@@ -1,0 +1,76 @@
+{
+ "about": "Second review of #471 (lab PR 267): a process staged in /tmp connects out with no image on the flow row (the connect raced its exec's image read), then executes /usr/bin/curl in the same pid. NN-L-NET-008's image fallback reads the lineage: in kernel order it is the staged image; on the priority bus the curl exec (P1) is taken ahead of the flow (P3), and judged as of the flow's start the lineage still answers the staged image.",
+ "fires": [
+  "NN-L-NET-008_OutboundFromTmpExec"
+ ],
+ "items": [
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6475001,
+     "ppid": 1,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "agent",
+     "filename": "/tmp/.n/agent",
+     "timestamp_ns": 3620000000000,
+     "argv": [
+      "/tmp/.n/agent"
+     ],
+     "parent_comm": "systemd",
+     "start_ns": 3619000000000,
+     "exe": {
+      "path": "/tmp/.n/agent"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3621000000000,
+     "end_ns": 3621050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40200,
+     "dst_addr": "100.64.20.9",
+     "dst_port": 443,
+     "proto": 6,
+     "pid": 6475001,
+     "uid": 1000,
+     "comm": "agent",
+     "exe": null,
+     "proc_start_ns": 3619000000000,
+     "bytes_sent": 1024,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6475001-3621000000000",
+     "phase": "connect"
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6475001,
+     "ppid": 1,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "curl",
+     "filename": "/usr/bin/curl",
+     "timestamp_ns": 3622000000000,
+     "argv": [
+      "curl",
+      "--version"
+     ],
+     "parent_comm": "systemd",
+     "start_ns": 3619000000000,
+     "exe": {
+      "path": "/usr/bin/curl"
+     }
+    }
+   }
+  }
+ ]
+}

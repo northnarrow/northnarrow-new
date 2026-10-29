@@ -28,6 +28,22 @@
  *       network rules judge. Prints "connect <t0 CLOCK_REALTIME ns> <pid>"
  *       before the connect (a kill at the connect ends it before any later
  *       line), then "result <pid> <errno or 0>".
+ *   readconnect <file> <ip> <port>
+ *       A probe of the three classes from one process: prints "connect <t0>
+ *       <pid>", reads <file> (a decoy credential: the FIM credential-read
+ *       rules), then connects as `connect` does.
+ *   bpfflood <seconds> <procs>
+ *       EXP-13d (second review of #471, R-A): <procs> loops of fork() + a
+ *       child's bpf(BPF_MAP_CREATE) with an array map of one entry, then
+ *       its exit — from an unprivileged user the call is refused (EPERM:
+ *       kernel.unprivileged_bpf_disabled), but the kernel's `bpf` LSM hook
+ *       runs first on 6.x and the agent sees one call per new process.
+ *       Prints "bpfflood <children> <refused> <allowed> <other errno>".
+ *   denialflood <seconds> <procs> <file>
+ *       EXP-13e: <procs> loops of fork() + a child's chmod(<file>) to the
+ *       mode it has (refused by the agent's deny hook: one denial per new
+ *       process, none coalesced). Prints "denialflood <children> <refused>
+ *       <allowed>".
  *
  * Exit 0, 2 on a usage error.
  */
@@ -38,6 +54,9 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <linux/bpf.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -238,8 +257,119 @@ static int probe_connect(const char *ip, int port)
     return 0;
 }
 
+static int read_connect(const char *file, const char *ip, int port)
+{
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((unsigned short)port)};
+    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1)
+        return 2;
+    long long t0 = now_ns(CLOCK_REALTIME);
+    printf("connect %lld %d\n", t0, (int)getpid());
+    fflush(stdout);
+    int fd = open(file, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        char buf[256];
+        while (read(fd, buf, sizeof buf) > 0)
+            ;
+        close(fd);
+    }
+    int c = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (c >= 0) {
+        if (connect(c, (struct sockaddr *)&a, sizeof a) == 0 || errno == EINPROGRESS) {
+            struct pollfd p = {.fd = c, .events = POLLOUT};
+            poll(&p, 1, 300);
+        }
+        close(c);
+    }
+    printf("result %d %d\n", (int)getpid(), fd >= 0 ? 0 : errno);
+    return 0;
+}
+
+/* One process's loop of fork() + `child` (its exit status: 0 allowed, 1
+ * refused, 2 other) until `end`; the counts summed through a pipe. */
+static void fork_loop(long long end, int (*child)(const char *), const char *arg, long *n,
+                      long *refused, long *allowed, long *other)
+{
+    while (now_ns(CLOCK_MONOTONIC) < end) {
+        pid_t pid = fork();
+        if (pid == 0)
+            _exit(child(arg));
+        if (pid < 0) {
+            usleep(1000);
+            continue;
+        }
+        int st = 0;
+        waitpid(pid, &st, 0);
+        (*n)++;
+        int code = WIFEXITED(st) ? WEXITSTATUS(st) : 3;
+        if (code == 0)
+            (*allowed)++;
+        else if (code == 1)
+            (*refused)++;
+        else
+            (*other)++;
+    }
+}
+
+static int bpf_child(const char *unused)
+{
+    (void)unused;
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof attr);
+    attr.map_type = BPF_MAP_TYPE_ARRAY;
+    attr.key_size = 4;
+    attr.value_size = 4;
+    attr.max_entries = 1;
+    long fd = syscall(SYS_bpf, BPF_MAP_CREATE, &attr, sizeof attr);
+    if (fd >= 0)
+        return 0;
+    return errno == EPERM || errno == EACCES ? 1 : 2;
+}
+
+static int chmod_child(const char *file)
+{
+    struct stat st;
+    if (stat(file, &st) != 0)
+        return 2;
+    if (chmod(file, st.st_mode & 07777) == 0)
+        return 0;
+    return errno == EPERM || errno == EACCES ? 1 : 2;
+}
+
+static int floods(const char *what, int secs, int procs, int (*child)(const char *), const char *arg)
+{
+    long long end = now_ns(CLOCK_MONOTONIC) + (long long)secs * 1000000000LL;
+    int fds[2];
+    if (pipe(fds) != 0)
+        return 1;
+    for (int i = 0; i < procs; i++) {
+        if (fork() == 0) {
+            long n = 0, r = 0, a = 0, o = 0;
+            fork_loop(end, child, arg, &n, &r, &a, &o);
+            long v[4] = {n, r, a, o};
+            if (write(fds[1], v, sizeof v) != (ssize_t)sizeof v)
+                _exit(1);
+            _exit(0);
+        }
+    }
+    close(fds[1]);
+    long tot[4] = {0, 0, 0, 0}, v[4];
+    while (read(fds[0], v, sizeof v) == (ssize_t)sizeof v)
+        for (int k = 0; k < 4; k++)
+            tot[k] += v[k];
+    while (wait(NULL) > 0)
+        ;
+    printf("%s %ld %ld %ld %ld\n", what, tot[0], tot[1], tot[2], tot[3]);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 5 && strcmp(argv[1], "readconnect") == 0)
+        return read_connect(argv[2], argv[3], atoi(argv[4]));
+    if (argc == 4 && strcmp(argv[1], "bpfflood") == 0)
+        return floods("bpfflood", atoi(argv[2]), atoi(argv[3]), bpf_child, NULL);
+    if (argc == 5 && strcmp(argv[1], "denialflood") == 0)
+        return floods("denialflood", atoi(argv[2]), atoi(argv[3]), chmod_child, argv[4]);
     if (argc == 6 && strcmp(argv[1], "net") == 0)
         return net(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]));
     if (argc == 4 && strcmp(argv[1], "connect") == 0)
@@ -249,6 +379,8 @@ int main(int argc, char **argv)
     if (argc == 6 && strcmp(argv[1], "tamper") == 0)
         return tamper(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), argv[5]);
     fprintf(stderr, "usage: %s flood <secs> <threads> <file>... | tamper <bursts> <size> <gap-ms> <file>"
-                    " | net <secs> <connects/s> <port> <dns/s> | connect <ip> <port>\n", argv[0]);
+                    " | net <secs> <connects/s> <port> <dns/s> | connect <ip> <port>"
+                    " | readconnect <file> <ip> <port> | bpfflood <secs> <procs>"
+                    " | denialflood <secs> <procs> <file>\n", argv[0]);
     return 2;
 }

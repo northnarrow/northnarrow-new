@@ -484,10 +484,10 @@ exit: 0
 | last admin action : 42s ago
 | ringbuf drops     : 3 (exec 2, file 1) — events lost since boot, see the agent WARNs
 | ringbuf rejected  : 1 (net 1) — malformed records since boot (a desynced ring), see the agent WARNs
-| event bus         : P0 tamper  1024 slots (wait 50 ms, then drop for FsProtectDenial; other tamper events wait): 12 queued, 0 dropped, depth 0 (max 3), longest wait 41 µs (recent 0 µs), 0 waited for room (longest 0 µs), 0 taken ahead by share; decided 12, p50 120 µs p99 900 µs max 950 µs
-|                     P1 process 4096 slots (wait 10 ms, then drop): 800 queued, 0 dropped, depth 2 (max 64), longest wait 3000 µs (recent 900 µs), 1 waited for room (longest 2000 µs), 0 taken ahead by share; decided 798, p50 40 µs p99 2100 µs max 3100 µs
-|                     P2 file    8192 slots (drop the new FileOpen (past 2048 queued); other file events wait): 90000 queued, 98 dropped, depth 2048 (max 2048), longest wait 450000 µs (recent 300000 µs), 2 waited for room (longest 1500 µs), 9 taken ahead by share; decided 81808, p50 15 µs p99 400000 µs max 450000 µs
-|                     P3 network 8192 slots (drop the new event): 40 queued, 0 dropped, depth 0 (max 5), longest wait 9000 µs (recent 0 µs), 0 waited for room (longest 0 µs), 1 taken ahead by share; decided 40, p50 - p99 - max -
+| event bus         : P0 tamper  1024 slots (wait 50 ms, then drop for FsProtectDenial (repeats within 1 s coalesced); other tamper events wait, 64 slots kept from denials and bpf() calls): 12 queued, 0 dropped, depth 0 (max 3), longest wait 41 µs (recent 0 µs), 0 waited for room (longest 0 µs), 0 taken ahead by share, 1499 coalesced; decided 12, p50 120 µs p99 900 µs max 950 µs
+|                     P1 process 4096 slots (wait 10 ms, then drop): 800 queued, 0 dropped, depth 2 (max 64), longest wait 3000 µs (recent 900 µs), 1 waited for room (longest 2000 µs), 0 taken ahead by share, 0 coalesced; decided 798, p50 40 µs p99 2100 µs max 3100 µs
+|                     P2 file    8192 slots (drop the new FileOpen (past 2048 opens queued); write-opens of CRITICAL/PERSIST files and other file events wait): 90000 queued, 98 dropped, depth 2048 (max 2048), longest wait 450000 µs (recent 300000 µs), 2 waited for room (longest 1500 µs), 9 taken ahead by share, 0 coalesced; decided 81808, p50 15 µs p99 400000 µs max 450000 µs
+|                     P3 network 8192 slots (drop the new event): 40 queued, 0 dropped, depth 0 (max 5), longest wait 9000 µs (recent 0 µs), 0 waited for room (longest 0 µs), 1 taken ahead by share, 0 coalesced; decided 40, p50 - p99 - max -
 | loss by stage     : 1 kernel ring           3 (RING_DROPS: a ring or map full)
 |                     2 kernel budget         0 (RING_DROPS dns_rate, listen_rate, io_uring_rate, task_denial_rate)
 |                     3 decode                1 (RejectThrottle: malformed records)

@@ -23,6 +23,7 @@
 #   [--threads T] [--bursts B] [--burst-size K] [--burst-gap-ms G]
 #   [--settle S] [--key FILE] [--stall-secs N]
 #   [--net-rate R] [--dns-rate D] [--net-port P] [--probes N]
+#   [--stage-read] [--bpf-flood-procs N] [--denial-flood-procs N]
 # --flood-secs 0: no flood. --stall-secs N (a lab build: debug-trigger): the
 # event loop is first made to stand still N seconds
 # (/run/northnarrow/debug-stall-loop, lab PR 216), and the bursts start when
@@ -40,6 +41,15 @@
 # NN-L-NET-001 kills it) and a connect to the listener from a copy of the
 # helper in /var/tmp (a staging directory: NN-L-CHAIN-002 / NN-L-NET-008).
 # The summary counts each probe's record and its latency.
+# Second review of #471: --stage-read makes the staging probe read a decoy
+# GPG private key of the lab user's first (FIM credential-read rules: one
+# process of the three classes — exec, file, network); --bpf-flood-procs N
+# (EXP-13d) runs N loops of fork() + bpf(BPF_MAP_CREATE) as the lab user,
+# --denial-flood-procs N (EXP-13e) N loops of fork() + a refused chmod of
+# the target as root, through the flood's time, each in a unit of its own;
+# --flood-procs 0 keeps the open flood off. The agent's threads' CPU time
+# and the host's CPU pressure (/proc/pressure/cpu) are read before and
+# after (cpu-before.txt, cpu-after.txt).
 # Output (DIR, default /var/lib/nn-exp13/<UTC stamp>): status-before.json,
 # status-after.json (`nn-admin status --json --key`), tamper.txt (one line
 # per burst), flood.txt, detections.jsonl (the new detection records),
@@ -52,6 +62,7 @@ export LC_ALL=C
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT= FLOOD_SECS=40 FLOOD_PROCS=4 THREADS=32 BURSTS=8 BURST_SIZE=1500 BURST_GAP_MS=3000
 SETTLE=75 KEY= STALL=0 NET_RATE=0 DNS_RATE=0 NET_PORT=18099 PROBES=0
+STAGE_READ=0 BPF_PROCS=0 DENIAL_PROCS=0
 DET=/var/lib/northnarrow/detections/detections.jsonl
 AUDIT=/etc/northnarrow/audit.log
 TARGET=/etc/northnarrow/admin.pub
@@ -75,10 +86,13 @@ while (($#)); do
         --dns-rate) DNS_RATE=${2:?}; shift 2 ;;
         --net-port) NET_PORT=${2:?}; shift 2 ;;
         --probes) PROBES=${2:?}; shift 2 ;;
+        --stage-read) STAGE_READ=1; shift ;;
+        --bpf-flood-procs) BPF_PROCS=${2:?}; shift 2 ;;
+        --denial-flood-procs) DENIAL_PROCS=${2:?}; shift 2 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
-for v in FLOOD_SECS FLOOD_PROCS THREADS BURSTS BURST_SIZE BURST_GAP_MS SETTLE STALL NET_RATE DNS_RATE NET_PORT PROBES; do
+for v in FLOOD_SECS FLOOD_PROCS THREADS BURSTS BURST_SIZE BURST_GAP_MS SETTLE STALL NET_RATE DNS_RATE NET_PORT PROBES BPF_PROCS DENIAL_PROCS; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "--${v,,} takes a whole number: ${!v}"
 done
 (($(id -u) == 0)) || die "run as root"
@@ -121,7 +135,27 @@ status() { "$NNADMIN" status --json --key "$KEY" > "$1" 2> "$1.err" || echo "exp
 echo "exp13: agent $AGENT_EXE ($(sha256sum "$AGENT_EXE" | cut -c1-16)), $(nproc) cpus, flood ${FLOOD_PROCS}x${THREADS} threads ${FLOOD_SECS}s, ${BURSTS} bursts of ${BURST_SIZE} every ${BURST_GAP_MS} ms, net ${NET_RATE}/s dns ${DNS_RATE}/s probes ${PROBES}" | tee "$OUT/summary.txt"
 det0=$(stat -c %s "$DET" 2>/dev/null || echo 0)
 aud0=$(stat -c %s "$AUDIT" 2>/dev/null || echo 0)
+# The agent's threads' CPU time (utime + stime, clock ticks) and the CPU
+# pressure, for the attribution of a ring that falls behind.
+cpu() {
+    local pid
+    pid=$(systemctl show -p MainPID --value northnarrow-agent)
+    { echo "ticks $(getconf CLK_TCK) uptime $(cut -d' ' -f1 /proc/uptime)"
+      cat /proc/pressure/cpu 2>/dev/null | sed 's/^/psi /'
+      for t in /proc/"$pid"/task/*; do
+          [[ -r $t/stat ]] || continue
+          printf 'thread %s %s\n' "$(cat "$t/comm" 2>/dev/null | tr ' ' '_')" "$(awk '{print $14 + $15}' "$t/stat" 2>/dev/null)"
+      done; } > "$1" 2>/dev/null
+}
+DECOY=
+if ((STAGE_READ)); then
+    home=$(getent passwd "$USER_NAME" | cut -d: -f6)
+    DECOY=$home/.gnupg/private-keys-v1.d/nn-exp13-decoy.key
+    runuser -u "$USER_NAME" -- mkdir -p -m 0700 "$(dirname "$DECOY")"
+    runuser -u "$USER_NAME" -- bash -c "printf '(private-key (nn-exp13 decoy))\n' > '$DECOY'"
+fi
 status "$OUT/status-before.json"
+cpu "$OUT/cpu-before.txt"
 t_start=$(date +%s%N)
 
 # The flood, in a transient unit of its own: its cgroup, at most 3 CPUs.
@@ -159,6 +193,7 @@ if ((PROBES > 0)); then
             cmd="$LIBEXEC/nn-exp13-probe connect 192.0.2.1 80"
         else
             cmd="$STAGE/nn-exp13-stage connect 127.0.0.1 $NET_PORT"
+            ((STAGE_READ)) && cmd="$STAGE/nn-exp13-stage readconnect $DECOY 127.0.0.1 $NET_PORT"
         fi
         systemctl stop "nn-exp13-probe-$kind.service" 2>/dev/null
         systemctl reset-failed "nn-exp13-probe-$kind.service" 2>/dev/null
@@ -168,6 +203,26 @@ if ((PROBES > 0)); then
             || die "the $kind probes did not start"
         units+=("nn-exp13-probe-$kind.service")
     done
+fi
+# EXP-13d / EXP-13e: the tamper floods P0 can be kept full with.
+: > "$OUT/bpfflood.txt"
+: > "$OUT/denialflood.txt"
+dur=$((FLOOD_SECS > 0 ? FLOOD_SECS : 30))
+if ((BPF_PROCS > 0)); then
+    systemctl stop nn-exp13-bpfflood.service 2>/dev/null
+    systemctl reset-failed nn-exp13-bpfflood.service 2>/dev/null
+    systemd-run --quiet --unit=nn-exp13-bpfflood --uid="$USER_NAME" \
+        -p StandardOutput="file:$OUT/bpfflood.txt" -p StandardError="file:$OUT/bpfflood.err" \
+        "$LIBEXEC/nn-exp13-flood" bpfflood "$dur" "$BPF_PROCS" || die "the bpf flood did not start"
+    units+=(nn-exp13-bpfflood.service)
+fi
+if ((DENIAL_PROCS > 0)); then
+    systemctl stop nn-exp13-denialflood.service 2>/dev/null
+    systemctl reset-failed nn-exp13-denialflood.service 2>/dev/null
+    systemd-run --quiet --unit=nn-exp13-denialflood \
+        -p StandardOutput="file:$OUT/denialflood.txt" -p StandardError="file:$OUT/denialflood.err" \
+        "$LIBEXEC/nn-exp13-tamper" denialflood "$dur" "$DENIAL_PROCS" "$TARGET" || die "the denial flood did not start"
+    units+=(nn-exp13-denialflood.service)
 fi
 # A lab build's stalled loop: the trigger is read at the loop's next 5 s
 # check, which removes it and stands still.
@@ -185,8 +240,10 @@ for u in "${units[@]}"; do
     while systemctl is-active --quiet "$u"; do sleep 1; done
 done
 t_flood_end=$(date +%s%N)
+cpu "$OUT/cpu-flood-end.txt"
 sleep "$SETTLE"
 status "$OUT/status-after.json"
+cpu "$OUT/cpu-after.txt"
 t_end=$(date +%s%N)
 tail -c +"$((det0 + 1))" "$DET" > "$OUT/detections.jsonl" 2>/dev/null
 tail -c +"$((aud0 + 1))" "$AUDIT" > "$OUT/audit.jsonl" 2>/dev/null
@@ -197,6 +254,7 @@ journalctl --namespace=northnarrow -u northnarrow-agent --since "@$((t_start / 1
 # released the operator's way.
 "$NNADMIN" unlock --key "$KEY" > "$OUT/unlock.txt" 2>&1 || true
 [[ -n $STAGE ]] && rm -rf "$STAGE"
+[[ -n $DECOY ]] && rm -f "$DECOY"
 
 python3 -I - "$OUT" "$t_start" "$t_flood_end" "$t_end" "$tamper_rc" <<'PY' | tee -a "$OUT/summary.txt"
 import json, sys, calendar, time
@@ -248,7 +306,7 @@ for line in open(out + "/detections.jsonl", errors="replace"):
     suppressed += int(r.get("suppressed_before") or 0)
 recs.sort()
 
-held, bus_rows, ring_rows = 0, [], []
+held, bus_rows, ring_rows, coalesced = 0, [], [], 0
 for line in open(out + "/audit.jsonl", errors="replace"):
     try:
         r = json.loads(line)
@@ -264,6 +322,8 @@ for line in open(out + "/audit.jsonl", errors="replace"):
                 held += int(h.get("count") or 0)
     elif op == "event_bus_drop":
         bus_rows.append(extra)
+    elif op == "event_bus_coalesced":
+        coalesced += int(extra.get("repeats_since_last_row") or 0)
     elif op == "ringbuf_drop":
         ring_rows.append(extra)
 
@@ -313,16 +373,57 @@ def probes(kind, rules):
     killed = sum(1 for l in lines_of("probes-%s.err" % kind) if "Killed" in l)
     return {"sent": len(out_p), "judged": sum(1 for p in out_p if p["records"]), "killed_while_connecting": killed, "probes": out_p}
 net_line = next((f for f in lines_of("net.txt") if len(f) == 4 and f[0] == "net"), None)
+
+def per_class(kind, classes):
+    """For each probe of `kind`, which classes of its events were judged."""
+    out_c = {c: 0 for c in classes}
+    sent = 0
+    for f in lines_of("probes-%s.txt" % kind):
+        if len(f) in (3, 4) and f[0] == "connect":
+            sent += 1
+            names = [n for _, ns, _ in recs_by_pid.get(int(f[2]), []) for n in ns]
+            for c, prefixes in classes.items():
+                if any(n.startswith(prefixes) for n in names):
+                    out_c[c] += 1
+    return {"sent": sent, "judged": out_c}
+
+def cpu_read(name):
+    th, psi, ticks = {}, {}, 100
+    for f in lines_of(name):
+        if f and f[0] == "ticks":
+            ticks = int(f[1])
+        elif f and f[0] == "thread" and len(f) == 3:
+            th[f[1]] = th.get(f[1], 0) + int(f[2])
+        elif f and f[0] == "psi" and len(f) >= 6:
+            psi[f[1]] = {k: float(v) for k, v in (x.split("=") for x in f[2:])}
+    return th, psi, ticks
+
+def cpu_delta(a, b):
+    ta, pa, ticks = cpu_read(a)
+    tb, pb, _ = cpu_read(b)
+    threads = {k: round((tb.get(k, 0) - ta.get(k, 0)) / ticks, 2) for k in set(ta) | set(tb)}
+    threads = dict(sorted(((k, v) for k, v in threads.items() if v > 0), key=lambda kv: -kv[1]))
+    psi = {k: {"total_ms": round((pb[k]["total"] - pa.get(k, {}).get("total", 0)) / 1000), "avg10_after": pb[k].get("avg10")} for k in pb}
+    return {"agent_cpu_s_by_thread": threads, "agent_cpu_s": round(sum(threads.values()), 2), "cpu_pressure": psi}
+
+def helper_line(name, tag):
+    f = next((f for f in lines_of(name) if f and f[0] == tag), None)
+    return None if f is None else [int(x) for x in f[1:]]
 ring_names = sorted(set((before or {}).get("ringbuf_drops") or {}) | set((after or {}).get("ringbuf_drops") or {}))
 
 summary = {
     "net_load": None if net_line is None else {"connected": int(net_line[1]), "failed": int(net_line[2]), "dns_sent": int(net_line[3])},
     "probes_net001": probes("net001", ("NN-L-NET-001",)),
     "probes_stage": probes("stage", ("NN-L-CHAIN-002", "NN-L-NET-008")),
+    "probes_stage_by_class": per_class("stage", {"exec": ("R00",), "file": ("NN-L-FIM-",), "net": ("NN-L-CHAIN-", "NN-L-NET-008")}),
+    "bpfflood": helper_line("bpfflood.txt", "bpfflood"),
+    "denialflood": helper_line("denialflood.txt", "denialflood"),
+    "cpu_flood": cpu_delta("cpu-before.txt", "cpu-flood-end.txt"),
     "ring_drops_delta_all": {r: delta(r) for r in ring_names},
     "attempts_refused": attempts, "attempts_allowed": allowed, "tamper_rc": tamper_rc,
     "at001_records": len(recs), "at001_suppressed_before": suppressed, "at001_held_reported": held,
-    "at001_accounted": len(recs) + held,
+    "at001_coalesced": coalesced,
+    "at001_accounted": len(recs) + held + coalesced,
     "ring_drops_delta": {r: delta(r) for r in ("fs_protect", "open_sensor", "task_denial_rate", "exec", "fim")},
     "first_record_latency_ms": lat,
     "event_bus": None if not ba else {p: {k: qd(p, k) for k in ("enqueued", "dropped", "waited", "aged", "ahead", "decided", "max_depth", "max_wait_us", "recent_max_wait_us", "send_wait_max_us", "latency_p50_us", "latency_p99_us", "latency_max_us")} for p in sorted(ba)},
@@ -332,7 +433,7 @@ summary = {
 }
 json.dump(summary, open(out + "/summary.json", "w"), indent=1)
 print("refused attempts   :", attempts, "(allowed:", allowed, ")")
-print("AT-001 recorded    :", len(recs), "records +", held, "held (budget, signed detections_held) =", len(recs) + held)
+print("AT-001 recorded    :", len(recs), "records +", held, "held (budget, signed detections_held) +", coalesced, "coalesced (signed event_bus_coalesced) =", len(recs) + held + coalesced)
 print("ring drops (delta) :", summary["ring_drops_delta"])
 print("first record (ms)  :", lat)
 if summary["event_bus"]:
@@ -348,5 +449,11 @@ if summary["net_load"] or summary["probes_net001"]["sent"]:
         v = summary[k]
         print(k.ljust(19) + ":", v["judged"], "of", v["sent"], "judged,", v["killed_while_connecting"], "killed while connecting; latency ms", [p["latency_ms"] for p in v["probes"]])
     print("ring drops (all)   :", summary["ring_drops_delta_all"])
+    print("stage by class     :", summary["probes_stage_by_class"])
+if summary["bpfflood"] or summary["denialflood"]:
+    print("bpf flood          :", summary["bpfflood"], "(children, refused, allowed, other)")
+    print("denial flood       :", summary["denialflood"], "(children, refused, allowed, other)")
+print("agent CPU (flood)  :", summary["cpu_flood"]["agent_cpu_s"], "s;", list(summary["cpu_flood"]["agent_cpu_s_by_thread"].items())[:6])
+print("CPU pressure       :", summary["cpu_flood"]["cpu_pressure"])
 PY
 echo "exp13: results in $OUT"

@@ -950,6 +950,9 @@ pub struct BusQueueStatus {
     /// Events taken by their share ahead of a higher class that held
     /// events (review #471 A2).
     pub ahead: u64,
+    /// Repeated denials counted into the one queued (P0; 0 elsewhere —
+    /// second review of #471).
+    pub coalesced: u64,
     /// Decisions timed, and their latency from queue to decision,
     /// microseconds (`None` before the first).
     pub decided: u64,
@@ -2685,6 +2688,7 @@ mod tests {
                 waited: 0,
                 send_wait_max_us: 0,
                 ahead: 0,
+                coalesced: 0,
                 decided: 3,
                 latency_p50_us: Some(120),
                 latency_p99_us: Some(900),

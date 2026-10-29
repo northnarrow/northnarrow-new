@@ -1406,6 +1406,12 @@ pub async fn pump(ring: RingBuf<MapData>, tx: crate::sensors::bus::BusSender) {
             reject.flush_idle(PUMP_LABEL, size);
         }
         for r in send_order(&batch.records) {
+            // Second review of #471: an open the opens' cap would drop is
+            // not decoded, resolved and allocated first — counted as P2's.
+            if open_only(r) && !tx.open_room() {
+                tx.note_open_dropped();
+                continue;
+            }
             for ev in events_of(r, &mut mounts) {
                 if tx.send(ev).await.is_err() {
                     return;
@@ -1413,6 +1419,19 @@ pub async fn pump(ring: RingBuf<MapData>, tx: crate::sensors::bus::BusSender) {
             }
         }
     }
+}
+
+/// A record that makes one plain `FileOpen` and nothing else — no FIM
+/// credential read, mass write, burst, capability or signal — and not a
+/// write-open of a CRITICAL or PERSIST file (which waits for room): what a
+/// full opens' cap drops (second review of #471).
+pub(crate) fn open_only(r: &OpenRecordRaw) -> bool {
+    let open =
+        open_reason::SENSITIVE | open_reason::CRITICAL | open_reason::PERSIST | open_reason::PROBE;
+    let guarded = open_reason::CRITICAL | open_reason::PERSIST;
+    r.reason & open != 0
+        && r.reason & !open == 0
+        && !(matches!(r.flags & 0b11, 1 | 2) && r.reason & guarded != 0)
 }
 
 /// The order a batch's records are sent in (review #471 M2): the signals
@@ -2020,6 +2039,45 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    /// Second review of #471: the pump's early check names the records
+    /// that make one plain open only — not a guarded write-open, not one
+    /// that carries any other event; and it matches what the events are.
+    #[test]
+    fn open_only_is_a_plain_open_and_nothing_else() {
+        let mut mounts = MountTable::default();
+        mounts.roots.insert((0, 0), "/".into());
+        mounts.loaded = Some(Instant::now());
+        for (reason, flags, want) in [
+            (open_reason::SENSITIVE, 0, true),
+            (open_reason::PROBE, 0, true),
+            (open_reason::PERSIST, 0, true),
+            (open_reason::PERSIST, 1, false),
+            (open_reason::CRITICAL, 2, false),
+            (open_reason::SENSITIVE, 1, true),
+            (open_reason::SENSITIVE | open_reason::CRED, 0, false),
+            (open_reason::MASS_WRITE, 1, false),
+            (open_reason::DEFENDER_SIGNAL, 0, false),
+        ] {
+            let mut r = record(reason, &["etc", "x"], (0, 0));
+            r.flags = flags;
+            assert_eq!(open_only(&r), want, "{reason:#x} {flags}");
+            if want {
+                let evs = events_of(&r, &mut mounts);
+                assert!(
+                    matches!(&evs[..], [e @ Event::FileOpen { .. }] if !nn_core::bus::guarded_write_open(e)),
+                    "{evs:?}"
+                );
+            }
+        }
+        let pump = include_str!("open_sensor.rs");
+        let pump = &pump[pump.find("pub async fn pump(").unwrap()..];
+        let pump = &pump[..pump.find("\n}\n").unwrap()];
+        assert!(
+            pump.contains("if open_only(r) && !tx.open_room() {"),
+            "{pump}"
+        );
     }
 
     /// Review #471 M2: a batch's signals to a security tool are sent

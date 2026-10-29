@@ -10,17 +10,22 @@
 //! most 50 ms for room while its kernel ring absorbs, a P1 (process) event
 //! 10 ms, then the event is dropped and counted; P2 (file) and P3
 //! (network) drop the new event at once. The other tamper events (review
-//! #471 M1) and the file events other than `FileOpen` (review 75) wait for
-//! room as every source waited before; and the opens fill at most
-//! [`core_bus::FILE_OPEN_SHARE`] of P2 (review #471 B3), so a flood of them
-//! neither holds a FIM record seconds behind it nor makes the FIM drain
-//! wait. The wait is fair: a waiting sender takes the next free slot of its
-//! queue before a sender that comes later. The receiver — the event loop,
-//! the one consumer — takes P0 first, then P1–P3 by weighted shares
-//! ([`core_bus::SHARE_WEIGHTS`], review #471 A2), FIFO inside a class; a
-//! flood of one class no longer holds the others back, and the kernel no
-//! longer drops a tamper record because a flood of opens filled the shared
-//! queue (plan §1.5, EXP-13).
+//! #471 M1), the file events other than `FileOpen` (review 75) and the
+//! write-opens of CRITICAL/PERSIST files (second review, R-E) wait for room
+//! as every source waited before; the opens fill at most
+//! [`core_bus::FILE_OPEN_SHARE`] of P2 (review #471 B3; the opens counted,
+//! R-E), so a flood of them neither holds a FIM record seconds behind it
+//! nor makes the FIM drain wait. The wait is fair: a waiting sender takes
+//! the next free slot of its queue before a sender that comes later. The
+//! events that can flood P0 (`FsProtectDenial`, `BpfSyscall`) take all of
+//! it but [`core_bus::P0_RESERVE`] slots, the rare tamper events' (R-D);
+//! and a denial repeated by one process on one inode within a second is
+//! counted into the one queued and signed (R-A). The receiver — the event
+//! loop, the one consumer — takes by weighted shares 8 : 2 : 1 : 1
+//! ([`core_bus::SHARE_WEIGHTS`]: review #471 A2, R-A of the second review),
+//! FIFO inside a class; a flood of one class no longer holds the others
+//! back, and the kernel no longer drops a tamper record because a flood of
+//! opens filled the shared queue (plan §1.5, EXP-13).
 //!
 //! What the receiver hands over with an event (lab PR 267, the property test
 //! of `agent/src/decision/golden.rs`): an event taken ahead of execs still
@@ -76,9 +81,154 @@ pub const SAMPLE_SECS: u64 = ring_drops::SAMPLE_SECS;
 /// sample).
 pub const AUDIT_WINDOW_SECS: u64 = ring_drops::AUDIT_WINDOW_SECS;
 
+/// Audit op of the denials coalesced on the bus (second review of #471).
+pub const COALESCED_AUDIT_OP: &str = "event_bus_coalesced";
+/// Second review of #471, R-A: a refused operation repeated by the same
+/// process on the same inode within this window of the one sent is
+/// counted into it, not queued.
+pub const COALESCE_WINDOW_NS: u64 = 1_000_000_000;
+/// The coalescing windows kept (a repeat of an evicted one is sent again).
+const COALESCE_KEYS: usize = 512;
+/// The keys a coalesced row names, the rest summed.
+const COALESCED_ROW_KEYS: usize = 32;
+
 /// The receiver is gone (the agent is stopping).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendError;
+
+/// One process's refused operation on one inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DenialKey {
+    pid: u32,
+    op: std::mem::Discriminant<nn_model::FsProtectOperation>,
+    dev: u64,
+    ino: u64,
+}
+
+/// A coalescing window: the denial sent at `sent_ns` and the repeats
+/// counted into it since the last signed row.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    operation: nn_model::FsProtectOperation,
+    sent_ns: u64,
+    repeats: u64,
+    first_ns: u64,
+    last_ns: u64,
+}
+
+/// Second review of #471, R-A: identical denials (same pid, operation and
+/// inode) within [`COALESCE_WINDOW_NS`] of the one sent are counted, not
+/// queued — P0 no longer fills with copies of one refused `chmod` loop, and
+/// every repeat is in a signed `event_bus_coalesced` row (count, first and
+/// last time per key).
+#[derive(Debug, Default)]
+struct Coalescer {
+    windows: std::collections::HashMap<DenialKey, Window>,
+    /// Repeats of windows evicted before their row.
+    evicted: u64,
+    /// Every repeat since boot.
+    total: u64,
+}
+
+impl Coalescer {
+    /// `true`: `event` repeats a denial sent within the window — counted.
+    fn offer(&mut self, event: &Event) -> bool {
+        let Event::FsProtectDenial {
+            pid,
+            target_dev,
+            target_ino,
+            operation,
+            timestamp_ns,
+            ..
+        } = event
+        else {
+            return false;
+        };
+        let key = DenialKey {
+            pid: *pid,
+            op: std::mem::discriminant(operation),
+            dev: *target_dev,
+            ino: *target_ino,
+        };
+        let ts = *timestamp_ns;
+        if let Some(w) = self.windows.get_mut(&key) {
+            if ts >= w.sent_ns && ts - w.sent_ns < COALESCE_WINDOW_NS {
+                if w.repeats == 0 {
+                    w.first_ns = ts;
+                }
+                w.repeats += 1;
+                w.last_ns = w.last_ns.max(ts);
+                self.total += 1;
+                return true;
+            }
+            // past the window: this one is sent and opens the next; the
+            // repeats not yet in a row stay counted
+            if w.repeats == 0 {
+                w.sent_ns = ts;
+                return false;
+            }
+        }
+        if self.windows.len() >= COALESCE_KEYS && !self.windows.contains_key(&key) {
+            self.evict(ts);
+        }
+        let pending = self.windows.get(&key).map_or(0, |w| w.repeats);
+        if pending > 0 {
+            // a window with repeats not yet signed: keep them, restart it
+            let w = self.windows.get_mut(&key).expect("present");
+            w.sent_ns = ts;
+            return false;
+        }
+        self.windows.insert(
+            key,
+            Window {
+                operation: *operation,
+                sent_ns: ts,
+                repeats: 0,
+                first_ns: 0,
+                last_ns: 0,
+            },
+        );
+        false
+    }
+
+    /// Room for a new key: the expired windows with nothing pending go,
+    /// then the oldest, its pending repeats kept in the evicted count.
+    fn evict(&mut self, now_ns: u64) {
+        self.windows
+            .retain(|_, w| w.repeats > 0 || now_ns.saturating_sub(w.sent_ns) < COALESCE_WINDOW_NS);
+        while self.windows.len() >= COALESCE_KEYS {
+            let Some(oldest) = self
+                .windows
+                .iter()
+                .min_by_key(|(_, w)| w.sent_ns)
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            if let Some(w) = self.windows.remove(&oldest) {
+                self.evicted += w.repeats;
+            }
+        }
+    }
+
+    /// The repeats not yet in a row, per key (the most first), and those
+    /// of evicted windows; their counters start again.
+    fn take_pending(&mut self) -> (Vec<(DenialKey, Window)>, u64) {
+        let mut out: Vec<(DenialKey, Window)> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| w.repeats > 0)
+            .map(|(k, w)| (*k, *w))
+            .collect();
+        out.sort_by_key(|(_, w)| std::cmp::Reverse(w.repeats));
+        for (k, _) in &out {
+            if let Some(w) = self.windows.get_mut(k) {
+                w.repeats = 0;
+            }
+        }
+        (out, std::mem::take(&mut self.evicted))
+    }
+}
 
 struct State {
     queues: ClassQueues<Event>,
@@ -90,6 +240,9 @@ struct State {
     /// The longest wait in each queue in the last complete sample window
     /// (review #471 B2).
     recent_max_wait_ns: [u64; QUEUES],
+    /// The `FileOpen`s queued in P2 that count against the opens' cap
+    /// (second review of #471, R-E: not the whole of P2).
+    opens: usize,
 }
 
 struct Inner {
@@ -103,6 +256,17 @@ struct Inner {
     p0_dropped: Notify,
     /// The most `FileOpen`s P2 holds ([`core_bus::FILE_OPEN_SHARE`]).
     open_cap: usize,
+    /// The opens queued, for the open-sensor pump's check before it builds
+    /// an open (second review of #471: the event a full cap drops is not
+    /// decoded, resolved and allocated first) — kept with `State::opens`.
+    opens_hint: AtomicUsize,
+    /// Opens the pump dropped on that check, without the queue's lock.
+    opens_dropped_early: std::sync::atomic::AtomicU64,
+    /// Second review of #471, R-D: P0's slots for the events that can flood
+    /// it ([`core_bus::floods_p0`]) — its capacity less
+    /// [`core_bus::P0_RESERVE`]; the rare tamper events take the rest.
+    p0_flood_room: Semaphore,
+    coalescer: Mutex<Coalescer>,
     senders: AtomicUsize,
     closed: AtomicBool,
     specs: [QueueSpec; QUEUES],
@@ -132,6 +296,50 @@ impl Inner {
     }
 }
 
+/// P0's slots the events that can flood it may take: its capacity less the
+/// reserve (a quarter of a small test queue at most).
+fn p0_flood_slots(capacity: usize) -> usize {
+    let capacity = capacity.max(1);
+    (capacity - core_bus::P0_RESERVE.min(capacity / 4)).max(1)
+}
+
+/// A plain `FileOpen`: one the opens' cap counts (not a guarded write-open,
+/// which waits for room — second review of #471, R-E).
+fn counted_open(event: &Event) -> bool {
+    matches!(event, Event::FileOpen { .. }) && !core_bus::guarded_write_open(event)
+}
+
+/// Take one slot of `room` as `policy` says: `Ok(Some)` a slot, `Ok(None)`
+/// the event is to be dropped, `Err` the bus is closed. Counts the wait.
+async fn slot<'a>(
+    inner: &Inner,
+    room: &'a Semaphore,
+    policy: WhenFull,
+    p: Priority,
+) -> Result<Option<tokio::sync::SemaphorePermit<'a>>, SendError> {
+    match room.try_acquire() {
+        Ok(permit) => return Ok(Some(permit)),
+        Err(TryAcquireError::Closed) => return Err(SendError),
+        Err(TryAcquireError::NoPermits) => {}
+    }
+    let started = Instant::now();
+    let permit = match policy {
+        WhenFull::DropNew => return Ok(None),
+        WhenFull::Backpressure => room.acquire().await.map_err(|_| SendError)?,
+        WhenFull::Wait { max_ns } => {
+            match tokio::time::timeout(Duration::from_nanos(max_ns), room.acquire()).await {
+                Ok(permit) => permit.map_err(|_| SendError)?,
+                Err(_) => return Ok(None),
+            }
+        }
+    };
+    let waited_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let mut st = inner.state.lock();
+    st.waited[p.index()] += 1;
+    st.send_wait_max_ns[p.index()] = st.send_wait_max_ns[p.index()].max(waited_ns);
+    Ok(Some(permit))
+}
+
 /// A bus of the plan's queues ([`SPECS`]): its sender and its receiver.
 pub fn channel() -> (BusSender, BusReceiver) {
     channel_with(SPECS)
@@ -146,11 +354,16 @@ pub fn channel_with(specs: [QueueSpec; QUEUES]) -> (BusSender, BusReceiver) {
             waited: [0; QUEUES],
             send_wait_max_ns: [0; QUEUES],
             recent_max_wait_ns: [0; QUEUES],
+            opens: 0,
         }),
         room: specs.map(|s| Semaphore::new(s.capacity.max(1))),
         ready: Notify::new(),
         p0_dropped: Notify::new(),
         open_cap: core_bus::FILE_OPEN_SHARE.min(specs[Priority::P2.index()].capacity.max(1)),
+        opens_hint: AtomicUsize::new(0),
+        opens_dropped_early: std::sync::atomic::AtomicU64::new(0),
+        p0_flood_room: Semaphore::new(p0_flood_slots(specs[Priority::P0.index()].capacity)),
+        coalescer: Mutex::new(Coalescer::default()),
         senders: AtomicUsize::new(1),
         closed: AtomicBool::new(false),
         specs,
@@ -200,66 +413,93 @@ impl BusSender {
         if inner.closed.load(Ordering::Acquire) {
             return Err(SendError);
         }
+        // Second review of #471, R-A: a repeat of a denial just sent is
+        // counted into it (a signed row), not queued.
+        if matches!(event, Event::FsProtectDenial { .. }) && inner.coalescer.lock().offer(&event) {
+            return Ok(());
+        }
         let p = Priority::of_event(&event);
-        let room = &inner.room[p.index()];
-        let permit = match room.try_acquire() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::Closed) => return Err(SendError),
-            Err(TryAcquireError::NoPermits) => {
-                let started = Instant::now();
-                let waited = match inner.when_full(&event, p) {
-                    WhenFull::DropNew => {
-                        inner.note_dropped(p);
-                        return Ok(());
-                    }
-                    WhenFull::Backpressure => room.acquire().await.ok(),
-                    WhenFull::Wait { max_ns } => {
-                        match tokio::time::timeout(Duration::from_nanos(max_ns), room.acquire())
-                            .await
-                        {
-                            Ok(permit) => permit.ok(),
-                            Err(_) => {
-                                inner.note_dropped(p);
-                                return Ok(());
-                            }
-                        }
-                    }
-                };
-                let Some(permit) = waited else {
-                    return Err(SendError);
-                };
-                let waited_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                let mut st = inner.state.lock();
-                st.waited[p.index()] += 1;
-                st.send_wait_max_ns[p.index()] = st.send_wait_max_ns[p.index()].max(waited_ns);
-                permit
+        let counted = counted_open(&event);
+        if counted && !self.open_room() {
+            self.note_open_dropped();
+            return Ok(());
+        }
+        let policy = inner.when_full(&event, p);
+        // R-D: the events that can flood P0 take its slots but the reserve
+        // first (their own policy), then the queue's slot, which is then
+        // free unless the rare events hold more than the reserve.
+        let flood_permit = if p == Priority::P0 && core_bus::floods_p0(&event) {
+            match slot(inner, &inner.p0_flood_room, policy, p).await? {
+                Some(permit) => Some(permit),
+                None => {
+                    inner.note_dropped(p);
+                    return Ok(());
+                }
             }
+        } else {
+            None
         };
-        // The slot is the queue's now: the receiver gives it back at the take.
+        let policy = if flood_permit.is_some() {
+            WhenFull::Backpressure
+        } else {
+            policy
+        };
+        let Some(permit) = slot(inner, &inner.room[p.index()], policy, p).await? else {
+            drop(flood_permit); // back to the semaphore
+            inner.note_dropped(p);
+            return Ok(());
+        };
+        // The slots are the queue's now: the receiver gives them back at
+        // the take.
         permit.forget();
+        if let Some(fp) = flood_permit {
+            fp.forget();
+        }
         {
             let mut st = inner.state.lock();
-            if matches!(event, Event::FileOpen { .. }) && st.queues.len(p) >= inner.open_cap {
-                // Review #471 B3: the opens' part of P2 is full — the open
-                // is dropped as on a full queue; the slot stays the other
-                // file events'.
+            if counted && st.opens >= inner.open_cap {
+                // Review #471 B3 (second review, R-E: the opens only): the
+                // opens' part of P2 is full — the open is dropped as on a
+                // full queue; the slot stays the other file events'.
                 st.queues.note_dropped(p);
                 drop(st);
                 inner.room[p.index()].add_permits(1);
                 return Ok(());
             }
             let now = inner.now_ns();
+            let floods = p == Priority::P0 && core_bus::floods_p0(&event);
             if st.queues.push(p, now, event).is_err() {
                 // A permit is a slot: never here. Counted, never silent.
                 st.queues.note_dropped(p);
                 drop(st);
                 inner.room[p.index()].add_permits(1);
+                if floods {
+                    inner.p0_flood_room.add_permits(1);
+                }
                 debug_assert!(false, "a send held a slot of a full queue");
                 return Ok(());
+            }
+            if counted {
+                st.opens += 1;
+                inner.opens_hint.store(st.opens, Ordering::Relaxed);
             }
         }
         inner.ready.notify_one();
         Ok(())
+    }
+
+    /// Second review of #471: whether the opens' cap leaves room for one
+    /// more open — the open-sensor pump asks before it builds one (a hint:
+    /// `send` checks again under the queue's lock).
+    pub fn open_room(&self) -> bool {
+        self.inner.opens_hint.load(Ordering::Relaxed) < self.inner.open_cap
+    }
+
+    /// An open the pump dropped on [`Self::open_room`]: counted as P2's.
+    pub fn note_open_dropped(&self) {
+        self.inner
+            .opens_dropped_early
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// The bus's counts.
@@ -293,11 +533,12 @@ impl Drop for BusReceiver {
         for room in &self.inner.room {
             room.close();
         }
+        self.inner.p0_flood_room.close();
     }
 }
 
 impl BusReceiver {
-    /// The next event: P0 first, then P1–P3 by share; `None` once every
+    /// The next event, by share (P0 far ahead); `None` once every
     /// sender is gone and the queues are empty. Cancel-safe: an event is
     /// taken and returned in one step.
     pub async fn recv(&mut self) -> Option<Received> {
@@ -334,6 +575,11 @@ impl BusReceiver {
         let mut st = inner.state.lock();
         let now = inner.now_ns();
         let taken = st.queues.take(now)?;
+        if counted_open(&taken.item) {
+            st.opens = st.opens.saturating_sub(1);
+            inner.opens_hint.store(st.opens, Ordering::Relaxed);
+        }
+        let floods = taken.priority == Priority::P0 && core_bus::floods_p0(&taken.item);
         let mut overtaken = Vec::new();
         if taken.priority != Priority::P1 {
             st.queues
@@ -345,6 +591,9 @@ impl BusReceiver {
         }
         drop(st);
         inner.room[taken.priority.index()].add_permits(1);
+        if floods {
+            inner.p0_flood_room.add_permits(1);
+        }
         self.in_flight = Some((taken.priority.index(), taken.enqueued_ns));
         Some(Received {
             event: taken.item,
@@ -362,6 +611,7 @@ impl BusReceiver {
         for room in &self.inner.room {
             room.close();
         }
+        self.inner.p0_flood_room.close();
         let st = self.inner.state.lock();
         Priority::ALL.map(|p| st.queues.len(p) as u64)
     }
@@ -414,22 +664,31 @@ pub struct QueueSnapshot {
     pub latency_max_us: Option<u64>,
     /// Decisions counted.
     pub decided: u64,
+    /// Repeated denials counted into the one sent (P0; 0 elsewhere —
+    /// second review of #471, R-A).
+    pub coalesced: u64,
 }
 
 impl BusStats {
     /// Every queue's counts, P0 first.
     pub fn snapshot(&self) -> Vec<QueueSnapshot> {
+        let coalesced = self.0.coalescer.lock().total;
+        let early = self.0.opens_dropped_early.load(Ordering::Relaxed);
         let st = self.0.state.lock();
         Priority::ALL
             .iter()
             .map(|&p| {
                 let i = p.index();
                 let h = &st.latency[i];
+                let mut stats = st.queues.stats(p);
+                if p == Priority::P2 {
+                    stats.dropped += early;
+                }
                 QueueSnapshot {
                     priority: p,
                     capacity: st.queues.capacity(p) as u64,
                     when_full: when_full_text(p, self.0.specs[i].when_full, self.0.open_cap),
-                    stats: st.queues.stats(p),
+                    stats,
                     waited: st.waited[i],
                     send_wait_max_us: st.send_wait_max_ns[i] / 1_000,
                     recent_max_wait_us: st.recent_max_wait_ns[i]
@@ -439,6 +698,7 @@ impl BusStats {
                     latency_p99_us: h.quantile_us(0.99),
                     latency_max_us: (h.count() > 0).then(|| h.max_us()),
                     decided: h.count(),
+                    coalesced: if p == Priority::P0 { coalesced } else { 0 },
                 }
             })
             .collect()
@@ -460,15 +720,16 @@ impl BusStats {
 /// and the opens' part of P2.
 fn when_full_text(p: Priority, w: WhenFull, open_cap: usize) -> String {
     match (p, w) {
-        (Priority::P0, WhenFull::Wait { .. }) => {
-            format!(
-                "{} for FsProtectDenial; other tamper events wait",
-                w.describe()
-            )
-        }
-        (Priority::P2, WhenFull::DropNew) => {
-            format!("drop the new FileOpen (past {open_cap} queued); other file events wait")
-        }
+        (Priority::P0, WhenFull::Wait { .. }) => format!(
+            "{} for FsProtectDenial (repeats within 1 s coalesced); other tamper events wait, \
+             {} slots kept from denials and bpf() calls",
+            w.describe(),
+            core_bus::P0_RESERVE
+        ),
+        (Priority::P2, WhenFull::DropNew) => format!(
+            "drop the new FileOpen (past {open_cap} opens queued); write-opens of CRITICAL/PERSIST \
+             files and other file events wait"
+        ),
         _ => w.describe(),
     }
 }
@@ -755,6 +1016,73 @@ fn record(stats: &BusStats, losses: &BusLosses, why: Sample) {
             .collect();
         let lost: Vec<(&str, u64)> = lost.iter().map(|(n, d)| (n.as_str(), *d)).collect();
         ring_drops::raise_loss(&losses.posture, &lost, "event bus");
+    }
+    if why != Sample::P0Drop {
+        sign_coalesced(stats, losses);
+    }
+}
+
+/// Second review of #471, R-A: the denials coalesced since the last row,
+/// signed — per key (pid, operation, inode) the repeats and their first
+/// and last time, the most repeated first, the rest summed. Nothing while
+/// no audit log is bound (they wait for the next sample).
+fn sign_coalesced(stats: &BusStats, losses: &BusLosses) {
+    let Some(log) = losses.audit.get() else {
+        return;
+    };
+    let (keys, evicted) = stats.0.coalescer.lock().take_pending();
+    let since: u64 = keys.iter().map(|(_, w)| w.repeats).sum::<u64>() + evicted;
+    if since == 0 {
+        return;
+    }
+    let named: Vec<serde_json::Value> = keys
+        .iter()
+        .take(COALESCED_ROW_KEYS)
+        .map(|(k, w)| {
+            serde_json::json!({
+                "pid": k.pid,
+                "operation": w.operation.to_string(),
+                "target_dev": k.dev,
+                "target_ino": k.ino,
+                "repeats": w.repeats,
+                "first_ns": w.first_ns,
+                "last_ns": w.last_ns,
+            })
+        })
+        .collect();
+    let other: u64 = keys
+        .iter()
+        .skip(COALESCED_ROW_KEYS)
+        .map(|(_, w)| w.repeats)
+        .sum::<u64>()
+        + evicted;
+    let total = stats.0.coalescer.lock().total;
+    let draft = crate::audit::AuditEntryDraft {
+        op: COALESCED_AUDIT_OP.to_string(),
+        extra: serde_json::json!({
+            "queue": Priority::P0.label(),
+            "event": "FsProtectDenial",
+            "window_ms": COALESCE_WINDOW_NS / 1_000_000,
+            "repeats_since_last_row": since,
+            "total": total,
+            "keys": named,
+            "other_keys_repeats": other,
+        }),
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: "detected".to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
+    };
+    if let Err(e) = log.lock().append(draft) {
+        warn!(
+            error = format!("{e:#}"),
+            "event-bus coalesced audit entry failed"
+        );
+        // counted again at the next row, without their keys
+        stats.0.coalescer.lock().evicted += since;
     }
 }
 
@@ -1375,16 +1703,32 @@ mod tests {
         .await
     }
 
-    /// Review #471 M1: a rare tamper event (a module load) waits for room
-    /// behind a flood of denials while the loop stands still, and arrives —
-    /// the denials wait their 50 ms and are dropped, it is not.
+    fn sensor_flood(pid: u32) -> Event {
+        Event::SensorFlood {
+            source: nn_model::FloodSource::Listen,
+            pid,
+            uid: 1000,
+            comm: "l".into(),
+            exe: None,
+            held: 10,
+            uid_level: false,
+            timestamp_ns: 0,
+        }
+    }
+
+    /// Review #471 M1, second review R-D: P0 full of denials (a flooder
+    /// refilling it) while the loop stands still — the rare tamper events
+    /// find the reserve at once (a module load; a sensor flood, which the
+    /// network drain carries between its flows: the drain does not stall);
+    /// one past the reserve waits for room and arrives; the denials wait
+    /// their 20 ms and are dropped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_rare_tamper_event_outlasts_a_flood_of_denials() {
         within(async {
             let mut specs = small(20);
-            specs[0].capacity = 4;
+            specs[0].capacity = 8; // a reserve of 2
             let (tx, mut rx) = channel_with(specs);
-            for i in 0..4 {
+            for i in 0..6 {
                 tx.send(denial(i)).await.unwrap();
             }
             let stop = Arc::new(AtomicBool::new(false));
@@ -1401,26 +1745,167 @@ mod tests {
                 })
             };
             tokio::time::sleep(Duration::from_millis(30)).await;
-            let module = {
+            let started = Instant::now();
+            tx.send(module_load(77)).await.unwrap();
+            tx.send(sensor_flood(5)).await.unwrap();
+            assert!(
+                started.elapsed() < Duration::from_millis(15),
+                "the reserve: no wait ({:?})",
+                started.elapsed()
+            );
+            let late = {
                 let tx = tx.clone();
-                tokio::spawn(async move { tx.send(module_load(77)).await })
+                tokio::spawn(async move { tx.send(module_load(78)).await })
             };
             // the loop stands still for 200 ms
             tokio::time::sleep(Duration::from_millis(200)).await;
-            assert!(!module.is_finished(), "it waits for room");
+            assert!(!late.is_finished(), "past the reserve it waits for room");
             assert!(
                 rx.stats().snapshot()[0].stats.dropped >= 3,
                 "denials dropped meanwhile"
             );
-            let mut seen = false;
-            while !seen {
-                let r = rx.recv().await.unwrap();
-                seen = matches!(r.event, Event::ModuleLoad { loader_pid: 77, .. });
+            let mut seen = Vec::new();
+            while seen.len() < 3 {
+                match rx.recv().await.unwrap().event {
+                    Event::ModuleLoad { loader_pid, .. } => seen.push(loader_pid),
+                    Event::SensorFlood { pid, .. } => seen.push(pid),
+                    _ => {}
+                }
             }
-            module.await.unwrap().unwrap();
+            seen.sort_unstable();
+            assert_eq!(seen, [5, 77, 78], "none dropped");
+            late.await.unwrap().unwrap();
             stop.store(true, Ordering::Release);
             drop(rx);
             flood.await.unwrap();
+        })
+        .await
+    }
+
+    /// Second review of #471, R-A: a refused operation repeated by one
+    /// process on one inode is queued once a second and counted into it;
+    /// another process, operation or inode is its own; the repeats are in a
+    /// signed row (count, first and last time) and in the status.
+    #[tokio::test]
+    async fn repeated_denials_are_coalesced_and_signed() {
+        within(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (log, path) = audit_log(dir.path());
+            let (tx, mut rx) = channel();
+            let at = |pid: u32, ino: u64, ts: u64| Event::FsProtectDenial {
+                pid,
+                uid: 0,
+                comm: "chmod".into(),
+                target_dev: 1,
+                target_ino: ino,
+                operation: nn_model::FsProtectOperation::Setattr,
+                timestamp_ns: ts,
+            };
+            for i in 0..1_500u64 {
+                tx.send(at(9, 2, 1_000 + i * 1_000)).await.unwrap(); // 1.5 ms
+            }
+            tx.send(at(10, 2, 2_000)).await.unwrap(); // another process
+            tx.send(at(9, 3, 2_000)).await.unwrap(); // another inode
+            tx.send(at(9, 2, 1_000 + COALESCE_WINDOW_NS)).await.unwrap(); // next window
+            let queued: Vec<(u32, u64, u64)> = std::iter::from_fn(|| rx.try_recv())
+                .map(|r| match r.event {
+                    Event::FsProtectDenial {
+                        pid,
+                        target_ino,
+                        timestamp_ns,
+                        ..
+                    } => (pid, target_ino, timestamp_ns),
+                    e => panic!("{e:?}"),
+                })
+                .collect();
+            assert_eq!(
+                queued,
+                [
+                    (9, 2, 1_000),
+                    (10, 2, 2_000),
+                    (9, 3, 2_000),
+                    (9, 2, 1_000 + COALESCE_WINDOW_NS)
+                ]
+            );
+            let snap = rx.stats().snapshot();
+            assert_eq!((snap[0].stats.enqueued, snap[0].coalesced), (4, 1_499));
+            let losses = BusLosses::default();
+            losses.bind_audit_log(Some(log));
+            record(&rx.stats(), &losses, Sample::Tick);
+            let got = rows(dir.path(), &path, COALESCED_AUDIT_OP);
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert_eq!(got[0]["repeats_since_last_row"], 1_499);
+            assert_eq!(got[0]["keys"][0]["pid"], 9);
+            assert_eq!(got[0]["keys"][0]["repeats"], 1_499);
+            assert_eq!(got[0]["keys"][0]["first_ns"], 2_000);
+            assert_eq!(got[0]["keys"][0]["last_ns"], 1_000 + 1_499 * 1_000);
+            record(&rx.stats(), &losses, Sample::Tick);
+            assert_eq!(
+                rows(dir.path(), &path, COALESCED_AUDIT_OP).len(),
+                1,
+                "nothing new"
+            );
+        })
+        .await
+    }
+
+    /// Second review of #471, R-E: the opens' cap counts the opens — a
+    /// P2 full of other file events up to the cap still takes an open; a
+    /// write-open of a PERSIST file waits for room and is not capped; the
+    /// pump's early check sees the cap and its drops are P2's.
+    #[tokio::test]
+    async fn the_opens_cap_counts_the_opens_only() {
+        within(async {
+            let (tx, rx) = channel();
+            let mass = |pid: u32| Event::MassWrite {
+                pid,
+                uid: 0,
+                comm: "w".into(),
+                count: 64,
+                filename: "/srv/x".into(),
+                timestamp_ns: 0,
+                overwrites: true,
+                cgroup_window: false,
+            };
+            for i in 0..core_bus::FILE_OPEN_SHARE as u32 {
+                tx.send(mass(i)).await.unwrap();
+            }
+            let write_open = |kernel_class: u32| Event::FileOpen {
+                pid: 7,
+                uid: 0,
+                gid: 0,
+                comm: "sh".into(),
+                filename: "/etc/cron.d/x".into(),
+                flags: 1,
+                timestamp_ns: 0,
+                path_from_user: false,
+                kernel_class,
+            };
+            use common::wire::open_sensor::open_reason;
+            tx.send(write_open(open_reason::PERSIST)).await.unwrap();
+            tx.send(open(1)).await.unwrap();
+            let snap = rx.stats().snapshot();
+            assert_eq!(snap[2].stats.enqueued, core_bus::FILE_OPEN_SHARE as u64 + 2);
+            assert_eq!(snap[2].stats.dropped, 0);
+            for i in 2..core_bus::FILE_OPEN_SHARE as u32 + 10 {
+                tx.send(open(i)).await.unwrap();
+            }
+            let snap = rx.stats().snapshot();
+            assert_eq!(
+                (snap[2].stats.enqueued, snap[2].stats.dropped),
+                (2 * core_bus::FILE_OPEN_SHARE as u64 + 1, 9),
+                "the cap is the opens'"
+            );
+            assert!(!tx.open_room());
+            tx.send(write_open(open_reason::CRITICAL)).await.unwrap();
+            tx.note_open_dropped();
+            let snap = rx.stats().snapshot();
+            assert_eq!(
+                snap[2].stats.enqueued,
+                2 * core_bus::FILE_OPEN_SHARE as u64 + 2,
+                "past the cap"
+            );
+            assert_eq!(snap[2].stats.dropped, 10, "the pump's early drop is P2's");
         })
         .await
     }

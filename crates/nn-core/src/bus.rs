@@ -6,8 +6,9 @@
 //! class held every other class back, and while the queue was full the
 //! kernel dropped the next records of every ring (plan §1.5: a `file_open`
 //! flood made the `fs_protect` denials lost). R12a gives each class of
-//! events ([`nn_model::EventClass`]) a queue of its own, drained by strict
-//! priority with aging, FIFO inside a class, with a loss counter per class.
+//! events ([`nn_model::EventClass`]) a queue of its own, drained by weighted
+//! shares (tamper far ahead, never alone), FIFO inside a class, with a loss
+//! counter per class.
 //! This module is the bus's portable half: which class an event is
 //! ([`class_of`], an exhaustive match: a new variant does not compile until
 //! it is placed), each class's priority and queue ([`Priority`],
@@ -33,9 +34,11 @@ use nn_model::{CanaryAccessKind, Event, EventClass, ProcessKey};
 
 /// A priority of the bus; [`Priority::P0`] is drained first. Plan §3.4:
 /// tamper (with the sensors' health) at P0, a process's life at P1, files at
-/// P2, the network at P3. P0 is strict; P1–P3 share what P0 leaves by
-/// weight ([`SHARE_WEIGHTS`], review #471 A2: the plan's aging gave a
-/// lower class one take in 65 under a higher class's flood).
+/// P2, the network at P3. Every queue is taken by its weight
+/// ([`SHARE_WEIGHTS`]): P0 far ahead, never alone (review #471 A2: the
+/// plan's aging gave a lower class one take in 65 under a higher class's
+/// flood; R-A of its second review: a strict P0 gave them none while a
+/// flood kept P0 full).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Priority {
     P0,
@@ -225,13 +228,57 @@ pub const SPECS: [QueueSpec; QUEUES] = [
 ///   (inode denials have no kernel budget); while the loop stands still
 ///   those wait 50 ms and are dropped, and the rare one queues behind them
 ///   instead of being dropped with them.
+///
+/// And (second review of #471, R-E) a `FileOpen` that writes a file the
+/// kernel classes CRITICAL or PERSIST ([`guarded_write_open`]): rare (only
+/// who may write the file opens it so), and what a flood of reads must not
+/// hide — it waits for room like the FIM records, outside the opens' cap.
 pub fn when_full(event: &Event) -> WhenFull {
     match Priority::of_event(event) {
         Priority::P0 if !matches!(event, Event::FsProtectDenial { .. }) => WhenFull::Backpressure,
-        Priority::P2 if !matches!(event, Event::FileOpen { .. }) => WhenFull::Backpressure,
+        Priority::P2 if !matches!(event, Event::FileOpen { .. }) || guarded_write_open(event) => {
+            WhenFull::Backpressure
+        }
         p => p.spec().when_full,
     }
 }
+
+/// Second review of #471, R-E: a `FileOpen` for writing (`O_WRONLY` or
+/// `O_RDWR`) of a file the kernel's open sensor classes CRITICAL or PERSIST
+/// (its `kernel_class`: a system binary, a unit, a cron or profile file) —
+/// a write-open that waits for room and is not counted in the opens' cap.
+pub fn guarded_write_open(event: &Event) -> bool {
+    use common::wire::open_sensor::open_reason;
+    match event {
+        Event::FileOpen {
+            flags,
+            kernel_class,
+            ..
+        } => {
+            matches!(flags & 0b11, 1 | 2)
+                && kernel_class & (open_reason::CRITICAL | open_reason::PERSIST) != 0
+        }
+        _ => false,
+    }
+}
+
+/// Second review of #471, R-A/R-D: the tamper events a process can repeat
+/// at will — a refused operation on a protected inode (root; no kernel
+/// budget) and a `bpf()` call (on 6.x the LSM hook runs before the
+/// permission checks: any user, one record per new process and command a
+/// second). They share P0 but for [`P0_RESERVE`] slots, so the rare ones
+/// (a module load, an exploit post-condition, a signal to a security tool,
+/// a sensor flood — the last two carried by pumps of other classes) never
+/// wait behind them.
+pub fn floods_p0(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::FsProtectDenial { .. } | Event::BpfSyscall { .. }
+    )
+}
+
+/// The P0 slots only the rare tamper events take ([`floods_p0`]).
+pub const P0_RESERVE: usize = 64;
 
 /// Review #471 B3: the most `FileOpen`s the file queue holds (a quarter
 /// of it). Past it a new open is dropped as on a full queue; the rest of
@@ -241,18 +288,29 @@ pub fn when_full(event: &Event) -> WhenFull {
 /// them four times longer) and never makes the FIM drain wait for room.
 pub const FILE_OPEN_SHARE: usize = 2048;
 
-/// Review #471 A2: what P1, P2 and P3 get of the takes P0 leaves, while
-/// they all hold events — 2 : 1 : 1 (P0's weight is unused: it is strict).
-/// Work-conserving: a class with nothing queued gives its turns to the
-/// others. Under a flood of any one lower class the other two keep at
-/// least a quarter of the consumer each (P1 half): at EXP-13's ~7,000
-/// decisions a second, ≥ 1,750 network events a second against a file
-/// flood (≥ 3,500 with no exec load), where the plan's aging gave one take
-/// in 65 (~110 a second) and the network queue dropped past it. P1 has the
-/// larger share: an exec is the lineage every later event of its process
-/// is judged on, and the exec quarantine holds a process until its exec is
-/// judged.
-pub const SHARE_WEIGHTS: [i64; QUEUES] = [0, 2, 1, 1];
+/// What each queue gets of the takes while every queue holds events:
+/// 8 : 2 : 1 : 1 (a smooth weighted round robin, work-conserving: a queue
+/// with nothing queued gives its turns to the others and banks none).
+///
+/// - P0 two thirds when every queue is busy, more when fewer are (8/9
+///   against one other): a tamper burst is still taken first — its first
+///   event within a take or two — and drained at ≥ 2/3 of the consumer,
+///   ~4,700 a second at EXP-13's ~7,000 decisions a second. Second review
+///   of #471, R-A: a strict P0 gave the other classes nothing while a flood
+///   kept it full — a root loop of refused `chmod`s, or any user's
+///   `fork` + `bpf()` loop (the rare P0 sources wait for room since M1, so
+///   their pumps refill P0 at each freed slot). Now P1 keeps 1/6 and P2, P3
+///   1/12 each in the worst case (all four flooded: ~1,170 execs and ~580
+///   file and network events a second); against a P0 flood alone, P3 keeps
+///   1/9 (~780 a second).
+/// - Among P1–P3 the review #471 A2 shares stand: 2 : 1 : 1, a quarter each
+///   to P2 and P3 under a flood of the other lower classes (≥ 1,750 network
+///   events a second against a file flood, ≥ 3,500 with no exec load, where
+///   the plan's aging gave one take in 65, ~110 a second). P1 has the
+///   larger share: an exec is the lineage every later event of its process
+///   is judged on, and the exec quarantine holds a process until its exec
+///   is judged.
+pub const SHARE_WEIGHTS: [i64; QUEUES] = [8, 2, 1, 1];
 
 /// One event taken from the bus, with where and how long it waited.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,8 +346,8 @@ pub struct QueueStats {
     pub ahead: u64,
 }
 
-/// The bus's queues, one per [`Priority`], and their take order: P0 strict,
-/// P1–P3 by weighted shares ([`SHARE_WEIGHTS`]), FIFO inside a queue. Bounded: a push to a full
+/// The bus's queues, one per [`Priority`], and their take order: by
+/// weighted shares ([`SHARE_WEIGHTS`]), P0 far ahead, FIFO inside a queue. Bounded: a push to a full
 /// queue gives the event back (the runtime then waits or drops it, as its
 /// [`WhenFull`] says, and counts the drop with [`Self::note_dropped`]).
 /// Pure: the caller passes the time.
@@ -345,20 +403,17 @@ impl<T> ClassQueues<T> {
         self.stats[p.index()].dropped += 1;
     }
 
-    /// The next event: P0's while it holds one; else the turn of the
-    /// queues P1–P3 that hold events, by the smooth weighted round robin
-    /// of [`SHARE_WEIGHTS`] (each adds its weight, the largest total is
-    /// taken and pays the sum back; the higher queue on a tie). FIFO inside
-    /// a queue.
+    /// The next event: the turn of the queues that hold events, by the
+    /// smooth weighted round robin of [`SHARE_WEIGHTS`] (each adds its
+    /// weight, the largest total is taken and pays the sum back; the higher
+    /// queue on a tie). FIFO inside a queue.
     pub fn take(&mut self, now_ns: u64) -> Option<Taken<T>> {
         let top = (0..QUEUES).find(|&i| !self.queues[i].is_empty())?;
-        let pick = if top == Priority::P0.index() {
-            top
-        } else {
+        let pick = {
             let mut total = 0;
             let mut best = top;
-            let lower = self.queues.iter().zip(&mut self.credit).zip(SHARE_WEIGHTS);
-            for ((queue, credit), weight) in lower.skip(1) {
+            let all = self.queues.iter().zip(&mut self.credit).zip(SHARE_WEIGHTS);
+            for ((queue, credit), weight) in all {
                 if queue.is_empty() {
                     *credit = 0;
                 } else {
@@ -650,9 +705,9 @@ mod tests {
         }
     }
 
-    /// FIFO inside a queue; P0 first; then P1–P3 by their shares — P1's
-    /// two turns in four, P2's and P3's one each, an empty queue's turns to
-    /// the others (the higher on a tie).
+    /// FIFO inside a queue; P0 first (its weight); then P1–P3 by their
+    /// shares — P1's two turns in four, P2's and P3's one each, an empty
+    /// queue's turns to the others (the higher on a tie).
     #[test]
     fn takes_are_fifo_in_a_queue_p0_first_then_by_share() {
         let mut q = ClassQueues::new([8; QUEUES]);
@@ -669,10 +724,11 @@ mod tests {
         assert_eq!(q.stats(p(2)).ahead, 0);
     }
 
-    /// P0 is strict: a flood of it is taken whole before any other class,
-    /// and no take of it counts as ahead.
+    /// Second review of #471, R-A: P0 is far ahead but never alone — a
+    /// flood of it leaves a waiting exec and a waiting network event their
+    /// turns within the first takes (8 : 2 : 1 of 11 here), P0 in its order.
     #[test]
-    fn p0_is_strict() {
+    fn p0_is_first_but_never_alone() {
         let mut q = ClassQueues::new([1000; QUEUES]);
         q.push(p(3), 0, ("n", 0)).unwrap();
         q.push(p(1), 0, ("p", 0)).unwrap();
@@ -681,16 +737,46 @@ mod tests {
         }
         let order: Vec<(&str, u64)> =
             std::iter::from_fn(|| q.take(1_000).map(|t| t.item)).collect();
-        assert!(order[..300].iter().all(|(c, _)| *c == "t"));
-        assert_eq!(order[300..], [("p", 0), ("n", 0)]);
-        for pr in Priority::ALL {
-            assert_eq!(q.stats(pr).ahead, 0, "{pr:?}");
+        assert_eq!(order[0], ("t", 0), "a tamper event first");
+        let at = |c: &str| order.iter().position(|(k, _)| *k == c).unwrap();
+        assert!(at("p") < 6, "the exec within the first takes: {}", at("p"));
+        assert!(at("n") < 11, "the network event too: {}", at("n"));
+        let tampers: Vec<u64> = order
+            .iter()
+            .filter(|(k, _)| *k == "t")
+            .map(|(_, i)| *i)
+            .collect();
+        assert_eq!(tampers, (0..300).collect::<Vec<_>>(), "FIFO");
+        assert_eq!(
+            q.stats(p(1)).ahead + q.stats(p(3)).ahead,
+            2,
+            "both taken ahead of P0"
+        );
+    }
+
+    /// Every queue flooded: every window of twelve takes is 8 of P0, 2 of
+    /// P1, 1 of P2, 1 of P3 (the floor holds at every point, R-A).
+    #[test]
+    fn under_a_p0_flood_every_class_keeps_its_share() {
+        let mut q = ClassQueues::new([10_000; QUEUES]);
+        for i in 0..2_400u32 {
+            for c in 0..QUEUES {
+                q.push(p(c), u64::from(i), i).unwrap();
+            }
+        }
+        let taken: Vec<usize> = (0..2_400)
+            .map(|_| q.take(10_000).unwrap().priority.index())
+            .collect();
+        for w in taken.chunks(12) {
+            let n = |c| w.iter().filter(|pr| **pr == c).count();
+            assert_eq!((n(0), n(1), n(2), n(3)), (8, 2, 1, 1), "{w:?}");
         }
     }
 
-    /// With P1, P2 and P3 all holding events, every window of four takes
-    /// is two of P1, one of P2, one of P3, each queue FIFO (review #471
-    /// A2: the share is a floor at every point, not on average).
+    /// With P1, P2 and P3 all holding events (P0 empty), every window of
+    /// four takes is two of P1, one of P2, one of P3, each queue FIFO
+    /// (review #471 A2: the share is a floor at every point, not on
+    /// average).
     #[test]
     fn the_shares_hold_in_every_window_of_four_takes() {
         let mut q = ClassQueues::new([1000; QUEUES]);
@@ -809,6 +895,70 @@ mod tests {
         );
     }
 
+    /// Second review of #471, R-A, as a simulation: P0 kept full (a root
+    /// `chmod` loop, a `fork` + `bpf()` loop), the opens flooding P2, execs
+    /// flooding P1 or not, the network at a fraction of the takes. With a
+    /// strict P0 the network got no take at all; now it keeps 1/10 of the
+    /// consumer (1/12 with P1 flooded too) and drops nothing below it.
+    #[test]
+    fn a_tamper_flood_leaves_the_other_classes_their_share() {
+        const TAKES: u64 = 120_000;
+        let run = |p1_flood: bool, every: u64| {
+            let mut q = ClassQueues::with_specs();
+            let (mut arrived, mut net, mut dropped, mut max_wait) = (0u64, 0u64, 0u64, 0u64);
+            let mut execs = 0u64;
+            for now in 0..TAKES {
+                for c in [0, 2] {
+                    while q.len(p(c)) < q.capacity(p(c)) {
+                        q.push(p(c), now, 0u8).unwrap();
+                    }
+                }
+                while p1_flood && q.len(p(1)) < q.capacity(p(1)) {
+                    q.push(p(1), now, 1).unwrap();
+                }
+                if now % every == 0 {
+                    arrived += 1;
+                    if q.push(p(3), now, 3).is_err() {
+                        dropped += 1;
+                    }
+                }
+                let t = q.take(now).unwrap();
+                match t.item {
+                    3 => {
+                        net += 1;
+                        max_wait = max_wait.max(t.waited_ns);
+                    }
+                    1 => execs += 1,
+                    _ => {}
+                }
+            }
+            (arrived, net, dropped, max_wait, execs)
+        };
+        for every in [100, 20, 10] {
+            let (arrived, net, dropped, max_wait, _) = run(false, every);
+            assert_eq!(dropped, 0, "1/{every}: {dropped} dropped");
+            assert!(arrived - net <= 1, "1/{every}: {net} of {arrived}");
+            // a network event waits at most about one round of the shares
+            assert!(max_wait <= 12, "1/{every}: waited {max_wait} takes");
+        }
+        for every in [100, 20, 12] {
+            let (arrived, net, dropped, max_wait, execs) = run(true, every);
+            assert_eq!(dropped, 0, "P1 flooded, 1/{every}: {dropped} dropped");
+            assert!(
+                arrived - net <= 1,
+                "P1 flooded, 1/{every}: {net} of {arrived}"
+            );
+            assert!(
+                max_wait <= 14,
+                "P1 flooded, 1/{every}: waited {max_wait} takes"
+            );
+            assert!(
+                execs >= TAKES / 6 - 1,
+                "the execs keep their sixth: {execs}"
+            );
+        }
+    }
+
     /// A full queue gives the event back; the counts follow the queue.
     #[test]
     fn a_full_queue_refuses_and_counts() {
@@ -915,6 +1065,48 @@ mod tests {
         };
         assert_eq!(class_of(&module), EventClass::Tamper);
         assert_eq!(when_full(&module), WhenFull::Backpressure);
+        assert!(floods_p0(&denial) && !floods_p0(&module));
+        let bpf = Event::BpfSyscall {
+            pid: 1,
+            uid: 1000,
+            comm: String::new(),
+            cmd: 0,
+            arg: 0,
+            timestamp_ns: 0,
+        };
+        assert!(floods_p0(&bpf));
+        assert_eq!(when_full(&bpf), WhenFull::Backpressure);
+        // second review, R-E: a write-open of a CRITICAL or PERSIST file
+        // waits for room; a read of it, or a write of another file, is an
+        // open a full P2 drops
+        use common::wire::open_sensor::open_reason;
+        let open_of = |flags: u32, kernel_class: u32| Event::FileOpen {
+            pid: 1,
+            uid: 0,
+            gid: 0,
+            comm: String::new(),
+            filename: "/etc/cron.d/x".into(),
+            flags,
+            timestamp_ns: 0,
+            path_from_user: false,
+            kernel_class,
+        };
+        for (flags, class, waits) in [
+            (1, open_reason::PERSIST, true),
+            (2 | 0o100, open_reason::CRITICAL, true),
+            (0, open_reason::PERSIST, false),
+            (1, open_reason::SENSITIVE, false),
+            (1, open_reason::PROBE, false),
+        ] {
+            let e = open_of(flags, class);
+            assert_eq!(guarded_write_open(&e), waits, "{flags:o} {class}");
+            let want = if waits {
+                WhenFull::Backpressure
+            } else {
+                WhenFull::DropNew
+            };
+            assert_eq!(when_full(&e), want, "{flags:o} {class}");
+        }
         let listener = Event::NetListener(nn_model::telemetry::NetListenerEvent {
             timestamp_ns: 0,
             family: 2,

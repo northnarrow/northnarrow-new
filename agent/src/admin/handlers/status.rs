@@ -153,6 +153,7 @@ fn event_bus_status(
                 waited: q.waited,
                 send_wait_max_us: q.send_wait_max_us,
                 ahead: q.stats.ahead,
+                coalesced: q.coalesced,
                 decided: q.decided,
                 latency_p50_us: q.latency_p50_us,
                 latency_p99_us: q.latency_p99_us,

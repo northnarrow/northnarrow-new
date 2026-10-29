@@ -2322,6 +2322,77 @@ mod tests {
     /// again later answers with the image it ran then — its identity, its
     /// image, its walk — and one whose only cached exec is later answers
     /// "not known", never `/proc`'s later image; without a scope, now.
+    /// Second review of #471 (R-B): the history is three execs deep — an
+    /// event followed by three more execs of its process is still judged on
+    /// its own image; by four, "not known" (an exemption then does not
+    /// apply, fail-closed; a rule that wants a positive image does not fire
+    /// — the open R-B follow-up).
+    #[test]
+    fn the_history_is_three_execs_deep() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        t.ingest_exec(4500, 1, "/tmp/.x/stager", &[], 10 * S, 9 * S, 1000);
+        for (i, exe) in ["/usr/bin/a", "/usr/bin/b", "/usr/bin/c"]
+            .iter()
+            .enumerate()
+        {
+            t.ingest_exec(4500, 1, exe, &[], (20 + 10 * i as u64) * S, 9 * S, 1000);
+        }
+        assert_eq!(
+            t.image_path_at(4500, 15 * S).as_deref(),
+            Some("/tmp/.x/stager")
+        );
+        assert_eq!(t.image_path_at(4500, 25 * S).as_deref(), Some("/usr/bin/a"));
+        t.ingest_exec(4500, 1, "/usr/bin/d", &[], 50 * S, 9 * S, 1000);
+        assert_eq!(t.image_path_at(4500, 15 * S), None, "four later: not known");
+        assert_eq!(t.image_path_at(4500, 25 * S).as_deref(), Some("/usr/bin/a"));
+    }
+
+    /// Second review of #471 (R2, R3): the time a judgement is scoped to is
+    /// the event's own — a FIM record's (the canary detector makes a file
+    /// canary's trip from it, judged in the same scope: the reader
+    /// exemption), a flow's start (NET-008's image fallback) — not "now",
+    /// which a later exec of the process has moved.
+    #[test]
+    fn a_fim_record_and_a_flow_are_judged_as_of_their_own_time() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        t.ingest_exec(4600, 1, "/usr/bin/cat", &[], 10 * S, 9 * S, 1000);
+        t.ingest_exec(4600, 1, "/usr/bin/restic", &[], 30 * S, 9 * S, 1000);
+        let fim: nn_model::telemetry::FimEvent = serde_json::from_value(serde_json::json!({
+            "timestamp_ns": 20 * S, "path": "/home/u/.ssh/id_backup", "op": 6,
+            "new_sha256": null, "baseline_sha256": null, "modifier_exe": null,
+            "modifier_pid": 4600, "modifier_uid": 1000, "modifier_comm": "cat"
+        }))
+        .unwrap();
+        let fim = Event::Fim(fim);
+        let readers = crate::canary::readers::CanaryReaders::new(Default::default(), t.clone());
+        assert_eq!(
+            readers.reader(4600).as_deref(),
+            Some("/usr/bin/restic"),
+            "now: the later exec"
+        );
+        assert_eq!(
+            judged_at(event_time_ns(&fim), || readers.reader(4600)),
+            None,
+            "the trip from the FIM record: cat read it, no reader"
+        );
+        let mut flow: nn_model::telemetry::NetFlowEvent = serde_json::from_value(serde_json::json!({
+            "start_ns": 20 * S, "end_ns": 21 * S, "family": 2, "src_addr": "10.0.2.15",
+            "src_port": 40000, "dst_addr": "100.64.20.9", "dst_port": 443, "proto": 6,
+            "pid": 4600, "uid": 1000, "comm": "cat", "exe": null, "proc_start_ns": 9 * S,
+            "bytes_sent": 1, "bytes_recv": 1, "resolved_hostname": null, "tls_fingerprint": null,
+            "flow_id": "f", "phase": "connect"
+        }))
+        .unwrap();
+        flow.observed_ns = 25 * S;
+        let flow = Event::NetFlow(flow);
+        assert_eq!(
+            judged_at(event_time_ns(&flow), || t.image_path(4600)).as_deref(),
+            Some("/usr/bin/cat")
+        );
+    }
+
     /// Review #471 A1, a pid reused: the exec of the process the pid had
     /// before answers for a time before the current process started, never
     /// for a time the current one already ran (forked, not yet exec'd).
