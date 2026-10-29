@@ -234,6 +234,10 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
 
 - **R12b** — the decision thread without `await`: `exe_identity::resolve`
   in the pumps (the bus's receiver does it for the execs it hands over),
+  the ring pumps on threads of their own (EXP-13c, review #471: on a guest
+  the flood saturates, the `fs_protect`, FIM and open-sensor rings fell
+  behind in two of four runs while P0's sends waited at most 3.4 ms — the
+  pumps short of CPU, not the bus),
   the systemd state as a snapshot, `close_if_expired` on a tick, the canary
   append through the writer's queue, a cache of `PackageOwnership` for
   module provenance; the decision delay per class (stage 5) against a
