@@ -832,6 +832,58 @@ impl Cli {
         })
     }
 
+    /// Lab PR 265 (review #466 F4-bis): the chains whose signed rows say
+    /// that this install had a signing identity — the audit log, the
+    /// chains the agent anchors, the FIM baseline and the listener log —
+    /// with the key's name and the install's id
+    /// (`boot::checks::signing_identity`).
+    pub(crate) fn identity_paths(&self) -> northnarrow_agent::boot::continuity::IdentityPaths {
+        let p = self.chain_paths();
+        northnarrow_agent::boot::continuity::IdentityPaths {
+            signing_key: self.signing_key_file.clone(),
+            agent_id: self.agent_id_file.clone(),
+            chains: vec![
+                p.audit,
+                p.canary_registry,
+                p.canary_access,
+                p.detections,
+                p.status_events,
+                p.netflow,
+                p.fim_drift,
+                self.fim_baseline_file.clone(),
+                self.netflow_listeners_file.clone(),
+            ],
+        }
+    }
+
+    /// Lab PR 265 (review #466 F4-bis): the directories of the files that
+    /// make this agent — its key, identity, administrators' keys, install
+    /// manifest, head anchor and chains — for `boot::checks::agent_mounts`,
+    /// which adds `/etc/northnarrow` and `/var/lib/northnarrow` itself.
+    pub(crate) fn state_dirs(&self) -> Vec<PathBuf> {
+        let heads = self.resolved_chain_heads_file();
+        let ids = self.identity_paths();
+        let mut files: Vec<&std::path::Path> = vec![
+            &self.signing_key_file,
+            &self.agent_id_file,
+            &self.admin_pub,
+            &self.install_manifest,
+            &heads,
+        ];
+        files.extend(ids.chains.iter().map(PathBuf::as_path));
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for f in files {
+            let d = match f.parent() {
+                Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+        dirs
+    }
+
     /// The chains the agent anchors, at the configured paths.
     pub(crate) fn chain_paths(&self) -> northnarrow_agent::chains::ChainPaths {
         northnarrow_agent::chains::ChainPaths {

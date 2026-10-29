@@ -81,6 +81,14 @@ impl AgentSigningKey {
     /// read to a bound ([`read_key_file`]) — a bind mount of `/dev/null`, a
     /// device or a FIFO over the name is an error (the start refuses), not
     /// an empty key —, and no error quotes its content.
+    ///
+    /// Lab PR 265 (review #466 F4-bis): an absent key whose public half is
+    /// beside its name (`agent.sig.pub`) is not minted either: it was
+    /// removed or is hidden, and a new key would publish its own half over
+    /// the old one and restart every chain under another identity. The
+    /// start's `boot::checks::signing_identity` refuses it before any load
+    /// (on the rest of the evidence too: the install's id, signed rows);
+    /// this keeps every other caller from minting one.
     pub fn load_or_bootstrap(path: &Path) -> Result<Self> {
         match read_key_file(path) {
             Ok(content) => {
@@ -103,6 +111,16 @@ impl AgentSigningKey {
                 Ok(key)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let public = verifying_key_path(path);
+                if fs::symlink_metadata(&public).is_ok() {
+                    return Err(anyhow!(
+                        "agent signing key {} is absent but its public half {} is there: the key \
+                         was removed or is hidden (a mount over its directory?) — refusing to mint \
+                         a new one, which would restart every chain under another identity",
+                        path.display(),
+                        public.display()
+                    ));
+                }
                 let key = mint_signing_key()?;
                 persist_signing_key_atomically(path, &key)?;
                 info!(
@@ -418,6 +436,38 @@ mod tests {
         // regeneration that would invalidate the audit log.
         let after = fs::read_to_string(&key_path).unwrap();
         assert_eq!(after, "definitely not hex\n");
+    }
+
+    /// Lab PR 265 (review #466 F4-bis): an absent key beside its public half
+    /// is an error, and nothing is written; without the public half it is
+    /// minted (a first boot), and the public half published.
+    #[test]
+    fn an_absent_key_beside_its_public_half_is_not_minted() {
+        let (dir, key_path, _) = fresh_paths();
+        let first = AgentSigningKey::load_or_bootstrap(&key_path).expect("first boot");
+        let public = verifying_key_path(&key_path);
+        let published = fs::read(&public).unwrap();
+        fs::remove_file(&key_path).unwrap();
+        let err = AgentSigningKey::load_or_bootstrap(&key_path).expect_err("not minted");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to mint"), "{msg}");
+        assert!(!key_path.exists(), "a key was minted");
+        assert_eq!(
+            fs::read(&public).unwrap(),
+            published,
+            "the public half rewritten"
+        );
+        // an empty file at the public half's name counts the same
+        fs::remove_file(&public).unwrap();
+        fs::write(&public, "").unwrap();
+        assert!(AgentSigningKey::load_or_bootstrap(&key_path).is_err());
+        assert!(!key_path.exists());
+        // both gone: a first boot again, a new key
+        fs::remove_file(&public).unwrap();
+        let again = AgentSigningKey::load_or_bootstrap(&key_path).expect("minted");
+        assert_ne!(again.verifying_key(), first.verifying_key());
+        assert_eq!(read_verifying_key(&public).unwrap(), again.verifying_key());
+        drop(dir);
     }
 
     /// R11b (lab PR 262, review #466 F4): what sits at the key's name and is

@@ -10,8 +10,9 @@
 //! caller, the agent's preflight and integrity phases, logs, signs and
 //! refuses on; a check that refuses records nothing.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use super::continuity;
 use super::lsm::{self, BpfLsm, LsmGate};
 use super::{BootOrderError, BootSequence, BootStep};
 use crate::anti_tamper::btf_revalidate::{self, ResolveOutcome};
@@ -27,6 +28,94 @@ pub enum Verdict {
     Passed,
     /// The check refuses the start: why (nothing recorded).
     Refused(String),
+}
+
+/// Lab PR 265 (review #466 F4-bis): no mount at or under the agent's own
+/// directories but a bind of a directory onto itself (the unit's
+/// `ReadWritePaths=`), in the agent's own mount table
+/// ([`continuity::OWN_MOUNTINFO`], [`continuity::mounts_over`]): the
+/// configuration directory and the state directory always (the host's
+/// roots, review #466 F3), and the directories of the files the operator's
+/// configuration names (`configured`: the key's, the audit log's, the
+/// identity's, the chains'). A bind of another directory there, another
+/// filesystem (a tmpfs, a runtime drop-in's `TemporaryFileSystem=`), a
+/// file bound over the key: each hides the files the agent had, and the
+/// start would read, mint and sign in what was laid over them. A mount
+/// above them (a separate `/var`) is not judged. A table that cannot be
+/// read refuses too.
+pub fn agent_mounts(
+    boot: &mut BootSequence,
+    configured: &[&Path],
+) -> Result<Verdict, BootOrderError> {
+    let table = std::fs::read_to_string(continuity::OWN_MOUNTINFO).map_err(|e| e.to_string());
+    let mut dirs: Vec<&Path> = vec![
+        Path::new(crate::anti_tamper::filesystem::CONFIG_DIR),
+        Path::new(crate::anti_tamper::filesystem::STATE_DIR),
+    ];
+    dirs.extend_from_slice(configured);
+    agent_mounts_decided(boot, table, &continuity::spelled(&dirs))
+}
+
+/// [`agent_mounts`] on the table `table` (this crate's tests).
+fn agent_mounts_decided(
+    boot: &mut BootSequence,
+    table: Result<String, String>,
+    dirs: &[PathBuf],
+) -> Result<Verdict, BootOrderError> {
+    let table = match table {
+        Ok(t) => continuity::parse_mountinfo(&t),
+        Err(why) => {
+            return Ok(Verdict::Refused(format!(
+                "{}: {why} — the mounts over the agent's directories cannot be checked",
+                continuity::OWN_MOUNTINFO
+            )))
+        }
+    };
+    if !table.iter().any(|m| m.mount_point == Path::new("/")) {
+        return Ok(Verdict::Refused(format!(
+            "{} names no root mount — the mounts over the agent's directories cannot be checked",
+            continuity::OWN_MOUNTINFO
+        )));
+    }
+    let found = continuity::mounts_over(&table, dirs);
+    if !found.is_empty() {
+        return Ok(Verdict::Refused(format!(
+            "a mount hides the agent's own files: {}. The start would read, mint and sign in what \
+             was laid over them, so it is refused before anything is read or written. Remove the \
+             mount (or the drop-in that makes it: BindPaths=, TemporaryFileSystem=, \
+             BindReadOnlyPaths=); the agent's directories must not be mount points of their own \
+             (a separate /var, or /var/lib, is fine)",
+            found.join("; ")
+        )));
+    }
+    boot.passed(BootStep::AgentMounts)?;
+    Ok(Verdict::Passed)
+}
+
+/// Lab PR 265 (review #466 F4-bis): the agent's signing key is there — in
+/// any form: a key that is not one is the audit check's refusal (review
+/// #466 F4) — or nothing says this install had one
+/// ([`continuity::prior_identity`]: the key's public half, the install's
+/// id, a signed row of the audit chain or of another chain): a first
+/// install, which mints it. A key absent where any of that is found was
+/// removed or is hidden: the start is refused and nothing is minted — a
+/// new key would restart every chain under another identity, with one
+/// INFO line.
+pub fn signing_identity(
+    boot: &mut BootSequence,
+    paths: &continuity::IdentityPaths,
+) -> Result<Verdict, BootOrderError> {
+    if continuity::key_absent(&paths.signing_key) {
+        let evidence = continuity::prior_identity(paths);
+        if !evidence.is_empty() {
+            return Ok(Verdict::Refused(continuity::refusal_detail(
+                &paths.signing_key,
+                &evidence,
+            )));
+        }
+    }
+    boot.passed(BootStep::SigningIdentity)?;
+    Ok(Verdict::Passed)
 }
 
 /// The embedded eBPF object is real and intact
@@ -222,7 +311,9 @@ pub enum AuditOpen {
     /// that could not be minted: no row can be signed. Refused like an
     /// unwritable log unless `NN_AUDIT_ALLOW_UNWRITABLE=1` (review #466 F4:
     /// the start ran unaudited, with only a WARN, until then); the refusal
-    /// is the journal's alone. An absent key is minted, as at a first boot.
+    /// is the journal's alone. An absent key is minted only at a first
+    /// install: where an earlier identity is on record, [`signing_identity`]
+    /// refused the start before (lab PR 265, review #466 F4-bis).
     NoKey(String),
     /// The log cannot be opened: a line before the end is not a row (the
     /// chain is broken), or the file cannot be opened for writing (under
@@ -264,7 +355,8 @@ impl std::fmt::Debug for AuditOpen {
 /// opened with the agent's key at `signing_key` and the start's `agent_id`
 /// ([`crate::audit::AuditLog::open`]: its chain read, a broken one refused).
 /// An unwritable log, one that cannot be opened, or a key that cannot be
-/// loaded (review #466 F4; an absent one is minted) refuses the start unless
+/// loaded (review #466 F4; an absent one is minted, at a first install
+/// only: [`signing_identity`]) refuses the start unless
 /// the process's environment has
 /// [`crate::audit::AUDIT_ALLOW_UNWRITABLE_ENV`]`=1` (read here, review #466
 /// F3).
@@ -827,6 +919,279 @@ mod tests {
         assert!(has(&boot, BootStep::VmlinuxBtf));
     }
 
+    /// The agent's own mount table as the lab guest shows it under the
+    /// unit: `/` and the unit's `ReadWritePaths=` binds, each directory
+    /// onto itself.
+    const SANDBOX: &str = "\
+29 1 252:1 / / ro,relatime shared:1 - ext4 /dev/vda1 rw,discard
+701 29 252:1 /etc/northnarrow /etc/northnarrow rw,relatime shared:1 - ext4 /dev/vda1 rw
+702 29 252:1 /var/lib/northnarrow /var/lib/northnarrow rw,relatime shared:1 - ext4 /dev/vda1 rw
+";
+
+    fn agent_dirs() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from("/etc/northnarrow"),
+            PathBuf::from("/var/lib/northnarrow"),
+        ]
+    }
+
+    /// Lab PR 265 (review #466 F4-bis): the unit's binds and a separate
+    /// `/var` pass and record the step; an empty directory bound over the
+    /// configuration directory, a tmpfs over the state directory, a table
+    /// that cannot be read or names no root refuse and record nothing.
+    #[test]
+    fn a_mount_over_the_agents_directories_refuses_and_records_nothing() {
+        let mut boot = BootSequence::new();
+        assert_eq!(
+            agent_mounts_decided(&mut boot, Ok(SANDBOX.into()), &agent_dirs()).unwrap(),
+            Verdict::Passed
+        );
+        assert!(has(&boot, BootStep::AgentMounts));
+        let var = "\
+29 1 252:1 / / rw - ext4 /dev/vda1 rw
+40 29 252:2 / /var rw - ext4 /dev/vda2 rw
+702 40 252:2 /lib/northnarrow /var/lib/northnarrow rw - ext4 /dev/vda2 rw
+";
+        let mut boot = BootSequence::new();
+        assert_eq!(
+            agent_mounts_decided(&mut boot, Ok(var.into()), &agent_dirs()).unwrap(),
+            Verdict::Passed,
+            "a separate /var is a normal layout"
+        );
+        let hidden = [
+            format!("{SANDBOX}800 701 252:1 /root/empty /etc/northnarrow rw - ext4 /dev/vda1 rw\n"),
+            format!("{SANDBOX}801 702 0:90 / /var/lib/northnarrow rw - tmpfs tmpfs rw\n"),
+        ];
+        for table in hidden {
+            let mut boot = BootSequence::new();
+            let v = agent_mounts_decided(&mut boot, Ok(table), &agent_dirs()).unwrap();
+            assert!(
+                matches!(&v, Verdict::Refused(w) if w.contains("a mount hides the agent's own files")),
+                "{v:?}"
+            );
+            assert!(!has(&boot, BootStep::AgentMounts));
+        }
+        for table in [
+            Err("No such file or directory".to_string()),
+            Ok(String::new()),
+        ] {
+            let mut boot = BootSequence::new();
+            let v = agent_mounts_decided(&mut boot, table, &agent_dirs()).unwrap();
+            assert!(
+                matches!(&v, Verdict::Refused(w) if w.contains("cannot be checked")),
+                "{v:?}"
+            );
+            assert!(!has(&boot, BootStep::AgentMounts));
+        }
+    }
+
+    /// Lab PR 265: the environment variable that makes
+    /// [`mounts_in_a_namespace_of_its_own`] run (inside `unshare -rm`, in
+    /// the directory it names); without it the test does nothing.
+    const MOUNT_NS_ENV: &str = "NN_TEST_K265_MOUNT_NS_DIR";
+
+    /// Lab PR 265 (review #466's nit on the fallback's mount check): the
+    /// check on the real table, `/proc/self/mountinfo`, with real mounts —
+    /// in a user and mount namespace of its own (`unshare -rm`), where an
+    /// unprivileged test may mount. Where the host allows no unprivileged
+    /// user namespace (AppArmor's restriction of them) it says so and
+    /// passes.
+    #[test]
+    fn the_real_mount_table_in_a_namespace_of_its_own() {
+        let probe = std::process::Command::new("unshare")
+            .args(["-rm", "true"])
+            .stdin(std::process::Stdio::null())
+            .output();
+        if !probe.as_ref().is_ok_and(|o| o.status.success()) {
+            eprintln!("no unprivileged user and mount namespace here (unshare -rm): {probe:?}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("unshare")
+            .arg("-rm")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "boot::checks::tests::mounts_in_a_namespace_of_its_own",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(MOUNT_NS_ENV, dir.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("1 passed"), "the helper did not run: {text}");
+        assert!(text.contains("k265 mount namespace: 4 cases"), "{text}");
+    }
+
+    /// The other half of [`the_real_mount_table_in_a_namespace_of_its_own`]:
+    /// inside the namespace, a directory bound onto itself passes; an empty
+    /// directory bound over it, a tmpfs over it, a file bound over a file in
+    /// it are refused, each from `/proc/self/mountinfo`. A no-op without
+    /// [`MOUNT_NS_ENV`].
+    #[test]
+    #[ignore = "run by the_real_mount_table_in_a_namespace_of_its_own, under unshare -rm"]
+    fn mounts_in_a_namespace_of_its_own() {
+        let Some(root) = std::env::var_os(MOUNT_NS_ENV) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let state = root.join("state");
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(state.join("agent.sig.key"), "k\n").unwrap();
+        std::fs::write(root.join("other.key"), "o\n").unwrap();
+        let mount = |args: &[&std::ffi::OsStr]| {
+            let st = std::process::Command::new("mount")
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(st.success(), "mount {args:?}");
+        };
+        let umount = |p: &Path| {
+            let st = std::process::Command::new("umount")
+                .arg(p)
+                .status()
+                .unwrap();
+            assert!(st.success(), "umount {}", p.display());
+        };
+        let check = || {
+            let mut boot = BootSequence::new();
+            let table =
+                std::fs::read_to_string(continuity::OWN_MOUNTINFO).map_err(|e| e.to_string());
+            let v =
+                agent_mounts_decided(&mut boot, table, &continuity::spelled(&[&state])).unwrap();
+            assert_eq!(v == Verdict::Passed, has(&boot, BootStep::AgentMounts));
+            v
+        };
+        assert_eq!(check(), Verdict::Passed, "nothing mounted");
+        mount(&["--bind".as_ref(), state.as_os_str(), state.as_os_str()]);
+        assert_eq!(check(), Verdict::Passed, "a bind onto itself");
+        mount(&["--bind".as_ref(), empty.as_os_str(), state.as_os_str()]);
+        let v = check();
+        assert!(
+            matches!(&v, Verdict::Refused(w) if w.contains("another directory or file bound there")),
+            "{v:?}"
+        );
+        umount(&state);
+        mount(&[
+            "-t".as_ref(),
+            "tmpfs".as_ref(),
+            "k265".as_ref(),
+            state.as_os_str(),
+        ]);
+        let v = check();
+        assert!(
+            matches!(&v, Verdict::Refused(w) if w.contains("another filesystem mounted there")),
+            "{v:?}"
+        );
+        umount(&state);
+        let key = state.join("agent.sig.key");
+        mount(&[
+            "--bind".as_ref(),
+            root.join("other.key").as_os_str(),
+            key.as_os_str(),
+        ]);
+        let v = check();
+        assert!(
+            matches!(&v, Verdict::Refused(w) if w.contains("agent.sig.key (")),
+            "{v:?}"
+        );
+        println!("k265 mount namespace: 4 cases");
+    }
+
+    /// Lab PR 265 (review #466 F4-bis): a fresh directory passes (a first
+    /// install mints its key); the key there passes, whatever else is;
+    /// an absent key where its public half, the install's id or a signed
+    /// row of a chain is found refuses, records nothing and mints nothing.
+    #[test]
+    fn a_key_absent_where_an_identity_was_refuses_and_mints_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = continuity::IdentityPaths {
+            signing_key: dir.path().join("agent.sig.key"),
+            agent_id: dir.path().join("agent_id"),
+            chains: vec![dir.path().join("audit.log")],
+        };
+        let mut boot = BootSequence::new();
+        assert_eq!(
+            signing_identity(&mut boot, &paths).unwrap(),
+            Verdict::Passed
+        );
+        assert!(has(&boot, BootStep::SigningIdentity));
+        // a first boot: the key, its public half, the id, a signed row
+        let key = crate::keys::AgentSigningKey::load_or_bootstrap(&paths.signing_key).unwrap();
+        let id = crate::agent_id::load_or_bootstrap(&paths.agent_id).unwrap();
+        let mut log = crate::audit::AuditLog::open(&dir.path().join("audit.log"), key, id).unwrap();
+        log.boot_probe(
+            None,
+            "no-manifest",
+            "none",
+            &crate::audit::AgentBuild {
+                version: "0.0.0",
+                features: Vec::new(),
+                bpf_guard_enforce: true,
+            },
+        )
+        .unwrap();
+        drop(log);
+        let mut boot = BootSequence::new();
+        assert_eq!(
+            signing_identity(&mut boot, &paths).unwrap(),
+            Verdict::Passed
+        );
+        // the key removed: each piece of evidence alone refuses
+        let secret = std::fs::read(&paths.signing_key).unwrap();
+        std::fs::remove_file(&paths.signing_key).unwrap();
+        let public = crate::keys::verifying_key_path(&paths.signing_key);
+        let saved = |p: &Path| (p.to_path_buf(), std::fs::read(p).unwrap());
+        let evidence = [
+            saved(&public),
+            saved(&paths.agent_id),
+            saved(&dir.path().join("audit.log")),
+        ];
+        for (p, _) in &evidence {
+            std::fs::rename(p, p.with_extension("aside")).unwrap();
+        }
+        for (p, bytes) in &evidence {
+            std::fs::write(p, bytes).unwrap();
+            let mut boot = BootSequence::new();
+            let v = signing_identity(&mut boot, &paths).unwrap();
+            assert!(
+                matches!(&v, Verdict::Refused(w) if w.contains("none is minted")),
+                "{}: {v:?}",
+                p.display()
+            );
+            assert!(!has(&boot, BootStep::SigningIdentity));
+            assert!(!paths.signing_key.exists(), "a key minted");
+            assert_eq!(&std::fs::read(p).unwrap(), bytes, "{}", p.display());
+            std::fs::remove_file(p).unwrap();
+        }
+        // nothing left: a fresh install again
+        let mut boot = BootSequence::new();
+        assert_eq!(
+            signing_identity(&mut boot, &paths).unwrap(),
+            Verdict::Passed
+        );
+        // the key back: passes
+        std::fs::write(&paths.signing_key, &secret).unwrap();
+        for (p, bytes) in &evidence {
+            std::fs::write(p, bytes).unwrap();
+        }
+        let mut boot = BootSequence::new();
+        assert_eq!(
+            signing_identity(&mut boot, &paths).unwrap(),
+            Verdict::Passed
+        );
+    }
+
     /// The proof is given once every check passed, and the attach phase
     /// begins with it: what no other path reaches.
     #[test]
@@ -835,6 +1200,22 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("sys/kernel/security")).unwrap();
         std::fs::write(dir.path().join(lsm::ACTIVE_LSM_REL), "capability,bpf\n").unwrap();
         let mut boot = BootSequence::new();
+        assert_eq!(
+            agent_mounts_decided(&mut boot, Ok(SANDBOX.into()), &agent_dirs()).unwrap(),
+            Verdict::Passed
+        );
+        assert_eq!(
+            signing_identity(
+                &mut boot,
+                &continuity::IdentityPaths {
+                    signing_key: dir.path().join("agent.sig.key"),
+                    agent_id: dir.path().join("agent_id"),
+                    chains: vec![dir.path().join("audit.log")],
+                }
+            )
+            .unwrap(),
+            Verdict::Passed
+        );
         // the eBPF object and the BTF are the host's: decided here as they
         // pass on a host that has them
         boot.passed(BootStep::EbpfObject).unwrap();

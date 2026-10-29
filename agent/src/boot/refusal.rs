@@ -139,7 +139,7 @@ impl Context<'_> {
     /// registration in the pinned `PROTECTED_PIDS`, exit [`EX_CONFIG`]
     /// ([`Self::conclude`]). The gate has logged what it found.
     pub(crate) fn refuse(&self, audit: Option<&mut AuditLog>, refusal: Refusal) -> ! {
-        std::process::exit(self.conclude(audit, refusal, withdraw_registration))
+        exit_refused(self.conclude(audit, refusal, withdraw_registration))
     }
 
     /// What [`Self::refuse`] does before it exits (review #466 F7: the tail
@@ -153,35 +153,67 @@ impl Context<'_> {
         refusal: Refusal,
         withdraw: impl FnOnce(&Path),
     ) -> i32 {
-        let gate = refusal.gate;
-        match sign(self, audit, &refusal) {
-            Signed::AuditLog { entry_hash } => {
-                info!(entry_hash = %entry_hash, gate, "refused boot recorded in the audit chain")
-            }
-            Signed::Fallback {
-                path,
-                entry_hash,
-                audit_log,
-            } => error!(
-                path = %path.display(),
-                entry_hash = %entry_hash,
-                gate,
-                audit_log = %audit_log,
-                "refused boot recorded in the fallback chain: the audit log cannot take it \
-                 (nn-admin audit verify --from <path>)"
-            ),
-            Signed::Unsigned(why) => error!(
-                gate,
-                why = %why,
-                "could not record the refused boot in a signed chain — the journal holds it alone"
-            ),
-        }
-        withdraw(Path::new(
-            northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT,
-        ));
-        error!(gate, exit = EX_CONFIG, "start refused");
-        EX_CONFIG
+        let signed = sign(self, audit, &refusal);
+        finish(refusal.gate, signed, withdraw)
     }
+}
+
+/// Lab PR 265 (review #466 F4-bis): refuse a start that nothing can sign —
+/// the agent's own directories mounted over (a chain opened now would be
+/// in the view the gate refuses), or its key absent where an earlier
+/// identity is on record (signing would mean minting the key the gate
+/// refuses to mint). The gate has logged what it found; the journal holds
+/// the refusal (`why`: why it is not signed), the start's registration in
+/// the pinned `PROTECTED_PIDS` is withdrawn — the preflight refuses these
+/// before the start registers, so there is none to withdraw then, as
+/// [`withdraw_registration`] says —, and the process exits [`EX_CONFIG`],
+/// as every refusal ([`Context::refuse`]).
+pub(crate) fn refuse_unsigned(refusal: Refusal, why: &str) -> ! {
+    exit_refused(conclude_unsigned(refusal, why, withdraw_registration))
+}
+
+/// What [`refuse_unsigned`] does before it exits (the tail a test can run):
+/// the journal's lines, `withdraw`, [`EX_CONFIG`].
+pub(crate) fn conclude_unsigned(refusal: Refusal, why: &str, withdraw: impl FnOnce(&Path)) -> i32 {
+    finish(refusal.gate, Signed::Unsigned(why.to_string()), withdraw)
+}
+
+/// The one exit of a refused start (review #466 F7).
+fn exit_refused(status: i32) -> ! {
+    std::process::exit(status)
+}
+
+/// The tail of every refusal: where it was signed, said in the journal; the
+/// registration withdrawn — always, signed or not —; the status to exit
+/// with, [`EX_CONFIG`].
+fn finish(gate: &'static str, signed: Signed, withdraw: impl FnOnce(&Path)) -> i32 {
+    match signed {
+        Signed::AuditLog { entry_hash } => {
+            info!(entry_hash = %entry_hash, gate, "refused boot recorded in the audit chain")
+        }
+        Signed::Fallback {
+            path,
+            entry_hash,
+            audit_log,
+        } => error!(
+            path = %path.display(),
+            entry_hash = %entry_hash,
+            gate,
+            audit_log = %audit_log,
+            "refused boot recorded in the fallback chain: the audit log cannot take it \
+             (nn-admin audit verify --from <path>)"
+        ),
+        Signed::Unsigned(why) => error!(
+            gate,
+            why = %why,
+            "could not record the refused boot in a signed chain — the journal holds it alone"
+        ),
+    }
+    withdraw(Path::new(
+        northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT,
+    ));
+    error!(gate, exit = EX_CONFIG, "start refused");
+    EX_CONFIG
 }
 
 /// Where a refusal was signed.
