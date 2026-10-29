@@ -842,15 +842,25 @@ pub fn spawn_loss_recorder(stats: BusStats, losses: BusLosses) -> JoinHandle<()>
         tick.tick().await;
         let inner = Arc::clone(&stats.0);
         loop {
-            tokio::select! {
-                _ = tick.tick() => {
-                    record(&stats, &losses, Sample::Tick);
-                    debug!("event-bus loss sample");
+            let why = tokio::select! {
+                _ = tick.tick() => Sample::Tick,
+                () = inner.p0_dropped.notified() => Sample::P0Drop,
+            };
+            // Review #471 B4: the sample can scan /proc (the posture's
+            // package-transaction exemption) and append to the audit log —
+            // off the runtime's workers.
+            // A panic still ends the recorder (the multiplexer's task check
+            // stops the agent, as for a dead pump); a cancel is the stop.
+            let (s, l) = (stats.clone(), losses.clone());
+            if let Err(e) = tokio::task::spawn_blocking(move || record(&s, &l, why)).await {
+                if e.is_panic() {
+                    std::panic::resume_unwind(e.into_panic());
                 }
-                () = inner.p0_dropped.notified() => {
-                    record(&stats, &losses, Sample::P0Drop);
-                    tokio::time::sleep(P0_ROW_EVERY).await;
-                }
+                return;
+            }
+            debug!(?why, "event-bus loss sample");
+            if why == Sample::P0Drop {
+                tokio::time::sleep(P0_ROW_EVERY).await;
             }
         }
     })
