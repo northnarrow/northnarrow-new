@@ -514,7 +514,9 @@ pub enum AuditOpen {
     /// the start ran unaudited, with only a WARN, until then); the refusal
     /// is the journal's alone. An absent key is minted only at a first
     /// install: where an earlier identity is on record, [`signing_identity`]
-    /// refused the start before (lab PR 265, review #466 F4-bis).
+    /// refused the start before (lab PR 265, review #466 F4-bis); a key it
+    /// found there and gone (or another file) at the start's one load is
+    /// this too, never a mint (the review of #468, R4).
     NoKey(String),
     /// The log cannot be opened: a line before the end is not a row (the
     /// chain is broken), or the file cannot be opened for writing (under
