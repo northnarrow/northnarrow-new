@@ -1,7 +1,7 @@
 //! The help texts — every subcommand, found by walking the binary's own
 //! `-h` — and clap's errors.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::fixtures;
 use crate::harness::{Case, BIN};
@@ -18,12 +18,20 @@ struct Node {
 }
 
 fn short_help(path: &[String]) -> String {
-    let out = Command::new(BIN)
-        .args(path)
-        .arg("-h")
-        .env_clear()
-        .output()
-        .expect("nn-admin -h");
+    let child = {
+        // Lab PR 266b: every child is started under `harness::spawning`.
+        let _spawning = crate::harness::spawning();
+        Command::new(BIN)
+            .args(path)
+            .arg("-h")
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("nn-admin -h")
+    };
+    let out = child.wait_with_output().expect("nn-admin -h");
     assert!(out.status.success(), "nn-admin {path:?} -h: {out:?}");
     String::from_utf8(out.stdout).unwrap()
 }

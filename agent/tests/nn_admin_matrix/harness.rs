@@ -7,6 +7,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::mock;
@@ -140,6 +141,38 @@ pub struct Outcome {
     pub text: String,
 }
 
+/// Lab PR 266b: the children this test starts, and the descriptors that
+/// must be closed before a case's nn-admin runs, ordered by one lock.
+///
+/// A child holds a copy of every descriptor of this process from its fork
+/// to its exec (`O_CLOEXEC` closes them only at the exec), and the matrix
+/// starts nn-admin from several threads at once. The listening socket a
+/// refused-connection case binds and closes, or the read end of the pipe a
+/// closed-pipe case closes, could still be open in another thread's child,
+/// between its fork and its exec, when the case's nn-admin connected or
+/// wrote: the connect went into that socket's backlog and was reset when
+/// the copy closed — "Connection reset by peer" instead of "Connection
+/// refused", once in five `cargo xtask golden` runs (lot 265) — and a write
+/// would have found a reader. Starting a child takes the lock shared, from
+/// before its fork to after its exec (`Command::spawn` returns once the
+/// child has exec'd); making and closing such a descriptor takes it
+/// exclusive, so no child of this process is between its fork and its exec
+/// while the descriptor exists. Other descriptors a child may copy (the
+/// mock's listener while it serves, an accepted connection, the parent's
+/// ends of the piped streams) only delay an end of file by that window;
+/// they never change what nn-admin sees.
+static FORKS: RwLock<()> = RwLock::new(());
+
+/// Held while a child is started (fork to exec).
+pub fn spawning() -> RwLockReadGuard<'static, ()> {
+    FORKS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Held while a descriptor no child may copy is made and closed.
+pub fn closing() -> RwLockWriteGuard<'static, ()> {
+    FORKS.write().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The paths nn-admin uses when no flag names another.
 pub const HOST_DEFAULT_DIRS: [&str; 3] = [
     "/etc/northnarrow",
@@ -250,10 +283,18 @@ pub fn run(case: &Case, root: &Path) -> Outcome {
             }
         }
     };
-    cmd.stdout(sink(case.stdout)).stderr(sink(case.stderr));
-    let out = cmd
-        .spawn()
-        .unwrap_or_else(|e| panic!("{}: spawning nn-admin: {e}", case.id))
+    // A closed pipe's read end is closed before any child can copy it.
+    let (stdout, stderr) = {
+        let _closing = closing();
+        (sink(case.stdout), sink(case.stderr))
+    };
+    cmd.stdout(stdout).stderr(stderr);
+    let child = {
+        let _spawning = spawning();
+        cmd.spawn()
+            .unwrap_or_else(|e| panic!("{}: spawning nn-admin: {e}", case.id))
+    };
+    let out = child
         .wait_with_output()
         .unwrap_or_else(|e| panic!("{}: waiting for nn-admin: {e}", case.id));
     let requests = mock.map(|m| m.finish());

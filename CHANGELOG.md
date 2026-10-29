@@ -431,6 +431,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- nn-admin's output matrix no longer flakes on a refused connection (lab
+  PR 266b, found by lab PR 265's golden runs: `sock.net-status-json.
+  refused-connection` read "Connection reset by peer" once in five). A
+  child the test started from another thread held a copy of the case's
+  listener between its fork and its exec, so the connect went into that
+  listener's backlog and was reset when the copy closed. The test now
+  starts every child under one lock, held shared from fork to exec, and
+  makes and closes the listener of a refused connection and the read end
+  of a closed pipe holding it exclusive; the golden files are unchanged
+  (`docs/validation/GOLDEN_REPLAY.md` §8).
+  The matrix 80 times in a row with no failure: 50 beside a fork storm,
+  30 beside a parallel release build.
 - Every integrity check before the eBPF load and the pin, enforced by the
   types, and every refused start signed (lab PR 262, Wave 4 restructure,
   R11b; `docs/operator/BOOT_INTEGRITY.md` §1 and §7). **The map.** Lab PR
