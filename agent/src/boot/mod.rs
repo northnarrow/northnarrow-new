@@ -267,6 +267,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         ransom_tracker,
         defense_detector,
         rule_policy,
+        ja3_entries,
         engine,
     } = policy::load(
         &cli,
@@ -419,6 +420,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             defense_detector: Some(Arc::clone(&defense_detector)),
             cow_guard: Some(combat.cow_guard.clone()),
             overlay_gate: Some(Arc::clone(&overlay_gate)),
+            ja3_entries,
         },
     );
     let tasks::Tasks {
@@ -867,7 +869,8 @@ mod tests {
         let policy = function(src, head);
         assert!(policy.contains("rp::PolicyHandle::new(policy)"));
         assert!(policy.contains(".with_policy(rule_policy.clone())"));
-        assert!(policy.contains("        rule_policy,\n        engine,\n    }\n}"));
+        assert!(policy
+            .contains("        rule_policy,\n        ja3_entries,\n        engine,\n    }\n}"));
         let posture = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/posture.rs"));
         assert_eq!(
             posture
@@ -892,7 +895,7 @@ mod tests {
             let rest = &run[at..];
             rest[..rest.find(");").expect("the call's end")].to_string()
         };
-        assert!(run.contains("rule_policy,engine,}=policy::load("));
+        assert!(run.contains("rule_policy,ja3_entries,engine,}=policy::load("));
         assert!(
             call("=posture::machine(").contains("&rule_policy"),
             "the posture gets the policy phase's handle"

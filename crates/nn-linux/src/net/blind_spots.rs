@@ -295,10 +295,12 @@ pub fn dns_blind_rule(dot: &ResolverDot) -> String {
 /// and the DNS rules blind to the resolver's upstream while
 /// systemd-resolved runs DNS over TLS, read from its configuration at each
 /// call ([`resolver_dns_over_tls`]). R07 (lab PR 247): from `blocklist`,
-/// which keeps the JA3 list's size and its sentence.
-pub fn inactive_net_rules() -> Vec<String> {
+/// which keeps the JA3 list's sentence. `ja3_entries`: the size of the JA3
+/// list the boot loaded (R11c, lab PR 264: the start gives it the admin
+/// socket; it was a process-wide value the start noted).
+pub fn inactive_net_rules(ja3_entries: usize) -> Vec<String> {
     inactive_net_rules_with(
-        crate::net::blocklist::ja3_entries(),
+        ja3_entries,
         crate::net::blocklist::TLS_FINGERPRINT_PRODUCER,
         resolver_dns_over_tls().as_ref(),
     )

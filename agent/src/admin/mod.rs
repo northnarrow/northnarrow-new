@@ -318,6 +318,9 @@ pub struct AdminHandles {
     /// `config overlay set` writes where the next boot reads (`None`: the
     /// default paths; it was a process-wide map every gate filled).
     pub overlay_gate: Option<Arc<crate::config::overlay_auth::OverlayGate>>,
+    /// The JA3 list's size the boot loaded, for the inactive network rules
+    /// (it was a process-wide value the start noted).
+    pub ja3_entries: usize,
 }
 
 /// External audit NN-AUD-082 — the files the read verbs serve, from the

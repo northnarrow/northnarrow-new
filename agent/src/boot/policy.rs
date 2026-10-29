@@ -29,6 +29,9 @@ pub(crate) struct Policy {
     /// socket get (`nn-admin policy set` installs the next policy through
     /// it). It was a process-wide handle the start set.
     pub(crate) rule_policy: northnarrow_agent::decision::rule_policy::PolicyHandle,
+    /// The JA3 list's size, for `net status`'s inactive rules (R11c, lab
+    /// PR 264: it was a process-wide value this phase noted).
+    pub(crate) ja3_entries: usize,
     pub(crate) engine: RuleEngine,
 }
 
@@ -155,8 +158,10 @@ pub(crate) fn load(
     );
     // External audit NET-009 (BUG-025): no sensor produces TLS
     // fingerprints, so a JA3 list with entries protects nothing. Said at
-    // boot, and in the signed chain once the audit log is open (below).
-    northnarrow_agent::net::blocklist::note_ja3_entries(ja3_blocklist.len());
+    // boot, and in the signed chain once the audit log is open (below);
+    // the list's size goes to the admin socket's `net status` (R11c, lab PR
+    // 264: in `Policy`, no longer a process-wide note).
+    let ja3_entries = ja3_blocklist.len();
     let ja3_gap = northnarrow_agent::net::blocklist::ja3_coverage_gap(
         ja3_blocklist.len(),
         northnarrow_agent::net::blocklist::TLS_FINGERPRINT_PRODUCER,
@@ -412,6 +417,7 @@ pub(crate) fn load(
         ransom_tracker,
         defense_detector,
         rule_policy,
+        ja3_entries,
         engine,
     }
 }
