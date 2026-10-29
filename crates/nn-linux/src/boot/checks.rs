@@ -1165,7 +1165,7 @@ mod tests {
     #[test]
     fn a_malformed_line_refuses_only_when_it_may_concern_the_agents_directories() {
         for (line, refused) in [
-            ("900 29 252:1 / /home/x rw - ext4\n", false),
+            ("900 29 252:1 / /home/u/x rw - ext4\n", false),
             ("900 29 252:1 / /etc/northnarrow rw - ext4\n", true),
             (
                 "900 29 252:1 / /var/lib/northnarrow/detections rw ext4 /dev/x rw\n",
