@@ -2043,6 +2043,14 @@ mod tests {
         }
         let order: Vec<u32> = send_order(&batch).map(|r| r.pid).collect();
         assert_eq!(order, [2, 4, 0, 1, 3]);
+        // and the pump sends in that order
+        let pump = include_str!("open_sensor.rs");
+        let pump = &pump[pump.find("pub async fn pump(").unwrap()..];
+        let pump = &pump[..pump.find("\n}\n").unwrap()];
+        assert!(
+            pump.contains("for r in send_order(&batch.records) {"),
+            "{pump}"
+        );
     }
 
     #[test]

@@ -1542,6 +1542,23 @@ mod tests {
         assert_eq!(w.flow_tracker.lock().pending_len(), 1);
         // Without net wiring: the `TcpConnect` alone, as before.
         assert_eq!(connect_events(&raw, None).len(), 1);
+        // Review #471 A1: a later exec of the pid, ingested before the
+        // connect is read, does not name it — the image as of the connect.
+        w.lineage.ingest_spawn(4500, 1, "/usr/sbin/nginx", 20_000);
+        let exe_at = |ts: u64, sk: u64| {
+            let mut r = raw;
+            r.timestamp_ns = ts;
+            r.sk_ptr = sk;
+            match &connect_events(&r, Some(&w))[1] {
+                Event::NetFlow(row) => row.exe.clone(),
+                e => panic!("{e:?}"),
+            }
+        };
+        assert_eq!(
+            exe_at(10_500, 0xbeef).as_deref(),
+            Some("/usr/bin/python3.12")
+        );
+        assert_eq!(exe_at(30_000, 0xcafe).as_deref(), Some("/usr/sbin/nginx"));
     }
 
     /// Lab PR 246: a connect is announced to the flow tracker only once its

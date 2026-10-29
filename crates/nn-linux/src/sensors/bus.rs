@@ -1567,9 +1567,11 @@ mod tests {
             let st = rx.stats();
             let q = |s: &BusStats| s.snapshot()[2].clone();
             assert!(q(&st).recent_max_wait_us >= 4_000, "{:?}", q(&st));
-            st.roll_window();
+            // the recorder's sample rolls the window
+            let losses = BusLosses::default();
+            record(&st, &losses, Sample::Tick);
             assert!(q(&st).recent_max_wait_us >= 4_000, "the last window's");
-            st.roll_window();
+            record(&st, &losses, Sample::Tick);
             assert_eq!(q(&st).recent_max_wait_us, 0, "a window with no take");
             assert!(q(&st).stats.max_wait_ns >= 4_000_000, "since boot");
         })
