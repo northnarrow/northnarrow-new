@@ -353,6 +353,8 @@ pub fn restart_key_findings(
     if !restart {
         return Vec::new();
     }
+    // the binary by its path (`/proc/self/exe` is a link to it)
+    let shown = std::fs::read_link(exe).unwrap_or_else(|_| exe.to_path_buf());
     let mut out = Vec::new();
     let key_dir = signing_key
         .parent()
@@ -363,7 +365,7 @@ pub fn restart_key_findings(
             "this start runs the binary the previous agent protected ({}), a restart of it, but \
              its signing key {} is not in a directory that agent protected: a restart keeps its \
              identity",
-            exe.display(),
+            shown.display(),
             signing_key.display()
         ));
     }
@@ -372,7 +374,7 @@ pub fn restart_key_findings(
             "this start runs the binary the previous agent protected ({}), a restart of it, and \
              its signing key {} is absent: a restart never mints a key (an upgrade, an \
              uninstall and a re-key remove the pins before the key goes)",
-            exe.display(),
+            shown.display(),
             signing_key.display()
         ));
     }
