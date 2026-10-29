@@ -1304,6 +1304,47 @@ mod tests {
         }
     }
 
+    /// Lab PR 267 (R12a): an exec overtaken on the bus gives the ancestry
+    /// tree its edge before it is judged (`observe_arrival`), and judging it
+    /// later keeps what was recorded since; without the process's start it
+    /// is left to the judgment (a second sighting would read as a reuse).
+    #[test]
+    fn an_overtaken_exec_gives_its_edge_first() {
+        let store = Arc::new(Mutex::new(CorrelationStore::new()));
+        let rule = NnLChain002TmpExecThenEgress::new(Arc::clone(&store));
+        let mut child = tmp_spawn(200, 10 * SEC);
+        if let Event::ProcessSpawn {
+            ppid,
+            start_ns,
+            filename,
+            ..
+        } = &mut child
+        {
+            *ppid = 100;
+            *start_ns = 9 * SEC;
+            *filename = "/usr/bin/curl".to_string();
+        }
+        rule.observe_arrival(&child);
+        assert_eq!(store.lock().ancestry().parent_of(200), Some(100));
+        store
+            .lock()
+            .record_for_pid(200, PrecursorKind::CredRead, 11 * SEC);
+        assert!(rule.evaluate(&child).is_none());
+        assert_eq!(store.lock().ancestry().parent_of(200), Some(100));
+        assert!(
+            store.lock().has_recent_for_pid(
+                200,
+                PrecursorKind::CredRead,
+                12 * SEC,
+                CORRELATION_WINDOW_NS
+            ),
+            "judged after, the exec kept what was recorded since"
+        );
+        let unknown_start = tmp_spawn(300, 10 * SEC);
+        rule.observe_arrival(&unknown_start);
+        assert_eq!(store.lock().ancestry().parent_of(300), None);
+    }
+
     fn canary_trip(pid: u32, ts_ns: u64) -> Event {
         Event::CanaryTripped {
             canary_id: "deadbeef".to_string(),

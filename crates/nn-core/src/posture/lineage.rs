@@ -2148,6 +2148,65 @@ mod tests {
     /// R08a (lab PR 250): the tracker on the portable test host.
     type AuthSessionTracker = super::AuthSessionTracker<H>;
 
+    /// Lab PR 267 (R12a): an exec the cache holds already, or one older than
+    /// the exec it holds for the pid, changes nothing — the priority bus
+    /// ingests an exec a tamper event overtakes, and again when the exec is
+    /// judged, possibly after a newer exec of the same pid.
+    #[test]
+    fn an_exec_ingested_again_or_out_of_order_changes_nothing() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        let spawn = |exe: &str, ts: u64| Event::ProcessSpawn {
+            pid: 4100,
+            ppid: 1,
+            uid: 0,
+            gid: 0,
+            comm: "x".to_string(),
+            filename: exe.to_string(),
+            timestamp_ns: ts,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+            start_ns: 5,
+            parent_is_kthread: false,
+            exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        };
+        let a = spawn("/usr/bin/env", 10);
+        let b = spawn("/usr/bin/python3", 20);
+        assert!(t.ingest_spawn_event(&a));
+        assert!(t.ingest_spawn_event(&b), "the newer exec, overtaken");
+        assert_eq!(t.image_path(4100).as_deref(), Some("/usr/bin/python3"));
+        assert!(
+            t.ingest_spawn_event(&a),
+            "the older exec judged in its turn"
+        );
+        assert_eq!(
+            t.image_path(4100).as_deref(),
+            Some("/usr/bin/python3"),
+            "an older exec does not overwrite the newer"
+        );
+        assert!(t.ingest_spawn_event(&b));
+        assert_eq!(t.image_path(4100).as_deref(), Some("/usr/bin/python3"));
+        let c = spawn("/usr/bin/perl", 30);
+        t.ingest_spawn_event(&c);
+        assert_eq!(
+            t.image_path(4100).as_deref(),
+            Some("/usr/bin/perl"),
+            "a newer one does"
+        );
+        assert!(!t.ingest_spawn_event(&Event::BpfSyscall {
+            pid: 1,
+            uid: 0,
+            comm: String::new(),
+            cmd: 0,
+            arg: 0,
+            timestamp_ns: 0,
+        }));
+    }
+
     fn write_status(dir: &Path, pid: u32, ppid: u32) {
         let pid_dir = dir.join(pid.to_string());
         fs::create_dir_all(&pid_dir).unwrap();
