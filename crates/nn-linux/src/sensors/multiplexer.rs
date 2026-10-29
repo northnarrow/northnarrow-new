@@ -178,7 +178,7 @@ pub struct SensorMultiplexer<G> {
 
 impl<G: ExecGuards> SensorMultiplexer<G> {
     /// Load + attach + start. The returned multiplexer is hot: events
-    /// will already be flowing into the channel by the time it
+    /// will already be flowing onto the bus by the time it
     /// returns. Net observation programs (Tappa 10 N2) are NOT
     /// attached — use [`Self::start_with_net`] for those.
     ///
@@ -622,7 +622,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     /// External audit SNS-001: the labels of the telemetry tasks that have
     /// ended (returned, failed or panicked). They never end while the agent
     /// runs, so any entry is a sensor gone blind. `next_event()` cannot
-    /// tell: this struct and the drains hold senders of the channel.
+    /// tell: this struct and the drains hold senders of the bus.
     pub fn finished_pumps(&self) -> Vec<&'static str> {
         finished(&self.pumps)
     }
@@ -653,7 +653,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     }
 
     /// Lab PR 219: attach the exploit post-condition guard (detect mode)
-    /// and pump its records into the event channel; the running guard goes
+    /// and pump its records onto the event bus; the running guard goes
     /// to the start (R11c, lab PR 264: its response and its audit log).
     /// `Err(reason)` when it does not run; nothing of it is attached then.
     /// `_verified`: as for [`Self::start_with_net`] (R11b, lab PR 262).

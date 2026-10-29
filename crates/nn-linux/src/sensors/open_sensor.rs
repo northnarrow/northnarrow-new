@@ -1368,7 +1368,7 @@ pub(crate) fn decode_batch<'a>(
     (d.records, d.rejected)
 }
 
-/// Drain the ring into the agent's event channel until the receiver goes
+/// Drain the ring onto the agent's event bus until the receiver goes
 /// away.
 pub async fn pump(ring: RingBuf<MapData>, tx: crate::sensors::bus::BusSender) {
     let mut fd = match crate::async_fd::register(ring) {
