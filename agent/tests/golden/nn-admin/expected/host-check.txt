@@ -1,0 +1,107 @@
+# nn-admin output matrix: host-check (lab PR 266). Written by `cargo xtask golden --update`; never by hand. docs/validation/GOLDEN_REPLAY.md, §8.
+
+### host-check.table
+$ nn-admin host-check
+exit: <0, or 2 with the host's warnings: checked>
+--- stdout
+| <status>  BPF LSM in the active LSM list   <value>
+| <status>  Kernel lockdown mode             <value>
+| <status>  Unprivileged BPF disabled        <value>
+| <status>  Kernel module signature enforced <value>
+| <status>  UEFI Secure Boot                 <value>
+| <status>  IMA measurement / appraisal active <value>
+| <status>  kexec disabled                   <value>
+| <status>  bpffs mounted once at /sys/fs/bpf <value>
+| <status>  admin private key off the host   <value>
+| <status>  nftables for COMBAT containment  <value>
+| <status>  release verified at install      <value>
+| 11 check(s), <warnings> warning(s)<, and the anti-tamper note when there are any>
+--- stderr
+(empty)
+
+### host-check.json
+$ nn-admin host-check --json
+exit: <0, or 2 with the host's warnings: checked>
+--- stdout
+| [
+|   {
+|     "id": "bpf_lsm",
+|     "name": "BPF LSM in the active LSM list",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "append `bpf` to the LSM list the kernel runs (never a fixed `lsm=` list: it can switch SELinux or AppArmor off; docs/operator/KERNEL_COMPATIBILITY.md, \"Enabling the bpf LSM\") and reboot"
+|   },
+|   {
+|     "id": "lockdown",
+|     "name": "Kernel lockdown mode",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "boot with `lockdown=integrity` (Secure Boot enables it on most distros): blocks unsigned modules, kexec of unsigned kernels, /dev/mem and other runtime kernel modification by root"
+|   },
+|   {
+|     "id": "unprivileged_bpf",
+|     "name": "Unprivileged BPF disabled",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "`sysctl -w kernel.unprivileged_bpf_disabled=1` (persist in /etc/sysctl.d/) — only CAP_BPF/CAP_SYS_ADMIN may load BPF programs"
+|   },
+|   {
+|     "id": "module_sig_enforce",
+|     "name": "Kernel module signature enforced",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "boot with `module.sig_enforce=1` (or Secure Boot + lockdown, which forces it): an unsigned module is the classic way to blind a kernel sensor"
+|   },
+|   {
+|     "id": "secure_boot",
+|     "name": "UEFI Secure Boot",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "enable Secure Boot in firmware with the distro's shim (or your own keys): anchors the boot chain and turns on lockdown + module signing"
+|   },
+|   {
+|     "id": "ima",
+|     "name": "IMA measurement / appraisal active",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "boot with `ima_policy=tcb` (measure) or an appraise policy with signed binaries: makes a replaced agent binary fail before it runs"
+|   },
+|   {
+|     "id": "kexec_load_disabled",
+|     "name": "kexec disabled",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "`sysctl -w kernel.kexec_load_disabled=1` (one-way until reboot; persist in /etc/sysctl.d/) — kexec boots a different kernel without a reboot the sensor would notice"
+|   },
+|   {
+|     "id": "bpffs",
+|     "name": "bpffs mounted once at /sys/fs/bpf",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "mount bpffs once (`mount -t bpf bpf /sys/fs/bpf`, or the systemd sys-fs-bpf.mount unit) and investigate any extra bpffs mount"
+|   },
+|   {
+|     "id": "admin_key",
+|     "name": "admin private key off the host",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "move the admin private key offline (`mv <key> <offline media>`): on the host it lets root release COMBAT, open trusted-installer windows (the anti-tamper suspended) and sign overlays"
+|   },
+|   {
+|     "id": "nft",
+|     "name": "nftables for COMBAT containment",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "install nftables (`apt-get install nftables` / `dnf install nftables`); the agent runs the `nft` of /usr/sbin, /usr/bin, /sbin or /bin only, root's and writable by nobody else — without `nft` neither a BlockOutbound verdict nor the COMBAT soft egress block drops the offender's traffic (the agent records a signed subsystem_degraded at boot, and each episode records the failure and shortens INVESTIGATE)"
+|   },
+|   {
+|     "id": "install_provenance",
+|     "name": "release verified at install",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "install from the release tarball (next to the tree, or `--tarball`) with `gh` or `cosign` for its tag-bound attestation (install.sh refuses less without `--allow-unverified`): `checksums`, `manifest`, `source-tree`, `unverified` and `package` mean nothing proved where these binaries were built"
+|   }
+| ]
+--- stderr
+(empty)
+

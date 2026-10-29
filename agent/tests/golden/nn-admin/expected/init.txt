@@ -1,0 +1,171 @@
+# nn-admin output matrix: init (lab PR 266). Written by `cargo xtask golden --update`; never by hand. docs/validation/GOLDEN_REPLAY.md, §8.
+
+### init.fresh-pub-appended
+$ nn-admin init --priv-out new.key --pub-append admin.pub
+exit: 0
+--- stdout
+| init: keypair generated.
+| private key : new.key
+| appended to : admin.pub
+| fingerprint : <init-fp>
+|
+| Record the fingerprint above — it is the short identifier the
+| agent prints in logs whenever this key is used.
+--- stderr
+(empty)
+--- files
+~ admin.pub (file 0644)
+| # admin keys of the nn-admin matrix
+| bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5 all
+| 55154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207 unlock,audit-read
+| # nn-admin generated <now> (fingerprint <init-fp>)
+| <init-pub>
++ new.key (file 0600)
+| <init-key>
+
+### init.fresh-pub-created
+$ nn-admin init --priv-out new.key --pub-append new.pub
+exit: 0
+--- stdout
+| init: keypair generated.
+| private key : new.key
+| appended to : new.pub
+| fingerprint : <init-fp>
+|
+| Record the fingerprint above — it is the short identifier the
+| agent prints in logs whenever this key is used.
+--- stderr
+(empty)
+--- files
++ new.key (file 0600)
+| <init-key>
++ new.pub (file 0644)
+| # nn-admin generated <now> (fingerprint <init-fp>)
+| <init-pub>
+
+### init.priv-exists
+$ nn-admin init --priv-out key-a --pub-append admin.pub
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| writing private key to key-a: File exists (os error 17)
+
+### init.priv-exists-forced-mode-reset
+$ nn-admin init --priv-out old.key --pub-append admin.pub --force
+exit: 0
+--- stdout
+| init: keypair generated.
+| private key : old.key
+| appended to : admin.pub
+| fingerprint : <init-fp>
+|
+| Record the fingerprint above — it is the short identifier the
+| agent prints in logs whenever this key is used.
+--- stderr
+(empty)
+--- files
+~ admin.pub (file 0644)
+| # admin keys of the nn-admin matrix
+| bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5 all
+| 55154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207 unlock,audit-read
+| # nn-admin generated <now> (fingerprint <init-fp>)
+| <init-pub>
+~ old.key (file 0600)
+| <init-key>
+
+### init.priv-dir-missing
+$ nn-admin init --priv-out no/such/dir/new.key --pub-append new.pub
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| writing private key to no/such/dir/new.key: No such file or directory (os error 2)
+
+### init.pub-dir-missing
+$ nn-admin init --priv-out new.key --pub-append no/such/dir/admin.pub
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| appending pub key to no/such/dir/admin.pub: No such file or directory (os error 2)
+--- files
++ new.key (file 0600)
+| <init-key>
+
+### init.priv-a-symlink
+$ nn-admin init --priv-out link.key --pub-append new.pub
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| writing private key to link.key: File exists (os error 17)
+
+### init.priv-a-symlink-forced
+$ nn-admin init --priv-out link.key --pub-append new.pub --force
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| writing private key to link.key: Too many levels of symbolic links (os error 40)
+
+### init.priv-a-dangling-symlink
+$ nn-admin init --priv-out link.key --pub-append new.pub
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| writing private key to link.key: File exists (os error 17)
+
+### init.pub-a-directory
+$ nn-admin init --priv-out new.key --pub-append pub.d
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| appending pub key to pub.d: Is a directory (os error 21)
+--- files
++ new.key (file 0600)
+| <init-key>
+
+### init.priv-a-directory-forced
+$ nn-admin init --priv-out key.d --pub-append new.pub --force
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| writing private key to key.d: Is a directory (os error 21)
+
+### init.pub-kept-0600
+$ nn-admin init --priv-out new.key --pub-append admin.pub
+exit: 0
+--- stdout
+(the same bytes as in init.fresh-pub-appended)
+--- stderr
+(empty)
+--- files
+~ admin.pub (file 0600)
+| # admin keys of the nn-admin matrix
+| bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5 all
+| 55154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207 unlock,audit-read
+| # nn-admin generated <now> (fingerprint <init-fp>)
+| <init-pub>
++ new.key (file 0600)
+| <init-key>
+
+### init.pub-without-final-newline
+$ nn-admin init --priv-out new.key --pub-append admin.pub
+exit: 0
+--- stdout
+(the same bytes as in init.fresh-pub-appended)
+--- stderr
+(empty)
+--- files
+~ admin.pub (file 0644)
+| # admin keys of the nn-admin matrix
+| bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5 all
+| 55154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207 unlock,audit-read# nn-admin generated <now> (fingerprint <init-fp>)
+| <init-pub>
++ new.key (file 0600)
+| <init-key>
+

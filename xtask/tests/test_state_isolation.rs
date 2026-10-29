@@ -122,6 +122,13 @@ const HOST_PATH_USERS: &[(&str, &str)] = &[
         "data: the paths inside the pinned audit rows; nothing on the host is opened",
     ),
     (
+        "agent/tests/nn_admin_matrix/harness.rs",
+        "nn-admin's default directories, only checked for: the matrix's default-path cases \
+         (lab PR 266) run where none of them exists, so an installed agent's files are never \
+         read and its socket never reached; every other case names its files in its own \
+         directory",
+    ),
+    (
         "watchdog/tests/privileged_e2e.rs",
         "the pin root the agent and the watchdog share (--bpffs-root), purged before and after \
          each test",

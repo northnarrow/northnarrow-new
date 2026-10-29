@@ -1,0 +1,581 @@
+# nn-admin output matrix: chain (lab PR 266). Written by `cargo xtask golden --update`; never by hand. docs/validation/GOLDEN_REPLAY.md, §8.
+
+### chain.pin-audit-only
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### chain.pin-audit-by-pubkey
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 0
+--- stdout
+(the same bytes as in chain.pin-audit-only)
+--- stderr
+(empty)
+
+### chain.pin-heads-of-another-layout
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| BROKEN  audit            audit.log: chain_rewritten: no line with that hash ends there; the head anchored at 2026-10-22T08:00:00.000000Z ends at byte 1234 (row 2, entry_hash abababababababababababababababababababababababababababababababab): the file was rewritten
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.heads-reached
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: 1 head(s) anchored at 2025-06-15T15:06:40.000000Z, all reached
+--- stderr
+(empty)
+
+### chain.heads-not-reached-chain-truncated
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| OK      audit            audit.log: 2 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| BROKEN  audit            audit.log: chain_truncated: the file is 1150 bytes; the head anchored at 2025-06-15T15:06:40.000000Z ends at byte 1692 (row 2, entry_hash 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1): rows were cut from its end
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.heads-named-elsewhere
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key --heads anchors/heads.json
+exit: 0
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            anchors/heads.json: 1 head(s) anchored at 2025-06-15T15:06:40.000000Z, all reached
+--- stderr
+(empty)
+
+### chain.heads-absent-named
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key --heads absent.json
+exit: 0
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            absent.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### chain.heads-not-json
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| BROKEN  chain_heads      chain_heads.json: chain_heads_unverified: the head anchor holds no genuine snapshot (slot 0: key must be a string at line 1 column 2)
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.no-audit-log
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| OK      audit            audit.log: 0 rows in the old format
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### chain.audit.content-altered
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| BROKEN  audit            audit.log: entry 1: entry_hash mismatch (recomputed 558bba6415c130e7c6ee52f579c43398ca5ee7bff9e84435cb05c0b7381ec9f9, stored 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742)
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.audit.link-broken
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| BROKEN  audit            audit.log: entry 1: row 1 carries seq 2: rows before it were removed or inserted
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.audit.malformed-line
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| BROKEN  audit            audit.log: line 2: not an audit row (not a row: expected ident at line 1 column 2); 1 row(s) verified before it
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.audit.torn-last-line
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| BROKEN  audit            audit.log: line 3: not an audit row (the last line, cut short (no newline): EOF while parsing a string at line 1 column 522); 2 row(s) verified before it
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.audit.not-canonical
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| BROKEN  audit            audit.log: entry 1: a numbered row not in its canonical form (the bytes on disk are not what the agent wrote: a key added, reordered or re-spelled)
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.audit.rows-reordered
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| BROKEN  audit            audit.log: entry 0: row 0 carries seq 1: rows before it were removed or inserted
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.audit.row-duplicated
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| BROKEN  audit            audit.log: entry 2: row 2 carries seq 1: rows before it were removed or inserted
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.audit.not-utf8-line
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| BROKEN  audit            audit.log: line 2: not an audit row (not UTF-8 (invalid utf-8 sequence of 1 bytes from index 0)); 1 row(s) verified before it
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.audit.empty
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+(the same bytes as in chain.no-audit-log)
+--- stderr
+(empty)
+
+### chain.audit.another-agents-key
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| BROKEN  audit            audit.log: entry 0: agent_sig invalid
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.only.audit
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key --log audit
+exit: 0
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### chain.only.canary-registry
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key --log canary-registry
+exit: 0
+--- stdout
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### chain.only.canary-access
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key --log canary-access
+exit: 0
+--- stdout
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### chain.only.detections
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key --log detections
+exit: 0
+--- stdout
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### chain.only.status-events
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key --log status-events
+exit: 0
+--- stdout
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### chain.only.netflow
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key --log netflow
+exit: 0
+--- stdout
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### chain.only.fim-drift
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key --log fim-drift
+exit: 0
+--- stdout
+| OK      fim_drift        ./fim_drift.jsonl: 12 records, 5 archive(s) from seq 1, 1 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### chain.only.all
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key --log all
+exit: 0
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 12 records, 5 archive(s) from seq 1, 1 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### chain.only.audit-and-fim-drift
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key --log audit --log fim-drift
+exit: 0
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      fim_drift        ./fim_drift.jsonl: 12 records, 5 archive(s) from seq 1, 1 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### chain.only.all-and-audit
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key --log all --log audit
+exit: 0
+--- stdout
+(the same bytes as in chain.pin-audit-only)
+--- stderr
+(empty)
+
+### chain.fim-drift.intact
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+(the same bytes as in chain.only.all)
+--- stderr
+(empty)
+
+### chain.fim-drift.another-agents-key
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl.manifest.jsonl: entry 0: signature invalid (its entry_hash recomputes: the line is as it was written, but this agent's key did not sign it — another key did, or it was forged)
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.fim-drift.active-row-altered
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl: entry 0: entry_hash mismatch (recomputed ccbfcc2a73a802efa444f2b13d4636e49af89832e7b9ff32ab66a244ce798d77, stored 757d8b3c585d1cc7994026c9b45252fea36384cd15ca680b2747111e51685bd2)
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.fim-drift.active-row-removed
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl: entry 0: prev_hash 757d8b3c585d1cc7994026c9b45252fea36384cd15ca680b2747111e51685bd2 != expected 1d2141114991ffcf07fb0046bfbb8b9e24076735f00aedcfa6f5dad33714ed0b
+| BROKEN  fim_drift        ./fim_drift.jsonl: chain_truncated: the file is 675 bytes; the head checkpointed in the manifest (generation 6) ends at byte 1350 (entry_hash 70ce0cad2207532c79283e5d06d63ff5917f48d248cbfdb70b49b0f7fcf1e09a): rows were cut from its end
+--- stderr
+| chain: 2 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.fim-drift.active-torn
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl: malformed line 1: data decode: EOF while parsing a string at line 1 column 660
+| BROKEN  fim_drift        ./fim_drift.jsonl: chain_truncated: the file is 1335 bytes; the head checkpointed in the manifest (generation 6) ends at byte 1350 (entry_hash 70ce0cad2207532c79283e5d06d63ff5917f48d248cbfdb70b49b0f7fcf1e09a): rows were cut from its end
+--- stderr
+| chain: 2 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.fim-drift.active-malformed-line
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl: malformed line 0: data decode: expected value at line 1 column 1
+| BROKEN  fim_drift        ./fim_drift.jsonl: chain_rewritten: no line with that hash ends there; the head checkpointed in the manifest (generation 6) ends at byte 1350 (entry_hash 70ce0cad2207532c79283e5d06d63ff5917f48d248cbfdb70b49b0f7fcf1e09a): the file was rewritten
+--- stderr
+| chain: 2 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.fim-drift.archive-missing
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| BROKEN  fim_drift        ./fim_drift.jsonl: evicted prefix seq 1 not corroborated by the manifest
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.fim-drift.archive-altered
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl.000001: entry 0: entry_hash mismatch (recomputed 0f2a6b869035e2abaf63c1aaab6d71c12a869761eb451a8cecf92415140522c4, stored 98e8aecf8718820719fccea54dc7180535d912dff86b60670d104e8bee9553d1)
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.fim-drift.manifest-missing
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 12 records, 5 archive(s) from seq 1, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### chain.fim-drift.manifest-altered
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl.manifest.jsonl: entry 0: entry_hash mismatch (recomputed 522dc0fe33f83e1f5884aef466f7ee3caf98d070fc403b54acf7a3b967d8cd87, stored 6cbdb023d22c8423885ca545b52a8174071f7b9c502312dc3b6e7e9870485f58)
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.fim-drift.manifest-last-row-removed
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+(the same bytes as in chain.fim-drift.manifest-missing)
+--- stderr
+(empty)
+
+### chain.fim-drift.active-not-canonical
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl: entry 0: a v3 line not in its canonical form (the bytes on disk are not what the agent wrote: a key added, reordered or re-spelled)
+| BROKEN  fim_drift        ./fim_drift.jsonl: chain_rewritten: no line with that hash ends there; the head checkpointed in the manifest (generation 6) ends at byte 1350 (entry_hash 70ce0cad2207532c79283e5d06d63ff5917f48d248cbfdb70b49b0f7fcf1e09a): the file was rewritten
+--- stderr
+| chain: 2 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.fim-drift.only-the-active-file
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 8
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl: entry 0: prev_hash 1d2141114991ffcf07fb0046bfbb8b9e24076735f00aedcfa6f5dad33714ed0b != expected 0000000000000000000000000000000000000000000000000000000000000000
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+| chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
+
+### chain.no-key
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| chain: no agent.sig.pub — deriving the agent pubkey from the signing key file agent.sig.key (refused once the agent protects it); pass --agent-pubkey <hex> when verifying off-host: reading agent.sig.key: No such file or directory (os error 2)
+
+### chain.published-key-not-hex
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| chain: agent.sig.pub: not hex: Odd number of digits
+
+### chain.state-dir-missing
+$ nn-admin chain verify --state-dir no/such --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  no/such/canaries.jsonl: 0 rows in the old format
+| OK      canary_access    no/such/canary_access.jsonl: 0 rows in the old format
+| OK      detections       no/such/detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    no/such/detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          no/such/netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        no/such/fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+

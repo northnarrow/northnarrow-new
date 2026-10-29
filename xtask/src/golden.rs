@@ -3,7 +3,12 @@
 //! posture and the COMBAT ladder (`agent/src/posture/golden.rs`); lab PR
 //! 263: and the admin socket's verification table, the replies and signed
 //! audit rows of every signed verb refused, accepted and rate-limited
-//! (`agent/src/admin/pipeline_tests.rs`, `agent/tests/golden/admin/expected/`).
+//! (`agent/src/admin/pipeline_tests.rs`, `agent/tests/golden/admin/expected/`);
+//! lab PR 266: and nn-admin's output matrix — the `nn-admin` binary's
+//! stdout, stderr, exit status, files written and requests sent to a mock
+//! agent, case by case (`agent/tests/nn_admin_matrix/`,
+//! `agent/tests/golden/nn-admin/expected/`), a test of the agent package
+//! (the binary is its shim), run after the library's.
 //!
 //! Without `--update` it runs the replays' tests: every case of
 //! `agent/tests/golden/cases/` gives its committed golden file of
@@ -28,12 +33,14 @@ use anyhow::{bail, Context, Result};
 /// `posture::golden::UPDATE_ENV`).
 pub const UPDATE_ENV: &str = "NN_GOLDEN_UPDATE";
 /// The golden files, relative to the repository root: the decision
-/// replay's, (lab PR 243) the posture and ladder replay's, and (lab PR 263)
-/// the admin socket's verification table.
-pub const EXPECTED_DIRS: [&str; 3] = [
+/// replay's, (lab PR 243) the posture and ladder replay's, (lab PR 263)
+/// the admin socket's verification table, and (lab PR 266) nn-admin's
+/// output matrix.
+pub const EXPECTED_DIRS: [&str; 4] = [
     "agent/tests/golden/expected",
     "agent/tests/golden/posture/expected",
     "agent/tests/golden/admin/expected",
+    "agent/tests/golden/nn-admin/expected",
 ];
 /// The agent's golden tests, by module (lab PR 243: one filter each).
 const TEST_FILTERS: [&str; 3] = [
@@ -41,6 +48,10 @@ const TEST_FILTERS: [&str; 3] = [
     "posture::golden::",
     "admin::pipeline_tests::",
 ];
+
+/// Lab PR 266: nn-admin's output matrix, an integration test of the agent
+/// package (it runs the package's `nn-admin` binary).
+const MATRIX_TEST: &str = "nn_admin_matrix";
 
 /// The cargo arguments of the run.
 fn cargo_args(locked: bool) -> Vec<&'static str> {
@@ -53,6 +64,21 @@ fn cargo_args(locked: bool) -> Vec<&'static str> {
     args
 }
 
+/// The cargo arguments of the matrix's run (lab PR 266): the whole test.
+fn matrix_args(locked: bool) -> Vec<&'static str> {
+    let mut args = vec![
+        "test",
+        "--package",
+        "northnarrow-agent",
+        "--test",
+        MATRIX_TEST,
+    ];
+    if locked {
+        args.push("--locked");
+    }
+    args
+}
+
 pub fn run(root: &Path, update: bool, locked: bool) -> Result<()> {
     if update && std::env::var_os("CI").is_some() {
         bail!(
@@ -60,28 +86,30 @@ pub fn run(root: &Path, update: bool, locked: bool) -> Result<()> {
              maintainer rewrites them and reviews the diff"
         );
     }
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir(root).args(cargo_args(locked));
-    crate::scrub_cargo_env(&mut cmd);
-    if update {
-        cmd.env(UPDATE_ENV, "1");
-    } else {
-        cmd.env_remove(UPDATE_ENV);
-    }
-    let status = cmd
-        .status()
-        .with_context(|| "failed to spawn cargo test for the golden replay")?;
-    if !status.success() {
-        bail!(
-            "the golden replay failed ({status}){}",
-            if update {
-                ""
-            } else {
-                ": a decision, a posture transition, a ladder step or an admin socket's \
-                 reply or row moved — if it is intended, `cargo xtask golden --update` and \
-                 review the diff"
-            }
-        );
+    for args in [cargo_args(locked), matrix_args(locked)] {
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(root).args(&args);
+        crate::scrub_cargo_env(&mut cmd);
+        if update {
+            cmd.env(UPDATE_ENV, "1");
+        } else {
+            cmd.env_remove(UPDATE_ENV);
+        }
+        let status = cmd
+            .status()
+            .with_context(|| "failed to spawn cargo test for the golden replay")?;
+        if !status.success() {
+            bail!(
+                "the golden replay failed ({status}){}",
+                if update {
+                    ""
+                } else {
+                    ": a decision, a posture transition, a ladder step, an admin socket's \
+                     reply or row, or nn-admin's output moved — if it is intended, `cargo \
+                     xtask golden --update` and review the diff"
+                }
+            );
+        }
     }
     if update {
         let out = Command::new("git")
@@ -96,7 +124,7 @@ pub fn run(root: &Path, update: bool, locked: bool) -> Result<()> {
         } else {
             eprintln!(
                 "golden: changed golden files — review `git diff -- {}` and say in the pull \
-                 request why each verdict, transition, step, reply or row moved:\n{changed}",
+                 request why each verdict, transition, step, reply, row or output moved:\n{changed}",
                 EXPECTED_DIRS.join(" ")
             );
         }
@@ -140,9 +168,38 @@ mod tests {
         );
     }
 
+    /// Lab PR 266: the matrix runs as the whole integration test, after
+    /// the library's replays.
+    #[test]
+    fn the_matrix_runs_as_the_agent_package_s_integration_test() {
+        assert_eq!(
+            matrix_args(false),
+            [
+                "test",
+                "--package",
+                "northnarrow-agent",
+                "--test",
+                "nn_admin_matrix"
+            ]
+        );
+        assert_eq!(
+            matrix_args(true),
+            [
+                "test",
+                "--package",
+                "northnarrow-agent",
+                "--test",
+                "nn_admin_matrix",
+                "--locked"
+            ]
+        );
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        assert!(root.join("agent/tests/nn_admin_matrix/main.rs").is_file());
+    }
+
     /// Lab PR 243: the update lists the changed files of every golden
-    /// suite (lab PR 263: the admin socket's table too): the directories
-    /// are there.
+    /// suite (lab PR 263: the admin socket's table too; lab PR 266:
+    /// nn-admin's matrix): the directories are there.
     #[test]
     fn both_replays_golden_directories_are_listed() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");

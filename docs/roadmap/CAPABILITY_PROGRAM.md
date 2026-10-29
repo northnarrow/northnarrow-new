@@ -3245,3 +3245,77 @@ only in the table below, in the same PR as the evidence.
     merged; R12 and R14 will move the sensors and the parsers, where more
     of the (a) kernel-object state may become a worker's.
   - Lab: On Ubuntu 24.04 (6.8.0-147, the lab guest ubuntu2404, ssh 2322, QEMU for Windows with WHPX, 4 vCPU, 7 GiB; ubuntu2204 up for lot 265, two guests). The lot's code (ffbd3a84) synced, built (release, test-privileged,debug-trigger) and installed three times (`nn-lab.sh sync`, `build`, `install`), the three boots collected (the agent's journal from "starting" to `READY=1`, the signed rows of each boot's window): 204 lines each, the same among themselves as multisets. `test-ignored` (every `#[ignore]` test as root, single-threaded, its five runs, each exit 0): 91 passed, 0 failed — `main`'s 91 on this guest (lab PR 262's last round) —, the tests' agents' chain checks `result="ok"` (52, none other); `policy-check`: PASS (its 8 checks: the built-in defaults hold IMP-001's kill; the signed `policy set` stored, "applied now", and the simulator's tree killed on the next event; a comm exemption refused by nn-admin, nothing sent, the policy unchanged; the policy at boot, its signed `rule_policy_loaded` row, still enforced; the built-in defaults back at once); `tamper-check`: 72 of 75 cases OK — C27 (no lockdown on the guest) and C57c (the journal's vacuum) known gaps, C64 (lab PR 215's stale own link id) the recorded deviation. `main` 118d5044 right after on the same guest, the same way (installed three times, the boots, `policy-check`, `tamper-check`): each of `main`'s three boots against the tip's the same 204 lines as multisets and the same signed rows op by op (6, 6, 4); in boots 1 and 3 two neighbouring lines in the other order ("fim recompute task: ready", which the spawned recompute task logs, and the signing key's "reusing existing"; the tip's boot 2 has `main`'s order). `policy-check` the same 22 lines (times aside). `tamper-check` the same 75 outcomes and verdicts, case by case (C38's pids aside); the evidence of 4 cases differs by what landed in their window: in C15 (the agent's cgroup frozen for 45 s) on `main` the watchdog's STATUS ping timed out twice and its stuck recovery stopped the agent with SIGINT and restarted it (the watchdog is the same bytes in both builds; on the tip the freeze ended before the second timeout) — hence `main`'s one more `agent_stop`, `agent_boot`, `capability_manifest`, `chain_verify`, `overlay_floor_anchor` and two `integrity_drift` there, and in C19 the restarted agent's `combat_stage` (its COMBAT entry on the case's denial; the tip's agent was in COMBAT, locked, since C01) —; in C35 and C36 the self-integrity watcher's round (an `integrity_drift_cleared` and a `unit_shadowed`) one case apart. Summed over each run the cases' signed rows are the same op by op but those (the tip 55, `main` 63). `upgrade-check` from that `main` to the tip: `install.sh` without `--upgrade` refused; with `--upgrade` and the lab's admin key the trusted-installer window opened, "UPGRADE complete — health check passed"; a new agent pid and a new `agent_boot` (audit log 6,608 → 6,616 lines), the identity the same, 19 of 19 deny hooks, 36 own LSM programs before and after, no foreign one; the upgraded boot is lot 262's upgraded boot of 1d8a26d1 line for line (205 lines, the same order, the same signed rows). The live A/B of lab PR 263 (lab PR 259's commands and the verification's refusals on the real socket — an unknown key, another install's id, the roles the lab key lacks, `shutdown` with one key, refused by nn-admin before sending, the signed `unlock` —, 41 commands, each run with `main`'s nn-admin, the tip's and `main`'s again, the signed rows each appended kept, masked), with the release builds of both nn-admin binaries, against the tip's agent and then, `main` 118d5044 installed again, against `main`'s: the two nn-admin binaries give the same stdout, stderr, exit status and rows in 41 of 41 on each agent (the binary's name aside); the two agents the same in 33, the same but numbers in 6 (the telemetry's counters, the `--since` times, the verifiers' row counts) and in 2 (`capabilities`, text and JSON) the same but the hash of the boot's signed manifest row — the manifest itself the same —, and the same rows command by command (`telemetry_status`, `status_polled`, `response_status` and `unlock` accepted; `role_denied` ×10, `invalid_signature` ×2, `agent_id_mismatch` ×2 refused). The guest powered off after. Host, on ffbd3a84 (the lot's code; the commit after it is this documentation), `set -o pipefail`, `CARGO_BUILD_JOBS=6`: `cargo xtask build-ebpf --release` (the stamp's source 235e2fed…, `main`'s); the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --all -- --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 73 suites, 3,168 passed, 0 failed, 15 ignored (`main`: 72 suites, 3,161; the 7 new tests); `cargo test --no-run` with the agent's test-privileged,debug-trigger; `cargo xtask attack-coverage --check`; `cargo xtask golden` five times, each a process of its own: 25 tests passed each time (the hot-apply test is in `admin::pipeline_tests`, which the golden run includes), the 36 golden files the same bytes after every run and the tree clean; `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (the 13 targets' seeds and regressions; no lockfile changed by the build); `portable-core`'s `cargo check` of the pure crates for its five targets; every commit of the lot checked on its own (`cargo check` of the workspace and of the agent with the privileged features, `fmt`, clippy, the agent library's tests 543, nn-linux's 769 then 770, nn-core's 1,033, xtask's 193, then 197 with the ratchet): all pass. The pins pass unchanged, by name (nn-proto, `common`, the eBPF crates and the golden cases untouched): `encoded_frames_are_pinned`, `chain_format_pin` (5, its generator ignored), `chain_format_clock` (2), `crypto_vectors` (19), nn-core's rule-policy tests (12). The identity build (each commit exported with `git archive` into one path and built as the release job builds it: x86-64-v2, stripped and unstripped, the debug build, the tarball, the `.deb`, the SBOMs): the eBPF object and its stamp, the watchdog and the scanner byte-identical to `main`'s; the tarball's 72 entries and the `.deb`'s 79 the same paths and modes; the three SBOMs the same (146, 59 and 112 components); `posture_demo`'s output, the agent's `--help`, `--version`, `--build-features` (release and debug), `--btf-check` and a bad flag's error, nn-admin's `--help` the same. The agent and nn-admin differ; function by function (objdump of the unstripped builds, addresses and the linker's data symbols masked): nn-admin 3,707 of 3,709 the same, the 2 the overlay gate's (`AgentAdminHost::overlay_gate` and the gate's drop glue: its configured map); the agent 7,582 the same and 165 differing — 134 in the code the lot changed (its modules and types, and library code instantiated over them), 31 elsewhere, each read: 13 by `int3` padding only, 11 by the name the linker kept for a folded `drop_slow` (identical code; the new `Arc<Mutex<Option<Expected>>>`'s), 6 by register allocation with the same calls in the same order (`default_rules_with_net`, hashbrown's and `RawVec`'s growth), 1 (`impact::trust::topmost_same`) by an inlining choice —, 114 only in `main` (the removed setters, their statics' `OnceLock` initialisers, the tasks renamed) and 97 only in the tip (the handles). The test list: `main`'s 3,176 names and the 7 new (3,183), none removed, no `#[ignore]` added.
+- **Lab PR 266 — nn-admin's output matrix, committed (Wave 4 Phase 2,
+  test infrastructure before R12–R14; no capability, no level changes).**
+  - What was wrong: lab PRs 259 and 263 proved "nn-admin's output identical
+    to `main`" with a matrix of 1,964 cases — stdout, stderr, exit status,
+    files written and requests sent to a mock agent — run from a
+    scratchpad, which a stopped session deleted. The next refactors
+    (R12–R14) had nothing to prove the same against, and no test of the
+    tree held nn-admin's messages, exit codes or requests: a change of one
+    of them passed CI unseen.
+  - What changed: `agent/tests/nn_admin_matrix/`, an integration test of
+    the agent package (the `nn-admin` binary is its shim, on the agent's
+    host): 2,703 cases, each in a directory of its own, an emptied
+    environment, umask 022, compared byte for byte with
+    `agent/tests/golden/nn-admin/expected/<area>.txt` (13 files) on every
+    `cargo test`. The mock agent is a thread of the test serving the case's
+    socket with nn-proto's frames and a script of replies; the keys are
+    constant seeds (the agent's RFC 8032 test 1's, chain-pin-v1's), the
+    install's id chain-pin-v1's, the chains written by the agent's writers
+    with a fixed clock (2025-06-15, one second a row), the overlays signed
+    at that time. Normalised, each after it is checked: the clock (a time
+    within ten minutes of the run), `init`'s fresh key, `config overlay
+    sign`'s random nonce and its signatures (verified with the fixture
+    keys), the mock's view of each request (its time within five minutes,
+    the nonce it issued, each signature verified and named), the host's
+    hardening checks (`host-check` first compared with the agent library's
+    checks run in the test, then each status and value masked; `status`'s
+    summary line the same way), the case's directory and the repository
+    (no case prints them) and `policy test`'s temporary `/proc`. A stream
+    or files longer than four lines that an earlier case of the area has
+    byte for byte name that case (`policy test` gives one output for many
+    inputs: about 2 MB in all). `cargo xtask golden [--update]` runs the matrix
+    after the library's replays (`EXPECTED_DIRS` +1); `--update` and
+    `NN_GOLDEN_UPDATE=1` are refused with `CI` set.
+    `docs/validation/GOLDEN_REPLAY.md` §8. `xtask/tests/test_state_isolation.rs`:
+    the harness names nn-admin's default directories (to run the
+    default-path cases only where none exists), listed in
+    `HOST_PATH_USERS` with that reason.
+  - Coverage, against lab PR 259's: help texts and clap's errors 505
+    (every subcommand found by walking `-h`: `--help`, `-h`, `help <path>`;
+    per subcommand an unknown flag, a missing argument, a stray positional,
+    each option without its value, each flag twice and with a value; values
+    clap refuses), `init` 13, `verify-keys` 17, `host-check` 2, `audit read|verify` 58,
+    `chain verify` 45 (chain-pin-v1's log and heads, every class of lab PR
+    256 on the flat audit chain and on the rotating FIM drift log, a head
+    anchor reached, cut and rewritten), `config overlay status|sign` 56,
+    `policy show|test` 548 (lab PR 259's 520 — the 24 golden cases and
+    their 205 events as two streams × the built-in defaults, the three
+    golden candidates and one refused × shipped lists or none × table or
+    JSON — 18 errors, `show`'s 10), the socket verbs 789 (37 verbs, each
+    success reply, the ten refusals, 7 transport faults for a signed verb
+    and 5 for an unsigned one where lab PR 259 had 6, no socket, a socket
+    nobody listens on, and 57 argument variants; lab PR 259: 647), key and
+    identity errors through every signed verb 544, closed pipes 48, default
+    paths 78. Not reproduced: the A/B of two builds (the committed files
+    are the reference: a pull request's diff of them is that A/B), the lab
+    build's `debug force-posture` (the test is not compiled with
+    `debug-trigger`; in this build it is clap's unknown subcommand, a
+    case), a key owned by another uid (needs root; the mode check before
+    it is covered), an agent that never answers (the 5 s timeout; closed,
+    cut and garbled frames are covered), rows in the canary, detections,
+    status-events and netflow chains (listed empty; the classes run on the
+    audit chain and the FIM drift log).
+  - Found, pinned as they are (not changed here): `unlock`'s error for a
+    key or an identity file it cannot read says "the signed unlock got no
+    reply — an agent older than this nn-admin …" (the context wraps the
+    whole signed request); `chain verify` with no chain on disk at all
+    reports every chain OK and exits 0; `init` that cannot append the
+    public half leaves the private key written and exits 1; clap's own
+    `--help` and `--version` into a closed stdout exit 0, not 141; an error
+    into a closed stderr exits 141, not the error's code.
+  - Open: the findings above, for a lot of their own; rows in the other
+    chains; the lab build's matrix, if CI ever runs the `debug-trigger`
+    tests.
+  - Lab: host tests only (no guest, no root, no agent). Host, on the lot's tree, `set -o pipefail`, `CARGO_BUILD_JOBS=4`: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 74 suites, 3,171 passed, 0 failed, 15 ignored, in 176 s (`main` 8788e0d0: 73 suites, 3,168; the matrix's 2 tests and xtask's 1); `cargo xtask golden` three times, each a process of its own: 27 tests passed each time (the library's 25 replays and the matrix's 2), every golden file the same bytes before and after each run (sha256 of them all dbf57a09…). The matrix: 2,703 cases in 8.8 to 10.1 s a run (8 threads, the debug build), its cases built in 2.5 s; three runs in a row, and the three golden runs, the same bytes. The mutation check, each on the committed goldens and reverted after: `status`'s help text changed ("Print current posture" → "Print the current posture"): the test fails with 4 problems (`help.no-arguments`, `help.help-alone`, `help.status.long`, `pipe.stderr.help`; the cases that name them by "the same bytes as" follow), each with the golden line and the new one; `unlock`'s exit code for a refused role 7 → 8: it fails on `sock.unlock.refused.role-denied` (`exit: 7` / `exit: 8`); reverted, it passes. Only the comments of the harness and this line changed after the gates' run; the matrix, fmt, clippy of the agent's tests and the state-isolation ratchet run again on the final tree: all pass.
