@@ -12,6 +12,8 @@ use northnarrow_agent::posture::PostureMachine;
 use northnarrow_agent::response::Executor;
 use tracing::{debug, error, info, warn};
 
+use nn_core::posture::lineage::{event_time_ns, judged_at};
+
 use super::{systemd_state, HostStopping};
 
 /// Categorise + log + evaluate + (maybe) execute.
@@ -113,7 +115,11 @@ pub(crate) async fn process_event(
     //
     // When `canary_detector` is `None` (early-boot path
     // before K6 wires the Detector handle), this is a no-op.
-    let event = match canary_detector.and_then(|d| d.process_event(&event)) {
+    // Lab PR 267 (review #471 A1): the event is judged on the lineage as of
+    // its own time — on the priority bus an exec of its process may have
+    // been taken, or handed over, ahead of it ([`judged_at`]).
+    let at = event_time_ns(&event);
+    let event = match judged_at(at, || canary_detector.and_then(|d| d.process_event(&event))) {
         Some(canary_event) => canary_event,
         None => event,
     };
@@ -137,7 +143,11 @@ pub(crate) async fn process_event(
     // exec burst). Nothing pushes to the buffer until this returns.
     let host_stopping = host_stopping.is_stopping();
     if let Some((new_state, firing_trigger)) = (!host_stopping)
-        .then(|| correlation.with_recent(|recent| posture.observe(&event, recent)))
+        .then(|| {
+            judged_at(at, || {
+                correlation.with_recent(|recent| posture.observe(&event, recent))
+            })
+        })
         .flatten()
     {
         // BUG-015 observability: include the firing TriggerType so
@@ -166,11 +176,11 @@ pub(crate) async fn process_event(
     // spawning children DURING INVESTIGATE pre-empts the time-bound
     // deadline and advances straight to NEUTRALIZE.
     if !host_stopping && ladder.current_stage().is_some() {
-        ladder.observe(&event, Instant::now());
+        judged_at(at, || ladder.observe(&event, Instant::now()));
     }
     // Lab PR 222: a mass rewrite of existing files flags its writer for the
     // copy-on-first-write guard (a ransomware verdict's offender).
-    cow_guard.observe_event(&event);
+    judged_at(at, || cow_guard.observe_event(&event));
     // Lab PR 224: an open flow's rows (its connect, its snapshots, a
     // refused connect) are for the rules; the correlation buffer keeps its
     // `TcpConnect` and its closed row, as before.
@@ -577,7 +587,7 @@ pub(crate) async fn process_event(
     // Lab PR 236 (multi-match): every rule judged the event; the decision
     // names the primary rule and every match, and runs, per target, the
     // strongest response the per-rule policy allows.
-    if let Some(decision) = engine.decide(&event) {
+    if let Some(decision) = judged_at(at, || engine.decide(&event)) {
         let verdict = &decision.verdict;
         // Review 75: every verdict is acted on; its log lines and its
         // record count against the primary rule's budget for the acting uid.

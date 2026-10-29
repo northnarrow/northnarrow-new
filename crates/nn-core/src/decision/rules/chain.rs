@@ -78,15 +78,17 @@
 //! time. CHAIN-007 notes every flow it sees that completes no chain
 //! ([`CorrelationStore::note_egress`]); a late precursor completes the chain
 //! with the noted egress on the kernel timestamps and the verdict names that
-//! egress: a credential read completes CHAIN-007 or CHAIN-001 (review 70), a
-//! staging exec CHAIN-007 (lab PR 235) or CHAIN-002 (lab PR 244). A two-step
-//! chain (CHAIN-001, CHAIN-002), in order or late, claims the egress, naming
-//! its precursor, and a late two-step completion needs an unclaimed one. The
-//! three-step CHAIN-007 takes the egress (it is removed): a late read one
-//! unclaimed or claimed by CHAIN-002, a late exec one unclaimed or claimed.
-//! So a flow gets at most two chain verdicts, the two-step one first and
-//! then CHAIN-007, and the flow ledger keeps the flow's later phases from a
-//! third.
+//! egress: a credential read completes CHAIN-007 and CHAIN-001 (review 70),
+//! a staging exec CHAIN-007 (lab PR 235) and CHAIN-002 (lab PR 244). Lab PR
+//! 267 (R12a): each chain answers a noted egress once, in order or late, and
+//! no chain keeps another from it — the flow gets the chains it gets when
+//! the exec, the read and the egress are processed in kernel order, in any
+//! order the priority bus takes them in (`agent/src/decision/golden.rs`
+//! checks it on the golden corpus). Lab PRs 235 and 244 let the first
+//! two-step chain to answer a flow keep the other from a late completion,
+//! and CHAIN-007 took the egress from both: a flow whose staging exec was
+//! processed last lost the CHAIN-002 it has in order. The flow ledger keeps
+//! the flow's later phases from a chain that already answered it.
 //!
 //! ## Rate limiting (§13 Q4)
 //!
@@ -111,7 +113,7 @@ use parking_lot::Mutex;
 
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::correlation::{
-    retention_ns, ChainAge, CorrelationStore, EgressNote, PrecursorKind, ProcKey,
+    retention_ns, ChainAge, CorrelationStore, EgressChain, EgressNote, PrecursorKind, ProcKey,
     CORRELATION_WINDOW_NS,
 };
 use crate::decision::Rule;
@@ -407,6 +409,25 @@ impl<H: PostureHost> Rule for NnLChain002TmpExecThenEgress<H> {
     fn id(&self) -> &'static str {
         "NN-L-CHAIN-002_TmpExecThenEgress"
     }
+    /// Lab PR 267 (R12a): the exec's edge in the shared ancestry tree (D4),
+    /// as `evaluate` records it — the fan-out and chain rules then count a
+    /// child under its parent before the exec itself is judged. Only with
+    /// the process's own start: without one a second sighting of the pid
+    /// reads as a reuse ([`CorrelationStore::observe_spawn`]), so a record
+    /// without it is observed when judged, as before.
+    fn observe_arrival(&self, event: &Event) {
+        if let Event::ProcessSpawn {
+            pid,
+            ppid,
+            start_ns,
+            ..
+        } = event
+        {
+            if *start_ns != 0 {
+                self.buf.lock().observe_spawn(*pid, *ppid, *start_ns);
+            }
+        }
+    }
     fn name(&self) -> &'static str {
         "/tmp exec followed by network egress"
     }
@@ -463,13 +484,25 @@ impl<H: PostureHost> Rule for NnLChain002TmpExecThenEgress<H> {
                 let candidates =
                     store.exec_egresses(*pid, *start_ns, *timestamp_ns, CORRELATION_WINDOW_NS);
                 drop(store);
-                let egress = candidates.into_iter().find(|n| {
-                    !crate::net::resolvers::is_resolver_destination(
-                        &n.dst_addr,
-                        n.dst_port,
-                        &self.resolvers,
-                    ) && !package_mediated(self.lineage.as_ref(), *pid, n.start_ns)
-                })?;
+                let admitted: Vec<EgressNote> = candidates
+                    .into_iter()
+                    .filter(|n| {
+                        !crate::net::resolvers::is_resolver_destination(
+                            &n.dst_addr,
+                            n.dst_port,
+                            &self.resolvers,
+                        ) && !package_mediated(self.lineage.as_ref(), *pid, n.start_ns)
+                    })
+                    .collect();
+                // Lab PR 267 (R12a): the earliest egress whose verdict holds
+                // nothing back, else the earliest — in order each flow gets
+                // its own verdict, and one held at port 53 of another server
+                // no longer stands for a later flow the chain kills for.
+                let egress = admitted
+                    .iter()
+                    .find(|n| n.dst_port != crate::net::resolvers::DNS_PORT)
+                    .or_else(|| admitted.first())
+                    .cloned()?;
                 // Claimed: no late precursor completes a two-step chain with
                 // it again; a late credential read can still complete
                 // CHAIN-007 with it.
@@ -907,6 +940,12 @@ impl<H: PostureHost> Rule for NnLChain007TmpCredExfilSequence<H> {
                 if package_mediated(self.lineage.as_ref(), nf.pid, nf.start_ns) {
                     return None;
                 }
+                // Lab PR 267 (R12a): answered in order — a note an earlier
+                // phase of this flow left completes no late CHAIN-007.
+                let mut store = self.buf.lock();
+                let key = store.current_key(nf.pid);
+                store.answer_egress(key, nf.start_ns, EgressChain::Sequence);
+                drop(store);
                 Some(chain_verdict(
                     self,
                     nf,
@@ -937,7 +976,7 @@ impl<H: PostureHost> Rule for NnLChain007TmpCredExfilSequence<H> {
                     return None;
                 }
                 let egress =
-                    store.take_egress_after(key, fe.timestamp_ns, CORRELATION_WINDOW_NS)?;
+                    store.answer_sequence_after(key, fe.timestamp_ns, CORRELATION_WINDOW_NS)?;
                 store.record(key, PrecursorKind::CredRead, fe.timestamp_ns);
                 Some(late_chain_verdict(
                     self,
@@ -1263,6 +1302,47 @@ mod tests {
             filename_truncated: false,
             stdio: Default::default(),
         }
+    }
+
+    /// Lab PR 267 (R12a): an exec overtaken on the bus gives the ancestry
+    /// tree its edge before it is judged (`observe_arrival`), and judging it
+    /// later keeps what was recorded since; without the process's start it
+    /// is left to the judgment (a second sighting would read as a reuse).
+    #[test]
+    fn an_overtaken_exec_gives_its_edge_first() {
+        let store = Arc::new(Mutex::new(CorrelationStore::new()));
+        let rule = NnLChain002TmpExecThenEgress::new(Arc::clone(&store));
+        let mut child = tmp_spawn(200, 10 * SEC);
+        if let Event::ProcessSpawn {
+            ppid,
+            start_ns,
+            filename,
+            ..
+        } = &mut child
+        {
+            *ppid = 100;
+            *start_ns = 9 * SEC;
+            *filename = "/usr/bin/curl".to_string();
+        }
+        rule.observe_arrival(&child);
+        assert_eq!(store.lock().ancestry().parent_of(200), Some(100));
+        store
+            .lock()
+            .record_for_pid(200, PrecursorKind::CredRead, 11 * SEC);
+        assert!(rule.evaluate(&child).is_none());
+        assert_eq!(store.lock().ancestry().parent_of(200), Some(100));
+        assert!(
+            store.lock().has_recent_for_pid(
+                200,
+                PrecursorKind::CredRead,
+                12 * SEC,
+                CORRELATION_WINDOW_NS
+            ),
+            "judged after, the exec kept what was recorded since"
+        );
+        let unknown_start = tmp_spawn(300, 10 * SEC);
+        rule.observe_arrival(&unknown_start);
+        assert_eq!(store.lock().ancestry().parent_of(300), None);
     }
 
     fn canary_trip(pid: u32, ts_ns: u64) -> Event {
@@ -2068,6 +2148,13 @@ mod tests {
             "the verdict names the egress"
         );
         assert_eq!(on_read.action, ResponseAction::KillProcessTree);
+        // Lab PR 267 (R12a): the engine judges the read with every rule
+        // (lab PR 236); in order the egress would have had CHAIN-001 too, so
+        // the late read gives it — once.
+        let rules = chain_rules();
+        fire_ids(&rules, &tmp_spawn(42, 10 * SEC));
+        assert_eq!(fire_ids(&rules, &flow(42, 443, 12 * SEC)), [C002]);
+        assert_eq!(fire_ids(&rules, &cred_fim(42, 11 * SEC)), [C007, C001]);
         let again = fire_ids(&rules, &cred_fim(42, 11 * SEC + 5));
         assert!(
             !again.iter().any(|id| id == C007 || id == C001),
@@ -2148,10 +2235,19 @@ mod tests {
         );
         assert_eq!(on_exec.action, ResponseAction::KillProcessTree);
         assert_eq!(on_exec.severity, Severity::Critical);
-        // The egress is spent; a re-exec of the same process completes
+        // Lab PR 267 (R12a): judged by every rule (lab PR 236), the late exec
+        // also gives the egress the CHAIN-002 it has in order; the egress is
+        // then spent for both — a re-exec of the same process completes
         // nothing more, and the exec was recorded for the flows to come.
-        let again = first_verdict(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC + 5));
-        assert!(again.is_none(), "{again:?}");
+        let rules = chain_rules();
+        fire_ids(&rules, &cred_fim(42, 11 * SEC));
+        assert_eq!(fire_ids(&rules, &flow(42, 443, 12 * SEC)), [C001]);
+        assert_eq!(
+            fire_ids(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC)),
+            [C007, C002]
+        );
+        let again = fire_ids(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC + 5));
+        assert!(again.is_empty(), "{again:?}");
         assert_eq!(
             first_verdict(&rules, &flow(42, 443, 13 * SEC)).map(|v| v.rule_id),
             Some(C007.to_string()),
@@ -2269,19 +2365,30 @@ mod tests {
     }
 
     /// The CI ordering of lab PR 235 — the exec processed after the read
-    /// and the egress: CHAIN-001 on the egress, CHAIN-007 on the late exec,
-    /// never CHAIN-002 as well — and the egress first, the exec, then the
-    /// read: CHAIN-002 on the late exec, CHAIN-007 on the late read. Either
-    /// way the flow gets the two-step chain first, then the longer one, and
-    /// nothing completes it a third time.
+    /// and the egress: CHAIN-001 on the egress, then CHAIN-007 and (lab PR
+    /// 267) CHAIN-002 on the late exec — and the egress first, the exec,
+    /// then the read: CHAIN-002 on the late exec, CHAIN-007 and CHAIN-001
+    /// on the late read. Either way the flow gets the three chains it gets
+    /// when the exec, the read and the egress are processed in kernel order
+    /// (lab PR 267, R12a: the priority bus takes them in any order), each
+    /// once, and nothing completes one a second time.
     #[test]
-    fn a_flow_gets_at_most_the_two_step_chain_then_chain007() {
+    fn a_flow_gets_each_chain_once_in_any_order() {
+        let rules = chain_rules();
+        fire_ids(&rules, &tmp_exec_started(41, 9 * SEC, 10 * SEC));
+        fire_ids(&rules, &cred_fim(41, 11 * SEC));
+        assert_eq!(
+            fire_ids(&rules, &flow(41, 443, 12 * SEC)),
+            [C007, C001, C002],
+            "in kernel order"
+        );
+
         let rules = chain_rules();
         assert!(fire_ids(&rules, &cred_fim(42, 11 * SEC)).is_empty());
         assert_eq!(fire_ids(&rules, &flow(42, 443, 12 * SEC)), [C001]);
         assert_eq!(
             fire_ids(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC)),
-            [C007]
+            [C007, C002]
         );
         assert!(fire_ids(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC + 5)).is_empty());
         assert!(fire_ids(&rules, &cred_fim(42, 11 * SEC + 5)).is_empty());
@@ -2298,11 +2405,49 @@ mod tests {
                 .iter()
                 .map(|v| (v.rule_id.as_str(), v.timestamp_ns))
                 .collect::<Vec<_>>(),
-            [(C007, 12 * SEC)],
-            "the read is the step CHAIN-002 lacked"
+            [(C007, 12 * SEC), (C001, 12 * SEC)],
+            "the read is the step CHAIN-002 lacked, and CHAIN-001's own"
         );
         assert!(fire_ids(&rules, &cred_fim(43, 11 * SEC + 5)).is_empty());
         assert!(fire_ids(&rules, &tmp_exec_started(43, 9 * SEC, 10 * SEC + 5)).is_empty());
+    }
+
+    /// Review #471 M9: a flow CHAIN-007 judged in order is answered — a
+    /// credential read processed later (stamped before the flow) completes
+    /// no second CHAIN-007 with the note an earlier phase of the flow left.
+    /// Two flows: the first late read completes the earlier one, the later
+    /// flow's next phase fires in order, and a second late read finds
+    /// nothing left.
+    #[test]
+    fn chain007_judged_in_order_is_not_completed_again_by_a_late_read() {
+        let phase = |e: Event, ph: FlowPhase| match e {
+            Event::NetFlow(mut nf) => {
+                nf.phase = ph;
+                Event::NetFlow(nf)
+            }
+            e => e,
+        };
+        let rules = chain_rules();
+        fire_ids(&rules, &tmp_exec_started(44, 9 * SEC, 10 * SEC));
+        let f1 = phase(flow(44, 443, 12 * SEC), FlowPhase::Connect);
+        let f2 = phase(flow(44, 8443, 13 * SEC), FlowPhase::Connect);
+        assert_eq!(fire_ids(&rules, &f1), [C002], "no read yet: noted");
+        assert_eq!(fire_ids(&rules, &f2), [C002], "noted");
+        let v = verdicts(&rules, &cred_fim(44, 11 * SEC));
+        assert_eq!(
+            v.iter()
+                .map(|v| (v.rule_id.as_str(), v.timestamp_ns))
+                .collect::<Vec<_>>(),
+            [(C007, 12 * SEC), (C001, 12 * SEC)],
+            "the late read completes the earlier flow"
+        );
+        let f2_later = phase(flow(44, 8443, 13 * SEC), FlowPhase::Snapshot);
+        assert_eq!(fire_ids(&rules, &f2_later), [C007, C001, C002], "in order");
+        let again = fire_ids(&rules, &cred_fim(44, 11 * SEC + 500));
+        assert!(
+            again.is_empty(),
+            "the in-order CHAIN-007 answered it: {again:?}"
+        );
     }
 
     /// An egress CHAIN-002 answered in order is claimed: a second staging

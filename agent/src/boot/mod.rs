@@ -434,6 +434,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             cow_guard: Some(combat.cow_guard.clone()),
             overlay_gate: Some(Arc::clone(&overlay_gate)),
             ja3_entries,
+            event_bus: Some(sensor.bus_stats()),
         },
     );
     let tasks::Tasks {

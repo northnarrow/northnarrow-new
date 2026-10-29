@@ -66,6 +66,7 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use nn_model::Event;
 use parking_lot::RwLock;
 
 use super::host::PostureHost;
@@ -679,6 +680,87 @@ struct InnerState {
     /// hot entry simply pays a single readlink+read_to_string on
     /// the next lookup.
     order: VecDeque<u32>,
+    /// Lab PR 267 (review #471 A1): the execs a pid ran before the one
+    /// [`Self::map`] holds, oldest first, at most [`HISTORY_PER_PID`] — what
+    /// an event judged after a later exec of its process ran at its time
+    /// ([`judged_at`]). Dropped with the pid's entry.
+    history: HashMap<u32, Vec<Entry>>,
+}
+
+/// Lab PR 267 (review #471 A1): earlier execs kept per pid (a wrapper's
+/// `exec`, an interpreter re-executing, a `dpkg` run after the event).
+const HISTORY_PER_PID: usize = 3;
+
+thread_local! {
+    /// Lab PR 267 (review #471 A1): the time the event being judged on this
+    /// thread happened ([`judged_at`]), set and cleared around the
+    /// synchronous judgement of one event.
+    static JUDGED_AT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Lab PR 267 (review #471 A1): run `f` — the synchronous judgement of one
+/// event that happened at `ts_ns` (CLOCK_MONOTONIC; 0: unknown, nothing is
+/// scoped) — with every lineage lookup made on this thread answered as of
+/// `ts_ns`: the exec a process had run by then, not one it ran after. On
+/// the priority bus an exec (P1) is taken ahead of the older file and
+/// network events of its process, and a tamper event hands the queued
+/// execs to the lineage before they are judged (`nn_linux::sensors::bus`):
+/// without the scope an event was judged on the image of a later exec of
+/// its pid (a reader exemption through a later `execve(restic)`, a package
+/// carve-out through a later `dpkg`). A pid whose only cached exec is later
+/// than `ts_ns` answers "not known" — never `/proc`, which shows the later
+/// image. Nested scopes restore the outer one.
+pub fn judged_at<R>(ts_ns: u64, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            JUDGED_AT.with(|c| c.set(self.0));
+        }
+    }
+    if ts_ns == 0 {
+        return f();
+    }
+    let _restore = Restore(JUDGED_AT.with(|c| c.replace(Some(ts_ns))));
+    f()
+}
+
+/// The time an event happened, as [`judged_at`] scopes its judgement: its
+/// kernel timestamp; a flow's connect time (`start_ns`: the process that
+/// connected), a canary trip's source event's. Every variant named.
+pub fn event_time_ns(event: &Event) -> u64 {
+    match event {
+        Event::ProcessSpawn { timestamp_ns, .. }
+        | Event::FileOpen { timestamp_ns, .. }
+        | Event::MassWrite { timestamp_ns, .. }
+        | Event::FileBurst { timestamp_ns, .. }
+        | Event::DefenderSignal { timestamp_ns, .. }
+        | Event::ExecCheck { timestamp_ns, .. }
+        | Event::ModuleLoad { timestamp_ns, .. }
+        | Event::BpfSyscall { timestamp_ns, .. }
+        | Event::IoUring { timestamp_ns, .. }
+        | Event::TcpConnect { timestamp_ns, .. }
+        | Event::DnsQuery { timestamp_ns, .. }
+        | Event::FsProtectDenial { timestamp_ns, .. }
+        | Event::CanaryTripped { timestamp_ns, .. }
+        | Event::DnsFlood { timestamp_ns, .. }
+        | Event::SensorFlood { timestamp_ns, .. }
+        | Event::ExploitPostcondition { timestamp_ns, .. } => *timestamp_ns,
+        Event::Fim(fe) => fe.timestamp_ns,
+        Event::NetFlow(nf) => nf.start_ns,
+        Event::NetListener(nl) => nl.timestamp_ns,
+    }
+}
+
+/// What the spawn cache knows a pid ran at a time.
+enum CachedAt {
+    /// The pid's latest exec (the time is at or after it, or no time).
+    Current(Entry),
+    /// An earlier exec of the pid, the latest at or before the time.
+    Past(Entry),
+    /// Only execs after the time: what it ran then is not known.
+    LaterOnly,
+    /// Nothing cached for the pid.
+    Absent,
 }
 
 #[derive(Debug)]
@@ -731,6 +813,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     daemons: HashMap::new(),
                     daemon_order: VecDeque::new(),
                     seen_running: HashMap::new(),
+                    history: HashMap::new(),
                 }),
                 proc_root,
                 live,
@@ -805,6 +888,41 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         self.ingest_exec(pid, ppid, exe, argv, spawn_ns, 0, 0);
     }
 
+    /// Lab PR 267 (R12a): ingest `event` when it is an exec
+    /// (`Event::ProcessSpawn`), with what the posture's triggers and the
+    /// replay ingest — the file the kernel executed (else the caller's
+    /// string), the arguments, the exec's time, the process's own start,
+    /// the uid. Returns whether it was one. The priority bus calls it for
+    /// the execs still queued when an event of a higher class overtakes
+    /// them, so the lineage that event is judged on holds every exec that
+    /// reached the bus before it, as on a single queue.
+    pub fn ingest_spawn_event(&self, event: &Event) -> bool {
+        let Event::ProcessSpawn {
+            pid,
+            ppid,
+            uid,
+            filename,
+            argv,
+            timestamp_ns,
+            exe,
+            start_ns,
+            ..
+        } = event
+        else {
+            return false;
+        };
+        self.ingest_exec(
+            *pid,
+            *ppid,
+            exe.path_or(filename),
+            argv,
+            *timestamp_ns,
+            *start_ns,
+            *uid,
+        );
+        true
+    }
+
     /// External audit POS-003: [`Self::ingest_spawn_with_argv`] with the
     /// process's own start (`Event::ProcessSpawn::start_ns`, its fork),
     /// as the exec event carries it (production; 0 unknown). Lab PR 175:
@@ -859,6 +977,33 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             uid,
         };
         let mut s = self.inner.state.write();
+        // Lab PR 267 (R12a): an exec the cache already holds (its time and
+        // its process's start) changes nothing — the first ingest of an
+        // exec stays. The priority bus ingests an exec when an event of a
+        // higher class overtakes it ([`Self::ingest_spawn_event`]), and
+        // again when the exec itself is judged. Review #471 A1: one older
+        // than the exec held for the pid goes into the pid's history, at its
+        // place, and the newer one stays current; the exec a newer one
+        // replaces goes into the history too ([`judged_at`]).
+        let same = |e: &Entry| e.spawn_ns == spawn_ns && e.start_ns == entry.start_ns;
+        if let Some(prev) = s.map.get(&pid).cloned() {
+            if same(&prev) || s.history.get(&pid).is_some_and(|h| h.iter().any(same)) {
+                return;
+            }
+            let h = s.history.entry(pid).or_default();
+            if prev.spawn_ns > spawn_ns {
+                let at = h.partition_point(|e| e.spawn_ns <= spawn_ns);
+                h.insert(at, entry);
+                if h.len() > HISTORY_PER_PID {
+                    h.remove(0);
+                }
+                return;
+            }
+            h.push(prev);
+            if h.len() > HISTORY_PER_PID {
+                h.remove(0);
+            }
+        }
         // NN-AUD-284: whatever ran under this pid before is over.
         s.seen_running.remove(&pid);
         // Review 49: package-manager spawns also go to the side cache;
@@ -888,8 +1033,45 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     // the rare case where the evicted entry was
                     // freshly overwritten.)
                     s.map.remove(&evict);
+                    s.history.remove(&evict);
                 }
             }
+        }
+    }
+
+    /// Lab PR 267 (review #471 A1): the time lookups answer for — `explicit`
+    /// (an event's time a caller passes; 0 is none), else the event being
+    /// judged on this thread ([`judged_at`]), else none (now).
+    fn at(&self, explicit: Option<u64>) -> Option<u64> {
+        explicit
+            .filter(|t| *t != 0)
+            .or_else(|| JUDGED_AT.with(std::cell::Cell::get))
+    }
+
+    /// What the spawn cache knows `pid` ran at `at` ([`CachedAt`]): its
+    /// latest exec when `at` is at or after it (or none), else the latest of
+    /// its earlier execs at or before `at`, else "only later". An earlier
+    /// exec of another process the pid was reused from answers only for a
+    /// time before the current process started: at a time the current
+    /// process already existed, the pid was it, still running what it
+    /// forked with (not known).
+    fn cached_at(&self, pid: u32, at: Option<u64>) -> CachedAt {
+        let s = self.inner.state.read();
+        let Some(cur) = s.map.get(&pid).or_else(|| s.daemons.get(&pid)) else {
+            return CachedAt::Absent;
+        };
+        match at {
+            Some(t) if cur.spawn_ns > t => match s
+                .history
+                .get(&pid)
+                .and_then(|h| h.iter().rev().find(|e| e.spawn_ns <= t))
+            {
+                Some(e) if e.start_ns == cur.start_ns || t < cur.start_ns => {
+                    CachedAt::Past(e.clone())
+                }
+                _ => CachedAt::LaterOnly,
+            },
+            _ => CachedAt::Current(cur.clone()),
         }
     }
 
@@ -974,8 +1156,11 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// Serves the FIM rules, NN-L-NET-008, the chains' package carve-out,
     /// R009 and the posture's arms.
     pub fn in_package_transaction(&self, pid: u32, event_ns: u64) -> bool {
-        let Some(Some(hop)) = self.lineage_walk(
+        // Review #471 A1: the lineage as of the event — a package manager
+        // the pid (or an ancestor) executed after it covers nothing.
+        let Some(Some(hop)) = self.lineage_walk_at(
             pid,
+            self.at(Some(event_ns)),
             |hop| is_package_manager_binary(&hop.exe),
             LINEAGE_DEPTH_CAP,
         ) else {
@@ -1430,10 +1615,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if pid == 0 || pid == 1 {
             return false;
         }
-        let s = self.inner.state.read();
-        s.map
-            .get(&pid)
-            .is_some_and(|e| e.argv_npm_cli && is_node_exe(&e.exe))
+        match self.cached_at(pid, self.at(None)) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e.argv_npm_cli && is_node_exe(&e.exe),
+            CachedAt::LaterOnly | CachedAt::Absent => false,
+        }
     }
 
     /// Walk the lineage of `pid` upward and return true if `pid` runs an
@@ -1482,10 +1667,22 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         is_match: impl Fn(&Hop) -> bool,
         max_up: usize,
     ) -> Option<Option<Hop>> {
+        self.lineage_walk_at(pid, self.at(None), is_match, max_up)
+    }
+
+    /// [`Self::lineage_walk`] as of `at` (review #471 A1): each hop the
+    /// exec its pid had run by then ([`Self::hop_at`]).
+    fn lineage_walk_at(
+        &self,
+        pid: u32,
+        at: Option<u64>,
+        is_match: impl Fn(&Hop) -> bool,
+        max_up: usize,
+    ) -> Option<Option<Hop>> {
         if pid == 0 || pid == 1 {
             return Some(None);
         }
-        let mut below = self.hop(pid)?;
+        let mut below = self.hop_at(pid, at)?;
         if is_match(&below) {
             return Some(Some(below));
         }
@@ -1494,7 +1691,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             if ppid == 0 || ppid == 1 || ppid == below.pid {
                 return Some(None);
             }
-            let up = self.hop(ppid)?;
+            let up = self.hop_at(ppid, at)?;
             if !self.started_no_later(&up, &below) {
                 return Some(None);
             }
@@ -1578,12 +1775,21 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// One hop of the walk: the spawn cache's record of `pid` while it
     /// still describes the process `pid` names, else `/proc`.
     fn hop(&self, pid: u32) -> Option<Hop> {
-        let cached = {
-            let s = self.inner.state.read();
-            s.map.get(&pid).or_else(|| s.daemons.get(&pid)).cloned()
+        self.hop_at(pid, self.at(None))
+    }
+
+    /// [`Self::hop`] as of `at` (review #471 A1): an earlier exec of the
+    /// pid when its latest came after `at`; `None` (not known) when only
+    /// later ones are cached — `/proc` would show the later image.
+    fn hop_at(&self, pid: u32, at: Option<u64>) -> Option<Hop> {
+        let (cached, past) = match self.cached_at(pid, at) {
+            CachedAt::Current(e) => (Some(e), false),
+            CachedAt::Past(e) => (Some(e), true),
+            CachedAt::LaterOnly => return None,
+            CachedAt::Absent => (None, false),
         };
         if let Some(e) = cached {
-            if self.entry_is_current(pid, &e) {
+            if past || self.entry_is_current(pid, &e) {
                 return Some(Hop {
                     pid,
                     ppid: e.ppid,
@@ -1828,14 +2034,16 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if pid == 0 {
             return None;
         }
-        {
-            let s = self.inner.state.read();
-            if let Some(e) = s.map.get(&pid).or_else(|| s.daemons.get(&pid)) {
+        // Review #471 A1: as of the event being judged ([`judged_at`]).
+        match self.cached_at(pid, self.at(None)) {
+            CachedAt::Current(e) | CachedAt::Past(e) => {
                 return Some(ExecIdentity {
-                    exe: e.exe.clone(),
+                    exe: e.exe,
                     script: e.script.as_deref().map(str::to_string),
                 });
             }
+            CachedAt::LaterOnly => return None,
+            CachedAt::Absent => {}
         }
         let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
         if exe.to_string_lossy().ends_with(" (deleted)") {
@@ -1852,14 +2060,22 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// itself is still judged by the directory it ran from. A forked child
     /// that never exec'd has no cache entry and answers through `/proc`.
     pub fn image_path(&self, pid: u32) -> Option<String> {
+        self.image_path_at(pid, 0)
+    }
+
+    /// [`Self::image_path`] as of `at_ns` (review #471 A1; 0: the event
+    /// being judged on this thread, else now): an earlier exec when the
+    /// latest came after it, `None` when only later ones are cached.
+    pub fn image_path_at(&self, pid: u32, at_ns: u64) -> Option<String> {
         if pid == 0 {
             return None;
         }
-        {
-            let s = self.inner.state.read();
-            if let Some(e) = s.map.get(&pid).or_else(|| s.daemons.get(&pid)) {
-                return Some(e.exe.to_string_lossy().into_owned());
+        match self.cached_at(pid, self.at(Some(at_ns))) {
+            CachedAt::Current(e) | CachedAt::Past(e) => {
+                return Some(e.exe.to_string_lossy().into_owned())
             }
+            CachedAt::LaterOnly => return None,
+            CachedAt::Absent => {}
         }
         let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
         Some(exe.to_string_lossy().into_owned())
@@ -1893,29 +2109,32 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if floor > at_ns {
             return None;
         }
-        let cached = {
-            let s = self.inner.state.read();
-            s.map
-                .get(&pid)
-                .or_else(|| s.daemons.get(&pid))
-                .map(|e| (e.exe.clone(), e.spawn_ns, e.start_ns))
-        };
-        if let Some((exe, exec_ns, start_ns)) = cached {
-            // An earlier holder's exec says nothing about this process.
-            if !self.inner.live || self.ticks_show_start(ticks, start_ns) {
-                return (exec_ns <= at_ns).then(|| exe.to_string_lossy().into_owned());
+        // Review #471 A1: an earlier exec of the process when it executed
+        // another image after `at_ns` (its history), else not known.
+        match self.cached_at(pid, Some(at_ns)) {
+            CachedAt::Current(e) | CachedAt::Past(e) => {
+                // An earlier holder's exec says nothing about this process.
+                if !self.inner.live || self.ticks_show_start(ticks, e.start_ns) {
+                    return (e.spawn_ns <= at_ns).then(|| e.exe.to_string_lossy().into_owned());
+                }
             }
+            CachedAt::LaterOnly => {
+                let latest = self.inner.state.read().map.get(&pid).map(|e| e.start_ns);
+                if !self.inner.live || latest.is_some_and(|st| self.ticks_show_start(ticks, st)) {
+                    return None;
+                }
+            }
+            CachedAt::Absent => {}
         }
         let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
         Some(exe.to_string_lossy().into_owned())
     }
 
     fn lookup_cache(&self, pid: u32) -> Option<(u32, PathBuf)> {
-        let s = self.inner.state.read();
-        s.map
-            .get(&pid)
-            .or_else(|| s.daemons.get(&pid))
-            .map(|e| (e.ppid, e.exe.clone()))
+        match self.cached_at(pid, self.at(None)) {
+            CachedAt::Current(e) | CachedAt::Past(e) => Some((e.ppid, e.exe)),
+            CachedAt::LaterOnly | CachedAt::Absent => None,
+        }
     }
 
     /// `/proc/<pid>`: its parent, its exe, and its real uid (`None` when
@@ -2098,6 +2317,227 @@ mod tests {
 
     /// R08a (lab PR 250): the tracker on the portable test host.
     type AuthSessionTracker = super::AuthSessionTracker<H>;
+
+    /// Review #471 A1: judged as of an event's time, a pid that executed
+    /// again later answers with the image it ran then — its identity, its
+    /// image, its walk — and one whose only cached exec is later answers
+    /// "not known", never `/proc`'s later image; without a scope, now.
+    /// Second review of #471 (R-B): the history is three execs deep — an
+    /// event followed by three more execs of its process is still judged on
+    /// its own image; by four, "not known" (an exemption then does not
+    /// apply, fail-closed; a rule that wants a positive image does not fire
+    /// — the open R-B follow-up).
+    #[test]
+    fn the_history_is_three_execs_deep() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        t.ingest_exec(4500, 1, "/tmp/.x/stager", &[], 10 * S, 9 * S, 1000);
+        for (i, exe) in ["/usr/bin/a", "/usr/bin/b", "/usr/bin/c"]
+            .iter()
+            .enumerate()
+        {
+            t.ingest_exec(4500, 1, exe, &[], (20 + 10 * i as u64) * S, 9 * S, 1000);
+        }
+        assert_eq!(
+            t.image_path_at(4500, 15 * S).as_deref(),
+            Some("/tmp/.x/stager")
+        );
+        assert_eq!(t.image_path_at(4500, 25 * S).as_deref(), Some("/usr/bin/a"));
+        t.ingest_exec(4500, 1, "/usr/bin/d", &[], 50 * S, 9 * S, 1000);
+        assert_eq!(t.image_path_at(4500, 15 * S), None, "four later: not known");
+        assert_eq!(t.image_path_at(4500, 25 * S).as_deref(), Some("/usr/bin/a"));
+    }
+
+    /// Second review of #471 (R2, R3): the time a judgement is scoped to is
+    /// the event's own — a FIM record's (the canary detector makes a file
+    /// canary's trip from it, judged in the same scope: the reader
+    /// exemption), a flow's start (NET-008's image fallback) — not "now",
+    /// which a later exec of the process has moved.
+    #[test]
+    fn a_fim_record_and_a_flow_are_judged_as_of_their_own_time() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        t.ingest_exec(4600, 1, "/usr/bin/cat", &[], 10 * S, 9 * S, 1000);
+        t.ingest_exec(4600, 1, "/usr/bin/restic", &[], 30 * S, 9 * S, 1000);
+        let fim: nn_model::telemetry::FimEvent = serde_json::from_value(serde_json::json!({
+            "timestamp_ns": 20 * S, "path": "/home/u/.ssh/id_backup", "op": 6,
+            "new_sha256": null, "baseline_sha256": null, "modifier_exe": null,
+            "modifier_pid": 4600, "modifier_uid": 1000, "modifier_comm": "cat"
+        }))
+        .unwrap();
+        let fim = Event::Fim(fim);
+        let readers = crate::canary::readers::CanaryReaders::new(Default::default(), t.clone());
+        assert_eq!(
+            readers.reader(4600).as_deref(),
+            Some("/usr/bin/restic"),
+            "now: the later exec"
+        );
+        assert_eq!(
+            judged_at(event_time_ns(&fim), || readers.reader(4600)),
+            None,
+            "the trip from the FIM record: cat read it, no reader"
+        );
+        let mut flow: nn_model::telemetry::NetFlowEvent = serde_json::from_value(serde_json::json!({
+            "start_ns": 20 * S, "end_ns": 21 * S, "family": 2, "src_addr": "10.0.2.15",
+            "src_port": 40000, "dst_addr": "100.64.20.9", "dst_port": 443, "proto": 6,
+            "pid": 4600, "uid": 1000, "comm": "cat", "exe": null, "proc_start_ns": 9 * S,
+            "bytes_sent": 1, "bytes_recv": 1, "resolved_hostname": null, "tls_fingerprint": null,
+            "flow_id": "f", "phase": "connect"
+        }))
+        .unwrap();
+        flow.observed_ns = 25 * S;
+        let flow = Event::NetFlow(flow);
+        assert_eq!(
+            judged_at(event_time_ns(&flow), || t.image_path(4600)).as_deref(),
+            Some("/usr/bin/cat")
+        );
+    }
+
+    /// Review #471 A1, a pid reused: the exec of the process the pid had
+    /// before answers for a time before the current process started, never
+    /// for a time the current one already ran (forked, not yet exec'd).
+    #[test]
+    fn a_reused_pid_s_earlier_process_answers_only_for_its_own_time() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        t.ingest_exec(4400, 1, "/usr/bin/restic", &[], 2 * S, S, 0);
+        t.ingest_exec(4400, 1, "/usr/bin/cat", &[], 40 * S, 30 * S, 1000);
+        assert_eq!(
+            t.image_path_at(4400, 5 * S).as_deref(),
+            Some("/usr/bin/restic")
+        );
+        assert_eq!(
+            t.image_path_at(4400, 35 * S),
+            None,
+            "the current process, before its exec"
+        );
+        assert_eq!(
+            t.image_path_at(4400, 45 * S).as_deref(),
+            Some("/usr/bin/cat")
+        );
+        judged_at(35 * S, || assert_eq!(t.exec_identity(4400), None));
+    }
+
+    #[test]
+    fn a_lookup_judged_at_an_event_s_time_sees_the_exec_of_then() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        t.ingest_exec(4200, 1, "/usr/bin/cat", &[], 10 * S, 9 * S, 1000);
+        t.ingest_exec(4200, 1, "/usr/bin/restic", &[], 20 * S, 9 * S, 1000);
+        let exe = |id: Option<ExecIdentity>| id.map(|i| i.exe.to_string_lossy().into_owned());
+        assert_eq!(
+            exe(t.exec_identity(4200)).as_deref(),
+            Some("/usr/bin/restic"),
+            "now"
+        );
+        judged_at(15 * S, || {
+            assert_eq!(exe(t.exec_identity(4200)).as_deref(), Some("/usr/bin/cat"));
+            assert_eq!(t.image_path(4200).as_deref(), Some("/usr/bin/cat"));
+            // nested: the inner time, then the outer one again
+            judged_at(25 * S, || {
+                assert_eq!(t.image_path(4200).as_deref(), Some("/usr/bin/restic"));
+            });
+            assert_eq!(t.image_path(4200).as_deref(), Some("/usr/bin/cat"));
+        });
+        judged_at(5 * S, || {
+            assert_eq!(t.exec_identity(4200), None, "before every cached exec");
+            assert_eq!(t.image_path(4200), None);
+        });
+        assert_eq!(
+            t.image_path_at(4200, 15 * S).as_deref(),
+            Some("/usr/bin/cat")
+        );
+        assert_eq!(
+            exe(t.exec_identity(4200)).as_deref(),
+            Some("/usr/bin/restic"),
+            "scope gone"
+        );
+        // the overtaken order: the later exec ingested first, the earlier
+        // one after it goes to the history
+        let u = AuthSessionTracker::new(proc.path());
+        u.ingest_exec(4300, 1, "/usr/bin/restic", &[], 20 * S, 9 * S, 1000);
+        u.ingest_exec(4300, 1, "/usr/bin/cat", &[], 10 * S, 9 * S, 1000);
+        assert_eq!(
+            u.image_path_at(4300, 15 * S).as_deref(),
+            Some("/usr/bin/cat")
+        );
+        assert_eq!(u.image_path(4300).as_deref(), Some("/usr/bin/restic"));
+    }
+
+    /// Review #471 A1: a package manager the process executed after the
+    /// event covers nothing — the transaction is the lineage's as of the
+    /// event, not the one cached now.
+    #[test]
+    fn a_later_package_manager_exec_covers_no_earlier_event() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        t.ingest_exec(4400, 1, "/tmp/.r/stager", &[], 10 * S, 9 * S, 0);
+        t.ingest_exec(4400, 1, "/usr/bin/dpkg", &[], 20 * S, 9 * S, 0);
+        assert!(
+            !t.in_package_transaction(4400, 15 * S),
+            "the write before dpkg"
+        );
+        assert!(t.in_package_transaction(4400, 21 * S), "the run after it");
+    }
+
+    /// Lab PR 267 (R12a): an exec the cache holds already, or one older than
+    /// the exec it holds for the pid, changes nothing — the priority bus
+    /// ingests an exec a tamper event overtakes, and again when the exec is
+    /// judged, possibly after a newer exec of the same pid.
+    #[test]
+    fn an_exec_ingested_again_or_out_of_order_changes_nothing() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        let spawn = |exe: &str, ts: u64| Event::ProcessSpawn {
+            pid: 4100,
+            ppid: 1,
+            uid: 0,
+            gid: 0,
+            comm: "x".to_string(),
+            filename: exe.to_string(),
+            timestamp_ns: ts,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+            start_ns: 5,
+            parent_is_kthread: false,
+            exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        };
+        let a = spawn("/usr/bin/env", 10);
+        let b = spawn("/usr/bin/python3", 20);
+        assert!(t.ingest_spawn_event(&a));
+        assert!(t.ingest_spawn_event(&b), "the newer exec, overtaken");
+        assert_eq!(t.image_path(4100).as_deref(), Some("/usr/bin/python3"));
+        assert!(
+            t.ingest_spawn_event(&a),
+            "the older exec judged in its turn"
+        );
+        assert_eq!(
+            t.image_path(4100).as_deref(),
+            Some("/usr/bin/python3"),
+            "an older exec does not overwrite the newer"
+        );
+        assert!(t.ingest_spawn_event(&b));
+        assert_eq!(t.image_path(4100).as_deref(), Some("/usr/bin/python3"));
+        let c = spawn("/usr/bin/perl", 30);
+        t.ingest_spawn_event(&c);
+        assert_eq!(
+            t.image_path(4100).as_deref(),
+            Some("/usr/bin/perl"),
+            "a newer one does"
+        );
+        assert!(!t.ingest_spawn_event(&Event::BpfSyscall {
+            pid: 1,
+            uid: 0,
+            comm: String::new(),
+            cmd: 0,
+            arg: 0,
+            timestamp_ns: 0,
+        }));
+    }
 
     fn write_status(dir: &Path, pid: u32, ppid: u32) {
         let pid_dir = dir.join(pid.to_string());
@@ -3125,10 +3565,13 @@ mod tests {
         write_started(tmp.path(), "200", 1, ticks(499 * S));
         write_exe(tmp.path(), 200, "/usr/sbin/dnsmasq");
         assert_eq!(t.image_at(200, 600 * S).as_deref(), Some("/usr/bin/curl"));
-        // it executed a forwarder's image after the query: not known, and
-        // never that image
+        // it executed a forwarder's image after the query: never that
+        // image — lab PR 267 (review #471 A1): the exec it ran then, kept in
+        // the pid's history (it was "not known" before the history)
         t.ingest_exec(200, 1, "/usr/sbin/dnsmasq", &[], 700 * S, 499 * S, 0);
-        assert_eq!(t.image_at(200, 600 * S), None);
+        assert_eq!(t.image_at(200, 600 * S).as_deref(), Some("/usr/bin/curl"));
+        // before any exec the cache knows of: not known
+        assert_eq!(t.image_at(200, 450 * S), None);
         assert_eq!(
             t.image_at(200, 800 * S).as_deref(),
             Some("/usr/sbin/dnsmasq")

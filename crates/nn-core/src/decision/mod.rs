@@ -72,6 +72,14 @@ pub trait Rule: Send + Sync {
     /// Implementations must keep this hot-path cheap — no allocations
     /// in the negative case where possible.
     fn evaluate(&self, event: &Event) -> Option<Verdict>;
+
+    /// Lab PR 267 (R12a): `event` reached the bus and an event of a higher
+    /// class is judged before it ([`RuleEngine::observe_arrival`]). A rule
+    /// whose state other events are judged on learns here what `event`
+    /// makes known of the process tree, so the overtaking event is judged as
+    /// on a single queue; `evaluate` runs later all the same and must find
+    /// the state as it left it. Nothing by default.
+    fn observe_arrival(&self, _event: &Event) {}
 }
 
 #[cfg(test)]

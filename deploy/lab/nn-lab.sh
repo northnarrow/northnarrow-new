@@ -1744,7 +1744,13 @@ cmd_soak() {
             mkdir -p "$dir"
             vscp \
                 "$GUEST:soak/samples.csv" "$GUEST:soak/sample.log" "$GUEST:soak/sample.err" "$GUEST:soak/generate.log" "$GUEST:soak/host" "$GUEST:soak/hours" "$dir/" 2>/dev/null || true
-            vssh 'sudo journalctl -u northnarrow-agent -u northnarrow-watchdog --since "$(cat ~/soak/start)" -p 4 --no-pager -q 2>/dev/null | tail -200' > "$dir/journal-warn-err.log" 2>/dev/null || true
+            # Review #471: the units log to their journal namespace
+            # (LogNamespace=northnarrow) through tracing on stdout, every
+            # line at journald priority 6 — a plain `journalctl -p 4` read
+            # the default namespace by priority and found nothing. The
+            # tracing level by text, as the sampler counts it
+            # (deploy/lab/soak/sample.sh), every WARN and ERROR of the soak.
+            vssh 'sudo journalctl --namespace=northnarrow -u northnarrow-agent -u northnarrow-watchdog --since "$(cat ~/soak/start)" --no-pager -q 2>/dev/null | grep -E "Z +(WARN|ERROR) "' > "$dir/journal-warn-err.log" 2>/dev/null || true
             [ -s "$dir/samples.csv" ] || die "no samples.csv on the guest — was the soak started?"
             local max_rss_mb_h=${NN_LAB_SOAK_MAX_RSS_MB_H:-5}
             # External audit NN-AUD-216: ring drops fail the soak above this

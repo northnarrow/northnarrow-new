@@ -2467,6 +2467,7 @@ fn telemetry_withheld(out: &StatusOutcome) -> bool {
         && out.ransomware_decisive_total.is_none()
         && out.defense_tamper_total.is_none()
         && out.execpol_state.is_none()
+        && out.event_bus.is_none()
 }
 
 /// The line that replaces the telemetry in an unsigned reply.
@@ -3115,7 +3116,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"telemetry_signed\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"event_bus\":{},\"telemetry_signed\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -3165,6 +3166,8 @@ fn print_status(out: &StatusOutcome, json: bool) {
             serde_json::to_string(&out.cow_guard).unwrap_or_else(|_| "null".to_string()),
             execq_json(out),
             execpol_json(out),
+            // Lab PR 267 (R12a).
+            serde_json::to_string(&out.event_bus).unwrap_or_else(|_| "null".to_string()),
             out.telemetry_signed,
         );
         return;
@@ -3265,11 +3268,82 @@ fn print_status(out: &StatusOutcome, json: bool) {
             );
         }
     }
+    // Lab PR 267 (R12a): the event bus's queues, and the losses by stage.
+    for line in event_bus_lines(out.event_bus.as_ref(), tty) {
+        println!("{line}");
+    }
     println!("{}", deny_fail_open_line(out, tty));
     // Lab PR 222: the copy-on-first-write guard.
     for line in cow_guard_lines(out.cow_guard.as_ref()) {
         println!("{line}");
     }
+}
+
+/// Lab PR 267 (R12a): the event bus's lines of `status --key` — a queue per
+/// class (its capacity and what a full queue does, the events queued and
+/// dropped, the depth, the longest wait, the sends that waited for room,
+/// the takes by aging, the latency from queue to decision), then the loss
+/// counters of every stage of an event's path.
+fn event_bus_lines(
+    bus: Option<&nn_proto::admin_protocol::EventBusStatus>,
+    tty: bool,
+) -> Vec<String> {
+    let Some(bus) = bus else {
+        return vec!["event bus         : (agent predates the bus)".to_string()];
+    };
+    let us = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |v| format!("{v} µs"));
+    let mut out = Vec::new();
+    for (i, q) in bus.queues.iter().enumerate() {
+        let label = if i == 0 {
+            "event bus         : "
+        } else {
+            "                    "
+        };
+        let dropped = if q.dropped == 0 {
+            colorize("0", "32", tty)
+        } else {
+            colorize(&q.dropped.to_string(), "31", tty)
+        };
+        out.push(format!(
+            "{label}{} {:<7} {} slots ({}): {} queued, {dropped} dropped, depth {} (max {}), \
+             longest wait {} µs (recent {} µs), {} waited for room (longest {} µs), \
+             {} taken ahead by share, {} coalesced; decided {}, p50 {} p99 {} max {}",
+            q.priority,
+            q.class,
+            q.capacity,
+            q.when_full,
+            q.enqueued,
+            q.depth,
+            q.max_depth,
+            q.max_wait_us,
+            q.recent_max_wait_us,
+            q.waited,
+            q.send_wait_max_us,
+            q.ahead,
+            q.coalesced,
+            q.decided,
+            us(q.latency_p50_us),
+            us(q.latency_p99_us),
+            us(q.latency_max_us),
+        ));
+    }
+    for (i, st) in bus.stages.iter().enumerate() {
+        let label = if i == 0 {
+            "loss by stage     : "
+        } else {
+            "                    "
+        };
+        let total = match st.total {
+            Some(0) => colorize("0", "32", tty),
+            Some(n) => colorize(&n.to_string(), "31", tty),
+            None => "-".to_string(),
+        };
+        out.push(format!(
+            "{label}{} {:<21} {total} ({})",
+            st.stage, st.name, st.source
+        ));
+    }
+    out
 }
 
 /// Lab PR 222: the guard's lines of `status --key`.
@@ -5131,6 +5205,7 @@ mod flow_sock_line_tests {
             execpol_map_denied_total: None,
             execpol_map_recorded_total: None,
             execq_script_refused_total: None,
+            event_bus: None,
             telemetry_signed: true,
         }
     }

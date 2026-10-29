@@ -996,6 +996,7 @@ fn audit_chains_rotate_keys_add_emissions_and_skips_non_auditable() {
         execpol_map_denied_total: None,
         execpol_map_recorded_total: None,
         execq_script_refused_total: None,
+        event_bus: None,
     });
     emit_audit_for(
         &status_req,

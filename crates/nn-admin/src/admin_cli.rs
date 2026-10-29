@@ -249,6 +249,10 @@ pub struct StatusOutcome {
     pub execpol_map_denied_total: Option<u64>,
     pub execpol_map_recorded_total: Option<u64>,
     pub execq_script_refused_total: Option<u64>,
+    /// Lab PR 267 (R12a): the priority event bus and the loss counters by
+    /// stage (`StatusResponse::event_bus`; `None` from an older agent or
+    /// the unsigned reply).
+    pub event_bus: Option<nn_proto::admin_protocol::EventBusStatus>,
     /// External audit ASK-009 (lab PR 213): the reply of the signed
     /// telemetry verb (`--key`). `false` for the unsigned `status`, whose
     /// telemetry fields the agent leaves `None` — withheld, not unknown.
@@ -503,6 +507,7 @@ fn status_outcome(resp: nn_proto::admin_protocol::StatusResponse, signed: bool) 
         execpol_map_denied_total: resp.execpol_map_denied_total,
         execpol_map_recorded_total: resp.execpol_map_recorded_total,
         execq_script_refused_total: resp.execq_script_refused_total,
+        event_bus: resp.event_bus,
         telemetry_signed: signed,
     }
 }
@@ -3788,6 +3793,7 @@ mod tests {
                     execpol_map_denied_total: Some(17),
                     execpol_map_recorded_total: Some(18),
                     execq_script_refused_total: Some(19),
+                    event_bus: None,
                 }),
             );
         });

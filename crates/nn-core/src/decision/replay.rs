@@ -112,8 +112,11 @@ pub fn engine<H: DecisionHost>(host: HostParts<'_, H>) -> RuleEngine<H> {
         Arc::new(Mutex::new(super::rules::net::BeaconWindow::new())),
         Arc::new(crate::net::dns_cache::DnsCache::default()),
         H::inert_installer_window(),
-        lineage,
-        crate::canary::readers::CanaryReaders::default(),
+        lineage.clone(),
+        // Lab PR 267 (review #471 A1): the built-in readers judged through
+        // the lineage, as the start wires them (`CanaryReaders::load`) — the
+        // reader exemption of NN-L-CANARY-001 in the replay too.
+        crate::canary::readers::CanaryReaders::new(Default::default(), lineage),
         correlation,
         net_config,
         ransom,
@@ -132,28 +135,16 @@ pub fn decide<H: DecisionHost>(
     lineage: &AuthSessionTracker<H>,
     event: &Event,
 ) -> Value {
-    if let Event::ProcessSpawn {
-        pid,
-        ppid,
-        uid,
-        filename,
-        argv,
-        timestamp_ns,
-        exe,
-        start_ns,
-        ..
-    } = event
-    {
-        lineage.ingest_exec(
-            *pid,
-            *ppid,
-            exe.path_or(filename),
-            argv,
-            *timestamp_ns,
-            *start_ns,
-            *uid,
-        );
-    }
+    lineage.ingest_spawn_event(event);
+    // Lab PR 267 (review #471 A1): judged as of the event's own time, as
+    // `process_event` judges it.
+    crate::posture::lineage::judged_at(crate::posture::lineage::event_time_ns(event), || {
+        decide_now(engine, event)
+    })
+}
+
+/// [`decide`] without the ingest, as of the scope the caller set.
+fn decide_now<H: DecisionHost>(engine: &RuleEngine<H>, event: &Event) -> Value {
     match event {
         Event::FsProtectDenial { .. } => {
             let at001 = super::rules::anti_tamper::NnLAt001AntiTamperDenial;
@@ -166,6 +157,20 @@ pub fn decide<H: DecisionHost>(
             outside_line(v, rule.map_or(&[][..], |r| r.attack()), response)
         }
         _ => decision_line(engine.decide(event).as_ref()),
+    }
+}
+
+/// Lab PR 267 (R12a): what the bus does for an exec an event of a higher
+/// class overtakes (`nn_linux::sensors::bus`): the lineage ingests it and
+/// the engine's rules learn its place in the process tree
+/// ([`RuleEngine::observe_arrival`]); judging it later changes neither.
+pub fn arrive<H: DecisionHost>(
+    engine: &RuleEngine<H>,
+    lineage: &AuthSessionTracker<H>,
+    event: &Event,
+) {
+    if lineage.ingest_spawn_event(event) {
+        engine.observe_arrival(event);
     }
 }
 

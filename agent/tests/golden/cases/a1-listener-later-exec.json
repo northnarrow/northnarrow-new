@@ -1,0 +1,66 @@
+{
+ "about": "Review #471 A1 (lab PR 267): a program staged in /tmp listens on port 8080, then executes /usr/sbin/nginx in the same pid (the socket is inherited). In kernel order the listener is judged on the staged program; on the priority bus the exec (P1) is taken ahead of the listener (P3) and NN-L-NET-006/019's installed-service exemption read nginx; judged as of the listener's time it is the staged program's.",
+ "fires": [
+  "NN-L-NET-006_UncommonListener",
+  "NN-L-NET-019_WildcardListener"
+ ],
+ "items": [
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6474001,
+     "ppid": 1,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "srv",
+     "filename": "/tmp/.l/srv",
+     "timestamp_ns": 3610000000000,
+     "argv": [
+      "/tmp/.l/srv"
+     ],
+     "parent_comm": "systemd",
+     "start_ns": 3609000000000,
+     "exe": {
+      "path": "/tmp/.l/srv"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "NetListener": {
+     "timestamp_ns": 3611000000000,
+     "family": 2,
+     "bind_addr": "0.0.0.0",
+     "bind_port": 8080,
+     "proto": 6,
+     "pid": 6474001,
+     "uid": 1000,
+     "comm": "srv",
+     "exe": null
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6474001,
+     "ppid": 1,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "nginx",
+     "filename": "/usr/sbin/nginx",
+     "timestamp_ns": 3612000000000,
+     "argv": [
+      "nginx"
+     ],
+     "parent_comm": "systemd",
+     "start_ns": 3609000000000,
+     "exe": {
+      "path": "/usr/sbin/nginx"
+     }
+    }
+   }
+  }
+ ]
+}

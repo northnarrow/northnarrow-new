@@ -118,6 +118,57 @@ fn telemetry_status(
         execpol_map_denied_total: Some(execpol.map_denied),
         execpol_map_recorded_total: Some(execpol.map_recorded),
         execq_script_refused_total: Some(execq.script_refused),
+        // Lab PR 267 (R12a): the event bus and the losses by stage.
+        event_bus: handles.event_bus.as_ref().map(event_bus_status),
+    }
+}
+
+/// Lab PR 267 (R12a): the bus's queues, and the loss counters of every
+/// stage of an event's path (1 to 3 next to the bus's, 5 to 8 named, not
+/// counted yet).
+fn event_bus_status(
+    bus: &crate::sensors::bus::BusStats,
+) -> nn_proto::admin_protocol::EventBusStatus {
+    use nn_proto::admin_protocol::{BusQueueStatus, EventBusStatus, LossStageCount};
+    let queues = bus.snapshot();
+    let stages = crate::sensors::bus::loss_stages(
+        &crate::sensors::ring_drops::snapshot(),
+        crate::sensors::reject::total(),
+        &queues,
+    );
+    EventBusStatus {
+        queues: queues
+            .iter()
+            .map(|q| BusQueueStatus {
+                priority: q.priority.label().to_string(),
+                class: q.priority.name().to_string(),
+                capacity: q.capacity,
+                when_full: q.when_full.clone(),
+                enqueued: q.stats.enqueued,
+                dropped: q.stats.dropped,
+                depth: q.stats.depth,
+                max_depth: q.stats.max_depth,
+                max_wait_us: q.stats.max_wait_ns / 1_000,
+                recent_max_wait_us: q.recent_max_wait_us,
+                waited: q.waited,
+                send_wait_max_us: q.send_wait_max_us,
+                ahead: q.stats.ahead,
+                coalesced: q.coalesced,
+                decided: q.decided,
+                latency_p50_us: q.latency_p50_us,
+                latency_p99_us: q.latency_p99_us,
+                latency_max_us: q.latency_max_us,
+            })
+            .collect(),
+        stages: stages
+            .into_iter()
+            .map(|s| LossStageCount {
+                stage: s.stage,
+                name: s.name.to_string(),
+                total: s.total,
+                source: s.source.to_string(),
+            })
+            .collect(),
     }
 }
 

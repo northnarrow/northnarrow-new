@@ -148,19 +148,70 @@ impl EgressNote {
     }
 }
 
-/// Lab PR 235: a noted egress, and whether a two-step chain already fired
-/// on it. A claimed egress completes no further two-step chain, but a late
-/// precursor can still complete the three-step CHAIN-007 with it.
+/// Lab PR 235: a noted egress, and the chains that answered it.
 ///
-/// Lab PR 244: the claim names the precursor of the two-step chain —
-/// `CredRead` for NN-L-CHAIN-001, `TmpExec` for NN-L-CHAIN-002 — because
-/// the step CHAIN-007 still lacks differs: after CHAIN-001 the staging exec
-/// ([`CorrelationStore::exec_sequence_egress`]), after CHAIN-002 the
-/// credential read ([`CorrelationStore::take_egress_after`]).
+/// Lab PR 267 (R12a): each chain answers an egress at most once, in order
+/// or late — NN-L-CHAIN-001 (its precursor `CredRead`), NN-L-CHAIN-002
+/// (`TmpExec`), the three-step NN-L-CHAIN-007 — and none keeps another
+/// from it. Lab PRs 235 and 244 let the first two-step chain to answer a
+/// flow keep the other one from a late completion, and CHAIN-007 took the
+/// egress from both: a flow whose staging exec and credential read reach
+/// the engine before it gets CHAIN-001, CHAIN-002 and CHAIN-007, and one
+/// whose exec comes last got CHAIN-001 and CHAIN-007 only. On the priority
+/// bus the exec (P1), the read (P2) and the flow (P3) are taken in any of
+/// those orders, so the verdicts of a flow no longer depend on which came
+/// last ([`Answered`]).
 #[derive(Clone, Debug)]
 struct NotedEgress {
     note: EgressNote,
-    claimed_by: Option<PrecursorKind>,
+    answered: Answered,
+}
+
+/// Lab PR 267 (R12a): the chains that answered a noted egress
+/// ([`NotedEgress`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Answered {
+    /// NN-L-CHAIN-001 (credential read, then the egress).
+    pub cred_read: bool,
+    /// NN-L-CHAIN-002 (staging exec, then the egress).
+    pub tmp_exec: bool,
+    /// NN-L-CHAIN-007 (staging exec, credential read, then the egress).
+    pub sequence: bool,
+}
+
+/// Lab PR 267 (R12a): a chain that answers an egress ([`Answered`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EgressChain {
+    /// NN-L-CHAIN-001.
+    CredRead,
+    /// NN-L-CHAIN-002.
+    TmpExec,
+    /// NN-L-CHAIN-007.
+    Sequence,
+}
+
+impl Answered {
+    fn by(self, chain: EgressChain) -> bool {
+        match chain {
+            EgressChain::CredRead => self.cred_read,
+            EgressChain::TmpExec => self.tmp_exec,
+            EgressChain::Sequence => self.sequence,
+        }
+    }
+
+    fn mark(&mut self, chain: EgressChain) {
+        match chain {
+            EgressChain::CredRead => self.cred_read = true,
+            EgressChain::TmpExec => self.tmp_exec = true,
+            EgressChain::Sequence => self.sequence = true,
+        }
+    }
+
+    fn merge(&mut self, other: Answered) {
+        self.cred_read |= other.cred_read;
+        self.tmp_exec |= other.tmp_exec;
+        self.sequence |= other.sequence;
+    }
 }
 
 /// PID-reuse-safe process identity (§13 Q2). `start_ns` is the task's
@@ -349,7 +400,7 @@ impl<H: PostureHost> CorrelationStore<H> {
         }
         q.push_back(NotedEgress {
             note,
-            claimed_by: None,
+            answered: Answered::default(),
         });
         while q.len() > MAX_EGRESS_PER_PROC {
             q.pop_front();
@@ -357,44 +408,44 @@ impl<H: PostureHost> CorrelationStore<H> {
         self.egress_order.touch(key);
     }
 
-    /// Review 70: take the earliest noted egress of `key` that happened
-    /// after `after_ns`, within `window_ns` of it — the one a credential
-    /// read stamped `after_ns` completes CHAIN-007 with. It is taken: an
-    /// egress completes one late chain only. Lab PR 244: unclaimed, or
-    /// claimed by NN-L-CHAIN-002 (`TmpExec`), whose verdict lacked the read;
-    /// not one NN-L-CHAIN-001 claimed (the read was its own step).
-    pub fn take_egress_after(
+    /// Review 70: the earliest noted egress of `key` that happened after
+    /// `after_ns`, within `window_ns` of it, that CHAIN-007 has not answered
+    /// — the one a credential read stamped `after_ns` completes CHAIN-007
+    /// with; marked answered by it. Lab PR 267 (R12a): kept, not taken — a
+    /// two-step chain that has not answered it may still (the read's own
+    /// CHAIN-001, a late exec's CHAIN-002), as in order ([`NotedEgress`]).
+    pub fn answer_sequence_after(
         &mut self,
         key: ProcKey,
         after_ns: u64,
         window_ns: u64,
     ) -> Option<EgressNote> {
-        let q = self.egress.get_mut(&key)?;
-        let idx = earliest_after(q, after_ns, window_ns, |c| {
-            matches!(c, None | Some(PrecursorKind::TmpExec))
-        });
-        let note = idx.and_then(|i| q.remove(i)).map(|n| n.note);
-        if q.is_empty() {
-            self.remove_egress(&key);
-        }
-        note
+        self.answer_after(key, after_ns, window_ns, EgressChain::Sequence)
     }
 
-    /// Lab PR 235: [`Self::take_egress_after`] for a two-step chain
-    /// (CHAIN-001): the earliest unclaimed egress is claimed, not removed —
-    /// no later precursor completes a two-step chain with it again, and a
-    /// `/tmp` exec processed after both can still complete CHAIN-007 with
-    /// it.
+    /// Lab PR 235: the earliest noted egress after `after_ns` that CHAIN-001
+    /// has not answered, marked answered by it — the late credential read's
+    /// two-step chain. Lab PR 267 (R12a): whatever else answered it.
     pub fn claim_egress_after(
         &mut self,
         key: ProcKey,
         after_ns: u64,
         window_ns: u64,
     ) -> Option<EgressNote> {
+        self.answer_after(key, after_ns, window_ns, EgressChain::CredRead)
+    }
+
+    fn answer_after(
+        &mut self,
+        key: ProcKey,
+        after_ns: u64,
+        window_ns: u64,
+        chain: EgressChain,
+    ) -> Option<EgressNote> {
         let q = self.egress.get_mut(&key)?;
-        let i = earliest_after(q, after_ns, window_ns, |c| c.is_none())?;
+        let i = earliest_after(q, after_ns, window_ns, |a| !a.by(chain))?;
         let n = &mut q[i];
-        n.claimed_by = Some(PrecursorKind::CredRead);
+        n.answered.mark(chain);
         Some(n.note.clone())
     }
 
@@ -426,14 +477,24 @@ impl<H: PostureHost> CorrelationStore<H> {
     }
 
     /// Review 70: a two-step chain fired on this egress — `by` its
-    /// precursor — so no late precursor may complete a two-step chain with
-    /// it again. Lab PR 235: claimed, not removed (see
-    /// [`Self::claim_egress_after`]). Lab PR 244: the first claim is kept
-    /// (CHAIN-001 and CHAIN-002 may both answer a flow in order).
+    /// precursor — so no late precursor completes that chain with it again.
+    /// Lab PR 235: claimed, not removed (see [`Self::claim_egress_after`]).
+    /// Lab PR 267 (R12a): for that chain only ([`Self::answer_egress`]).
     pub fn claim_egress(&mut self, key: ProcKey, start_ns: u64, by: PrecursorKind) {
+        let chain = match by {
+            PrecursorKind::CredRead => EgressChain::CredRead,
+            PrecursorKind::TmpExec => EgressChain::TmpExec,
+            PrecursorKind::CanaryTrip | PrecursorKind::PrivEsc => return,
+        };
+        self.answer_egress(key, start_ns, chain);
+    }
+
+    /// Lab PR 267 (R12a): `chain` answered the egress connected at
+    /// `start_ns` (in order): no late precursor completes `chain` with it.
+    pub fn answer_egress(&mut self, key: ProcKey, start_ns: u64, chain: EgressChain) {
         if let Some(q) = self.egress.get_mut(&key) {
             for n in q.iter_mut().filter(|n| n.note.start_ns == start_ns) {
-                n.claimed_by.get_or_insert(by);
+                n.answered.mark(chain);
             }
         }
     }
@@ -465,7 +526,7 @@ impl<H: PostureHost> CorrelationStore<H> {
             .filter(|&(i, k)| !keys[..i].contains(k))
             .filter_map(|(_, k)| self.egress.get(k))
             .flatten()
-            .filter(|n| n.claimed_by.is_none() && within(n.note.start_ns))
+            .filter(|n| !n.answered.tmp_exec && within(n.note.start_ns))
             .map(|n| n.note.clone())
             .collect();
         out.sort_by_key(|n| n.start_ns);
@@ -497,7 +558,8 @@ impl<H: PostureHost> CorrelationStore<H> {
     /// of the process started at `start_ns`) is processed after the
     /// credential read and the egress that followed it — another ring, in
     /// kernel order before both (the CI flake of 22/10/2026). Returns the
-    /// earliest noted egress, claimed or not, that follows a credential
+    /// earliest noted egress CHAIN-007 has not answered (lab PR 267: a
+    /// two-step chain's answer does not matter) that follows a credential
     /// read of the same process made at or after the exec, all within
     /// `window_ns` of the exec. Read-only: [`Self::complete_exec_sequence`]
     /// commits it.
@@ -532,6 +594,7 @@ impl<H: PostureHost> CorrelationStore<H> {
         keys.iter()
             .filter_map(|k| self.egress.get(k))
             .flatten()
+            .filter(|n| !n.answered.sequence)
             .map(|n| &n.note)
             .filter(|n| n.start_ns > read_ts && within(n.start_ns))
             .min_by_key(|n| n.start_ns)
@@ -541,7 +604,9 @@ impl<H: PostureHost> CorrelationStore<H> {
     /// Lab PR 235: commit a late exec's CHAIN-007 found by
     /// [`Self::exec_sequence_egress`]: the exec is observed (the read and
     /// the egress handed to its incarnation), its `TmpExec` recorded, and
-    /// the egress removed — it completes no other chain.
+    /// the egress marked answered by CHAIN-007. Lab PR 267 (R12a): kept —
+    /// the exec's own CHAIN-002, judged after this rule, answers it too
+    /// unless it already did, as in order ([`NotedEgress`]).
     pub fn complete_exec_sequence(
         &mut self,
         pid: u32,
@@ -553,12 +618,7 @@ impl<H: PostureHost> CorrelationStore<H> {
         self.observe_spawn(pid, ppid, start_ns);
         let key = ProcKey { pid, start_ns };
         self.record(key, PrecursorKind::TmpExec, exec_ts);
-        if let Some(q) = self.egress.get_mut(&key) {
-            q.retain(|n| n.note.start_ns != egress_start_ns);
-            if q.is_empty() {
-                self.remove_egress(&key);
-            }
-        }
+        self.answer_egress(key, egress_start_ns, EgressChain::Sequence);
     }
 
     // ── querying ─────────────────────────────────────────────────────
@@ -748,10 +808,12 @@ impl<H: PostureHost> CorrelationStore<H> {
             if let Some(q) = self.egress.get(&old).cloned() {
                 self.remove_egress(&old);
                 for n in q.into_iter().filter(|n| n.note.start_ns >= start_ns) {
-                    let (claimed_by, at) = (n.claimed_by, n.note.start_ns);
+                    let (answered, at) = (n.answered, n.note.start_ns);
                     self.note_egress(new_key, n.note);
-                    if let Some(by) = claimed_by {
-                        self.claim_egress(new_key, at, by);
+                    if let Some(q) = self.egress.get_mut(&new_key) {
+                        for m in q.iter_mut().filter(|m| m.note.start_ns == at) {
+                            m.answered.merge(answered);
+                        }
                     }
                 }
             }
@@ -932,16 +994,16 @@ impl<H: PostureHost> CorrelationStore<H> {
 }
 
 /// The index of the earliest egress of `q` after `after_ns` and within
-/// `window_ns` of it, of those whose claim `takes` accepts.
+/// `window_ns` of it, of those whose answers `takes` accepts.
 fn earliest_after(
     q: &VecDeque<NotedEgress>,
     after_ns: u64,
     window_ns: u64,
-    takes: impl Fn(Option<PrecursorKind>) -> bool,
+    takes: impl Fn(&Answered) -> bool,
 ) -> Option<usize> {
     q.iter()
         .enumerate()
-        .filter(|(_, n)| takes(n.claimed_by))
+        .filter(|(_, n)| takes(&n.answered))
         .filter(|(_, n)| n.note.start_ns > after_ns && n.note.start_ns - after_ns <= window_ns)
         .min_by_key(|(_, n)| n.note.start_ns)
         .map(|(i, _)| i)
@@ -1401,7 +1463,7 @@ mod tests {
             .claim_egress_after(key(9825, 7), 99 * SEC, W)
             .is_some_and(|n| n.start_ns == 101 * SEC));
         assert!(s
-            .take_egress_after(ProcKey::unresolved(9826), 99 * SEC, W)
+            .answer_sequence_after(ProcKey::unresolved(9826), 99 * SEC, W)
             .is_some());
     }
 
@@ -1627,14 +1689,26 @@ mod tests {
         };
         assert_eq!(at(&s, 9 * SEC), [(11 * SEC, 443), (12 * SEC, 53)]);
         assert!(at(&s, 0).is_empty(), "start unknown");
+        // Lab PR 267 (R12a): CHAIN-001's answer keeps CHAIN-002 from none.
         s.claim_egress(k, 11 * SEC, PrecursorKind::CredRead);
-        assert_eq!(at(&s, 9 * SEC), [(12 * SEC, 53)], "a claimed one is not");
-        // Observed, the exec's incarnation holds them, the claim kept.
+        assert_eq!(at(&s, 9 * SEC), [(11 * SEC, 443), (12 * SEC, 53)]);
+        s.claim_egress(k, 11 * SEC, PrecursorKind::TmpExec);
+        assert_eq!(
+            at(&s, 9 * SEC),
+            [(12 * SEC, 53)],
+            "one CHAIN-002 answered is not"
+        );
+        // Observed, the exec's incarnation holds them, the answers kept.
         s.observe_spawn(42, 1, 9 * SEC);
         assert_eq!(at(&s, 9 * SEC), [(12 * SEC, 53)]);
-        assert!(s
-            .claim_egress_after(key(42, 9 * SEC), 10 * SEC, W)
-            .is_some());
+        assert_eq!(
+            s.claim_egress_after(key(42, 9 * SEC), 10 * SEC, W)
+                .map(|n| n.start_ns),
+            Some(12 * SEC),
+            "the 11 s one is CHAIN-001's already"
+        );
+        assert_eq!(at(&s, 9 * SEC), [(12 * SEC, 53)]);
+        s.claim_exec_egress(42, 9 * SEC, 12 * SEC);
         assert!(at(&s, 9 * SEC).is_empty());
         // The window is the exec's: at its end, not past it.
         let mut s = CorrelationStore::new();
@@ -1650,23 +1724,38 @@ mod tests {
     /// chain, and CHAIN-007 with a late read; after CHAIN-001 (`CredRead`)
     /// no second two-step chain, and CHAIN-007 with a late exec only. The
     /// first claim is kept.
+    /// Lab PR 267 (R12a): each chain answers an egress once and keeps no
+    /// other from it — CHAIN-001 (`CredRead`), CHAIN-002 (`TmpExec`) and
+    /// CHAIN-007, in order or late, as the flow gets all three in order.
+    /// (Lab PR 244's claim kept a late CHAIN-001 off an egress CHAIN-002
+    /// had answered, and a late read's CHAIN-007 off one CHAIN-001 had: the
+    /// verdicts then depended on which event reached the engine last.)
     #[test]
-    fn the_claim_names_the_two_step_chain() {
+    fn each_chain_answers_an_egress_once() {
         let k = key(42, SEC);
         let mut s = CorrelationStore::new();
         s.note_egress(k, note(42, 12 * SEC, 443));
         s.claim_egress(k, 12 * SEC, PrecursorKind::TmpExec);
-        assert!(s.claim_egress_after(k, 11 * SEC, W).is_none(), "CHAIN-001");
         assert!(
             s.exec_egresses(42, SEC, 10 * SEC, W).is_empty(),
-            "CHAIN-002"
+            "CHAIN-002 answered it"
         );
         assert_eq!(
-            s.take_egress_after(k, 11 * SEC, W).map(|n| n.start_ns),
+            s.claim_egress_after(k, 11 * SEC, W).map(|n| n.start_ns),
+            Some(12 * SEC),
+            "a late read's CHAIN-001 still answers it"
+        );
+        assert!(s.claim_egress_after(k, 11 * SEC, W).is_none(), "once");
+        assert_eq!(
+            s.answer_sequence_after(k, 11 * SEC, W).map(|n| n.start_ns),
             Some(12 * SEC),
             "CHAIN-007 on a late read"
         );
-        assert!(s.take_egress_after(k, 11 * SEC, W).is_none(), "taken");
+        assert!(s.answer_sequence_after(k, 11 * SEC, W).is_none(), "once");
+        assert!(
+            s.exec_sequence_egress(42, SEC, 10 * SEC, W).is_none(),
+            "a late exec's CHAIN-007 neither"
+        );
 
         let mut s = CorrelationStore::new();
         s.note_egress(k, note(42, 12 * SEC, 443));
@@ -1675,15 +1764,20 @@ mod tests {
         s.claim_egress(k, 12 * SEC, PrecursorKind::TmpExec);
         assert!(s.claim_egress_after(k, 11 * SEC, W).is_none());
         assert!(s.exec_egresses(42, SEC, 10 * SEC, W).is_empty());
-        assert!(
-            s.take_egress_after(k, 11 * SEC + 5, W).is_none(),
-            "a late read does not upgrade CHAIN-001: the read was its step"
-        );
         assert_eq!(
             s.exec_sequence_egress(42, SEC, 10 * SEC, W)
                 .map(|n| n.start_ns),
             Some(12 * SEC),
-            "a late exec does"
+            "a late exec's CHAIN-007"
+        );
+        s.complete_exec_sequence(42, 1, SEC, 10 * SEC, 12 * SEC);
+        assert!(
+            s.exec_sequence_egress(42, SEC, 10 * SEC, W).is_none(),
+            "once"
+        );
+        assert!(
+            s.answer_sequence_after(k, 11 * SEC + 5, W).is_none(),
+            "nor a late read's"
         );
     }
 }

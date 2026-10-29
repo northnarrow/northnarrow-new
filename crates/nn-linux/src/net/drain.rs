@@ -18,7 +18,7 @@
 //!     visibility lock-in; the rule layer applies the operator-
 //!     tunable comm/port filter (NN-L-NET-006).
 //!
-//! Both records emit through the same `mpsc::Sender<Event>` the
+//! Both records emit through the same `crate::sensors::bus::BusSender` the
 //! sensor multiplexer feeds the main loop with, so the rule engine
 //! sees `Event::NetFlow` / `Event::NetListener` items via the
 //! existing `process_event` path (`main::process_event` already
@@ -53,7 +53,6 @@ use nn_model::Event;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
@@ -417,7 +416,7 @@ pub async fn drain_loop(
     mut gate: RuleGate,
     // Lab PR 224 (CM-02 b): which open flows are re-judged, how often.
     snapshot: SnapshotPolicy,
-    event_tx: mpsc::Sender<Event>,
+    event_tx: crate::sensors::bus::BusSender,
 ) -> std::io::Result<()> {
     let mut close_fd = crate::async_fd::register(close_rb)?;
     let mut listen_fd = crate::async_fd::register(listen_rb)?;
@@ -615,7 +614,8 @@ pub(crate) fn due_snapshot_rows(
             Some(floor) if floor > row.start_ns => continue,
             Some(_) => {}
         }
-        if let Some(image) = lineage.image_path(row.pid) {
+        // Review #471 A1: the image at the flow's connect, not a later exec.
+        if let Some(image) = lineage.image_path_at(row.pid, row.start_ns) {
             row.exe = Some(image);
         }
         row.resolved_hostname =
@@ -709,7 +709,7 @@ async fn process_close_record(
     netflow_db: Option<&Arc<Mutex<NetFlowDb>>>,
     lineage: &crate::posture::lineage::AuthSessionTracker,
     gate: &mut RuleGate,
-    event_tx: &mpsc::Sender<Event>,
+    event_tx: &crate::sensors::bus::BusSender,
 ) {
     let raw: &NetFlowCloseRaw = match bytemuck::try_from_bytes(bytes) {
         Ok(r) => r,
@@ -753,7 +753,7 @@ async fn process_close_record(
                     // names the image as a UDP row does; read after the
                     // tracker's lock.
                     if e.exe.is_none() {
-                        e.exe = lineage.image_path(e.pid);
+                        e.exe = lineage.image_path_at(e.pid, e.start_ns);
                     }
                     e
                 }
@@ -821,7 +821,7 @@ async fn process_close_record(
                 // External audit NETR-008: the sender's image, read before
                 // the tracker's lock (a datagram record is emitted while
                 // its sender runs).
-                exe: lineage.image_path(raw.pid),
+                exe: lineage.image_path_at(raw.pid, raw.timestamp_ns),
                 // External audit NET-016: who holds the PID, for the DNS
                 // attribution below.
                 proc_start_ns: lineage.start_floor_ns(raw.pid).unwrap_or(0),
@@ -883,7 +883,7 @@ async fn process_close_record(
 async fn process_listen_record(
     bytes: &[u8],
     listener_db: Option<&Arc<Mutex<NetListenerDb>>>,
-    event_tx: &mpsc::Sender<Event>,
+    event_tx: &crate::sensors::bus::BusSender,
 ) {
     let raw: &NetListenRaw = match bytemuck::try_from_bytes(bytes) {
         Ok(r) => r,
@@ -1700,7 +1700,7 @@ mod tests {
             Arc::new(Mutex::new(CorrelationStore::new())),
             UidPacer::with_rate(2, 1),
         );
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = crate::sensors::bus::channel();
         for corr in 1..=5u8 {
             let raw = close_raw(1000, 4242, [100, 64, 0, 1], 8080, corr);
             process_close_record(&raw, &tracker, &dns, Some(&db), &lineage, &mut gate, &tx).await;
@@ -1709,7 +1709,7 @@ mod tests {
         process_close_record(&raw, &tracker, &dns, Some(&db), &lineage, &mut gate, &tx).await;
         drop(tx);
         let mut sent = Vec::new();
-        while let Some(Event::NetFlow(nf)) = rx.recv().await {
+        while let Some(Event::NetFlow(nf)) = rx.recv().await.map(|r| r.event) {
             sent.push(nf.dst_addr.to_string());
         }
         assert_eq!(
@@ -1790,7 +1790,7 @@ mod tests {
             Arc::new(Mutex::new(CorrelationStore::new())),
             UidPacer::with_rate(100, 100),
         );
-        let (tx, _rx) = mpsc::channel(4);
+        let (tx, _rx) = crate::sensors::bus::channel();
         // No destination either: the tracker cannot synthesise a row
         // (NET-012), the path that logs the WARN.
         let mut raw: NetFlowCloseRaw =
@@ -1967,7 +1967,7 @@ mod tests {
     }
 
     impl Harness {
-        async fn close(&mut self, raw: &NetFlowCloseRaw, tx: &mpsc::Sender<Event>) {
+        async fn close(&mut self, raw: &NetFlowCloseRaw, tx: &crate::sensors::bus::BusSender) {
             process_close_record(
                 bytemuck::bytes_of(raw),
                 &self.tracker,
@@ -1994,7 +1994,7 @@ mod tests {
     #[tokio::test]
     async fn comm_decoding_is_identical_across_drain_branches() {
         let mut h = harness();
-        let (tx, mut rx) = mpsc::channel(16);
+        let (tx, mut rx) = crate::sensors::bus::channel();
 
         // TCP: a close whose connect was not seen — the tracker
         // synthesises the row from the close's own fields (NET-012).
@@ -2039,7 +2039,7 @@ mod tests {
         drop(tx);
 
         let mut names = Vec::new();
-        while let Some(ev) = rx.recv().await {
+        while let Some(ev) = rx.recv().await.map(|r| r.event) {
             match ev {
                 Event::NetFlow(nf) => names.push(("flow", nf.proto, nf.comm)),
                 Event::NetListener(l) => names.push(("listener", l.proto, l.comm)),
@@ -2078,7 +2078,7 @@ mod tests {
     #[tokio::test]
     async fn drain_counts_dot_and_quic_rows() {
         let mut h = harness();
-        let (tx, _rx) = mpsc::channel(16);
+        let (tx, _rx) = crate::sensors::bus::channel();
         let before = crate::net::blind_spots::encrypted_flows();
         let dot: NetFlowCloseRaw =
             bytemuck::pod_read_unaligned(&close_raw(1000, 4243, [1, 1, 1, 1], 853, 11));
@@ -2103,7 +2103,7 @@ mod tests {
     async fn flows_reach_the_rules_without_the_netflow_log() {
         let mut h = harness();
         h.db = None;
-        let (tx, mut rx) = mpsc::channel(16);
+        let (tx, mut rx) = crate::sensors::bus::channel();
         let tcp: NetFlowCloseRaw =
             bytemuck::pod_read_unaligned(&close_raw(1000, 4244, [100, 64, 0, 2], 8443, 12));
         h.close(&tcp, &tx).await;
@@ -2122,7 +2122,7 @@ mod tests {
         group_commit(None, None);
         drop(tx);
         let mut seen = Vec::new();
-        while let Some(ev) = rx.recv().await {
+        while let Some(ev) = rx.recv().await.map(|r| r.event) {
             match ev {
                 Event::NetFlow(nf) => seen.push(("flow", nf.proto, nf.dst_port)),
                 Event::NetListener(l) => seen.push(("listener", l.proto, l.bind_port)),

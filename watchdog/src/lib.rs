@@ -4203,6 +4203,7 @@ mod tests {
                 execpol_map_denied_total: None,
                 execpol_map_recorded_total: None,
                 execq_script_refused_total: None,
+                event_bus: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

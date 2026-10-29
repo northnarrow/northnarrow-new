@@ -1350,6 +1350,67 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- The priority event bus replaces the one channel between the sensors and
+  the event loop (lab PR 267, Wave 4 phase 2, R12a of the restructure plan;
+  `docs/architecture/EVENT_BUS.md`). Every source — the nine ring pumps,
+  the exploit guard's, the file-open sensor's, the FIM and network drains —
+  sends into its class's queue: P0 tamper (`FsProtectDenial`,
+  `BpfSyscall`, `ModuleLoad`, `SensorFlood`, `DefenderSignal`,
+  `ExploitPostcondition`; 1,024: a denial repeated by its process on its
+  inode within a second is counted into the one queued and signed, a new
+  denial's sender waits 50 ms then drops, every other tamper event waits
+  for room, and denials and `bpf()` calls take all but 64 slots, the rare
+  tamper events'), P1 process (4,096, 10 ms), P2 file (8,192: a new
+  `FileOpen` is dropped when the queue is full or holds 2,048 opens; a
+  write-open of a CRITICAL or PERSIST file and every other file event wait
+  as on the channel, review 75), P3 network (8,192, drop the new event);
+  every `Event` variant placed by an exhaustive match. The event loop takes
+  by weighted shares 8 : 2 : 1 : 1 (a smooth weighted round robin), FIFO
+  inside a queue: a flood of opens no longer holds the tamper records back,
+  nor makes the kernel drop them (EXP-13); a flood of any lower class leaves
+  each other one at least a quarter of the consumer, and a tamper flood
+  (a root loop of refused operations, any user's `fork` + `bpf()` loop)
+  leaves the exec, file and network events their sixth and twelfths. An event taken ahead of queued execs hands them to the
+  lineage and the rules first, so it is judged on the process tree of
+  every exec that reached the bus before it; and the lineage keeps the
+  last three execs of a pid and answers as of the judged event's time, so
+  an event is never judged on the image of a later exec of its process.
+  Per queue: events queued and dropped, depth and the most it held, the
+  longest wait (since boot and in the last sample), the sends that waited
+  and the longest such wait, the takes by share ahead of a higher queue,
+  the latency from queue to decision (p50/p99/max), in `nn-admin status
+  --key` with the loss counters of the eight stages of an event's path
+  (1–3 the kernel ring, the kernel budget and the decoder, 4 the bus; 5–8
+  named, counted by R12b, R12c and R15). A drop is a WARN, a signed
+  `event_bus_drop` row (P0 within a second, at most one a second; the
+  other queues at most every 600 s; each row carrying every drop since
+  the previous one) and the posture's `TelemetryLoss` — at any P0 drop,
+  past 64 in a sample for P1–P3. At the stop the bus is closed and what
+  it still holds is counted in a signed `event_bus_stop` row, every drop
+  signed. Ordering: a property test replays every golden case in every
+  order that keeps each class's own order (all of them for 25 of the 28
+  cases, 973 orders) and requires, for each rule and process, the same
+  verdict and the same responses. It found three stores that depended on
+  the order between classes, fixed: the lineage and the chains' ancestry
+  tree learned an exec only when it was judged (an exec ingested twice, or
+  after a newer one of its pid, now changes nothing), the lineage answered
+  with the latest exec of a pid (independent review of PR #471: a canary
+  reader's later `restic`, a `/tmp` program's later `dpkg`, a listener's
+  later `nginx` — four golden cases), and the chain store let one chain
+  keep another off a flow — each chain now answers a flow once, in any
+  order, and a late exec's CHAIN-002 prefers the egress whose kill is not
+  held at port 53 (outside the corpus: a late exec whose process had a
+  port-53 flow to a non-resolver and then another flow now kills for the
+  later one, where the held port-53 verdict answered it). Golden:
+  `shadow-chain007-late-exec` gains CHAIN-002 on its late exec's line (the
+  chain the flow has in kernel order; the responses are unchanged), and so
+  do the two nn-admin matrix files that replay it; the matrix's full
+  status shows the new lines, its policy runs the four new cases. The
+  unsigned status frame is one byte longer (the appended field's `None`).
+  The DNS pump's outbox for a full channel (lab PR 229) is gone. The lab's
+  soak report reads the units' journal namespace and their WARN/ERROR lines
+  by the tracing level (journald gives every line priority 6: its
+  WARN/ERROR file was empty in every soak).
 - Determinism seams: the signed chains' clock and the posture's switches
   per machine (lab PR 249, Wave 4 phase 2, before R08; no behaviour
   change). **Clock.** nn-evidence's writers read the time they stamp on a
