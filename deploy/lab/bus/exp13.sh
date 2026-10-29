@@ -22,12 +22,24 @@
 # Usage: exp13.sh [--out DIR] [--flood-secs S] [--flood-procs P]
 #   [--threads T] [--bursts B] [--burst-size K] [--burst-gap-ms G]
 #   [--settle S] [--key FILE] [--stall-secs N]
+#   [--net-rate R] [--dns-rate D] [--net-port P] [--probes N]
 # --flood-secs 0: no flood. --stall-secs N (a lab build: debug-trigger): the
 # event loop is first made to stand still N seconds
 # (/run/northnarrow/debug-stall-loop, lab PR 216), and the bursts start when
 # it does — the tamper queue fills and its sender waits, then drops: the
 # drop's WARN, count and signed `event_bus_drop` row (the P0 path EXP-13
 # itself never reaches).
+# EXP-13c (review #471 A2: a lower class starved under a higher one's
+# flood): --net-rate R connects a second to a listener of the lab user's on
+# 127.0.0.1:P (--net-port, 18099) and --dns-rate D DNS queries a second for
+# names under .example to 127.0.0.1:53 (nothing leaves the guest), in a
+# unit of their own, through
+# the flood; --probes N then, spread over it, N probes of each kind, each a
+# new process of the lab user's in a unit of its own: a connect to
+# 192.0.2.1:80 (TEST-NET-1, RFC 5737, in the shipped netflow blocklist:
+# NN-L-NET-001 kills it) and a connect to the listener from a copy of the
+# helper in /var/tmp (a staging directory: NN-L-CHAIN-002 / NN-L-NET-008).
+# The summary counts each probe's record and its latency.
 # Output (DIR, default /var/lib/nn-exp13/<UTC stamp>): status-before.json,
 # status-after.json (`nn-admin status --json --key`), tamper.txt (one line
 # per burst), flood.txt, detections.jsonl (the new detection records),
@@ -39,7 +51,7 @@ export LC_ALL=C
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT= FLOOD_SECS=40 FLOOD_PROCS=4 THREADS=32 BURSTS=8 BURST_SIZE=1500 BURST_GAP_MS=3000
-SETTLE=75 KEY= STALL=0
+SETTLE=75 KEY= STALL=0 NET_RATE=0 DNS_RATE=0 NET_PORT=18099 PROBES=0
 DET=/var/lib/northnarrow/detections/detections.jsonl
 AUDIT=/etc/northnarrow/audit.log
 TARGET=/etc/northnarrow/admin.pub
@@ -59,10 +71,14 @@ while (($#)); do
         --settle) SETTLE=${2:?}; shift 2 ;;
         --key) KEY=${2:?}; shift 2 ;;
         --stall-secs) STALL=${2:?}; shift 2 ;;
+        --net-rate) NET_RATE=${2:?}; shift 2 ;;
+        --dns-rate) DNS_RATE=${2:?}; shift 2 ;;
+        --net-port) NET_PORT=${2:?}; shift 2 ;;
+        --probes) PROBES=${2:?}; shift 2 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
-for v in FLOOD_SECS FLOOD_PROCS THREADS BURSTS BURST_SIZE BURST_GAP_MS SETTLE STALL; do
+for v in FLOOD_SECS FLOOD_PROCS THREADS BURSTS BURST_SIZE BURST_GAP_MS SETTLE STALL NET_RATE DNS_RATE NET_PORT PROBES; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "--${v,,} takes a whole number: ${!v}"
 done
 (($(id -u) == 0)) || die "run as root"
@@ -91,10 +107,18 @@ mkdir -p "$OUT"
 install -d -m 0755 "$LIBEXEC"
 cc -O2 -pthread -o "$LIBEXEC/nn-exp13-flood" "$SCRIPT_DIR/nn-exp13.c" || die "cc failed"
 install -m 0755 "$LIBEXEC/nn-exp13-flood" "$LIBEXEC/nn-exp13-tamper"
+install -m 0755 "$LIBEXEC/nn-exp13-flood" "$LIBEXEC/nn-exp13-net"
+install -m 0755 "$LIBEXEC/nn-exp13-flood" "$LIBEXEC/nn-exp13-probe"
+STAGE=
+if ((PROBES > 0)); then
+    STAGE=$(mktemp -d /var/tmp/nn-exp13c.XXXXXX) || die "mktemp"
+    chmod 0755 "$STAGE"
+    install -m 0755 "$LIBEXEC/nn-exp13-flood" "$STAGE/nn-exp13-stage"
+fi
 
 status() { "$NNADMIN" status --json --key "$KEY" > "$1" 2> "$1.err" || echo "exp13: status read failed ($1.err)" >&2; }
 
-echo "exp13: agent $AGENT_EXE ($(sha256sum "$AGENT_EXE" | cut -c1-16)), $(nproc) cpus, flood ${FLOOD_PROCS}x${THREADS} threads ${FLOOD_SECS}s, ${BURSTS} bursts of ${BURST_SIZE} every ${BURST_GAP_MS} ms" | tee "$OUT/summary.txt"
+echo "exp13: agent $AGENT_EXE ($(sha256sum "$AGENT_EXE" | cut -c1-16)), $(nproc) cpus, flood ${FLOOD_PROCS}x${THREADS} threads ${FLOOD_SECS}s, ${BURSTS} bursts of ${BURST_SIZE} every ${BURST_GAP_MS} ms, net ${NET_RATE}/s dns ${DNS_RATE}/s probes ${PROBES}" | tee "$OUT/summary.txt"
 det0=$(stat -c %s "$DET" 2>/dev/null || echo 0)
 aud0=$(stat -c %s "$AUDIT" 2>/dev/null || echo 0)
 status "$OUT/status-before.json"
@@ -111,6 +135,40 @@ if ((FLOOD_SECS > 0)); then
         || die "the flood unit did not start"
     sleep 5
 fi
+# EXP-13c: the network load and the probes, each in a unit of its own (a
+# probe's kill ends its process, never this script).
+: > "$OUT/net.txt"
+: > "$OUT/probes-net001.txt"
+: > "$OUT/probes-stage.txt"
+units=(nn-exp13-flood.service)
+if ((NET_RATE > 0 || DNS_RATE > 0)); then
+    systemctl stop nn-exp13-net.service 2>/dev/null
+    systemctl reset-failed nn-exp13-net.service 2>/dev/null
+    systemd-run --quiet --unit=nn-exp13-net --uid="$USER_NAME" \
+        -p StandardOutput="file:$OUT/net.txt" -p StandardError="file:$OUT/net.err" \
+        "$LIBEXEC/nn-exp13-net" net "$((FLOOD_SECS > 0 ? FLOOD_SECS : 30))" "$NET_RATE" "$NET_PORT" "$DNS_RATE" \
+        || die "the network unit did not start"
+    units+=(nn-exp13-net.service)
+    sleep 1
+fi
+if ((PROBES > 0)); then
+    gap=$(( (FLOOD_SECS > 0 ? FLOOD_SECS : 30) * 700 / PROBES ))
+    gap_s=$(printf '%d.%03d' $((gap / 1000)) $((gap % 1000)))
+    for kind in net001 stage; do
+        if [[ $kind == net001 ]]; then
+            cmd="$LIBEXEC/nn-exp13-probe connect 192.0.2.1 80"
+        else
+            cmd="$STAGE/nn-exp13-stage connect 127.0.0.1 $NET_PORT"
+        fi
+        systemctl stop "nn-exp13-probe-$kind.service" 2>/dev/null
+        systemctl reset-failed "nn-exp13-probe-$kind.service" 2>/dev/null
+        systemd-run --quiet --unit="nn-exp13-probe-$kind" --uid="$USER_NAME" \
+            -p StandardOutput="file:$OUT/probes-$kind.txt" -p StandardError="file:$OUT/probes-$kind.err" \
+            /bin/bash -c "for i in \$(seq 1 $PROBES); do $cmd; sleep $gap_s; done" \
+            || die "the $kind probes did not start"
+        units+=("nn-exp13-probe-$kind.service")
+    done
+fi
 # A lab build's stalled loop: the trigger is read at the loop's next 5 s
 # check, which removes it and stands still.
 if ((STALL > 0)); then
@@ -121,8 +179,11 @@ fi
 # The tamper bursts, in the flood.
 "$LIBEXEC/nn-exp13-tamper" tamper "$BURSTS" "$BURST_SIZE" "$BURST_GAP_MS" "$TARGET" > "$OUT/tamper.txt" 2> "$OUT/tamper.err"
 tamper_rc=$?
-# The flood's end, then the detection budget's reporter (60 s windows).
-while systemctl is-active --quiet nn-exp13-flood.service; do sleep 1; done
+# The flood's end (and the network load's and the probes'), then the
+# detection budget's reporter (60 s windows).
+for u in "${units[@]}"; do
+    while systemctl is-active --quiet "$u"; do sleep 1; done
+done
 t_flood_end=$(date +%s%N)
 sleep "$SETTLE"
 status "$OUT/status-after.json"
@@ -135,6 +196,7 @@ journalctl --namespace=northnarrow -u northnarrow-agent --since "@$((t_start / 1
 # Leave the host as the run found it: the COMBAT the denials raised is
 # released the operator's way.
 "$NNADMIN" unlock --key "$KEY" > "$OUT/unlock.txt" 2>&1 || true
+[[ -n $STAGE ]] && rm -rf "$STAGE"
 
 python3 -I - "$OUT" "$t_start" "$t_flood_end" "$t_end" "$tamper_rc" <<'PY' | tee -a "$OUT/summary.txt"
 import json, sys, calendar, time
@@ -222,7 +284,41 @@ def qd(p, k):
         return None
     return ba[p][k] - (bb.get(p, {}).get(k, 0) if k in ("enqueued", "dropped", "waited", "aged", "ahead", "decided") else 0)
 
+def lines_of(name):
+    try:
+        return [l.split() for l in open(out + "/" + name, errors="replace")]
+    except OSError:
+        return []
+recs_by_pid = {}
+for line in open(out + "/detections.jsonl", errors="replace"):
+    try:
+        r = json.loads(line)
+    except ValueError:
+        continue
+    if not isinstance(r, dict):
+        continue
+    pid = (r.get("principal") or {}).get("pid")
+    t = ts_ns(r.get("ts"))
+    names = [str(r.get("rule_id", ""))] + [str(m.get("rule", "")) for m in (r.get("matches") or []) if isinstance(m, dict)]
+    recs_by_pid.setdefault(pid, []).append((t, names, r.get("verdict")))
+def probes(kind, rules):
+    out_p = []
+    for f in lines_of("probes-%s.txt" % kind):
+        if len(f) == 4 and f[0] == "connect":
+            t0, pid = int(f[1]), int(f[2])
+            hits = [(t, v) for t, names, v in recs_by_pid.get(pid, []) if any(n.startswith(rules) for n in names)]
+            first = min((t for t, _ in hits if t is not None), default=None)
+            out_p.append({"pid": pid, "records": len(hits),
+                          "latency_ms": None if first is None else round((first - t0) / 1e6, 1)})
+    return {"sent": len(out_p), "judged": sum(1 for p in out_p if p["records"]), "probes": out_p}
+net_line = next((f for f in lines_of("net.txt") if len(f) == 4 and f[0] == "net"), None)
+ring_names = sorted(set((before or {}).get("ringbuf_drops") or {}) | set((after or {}).get("ringbuf_drops") or {}))
+
 summary = {
+    "net_load": None if net_line is None else {"connected": int(net_line[1]), "failed": int(net_line[2]), "dns_sent": int(net_line[3])},
+    "probes_net001": probes("net001", ("NN-L-NET-001",)),
+    "probes_stage": probes("stage", ("NN-L-CHAIN-002", "NN-L-NET-008")),
+    "ring_drops_delta_all": {r: delta(r) for r in ring_names},
     "attempts_refused": attempts, "attempts_allowed": allowed, "tamper_rc": tamper_rc,
     "at001_records": len(recs), "at001_suppressed_before": suppressed, "at001_held_reported": held,
     "at001_accounted": len(recs) + held,
@@ -245,5 +341,11 @@ else:
     print("bus                : (this agent has no event bus)")
 print("event_bus_drop rows:", len(bus_rows), "ringbuf_drop rows:", len(ring_rows))
 print("flood              :", " | ".join(x for x in summary["flood"] if x))
+if summary["net_load"] or summary["probes_net001"]["sent"]:
+    print("net load           :", summary["net_load"])
+    for k in ("probes_net001", "probes_stage"):
+        v = summary[k]
+        print(k.ljust(19) + ":", v["judged"], "of", v["sent"], "judged; latency ms", [p["latency_ms"] for p in v["probes"]])
+    print("ring drops (all)   :", summary["ring_drops_delta_all"])
 PY
 echo "exp13: results in $OUT"
