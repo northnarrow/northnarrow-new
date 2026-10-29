@@ -80,7 +80,17 @@ pub(crate) async fn run(
         northnarrow_agent::loop_progress::tick();
         tokio::select! {
             evt = sensor.next_event() => match evt {
-                Some(e) => {
+                Some(received) => {
+                    // Lab PR 267 (R12a): a tamper event taken ahead of execs
+                    // still queued brings them; the lineage has learned
+                    // them, the engine's rules learn them here, so the
+                    // event is judged on the process tree of every exec
+                    // that reached the bus before it (they are judged in
+                    // their own turn, which then changes nothing there).
+                    for exec in &received.overtaken {
+                        engine.observe_arrival(exec);
+                    }
+                    let e = received.event;
                     // Tappa 10.8 telemetry probe: every event is offered to
                     // the probe tracker before the decision engine (R11c, lab
                     // PR 264: the probe the late binding started).
@@ -108,7 +118,9 @@ pub(crate) async fn run(
                     host_stopping,
                     cow_guard,
                     e,
-                ).await
+                ).await;
+                    // Lab PR 267: the event's latency, queue to decision.
+                    sensor.decided();
                 }
                 None => {
                     warn!("sensor pump exited; shutting down");
@@ -195,6 +207,9 @@ pub(crate) async fn run(
             }
         }
     }
+    // Lab PR 267 (R12a): every drop of the bus not in a signed row yet is
+    // signed before the stop is (a queue's window does not hold it back).
+    sensor.bus_losses().flush(&sensor.bus_stats());
     Stopped {
         stop_reason,
         loop_started,

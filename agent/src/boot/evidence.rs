@@ -418,6 +418,12 @@ pub(crate) fn wire(
     sensor
         .ring_drops()
         .bind_posture(posture.clone(), Some(Arc::clone(installer_override)));
+    // Lab PR 267 (R12a): the event bus's drops — signed, and a queue of
+    // security events that loses them raises ALERTED, as a security ring.
+    sensor.bus_losses().bind_audit_log(audit_log.clone());
+    sensor
+        .bus_losses()
+        .bind_posture(posture.clone(), Some(Arc::clone(installer_override)));
 
     // FIM-009 self-upgrade (§15.1): late-bind the audit-chain writer to
     // the trusted-installer override so its close/expiry records chain.

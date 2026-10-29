@@ -5,10 +5,14 @@
 //! Tappa 4 introduces the [`SensorMultiplexer`]: a single owner of
 //! the loaded eBPF object that attaches every program (process exec,
 //! file open, exec validation, TCP connect v4/v6, DNS via UDP) and
-//! exposes a single tokio mpsc channel of decoded events. The Tappa 1
+//! exposes the decoded events on one bus — a queue per class of events
+//! since R12a (lab PR 267, [`bus`]). The Tappa 1
 //! [`ExecSensor`] is preserved as a thin compatibility wrapper so the
 //! existing live integration test keeps working.
 
+/// Lab PR 267 (R12a): the priority event bus between the sensors and the
+/// event loop.
+pub mod bus;
 pub mod connect_deny;
 pub mod dns_sensor;
 pub mod ebpf_object;

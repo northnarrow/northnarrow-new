@@ -842,7 +842,7 @@ const RANDOM_ORDERS: u64 = 256;
 /// One item of a stream as the bus carries it: an event (a sweep is its
 /// events, each queued on its own) or an exec policy report.
 enum Unit<'a> {
-    Event(Event),
+    Event(Box<Event>),
     Execpol(&'a ExecPolInput),
 }
 
@@ -853,11 +853,14 @@ fn units(case: &Case) -> Vec<(usize, Unit<'_>)> {
         match item {
             Item::Event(e) => out.push((
                 nn_core::bus::Priority::of_event(e).index(),
-                Unit::Event((**e).clone()),
+                Unit::Event(e.clone()),
             )),
             Item::TcpSweep(s) => {
                 for e in s.events() {
-                    out.push((nn_core::bus::Priority::of_event(&e).index(), Unit::Event(e)));
+                    out.push((
+                        nn_core::bus::Priority::of_event(&e).index(),
+                        Unit::Event(Box::new(e)),
+                    ));
                 }
             }
             Item::Execpol(p) => out.push((OUTSIDE_BUS, Unit::Execpol(p))),

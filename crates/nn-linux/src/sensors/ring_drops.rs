@@ -188,9 +188,13 @@ fn security_losses(prev: &[u64], cur: &[u64]) -> Vec<(&'static str, u64)> {
         .collect()
 }
 
-struct PostureSink {
-    posture: crate::posture::PostureMachine,
-    installer: Option<Arc<crate::anti_tamper::trusted_installer::TrustedInstallerOverride>>,
+/// The posture a loss of security events raises, and the trusted-installer
+/// window that exempts it (lab PR 267: the event bus's loss recorder raises
+/// it too, `sensors::bus`).
+pub(crate) struct PostureSink {
+    pub(crate) posture: crate::posture::PostureMachine,
+    pub(crate) installer:
+        Option<Arc<crate::anti_tamper::trusted_installer::TrustedInstallerOverride>>,
 }
 
 /// Package managers whose run, as root, is a package transaction. Their
@@ -263,6 +267,12 @@ fn package_transaction_running(proc_root: &std::path::Path) -> bool {
 /// `TelemetryLoss` (ALERTED), except during a trusted-installer window or a
 /// package transaction. The signed `ringbuf_drop` entry is written anyway.
 fn raise_telemetry_loss(posture: &OnceLock<PostureSink>, lost: &[(&'static str, u64)]) {
+    raise_loss(posture, lost, "security ring")
+}
+
+/// [`raise_telemetry_loss`] for the events `source` lost (lab PR 267: `event
+/// bus` queues as well as security rings), with the same exemptions.
+pub(crate) fn raise_loss(posture: &OnceLock<PostureSink>, lost: &[(&str, u64)], source: &str) {
     let Some(sink) = posture.get() else { return };
     let what = lost
         .iter()
@@ -270,14 +280,14 @@ fn raise_telemetry_loss(posture: &OnceLock<PostureSink>, lost: &[(&'static str, 
         .collect::<Vec<_>>()
         .join(", ");
     if sink.installer.as_ref().is_some_and(|i| i.is_window_open()) {
-        info!(lost = %what, "ring drops during a trusted-installer window — posture not raised");
+        info!(lost = %what, source, "event drops during a trusted-installer window — posture not raised");
         return;
     }
     if package_transaction_running(std::path::Path::new("/proc")) {
-        info!(lost = %what, "ring drops during a package transaction — posture not raised");
+        info!(lost = %what, source, "event drops during a package transaction — posture not raised");
         return;
     }
-    let reason = format!("security ring events dropped in {SAMPLE_SECS} s: {what}");
+    let reason = format!("{source} events dropped in {SAMPLE_SECS} s: {what}");
     if let Some(state) = sink
         .posture
         .raise_signal(nn_model::posture_types::TriggerType::TelemetryLoss, &reason)

@@ -271,6 +271,9 @@ pub struct ClassQueues<T> {
     /// Takes in a row that passed over a waiting lower class.
     streak: u32,
     stats: [QueueStats; QUEUES],
+    /// Per queue, how many of its front events [`Self::hand_over_older`]
+    /// has handed over (each once).
+    handed: [usize; QUEUES],
 }
 
 /// A queue's memory is given back once it runs empty above this capacity:
@@ -285,6 +288,7 @@ impl<T> ClassQueues<T> {
             capacity: capacity.map(|c| c.max(1)),
             streak: 0,
             stats: [QueueStats::default(); QUEUES],
+            handed: [0; QUEUES],
         }
     }
 
@@ -333,6 +337,7 @@ impl<T> ClassQueues<T> {
             self.streak += 1;
         }
         let (enqueued_ns, item) = self.queues[pick].pop_front()?;
+        self.handed[pick] = self.handed[pick].saturating_sub(1);
         if self.queues[pick].is_empty() && self.queues[pick].capacity() > SHRINK_ABOVE {
             self.queues[pick].shrink_to(SHRINK_ABOVE);
         }
@@ -351,6 +356,23 @@ impl<T> ClassQueues<T> {
             waited_ns,
             aged,
         })
+    }
+
+    /// Hand `f` every event of `p` queued before `before_ns` that no earlier
+    /// call handed over, front first, each once — the events of `p` an event
+    /// taken from a higher queue overtakes (lab PR 267: the execs the
+    /// lineage learns before the tamper event that overtakes them is
+    /// judged). Amortised O(1) per event. The queue's times are its push
+    /// order's (the caller takes the time under the same lock as the push).
+    pub fn hand_over_older(&mut self, p: Priority, before_ns: u64, mut f: impl FnMut(&T)) {
+        let i = p.index();
+        while let Some((t, item)) = self.queues[i].get(self.handed[i]) {
+            if *t >= before_ns {
+                break;
+            }
+            f(item);
+            self.handed[i] += 1;
+        }
     }
 
     /// Events queued at `p` now.
@@ -697,6 +719,38 @@ mod tests {
         q.push(p(0), 11, 4).unwrap();
         assert_eq!(q.len(p(0)), 2);
         assert_eq!(q.capacity(p(0)), 2);
+    }
+
+    /// The events of a lower queue an event taken ahead of them overtakes
+    /// are handed over once each, front first, and only those queued before
+    /// it.
+    #[test]
+    fn overtaken_events_are_handed_over_once() {
+        let mut q = ClassQueues::new([16; QUEUES]);
+        q.push(p(1), 1, "e1").unwrap();
+        q.push(p(1), 2, "e2").unwrap();
+        q.push(p(0), 3, "t1").unwrap();
+        q.push(p(1), 4, "e3").unwrap();
+        q.push(p(0), 5, "t2").unwrap();
+        let t1 = q.take(10).unwrap();
+        assert_eq!(t1.item, "t1");
+        let mut got = Vec::new();
+        q.hand_over_older(p(1), t1.enqueued_ns, |e| got.push(*e));
+        assert_eq!(got, ["e1", "e2"]);
+        let t2 = q.take(10).unwrap();
+        got.clear();
+        q.hand_over_older(p(1), t2.enqueued_ns, |e| got.push(*e));
+        assert_eq!(got, ["e3"], "e1 and e2 were handed already");
+        // the handed ones are taken in their order; nothing again
+        assert_eq!(q.take(10).unwrap().item, "e1");
+        got.clear();
+        q.hand_over_older(p(1), u64::MAX, |e| got.push(*e));
+        assert!(got.is_empty(), "{got:?}");
+        q.push(p(1), 11, "e4").unwrap();
+        q.hand_over_older(p(1), u64::MAX, |e| got.push(*e));
+        assert_eq!(got, ["e4"]);
+        let rest: Vec<&str> = std::iter::from_fn(|| q.take(20).map(|t| t.item)).collect();
+        assert_eq!(rest, ["e2", "e3", "e4"]);
     }
 
     /// The opens are what a full P2 drops; every other file event waits

@@ -38,7 +38,6 @@ use common::wire::open_sensor::{
 use common::wire::InodeKey;
 use nn_model::telemetry::{FileCapability, FimEvent, FimOp};
 use nn_model::Event;
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::anti_tamper::filesystem::{stat_dev_to_kernel_dev, AyaInodeKey};
@@ -1371,7 +1370,7 @@ pub(crate) fn decode_batch<'a>(
 
 /// Drain the ring into the agent's event channel until the receiver goes
 /// away.
-pub async fn pump(ring: RingBuf<MapData>, tx: mpsc::Sender<Event>) {
+pub async fn pump(ring: RingBuf<MapData>, tx: crate::sensors::bus::BusSender) {
     let mut fd = match crate::async_fd::register(ring) {
         Ok(fd) => fd,
         Err(e) => {

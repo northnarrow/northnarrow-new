@@ -83,7 +83,6 @@ use common::wire::{
 use nn_model::telemetry::{FileAttrChange, FimEvent, FimOp};
 use nn_model::Event;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 
 use crate::posture::lineage::AuthSessionTracker;
 // The drain's synchronous work (hashing, the drift log, `/proc` reads)
@@ -2309,11 +2308,13 @@ fn resolve_pid_exe(pid: u32) -> Option<String> {
 /// in-memory views stay consistent: no event meets a baseline row that
 /// the cache does not hold yet.
 ///
-/// The `event_tx` is the same channel
+/// The `event_tx` is the event bus
 /// [`crate::sensors::SensorMultiplexer`] funnels its events into;
 /// `Event::Fim(FimEvent)` lands alongside `ProcessSpawn` /
 /// `FsProtectDenial` so the existing main-loop `process_event`
-/// path picks them up without changes.
+/// path picks them up without changes. Lab PR 267 (R12a): in the file
+/// queue, where a drift waits for room as it did on the one channel
+/// (review 75) while a full queue drops new `FileOpen`s.
 #[allow(clippy::too_many_arguments)]
 pub async fn drain_loop(
     rb: aya::maps::ring_buf::RingBuf<aya::maps::MapData>,
@@ -2324,7 +2325,7 @@ pub async fn drain_loop(
     rate_limiter: std::sync::Arc<DriftRateLimiter>,
     watched_paths: Option<std::sync::Arc<parking_lot::Mutex<WatchedPathsHandle>>>,
     lineage: AuthSessionTracker,
-    event_tx: mpsc::Sender<Event>,
+    event_tx: crate::sensors::bus::BusSender,
 ) -> std::io::Result<()> {
     let mut async_fd = crate::async_fd::register(rb)?;
     info!(

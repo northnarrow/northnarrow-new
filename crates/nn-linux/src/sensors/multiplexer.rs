@@ -2,10 +2,12 @@
 //!
 //! Loads the compiled eBPF object once, attaches all six programs
 //! (one tracepoint exec + two syscall tracepoints + three kprobes),
-//! drains each program's dedicated ringbuf, and funnels every decoded
-//! event into a unified [`mpsc`] channel. The agent main loop reads
-//! from a single `Receiver<Event>` and stays oblivious to which
-//! sensor produced what.
+//! drains each program's dedicated ringbuf, and sends every decoded
+//! event onto the event bus. Lab PR 267 (R12a): the bus is a queue per
+//! class of events, taken by priority ([`crate::sensors::bus`]), in place
+//! of the one `mpsc` channel of 4,096 events every pump shared; the agent
+//! main loop reads it through [`SensorMultiplexer::next_event`] and stays
+//! oblivious to which sensor produced what.
 //!
 //! Tappa 10 N9 — [`Self::start_with_net`] additionally attaches the
 //! three N2 network observation programs (`inet_csk_listen_start`
@@ -35,12 +37,13 @@ use common::wire::{
 };
 use nn_model::Event;
 use parking_lot::Mutex;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::net::dns_cache::DnsCache;
 use crate::net::flow_tracker::{FlowTracker, TcpConnectInfo};
 use crate::posture::lineage::AuthSessionTracker;
+use crate::sensors::bus::{BusLosses, BusReceiver, BusSender, BusStats, Received};
 
 /// The DNS record's decode (R09b, lab PR 254: nn-model's until then).
 use crate::sensors::dns_sensor::{nss_query_name, query_event};
@@ -50,8 +53,9 @@ use crate::sensors::dns_sensor::{nss_query_name, query_event};
 use crate::sensors::ebpf_object::EBPF_BYTES;
 use crate::sensors::reject::RejectThrottle;
 
-/// Channel between the per-ringbuf pumps and the agent main loop.
-const CHANNEL_CAPACITY: usize = 4096;
+/// Lab PR 267 (R12a): the loss recorder's label among the telemetry tasks
+/// (a dead recorder would leave the bus's drops unsigned).
+pub const BUS_LOSSES_LABEL: &str = "event_bus_losses";
 
 /// Tappa 10 N9 — shared state the multiplexer threads into the
 /// TcpConnect + DnsQuery pumps so each kernel observation feeds
@@ -140,14 +144,19 @@ pub struct SensorMultiplexer<G> {
     /// main loop polls [`Self::finished_pumps`]; a task that ended is a
     /// blind spot and stops the agent.
     pumps: Vec<(&'static str, JoinHandle<()>)>,
-    rx: mpsc::Receiver<Event>,
-    /// Tappa 9 C8: cloneable handle to the same `Event` channel
-    /// the sensor pumps feed. The FIM drain loop (also spawned at
-    /// agent boot) clones this to push `Event::Fim` items into the
-    /// same main-loop receiver — no extra `select!` arm needed in
-    /// `main.rs`. Tappa 10 N9 reuses the same pattern for the
-    /// net drain loop.
-    event_tx: mpsc::Sender<Event>,
+    /// Lab PR 267 (R12a): the event bus's receiving end.
+    rx: BusReceiver,
+    /// Tappa 9 C8: cloneable handle to the same event bus the sensor
+    /// pumps feed. The FIM drain loop (also spawned at agent boot) clones
+    /// this to push `Event::Fim` items into the same main-loop receiver —
+    /// no extra `select!` arm needed in `main.rs`. Tappa 10 N9 reuses the
+    /// same pattern for the net drain loop.
+    event_tx: BusSender,
+    /// Lab PR 267 (R12a): the bus's loss recorder's bindings, and the
+    /// lineage the receiver teaches the execs a tamper event overtakes
+    /// (the net wiring's; none without it).
+    bus_losses: BusLosses,
+    lineage: Option<AuthSessionTracker>,
     /// R09b (lab PR 254): the exec guards of the load.
     guards: PhantomData<fn() -> G>,
     /// R11c (lab PR 264): the ring-drop and fail-open samplers the load
@@ -459,7 +468,9 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         let iouring_rb = take_ringbuf(&mut ebpf, "IOURING_EVENTS")?;
         let bpf_syscall_rb = take_ringbuf(&mut ebpf, "BPF_SYSCALL_EVENTS")?;
 
-        let (tx, rx) = mpsc::channel::<Event>(CHANNEL_CAPACITY);
+        let (tx, rx) = crate::sensors::bus::channel();
+        let bus_losses = BusLosses::default();
+        let lineage_for_bus = net.as_ref().map(|w| w.lineage.clone());
         let flow_tracker_for_tcp = net.as_ref().map(|w| ConnectWiring {
             flow_tracker: Arc::clone(&w.flow_tracker),
             lineage: w.lineage.clone(),
@@ -507,6 +518,11 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 "bpf_syscall",
                 spawn_pump::<BpfSyscallRaw>("bpf_syscall", bpf_syscall_rb, tx.clone()),
             ),
+            // Lab PR 267 (R12a): the bus's drops, WARNed, signed, raised.
+            (
+                BUS_LOSSES_LABEL,
+                crate::sensors::bus::spawn_loss_recorder(tx.stats(), bus_losses.clone()),
+            ),
         ];
 
         Ok((
@@ -515,6 +531,8 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 pumps,
                 rx,
                 event_tx: tx,
+                bus_losses,
+                lineage: lineage_for_bus,
                 guards: PhantomData,
                 ring_drops,
                 fail_open,
@@ -567,12 +585,30 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         &mut self.ebpf
     }
 
-    /// Tappa 9 C8 — clone of the cross-sensor `Event` channel sender.
+    /// Tappa 9 C8 — clone of the cross-sensor event bus's sender.
     /// The FIM drain loop pushes `Event::Fim` items through this so
     /// they land in the same `next_event()` receiver the main loop
     /// already polls.
-    pub fn event_tx(&self) -> mpsc::Sender<Event> {
+    pub fn event_tx(&self) -> BusSender {
         self.event_tx.clone()
+    }
+
+    /// Lab PR 267 (R12a): the event bus's counts per queue, for the status.
+    pub fn bus_stats(&self) -> BusStats {
+        self.rx.stats()
+    }
+
+    /// Lab PR 267 (R12a): the bus's loss recorder, whose audit log and
+    /// posture the start binds once they exist (as the ring-drop
+    /// sampler's), and which the stop flushes.
+    pub fn bus_losses(&self) -> &BusLosses {
+        &self.bus_losses
+    }
+
+    /// Lab PR 267 (R12a): the event the loop took last is decided (its
+    /// latency, queue to decision, is counted).
+    pub fn decided(&mut self) {
+        self.rx.decided();
     }
 
     /// Tappa 9 C8 — register a spawned telemetry task (the FIM and net
@@ -606,11 +642,14 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         found
     }
 
-    /// Drain the next event. In practice never `None`: this struct and the
-    /// drains hold senders (a dead pump is caught by
-    /// [`Self::finished_pumps`] instead).
-    pub async fn next_event(&mut self) -> Option<Event> {
-        self.rx.recv().await
+    /// Drain the next event, by priority (lab PR 267, R12a: the bus). In
+    /// practice never `None`: this struct and the drains hold senders (a
+    /// dead pump is caught by [`Self::finished_pumps`] instead). A tamper
+    /// event comes with the execs it overtook ([`Received::overtaken`]),
+    /// which the lineage has learned already; the event loop teaches the
+    /// engine's rules (`RuleEngine::observe_arrival`) before judging it.
+    pub async fn next_event(&mut self) -> Option<Received> {
+        self.rx.recv_with(self.lineage.as_ref()).await
     }
 
     /// Lab PR 219: attach the exploit post-condition guard (detect mode)
@@ -868,11 +907,7 @@ fn take_ringbuf(ebpf: &mut Ebpf, name: &str) -> Result<RingBuf<MapData>> {
     RingBuf::try_from(map).map_err(|e| anyhow!("expected `{name}` to be a RINGBUF: {e}"))
 }
 
-fn spawn_pump<T>(
-    label: &'static str,
-    rb: RingBuf<MapData>,
-    tx: mpsc::Sender<Event>,
-) -> JoinHandle<()>
+fn spawn_pump<T>(label: &'static str, rb: RingBuf<MapData>, tx: BusSender) -> JoinHandle<()>
 where
     T: Pod,
     for<'a> Event: From<&'a T>,
@@ -884,11 +919,7 @@ where
     })
 }
 
-async fn pump<T>(
-    label: &'static str,
-    rb: RingBuf<MapData>,
-    tx: mpsc::Sender<Event>,
-) -> std::io::Result<()>
+async fn pump<T>(label: &'static str, rb: RingBuf<MapData>, tx: BusSender) -> std::io::Result<()>
 where
     T: Pod,
     for<'a> Event: From<&'a T>,
@@ -899,7 +930,7 @@ where
 /// External audit EBPF-013: io_uring records, followed by the
 /// [`Event::SensorFlood`]s a ring creation carries (creations the kernel's
 /// record budgets held back since the process's previous one).
-fn spawn_iouring_pump(rb: RingBuf<MapData>, tx: mpsc::Sender<Event>) -> JoinHandle<()> {
+fn spawn_iouring_pump(rb: RingBuf<MapData>, tx: BusSender) -> JoinHandle<()> {
     tokio::spawn(async move {
         let floods = |raw: &IoUringRaw, e: Event| (e, nn_model::io_uring_floods(raw));
         if let Err(e) = pump_with("io_uring", rb, tx, floods).await {
@@ -911,7 +942,7 @@ fn spawn_iouring_pump(rb: RingBuf<MapData>, tx: mpsc::Sender<Event>) -> JoinHand
 /// External audit PROC-005: module loads, their path made absolute — the
 /// kernel's walk stops at the root of the `.ko`'s filesystem, which is put
 /// back on its mount point ([`module_path_on_host`]).
-fn spawn_module_load_pump(rb: RingBuf<MapData>, tx: mpsc::Sender<Event>) -> JoinHandle<()> {
+fn spawn_module_load_pump(rb: RingBuf<MapData>, tx: BusSender) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut mounts = crate::sensors::open_sensor::MountTable::load();
         let place = move |raw: &ModuleLoadRaw, mut e: Event| {
@@ -946,7 +977,7 @@ pub(crate) fn module_path_on_host(
 async fn pump_with<T>(
     label: &'static str,
     rb: RingBuf<MapData>,
-    tx: mpsc::Sender<Event>,
+    tx: BusSender,
     // The record's event, then any events it carries (External audit
     // EBPF-013: the floods a budgeted record reports).
     mut after: impl FnMut(&T, Event) -> (Event, [Option<Event>; 2]),
@@ -1001,7 +1032,7 @@ struct ConnectWiring {
 fn spawn_tcp_connect_pump(
     rb: RingBuf<MapData>,
     flow_tracker: Option<ConnectWiring>,
-    tx: mpsc::Sender<Event>,
+    tx: BusSender,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = pump_tcp_connect(rb, flow_tracker, tx).await {
@@ -1032,11 +1063,7 @@ impl Drop for ConnectPumpClaim {
 /// lab PR 246, announced to the flow tracker: its close, held by the net
 /// drain until then, follows it on the bus. `false` when the bus is
 /// closed.
-async fn send_connect(
-    raw: &TcpConnectRaw,
-    wiring: Option<&ConnectWiring>,
-    tx: &mpsc::Sender<Event>,
-) -> bool {
+async fn send_connect(raw: &TcpConnectRaw, wiring: Option<&ConnectWiring>, tx: &BusSender) -> bool {
     for event in connect_events(raw, wiring) {
         if tx.send(event).await.is_err() {
             return false;
@@ -1053,7 +1080,7 @@ async fn send_connect(
 async fn pump_tcp_connect(
     rb: RingBuf<MapData>,
     flow_tracker: Option<ConnectWiring>,
-    tx: mpsc::Sender<Event>,
+    tx: BusSender,
 ) -> std::io::Result<()> {
     let mut async_fd = crate::async_fd::register(rb)?;
     let mut reject = RejectThrottle::new();
@@ -1287,7 +1314,7 @@ fn spawn_dns_query_pump(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
     lineage: AuthSessionTracker,
-    tx: mpsc::Sender<Event>,
+    tx: BusSender,
 ) -> JoinHandle<()> {
     // Lab PR 229: the DNS attributions of the net drain and the connect
     // pump wait for this pump's passes while it runs (`DnsIngest`) —
@@ -1308,21 +1335,21 @@ async fn pump_dns_query(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
     lineage: AuthSessionTracker,
-    tx: mpsc::Sender<Event>,
+    tx: BusSender,
 ) -> std::io::Result<()> {
     let mut async_fd = crate::async_fd::register(rb)?;
     let mut reject = RejectThrottle::new();
-    // Lab PR 229: a pass feeds the cache with every record it reads; the
-    // events wait here for the bus, in ring order. A full bus held each
-    // record — and the cache — behind the send of the one before it, so a
-    // connect and a close were attributed while their process's query was
-    // still in the ring. The ring is read on, and a lookup's pass served,
-    // while events wait, up to [`DNS_OUTBOX_MAX`] of them.
+    // Lab PR 229: a pass feeds the cache with every record it reads, and a
+    // lookup's pass is served while the pass's events go out, in ring
+    // order. Lab PR 267 (R12a): the bus never makes a network event wait —
+    // a full network queue drops the new event and counts it — so they go
+    // out as soon as the pass ends; a full bus no longer holds a record,
+    // and the cache, behind the send of the one before it (the outbox lab
+    // PR 229 kept for that is gone).
     let mut outbox: VecDeque<Event> = VecDeque::new();
     loop {
-        let room = outbox.len() < DNS_OUTBOX_MAX;
         let step = tokio::select! {
-            r = async_fd.readable_mut(), if room => {
+            r = async_fd.readable_mut() => {
                 let mut guard = r?;
                 let drained = dns_pass(
                     guard.get_inner_mut(),
@@ -1339,27 +1366,7 @@ async fn pump_dns_query(
                     Some(c) => c.ingest().wanted().await,
                     None => std::future::pending().await,
                 }
-            }, if room => DnsStep::Asked,
-            permit = tx.reserve(), if !outbox.is_empty() => match permit {
-                Ok(permit) => {
-                    if let Some(event) = outbox.pop_front() {
-                        permit.send(event);
-                    }
-                    // and whatever else the bus takes now, in order
-                    while let Some(event) = outbox.pop_front() {
-                        match tx.try_send(event) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(event)) => {
-                                outbox.push_front(event);
-                                break;
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
-                        }
-                    }
-                    DnsStep::Read
-                }
-                Err(_) => return Ok(()),
-            },
+            } => DnsStep::Asked,
         };
         match step {
             // a lookup asked for a pass: the ring is read, ready or not
@@ -1378,23 +1385,23 @@ async fn pump_dns_query(
             }
             DnsStep::Read => {}
         }
+        for event in outbox.drain(..) {
+            if tx.send(event).await.is_err() {
+                return Ok(());
+            }
+        }
     }
 }
 
 /// Lab PR 229: what one turn of the DNS pump did.
 enum DnsStep {
-    /// Read records, or sent events.
+    /// Read records.
     Read,
     /// Woken with nothing to read.
     Idle,
     /// A lookup asked for a pass.
     Asked,
 }
-
-/// Lab PR 229: the most DNS events the pump holds for a full bus. Past it
-/// the ring is left to fill (the kernel counts what it then drops), as it
-/// was while the pump waited on each send.
-const DNS_OUTBOX_MAX: usize = 8192;
 
 /// One pass over the DNS ring, to empty: each record's events into
 /// `outbox`, the cache fed. Returns the records read. Lab PR 229: the pass
@@ -1544,13 +1551,16 @@ mod tests {
         raw.sk_ptr = 0xbeef;
         let corr = FlowTracker::corr_id(raw.timestamp_ns, raw.sk_ptr);
         assert!(!w.flow_tracker.lock().close_may_proceed(&corr));
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, mut rx) = crate::sensors::bus::channel();
         assert!(send_connect(&raw, Some(&w), &tx).await);
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Event::TcpConnect { pid: 4700, .. })
+            rx.try_recv().map(|r| r.event),
+            Some(Event::TcpConnect { pid: 4700, .. })
         ));
-        assert!(matches!(rx.try_recv(), Ok(Event::NetFlow(_))));
+        assert!(matches!(
+            rx.try_recv().map(|r| r.event),
+            Some(Event::NetFlow(_))
+        ));
         assert!(w.flow_tracker.lock().close_may_proceed(&corr));
         // Another connect, not sent: its close waits until the pump ends.
         let other = FlowTracker::corr_id(30_000, 0xbeef);
