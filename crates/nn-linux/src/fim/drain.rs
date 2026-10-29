@@ -71,7 +71,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -173,6 +173,11 @@ pub const RUNTIME_CHILD_CAP: usize = crate::fim::attach::WATCHED_PATHS_CAPACITY 
 pub struct InodePathMap {
     inner: parking_lot::RwLock<PathMapInner>,
     child_cap: usize,
+    /// External audit NN-AUD-120: the signed audit log a full watch set is
+    /// recorded in ([`note_watch_pressure`]), bound by the start
+    /// ([`Self::bind_audit_log`]; R11c, lab PR 264: it was a process-wide
+    /// static a setter filled, `set_audit_log`).
+    audit: crate::late_audit::LateAudit,
 }
 
 #[derive(Debug, Default)]
@@ -248,7 +253,15 @@ impl InodePathMap {
         Self {
             inner: parking_lot::RwLock::new(PathMapInner::default()),
             child_cap,
+            audit: crate::late_audit::LateAudit::new(),
         }
+    }
+
+    /// Hand the signed audit log to the FIM (the start, once the map is
+    /// made): a full watch set is recorded there (external audit
+    /// NN-AUD-120).
+    pub fn bind_audit_log(&self, log: Option<crate::late_audit::AuditHandle>) {
+        self.audit.bind(log);
     }
 
     /// Map a configured path: [`Self::insert_as`] with
@@ -1510,17 +1523,6 @@ impl WatchPressure {
 static WATCH_PRESSURE: parking_lot::Mutex<WatchPressure> =
     parking_lot::Mutex::new(WatchPressure::new());
 
-/// The signed audit log, for [`note_watch_pressure`].
-static FIM_AUDIT_LOG: OnceLock<Arc<parking_lot::Mutex<crate::audit::AuditLog>>> = OnceLock::new();
-
-/// Hand the signed audit log to the FIM (from `main`, once it exists): a
-/// full watch set is recorded there (external audit NN-AUD-120).
-pub fn set_audit_log(log: Option<Arc<parking_lot::Mutex<crate::audit::AuditLog>>>) {
-    if let Some(l) = log {
-        let _ = FIM_AUDIT_LOG.set(l);
-    }
-}
-
 fn note_watch_pressure(evicted: u64, refused: u64, path: &str, path_map: &InodePathMap) {
     let (log, attest, evicted_total, refused_total) = {
         let mut p = WATCH_PRESSURE.lock();
@@ -1544,7 +1546,7 @@ fn note_watch_pressure(evicted: u64, refused: u64, path: &str, path_map: &InodeP
         );
     }
     if attest {
-        if let Some(log) = FIM_AUDIT_LOG.get() {
+        if let Some(log) = path_map.audit.get() {
             let draft = watch_map_full_draft(evicted_total, refused_total, children, cap);
             if let Err(e) = log.lock().append(draft) {
                 warn!(

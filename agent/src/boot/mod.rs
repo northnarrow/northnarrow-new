@@ -209,6 +209,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         mut sensor,
         net_bufs,
         exploit_guard_degraded,
+        exploit_guard,
     } = attach::load(
         &cli,
         &mut boot,
@@ -244,6 +245,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         tracepoint_degraded,
         hook_args_degraded,
         exploit_guard_degraded,
+        &exploit_guard,
         caps_degraded,
         audit,
     )?;
@@ -270,7 +272,14 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         executor,
         correlation,
         isolator,
-    } = response::build(&cli, exec_cfg, detect_only, &audit_log, &overlay_gate)?;
+    } = response::build(
+        &cli,
+        exec_cfg,
+        detect_only,
+        &audit_log,
+        &overlay_gate,
+        &exploit_guard,
+    )?;
     let posture::Posture {
         ladder_slot,
         exempt,
@@ -288,8 +297,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &defense_detector,
         &rule_policy,
     );
-    evidence::wire(
+    let evidence::Wired { telemetry_probe } = evidence::wire(
         &cli,
+        &sensor,
         &audit_log,
         &watchdog_audit,
         &overlay_gate,
@@ -417,6 +427,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &installer_override,
         &detection_sink,
         &audit_log,
+        &telemetry_probe,
         &mut signals,
     )
     .await;
@@ -424,6 +435,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &cli,
         execq_handle,
         execpol_handle,
+        sensor.bpf_guard(),
         &audit_log,
         &chain_anchor,
         stopped,
@@ -828,27 +840,30 @@ mod tests {
             2,
             "both machines (with and without the isolator)"
         );
-        let run = function(
+        // `run`, without whitespace (rustfmt splits a call over lines): the
+        // policy phase's handle goes to the posture and the admin socket.
+        let run: String = function(
             include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/mod.rs")),
             "async fn run(",
-        );
-        let at = |needle: &str| {
-            run.find(needle)
-                .unwrap_or_else(|| panic!("run: `{needle}` not found"))
+        )
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+        let call = |head: &str| {
+            let at = run
+                .find(head)
+                .unwrap_or_else(|| panic!("run: `{head}` not found"));
+            let rest = &run[at..];
+            rest[..rest.find(");").expect("the call's end")].to_string()
         };
+        assert!(run.contains("rule_policy,engine,}=policy::load("));
         assert!(
-            at("        rule_policy,\n        engine,\n    } = policy::load(")
-                < at("posture::machine(")
+            call("=posture::machine(").contains("&rule_policy"),
+            "the posture gets the policy phase's handle"
         );
-        assert!(at("&rule_policy,\n    );\n    evidence::wire(") > at("posture::machine("));
-        let admin = &run[at("admin::start(")..];
-        let admin: String = admin[..admin.find(");").expect("the call's end")]
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
         assert!(
-            admin.contains("AdminHandles{rule_policy"),
-            "the admin socket gets the policy phase's handle: {admin}"
+            call("admin::start(").contains("AdminHandles{rule_policy"),
+            "the admin socket gets the policy phase's handle"
         );
     }
 

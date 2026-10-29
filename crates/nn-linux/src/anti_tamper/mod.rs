@@ -225,6 +225,7 @@ const PTRACE_HOOK: &str = "ptrace_access_check";
 pub fn attach(
     _verified: &crate::boot::IntegrityVerified,
     ebpf: &mut Ebpf,
+    bpf_guard: &bpf_defense::BpfGuard,
     pids: &[u32],
     keep: &[ExeIdentity],
 ) -> Result<()> {
@@ -471,7 +472,7 @@ pub fn attach(
     deny_expected += fs.optional_present;
 
     // BPF self-defence (Tappa 10.8): map guard (deny) + bpf() observer.
-    let bd = bpf_defense::attach(ebpf, &btf, pin_root);
+    let bd = bpf_defense::attach(bpf_guard, ebpf, &btf, pin_root);
     for (program, why) in bd.deny_failures {
         deny.missing_hook(program, why);
     }
@@ -479,7 +480,7 @@ pub fn attach(
     // Every program is loaded now: register the agent's own object ids
     // and arm the mode. A failure leaves the guard with an empty set
     // (nothing denied) and counts as a deny-hook failure.
-    match bpf_defense::register_own_objects(ebpf, pin_root) {
+    match bpf_defense::register_own_objects(bpf_guard, ebpf, pin_root) {
         Ok(o) => {
             debug!(
                 maps = o.maps,

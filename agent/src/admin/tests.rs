@@ -3189,6 +3189,7 @@ fn detection_state_with_max_id(max_id: u64) -> (DetectionAdminState, TempDir) {
         agent_key,
         detections_path: det_path,
         status_events_path: evt_path,
+        unverified: Default::default(),
     };
     (state, dir)
 }
@@ -3380,6 +3381,7 @@ fn the_detections_read_verifies_its_rows_on_a_degraded_boot_too() {
         agent_key,
         detections_path: det_path,
         status_events_path: dir.path().join("status_events.jsonl"),
+        unverified: Default::default(),
     };
     let read = |state: Option<&DetectionAdminState>| {
         let auth = ConnAuth::new(&auth);

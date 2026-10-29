@@ -36,6 +36,10 @@ pub(crate) struct Attached {
     /// The exploit guard off or unavailable, signed once the audit log is
     /// open.
     pub(crate) exploit_guard_degraded: Option<String>,
+    /// R11c (lab PR 264): the running exploit guard (`None`: off or
+    /// unavailable) — its sampler's audit log, which the attest phase
+    /// binds, and its response, which the response phase sets.
+    pub(crate) exploit_guard: Option<northnarrow_agent::sensors::epg::ExploitGuard>,
 }
 
 /// `BootPhase::Attach`: the eBPF object loads and the sensors attach
@@ -227,18 +231,24 @@ pub(crate) async fn load(
     // agent's programs are recorded as its own (DEP-006), in detect mode
     // until the no-enforcement gate is resolved below. Off or unavailable
     // is attested once the audit log is open.
-    let exploit_guard_degraded: Option<String> =
+    let (exploit_guard, exploit_guard_degraded) =
         match sensor.attach_exploit_guard(verified, cli.exploit_guard.variant()) {
-            Ok(()) => None,
-            Err(_) if cli.exploit_guard == ExploitGuard::Off => Some(
-                "exploit post-condition guard off (--exploit-guard off / NN_EXPLOIT_GUARD=off): \
-                 kernel exploit post-conditions are not watched"
-                    .to_string(),
+            Ok(guard) => (Some(guard), None),
+            Err(_) if cli.exploit_guard == ExploitGuard::Off => (
+                None,
+                Some(
+                    "exploit post-condition guard off (--exploit-guard off / \
+                     NN_EXPLOIT_GUARD=off): kernel exploit post-conditions are not watched"
+                        .to_string(),
+                ),
             ),
-            Err(e) => Some(format!(
-                "exploit post-condition guard unavailable on this kernel: {e} — kernel exploit \
-                 post-conditions are not watched"
-            )),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "exploit post-condition guard unavailable on this kernel: {e} — kernel \
+                     exploit post-conditions are not watched"
+                )),
+            ),
         };
     // External audit DEP-006: the ids install.sh / uninstall.sh wait for.
     record_own_prog_ids(own_prog_ids_file.as_deref(), sensor.ebpf_mut());
@@ -252,6 +262,7 @@ pub(crate) async fn load(
         sensor,
         net_bufs,
         exploit_guard_degraded,
+        exploit_guard,
     })
 }
 

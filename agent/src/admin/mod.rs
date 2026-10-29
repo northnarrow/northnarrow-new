@@ -261,6 +261,10 @@ pub struct DetectionAdminState {
     /// Path to `status_events.jsonl`. `dispatch_detections` builds the
     /// `{id -> current status}` overlay from here.
     pub status_events_path: PathBuf,
+    /// External audit NN-AUD-112: the served rows that do not verify,
+    /// reported (signed) — R11c (lab PR 264): the read path's own, with the
+    /// start's audit log; it was process-wide.
+    pub unverified: Arc<crate::chains::UnverifiedRows>,
 }
 
 /// External audit CMB-016 — what the response verbs (`nn-admin response

@@ -33,6 +33,7 @@ pub(crate) fn build(
     detect_only: bool,
     audit_log: &AuditHandle,
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    exploit_guard: &Option<northnarrow_agent::sensors::epg::ExploitGuard>,
 ) -> Result<Response> {
     // Tappa 7 task 6 #2b-verify: optional PID file. `attach_anti_tamper`
     // above is fully synchronous (anti_tamper::attach attempts AND pins
@@ -62,12 +63,13 @@ pub(crate) fn build(
     }
 
     // Lab PR 219: the exploit guard enforces only when asked to and outside
-    // detect-only (the one no-enforcement switch wins).
+    // detect-only (the one no-enforcement switch wins). R11c (lab PR 264):
+    // the guard the attach gave, no longer a process-wide control.
     if cli.exploit_guard != ExploitGuard::Off {
         use northnarrow_agent::sensors::epg::{effective_response, set_response, Response};
         let requested = cli.exploit_guard_response.response();
         match effective_response(requested, detect_only) {
-            Response::Enforce => match set_response(Response::Enforce) {
+            Response::Enforce => match set_response(exploit_guard.as_ref(), Response::Enforce) {
                 Ok(()) => warn!(
                     "exploit post-condition guard ENFORCING: a task found holding what no \
                      legitimate transition gave it is sent SIGKILL in the kernel (lite: and \

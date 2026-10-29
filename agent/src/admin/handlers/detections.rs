@@ -137,7 +137,9 @@ fn detections(
         Some(&state.agent_key),
     );
     if unverified > 0 {
-        crate::chains::report_unverified_rows("detections", detections_path, unverified);
+        state
+            .unverified
+            .report("detections", detections_path, unverified);
     }
 
     // Serialise newest-first, bounding the body at the wire soft cap.

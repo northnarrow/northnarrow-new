@@ -112,6 +112,16 @@ pub struct SensorMultiplexer<G> {
     event_tx: mpsc::Sender<Event>,
     /// R09b (lab PR 254): the exec guards of the load.
     guards: PhantomData<fn() -> G>,
+    /// R11c (lab PR 264): the ring-drop and fail-open samplers the load
+    /// started, for the start to bind their audit log and posture
+    /// ([`Self::ring_drops`], [`Self::fail_open`]; process-wide setters
+    /// until then).
+    ring_drops: crate::sensors::ring_drops::RingDrops,
+    fail_open: crate::anti_tamper::fail_open::FailOpen,
+    /// R11c (lab PR 264): the BPF guard's record of this object's own maps,
+    /// programs and links ([`Self::bpf_guard`]; process-wide statics until
+    /// then).
+    bpf_guard: crate::anti_tamper::bpf_defense::BpfGuard,
 }
 
 impl<G: ExecGuards> SensorMultiplexer<G> {
@@ -207,8 +217,10 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             .with_context(|| "loading eBPF object (BTF, maps, programs)")?;
         // External audit ATP-013: every map's id, before the ring buffers
         // and RING_DROPS are taken out of the object below — the BPF guard
-        // registers them as the agent's own from this record.
-        crate::anti_tamper::bpf_defense::remember_loaded_maps(&ebpf);
+        // registers them as the agent's own from this record (R11c, lab PR
+        // 264: the object's own record).
+        let bpf_guard = crate::anti_tamper::bpf_defense::BpfGuard::new();
+        bpf_guard.remember_loaded_maps(&ebpf);
 
         // Multi-kernel, level 1: hand the programs the offsets resolved
         // from THIS kernel's BTF before anything attaches. 0 = nothing
@@ -238,9 +250,9 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             );
         }
 
-        crate::sensors::ring_drops::install(&mut ebpf);
+        let ring_drops = crate::sensors::ring_drops::install(&mut ebpf);
         // Lab PR 215: the deny hooks' fail-open counters.
-        crate::anti_tamper::fail_open::install(&mut ebpf);
+        let fail_open = crate::anti_tamper::fail_open::install(&mut ebpf);
         // Lab PR 164: FLOW_SOCK_MAP's occupancy for `nn-admin net status`.
         crate::sensors::flow_sock::install(&mut ebpf);
 
@@ -445,9 +457,32 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 rx,
                 event_tx: tx,
                 guards: PhantomData,
+                ring_drops,
+                fail_open,
+                bpf_guard,
             },
             net_bufs,
         ))
+    }
+
+    /// R11c (lab PR 264): the BPF guard's record of this object's own
+    /// objects: the start spawns its link self-check and signs its foreign
+    /// pins once the audit log exists, retires a link it detaches, and
+    /// marks the stop.
+    pub fn bpf_guard(&self) -> &crate::anti_tamper::bpf_defense::BpfGuard {
+        &self.bpf_guard
+    }
+
+    /// R11c (lab PR 264): the ring-drop sampler the load started, whose
+    /// audit log and posture the start binds once they exist.
+    pub fn ring_drops(&self) -> &crate::sensors::ring_drops::RingDrops {
+        &self.ring_drops
+    }
+
+    /// R11c (lab PR 264): the deny hooks' fail-open sampler the load
+    /// started, whose audit log the start binds once it exists.
+    pub fn fail_open(&self) -> &crate::anti_tamper::fail_open::FailOpen {
+        &self.fail_open
     }
 
     /// Tappa 9 C8 — mutable access to the underlying [`Ebpf`] object
@@ -505,22 +540,23 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     }
 
     /// Lab PR 219: attach the exploit post-condition guard (detect mode)
-    /// and pump its records into the event channel. `Err(reason)` when it
-    /// does not run; nothing of it is attached then. `_verified`: as for
-    /// [`Self::start_with_net`] (R11b, lab PR 262).
+    /// and pump its records into the event channel; the running guard goes
+    /// to the start (R11c, lab PR 264: its response and its audit log).
+    /// `Err(reason)` when it does not run; nothing of it is attached then.
+    /// `_verified`: as for [`Self::start_with_net`] (R11b, lab PR 262).
     pub fn attach_exploit_guard(
         &mut self,
         _verified: &crate::boot::IntegrityVerified,
         variant: crate::sensors::epg::Variant,
-    ) -> std::result::Result<(), String> {
-        let ring = crate::sensors::epg::attach(&mut self.ebpf, variant)?;
+    ) -> std::result::Result<crate::sensors::epg::ExploitGuard, String> {
+        let (ring, guard) = crate::sensors::epg::attach(&mut self.ebpf, variant)?;
         let handle = spawn_pump::<common::wire::epg::EpgEventRaw>(
             crate::sensors::epg::PUMP_LABEL,
             ring,
             self.event_tx.clone(),
         );
         self.register_pump_handle(crate::sensors::epg::PUMP_LABEL, handle);
-        Ok(())
+        Ok(guard)
     }
 
     /// Wire up the Tappa 7 anti-tamper LSM hooks: register the
@@ -541,7 +577,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         pids: &[u32],
         keep: &[crate::anti_tamper::ExeIdentity],
     ) -> Result<()> {
-        crate::anti_tamper::attach(verified, &mut self.ebpf, pids, keep)
+        crate::anti_tamper::attach(verified, &mut self.ebpf, &self.bpf_guard, pids, keep)
     }
 }
 

@@ -119,12 +119,13 @@ fn start_open_sensor(
     posture.set_kernel_mass_write(true);
     // Armed: the old tracepoint (every openat to userland) goes. Its link
     // is retired first, or the BPF self-defence would report its absence
-    // as tampering.
+    // as tampering (R11c, lab PR 264: in the object's own record).
+    let bpf_guard = sensor.bpf_guard().clone();
     let detached = match sensor.ebpf_mut().program_mut("sys_enter_openat") {
         Some(p) => match <&mut aya::programs::TracePoint>::try_from(p) {
             Ok(tp) => {
                 if let Ok(info) = tp.info() {
-                    northnarrow_agent::anti_tamper::bpf_defense::retire_program_links(info.id());
+                    bpf_guard.retire_program_links(info.id());
                 }
                 tp.unload().is_ok()
             }
@@ -563,6 +564,10 @@ pub(crate) fn start(
                         Arc::new(InodePathMap::new())
                     }
                 };
+                // External audit NN-AUD-120: a full watch set is signed (R11c,
+                // lab PR 264: in the map's own slot, no longer a process-wide
+                // setter the late binding called).
+                inode_map.bind_audit_log(audit_log.clone());
                 northnarrow_agent::boot::manifest::note_sensor(
                     "fim_observers",
                     &format!(
