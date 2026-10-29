@@ -254,6 +254,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         exploit_guard_degraded,
         &exploit_guard,
         &anti_tamper,
+        sensor.dns_mode(),
         caps_degraded,
         audit,
     )?;
@@ -440,6 +441,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         detect_only,
         &audit_log,
         &capability_manifest,
+        sensor.attach_points(),
     )?;
     let stopped = crate::run_loop::run(
         armed,

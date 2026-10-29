@@ -159,14 +159,15 @@ pub fn state() -> String {
         .unwrap_or_else(|| Mode::Off.as_str().to_string())
 }
 
-/// From the multiplexer, once the exec sensor is attached: write the
-/// kernel configuration (always, `OFF` included, then frozen) and take the
-/// guard's maps. A guard that cannot run (the exec sensor is not on LSM)
-/// is written off and its reason kept for the signed degradation.
-pub fn install(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
+/// From the multiplexer, once the exec sensor is attached (`exec_on_lsm`:
+/// the LSM one): write the kernel configuration (always, `OFF` included,
+/// then frozen) and take the guard's maps. A guard that cannot run (the
+/// exec sensor is not on LSM) is written off and its reason kept for the
+/// signed degradation.
+pub fn install(ebpf: &mut aya::Ebpf, exec_on_lsm: bool) -> anyhow::Result<()> {
     let cfg = CONFIG.get().cloned().unwrap_or_default();
     let mut m = cfg.mode;
-    if m != Mode::Off && !crate::sensors::exe_identity::lsm_active() {
+    if m != Mode::Off && !exec_on_lsm {
         set_state(
             "degraded: the exec sensor is not on LSM bprm_check_security (tracepoint mode or \
              refused), the guard has no candidate to hold",

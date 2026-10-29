@@ -24,8 +24,9 @@ pub const AUDIT_OP: &str = "capability_manifest";
 pub const MANIFEST_VERSION: u32 = 1;
 
 /// R09b shim (lab PR 254; plan §4.1 rule 2, removed in R17): the sensors'
-/// attach points are noted by the eBPF loader and the sensors, nn-linux's.
-pub use nn_linux::boot::manifest::{note_sensor, sensors, SensorEntry};
+/// attach points are noted by the eBPF loader and the sensors, nn-linux's
+/// (R11c, lab PR 264: into the multiplexer's own `AttachPoints`).
+pub use nn_linux::boot::manifest::{AttachPoints, SensorEntry};
 
 /// The deny hooks of the boot.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

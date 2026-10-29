@@ -2,13 +2,12 @@
 //! `bprm_check_security` (`agent-ebpf/src/exec_lsm.rs`, design
 //! `docs/design/TAPPA10_9_SENSOR_ATTACH_POINTS_DESIGN.md` §11).
 //!
-//! - The mode: [`want_lsm`] (the `--exec-sensor` switch) before the
-//!   multiplexer starts, [`attach`] there, [`lsm_active`] after.
+//! - The mode: the `--exec-sensor` switch in the multiplexer's load plan,
+//!   [`attach`] there, which says which program runs (R11c, lab PR 264:
+//!   they were process-wide switches, `want_lsm` and `lsm_active`).
 //! - [`resolve`] turns the record's filesystem-relative path into an
 //!   absolute one with the mount table, before any consumer reads the
 //!   event (review 61: the exec rules read `exe.path_or(filename)`).
-
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use aya::programs::Lsm;
@@ -18,24 +17,11 @@ use nn_model::Event;
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
+use crate::boot::manifest::AttachPoints;
 use crate::sensors::open_sensor::MountTable;
 
 /// The LSM program in the eBPF object.
 pub const EXEC_LSM_PROGRAM: &str = "exec_check_lsm";
-
-static LSM_WANTED: AtomicBool = AtomicBool::new(true);
-static LSM_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// `--exec-sensor lsm` (the default) or `tracepoint`; set before the
-/// multiplexer starts.
-pub fn want_lsm(on: bool) {
-    LSM_WANTED.store(on, Ordering::Relaxed);
-}
-
-/// Whether the LSM exec sensor is the one attached.
-pub fn lsm_active() -> bool {
-    LSM_ACTIVE.load(Ordering::Relaxed)
-}
 
 /// The offsets the LSM program cannot do without, resolved on this
 /// kernel: `linux_binprm.file`, `.filename` and `.interp`.
@@ -56,17 +42,20 @@ fn offsets_resolved() -> Option<&'static str> {
     None
 }
 
-/// Attach the exec sensor: the LSM program when wanted and loadable,
-/// else `sys_enter_execve` (`attach_tracepoint`, from the multiplexer).
-/// Returns which one runs.
+/// Attach the exec sensor: the LSM program when wanted (`want_lsm`:
+/// `--exec-sensor lsm`, the default) and loadable, else `sys_enter_execve`
+/// (`attach_tracepoint`, from the multiplexer), noted in `points`. Returns
+/// which one runs ([`EXEC_LSM_PROGRAM`]: the LSM one).
 pub fn attach(
     ebpf: &mut Ebpf,
+    want_lsm: bool,
+    points: &AttachPoints,
     attach_tracepoint: impl FnOnce(&mut Ebpf) -> Result<()>,
 ) -> Result<&'static str> {
-    if !LSM_WANTED.load(Ordering::Relaxed) {
+    if !want_lsm {
         info!("exec sensor: tracepoint mode (--exec-sensor tracepoint) — sys_enter_execve");
         attach_tracepoint(ebpf)?;
-        tracepoint_fallback("chosen with --exec-sensor tracepoint");
+        tracepoint_fallback(points, "chosen with --exec-sensor tracepoint");
         return Ok("sys_enter_execve");
     }
     if let Some(missing) = offsets_resolved() {
@@ -75,17 +64,19 @@ pub fn attach(
             "exec sensor: an offset the LSM program needs is missing — attaching sys_enter_execve"
         );
         attach_tracepoint(ebpf)?;
-        tracepoint_fallback(&format!("the LSM program needs {missing}, not resolved"));
+        tracepoint_fallback(
+            points,
+            &format!("the LSM program needs {missing}, not resolved"),
+        );
         return Ok("sys_enter_execve");
     }
     match attach_lsm(ebpf) {
         Ok(()) => {
-            LSM_ACTIVE.store(true, Ordering::Relaxed);
             info!(
                 program = EXEC_LSM_PROGRAM,
                 "exec sensor armed on LSM bprm_check_security (Tappa 10.9 step 2)"
             );
-            crate::boot::manifest::note_sensor("exec", "lsm:bprm_check_security");
+            points.note("exec", "lsm:bprm_check_security");
             Ok(EXEC_LSM_PROGRAM)
         }
         Err(e) => {
@@ -94,7 +85,7 @@ pub fn attach(
                 "exec sensor: the LSM program was refused — attaching sys_enter_execve"
             );
             attach_tracepoint(ebpf)?;
-            tracepoint_fallback("the LSM program was refused by the kernel");
+            tracepoint_fallback(points, "the LSM program was refused by the kernel");
             Ok("sys_enter_execve")
         }
     }
@@ -107,11 +98,8 @@ pub fn attach(
 pub const EXEC_TRACEPOINT_DEGRADED: &str = "exec sensor on sys_enter_execve: the executed path is \
      read from the caller's memory (it can differ from the file the kernel runs)";
 
-fn tracepoint_fallback(why: &str) {
-    crate::boot::manifest::note_sensor(
-        "exec",
-        "tracepoint:syscalls/sys_enter_execve (user memory)",
-    );
+fn tracepoint_fallback(points: &AttachPoints, why: &str) {
+    points.note("exec", "tracepoint:syscalls/sys_enter_execve (user memory)");
     crate::boot::degradation::report(
         "exec_sensor",
         &format!("{EXEC_TRACEPOINT_DEGRADED} — {why}"),

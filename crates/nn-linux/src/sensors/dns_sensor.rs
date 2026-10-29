@@ -2,13 +2,12 @@
 //! buffer (`agent-ebpf/src/dns_skb.rs`, design
 //! `docs/design/TAPPA10_9_SENSOR_ATTACH_POINTS_DESIGN.md` §12).
 //!
-//! The mode: [`want_skb`] (the `--dns-sensor` switch) before the
-//! multiplexer starts, [`attach`] there, [`skb_active`] after. The record
+//! The mode: the `--dns-sensor` switch in the multiplexer's load plan,
+//! [`attach`] there, which says what runs ([`DnsMode`]; R11c, lab PR 264:
+//! they were process-wide switches, `want_skb` and `skb_active`). The record
 //! is decoded here ([`query_event`], [`nss_query_name`]; nn-model's
 //! `From<&DnsQueryRaw>` until R09b, lab PR 254), which walks the wire bytes
 //! the kernel side copied.
-
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use aya::Ebpf;
@@ -18,6 +17,7 @@ use nn_model::Event;
 use nn_parse::dns_qname::{decode_dns_qname, qname_wire_end};
 use tracing::{info, warn};
 
+use crate::boot::manifest::AttachPoints;
 use crate::sensors::exe_identity::verifier_tail;
 
 /// The socket-buffer programs in the eBPF object and their kernel functions.
@@ -28,29 +28,18 @@ const SKB6_SYMBOL: &str = "udp_v6_send_skb";
 /// The previous sensor: user memory at `udp_sendmsg` entry, IPv4 only.
 pub const SENDMSG_PROGRAM: &str = "udp_sendmsg";
 
-static SKB_WANTED: AtomicBool = AtomicBool::new(true);
-static SKB_ACTIVE: AtomicBool = AtomicBool::new(false);
-static SKB6_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// `--dns-sensor skb` (the default) or `sendmsg`; set before the
-/// multiplexer starts.
-pub fn want_skb(on: bool) {
-    SKB_WANTED.store(on, Ordering::Relaxed);
-}
-
-/// Whether DNS queries are read from the socket buffer (IPv4 at least).
-pub fn skb_active() -> bool {
-    SKB_ACTIVE.load(Ordering::Relaxed)
+/// What [`attach`] armed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DnsMode {
+    /// DNS queries are read from the socket buffer (IPv4 at least).
+    pub skb: bool,
+    /// Queries to IPv6 resolvers are observed (`udp_v6_send_skb`).
+    pub ipv6: bool,
 }
 
 /// Lab PR 218: the degradation when `udp_v6_send_skb` does not attach.
 pub const IPV6_NOT_OBSERVED: &str =
     "udp_v6_send_skb not attached: DNS queries to IPv6 resolvers are not observed";
-
-/// Whether queries to IPv6 resolvers are observed at all.
-pub fn ipv6_observed() -> bool {
-    SKB6_ACTIVE.load(Ordering::Relaxed)
-}
 
 /// The offsets the socket-buffer programs cannot do without, resolved on
 /// this kernel; the first one missing.
@@ -79,10 +68,10 @@ fn offsets_resolved() -> Option<&'static str> {
     None
 }
 
-/// Attach the DNS sensor: the socket-buffer kprobes when wanted and
-/// attachable, else the `udp_sendmsg` kprobe. `attach_kprobe(ebpf,
-/// program, symbol)` is the multiplexer's. Returns the IPv4 program that
-/// runs.
+/// Attach the DNS sensor: the socket-buffer kprobes when wanted
+/// (`want_skb`: `--dns-sensor skb`, the default) and attachable, else the
+/// `udp_sendmsg` kprobe, noted in `points`. `attach_kprobe(ebpf, program,
+/// symbol)` is the multiplexer's. Returns what runs.
 ///
 /// Only the plain function names are attached: a compiler's renamed copy
 /// (`.isra.0`, `.constprop.0`) may take different arguments. Without
@@ -91,17 +80,19 @@ fn offsets_resolved() -> Option<&'static str> {
 /// not observed (the `udp_sendmsg` program never saw them either).
 pub fn attach(
     ebpf: &mut Ebpf,
+    want_skb: bool,
+    points: &AttachPoints,
     attach_kprobe: impl Fn(&mut Ebpf, &str, &str) -> Result<()>,
-) -> Result<&'static str> {
+) -> Result<DnsMode> {
     exempt_resolvers(ebpf);
-    // The `udp_sendmsg` fallback's own signed record is `main.rs`'s
-    // (external audit EBPF-006, `!skb_active()`); the manifest names it.
-    let sendmsg = |ebpf: &mut Ebpf| -> Result<&'static str> {
+    // The `udp_sendmsg` fallback's own signed record is the start's attest
+    // phase's (external audit EBPF-006, `!skb`); the manifest names it.
+    let sendmsg = |ebpf: &mut Ebpf| -> Result<DnsMode> {
         attach_kprobe(ebpf, SENDMSG_PROGRAM, SENDMSG_PROGRAM)?;
-        crate::boot::manifest::note_sensor("dns", "kprobe:udp_sendmsg (user memory, IPv4 only)");
-        Ok(SENDMSG_PROGRAM)
+        points.note("dns", "kprobe:udp_sendmsg (user memory, IPv4 only)");
+        Ok(DnsMode::default())
     };
-    if !SKB_WANTED.load(Ordering::Relaxed) {
+    if !want_skb {
         info!(
             "DNS sensor: sendmsg mode (--dns-sensor sendmsg) — udp_sendmsg, user memory, IPv4 only"
         );
@@ -123,15 +114,18 @@ pub fn attach(
         );
         return sendmsg(ebpf);
     }
-    SKB_ACTIVE.store(true, Ordering::Relaxed);
+    let mut mode = DnsMode {
+        skb: true,
+        ipv6: false,
+    };
     match attach_kprobe(ebpf, SKB6_PROGRAM, SKB6_SYMBOL) {
         Ok(()) => {
-            SKB6_ACTIVE.store(true, Ordering::Relaxed);
+            mode.ipv6 = true;
             info!(
                 "DNS sensor armed on {SKB4_SYMBOL} + {SKB6_SYMBOL}: the kernel's copy of the \
                  query, IPv4 and IPv6 (Tappa 10.9 step 3)"
             );
-            crate::boot::manifest::note_sensor("dns", "kprobe:udp_send_skb+udp_v6_send_skb");
+            points.note("dns", "kprobe:udp_send_skb+udp_v6_send_skb");
         }
         Err(e) => {
             warn!(
@@ -139,12 +133,12 @@ pub fn attach(
                 "DNS sensor armed on {SKB4_SYMBOL} only: {SKB6_SYMBOL} could not be attached — DNS \
                  queries to IPv6 resolvers are NOT observed"
             );
-            crate::boot::manifest::note_sensor("dns", "kprobe:udp_send_skb (IPv4 only)");
+            points.note("dns", "kprobe:udp_send_skb (IPv4 only)");
             // Lab PR 218 (external audit App.D C-13): signed, not only a WARN.
             crate::boot::degradation::report("dns_sensor", IPV6_NOT_OBSERVED);
         }
     }
-    Ok(SKB4_PROGRAM)
+    Ok(mode)
 }
 
 /// Lab PR 229: the uprobe on systemd-resolved's NSS module
@@ -202,11 +196,11 @@ fn nss_libraries() -> Vec<std::path::PathBuf> {
 /// connects of those processes carry no name, as before (logged, and in
 /// the boot manifest). A module replaced after the attach (an upgrade of
 /// systemd) is a new file the probe is not on until the agent restarts.
-pub fn attach_nss(ebpf: &mut Ebpf) {
+pub fn attach_nss(ebpf: &mut Ebpf, points: &AttachPoints) {
     let libs = nss_libraries();
     if libs.is_empty() {
         info!("DNS sensor: no {NSS_LIBRARY} on this host — no NSS lookups to attribute");
-        crate::boot::manifest::note_sensor("dns_nss", "none (no libnss_resolve)");
+        points.note("dns_nss", "none (no libnss_resolve)");
         return;
     }
     let prog: &mut aya::programs::UProbe = match ebpf
@@ -219,7 +213,7 @@ pub fn attach_nss(ebpf: &mut Ebpf) {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "DNS sensor: NSS lookups are not attributed");
-            crate::boot::manifest::note_sensor("dns_nss", "not attached");
+            points.note("dns_nss", "not attached");
             return;
         }
     };
@@ -228,7 +222,7 @@ pub fn attach_nss(ebpf: &mut Ebpf) {
             error = %verifier_tail(&anyhow::Error::from(e)),
             "DNS sensor: the NSS uprobe was refused — NSS lookups are not attributed"
         );
-        crate::boot::manifest::note_sensor("dns_nss", "not attached");
+        points.note("dns_nss", "not attached");
         return;
     }
     let mut attached = Vec::new();
@@ -246,7 +240,7 @@ pub fn attach_nss(ebpf: &mut Ebpf) {
         }
     }
     if attached.is_empty() {
-        crate::boot::manifest::note_sensor("dns_nss", "not attached");
+        points.note("dns_nss", "not attached");
         return;
     }
     info!(
@@ -254,7 +248,7 @@ pub fn attach_nss(ebpf: &mut Ebpf) {
         "DNS sensor: uprobe on systemd-resolved's NSS module — names resolved through it \
          attribute the connects that follow (lab PR 229)"
     );
-    crate::boot::manifest::note_sensor("dns_nss", &format!("uprobe:{}", attached.join("+")));
+    points.note("dns_nss", &format!("uprobe:{}", attached.join("+")));
 }
 
 /// Review 78: users of the local resolvers, whose forwarded queries the

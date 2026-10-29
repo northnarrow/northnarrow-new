@@ -199,11 +199,12 @@ fn attach_map_lsm(ebpf: &mut Ebpf) -> Result<()> {
 /// quarantine's configuration is written: attach the environment and
 /// mapping programs the policy needs, write the kernel configuration
 /// (always, `OFF` included, then frozen), take the maps. `execq_on`: the
-/// exec quarantine runs (it refreshes the guarded mount roots then).
-pub fn install(ebpf: &mut Ebpf, execq_on: bool) -> Result<()> {
+/// exec quarantine runs (it refreshes the guarded mount roots then);
+/// `exec_on_lsm`: the exec sensor attached is the LSM one.
+pub fn install(ebpf: &mut Ebpf, execq_on: bool, exec_on_lsm: bool) -> Result<()> {
     let cfg = CONFIG.get().cloned().unwrap_or_default();
     let mut m = cfg.mode;
-    if m != Mode::Off && !crate::sensors::exe_identity::lsm_active() {
+    if m != Mode::Off && !exec_on_lsm {
         set_state(
             "degraded: the exec sensor is not on LSM bprm_check_security (tracepoint mode or \
              refused): no exec can be refused or judged",

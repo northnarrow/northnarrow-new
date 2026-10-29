@@ -14,12 +14,12 @@ use crate::sensors::multiplexer::ExecGuards;
 pub struct AgentExecGuards;
 
 impl ExecGuards for AgentExecGuards {
-    fn install(ebpf: &mut Ebpf) {
+    fn install(ebpf: &mut Ebpf, exec_on_lsm: bool) {
         // Lab PR 223 (EXPERIMENTAL): the exec quarantine's kernel
         // configuration, once the exec sensor's mode is known — written OFF
         // too, then frozen — and its maps for the controller. Not fatal:
         // an unwritten configuration is OFF, the kernel holds nothing.
-        if let Err(e) = crate::execq::install(ebpf) {
+        if let Err(e) = crate::execq::install(ebpf, exec_on_lsm) {
             error!(
                 error = format!("{e:#}"),
                 "exec quarantine: kernel configuration failed — the guard is off"
@@ -33,7 +33,7 @@ impl ExecGuards for AgentExecGuards {
         // and frozen. Not fatal: an unwritten configuration is OFF.
         let execq_on = crate::execq::config().is_some_and(|c| c.mode != crate::execq::Mode::Off)
             && !crate::execq::state().starts_with("degraded");
-        if let Err(e) = crate::execpol::install(ebpf, execq_on) {
+        if let Err(e) = crate::execpol::install(ebpf, execq_on, exec_on_lsm) {
             error!(
                 error = format!("{e:#}"),
                 "exec policy: kernel configuration failed — the policy is off"

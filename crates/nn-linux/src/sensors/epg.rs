@@ -31,7 +31,7 @@
 //! when strict's task map is full or lite's lost records, and attests each
 //! once per window.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -212,10 +212,6 @@ impl std::fmt::Debug for ExploitGuard {
 static MODE_LINE: Mutex<String> = Mutex::new(String::new());
 static COUNTERS: [AtomicU64; counter::SLOTS as usize] =
     [const { AtomicU64::new(0) }; counter::SLOTS as usize];
-/// Strict's task map size for the next load (0: not set, [`pid_max`]).
-static TASK_MAP_ENTRIES: AtomicU32 = AtomicU32::new(0);
-/// Lite's task map size for the next load (0: not set, the default).
-static LITE_MAP_ENTRIES: AtomicU32 = AtomicU32::new(0);
 
 fn set_mode_line(s: impl Into<String>) {
     if let Ok(mut m) = MODE_LINE.lock() {
@@ -304,31 +300,41 @@ pub fn lite_task_map_entries(
     }
 }
 
-/// Set both task map sizes before the eBPF object is loaded (from `main`,
-/// before the multiplexer starts). Lite's gets one entry when lite does not
-/// run (it is preallocated); strict's costs nothing unused.
-pub fn set_task_map_entries(requested: Option<u32>, v: Variant) {
-    TASK_MAP_ENTRIES.store(task_map_entries(requested, pid_max()), Ordering::Relaxed);
-    let lite = match v {
-        Variant::Lite => lite_task_map_entries(requested, pid_max(), threads_max()),
-        Variant::Strict | Variant::Off => 1,
-    };
-    LITE_MAP_ENTRIES.store(lite, Ordering::Relaxed);
+/// The sizes the loader gives the two task maps
+/// (`EbpfLoader::map_max_entries`), decided before the eBPF object is
+/// loaded (R11c, lab PR 264: in the multiplexer's load plan; they were
+/// process-wide values `set_task_map_entries` stored).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskMaps {
+    /// Strict's.
+    pub strict: u32,
+    /// Lite's.
+    pub lite: u32,
 }
 
-/// The size the loader gives strict's task map (`EbpfLoader::map_max_entries`).
-pub fn task_map_entries_for_load() -> u32 {
-    match TASK_MAP_ENTRIES.load(Ordering::Relaxed) {
-        0 => task_map_entries(None, pid_max()),
-        n => n,
+impl TaskMaps {
+    /// Both sizes for a start that runs variant `v` (`requested`:
+    /// `--exploit-guard-tasks`). Lite's gets one entry when lite does not
+    /// run (it is preallocated); strict's costs nothing unused.
+    pub fn for_variant(requested: Option<u32>, v: Variant) -> Self {
+        Self {
+            strict: task_map_entries(requested, pid_max()),
+            lite: match v {
+                Variant::Lite => lite_task_map_entries(requested, pid_max(), threads_max()),
+                Variant::Strict | Variant::Off => 1,
+            },
+        }
     }
 }
 
-/// The size the loader gives lite's task map.
-pub fn lite_task_map_entries_for_load() -> u32 {
-    match LITE_MAP_ENTRIES.load(Ordering::Relaxed) {
-        0 => lite_task_map_entries(None, pid_max(), threads_max()),
-        n => n,
+impl Default for TaskMaps {
+    /// The sizes of a load nothing decided for (the lab's one-shot modes):
+    /// strict's [`pid_max`], lite's its default.
+    fn default() -> Self {
+        Self {
+            strict: task_map_entries(None, pid_max()),
+            lite: lite_task_map_entries(None, pid_max(), threads_max()),
+        }
     }
 }
 

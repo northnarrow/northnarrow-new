@@ -29,6 +29,7 @@ pub(crate) fn arm(
     detect_only: bool,
     audit_log: &AuditHandle,
     capability_manifest: &northnarrow_agent::boot::manifest::SignedManifest,
+    attach_points: &northnarrow_agent::boot::manifest::AttachPoints,
 ) -> Result<Armed> {
     // Lab PR 218 (external review G-12): every attach of this boot is done.
     // The capability manifest — kernel, BTF, LSMs, deny hooks, self-test,
@@ -73,7 +74,7 @@ pub(crate) fn arm(
                 "observe"
             }
             .to_string(),
-            sensors: manifest::sensors(),
+            sensors: attach_points.list(),
             host_hardening: manifest::host_checks(&host_checks),
             detect_only,
             degradations: northnarrow_agent::boot::degradation::snapshot(),

@@ -60,6 +60,7 @@ pub(crate) fn attest(
     exploit_guard_degraded: Option<String>,
     exploit_guard: &Option<northnarrow_agent::sensors::epg::ExploitGuard>,
     anti_tamper: &northnarrow_agent::anti_tamper::AttachReport,
+    dns_mode: northnarrow_agent::sensors::dns_sensor::DnsMode,
     caps_degraded: Vec<String>,
     audit: checks::AuditOpen,
 ) -> Result<Attested> {
@@ -247,7 +248,7 @@ pub(crate) fn attest(
     // sendmsg`) a query's name is read from the sender's memory before the
     // kernel copies it: the sender can change it in between, so the name
     // recorded and the one sent may differ.
-    if !northnarrow_agent::sensors::dns_sensor::skb_active() {
+    if !dns_mode.skb {
         northnarrow_agent::boot::degradation::report(
             "dns_sensor",
             "DNS sensor on udp_sendmsg: query names read from the sender's memory, which it \

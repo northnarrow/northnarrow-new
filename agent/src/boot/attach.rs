@@ -88,15 +88,18 @@ pub(crate) async fn load(
         dns_cache: Arc::clone(&dns_cache),
         lineage: lineage.clone(),
     };
-    // Tappa 10.9 step 2: which exec sensor the multiplexer attaches.
-    northnarrow_agent::sensors::exe_identity::want_lsm(cli.exec_sensor == ExecSensor::Lsm);
-    // Review 69: `sys_enter_openat` emits from the start only in tracepoint
-    // mode; otherwise `start_open_sensor` decides.
-    northnarrow_agent::sensors::open_sensor::want_tracepoint(
-        cli.file_open_sensor == FileOpenSensor::Tracepoint,
-    );
-    // Tappa 10.9 step 3: which DNS sensor the multiplexer attaches.
-    northnarrow_agent::sensors::dns_sensor::want_skb(cli.dns_sensor == DnsSensor::Skb);
+    // R11c (lab PR 264): what the load is told — it was set in process-wide
+    // switches before the multiplexer started.
+    let mut plan = northnarrow_agent::sensors::multiplexer::LoadPlan {
+        // Tappa 10.9 step 2: which exec sensor the multiplexer attaches.
+        exec_lsm: cli.exec_sensor == ExecSensor::Lsm,
+        // Review 69: `sys_enter_openat` emits from the start only in
+        // tracepoint mode; otherwise `start_open_sensor` decides.
+        open_tracepoint: cli.file_open_sensor == FileOpenSensor::Tracepoint,
+        // Tappa 10.9 step 3: which DNS sensor the multiplexer attaches.
+        dns_skb: cli.dns_sensor == DnsSensor::Skb,
+        ..Default::default()
+    };
     // Lab PR 223 (EXPERIMENTAL): the exec quarantine's mode, before the
     // multiplexer writes it into the kernel (the same detect-only inputs
     // the executor reads further down: a detect-only agent observes).
@@ -158,13 +161,15 @@ pub(crate) async fn load(
         }
     }
     // Lab PR 219: the exploit guard's task maps, sized at load.
-    northnarrow_agent::sensors::epg::set_task_map_entries(
+    plan.epg_task_maps = northnarrow_agent::sensors::epg::TaskMaps::for_variant(
         cli.exploit_guard_tasks,
         cli.exploit_guard.variant(),
     );
-    let (mut sensor, net_bufs) = match SensorMultiplexer::start_with_net(net_wiring, verified)
-        .await
-        .context("starting the sensor multiplexer (with net observation)")
+    let (mut sensor, net_bufs) = match SensorMultiplexer::start_with_net(
+        net_wiring, &plan, verified,
+    )
+    .await
+    .context("starting the sensor multiplexer (with net observation)")
     {
         Ok(started) => started,
         // R11b (lab PR 262): a load or a mandatory sensor's attach that
