@@ -1291,6 +1291,51 @@ fn the_event_loop_wires_the_bus_as_modelled() {
     assert_eq!(code.matches("sensor.stop_bus();").count(), 1);
 }
 
+/// Review #471 A1: the event loop judges each event as of its own time,
+/// as the replay this test runs does (`replay::decide`): the canary
+/// detector, the posture, the ladder, the copy-on-write guard and the
+/// engine all inside `judged_at(at, ..)`, `at` the event's
+/// `event_time_ns`. The loop's pipeline needs the whole agent, so its
+/// source is pinned (comments left out).
+#[test]
+fn the_event_loop_judges_each_event_as_of_its_time() {
+    let src = include_str!("../pipeline/process_event.rs");
+    let code: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        code.matches("let at = event_time_ns(&event);").count(),
+        1,
+        "the judged time is the event's"
+    );
+    let calls = [
+        ".process_event(&event)",
+        "posture.observe(&event",
+        "ladder.observe(&event",
+        "cow_guard.observe_event(&event)",
+        "engine.decide(&event)",
+    ];
+    for call in calls {
+        let sites: Vec<usize> = code.match_indices(call).map(|(i, _)| i).collect();
+        assert!(!sites.is_empty(), "process_event.rs: no `{call}`");
+        for i in sites {
+            let scope = code[..i].rfind("judged_at(at, ||");
+            let stmt = code[..i].rfind(';').unwrap_or(0);
+            assert!(
+                scope.is_some_and(|j| j > stmt),
+                "`{call}` at byte {i} is judged outside `judged_at(at, ..)`"
+            );
+        }
+    }
+    assert_eq!(
+        code.matches("judged_at(").count(),
+        code.matches("judged_at(at, ||").count(),
+        "every scope is the event's time"
+    );
+}
+
 /// Lab PR 267 (R12a): every order of a golden case's events that keeps
 /// each class's own order gives the verdicts of the stream's order.
 #[test]
