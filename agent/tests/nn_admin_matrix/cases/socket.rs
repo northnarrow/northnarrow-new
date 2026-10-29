@@ -237,7 +237,50 @@ pub fn full_status() -> StatusResponse {
         "execpol_quarantine_total": 0, "execpol_quarantine_inactive_total": 1,
         "execpol_env_denied_total": 0, "execpol_env_recorded_total": 1,
         "execpol_map_denied_total": 0, "execpol_map_recorded_total": 0,
-        "execq_script_refused_total": 0
+        "execq_script_refused_total": 0,
+        // Lab PR 267 (R12a): the event bus and the losses by stage.
+        "event_bus": {
+            "queues": [
+                {"priority": "P0", "class": "tamper", "capacity": 1024,
+                 "when_full": "wait 50 ms, then drop", "enqueued": 12, "dropped": 0,
+                 "depth": 0, "max_depth": 3, "max_wait_us": 41, "waited": 0, "aged": 0,
+                 "decided": 12, "latency_p50_us": 120, "latency_p99_us": 900,
+                 "latency_max_us": 950},
+                {"priority": "P1", "class": "process", "capacity": 4096,
+                 "when_full": "wait 10 ms, then drop", "enqueued": 800, "dropped": 0,
+                 "depth": 2, "max_depth": 64, "max_wait_us": 3000, "waited": 1, "aged": 0,
+                 "decided": 798, "latency_p50_us": 40, "latency_p99_us": 2100,
+                 "latency_max_us": 3100},
+                {"priority": "P2", "class": "file", "capacity": 8192,
+                 "when_full": "drop the new FileOpen; other file events wait",
+                 "enqueued": 90000, "dropped": 98, "depth": 8192, "max_depth": 8192,
+                 "max_wait_us": 450000, "waited": 2, "aged": 9, "decided": 81808,
+                 "latency_p50_us": 15, "latency_p99_us": 400000, "latency_max_us": 450000},
+                {"priority": "P3", "class": "network", "capacity": 8192,
+                 "when_full": "drop the new event", "enqueued": 40, "dropped": 0,
+                 "depth": 0, "max_depth": 5, "max_wait_us": 9000, "waited": 0, "aged": 1,
+                 "decided": 40, "latency_p50_us": null, "latency_p99_us": null,
+                 "latency_max_us": null}
+            ],
+            "stages": [
+                {"stage": 1, "name": "kernel ring", "total": 3,
+                 "source": "RING_DROPS: a ring or map full"},
+                {"stage": 2, "name": "kernel budget", "total": 0,
+                 "source": "RING_DROPS dns_rate, listen_rate, io_uring_rate, task_denial_rate"},
+                {"stage": 3, "name": "decode", "total": 1,
+                 "source": "RejectThrottle: malformed records"},
+                {"stage": 4, "name": "bus queue", "total": 98,
+                 "source": "the event bus, per queue"},
+                {"stage": 5, "name": "decision delay", "total": null,
+                 "source": "not counted yet: R12b"},
+                {"stage": 6, "name": "response queue", "total": null,
+                 "source": "not counted yet: R12c"},
+                {"stage": 7, "name": "evidence writer queue", "total": null,
+                 "source": "not counted yet: R12c"},
+                {"stage": 8, "name": "export", "total": null,
+                 "source": "not counted yet: R12c, the telemetry_loss rows; R15, the export"}
+            ]
+        }
     });
     for (k, x) in fill.as_object().unwrap() {
         v[k] = x.clone();

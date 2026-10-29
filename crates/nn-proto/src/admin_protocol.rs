@@ -903,6 +903,66 @@ pub struct StatusResponse {
     /// mode: the interpreter would re-read the file after the scan).
     #[serde(default)]
     pub execq_script_refused_total: Option<u64>,
+    /// Lab PR 267 (R12a): the priority event bus — each class's queue and
+    /// its counts since boot — and the loss counters by stage of an event's
+    /// path. Appended after lab PR 226's fields; telemetry (`None` in the
+    /// unsigned reply, one byte); `None` from an agent older than the field.
+    #[serde(default)]
+    pub event_bus: Option<EventBusStatus>,
+}
+
+/// Lab PR 267 (R12a): the priority event bus in `nn-admin status --key`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventBusStatus {
+    /// The queues, P0 first.
+    pub queues: Vec<BusQueueStatus>,
+    /// Every stage of an event's path where it can be lost (plan §3.4: the
+    /// kernel ring, the kernel's budget, the decoder, the bus, the decision,
+    /// the response, the evidence writer, the export), with its count since
+    /// boot — `None` for a stage no lot counts yet — and where it is counted.
+    pub stages: Vec<LossStageCount>,
+}
+
+/// One queue of the bus ([`EventBusStatus::queues`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusQueueStatus {
+    /// `P0` … `P3`.
+    pub priority: String,
+    /// `tamper`, `process`, `file`, `network`.
+    pub class: String,
+    pub capacity: u64,
+    /// What a full queue does with a new event.
+    pub when_full: String,
+    /// Events queued, and dropped because the queue was full.
+    pub enqueued: u64,
+    pub dropped: u64,
+    /// Events in it now, and the most it held.
+    pub depth: u64,
+    pub max_depth: u64,
+    /// The longest an event waited in it, microseconds.
+    pub max_wait_us: u64,
+    /// Sends that waited for room.
+    pub waited: u64,
+    /// Events taken by aging ahead of a higher class.
+    pub aged: u64,
+    /// Decisions timed, and their latency from queue to decision,
+    /// microseconds (`None` before the first).
+    pub decided: u64,
+    pub latency_p50_us: Option<u64>,
+    pub latency_p99_us: Option<u64>,
+    pub latency_max_us: Option<u64>,
+}
+
+/// One stage of an event's path ([`EventBusStatus::stages`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LossStageCount {
+    /// 1 to 8, the plan's order.
+    pub stage: u8,
+    pub name: String,
+    /// Events lost there since boot; `None`: not counted yet.
+    pub total: Option<u64>,
+    /// Where it is counted, or the lot that will count it.
+    pub source: String,
 }
 
 /// Lab PR 219: the exploit post-condition guard in `nn-admin status`.
@@ -1016,6 +1076,7 @@ impl StatusResponse {
             execpol_map_denied_total: None,
             execpol_map_recorded_total: None,
             execq_script_refused_total: None,
+            event_bus: None,
         }
     }
 
@@ -2114,6 +2175,7 @@ mod tests {
             execpol_map_denied_total: None,
             execpol_map_recorded_total: None,
             execq_script_refused_total: None,
+            event_bus: None,
         }));
     }
 
@@ -2184,6 +2246,7 @@ mod tests {
             execpol_map_denied_total: None,
             execpol_map_recorded_total: None,
             execq_script_refused_total: None,
+            event_bus: None,
         }));
     }
 
@@ -2435,6 +2498,7 @@ mod tests {
             execpol_map_denied_total: None,
             execpol_map_recorded_total: None,
             execq_script_refused_total: None,
+            event_bus: None,
         }));
     }
 
@@ -2534,6 +2598,7 @@ mod tests {
             execpol_map_denied_total: None,
             execpol_map_recorded_total: None,
             execq_script_refused_total: None,
+            event_bus: None,
         }
     }
 
@@ -2589,6 +2654,52 @@ mod tests {
         };
         let body = postcard::to_allocvec(&old).unwrap();
         assert!(postcard::from_bytes::<StatusResponse>(&body).is_err());
+    }
+
+    /// Lab PR 267 (R12a): the event bus is appended last — the reply of an
+    /// agent that fills it is the reply without it up to its last byte (the
+    /// absent field's tag), so an `nn-admin` or watchdog that predates it
+    /// reads every field it knows — and it is telemetry, withheld from the
+    /// unsigned reply.
+    #[test]
+    fn the_event_bus_is_appended_and_withheld() {
+        let without = status_with_lab193_fields();
+        let mut with = without.clone();
+        with.event_bus = Some(EventBusStatus {
+            queues: vec![BusQueueStatus {
+                priority: "P0".to_string(),
+                class: "tamper".to_string(),
+                capacity: 1024,
+                when_full: "wait 50 ms, then drop".to_string(),
+                enqueued: 3,
+                dropped: 0,
+                depth: 0,
+                max_depth: 2,
+                max_wait_us: 40,
+                waited: 0,
+                aged: 0,
+                decided: 3,
+                latency_p50_us: Some(120),
+                latency_p99_us: Some(900),
+                latency_max_us: Some(950),
+            }],
+            stages: vec![LossStageCount {
+                stage: 5,
+                name: "decision delay".to_string(),
+                total: None,
+                source: "R12b".to_string(),
+            }],
+        });
+        let a = postcard::to_allocvec(&without).unwrap();
+        let b = postcard::to_allocvec(&with).unwrap();
+        assert_eq!(a.last(), Some(&0), "the absent field's tag");
+        assert!(b.starts_with(&a[..a.len() - 1]) && b.len() > a.len());
+        assert_eq!(postcard::from_bytes::<StatusResponse>(&b).unwrap(), with);
+        let public = StatusResponse::public(PostureKind::Observing, false, None, None, None);
+        assert_eq!(public.event_bus, None);
+        let mut only_bus = public.clone();
+        only_bus.event_bus = with.event_bus.clone();
+        assert!(!only_bus.telemetry_withheld(), "the bus is telemetry");
     }
 
     /// Lab PR 218: the new fields are telemetry — the unsigned reply sends
@@ -3121,8 +3232,9 @@ mod tests {
         // them (one `None` byte each here) are the last bytes of both: lab
         // PR 218's four, lab PR 219's `exploit_guard`, lab PR 222's
         // `cow_guard`, lab PR 223's ten `execq_*`, lab PR 224's four
-        // counters, lab PR 225's seven, lab PR 226's ten.
-        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10;
+        // counters, lab PR 225's seven, lab PR 226's ten, lab PR 267's
+        // `event_bus`.
+        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
@@ -3897,9 +4009,12 @@ mod tests {
         const STATUS_REQUEST: &str = "0000000102";
         const CHALLENGE: &str =
             "00000021031111111111111111111111111111111111111111111111111111111111111111";
+        // Lab PR 267 (R12a): one byte longer — the `None` of the appended
+        // `event_bus` (telemetry, withheld here); every byte before it is
+        // the lab PR 240 pin's.
         const STATUS_RESPONSE: &str = concat!(
-            "0000004b050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
-            "000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "0000004c050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
+            "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
         );
         const SHUTDOWN_REQUEST: &str = concat!(
             "0000007a0602abababababababababababababababababababababababababababababababab808f",

@@ -321,6 +321,9 @@ pub struct AdminHandles {
     /// The JA3 list's size the boot loaded, for the inactive network rules
     /// (it was a process-wide value the start noted).
     pub ja3_entries: usize,
+    /// Lab PR 267 (R12a): the event bus's counts per queue, for the signed
+    /// status (`None`: no bus — tests).
+    pub event_bus: Option<crate::sensors::bus::BusStats>,
 }
 
 /// External audit NN-AUD-082 — the files the read verbs serve, from the
