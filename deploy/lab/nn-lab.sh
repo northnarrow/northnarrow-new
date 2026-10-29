@@ -1744,7 +1744,11 @@ cmd_soak() {
             mkdir -p "$dir"
             vscp \
                 "$GUEST:soak/samples.csv" "$GUEST:soak/sample.log" "$GUEST:soak/sample.err" "$GUEST:soak/generate.log" "$GUEST:soak/host" "$GUEST:soak/hours" "$dir/" 2>/dev/null || true
-            vssh 'sudo journalctl -u northnarrow-agent -u northnarrow-watchdog --since "$(cat ~/soak/start)" -p 4 --no-pager -q 2>/dev/null | tail -200' > "$dir/journal-warn-err.log" 2>/dev/null || true
+            # Review #471: the units log to their journal namespace
+            # (LogNamespace=northnarrow); a plain journalctl reads the
+            # default one and found nothing — every WARN and ERROR of the
+            # soak, not the last 200.
+            vssh 'sudo journalctl --namespace=northnarrow -u northnarrow-agent -u northnarrow-watchdog --since "$(cat ~/soak/start)" -p 4 --no-pager -q 2>/dev/null' > "$dir/journal-warn-err.log" 2>/dev/null || true
             [ -s "$dir/samples.csv" ] || die "no samples.csv on the guest — was the soak started?"
             local max_rss_mb_h=${NN_LAB_SOAK_MAX_RSS_MB_H:-5}
             # External audit NN-AUD-216: ring drops fail the soak above this
