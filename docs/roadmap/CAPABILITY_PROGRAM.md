@@ -3454,28 +3454,36 @@ only in the table below, in the same PR as the evidence.
     `SensorFlood`, `DefenderSignal`, `ExploitPostcondition`; 1,024; the
     sender waits 50 ms, then drop), P1 process (`ProcessSpawn`,
     `ExecCheck`, `IoUring`; 4,096; 10 ms), P2 file (`Fim`, `MassWrite`,
-    `FileOpen`, `FileBurst`; 8,192; a new `FileOpen` dropped, every other
-    file event waits, review 75), P3 network (`TcpConnect`, `DnsQuery`,
-    `DnsFlood`, `NetFlow`, `NetListener`; 8,192; drop the new event);
-    `CanaryTripped` has the class of the event the detector replaces. Every
-    variant placed by an exhaustive match (`nn_core::bus::class_of`). Take:
-    strict priority with aging (after 64 takes that passed over a waiting
-    lower queue, one by age), FIFO inside a queue. A P0 event taken ahead of
-    queued execs hands them to the lineage and the rules first. Per-queue
-    counters (queued, dropped, depth, max depth, longest wait, sends that
-    waited, takes by age, latency queue → decision p50/p99/max) and the
-    eight loss stages in `nn-admin status --key` (1–3 the kernel ring, the
-    kernel budget, the decoder; 4 the bus; 5–8 named, not counted: R12b,
-    R12c, R15). A drop: a WARN, a signed `event_bus_drop` row (P0 at the
-    next 10 s sample, the others at most every 600 s, every drop in a row,
-    the rest signed at the stop), `TelemetryLoss` past 64 a sample for
-    P0–P2. The DNS pump's outbox for a full channel is gone.
+    `FileOpen`, `FileBurst`; 8,192; a new `FileOpen` dropped when full or
+    past 2,048 opens, every other file event waits, review 75), P3 network
+    (`TcpConnect`, `DnsQuery`, `DnsFlood`, `NetFlow`, `NetListener`; 8,192;
+    drop the new event); in P0 only `FsProtectDenial` waits 50 ms then
+    drops, every other tamper event waits for room; `CanaryTripped` has the
+    class of the event the detector replaces. Every variant placed by an
+    exhaustive match (`nn_core::bus::class_of`). Take: P0 first, then P1,
+    P2, P3 by weighted shares 2 : 1 : 1 (smooth weighted round robin), FIFO
+    inside a queue. An event of any queue but P1 taken ahead of queued
+    execs hands them to the lineage and the rules first; the lineage keeps
+    three execs per pid and answers as of the judged event's time. Per-queue
+    counters (queued, dropped, depth, max depth, longest wait since boot and
+    in the last sample, sends that waited and the longest wait, takes by
+    share ahead of a higher queue, latency queue → decision p50/p99/max)
+    and the eight loss stages in `nn-admin status --key` (1–3 the kernel
+    ring, the kernel budget, the decoder; 4 the bus; 5–8 named, not
+    counted: R12b, R12c, R15). A drop: a WARN, a signed `event_bus_drop`
+    row (P0 within a second, at most one a second; the others at most every
+    600 s; every drop in a row), `TelemetryLoss` at any P0 drop and past 64
+    a sample for P1–P3; at the stop the bus closed and what it still held
+    counted in a signed `event_bus_stop` row. The DNS pump's outbox for a
+    full channel is gone.
   - Ordering (`agent/src/decision/golden.rs`): every order of a golden
     case's events that keeps each class's own order gives, for each rule
     and process, the same strongest verdict and the same responses — all
-    such orders for 21 of the 24 cases, class-major orders, the bus's take
+    such orders for 25 of the 28 cases, class-major orders, the bus's take
     order with the consumer behind and 256 random merges for the others
-    (952). It found two stores that depended on the order between classes,
+    (973). It found three stores that depended on the order between classes
+    (the third, the lineage answering with a pid's latest exec, by the
+    independent review — below),
     fixed: the lineage and the chains' ancestry tree learned an exec only
     when judged (NN-L-EVA-003, NN-L-NET-026/027, NN-L-IMP-001 lost their
     target, parent or actor when the exec came later; an exec ingested
@@ -3488,6 +3496,25 @@ only in the table below, in the same PR as the evidence.
     (responses unchanged), as do the two nn-admin matrix files that replay
     it; the matrix's full status shows the bus. The unsigned status frame
     is one byte longer (the appended field's `None`).
+  - Independent review (PR #471, "merge after X"), fixed in the lot: A1
+    (HIGH) an event could be judged on the image of a later exec of its pid
+    — a File canary's reader exempt as its later `restic`, a `/tmp`
+    program's credential read and connect in the package carve-out once it
+    exec'd `dpkg`, NET-006/019 on a later `nginx` — the lineage keeps three
+    execs per pid and every lookup of a judgement is scoped to the event's
+    time (`lineage::judged_at`, `*_at(pid, ts)`), four golden cases; A2 the
+    network starved under a higher class's flood (aging gave it one take in
+    65, ~110 events/s) — the shares, `TelemetryLoss` for P3, the
+    reviewer's simulation as a test; M1 a root denial flood dropped a rare
+    tamper event — those wait for room; M3 the stop and a crash — the
+    `event_bus_stop` row, the P0 row within a second; B2 the windowed wait,
+    B3 the opens' cap, B4 the loss sample off the workers, M2 the
+    open-sensor pump's signals first; wiring tests for the six mutations
+    that survived (all 16 of the review's and 19 of the fix's caught, the
+    lot's table in the PR); the soak report's journal namespace. Behaviour
+    change outside the corpus: a late exec whose process had a port-53 flow
+    to a non-resolver and then another flow now kills for the later one.
+    Lab after the review: on ubuntu2404 only (ubuntu2204 was lot 268's), `main` 769d5615 and the tip in turn in one tree path, each freshly installed. EXP-13: `main` lost 3,681 of 12,000 `fs_protect` denials in the kernel, first records 532–602 ms; the tip 0, 12,000 accounted, 0.45–2.8 ms, P2 held at its 2,048 opens (longest wait 0.51 s). EXP-13c (new: the same flood and bursts plus 500 connects/s and 20 DNS queries/s of uid 1000, and probes — a connect to TEST-NET-1, in the shipped blocklist, and one from a copy of the helper in /var/tmp): `main` judged its NET-001 and chain probes 456–532 ms after the connect (the process gone), lost 3,732 denials; the tip, four runs, P3 49,8xx queued and 0 dropped each, 18 NET-001 probes judged and killed while connecting (13–27 ms), 24 chain probes judged (1.7–214 ms), no bus drop; in two runs the agent's rings fell behind on the saturated guest (`fs_protect` 408 once, `fim` 1,575 and 439, `open_sensor` 6,819 once) while P0's sends waited at most 3.4 ms — the pumps short of CPU, not the bus (the run without probes dropped nothing; pumps on threads of their own are R12b's). EXP-13b (the loop stalled 4 s, a burst of 3,000): `main`'s channel held it (3,000 judged, the first 3.94 s late); the tip 1,971 judged, 76 denials dropped on P0 after 50 ms — five signed rows one second apart during the stall — and 953 in the ring, 3,000 accounted. Overhead within noise (open +30.5 / +29.4 %, exec +13.4 / +8.6 %, connect +43.5 / +44.9 %). Soak pair, each after a fresh install, the same 0.8 h: RSS 33.2 → 55.7 MB (`main`) and 33.3 → 55.5 MB (the tip), threads 9 → 11 and 9 → 10, no restart, no ring drop, the bus's queues empty at every sample with nothing dropped, WARN/ERROR lines 2,887 / 1 and 3,022 / 1 (the one ERROR the lab's admin key on the host) — the first pair's 23 threads against 16 were not comparable runs; the soak report's WARN/ERROR file now reads the units' namespace by tracing level (it was empty: journald gives every line priority 6). Gates on fc23d1d1: build-ebpf, clippy ×4, fmt, 74 suites 3,237 passed 0 failed, the privileged build, attack-coverage, `golden` ×5 (53 files the same bytes), MSRV, 13 fuzz targets, portable-core 5 targets, lockfiles unchanged (`tmp/fix471/`).
   - Open: R12b (the decision thread without `await`: `exe_identity::
     resolve` in every pump, the systemd state as a snapshot,
     `close_if_expired` on a tick, the canary append through the writer,

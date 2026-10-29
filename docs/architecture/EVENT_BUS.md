@@ -120,7 +120,9 @@ three execs of a pid with their spawn times and answers as of a time:
 `lineage::judged_at(ts, ..)` scopes every lookup of one event's judgement to
 the event's own time (`event_time_ns`: its kernel timestamp, a flow's
 connect), the `*_at(pid, ts)` lookups take it explicitly, and an exec later
-than the time is "not known" — never the later image, never `/proc`.
+than the time is "not known" — never the later image, never `/proc`; an
+exec of the process a pid was reused from answers only for a time before
+the current process started.
 `in_package_transaction` walks the tree as of the event. The event loop and
 the replay judge every event inside `judged_at`; the network drains' image
 fallbacks ask as of the flow's start.
@@ -244,9 +246,9 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   overtaking event is judged (R12b moves `resolve` into the pumps; the
   loss sample runs off the runtime's workers since the review); B5: "(agent predates the
   bus)" in `nn-admin status` is reachable only against an agent older than
-  R12a (the matrix shows it through its mock); B7: the soak's 23 threads
-  against `main`'s 16 are the runtime's workers and the pumps of the bus
-  (the lot's note); M2: the signals to a security tool on a ring of their
+  R12a (the matrix shows it through its mock); B7: the soak's thread count (23
+  on the tip, 16 on `main` in the first soak pair), measured again in the
+  comparable pair (the lot's note); M2: the signals to a security tool on a ring of their
   own.
 - **R12c** — the response dispatcher by severity, its queue (stage 6);
   no action without a signed record (intent, then outcome); the budget
