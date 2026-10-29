@@ -117,95 +117,116 @@ struct Window {
 }
 
 /// Second review of #471, R-A: identical denials (same pid, operation and
-/// inode) within [`COALESCE_WINDOW_NS`] of the one sent are counted, not
+/// inode) within [`COALESCE_WINDOW_NS`] of the one queued are counted, not
 /// queued — P0 no longer fills with copies of one refused `chmod` loop, and
 /// every repeat is in a signed `event_bus_coalesced` row (count, first and
-/// last time per key).
+/// last time per key). A window opens only when its denial was queued
+/// (third review, C1: a denial the bus dropped coalesces nothing — the
+/// next one is sent and judged); the oldest window goes first when the
+/// keys are full, in O(1) (C2: a fork loop is a new key per event).
 #[derive(Debug, Default)]
 struct Coalescer {
     windows: std::collections::HashMap<DenialKey, Window>,
+    /// The windows in the order they were opened or restarted, with that
+    /// time: the front is the oldest (an entry whose window restarted
+    /// since, or went, is stale and skipped).
+    order: std::collections::VecDeque<(u64, DenialKey)>,
     /// Repeats of windows evicted before their row.
     evicted: u64,
     /// Every repeat since boot.
     total: u64,
 }
 
+/// A denial's coalescing key, its operation and its time.
+type DenialOf = (DenialKey, nn_model::FsProtectOperation, u64);
+
+fn denial_key(event: &Event) -> Option<DenialOf> {
+    let Event::FsProtectDenial {
+        pid,
+        target_dev,
+        target_ino,
+        operation,
+        timestamp_ns,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let key = DenialKey {
+        pid: *pid,
+        op: std::mem::discriminant(operation),
+        dev: *target_dev,
+        ino: *target_ino,
+    };
+    Some((key, *operation, *timestamp_ns))
+}
+
 impl Coalescer {
-    /// `true`: `event` repeats a denial sent within the window — counted.
-    fn offer(&mut self, event: &Event) -> bool {
-        let Event::FsProtectDenial {
-            pid,
-            target_dev,
-            target_ino,
-            operation,
-            timestamp_ns,
-            ..
-        } = event
-        else {
+    /// `true`: the denial repeats one queued within the window — counted.
+    /// Changes nothing otherwise: the window opens only once the denial is
+    /// queued ([`Self::queued`]).
+    fn repeat(&mut self, denial: &DenialOf) -> bool {
+        let (key, _, ts) = *denial;
+        let Some(w) = self.windows.get_mut(&key) else {
             return false;
         };
-        let key = DenialKey {
-            pid: *pid,
-            op: std::mem::discriminant(operation),
-            dev: *target_dev,
-            ino: *target_ino,
-        };
-        let ts = *timestamp_ns;
-        if let Some(w) = self.windows.get_mut(&key) {
-            if ts >= w.sent_ns && ts - w.sent_ns < COALESCE_WINDOW_NS {
-                if w.repeats == 0 {
-                    w.first_ns = ts;
-                }
-                w.repeats += 1;
-                w.last_ns = w.last_ns.max(ts);
-                self.total += 1;
-                return true;
-            }
-            // past the window: this one is sent and opens the next; the
-            // repeats not yet in a row stay counted
-            if w.repeats == 0 {
-                w.sent_ns = ts;
-                return false;
-            }
-        }
-        if self.windows.len() >= COALESCE_KEYS && !self.windows.contains_key(&key) {
-            self.evict(ts);
-        }
-        let pending = self.windows.get(&key).map_or(0, |w| w.repeats);
-        if pending > 0 {
-            // a window with repeats not yet signed: keep them, restart it
-            let w = self.windows.get_mut(&key).expect("present");
-            w.sent_ns = ts;
+        if ts < w.sent_ns || ts - w.sent_ns >= COALESCE_WINDOW_NS {
             return false;
         }
-        self.windows.insert(
-            key,
-            Window {
-                operation: *operation,
-                sent_ns: ts,
-                repeats: 0,
-                first_ns: 0,
-                last_ns: 0,
-            },
-        );
-        false
+        if w.repeats == 0 {
+            w.first_ns = ts;
+        }
+        w.repeats += 1;
+        w.last_ns = w.last_ns.max(ts);
+        self.total += 1;
+        true
     }
 
-    /// Room for a new key: the expired windows with nothing pending go,
-    /// then the oldest, its pending repeats kept in the evicted count.
-    fn evict(&mut self, now_ns: u64) {
-        self.windows
-            .retain(|_, w| w.repeats > 0 || now_ns.saturating_sub(w.sent_ns) < COALESCE_WINDOW_NS);
-        while self.windows.len() >= COALESCE_KEYS {
-            let Some(oldest) = self
-                .windows
-                .iter()
-                .min_by_key(|(_, w)| w.sent_ns)
-                .map(|(k, _)| *k)
-            else {
-                break;
-            };
-            if let Some(w) = self.windows.remove(&oldest) {
+    /// The denial was queued: its window opens (or restarts, the repeats
+    /// not yet in a row kept).
+    fn queued(&mut self, denial: &DenialOf) {
+        let (key, operation, ts) = *denial;
+        if let Some(w) = self.windows.get_mut(&key) {
+            w.sent_ns = ts;
+        } else {
+            while self.windows.len() >= COALESCE_KEYS {
+                self.evict_oldest();
+            }
+            self.windows.insert(
+                key,
+                Window {
+                    operation,
+                    sent_ns: ts,
+                    repeats: 0,
+                    first_ns: 0,
+                    last_ns: 0,
+                },
+            );
+        }
+        self.order.push_back((ts, key));
+        if self.order.len() > 4 * COALESCE_KEYS {
+            // restarted windows leave stale entries: drop them, keeping the
+            // order (amortised O(1) per event)
+            let windows = &self.windows;
+            self.order
+                .retain(|(t, k)| windows.get(k).is_some_and(|w| w.sent_ns == *t));
+        }
+    }
+
+    /// The oldest window goes, its repeats not yet in a row kept in the
+    /// evicted count.
+    fn evict_oldest(&mut self) {
+        while let Some((t, k)) = self.order.pop_front() {
+            if self.windows.get(&k).is_some_and(|w| w.sent_ns == t) {
+                if let Some(w) = self.windows.remove(&k) {
+                    self.evicted += w.repeats;
+                }
+                return;
+            }
+        }
+        // no order left (cannot be): any one
+        if let Some(k) = self.windows.keys().next().copied() {
+            if let Some(w) = self.windows.remove(&k) {
                 self.evicted += w.repeats;
             }
         }
@@ -415,8 +436,11 @@ impl BusSender {
         }
         // Second review of #471, R-A: a repeat of a denial just sent is
         // counted into it (a signed row), not queued.
-        if matches!(event, Event::FsProtectDenial { .. }) && inner.coalescer.lock().offer(&event) {
-            return Ok(());
+        let denial = denial_key(&event);
+        if let Some(d) = &denial {
+            if inner.coalescer.lock().repeat(d) {
+                return Ok(());
+            }
         }
         let p = Priority::of_event(&event);
         let counted = counted_open(&event);
@@ -425,6 +449,7 @@ impl BusSender {
             return Ok(());
         }
         let policy = inner.when_full(&event, p);
+        let started = Instant::now();
         // R-D: the events that can flood P0 take its slots but the reserve
         // first (their own policy), then the queue's slot, which is then
         // free unless the rare events hold more than the reserve.
@@ -439,10 +464,18 @@ impl BusSender {
         } else {
             None
         };
-        let policy = if flood_permit.is_some() {
-            WhenFull::Backpressure
-        } else {
-            policy
+        // The queue's slot: a denial keeps its bound for both slots (third
+        // review, C6: with the rare events past the reserve the second slot
+        // can be full too); a bpf() call waits as it waited for the first.
+        let policy = match (flood_permit.is_some(), policy) {
+            (true, WhenFull::Wait { max_ns }) => {
+                let spent = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                WhenFull::Wait {
+                    max_ns: max_ns.saturating_sub(spent).max(1),
+                }
+            }
+            (true, _) => WhenFull::Backpressure,
+            (false, policy) => policy,
         };
         let Some(permit) = slot(inner, &inner.room[p.index()], policy, p).await? else {
             drop(flood_permit); // back to the semaphore
@@ -483,6 +516,10 @@ impl BusSender {
                 st.opens += 1;
                 inner.opens_hint.store(st.opens, Ordering::Relaxed);
             }
+        }
+        if let Some(d) = &denial {
+            // C1: the window opens now the denial is queued
+            inner.coalescer.lock().queued(d);
         }
         inner.ready.notify_one();
         Ok(())
@@ -1806,7 +1843,10 @@ mod tests {
             }
             tx.send(at(10, 2, 2_000)).await.unwrap(); // another process
             tx.send(at(9, 3, 2_000)).await.unwrap(); // another inode
-            tx.send(at(9, 2, 1_000 + COALESCE_WINDOW_NS)).await.unwrap(); // next window
+                                                     // third review, C4: the window is one second — 0.9 s after the
+                                                     // queued one a repeat is counted, 1.1 s after it is queued
+            tx.send(at(9, 2, 1_000 + 900_000_000)).await.unwrap();
+            tx.send(at(9, 2, 1_000 + 1_100_000_000)).await.unwrap();
             let queued: Vec<(u32, u64, u64)> = std::iter::from_fn(|| rx.try_recv())
                 .map(|r| match r.event {
                     Event::FsProtectDenial {
@@ -1824,21 +1864,21 @@ mod tests {
                     (9, 2, 1_000),
                     (10, 2, 2_000),
                     (9, 3, 2_000),
-                    (9, 2, 1_000 + COALESCE_WINDOW_NS)
+                    (9, 2, 1_000 + 1_100_000_000)
                 ]
             );
             let snap = rx.stats().snapshot();
-            assert_eq!((snap[0].stats.enqueued, snap[0].coalesced), (4, 1_499));
+            assert_eq!((snap[0].stats.enqueued, snap[0].coalesced), (4, 1_500));
             let losses = BusLosses::default();
             losses.bind_audit_log(Some(log));
             record(&rx.stats(), &losses, Sample::Tick);
             let got = rows(dir.path(), &path, COALESCED_AUDIT_OP);
             assert_eq!(got.len(), 1, "{got:?}");
-            assert_eq!(got[0]["repeats_since_last_row"], 1_499);
+            assert_eq!(got[0]["repeats_since_last_row"], 1_500);
             assert_eq!(got[0]["keys"][0]["pid"], 9);
-            assert_eq!(got[0]["keys"][0]["repeats"], 1_499);
+            assert_eq!(got[0]["keys"][0]["repeats"], 1_500);
             assert_eq!(got[0]["keys"][0]["first_ns"], 2_000);
-            assert_eq!(got[0]["keys"][0]["last_ns"], 1_000 + 1_499 * 1_000);
+            assert_eq!(got[0]["keys"][0]["last_ns"], 1_000 + 900_000_000);
             record(&rx.stats(), &losses, Sample::Tick);
             assert_eq!(
                 rows(dir.path(), &path, COALESCED_AUDIT_OP).len(),
@@ -1847,6 +1887,125 @@ mod tests {
             );
         })
         .await
+    }
+
+    /// Third review of #471, C1: a denial the bus dropped (P0 full while
+    /// the loop stands still) opens no coalescing window — its process's
+    /// next denial is queued and judged, not counted into one that never
+    /// was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_denial_coalesces_nothing() {
+        within(async {
+            let mut specs = small(20);
+            specs[0].capacity = 4; // a reserve of 1: denials take 3
+            let (tx, mut rx) = channel_with(specs);
+            let at = |pid: u32, ts: u64| Event::FsProtectDenial {
+                pid,
+                uid: 0,
+                comm: "chmod".into(),
+                target_dev: 1,
+                target_ino: 2,
+                operation: nn_model::FsProtectOperation::Setattr,
+                timestamp_ns: ts,
+            };
+            for pid in [100, 101, 102] {
+                tx.send(at(pid, 1)).await.unwrap();
+            }
+            tx.send(at(7, 1_000)).await.unwrap(); // waits 20 ms, dropped
+            for i in 1..=5 {
+                tx.send(at(7, 1_000 + i)).await.unwrap(); // dropped too
+            }
+            let snap = rx.stats().snapshot();
+            assert_eq!(
+                (snap[0].stats.dropped, snap[0].coalesced),
+                (6, 0),
+                "none counted into a drop"
+            );
+            let pid_of_denial = |r: Received| match r.event {
+                Event::FsProtectDenial { pid, .. } => Some(pid),
+                _ => None,
+            };
+            let mut pids: Vec<u32> = std::iter::from_fn(|| rx.try_recv())
+                .filter_map(pid_of_denial)
+                .collect();
+            tx.send(at(7, 1_000 + 10)).await.unwrap(); // after the stall, within the second
+            pids.extend(std::iter::from_fn(|| rx.try_recv()).filter_map(pid_of_denial));
+            assert_eq!(pids, [100, 101, 102, 7], "the process is judged");
+        })
+        .await
+    }
+
+    /// Third review of #471, C6: a denial keeps its 50 ms bound (20 here)
+    /// on the queue's slot too — with the rare events holding every slot
+    /// of P0, past the reserve, it is dropped, not held without end.
+    #[tokio::test]
+    async fn a_denial_s_bound_holds_on_the_second_slot() {
+        within(async {
+            let mut specs = small(20);
+            specs[0].capacity = 8; // a reserve of 2
+            let (tx, rx) = channel_with(specs);
+            for i in 0..8 {
+                tx.send(module_load(i)).await.unwrap(); // the rare events hold all 8
+            }
+            let started = Instant::now();
+            tx.send(denial(9)).await.unwrap();
+            let took = started.elapsed();
+            assert!(
+                took >= Duration::from_millis(15) && took < Duration::from_millis(500),
+                "{took:?}"
+            );
+            assert_eq!(rx.stats().snapshot()[0].stats.dropped, 1);
+        })
+        .await
+    }
+
+    /// Third review of #471, C2: with every key of the coalescer in use, a
+    /// new one evicts the oldest window — in the order they opened, a
+    /// restarted window counting from its restart — its repeats not yet in
+    /// a row kept in the count; the evicted key's next denial is queued.
+    #[test]
+    fn the_oldest_coalescing_window_goes_first() {
+        let mut c = Coalescer::default();
+        let d = |pid: u32, ts: u64| {
+            denial_key(&Event::FsProtectDenial {
+                pid,
+                uid: 0,
+                comm: String::new(),
+                target_dev: 1,
+                target_ino: 2,
+                operation: nn_model::FsProtectOperation::Setattr,
+                timestamp_ns: ts,
+            })
+            .unwrap()
+        };
+        for pid in 0..COALESCE_KEYS as u32 {
+            c.queued(&d(pid, 10));
+        }
+        assert!(c.repeat(&d(0, 20)) && c.repeat(&d(1, 20)));
+        c.queued(&d(1, 30)); // pid 1's window restarts: now the newest
+        c.queued(&d(9_000, 40)); // a new key: pid 0's window goes
+        assert_eq!(c.windows.len(), COALESCE_KEYS);
+        assert!(!c.windows.contains_key(&d(0, 0).0) && c.windows.contains_key(&d(1, 0).0));
+        assert_eq!(
+            (c.evicted, c.total),
+            (1, 2),
+            "pid 0's repeat kept in the count"
+        );
+        assert!(!c.repeat(&d(0, 50)), "an evicted key is queued again");
+        c.queued(&d(9_001, 60)); // pid 2's goes next, not pid 1's
+        assert!(!c.windows.contains_key(&d(2, 0).0) && c.windows.contains_key(&d(1, 0).0));
+        // stale order entries stay bounded
+        for i in 0..(8 * COALESCE_KEYS as u64) {
+            c.queued(&d(1, 100 + i));
+        }
+        assert!(c.order.len() <= 4 * COALESCE_KEYS + 1, "{}", c.order.len());
+        let (pending, evicted) = c.take_pending();
+        assert_eq!(evicted, 1);
+        assert_eq!(
+            pending.iter().map(|(_, w)| w.repeats).sum::<u64>(),
+            1,
+            "pid 1's repeat"
+        );
     }
 
     /// Second review of #471, R-E: the opens' cap counts the opens — a
