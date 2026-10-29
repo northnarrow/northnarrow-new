@@ -42,8 +42,6 @@ pub const ROLE_EXIT_PROGRAM: &str = "role_exit";
 /// Pin of the liveness watch's link (a `link_*` pin: protected like the
 /// LSM links, and found by the link self-check).
 const ROLE_EXIT_LINK_PIN: &str = "link_role_exit";
-/// The liveness watch is attached: `ROLE_TGIDS` slots are claimed.
-static ROLE_WATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 const OWN_IDS_MAP: &str = "OWN_BPF_IDS";
 const OWN_EXE_MAP: &str = "OWN_EXE_INODES";
@@ -69,7 +67,7 @@ pub const LINK_CHECK_SECS: u64 = 10;
 pub const LINK_MISSING_AUDIT_OP: &str = "bpf_link_missing";
 
 /// What the self-check needs, recorded at boot and read by the task spawned
-/// later from `main` (the audit log does not exist yet when the hooks
+/// later by the start (the audit log does not exist yet when the hooks
 /// attach).
 #[derive(Debug, Clone)]
 struct OwnLinks {
@@ -77,29 +75,66 @@ struct OwnLinks {
     pin_root: Option<PathBuf>,
 }
 
-static OWN_LINKS: OnceLock<OwnLinks> = OnceLock::new();
+/// The guard's record of this boot's own objects (R11c, lab PR 264): made
+/// with the eBPF object (the maps' ids at the load,
+/// [`Self::remember_loaded_maps`]), filled by the registration (the links
+/// the self-check expects, the `link_*` pins that are not the agent's, the
+/// liveness watch), read by the self-check and the foreign pins' attestation
+/// the start runs once the audit log exists ([`Self::spawn_link_self_check`],
+/// [`Self::attest_foreign_pins`]), told of the links the agent retires and
+/// of its stop. The multiplexer that owns the object holds it. They were
+/// process-wide statics (`LOADED_MAP_IDS`, `OWN_LINKS`, `FOREIGN_PINS`,
+/// `RETIRED_LINKS`, `ROLE_WATCH`, `STOPPING`).
+#[derive(Clone, Default)]
+pub struct BpfGuard(Arc<GuardState>);
 
-/// Links the agent detached on purpose (Tappa 10.9 step 1: the
-/// `sys_enter_openat` tracepoint once the LSM file-open sensor takes
-/// over). The self-check stops expecting them; any other missing link is
-/// still tampering.
-static RETIRED_LINKS: OnceLock<parking_lot::Mutex<HashSet<u32>>> = OnceLock::new();
-
-fn retired_links() -> &'static parking_lot::Mutex<HashSet<u32>> {
-    RETIRED_LINKS.get_or_init(Default::default)
+#[derive(Default)]
+struct GuardState {
+    /// External audit ATP-013: the ids of every map of the object as
+    /// loaded, taken before the sensors move maps out of it. `take_map`
+    /// removes a map from `ebpf.maps()`, and the twelve ring buffers
+    /// (`FS_PROTECT_EVENTS`, with the anti-tamper denials, among them) and
+    /// `RING_DROPS` were taken before [`register_own_objects`] ran: none
+    /// was in `OWN_BPF_IDS`, so the guard handed a foreign root a writable
+    /// handle on each — enough to move a ring's consumer position,
+    /// silencing that sensor, or to zero the drop counters. `Err` names the
+    /// maps whose id could not be read.
+    loaded_map_ids: parking_lot::Mutex<Option<std::result::Result<Vec<u32>, String>>>,
+    own_links: OnceLock<OwnLinks>,
+    /// Links the agent detached on purpose (Tappa 10.9 step 1: the
+    /// `sys_enter_openat` tracepoint once the LSM file-open sensor takes
+    /// over). The self-check stops expecting them; any other missing link
+    /// is still tampering.
+    retired_links: parking_lot::Mutex<HashSet<u32>>,
+    /// The `link_*` entries found at boot that are not the agent's links,
+    /// for one signed `integrity_drift` each once the audit log is open
+    /// ([`BpfGuard::attest_foreign_pins`]).
+    foreign_pins: parking_lot::Mutex<Vec<String>>,
+    /// The liveness watch is attached: `ROLE_TGIDS` slots are claimed.
+    role_watch: std::sync::atomic::AtomicBool,
+    /// The agent is stopping: its links go with it, and the self-check must
+    /// not report them ([`BpfGuard::mark_stopping`]).
+    stopping: std::sync::atomic::AtomicBool,
 }
 
-/// Retire every live link of program `prog_id` before the agent itself
-/// detaches it; the number of links retired.
-pub fn retire_program_links(prog_id: u32) -> usize {
-    let pin_root = OWN_LINKS.get().and_then(|o| o.pin_root.clone());
-    let ids: Vec<u32> = live_links(pin_root.as_deref())
-        .into_iter()
-        .filter(|(_, prog)| *prog == prog_id)
-        .map(|(id, _)| id)
-        .collect();
-    retired_links().lock().extend(ids.iter().copied());
-    ids.len()
+impl BpfGuard {
+    /// An empty record, for one eBPF object.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Retire every live link of program `prog_id` before the agent itself
+    /// detaches it; the number of links retired.
+    pub fn retire_program_links(&self, prog_id: u32) -> usize {
+        let pin_root = self.0.own_links.get().and_then(|o| o.pin_root.clone());
+        let ids: Vec<u32> = live_links(pin_root.as_deref())
+            .into_iter()
+            .filter(|(_, prog)| *prog == prog_id)
+            .map(|(id, _)| id)
+            .collect();
+        self.0.retired_links.lock().extend(ids.iter().copied());
+        ids.len()
+    }
 }
 
 /// `BPF_OBJ_GET` (lab PR 215: the number from `common::bpf_cmd`, the one
@@ -163,7 +198,12 @@ pub(crate) fn observe_shortfall(enforce: bool, debug_build: bool) -> Option<Stri
 /// Attach both hooks (deny + observe). Errors are reported to the caller's
 /// health accounting, not returned: the anti-tamper health decides the
 /// fail-closed outcome.
-pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> BpfDefenseHealth {
+pub(crate) fn attach(
+    guard: &BpfGuard,
+    ebpf: &mut Ebpf,
+    btf: &Btf,
+    pin_root: Option<&Path>,
+) -> BpfDefenseHealth {
     let mut health = BpfDefenseHealth::default();
     match antitamper_bpf::reattach_fresh(ebpf, GUARD_PROGRAM, GUARD_HOOK, btf, pin_root) {
         Ok(()) => info!(
@@ -187,7 +227,10 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Bpf
     // restarts keep working.
     match attach_role_exit(ebpf, pin_root) {
         Ok(()) => {
-            ROLE_WATCH.store(true, std::sync::atomic::Ordering::SeqCst);
+            guard
+                .0
+                .role_watch
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             info!(
                 program = ROLE_EXIT_PROGRAM,
                 "BPF self-defence: role liveness watch attached (sched_process_exit)"
@@ -255,7 +298,7 @@ fn attach_role_exit(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<()> {
 /// External audit EBPF-002: pin `ROLE_TGIDS` and record this agent as the
 /// live one, once it is a protected pid and the liveness watch runs (else
 /// the slot stays vacant: the window is bounded by age only).
-fn claim_agent_role(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<()> {
+fn claim_agent_role(guard: &BpfGuard, ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<()> {
     if let Some(root) = pin_root {
         let pin = root.join(antitamper_bpf::ROLE_TGIDS_MAP_NAME);
         if !pin.exists() {
@@ -270,7 +313,7 @@ fn claim_agent_role(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<()> {
                 .with_context(|| format!("pinning {}", pin.display()))?;
         }
     }
-    if !ROLE_WATCH.load(std::sync::atomic::Ordering::SeqCst) {
+    if !guard.0.role_watch.load(std::sync::atomic::Ordering::SeqCst) {
         return Ok(());
     }
     let map = ebpf
@@ -289,33 +332,24 @@ fn claim_agent_role(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// External audit ATP-013: the ids of every map of the object as loaded,
-/// taken before the sensors move maps out of it. `take_map` removes a map
-/// from `ebpf.maps()`, and the twelve ring buffers (`FS_PROTECT_EVENTS`,
-/// with the anti-tamper denials, among them) and `RING_DROPS` were taken
-/// before [`register_own_objects`] ran: none was in `OWN_BPF_IDS`, so the
-/// guard handed a foreign root a writable handle on each — enough to move
-/// a ring's consumer position, silencing that sensor, or to zero the drop
-/// counters. `Err` names the maps whose id could not be read.
-static LOADED_MAP_IDS: parking_lot::Mutex<Option<std::result::Result<Vec<u32>, String>>> =
-    parking_lot::Mutex::new(None);
-
-/// Record the ids of every map of `ebpf` — call right after the load,
-/// before any `take_map`.
-pub fn remember_loaded_maps(ebpf: &Ebpf) {
-    let mut ids = Vec::new();
-    let mut unreadable = Vec::new();
-    for (name, map) in ebpf.maps() {
-        match map_data(map).info() {
-            Ok(info) => ids.push(info.id()),
-            Err(e) => unreadable.push(format!("{name}: {e}")),
+impl BpfGuard {
+    /// External audit ATP-013: record the ids of every map of `ebpf` — call
+    /// right after the load, before any `take_map`.
+    pub fn remember_loaded_maps(&self, ebpf: &Ebpf) {
+        let mut ids = Vec::new();
+        let mut unreadable = Vec::new();
+        for (name, map) in ebpf.maps() {
+            match map_data(map).info() {
+                Ok(info) => ids.push(info.id()),
+                Err(e) => unreadable.push(format!("{name}: {e}")),
+            }
         }
+        *self.0.loaded_map_ids.lock() = Some(if unreadable.is_empty() {
+            Ok(ids)
+        } else {
+            Err(unreadable.join("; "))
+        });
     }
-    *LOADED_MAP_IDS.lock() = Some(if unreadable.is_empty() {
-        Ok(ids)
-    } else {
-        Err(unreadable.join("; "))
-    });
 }
 
 /// The maps a loaded program of ours uses that are not in `own`: what the
@@ -338,11 +372,16 @@ fn unregistered_maps(ebpf: &Ebpf, own: &HashSet<u32>) -> Vec<String> {
 /// Fill `OWN_BPF_IDS` with the ids of every map and program of this object
 /// and arm the mode. Call once every program is loaded (after the
 /// anti-tamper hooks), so the set is complete.
-pub(crate) fn register_own_objects(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<OwnObjects> {
+pub(crate) fn register_own_objects(
+    guard: &BpfGuard,
+    ebpf: &mut Ebpf,
+    pin_root: Option<&Path>,
+) -> Result<OwnObjects> {
     // External audit ATP-013: the maps taken out of the object before this
     // point, as recorded at load; then those still in it. An id that cannot
     // be read is a hole in the guard, not a map to skip.
-    let mut map_ids: Vec<u32> = match LOADED_MAP_IDS.lock().clone() {
+    let loaded = guard.0.loaded_map_ids.lock().clone();
+    let mut map_ids: Vec<u32> = match loaded {
         Some(Ok(ids)) => ids,
         Some(Err(unreadable)) => {
             anyhow::bail!("own map ids unreadable at load: {unreadable}")
@@ -400,7 +439,7 @@ pub(crate) fn register_own_objects(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> 
         own.insert(own_key(KIND_LINK, *id), KIND_LINK, 0)
             .with_context(|| format!("registering own link id {id}"))?;
     }
-    let _ = OWN_LINKS.set(OwnLinks {
+    let _ = guard.0.own_links.set(OwnLinks {
         ids: link_ids.clone(),
         pin_root: pin_root.map(Path::to_path_buf),
     });
@@ -424,7 +463,7 @@ pub(crate) fn register_own_objects(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> 
              not registered, not removed"
         );
     }
-    *FOREIGN_PINS.lock() = foreign;
+    *guard.0.foreign_pins.lock() = foreign;
     {
         let names = ebpf
             .map_mut(PIN_NAMES_MAP)
@@ -477,7 +516,7 @@ pub(crate) fn register_own_objects(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> 
     }
     // Not fatal: without the claim the fresh-instance window is bounded by
     // age only, while a failure here must not leave the guard unarmed.
-    if let Err(e) = claim_agent_role(ebpf, pin_root) {
+    if let Err(e) = claim_agent_role(guard, ebpf, pin_root) {
         error!(
             error = format!("{e:#}"),
             "BPF self-defence: the agent's role NOT recorded in ROLE_TGIDS — a fresh agent \
@@ -721,11 +760,6 @@ struct LinkPins {
     foreign: Vec<String>,
 }
 
-/// The `link_*` entries found at boot that are not the agent's links, for
-/// one signed `integrity_drift` each once the audit log is open
-/// ([`attest_foreign_pins`]).
-static FOREIGN_PINS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
-
 /// Kind of the signed `integrity_drift` for a `link_*` entry of the pin
 /// root that is not one of the agent's links.
 pub const FOREIGN_PIN_KIND: &str = "foreign_pin";
@@ -783,47 +817,49 @@ fn link_pins(pin_root: Option<&Path>, own_progs: &HashSet<u32>) -> LinkPins {
     out
 }
 
-/// One signed `integrity_drift` ([`FOREIGN_PIN_KIND`]) per `link_*` entry
-/// of the pin root found at boot that is not one of the agent's links (a
-/// stale pin of an earlier build, or one a root planted). Called from
-/// `main` once the audit log is open.
-pub fn attest_foreign_pins(audit_log: Option<&Arc<parking_lot::Mutex<AuditLog>>>) {
-    let foreign = std::mem::take(&mut *FOREIGN_PINS.lock());
-    if foreign.is_empty() {
-        return;
-    }
-    error!(
-        count = foreign.len(),
-        "INTEGRITY DRIFT — link_* entries in the agent's pin root that are not its links \
+impl BpfGuard {
+    /// One signed `integrity_drift` ([`FOREIGN_PIN_KIND`]) per `link_*` entry
+    /// of the pin root found at boot that is not one of the agent's links (a
+    /// stale pin of an earlier build, or one a root planted). Called by the
+    /// start once the audit log is open.
+    pub fn attest_foreign_pins(&self, audit_log: Option<&Arc<parking_lot::Mutex<AuditLog>>>) {
+        let foreign = std::mem::take(&mut *self.0.foreign_pins.lock());
+        if foreign.is_empty() {
+            return;
+        }
+        error!(
+            count = foreign.len(),
+            "INTEGRITY DRIFT — link_* entries in the agent's pin root that are not its links \
          (not registered as its own, not removed)"
-    );
-    let Some(log) = audit_log else {
-        return;
-    };
-    for detail in foreign {
-        let draft = AuditEntryDraft {
-            op: crate::self_integrity::AUDIT_OP.to_string(),
-            extra: serde_json::json!({
-                "kind": FOREIGN_PIN_KIND,
-                "detail": format!(
-                    "{detail} — a link_* entry in the pin root that is not the agent's: not \
-                     registered as its own, not removed"
-                ),
-                "at_boot": true,
-            }),
-            key_fp: "agent-self".to_string(),
-            cosigner_fps: Vec::new(),
-            result: "detected".to_string(),
-            client_pid: std::process::id(),
-            client_uid: 0,
-            client_comm: "northnarrow-agent".to_string(),
-            client_exe: None,
+        );
+        let Some(log) = audit_log else {
+            return;
         };
-        if let Err(e) = log.lock().append(draft) {
-            warn!(
-                error = format!("{e:#}"),
-                "BPF self-defence: audit entry for a foreign pin failed"
-            );
+        for detail in foreign {
+            let draft = AuditEntryDraft {
+                op: crate::self_integrity::AUDIT_OP.to_string(),
+                extra: serde_json::json!({
+                    "kind": FOREIGN_PIN_KIND,
+                    "detail": format!(
+                        "{detail} — a link_* entry in the pin root that is not the agent's: not \
+                         registered as its own, not removed"
+                    ),
+                    "at_boot": true,
+                }),
+                key_fp: "agent-self".to_string(),
+                cosigner_fps: Vec::new(),
+                result: "detected".to_string(),
+                client_pid: std::process::id(),
+                client_uid: 0,
+                client_comm: "northnarrow-agent".to_string(),
+                client_exe: None,
+            };
+            if let Err(e) = log.lock().append(draft) {
+                warn!(
+                    error = format!("{e:#}"),
+                    "BPF self-defence: audit entry for a foreign pin failed"
+                );
+            }
         }
     }
 }
@@ -839,93 +875,98 @@ fn pin_name_key(name: &str) -> Option<u64> {
     Some(common::wire::pin_name_hash(bytes))
 }
 
-/// The agent is stopping: its links go with it, and the self-check must
-/// not report them. Set by `main` as soon as the event loop ends, before
-/// anything is released.
-static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Mark the agent as stopping (see [`spawn_link_self_check`]). The lab
-/// caught the self-check of an agent stopped in a trusted-installer window
-/// reporting a link it had just released, 44 ms after `agent_stop`: a
-/// signed `bpf_link_missing` for an authorised restart.
-pub fn mark_stopping() {
-    STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
-fn stopping() -> bool {
-    STOPPING.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// Periodic proof that the agent's own links are still attached: every
-/// link registered at boot must still be reachable (held fd or pin) with a
-/// non-zero program. A link that is gone while the agent is alive was
-/// unpinned or detached from outside (observe mode, a bypass of the pin
-/// protection): ERROR in the journal and one signed audit entry per link.
-/// Spawned from `main` once the audit log exists.
-pub fn spawn_link_self_check(audit_log: Option<Arc<parking_lot::Mutex<AuditLog>>>) {
-    let Some(own) = OWN_LINKS.get().cloned() else {
-        return;
-    };
-    let ids = own.ids.clone();
-    if ids.is_empty() {
-        return;
+impl BpfGuard {
+    /// Mark the agent as stopping (see [`Self::spawn_link_self_check`]): its
+    /// links go with it, and the self-check must not report them. Set by the
+    /// start's stop as soon as the event loop ends, before anything is
+    /// released. The lab caught the self-check of an agent stopped in a
+    /// trusted-installer window reporting a link it had just released, 44 ms
+    /// after `agent_stop`: a signed `bpf_link_missing` for an authorised
+    /// restart.
+    pub fn mark_stopping(&self) {
+        self.0
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
-    info!(
-        links = ids.len(),
-        every_secs = LINK_CHECK_SECS,
-        "BPF self-defence: link self-check armed"
-    );
-    tokio::spawn(async move {
-        let mut reported: HashSet<u32> = HashSet::new();
-        loop {
-            tokio::time::sleep(crate::self_integrity::jittered(Duration::from_secs(
-                LINK_CHECK_SECS,
-            )))
-            .await;
-            if stopping() {
-                return;
-            }
-            let live: HashSet<u32> = live_links(own.pin_root.as_deref())
-                .into_iter()
-                .filter(|(_, prog)| *prog != 0)
-                .map(|(id, _)| id)
-                .collect();
-            for id in &ids {
-                // re-read per link: the stop can begin during the walk
-                if stopping() {
+
+    fn stopping(&self) -> bool {
+        self.0.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Periodic proof that the agent's own links are still attached: every
+    /// link registered at boot must still be reachable (held fd or pin) with a
+    /// non-zero program. A link that is gone while the agent is alive was
+    /// unpinned or detached from outside (observe mode, a bypass of the pin
+    /// protection): ERROR in the journal and one signed audit entry per link.
+    /// Spawned by the start once the audit log exists.
+    pub fn spawn_link_self_check(&self, audit_log: Option<Arc<parking_lot::Mutex<AuditLog>>>) {
+        let Some(own) = self.0.own_links.get().cloned() else {
+            return;
+        };
+        let guard = self.clone();
+        let ids = own.ids.clone();
+        if ids.is_empty() {
+            return;
+        }
+        info!(
+            links = ids.len(),
+            every_secs = LINK_CHECK_SECS,
+            "BPF self-defence: link self-check armed"
+        );
+        tokio::spawn(async move {
+            let mut reported: HashSet<u32> = HashSet::new();
+            loop {
+                tokio::time::sleep(crate::self_integrity::jittered(Duration::from_secs(
+                    LINK_CHECK_SECS,
+                )))
+                .await;
+                if guard.stopping() {
                     return;
                 }
-                if live.contains(id) || retired_links().lock().contains(id) || !reported.insert(*id)
-                {
-                    continue;
-                }
-                error!(
+                let live: HashSet<u32> = live_links(own.pin_root.as_deref())
+                    .into_iter()
+                    .filter(|(_, prog)| *prog != 0)
+                    .map(|(id, _)| id)
+                    .collect();
+                for id in &ids {
+                    // re-read per link: the stop can begin during the walk
+                    if guard.stopping() {
+                        return;
+                    }
+                    if live.contains(id)
+                        || guard.0.retired_links.lock().contains(id)
+                        || !reported.insert(*id)
+                    {
+                        continue;
+                    }
+                    error!(
                     link_id = id,
                     "ANTI-TAMPER: one of the agent's own BPF links is GONE — an LSM hook or sensor was \
                      detached from outside the agent"
                 );
-                if let Some(log) = &audit_log {
-                    let draft = AuditEntryDraft {
-                        op: LINK_MISSING_AUDIT_OP.to_string(),
-                        extra: serde_json::json!({ "link_id": id, "links_registered": ids.len() }),
-                        key_fp: "agent-self".to_string(),
-                        cosigner_fps: Vec::new(),
-                        result: "detected".to_string(),
-                        client_pid: std::process::id(),
-                        client_uid: 0,
-                        client_comm: "northnarrow-agent".to_string(),
-                        client_exe: None,
-                    };
-                    if let Err(e) = log.lock().append(draft) {
-                        warn!(
-                            error = format!("{e:#}"),
-                            "BPF self-defence: audit entry for the missing link failed"
-                        );
+                    if let Some(log) = &audit_log {
+                        let draft = AuditEntryDraft {
+                            op: LINK_MISSING_AUDIT_OP.to_string(),
+                            extra: serde_json::json!({ "link_id": id, "links_registered": ids.len() }),
+                            key_fp: "agent-self".to_string(),
+                            cosigner_fps: Vec::new(),
+                            result: "detected".to_string(),
+                            client_pid: std::process::id(),
+                            client_uid: 0,
+                            client_comm: "northnarrow-agent".to_string(),
+                            client_exe: None,
+                        };
+                        if let Err(e) = log.lock().append(draft) {
+                            warn!(
+                                error = format!("{e:#}"),
+                                "BPF self-defence: audit entry for the missing link failed"
+                            );
+                        }
                     }
                 }
             }
-        }
-    });
+        });
+    }
 }
 
 /// The `MapData` behind any `Map` variant (aya 0.14 exposes `info()` on

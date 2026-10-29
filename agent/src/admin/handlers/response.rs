@@ -273,6 +273,7 @@ fn response_restore(
 pub(in crate::admin) fn dispatch_remediate_ransomware(
     req: RemediateRansomwareRequest,
     auth: &ConnAuth<'_>,
+    cow_guard: Option<&crate::cow::CowGuard>,
     fps_out: &mut Vec<String>,
 ) -> RemediateRansomwareResponse {
     let refuse = |result: AdminResult, message: String| RemediateRansomwareResponse {
@@ -293,7 +294,7 @@ pub(in crate::admin) fn dispatch_remediate_ransomware(
         auth,
         fps_out,
         |r| refuse(r, String::new()),
-        |v| remediate_ransomware(v, refuse),
+        |v| remediate_ransomware(v, cow_guard, refuse),
     )
 }
 
@@ -301,12 +302,20 @@ pub(in crate::admin) fn dispatch_remediate_ransomware(
 /// it did.
 fn remediate_ransomware(
     v: Verified<'_, RemediateRansomwareRequest>,
+    cow_guard: Option<&crate::cow::CowGuard>,
     refuse: impl Fn(AdminResult, String) -> RemediateRansomwareResponse,
 ) -> RemediateRansomwareResponse {
     let extra = v.extra();
     let key_fp = v.signer_fp().to_string();
-    let report = match crate::cow::admin_restore(extra.pid, extra.since_unix, extra.dry_run, key_fp)
-    {
+    // R11c (lab PR 264): the guard the start gave the socket (it was a
+    // process-wide one).
+    let report = match crate::cow::admin_restore(
+        cow_guard,
+        extra.pid,
+        extra.since_unix,
+        extra.dry_run,
+        key_fp,
+    ) {
         Ok(r) => r,
         Err(why) => return refuse(AdminResult::Success, why),
     };

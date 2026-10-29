@@ -171,8 +171,8 @@ struct Inner<H: DecisionHost> {
     clock: Arc<dyn Clock>,
     /// Lab PR 249: the per-rule policy this machine reads its ransomware
     /// directive from (`combat-without-corroboration NN-L-IMP-001`, lab PR
-    /// 236) — production: the agent's `rule_policy::global()`, the handle
-    /// the engine reads and `nn-admin policy set` swaps
+    /// 236) — production: the handle the agent's start makes, the one the
+    /// engine reads and `nn-admin policy set` swaps
     /// ([`PostureMachine::with_rule_policy`]); the built-in defaults
     /// otherwise. It was a process-wide switch.
     rule_policy: crate::decision::rule_policy::PolicyHandle,
@@ -360,7 +360,8 @@ impl<H: DecisionHost> PostureMachine<H> {
     }
 
     /// Lab PR 249: read the ransomware directive of the per-rule policy
-    /// `handle` holds — production: the agent's `rule_policy::global()`,
+    /// `handle` holds — production: the engine's handle (R11c, lab PR 264:
+    /// one the start makes; it was the process-wide `rule_policy::global()`),
     /// so a policy `nn-admin policy set` puts in force reaches the posture
     /// at its next event, as it reaches the engine. Without it the machine
     /// reads the built-in defaults (off). Call before the machine is

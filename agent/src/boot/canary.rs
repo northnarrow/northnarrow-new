@@ -130,8 +130,16 @@ pub(crate) fn start(
                             &cli.canary_access_file,
                             audit_log.as_ref(),
                         );
+                        // R11c (lab PR 264): the decoys' inodes go to the
+                        // FIM drain's own read-forward set (a process-wide
+                        // one until then; without FIM, nobody reads them).
+                        let read_forward = fim_admin_state
+                            .as_ref()
+                            .map(|f| f.watch.path_map.read_forward().clone())
+                            .unwrap_or_default();
                         let indexes = Arc::new(parking_lot::Mutex::new(
-                            northnarrow_agent::canary::detector::CanaryIndexes::new(),
+                            northnarrow_agent::canary::detector::CanaryIndexes::new()
+                                .with_read_forward(read_forward),
                         ));
                         // Rebuild indexes from any pre-existing
                         // registry entries. V1.0 inode resolver
@@ -233,7 +241,7 @@ pub(crate) fn start(
                                      writes them again and records it"
                                 );
                             }
-                            let read_forward = northnarrow_agent::canary::read_forward::len();
+                            let read_forward = idx.read_forward().len();
                             info!(
                                 canaries = idx.len(),
                                 read_forward, "canary indexes rebuilt from registry"

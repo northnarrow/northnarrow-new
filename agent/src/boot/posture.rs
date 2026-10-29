@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 use super::cli::Cli;
 use super::evidence::AuditHandle;
 use super::tasks::{spawn_shutdown_exe_refresh, spawn_watchdog_exempt_refresh, WatchdogAudit};
-use crate::pipeline::{host_stopping, systemd_state, HOST_STOPPING};
+use crate::pipeline::{systemd_state, HostStopping};
 
 /// What [`machine`] built.
 pub(crate) struct Posture {
@@ -40,6 +40,7 @@ pub(crate) struct Posture {
 /// exemption, the posture machine (with the release through the isolator,
 /// or without one), its window, tracker and detector; the watchdog's and
 /// systemd-shutdown's refreshes; a stale COMBAT chain torn down.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn machine(
     cli: &Cli,
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
@@ -50,6 +51,7 @@ pub(crate) fn machine(
     >,
     ransom_tracker: &Arc<northnarrow_agent::impact::RansomTracker>,
     defense_detector: &Arc<northnarrow_agent::impair::DefenseDetector>,
+    rule_policy: &northnarrow_agent::decision::rule_policy::PolicyHandle,
 ) -> Posture {
     // The COMBAT graduated-response ladder is constructed once agent_id
     // + the audit log are available (further down). The posture combat
@@ -194,8 +196,9 @@ pub(crate) fn machine(
         )
         // Lab PR 249: the ransomware directive of the per-rule policy put
         // in force above, read from the engine's handle (it was a
-        // process-wide switch set by `install_global`).
-        .with_rule_policy(northnarrow_agent::decision::rule_policy::global().clone())
+        // process-wide switch; R11c, lab PR 264: the handle the policy
+        // phase made, no longer the process-wide handle).
+        .with_rule_policy(rule_policy.clone())
     } else {
         // Dev / no-isolator build: still wire the ladder hooks so a
         // (detector- or admin-forced) COMBAT engages the same graduated
@@ -223,7 +226,7 @@ pub(crate) fn machine(
             ExemptPids::default(),
             lineage.clone(),
         )
-        .with_rule_policy(northnarrow_agent::decision::rule_policy::global().clone())
+        .with_rule_policy(rule_policy.clone())
     };
     // Lab PR 162: inside the trusted-installer window a control-surface
     // tamper (NN-L-FIM-024) does not raise the posture; the rule still acts.
@@ -238,9 +241,8 @@ pub(crate) fn machine(
     // window a stop or restart of the agent's own units is sanctioned (Low,
     // the window named; no posture move).
     defense_detector.set_installer_window(Arc::clone(installer_override));
-    // Lab PR 225: their counters in `status --key`.
-    northnarrow_agent::impact::publish(ransom_tracker);
-    northnarrow_agent::impair::publish(defense_detector);
+    // Lab PR 225: their counters in `status --key` — R11c (lab PR 264): the
+    // admin socket gets them from the start, no longer a published slot.
     info!("posture state machine initialized (state: OBSERVING)");
 
     // Beta Step 3: keep the watchdog PID exemption fresh. The watchdog
@@ -328,6 +330,13 @@ pub(crate) struct Combat {
     pub(crate) debug_guard: northnarrow_agent::combat::SystemProtectedProcs,
     /// Tappa 8 A8: fired by a verified admin `ShutdownRequest`.
     pub(crate) shutdown_signal: ShutdownSignal,
+    /// R11c (lab PR 264): systemd reported the host as stopping (the event
+    /// loop reads it; process-wide until then).
+    pub(crate) host_stopping: HostStopping,
+    /// R11c (lab PR 264): the copy-on-first-write guard of this boot (the
+    /// event loop, the admin socket and the stop use it; process-wide until
+    /// then).
+    pub(crate) cow_guard: northnarrow_agent::cow::CowGuard,
 }
 
 /// The COMBAT ladder on the system actuator and the signed evidence,
@@ -347,6 +356,10 @@ pub(crate) fn ladder(
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
     lineage: &AuthSessionTracker,
 ) -> Combat {
+    // R11c (lab PR 264): the copy-on-first-write guard the NEUTRALIZE hook
+    // tells, filled once the guard has booted below (before, the hook found
+    // no running guard, as it found none in the process-wide state).
+    let cow_slot: Arc<std::sync::OnceLock<northnarrow_agent::cow::CowGuard>> = Arc::default();
     // Build the ladder with the system actuator (real kill / quarantine /
     // per-PID egress / full isolation) + the signed-audit evidence sink,
     // then publish it to the slot the posture combat hooks read. Driven
@@ -385,16 +398,21 @@ pub(crate) fn ladder(
         // Lab PR 222: a NEUTRALIZE that contained a ransomware tree lets the
         // copy-on-first-write guard restore what it rewrote (a no-op
         // without the guard, or without copies of that tree's writes).
-        .with_neutralize_hook(Box::new(|refs| {
-            northnarrow_agent::cow::on_ladder_neutralized(
-                refs.iter()
-                    .map(|r| northnarrow_agent::cow::trust::ProcId {
-                        pid: r.pid(),
-                        start: r.start_ticks().unwrap_or(0),
-                    })
-                    .collect(),
-            )
-        }))
+        .with_neutralize_hook({
+            let cow_slot = Arc::clone(&cow_slot);
+            Box::new(move |refs| {
+                if let Some(cow) = cow_slot.get() {
+                    cow.on_ladder_neutralized(
+                        refs.iter()
+                            .map(|r| northnarrow_agent::cow::trust::ProcId {
+                                pid: r.pid(),
+                                start: r.start_ticks().unwrap_or(0),
+                            })
+                            .collect(),
+                    )
+                }
+            })
+        })
         // External audit CMB-007: the ladder's side effects (nft, cgroup
         // writes, kills, quarantine, iptables, audit) run on a worker of
         // their own, in order — never on the event loop.
@@ -442,7 +460,7 @@ pub(crate) fn ladder(
     // `cow-guard.local` that says `enabled = true`; started here, after the
     // anti-tamper hooks (its journals are registered in their map) and the
     // audit log (its degradations and restores are signed rows).
-    match northnarrow_agent::cow::boot(
+    let cow_guard = northnarrow_agent::cow::boot(
         &overlay_gate.verified(
             OverlayKind::CowGuard,
             std::path::Path::new(northnarrow_agent::cow::config::COW_GUARD_LOCAL),
@@ -451,7 +469,8 @@ pub(crate) fn ladder(
         audit_log.clone(),
         northnarrow_agent::anti_tamper::prepare_pin_root().map(|p| p.to_path_buf()),
         detect_only,
-    ) {
+    );
+    match cow_guard.state() {
         northnarrow_agent::cow::GuardState::Off => {
             debug!("copy on first write: off (no signed cow-guard.local enabling it)")
         }
@@ -460,18 +479,21 @@ pub(crate) fn ladder(
         }
         northnarrow_agent::cow::GuardState::Running(_) => {}
     }
+    let _ = cow_slot.set(cow_guard.clone());
+    let host_stopping = HostStopping::default();
 
     // Fast heartbeat advancing the time-bound INVESTIGATE deadline. The
     // 60 s posture-decay loop is too coarse for the ladder's
     // seconds-scale windows; this 5 s tick is a no-op unless a COMBAT
     // episode is active and its investigate deadline has elapsed.
     let ladder_tick = Arc::clone(&ladder);
+    let stopping_tick = host_stopping.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         tick.tick().await; // skip the immediate first tick
         loop {
             tick.tick().await;
-            if HOST_STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
+            if stopping_tick.is_stopping() {
                 continue;
             }
             ladder_tick.tick(Instant::now());
@@ -485,12 +507,13 @@ pub(crate) fn ladder(
     // the posture or the ladder. Detection goes on.
     if std::path::Path::new(northnarrow_agent::systemd_state::PRIVATE_SOCKET).exists() {
         let ladder_stop = Arc::clone(&ladder);
+        let stopping_watch = host_stopping.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             loop {
                 tick.tick().await;
                 if systemd_state().await.as_deref() == Some("stopping") {
-                    host_stopping(&ladder_stop);
+                    stopping_watch.stand_down(&ladder_stop);
                     break;
                 }
             }
@@ -508,6 +531,8 @@ pub(crate) fn ladder(
         #[cfg(feature = "debug-trigger")]
         debug_guard,
         shutdown_signal,
+        host_stopping,
+        cow_guard,
     }
 }
 

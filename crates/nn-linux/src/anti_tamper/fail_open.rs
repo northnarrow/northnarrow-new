@@ -13,8 +13,9 @@
 //! it let through is judged by the other sensors like any other.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+use crate::late_audit::{AuditHandle, LateAudit};
 
 use aya::maps::{MapData, PerCpuArray};
 use aya::Ebpf;
@@ -36,30 +37,34 @@ static TOTALS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 /// The counters are read (the map was found and the sampler runs).
 static ARMED: AtomicBool = AtomicBool::new(false);
 
-static AUDIT_LOG: OnceLock<Arc<parking_lot::Mutex<crate::audit::AuditLog>>> = OnceLock::new();
-/// Why the counters could not be armed, attested once the audit log exists.
-static INSTALL_FAILURE: OnceLock<String> = OnceLock::new();
+/// What [`install`] gives the start (R11c, lab PR 264): the sampler's
+/// audit log, bound once it exists (the sampler starts earlier, with the
+/// eBPF object), and why the counters could not be armed, attested at the
+/// binding. They were process-wide statics that `set_audit_log` filled.
+#[derive(Clone, Debug, Default)]
+pub struct FailOpen {
+    audit: LateAudit,
+    install_failure: Option<String>,
+}
 
-/// Hand the signed audit log to the sampler (from `main`, once it exists;
-/// the sampler starts earlier, with the eBPF object).
-pub fn set_audit_log(log: Option<Arc<parking_lot::Mutex<crate::audit::AuditLog>>>) {
-    if let Some(l) = log {
-        if let Some(detail) = INSTALL_FAILURE.get() {
-            append(
-                &l,
-                crate::self_integrity::AUDIT_OP,
-                serde_json::json!({ "kind": "subsystem_degraded", "detail": detail, "at_boot": true }),
-            );
+impl FailOpen {
+    /// Hand the signed audit log to the sampler (the start's late binding,
+    /// once it exists): a failed install is signed now.
+    pub fn bind_audit_log(&self, log: Option<AuditHandle>) {
+        if let Some(l) = log {
+            if let Some(detail) = &self.install_failure {
+                append(
+                    &l,
+                    crate::self_integrity::AUDIT_OP,
+                    serde_json::json!({ "kind": "subsystem_degraded", "detail": detail, "at_boot": true }),
+                );
+            }
+            self.audit.bind(Some(l));
         }
-        let _ = AUDIT_LOG.set(l);
     }
 }
 
-fn append(
-    log: &Arc<parking_lot::Mutex<crate::audit::AuditLog>>,
-    op: &str,
-    extra: serde_json::Value,
-) {
+fn append(log: &AuditHandle, op: &str, extra: serde_json::Value) {
     let draft = crate::audit::AuditEntryDraft {
         op: op.to_string(),
         extra,
@@ -193,31 +198,35 @@ fn apply_sample(
 
 /// Take the `DENY_FAIL_OPEN` map from the loaded object and start the
 /// sampler. A missing or mistyped map is a WARN and, once the audit log is
-/// set, a signed `subsystem_degraded` (fail-opens then go uncounted, and
-/// the status says "not counted").
-pub fn install(ebpf: &mut Ebpf) {
+/// bound ([`FailOpen::bind_audit_log`]), a signed `subsystem_degraded`
+/// (fail-opens then go uncounted, and the status says "not counted").
+pub fn install(ebpf: &mut Ebpf) -> FailOpen {
+    let failed = |detail: String| FailOpen {
+        install_failure: Some(detail),
+        ..FailOpen::default()
+    };
     let Some(map) = ebpf.take_map(MAP_NAME) else {
         warn!(
             map = MAP_NAME,
             "deny fail-open counters not exported by the eBPF object — fail-opens will not be counted"
         );
-        let _ = INSTALL_FAILURE.set(format!(
+        return failed(format!(
             "deny fail-open counters unavailable: map {MAP_NAME} not exported by the eBPF \
              object; a deny hook that lets an operation through undecided is not counted"
         ));
-        return;
     };
     let map: PerCpuArray<MapData, u64> = match PerCpuArray::try_from(map) {
         Ok(m) => m,
         Err(e) => {
             warn!(error = %e, map = MAP_NAME, "deny fail-open map has an unexpected type — fail-opens will not be counted");
-            let _ = INSTALL_FAILURE.set(format!(
+            return failed(format!(
                 "deny fail-open counters unavailable: map {MAP_NAME} has an unexpected type \
                  ({e}); a deny hook that lets an operation through undecided is not counted"
             ));
-            return;
         }
     };
+    let bindings = FailOpen::default();
+    let audit = bindings.audit.clone();
     ARMED.store(true, Ordering::Relaxed);
     info!(
         hooks = FAIL_OPEN_SLOTS,
@@ -231,7 +240,7 @@ pub fn install(ebpf: &mut Ebpf) {
             tokio::time::sleep(Duration::from_secs(SAMPLE_SECS)).await;
             let cur = merge_sample(&prev, &read_map(&map));
             let entries = apply_sample(&prev, &cur, &mut pacers, Instant::now());
-            if let Some(log) = AUDIT_LOG.get() {
+            if let Some(log) = audit.get() {
                 for (hook, since, total) in entries {
                     append(log, AUDIT_OP, audit_extra(hook, since, total));
                 }
@@ -250,6 +259,7 @@ pub fn install(ebpf: &mut Ebpf) {
             debug!(total = total(), "deny fail-open sample");
         }
     });
+    bindings
 }
 
 #[cfg(test)]

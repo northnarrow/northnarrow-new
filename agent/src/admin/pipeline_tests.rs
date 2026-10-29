@@ -59,7 +59,7 @@ use super::tests::{
 };
 use super::transport::serve_request;
 use super::verify::{now_unix_secs, Quorum, Signed, RULES};
-use super::{AdminReadPaths, StatusPolls};
+use super::{AdminHandles, AdminReadPaths, StatusPolls};
 use crate::anti_tamper::admin_auth::{AdminAuth, ConnAuth};
 use crate::anti_tamper::network_isolate::NetworkIsolator;
 use crate::audit::{AuditEntry, AuditLog};
@@ -125,6 +125,7 @@ struct Fixture {
     marker: PathBuf,
     read_paths: AdminReadPaths,
     polls: StatusPolls,
+    handles: AdminHandles,
 }
 
 impl Fixture {
@@ -157,6 +158,7 @@ impl Fixture {
             posture: PostureMachine::new(),
             isolator: NetworkIsolator::new(rules_path()).unwrap(),
             polls: StatusPolls::default(),
+            handles: AdminHandles::default(),
             read_paths,
             auth,
             audit,
@@ -211,6 +213,7 @@ impl Fixture {
                 &self.isolator,
                 &self.marker,
                 &self.read_paths,
+                &self.handles,
             ),
             &fake_client(),
             Some(&self.audit),
@@ -1993,6 +1996,269 @@ fn every_role_is_in_the_role_tests() {
             );
         }
     }
+}
+
+// ── R11c (lab PR 264): `nn-admin policy set`, applied at once ─────────
+
+/// R11c (lab PR 264): the per-rule policy is one handle the start makes
+/// and gives the engine, the posture and the admin socket (it was the
+/// process-wide `rule_policy::global()`, which `install_global` swapped).
+/// A signed `config overlay set` of the policy — what `nn-admin policy set`
+/// sends — through the pipeline a connection runs (`serve_request`) is in
+/// force at once on each: the engine's next decision gives R020 its held
+/// kill back, the executor runs that response (`process_event`'s way: the
+/// decision's responses, or `Log` when there are none; an enforcing
+/// executor on the test's paths, whose target is the test's own child), and
+/// the posture's next judgement takes the ransomware directive (COMBAT
+/// without corroboration). The handles are shared as `boot::run` shares them: the
+/// engine's, the posture's clone of it and the admin socket's
+/// (`AdminHandles`); the start's own wiring is the boot tests'
+/// `the_start_shares_one_policy_handle`.
+#[test]
+fn a_signed_policy_set_applies_at_once_to_the_engine_the_posture_and_the_executor() {
+    use crate::posture::{AuthSessionTracker, ExemptPids};
+    use crate::response::{ExecutionOutcome, Executor, ExecutorConfig};
+    use nn_model::{Event, ResponseAction};
+
+    // The engine (the shipped lists, an empty `/proc`), its handle the
+    // start's: the built-in defaults, R020's kill held.
+    let proc = TempDir::new().unwrap();
+    let lineage = AuthSessionTracker::new(proc.path());
+    let engine = crate::decision::replay::engine(crate::decision::replay::HostParts {
+        configs: Path::new(concat!(env!("NN_REPO_ROOT"), "/configs")),
+        proc_root: proc.path(),
+        lineage: lineage.clone(),
+        ransom: Arc::new(crate::impact::RansomTracker::new(lineage.clone())),
+        resolvers: Vec::new(),
+        policy: crate::decision::rule_policy::RulePolicy::builtin(),
+    });
+    let rule_policy = engine.policy().clone();
+    // The posture on the same handle, judging rewrites with ciphertext left
+    // behind as the ransomware combination (lab PR 225).
+    struct Cipher;
+    impl crate::impact::entropy::Sampler for Cipher {
+        fn sample(&self, _: &str, _: std::time::Duration) -> crate::impact::entropy::Sample {
+            crate::impact::entropy::Sample {
+                examined: 4,
+                high: 4,
+                containers: 0,
+            }
+        }
+        fn sample_copies(
+            &self,
+            copy: &str,
+            _: &str,
+            since: std::time::Duration,
+        ) -> crate::impact::entropy::Sample {
+            self.sample(copy, since)
+        }
+    }
+    let posture = PostureMachine::new_with_hooks_and_exempt_and_auth(
+        Arc::new(|_| {}),
+        Arc::new(|_, _| Ok(String::new())),
+        ExemptPids::default(),
+        AuthSessionTracker::new(proc.path()),
+    )
+    .with_rule_policy(rule_policy.clone());
+    posture.set_ransom_tracker(Arc::new(crate::impact::RansomTracker::with(
+        lineage.clone(),
+        crate::impact::trust::ProgramOwners::new(proc.path().join("no-package-db")),
+        Arc::new(Cipher),
+    )));
+    // Enforcing, on the test's paths: its kill cgroup is no cgroup (the tree
+    // is killed process by process), its target the test's own child.
+    let executor = Executor::with_config(ExecutorConfig {
+        dry_run: false,
+        ..ExecutorConfig::for_test(proc.path())
+    });
+    // The admin socket on the same handle.
+    let mut fx = Fixture::new(&keys());
+    fx.handles = AdminHandles {
+        rule_policy: rule_policy.clone(),
+        ..AdminHandles::default()
+    };
+
+    // R020's reverse shell: the shell of a web server, stdio on a socket it
+    // connected out; the response's target a real process of the test's
+    // own, so a kill that ran shows.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let reverse_shell = |pid: u32| {
+        let mut e = crate::decision::rules::testutil::spawn_as(33, "bash", "/usr/bin/bash");
+        if let Event::ProcessSpawn {
+            pid: p,
+            ppid,
+            stdio,
+            exe,
+            ..
+        } = &mut e
+        {
+            *p = pid;
+            *ppid = pid - 1;
+            exe.path = "/usr/bin/bash".into();
+            stdio.own = nn_model::StdioSocket {
+                read: true,
+                inet_fds: 3,
+                outbound: true,
+                proto: 6,
+                peer: Some("203.0.113.7:4444".parse().unwrap()),
+            };
+        }
+        e
+    };
+    let target = child.id();
+    // What `process_event` does with a decision: its responses, or `Log`.
+    let respond = |e: &Event| {
+        if let Event::ProcessSpawn {
+            pid,
+            ppid,
+            uid,
+            filename,
+            argv,
+            timestamp_ns,
+            exe,
+            start_ns,
+            ..
+        } = e
+        {
+            lineage.ingest_exec(
+                *pid,
+                *ppid,
+                exe.path_or(filename),
+                argv,
+                *timestamp_ns,
+                *start_ns,
+                *uid,
+            );
+        }
+        let d = engine.decide(e).expect("R020 matches");
+        let outcomes: Vec<(ResponseAction, ExecutionOutcome)> = if d.responses.is_empty() {
+            let r = executor.execute(ResponseAction::Log, target);
+            vec![(r.action, r.primary)]
+        } else {
+            d.responses
+                .iter()
+                .map(|r| {
+                    let report =
+                        executor.execute_for_started(r.action.clone(), target, 0, 0, &r.filename);
+                    (report.action, report.primary)
+                })
+                .collect()
+        };
+        (
+            d.verdict.action.clone(),
+            d.primary().applied.name(),
+            outcomes,
+        )
+    };
+    // A ransomware run of its own for each judgement: an actor the lineage
+    // knows, its rewrites with ciphertext left behind.
+    let ransomware = |pid: u32| {
+        lineage.ingest_exec(
+            pid,
+            1,
+            "/usr/bin/python3",
+            &["python3".into(), "/srv/nn-malsim/ransom-sim.py".into()],
+            1_000_000_000,
+            1_000_000_000,
+            1000,
+        );
+        Event::MassWrite {
+            pid,
+            uid: 1000,
+            comm: "python3".into(),
+            count: 20,
+            filename: "/srv/nn-malsim/f020".into(),
+            timestamp_ns: 50_000_000_000,
+            overwrites: true,
+            cgroup_window: false,
+        }
+    };
+
+    // Before: the built-in defaults everywhere.
+    let (action, applied, outcomes) = respond(&reverse_shell(7601));
+    assert_eq!(action, ResponseAction::Log, "R020's kill held");
+    assert_eq!(applied, "builtin");
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [(ResponseAction::Log, ExecutionOutcome::Refused { reason, .. })]
+                if reason.starts_with("Log action")
+        ),
+        "{outcomes:?}"
+    );
+    assert!(child.try_wait().unwrap().is_none(), "nothing ran");
+    assert!(!posture.ransomware_combat_without_corroboration());
+    let _ = posture.observe(&ransomware(300), &[]);
+    assert_eq!(
+        posture.current_kind(),
+        PostureKind::Engaged,
+        "the combination alone needs corroboration"
+    );
+
+    // `nn-admin policy set`: the signed overlay through the pipeline.
+    let content = "# lab PR 264\nenforce R020\ncombat-without-corroboration NN-L-IMP-001\n";
+    let k = keys();
+    let conn = ConnAuth::new(&fx.auth);
+    let nonce = fx.challenge(&conn);
+    let p = payload(
+        OperationExtra::ConfigOverlaySet(ConfigOverlaySetExtra {
+            kind: OverlayKind::RulePolicy,
+            sha256: Sha256::digest(content.as_bytes()).into(),
+            len: content.len() as u32,
+        }),
+        nonce,
+        now_unix_secs(),
+        AGENT_ID,
+    );
+    let reply = fx.serve(
+        &conn,
+        &AdminMessage::ConfigOverlaySetRequest(ConfigOverlaySetRequest {
+            signatures: signatures(&p, &[&k.a]),
+            payload: p,
+            content: content.to_string(),
+        }),
+    );
+    let AdminMessage::ConfigOverlaySetResponse(r) = &reply else {
+        panic!("{reply:?}");
+    };
+    assert_eq!(r.result, AdminResult::Success, "{r:?}");
+    assert!(r.stored && r.message.contains("applied now"), "{r:?}");
+    assert!(
+        r.message.contains("replaces built-in"),
+        "the handle's own previous policy: {r:?}"
+    );
+
+    // After, with nothing else done: the next event of each.
+    let (action, applied, outcomes) = respond(&reverse_shell(7602));
+    assert_eq!(
+        action,
+        ResponseAction::KillProcessTree,
+        "R020's kill given back"
+    );
+    assert_eq!(applied, "enforce");
+    assert_eq!(
+        outcomes,
+        vec![(
+            ResponseAction::KillProcessTree,
+            ExecutionOutcome::Killed { pid: target }
+        )],
+        "the executor runs the enforced kill"
+    );
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    assert!(posture.ransomware_combat_without_corroboration());
+    let _ = posture.observe(&ransomware(301), &[]);
+    assert_eq!(
+        posture.current_kind(),
+        PostureKind::Combat,
+        "the combination alone is decisive under the directive"
+    );
+    assert!(!posture.is_combat_locked(), "never locked (POS-001)");
+    // The handle is the start's, not a copy: the engine's reads it.
+    assert!(!engine.policy().current().is_builtin());
 }
 
 /// The tables' golden files (the module doc).

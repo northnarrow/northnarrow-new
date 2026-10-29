@@ -21,8 +21,6 @@
 //! --key` shows is recomputed with the degradations recorded since the boot;
 //! the manifest keeps the boot's.
 
-use std::sync::OnceLock;
-
 use serde::Serialize;
 
 use super::deny_selftest::SelfTestOutcome;
@@ -136,23 +134,13 @@ pub fn compute(inputs: &TrustInputs, degradations: usize) -> Trust {
     Trust { level, reasons }
 }
 
-static BOOT_INPUTS: OnceLock<TrustInputs> = OnceLock::new();
-
-/// The boot's measurements, once, after the self-test.
-pub fn set_boot_inputs(inputs: TrustInputs) {
-    let _ = BOOT_INPUTS.set(inputs);
-}
-
-pub fn boot_inputs() -> Option<&'static TrustInputs> {
-    BOOT_INPUTS.get()
-}
-
-/// The level now: the boot's measurements and the degradations recorded
-/// since. `None` before the self-test ran.
-pub fn current() -> Option<Trust> {
-    BOOT_INPUTS
-        .get()
-        .map(|i| compute(i, super::degradation::count()))
+/// The level now: the boot's measurements (`inputs`, what the self-test
+/// phase measured; `None`: nothing measured) and the degradations recorded
+/// since. R11c (lab PR 264): the measurements are the start's, handed to
+/// the manifest and to the admin socket; they were a process-wide
+/// `BOOT_INPUTS` the self-test phase set (`set_boot_inputs`).
+pub fn current(inputs: Option<&TrustInputs>) -> Option<Trust> {
+    inputs.map(|i| compute(i, super::degradation::count()))
 }
 
 #[cfg(test)]

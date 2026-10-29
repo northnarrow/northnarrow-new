@@ -58,7 +58,9 @@ fn a_mount_marked_guard_never_waits_on_its_own_journal() {
         scope.display()
     ))
     .unwrap();
-    let (store, problems) = Store::open(cfg);
+    // No pin root: the test registers nothing in the installed agent's maps
+    // (R11c, lab PR 264: given here, as the process-wide one was unset).
+    let (store, problems) = Store::open(cfg, None);
     assert!(problems.is_empty(), "{problems:?}");
     let tracker = AuthSessionTracker::new(dir.path());
     let guard = Runtime::start(Arc::clone(&store), tracker).expect("the guard starts");

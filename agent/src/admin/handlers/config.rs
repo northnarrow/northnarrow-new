@@ -10,6 +10,7 @@ use nn_proto::admin_protocol::{AdminResult, ConfigOverlaySetRequest, ConfigOverl
 
 use crate::admin::verify::{signed, Verified};
 use crate::anti_tamper::admin_auth::ConnAuth;
+use crate::decision::rule_policy::PolicyHandle;
 
 /// Tappa 10.8 — handle one [`ConfigOverlaySetRequest`]: verify the
 /// 1-of-N quorum carrying `Role::ConfigManage` (single-use challenge, skew,
@@ -19,6 +20,8 @@ use crate::anti_tamper::admin_auth::ConnAuth;
 pub(in crate::admin) fn dispatch_config_overlay_set(
     req: ConfigOverlaySetRequest,
     auth: &ConnAuth<'_>,
+    rule_policy: &PolicyHandle,
+    overlay_gate: Option<&crate::config::overlay_auth::OverlayGate>,
     fps_out: &mut Vec<String>,
 ) -> ConfigOverlaySetResponse {
     let refuse = |result: AdminResult, message: String| ConfigOverlaySetResponse {
@@ -31,7 +34,7 @@ pub(in crate::admin) fn dispatch_config_overlay_set(
         auth,
         fps_out,
         |r| refuse(r, "signature verification failed".to_string()),
-        |v| config_overlay_set(v, auth, refuse),
+        |v| config_overlay_set(v, auth, rule_policy, overlay_gate, refuse),
     )
 }
 
@@ -40,6 +43,8 @@ pub(in crate::admin) fn dispatch_config_overlay_set(
 fn config_overlay_set(
     v: Verified<'_, ConfigOverlaySetRequest>,
     auth: &ConnAuth<'_>,
+    rule_policy: &PolicyHandle,
+    overlay_gate: Option<&crate::config::overlay_auth::OverlayGate>,
     refuse: impl Fn(AdminResult, String) -> ConfigOverlaySetResponse,
 ) -> ConfigOverlaySetResponse {
     use crate::config::overlay_auth;
@@ -73,7 +78,7 @@ fn config_overlay_set(
         .and_then(|p| p.parent())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("/etc/northnarrow"));
-    let target = overlay_auth::configured_path(extra.kind, &config_dir);
+    let target = overlay_auth::configured_path(overlay_gate, extra.kind, &config_dir);
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
     let sig = match overlay_auth::OverlaySignature::new(req.payload.clone(), &sigs) {
         Ok(s) => s,
@@ -82,13 +87,15 @@ fn config_overlay_set(
     match crate::config::overlay_install::store(&target, &req.content, &sig) {
         // Lab PR 236: the per-rule policy is put in force at once, between
         // two events; the signed `config_overlay_set` row records it
-        // (`applied` in its detail).
+        // (`applied` in its detail). R11c (lab PR 264): through the start's
+        // handle, the one the engine and the posture read (it was the
+        // process-wide `rule_policy::install_global`).
         Ok(sig_file) if extra.kind == nn_proto::admin_signed_payload::OverlayKind::RulePolicy => {
             use crate::decision::rule_policy as rp;
             let boot = rp::boot_policy(Some((&target, &req.content)));
             let summary = boot.policy.summary();
             let source = boot.policy.source.clone();
-            let previous = rp::install_global(boot.policy);
+            let previous = rule_policy.install(boot.policy);
             warn!(
                 target: "admin.config_overlay",
                 path = %target.display(),

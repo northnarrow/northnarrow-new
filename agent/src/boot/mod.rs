@@ -48,6 +48,8 @@
 //! read: the attach takes the proof only the integrity phase holds, the
 //! event loop the proof of READY only `ready` makes.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 
@@ -210,10 +212,13 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         dns_cache,
         execq_mode,
         execpol_mode,
+        exec_guards,
         own_prog_ids_file,
         mut sensor,
         net_bufs,
         exploit_guard_degraded,
+        exploit_guard,
+        anti_tamper,
     } = attach::load(
         &cli,
         &mut boot,
@@ -224,13 +229,18 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &mut audit,
     )
     .await?;
-    let attach::SelfTested { self_test } = attach::self_test(
+    let attach::SelfTested {
+        self_test,
+        expected_denial,
+        trust_inputs,
+    } = attach::self_test(
         &mut boot,
         &refusals,
         &mut audit,
         allow_degraded,
         &bpf_lsm_state,
         detect_only,
+        &anti_tamper,
     )?;
     let evidence::Attested {
         chain_anchor,
@@ -249,6 +259,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         tracepoint_degraded,
         hook_args_degraded,
         exploit_guard_degraded,
+        &exploit_guard,
+        &anti_tamper,
+        sensor.dns_mode(),
         caps_degraded,
         audit,
     )?;
@@ -258,6 +271,8 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         chain_store,
         ransom_tracker,
         defense_detector,
+        rule_policy,
+        ja3_entries,
         engine,
     } = policy::load(
         &cli,
@@ -274,7 +289,14 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         executor,
         correlation,
         isolator,
-    } = response::build(&cli, exec_cfg, detect_only, &audit_log, &overlay_gate)?;
+    } = response::build(
+        &cli,
+        exec_cfg,
+        detect_only,
+        &audit_log,
+        &overlay_gate,
+        &exploit_guard,
+    )?;
     let posture::Posture {
         ladder_slot,
         exempt,
@@ -290,9 +312,11 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &installer_override,
         &ransom_tracker,
         &defense_detector,
+        &rule_policy,
     );
-    evidence::wire(
+    let evidence::Wired { telemetry_probe } = evidence::wire(
         &cli,
+        &sensor,
         &audit_log,
         &watchdog_audit,
         &overlay_gate,
@@ -331,7 +355,14 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         netflow_rotation,
         detection_sink,
         detection_admin_state,
-    } = evidence::stores(&cli, &mut sensor, &stale_combat, &chain_anchor, &audit_log);
+    } = evidence::stores(
+        &cli,
+        &mut sensor,
+        &stale_combat,
+        &chain_anchor,
+        &audit_log,
+        &defense_detector,
+    );
     let fim_admin_state = fim::start(
         &cli,
         agent_id,
@@ -367,6 +398,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         netflow_blocklist,
         chain_store,
     );
+    // R11c (lab PR 264): the boot's signed capability manifest, signed by
+    // the run phase and read by the admin socket's status.
+    let capability_manifest = northnarrow_agent::boot::manifest::SignedManifest::default();
     admin::start(
         &cli,
         &isolator,
@@ -383,6 +417,16 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &combat.ladder,
         &detect_only_source,
         &exempt,
+        northnarrow_agent::admin_socket::AdminHandles {
+            rule_policy,
+            trust_inputs: Some(trust_inputs.clone()),
+            capability_manifest: capability_manifest.clone(),
+            ransom_tracker: Some(Arc::clone(&ransom_tracker)),
+            defense_detector: Some(Arc::clone(&defense_detector)),
+            cow_guard: Some(combat.cow_guard.clone()),
+            overlay_gate: Some(Arc::clone(&overlay_gate)),
+            ja3_entries,
+        },
     );
     let tasks::Tasks {
         execq_handle,
@@ -397,14 +441,19 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &audit_log,
         execq_exec_cfg,
         execpol_mode,
+        exec_guards,
     )?;
     let armed = ready::arm(
         &mut boot,
         bpf_lsm_state,
         self_test,
+        &trust_inputs,
+        &anti_tamper,
         host_checks,
         detect_only,
         &audit_log,
+        &capability_manifest,
+        sensor.attach_points(),
     )?;
     let stopped = crate::run_loop::run(
         armed,
@@ -419,6 +468,8 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &installer_override,
         &detection_sink,
         &audit_log,
+        &telemetry_probe,
+        &expected_denial,
         &mut signals,
     )
     .await;
@@ -426,6 +477,8 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &cli,
         execq_handle,
         execpol_handle,
+        sensor.bpf_guard(),
+        &combat.cow_guard,
         &audit_log,
         &chain_anchor,
         stopped,
@@ -711,7 +764,7 @@ mod tests {
             at("RuleEngine::with_default_rules_and_net(") > at("boot.enter(BootPhase::Subsystems)"),
             "the rule engine in the subsystems phase, after the audit log"
         );
-        let manifest = at("boot::manifest::sign(");
+        let manifest = at("capability_manifest.sign(");
         assert!(manifest > at("boot.enter(BootPhase::Run)"));
         assert!(manifest < at("sd_notify::ready()"));
         assert!(at("boot.done(BootStep::CapabilityManifest)") > manifest);
@@ -830,6 +883,67 @@ mod tests {
         );
     }
 
+    /// R11c (lab PR 264): the start makes the per-rule policy's handle once,
+    /// in the policy phase, with the boot policy in force, and gives that
+    /// one to the engine, to the posture and to the admin socket — no other
+    /// handle, no process-wide one. That they then see a `policy set` at
+    /// once is the admin pipeline's
+    /// `a_signed_policy_set_applies_at_once_to_the_engine_the_posture_and_the_executor`.
+    #[test]
+    fn the_start_shares_one_policy_handle() {
+        let sources = start_sources();
+        assert_eq!(
+            sources.matches("PolicyHandle::new(").count(),
+            1,
+            "one handle"
+        );
+        assert!(!sources.contains("PolicyHandle::default("));
+        assert!(!sources.contains("rule_policy::global("));
+        assert!(!sources.contains("install_global("));
+        let (_, src, head) = PHASES
+            .iter()
+            .find(|(call, _, _)| *call == "policy::load(")
+            .expect("the policy phase");
+        let policy = function(src, head);
+        assert!(policy.contains("rp::PolicyHandle::new(policy)"));
+        assert!(policy.contains(".with_policy(rule_policy.clone())"));
+        assert!(policy
+            .contains("        rule_policy,\n        ja3_entries,\n        engine,\n    }\n}"));
+        let posture = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/posture.rs"));
+        assert_eq!(
+            posture
+                .matches(".with_rule_policy(rule_policy.clone())")
+                .count(),
+            2,
+            "both machines (with and without the isolator)"
+        );
+        // `run`, without whitespace (rustfmt splits a call over lines): the
+        // policy phase's handle goes to the posture and the admin socket.
+        let run: String = function(
+            include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/mod.rs")),
+            "async fn run(",
+        )
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+        let call = |head: &str| {
+            let at = run
+                .find(head)
+                .unwrap_or_else(|| panic!("run: `{head}` not found"));
+            let rest = &run[at..];
+            rest[..rest.find(");").expect("the call's end")].to_string()
+        };
+        assert!(run.contains("rule_policy,ja3_entries,engine,}=policy::load("));
+        assert!(
+            call("=posture::machine(").contains("&rule_policy"),
+            "the posture gets the policy phase's handle"
+        );
+        assert!(
+            call("admin::start(").contains("AdminHandles{rule_policy"),
+            "the admin socket gets the policy phase's handle"
+        );
+    }
+
     /// Lab PR 231: the boot's heap is released once, after READY — after
     /// every attach (the BTF parses whose pages glibc kept) and only once.
     #[test]
@@ -843,7 +957,7 @@ mod tests {
             1
         );
         assert!(release > main.find("sd_notify::ready()").expect("READY"));
-        assert!(release > main.find("boot::manifest::sign(").expect("manifest"));
+        assert!(release > main.find("capability_manifest.sign(").expect("manifest"));
     }
 
     /// Lab PR 231: only free memory goes back: what is still allocated is

@@ -54,7 +54,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nn_model::Event;
@@ -124,8 +124,28 @@ struct State {
     rounds: u64,
 }
 
-static TRACKER: OnceLock<Arc<Mutex<State>>> = OnceLock::new();
 static GAPS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// The running probe (R11c, lab PR 264): what [`spawn`] gives the start,
+/// whose event loop offers it every event ([`Self::observe`]). It was a
+/// process-wide `TRACKER` the spawn set and a free `observe` read.
+#[derive(Clone)]
+pub struct TelemetryProbe {
+    tracker: Arc<Mutex<State>>,
+}
+
+impl TelemetryProbe {
+    /// Event tap: called for every event before the decision engine.
+    pub fn observe(&self, event: &Event) {
+        let mut st = self.tracker.lock();
+        let Some(round) = st.round.as_mut() else {
+            return;
+        };
+        if let Some(sensor) = matches(event, &round.nonce) {
+            round.seen[sensor as usize] = true;
+        }
+    }
+}
 
 /// Round nonce: [`NONCE_BYTES`] bytes from the OS random source, lowercase
 /// hex, 16 characters; `None` when the source fails (the round is skipped).
@@ -184,20 +204,6 @@ pub fn matches(event: &Event, nonce: &str) -> Option<Sensor> {
     }
 }
 
-/// Event tap: called for every event before the decision engine.
-pub fn observe(event: &Event) {
-    let Some(tracker) = TRACKER.get() else {
-        return;
-    };
-    let mut st = tracker.lock();
-    let Some(round) = st.round.as_mut() else {
-        return;
-    };
-    if let Some(sensor) = matches(event, &round.nonce) {
-        round.seen[sensor as usize] = true;
-    }
-}
-
 /// Telemetry gaps since boot (all sensors, all rounds).
 pub fn gaps_total() -> u64 {
     GAPS_TOTAL.load(Ordering::Relaxed)
@@ -225,20 +231,21 @@ pub fn interval_weakens(value: &str) -> bool {
         .is_ok_and(|secs| secs == 0 || secs > DEFAULT_INTERVAL_SECS)
 }
 
-/// Start the periodic probe (from `main`, once the audit log exists).
-pub fn spawn(audit_log: Option<Arc<Mutex<AuditLog>>>) {
+/// Start the periodic probe (the start's late binding, once the audit log
+/// exists); the running probe, for the event loop (`None`: disabled).
+pub fn spawn(audit_log: Option<Arc<Mutex<AuditLog>>>) -> Option<TelemetryProbe> {
     let Some(every) = interval_from_env() else {
         info!(env = INTERVAL_ENV, "telemetry probe disabled");
-        return;
+        return None;
     };
     if let Err(e) = std::fs::create_dir_all(PROBE_DIR) {
         warn!(error = %e, dir = PROBE_DIR, "telemetry probe: cannot create the probe directory — probe disabled");
-        return;
+        return None;
     }
     let tracker = Arc::new(Mutex::new(State::default()));
-    if TRACKER.set(tracker.clone()).is_err() {
-        return;
-    }
+    let probe = TelemetryProbe {
+        tracker: Arc::clone(&tracker),
+    };
     info!(
         every_secs = every.as_secs(),
         deadline_secs = DEADLINE_SECS,
@@ -253,6 +260,7 @@ pub fn spawn(audit_log: Option<Arc<Mutex<AuditLog>>>) {
             tokio::time::sleep(crate::self_integrity::jittered(every)).await;
         }
     });
+    Some(probe)
 }
 
 async fn run_round(tracker: &Arc<Mutex<State>>, audit_log: Option<&Arc<Mutex<AuditLog>>>) {

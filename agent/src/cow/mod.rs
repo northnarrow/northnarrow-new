@@ -41,7 +41,7 @@ pub mod trust;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -76,31 +76,49 @@ pub enum GuardState {
     Running(Arc<Runtime>),
 }
 
-static STATE: OnceLock<GuardState> = OnceLock::new();
-/// The agent runs detect-only: no restore runs on its own.
-static DETECT_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// The running guard, if any.
-pub fn global() -> Option<&'static Arc<Runtime>> {
-    match STATE.get() {
-        Some(GuardState::Running(rt)) => Some(rt),
-        _ => None,
-    }
+/// The guard of this boot (R11c, lab PR 264): what [`boot`] decided, the
+/// response mode and the ransomware signals it acts on. The start hands it
+/// to the event loop (the signals of the events and of the rules'
+/// responses), the COMBAT ladder's NEUTRALIZE, the admin socket (its status
+/// and the remediate verb) and the stop. They were process-wide statics
+/// (`STATE`, `DETECT_ONLY`, the signals' map) behind free functions.
+#[derive(Clone)]
+pub struct CowGuard {
+    state: GuardState,
+    /// The agent runs detect-only: no restore runs on its own.
+    detect_only: bool,
+    /// Processes a ransomware signal named, by pid.
+    signals: Arc<Mutex<HashMap<u32, Signal>>>,
 }
 
-/// The guard as `status --key` shows it (`None` before the boot decided).
-pub fn status() -> Option<CowGuardStatus> {
-    let off = |state: String| CowGuardStatus {
-        state,
-        flags_source: String::new(),
-        auto_restore: false,
-        scopes: Vec::new(),
-        counters: Vec::new(),
-    };
-    match STATE.get()? {
-        GuardState::Off => Some(off("off".into())),
-        GuardState::Failed(why) => Some(off(format!("failed: {why}"))),
-        GuardState::Running(rt) => Some(rt.status()),
+impl CowGuard {
+    /// What [`boot`] decided.
+    pub fn state(&self) -> &GuardState {
+        &self.state
+    }
+
+    /// The running guard, if any.
+    fn running(&self) -> Option<&Arc<Runtime>> {
+        match &self.state {
+            GuardState::Running(rt) => Some(rt),
+            _ => None,
+        }
+    }
+
+    /// The guard as `status --key` shows it.
+    pub fn status(&self) -> CowGuardStatus {
+        let off = |state: String| CowGuardStatus {
+            state,
+            flags_source: String::new(),
+            auto_restore: false,
+            scopes: Vec::new(),
+            counters: Vec::new(),
+        };
+        match &self.state {
+            GuardState::Off => off("off".into()),
+            GuardState::Failed(why) => off(format!("failed: {why}")),
+            GuardState::Running(rt) => rt.status(),
+        }
     }
 }
 
@@ -113,11 +131,12 @@ pub fn boot(
     audit: Option<Arc<parking_lot::Mutex<AuditLog>>>,
     pin_root: Option<PathBuf>,
     detect_only: bool,
-) -> GuardState {
-    DETECT_ONLY.store(detect_only, std::sync::atomic::Ordering::Relaxed);
-    let state = boot_inner(overlay, tracker, audit, pin_root);
-    let _ = STATE.set(state.clone());
-    state
+) -> CowGuard {
+    CowGuard {
+        state: boot_inner(overlay, tracker, audit, pin_root),
+        detect_only,
+        signals: Arc::default(),
+    }
 }
 
 fn boot_inner(
@@ -146,8 +165,7 @@ fn boot_inner(
         info!("copy on first write: cow-guard.local present, enabled = false — off");
         return GuardState::Off;
     }
-    protect::set_pin_root(pin_root);
-    let (store, problems) = Store::open(cfg);
+    let (store, problems) = Store::open(cfg, pin_root.clone());
     store.set_audit_log(audit);
     for p in &problems {
         warn!(problem = %p, "copy on first write: a journal could not be used");
@@ -162,7 +180,7 @@ fn boot_inner(
     let mut protected = 0;
     for (i, j) in store.journals.iter().enumerate() {
         let Some(j) = j else { continue };
-        match protect::protect_journal(&j.lock()) {
+        match protect::protect_journal(&j.lock(), pin_root.as_deref()) {
             Ok(n) => protected += n,
             Err(e) => {
                 let scope = store.cfg.scopes[i].journal.display().to_string();
@@ -227,93 +245,108 @@ fn boot_inner(
     }
 }
 
-/// Agent shutdown: close the group (the kernel allows whatever waits).
-pub fn shutdown() {
-    if let Some(rt) = global() {
-        rt.stop();
-    }
-}
-
 // ── ransomware verdicts ───────────────────────────────────────────────
 
 /// A ransomware signal: the process's start, when, which signal.
 type Signal = (u64, u64, &'static str);
 
-/// Processes a ransomware signal named, by pid.
-fn signals() -> &'static Mutex<HashMap<u32, Signal>> {
-    static S: OnceLock<Mutex<HashMap<u32, Signal>>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 const SIGNAL_TTL_MS: u64 = 3_600_000;
 
-fn flag(pid: u32, why: &'static str) {
-    if pid <= 1 {
-        return;
+impl CowGuard {
+    /// Agent shutdown: close the group (the kernel allows whatever waits).
+    pub fn shutdown(&self) {
+        if let Some(rt) = self.running() {
+            rt.stop();
+        }
     }
-    let start = proc_start_ticks(std::path::Path::new("/proc"), pid).unwrap_or(0);
-    let now = now_ms();
-    let mut s = signals().lock();
-    if s.len() >= 1024 {
-        s.retain(|_, (_, at, _)| now.saturating_sub(*at) < SIGNAL_TTL_MS);
-    }
-    s.insert(pid, (start, now, why));
-}
 
-fn flagged(p: ProcId) -> bool {
-    let now = now_ms();
-    signals().lock().get(&p.pid).is_some_and(|(start, at, _)| {
-        now.saturating_sub(*at) < SIGNAL_TTL_MS
-            && (p.start == 0 || *start == 0 || *start == p.start)
-    })
-}
-
-/// Every event the agent reads: a mass rewrite of existing files is a
-/// ransomware signal for its writer.
-pub fn observe_event(event: &Event) {
-    if global().is_none() {
-        return;
-    }
-    if let Event::MassWrite {
-        pid,
-        overwrites: true,
-        ..
-    } = event
-    {
-        flag(*pid, "mass_write_overwrites");
-    }
-}
-
-/// A rule verdict's response ran: the ransomware rule's kill neutralized
-/// its writer.
-pub fn after_rule_response(rule_id: &str, pid: u32, neutralized: bool) {
-    if global().is_none() {
-        return;
-    }
-    let Some(rule) = RANSOMWARE_RULES
-        .iter()
-        .copied()
-        .find(|r| rule_id.starts_with(r))
-    else {
-        return;
-    };
-    flag(pid, rule);
-    if neutralized {
+    fn flag(&self, pid: u32, why: &'static str) {
+        if pid <= 1 {
+            return;
+        }
         let start = proc_start_ticks(std::path::Path::new("/proc"), pid).unwrap_or(0);
-        on_neutralized(vec![ProcId { pid, start }], format!("{rule} kill"));
+        let now = now_ms();
+        let mut s = self.signals.lock();
+        if s.len() >= 1024 {
+            s.retain(|_, (_, at, _)| now.saturating_sub(*at) < SIGNAL_TTL_MS);
+        }
+        s.insert(pid, (start, now, why));
+    }
+
+    fn flagged(&self, p: ProcId) -> bool {
+        let now = now_ms();
+        self.signals
+            .lock()
+            .get(&p.pid)
+            .is_some_and(|(start, at, _)| {
+                now.saturating_sub(*at) < SIGNAL_TTL_MS
+                    && (p.start == 0 || *start == 0 || *start == p.start)
+            })
+    }
+
+    /// Every event the agent reads: a mass rewrite of existing files is a
+    /// ransomware signal for its writer.
+    pub fn observe_event(&self, event: &Event) {
+        if self.running().is_none() {
+            return;
+        }
+        if let Event::MassWrite {
+            pid,
+            overwrites: true,
+            ..
+        } = event
+        {
+            self.flag(*pid, "mass_write_overwrites");
+        }
+    }
+
+    /// A rule verdict's response ran: the ransomware rule's kill
+    /// neutralized its writer.
+    pub fn after_rule_response(&self, rule_id: &str, pid: u32, neutralized: bool) {
+        if self.running().is_none() {
+            return;
+        }
+        let Some(rule) = RANSOMWARE_RULES
+            .iter()
+            .copied()
+            .find(|r| rule_id.starts_with(r))
+        else {
+            return;
+        };
+        self.flag(pid, rule);
+        if neutralized {
+            let start = proc_start_ticks(std::path::Path::new("/proc"), pid).unwrap_or(0);
+            self.on_neutralized(vec![ProcId { pid, start }], format!("{rule} kill"));
+        }
+    }
+
+    /// The COMBAT ladder's NEUTRALIZE contained these offenders.
+    pub fn on_ladder_neutralized(&self, offenders: Vec<ProcId>) {
+        self.on_neutralized(offenders, "COMBAT NEUTRALIZE".into());
+    }
+
+    /// A response killed `offenders`. When a ransomware signal named one of
+    /// them (or a writer of their trees) and the journal holds copies of
+    /// their writes: restore them if `auto_restore`, else say how.
+    pub fn on_neutralized(&self, offenders: Vec<ProcId>, source: String) {
+        on_neutralized(self, offenders, source)
+    }
+
+    /// The signed admin verb's restore.
+    pub fn admin_restore(
+        &self,
+        pid: Option<u32>,
+        since_unix: Option<u64>,
+        dry_run: bool,
+        key_fp: String,
+    ) -> Result<RestoreReport, String> {
+        admin_restore(Some(self), pid, since_unix, dry_run, key_fp)
     }
 }
 
-/// The COMBAT ladder's NEUTRALIZE contained these offenders.
-pub fn on_ladder_neutralized(offenders: Vec<ProcId>) {
-    on_neutralized(offenders, "COMBAT NEUTRALIZE".into());
-}
-
-/// A response killed `offenders`. When a ransomware signal named one of
-/// them (or a writer of their trees) and the journal holds copies of
-/// their writes: restore them if `auto_restore`, else say how.
-pub fn on_neutralized(offenders: Vec<ProcId>, source: String) {
-    let Some(rt) = global() else {
+/// [`CowGuard::on_neutralized`].
+fn on_neutralized(guard: &CowGuard, offenders: Vec<ProcId>, source: String) {
+    let Some(rt) = guard.running() else {
         return;
     };
     let entries: Vec<ProcId> = {
@@ -326,12 +359,13 @@ pub fn on_neutralized(offenders: Vec<ProcId>, source: String) {
     if entries.is_empty() {
         return;
     }
-    let ransomware = offenders.iter().any(|o| flagged(*o)) || entries.iter().any(|w| flagged(*w));
+    let ransomware =
+        offenders.iter().any(|o| guard.flagged(*o)) || entries.iter().any(|w| guard.flagged(*w));
     if !ransomware {
         return;
     }
     let pids: Vec<u32> = offenders.iter().map(|o| o.pid).collect();
-    let detect_only = DETECT_ONLY.load(std::sync::atomic::Ordering::Relaxed);
+    let detect_only = guard.detect_only;
     if !rt.store.cfg.auto_restore || detect_only {
         warn!(
             offenders = ?pids,
@@ -415,15 +449,18 @@ fn log_report(r: &RestoreReport, source: &str) {
     );
 }
 
-/// The signed admin verb's restore.
+/// [`CowGuard::admin_restore`]; `guard`: `None` when the start gave the
+/// admin socket none (tests, the legacy serve entry points): the guard is
+/// off, as it said before a boot decided.
 pub fn admin_restore(
+    guard: Option<&CowGuard>,
     pid: Option<u32>,
     since_unix: Option<u64>,
     dry_run: bool,
     key_fp: String,
 ) -> Result<RestoreReport, String> {
-    let Some(rt) = global() else {
-        return Err(match STATE.get() {
+    let Some(rt) = guard.and_then(CowGuard::running) else {
+        return Err(match guard.map(CowGuard::state) {
             Some(GuardState::Failed(why)) => {
                 format!("the copy-on-first-write guard is not running: {why}")
             }
@@ -453,28 +490,45 @@ pub fn admin_restore(
 mod tests {
     use super::*;
 
+    fn guard(state: GuardState) -> CowGuard {
+        CowGuard {
+            state,
+            detect_only: false,
+            signals: Arc::default(),
+        }
+    }
+
     #[test]
     fn signals_match_by_pid_and_start() {
+        let g = guard(GuardState::Off);
         let me = std::process::id();
-        flag(me, "test");
+        g.flag(me, "test");
         let start = proc_start_ticks(std::path::Path::new("/proc"), me).unwrap();
-        assert!(flagged(ProcId { pid: me, start }));
-        assert!(flagged(ProcId { pid: me, start: 0 }));
-        assert!(!flagged(ProcId {
+        assert!(g.flagged(ProcId { pid: me, start }));
+        assert!(g.flagged(ProcId { pid: me, start: 0 }));
+        assert!(!g.flagged(ProcId {
             pid: me,
             start: start + 1
         }));
-        assert!(!flagged(ProcId {
+        assert!(!g.flagged(ProcId {
             pid: 4_000_001,
             start: 0
         }));
-        flag(1, "init is never flagged");
-        assert!(!flagged(ProcId { pid: 1, start: 0 }));
+        g.flag(1, "init is never flagged");
+        assert!(!g.flagged(ProcId { pid: 1, start: 0 }));
+        // R11c (lab PR 264): another guard's signals are its own.
+        assert!(!guard(GuardState::Off).flagged(ProcId { pid: me, start: 0 }));
     }
 
     #[test]
     fn without_a_guard_the_verb_says_so() {
-        let err = admin_restore(Some(1), None, true, "k".into()).unwrap_err();
-        assert!(err.contains("off") || err.contains("not running"), "{err}");
+        let err = guard(GuardState::Off)
+            .admin_restore(Some(1), None, true, "k".into())
+            .unwrap_err();
+        assert!(err.contains("off"), "{err}");
+        let err = guard(GuardState::Failed("no journal".into()))
+            .admin_restore(Some(1), None, true, "k".into())
+            .unwrap_err();
+        assert!(err.contains("not running: no journal"), "{err}");
     }
 }

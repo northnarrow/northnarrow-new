@@ -27,7 +27,7 @@ pub mod record;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::LazyLock;
 
 use anyhow::{anyhow, Context, Result};
 use aya::programs::{Lsm, TracePoint};
@@ -117,20 +117,10 @@ impl Default for Config {
     }
 }
 
-static CONFIG: OnceLock<Config> = OnceLock::new();
-static KERNEL: Mutex<Option<kernel::Kernel>> = Mutex::new(None);
 static STATE: Mutex<Option<String>> = Mutex::new(None);
 /// What runs partly: each a signed `subsystem_degraded` at start.
 static NOTES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static STOPPING: AtomicBool = AtomicBool::new(false);
-
-pub fn configure(cfg: Config) {
-    let _ = CONFIG.set(cfg);
-}
-
-pub fn config() -> Option<&'static Config> {
-    CONFIG.get()
-}
 
 fn set_state(s: impl Into<String>) {
     *STATE.lock() = Some(s.into());
@@ -198,12 +188,20 @@ fn attach_map_lsm(ebpf: &mut Ebpf) -> Result<()> {
 /// From the multiplexer, once the exec sensor's mode is known and the exec
 /// quarantine's configuration is written: attach the environment and
 /// mapping programs the policy needs, write the kernel configuration
-/// (always, `OFF` included, then frozen), take the maps. `execq_on`: the
-/// exec quarantine runs (it refreshes the guarded mount roots then).
-pub fn install(ebpf: &mut Ebpf, execq_on: bool) -> Result<()> {
-    let cfg = CONFIG.get().cloned().unwrap_or_default();
+/// (always, `OFF` included, then frozen), take the maps, returned for the
+/// controller ([`start`]; `None`: the policy does not run). `execq_on`: the
+/// exec quarantine runs (it refreshes the guarded mount roots then);
+/// `exec_on_lsm`: the exec sensor attached is the LSM one. R11c (lab PR
+/// 264): `cfg` and the maps are the start's (`exec_guards::AgentExecGuards`);
+/// they were process-wide statics (`configure`, `KERNEL`).
+pub fn install(
+    ebpf: &mut Ebpf,
+    cfg: &Config,
+    execq_on: bool,
+    exec_on_lsm: bool,
+) -> Result<Option<kernel::Kernel>> {
     let mut m = cfg.mode;
-    if m != Mode::Off && !crate::sensors::exe_identity::lsm_active() {
+    if m != Mode::Off && !exec_on_lsm {
         set_state(
             "degraded: the exec sensor is not on LSM bprm_check_security (tracepoint mode or \
              refused): no exec can be refused or judged",
@@ -242,9 +240,9 @@ pub fn install(ebpf: &mut Ebpf, execq_on: bool) -> Result<()> {
         if STATE.lock().is_none() {
             set_state(Mode::Off.as_str());
         }
-        return Ok(());
+        return Ok(None);
     }
-    *KERNEL.lock() = Some(kernel::take(ebpf, !execq_on)?);
+    let taken = kernel::take(ebpf, !execq_on)?;
     use common::btf_offsets::slot;
     if !offsets_resolved(&[
         slot::TASK_STRUCT_SIGNAL_OFFSET,
@@ -287,12 +285,12 @@ pub fn install(ebpf: &mut Ebpf, execq_on: bool) -> Result<()> {
         map = map_ok,
         "exec policy armed in the kernel (EXPERIMENTAL, lab PR 226)"
     );
-    Ok(())
+    Ok(Some(taken))
 }
 
-/// The policy cannot run: `degraded: <why>`.
+/// The policy cannot run: `degraded: <why>` (the caller keeps no kernel
+/// object of it).
 pub fn fail(why: String) {
-    *KERNEL.lock() = None;
     set_state(format!("degraded: {why}"));
 }
 
@@ -375,9 +373,14 @@ pub struct Handle {
 /// the kernel then judges with no slices (every caller `unknown`) and no
 /// image roles, and nothing is recorded; the reason is for the signed
 /// `subsystem_degraded`.
-pub fn start(recorder: Box<dyn record::Recorder>, execq_on: bool) -> Result<Handle, String> {
-    let cfg = CONFIG.get().cloned().unwrap_or_default();
-    let Some(k) = KERNEL.lock().take() else {
+pub fn start(
+    cfg: &Config,
+    kernel: Option<kernel::Kernel>,
+    recorder: Box<dyn record::Recorder>,
+    execq_on: bool,
+) -> Result<Handle, String> {
+    let cfg = cfg.clone();
+    let Some(k) = kernel else {
         return Err(match STATE.lock().clone() {
             Some(s) if s.starts_with("degraded") => s,
             _ => "the policy's kernel objects were not installed".to_string(),

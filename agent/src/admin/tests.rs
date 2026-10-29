@@ -420,6 +420,7 @@ async fn spawn_shutdown_server() -> (
             None,
             Arc::default(),
             Arc::default(),
+            Arc::default(),
         )
         .await;
     });
@@ -676,6 +677,7 @@ async fn shutdown_request_fires_in_process_shutdown_signal() {
             None,
             Arc::default(),
             Arc::default(),
+            Arc::default(),
         )
         .await;
     });
@@ -774,12 +776,14 @@ pub(super) fn fake_client() -> AuditClient {
 }
 
 /// A request's context with no subsystem wired: the posture, the
-/// isolator, the marker's path and the read verbs' files only.
+/// isolator, the marker's path, the read verbs' files and the start's
+/// handles (R11c, lab PR 264) only.
 pub(super) fn bare_context<'a>(
     posture: &'a PostureMachine,
     isolator: &'a NetworkIsolator,
     marker_path: &'a Path,
     read_paths: &'a AdminReadPaths,
+    handles: &'a AdminHandles,
 ) -> Wired<'a> {
     Wired {
         posture,
@@ -792,6 +796,7 @@ pub(super) fn bare_context<'a>(
         detection_state: None,
         response_state: None,
         read_paths,
+        handles,
     }
 }
 
@@ -2022,7 +2027,13 @@ fn status_reports_detect_only_and_combat_evidence() {
         &auth,
         Wired {
             response_state: state,
-            ..bare_context(&posture, &isolator, &marker, &AdminReadPaths::default())
+            ..bare_context(
+                &posture,
+                &isolator,
+                &marker,
+                &AdminReadPaths::default(),
+                &AdminHandles::default(),
+            )
         },
         &fake_client(),
         &mut Vec::new(),
@@ -2109,7 +2120,13 @@ fn the_unsigned_status_withholds_the_telemetry() {
         &auth,
         Wired {
             response_state: Some(&detect),
-            ..bare_context(&posture, &isolator, &marker, &AdminReadPaths::default())
+            ..bare_context(
+                &posture,
+                &isolator,
+                &marker,
+                &AdminReadPaths::default(),
+                &AdminHandles::default(),
+            )
         },
         &fake_client(),
         &mut fps,
@@ -2164,7 +2181,15 @@ fn the_signed_telemetry_status_needs_a_read_role() {
         let req = telemetry_req(&signing, &auth, agent_id);
         let msg = AdminMessage::TelemetryStatusRequest(req.clone());
         let mut fps = Vec::new();
-        let r = dispatch_telemetry_status(req, &auth, &posture, &isolator, Some(&state), &mut fps);
+        let r = dispatch_telemetry_status(
+            req,
+            &auth,
+            &posture,
+            &isolator,
+            Some(&state),
+            &AdminHandles::default(),
+            &mut fps,
+        );
         assert_eq!(r.result, expected, "{roles}");
         match expected {
             AdminResult::Success => {
@@ -2222,7 +2247,15 @@ fn the_signed_telemetry_status_refuses_another_operation() {
     let isolator = NetworkIsolator::new(rules_path()).unwrap();
     let posture = PostureMachine::new();
     let mut fps = Vec::new();
-    let r = dispatch_telemetry_status(req, &auth, &posture, &isolator, None, &mut fps);
+    let r = dispatch_telemetry_status(
+        req,
+        &auth,
+        &posture,
+        &isolator,
+        None,
+        &AdminHandles::default(),
+        &mut fps,
+    );
     assert_eq!(r.result, AdminResult::UnknownOperation);
     assert!(r.status.is_none());
 }
@@ -3172,6 +3205,7 @@ fn detection_state_with_max_id(max_id: u64) -> (DetectionAdminState, TempDir) {
         agent_key,
         detections_path: det_path,
         status_events_path: evt_path,
+        unverified: Default::default(),
     };
     (state, dir)
 }
@@ -3363,6 +3397,7 @@ fn the_detections_read_verifies_its_rows_on_a_degraded_boot_too() {
         agent_key,
         detections_path: det_path,
         status_events_path: dir.path().join("status_events.jsonl"),
+        unverified: Default::default(),
     };
     let read = |state: Option<&DetectionAdminState>| {
         let auth = ConnAuth::new(&auth);
@@ -3738,6 +3773,7 @@ fn spawn_conn_handler(
             None,
             &AdminReadPaths::default(),
             &StatusPolls::default(),
+            &AdminHandles::default(),
         )
         .await
     });
@@ -4882,6 +4918,7 @@ fn the_legacy_unlock_is_refused_and_audited() {
             &isolator,
             &dir.path().join("marker"),
             &AdminReadPaths::default(),
+            &AdminHandles::default(),
         ),
         &fake_client(),
         &mut fps,

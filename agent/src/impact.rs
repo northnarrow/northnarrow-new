@@ -6,11 +6,9 @@
 //! `rpm`, the host's view of a path and the production sampler of the
 //! host's files ([`entropy::FsSampler`], nn-linux's since R09a, lab PR 253,
 //! with the host: both named here by their crate). Here the tracker
-//! and the owners are aliases on that host, and the tracker `status`
-//! reports is published as before (the process-wide slot holds the agent's
-//! tracker: it is the agent's, cut verbatim from `impact`).
-
-use std::sync::Arc;
+//! and the owners are aliases on that host. R11c (lab PR 264): the tracker
+//! `status` reports is the one the start gives the admin socket (it was
+//! published in a process-wide slot).
 
 use nn_linux::chain_host_linux::LinuxHost;
 
@@ -30,19 +28,6 @@ pub mod trust {
     /// [`nn_core::impact::trust::ProgramOwners`] on the agent's host.
     pub type ProgramOwners =
         nn_core::impact::trust::ProgramOwners<nn_linux::chain_host_linux::LinuxHost>;
-}
-
-/// The agent's tracker, for `status` ([`publish`]).
-static PUBLISHED: std::sync::OnceLock<Arc<RansomTracker>> = std::sync::OnceLock::new();
-
-/// Make `tracker` the one `status` reports (`main.rs`, once).
-pub fn publish(tracker: &Arc<RansomTracker>) {
-    let _ = PUBLISHED.set(Arc::clone(tracker));
-}
-
-/// The published tracker's counters; `None` before [`publish`].
-pub fn published_counts() -> Option<RansomCounts> {
-    PUBLISHED.get().map(|t| t.counts())
 }
 
 /// Copy-delete on real files, through the production sampler (cut from

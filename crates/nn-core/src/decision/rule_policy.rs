@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
@@ -472,7 +472,12 @@ pub fn parse(text: &str) -> Result<RulePolicy, PolicyError> {
     Ok(p)
 }
 
-/// The active policy, shared by the engine and the admin socket.
+/// The active policy, shared by the engine, the posture and the admin
+/// socket. R11c (lab PR 264): the agent's start makes one
+/// (`boot::policy::load`, the boot policy in force) and hands a clone to
+/// each of them; `nn-admin policy set` installs the next one through the
+/// admin socket's clone, and the engine and the posture read it at their
+/// next event (it was a process-wide handle, `global()`).
 #[derive(Debug, Clone)]
 pub struct PolicyHandle(Arc<RwLock<Arc<RulePolicy>>>);
 
@@ -496,21 +501,6 @@ impl Default for PolicyHandle {
     fn default() -> Self {
         Self::new(RulePolicy::builtin())
     }
-}
-
-/// The agent's policy (production: `main.rs` installs the boot policy,
-/// `nn-admin policy set` the next).
-pub fn global() -> &'static PolicyHandle {
-    static G: OnceLock<PolicyHandle> = OnceLock::new();
-    G.get_or_init(PolicyHandle::default)
-}
-
-/// Put `p` in force for the agent: the [`global`] handle the production
-/// engine and posture read (lab PR 249: the posture reads its ransomware
-/// directive from it, `PostureMachine::with_rule_policy`; it used to be a
-/// process-wide flag this set beside the handle).
-pub fn install_global(p: RulePolicy) -> Arc<RulePolicy> {
-    global().install(p)
 }
 
 /// What the boot read made of the overlay.

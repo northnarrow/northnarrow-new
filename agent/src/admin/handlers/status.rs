@@ -6,7 +6,7 @@ use nn_proto::admin_protocol::{
 };
 
 use crate::admin::verify::{signed, Verified};
-use crate::admin::ResponseAdminState;
+use crate::admin::{AdminHandles, ResponseAdminState};
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::anti_tamper::network_isolate::{Family, NetworkIsolator};
 use crate::posture::PostureMachine;
@@ -17,13 +17,16 @@ fn telemetry_status(
     posture: &PostureMachine,
     isolator: &NetworkIsolator,
     response_state: Option<&ResponseAdminState>,
+    handles: &AdminHandles,
 ) -> StatusResponse {
     let evidence = response_state.map(|s| (s.combat_evidence)());
     let encrypted = crate::net::blind_spots::encrypted_flows();
-    let trust = crate::boot::trust::current();
+    // R11c (lab PR 264): the boot's results the start handed the socket
+    // (they were process-wide statics the start set).
+    let trust = crate::boot::trust::current(handles.trust_inputs.as_ref());
     let execq = crate::execq::snapshot();
-    let ransom = crate::impact::published_counts();
-    let defense = crate::impair::published_counts();
+    let ransom = handles.ransom_tracker.as_ref().map(|t| t.counts());
+    let defense = handles.defense_detector.as_ref().map(|d| d.counts());
     let execpol = crate::execpol::snapshot();
     StatusResponse {
         posture: posture.current_kind(),
@@ -43,7 +46,9 @@ fn telemetry_status(
         // External audit NET-019 / NET-012 / NET-009: `nn-admin net status`.
         netflow_rows_skipped_total: Some(crate::net::limiter::rows_skipped_total()),
         netflow_pending_evicted_total: Some(crate::net::flow_tracker::pending_evictions_total()),
-        net_inactive_rules: Some(crate::net::blind_spots::inactive_net_rules()),
+        net_inactive_rules: Some(crate::net::blind_spots::inactive_net_rules(
+            handles.ja3_entries,
+        )),
         // Lab PR 164: the kernel's connect→close socket map.
         flow_sock_pending: crate::sensors::flow_sock::snapshot().map(|o| o.pending),
         flow_sock_capacity: crate::sensors::flow_sock::snapshot().map(|o| o.capacity),
@@ -70,11 +75,11 @@ fn telemetry_status(
         trust_level: trust.as_ref().map(|t| t.level.as_u8()),
         trust_reasons: trust.map(|t| t.reasons),
         degradations: Some(crate::boot::degradation::snapshot()),
-        capability_manifest: crate::boot::manifest::current_json(),
+        capability_manifest: handles.capability_manifest.current_json(),
         // Lab PR 219: the exploit post-condition guard.
         exploit_guard: Some(crate::sensors::epg::status()),
         // Lab PR 222: the copy-on-first-write guard.
-        cow_guard: crate::cow::status(),
+        cow_guard: handles.cow_guard.as_ref().map(crate::cow::CowGuard::status),
         // Lab PR 223 (EXPERIMENTAL): the exec quarantine.
         execq_state: Some(execq.state),
         execq_held_total: Some(execq.held),
@@ -153,6 +158,7 @@ pub(in crate::admin) fn dispatch_telemetry_status(
     posture: &PostureMachine,
     isolator: &NetworkIsolator,
     response_state: Option<&ResponseAdminState>,
+    handles: &AdminHandles,
     fps_out: &mut Vec<String>,
 ) -> TelemetryStatusResponse {
     let refuse = |result| TelemetryStatusResponse {
@@ -163,7 +169,7 @@ pub(in crate::admin) fn dispatch_telemetry_status(
     // signer's roles are checked after it, any one of the two — the
     // pipeline's `Roles::AnyOf`, whose refusal names the signer.
     signed(&req, auth, fps_out, refuse, |v| {
-        signed_telemetry_status(v, posture, isolator, response_state)
+        signed_telemetry_status(v, posture, isolator, response_state, handles)
     })
 }
 
@@ -173,9 +179,10 @@ fn signed_telemetry_status(
     posture: &PostureMachine,
     isolator: &NetworkIsolator,
     response_state: Option<&ResponseAdminState>,
+    handles: &AdminHandles,
 ) -> TelemetryStatusResponse {
     TelemetryStatusResponse {
         result: AdminResult::Success,
-        status: Some(telemetry_status(posture, isolator, response_state)),
+        status: Some(telemetry_status(posture, isolator, response_state, handles)),
     }
 }

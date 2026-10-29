@@ -12,7 +12,7 @@ use northnarrow_agent::posture::PostureMachine;
 use northnarrow_agent::response::Executor;
 use tracing::{debug, error, info, warn};
 
-use super::{host_stopping, systemd_state, HOST_STOPPING};
+use super::{systemd_state, HostStopping};
 
 /// Categorise + log + evaluate + (maybe) execute.
 ///
@@ -39,12 +39,18 @@ pub(crate) async fn process_event(
     // this boot (e.g. signing key / store open failed at startup). All
     // record calls are off the hot path (bounded queue + writer task).
     detection_sink: Option<&northnarrow_agent::detection_store::DetectionSink>,
+    // R11c (lab PR 264): the run's handles the start gives the event loop
+    // (they were process-wide statics): the self-test's own denial, the
+    // host's stop, the copy-on-first-write guard.
+    expected_denial: &northnarrow_agent::boot::deny_selftest::ExpectedDenial,
+    host_stopping: &HostStopping,
+    cow_guard: &northnarrow_agent::cow::CowGuard,
     event: Event,
 ) {
     // Lab PR 218: the deny self-test's own refused signal is the boot's
     // measurement, not an attempt on the agent — taken before the posture
     // (it would raise COMBAT) and the rules; any other denial goes on.
-    if northnarrow_agent::boot::deny_selftest::take_expected_denial(&event) {
+    if expected_denial.take(&event) {
         return;
     }
     // Tappa 10.9 step 2: an exec event's path made absolute before any
@@ -83,7 +89,7 @@ pub(crate) async fn process_event(
                 "systemd is stopping the host — its signal to a protected process is refused \
                  until systemd-shutdown's final stage (expected, not an attempt)"
             );
-            host_stopping(ladder);
+            host_stopping.stand_down(ladder);
             return;
         }
         info!(
@@ -129,7 +135,7 @@ pub(crate) async fn process_event(
     // Review 72: borrowed under the buffer's read lock, not cloned (up to
     // 1,000 events, for every event, was most of the agent's CPU under an
     // exec burst). Nothing pushes to the buffer until this returns.
-    let host_stopping = HOST_STOPPING.load(std::sync::atomic::Ordering::SeqCst);
+    let host_stopping = host_stopping.is_stopping();
     if let Some((new_state, firing_trigger)) = (!host_stopping)
         .then(|| correlation.with_recent(|recent| posture.observe(&event, recent)))
         .flatten()
@@ -164,7 +170,7 @@ pub(crate) async fn process_event(
     }
     // Lab PR 222: a mass rewrite of existing files flags its writer for the
     // copy-on-first-write guard (a ransomware verdict's offender).
-    northnarrow_agent::cow::observe_event(&event);
+    cow_guard.observe_event(&event);
     // Lab PR 224: an open flow's rows (its connect, its snapshots, a
     // refused connect) are for the rules; the correlation buffer keeps its
     // `TcpConnect` and its closed row, as before.
@@ -665,7 +671,7 @@ pub(crate) async fn process_event(
                             | northnarrow_agent::response::ExecutionOutcome::AlreadyGone { .. }
                     )
             });
-            northnarrow_agent::cow::after_rule_response(m.rule_id, pid, neutralized);
+            cow_guard.after_rule_response(m.rule_id, pid, neutralized);
         }
         if let Admit::Record { suppressed_before } = admit {
             for (_, report) in &reports {

@@ -167,10 +167,13 @@ for one rule, more than 4,096 lines.
 `posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`: the ransomware
 trigger reaches COMBAT without corroboration (it never locks it, lab PR 225).
 Lab PR 249: the posture reads it from the policy handle it is given
-(`PostureMachine::with_rule_policy`; the agent's is the engine's,
-`rule_policy::global()`), as the engine reads its modes — `nn-admin policy
-set` reaches both at the next event. It was a process-wide flag that
-`install_global` set beside the handle.
+(`PostureMachine::with_rule_policy`; the agent's is the engine's), as the
+engine reads its modes — `nn-admin policy set` reaches both at the next
+event. It was a process-wide flag that `install_global` set beside the
+handle. R11c (lab PR 264): the handle is no longer process-wide either
+(`rule_policy::global()`): the start's policy phase makes it and hands it
+to the engine, the posture and the admin socket, whose `config overlay
+set` installs the next policy through it.
 
 ### 3.2 Built-in defaults
 

@@ -24,6 +24,14 @@ pub(crate) struct Policy {
         Arc<parking_lot::Mutex<northnarrow_agent::decision::correlation::CorrelationStore>>,
     pub(crate) ransom_tracker: Arc<northnarrow_agent::impact::RansomTracker>,
     pub(crate) defense_detector: Arc<northnarrow_agent::impair::DefenseDetector>,
+    /// R11c (lab PR 264): the signed per-rule response policy in force —
+    /// the handle the engine reads, and the one the posture and the admin
+    /// socket get (`nn-admin policy set` installs the next policy through
+    /// it). It was a process-wide handle the start set.
+    pub(crate) rule_policy: northnarrow_agent::decision::rule_policy::PolicyHandle,
+    /// The JA3 list's size, for `net status`'s inactive rules (R11c, lab
+    /// PR 264: it was a process-wide value this phase noted).
+    pub(crate) ja3_entries: usize,
     pub(crate) engine: RuleEngine,
 }
 
@@ -150,8 +158,10 @@ pub(crate) fn load(
     );
     // External audit NET-009 (BUG-025): no sensor produces TLS
     // fingerprints, so a JA3 list with entries protects nothing. Said at
-    // boot, and in the signed chain once the audit log is open (below).
-    northnarrow_agent::net::blocklist::note_ja3_entries(ja3_blocklist.len());
+    // boot, and in the signed chain once the audit log is open (below);
+    // the list's size goes to the admin socket's `net status` (R11c, lab PR
+    // 264: in `Policy`, no longer a process-wide note).
+    let ja3_entries = ja3_blocklist.len();
     let ja3_gap = northnarrow_agent::net::blocklist::ja3_coverage_gap(
         ja3_blocklist.len(),
         northnarrow_agent::net::blocklist::TLS_FINGERPRINT_PRODUCER,
@@ -322,8 +332,9 @@ pub(crate) fn load(
     // Lab PR 236: the signed per-rule response policy, read once through the
     // overlay gate (absent or refused: the built-in defaults — every held
     // kill held). A signed file that does not parse leaves the defaults in
-    // force, a signed degradation.
-    {
+    // force, a signed degradation. R11c (lab PR 264): in force in the handle
+    // made here, which the engine, the posture and the admin socket share.
+    let rule_policy = {
         use northnarrow_agent::config::overlay_auth::Verified;
         use northnarrow_agent::decision::rule_policy as rp;
         let boot = match overlay_gate.verified(OverlayKind::RulePolicy, &cli.rule_policy_local) {
@@ -353,8 +364,8 @@ pub(crate) fn load(
         } else {
             info!("per-rule response policy: built-in defaults (every held kill held)");
         }
-        rp::install_global(policy);
-    }
+        rp::PolicyHandle::new(policy)
+    };
     let engine = RuleEngine::with_default_rules_and_net(
         Arc::clone(&netflow_blocklist),
         Arc::clone(&ja3_blocklist),
@@ -384,7 +395,7 @@ pub(crate) fn load(
         Arc::clone(&ransom_tracker),
         Arc::clone(&defense_detector),
     )
-    .with_policy(northnarrow_agent::decision::rule_policy::global().clone());
+    .with_policy(rule_policy.clone());
     // External audit PROC-015 / PROC-014: a demo build runs R901..R904
     // ahead of the production engine (operator state included), and
     // enforces only under the demo-rules gate below.
@@ -405,6 +416,8 @@ pub(crate) fn load(
         chain_store,
         ransom_tracker,
         defense_detector,
+        rule_policy,
+        ja3_entries,
         engine,
     }
 }
