@@ -1480,6 +1480,12 @@ impl GuardFixture {
             .try_clone()
             .map_err(|e| format!("clone {name}.log: {e}"))?;
         let state = AgentState::named(d, name);
+        // Lab PR 265 (review #466 F4-bis): an agent whose key is absent
+        // where the install's id is on record refuses its start (the key was
+        // removed or hidden) — and the runs of one directory share the id.
+        // Each run's key is made first, as a first install's start would.
+        northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&state.signing_key())
+            .map_err(|e| format!("the {name} agent's key: {e:#}"))?;
         let mut env = vec![("NO_COLOR", "1")];
         if enforce {
             env.push((

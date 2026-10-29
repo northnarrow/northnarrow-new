@@ -559,6 +559,129 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   programs and 22 links left pinned); `upgrade-check` from `main` and back
   OK; the boots the same 204 lines but the key's line and the preflight's
   step list, the same signed rows and capability manifest.
+- The agent's signing key made to look absent refuses the start where it
+  re-keyed the install, for every way the review of #468 found while the
+  previous agent's pins are there; after a reboot, a persistent view that
+  hides both trees still looks like a first install (lab PR 265, the
+  independent re-review of #466, F4-bis;
+  `docs/operator/BOOT_INTEGRITY.md` §1.1,
+  `docs/operator/INSTALL_UPGRADE_UNINSTALL.md` §3.10). Since review #466 F4
+  a key that is there but cannot be loaded refuses the start; an absent key
+  was minted as at a first boot, and root could make it look absent without
+  the unlink the deny hooks refuse: a bind mount over `/etc/northnarrow` on
+  the host (no deny hook covers `mount(2)`), or a runtime drop-in
+  (`TemporaryFileSystem=`, `BindPaths=`) and a `cgroup.kill` (tamper case
+  C20). The watchdog's respawn then minted a new key, published its public
+  half, signed new chains and appended to the old ones under it, with one
+  INFO line. Two checks now run first in the preflight, before the start
+  registers, bootstraps a file or reads its identity, each a step the
+  integrity proof requires (nn-linux `boot::checks::agent_mounts`,
+  `signing_identity`; `boot::continuity`): **mounts** — in the agent's own
+  `/proc/self/mountinfo`, every mount at or under `/etc/northnarrow`,
+  `/var/lib/northnarrow` and the directories the command line puts the
+  key, the identity, `admin.pub`, the manifest, the head anchor and the
+  chains in must be a bind of a directory onto itself (the same filesystem
+  as the mount under it, the directory that is there: what the unit's
+  `ReadWritePaths=` makes, on ext4, on a btrfs subvolume, with a separate
+  `/var`); another directory or file bound there, another filesystem, or a
+  mount whose underlying one is not in the table refuses (`agent_mounts`),
+  naming what is mounted where; a mount above those directories is not
+  judged (a separate `/var` is a normal layout); **identity** — a key whose
+  name holds nothing, where its public half, the install's id or a signed
+  first row of the audit log or another chain is found, refuses
+  (`signing_identity`) and nothing is minted; only a start with none of it
+  (a first install, as far as those paths tell) mints the key, and the
+  key's loader never mints one beside an existing public half. Both refusals are unsigned (nothing can
+  sign them: the key is the one hidden or absent), exit 78, the
+  registration withdrawn, as review #466 F4's (`boot::refusal::refuse_unsigned`,
+  the start's one exit). No override: a variable a drop-in can set would
+  come with the drop-in that lays the mount. The unit's runtime drop-in
+  directory `/run/systemd/system/northnarrow-agent.service.d` is made
+  (empty) before every start (`ExecStartPre=+/bin/mkdir -p`) and registered
+  NOCREATE like the persistent one: a drop-in there (`systemctl edit
+  --runtime`) needs a signed trusted-installer window; `uninstall.sh`
+  removes it. Re-keying on purpose is retiring the identity: archive the
+  chains with `agent.sig.pub`, `uninstall.sh --purge --grant-key`, install
+  again. Tests: the mount rule on parsed tables (the unit's binds, a
+  separate `/var`, a btrfs subvolume, an empty directory bound over the
+  configuration directory, a tmpfs, a copy over the state directory, a file
+  bound over the key, a mount inside, an unknown parent, an ancestor not
+  judged, escaped paths), the real table in a user and mount namespace of
+  its own (a bind onto itself passes; an empty directory, a tmpfs, a file
+  bound over the key refuse), the evidence one by one (an empty, broken,
+  linked or FIFO chain is none), the checks recording their steps only when
+  they pass, the loader's refusal to mint, the start's order (both checks
+  before the registration, the first key load, the identity and every other
+  check; one exit); privileged e2e: the key absent beside an earlier
+  identity (exit 78, unsigned, no key minted, the identity's bytes kept), an
+  empty directory bound over the state directory in a mount namespace of
+  the agent's own (`InstalledAgent::command_with_binds`; refused, nothing
+  written). The guard fixture's runs of one directory share the install's
+  id: each run's key is made before its first start. On the lab guest
+  (Ubuntu 22.04, 5.15), `main` first: an empty directory bound over
+  `/etc/northnarrow` (and a copy over `/var/lib/northnarrow`) on the host,
+  then `cgroup.kill`: the watchdog's respawn minted a key
+  (`bootstrapped fresh agent signing key`, INFO), published a new public
+  half, began a new audit chain and appended to the copy's chains, and
+  reached READY; a runtime prefix drop-in `TemporaryFileSystem=` did the
+  same in a tmpfs; a drop-in in the agent's runtime drop-in directory was
+  made at will. On the lot's code: both refused (`agent_mounts`, exit 78,
+  unsigned, nothing written in the empty directory or the copy); another
+  key bound over the key refused, not loaded; the key moved aside in a
+  window refused (`signing_identity`, the evidence named, no key minted);
+  the runtime drop-in denied outside a window; the identity, the public
+  half and the audit chain unchanged throughout. `test-ignored` 77 suites,
+  94 passed (the two new e2e on the real kernel); `tamper-check` the same
+  75 outcomes and verdicts as `main` (C30: one more protected inode, the
+  runtime drop-in directory); `upgrade-check` from `main` and back OK.
+  After the independent review of the PR (#468, "merge after X"): **one
+  `mountinfo` reader** (nn-linux `mountinfo`) for the start and the
+  self-integrity watcher — the table read as bytes, split on the ASCII
+  space only, every `\ooo` escape a byte, the paths `OsString`s, the
+  kernel's line shape checked: a split on every Unicode space shifted the
+  fields of a path holding U+00A0, so a bind over `/etc/northnarrow` from
+  such a directory went unseen (R1), and a byte that is not UTF-8 in any
+  mount — an unprivileged FUSE mount can make one — left the table
+  unreadable and the agent refused to start (R3); a line not in the
+  kernel's shape refuses only when it may concern the agent's
+  directories; the watcher's sandbox rule is the start's self-bind rule
+  (it was a string suffix). **The kernel's proof** (R2): the previous
+  agent's pins outlive a `cgroup.kill`, and its pinned `PROTECTED_INODES`
+  holds what it protected; with pins there, `/etc/northnarrow` and
+  `/var/lib/northnarrow` as the start sees them must be those inodes (a
+  copy bound over `/etc` or `/var/lib`, a rename above them, another root
+  refuse: `agent_mounts`), and a start that runs the binary the previous
+  agent protected is its restart — its key in a directory that agent
+  protected, and there (a drop-in redefining `ExecStart=` with every
+  identity path in an empty directory refuses: `signing_identity`); one
+  bpffs alone at `/sys/fs/bpf`, nothing over the pin root. The tests'
+  agents run copies of the binary and keep their files elsewhere: judged by
+  the evidence alone. **The evidence** (R8): any lookup that is not "not
+  found" counts, and so do the chains' manifests and sealed archives and a
+  written head anchor. **The re-key procedure** (R5,
+  `INSTALL_UPGRADE_UNINSTALL.md` §3.10): the journal and the fallback
+  chains archived first (`--purge` deletes the only record of the unsigned
+  refusals), and the way for an agent that refuses to start (disable the
+  units, archive, reboot, `uninstall.sh --purge`, install). What stays open
+  is listed in `BOOT_INTEGRITY.md` §1.1: a reboot with a persistent
+  mount, drop-in or generator that swaps both trees or moves every
+  identity path; a copy of the binary started by a drop-in; the window
+  between the check and the key's load (R4). On the lab guest (Ubuntu 22.04), against `main` 8788e0d0: on `main`
+  copies of `/etc` and `/var/lib` (an empty `northnarrow` in each) bound
+  over them, and a `system.control` drop-in redefining `ExecStart=` with
+  every identity path in an empty directory, each followed by a
+  `cgroup.kill`, re-keyed the install; on the lot's code both refuse
+  (`agent_mounts`: not the inodes the previous agent protected;
+  `signing_identity`: a restart of the protected binary, its key elsewhere
+  and absent), and so does a bpffs stacked on `/sys/fs/bpf`; the pins
+  survive `cgroup.kill`, and a plain start and the watchdog's respawn with
+  them there reach READY; `test-ignored` 78 suites, 94 passed; `tamper-check`
+  the same 75 outcomes and verdicts as `main` 8788e0d0; `upgrade-check`
+  from `main` and back OK; §3.10's two branches run as written (a signed
+  uninstall of a running agent; for a refusing one the signed uninstall
+  fails, then disable, archive, reboot, `uninstall.sh --purge` without a
+  window, a fresh install): new keys, the archives verify with the old
+  public halves, the archived journal holds the refusals.
 - `nn-admin fim baseline` was answered `Success`, and its signed audit row
   read "success", when no baseline would be recorded (lab PR 263, found
   by R11d's table of the admin socket's verification copies): without

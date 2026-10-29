@@ -39,7 +39,13 @@
 //! leaves no protected pid behind for a recycled pid to inherit, and the
 //! process exits 78 (`EX_CONFIG`: the unit lands `failed`).
 //!
-//! Every gate before the load refuses through [`Context::refuse`] — the
+//! Lab PR 265 (review #466 F4-bis): the two gates nothing can sign — the
+//! agent's directories mounted over (`agent_mounts`), its key absent where
+//! an earlier identity is on record (`signing_identity`) — refuse through
+//! [`refuse_unsigned`], first thing in the preflight: the journal holds
+//! them, the same withdrawal and exit follow.
+//!
+//! Every other gate before the load refuses through [`Context::refuse`] — the
 //! eBPF object, the state directory, the BTF offsets (the preflight's three,
 //! found before the identity is read, refuse at the start of the integrity
 //! phase), the demo rules, the capabilities, the install manifest, the
@@ -139,7 +145,7 @@ impl Context<'_> {
     /// registration in the pinned `PROTECTED_PIDS`, exit [`EX_CONFIG`]
     /// ([`Self::conclude`]). The gate has logged what it found.
     pub(crate) fn refuse(&self, audit: Option<&mut AuditLog>, refusal: Refusal) -> ! {
-        std::process::exit(self.conclude(audit, refusal, withdraw_registration))
+        exit_refused(self.conclude(audit, refusal, withdraw_registration))
     }
 
     /// What [`Self::refuse`] does before it exits (review #466 F7: the tail
@@ -153,35 +159,67 @@ impl Context<'_> {
         refusal: Refusal,
         withdraw: impl FnOnce(&Path),
     ) -> i32 {
-        let gate = refusal.gate;
-        match sign(self, audit, &refusal) {
-            Signed::AuditLog { entry_hash } => {
-                info!(entry_hash = %entry_hash, gate, "refused boot recorded in the audit chain")
-            }
-            Signed::Fallback {
-                path,
-                entry_hash,
-                audit_log,
-            } => error!(
-                path = %path.display(),
-                entry_hash = %entry_hash,
-                gate,
-                audit_log = %audit_log,
-                "refused boot recorded in the fallback chain: the audit log cannot take it \
-                 (nn-admin audit verify --from <path>)"
-            ),
-            Signed::Unsigned(why) => error!(
-                gate,
-                why = %why,
-                "could not record the refused boot in a signed chain — the journal holds it alone"
-            ),
-        }
-        withdraw(Path::new(
-            northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT,
-        ));
-        error!(gate, exit = EX_CONFIG, "start refused");
-        EX_CONFIG
+        let signed = sign(self, audit, &refusal);
+        finish(refusal.gate, signed, withdraw)
     }
+}
+
+/// Lab PR 265 (review #466 F4-bis): refuse a start that nothing can sign —
+/// the agent's own directories mounted over (a chain opened now would be
+/// in the view the gate refuses), or its key absent where an earlier
+/// identity is on record (signing would mean minting the key the gate
+/// refuses to mint). The gate has logged what it found; the journal holds
+/// the refusal (`why`: why it is not signed), the start's registration in
+/// the pinned `PROTECTED_PIDS` is withdrawn — the preflight refuses these
+/// before the start registers, so there is none to withdraw then, as
+/// [`withdraw_registration`] says —, and the process exits [`EX_CONFIG`],
+/// as every refusal ([`Context::refuse`]).
+pub(crate) fn refuse_unsigned(refusal: Refusal, why: &str) -> ! {
+    exit_refused(conclude_unsigned(refusal, why, withdraw_registration))
+}
+
+/// What [`refuse_unsigned`] does before it exits (the tail a test can run):
+/// the journal's lines, `withdraw`, [`EX_CONFIG`].
+pub(crate) fn conclude_unsigned(refusal: Refusal, why: &str, withdraw: impl FnOnce(&Path)) -> i32 {
+    finish(refusal.gate, Signed::Unsigned(why.to_string()), withdraw)
+}
+
+/// The one exit of a refused start (review #466 F7).
+fn exit_refused(status: i32) -> ! {
+    std::process::exit(status)
+}
+
+/// The tail of every refusal: where it was signed, said in the journal; the
+/// registration withdrawn — always, signed or not —; the status to exit
+/// with, [`EX_CONFIG`].
+fn finish(gate: &'static str, signed: Signed, withdraw: impl FnOnce(&Path)) -> i32 {
+    match signed {
+        Signed::AuditLog { entry_hash } => {
+            info!(entry_hash = %entry_hash, gate, "refused boot recorded in the audit chain")
+        }
+        Signed::Fallback {
+            path,
+            entry_hash,
+            audit_log,
+        } => error!(
+            path = %path.display(),
+            entry_hash = %entry_hash,
+            gate,
+            audit_log = %audit_log,
+            "refused boot recorded in the fallback chain: the audit log cannot take it \
+             (nn-admin audit verify --from <path>)"
+        ),
+        Signed::Unsigned(why) => error!(
+            gate,
+            why = %why,
+            "could not record the refused boot in a signed chain — the journal holds it alone"
+        ),
+    }
+    withdraw(Path::new(
+        northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT,
+    ));
+    error!(gate, exit = EX_CONFIG, "start refused");
+    EX_CONFIG
 }
 
 /// Where a refusal was signed.
@@ -1690,6 +1728,42 @@ mod tests {
             78
         );
         assert_eq!(withdrawn, 1);
+    }
+
+    /// Lab PR 265 (review #466 F4-bis): a refusal nothing can sign — the
+    /// agent's directories mounted over, its key absent beside an earlier
+    /// identity — writes nothing (no chain, no fallback, no key), withdraws
+    /// the registration under the pinned root once and exits 78, as every
+    /// refusal.
+    #[test]
+    fn an_unsigned_refusal_writes_nothing_withdraws_and_exits_78() {
+        let f = Fixture::new();
+        let before: Vec<_> = std::fs::read_dir(f.dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        for gate in ["agent_mounts", "signing_identity"] {
+            let mut withdrawn = Vec::new();
+            let code = conclude_unsigned(Refusal::new(gate, "x"), "nothing can sign it", |root| {
+                withdrawn.push(root.to_path_buf());
+            });
+            assert_eq!(code, EX_CONFIG);
+            assert_eq!(
+                withdrawn,
+                vec![PathBuf::from(
+                    northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT
+                )],
+                "{gate}"
+            );
+        }
+        let after: Vec<_> = std::fs::read_dir(f.dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(before, after, "an unsigned refusal wrote a file");
+        assert!(f.files().is_empty(), "a fallback chain");
     }
 
     /// No pinned map: nothing to withdraw, nothing touched.

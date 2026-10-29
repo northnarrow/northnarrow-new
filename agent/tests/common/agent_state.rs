@@ -252,7 +252,10 @@ impl AgentState {
 
     /// One of several agents of the same directory: its own files are
     /// `<name>.<file>`; the [`StateFlag::shared`] ones (the id, the
-    /// administrators' keys) are the directory's, one install.
+    /// administrators' keys) are the directory's, one install. Lab PR 265:
+    /// an agent whose key is absent where the install's id is on record
+    /// refuses its start (`boot::checks::signing_identity`), so a test makes
+    /// each agent's key before its first start once the id exists.
     pub fn named(dir: &Path, name: &str) -> Self {
         Self {
             dir: dir.to_path_buf(),
@@ -517,6 +520,63 @@ impl InstalledAgent {
         };
         cmd.args(state.args());
         cmd
+    }
+
+    /// Lab PR 265 (review #466 F4-bis): [`InstalledAgent::command`] (through
+    /// the real sudo, the variables `env`) run in a mount namespace of its
+    /// own (`unshare --mount --propagation private`), in which each
+    /// `(source, target)` of `binds` is bind-mounted before the agent
+    /// starts: what a mount laid over the agent's directories shows the
+    /// agent, without touching any mount of the host. Both ends of every
+    /// bind are inside the test's directory, `state`'s or the one above it
+    /// (a temporary directory of the test's own): panics otherwise, so no
+    /// test binds over a host path.
+    pub fn command_with_binds(
+        &self,
+        state: &AgentState,
+        env: &[(&str, &str)],
+        binds: &[(&Path, &Path)],
+    ) -> Command {
+        let scope = state.dir().parent().unwrap_or(state.dir());
+        assert!(
+            scope != Path::new("/") && scope.parent().is_some(),
+            "{}: not a test's directory",
+            scope.display()
+        );
+        for (src, dst) in binds {
+            for p in [src, dst] {
+                assert!(
+                    p.is_absolute() && p.starts_with(scope) && p != &scope,
+                    "{}: a bind end outside the test's directory {}",
+                    p.display(),
+                    scope.display()
+                );
+            }
+        }
+        let inner = self.command(state, Launch::Direct, env);
+        let mut c = Command::new(SUDO);
+        c.args(["unshare", "--mount", "--propagation", "private", "--"]);
+        c.args([
+            "sh",
+            "-c",
+            "while [ \"$1\" != -- ]; do mount --bind \"$1\" \"$2\" || exit 97; shift 2; done; \
+             shift; exec \"$@\"",
+            "sh",
+        ]);
+        for (src, dst) in binds {
+            c.arg(src).arg(dst);
+        }
+        c.args(["--", "env"]);
+        for (k, v) in inner.get_envs() {
+            if let Some(v) = v {
+                let mut kv = k.to_os_string();
+                kv.push("=");
+                kv.push(v);
+                c.arg(kv);
+            }
+        }
+        c.arg(inner.get_program()).args(inner.get_args());
+        c
     }
 }
 

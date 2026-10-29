@@ -3,7 +3,10 @@
 Lab PR 218 (external review G-09, G-11, G-12, AR-09, P0 C-13, P0 C-14;
 capability program C01 and C23); lab PR 262 (Wave 4 restructure, R11b:
 every integrity check before the load and the pin, enforced by the types;
-every refused start signed, section 7). What the agent checks before it
+every refused start signed, section 7); lab PR 265 (the independent review
+of #466, F4-bis: the start is the agent that ran before — its directories
+not mounted over, its signing key not minted again where an identity was,
+section 1.1). What the agent checks before it
 touches the kernel, how it proves that its deny hooks run, how it records
 what it runs without, and how it says, signed, how far its protection is
 measured. Code: `agent/src/boot/` (`mod.rs`, the phases, `refusal.rs`,
@@ -21,7 +24,8 @@ maps are made there), every pin and every attach take an
 `IntegrityVerified` (lab PR 262; lab PR 218's `AttachPermit`), and only
 `BootSequence::verify_integrity`, the move from preflight to attach, hands
 one out, once every preflight check has passed. The steps it requires —
-the eBPF object, the state directory, the BTF offsets, the capabilities,
+the agent's directories' mounts and its signing identity (lab PR 265), the
+eBPF object, the state directory, the BTF offsets, the capabilities,
 the install manifest, the audit log, the BPF LSM, the deny hooks' pin root
 and the kernel's BTF — are recorded only by the checks themselves
 (`boot::checks`, each after it ran against the host and passed;
@@ -46,7 +50,7 @@ type it can be forged by `unsafe` code — the guarantee is safe Rust's.
 
 | Phase | What runs | Required before the next phase |
 |---|---|---|
-| 1. preflight | the embedded eBPF object; the state directory; the BTF offsets; the chains against their heads; the identity; the demo rules' gate; the capabilities (`caps::boot_gate`); the install manifest; the audit log's writability, the agent's key and the chain, opened; the host hardening table; the BPF LSM gate (section 2); the deny hooks' pin root and the kernel's BTF | eBPF object, state directory, BTF offsets, capabilities, install manifest, audit log, BPF LSM, pin root, vmlinux BTF |
+| 1. preflight | the agent's own directories not mounted over, its signing key there or no earlier identity on record (section 1.1); the embedded eBPF object; the state directory; the BTF offsets; the chains against their heads; the identity; the demo rules' gate; the capabilities (`caps::boot_gate`); the install manifest; the audit log's writability, the agent's key and the chain, opened; the host hardening table; the BPF LSM gate (section 2); the deny hooks' pin root and the kernel's BTF | agent mounts, signing identity, eBPF object, state directory, BTF offsets, capabilities, install manifest, audit log, BPF LSM, pin root, vmlinux BTF |
 | 2. attach | the eBPF object loads (and pins its maps); the sensors; the deny hooks (`anti_tamper::attach`) | sensors, deny hooks |
 | 3. self-test | one deny hook exercised against the agent (section 3) | self-test |
 | 4. attest | the signed audit log, opened in the preflight, takes `agent_boot`; every degradation found so far is signed (section 4) | `agent_boot`, boot degradations |
@@ -61,7 +65,8 @@ withdrawn; the refusal is signed (section 7). It creates no state file
 but what its signature needs (review #466 F8): when the eBPF object, the
 state directory or the BTF offsets refuse, the state files are not
 bootstrapped; the agent's key and identity are made when they are
-missing, and the chain that takes the refusal. The capability,
+missing — only when nothing says the install had them (section 1.1) —, and
+the chain that takes the refusal. The capability,
 install-manifest and audit writability checks used to run after the eBPF
 programs were loaded, attached and pinned (until lab PR 218), and so did
 the audit chain's open (until lab PR 262) and the deny hooks' pin root
@@ -69,6 +74,8 @@ and BTF (until review #466 F6).
 
 | Check | Before the load (L) and the first pin | Refuses with |
 |---|---|---|
+| no mount at or under the agent's own directories but a bind of a directory onto itself; one bpffs alone at `/sys/fs/bpf`; with the previous agent's pins, the directories it protected (section 1.1) | yes, first: before anything is read or written | `agent_mounts` (unsigned) |
+| with the previous agent's pins, a restart of the binary it protected keeps its key; the signing key there, or no earlier identity on record — its public half, the install's id, a written head anchor, a signed row of a chain (section 1.1) | yes, first | `signing_identity` (unsigned) |
 | the embedded eBPF object (real, its hash) | yes | `ebpf_object` |
 | the state directory not a link | yes | `state_dir` |
 | the BTF offsets the programs read (the running kernel's BTF; arming the `BTF_OFFSETS` map needs the loaded object: after L, before any attach) | yes | `btf_offsets` |
@@ -84,10 +91,14 @@ and BTF (until review #466 F6).
 | the deny self-test | after the attach (it exercises an attached hook) | `deny_self_test` |
 | the boot's own `agent_boot` row (a full disk is found by the write) | after the attach | `audit_log` |
 
-The preflight's first three run before the identity is read: the first
-that refuses is kept and signed at the start of the integrity checks,
-still before the load (on a linked state directory, nothing under it is
-read or created first).
+The two continuity checks (section 1.1) run first and refuse at once:
+before the start registers in the previous agent's `PROTECTED_PIDS`,
+before any state file is bootstrapped and before the identity is read —
+nothing can sign them (the key is the one hidden or absent), so the
+journal holds the refusal. The preflight's next three run before the
+identity is read: the first that refuses is kept and signed at the start
+of the integrity checks, still before the load (on a linked state
+directory, nothing under it is read or created first).
 
 The audit log's preflight opens it for append without writing (or, when
 the file does not exist yet, checks that its directory can take it): a
@@ -108,8 +119,142 @@ but a regular file, unreadable — or an absent one that cannot be minted
 refuses the start the same way, unless `NN_AUDIT_ALLOW_UNWRITABLE=1`
 (review #466 F4: it started unaudited, with one WARN, until then): no row
 can be signed without it, so the journal holds that refusal alone
-(section 7). An absent key is minted, as at a first boot.
+(section 7). An absent key is minted only at a first install: where an
+earlier identity is on record the start was refused before (section 1.1).
 
+### 1.1 The start's continuity (lab PR 265)
+
+Since review #466 F4 a key that is there but cannot be loaded refuses the
+start. An absent key was minted, as at a first boot — and root can make the
+key look absent without unlinking it, which the deny hooks refuse: a bind
+mount over `/etc/northnarrow` on the host (no deny hook covers `mount(2)`),
+or a runtime drop-in (`BindPaths=`, `TemporaryFileSystem=` — with
+`ReadWritePaths=` reset, or systemd keeps the unit's bind of the same path)
+and a `cgroup.kill` of the agent's cgroup (allowed: tamper case C20). The
+watchdog's respawn then minted a new key, published its public half over
+the old one in the view it saw, and signed every chain under it from then
+on: the signing identity reset, with one INFO line (`bootstrapped fresh
+agent signing key`). Two checks now run first in the preflight, both
+recorded steps the integrity proof requires. They read two kinds of proof:
+the agent's own mount table, and — when the previous agent's pins are
+there — the kernel's record of what that agent protected, which no view
+of the filesystem can change (the independent review of the PR, #468, R2).
+
+- **`agent_mounts`.**
+  - In the agent's own mount table (`/proc/self/mountinfo`: a bind on the
+    host is copied into it, a drop-in's mounts are made there; read as
+    bytes, split on the ASCII space only, every `\ooo` escape turned back
+    into its byte — review of #468 R1, R3: a split on every Unicode space
+    shifted the fields of a path holding U+00A0, so a bind over
+    `/etc/northnarrow` from such a directory went unseen, and a byte that
+    is not UTF-8 in any mount made the table unreadable), every mount at or
+    under the agent's directories — `/etc/northnarrow` and
+    `/var/lib/northnarrow` always, and the directories of the key, the
+    identity, `admin.pub`, the install manifest, the head anchor and the
+    chains the command line names — must be a bind of a directory onto
+    itself: the same filesystem as the mount it sits on, showing the
+    directory that is there. That is what the unit's `ReadWritePaths=` (and
+    `RuntimeDirectory=`) make, on any layout: `/` on ext4 or xfs, a btrfs
+    subvolume as `/`, a separate `/var` (or `/var/lib`) partition. Anything
+    else refuses the start: another directory or a file bound there (a bind
+    of an empty directory over `/etc/northnarrow`, a directory of the same
+    basename elsewhere, another key bound over `agent.sig.key`), another
+    filesystem (a tmpfs, a loop device holding the same path, an overlay),
+    a mount whose underlying mount is not in the table. The journal line
+    names what is mounted where, and what was there. A line of the table
+    not in the kernel's shape refuses only when it may be a mount over
+    those directories; one about anything else never refuses. The agent's
+    directories themselves must therefore not be mount points of their own
+    (put `/var` or `/var/lib` on its own filesystem instead).
+  - One bpffs alone at `/sys/fs/bpf`, nothing stacked on it and nothing
+    mounted over the pin root `/sys/fs/bpf/northnarrow`: those would hide
+    the pins, the next proof.
+  - With the previous agent's pins there (they survive a `cgroup.kill` and
+    a crash, not a reboot): `/etc/northnarrow` and `/var/lib/northnarrow`
+    as this start sees them must be the inodes that agent protected (its
+    pinned `PROTECTED_INODES`). A copy bound over an ancestor (`/etc`,
+    `/var/lib`), a directory swapped by a rename above it, another root
+    (`RootDirectory=`) show other inodes and refuse. Every agent registers
+    the host's directories (their paths are fixed), so an agent the
+    privileged tests run, whose files are elsewhere, sees the same ones.
+  - A table that cannot be read, or pins whose inode map cannot be read,
+    refuse too.
+- **`signing_identity`.**
+  - With the previous agent's pins there, a start that runs the very
+    binary that agent protected (the installed one; the privileged tests
+    run copies of their own) is its restart, and a restart keeps its
+    identity: its key's directory must be one that agent protected — a
+    drop-in redefining `ExecStart=` with the key, the id and the chains in
+    an empty directory refuses — and its key must be there. In the
+    documented flows the pins go before the key: an upgrade, an uninstall
+    and a re-key remove them first (`install.sh --upgrade`, `uninstall.sh`;
+    a re-key after a refusal reboots first, section 3.10 of
+    `INSTALL_UPGRADE_UNINSTALL.md`), and while they are there the deny
+    hooks keep the key from being removed outside a window.
+  - When the key's name holds nothing (read without following a link or
+    opening it: a key the previous agent's hooks close to this process is
+    there), the start looks for an earlier identity in the paths it was
+    given: the key's public half (`agent.sig.pub`) and the install's id
+    (`agent_id`) — anything at their names, or a lookup that fails
+    otherwise than "not found" (review of #468 R8) —; the head anchor when
+    it is not empty (install.sh creates it empty); a signed first row
+    (`entry_hash`, `agent_sig`) in the audit log or in one of the other
+    chains (canary registry and accesses, detections, status events,
+    netflow, FIM drift and baseline, listeners), their manifests and sealed
+    archives, or one of them that cannot be opened otherwise than "not
+    found" (a link counts). An empty chain, a directory or another non-file
+    at its name, or a first line that is not a row is no evidence (the
+    chain's own check judges it). Any evidence refuses the start and
+    nothing is minted. The key's loader never mints a key beside an
+    existing public half, for every later caller.
+
+Neither has an override: an environment variable a drop-in can set would
+be set by the same drop-in that lays the mount. Both refuse at once,
+unsigned, exit 78, the registration withdrawn (there is none yet) —
+section 7. The watchdog restarts the refused agent within its ceiling and
+then holds; removing the mount (or the drop-in, then `daemon-reload`) and
+`systemctl start northnarrow-agent` bring the agent back with its own key.
+To re-key on purpose, retire the install's identity
+(`INSTALL_UPGRADE_UNINSTALL.md`, "Re-keying the agent").
+
+What these checks close, and what they do not:
+
+- Closed while the previous agent's pins are there (no reboot): a bind
+  over the agent's directories or over an ancestor, on the host or from a
+  drop-in (`BindPaths=`, `TemporaryFileSystem=`, `RootDirectory=`); a
+  rename that swaps `/etc` or `/var/lib` with a copy; a drop-in redefining
+  `ExecStart=` with the identity's paths elsewhere (for the installed
+  binary); a bpffs stacked over the pins. (A view without
+  `/etc/northnarrow` at all does not start the shipped unit: systemd
+  cannot set up its `ReadWritePaths=`.)
+- Closed after a reboot only by the evidence the start can read: a mount
+  over the agent's directories themselves (the mount table), and the
+  key's absence beside its own public half, id or chains.
+- Still open: a reboot with a persistent mount, drop-in or generator that
+  swaps both `/etc` and `/var/lib` together, or redefines `ExecStart=`
+  with every identity path elsewhere (nothing on that view says an
+  identity was there: it looks like a first install); a copy of the
+  binary started by a drop-in (not the binary the previous agent
+  protected); a key changed between the check and its load (one decision,
+  then one load, is the follow-up; review of #468 R4). An off-host record
+  of the public key is what would cover the reboot.
+
+The unit's runtime drop-in directory,
+`/run/systemd/system/northnarrow-agent.service.d`, is made (empty) by the
+unit before every start (`ExecStartPre=+/bin/mkdir -p …`) and registered
+by the deny hooks like the persistent one (NOCREATE, external audit
+EBPF-015): a new drop-in there — `systemctl edit --runtime`, the drop-in
+above — is refused outside a signed trusted-installer window, and the
+directory cannot be removed or renamed (`systemctl revert
+northnarrow-agent` fails with `EPERM` outside a window). It is one of the
+places systemd reads drop-ins from: the others are the host's
+(`service.d`, the `northnarrow-.service.d` prefix, `system.control` —
+`set-property` writes resource properties there, but any directive placed
+there is read —, the generators', `transient`, the vendor directory). A
+drop-in there is a self-integrity finding (`unit_dropin`,
+`unit_shadowed`); a mount it lays on or under the agent's directories is
+refused by the mount table, and one above them by the pins' proof while
+they are there.
 ## 2. The BPF LSM gate
 
 The deny hooks are BPF LSM programs. A kernel built with
@@ -266,7 +411,9 @@ agent's reply; upgrade the agent first).
 ## 7. Refused starts
 
 Every gate refuses the start the same way (lab PR 262; lab PR 218's
-`record_refused_boot`): it logs what it found, then the refusal is signed —
+`record_refused_boot`) — but the two continuity checks of section 1.1,
+which nothing can sign and the journal holds alone (lab PR 265): it logs
+what it found, then the refusal is signed —
 the rollback floor, the identity, a `subsystem_degraded` for the gates that
 had one (`bpf_lsm`, `deny_self_test`), then an `agent_boot` row with
 `result: refused`, `refused_by` naming the gate (the table of section 1),
@@ -308,8 +455,11 @@ line, and all but the BTF offsets' exited 1. Where the rows go:
    all the same; a directory that is not the agent's is recorded and left.
    At most 16 files per start;
 3. nowhere when neither can be written (no key, no absolute `--pid-file`,
-   a fallback directory that is not the agent's): the journal says why,
-   without the content of any file.
+   a fallback directory that is not the agent's), and for `agent_mounts`
+   and `signing_identity` (a chain opened under a mount would be in the
+   view the start refuses; signing would mean minting the key the start
+   refuses to mint): the journal says why, without the content of any
+   file.
 
 The fallback is on the runtime directory's tmpfs: a reboot empties it,
 and root can delete a file there before the next start records it — the
@@ -324,7 +474,11 @@ The gates after the load keep what attached before them pinned, as they
 did. The watchdog restarts a refused agent as any other exit, within its
 ceiling (5 in 60 s).
 
-Journal lines: the gate's own ERROR (`refusing to start: …`, `binary
+Journal lines: the gate's own ERROR (`refusing to start: …` — for the
+continuity checks `refusing to start: a mount hides the agent's own files:
+<mount point> (<fstype> <source>, its directory <root>): …` and `refusing
+to start: the agent's signing key <path> is absent, but this install had
+one: <evidence>. …` —, `binary
 integrity MISMATCH …`, `audit log NOT writable …`, `audit log open failed
 …`, `agent signing key cannot be loaded …`, `CAP_KILL missing …`), then
 `refused boot recorded in the audit chain`
