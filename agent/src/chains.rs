@@ -230,48 +230,55 @@ pub fn spawn_boot_verify(
     });
 }
 
-/// The signed audit log, for [`report_unverified_rows`].
-static READ_AUDIT_LOG: std::sync::OnceLock<Arc<parking_lot::Mutex<AuditLog>>> =
-    std::sync::OnceLock::new();
-/// Last count reported per file, so a dashboard polling the same forged
-/// rows does not write one entry per query.
-static REPORTED: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, usize>>> =
-    std::sync::Mutex::new(None);
-
-/// Hand the signed audit log to the read paths (from `main`).
-pub fn set_audit_log(log: Option<Arc<parking_lot::Mutex<AuditLog>>>) {
-    if let Some(l) = log {
-        let _ = READ_AUDIT_LOG.set(l);
-    }
+/// External audit NN-AUD-112: the rows a read verb left out because they
+/// do not verify, reported (R11c, lab PR 264: the read verbs' own, which
+/// the start gives the detections verb — the signed audit log and the
+/// counts were process-wide, the log filled by a setter, `set_audit_log`).
+#[derive(Default)]
+pub struct UnverifiedRows {
+    /// The signed audit log (`None`: the start runs unaudited; the journal
+    /// line only).
+    audit_log: Option<Arc<parking_lot::Mutex<AuditLog>>>,
+    /// Last count reported per file, so a dashboard polling the same forged
+    /// rows does not write one entry per query.
+    reported: std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>,
 }
 
-/// External audit NN-AUD-112: a read verb left out `count` rows of `file`
-/// that do not verify. ERROR in the journal every time; a signed
-/// `integrity_drift` (`chain_lines_unverified`) when the count for that
-/// file changed since the last one.
-pub fn report_unverified_rows(chain: &str, file: &Path, count: usize) {
-    let finding = ChainFinding::new(
-        chain,
-        file,
-        "chain_lines_unverified",
-        format!(
-            "{count} row(s) served by a read verb fail hash or signature verification: left out"
-        ),
-    );
-    let fresh = REPORTED
-        .lock()
-        .map(|mut m| {
-            let m = m.get_or_insert_with(Default::default);
-            m.insert(file.to_path_buf(), count) != Some(count)
-        })
-        .unwrap_or(true);
-    if !fresh {
-        error!(chain, file = %file.display(), count, "read verb: rows that do not verify left out");
-        return;
+impl UnverifiedRows {
+    /// The read verbs' reports, signed into `audit_log`.
+    pub fn new(audit_log: Option<Arc<parking_lot::Mutex<AuditLog>>>) -> Self {
+        Self {
+            audit_log,
+            reported: Default::default(),
+        }
     }
-    match READ_AUDIT_LOG.get() {
-        Some(log) => finding.attest(Some(&mut log.lock())),
-        None => finding.attest(None::<&mut AuditLog>),
+
+    /// A read verb left out `count` rows of `file` that do not verify.
+    /// ERROR in the journal every time; a signed `integrity_drift`
+    /// (`chain_lines_unverified`) when the count for that file changed since
+    /// the last one.
+    pub fn report(&self, chain: &str, file: &Path, count: usize) {
+        let finding = ChainFinding::new(
+            chain,
+            file,
+            "chain_lines_unverified",
+            format!(
+                "{count} row(s) served by a read verb fail hash or signature verification: left out"
+            ),
+        );
+        let fresh = self
+            .reported
+            .lock()
+            .map(|mut m| m.insert(file.to_path_buf(), count) != Some(count))
+            .unwrap_or(true);
+        if !fresh {
+            error!(chain, file = %file.display(), count, "read verb: rows that do not verify left out");
+            return;
+        }
+        match &self.audit_log {
+            Some(log) => finding.attest(Some(&mut log.lock())),
+            None => finding.attest(None::<&mut AuditLog>),
+        }
     }
 }
 

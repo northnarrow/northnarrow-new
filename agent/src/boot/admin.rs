@@ -36,6 +36,7 @@ pub(crate) fn start(
     ladder: &Arc<northnarrow_agent::combat::CombatLadder>,
     detect_only_source: &Option<String>,
     exempt: &ExemptPids,
+    handles: admin_socket::AdminHandles,
 ) {
     // Optional admin socket: only spawned if admin pubkey config
     // is present. Missing config = no unlock path; the agent still
@@ -122,6 +123,10 @@ pub(crate) fn start(
                 // the verified watchdog (the pid in PROTECTED_PIDS) is not.
                 let status_polls_for_serve =
                     Arc::new(admin_socket::StatusPolls::new(exempt.clone()));
+                // R11c (lab PR 264): the start's handles the verbs read or
+                // act on — the per-rule policy the engine and the posture
+                // read, … (they were process-wide globals the start set).
+                let handles_for_serve = Arc::new(handles);
                 // External audit NN-AUD-077: the loop now outlives a
                 // transient accept error; if it still ends, the admin plane
                 // is gone until a restart — an ERROR and a signed record.
@@ -142,6 +147,7 @@ pub(crate) fn start(
                         response_state_for_serve,
                         read_paths_for_serve,
                         status_polls_for_serve,
+                        handles_for_serve,
                     )
                     .await
                     {

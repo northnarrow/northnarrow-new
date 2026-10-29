@@ -31,8 +31,8 @@
 //! when strict's task map is full or lite's lost records, and attests each
 //! once per window.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aya::maps::{Array, MapData, PerCpuArray, RingBuf};
@@ -42,6 +42,8 @@ use aya::{Btf, Ebpf};
 use common::btf_offsets::{slot, BTF_OFFSETS_ABSENT};
 use common::epg::{self, cfg, counter, variant, GuardConfig, ResolvedLayout};
 use tracing::{info, warn};
+
+use crate::late_audit::{AuditHandle, LateAudit};
 
 /// Which guard runs (`--exploit-guard`, `NN_EXPLOIT_GUARD`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,15 +189,29 @@ struct Control {
     variant: Variant,
 }
 
-static CONTROL: OnceLock<Mutex<Control>> = OnceLock::new();
+/// The running guard (R11c, lab PR 264): its kernel configuration, which
+/// the start's response phase switches ([`Self::set_response`]), and the
+/// sampler's audit log, which the attest phase binds
+/// ([`Self::bind_audit_log`]). [`attach`] gives it to the start; they were
+/// the process-wide `CONTROL` (set by the attach, read by the response
+/// phase) and `AUDIT_LOG` (filled by `set_audit_log`).
+#[derive(Clone)]
+pub struct ExploitGuard {
+    control: Arc<Mutex<Control>>,
+    audit: LateAudit,
+}
+
+impl std::fmt::Debug for ExploitGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExploitGuard")
+            .field("audit", &self.audit)
+            .finish_non_exhaustive()
+    }
+}
+
 static MODE_LINE: Mutex<String> = Mutex::new(String::new());
 static COUNTERS: [AtomicU64; counter::SLOTS as usize] =
     [const { AtomicU64::new(0) }; counter::SLOTS as usize];
-static AUDIT_LOG: OnceLock<Arc<parking_lot::Mutex<crate::audit::AuditLog>>> = OnceLock::new();
-/// Strict's task map size for the next load (0: not set, [`pid_max`]).
-static TASK_MAP_ENTRIES: AtomicU32 = AtomicU32::new(0);
-/// Lite's task map size for the next load (0: not set, the default).
-static LITE_MAP_ENTRIES: AtomicU32 = AtomicU32::new(0);
 
 fn set_mode_line(s: impl Into<String>) {
     if let Ok(mut m) = MODE_LINE.lock() {
@@ -233,13 +249,6 @@ pub fn status() -> nn_proto::admin_protocol::ExploitGuardStatus {
         untracked_total: counter_total(counter::UNTRACKED) + counter_total(counter::BASELINES_LOST),
         use_checks_total: counter_total(counter::USE_CHECKS),
         denied_total: counter_total(counter::DENIED),
-    }
-}
-
-/// Hand the signed audit log to the sampler (from `main`, once it exists).
-pub fn set_audit_log(log: Option<Arc<parking_lot::Mutex<crate::audit::AuditLog>>>) {
-    if let Some(l) = log {
-        let _ = AUDIT_LOG.set(l);
     }
 }
 
@@ -291,31 +300,41 @@ pub fn lite_task_map_entries(
     }
 }
 
-/// Set both task map sizes before the eBPF object is loaded (from `main`,
-/// before the multiplexer starts). Lite's gets one entry when lite does not
-/// run (it is preallocated); strict's costs nothing unused.
-pub fn set_task_map_entries(requested: Option<u32>, v: Variant) {
-    TASK_MAP_ENTRIES.store(task_map_entries(requested, pid_max()), Ordering::Relaxed);
-    let lite = match v {
-        Variant::Lite => lite_task_map_entries(requested, pid_max(), threads_max()),
-        Variant::Strict | Variant::Off => 1,
-    };
-    LITE_MAP_ENTRIES.store(lite, Ordering::Relaxed);
+/// The sizes the loader gives the two task maps
+/// (`EbpfLoader::map_max_entries`), decided before the eBPF object is
+/// loaded (R11c, lab PR 264: in the multiplexer's load plan; they were
+/// process-wide values `set_task_map_entries` stored).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskMaps {
+    /// Strict's.
+    pub strict: u32,
+    /// Lite's.
+    pub lite: u32,
 }
 
-/// The size the loader gives strict's task map (`EbpfLoader::map_max_entries`).
-pub fn task_map_entries_for_load() -> u32 {
-    match TASK_MAP_ENTRIES.load(Ordering::Relaxed) {
-        0 => task_map_entries(None, pid_max()),
-        n => n,
+impl TaskMaps {
+    /// Both sizes for a start that runs variant `v` (`requested`:
+    /// `--exploit-guard-tasks`). Lite's gets one entry when lite does not
+    /// run (it is preallocated); strict's costs nothing unused.
+    pub fn for_variant(requested: Option<u32>, v: Variant) -> Self {
+        Self {
+            strict: task_map_entries(requested, pid_max()),
+            lite: match v {
+                Variant::Lite => lite_task_map_entries(requested, pid_max(), threads_max()),
+                Variant::Strict | Variant::Off => 1,
+            },
+        }
     }
 }
 
-/// The size the loader gives lite's task map.
-pub fn lite_task_map_entries_for_load() -> u32 {
-    match LITE_MAP_ENTRIES.load(Ordering::Relaxed) {
-        0 => lite_task_map_entries(None, pid_max(), threads_max()),
-        n => n,
+impl Default for TaskMaps {
+    /// The sizes of a load nothing decided for (the lab's one-shot modes):
+    /// strict's [`pid_max`], lite's its default.
+    fn default() -> Self {
+        Self {
+            strict: task_map_entries(None, pid_max()),
+            lite: lite_task_map_entries(None, pid_max(), threads_max()),
+        }
     }
 }
 
@@ -481,10 +500,11 @@ fn unload_all(ebpf: &mut Ebpf) {
     }
 }
 
-/// Load, attach and arm `variant` in detect mode. `Ok(ring)` hands the
-/// record ring to the caller's pump; `Err(reason)` leaves the guard off
-/// (nothing attached) and is what the caller attests.
-pub fn attach(ebpf: &mut Ebpf, v: Variant) -> Result<RingBuf<MapData>, String> {
+/// Load, attach and arm `variant` in detect mode. `Ok((ring, guard))`
+/// hands the record ring to the caller's pump and the running guard to the
+/// start; `Err(reason)` leaves the guard off (nothing attached) and is what
+/// the caller attests.
+pub fn attach(ebpf: &mut Ebpf, v: Variant) -> Result<(RingBuf<MapData>, ExploitGuard), String> {
     if v == Variant::Off {
         set_mode_line("off");
         return Err("off (--exploit-guard off)".to_string());
@@ -513,7 +533,7 @@ pub fn attach(ebpf: &mut Ebpf, v: Variant) -> Result<RingBuf<MapData>, String> {
     result
 }
 
-fn attach_inner(ebpf: &mut Ebpf, v: Variant) -> Result<RingBuf<MapData>, String> {
+fn attach_inner(ebpf: &mut Ebpf, v: Variant) -> Result<(RingBuf<MapData>, ExploitGuard), String> {
     let wire_variant = match v {
         Variant::Lite => variant::LITE,
         Variant::Strict => variant::STRICT,
@@ -583,13 +603,16 @@ fn attach_inner(ebpf: &mut Ebpf, v: Variant) -> Result<RingBuf<MapData>, String>
         ..armed
     };
     write_config(&mut map, armed)?;
-    let _ = CONTROL.set(Mutex::new(Control {
-        map,
-        config: armed,
-        variant: v,
-    }));
-    spawn_sampler(counters);
-    Ok(ring)
+    let guard = ExploitGuard {
+        control: Arc::new(Mutex::new(Control {
+            map,
+            config: armed,
+            variant: v,
+        })),
+        audit: LateAudit::new(),
+    };
+    spawn_sampler(counters, guard.audit.clone());
+    Ok((ring, guard))
 }
 
 /// `debug-trigger` builds only: the lab's fault-injection comm
@@ -643,26 +666,40 @@ pub fn effective_response(requested: Response, detect_only: bool) -> Response {
     }
 }
 
-/// Switch a running guard between detect and enforce. `Err` when the guard
-/// is not running (off or unavailable).
-pub fn set_response(r: Response) -> Result<(), String> {
-    let control = CONTROL
-        .get()
-        .ok_or_else(|| "the exploit guard is not running".to_string())?;
-    let mut c = control
-        .lock()
-        .map_err(|_| "exploit guard control poisoned".to_string())?;
-    let next = GuardConfig {
-        mode: match r {
-            Response::Detect => cfg::MODE_DETECT,
-            Response::Enforce => cfg::MODE_ENFORCE,
-        },
-        ..c.config
-    };
-    write_config(&mut c.map, next)?;
-    c.config = next;
-    set_mode_line(format!("{} {}", c.variant.as_str(), r.as_str()));
-    Ok(())
+/// Switch the guard, when it runs (`guard`: what [`attach`] gave), between
+/// detect and enforce. `Err` when the guard is not running (off or
+/// unavailable).
+pub fn set_response(guard: Option<&ExploitGuard>, r: Response) -> Result<(), String> {
+    guard
+        .ok_or_else(|| "the exploit guard is not running".to_string())?
+        .set_response(r)
+}
+
+impl ExploitGuard {
+    /// Switch the running guard between detect and enforce.
+    pub fn set_response(&self, r: Response) -> Result<(), String> {
+        let mut c = self
+            .control
+            .lock()
+            .map_err(|_| "exploit guard control poisoned".to_string())?;
+        let next = GuardConfig {
+            mode: match r {
+                Response::Detect => cfg::MODE_DETECT,
+                Response::Enforce => cfg::MODE_ENFORCE,
+            },
+            ..c.config
+        };
+        write_config(&mut c.map, next)?;
+        c.config = next;
+        set_mode_line(format!("{} {}", c.variant.as_str(), r.as_str()));
+        Ok(())
+    }
+
+    /// Hand the signed audit log to the guard's sampler (the start's attest
+    /// phase, once it exists): a saturation is signed from then on.
+    pub fn bind_audit_log(&self, log: Option<AuditHandle>) {
+        self.audit.bind(log);
+    }
 }
 
 fn read_counters(map: &PerCpuArray<MapData, u64>) -> [u64; counter::SLOTS as usize] {
@@ -675,8 +712,8 @@ fn read_counters(map: &PerCpuArray<MapData, u64>) -> [u64; counter::SLOTS as usi
     out
 }
 
-fn attest(op: &str, detail: String) {
-    let Some(log) = AUDIT_LOG.get() else { return };
+fn attest(audit: &LateAudit, op: &str, detail: String) {
+    let Some(log) = audit.get() else { return };
     let draft = crate::audit::AuditEntryDraft {
         op: op.to_string(),
         extra: serde_json::json!({
@@ -729,7 +766,7 @@ struct Watched {
 }
 
 impl Watched {
-    fn check(&mut self, prev: &[u64], now: &[u64]) {
+    fn check(&mut self, audit: &LateAudit, prev: &[u64], now: &[u64]) {
         let (p, n) = (prev[self.slot], now[self.slot]);
         if n <= p {
             return;
@@ -741,12 +778,12 @@ impl Watched {
             .unwrap_or(true);
         if due {
             self.last_audit = Some(Instant::now());
-            attest(self.op, (self.detail)(n - p, n));
+            attest(audit, self.op, (self.detail)(n - p, n));
         }
     }
 }
 
-fn spawn_sampler(map: PerCpuArray<MapData, u64>) {
+fn spawn_sampler(map: PerCpuArray<MapData, u64>, audit: LateAudit) {
     tokio::spawn(async move {
         let mut prev = [0u64; counter::SLOTS as usize];
         let mut watched = [
@@ -773,7 +810,7 @@ fn spawn_sampler(map: PerCpuArray<MapData, u64>) {
                 COUNTERS[i].store(*v, Ordering::Relaxed);
             }
             for w in watched.iter_mut() {
-                w.check(&prev, &now);
+                w.check(&audit, &prev, &now);
             }
             let held = counter::REPORTS_HELD as usize;
             if now[held] > prev[held] {
@@ -949,7 +986,7 @@ mod tests {
     #[test]
     fn a_guard_that_never_started_says_so() {
         assert_eq!(mode_line(), "not started");
-        assert!(set_response(Response::Enforce).is_err());
+        assert!(set_response(None, Response::Enforce).is_err());
         assert_eq!(counter_total(counter::CHECKED), 0);
     }
 

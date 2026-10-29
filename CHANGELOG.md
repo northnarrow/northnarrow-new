@@ -2115,6 +2115,62 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`agent/tests/golden/admin/expected`, `docs/validation/
   GOLDEN_REPLAY.md` §7), and no test reads or removes the host's
   bootstrap files any more.
+- Wave 4 restructure, R11c — nn-agent: the global setters replaced by
+  explicit handles (lab PR 264). The start wired what it made into deep
+  code through process-wide statics that setters filled, and some
+  instances kept their own state in statics every other instance of the
+  process shared. Every `static` of the agent's code was inventoried
+  (the agent and the crates it is built from, test code aside; the table
+  is in the pull request) and classed: 48 were boot state handed on
+  through a setter, or one phase's result read by a later one, or one
+  instance's state the others shared — they are gone; 64 stay, one per
+  process by their nature (the event loop's heartbeat, the one boot, the
+  host's facts, the one eBPF object's state as the status reads it, the
+  status totals, the signed degradations, state keyed by an instance's
+  own path, per-thread scratch), each listed with why. Now explicit: the
+  per-rule policy (one `PolicyHandle` the policy phase makes, read by the
+  engine and the posture and swapped by `nn-admin policy set` through
+  the admin socket's clone; it was `rule_policy::global()`); the audit
+  log's late binding (the ring-drop and fail-open samplers, the exploit
+  guard and its control, the FIM's watch-pressure attestation, the read
+  verbs' unverified rows, the telemetry probe, the BPF guard's record of
+  the object's own maps and links and its stop, each a handle the part
+  hands the start); the boot's results (the anti-tamper attach's report,
+  the trust level's measurements, the signed capability manifest, the
+  ransomware tracker and the security-tool judge, the JA3 list's size);
+  the load's plan (the exec, file-open and DNS sensors the command line
+  chose, the exploit guard's task maps) and what it armed (the exec
+  sensor's and the DNS sensor's modes, the sensors' attach points); the
+  exec guards (an instance with their configuration and the kernel
+  objects their install took); the copy-on-first-write guard, the
+  quarantine's refusal of the agent's own files (in the executor's
+  configuration), the deny self-test's own denial and the host's stop;
+  and per instance: the overlay gate's configured paths, the canaries'
+  read-forward set (the FIM drain's), the FIM drain's retry queues (the
+  tests ran a thread-local copy). A new ratchet test
+  (`xtask/tests/global_state.rs`) lists the statics that stay with their
+  reasons and the start's calls into them, and fails on a new one. No
+  behaviour changes: the same values reach the same readers at the same
+  points of the start. A new test proves `policy set` still applies at
+  once everywhere: a signed `config overlay set` through the admin
+  pipeline, on one handle shared as the start shares it, gives R020 its
+  kill back in the engine's next decision, the executor runs that kill,
+  and the posture's next judgement takes the ransomware directive.
+  The eBPF object, the watchdog, the scanner, the packages' contents
+  and the SBOMs are `main`'s bytes; the wire, chain and crypto pins pass
+  unchanged, the golden replays too (five runs); the test list is
+  `main`'s and the 7 new (3,176 → 3,183 names). On the lab guest
+  (Ubuntu 24.04), against `main` 118d504 on the same guest, the lot's
+  code passes `test-ignored` (91 passed: `main`'s 91), `policy-check`
+  (the signed `policy set` applied at once — the next event's tree
+  killed — and at boot), `tamper-check` — `main`'s outcomes and
+  verdicts, case by case (72 of 75 OK, the same two known gaps and
+  deviation) — and `upgrade-check` from `main`; its boots log `main`'s
+  lines and sign `main`'s rows; 41 nn-admin commands against the live
+  agent — lab PR 263's, with the verification's refusals on the real
+  socket — give the same output, exit status and signed rows from
+  `main`'s agent and the lot's, with either build of nn-admin (the
+  telemetry's counters, the times and the boot's manifest hash aside).
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and

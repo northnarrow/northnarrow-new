@@ -20,7 +20,6 @@
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -51,18 +50,6 @@ pub const OPEN_SENSOR_EVENTS_MAP: &str = "OPEN_SENSOR_EVENTS";
 /// The `sys_enter_openat` program's switch (review 69): slot 0 non-zero =
 /// the tracepoint emits one record per `openat`.
 pub const FILE_OPEN_TP_ON_MAP: &str = "FILE_OPEN_TP_ON";
-
-static TRACEPOINT_MODE: AtomicBool = AtomicBool::new(false);
-
-/// `--file-open-sensor tracepoint`; set before the multiplexer starts.
-pub fn want_tracepoint(on: bool) {
-    TRACEPOINT_MODE.store(on, Ordering::Relaxed);
-}
-
-/// Whether `sys_enter_openat` must emit from the start.
-pub fn tracepoint_wanted() -> bool {
-    TRACEPOINT_MODE.load(Ordering::Relaxed)
-}
 
 /// Turn the `sys_enter_openat` records on or off (review 69). The program
 /// is attached at start in both modes. In LSM mode it stays off (the map's

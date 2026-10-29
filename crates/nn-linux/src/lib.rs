@@ -91,6 +91,11 @@ pub mod bounded_cmd;
 // manifest stay in the agent).
 pub mod boot;
 
+// The audit log for what starts before the start binds it: the samplers
+// the eBPF load starts (R11c, lab PR 264: their process-wide setters
+// became this explicit slot).
+pub mod late_audit;
+
 /// Deception (R09a, lab PR 253): the stores of the canary detector's host —
 /// the signed registry of deployed canaries and their access log, this
 /// host's interface addresses, the read-forward set the FIM drain consults

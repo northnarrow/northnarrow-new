@@ -139,6 +139,10 @@ pub struct CanaryIndexes<H: CanaryHost> {
     /// Reverse lookup `canary_id → name` for trip-event
     /// construction without re-walking the registry.
     name_index: HashMap<String, (String, CanaryTypeTag)>,
+    /// Where a rebuild publishes the file canaries' inodes (R11c, lab PR
+    /// 264: the set the start gives, [`Self::with_read_forward`]; a
+    /// process-wide one until then).
+    read_forward: H::ReadForward,
     /// R08b: the host whose registry the indexes are rebuilt from.
     host: PhantomData<fn() -> H>,
 }
@@ -162,12 +166,25 @@ impl<H: CanaryHost> Default for CanaryIndexes<H> {
             exe_index: HashMap::default(),
             port_index: HashMap::default(),
             name_index: HashMap::default(),
+            read_forward: H::ReadForward::default(),
             host: PhantomData,
         }
     }
 }
 
 impl<H: CanaryHost> CanaryIndexes<H> {
+    /// These indexes publishing the file canaries' inodes into
+    /// `read_forward` (the agent: the FIM drain's set).
+    pub fn with_read_forward(mut self, read_forward: H::ReadForward) -> Self {
+        self.read_forward = read_forward;
+        self
+    }
+
+    /// The set a rebuild publishes into.
+    pub fn read_forward(&self) -> &H::ReadForward {
+        &self.read_forward
+    }
+
     /// Empty indexes. `rebuild_from_registry` populates from
     /// a snapshot.
     pub fn new() -> Self {
@@ -233,7 +250,7 @@ impl<H: CanaryHost> CanaryIndexes<H> {
         }
         // Publish the file-canary inodes so the FIM drain forwards
         // their READ opens past the BUG-012 v2 gate (see read_forward).
-        H::publish_read_forward(self.inode_index.keys().copied());
+        H::publish_read_forward(&self.read_forward, self.inode_index.keys().copied());
     }
 
     /// Hot-path inode lookup. Returns the canary_id of the

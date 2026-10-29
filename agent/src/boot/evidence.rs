@@ -58,6 +58,9 @@ pub(crate) fn attest(
     tracepoint_degraded: Option<String>,
     hook_args_degraded: Option<String>,
     exploit_guard_degraded: Option<String>,
+    exploit_guard: &Option<northnarrow_agent::sensors::epg::ExploitGuard>,
+    anti_tamper: &northnarrow_agent::anti_tamper::AttachReport,
+    dns_mode: northnarrow_agent::sensors::dns_sensor::DnsMode,
     caps_degraded: Vec<String>,
     audit: checks::AuditOpen,
 ) -> Result<Attested> {
@@ -221,8 +224,8 @@ pub(crate) fn attest(
     // NN_ANTI_TAMPER_ALLOW_DEGRADED=1 and a missing observe hook, in the
     // signed chain with what is missing — the journal line was the only
     // trace.
-    for detail in northnarrow_agent::anti_tamper::take_degraded_boot_details() {
-        northnarrow_agent::boot::degradation::report("anti_tamper", &detail);
+    for detail in &anti_tamper.degraded {
+        northnarrow_agent::boot::degradation::report("anti_tamper", detail);
     }
     // External audit NN-AUD-098 / lab PR 164 / CMB-028: found before the
     // attach, signed here (lab PR 218: they waited for the subsystems'
@@ -245,15 +248,19 @@ pub(crate) fn attest(
     // sendmsg`) a query's name is read from the sender's memory before the
     // kernel copies it: the sender can change it in between, so the name
     // recorded and the one sent may differ.
-    if !northnarrow_agent::sensors::dns_sensor::skb_active() {
+    if !dns_mode.skb {
         northnarrow_agent::boot::degradation::report(
             "dns_sensor",
             "DNS sensor on udp_sendmsg: query names read from the sender's memory, which it \
              can rewrite before the kernel sends them (IPv4 only)",
         );
     }
-    // Lab PR 219: the exploit guard sampler's saturation entries from now on.
-    northnarrow_agent::sensors::epg::set_audit_log(audit_log.clone());
+    // Lab PR 219: the exploit guard sampler's saturation entries from now on
+    // (R11c, lab PR 264: bound in the guard the attach gave, no longer a
+    // process-wide setter).
+    if let Some(guard) = exploit_guard {
+        guard.bind_audit_log(audit_log.clone());
+    }
     let signed = northnarrow_agent::boot::degradation::attach_audit_log(audit_log.clone());
     northnarrow_agent::boot::degradation::spawn_flusher();
     if signed > 0 {
@@ -337,15 +344,24 @@ fn open_after_attach(
     }
 }
 
-/// The audit log reaches what was built before it opened (the late binding
-/// R11c turns into explicit handles): the BPF links' self-check, the
-/// watchdog refresh, the foreign pins, a rolled-back upgrade, the overlay
-/// gate, the executor, the telemetry probe, the self-integrity watcher, the
-/// chains' tasks, the ring drops, the deny hooks' fail-opens, the FIM
-/// drain, the trusted-installer window.
+/// The audit log reaches what was built before it opened: the BPF links'
+/// self-check, the watchdog refresh, the foreign pins, a rolled-back
+/// upgrade, the overlay gate, the executor, the telemetry probe, the
+/// self-integrity watcher, the chains' tasks, the ring drops, the deny
+/// hooks' fail-opens, the FIM drain, the trusted-installer window. R11c
+/// (lab PR 264): each through the handle the part that holds it gave the
+/// start (the samplers through `sensor`), no longer a process-wide setter.
+/// What [`wire`] started that the event loop reads.
+pub(crate) struct Wired {
+    /// The telemetry probe, offered every event (`None`: disabled). R11c
+    /// (lab PR 264): it was a process-wide tracker its spawn set.
+    pub(crate) telemetry_probe: Option<northnarrow_agent::telemetry_probe::TelemetryProbe>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wire(
     cli: &Cli,
+    sensor: &SensorMultiplexer,
     audit_log: &AuditHandle,
     watchdog_audit: &std::sync::OnceLock<WatchdogAudit>,
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
@@ -356,15 +372,15 @@ pub(crate) fn wire(
     installer_override: &Arc<
         northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
     >,
-) {
+) -> Wired {
     // Tappa 10.8 BPF self-defence: the link self-check needs the audit log,
     // which did not exist when the hooks attached.
-    northnarrow_agent::anti_tamper::bpf_defense::spawn_link_self_check(audit_log.clone());
+    sensor.bpf_guard().spawn_link_self_check(audit_log.clone());
     // Lab PR 216: and the watchdog refresh, to sign a watchdog that is gone.
     let _ = watchdog_audit.set(audit_log.clone());
     // External audit ATP-017 (NN-AUD-265): the `link_*` entries of the pin
     // root that are not the agent's links, one signed `integrity_drift` each.
-    northnarrow_agent::anti_tamper::bpf_defense::attest_foreign_pins(audit_log.as_ref());
+    sensor.bpf_guard().attest_foreign_pins(audit_log.as_ref());
     // Lab PR 220: an upgrade install.sh rolled back to this agent, signed
     // as `upgrade_rolled_back` before the agent says it is ready.
     northnarrow_agent::upgrade_rollback::attest(
@@ -378,7 +394,7 @@ pub(crate) fn wire(
         executor.set_audit_log(Arc::clone(audit));
     }
     // Tappa 10.8 telemetry probe: known events on each sensor, every minute.
-    northnarrow_agent::telemetry_probe::spawn(audit_log.clone());
+    let telemetry_probe = northnarrow_agent::telemetry_probe::spawn(audit_log.clone());
     // Tappa 10.8 adversarial findings: drop-ins, set-property, oom_score_adj, mounts.
     northnarrow_agent::self_integrity::spawn(
         audit_log.clone(),
@@ -391,27 +407,24 @@ pub(crate) fn wire(
     if let Some(a) = &chain_anchor {
         northnarrow_agent::chains::spawn(Arc::clone(a), audit_log.clone());
     }
-    northnarrow_agent::chains::set_audit_log(audit_log.clone());
     if let Some(pk) = northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file) {
         northnarrow_agent::chains::spawn_boot_verify(chain_targets.clone(), pk, audit_log.clone());
     }
-    northnarrow_agent::sensors::ring_drops::set_audit_log(audit_log.clone());
+    sensor.ring_drops().bind_audit_log(audit_log.clone());
     // Lab PR 215: a deny hook that let an operation through undecided.
-    northnarrow_agent::anti_tamper::fail_open::set_audit_log(audit_log.clone());
-    // External audit NN-AUD-120: a full FIM watch set is attested.
-    northnarrow_agent::fim::drain::set_audit_log(audit_log.clone());
+    sensor.fail_open().bind_audit_log(audit_log.clone());
     // External audit SNS-009: a security ring that loses events raises
     // ALERTED (TelemetryLoss), outside trusted-installer windows.
-    northnarrow_agent::sensors::ring_drops::set_posture(
-        posture.clone(),
-        Some(Arc::clone(installer_override)),
-    );
+    sensor
+        .ring_drops()
+        .bind_posture(posture.clone(), Some(Arc::clone(installer_override)));
 
     // FIM-009 self-upgrade (§15.1): late-bind the audit-chain writer to
     // the trusted-installer override so its close/expiry records chain.
     if let Some(audit) = audit_log.as_ref() {
         installer_override.set_audit_log(Arc::clone(audit));
     }
+    Wired { telemetry_probe }
 }
 
 /// What [`stores`] opened.
@@ -436,6 +449,7 @@ pub(crate) fn stores(
     stale_combat: &Option<northnarrow_agent::combat::reconcile::StaleChain>,
     chain_anchor: &AnchorHandle,
     audit_log: &AuditHandle,
+    defense_detector: &Arc<northnarrow_agent::impair::DefenseDetector>,
 ) -> Stores {
     // BUG-026: ONE shared StateDirProtection for the rotating on-disk logs
     // under /var/lib/northnarrow (netflow + fim_drift share its dance
@@ -548,6 +562,10 @@ pub(crate) fn stores(
                 detections_rotation,
                 rotation_protection.clone(),
                 northnarrow_agent::detection_store::DEFAULT_QUEUE_CAP,
+                // Lab PR 225: a sanctioned security-tool finding names why
+                // (R11c, lab PR 264: the judge given here, no longer a
+                // published slot).
+                Some(Arc::clone(defense_detector)),
             ) {
                 Ok((sink, _writer)) => Some(sink),
                 Err(e) => {
@@ -620,6 +638,11 @@ pub(crate) fn stores(
                     agent_key,
                     detections_path: cli.detections_file.clone(),
                     status_events_path: cli.status_events_file.clone(),
+                    // External audit NN-AUD-112 (R11c, lab PR 264: the
+                    // audit log given here, no longer a process-wide setter).
+                    unverified: Arc::new(northnarrow_agent::chains::UnverifiedRows::new(
+                        audit_log.clone(),
+                    )),
                 }))
             }
             Err(e) => {

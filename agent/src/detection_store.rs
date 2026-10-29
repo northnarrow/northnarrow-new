@@ -363,6 +363,10 @@ struct SinkInner {
     /// before.
     drops: Mutex<DropWindow>,
     cap: usize,
+    /// Lab PR 225: the agent's security-tool judge, whose sanction a
+    /// security-tool finding's record names (R11c, lab PR 264: given at the
+    /// open; it was the process-wide detector `impair::publish` set).
+    defense: Option<Arc<crate::impair::DefenseDetector>>,
 }
 
 /// Audit op of the signed record of queue drops (external audit NN-AUD-111).
@@ -542,7 +546,7 @@ impl DetectionSink {
         record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
         // Lab PR 225: a sanctioned security-tool finding names why.
         if verdict.rule_id.starts_with("NN-L-EVA-") {
-            record.sanction = crate::impair::published_sanction(event);
+            record.sanction = self.sanction_of(event);
         }
         self.enqueue(record);
     }
@@ -569,7 +573,7 @@ impl DetectionSink {
             .iter()
             .any(|m| m.rule_id.starts_with("NN-L-EVA-"))
         {
-            record.sanction = crate::impair::published_sanction(event);
+            record.sanction = self.sanction_of(event);
         }
         record.matches = RuleMatchRecord::of(decision);
         self.enqueue(record);
@@ -621,6 +625,15 @@ impl DetectionSink {
         self.enqueue(record);
     }
 
+    /// Lab PR 225: why a security-tool finding was sanctioned (the
+    /// trusted-installer window), by the detector the sink was opened with.
+    fn sanction_of(&self, event: &Event) -> Option<String> {
+        self.inner
+            .defense
+            .as_ref()
+            .and_then(|d| d.sanction_of(event))
+    }
+
     /// Cumulative records dropped under backpressure (for metrics).
     pub fn dropped(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
@@ -641,6 +654,7 @@ impl DetectionSink {
                 dropped: AtomicU64::new(0),
                 drops: Mutex::new(DropWindow::default()),
                 cap,
+                defense: None,
             }),
         }
     }
@@ -658,13 +672,15 @@ pub fn now_ts() -> String {
 /// the [`DetectionSink`] to thread into the event loop plus the writer's
 /// [`JoinHandle`]. The active file should already exist (bootstrapped
 /// pre-attach, mirroring the FIM/netflow logs) so the inode is
-/// registered with the anti-tamper LSM map before lockdown.
+/// registered with the anti-tamper LSM map before lockdown. `defense`: the
+/// security-tool judge whose sanctions the records name (lab PR 225).
 pub fn open(
     active_path: &Path,
     key: AgentSigningKey,
     cfg: RotationConfig,
     protection: Arc<dyn ProtectionManager>,
     queue_cap: usize,
+    defense: Option<Arc<crate::impair::DefenseDetector>>,
 ) -> Result<(DetectionSink, JoinHandle<()>)> {
     let log = RotatingChainLog::<DetectionRecord>::open(active_path, key, cfg, protection)
         .with_context(|| format!("opening detection chainlog {}", active_path.display()))?;
@@ -677,6 +693,7 @@ pub fn open(
         dropped: AtomicU64::new(0),
         drops: Mutex::new(DropWindow::default()),
         cap: queue_cap,
+        defense,
     });
     let handle = spawn_writer(log, Arc::clone(&inner));
     info!(
@@ -1831,6 +1848,7 @@ mod tests {
             RotationConfig::default(),
             Arc::new(NoProtection),
             DEFAULT_QUEUE_CAP,
+            None,
         )
         .expect("open detection store");
         for refs in [REFS, &[]] {
@@ -1889,6 +1907,7 @@ mod tests {
             RotationConfig::default(),
             Arc::new(NoProtection),
             DEFAULT_QUEUE_CAP,
+            None,
         )
         .expect("open detection store");
 
@@ -2431,6 +2450,7 @@ mod tests {
             RotationConfig::default(),
             Arc::new(NoProtection),
             DEFAULT_QUEUE_CAP,
+            None,
         )
         .expect("open detection store");
 

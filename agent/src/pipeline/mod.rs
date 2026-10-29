@@ -10,16 +10,26 @@ pub(crate) mod process_event;
 
 /// External audit EBPF-001: systemd (PID 1 itself, `SO_PEERCRED`) reported
 /// the host as stopping — no posture escalation and no ladder until the
-/// process ends at systemd-shutdown's final stage.
-pub(crate) static HOST_STOPPING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// process ends at systemd-shutdown's final stage. R11c (lab PR 264): the
+/// flag the ladder phase makes and hands to its tick, the shutdown watch
+/// and the event loop (it was a process-wide `HOST_STOPPING`). Clones
+/// share it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HostStopping(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
-/// The host is shutting down: stand the ladder down once and stop
-/// escalating (see [`HOST_STOPPING`]).
-pub(crate) fn host_stopping(ladder: &northnarrow_agent::combat::CombatLadder) {
-    if !HOST_STOPPING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        warn!("host shutting down — active response stood down, detection continues");
-        ladder.stand_down(Instant::now());
+impl HostStopping {
+    /// The host is shutting down: stand the ladder down once and stop
+    /// escalating.
+    pub(crate) fn stand_down(&self, ladder: &northnarrow_agent::combat::CombatLadder) {
+        if !self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            warn!("host shutting down — active response stood down, detection continues");
+            ladder.stand_down(Instant::now());
+        }
+    }
+
+    /// Whether systemd reported the host as stopping.
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 

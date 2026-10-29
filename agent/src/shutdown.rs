@@ -14,10 +14,13 @@ use crate::run_loop::Stopped;
 /// the heads anchored at stop, the pid file and the admin socket removed.
 /// A pump that exited is a failure (SNS-001): the watchdog restarts the
 /// agent.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stop(
     cli: &Cli,
     execq_handle: Option<northnarrow_agent::execq::Handle>,
     execpol_handle: Option<northnarrow_agent::execpol::Handle>,
+    bpf_guard: &northnarrow_agent::anti_tamper::bpf_defense::BpfGuard,
+    cow_guard: &northnarrow_agent::cow::CowGuard,
     audit_log: &AuditHandle,
     chain_anchor: &AnchorHandle,
     stopped: Stopped,
@@ -31,11 +34,12 @@ pub(crate) fn stop(
     // Lab PR 226: the kernel keeps the policy until its programs detach.
     northnarrow_agent::execpol::shutdown(execpol_handle);
     // The links go with the agent from here on: the self-check stops
-    // reporting them (a spurious signed bpf_link_missing otherwise).
-    northnarrow_agent::anti_tamper::bpf_defense::mark_stopping();
+    // reporting them (a spurious signed bpf_link_missing otherwise). R11c
+    // (lab PR 264): the object's own record, no longer a process-wide flag.
+    bpf_guard.mark_stopping();
     // Lab PR 222: the guard's fanotify group closes first — no open on a
     // protected scope waits on an agent that is leaving.
-    northnarrow_agent::cow::shutdown();
+    cow_guard.shutdown();
 
     if let Some(log) = &audit_log {
         let uptime = loop_started.elapsed().as_secs();

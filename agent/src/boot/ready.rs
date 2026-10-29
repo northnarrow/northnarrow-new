@@ -18,13 +18,18 @@ pub(crate) struct Armed {
 /// boot is done — the capability manifest and the trust level are signed
 /// before systemd hears the agent is ready (`sd_notify`), then the boot's
 /// transient heap goes back to the kernel (lab PR 231).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn arm(
     boot: &mut BootSequence,
     bpf_lsm_state: northnarrow_agent::boot::lsm::BpfLsm,
     self_test: northnarrow_agent::boot::deny_selftest::SelfTestOutcome,
+    trust_inputs: &northnarrow_agent::boot::trust::TrustInputs,
+    anti_tamper: &northnarrow_agent::anti_tamper::AttachReport,
     host_checks: Vec<northnarrow_agent::host_hardening::Check>,
     detect_only: bool,
     audit_log: &AuditHandle,
+    capability_manifest: &northnarrow_agent::boot::manifest::SignedManifest,
+    attach_points: &northnarrow_agent::boot::manifest::AttachPoints,
 ) -> Result<Armed> {
     // Lab PR 218 (external review G-12): every attach of this boot is done.
     // The capability manifest — kernel, BTF, LSMs, deny hooks, self-test,
@@ -33,14 +38,17 @@ pub(crate) fn arm(
     boot.enter(BootPhase::Run)?;
     {
         use northnarrow_agent::boot::manifest;
-        let deny = northnarrow_agent::anti_tamper::deny_report().unwrap_or_default();
+        // R11c (lab PR 264): what the attach and the self-test measured, as
+        // the phases hand it on (process-wide statics until then).
+        let deny = anti_tamper.deny.clone().unwrap_or_default();
         let resolved = northnarrow_agent::anti_tamper::btf_revalidate::resolved();
-        let trust = northnarrow_agent::boot::trust::current().unwrap_or_else(|| {
-            northnarrow_agent::boot::trust::Trust {
-                level: northnarrow_agent::boot::trust::TrustLevel::L0,
-                reasons: vec!["the boot measured nothing".to_string()],
-            }
-        });
+        let trust =
+            northnarrow_agent::boot::trust::current(Some(trust_inputs)).unwrap_or_else(|| {
+                northnarrow_agent::boot::trust::Trust {
+                    level: northnarrow_agent::boot::trust::TrustLevel::L0,
+                    reasons: vec!["the boot measured nothing".to_string()],
+                }
+            });
         let m = manifest::CapabilityManifest {
             manifest_version: manifest::MANIFEST_VERSION,
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -66,7 +74,7 @@ pub(crate) fn arm(
                 "observe"
             }
             .to_string(),
-            sensors: manifest::sensors(),
+            sensors: attach_points.list(),
             host_hardening: manifest::host_checks(&host_checks),
             detect_only,
             degradations: northnarrow_agent::boot::degradation::snapshot(),
@@ -86,7 +94,7 @@ pub(crate) fn arm(
                 "trust level L3: every mandatory deny hook attached and self-tested, nothing degraded"
             );
         }
-        northnarrow_agent::boot::manifest::sign(audit_log.as_ref(), m);
+        capability_manifest.sign(audit_log.as_ref(), m);
     }
     boot.done(BootStep::CapabilityManifest)?;
     northnarrow_agent::boot::degradation::mark_boot_over();

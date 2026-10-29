@@ -29,7 +29,6 @@
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use tracing::{info, warn};
@@ -392,9 +391,6 @@ pub fn parse_blocklist_overlay_text(
 /// holds. Turned on by the change that adds the producer.
 pub const TLS_FINGERPRINT_PRODUCER: bool = false;
 
-/// JA3 entries loaded at boot, for `net::blind_spots::inactive_net_rules`.
-static JA3_ENTRIES: AtomicUsize = AtomicUsize::new(0);
-
 pub fn ja3_entries_phrase(entries: usize) -> String {
     if entries == 1 {
         "1 JA3 blocklist entry".to_string()
@@ -415,16 +411,6 @@ pub fn ja3_coverage_gap(entries: usize, producer: bool) -> Option<String> {
             ja3_entries_phrase(entries)
         )
     })
-}
-
-/// Record the size of the JA3 list the boot loaded.
-pub fn note_ja3_entries(entries: usize) {
-    JA3_ENTRIES.store(entries, Ordering::Relaxed);
-}
-
-/// The size of the JA3 list the boot loaded ([`note_ja3_entries`]).
-pub fn ja3_entries() -> usize {
-    JA3_ENTRIES.load(Ordering::Relaxed)
 }
 
 /// JA3 fingerprint blocklist. JA3 hashes are 32-char lowercase

@@ -28,6 +28,9 @@ pub(crate) struct Attached {
     pub(crate) dns_cache: Arc<DnsCache>,
     pub(crate) execq_mode: northnarrow_agent::execq::Mode,
     pub(crate) execpol_mode: northnarrow_agent::execpol::Mode,
+    /// R11c (lab PR 264): the exec guards the load installed, with their
+    /// configuration and the kernel objects their controllers start on.
+    pub(crate) exec_guards: northnarrow_agent::exec_guards::AgentExecGuards,
     /// Where the ids of the agent's BPF programs go (DEP-006).
     pub(crate) own_prog_ids_file: Option<PathBuf>,
     pub(crate) sensor: SensorMultiplexer,
@@ -36,6 +39,14 @@ pub(crate) struct Attached {
     /// The exploit guard off or unavailable, signed once the audit log is
     /// open.
     pub(crate) exploit_guard_degraded: Option<String>,
+    /// R11c (lab PR 264): the running exploit guard (`None`: off or
+    /// unavailable) — its sampler's audit log, which the attest phase
+    /// binds, and its response, which the response phase sets.
+    pub(crate) exploit_guard: Option<northnarrow_agent::sensors::epg::ExploitGuard>,
+    /// R11c (lab PR 264): what the deny hooks' attach found — the deny
+    /// side, for the trust level and the manifest, and the degraded states,
+    /// signed by the attest phase (process-wide statics until then).
+    pub(crate) anti_tamper: northnarrow_agent::anti_tamper::AttachReport,
 }
 
 /// `BootPhase::Attach`: the eBPF object loads and the sensors attach
@@ -80,15 +91,18 @@ pub(crate) async fn load(
         dns_cache: Arc::clone(&dns_cache),
         lineage: lineage.clone(),
     };
-    // Tappa 10.9 step 2: which exec sensor the multiplexer attaches.
-    northnarrow_agent::sensors::exe_identity::want_lsm(cli.exec_sensor == ExecSensor::Lsm);
-    // Review 69: `sys_enter_openat` emits from the start only in tracepoint
-    // mode; otherwise `start_open_sensor` decides.
-    northnarrow_agent::sensors::open_sensor::want_tracepoint(
-        cli.file_open_sensor == FileOpenSensor::Tracepoint,
-    );
-    // Tappa 10.9 step 3: which DNS sensor the multiplexer attaches.
-    northnarrow_agent::sensors::dns_sensor::want_skb(cli.dns_sensor == DnsSensor::Skb);
+    // R11c (lab PR 264): what the load is told — it was set in process-wide
+    // switches before the multiplexer started.
+    let mut plan = northnarrow_agent::sensors::multiplexer::LoadPlan {
+        // Tappa 10.9 step 2: which exec sensor the multiplexer attaches.
+        exec_lsm: cli.exec_sensor == ExecSensor::Lsm,
+        // Review 69: `sys_enter_openat` emits from the start only in
+        // tracepoint mode; otherwise `start_open_sensor` decides.
+        open_tracepoint: cli.file_open_sensor == FileOpenSensor::Tracepoint,
+        // Tappa 10.9 step 3: which DNS sensor the multiplexer attaches.
+        dns_skb: cli.dns_sensor == DnsSensor::Skb,
+        ..Default::default()
+    };
     // Lab PR 223 (EXPERIMENTAL): the exec quarantine's mode, before the
     // multiplexer writes it into the kernel (the same detect-only inputs
     // the executor reads further down: a detect-only agent observes).
@@ -96,11 +110,10 @@ pub(crate) async fn load(
         cli.detect_only || northnarrow_agent::response::config::detect_only_env().is_some(),
     );
     let execq_mode = execq_cfg.mode;
-    northnarrow_agent::execq::configure(execq_cfg);
     // Lab PR 226 (EXPERIMENTAL): the exec policy, its signed table read
     // now (the kernel configuration is written and frozen when the
     // multiplexer starts); a detect-only agent audits.
-    let execpol_mode = {
+    let execpol_cfg = {
         use northnarrow_agent::execpol::{self as ep, Mode};
         let detect_only =
             cli.detect_only || northnarrow_agent::response::config::detect_only_env().is_some();
@@ -126,15 +139,20 @@ pub(crate) async fn load(
             northnarrow_agent::boot::degradation::report("exec_policy", detail);
         }
         let ep::BootTable { table, source, .. } = boot;
-        ep::configure(ep::Config {
+        ep::Config {
             mode,
             table,
             source,
             env: !cli.exec_policy_no_env,
             map: !cli.exec_policy_no_map,
-        });
-        mode
+        }
     };
+    let execpol_mode = execpol_cfg.mode;
+    // R11c (lab PR 264): the guards, with their configuration, given to the
+    // load, which installs them and leaves them their kernel objects (they
+    // were process-wide statics the start configured).
+    let mut exec_guards =
+        northnarrow_agent::exec_guards::AgentExecGuards::new(execq_cfg, execpol_cfg);
     // External audit DEP-006: the previous boot's program-id list goes before
     // this boot loads anything — its programs are replaced now, and a list
     // that cannot be rewritten must not outlive them (the scripts then fall
@@ -150,13 +168,18 @@ pub(crate) async fn load(
         }
     }
     // Lab PR 219: the exploit guard's task maps, sized at load.
-    northnarrow_agent::sensors::epg::set_task_map_entries(
+    plan.epg_task_maps = northnarrow_agent::sensors::epg::TaskMaps::for_variant(
         cli.exploit_guard_tasks,
         cli.exploit_guard.variant(),
     );
-    let (mut sensor, net_bufs) = match SensorMultiplexer::start_with_net(net_wiring, verified)
-        .await
-        .context("starting the sensor multiplexer (with net observation)")
+    let (mut sensor, net_bufs) = match SensorMultiplexer::start_with_net(
+        net_wiring,
+        &plan,
+        &mut exec_guards,
+        verified,
+    )
+    .await
+    .context("starting the sensor multiplexer (with net observation)")
     {
         Ok(started) => started,
         // R11b (lab PR 262): a load or a mandatory sensor's attach that
@@ -206,39 +229,48 @@ pub(crate) async fn load(
     // anti_tamper::attach). A kernel without `bpf` in its active LSMs was
     // refused by the preflight above (lab PR 218), or runs under that same
     // opt-in; hooks that attach and never run are the self-test's below.
-    if let Err(e) = sensor
+    let anti_tamper = match sensor
         .attach_anti_tamper(verified, &pids, &keep)
         .with_context(|| {
             format!(
                 "anti-tamper setup failed (agent_pid={agent_pid}) — \
                  refusing to start with a silently-absent protection"
             )
-        })
-    {
-        // R11b (lab PR 262): the deny hooks' shortfall refuses the start,
-        // signed; it is the attach's own result. The hooks that attached stay
-        // pinned: they protect the agent's files until the next start.
-        let why = format!("{e:#}");
-        error!(error = %why, "refusing to start: the deny hooks did not attach");
-        refusals.refuse(audit.log_mut(), Refusal::new("deny_hooks", why));
-    }
+        }) {
+        Ok(report) => report,
+        Err(e) => {
+            // R11b (lab PR 262): the deny hooks' shortfall refuses the start,
+            // signed; it is the attach's own result. The hooks that attached
+            // stay pinned: they protect the agent's files until the next
+            // start.
+            let why = format!("{e:#}");
+            error!(error = %why, "refusing to start: the deny hooks did not attach");
+            refusals.refuse(audit.log_mut(), Refusal::new("deny_hooks", why));
+        }
+    };
     boot.done(BootStep::AntiTamper)?;
     // Lab PR 219: the exploit post-condition guard, attached before the
     // agent's programs are recorded as its own (DEP-006), in detect mode
     // until the no-enforcement gate is resolved below. Off or unavailable
     // is attested once the audit log is open.
-    let exploit_guard_degraded: Option<String> =
+    let (exploit_guard, exploit_guard_degraded) =
         match sensor.attach_exploit_guard(verified, cli.exploit_guard.variant()) {
-            Ok(()) => None,
-            Err(_) if cli.exploit_guard == ExploitGuard::Off => Some(
-                "exploit post-condition guard off (--exploit-guard off / NN_EXPLOIT_GUARD=off): \
-                 kernel exploit post-conditions are not watched"
-                    .to_string(),
+            Ok(guard) => (Some(guard), None),
+            Err(_) if cli.exploit_guard == ExploitGuard::Off => (
+                None,
+                Some(
+                    "exploit post-condition guard off (--exploit-guard off / \
+                     NN_EXPLOIT_GUARD=off): kernel exploit post-conditions are not watched"
+                        .to_string(),
+                ),
             ),
-            Err(e) => Some(format!(
-                "exploit post-condition guard unavailable on this kernel: {e} — kernel exploit \
-                 post-conditions are not watched"
-            )),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "exploit post-condition guard unavailable on this kernel: {e} — kernel \
+                     exploit post-conditions are not watched"
+                )),
+            ),
         };
     // External audit DEP-006: the ids install.sh / uninstall.sh wait for.
     record_own_prog_ids(own_prog_ids_file.as_deref(), sensor.ebpf_mut());
@@ -248,16 +280,26 @@ pub(crate) async fn load(
         dns_cache,
         execq_mode,
         execpol_mode,
+        exec_guards,
         own_prog_ids_file,
         sensor,
         net_bufs,
         exploit_guard_degraded,
+        exploit_guard,
+        anti_tamper,
     })
 }
 
 /// What [`self_test`] measured.
 pub(crate) struct SelfTested {
     pub(crate) self_test: northnarrow_agent::boot::deny_selftest::SelfTestOutcome,
+    /// R11c (lab PR 264): the self-test's own denial, which the event loop
+    /// takes (a process-wide slot until then).
+    pub(crate) expected_denial: northnarrow_agent::boot::deny_selftest::ExpectedDenial,
+    /// R11c (lab PR 264): the boot's measurements the trust level is
+    /// computed from (the manifest's, the admin socket's status); they were
+    /// a process-wide static this phase set.
+    pub(crate) trust_inputs: northnarrow_agent::boot::trust::TrustInputs,
 }
 
 /// `BootPhase::SelfTest` (lab PR 218, external review AR-09 / G-12): one
@@ -265,6 +307,7 @@ pub(crate) struct SelfTested {
 /// run refuse the start (signed, `refusals`: into `audit`, the log the
 /// integrity phase opened) unless the degraded mode is asked for. It needs
 /// the attached hooks: after the attach, by its nature.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn self_test(
     boot: &mut BootSequence,
     refusals: &refusal::Context<'_>,
@@ -272,6 +315,7 @@ pub(crate) fn self_test(
     allow_degraded: bool,
     bpf_lsm_state: &northnarrow_agent::boot::lsm::BpfLsm,
     detect_only: bool,
+    anti_tamper: &northnarrow_agent::anti_tamper::AttachReport,
 ) -> Result<SelfTested> {
     // Lab PR 218 (external review AR-09 / G-12): one deny hook exercised
     // against the agent itself — an unprotected child signals it and must
@@ -279,7 +323,7 @@ pub(crate) fn self_test(
     // LSMs, Ubuntu) refuse the start unless NN_ANTI_TAMPER_ALLOW_DEGRADED=1;
     // an unmeasured test is signed and lowers the trust level to L1.
     boot.enter(BootPhase::SelfTest)?;
-    let self_test =
+    let (self_test, expected_denial) =
         northnarrow_agent::boot::deny_selftest::run(std::path::Path::new("/proc/self/exe"));
     let self_test_detail = northnarrow_agent::boot::deny_selftest::report(&self_test);
     if self_test == northnarrow_agent::boot::deny_selftest::SelfTestOutcome::NotDenied
@@ -298,20 +342,22 @@ pub(crate) fn self_test(
     if let Some(detail) = &self_test_detail {
         northnarrow_agent::boot::degradation::report("deny_self_test", detail);
     }
-    {
-        let deny = northnarrow_agent::anti_tamper::deny_report().unwrap_or_default();
-        northnarrow_agent::boot::trust::set_boot_inputs(
-            northnarrow_agent::boot::trust::TrustInputs {
-                bpf_lsm: bpf_lsm_state.clone(),
-                deny_expected: deny.expected,
-                deny_attached: deny.attached,
-                self_test: self_test.clone(),
-                detect_only,
-            },
-        );
-    }
+    let trust_inputs = {
+        let deny = anti_tamper.deny.clone().unwrap_or_default();
+        northnarrow_agent::boot::trust::TrustInputs {
+            bpf_lsm: bpf_lsm_state.clone(),
+            deny_expected: deny.expected,
+            deny_attached: deny.attached,
+            self_test: self_test.clone(),
+            detect_only,
+        }
+    };
     boot.done(BootStep::DenySelfTest)?;
-    Ok(SelfTested { self_test })
+    Ok(SelfTested {
+        self_test,
+        expected_denial,
+        trust_inputs,
+    })
 }
 
 /// External audit DEP-006: where the ids of the agent's loaded BPF programs

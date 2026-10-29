@@ -261,6 +261,10 @@ pub struct DetectionAdminState {
     /// Path to `status_events.jsonl`. `dispatch_detections` builds the
     /// `{id -> current status}` overlay from here.
     pub status_events_path: PathBuf,
+    /// External audit NN-AUD-112: the served rows that do not verify,
+    /// reported (signed) — R11c (lab PR 264): the read path's own, with the
+    /// start's audit log; it was process-wide.
+    pub unverified: Arc<crate::chains::UnverifiedRows>,
 }
 
 /// External audit CMB-016 — what the response verbs (`nn-admin response
@@ -280,6 +284,43 @@ pub struct ResponseAdminState {
     /// External audit CMB-027: the ladder's transitions the signed audit
     /// log did not get when they happened.
     pub combat_evidence: Arc<dyn Fn() -> crate::combat::EvidenceCounts + Send + Sync>,
+}
+
+/// R11c (lab PR 264) — what the start hands the verbs explicitly, which
+/// they read through process-wide globals the start set until then. Always
+/// present, like [`AdminReadPaths`]; `Default` is a handle of its own for
+/// each field (tests and the legacy serve entry points: nothing the start
+/// made reaches them).
+#[derive(Clone, Default)]
+pub struct AdminHandles {
+    /// The signed per-rule response policy in force: the start's handle,
+    /// the one the engine and the posture read. `config overlay set` of a
+    /// `rule-policy` installs the stored policy through it, applied at the
+    /// engine's and the posture's next event (lab PR 236; it was
+    /// `rule_policy::install_global`).
+    pub rule_policy: crate::decision::rule_policy::PolicyHandle,
+    /// The boot's measurements the trust level is computed from (`None`:
+    /// nothing measured); the status adds the degradations recorded since.
+    /// It was the process-wide `trust::BOOT_INPUTS`.
+    pub trust_inputs: Option<crate::boot::trust::TrustInputs>,
+    /// The boot's signed capability manifest, once the run phase signed it
+    /// (it was the process-wide `manifest::CURRENT`).
+    pub capability_manifest: crate::boot::manifest::SignedManifest,
+    /// Lab PR 225: the ransomware tracker and the security-tool judge whose
+    /// counters the status reports (they were published process-wide).
+    pub ransom_tracker: Option<Arc<crate::impact::RansomTracker>>,
+    pub defense_detector: Option<Arc<crate::impair::DefenseDetector>>,
+    /// Lab PR 222: the copy-on-first-write guard of this boot, for the
+    /// status and `remediate ransomware` (`None`: not decided; it was a
+    /// process-wide state).
+    pub cow_guard: Option<crate::cow::CowGuard>,
+    /// The overlay gate of this boot: where each overlay was read, so
+    /// `config overlay set` writes where the next boot reads (`None`: the
+    /// default paths; it was a process-wide map every gate filled).
+    pub overlay_gate: Option<Arc<crate::config::overlay_auth::OverlayGate>>,
+    /// The JA3 list's size the boot loaded, for the inactive network rules
+    /// (it was a process-wide value the start noted).
+    pub ja3_entries: usize,
 }
 
 /// External audit NN-AUD-082 — the files the read verbs serve, from the

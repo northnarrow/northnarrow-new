@@ -71,7 +71,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -173,6 +173,19 @@ pub const RUNTIME_CHILD_CAP: usize = crate::fim::attach::WATCHED_PATHS_CAPACITY 
 pub struct InodePathMap {
     inner: parking_lot::RwLock<PathMapInner>,
     child_cap: usize,
+    /// External audit NN-AUD-120: the signed audit log a full watch set is
+    /// recorded in ([`note_watch_pressure`]), bound by the start
+    /// ([`Self::bind_audit_log`]; R11c, lab PR 264: it was a process-wide
+    /// static a setter filled, `set_audit_log`).
+    audit: crate::late_audit::LateAudit,
+    /// The canaries' inodes whose READ opens this drain forwards to the
+    /// rules ([`Self::read_forward`]; R11c, lab PR 264: the canary indexes
+    /// publish into it, it was a process-wide set).
+    read_forward: crate::canary::read_forward::ReadForward,
+    /// The drain's retry queues (`DrainQueues`): this map's, as the entries
+    /// they hold are settled against it (R11c, lab PR 264: they were a
+    /// process-wide static, and a thread-local one under test).
+    queues: parking_lot::Mutex<DrainQueues>,
 }
 
 #[derive(Debug, Default)]
@@ -248,7 +261,23 @@ impl InodePathMap {
         Self {
             inner: parking_lot::RwLock::new(PathMapInner::default()),
             child_cap,
+            audit: crate::late_audit::LateAudit::new(),
+            read_forward: crate::canary::read_forward::ReadForward::new(),
+            queues: parking_lot::Mutex::new(DrainQueues::new()),
         }
+    }
+
+    /// The canaries' inodes whose reads this drain forwards: the set the
+    /// start gives the canary indexes, which publish into it.
+    pub fn read_forward(&self) -> &crate::canary::read_forward::ReadForward {
+        &self.read_forward
+    }
+
+    /// Hand the signed audit log to the FIM (the start, once the map is
+    /// made): a full watch set is recorded there (external audit
+    /// NN-AUD-120).
+    pub fn bind_audit_log(&self, log: Option<crate::late_audit::AuditHandle>) {
+        self.audit.bind(log);
     }
 
     /// Map a configured path: [`Self::insert_as`] with
@@ -796,6 +825,16 @@ struct DrainQueues {
     chain_awaiting: Vec<String>,
 }
 
+impl std::fmt::Debug for DrainQueues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DrainQueues")
+            .field("replacements", &self.replacements.len())
+            .field("awaiting_return", &self.awaiting_return.len())
+            .field("chain_awaiting", &self.chain_awaiting.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl DrainQueues {
     fn new() -> Self {
         Self {
@@ -810,29 +849,14 @@ impl DrainQueues {
     }
 }
 
-#[cfg(not(test))]
-static QUEUES: LazyLock<parking_lot::Mutex<DrainQueues>> =
-    LazyLock::new(|| parking_lot::Mutex::new(DrainQueues::new()));
-
-// Tests drive the drain functions in parallel, each with its own map: one
-// set of queues per test thread, so one test's retry pass does not settle
-// another's entries against the wrong map.
-#[cfg(test)]
-thread_local! {
-    static QUEUES: std::cell::RefCell<DrainQueues> = std::cell::RefCell::new(DrainQueues::new());
-}
-
-/// Work on the drain's queues. External audit NN-AUD-119: never across a
-/// `stat` — entries are taken out, worked on, and put back.
-fn queues<R>(f: impl FnOnce(&mut DrainQueues) -> R) -> R {
-    #[cfg(not(test))]
-    {
-        f(&mut QUEUES.lock())
-    }
-    #[cfg(test)]
-    {
-        QUEUES.with(|q| f(&mut q.borrow_mut()))
-    }
+/// Work on `path_map`'s queues (one set per map: a retry pass settles its
+/// entries against the map they came from — the tests, which drive the
+/// drain functions in parallel each with its own map, needed a thread's
+/// set of their own while the queues were process-wide; R11c, lab PR 264).
+/// External audit NN-AUD-119: never across a `stat` — entries are taken
+/// out, worked on, and put back.
+fn queues<R>(path_map: &InodePathMap, f: impl FnOnce(&mut DrainQueues) -> R) -> R {
+    f(&mut path_map.queues.lock())
 }
 
 const ENROLL_RETRY_FOR: Duration = Duration::from_secs(2);
@@ -887,7 +911,13 @@ const SETATTR_GAP_MAX: Duration = Duration::from_millis(250);
 /// — or for [`ENROLL_RETRY_FOR`]: a setattr that changed nothing (a touch,
 /// a chmod to the same mode) or was refused. An entry already waiting for
 /// the inode keeps its event and its `stat`: a change since either is seen.
-fn await_setattr(key: InodeKey, path: &str, raw: &FimDriftRaw, seen: ChangeMark) {
+fn await_setattr(
+    path_map: &InodePathMap,
+    key: InodeKey,
+    path: &str,
+    raw: &FimDriftRaw,
+    seen: ChangeMark,
+) {
     let now = Instant::now();
     let pending = PendingSetattr {
         path: path.to_string(),
@@ -897,12 +927,12 @@ fn await_setattr(key: InodeKey, path: &str, raw: &FimDriftRaw, seen: ChangeMark)
         next: now + RETRY_EVERY,
         gap: RETRY_EVERY,
     };
-    queues(|q| q.setattr.push(key, pending));
+    queues(path_map, |q| q.setattr.push(key, pending));
 }
 
 /// Lab PR 229: the waiting setattrs; `true` while some still wait.
-fn retry_setattrs(examined: &mut usize) -> bool {
-    let todo = queues(|q| q.setattr.take());
+fn retry_setattrs(path_map: &InodePathMap, examined: &mut usize) -> bool {
+    let todo = queues(path_map, |q| q.setattr.take());
     let now = Instant::now();
     let mut left = Vec::new();
     for (key, mut p) in todo {
@@ -914,7 +944,7 @@ fn retry_setattrs(examined: &mut usize) -> bool {
         match change_mark(&p.path) {
             // Gone: its unlink or rename reports it.
             None => {}
-            Some(mark) if mark != p.seen => queue_replacement(&p.path, &p.raw),
+            Some(mark) if mark != p.seen => queue_replacement(path_map, &p.path, &p.raw),
             Some(_) if p.since.elapsed() >= ENROLL_RETRY_FOR => {}
             Some(_) => {
                 p.gap = (p.gap * 2).min(SETATTR_GAP_MAX);
@@ -923,7 +953,7 @@ fn retry_setattrs(examined: &mut usize) -> bool {
             }
         }
     }
-    queues(|q| {
+    queues(path_map, |q| {
         q.setattr.put_back(left);
         !q.setattr.is_empty()
     })
@@ -1053,8 +1083,8 @@ impl Pacer {
 /// baseline, attributed to the renamer.
 const REPLACEMENTS_MAX: usize = 1024;
 
-fn queue_replacement(path: &str, renamed: &FimDriftRaw) {
-    queues(|q| {
+fn queue_replacement(path_map: &InodePathMap, path: &str, renamed: &FimDriftRaw) {
+    queues(path_map, |q| {
         if q.replacements.len() < REPLACEMENTS_MAX {
             q.replacements.push((path.to_string(), *renamed));
         } else {
@@ -1065,8 +1095,8 @@ fn queue_replacement(path: &str, renamed: &FimDriftRaw) {
 
 /// The queued replacements as modification events of the file now at each
 /// path, by the renamer. A path holding nothing any more is dropped.
-fn replacement_raws() -> Vec<FimDriftRaw> {
-    let queued = queues(|q| std::mem::take(&mut q.replacements));
+fn replacement_raws(path_map: &InodePathMap) -> Vec<FimDriftRaw> {
+    let queued = queues(path_map, |q| std::mem::take(&mut q.replacements));
     queued
         .into_iter()
         .filter_map(|(path, raw)| replacement_raw(&path, raw))
@@ -1108,25 +1138,25 @@ fn retry_pending_enrollments(
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
 ) -> RetryPass {
     let mut examined = 0;
-    let renames = queues(|q| q.rename.take());
+    let renames = queues(path_map, |q| q.rename.take());
     examined += renames.len();
     let mut left = Vec::new();
     for (key, p) in renames {
         if settle_rename(&key, &p.path, p.class, path_map, watched_paths) {
             if let Some(raw) = &p.replaced {
-                queue_replacement(&p.path, raw);
+                queue_replacement(path_map, &p.path, raw);
             }
         } else if p.since.elapsed() < ENROLL_RETRY_FOR {
             left.push((key, p));
         }
     }
-    let renames_waiting = queues(|q| {
+    let renames_waiting = queues(path_map, |q| {
         q.rename.put_back(left);
         !q.rename.is_empty()
     });
     let enrolls_waiting = retry_enrollments(path_map, watched_paths, &mut examined);
     let chains_waiting = retry_chain_checks(path_map, watched_paths, &mut examined);
-    let setattrs_waiting = retry_setattrs(&mut examined);
+    let setattrs_waiting = retry_setattrs(path_map, &mut examined);
     RetryPass {
         waiting: renames_waiting || enrolls_waiting || chains_waiting || setattrs_waiting,
         examined,
@@ -1139,7 +1169,7 @@ fn retry_enrollments(
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
     examined: &mut usize,
 ) -> bool {
-    let todo = queues(|q| q.enroll.take());
+    let todo = queues(path_map, |q| q.enroll.take());
     *examined += todo.len();
     let left: Vec<(String, Instant)> = todo
         .into_iter()
@@ -1148,7 +1178,7 @@ fn retry_enrollments(
                 && since.elapsed() < ENROLL_RETRY_FOR
         })
         .collect();
-    queues(|q| {
+    queues(path_map, |q| {
         q.enroll.put_back(left);
         !q.enroll.is_empty()
     })
@@ -1164,26 +1194,26 @@ fn retry_chain_checks(
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
     examined: &mut usize,
 ) -> bool {
-    let todo = queues(|q| q.chain.take());
+    let todo = queues(path_map, |q| q.chain.take());
     *examined += todo.len();
     let mut left = Vec::new();
     for (owner, (since, raw)) in todo {
         if chain_keys_now(&owner) != path_map.chain(&owner) {
             enroll_chain(&owner, path_map, watched_paths);
-            queue_replacement(&owner, &raw);
+            queue_replacement(path_map, &owner, &raw);
         } else if since.elapsed() < ENROLL_RETRY_FOR {
             left.push((owner, (since, raw)));
         }
     }
-    queues(|q| {
+    queues(path_map, |q| {
         q.chain.put_back(left);
         !q.chain.is_empty()
     })
 }
 
 /// `true` while a retry queue holds entries.
-fn retries_waiting() -> bool {
-    queues(|q| {
+fn retries_waiting(path_map: &InodePathMap) -> bool {
+    queues(path_map, |q| {
         !q.rename.is_empty() || !q.enroll.is_empty() || !q.chain.is_empty() || !q.setattr.is_empty()
     })
 }
@@ -1213,14 +1243,14 @@ fn settle_rename(
     // enrolled by the directory's own event, and children renamed away
     // (`crontab`'s temporary file) filled the list for good.
     if !enroll_path(path, class, path_map, watched_paths) && class != WatchClass::RuntimeChild {
-        await_return(path, class);
+        await_return(path_map, path, class);
     }
     true
 }
 
 /// Wait for a file to come back at `path`, watched as `class`.
-fn await_return(path: &str, class: WatchClass) {
-    queues(|q| {
+fn await_return(path_map: &InodePathMap, path: &str, class: WatchClass) {
+    queues(path_map, |q| {
         let awaiting = &mut q.awaiting_return;
         if !awaiting.iter().any(|(p, _)| p == path) && awaiting.len() < AWAITING_RETURN_MAX {
             awaiting.push((path.to_string(), class));
@@ -1244,12 +1274,12 @@ fn returned_paths(
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
 ) -> Vec<InodeKey> {
-    let todo = queues(|q| std::mem::take(&mut q.awaiting_return));
+    let todo = queues(path_map, |q| std::mem::take(&mut q.awaiting_return));
     let mut back = Vec::new();
     for (path, class) in todo {
         match key_for_path(&fs_path(&path)) {
             Ok(key) if enroll_path(&path, class, path_map, watched_paths) => back.push(key),
-            _ => await_return(&path, class),
+            _ => await_return(path_map, &path, class),
         }
     }
     back
@@ -1263,8 +1293,8 @@ fn returned_paths(
 const CHAIN_AWAITING_MAX: usize = 256;
 
 /// Wait for the final target behind `owner` to exist again.
-pub(crate) fn await_chain_repair(owner: &str) {
-    queues(|q| {
+pub(crate) fn await_chain_repair(path_map: &InodePathMap, owner: &str) {
+    queues(path_map, |q| {
         let awaiting = &mut q.chain_awaiting;
         if !awaiting.iter().any(|p| p == owner) && awaiting.len() < CHAIN_AWAITING_MAX {
             awaiting.push(owner.to_string());
@@ -1279,7 +1309,7 @@ fn repaired_chains(
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
 ) -> Vec<InodeKey> {
-    let todo = queues(|q| std::mem::take(&mut q.chain_awaiting));
+    let todo = queues(path_map, |q| std::mem::take(&mut q.chain_awaiting));
     let mut back = Vec::new();
     for owner in todo {
         match crate::fim::attach::plan_path_watches(Path::new(&owner)) {
@@ -1287,7 +1317,7 @@ fn repaired_chains(
                 enroll_chain(&owner, path_map, watched_paths);
                 back.push(plan.own);
             }
-            Ok(_) => await_chain_repair(&owner),
+            Ok(_) => await_chain_repair(path_map, &owner),
             Err(_) => {}
         }
     }
@@ -1296,8 +1326,10 @@ fn repaired_chains(
 
 /// `true` while a renamed-away path waits for its file, or a symlinked one
 /// for its target.
-fn awaiting_returns() -> bool {
-    queues(|q| !q.awaiting_return.is_empty() || !q.chain_awaiting.is_empty())
+fn awaiting_returns(path_map: &InodePathMap) -> bool {
+    queues(path_map, |q| {
+        !q.awaiting_return.is_empty() || !q.chain_awaiting.is_empty()
+    })
 }
 
 /// External audit FIMP-005: the drift record for a file back at a watched
@@ -1396,7 +1428,7 @@ fn enroll_chain(
         watch_inode(key, owner, WatchClass::ChainHop, path_map, watched_paths);
     }
     if broken {
-        await_chain_repair(owner);
+        await_chain_repair(path_map, owner);
     }
 }
 
@@ -1510,17 +1542,6 @@ impl WatchPressure {
 static WATCH_PRESSURE: parking_lot::Mutex<WatchPressure> =
     parking_lot::Mutex::new(WatchPressure::new());
 
-/// The signed audit log, for [`note_watch_pressure`].
-static FIM_AUDIT_LOG: OnceLock<Arc<parking_lot::Mutex<crate::audit::AuditLog>>> = OnceLock::new();
-
-/// Hand the signed audit log to the FIM (from `main`, once it exists): a
-/// full watch set is recorded there (external audit NN-AUD-120).
-pub fn set_audit_log(log: Option<Arc<parking_lot::Mutex<crate::audit::AuditLog>>>) {
-    if let Some(l) = log {
-        let _ = FIM_AUDIT_LOG.set(l);
-    }
-}
-
 fn note_watch_pressure(evicted: u64, refused: u64, path: &str, path_map: &InodePathMap) {
     let (log, attest, evicted_total, refused_total) = {
         let mut p = WATCH_PRESSURE.lock();
@@ -1544,7 +1565,7 @@ fn note_watch_pressure(evicted: u64, refused: u64, path: &str, path_map: &InodeP
         );
     }
     if attest {
-        if let Some(log) = FIM_AUDIT_LOG.get() {
+        if let Some(log) = path_map.audit.get() {
             let draft = watch_map_full_draft(evicted_total, refused_total, children, cap);
             if let Err(e) = log.lock().append(draft) {
                 warn!(
@@ -1744,7 +1765,7 @@ pub fn process_drift(
                     ident = child_ident(&child, op == FimOp::Renamed, path_map);
                     child_read = true;
                     if !enroll_path(&child, WatchClass::RuntimeChild, path_map, watched_paths) {
-                        queues(|q| q.enroll.push(child.clone(), Instant::now()));
+                        queues(path_map, |q| q.enroll.push(child.clone(), Instant::now()));
                     }
                     // A rename INTO a watched dir is a drop → present as Created
                     // (single userland normalization point; the dir-class rules
@@ -1764,7 +1785,9 @@ pub fn process_drift(
     if class == WatchClass::ChainHop
         && (op == FimOp::Deleted || (op == FimOp::Renamed && !moved_in_leaf))
     {
-        queues(|q| q.chain.push(path.clone(), (Instant::now(), *raw)));
+        queues(path_map, |q| {
+            q.chain.push(path.clone(), (Instant::now(), *raw))
+        });
         return Ok(false);
     }
     if op == FimOp::Deleted {
@@ -1777,7 +1800,7 @@ pub fn process_drift(
         let replaced = (raw.op_flags & FIM_RENAME_REPLACED != 0).then_some(*raw);
         if settle_rename(&key, &path, class, path_map, watched_paths) {
             if let Some(r) = &replaced {
-                queue_replacement(&path, r);
+                queue_replacement(path_map, &path, r);
             }
         } else {
             let pending = PendingRename {
@@ -1786,7 +1809,7 @@ pub fn process_drift(
                 since: Instant::now(),
                 replaced,
             };
-            queues(|q| {
+            queues(path_map, |q| {
                 q.rename.push_with(key, pending, |queued, new| {
                     if queued.replaced.is_none() {
                         queued.replaced = new.replaced;
@@ -1823,7 +1846,7 @@ pub fn process_drift(
         // (NN-L-FIM-011..017, matched by path) and the K3 file-canary
         // detector (matched by inode, published by the canary index
         // rebuilds). Everything else is dropped as non-drift noise.
-        let is_canary = crate::canary::read_forward::contains(&key);
+        let is_canary = path_map.read_forward().contains(&key);
         if !is_canary && !crate::fim::rules::is_credential_path(&path) {
             debug!(
                 target: "fim.drain",
@@ -1944,7 +1967,7 @@ pub fn process_drift(
         // read above may have come first. The event waits for it.
         if op == FimOp::Modified {
             if let Some(seen) = content.as_ref().and_then(|c| c.mark) {
-                await_setattr(key, &path, raw, seen);
+                await_setattr(path_map, key, &path, raw, seen);
             }
         }
         // External audit NN-AUD-121 (FIMP-009): the kernel saw a write, and
@@ -2358,12 +2381,12 @@ pub async fn drain_loop(
             })
             .waiting
         } else {
-            retries_waiting()
+            retries_waiting(&inode_map)
         };
         // External audit FIMP-005: a file back at a watched path it was
         // renamed away from is watched again and checked as a creation.
         // NN-AUD-122: so is a symlinked path whose target is back.
-        if awaiting_returns() && returns_pacer.due(now) {
+        if awaiting_returns(&inode_map) && returns_pacer.due(now) {
             let back = off_the_runtime(|| {
                 let mut back = returned_paths(inode_map.as_ref(), watched_paths.as_deref());
                 back.extend(repaired_chains(
@@ -2388,7 +2411,7 @@ pub async fn drain_loop(
             }
         }
         // External audit FIMR-004: files renamed over watched ones, landed.
-        for raw in replacement_raws() {
+        for raw in replacement_raws(&inode_map) {
             if let Err(e) = check(&raw, &mut outbox) {
                 warn!(target: "fim.drain", error = %format!("{e:#}"), "drift check of a replaced file failed");
             }
@@ -2400,7 +2423,7 @@ pub async fn drain_loop(
         }
         let wake_after = if waiting {
             RETRY_EVERY
-        } else if awaiting_returns() {
+        } else if awaiting_returns(&inode_map) {
             AWAITING_RETURN_EVERY
         } else {
             CHILD_GC_EVERY
@@ -3179,17 +3202,21 @@ mod tests {
         // the re-read comes first: nothing to see yet
         let (emitted, out) = fx.check(&raw);
         assert!(!emitted && out.is_empty() && fx.rows().is_empty());
-        assert_eq!(queues(|q| q.setattr.len()), 1, "the event waits");
+        assert_eq!(
+            queues(&fx.path_map, |q| q.setattr.len()),
+            1,
+            "the event waits"
+        );
         // a look before anything landed keeps it waiting
         std::thread::sleep(RETRY_EVERY + Duration::from_millis(1));
         assert!(retry_pending_enrollments(&fx.path_map, None).waiting);
-        assert!(replacement_raws().is_empty());
+        assert!(replacement_raws(&fx.path_map).is_empty());
         // the chmod lands
         std::fs::set_permissions(&fx.file, std::fs::Permissions::from_mode(0o4755)).unwrap();
         std::thread::sleep(2 * RETRY_EVERY + Duration::from_millis(1));
         let pass = retry_pending_enrollments(&fx.path_map, None);
         assert!(!pass.waiting && pass.examined == 1, "{pass:?}");
-        let raws = replacement_raws();
+        let raws = replacement_raws(&fx.path_map);
         assert_eq!(raws.len(), 1);
         let (emitted, mut out) = fx.check(&raws[0]);
         assert!(emitted);
@@ -3205,7 +3232,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["op"], FimOp::AttrChanged as u8);
         assert_eq!(rows[0]["attrs"]["mode_after"], 0o4755);
-        assert_eq!(queues(|q| q.setattr.len()), 0);
+        assert_eq!(queues(&fx.path_map, |q| q.setattr.len()), 0);
     }
 
     /// Lab PR 229: a setattr that changes nothing (a touch, a chmod to the
@@ -3219,17 +3246,21 @@ mod tests {
             let (emitted, _) = fx.check(&raw);
             assert!(!emitted);
         }
-        assert_eq!(queues(|q| q.setattr.len()), 1, "one wait per inode");
-        queues(|q| {
+        assert_eq!(
+            queues(&fx.path_map, |q| q.setattr.len()),
+            1,
+            "one wait per inode"
+        );
+        queues(&fx.path_map, |q| {
             for p in q.setattr.entries.values_mut() {
                 p.since -= ENROLL_RETRY_FOR;
                 p.next = Instant::now();
             }
         });
         assert!(!retry_pending_enrollments(&fx.path_map, None).waiting);
-        assert!(replacement_raws().is_empty());
+        assert!(replacement_raws(&fx.path_map).is_empty());
         assert!(fx.rows().is_empty());
-        assert_eq!(queues(|q| q.setattr.len()), 0);
+        assert_eq!(queues(&fx.path_map, |q| q.setattr.len()), 0);
     }
 
     /// Lab PR 229: a content change read together with a mode change (a
@@ -3581,7 +3612,7 @@ mod tests {
         .unwrap();
         assert!(matches!(&out[..], [Event::Fim(fe)] if fe.op == FimOp::Renamed));
 
-        let replaced: Vec<_> = replacement_raws()
+        let replaced: Vec<_> = replacement_raws(&path_map)
             .into_iter()
             .filter(|r| r.modifier_pid == 4242)
             .collect();
@@ -3710,7 +3741,7 @@ mod tests {
 
         // Moved back: the file is watched again (and drift-checked as a
         // creation) once the drain looks for returns.
-        assert!(queues(|q| {
+        assert!(queues(&path_map, |q| {
             q.awaiting_return
                 .iter()
                 .any(|(p, c)| *p == watched_str && *c == WatchClass::Configured)
@@ -3722,7 +3753,7 @@ mod tests {
             path_map.lookup(&back).as_deref(),
             Some(watched_str.as_str())
         );
-        assert!(!queues(|q| q
+        assert!(!queues(&path_map, |q| q
             .awaiting_return
             .iter()
             .any(|(p, _)| *p == watched_str)));
@@ -4566,7 +4597,7 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(queues(|q| q.enroll.len()), 1);
+        assert_eq!(queues(&path_map, |q| q.enroll.len()), 1);
         let watched = dir.path().join("sshd_config");
         std::fs::write(&watched, b"x").unwrap();
         let key = key_for_path(&watched).unwrap();
@@ -4588,10 +4619,10 @@ mod tests {
             )
             .unwrap();
         }
-        let renames = queues(|q| q.rename.take());
+        let renames = queues(&path_map, |q| q.rename.take());
         assert_eq!(renames.len(), 1, "one entry per inode");
         assert!(renames[&key].replaced.is_some(), "the replacement is kept");
-        let _ = queues(|q| q.enroll.take());
+        let _ = queues(&path_map, |q| q.enroll.take());
     }
 
     /// External audit NN-AUD-119 (FIMP-007): however many events a burst
@@ -4603,7 +4634,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path_map = InodePathMap::new();
         let t0 = Instant::now();
-        queues(|q| {
+        queues(&path_map, |q| {
             for i in 0..100 {
                 let gone = dir.path().join(format!("short-lived.{i}"));
                 q.enroll.push(gone.to_string_lossy().into_owned(), t0);
@@ -4629,7 +4660,7 @@ mod tests {
         assert_eq!(examined, 100);
         turn(t0 + RETRY_EVERY, &mut examined);
         assert_eq!(examined, 200);
-        let _ = queues(|q| q.enroll.take());
+        let _ = queues(&path_map, |q| q.enroll.take());
     }
 
     /// External audit NN-AUD-120 (FIMP-008): with the kernel map full,
@@ -5010,7 +5041,7 @@ mod tests {
             retry_pending_enrollments(&path_map, Some(&wp)).waiting,
             "not landed yet"
         );
-        assert!(replacement_raws().is_empty());
+        assert!(replacement_raws(&path_map).is_empty());
         std::os::unix::fs::symlink(d.join("evil"), d.join("alternatives/nc.tmp")).unwrap();
         std::fs::rename(d.join("alternatives/nc.tmp"), d.join("alternatives/nc")).unwrap();
         retry_pending_enrollments(&path_map, Some(&wp));
@@ -5023,7 +5054,7 @@ mod tests {
             !wp.lock().holds(&old_target),
             "nc.openbsd is no longer behind it"
         );
-        let checks = replacement_raws();
+        let checks = replacement_raws(&path_map);
         assert_eq!(checks.len(), 1);
         assert!(run(&checks[0], &mut db, &mut out));
         let Event::Fim(fe) = &out[0] else {
@@ -5043,14 +5074,14 @@ mod tests {
         ));
         retry_pending_enrollments(&path_map, Some(&wp));
         assert_eq!(path_map.chain(&nc), vec![new_alt]);
-        assert!(awaiting_returns(), "waits for the target");
+        assert!(awaiting_returns(&path_map), "waits for the target");
         std::fs::write(d.join("evil"), b"back").unwrap();
         let back = repaired_chains(&path_map, Some(&wp));
         assert_eq!(back, vec![key_for_path(&d.join("nc")).unwrap()]);
         let evil = key_for_path(&d.join("evil")).unwrap();
         assert!(wp.lock().holds(&evil));
-        assert!(!awaiting_returns());
-        let _ = replacement_raws();
+        assert!(!awaiting_returns(&path_map));
+        let _ = replacement_raws(&path_map);
 
         // the watched link itself removed: the chain behind it goes too,
         // and comes back with it

@@ -48,7 +48,14 @@ pub(crate) fn start(
     audit_log: &AuditHandle,
     execq_exec_cfg: ExecutorConfig,
     execpol_mode: northnarrow_agent::execpol::Mode,
+    exec_guards: northnarrow_agent::exec_guards::AgentExecGuards,
 ) -> Result<Tasks> {
+    let northnarrow_agent::exec_guards::AgentExecGuards {
+        execq: execq_cfg,
+        execpol: execpol_cfg,
+        execq_kernel,
+        execpol_kernel,
+    } = exec_guards;
     // Decay loop: walks the posture down (ALERTED→OBSERVING after 1h
     // idle, ENGAGED→ALERTED after 24h idle, and — external audit POS-001 —
     // an unlocked COMBAT, reached on heuristics alone, to ENGAGED after
@@ -89,11 +96,8 @@ pub(crate) fn start(
     let execq_handle = if execq_mode == northnarrow_agent::execq::Mode::Off {
         None
     } else {
-        let cfg = northnarrow_agent::execq::config()
-            .cloned()
-            .unwrap_or_default();
         let (hashes, hashes_source) = match overlay_gate
-            .verified(OverlayKind::ExecqHashes, &cfg.hashes_local)
+            .verified(OverlayKind::ExecqHashes, &execq_cfg.hashes_local)
         {
             northnarrow_agent::config::overlay_auth::Verified::Content { path, text } => {
                 match nn_proto::execq::parse_hash_list(&text) {
@@ -115,12 +119,16 @@ pub(crate) fn start(
             audit: audit_log.clone(),
             posture: Box::new(move || posture_for_execq.current_kind()),
         };
-        match northnarrow_agent::execq::start(northnarrow_agent::execq::StartDeps {
-            hashes,
-            hashes_source,
-            recorder: Box::new(recorder),
-            exec_cfg: execq_exec_cfg,
-        }) {
+        match northnarrow_agent::execq::start(
+            &execq_cfg,
+            execq_kernel,
+            northnarrow_agent::execq::StartDeps {
+                hashes,
+                hashes_source,
+                recorder: Box::new(recorder),
+                exec_cfg: execq_exec_cfg,
+            },
+        ) {
             Ok(h) => Some(h),
             Err(why) => {
                 error!(reason = %why, "exec quarantine NOT running — the kernel holds nothing");
@@ -142,7 +150,12 @@ pub(crate) fn start(
             posture: Box::new(move || posture_for_execpol.current_kind()),
         };
         let execq_on = execq_handle.is_some();
-        let handle = match northnarrow_agent::execpol::start(Box::new(recorder), execq_on) {
+        let handle = match northnarrow_agent::execpol::start(
+            &execpol_cfg,
+            execpol_kernel,
+            Box::new(recorder),
+            execq_on,
+        ) {
             Ok(h) => Some(h),
             Err(why) => {
                 error!(reason = %why, "exec policy controller NOT running — nothing is recorded");

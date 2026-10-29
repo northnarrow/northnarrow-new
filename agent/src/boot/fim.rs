@@ -25,8 +25,8 @@ use super::response::attest_legacy_isolation_removed;
 /// `sys_enter_openat` — every open goes to userland and its path is read
 /// from the caller's memory. Signed and in `nn-admin status`, not only a
 /// WARN.
-fn open_sensor_on_tracepoint(why: &str) {
-    northnarrow_agent::boot::manifest::note_sensor(
+fn open_sensor_on_tracepoint(sensor: &SensorMultiplexer, why: &str) {
+    sensor.attach_points().note(
         "file_open",
         "tracepoint:syscalls/sys_enter_openat (user memory)",
     );
@@ -69,7 +69,7 @@ fn start_open_sensor(
     };
     if mode == FileOpenSensor::Tracepoint {
         info!("file-open sensor: tracepoint mode (--file-open-sensor tracepoint) — every open reaches userland");
-        open_sensor_on_tracepoint("chosen with --file-open-sensor tracepoint");
+        open_sensor_on_tracepoint(sensor, "chosen with --file-open-sensor tracepoint");
         return;
     }
     if !fim_attached.contains(&northnarrow_agent::fim::attach::OPEN_SENSOR_PROGRAM) {
@@ -77,7 +77,7 @@ fn start_open_sensor(
             "file-open sensor: its file_open observer is not attached — keeping sys_enter_openat"
         );
         open_tracepoint_fallback(sensor);
-        open_sensor_on_tracepoint("its file_open observer is not attached");
+        open_sensor_on_tracepoint(sensor, "its file_open observer is not attached");
         return;
     }
     let rules = RuleSet::build(&RuleInputs::from_host(carveout));
@@ -87,7 +87,7 @@ fn start_open_sensor(
         Err(e) => {
             warn!(error = %e, "file-open sensor: rule maps unavailable — keeping sys_enter_openat");
             open_tracepoint_fallback(sensor);
-            open_sensor_on_tracepoint(&format!("its rule maps are unavailable ({e})"));
+            open_sensor_on_tracepoint(sensor, &format!("its rule maps are unavailable ({e})"));
             return;
         }
     };
@@ -102,7 +102,7 @@ fn start_open_sensor(
         Err(e) => {
             warn!(error = %e, "file-open sensor: ring unavailable — keeping sys_enter_openat");
             open_tracepoint_fallback(sensor);
-            open_sensor_on_tracepoint(&format!("its ring is unavailable ({e})"));
+            open_sensor_on_tracepoint(sensor, &format!("its ring is unavailable ({e})"));
             return;
         }
     };
@@ -111,20 +111,23 @@ fn start_open_sensor(
     if let Err(e) = maps.arm(true) {
         warn!(error = %e, "file-open sensor: arming failed — keeping sys_enter_openat");
         open_tracepoint_fallback(sensor);
-        open_sensor_on_tracepoint(&format!("arming failed ({e})"));
+        open_sensor_on_tracepoint(sensor, &format!("arming failed ({e})"));
         return;
     }
-    northnarrow_agent::boot::manifest::note_sensor("file_open", "lsm:file_open (FIM observer)");
+    sensor
+        .attach_points()
+        .note("file_open", "lsm:file_open (FIM observer)");
     // Lab PR 249: the posture's own switch (it was process-wide).
     posture.set_kernel_mass_write(true);
     // Armed: the old tracepoint (every openat to userland) goes. Its link
     // is retired first, or the BPF self-defence would report its absence
-    // as tampering.
+    // as tampering (R11c, lab PR 264: in the object's own record).
+    let bpf_guard = sensor.bpf_guard().clone();
     let detached = match sensor.ebpf_mut().program_mut("sys_enter_openat") {
         Some(p) => match <&mut aya::programs::TracePoint>::try_from(p) {
             Ok(tp) => {
                 if let Ok(info) = tp.info() {
-                    northnarrow_agent::anti_tamper::bpf_defense::retire_program_links(info.id());
+                    bpf_guard.retire_program_links(info.id());
                 }
                 tp.unload().is_ok()
             }
@@ -563,7 +566,11 @@ pub(crate) fn start(
                         Arc::new(InodePathMap::new())
                     }
                 };
-                northnarrow_agent::boot::manifest::note_sensor(
+                // External audit NN-AUD-120: a full watch set is signed (R11c,
+                // lab PR 264: in the map's own slot, no longer a process-wide
+                // setter the late binding called).
+                inode_map.bind_audit_log(audit_log.clone());
+                sensor.attach_points().note(
                     "fim_observers",
                     &format!(
                         "lsm: {} of {} observe programs",

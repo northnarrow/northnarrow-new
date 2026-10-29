@@ -40,7 +40,8 @@ pub struct RuleEngine<H: DecisionHost> {
     /// ([`flow_ledger`]).
     flow_ledger: Mutex<FlowLedger>,
     /// Lab PR 236: the per-rule policy this engine reads (production: the
-    /// agent's [`rule_policy::global`]).
+    /// handle the agent's start makes, R11c: the posture's and the admin
+    /// socket's too).
     policy: PolicyHandle,
     /// What an exemption check reads about a process.
     facts: Arc<dyn ActorFacts>,
@@ -68,8 +69,9 @@ impl<H: DecisionHost> RuleEngine<H> {
         }
     }
 
-    /// This engine reading the policy `handle` (production: the agent's
-    /// [`rule_policy::global`], swapped by `nn-admin policy set`).
+    /// This engine reading the policy `handle` (production: the one the
+    /// agent's start makes, which `nn-admin policy set` swaps; R11c, lab PR
+    /// 264: it was the process-wide `rule_policy::global()`).
     pub fn with_policy(mut self, handle: PolicyHandle) -> Self {
         self.policy = handle;
         self

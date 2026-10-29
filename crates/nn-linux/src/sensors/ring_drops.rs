@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::late_audit::{AuditHandle, LateAudit};
+
 use aya::maps::{MapData, PerCpuArray};
 use aya::Ebpf;
 use common::ring_drops::{ring_slot, RING_DROP_NAMES, RING_DROP_SLOTS};
@@ -25,21 +27,43 @@ pub const AUDIT_OP: &str = "ringbuf_drop";
 /// At most one audit entry per ring per window (the WARN stays per sample).
 pub const AUDIT_WINDOW_SECS: u64 = 600;
 
-static AUDIT_LOG: OnceLock<Arc<parking_lot::Mutex<crate::audit::AuditLog>>> = OnceLock::new();
+/// What [`install`] gives the start (R11c, lab PR 264): the sampler's
+/// audit log and posture, bound once they exist (the sampler starts
+/// earlier, with the eBPF object), and why the counters could not be armed.
+/// They were process-wide statics that `set_audit_log` and `set_posture`
+/// filled.
+#[derive(Clone, Default)]
+pub struct RingDrops {
+    audit: LateAudit,
+    posture: Arc<OnceLock<PostureSink>>,
+    install_failure: Option<String>,
+}
 
-/// Hand the signed audit log to the sampler (from `main`, once it exists;
-/// the sampler starts earlier, with the eBPF object).
-pub fn set_audit_log(log: Option<Arc<parking_lot::Mutex<crate::audit::AuditLog>>>) {
-    if let Some(l) = log {
-        if let Some(detail) = INSTALL_FAILURE.get() {
-            attest_install_failure(&l, detail);
+impl RingDrops {
+    /// Hand the signed audit log to the sampler (the start's late binding,
+    /// once it exists): a failed install is signed now.
+    pub fn bind_audit_log(&self, log: Option<AuditHandle>) {
+        if let Some(l) = log {
+            if let Some(detail) = &self.install_failure {
+                attest_install_failure(&l, detail);
+            }
+            self.audit.bind(Some(l));
         }
-        let _ = AUDIT_LOG.set(l);
+    }
+
+    /// Hand the posture machine (and the trusted-installer window) to the
+    /// sampler, so a security ring that loses events raises ALERTED.
+    pub fn bind_posture(
+        &self,
+        posture: crate::posture::PostureMachine,
+        installer: Option<Arc<crate::anti_tamper::trusted_installer::TrustedInstallerOverride>>,
+    ) {
+        let _ = self.posture.set(PostureSink { posture, installer });
     }
 }
 
-fn audit_drop(ring: &str, dropped: u64, total: u64) {
-    let Some(log) = AUDIT_LOG.get() else { return };
+fn audit_drop(audit: &LateAudit, ring: &str, dropped: u64, total: u64) {
+    let Some(log) = audit.get() else { return };
     let draft = crate::audit::AuditEntryDraft {
         op: AUDIT_OP.to_string(),
         extra: serde_json::json!({ "ring": ring, "dropped_since_last_sample": dropped, "total": total }),
@@ -169,17 +193,6 @@ struct PostureSink {
     installer: Option<Arc<crate::anti_tamper::trusted_installer::TrustedInstallerOverride>>,
 }
 
-static POSTURE: OnceLock<PostureSink> = OnceLock::new();
-
-/// Hand the posture machine (and the trusted-installer window) to the
-/// sampler, so a security ring that loses events raises ALERTED.
-pub fn set_posture(
-    posture: crate::posture::PostureMachine,
-    installer: Option<Arc<crate::anti_tamper::trusted_installer::TrustedInstallerOverride>>,
-) {
-    let _ = POSTURE.set(PostureSink { posture, installer });
-}
-
 /// Package managers whose run, as root, is a package transaction. Their
 /// bursts (maintainer scripts, unit reloads) legitimately overflow rings.
 const PACKAGE_MANAGER_EXES: &[&str] = &[
@@ -249,8 +262,8 @@ fn package_transaction_running(proc_root: &std::path::Path) -> bool {
 /// External audit SNS-009: security rings lost events — raise
 /// `TelemetryLoss` (ALERTED), except during a trusted-installer window or a
 /// package transaction. The signed `ringbuf_drop` entry is written anyway.
-fn raise_telemetry_loss(lost: &[(&'static str, u64)]) {
-    let Some(sink) = POSTURE.get() else { return };
+fn raise_telemetry_loss(posture: &OnceLock<PostureSink>, lost: &[(&'static str, u64)]) {
+    let Some(sink) = posture.get() else { return };
     let what = lost
         .iter()
         .map(|(r, d)| format!("{r} {d}"))
@@ -279,10 +292,8 @@ fn raise_telemetry_loss(lost: &[(&'static str, u64)]) {
 }
 
 /// External audit SNS-009: why the counters could not be armed, attested
-/// in the signed chain once the audit log exists.
-static INSTALL_FAILURE: OnceLock<String> = OnceLock::new();
-
-fn attest_install_failure(log: &Arc<parking_lot::Mutex<crate::audit::AuditLog>>, detail: &str) {
+/// in the signed chain once the audit log exists ([`RingDrops`]).
+fn attest_install_failure(log: &AuditHandle, detail: &str) {
     let draft = crate::audit::AuditEntryDraft {
         op: crate::self_integrity::AUDIT_OP.to_string(),
         extra: serde_json::json!({ "kind": "subsystem_degraded", "detail": detail, "at_boot": true }),
@@ -304,28 +315,33 @@ fn attest_install_failure(log: &Arc<parking_lot::Mutex<crate::audit::AuditLog>>,
 
 /// Take the `RING_DROPS` map from the loaded object and start the
 /// sampler. A missing or mistyped map is a WARN and, once the audit log is
-/// set, a signed `subsystem_degraded` (drops then go uncounted).
-pub fn install(ebpf: &mut Ebpf) {
+/// bound ([`RingDrops::bind_audit_log`]), a signed `subsystem_degraded`
+/// (drops then go uncounted).
+pub fn install(ebpf: &mut Ebpf) -> RingDrops {
+    let failed = |detail: String| RingDrops {
+        install_failure: Some(detail),
+        ..RingDrops::default()
+    };
     let Some(map) = ebpf.take_map(MAP_NAME) else {
         warn!(
             map = MAP_NAME,
             "ring-drop counters not exported by the eBPF object — drops will not be counted"
         );
-        let _ = INSTALL_FAILURE.set(format!(
+        return failed(format!(
             "ring-drop counters unavailable: map {MAP_NAME} not exported by the eBPF object; ring drops are not counted"
         ));
-        return;
     };
     let map: PerCpuArray<MapData, u64> = match PerCpuArray::try_from(map) {
         Ok(m) => m,
         Err(e) => {
             warn!(error = %e, map = MAP_NAME, "ring-drop map has an unexpected type — drops will not be counted");
-            let _ = INSTALL_FAILURE.set(format!(
+            return failed(format!(
                 "ring-drop counters unavailable: map {MAP_NAME} has an unexpected type ({e}); ring drops are not counted"
             ));
-            return;
         }
     };
+    let bindings = RingDrops::default();
+    let (audit, posture) = (bindings.audit.clone(), Arc::clone(&bindings.posture));
     info!(
         rings = RING_DROP_SLOTS,
         every_secs = SAMPLE_SECS,
@@ -346,7 +362,7 @@ pub fn install(ebpf: &mut Ebpf) {
                         .unwrap_or(true);
                     if due {
                         last_audit[i] = Some(Instant::now());
-                        audit_drop(RING_DROP_NAMES[i], n - p, n);
+                        audit_drop(&audit, RING_DROP_NAMES[i], n - p, n);
                     }
                     warn!(
                         ring = RING_DROP_NAMES[i],
@@ -358,12 +374,13 @@ pub fn install(ebpf: &mut Ebpf) {
             }
             let lost = security_losses(&prev, &now);
             if !lost.is_empty() {
-                raise_telemetry_loss(&lost);
+                raise_telemetry_loss(&posture, &lost);
             }
             prev = now;
             debug!(total = total(), "ring-drop sample");
         }
     });
+    bindings
 }
 
 #[cfg(test)]
