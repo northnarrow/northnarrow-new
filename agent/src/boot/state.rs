@@ -29,6 +29,7 @@ pub(crate) fn bootstrap(
     cli: &Cli,
     heads_file: &std::path::Path,
     preflight_refused: bool,
+    signing_key: &northnarrow_agent::keys::BootKey,
 ) -> StateReady {
     // External audit EBPF-015: the predecessor's pinned deny hooks refuse
     // a new entry in the agent's directories to a process not yet
@@ -76,32 +77,28 @@ pub(crate) fn bootstrap(
     // window starts at boot rather than at "first signed admin op".
     // audit.log is created as a zero-byte placeholder if absent
     // (first append writes the genesis entry).
-    if let Err(e) =
-        northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file)
-    {
-        // External audit EVD-001: on a restart the previous instance's
-        // pinned hooks close the key to a process not yet registered (the
-        // early registration above failed); the loads after the attach
-        // read it.
-        let refused = e
-            .root_cause()
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied);
-        if refused {
-            info!(
+    // The review of #468, R4: the start's one load of its key, as the
+    // preflight decided it — the key there (never minted, the file the check
+    // saw), or a first install's, minted once —; every chain takes a copy.
+    if let Err(e) = signing_key.load() {
+        match e {
+            // External audit EVD-001: on a restart the previous instance's
+            // pinned hooks close the key to a process not yet registered
+            // (the early registration above failed); the decision is kept
+            // and the key read at its next use, after the attach.
+            northnarrow_agent::keys::NoKey::Closed(_) => info!(
                 path = %cli.signing_key_file.display(),
                 "agent signing key closed to this process until it is registered with the \
                  anti-tamper hooks — read after the attach"
-            );
-        } else {
+            ),
             // Review #466 F4: the integrity phase's audit check refuses the
             // start on it (unless NN_AUDIT_ALLOW_UNWRITABLE=1).
-            warn!(
-                error = %e,
+            northnarrow_agent::keys::NoKey::Failed(why) => warn!(
+                error = %why,
                 path = %cli.signing_key_file.display(),
-                "agent signing key bootstrap failed pre-attach — the audit check refuses the \
-                 start unless NN_AUDIT_ALLOW_UNWRITABLE=1"
-            );
+                "agent signing key cannot be loaded pre-attach — the audit check refuses the \
+                 start unless NN_AUDIT_ALLOW_UNWRITABLE=1; nothing is minted"
+            ),
         }
     }
     if let Err(e) =
@@ -274,14 +271,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cli = cli(dir.path());
         let heads = dir.path().join("chain_heads.json");
-        bootstrap(&cli, &heads, true);
+        let key = northnarrow_agent::keys::BootKey::decided(
+            northnarrow_agent::boot::checks::KeyDecision::first_install_for_tests(
+                &cli.signing_key_file,
+            ),
+        );
+        bootstrap(&cli, &heads, true, &key);
         let left: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .flatten()
             .map(|e| e.file_name())
             .collect();
         assert!(left.is_empty(), "{left:?}");
-        bootstrap(&cli, &heads, false);
+        bootstrap(&cli, &heads, false, &key);
         for made in [
             "agent.sig.key",
             "audit.log",
@@ -290,5 +292,50 @@ mod tests {
         ] {
             assert!(dir.path().join(made).exists(), "{made}");
         }
+    }
+
+    /// The review of #468, R4: the key the preflight decided present and
+    /// gone before the bootstrap's one load — hidden by a mount laid during
+    /// the start, every piece of evidence with it — is not minted: the load
+    /// fails, the audit check refuses the start (review #466 F4), no file
+    /// is written at the key's name or its public half's, and no later
+    /// phase gets a key.
+    #[test]
+    fn a_key_gone_between_the_check_and_the_load_is_never_minted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = cli(dir.path());
+        let heads = dir.path().join("chain_heads.json");
+        northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file)
+            .unwrap();
+        let mut boot = northnarrow_agent::boot::BootSequence::for_tests();
+        let decision =
+            northnarrow_agent::boot::checks::KeyDecision::present_for_tests(&cli.signing_key_file);
+        let key = northnarrow_agent::keys::BootKey::decided(decision);
+        let public = northnarrow_agent::keys::verifying_key_path(&cli.signing_key_file);
+        std::fs::remove_file(&cli.signing_key_file).unwrap();
+        std::fs::remove_file(&public).unwrap();
+        bootstrap(&cli, &heads, false, &key);
+        assert!(!cli.signing_key_file.exists(), "a key minted");
+        assert!(!public.exists(), "a public half published");
+        let audit = northnarrow_agent::boot::checks::audit_log(
+            &mut boot,
+            &cli.audit_log_file,
+            &key,
+            [7; 16],
+            false,
+        )
+        .unwrap();
+        assert!(
+            matches!(&audit.open, northnarrow_agent::boot::checks::AuditOpen::NoKey(w)
+                if w.contains("refusing to mint")),
+            "{:?}",
+            audit.open
+        );
+        assert!(
+            audit.fatal || std::env::var("NN_AUDIT_ALLOW_UNWRITABLE").is_ok(),
+            "refused"
+        );
+        assert!(key.signer().is_err(), "a later phase got a key");
+        assert!(!cli.signing_key_file.exists(), "a key minted");
     }
 }

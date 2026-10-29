@@ -2,7 +2,7 @@
 //! releases are verified, what the default build targets, and which RustSEC
 //! advisories are accepted. External audit SUP-001, SUP-002, SUP-004,
 //! SUP-005, SUP-006, SUP-007 to SUP-018, SUP-021 to SUP-024, DEP-008 and
-//! PROC-015. The tests read committed files; five run a local tool and
+//! PROC-015. The tests read committed files; six run a local tool and
 //! none touches the network: `prune_script_fails_closed` runs the CI prune
 //! script under bash with a stub `cargo`, `advisory_exceptions_expire_in_ci`
 //! runs the CI expiry check under bash with a fixed date,
@@ -10,8 +10,10 @@
 //! --locked --offline` (the crates a workspace build downloads are enough),
 //! `btf_matrix_script_passes_its_offline_tests` runs
 //! `deploy/btf-matrix/run-test.sh` (bash, tar, xz, sha256sum; stub curl, gh
-//! and agent) and `release_tag_check_accepts_only_listed_signers` runs the
-//! tag check's selftest (git and ssh-keygen, throwaway keys).
+//! and agent), `release_tag_check_accepts_only_listed_signers` runs the
+//! tag check's selftest (git and ssh-keygen, throwaway keys) and
+//! `the_release_scripts_refuse_a_lab_build` runs the tarball's and the
+//! packages' scripts under bash with stub binaries.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -2063,6 +2065,136 @@ fn the_release_build_carries_no_lab_feature() {
         built < check && check < upload,
         "release.yml: the artefact check runs after the packages are built and before the upload"
     );
+}
+
+/// Lab PR 268 (the review of #473, B4): the two scripts that pack a release
+/// — the tarball's and the packages' — refuse an agent built with a lab
+/// feature (`--build-features` not `none`: test-privileged exempts copies of
+/// the binary from the restart rule, debug-trigger runs its BPF guard in
+/// observe) and an nn-admin with the `debug` subcommand, before they copy
+/// anything; only the lab's package check packs its lab build, with
+/// `NN_PKG_LAB_FEATURES=1` (a warning), and no workflow sets it. Run under
+/// bash in a scratch tree with stub binaries.
+#[test]
+fn the_release_scripts_refuse_a_lab_build() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("release-scripts-lab-build");
+    let _ = fs::remove_dir_all(&base);
+    let ebpf = "agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf";
+    // the script in a tree of its own: (status, stderr)
+    let run = |script: &str, case: &str, features: &str, debug: bool, opt_in: bool| {
+        let tree = base.join(script).join(case);
+        fs::create_dir_all(tree.join("deploy/release")).unwrap();
+        fs::create_dir_all(tree.join("target/release")).unwrap();
+        fs::create_dir_all(tree.join(ebpf).parent().unwrap()).unwrap();
+        fs::copy(
+            repo_root().join(format!("deploy/release/{script}")),
+            tree.join(format!("deploy/release/{script}")),
+        )
+        .unwrap();
+        fs::write(tree.join("Cargo.toml"), "version = \"0.0.0\"\n").unwrap();
+        // the eBPF object and its stamp, older than the binaries
+        for f in [ebpf.to_string(), format!("{ebpf}.buildhash")] {
+            fs::write(tree.join(&f), "stamp").unwrap();
+            let status = std::process::Command::new("touch")
+                .args(["-d", "2020-01-01"])
+                .arg(tree.join(&f))
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let stub = |name: &str, body: &str| {
+            let p = tree.join("target/release").join(name);
+            fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        stub(
+            "northnarrow-agent",
+            &format!("[ \"$1\" = --build-features ] && echo '{features}'; exit 0"),
+        );
+        stub(
+            "nn-admin",
+            if debug {
+                "printf 'Commands:\\n  status  x\\n  debug   y\\n'"
+            } else {
+                "printf 'Commands:\\n  status  x\\n'"
+            },
+        );
+        stub("northnarrow-watchdog", "exit 0");
+        stub("northnarrow-scan", "exit 0");
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(tree.join(format!("deploy/release/{script}")))
+            .arg(tree.join("out"))
+            .env("NN_PKG_FORMATS", "none")
+            .env_remove("NN_PKG_LAB_FEATURES");
+        if opt_in {
+            cmd.env("NN_PKG_LAB_FEATURES", "1");
+        }
+        let out = cmd.output().expect("bash runs");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    for script in ["mk-tarball.sh", "mk-packages.sh"] {
+        let tool = script.trim_end_matches(".sh");
+        let (ok, err) = run(
+            script,
+            "lab-agent",
+            "debug-trigger,test-privileged",
+            false,
+            false,
+        );
+        assert!(!ok, "{script}: a lab agent packed: {err}");
+        assert!(
+            err.contains(&format!(
+                "{tool}: target/release/northnarrow-agent was built with lab features (debug-trigger,test-privileged)"
+            )),
+            "{script}: {err}"
+        );
+        let (ok, err) = run(script, "lab-admin", "none", true, false);
+        assert!(!ok, "{script}: an nn-admin with debug packed: {err}");
+        assert!(err.contains("has the debug subcommand"), "{script}: {err}");
+        // a release build gets past the check (to whatever the scratch tree
+        // lacks after it)
+        let (_, err) = run(script, "release", "none", false, false);
+        assert!(
+            !err.contains("lab features") && !err.contains("debug subcommand"),
+            "{script}: {err}"
+        );
+        assert!(
+            err.contains("deploy/"),
+            "{script}: not past the check: {err}"
+        );
+        // the lab's own opt-in: a warning, past the check
+        let (_, err) = run(
+            script,
+            "opt-in",
+            "debug-trigger,test-privileged",
+            true,
+            true,
+        );
+        assert!(
+            err.contains("WARNING") && err.contains("NN_PKG_LAB_FEATURES=1"),
+            "{script}: {err}"
+        );
+        assert!(!err.contains("rebuild with"), "{script}: {err}");
+        // the check comes before anything is copied
+        let text = read(&repo_root().join(format!("deploy/release/{script}")));
+        let check = text.find("--build-features)").expect("the check");
+        let first_copy = text.find("install -").expect("the first copy");
+        assert!(check < first_copy, "{script}: the check after the copy");
+    }
+    // only the lab's package check opts in; no workflow does
+    for file in workflow_files() {
+        assert!(
+            !read(&file).contains("NN_PKG_LAB_FEATURES"),
+            "{}: a workflow packs lab features",
+            rel(&file)
+        );
+    }
+    assert!(read(&repo_root().join("deploy/lab/pkg/pkg-check.sh"))
+        .contains("NN_PKG_LAB_FEATURES=1 NN_PKG_FORMATS=$fmt"));
 }
 
 // ---------------------------------------------------------------------------

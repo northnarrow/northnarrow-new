@@ -3438,3 +3438,90 @@ only in the table below, in the same PR as the evidence.
     exits without a request, and no golden file holds a read error or a
     reset. `GOLDEN_REPLAY.md` §8 says how the cases are kept apart.
   - Lab: host tests only (no guest, no root, no agent). Before the fix: the mechanism shown alone (a Unix listener closed while a forked child that has not exec'd holds it — the connect succeeds and the read is reset, `Connection reset by peer`; with no such child, `Connection refused`); the matrix on `main` 8df17fbb, 20 runs beside a fork storm: 0 failed (the race is rare: lab PR 265 saw it once in five golden runs). After it, the matrix's test binary run in a row by `loop-matrix.sh <worktree> <runs> <load> <log>` (the binary under `target/debug/deps/nn_admin_matrix-*`, each run its own process): 50 runs beside a fork storm (24 `while :; do /bin/true; done` loops under `timeout`, load average 42 on 24 cores), 0 failed, 17.3 to 24.1 s a run; 30 runs beside a parallel release build of the workspace (24 jobs, its own target directory), 0 failed, 9.2 to 13.0 s. Host, `set -o pipefail`, `CARGO_BUILD_JOBS=4`: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 74 suites, 3,171 passed, 0 failed, 15 ignored, in 193 s (`main`'s totals: no test added or removed); `cargo xtask golden` five times, each a process of its own: 27 tests passed each time, every golden file the same bytes before and after each run (sha256 of them all dbf57a09…, `main`'s) and the tree clean. The matrix still 2,703 cases, 9 to 10.5 s a run unloaded. Only this line changed after the gates' run; fmt and xtask's tests (the documentation's among them) run again on the final tree: pass.
+
+- **Lab PR 268 — nn-agent, nn-linux: the signing key decided once at boot
+  and loaded once; the restart rule for any binary in a release build
+  (Wave 4, security follow-up of the independent review of #468, R4, and
+  its re-review, S1–S3; C23, C01; no level changes).**
+  - What was wrong (R4, a TOCTOU): `boot::checks::signing_identity` ran
+    once, then about 13 loads by path — the state bootstrap, the audit
+    check (`checks::open_audit_log`), the refusals (two), the attest
+    phase's deferred open, the head anchor, the detection store and the
+    status log, FIM (two), the canaries (two), the network logs (two) —
+    each called `AgentSigningKey::load_or_bootstrap`, which minted an
+    absent key. A mount laid during the boot, after the check (systemd
+    makes the unit's namespace a shared one: a mount on the host reaches
+    it), gave a new key at the next load, and a later load a second one:
+    one boot's chains under two keys. S1 (the re-review): the restart rule
+    of lab PR 265 held only for the binary the previous agent protected; a
+    copy started by a drop-in was stopped by accident — the check opens the
+    pinned inode map read-write and the BPF guard denies a write handle to
+    a process neither protected nor running a protected binary, which does
+    not hold with the guard in observe or a read-only open. S2: the restart
+    rule covered the key only (the id and the audit log moved away opened
+    new chains under the real key). S3: the single-bpffs rule counted
+    mounts, so a bind of the same instance onto itself refused every start
+    on a host that has one.
+  - What changed: the decision is a token (nn-linux `boot::checks`:
+    `KeyVerdict::Decided(KeyDecision::KeyPresent | FirstInstall)`; private
+    fields, not `Clone`, the `compile_fail` examples show it; a second
+    decision in one boot sequence is `BootOrderError::KeyDecided`).
+    `KeyPresent` records the file the check saw (device, inode). The start
+    builds one `keys::BootKey` from it in the preflight, loads it in the
+    state bootstrap (after `preregister_self`), and every phase takes a
+    copy (`BootKey::signer`); a load the previous agent's hooks close
+    (`EACCES` before the registration) keeps the decision and is read after
+    the attach, any other failure is final. `load_or_bootstrap` split:
+    `load_existing(path, &KeyPresent)` never mints and refuses another file
+    than the one seen; `mint_first(path, FirstInstall)` takes the token by
+    value, writes `<key>.tmp` with `O_CREAT|O_EXCL`, links it at the name
+    (`link(2)`: `EEXIST` on anything there, where `rename(2)` replaced it)
+    and refuses beside a public half; `load_or_bootstrap` stays as the
+    tests' door, `#[cfg(any(test, feature = "test-util"))]` (a production
+    caller does not compile in a build without dev-dependencies). S1:
+    `continuity::restart_findings` (was `restart_key_findings`) treats any
+    start with the pins as a restart unless `COPIES_EXEMPT`
+    (`cfg!(any(feature = "test-privileged", feature = "debug-trigger"))`).
+    S2: the key, the id and the audit log each in a directory the previous
+    agent protected, and there. S3: stacked mounts at `/sys/fs/bpf` pass
+    when they are one instance (the same `major:minor`, root `/`, the same
+    type). Nits: the watcher reports a malformed line over a protected path
+    (`mount_over_protected`, W1); `uninstall.sh`'s pin-root message names
+    §3.10 branch B (N1); the comments of `boot::BootStep::SigningIdentity`
+    and `continuity`'s header name the pins' proof and what stays open
+    (N2); a test of `mounts_over`'s `(any)` branch.
+  - Tests: the TOCTOU (a key decided present then gone with every piece of
+    evidence: an error, no file at the key's or the public half's name, the
+    audit check refusing; a key swapped in at the name: not loaded; the one
+    key handed to every chain unchanged by what happens to the file after),
+    a first install minting once and never over a key planted since the
+    check, the decision once per sequence, the restart's id and audit log,
+    V3b′ refused under the release rule and accepted under the lab
+    builds', the release build holding no exemption, the bpffs self-bind,
+    the watcher's malformed line; two ratchets — no source of the
+    workspace but the start's one load mints the key or builds a
+    `FirstInstall`, and no phase of the start reads a key of its own (each
+    signing phase takes `signing_key.signer()`).
+  - After the independent review of the PR (#473, "merge after the lab";
+    its B1–B5): the tokens carry the key's path they were decided for
+    (`BootKey::decided(decision)`, `load_existing(&present)`,
+    `mint_first(first)`); a key decided present whose name the check could
+    not look at (`seen` `None`: a dangling link) is never loaded; a first
+    install removes the leftover `<key>.tmp` of a mint that died before its
+    link; `mk-tarball.sh` and `mk-packages.sh` refuse an agent whose
+    `--build-features` is not `none` and an nn-admin with `debug` (the
+    lab's pkg-check packs its lab build with `NN_PKG_LAB_FEATURES=1`, no
+    workflow sets it; xtask `the_release_scripts_refuse_a_lab_build`);
+    `IdentityPaths::audit_log` named; a key, id or audit log outside the
+    installed layout refuses every restart with the pins there (documented
+    as not supported, BOOT_INTEGRITY §1.1, INSTALL §3.10).
+  - Open (BOOT_INTEGRITY §1.1): a reboot with a persistent view that hides
+    both trees (an off-host record of the public key); the bpffs unmounted
+    and mounted fresh (CM-12); the chains other than the audit log moved
+    away on a restart (signed by the chain check against the head anchor);
+    the copies' exemption in the lab builds; a mount laid after the start's
+    one load (the lab below: no mint, but the start goes on in that view
+    and registers it, and the real view's next start is refused until the
+    pins go); the id is still minted by `agent_id::resolve` outside the
+    decision (a restart without it is refused, S2).
+  - Lab: On Ubuntu 22.04 (5.15.0-198, the lab guest ubuntu2204, ssh 2522, QEMU for Windows with WHPX, 4 vCPU, 7 GiB; ubuntu2404 was lot 267's, not touched). Two builds of each tree: the lab's (`nn-lab.sh build`, test-privileged,debug-trigger: copies exempt, the BPF guard in observe) and a release build without features made in the guest (`--build-features` `none`), installed with `upgrade-check`. `main` cc1aefd1, the release build, as root, each case undone before the next: the restart (a plain start with the pins there) and the watchdog's respawn after a `cgroup.kill` READY, the key loaded 11 times per boot ("reusing existing agent signing key"); V3b′ (a drop-in in `system.control` with `ExecStart=` naming a copy of the binary, every identity path in an empty `/opt/k268-v3`): refused `agent_mounts` (the pinned `PROTECTED_INODES` unreadable, `BPF_OBJ_GET` EPERM: the guard's denial); V3b″ (first `Environment=NN_BPF_DEFENSE_OBSERVE=1 NN_ANTI_TAMPER_ALLOW_DEGRADED=1` and a `cgroup.kill`: the installed binary READY with its guard "observed only"; then V3b′): **minted** — a key in `/opt/k268-v3` (a new public half, f15a2c77…), 8 rows signed under it, READY; S2 (the installed binary, its key in place, `--agent-id-file` and `--audit-log-file` in an empty `/opt/k268-s2`): READY with a new id (f8a71944… for the installed 24b958f6…) and a new audit chain of 7 rows there; S3 (`mount --bind /sys/fs/bpf /sys/fs/bpf`): refused `agent_mounts` ("2 mounts stacked"); B1 (a second bpffs stacked) refused; restored each time with the installed public half unchanged. `main`'s lab build: the restart and the respawn READY (11 loads); `tamper-check` 75 cases, 72 OK, C27 and C57c the known gaps, C64 the recorded deviation. The lot (f881cb4d), its lab build: `upgrade-check` from `main` (refused without `--upgrade`; the identity the same, 17 of 17 deny hooks, 34 own LSM programs before and after, no foreign one); `test-ignored` 5/5 exit 0 (94 passed, 0 failed, the tests' agents' 52 chain checks `result="ok"`); the restart and the respawn READY, the key loaded once per boot; `tamper-check`: the same 75 outcomes and verdicts as `main`, case by case; `uninstall-check` OK, and its first install: one "bootstrapped fresh agent signing key", no other load, no refusal, its chains verified; re-key A (§3.10: step 0's archive, `uninstall.sh --purge --grant-key`, install): a new identity, one mint and no load at its first start, the archive verified with the old public half. Its release build: the restart and the respawn READY (one load); V1b refused `agent_mounts`; V3b refused `signing_identity`; V3b′ refused `agent_mounts`; V3b″ refused `signing_identity` ("whatever it runs … not the binary that agent protected"), nothing in `/opt/k268-v3`; S2 refused `signing_identity`, no id there; S3 READY; B1 refused. The TOCTOU probe (a copy of `/etc` whose `northnarrow` is empty bound over `/etc` while the respawned agent boots; triggers: the "BTF offsets resolved" line, the early registration's, 0 to 500 ms after the new process; 21 cycles): no mint in any, the installed public half unchanged — but the window from the decision to the load is about 25 ms here, too short for those triggers and the watchdog's back-off: cycle 1's bind landed after the load, that start went on READY in the copy's view and registered its directory, and every later start in the real view (cycles 2–21 among them) was refused by the pins' view proof until a reboot removed the pins. The final tip (0daa4afc, the review's B1–B5), its lab build: `upgrade-check` OK (the identity the same, 17/17, 34 own LSM programs), the restart and the respawn READY (one load), `uninstall-check` OK and its first install one mint, no load, no refusal; its release build: the restart and the respawn READY, V3b″ refused `signing_identity`, S2 refused, S3 READY, B1 refused; the TOCTOU probe with the window widened — the unit held to `CPUQuota=5%` (`set-property --runtime`, undone after), both cgroups killed (a restart, the pins kept), the agent started by the probe, the bind at a fraction of the measured "starting" → load window (0.5 to 1.6 s) or at the BTF line, each start killed at its outcome, before its attach (two earlier runs that let a copy-view start go on were polluted after their first cycle, as above; no mint in them either): 14 cycles, 2 with the bind between the decision and the load — refused at the audit check, "agent signing key /etc/northnarrow/agent.sig.key is absent, but the start's check found it there … refusing to mint", unsigned, exit 78 —, 12 after the load (the key loaded, the start killed before its attach), 0 minted, the public half unchanged, the audit chain 157 rows verified. Back to `main` (`upgrade-check` from its tree, the downgrade): OK (17/17, 34 own LSM programs), the restart and the respawn READY with `main`'s 11 loads, its audit chain 172 rows verified; the guest powered off. Host, on 0daa4afc (`set -o pipefail`, `CARGO_BUILD_JOBS=6`): `cargo xtask build-ebpf --release` (no eBPF change), the four clippy runs with `-D warnings`, `cargo fmt --check`, `cargo test` 74 suites, 3,212 passed, 0 failed, 16 ignored, the privileged no-run, `attack-coverage --check`, `cargo xtask golden` five times (49 files the same bytes, the tree clean), `cargo +1.89.0 check`, the fuzz replay (13 targets), `portable-core` (5 targets): all pass; again on e11e23cf (main 769d5615 merged, this lab in the docs): the same results, 3,212 passed. Mutations, each alone: R4 (the load minting on NotFound, the seen inode ignored, `rename` for `link`, a second decision, the key reloaded each time), S1 (copies exempt in every build), S2, S3, W1, the two ratchets (a phase loading its own key, another mint caller), the skipped load, B2 (an unseen key loaded), B3 (the leftover kept), B4 (the tarball's check dropped): each fails one test or more.

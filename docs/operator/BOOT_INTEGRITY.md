@@ -166,9 +166,13 @@ of the filesystem can change (the independent review of the PR, #468, R2).
     those directories; one about anything else never refuses. The agent's
     directories themselves must therefore not be mount points of their own
     (put `/var` or `/var/lib` on its own filesystem instead).
-  - One bpffs alone at `/sys/fs/bpf`, nothing stacked on it and nothing
-    mounted over the pin root `/sys/fs/bpf/northnarrow`: those would hide
-    the pins, the next proof.
+  - One bpffs instance at `/sys/fs/bpf`, nothing else stacked on it and
+    nothing mounted over the pin root `/sys/fs/bpf/northnarrow`: those
+    would hide the pins, the next proof. What counts is the instances, not
+    the mounts (the re-review of #468, S3): a bind of the same bpffs (its
+    `major:minor`, its root `/`) onto itself, as a node or CNI script may
+    lay, shows the same pins and is accepted; another bpffs, a tmpfs or a
+    directory of the bpffs bound there refuses.
   - With the previous agent's pins there (they survive a `cgroup.kill` and
     a crash, not a reboot): `/etc/northnarrow` and `/var/lib/northnarrow`
     as this start sees them must be the inodes that agent protected (its
@@ -180,17 +184,42 @@ of the filesystem can change (the independent review of the PR, #468, R2).
   - A table that cannot be read, or pins whose inode map cannot be read,
     refuse too.
 - **`signing_identity`.**
-  - With the previous agent's pins there, a start that runs the very
-    binary that agent protected (the installed one; the privileged tests
-    run copies of their own) is its restart, and a restart keeps its
-    identity: its key's directory must be one that agent protected — a
-    drop-in redefining `ExecStart=` with the key, the id and the chains in
-    an empty directory refuses — and its key must be there. In the
-    documented flows the pins go before the key: an upgrade, an uninstall
-    and a re-key remove them first (`install.sh --upgrade`, `uninstall.sh`;
-    a re-key after a refusal reboots first, section 3.10 of
-    `INSTALL_UPGRADE_UNINSTALL.md`), and while they are there the deny
-    hooks keep the key from being removed outside a window.
+  - With the previous agent's pins there, the start is that agent's
+    restart, and a restart keeps its identity: its key, its id
+    (`agent_id`) and its audit log must each be in a directory that agent
+    protected — a drop-in redefining `ExecStart=` with them in an empty
+    directory refuses — and be there (the re-review of #468, S2: the id
+    and the audit log too, not only the key; the other chains moved away
+    are not refused, but the head anchor beside the audit log records
+    their heads, and the boot's chain check signs a chain that starts
+    again). In a release build this holds whatever binary the start runs
+    (the re-review's S1): a copy of the binary started by a drop-in
+    (`ExecStart=` naming a copy, or `ld.so` and the binary) is judged as
+    the restart it is. Before, the rule held only for the binary the
+    previous agent protected, and a copy was stopped for another reason:
+    the check opens the pinned inode map read-write, and the BPF guard
+    still attached denies a write handle on it to a process that is
+    neither protected nor running a protected binary — the map unread,
+    `agent_mounts` refused. That held while the guard enforced, not with
+    `NN_BPF_DEFENSE_OBSERVE=1` (a drop-in can set it, leaving one signed
+    degraded boot) nor for a read-only open. Only the lab builds
+    (`test-privileged`, `debug-trigger`: the privileged tests run copies
+    of the binary with files of their own beside the installed agent) keep
+    the copies' exemption, and a test holds that a build without those
+    features has none. The directories the previous agent protects are
+    the installed layout's: `/etc/northnarrow`, `/var/lib/northnarrow` and
+    its subdirectories. A key, an id or an audit log that the command line
+    puts anywhere else (`--signing-key-file`, `--agent-id-file`,
+    `--audit-log-file`) is therefore refused at every restart while the
+    pins are there, in a release build, without an override: that layout
+    is not supported (the review of #473, B5; the first start after a
+    boot, with no pins, is not refused, which makes it fail only later).
+    In the documented flows the pins go before the
+    identity: an upgrade, an uninstall and a re-key remove them first
+    (`install.sh --upgrade`, `uninstall.sh`; a re-key after a refusal
+    reboots first, section 3.10 of `INSTALL_UPGRADE_UNINSTALL.md`), and
+    while they are there the deny hooks keep the files from being removed
+    outside a window.
   - When the key's name holds nothing (read without following a link or
     opening it: a key the previous agent's hooks close to this process is
     there), the start looks for an earlier identity in the paths it was
@@ -205,8 +234,35 @@ of the filesystem can change (the independent review of the PR, #468, R2).
     found" (a link counts). An empty chain, a directory or another non-file
     at its name, or a first line that is not a row is no evidence (the
     chain's own check judges it). Any evidence refuses the start and
-    nothing is minted. The key's loader never mints a key beside an
-    existing public half, for every later caller.
+    nothing is minted.
+  - The key is decided once (the review of #468, R4). The check gives
+    one of two tokens, which no other code can make and the boot
+    sequence gives once: *key present* — loaded, never minted — or *first
+    install* — the one value that lets the key be minted, taken by value.
+    The start then loads the key once, right after it registered with the
+    previous agent's hooks, and every chain it signs — the audit log, the
+    refusals, the head anchor, the detections and status events, FIM,
+    the canaries, the network logs — takes a copy of that one key: no
+    phase loads a key of its own, and the chains of one boot are signed
+    by exactly one key. The load of a key decided present never mints:
+    a key gone between the check and the load (a mount laid during the
+    start) is an error, and so is a file other than the one the check saw
+    there (another device or inode: a key swapped in), or any file when
+    the check could not look at the name (a dangling link: what appears at
+    its end later is not what the start decided on); the audit check then
+    refuses the start (review #466 F4). The tokens carry the key's path
+    they were decided for: the load and the mint take it from them. The
+    mint of a first install writes the key to a file of its own
+    (`O_CREAT|O_EXCL`; a leftover of a mint that died before its link is
+    removed first, so it cannot block every later first install) and
+    links it at the key's name with `link(2)`, which never replaces what
+    is there (the `rename(2)` used before did): a key that appeared since
+    the check is kept and the mint refused. A load the previous agent's hooks close to
+    this process before it is registered keeps the decision and is read
+    after the attach. Tests hold both rules: nothing in the workspace
+    mints the key but that one load (the tests' door that mints without a
+    decision is compiled into test builds only), and the start's phases
+    read no key but the one.
 
 Neither has an override: an environment variable a drop-in can set would
 be set by the same drop-in that lays the mount. Both refuse at once,
@@ -223,21 +279,34 @@ What these checks close, and what they do not:
   over the agent's directories or over an ancestor, on the host or from a
   drop-in (`BindPaths=`, `TemporaryFileSystem=`, `RootDirectory=`); a
   rename that swaps `/etc` or `/var/lib` with a copy; a drop-in redefining
-  `ExecStart=` with the identity's paths elsewhere (for the installed
-  binary); a bpffs stacked over the pins. (A view without
-  `/etc/northnarrow` at all does not start the shipped unit: systemd
-  cannot set up its `ReadWritePaths=`.)
+  `ExecStart=` with the key's, the id's or the audit log's path elsewhere
+  — for the installed binary and, in a release build, for a copy of it;
+  a bpffs stacked over the pins (a bind of the same bpffs instance onto
+  itself, which hides nothing, is accepted: the re-review's S3). (A view
+  without `/etc/northnarrow` at all does not start the shipped unit:
+  systemd cannot set up its `ReadWritePaths=`.)
+- Closed by the one decision, pins or not: a key hidden, removed or
+  swapped between the check and its load — never minted, never another
+  file (the review of #468, R4).
 - Closed after a reboot only by the evidence the start can read: a mount
   over the agent's directories themselves (the mount table), and the
   key's absence beside its own public half, id or chains.
 - Still open: a reboot with a persistent mount, drop-in or generator that
   swaps both `/etc` and `/var/lib` together, or redefines `ExecStart=`
   with every identity path elsewhere (nothing on that view says an
-  identity was there: it looks like a first install); a copy of the
-  binary started by a drop-in (not the binary the previous agent
-  protected); a key changed between the check and its load (one decision,
-  then one load, is the follow-up; review of #468 R4). An off-host record
-  of the public key is what would cover the reboot.
+  identity was there: it looks like a first install); the bpffs itself
+  unmounted (`umount -l /sys/fs/bpf`) and a fresh one mounted in its
+  place, which puts the pins out of the start's reach as a reboot does
+  (no deny hook covers `mount(2)` or `umount(2)` yet: CM-12); the chains
+  other than the audit log moved away on a restart (not refused: signed
+  by the boot's chain check against the head anchor); the copies'
+  exemption in the lab builds; a mount laid after the start's one load
+  (lab PR 268's TOCTOU probe): no key is minted, but the start goes on in
+  the view laid over its directories, its rows signed with its one key,
+  and registers that view's directories, so the next start in the real
+  view is refused by the pins' proof until they are removed (a reboot, as
+  in §3.10 branch B). An off-host record of the public key is what would
+  cover the reboot.
 
 The unit's runtime drop-in directory,
 `/run/systemd/system/northnarrow-agent.service.d`, is made (empty) by the

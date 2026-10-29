@@ -856,11 +856,14 @@ chain the install keeps; its public half (`agent.sig.pub`) is what
 does not mint a key where it finds an earlier identity — the public half,
 `agent_id`, a written head anchor, a signed row of the audit chain or of
 another chain — nor, while the previous agent's pins are there, when it is
-that agent's restart; it refuses (exit 78, `start refused
-gate=signing_identity`), and so does a start whose directories are
-mounted over or are not the ones the previous agent protected
-(`gate=agent_mounts`; `BOOT_INTEGRITY.md` §1.1, which also lists what
-these checks do not cover). Before lab PR 265 such a start minted a new key
+that agent's restart (in a release build whatever binary it runs), whose
+key, id and audit log must be where that agent protected them; it refuses
+(exit 78, `start refused gate=signing_identity`). A start whose directories
+are mounted over or are not the ones the previous agent protected refuses
+too (`gate=agent_mounts`; `BOOT_INTEGRITY.md` §1.1, which also lists what
+these checks do not cover). The key is decided once, in the preflight, and
+loaded once: a key gone or swapped between the check and its load is not
+minted, nor replaced (lab PR 268). Before lab PR 265 such a start minted a new key
 with one INFO line, and the chains went on under another identity. A new
 key is a new install's identity, made on purpose, in one of two ways.
 
@@ -926,7 +929,14 @@ northnarrow-agent`. Layouts: a separate `/var` or `/var/lib` filesystem is
 fine; `/etc/northnarrow` and `/var/lib/northnarrow` (and any directory a
 `--…-file` flag points the agent's state to) must not be mount points of
 their own — a bind of the directory onto itself, as the unit's
-`ReadWritePaths=` makes, is the one mount there the start accepts.
+`ReadWritePaths=` makes, is the one mount there the start accepts. The key,
+`agent_id` and the audit log must stay in `/etc/northnarrow` (the
+installed layout): with the previous agent's pins there, a release build
+refuses every restart whose key, id or audit log the command line puts in
+another directory (`--signing-key-file`, `--agent-id-file`,
+`--audit-log-file`), since a restart keeps its identity where the previous
+agent protected it (`BOOT_INTEGRITY.md` §1.1). Such a layout is not
+supported.
 
 ## 4. What still needs a reboot
 

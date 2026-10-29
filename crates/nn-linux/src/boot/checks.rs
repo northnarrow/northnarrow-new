@@ -138,62 +138,227 @@ fn agent_mounts_decided(
     Ok(Verdict::Passed)
 }
 
-/// Lab PR 265 (review #466 F4-bis; the review of #468, R2 and R8): the
-/// agent's signing key is not minted where an earlier identity is on
-/// record.
+/// What [`signing_identity`] decided (the review of #468, R4): the start's
+/// signing key is decided once, here, and the token is what its one load
+/// takes ([`crate::keys::BootKey`]).
+#[derive(Debug)]
+#[must_use]
+pub enum KeyVerdict {
+    /// The check refuses the start: why (nothing recorded, nothing minted).
+    Refused(String),
+    /// The check passed (its step is recorded): what the load does.
+    Decided(KeyDecision),
+}
+
+/// The decision on the start's signing key (the review of #468, R4): there,
+/// loaded and never minted — or a first install's, minted once. Only
+/// [`signing_identity`] makes one, once per boot sequence; neither token is
+/// `Clone`, `Copy` nor `Default`, and their fields are private to this
+/// module, so no other path of the process holds a decision.
+#[derive(Debug)]
+pub enum KeyDecision {
+    /// The key is at its name (in some form: a key that is not one is the
+    /// audit check's refusal, review #466 F4): the start loads it
+    /// ([`crate::keys::AgentSigningKey::load_existing`]) and never mints.
+    KeyPresent(KeyPresent),
+    /// Nothing says this install had an identity, and no previous agent's
+    /// pins say this start is a restart: the one start that mints its key
+    /// ([`crate::keys::AgentSigningKey::mint_first`]).
+    FirstInstall(FirstInstall),
+}
+
+/// The review of #468, R4: [`signing_identity`] found the agent's signing key
+/// at its name (`path`, the one it decided on: the review of #473, B1). The
+/// load that takes it never mints, and refuses a file other than the one the
+/// check saw there (`seen`) — and, when the check could not look at the
+/// name (`seen` `None`: a dangling link, a loop; the review of #473, B2),
+/// any file: a key hidden, removed or swapped between the check and the load
+/// is an error, never a new key.
 ///
+/// ```compile_fail,E0451
+/// // Not built outside the check: its fields are private.
+/// let forged = nn_linux::boot::checks::KeyPresent {
+///     path: std::path::PathBuf::new(),
+///     seen: None,
+///     _sealed: (),
+/// };
+/// ```
+#[derive(Debug)]
+pub struct KeyPresent {
+    /// The key's path the check decided on.
+    path: PathBuf,
+    /// The file at the key's name when the check ran (`stat`, its links
+    /// followed: what the load opens), as (device, inode); `None` when it
+    /// could not be looked at (the load then refuses).
+    seen: Option<(u64, u64)>,
+    _sealed: (),
+}
+
+impl KeyPresent {
+    /// The key's path the check decided on.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The file the check saw at the key's name: (device, inode).
+    pub fn seen(&self) -> Option<(u64, u64)> {
+        self.seen
+    }
+}
+
+/// The review of #468, R4: [`signing_identity`] found no key and nothing that
+/// says this install had one — a first install. The one value that lets
+/// [`crate::keys::AgentSigningKey::mint_first`] mint a key, at the path the
+/// check decided on (the review of #473, B1); it takes it by value.
+///
+/// ```compile_fail,E0451
+/// // Not built outside the check: its fields are private.
+/// let forged = nn_linux::boot::checks::FirstInstall {
+///     path: std::path::PathBuf::new(),
+///     _sealed: (),
+/// };
+/// ```
+///
+/// ```compile_fail,E0308
+/// // Not copied: one decision, one mint (`clone` here is the reference's).
+/// use nn_linux::boot::checks::FirstInstall;
+/// fn twice(f: &FirstInstall) -> FirstInstall {
+///     f.clone()
+/// }
+/// ```
+#[derive(Debug)]
+pub struct FirstInstall {
+    /// The key's path the check decided on.
+    path: PathBuf,
+    _sealed: (),
+}
+
+impl FirstInstall {
+    /// The key's path the check decided on.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl KeyDecision {
+    /// The key's path the decision is about.
+    pub fn path(&self) -> &Path {
+        match self {
+            KeyDecision::KeyPresent(p) => p.path(),
+            KeyDecision::FirstInstall(f) => f.path(),
+        }
+    }
+
+    /// A decision without a boot sequence, for the agent's tests (`test-util`,
+    /// a dev-dependency feature: no build of the binaries has it): the key at
+    /// `path` decided present.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn present_for_tests(path: &Path) -> Self {
+        KeyDecision::KeyPresent(KeyPresent {
+            path: path.to_path_buf(),
+            seen: seen_at(path),
+            _sealed: (),
+        })
+    }
+
+    /// A first install at `path` without a boot sequence, for the agent's
+    /// tests (`test-util`).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn first_install_for_tests(path: &Path) -> Self {
+        KeyDecision::FirstInstall(FirstInstall {
+            path: path.to_path_buf(),
+            _sealed: (),
+        })
+    }
+}
+
+/// The file at `path`, its links followed (what a load opens): (device,
+/// inode), when it can be looked at.
+fn seen_at(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Lab PR 265 (review #466 F4-bis; the review of #468, R2, R4 and R8; its
+/// re-review, S1 and S2): the agent's signing key is not minted where an
+/// earlier identity is on record, and it is decided once.
+///
+/// - The previous agent's pins, when there are some: this start is that
+///   agent's restart — in a release build whatever binary it runs (the
+///   re-review's S1; only the lab builds, `test-privileged` and
+///   `debug-trigger`, judge a copy of the binary by the evidence alone:
+///   [`continuity::COPIES_EXEMPT`]) — and a restart keeps its identity: its
+///   key, its id and its audit log must be in directories that agent
+///   protected and there ([`continuity::restart_findings`]): a restart never
+///   mints.
 /// - The key there — in any form: a key that is not one is the audit
-///   check's refusal (review #466 F4) — or nothing says this install had
-///   one ([`continuity::prior_identity`]: the key's public half, the
+///   check's refusal (review #466 F4) — is [`KeyDecision::KeyPresent`]: it
+///   is loaded, never minted. Absent, with nothing that says this install
+///   had one ([`continuity::prior_identity`]: the key's public half, the
 ///   install's id, a written head anchor, a signed row of a chain, its
 ///   manifest or its archives; any lookup that fails otherwise than "not
-///   found"): a first install, which mints it. A key absent where any of
-///   that is found was removed or is hidden: refused, nothing minted.
-/// - The previous agent's pins, when there are some: a start that runs
-///   the binary that agent protected (the installed one) is its restart —
-///   its key must be in a directory that agent protected and there
-///   ([`continuity::restart_key_findings`]): a restart never mints.
+///   found"): [`KeyDecision::FirstInstall`], the one start that mints it.
+///   A key absent where any of that is found was removed or is hidden:
+///   refused, nothing minted.
+///
+/// Decided once per boot sequence: a second call is
+/// [`BootOrderError::KeyDecided`].
 pub fn signing_identity(
     boot: &mut BootSequence,
     paths: &continuity::IdentityPaths,
-) -> Result<Verdict, BootOrderError> {
+) -> Result<KeyVerdict, BootOrderError> {
     signing_identity_decided(
         boot,
         paths,
         &continuity::previous_agent(Path::new(crate::anti_tamper::DEFAULT_BPFFS_ROOT)),
         Path::new("/proc/self/exe"),
+        continuity::COPIES_EXEMPT,
     )
 }
 
-/// [`signing_identity`] against the previous agent `previous` and the
-/// binary `exe` (this crate's tests).
+/// [`signing_identity`] against the previous agent `previous`, the binary
+/// `exe` and the copies' exemption `copies_exempt` (this crate's tests).
 fn signing_identity_decided(
     boot: &mut BootSequence,
     paths: &continuity::IdentityPaths,
     previous: &continuity::PreviousAgent,
     exe: &Path,
-) -> Result<Verdict, BootOrderError> {
-    let restart = continuity::restart_key_findings(previous, exe, &paths.signing_key);
+    copies_exempt: bool,
+) -> Result<KeyVerdict, BootOrderError> {
+    if boot.has_done(BootStep::SigningIdentity) {
+        return Err(BootOrderError::KeyDecided);
+    }
+    let restart = continuity::restart_findings(previous, exe, paths, copies_exempt);
     if !restart.is_empty() {
-        return Ok(Verdict::Refused(format!(
-            "{}. Nothing is minted. Put the key back, or undo what changed its path (a drop-in \
-             redefining ExecStart=); to re-key on purpose, retire the install's identity \
+        return Ok(KeyVerdict::Refused(format!(
+            "{}. Nothing is minted. Put the files back, or undo what changed their paths (a \
+             drop-in redefining ExecStart=); to re-key on purpose, retire the install's identity \
              (docs/operator/INSTALL_UPGRADE_UNINSTALL.md, \"Re-keying the agent\": the agent \
              that refuses to start)",
             restart.join("; ")
         )));
     }
-    if continuity::key_absent(&paths.signing_key) {
+    let decision = if continuity::key_absent(&paths.signing_key) {
         let evidence = continuity::prior_identity(paths);
         if !evidence.is_empty() {
-            return Ok(Verdict::Refused(continuity::refusal_detail(
+            return Ok(KeyVerdict::Refused(continuity::refusal_detail(
                 &paths.signing_key,
                 &evidence,
             )));
         }
-    }
+        KeyDecision::FirstInstall(FirstInstall {
+            path: paths.signing_key.clone(),
+            _sealed: (),
+        })
+    } else {
+        KeyDecision::KeyPresent(KeyPresent {
+            path: paths.signing_key.clone(),
+            seen: seen_at(&paths.signing_key),
+            _sealed: (),
+        })
+    };
     boot.passed(BootStep::SigningIdentity)?;
-    Ok(Verdict::Passed)
+    Ok(KeyVerdict::Decided(decision))
 }
 
 /// The embedded eBPF object is real and intact
@@ -391,7 +556,9 @@ pub enum AuditOpen {
     /// the start ran unaudited, with only a WARN, until then); the refusal
     /// is the journal's alone. An absent key is minted only at a first
     /// install: where an earlier identity is on record, [`signing_identity`]
-    /// refused the start before (lab PR 265, review #466 F4-bis).
+    /// refused the start before (lab PR 265, review #466 F4-bis); a key it
+    /// found there and gone (or another file) at the start's one load is
+    /// this too, never a mint (the review of #468, R4).
     NoKey(String),
     /// The log cannot be opened: a line before the end is not a row (the
     /// chain is broken), or the file cannot be opened for writing (under
@@ -430,18 +597,19 @@ impl std::fmt::Debug for AuditOpen {
 /// ([`audit_preflight::preflight_writable`]; `closed_by_previous_hooks`:
 /// the early registration in the pinned `PROTECTED_PIDS` failed, so a
 /// permission error is left to the attest phase); then (R11b, lab PR 262)
-/// opened with the agent's key at `signing_key` and the start's `agent_id`
-/// ([`crate::audit::AuditLog::open`]: its chain read, a broken one refused).
-/// An unwritable log, one that cannot be opened, or a key that cannot be
-/// loaded (review #466 F4; an absent one is minted, at a first install
-/// only: [`signing_identity`]) refuses the start unless
-/// the process's environment has
+/// opened with the start's one key (`key`, the review of #468 R4: a copy
+/// of the key the preflight decided and the start loaded once) and the
+/// start's `agent_id` ([`crate::audit::AuditLog::open`]: its chain read, a
+/// broken one refused). An unwritable log, one that cannot be opened, or a
+/// key that cannot be loaded (review #466 F4; an absent one is minted, at a
+/// first install only: [`signing_identity`]) refuses the start unless the
+/// process's environment has
 /// [`crate::audit::AUDIT_ALLOW_UNWRITABLE_ENV`]`=1` (read here, review #466
 /// F3).
 pub fn audit_log(
     boot: &mut BootSequence,
     path: &Path,
-    signing_key: &Path,
+    key: &crate::keys::BootKey,
     agent_id: [u8; 16],
     closed_by_previous_hooks: bool,
 ) -> Result<AuditCheck, BootOrderError> {
@@ -449,7 +617,7 @@ pub fn audit_log(
     audit_log_with(
         boot,
         path,
-        signing_key,
+        key,
         agent_id,
         closed_by_previous_hooks,
         allow.as_deref(),
@@ -460,7 +628,7 @@ pub fn audit_log(
 fn audit_log_with(
     boot: &mut BootSequence,
     path: &Path,
-    signing_key: &Path,
+    key: &crate::keys::BootKey,
     agent_id: [u8; 16],
     closed_by_previous_hooks: bool,
     allow_unwritable: Option<&str>,
@@ -470,7 +638,7 @@ fn audit_log_with(
     let open = match &preflight {
         AuditPreflight::Unwritable(_) if !allowed => AuditOpen::NotTried,
         AuditPreflight::Deferred(why) => AuditOpen::Deferred(why.clone()),
-        _ => open_audit_log(path, signing_key, agent_id, closed_by_previous_hooks),
+        _ => open_audit_log(path, key, agent_id, closed_by_previous_hooks),
     };
     let fatal = !allowed
         && (matches!(preflight, AuditPreflight::Unwritable(_))
@@ -485,11 +653,11 @@ fn audit_log_with(
     })
 }
 
-/// [`AuditLog::open`](crate::audit::AuditLog::open) with the agent's key,
+/// [`AuditLog::open`](crate::audit::AuditLog::open) with the start's key,
 /// as the attest phase opened it.
 fn open_audit_log(
     path: &Path,
-    signing_key: &Path,
+    key: &crate::keys::BootKey,
     agent_id: [u8; 16],
     closed_by_previous_hooks: bool,
 ) -> AuditOpen {
@@ -503,14 +671,14 @@ fn open_audit_log(
                     .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
             })
     };
-    let key = match crate::keys::AgentSigningKey::load_or_bootstrap(signing_key) {
+    let key = match key.signer() {
         Ok(key) => key,
-        Err(e) if closed(&e) => {
+        Err(crate::keys::NoKey::Closed(why)) if closed_by_previous_hooks => {
             return AuditOpen::Deferred(format!(
-                "{e:#} (the previous agent's hooks close it to an unregistered process)"
+                "{why} (the previous agent's hooks close it to an unregistered process)"
             ))
         }
-        Err(e) => return AuditOpen::NoKey(format!("{e:#}")),
+        Err(e) => return AuditOpen::NoKey(e.to_string()),
     };
     match crate::audit::AuditLog::open(path, key, agent_id) {
         Ok(log) => AuditOpen::Open(Box::new(log)),
@@ -792,18 +960,20 @@ mod tests {
     #[test]
     fn an_unwritable_audit_log_records_nothing_unless_allowed() {
         let dir = tempfile::tempdir().unwrap();
-        let key = dir.path().join("agent.sig.key");
+        let key_path = dir.path().join("agent.sig.key");
+        let key = first_install(&key_path);
+        let key = &key;
         let not_a_file = dir.path().join("audit.log");
         std::fs::create_dir(&not_a_file).unwrap();
         let mut boot = BootSequence::new();
-        let c = audit_log_with(&mut boot, &not_a_file, &key, [1; 16], false, None).unwrap();
+        let c = audit_log_with(&mut boot, &not_a_file, key, [1; 16], false, None).unwrap();
         assert!(matches!(c.preflight, AuditPreflight::Unwritable(_)));
         assert!(matches!(c.open, AuditOpen::NotTried), "{:?}", c.open);
         assert!(c.fatal);
         assert!(!has(&boot, BootStep::AuditWritable));
-        assert!(!key.exists(), "nothing opened, no key minted");
+        assert!(!key_path.exists(), "nothing opened, no key minted");
         // the override: tried, it fails, the start goes on unaudited
-        let c = audit_log_with(&mut boot, &not_a_file, &key, [1; 16], false, Some("1")).unwrap();
+        let c = audit_log_with(&mut boot, &not_a_file, key, [1; 16], false, Some("1")).unwrap();
         assert!(matches!(c.open, AuditOpen::Failed(_)), "{:?}", c.open);
         assert!(!c.fatal);
         assert!(has(&boot, BootStep::AuditWritable));
@@ -815,10 +985,11 @@ mod tests {
     #[test]
     fn the_audit_chain_opens_before_the_load_or_refuses() {
         let dir = tempfile::tempdir().unwrap();
-        let key = dir.path().join("agent.sig.key");
+        let key_path = dir.path().join("agent.sig.key");
+        let key = &first_install(&key_path);
         let path = dir.path().join("audit.log");
         let mut boot = BootSequence::new();
-        let c = audit_log_with(&mut boot, &path, &key, [1; 16], false, None).unwrap();
+        let c = audit_log_with(&mut boot, &path, key, [1; 16], false, None).unwrap();
         assert_eq!(c.preflight, AuditPreflight::Writable);
         let AuditOpen::Open(mut log) = c.open else {
             panic!("{:?}", c.open)
@@ -832,9 +1003,11 @@ mod tests {
         };
         log.boot_probe(None, "no-manifest", "none", &build).unwrap();
         drop(log);
-        // written: opens again, the next row chains on
+        // written: opens again (the next start: its key there), the next row
+        // chains on
+        let key = &present(&key_path);
         let mut boot = BootSequence::new();
-        let c = audit_log_with(&mut boot, &path, &key, [1; 16], false, None).unwrap();
+        let c = audit_log_with(&mut boot, &path, key, [1; 16], false, None).unwrap();
         let AuditOpen::Open(log) = c.open else {
             panic!("{:?}", c.open)
         };
@@ -844,7 +1017,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, format!("{{not a row}}\n{text}")).unwrap();
         let mut boot = BootSequence::new();
-        let c = audit_log_with(&mut boot, &path, &key, [1; 16], false, None).unwrap();
+        let c = audit_log_with(&mut boot, &path, key, [1; 16], false, None).unwrap();
         assert!(
             matches!(c.open, AuditOpen::Failed(ref why) if why.contains("is not an audit row")),
             "{:?}",
@@ -853,7 +1026,7 @@ mod tests {
         assert!(c.fatal);
         assert!(!has(&boot, BootStep::AuditWritable));
         // under the override the start goes on, unaudited
-        let c = audit_log_with(&mut boot, &path, &key, [1; 16], false, Some("1")).unwrap();
+        let c = audit_log_with(&mut boot, &path, key, [1; 16], false, Some("1")).unwrap();
         assert!(matches!(c.open, AuditOpen::Failed(_)));
         assert!(!c.fatal);
         // a key that cannot be loaded: refused (review #466 F4), below
@@ -875,11 +1048,12 @@ mod tests {
         std::os::unix::fs::symlink("/dev/null", &null).unwrap();
         let directory = dir.path().join("dir.key");
         std::fs::create_dir(&directory).unwrap();
-        for key in [&corrupted, &empty, &null, &directory] {
+        for key_path in [&corrupted, &empty, &null, &directory] {
+            let key = &present(key_path);
             let mut boot = BootSequence::new();
             let c = audit_log_with(&mut boot, &log, key, [1; 16], false, None).unwrap();
             assert!(matches!(c.open, AuditOpen::NoKey(_)), "{:?}", c.open);
-            assert!(c.fatal, "{}", key.display());
+            assert!(c.fatal, "{}", key_path.display());
             assert!(!has(&boot, BootStep::AuditWritable));
             let c = audit_log_with(&mut boot, &log, key, [1; 16], false, Some("1")).unwrap();
             assert!(matches!(c.open, AuditOpen::NoKey(_)));
@@ -887,10 +1061,18 @@ mod tests {
             assert!(has(&boot, BootStep::AuditWritable));
         }
         assert_eq!(std::fs::read(&empty).unwrap(), b"", "not replaced");
-        // absent: minted, as at a first boot
+        // absent at a first install: minted
         let fresh = dir.path().join("fresh.key");
         let mut boot = BootSequence::new();
-        let c = audit_log_with(&mut boot, &log, &fresh, [1; 16], false, None).unwrap();
+        let c = audit_log_with(
+            &mut boot,
+            &log,
+            &first_install(&fresh),
+            [1; 16],
+            false,
+            None,
+        )
+        .unwrap();
         assert!(matches!(c.open, AuditOpen::Open(_)), "{:?}", c.open);
         assert!(!c.fatal);
         assert!(fresh.is_file());
@@ -904,22 +1086,32 @@ mod tests {
     fn a_key_closed_to_an_unregistered_start_defers_the_open() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let key = dir.path().join("agent.sig.key");
-        crate::keys::AgentSigningKey::load_or_bootstrap(&key).unwrap();
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).unwrap();
-        if std::fs::read(&key).is_ok() {
+        let key_path = dir.path().join("agent.sig.key");
+        crate::keys::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&key_path).is_ok() {
             // root reads it all the same: nothing to show here
             return;
         }
+        let key = &present(&key_path);
         let path = dir.path().join("audit.log");
         let mut boot = BootSequence::new();
-        let c = audit_log_with(&mut boot, &path, &key, [1; 16], true, None).unwrap();
+        let c = audit_log_with(&mut boot, &path, key, [1; 16], true, None).unwrap();
         assert!(matches!(c.open, AuditOpen::Deferred(_)), "{:?}", c.open);
         assert!(!c.fatal);
         assert!(has(&boot, BootStep::AuditWritable));
+        // the decision kept: once the key can be read (the attach registered
+        // the start), the same load gives it
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(
+            key.signer().is_ok(),
+            "the load closed by the hooks, tried again"
+        );
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o000)).unwrap();
         // registered (or no previous hooks): the key is unloadable, refused
+        let key = &present(&key_path);
         let mut boot = BootSequence::new();
-        let c = audit_log_with(&mut boot, &path, &key, [1; 16], false, None).unwrap();
+        let c = audit_log_with(&mut boot, &path, key, [1; 16], false, None).unwrap();
         assert!(matches!(c.open, AuditOpen::NoKey(_)), "{:?}", c.open);
         assert!(c.fatal, "review #466 F4");
     }
@@ -1028,21 +1220,47 @@ mod tests {
         .unwrap()
     }
 
-    /// [`signing_identity_decided`] with no previous agent.
+    /// [`signing_identity_decided`] with no previous agent, a release
+    /// build's rule (no copy exempt).
     fn identity(boot: &mut BootSequence, paths: &continuity::IdentityPaths) -> Verdict {
+        verdict(decide(boot, paths))
+    }
+
+    /// [`signing_identity_decided`] with no previous agent: the decision.
+    fn decide(boot: &mut BootSequence, paths: &continuity::IdentityPaths) -> KeyVerdict {
         signing_identity_decided(
             boot,
             paths,
             &continuity::PreviousAgent::None,
             Path::new("/proc/self/exe"),
+            false,
         )
         .unwrap()
+    }
+
+    /// A [`KeyVerdict`] as a [`Verdict`]: passed (a decision) or refused.
+    fn verdict(v: KeyVerdict) -> Verdict {
+        match v {
+            KeyVerdict::Refused(why) => Verdict::Refused(why),
+            KeyVerdict::Decided(_) => Verdict::Passed,
+        }
+    }
+
+    /// The start's key at `path`, decided a first install.
+    fn first_install(path: &Path) -> crate::keys::BootKey {
+        crate::keys::BootKey::decided(KeyDecision::first_install_for_tests(path))
+    }
+
+    /// The start's key at `path`, decided there.
+    fn present(path: &Path) -> crate::keys::BootKey {
+        crate::keys::BootKey::decided(KeyDecision::present_for_tests(path))
     }
 
     fn identity_paths(dir: &Path) -> continuity::IdentityPaths {
         continuity::IdentityPaths {
             signing_key: dir.join("agent.sig.key"),
             agent_id: dir.join("agent_id"),
+            audit_log: dir.join("audit.log"),
             heads: dir.join("chain_heads.json"),
             chains: vec![dir.join("audit.log")],
         }
@@ -1130,7 +1348,22 @@ mod tests {
             Verdict::Passed,
             "no bpffs"
         );
+        // the re-review of #468, S3: the same instance bound onto itself
+        // (its device, its root) shows the same pins — one instance, twice
+        // mounted, is not a finding
+        let self_bound = format!(
+            "{bpffs}555 554 0:30 / /sys/fs/bpf rw - bpf bpf rw\n556 555 0:30 / /sys/fs/bpf rw - bpf bpf rw\n"
+        );
+        assert_eq!(
+            mounts(&mut BootSequence::new(), Ok(self_bound.into_bytes())),
+            Verdict::Passed,
+            "a self-bind of the bpffs"
+        );
         for (what, extra) in [
+            (
+                "a directory of the same bpffs bound over it",
+                "555 554 0:30 /other /sys/fs/bpf rw - bpf bpf rw\n",
+            ),
             (
                 "stacked bpffs",
                 "555 554 0:91 / /sys/fs/bpf rw - bpf bpf rw\n",
@@ -1251,8 +1484,9 @@ mod tests {
     /// the previous agent protected is its restart — its key must be in a
     /// directory that agent protected and there, never minted (the
     /// reviewer's V3b: `ExecStart=` redefined with the key in an empty
-    /// directory). A start of another binary (the tests' copies) is judged
-    /// by the evidence alone.
+    /// directory). The re-review's S2: its id and its audit log too. A start
+    /// of another binary (the lab tests' copies) is judged by the evidence
+    /// alone only where copies are exempt (the lab builds, S1: below).
     #[test]
     fn a_restart_of_the_protected_binary_never_mints() {
         let d = tempfile::tempdir().unwrap();
@@ -1265,58 +1499,402 @@ mod tests {
         std::fs::create_dir(&empty).unwrap();
         let key = etc.join("agent.sig.key");
         crate::keys::AgentSigningKey::load_or_bootstrap(&key).unwrap();
+        crate::agent_id::load_or_bootstrap(&etc.join("agent_id")).unwrap();
+        std::fs::write(etc.join("audit.log"), "").unwrap();
         let previous = pinned(&[&etc], &[&installed]);
-        let decided = |paths: &continuity::IdentityPaths, exe: &Path| {
+        let decided = |paths: &continuity::IdentityPaths, exe: &Path, copies_exempt: bool| {
             let mut boot = BootSequence::new();
-            let v = signing_identity_decided(&mut boot, paths, &previous, exe).unwrap();
+            let v = verdict(
+                signing_identity_decided(&mut boot, paths, &previous, exe, copies_exempt).unwrap(),
+            );
             assert_eq!(v == Verdict::Passed, has(&boot, BootStep::SigningIdentity));
             v
         };
-        assert_eq!(
-            decided(&identity_paths(&etc), &installed),
-            Verdict::Passed,
-            "a restart"
-        );
+        for copies_exempt in [false, true] {
+            assert_eq!(
+                decided(&identity_paths(&etc), &installed, copies_exempt),
+                Verdict::Passed,
+                "a restart"
+            );
+        }
         // V3b: the installed binary, its key, id and chains in an empty
         // directory: nothing there says an identity, but it is a restart
-        let v = decided(&identity_paths(&empty), &installed);
+        let v = decided(&identity_paths(&empty), &installed, true);
         assert!(
             matches!(&v, Verdict::Refused(w) if w.contains("not in a directory that agent protected")
                 && w.contains("never mints")),
             "{v:?}"
         );
         assert!(!empty.join("agent.sig.key").exists(), "a key minted");
+        // S2: the key where it was, the id or the audit log moved away (a
+        // drop-in's --agent-id-file, --audit-log-file in an empty directory),
+        // or gone: refused, the id and the chain not started anew
+        for (paths, want) in [
+            (
+                continuity::IdentityPaths {
+                    agent_id: empty.join("agent_id"),
+                    ..identity_paths(&etc)
+                },
+                "its id",
+            ),
+            (
+                continuity::IdentityPaths {
+                    audit_log: empty.join("audit.log"),
+                    chains: vec![empty.join("audit.log")],
+                    ..identity_paths(&etc)
+                },
+                "its audit log",
+            ),
+        ] {
+            let v = decided(&paths, &installed, true);
+            assert!(
+                matches!(&v, Verdict::Refused(w) if w.contains(want)
+                    && w.contains("not in a directory that agent protected")),
+                "{want}: {v:?}"
+            );
+        }
+        std::fs::rename(etc.join("agent_id"), etc.join("agent_id.aside")).unwrap();
+        assert!(matches!(
+            decided(&identity_paths(&etc), &installed, true),
+            Verdict::Refused(w) if w.contains("a restart never mints an id")
+        ));
+        std::fs::rename(etc.join("agent_id.aside"), etc.join("agent_id")).unwrap();
+        std::fs::remove_file(etc.join("audit.log")).unwrap();
+        assert!(matches!(
+            decided(&identity_paths(&etc), &installed, true),
+            Verdict::Refused(w) if w.contains("a restart never starts a new audit chain")
+        ));
+        std::fs::write(etc.join("audit.log"), "").unwrap();
         // the key gone from the protected directory, its public half too
         std::fs::remove_file(&key).unwrap();
         std::fs::remove_file(etc.join("agent.sig.pub")).unwrap();
         assert!(matches!(
-            decided(&identity_paths(&etc), &installed),
+            decided(&identity_paths(&etc), &installed, true),
             Verdict::Refused(w) if w.contains("a restart never mints a key")
         ));
-        // another binary (a test's copy) in an empty directory: a first start
-        assert_eq!(decided(&identity_paths(&empty), &copy), Verdict::Passed);
+        // another binary (a lab test's copy) in an empty directory: a first
+        // start where copies are exempt
+        assert_eq!(
+            decided(&identity_paths(&empty), &copy, true),
+            Verdict::Passed
+        );
         // no pins (a boot, or removed on purpose): the evidence alone
         let mut boot = BootSequence::new();
         assert_eq!(
-            signing_identity_decided(
-                &mut boot,
-                &identity_paths(&empty),
-                &continuity::PreviousAgent::None,
-                &installed
-            )
-            .unwrap(),
+            verdict(
+                signing_identity_decided(
+                    &mut boot,
+                    &identity_paths(&empty),
+                    &continuity::PreviousAgent::None,
+                    &installed,
+                    false,
+                )
+                .unwrap()
+            ),
             Verdict::Passed
         );
         assert!(matches!(
-            signing_identity_decided(
+            verdict(signing_identity_decided(
                 &mut BootSequence::new(),
                 &identity_paths(&empty),
                 &continuity::PreviousAgent::Unreadable("EPERM".into()),
-                &installed
+                &installed,
+                false,
             )
-            .unwrap(),
+            .unwrap()),
             Verdict::Refused(w) if w.contains("cannot be read")
         ));
+    }
+
+    /// The re-review of #468, S1: in a release build, with the previous
+    /// agent's pins there, every start is that agent's restart, whatever
+    /// binary it runs — a copy of the binary started by a drop-in (V3b′:
+    /// `ExecStart=` naming a copy, or `ld.so` and the binary) with the key,
+    /// the id and the audit log in an empty directory is refused, and so is
+    /// a copy with its key absent where the protected one was, even when it
+    /// can read the inode map (the BPF guard in observe). The exemption of
+    /// copies is the lab builds' alone (`test-privileged`, `debug-trigger`):
+    /// this build — the workspace's tests, without them — has none.
+    #[test]
+    fn a_release_build_exempts_no_copy_from_the_restart_rule() {
+        assert_eq!(
+            continuity::COPIES_EXEMPT,
+            cfg!(any(feature = "test-privileged", feature = "debug-trigger"))
+        );
+        #[cfg(not(any(feature = "test-privileged", feature = "debug-trigger")))]
+        const {
+            assert!(!continuity::COPIES_EXEMPT, "a release build exempts copies")
+        };
+        let src = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/crates/nn-linux/src/boot/continuity.rs"
+        ));
+        assert!(src.contains(
+            "pub const COPIES_EXEMPT: bool = cfg!(any(feature = \"test-privileged\", feature = \"debug-trigger\"));"
+        ));
+        let d = tempfile::tempdir().unwrap();
+        let (installed, copy) = (d.path().join("northnarrow-agent"), d.path().join("copy"));
+        std::fs::write(&installed, "ELF").unwrap();
+        std::fs::write(&copy, "ELF").unwrap();
+        let (etc, empty) = (d.path().join("etc"), d.path().join("empty"));
+        std::fs::create_dir(&etc).unwrap();
+        std::fs::create_dir(&empty).unwrap();
+        crate::keys::AgentSigningKey::load_or_bootstrap(&etc.join("agent.sig.key")).unwrap();
+        crate::agent_id::load_or_bootstrap(&etc.join("agent_id")).unwrap();
+        std::fs::write(etc.join("audit.log"), "").unwrap();
+        let previous = pinned(&[&etc], &[&installed]);
+        // the release build's rule: no copy exempt
+        let release = |paths: &continuity::IdentityPaths, exe: &Path| {
+            let mut boot = BootSequence::new();
+            let v =
+                verdict(signing_identity_decided(&mut boot, paths, &previous, exe, false).unwrap());
+            assert_eq!(v == Verdict::Passed, has(&boot, BootStep::SigningIdentity));
+            v
+        };
+        // V3b′: the copy, its files in an empty directory
+        let v = release(&identity_paths(&empty), &copy);
+        assert!(
+            matches!(&v, Verdict::Refused(w) if w.contains("whatever it runs")
+                && w.contains("not the binary that agent protected")
+                && w.contains("not in a directory that agent protected")
+                && w.contains("a restart never mints a key")),
+            "{v:?}"
+        );
+        assert!(!empty.join("agent.sig.key").exists(), "a key minted");
+        // the copy with the installed files: a restart, its key there
+        assert_eq!(release(&identity_paths(&etc), &copy), Verdict::Passed);
+        // the lab builds' exemption: the copy judged by the evidence alone
+        let mut boot = BootSequence::new();
+        assert_eq!(
+            verdict(
+                signing_identity_decided(
+                    &mut boot,
+                    &identity_paths(&empty),
+                    &previous,
+                    &copy,
+                    true
+                )
+                .unwrap()
+            ),
+            Verdict::Passed
+        );
+    }
+
+    /// The review of #468, R4: the key is decided once per boot sequence —
+    /// a first install, or a key there (its file as the check saw it) —,
+    /// and a second decision in the same sequence is an error.
+    #[test]
+    fn the_key_is_decided_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = identity_paths(dir.path());
+        let mut boot = BootSequence::new();
+        assert!(matches!(
+            decide(&mut boot, &paths),
+            KeyVerdict::Decided(KeyDecision::FirstInstall(_))
+        ));
+        assert_eq!(
+            signing_identity_decided(
+                &mut boot,
+                &paths,
+                &continuity::PreviousAgent::None,
+                Path::new("/proc/self/exe"),
+                false,
+            )
+            .unwrap_err(),
+            BootOrderError::KeyDecided
+        );
+        crate::keys::AgentSigningKey::load_or_bootstrap(&paths.signing_key).unwrap();
+        let mut boot = BootSequence::new();
+        let KeyVerdict::Decided(KeyDecision::KeyPresent(present)) = decide(&mut boot, &paths)
+        else {
+            panic!("the key is there")
+        };
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(&paths.signing_key).unwrap();
+        assert_eq!(present.seen(), Some((m.dev(), m.ino())));
+    }
+
+    /// The review of #468, R4 (the TOCTOU): the key decided present, then
+    /// gone before its load — hidden by a mount laid during the start,
+    /// removed, its public half and every other piece of evidence with it —
+    /// is an error, never a mint; a key swapped in at the name since the
+    /// check is not loaded either; and the one key loaded is the one every
+    /// chain of the start gets, whatever happens to the file after.
+    #[test]
+    fn a_key_gone_after_the_check_is_never_minted() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = identity_paths(dir.path());
+        let first = crate::keys::AgentSigningKey::load_or_bootstrap(&paths.signing_key).unwrap();
+        let public = crate::keys::verifying_key_path(&paths.signing_key);
+        let decided = |boot: &mut BootSequence| match decide(boot, &paths) {
+            KeyVerdict::Decided(d @ KeyDecision::KeyPresent(_)) => crate::keys::BootKey::decided(d),
+            other => panic!("{other:?}"),
+        };
+        // gone, with all the evidence, between the check and the load
+        let key = decided(&mut BootSequence::new());
+        let secret = std::fs::read(&paths.signing_key).unwrap();
+        std::fs::remove_file(&paths.signing_key).unwrap();
+        std::fs::remove_file(&public).unwrap();
+        let err = key.load().unwrap_err();
+        assert!(
+            matches!(&err, crate::keys::NoKey::Failed(w) if w.contains("refusing to mint")),
+            "{err:?}"
+        );
+        assert!(key.signer().is_err(), "the decision is spent");
+        assert!(!paths.signing_key.exists(), "a key minted");
+        assert!(!public.exists(), "a public half published");
+        // a key swapped in at the name after the check: not the file it saw
+        std::fs::write(&paths.signing_key, &secret).unwrap();
+        let key = decided(&mut BootSequence::new());
+        let other = dir.path().join("other.sig.key");
+        let _ = crate::keys::AgentSigningKey::load_or_bootstrap(&other).unwrap();
+        std::fs::rename(&other, &paths.signing_key).unwrap();
+        let err = key.load().unwrap_err();
+        assert!(
+            matches!(&err, crate::keys::NoKey::Failed(w) if w.contains("not the file the start's check found there")),
+            "{err:?}"
+        );
+        // the one key of a start: loaded once, every chain gets a copy of it,
+        // and a file changed after the load changes nothing
+        std::fs::remove_file(&paths.signing_key).unwrap();
+        std::fs::write(&paths.signing_key, &secret).unwrap();
+        let key = decided(&mut BootSequence::new());
+        let a = key.signer().unwrap();
+        std::fs::remove_file(&paths.signing_key).unwrap();
+        let _ = crate::keys::AgentSigningKey::load_or_bootstrap(&paths.signing_key);
+        let b = key.signer().unwrap();
+        assert_eq!(a.verifying_key(), first.verifying_key());
+        assert_eq!(b.verifying_key(), first.verifying_key());
+        assert_eq!(key.verifying_key(), Some(first.verifying_key()));
+    }
+
+    /// The review of #473, B2: a key's name the check could not look at — a
+    /// dangling link there, so `stat` fails and nothing is recorded — is
+    /// decided present (something is at the name) and then never loaded: a
+    /// key that appears at the link's end after the check is not the file
+    /// the start decided on. Nothing is minted.
+    #[test]
+    fn a_key_name_the_check_could_not_look_at_is_never_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = identity_paths(dir.path());
+        let target = dir.path().join("elsewhere.key");
+        std::os::unix::fs::symlink(&target, &paths.signing_key).unwrap();
+        let mut boot = BootSequence::new();
+        let KeyVerdict::Decided(KeyDecision::KeyPresent(present)) = decide(&mut boot, &paths)
+        else {
+            panic!("a link at the name is something there")
+        };
+        assert_eq!(present.seen(), None, "a dangling link: nothing to record");
+        assert_eq!(present.path(), paths.signing_key);
+        // the link's end appears, a valid key, after the check
+        let planted = crate::keys::AgentSigningKey::load_or_bootstrap(&target).unwrap();
+        let key = crate::keys::BootKey::decided(KeyDecision::KeyPresent(present));
+        let err = key.load().unwrap_err();
+        assert!(
+            matches!(&err, crate::keys::NoKey::Failed(w) if w.contains("could not look at what its name holds")),
+            "{err:?}"
+        );
+        assert!(key.signer().is_err(), "the planted key was loaded");
+        assert!(key.verifying_key().is_none());
+        assert_eq!(
+            crate::keys::read_signing_key(&target)
+                .unwrap()
+                .verifying_key(),
+            planted.verifying_key(),
+            "the file at the link's end changed"
+        );
+        assert!(std::fs::symlink_metadata(&paths.signing_key)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// The review of #473, B3: a first install whose earlier mint died before
+    /// its link left `agent.sig.key.tmp` mints all the same (the leftover is
+    /// removed: it never signed anything); a directory at that name, which
+    /// cannot be removed as a file, is an error, and nothing is minted.
+    #[test]
+    fn a_leftover_temporary_key_does_not_block_a_first_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = identity_paths(dir.path());
+        let tmp = dir.path().join("agent.sig.key.tmp");
+        std::fs::write(&tmp, "half a key").unwrap();
+        let mut boot = BootSequence::new();
+        let KeyVerdict::Decided(d @ KeyDecision::FirstInstall(_)) = decide(&mut boot, &paths)
+        else {
+            panic!("a first install: a leftover temporary file is no identity")
+        };
+        let key = crate::keys::BootKey::decided(d);
+        let minted = key.signer().expect("minted despite the leftover");
+        assert!(!tmp.exists(), "the leftover is gone");
+        assert_eq!(
+            crate::keys::read_signing_key(&paths.signing_key)
+                .unwrap()
+                .verifying_key(),
+            minted.verifying_key()
+        );
+        assert_eq!(
+            crate::keys::read_verifying_key(&crate::keys::verifying_key_path(&paths.signing_key))
+                .unwrap(),
+            minted.verifying_key()
+        );
+        // a directory at the temporary name: an error, nothing minted
+        let dir = tempfile::tempdir().unwrap();
+        let paths = identity_paths(dir.path());
+        std::fs::create_dir(dir.path().join("agent.sig.key.tmp")).unwrap();
+        let mut boot = BootSequence::new();
+        let KeyVerdict::Decided(d @ KeyDecision::FirstInstall(_)) = decide(&mut boot, &paths)
+        else {
+            panic!("a first install")
+        };
+        let key = crate::keys::BootKey::decided(d);
+        assert!(key.load().is_err());
+        assert!(!paths.signing_key.exists(), "a key minted");
+    }
+
+    /// The review of #468, R4: a first install mints once, and never over
+    /// what is at the name since the check (`link(2)`, which does not
+    /// replace): a key that appeared there is kept and the mint refused.
+    #[test]
+    fn a_first_install_mints_once_and_never_over_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = identity_paths(dir.path());
+        let mut boot = BootSequence::new();
+        let KeyVerdict::Decided(d @ KeyDecision::FirstInstall(_)) = decide(&mut boot, &paths)
+        else {
+            panic!("a first install")
+        };
+        let key = crate::keys::BootKey::decided(d);
+        let minted = key.signer().unwrap();
+        assert_eq!(
+            crate::keys::read_verifying_key(&crate::keys::verifying_key_path(&paths.signing_key))
+                .unwrap(),
+            minted.verifying_key()
+        );
+        assert_eq!(
+            key.signer().unwrap().verifying_key(),
+            minted.verifying_key(),
+            "one key"
+        );
+        assert!(!dir.path().join("agent.sig.key.tmp").exists());
+        // a key at the name since the check (decided on a fresh directory)
+        let dir = tempfile::tempdir().unwrap();
+        let paths = identity_paths(dir.path());
+        let mut boot = BootSequence::new();
+        let KeyVerdict::Decided(d @ KeyDecision::FirstInstall(_)) = decide(&mut boot, &paths)
+        else {
+            panic!("a first install")
+        };
+        std::fs::write(&paths.signing_key, "planted\n").unwrap();
+        let key = crate::keys::BootKey::decided(d);
+        let err = key.load().unwrap_err();
+        assert!(
+            matches!(&err, crate::keys::NoKey::Failed(w) if w.contains("not replaced, nothing minted")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&paths.signing_key).unwrap(), b"planted\n");
+        assert!(!dir.path().join("agent.sig.key.tmp").exists());
+        assert!(key.signer().is_err(), "one mint, not tried again");
     }
 
     /// Lab PR 265: the environment variable that makes
@@ -1589,7 +2167,7 @@ mod tests {
         )
         .unwrap();
         assert!(!c.fatal);
-        let key = dir.path().join("agent.sig.key");
+        let key = first_install(&dir.path().join("agent.sig.key"));
         let audit = audit_log_with(
             &mut boot,
             &dir.path().join("audit.log"),

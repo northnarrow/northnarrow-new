@@ -164,6 +164,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     let preflight::Preflight {
         refused,
         mut boot,
+        signing_key,
         tracepoint_degraded,
         hook_args_degraded,
         heads_file,
@@ -171,7 +172,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         boot_chains,
         rollback_floor,
     } = preflight::check(&cli)?;
-    let state_ready = state::bootstrap(&cli, &heads_file, refused.is_some());
+    let state_ready = state::bootstrap(&cli, &heads_file, refused.is_some(), &signing_key);
     let identity::Identity {
         identity,
         agent_id,
@@ -196,6 +197,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &overlay_gate,
         state_ready.early_registration_failed,
         refused,
+        &signing_key,
     )?;
     // R11b (lab PR 262): what signs a refusal of the attach and the
     // self-test, which need the loaded object (into the audit log the
@@ -205,6 +207,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         identity: &identity,
         overlay_gate: &overlay_gate,
         integrity: (integrity.label(), integrity.provenance()),
+        key: &signing_key,
     };
     let attach::Attached {
         lineage,
@@ -264,6 +267,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         sensor.dns_mode(),
         caps_degraded,
         audit,
+        &signing_key,
     )?;
     let policy::Policy {
         netflow_blocklist,
@@ -325,6 +329,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         chain_targets,
         &posture,
         &installer_override,
+        &signing_key,
     );
     let combat = posture::ladder(
         &cli,
@@ -362,6 +367,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &chain_anchor,
         &audit_log,
         &defense_detector,
+        &signing_key,
     );
     let fim_admin_state = fim::start(
         &cli,
@@ -379,11 +385,12 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &lineage,
         paths_summary,
         &state_protection,
+        &signing_key,
     );
     let canary::Canary {
         canary_admin_state,
         canary_detector,
-    } = canary::start(&cli, agent_id, &audit_log, &fim_admin_state);
+    } = canary::start(&cli, agent_id, &audit_log, &fim_admin_state, &signing_key);
     net::start(
         &cli,
         agent_id,
@@ -397,6 +404,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         net_bufs,
         netflow_blocklist,
         chain_store,
+        &signing_key,
     );
     // R11c (lab PR 264): the boot's signed capability manifest, signed by
     // the run phase and read by the admin socket's status.
@@ -736,18 +744,25 @@ mod tests {
             assert!(at(check) < attach, "`{check}` after the attach");
         }
         // lab PR 265 (review #466 F4-bis): the start's continuity first —
-        // before the registration, the first key load (which mints an
-        // absent key), the identity and every other check
+        // before the registration, the key's decision and its one load
+        // (the review of #468, R4: the mint of a first install), the
+        // identity and every other check
         for first in ["checks::agent_mounts(", "checks::signing_identity("] {
             for later in [
                 "checks::ebpf_object(",
                 "preregister_self(",
-                "AgentSigningKey::load_or_bootstrap(",
+                "BootKey::decided(",
+                "signing_key.load()",
                 "agent_id::resolve(",
             ] {
                 assert!(at(first) < at(later), "`{first}` after `{later}`");
             }
         }
+        // the key decided right after its check, loaded once the start
+        // registered with the previous agent's hooks, before the identity
+        assert!(at("BootKey::decided(") < at("checks::ebpf_object("));
+        assert!(at("preregister_self(") < at("signing_key.load()"));
+        assert!(at("signing_key.load()") < at("agent_id::resolve("));
         let selftest = at("boot::deny_selftest::run(");
         assert!(selftest > at(".attach_anti_tamper("));
         // R11b (lab PR 262): the audit chain opens before the load (above,
@@ -789,6 +804,83 @@ mod tests {
         assert_eq!(sources.matches("BootSequence::begin()").count(), 1);
         assert!(function(PHASES[1].1, PHASES[1].2).contains("BootSequence::begin()?"));
         assert!(!sources.contains("BootSequence::for_tests"));
+    }
+
+    /// The review of #468, R4 (the ratchet): the start decides its signing
+    /// key once and loads it once. The preflight makes the one
+    /// `BootKey` from `checks::signing_identity`'s decision, the state
+    /// bootstrap loads it, and every phase that signs — the audit check,
+    /// the refusals, the attest phase, the anchor, the stores, FIM, the
+    /// canaries, the network logs — takes a copy of that one key
+    /// (`signer()`): no phase of the start reads, loads or mints a key of
+    /// its own, so the chains of one boot are signed by exactly one key.
+    #[test]
+    fn the_start_decides_its_key_once_and_loads_it_once() {
+        let sources = start_sources();
+        for other in [
+            "load_or_bootstrap(",
+            "load_existing(",
+            "mint_first(",
+            "read_signing_key(",
+            "KeyDecision::",
+            "_for_tests(",
+        ] {
+            assert!(
+                !sources.contains(other),
+                "the start loads a key of its own: `{other}`"
+            );
+        }
+        assert_eq!(sources.matches("BootKey::decided(").count(), 1);
+        assert!(function(PHASES[1].1, PHASES[1].2)
+            .contains("let signing_key = northnarrow_agent::keys::BootKey::decided(decision);"));
+        assert_eq!(sources.matches("signing_key.load()").count(), 1);
+        assert!(function(PHASES[2].1, PHASES[2].2).contains("signing_key.load()"));
+        // the one decision is the check's
+        assert!(function(PHASES[1].1, PHASES[1].2)
+            .contains("checks::KeyVerdict::Decided(decision) => decision,"));
+        // each phase that signs takes copies of the one key (the network
+        // phase through a closure it calls for each of its two logs)
+        for (phase, copies) in [
+            ("evidence::stores(", 2),
+            ("fim::start(", 2),
+            ("canary::start(", 2),
+            ("net::start(", 1),
+        ] {
+            let (_, src, head) = PHASES
+                .iter()
+                .find(|(call, _, _)| *call == phase)
+                .expect("the phase");
+            // without whitespace: rustfmt splits a call over lines
+            let body: String = function(src, head)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert_eq!(
+                body.matches("signing_key.signer()").count(),
+                copies,
+                "{phase}"
+            );
+        }
+        let evidence = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/evidence.rs"));
+        assert!(function(evidence, "fn open_after_attach(").contains("refusals.key.signer()"));
+        assert!(function(evidence, "fn start_chain_anchor(").contains("signing_key.signer()"));
+        let refusal = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/refusal.rs"));
+        assert_eq!(
+            function(refusal, "pub(crate) fn sign(")
+                .matches("key.signer()")
+                .count(),
+            2
+        );
+        // and `run` hands the same one to every phase
+        let run: String = function(
+            include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/mod.rs")),
+            "async fn run(",
+        )
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+        assert!(run.contains("mutboot,signing_key,"));
+        assert_eq!(run.matches("&signing_key").count(), 9, "{run}");
     }
 
     /// R11b (lab PR 262): every refusal of the start goes through

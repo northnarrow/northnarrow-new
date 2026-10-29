@@ -66,6 +66,28 @@ done
 # Same guard install.sh applies to a tree: the agent must embed the stamped object.
 [[ "$ebpf.buildhash" -nt target/release/northnarrow-agent ]] \
     && { echo "mk-packages: agent binary older than the eBPF stamp — rebuild with \`cargo xtask build --release\`" >&2; exit 1; }
+# Lab PR 268 (the review of #473, B4): no lab feature in what is packed. A
+# binary built with test-privileged or debug-trigger exempts copies of itself
+# from the restart rule and runs its BPF guard in observe; release.yml checks
+# the artefacts the same way (PROC-015). The agent says what it was built
+# with (`--build-features`: `none`); nn-admin has no `debug` subcommand. The
+# lab's package check (deploy/lab/pkg/pkg-check.sh) packs its lab build on
+# purpose, with NN_PKG_LAB_FEATURES=1: a warning then, never in a release.
+lab_features() {
+    if [[ ${NN_PKG_LAB_FEATURES:-} == 1 ]]; then
+        echo "mk-packages: WARNING: $1 — packed on purpose (NN_PKG_LAB_FEATURES=1, the lab's package check): never a release" >&2
+    else
+        echo "mk-packages: $1 — rebuild with \`cargo xtask build --release\`" >&2; exit 1
+    fi
+}
+feat=$(target/release/northnarrow-agent --build-features) \
+    || { echo "mk-packages: target/release/northnarrow-agent cannot report its build features" >&2; exit 1; }
+[[ "$feat" == none ]] || lab_features "target/release/northnarrow-agent was built with lab features ($feat)"
+help=$(target/release/nn-admin --help) \
+    || { echo "mk-packages: target/release/nn-admin --help failed" >&2; exit 1; }
+if grep -qE '^  debug( |$)' <<<"$help"; then
+    lab_features "target/release/nn-admin has the debug subcommand (debug-trigger)"
+fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

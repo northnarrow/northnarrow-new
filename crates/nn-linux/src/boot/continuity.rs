@@ -12,25 +12,38 @@
 //! a new key, published its public half over the old one and went on
 //! signing every chain under it — the signing identity reset with one INFO
 //! line. Two checks of the preflight, before anything is read, written or
-//! loaded, close that:
+//! loaded, close that, on two kinds of proof — what the start can read in
+//! its own view, and (the review of #468, R2) what the kernel keeps of the
+//! previous agent, which no view of the filesystem changes:
 //!
 //! - [`mounts_over`]: no mount at or under the agent's own directories
 //!   but a bind of a directory onto itself (what the unit's
 //!   `ReadWritePaths=` makes: the same filesystem, the same directory);
 //!   anything else at one of them — another directory bound there, another
 //!   filesystem — hides the files the agent had. Mounts above them are not
-//!   judged here: a separate `/var` (or any ancestor) on its own
-//!   filesystem is a normal layout. The self-integrity watcher reports
-//!   those, and a mount that swaps only one of the two trees leaves the
-//!   other's evidence for [`prior_identity`].
+//!   judged by the table: a separate `/var` (or any ancestor) on its own
+//!   filesystem is a normal layout. [`bpffs_findings`]: one bpffs instance
+//!   at `/sys/fs/bpf`, nothing over the pin root — the pins are the next
+//!   proof.
+//! - The previous agent's pins ([`previous_agent`]: they outlive it — a
+//!   `cgroup.kill`, a crash —, not a reboot), when they are there: its
+//!   `PROTECTED_INODES` holds the inodes it protected. [`view_findings`]:
+//!   the agent's directories as this start sees them must be those inodes
+//!   (a copy bound over an ancestor, a rename above them, another root show
+//!   others). [`restart_findings`]: this start is that agent's restart —
+//!   in a release build whatever binary it runs (the re-review's S1,
+//!   [`COPIES_EXEMPT`]) — and keeps its identity: its key, id and audit log
+//!   in directories that agent protected, and there. A restart never mints.
 //! - [`prior_identity`]: what says this install had a signing identity —
 //!   the key's public half (`agent.sig.pub`), the install's id
 //!   (`agent_id`), a signed row in the audit chain or in one of the other
 //!   chains. A key absent with any of it is a key removed or hidden: the
-//!   start refuses, and only a start with none of it (a first install)
-//!   mints one.
+//!   start refuses, and only a start with none of it and no pins (a first
+//!   install) mints one — once, from the preflight's decision
+//!   (`boot::checks::KeyDecision`, the review of #468 R4; what still opens
+//!   the way is in `docs/operator/BOOT_INTEGRITY.md` §1.1).
 //!
-//! Both refusals are the journal's alone: nothing can sign them — the key
+//! The refusals are the journal's alone: nothing can sign them — the key
 //! is the one hidden, and a mount over the agent's directories puts any
 //! chain the start could open in the view it refuses.
 
@@ -171,11 +184,14 @@ pub fn mounts_over(table: &MountTable, dirs: &[PathBuf]) -> Vec<String> {
 /// Lab PR 265 (review of #468 R2): the bpffs the previous agent's pins are
 /// in must be the one at [`BPFFS_MOUNT`], alone there and nothing mounted
 /// over its pin root (`pin_root`): a second bpffs or a tmpfs stacked on
-/// it, or a mount over the pin root, hides the pins — and with them the
-/// kernel's proof of what the previous agent protected ([`view_findings`],
-/// [`restart_key_findings`]). A
-/// host without a bpffs there has no pins: nothing to judge. A bpffs
-/// mounted elsewhere is the self-integrity watcher's finding.
+/// it, a bind of one of its directories over it, or a mount over the pin
+/// root, hides the pins — and with them the kernel's proof of what the
+/// previous agent protected ([`view_findings`], [`restart_findings`]). The
+/// re-review of #468, S3: what counts is the instances, not the mounts — a
+/// bind of the same bpffs (its `major:minor`) onto itself, its root `/`
+/// (what a node or CNI script may lay there), shows the same pins and is
+/// not a finding. A host without a bpffs there has no pins: nothing to
+/// judge. A bpffs mounted elsewhere is the self-integrity watcher's finding.
 pub fn bpffs_findings(table: &MountTable, pin_root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let at: Vec<&MountEntry> = table
@@ -183,20 +199,31 @@ pub fn bpffs_findings(table: &MountTable, pin_root: &Path) -> Vec<String> {
         .iter()
         .filter(|m| m.mount_point == Path::new(BPFFS_MOUNT))
         .collect();
-    if at.len() > 1 {
-        out.push(format!(
-            "{} mounts stacked on {BPFFS_MOUNT} ({}): one hides the previous agent's pins",
-            at.len(),
-            at.iter()
-                .map(|m| m.fstype.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    } else if let Some(m) = at.first() {
-        if m.fstype != "bpf" {
+    if let Some(first) = at.first() {
+        // the bottom one is the instance; every mount stacked on it must be
+        // that instance again, whole
+        let one_instance = at
+            .iter()
+            .all(|m| m.same_dev(first) && m.root == Path::new("/") && m.fstype == first.fstype);
+        if at.len() > 1 && !one_instance {
+            out.push(format!(
+                "{} mounts stacked on {BPFFS_MOUNT}, not one instance bound onto itself ({}): \
+                 one hides the previous agent's pins",
+                at.len(),
+                at.iter()
+                    .map(|m| format!(
+                        "{} {} {}",
+                        m.fstype.to_string_lossy(),
+                        m.dev(),
+                        m.root.display()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        } else if first.fstype != "bpf" {
             out.push(format!(
                 "{BPFFS_MOUNT} is a {} mount, not a bpffs",
-                m.fstype.to_string_lossy()
+                first.fstype.to_string_lossy()
             ));
         }
     }
@@ -325,58 +352,97 @@ pub fn view_findings(previous: &PreviousAgent, dirs: &[PathBuf]) -> Vec<String> 
     out
 }
 
-/// Lab PR 265 (review of #468 R2, fix a), the restart: when this process
-/// runs the very binary the previous agent protected (`exe`, followed: the
-/// installed one — the privileged tests run copies of their own), this
-/// start is that agent's restart, and a restart keeps its identity: its
-/// key's directory must be one the previous agent protected (a drop-in
-/// redefining `ExecStart=` with the key, the id and the chains in an empty
-/// directory is refused) and its key must be there — never minted. No
-/// pins: nothing to compare; pins whose inode map cannot be read: a
-/// finding.
-pub fn restart_key_findings(
+/// The re-review of #468, S1: a start of another binary than the one the
+/// previous agent protected (a copy) is judged by the evidence alone, not as
+/// that agent's restart — in the lab builds only: the privileged tests
+/// (`test-privileged`) run copies of the binary, with files of their own,
+/// beside the installed agent, and a `debug-trigger` build's BPF guard
+/// observes. A release build has no exemption: with the pins there every
+/// start is a restart, whatever it runs — a copy started by a drop-in
+/// (`ExecStart=` naming a copy, or `ld.so` and the binary) with the key's
+/// path elsewhere is refused by [`restart_findings`], not only by the BPF
+/// guard denying it a handle on the inode map (which holds while the guard
+/// enforces, and not with `NN_BPF_DEFENSE_OBSERVE=1`).
+pub const COPIES_EXEMPT: bool = cfg!(any(feature = "test-privileged", feature = "debug-trigger"));
+
+/// Lab PR 265 (review of #468 R2, fix a; its re-review, S1 and S2), the
+/// restart: with the previous agent's pins there, this start is that
+/// agent's restart — whatever binary it runs (`exe`, followed), unless
+/// `copies_exempt` ([`COPIES_EXEMPT`], the lab builds) and it is not the one
+/// that agent protected — and a restart keeps its identity. Its signing key,
+/// its id and its audit log (`paths.audit_log`) must each be in a
+/// directory that agent protected (a drop-in redefining `ExecStart=` with
+/// them in an empty directory is refused) and be there: a restart never
+/// mints a key or an id, nor starts a new audit chain (an upgrade, an
+/// uninstall and a re-key remove the pins first). No pins: nothing to
+/// compare; pins whose inode map cannot be read: a finding.
+pub fn restart_findings(
     previous: &PreviousAgent,
     exe: &Path,
-    signing_key: &Path,
+    paths: &IdentityPaths,
+    copies_exempt: bool,
 ) -> Vec<String> {
     let contains = match pinned_inodes(previous) {
         Ok(Some(c)) => c,
         Ok(None) => return Vec::new(),
         Err(why) => return vec![why],
     };
-    let restart = std::fs::metadata(exe)
+    let protected = std::fs::metadata(exe)
         .map(|m| InodeKey {
             dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
             ino: m.ino(),
         })
         .is_ok_and(contains);
-    if !restart {
+    if copies_exempt && !protected {
         return Vec::new();
     }
     // the binary by its path (`/proc/self/exe` is a link to it)
     let shown = std::fs::read_link(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let restart = if protected {
+        format!(
+            "this start runs the binary the previous agent protected ({}), a restart of it",
+            shown.display()
+        )
+    } else {
+        format!(
+            "the previous agent's pins are there, so this start is its restart, whatever it runs \
+             ({}, not the binary that agent protected)",
+            shown.display()
+        )
+    };
+    let files = [
+        (
+            "signing key",
+            &paths.signing_key,
+            "a restart never mints a key",
+        ),
+        ("id", &paths.agent_id, "a restart never mints an id"),
+        (
+            "audit log",
+            &paths.audit_log,
+            "a restart never starts a new audit chain",
+        ),
+    ];
     let mut out = Vec::new();
-    let key_dir = signing_key
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    if !inode_key(key_dir).is_ok_and(contains) {
-        out.push(format!(
-            "this start runs the binary the previous agent protected ({}), a restart of it, but \
-             its signing key {} is not in a directory that agent protected: a restart keeps its \
-             identity",
-            shown.display(),
-            signing_key.display()
-        ));
-    }
-    if key_absent(signing_key) {
-        out.push(format!(
-            "this start runs the binary the previous agent protected ({}), a restart of it, and \
-             its signing key {} is absent: a restart never mints a key (an upgrade, an \
-             uninstall and a re-key remove the pins before the key goes)",
-            shown.display(),
-            signing_key.display()
-        ));
+    for (what, path, never) in files {
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if !inode_key(dir).is_ok_and(contains) {
+            out.push(format!(
+                "{restart}, but its {what} {} is not in a directory that agent protected: a \
+                 restart keeps its identity",
+                path.display()
+            ));
+        }
+        if key_absent(path) {
+            out.push(format!(
+                "{restart}, and its {what} {} is absent: {never} (an upgrade, an uninstall and a \
+                 re-key remove the pins before the {what} goes)",
+                path.display()
+            ));
+        }
     }
     out
 }
@@ -388,6 +454,10 @@ pub fn restart_key_findings(
 pub struct IdentityPaths {
     pub signing_key: PathBuf,
     pub agent_id: PathBuf,
+    /// The audit log (the review of #473: named, not the first of `chains`
+    /// by convention): what a restart must find where the previous agent
+    /// protected it ([`restart_findings`]). `chains` holds it too.
+    pub audit_log: PathBuf,
     /// The head anchor (`chain_heads.json`): install.sh creates it empty,
     /// the agent writes it.
     pub heads: PathBuf,
@@ -690,6 +760,28 @@ mod tests {
         assert!(mounts_over(&parse_mountinfo(t), &dirs()).is_empty());
     }
 
+    /// The re-review of #468: a line not in the kernel's shape whose mount
+    /// point cannot be read may be a mount over any directory: a finding of
+    /// `mounts_over` itself (`(any)`), not only of the bpffs rule.
+    #[test]
+    fn a_malformed_line_without_a_mount_point_is_a_finding() {
+        let t = parse_mountinfo("29 1 252:1 / / rw - ext4 /dev/vda1 rw\n900 29\n");
+        assert_eq!(t.malformed.len(), 1);
+        assert_eq!(t.malformed[0].mount_point, None);
+        let f = mounts_over(&t, &dirs());
+        assert!(
+            f.len() == 1 && f[0].contains("over the agent's directory (any)"),
+            "{f:?}"
+        );
+        assert!(bpffs_findings(&t, Path::new("/sys/fs/bpf/northnarrow")).len() == 1);
+        // with a readable mount point elsewhere: none
+        let t = parse_mountinfo(
+            "29 1 252:1 / / rw - ext4 /dev/vda1 rw\n900 29 252:1 / /srv rw - ext4\n",
+        );
+        assert_eq!(t.malformed.len(), 1);
+        assert!(mounts_over(&t, &dirs()).is_empty());
+    }
+
     /// `mountinfo` escapes the blanks of a path; the mount point is
     /// matched by components, not as a string prefix.
     #[test]
@@ -735,6 +827,7 @@ mod tests {
         let paths = IdentityPaths {
             signing_key: d.path().join("agent.sig.key"),
             agent_id: d.path().join("agent_id"),
+            audit_log: d.path().join("audit.log"),
             heads: d.path().join("chain_heads.json"),
             chains: vec![
                 d.path().join("audit.log"),

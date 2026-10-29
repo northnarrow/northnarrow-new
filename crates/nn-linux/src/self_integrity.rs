@@ -529,7 +529,8 @@ struct Mount {
 }
 
 /// The lines of a `mountinfo` table, in order ([`crate::mountinfo::parse`]);
-/// a line not in the kernel's shape is skipped.
+/// a line not in the kernel's shape is skipped here (and judged by
+/// [`malformed_over_protected`]).
 fn parse_mountinfo(mountinfo: &[u8]) -> Vec<Mount> {
     crate::mountinfo::parse(mountinfo)
         .entries
@@ -634,7 +635,36 @@ fn covers_protected(mp: &str, extra_files: &[String]) -> bool {
 /// outside the canonical root, or the tracefs the agent reads its
 /// tracepoint offsets from.
 pub fn mount_findings(mountinfo: impl AsRef<[u8]>, extra_files: &[String]) -> Vec<Finding> {
-    mounts_over_protected(&parse_mountinfo(mountinfo.as_ref()), extra_files, &[])
+    let mut out = mounts_over_protected(&parse_mountinfo(mountinfo.as_ref()), extra_files, &[]);
+    out.extend(malformed_over_protected(mountinfo.as_ref(), extra_files));
+    out
+}
+
+/// The re-review of #468 (W1): a line of the table not in the kernel's shape
+/// ([`crate::mountinfo::parse`] keeps it aside) whose mount point is a
+/// protected path — an nsfs over `agent.sig.key`, whose root is not a path:
+/// a `mount_over_protected`, as the start's check refuses it
+/// (`boot::continuity::mounts_over`). One elsewhere, or one whose mount
+/// point cannot be read (what the start refuses fail-closed, and the kernel
+/// never writes), is not a finding of the watcher.
+fn malformed_over_protected(mountinfo: &[u8], extra_files: &[String]) -> Vec<Finding> {
+    crate::mountinfo::parse(mountinfo)
+        .malformed
+        .into_iter()
+        .filter_map(|bad| {
+            let over = bad.mount_point.as_ref()?.to_string_lossy().into_owned();
+            if !covers_protected(&over, extra_files) {
+                return None;
+            }
+            Some(Finding {
+                kind: "mount_over_protected",
+                detail: format!(
+                    "{over} (line {} of the mount table, not in the kernel's shape: {})",
+                    bad.line, bad.why
+                ),
+            })
+        })
+        .collect()
 }
 
 /// [`mount_findings`] on parsed lines; a mount of the unit's own sandbox
@@ -750,6 +780,7 @@ pub fn mount_round<T: AsRef<[u8]>>(
         MountSource::Own => unit_sandbox_dirs(),
     };
     let mut out = mounts_over_protected(&mounts, own_files, &sandbox);
+    out.extend(malformed_over_protected(text.as_ref(), own_files));
     out.extend(hidden_by_mounts(
         &mounts,
         &watched,
@@ -2458,6 +2489,37 @@ mod tests {
         ];
         assert!(is_unit_sandbox(&m[1], &m, &sandbox));
         assert!(!is_unit_sandbox(&m[2], &m, &sandbox));
+    }
+
+    /// The re-review of #468 (W1): a line not in the kernel's shape over a
+    /// protected path — an nsfs mounted over `agent.sig.key` (its root
+    /// `net:[…]` is not a path) — is a `mount_over_protected`, in a round
+    /// too; one elsewhere (an nsfs under `/run/netns`, as on a k8s node) is
+    /// nothing.
+    #[test]
+    fn a_malformed_line_over_a_protected_path_is_reported() {
+        let base = "29 1 252:1 / / rw - ext4 /dev/vda1 rw\n";
+        let over = format!(
+            "{base}600 29 0:4 net:[4026532] /etc/northnarrow/agent.sig.key rw - nsfs nsfs rw\n"
+        );
+        let f = mount_findings(&over, &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "mount_over_protected");
+        assert!(
+            f[0].detail
+                .starts_with("/etc/northnarrow/agent.sig.key (line 2 of the mount table"),
+            "{f:?}"
+        );
+        let mut w = MountWatch::default();
+        let r = mount_round(Ok(over.into_bytes()), || Ok(Vec::new()), &[], &mut w);
+        assert!(
+            r.iter()
+                .any(|f| f.kind == "mount_over_protected" && f.detail.contains("line 2")),
+            "{r:?}"
+        );
+        let elsewhere =
+            format!("{base}600 29 0:4 net:[4026532] /run/netns/cni-1 rw - nsfs nsfs rw\n");
+        assert!(mount_findings(&elsewhere, &[]).is_empty());
     }
 
     #[test]
