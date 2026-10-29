@@ -1356,17 +1356,21 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   the exploit guard's, the file-open sensor's, the FIM and network drains —
   sends into its class's queue: P0 tamper (`FsProtectDenial`,
   `BpfSyscall`, `ModuleLoad`, `SensorFlood`, `DefenderSignal`,
-  `ExploitPostcondition`; 1,024: a denial's sender waits 50 ms then
-  drops, every other tamper event waits for room), P1 process (4,096,
-  10 ms), P2 file (8,192: a new `FileOpen` is dropped when the queue is
-  full or holds 2,048 opens, every other file event waits as on the
-  channel, review 75), P3 network (8,192, drop the new event); every
-  `Event` variant placed by an exhaustive match. The event loop takes P0
-  first, then P1, P2 and P3 by weighted shares 2 : 1 : 1 (a smooth
-  weighted round robin), FIFO inside a queue: a flood of opens no longer
-  holds the tamper records back, nor makes the kernel drop them (EXP-13),
-  and a flood of any lower class leaves each other one at least a quarter
-  of the consumer. An event taken ahead of queued execs hands them to the
+  `ExploitPostcondition`; 1,024: a denial repeated by its process on its
+  inode within a second is counted into the one queued and signed, a new
+  denial's sender waits 50 ms then drops, every other tamper event waits
+  for room, and denials and `bpf()` calls take all but 64 slots, the rare
+  tamper events'), P1 process (4,096, 10 ms), P2 file (8,192: a new
+  `FileOpen` is dropped when the queue is full or holds 2,048 opens; a
+  write-open of a CRITICAL or PERSIST file and every other file event wait
+  as on the channel, review 75), P3 network (8,192, drop the new event);
+  every `Event` variant placed by an exhaustive match. The event loop takes
+  by weighted shares 8 : 2 : 1 : 1 (a smooth weighted round robin), FIFO
+  inside a queue: a flood of opens no longer holds the tamper records back,
+  nor makes the kernel drop them (EXP-13); a flood of any lower class leaves
+  each other one at least a quarter of the consumer, and a tamper flood
+  (a root loop of refused operations, any user's `fork` + `bpf()` loop)
+  leaves the exec, file and network events their sixth and twelfths. An event taken ahead of queued execs hands them to the
   lineage and the rules first, so it is judged on the process tree of
   every exec that reached the bus before it; and the lineage keeps the
   last three execs of a pid and answers as of the judged event's time, so

@@ -3515,6 +3515,47 @@ only in the table below, in the same PR as the evidence.
     change outside the corpus: a late exec whose process had a port-53 flow
     to a non-resolver and then another flow now kills for the later one.
     Lab after the review: on ubuntu2404 only (ubuntu2204 was lot 268's), `main` 769d5615 and the tip in turn in one tree path, each freshly installed. EXP-13: `main` lost 3,681 of 12,000 `fs_protect` denials in the kernel, first records 532–602 ms; the tip 0, 12,000 accounted, 0.45–2.8 ms, P2 held at its 2,048 opens (longest wait 0.51 s). EXP-13c (new: the same flood and bursts plus 500 connects/s and 20 DNS queries/s of uid 1000, and probes — a connect to TEST-NET-1, in the shipped blocklist, and one from a copy of the helper in /var/tmp): `main` judged its NET-001 and chain probes 456–532 ms after the connect (the process gone), lost 3,732 denials; the tip, four runs, P3 49,8xx queued and 0 dropped each, 18 NET-001 probes judged and killed while connecting (13–27 ms), 24 chain probes judged (1.7–214 ms), no bus drop; in two runs the agent's rings fell behind on the saturated guest (`fs_protect` 408 once, `fim` 1,575 and 439, `open_sensor` 6,819 once) while P0's sends waited at most 3.4 ms — the pumps short of CPU, not the bus (the run without probes dropped nothing; pumps on threads of their own are R12b's). EXP-13b (the loop stalled 4 s, a burst of 3,000): `main`'s channel held it (3,000 judged, the first 3.94 s late); the tip 1,971 judged, 76 denials dropped on P0 after 50 ms — five signed rows one second apart during the stall — and 953 in the ring, 3,000 accounted. Overhead within noise (open +30.5 / +29.4 %, exec +13.4 / +8.6 %, connect +43.5 / +44.9 %). Soak pair, each after a fresh install, the same 0.8 h: RSS 33.2 → 55.7 MB (`main`) and 33.3 → 55.5 MB (the tip), threads 9 → 11 and 9 → 10, no restart, no ring drop, the bus's queues empty at every sample with nothing dropped, WARN/ERROR lines 2,887 / 1 and 3,022 / 1 (the one ERROR the lab's admin key on the host) — the first pair's 23 threads against 16 were not comparable runs; the soak report's WARN/ERROR file now reads the units' namespace by tracing level (it was empty: journald gives every line priority 6). Gates on fc23d1d1: build-ebpf, clippy ×4, fmt, 74 suites 3,237 passed 0 failed, the privileged build, attack-coverage, `golden` ×5 (53 files the same bytes), MSRV, 13 fuzz targets, portable-core 5 targets, lockfiles unchanged; the same gates on the merge with `main` c209e353 (lot 268, 35811cd1): 74 suites, 3,252 passed, 0 failed, every other gate green (`tmp/fix471/`).
+  - Second review (PR #471, "merge after X"), fixed in the lot: R-A — the
+    fix's strict P0 left exec, file and network events no take while a
+    flood kept P0 full, and any user can keep it full on 6.8 (the lab: a
+    uid-1000 `fork` + `bpf(BPF_MAP_CREATE)` loop, refused with EPERM under
+    `unprivileged_bpf_disabled=2`, reached the agent's hook 581,951 times
+    in 40 s on `main`) — every queue in the shares, 8 : 2 : 1 : 1, and a
+    denial repeated by its process on its inode within a second counted
+    into the one queued and signed (`event_bus_coalesced`); R-D — denials
+    and `bpf()` calls take all of P0 but 64 slots, the rare tamper events';
+    R-E — the opens' cap counts the opens, a write-open of a CRITICAL or
+    PERSIST file waits for room, the open-sensor pump checks the cap before
+    it builds an open; tests for the three mutations that survived it (the
+    history's depth, a FIM record and a flow judged as of their own time,
+    the golden case `a1-netflow-no-exe-later-exec`); 46 of 46 mutations
+    caught. Lab on ubuntu2404 (6.8), `main` c209e353 against the tip
+    9d0deab2, each freshly installed: EXP-13d (that bpf loop, 8 processes,
+    with 500 connects/s, 20 DNS queries/s and probes of every class — a
+    connect to TEST-NET-1, and a /var/tmp program that reads a decoy GPG
+    key and connects): the tip queued 623,646 `bpf()` events in P0 (at
+    most 960, its share) and dropped none on the bus, P1–P3 dropped
+    nothing, every probe judged — NET-001 6/6 in 18–23 ms, the staged
+    probe's exec, file and network records 6/6 each — the `bpf` ring 672 in
+    the kernel while its pump waited; `main` (one FIFO channel) judged them
+    all too. EXP-13e (8 processes' `fork` + refused `chmod`, root): the tip
+    578,189 denials queued, none dropped on the bus, every probe judged,
+    `fs_protect` 888 in the ring (`main` 236), all accounted (records +
+    held + coalesced + ring). EXP-13: the tip 0 `fs_protect` drops (`main`
+    3,699), the bursts' 12,000 denials 8 records + 11,992 coalesced, first
+    records 0.23–1.2 ms (`main` 529–597 ms). EXP-13c ×3 with the agent's
+    threads' CPU and the CPU pressure: P3 49,836–49,838 queued and 0
+    dropped (longest wait 29 ms), NET-001 18/18 in 13–29 ms; rings: none,
+    `fs_protect` 23, `open_sensor` 5,543 — in runs where no send of the bus
+    waited for room, the agent used 56 s of CPU in the flood's 45 s on both
+    builds (`main` 55 s) and the guest's CPU pressure covered ~36 s of it:
+    the pumps short of CPU, plausible, not proven. Overhead within noise
+    (open +27.3 / +28.8 %, exec +8.8 / +7.6 %, connect +43.5 / +39.5 %).
+    Open from it: R-B (a deeper history and the walk on from the parent),
+    R-C (a FIM `Modified` carries its close's time: an eBPF and wire
+    change), R-F (the `/proc` fallback inside a judgement's scope; an
+    assertion for a lookup outside one), a kernel budget per uid for the
+    `bpf` hook (`tmp/fix471/lab3/`).
   - Open: R12b (the decision thread without `await`: `exe_identity::
     resolve` in every pump, the systemd state as a snapshot,
     `close_if_expired` on a tick, the canary append through the writer,

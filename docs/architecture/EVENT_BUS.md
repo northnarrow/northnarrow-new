@@ -30,9 +30,9 @@ placed). Each class has its queue (`Priority::of`):
 
 | Queue | Class | Events | Capacity | Full queue |
 |---|---|---|---|---|
-| P0 | tamper (and the sensors' health) | `FsProtectDenial`, `BpfSyscall`, `ModuleLoad`, `SensorFlood`, `DefenderSignal`, `ExploitPostcondition` | 1,024 | an `FsProtectDenial`'s sender waits for room 50 ms (the kernel ring absorbs), then the denial is dropped, counted, signed; every other tamper event waits for room |
+| P0 | tamper (and the sensors' health) | `FsProtectDenial`, `BpfSyscall`, `ModuleLoad`, `SensorFlood`, `DefenderSignal`, `ExploitPostcondition` | 1,024 | an `FsProtectDenial` repeated by its process on its inode within 1 s of the one queued is counted into it (signed `event_bus_coalesced`); a new one's sender waits for room 50 ms (the kernel ring absorbs), then the denial is dropped, counted, signed; every other tamper event waits for room; denials and `bpf()` calls take all but 64 slots, the rare tamper events' |
 | P1 | process | `ProcessSpawn`, `ExecCheck`, `IoUring` | 4,096 | waits 10 ms, then dropped and counted |
-| P2 | file | `Fim`, `MassWrite`, `FileOpen`, `FileBurst` | 8,192 | a new `FileOpen` is dropped and counted when the queue is full or holds 2,048 events; every other file event waits for room |
+| P2 | file | `Fim`, `MassWrite`, `FileOpen`, `FileBurst` | 8,192 | a new `FileOpen` is dropped and counted when the queue is full or holds 2,048 opens; a write-open of a CRITICAL or PERSIST file and every other file event wait for room |
 | P3 | network | `TcpConnect`, `DnsQuery`, `DnsFlood`, `NetFlow`, `NetListener` | 8,192 | the new event is dropped and counted |
 
 The plan's table placed fifteen variants. The others: `DefenderSignal`
@@ -52,10 +52,18 @@ persistence write. On P2 the flood is `FileOpen`; a drift, a credential
 read, a mass write or a rename burst waits for room, ahead of the opens
 that come after it (the wait is fair: a semaphore per queue serves the
 waiting sender first). The opens fill at most a quarter of P2
-(`FILE_OPEN_SHARE`, 2,048; review #471 B3): a file event other than an
-open finds room behind them at once, and waits behind at most 2,048 opens
-(≈ 0.6–1.2 s at the shares a flood leaves P2), where the whole queue held
-it four times longer. The DNS pump's outbox (lab PR 229), which held its
+(`FILE_OPEN_SHARE`, 2,048; review #471 B3; the opens counted, not the
+queue — second review, R-E: 2,048 mass writes queued made the cap drop a
+write-open of `/etc/cron.d/x`): a file event other than an open finds room
+behind them at once, and waits behind at most 2,048 opens (≈ 0.6–1.2 s at
+the shares a flood leaves P2), where the whole queue held it four times
+longer. A write-open (`O_WRONLY`, `O_RDWR`) of a file the kernel classes
+CRITICAL or PERSIST (`guarded_write_open`) is not one of those opens: only
+who may write the file opens it so, and a flood of reads must not hide it —
+it waits for room like the FIM records. The open-sensor pump checks the
+cap before it decodes, resolves and allocates an open (an atomic hint,
+`BusSender::open_room`; its drops are P2's), so a flood of opens the bus
+drops costs the pump next to nothing. The DNS pump's outbox (lab PR 229), which held its
 events while the one channel was full, is gone: a network event never
 waits.
 
@@ -68,6 +76,25 @@ security tool, a sensor flood) waits for room instead, as every source
 waited before R12a, its own ring absorbing; it is judged late, never
 dropped by the bus.
 
+The tamper events a process can repeat at will (second review of #471,
+R-A, R-D) — a refused operation (root; no kernel budget) and a `bpf()`
+call (any user: on 6.x the LSM hook runs before the permission checks, one
+record per new process and command a second) — are kept from filling P0
+and from starving the rest:
+- a denial repeated by its process on its inode within a second of the one
+  queued is counted into it, not queued (`COALESCE_WINDOW_NS`); every
+  repeat is in a signed `event_bus_coalesced` row (per key the repeats and
+  their first and last time, the most repeated first) and in the status
+  (`coalesced`). A loop of one `chmod` is one event a second; a loop of new
+  processes is not coalesced (each is its own offender) and is bounded by
+  the shares (§3);
+- denials and `bpf()` calls (`floods_p0`) take all of P0 but
+  `P0_RESERVE` (64) slots, the rare tamper events': a module load, an
+  exploit post-condition, a signal to a security tool, a sensor flood —
+  the last two carried by the open-sensor pump and by the network drain
+  and the io_uring pump between their own events — find room at once and
+  hold no pump back while a flood fills the rest.
+
 `DefenderSignal` shares the file-open sensor's ring and pump with the FIM
 credential reads, mass writes and bursts (review #471 M2): the pump sends
 a batch's signals first, so one read with a file event that waits for
@@ -78,17 +105,26 @@ is R12b's (§7).
 
 ## 3. The take order
 
-P0 first, while it holds an event. Then P1, P2 and P3 by weighted shares,
-2 : 1 : 1 (`SHARE_WEIGHTS`, a smooth weighted round robin:
-`ClassQueues::take`), FIFO inside a queue. Work-conserving: a queue with
-nothing in it gives its turns to the others and banks none for later.
-Under a flood of any one lower class the other two keep a quarter of the
-consumer each (P1 half): at EXP-13's ~7,000 decisions a second, at least
-1,750 network events a second against a file-open flood (3,500 with no
-exec load). The plan's aging — one take by age after 64 that passed over a
+By weighted shares, 8 : 2 : 1 : 1 (`SHARE_WEIGHTS`, a smooth weighted
+round robin over the queues that hold events: `ClassQueues::take`), FIFO
+inside a queue. Work-conserving: a queue with nothing in it gives its
+turns to the others and banks none for later. P0 is far ahead — a tamper
+burst's first event is taken within a take or two, and the burst drains at
+two thirds of the consumer or more — but never alone: the first version of
+the review's fix took P0 strictly, and a flood that kept P0 full (a root
+loop of new processes' refused `chmod`s, any user's `fork` + `bpf()` loop)
+left exec, file and network events no take at all (second review, R-A).
+With every queue flooded P1 keeps a sixth of the consumer and P2 and P3 a
+twelfth each (~1,170 execs and ~580 file and network events a second at
+EXP-13's ~7,000 decisions a second); against a tamper flood alone the
+network keeps a ninth. Among P1–P3 the shares are 2 : 1 : 1: under a
+flood of any one lower class the other two keep a quarter of the consumer
+each (P1 half): at least 1,750 network events a second against a
+file-open flood (3,500 with no exec load). The plan's aging — one take by age after 64 that passed over a
 waiting lower queue — gave a lower class one take in 65 (~110 network
 events a second), and P3 dropped past it (review #471 A2; the reviewer's
-simulation is the test `a_flood_of_a_higher_class_leaves_the_network_its_share`).
+simulation is the test `a_flood_of_a_higher_class_leaves_the_network_its_share`;
+the tamper flood's, `a_tamper_flood_leaves_the_other_classes_their_share`).
 P1 has the larger share: an exec is the lineage every later event of its
 process is judged on, and the exec quarantine holds a process until its
 exec is judged.
@@ -207,6 +243,11 @@ refused, and what the queues still hold is counted in a signed
 never silent — with every drop not yet in a row signed whatever its
 window.
 
+Coalesced denials (§2) are not lost: each sample signs the repeats counted
+since the last row (`event_bus_coalesced`: the key — pid, operation, inode
+— the repeats, their first and last time; at most 32 keys named, the rest
+and any evicted window's repeats summed), and so does the stop.
+
 `nn-admin status --key` shows the queues and the loss counters of every
 stage of an event's path (plan §3.4):
 
@@ -234,10 +275,11 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
 
 - **R12b** — the decision thread without `await`: `exe_identity::resolve`
   in the pumps (the bus's receiver does it for the execs it hands over),
-  the ring pumps on threads of their own (EXP-13c, review #471: on a guest
-  the flood saturates, the `fs_protect`, FIM and open-sensor rings fell
-  behind in two of four runs while P0's sends waited at most 3.4 ms — the
-  pumps short of CPU, not the bus),
+  the ring pumps on threads of their own (EXP-13c: on a guest the flood
+  saturates — CPU pressure on 75–80 % of the flood's time, the agent's CPU
+  the same on `main` and the tip — a ring fell behind in some runs while no
+  send of the bus had waited for room: the pumps short of CPU, plausible,
+  not proven to the thread),
   the systemd state as a snapshot, `close_if_expired` on a tick, the canary
   append through the writer's queue, a cache of `PackageOwnership` for
   module provenance; the decision delay per class (stage 5) against a
@@ -254,6 +296,22 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   on the tip, 16 on `main` in the first soak pair), measured again in the
   comparable pair (the lot's note); M2: the signals to a security tool on a ring of their
   own.
+- **Open after the second review of #471** — R-B: the history is three
+  execs deep — an event followed by four execs of its process before it is
+  judged reads "not known" (an exemption then does not apply; a rule that
+  wants a positive image, the transfer tools' staged ancestor or NET-008's
+  fallback, does not fire), and a walk stops at a "not known" hop although
+  its parent is known: a deeper history, the walk on from the parent,
+  facts of a process kept past the cache's eviction. R-C (eBPF, wire): a
+  FIM `Modified` carries its close's time, not its write's — a file kept
+  open across an `exec dpkg` falls in the package carve-out (on `main`
+  too). R-F: a pid the cache does not hold (`Absent`: an exec dropped by
+  P1, not yet read, evicted) is read from `/proc`, which shows its present
+  image — inside a judgement's scope it should be "not known"; and a
+  lineage lookup made in the event loop outside `judged_at` is caught only
+  by the pinned sources, not by an assertion (the time as an explicit
+  parameter instead of the thread-local). A kernel budget per uid for the
+  `bpf` hook's records (stage 2).
 - **R12c** — the response dispatcher by severity, its queue (stage 6);
   no action without a signed record (intent, then outcome); the budget
   never limits an action's record; the evidence writer's queue (stage 7);
