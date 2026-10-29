@@ -272,8 +272,9 @@ mod tests {
         let cli = cli(dir.path());
         let heads = dir.path().join("chain_heads.json");
         let key = northnarrow_agent::keys::BootKey::decided(
-            &cli.signing_key_file,
-            northnarrow_agent::boot::checks::KeyDecision::first_install_for_tests(),
+            northnarrow_agent::boot::checks::KeyDecision::first_install_for_tests(
+                &cli.signing_key_file,
+            ),
         );
         bootstrap(&cli, &heads, true, &key);
         let left: Vec<_> = std::fs::read_dir(dir.path())
@@ -309,7 +310,7 @@ mod tests {
         let mut boot = northnarrow_agent::boot::BootSequence::for_tests();
         let decision =
             northnarrow_agent::boot::checks::KeyDecision::present_for_tests(&cli.signing_key_file);
-        let key = northnarrow_agent::keys::BootKey::decided(&cli.signing_key_file, decision);
+        let key = northnarrow_agent::keys::BootKey::decided(decision);
         let public = northnarrow_agent::keys::verifying_key_path(&cli.signing_key_file);
         std::fs::remove_file(&cli.signing_key_file).unwrap();
         std::fs::remove_file(&public).unwrap();

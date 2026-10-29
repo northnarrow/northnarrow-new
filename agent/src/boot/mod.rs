@@ -831,9 +831,8 @@ mod tests {
             );
         }
         assert_eq!(sources.matches("BootKey::decided(").count(), 1);
-        assert!(function(PHASES[1].1, PHASES[1].2).contains(
-            "let signing_key = northnarrow_agent::keys::BootKey::decided(&cli.signing_key_file, decision);"
-        ));
+        assert!(function(PHASES[1].1, PHASES[1].2)
+            .contains("let signing_key = northnarrow_agent::keys::BootKey::decided(decision);"));
         assert_eq!(sources.matches("signing_key.load()").count(), 1);
         assert!(function(PHASES[2].1, PHASES[2].2).contains("signing_key.load()"));
         // the one decision is the check's

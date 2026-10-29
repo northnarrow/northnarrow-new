@@ -103,18 +103,30 @@ impl AgentSigningKey {
         }
     }
 
-    /// The review of #468, R4: the agent's signing key at `path`, which the
-    /// start's preflight found there (`present`, from
+    /// The review of #468, R4: the agent's signing key at the path the
+    /// start's preflight decided on and found it at (`present`, from
     /// [`crate::boot::checks::signing_identity`]) — loaded, never minted.
     /// An absent key is an error: it was there when the start decided, so it
     /// was removed or hidden since (a mount laid during the start), and a new
     /// key would restart every chain under another identity. A file other
     /// than the one the check saw at the name (another device or inode: a
-    /// key swapped, a mount over it) is an error too. Otherwise as the key
-    /// always loaded: a file that is not a regular one, or not a key, is an
-    /// error that quotes nothing of it (R11b, review #466 F4); the public
-    /// half is published beside it ([`Self::publish_verifying_key`]).
-    pub fn load_existing(path: &Path, present: &KeyPresent) -> Result<Self> {
+    /// key swapped, a mount over it) is an error too, and so is any file when
+    /// the check could not look at the name (the review of #473, B2: a
+    /// dangling link or a loop there; what appears at its end later is not
+    /// the file the start decided on). Otherwise as the key always loaded: a
+    /// file that is not a regular one, or not a key, is an error that quotes
+    /// nothing of it (R11b, review #466 F4); the public half is published
+    /// beside it ([`Self::publish_verifying_key`]).
+    pub fn load_existing(present: &KeyPresent) -> Result<Self> {
+        let path = present.path();
+        let Some(seen) = present.seen() else {
+            return Err(anyhow!(
+                "agent signing key {}: the start's check could not look at what its name holds \
+                 (a dangling link, a loop, a lookup refused), so no file can be shown to be the \
+                 one it decided on — not loaded, and nothing is minted",
+                path.display()
+            ));
+        };
         match read_key_file(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
                 "agent signing key {} is absent, but the start's check found it there: it was \
@@ -122,21 +134,22 @@ impl AgentSigningKey {
                  a new one, which would restart every chain under another identity",
                 path.display()
             )),
-            read => loaded(path, read, present.seen()),
+            read => loaded(path, read, Some(seen)),
         }
     }
 
-    /// The review of #468, R4: a first install's key, minted at `path` — the
-    /// one mint of the agent, which only the start's decision lets happen
-    /// (`_first`, from [`crate::boot::checks::signing_identity`]: no key and
-    /// nothing that says this install had one; taken by value). The name is
+    /// The review of #468, R4: a first install's key, minted at the path the
+    /// start's decision names — the one mint of the agent, which only that
+    /// decision lets happen (`first`, from
+    /// [`crate::boot::checks::signing_identity`]: no key and nothing that
+    /// says this install had one; taken by value). The name is
     /// taken exclusively: the key is written to a file of its own
     /// (`O_CREAT | O_EXCL`), synced, then linked at `path` with `link(2)`,
     /// which — like `O_EXCL`, and unlike the `rename(2)` used before — never
     /// replaces what is there: a key (or anything) at the name since the
     /// check is an error, and so is its public half beside it (lab PR 265).
-    pub fn mint_first(path: &Path, _first: crate::boot::checks::FirstInstall) -> Result<Self> {
-        mint_at(path)
+    pub fn mint_first(first: crate::boot::checks::FirstInstall) -> Result<Self> {
+        mint_at(first.path())
     }
 
     /// Public verifying key for off-host auditors. Embeds in the
@@ -391,6 +404,28 @@ fn persist_signing_key_exclusively(path: &Path, key: &SigningKey) -> Result<()> 
         }
     }
     let tmp_path = tmp_path_for(path);
+    // The review of #473, B3: a mint that died before its link left its
+    // temporary file, and `O_EXCL` would refuse every first install after
+    // it. A first install has no key and no previous agent's pins (nothing
+    // protects the name): the leftover is removed — it never signed
+    // anything, the key is signed with only once it is at its name. Anything
+    // there that cannot be removed (a directory) is an error, as before.
+    match fs::symlink_metadata(&tmp_path) {
+        Ok(m) if !m.is_dir() => {
+            fs::remove_file(&tmp_path).with_context(|| {
+                format!(
+                    "removing the leftover signing-key tmpfile {}",
+                    tmp_path.display()
+                )
+            })?;
+            warn!(
+                target: "audit.signing_key",
+                path = %tmp_path.display(),
+                "a leftover temporary key file of an earlier mint that did not finish was removed"
+            );
+        }
+        _ => {}
+    }
     {
         let mut f = OpenOptions::new()
             .write(true)
@@ -526,11 +561,12 @@ impl std::fmt::Display for NoKey {
 impl std::error::Error for NoKey {}
 
 impl BootKey {
-    /// The start's key at `path`, as the preflight decided it (nothing read
-    /// yet).
-    pub fn decided(path: &Path, decision: KeyDecision) -> Self {
+    /// The start's key, at the path the preflight decided on and as it
+    /// decided it (nothing read yet; the review of #473, B1: the path is the
+    /// decision's, not one the caller names).
+    pub fn decided(decision: KeyDecision) -> Self {
         BootKey {
-            path: path.to_path_buf(),
+            path: decision.path().to_path_buf(),
             slot: std::sync::Mutex::new(Slot::Decided(decision)),
         }
     }
@@ -582,7 +618,7 @@ impl BootKey {
         let pending = std::mem::replace(&mut *slot, Slot::Failed("being loaded".to_string()));
         *slot = match pending {
             Slot::Decided(KeyDecision::KeyPresent(present)) | Slot::Closed(present, _) => {
-                match AgentSigningKey::load_existing(&self.path, &present) {
+                match AgentSigningKey::load_existing(&present) {
                     Ok(key) => Slot::Loaded(key),
                     Err(e) => {
                         let why = format!("{e:#}");
@@ -599,7 +635,7 @@ impl BootKey {
                 }
             }
             Slot::Decided(KeyDecision::FirstInstall(first)) => {
-                match AgentSigningKey::mint_first(&self.path, first) {
+                match AgentSigningKey::mint_first(first) {
                     Ok(key) => Slot::Loaded(key),
                     Err(e) => Slot::Failed(format!("{e:#}")),
                 }
@@ -813,7 +849,7 @@ mod tests {
                 }
                 for needle in [
                     "mint_first(",
-                    "FirstInstall { _sealed",
+                    "FirstInstall(FirstInstall {",
                     "mint_signing_key(",
                     "persist_signing_key_exclusively(",
                     "AgentSigningKey::load_or_bootstrap(",
@@ -830,8 +866,8 @@ mod tests {
         assert_eq!(
             found,
             vec![
-                (checks.clone(), "FirstInstall { _sealed"),
-                (checks, "FirstInstall { _sealed"),
+                (checks.clone(), "FirstInstall(FirstInstall {"),
+                (checks, "FirstInstall(FirstInstall {"),
                 (keys.clone(), "AgentSigningKey::load_or_bootstrap("),
                 (keys.clone(), "mint_first("),
                 (keys.clone(), "mint_first("),
@@ -861,7 +897,7 @@ mod tests {
             .is_some_and(|at| !here[at..door].contains("\n    }\n")));
         // the one call of the mint is the start's key's
         let boot_key = &here[here.find("impl BootKey {").unwrap()..];
-        assert!(boot_key.contains("AgentSigningKey::mint_first(&self.path, first)"));
+        assert!(boot_key.contains("AgentSigningKey::mint_first(first)"));
     }
 
     /// R11b (lab PR 262, review #466 F4): what sits at the key's name and is

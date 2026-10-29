@@ -206,7 +206,15 @@ of the filesystem can change (the independent review of the PR, #468, R2).
     (`test-privileged`, `debug-trigger`: the privileged tests run copies
     of the binary with files of their own beside the installed agent) keep
     the copies' exemption, and a test holds that a build without those
-    features has none. In the documented flows the pins go before the
+    features has none. The directories the previous agent protects are
+    the installed layout's: `/etc/northnarrow`, `/var/lib/northnarrow` and
+    its subdirectories. A key, an id or an audit log that the command line
+    puts anywhere else (`--signing-key-file`, `--agent-id-file`,
+    `--audit-log-file`) is therefore refused at every restart while the
+    pins are there, in a release build, without an override: that layout
+    is not supported (the review of #473, B5; the first start after a
+    boot, with no pins, is not refused, which makes it fail only later).
+    In the documented flows the pins go before the
     identity: an upgrade, an uninstall and a re-key remove them first
     (`install.sh --upgrade`, `uninstall.sh`; a re-key after a refusal
     reboots first, section 3.10 of `INSTALL_UPGRADE_UNINSTALL.md`), and
@@ -239,12 +247,17 @@ of the filesystem can change (the independent review of the PR, #468, R2).
     by exactly one key. The load of a key decided present never mints:
     a key gone between the check and the load (a mount laid during the
     start) is an error, and so is a file other than the one the check saw
-    there (another device or inode: a key swapped in); the audit check
-    then refuses the start (review #466 F4). The mint of a first install
-    writes the key to a file of its own (`O_CREAT|O_EXCL`) and links it at
-    the key's name with `link(2)`, which never replaces what is there (the
-    `rename(2)` used before did): a key that appeared since the check is
-    kept and the mint refused. A load the previous agent's hooks close to
+    there (another device or inode: a key swapped in), or any file when
+    the check could not look at the name (a dangling link: what appears at
+    its end later is not what the start decided on); the audit check then
+    refuses the start (review #466 F4). The tokens carry the key's path
+    they were decided for: the load and the mint take it from them. The
+    mint of a first install writes the key to a file of its own
+    (`O_CREAT|O_EXCL`; a leftover of a mint that died before its link is
+    removed first, so it cannot block every later first install) and
+    links it at the key's name with `link(2)`, which never replaces what
+    is there (the `rename(2)` used before did): a key that appeared since
+    the check is kept and the mint refused. A load the previous agent's hooks close to
     this process before it is registered keeps the decision and is read
     after the attach. Tests hold both rules: nothing in the workspace
     mints the key but that one load (the tests' door that mints without a

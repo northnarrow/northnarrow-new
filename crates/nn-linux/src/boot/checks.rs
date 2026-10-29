@@ -168,24 +168,38 @@ pub enum KeyDecision {
 }
 
 /// The review of #468, R4: [`signing_identity`] found the agent's signing key
-/// at its name. The load that takes it never mints, and refuses a file other
-/// than the one the check saw there (`seen`): a key hidden, removed or
-/// swapped between the check and the load is an error, never a new key.
+/// at its name (`path`, the one it decided on: the review of #473, B1). The
+/// load that takes it never mints, and refuses a file other than the one the
+/// check saw there (`seen`) — and, when the check could not look at the
+/// name (`seen` `None`: a dangling link, a loop; the review of #473, B2),
+/// any file: a key hidden, removed or swapped between the check and the load
+/// is an error, never a new key.
 ///
 /// ```compile_fail,E0451
 /// // Not built outside the check: its fields are private.
-/// let forged = nn_linux::boot::checks::KeyPresent { seen: None, _sealed: () };
+/// let forged = nn_linux::boot::checks::KeyPresent {
+///     path: std::path::PathBuf::new(),
+///     seen: None,
+///     _sealed: (),
+/// };
 /// ```
 #[derive(Debug)]
 pub struct KeyPresent {
+    /// The key's path the check decided on.
+    path: PathBuf,
     /// The file at the key's name when the check ran (`stat`, its links
     /// followed: what the load opens), as (device, inode); `None` when it
-    /// could not be looked at (the load decides on what it opens).
+    /// could not be looked at (the load then refuses).
     seen: Option<(u64, u64)>,
     _sealed: (),
 }
 
 impl KeyPresent {
+    /// The key's path the check decided on.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The file the check saw at the key's name: (device, inode).
     pub fn seen(&self) -> Option<(u64, u64)> {
         self.seen
@@ -194,12 +208,15 @@ impl KeyPresent {
 
 /// The review of #468, R4: [`signing_identity`] found no key and nothing that
 /// says this install had one — a first install. The one value that lets
-/// [`crate::keys::AgentSigningKey::mint_first`] mint a key; it takes it by
-/// value.
+/// [`crate::keys::AgentSigningKey::mint_first`] mint a key, at the path the
+/// check decided on (the review of #473, B1); it takes it by value.
 ///
 /// ```compile_fail,E0451
-/// // Not built outside the check: its field is private.
-/// let forged = nn_linux::boot::checks::FirstInstall { _sealed: () };
+/// // Not built outside the check: its fields are private.
+/// let forged = nn_linux::boot::checks::FirstInstall {
+///     path: std::path::PathBuf::new(),
+///     _sealed: (),
+/// };
 /// ```
 ///
 /// ```compile_fail,E0308
@@ -211,26 +228,47 @@ impl KeyPresent {
 /// ```
 #[derive(Debug)]
 pub struct FirstInstall {
+    /// The key's path the check decided on.
+    path: PathBuf,
     _sealed: (),
 }
 
+impl FirstInstall {
+    /// The key's path the check decided on.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 impl KeyDecision {
+    /// The key's path the decision is about.
+    pub fn path(&self) -> &Path {
+        match self {
+            KeyDecision::KeyPresent(p) => p.path(),
+            KeyDecision::FirstInstall(f) => f.path(),
+        }
+    }
+
     /// A decision without a boot sequence, for the agent's tests (`test-util`,
     /// a dev-dependency feature: no build of the binaries has it): the key at
     /// `path` decided present.
     #[cfg(any(test, feature = "test-util"))]
     pub fn present_for_tests(path: &Path) -> Self {
         KeyDecision::KeyPresent(KeyPresent {
+            path: path.to_path_buf(),
             seen: seen_at(path),
             _sealed: (),
         })
     }
 
-    /// A first install without a boot sequence, for the agent's tests
-    /// (`test-util`).
+    /// A first install at `path` without a boot sequence, for the agent's
+    /// tests (`test-util`).
     #[cfg(any(test, feature = "test-util"))]
-    pub fn first_install_for_tests() -> Self {
-        KeyDecision::FirstInstall(FirstInstall { _sealed: () })
+    pub fn first_install_for_tests(path: &Path) -> Self {
+        KeyDecision::FirstInstall(FirstInstall {
+            path: path.to_path_buf(),
+            _sealed: (),
+        })
     }
 }
 
@@ -308,9 +346,13 @@ fn signing_identity_decided(
                 &evidence,
             )));
         }
-        KeyDecision::FirstInstall(FirstInstall { _sealed: () })
+        KeyDecision::FirstInstall(FirstInstall {
+            path: paths.signing_key.clone(),
+            _sealed: (),
+        })
     } else {
         KeyDecision::KeyPresent(KeyPresent {
+            path: paths.signing_key.clone(),
             seen: seen_at(&paths.signing_key),
             _sealed: (),
         })
@@ -1206,18 +1248,19 @@ mod tests {
 
     /// The start's key at `path`, decided a first install.
     fn first_install(path: &Path) -> crate::keys::BootKey {
-        crate::keys::BootKey::decided(path, KeyDecision::first_install_for_tests())
+        crate::keys::BootKey::decided(KeyDecision::first_install_for_tests(path))
     }
 
     /// The start's key at `path`, decided there.
     fn present(path: &Path) -> crate::keys::BootKey {
-        crate::keys::BootKey::decided(path, KeyDecision::present_for_tests(path))
+        crate::keys::BootKey::decided(KeyDecision::present_for_tests(path))
     }
 
     fn identity_paths(dir: &Path) -> continuity::IdentityPaths {
         continuity::IdentityPaths {
             signing_key: dir.join("agent.sig.key"),
             agent_id: dir.join("agent_id"),
+            audit_log: dir.join("audit.log"),
             heads: dir.join("chain_heads.json"),
             chains: vec![dir.join("audit.log")],
         }
@@ -1496,6 +1539,7 @@ mod tests {
             ),
             (
                 continuity::IdentityPaths {
+                    audit_log: empty.join("audit.log"),
                     chains: vec![empty.join("audit.log")],
                     ..identity_paths(&etc)
                 },
@@ -1683,9 +1727,7 @@ mod tests {
         let first = crate::keys::AgentSigningKey::load_or_bootstrap(&paths.signing_key).unwrap();
         let public = crate::keys::verifying_key_path(&paths.signing_key);
         let decided = |boot: &mut BootSequence| match decide(boot, &paths) {
-            KeyVerdict::Decided(d @ KeyDecision::KeyPresent(_)) => {
-                crate::keys::BootKey::decided(&paths.signing_key, d)
-            }
+            KeyVerdict::Decided(d @ KeyDecision::KeyPresent(_)) => crate::keys::BootKey::decided(d),
             other => panic!("{other:?}"),
         };
         // gone, with all the evidence, between the check and the load
@@ -1726,6 +1768,90 @@ mod tests {
         assert_eq!(key.verifying_key(), Some(first.verifying_key()));
     }
 
+    /// The review of #473, B2: a key's name the check could not look at — a
+    /// dangling link there, so `stat` fails and nothing is recorded — is
+    /// decided present (something is at the name) and then never loaded: a
+    /// key that appears at the link's end after the check is not the file
+    /// the start decided on. Nothing is minted.
+    #[test]
+    fn a_key_name_the_check_could_not_look_at_is_never_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = identity_paths(dir.path());
+        let target = dir.path().join("elsewhere.key");
+        std::os::unix::fs::symlink(&target, &paths.signing_key).unwrap();
+        let mut boot = BootSequence::new();
+        let KeyVerdict::Decided(KeyDecision::KeyPresent(present)) = decide(&mut boot, &paths)
+        else {
+            panic!("a link at the name is something there")
+        };
+        assert_eq!(present.seen(), None, "a dangling link: nothing to record");
+        assert_eq!(present.path(), paths.signing_key);
+        // the link's end appears, a valid key, after the check
+        let planted = crate::keys::AgentSigningKey::load_or_bootstrap(&target).unwrap();
+        let key = crate::keys::BootKey::decided(KeyDecision::KeyPresent(present));
+        let err = key.load().unwrap_err();
+        assert!(
+            matches!(&err, crate::keys::NoKey::Failed(w) if w.contains("could not look at what its name holds")),
+            "{err:?}"
+        );
+        assert!(key.signer().is_err(), "the planted key was loaded");
+        assert!(key.verifying_key().is_none());
+        assert_eq!(
+            crate::keys::read_signing_key(&target)
+                .unwrap()
+                .verifying_key(),
+            planted.verifying_key(),
+            "the file at the link's end changed"
+        );
+        assert!(std::fs::symlink_metadata(&paths.signing_key)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// The review of #473, B3: a first install whose earlier mint died before
+    /// its link left `agent.sig.key.tmp` mints all the same (the leftover is
+    /// removed: it never signed anything); a directory at that name, which
+    /// cannot be removed as a file, is an error, and nothing is minted.
+    #[test]
+    fn a_leftover_temporary_key_does_not_block_a_first_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = identity_paths(dir.path());
+        let tmp = dir.path().join("agent.sig.key.tmp");
+        std::fs::write(&tmp, "half a key").unwrap();
+        let mut boot = BootSequence::new();
+        let KeyVerdict::Decided(d @ KeyDecision::FirstInstall(_)) = decide(&mut boot, &paths)
+        else {
+            panic!("a first install: a leftover temporary file is no identity")
+        };
+        let key = crate::keys::BootKey::decided(d);
+        let minted = key.signer().expect("minted despite the leftover");
+        assert!(!tmp.exists(), "the leftover is gone");
+        assert_eq!(
+            crate::keys::read_signing_key(&paths.signing_key)
+                .unwrap()
+                .verifying_key(),
+            minted.verifying_key()
+        );
+        assert_eq!(
+            crate::keys::read_verifying_key(&crate::keys::verifying_key_path(&paths.signing_key))
+                .unwrap(),
+            minted.verifying_key()
+        );
+        // a directory at the temporary name: an error, nothing minted
+        let dir = tempfile::tempdir().unwrap();
+        let paths = identity_paths(dir.path());
+        std::fs::create_dir(dir.path().join("agent.sig.key.tmp")).unwrap();
+        let mut boot = BootSequence::new();
+        let KeyVerdict::Decided(d @ KeyDecision::FirstInstall(_)) = decide(&mut boot, &paths)
+        else {
+            panic!("a first install")
+        };
+        let key = crate::keys::BootKey::decided(d);
+        assert!(key.load().is_err());
+        assert!(!paths.signing_key.exists(), "a key minted");
+    }
+
     /// The review of #468, R4: a first install mints once, and never over
     /// what is at the name since the check (`link(2)`, which does not
     /// replace): a key that appeared there is kept and the mint refused.
@@ -1738,7 +1864,7 @@ mod tests {
         else {
             panic!("a first install")
         };
-        let key = crate::keys::BootKey::decided(&paths.signing_key, d);
+        let key = crate::keys::BootKey::decided(d);
         let minted = key.signer().unwrap();
         assert_eq!(
             crate::keys::read_verifying_key(&crate::keys::verifying_key_path(&paths.signing_key))
@@ -1760,7 +1886,7 @@ mod tests {
             panic!("a first install")
         };
         std::fs::write(&paths.signing_key, "planted\n").unwrap();
-        let key = crate::keys::BootKey::decided(&paths.signing_key, d);
+        let key = crate::keys::BootKey::decided(d);
         let err = key.load().unwrap_err();
         assert!(
             matches!(&err, crate::keys::NoKey::Failed(w) if w.contains("not replaced, nothing minted")),

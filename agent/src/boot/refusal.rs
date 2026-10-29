@@ -998,9 +998,9 @@ mod tests {
         let decision = if std::fs::symlink_metadata(&path).is_ok() {
             northnarrow_agent::boot::checks::KeyDecision::present_for_tests(&path)
         } else {
-            northnarrow_agent::boot::checks::KeyDecision::first_install_for_tests()
+            northnarrow_agent::boot::checks::KeyDecision::first_install_for_tests(&path)
         };
-        BootKey::decided(&path, decision)
+        BootKey::decided(decision)
     }
 
     fn pk(dir: &Path) -> ed25519_dalek::VerifyingKey {

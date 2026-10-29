@@ -929,7 +929,14 @@ northnarrow-agent`. Layouts: a separate `/var` or `/var/lib` filesystem is
 fine; `/etc/northnarrow` and `/var/lib/northnarrow` (and any directory a
 `--…-file` flag points the agent's state to) must not be mount points of
 their own — a bind of the directory onto itself, as the unit's
-`ReadWritePaths=` makes, is the one mount there the start accepts.
+`ReadWritePaths=` makes, is the one mount there the start accepts. The key,
+`agent_id` and the audit log must stay in `/etc/northnarrow` (the
+installed layout): with the previous agent's pins there, a release build
+refuses every restart whose key, id or audit log the command line puts in
+another directory (`--signing-key-file`, `--agent-id-file`,
+`--audit-log-file`), since a restart keeps its identity where the previous
+agent protected it (`BOOT_INTEGRITY.md` §1.1). Such a layout is not
+supported.
 
 ## 4. What still needs a reboot
 

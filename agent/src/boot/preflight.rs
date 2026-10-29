@@ -96,7 +96,7 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
             );
         }
     };
-    let signing_key = northnarrow_agent::keys::BootKey::decided(&cli.signing_key_file, decision);
+    let signing_key = northnarrow_agent::keys::BootKey::decided(decision);
 
     // Boot preflight: prove the embedded eBPF half is real and intact
     // BEFORE doing any work. The build-time staleness guard

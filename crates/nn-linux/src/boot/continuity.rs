@@ -370,7 +370,7 @@ pub const COPIES_EXEMPT: bool = cfg!(any(feature = "test-privileged", feature = 
 /// agent's restart — whatever binary it runs (`exe`, followed), unless
 /// `copies_exempt` ([`COPIES_EXEMPT`], the lab builds) and it is not the one
 /// that agent protected — and a restart keeps its identity. Its signing key,
-/// its id and its audit log (the first of `paths.chains`) must each be in a
+/// its id and its audit log (`paths.audit_log`) must each be in a
 /// directory that agent protected (a drop-in redefining `ExecStart=` with
 /// them in an empty directory is refused) and be there: a restart never
 /// mints a key or an id, nor starts a new audit chain (an upgrade, an
@@ -410,21 +410,19 @@ pub fn restart_findings(
             shown.display()
         )
     };
-    let mut files = vec![
+    let files = [
         (
             "signing key",
             &paths.signing_key,
             "a restart never mints a key",
         ),
         ("id", &paths.agent_id, "a restart never mints an id"),
-    ];
-    if let Some(audit) = paths.chains.first() {
-        files.push((
+        (
             "audit log",
-            audit,
+            &paths.audit_log,
             "a restart never starts a new audit chain",
-        ));
-    }
+        ),
+    ];
     let mut out = Vec::new();
     for (what, path, never) in files {
         let dir = path
@@ -456,6 +454,10 @@ pub fn restart_findings(
 pub struct IdentityPaths {
     pub signing_key: PathBuf,
     pub agent_id: PathBuf,
+    /// The audit log (the review of #473: named, not the first of `chains`
+    /// by convention): what a restart must find where the previous agent
+    /// protected it ([`restart_findings`]). `chains` holds it too.
+    pub audit_log: PathBuf,
     /// The head anchor (`chain_heads.json`): install.sh creates it empty,
     /// the agent writes it.
     pub heads: PathBuf,
@@ -825,6 +827,7 @@ mod tests {
         let paths = IdentityPaths {
             signing_key: d.path().join("agent.sig.key"),
             agent_id: d.path().join("agent_id"),
+            audit_log: d.path().join("audit.log"),
             heads: d.path().join("chain_heads.json"),
             chains: vec![
                 d.path().join("audit.log"),
