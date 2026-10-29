@@ -63,6 +63,7 @@ pub(crate) fn attest(
     dns_mode: northnarrow_agent::sensors::dns_sensor::DnsMode,
     caps_degraded: Vec<String>,
     audit: checks::AuditOpen,
+    signing_key: &northnarrow_agent::keys::BootKey,
 ) -> Result<Attested> {
     // Lab PR 218: the signed audit log right after the self-test, before
     // the subsystems below load (the blocklists, the rules, the response
@@ -76,6 +77,7 @@ pub(crate) fn attest(
         identity: &identity,
         overlay_gate,
         integrity: (integrity.label(), integrity.provenance()),
+        key: signing_key,
     };
     // ── Shared audit log + COMBAT graduated-response ladder ─────────
     //
@@ -116,7 +118,7 @@ pub(crate) fn attest(
                     boot_chains.findings.push(f);
                 }
                 chain_anchor = start_chain_anchor(
-                    cli,
+                    signing_key,
                     &heads_file,
                     chain_targets,
                     &mut boot_chains,
@@ -149,7 +151,9 @@ pub(crate) fn attest(
                 // (review #466 F2: each read once, verified, bound to this
                 // log).
                 if let Some(dir) = refusal::fallback_dir(cli) {
-                    let pk = northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file);
+                    // the review of #468, R4: the start's one key (the log
+                    // is open: it is loaded)
+                    let pk = signing_key.verifying_key();
                     for e in refusal::record_fallback(&mut log, &dir, pk.as_ref(), agent_id)
                         .into_iter()
                         .filter_map(Result::err)
@@ -305,26 +309,28 @@ fn open_after_attach(
             ),
         )
     };
-    let key =
-        match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
-            Ok(key) => key,
-            Err(e) => {
-                error!(
-                    error = format!("{e:#}"),
-                    fatal,
-                    path = %cli.signing_key_file.display(),
-                    "agent signing key cannot be loaded — no row of the audit chain could be signed"
-                );
-                if fatal {
-                    refuse(format!(
-                        "the agent's signing key {} cannot be loaded: {e:#}",
-                        cli.signing_key_file.display()
-                    ));
-                }
-                warn!("COMBAT stage transitions + admin ops UNAUDITED this boot");
-                return None;
+    // the review of #468, R4: the start's one key — the load the previous
+    // agent's hooks closed before the attach, tried again now that it
+    // registered this process; never another file, never a mint
+    let key = match refusals.key.signer() {
+        Ok(key) => key,
+        Err(e) => {
+            error!(
+                error = %e,
+                fatal,
+                path = %cli.signing_key_file.display(),
+                "agent signing key cannot be loaded — no row of the audit chain could be signed"
+            );
+            if fatal {
+                refuse(format!(
+                    "the agent's signing key {} cannot be loaded: {e}",
+                    cli.signing_key_file.display()
+                ));
             }
-        };
+            warn!("COMBAT stage transitions + admin ops UNAUDITED this boot");
+            return None;
+        }
+    };
     match northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id) {
         Ok(log) => Some(log),
         Err(e) => {
@@ -372,6 +378,7 @@ pub(crate) fn wire(
     installer_override: &Arc<
         northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
     >,
+    signing_key: &northnarrow_agent::keys::BootKey,
 ) -> Wired {
     // Tappa 10.8 BPF self-defence: the link self-check needs the audit log,
     // which did not exist when the hooks attached.
@@ -407,7 +414,12 @@ pub(crate) fn wire(
     if let Some(a) = &chain_anchor {
         northnarrow_agent::chains::spawn(Arc::clone(a), audit_log.clone());
     }
-    if let Some(pk) = northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file) {
+    // the review of #468, R4: against the start's one key (its public half
+    // when it could not be loaded: the chains are still verified)
+    if let Some(pk) = signing_key
+        .verifying_key()
+        .or_else(|| northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file))
+    {
         northnarrow_agent::chains::spawn_boot_verify(chain_targets.clone(), pk, audit_log.clone());
     }
     sensor.ring_drops().bind_audit_log(audit_log.clone());
@@ -456,6 +468,7 @@ pub(crate) fn stores(
     chain_anchor: &AnchorHandle,
     audit_log: &AuditHandle,
     defense_detector: &Arc<northnarrow_agent::impair::DefenseDetector>,
+    signing_key: &northnarrow_agent::keys::BootKey,
 ) -> Stores {
     // BUG-026: ONE shared StateDirProtection for the rotating on-disk logs
     // under /var/lib/northnarrow (netflow + fim_drift share its dance
@@ -546,8 +559,9 @@ pub(crate) fn stores(
     // Tappa 9.0.a: open the detection store + spawn its dedicated writer
     // task. Detections are lower-volume than netflow → default 16 MiB ×
     // 8 archives (≈144 MiB budget), overridable via NN_DETECTIONS_CAP_BYTES
-    // for rotation validation. Re-load the signing key (separate domain
-    // handle, like the FIM block below). Degrade-not-fail: any error here
+    // for rotation validation. A copy of the start's one signing key (its
+    // own handle, like the FIM block below; the review of #468, R4: no load
+    // of its own). Degrade-not-fail: any error here
     // means "no detection persistence this boot", never an agent abort.
     // The writer JoinHandle is detached on drop (tokio keeps the task
     // running); the sink is threaded into the event loop.
@@ -561,7 +575,7 @@ pub(crate) fn stores(
             max_archives: northnarrow_agent::detection_store::DEFAULT_MAX_ARCHIVES,
             file_mode: northnarrow_agent::chainlog::STATE_LOG_FILE_MODE,
         };
-        match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
+        match signing_key.signer() {
             Ok(key) => match northnarrow_agent::detection_store::open(
                 &cli.detections_file,
                 key,
@@ -619,7 +633,7 @@ pub(crate) fn stores(
             max_archives: northnarrow_agent::detection_store::DEFAULT_MAX_ARCHIVES,
             file_mode: northnarrow_agent::chainlog::STATE_LOG_FILE_MODE,
         };
-        match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
+        match signing_key.signer() {
             Ok(key) => {
                 let agent_key = key.verifying_key();
                 let status_log = match northnarrow_agent::detection_store::open_status_log(
@@ -724,7 +738,7 @@ pub(crate) fn drain_ended(
 /// this boot found (before this boot appends anything). Reports a removed
 /// anchor first ([`northnarrow_agent::chain_anchor::BootCheck::heads_missing`]).
 fn start_chain_anchor(
-    cli: &Cli,
+    signing_key: &northnarrow_agent::keys::BootKey,
     heads_file: &std::path::Path,
     targets: &[northnarrow_agent::chain_anchor::ChainTarget],
     boot: &mut northnarrow_agent::chain_anchor::BootCheck,
@@ -732,17 +746,13 @@ fn start_chain_anchor(
     log: &northnarrow_agent::audit::AuditLog,
 ) -> Option<Arc<parking_lot::Mutex<northnarrow_agent::chain_anchor::Anchor>>> {
     boot.heads_missing(heads_file, log.anchoring_started());
-    let key =
-        match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
-            Ok(k) => k,
-            Err(e) => {
-                warn!(
-                    error = format!("{e:#}"),
-                    "chain heads: no signing key — heads not anchored"
-                );
-                return None;
-            }
-        };
+    let key = match signing_key.signer() {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(error = %e, "chain heads: no signing key — heads not anchored");
+            return None;
+        }
+    };
     let mut anchor = northnarrow_agent::chain_anchor::Anchor::new(
         heads_file.to_path_buf(),
         key,

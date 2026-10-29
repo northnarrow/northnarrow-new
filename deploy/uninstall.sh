@@ -270,7 +270,10 @@ if [[ -d "$BPFFS_ROOT" ]]; then
     if [[ -d "$BPFFS_ROOT" ]]; then
         echo "uninstall.sh: $BPFFS_ROOT is PROTECTED by the anti-tamper and no trusted-installer window is open" >&2
         echo "uninstall.sh: (review entry 39). Start the agent again (systemctl start northnarrow-agent) and re-run" >&2
-        echo "uninstall.sh: with --grant-key <admin.key carrying the trusted-installer role>." >&2
+        echo "uninstall.sh: with --grant-key <admin.key carrying the trusted-installer role>; or, if the agent" >&2
+        echo "uninstall.sh: refuses to start (exit 78: its key lost or hidden), follow INSTALL_UPGRADE_UNINSTALL.md" >&2
+        echo "uninstall.sh: section 3.10, branch B: systemctl disable northnarrow-agent northnarrow-watchdog, archive," >&2
+        echo "uninstall.sh: reboot (bpffs does not survive one), then re-run without --grant-key." >&2
         (( PACKAGE )) || exit 1
         echo "uninstall.sh: package removal continues; the pins detach at the next reboot" >&2
     fi

@@ -50,8 +50,10 @@ fi
 # have created first to swap a package before the install.
 PKGDIR=$(mktemp -d) || { bad "mktemp"; exit 1; }
 trap 'rm -rf "$PKGDIR"' EXIT
+# Lab PR 268: the lab build (test-privileged,debug-trigger) packed on purpose;
+# mk-packages.sh refuses it otherwise.
 for r in 1 2 3; do
-    NN_PKG_FORMATS=$fmt NN_PKG_RELEASE=$r deploy/release/mk-packages.sh "$PKGDIR" >/dev/null || { bad "build release $r"; exit 1; }
+    NN_PKG_LAB_FEATURES=1 NN_PKG_FORMATS=$fmt NN_PKG_RELEASE=$r deploy/release/mk-packages.sh "$PKGDIR" >/dev/null || { bad "build release $r"; exit 1; }
 done
 pkg() { ls "$PKGDIR"/* | grep -E "[-_]0?[0-9.]+-$1[._]" | head -1; }
 # Lab follow-up (lab PR 165): the per-process outbound block needs nft. The

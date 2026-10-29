@@ -842,6 +842,7 @@ impl Cli {
         northnarrow_agent::boot::continuity::IdentityPaths {
             signing_key: self.signing_key_file.clone(),
             agent_id: self.agent_id_file.clone(),
+            audit_log: self.audit_log_file.clone(),
             heads: self.resolved_chain_heads_file(),
             chains: vec![
                 p.audit,
@@ -1035,6 +1036,9 @@ mod tests {
         assert_eq!(ids.signing_key, Path::new("/etc/northnarrow/agent.sig.key"));
         assert_eq!(ids.agent_id, Path::new("/etc/northnarrow/agent_id"));
         assert_eq!(ids.heads, Path::new("/etc/northnarrow/chain_heads.json"));
+        // the review of #473: the audit log named, and among the chains
+        assert_eq!(ids.audit_log, Path::new("/etc/northnarrow/audit.log"));
+        assert!(ids.chains.contains(&ids.audit_log));
         let mut chains: Vec<String> = ids.chains.iter().map(|p| p.display().to_string()).collect();
         chains.sort();
         assert_eq!(

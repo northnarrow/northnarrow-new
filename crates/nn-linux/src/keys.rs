@@ -20,6 +20,7 @@ use rand::TryRng;
 use tracing::{info, warn};
 
 use crate::audit::PARENT_DIR_MODE;
+use crate::boot::checks::{KeyDecision, KeyPresent};
 use crate::chain_host::ChainSigner;
 
 /// Default location of the agent's audit-log signing key. Stored
@@ -70,6 +71,12 @@ impl AgentSigningKey {
     /// `OsRng` and persist it atomically. Returns the loaded /
     /// minted key.
     ///
+    /// The review of #468, R4: the tests' door — test builds only (`test`,
+    /// and `test-util`, a dev-dependency feature: no build of the binaries
+    /// has it). The start decides its key once, in its preflight, and loads
+    /// it once ([`BootKey`]: [`Self::load_existing`], or [`Self::mint_first`]
+    /// on a first install); nothing else mints one.
+    ///
     /// Errors are the same shape as
     /// [`crate::agent_id::load_or_bootstrap`]:
     /// - corrupted file (wrong length, non-hex) → hard error,
@@ -87,56 +94,62 @@ impl AgentSigningKey {
     /// Lab PR 265 (review #466 F4-bis): an absent key whose public half is
     /// beside its name (`agent.sig.pub`) is not minted either: it was
     /// removed or is hidden, and a new key would publish its own half over
-    /// the old one and restart every chain under another identity. The
-    /// start's `boot::checks::signing_identity` refuses it before any load
-    /// (on the rest of the evidence too: the install's id, signed rows);
-    /// this keeps every other caller from minting one.
+    /// the old one and restart every chain under another identity.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn load_or_bootstrap(path: &Path) -> Result<Self> {
         match read_key_file(path) {
-            Ok(content) => {
-                let key = parse_signing_key(&content).with_context(|| {
-                    format!(
-                        "agent signing key {} present but corrupted — refuse to \
-                         silently regenerate; to re-key on purpose, retire the \
-                         install's identity (docs/operator/INSTALL_UPGRADE_UNINSTALL.md, \
-                         \"Re-keying the agent\"): removing the file alone refuses \
-                         the start",
-                        path.display()
-                    )
-                })?;
-                info!(
-                    target: "audit.signing_key",
-                    path = %path.display(),
-                    "reusing existing agent signing key"
-                );
-                let key = Self { inner: key };
-                key.publish_verifying_key(path);
-                Ok(key)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let public = verifying_key_path(path);
-                if fs::symlink_metadata(&public).is_ok() {
-                    return Err(anyhow!(
-                        "agent signing key {} is absent but its public half {} is there: the key \
-                         was removed or is hidden (a mount over its directory?) — refusing to mint \
-                         a new one, which would restart every chain under another identity",
-                        path.display(),
-                        public.display()
-                    ));
-                }
-                let key = mint_signing_key()?;
-                persist_signing_key_atomically(path, &key)?;
-                info!(
-                    target: "audit.signing_key",
-                    path = %path.display(),
-                    "bootstrapped fresh agent signing key"
-                );
-                let key = Self { inner: key };
-                key.publish_verifying_key(path);
-                Ok(key)
-            }
-            Err(e) => Err(anyhow!(e).context(format!("reading {}", path.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => mint_at(path),
+            read => loaded(path, read, None),
         }
+    }
+
+    /// The review of #468, R4: the agent's signing key at the path the
+    /// start's preflight decided on and found it at (`present`, from
+    /// [`crate::boot::checks::signing_identity`]) — loaded, never minted.
+    /// An absent key is an error: it was there when the start decided, so it
+    /// was removed or hidden since (a mount laid during the start), and a new
+    /// key would restart every chain under another identity. A file other
+    /// than the one the check saw at the name (another device or inode: a
+    /// key swapped, a mount over it) is an error too, and so is any file when
+    /// the check could not look at the name (the review of #473, B2: a
+    /// dangling link or a loop there; what appears at its end later is not
+    /// the file the start decided on). Otherwise as the key always loaded: a
+    /// file that is not a regular one, or not a key, is an error that quotes
+    /// nothing of it (R11b, review #466 F4); the public half is published
+    /// beside it ([`Self::publish_verifying_key`]).
+    pub fn load_existing(present: &KeyPresent) -> Result<Self> {
+        let path = present.path();
+        let Some(seen) = present.seen() else {
+            return Err(anyhow!(
+                "agent signing key {}: the start's check could not look at what its name holds \
+                 (a dangling link, a loop, a lookup refused), so no file can be shown to be the \
+                 one it decided on — not loaded, and nothing is minted",
+                path.display()
+            ));
+        };
+        match read_key_file(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
+                "agent signing key {} is absent, but the start's check found it there: it was \
+                 removed or is hidden since (a mount laid during the start?) — refusing to mint \
+                 a new one, which would restart every chain under another identity",
+                path.display()
+            )),
+            read => loaded(path, read, Some(seen)),
+        }
+    }
+
+    /// The review of #468, R4: a first install's key, minted at the path the
+    /// start's decision names — the one mint of the agent, which only that
+    /// decision lets happen (`first`, from
+    /// [`crate::boot::checks::signing_identity`]: no key and nothing that
+    /// says this install had one; taken by value). The name is
+    /// taken exclusively: the key is written to a file of its own
+    /// (`O_CREAT | O_EXCL`), synced, then linked at `path` with `link(2)`,
+    /// which — like `O_EXCL`, and unlike the `rename(2)` used before — never
+    /// replaces what is there: a key (or anything) at the name since the
+    /// check is an error, and so is its public half beside it (lab PR 265).
+    pub fn mint_first(first: crate::boot::checks::FirstInstall) -> Result<Self> {
+        mint_at(first.path())
     }
 
     /// Public verifying key for off-host auditors. Embeds in the
@@ -225,7 +238,7 @@ pub fn read_verifying_key(path: &Path) -> Result<VerifyingKey> {
 /// The private key at `path`, read and parsed — never minted (legacy
 /// verification on a host without `agent.sig.pub`).
 pub fn read_signing_key(path: &Path) -> Result<AgentSigningKey> {
-    let raw = read_key_file(path).with_context(|| format!("reading {}", path.display()))?;
+    let (raw, _) = read_key_file(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(AgentSigningKey {
         inner: parse_signing_key(&raw)?,
     })
@@ -236,17 +249,20 @@ const MAX_KEY_FILE_BYTES: u64 = 4096;
 
 /// R11b (lab PR 262, review #466 F4): the text of the key file at `path`,
 /// without waiting on a FIFO: a regular file, at most
-/// [`MAX_KEY_FILE_BYTES`], UTF-8. Anything else at the name — a character
+/// [`MAX_KEY_FILE_BYTES`], UTF-8 — and the device and inode of the file
+/// opened. Anything else at the name — a character
 /// device (a bind mount of `/dev/null`), a FIFO, a socket, a directory — is
 /// an `InvalidData` error naming what it is.
-fn read_key_file(path: &Path) -> std::io::Result<String> {
+fn read_key_file(path: &Path) -> std::io::Result<(String, (u64, u64))> {
     use std::io::Read;
-    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let f = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)?;
-    let t = f.metadata()?.file_type();
+    let meta = f.metadata()?;
+    let opened = (meta.dev(), meta.ino());
+    let t = meta.file_type();
     if !t.is_file() {
         let what = if t.is_char_device() || t.is_block_device() {
             "a device (a mount over the key's name?)"
@@ -273,6 +289,7 @@ fn read_key_file(path: &Path) -> std::io::Result<String> {
         ));
     }
     String::from_utf8(buf)
+        .map(|text| (text, opened))
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not UTF-8 text"))
 }
 
@@ -302,7 +319,81 @@ fn parse_signing_key(raw: &str) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&secret))
 }
 
-fn persist_signing_key_atomically(path: &Path, key: &SigningKey) -> Result<()> {
+/// The key read at `path` (`read`, with the device and inode of the file it
+/// opened), parsed, and its public half published; `seen`: the file the
+/// start's check saw there, which it must be.
+fn loaded(
+    path: &Path,
+    read: std::io::Result<(String, (u64, u64))>,
+    seen: Option<(u64, u64)>,
+) -> Result<AgentSigningKey> {
+    let (content, opened) =
+        read.map_err(|e| anyhow!(e).context(format!("reading {}", path.display())))?;
+    if let Some(seen) = seen.filter(|s| *s != opened) {
+        return Err(anyhow!(
+            "agent signing key {} is not the file the start's check found there (device {} \
+             inode {} then, device {} inode {} now): it was replaced or a mount was laid over \
+             it since — not loaded, and nothing is minted",
+            path.display(),
+            seen.0,
+            seen.1,
+            opened.0,
+            opened.1
+        ));
+    }
+    let key = parse_signing_key(&content).with_context(|| {
+        format!(
+            "agent signing key {} present but corrupted — refuse to \
+             silently regenerate; to re-key on purpose, retire the \
+             install's identity (docs/operator/INSTALL_UPGRADE_UNINSTALL.md, \
+             \"Re-keying the agent\"): removing the file alone refuses \
+             the start",
+            path.display()
+        )
+    })?;
+    info!(
+        target: "audit.signing_key",
+        path = %path.display(),
+        "reusing existing agent signing key"
+    );
+    let key = AgentSigningKey { inner: key };
+    key.publish_verifying_key(path);
+    Ok(key)
+}
+
+/// A new key at `path` ([`AgentSigningKey::mint_first`]; the tests'
+/// [`AgentSigningKey::load_or_bootstrap`]), unless its public half is there
+/// — anything at its name, or a lookup that fails otherwise than "not
+/// found" (lab PR 265; the review of #468, R8).
+fn mint_at(path: &Path) -> Result<AgentSigningKey> {
+    let public = verifying_key_path(path);
+    if !matches!(fs::symlink_metadata(&public), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err(anyhow!(
+            "agent signing key {} is absent but its public half {} is there: the key \
+             was removed or is hidden (a mount over its directory?) — refusing to mint \
+             a new one, which would restart every chain under another identity",
+            path.display(),
+            public.display()
+        ));
+    }
+    let key = mint_signing_key()?;
+    persist_signing_key_exclusively(path, &key)?;
+    info!(
+        target: "audit.signing_key",
+        path = %path.display(),
+        "bootstrapped fresh agent signing key"
+    );
+    let key = AgentSigningKey { inner: key };
+    key.publish_verifying_key(path);
+    Ok(key)
+}
+
+/// The new key `key` at `path`, never over what is there (the review of
+/// #468, R4): written to `<path>.tmp` (`O_CREAT | O_EXCL`, 0400), synced,
+/// linked at `path` (`link(2)` fails with `EEXIST` on a name that holds
+/// anything), the temporary name removed.
+fn persist_signing_key_exclusively(path: &Path, key: &SigningKey) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::DirBuilder::new()
@@ -313,6 +404,28 @@ fn persist_signing_key_atomically(path: &Path, key: &SigningKey) -> Result<()> {
         }
     }
     let tmp_path = tmp_path_for(path);
+    // The review of #473, B3: a mint that died before its link left its
+    // temporary file, and `O_EXCL` would refuse every first install after
+    // it. A first install has no key and no previous agent's pins (nothing
+    // protects the name): the leftover is removed — it never signed
+    // anything, the key is signed with only once it is at its name. Anything
+    // there that cannot be removed (a directory) is an error, as before.
+    match fs::symlink_metadata(&tmp_path) {
+        Ok(m) if !m.is_dir() => {
+            fs::remove_file(&tmp_path).with_context(|| {
+                format!(
+                    "removing the leftover signing-key tmpfile {}",
+                    tmp_path.display()
+                )
+            })?;
+            warn!(
+                target: "audit.signing_key",
+                path = %tmp_path.display(),
+                "a leftover temporary key file of an earlier mint that did not finish was removed"
+            );
+        }
+        _ => {}
+    }
     {
         let mut f = OpenOptions::new()
             .write(true)
@@ -322,13 +435,40 @@ fn persist_signing_key_atomically(path: &Path, key: &SigningKey) -> Result<()> {
             .with_context(|| format!("creating signing-key tmpfile {}", tmp_path.display()))?;
         let mut line = hex::encode(key.to_bytes());
         line.push('\n');
-        f.write_all(line.as_bytes())
-            .with_context(|| format!("writing signing-key bytes to {}", tmp_path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", tmp_path.display()))?;
+        let written = f
+            .write_all(line.as_bytes())
+            .with_context(|| format!("writing signing-key bytes to {}", tmp_path.display()))
+            .and_then(|()| {
+                f.sync_all()
+                    .with_context(|| format!("fsync {}", tmp_path.display()))
+            });
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
     }
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("renaming {} → {}", tmp_path.display(), path.display()))?;
+    if let Err(e) = fs::hard_link(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        let why = if e.kind() == std::io::ErrorKind::AlreadyExists {
+            "something is at the name now, and the start's check found nothing there (the view \
+             changed during the start?): not replaced, nothing minted"
+        } else {
+            "taking the name for the new key"
+        };
+        return Err(anyhow!(e).context(format!(
+            "linking {} → {}: {why}",
+            tmp_path.display(),
+            path.display()
+        )));
+    }
+    if let Err(e) = fs::remove_file(&tmp_path) {
+        warn!(
+            target: "audit.signing_key",
+            path = %tmp_path.display(),
+            error = %e,
+            "the new signing key is at its name, but its temporary name could not be removed"
+        );
+    }
     Ok(())
 }
 
@@ -356,6 +496,159 @@ pub fn boot_verifying_key(signing_key_file: &Path) -> Option<VerifyingKey> {
     match read_signing_key(signing_key_file) {
         Ok(k) => Some(k.verifying_key()),
         Err(_) => read_verifying_key(&verifying_key_path(signing_key_file)).ok(),
+    }
+}
+
+/// The review of #468, R4: the agent's signing key for one start — decided
+/// once, by the preflight ([`crate::boot::checks::signing_identity`]: a
+/// [`KeyDecision`]), loaded once, and given to every chain the start signs
+/// as a copy of that one key ([`Self::signer`]): no subsystem reads, let
+/// alone mints, a key of its own, so the chains of one boot are signed by
+/// exactly one key.
+///
+/// - [`KeyDecision::KeyPresent`]: [`AgentSigningKey::load_existing`] —
+///   never minted, and the file the check saw or an error. A load the
+///   previous agent's deny hooks close to this process (`EACCES` while it
+///   is not registered with them yet) keeps the decision and is tried again
+///   at the next use, after the attach registered it; any other failure is
+///   final: no key this start (the audit check refuses it unless
+///   `NN_AUDIT_ALLOW_UNWRITABLE=1`), never another file, never a mint.
+/// - [`KeyDecision::FirstInstall`]: [`AgentSigningKey::mint_first`], the
+///   token taken by value — one mint, never tried again.
+///
+/// The load is the first use's: the state files' bootstrap
+/// ([`Self::load`], right after the start registered with the previous
+/// agent's hooks), or a refusal's signature when the preflight refused the
+/// start (no state file is bootstrapped then, review #466 F8).
+#[derive(Debug)]
+pub struct BootKey {
+    path: PathBuf,
+    slot: std::sync::Mutex<Slot>,
+}
+
+#[derive(Debug)]
+enum Slot {
+    /// Decided by the preflight, not loaded yet.
+    Decided(KeyDecision),
+    /// The previous agent's hooks closed the key to this process: the
+    /// decision kept, tried again at the next use; why.
+    Closed(KeyPresent, String),
+    /// The one key of this start.
+    Loaded(AgentSigningKey),
+    /// No key this start, and none is tried again: why.
+    Failed(String),
+}
+
+/// Why [`BootKey::signer`] gives no key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoKey {
+    /// The key's file cannot be opened by this process (`EACCES`): the
+    /// previous agent's hooks close it to a process not yet registered with
+    /// them; tried again at the next use.
+    Closed(String),
+    /// No key this start: why (the decision is spent).
+    Failed(String),
+}
+
+impl std::fmt::Display for NoKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoKey::Closed(why) | NoKey::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for NoKey {}
+
+impl BootKey {
+    /// The start's key, at the path the preflight decided on and as it
+    /// decided it (nothing read yet; the review of #473, B1: the path is the
+    /// decision's, not one the caller names).
+    pub fn decided(decision: KeyDecision) -> Self {
+        BootKey {
+            path: decision.path().to_path_buf(),
+            slot: std::sync::Mutex::new(Slot::Decided(decision)),
+        }
+    }
+
+    /// A start's key loaded (or minted) at `path` without a decision, for the
+    /// agent's tests (`test-util`: no build of the binaries has it).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn loaded_for_tests(path: &Path) -> Result<Self> {
+        Ok(BootKey {
+            path: path.to_path_buf(),
+            slot: std::sync::Mutex::new(Slot::Loaded(AgentSigningKey::load_or_bootstrap(path)?)),
+        })
+    }
+
+    /// The key's path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The one load (or mint) of the start's key, when it has not happened
+    /// yet — or the load the previous agent's hooks closed, tried again.
+    /// What [`Self::signer`] then gives, without the key.
+    pub fn load(&self) -> Result<(), NoKey> {
+        self.with_loaded(|_| ())
+    }
+
+    /// A copy of the start's one key, for one chain (loaded at the first
+    /// use, [`Self::load`]); or why there is none.
+    pub fn signer(&self) -> Result<AgentSigningKey, NoKey> {
+        self.with_loaded(|k| AgentSigningKey {
+            inner: k.inner.clone(),
+        })
+    }
+
+    /// The verifying key of the start's key, once it is loaded (no load).
+    pub fn verifying_key(&self) -> Option<VerifyingKey> {
+        match &*self.lock() {
+            Slot::Loaded(k) => Some(k.verifying_key()),
+            _ => None,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Slot> {
+        self.slot.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn with_loaded<T>(&self, f: impl FnOnce(&AgentSigningKey) -> T) -> Result<T, NoKey> {
+        let mut slot = self.lock();
+        let pending = std::mem::replace(&mut *slot, Slot::Failed("being loaded".to_string()));
+        *slot = match pending {
+            Slot::Decided(KeyDecision::KeyPresent(present)) | Slot::Closed(present, _) => {
+                match AgentSigningKey::load_existing(&present) {
+                    Ok(key) => Slot::Loaded(key),
+                    Err(e) => {
+                        let why = format!("{e:#}");
+                        let closed = e.chain().any(|c| {
+                            c.downcast_ref::<std::io::Error>()
+                                .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                        });
+                        if closed {
+                            Slot::Closed(present, why)
+                        } else {
+                            Slot::Failed(why)
+                        }
+                    }
+                }
+            }
+            Slot::Decided(KeyDecision::FirstInstall(first)) => {
+                match AgentSigningKey::mint_first(first) {
+                    Ok(key) => Slot::Loaded(key),
+                    Err(e) => Slot::Failed(format!("{e:#}")),
+                }
+            }
+            done @ (Slot::Loaded(_) | Slot::Failed(_)) => done,
+        };
+        match &*slot {
+            Slot::Loaded(k) => Ok(f(k)),
+            Slot::Closed(_, why) => Err(NoKey::Closed(why.clone())),
+            Slot::Failed(why) => Err(NoKey::Failed(why.clone())),
+            // never left in the slot by the match above
+            Slot::Decided(_) => Err(NoKey::Failed("not loaded".to_string())),
+        }
     }
 }
 
@@ -471,6 +764,140 @@ mod tests {
         assert_ne!(again.verifying_key(), first.verifying_key());
         assert_eq!(read_verifying_key(&public).unwrap(), again.verifying_key());
         drop(dir);
+    }
+
+    /// The review of #468, R4 (the ratchet): no code mints the agent's key
+    /// but the start's one load. In every source of the workspace's crates,
+    /// their tests left out (`tests/`, `tests.rs`, `*_tests.rs`, a
+    /// `#[cfg(test)] mod` and what follows it, comments): `mint_first(` is
+    /// named twice, both here — its definition and [`BootKey`]'s one call —;
+    /// a [`crate::boot::checks::FirstInstall`] is built only by the check
+    /// that decides (and its test door); the key's writers are called from
+    /// here alone; and the tests' minting door, `load_or_bootstrap`, is
+    /// compiled into test builds only (a release build that called it would
+    /// not compile).
+    #[test]
+    fn only_the_starts_one_load_mints_a_key() {
+        let root = Path::new(env!("NN_REPO_ROOT"));
+        let mut files = Vec::new();
+        let mut dirs: Vec<PathBuf> = [
+            "agent/src",
+            "cli",
+            "common/src",
+            "crates",
+            "scan/src",
+            "watchdog/src",
+            "xtask/src",
+            "fuzz",
+        ]
+        .iter()
+        .map(|d| root.join(d))
+        .collect();
+        while let Some(d) = dirs.pop() {
+            let Ok(entries) = fs::read_dir(&d) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                if p.is_dir() {
+                    if name != "tests" && name != "target" {
+                        dirs.push(p);
+                    }
+                } else if name.ends_with(".rs")
+                    && name != "tests.rs"
+                    && !name.ends_with("_tests.rs")
+                {
+                    files.push(p);
+                }
+            }
+        }
+        assert!(files.len() > 300, "only {} sources found", files.len());
+        // the files a `#[cfg(test)] mod name;` brings in are tests too
+        let mut test_only: Vec<PathBuf> = Vec::new();
+        for f in &files {
+            let text = fs::read_to_string(f).unwrap();
+            let dir = f.parent().unwrap();
+            let stem = f.file_stem().unwrap().to_string_lossy();
+            let here = if stem == "mod" || stem == "lib" || stem == "main" {
+                dir.to_path_buf()
+            } else {
+                dir.join(&*stem)
+            };
+            for decl in text.split("#[cfg(test)]\n").skip(1) {
+                let decl = decl
+                    .trim_start_matches("pub(crate) ")
+                    .trim_start_matches("pub ");
+                if let Some(name) = decl.strip_prefix("mod ").and_then(|r| r.split_once(';')) {
+                    if !name.0.contains(char::is_whitespace) {
+                        test_only.push(here.join(format!("{}.rs", name.0)));
+                        test_only.push(here.join(name.0).join("mod.rs"));
+                    }
+                }
+            }
+        }
+        let mut found: Vec<(String, &str)> = Vec::new();
+        for f in files.iter().filter(|f| !test_only.contains(f)) {
+            let text = fs::read_to_string(f).unwrap();
+            let code = text
+                .find("\n#[cfg(test)]\nmod ")
+                .map_or(text.as_str(), |end| &text[..end]);
+            let rel = f.strip_prefix(root).unwrap().display().to_string();
+            for line in code.lines().map(str::trim_start) {
+                if line.starts_with("//") {
+                    continue;
+                }
+                for needle in [
+                    "mint_first(",
+                    "FirstInstall(FirstInstall {",
+                    "mint_signing_key(",
+                    "persist_signing_key_exclusively(",
+                    "AgentSigningKey::load_or_bootstrap(",
+                ] {
+                    if line.contains(needle) {
+                        found.push((rel.clone(), needle));
+                    }
+                }
+            }
+        }
+        found.sort();
+        let keys = "crates/nn-linux/src/keys.rs".to_string();
+        let checks = "crates/nn-linux/src/boot/checks.rs".to_string();
+        assert_eq!(
+            found,
+            vec![
+                (checks.clone(), "FirstInstall(FirstInstall {"),
+                (checks, "FirstInstall(FirstInstall {"),
+                (keys.clone(), "AgentSigningKey::load_or_bootstrap("),
+                (keys.clone(), "mint_first("),
+                (keys.clone(), "mint_first("),
+                (keys.clone(), "mint_signing_key("),
+                (keys.clone(), "mint_signing_key("),
+                (keys.clone(), "persist_signing_key_exclusively("),
+                (keys, "persist_signing_key_exclusively("),
+            ],
+            "a caller that mints the agent's key (or builds the decision that lets it) other \
+             than the start's one load"
+        );
+        let here = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/crates/nn-linux/src/keys.rs"
+        ));
+        let here = &here[..here.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        assert!(here.contains(
+            "    #[cfg(any(test, feature = \"test-util\"))]\n    pub fn load_or_bootstrap(path: &Path)"
+        ));
+        assert_eq!(here.matches("pub fn load_or_bootstrap(").count(), 1);
+        // its one other caller here is the tests' door of the start's key
+        let door = here
+            .find("AgentSigningKey::load_or_bootstrap(path)?")
+            .expect("the door");
+        assert!(here[..door]
+            .rfind("#[cfg(any(test, feature = \"test-util\"))]\n    pub fn loaded_for_tests(")
+            .is_some_and(|at| !here[at..door].contains("\n    }\n")));
+        // the one call of the mint is the start's key's
+        let boot_key = &here[here.find("impl BootKey {").unwrap()..];
+        assert!(boot_key.contains("AgentSigningKey::mint_first(first)"));
     }
 
     /// R11b (lab PR 262, review #466 F4): what sits at the key's name and is

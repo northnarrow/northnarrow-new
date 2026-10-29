@@ -328,18 +328,16 @@ pub(crate) fn start(
     state_protection: &Option<
         std::sync::Arc<northnarrow_agent::anti_tamper::filesystem::StateDirProtection>,
     >,
+    signing_key: &northnarrow_agent::keys::BootKey,
 ) -> Option<Arc<admin_socket::FimAdminState>> {
     let fim_admin_state: Option<Arc<admin_socket::FimAdminState>> = {
-        // Re-derive the signing key + agent_id for FIM the same way
-        // the audit log does (re-load rather than steal the audit
-        // log's clone — they're separate domains with separate Db
-        // handles). A failure here leaves no recompute task: `fim
-        // baseline` is refused (lab PR 263: it answered success),
-        // `fim status` still serves its snapshot.
+        // The signing key + agent_id for FIM: a copy of the start's one
+        // key (the review of #468, R4: no load of its own; a handle of its
+        // own — separate domains with separate Db handles). A failure here
+        // leaves no recompute task: `fim baseline` is refused (lab PR 263:
+        // it answered success), `fim status` still serves its snapshot.
         let mut baseline_pubkey: Option<ed25519_dalek::VerifyingKey> = None;
-        let baseline_db_opt = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
-            &cli.signing_key_file,
-        ) {
+        let baseline_db_opt = match signing_key.signer() {
             Ok(key) => {
                 baseline_pubkey = Some(key.verifying_key());
                 match northnarrow_agent::fim::baseline::BaselineDb::open(
@@ -659,10 +657,9 @@ pub(crate) fn start(
                 // map_mut("FS_FIM_EVENTS") calls would return None,
                 // which is fine because no other code references the
                 // map name.
-                let drift_db_for_drain =
-                    match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
-                        &cli.signing_key_file,
-                    )
+                let drift_db_for_drain = match signing_key
+                    .signer()
+                    .map_err(anyhow::Error::from)
                     .and_then(|key| {
                         FimDriftDb::open(
                             &cli.fim_drift_file,
@@ -672,17 +669,17 @@ pub(crate) fn start(
                             fim_drift_rotation,
                         )
                     }) {
-                        Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
-                        Err(e) => {
-                            warn!(
-                                error = %e,
-                                path = %cli.fim_drift_file.display(),
-                                "fim drift DB open failed — drain loop will not spawn; \
-                                 kernel drift events will be dropped this boot"
-                            );
-                            None
-                        }
-                    };
+                    Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            path = %cli.fim_drift_file.display(),
+                            "fim drift DB open failed — drain loop will not spawn; \
+                             kernel drift events will be dropped this boot"
+                        );
+                        None
+                    }
+                };
 
                 if let Some(drift_db) = drift_db_for_drain {
                     match take_fs_fim_events_ringbuf(sensor.ebpf_mut()) {

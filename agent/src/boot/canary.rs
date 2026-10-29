@@ -22,6 +22,7 @@ pub(crate) fn start(
     agent_id: [u8; 16],
     audit_log: &AuditHandle,
     fim_admin_state: &Option<Arc<admin_socket::FimAdminState>>,
+    signing_key: &northnarrow_agent::keys::BootKey,
 ) -> Canary {
     // ── Tappa 9.5 K6 — canary subsystem boot ───────────────────────
     //
@@ -47,23 +48,20 @@ pub(crate) fn start(
         Option<Arc<admin_socket::CanaryAdminState>>,
         Option<Arc<northnarrow_agent::canary::detector::Detector>>,
     ) = {
-        let signing_key_for_canary =
-            match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
-                &cli.signing_key_file,
-            ) {
-                Ok(key) => Some(key),
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "canary subsystem needs agent signing key — load failed; \
-                         canary admin surface disabled this boot"
-                    );
-                    None
-                }
-            };
-        let signing_key_for_access =
-            northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file)
-                .ok();
+        // The review of #468, R4: copies of the start's one key, no load of
+        // their own.
+        let signing_key_for_canary = match signing_key.signer() {
+            Ok(key) => Some(key),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "canary subsystem needs agent signing key — load failed; \
+                     canary admin surface disabled this boot"
+                );
+                None
+            }
+        };
+        let signing_key_for_access = signing_key.signer().ok();
         match (signing_key_for_canary, signing_key_for_access) {
             (Some(reg_key), Some(access_key)) => {
                 let registry = match northnarrow_agent::canary::registry::Registry::open(

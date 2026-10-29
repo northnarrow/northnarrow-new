@@ -62,10 +62,11 @@ use std::path::{Path, PathBuf};
 
 use northnarrow_agent::agent_id::AgentIdentity;
 use northnarrow_agent::audit::{
-    AgentSigningKey, AuditEntry, AuditEntryDraft, AuditLog, AuditVerifyError, GENESIS_PREV_HASH,
+    AuditEntry, AuditEntryDraft, AuditLog, AuditVerifyError, GENESIS_PREV_HASH,
 };
 use northnarrow_agent::chain_host_linux::LinuxHost;
 use northnarrow_agent::config::overlay_auth::OverlayGate;
+use northnarrow_agent::keys::BootKey;
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
@@ -137,6 +138,10 @@ pub(crate) struct Context<'a> {
     /// The install manifest's verdict and provenance ([`UNCHECKED`] before
     /// it ran).
     pub(crate) integrity: (&'a str, &'a str),
+    /// The review of #468, R4: the start's one key, which signs the refusal
+    /// as it signs every other row of the start (loaded at this first use
+    /// when the preflight refused the start: no state file was bootstrapped).
+    pub(crate) key: &'a BootKey,
 }
 
 impl Context<'_> {
@@ -247,6 +252,7 @@ pub(crate) fn sign(ctx: &Context<'_>, audit: Option<&mut AuditLog>, refusal: &Re
         identity,
         overlay_gate,
         integrity,
+        key,
     } = *ctx;
     // 1. the audit log: the one opened before the load, or opened now. When
     // an open log cannot take the rows, its head is what the fallback chain
@@ -261,13 +267,13 @@ pub(crate) fn sign(ctx: &Context<'_>, audit: Option<&mut AuditLog>, refusal: &Re
     };
     let audit_log = match audit {
         Some(log) => take(log),
-        None => match AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
+        None => match key.signer() {
             Ok(key) => match AuditLog::open(&cli.audit_log_file, key, identity.id) {
                 Ok(mut log) => take(&mut log),
                 Err(e) => Err(format!("{e:#}")),
             },
             Err(e) => {
-                return Signed::Unsigned(format!("the agent's signing key cannot be loaded: {e:#}"))
+                return Signed::Unsigned(format!("the agent's signing key cannot be loaded: {e}"))
             }
         },
     };
@@ -282,12 +288,12 @@ pub(crate) fn sign(ctx: &Context<'_>, audit: Option<&mut AuditLog>, refusal: &Re
              path) there is no fallback chain"
         ));
     };
-    let key = match AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
+    let key = match key.signer() {
         Ok(key) => key,
         Err(e) => {
             return Signed::Unsigned(format!(
                 "the audit log cannot take it ({audit_log}); the agent's signing key cannot be \
-                 loaded: {e:#}"
+                 loaded: {e}"
             ))
         }
     };
@@ -940,6 +946,7 @@ fn write_recovered(log: &mut AuditLog, path: &Path, mut extra: Value) -> Result<
 mod tests {
     use super::*;
     use clap::Parser;
+    use northnarrow_agent::audit::AgentSigningKey;
     use std::os::unix::fs::PermissionsExt;
 
     fn cli(dir: &Path, audit_log: &Path) -> Cli {
@@ -984,6 +991,18 @@ mod tests {
             .collect()
     }
 
+    /// The start's key in `dir`, decided as the preflight decides it there:
+    /// there (in any form), or a first install.
+    fn start_key(dir: &Path) -> BootKey {
+        let path = dir.join("agent.sig.key");
+        let decision = if std::fs::symlink_metadata(&path).is_ok() {
+            northnarrow_agent::boot::checks::KeyDecision::present_for_tests(&path)
+        } else {
+            northnarrow_agent::boot::checks::KeyDecision::first_install_for_tests(&path)
+        };
+        BootKey::decided(decision)
+    }
+
     fn pk(dir: &Path) -> ed25519_dalek::VerifyingKey {
         northnarrow_agent::keys::boot_verifying_key(&dir.join("agent.sig.key")).expect("the key")
     }
@@ -1008,6 +1027,7 @@ mod tests {
         cli: Cli,
         id: AgentIdentity,
         gate: OverlayGate,
+        key: BootKey,
     }
 
     impl Fixture {
@@ -1020,7 +1040,14 @@ mod tests {
             let cli = cli(dir.path(), &audit);
             let id = identity(dir.path());
             let gate = gate(dir.path(), id.id);
-            Fixture { dir, cli, id, gate }
+            let key = start_key(dir.path());
+            Fixture {
+                dir,
+                cli,
+                id,
+                gate,
+                key,
+            }
         }
 
         fn path(&self, name: &str) -> PathBuf {
@@ -1032,7 +1059,7 @@ mod tests {
         }
 
         fn refuse(&self) -> Signed {
-            refuse_with(&self.cli, &self.id, &self.gate)
+            refuse_with(&self.cli, &self.id, &self.gate, &self.key)
         }
 
         /// The audit log back (the directory removed), opened as the next
@@ -1065,12 +1092,13 @@ mod tests {
         }
     }
 
-    fn refuse_with(cli: &Cli, id: &AgentIdentity, gate: &OverlayGate) -> Signed {
+    fn refuse_with(cli: &Cli, id: &AgentIdentity, gate: &OverlayGate, key: &BootKey) -> Signed {
         let ctx = Context {
             cli,
             identity: id,
             overlay_gate: gate,
             integrity: UNCHECKED,
+            key,
         };
         sign(
             &ctx,
@@ -1107,11 +1135,13 @@ mod tests {
         let cli = cli(dir.path(), &audit);
         let id = identity(dir.path());
         let gate_ = gate(dir.path(), id.id);
+        let key = start_key(dir.path());
         let ctx = Context {
             cli: &cli,
             identity: &id,
             overlay_gate: &gate_,
             integrity: UNCHECKED,
+            key: &key,
         };
         let r = Refusal::new("capabilities", "CAP_KILL missing").degraded("capabilities");
         let signed = sign(&ctx, None, &r);
@@ -1144,11 +1174,13 @@ mod tests {
         let gate_ = gate(dir.path(), id.id);
         let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
         let mut log = AuditLog::open(&audit, key, id.id).unwrap();
+        let key = start_key(dir.path());
         let ctx = Context {
             cli: &cli,
             identity: &id,
             overlay_gate: &gate_,
             integrity: ("verified", "source-tree"),
+            key: &key,
         };
         let signed = sign(
             &ctx,
@@ -1240,11 +1272,13 @@ mod tests {
         // a directory where the log goes, after the open (which creates no
         // file): every append fails
         std::fs::create_dir(&audit).unwrap();
+        let key = start_key(dir.path());
         let ctx = Context {
             cli: &cli,
             identity: &id,
             overlay_gate: &gate_,
             integrity: UNCHECKED,
+            key: &key,
         };
         let signed = sign(
             &ctx,
@@ -1272,7 +1306,7 @@ mod tests {
             let mut cli = cli(f.dir.path(), &f.path("audit.log"));
             cli.pid_file = pid_file;
             assert_eq!(fallback_dir(&cli), None);
-            let signed = refuse_with(&cli, &f.id, &f.gate);
+            let signed = refuse_with(&cli, &f.id, &f.gate, &f.key);
             assert!(
                 matches!(&signed, Signed::Unsigned(why) if why.contains("--pid-file")),
                 "{signed:?}"
@@ -1342,11 +1376,13 @@ mod tests {
             let aside = dir.path().join("aside.log");
             std::fs::rename(&audit, &aside).unwrap();
             std::fs::create_dir(&audit).unwrap();
+            let start = start_key(dir.path());
             let ctx = Context {
                 cli: &cli,
                 identity: &id,
                 overlay_gate: &gate_,
                 integrity: UNCHECKED,
+                key: &start,
             };
             let signed = sign(&ctx, Some(&mut open), &Refusal::new("audit_log", "x"));
             let Signed::Fallback { path, .. } = signed else {
@@ -1705,6 +1741,7 @@ mod tests {
             identity: &f.id,
             overlay_gate: &f.gate,
             integrity: UNCHECKED,
+            key: &f.key,
         };
         let mut withdrawn = Vec::new();
         let code = ctx.conclude(None, Refusal::new("audit_log", "x"), |root| {
