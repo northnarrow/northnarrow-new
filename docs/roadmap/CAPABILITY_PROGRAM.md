@@ -3401,3 +3401,73 @@ only in the table below, in the same PR as the evidence.
     chains; the lab build's matrix, if CI ever runs the `debug-trigger`
     tests.
   - Lab: host tests only (no guest, no root, no agent). Host, on the lot's tree, `set -o pipefail`, `CARGO_BUILD_JOBS=4`: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 74 suites, 3,171 passed, 0 failed, 15 ignored, in 176 s (`main` 8788e0d0: 73 suites, 3,168; the matrix's 2 tests and xtask's 1); `cargo xtask golden` three times, each a process of its own: 27 tests passed each time (the library's 25 replays and the matrix's 2), every golden file the same bytes before and after each run (sha256 of them all dbf57a09…). The matrix: 2,703 cases in 8.8 to 10.1 s a run (8 threads, the debug build), its cases built in 2.5 s; three runs in a row, and the three golden runs, the same bytes. The mutation check, each on the committed goldens and reverted after: `status`'s help text changed ("Print current posture" → "Print the current posture"): the test fails with 4 problems (`help.no-arguments`, `help.help-alone`, `help.status.long`, `pipe.stderr.help`; the cases that name them by "the same bytes as" follow), each with the golden line and the new one; `unlock`'s exit code for a refused role 7 → 8: it fails on `sock.unlock.refused.role-denied` (`exit: 7` / `exit: 8`); reverted, it passes. Only the comments of the harness and this line changed after the gates' run; the matrix, fmt, clippy of the agent's tests and the state-isolation ratchet run again on the final tree: all pass.
+
+- **Lab PR 268 — nn-agent, nn-linux: the signing key decided once at boot
+  and loaded once; the restart rule for any binary in a release build
+  (Wave 4, security follow-up of the independent review of #468, R4, and
+  its re-review, S1–S3; C23, C01; no level changes).**
+  - What was wrong (R4, a TOCTOU): `boot::checks::signing_identity` ran
+    once, then about 13 loads by path — the state bootstrap, the audit
+    check (`checks::open_audit_log`), the refusals (two), the attest
+    phase's deferred open, the head anchor, the detection store and the
+    status log, FIM (two), the canaries (two), the network logs (two) —
+    each called `AgentSigningKey::load_or_bootstrap`, which minted an
+    absent key. A mount laid during the boot, after the check (systemd
+    makes the unit's namespace a shared one: a mount on the host reaches
+    it), gave a new key at the next load, and a later load a second one:
+    one boot's chains under two keys. S1 (the re-review): the restart rule
+    of lab PR 265 held only for the binary the previous agent protected; a
+    copy started by a drop-in was stopped by accident — the check opens the
+    pinned inode map read-write and the BPF guard denies a write handle to
+    a process neither protected nor running a protected binary, which does
+    not hold with the guard in observe or a read-only open. S2: the restart
+    rule covered the key only (the id and the audit log moved away opened
+    new chains under the real key). S3: the single-bpffs rule counted
+    mounts, so a bind of the same instance onto itself refused every start
+    on a host that has one.
+  - What changed: the decision is a token (nn-linux `boot::checks`:
+    `KeyVerdict::Decided(KeyDecision::KeyPresent | FirstInstall)`; private
+    fields, not `Clone`, the `compile_fail` examples show it; a second
+    decision in one boot sequence is `BootOrderError::KeyDecided`).
+    `KeyPresent` records the file the check saw (device, inode). The start
+    builds one `keys::BootKey` from it in the preflight, loads it in the
+    state bootstrap (after `preregister_self`), and every phase takes a
+    copy (`BootKey::signer`); a load the previous agent's hooks close
+    (`EACCES` before the registration) keeps the decision and is read after
+    the attach, any other failure is final. `load_or_bootstrap` split:
+    `load_existing(path, &KeyPresent)` never mints and refuses another file
+    than the one seen; `mint_first(path, FirstInstall)` takes the token by
+    value, writes `<key>.tmp` with `O_CREAT|O_EXCL`, links it at the name
+    (`link(2)`: `EEXIST` on anything there, where `rename(2)` replaced it)
+    and refuses beside a public half; `load_or_bootstrap` stays as the
+    tests' door, `#[cfg(any(test, feature = "test-util"))]` (a production
+    caller does not compile in a build without dev-dependencies). S1:
+    `continuity::restart_findings` (was `restart_key_findings`) treats any
+    start with the pins as a restart unless `COPIES_EXEMPT`
+    (`cfg!(any(feature = "test-privileged", feature = "debug-trigger"))`).
+    S2: the key, the id and the audit log each in a directory the previous
+    agent protected, and there. S3: stacked mounts at `/sys/fs/bpf` pass
+    when they are one instance (the same `major:minor`, root `/`, the same
+    type). Nits: the watcher reports a malformed line over a protected path
+    (`mount_over_protected`, W1); `uninstall.sh`'s pin-root message names
+    §3.10 branch B (N1); the comments of `boot::BootStep::SigningIdentity`
+    and `continuity`'s header name the pins' proof and what stays open
+    (N2); a test of `mounts_over`'s `(any)` branch.
+  - Tests: the TOCTOU (a key decided present then gone with every piece of
+    evidence: an error, no file at the key's or the public half's name, the
+    audit check refusing; a key swapped in at the name: not loaded; the one
+    key handed to every chain unchanged by what happens to the file after),
+    a first install minting once and never over a key planted since the
+    check, the decision once per sequence, the restart's id and audit log,
+    V3b′ refused under the release rule and accepted under the lab
+    builds', the release build holding no exemption, the bpffs self-bind,
+    the watcher's malformed line; two ratchets — no source of the
+    workspace but the start's one load mints the key or builds a
+    `FirstInstall`, and no phase of the start reads a key of its own (each
+    signing phase takes `signing_key.signer()`).
+  - Open (BOOT_INTEGRITY §1.1): a reboot with a persistent view that hides
+    both trees (an off-host record of the public key); the bpffs unmounted
+    and mounted fresh (CM-12); the chains other than the audit log moved
+    away on a restart (signed by the chain check against the head anchor);
+    the copies' exemption in the lab builds.
+  - Lab: pending (phase 2, one guest, ubuntu2204).

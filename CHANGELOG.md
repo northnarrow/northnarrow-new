@@ -682,6 +682,52 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   fails, then disable, archive, reboot, `uninstall.sh --purge` without a
   window, a fresh install): new keys, the archives verify with the old
   public halves, the archived journal holds the refusals.
+- The agent's signing key is decided once at boot and loaded once (lab PR
+  268, the independent review of #468, R4, and its re-review, S1–S3;
+  `docs/operator/BOOT_INTEGRITY.md` §1.1). The preflight's
+  `signing_identity` decided whether a key could be minted, then about 13
+  loads (the state bootstrap, the audit check, the refusals, the attest
+  phase, the head anchor, the detections and status events, FIM, the
+  canaries, the network logs) each read the key's path again, and each
+  minted one when it found none: a mount laid during the boot, after the
+  check, gave a new key, and a later load could give a second one — the
+  chains of one boot under two keys. Now the check returns a token no
+  other code can make, and a boot sequence gives once (nn-linux
+  `boot::checks::KeyDecision`: `KeyPresent`, with the file it saw, or
+  `FirstInstall`); the start builds one `keys::BootKey` from it, loads it
+  once after its registration with the previous agent's hooks, and every
+  phase takes a copy of that key. `load_or_bootstrap` is split:
+  `AgentSigningKey::load_existing` never mints (a key gone since the check,
+  or another file at its name, is an error: the audit check refuses the
+  start), and `mint_first` takes the `FirstInstall` by value and links the
+  new key at its name with `link(2)` from an `O_CREAT|O_EXCL` file, never
+  over what is there (the `rename(2)` used before replaced it). The tests'
+  door that mints without a decision is compiled into test builds only;
+  a test fails if any other source of the workspace mints the key, and
+  another if a phase of the start reads a key of its own. **The restart
+  rule for any binary (S1):** with the previous agent's pins there, a
+  release build treats every start as that agent's restart — a copy of
+  the binary started by a drop-in (`ExecStart=` naming a copy, or `ld.so`
+  and the binary) with the key's path elsewhere is refused by
+  `signing_identity`; before, the rule held only for the protected binary,
+  and a copy was stopped only because the BPF guard denies it a write
+  handle on the pinned inode map (not with the guard in observe). The
+  copies' exemption is the lab builds' alone (`test-privileged`,
+  `debug-trigger`, whose privileged tests run copies beside the installed
+  agent), and a test holds that a build without them has none. **S2:** a
+  restart keeps its id and its audit log as well as its key — each in a
+  directory the previous agent protected and there. **S3:** the single
+  bpffs rule counts instances, not mounts: a bind of the same bpffs onto
+  itself at `/sys/fs/bpf` is accepted (on a host where a node or CNI
+  script lays one, it refused every start, a first install too). Also: the self-integrity watcher reports a mount-table line
+  not in the kernel's shape over a protected path (an nsfs over
+  `agent.sig.key`) as `mount_over_protected`, as the start refuses it; the
+  pin-root message of `uninstall.sh` names the branch for an agent that
+  refuses to start (`INSTALL_UPGRADE_UNINSTALL.md` §3.10 B). Still open
+  (§1.1): a reboot with a persistent view that hides both trees, the bpffs
+  unmounted and mounted fresh (no deny hook on `mount(2)`/`umount(2)`), the
+  other chains moved away on a restart (signed by the chain check against
+  the head anchor, not refused).
 - `nn-admin fim baseline` was answered `Success`, and its signed audit row
   read "success", when no baseline would be recorded (lab PR 263, found
   by R11d's table of the admin socket's verification copies): without

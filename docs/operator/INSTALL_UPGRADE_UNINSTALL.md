@@ -856,11 +856,14 @@ chain the install keeps; its public half (`agent.sig.pub`) is what
 does not mint a key where it finds an earlier identity — the public half,
 `agent_id`, a written head anchor, a signed row of the audit chain or of
 another chain — nor, while the previous agent's pins are there, when it is
-that agent's restart; it refuses (exit 78, `start refused
-gate=signing_identity`), and so does a start whose directories are
-mounted over or are not the ones the previous agent protected
-(`gate=agent_mounts`; `BOOT_INTEGRITY.md` §1.1, which also lists what
-these checks do not cover). Before lab PR 265 such a start minted a new key
+that agent's restart (in a release build whatever binary it runs), whose
+key, id and audit log must be where that agent protected them; it refuses
+(exit 78, `start refused gate=signing_identity`). A start whose directories
+are mounted over or are not the ones the previous agent protected refuses
+too (`gate=agent_mounts`; `BOOT_INTEGRITY.md` §1.1, which also lists what
+these checks do not cover). The key is decided once, in the preflight, and
+loaded once: a key gone or swapped between the check and its load is not
+minted, nor replaced (lab PR 268). Before lab PR 265 such a start minted a new key
 with one INFO line, and the chains went on under another identity. A new
 key is a new install's identity, made on purpose, in one of two ways.
 
