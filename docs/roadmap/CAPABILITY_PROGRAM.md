@@ -3556,6 +3556,23 @@ only in the table below, in the same PR as the evidence.
     change), R-F (the `/proc` fallback inside a judgement's scope; an
     assertion for a lookup outside one), a kernel budget per uid for the
     `bpf` hook (`tmp/fix471/lab3/`).
+  - Third review (PR #471, "merge after X"): C1 — a denial the bus
+    dropped opened a coalescing window, so for a second that process's
+    repeats were counted into an event never judged: the window opens once
+    the denial is queued; C2 — the coalescer's eviction scanned its 512
+    windows per new key (a fork loop): a FIFO of keys, O(1); C6 — a denial
+    keeps its 50 ms on the queue's slot too; C4 — the window's length is
+    tested. Mutations on the bus's runtime, 22 of 22 caught (the window at
+    60 s among them). EXP-13e ×3 per build on ubuntu2404, clean installs:
+    `fs_protect` ring drops `main` 0, 662, 132, the tip 472, 0, 2,783 of
+    ~590,000 denials a run; on the tip no bus queue dropped and no send
+    waited for room, every probe judged (NET-001 18/18, 13–27 ms), the
+    agent's CPU 37.3 s against `main`'s 37.0 s in the flood's 40 s with the
+    guest's CPU pressure ~34 s of it — the fs_protect pump's own pace on a
+    saturated guest, its sends dearer than one `mpsc` send (the coalescer,
+    two semaphores, the queue's lock): batching them is with the pumps'
+    threads in R12b. C3 (a cap per uid on `bpf()` records) and C5 (the
+    coalesced repeats in AT-001's record) are open (`tmp/fix471/lab4/`).
   - Open: R12b (the decision thread without `await`: `exe_identity::
     resolve` in every pump, the systemd state as a snapshot,
     `close_if_expired` on a tick, the canary append through the writer,

@@ -82,7 +82,10 @@ call (any user: on 6.x the LSM hook runs before the permission checks, one
 record per new process and command a second) — are kept from filling P0
 and from starving the rest:
 - a denial repeated by its process on its inode within a second of the one
-  queued is counted into it, not queued (`COALESCE_WINDOW_NS`); every
+  queued is counted into it, not queued (`COALESCE_WINDOW_NS`; the window
+  opens only once the denial is queued — third review, C1: one the bus
+  dropped coalesces nothing, the process's next denial is queued and
+  judged; the oldest of the 512 windows goes first, in O(1), C2); every
   repeat is in a signed `event_bus_coalesced` row (per key the repeats and
   their first and last time, the most repeated first) and in the status
   (`coalesced`). A loop of one `chmod` is one event a second; a loop of new
@@ -93,7 +96,9 @@ and from starving the rest:
   exploit post-condition, a signal to a security tool, a sensor flood —
   the last two carried by the open-sensor pump and by the network drain
   and the io_uring pump between their own events — find room at once and
-  hold no pump back while a flood fills the rest.
+  hold no pump back while a flood fills the rest. A denial holding a flood
+  slot waits for the queue's slot within what is left of its 50 ms (third
+  review, C6: the rare events past the reserve).
 
 `DefenderSignal` shares the file-open sensor's ring and pump with the FIM
 credential reads, mass writes and bursts (review #471 M2): the pump sends
@@ -279,7 +284,11 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   saturates — CPU pressure on 75–80 % of the flood's time, the agent's CPU
   the same on `main` and the tip — a ring fell behind in some runs while no
   send of the bus had waited for room: the pumps short of CPU, plausible,
-  not proven to the thread),
+  not proven to the thread; and EXP-13e, a root fork loop of refused
+  `chmod`s, lost more `fs_protect` records on the tip than on `main` in
+  three runs each — 472, 0, 2,783 against 0, 662, 132 of ~590,000 — with
+  the same agent CPU and no send waiting: the pump's sends cost more than
+  one `mpsc` send, so the pumps batch their sends),
   the systemd state as a snapshot, `close_if_expired` on a tick, the canary
   append through the writer's queue, a cache of `PackageOwnership` for
   module provenance; the decision delay per class (stage 5) against a
@@ -311,7 +320,12 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   lineage lookup made in the event loop outside `judged_at` is caught only
   by the pinned sources, not by an assertion (the time as an explicit
   parameter instead of the thread-local). A kernel budget per uid for the
-  `bpf` hook's records (stage 2).
+  `bpf` hook's records (stage 2) — or, sooner, a userland cap per uid and
+  second on `BpfSyscall` with the rest counted in a signed row (third
+  review, C3: under 8 : 2 : 1 : 1 a `bpf()` flood still takes two thirds of
+  the consumer). C5: the coalesced repeats are counted in a signed row of
+  their own, not in AT-001's record (`detections_held` no longer counts
+  them): a `repeats` field in the record, or in the next one of the key.
 - **R12c** — the response dispatcher by severity, its queue (stage 6);
   no action without a signed record (intent, then outcome); the budget
   never limits an action's record; the evidence writer's queue (stage 7);
