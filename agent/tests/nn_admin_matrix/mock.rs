@@ -87,17 +87,26 @@ impl Running {
 
 pub fn start(path: &Path, script: Script) -> Running {
     let stop = Arc::new(AtomicBool::new(false));
-    let listener = UnixListener::bind(path)
-        .unwrap_or_else(|e| panic!("binding the mock agent at {}: {e}", path.display()));
+    let bind = || {
+        UnixListener::bind(path)
+            .unwrap_or_else(|e| panic!("binding the mock agent at {}: {e}", path.display()))
+    };
     let replies = match script {
         Script::Refused => {
-            drop(listener);
+            // Lab PR 266b: bound and closed while no child of this test is
+            // between its fork and its exec (`harness::closing`): no copy of
+            // the listener outlives it, and a connect is always refused.
+            {
+                let _closing = crate::harness::closing();
+                drop(bind());
+            }
             let handle =
                 std::thread::spawn(|| vec!["(a socket file nobody listens on)".to_string()]);
             return Running { stop, handle };
         }
         Script::Replies(r) => r,
     };
+    let listener = bind();
     listener.set_nonblocking(true).unwrap();
     let flag = stop.clone();
     let handle = std::thread::spawn(move || {

@@ -3401,3 +3401,40 @@ only in the table below, in the same PR as the evidence.
     chains; the lab build's matrix, if CI ever runs the `debug-trigger`
     tests.
   - Lab: host tests only (no guest, no root, no agent). Host, on the lot's tree, `set -o pipefail`, `CARGO_BUILD_JOBS=4`: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 74 suites, 3,171 passed, 0 failed, 15 ignored, in 176 s (`main` 8788e0d0: 73 suites, 3,168; the matrix's 2 tests and xtask's 1); `cargo xtask golden` three times, each a process of its own: 27 tests passed each time (the library's 25 replays and the matrix's 2), every golden file the same bytes before and after each run (sha256 of them all dbf57a09…). The matrix: 2,703 cases in 8.8 to 10.1 s a run (8 threads, the debug build), its cases built in 2.5 s; three runs in a row, and the three golden runs, the same bytes. The mutation check, each on the committed goldens and reverted after: `status`'s help text changed ("Print current posture" → "Print the current posture"): the test fails with 4 problems (`help.no-arguments`, `help.help-alone`, `help.status.long`, `pipe.stderr.help`; the cases that name them by "the same bytes as" follow), each with the golden line and the new one; `unlock`'s exit code for a refused role 7 → 8: it fails on `sock.unlock.refused.role-denied` (`exit: 7` / `exit: 8`); reverted, it passes. Only the comments of the harness and this line changed after the gates' run; the matrix, fmt, clippy of the agent's tests and the state-isolation ratchet run again on the final tree: all pass.
+- **Lab PR 266b — nn-admin's output matrix: a refused connection is
+  always refused (follow-up of lab PR 266; test infrastructure, no
+  capability, no level changes).**
+  - What was wrong: in one of five `cargo xtask golden` runs of lab PR
+    265, `sock.net-status-json.refused-connection` read `net status:
+    reading frame length header: Connection reset by peer` where its
+    golden file says `connecting to admin.sock: Connection refused`; the
+    matrix runs in every `cargo test`, so CI would have failed at random.
+    The cause is in the harness, not nn-admin: the case binds a listener
+    and closes it, leaving a socket file nobody listens on, while other
+    threads of the test start nn-admin for their cases. A child holds a
+    copy of every descriptor of the test from its fork to its exec
+    (`O_CLOEXEC` closes them at the exec only); when one was between the
+    two as the listener was closed, the listener lived on in it, the
+    case's connect went into its backlog, and the copy's close at the exec
+    reset the connection. Shown alone (a listener closed while a forked
+    child that has not exec'd holds it: the connect succeeds and the read
+    is reset; without the child: refused). The closed-pipe cases had the
+    same window: the read end closed before nn-admin starts could live on
+    in another thread's child, and nn-admin's write would have found a
+    reader.
+  - What changed: one lock in the harness (`harness::FORKS`): every child
+    the test starts (each case's nn-admin, the `-h` walk of the help
+    cases) is spawned holding it shared, from before its fork to after its
+    exec (`Command::spawn` returns once the child has exec'd); the
+    refused-connection listener is bound and closed, and a closed pipe made
+    and its read end closed, holding it exclusive — no child of the test is
+    between its fork and its exec while either exists. The error text is
+    not normalised and no golden file changed. The other socket cases,
+    checked for the same race: a copy of the live mock's listener or of an
+    accepted connection only delays an end of file by the fork-to-exec
+    window (the mock keeps its listener until nn-admin has exited, and
+    closes a connection only after reading every byte nn-admin sent, so no
+    close leaves unread data and resets the peer); no case connects and
+    exits without a request, and no golden file holds a read error or a
+    reset. `GOLDEN_REPLAY.md` §8 says how the cases are kept apart.
+  - Lab: host tests only (no guest, no root, no agent). Before the fix: the mechanism shown alone (a Unix listener closed while a forked child that has not exec'd holds it — the connect succeeds and the read is reset, `Connection reset by peer`; with no such child, `Connection refused`); the matrix on `main` 8df17fbb, 20 runs beside a fork storm: 0 failed (the race is rare: lab PR 265 saw it once in five golden runs). After it, the matrix's test binary run in a row by `loop-matrix.sh <worktree> <runs> <load> <log>` (the binary under `target/debug/deps/nn_admin_matrix-*`, each run its own process): 50 runs beside a fork storm (24 `while :; do /bin/true; done` loops under `timeout`, load average 42 on 24 cores), 0 failed, 17.3 to 24.1 s a run; 30 runs beside a parallel release build of the workspace (24 jobs, its own target directory), 0 failed, 9.2 to 13.0 s. Host, `set -o pipefail`, `CARGO_BUILD_JOBS=4`: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 74 suites, 3,171 passed, 0 failed, 15 ignored, in 193 s (`main`'s totals: no test added or removed); `cargo xtask golden` five times, each a process of its own: 27 tests passed each time, every golden file the same bytes before and after each run (sha256 of them all dbf57a09…, `main`'s) and the tree clean. The matrix still 2,703 cases, 9 to 10.5 s a run unloaded. Only this line changed after the gates' run; fmt and xtask's tests (the documentation's among them) run again on the final tree: pass.

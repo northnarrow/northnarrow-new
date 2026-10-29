@@ -461,6 +461,16 @@ request that makes it.
   `admin.sock` with nn-proto's frames. It answers each frame with the next
   reply of the case's script (a challenge with a fixed nonce, then the
   reply under test) and keeps what it read.
+- The cases run on several threads, and a child holds a copy of every
+  descriptor of the test from its fork to its exec. Lab PR 266b: every
+  child is started under one lock, held shared from before its fork to
+  after its exec, and the descriptors a case closes before nn-admin runs
+  (the listener of a socket nobody listens on, the read end of a closed
+  pipe) are made and closed holding it exclusive — no copy of them
+  outlives the close, so a refused connection is always `Connection
+  refused` (a copy left it in a listener's backlog, reset when the copy
+  closed: `Connection reset by peer`, once in five runs of lab PR 265's)
+  and a closed pipe always has no reader.
 - Golden files: `agent/tests/golden/nn-admin/expected/<area>.txt`, one per
   area (below). The `debug-trigger` build (the lab's) is not compiled into
   the test: its extra subcommand changes the help texts.
