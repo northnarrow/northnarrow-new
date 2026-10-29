@@ -1257,7 +1257,7 @@ fn assert_fifo_order(lanes: &[usize], order: &[usize]) {
 /// whole agent to run, so its source is pinned (comments left out).
 #[test]
 fn the_event_loop_wires_the_bus_as_modelled() {
-    let src = include_str!("../run_loop.rs");
+    let src = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/run_loop.rs"));
     let code: String = src
         .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
@@ -1299,7 +1299,10 @@ fn the_event_loop_wires_the_bus_as_modelled() {
 /// source is pinned (comments left out).
 #[test]
 fn the_event_loop_judges_each_event_as_of_its_time() {
-    let src = include_str!("../pipeline/process_event.rs");
+    let src = include_str!(concat!(
+        env!("NN_REPO_ROOT"),
+        "/agent/src/pipeline/process_event.rs"
+    ));
     let code: String = src
         .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
