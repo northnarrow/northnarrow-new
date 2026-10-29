@@ -576,7 +576,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         verified: &crate::boot::IntegrityVerified,
         pids: &[u32],
         keep: &[crate::anti_tamper::ExeIdentity],
-    ) -> Result<()> {
+    ) -> Result<crate::anti_tamper::AttachReport> {
         crate::anti_tamper::attach(verified, &mut self.ebpf, &self.bpf_guard, pids, keep)
     }
 }

@@ -4,14 +4,10 @@
 //! (`nn_core::impair`). The detector takes its host as a type parameter:
 //! the agent's `LinuxHost` gives it the process table, the
 //! trusted-installer window's grant and the kernel's `DEFENDER_PIDS`
-//! ([`DefenderMap`]). Here the detector is an alias on that host, and the
-//! detector `status` and the detection records read is published as before
-//! (the process-wide slot holds the agent's detector: it is the agent's,
-//! cut verbatim from `impair`).
-
-use std::sync::Arc;
-
-use nn_model::Event;
+//! ([`DefenderMap`]). Here the detector is an alias on that host. R11c (lab
+//! PR 264): the detector `status` and the detection records read is the one
+//! the start gives the admin socket and the detection store (it was
+//! published in a process-wide slot).
 
 use nn_linux::chain_host_linux::LinuxHost;
 
@@ -23,24 +19,6 @@ pub type DefenseDetector = nn_core::impair::DefenseDetector<LinuxHost>;
 /// The kernel map of the tools' processes ([`DefenseDetector::attach_map`]):
 /// nn-linux's (R09a, lab PR 253: the decision engine's host names it).
 pub use nn_linux::impair::DefenderMap;
-
-/// The agent's detector, for `status` ([`publish`]).
-static PUBLISHED: std::sync::OnceLock<Arc<DefenseDetector>> = std::sync::OnceLock::new();
-
-/// Make `detector` the one `status` reports (`main.rs`, once).
-pub fn publish(detector: &Arc<DefenseDetector>) {
-    let _ = PUBLISHED.set(Arc::clone(detector));
-}
-
-/// The published detector's counters; `None` before [`publish`].
-pub fn published_counts() -> Option<DefenseCounts> {
-    PUBLISHED.get().map(|d| d.counts())
-}
-
-/// [`DefenseDetector::sanction_of`] on the published detector.
-pub fn published_sanction(event: &Event) -> Option<String> {
-    PUBLISHED.get().and_then(|d| d.sanction_of(event))
-}
 
 /// The trusted-installer window's sanction (cut from `impair`'s tests by
 /// R08b, lab PR 251).

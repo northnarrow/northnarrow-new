@@ -241,9 +241,8 @@ pub(crate) fn machine(
     // window a stop or restart of the agent's own units is sanctioned (Low,
     // the window named; no posture move).
     defense_detector.set_installer_window(Arc::clone(installer_override));
-    // Lab PR 225: their counters in `status --key`.
-    northnarrow_agent::impact::publish(ransom_tracker);
-    northnarrow_agent::impair::publish(defense_detector);
+    // Lab PR 225: their counters in `status --key` — R11c (lab PR 264): the
+    // admin socket gets them from the start, no longer a published slot.
     info!("posture state machine initialized (state: OBSERVING)");
 
     // Beta Step 3: keep the watchdog PID exemption fresh. The watchdog

@@ -59,6 +59,7 @@ pub(crate) fn attest(
     hook_args_degraded: Option<String>,
     exploit_guard_degraded: Option<String>,
     exploit_guard: &Option<northnarrow_agent::sensors::epg::ExploitGuard>,
+    anti_tamper: &northnarrow_agent::anti_tamper::AttachReport,
     caps_degraded: Vec<String>,
     audit: checks::AuditOpen,
 ) -> Result<Attested> {
@@ -222,8 +223,8 @@ pub(crate) fn attest(
     // NN_ANTI_TAMPER_ALLOW_DEGRADED=1 and a missing observe hook, in the
     // signed chain with what is missing — the journal line was the only
     // trace.
-    for detail in northnarrow_agent::anti_tamper::take_degraded_boot_details() {
-        northnarrow_agent::boot::degradation::report("anti_tamper", &detail);
+    for detail in &anti_tamper.degraded {
+        northnarrow_agent::boot::degradation::report("anti_tamper", detail);
     }
     // External audit NN-AUD-098 / lab PR 164 / CMB-028: found before the
     // attach, signed here (lab PR 218: they waited for the subsystems'
@@ -447,6 +448,7 @@ pub(crate) fn stores(
     stale_combat: &Option<northnarrow_agent::combat::reconcile::StaleChain>,
     chain_anchor: &AnchorHandle,
     audit_log: &AuditHandle,
+    defense_detector: &Arc<northnarrow_agent::impair::DefenseDetector>,
 ) -> Stores {
     // BUG-026: ONE shared StateDirProtection for the rotating on-disk logs
     // under /var/lib/northnarrow (netflow + fim_drift share its dance
@@ -559,6 +561,10 @@ pub(crate) fn stores(
                 detections_rotation,
                 rotation_protection.clone(),
                 northnarrow_agent::detection_store::DEFAULT_QUEUE_CAP,
+                // Lab PR 225: a sanctioned security-tool finding names why
+                // (R11c, lab PR 264: the judge given here, no longer a
+                // published slot).
+                Some(Arc::clone(defense_detector)),
             ) {
                 Ok((sink, _writer)) => Some(sink),
                 Err(e) => {

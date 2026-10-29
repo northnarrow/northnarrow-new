@@ -40,6 +40,10 @@ pub(crate) struct Attached {
     /// unavailable) — its sampler's audit log, which the attest phase
     /// binds, and its response, which the response phase sets.
     pub(crate) exploit_guard: Option<northnarrow_agent::sensors::epg::ExploitGuard>,
+    /// R11c (lab PR 264): what the deny hooks' attach found — the deny
+    /// side, for the trust level and the manifest, and the degraded states,
+    /// signed by the attest phase (process-wide statics until then).
+    pub(crate) anti_tamper: northnarrow_agent::anti_tamper::AttachReport,
 }
 
 /// `BootPhase::Attach`: the eBPF object loads and the sensors attach
@@ -210,22 +214,25 @@ pub(crate) async fn load(
     // anti_tamper::attach). A kernel without `bpf` in its active LSMs was
     // refused by the preflight above (lab PR 218), or runs under that same
     // opt-in; hooks that attach and never run are the self-test's below.
-    if let Err(e) = sensor
+    let anti_tamper = match sensor
         .attach_anti_tamper(verified, &pids, &keep)
         .with_context(|| {
             format!(
                 "anti-tamper setup failed (agent_pid={agent_pid}) — \
                  refusing to start with a silently-absent protection"
             )
-        })
-    {
-        // R11b (lab PR 262): the deny hooks' shortfall refuses the start,
-        // signed; it is the attach's own result. The hooks that attached stay
-        // pinned: they protect the agent's files until the next start.
-        let why = format!("{e:#}");
-        error!(error = %why, "refusing to start: the deny hooks did not attach");
-        refusals.refuse(audit.log_mut(), Refusal::new("deny_hooks", why));
-    }
+        }) {
+        Ok(report) => report,
+        Err(e) => {
+            // R11b (lab PR 262): the deny hooks' shortfall refuses the start,
+            // signed; it is the attach's own result. The hooks that attached
+            // stay pinned: they protect the agent's files until the next
+            // start.
+            let why = format!("{e:#}");
+            error!(error = %why, "refusing to start: the deny hooks did not attach");
+            refusals.refuse(audit.log_mut(), Refusal::new("deny_hooks", why));
+        }
+    };
     boot.done(BootStep::AntiTamper)?;
     // Lab PR 219: the exploit post-condition guard, attached before the
     // agent's programs are recorded as its own (DEP-006), in detect mode
@@ -263,12 +270,17 @@ pub(crate) async fn load(
         net_bufs,
         exploit_guard_degraded,
         exploit_guard,
+        anti_tamper,
     })
 }
 
 /// What [`self_test`] measured.
 pub(crate) struct SelfTested {
     pub(crate) self_test: northnarrow_agent::boot::deny_selftest::SelfTestOutcome,
+    /// R11c (lab PR 264): the boot's measurements the trust level is
+    /// computed from (the manifest's, the admin socket's status); they were
+    /// a process-wide static this phase set.
+    pub(crate) trust_inputs: northnarrow_agent::boot::trust::TrustInputs,
 }
 
 /// `BootPhase::SelfTest` (lab PR 218, external review AR-09 / G-12): one
@@ -276,6 +288,7 @@ pub(crate) struct SelfTested {
 /// run refuse the start (signed, `refusals`: into `audit`, the log the
 /// integrity phase opened) unless the degraded mode is asked for. It needs
 /// the attached hooks: after the attach, by its nature.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn self_test(
     boot: &mut BootSequence,
     refusals: &refusal::Context<'_>,
@@ -283,6 +296,7 @@ pub(crate) fn self_test(
     allow_degraded: bool,
     bpf_lsm_state: &northnarrow_agent::boot::lsm::BpfLsm,
     detect_only: bool,
+    anti_tamper: &northnarrow_agent::anti_tamper::AttachReport,
 ) -> Result<SelfTested> {
     // Lab PR 218 (external review AR-09 / G-12): one deny hook exercised
     // against the agent itself — an unprotected child signals it and must
@@ -309,20 +323,21 @@ pub(crate) fn self_test(
     if let Some(detail) = &self_test_detail {
         northnarrow_agent::boot::degradation::report("deny_self_test", detail);
     }
-    {
-        let deny = northnarrow_agent::anti_tamper::deny_report().unwrap_or_default();
-        northnarrow_agent::boot::trust::set_boot_inputs(
-            northnarrow_agent::boot::trust::TrustInputs {
-                bpf_lsm: bpf_lsm_state.clone(),
-                deny_expected: deny.expected,
-                deny_attached: deny.attached,
-                self_test: self_test.clone(),
-                detect_only,
-            },
-        );
-    }
+    let trust_inputs = {
+        let deny = anti_tamper.deny.clone().unwrap_or_default();
+        northnarrow_agent::boot::trust::TrustInputs {
+            bpf_lsm: bpf_lsm_state.clone(),
+            deny_expected: deny.expected,
+            deny_attached: deny.attached,
+            self_test: self_test.clone(),
+            detect_only,
+        }
+    };
     boot.done(BootStep::DenySelfTest)?;
-    Ok(SelfTested { self_test })
+    Ok(SelfTested {
+        self_test,
+        trust_inputs,
+    })
 }
 
 /// External audit DEP-006: where the ids of the agent's loaded BPF programs

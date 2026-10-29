@@ -97,17 +97,47 @@ pub fn kernel_release() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// The signed manifest of this boot and its row's `entry_hash`.
-static CURRENT: Mutex<Option<(CapabilityManifest, Option<String>)>> = Mutex::new(None);
+/// The signed manifest of this boot and its row's `entry_hash`, for
+/// `nn-admin capabilities` (R11c, lab PR 264: the slot the start gives the
+/// run phase, which signs into it, and the admin socket, which reads it;
+/// it was a process-wide `CURRENT`).
+#[derive(Clone, Debug, Default)]
+pub struct SignedManifest(Arc<Mutex<Option<Signed>>>);
 
-/// Sign `manifest` in the audit chain (when there is one) and keep it for
-/// `nn-admin capabilities`. Returns the row's `entry_hash`.
+/// A signed manifest and its row's `entry_hash` (`None`: not signed, no
+/// audit log).
+type Signed = (CapabilityManifest, Option<String>);
+
+impl SignedManifest {
+    /// Sign `manifest` (see [`sign`]) and keep it here.
+    pub fn sign(
+        &self,
+        audit_log: Option<&Arc<Mutex<AuditLog>>>,
+        manifest: CapabilityManifest,
+    ) -> Option<String> {
+        let entry_hash = sign(audit_log, &manifest);
+        *self.0.lock() = Some((manifest, entry_hash.clone()));
+        entry_hash
+    }
+
+    /// The manifest of this boot for `nn-admin capabilities`: one JSON
+    /// object, `{"entry_hash": …, "manifest": {…}}`. `None` before the boot
+    /// signed it.
+    pub fn current_json(&self) -> Option<String> {
+        let cur = self.0.lock();
+        let (m, hash) = cur.as_ref()?;
+        serde_json::to_string(&serde_json::json!({ "entry_hash": hash, "manifest": m })).ok()
+    }
+}
+
+/// Sign `manifest` in the audit chain (when there is one). Returns the
+/// row's `entry_hash`.
 pub fn sign(
     audit_log: Option<&Arc<Mutex<AuditLog>>>,
-    manifest: CapabilityManifest,
+    manifest: &CapabilityManifest,
 ) -> Option<String> {
     let entry_hash = audit_log.and_then(|log| {
-        let extra = match serde_json::to_value(&manifest) {
+        let extra = match serde_json::to_value(manifest) {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "capability manifest not serialisable");
@@ -143,16 +173,7 @@ pub fn sign(
         entry_hash = entry_hash.as_deref().unwrap_or("(not signed: no audit log)"),
         "capability manifest of this boot"
     );
-    *CURRENT.lock() = Some((manifest, entry_hash.clone()));
     entry_hash
-}
-
-/// The manifest of this boot for `nn-admin capabilities`: one JSON object,
-/// `{"entry_hash": …, "manifest": {…}}`. `None` before the boot signed it.
-pub fn current_json() -> Option<String> {
-    let cur = CURRENT.lock();
-    let (m, hash) = cur.as_ref()?;
-    serde_json::to_string(&serde_json::json!({ "entry_hash": hash, "manifest": m })).ok()
 }
 
 #[cfg(test)]
@@ -202,7 +223,9 @@ mod tests {
         let log = Arc::new(Mutex::new(
             AuditLog::open(&dir.path().join("audit.log"), key, [3u8; 16]).unwrap(),
         ));
-        let hash = sign(Some(&log), sample()).expect("signed");
+        let current = SignedManifest::default();
+        assert!(current.current_json().is_none(), "nothing signed yet");
+        let hash = current.sign(Some(&log), sample()).expect("signed");
         let body = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
         let rows: Vec<crate::audit::AuditEntry> = body
             .lines()
@@ -214,7 +237,8 @@ mod tests {
         let back: CapabilityManifest = serde_json::from_value(rows[0].extra.clone()).unwrap();
         assert_eq!(back, sample());
         crate::audit::verify_chain(&rows, &pk).expect("the chain verifies");
-        let cur: serde_json::Value = serde_json::from_str(&current_json().unwrap()).unwrap();
+        let cur: serde_json::Value =
+            serde_json::from_str(&current.current_json().unwrap()).unwrap();
         assert_eq!(cur["entry_hash"], hash);
         assert_eq!(cur["manifest"]["trust_level"], 3);
     }

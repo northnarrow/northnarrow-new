@@ -45,6 +45,8 @@
 //! read: the attach takes the proof only the integrity phase holds, the
 //! event loop the proof of READY only `ready` makes.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 
@@ -210,6 +212,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         net_bufs,
         exploit_guard_degraded,
         exploit_guard,
+        anti_tamper,
     } = attach::load(
         &cli,
         &mut boot,
@@ -220,13 +223,17 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &mut audit,
     )
     .await?;
-    let attach::SelfTested { self_test } = attach::self_test(
+    let attach::SelfTested {
+        self_test,
+        trust_inputs,
+    } = attach::self_test(
         &mut boot,
         &refusals,
         &mut audit,
         allow_degraded,
         &bpf_lsm_state,
         detect_only,
+        &anti_tamper,
     )?;
     let evidence::Attested {
         chain_anchor,
@@ -246,6 +253,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         hook_args_degraded,
         exploit_guard_degraded,
         &exploit_guard,
+        &anti_tamper,
         caps_degraded,
         audit,
     )?;
@@ -338,7 +346,14 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         netflow_rotation,
         detection_sink,
         detection_admin_state,
-    } = evidence::stores(&cli, &mut sensor, &stale_combat, &chain_anchor, &audit_log);
+    } = evidence::stores(
+        &cli,
+        &mut sensor,
+        &stale_combat,
+        &chain_anchor,
+        &audit_log,
+        &defense_detector,
+    );
     let fim_admin_state = fim::start(
         &cli,
         agent_id,
@@ -374,6 +389,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         netflow_blocklist,
         chain_store,
     );
+    // R11c (lab PR 264): the boot's signed capability manifest, signed by
+    // the run phase and read by the admin socket's status.
+    let capability_manifest = northnarrow_agent::boot::manifest::SignedManifest::default();
     admin::start(
         &cli,
         &isolator,
@@ -390,7 +408,13 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &combat.ladder,
         &detect_only_source,
         &exempt,
-        northnarrow_agent::admin_socket::AdminHandles { rule_policy },
+        northnarrow_agent::admin_socket::AdminHandles {
+            rule_policy,
+            trust_inputs: Some(trust_inputs.clone()),
+            capability_manifest: capability_manifest.clone(),
+            ransom_tracker: Some(Arc::clone(&ransom_tracker)),
+            defense_detector: Some(Arc::clone(&defense_detector)),
+        },
     );
     let tasks::Tasks {
         execq_handle,
@@ -410,9 +434,12 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &mut boot,
         bpf_lsm_state,
         self_test,
+        &trust_inputs,
+        &anti_tamper,
         host_checks,
         detect_only,
         &audit_log,
+        &capability_manifest,
     )?;
     let stopped = crate::run_loop::run(
         armed,
@@ -706,7 +733,7 @@ mod tests {
             at("RuleEngine::with_default_rules_and_net(") > at("boot.enter(BootPhase::Subsystems)"),
             "the rule engine in the subsystems phase, after the audit log"
         );
-        let manifest = at("boot::manifest::sign(");
+        let manifest = at("capability_manifest.sign(");
         assert!(manifest > at("boot.enter(BootPhase::Run)"));
         assert!(manifest < at("sd_notify::ready()"));
         assert!(at("boot.done(BootStep::CapabilityManifest)") > manifest);
@@ -880,7 +907,7 @@ mod tests {
             1
         );
         assert!(release > main.find("sd_notify::ready()").expect("READY"));
-        assert!(release > main.find("boot::manifest::sign(").expect("manifest"));
+        assert!(release > main.find("capability_manifest.sign(").expect("manifest"));
     }
 
     /// Lab PR 231: only free memory goes back: what is still allocated is

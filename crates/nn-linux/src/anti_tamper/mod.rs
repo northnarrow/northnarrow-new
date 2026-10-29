@@ -223,11 +223,26 @@ const PTRACE_HOOK: &str = "ptrace_access_check";
 /// integrity check of the start passed ([`crate::boot::IntegrityVerified`]):
 /// the pins and the deny hooks' attach take it, as the load does.
 pub fn attach(
+    verified: &crate::boot::IntegrityVerified,
+    ebpf: &mut Ebpf,
+    bpf_guard: &bpf_defense::BpfGuard,
+    pids: &[u32],
+    keep: &[ExeIdentity],
+) -> Result<AttachReport> {
+    let mut report = AttachReport::default();
+    attach_reporting(verified, ebpf, bpf_guard, pids, keep, &mut report)?;
+    Ok(report)
+}
+
+/// [`attach`], what it found going to `report` (R11c, lab PR 264: it went
+/// to process-wide statics the later phases read).
+fn attach_reporting(
     _verified: &crate::boot::IntegrityVerified,
     ebpf: &mut Ebpf,
     bpf_guard: &bpf_defense::BpfGuard,
     pids: &[u32],
     keep: &[ExeIdentity],
+    report: &mut AttachReport,
 ) -> Result<()> {
     // The agent first: the scan below reads `/proc/<pid>/exe` of protected
     // processes, which the previous agent's pinned ptrace_access_check
@@ -382,8 +397,13 @@ pub fn attach(
                 "vmlinux BTF unavailable ({e:#}) — no LSM hook can attach: kernel built \
                  without CONFIG_DEBUG_INFO_BTF, or /sys/kernel/btf hidden"
             )];
-            note_deny_report(LSM_DENY_HOOKS_EXPECTED, 0, &infra, &[]);
-            return deny_shortfall(LSM_DENY_HOOKS_EXPECTED, 0, &[], &infra);
+            report.deny = Some(DenyReport {
+                expected: LSM_DENY_HOOKS_EXPECTED,
+                attached: 0,
+                missing: infra.to_vec(),
+                observe_missing: Vec::new(),
+            });
+            return deny_shortfall(LSM_DENY_HOOKS_EXPECTED, 0, &[], &infra, report);
         }
     };
 
@@ -537,7 +557,7 @@ pub fn attach(
         ),
     }
 
-    report_lsm_health(deny_expected, &deny, &observe_failures)
+    report_lsm_health(deny_expected, &deny, &observe_failures, report)
 }
 
 /// External audit ATP-016 (NN-AUD-264): what the boot's deny side lacks,
@@ -578,17 +598,20 @@ impl DenyHealth {
     }
 }
 
-/// External audit ATP-016: what this boot runs without — a deny shortfall
-/// started under [`ALLOW_DEGRADED_ENV`], a missing observe hook — for one
-/// signed `subsystem_degraded` each once the audit log is open
-/// ([`take_degraded_boot_details`]). The journal line alone was the only
-/// trace of a degraded start.
-static DEGRADED_BOOT: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
-
-/// The degraded states [`attach`] found this boot (each once), for the
-/// signed chain.
-pub fn take_degraded_boot_details() -> Vec<String> {
-    std::mem::take(&mut *DEGRADED_BOOT.lock())
+/// What [`attach`] found (R11c, lab PR 264: it returns it, for the start's
+/// later phases — the deny side for the trust level and the capability
+/// manifest, the degraded states for the signed chain; they were
+/// process-wide statics, `DENY_REPORT` and `DEGRADED_BOOT`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AttachReport {
+    /// The deny side of this boot's attach.
+    pub deny: Option<DenyReport>,
+    /// External audit ATP-016: what this boot runs without — a deny
+    /// shortfall started under [`ALLOW_DEGRADED_ENV`], a missing observe
+    /// hook — for one signed `subsystem_degraded` each once the audit log
+    /// is open. The journal line alone was the only trace of a degraded
+    /// start.
+    pub degraded: Vec<String>,
 }
 
 /// Lab PR 218: the deny side of this boot's attach, for the trust level and
@@ -622,22 +645,6 @@ impl DenyReport {
             observe_missing: named(observe_failures),
         }
     }
-}
-
-static DENY_REPORT: parking_lot::Mutex<Option<DenyReport>> = parking_lot::Mutex::new(None);
-
-fn note_deny_report(expected: usize, attached: usize, missing: &[String], observe: &[String]) {
-    *DENY_REPORT.lock() = Some(DenyReport {
-        expected,
-        attached,
-        missing: missing.to_vec(),
-        observe_missing: observe.to_vec(),
-    });
-}
-
-/// What [`attach`] found on the deny side (`None` before it ran).
-pub fn deny_report() -> Option<DenyReport> {
-    DENY_REPORT.lock().clone()
 }
 
 fn named(entries: &[(&'static str, String)]) -> Vec<String> {
@@ -701,9 +708,10 @@ fn report_lsm_health(
     deny_expected: usize,
     deny: &DenyHealth,
     observe_failures: &[(&'static str, String)],
+    report: &mut AttachReport,
 ) -> Result<()> {
     let deny_attached = deny_expected.saturating_sub(deny.missing.len());
-    *DENY_REPORT.lock() = Some(DenyReport::of(deny_expected, deny, observe_failures));
+    report.deny = Some(DenyReport::of(deny_expected, deny, observe_failures));
     if deny.is_empty() && observe_failures.is_empty() {
         info!(
             deny_attached,
@@ -713,7 +721,7 @@ fn report_lsm_health(
     }
     let observe_failed = named(observe_failures);
     if !observe_failed.is_empty() {
-        DEGRADED_BOOT.lock().push(format!(
+        report.degraded.push(format!(
             "anti-tamper observe hooks not attached ({}): their telemetry is absent this boot \
              (module-load records for R018, the bpf() observer, the role liveness watch); no \
              deny is missing for it",
@@ -734,6 +742,7 @@ fn report_lsm_health(
         deny_attached,
         &named(&deny.missing),
         &named(&deny.infra),
+        report,
     )
 }
 
@@ -747,11 +756,19 @@ fn deny_shortfall(
     deny_attached: usize,
     missing: &[String],
     infra: &[String],
+    report: &mut AttachReport,
 ) -> Result<()> {
     let allow_degraded = std::env::var(ALLOW_DEGRADED_ENV)
         .map(|v| v == "1")
         .unwrap_or(false);
-    decide_shortfall(allow_degraded, deny_expected, deny_attached, missing, infra)
+    decide_shortfall(
+        allow_degraded,
+        deny_expected,
+        deny_attached,
+        missing,
+        infra,
+        report,
+    )
 }
 
 /// [`deny_shortfall`] with the opt-in read: refuse, or record the degraded
@@ -762,6 +779,7 @@ fn decide_shortfall(
     deny_attached: usize,
     missing: &[String],
     infra: &[String],
+    report: &mut AttachReport,
 ) -> Result<()> {
     error!(
         deny_attached,
@@ -788,7 +806,7 @@ fn decide_shortfall(
              {} of {} deny hooks attached",
             deny_attached, deny_expected
         );
-        DEGRADED_BOOT.lock().push(format!(
+        report.degraded.push(format!(
             "anti-tamper running degraded ({ALLOW_DEGRADED_ENV}=1): {what}"
         ));
         return Ok(());
@@ -1289,8 +1307,13 @@ mod tests {
         }
         let mut deny = DenyHealth::default();
         deny.missing_hook("protected_create_deny", "verifier rejected".to_string());
-        let err = report_lsm_health(LSM_DENY_HOOKS_EXPECTED + 2, &deny, &[])
-            .expect_err("a missing create deny must refuse to start");
+        let err = report_lsm_health(
+            LSM_DENY_HOOKS_EXPECTED + 2,
+            &deny,
+            &[],
+            &mut AttachReport::default(),
+        )
+        .expect_err("a missing create deny must refuse to start");
         assert!(format!("{err:#}").contains("17 of 18"), "{err:#}");
     }
 
@@ -1322,6 +1345,7 @@ mod tests {
                 LSM_DENY_HOOKS_EXPECTED + fs.optional_present,
                 &deny,
                 &fs.observe_failures,
+                &mut AttachReport::default(),
             )
             .expect_err("an FS bootstrap failure refuses to start");
             let msg = format!("{err:#}");
@@ -1351,7 +1375,13 @@ mod tests {
         deny.infra_failure("filesystem::register_bpffs_pins", "listing".to_string());
         let msg = format!(
             "{:#}",
-            report_lsm_health(LSM_DENY_HOOKS_EXPECTED, &deny, &[]).unwrap_err()
+            report_lsm_health(
+                LSM_DENY_HOOKS_EXPECTED,
+                &deny,
+                &[],
+                &mut AttachReport::default()
+            )
+            .unwrap_err()
         );
         assert!(msg.contains("16 of 16 deny hooks"), "{msg}");
         assert!(msg.contains("2 protection step(s) failed"), "{msg}");
@@ -1365,7 +1395,13 @@ mod tests {
         assert_eq!(deny.missing.len(), 1, "one hook, two reasons");
         let msg = format!(
             "{:#}",
-            report_lsm_health(LSM_DENY_HOOKS_EXPECTED, &deny, &[]).unwrap_err()
+            report_lsm_health(
+                LSM_DENY_HOOKS_EXPECTED,
+                &deny,
+                &[],
+                &mut AttachReport::default()
+            )
+            .unwrap_err()
         );
         assert!(msg.contains("15 of 16 deny hooks"), "{msg}");
         assert!(
@@ -1375,15 +1411,18 @@ mod tests {
     }
 
     /// External audit ATP-016: a degraded start and a missing observe hook
-    /// are kept for the signed chain, with what is missing.
+    /// are kept for the signed chain, with what is missing. R11c (lab PR
+    /// 264): in the attach's own report, so the test reads exactly its two.
     #[test]
     fn a_degraded_start_is_kept_for_the_signed_chain() {
+        let mut report = AttachReport::default();
         decide_shortfall(
             true,
             16,
             15,
             &["protected_link_deny: nn-test-degraded-264".to_string()],
             &[],
+            &mut report,
         )
         .expect("the opt-in starts degraded");
         let deny = DenyHealth::default();
@@ -1394,9 +1433,20 @@ mod tests {
                 "module_load_data_observe",
                 "nn-test-observe-264".to_string(),
             )],
+            &mut report,
         )
         .expect("an observe shortfall is not fatal");
-        let kept = take_degraded_boot_details();
+        let kept = report.degraded;
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert_eq!(
+            report.deny,
+            Some(DenyReport {
+                expected: 16,
+                attached: 16,
+                missing: Vec::new(),
+                observe_missing: vec!["module_load_data_observe: nn-test-observe-264".to_string()],
+            })
+        );
         assert!(
             kept.iter()
                 .any(|d| d.contains("15 of 16 deny hooks attached and armed")
@@ -1423,6 +1473,7 @@ mod tests {
             0,
             &[],
             &["vmlinux BTF unavailable (test)".to_string()],
+            &mut AttachReport::default(),
         )
         .expect_err("a deny-hook shortfall must refuse to start");
         let msg = format!("{err:#}");

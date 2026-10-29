@@ -145,9 +145,17 @@ pub(super) fn dispatch(
             AdminMessage::StatusResponse(public_status(posture, isolator, response_state))
         }
 
-        AdminMessage::TelemetryStatusRequest(req) => AdminMessage::TelemetryStatusResponse(
-            dispatch_telemetry_status(req, auth, posture, isolator, response_state, fps_out),
-        ),
+        AdminMessage::TelemetryStatusRequest(req) => {
+            AdminMessage::TelemetryStatusResponse(dispatch_telemetry_status(
+                req,
+                auth,
+                posture,
+                isolator,
+                response_state,
+                handles,
+                fps_out,
+            ))
+        }
 
         // Lab PR 216: unsigned, the event loop's round count — the
         // watchdog's check that the loop moves, not only this socket.

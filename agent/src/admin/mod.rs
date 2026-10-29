@@ -291,7 +291,7 @@ pub struct ResponseAdminState {
 /// present, like [`AdminReadPaths`]; `Default` is a handle of its own for
 /// each field (tests and the legacy serve entry points: nothing the start
 /// made reaches them).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AdminHandles {
     /// The signed per-rule response policy in force: the start's handle,
     /// the one the engine and the posture read. `config overlay set` of a
@@ -299,6 +299,17 @@ pub struct AdminHandles {
     /// engine's and the posture's next event (lab PR 236; it was
     /// `rule_policy::install_global`).
     pub rule_policy: crate::decision::rule_policy::PolicyHandle,
+    /// The boot's measurements the trust level is computed from (`None`:
+    /// nothing measured); the status adds the degradations recorded since.
+    /// It was the process-wide `trust::BOOT_INPUTS`.
+    pub trust_inputs: Option<crate::boot::trust::TrustInputs>,
+    /// The boot's signed capability manifest, once the run phase signed it
+    /// (it was the process-wide `manifest::CURRENT`).
+    pub capability_manifest: crate::boot::manifest::SignedManifest,
+    /// Lab PR 225: the ransomware tracker and the security-tool judge whose
+    /// counters the status reports (they were published process-wide).
+    pub ransom_tracker: Option<Arc<crate::impact::RansomTracker>>,
+    pub defense_detector: Option<Arc<crate::impair::DefenseDetector>>,
 }
 
 /// External audit NN-AUD-082 — the files the read verbs serve, from the

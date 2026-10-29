@@ -2181,7 +2181,15 @@ fn the_signed_telemetry_status_needs_a_read_role() {
         let req = telemetry_req(&signing, &auth, agent_id);
         let msg = AdminMessage::TelemetryStatusRequest(req.clone());
         let mut fps = Vec::new();
-        let r = dispatch_telemetry_status(req, &auth, &posture, &isolator, Some(&state), &mut fps);
+        let r = dispatch_telemetry_status(
+            req,
+            &auth,
+            &posture,
+            &isolator,
+            Some(&state),
+            &AdminHandles::default(),
+            &mut fps,
+        );
         assert_eq!(r.result, expected, "{roles}");
         match expected {
             AdminResult::Success => {
@@ -2239,7 +2247,15 @@ fn the_signed_telemetry_status_refuses_another_operation() {
     let isolator = NetworkIsolator::new(rules_path()).unwrap();
     let posture = PostureMachine::new();
     let mut fps = Vec::new();
-    let r = dispatch_telemetry_status(req, &auth, &posture, &isolator, None, &mut fps);
+    let r = dispatch_telemetry_status(
+        req,
+        &auth,
+        &posture,
+        &isolator,
+        None,
+        &AdminHandles::default(),
+        &mut fps,
+    );
     assert_eq!(r.result, AdminResult::UnknownOperation);
     assert!(r.status.is_none());
 }

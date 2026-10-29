@@ -2075,6 +2075,7 @@ fn a_signed_policy_set_applies_at_once_to_the_engine_the_posture_and_the_executo
     let mut fx = Fixture::new(&keys());
     fx.handles = AdminHandles {
         rule_policy: rule_policy.clone(),
+        ..AdminHandles::default()
     };
 
     // R020's reverse shell: the shell of a web server, stdio on a socket it
