@@ -858,6 +858,82 @@ mod tests {
         assert_eq!(rest, [(10, 0), (11, 0), (12, 0)]);
     }
 
+    /// Under concurrent senders of every class and a slow receiver: every
+    /// event sent is taken or counted as dropped, never both and never lost;
+    /// inside a class each sender's events keep their order; a tamper event
+    /// is never dropped while its wait allows the receiver to free a slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_senders_keep_each_class_fifo_and_account_for_every_event() {
+        let mut specs = SPECS;
+        for (q, c) in specs.iter_mut().zip([64, 64, 128, 128]) {
+            q.capacity = c;
+        }
+        let (tx, mut rx) = channel_with(specs);
+        const PER: u32 = 3_000;
+        let mut senders = Vec::new();
+        for s in 0..4u32 {
+            let tx = tx.clone();
+            senders.push(tokio::spawn(async move {
+                for i in 0..PER {
+                    let seq = s * 1_000_000 + i;
+                    let e = match i % 4 {
+                        0 => denial(seq),
+                        1 => spawn(seq),
+                        2 => open(seq),
+                        _ => Event::NetListener(nn_model::telemetry::NetListenerEvent {
+                            timestamp_ns: 0,
+                            family: 2,
+                            bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                            bind_port: 1,
+                            proto: 6,
+                            pid: seq,
+                            uid: 0,
+                            comm: String::new(),
+                            exe: None,
+                        }),
+                    };
+                    tx.send(e).await.unwrap();
+                }
+            }));
+        }
+        drop(tx);
+        let mut last: std::collections::HashMap<(usize, u32), u32> = Default::default();
+        let mut taken = [0u64; QUEUES];
+        while let Some(r) = rx.recv().await {
+            let (p, pid) = match &r.event {
+                Event::NetListener(l) => (Priority::P3, l.pid),
+                e => (Priority::of_event(e), pid_of(e)),
+            };
+            let (sender, i) = (pid / 1_000_000, pid % 1_000_000);
+            if let Some(prev) = last.insert((p.index(), sender), i) {
+                assert!(prev < i, "{p:?} sender {sender}: {prev} then {i}");
+            }
+            taken[p.index()] += 1;
+            if taken.iter().sum::<u64>() % 97 == 0 {
+                tokio::time::sleep(Duration::from_micros(200)).await;
+            }
+        }
+        for h in senders {
+            h.await.unwrap();
+        }
+        let snap = rx.stats().snapshot();
+        for q in &snap {
+            let i = q.priority.index();
+            assert_eq!(q.stats.enqueued, taken[i], "{:?}", q.priority);
+            assert_eq!(
+                q.stats.enqueued + q.stats.dropped,
+                u64::from(4 * PER / 4),
+                "{:?}: every event queued or dropped",
+                q.priority
+            );
+            assert_eq!(q.stats.depth, 0);
+        }
+        assert_eq!(
+            snap[0].stats.dropped, 0,
+            "P0 waits 50 ms; the receiver frees slots well within it"
+        );
+    }
+
     /// The receiver ends once every sender is gone; senders fail once the
     /// receiver is.
     #[tokio::test]
