@@ -60,14 +60,17 @@ pub(crate) fn check(
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
     early_registration_failed: bool,
     refused: Option<Refusal>,
+    signing_key: &northnarrow_agent::keys::BootKey,
 ) -> Result<Integrity> {
     // R11b (lab PR 262): what signs a refusal before the install manifest
-    // is checked (after it, its verdict too).
+    // is checked (after it, its verdict too); the review of #468, R4: with
+    // the start's one key.
     let unchecked = refusal::Context {
         cli,
         identity,
         overlay_gate,
         integrity: refusal::UNCHECKED,
+        key: signing_key,
     };
     // The eBPF object, the state directory or the BTF offsets refused the
     // start in the preflight: signed now that the identity is read and the
@@ -289,7 +292,7 @@ pub(crate) fn check(
     let audit = checks::audit_log(
         boot,
         &cli.audit_log_file,
-        &cli.signing_key_file,
+        signing_key,
         identity.id,
         early_registration_failed,
     )?;

@@ -116,11 +116,19 @@ impl BootPhase {
 pub enum BootStep {
     /// Lab PR 265 (review #466 F4-bis): no mount laid over the agent's own
     /// directories but a bind of a directory onto itself
-    /// ([`continuity::mounts_over`]).
+    /// ([`continuity::mounts_over`]), one bpffs instance under the pins and,
+    /// with the previous agent's pins there, the directories that agent
+    /// protected ([`continuity::view_findings`]).
     AgentMounts,
-    /// Lab PR 265 (review #466 F4-bis): the agent's signing key is there,
-    /// or nothing says the install had one ([`continuity::prior_identity`]):
-    /// only a first install mints one.
+    /// Lab PR 265 (review #466 F4-bis): the agent's signing key decided once
+    /// ([`checks::KeyDecision`], the review of #468 R4) — with the previous
+    /// agent's pins there, a restart, which keeps its key, id and audit log
+    /// ([`continuity::restart_findings`]); otherwise the key there, or
+    /// nothing in the start's view that says the install had one
+    /// ([`continuity::prior_identity`]). The checks do not cover everything
+    /// that can make a key look absent (`docs/operator/BOOT_INTEGRITY.md`
+    /// §1.1: a reboot with a persistent mount or drop-in); the key is
+    /// minted only on a [`checks::FirstInstall`], once.
     SigningIdentity,
     /// The embedded eBPF object is real and intact.
     EbpfObject,
@@ -259,6 +267,10 @@ pub enum BootOrderError {
     /// Review #466 F3: a second [`BootSequence::begin`] in one process.
     #[error("a boot sequence was begun already in this process: one start, one sequence")]
     Begun,
+    /// The review of #468, R4: a second decision on the signing key in one
+    /// sequence ([`checks::signing_identity`]): one start, one decision.
+    #[error("the signing key was decided already in this boot sequence: one start, one decision")]
+    KeyDecided,
 }
 
 /// The proof that every integrity check of the start passed: the only way

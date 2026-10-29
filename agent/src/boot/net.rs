@@ -32,6 +32,7 @@ pub(crate) fn start(
     chain_store: Arc<
         parking_lot::Mutex<northnarrow_agent::decision::correlation::CorrelationStore>,
     >,
+    signing_key: &northnarrow_agent::keys::BootKey,
 ) {
     // ── Tappa 10 N9 — net drain subsystem boot ─────────────────────
     //
@@ -59,10 +60,10 @@ pub(crate) fn start(
     {
         use northnarrow_agent::net::drain::{drain_loop, NetFlowDb, NetListenerDb};
 
-        let netflow_db_opt = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
-            &cli.signing_key_file,
-        )
-        .and_then(|key| {
+        // The review of #468, R4: copies of the start's one key, no load of
+        // their own.
+        let key = || signing_key.signer().map_err(anyhow::Error::from);
+        let netflow_db_opt = match key().and_then(|key| {
             NetFlowDb::open(
                 &cli.netflow_file,
                 key,
@@ -95,10 +96,8 @@ pub(crate) fn start(
                 None
             }
         };
-        let listener_db_opt = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
-            &cli.signing_key_file,
-        )
-        .and_then(|key| NetListenerDb::open(&cli.netflow_listeners_file, key, agent_id))
+        let listener_db_opt = match key()
+            .and_then(|key| NetListenerDb::open(&cli.netflow_listeners_file, key, agent_id))
         {
             Ok(mut db) => {
                 if let (Some(r), Some(log)) = (db.take_tail_repair(), audit_log.as_ref()) {
