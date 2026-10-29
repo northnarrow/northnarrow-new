@@ -5,38 +5,46 @@
 //! Each class of events has a queue of its own ([`nn_core::bus`]: the
 //! classes, the queues, the take order). A sender — every ring pump, the
 //! FIM and network drains, the file-open sensor, the exploit guard — sends
-//! an event into its class's queue; a full queue does what the class says
-//! ([`nn_core::bus::when_full`]): P0 (tamper) waits at most 50 ms for room
-//! while its kernel ring absorbs, P1 (process) 10 ms, then the event is
-//! dropped and counted; P2 (file) and P3 (network) drop the new event at
-//! once, except the file events other than `FileOpen`, which wait for room
-//! as every source waited before (review 75). The wait is fair: a waiting
-//! sender takes the next free slot of its queue before a sender that comes
-//! later. The receiver — the event loop, the one consumer — takes by strict
-//! priority with aging, FIFO inside a class; a flood of one class no longer
-//! holds the others back, and the kernel no longer drops a tamper record
-//! because a flood of opens filled the shared queue (plan §1.5, EXP-13).
+//! an event into its class's queue; a full queue does what the event's
+//! class says ([`nn_core::bus::when_full`]): an `FsProtectDenial` waits at
+//! most 50 ms for room while its kernel ring absorbs, a P1 (process) event
+//! 10 ms, then the event is dropped and counted; P2 (file) and P3
+//! (network) drop the new event at once. The other tamper events (review
+//! #471 M1) and the file events other than `FileOpen` (review 75) wait for
+//! room as every source waited before; and the opens fill at most
+//! [`core_bus::FILE_OPEN_SHARE`] of P2 (review #471 B3), so a flood of them
+//! neither holds a FIM record seconds behind it nor makes the FIM drain
+//! wait. The wait is fair: a waiting sender takes the next free slot of its
+//! queue before a sender that comes later. The receiver — the event loop,
+//! the one consumer — takes P0 first, then P1–P3 by weighted shares
+//! ([`core_bus::SHARE_WEIGHTS`], review #471 A2), FIFO inside a class; a
+//! flood of one class no longer holds the others back, and the kernel no
+//! longer drops a tamper record because a flood of opens filled the shared
+//! queue (plan §1.5, EXP-13).
 //!
 //! What the receiver hands over with an event (lab PR 267, the property test
-//! of `agent/src/decision/golden.rs`): a tamper event taken ahead of execs
-//! still queued in P1 brings them along ([`Received::overtaken`]), and the
-//! process lineage learns them first ([`BusReceiver::recv_with`]), so the
-//! tamper event is judged on the process tree of every exec that reached
-//! the bus before it — as on a single queue — and the rules' own tree learns
-//! them at the event loop (`RuleEngine::observe_arrival`).
+//! of `agent/src/decision/golden.rs`): an event taken ahead of execs still
+//! queued in P1 brings them along ([`Received::overtaken`]), and the process
+//! lineage learns them first ([`BusReceiver::recv_with`]), so the event is
+//! judged on the process tree of every exec that reached the bus before it
+//! — as on a single queue — and the rules' own tree learns them at the
+//! event loop (`RuleEngine::observe_arrival`).
 //!
 //! What it counts, per queue ([`BusStats`]): events queued, dropped, the
-//! depth and the most it held, the longest wait in it, the sends that had
-//! to wait for room, the takes by aging, and the latency from queue to
-//! decision (p50/p99), for `nn-admin status --key`. A drop is never silent
-//! ([`spawn_loss_recorder`]): a WARN each sample it happens in, a signed
-//! `event_bus_drop` row — for P0 at the first sample after it (at most one
-//! a sample), for the other queues at most once per [`AUDIT_WINDOW_SECS`],
-//! each row carrying every drop since the queue's previous row — and, past
-//! the security rings' threshold, the posture's `TelemetryLoss`, as a
-//! security ring's kernel drops raised it (P0, P1 and P2: the events of the
-//! exec, file-open, FIM and tamper rings that would have been lost in the
-//! kernel before R12a; P3's network rings were never security rings).
+//! depth and the most it held, the longest wait in it (since boot and in
+//! the last sample), the sends that had to wait for room and the longest
+//! such wait, the takes by share ahead of a higher class, and the latency
+//! from queue to decision (p50/p99), for `nn-admin status --key`. A drop is
+//! never silent ([`spawn_loss_recorder`]): a WARN each sample it happens in,
+//! a signed `event_bus_drop` row — for P0 within a second of the first drop
+//! (at most one a second: an agent that crashes leaves at most a second of
+//! P0 drops unsigned), for the other queues at most once per
+//! [`AUDIT_WINDOW_SECS`], each row carrying every drop since the queue's
+//! previous row — and the posture's `TelemetryLoss`: any P0 drop, and past
+//! the security rings' threshold in a sample a drop of any other queue
+//! (review #471 A2: P3's too — NET-001's connects, the chains' egress, the
+//! DNS rules). At the stop ([`BusLosses::stop`]) what is still queued is
+//! counted and signed (`event_bus_stop`), and every drop not yet signed is.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -58,6 +66,10 @@ use crate::sensors::ring_drops::{self, PostureSink};
 
 /// Audit op of a drop on the bus.
 pub const AUDIT_OP: &str = "event_bus_drop";
+/// Audit op of the events still queued at the stop (review #471 M3).
+pub const STOP_AUDIT_OP: &str = "event_bus_stop";
+/// The least time between two P0 rows written ahead of the sample.
+pub const P0_ROW_EVERY: Duration = Duration::from_secs(1);
 /// The loss recorder's sample (the ring-drop sampler's).
 pub const SAMPLE_SECS: u64 = ring_drops::SAMPLE_SECS;
 /// At most one signed row per queue per window, P0 aside (P0: one per
@@ -72,8 +84,12 @@ struct State {
     queues: ClassQueues<Event>,
     /// Queue → decision, per queue.
     latency: [LatencyHistogram; QUEUES],
-    /// Sends that waited for room, per queue.
+    /// Sends that waited for room, per queue, and the longest such wait.
     waited: [u64; QUEUES],
+    send_wait_max_ns: [u64; QUEUES],
+    /// The longest wait in each queue in the last complete sample window
+    /// (review #471 B2).
+    recent_max_wait_ns: [u64; QUEUES],
 }
 
 struct Inner {
@@ -82,6 +98,11 @@ struct Inner {
     room: [Semaphore; QUEUES],
     /// An event was queued, or the last sender left.
     ready: Notify,
+    /// A P0 event was dropped: the loss recorder signs it ahead of its
+    /// sample.
+    p0_dropped: Notify,
+    /// The most `FileOpen`s P2 holds ([`core_bus::FILE_OPEN_SHARE`]).
+    open_cap: usize,
     senders: AtomicUsize,
     closed: AtomicBool,
     specs: [QueueSpec; QUEUES],
@@ -105,6 +126,9 @@ impl Inner {
 
     fn note_dropped(&self, p: Priority) {
         self.state.lock().queues.note_dropped(p);
+        if p == Priority::P0 {
+            self.p0_dropped.notify_one();
+        }
     }
 }
 
@@ -120,9 +144,13 @@ pub fn channel_with(specs: [QueueSpec; QUEUES]) -> (BusSender, BusReceiver) {
             queues: ClassQueues::new(specs.map(|s| s.capacity)),
             latency: Default::default(),
             waited: [0; QUEUES],
+            send_wait_max_ns: [0; QUEUES],
+            recent_max_wait_ns: [0; QUEUES],
         }),
         room: specs.map(|s| Semaphore::new(s.capacity.max(1))),
         ready: Notify::new(),
+        p0_dropped: Notify::new(),
+        open_cap: core_bus::FILE_OPEN_SHARE.min(specs[Priority::P2.index()].capacity.max(1)),
         senders: AtomicUsize::new(1),
         closed: AtomicBool::new(false),
         specs,
@@ -178,6 +206,7 @@ impl BusSender {
             Ok(permit) => permit,
             Err(TryAcquireError::Closed) => return Err(SendError),
             Err(TryAcquireError::NoPermits) => {
+                let started = Instant::now();
                 let waited = match inner.when_full(&event, p) {
                     WhenFull::DropNew => {
                         inner.note_dropped(p);
@@ -199,7 +228,10 @@ impl BusSender {
                 let Some(permit) = waited else {
                     return Err(SendError);
                 };
-                inner.state.lock().waited[p.index()] += 1;
+                let waited_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let mut st = inner.state.lock();
+                st.waited[p.index()] += 1;
+                st.send_wait_max_ns[p.index()] = st.send_wait_max_ns[p.index()].max(waited_ns);
                 permit
             }
         };
@@ -207,6 +239,15 @@ impl BusSender {
         permit.forget();
         {
             let mut st = inner.state.lock();
+            if matches!(event, Event::FileOpen { .. }) && st.queues.len(p) >= inner.open_cap {
+                // Review #471 B3: the opens' part of P2 is full — the open
+                // is dropped as on a full queue; the slot stays the other
+                // file events'.
+                st.queues.note_dropped(p);
+                drop(st);
+                inner.room[p.index()].add_permits(1);
+                return Ok(());
+            }
             let now = inner.now_ns();
             if st.queues.push(p, now, event).is_err() {
                 // A permit is a slot: never here. Counted, never silent.
@@ -232,9 +273,10 @@ impl BusSender {
 pub struct Received {
     pub event: Event,
     /// Lab PR 267: the execs (`Event::ProcessSpawn`) still queued in P1
-    /// that reached the bus before this tamper event, each handed over
-    /// once; they are taken in their turn all the same. Empty for every
-    /// other event (no other class is taken ahead of an older P1 event).
+    /// that reached the bus before this event, each handed over once; they
+    /// are taken in their turn all the same. Any class but P1 can be taken
+    /// ahead of an older exec: P0 always, P2 and P3 by their share (review
+    /// #471 A2). Empty for a P1 event (FIFO in its queue).
     pub overtaken: Vec<Event>,
 }
 
@@ -255,7 +297,7 @@ impl Drop for BusReceiver {
 }
 
 impl BusReceiver {
-    /// The next event, by strict priority with aging; `None` once every
+    /// The next event: P0 first, then P1–P3 by share; `None` once every
     /// sender is gone and the queues are empty. Cancel-safe: an event is
     /// taken and returned in one step.
     pub async fn recv(&mut self) -> Option<Received> {
@@ -293,7 +335,7 @@ impl BusReceiver {
         let now = inner.now_ns();
         let taken = st.queues.take(now)?;
         let mut overtaken = Vec::new();
-        if taken.priority < Priority::P1 {
+        if taken.priority != Priority::P1 {
             st.queues
                 .hand_over_older(Priority::P1, taken.enqueued_ns, |e| {
                     if matches!(e, Event::ProcessSpawn { .. }) {
@@ -308,6 +350,20 @@ impl BusReceiver {
             event: taken.item,
             overtaken,
         })
+    }
+
+    /// The stop (review #471 M3): no event is taken any more, a send is
+    /// refused from now on (a pump waiting for room is woken and ends, as
+    /// at a closed channel), and the events still queued are counted —
+    /// `[P0, P1, P2, P3]`, for [`BusLosses::stop`] to sign.
+    pub fn close(&mut self) -> [u64; QUEUES] {
+        self.decided();
+        self.inner.closed.store(true, Ordering::Release);
+        for room in &self.inner.room {
+            room.close();
+        }
+        let st = self.inner.state.lock();
+        Priority::ALL.map(|p| st.queues.len(p) as u64)
     }
 
     /// The event last taken is decided: its latency, queue to decision, is
@@ -345,8 +401,12 @@ pub struct QueueSnapshot {
     /// What a full queue does, as `nn-admin status` shows it.
     pub when_full: String,
     pub stats: QueueStats,
-    /// Sends that waited for room.
+    /// Sends that waited for room, and the longest such wait (µs).
     pub waited: u64,
+    pub send_wait_max_us: u64,
+    /// The longest wait in the queue in the last sample window and the one
+    /// running (µs; review #471 B2 — `stats.max_wait_ns` is since boot).
+    pub recent_max_wait_us: u64,
     /// Queue → decision, microseconds: p50, p99, the largest; `None` before
     /// the first decision.
     pub latency_p50_us: Option<u64>,
@@ -368,9 +428,13 @@ impl BusStats {
                 QueueSnapshot {
                     priority: p,
                     capacity: st.queues.capacity(p) as u64,
-                    when_full: when_full_text(p, self.0.specs[i].when_full),
+                    when_full: when_full_text(p, self.0.specs[i].when_full, self.0.open_cap),
                     stats: st.queues.stats(p),
                     waited: st.waited[i],
+                    send_wait_max_us: st.send_wait_max_ns[i] / 1_000,
+                    recent_max_wait_us: st.recent_max_wait_ns[i]
+                        .max(st.queues.stats(p).window_max_wait_ns)
+                        / 1_000,
                     latency_p50_us: h.quantile_us(0.50),
                     latency_p99_us: h.quantile_us(0.99),
                     latency_max_us: (h.count() > 0).then(|| h.max_us()),
@@ -379,14 +443,31 @@ impl BusStats {
             })
             .collect()
     }
+
+    /// The loss recorder's sample: each queue's longest wait since the
+    /// last one becomes the "recent" one the status shows.
+    fn roll_window(&self) {
+        let mut st = self.0.state.lock();
+        for p in Priority::ALL {
+            let w = st.queues.take_window_max_wait(p);
+            st.recent_max_wait_ns[p.index()] = w;
+        }
+    }
 }
 
-/// A queue's full behaviour for the status: its class's, and on P2 the
-/// opens' drop with the other file events' wait.
-fn when_full_text(p: Priority, w: WhenFull) -> String {
+/// A queue's full behaviour for the status: its class's, with the events
+/// that wait for room instead (P0's rare sources, P2's other file events)
+/// and the opens' part of P2.
+fn when_full_text(p: Priority, w: WhenFull, open_cap: usize) -> String {
     match (p, w) {
+        (Priority::P0, WhenFull::Wait { .. }) => {
+            format!(
+                "{} for FsProtectDenial; other tamper events wait",
+                w.describe()
+            )
+        }
         (Priority::P2, WhenFull::DropNew) => {
-            "drop the new FileOpen; other file events wait".to_string()
+            format!("drop the new FileOpen (past {open_cap} queued); other file events wait")
         }
         _ => w.describe(),
     }
@@ -518,18 +599,59 @@ impl BusLosses {
         let _ = self.posture.set(PostureSink { posture, installer });
     }
 
-    /// At the stop: every drop not yet in a signed row is signed now,
-    /// whatever its queue's window.
+    /// Every drop not yet in a signed row is signed now, whatever its
+    /// queue's window.
     pub fn flush(&self, stats: &BusStats) {
-        record(stats, self, true);
+        record(stats, self, Sample::Flush);
+    }
+
+    /// At the stop (review #471 M3), the receiver closed
+    /// ([`BusReceiver::close`]): the events it left queued (`queued`, P0
+    /// first) are counted in a signed `event_bus_stop` row and WARNed —
+    /// never judged, never silent — and every drop is signed
+    /// ([`Self::flush`]). `false` when a row was due and could not be
+    /// written (no audit log).
+    pub fn stop(&self, stats: &BusStats, queued: [u64; QUEUES]) -> bool {
+        self.flush(stats);
+        if queued.iter().all(|&n| n == 0) {
+            return true;
+        }
+        warn!(
+            p0 = queued[0],
+            p1 = queued[1],
+            p2 = queued[2],
+            p3 = queued[3],
+            "event bus: the agent stops with events queued — they are not judged"
+        );
+        sign_stop(&self.audit, queued)
     }
 }
 
 /// The queues whose drops are security events lost (the posture's
-/// `TelemetryLoss` past [`ring_drops::TELEMETRY_LOSS_THRESHOLD`] in a
-/// sample): tamper, process, file — what the exec, file-open, FIM and
-/// tamper rings carried, security rings whose kernel drops raised it.
-const SECURITY_QUEUES: [Priority; 3] = [Priority::P0, Priority::P1, Priority::P2];
+/// `TelemetryLoss`): every queue — the exec, file-open, FIM and tamper
+/// rings' events, security rings whose kernel drops raised it, and (review
+/// #471 A2) the network's, NET-001's connects and the chains' egress.
+const SECURITY_QUEUES: [Priority; QUEUES] = Priority::ALL;
+
+/// What a queue must drop in a sample to raise `TelemetryLoss`: any tamper
+/// event; past [`ring_drops::TELEMETRY_LOSS_THRESHOLD`] for the others.
+const fn loss_threshold(p: Priority) -> u64 {
+    match p {
+        Priority::P0 => 0,
+        _ => ring_drops::TELEMETRY_LOSS_THRESHOLD,
+    }
+}
+
+/// Why the recorder samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sample {
+    /// Its tick, every [`SAMPLE_SECS`].
+    Tick,
+    /// A P0 drop, ahead of the tick: P0 alone.
+    P0Drop,
+    /// The stop: every queue's row is due.
+    Flush,
+}
 
 /// What one sample decided (pure: [`LossRecorder::sample`]).
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -552,19 +674,24 @@ pub struct LossRecorder {
 
 impl LossRecorder {
     /// One sample of the queues' drop totals (`dropped[i]`, P0 first) at
-    /// `now`: what to WARN, sign and raise (`flush`: every queue's row is
-    /// due). Each row written is told back ([`Self::row_written`]); one
-    /// that could not be (no audit log yet) is tried again at the next
-    /// sample, with what accrued since.
-    pub fn sample(&mut self, dropped: [u64; QUEUES], now: Instant, flush: bool) -> SampleOutcome {
+    /// `now`: what to WARN, sign and raise ([`Sample::Flush`]: every
+    /// queue's row is due; [`Sample::P0Drop`]: P0 alone). Each row written
+    /// is told back ([`Self::row_written`]); one that could not be (no
+    /// audit log yet) is tried again at the next sample, with what accrued
+    /// since.
+    pub fn sample(&mut self, dropped: [u64; QUEUES], now: Instant, why: Sample) -> SampleOutcome {
         let mut out = SampleOutcome::default();
+        let flush = why == Sample::Flush;
         for p in Priority::ALL {
+            if why == Sample::P0Drop && p != Priority::P0 {
+                continue;
+            }
             let i = p.index();
             let (total, delta) = (dropped[i], dropped[i].saturating_sub(self.seen[i]));
             self.seen[i] = self.seen[i].max(total);
             if delta > 0 {
                 out.warn.push((p, delta, total));
-                if SECURITY_QUEUES.contains(&p) && delta > ring_drops::TELEMETRY_LOSS_THRESHOLD {
+                if SECURITY_QUEUES.contains(&p) && delta > loss_threshold(p) {
                     out.telemetry_loss.push((p, delta));
                 }
             }
@@ -590,15 +717,18 @@ impl LossRecorder {
 }
 
 /// Run one sample: WARN, sign, raise.
-fn record(stats: &BusStats, losses: &BusLosses, flush: bool) {
+fn record(stats: &BusStats, losses: &BusLosses, why: Sample) {
     let mut rec = losses.recorder.lock();
+    if why == Sample::Tick {
+        stats.roll_window();
+    }
     let snap = stats.snapshot();
     let mut dropped = [0u64; QUEUES];
     for q in &snap {
         dropped[q.priority.index()] = q.stats.dropped;
     }
     let now = Instant::now();
-    let out = rec.sample(dropped, now, flush);
+    let out = rec.sample(dropped, now, why);
     for (p, d, total) in &out.warn {
         let q = &snap[p.index()];
         warn!(
@@ -665,17 +795,63 @@ fn sign_drop(audit: &LateAudit, q: &QueueSnapshot, dropped: u64, total: u64) -> 
     }
 }
 
+/// The signed row of the events left queued at the stop.
+fn sign_stop(audit: &LateAudit, queued: [u64; QUEUES]) -> bool {
+    let Some(log) = audit.get() else {
+        return false;
+    };
+    let per_queue: serde_json::Map<String, serde_json::Value> = Priority::ALL
+        .iter()
+        .map(|p| (p.label().to_string(), serde_json::json!(queued[p.index()])))
+        .collect();
+    let draft = crate::audit::AuditEntryDraft {
+        op: STOP_AUDIT_OP.to_string(),
+        extra: serde_json::json!({
+            "queued_at_stop": per_queue,
+            "total": queued.iter().sum::<u64>(),
+            "judged": false,
+        }),
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: "detected".to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
+    };
+    match log.lock().append(draft) {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(
+                error = format!("{e:#}"),
+                "event-bus stop audit entry failed"
+            );
+            false
+        }
+    }
+}
+
 /// The loss recorder: every [`SAMPLE_SECS`], the queues' drops WARNed,
-/// signed and, for the security queues past the threshold, raised.
+/// signed and raised; a P0 drop ahead of that, at most once per
+/// [`P0_ROW_EVERY`] (review #471 M3: an agent that crashes leaves at most
+/// that much of P0's drops unsigned, not a sample's).
 pub fn spawn_loss_recorder(stats: BusStats, losses: BusLosses) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(SAMPLE_SECS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
+        let inner = Arc::clone(&stats.0);
         loop {
-            tick.tick().await;
-            record(&stats, &losses, false);
-            debug!("event-bus loss sample");
+            tokio::select! {
+                _ = tick.tick() => {
+                    record(&stats, &losses, Sample::Tick);
+                    debug!("event-bus loss sample");
+                }
+                () = inner.p0_dropped.notified() => {
+                    record(&stats, &losses, Sample::P0Drop);
+                    tokio::time::sleep(P0_ROW_EVERY).await;
+                }
+            }
         }
     })
 }
@@ -683,6 +859,7 @@ pub fn spawn_loss_recorder(stats: BusStats, losses: BusLosses) -> JoinHandle<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::AuditLog;
 
     fn open(pid: u32) -> Event {
         Event::FileOpen {
@@ -740,6 +917,50 @@ mod tests {
         }
     }
 
+    /// Review #471: a bus test that hangs fails instead (the M3 mutation
+    /// hung one forever).
+    async fn within<F: std::future::Future>(f: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(30), f)
+            .await
+            .expect("a bus test hung")
+    }
+
+    fn module_load(pid: u32) -> Event {
+        Event::ModuleLoad {
+            method: nn_model::ModuleLoadMethod::Finit,
+            loader_pid: pid,
+            loader_uid: 0,
+            loader_comm: "insmod".into(),
+            parent_comm: "sh".into(),
+            parent_is_kthread: false,
+            path: Some("/tmp/rk.ko".into()),
+            timestamp_ns: 0,
+        }
+    }
+
+    fn audit_log(dir: &std::path::Path) -> (AuditHandle, std::path::PathBuf) {
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.join("agent.key")).unwrap();
+        let path = dir.join("audit.log");
+        let log = AuditLog::open(&path, key, [0u8; 16]).unwrap();
+        (Arc::new(Mutex::new(log)), path)
+    }
+
+    /// The rows of `op` in the log at `path`, the chain verified.
+    fn rows(dir: &std::path::Path, path: &std::path::Path, op: &str) -> Vec<serde_json::Value> {
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.join("agent.key")).unwrap();
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let entries: Vec<crate::audit::AuditEntry> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        crate::audit::verify_chain(&entries, &key.verifying_key()).expect("the rows verify");
+        entries
+            .into_iter()
+            .filter(|e| e.op == op)
+            .map(|e| e.extra)
+            .collect()
+    }
+
     fn small(wait_ms: u64) -> [QueueSpec; QUEUES] {
         let mut s = SPECS;
         for q in &mut s {
@@ -758,104 +979,121 @@ mod tests {
     /// never delays a tamper event, which is taken first.
     #[tokio::test]
     async fn a_flood_of_opens_neither_blocks_nor_hides_a_denial() {
-        let (tx, mut rx) = channel_with(small(50));
-        for i in 0..100 {
-            tx.send(open(i)).await.unwrap();
-        }
-        let started = Instant::now();
-        tx.send(denial(7)).await.unwrap();
-        assert!(
-            started.elapsed() < Duration::from_millis(20),
-            "never waited"
-        );
-        let first = rx.try_recv().unwrap();
-        assert_eq!(pid_of(&first.event), 7, "the denial first");
-        let snap = rx.stats().snapshot();
-        assert_eq!(snap[0].stats.enqueued, 1);
-        assert_eq!(snap[0].stats.dropped, 0);
-        assert_eq!(snap[2].stats.enqueued, 2);
-        assert_eq!(snap[2].stats.dropped, 98, "the new opens dropped, counted");
-        let rest: Vec<u32> =
-            std::iter::from_fn(|| rx.try_recv().map(|r| pid_of(&r.event))).collect();
-        assert_eq!(rest, [0, 1], "FIFO: the first two opens");
+        within(async {
+            let (tx, mut rx) = channel_with(small(50));
+            for i in 0..100 {
+                tx.send(open(i)).await.unwrap();
+            }
+            let started = Instant::now();
+            tx.send(denial(7)).await.unwrap();
+            assert!(
+                started.elapsed() < Duration::from_millis(20),
+                "never waited"
+            );
+            let first = rx.try_recv().unwrap();
+            assert_eq!(pid_of(&first.event), 7, "the denial first");
+            let snap = rx.stats().snapshot();
+            assert_eq!(snap[0].stats.enqueued, 1);
+            assert_eq!(snap[0].stats.dropped, 0);
+            assert_eq!(snap[2].stats.enqueued, 2);
+            assert_eq!(snap[2].stats.dropped, 98, "the new opens dropped, counted");
+            let rest: Vec<u32> =
+                std::iter::from_fn(|| rx.try_recv().map(|r| pid_of(&r.event))).collect();
+            assert_eq!(rest, [0, 1], "FIFO: the first two opens");
+        })
+        .await
     }
 
     /// A full P0 waits for room at most its wait, then drops and counts; a
     /// slot freed meanwhile takes the waiting event.
     #[tokio::test]
     async fn a_full_tamper_queue_waits_then_drops() {
-        let (tx, mut rx) = channel_with(small(30));
-        tx.send(denial(1)).await.unwrap();
-        tx.send(denial(2)).await.unwrap();
-        let started = Instant::now();
-        tx.send(denial(3)).await.unwrap();
-        let waited = started.elapsed();
-        assert!(waited >= Duration::from_millis(25), "{waited:?}");
-        let snap = rx.stats().snapshot();
-        assert_eq!((snap[0].stats.enqueued, snap[0].stats.dropped), (2, 1));
-        // now one waits and a take frees its slot
-        let tx2 = tx.clone();
-        let waiter = tokio::spawn(async move { tx2.send(denial(4)).await });
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        assert_eq!(pid_of(&rx.try_recv().unwrap().event), 1);
-        waiter.await.unwrap().unwrap();
-        let snap = rx.stats().snapshot();
-        assert_eq!((snap[0].stats.enqueued, snap[0].stats.dropped), (3, 1));
-        assert_eq!(snap[0].waited, 1);
-        let rest: Vec<u32> =
-            std::iter::from_fn(|| rx.try_recv().map(|r| pid_of(&r.event))).collect();
-        assert_eq!(rest, [2, 4]);
+        within(async {
+            let (tx, mut rx) = channel_with(small(30));
+            tx.send(denial(1)).await.unwrap();
+            tx.send(denial(2)).await.unwrap();
+            let started = Instant::now();
+            tx.send(denial(3)).await.unwrap();
+            let waited = started.elapsed();
+            assert!(waited >= Duration::from_millis(25), "{waited:?}");
+            let snap = rx.stats().snapshot();
+            assert_eq!((snap[0].stats.enqueued, snap[0].stats.dropped), (2, 1));
+            // now one waits and a take frees its slot
+            let tx2 = tx.clone();
+            let waiter = tokio::spawn(async move { tx2.send(denial(4)).await });
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert_eq!(pid_of(&rx.try_recv().unwrap().event), 1);
+            waiter.await.unwrap().unwrap();
+            let snap = rx.stats().snapshot();
+            assert_eq!((snap[0].stats.enqueued, snap[0].stats.dropped), (3, 1));
+            assert_eq!(snap[0].waited, 1);
+            assert!(
+                snap[0].send_wait_max_us >= 4_000,
+                "{}",
+                snap[0].send_wait_max_us
+            );
+            let rest: Vec<u32> =
+                std::iter::from_fn(|| rx.try_recv().map(|r| pid_of(&r.event))).collect();
+            assert_eq!(rest, [2, 4]);
+        })
+        .await
     }
 
     /// A file event other than an open waits for room (review 75), ahead of
     /// the opens that come after it.
     #[tokio::test]
     async fn a_drift_waits_for_room_ahead_of_new_opens() {
-        let (tx, mut rx) = channel_with(small(30));
-        tx.send(open(1)).await.unwrap();
-        tx.send(open(2)).await.unwrap();
-        let drift = Event::MassWrite {
-            pid: 9,
-            uid: 0,
-            comm: "w".into(),
-            count: 64,
-            filename: "/srv/x".into(),
-            timestamp_ns: 0,
-            overwrites: true,
-            cgroup_window: false,
-        };
-        let tx2 = tx.clone();
-        let waiter = tokio::spawn(async move { tx2.send(drift).await });
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        assert!(!waiter.is_finished(), "it waits");
-        assert_eq!(pid_of(&rx.try_recv().unwrap().event), 1);
-        tx.send(open(3)).await.unwrap(); // the freed slot is the drift's
-        waiter.await.unwrap().unwrap();
-        let order: Vec<Event> = std::iter::from_fn(|| rx.try_recv().map(|r| r.event)).collect();
-        assert!(matches!(order[0], Event::FileOpen { pid: 2, .. }));
-        assert!(matches!(order[1], Event::MassWrite { .. }));
-        assert_eq!(order.len(), 2, "the open after it was dropped");
-        assert_eq!(rx.stats().snapshot()[2].stats.dropped, 1);
+        within(async {
+            let (tx, mut rx) = channel_with(small(30));
+            tx.send(open(1)).await.unwrap();
+            tx.send(open(2)).await.unwrap();
+            let drift = Event::MassWrite {
+                pid: 9,
+                uid: 0,
+                comm: "w".into(),
+                count: 64,
+                filename: "/srv/x".into(),
+                timestamp_ns: 0,
+                overwrites: true,
+                cgroup_window: false,
+            };
+            let tx2 = tx.clone();
+            let waiter = tokio::spawn(async move { tx2.send(drift).await });
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(!waiter.is_finished(), "it waits");
+            assert_eq!(pid_of(&rx.try_recv().unwrap().event), 1);
+            tx.send(open(3)).await.unwrap(); // the freed slot is the drift's
+            waiter.await.unwrap().unwrap();
+            let order: Vec<Event> = std::iter::from_fn(|| rx.try_recv().map(|r| r.event)).collect();
+            assert!(matches!(order[0], Event::FileOpen { pid: 2, .. }));
+            assert!(matches!(order[1], Event::MassWrite { .. }));
+            assert_eq!(order.len(), 2, "the open after it was dropped");
+            assert_eq!(rx.stats().snapshot()[2].stats.dropped, 1);
+        })
+        .await
     }
 
     /// A tamper event taken ahead of queued execs brings the older ones
     /// along, each once.
     #[tokio::test]
     async fn a_tamper_event_hands_over_the_execs_it_overtakes() {
-        let (tx, mut rx) = channel();
-        tx.send(spawn(10)).await.unwrap();
-        tx.send(spawn(11)).await.unwrap();
-        tx.send(denial(10)).await.unwrap();
-        tx.send(spawn(12)).await.unwrap();
-        let r = rx.recv().await.unwrap();
-        assert_eq!(pid_of(&r.event), 10);
-        assert!(matches!(r.event, Event::FsProtectDenial { .. }));
-        let handed: Vec<u32> = r.overtaken.iter().map(pid_of).collect();
-        assert_eq!(handed, [10, 11], "the execs before it, not the one after");
-        let rest: Vec<(u32, usize)> =
-            std::iter::from_fn(|| rx.try_recv().map(|r| (pid_of(&r.event), r.overtaken.len())))
-                .collect();
-        assert_eq!(rest, [(10, 0), (11, 0), (12, 0)]);
+        within(async {
+            let (tx, mut rx) = channel();
+            tx.send(spawn(10)).await.unwrap();
+            tx.send(spawn(11)).await.unwrap();
+            tx.send(denial(10)).await.unwrap();
+            tx.send(spawn(12)).await.unwrap();
+            let r = rx.recv().await.unwrap();
+            assert_eq!(pid_of(&r.event), 10);
+            assert!(matches!(r.event, Event::FsProtectDenial { .. }));
+            let handed: Vec<u32> = r.overtaken.iter().map(pid_of).collect();
+            assert_eq!(handed, [10, 11], "the execs before it, not the one after");
+            let rest: Vec<(u32, usize)> =
+                std::iter::from_fn(|| rx.try_recv().map(|r| (pid_of(&r.event), r.overtaken.len())))
+                    .collect();
+            assert_eq!(rest, [(10, 0), (11, 0), (12, 0)]);
+        })
+        .await
     }
 
     /// Under concurrent senders of every class and a slow receiver: every
@@ -864,103 +1102,112 @@ mod tests {
     /// is never dropped while its wait allows the receiver to free a slot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_senders_keep_each_class_fifo_and_account_for_every_event() {
-        let mut specs = SPECS;
-        for (q, c) in specs.iter_mut().zip([64, 64, 128, 128]) {
-            q.capacity = c;
-        }
-        let (tx, mut rx) = channel_with(specs);
-        const PER: u32 = 3_000;
-        let mut senders = Vec::new();
-        for s in 0..4u32 {
-            let tx = tx.clone();
-            senders.push(tokio::spawn(async move {
-                for i in 0..PER {
-                    let seq = s * 1_000_000 + i;
-                    let e = match i % 4 {
-                        0 => denial(seq),
-                        1 => spawn(seq),
-                        2 => open(seq),
-                        _ => Event::NetListener(nn_model::telemetry::NetListenerEvent {
-                            timestamp_ns: 0,
-                            family: 2,
-                            bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                            bind_port: 1,
-                            proto: 6,
-                            pid: seq,
-                            uid: 0,
-                            comm: String::new(),
-                            exe: None,
-                        }),
-                    };
-                    tx.send(e).await.unwrap();
+        within(async {
+            let mut specs = SPECS;
+            for (q, c) in specs.iter_mut().zip([64, 64, 128, 128]) {
+                q.capacity = c;
+            }
+            let (tx, mut rx) = channel_with(specs);
+            const PER: u32 = 3_000;
+            let mut senders = Vec::new();
+            for s in 0..4u32 {
+                let tx = tx.clone();
+                senders.push(tokio::spawn(async move {
+                    for i in 0..PER {
+                        let seq = s * 1_000_000 + i;
+                        let e = match i % 4 {
+                            0 => denial(seq),
+                            1 => spawn(seq),
+                            2 => open(seq),
+                            _ => Event::NetListener(nn_model::telemetry::NetListenerEvent {
+                                timestamp_ns: 0,
+                                family: 2,
+                                bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                                bind_port: 1,
+                                proto: 6,
+                                pid: seq,
+                                uid: 0,
+                                comm: String::new(),
+                                exe: None,
+                            }),
+                        };
+                        tx.send(e).await.unwrap();
+                    }
+                }));
+            }
+            drop(tx);
+            let mut last: std::collections::HashMap<(usize, u32), u32> = Default::default();
+            let mut taken = [0u64; QUEUES];
+            while let Some(r) = rx.recv().await {
+                let (p, pid) = match &r.event {
+                    Event::NetListener(l) => (Priority::P3, l.pid),
+                    e => (Priority::of_event(e), pid_of(e)),
+                };
+                let (sender, i) = (pid / 1_000_000, pid % 1_000_000);
+                if let Some(prev) = last.insert((p.index(), sender), i) {
+                    assert!(prev < i, "{p:?} sender {sender}: {prev} then {i}");
                 }
-            }));
-        }
-        drop(tx);
-        let mut last: std::collections::HashMap<(usize, u32), u32> = Default::default();
-        let mut taken = [0u64; QUEUES];
-        while let Some(r) = rx.recv().await {
-            let (p, pid) = match &r.event {
-                Event::NetListener(l) => (Priority::P3, l.pid),
-                e => (Priority::of_event(e), pid_of(e)),
-            };
-            let (sender, i) = (pid / 1_000_000, pid % 1_000_000);
-            if let Some(prev) = last.insert((p.index(), sender), i) {
-                assert!(prev < i, "{p:?} sender {sender}: {prev} then {i}");
+                taken[p.index()] += 1;
+                if taken.iter().sum::<u64>() % 97 == 0 {
+                    tokio::time::sleep(Duration::from_micros(200)).await;
+                }
             }
-            taken[p.index()] += 1;
-            if taken.iter().sum::<u64>() % 97 == 0 {
-                tokio::time::sleep(Duration::from_micros(200)).await;
+            for h in senders {
+                h.await.unwrap();
             }
-        }
-        for h in senders {
-            h.await.unwrap();
-        }
-        let snap = rx.stats().snapshot();
-        for q in &snap {
-            let i = q.priority.index();
-            assert_eq!(q.stats.enqueued, taken[i], "{:?}", q.priority);
+            let snap = rx.stats().snapshot();
+            for q in &snap {
+                let i = q.priority.index();
+                assert_eq!(q.stats.enqueued, taken[i], "{:?}", q.priority);
+                assert_eq!(
+                    q.stats.enqueued + q.stats.dropped,
+                    u64::from(4 * PER / 4),
+                    "{:?}: every event queued or dropped",
+                    q.priority
+                );
+                assert_eq!(q.stats.depth, 0);
+            }
             assert_eq!(
-                q.stats.enqueued + q.stats.dropped,
-                u64::from(4 * PER / 4),
-                "{:?}: every event queued or dropped",
-                q.priority
+                snap[0].stats.dropped, 0,
+                "P0 waits 50 ms; the receiver frees slots well within it"
             );
-            assert_eq!(q.stats.depth, 0);
-        }
-        assert_eq!(
-            snap[0].stats.dropped, 0,
-            "P0 waits 50 ms; the receiver frees slots well within it"
-        );
+        })
+        .await
     }
 
     /// The receiver ends once every sender is gone; senders fail once the
     /// receiver is.
     #[tokio::test]
     async fn the_ends_close_each_other() {
-        let (tx, mut rx) = channel();
-        tx.send(open(1)).await.unwrap();
-        drop(tx);
-        assert!(rx.recv().await.is_some());
-        assert!(rx.recv().await.is_none());
-        let (tx, rx) = channel();
-        drop(rx);
-        assert!(tx.send(open(1)).await.is_err());
+        within(async {
+            let (tx, mut rx) = channel();
+            tx.send(open(1)).await.unwrap();
+            drop(tx);
+            assert!(rx.recv().await.is_some());
+            assert!(rx.recv().await.is_none());
+            let (tx, rx) = channel();
+            drop(rx);
+            assert!(tx.send(open(1)).await.is_err());
+        })
+        .await
     }
 
     /// A decision's latency is counted at the next take, or when said.
     #[tokio::test]
     async fn decisions_are_timed_per_queue() {
-        let (tx, mut rx) = channel();
-        tx.send(denial(1)).await.unwrap();
-        tx.send(open(2)).await.unwrap();
-        rx.try_recv().unwrap();
-        rx.try_recv().unwrap(); // the denial's decision ends here
-        rx.decided();
-        let snap = rx.stats().snapshot();
-        assert_eq!((snap[0].decided, snap[2].decided), (1, 1));
-        assert!(snap[0].latency_p50_us.is_some());
-        assert_eq!(snap[1].latency_p50_us, None);
+        within(async {
+            let (tx, mut rx) = channel();
+            tx.send(denial(1)).await.unwrap();
+            tx.send(open(2)).await.unwrap();
+            rx.try_recv().unwrap();
+            rx.try_recv().unwrap(); // the denial's decision ends here
+            rx.decided();
+            let snap = rx.stats().snapshot();
+            assert_eq!((snap[0].decided, snap[2].decided), (1, 1));
+            assert!(snap[0].latency_p50_us.is_some());
+            assert_eq!(snap[1].latency_p50_us, None);
+        })
+        .await
     }
 
     /// The stages: the ring drops split into full rings and budgets, the
@@ -998,13 +1245,14 @@ mod tests {
 
     /// The recorder: a WARN for each sample with drops; P0 signed at once,
     /// every drop in a row; the other queues at most once per window, the
-    /// row then carrying everything since the previous one; the security
-    /// queues raise past the threshold.
+    /// row then carrying everything since the previous one; any P0 drop
+    /// raises, the other queues past the threshold — the network's too
+    /// (review #471 A2).
     #[test]
     fn the_recorder_signs_every_drop() {
         let mut rec = LossRecorder::default();
         let t0 = Instant::now();
-        let out = rec.sample([3, 0, 100, 5], t0, false);
+        let out = rec.sample([3, 0, 100, 5], t0, Sample::Tick);
         assert_eq!(out.warn.len(), 3);
         assert_eq!(
             out.rows,
@@ -1014,17 +1262,17 @@ mod tests {
                 (Priority::P3, 5, 5)
             ]
         );
-        assert_eq!(out.telemetry_loss, [(Priority::P2, 100)]);
+        assert_eq!(out.telemetry_loss, [(Priority::P0, 3), (Priority::P2, 100)]);
         for (p, _, total) in &out.rows {
             rec.row_written(*p, *total, t0);
         }
         let t1 = t0 + Duration::from_secs(10);
-        let out = rec.sample([4, 0, 130, 5], t1, false);
+        let out = rec.sample([4, 0, 130, 5], t1, Sample::Tick);
         assert_eq!(out.rows, [(Priority::P0, 1, 4)], "P2 waits for its window");
         rec.row_written(Priority::P0, 4, t1);
         // an unwritten row (no audit log) is tried again with what accrued
         let t2 = t1 + Duration::from_secs(AUDIT_WINDOW_SECS);
-        let out = rec.sample([6, 0, 130, 9], t2, false);
+        let out = rec.sample([6, 0, 130, 9], t2, Sample::Tick);
         assert_eq!(
             out.rows,
             [
@@ -1033,7 +1281,7 @@ mod tests {
                 (Priority::P3, 4, 9)
             ]
         );
-        let out = rec.sample([6, 0, 130, 9], t2 + Duration::from_secs(10), false);
+        let out = rec.sample([6, 0, 130, 9], t2 + Duration::from_secs(10), Sample::Tick);
         assert_eq!(
             out.rows,
             [
@@ -1045,8 +1293,286 @@ mod tests {
         );
         // a flush signs every queue whatever the window
         rec.row_written(Priority::P0, 6, t2);
-        let out = rec.sample([6, 0, 130, 9], t2 + Duration::from_secs(20), true);
+        let out = rec.sample([6, 0, 130, 9], t2 + Duration::from_secs(20), Sample::Flush);
         assert_eq!(out.rows, [(Priority::P2, 30, 130), (Priority::P3, 4, 9)]);
         assert!(out.warn.is_empty());
+        // a P0 drop ahead of the sample: P0 alone, the others left to theirs
+        let t3 = t2 + Duration::from_secs(21);
+        let out = rec.sample([7, 0, 200, 300], t3, Sample::P0Drop);
+        assert_eq!(out.rows, [(Priority::P0, 1, 7)]);
+        assert_eq!(out.warn, [(Priority::P0, 1, 7)]);
+        assert_eq!(out.telemetry_loss, [(Priority::P0, 1)]);
+        rec.row_written(Priority::P0, 7, t3);
+        let out = rec.sample([7, 0, 200, 300], t3 + Duration::from_secs(1), Sample::Tick);
+        assert_eq!(
+            out.warn,
+            [(Priority::P2, 70, 200), (Priority::P3, 291, 300)]
+        );
+        assert_eq!(
+            out.telemetry_loss,
+            [(Priority::P2, 70), (Priority::P3, 291)]
+        );
+    }
+
+    /// Review #471 A2: an event of P2 or P3 taken by its share ahead of
+    /// older execs brings them along too (the lineage learns an exec before
+    /// any later event of its process is judged, whatever its class).
+    #[tokio::test]
+    async fn an_event_of_any_class_but_p1_hands_over_the_execs_it_overtakes() {
+        within(async {
+            let (tx, mut rx) = channel();
+            for pid in [10, 11, 12] {
+                tx.send(spawn(pid)).await.unwrap();
+            }
+            tx.send(open(5)).await.unwrap();
+            let first = rx.try_recv().unwrap();
+            assert_eq!((pid_of(&first.event), first.overtaken.len()), (10, 0));
+            let second = rx.try_recv().unwrap();
+            assert!(
+                matches!(second.event, Event::FileOpen { pid: 5, .. }),
+                "P2's turn"
+            );
+            let handed: Vec<u32> = second.overtaken.iter().map(pid_of).collect();
+            assert_eq!(handed, [11, 12]);
+            let rest: Vec<(u32, usize)> =
+                std::iter::from_fn(|| rx.try_recv().map(|r| (pid_of(&r.event), r.overtaken.len())))
+                    .collect();
+            assert_eq!(rest, [(11, 0), (12, 0)]);
+        })
+        .await
+    }
+
+    /// Review #471 M4c: the receiver itself teaches the process lineage the
+    /// execs an event overtook — before the event is handed to the loop.
+    #[tokio::test]
+    async fn the_receiver_teaches_the_lineage_the_execs_an_event_overtook() {
+        within(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let lineage = AuthSessionTracker::new(tmp.path());
+            let (tx, mut rx) = channel();
+            tx.send(spawn(4242)).await.unwrap();
+            tx.send(denial(4242)).await.unwrap();
+            assert_eq!(lineage.image_path(4242), None);
+            let r = rx.recv_with(Some(&lineage)).await.unwrap();
+            assert!(matches!(r.event, Event::FsProtectDenial { .. }));
+            assert_eq!(r.overtaken.len(), 1);
+            assert_eq!(
+                lineage.image_path(4242).as_deref(),
+                Some("/bin/sh"),
+                "the lineage knows the exec before the denial is judged"
+            );
+        })
+        .await
+    }
+
+    /// Review #471 M1: a rare tamper event (a module load) waits for room
+    /// behind a flood of denials while the loop stands still, and arrives —
+    /// the denials wait their 50 ms and are dropped, it is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rare_tamper_event_outlasts_a_flood_of_denials() {
+        within(async {
+            let mut specs = small(20);
+            specs[0].capacity = 4;
+            let (tx, mut rx) = channel_with(specs);
+            for i in 0..4 {
+                tx.send(denial(i)).await.unwrap();
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let flood = {
+                let (tx, stop) = (tx.clone(), Arc::clone(&stop));
+                tokio::spawn(async move {
+                    let mut i = 100;
+                    while !stop.load(Ordering::Acquire) {
+                        if tx.send(denial(i)).await.is_err() {
+                            return;
+                        }
+                        i += 1;
+                    }
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let module = {
+                let tx = tx.clone();
+                tokio::spawn(async move { tx.send(module_load(77)).await })
+            };
+            // the loop stands still for 200 ms
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(!module.is_finished(), "it waits for room");
+            assert!(
+                rx.stats().snapshot()[0].stats.dropped >= 3,
+                "denials dropped meanwhile"
+            );
+            let mut seen = false;
+            while !seen {
+                let r = rx.recv().await.unwrap();
+                seen = matches!(r.event, Event::ModuleLoad { loader_pid: 77, .. });
+            }
+            module.await.unwrap().unwrap();
+            stop.store(true, Ordering::Release);
+            drop(rx);
+            flood.await.unwrap();
+        })
+        .await
+    }
+
+    /// Review #471 B3: the opens fill a quarter of P2; the other file
+    /// events find room at once behind them.
+    #[tokio::test]
+    async fn the_opens_fill_a_quarter_of_the_file_queue() {
+        within(async {
+            let (tx, rx) = channel();
+            for i in 0..3_000 {
+                tx.send(open(i)).await.unwrap();
+            }
+            let snap = rx.stats().snapshot();
+            assert_eq!(
+                (snap[2].stats.enqueued, snap[2].stats.dropped),
+                (
+                    core_bus::FILE_OPEN_SHARE as u64,
+                    3_000 - core_bus::FILE_OPEN_SHARE as u64
+                )
+            );
+            let drift = Event::MassWrite {
+                pid: 9,
+                uid: 0,
+                comm: "w".into(),
+                count: 64,
+                filename: "/srv/x".into(),
+                timestamp_ns: 0,
+                overwrites: true,
+                cgroup_window: false,
+            };
+            tx.send(drift).await.unwrap();
+            let snap = rx.stats().snapshot();
+            assert_eq!(snap[2].stats.depth, core_bus::FILE_OPEN_SHARE as u64 + 1);
+            assert_eq!(snap[2].waited, 0, "no wait for room");
+            assert!(
+                snap[2].when_full.contains("past 2048"),
+                "{}",
+                snap[2].when_full
+            );
+        })
+        .await
+    }
+
+    /// Review #471 M5a: a drop is signed into the audit log — a row that
+    /// verifies, with the queue and its counts.
+    #[tokio::test]
+    async fn a_drop_is_signed_into_the_audit_log() {
+        within(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (log, path) = audit_log(dir.path());
+            let (tx, rx) = channel_with(small(1));
+            for i in 0..3 {
+                tx.send(denial(i)).await.unwrap();
+            }
+            for i in 0..5 {
+                tx.send(open(i)).await.unwrap();
+            }
+            let losses = BusLosses::default();
+            losses.bind_audit_log(Some(log));
+            record(&rx.stats(), &losses, Sample::Tick);
+            let got = rows(dir.path(), &path, AUDIT_OP);
+            assert_eq!(got.len(), 2, "{got:?}");
+            assert_eq!(got[0]["queue"], "P0");
+            assert_eq!(got[0]["dropped_since_last_row"], 1);
+            assert_eq!(got[1]["queue"], "P2");
+            assert_eq!(got[1]["total"], 3);
+            // nothing new: no row
+            record(&rx.stats(), &losses, Sample::Tick);
+            assert_eq!(rows(dir.path(), &path, AUDIT_OP).len(), 2);
+        })
+        .await
+    }
+
+    /// Review #471 M3: a P0 drop is signed within about a second, not at
+    /// the next ten-second sample (a crash leaves at most that unsigned).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_p0_drop_is_signed_ahead_of_the_sample() {
+        within(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (log, path) = audit_log(dir.path());
+            let (tx, rx) = channel_with(small(1));
+            let losses = BusLosses::default();
+            losses.bind_audit_log(Some(log));
+            let recorder = spawn_loss_recorder(rx.stats(), losses.clone());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let started = Instant::now();
+            for i in 0..3 {
+                tx.send(denial(i)).await.unwrap();
+            }
+            while rows(dir.path(), &path, AUDIT_OP).is_empty() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(SAMPLE_SECS / 2),
+                    "no row ahead of the sample"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let got = rows(dir.path(), &path, AUDIT_OP);
+            assert_eq!((got.len(), &got[0]["queue"]), (1, &serde_json::json!("P0")));
+            recorder.abort();
+        })
+        .await
+    }
+
+    /// Review #471 M3: at the stop the bus refuses sends, and the events it
+    /// still held are counted in a signed row with the drops not yet
+    /// signed; a stop with nothing queued writes no stop row.
+    #[tokio::test]
+    async fn the_stop_counts_and_signs_what_is_still_queued() {
+        within(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (log, path) = audit_log(dir.path());
+            let (tx, mut rx) = channel_with(small(1));
+            tx.send(denial(1)).await.unwrap();
+            tx.send(spawn(2)).await.unwrap();
+            for i in 0..4 {
+                tx.send(open(i)).await.unwrap();
+            }
+            let losses = BusLosses::default();
+            losses.bind_audit_log(Some(log));
+            assert!(rx.try_recv().is_some());
+            let queued = rx.close();
+            assert_eq!(queued, [0, 1, 2, 0]);
+            assert!(tx.send(denial(3)).await.is_err(), "refused after the stop");
+            assert!(rx.try_recv().is_some(), "close takes nothing itself");
+            assert!(losses.stop(&rx.stats(), queued));
+            let stop = rows(dir.path(), &path, STOP_AUDIT_OP);
+            assert_eq!(stop.len(), 1);
+            assert_eq!(stop[0]["queued_at_stop"]["P1"], 1);
+            assert_eq!(stop[0]["queued_at_stop"]["P2"], 2);
+            assert_eq!(stop[0]["total"], 3);
+            let drops = rows(dir.path(), &path, AUDIT_OP);
+            assert_eq!(
+                drops.len(),
+                1,
+                "the P2 drops signed at the stop, whatever the window"
+            );
+            assert_eq!(drops[0]["queue"], "P2");
+            assert!(losses.stop(&rx.stats(), [0; QUEUES]));
+            assert_eq!(rows(dir.path(), &path, STOP_AUDIT_OP).len(), 1);
+        })
+        .await
+    }
+
+    /// Review #471 B2: the status's recent wait is the last sample's — a
+    /// boot backlog leaves it; the all-time maximum stays.
+    #[tokio::test]
+    async fn the_recent_wait_is_the_last_sample_s() {
+        within(async {
+            let (tx, mut rx) = channel();
+            tx.send(open(1)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            rx.try_recv().unwrap();
+            let st = rx.stats();
+            let q = |s: &BusStats| s.snapshot()[2].clone();
+            assert!(q(&st).recent_max_wait_us >= 4_000, "{:?}", q(&st));
+            st.roll_window();
+            assert!(q(&st).recent_max_wait_us >= 4_000, "the last window's");
+            st.roll_window();
+            assert_eq!(q(&st).recent_max_wait_us, 0, "a window with no take");
+            assert!(q(&st).stats.max_wait_ns >= 4_000_000, "since boot");
+        })
+        .await
     }
 }

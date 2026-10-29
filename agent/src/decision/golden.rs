@@ -1249,6 +1249,48 @@ fn assert_fifo_order(lanes: &[usize], order: &[usize]) {
     assert!(seen.iter().all(|&s| s), "a unit left out");
 }
 
+/// Review #471 M4b, M5c: the event loop does what the property test below
+/// models, and what the bus's own tests cannot see — the engine's rules
+/// learn the execs an event overtook (`Received::overtaken`) before the
+/// event is judged, and when the loop ends the bus is stopped: what it
+/// still holds counted and signed, every drop signed. The loop needs the
+/// whole agent to run, so its source is pinned (comments left out).
+#[test]
+fn the_event_loop_wires_the_bus_as_modelled() {
+    let src = include_str!("../run_loop.rs");
+    let code: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let at = |what: &str, from: usize| {
+        code[from..]
+            .find(what)
+            .map(|i| from + i)
+            .unwrap_or_else(|| panic!("run_loop.rs: `{what}` not found after byte {from}"))
+    };
+    let arm = at("Some(received) => {", 0);
+    let each = at("for exec in &received.overtaken {", arm);
+    let teach = at("engine.observe_arrival(exec);", each);
+    assert!(
+        !code[each..teach].contains('}'),
+        "observe_arrival is the loop over the overtaken execs"
+    );
+    let event = at("let e = received.event;", arm);
+    let judge = at("process_event(", arm);
+    assert!(
+        teach < event && event < judge,
+        "taught before the event is judged"
+    );
+    let stop = at("sensor.stop_bus();", judge);
+    let reported = at("Stopped {", stop);
+    assert!(
+        code[judge..stop].contains("break;") && !code[stop..reported].contains("break;"),
+        "the bus is stopped after the loop, before the stop is reported"
+    );
+    assert_eq!(code.matches("sensor.stop_bus();").count(), 1);
+}
+
 /// Lab PR 267 (R12a): every order of a golden case's events that keeps
 /// each class's own order gives the verdicts of the stream's order.
 #[test]

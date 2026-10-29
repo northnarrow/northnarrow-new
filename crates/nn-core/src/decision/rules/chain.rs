@@ -2412,6 +2412,44 @@ mod tests {
         assert!(fire_ids(&rules, &tmp_exec_started(43, 9 * SEC, 10 * SEC + 5)).is_empty());
     }
 
+    /// Review #471 M9: a flow CHAIN-007 judged in order is answered — a
+    /// credential read processed later (stamped before the flow) completes
+    /// no second CHAIN-007 with the note an earlier phase of the flow left.
+    /// Two flows: the first late read completes the earlier one, the later
+    /// flow's next phase fires in order, and a second late read finds
+    /// nothing left.
+    #[test]
+    fn chain007_judged_in_order_is_not_completed_again_by_a_late_read() {
+        let phase = |e: Event, ph: FlowPhase| match e {
+            Event::NetFlow(mut nf) => {
+                nf.phase = ph;
+                Event::NetFlow(nf)
+            }
+            e => e,
+        };
+        let rules = chain_rules();
+        fire_ids(&rules, &tmp_exec_started(44, 9 * SEC, 10 * SEC));
+        let f1 = phase(flow(44, 443, 12 * SEC), FlowPhase::Connect);
+        let f2 = phase(flow(44, 8443, 13 * SEC), FlowPhase::Connect);
+        assert_eq!(fire_ids(&rules, &f1), [C002], "no read yet: noted");
+        assert_eq!(fire_ids(&rules, &f2), [C002], "noted");
+        let v = verdicts(&rules, &cred_fim(44, 11 * SEC));
+        assert_eq!(
+            v.iter()
+                .map(|v| (v.rule_id.as_str(), v.timestamp_ns))
+                .collect::<Vec<_>>(),
+            [(C007, 12 * SEC), (C001, 12 * SEC)],
+            "the late read completes the earlier flow"
+        );
+        let f2_later = phase(flow(44, 8443, 13 * SEC), FlowPhase::Snapshot);
+        assert_eq!(fire_ids(&rules, &f2_later), [C007, C001, C002], "in order");
+        let again = fire_ids(&rules, &cred_fim(44, 11 * SEC + 500));
+        assert!(
+            again.is_empty(),
+            "the in-order CHAIN-007 answered it: {again:?}"
+        );
+    }
+
     /// An egress CHAIN-002 answered in order is claimed: a second staging
     /// exec of the process (execve keeps its start) stamped before the
     /// egress but processed after it completes no second CHAIN-002.

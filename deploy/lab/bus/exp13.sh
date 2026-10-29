@@ -217,9 +217,10 @@ def bus(s):
     return {x["priority"]: x for x in q}
 bb, ba = bus(before), bus(after)
 def qd(p, k):
-    if p not in ba:
+    # "aged" before review #471, "ahead" after it: a key the build lacks is None
+    if p not in ba or ba[p].get(k) is None:
         return None
-    return ba[p][k] - (bb.get(p, {}).get(k, 0) if k in ("enqueued", "dropped", "waited", "aged", "decided") else 0)
+    return ba[p][k] - (bb.get(p, {}).get(k, 0) if k in ("enqueued", "dropped", "waited", "aged", "ahead", "decided") else 0)
 
 summary = {
     "attempts_refused": attempts, "attempts_allowed": allowed, "tamper_rc": tamper_rc,
@@ -227,7 +228,7 @@ summary = {
     "at001_accounted": len(recs) + held,
     "ring_drops_delta": {r: delta(r) for r in ("fs_protect", "open_sensor", "task_denial_rate", "exec", "fim")},
     "first_record_latency_ms": lat,
-    "event_bus": None if not ba else {p: {k: qd(p, k) for k in ("enqueued", "dropped", "waited", "aged", "decided", "max_depth", "max_wait_us", "latency_p50_us", "latency_p99_us", "latency_max_us")} for p in sorted(ba)},
+    "event_bus": None if not ba else {p: {k: qd(p, k) for k in ("enqueued", "dropped", "waited", "aged", "ahead", "decided", "max_depth", "max_wait_us", "recent_max_wait_us", "send_wait_max_us", "latency_p50_us", "latency_p99_us", "latency_max_us")} for p in sorted(ba)},
     "event_bus_drop_rows": bus_rows, "ringbuf_drop_rows": ring_rows,
     "flood": open(out + "/flood.txt").read().split("\n") if True else None,
     "flood_secs_measured": round((t_flood_end - t_start) / 1e9, 1),

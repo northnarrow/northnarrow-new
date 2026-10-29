@@ -207,9 +207,11 @@ pub(crate) async fn run(
             }
         }
     }
-    // Lab PR 267 (R12a): every drop of the bus not in a signed row yet is
-    // signed before the stop is (a queue's window does not hold it back).
-    sensor.bus_losses().flush(&sensor.bus_stats());
+    // Lab PR 267 (R12a), review #471 M3: the bus is closed, the events it
+    // still held counted in a signed row, and every drop not in a signed
+    // row yet signed, before the stop is (a queue's window does not hold
+    // it back).
+    sensor.stop_bus();
     Stopped {
         stop_reason,
         loop_started,

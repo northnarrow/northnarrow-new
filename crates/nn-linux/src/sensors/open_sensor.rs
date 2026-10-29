@@ -1405,7 +1405,7 @@ pub async fn pump(ring: RingBuf<MapData>, tx: crate::sensors::bus::BusSender) {
         if batch.rejected.is_empty() {
             reject.flush_idle(PUMP_LABEL, size);
         }
-        for r in &batch.records {
+        for r in send_order(&batch.records) {
             for ev in events_of(r, &mut mounts) {
                 if tx.send(ev).await.is_err() {
                     return;
@@ -1413,6 +1413,20 @@ pub async fn pump(ring: RingBuf<MapData>, tx: crate::sensors::bus::BusSender) {
             }
         }
     }
+}
+
+/// The order a batch's records are sent in (review #471 M2): the signals
+/// to a security tool (P0, tamper) first, then the file records in the
+/// ring's order. A file record other than an open waits for room on a full
+/// P2 (review 75), and the pump with it: a signal read in the same batch
+/// behind it does not wait too. (One read in a later batch still can, while
+/// P2 is full of file events other than opens: `EVENT_BUS.md`, Open.)
+pub(crate) fn send_order(records: &[OpenRecordRaw]) -> impl Iterator<Item = &OpenRecordRaw> {
+    let signal = |r: &&OpenRecordRaw| r.reason & open_reason::DEFENDER_SIGNAL != 0;
+    records
+        .iter()
+        .filter(signal)
+        .chain(records.iter().filter(move |r| !signal(r)))
 }
 
 /// External audit EBPF-011: the kernel's count of classifications whose
@@ -2006,6 +2020,29 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    /// Review #471 M2: a batch's signals to a security tool are sent
+    /// first, the file records after them in the ring's order.
+    #[test]
+    fn a_batch_sends_its_defender_signals_first() {
+        let mut batch = Vec::new();
+        for (i, reason) in [
+            open_reason::CRED,
+            open_reason::MASS_WRITE,
+            open_reason::DEFENDER_SIGNAL,
+            open_reason::SENSITIVE,
+            open_reason::DEFENDER_SIGNAL,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut r = record(reason, &[], (0, 0));
+            r.pid = i as u32;
+            batch.push(r);
+        }
+        let order: Vec<u32> = send_order(&batch).map(|r| r.pid).collect();
+        assert_eq!(order, [2, 4, 0, 1, 3]);
     }
 
     #[test]

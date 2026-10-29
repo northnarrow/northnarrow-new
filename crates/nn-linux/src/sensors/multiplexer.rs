@@ -611,6 +611,16 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         self.rx.decided();
     }
 
+    /// Review #471 M3: the event loop stops — the bus takes no event any
+    /// more and refuses the pumps' sends; the events still queued are
+    /// counted in a signed `event_bus_stop` row, and every drop not yet
+    /// signed is signed ([`BusLosses::stop`]). The counts, P0 first.
+    pub fn stop_bus(&mut self) -> [u64; nn_core::bus::QUEUES] {
+        let queued = self.rx.close();
+        self.bus_losses.stop(&self.rx.stats(), queued);
+        queued
+    }
+
     /// Tappa 9 C8 — register a spawned telemetry task (the FIM and net
     /// drains, the open-sensor pump and its rule refresher) with the
     /// multiplexer so `Drop` aborts it alongside the sensor pumps, and
@@ -1193,7 +1203,8 @@ fn tcp_connect_info_from_raw(raw: &TcpConnectRaw, lineage: &AuthSessionTracker) 
         // process is alive (a spawn-cache read, `/proc` on a miss). Left
         // `None`, NN-L-NET-008 never fired in production, and a forked
         // child of a staged dropper (no exec event) went unjudged.
-        exe: lineage.image_path(raw.pid),
+        // Review #471 A1: the image at the connect, not a later exec.
+        exe: lineage.image_path_at(raw.pid, raw.timestamp_ns),
         // External audit NET-016: who holds the PID, read while the process
         // runs; the DNS attribution at close ignores the queries older than
         // it (an earlier holder's).

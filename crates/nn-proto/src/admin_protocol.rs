@@ -939,12 +939,17 @@ pub struct BusQueueStatus {
     /// Events in it now, and the most it held.
     pub depth: u64,
     pub max_depth: u64,
-    /// The longest an event waited in it, microseconds.
+    /// The longest an event waited in it, microseconds: since boot, and in
+    /// the last sample or two (review #471 B2: the boot's backlog is not
+    /// the queue's state).
     pub max_wait_us: u64,
-    /// Sends that waited for room.
+    pub recent_max_wait_us: u64,
+    /// Sends that waited for room, and the longest such wait (µs).
     pub waited: u64,
-    /// Events taken by aging ahead of a higher class.
-    pub aged: u64,
+    pub send_wait_max_us: u64,
+    /// Events taken by their share ahead of a higher class that held
+    /// events (review #471 A2).
+    pub ahead: u64,
     /// Decisions timed, and their latency from queue to decision,
     /// microseconds (`None` before the first).
     pub decided: u64,
@@ -2676,8 +2681,10 @@ mod tests {
                 depth: 0,
                 max_depth: 2,
                 max_wait_us: 40,
+                recent_max_wait_us: 12,
                 waited: 0,
-                aged: 0,
+                send_wait_max_us: 0,
+                ahead: 0,
                 decided: 3,
                 latency_p50_us: Some(120),
                 latency_p99_us: Some(900),

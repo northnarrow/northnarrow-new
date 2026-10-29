@@ -3306,7 +3306,8 @@ fn event_bus_lines(
         };
         out.push(format!(
             "{label}{} {:<7} {} slots ({}): {} queued, {dropped} dropped, depth {} (max {}), \
-             longest wait {} µs, {} waited for room, {} aged; decided {}, p50 {} p99 {} max {}",
+             longest wait {} µs (recent {} µs), {} waited for room (longest {} µs), \
+             {} taken ahead by share; decided {}, p50 {} p99 {} max {}",
             q.priority,
             q.class,
             q.capacity,
@@ -3315,8 +3316,10 @@ fn event_bus_lines(
             q.depth,
             q.max_depth,
             q.max_wait_us,
+            q.recent_max_wait_us,
             q.waited,
-            q.aged,
+            q.send_wait_max_us,
+            q.ahead,
             q.decided,
             us(q.latency_p50_us),
             us(q.latency_p99_us),

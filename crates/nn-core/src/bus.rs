@@ -33,8 +33,9 @@ use nn_model::{CanaryAccessKind, Event, EventClass, ProcessKey};
 
 /// A priority of the bus; [`Priority::P0`] is drained first. Plan §3.4:
 /// tamper (with the sensors' health) at P0, a process's life at P1, files at
-/// P2, the network at P3 — strict, with aging (every [`AGING_EVERY`] draws
-/// from the higher classes, one from the class whose head is oldest).
+/// P2, the network at P3. P0 is strict; P1–P3 share what P0 leaves by
+/// weight ([`SHARE_WEIGHTS`], review #471 A2: the plan's aging gave a
+/// lower class one take in 65 under a higher class's flood).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Priority {
     P0,
@@ -208,25 +209,50 @@ pub const SPECS: [QueueSpec; QUEUES] = [
 ];
 
 /// What a full queue does with `event`: its queue's
-/// [`QueueSpec::when_full`], except for the file events other than
-/// `FileOpen`. Review 75 made the FIM drain wait for room (it dropped its
-/// events on a full queue, and an unprivileged loop of reads was enough to
-/// keep the FIM kill rules from seeing a persistence write); on P2 the
-/// flood is `FileOpen`, so the opens are what a full P2 drops, and a drift,
-/// a credential read, a mass write or a rename burst waits for room — ahead
-/// of the next opens (the runtime's wait is fair), as it waited before.
+/// [`QueueSpec::when_full`], except two kinds of event that wait for room
+/// as every source waited before R12a, their kernel ring absorbing:
+/// - the file events other than `FileOpen`. Review 75 made the FIM drain
+///   wait for room (it dropped its events on a full queue, and an
+///   unprivileged loop of reads was enough to keep the FIM kill rules from
+///   seeing a persistence write); on P2 the flood is `FileOpen`, so the
+///   opens are what a full P2 drops, and a drift, a credential read, a mass
+///   write or a rename burst waits — ahead of the next opens (the runtime's
+///   wait is fair);
+/// - the tamper events other than `FsProtectDenial` (review #471 M1): a
+///   module load, a `bpf()` call, an exploit post-condition, a security
+///   tool signalled, a sensor flood — rare, each from a ring of its own or
+///   carried by another record. Root can fill P0 with refused operations
+///   (inode denials have no kernel budget); while the loop stands still
+///   those wait 50 ms and are dropped, and the rare one queues behind them
+///   instead of being dropped with them.
 pub fn when_full(event: &Event) -> WhenFull {
-    let p = Priority::of_event(event);
-    if p == Priority::P2 && !matches!(event, Event::FileOpen { .. }) {
-        return WhenFull::Backpressure;
+    match Priority::of_event(event) {
+        Priority::P0 if !matches!(event, Event::FsProtectDenial { .. }) => WhenFull::Backpressure,
+        Priority::P2 if !matches!(event, Event::FileOpen { .. }) => WhenFull::Backpressure,
+        p => p.spec().when_full,
     }
-    p.spec().when_full
 }
 
-/// Takes from the higher classes before one is taken by age: after this
-/// many takes in a row that passed over a waiting lower class, the next
-/// take is from the class whose head waited longest (plan §3.4).
-pub const AGING_EVERY: u32 = 64;
+/// Review #471 B3: the most `FileOpen`s the file queue holds (a quarter
+/// of it). Past it a new open is dropped as on a full queue; the rest of
+/// the queue is the other file events' — a FIM record, a mass write, a
+/// rename burst — so a flood of opens holds them at most this many events
+/// behind it (≈ 0.3–1.2 s at EXP-13's rates, where the whole queue held
+/// them four times longer) and never makes the FIM drain wait for room.
+pub const FILE_OPEN_SHARE: usize = 2048;
+
+/// Review #471 A2: what P1, P2 and P3 get of the takes P0 leaves, while
+/// they all hold events — 2 : 1 : 1 (P0's weight is unused: it is strict).
+/// Work-conserving: a class with nothing queued gives its turns to the
+/// others. Under a flood of any one lower class the other two keep at
+/// least a quarter of the consumer each (P1 half): at EXP-13's ~7,000
+/// decisions a second, ≥ 1,750 network events a second against a file
+/// flood (≥ 3,500 with no exec load), where the plan's aging gave one take
+/// in 65 (~110 a second) and the network queue dropped past it. P1 has the
+/// larger share: an exec is the lineage every later event of its process
+/// is judged on, and the exec quarantine holds a process until its exec is
+/// judged.
+pub const SHARE_WEIGHTS: [i64; QUEUES] = [0, 2, 1, 1];
 
 /// One event taken from the bus, with where and how long it waited.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,8 +263,8 @@ pub struct Taken<T> {
     pub enqueued_ns: u64,
     /// How long it waited in its queue.
     pub waited_ns: u64,
-    /// Taken by aging, ahead of a higher class.
-    pub aged: bool,
+    /// Taken by its share ahead of a higher class that held events.
+    pub ahead: bool,
 }
 
 /// One queue's counts since the bus started.
@@ -255,12 +281,15 @@ pub struct QueueStats {
     pub max_depth: u64,
     /// The longest an event waited in it before its take.
     pub max_wait_ns: u64,
-    /// Events taken by aging ahead of a higher class.
-    pub aged: u64,
+    /// The longest since [`ClassQueues::take_window_max_wait`] was last
+    /// called (review #471 B2: the all-time maximum is the boot's backlog).
+    pub window_max_wait_ns: u64,
+    /// Events taken by their share ahead of a higher class.
+    pub ahead: u64,
 }
 
-/// The bus's queues, one per [`Priority`], and their take order: strict
-/// priority with aging, FIFO inside a queue. Bounded: a push to a full
+/// The bus's queues, one per [`Priority`], and their take order: P0 strict,
+/// P1–P3 by weighted shares ([`SHARE_WEIGHTS`]), FIFO inside a queue. Bounded: a push to a full
 /// queue gives the event back (the runtime then waits or drops it, as its
 /// [`WhenFull`] says, and counts the drop with [`Self::note_dropped`]).
 /// Pure: the caller passes the time.
@@ -268,8 +297,8 @@ pub struct QueueStats {
 pub struct ClassQueues<T> {
     queues: [VecDeque<(u64, T)>; QUEUES],
     capacity: [usize; QUEUES],
-    /// Takes in a row that passed over a waiting lower class.
-    streak: u32,
+    /// The smooth weighted round robin's current weights.
+    credit: [i64; QUEUES],
     stats: [QueueStats; QUEUES],
     /// Per queue, how many of its front events [`Self::hand_over_older`]
     /// has handed over (each once).
@@ -286,7 +315,7 @@ impl<T> ClassQueues<T> {
         Self {
             queues: Default::default(),
             capacity: capacity.map(|c| c.max(1)),
-            streak: 0,
+            credit: [0; QUEUES],
             stats: [QueueStats::default(); QUEUES],
             handed: [0; QUEUES],
         }
@@ -316,53 +345,68 @@ impl<T> ClassQueues<T> {
         self.stats[p.index()].dropped += 1;
     }
 
-    /// The next event: from the highest queue that holds one, except that
-    /// after [`AGING_EVERY`] such takes in a row that passed over a waiting
-    /// lower queue, from the queue whose head was queued first (the higher
-    /// on a tie). FIFO inside a queue.
+    /// The next event: P0's while it holds one; else the turn of the
+    /// queues P1–P3 that hold events, by the smooth weighted round robin
+    /// of [`SHARE_WEIGHTS`] (each adds its weight, the largest total is
+    /// taken and pays the sum back; the higher queue on a tie). FIFO inside
+    /// a queue.
     pub fn take(&mut self, now_ns: u64) -> Option<Taken<T>> {
         let top = (0..QUEUES).find(|&i| !self.queues[i].is_empty())?;
-        let lower_waiting = (top + 1..QUEUES).any(|i| !self.queues[i].is_empty());
-        let mut pick = top;
-        if !lower_waiting {
-            self.streak = 0;
-        } else if self.streak >= AGING_EVERY {
-            self.streak = 0;
-            // the oldest head; `min_by_key` keeps the first (higher) on a tie
-            pick = (0..QUEUES)
-                .filter(|&i| !self.queues[i].is_empty())
-                .min_by_key(|&i| self.queues[i].front().map_or(u64::MAX, |(t, _)| *t))
-                .unwrap_or(top);
+        let pick = if top == Priority::P0.index() {
+            top
         } else {
-            self.streak += 1;
-        }
+            let mut total = 0;
+            let mut best = top;
+            let lower = self.queues.iter().zip(&mut self.credit).zip(SHARE_WEIGHTS);
+            for ((queue, credit), weight) in lower.skip(1) {
+                if queue.is_empty() {
+                    *credit = 0;
+                } else {
+                    *credit += weight;
+                    total += weight;
+                }
+            }
+            for i in top..QUEUES {
+                if !self.queues[i].is_empty() && self.credit[i] > self.credit[best] {
+                    best = i;
+                }
+            }
+            self.credit[best] -= total;
+            best
+        };
         let (enqueued_ns, item) = self.queues[pick].pop_front()?;
         self.handed[pick] = self.handed[pick].saturating_sub(1);
         if self.queues[pick].is_empty() && self.queues[pick].capacity() > SHRINK_ABOVE {
             self.queues[pick].shrink_to(SHRINK_ABOVE);
         }
         let waited_ns = now_ns.saturating_sub(enqueued_ns);
-        let aged = pick != top;
+        let ahead = pick != top;
         let st = &mut self.stats[pick];
         st.depth = self.queues[pick].len() as u64;
         st.max_wait_ns = st.max_wait_ns.max(waited_ns);
-        if aged {
-            st.aged += 1;
+        st.window_max_wait_ns = st.window_max_wait_ns.max(waited_ns);
+        if ahead {
+            st.ahead += 1;
         }
         Some(Taken {
             priority: Priority::ALL[pick],
             item,
             enqueued_ns,
             waited_ns,
-            aged,
+            ahead,
         })
+    }
+
+    /// The longest wait of `p` since the last call (review #471 B2: the
+    /// loss recorder's sample window), and start a new window.
+    pub fn take_window_max_wait(&mut self, p: Priority) -> u64 {
+        std::mem::take(&mut self.stats[p.index()].window_max_wait_ns)
     }
 
     /// Hand `f` every event of `p` queued before `before_ns` that no earlier
     /// call handed over, front first, each once — the events of `p` an event
-    /// taken from a higher queue overtakes (lab PR 267: the execs the
-    /// lineage learns before the tamper event that overtakes them is
-    /// judged). Amortised O(1) per event. The queue's times are its push
+    /// taken from another queue overtakes (lab PR 267: the execs the lineage
+    /// learns before the event that overtakes them is judged). Amortised O(1) per event. The queue's times are its push
     /// order's (the caller takes the time under the same lock as the push).
     pub fn hand_over_older(&mut self, p: Priority, before_ns: u64, mut f: impl FnMut(&T)) {
         let i = p.index();
@@ -606,9 +650,11 @@ mod tests {
         }
     }
 
-    /// FIFO inside a queue, strict priority between them.
+    /// FIFO inside a queue; P0 first; then P1–P3 by their shares — P1's
+    /// two turns in four, P2's and P3's one each, an empty queue's turns to
+    /// the others (the higher on a tie).
     #[test]
-    fn takes_are_fifo_in_a_queue_and_by_priority_between() {
+    fn takes_are_fifo_in_a_queue_p0_first_then_by_share() {
         let mut q = ClassQueues::new([8; QUEUES]);
         q.push(p(3), 1, "n1").unwrap();
         q.push(p(2), 2, "f1").unwrap();
@@ -616,87 +662,151 @@ mod tests {
         q.push(p(0), 4, "t1").unwrap();
         q.push(p(1), 5, "p1").unwrap();
         let order: Vec<&str> = std::iter::from_fn(|| q.take(10).map(|t| t.item)).collect();
-        assert_eq!(order, ["t1", "p1", "f1", "f2", "n1"]);
+        assert_eq!(order, ["t1", "p1", "f1", "n1", "f2"]);
         assert!(q.is_empty());
         assert!(q.take(11).is_none());
+        assert_eq!(q.stats(p(3)).ahead, 1, "n1 went ahead of f2");
+        assert_eq!(q.stats(p(2)).ahead, 0);
     }
 
-    /// After 64 takes that passed over a waiting lower queue, one take by
-    /// age: a lower class is never starved by a flood of a higher one.
+    /// P0 is strict: a flood of it is taken whole before any other class,
+    /// and no take of it counts as ahead.
     #[test]
-    fn aging_takes_the_oldest_head_once_every_64() {
+    fn p0_is_strict() {
         let mut q = ClassQueues::new([1000; QUEUES]);
-        q.push(p(3), 0, 9999u32).unwrap();
-        for i in 0..200u32 {
-            q.push(p(2), 1 + u64::from(i), i).unwrap();
+        q.push(p(3), 0, ("n", 0)).unwrap();
+        q.push(p(1), 0, ("p", 0)).unwrap();
+        for i in 0..300u64 {
+            q.push(p(0), 1 + i, ("t", i)).unwrap();
         }
-        let mut taken = Vec::new();
-        while let Some(t) = q.take(1_000) {
-            taken.push((t.priority, t.item, t.aged));
+        let order: Vec<(&str, u64)> =
+            std::iter::from_fn(|| q.take(1_000).map(|t| t.item)).collect();
+        assert!(order[..300].iter().all(|(c, _)| *c == "t"));
+        assert_eq!(order[300..], [("p", 0), ("n", 0)]);
+        for pr in Priority::ALL {
+            assert_eq!(q.stats(pr).ahead, 0, "{pr:?}");
         }
-        let net_at = taken
-            .iter()
-            .position(|(pr, _, _)| *pr == Priority::P3)
-            .unwrap();
-        assert_eq!(
-            net_at, AGING_EVERY as usize,
-            "the 65th take is the aged one"
-        );
-        assert!(taken[net_at].2, "marked aged");
-        // FIFO of the file queue is kept around it
-        let files: Vec<u32> = taken
-            .iter()
-            .filter(|(pr, _, _)| *pr == Priority::P2)
-            .map(|(_, i, _)| *i)
-            .collect();
-        assert_eq!(files, (0..200).collect::<Vec<_>>());
-        assert_eq!(q.stats(p(3)).aged, 1);
-        assert_eq!(q.stats(p(2)).aged, 0);
     }
 
-    /// An aging take picks the oldest head, which can be a higher class:
-    /// then nothing is taken out of order, and nothing counts as aged.
+    /// With P1, P2 and P3 all holding events, every window of four takes
+    /// is two of P1, one of P2, one of P3, each queue FIFO (review #471
+    /// A2: the share is a floor at every point, not on average).
     #[test]
-    fn aging_picks_the_oldest_head_even_a_higher_one() {
+    fn the_shares_hold_in_every_window_of_four_takes() {
         let mut q = ClassQueues::new([1000; QUEUES]);
-        for i in 0..100u64 {
-            q.push(p(0), i, ("t", i)).unwrap();
-        }
-        q.push(p(1), 1_000, ("p", 0)).unwrap();
-        let mut aged = 0;
-        let mut first_p = None;
-        let mut n = 0;
-        while let Some(t) = q.take(2_000) {
-            aged += u32::from(t.aged);
-            if t.item.0 == "p" && first_p.is_none() {
-                first_p = Some(n);
+        for i in 0..400u32 {
+            for c in 1..QUEUES {
+                q.push(p(c), u64::from(i), i).unwrap();
             }
-            n += 1;
         }
-        assert_eq!(aged, 0, "the P0 heads were older than the P1 one");
-        assert_eq!(first_p, Some(100), "P1 after every older P0");
+        let mut taken: Vec<(usize, u32)> = Vec::new();
+        for _ in 0..400 {
+            let t = q.take(1_000).unwrap();
+            taken.push((t.priority.index(), t.item));
+        }
+        for w in taken.chunks(4) {
+            let n = |c| w.iter().filter(|(pr, _)| *pr == c).count();
+            assert_eq!((n(1), n(2), n(3)), (2, 1, 1), "{w:?}");
+        }
+        for c in 1..QUEUES {
+            let items: Vec<u32> = taken
+                .iter()
+                .filter(|(pr, _)| *pr == c)
+                .map(|(_, i)| *i)
+                .collect();
+            assert_eq!(
+                items,
+                (0..items.len() as u32).collect::<Vec<_>>(),
+                "P{c} FIFO"
+            );
+        }
     }
 
-    /// No lower queue waiting: no streak builds (a lone flood takes no
-    /// aging turn that would later jump an event that just arrived).
+    /// A queue that ran empty banks no turns: an event arriving after a
+    /// long flood of another class waits at most one take, not a burst of
+    /// saved-up turns that would hold the flood back.
     #[test]
-    fn the_streak_counts_only_takes_that_passed_over_a_waiting_queue() {
+    fn an_empty_queue_banks_no_turns() {
         let mut q = ClassQueues::new([1000; QUEUES]);
         for i in 0..300u64 {
-            q.push(p(0), i, i).unwrap();
+            q.push(p(2), i, i).unwrap();
         }
         for _ in 0..200 {
-            q.take(400).unwrap();
+            assert_eq!(q.take(400).unwrap().priority, Priority::P2);
         }
-        q.push(p(3), 500, 7).unwrap();
-        let mut before = 0;
-        while let Some(t) = q.take(600) {
-            if t.priority == Priority::P3 {
-                break;
+        for i in 0..4u64 {
+            q.push(p(3), 500 + i, 1_000 + i).unwrap();
+        }
+        let order: Vec<usize> = (0..8)
+            .map(|_| q.take(600).unwrap().priority.index())
+            .collect();
+        assert_eq!(order, [2, 3, 2, 3, 2, 3, 2, 3]);
+    }
+
+    /// Review #471 A2, the reviewer's simulation as a test: P2 kept full
+    /// (a file-open flood), the network arriving at a fraction of the
+    /// takes, P3 dropping when full. With the plan's aging the network got
+    /// one take in ~66: at 1/20 of the takes 5,781 of 20,000 were dropped,
+    /// at 1/10 25,781 of 40,000. With the shares nothing is dropped up to
+    /// half the takes, the wait stays a take or two; and with P1 flooded
+    /// too, the network keeps its quarter.
+    #[test]
+    fn a_flood_of_a_higher_class_leaves_the_network_its_share() {
+        const TAKES: u64 = 400_000;
+        // (P1 flooded too, network every n takes) -> (taken, dropped, max wait in takes)
+        let run = |p1_flood: bool, every: u64| {
+            let mut q = ClassQueues::with_specs();
+            let (mut arrived, mut taken, mut dropped, mut max_wait) = (0u64, 0u64, 0u64, 0u64);
+            for now in 0..TAKES {
+                while q.len(Priority::P2) < q.capacity(Priority::P2) {
+                    q.push(Priority::P2, now, false).unwrap();
+                }
+                while p1_flood && q.len(Priority::P1) < q.capacity(Priority::P1) {
+                    q.push(Priority::P1, now, false).unwrap();
+                }
+                if now % every == 0 {
+                    arrived += 1;
+                    if q.push(Priority::P3, now, true).is_err() {
+                        q.note_dropped(Priority::P3);
+                        dropped += 1;
+                    }
+                }
+                let t = q.take(now).unwrap();
+                if t.item {
+                    taken += 1;
+                    max_wait = max_wait.max(t.waited_ns);
+                }
             }
-            before += 1;
+            assert_eq!(q.stats(Priority::P3).dropped, dropped);
+            (arrived, taken, dropped, max_wait)
+        };
+        for every in [100, 50, 20, 10, 4, 2] {
+            let (arrived, taken, dropped, max_wait) = run(false, every);
+            assert_eq!(dropped, 0, "1/{every}: {dropped} dropped");
+            assert!(
+                arrived - taken <= 1,
+                "1/{every}: {taken} of {arrived} taken"
+            );
+            assert!(max_wait <= 1, "1/{every}: waited {max_wait} takes");
         }
-        assert_eq!(before, 100, "the P0 queue ran empty first (all older)");
+        for every in [100, 20, 10, 4] {
+            let (arrived, taken, dropped, max_wait) = run(true, every);
+            assert_eq!(dropped, 0, "P1 flooded, 1/{every}: {dropped} dropped");
+            assert!(
+                arrived - taken <= 1,
+                "P1 flooded, 1/{every}: {taken} of {arrived}"
+            );
+            assert!(
+                max_wait <= 3,
+                "P1 flooded, 1/{every}: waited {max_wait} takes"
+            );
+        }
+        // past its share the queue fills and drops, and says so
+        let (arrived, taken, dropped, _) = run(true, 2);
+        assert!(
+            dropped > 0 && taken >= TAKES / 4 - 1,
+            "{taken} of {arrived}, {dropped} dropped"
+        );
     }
 
     /// A full queue gives the event back; the counts follow the queue.
@@ -791,6 +901,20 @@ mod tests {
         };
         assert_eq!(class_of(&denial), EventClass::Tamper);
         assert_eq!(when_full(&denial), WhenFull::Wait { max_ns: P0_WAIT_NS });
+        // review #471 M1: the rare tamper sources wait for room — a flood of
+        // denials does not drop them
+        let module = Event::ModuleLoad {
+            method: nn_model::ModuleLoadMethod::Finit,
+            loader_pid: 1,
+            loader_uid: 0,
+            loader_comm: String::new(),
+            parent_comm: String::new(),
+            parent_is_kthread: false,
+            path: None,
+            timestamp_ns: 0,
+        };
+        assert_eq!(class_of(&module), EventClass::Tamper);
+        assert_eq!(when_full(&module), WhenFull::Backpressure);
         let listener = Event::NetListener(nn_model::telemetry::NetListenerEvent {
             timestamp_ns: 0,
             family: 2,
@@ -803,6 +927,42 @@ mod tests {
             exe: None,
         });
         assert_eq!(when_full(&listener), WhenFull::DropNew);
+    }
+
+    /// A canary trip is its source event's class (review #471 M10: a file
+    /// canary read is a file event, judged in P2's order, not a tamper
+    /// event jumping the opens of the same reader).
+    #[test]
+    fn a_canary_trip_is_its_source_event_s_class() {
+        let trip = |access_kind, canary_type| Event::CanaryTripped {
+            canary_id: String::new(),
+            canary_name: String::new(),
+            canary_type,
+            access_kind,
+            accessor_pid: 1,
+            accessor_uid: 0,
+            accessor_comm: String::new(),
+            accessor_exe: None,
+            timestamp_ns: 0,
+            first_trip: true,
+        };
+        use nn_model::CanaryTypeTag as T;
+        for (kind, ty, class) in [
+            (CanaryAccessKind::FileOpen, T::File, EventClass::File),
+            (CanaryAccessKind::FileOpen, T::Credential, EventClass::File),
+            (
+                CanaryAccessKind::ProcessExec,
+                T::Process,
+                EventClass::Process,
+            ),
+            (
+                CanaryAccessKind::NetworkConnect,
+                T::Network,
+                EventClass::Network,
+            ),
+        ] {
+            assert_eq!(class_of(&trip(kind, ty)), class, "{kind:?}");
+        }
     }
 
     /// The histogram's quantiles stay within a bucket (12.5 %) of the value
