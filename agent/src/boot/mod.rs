@@ -5,7 +5,10 @@
 //! instead of comments in `main()`:
 //!
 //! 1. [`BootPhase::Preflight`] — checks only, nothing is loaded into the
-//!    kernel: the embedded eBPF object, the state directory, the BTF
+//!    kernel: first (lab PR 265) the agent's own directories not mounted
+//!    over and its signing key there or no earlier identity on record —
+//!    refused at once and unsigned, before anything is read or written —;
+//!    then the embedded eBPF object, the state directory, the BTF
 //!    offsets, the capabilities, the install manifest, the audit log's
 //!    writability and (R11b, lab PR 262) its chain, opened, the active LSMs
 //!    ([`lsm`]), the deny hooks' pin root and BTF. A refusal here leaves

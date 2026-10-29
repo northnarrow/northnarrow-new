@@ -41,7 +41,9 @@ const SIGNING_KEY_HEX_LEN: usize = SECRET_KEY_LENGTH * 2;
 /// Agent-owned Ed25519 keypair that signs audit-log entries. The
 /// key is **internal** to the agent install — not an admin key,
 /// not user-facing — and is rotated only by re-installing the
-/// agent. Off-host verifiers consume the pubkey via
+/// agent with its identity retired (lab PR 265: `uninstall.sh
+/// --purge`, then a fresh install; an absent key is never minted where
+/// an earlier identity is on record). Off-host verifiers consume the pubkey via
 /// [`AgentSigningKey::verifying_key`] which the future
 /// `nn-admin audit verify` command will accept on the CLI.
 ///
@@ -95,9 +97,10 @@ impl AgentSigningKey {
                 let key = parse_signing_key(&content).with_context(|| {
                     format!(
                         "agent signing key {} present but corrupted — refuse to \
-                         silently regenerate; remove the file deliberately if you \
-                         intend to mint a new key (note: every existing audit-log \
-                         signature stops verifying)",
+                         silently regenerate; to re-key on purpose, retire the \
+                         install's identity (docs/operator/INSTALL_UPGRADE_UNINSTALL.md, \
+                         \"Re-keying the agent\"): removing the file alone refuses \
+                         the start",
                         path.display()
                     )
                 })?;
