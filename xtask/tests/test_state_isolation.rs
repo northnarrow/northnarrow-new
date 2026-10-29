@@ -46,7 +46,7 @@ mod support;
 use std::collections::BTreeSet;
 use std::fs;
 
-use support::{repo_root, rs_files};
+use support::{repo_root, rs_files, strip_comments};
 
 const HELPER: &str = "agent/tests/common/agent_state.rs";
 const COMMON: &str = "agent/tests/common/mod.rs";
@@ -183,103 +183,6 @@ fn test_sources() -> Vec<(String, String)> {
 }
 
 // ── lexing ────────────────────────────────────────────────────────────────
-
-/// `src` with its comments blanked (newlines kept, so line numbers hold);
-/// string, raw string and char literals kept as they are.
-fn strip_comments(src: &str) -> String {
-    let b = src.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    let blank = |c: u8| if c == b'\n' { b'\n' } else { b' ' };
-    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
-    while i < b.len() {
-        let c = b[i];
-        if c == b'/' && b.get(i + 1) == Some(&b'/') {
-            while i < b.len() && b[i] != b'\n' {
-                out.push(b' ');
-                i += 1;
-            }
-        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
-            let mut depth = 0usize;
-            while i < b.len() {
-                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
-                    depth += 1;
-                    out.extend_from_slice(b"  ");
-                    i += 2;
-                } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
-                    depth -= 1;
-                    out.extend_from_slice(b"  ");
-                    i += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    out.push(blank(b[i]));
-                    i += 1;
-                }
-            }
-        } else if c == b'r'
-            && (i == 0 || !ident(b[i - 1]))
-            && matches!(b.get(i + 1), Some(b'"') | Some(b'#'))
-        {
-            // r"…", r#"…"#
-            let mut j = i + 1;
-            while b.get(j) == Some(&b'#') {
-                j += 1;
-            }
-            if b.get(j) != Some(&b'"') {
-                out.push(c);
-                i += 1;
-                continue;
-            }
-            let hashes = j - i - 1;
-            let mut close = vec![b'"'];
-            close.extend(std::iter::repeat_n(b'#', hashes));
-            let end = b[j + 1..]
-                .windows(close.len())
-                .position(|w| w == close.as_slice())
-                .map_or(b.len(), |p| j + 1 + p + close.len());
-            out.extend_from_slice(&b[i..end]);
-            i = end;
-        } else if c == b'"' {
-            let start = i;
-            i += 1;
-            while i < b.len() && b[i] != b'"' {
-                if b[i] == b'\\' {
-                    i += 1;
-                }
-                i += 1;
-            }
-            i = (i + 1).min(b.len());
-            out.extend_from_slice(&b[start..i]);
-        } else if c == b'\'' {
-            // A char literal ('x', '\n', '\u{1b}') or a lifetime ('a).
-            if b.get(i + 1) == Some(&b'\\') {
-                let start = i;
-                i += 2;
-                while i < b.len() && b[i] != b'\'' {
-                    i += 1;
-                }
-                i = (i + 1).min(b.len());
-                out.extend_from_slice(&b[start..i]);
-            } else {
-                // `i` follows ASCII bytes only, so `i + 1` is a char boundary.
-                let len = src[i + 1..].chars().next().map_or(1, char::len_utf8);
-                if b.get(i + 1 + len) == Some(&b'\'') {
-                    out.extend_from_slice(&b[i..i + 2 + len]);
-                    i += 2 + len;
-                } else {
-                    out.push(c);
-                    i += 1;
-                }
-            }
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).expect("blanking keeps UTF-8")
-}
 
 /// The contents of the string literals of `code` (comments already
 /// blanked), with the line each starts on.
