@@ -509,7 +509,11 @@ const MOUNT_WATCHED: &[&str] = &[
     "/usr/lib/systemd/system/northnarrow-watchdog-failed.service",
 ];
 
-/// One line of a `mountinfo` text.
+/// One line of a `mountinfo` text: the shared byte-level parse
+/// ([`crate::mountinfo`], lab PR 265, the review of #468 R1/R3 — the split
+/// on Unicode spaces shifted the fields of a path holding U+00A0, and a
+/// byte that is not UTF-8 anywhere in the table made it unreadable), with
+/// the paths as text for the findings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Mount {
     id: u64,
@@ -520,34 +524,26 @@ struct Mount {
     root: String,
     mount_point: String,
     fstype: String,
+    /// The line as parsed, its paths byte for byte (the self-bind rule).
+    entry: crate::mountinfo::MountEntry,
 }
 
-/// The lines of a `mountinfo` text, in order; malformed lines are skipped.
-fn parse_mountinfo(mountinfo: &str) -> Vec<Mount> {
-    let mut out = Vec::new();
-    for line in mountinfo.lines() {
-        // id parent major:minor root mount_point opts [optional...] - fstype source superopts
-        let mut parts = line.split(" - ");
-        let (Some(left), Some(right)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let fields: Vec<&str> = left.split_whitespace().collect();
-        if fields.len() < 5 {
-            continue;
-        }
-        let (Ok(id), Ok(parent)) = (fields[0].parse(), fields[1].parse()) else {
-            continue;
-        };
-        out.push(Mount {
-            id,
-            parent,
-            dev: fields[2].to_string(),
-            root: unescape(fields[3]),
-            mount_point: unescape(fields[4]),
-            fstype: right.split_whitespace().next().unwrap_or("").to_string(),
-        });
-    }
-    out
+/// The lines of a `mountinfo` table, in order ([`crate::mountinfo::parse`]);
+/// a line not in the kernel's shape is skipped.
+fn parse_mountinfo(mountinfo: &[u8]) -> Vec<Mount> {
+    crate::mountinfo::parse(mountinfo)
+        .entries
+        .into_iter()
+        .map(|e| Mount {
+            id: e.id,
+            parent: e.parent,
+            dev: e.dev(),
+            root: e.root.to_string_lossy().into_owned(),
+            mount_point: e.mount_point.to_string_lossy().into_owned(),
+            fstype: e.fstype.to_string_lossy().into_owned(),
+            entry: e,
+        })
+        .collect()
 }
 
 /// Is `mp` the path or a directory above it?
@@ -598,17 +594,21 @@ fn mount_chain<'a>(mounts: &'a [Mount], path: &str) -> Vec<&'a Mount> {
 }
 
 /// A mount the agent's own unit makes in its namespace: `ReadWritePaths=`
-/// and `RuntimeDirectory=` bind each directory onto itself (same
-/// filesystem as the mount below it, the directory's own path as root).
-/// Only in [`MountSource::Own`]: in the host's namespace there is none.
+/// and `RuntimeDirectory=` bind each directory onto itself — the start's
+/// rule ([`crate::mountinfo::is_self_bind`], lab PR 265: the same
+/// filesystem as the mount below it, its root that mount's root joined
+/// with the path between them, by component; the string suffix it was
+/// took any bind whose mount point ends with its root for one: a
+/// `/lib/northnarrow` of the root filesystem over `/var/lib/northnarrow`). Only in
+/// [`MountSource::Own`]: in the host's namespace there is none.
 fn is_unit_sandbox(m: &Mount, mounts: &[Mount], sandbox: &[String]) -> bool {
-    sandbox.contains(&m.mount_point)
-        && m.root != "/"
-        && m.mount_point.ends_with(&m.root)
+    sandbox
+        .iter()
+        .any(|d| std::path::Path::new(d) == m.entry.mount_point)
         && mounts
             .iter()
-            .find(|p| p.id == m.parent)
-            .is_some_and(|p| p.dev == m.dev)
+            .find(|p| p.id == m.parent && p.id != m.id)
+            .is_some_and(|p| crate::mountinfo::is_self_bind(&m.entry, &p.entry))
 }
 
 /// The directories the agent's unit makes writable (and so binds onto
@@ -633,8 +633,8 @@ fn covers_protected(mp: &str, extra_files: &[String]) -> bool {
 /// Mounts in a `mountinfo` text that cover a protected path, a bpffs
 /// outside the canonical root, or the tracefs the agent reads its
 /// tracepoint offsets from.
-pub fn mount_findings(mountinfo: &str, extra_files: &[String]) -> Vec<Finding> {
-    mounts_over_protected(&parse_mountinfo(mountinfo), extra_files, &[])
+pub fn mount_findings(mountinfo: impl AsRef<[u8]>, extra_files: &[String]) -> Vec<Finding> {
+    mounts_over_protected(&parse_mountinfo(mountinfo.as_ref()), extra_files, &[])
 }
 
 /// [`mount_findings`] on parsed lines; a mount of the unit's own sandbox
@@ -698,9 +698,9 @@ pub struct MountWatch {
 /// ([`MOUNT_WATCHED`], `own_files`) is `mount_over_protected` too, and a
 /// mount a watched path resolved through that is gone is
 /// `protected_mount_gone`.
-pub fn mount_round(
-    primary: std::io::Result<String>,
-    fallback: impl FnOnce() -> std::io::Result<String>,
+pub fn mount_round<T: AsRef<[u8]>>(
+    primary: std::io::Result<T>,
+    fallback: impl FnOnce() -> std::io::Result<T>,
     own_files: &[String],
     watch: &mut MountWatch,
 ) -> Vec<Finding> {
@@ -719,7 +719,7 @@ pub fn mount_round(
             }
         },
     };
-    let mounts = parse_mountinfo(&text);
+    let mounts = parse_mountinfo(text.as_ref());
     let watched: Vec<String> = MOUNT_WATCHED
         .iter()
         .map(|p| p.to_string())
@@ -834,13 +834,6 @@ fn covers_tracefs(mp: &str, source_root: &str, fstype: &str) -> bool {
             Some(rest) => rest.starts_with('/'),
             None => false,
         })
-}
-
-fn unescape(s: &str) -> String {
-    s.replace("\\040", " ")
-        .replace("\\011", "\t")
-        .replace("\\012", "\n")
-        .replace("\\134", "\\")
 }
 
 /// `*.local` overlays in `dir` with size and a short sha256.
@@ -1529,8 +1522,8 @@ impl Checker {
     /// This round's mount findings ([`mount_round`] on the live files).
     fn read_mounts(&mut self) -> Vec<Finding> {
         mount_round(
-            std::fs::read_to_string(MOUNTINFO_HOST),
-            || std::fs::read_to_string(MOUNTINFO_OWN),
+            std::fs::read(MOUNTINFO_HOST),
+            || std::fs::read(MOUNTINFO_OWN),
             &self.own_files,
             &mut self.mounts,
         )
@@ -2431,6 +2424,42 @@ mod tests {
         );
     }
 
+    /// Lab PR 265 (the review of #468 R1, R3): the watcher reads the table
+    /// byte by byte as the start does — a bind over `/etc/northnarrow` from
+    /// a directory named with U+00A0 is reported (the split on Unicode
+    /// spaces read its mount point as `/x`), a mount elsewhere on a name
+    /// that is not UTF-8 is read (it made the round's table unreadable), and
+    /// the unit's sandbox is judged by the start's self-bind rule: a bind of
+    /// the root filesystem's `/lib/northnarrow` over `/var/lib/northnarrow`
+    /// (the string suffix rule's look-alike: the mount point ends with the
+    /// root) is not the unit's.
+    #[test]
+    fn the_watcher_reads_the_table_as_bytes_and_by_component() {
+        let mut mi = b"29 1 252:1 / / rw - ext4 /dev/vda1 rw\n".to_vec();
+        mi.extend_from_slice(
+            b"500 29 252:1 /tmp/fake\xc2\xa0/x /etc/northnarrow rw - ext4 /dev/vda1 rw\n",
+        );
+        mi.extend_from_slice(b"501 29 0:90 / /home/u/x\xff rw - fuse.sshfs u\xff rw\n");
+        let f = mount_findings(&mi, &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "mount_over_protected");
+        assert!(f[0].detail.starts_with("/etc/northnarrow (ext4"), "{f:?}");
+        let mut w = MountWatch::default();
+        let r = mount_round(Ok(mi.clone()), || Ok(Vec::new()), &[], &mut w);
+        assert!(r.iter().all(|f| f.kind != "mountinfo_unreadable"), "{r:?}");
+        let own = "29 1 252:1 / / rw - ext4 /dev/vda1 rw
+566 29 252:1 /etc/northnarrow /etc/northnarrow rw - ext4 /dev/vda1 rw
+567 29 252:1 /lib/northnarrow /var/lib/northnarrow rw - ext4 /dev/vda1 rw
+";
+        let m = parse_mountinfo(own.as_bytes());
+        let sandbox = vec![
+            "/etc/northnarrow".to_string(),
+            "/var/lib/northnarrow".to_string(),
+        ];
+        assert!(is_unit_sandbox(&m[1], &m, &sandbox));
+        assert!(!is_unit_sandbox(&m[2], &m, &sandbox));
+    }
+
     #[test]
     fn mount_chain_follows_stacking_and_skips_shadowed_mounts() {
         // /var/lib mounted on the root filesystem, then /var over it: the
@@ -2441,7 +2470,7 @@ mod tests {
 51 24 8:3 / /var rw - ext4 /dev/sda3 rw
 52 51 0:40 / /var rw - tmpfs tmpfs rw
 ";
-        let m = parse_mountinfo(mi);
+        let m = parse_mountinfo(mi.as_bytes());
         let ids: Vec<u64> = mount_chain(&m, "/var/lib/northnarrow")
             .iter()
             .map(|m| m.id)

@@ -832,6 +832,59 @@ impl Cli {
         })
     }
 
+    /// Lab PR 265 (review #466 F4-bis): the chains whose signed rows say
+    /// that this install had a signing identity — the audit log, the
+    /// chains the agent anchors, the FIM baseline and the listener log —
+    /// with the key's name, the install's id and the head anchor
+    /// (`boot::checks::signing_identity`).
+    pub(crate) fn identity_paths(&self) -> northnarrow_agent::boot::continuity::IdentityPaths {
+        let p = self.chain_paths();
+        northnarrow_agent::boot::continuity::IdentityPaths {
+            signing_key: self.signing_key_file.clone(),
+            agent_id: self.agent_id_file.clone(),
+            heads: self.resolved_chain_heads_file(),
+            chains: vec![
+                p.audit,
+                p.canary_registry,
+                p.canary_access,
+                p.detections,
+                p.status_events,
+                p.netflow,
+                p.fim_drift,
+                self.fim_baseline_file.clone(),
+                self.netflow_listeners_file.clone(),
+            ],
+        }
+    }
+
+    /// Lab PR 265 (review #466 F4-bis): the directories of the files that
+    /// make this agent — its key, identity, administrators' keys, install
+    /// manifest, head anchor and chains — for `boot::checks::agent_mounts`,
+    /// which adds `/etc/northnarrow` and `/var/lib/northnarrow` itself.
+    pub(crate) fn state_dirs(&self) -> Vec<PathBuf> {
+        let heads = self.resolved_chain_heads_file();
+        let ids = self.identity_paths();
+        let mut files: Vec<&std::path::Path> = vec![
+            &self.signing_key_file,
+            &self.agent_id_file,
+            &self.admin_pub,
+            &self.install_manifest,
+            &heads,
+        ];
+        files.extend(ids.chains.iter().map(PathBuf::as_path));
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for f in files {
+            let d = match f.parent() {
+                Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+        dirs
+    }
+
     /// The chains the agent anchors, at the configured paths.
     pub(crate) fn chain_paths(&self) -> northnarrow_agent::chains::ChainPaths {
         northnarrow_agent::chains::ChainPaths {
@@ -965,7 +1018,92 @@ pub(crate) static TEST_ENV: parking_lot::Mutex<()> = parking_lot::Mutex::new(())
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+
+    /// Lab PR 265 (the review of #468, M5): the identity the start looks
+    /// for and the directories it checks are every state file of the
+    /// command line — the installed agent's paths by default, the test's
+    /// with its flags: each chain, the key, the id, the head anchor; each
+    /// file's directory, the administrators' keys' and the manifest's too.
+    #[test]
+    fn the_identity_and_the_state_dirs_are_every_state_file() {
+        let _env = TEST_ENV.lock();
+        let cli = Cli::try_parse_from(["northnarrow-agent"]).expect("the defaults");
+        let ids = cli.identity_paths();
+        assert_eq!(ids.signing_key, Path::new("/etc/northnarrow/agent.sig.key"));
+        assert_eq!(ids.agent_id, Path::new("/etc/northnarrow/agent_id"));
+        assert_eq!(ids.heads, Path::new("/etc/northnarrow/chain_heads.json"));
+        let mut chains: Vec<String> = ids.chains.iter().map(|p| p.display().to_string()).collect();
+        chains.sort();
+        assert_eq!(
+            chains,
+            [
+                "/etc/northnarrow/audit.log",
+                "/var/lib/northnarrow/canaries.jsonl",
+                "/var/lib/northnarrow/canary_access.jsonl",
+                "/var/lib/northnarrow/detections/detections.jsonl",
+                "/var/lib/northnarrow/detections/status_events.jsonl",
+                "/var/lib/northnarrow/fim_baseline.jsonl",
+                "/var/lib/northnarrow/fim_drift.jsonl",
+                "/var/lib/northnarrow/netflow.jsonl",
+                "/var/lib/northnarrow/netflow_listeners.jsonl",
+            ]
+        );
+        let mut dirs: Vec<String> = cli
+            .state_dirs()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        dirs.sort();
+        assert_eq!(
+            dirs,
+            [
+                "/etc/northnarrow",
+                "/var/lib/northnarrow",
+                "/var/lib/northnarrow/detections",
+            ]
+        );
+
+        let d = std::path::PathBuf::from("/srv/t");
+        let flag = |f: &str, name: &str| [f.to_string(), d.join(name).display().to_string()];
+        let mut args = vec!["northnarrow-agent".to_string()];
+        for (f, name) in [
+            ("--signing-key-file", "k/agent.sig.key"),
+            ("--agent-id-file", "id/agent_id"),
+            ("--admin-pub", "admin/admin.pub"),
+            ("--install-manifest", "m/install-manifest.json"),
+            ("--audit-log-file", "a/audit.log"),
+            ("--chain-heads-file", "h/chain_heads.json"),
+            ("--detections-file", "c/detections.jsonl"),
+            ("--status-events-file", "c/status_events.jsonl"),
+            ("--netflow-file", "c/netflow.jsonl"),
+            ("--netflow-listeners-file", "c/netflow_listeners.jsonl"),
+            ("--fim-baseline-file", "f/fim_baseline.jsonl"),
+            ("--fim-drift-file", "f/fim_drift.jsonl"),
+            ("--canary-registry-file", "y/canaries.jsonl"),
+            ("--canary-access-file", "y/canary_access.jsonl"),
+        ] {
+            args.extend(flag(f, name));
+        }
+        let cli = Cli::try_parse_from(&args).expect("a test's command line");
+        let ids = cli.identity_paths();
+        assert_eq!(ids.heads, d.join("h/chain_heads.json"));
+        assert_eq!(ids.chains.len(), 9);
+        assert!(
+            ids.chains.iter().all(|c| c.starts_with(&d)),
+            "{:?}",
+            ids.chains
+        );
+        let mut dirs: Vec<String> = cli
+            .state_dirs()
+            .iter()
+            .map(|p| p.strip_prefix(&d).unwrap().display().to_string())
+            .collect();
+        dirs.sort();
+        assert_eq!(dirs, ["a", "admin", "c", "f", "h", "id", "k", "m", "y"]);
+    }
 
     /// Wave 4 (lab PR 214): a unit written for an agent with the LLM
     /// advisor still parses — its flags are accepted, ignored and named.

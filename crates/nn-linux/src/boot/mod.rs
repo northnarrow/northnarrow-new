@@ -27,6 +27,7 @@
 //! check against this host and was refused by none.
 
 pub mod checks;
+pub mod continuity;
 pub mod degradation;
 pub mod lsm;
 pub mod manifest;
@@ -89,6 +90,8 @@ impl BootPhase {
         use BootStep::*;
         match self {
             BootPhase::Preflight => &[
+                AgentMounts,
+                SigningIdentity,
                 EbpfObject,
                 StateDir,
                 BtfOffsets,
@@ -111,6 +114,14 @@ impl BootPhase {
 /// One step of a start, each in one phase ([`BootStep::phase`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BootStep {
+    /// Lab PR 265 (review #466 F4-bis): no mount laid over the agent's own
+    /// directories but a bind of a directory onto itself
+    /// ([`continuity::mounts_over`]).
+    AgentMounts,
+    /// Lab PR 265 (review #466 F4-bis): the agent's signing key is there,
+    /// or nothing says the install had one ([`continuity::prior_identity`]):
+    /// only a first install mints one.
+    SigningIdentity,
     /// The embedded eBPF object is real and intact.
     EbpfObject,
     /// The state directory is not a symbolic link.
@@ -161,12 +172,16 @@ impl BootStep {
     /// ([`checks`]), never [`BootSequence::done`] — the ones the attach
     /// depends on: the eBPF object, the state directory, the BTF offsets,
     /// the capabilities, the install manifest, the audit log, the BPF LSM,
-    /// and (review #466 F6) the deny hooks' pin root and the kernel's BTF.
+    /// (review #466 F6) the deny hooks' pin root and the kernel's BTF, and
+    /// (lab PR 265, review #466 F4-bis) the agent's directories' mounts and
+    /// its signing identity.
     pub fn is_checked(self) -> bool {
         use BootStep::*;
         matches!(
             self,
-            EbpfObject
+            AgentMounts
+                | SigningIdentity
+                | EbpfObject
                 | StateDir
                 | BtfOffsets
                 | Capabilities
@@ -181,10 +196,9 @@ impl BootStep {
     pub fn phase(self) -> BootPhase {
         use BootStep::*;
         match self {
-            EbpfObject | StateDir | BtfOffsets | ChainHeads | Identity | Capabilities
-            | InstallManifest | AuditWritable | HostHardening | BpfLsm | PinRoot | VmlinuxBtf => {
-                BootPhase::Preflight
-            }
+            AgentMounts | SigningIdentity | EbpfObject | StateDir | BtfOffsets | ChainHeads
+            | Identity | Capabilities | InstallManifest | AuditWritable | HostHardening
+            | BpfLsm | PinRoot | VmlinuxBtf => BootPhase::Preflight,
             Sensors | AntiTamper => BootPhase::Attach,
             DenySelfTest => BootPhase::SelfTest,
             AgentBoot | BootDegradations => BootPhase::Attest,
@@ -195,6 +209,8 @@ impl BootStep {
     pub fn name(self) -> &'static str {
         use BootStep::*;
         match self {
+            AgentMounts => "agent_mounts",
+            SigningIdentity => "signing_identity",
             EbpfObject => "ebpf_object",
             StateDir => "state_dir",
             BtfOffsets => "btf_offsets",
@@ -491,6 +507,8 @@ mod tests {
             assert_eq!(b.phase(), BootPhase::Preflight);
         }
         for check in [
+            BootStep::AgentMounts,
+            BootStep::SigningIdentity,
             BootStep::EbpfObject,
             BootStep::StateDir,
             BootStep::BtfOffsets,
@@ -514,6 +532,8 @@ mod tests {
         for p in BootPhase::ORDER {
             let steps: &[BootStep] = match p {
                 BootPhase::Preflight => &[
+                    BootStep::AgentMounts,
+                    BootStep::SigningIdentity,
                     BootStep::EbpfObject,
                     BootStep::StateDir,
                     BootStep::BtfOffsets,

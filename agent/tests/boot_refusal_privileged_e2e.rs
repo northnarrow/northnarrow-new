@@ -11,7 +11,12 @@
 //! - an audit log that cannot be written (a directory where it goes);
 //! - a broken audit chain (a line that is not a row before the end);
 //! - a failed capability gate (`CAP_KILL` dropped from the bounding set by
-//!   `setpriv`, the enforcing agent's gate).
+//!   `setpriv`, the enforcing agent's gate);
+//! - lab PR 265 (review #466 F4-bis): the key absent beside an earlier
+//!   identity (its public half, the install's id, a signed audit row), and
+//!   an empty directory bound over the state directory in a mount
+//!   namespace of the agent's own — refused unsigned (nothing can sign
+//!   them), no key minted, nothing written.
 //!
 //! Each start exits 78 with its gate's refusal signed — an `agent_boot` row
 //! with `result: refused` and `refused_by` the gate, in the audit log or,
@@ -201,11 +206,17 @@ fn run_until_exit(
     extra: &[&std::ffi::OsStr],
     log: &Path,
 ) -> ExitStatus {
+    let mut cmd = installed.command(state, launch, &[]);
+    cmd.args(extra);
+    command_until_exit(cmd, log)
+}
+
+/// [`run_until_exit`] of a command already made (lab PR 265: the agent in a
+/// mount namespace of its own, `InstalledAgent::command_with_binds`).
+fn command_until_exit(mut cmd: Command, log: &Path) -> ExitStatus {
     let out = std::fs::File::create(log).expect("the agent's log");
     let err = out.try_clone().expect("the agent's log");
-    let mut child = installed
-        .command(state, launch, &[])
-        .args(extra)
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err)
@@ -650,6 +661,154 @@ fn a_key_that_cannot_be_loaded_is_refused_before_the_load() {
             .is_symlink(),
         "the key's name left as it was"
     );
+}
+
+/// What an earlier boot of this install leaves: the agent's key and its
+/// public half, the install's id, a signed row in the audit chain. Made the
+/// way the agent makes them, in `state`'s directory.
+fn an_earlier_identity(state: &AgentState) {
+    let key = northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&state.signing_key())
+        .expect("the key");
+    let id =
+        northnarrow_agent::agent_id::load_or_bootstrap(&state.agent_id_file()).expect("the id");
+    let mut log = northnarrow_agent::audit::AuditLog::open(&state.audit_log(), key, id)
+        .expect("the audit log");
+    log.boot_probe(
+        None,
+        "no-manifest",
+        "none",
+        &northnarrow_agent::audit::AgentBuild {
+            version: env!("CARGO_PKG_VERSION"),
+            features: Vec::new(),
+            bpf_guard_enforce: false,
+        },
+    )
+    .expect("a signed row");
+}
+
+/// The bytes of `paths` (absent: `None`).
+fn bytes_of(paths: &[PathBuf]) -> Vec<Option<Vec<u8>>> {
+    paths.iter().map(|p| std::fs::read(p).ok()).collect()
+}
+
+/// Lab PR 265 (review #466 F4-bis): the agent's key absent where an earlier
+/// identity is on record — its public half, the install's id, a signed row
+/// of the audit chain beside it, as root leaves them by making the key look
+/// absent — is refused before the load (exit 78, nothing in the kernel, the
+/// journal's refusal alone: nothing can sign it), and no key is minted: the
+/// public half, the id and the audit chain are as they were.
+#[test]
+#[ignore = "root and bpftool: nn-lab.sh test-ignored"]
+fn a_key_absent_where_an_identity_was_is_refused_and_none_minted() {
+    preconditions("start an agent whose key is absent beside an earlier identity");
+    let dir = tempfile::tempdir().unwrap();
+    let state = AgentState::new(dir.path());
+    an_earlier_identity(&state);
+    std::fs::remove_file(state.signing_key()).unwrap();
+    let public = northnarrow_agent::keys::verifying_key_path(&state.signing_key());
+    let kept = [public, state.agent_id_file(), state.audit_log()];
+    let before_bytes = bytes_of(&kept);
+    assert!(before_bytes.iter().all(Option::is_some));
+    let installed = InstalledAgent::install();
+    let rules = combat_rules(dir.path());
+    let manifest = manifest_of_another_copy(dir.path());
+    let before = kernel();
+    let log = dir.path().join("agent.log");
+    let status = run_until_exit(
+        &installed,
+        &state,
+        Launch::Sudo,
+        &[
+            "--install-manifest".as_ref(),
+            manifest.as_os_str(),
+            "--combat-rules".as_ref(),
+            rules.as_os_str(),
+        ],
+        &log,
+    );
+    let text = assert_refused_before_the_load(status, &log, &state, &before, "signing_identity");
+    assert!(
+        text.contains("is absent, but this install had one"),
+        "{}",
+        tail(&log)
+    );
+    for found in ["its public half", "the install's id", "holds signed rows"] {
+        assert!(text.contains(found), "`{found}` not named: {}", tail(&log));
+    }
+    assert!(
+        text.contains("could not record the refused boot in a signed chain"),
+        "{}",
+        tail(&log)
+    );
+    assert!(
+        !text.contains("bootstrapped fresh agent signing key"),
+        "{}",
+        tail(&log)
+    );
+    assert!(!state.signing_key().exists(), "a key was minted");
+    assert_eq!(bytes_of(&kept), before_bytes, "the identity changed");
+}
+
+/// Lab PR 265 (review #466 F4-bis): an empty directory bound over the
+/// agent's state directory — in a mount namespace of the agent's own, as a
+/// bind on the host or a runtime drop-in shows it — is refused before the
+/// load (exit 78, nothing in the kernel, unsigned), before anything is
+/// written: the empty directory stays empty (on `main` the start minted a
+/// key there, a new identity, and loaded), and the real directory's
+/// identity is as it was.
+#[test]
+#[ignore = "root and bpftool: nn-lab.sh test-ignored"]
+fn the_agents_directory_bound_over_is_refused_and_nothing_written() {
+    preconditions("start an agent whose state directory is bound over");
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("state");
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::create_dir(&empty).unwrap();
+    let state = AgentState::new(&real);
+    an_earlier_identity(&state);
+    let kept = [
+        state.signing_key(),
+        northnarrow_agent::keys::verifying_key_path(&state.signing_key()),
+        state.agent_id_file(),
+        state.audit_log(),
+    ];
+    let before_bytes = bytes_of(&kept);
+    let installed = InstalledAgent::install();
+    let rules = combat_rules(dir.path());
+    let manifest = manifest_of_another_copy(dir.path());
+    let before = kernel();
+    let log = dir.path().join("agent.log");
+    let mut cmd = installed.command_with_binds(&state, &[], &[(&empty, &real)]);
+    cmd.args([
+        "--install-manifest".as_ref(),
+        manifest.as_os_str(),
+        "--combat-rules".as_ref(),
+        rules.as_os_str(),
+    ]);
+    let status = command_until_exit(cmd, &log);
+    let text = assert_refused_before_the_load(status, &log, &state, &before, "agent_mounts");
+    assert!(
+        text.contains("a mount hides the agent's own files")
+            && text.contains("another directory or file bound there"),
+        "{}",
+        tail(&log)
+    );
+    assert!(
+        text.contains("could not record the refused boot in a signed chain"),
+        "{}",
+        tail(&log)
+    );
+    let written: Vec<_> = std::fs::read_dir(&empty)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert!(
+        written.is_empty(),
+        "written in the bound directory: {written:?}"
+    );
+    assert_eq!(bytes_of(&kept), before_bytes, "the identity changed");
 }
 
 /// The capability gate: an enforcing agent without CAP_KILL refuses before

@@ -70,6 +70,17 @@ LogRateLimitBurst=50000
 # next start). Lab PR 216: the watchdog's own unit has one
 # (northnarrow-watchdog-failed.service).
 ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf
+# Lab PR 265 (review #466 F4-bis): this unit's runtime drop-in directory,
+# made (empty) before every start so that the agent registers it with its
+# deny hooks as it does the persistent one: a new drop-in there —
+# `systemctl edit --runtime`, or a BindPaths=/TemporaryFileSystem= that
+# hides /etc/northnarrow from the next start — is refused outside a signed
+# trusted-installer window, and the directory cannot be removed or renamed.
+# `+`: outside this unit's sandbox (ProtectSystem=strict keeps /run
+# read-only to the agent); `mkdir -p` leaves a directory that is there as it
+# is. A mount over the agent's directories made any other way refuses the
+# start (docs/operator/BOOT_INTEGRITY.md, section 1).
+ExecStartPre=+/bin/mkdir -p /run/systemd/system/northnarrow-agent.service.d
 # External audit ATP-014 (NN-AUD-262): an explicit search path, without
 # /usr/local. systemd's default for a service starts with
 # /usr/local/sbin:/usr/local/bin, which the FIM list does not watch, and

@@ -303,6 +303,10 @@ pub mod response;
 // agent's `runtime`).
 pub mod runtime;
 
+// Lab PR 265 (review of #468 R1, R3): the one `mountinfo` reader, byte by
+// byte, of the start's mount check and the self-integrity watcher.
+pub mod mountinfo;
+
 // systemd's readiness notification (`READY=1` on `$NOTIFY_SOCKET`, T7.10),
 // through the datagram `antitamper-bpf` shares with the watchdog (R09c, lab
 // PR 257; was the agent's `sd_notify`).
