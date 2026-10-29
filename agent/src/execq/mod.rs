@@ -29,7 +29,7 @@ use std::collections::{HashSet, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use common::wire::execq::{class, mode};
@@ -130,22 +130,11 @@ pub fn sibling_scanner_exe(own_exe: Option<&std::path::Path>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SCANNER_EXE))
 }
 
-static CONFIG: OnceLock<Config> = OnceLock::new();
-static KERNEL: Mutex<Option<kernel::Kernel>> = Mutex::new(None);
 /// What `nn-admin status` says of the guard.
 static STATE: Mutex<Option<String>> = Mutex::new(None);
 /// The controller runs (the spawn ledger records).
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STOPPING: AtomicBool = AtomicBool::new(false);
-
-/// Set the guard's configuration (before the sensor multiplexer starts).
-pub fn configure(cfg: Config) {
-    let _ = CONFIG.set(cfg);
-}
-
-pub fn config() -> Option<&'static Config> {
-    CONFIG.get()
-}
 
 fn set_state(s: impl Into<String>) {
     *STATE.lock() = Some(s.into());
@@ -160,12 +149,18 @@ pub fn state() -> String {
 }
 
 /// From the multiplexer, once the exec sensor is attached (`exec_on_lsm`:
-/// the LSM one): write the kernel configuration (always, `OFF` included,
-/// then frozen) and take the guard's maps. A guard that cannot run (the
-/// exec sensor is not on LSM) is written off and its reason kept for the
-/// signed degradation.
-pub fn install(ebpf: &mut aya::Ebpf, exec_on_lsm: bool) -> anyhow::Result<()> {
-    let cfg = CONFIG.get().cloned().unwrap_or_default();
+/// the LSM one): write `cfg`'s kernel configuration (always, `OFF`
+/// included, then frozen) and take the guard's maps, returned for the
+/// controller ([`start`]; `None`: the guard does not run). A guard that
+/// cannot run (the exec sensor is not on LSM) is written off and its reason
+/// kept for the signed degradation. R11c (lab PR 264): the configuration
+/// and the maps are the start's (`exec_guards::AgentExecGuards`); they were
+/// process-wide statics (`configure`, `take_kernel`).
+pub fn install(
+    ebpf: &mut aya::Ebpf,
+    cfg: &Config,
+    exec_on_lsm: bool,
+) -> anyhow::Result<Option<kernel::Kernel>> {
     let mut m = cfg.mode;
     if m != Mode::Off && !exec_on_lsm {
         set_state(
@@ -184,9 +179,9 @@ pub fn install(ebpf: &mut aya::Ebpf, exec_on_lsm: bool) -> anyhow::Result<()> {
         if STATE.lock().is_none() {
             set_state(Mode::Off.as_str());
         }
-        return Ok(());
+        return Ok(None);
     }
-    *KERNEL.lock() = Some(kernel::take(ebpf)?);
+    let taken = kernel::take(ebpf)?;
     set_state(format!("{} (starting)", m.as_str()));
     info!(
         mode = m.as_str(),
@@ -194,19 +189,13 @@ pub fn install(ebpf: &mut aya::Ebpf, exec_on_lsm: bool) -> anyhow::Result<()> {
         classes = ?common::wire::execq::class_names(cfg.classes),
         "exec quarantine armed in the kernel (EXPERIMENTAL, lab PR 223)"
     );
-    Ok(())
+    Ok(Some(taken))
 }
 
 /// The guard cannot run: `degraded: <why>` in the status, the reason for
-/// the signed degradation.
+/// the signed degradation (the caller keeps no kernel object of it).
 pub fn fail(why: String) {
-    *KERNEL.lock() = None;
     set_state(format!("degraded: {why}"));
-}
-
-/// The kernel objects [`install`] took, once.
-pub fn take_kernel() -> Option<kernel::Kernel> {
-    KERNEL.lock().take()
 }
 
 /// Whether the ctime offsets resolved on this kernel (the identity cache
@@ -426,12 +415,17 @@ pub struct Handle {
     thread: std::thread::JoinHandle<()>,
 }
 
-/// Start the controller thread. `Err`: the guard does not run — the kernel
-/// stops nothing without its heartbeat — and the reason is for the signed
-/// `subsystem_degraded`.
-pub fn start(deps: StartDeps) -> Result<Handle, String> {
-    let cfg = CONFIG.get().cloned().unwrap_or_default();
-    let Some(k) = take_kernel() else {
+/// Start the controller thread on the configuration `cfg` and the kernel
+/// objects [`install`] took (`kernel`). `Err`: the guard does not run — the
+/// kernel stops nothing without its heartbeat — and the reason is for the
+/// signed `subsystem_degraded`.
+pub fn start(
+    cfg: &Config,
+    kernel: Option<kernel::Kernel>,
+    deps: StartDeps,
+) -> Result<Handle, String> {
+    let cfg = cfg.clone();
+    let Some(k) = kernel else {
         return Err(match STATE.lock().clone() {
             Some(s) if s.starts_with("degraded") => s,
             _ => "the guard's kernel objects were not installed".to_string(),

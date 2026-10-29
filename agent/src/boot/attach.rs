@@ -28,6 +28,9 @@ pub(crate) struct Attached {
     pub(crate) dns_cache: Arc<DnsCache>,
     pub(crate) execq_mode: northnarrow_agent::execq::Mode,
     pub(crate) execpol_mode: northnarrow_agent::execpol::Mode,
+    /// R11c (lab PR 264): the exec guards the load installed, with their
+    /// configuration and the kernel objects their controllers start on.
+    pub(crate) exec_guards: northnarrow_agent::exec_guards::AgentExecGuards,
     /// Where the ids of the agent's BPF programs go (DEP-006).
     pub(crate) own_prog_ids_file: Option<PathBuf>,
     pub(crate) sensor: SensorMultiplexer,
@@ -107,11 +110,10 @@ pub(crate) async fn load(
         cli.detect_only || northnarrow_agent::response::config::detect_only_env().is_some(),
     );
     let execq_mode = execq_cfg.mode;
-    northnarrow_agent::execq::configure(execq_cfg);
     // Lab PR 226 (EXPERIMENTAL): the exec policy, its signed table read
     // now (the kernel configuration is written and frozen when the
     // multiplexer starts); a detect-only agent audits.
-    let execpol_mode = {
+    let execpol_cfg = {
         use northnarrow_agent::execpol::{self as ep, Mode};
         let detect_only =
             cli.detect_only || northnarrow_agent::response::config::detect_only_env().is_some();
@@ -137,15 +139,20 @@ pub(crate) async fn load(
             northnarrow_agent::boot::degradation::report("exec_policy", detail);
         }
         let ep::BootTable { table, source, .. } = boot;
-        ep::configure(ep::Config {
+        ep::Config {
             mode,
             table,
             source,
             env: !cli.exec_policy_no_env,
             map: !cli.exec_policy_no_map,
-        });
-        mode
+        }
     };
+    let execpol_mode = execpol_cfg.mode;
+    // R11c (lab PR 264): the guards, with their configuration, given to the
+    // load, which installs them and leaves them their kernel objects (they
+    // were process-wide statics the start configured).
+    let mut exec_guards =
+        northnarrow_agent::exec_guards::AgentExecGuards::new(execq_cfg, execpol_cfg);
     // External audit DEP-006: the previous boot's program-id list goes before
     // this boot loads anything — its programs are replaced now, and a list
     // that cannot be rewritten must not outlive them (the scripts then fall
@@ -166,7 +173,10 @@ pub(crate) async fn load(
         cli.exploit_guard.variant(),
     );
     let (mut sensor, net_bufs) = match SensorMultiplexer::start_with_net(
-        net_wiring, &plan, verified,
+        net_wiring,
+        &plan,
+        &mut exec_guards,
+        verified,
     )
     .await
     .context("starting the sensor multiplexer (with net observation)")
@@ -270,6 +280,7 @@ pub(crate) async fn load(
         dns_cache,
         execq_mode,
         execpol_mode,
+        exec_guards,
         own_prog_ids_file,
         sensor,
         net_bufs,

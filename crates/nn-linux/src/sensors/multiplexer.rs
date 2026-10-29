@@ -81,7 +81,9 @@ pub struct NetRingBufs {
 
 /// The exec guards' kernel configuration, which the load writes once the
 /// exec sensor is attached and before the io_uring, TCP, DNS and network
-/// programs attach. Wave 4 restructure, R09b (lab PR 254): the seam that
+/// programs attach (R11c, lab PR 264: on the instance the start gives the
+/// load, which keeps what it installs; it was a static seam over the
+/// guards' process-wide configuration). Wave 4 restructure, R09b (lab PR 254): the seam that
 /// lets this loader move to nn-linux while the exec quarantine (lab PR 223)
 /// and the exec policy (lab PR 226) stay in the agent, whose
 /// `exec_guards::AgentExecGuards` is the one implementation (the agent's
@@ -92,7 +94,7 @@ pub trait ExecGuards {
     /// hold candidates only then; R11c, lab PR 264: it was a process-wide
     /// `exe_identity::lsm_active`). Not fatal: a guard whose configuration
     /// fails is off, and says so.
-    fn install(ebpf: &mut Ebpf, exec_on_lsm: bool);
+    fn install(&mut self, ebpf: &mut Ebpf, exec_on_lsm: bool);
 }
 
 /// What the start decided before the load (R11c, lab PR 264): the attach
@@ -176,9 +178,10 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     /// 262: the load, and the by-name pins of the maps it makes, take it).
     pub async fn start(
         plan: &LoadPlan,
+        guards: &mut G,
         _verified: &crate::boot::IntegrityVerified,
     ) -> Result<Self> {
-        let (mux, _) = Self::do_start(None, plan).await?;
+        let (mux, _) = Self::do_start(None, plan, guards).await?;
         Ok(mux)
     }
 
@@ -195,9 +198,10 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     pub async fn start_with_net(
         net: NetWiring,
         plan: &LoadPlan,
+        guards: &mut G,
         _verified: &crate::boot::IntegrityVerified,
     ) -> Result<(Self, NetRingBufs)> {
-        let (mux, bufs) = Self::do_start(Some(net), plan).await?;
+        let (mux, bufs) = Self::do_start(Some(net), plan, guards).await?;
         let bufs =
             bufs.ok_or_else(|| anyhow!("start_with_net must yield NetRingBufs (invariant)"))?;
         Ok((mux, bufs))
@@ -206,6 +210,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     async fn do_start(
         net: Option<NetWiring>,
         plan: &LoadPlan,
+        guards: &mut G,
     ) -> Result<(Self, Option<NetRingBufs>)> {
         if EBPF_BYTES.is_empty() {
             anyhow::bail!(
@@ -331,7 +336,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         // Lab PRs 223 and 226 (EXPERIMENTAL): the exec guards' kernel
         // configuration, once the exec sensor's mode is known (R09b, lab PR
         // 254: the agent's, through [`ExecGuards`]).
-        G::install(
+        guards.install(
             &mut ebpf,
             exec_program == crate::sensors::exe_identity::EXEC_LSM_PROGRAM,
         );

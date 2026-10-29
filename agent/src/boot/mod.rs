@@ -207,6 +207,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         dns_cache,
         execq_mode,
         execpol_mode,
+        exec_guards,
         own_prog_ids_file,
         mut sensor,
         net_bufs,
@@ -430,6 +431,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &audit_log,
         execq_exec_cfg,
         execpol_mode,
+        exec_guards,
     )?;
     let armed = ready::arm(
         &mut boot,
