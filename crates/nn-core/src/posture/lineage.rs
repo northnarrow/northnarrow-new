@@ -1050,7 +1050,11 @@ impl<H: PostureHost> AuthSessionTracker<H> {
 
     /// What the spawn cache knows `pid` ran at `at` ([`CachedAt`]): its
     /// latest exec when `at` is at or after it (or none), else the latest of
-    /// its earlier execs at or before `at`, else "only later".
+    /// its earlier execs at or before `at`, else "only later". An earlier
+    /// exec of another process the pid was reused from answers only for a
+    /// time before the current process started: at a time the current
+    /// process already existed, the pid was it, still running what it
+    /// forked with (not known).
     fn cached_at(&self, pid: u32, at: Option<u64>) -> CachedAt {
         let s = self.inner.state.read();
         let Some(cur) = s.map.get(&pid).or_else(|| s.daemons.get(&pid)) else {
@@ -1062,8 +1066,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 .get(&pid)
                 .and_then(|h| h.iter().rev().find(|e| e.spawn_ns <= t))
             {
-                Some(e) => CachedAt::Past(e.clone()),
-                None => CachedAt::LaterOnly,
+                Some(e) if e.start_ns == cur.start_ns || t < cur.start_ns => {
+                    CachedAt::Past(e.clone())
+                }
+                _ => CachedAt::LaterOnly,
             },
             _ => CachedAt::Current(cur.clone()),
         }
@@ -2316,6 +2322,31 @@ mod tests {
     /// again later answers with the image it ran then — its identity, its
     /// image, its walk — and one whose only cached exec is later answers
     /// "not known", never `/proc`'s later image; without a scope, now.
+    /// Review #471 A1, a pid reused: the exec of the process the pid had
+    /// before answers for a time before the current process started, never
+    /// for a time the current one already ran (forked, not yet exec'd).
+    #[test]
+    fn a_reused_pid_s_earlier_process_answers_only_for_its_own_time() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        t.ingest_exec(4400, 1, "/usr/bin/restic", &[], 2 * S, S, 0);
+        t.ingest_exec(4400, 1, "/usr/bin/cat", &[], 40 * S, 30 * S, 1000);
+        assert_eq!(
+            t.image_path_at(4400, 5 * S).as_deref(),
+            Some("/usr/bin/restic")
+        );
+        assert_eq!(
+            t.image_path_at(4400, 35 * S),
+            None,
+            "the current process, before its exec"
+        );
+        assert_eq!(
+            t.image_path_at(4400, 45 * S).as_deref(),
+            Some("/usr/bin/cat")
+        );
+        judged_at(35 * S, || assert_eq!(t.exec_identity(4400), None));
+    }
+
     #[test]
     fn a_lookup_judged_at_an_event_s_time_sees_the_exec_of_then() {
         let proc = TempDir::new().unwrap();
