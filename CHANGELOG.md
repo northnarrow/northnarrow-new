@@ -739,7 +739,27 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (§1.1): a reboot with a persistent view that hides both trees, the bpffs
   unmounted and mounted fresh (no deny hook on `mount(2)`/`umount(2)`), the
   other chains moved away on a restart (signed by the chain check against
-  the head anchor, not refused).
+  the head anchor, not refused); a mount laid after the start's one load
+  (no mint, but that start goes on in the view and the real view's next
+  start is refused until the pins go). After the PR's review (#473): the
+  tokens carry the key's path they were decided for; a key's name the
+  check could not look at (a dangling link) is never loaded; a first
+  install removes the leftover temporary file of a mint that died before
+  its link; `mk-tarball.sh` and `mk-packages.sh` refuse an agent built
+  with a lab feature or an nn-admin with `debug` (the lab's package check
+  opts in with `NN_PKG_LAB_FEATURES=1`); a key, id or audit log outside
+  the installed layout is documented as refused at every restart with the
+  pins there. On the lab guest (Ubuntu 22.04, the release build): V3b″
+  (the guard in observe, then a copy of the binary with the identity in
+  an empty directory) minted a key on `main` and is refused; S2 minted a
+  new id on `main` and is refused; a self-bind of the bpffs refused the
+  start on `main` and passes; V1b, V3b, V3b′ refused; with the window
+  between the decision and the load widened by a CPU quota, the binds
+  that landed in it were refused at the audit check ("absent, but the
+  start's check found it there") and none minted; the key is loaded once
+  per boot (11 times on `main`); a first install mints once; the restart,
+  the respawn, `upgrade-check`, `test-ignored`, `uninstall-check`, re-key
+  A and `tamper-check` (the same 75 outcomes as `main`) pass.
 - `nn-admin fim baseline` was answered `Success`, and its signed audit row
   read "success", when no baseline would be recorded (lab PR 263, found
   by R11d's table of the admin socket's verification copies): without

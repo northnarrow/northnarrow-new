@@ -300,8 +300,13 @@ What these checks close, and what they do not:
   (no deny hook covers `mount(2)` or `umount(2)` yet: CM-12); the chains
   other than the audit log moved away on a restart (not refused: signed
   by the boot's chain check against the head anchor); the copies'
-  exemption in the lab builds. An off-host record of the public key is
-  what would cover the reboot.
+  exemption in the lab builds; a mount laid after the start's one load
+  (lab PR 268's TOCTOU probe): no key is minted, but the start goes on in
+  the view laid over its directories, its rows signed with its one key,
+  and registers that view's directories, so the next start in the real
+  view is refused by the pins' proof until they are removed (a reboot, as
+  in §3.10 branch B). An off-host record of the public key is what would
+  cover the reboot.
 
 The unit's runtime drop-in directory,
 `/run/systemd/system/northnarrow-agent.service.d`, is made (empty) by the
