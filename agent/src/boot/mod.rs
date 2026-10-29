@@ -253,6 +253,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         chain_store,
         ransom_tracker,
         defense_detector,
+        rule_policy,
         engine,
     } = policy::load(
         &cli,
@@ -285,6 +286,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &installer_override,
         &ransom_tracker,
         &defense_detector,
+        &rule_policy,
     );
     evidence::wire(
         &cli,
@@ -378,6 +380,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &combat.ladder,
         &detect_only_source,
         &exempt,
+        northnarrow_agent::admin_socket::AdminHandles { rule_policy },
     );
     let tasks::Tasks {
         execq_handle,
@@ -789,6 +792,63 @@ mod tests {
             sources
                 .contains("fn refuse(&self, audit: Option<&mut AuditLog>, refusal: Refusal) -> !"),
             "a refusal never returns"
+        );
+    }
+
+    /// R11c (lab PR 264): the start makes the per-rule policy's handle once,
+    /// in the policy phase, with the boot policy in force, and gives that
+    /// one to the engine, to the posture and to the admin socket — no other
+    /// handle, no process-wide one. That they then see a `policy set` at
+    /// once is the admin pipeline's
+    /// `a_signed_policy_set_applies_at_once_to_the_engine_the_posture_and_the_executor`.
+    #[test]
+    fn the_start_shares_one_policy_handle() {
+        let sources = start_sources();
+        assert_eq!(
+            sources.matches("PolicyHandle::new(").count(),
+            1,
+            "one handle"
+        );
+        assert!(!sources.contains("PolicyHandle::default("));
+        assert!(!sources.contains("rule_policy::global("));
+        assert!(!sources.contains("install_global("));
+        let (_, src, head) = PHASES
+            .iter()
+            .find(|(call, _, _)| *call == "policy::load(")
+            .expect("the policy phase");
+        let policy = function(src, head);
+        assert!(policy.contains("rp::PolicyHandle::new(policy)"));
+        assert!(policy.contains(".with_policy(rule_policy.clone())"));
+        assert!(policy.contains("        rule_policy,\n        engine,\n    }\n}"));
+        let posture = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/posture.rs"));
+        assert_eq!(
+            posture
+                .matches(".with_rule_policy(rule_policy.clone())")
+                .count(),
+            2,
+            "both machines (with and without the isolator)"
+        );
+        let run = function(
+            include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/mod.rs")),
+            "async fn run(",
+        );
+        let at = |needle: &str| {
+            run.find(needle)
+                .unwrap_or_else(|| panic!("run: `{needle}` not found"))
+        };
+        assert!(
+            at("        rule_policy,\n        engine,\n    } = policy::load(")
+                < at("posture::machine(")
+        );
+        assert!(at("&rule_policy,\n    );\n    evidence::wire(") > at("posture::machine("));
+        let admin = &run[at("admin::start(")..];
+        let admin: String = admin[..admin.find(");").expect("the call's end")]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            admin.contains("AdminHandles{rule_policy"),
+            "the admin socket gets the policy phase's handle: {admin}"
         );
     }
 

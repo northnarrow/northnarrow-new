@@ -22,8 +22,8 @@ use nn_proto::admin_protocol::{decode_frame, encode_frame, AdminMessage, MAX_FRA
 use super::audit::{emit_audit_for, AuditClient, DispatchNotes};
 use super::handlers::{dispatch, Wired};
 use super::{
-    socket_watch, status_polls, AdminReadPaths, CanaryAdminState, DetectionAdminState,
-    FimAdminState, ResponseAdminState, ShutdownSignal, StatusPolls,
+    socket_watch, status_polls, AdminHandles, AdminReadPaths, CanaryAdminState,
+    DetectionAdminState, FimAdminState, ResponseAdminState, ShutdownSignal, StatusPolls,
 };
 use crate::anti_tamper::admin_auth::{AdminAuth, ConnAuth};
 use crate::anti_tamper::network_isolate::NetworkIsolator;
@@ -71,6 +71,7 @@ pub async fn serve(
         None,
         Arc::default(),
         Arc::default(),
+        Arc::default(),
     )
     .await
 }
@@ -103,6 +104,7 @@ pub async fn serve_with_audit_log(
         None,
         None,
         None,
+        Arc::default(),
         Arc::default(),
         Arc::default(),
     )
@@ -143,6 +145,7 @@ pub async fn serve_with_fim_state(
         None,
         Arc::default(),
         Arc::default(),
+        Arc::default(),
     )
     .await
 }
@@ -177,6 +180,7 @@ pub async fn serve_with_canary_state(
         None,
         None,
         None,
+        Arc::default(),
         Arc::default(),
         Arc::default(),
     )
@@ -218,6 +222,8 @@ pub async fn serve_with_marker_path(
     // External audit ASK-009 (lab PR 213): the unsigned status polling, per
     // peer, and the registered watchdog it leaves out.
     status_polls: Arc<StatusPolls>,
+    // R11c (lab PR 264): the start's handles the verbs read or act on.
+    handles: Arc<AdminHandles>,
 ) -> Result<()> {
     // A stale socket (or anything else but a directory) at the path is
     // removed without following a link; the mode is forced to 0600 so a
@@ -310,6 +316,7 @@ pub async fn serve_with_marker_path(
         let response_state = response_state.clone();
         let read_paths = Arc::clone(&read_paths);
         let status_polls = Arc::clone(&status_polls);
+        let handles = Arc::clone(&handles);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 stream,
@@ -328,6 +335,7 @@ pub async fn serve_with_marker_path(
                 response_state.as_ref(),
                 &read_paths,
                 &status_polls,
+                &handles,
             )
             .await
             {
@@ -627,6 +635,7 @@ pub(super) async fn handle_connection(
     response_state: Option<&Arc<ResponseAdminState>>,
     read_paths: &AdminReadPaths,
     status_polls: &StatusPolls,
+    handles: &AdminHandles,
 ) -> Result<()> {
     // The peer's identity once per connection — the audit log wants
     // pid/uid/comm/exe of the caller, and a single connection never
@@ -644,6 +653,7 @@ pub(super) async fn handle_connection(
         detection_state: detection_state.map(|s| s.as_ref()),
         response_state: response_state.map(|s| s.as_ref()),
         read_paths,
+        handles,
     };
     let limits = slot.limits();
     loop {

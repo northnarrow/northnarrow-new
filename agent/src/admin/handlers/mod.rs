@@ -23,8 +23,8 @@ use nn_proto::admin_protocol::{AdminMessage, Challenge, UnlockResult};
 
 use super::audit::{AuditClient, DispatchNotes};
 use super::{
-    AdminReadPaths, CanaryAdminState, DetectionAdminState, FimAdminState, ResponseAdminState,
-    ShutdownSignal,
+    AdminHandles, AdminReadPaths, CanaryAdminState, DetectionAdminState, FimAdminState,
+    ResponseAdminState, ShutdownSignal,
 };
 use crate::anti_tamper::admin_auth::{AdminAuthError, ConnAuth};
 use crate::anti_tamper::network_isolate::NetworkIsolator;
@@ -66,6 +66,8 @@ pub(in crate::admin) struct Wired<'a> {
     pub(in crate::admin) detection_state: Option<&'a DetectionAdminState>,
     pub(in crate::admin) response_state: Option<&'a ResponseAdminState>,
     pub(in crate::admin) read_paths: &'a AdminReadPaths,
+    /// R11c (lab PR 264): the start's handles (the per-rule policy, …).
+    pub(in crate::admin) handles: &'a AdminHandles,
 }
 
 /// Synchronous request→reply mapping. All AdminAuth + PostureMachine
@@ -92,6 +94,7 @@ pub(super) fn dispatch(
         detection_state,
         response_state,
         read_paths,
+        handles,
     } = ctx;
     match msg {
         AdminMessage::ChallengeRequest(_) => match auth.issue_challenge() {
@@ -223,9 +226,9 @@ pub(super) fn dispatch(
                 fps_out,
             ))
         }
-        AdminMessage::ConfigOverlaySetRequest(req) => {
-            AdminMessage::ConfigOverlaySetResponse(dispatch_config_overlay_set(req, auth, fps_out))
-        }
+        AdminMessage::ConfigOverlaySetRequest(req) => AdminMessage::ConfigOverlaySetResponse(
+            dispatch_config_overlay_set(req, auth, &handles.rule_policy, fps_out),
+        ),
 
         // Tappa 9.0.b — signed detections read (read-only,
         // Role::TelemetryRead, or Triage via subsumption). Overlays the

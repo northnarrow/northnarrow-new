@@ -282,6 +282,21 @@ pub struct ResponseAdminState {
     pub combat_evidence: Arc<dyn Fn() -> crate::combat::EvidenceCounts + Send + Sync>,
 }
 
+/// R11c (lab PR 264) — what the start hands the verbs explicitly, which
+/// they read through process-wide globals the start set until then. Always
+/// present, like [`AdminReadPaths`]; `Default` is a handle of its own for
+/// each field (tests and the legacy serve entry points: nothing the start
+/// made reaches them).
+#[derive(Debug, Clone, Default)]
+pub struct AdminHandles {
+    /// The signed per-rule response policy in force: the start's handle,
+    /// the one the engine and the posture read. `config overlay set` of a
+    /// `rule-policy` installs the stored policy through it, applied at the
+    /// engine's and the posture's next event (lab PR 236; it was
+    /// `rule_policy::install_global`).
+    pub rule_policy: crate::decision::rule_policy::PolicyHandle,
+}
+
 /// External audit NN-AUD-082 — the files the read verbs serve, from the
 /// agent's command line (`--fim-drift-file`, `--netflow-file`,
 /// `--netflow-listeners-file`); `fim report` and `net flows` used to read

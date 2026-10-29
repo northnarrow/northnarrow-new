@@ -40,6 +40,7 @@ pub(crate) struct Posture {
 /// exemption, the posture machine (with the release through the isolator,
 /// or without one), its window, tracker and detector; the watchdog's and
 /// systemd-shutdown's refreshes; a stale COMBAT chain torn down.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn machine(
     cli: &Cli,
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
@@ -50,6 +51,7 @@ pub(crate) fn machine(
     >,
     ransom_tracker: &Arc<northnarrow_agent::impact::RansomTracker>,
     defense_detector: &Arc<northnarrow_agent::impair::DefenseDetector>,
+    rule_policy: &northnarrow_agent::decision::rule_policy::PolicyHandle,
 ) -> Posture {
     // The COMBAT graduated-response ladder is constructed once agent_id
     // + the audit log are available (further down). The posture combat
@@ -194,8 +196,9 @@ pub(crate) fn machine(
         )
         // Lab PR 249: the ransomware directive of the per-rule policy put
         // in force above, read from the engine's handle (it was a
-        // process-wide switch set by `install_global`).
-        .with_rule_policy(northnarrow_agent::decision::rule_policy::global().clone())
+        // process-wide switch; R11c, lab PR 264: the handle the policy
+        // phase made, no longer the process-wide handle).
+        .with_rule_policy(rule_policy.clone())
     } else {
         // Dev / no-isolator build: still wire the ladder hooks so a
         // (detector- or admin-forced) COMBAT engages the same graduated
@@ -223,7 +226,7 @@ pub(crate) fn machine(
             ExemptPids::default(),
             lineage.clone(),
         )
-        .with_rule_policy(northnarrow_agent::decision::rule_policy::global().clone())
+        .with_rule_policy(rule_policy.clone())
     };
     // Lab PR 162: inside the trusted-installer window a control-surface
     // tamper (NN-L-FIM-024) does not raise the posture; the rule still acts.
