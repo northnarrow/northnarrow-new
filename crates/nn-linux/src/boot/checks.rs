@@ -30,40 +30,63 @@ pub enum Verdict {
     Refused(String),
 }
 
-/// Lab PR 265 (review #466 F4-bis): no mount at or under the agent's own
-/// directories but a bind of a directory onto itself (the unit's
-/// `ReadWritePaths=`), in the agent's own mount table
-/// ([`continuity::OWN_MOUNTINFO`], [`continuity::mounts_over`]): the
-/// configuration directory and the state directory always (the host's
-/// roots, review #466 F3), and the directories of the files the operator's
-/// configuration names (`configured`: the key's, the audit log's, the
-/// identity's, the chains'). A bind of another directory there, another
-/// filesystem (a tmpfs, a runtime drop-in's `TemporaryFileSystem=`), a
-/// file bound over the key: each hides the files the agent had, and the
-/// start would read, mint and sign in what was laid over them. A mount
-/// above them (a separate `/var`) is not judged. A table that cannot be
-/// read refuses too.
+/// Lab PR 265 (review #466 F4-bis; the review of #468, R1–R3): the
+/// agent's view of its own directories is the one it had.
+///
+/// - In the agent's own mount table ([`continuity::OWN_MOUNTINFO`], read
+///   as bytes by [`crate::mountinfo`]), no mount at or under the agent's
+///   directories but a bind of a directory onto itself (the unit's
+///   `ReadWritePaths=`; [`continuity::mounts_over`]): the configuration
+///   directory and the state directory always (the host's roots, review
+///   #466 F3), and the directories of the files the operator's
+///   configuration names (`configured`: the key's, the audit log's, the
+///   identity's, the chains'). Another directory or file bound there,
+///   another filesystem (a tmpfs, a runtime drop-in's
+///   `TemporaryFileSystem=`): each hides the files the agent had. A mount
+///   above them (a separate `/var`) is not judged there. A line the table
+///   does not hold in the kernel's shape refuses only when it may concern
+///   those directories.
+/// - One bpffs at `/sys/fs/bpf`, nothing stacked on it or over the pin
+///   root ([`continuity::bpffs_findings`]): the pins are the next proof.
+/// - The previous agent's pins, when there are some: the configuration
+///   and the state directory this start sees are the inodes that agent
+///   protected ([`continuity::view_findings`]) — what no view of the
+///   filesystem can change: a copy bound over an ancestor, a rename above
+///   them, another root show other inodes.
+///
+/// A table that cannot be read refuses too.
 pub fn agent_mounts(
     boot: &mut BootSequence,
     configured: &[&Path],
 ) -> Result<Verdict, BootOrderError> {
-    let table = std::fs::read_to_string(continuity::OWN_MOUNTINFO).map_err(|e| e.to_string());
-    let mut dirs: Vec<&Path> = vec![
-        Path::new(crate::anti_tamper::filesystem::CONFIG_DIR),
-        Path::new(crate::anti_tamper::filesystem::STATE_DIR),
-    ];
+    let table = std::fs::read(continuity::OWN_MOUNTINFO).map_err(|e| e.to_string());
+    let config = Path::new(crate::anti_tamper::filesystem::CONFIG_DIR);
+    let state = Path::new(crate::anti_tamper::filesystem::STATE_DIR);
+    let mut dirs: Vec<&Path> = vec![config, state];
     dirs.extend_from_slice(configured);
-    agent_mounts_decided(boot, table, &continuity::spelled(&dirs))
+    let pin_root = Path::new(crate::anti_tamper::DEFAULT_BPFFS_ROOT);
+    agent_mounts_decided(
+        boot,
+        table,
+        &continuity::spelled(&dirs),
+        pin_root,
+        &continuity::previous_agent(pin_root),
+        &[config.to_path_buf(), state.to_path_buf()],
+    )
 }
 
-/// [`agent_mounts`] on the table `table` (this crate's tests).
+/// [`agent_mounts`] on the table `table`, the previous agent `previous`
+/// and the agent's own directories `own` (this crate's tests).
 fn agent_mounts_decided(
     boot: &mut BootSequence,
-    table: Result<String, String>,
+    table: Result<Vec<u8>, String>,
     dirs: &[PathBuf],
+    pin_root: &Path,
+    previous: &continuity::PreviousAgent,
+    own: &[PathBuf],
 ) -> Result<Verdict, BootOrderError> {
     let table = match table {
-        Ok(t) => continuity::parse_mountinfo(&t),
+        Ok(t) => crate::mountinfo::parse(&t),
         Err(why) => {
             return Ok(Verdict::Refused(format!(
                 "{}: {why} — the mounts over the agent's directories cannot be checked",
@@ -71,7 +94,11 @@ fn agent_mounts_decided(
             )))
         }
     };
-    if !table.iter().any(|m| m.mount_point == Path::new("/")) {
+    if !table
+        .entries
+        .iter()
+        .any(|m| m.mount_point == Path::new("/"))
+    {
         return Ok(Verdict::Refused(format!(
             "{} names no root mount — the mounts over the agent's directories cannot be checked",
             continuity::OWN_MOUNTINFO
@@ -88,23 +115,74 @@ fn agent_mounts_decided(
             found.join("; ")
         )));
     }
+    let found = continuity::bpffs_findings(&table, pin_root);
+    if !found.is_empty() {
+        return Ok(Verdict::Refused(format!(
+            "the bpffs of the previous agent's pins is not the one alone at /sys/fs/bpf: {}. A \
+             mount stacked there hides the pins, the kernel's record of what the previous agent \
+             protected; remove it",
+            found.join("; ")
+        )));
+    }
+    let found = continuity::view_findings(previous, own);
+    if !found.is_empty() {
+        return Ok(Verdict::Refused(format!(
+            "the agent's directories are not the ones the previous agent protected: {}. A start \
+             in another view would read, mint and sign in it. Undo the mount or the rename; when \
+             the change is the operator's own, stop the units and remove the pins first \
+             (docs/operator/INSTALL_UPGRADE_UNINSTALL.md, \"Re-keying the agent\")",
+            found.join("; ")
+        )));
+    }
     boot.passed(BootStep::AgentMounts)?;
     Ok(Verdict::Passed)
 }
 
-/// Lab PR 265 (review #466 F4-bis): the agent's signing key is there — in
-/// any form: a key that is not one is the audit check's refusal (review
-/// #466 F4) — or nothing says this install had one
-/// ([`continuity::prior_identity`]: the key's public half, the install's
-/// id, a signed row of the audit chain or of another chain): a first
-/// install, which mints it. A key absent where any of that is found was
-/// removed or is hidden: the start is refused and nothing is minted — a
-/// new key would restart every chain under another identity, with one
-/// INFO line.
+/// Lab PR 265 (review #466 F4-bis; the review of #468, R2 and R8): the
+/// agent's signing key is not minted where an earlier identity is on
+/// record.
+///
+/// - The key there — in any form: a key that is not one is the audit
+///   check's refusal (review #466 F4) — or nothing says this install had
+///   one ([`continuity::prior_identity`]: the key's public half, the
+///   install's id, a written head anchor, a signed row of a chain, its
+///   manifest or its archives; any lookup that fails otherwise than "not
+///   found"): a first install, which mints it. A key absent where any of
+///   that is found was removed or is hidden: refused, nothing minted.
+/// - The previous agent's pins, when there are some: a start that runs
+///   the binary that agent protected (the installed one) is its restart —
+///   its key must be in a directory that agent protected and there
+///   ([`continuity::restart_key_findings`]): a restart never mints.
 pub fn signing_identity(
     boot: &mut BootSequence,
     paths: &continuity::IdentityPaths,
 ) -> Result<Verdict, BootOrderError> {
+    signing_identity_decided(
+        boot,
+        paths,
+        &continuity::previous_agent(Path::new(crate::anti_tamper::DEFAULT_BPFFS_ROOT)),
+        Path::new("/proc/self/exe"),
+    )
+}
+
+/// [`signing_identity`] against the previous agent `previous` and the
+/// binary `exe` (this crate's tests).
+fn signing_identity_decided(
+    boot: &mut BootSequence,
+    paths: &continuity::IdentityPaths,
+    previous: &continuity::PreviousAgent,
+    exe: &Path,
+) -> Result<Verdict, BootOrderError> {
+    let restart = continuity::restart_key_findings(previous, exe, &paths.signing_key);
+    if !restart.is_empty() {
+        return Ok(Verdict::Refused(format!(
+            "{}. Nothing is minted. Put the key back, or undo what changed its path (a drop-in \
+             redefining ExecStart=); to re-key on purpose, retire the install's identity \
+             (docs/operator/INSTALL_UPGRADE_UNINSTALL.md, \"Re-keying the agent\": the agent \
+             that refuses to start)",
+            restart.join("; ")
+        )));
+    }
     if continuity::key_absent(&paths.signing_key) {
         let evidence = continuity::prior_identity(paths);
         if !evidence.is_empty() {
@@ -935,6 +1013,62 @@ mod tests {
         ]
     }
 
+    const PIN_ROOT: &str = "/sys/fs/bpf/northnarrow";
+
+    /// [`agent_mounts_decided`] on `table` with no previous agent.
+    fn mounts(boot: &mut BootSequence, table: Result<Vec<u8>, String>) -> Verdict {
+        agent_mounts_decided(
+            boot,
+            table,
+            &agent_dirs(),
+            Path::new(PIN_ROOT),
+            &continuity::PreviousAgent::None,
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// [`signing_identity_decided`] with no previous agent.
+    fn identity(boot: &mut BootSequence, paths: &continuity::IdentityPaths) -> Verdict {
+        signing_identity_decided(
+            boot,
+            paths,
+            &continuity::PreviousAgent::None,
+            Path::new("/proc/self/exe"),
+        )
+        .unwrap()
+    }
+
+    fn identity_paths(dir: &Path) -> continuity::IdentityPaths {
+        continuity::IdentityPaths {
+            signing_key: dir.join("agent.sig.key"),
+            agent_id: dir.join("agent_id"),
+            heads: dir.join("chain_heads.json"),
+            chains: vec![dir.join("audit.log")],
+        }
+    }
+
+    /// A previous agent whose `PROTECTED_INODES` holds the inodes of
+    /// `paths` (each as [`continuity::inode_key`] reads it; the binaries
+    /// followed, as the attach stats them).
+    fn pinned(dirs: &[&Path], binaries: &[&Path]) -> continuity::PreviousAgent {
+        use std::os::unix::fs::MetadataExt;
+        let mut keys: Vec<common::wire::InodeKey> = dirs
+            .iter()
+            .map(|d| continuity::inode_key(d).unwrap())
+            .collect();
+        for b in binaries {
+            let m = std::fs::metadata(b).unwrap();
+            keys.push(common::wire::InodeKey {
+                dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
+                ino: m.ino(),
+            });
+        }
+        continuity::PreviousAgent::Pinned(Box::new(move |k| {
+            keys.iter().any(|x| x.dev == k.dev && x.ino == k.ino)
+        }))
+    }
+
     /// Lab PR 265 (review #466 F4-bis): the unit's binds and a separate
     /// `/var` pass and record the step; an empty directory bound over the
     /// configuration directory, a tmpfs over the state directory, a table
@@ -942,10 +1076,7 @@ mod tests {
     #[test]
     fn a_mount_over_the_agents_directories_refuses_and_records_nothing() {
         let mut boot = BootSequence::new();
-        assert_eq!(
-            agent_mounts_decided(&mut boot, Ok(SANDBOX.into()), &agent_dirs()).unwrap(),
-            Verdict::Passed
-        );
+        assert_eq!(mounts(&mut boot, Ok(SANDBOX.into())), Verdict::Passed);
         assert!(has(&boot, BootStep::AgentMounts));
         let var = "\
 29 1 252:1 / / rw - ext4 /dev/vda1 rw
@@ -954,7 +1085,7 @@ mod tests {
 ";
         let mut boot = BootSequence::new();
         assert_eq!(
-            agent_mounts_decided(&mut boot, Ok(var.into()), &agent_dirs()).unwrap(),
+            mounts(&mut boot, Ok(var.into())),
             Verdict::Passed,
             "a separate /var is a normal layout"
         );
@@ -964,25 +1095,228 @@ mod tests {
         ];
         for table in hidden {
             let mut boot = BootSequence::new();
-            let v = agent_mounts_decided(&mut boot, Ok(table), &agent_dirs()).unwrap();
+            let v = mounts(&mut boot, Ok(table.into_bytes()));
             assert!(
                 matches!(&v, Verdict::Refused(w) if w.contains("a mount hides the agent's own files")),
                 "{v:?}"
             );
             assert!(!has(&boot, BootStep::AgentMounts));
         }
-        for table in [
-            Err("No such file or directory".to_string()),
-            Ok(String::new()),
-        ] {
+        for table in [Err("No such file or directory".to_string()), Ok(Vec::new())] {
             let mut boot = BootSequence::new();
-            let v = agent_mounts_decided(&mut boot, table, &agent_dirs()).unwrap();
+            let v = mounts(&mut boot, table);
             assert!(
                 matches!(&v, Verdict::Refused(w) if w.contains("cannot be checked")),
                 "{v:?}"
             );
             assert!(!has(&boot, BootStep::AgentMounts));
         }
+    }
+
+    /// Review of #468 R2: one bpffs alone at `/sys/fs/bpf`, nothing over the
+    /// pin root — a second bpffs or a tmpfs stacked there, or a mount over
+    /// the pin root, hides the previous agent's pins and refuses; no bpffs
+    /// at all has nothing to hide.
+    #[test]
+    fn the_bpffs_of_the_pins_is_the_one_alone_at_sys_fs_bpf() {
+        let bpffs = format!("{SANDBOX}554 29 0:30 / /sys/fs/bpf rw - bpf bpf rw,mode=700\n");
+        let mut boot = BootSequence::new();
+        assert_eq!(
+            mounts(&mut boot, Ok(bpffs.clone().into_bytes())),
+            Verdict::Passed
+        );
+        assert_eq!(
+            mounts(&mut BootSequence::new(), Ok(SANDBOX.into())),
+            Verdict::Passed,
+            "no bpffs"
+        );
+        for (what, extra) in [
+            (
+                "stacked bpffs",
+                "555 554 0:91 / /sys/fs/bpf rw - bpf bpf rw\n",
+            ),
+            (
+                "stacked tmpfs",
+                "555 554 0:92 / /sys/fs/bpf rw - tmpfs tmpfs rw\n",
+            ),
+            (
+                "over the pin root",
+                "556 554 0:93 / /sys/fs/bpf/northnarrow rw - bpf bpf rw\n",
+            ),
+        ] {
+            let mut boot = BootSequence::new();
+            let v = mounts(&mut boot, Ok(format!("{bpffs}{extra}").into_bytes()));
+            assert!(
+                matches!(&v, Verdict::Refused(w) if w.contains("hides the pins")),
+                "{what}: {v:?}"
+            );
+            assert!(!has(&boot, BootStep::AgentMounts), "{what}");
+        }
+        let tmpfs = format!("{SANDBOX}554 29 0:30 / /sys/fs/bpf rw - tmpfs tmpfs rw\n");
+        assert!(matches!(
+            mounts(&mut BootSequence::new(), Ok(tmpfs.into_bytes())),
+            Verdict::Refused(w) if w.contains("not a bpffs")
+        ));
+    }
+
+    /// Review of #468 R1/R3: a line not in the kernel's shape refuses only
+    /// when it may be a mount over the agent's directories (or over the pin
+    /// root); one elsewhere never refuses.
+    #[test]
+    fn a_malformed_line_refuses_only_when_it_may_concern_the_agents_directories() {
+        for (line, refused) in [
+            ("900 29 252:1 / /home/x rw - ext4\n", false),
+            ("900 29 252:1 / /etc/northnarrow rw - ext4\n", true),
+            (
+                "900 29 252:1 / /var/lib/northnarrow/detections rw ext4 /dev/x rw\n",
+                true,
+            ),
+            ("900 29\n", true),
+            ("900 29 252:1 / /sys/fs/bpf rw - bpf\n", true),
+        ] {
+            let v = mounts(
+                &mut BootSequence::new(),
+                Ok(format!("{SANDBOX}{line}").into_bytes()),
+            );
+            assert_eq!(matches!(v, Verdict::Refused(_)), refused, "{line:?}: {v:?}");
+        }
+    }
+
+    /// Review of #468 R2, fix a, the view: with the previous agent's pins,
+    /// the agent's directories that exist must be the inodes it protected —
+    /// another directory at the name (a copy bound over an ancestor, a
+    /// rename above it) refuses; an absent one is not compared; no pins:
+    /// nothing to compare; pins whose inode map cannot be read refuse.
+    #[test]
+    fn the_agents_directories_are_the_inodes_the_previous_agent_protected() {
+        let d = tempfile::tempdir().unwrap();
+        let (config, state, copy) = (
+            d.path().join("etc"),
+            d.path().join("var"),
+            d.path().join("copy"),
+        );
+        for p in [&config, &state, &copy] {
+            std::fs::create_dir(p).unwrap();
+        }
+        let previous = pinned(&[&config, &state], &[]);
+        let decided = |previous: &continuity::PreviousAgent, own: &[PathBuf]| {
+            let mut boot = BootSequence::new();
+            let v = agent_mounts_decided(
+                &mut boot,
+                Ok(SANDBOX.into()),
+                &agent_dirs(),
+                Path::new(PIN_ROOT),
+                previous,
+                own,
+            )
+            .unwrap();
+            assert_eq!(v == Verdict::Passed, has(&boot, BootStep::AgentMounts));
+            v
+        };
+        assert_eq!(
+            decided(&previous, &[config.clone(), state.clone()]),
+            Verdict::Passed
+        );
+        assert!(matches!(
+            decided(&previous, &[config.clone(), copy.clone()]),
+            Verdict::Refused(w) if w.contains("is not the directory the previous agent protected")
+        ));
+        // the copy in place of the real one (what a rename above it shows)
+        std::fs::rename(&config, d.path().join("etc.real")).unwrap();
+        std::fs::rename(&copy, &config).unwrap();
+        assert!(matches!(
+            decided(&previous, &[config.clone(), state.clone()]),
+            Verdict::Refused(_)
+        ));
+        assert_eq!(
+            decided(&previous, &[d.path().join("absent"), state.clone()]),
+            Verdict::Passed,
+            "an absent directory is not compared"
+        );
+        assert_eq!(
+            decided(
+                &continuity::PreviousAgent::None,
+                std::slice::from_ref(&config)
+            ),
+            Verdict::Passed,
+            "no pins"
+        );
+        assert!(matches!(
+            decided(&continuity::PreviousAgent::Unreadable("EPERM".into()), std::slice::from_ref(&state)),
+            Verdict::Refused(w) if w.contains("cannot be read")
+        ));
+    }
+
+    /// Review of #468 R2, fix a, the restart: a start that runs the binary
+    /// the previous agent protected is its restart — its key must be in a
+    /// directory that agent protected and there, never minted (the
+    /// reviewer's V3b: `ExecStart=` redefined with the key in an empty
+    /// directory). A start of another binary (the tests' copies) is judged
+    /// by the evidence alone.
+    #[test]
+    fn a_restart_of_the_protected_binary_never_mints() {
+        let d = tempfile::tempdir().unwrap();
+        let (installed, copy) = (d.path().join("northnarrow-agent"), d.path().join("e2etest"));
+        std::fs::write(&installed, "ELF").unwrap();
+        std::fs::write(&copy, "ELF").unwrap();
+        let etc = d.path().join("etc");
+        let empty = d.path().join("empty");
+        std::fs::create_dir(&etc).unwrap();
+        std::fs::create_dir(&empty).unwrap();
+        let key = etc.join("agent.sig.key");
+        crate::keys::AgentSigningKey::load_or_bootstrap(&key).unwrap();
+        let previous = pinned(&[&etc], &[&installed]);
+        let decided = |paths: &continuity::IdentityPaths, exe: &Path| {
+            let mut boot = BootSequence::new();
+            let v = signing_identity_decided(&mut boot, paths, &previous, exe).unwrap();
+            assert_eq!(v == Verdict::Passed, has(&boot, BootStep::SigningIdentity));
+            v
+        };
+        assert_eq!(
+            decided(&identity_paths(&etc), &installed),
+            Verdict::Passed,
+            "a restart"
+        );
+        // V3b: the installed binary, its key, id and chains in an empty
+        // directory: nothing there says an identity, but it is a restart
+        let v = decided(&identity_paths(&empty), &installed);
+        assert!(
+            matches!(&v, Verdict::Refused(w) if w.contains("not in a directory that agent protected")
+                && w.contains("never mints")),
+            "{v:?}"
+        );
+        assert!(!empty.join("agent.sig.key").exists(), "a key minted");
+        // the key gone from the protected directory, its public half too
+        std::fs::remove_file(&key).unwrap();
+        std::fs::remove_file(etc.join("agent.sig.pub")).unwrap();
+        assert!(matches!(
+            decided(&identity_paths(&etc), &installed),
+            Verdict::Refused(w) if w.contains("a restart never mints a key")
+        ));
+        // another binary (a test's copy) in an empty directory: a first start
+        assert_eq!(decided(&identity_paths(&empty), &copy), Verdict::Passed);
+        // no pins (a boot, or removed on purpose): the evidence alone
+        let mut boot = BootSequence::new();
+        assert_eq!(
+            signing_identity_decided(
+                &mut boot,
+                &identity_paths(&empty),
+                &continuity::PreviousAgent::None,
+                &installed
+            )
+            .unwrap(),
+            Verdict::Passed
+        );
+        assert!(matches!(
+            signing_identity_decided(
+                &mut BootSequence::new(),
+                &identity_paths(&empty),
+                &continuity::PreviousAgent::Unreadable("EPERM".into()),
+                &installed
+            )
+            .unwrap(),
+            Verdict::Refused(w) if w.contains("cannot be read")
+        ));
     }
 
     /// Lab PR 265: the environment variable that makes
@@ -1028,7 +1362,7 @@ mod tests {
         );
         assert!(out.status.success(), "{text}");
         assert!(text.contains("1 passed"), "the helper did not run: {text}");
-        assert!(text.contains("k265 mount namespace: 4 cases"), "{text}");
+        assert!(text.contains("k265 mount namespace: 6 cases"), "{text}");
     }
 
     /// The other half of [`the_real_mount_table_in_a_namespace_of_its_own`]:
@@ -1065,10 +1399,16 @@ mod tests {
         };
         let check = || {
             let mut boot = BootSequence::new();
-            let table =
-                std::fs::read_to_string(continuity::OWN_MOUNTINFO).map_err(|e| e.to_string());
-            let v =
-                agent_mounts_decided(&mut boot, table, &continuity::spelled(&[&state])).unwrap();
+            let table = std::fs::read(continuity::OWN_MOUNTINFO).map_err(|e| e.to_string());
+            let v = agent_mounts_decided(
+                &mut boot,
+                table,
+                &continuity::spelled(&[&state]),
+                Path::new(PIN_ROOT),
+                &continuity::PreviousAgent::None,
+                &[],
+            )
+            .unwrap();
             assert_eq!(v == Verdict::Passed, has(&boot, BootStep::AgentMounts));
             v
         };
@@ -1105,7 +1445,36 @@ mod tests {
             matches!(&v, Verdict::Refused(w) if w.contains("agent.sig.key (")),
             "{v:?}"
         );
-        println!("k265 mount namespace: 4 cases");
+        umount(&key);
+        // review of #468, case A: a directory whose name holds U+00A0 bound
+        // over the state directory, the unit's bind of it on top — the
+        // split on Unicode spaces made both lines look elsewhere
+        use std::os::unix::ffi::OsStrExt;
+        let fake = root
+            .join(std::ffi::OsStr::from_bytes(b"fake\xc2\xa0"))
+            .join("x");
+        std::fs::create_dir_all(&fake).unwrap();
+        mount(&["--bind".as_ref(), fake.as_os_str(), state.as_os_str()]);
+        mount(&["--bind".as_ref(), state.as_os_str(), state.as_os_str()]);
+        let v = check();
+        assert!(
+            matches!(&v, Verdict::Refused(w) if w.contains("another directory or file bound there")),
+            "{v:?}"
+        );
+        umount(&state);
+        umount(&state);
+        // case B: a tmpfs on a name that is not UTF-8, elsewhere — the
+        // table read as text could not be read at all
+        let other = root.join(std::ffi::OsStr::from_bytes(b"other\xff"));
+        std::fs::create_dir_all(&other).unwrap();
+        mount(&[
+            "-t".as_ref(),
+            "tmpfs".as_ref(),
+            "k265".as_ref(),
+            other.as_os_str(),
+        ]);
+        assert_eq!(check(), Verdict::Passed, "a mount elsewhere, not UTF-8");
+        println!("k265 mount namespace: 6 cases");
     }
 
     /// Lab PR 265 (review #466 F4-bis): a fresh directory passes (a first
@@ -1115,16 +1484,9 @@ mod tests {
     #[test]
     fn a_key_absent_where_an_identity_was_refuses_and_mints_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = continuity::IdentityPaths {
-            signing_key: dir.path().join("agent.sig.key"),
-            agent_id: dir.path().join("agent_id"),
-            chains: vec![dir.path().join("audit.log")],
-        };
+        let paths = identity_paths(dir.path());
         let mut boot = BootSequence::new();
-        assert_eq!(
-            signing_identity(&mut boot, &paths).unwrap(),
-            Verdict::Passed
-        );
+        assert_eq!(identity(&mut boot, &paths), Verdict::Passed);
         assert!(has(&boot, BootStep::SigningIdentity));
         // a first boot: the key, its public half, the id, a signed row
         let key = crate::keys::AgentSigningKey::load_or_bootstrap(&paths.signing_key).unwrap();
@@ -1143,10 +1505,7 @@ mod tests {
         .unwrap();
         drop(log);
         let mut boot = BootSequence::new();
-        assert_eq!(
-            signing_identity(&mut boot, &paths).unwrap(),
-            Verdict::Passed
-        );
+        assert_eq!(identity(&mut boot, &paths), Verdict::Passed);
         // the key removed: each piece of evidence alone refuses
         let secret = std::fs::read(&paths.signing_key).unwrap();
         std::fs::remove_file(&paths.signing_key).unwrap();
@@ -1163,7 +1522,7 @@ mod tests {
         for (p, bytes) in &evidence {
             std::fs::write(p, bytes).unwrap();
             let mut boot = BootSequence::new();
-            let v = signing_identity(&mut boot, &paths).unwrap();
+            let v = identity(&mut boot, &paths);
             assert!(
                 matches!(&v, Verdict::Refused(w) if w.contains("none is minted")),
                 "{}: {v:?}",
@@ -1176,20 +1535,14 @@ mod tests {
         }
         // nothing left: a fresh install again
         let mut boot = BootSequence::new();
-        assert_eq!(
-            signing_identity(&mut boot, &paths).unwrap(),
-            Verdict::Passed
-        );
+        assert_eq!(identity(&mut boot, &paths), Verdict::Passed);
         // the key back: passes
         std::fs::write(&paths.signing_key, &secret).unwrap();
         for (p, bytes) in &evidence {
             std::fs::write(p, bytes).unwrap();
         }
         let mut boot = BootSequence::new();
-        assert_eq!(
-            signing_identity(&mut boot, &paths).unwrap(),
-            Verdict::Passed
-        );
+        assert_eq!(identity(&mut boot, &paths), Verdict::Passed);
     }
 
     /// The proof is given once every check passed, and the attach phase
@@ -1200,20 +1553,9 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("sys/kernel/security")).unwrap();
         std::fs::write(dir.path().join(lsm::ACTIVE_LSM_REL), "capability,bpf\n").unwrap();
         let mut boot = BootSequence::new();
+        assert_eq!(mounts(&mut boot, Ok(SANDBOX.into())), Verdict::Passed);
         assert_eq!(
-            agent_mounts_decided(&mut boot, Ok(SANDBOX.into()), &agent_dirs()).unwrap(),
-            Verdict::Passed
-        );
-        assert_eq!(
-            signing_identity(
-                &mut boot,
-                &continuity::IdentityPaths {
-                    signing_key: dir.path().join("agent.sig.key"),
-                    agent_id: dir.path().join("agent_id"),
-                    chains: vec![dir.path().join("audit.log")],
-                }
-            )
-            .unwrap(),
+            identity(&mut boot, &identity_paths(dir.path())),
             Verdict::Passed
         );
         // the eBPF object and the BTF are the host's: decided here as they

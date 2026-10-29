@@ -35,67 +35,22 @@
 //! chain the start could open in the view it refuses.
 
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+
+use common::wire::InodeKey;
+
+pub use crate::mountinfo::{MountEntry, MountTable};
 
 /// The agent's own mount table.
 pub const OWN_MOUNTINFO: &str = "/proc/self/mountinfo";
 
+/// The bpffs the agent pins into, and the directory of its pins.
+pub const BPFFS_MOUNT: &str = "/sys/fs/bpf";
+
 /// The bytes of a chain read to find its first row: a row is a few hundred
 /// bytes, an `agent_boot` a few kilobytes.
 const FIRST_ROW_MAX: u64 = 64 * 1024;
-
-/// One line of a `mountinfo` text (`proc(5)`): the fields the check reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MountEntry {
-    pub id: u64,
-    pub parent: u64,
-    /// `major:minor` of the filesystem.
-    pub dev: String,
-    /// The directory of that filesystem mounted here (`/` for its root).
-    pub root: PathBuf,
-    pub mount_point: PathBuf,
-    pub fstype: String,
-    pub source: String,
-}
-
-/// The lines of a `mountinfo` text, in order, their paths unescaped
-/// (`\040` a space, `\011` a tab, `\012` a newline, `\134` a backslash);
-/// malformed lines are skipped.
-pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        // id parent major:minor root mount_point opts [optional…] - fstype source superopts
-        let Some((left, right)) = line.split_once(" - ") else {
-            continue;
-        };
-        let fields: Vec<&str> = left.split_whitespace().collect();
-        if fields.len() < 5 {
-            continue;
-        }
-        let (Ok(id), Ok(parent)) = (fields[0].parse(), fields[1].parse()) else {
-            continue;
-        };
-        let mut right = right.split_whitespace();
-        out.push(MountEntry {
-            id,
-            parent,
-            dev: fields[2].to_string(),
-            root: PathBuf::from(unescape(fields[3])),
-            mount_point: PathBuf::from(unescape(fields[4])),
-            fstype: right.next().unwrap_or("").to_string(),
-            source: unescape(right.next().unwrap_or("")),
-        });
-    }
-    out
-}
-
-fn unescape(s: &str) -> String {
-    s.replace("\\040", " ")
-        .replace("\\011", "\t")
-        .replace("\\012", "\n")
-        .replace("\\134", "\\")
-}
 
 /// `p` without `.` components and with `..` taken back lexically: the
 /// spelling `mountinfo` uses for an absolute path.
@@ -133,31 +88,33 @@ pub fn spelled(dirs: &[&Path]) -> Vec<PathBuf> {
 
 /// The mounts at or under `dirs` (spelled as `mountinfo` spells them,
 /// [`spelled`]) that hide what was there: every one but a bind of a
-/// directory onto itself. A mount `m` is that when the mount it sits on
-/// (its parent, by id) is of the same filesystem and shows, at `m`'s
-/// mount point, the directory `m` mounts — `m`'s root is the parent's root
-/// joined with the path from the parent's mount point to `m`'s. That is
-/// what the unit's `ReadWritePaths=` (and `RuntimeDirectory=`) make in the
-/// agent's namespace, on any layout: a separate `/var`, a btrfs subvolume
-/// mounted as `/`. Another directory bound there (its root another path),
+/// directory onto itself ([`crate::mountinfo::is_self_bind`]: the mount it
+/// sits on is of the same filesystem and shows, at its mount point, the
+/// directory it mounts — what the unit's `ReadWritePaths=` and
+/// `RuntimeDirectory=` make in the agent's namespace, on any layout: a
+/// separate `/var`, a btrfs subvolume mounted as `/`). Another directory or
+/// file bound there (its root another path, the same basename included),
 /// another filesystem (a tmpfs, a loop device, an overlay: another
-/// `major:minor`), a mount whose parent is not in the table: each is one
-/// finding, saying what is mounted there. Stacked mounts are each judged
-/// against the one below.
-pub fn mounts_over(table: &[MountEntry], dirs: &[PathBuf]) -> Vec<String> {
+/// `major:minor`, the same path included), a mount whose parent is not in
+/// the table: each is one finding, saying what is mounted there. Stacked
+/// mounts are each judged against the one below. A line of the table that
+/// is not in the kernel's shape is a finding when its mount point is at or
+/// under one of `dirs`, or cannot be read (review of #468 R3: a line about
+/// anything else never refuses).
+pub fn mounts_over(table: &MountTable, dirs: &[PathBuf]) -> Vec<String> {
     let mut out = Vec::new();
-    for m in table {
+    for m in &table.entries {
         let Some(dir) = dirs.iter().find(|d| m.mount_point.starts_with(d)) else {
             continue;
         };
         let what = format!(
             "{} ({} {}, its directory {})",
             m.mount_point.display(),
-            if m.fstype.is_empty() { "?" } else { &m.fstype },
-            if m.source.is_empty() { "?" } else { &m.source },
+            m.fstype.to_string_lossy(),
+            m.source.to_string_lossy(),
             m.root.display()
         );
-        let Some(parent) = table.iter().find(|p| p.id == m.parent && p.id != m.id) else {
+        let Some(parent) = table.parent_of(m) else {
             out.push(format!(
                 "{what}: a mount over the agent's directory {} whose underlying mount is not in \
                  the table",
@@ -165,6 +122,9 @@ pub fn mounts_over(table: &[MountEntry], dirs: &[PathBuf]) -> Vec<String> {
             ));
             continue;
         };
+        if crate::mountinfo::is_self_bind(m, parent) {
+            continue;
+        }
         let Ok(rel) = m.mount_point.strip_prefix(&parent.mount_point) else {
             out.push(format!(
                 "{what}: a mount over the agent's directory {} outside the mount it sits on ({})",
@@ -173,16 +133,12 @@ pub fn mounts_over(table: &[MountEntry], dirs: &[PathBuf]) -> Vec<String> {
             ));
             continue;
         };
-        let expected = parent.root.join(rel);
-        if m.dev == parent.dev && lexical(&m.root) == lexical(&expected) {
-            continue;
-        }
-        out.push(if m.dev != parent.dev {
+        out.push(if !m.same_dev(parent) {
             format!(
                 "{what}: another filesystem mounted there, over the agent's directory {} (the \
                  one under it is {}, mounted at {})",
                 dir.display(),
-                parent.dev,
+                parent.dev(),
                 parent.mount_point.display()
             )
         } else {
@@ -190,21 +146,251 @@ pub fn mounts_over(table: &[MountEntry], dirs: &[PathBuf]) -> Vec<String> {
                 "{what}: another directory or file bound there, over the agent's directory {} \
                  (what is there is {})",
                 dir.display(),
-                expected.display()
+                parent.root.join(rel).display()
             )
         });
+    }
+    for bad in &table.malformed {
+        let concerns = match &bad.mount_point {
+            Some(mp) => dirs.iter().find(|d| mp.starts_with(d)).cloned(),
+            None => Some(PathBuf::from("(any)")),
+        };
+        if let Some(dir) = concerns {
+            out.push(format!(
+                "line {} of the mount table is not in the kernel's shape ({}), and it may be a \
+                 mount over the agent's directory {}",
+                bad.line,
+                bad.why,
+                dir.display()
+            ));
+        }
+    }
+    out
+}
+
+/// Lab PR 265 (review of #468 R2): the bpffs the previous agent's pins are
+/// in must be the one at [`BPFFS_MOUNT`], alone there and nothing mounted
+/// over its pin root (`pin_root`): a second bpffs or a tmpfs stacked on
+/// it, or a mount over the pin root, hides the pins — and with them the
+/// kernel's proof of what the previous agent protected ([`view_findings`],
+/// [`restart_key_findings`]). A
+/// host without a bpffs there has no pins: nothing to judge. A bpffs
+/// mounted elsewhere is the self-integrity watcher's finding.
+pub fn bpffs_findings(table: &MountTable, pin_root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let at: Vec<&MountEntry> = table
+        .entries
+        .iter()
+        .filter(|m| m.mount_point == Path::new(BPFFS_MOUNT))
+        .collect();
+    if at.len() > 1 {
+        out.push(format!(
+            "{} mounts stacked on {BPFFS_MOUNT} ({}): one hides the previous agent's pins",
+            at.len(),
+            at.iter()
+                .map(|m| m.fstype.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    } else if let Some(m) = at.first() {
+        if m.fstype != "bpf" {
+            out.push(format!(
+                "{BPFFS_MOUNT} is a {} mount, not a bpffs",
+                m.fstype.to_string_lossy()
+            ));
+        }
+    }
+    for m in table
+        .entries
+        .iter()
+        .filter(|m| m.mount_point.starts_with(pin_root))
+    {
+        out.push(format!(
+            "{} ({} {}): a mount over the pin root {}",
+            m.mount_point.display(),
+            m.fstype.to_string_lossy(),
+            m.source.to_string_lossy(),
+            pin_root.display()
+        ));
+    }
+    for bad in &table.malformed {
+        if bad
+            .mount_point
+            .as_deref()
+            .is_none_or(|mp| mp == Path::new(BPFFS_MOUNT) || mp.starts_with(pin_root))
+        {
+            out.push(format!(
+                "line {} of the mount table is not in the kernel's shape ({}), and it may be a \
+                 mount over {BPFFS_MOUNT}",
+                bad.line, bad.why
+            ));
+        }
+    }
+    out
+}
+
+/// The key `PROTECTED_INODES` holds for the inode at `path`, read as the
+/// previous agent read it when it registered the inode (the name itself,
+/// `lstat`; the kernel's encoding of the device).
+pub fn inode_key(path: &Path) -> std::io::Result<InodeKey> {
+    let meta = std::fs::symlink_metadata(path)?;
+    Ok(InodeKey {
+        dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(meta.dev()),
+        ino: meta.ino(),
+    })
+}
+
+/// The previous agent's kernel state (lab PR 265, review of #468 R2): its
+/// pins outlive it — a `cgroup.kill`, a crash —, and `PROTECTED_INODES`
+/// holds the inodes it protected, so they are a proof of what the start
+/// before this one saw that no view of the filesystem can change.
+pub enum PreviousAgent {
+    /// No pins under the bpffs root: no agent has run since the bpffs was
+    /// mounted (a boot), or they were removed on purpose (an upgrade, an
+    /// uninstall, a re-key: each removes them before it touches a file).
+    None,
+    /// Its pins, and the inodes it protected (`contains`).
+    Pinned(Box<dyn Fn(InodeKey) -> bool>),
+    /// Pinned, but its inode map cannot be read: why.
+    Unreadable(String),
+}
+
+/// [`PreviousAgent`] from the pins under `bpffs_root`: `PROTECTED_PIDS` or
+/// `PROTECTED_INODES` there (looked at without following a link: what is
+/// at the name, as `preregister_self` asks), then the inode map opened.
+pub fn previous_agent(bpffs_root: &Path) -> PreviousAgent {
+    let pinned = |name: &str| {
+        !matches!(std::fs::symlink_metadata(bpffs_root.join(name)),
+                  Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    };
+    if !pinned(crate::anti_tamper::PROTECTED_PIDS_MAP_NAME) && !pinned("PROTECTED_INODES") {
+        return PreviousAgent::None;
+    }
+    match crate::anti_tamper::filesystem::ProtectedInodesHandle::open(bpffs_root) {
+        Ok(h) => PreviousAgent::Pinned(Box::new(move |k| h.contains(k))),
+        Err(e) => PreviousAgent::Unreadable(format!("{e:#}")),
+    }
+}
+
+/// The `contains` of `previous`, or the finding that says why there is
+/// none to ask (no pins: `Ok(None)`).
+fn pinned_inodes(previous: &PreviousAgent) -> Result<Option<&dyn Fn(InodeKey) -> bool>, String> {
+    match previous {
+        PreviousAgent::None => Ok(None),
+        PreviousAgent::Unreadable(why) => Err(format!(
+            "the previous agent's pins are there but its PROTECTED_INODES cannot be read \
+             ({why}): what it protected cannot be compared"
+        )),
+        PreviousAgent::Pinned(c) => Ok(Some(c.as_ref())),
+    }
+}
+
+/// Lab PR 265 (review of #468 R2, fix a), the view: each of `dirs` (the
+/// agent's own directories, the configuration and the state directory, as
+/// this start sees them) that exists must be the inode the previous agent
+/// protected. A copy bound over an ancestor (`/etc`, `/var/lib`), a
+/// directory swapped by a rename above it, another root
+/// (`RootDirectory=`) each show another inode. Every agent registers the
+/// host's directories (their paths are fixed), so the privileged tests'
+/// agents, which keep their own files elsewhere, see the same ones. No
+/// pins: nothing to compare (a boot, or the pins removed on purpose);
+/// pins whose inode map cannot be read: a finding.
+pub fn view_findings(previous: &PreviousAgent, dirs: &[PathBuf]) -> Vec<String> {
+    let contains = match pinned_inodes(previous) {
+        Ok(Some(c)) => c,
+        Ok(None) => return Vec::new(),
+        Err(why) => return vec![why],
+    };
+    let mut out = Vec::new();
+    for d in dirs {
+        match inode_key(d) {
+            Ok(k) if contains(k) => {}
+            Ok(k) => out.push(format!(
+                "{} (dev {}, inode {}) is not the directory the previous agent protected: the \
+                 view changed since it ran (a mount or a rename above it, another root)",
+                d.display(),
+                k.dev,
+                k.ino
+            )),
+            // absent now: nothing to compare (the restart's own check holds
+            // the installed agent's key)
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => out.push(format!(
+                "{}: {e} — whether it is the directory the previous agent protected cannot be \
+                 shown",
+                d.display()
+            )),
+        }
+    }
+    out
+}
+
+/// Lab PR 265 (review of #468 R2, fix a), the restart: when this process
+/// runs the very binary the previous agent protected (`exe`, followed: the
+/// installed one — the privileged tests run copies of their own), this
+/// start is that agent's restart, and a restart keeps its identity: its
+/// key's directory must be one the previous agent protected (a drop-in
+/// redefining `ExecStart=` with the key, the id and the chains in an empty
+/// directory is refused) and its key must be there — never minted. No
+/// pins: nothing to compare; pins whose inode map cannot be read: a
+/// finding.
+pub fn restart_key_findings(
+    previous: &PreviousAgent,
+    exe: &Path,
+    signing_key: &Path,
+) -> Vec<String> {
+    let contains = match pinned_inodes(previous) {
+        Ok(Some(c)) => c,
+        Ok(None) => return Vec::new(),
+        Err(why) => return vec![why],
+    };
+    let restart = std::fs::metadata(exe)
+        .map(|m| InodeKey {
+            dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
+            ino: m.ino(),
+        })
+        .is_ok_and(contains);
+    if !restart {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let key_dir = signing_key
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !inode_key(key_dir).is_ok_and(contains) {
+        out.push(format!(
+            "this start runs the binary the previous agent protected ({}), a restart of it, but \
+             its signing key {} is not in a directory that agent protected: a restart keeps its \
+             identity",
+            exe.display(),
+            signing_key.display()
+        ));
+    }
+    if key_absent(signing_key) {
+        out.push(format!(
+            "this start runs the binary the previous agent protected ({}), a restart of it, and \
+             its signing key {} is absent: a restart never mints a key (an upgrade, an \
+             uninstall and a re-key remove the pins before the key goes)",
+            exe.display(),
+            signing_key.display()
+        ));
     }
     out
 }
 
 /// The paths whose presence says the install had a signing identity
 /// before this start: the key's public half beside `signing_key`, the
-/// install's id, and the chains whose signed rows count.
+/// install's id, the head anchor, and the chains whose signed rows count.
 #[derive(Debug, Clone)]
 pub struct IdentityPaths {
     pub signing_key: PathBuf,
     pub agent_id: PathBuf,
-    /// The audit log and the other chains (their active files).
+    /// The head anchor (`chain_heads.json`): install.sh creates it empty,
+    /// the agent writes it.
+    pub heads: PathBuf,
+    /// The audit log and the other chains (their active files; their
+    /// manifests and sealed archives are looked at too).
     pub chains: Vec<PathBuf>,
 }
 
@@ -216,65 +402,96 @@ pub fn key_absent(path: &Path) -> bool {
     matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// What is at `path`, looked at without following a link: `None` when the
+/// name holds nothing; any other answer — a file, a link, an error that is
+/// not "not found" — is something (review of #468 R8: a lookup that fails
+/// counts against minting).
+fn something_at(path: &Path) -> Option<String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Some("is there".to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(format!("cannot be looked at ({e}): counted as there")),
+    }
+}
+
 /// What says this install had a signing identity before this start, each
 /// as a line for the journal (empty: none, a first install): the key's
-/// public half (`agent.sig.pub`, any file at its name), the install's id
-/// (any file at its name), a chain whose first line is a signed row (a
-/// JSON object with a non-empty `entry_hash` and `agent_sig`: what every
-/// row of the audit chain and of the other chains carries). A chain is
-/// read as the chains are — no link followed, no FIFO waited on, a regular
-/// file only, at most its first 64 KiB —; an empty one (install.sh creates
-/// the audit log and the head anchor empty), one that is not a regular
-/// file or whose first line is not a row is no evidence: the chain's own
-/// check judges it.
+/// public half (`agent.sig.pub`) and the install's id — anything at their
+/// names, or a lookup that fails otherwise than "not found" —; the head
+/// anchor when it is not an empty file (install.sh creates it empty); a
+/// chain, one of its manifests or sealed archives whose first line is a
+/// signed row (a JSON object with a non-empty `entry_hash` and
+/// `agent_sig`: what every row of the audit chain and of the other chains
+/// carries), or that cannot be opened otherwise than "not found". A chain
+/// is read as the chains are — no link followed (a link counts), no FIFO
+/// waited on, at most its first 64 KiB —; an empty one, a directory or
+/// another non-file at its name, or a first line that is not a signed row
+/// is no evidence: the chain's own check judges it.
 pub fn prior_identity(paths: &IdentityPaths) -> Vec<String> {
     let mut out = Vec::new();
     let public = crate::keys::verifying_key_path(&paths.signing_key);
-    if std::fs::symlink_metadata(&public).is_ok() {
-        out.push(format!("its public half {} is there", public.display()));
+    if let Some(what) = something_at(&public) {
+        out.push(format!("its public half {} {what}", public.display()));
     }
-    if std::fs::symlink_metadata(&paths.agent_id).is_ok() {
+    if let Some(what) = something_at(&paths.agent_id) {
         out.push(format!(
-            "the install's id {} is there",
+            "the install's id {} {what}",
             paths.agent_id.display()
         ));
     }
+    match std::fs::symlink_metadata(&paths.heads) {
+        Ok(m) if m.file_type().is_file() && m.len() == 0 => {}
+        Ok(_) => out.push(format!(
+            "the head anchor {} is not an empty file",
+            paths.heads.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => out.push(format!(
+            "the head anchor {} cannot be looked at ({e}): counted as there",
+            paths.heads.display()
+        )),
+    }
     for chain in &paths.chains {
-        if has_signed_row(chain) {
-            out.push(format!("{} holds signed rows", chain.display()));
+        let mut files = vec![chain.clone(), crate::chainlog::manifest_path(chain)];
+        files.extend(crate::chainlog::archives_newest_first(chain));
+        for f in files {
+            if let Some(what) = chain_evidence(&f) {
+                out.push(format!("{} {what}", f.display()));
+            }
         }
     }
     out
 }
 
-/// Whether the chain at `path` starts with a signed row ([`prior_identity`]).
-fn has_signed_row(path: &Path) -> bool {
-    let Ok(f) = std::fs::OpenOptions::new()
+/// What the chain file at `path` says of an earlier identity
+/// ([`prior_identity`]): `None` for nothing.
+fn chain_evidence(path: &Path) -> Option<String> {
+    let f = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-    else {
-        return false;
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("cannot be opened ({e}): counted as rows")),
     };
-    if !f.metadata().is_ok_and(|m| m.file_type().is_file()) {
-        return false;
+    match f.metadata() {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => return None,
+        Err(e) => return Some(format!("cannot be looked at ({e}): counted as rows")),
     }
     let mut head = Vec::new();
-    if f.take(FIRST_ROW_MAX).read_to_end(&mut head).is_err() {
-        return false;
+    if let Err(e) = f.take(FIRST_ROW_MAX).read_to_end(&mut head) {
+        return Some(format!("cannot be read ({e}): counted as rows"));
     }
-    let Some(line) = head.split(|b| *b == b'\n').next() else {
-        return false;
-    };
-    let Ok(row) = serde_json::from_slice::<serde_json::Value>(line) else {
-        return false;
-    };
+    let line = head.split(|b| *b == b'\n').next()?;
+    let row = serde_json::from_slice::<serde_json::Value>(line).ok()?;
     let signed = |k: &str| {
         row.get(k)
             .and_then(|v| v.as_str())
             .is_some_and(|s| !s.is_empty())
     };
-    signed("entry_hash") && signed("agent_sig")
+    (signed("entry_hash") && signed("agent_sig")).then(|| "holds signed rows".to_string())
 }
 
 /// Why a start whose key is absent must not mint one ([`prior_identity`]'s
@@ -294,6 +511,10 @@ pub fn refusal_detail(signing_key: &Path, evidence: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_mountinfo(text: &str) -> MountTable {
+        crate::mountinfo::parse(text.as_bytes())
+    }
 
     /// A host's `/` on ext4 and, in the agent's namespace, the unit's
     /// `ReadWritePaths=` binds (each directory onto itself), as the lab
@@ -316,7 +537,7 @@ mod tests {
     #[test]
     fn the_units_own_binds_are_not_findings() {
         let t = parse_mountinfo(SANDBOX);
-        assert_eq!(t.len(), 5);
+        assert_eq!(t.entries.len(), 5);
         assert!(
             mounts_over(&t, &dirs()).is_empty(),
             "{:?}",
@@ -402,6 +623,52 @@ mod tests {
         assert!(f[2].contains("/dev/loop0"), "{}", f[2]);
     }
 
+    /// Review of #468 (M2, M2d): another directory with the agent's
+    /// directory's basename (`/srv/copy/northnarrow`), and the same path on
+    /// another filesystem (a loop image holding `/etc/northnarrow`), are
+    /// findings; so are the review's NBSP variants — a directory named
+    /// `fake<U+00A0>` bound over the directory, and one named
+    /// `/etc/northnarrow<U+00A0>/etc/northnarrow` that a split on Unicode
+    /// spaces read as a self-bind.
+    #[test]
+    fn the_same_basename_the_same_path_elsewhere_and_nbsp_are_findings() {
+        let base = "29 1 252:1 / / rw - ext4 /dev/vda1 rw\n";
+        for (extra, want) in [
+            (
+                "701 29 252:1 /srv/copy/northnarrow /etc/northnarrow rw - ext4 /dev/vda1 rw\n",
+                "another directory or file",
+            ),
+            (
+                "701 29 7:0 /etc/northnarrow /etc/northnarrow rw - ext4 /dev/loop0 rw\n",
+                "another filesystem",
+            ),
+        ] {
+            let f = mounts_over(&parse_mountinfo(&format!("{base}{extra}")), &dirs());
+            assert!(f.len() == 1 && f[0].contains(want), "{extra}: {f:?}");
+        }
+        let mut nbsp = base.as_bytes().to_vec();
+        nbsp.extend_from_slice(
+            b"701 29 252:1 /tmp/fake\xc2\xa0/x /etc/northnarrow rw - ext4 /dev/vda1 rw\n",
+        );
+        nbsp.extend_from_slice(
+            b"702 701 252:1 /tmp/fake\xc2\xa0/x /etc/northnarrow rw - ext4 /dev/vda1 rw\n",
+        );
+        let f = mounts_over(&crate::mountinfo::parse(&nbsp), &dirs());
+        assert!(
+            f.len() == 1 && f[0].contains("another directory or file"),
+            "{f:?}"
+        );
+        let mut lookalike = base.as_bytes().to_vec();
+        lookalike.extend_from_slice(
+            b"701 29 252:1 /etc/northnarrow\xc2\xa0/etc/northnarrow /etc/northnarrow rw - ext4 /dev/vda1 rw\n",
+        );
+        let f = mounts_over(&crate::mountinfo::parse(&lookalike), &dirs());
+        assert!(
+            f.len() == 1 && f[0].contains("another directory or file"),
+            "{f:?}"
+        );
+    }
+
     /// A mount whose underlying mount is not in the table cannot be shown
     /// to be a bind of the directory onto itself: a finding. A mount above
     /// the agent's directories (a bind over `/etc`) is not judged here.
@@ -431,8 +698,8 @@ mod tests {
 702 29 0:91 / /etc/northnarrow-other rw - tmpfs tmpfs rw
 ";
         let table = parse_mountinfo(t);
-        assert_eq!(table[1].mount_point, PathBuf::from("/tmp/st ate"));
-        assert_eq!(table[1].root, PathBuf::from("/tmp/a b"));
+        assert_eq!(table.entries[1].mount_point, PathBuf::from("/tmp/st ate"));
+        assert_eq!(table.entries[1].root, PathBuf::from("/tmp/a b"));
         let f = mounts_over(&table, &[PathBuf::from("/tmp/st ate")]);
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(mounts_over(&table, &dirs()).is_empty());
@@ -466,6 +733,7 @@ mod tests {
         let paths = IdentityPaths {
             signing_key: d.path().join("agent.sig.key"),
             agent_id: d.path().join("agent_id"),
+            heads: d.path().join("chain_heads.json"),
             chains: vec![
                 d.path().join("audit.log"),
                 d.path().join("detections.jsonl"),
@@ -488,10 +756,40 @@ mod tests {
         std::fs::create_dir(d.path().join("audit.log")).unwrap();
         assert!(prior_identity(&paths).is_empty());
         std::fs::remove_dir(d.path().join("audit.log")).unwrap();
-        std::fs::write(d.path().join("elsewhere"), row("ab", "c2ln")).unwrap();
+        // review of #468 R8: a link is not followed, and it counts (a lookup
+        // that is not "not found" is something)
+        std::fs::write(d.path().join("elsewhere"), "").unwrap();
         std::os::unix::fs::symlink(d.path().join("elsewhere"), d.path().join("audit.log")).unwrap();
-        assert!(prior_identity(&paths).is_empty(), "a link is not followed");
+        let e = prior_identity(&paths);
+        assert!(
+            e.len() == 1 && e[0].contains("audit.log cannot be opened"),
+            "{e:?}"
+        );
         std::fs::remove_file(d.path().join("audit.log")).unwrap();
+        // the head anchor: empty (install.sh's) is none, written is
+        std::fs::write(&paths.heads, "").unwrap();
+        assert!(prior_identity(&paths).is_empty());
+        std::fs::write(&paths.heads, "{\"slots\":[]}").unwrap();
+        let e = prior_identity(&paths);
+        assert!(e.len() == 1 && e[0].contains("head anchor"), "{e:?}");
+        std::fs::remove_file(&paths.heads).unwrap();
+        // a sealed archive and a manifest of a chain count like its active file
+        let archive = crate::chainlog::archive_path_for(&d.path().join("detections.jsonl"), 1);
+        std::fs::write(&archive, row("ab", "c2ln")).unwrap();
+        let e = prior_identity(&paths);
+        assert!(
+            e.len() == 1 && e[0].contains(".000001 holds signed rows"),
+            "{e:?}"
+        );
+        std::fs::remove_file(&archive).unwrap();
+        let manifest = crate::chainlog::manifest_path(&d.path().join("audit.log"));
+        std::fs::write(&manifest, row("ab", "c2ln")).unwrap();
+        let e = prior_identity(&paths);
+        assert!(
+            e.len() == 1 && e[0].contains("manifest.jsonl holds signed rows"),
+            "{e:?}"
+        );
+        std::fs::remove_file(&manifest).unwrap();
 
         std::fs::write(
             d.path().join("audit.log"),
@@ -520,6 +818,18 @@ mod tests {
         let e = prior_identity(&paths);
         assert!(e.len() == 1 && e[0].contains("its public half"), "{e:?}");
         assert!(key_absent(&paths.signing_key));
+        std::fs::remove_file(d.path().join("agent.sig.pub")).unwrap();
+        // a lookup that fails otherwise than "not found" counts (ENOTDIR:
+        // the id's directory is a file)
+        let odd = IdentityPaths {
+            agent_id: d.path().join("elsewhere").join("agent_id"),
+            ..paths.clone()
+        };
+        let e = prior_identity(&odd);
+        assert!(
+            e.len() == 1 && e[0].contains("cannot be looked at"),
+            "{e:?}"
+        );
 
         // a key there in any form is not absent: its load decides
         std::os::unix::fs::symlink("/dev/null", &paths.signing_key).unwrap();
@@ -536,12 +846,12 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(has_signed_row(&fifo));
+            let _ = tx.send(chain_evidence(&fifo));
         });
         let got = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("blocked on a FIFO for 5 s");
-        assert!(!got);
+        assert_eq!(got, None);
     }
 
     /// The refusal says what was found and how to re-key on purpose.

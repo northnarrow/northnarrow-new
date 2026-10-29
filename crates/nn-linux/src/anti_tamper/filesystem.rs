@@ -89,12 +89,16 @@ pub const PROTECTED_DIR_FLAGS: u8 = FS_PROTECT_MUTATE | FS_PROTECT_NOCREATE;
 /// (`ExecStartPre=+/bin/mkdir -p …`; `/run` is a tmpfs): a runtime drop-in
 /// there (`systemctl edit --runtime`, a `BindPaths=` or
 /// `TemporaryFileSystem=` that hides `/etc/northnarrow` from the next start)
-/// is refused outside a signed trusted-installer window. The unit's other
-/// drop-in directories (`system.control`, `transient`, the generators', the
-/// `northnarrow-.service.d` and `service.d` prefixes) are the host's or do
-/// not exist: a drop-in there is a self-integrity finding, and a mount it
-/// lays over the agent's directories refuses the start
-/// (`boot::checks::agent_mounts`).
+/// is refused outside a signed trusted-installer window. It is one of the
+/// places systemd reads the unit's drop-ins from; the others
+/// (`system.control` — `set-property` writes resource properties there,
+/// but systemd reads any directive placed there —, `transient`, the
+/// generators', the vendor directory, the `northnarrow-.service.d` and
+/// `service.d` prefixes) are the host's or do not exist: a drop-in there is
+/// a self-integrity finding, and a mount it lays on or under the agent's
+/// directories refuses the start, one above them while the previous
+/// agent's pins are there (`boot::checks::agent_mounts`; the review of
+/// #468, R7).
 pub const NOCREATE_UNIT_DIRS: &[&str] = &[
     "/etc/systemd/system/northnarrow-agent.service.d",
     "/run/systemd/system/northnarrow-agent.service.d",
@@ -3151,6 +3155,23 @@ mod tests {
     #[test]
     fn only_the_agents_own_directories_refuse_new_entries() {
         assert_eq!(PROTECTED_DIR_FLAGS, FS_PROTECT_MUTATE | FS_PROTECT_NOCREATE);
+        // Lab PR 265 (the review of #468: the runtime drop-in directory left
+        // out of the NOCREATE list went unseen): the unit's two drop-in
+        // directories, the persistent and the runtime one.
+        assert_eq!(
+            NOCREATE_UNIT_DIRS,
+            &[
+                "/etc/systemd/system/northnarrow-agent.service.d",
+                "/run/systemd/system/northnarrow-agent.service.d",
+            ]
+        );
+        for d in NOCREATE_UNIT_DIRS {
+            assert_ne!(
+                binary_or_unit_flags(Path::new(d)) & FS_PROTECT_NOCREATE,
+                0,
+                "{d}"
+            );
+        }
         for d in NOCREATE_UNIT_DIRS {
             assert!(BINARY_AND_UNIT_PATHS.contains(d), "{d}");
             assert!(d.contains("northnarrow"), "{d} is not the agent's own");
