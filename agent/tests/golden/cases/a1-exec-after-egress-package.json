@@ -1,0 +1,94 @@
+{
+ "about": "Review #471 A1 (lab PR 267): a root process staged in /tmp reads a GPG private key, connects out, then executes /usr/bin/dpkg in the same pid. In kernel order the read and the connect are judged before the dpkg exec; on the priority bus the exec (P1) is taken ahead of the queued read (P2) and connect (P3), and the package carve-out (`in_package_transaction`) read the later dpkg: CHAIN-002, CHAIN-007 and NET-008's kill went. The lineage is now read as of each event's time (`lineage::judged_at`): a package manager executed after the event covers nothing.",
+ "fires": [
+  "NN-L-CHAIN-002_TmpExecThenEgress",
+  "NN-L-CHAIN-007_TmpCredExfilSequence",
+  "NN-L-NET-008_OutboundFromTmpExec",
+  "NN-L-CHAIN-001_CredReadThenEgress"
+ ],
+ "items": [
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6471001,
+     "ppid": 1,
+     "uid": 0,
+     "gid": 0,
+     "comm": "stager",
+     "filename": "/tmp/.r/stager",
+     "timestamp_ns": 3610000000000,
+     "argv": [
+      "/tmp/.r/stager"
+     ],
+     "parent_comm": "systemd",
+     "start_ns": 3609000000000,
+     "exe": {
+      "path": "/tmp/.r/stager"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3611000000000,
+     "path": "/root/.gnupg/private-keys-v1.d/golden.key",
+     "op": 6,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/tmp/.r/stager",
+     "modifier_pid": 6471001,
+     "modifier_uid": 0,
+     "modifier_comm": "stager"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3612000000000,
+     "end_ns": 3612050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "100.64.20.9",
+     "dst_port": 443,
+     "proto": 6,
+     "pid": 6471001,
+     "uid": 0,
+     "comm": "stager",
+     "exe": "/tmp/.r/stager",
+     "proc_start_ns": 3609000000000,
+     "bytes_sent": 1024,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6471001-3612000000000",
+     "phase": "connect"
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6471001,
+     "ppid": 1,
+     "uid": 0,
+     "gid": 0,
+     "comm": "dpkg",
+     "filename": "/usr/bin/dpkg",
+     "timestamp_ns": 3613000000000,
+     "argv": [
+      "dpkg",
+      "--version"
+     ],
+     "parent_comm": "systemd",
+     "start_ns": 3609000000000,
+     "exe": {
+      "path": "/usr/bin/dpkg"
+     }
+    }
+   }
+  }
+ ]
+}

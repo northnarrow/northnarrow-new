@@ -614,7 +614,8 @@ pub(crate) fn due_snapshot_rows(
             Some(floor) if floor > row.start_ns => continue,
             Some(_) => {}
         }
-        if let Some(image) = lineage.image_path(row.pid) {
+        // Review #471 A1: the image at the flow's connect, not a later exec.
+        if let Some(image) = lineage.image_path_at(row.pid, row.start_ns) {
             row.exe = Some(image);
         }
         row.resolved_hostname =
@@ -752,7 +753,7 @@ async fn process_close_record(
                     // names the image as a UDP row does; read after the
                     // tracker's lock.
                     if e.exe.is_none() {
-                        e.exe = lineage.image_path(e.pid);
+                        e.exe = lineage.image_path_at(e.pid, e.start_ns);
                     }
                     e
                 }
@@ -820,7 +821,7 @@ async fn process_close_record(
                 // External audit NETR-008: the sender's image, read before
                 // the tracker's lock (a datagram record is emitted while
                 // its sender runs).
-                exe: lineage.image_path(raw.pid),
+                exe: lineage.image_path_at(raw.pid, raw.timestamp_ns),
                 // External audit NET-016: who holds the PID, for the DNS
                 // attribution below.
                 proc_start_ns: lineage.start_floor_ns(raw.pid).unwrap_or(0),

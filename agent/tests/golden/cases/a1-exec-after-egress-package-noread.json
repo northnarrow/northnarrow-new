@@ -1,0 +1,77 @@
+{
+ "about": "Review #471 A1 (lab PR 267): a root process staged in /tmp connects out, then executes /usr/bin/dpkg in the same pid; no credential read. Taken ahead of the connect, the dpkg exec made NET-008 a Log and dropped CHAIN-002; judged as of the connect's time, the flow is the staging exec's.",
+ "fires": [
+  "NN-L-CHAIN-002_TmpExecThenEgress",
+  "NN-L-NET-008_OutboundFromTmpExec"
+ ],
+ "items": [
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6472001,
+     "ppid": 1,
+     "uid": 0,
+     "gid": 0,
+     "comm": "stager",
+     "filename": "/tmp/.r/stager",
+     "timestamp_ns": 3610000000000,
+     "argv": [
+      "/tmp/.r/stager"
+     ],
+     "parent_comm": "systemd",
+     "start_ns": 3609000000000,
+     "exe": {
+      "path": "/tmp/.r/stager"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3612000000000,
+     "end_ns": 3612050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "100.64.20.9",
+     "dst_port": 443,
+     "proto": 6,
+     "pid": 6472001,
+     "uid": 0,
+     "comm": "stager",
+     "exe": "/tmp/.r/stager",
+     "proc_start_ns": 3609000000000,
+     "bytes_sent": 1024,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6472001-3612000000000",
+     "phase": "connect"
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6472001,
+     "ppid": 1,
+     "uid": 0,
+     "gid": 0,
+     "comm": "dpkg",
+     "filename": "/usr/bin/dpkg",
+     "timestamp_ns": 3613000000000,
+     "argv": [
+      "dpkg",
+      "--version"
+     ],
+     "parent_comm": "systemd",
+     "start_ns": 3609000000000,
+     "exe": {
+      "path": "/usr/bin/dpkg"
+     }
+    }
+   }
+  }
+ ]
+}
