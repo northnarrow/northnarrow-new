@@ -14,7 +14,7 @@ use northnarrow_agent::boot::{BootSequence, BootStep};
 use tracing::{error, info, warn};
 
 use super::cli::Cli;
-use super::refusal::Refusal;
+use super::refusal::{self, Refusal};
 
 /// What [`check`] found, for the state files' bootstrap, the
 /// identity and the attest phase.
@@ -58,6 +58,33 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     // their checks (`boot::checks`), each once it passed. Review #466 F3:
     // the process's one sequence — a second `begin` is refused.
     let mut boot = BootSequence::begin()?;
+
+    // Lab PR 265 (review #466 F4-bis): first, before anything is read or
+    // written — the start is the agent that ran before. A mount laid over
+    // its own directories (a bind on the host, a runtime drop-in's
+    // `BindPaths=` / `TemporaryFileSystem=`) hides the files it had, and its
+    // key absent where an earlier identity is on record was removed or is
+    // hidden: either way the start would mint a new key and restart every
+    // chain under it. Refused at once, unsigned (nothing can sign them: the
+    // key is the one hidden), before the registration, the bootstraps and
+    // the identity read.
+    let state_dirs = cli.state_dirs();
+    let state_dirs: Vec<&std::path::Path> = state_dirs.iter().map(PathBuf::as_path).collect();
+    if let Verdict::Refused(why) = checks::agent_mounts(&mut boot, &state_dirs)? {
+        error!("refusing to start: {why}");
+        refusal::refuse_unsigned(
+            Refusal::new("agent_mounts", why),
+            "a mount hides the agent's own files: a chain opened now would be in the view the \
+             start refuses",
+        );
+    }
+    if let Verdict::Refused(why) = checks::signing_identity(&mut boot, &cli.identity_paths())? {
+        error!("refusing to start: {why}");
+        refusal::refuse_unsigned(
+            Refusal::new("signing_identity", why),
+            "the agent's signing key is absent and a new one is not minted",
+        );
+    }
 
     // Boot preflight: prove the embedded eBPF half is real and intact
     // BEFORE doing any work. The build-time staleness guard

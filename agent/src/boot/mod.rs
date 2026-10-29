@@ -5,7 +5,10 @@
 //! instead of comments in `main()`:
 //!
 //! 1. [`BootPhase::Preflight`] — checks only, nothing is loaded into the
-//!    kernel: the embedded eBPF object, the state directory, the BTF
+//!    kernel: first (lab PR 265) the agent's own directories not mounted
+//!    over and its signing key there or no earlier identity on record —
+//!    refused at once and unsigned, before anything is read or written —;
+//!    then the embedded eBPF object, the state directory, the BTF
 //!    offsets, the capabilities, the install manifest, the audit log's
 //!    writability and (R11b, lab PR 262) its chain, opened, the active LSMs
 //!    ([`lsm`]), the deny hooks' pin root and BTF. A refusal here leaves
@@ -81,9 +84,11 @@ pub(crate) mod tasks;
 /// the integrity proof and the degradations of a run are nn-linux's, with
 /// the eBPF loader and the sensors that take and report them; R11b (lab PR
 /// 262): the checks that record the steps the proof requires, and the BPF
-/// LSM gate among them.
+/// LSM gate among them; lab PR 265: the start's continuity — its
+/// directories not mounted over, its signing identity kept.
 pub use nn_linux::boot::{
-    checks, degradation, lsm, BootOrderError, BootPhase, BootSequence, BootStep, IntegrityVerified,
+    checks, continuity, degradation, lsm, BootOrderError, BootPhase, BootSequence, BootStep,
+    IntegrityVerified,
 };
 
 /// The agent daemon (R11a, lab PR 261: `main.rs`'s `main`): the command
@@ -715,6 +720,8 @@ mod tests {
         // R11b (lab PR 262): the checks that record the proof's steps
         // (`boot::checks`), and the proof, before the load.
         for check in [
+            "checks::agent_mounts(",
+            "checks::signing_identity(",
             "checks::ebpf_object(",
             "checks::state_dir(",
             "checks::btf_offsets(",
@@ -727,6 +734,19 @@ mod tests {
             "boot.verify_integrity()",
         ] {
             assert!(at(check) < attach, "`{check}` after the attach");
+        }
+        // lab PR 265 (review #466 F4-bis): the start's continuity first —
+        // before the registration, the first key load (which mints an
+        // absent key), the identity and every other check
+        for first in ["checks::agent_mounts(", "checks::signing_identity("] {
+            for later in [
+                "checks::ebpf_object(",
+                "preregister_self(",
+                "AgentSigningKey::load_or_bootstrap(",
+                "agent_id::resolve(",
+            ] {
+                assert!(at(first) < at(later), "`{first}` after `{later}`");
+            }
         }
         let selftest = at("boot::deny_selftest::run(");
         assert!(selftest > at(".attach_anti_tamper("));
@@ -790,6 +810,8 @@ mod tests {
         };
         let load = at("SensorMultiplexer::start_with_net(");
         for gate in [
+            "agent_mounts",
+            "signing_identity",
             "ebpf_object",
             "state_dir",
             "btf_offsets",
@@ -835,8 +857,24 @@ mod tests {
             1,
             "an exit of the start that is not the refusal's"
         );
-        assert!(phases
-            .contains("std::process::exit(self.conclude(audit, refusal, withdraw_registration))"));
+        assert!(
+            phases.contains("fn exit_refused(status: i32) -> ! {\n    std::process::exit(status)")
+        );
+        assert!(
+            phases.contains("exit_refused(self.conclude(audit, refusal, withdraw_registration))")
+        );
+        // lab PR 265: the refusals nothing can sign end the same way, and
+        // only the preflight's two continuity gates use them
+        assert!(
+            phases.contains("exit_refused(conclude_unsigned(refusal, why, withdraw_registration))")
+        );
+        assert_eq!(main.matches("refusal::refuse_unsigned(").count(), 2);
+        assert_eq!(
+            sources.matches("refuse_unsigned(").count(),
+            3,
+            "the two and its own"
+        );
+        assert!(function(PHASES[1].1, PHASES[1].2).contains("refusal::refuse_unsigned("));
         assert!(!phases.contains("libc::exit(") && !phases.contains("libc::_exit("));
         assert!(
             sources

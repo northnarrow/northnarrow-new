@@ -736,8 +736,10 @@ is neither the agent nor the watchdog gets `EPERM` for:
   device node or FIFO in `/etc/northnarrow`, `/var/lib/northnarrow` and
   its `detections/` directory, the agent's drop-in directory
   `/etc/systemd/system/northnarrow-agent.service.d` (Debian family, where
-  install.sh makes it), and the bpffs pin root — `op=create`, `mkdir`,
-  `symlink`, `link`, `mknod`;
+  install.sh makes it), its runtime drop-in directory
+  `/run/systemd/system/northnarrow-agent.service.d` (lab PR 265: the unit
+  makes it, empty, before every start), and the bpffs pin root —
+  `op=create`, `mkdir`, `symlink`, `link`, `mknod`;
 - an extended attribute set or removed on any protected inode (`setfattr`,
   `setcap`, `evmctl`, and `setfacl`, which 6.2+ kernels send through their
   own ACL hooks) — `op=xattr`. `security.selinux` is not refused:
@@ -746,7 +748,8 @@ is neither the agent nor the watchdog gets `EPERM` for:
 Each refusal is an `ANTI-TAMPER DENIAL`, an `NN-L-AT-001` detection and a
 decisive tamper signal (COMBAT), like a refused unlink. What changes for an
 operator: overlays go through `nn-admin config overlay set` (the agent
-writes them); `systemctl edit northnarrow-agent`, `nn-admin config overlay
+writes them); `systemctl edit northnarrow-agent` (and, since lab PR 265,
+`systemctl edit --runtime` and `systemctl revert`), `nn-admin config overlay
 sign` into `/etc/northnarrow`, `nn-admin init` creating a missing
 `admin.pub` and an editor's swap file need a window
 (`nn-admin trusted-installer-grant`) — editing those files in place was
@@ -844,6 +847,86 @@ watchdog create it 0700). Each unit bounds its start: `TimeoutStartSec=180s`
 for the agent (its `READY=1` follows the eBPF attach and the ADE load),
 `60s` for the watchdog (its own 30-s deadline for a verified agent fires
 first).
+
+### 3.10 Re-keying the agent (lab PR 265)
+
+The agent's signing key (`/etc/northnarrow/agent.sig.key`) signs every
+chain the install keeps; its public half (`agent.sig.pub`) is what
+`nn-admin audit verify` and an off-host auditor check them with. A start
+does not mint a key where it finds an earlier identity — the public half,
+`agent_id`, a written head anchor, a signed row of the audit chain or of
+another chain — nor, while the previous agent's pins are there, when it is
+that agent's restart; it refuses (exit 78, `start refused
+gate=signing_identity`), and so does a start whose directories are
+mounted over or are not the ones the previous agent protected
+(`gate=agent_mounts`; `BOOT_INTEGRITY.md` §1.1, which also lists what
+these checks do not cover). Before lab PR 265 such a start minted a new key
+with one INFO line, and the chains went on under another identity. A new
+key is a new install's identity, made on purpose, in one of two ways.
+
+**0. Archive first, whichever way.** The refusals of these two gates are
+unsigned: the agent's journal namespace holds them alone, and `--purge`
+deletes it. Keep the journal, the refused starts' fallback chains (on the
+runtime tmpfs: a reboot empties them) and the old identity's evidence with
+the public half that verifies it, then check the evidence off the host:
+
+```sh
+A=/root/northnarrow-identity-$(date +%F)    # anywhere but /etc/northnarrow, /var/lib/northnarrow
+sudo mkdir -p "$A"
+sudo journalctl --namespace=northnarrow -o export > "$A/journal.export"
+sudo cp -a /run/northnarrow/boot-refusals "$A/" 2>/dev/null
+sudo tar -C / -czf "$A/state.tgz" \
+    etc/northnarrow/agent.sig.pub etc/northnarrow/agent_id \
+    etc/northnarrow/audit.log etc/northnarrow/chain_heads.json \
+    var/lib/northnarrow
+# off the host, in the extracted state.tgz:
+nn-admin audit verify --from etc/northnarrow/audit.log \
+    --agent-pubkey "$(cat etc/northnarrow/agent.sig.pub)"
+nn-admin chain verify --state-dir var/lib/northnarrow \
+    --audit-log etc/northnarrow/audit.log \
+    --agent-pubkey "$(cat etc/northnarrow/agent.sig.pub)"
+```
+
+**A. The agent runs (a planned rotation).**
+
+1. Archive (step 0).
+2. Retire the identity with the signed uninstall:
+   `sudo ./deploy/uninstall.sh --purge --grant-key <trusted-installer key>`
+   (the window, both units stopped, the pins dropped; `/etc/northnarrow`
+   and `/var/lib/northnarrow` removed — the bootstrap admin key and the
+   namespace journal too).
+3. Install again (`sudo ./deploy/install.sh …`, §1): the first start mints
+   the new key, its public half and a new `agent_id`, and begins new
+   chains. Record the new `agent.sig.pub` where the old one is kept.
+
+**B. The agent refuses to start (the key lost or corrupted).** Its
+previous agent's pins are still there, and they keep protecting the files:
+no trusted-installer window can be opened (only a running agent opens one),
+so `uninstall.sh --grant-key` cannot stop the units or drop the pins. The
+pins do not survive a reboot:
+
+1. `sudo systemctl disable northnarrow-agent northnarrow-watchdog` (they
+   would start again at boot).
+2. Archive (step 0) — before the reboot, for the fallback chains.
+3. Reboot.
+4. `sudo ./deploy/uninstall.sh --purge` (no pins and both units inactive:
+   no window is needed, and none is asked for).
+5. Install again (A.3); the units are enabled by the install.
+
+To keep the administrators' keys either way, copy `admin.pub` aside before
+the purge and put it back in a new `/etc/northnarrow` (0755, the file
+0600) before the install: `install.sh` leaves an existing `admin.pub`
+untouched, and it is not an identity of the agent. Signed overlays bind
+the old `agent_id` and must be signed again.
+
+Removing `agent.sig.key` alone, or hiding it, does not re-key: the start
+refuses and says what it found. Put the key back (or remove the mount or
+the drop-in, then `systemctl daemon-reload`) and `systemctl start
+northnarrow-agent`. Layouts: a separate `/var` or `/var/lib` filesystem is
+fine; `/etc/northnarrow` and `/var/lib/northnarrow` (and any directory a
+`--…-file` flag points the agent's state to) must not be mount points of
+their own — a bind of the directory onto itself, as the unit's
+`ReadWritePaths=` makes, is the one mount there the start accepts.
 
 ## 4. What still needs a reboot
 

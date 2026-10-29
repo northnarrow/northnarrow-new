@@ -341,6 +341,9 @@ for u in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do
     [[ -e "$UNIT_DIR/$u.service" ]] && { log "removing $UNIT_DIR/$u.service"; rm -f "$UNIT_DIR/$u.service"; }
 done
 rm -rf "$DROPIN_ROOT/northnarrow-agent.service.d" "$DROPIN_ROOT/northnarrow-watchdog.service.d" 2>/dev/null || true
+# Lab PR 265: the runtime drop-in directory the unit makes before each start
+# (empty unless a drop-in was added in a window).
+rm -rf "${RUNTIME_DROPIN_ROOT:-/run/systemd/system}/northnarrow-agent.service.d" 2>/dev/null || true
 if [[ -e "$JOURNALD_NS_CONF" ]]; then
     log "removing $JOURNALD_NS_CONF"
     rm -f "$JOURNALD_NS_CONF"
