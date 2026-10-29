@@ -25,8 +25,9 @@
  *       "net <connected> <failed> <dns sent>".
  *   connect <ip> <port>
  *       One non-blocking connect (at most 300 ms), then exit: a probe the
- *       network rules judge. Prints "connect <t0 CLOCK_REALTIME ns> <pid>
- *       <errno or 0>".
+ *       network rules judge. Prints "connect <t0 CLOCK_REALTIME ns> <pid>"
+ *       before the connect (a kill at the connect ends it before any later
+ *       line), then "result <pid> <errno or 0>".
  *
  * Exit 0, 2 on a usage error.
  */
@@ -221,6 +222,8 @@ static int probe_connect(const char *ip, int port)
         return 2;
     int c = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     long long t0 = now_ns(CLOCK_REALTIME);
+    printf("connect %lld %d\n", t0, (int)getpid());
+    fflush(stdout);
     int err = 0;
     if (c < 0 || (connect(c, (struct sockaddr *)&a, sizeof a) != 0 && errno != EINPROGRESS))
         err = errno;
@@ -228,7 +231,7 @@ static int probe_connect(const char *ip, int port)
         struct pollfd p = {.fd = c, .events = POLLOUT};
         poll(&p, 1, 300);
     }
-    printf("connect %lld %d %d\n", t0, (int)getpid(), err);
+    printf("result %d %d\n", (int)getpid(), err);
     fflush(stdout);
     if (c >= 0)
         close(c);

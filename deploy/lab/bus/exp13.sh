@@ -304,13 +304,14 @@ for line in open(out + "/detections.jsonl", errors="replace"):
 def probes(kind, rules):
     out_p = []
     for f in lines_of("probes-%s.txt" % kind):
-        if len(f) == 4 and f[0] == "connect":
+        if len(f) in (3, 4) and f[0] == "connect":
             t0, pid = int(f[1]), int(f[2])
             hits = [(t, v) for t, names, v in recs_by_pid.get(pid, []) if any(n.startswith(rules) for n in names)]
             first = min((t for t, _ in hits if t is not None), default=None)
             out_p.append({"pid": pid, "records": len(hits),
                           "latency_ms": None if first is None else round((first - t0) / 1e6, 1)})
-    return {"sent": len(out_p), "judged": sum(1 for p in out_p if p["records"]), "probes": out_p}
+    killed = sum(1 for l in lines_of("probes-%s.err" % kind) if "Killed" in l)
+    return {"sent": len(out_p), "judged": sum(1 for p in out_p if p["records"]), "killed_while_connecting": killed, "probes": out_p}
 net_line = next((f for f in lines_of("net.txt") if len(f) == 4 and f[0] == "net"), None)
 ring_names = sorted(set((before or {}).get("ringbuf_drops") or {}) | set((after or {}).get("ringbuf_drops") or {}))
 
@@ -345,7 +346,7 @@ if summary["net_load"] or summary["probes_net001"]["sent"]:
     print("net load           :", summary["net_load"])
     for k in ("probes_net001", "probes_stage"):
         v = summary[k]
-        print(k.ljust(19) + ":", v["judged"], "of", v["sent"], "judged; latency ms", [p["latency_ms"] for p in v["probes"]])
+        print(k.ljust(19) + ":", v["judged"], "of", v["sent"], "judged,", v["killed_while_connecting"], "killed while connecting; latency ms", [p["latency_ms"] for p in v["probes"]])
     print("ring drops (all)   :", summary["ring_drops_delta_all"])
 PY
 echo "exp13: results in $OUT"
