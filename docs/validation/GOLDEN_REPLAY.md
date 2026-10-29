@@ -1,4 +1,4 @@
-# Golden replays: the decision engine (lab PR 228), the posture and the COMBAT ladder (lab PR 243), the admin socket's verification (lab PR 263)
+# Golden replays: the decision engine (lab PR 228), the posture and the COMBAT ladder (lab PR 243), the admin socket's verification (lab PR 263), nn-admin's output matrix (lab PR 266)
 
 What the decision path answers to a recorded event stream, kept as a
 committed file and checked byte for byte on every `cargo test`: a change of a
@@ -437,3 +437,107 @@ makes it.
 - Updating: as §5 — `cargo xtask golden --update`, `git diff --
   agent/tests/golden/admin/expected` read line by line, and the pull
   request says why each reply or row moved.
+
+## 8. nn-admin's output matrix (lab PR 266)
+
+What the `nn-admin` binary does in 2,703 cases: its stdout, stderr and exit
+status, the files it writes and the requests it sends to an agent,
+committed and checked byte for byte on every `cargo test`. Lab PRs 259 and
+263 proved "nn-admin's output identical to `main`" with a matrix of 1,964
+cases run from a scratchpad, which a stopped session deleted; this is that
+matrix as a test of the tree, for the refactors after them (R12–R14). A
+change of a help text, a clap error, a message, an exit code, a file
+nn-admin writes or a request it sends is a diff of these files in the pull
+request that makes it.
+
+- Harness: `agent/tests/nn_admin_matrix/` (an integration test of the agent
+  package: it runs that package's `nn-admin` binary,
+  `CARGO_BIN_EXE_nn-admin` — nn-admin's command line on the agent's host,
+  `AgentAdminHost`). Each case runs in a directory of its own, with an
+  emptied environment, stdin from `/dev/null`, umask 022. No root, no
+  agent, no network; part of `cargo test --workspace` (about 10 s on 8
+  threads).
+- The mock agent (`mock.rs`): a thread of the test serving the case's
+  `admin.sock` with nn-proto's frames. It answers each frame with the next
+  reply of the case's script (a challenge with a fixed nonce, then the
+  reply under test) and keeps what it read.
+- Golden files: `agent/tests/golden/nn-admin/expected/<area>.txt`, one per
+  area (below). The `debug-trigger` build (the lab's) is not compiled into
+  the test: its extra subcommand changes the help texts.
+- A case: `### <id>`, `$ nn-admin <arguments>`, the environment it sets,
+  a stream closed before the start, `exit:`, then `--- stdout`, `--- stderr`
+  (each line after `| `; a last line without its newline is marked;
+  invalid UTF-8 and control characters as `\x{..}`), `--- files` (`+`
+  created, `~` changed, `-` removed, with mode and content) and `--- agent`
+  (each connection: `>` a frame read, decoded as JSON, `<` what the mock
+  answered). A stream or the files of a case longer than four lines that
+  are the same bytes as an earlier case's of the area read `(the same
+  bytes as in <id>)`: a change shows in the first case that has them (and
+  in each case that no longer shares them).
+
+| area | cases | what |
+|---|---|---|
+| `help` | 182 | every subcommand, found by walking the binary's `-h`: `--help`, `-h`, `help <path>`, a group without its subcommand; the version, no arguments, `help` of `help` and of unknown names |
+| `clap-errors` | 323 | per subcommand: an unknown flag, a missing required argument, a stray positional, each option without its value, each flag twice and with a value; values clap refuses (numbers, value enums), typos and their suggestions |
+| `init` | 13 | fresh keys, an existing key with and without `--force` (the mode reset), missing directories, symlinks, directories, admin.pub kept 0600 |
+| `verify-keys` | 17 | the installed file, every role, comments only, empty, short, not hex, not a point, unknown and empty roles, a third token, a duplicate, CRLF, not UTF-8, missing, a directory |
+| `host-check` | 2 | the table and the JSON (normalised: below) |
+| `audit` | 58 | `audit read` (plain and JSON, `--since`, every damage class, 105 bad lines, a line over 16 MiB) and `audit verify` (each way to the key, bad keys, the wrong key, `--expect-head`, `--min-seq`, every class) on chain-pin-v1's log and on logs written with the fixed clock |
+| `chain` | 45 | `chain verify` on chain-pin-v1's log with and without heads, a head anchor reached, cut (`chain_truncated`), rewritten, elsewhere, absent, not JSON; the audit chain's classes (lab PR 256's: content altered, link broken, malformed, not canonical, another agent's key; torn, reordered, duplicated); each `--log`; the FIM drift log (a rotating chain with archives, manifest and checkpoint) intact and its classes; no key |
+| `overlay` | 56 | `config overlay status` (signed by one and two keys, by a key without `config-manage`, by an uninstalled key, for another install, changed after signing, unsigned, a bad signature file, another kind's signature, the shipped COMBAT files, the carve-out's dropped lines, every kind signed, the rollback floor reset, missing files) and `config overlay sign` (every kind, `--out`, a co-signer, refusals of the loaders' checks, bad files, missing keys) |
+| `policy` | 548 | `policy show` (10) and `policy test`: the 24 golden cases and their 205 events as two streams (plain and `{"event": …}`), under the built-in defaults, the three golden candidates and one refused (it exempts uid 0), with the shipped lists and with none, as a table and as JSON — 520 — and 18 error cases |
+| `socket` | 789 | 37 verbs (33 signed, 4 unsigned) against the mock agent: each success reply the verb renders differently, the ten refusals (every `AdminResult` but `Success`), the transport faults (7 for a signed verb: closed at the challenge, a wrong challenge, closed at the reply, an undecodable frame, a frame over the limit, a cut frame, a wrong reply; the last 5 for an unsigned one), no socket, a socket nobody listens on; and 57 variants of the arguments (other targets and kinds, clamps, the local refusals before the connection) |
+| `key-identity` | 544 | through every signed verb: the key missing, group- or world-readable (and with `NN_ADMIN_ALLOW_LOOSE_KEY`), empty, short, not hex, a directory, not installed; the identity file missing, all zeros, short, not hex, two lines, a directory; the co-signer's key |
+| `pipes` | 48 | stdout, then stderr, a pipe already closed (lab PR 188): local commands and the socket verbs that stream |
+| `defaults` | 78 | the default paths with nothing installed: each command without its path flags, each signed verb without `--agent-id-file` and without `--socket`; run only where none of `/etc/northnarrow`, `/run/northnarrow`, `/var/lib/northnarrow` exists (a note says so otherwise; CI always runs them) |
+
+Fixed inputs (`fixtures.rs`): the admin keys are constant seeds (`key-a`
+installed with `all`, `key-b` with `unlock,audit-read`, `key-c` not
+installed); the agent's key is RFC 8032 test 1's, chain-pin-v1's; the
+install's id is chain-pin-v1's; the chains are written by the agent's
+writers with a clock that answers 2025-06-15T15:06:40Z and one second
+after another; the signed overlays carry that time and a fixed nonce.
+
+What is inherently variable is normalised, after it is checked
+(`norm.rs`):
+
+- the clock: a Unix time or an RFC 3339 time within ten minutes of the run
+  is `<now>` (the fixtures' times are a year and more away from any run);
+- `init`'s fresh key: the private key, its public half and fingerprint are
+  `<init-key>`, `<init-pub>`, `<init-fp>`, once found to belong together;
+- `config overlay sign`'s random nonce (`<random nonce>`) and every
+  signature in a written `.sig` (`<sig of key-a>`, verified over its payload
+  with that key; byte arrays shown as `hex:…`);
+- the mock agent's view of a request: its time (`<now>`, within five
+  minutes of the mock's clock, or the value said), its nonce
+  (`<challenge>`, the one the mock issued, or the value said) and its
+  signatures (`<sig of key-a>`, verified; `<sig: by no fixture key>`);
+- the host's hardening checks: `host-check`'s output is compared byte for
+  byte with the agent library's checks run in the test
+  (`host_hardening::run`), then each check's status and value read
+  `<status>` / `<value>`, the warnings `<warnings>` and the exit status (0,
+  or 2 with warnings) `checked`; `status`'s summary line the same way;
+- the case's directory and the repository's path (`<dir>`, `<repo>`; no
+  case prints them today: the arguments are relative to the case's
+  directory) and `policy test`'s temporary `/proc` (`nn-policy-test-<pid>-<ns>`).
+
+Not reproduced from lab PR 259's run, and what covers it instead: the A/B
+of `main`'s and the tip's binaries (release and lab builds) — the
+committed files are the reference now, so a diff in a pull request is that
+A/B; the lab build's `debug force-posture` (not in CI's builds: in this
+build it is clap's unknown subcommand, a case); a key owned by another
+user (making one needs root: the mode check, which runs first, is
+covered); an agent that never answers (nn-admin's 5 s read timeout: the
+faults that close, cut or garble a frame are covered); the canary chains
+and the detections, status-events and netflow logs with rows (each row
+type is the agent's; the matrix lists them empty, and runs every damage
+class on the flat audit chain and on the rotating FIM drift log, which the
+other rotating logs share `verify_log_set` with; the canary chains'
+verifiers are covered by their unit tests).
+
+Updating: as §5 — `cargo xtask golden --update` (which runs this test after
+the library's replays), `git diff -- agent/tests/golden/nn-admin/expected`
+read case by case, and the pull request says why each output moved. A case
+is added in `cases/`; the fewest cases of each area are held by
+`the_matrix_covers_lab_pr_259s_areas`, with every socket verb's refusals
+and faults.

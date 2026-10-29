@@ -165,7 +165,10 @@ enum Cmd {
     /// (agent/tests/golden/posture, the agent's `posture::golden` tests);
     /// lab PR 263: and the admin socket's verification table, every signed
     /// verb's replies and audit rows (agent/tests/golden/admin, the agent's
-    /// `admin::pipeline_tests`).
+    /// `admin::pipeline_tests`); lab PR 266: and nn-admin's output matrix,
+    /// the binary's stdout, stderr, exit status, files and requests in
+    /// every case (agent/tests/golden/nn-admin, the agent's
+    /// `nn_admin_matrix` test).
     /// `--update` rewrites the golden files for review; refused under CI.
     Golden {
         /// Write the golden files from the replay instead of comparing.

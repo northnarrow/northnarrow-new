@@ -1,0 +1,841 @@
+# nn-admin output matrix: defaults (lab PR 266). Written by `cargo xtask golden --update`; never by hand. docs/validation/GOLDEN_REPLAY.md, §8.
+
+### default.status
+$ nn-admin status
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.status-json
+$ nn-admin status --json
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.net-status
+$ nn-admin net status
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| net status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.verify-keys
+$ nn-admin verify-keys
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| verify-keys: reading /etc/northnarrow/admin.pub: No such file or directory (os error 2)
+
+### default.audit-read
+$ nn-admin audit read
+exit: 0
+--- stdout
+(empty)
+--- stderr
+| audit: 0 entries read from /etc/northnarrow/audit.log
+
+### default.audit-verify
+$ nn-admin audit verify --from audit.log
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| audit: no /etc/northnarrow/agent.sig.pub — deriving the agent pubkey from the signing key file /etc/northnarrow/agent.sig.key (refused once the agent protects it); pass --agent-pubkey <hex> when verifying off-host: reading /etc/northnarrow/agent.sig.key: No such file or directory (os error 2)
+
+### default.chain-verify
+$ nn-admin chain verify
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| chain: no /etc/northnarrow/agent.sig.pub — deriving the agent pubkey from the signing key file /etc/northnarrow/agent.sig.key (refused once the agent protects it); pass --agent-pubkey <hex> when verifying off-host: reading /etc/northnarrow/agent.sig.key: No such file or directory (os error 2)
+
+### default.chain-verify-pubkey
+$ nn-admin chain verify --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 0
+--- stdout
+| OK      audit            /etc/northnarrow/audit.log: 0 rows in the old format
+| OK      canary_registry  /var/lib/northnarrow/canaries.jsonl: 0 rows in the old format
+| OK      canary_access    /var/lib/northnarrow/canary_access.jsonl: 0 rows in the old format
+| OK      detections       /var/lib/northnarrow/detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    /var/lib/northnarrow/detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          /var/lib/northnarrow/netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        /var/lib/northnarrow/fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            /etc/northnarrow/chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
+### default.overlay-status
+$ nn-admin config overlay status
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay status: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.policy-show
+$ nn-admin policy show
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| policy show: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.init-pub-append
+$ nn-admin init --priv-out new.key
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| appending pub key to /etc/northnarrow/admin.pub: No such file or directory (os error 2)
+--- files
++ new.key (file 0600)
+| <init-key>
+
+### default.policy-test-config-dir
+$ nn-admin policy test --events events.jsonl
+exit: 0
+--- stdout
+| policy: built-in defaults
+|    0  -
+|    1  NN-L-CANARY-003_NetworkConnect KillProcessTree Critical pid 6460002
+|    2  NN-L-FIM-016_PasswordManagerDbAccessed KillProcess High pid 6460002
+|    3  NN-L-CHAIN-001_CredReadThenEgress KillProcessTree Critical pid 6460002  [NN-L-CHAIN-001_CredReadThenEgress builtin KillProcessTree; NN-L-CHAIN-003_CanaryThenEgress builtin KillProcessTree]
+|    4  -
+|    5  NN-L-CANARY-003_NetworkConnect KillProcessTree Critical pid 6460003
+|    6  R001_ExecFromTmp KillProcessTree Medium pid 6460003
+|    7  NN-L-CHAIN-002_TmpExecThenEgress KillProcessTree Critical pid 6460003  [NN-L-CHAIN-002_TmpExecThenEgress builtin KillProcessTree; NN-L-CHAIN-003_CanaryThenEgress builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin KillProcess]
+|    8  NN-L-CANARY-003_NetworkConnect KillProcessTree Critical pid 6460001
+|    9  -
+|   10  -
+|   11  NN-L-CHAIN-003_CanaryThenEgress KillProcessTree Critical pid 6460001
+|   12  NN-L-NET-008_OutboundFromTmpExec KillProcess High pid 6440001
+|   13  NN-L-CHAIN-002_TmpExecThenEgress KillProcessTree Critical pid 6440001  [NN-L-CHAIN-002_TmpExecThenEgress builtin KillProcessTree; R001_ExecFromTmp builtin KillProcessTree]
+|   14  -
+|   15  NN-L-NET-008_OutboundFromTmpExec Log High pid 6440002  (held)
+|   16  NN-L-CHAIN-002_TmpExecThenEgress KillProcessTree Critical pid 6440002  [NN-L-CHAIN-002_TmpExecThenEgress builtin Log (held); R001_ExecFromTmp builtin KillProcessTree]
+|   17  NN-L-EPG-001_CredentialPostcondition Log Critical pid 5920001
+|   18  NN-L-EPG-002_NamespaceRootPostcondition KillProcess Critical pid 5920002
+|   19  -
+|   20  -
+|   21  NN-L-EVA-002_SecurityToolSwitchedOff Log High pid 5450003
+|   22  -
+|   23  -
+|   24  NN-L-EVA-003_SecurityToolKilled Log High pid 5450002
+|   25  NN-L-EVA-004_SecurityToolConfigChanged Log High pid 5450002
+|   26  -
+|   27  -
+|   28  -
+|   29  NN-L-EVA-001_SecurityServiceStopped Log Low pid 5400004
+|   30  -
+|   31  -
+|   32  NN-L-EVA-001_SecurityServiceStopped Log High pid 5400013
+|   33  R009_RootExecFromUserPath KillProcessTree High pid 5400021  [R009_RootExecFromUserPath builtin KillProcessTree; R001_ExecFromTmp builtin KillProcessTree]
+|   34  NN-L-EVA-001_SecurityServiceStopped Log High pid 5400021  (held)
+|   35  NN-L-FIM-010_RansomwareExtensionRename KillProcessTree Critical pid 5100101
+|   36  -
+|   37  NN-L-FIM-010_RansomwareExtensionRename Log Critical pid 5100101  (held)
+|   38  -
+|   39  -
+|   40  -
+|   41  -
+|   42  -
+|   43  -
+|   44  -
+|   45  -
+|   46  -
+|   47  -
+|   48  -
+|   49  -
+|   50  -
+|   51  -
+|   52  NN-L-IMP-002_RenameExtensionBurst Log High pid 5350003
+|   53  -
+|   54  -
+|   55  -
+|   56  -
+|   57  -
+|   58  -
+|   59  -
+|   60  -
+|   61  -
+|   62  NN-L-FIM-004_AuthorizedKeysModified Log High pid 6200003  [NN-L-FIM-002_NewSuidBinary builtin Log; NN-L-FIM-004_AuthorizedKeysModified builtin Log (held)]
+|   63  -
+|   64  -
+|   65  -
+|   66  -
+|   67  -
+|   68  -
+|   69  -
+|   70  -
+|   71  R020_ShellWithSocketStdio Log Critical pid 5700003  (held)
+|   72  R020_ShellWithSocketStdio Log Critical pid 5700011  (held)
+|   73  R020_ShellWithSocketStdio Log Critical pid 5700012  (held)
+|   74  -
+|   75  -
+|   76  -
+|   77  R020_ShellWithSocketStdio Log Critical pid 5700103  (held)
+|   78  -
+|   79  -
+|   80  R001_ExecFromTmp KillProcessTree Medium pid 5910002
+|   81  NN-L-CHAIN-002_TmpExecThenEgress Log Critical pid 5910002  [NN-L-CHAIN-002_TmpExecThenEgress builtin Log (held); NN-L-NET-008_OutboundFromTmpExec builtin Log (held)]
+|   82  NN-L-CHAIN-002_TmpExecThenEgress Log Critical pid 5910002  [NN-L-CHAIN-002_TmpExecThenEgress builtin Log (held); NN-L-NET-008_OutboundFromTmpExec builtin Log (held)]
+|   83  NN-L-NET-001_OutboundToBlockedIp KillProcessTree Critical pid 5910002  [NN-L-CHAIN-002_TmpExecThenEgress builtin Log (held); NN-L-NET-001_OutboundToBlockedIp builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin Log (held)]
+|   84  NN-L-CHAIN-002_TmpExecThenEgress KillProcessTree Critical pid 5910002  [NN-L-CHAIN-002_TmpExecThenEgress builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin KillProcess]
+|   85  -
+|   86  -
+|   87  R020_ShellWithSocketStdio Log Critical pid 5700003  (held)
+|   88  R020_ShellWithSocketStdio Log Critical pid 5700011  (held)
+|   89  R020_ShellWithSocketStdio Log Critical pid 5700012  (held)
+|   90  -
+|   91  NN-L-FIM-017_GpgKeyringAccessed KillProcess High pid 6400001
+|   92  NN-L-CHAIN-001_CredReadThenEgress KillProcessTree Critical pid 6400001  [NN-L-CHAIN-001_CredReadThenEgress builtin KillProcessTree; NN-L-NET-001_OutboundToBlockedIp builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin KillProcess]
+|   93  NN-L-CHAIN-007_TmpCredExfilSequence KillProcessTree Critical pid 6400001  [NN-L-CHAIN-007_TmpCredExfilSequence builtin KillProcessTree; R009_RootExecFromUserPath builtin KillProcessTree; R001_ExecFromTmp builtin KillProcessTree]
+|   94  -
+|   95  -
+|   96  -
+|   97  NN-L-FIM-004_AuthorizedKeysModified Log High pid 6200003  [NN-L-FIM-002_NewSuidBinary builtin Log; NN-L-FIM-004_AuthorizedKeysModified builtin Log (held)]
+|   98  R009_RootExecFromUserPath KillProcessTree High pid 6100001  [R009_RootExecFromUserPath builtin KillProcessTree; R001_ExecFromTmp builtin KillProcessTree]
+|   99  NN-L-FIM-009_SystemdUnitDropped KillProcess High pid 6100001  [NN-L-FIM-009_SystemdUnitDropped builtin KillProcess; NN-L-FIM-023_SystemdTimerCreated builtin KillProcess]
+|  100  -
+|  101  -
+|  102  -
+|  103  NN-L-NET-009_ByteAnomaly Log High pid 6300003  [NN-L-NET-007_Rfc1918FromUnusualProc builtin Log; NN-L-NET-009_ByteAnomaly builtin Log]
+|  104  NN-L-NET-007_Rfc1918FromUnusualProc Log Medium pid 6300003
+|  105  NN-L-NET-007_Rfc1918FromUnusualProc Log Medium pid 6300003
+|  106  NN-L-NET-007_Rfc1918FromUnusualProc Log Medium pid 6300003
+|  107  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  108  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  109  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  110  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  111  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  112  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  113  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  114  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  115  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  116  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  117  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  118  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  119  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  120  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  121  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  122  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  123  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  124  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  125  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  126  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  127  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  128  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  129  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  130  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  131  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  132  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  133  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  134  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  135  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  136  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  137  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  138  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  139  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  140  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  141  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  142  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  143  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  144  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  145  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  146  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  147  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  148  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  149  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  150  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  151  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  152  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  153  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  154  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  155  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  156  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  157  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  158  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  159  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  160  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  161  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  162  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  163  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  164  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  165  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  166  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  167  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  168  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  169  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  170  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  171  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  172  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  173  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  174  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  175  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  176  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  177  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  178  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  179  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  180  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  181  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  182  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  183  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  184  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  185  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  186  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  187  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  188  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  189  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  190  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  191  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  192  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  193  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  194  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  195  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  196  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  197  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  198  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  199  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  200  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  201  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  202  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  203  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log]
+|  204  NN-L-NET-013_Beacon Log High pid 6300003  [NN-L-NET-013_Beacon builtin Log; NN-L-NET-007_Rfc1918FromUnusualProc builtin Log; NN-L-NET-009_ByteAnomaly builtin Log]
+--- stderr
+(empty)
+
+### default.unlock.agent-id
+$ nn-admin unlock --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| unlock: the signed unlock got no reply — an agent older than this nn-admin (before lab PR 217) does not know it: unlock it with the nn-admin of its own release: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.unlock.socket
+$ nn-admin unlock --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| unlock: the signed unlock got no reply — an agent older than this nn-admin (before lab PR 217) does not know it: unlock it with the nn-admin of its own release: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.status-key.agent-id
+$ nn-admin status --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| status: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.status-key.socket
+$ nn-admin status --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.status-key-json.agent-id
+$ nn-admin status --json --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| status: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.status-key-json.socket
+$ nn-admin status --json --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.net-status-key.agent-id
+$ nn-admin net status --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| net status: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.net-status-key.socket
+$ nn-admin net status --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| net status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.net-status-key-json.agent-id
+$ nn-admin net status --json --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| net status: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.net-status-key-json.socket
+$ nn-admin net status --json --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| net status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.capabilities.agent-id
+$ nn-admin capabilities --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| capabilities: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.capabilities.socket
+$ nn-admin capabilities --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| capabilities: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.capabilities-json.agent-id
+$ nn-admin capabilities --json --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| capabilities: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.capabilities-json.socket
+$ nn-admin capabilities --json --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| capabilities: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.detections.agent-id
+$ nn-admin detections --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| detections: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.detections.socket
+$ nn-admin detections --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| detections: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.detections-filtered.agent-id
+$ nn-admin detections --limit 5 --since 1750000000 --until 1750003600 --min-severity high --status open --sensor exec --path /usr/bin/curl --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| detections: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.detections-filtered.socket
+$ nn-admin detections --limit 5 --since 1750000000 --until 1750003600 --min-severity high --status open --sensor exec --path /usr/bin/curl --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| detections: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.detection-set-status.agent-id
+$ nn-admin detection-set-status --id 42 --status resolved --note checked --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| detection-set-status: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.detection-set-status.socket
+$ nn-admin detection-set-status --id 42 --status resolved --note checked --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| detection-set-status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.shutdown.agent-id
+$ nn-admin shutdown --cosign-key key-b --grace-secs 45 --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| shutdown: reading agent_id at /etc/northnarrow/agent_id (nn-admin must run on the agent host or have the file copied / SSH-forwarded — design §6.5): agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.shutdown.socket
+$ nn-admin shutdown --cosign-key key-b --grace-secs 45 --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| shutdown: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.force-posture.agent-id
+$ nn-admin force-posture engaged --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| force-posture: reading agent_id at /etc/northnarrow/agent_id (nn-admin must run on the agent host or have the file copied / SSH-forwarded — design §6.5): agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.force-posture.socket
+$ nn-admin force-posture engaged --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| force-posture: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.rotate-keys-add.agent-id
+$ nn-admin rotate-keys add --new-pubkey d404bc44565aedbb899150e5b0b3b32b9441bf0cb7884c33130da8dbc27dd2cf --new-roles fim-read,net-read --cosign-key key-b --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| rotate-keys add: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.rotate-keys-add.socket
+$ nn-admin rotate-keys add --new-pubkey d404bc44565aedbb899150e5b0b3b32b9441bf0cb7884c33130da8dbc27dd2cf --new-roles fim-read,net-read --cosign-key key-b --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| rotate-keys add: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.rotate-keys-revoke.agent-id
+$ nn-admin rotate-keys revoke --fingerprint b28baab3 --cosign-key key-b --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| rotate-keys revoke: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.rotate-keys-revoke.socket
+$ nn-admin rotate-keys revoke --fingerprint b28baab3 --cosign-key key-b --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| rotate-keys revoke: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.fim-baseline.agent-id
+$ nn-admin fim baseline --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| fim baseline: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.fim-baseline.socket
+$ nn-admin fim baseline --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| fim baseline: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.fim-report.agent-id
+$ nn-admin fim report --since 1750000000 --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| fim report: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.fim-report.socket
+$ nn-admin fim report --since 1750000000 --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| fim report: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.fim-status.agent-id
+$ nn-admin fim status --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| fim status: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.fim-status.socket
+$ nn-admin fim status --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| fim status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.canary-deploy-file.agent-id
+$ nn-admin canary deploy --name honeypot-file --key key-a file --path /srv/matrix/canary.txt
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| canary deploy: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.canary-deploy-file.socket
+$ nn-admin canary deploy --name honeypot-file --key key-a --agent-id-file agent_id file --path /srv/matrix/canary.txt
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| canary deploy: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.canary-list.agent-id
+$ nn-admin canary list --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| canary list: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.canary-list.socket
+$ nn-admin canary list --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| canary list: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.canary-burn.agent-id
+$ nn-admin canary burn --canary-id c0ffee0123456789 --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| canary burn: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.canary-burn.socket
+$ nn-admin canary burn --canary-id c0ffee0123456789 --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| canary burn: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.canary-refresh.agent-id
+$ nn-admin canary refresh --canary-id c0ffee0123456789 --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| canary refresh: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.canary-refresh.socket
+$ nn-admin canary refresh --canary-id c0ffee0123456789 --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| canary refresh: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.net-flows.agent-id
+$ nn-admin net flows --since-unix 1750000000 --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| net flows: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.net-flows.socket
+$ nn-admin net flows --since-unix 1750000000 --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| net flows: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.net-listeners.agent-id
+$ nn-admin net listeners --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| net listeners: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.net-listeners.socket
+$ nn-admin net listeners --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| net listeners: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.net-resolve.agent-id
+$ nn-admin net resolve --ip 203.0.113.7 --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| net resolve: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.net-resolve.socket
+$ nn-admin net resolve --ip 203.0.113.7 --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| net resolve: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.net-fingerprint.agent-id
+$ nn-admin net fingerprint --flow-id 0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| net fingerprint: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.net-fingerprint.socket
+$ nn-admin net fingerprint --flow-id 0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| net fingerprint: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.trusted-installer-grant.agent-id
+$ nn-admin trusted-installer-grant --window-secs 300 --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| trusted-installer-grant: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.trusted-installer-grant.socket
+$ nn-admin trusted-installer-grant --window-secs 300 --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| trusted-installer-grant: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.response-status.agent-id
+$ nn-admin response status --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| response status: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.response-status.socket
+$ nn-admin response status --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| response status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.response-release.agent-id
+$ nn-admin response release --pid 4242 --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| response release: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.response-release.socket
+$ nn-admin response release --pid 4242 --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| response release: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.response-restore.agent-id
+$ nn-admin response restore --vault-id 1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b --to /srv/matrix/restored --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| response restore: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.response-restore.socket
+$ nn-admin response restore --vault-id 1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b --to /srv/matrix/restored --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| response restore: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.remediate-ransomware.agent-id
+$ nn-admin remediate ransomware --pid 4242 --since 2025-06-15T15:00:00Z --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| remediate ransomware: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.remediate-ransomware.socket
+$ nn-admin remediate ransomware --pid 4242 --since 2025-06-15T15:00:00Z --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| remediate ransomware: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.remediate-ransomware-json.agent-id
+$ nn-admin remediate ransomware --since 1750000000 --dry-run --json --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| remediate ransomware: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.remediate-ransomware-json.socket
+$ nn-admin remediate ransomware --since 1750000000 --dry-run --json --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| remediate ransomware: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.config-overlay-set.agent-id
+$ nn-admin config overlay set process-comm-allowlist --file overlay.local --cosign-key key-b --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay set: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.config-overlay-set.socket
+$ nn-admin config overlay set process-comm-allowlist --file overlay.local --cosign-key key-b --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay set: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.policy-set.agent-id
+$ nn-admin policy set --file policy.local --key key-a
+exit: 5
+--- stdout
+| policy set: 1 enforce, 0 alert, 0 audit, 0 off, 0 exemptions on 0 rules, ransomware COMBAT without corroboration off
+--- stderr
+| config overlay set: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.policy-set.socket
+$ nn-admin policy set --file policy.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+| policy set: 1 enforce, 0 alert, 0 audit, 0 off, 0 exemptions on 0 rules, ransomware COMBAT without corroboration off
+--- stderr
+| config overlay set: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+

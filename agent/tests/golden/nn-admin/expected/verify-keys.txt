@@ -1,0 +1,155 @@
+# nn-admin output matrix: verify-keys (lab PR 266). Written by `cargo xtask golden --update`; never by hand. docs/validation/GOLDEN_REPLAY.md, §8.
+
+### verify-keys.installed
+$ nn-admin verify-keys --path admin.pub
+exit: 0
+--- stdout
+| verify-keys: 2 valid key(s)
+|   730a5edc  all
+|   b28baab3  unlock,audit-read
+--- stderr
+(empty)
+
+### verify-keys.bare-keys
+$ nn-admin verify-keys --path admin.pub
+exit: 0
+--- stdout
+| verify-keys: 2 valid key(s)
+|   730a5edc  unlock,audit-read
+|   b28baab3  unlock,audit-read
+--- stderr
+(empty)
+
+### verify-keys.every-role
+$ nn-admin verify-keys --path admin.pub
+exit: 0
+--- stdout
+| verify-keys: 1 valid key(s)
+|   730a5edc  unlock,shutdown,force-posture,rotate-keys,audit-read,fim-manage,fim-read,canary-read,canary-manage,net-read,net-manage,trusted-installer,telemetry-read,triage,config-manage,response-manage
+--- stderr
+(empty)
+
+### verify-keys.comments-only
+$ nn-admin verify-keys --path admin.pub
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| verify-keys: no valid pub keys installed
+
+### verify-keys.empty
+$ nn-admin verify-keys --path admin.pub
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| verify-keys: no valid pub keys installed
+
+### verify-keys.short-key
+$ nn-admin verify-keys --path admin.pub
+exit: 1
+--- stdout
+| verify-keys: 1 valid key(s)
+|   730a5edc  all
+--- stderr
+| verify-keys: line 1 is not a key (the agent skips it): pub key must be 64 hex chars (got 4)
+
+### verify-keys.not-hex
+$ nn-admin verify-keys --path admin.pub
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| verify-keys: line 1 is not a key (the agent skips it): invalid hex: Invalid character 'z' at position 0
+| verify-keys: no valid pub keys installed
+
+### verify-keys.not-a-point
+$ nn-admin verify-keys --path admin.pub
+exit: 0
+--- stdout
+| verify-keys: 2 valid key(s)
+|   af961376  all
+|   b28baab3  unlock,audit-read
+--- stderr
+(empty)
+
+### verify-keys.unknown-role
+$ nn-admin verify-keys --path admin.pub
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| verify-keys: line 1 is not a key (the agent skips it): unknown role `root` — expected one of: unlock, shutdown, force-posture, rotate-keys, audit-read, fim-manage, fim-read, canary-read, canary-manage, net-read, net-manage, trusted-installer, telemetry-read, triage, config-manage, response-manage, all
+| verify-keys: no valid pub keys installed
+
+### verify-keys.empty-role
+$ nn-admin verify-keys --path admin.pub
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| verify-keys: line 1 is not a key (the agent skips it): role list has empty entry (leading/trailing/double comma)
+| verify-keys: no valid pub keys installed
+
+### verify-keys.roles-without-comma
+$ nn-admin verify-keys --path admin.pub
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| verify-keys: line 1 is not a key (the agent skips it): unexpected token after role list — roles must be comma-separated within a single token (no spaces)
+| verify-keys: no valid pub keys installed
+
+### verify-keys.duplicate-key
+$ nn-admin verify-keys --path admin.pub
+exit: 0
+--- stdout
+| verify-keys: 2 valid key(s)
+|   730a5edc  all
+|   730a5edc  unlock
+--- stderr
+(empty)
+
+### verify-keys.crlf
+$ nn-admin verify-keys --path admin.pub
+exit: 0
+--- stdout
+| verify-keys: 2 valid key(s)
+|   730a5edc  all
+|   b28baab3  unlock
+--- stderr
+(empty)
+
+### verify-keys.indented-and-trailing-space
+$ nn-admin verify-keys --path admin.pub
+exit: 0
+--- stdout
+| verify-keys: 1 valid key(s)
+|   730a5edc  all
+--- stderr
+(empty)
+
+### verify-keys.not-utf8
+$ nn-admin verify-keys --path admin.pub
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| verify-keys: reading admin.pub: stream did not contain valid UTF-8
+
+### verify-keys.missing
+$ nn-admin verify-keys --path absent.pub
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| verify-keys: reading absent.pub: No such file or directory (os error 2)
+
+### verify-keys.a-directory
+$ nn-admin verify-keys --path pub.d
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| verify-keys: reading pub.d: Is a directory (os error 21)
+

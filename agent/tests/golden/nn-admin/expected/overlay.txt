@@ -1,0 +1,1088 @@
+# nn-admin output matrix: overlay (lab PR 266). Written by `cargo xtask golden --update`; never by hand. docs/validation/GOLDEN_REPLAY.md, §8.
+
+### overlay-status.nothing-present
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   absent
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.signed-by-key-a
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   signed (ts 1750000000, keys 730a5edc)
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.signed-by-two-keys
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   signed (ts 1750000000, keys 730a5edc,b28baab3)
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.signed-by-key-b-without-config-manage
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   NOT LOADED at the next start: signature rejected: admin key b28baab3 not authorised for ConfigManage
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.signed-by-an-uninstalled-key
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   NOT LOADED at the next start: signature rejected: invalid signature
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.signed-for-another-install
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   NOT LOADED at the next start: signature rejected: agent_id mismatch
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.signed-at-time-zero
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   signed (ts 0, keys 730a5edc)
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.content-changed-after-signing
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   NOT LOADED at the next start: content does not match its signature (edited after signing)
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.unsigned
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   NOT LOADED at the next start: no signature file etc/process-comm-allowlist.local.sig
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.signature-not-json
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   NOT LOADED at the next start: malformed signature file etc/process-comm-allowlist.local.sig: key must be a string at line 1 column 2
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.signature-of-another-kind
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   NOT LOADED at the next start: signature is for `fim-paths`
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.not-utf8
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   NOT LOADED at the next start: not UTF-8 text
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.shipped-combat-defaults
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   absent
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          shipped default
+| combat-rules-v6          shipped default
+| combat-allow             shipped default
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.combat-allow-unsigned
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   absent
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             NOT LOADED at the next start: no signature file etc/combat-allow.cidrs.sig — COMBAT applies the built-in content
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.combat-allow-signed-with-dropped-lines
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   absent
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             signed (ts 1750000000, keys 730a5edc) — 1 line skipped at COMBAT engage: prefix /0 too wide for a management carve-out in `0.0.0.0/0` (at most /8 for IPv4): it would undo COMBAT isolation
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.every-kind-signed
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| fim-paths                signed (ts 1750000000, keys 730a5edc)
+| process-comm-allowlist   signed (ts 1750000000, keys 730a5edc)
+| netflow-comm-allowlist   signed (ts 1750000000, keys 730a5edc)
+| netflow-blocklist        signed (ts 1750000000, keys 730a5edc)
+| netflow-ja3-blocklist    signed (ts 1750000000, keys 730a5edc)
+| mass-write-carveout      signed (ts 1750000000, keys 730a5edc)
+| escalation-allow         signed (ts 1750000000, keys 730a5edc)
+| combat-rules-v4          signed (ts 1750000000, keys 730a5edc)
+| combat-rules-v6          signed (ts 1750000000, keys 730a5edc)
+| combat-allow             signed (ts 1750000000, keys 730a5edc)
+| canary-readers           signed (ts 1750000000, keys 730a5edc)
+| cow-guard                signed (ts 1750000000, keys 730a5edc)
+| execq-hashes             signed (ts 1750000000, keys 730a5edc)
+| exec-policy              signed (ts 1750000000, keys 730a5edc)
+| rule-policy              signed (ts 1750000000, keys 730a5edc)
+--- stderr
+(empty)
+
+### overlay-status.audit-log-missing
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+| rollback-floor           reset at the next start: the audit log is missing or empty while the agent signing key exists: the chain's history is gone — an overlay signed before it is not loaded
+| fim-paths                absent
+| process-comm-allowlist   NOT LOADED at the next start: signed at 1750000000 — before <now>, when the rollback floor was reset (the audit chain's history was found gone or broken): sign it again
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.audit-chain-broken
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+| rollback-floor           reset at the next start: the audit chain does not verify: entry 1: entry_hash mismatch (recomputed cd39eea956f86911f9b337ac645d81edda524a2f55e7e0f86f31c2045ba87e24, stored f962d44ca2469db685e17efdd8593988db987bad67a5270f8c44a83c7dff768b) — an overlay signed before it is not loaded
+| fim-paths                absent
+| process-comm-allowlist   NOT LOADED at the next start: signed at 1750000000 — before <now>, when the rollback floor was reset (the audit chain's history was found gone or broken): sign it again
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.agent-key-missing
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+| rollback-floor           reset at the next start: the audit chain is there but the agent signing key is not: its signatures cannot be checked — an overlay signed before it is not loaded
+| fim-paths                absent
+| process-comm-allowlist   NOT LOADED at the next start: signed at 1750000000 — before <now>, when the rollback floor was reset (the audit chain's history was found gone or broken): sign it again
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.admin-pub-missing
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+| fim-paths                absent
+| process-comm-allowlist   NOT LOADED at the next start: admin.pub unavailable
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+--- stderr
+(empty)
+
+### overlay-status.agent-id-missing
+$ nn-admin config overlay status --dir etc --admin-pub admin.pub --agent-id-file absent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay status: agent_id not found at absent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### overlay-status.dir-missing
+$ nn-admin config overlay status --dir no/such --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+(the same bytes as in overlay-status.nothing-present)
+--- stderr
+(empty)
+
+### overlay-sign.kind.fim-paths
+$ nn-admin config overlay sign fim-paths --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "fim-paths",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 1,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.kind.process-comm-allowlist
+$ nn-admin config overlay sign process-comm-allowlist --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "process-comm-allowlist",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 2,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.kind.netflow-comm-allowlist
+$ nn-admin config overlay sign netflow-comm-allowlist --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "netflow-comm-allowlist",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 3,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.kind.netflow-blocklist
+$ nn-admin config overlay sign netflow-blocklist --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "netflow-blocklist",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 4,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.kind.netflow-ja3-blocklist
+$ nn-admin config overlay sign netflow-ja3-blocklist --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "netflow-ja3-blocklist",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 5,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.kind.mass-write-carveout
+$ nn-admin config overlay sign mass-write-carveout --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "mass-write-carveout",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 6,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.kind.escalation-allow
+$ nn-admin config overlay sign escalation-allow --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "escalation-allow",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 7,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.kind.combat-rules-v4
+$ nn-admin config overlay sign combat-rules-v4 --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: overlay.local does not parse as a combat-rules-v4 overlay: combat-rules.v4: COMBAT ruleset lacks *filter — it would not isolate
+
+### overlay-sign.kind.combat-rules-v6
+$ nn-admin config overlay sign combat-rules-v6 --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: overlay.local does not parse as a combat-rules-v6 overlay: combat-rules.v6: COMBAT ruleset lacks *filter — it would not isolate
+
+### overlay-sign.kind.combat-allow
+$ nn-admin config overlay sign combat-allow --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "combat-allow",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 10,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.kind.canary-readers
+$ nn-admin config overlay sign canary-readers --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "canary-readers",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 11,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.kind.cow-guard
+$ nn-admin config overlay sign cow-guard --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "cow-guard",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 12,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.kind.execq-hashes
+$ nn-admin config overlay sign execq-hashes --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "execq-hashes",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 13,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.kind.exec-policy
+$ nn-admin config overlay sign exec-policy --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "exec-policy",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 14,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.kind.rule-policy
+$ nn-admin config overlay sign rule-policy --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "rule-policy",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 15,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.to-out
+$ nn-admin config overlay sign fim-paths --file overlay.local --key key-a --agent-id-file agent_id --out elsewhere.sig
+exit: 0
+--- stdout
+| config overlay sign: elsewhere.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ elsewhere.sig (file 0644)
+| {
+|   "kind": "fim-paths",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 1,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.out-dir-missing
+$ nn-admin config overlay sign fim-paths --file overlay.local --key key-a --agent-id-file agent_id --out no/such/x.sig
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: writing no/such/x.sig: No such file or directory (os error 2)
+
+### overlay-sign.with-cosigner
+$ nn-admin config overlay sign fim-paths --file overlay.local --key key-a --agent-id-file agent_id --cosign-key key-b
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "fim-paths",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 1,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>",
+|     "<sig of key-b>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.cosigner-missing
+$ nn-admin config overlay sign fim-paths --file overlay.local --key key-a --agent-id-file agent_id --cosign-key absent.key
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: reading private key absent.key: No such file or directory (os error 2)
+
+### overlay-sign.unknown-kind
+$ nn-admin config overlay sign no-such-list --file overlay.local --key key-a --agent-id-file agent_id
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| config overlay: unknown overlay `no-such-list` — one of: fim-paths, process-comm-allowlist, netflow-comm-allowlist, netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout, escalation-allow, combat-rules-v4, combat-rules-v6, combat-allow, canary-readers, cow-guard, execq-hashes, exec-policy, rule-policy
+
+### overlay-sign.kind-by-file-name
+$ nn-admin config overlay sign process-comm-allowlist.local --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
+(the same bytes as in overlay-sign.kind.process-comm-allowlist)
+
+### overlay-sign.file-missing
+$ nn-admin config overlay sign fim-paths --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: reading overlay overlay.local: No such file or directory (os error 2)
+
+### overlay-sign.file-too-big
+$ nn-admin config overlay sign fim-paths --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: overlay.local is 32769 bytes; overlays are limited to 32768 bytes
+
+### overlay-sign.file-not-utf8
+$ nn-admin config overlay sign fim-paths --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: reading overlay overlay.local: stream did not contain valid UTF-8
+
+### overlay-sign.rule-policy-bad-line
+$ nn-admin config overlay sign rule-policy --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: overlay.local does not parse as a rule-policy overlay: rule-policy.local: line 1: unknown rule `NO-SUCH-RULE`
+
+### overlay-sign.rule-policy-exempts-uid-0
+$ nn-admin config overlay sign rule-policy --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: overlay.local does not parse as a rule-policy overlay: rule-policy.local: line 2: uid 0: exempting root is turning the rule off — say `audit` or `off` instead
+
+### overlay-sign.rule-policy-good
+$ nn-admin config overlay sign rule-policy --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "rule-policy",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 15,
+|         "len": 21,
+|         "sha256": "hex:cb75ea97bf4dc56680e06c99c8e82f06780b99cef1786c81ff5ab4eeef6b7b1b"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
+### overlay-sign.fim-paths-relative
+$ nn-admin config overlay sign fim-paths --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: overlay.local does not parse as a fim-paths overlay: fim-paths.local:1: paths must be absolute (start with `/`), got `etc/passwd`
+
+### overlay-sign.combat-rules-v4-garbage
+$ nn-admin config overlay sign combat-rules-v4 --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: overlay.local does not parse as a combat-rules-v4 overlay: combat-rules.v4: COMBAT ruleset lacks *filter — it would not isolate
+
+### overlay-sign.combat-allow-wide
+$ nn-admin config overlay sign combat-allow --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: overlay.local does not parse as a combat-allow overlay: combat-allow.cidrs: prefix /0 too wide for a management carve-out in `0.0.0.0/0` (at most /8 for IPv4): it would undo COMBAT isolation
+
+### overlay-sign.netflow-blocklist-bad-cidr
+$ nn-admin config overlay sign netflow-blocklist --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: overlay.local does not parse as a netflow-blocklist overlay: netflow-blocklist.local:1: malformed overlay entry: invalid CIDR network in `300.1.2.3/40`: invalid IP address syntax
+
+### overlay-sign.execq-hashes-bad
+$ nn-admin config overlay sign execq-hashes --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: overlay.local does not parse as a execq-hashes overlay: execq-hashes.local: line 1: `not-a-hash` without a sha256
+
+### overlay-sign.key-missing
+$ nn-admin config overlay sign fim-paths --file overlay.local --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: private key file key-a is empty
+
+### overlay-sign.agent-id-missing
+$ nn-admin config overlay sign fim-paths --file overlay.local --key key-a --agent-id-file absent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| config overlay sign: agent_id not found at absent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
