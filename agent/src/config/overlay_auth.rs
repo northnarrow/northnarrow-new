@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, OverlayKind, Role};
@@ -56,24 +56,18 @@ pub const AUDIT_OP_ACCEPTED: &str = "config_overlay_accepted";
 /// Audit op of an overlay stored through `nn-admin config overlay set`.
 pub const AUDIT_OP_SET: &str = "config_overlay_set";
 
-/// Overlay paths as configured for this boot (CLI flags can move them);
-/// recorded by [`OverlayGate::verified`] so `config overlay set` writes
-/// where the next boot will read.
-static CONFIGURED: OnceLock<parking_lot::Mutex<HashMap<OverlayKind, PathBuf>>> = OnceLock::new();
-
-fn remember_path(kind: OverlayKind, path: &Path) {
-    CONFIGURED
-        .get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
-        .lock()
-        .insert(kind, path.to_path_buf());
-}
-
-/// Where the agent reads overlay `kind` (the configured path, or
-/// `<config_dir>/<kind>.local`).
-pub fn configured_path(kind: OverlayKind, config_dir: &Path) -> PathBuf {
-    CONFIGURED
-        .get()
-        .and_then(|m| m.lock().get(&kind).cloned())
+/// Where the agent reads overlay `kind`: the path `gate` verified it at
+/// this boot (CLI flags can move them; [`OverlayGate::verified`] records
+/// it), or `<config_dir>/<kind>.local` — `config overlay set` writes where
+/// the next boot will read. R11c (lab PR 264): the gate's own record (the
+/// admin socket gets the start's gate; `None`: none, the default path); it
+/// was a process-wide map every gate filled.
+pub fn configured_path(
+    gate: Option<&OverlayGate>,
+    kind: OverlayKind,
+    config_dir: &Path,
+) -> PathBuf {
+    gate.and_then(|g| g.configured.lock().get(&kind).cloned())
         .unwrap_or_else(|| config_dir.join(kind.file_name()))
 }
 
@@ -180,6 +174,9 @@ pub struct OverlayGate {
     floor_pending: Mutex<Vec<AuditEntryDraft>>,
     /// Entries made before the audit log was attached.
     pending: Mutex<Vec<AuditEntryDraft>>,
+    /// The path each overlay kind was verified at this boot
+    /// ([`configured_path`]).
+    configured: Mutex<HashMap<OverlayKind, PathBuf>>,
 }
 
 impl std::fmt::Debug for OverlayGate {
@@ -237,6 +234,7 @@ impl OverlayGate {
             allow_unsigned,
             audit_log: Mutex::new(None),
             pending: Mutex::new(Vec::new()),
+            configured: Mutex::new(HashMap::new()),
         }
     }
 
@@ -370,7 +368,7 @@ impl OverlayGate {
     /// through the escape hatch — else nothing, and the loader runs on the
     /// shipped defaults. Every decision is logged and recorded.
     pub fn verified(&self, kind: OverlayKind, path: &Path) -> Verified {
-        remember_path(kind, path);
+        self.configured.lock().insert(kind, path.to_path_buf());
         let (decision, read) = self.read_and_check(kind, path);
         let out = match (&decision, read) {
             (_, Read::Missing) => Verified::Missing,

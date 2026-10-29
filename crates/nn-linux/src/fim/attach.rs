@@ -412,7 +412,7 @@ pub fn populate_watched_paths(
             inode_map.set_chain(&path_str, hops);
         }
         if plan.broken {
-            crate::fim::drain::await_chain_repair(&path_str);
+            crate::fim::drain::await_chain_repair(&inode_map, &path_str);
         }
     }
     // Review 57: WATCHED_PATHS is pinned and outlives the agent. A child a

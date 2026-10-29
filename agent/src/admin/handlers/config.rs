@@ -21,6 +21,7 @@ pub(in crate::admin) fn dispatch_config_overlay_set(
     req: ConfigOverlaySetRequest,
     auth: &ConnAuth<'_>,
     rule_policy: &PolicyHandle,
+    overlay_gate: Option<&crate::config::overlay_auth::OverlayGate>,
     fps_out: &mut Vec<String>,
 ) -> ConfigOverlaySetResponse {
     let refuse = |result: AdminResult, message: String| ConfigOverlaySetResponse {
@@ -33,7 +34,7 @@ pub(in crate::admin) fn dispatch_config_overlay_set(
         auth,
         fps_out,
         |r| refuse(r, "signature verification failed".to_string()),
-        |v| config_overlay_set(v, auth, rule_policy, refuse),
+        |v| config_overlay_set(v, auth, rule_policy, overlay_gate, refuse),
     )
 }
 
@@ -43,6 +44,7 @@ fn config_overlay_set(
     v: Verified<'_, ConfigOverlaySetRequest>,
     auth: &ConnAuth<'_>,
     rule_policy: &PolicyHandle,
+    overlay_gate: Option<&crate::config::overlay_auth::OverlayGate>,
     refuse: impl Fn(AdminResult, String) -> ConfigOverlaySetResponse,
 ) -> ConfigOverlaySetResponse {
     use crate::config::overlay_auth;
@@ -76,7 +78,7 @@ fn config_overlay_set(
         .and_then(|p| p.parent())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("/etc/northnarrow"));
-    let target = overlay_auth::configured_path(extra.kind, &config_dir);
+    let target = overlay_auth::configured_path(overlay_gate, extra.kind, &config_dir);
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
     let sig = match overlay_auth::OverlaySignature::new(req.payload.clone(), &sigs) {
         Ok(s) => s,

@@ -418,6 +418,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             ransom_tracker: Some(Arc::clone(&ransom_tracker)),
             defense_detector: Some(Arc::clone(&defense_detector)),
             cow_guard: Some(combat.cow_guard.clone()),
+            overlay_gate: Some(Arc::clone(&overlay_gate)),
         },
     );
     let tasks::Tasks {

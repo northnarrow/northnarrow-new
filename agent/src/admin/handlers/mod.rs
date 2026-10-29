@@ -234,9 +234,15 @@ pub(super) fn dispatch(
                 fps_out,
             ))
         }
-        AdminMessage::ConfigOverlaySetRequest(req) => AdminMessage::ConfigOverlaySetResponse(
-            dispatch_config_overlay_set(req, auth, &handles.rule_policy, fps_out),
-        ),
+        AdminMessage::ConfigOverlaySetRequest(req) => {
+            AdminMessage::ConfigOverlaySetResponse(dispatch_config_overlay_set(
+                req,
+                auth,
+                &handles.rule_policy,
+                handles.overlay_gate.as_deref(),
+                fps_out,
+            ))
+        }
 
         // Tappa 9.0.b — signed detections read (read-only,
         // Role::TelemetryRead, or Triage via subsumption). Overlays the

@@ -28,6 +28,7 @@ impl CanaryHost for LinuxHost {
     type AccessLog = CanaryAccessDb;
 
     type LocalAddrs = LocalAddrs;
+    type ReadForward = crate::canary::read_forward::ReadForward;
 
     /// [`Registry::list`]: of each live canary, the fields the detector
     /// indexes.
@@ -69,8 +70,11 @@ impl CanaryHost for LinuxHost {
         addrs.contains(addr)
     }
 
-    fn publish_read_forward(keys: impl IntoIterator<Item = InodeKey>) {
-        crate::canary::read_forward::replace(keys);
+    fn publish_read_forward(
+        sink: &crate::canary::read_forward::ReadForward,
+        keys: impl IntoIterator<Item = InodeKey>,
+    ) {
+        sink.replace(keys);
     }
 
     fn inode_key(path: &Path) -> Option<InodeKey> {
@@ -164,6 +168,7 @@ mod stop_tests {
         type Registry = Registry;
         type AccessLog = CanaryAccessDb;
         type LocalAddrs = LocalAddrs;
+        type ReadForward = crate::canary::read_forward::ReadForward;
 
         fn live(registry: &Registry) -> Vec<LiveCanary> {
             LinuxHost::live(registry)
@@ -204,8 +209,13 @@ mod stop_tests {
             LinuxHost::is_local(addrs, addr)
         }
 
-        // Not the process-wide read-forward set: other tests read it.
-        fn publish_read_forward(_keys: impl IntoIterator<Item = InodeKey>) {}
+        // The indexes' own set (R11c: no process-wide one any more).
+        fn publish_read_forward(
+            sink: &crate::canary::read_forward::ReadForward,
+            keys: impl IntoIterator<Item = InodeKey>,
+        ) {
+            sink.replace(keys);
+        }
 
         fn inode_key(_path: &Path) -> Option<InodeKey> {
             None

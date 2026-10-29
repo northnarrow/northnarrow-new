@@ -314,6 +314,10 @@ pub struct AdminHandles {
     /// status and `remediate ransomware` (`None`: not decided; it was a
     /// process-wide state).
     pub cow_guard: Option<crate::cow::CowGuard>,
+    /// The overlay gate of this boot: where each overlay was read, so
+    /// `config overlay set` writes where the next boot reads (`None`: the
+    /// default paths; it was a process-wide map every gate filled).
+    pub overlay_gate: Option<Arc<crate::config::overlay_auth::OverlayGate>>,
 }
 
 /// External audit NN-AUD-082 — the files the read verbs serve, from the

@@ -7,7 +7,8 @@
 //! agent's state directory (`canaries.jsonl`, `canary_access.jsonl`), this
 //! host's interface addresses are read with `getifaddrs`, the inodes of the
 //! file canaries are published to the FIM drain, which forwards their reads
-//! (`read_forward`, a process-wide set), a canary's inode is `stat(2)`'s,
+//! (`read_forward`, the FIM drain's set: R11c, lab PR 264, it was a
+//! process-wide one), a canary's inode is `stat(2)`'s,
 //! and an accessor's executable is `/proc/<pid>/exe`. Those calls are here,
 //! as a trait the host implements (the agent: `LinuxHost`, in its
 //! `canary_host_linux` module). Each is the call the detector made itself
@@ -94,9 +95,16 @@ pub trait CanaryHost {
     /// `LocalAddrs::contains`).
     fn is_local(addrs: &Self::LocalAddrs, addr: IpAddr) -> bool;
 
-    /// Publish the file canaries' inodes, whose reads the FIM drain then
-    /// forwards (the agent: `canary::read_forward::replace`).
-    fn publish_read_forward(keys: impl IntoIterator<Item = InodeKey>);
+    /// Where the file canaries' inodes are published, whose reads the FIM
+    /// drain then forwards (the agent: `canary::read_forward::ReadForward`,
+    /// the FIM drain's own set, which the indexes are given at the start —
+    /// R11c, lab PR 264: it was a process-wide set). A handle: clones share
+    /// it.
+    type ReadForward: Clone + Default + Send + Sync + 'static;
+
+    /// Publish the file canaries' inodes into `sink` (the agent:
+    /// `ReadForward::replace`).
+    fn publish_read_forward(sink: &Self::ReadForward, keys: impl IntoIterator<Item = InodeKey>);
 
     /// The kernel's `(dev, ino)` of the file at `path`, `None` when it is not
     /// there (the agent: `stat_inode_key`, `stat(2)` without following a
