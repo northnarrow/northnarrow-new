@@ -21,7 +21,13 @@
 #
 # Usage: exp13.sh [--out DIR] [--flood-secs S] [--flood-procs P]
 #   [--threads T] [--bursts B] [--burst-size K] [--burst-gap-ms G]
-#   [--settle S] [--key FILE]
+#   [--settle S] [--key FILE] [--stall-secs N]
+# --flood-secs 0: no flood. --stall-secs N (a lab build: debug-trigger): the
+# event loop is first made to stand still N seconds
+# (/run/northnarrow/debug-stall-loop, lab PR 216), and the bursts start when
+# it does — the tamper queue fills and its sender waits, then drops: the
+# drop's WARN, count and signed `event_bus_drop` row (the P0 path EXP-13
+# itself never reaches).
 # Output (DIR, default /var/lib/nn-exp13/<UTC stamp>): status-before.json,
 # status-after.json (`nn-admin status --json --key`), tamper.txt (one line
 # per burst), flood.txt, detections.jsonl (the new detection records),
@@ -33,7 +39,7 @@ export LC_ALL=C
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT= FLOOD_SECS=40 FLOOD_PROCS=4 THREADS=32 BURSTS=8 BURST_SIZE=1500 BURST_GAP_MS=3000
-SETTLE=75 KEY=
+SETTLE=75 KEY= STALL=0
 DET=/var/lib/northnarrow/detections/detections.jsonl
 AUDIT=/etc/northnarrow/audit.log
 TARGET=/etc/northnarrow/admin.pub
@@ -52,10 +58,11 @@ while (($#)); do
         --burst-gap-ms) BURST_GAP_MS=${2:?}; shift 2 ;;
         --settle) SETTLE=${2:?}; shift 2 ;;
         --key) KEY=${2:?}; shift 2 ;;
+        --stall-secs) STALL=${2:?}; shift 2 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
-for v in FLOOD_SECS FLOOD_PROCS THREADS BURSTS BURST_SIZE BURST_GAP_MS SETTLE; do
+for v in FLOOD_SECS FLOOD_PROCS THREADS BURSTS BURST_SIZE BURST_GAP_MS SETTLE STALL; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "--${v,,} takes a whole number: ${!v}"
 done
 (($(id -u) == 0)) || die "run as root"
@@ -94,13 +101,23 @@ status "$OUT/status-before.json"
 t_start=$(date +%s%N)
 
 # The flood, in a transient unit of its own: its cgroup, at most 3 CPUs.
-systemctl stop nn-exp13-flood.service 2>/dev/null
-systemctl reset-failed nn-exp13-flood.service 2>/dev/null
-systemd-run --quiet --unit=nn-exp13-flood --uid="$USER_NAME" -p CPUQuota=300% \
-    -p StandardOutput="file:$OUT/flood.txt" -p StandardError="file:$OUT/flood.err" \
-    /bin/bash -c "for i in \$(seq 1 $FLOOD_PROCS); do $LIBEXEC/nn-exp13-flood flood $FLOOD_SECS $THREADS /etc/passwd /etc/login.defs & done; wait" \
-    || die "the flood unit did not start"
-sleep 5
+: > "$OUT/flood.txt"
+if ((FLOOD_SECS > 0)); then
+    systemctl stop nn-exp13-flood.service 2>/dev/null
+    systemctl reset-failed nn-exp13-flood.service 2>/dev/null
+    systemd-run --quiet --unit=nn-exp13-flood --uid="$USER_NAME" -p CPUQuota=300% \
+        -p StandardOutput="file:$OUT/flood.txt" -p StandardError="file:$OUT/flood.err" \
+        /bin/bash -c "for i in \$(seq 1 $FLOOD_PROCS); do $LIBEXEC/nn-exp13-flood flood $FLOOD_SECS $THREADS /etc/passwd /etc/login.defs & done; wait" \
+        || die "the flood unit did not start"
+    sleep 5
+fi
+# A lab build's stalled loop: the trigger is read at the loop's next 5 s
+# check, which removes it and stands still.
+if ((STALL > 0)); then
+    echo "$STALL" > /run/northnarrow/debug-stall-loop || die "cannot write the stall trigger"
+    for _ in $(seq 1 100); do [[ -e /run/northnarrow/debug-stall-loop ]] || break; sleep 0.1; done
+    [[ -e /run/northnarrow/debug-stall-loop ]] && { rm -f /run/northnarrow/debug-stall-loop; die "the trigger was not taken (not a debug-trigger build?)"; }
+fi
 # The tamper bursts, in the flood.
 "$LIBEXEC/nn-exp13-tamper" tamper "$BURSTS" "$BURST_SIZE" "$BURST_GAP_MS" "$TARGET" > "$OUT/tamper.txt" 2> "$OUT/tamper.err"
 tamper_rc=$?
