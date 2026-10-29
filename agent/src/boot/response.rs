@@ -109,10 +109,13 @@ pub(crate) fn build(
         };
     // External audit CMB-025: the quarantine never takes the agent's own
     // files, wherever this host keeps them (`--watchdog-exe`, the running
-    // binary, the executor's key, vault and containment record).
+    // binary, the executor's key, vault and containment record). R11c (lab
+    // PR 264): in the executor's configuration, which the exec quarantine
+    // and the restore verbs copy (it was a process-wide setter).
+    let mut exec_cfg = exec_cfg;
     {
         let own_exe = std::env::current_exe().ok();
-        let deny = northnarrow_agent::response::quarantine::RuntimeDeny::new(
+        let deny = northnarrow_agent::response::quarantine::own_files(
             &exec_cfg,
             own_exe.as_deref(),
             &cli.resolved_watchdog_exe(),
@@ -121,7 +124,7 @@ pub(crate) fn build(
             paths = %deny.describe(),
             "quarantine: the agent's own files are never quarantined"
         );
-        northnarrow_agent::response::quarantine::set_runtime_deny(deny);
+        exec_cfg.own_files = deny;
     }
     // Lab PR 223: the exec quarantine vaults block-listed files.
     let execq_exec_cfg = exec_cfg.clone();

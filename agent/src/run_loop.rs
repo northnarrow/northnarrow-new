@@ -47,6 +47,7 @@ pub(crate) async fn run(
     detection_sink: &Option<northnarrow_agent::detection_store::DetectionSink>,
     audit_log: &AuditHandle,
     telemetry_probe: &Option<northnarrow_agent::telemetry_probe::TelemetryProbe>,
+    expected_denial: &northnarrow_agent::boot::deny_selftest::ExpectedDenial,
     signals: &mut Signals,
 ) -> Stopped {
     let Combat {
@@ -54,6 +55,8 @@ pub(crate) async fn run(
         #[cfg(feature = "debug-trigger")]
         debug_guard,
         shutdown_signal,
+        host_stopping,
+        cow_guard,
     } = combat;
     let Signals {
         sigint,
@@ -101,6 +104,9 @@ pub(crate) async fn run(
                     installer_override,
                     // Tappa 9.0.a: detection-persistence sink (off the hot path).
                     detection_sink.as_ref(),
+                    expected_denial,
+                    host_stopping,
+                    cow_guard,
                     e,
                 ).await
                 }

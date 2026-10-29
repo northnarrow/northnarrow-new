@@ -226,6 +226,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     .await?;
     let attach::SelfTested {
         self_test,
+        expected_denial,
         trust_inputs,
     } = attach::self_test(
         &mut boot,
@@ -416,6 +417,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             capability_manifest: capability_manifest.clone(),
             ransom_tracker: Some(Arc::clone(&ransom_tracker)),
             defense_detector: Some(Arc::clone(&defense_detector)),
+            cow_guard: Some(combat.cow_guard.clone()),
         },
     );
     let tasks::Tasks {
@@ -459,6 +461,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &detection_sink,
         &audit_log,
         &telemetry_probe,
+        &expected_denial,
         &mut signals,
     )
     .await;
@@ -467,6 +470,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         execq_handle,
         execpol_handle,
         sensor.bpf_guard(),
+        &combat.cow_guard,
         &audit_log,
         &chain_anchor,
         stopped,

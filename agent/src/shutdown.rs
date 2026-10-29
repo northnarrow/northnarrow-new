@@ -14,11 +14,13 @@ use crate::run_loop::Stopped;
 /// the heads anchored at stop, the pid file and the admin socket removed.
 /// A pump that exited is a failure (SNS-001): the watchdog restarts the
 /// agent.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stop(
     cli: &Cli,
     execq_handle: Option<northnarrow_agent::execq::Handle>,
     execpol_handle: Option<northnarrow_agent::execpol::Handle>,
     bpf_guard: &northnarrow_agent::anti_tamper::bpf_defense::BpfGuard,
+    cow_guard: &northnarrow_agent::cow::CowGuard,
     audit_log: &AuditHandle,
     chain_anchor: &AnchorHandle,
     stopped: Stopped,
@@ -37,7 +39,7 @@ pub(crate) fn stop(
     bpf_guard.mark_stopping();
     // Lab PR 222: the guard's fanotify group closes first — no open on a
     // protected scope waits on an agent that is leaving.
-    northnarrow_agent::cow::shutdown();
+    cow_guard.shutdown();
 
     if let Some(log) = &audit_log {
         let uptime = loop_started.elapsed().as_secs();

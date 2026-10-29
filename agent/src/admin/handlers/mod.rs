@@ -265,7 +265,7 @@ pub(super) fn dispatch(
         ),
         // Lab PR 222 — restore from the copy-on-first-write journal.
         AdminMessage::RemediateRansomwareRequest(req) => AdminMessage::RemediateRansomwareResponse(
-            dispatch_remediate_ransomware(req, auth, fps_out),
+            dispatch_remediate_ransomware(req, auth, handles.cow_guard.as_ref(), fps_out),
         ),
 
         // Server-only variants — clients sending these are speaking

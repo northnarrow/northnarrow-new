@@ -173,12 +173,17 @@ pub struct Store {
     /// this was taken by an earlier run.
     pub run_started_ms: u64,
     audit: Mutex<Option<Arc<Mutex<AuditLog>>>>,
+    /// The bpffs pin root the agent's anti-tamper maps live under (`None`:
+    /// the anti-tamper layer did not come up), where a compacted index is
+    /// registered again (R11c, lab PR 264: given at the open; it was a
+    /// process-wide `protect::PIN_ROOT`).
+    pin_root: Option<std::path::PathBuf>,
 }
 
 impl Store {
     /// Open every scope's journal and read its index back. A scope whose
     /// journal cannot be opened is reported and left unprotected.
-    pub fn open(cfg: CowConfig) -> (Arc<Self>, Vec<String>) {
+    pub fn open(cfg: CowConfig, pin_root: Option<std::path::PathBuf>) -> (Arc<Self>, Vec<String>) {
         let budgets: Vec<u64> = cfg.scopes.iter().map(|s| s.budget).collect();
         let mut ix = JournalIndex::new(
             &budgets,
@@ -217,6 +222,7 @@ impl Store {
             stats: Stats::default(),
             run_started_ms: now_ms(),
             audit: Mutex::new(None),
+            pin_root,
         });
         store.remove_orphans();
         store.expire(now_ms());
@@ -379,7 +385,7 @@ impl Store {
             if let Err(e) = j.compact_into(f, &recs) {
                 warn!(error = %e, "copy on first write: compacting index.jsonl failed");
             } else {
-                super::protect::reprotect_index(&j, old);
+                super::protect::reprotect_index(&j, old, self.pin_root.as_deref());
             }
         }
     }
@@ -1004,7 +1010,7 @@ mod tests {
             }],
             ..CowConfig::default()
         };
-        let (store, problems) = Store::open(cfg);
+        let (store, problems) = Store::open(cfg, None);
         assert!(problems.is_empty(), "{problems:?}");
         Lab {
             _t: t,
@@ -1295,7 +1301,7 @@ mod tests {
         std::fs::write(l.scope.join("a"), b"junk").unwrap();
         let cfg = l.store.cfg.clone();
         drop(l.store);
-        let (store, problems) = Store::open(cfg);
+        let (store, problems) = Store::open(cfg, None);
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(store.index.lock().entry_count(0), 1);
         let rep = store.restore(&sel(), false, &by());

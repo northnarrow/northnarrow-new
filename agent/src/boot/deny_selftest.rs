@@ -25,13 +25,16 @@
 //!
 //! The refusal leaves a denial on the evidence ring like any other attempt
 //! on the agent (an `FsProtectDenial` from the child, `Signal`, the
-//! signal, the agent's pid). [`take_expected_denial`] recognises that one
+//! signal, the agent's pid). [`ExpectedDenial::take`] recognises that one
 //! record — the child's pid, the signal, the target, a kernel timestamp
 //! between the spawn and the reap — before the posture sees it, so the
-//! self-test never raises COMBAT; any other denial is untouched.
+//! self-test never raises COMBAT; any other denial is untouched. R11c (lab
+//! PR 264): [`run`] returns it to the start, which hands it to the event
+//! loop (it was a process-wide `EXPECTED`).
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nn_model::{Event, FsProtectOperation};
@@ -126,7 +129,10 @@ struct Expected {
     until_ns: u64,
 }
 
-static EXPECTED: Mutex<Option<Expected>> = Mutex::new(None);
+/// The self-test's own denial, which the event loop takes once (R11c, lab
+/// PR 264: what [`run`] returns; clones share it).
+#[derive(Clone, Debug, Default)]
+pub struct ExpectedDenial(Arc<Mutex<Option<Expected>>>);
 
 /// `CLOCK_MONOTONIC` in nanoseconds, the clock of `bpf_ktime_get_ns`.
 fn monotonic_ns() -> u64 {
@@ -139,18 +145,24 @@ fn monotonic_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-fn arm(child: u32, target: u32, from_ns: u64, until_ns: u64) {
-    *EXPECTED.lock() = Some(Expected {
-        child,
-        target,
-        from_ns,
-        until_ns,
-    });
+impl ExpectedDenial {
+    fn arm(child: u32, target: u32, from_ns: u64, until_ns: u64) -> Self {
+        Self(Arc::new(Mutex::new(Some(Expected {
+            child,
+            target,
+            from_ns,
+            until_ns,
+        }))))
+    }
+
+    /// `true` when `event` is the self-test's own denial (consumed: once).
+    /// The event loop calls it first, before the posture and the rules.
+    pub fn take(&self, event: &Event) -> bool {
+        take_expected_denial(&self.0, event)
+    }
 }
 
-/// `true` when `event` is the self-test's own denial (consumed: once). The
-/// event loop calls it first, before the posture and the rules.
-pub fn take_expected_denial(event: &Event) -> bool {
+fn take_expected_denial(expected: &Mutex<Option<Expected>>, event: &Event) -> bool {
     let Event::FsProtectDenial {
         pid,
         operation: FsProtectOperation::Signal,
@@ -162,7 +174,7 @@ pub fn take_expected_denial(event: &Event) -> bool {
     else {
         return false;
     };
-    let mut slot = EXPECTED.lock();
+    let mut slot = expected.lock();
     let Some(e) = *slot else {
         return false;
     };
@@ -182,13 +194,14 @@ pub fn take_expected_denial(event: &Event) -> bool {
 
 /// Run the self-test with `exe` (the agent's own binary,
 /// `/proc/self/exe`) as the child. Blocking, at most [`CHILD_TIMEOUT`].
-pub fn run(exe: &Path) -> SelfTestOutcome {
+/// The outcome, and the denial it leaves for the event loop to take.
+pub fn run(exe: &Path) -> (SelfTestOutcome, ExpectedDenial) {
     let mut cmd = Command::new(exe);
     cmd.arg(SELFTEST_FLAG);
     run_command(cmd, &exe.display().to_string())
 }
 
-fn run_command(mut cmd: Command, what: &str) -> SelfTestOutcome {
+fn run_command(mut cmd: Command, what: &str) -> (SelfTestOutcome, ExpectedDenial) {
     let target = std::process::id();
     let from_ns = monotonic_ns();
     let spawned = cmd
@@ -199,9 +212,10 @@ fn run_command(mut cmd: Command, what: &str) -> SelfTestOutcome {
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
-            return SelfTestOutcome::Inconclusive(format!(
-                "cannot spawn {what} {SELFTEST_FLAG}: {e}"
-            ))
+            return (
+                SelfTestOutcome::Inconclusive(format!("cannot spawn {what} {SELFTEST_FLAG}: {e}")),
+                ExpectedDenial::default(),
+            )
         }
     };
     let child_pid = child.id();
@@ -224,8 +238,8 @@ fn run_command(mut cmd: Command, what: &str) -> SelfTestOutcome {
     };
     // Reaped: its pid is free from here, and any later denial from it is
     // stamped after `until_ns`. The event loop has not started yet.
-    arm(child_pid, target, from_ns, monotonic_ns());
-    outcome
+    let expected = ExpectedDenial::arm(child_pid, target, from_ns, monotonic_ns());
+    (outcome, expected)
 }
 
 /// The journal line for `outcome`, and the signed detail when it is not
@@ -262,9 +276,6 @@ pub fn report(outcome: &SelfTestOutcome) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// [`EXPECTED`] is one per process.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn exit_statuses_map_to_outcomes() {
         assert_eq!(classify(Some(EXIT_DENIED)), SelfTestOutcome::Denied);
@@ -300,9 +311,8 @@ mod tests {
     /// operation all reach the posture.
     #[test]
     fn only_the_self_tests_own_denial_is_taken() {
-        let _g = TEST_LOCK.lock();
         let sig = SELFTEST_SIGNAL as u64;
-        arm(4242, 100, 1_000, 2_000);
+        let expected = ExpectedDenial::arm(4242, 100, 1_000, 2_000);
         for other in [
             denial(4243, sig, 100, 1_500),
             denial(4242, 9, 100, 1_500),
@@ -319,11 +329,15 @@ mod tests {
                 timestamp_ns: 1_500,
             },
         ] {
-            assert!(!take_expected_denial(&other), "{other:?}");
+            assert!(!expected.take(&other), "{other:?}");
         }
-        assert!(take_expected_denial(&denial(4242, sig, 100, 1_500)));
         assert!(
-            !take_expected_denial(&denial(4242, sig, 100, 1_500)),
+            !ExpectedDenial::default().take(&denial(4242, sig, 100, 1_500)),
+            "another run's: nothing armed (R11c: no process-wide slot)"
+        );
+        assert!(expected.clone().take(&denial(4242, sig, 100, 1_500)));
+        assert!(
+            !expected.take(&denial(4242, sig, 100, 1_500)),
             "consumed: a second one is an attempt"
         );
     }
@@ -347,19 +361,21 @@ mod tests {
     /// binary exits with a status and the parent reads it.
     #[test]
     fn the_parent_reads_the_childs_status() {
-        let _g = TEST_LOCK.lock();
         let sh = |code: i32| {
             let mut c = Command::new("sh");
             c.arg("-c").arg(format!("exit {code}"));
             c
         };
         assert_eq!(
-            run_command(sh(EXIT_DELIVERED), "sh"),
+            run_command(sh(EXIT_DELIVERED), "sh").0,
             SelfTestOutcome::NotDenied
         );
-        assert_eq!(run_command(sh(EXIT_DENIED), "sh"), SelfTestOutcome::Denied);
+        assert_eq!(
+            run_command(sh(EXIT_DENIED), "sh").0,
+            SelfTestOutcome::Denied
+        );
         assert!(matches!(
-            run(Path::new("/nonexistent/northnarrow-agent")),
+            run(Path::new("/nonexistent/northnarrow-agent")).0,
             SelfTestOutcome::Inconclusive(_)
         ));
     }

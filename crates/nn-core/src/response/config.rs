@@ -58,6 +58,67 @@ pub struct ExecutorConfig {
     /// (the legacy name now gates ALL enforcement, including kill +
     /// COMBAT, closing the old "dry-run that still kills" trap).
     pub dry_run: bool,
+
+    /// External audit CMB-025: the agent's own files where this host keeps
+    /// them, which the quarantine never takes and a restore never writes
+    /// (nn-linux's `quarantine::own_files` makes them at the start; empty by
+    /// default). R11c (lab PR 264): the executor's configuration, so the
+    /// executor, the exec quarantine and the restore verbs, which hold
+    /// copies of it, read the same set; it was a process-wide
+    /// `RUNTIME_DENY` the start set.
+    pub own_files: OwnFiles,
+}
+
+/// The names of the agent's binaries next to it ([`OwnFiles`]).
+const OWN_BINARY_PREFIXES: &[&str] = &["northnarrow-", "nn-admin"];
+
+/// External audit CMB-025: the agent's own files, wherever this host keeps
+/// them. The quarantine's fixed prefixes name the default install paths
+/// only, while `--watchdog-exe`, the binary's own location and the
+/// executor's files are configurable — and the agent, a protected PID, is
+/// not stopped by the kernel's deny on its own binaries. Not `/opt/`
+/// wholesale: a dropper there would become unquarantinable (a false
+/// positive on an `/opt` application is reversible with `nn-admin response
+/// restore`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OwnFiles {
+    /// Files: the running binary, the watchdog's, the master key, the
+    /// containment record.
+    pub files: Vec<PathBuf>,
+    /// Subtrees: the quarantine vault.
+    pub dirs: Vec<PathBuf>,
+    /// The running binary's directory: its siblings `northnarrow-*` and
+    /// `nn-admin`, as the default prefixes do for `/usr/local/bin`.
+    pub install_dirs: Vec<PathBuf>,
+}
+
+impl OwnFiles {
+    /// `path` is one of the agent's own files.
+    pub fn denies(&self, path: &Path) -> bool {
+        if self.files.iter().any(|f| f == path) || self.dirs.iter().any(|d| path.starts_with(d)) {
+            return true;
+        }
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return false;
+        };
+        let name = name.to_string_lossy();
+        self.install_dirs.iter().any(|d| d == parent)
+            && OWN_BINARY_PREFIXES.iter().any(|p| name.starts_with(p))
+    }
+
+    /// The paths, for the boot line.
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = self
+            .files
+            .iter()
+            .chain(&self.dirs)
+            .map(|p| p.display().to_string())
+            .collect();
+        for d in &self.install_dirs {
+            parts.push(format!("{}/{{northnarrow-*,nn-admin*}}", d.display()));
+        }
+        parts.join(", ")
+    }
 }
 
 impl ExecutorConfig {
@@ -88,6 +149,7 @@ impl ExecutorConfig {
             nft_table: "northnarrow_test".into(),
             quarantine_max_bytes: 100 * 1024 * 1024,
             dry_run: true,
+            own_files: OwnFiles::default(),
         }
     }
 
@@ -135,6 +197,7 @@ impl Default for ExecutorConfig {
             isolation_flag_file: PathBuf::from("/var/lib/northnarrow/isolated"),
             containment_file: PathBuf::from("/run/northnarrow/containment.json"),
             dry_run: false,
+            own_files: OwnFiles::default(),
         }
     }
 }

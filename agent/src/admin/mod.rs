@@ -310,6 +310,10 @@ pub struct AdminHandles {
     /// counters the status reports (they were published process-wide).
     pub ransom_tracker: Option<Arc<crate::impact::RansomTracker>>,
     pub defense_detector: Option<Arc<crate::impair::DefenseDetector>>,
+    /// Lab PR 222: the copy-on-first-write guard of this boot, for the
+    /// status and `remediate ransomware` (`None`: not decided; it was a
+    /// process-wide state).
+    pub cow_guard: Option<crate::cow::CowGuard>,
 }
 
 /// External audit NN-AUD-082 — the files the read verbs serve, from the

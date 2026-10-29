@@ -293,6 +293,9 @@ pub(crate) async fn load(
 /// What [`self_test`] measured.
 pub(crate) struct SelfTested {
     pub(crate) self_test: northnarrow_agent::boot::deny_selftest::SelfTestOutcome,
+    /// R11c (lab PR 264): the self-test's own denial, which the event loop
+    /// takes (a process-wide slot until then).
+    pub(crate) expected_denial: northnarrow_agent::boot::deny_selftest::ExpectedDenial,
     /// R11c (lab PR 264): the boot's measurements the trust level is
     /// computed from (the manifest's, the admin socket's status); they were
     /// a process-wide static this phase set.
@@ -320,7 +323,7 @@ pub(crate) fn self_test(
     // LSMs, Ubuntu) refuse the start unless NN_ANTI_TAMPER_ALLOW_DEGRADED=1;
     // an unmeasured test is signed and lowers the trust level to L1.
     boot.enter(BootPhase::SelfTest)?;
-    let self_test =
+    let (self_test, expected_denial) =
         northnarrow_agent::boot::deny_selftest::run(std::path::Path::new("/proc/self/exe"));
     let self_test_detail = northnarrow_agent::boot::deny_selftest::report(&self_test);
     if self_test == northnarrow_agent::boot::deny_selftest::SelfTestOutcome::NotDenied
@@ -352,6 +355,7 @@ pub(crate) fn self_test(
     boot.done(BootStep::DenySelfTest)?;
     Ok(SelfTested {
         self_test,
+        expected_denial,
         trust_inputs,
     })
 }

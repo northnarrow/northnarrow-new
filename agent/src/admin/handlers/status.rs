@@ -77,7 +77,7 @@ fn telemetry_status(
         // Lab PR 219: the exploit post-condition guard.
         exploit_guard: Some(crate::sensors::epg::status()),
         // Lab PR 222: the copy-on-first-write guard.
-        cow_guard: crate::cow::status(),
+        cow_guard: handles.cow_guard.as_ref().map(crate::cow::CowGuard::status),
         // Lab PR 223 (EXPERIMENTAL): the exec quarantine.
         execq_state: Some(execq.state),
         execq_held_total: Some(execq.held),
