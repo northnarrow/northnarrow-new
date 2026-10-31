@@ -383,9 +383,12 @@ fn tmp_dropper_forked_child_dies_with_it() {
         BufReader::new(dropper.0.stdout.take().expect("dropper stdout"))
             .read_line(&mut line)
             .expect("read the child's pid");
-        let child: u32 = line.trim().parse().unwrap_or_else(|_| {
-            panic!("uid {uid:?}: no child pid ({line:?}): the tree died before the child wrote it")
-        });
+        // Lab PR 269: with the decision on a thread of its own the kill can
+        // land before the child writes its pid (ubuntu2204: "the tree died
+        // before the child wrote it"). The child's pid is checked when it
+        // was written; every process of the dropper's image is checked
+        // either way, below.
+        let child: Option<u32> = line.trim().parse().ok();
 
         let rec = fx.wait_record_of(pid);
         assert_eq!(
@@ -411,12 +414,42 @@ fn tmp_dropper_forked_child_dies_with_it() {
             Some(libc::SIGKILL),
             "uid {uid:?}: the dropper ended otherwise: {status:?}; record: {rec}"
         );
-        let child_gone = common::wait_until(Duration::from_secs(5), || {
-            common::pid_gone(child).then_some(())
+        if let Some(child) = child {
+            let child_gone = common::wait_until(Duration::from_secs(5), || {
+                common::pid_gone(child).then_some(())
+            });
+            assert!(
+                child_gone.is_some(),
+                "uid {uid:?}: the dropper's child {child} survived the kill; record: {rec}"
+            );
+        }
+        // No process runs the image from /tmp any more: the child (it never
+        // execs) and any other descendant, whether or not it wrote its pid.
+        let none_left = common::wait_until(Duration::from_secs(5), || {
+            processes_of(&bin).is_empty().then_some(())
         });
         assert!(
-            child_gone.is_some(),
-            "uid {uid:?}: the dropper's child {child} survived the kill; record: {rec}"
+            none_left.is_some(),
+            "uid {uid:?}: processes of the dropper's image survived the kill: {:?} (child {child:?}); record: {rec}",
+            processes_of(&bin)
         );
     }
+}
+
+/// The pids whose executable is `image` (`/proc/<pid>/exe`; read as root).
+fn processes_of(image: &std::path::Path) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc").expect("read /proc").flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if std::fs::read_link(entry.path().join("exe")).is_ok_and(|exe| exe == image) {
+            pids.push(pid);
+        }
+    }
+    pids
 }
