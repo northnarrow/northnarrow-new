@@ -35,9 +35,8 @@
 
 #![cfg(feature = "test-privileged")]
 
-use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -97,6 +96,9 @@ struct Fixture {
     /// Lab PR 256: the agent runs from a root-owned copy, as in the other
     /// suites (it ran from `target/`); removed after it stopped.
     _installed_agent: InstalledAgent,
+    /// Lab PR 269: its admin socket (the debug triggers sit next to it).
+    #[cfg_attr(not(feature = "debug-trigger"), allow(dead_code))]
+    admin_socket: PathBuf,
 }
 
 impl Fixture {
@@ -197,7 +199,27 @@ impl Fixture {
             detections_log,
             _agent_guard: guard,
             _installed_agent: installed_agent,
+            admin_socket: socket,
         }
+    }
+
+    /// Lab PR 269 (review of #475), `debug-trigger` builds: the decision
+    /// thread stands still `secs` seconds — the trigger next to the admin
+    /// socket, taken at the loop's next check, and a second for the thread
+    /// to reach its stall — so what a test starts meanwhile is judged after.
+    #[cfg(feature = "debug-trigger")]
+    fn stall_decision(&self, secs: u64) {
+        let trigger = self
+            .admin_socket
+            .parent()
+            .expect("the socket's directory")
+            .join("debug-stall-loop");
+        std::fs::write(&trigger, secs.to_string()).expect("write the stall trigger");
+        let taken = common::wait_until(Duration::from_secs(15), || {
+            (!trigger.exists()).then_some(())
+        });
+        assert!(taken.is_some(), "the agent did not take the stall trigger");
+        std::thread::sleep(Duration::from_secs(1));
     }
 
     /// The detection record of the process `pid`.
@@ -307,12 +329,14 @@ fn tmp_exec_kill_hits_the_offender_only() {
 }
 
 /// `nobody` on Debian and Ubuntu.
+#[cfg(feature = "debug-trigger")]
 const NOBODY: u32 = 65534;
 
 /// The lab's root dropper (lab PR 166), built with `cc` in a fresh
 /// directory under `/tmp` that another user can enter: it forks at once;
 /// the child writes its pid on stdout and sleeps, the parent waits in
 /// `pause()`. The child never execs, so it draws no verdict of its own.
+#[cfg(feature = "debug-trigger")]
 fn tmp_fork_dropper() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::Builder::new()
         .prefix("nnfork")
@@ -362,7 +386,10 @@ int main(void) {
 /// R009, which runs ahead of R001).
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+#[cfg(feature = "debug-trigger")]
 fn tmp_dropper_forked_child_dies_with_it() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::CommandExt;
     let _eni = EniIptablesGuard::install();
     // Built before the agent runs: nothing here should draw a verdict.
     let (_dir, bin) = tmp_fork_dropper();
@@ -372,6 +399,11 @@ fn tmp_dropper_forked_child_dies_with_it() {
         (None, "R009_RootExecFromUserPath"),
         (Some(NOBODY), "R001_ExecFromTmp"),
     ] {
+        // Lab PR 269 (review of #475): the decision thread stands still
+        // while the dropper starts, so its child exists — it has written its
+        // pid — before the verdict, every run (with the decision on a thread
+        // of its own the kill could land before the fork on ubuntu2204).
+        fx.stall_decision(4);
         let mut cmd = Command::new(&bin);
         cmd.stdout(Stdio::piped());
         if let Some(id) = uid {
@@ -383,12 +415,13 @@ fn tmp_dropper_forked_child_dies_with_it() {
         BufReader::new(dropper.0.stdout.take().expect("dropper stdout"))
             .read_line(&mut line)
             .expect("read the child's pid");
-        // Lab PR 269: with the decision on a thread of its own the kill can
-        // land before the child writes its pid (ubuntu2204: "the tree died
-        // before the child wrote it"). The child's pid is checked when it
-        // was written; every process of the dropper's image is checked
-        // either way, below.
-        let child: Option<u32> = line.trim().parse().ok();
+        let child: u32 = line.trim().parse().unwrap_or_else(|_| {
+            panic!("uid {uid:?}: no child pid ({line:?}) though the verdict was held back")
+        });
+        assert!(
+            !common::pid_gone(child) && runs_image(child, &bin),
+            "uid {uid:?}: the child {child} runs the dropper's image before the verdict"
+        );
 
         let rec = fx.wait_record_of(pid);
         assert_eq!(
@@ -414,29 +447,38 @@ fn tmp_dropper_forked_child_dies_with_it() {
             Some(libc::SIGKILL),
             "uid {uid:?}: the dropper ended otherwise: {status:?}; record: {rec}"
         );
-        if let Some(child) = child {
-            let child_gone = common::wait_until(Duration::from_secs(5), || {
-                common::pid_gone(child).then_some(())
-            });
-            assert!(
-                child_gone.is_some(),
-                "uid {uid:?}: the dropper's child {child} survived the kill; record: {rec}"
-            );
-        }
-        // No process runs the image from /tmp any more: the child (it never
-        // execs) and any other descendant, whether or not it wrote its pid.
+        let child_gone = common::wait_until(Duration::from_secs(5), || {
+            common::pid_gone(child).then_some(())
+        });
+        assert!(
+            child_gone.is_some(),
+            "uid {uid:?}: the dropper's child {child} survived the kill; record: {rec}"
+        );
+        // No process runs the image from /tmp any more, deleted or not: the
+        // child and any other descendant.
         let none_left = common::wait_until(Duration::from_secs(5), || {
             processes_of(&bin).is_empty().then_some(())
         });
         assert!(
             none_left.is_some(),
-            "uid {uid:?}: processes of the dropper's image survived the kill: {:?} (child {child:?}); record: {rec}",
+            "uid {uid:?}: processes of the dropper's image survived the kill: {:?} (child \
+             {child}); record: {rec}",
             processes_of(&bin)
         );
     }
 }
 
-/// The pids whose executable is `image` (`/proc/<pid>/exe`; read as root).
+/// `/proc/<pid>/exe` is `image`, or `image` deleted since (` (deleted)`).
+#[cfg(feature = "debug-trigger")]
+fn runs_image(pid: u32, image: &std::path::Path) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| {
+        exe == image || exe.as_os_str() == format!("{} (deleted)", image.display()).as_str()
+    })
+}
+
+/// The pids whose executable is `image`, deleted or not (`/proc/<pid>/exe`;
+/// read as root).
+#[cfg(feature = "debug-trigger")]
 fn processes_of(image: &std::path::Path) -> Vec<u32> {
     let mut pids = Vec::new();
     for entry in std::fs::read_dir("/proc").expect("read /proc").flatten() {
@@ -447,7 +489,7 @@ fn processes_of(image: &std::path::Path) -> Vec<u32> {
         else {
             continue;
         };
-        if std::fs::read_link(entry.path().join("exe")).is_ok_and(|exe| exe == image) {
+        if runs_image(pid, image) {
             pids.push(pid);
         }
     }
