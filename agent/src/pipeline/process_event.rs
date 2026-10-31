@@ -773,3 +773,126 @@ fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
         format!("family={family}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use nn_model::Event;
+    use northnarrow_agent::response::journal::{ActionJournal, ActionRow};
+    use northnarrow_agent::response::{Executor, ExecutorConfig};
+
+    use super::*;
+    use crate::pipeline::dispatch::{Dispatcher, Followups};
+
+    fn exec_from_tmp(pid: u32, uid: u32) -> Event {
+        Event::ProcessSpawn {
+            pid,
+            ppid: 1,
+            uid,
+            gid: uid,
+            comm: "payload".to_string(),
+            filename: "/tmp/nn-r12c-test/payload".to_string(),
+            timestamp_ns: 1_000 + u64::from(pid),
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+            start_ns: 0,
+            parent_is_kthread: false,
+            exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        }
+    }
+
+    /// R12c (lab PR 270; plan §3.4): the decision hands its responses to
+    /// the dispatcher, and an acting decision is recorded past the record
+    /// budget — its journal lines held, never its record nor its action's
+    /// rows. 150 execs from /tmp of one uid (NN-L-R001, KillProcessTree;
+    /// the budget's burst is 100): 150 detection records, 150 intents each
+    /// answered by its outcome (detect-only: none touches the host).
+    #[test]
+    fn an_acting_decision_is_dispatched_and_recorded_past_the_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exec = Executor::with_config(ExecutorConfig::for_test(tmp.path()));
+        assert!(exec.config().dry_run);
+        let journal = ActionJournal::memory();
+        let sink = northnarrow_agent::detection_store::DetectionSink::for_test(4096, 0);
+        let cow = northnarrow_agent::cow::CowGuard::off_for_test();
+        let dispatcher = Dispatcher::start(
+            exec.clone(),
+            journal.clone(),
+            Followups {
+                sink: Some(sink.clone()),
+                cow: cow.clone(),
+            },
+            None,
+        );
+        let engine = RuleEngine::with_default_rules();
+        let correlation = CorrelationBuffer::with_default_capacity();
+        let posture = PostureMachine::new();
+        let ladder = northnarrow_agent::combat::CombatLadder::new(
+            Box::new(northnarrow_agent::combat::SystemActuator::new(
+                exec.clone(),
+                None,
+                true,
+                journal.clone(),
+            )),
+            Box::new(northnarrow_agent::combat::AuditEvidence::new(None)),
+            Box::new(northnarrow_agent::combat::NoProtectedProcs),
+            northnarrow_agent::combat::LadderConfig::default(),
+        );
+        let expected = northnarrow_agent::boot::deny_selftest::ExpectedDenial::default();
+        let stopping = HostStopping::default();
+        let systemd = SystemdSnapshot::default();
+        // a uid of this test's own: the budget is the process's
+        let uid = 77_001;
+        for i in 0..150u32 {
+            process_event(
+                &engine,
+                &exec,
+                &correlation,
+                &posture,
+                &ladder,
+                None,
+                Some(&sink),
+                &expected,
+                &stopping,
+                &systemd,
+                &cow,
+                &dispatcher,
+                exec_from_tmp(910_000 + i, uid),
+            );
+        }
+        dispatcher.stop(Duration::from_secs(10));
+        let records = sink.queued_for_test();
+        let r001: Vec<_> = records
+            .iter()
+            .filter(|r| format!("{:?}", r.verdict).contains("KillProcessTree"))
+            .collect();
+        assert_eq!(r001.len(), 150, "every acting decision is recorded");
+        assert!(
+            r001.iter().all(|r| r.response.contains("detect-only")),
+            "{r001:#?}"
+        );
+        let rows = journal.rows();
+        let rule_intents: Vec<_> = rows
+            .iter()
+            .filter(|r| {
+                r.row == ActionRow::Intent && r.intent.as_ref().is_some_and(|i| i.source == "rule")
+            })
+            .collect();
+        assert_eq!(rule_intents.len(), 150, "an intent per response");
+        for i in &rule_intents {
+            assert!(
+                rows.iter()
+                    .any(|o| o.row == ActionRow::Outcome && o.run == i.run && o.action == i.action),
+                "intent {} unanswered",
+                i.action
+            );
+        }
+        let st = dispatcher.status();
+        assert_eq!(st.queue.lost(), 0);
+    }
+}

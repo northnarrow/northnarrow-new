@@ -289,6 +289,8 @@ struct World {
     ledger: &'static SpawnLedger,
     ctl: Controller<FakeKernel, InProc>,
     dir: tempfile::TempDir,
+    /// R12c (lab PR 270): the actions chain its kills and quarantines write.
+    journal: crate::response::journal::ActionJournal,
 }
 
 fn world(cfg: ScanConfig, policy: Policy, budget_ms: u64, vault: bool) -> World {
@@ -302,6 +304,7 @@ fn world(cfg: ScanConfig, policy: Policy, budget_ms: u64, vault: bool) -> World 
     let ledger: &'static SpawnLedger = Box::leak(Box::default());
     let mut exec_cfg = ExecutorConfig::for_test(&dir.path().join("vault"));
     exec_cfg.dry_run = false;
+    let journal = crate::response::journal::ActionJournal::memory();
     let ctl = Controller::new(
         k.clone(),
         b.clone(),
@@ -312,7 +315,7 @@ fn world(cfg: ScanConfig, policy: Policy, budget_ms: u64, vault: bool) -> World 
             hung_after: Duration::from_millis(budget_ms),
             exec_cfg: vault.then_some(exec_cfg),
             ctime: true,
-            journal: crate::response::journal::ActionJournal::memory(),
+            journal: journal.clone(),
         },
         ledger,
     )
@@ -327,6 +330,7 @@ fn world(cfg: ScanConfig, policy: Policy, budget_ms: u64, vault: bool) -> World 
         ledger,
         ctl,
         dir,
+        journal,
     }
 }
 
@@ -445,6 +449,30 @@ fn a_blocklisted_binary_is_killed_and_quarantined() {
     assert!(
         w.k.0.lock().known.is_empty(),
         "a killed file is never cached"
+    );
+    // R12c (lab PR 270): the kill and the quarantine, each its signed
+    // intent before and its outcome after
+    use crate::response::journal::{ActionResult, ActionRow};
+    let rows = w.journal.rows();
+    let seen: Vec<String> = rows
+        .iter()
+        .map(|r| match r.row {
+            ActionRow::Intent => {
+                let i = r.intent.as_ref().unwrap();
+                format!("intent {} {} {}", i.source, i.response, i.pid)
+            }
+            _ => format!("{:?} {:?}", r.row, r.outcome.as_ref().unwrap().result),
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            format!("intent exec_quarantine KillProcess {}", h.pid),
+            format!("Outcome {:?}", ActionResult::Success),
+            format!("intent exec_quarantine Quarantine {}", h.pid),
+            format!("Outcome {:?}", ActionResult::Success),
+        ],
+        "{rows:#?}"
     );
 }
 

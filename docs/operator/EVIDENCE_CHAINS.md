@@ -49,6 +49,34 @@ and check with `journalctl --namespace=northnarrow --verify
 not stop root from removing the files, which is what the forwarded copy is
 for.
 
+### The actions chain (R12c, lab PR 270)
+
+`/var/lib/northnarrow/detections/actions.jsonl` (`--actions-file`; its
+archives and manifest beside it, 16 MiB × 8 archives, `NN_ACTIONS_CAP_BYTES`
+overrides the cap, never below 1 MiB, reported as weakening by the
+self-integrity check) holds the record of every action the agent carries
+out on its own decision — a rule's response, a step of the COMBAT ladder
+(the soft egress block and its release, a kill tree, a quarantine, the
+isolation), an exec quarantine's kill or quarantine, the copy-on-write
+guard's automatic restore. **No action without a signed record**: each
+action's `intent` row is written and synced before it acts, and its
+`outcome` row after (`success`, `failure`, `partial`, `would_execute`
+in detect-only, `not_run`, `abandoned` when the code holding it panicked).
+The two share `run` (the agent run, 16 hex digits, named in the start's
+journal: `actions journal: this run's id`) and `action` (its number in the
+run). An `interrupted` row, written by a later start, answers an intent of
+an earlier run that has no outcome — the agent stopped, crashed or was
+killed between the two: whether that action took effect is not known; the
+same start signs a `response_interrupted` audit row naming them and
+`nn-admin status --key` counts them (`intents of an earlier run without an
+outcome`). An `overflow` row names the responses decided and never run —
+displaced or refused by the full response queue, or still queued at the
+stop (stage 6). `sudo nn-admin chain verify --log actions` verifies it;
+the record budget never limits it. A row the chain could not take (the
+log not open: no key, a write refused) is logged whole at ERROR (`an
+action's row is NOT in the signed actions chain — this line is its
+record`) and counted (`rows not in the chain`); the action still runs.
+
 ## Exit codes of the verifiers
 
 Stable (scripts may rely on them; external audit MAIN-014, EVD-017, lab
@@ -100,7 +128,7 @@ audit EVD-007, EVD-008, EVD-023):
 
 | Lines | Pre-image signed | The bytes on disk |
 |---|---|---|
-| rotating logs (detections, status events, netflow, FIM drift): data lines, terminators and manifest rows with `fmt_ver` 3 — every line this version writes | `SHA-256("northnarrow/chainlog/<log>/<line type>/v3\0" ‖ prev_hash ‖ line)`, `<log>` one of `detections`, `status_events`, `netflow`, `fim_drift`, `<line type>` `data`, `terminator` or `manifest` | must be the canonical serialisation of the line |
+| rotating logs (detections, status events, netflow, FIM drift, actions): data lines, terminators and manifest rows with `fmt_ver` 3 — every line this version writes | `SHA-256("northnarrow/chainlog/<log>/<line type>/v3\0" ‖ prev_hash ‖ line)`, `<log>` one of `detections`, `status_events`, `netflow`, `fim_drift`, `actions`, `<line type>` `data`, `terminator` or `manifest` | must be the canonical serialisation of the line |
 | the same logs, lines without `fmt_ver` or with `fmt_ver` 2 (written before this version) | `SHA-256(prev_hash ‖ line)`, the same for every log and line type | not checked; counted |
 | `audit.log`, `canaries.jsonl`, `canary_access.jsonl`, numbered rows (`seq`, lab PR 160 on) | `SHA-256("northnarrow/audit/v2\0"` (or `canary-registry`, `canary-access`) `‖ prev_hash ‖ row)` | must be the canonical serialisation of the row |
 | the same files, rows without `seq` | `SHA-256(prev_hash ‖ row)` | not checked; counted |

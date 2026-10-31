@@ -1350,6 +1350,46 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- The responses off the decision thread, and no action without a signed
+  record (lab PR 270, Wave 4 phase 2, R12c-1 of the restructure plan;
+  `docs/architecture/EVENT_BUS.md` §2d, §2e, §5). The decision thread
+  submits a decision's responses to the response dispatcher (`nn-response`)
+  and judges the next event; the dispatcher takes them by severity (a job
+  that waited 500 ms next whatever its lane), each process's in the order
+  they were decided (priority inheritance), a repeat of a process's last
+  queued response merged into it; a full queue (1,024) displaces a less
+  severe response or refuses the new one — answered at once ("not run"),
+  counted per severity (stage 6), signed in an `overflow` row, raising
+  `TelemetryLoss`; at the stop what is left after 2 s is answered and
+  signed the same way. Every action the agent carries out on its own
+  decision — a rule's response, the COMBAT ladder's soft block and
+  release, kill trees, quarantines and isolation, the exec quarantine's
+  kill and quarantine, the copy-on-write guard's automatic restore —
+  writes a signed `intent` row, synced, before it acts and a signed
+  `outcome` row after (`success`, `failure`, `partial`, `would_execute`,
+  `not_run`, `abandoned`) into the new `actions` chain
+  (`/var/lib/northnarrow/detections/actions.jsonl`, `--actions-file`,
+  16 MiB × 8 archives, `NN_ACTIONS_CAP_BYTES`; `nn-admin chain verify
+  --log actions`): every acting entry point takes the `Intent` ticket only
+  the journal makes after the intent row (`xtask/tests/action_records.rs`
+  guards it). An intent an earlier run left without an outcome — the agent
+  stopped, crashed or was killed between the two — is answered at the next
+  start by an `interrupted` row, a WARN, the status count and a signed
+  `response_interrupted` audit row. A row the chain cannot take is logged
+  whole at ERROR and counted; the action still runs (CMB-027). The record
+  budget never holds an acting decision's record (only its journal lines),
+  nor the exploit guard's kernel kills' nor the exec quarantine's. Stage 7:
+  the detection store's queue takes the records of actions past its
+  capacity (up to twice it) instead of evicting them for each other; past
+  that the oldest is dropped, counted and signed — the action's own rows
+  are in the actions chain. The ransomware tracker's sampler and trust run
+  on a thread of their own (`nn-slow-work`); the burst comes back prepared
+  and is judged then. `nn-admin status --key` shows stages 6 and 7
+  (`response_dispatch`, appended to `StatusResponse`) and counts them in
+  the loss by stage. The decision path's guard gains rule 1b (the decision
+  thread runs no action) and loses the response code (off the thread now).
+  Lab: `deploy/lab/bus/responses.sh` (EXP-13r: a burst of benign
+  R001/NET-001 kills; `--crash`, the lab build's `debug-crash-mid-action`).
 - The decision on a thread of its own, without `await` (lab PR 269, Wave 4
   phase 2, R12b-2 of the restructure plan; `docs/architecture/EVENT_BUS.md`
   §2d, §3). `nn-decision` takes each event from the bus, judges it and

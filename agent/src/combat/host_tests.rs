@@ -646,12 +646,14 @@ fn detect_only_rows_name_the_trigger_and_offender_and_nothing_acts() {
     );
     assert!(exec.config().dry_run, "for_test is detect-only");
     let log = SignedLog::new();
+    // R12c (lab PR 270): the ladder's actions in the actions chain
+    let journal = crate::response::journal::ActionJournal::memory();
     let ladder = Arc::new(CombatLadder::new(
         Box::new(super::SystemActuator::new(
             exec,
             None,
             true,
-            crate::response::journal::ActionJournal::memory(),
+            journal.clone(),
         )),
         log.evidence(),
         Box::new(NoProtectedProcs),
@@ -725,4 +727,39 @@ fn detect_only_rows_name_the_trigger_and_offender_and_nothing_acts() {
         std::path::Path::new(&exe).exists(),
         "the binary is not quarantined"
     );
+    // R12c (lab PR 270): no action without a signed record — the soft
+    // block (INVESTIGATE), the kill tree and the quarantine (NEUTRALIZE),
+    // each an intent before and an outcome after: detect-only, approved and
+    // not enforced. The worker ran them in order.
+    use crate::response::journal::{ActionResult, ActionRow};
+    let rows = journal.rows();
+    let seen: Vec<(ActionRow, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.row,
+                r.intent
+                    .as_ref()
+                    .map(|i| format!("{} {} {}", i.source, i.response, i.pid))
+                    .unwrap_or_else(|| {
+                        format!("{:?}", r.outcome.as_ref().map(|o| o.result).unwrap())
+                    }),
+            )
+        })
+        .collect();
+    let would = format!("{:?}", ActionResult::WouldExecute);
+    assert_eq!(
+        seen,
+        [
+            (ActionRow::Intent, format!("combat BlockOutbound {pid}")),
+            (ActionRow::Outcome, would.clone()),
+            (ActionRow::Intent, format!("combat KillProcessTree {pid}")),
+            (ActionRow::Outcome, would.clone()),
+            (ActionRow::Intent, format!("combat Quarantine {pid}")),
+            (ActionRow::Outcome, would),
+        ],
+        "{rows:#?}"
+    );
+    assert!(rows.windows(2).all(|w| w[0].row != ActionRow::Intent
+        || (w[1].row == ActionRow::Outcome && w[1].action == w[0].action)));
 }
