@@ -3767,3 +3767,51 @@ only in the table below, in the same PR as the evidence.
     final code: 44 of 44 caught (the reviewer's K2 and K3 among them; AN2,
     every `bpf()` command keyed as one, survived the run and has a
     stronger test). The overhead and the soak were not run again.
+  - R12b-2 (part 2 of 2, #475, stacked on R12b-1) — what was wrong: the
+    decision was an async function on the runtime: it awaited systemd's
+    state for a signal PID 1 relayed and the executor, read `/proc` for
+    every exec (`exe_identity::resolve`, also in the bus's hand-over,
+    review #471 B4), swept the trusted-installer window, appended a canary
+    trip's row inline, and R018 asked the package database; the lineage's
+    judgement time was a thread-local (`judged_at`), and a pid its cache
+    did not hold was read from `/proc` — its present image — in a
+    judgement (R-F, second review of #471).
+  - R12b-2 — what changed (`docs/architecture/EVENT_BUS.md` §2d, §3): the
+    decision on an OS thread of its own (`nn-decision`: `recv_blocking`,
+    the overtaken execs taught, a plain `process_event` without `await`,
+    stage 5), the event loop's task left with the signals, the admin
+    shutdown, SNS-001's check and the lab triggers; its blocking I/O moved
+    to the pumps (an exec's absolute path), the systemd watch (a snapshot
+    refreshed every 2 s; a relayed signal on an answer older than a second
+    handed to the watch, which asks at once and hands it back answered),
+    the existing 1-s tick (the installer window), a writer thread
+    (`nn-canary-log`: a trip's rows in DEC-011's order) and the module-load
+    pump (R018's package answers, `OWNERSHIP`); the guard,
+    `xtask/tests/decision_path_io.rs` (CI's `cargo test`): no `.await`,
+    file, `/proc`, process, sleep, socket or fsync in the decision thread's
+    own code, and a ratchet of the I/O sites the code it calls into still
+    has, each listed with why. R-F: the lineage's time an explicit
+    parameter (`AsOf`: `Judged`, `Live`, `Now`); in a judgement a pid the
+    cache does not hold is not known unless its process started before the
+    agent (the strict rule left a COMBAT reached after a restart unlocked:
+    the posture golden replay's `eva-installer-window`; kept narrowed, no
+    golden change). A decision thread that does not start ends the agent
+    with a failure. Found while building it: the first systemd watch sent a
+    deferred signal back on the bus, where the coalescer counted it into
+    the denial already queued — never judged; it is handed back now. The
+    lab found two privileged e2e tests racing the response, which the
+    decision on its own thread now wins on 5.15 (the process canary's decoy
+    killed before it returned, the /tmp dropper's tree before its child
+    wrote its pid): the decoy sleeps and its SIGKILL is asserted, the
+    dropper's test checks that no process of its image survives.
+  - R12b-2 — open: the responses still run on the decision thread (R12c's
+    dispatcher); the I/O sites the ratchet lists (the ransomware tracker's
+    sampler, the policy's exemption facts, the ancestry tree's fallback, a
+    canary trip's reader, the security-tool detector); R-F's remainder (a
+    process older than the agent that executes another image after an
+    event, judged before that exec is read, is judged on `/proc`'s image);
+    R-B and the property test over the posture corpus not done; the FIM
+    ring's drops under EXP-13c on the tips (the FIM drain a task still);
+    the self-integrity check's window for a freeze that starts right after
+    a round (C15 on the first tip).
+  - R12b-2 — lab: the same guests and method, `main` 28ecf720 (#474's runs), the first tip bc480855 and the final tip 8c3c253b (it holds R12b-1's final; the branch's later commits are documents and two privileged tests, below). EXP-13e ×3: `fs_protect` ring drops `main` 575, 865, 3,176 (mean 1,539), the first tip 0, 0, 21 (mean 7, max 21), the final tip 0, 0, 0, the agent's CPU ~12.5 s against 36.7 s, every refused attempt accounted, NET-001 6/6 in every run. EXP-13, 13c ×3 and 13d: the first tip lost 297, 249 and 189 in the bursts (R12b-1's ring finding), the final tip 0 in each of its 7 runs; the FIM ring dropped 2,249 and 6,311 records in two 13c runs of the tips (none in `main`'s three; R12a's lab saw 1,575 and 439 on this `main` code). EXP-13b (`debug-stall-loop` stalls the decision thread 4 s): the first record 4.00 s late, stage 5 counting it, 1 record + 2,999 held, nothing dropped. Overhead (the first tip): open +31.6 %, wopen +30.6 %, exec +6.1 %, connect +18.0 %, udp +15.8 %, dns +14.4 % (`main` +27.8, +31.1, +4.6, +40.4, +15.3, +13.0) — and 256 `tcp_close` records dropped by the network drain during the connect workload (not on `main` or R12b-1). Soak on ubuntu2204 (a fresh install, the same 0.78 h load as R12b-1's pair): RSS 31.8 → 57.4 MB, threads 23 → 23 (the runtime's 8 throughout; `main` 9 → 22), no restart, no ring or bus drop, P0 1,810 queued and none capped, stage 5 late only the boot's backlog (P3 none, max 238 ms), 2,917 WARN/ERROR lines (one ERROR: the lab's admin key). `test-ignored`: the first tip and the final code 95 passed, 0 failed on ubuntu2404 and one failure on ubuntu2204 — the process canary's decoy (a copy of `/bin/true`) killed by NN-L-CANARY-002's response before it returned 0, a race the decision on its own thread now wins on 5.15 (R12b-1's runs found it `AlreadyGone`); with that test made deterministic the next run failed the /tmp dropper's test the same way (R001's kill before its child wrote its pid); with both tests fixed (1277ec24) 95 passed, 0 failed on ubuntu2204 and 95 passed, 0 failed on ubuntu2404, the 52 chain checks `ok` in every run. `tamper-check` (the final code): its 75 outcomes and verdicts those of `main`, case by case; the first tip's run missed C15's stall report (a 45-s freeze that began right after a self-integrity round: the check's window, Open). The `fs_protect` ring read back 262,144 bytes on both guests. posture_demo identical to `main`'s (29 lines). Host gates on 8c3c253b: build-ebpf, clippy ×4, fmt, 75 suites 3,303 passed 0 failed 17 ignored, the privileged no-run, attack-coverage, `golden` ×5 (54 files the same bytes), MSRV, fuzz (13), portable-core (5), lockfiles unchanged; clippy (privileged tests) and fmt again on 1277ec24 (the two e2e tests). Mutations: 18 of 18 on the final code (the resolve in the pumps, the systemd snapshot and its watch, the decision loop's teaching, delay and answered signals, the canary writer, the provenance cache, R-F's rules, the ratchet) and R-F's own 11 of 11; survivors along the way (B5 on the first watch, B17) have their tests.
