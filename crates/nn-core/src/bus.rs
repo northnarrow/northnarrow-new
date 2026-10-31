@@ -775,13 +775,28 @@ impl DecisionDelay {
 pub const FLOOD_CAP_PER_UID: u32 = 256;
 /// The cap's window: [`FLOOD_CAP_PER_UID`] per uid and kind each second.
 pub const FLOOD_CAP_WINDOW_NS: u64 = 1_000_000_000;
-/// The (kind, uid) pairs the cap keeps. Full, the pairs whose window has
-/// ended and that hold nothing to sign go first; a new pair that still
-/// finds no room is queued, uncapped (never dropped for want of a slot).
+/// The keys ([`CapKey`]: kind, uid and target) the cap keeps. Full, the
+/// keys whose window has ended and that hold nothing to sign go first. A
+/// new key that still finds no room is queued uncapped — judged like any
+/// P0 event, or, when P0 itself is full, dropped by the bus with its signed
+/// `event_bus_drop` row and `TelemetryLoss`: never set aside uncounted and
+/// unjudged. It is counted ([`FloodCap::take_overflow`]) and signed in the
+/// next capped row, and raises the posture's `TelemetryLoss` (review of
+/// #474: the policy for a full table).
 pub const FLOOD_CAP_KEYS: usize = 4096;
-/// The kinds of process (`comm` and action) a capped pair names between
-/// two rows.
+/// The kinds of process (`comm` and action) a capped key names between
+/// two rows (its count covers them all).
 pub const FLOOD_CAP_SAMPLES: usize = 8;
+
+/// Review of #474: the `bpf()` commands the cap never holds back —
+/// NN-L-BPF-001's (a program loaded, attached, a link made). Each is judged
+/// whatever else the same uid sends; a burst of them is bounded by P0's
+/// shares and its wait for room, as on R12a.
+pub const NEVER_CAPPED_BPF: [u32; 3] = [
+    common::bpf_cmd::BPF_PROG_LOAD,
+    common::bpf_cmd::BPF_PROG_ATTACH,
+    common::bpf_cmd::BPF_LINK_CREATE,
+];
 
 /// R12b: the allowance of a uid's `bpf()` records about the agent's own
 /// objects ([`FloodKind::BpfOwn`]: a handle to one of its maps, programs or
@@ -836,7 +851,77 @@ impl FloodKind {
     }
 }
 
-/// One process a capped pair names: its pid, its `comm`, and what it did
+/// What, inside a kind and a uid, the cap counts apart (review of #474):
+/// each refused operation on each target, each `bpf()` command — one
+/// target's or command's burst never holds back another's event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CapTarget {
+    /// A refused operation on one target (`target_dev`, `target_ino`: an
+    /// inode, or the process of a refused signal or ptrace).
+    Denial {
+        operation: nn_model::FsProtectOperation,
+        dev: u64,
+        ino: u64,
+    },
+    /// A `bpf()` command (uapi, or a synthetic `BPF_CMD_*`).
+    Bpf { cmd: u32 },
+}
+
+/// The cap's key: the kind of flood, the actor's uid, and its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CapKey {
+    pub kind: FloodKind,
+    pub uid: u32,
+    pub target: CapTarget,
+}
+
+impl CapKey {
+    /// The key `event` is counted under, `None` when the cap never holds it
+    /// back: not a flood of P0, or one of [`NEVER_CAPPED_BPF`].
+    pub fn of(event: &Event) -> Option<CapKey> {
+        let (kind, uid) = FloodKind::of(event)?;
+        let target = match event {
+            Event::FsProtectDenial {
+                operation,
+                target_dev,
+                target_ino,
+                ..
+            } => CapTarget::Denial {
+                operation: *operation,
+                dev: *target_dev,
+                ino: *target_ino,
+            },
+            Event::BpfSyscall { cmd, .. } => {
+                if NEVER_CAPPED_BPF.contains(cmd) {
+                    return None;
+                }
+                CapTarget::Bpf { cmd: *cmd }
+            }
+            _ => return None,
+        };
+        Some(CapKey { kind, uid, target })
+    }
+
+    /// As the signed row names the target.
+    pub fn target_json(&self) -> serde_json::Value {
+        match self.target {
+            CapTarget::Denial {
+                operation,
+                dev,
+                ino,
+            } => serde_json::json!({
+                "operation": operation.to_string(),
+                "target_dev": dev,
+                "target_ino": ino,
+            }),
+            CapTarget::Bpf { cmd } => serde_json::json!({
+                "cmd": common::wire::bpf_cmd_name(cmd),
+            }),
+        }
+    }
+}
+
+/// One process a capped key names: its pid, its `comm`, and what it did
 /// (a refused operation and its target, a `bpf()` command).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapSample {
@@ -845,11 +930,12 @@ pub struct CapSample {
     pub what: String,
 }
 
-/// What one (kind, uid) had capped since the last row.
+/// What one key ([`CapKey`]) had capped since the last row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capped {
     pub kind: FloodKind,
     pub uid: u32,
+    pub target: CapTarget,
     /// Events counted, not queued.
     pub count: u64,
     /// Bus time (ns) of the first and the last.
@@ -869,16 +955,21 @@ struct CapWindow {
     pending: Option<Capped>,
 }
 
-/// C3's cap ([`FLOOD_CAP_PER_UID`]): per (kind, uid), a window of a second
-/// that lets the first events through and counts the rest. Pure: the
-/// caller passes the time.
+/// C3's cap ([`FLOOD_CAP_PER_UID`]): per key ([`CapKey`]: kind, uid,
+/// target), a window of a second that lets the first events through and
+/// counts the rest. Pure: the caller passes the time.
 #[derive(Debug)]
 pub struct FloodCap {
     per_uid: u32,
     window_ns: u64,
     keys: usize,
-    windows: std::collections::HashMap<(FloodKind, u32), CapWindow>,
+    windows: std::collections::HashMap<CapKey, CapWindow>,
     total: u64,
+    /// Queued uncapped because the table was full, since the last
+    /// [`Self::take_overflow`], and the uids among them that were root's.
+    overflow: u64,
+    overflow_root: bool,
+    overflow_total: u64,
 }
 
 impl Default for FloodCap {
@@ -896,24 +987,25 @@ impl FloodCap {
             keys: keys.max(1),
             windows: std::collections::HashMap::new(),
             total: 0,
+            overflow: 0,
+            overflow_root: false,
+            overflow_total: 0,
         }
     }
 
-    /// The event of `kind` by `uid` at `now_ns`: `true` it may be queued
-    /// (counted in its uid's allowance), `false` it is over it — counted,
-    /// `sample` naming its process while the pair names fewer than
-    /// [`FLOOD_CAP_SAMPLES`] kinds (`comm` and action).
-    pub fn admit(
-        &mut self,
-        kind: FloodKind,
-        uid: u32,
-        now_ns: u64,
-        sample: impl FnOnce() -> CapSample,
-    ) -> bool {
-        let key = (kind, uid);
+    /// The event of `key` at `now_ns`: `true` it may be queued (counted in
+    /// its key's allowance), `false` it is over it — counted, `sample`
+    /// naming its process while the key names fewer than
+    /// [`FLOOD_CAP_SAMPLES`] kinds (`comm` and action). A full table queues
+    /// a new key uncapped and counts it ([`FLOOD_CAP_KEYS`]).
+    pub fn admit(&mut self, key: CapKey, now_ns: u64, sample: impl FnOnce() -> CapSample) -> bool {
+        let kind = key.kind;
         if !self.windows.contains_key(&key) && self.windows.len() >= self.keys {
             self.prune(now_ns);
             if self.windows.len() >= self.keys {
+                self.overflow += 1;
+                self.overflow_total += 1;
+                self.overflow_root |= key.uid == 0;
                 return true;
             }
         }
@@ -937,7 +1029,8 @@ impl FloodCap {
         }
         let p = w.pending.get_or_insert_with(|| Capped {
             kind,
-            uid,
+            uid: key.uid,
+            target: key.target,
             count: 0,
             first_ns: now_ns,
             last_ns: now_ns,
@@ -960,11 +1053,21 @@ impl FloodCap {
     }
 
     /// An event [`Self::admit`] let through that was not queued after all
-    /// (the bus dropped it): its place in the allowance is given back.
-    pub fn refund(&mut self, kind: FloodKind, uid: u32) {
-        if let Some(w) = self.windows.get_mut(&(kind, uid)) {
+    /// (the bus dropped it, or the batch's fast path handed it to the slow
+    /// one, which admits it again): its place in the allowance is given back.
+    pub fn refund(&mut self, key: CapKey) {
+        if let Some(w) = self.windows.get_mut(&key) {
             w.queued = w.queued.saturating_sub(1);
         }
+    }
+
+    /// The events queued uncapped because the table was full, since the
+    /// last call, and whether root's were among them; and since boot.
+    pub fn take_overflow(&mut self) -> (u64, bool, u64) {
+        let out = (self.overflow, self.overflow_root, self.overflow_total);
+        self.overflow = 0;
+        self.overflow_root = false;
+        out
     }
 
     /// Every event capped since boot.
@@ -972,8 +1075,8 @@ impl FloodCap {
         self.total
     }
 
-    /// What was capped since the last call, per (kind, uid), the most
-    /// first; the pairs start counting again.
+    /// What was capped since the last call, per key — every key that
+    /// capped something —, the most first; the keys start counting again.
     pub fn take_pending(&mut self) -> Vec<Capped> {
         let mut out: Vec<Capped> = self
             .windows
@@ -983,7 +1086,7 @@ impl FloodCap {
         out.sort_by(|a, b| {
             b.count
                 .cmp(&a.count)
-                .then((a.kind, a.uid).cmp(&(b.kind, b.uid)))
+                .then((a.kind, a.uid, a.target).cmp(&(b.kind, b.uid, b.target)))
         });
         out
     }
@@ -1572,6 +1675,23 @@ mod tests {
         }
     }
 
+    /// A key of `kind` by `uid` on one fixed target (a `bpf(BPF_MAP_CREATE)`,
+    /// a handle on an agent object, a `chmod` of inode 1:2).
+    fn key(kind: FloodKind, uid: u32) -> CapKey {
+        let target = match kind {
+            FloodKind::Denial => CapTarget::Denial {
+                operation: nn_model::FsProtectOperation::Setattr,
+                dev: 1,
+                ino: 2,
+            },
+            FloodKind::Bpf => CapTarget::Bpf { cmd: 0 },
+            FloodKind::BpfOwn => CapTarget::Bpf {
+                cmd: common::wire::BPF_CMD_FOREIGN_GET_FD,
+            },
+        };
+        CapKey { kind, uid, target }
+    }
+
     fn sample(pid: u32) -> CapSample {
         CapSample {
             pid,
@@ -1587,15 +1707,15 @@ mod tests {
     fn the_floods_of_p0_are_capped_per_uid_and_second() {
         let mut cap = FloodCap::new(3, 1_000, 16);
         let admitted: Vec<bool> = (0..5u32)
-            .map(|i| cap.admit(FloodKind::Bpf, 1000, 10 + u64::from(i), || sample(i)))
+            .map(|i| cap.admit(key(FloodKind::Bpf, 1000), 10 + u64::from(i), || sample(i)))
             .collect();
         assert_eq!(admitted, [true, true, true, false, false]);
         // another uid, the other kind: their own allowance
-        assert!(cap.admit(FloodKind::Bpf, 1001, 20, || sample(9)));
-        assert!(cap.admit(FloodKind::Denial, 1000, 20, || sample(9)));
+        assert!(cap.admit(key(FloodKind::Bpf, 1001), 20, || sample(9)));
+        assert!(cap.admit(key(FloodKind::Denial, 1000), 20, || sample(9)));
         // the window's end (exclusive): still capped at 1_009, not at 1_010
-        assert!(!cap.admit(FloodKind::Bpf, 1000, 1_009, || sample(5)));
-        assert!(cap.admit(FloodKind::Bpf, 1000, 1_010, || sample(6)));
+        assert!(!cap.admit(key(FloodKind::Bpf, 1000), 1_009, || sample(5)));
+        assert!(cap.admit(key(FloodKind::Bpf, 1000), 1_010, || sample(6)));
         assert_eq!(cap.total(), 3);
         let rows = cap.take_pending();
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1606,11 +1726,11 @@ mod tests {
         assert_eq!(pids, [3, 4, 5]);
         assert!(cap.take_pending().is_empty(), "taken once");
         // a refund gives one place back
-        assert!(cap.admit(FloodKind::Bpf, 1000, 1_011, || sample(7)));
-        assert!(cap.admit(FloodKind::Bpf, 1000, 1_012, || sample(7)));
-        assert!(!cap.admit(FloodKind::Bpf, 1000, 1_013, || sample(7)));
-        cap.refund(FloodKind::Bpf, 1000);
-        assert!(cap.admit(FloodKind::Bpf, 1000, 1_014, || sample(7)));
+        assert!(cap.admit(key(FloodKind::Bpf, 1000), 1_011, || sample(7)));
+        assert!(cap.admit(key(FloodKind::Bpf, 1000), 1_012, || sample(7)));
+        assert!(!cap.admit(key(FloodKind::Bpf, 1000), 1_013, || sample(7)));
+        cap.refund(key(FloodKind::Bpf, 1000));
+        assert!(cap.admit(key(FloodKind::Bpf, 1000), 1_014, || sample(7)));
     }
 
     /// The cap's samples name what the flood is made of: one process per
@@ -1626,11 +1746,11 @@ mod tests {
             comm: comm.into(),
             what: "setattr 1:2".into(),
         };
-        assert!(one.admit(FloodKind::Denial, 0, 0, || loop_of(1, "forkloop")));
+        assert!(one.admit(key(FloodKind::Denial, 0), 0, || loop_of(1, "forkloop")));
         for pid in 2..50 {
-            assert!(!one.admit(FloodKind::Denial, 0, 1, || loop_of(pid, "forkloop")));
+            assert!(!one.admit(key(FloodKind::Denial, 0), 1, || loop_of(pid, "forkloop")));
         }
-        assert!(!one.admit(FloodKind::Denial, 0, 2, || loop_of(77, "rm")));
+        assert!(!one.admit(key(FloodKind::Denial, 0), 2, || loop_of(77, "rm")));
         let rows = one.take_pending();
         let named: Vec<(u32, &str)> = rows[0]
             .samples
@@ -1645,10 +1765,10 @@ mod tests {
         let mut cap = FloodCap::default();
         let per = FLOOD_CAP_PER_UID;
         for i in 0..per {
-            assert!(cap.admit(FloodKind::Denial, 0, u64::from(i), || sample(i)));
+            assert!(cap.admit(key(FloodKind::Denial, 0), u64::from(i), || sample(i)));
         }
         for i in 0..40u32 {
-            assert!(!cap.admit(FloodKind::Denial, 0, 500_000_000, || sample(i % 20)));
+            assert!(!cap.admit(key(FloodKind::Denial, 0), 500_000_000, || sample(i % 20)));
         }
         let rows = cap.take_pending();
         assert_eq!(rows[0].count, 40);
@@ -1657,7 +1777,9 @@ mod tests {
         pids.dedup();
         assert_eq!(pids.len(), FLOOD_CAP_SAMPLES);
         assert!(
-            cap.admit(FloodKind::Denial, 0, FLOOD_CAP_WINDOW_NS + 1, || sample(0)),
+            cap.admit(key(FloodKind::Denial, 0), FLOOD_CAP_WINDOW_NS + 1, || {
+                sample(0)
+            }),
             "a second later"
         );
     }
@@ -1667,23 +1789,94 @@ mod tests {
     #[test]
     fn a_full_cap_table_never_caps_a_new_uid() {
         let mut cap = FloodCap::new(1, 100, 2);
-        assert!(cap.admit(FloodKind::Bpf, 1, 0, || sample(1)));
+        assert!(cap.admit(key(FloodKind::Bpf, 1), 0, || sample(1)));
         assert!(
-            !cap.admit(FloodKind::Bpf, 1, 1, || sample(1)),
+            !cap.admit(key(FloodKind::Bpf, 1), 1, || sample(1)),
             "uid 1 capped"
         );
-        assert!(cap.admit(FloodKind::Bpf, 2, 1, || sample(2)));
+        assert!(cap.admit(key(FloodKind::Bpf, 2), 1, || sample(2)));
         // full: uid 3 finds no room yet (uid 1 has a row to sign, uid 2's
         // window runs) — queued uncapped, again and again
-        assert!(cap.admit(FloodKind::Bpf, 3, 2, || sample(3)));
-        assert!(cap.admit(FloodKind::Bpf, 3, 3, || sample(3)));
+        assert!(cap.admit(key(FloodKind::Bpf, 3), 2, || sample(3)));
+        assert!(cap.admit(key(FloodKind::Bpf, 3), 3, || sample(3)));
         // uid 2's window ends: it goes, uid 3 takes its place
-        assert!(cap.admit(FloodKind::Bpf, 3, 200, || sample(3)));
+        assert!(cap.admit(key(FloodKind::Bpf, 3), 200, || sample(3)));
         assert!(
-            !cap.admit(FloodKind::Bpf, 3, 201, || sample(3)),
+            !cap.admit(key(FloodKind::Bpf, 3), 201, || sample(3)),
             "uid 3 counted now"
         );
         assert_eq!(cap.take_pending().len(), 2);
+        // the two queued for want of a slot are counted, uid 3's (not root)
+        assert_eq!(cap.take_overflow(), (2, false, 2));
+        assert_eq!(cap.take_overflow(), (0, false, 2), "taken once");
+        // root's overflow is said apart (the posture's signal)
+        let mut full = FloodCap::new(1, 100, 1);
+        assert!(full.admit(key(FloodKind::Bpf, 5), 0, || sample(5)));
+        assert!(full.admit(key(FloodKind::Bpf, 0), 1, || sample(0)));
+        assert_eq!(full.take_overflow(), (1, true, 1));
+    }
+
+    /// Review of #474: inside a uid the cap counts each command and each
+    /// (operation, target) apart, and never holds back NN-L-BPF-001's
+    /// commands — one command's or target's burst never keeps another's
+    /// event from its judgement; every key that capped something is
+    /// reported with its count.
+    #[test]
+    fn each_command_and_target_has_its_own_allowance() {
+        use common::bpf_cmd::{BPF_LINK_CREATE, BPF_MAP_CREATE, BPF_PROG_ATTACH, BPF_PROG_LOAD};
+        let call = |cmd: u32| Event::BpfSyscall {
+            pid: 7,
+            uid: 0,
+            comm: "c".into(),
+            cmd,
+            arg: 0,
+            timestamp_ns: 1,
+        };
+        for cmd in [BPF_PROG_LOAD, BPF_PROG_ATTACH, BPF_LINK_CREATE] {
+            assert_eq!(CapKey::of(&call(cmd)), None, "cmd {cmd} is never capped");
+        }
+        let map = CapKey::of(&call(BPF_MAP_CREATE)).expect("a map create is counted");
+        assert_eq!(
+            map.target,
+            CapTarget::Bpf {
+                cmd: BPF_MAP_CREATE
+            }
+        );
+        let mut cap = FloodCap::new(3, 1_000, 16);
+        let n = |cap: &mut FloodCap, k: CapKey| {
+            (0..10u32)
+                .filter(|i| cap.admit(k, 10, || sample(*i)))
+                .count()
+        };
+        assert_eq!(n(&mut cap, map), 3);
+        let other = CapKey {
+            target: CapTarget::Bpf { cmd: 2 },
+            ..map
+        };
+        assert_eq!(n(&mut cap, other), 3, "another command: its own allowance");
+        let on = |ino: u64| {
+            CapKey::of(&Event::FsProtectDenial {
+                pid: 1,
+                uid: 0,
+                comm: "chmod".into(),
+                target_dev: 1,
+                target_ino: ino,
+                operation: nn_model::FsProtectOperation::Setattr,
+                timestamp_ns: 1,
+            })
+            .unwrap()
+        };
+        assert_eq!(n(&mut cap, on(2)), 3);
+        assert_eq!(n(&mut cap, on(3)), 3, "another target: its own allowance");
+        let rows = cap.take_pending();
+        assert_eq!(rows.len(), 4, "every key that capped: {rows:?}");
+        assert!(rows.iter().all(|r| r.count == 7 && r.uid == 0));
+        assert_eq!(cap.total(), 28);
+        assert_eq!(
+            map.target_json(),
+            serde_json::json!({"cmd": common::wire::bpf_cmd_name(BPF_MAP_CREATE)})
+        );
+        assert_eq!(on(3).target_json()["target_ino"], 3);
     }
 
     /// R12b (the lab's soak): a uid's `bpf()` records about the agent's own
@@ -1714,7 +1907,7 @@ mod tests {
         let mut cap = FloodCap::new(3, 1_000, 16);
         let n = |cap: &mut FloodCap, kind| {
             (0..20u32)
-                .filter(|i| cap.admit(kind, 0, u64::from(*i), || sample(*i)))
+                .filter(|i| cap.admit(key(kind, 0), u64::from(*i), || sample(*i)))
                 .count()
         };
         assert_eq!(n(&mut cap, FloodKind::Bpf), 3, "the other calls' allowance");

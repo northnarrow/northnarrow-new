@@ -697,6 +697,23 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     /// signed is signed ([`BusLosses::stop`]). The counts, P0 first.
     pub fn stop_bus(&mut self) -> [u64; nn_core::bus::QUEUES] {
         let queued = self.rx.close();
+        // Review of #474: the pump threads end (a batch they read and the
+        // closed bus refuses is counted), at most two of their waits, so
+        // the stop row counts it too
+        for (_, p) in &self.pumps {
+            if let Pump::Thread(t) = p {
+                t.stop();
+            }
+        }
+        let deadline = std::time::Instant::now() + crate::sensors::pump::STOP_WITHIN;
+        while std::time::Instant::now() < deadline
+            && self
+                .pumps
+                .iter()
+                .any(|(_, p)| matches!(p, Pump::Thread(t) if !t.is_finished()))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         self.bus_losses.stop(&self.rx.stats(), queued);
         queued
     }
@@ -1985,6 +2002,16 @@ mod tests {
         assert!(sized < loaded, "sized after the load");
         assert_eq!(code.matches(".load(EBPF_BYTES)").count(), 1);
         assert!(code.contains("take_ringbuf(&mut ebpf, FS_PROTECT_RING)?"));
+        // review of #474: the verifier check loads it as the agent does
+        let check = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/crates/nn-linux/src/verifier_check.rs"
+        ));
+        let check = &check[..check.find("#[cfg(test)]").unwrap_or(check.len())];
+        let sized = check
+            .find("crate::sensors::multiplexer::FS_PROTECT_RING_BYTES")
+            .expect("the verifier check sizes the denials' ring");
+        assert!(sized < check.find(".load(bytes)").expect("its load"));
     }
 
     /// External audit SNS-012 (NN-AUD-355): the WARN for an unarmed

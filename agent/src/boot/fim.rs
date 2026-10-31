@@ -703,23 +703,37 @@ pub(crate) fn start(
                             let lineage_for_drain = lineage.clone();
                             let event_tx = sensor.event_tx_for("fim_drain");
                             let audit_for_drain = audit_log.clone();
-                            let handle = tokio::spawn(async move {
-                                let outcome = drain_loop(
-                                    rb,
-                                    inode_map_for_drain,
-                                    baseline_cache_for_drain,
-                                    drift_db,
-                                    classifier,
-                                    rate_limiter_clone,
-                                    watched_paths_for_drain,
-                                    lineage_for_drain,
-                                    event_tx,
-                                )
-                                .await;
-                                drain_ended("fim", outcome, audit_for_drain.as_ref());
-                            });
-                            sensor.register_pump_handle("fim_drain", handle);
-                            info!("fim: drain loop spawned");
+                            // Review of #474: on a thread of its own, as
+                            // the pumps (`nn-fim_drain`)
+                            let spawned = northnarrow_agent::sensors::pump::spawn_drain_thread(
+                                "fim_drain",
+                                move || async move {
+                                    let outcome = drain_loop(
+                                        rb,
+                                        inode_map_for_drain,
+                                        baseline_cache_for_drain,
+                                        drift_db,
+                                        classifier,
+                                        rate_limiter_clone,
+                                        watched_paths_for_drain,
+                                        lineage_for_drain,
+                                        event_tx,
+                                    )
+                                    .await;
+                                    drain_ended("fim", outcome, audit_for_drain.as_ref());
+                                },
+                            );
+                            match spawned {
+                                Ok(t) => {
+                                    sensor.register_pump_thread("fim_drain", t);
+                                    info!("fim: drain loop spawned on a thread of its own");
+                                }
+                                Err(e) => warn!(
+                                    error = %e,
+                                    "fim: the drain's thread could not start — kernel drift \
+                                     events will be dropped"
+                                ),
+                            }
                         }
                         Err(e) => {
                             warn!(

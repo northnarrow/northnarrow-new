@@ -946,8 +946,9 @@ pub enum CanaryAccessKind {
 }
 
 /// Which inode operation the LSM hook denied. Wire-side these are
-/// the `FS_OP_*` byte constants in [`crate::wire`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// the `FS_OP_*` byte constants in [`crate::wire`]. Ordered and hashable:
+/// the bus's per-uid cap counts each (operation, target) apart (R12b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum FsProtectOperation {
     /// `unlink(2)` — `rm` of a file inside or pointing at the
     /// protected set.

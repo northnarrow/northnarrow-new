@@ -374,6 +374,11 @@ fn load_object(bytes: &[u8], level: VerifierLogLevel) -> Result<Ebpf> {
     let task_maps = crate::sensors::epg::TaskMaps::default();
     loader.map_max_entries(crate::sensors::epg::STRICT_TASKS_MAP, task_maps.strict);
     loader.map_max_entries(crate::sensors::epg::LITE_TASKS_MAP, task_maps.lite);
+    // Review of #474: the denials' ring at the size the agent loads it
+    loader.map_max_entries(
+        crate::sensors::multiplexer::FS_PROTECT_RING,
+        crate::sensors::multiplexer::FS_PROTECT_RING_BYTES,
+    );
     loader.default_map_pin_directory(PIN_DIR);
     loader.verifier_log_level(level);
     let mut ebpf = loader

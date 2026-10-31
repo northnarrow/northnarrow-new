@@ -82,6 +82,41 @@ impl PumpThread {
     }
 }
 
+/// Review of #474: a drain (the FIM's, the network's) on a thread of its
+/// own, as the pumps are: its loop — async, it awaits the bus, the DNS and
+/// connect barriers, its periodic steps — runs on a runtime of its own (one
+/// thread, its own reactor and timers), so the kernel's wake-up for its
+/// rings reaches that thread directly instead of a worker of the agent's
+/// runtime. `make` builds the loop on that thread (its rings registered
+/// with that reactor). The stop flag ends it, checked every [`POLL_MS`].
+pub fn spawn_drain_thread<F, Fut>(label: &'static str, make: F) -> io::Result<PumpThread>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    PumpThread::spawn(label, move |stop| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let watch = async {
+                let mut tick = tokio::time::interval(Duration::from_millis(POLL_MS as u64));
+                loop {
+                    tick.tick().await;
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                }
+            };
+            tokio::select! {
+                () = make() => {}
+                () = watch => {}
+            }
+        });
+        Ok(())
+    })
+}
+
 /// A telemetry task the multiplexer keeps (external audit SNS-001): a pump
 /// on a thread of its own (R12b), or a task of the runtime (the FIM and
 /// network drains, the open sensor's rule refresher, the loss recorder).
@@ -507,6 +542,43 @@ mod tests {
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);
+        }
+    }
+
+    /// Review of #474: a drain runs on a thread of its own (named after it)
+    /// with a runtime of its own — its timers and awaits work there, not on
+    /// the caller's runtime —; it ends at the stop flag, and a loop that
+    /// returns leaves a finished thread (SNS-001's blind spot).
+    #[test]
+    fn a_drain_runs_on_a_thread_and_runtime_of_its_own() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let drain = spawn_drain_thread("test_drain", move || async move {
+            let name = std::thread::current().name().map(str::to_string);
+            let own = tokio::runtime::Handle::current().runtime_flavor()
+                == tokio::runtime::RuntimeFlavor::CurrentThread;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            tx.send((name, own)).unwrap();
+            std::future::pending::<()>().await;
+        })
+        .unwrap();
+        let (name, own) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(name.as_deref(), Some("nn-test_drain"));
+        assert!(own, "a runtime of its own");
+        assert!(!drain.is_finished(), "a drain never ends on its own");
+        drain.stop();
+        let started = std::time::Instant::now();
+        while !drain.is_finished() {
+            assert!(started.elapsed() < STOP_WITHIN, "stopped within its wait");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ended = spawn_drain_thread("test_drain2", || async {}).unwrap();
+        let started = std::time::Instant::now();
+        while !ended.is_finished() {
+            assert!(
+                started.elapsed() < STOP_WITHIN,
+                "a returned drain is finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 }

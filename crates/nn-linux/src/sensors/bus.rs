@@ -56,7 +56,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use nn_core::bus::{
-    self as core_bus, CapSample, ClassQueues, DecisionDelay, Envelope, FloodCap, FloodKind,
+    self as core_bus, CapKey, CapSample, ClassQueues, DecisionDelay, Envelope, FloodCap, FloodKind,
     LatencyHistogram, Priority, QueueSpec, QueueStats, SourceId, WhenFull, DECISION_BUDGET_NS,
     QUEUES, SPECS,
 };
@@ -88,6 +88,10 @@ pub const COALESCED_AUDIT_OP: &str = "event_bus_coalesced";
 /// Audit op of the floods of P0 counted past their uid's cap (third review
 /// of #471, C3; R12b, lab PR 269).
 pub const CAPPED_AUDIT_OP: &str = "event_bus_capped";
+/// The capped keys one `event_bus_capped` row lists; more make more rows
+/// of the same sample (each says which part it is), so every key that
+/// capped something is in the chain with its count (review of #474).
+pub const CAPPED_ROW_KEYS: usize = 256;
 /// Second review of #471, R-A: a refused operation repeated by the same
 /// process on the same inode within this window of the one sent is
 /// counted into it, not queued.
@@ -373,6 +377,9 @@ struct Inner {
     cap: Mutex<FloodCap>,
     senders: AtomicUsize,
     closed: AtomicBool,
+    /// Review of #474: the events a sender had (a pump's batch read from
+    /// its ring) and the closed bus refused — counted in the stop row.
+    refused_closed: AtomicU64,
     specs: [QueueSpec; QUEUES],
     epoch: Instant,
     /// R12b: the boot the envelopes' process keys name.
@@ -408,16 +415,16 @@ impl Inner {
     /// C3: whether a flood of P0 by its uid may be queued now (counted in
     /// the uid's allowance), else counted as capped.
     fn admit_flood(&self, cap: &mut FloodCap, event: &Event) -> bool {
-        let Some((kind, uid)) = FloodKind::of(event) else {
+        let Some(key) = CapKey::of(event) else {
             return true;
         };
-        cap.admit(kind, uid, self.now_ns(), || cap_sample(event))
+        cap.admit(key, self.now_ns(), || cap_sample(event))
     }
 
     /// A flood admitted by the cap that the bus dropped after all.
     fn refund_flood(&self, event: &Event) {
-        if let Some((kind, uid)) = FloodKind::of(event) {
-            self.cap.lock().refund(kind, uid);
+        if let Some(key) = CapKey::of(event) {
+            self.cap.lock().refund(key);
         }
     }
 }
@@ -571,6 +578,7 @@ fn build(specs: [QueueSpec; QUEUES], boot_id: [u8; 16], cap: FloodCap) -> (BusSe
         cap: Mutex::new(cap),
         senders: AtomicUsize::new(1),
         closed: AtomicBool::new(false),
+        refused_closed: AtomicU64::new(0),
         specs,
         epoch: Instant::now(),
         boot_id,
@@ -658,10 +666,36 @@ impl BusSender {
     /// closed channel's send was.
     pub async fn send(&self, event: Event) -> Result<(), SendError> {
         if self.inner.closed.load(Ordering::Acquire) {
+            self.refused(1);
             return Err(SendError);
         }
         let env = self.envelope(event);
-        self.send_envelope(env).await
+        let r = self.send_envelope(env).await;
+        if r.is_err() {
+            self.refused(1);
+        }
+        r
+    }
+
+    /// Review of #474: `n` events the closed bus refused (a batch read and
+    /// not yet sent at the stop), counted for the stop row.
+    fn refused(&self, n: usize) {
+        self.inner
+            .refused_closed
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// The rest of a batch, one by one; at a refusal the events not sent
+    /// are counted.
+    async fn send_rest(&self, rest: Vec<Envelope>) -> Result<(), SendError> {
+        let n = rest.len();
+        for (i, env) in rest.into_iter().enumerate() {
+            if self.send_envelope(env).await.is_err() {
+                self.refused(n - i);
+                return Err(SendError);
+            }
+        }
+        Ok(())
     }
 
     /// R12b (lab PR 269): queue `events` in their order, as [`Self::send`]
@@ -673,10 +707,7 @@ impl BusSender {
     /// that finds no slot on, each is sent as [`Self::send`] sends it.
     pub async fn send_batch(&self, events: Vec<Event>) -> Result<(), SendError> {
         let rest = self.send_ready(events)?;
-        for env in rest {
-            self.send_envelope(env).await?;
-        }
-        Ok(())
+        self.send_rest(rest).await
     }
 
     /// [`Self::send_batch`] from a thread of its own (a pump's): the events
@@ -691,12 +722,7 @@ impl BusSender {
         if rest.is_empty() {
             return Ok(());
         }
-        rt.block_on(async {
-            for env in rest {
-                self.send_envelope(env).await?;
-            }
-            Ok(())
-        })
+        rt.block_on(self.send_rest(rest))
     }
 
     /// The batch's fast path: in order, each event coalesced, capped or
@@ -705,8 +731,22 @@ impl BusSender {
     fn send_ready(&self, events: Vec<Event>) -> Result<Vec<Envelope>, SendError> {
         let inner = &self.inner;
         if inner.closed.load(Ordering::Acquire) {
+            self.refused(events.len());
             return Err(SendError);
         }
+        let n = events.len();
+        let r = self.send_ready_open(events);
+        if let Err(not_sent) = r {
+            self.refused(not_sent.min(n));
+            return Err(SendError);
+        }
+        r.map_err(|_| SendError)
+    }
+
+    /// [`Self::send_ready`] on an open bus; `Err(n)`: it closed meanwhile,
+    /// `n` events not queued.
+    fn send_ready_open(&self, events: Vec<Event>) -> Result<Vec<Envelope>, usize> {
+        let inner = &self.inner;
         let mut envs = events.into_iter().map(|e| self.envelope(e));
         let mut ready: Vec<Ready> = Vec::new();
         let mut rest: Vec<Envelope> = Vec::new();
@@ -740,7 +780,7 @@ impl BusSender {
                 let flood_slot = if floods {
                     match inner.p0_flood_room.try_acquire() {
                         Ok(permit) => Some(permit),
-                        Err(TryAcquireError::Closed) => return Err(SendError),
+                        Err(TryAcquireError::Closed) => return Err(ready.len() + 1 + envs.len()),
                         Err(TryAcquireError::NoPermits) => None,
                     }
                 } else {
@@ -751,7 +791,7 @@ impl BusSender {
                 } else {
                     match inner.room[p.index()].try_acquire() {
                         Ok(permit) => Some(permit),
-                        Err(TryAcquireError::Closed) => return Err(SendError),
+                        Err(TryAcquireError::Closed) => return Err(ready.len() + 1 + envs.len()),
                         Err(TryAcquireError::NoPermits) => None,
                     }
                 };
@@ -764,10 +804,9 @@ impl BusSender {
                     }
                     // no room at once: this one and the rest one by one
                     // (the allowance it took is the slow path's to take)
-                    if let (Some(c), Some((kind, uid))) = (cap.as_mut(), FloodKind::of(&env.event))
-                    {
+                    if let (Some(c), Some(key)) = (cap.as_mut(), CapKey::of(&env.event)) {
                         if floods {
-                            FloodCap::refund(c, kind, uid);
+                            FloodCap::refund(c, key);
                         }
                     }
                     rest.push(env);
@@ -1178,6 +1217,12 @@ pub struct QueueSnapshot {
 }
 
 impl BusStats {
+    /// Review of #474: the events the closed bus refused (a batch read and
+    /// not yet sent at the stop).
+    pub fn refused_at_close(&self) -> u64 {
+        self.0.refused_closed.load(Ordering::Relaxed)
+    }
+
     /// Every queue's counts, P0 first.
     pub fn snapshot(&self) -> Vec<QueueSnapshot> {
         let coalesced = self.0.coalescer.lock().total;
@@ -1245,10 +1290,13 @@ fn when_full_text(p: Priority, w: WhenFull, open_cap: usize) -> String {
     match (p, w) {
         (Priority::P0, WhenFull::Wait { .. }) => format!(
             "{} for FsProtectDenial (repeats within 1 s coalesced); other tamper events wait, \
-             {} slots kept from denials and bpf() calls; denials and bpf() calls past {} per uid \
-             a second ({} for those about the agent's own objects) counted, not queued",
+             {} slots kept from denials and bpf() calls; denials past {} a second per uid, \
+             operation and target, bpf() calls past {} per uid and command ({} for those about \
+             the agent's own objects; program loads, attaches and link creations never) counted, \
+             not queued",
             w.describe(),
             core_bus::P0_RESERVE,
+            core_bus::FLOOD_CAP_PER_UID,
             core_bus::FLOOD_CAP_PER_UID,
             core_bus::FLOOD_CAP_OWN_PER_UID
         ),
@@ -1436,7 +1484,8 @@ impl BusLosses {
     /// written (no audit log).
     pub fn stop(&self, stats: &BusStats, queued: [u64; QUEUES]) -> bool {
         self.flush(stats);
-        if queued.iter().all(|&n| n == 0) {
+        let refused = stats.refused_at_close();
+        if queued.iter().all(|&n| n == 0) && refused == 0 {
             return true;
         }
         warn!(
@@ -1444,9 +1493,11 @@ impl BusLosses {
             p1 = queued[1],
             p2 = queued[2],
             p3 = queued[3],
-            "event bus: the agent stops with events queued — they are not judged"
+            refused_at_close = refused,
+            "event bus: the agent stops with events queued, or read and refused at the close — \
+             they are not judged"
         );
-        sign_stop(&self.audit, queued)
+        sign_stop(&self.audit, queued, refused)
     }
 }
 
@@ -1704,17 +1755,25 @@ fn sign_coalesced(stats: &BusStats, losses: &BusLosses) {
     }
 }
 
-/// R12b, the third review's C3: the floods of P0 counted past their uid's
-/// cap since the last row, signed — per (kind, uid) the count, its first
-/// and last time on the bus's clock, and the processes it names — and the
-/// capped denials counted as NN-L-AT-001's held records (C5). Nothing
+/// R12b, the third review's C3: the floods of P0 counted past their cap
+/// since the last row, signed — every key ([`CapKey`]: kind, uid, target)
+/// with its count, its first and last time on the bus's clock and the
+/// processes it names, in rows of at most [`CAPPED_ROW_KEYS`] keys; the
+/// events queued uncapped because the cap's table was full, counted; the
+/// capped denials counted as NN-L-AT-001's held records, the capped
+/// records about the agent's own objects as NN-L-BPF-002's (C5). Root's
+/// floods capped (or past a full table) raise the posture's
+/// `TelemetryLoss` (review of #474: the cap is itself a signal). Nothing
 /// while no audit log is bound (they wait for the next sample).
 fn sign_capped(stats: &BusStats, losses: &BusLosses) {
     let Some(log) = losses.audit.get() else {
         return;
     };
-    let pending = stats.0.cap.lock().take_pending();
-    if pending.is_empty() {
+    let (pending, (overflow, overflow_root, overflow_total), total) = {
+        let mut cap = stats.0.cap.lock();
+        (cap.take_pending(), cap.take_overflow(), cap.total())
+    };
+    if pending.is_empty() && overflow == 0 {
         return;
     }
     if let Some(held) = losses.held.get() {
@@ -1727,56 +1786,112 @@ fn sign_capped(stats: &BusStats, losses: &BusLosses) {
         }
     }
     let since: u64 = pending.iter().map(|c| c.count).sum();
-    let total = stats.0.cap.lock().total();
+    // the WARN per (kind, uid), the keys summed
+    let mut per_uid: std::collections::BTreeMap<(FloodKind, u32), (u64, usize)> =
+        std::collections::BTreeMap::new();
     for c in &pending {
+        let e = per_uid.entry((c.kind, c.uid)).or_default();
+        e.0 += c.count;
+        e.1 += 1;
+    }
+    for ((kind, uid), (count, keys)) in &per_uid {
         warn!(
-            event = c.kind.name(),
-            uid = c.uid,
-            capped = c.count,
+            event = kind.name(),
+            uid,
+            capped = count,
+            keys,
             cap_per_second = core_bus::FLOOD_CAP_PER_UID,
-            "event bus: a flood of tamper events CAPPED for this uid — counted and signed, not \
-             judged one by one"
+            "event bus: a flood of tamper events CAPPED for this uid — counted and signed per \
+             command or target, not judged one by one"
         );
     }
-    let floods: Vec<serde_json::Value> = pending
-        .iter()
-        .map(|c| {
-            serde_json::json!({
-                "event": c.kind.name(),
-                "uid": c.uid,
-                "capped": c.count,
-                "first_ns": c.first_ns,
-                "last_ns": c.last_ns,
-                "processes": c.samples.iter().map(|s| serde_json::json!({
-                    "pid": s.pid,
-                    "comm": s.comm,
-                    "what": s.what,
-                })).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-    let draft = crate::audit::AuditEntryDraft {
-        op: CAPPED_AUDIT_OP.to_string(),
-        extra: serde_json::json!({
-            "queue": Priority::P0.label(),
-            "cap_per_uid_per_second": core_bus::FLOOD_CAP_PER_UID,
-            "capped_since_last_row": since,
-            "total": total,
-            "floods": floods,
-        }),
-        key_fp: "agent-self".to_string(),
-        cosigner_fps: Vec::new(),
-        result: "detected".to_string(),
-        client_pid: std::process::id(),
-        client_uid: 0,
-        client_comm: "northnarrow-agent".to_string(),
-        client_exe: None,
-    };
-    if let Err(e) = log.lock().append(draft) {
+    if overflow > 0 {
         warn!(
-            error = format!("{e:#}"),
-            "event-bus capped audit entry failed — the counts stay in the status total"
+            queued_uncapped = overflow,
+            keys = core_bus::FLOOD_CAP_KEYS,
+            "event bus: the cap's table was full — new floods of P0 were queued uncapped (judged, \
+             or dropped and signed by the bus when P0 was full)"
         );
+    }
+    let key_json = |c: &core_bus::Capped| {
+        let key = CapKey {
+            kind: c.kind,
+            uid: c.uid,
+            target: c.target,
+        };
+        serde_json::json!({
+            "event": c.kind.name(),
+            "uid": c.uid,
+            "target": key.target_json(),
+            "capped": c.count,
+            "first_ns": c.first_ns,
+            "last_ns": c.last_ns,
+            "processes": c.samples.iter().map(|s| serde_json::json!({
+                "pid": s.pid,
+                "comm": s.comm,
+                "what": s.what,
+            })).collect::<Vec<_>>(),
+        })
+    };
+    let parts: Vec<&[core_bus::Capped]> = if pending.is_empty() {
+        vec![&[]]
+    } else {
+        pending.chunks(CAPPED_ROW_KEYS).collect()
+    };
+    let n = parts.len();
+    for (i, part) in parts.into_iter().enumerate() {
+        let draft = crate::audit::AuditEntryDraft {
+            op: CAPPED_AUDIT_OP.to_string(),
+            extra: serde_json::json!({
+                "queue": Priority::P0.label(),
+                "cap_per_key_per_second": core_bus::FLOOD_CAP_PER_UID,
+                "capped_since_last_row": since,
+                "keys_since_last_row": pending.len(),
+                "part": i + 1,
+                "parts": n,
+                "total": total,
+                "floods": part.iter().map(key_json).collect::<Vec<_>>(),
+                "queued_uncapped_table_full": overflow,
+                "queued_uncapped_table_full_total": overflow_total,
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "detected".to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
+        };
+        if let Err(e) = log.lock().append(draft) {
+            warn!(
+                error = format!("{e:#}"),
+                "event-bus capped audit entry failed — the counts stay in the status total"
+            );
+            break;
+        }
+    }
+    // root's floods held back from their judgement: a posture signal
+    let root: Vec<(String, u64)> = per_uid
+        .iter()
+        .filter(|((_, uid), _)| *uid == 0)
+        .map(|((kind, _), (count, _))| (format!("capped {} of uid 0", kind.name()), *count))
+        .chain(overflow_root.then(|| {
+            (
+                "queued uncapped past a full cap table (uid 0 among them)".to_string(),
+                overflow,
+            )
+        }))
+        .collect();
+    if !root.is_empty() {
+        let what = root
+            .iter()
+            .map(|(n, c)| format!("{n} {c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reason = format!(
+            "event bus: root's floods of tamper events counted, not judged one by one: {what}"
+        );
+        ring_drops::raise_signal_loss(&losses.posture, &what, "event bus cap", &reason);
     }
 }
 
@@ -1818,7 +1933,7 @@ fn sign_drop(audit: &LateAudit, q: &QueueSnapshot, dropped: u64, total: u64) -> 
 }
 
 /// The signed row of the events left queued at the stop.
-fn sign_stop(audit: &LateAudit, queued: [u64; QUEUES]) -> bool {
+fn sign_stop(audit: &LateAudit, queued: [u64; QUEUES], refused: u64) -> bool {
     let Some(log) = audit.get() else {
         return false;
     };
@@ -1830,7 +1945,8 @@ fn sign_stop(audit: &LateAudit, queued: [u64; QUEUES]) -> bool {
         op: STOP_AUDIT_OP.to_string(),
         extra: serde_json::json!({
             "queued_at_stop": per_queue,
-            "total": queued.iter().sum::<u64>(),
+            "refused_at_close": refused,
+            "total": queued.iter().sum::<u64>() + refused,
             "judged": false,
         }),
         key_fp: "agent-self".to_string(),
@@ -2871,13 +2987,18 @@ mod tests {
             let queued = rx.close();
             assert_eq!(queued, [0, 1, 2, 0]);
             assert!(tx.send(denial(3)).await.is_err(), "refused after the stop");
+            // review of #474: a pump's batch read and refused at the close
+            // is counted in the stop row
+            assert!(tx.send_batch(vec![spawn(5), open(6)]).await.is_err());
+            assert_eq!(rx.stats().refused_at_close(), 3);
             assert!(rx.try_recv().is_some(), "close takes nothing itself");
             assert!(losses.stop(&rx.stats(), queued));
             let stop = rows(dir.path(), &path, STOP_AUDIT_OP);
             assert_eq!(stop.len(), 1);
             assert_eq!(stop[0]["queued_at_stop"]["P1"], 1);
             assert_eq!(stop[0]["queued_at_stop"]["P2"], 2);
-            assert_eq!(stop[0]["total"], 3);
+            assert_eq!(stop[0]["refused_at_close"], 3);
+            assert_eq!(stop[0]["total"], 6);
             let drops = rows(dir.path(), &path, AUDIT_OP);
             assert_eq!(
                 drops.len(),
@@ -2885,7 +3006,9 @@ mod tests {
                 "the P2 drops signed at the stop, whatever the window"
             );
             assert_eq!(drops[0]["queue"], "P2");
-            assert!(losses.stop(&rx.stats(), [0; QUEUES]));
+            // nothing queued, nothing refused: no stop row
+            let (_tx2, mut rx2) = channel_with(small(1));
+            assert!(losses.stop(&rx2.stats(), rx2.close()));
             assert_eq!(rows(dir.path(), &path, STOP_AUDIT_OP).len(), 1);
         })
         .await
@@ -3107,8 +3230,16 @@ mod tests {
             assert_eq!(got[0]["floods"][0]["event"], "BpfSyscall");
             assert_eq!(got[0]["floods"][0]["processes"][0]["pid"], 105);
             assert_eq!(
-                got[0]["cap_per_uid_per_second"],
+                got[0]["cap_per_key_per_second"],
                 core_bus::FLOOD_CAP_PER_UID
+            );
+            assert_eq!(
+                got[0]["floods"][0]["target"]["cmd"],
+                common::wire::bpf_cmd_name(0)
+            );
+            assert_eq!(
+                (got[0]["part"].clone(), got[0]["parts"].clone()),
+                (1.into(), 1.into())
             );
             assert!(held.lock().is_empty(), "bpf() calls are no AT-001 records");
             record(&rx.stats(), &losses, Sample::Tick);
@@ -3124,6 +3255,134 @@ mod tests {
                 })
                 .collect();
             assert_eq!(uids, [1000, 1000, 1000, 1000, 1000, 1001]);
+        })
+        .await
+    }
+
+    /// Review of #474: inside a flood the cap holds back, NN-L-BPF-001's
+    /// commands are queued whatever the uid sent before them in the second,
+    /// and a refused operation on another target has its own allowance;
+    /// the signed row lists every key that capped something.
+    #[tokio::test]
+    async fn a_bpf_001_command_is_queued_inside_a_capped_flood() {
+        within(async {
+            use common::bpf_cmd::{BPF_MAP_CREATE, BPF_PROG_LOAD};
+            let dir = tempfile::tempdir().unwrap();
+            let (log, path) = audit_log(dir.path());
+            let (tx, mut rx) = channel_capped(SPECS, 256);
+            let call = |pid: u32, cmd: u32| Event::BpfSyscall {
+                pid,
+                uid: 0,
+                comm: "loader".into(),
+                cmd,
+                arg: 0,
+                timestamp_ns: 0,
+            };
+            let mut batch: Vec<Event> = (0..300).map(|i| call(1_000 + i, BPF_MAP_CREATE)).collect();
+            batch.push(call(5_000, BPF_PROG_LOAD));
+            tx.send_batch(batch).await.unwrap();
+            let denial = |pid: u32, ino: u64| Event::FsProtectDenial {
+                pid,
+                uid: 0,
+                comm: "chmod".into(),
+                target_dev: 1,
+                target_ino: ino,
+                operation: nn_model::FsProtectOperation::Setattr,
+                timestamp_ns: 0,
+            };
+            // new processes (no repeat to coalesce): 300 on one target, one
+            // on another
+            let mut denials: Vec<Event> = (0..300).map(|i| denial(10_000 + i, 2)).collect();
+            denials.push(denial(20_000, 3));
+            tx.send_batch(denials).await.unwrap();
+            let got: Vec<Event> = std::iter::from_fn(|| rx.try_recv())
+                .map(|r| r.envelope.event)
+                .collect();
+            assert!(
+                got.iter().any(|e| matches!(e, Event::BpfSyscall { pid: 5_000, cmd, .. } if *cmd == BPF_PROG_LOAD)),
+                "the program load is queued"
+            );
+            assert!(
+                got.iter().any(|e| matches!(e, Event::FsProtectDenial { pid: 20_000, .. })),
+                "the other target's denial is queued"
+            );
+            assert_eq!(got.len(), 256 + 1 + 256 + 1);
+            let snap = rx.stats().snapshot();
+            assert_eq!(snap[0].capped, 44 + 44);
+            let losses = BusLosses::default();
+            losses.bind_audit_log(Some(log));
+            record(&rx.stats(), &losses, Sample::Tick);
+            let got = rows(dir.path(), &path, CAPPED_AUDIT_OP);
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert_eq!(got[0]["keys_since_last_row"], 2);
+            let floods = got[0]["floods"].as_array().unwrap();
+            assert_eq!(floods.len(), 2, "every key that capped: {floods:?}");
+            assert!(floods.iter().all(|f| f["capped"] == 44 && f["uid"] == 0));
+            assert!(floods
+                .iter()
+                .any(|f| f["target"]["cmd"] == common::wire::bpf_cmd_name(BPF_MAP_CREATE)));
+            assert!(floods.iter().any(|f| f["target"]["target_ino"] == 2));
+        })
+        .await
+    }
+
+    /// Review of #474: root's floods capped raise the posture's
+    /// `TelemetryLoss` (ALERTED) at the sample; another uid's do not.
+    #[tokio::test]
+    async fn a_capped_flood_of_root_raises_the_posture() {
+        within(async {
+            for (uid, raised) in [(1000u32, false), (0, true)] {
+                let dir = tempfile::tempdir().unwrap();
+                let (log, _) = audit_log(dir.path());
+                let (tx, rx) = channel_capped(SPECS, 2);
+                for pid in 0..5u32 {
+                    tx.send(bpf(100 + pid, uid)).await.unwrap();
+                }
+                let posture = crate::posture::PostureMachine::new();
+                let losses = BusLosses::default();
+                losses.bind_audit_log(Some(log));
+                losses.bind_posture(posture.clone(), None);
+                record(&rx.stats(), &losses, Sample::Tick);
+                let kind = posture.current_kind();
+                assert_eq!(
+                    kind == nn_model::posture_types::PostureKind::Alerted,
+                    raised,
+                    "uid {uid}: {kind:?}"
+                );
+            }
+        })
+        .await
+    }
+
+    /// Review of #474 (its mutation K3): an event the batch's fast path
+    /// admitted under the cap and then handed to the slow path (no room at
+    /// once) gives its place back — the slow path admits it again, so the
+    /// cap is not counted twice: a uid's allowance still lets its whole
+    /// allowance through.
+    #[tokio::test]
+    async fn a_batch_handed_to_the_slow_path_is_not_capped_twice() {
+        within(async {
+            let (tx, mut rx) = channel_capped(small(5_000), 3);
+            // P0's flood slots taken by uid 1
+            tx.send(bpf(1, 1)).await.unwrap();
+            tx.send(bpf(2, 1)).await.unwrap();
+            let sender = tx.clone();
+            let batch = tokio::spawn(async move {
+                sender
+                    .send_batch((0..3).map(|i| bpf(10 + i, 2)).collect())
+                    .await
+            });
+            let mut pids = Vec::new();
+            while pids.len() < 5 {
+                let r = rx.recv().await.expect("the bus is open");
+                match r.envelope.event {
+                    Event::BpfSyscall { pid, .. } => pids.push(pid),
+                    e => panic!("{e:?}"),
+                }
+            }
+            batch.await.unwrap().unwrap();
+            assert_eq!(pids, [1, 2, 10, 11, 12], "uid 2's three, none capped");
+            assert_eq!(rx.stats().snapshot()[0].capped, 0);
         })
         .await
     }
