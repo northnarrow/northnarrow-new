@@ -3815,3 +3815,36 @@ only in the table below, in the same PR as the evidence.
     the self-integrity check's window for a freeze that starts right after
     a round (C15 on the first tip).
   - R12b-2 — lab: the same guests and method, `main` 28ecf720 (#474's runs), the first tip bc480855 and the final tip 8c3c253b (it holds R12b-1's final; the branch's later commits are documents and two privileged tests, below). EXP-13e ×3: `fs_protect` ring drops `main` 575, 865, 3,176 (mean 1,539), the first tip 0, 0, 21 (mean 7, max 21), the final tip 0, 0, 0, the agent's CPU ~12.5 s against 36.7 s, every refused attempt accounted, NET-001 6/6 in every run. EXP-13, 13c ×3 and 13d: the first tip lost 297, 249 and 189 in the bursts (R12b-1's ring finding), the final tip 0 in each of its 7 runs; the FIM ring dropped 2,249 and 6,311 records in two 13c runs of the tips (none in `main`'s three; R12a's lab saw 1,575 and 439 on this `main` code). EXP-13b (`debug-stall-loop` stalls the decision thread 4 s): the first record 4.00 s late, stage 5 counting it, 1 record + 2,999 held, nothing dropped. Overhead (the first tip): open +31.6 %, wopen +30.6 %, exec +6.1 %, connect +18.0 %, udp +15.8 %, dns +14.4 % (`main` +27.8, +31.1, +4.6, +40.4, +15.3, +13.0) — and 256 `tcp_close` records dropped by the network drain during the connect workload (not on `main` or R12b-1). Soak on ubuntu2204 (a fresh install, the same 0.78 h load as R12b-1's pair): RSS 31.8 → 57.4 MB, threads 23 → 23 (the runtime's 8 throughout; `main` 9 → 22), no restart, no ring or bus drop, P0 1,810 queued and none capped, stage 5 late only the boot's backlog (P3 none, max 238 ms), 2,917 WARN/ERROR lines (one ERROR: the lab's admin key). `test-ignored`: the first tip and the final code 95 passed, 0 failed on ubuntu2404 and one failure on ubuntu2204 — the process canary's decoy (a copy of `/bin/true`) killed by NN-L-CANARY-002's response before it returned 0, a race the decision on its own thread now wins on 5.15 (R12b-1's runs found it `AlreadyGone`); with that test made deterministic the next run failed the /tmp dropper's test the same way (R001's kill before its child wrote its pid); with both tests fixed (1277ec24) 95 passed, 0 failed on ubuntu2204 and 95 passed, 0 failed on ubuntu2404, the 52 chain checks `ok` in every run. `tamper-check` (the final code): its 75 outcomes and verdicts those of `main`, case by case; the first tip's run missed C15's stall report (a 45-s freeze that began right after a self-integrity round: the check's window, Open). The `fs_protect` ring read back 262,144 bytes on both guests. posture_demo identical to `main`'s (29 lines). Host gates on 8c3c253b: build-ebpf, clippy ×4, fmt, 75 suites 3,303 passed 0 failed 17 ignored, the privileged no-run, attack-coverage, `golden` ×5 (54 files the same bytes), MSRV, fuzz (13), portable-core (5), lockfiles unchanged; clippy (privileged tests) and fmt again on 1277ec24 (the two e2e tests). Mutations: 18 of 18 on the final code (the resolve in the pumps, the systemd snapshot and its watch, the decision loop's teaching, delay and answered signals, the canary writer, the provenance cache, R-F's rules, the ratchet) and R-F's own 11 of 11; survivors along the way (B5 on the first watch, B17) have their tests.
+  - Independent review of #475 ("merge after X"), fixed in the lot: R-F's
+    exception read `/proc` in a judgement for a process older than the
+    agent, which shows the image it runs now (a canary read, then a backup
+    tool's exec, the read judged as the tool's): the agent's start enters
+    every running process into the lineage once the exec sensors are
+    attached (`seed_from_proc`) and no judgement reads a process's image
+    from `/proc` (the posture replay seeds its host the same way: no golden
+    change); `predates_observer`'s same-tick boundary is tested (K5); the
+    guard's list includes the responses' code (the reviewer's K9, an I/O
+    planted in the executor, now fails it), and `EVENT_BUS.md` §2d lists
+    exactly what is still I/O on the decision thread — the responses
+    (R12c), the ransomware tracker's sampler on a burst, the per-rule
+    policy's exemption facts, a canary trip's reader, the security-tool
+    detector's registration, a process's start in a judgement; a full
+    canary writer's queue holds a trip at most 100 ms, then its rows are
+    counted; the dropper e2e test stands the decision thread still while
+    the dropper starts, so its child always exists before the verdict, and
+    finds a survivor whose image was deleted.
+  - R12b-2 — lab after the review (round g, ubuntu2404 and ubuntu2204,
+    clean installs; the host ran the mutation suites through it): the
+    final code e75d6205 — EXP-13c ×5 0 `fs_protect` and 0 FIM drops in
+    each (the decision thread ~33 s, `nn-fim_drain` ~11.5 s of the flood's
+    CPU), EXP-13e 0, 0, 0 (12.2–12.7 s of CPU), EXP-13 0, 0, 0, EXP-13d no
+    drop (707,931 capped, 11.5 s), EXP-13b (the decision thread stalled
+    4 s) 1 + 2,999 held, the first record 4.00 s late; the C3 check 6 of 6
+    program loads judged; `test-ignored` 80 suites, 95 passed, 0 failed on
+    each guest (the dropper test with the decision thread stalled, the
+    canary test with the kill asserted); `tamper-check` the 75 outcomes of
+    `main`, case by case, C15 reporting the freeze; the ring read back at
+    262,144 bytes on both. Gates on 8144429a (the code of 1ef530c0): build-ebpf, clippy ×4 `-D warnings`, fmt, 75 suites 3,310 passed 0 failed 17 ignored, the privileged no-run, attack-coverage, `golden` ×5 (54 files the same bytes), MSRV 1.89, the fuzz replay (13 targets), portable-core (5 targets), lockfiles unchanged. Mutations on the
+    final code: 22 of 23 caught (the reviewer's K5 and K9 among them; BN2,
+    the scan's first check of a pid already held, is an equivalent mutant:
+    the same check is made again before the ingest).
