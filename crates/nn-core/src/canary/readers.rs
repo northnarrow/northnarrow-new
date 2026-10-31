@@ -254,4 +254,47 @@ mod tests {
         let r = CanaryReaders::load(&content("# the nightly backup\n+tar\n"), t);
         assert!(r.extra.contains("tar"));
     }
+
+    /// Review of #475: an anti-malware daemon running since before the
+    /// agent (the start's scan entered it) is still a reader in a
+    /// judgement after 2,100 execs of other processes — the cache keeps a
+    /// live process's entry, so CANARY-001's reader exemption holds and
+    /// the daemon is not killed at its first read of a canary.
+    #[test]
+    fn a_daemon_older_than_the_agent_stays_a_reader_after_2100_other_execs() {
+        use crate::posture::lineage::AsOf;
+        const S: u64 = 1_000_000_000;
+        let (dir, t) = tracker();
+        let d = dir.path().join("500");
+        std::fs::create_dir_all(&d).unwrap();
+        crate::posture::host::testing::symlink("/usr/sbin/clamd", d.join("exe")).unwrap();
+        std::fs::write(
+            d.join("status"),
+            "Name:\tclamd\nPid:\t500\nPPid:\t1\nUid:\t0\t0\t0\t0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("stat"),
+            "500 (clamd) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n",
+        )
+        .unwrap();
+        assert_eq!(t.seed_from_proc(), 1);
+        for i in 0..2_100u64 {
+            t.ingest_exec(
+                10_000 + i as u32,
+                1,
+                "/usr/bin/true",
+                &[],
+                (10 + i) * S,
+                (10 + i) * S,
+                0,
+            );
+        }
+        t.sweep();
+        let r = CanaryReaders::new(BTreeSet::new(), t);
+        assert_eq!(
+            r.reader(500, AsOf::Judged(3_000 * S)).as_deref(),
+            Some("/usr/sbin/clamd")
+        );
+    }
 }

@@ -35,6 +35,15 @@
 
 #![cfg(feature = "test-privileged")]
 
+// The re-review of #475: the dropper test stands the decision thread still
+// (`debug-stall-loop`) — a privileged build without `debug-trigger` would
+// drop it silently; the lab, the gates and CI build both.
+#[cfg(not(feature = "debug-trigger"))]
+compile_error!(
+    "response_privileged_e2e needs `debug-trigger` with `test-privileged` (the /tmp dropper \
+     test stands the decision thread still)"
+);
+
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};

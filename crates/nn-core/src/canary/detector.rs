@@ -382,6 +382,11 @@ pub struct Detector<H: CanaryHost> {
     /// all ([`Self::unwritten`]); the trip event goes out all the same.
     unwritten: Mutex<std::collections::BTreeMap<String, u64>>,
     unwritten_total: std::sync::atomic::AtomicU64,
+    /// The re-review of #475: the writer's queue stayed full past a trip's
+    /// wait — later trips are counted at once, without waiting, until a
+    /// trip finds room again (a stuck writer costs the decision one wait,
+    /// not one per trip).
+    writer_stuck: std::sync::atomic::AtomicBool,
 }
 
 /// Review of #475: how long a trip waits for room in the writer's full
@@ -418,6 +423,7 @@ impl<H: CanaryHost> Detector<H> {
             queued: std::sync::atomic::AtomicUsize::new(0),
             unwritten: Mutex::new(std::collections::BTreeMap::new()),
             unwritten_total: std::sync::atomic::AtomicU64::new(0),
+            writer_stuck: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -445,10 +451,18 @@ impl<H: CanaryHost> Detector<H> {
         let mut job = job;
         loop {
             match queue.try_send(job) {
-                Ok(()) => return Ok(true),
+                Ok(()) => {
+                    self.writer_stuck
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return Ok(true);
+                }
                 Err(TrySendError::Disconnected(j)) => return Err(j),
                 Err(TrySendError::Full(j)) => {
-                    if started.elapsed() >= CANARY_QUEUE_WAIT {
+                    if self.writer_stuck.load(std::sync::atomic::Ordering::Acquire)
+                        || started.elapsed() >= CANARY_QUEUE_WAIT
+                    {
+                        self.writer_stuck
+                            .store(true, std::sync::atomic::Ordering::Release);
                         let id = j.draft.canary_id.clone();
                         let mut un = self.unwritten.lock();
                         if un.len() < UNWRITTEN_KEYS || un.contains_key(&id) {

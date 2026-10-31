@@ -307,14 +307,50 @@ pub const NODE_EXES: &[&str] = &["/usr/bin/node", "/usr/local/bin/node"];
 /// sole basis for the exemption.
 const NPM_CLI_SUFFIX: &str = "/npm/bin/npm-cli.js";
 
-/// Bounded FIFO cap for the in-memory pid→Entry map. At ~64 bytes
-/// per entry (pid + ppid + spawn_ns + short PathBuf) the cap is
-/// ~128 KiB worst case — comfortably inside the agent's per-task
-/// RAM ceiling, sized to cover the long tail of long-lived sudo
-/// sessions on a busy workstation. Overflow falls back to the
-/// `/proc/<pid>/exe`+`/proc/<pid>/status` walk so a miss is never
-/// fatal — just one extra `read_link` + small file read.
+/// The pid→Entry map's size past which the entries of processes that
+/// have exited (and whose [`EXIT_GRACE`] has passed) are dropped, oldest
+/// first. Review of #475: the map was a FIFO of this size, so 2,048 execs
+/// of other processes pushed out a live daemon's entry (a `clamd` the
+/// start's scan entered), and under R-F a judgement of it read "not
+/// known" — CANARY-001's reader exemption lost, the daemon killed. A live
+/// process's entry is never dropped for this size; the map grows past it
+/// up to [`TRACKER_HARD_CAP`].
 const TRACKER_CAP: usize = 2048;
+
+/// Review of #475: the most entries the map holds, live processes
+/// included. Past it the oldest entry goes whatever its process does —
+/// counted ([`AuthSessionTracker::evicted_live`]) and WARNed by the sweep;
+/// a host runs far fewer processes that executed something.
+const TRACKER_HARD_CAP: usize = 32_768;
+
+/// Review of #475: how long the entry of a process the sweep found gone
+/// is kept before it may be dropped — its last events, still on the bus
+/// or being judged, are judged on it.
+const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The map's bounds ([`TRACKER_CAP`], [`TRACKER_HARD_CAP`], [`EXIT_GRACE`]);
+/// tests make them small.
+#[derive(Debug, Clone, Copy)]
+struct Bounds {
+    soft: usize,
+    hard: usize,
+    grace: std::time::Duration,
+}
+
+/// Review of #475: what one [`AuthSessionTracker::sweep`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Cached processes found gone (or their pid naming another process).
+    pub gone: usize,
+    /// Running processes entered as forks of a cached parent whose image
+    /// they still run.
+    pub forks: usize,
+    /// Entries the map holds after it.
+    pub entries: usize,
+    /// Entries of processes not known to have exited that were dropped at
+    /// [`TRACKER_HARD_CAP`] since the start.
+    pub evicted_live: u64,
+}
 
 /// Side cache for spawns whose exe is a [`SYSTEM_DAEMON_EXES`] entry.
 /// A large package transaction spawns thousands of maintainer-script
@@ -685,6 +721,14 @@ struct InnerState {
     /// an event judged after a later exec of its process ran at its time
     /// ([`AsOf`]). Dropped with the pid's entry.
     history: HashMap<u32, Vec<Entry>>,
+    /// Review of #475: the cached processes the sweep found gone, and when,
+    /// in that order — the entries that may be dropped once past
+    /// [`TRACKER_CAP`] and their grace.
+    exited: HashMap<u32, std::time::Instant>,
+    exited_order: VecDeque<u32>,
+    /// Entries dropped at [`TRACKER_HARD_CAP`] whose process was not known
+    /// to have exited.
+    evicted_live: u64,
 }
 
 /// Lab PR 267 (review #471 A1): earlier execs kept per pid (a wrapper's
@@ -818,6 +862,8 @@ struct Inner {
     /// `CLOCK_MONOTONIC`) instead of the clocks'.
     #[cfg(test)]
     suspended_ns: Option<u64>,
+    /// The map's bounds (review of #475).
+    bounds: Bounds,
     /// Lab PR 175: the host's `/` for `/etc/passwd`, `/etc/subuid` and the
     /// owners of container storage directories; a fixture tree in tests.
     host_root: PathBuf,
@@ -853,12 +899,20 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     daemon_order: VecDeque::new(),
                     seen_running: HashMap::new(),
                     history: HashMap::new(),
+                    exited: HashMap::new(),
+                    exited_order: VecDeque::new(),
+                    evicted_live: 0,
                 }),
                 proc_root,
                 live,
                 observer_start: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 suspended_ns: None,
+                bounds: Bounds {
+                    soft: TRACKER_CAP,
+                    hard: TRACKER_HARD_CAP,
+                    grace: EXIT_GRACE,
+                },
                 host_root: PathBuf::from(H::HOST_ROOT),
             }),
             host: PhantomData,
@@ -896,6 +950,15 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         let mut t = Self::build(proc_root.to_path_buf(), true);
         Arc::get_mut(&mut t.inner).unwrap().suspended_ns = Some(suspended_ns);
         t
+    }
+
+    /// Tests: the map's bounds made small (review of #475).
+    #[cfg(test)]
+    fn with_bounds(mut self, soft: usize, hard: usize, grace: std::time::Duration) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("an unshared tracker")
+            .bounds = Bounds { soft, hard, grace };
+        self
     }
 
     /// Record a `ProcessSpawn` observation. Overwrites any prior
@@ -1109,6 +1172,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         }
         // NN-AUD-284: whatever ran under this pid before is over.
         s.seen_running.remove(&pid);
+        // review of #475: an exec of the pid — a process that runs (its
+        // old entry, if the sweep had found it gone, is history now)
+        s.exited.remove(&pid);
         // Review 49: package-manager spawns also go to the side cache;
         // any other spawn reusing the pid invalidates a stale copy there.
         if is_system_daemon_binary(&entry.exe) {
@@ -1126,20 +1192,196 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         let had_prior = s.map.insert(pid, entry).is_some();
         if !had_prior {
             s.order.push_back(pid);
-            while s.order.len() > TRACKER_CAP {
-                if let Some(evict) = s.order.pop_front() {
-                    // Possible-stale guard: only remove if the
-                    // map still maps this pid to ANY entry. (A
-                    // future PID-reuse handler could promote on
-                    // overwrite; today we simply evict whatever
-                    // is there, and the `/proc` fallback covers
-                    // the rare case where the evicted entry was
-                    // freshly overwritten.)
-                    s.map.remove(&evict);
-                    s.history.remove(&evict);
+            self.make_room(&mut s);
+        }
+    }
+
+    /// Review of #475: past [`TRACKER_CAP`], drop the entries of processes
+    /// the sweep found gone, the longest gone first, once past their grace;
+    /// a live process's entry stays. Past [`TRACKER_HARD_CAP`] the oldest
+    /// entry goes whatever its process does, counted.
+    fn make_room(&self, s: &mut InnerState) {
+        let b = self.inner.bounds;
+        while s.map.len() > b.soft {
+            let Some(&front) = s.exited_order.front() else {
+                break;
+            };
+            match s.exited.get(&front) {
+                // gone, and past its grace: dropped
+                Some(at) if at.elapsed() >= b.grace => {
+                    s.exited_order.pop_front();
+                    s.exited.remove(&front);
+                    s.map.remove(&front);
+                    s.history.remove(&front);
+                }
+                // the oldest gone is still in its grace: so are the rest
+                Some(_) => break,
+                // a mark an exec of the pid since cleared
+                None => {
+                    s.exited_order.pop_front();
                 }
             }
         }
+        while s.map.len() > b.hard {
+            let Some(evict) = s.order.pop_front() else {
+                break;
+            };
+            if s.map.remove(&evict).is_some() {
+                s.history.remove(&evict);
+                if s.exited.remove(&evict).is_none() {
+                    s.evicted_live += 1;
+                }
+            }
+        }
+        // the insertion order keeps no pid the map dropped for long
+        if s.order.len() > 2 * s.map.len() + 1024 {
+            let map = &s.map;
+            s.order.retain(|p| map.contains_key(p));
+        }
+    }
+
+    /// Review of #475: the entries of processes not known to have exited
+    /// that [`TRACKER_HARD_CAP`] dropped since the start.
+    pub fn evicted_live(&self) -> u64 {
+        self.inner.state.read().evicted_live
+    }
+
+    /// Review of #475, off the decision thread (a task of the agent's,
+    /// every few seconds): every cached process is checked against `/proc`
+    /// — gone, or its pid now naming another process (its start), it is
+    /// marked: its entry may be dropped once the map is past
+    /// [`TRACKER_CAP`] and its [`EXIT_GRACE`] has passed. And every running
+    /// process the cache does not hold that is a fork of a cached process
+    /// still running the image that process ran when it forked
+    /// ([`Self::fork_entry`]: its parent and start from `/proc/<pid>/stat`,
+    /// which no exec changes, and `/proc/<pid>/exe` the same file) is
+    /// entered as that image since its start — a prefork worker, a
+    /// subshell, a daemon's child after its parent exited. A process that
+    /// executed something else is never entered here (its exec event is).
+    pub fn sweep(&self) -> SweepReport {
+        let cached: Vec<(u32, u64)> = {
+            let s = self.inner.state.read();
+            s.map
+                .iter()
+                .filter(|(pid, _)| !s.exited.contains_key(pid))
+                .map(|(pid, e)| (*pid, e.start_ns))
+                .collect()
+        };
+        let gone: Vec<u32> = cached
+            .into_iter()
+            .filter(|(pid, start)| match self.proc_start_ticks(*pid) {
+                None => true,
+                Some(ticks) => *start != 0 && !self.ticks_show_start(ticks, *start),
+            })
+            .map(|(pid, _)| pid)
+            .collect();
+        let now = std::time::Instant::now();
+        {
+            let mut s = self.inner.state.write();
+            for pid in &gone {
+                if s.map.contains_key(pid) && s.exited.insert(*pid, now).is_none() {
+                    s.exited_order.push_back(*pid);
+                }
+            }
+            self.make_room(&mut s);
+        }
+        let mut forks = 0;
+        if let Ok(dir) = H::read_dir(&self.inner.proc_root) {
+            for entry in dir.flatten() {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                if pid == 0 || self.holds(pid) {
+                    continue;
+                }
+                let Some(e) = self.fork_entry(pid, None, 0) else {
+                    continue;
+                };
+                if self.holds(pid) {
+                    continue;
+                }
+                self.ingest_inner(
+                    pid,
+                    e.ppid,
+                    &e.exe.to_string_lossy(),
+                    e.argv_npm_cli,
+                    e.script,
+                    e.spawn_ns,
+                    e.start_ns,
+                    e.uid,
+                );
+                forks += 1;
+            }
+        }
+        let s = self.inner.state.read();
+        SweepReport {
+            gone: gone.len(),
+            forks,
+            entries: s.map.len(),
+            evicted_live: s.evicted_live,
+        }
+    }
+
+    /// Review of #475: `pid`, which the cache does not hold, as a fork of
+    /// its parent — its parent and start from `/proc/<pid>/stat` (an exec
+    /// changes neither), its parent's image as of that start (cached, or
+    /// itself such a fork, at most [`LINEAGE_DEPTH_CAP`] up), accepted only
+    /// when `/proc/<pid>/exe` is that very file (a different one, or a
+    /// deleted one: it executed something since, not known). `at`: the
+    /// event's time — a process that started after it is not the one the
+    /// pid named then. Never the image `/proc` shows instead of the
+    /// parent's: an exec the cache has not read leaves the pid not known.
+    fn fork_entry(&self, pid: u32, at: Option<u64>, depth: usize) -> Option<Entry> {
+        if pid <= 1 || depth > LINEAGE_DEPTH_CAP {
+            return None;
+        }
+        let (ppid, ticks) = self.proc_parent_and_start(pid)?;
+        if ppid == 0 || ppid == pid {
+            return None;
+        }
+        let tick = H::clock_tick_ns();
+        let start_ns = ticks
+            .saturating_mul(tick)
+            .saturating_sub(self.suspended_ns())
+            .max(1);
+        if at.is_some_and(|t| start_ns.saturating_sub(2 * tick) > t) {
+            return None;
+        }
+        let parent = match self.cached_at(ppid, Some(start_ns)) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e,
+            CachedAt::LaterOnly => return None,
+            CachedAt::Absent => self.fork_entry(ppid, Some(start_ns), depth + 1)?,
+        };
+        let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
+        if exe != parent.exe {
+            return None;
+        }
+        let uid = H::read_to_string(self.inner.proc_root.join(pid.to_string()).join("status"))
+            .ok()
+            .and_then(|t| parse_real_uid(&t))
+            .unwrap_or(parent.uid);
+        Some(Entry {
+            ppid,
+            exe: parent.exe,
+            spawn_ns: start_ns,
+            start_ns,
+            argv_npm_cli: parent.argv_npm_cli,
+            script: parent.script,
+            uid,
+        })
+    }
+
+    /// `/proc/<pid>/stat`'s parent (field 4) and start (field 22), counted
+    /// after the `(comm)` field.
+    fn proc_parent_and_start(&self, pid: u32) -> Option<(u32, u64)> {
+        let stat =
+            H::read_to_string(self.inner.proc_root.join(pid.to_string()).join("stat")).ok()?;
+        let rest: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        Some((rest.get(1)?.parse().ok()?, rest.get(19)?.parse().ok()?))
     }
 
     /// What the spawn cache knows `pid` ran at `at` ([`CachedAt`]): its
@@ -1868,6 +2110,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             CachedAt::Current(e) => (Some(e), false),
             CachedAt::Past(e) => (Some(e), true),
             CachedAt::LaterOnly => return None,
+            // review of #475: in a judgement, a fork of a cached process
+            // still running its image ([`Self::fork_entry`])
+            CachedAt::Absent if as_of.is_judged() => (self.fork_entry(pid, as_of.time(), 0), true),
             CachedAt::Absent => (None, false),
         };
         if let Some(e) = cached {
@@ -2154,7 +2399,14 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 });
             }
             CachedAt::LaterOnly => return None,
-            CachedAt::Absent if !self.judged_from_proc(pid, as_of) => return None,
+            CachedAt::Absent if !self.judged_from_proc(pid, as_of) => {
+                // review of #475: a fork of a cached process still running
+                // its image ([`Self::fork_entry`]), else not known
+                return self.fork_entry(pid, as_of.time(), 0).map(|e| ExecIdentity {
+                    exe: e.exe,
+                    script: e.script.as_deref().map(str::to_string),
+                });
+            }
             CachedAt::Absent => {}
         }
         let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
@@ -2194,7 +2446,11 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 return Some(e.exe.to_string_lossy().into_owned())
             }
             CachedAt::LaterOnly => return None,
-            CachedAt::Absent if !self.judged_from_proc(pid, as_of) => return None,
+            CachedAt::Absent if !self.judged_from_proc(pid, as_of) => {
+                return self
+                    .fork_entry(pid, as_of.time(), 0)
+                    .map(|e| e.exe.to_string_lossy().into_owned());
+            }
             CachedAt::Absent => {}
         }
         let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
@@ -3619,17 +3875,198 @@ mod tests {
         assert!(!t.is_auth_mediated(123, AsOf::Now));
     }
 
-    // ── Test #14: bounded FIFO eviction on cap overflow ─────────────
+    // ── Test #14 (review of #475): the map's bounds by process lifetime ──
+    /// Past the soft bound only the entries of processes the sweep found
+    /// gone are dropped (after their grace), never a live process's for
+    /// newer ones; past the hard bound the oldest goes, counted.
     #[test]
-    fn ingest_overwrites_lru_when_cap_exceeded() {
-        let t = AuthSessionTracker::new("/proc");
-        // Fill past TRACKER_CAP with distinct pids.
-        for pid in 1..=(TRACKER_CAP as u32 + 5) {
-            t.ingest_spawn(pid, 1, "/usr/bin/cat", pid as u64);
+    fn the_map_drops_gone_processes_never_a_live_one_for_newer_ones() {
+        let proc = TempDir::new().unwrap();
+        write_exe(proc.path(), 500, "/usr/sbin/clamd");
+        write_status(proc.path(), 500, 1);
+        write_started(proc.path(), "500", 1, 100);
+        let t =
+            AuthSessionTracker::new(proc.path()).with_bounds(64, 1024, std::time::Duration::ZERO);
+        assert_eq!(t.seed_from_proc(), 1);
+        // 300 other processes execute and exit (no /proc entry)
+        for i in 0..300u64 {
+            t.ingest_exec(
+                10_000 + i as u32,
+                1,
+                "/usr/bin/true",
+                &[],
+                (10 + i) * S,
+                (10 + i) * S,
+                0,
+            );
         }
-        // Map must not exceed the cap.
-        assert!(t.entry_count() <= TRACKER_CAP);
-        assert!(t.entry_count() >= TRACKER_CAP - 5);
+        assert_eq!(t.entry_count(), 301, "nothing known gone yet: all kept");
+        let report = t.sweep();
+        assert_eq!(report.gone, 300);
+        assert_eq!(
+            report.entries, 64,
+            "the gone ones dropped to the soft bound"
+        );
+        assert_eq!(report.evicted_live, 0);
+        assert_eq!(
+            t.exec_identity(500, AsOf::Judged(400 * S)).map(|i| i.exe),
+            Some(PathBuf::from("/usr/sbin/clamd")),
+            "the live daemon stays known"
+        );
+        // the hard bound: the oldest entry goes, live or not, counted
+        let hard =
+            AuthSessionTracker::new(proc.path()).with_bounds(4, 8, std::time::Duration::ZERO);
+        for pid in 1..=10u32 {
+            hard.ingest_spawn(pid + 100, 1, "/usr/bin/cat", u64::from(pid));
+        }
+        assert_eq!(hard.entry_count(), 8);
+        assert_eq!(hard.evicted_live(), 2);
+        // a grace not passed keeps a gone process's entry
+        let graced = AuthSessionTracker::new(proc.path()).with_bounds(
+            1,
+            1024,
+            std::time::Duration::from_secs(3600),
+        );
+        for pid in 1..=5u32 {
+            graced.ingest_spawn(pid + 200, 1, "/usr/bin/cat", u64::from(pid));
+        }
+        assert_eq!(graced.sweep().entries, 5, "gone, still in their grace");
+    }
+
+    /// Review of #475: the reviewer's case at the agent's own bounds — a
+    /// daemon the start's scan entered stays known after 2,100 execs of
+    /// other processes (and a sweep that found them gone, in their grace).
+    #[test]
+    fn a_seeded_daemon_stays_known_after_2100_other_execs() {
+        let proc = TempDir::new().unwrap();
+        write_exe(proc.path(), 500, "/usr/sbin/clamd");
+        write_status(proc.path(), 500, 1);
+        write_started(proc.path(), "500", 1, 100);
+        let t = AuthSessionTracker::new(proc.path());
+        assert_eq!(t.seed_from_proc(), 1);
+        for i in 0..2_100u64 {
+            t.ingest_exec(
+                10_000 + i as u32,
+                1,
+                "/usr/bin/true",
+                &[],
+                (10 + i) * S,
+                (10 + i) * S,
+                0,
+            );
+        }
+        let report = t.sweep();
+        assert_eq!(report.gone, 2_100);
+        assert_eq!(
+            t.exec_identity(500, AsOf::Judged(3_000 * S)).map(|i| i.exe),
+            Some(PathBuf::from("/usr/sbin/clamd"))
+        );
+    }
+
+    /// Review of #475: in a judgement, a fork that never executed (a
+    /// maintainer script's subshell) is its parent's image as of its start
+    /// when `/proc/<pid>/exe` is still that file — the package carve-out
+    /// reaches dpkg; one that executed something else since, or an event
+    /// before its start, is not known.
+    #[test]
+    fn a_fork_runs_its_parent_s_image_only_while_proc_says_so() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        // dpkg, root, runs a maintainer script (dash)
+        t.ingest_exec(600, 1, "/usr/bin/dpkg", &[], 10 * S, 10 * S, 0);
+        write_exe(proc.path(), 600, "/usr/bin/dpkg");
+        write_status(proc.path(), 600, 1);
+        write_started(proc.path(), "600", 1, 1_000);
+        let script = [
+            "sh".to_string(),
+            "/var/lib/dpkg/info/x.postinst".to_string(),
+        ];
+        t.ingest_exec(601, 600, "/usr/bin/dash", &script, 11 * S, 11 * S, 0);
+        write_exe(proc.path(), 601, "/usr/bin/dash");
+        write_status(proc.path(), 601, 600);
+        write_started(proc.path(), "601", 600, 1_100);
+        // its subshell: forked at 12 s, never executed
+        write_exe(proc.path(), 602, "/usr/bin/dash");
+        write_status(proc.path(), 602, 601);
+        write_started(proc.path(), "602", 601, 1_200);
+        let judged = AsOf::Judged(13 * S);
+        assert_eq!(
+            t.exec_identity(602, judged).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/dash"))
+        );
+        assert!(
+            t.in_package_transaction(602, judged),
+            "the subshell's write is dpkg's transaction"
+        );
+        // a fork that executed `restic` since: not known
+        write_exe(proc.path(), 603, "/usr/bin/restic");
+        write_status(proc.path(), 603, 601);
+        write_started(proc.path(), "603", 601, 1_250);
+        assert_eq!(t.exec_identity(603, judged), None);
+        assert_eq!(t.image_path_as(603, judged), None);
+        assert!(!t.in_package_transaction(603, judged));
+        // an event before the fork's start was another process's
+        assert_eq!(t.exec_identity(602, AsOf::Judged(11 * S + S / 2)), None);
+        // the sweep enters the fork (not the one that executed restic)
+        let report = t.sweep();
+        assert_eq!(report.forks, 1);
+        assert!(t.holds(602) && !t.holds(603));
+    }
+
+    /// Review of #475: a session older than the agent (sshd and its shell,
+    /// entered by the start's scan) still makes its processes auth-mediated
+    /// after 2,100 other execs — an exec'd command and a forked subshell;
+    /// a cron worker forked without an exec is a credential reader, and a
+    /// forked worker of a service daemon has its image.
+    #[test]
+    fn a_session_s_processes_stay_mediated_and_a_worker_known() {
+        let proc = TempDir::new().unwrap();
+        write_exe(proc.path(), 700, "/usr/sbin/sshd");
+        write_status(proc.path(), 700, 1);
+        write_started(proc.path(), "700", 1, 100);
+        write_exe(proc.path(), 701, "/usr/bin/bash");
+        write_status(proc.path(), 701, 700);
+        write_started(proc.path(), "701", 700, 110);
+        write_exe(proc.path(), 800, "/usr/sbin/cron");
+        write_status(proc.path(), 800, 1);
+        write_started(proc.path(), "800", 1, 120);
+        write_exe(proc.path(), 900, "/usr/sbin/postgres");
+        write_status(proc.path(), 900, 1);
+        write_started(proc.path(), "900", 1, 130);
+        let t = AuthSessionTracker::new(proc.path());
+        assert_eq!(t.seed_from_proc(), 4);
+        for i in 0..2_100u64 {
+            t.ingest_exec(
+                10_000 + i as u32,
+                1,
+                "/usr/bin/true",
+                &[],
+                (10 + i) * S,
+                (10 + i) * S,
+                0,
+            );
+        }
+        // a command the session ran later, and a subshell it forked
+        t.ingest_exec(702, 701, "/usr/bin/cp", &[], 2_200 * S, 2_200 * S, 1000);
+        write_exe(proc.path(), 703, "/usr/bin/bash");
+        write_status(proc.path(), 703, 701);
+        write_started(proc.path(), "703", 701, 220_000);
+        // cron's worker and postgres's backend, forked, never executed
+        write_exe(proc.path(), 801, "/usr/sbin/cron");
+        write_status(proc.path(), 801, 800);
+        write_started(proc.path(), "801", 800, 220_100);
+        write_exe(proc.path(), 901, "/usr/sbin/postgres");
+        write_status(proc.path(), 901, 900);
+        write_started(proc.path(), "901", 900, 220_200);
+        let judged = AsOf::Judged(2_300 * S);
+        assert!(t.is_auth_mediated(702, judged));
+        assert!(t.is_auth_mediated(703, judged));
+        assert!(t.is_credential_reader(801, judged), "cron's worker");
+        assert_eq!(
+            t.image_path_as(901, judged).as_deref(),
+            Some("/usr/sbin/postgres"),
+            "the backend's image, not unknown"
+        );
     }
 
     #[test]

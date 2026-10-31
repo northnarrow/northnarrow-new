@@ -190,12 +190,14 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        15,
+        19,
         "the lineage's /proc reads for the lookups outside a judgement (`AsOf::Now`, \
-         `AsOf::Live`: the pumps', the admin's, the responses'), its boot-time reads (the \
-         start's scan of the running processes, `seed_from_proc`), and — in a judgement — a \
-         process's start (`/proc/<pid>/stat`, POS-003's reuse check); never a process's image \
-         in a judgement (R-F, review of #475)",
+         `AsOf::Live`: the pumps', the admin's, the responses'), its boot-time scan \
+         (`seed_from_proc`) and its sweep (`sweep`: a thread of its own, every 5 s); in a \
+         judgement a process's start (`/proc/<pid>/stat`, POS-003's reuse check) and, for a \
+         pid the cache does not hold, a fork's parent and start, exe and uid (`fork_entry`: \
+         the parent's cached image accepted only when `/proc/<pid>/exe` is that file — the \
+         re-review of #475); never a process's image read as its identity in a judgement",
     ),
     (
         "crates/nn-core/src/posture/triggers.rs",

@@ -699,6 +699,106 @@ fn file_canary_open_triggers_canary_tripped_event_and_combat() {
     );
 }
 
+/// Review of #475: an anti-malware daemon running since before the agent
+/// (the start's scan enters it into the lineage) is still CANARY-001's
+/// reader after 2,100 execs of other processes — the lineage keeps a live
+/// process's entry (it was a FIFO of 2,048 that pushed it out, and the
+/// daemon was killed at its first read of a canary). The daemon here is a
+/// copy of bash named `clamd` in a system tree, started before the agent,
+/// that reads the decoy from its own process (a builtin's redirection)
+/// when the test tells it to: the access is recorded and signed, the rule
+/// records it High, and the daemon is not killed.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn a_reader_daemon_older_than_the_agent_stays_spared_after_2100_execs() {
+    let _eni = EniIptablesGuard::install();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let decoy = tmp.path().join("decoy_backup_keys.txt");
+    let go = tmp.path().join("go");
+    assert!(Command::new("mkfifo")
+        .arg(&go)
+        .status()
+        .expect("mkfifo")
+        .success());
+    // the daemon: /usr/local/lib/<dir>/clamd, a copy of bash (removed at the end)
+    let dir = PathBuf::from(format!(
+        "/usr/local/lib/nn-e2e-clamd-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("the daemon's directory");
+    struct Gone(PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _gone = Gone(dir.clone());
+    let clamd = dir.join("clamd");
+    std::fs::copy("/bin/bash", &clamd).expect("seed the daemon's binary");
+    let mut daemon = Command::new(&clamd)
+        .arg("-c")
+        .arg(format!(
+            "read -r _ < '{}'; read -r _ < '{}'; sleep 30",
+            go.display(),
+            decoy.display()
+        ))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the daemon");
+    let pid = daemon.id();
+
+    // the agent starts after it: its start's scan enters the daemon
+    let fx = CanaryFixture::setup(&[]);
+    // 2,100 execs of other processes
+    for _ in 0..2_100 {
+        let _ = Command::new("/bin/true").status();
+    }
+    let canary_id = fx.deploy_file_canary("honeypot-backup", &decoy);
+    assert_eq!(canary_id.len(), 32);
+    // the daemon reads the decoy
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&go)
+        .and_then(|mut f| f.write_all(b"go\n"))
+        .expect("tell the daemon to read");
+    let rows = fx.wait_access(1);
+    assert_eq!(
+        rows[0]["accessor_pid"].as_u64(),
+        Some(u64::from(pid)),
+        "{rows:?}"
+    );
+    assert_eq!(rows[0]["first_trip"].as_bool(), Some(true));
+    let rec = common::wait_jsonl_row(
+        &fx.detections_log,
+        ACCESS_LOG_POLL_TIMEOUT,
+        "NN-L-CANARY-001 record of the daemon",
+        |r| {
+            r["rule_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("NN-L-CANARY-001"))
+                && r["principal"]["pid"].as_u64() == Some(u64::from(pid))
+        },
+    );
+    assert_eq!(
+        rec["severity"], "High",
+        "a reader's read is recorded: {rec}"
+    );
+    assert!(
+        !rec["response"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("KillProcessTree")),
+        "the reader is not killed: {rec}"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        daemon.try_wait().expect("try_wait").is_none(),
+        "the daemon still runs"
+    );
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
 /// External audit DEC-001 and DEC-003: a file canary deployed at runtime
 /// in a directory the FIM path list does not cover trips, and still trips
 /// after the agent restarts — the boot used to publish an empty

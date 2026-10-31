@@ -1214,6 +1214,17 @@ fn a_full_writer_queue_holds_a_trip_at_most_its_wait_and_counts_it() {
     let (per, total) = detector.unwritten();
     assert_eq!(total, 1);
     assert_eq!(per.get(&id), Some(&1));
+    // the re-review of #475: the writer still stuck, the next trip is
+    // counted at once, without another wait
+    let started = std::time::Instant::now();
+    let third = detector.process_event(&fim_event_on("/tmp/decoy-f.txt", 4244));
+    assert!(matches!(third, Some(Event::CanaryTripped { .. })));
+    assert!(
+        started.elapsed() < CANARY_QUEUE_WAIT / 2,
+        "no second wait: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(detector.unwritten().1, 2);
     let started = std::time::Instant::now();
     assert!(
         !detector.flush(std::time::Duration::from_millis(50)),

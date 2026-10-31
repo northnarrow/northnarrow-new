@@ -970,6 +970,8 @@ pub struct FloodCap {
     overflow: u64,
     overflow_root: bool,
     overflow_total: u64,
+    /// Pending counts of keys a full table released before their row.
+    released: Vec<Capped>,
 }
 
 impl Default for FloodCap {
@@ -990,6 +992,7 @@ impl FloodCap {
             overflow: 0,
             overflow_root: false,
             overflow_total: 0,
+            released: Vec::new(),
         }
     }
 
@@ -1002,6 +1005,9 @@ impl FloodCap {
         let kind = key.kind;
         if !self.windows.contains_key(&key) && self.windows.len() >= self.keys {
             self.prune(now_ns);
+            if self.windows.len() >= self.keys {
+                self.release_oldest_pending(now_ns);
+            }
             if self.windows.len() >= self.keys {
                 self.overflow += 1;
                 self.overflow_total += 1;
@@ -1078,17 +1084,32 @@ impl FloodCap {
     /// What was capped since the last call, per key — every key that
     /// capped something —, the most first; the keys start counting again.
     pub fn take_pending(&mut self) -> Vec<Capped> {
-        let mut out: Vec<Capped> = self
-            .windows
-            .values_mut()
-            .filter_map(|w| w.pending.take())
-            .collect();
+        let mut out: Vec<Capped> = std::mem::take(&mut self.released);
+        out.extend(self.windows.values_mut().filter_map(|w| w.pending.take()));
         out.sort_by(|a, b| {
             b.count
                 .cmp(&a.count)
                 .then((a.kind, a.uid, a.target).cmp(&(b.kind, b.uid, b.target)))
         });
         out
+    }
+
+    /// The re-review of #475: a full table releases a key sooner — the one
+    /// whose window ended longest ago, its pending count kept for the next
+    /// row ([`Self::take_pending`]) — instead of holding it until the row.
+    fn release_oldest_pending(&mut self, now_ns: u64) {
+        let window_ns = self.window_ns;
+        let oldest = self
+            .windows
+            .iter()
+            .filter(|(_, w)| now_ns.saturating_sub(w.started_ns) >= window_ns)
+            .min_by_key(|(_, w)| w.started_ns)
+            .map(|(k, _)| *k);
+        if let Some(k) = oldest {
+            if let Some(Some(p)) = self.windows.remove(&k).map(|w| w.pending) {
+                self.released.push(p);
+            }
+        }
     }
 
     /// Forget the pairs whose window ended and that hold nothing to sign.
@@ -1814,6 +1835,35 @@ mod tests {
         assert!(full.admit(key(FloodKind::Bpf, 5), 0, || sample(5)));
         assert!(full.admit(key(FloodKind::Bpf, 0), 1, || sample(0)));
         assert_eq!(full.take_overflow(), (1, true, 1));
+    }
+
+    /// The re-review of #475: a full table releases the key whose window
+    /// ended longest ago (its pending count kept for the row) before it
+    /// queues a new key uncapped.
+    #[test]
+    fn a_full_table_releases_an_ended_key_before_it_overflows() {
+        let mut cap = FloodCap::new(1, 100, 2);
+        assert!(cap.admit(key(FloodKind::Bpf, 1), 0, || sample(1)));
+        assert!(
+            !cap.admit(key(FloodKind::Bpf, 1), 1, || sample(1)),
+            "uid 1 capped"
+        );
+        assert!(cap.admit(key(FloodKind::Bpf, 2), 120, || sample(2)));
+        // uid 1's window ended (it holds a count), uid 2's runs: uid 3
+        // takes uid 1's place instead of overflowing
+        assert!(cap.admit(key(FloodKind::Bpf, 3), 150, || sample(3)));
+        assert!(
+            !cap.admit(key(FloodKind::Bpf, 3), 151, || sample(3)),
+            "and is capped"
+        );
+        assert_eq!(cap.take_overflow().0, 0);
+        let rows = cap.take_pending();
+        assert_eq!(
+            rows.len(),
+            2,
+            "uid 1's released count and uid 3's: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.uid == 1 && r.count == 1));
     }
 
     /// Review of #474: inside a uid the cap counts each command and each

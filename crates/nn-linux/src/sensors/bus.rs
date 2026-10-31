@@ -1906,14 +1906,23 @@ fn sign_capped(stats: &BusStats, losses: &BusLosses) {
             break;
         }
     }
-    // root's floods held back from their judgement: a posture signal
+    // root's floods held back from their judgement, or any past a full
+    // table: a posture signal
     let root: Vec<(String, u64)> = per_uid
         .iter()
         .filter(|((_, uid), _)| *uid == 0)
         .map(|((kind, _), (count, _))| (format!("capped {} of uid 0", kind.name()), *count))
-        .chain(overflow_root.then(|| {
+        // the re-review of #475: a full table is a signal whatever the uids
+        .chain((overflow > 0).then(|| {
             (
-                "queued uncapped past a full cap table (uid 0 among them)".to_string(),
+                format!(
+                    "queued uncapped past a full cap table{}",
+                    if overflow_root {
+                        " (uid 0 among them)"
+                    } else {
+                        ""
+                    }
+                ),
                 overflow,
             )
         }))
@@ -1924,9 +1933,8 @@ fn sign_capped(stats: &BusStats, losses: &BusLosses) {
             .map(|(n, c)| format!("{n} {c}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let reason = format!(
-            "event bus: root's floods of tamper events counted, not judged one by one: {what}"
-        );
+        let reason =
+            format!("event bus: floods of tamper events counted, not judged one by one: {what}");
         ring_drops::raise_signal_loss(&losses.posture, &what, "event bus cap", &reason);
     }
 }
@@ -3386,6 +3394,36 @@ mod tests {
                     "uid {uid}: {kind:?}"
                 );
             }
+        })
+        .await
+    }
+
+    /// The re-review of #475: a full cap table is a posture signal whatever
+    /// the uids (a burst spread over uids other than 0 too).
+    #[tokio::test]
+    async fn a_full_cap_table_raises_the_posture_for_any_uid() {
+        within(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (log, path) = audit_log(dir.path());
+            let (tx, rx) = build(
+                SPECS,
+                [0; 16],
+                FloodCap::new(2, core_bus::FLOOD_CAP_WINDOW_NS, 2),
+            );
+            for uid in [1000u32, 1001, 1002] {
+                tx.send(bpf(uid, uid)).await.unwrap();
+            }
+            let posture = crate::posture::PostureMachine::new();
+            let losses = BusLosses::default();
+            losses.bind_audit_log(Some(log));
+            losses.bind_posture(posture.clone(), None);
+            record(&rx.stats(), &losses, Sample::Tick);
+            assert_eq!(
+                posture.current_kind(),
+                nn_model::posture_types::PostureKind::Alerted
+            );
+            let got = rows(dir.path(), &path, CAPPED_AUDIT_OP);
+            assert_eq!(got[0]["queued_uncapped_table_full"], 1, "{got:?}");
         })
         .await
     }
