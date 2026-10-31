@@ -215,8 +215,10 @@ queues a new key uncapped: it is judged like any P0 event, or — P0 itself
 full — dropped by the bus with its own signed `event_bus_drop` row and
 `TelemetryLoss`; never set aside uncounted and unjudged. Those events are
 counted and signed in the next capped row
-(`queued_uncapped_table_full`), and root's among them raise the posture as
-above. Holding them back instead would let a burst over many targets hide
+(`queued_uncapped_table_full`) and raise the posture's `TelemetryLoss`
+whatever their uids (the re-review of #475: a full table is anomalous by
+itself). Before it queues a new key uncapped, a full table releases the key
+whose second ended longest ago, its count kept for the next row. Holding them back instead would let a burst over many targets hide
 the rest of the second's events of every new key; queued, the flood falls
 back to R12a's bounds (the shares, P0's reserve of 64 slots).
 
@@ -292,7 +294,10 @@ What the decision thread still does that is I/O, exactly (review of #475:
 - the security-tool detector's registration of a tool (its start and
   executable from `/proc`), at the tool's exec only;
 - in a judgement, a process's start (`/proc/<pid>/stat`, POS-003's check of
-  a reused pid) — never its image (§3).
+  a reused pid), and for a pid the lineage does not hold a fork's parent,
+  start, executable and uid (`/proc/<pid>/stat`, `exe`, `status`) — the
+  parent's cached image accepted only when `exe` is that file, never the
+  image `/proc` shows instead (§3).
 
 A guard keeps any more off the decision path
 (`xtask/tests/decision_path_io.rs`, run by `cargo test`): the decision
@@ -385,9 +390,31 @@ unlocked after every restart: the posture golden case
 entry, the scanned image its past. R12b-2's first version read `/proc`
 instead for a process older than the agent, which could judge an event of
 it on an image executed after the event (review of #475: a canary read,
-then a backup tool's exec, the read judged as the tool's). A process the
-agent saw start whose exec it does not hold (dropped by P1, evicted, not
-yet read) is not known.
+then a backup tool's exec, the read judged as the tool's).
+
+The re-review of #475 found strict R-F with a cache of 2,048 entries kept
+first in, first out unsafe: 2,048 execs of other processes pushed out a
+live daemon's entry — a `clamd` the scan entered became not known, its
+read of a canary was no reader's and the daemon was killed; a fork that
+never executes (a maintainer script's subshell, a cron worker, a prefork
+backend) was not known at all. So:
+- the cache is bounded by process lifetime: a thread of its own
+  (`nn-lineage-sweep`, every 5 s) marks the cached processes that exited
+  (or whose pid names another process now); past 2,048 entries only marked
+  ones past a 30-s grace are dropped, a live process's never for newer
+  ones; past 32,768 the oldest goes whatever its process does, counted
+  (`evicted_live`) and WARNed;
+- a fork runs its parent's image while `/proc` says so (`fork_entry`): for
+  a pid the cache does not hold, its parent and start from
+  `/proc/<pid>/stat` (no exec changes them), its parent's image as of that
+  start (cached, or itself such a fork), accepted only when
+  `/proc/<pid>/exe` is that very file — a fork that executed something
+  else since stays not known; an event before the fork's start is not its;
+  the sweep enters the running forks of cached processes, so a daemon's
+  child outlives its parent's entry.
+
+A process the agent saw start whose exec it does not hold (dropped by P1,
+or not yet read) and whose image is not its parent's is not known.
 `in_package_transaction` walks the tree as of the event; the replay judges
 every event as the decision thread does.
 

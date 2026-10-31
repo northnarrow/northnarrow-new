@@ -1374,7 +1374,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   from `/proc` (R-F); the agent's start enters the processes already
   running into the cache once the exec sensors are attached, so the boot's
   daemons and older sessions are known (review of #475). The process-wide
-  cache of systemd's answer is gone (the snapshot keeps it).
+  cache of systemd's answer is gone (the snapshot keeps it). The lineage's
+  cache is bounded by process lifetime — a sweep thread marks the exited
+  processes, only their entries are dropped past 2,048 (after a grace), a
+  live one's never for newer ones — and a fork that never executes runs its
+  parent's image while `/proc/<pid>/exe` is that file (the re-review of
+  #475: a daemon pushed out by 2,048 other execs was killed at its first
+  read of a canary). A full cap table raises `TelemetryLoss` for any uid
+  and releases an ended key first; a stuck canary writer costs one wait.
 - The ring pumps on threads of their own, sending in batches (lab PR 269,
   Wave 4 phase 2, R12b-1 of the restructure plan;
   `docs/architecture/EVENT_BUS.md` §2a–2c, §5). Each ring's pump — the
