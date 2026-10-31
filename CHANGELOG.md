@@ -1382,6 +1382,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   #475: a daemon pushed out by 2,048 other execs was killed at its first
   read of a canary). A full cap table raises `TelemetryLoss` for any uid
   and releases an ended key first; a stuck canary writer costs one wait.
+  After the third review of #475: a daemon that forks and exits after the
+  start (`Type=forking`, `daemon()`) is its image's orphan once the sweep
+  found its parent gone; a pid reused by a fork is no longer judged as the
+  dead process's image (a session's subshell stays auth-mediated); the
+  hard bound drops the most numerous user's entries first and raises
+  `TelemetryLoss`; the released cap keys are bounded, their counts summed.
 - The ring pumps on threads of their own, sending in batches (lab PR 269,
   Wave 4 phase 2, R12b-1 of the restructure plan;
   `docs/architecture/EVENT_BUS.md` §2a–2c, §5). Each ring's pump — the

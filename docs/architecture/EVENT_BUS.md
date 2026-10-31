@@ -218,7 +218,11 @@ counted and signed in the next capped row
 (`queued_uncapped_table_full`) and raise the posture's `TelemetryLoss`
 whatever their uids (the re-review of #475: a full table is anomalous by
 itself). Before it queues a new key uncapped, a full table releases the key
-whose second ended longest ago, its count kept for the next row. Holding them back instead would let a burst over many targets hide
+whose second ended longest ago, its count kept for the next row; past
+4,096 released keys their counts are summed per kind and uid (a row's
+`released_keys` target), past 4,096 sums per kind for the rest of the uids
+(uid 4294967295) — the third review of #475: a row names a bounded number
+of keys and keeps every count. Holding them back instead would let a burst over many targets hide
 the rest of the second's events of every new key; queued, the flood falls
 back to R12a's bounds (the shares, P0's reserve of 64 slots).
 
@@ -294,7 +298,8 @@ What the decision thread still does that is I/O, exactly (review of #475:
 - the security-tool detector's registration of a tool (its start and
   executable from `/proc`), at the tool's exec only;
 - in a judgement, a process's start (`/proc/<pid>/stat`, POS-003's check of
-  a reused pid), and for a pid the lineage does not hold a fork's parent,
+  a reused pid, and a cached exec checked against the process its pid
+  names now), and for a pid the lineage does not hold a fork's parent,
   start, executable and uid (`/proc/<pid>/stat`, `exe`, `status`) — the
   parent's cached image accepted only when `exe` is that file, never the
   image `/proc` shows instead (§3).
@@ -402,8 +407,12 @@ backend) was not known at all. So:
   (`nn-lineage-sweep`, every 5 s) marks the cached processes that exited
   (or whose pid names another process now); past 2,048 entries only marked
   ones past a 30-s grace are dropped, a live process's never for newer
-  ones; past 32,768 the oldest goes whatever its process does, counted
-  (`evicted_live`) and WARNed;
+  ones; past 32,768 entries a gone process's go first, then the oldest of
+  the uid holding the most among the processes executed since the start
+  (users' before system accounts'; the start's scan's last), counted
+  (`evicted_live`), WARNed and raising the posture's `TelemetryLoss` (the
+  third review of #475: a user's flood of live processes pushes out its
+  own entries, not the boot's daemons);
 - a fork runs its parent's image while `/proc` says so (`fork_entry`): for
   a pid the cache does not hold, its parent and start from
   `/proc/<pid>/stat` (no exec changes them), its parent's image as of that
@@ -411,10 +420,35 @@ backend) was not known at all. So:
   `/proc/<pid>/exe` is that very file — a fork that executed something
   else since stays not known; an event before the fork's start is not its;
   the sweep enters the running forks of cached processes, so a daemon's
-  child outlives its parent's entry.
+  child outlives its parent's entry; the start is read again after the
+  exe, so a reuse between the reads mixes no two processes.
+
+The third review of #475 found two holes of the same family:
+- a process that daemonizes after the agent's start (`Type=forking`,
+  `daemon()`: the parent executes, forks and exits within milliseconds,
+  the child reparented to pid 1) was compared with pid 1's image and never
+  known. The sweep enters it as the orphan of a cached process it found
+  gone (`orphan_entry`): reparented to pid 1 or to a subreaper among that
+  process's ancestors, started no earlier than its exec, running that very
+  file; every gone process of that image it could descend from must have
+  run the same script. Its parent stays the one `/proc` shows. Until the
+  sweep after its parent's exit (at most 5 s) it is not known;
+- a pid reused by a fork while the dead process's entry was cached
+  answered with the dead process's image, and the walk stopped at it. A
+  cached exec whose process is not the one the pid names now (another
+  start in `/proc/<pid>/stat`), at a time that process may already have
+  existed, answers as not held (`cached_live`): a fork of its parent in a
+  judgement, `/proc` outside one; for a time before the reuse it is still
+  what the pid ran. The sweep marks the pid and enters the fork.
 
 A process the agent saw start whose exec it does not hold (dropped by P1,
-or not yet read) and whose image is not its parent's is not known.
+or not yet read) and whose image is not its parent's, nor that of a gone
+process it was orphaned from, is not known. What stays (§7): a fork that
+executes another image and then executes its parent's again (RR3) is
+judged as its parent's image for the events in between when neither exec
+is held at the judgement (both still in the ring, or dropped and counted);
+a fork the sweep entered whose later exec is lost is judged as its
+parent's image (RR5, as any process whose later exec is lost).
 `in_package_transaction` walks the tree as of the event; the replay judges
 every event as the decision thread does.
 
@@ -565,7 +599,10 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   NN-L-AT-001's held records (§5; C5). R12b-2: the decision thread without
   `await` and the blocking I/O taken off it, with its ratchet (§2d; review
   #471 B4); R-F (§3: the time a parameter, an `Absent` pid not known in a
-  judgement; the running processes entered at the start).
+  judgement; the running processes entered at the start; after the reviews
+  of #475 the cache bounded by process lifetime, forks and a daemon's
+  orphans running their parent's image, a pid reused by a fork not the dead
+  process's).
 - **Open after R12b** — the responses still run on the decision thread
   (R12c's dispatcher); the decision path's I/O the ratchet lists (§2d: the
   ransomware tracker's sampler and trust, the per-rule policy's exemption
@@ -580,7 +617,17 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   review of #474); the DNS pump's thread runs its loop on the runtime's
   reactor; the `fs_protect` ring is sized at load for a pump thread's
   wake-up on a saturated CPU (§2a), the other rings keep the object's
-  sizes; a burst of NN-L-BPF-001's commands is uncapped (§2c).
+  sizes; a burst of NN-L-BPF-001's commands is uncapped (§2c). The
+  lineage (§3, the third review of #475): RR3, a fork that executes Y and
+  then its parent's image X again, is judged as X for Y's events when
+  neither exec is held at the judgement (low: it needs code running in a
+  fork of an exempt image, and both execs still in the ring or dropped,
+  which is counted); RR5, a fork the sweep entered whose later exec is lost
+  is judged as its parent's image; the structural fix for both and for a
+  daemon's orphan before the sweep (≤ 5 s) is an exec identity the kernel
+  keeps per task (task storage written at `bprm_committed`, copied at fork,
+  read by pidfd). The start's scan can enter the image of an exec it reads
+  before that exec's event arrives (milliseconds, at the start only).
 - **Open after review #471** — B1: the property test compares the
   strongest verdict per rule and process (§4); B5: "(agent predates the
   bus)" in `nn-admin status` is reachable only against an agent older than

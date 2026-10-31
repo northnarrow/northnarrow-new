@@ -3766,7 +3766,8 @@ only in the table below, in the same PR as the evidence.
     back at 262,144 bytes. Gates on 5dab2c77: build-ebpf, clippy ×4 `-D warnings`, fmt, 74 suites 3,293 passed 0 failed 16 ignored, the privileged no-run, attack-coverage, `golden` ×5 (54 files the same bytes, the tree clean), MSRV 1.89, the fuzz replay (13 targets), portable-core (5 targets), lockfiles unchanged. Mutations on the
     final code: 44 of 44 caught (the reviewer's K2 and K3 among them; AN2,
     every `bpf()` command keyed as one, survived the run and has a
-    stronger test). The overhead and the soak were not run again.
+    stronger test). The overhead was run again after the second review
+    (R12b-2's last lab line, below).
   - R12b-2 (part 2 of 2, #475, stacked on R12b-1) — what was wrong: the
     decision was an async function on the runtime: it awaited systemd's
     state for a signal PID 1 relayed and the executor, read `/proc` for
@@ -3804,16 +3805,26 @@ only in the table below, in the same PR as the evidence.
     killed before it returned, the /tmp dropper's tree before its child
     wrote its pid): the decoy sleeps and its SIGKILL is asserted, the
     dropper's test checks that no process of its image survives.
-  - R12b-2 — open: the responses still run on the decision thread (R12c's
-    dispatcher); the I/O sites the ratchet lists (the ransomware tracker's
-    sampler, the policy's exemption facts, the ancestry tree's fallback, a
-    canary trip's reader, the security-tool detector); R-F's remainder (a
-    process older than the agent that executes another image after an
-    event, judged before that exec is read, is judged on `/proc`'s image);
-    R-B and the property test over the posture corpus not done; the FIM
-    ring's drops under EXP-13c on the tips (the FIM drain a task still);
-    the self-integrity check's window for a freeze that starts right after
-    a round (C15 on the first tip).
+  - R12b-2 — open (as of the third review): the responses still run on
+    the decision thread (R12c's dispatcher); the other I/O sites
+    `EVENT_BUS.md` §2d lists (the ransomware tracker's sampler on a burst,
+    the policy's exemption facts, a canary trip's reader, the
+    security-tool detector's registration, a process's start and a fork's
+    `/proc` facts in a judgement); in a judgement a process whose exec the
+    agent did not read (dropped by P1, or not yet read) and whose image is
+    neither its parent's nor that of a gone process it was orphaned from
+    is not known, and a daemon's orphan is not known until the sweep after
+    its parent's exit (at most 5 s); RR3 (a fork that executes another
+    image, then its parent's again, judged as its parent's for the events
+    between when neither exec is held) and RR5 (a swept fork whose later
+    exec is lost judged as its parent's image) — the structural fix is an
+    exec identity the kernel keeps per task; past 32,768 cached entries
+    live ones are dropped (the most numerous user's first; counted, WARNed,
+    `TelemetryLoss`); the start's scan can enter the image of an exec it
+    reads before that exec's event arrives (milliseconds at the start);
+    R-B and the property test over the posture corpus not done; the
+    self-integrity check's window for a freeze that starts right after a
+    round (C15 on the first tip).
   - R12b-2 — lab: the same guests and method, `main` 28ecf720 (#474's runs), the first tip bc480855 and the final tip 8c3c253b (it holds R12b-1's final; the branch's later commits are documents and two privileged tests, below). EXP-13e ×3: `fs_protect` ring drops `main` 575, 865, 3,176 (mean 1,539), the first tip 0, 0, 21 (mean 7, max 21), the final tip 0, 0, 0, the agent's CPU ~12.5 s against 36.7 s, every refused attempt accounted, NET-001 6/6 in every run. EXP-13, 13c ×3 and 13d: the first tip lost 297, 249 and 189 in the bursts (R12b-1's ring finding), the final tip 0 in each of its 7 runs; the FIM ring dropped 2,249 and 6,311 records in two 13c runs of the tips (none in `main`'s three; R12a's lab saw 1,575 and 439 on this `main` code). EXP-13b (`debug-stall-loop` stalls the decision thread 4 s): the first record 4.00 s late, stage 5 counting it, 1 record + 2,999 held, nothing dropped. Overhead (the first tip): open +31.6 %, wopen +30.6 %, exec +6.1 %, connect +18.0 %, udp +15.8 %, dns +14.4 % (`main` +27.8, +31.1, +4.6, +40.4, +15.3, +13.0) — and 256 `tcp_close` records dropped by the network drain during the connect workload (not on `main` or R12b-1). Soak on ubuntu2204 (a fresh install, the same 0.78 h load as R12b-1's pair): RSS 31.8 → 57.4 MB, threads 23 → 23 (the runtime's 8 throughout; `main` 9 → 22), no restart, no ring or bus drop, P0 1,810 queued and none capped, stage 5 late only the boot's backlog (P3 none, max 238 ms), 2,917 WARN/ERROR lines (one ERROR: the lab's admin key). `test-ignored`: the first tip and the final code 95 passed, 0 failed on ubuntu2404 and one failure on ubuntu2204 — the process canary's decoy (a copy of `/bin/true`) killed by NN-L-CANARY-002's response before it returned 0, a race the decision on its own thread now wins on 5.15 (R12b-1's runs found it `AlreadyGone`); with that test made deterministic the next run failed the /tmp dropper's test the same way (R001's kill before its child wrote its pid); with both tests fixed (1277ec24) 95 passed, 0 failed on ubuntu2204 and 95 passed, 0 failed on ubuntu2404, the 52 chain checks `ok` in every run. `tamper-check` (the final code): its 75 outcomes and verdicts those of `main`, case by case; the first tip's run missed C15's stall report (a 45-s freeze that began right after a self-integrity round: the check's window, Open). The `fs_protect` ring read back 262,144 bytes on both guests. posture_demo identical to `main`'s (29 lines). Host gates on 8c3c253b: build-ebpf, clippy ×4, fmt, 75 suites 3,303 passed 0 failed 17 ignored, the privileged no-run, attack-coverage, `golden` ×5 (54 files the same bytes), MSRV, fuzz (13), portable-core (5), lockfiles unchanged; clippy (privileged tests) and fmt again on 1277ec24 (the two e2e tests). Mutations: 18 of 18 on the final code (the resolve in the pumps, the systemd snapshot and its watch, the decision loop's teaching, delay and answered signals, the canary writer, the provenance cache, R-F's rules, the ratchet) and R-F's own 11 of 11; survivors along the way (B5 on the first watch, B17) have their tests.
   - Independent review of #475 ("merge after X"), fixed in the lot: R-F's
     exception read `/proc` in a judgement for a process older than the
@@ -3848,3 +3859,66 @@ only in the table below, in the same PR as the evidence.
     final code: 22 of 23 caught (the reviewer's K5 and K9 among them; BN2,
     the scan's first check of a pid already held, is an equivalent mutant:
     the same check is made again before the ingest).
+  - Second review of #475 ("merge after X"), fixed in the lot: strict R-F
+    with the lineage's cache of 2,048 kept first in, first out made
+    long-lived processes not known in a judgement (2,048 execs of other
+    processes pushed out a seeded `clamd`, CANARY-001's reader exemption
+    was lost and the daemon killed at its first canary read), and a fork
+    that never executes had no entry. The cache is bounded by process
+    lifetime (a sweep thread, `nn-lineage-sweep`, every 5 s, marks the
+    exited; past 2,048 only their entries go, after a 30-s grace; past
+    32,768 a live one, counted); a fork runs its parent's image while
+    `/proc/<pid>/exe` is that file (`fork_entry`, `/proc/<pid>/stat`'s
+    parent and start); a pin that the start seeds and sweeps; a full cap
+    table raises `TelemetryLoss` for any uid and releases an ended key; a
+    stuck canary writer costs one wait; the dropper test cannot vanish
+    without `debug-trigger` (`compile_error!`).
+  - Third review of #475 ("merge after a small X"), fixed in the lot: a
+    daemon that forks and exits after the start (`Type=forking`,
+    `daemon()`) is the orphan of its gone parent's image once the sweep
+    found the parent gone (`orphan_entry`: reparented to pid 1 or a
+    subreaper ancestor, started after the exec, the same file, the same
+    script among the candidates); a pid reused by a fork is not judged as
+    the dead process's image (`cached_live`: a fork of its parent in a
+    judgement; a session's subshell stays auth-mediated, a regression
+    against `main` before); the reviewer's surviving mutations M5, M6,
+    M9, M11 have their tests; the start is read again after the exe; the
+    hard bound drops the most numerous user's entries first, the start's
+    scan's last, and raises `TelemetryLoss`; the keys a full cap table
+    releases are bounded, their counts summed per kind and uid. RR3 and
+    RR5 stay open (above).
+  - R12b-2 — lab after the reviews (our own guests, fresh installs):
+    round m (ubuntu2404, the final code e01cb609): `test-ignored` 80
+    suites, 97 passed, 0 failed, the 54 chain checks `ok` — a `Type=forking`
+    reader daemon started after the agent (its subshell reparented to
+    pid 1, read a file canary after one sweep): NN-L-CANARY-001 `Log` High,
+    not killed; round j (ubuntu2404, the second review's X 8977f0b3):
+    `tamper-check` the 75 outcomes and verdicts of `main`, case by case,
+    and `test-ignored` 80 suites, 96 passed, 0 failed (a reader daemon
+    started before the agent, after 2,100 execs: NN-L-CANARY-001 `Log`
+    High, not killed). Overhead ×3 on ubuntu2404 (rounds i and l): `main`
+    open +29.5 %, wopen +32.4 %, exec +8.0 %, connect +42.2 %, udp
+    +16.7 %, dns +16.0 %; R12b-1's final 49bc024e +29.0, +32.5, +6.9,
+    +38.5, +18.0, +14.4; R12b-2 before the second X (065a9b8f) +29.0,
+    +31.4, +9.6, +33.5, +14.0, +23.6; with it (919b7416) +28.6, +30.7,
+    +8.2, +29.3, +11.2, +19.9 — `dns` above `main` in both R12b-2 runs,
+    not attributed. The soak pair on ubuntu2204 (0.78 h each): `main`
+    28ecf720 RSS 31.5 → 57.3 MB, threads 9 → 20, 2,525 WARN/ERROR lines;
+    919b7416 RSS 32.4 → 56.5 MB, threads 24 → 24, 2,298 lines; both no
+    restart, no ring or bus drop, P0 1,794 queued (none capped), one ERROR
+    (the lab's admin key); stage 5 on the tip: P0 1 and P1 10 late (the
+    boot's backlog), P3 72 late (max 2.18 s) in two windows when the host
+    ran the gates and builds (1-min load 4–7); the sweep's thread 2.1 s of
+    CPU. The 51 chain checks of round g's run on ubuntu2204 against 52:
+    the watchdog test SIGKILLs a respawned agent once its pid file names
+    it, one boot killed before its chain line, the next verified `ok`.
+    Gates on e01cb609: build-ebpf, clippy ×4 `-D warnings`, fmt, 75
+    suites 3,325 passed 0 failed 17 ignored, the privileged no-run,
+    attack-coverage, `golden` ×5 (54 files the same bytes), MSRV 1.89,
+    the fuzz replay (13 targets), portable-core (5 targets), lockfiles
+    unchanged (on 919b7416: 3,317 passed). Mutations on e01cb609: 31 of 32
+    caught (set C again, the reviewer's M5, M6, M9, M11, the third X's
+    own; DF1, the start's re-read, a race no unit test can stage); on
+    8977f0b3: set C 15 of 15 (CN1, the start's `seed_from_proc` call
+    removed, among them), set B 21 of 21 applicable, R-F's own 9 of 9
+    applicable.
