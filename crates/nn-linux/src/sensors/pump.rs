@@ -241,10 +241,30 @@ mod tests {
         stop: Arc<AtomicBool>,
         /// Records to add at each wait (a producer behind the pump).
         later: VecDeque<Vec<Vec<u8>>>,
+        /// The bus whose P0 count is noted at each read.
+        seen: Option<crate::sensors::bus::BusStats>,
+        queued_at_read: Vec<u64>,
+    }
+
+    impl FakeRing {
+        fn new(records: VecDeque<Vec<u8>>, stop_after: usize, stop: &Arc<AtomicBool>) -> Self {
+            Self {
+                records,
+                waits: 0,
+                stop_after,
+                stop: Arc::clone(stop),
+                later: VecDeque::new(),
+                seen: None,
+                queued_at_read: Vec::new(),
+            }
+        }
     }
 
     impl RingSource for FakeRing {
         fn next_record(&mut self, f: &mut dyn FnMut(&[u8])) -> bool {
+            if let Some(stats) = &self.seen {
+                self.queued_at_read.push(stats.snapshot()[0].stats.enqueued);
+            }
             match self.records.pop_front() {
                 Some(r) => {
                     f(&r);
@@ -307,18 +327,23 @@ mod tests {
         let n = (BATCH_MAX * 2 + 7) as u32;
         let mut records: VecDeque<Vec<u8>> = (0..n).map(rec).collect();
         records.insert(5, vec![0u8]);
-        let mut ring = FakeRing {
-            records,
-            waits: 0,
-            stop_after: 2,
-            stop: Arc::clone(&stop),
-            later: VecDeque::from([vec![rec(n), rec(n + 1)]]),
-        };
+        let mut ring = FakeRing::new(records, 2, &stop);
+        ring.later = VecDeque::from([vec![rec(n), rec(n + 1)]]);
+        ring.seen = Some(rx.stats());
         let mut decode = decode_pid;
         run_ring("test", 4, &mut ring, &tx, rt.handle(), &stop, &mut decode).unwrap();
         assert_eq!(
             ring.waits, 2,
             "a wait after each pass that read the ring empty"
+        );
+        // the batches are bounded: the first is sent once full — not before
+        // (the short record at 5 adds no event) — before the next read
+        let q = &ring.queued_at_read;
+        assert_eq!(q[BATCH_MAX], 0, "a batch is not sent before it is full");
+        assert_eq!(
+            q[BATCH_MAX + 1],
+            BATCH_MAX as u64,
+            "a full batch is sent at once"
         );
         let pids: Vec<u32> = std::iter::from_fn(|| rx.try_recv())
             .map(|r| match r.envelope.event {
@@ -354,17 +379,71 @@ mod tests {
         let (tx, mut rx) = crate::sensors::bus::channel_with(specs);
         let stop = Arc::new(AtomicBool::new(false));
         let n = (PASS_MAX * 2 + 3) as u32;
-        let mut ring = FakeRing {
-            records: (0..n).map(rec).collect(),
-            waits: 0,
-            stop_after: 1,
-            stop: Arc::clone(&stop),
-            later: VecDeque::new(),
-        };
+        let mut ring = FakeRing::new((0..n).map(rec).collect(), 1, &stop);
         let mut decode = decode_pid;
         run_ring("full", 4, &mut ring, &tx, rt.handle(), &stop, &mut decode).unwrap();
         assert_eq!(ring.waits, 1, "only once read empty");
         assert_eq!(std::iter::from_fn(|| rx.try_recv()).count(), n as usize);
+    }
+
+    /// A ring that never runs empty does not hold a pass forever: the
+    /// pump sees its stop flag at the end of each pass of [`PASS_MAX`].
+    #[test]
+    fn a_ring_that_never_empties_still_sees_the_stop() {
+        struct Endless(u32);
+        impl RingSource for Endless {
+            fn next_record(&mut self, f: &mut dyn FnMut(&[u8])) -> bool {
+                self.0 = self.0.wrapping_add(1);
+                f(&self.0.to_le_bytes());
+                true
+            }
+            fn wait(&mut self, _: i32) -> io::Result<()> {
+                panic!("an endless ring is never read empty")
+            }
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let t = {
+            let stop = Arc::clone(&stop);
+            let handle = rt.handle().clone();
+            std::thread::spawn(move || {
+                let mut ring = Endless(0);
+                // one network event per record: P3 drops what it cannot hold
+                let mut decode = |b: &[u8], out: &mut Vec<Event>| {
+                    let pid = u32::from_le_bytes(b.try_into().unwrap());
+                    out.push(Event::NetListener(nn_model::telemetry::NetListenerEvent {
+                        timestamp_ns: 0,
+                        family: 2,
+                        bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                        bind_port: 1,
+                        proto: 6,
+                        pid,
+                        uid: 0,
+                        comm: String::new(),
+                        exe: None,
+                    }));
+                    true
+                };
+                run_ring("endless", 4, &mut ring, &tx, &handle, &stop, &mut decode)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::Release);
+        let started = std::time::Instant::now();
+        while !t.is_finished() {
+            assert!(
+                started.elapsed() < STOP_WITHIN,
+                "the pass ends, the stop is seen"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        t.join().unwrap().unwrap();
+        assert!(rx.stats().snapshot()[3].stats.enqueued > 0);
     }
 
     /// A closed bus ends the pump (the agent stops), its stop flag too, and
@@ -379,13 +458,7 @@ mod tests {
         let (tx, rx) = channel();
         drop(rx);
         let stop = Arc::new(AtomicBool::new(false));
-        let mut ring = FakeRing {
-            records: (0..3).map(rec).collect(),
-            waits: 0,
-            stop_after: usize::MAX,
-            stop: Arc::clone(&stop),
-            later: VecDeque::new(),
-        };
+        let mut ring = FakeRing::new((0..3).map(rec).collect(), usize::MAX, &stop);
         let mut decode = decode_pid;
         run_ring("closed", 4, &mut ring, &tx, rt.handle(), &stop, &mut decode).unwrap();
         assert_eq!(ring.waits, 0, "ended at the first send");

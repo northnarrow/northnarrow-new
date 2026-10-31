@@ -2103,13 +2103,20 @@ mod tests {
                 );
             }
         }
-        let pump = include_str!("open_sensor.rs");
-        let pump = &pump[pump.find("pub async fn pump(").unwrap()..];
-        let pump = &pump[..pump.find("\n}\n").unwrap()];
+        let pump = pump_source();
         assert!(
             pump.contains("if open_only(r) && !tx.open_room() {"),
             "{pump}"
         );
+    }
+
+    /// The pump's source, from the file's code before its tests (R12b: a
+    /// search of the whole file found the tests' own text).
+    fn pump_source() -> &'static str {
+        let file = include_str!("open_sensor.rs");
+        let code = &file[..file.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        let pump = &code[code.find("\npub fn pump(").expect("the pump")..];
+        &pump[..pump.find("\n}\n").unwrap()]
     }
 
     /// Review #471 M2: a batch's signals to a security tool are sent
@@ -2133,14 +2140,93 @@ mod tests {
         }
         let order: Vec<u32> = send_order(&batch).map(|r| r.pid).collect();
         assert_eq!(order, [2, 4, 0, 1, 3]);
-        // and the pump sends in that order
-        let pump = include_str!("open_sensor.rs");
-        let pump = &pump[pump.find("pub async fn pump(").unwrap()..];
-        let pump = &pump[..pump.find("\n}\n").unwrap()];
-        assert!(
-            pump.contains("for r in send_order(&batch.records) {"),
-            "{pump}"
+    }
+
+    /// Review #471 M2, R12b: the pump sends a pass's signals first — with
+    /// P2 full of file events that wait for room, a mass write read before
+    /// a signal holds the pump, and the signal is queued all the same.
+    #[test]
+    fn the_pump_queues_a_pass_s_signal_while_a_file_event_waits() {
+        use crate::sensors::pump::RingSource;
+        struct Ring(
+            std::collections::VecDeque<OpenRecordRaw>,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
         );
+        impl RingSource for Ring {
+            fn next_record(&mut self, f: &mut dyn FnMut(&[u8])) -> bool {
+                match self.0.pop_front() {
+                    Some(r) => {
+                        f(bytemuck::bytes_of(&r));
+                        true
+                    }
+                    None => false,
+                }
+            }
+            fn wait(&mut self, _: i32) -> std::io::Result<()> {
+                self.1.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut specs = nn_core::bus::SPECS;
+        specs[2].capacity = 2;
+        let (tx, mut rx) = crate::sensors::bus::channel_with(specs);
+        let mass = |pid: u32| Event::MassWrite {
+            pid,
+            uid: 0,
+            comm: "w".into(),
+            count: 64,
+            filename: "/srv/x".into(),
+            timestamp_ns: 0,
+            overwrites: true,
+            cgroup_window: false,
+        };
+        rt.block_on(async {
+            tx.send(mass(100)).await.unwrap();
+            tx.send(mass(101)).await.unwrap();
+        });
+        let mut w = record(open_reason::MASS_WRITE, &["srv", "x"], (0, 0));
+        w.pid = 7;
+        let mut sig = record(open_reason::DEFENDER_SIGNAL, &[], (0, 0));
+        sig.pid = 8;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut ring = Ring([w, sig].into(), std::sync::Arc::clone(&stop));
+        let pump_tx = tx.for_source("open_sensor_test");
+        let handle = rt.handle().clone();
+        let stop2 = std::sync::Arc::clone(&stop);
+        let t = std::thread::spawn(move || pump(&mut ring, &pump_tx, &handle, &stop2));
+        // the pump waits for room for the mass write; the signal is queued
+        let started = Instant::now();
+        while rx.stats().snapshot()[0].stats.enqueued == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the signal waits behind the mass write"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!t.is_finished(), "the pump waits for room in P2");
+        let first = rx.try_recv().unwrap();
+        assert!(matches!(
+            first.envelope.event,
+            Event::DefenderSignal { pid: 8, .. }
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap().envelope.event,
+            Event::MassWrite { pid: 100, .. }
+        ));
+        t.join().unwrap();
+        let rest: Vec<u32> = std::iter::from_fn(|| rx.try_recv())
+            .map(|r| match r.envelope.event {
+                Event::MassWrite { pid, .. } => pid,
+                e => panic!("{e:?}"),
+            })
+            .collect();
+        assert_eq!(rest, [101, 7]);
+        assert!(stop.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]
