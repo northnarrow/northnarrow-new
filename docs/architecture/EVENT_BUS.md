@@ -136,6 +136,16 @@ each class's FIFO, a repeat of a denial queued earlier in the same batch
 counted into it, a full P2 or P3 dropping the new event (the test
 `a_batch_queues_as_the_sends_one_by_one_would`).
 
+A thread blocked in `poll(2)` must be scheduled when the kernel wakes it,
+and on a saturated CPU that may take a scheduler slice (EEVDF's 3 ms with 4
+CPUs on 6.8) — about the time one process's loop of refused operations
+takes to fill the `fs_protect` ring the object declares (64 KiB, 1,024
+denials). On R12a that pump was a task a runtime worker already running
+polled; in the lab's EXP-13 (bursts of 1,500 under a flood of opens) the
+threaded pump's ring lost more of them than R12a's. The loader sizes that ring
+at 256 KiB (`FS_PROTECT_RING_BYTES`, 4,096 denials; the object unchanged):
+four such waits of room.
+
 The connect pump waits, per batch, for the DNS pump's pass over the
 queries made before its connects (lab PR 229) and announces each connect
 after its batch is on the bus (lab PR 246); the DNS pump answers the
@@ -377,7 +387,8 @@ batch of up to 256 events and per take (R12b); the hand-over scans P1 only
 when an event of another queue is taken, each queued event once; the
 lineage keeps three execs per pid (its cache's bound is unchanged). R12b:
 eleven pump threads (blocked in `poll(2)` when their ring is empty), the
-envelope's 40 bytes per queued event, the cap's table (at most 4,096 uids
+`fs_protect` ring's 192 KiB more of kernel memory, the envelope's 40 bytes
+per queued event, the cap's table (at most 4,096 uids
 and kinds). The lab's numbers (overhead, latency per class, the
 soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
 

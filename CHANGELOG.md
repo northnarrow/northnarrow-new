@@ -1361,7 +1361,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   on R12a a pump was a task of the runtime sending one event at a time,
   and a ring fell behind on a saturated guest while no send had waited
   (EXP-13e). A dead pump thread stops the agent as a dead task did
-  (SNS-001). The queues hold envelopes (`nn_core::bus::Envelope`: the
+  (SNS-001). A woken thread may wait a scheduler slice on a saturated CPU,
+  about the time one process's loop of refused operations fills the
+  `fs_protect` ring the object declares (1,024 denials): the loader sizes
+  that ring at 256 KiB (4,096; the eBPF object unchanged). The queues hold envelopes (`nn_core::bus::Envelope`: the
   source and its sequence, the class, the record's kernel time, the
   process). Stage 5 of the losses is counted: each decision timed from its
   record's kernel time against its class's budget (P0 100 ms, P1 250 ms,

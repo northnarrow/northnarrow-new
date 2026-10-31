@@ -62,6 +62,20 @@ use crate::sensors::reject::RejectThrottle;
 /// (a dead recorder would leave the bus's drops unsigned).
 pub const BUS_LOSSES_LABEL: &str = "event_bus_losses";
 
+/// The anti-tamper denials' ring (`agent-ebpf/src/inode_protect.rs`).
+pub const FS_PROTECT_RING: &str = "FS_PROTECT_EVENTS";
+/// Lot 269 (R12b-1): the size [`FS_PROTECT_RING`] is loaded with — 256 KiB,
+/// 4,096 denials of 64 bytes (the 56-byte record and the ring's 8-byte
+/// header) where the object declares 64 KiB, 1,024. Its pump is a thread
+/// blocked in `poll(2)` since R12b-1, and on a saturated CPU a woken thread
+/// may wait a scheduler slice before it runs (EEVDF's 3 ms with 4 CPUs on
+/// 6.8) — about the time one process's loop of refused operations takes to
+/// fill 1,024 (EXP-13's bursts of 1,500 under an open flood); on R12a the
+/// pump was a task that a runtime worker already running polled. Four times
+/// the room rides out four such waits. The loader sizes the map
+/// (`EbpfLoader::map_max_entries`); the eBPF object is unchanged.
+pub const FS_PROTECT_RING_BYTES: u32 = 256 * 1024;
+
 /// Tappa 10 N9 — shared state the multiplexer threads into the
 /// TcpConnect + DnsQuery pumps so each kernel observation feeds
 /// the userland flow tracker / DNS cache before the corresponding
@@ -269,6 +283,9 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             plan.epg_task_maps.strict,
         );
         loader.map_max_entries(crate::sensors::epg::LITE_TASKS_MAP, plan.epg_task_maps.lite);
+        // Lot 269: the denials' ring four times the object's (see
+        // `FS_PROTECT_RING_BYTES`: a pump thread's wake-up on a busy CPU).
+        loader.map_max_entries(FS_PROTECT_RING, FS_PROTECT_RING_BYTES);
         if let Some(root) = pin_root {
             loader.default_map_pin_directory(root);
             debug!(
@@ -466,7 +483,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         let exec_check_rb = take_ringbuf(&mut ebpf, "EXEC_CHECK_EVENTS")?;
         let tcp_connect_rb = take_ringbuf(&mut ebpf, "TCP_CONNECT_EVENTS")?;
         let dns_query_rb = take_ringbuf(&mut ebpf, "DNS_QUERY_EVENTS")?;
-        let fs_protect_rb = take_ringbuf(&mut ebpf, "FS_PROTECT_EVENTS")?;
+        let fs_protect_rb = take_ringbuf(&mut ebpf, FS_PROTECT_RING)?;
         // BUG-034: module-load observations → Event::ModuleLoad → R018.
         // Maps exist at load time (before attach), so taking it here is safe.
         let module_load_rb = take_ringbuf(&mut ebpf, "MODULE_LOAD_EVENTS")?;
@@ -1922,6 +1939,52 @@ mod tests {
             );
         }
         assert!(rings.iter().all(|r| r.ends_with("EVENTS")), "{rings:?}");
+    }
+
+    /// Lot 269 (R12b-1): the denials' ring is loaded at four times the
+    /// size the object declares, a power of two of whole pages (a ring
+    /// buffer's size must be), under the object's own name for it.
+    #[test]
+    fn the_denials_ring_is_loaded_four_times_the_object_s() {
+        let src =
+            std::path::Path::new(env!("NN_REPO_ROOT")).join("agent-ebpf/src/inode_protect.rs");
+        let text = std::fs::read_to_string(&src).unwrap();
+        let line = text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.starts_with("//") && l.contains(&format!("{FS_PROTECT_RING}: RingBuf =")))
+            .expect("the object's declaration of the denials' ring");
+        let size = line
+            .split("with_byte_size(")
+            .nth(1)
+            .and_then(|r| r.split(',').next())
+            .expect("its byte size");
+        let declared: u32 = size
+            .split('*')
+            .map(|f| f.trim().parse::<u32>().expect("a product of integers"))
+            .product();
+        assert_eq!(declared, 64 * 1024, "{line}");
+        assert!(FS_PROTECT_RING_BYTES >= 4 * declared);
+        assert!(FS_PROTECT_RING_BYTES.is_power_of_two());
+        assert_eq!(FS_PROTECT_RING_BYTES % 4096, 0);
+        let record = (std::mem::size_of::<FsProtectDenialRaw>() + 8) as u32;
+        assert_eq!(FS_PROTECT_RING_BYTES / record, 4096);
+    }
+
+    /// Lot 269 (R12b-1): the loader is given that size before it loads the
+    /// object, and the pump reads the ring by that name — read from the
+    /// production code, before this file's tests.
+    #[test]
+    fn the_loader_sizes_the_denials_ring_before_the_load() {
+        let text = include_str!("multiplexer.rs");
+        let code = &text[..text.find("#[cfg(test)]").expect("the tests")];
+        let sized = code
+            .find("loader.map_max_entries(FS_PROTECT_RING, FS_PROTECT_RING_BYTES);")
+            .expect("the loader sizes the denials' ring");
+        let loaded = code.find(".load(EBPF_BYTES)").expect("the load");
+        assert!(sized < loaded, "sized after the load");
+        assert_eq!(code.matches(".load(EBPF_BYTES)").count(), 1);
+        assert!(code.contains("take_ringbuf(&mut ebpf, FS_PROTECT_RING)?"));
     }
 
     /// External audit SNS-012 (NN-AUD-355): the WARN for an unarmed
