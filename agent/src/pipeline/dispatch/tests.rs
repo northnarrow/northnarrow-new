@@ -87,6 +87,14 @@ fn decided(rule: &str, action: ResponseAction, severity: Severity, pid: u32) -> 
 }
 
 fn dispatcher(dry_run: bool, cap: usize) -> (Dispatcher, ActionJournal, DetectionSink) {
+    dispatcher_with(dry_run, cap, None)
+}
+
+fn dispatcher_with(
+    dry_run: bool,
+    cap: usize,
+    posture: Option<northnarrow_agent::posture::PostureMachine>,
+) -> (Dispatcher, ActionJournal, DetectionSink) {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = ExecutorConfig::for_test(tmp.path());
     cfg.dry_run = dry_run;
@@ -101,7 +109,7 @@ fn dispatcher(dry_run: bool, cap: usize) -> (Dispatcher, ActionJournal, Detectio
             sink: Some(sink.clone()),
             cow: northnarrow_agent::cow::CowGuard::off_for_test(),
         },
-        None,
+        posture,
         cap,
     );
     (d, journal, sink)
@@ -501,4 +509,57 @@ fn a_repeat_merges_and_answers_both_decisions() {
     assert_eq!(i.why, ["NN-L-T-1", "NN-L-T-2"]);
     assert_eq!(i.severity, "critical");
     assert_eq!(sink.queued_for_test().len(), 3);
+}
+
+/// Responses not run raise the posture's `TelemetryLoss` with their signed
+/// overflow row: an operator hears of them.
+#[test]
+fn responses_not_run_raise_telemetry_loss() {
+    let posture = northnarrow_agent::posture::PostureMachine::new();
+    assert_eq!(
+        posture.current_kind(),
+        nn_model::posture_types::PostureKind::Observing
+    );
+    let (d, journal, _sink) = dispatcher_with(true, 1, Some(posture.clone()));
+    let hold = d.shared.hold.lock();
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-0",
+            ResponseAction::KillProcess,
+            Severity::High,
+            6000,
+        ),
+    );
+    let t0 = Instant::now();
+    while d.status().queue.taken == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-1",
+            ResponseAction::KillProcess,
+            Severity::High,
+            6001,
+        ),
+    );
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-2",
+            ResponseAction::KillProcess,
+            Severity::High,
+            6002,
+        ),
+    );
+    drop(hold);
+    d.stop(Duration::from_secs(5));
+    assert_eq!(d.status().queue.refused, [0, 0, 1, 0]);
+    assert!(journal.rows().iter().any(|r| r.row == ActionRow::Overflow));
+    assert_eq!(
+        posture.current_kind(),
+        nn_model::posture_types::PostureKind::Alerted
+    );
 }

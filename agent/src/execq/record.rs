@@ -253,6 +253,56 @@ mod tests {
         }
     }
 
+    /// R12c (lab PR 270): an exec quarantine's kill is an action — its
+    /// record is written past the record budget (120 of one uid, the burst
+    /// 100); an observe-mode resume (Log) is held past it.
+    #[test]
+    fn a_kill_s_record_is_never_held_by_the_budget() {
+        use crate::detection_store::DetectionSink;
+        let sink = DetectionSink::for_test(4096, 0);
+        let rec = SinkRecorder {
+            sink: Some(sink.clone()),
+            audit: None,
+            posture: Box::new(|| nn_model::posture_types::PostureKind::Observing),
+        };
+        let o = decide(&Policy::default(), &Basis::Scanned(ScanVerdict::Malicious));
+        let with_uid = |uid: u32| {
+            let mut e = event();
+            if let Event::ExecCheck { uid: u, .. } = &mut e {
+                *u = uid;
+            }
+            e
+        };
+        let ev = || evidence(None, &o, true, true, 12, class::TMP, &[]);
+        for _ in 0..120 {
+            rec.detection(ExecqRecord::new(
+                with_uid(77_003),
+                "/tmp/nn-x",
+                &o,
+                ev(),
+                "killed while held".into(),
+                "elf64-x86_64-exec",
+            ));
+        }
+        assert_eq!(sink.queued_for_test().len(), 120, "every kill recorded");
+        let resume = decide(&Policy::default(), &Basis::Scanned(ScanVerdict::Clean));
+        for _ in 0..120 {
+            rec.detection(ExecqRecord::new(
+                with_uid(77_004),
+                "/tmp/nn-y",
+                &resume,
+                evidence(None, &resume, true, true, 12, class::TMP, &[]),
+                "resumed".into(),
+                "elf64-x86_64-exec",
+            ));
+        }
+        let logged = sink.queued_for_test().len() - 120;
+        assert!(
+            logged <= crate::detection_budget::BURST as usize,
+            "{logged}"
+        );
+    }
+
     #[test]
     fn a_blocked_file_is_a_critical_quarantine_with_its_reasons() {
         let o = decide(&Policy::default(), &Basis::Scanned(ScanVerdict::Malicious));

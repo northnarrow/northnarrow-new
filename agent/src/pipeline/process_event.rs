@@ -895,4 +895,94 @@ mod tests {
         let st = dispatcher.status();
         assert_eq!(st.queue.lost(), 0);
     }
+
+    /// R12c (lab PR 270): the exploit guard's kills in the kernel are
+    /// recorded whatever the budget (120 of them, past its burst of 100);
+    /// a Log decision runs nothing — no intent — and is recorded within it.
+    #[test]
+    fn the_kernel_s_kills_are_recorded_past_the_budget_and_a_log_decision_runs_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // enforcing: nothing here acts (the kernel killed, `nc` is logged)
+        let exec = Executor::with_config(ExecutorConfig {
+            dry_run: false,
+            ..ExecutorConfig::for_test(tmp.path())
+        });
+        let journal = ActionJournal::memory();
+        let sink = northnarrow_agent::detection_store::DetectionSink::for_test(4096, 0);
+        let cow = northnarrow_agent::cow::CowGuard::off_for_test();
+        let dispatcher = Dispatcher::start(
+            exec.clone(),
+            journal.clone(),
+            Followups {
+                sink: Some(sink.clone()),
+                cow: cow.clone(),
+            },
+            None,
+        );
+        let engine = RuleEngine::with_default_rules();
+        let correlation = CorrelationBuffer::with_default_capacity();
+        let posture = PostureMachine::new();
+        let ladder = northnarrow_agent::combat::CombatLadder::new(
+            Box::new(northnarrow_agent::combat::SystemActuator::new(
+                exec.clone(),
+                None,
+                true,
+                journal.clone(),
+            )),
+            Box::new(northnarrow_agent::combat::AuditEvidence::new(None)),
+            Box::new(northnarrow_agent::combat::NoProtectedProcs),
+            northnarrow_agent::combat::LadderConfig::default(),
+        );
+        let expected = northnarrow_agent::boot::deny_selftest::ExpectedDenial::default();
+        let stopping = HostStopping::default();
+        let systemd = SystemdSnapshot::default();
+        let judge = |e: Event| {
+            process_event(
+                &engine,
+                &exec,
+                &correlation,
+                &posture,
+                &ladder,
+                None,
+                Some(&sink),
+                &expected,
+                &stopping,
+                &systemd,
+                &cow,
+                &dispatcher,
+                e,
+            )
+        };
+        use nn_core::decision::rules::epg::testutil::epg_event;
+        for _ in 0..120 {
+            judge(epg_event(nn_model::EpgKind::CredNoMechanism, true));
+        }
+        let mut nc = exec_from_tmp(7_777, 77_002);
+        if let Event::ProcessSpawn { comm, filename, .. } = &mut nc {
+            *comm = "nc".to_string();
+            *filename = "/usr/bin/nc".to_string();
+        }
+        judge(nc);
+        dispatcher.stop(Duration::from_secs(10));
+        let records = sink.queued_for_test();
+        let killed = records
+            .iter()
+            .filter(|r| r.response.contains("killed in kernel"))
+            .count();
+        assert_eq!(killed, 120, "every kernel kill recorded");
+        let nc_records: Vec<_> = records
+            .iter()
+            .filter(|r| r.principal.pid == 7_777)
+            .collect();
+        assert_eq!(nc_records.len(), 1, "{records:#?}");
+        assert_eq!(
+            nc_records[0].response, "none",
+            "a Log decision runs nothing"
+        );
+        assert!(
+            journal.rows().is_empty(),
+            "no action: no intent ({:#?})",
+            journal.rows()
+        );
+    }
 }

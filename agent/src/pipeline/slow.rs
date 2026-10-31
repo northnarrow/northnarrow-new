@@ -271,4 +271,34 @@ mod tests {
         assert!(slow.defer(burst(1, 30)).is_err());
         assert_eq!(slow.counts().2, 1);
     }
+
+    /// A prepared burst ends the decision's wait on the bus at once (the
+    /// waker), not at its next idle round.
+    #[test]
+    fn a_prepared_burst_wakes_the_decision() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_tx, mut rx) = northnarrow_agent::sensors::bus::channel();
+        let tmp = tempfile::tempdir().unwrap();
+        let lineage = northnarrow_agent::posture::lineage::AuthSessionTracker::new(tmp.path());
+        let tracker = Arc::new(RansomTracker::new(lineage));
+        let slow = SlowWork::start(tracker, Some(rx.waker()));
+        slow.defer(burst(4242, 10)).unwrap();
+        let started = Instant::now();
+        let got = rx.recv_blocking(rt.handle(), None, Duration::from_secs(20));
+        assert!(
+            matches!(got, northnarrow_agent::sensors::bus::Recv::Idle),
+            "woken, no event"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(slow.take_ready().len(), 1);
+        slow.stop();
+    }
 }

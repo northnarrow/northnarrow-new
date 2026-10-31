@@ -352,3 +352,74 @@ fn host_critical_guard_applies_to_every_pid_scoped_action() {
         ExecutionOutcome::Refused { reason, .. } if reason.contains("Log action")
     ));
 }
+
+/// R12c (lab PR 270): an action's report as its signed outcome — each
+/// outcome's result, and a kill tree with a descendant left running is a
+/// partial success, never a success.
+#[test]
+fn journal_outcome_says_what_each_outcome_is() {
+    use super::journal::ActionResult as R;
+    let report = |primary, additional| super::ExecutionReport {
+        action: ResponseAction::KillProcessTree,
+        primary,
+        additional,
+        elapsed: Duration::from_micros(1),
+    };
+    let r = |primary| super::journal_outcome(&report(primary, Vec::new())).0;
+    assert_eq!(r(ExecutionOutcome::Killed { pid: 1 }), R::Success);
+    assert_eq!(r(ExecutionOutcome::Blocked { pid: 1 }), R::Success);
+    assert_eq!(
+        r(ExecutionOutcome::WouldExecute { pid: 1 }),
+        R::WouldExecute
+    );
+    assert_eq!(r(ExecutionOutcome::AlreadyGone { pid: 1 }), R::NotRun);
+    assert_eq!(
+        r(ExecutionOutcome::Refused {
+            pid: 1,
+            reason: "PID is protected"
+        }),
+        R::Failure
+    );
+    assert_eq!(
+        r(ExecutionOutcome::Failed {
+            pid: 1,
+            errno: libc::ETIMEDOUT
+        }),
+        R::Failure
+    );
+    assert_eq!(
+        r(ExecutionOutcome::PermissionDenied { pid: 1, errno: 1 }),
+        R::Failure
+    );
+    assert_eq!(
+        r(ExecutionOutcome::TreeTruncated { pid: 1, limit: 9 }),
+        R::Partial
+    );
+    assert_eq!(
+        r(ExecutionOutcome::Throttled {
+            pid: 1,
+            cpu_max_pct: Some(10),
+            io_weight: None,
+            memory_high_bytes: Some(1)
+        }),
+        R::Partial
+    );
+    let (res, text, reason) = super::journal_outcome(&report(
+        ExecutionOutcome::Killed { pid: 1 },
+        vec![
+            ExecutionOutcome::Killed { pid: 2 },
+            ExecutionOutcome::Refused {
+                pid: 3,
+                reason: "ssh-service(sshd)",
+            },
+        ],
+    ));
+    assert_eq!(res, R::Partial);
+    assert!(text.contains("2 descendant(s), 1 not contained"), "{text}");
+    assert_eq!(reason.as_deref(), Some("1 descendant(s) not contained"));
+    let (res, _, reason) = super::journal_outcome(&report(
+        ExecutionOutcome::Killed { pid: 1 },
+        vec![ExecutionOutcome::AlreadyGone { pid: 2 }],
+    ));
+    assert_eq!((res, reason), (R::Success, None));
+}
