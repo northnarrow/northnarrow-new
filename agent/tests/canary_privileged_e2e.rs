@@ -799,6 +799,126 @@ fn a_reader_daemon_older_than_the_agent_stays_spared_after_2100_execs() {
     let _ = daemon.wait();
 }
 
+/// Third review of #475 (X1): an anti-malware daemon started after the
+/// agent as a `Type=forking` unit — its process executes, forks the daemon
+/// and exits, the daemon reparented to pid 1 before any sweep of the
+/// lineage — is CANARY-001's reader once the sweep found its parent gone:
+/// the read is recorded High and the daemon is not killed. The daemon is a
+/// copy of bash named `clamd` in a system tree whose subshell (a fork, no
+/// exec) reads the decoy from its own process when the test tells it to,
+/// after one sweep's period.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn a_type_forking_reader_daemon_started_after_the_agent_stays_spared() {
+    let _eni = EniIptablesGuard::install();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let decoy = tmp.path().join("decoy_backup_keys.txt");
+    let go = tmp.path().join("go");
+    let pid_file = PathBuf::from(format!(
+        "/run/nn-e2e-clamd-forking-{}.pid",
+        std::process::id()
+    ));
+    assert!(Command::new("mkfifo")
+        .arg(&go)
+        .status()
+        .expect("mkfifo")
+        .success());
+    let dir = PathBuf::from(format!(
+        "/usr/local/lib/nn-e2e-clamd-forking-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("the daemon's directory");
+    let unit = format!("nn-e2e-clamd-forking-{}", std::process::id());
+    struct Gone(PathBuf, String, PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = Command::new("systemctl")
+                .args(["stop", &self.1])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_file(&self.2);
+        }
+    }
+    let _gone = Gone(dir.clone(), unit.clone(), pid_file.clone());
+    let clamd = dir.join("clamd");
+    std::fs::copy("/bin/bash", &clamd).expect("seed the daemon's binary");
+
+    // the agent first: the daemon starts after it
+    let fx = CanaryFixture::setup(&[]);
+    // the unit's process forks the daemon (a subshell), writes its pid, exits
+    let started = Command::new("systemd-run")
+        .arg(format!("--unit={unit}"))
+        .args(["--collect", "-p", "Type=forking"])
+        .args(["-p", &format!("PIDFile={}", pid_file.display())])
+        .arg(&clamd)
+        .arg("-c")
+        .arg(format!(
+            "( read -r _ < '{go}'; read -r _ < '{decoy}'; read -r _ < '{go}' ) & echo $! > '{pid}'; exit 0",
+            go = go.display(),
+            decoy = decoy.display(),
+            pid = pid_file.display()
+        ))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("systemd-run");
+    assert!(started.success(), "the Type=forking unit started");
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("the daemon's pid file")
+        .trim()
+        .parse()
+        .expect("a pid");
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("the daemon runs");
+    let ppid = stat
+        .rsplit_once(')')
+        .and_then(|(_, r)| r.split_whitespace().nth(1))
+        .expect("its parent");
+    assert_eq!(ppid, "1", "reparented to pid 1: {stat}");
+    // one sweep of the lineage's period (5 s) and a margin
+    std::thread::sleep(Duration::from_secs(7));
+    let canary_id = fx.deploy_file_canary("honeypot-backup", &decoy);
+    assert_eq!(canary_id.len(), 32);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&go)
+        .and_then(|mut f| f.write_all(b"go\n"))
+        .expect("tell the daemon to read");
+    let rows = fx.wait_access(1);
+    assert_eq!(
+        rows[0]["accessor_pid"].as_u64(),
+        Some(u64::from(pid)),
+        "{rows:?}"
+    );
+    let rec = common::wait_jsonl_row(
+        &fx.detections_log,
+        ACCESS_LOG_POLL_TIMEOUT,
+        "NN-L-CANARY-001 record of the daemon",
+        |r| {
+            r["rule_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("NN-L-CANARY-001"))
+                && r["principal"]["pid"].as_u64() == Some(u64::from(pid))
+        },
+    );
+    assert_eq!(
+        rec["severity"], "High",
+        "a reader's read is recorded: {rec}"
+    );
+    assert!(
+        !rec["response"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("KillProcessTree")),
+        "the reader is not killed: {rec}"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the daemon still runs"
+    );
+}
+
 /// External audit DEC-001 and DEC-003: a file canary deployed at runtime
 /// in a directory the FIM path list does not cover trips, and still trips
 /// after the agent restarts — the boot used to publish an empty

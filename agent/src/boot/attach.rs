@@ -204,7 +204,7 @@ pub(crate) async fn load(
     // decision thread): the cached processes that exited marked (their
     // entries dropped only past the cache's size and their grace), the
     // forks of cached processes that run their image entered.
-    spawn_lineage_sweep(lineage.clone());
+    spawn_lineage_sweep(lineage.clone(), sensor.ring_drops().clone());
     info!(
         sensors =
             "process_spawn, file_open, exec_check, tcp_connect_v4, tcp_connect_v6, dns_query, \
@@ -412,7 +412,10 @@ const LINEAGE_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(
 /// Review of #475: [`AuthSessionTracker::sweep`] every
 /// [`LINEAGE_SWEEP_EVERY`] on a thread of its own (`nn-lineage-sweep`); a
 /// live process's entry dropped at the cache's hard bound is WARNed.
-fn spawn_lineage_sweep(lineage: AuthSessionTracker) {
+fn spawn_lineage_sweep(
+    lineage: AuthSessionTracker,
+    losses: nn_linux::sensors::ring_drops::RingDrops,
+) {
     let spawned = std::thread::Builder::new()
         .name("nn-lineage-sweep".to_string())
         .spawn(move || {
@@ -421,18 +424,30 @@ fn spawn_lineage_sweep(lineage: AuthSessionTracker) {
                 std::thread::sleep(LINEAGE_SWEEP_EVERY);
                 let r = lineage.sweep();
                 if r.evicted_live > evicted_live {
+                    let dropped = r.evicted_live - evicted_live;
                     warn!(
-                        dropped = r.evicted_live - evicted_live,
+                        dropped,
                         total = r.evicted_live,
                         entries = r.entries,
                         "lineage: entries of processes not known to have exited dropped at the \
                          cache's hard bound — their events are judged \"not known\""
+                    );
+                    // third review of #475: a signal lost, as a full cap table
+                    let what = format!("lineage entries of live processes {dropped}");
+                    losses.raise_loss_signal(
+                        &what,
+                        "lineage hard bound",
+                        &format!(
+                            "lineage: {what} dropped at the cache's hard bound — their events \
+                             are judged \"not known\""
+                        ),
                     );
                     evicted_live = r.evicted_live;
                 }
                 debug!(
                     gone = r.gone,
                     forks = r.forks,
+                    orphans = r.orphans,
                     entries = r.entries,
                     "lineage: sweep"
                 );
@@ -464,9 +479,13 @@ mod tests {
             .find("let seeded = lineage.seed_from_proc();")
             .expect("the start's scan");
         let swept = code
-            .find("spawn_lineage_sweep(lineage.clone());")
+            .find("spawn_lineage_sweep(lineage.clone(), sensor.ring_drops().clone());")
             .expect("the sweep started");
         assert!(attached < seeded && seeded < swept);
         assert!(code.contains("let r = lineage.sweep();"));
+        // third review of #475: the hard bound's drops of live processes'
+        // entries raise the posture, not only a WARN
+        let sweep = &code[code.find("fn spawn_lineage_sweep(").expect("the sweep")..];
+        assert!(sweep.contains("losses.raise_loss_signal("));
     }
 }

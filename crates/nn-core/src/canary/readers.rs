@@ -297,4 +297,35 @@ mod tests {
             Some("/usr/sbin/clamd")
         );
     }
+
+    /// Third review of #475 (X1): an anti-malware daemon started after the
+    /// agent that forks and exits (`Type=forking`) — its child reparented to
+    /// pid 1 — is a reader once the sweep found its parent gone: CANARY-001's
+    /// exemption holds for the daemon that does the reading.
+    #[test]
+    fn a_daemon_that_forked_after_the_agent_s_start_is_a_reader_once_swept() {
+        use crate::posture::lineage::AsOf;
+        const S: u64 = 1_000_000_000;
+        let (dir, t) = tracker();
+        t.ingest_exec(500, 1, "/usr/sbin/clamd", &[], 10 * S, 10 * S, 0);
+        let d = dir.path().join("501");
+        std::fs::create_dir_all(&d).unwrap();
+        crate::posture::host::testing::symlink("/usr/sbin/clamd", d.join("exe")).unwrap();
+        std::fs::write(
+            d.join("status"),
+            "Name:\tclamd\nPid:\t501\nPPid:\t1\nUid:\t0\t0\t0\t0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("stat"),
+            "501 (clamd) S 1 501 501 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 1005 0 0\n",
+        )
+        .unwrap();
+        assert_eq!(t.sweep().orphans, 1);
+        let r = CanaryReaders::new(BTreeSet::new(), t);
+        assert_eq!(
+            r.reader(501, AsOf::Judged(20 * S)).as_deref(),
+            Some("/usr/sbin/clamd")
+        );
+    }
 }

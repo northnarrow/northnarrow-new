@@ -865,6 +865,10 @@ pub enum CapTarget {
     },
     /// A `bpf()` command (uapi, or a synthetic `BPF_CMD_*`).
     Bpf { cmd: u32 },
+    /// Third review of #475: `keys` keys a full table released past
+    /// [`FloodCap`]'s bound on them, their counts summed per kind and uid
+    /// (the uid [`u32::MAX`]: the uids past the bound on those sums).
+    Rest { keys: u32 },
 }
 
 /// The cap's key: the kind of flood, the actor's uid, and its target.
@@ -916,6 +920,9 @@ impl CapKey {
             }),
             CapTarget::Bpf { cmd } => serde_json::json!({
                 "cmd": common::wire::bpf_cmd_name(cmd),
+            }),
+            CapTarget::Rest { keys } => serde_json::json!({
+                "released_keys": keys,
             }),
         }
     }
@@ -970,8 +977,12 @@ pub struct FloodCap {
     overflow: u64,
     overflow_root: bool,
     overflow_total: u64,
-    /// Pending counts of keys a full table released before their row.
+    /// Pending counts of keys a full table released before their row, at
+    /// most `keys` of them; past it summed per kind and uid, at most `keys`
+    /// sums and then one per kind for the rest of the uids (third review of
+    /// #475: a row names a bounded number of keys).
     released: Vec<Capped>,
+    released_rest: std::collections::HashMap<(FloodKind, u32), Capped>,
 }
 
 impl Default for FloodCap {
@@ -993,6 +1004,7 @@ impl FloodCap {
             overflow_root: false,
             overflow_total: 0,
             released: Vec::new(),
+            released_rest: std::collections::HashMap::new(),
         }
     }
 
@@ -1085,6 +1097,7 @@ impl FloodCap {
     /// capped something —, the most first; the keys start counting again.
     pub fn take_pending(&mut self) -> Vec<Capped> {
         let mut out: Vec<Capped> = std::mem::take(&mut self.released);
+        out.extend(self.released_rest.drain().map(|(_, c)| c));
         out.extend(self.windows.values_mut().filter_map(|w| w.pending.take()));
         out.sort_by(|a, b| {
             b.count
@@ -1107,7 +1120,54 @@ impl FloodCap {
             .map(|(k, _)| *k);
         if let Some(k) = oldest {
             if let Some(Some(p)) = self.windows.remove(&k).map(|w| w.pending) {
-                self.released.push(p);
+                self.push_released(p);
+            }
+        }
+    }
+
+    /// A released key's pending count, kept for the next row: as it is
+    /// while fewer than `keys` are, else added to its kind's and uid's sum
+    /// (past `keys` sums, to its kind's for the uid [`u32::MAX`]).
+    fn push_released(&mut self, p: Capped) {
+        if self.released.len() < self.keys {
+            self.released.push(p);
+            return;
+        }
+        let uid = if self.released_rest.len() < self.keys
+            || self.released_rest.contains_key(&(p.kind, p.uid))
+        {
+            p.uid
+        } else {
+            u32::MAX
+        };
+        let r = self
+            .released_rest
+            .entry((p.kind, uid))
+            .or_insert_with(|| Capped {
+                kind: p.kind,
+                uid,
+                target: CapTarget::Rest { keys: 0 },
+                count: 0,
+                first_ns: p.first_ns,
+                last_ns: p.last_ns,
+                samples: Vec::new(),
+            });
+        r.count += p.count;
+        r.first_ns = r.first_ns.min(p.first_ns);
+        r.last_ns = r.last_ns.max(p.last_ns);
+        if let CapTarget::Rest { keys } = &mut r.target {
+            *keys = keys.saturating_add(1);
+        }
+        for s in p.samples {
+            if r.samples.len() >= FLOOD_CAP_SAMPLES {
+                break;
+            }
+            if !r
+                .samples
+                .iter()
+                .any(|x| x.comm == s.comm && x.what == s.what)
+            {
+                r.samples.push(s);
             }
         }
     }
@@ -1864,6 +1924,39 @@ mod tests {
             "uid 1's released count and uid 3's: {rows:?}"
         );
         assert!(rows.iter().any(|r| r.uid == 1 && r.count == 1));
+    }
+
+    /// Third review of #475: the keys a full table releases are kept apart
+    /// up to the table's size, then summed per kind and uid (as many sums,
+    /// then one per kind for the rest of the uids) — a row names a bounded
+    /// number of keys, and every count is in it.
+    #[test]
+    fn released_keys_past_the_bound_are_summed_per_kind_and_uid() {
+        let mut cap = FloodCap::new(1, 100, 2);
+        let mut t = 0;
+        let mut capped = 0;
+        // 8 keys, each capped once, each window ended before the next key:
+        // every new key past the second releases an older one
+        for uid in 1..=8u32 {
+            assert!(cap.admit(key(FloodKind::Bpf, uid), t, || sample(uid)));
+            assert!(!cap.admit(key(FloodKind::Bpf, uid), t + 1, || sample(uid)));
+            capped += 1;
+            t += 200;
+        }
+        assert_eq!(cap.take_overflow().0, 0);
+        let rows = cap.take_pending();
+        assert_eq!(rows.iter().map(|r| r.count).sum::<u64>(), capped);
+        // released 2, sums 2 and one per kind for the rest, the table's 2
+        assert!(rows.len() <= 2 + (2 + 3) + 2, "{rows:?}");
+        let rest: Vec<_> = rows
+            .iter()
+            .filter(|r| matches!(r.target, CapTarget::Rest { .. }))
+            .collect();
+        assert!(!rest.is_empty(), "past the bound: summed ({rows:?})");
+        assert!(
+            rest.iter().any(|r| r.uid == u32::MAX),
+            "past the sums' bound: the rest of the uids ({rows:?})"
+        );
     }
 
     /// Review of #474: inside a uid the cap counts each command and each

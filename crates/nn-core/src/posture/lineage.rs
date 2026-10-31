@@ -345,6 +345,10 @@ pub struct SweepReport {
     /// Running processes entered as forks of a cached parent whose image
     /// they still run.
     pub forks: usize,
+    /// Third review of #475: running processes entered as the orphans of a
+    /// cached process found gone in the sweep (a daemon's child after the
+    /// parent exited), whose image they still run.
+    pub orphans: usize,
     /// Entries the map holds after it.
     pub entries: usize,
     /// Entries of processes not known to have exited that were dropped at
@@ -729,6 +733,14 @@ struct InnerState {
     /// Entries dropped at [`TRACKER_HARD_CAP`] whose process was not known
     /// to have exited.
     evicted_live: u64,
+    /// Third review of #475: per uid, the entries of processes executed
+    /// since the start (not the start's scan's), and their insertion order
+    /// (pids the map no longer holds as that uid's are skipped, and pruned
+    /// with [`Self::order`]) — the hard bound's victims
+    /// ([`AuthSessionTracker::hard_victim`]).
+    uid_count: HashMap<u32, usize>,
+    by_uid: HashMap<u32, VecDeque<u32>>,
+    by_uid_len: usize,
 }
 
 /// Lab PR 267 (review #471 A1): earlier execs kept per pid (a wrapper's
@@ -902,6 +914,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     exited: HashMap::new(),
                     exited_order: VecDeque::new(),
                     evicted_live: 0,
+                    uid_count: HashMap::new(),
+                    by_uid: HashMap::new(),
+                    by_uid_len: 0,
                 }),
                 proc_root,
                 live,
@@ -1189,11 +1204,88 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         } else if s.daemons.remove(&pid).is_some() {
             s.daemon_order.retain(|p| *p != pid);
         }
-        let had_prior = s.map.insert(pid, entry).is_some();
-        if !had_prior {
+        let (uid, evictable) = (entry.uid, entry.spawn_ns != 0);
+        let prev = s.map.insert(pid, entry);
+        if let Some(p) = &prev {
+            Self::count_out(&mut s, p);
+        }
+        if evictable {
+            *s.uid_count.entry(uid).or_default() += 1;
+            if prev
+                .as_ref()
+                .is_none_or(|p| p.spawn_ns == 0 || p.uid != uid)
+            {
+                s.by_uid.entry(uid).or_default().push_back(pid);
+                s.by_uid_len += 1;
+            }
+        }
+        if prev.is_none() {
             s.order.push_back(pid);
             self.make_room(&mut s);
         }
+    }
+
+    /// Third review of #475: an entry leaves the map — its uid's count of
+    /// entries executed since the start ([`InnerState::uid_count`]).
+    fn count_out(s: &mut InnerState, e: &Entry) {
+        if e.spawn_ns == 0 {
+            return;
+        }
+        if let Some(c) = s.uid_count.get_mut(&e.uid) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                s.uid_count.remove(&e.uid);
+            }
+        }
+    }
+
+    /// Third review of #475: the entry the hard bound drops. A gone
+    /// process's first, whatever its grace; else the oldest entry of the
+    /// uid holding the most among the processes executed since the start —
+    /// users' (above [`SYSTEM_UID_MAX`]) before system accounts' —, so a
+    /// flood of one user's live processes pushes out that user's own; the
+    /// processes the start's scan entered (the boot's daemons, an older
+    /// session) last.
+    fn hard_victim(s: &mut InnerState) -> Option<u32> {
+        while let Some(p) = s.exited_order.pop_front() {
+            if s.exited.contains_key(&p) && s.map.contains_key(&p) {
+                return Some(p);
+            }
+        }
+        for system in [false, true] {
+            while let Some(uid) = s
+                .uid_count
+                .iter()
+                .filter(|(u, _)| (**u <= SYSTEM_UID_MAX) == system)
+                .max_by_key(|(u, c)| (**c, std::cmp::Reverse(**u)))
+                .map(|(u, _)| *u)
+            {
+                let mut found = None;
+                if let Some(q) = s.by_uid.get_mut(&uid) {
+                    while let Some(p) = q.pop_front() {
+                        s.by_uid_len = s.by_uid_len.saturating_sub(1);
+                        if s.map
+                            .get(&p)
+                            .is_some_and(|e| e.spawn_ns != 0 && e.uid == uid)
+                        {
+                            found = Some(p);
+                            break;
+                        }
+                    }
+                }
+                if found.is_some() {
+                    return found;
+                }
+                // a count without an entry in order (not expected): dropped
+                s.uid_count.remove(&uid);
+            }
+        }
+        while let Some(p) = s.order.pop_front() {
+            if s.map.contains_key(&p) {
+                return Some(p);
+            }
+        }
+        None
     }
 
     /// Review of #475: past [`TRACKER_CAP`], drop the entries of processes
@@ -1211,7 +1303,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 Some(at) if at.elapsed() >= b.grace => {
                     s.exited_order.pop_front();
                     s.exited.remove(&front);
-                    s.map.remove(&front);
+                    if let Some(e) = s.map.remove(&front) {
+                        Self::count_out(s, &e);
+                    }
                     s.history.remove(&front);
                 }
                 // the oldest gone is still in its grace: so are the rest
@@ -1223,25 +1317,38 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             }
         }
         while s.map.len() > b.hard {
-            let Some(evict) = s.order.pop_front() else {
+            let Some(evict) = Self::hard_victim(s) else {
                 break;
             };
-            if s.map.remove(&evict).is_some() {
+            if let Some(e) = s.map.remove(&evict) {
+                Self::count_out(s, &e);
                 s.history.remove(&evict);
                 if s.exited.remove(&evict).is_none() {
                     s.evicted_live += 1;
                 }
             }
         }
-        // the insertion order keeps no pid the map dropped for long
+        // the insertion orders keep no pid the map dropped for long
         if s.order.len() > 2 * s.map.len() + 1024 {
             let map = &s.map;
             s.order.retain(|p| map.contains_key(p));
         }
+        if s.by_uid_len > 2 * s.map.len() + 1024 {
+            let map = &s.map;
+            let mut len = 0;
+            for (uid, q) in s.by_uid.iter_mut() {
+                q.retain(|p| map.get(p).is_some_and(|e| e.spawn_ns != 0 && e.uid == *uid));
+                len += q.len();
+            }
+            s.by_uid.retain(|_, q| !q.is_empty());
+            s.by_uid_len = len;
+        }
     }
 
     /// Review of #475: the entries of processes not known to have exited
-    /// that [`TRACKER_HARD_CAP`] dropped since the start.
+    /// that [`TRACKER_HARD_CAP`] dropped since the start (the agent's sweep
+    /// raises the posture's `TelemetryLoss` when it grows: their events are
+    /// judged "not known").
     pub fn evicted_live(&self) -> u64 {
         self.inner.state.read().evicted_live
     }
@@ -1258,6 +1365,12 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// entered as that image since its start — a prefork worker, a
     /// subshell, a daemon's child after its parent exited. A process that
     /// executed something else is never entered here (its exec event is).
+    ///
+    /// Third review of #475: a pid the sweep found naming another process
+    /// than its entry's (reused by a fork) is tried the same way; and a
+    /// running process reparented when its parent exited, which runs the
+    /// image of a process this sweep found gone, is entered as that
+    /// process's orphan ([`Self::orphan_entry`]: `Type=forking`, `daemon()`).
     pub fn sweep(&self) -> SweepReport {
         let cached: Vec<(u32, u64)> = {
             let s = self.inner.state.read();
@@ -1267,25 +1380,33 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 .map(|(pid, e)| (*pid, e.start_ns))
                 .collect()
         };
-        let gone: Vec<u32> = cached
-            .into_iter()
-            .filter(|(pid, start)| match self.proc_start_ticks(*pid) {
-                None => true,
-                Some(ticks) => *start != 0 && !self.ticks_show_start(ticks, *start),
-            })
-            .map(|(pid, _)| pid)
-            .collect();
+        let mut gone = Vec::new();
+        for (pid, start) in cached {
+            match self.proc_start_ticks(pid) {
+                None => gone.push(pid),
+                Some(ticks) if start != 0 && !self.ticks_show_start(ticks, start) => gone.push(pid),
+                Some(_) => {}
+            }
+        }
         let now = std::time::Instant::now();
+        // third review of #475: the gone processes' images, for their orphans
+        let mut gone_by_exe: HashMap<PathBuf, Vec<Entry>> = HashMap::new();
         {
             let mut s = self.inner.state.write();
             for pid in &gone {
+                if let Some(e) = s.map.get(pid) {
+                    gone_by_exe
+                        .entry(e.exe.clone())
+                        .or_default()
+                        .push(e.clone());
+                }
                 if s.map.contains_key(pid) && s.exited.insert(*pid, now).is_none() {
                     s.exited_order.push_back(*pid);
                 }
             }
             self.make_room(&mut s);
         }
-        let mut forks = 0;
+        let (mut forks, mut orphans) = (0, 0);
         if let Ok(dir) = H::read_dir(&self.inner.proc_root) {
             for entry in dir.flatten() {
                 let Some(pid) = entry
@@ -1295,13 +1416,19 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 else {
                     continue;
                 };
-                if pid == 0 || self.holds(pid) {
+                // a pid whose entry the sweep marked gone names another
+                // process now (third review of #475: a pid reused by a fork)
+                if pid == 0 || self.holds_unmarked(pid) {
                     continue;
                 }
-                let Some(e) = self.fork_entry(pid, None, 0) else {
-                    continue;
+                let (e, orphan) = match self.fork_entry(pid, None, 0) {
+                    Some(e) => (e, false),
+                    None => match self.orphan_entry(pid, &gone_by_exe) {
+                        Some(e) => (e, true),
+                        None => continue,
+                    },
                 };
-                if self.holds(pid) {
+                if self.holds_unmarked(pid) {
                     continue;
                 }
                 self.ingest_inner(
@@ -1314,16 +1441,102 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     e.start_ns,
                     e.uid,
                 );
-                forks += 1;
+                if orphan {
+                    orphans += 1;
+                } else {
+                    forks += 1;
+                }
             }
         }
         let s = self.inner.state.read();
         SweepReport {
             gone: gone.len(),
             forks,
+            orphans,
             entries: s.map.len(),
             evicted_live: s.evicted_live,
         }
+    }
+
+    /// The cache holds an exec of `pid` the sweep has not found gone.
+    fn holds_unmarked(&self, pid: u32) -> bool {
+        let s = self.inner.state.read();
+        (s.map.contains_key(&pid) && !s.exited.contains_key(&pid)) || s.daemons.contains_key(&pid)
+    }
+
+    /// Third review of #475 (X1): `pid`, which the cache does not hold and
+    /// whose parent does not run its image, as the orphan of a process the
+    /// sweep found gone (`gone`, by image): a `Type=forking` unit's daemon,
+    /// a `daemon()` child, whose parent executed the image, forked and
+    /// exited before any sweep — reparented to pid 1, or to a subreaper
+    /// among that process's ancestors; started no earlier than that
+    /// process's exec; and running that very file (`/proc/<pid>/exe`). Every
+    /// gone process of the image it could descend from must have run the
+    /// same script (an interpreter's), else not known. Its parent stays the
+    /// one `/proc` shows (a walk from it learns nothing of the gone
+    /// process's session); its uid is its own.
+    fn orphan_entry(&self, pid: u32, gone: &HashMap<PathBuf, Vec<Entry>>) -> Option<Entry> {
+        if gone.is_empty() || pid <= 1 {
+            return None;
+        }
+        let (ppid, ticks) = self.proc_parent_and_start(pid)?;
+        let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
+        let tick = H::clock_tick_ns();
+        // the boot clock's start is the latest the monotonic one can be
+        let latest = ticks.saturating_mul(tick) + 2 * tick;
+        let could: Vec<&Entry> = gone
+            .get(&exe)?
+            .iter()
+            .filter(|e| e.spawn_ns <= latest && e.start_ns <= latest)
+            .collect();
+        let first = *could.first()?;
+        if could
+            .iter()
+            .any(|e| e.script != first.script || e.argv_npm_cli != first.argv_npm_cli)
+        {
+            return None;
+        }
+        if ppid != 1 && !could.iter().any(|e| self.is_cached_ancestor(ppid, e.ppid)) {
+            return None;
+        }
+        let uid = H::read_to_string(self.inner.proc_root.join(pid.to_string()).join("status"))
+            .ok()
+            .and_then(|t| parse_real_uid(&t))
+            .unwrap_or(first.uid);
+        // the pid still names the process whose start was read
+        if self.proc_parent_and_start(pid)? != (ppid, ticks) {
+            return None;
+        }
+        let start_ns = ticks
+            .saturating_mul(tick)
+            .saturating_sub(self.suspended_ns())
+            .max(1);
+        Some(Entry {
+            ppid,
+            exe,
+            spawn_ns: start_ns,
+            start_ns,
+            argv_npm_cli: first.argv_npm_cli,
+            script: first.script.clone(),
+            uid,
+        })
+    }
+
+    /// `ancestor` is `from` or one of its parents, as the cache holds them
+    /// (at most [`LINEAGE_DEPTH_CAP`] up).
+    fn is_cached_ancestor(&self, ancestor: u32, from: u32) -> bool {
+        let s = self.inner.state.read();
+        let mut cur = from;
+        for _ in 0..LINEAGE_DEPTH_CAP {
+            if cur == ancestor {
+                return true;
+            }
+            match s.map.get(&cur).or_else(|| s.daemons.get(&cur)) {
+                Some(e) if e.ppid != cur && e.ppid != 0 => cur = e.ppid,
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// Review of #475: `pid`, which the cache does not hold, as a fork of
@@ -1351,7 +1564,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if at.is_some_and(|t| start_ns.saturating_sub(2 * tick) > t) {
             return None;
         }
-        let parent = match self.cached_at(ppid, Some(start_ns)) {
+        let parent = match self.cached_live(ppid, Some(start_ns)) {
             CachedAt::Current(e) | CachedAt::Past(e) => e,
             CachedAt::LaterOnly => return None,
             CachedAt::Absent => self.fork_entry(ppid, Some(start_ns), depth + 1)?,
@@ -1364,6 +1577,11 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             .ok()
             .and_then(|t| parse_real_uid(&t))
             .unwrap_or(parent.uid);
+        // third review of #475: the pid still names the process whose start
+        // was read (a reuse between the reads would mix two processes)
+        if self.proc_parent_and_start(pid)? != (ppid, ticks) {
+            return None;
+        }
         Some(Entry {
             ppid,
             exe: parent.exe,
@@ -1408,6 +1626,41 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 _ => CachedAt::LaterOnly,
             },
             _ => CachedAt::Current(cur.clone()),
+        }
+    }
+
+    /// Third review of #475 (X2): [`Self::cached_at`], checked with live
+    /// checks on against the process the pid names now — a latest exec
+    /// whose process is not that one (`/proc/<pid>/stat` shows another
+    /// start) answers as not held ([`CachedAt::Absent`]: a fork of its
+    /// parent in a judgement, [`Self::fork_entry`]; `/proc` outside one)
+    /// at a time that process may already have existed (its start, less
+    /// the host's suspended time and two ticks, at or before the time; or
+    /// no time): the pid was reused by a fork, which no exec announces.
+    /// For a time before that process started, the cached exec is still
+    /// what the pid ran then; a pid `/proc` no longer shows keeps its last
+    /// record.
+    fn cached_live(&self, pid: u32, at: Option<u64>) -> CachedAt {
+        let found = self.cached_at(pid, at);
+        let CachedAt::Current(e) = &found else {
+            return found;
+        };
+        if !self.inner.live || e.start_ns == 0 {
+            return found;
+        }
+        let Some(ticks) = self.proc_start_ticks(pid) else {
+            return found;
+        };
+        if self.ticks_show_start(ticks, e.start_ns) {
+            return found;
+        }
+        let tick = H::clock_tick_ns();
+        let floor = ticks
+            .saturating_mul(tick)
+            .saturating_sub(self.suspended_ns() + 2 * tick);
+        match at {
+            Some(t) if floor > t => found,
+            _ => CachedAt::Absent,
         }
     }
 
@@ -1946,7 +2199,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if pid == 0 || pid == 1 {
             return false;
         }
-        match self.cached_at(pid, as_of.time()) {
+        match self.cached_live(pid, as_of.time()) {
             CachedAt::Current(e) | CachedAt::Past(e) => e.argv_npm_cli && is_node_exe(&e.exe),
             CachedAt::LaterOnly | CachedAt::Absent => false,
         }
@@ -2106,7 +2359,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// ([`AsOf::Judged`]) whenever the cache holds no exec of the process
     /// the pid named then.
     fn hop(&self, pid: u32, as_of: AsOf) -> Option<Hop> {
-        let (cached, past) = match self.cached_at(pid, as_of.time()) {
+        let (cached, past) = match self.cached_live(pid, as_of.time()) {
             CachedAt::Current(e) => (Some(e), false),
             CachedAt::Past(e) => (Some(e), true),
             CachedAt::LaterOnly => return None,
@@ -2391,7 +2644,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if pid == 0 {
             return None;
         }
-        match self.cached_at(pid, as_of.time()) {
+        match self.cached_live(pid, as_of.time()) {
             CachedAt::Current(e) | CachedAt::Past(e) => {
                 return Some(ExecIdentity {
                     exe: e.exe,
@@ -2441,7 +2694,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if pid == 0 {
             return None;
         }
-        match self.cached_at(pid, as_of.time()) {
+        match self.cached_live(pid, as_of.time()) {
             CachedAt::Current(e) | CachedAt::Past(e) => {
                 return Some(e.exe.to_string_lossy().into_owned())
             }
@@ -4066,6 +4319,280 @@ mod tests {
             t.image_path_as(901, judged).as_deref(),
             Some("/usr/sbin/postgres"),
             "the backend's image, not unknown"
+        );
+    }
+
+    /// Third review of #475 (X1, the reviewer's RR1): a daemon that forks
+    /// and exits after the agent's start (`Type=forking`, `daemon()`) — its
+    /// child reparented to pid 1 before any sweep — is its image's orphan
+    /// once the sweep found the parent gone, in production mode (live
+    /// checks on). Not a process that executed something else, one started
+    /// before the gone process's exec, one reparented elsewhere, nor one
+    /// whose gone candidates ran different scripts.
+    #[test]
+    fn a_daemon_that_forks_and_exits_is_its_image_s_orphan_after_the_sweep() {
+        let proc = TempDir::new().unwrap();
+        write_exe(proc.path(), 1, "/usr/lib/systemd/systemd");
+        write_status(proc.path(), 1, 0);
+        write_started(proc.path(), "1", 0, 1);
+        let t = AuthSessionTracker::live_on(proc.path(), 0);
+        assert_eq!(t.seed_from_proc(), 1);
+        // clamd executed at 10 s by pid 1, forked 501 at 10.05 s, exited
+        t.ingest_exec(500, 1, "/usr/sbin/clamd", &[], 10 * S, 10 * S, 0);
+        write_exe(proc.path(), 501, "/usr/sbin/clamd");
+        write_status_uid(proc.path(), 501, 1, 0);
+        write_started(proc.path(), "501", 1, 1_005);
+        // reparented too, but: executed restic; started before clamd's
+        // exec; reparented to a process that is no ancestor of clamd's
+        write_exe(proc.path(), 502, "/usr/bin/restic");
+        write_status_uid(proc.path(), 502, 1, 0);
+        write_started(proc.path(), "502", 1, 1_006);
+        write_exe(proc.path(), 503, "/usr/sbin/clamd");
+        write_status_uid(proc.path(), 503, 1, 0);
+        write_started(proc.path(), "503", 1, 900);
+        write_exe(proc.path(), 504, "/usr/sbin/clamd");
+        write_status_uid(proc.path(), 504, 77, 0);
+        write_started(proc.path(), "504", 77, 1_007);
+        let judged = AsOf::Judged(20 * S);
+        assert_eq!(
+            t.exec_identity(501, judged),
+            None,
+            "before a sweep: not known"
+        );
+        let r = t.sweep();
+        assert_eq!((r.gone, r.orphans), (1, 1));
+        assert_eq!(
+            t.exec_identity(501, judged).map(|i| i.exe),
+            Some(PathBuf::from("/usr/sbin/clamd"))
+        );
+        assert_eq!(
+            t.image_path_as(501, judged).as_deref(),
+            Some("/usr/sbin/clamd")
+        );
+        for pid in [502, 503, 504] {
+            assert_eq!(t.exec_identity(pid, judged), None, "{pid}");
+        }
+        // two gone interpreters of different scripts: which one is not known
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::live_on(proc.path(), 0);
+        let py = |script: &str| ["python3".to_string(), script.to_string()];
+        t.ingest_exec(
+            600,
+            1,
+            "/usr/bin/python3",
+            &py("/opt/a.py"),
+            10 * S,
+            10 * S,
+            0,
+        );
+        t.ingest_exec(
+            610,
+            1,
+            "/usr/bin/python3",
+            &py("/opt/b.py"),
+            11 * S,
+            11 * S,
+            0,
+        );
+        write_exe(proc.path(), 620, "/usr/bin/python3");
+        write_status_uid(proc.path(), 620, 1, 0);
+        write_started(proc.path(), "620", 1, 1_200);
+        let r = t.sweep();
+        assert_eq!((r.gone, r.orphans), (2, 0));
+        assert_eq!(t.exec_identity(620, judged), None);
+        // one gone interpreter: its script
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::live_on(proc.path(), 0);
+        t.ingest_exec(
+            600,
+            1,
+            "/usr/bin/python3",
+            &py("/opt/a.py"),
+            10 * S,
+            10 * S,
+            0,
+        );
+        write_exe(proc.path(), 620, "/usr/bin/python3");
+        write_status_uid(proc.path(), 620, 1, 0);
+        write_started(proc.path(), "620", 1, 1_200);
+        assert_eq!(t.sweep().orphans, 1);
+        assert_eq!(
+            t.exec_identity(620, judged)
+                .and_then(|i| i.script)
+                .as_deref(),
+            Some("/opt/a.py")
+        );
+    }
+
+    /// Third review of #475 (X2, the reviewer's RR2; M11): a pid reused by
+    /// a fork while the dead process's entry is still cached is not the dead
+    /// process's image — an SSH session's bash subshell on restic's old pid
+    /// is bash, and auth-mediated (a regression against `main` before);
+    /// an event before the reuse is still restic's. The sweep finds the pid
+    /// naming another process and enters the fork.
+    #[test]
+    fn a_pid_reused_by_a_fork_is_not_the_dead_process_s_image() {
+        let proc = TempDir::new().unwrap();
+        write_exe(proc.path(), 550, "/usr/sbin/sshd");
+        write_status(proc.path(), 550, 1);
+        write_started(proc.path(), "550", 1, 100);
+        write_exe(proc.path(), 600, "/usr/bin/bash");
+        write_status(proc.path(), 600, 550);
+        write_started(proc.path(), "600", 550, 110);
+        let t = AuthSessionTracker::live_on(proc.path(), 0);
+        assert_eq!(t.seed_from_proc(), 2);
+        // restic ran as 700 from 10 s and exited; 700 is now the shell's
+        // subshell, forked at 30 s
+        t.ingest_exec(700, 1, "/usr/bin/restic", &[], 10 * S, 10 * S, 0);
+        write_exe(proc.path(), 700, "/usr/bin/bash");
+        write_status(proc.path(), 700, 600);
+        write_started(proc.path(), "700", 600, 3_000);
+        let judged = AsOf::Judged(40 * S);
+        assert_eq!(
+            t.exec_identity(700, judged).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/bash"))
+        );
+        assert_eq!(
+            t.image_path_as(700, judged).as_deref(),
+            Some("/usr/bin/bash")
+        );
+        assert!(t.is_auth_mediated(700, judged), "the session's subshell");
+        assert_eq!(
+            t.image_path_as(700, AsOf::Judged(15 * S)).as_deref(),
+            Some("/usr/bin/restic"),
+            "before the reuse the pid was restic"
+        );
+        assert_eq!(t.image_path(700).as_deref(), Some("/usr/bin/bash"));
+        let r = t.sweep();
+        assert_eq!(
+            (r.gone, r.forks),
+            (1, 1),
+            "the reused pid found, the fork entered"
+        );
+        assert_eq!(
+            t.exec_identity(700, judged).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/bash"))
+        );
+        assert!(t.is_auth_mediated(700, judged));
+        assert_eq!(
+            t.image_path_as(700, AsOf::Judged(15 * S)).as_deref(),
+            Some("/usr/bin/restic")
+        );
+    }
+
+    /// Third review of #475 (M5): a subshell of a subshell, both forked
+    /// within a sweep's period, runs the image of the first's parent — the
+    /// fork's parent itself a fork, not cached.
+    #[test]
+    fn a_fork_of_a_fork_runs_the_image_before_any_sweep() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::live_on(proc.path(), 0);
+        t.ingest_exec(600, 1, "/usr/bin/dpkg", &[], 10 * S, 10 * S, 0);
+        write_exe(proc.path(), 600, "/usr/bin/dpkg");
+        write_status(proc.path(), 600, 1);
+        write_started(proc.path(), "600", 1, 1_000);
+        let script = [
+            "sh".to_string(),
+            "/var/lib/dpkg/info/x.postinst".to_string(),
+        ];
+        t.ingest_exec(601, 600, "/usr/bin/dash", &script, 11 * S, 11 * S, 0);
+        write_exe(proc.path(), 601, "/usr/bin/dash");
+        write_status(proc.path(), 601, 600);
+        write_started(proc.path(), "601", 600, 1_100);
+        write_exe(proc.path(), 602, "/usr/bin/dash");
+        write_status(proc.path(), 602, 601);
+        write_started(proc.path(), "602", 601, 1_200);
+        write_exe(proc.path(), 603, "/usr/bin/dash");
+        write_status(proc.path(), 603, 602);
+        write_started(proc.path(), "603", 602, 1_250);
+        let judged = AsOf::Judged(13 * S);
+        assert_eq!(
+            t.exec_identity(603, judged).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/dash"))
+        );
+        assert!(t.in_package_transaction(603, judged), "dpkg's transaction");
+    }
+
+    /// Third review of #475 (M6): a forked worker that changed its uid is
+    /// judged as its own uid, not its parent's — man-db's worker still
+    /// `man` is the system cache writer, one switched to a user's is not.
+    #[test]
+    fn a_forked_worker_that_changed_its_uid_is_judged_as_its_own() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::live_on(proc.path(), 0);
+        t.ingest_exec(800, 1, MANDB_EXE, &[], 10 * S, 10 * S, 6);
+        write_exe(proc.path(), 800, MANDB_EXE);
+        write_status_uid(proc.path(), 800, 1, 6);
+        write_started(proc.path(), "800", 1, 1_000);
+        write_exe(proc.path(), 801, MANDB_EXE);
+        write_status_uid(proc.path(), 801, 800, 6);
+        write_started(proc.path(), "801", 800, 1_100);
+        write_exe(proc.path(), 802, MANDB_EXE);
+        write_status_uid(proc.path(), 802, 800, 1000);
+        write_started(proc.path(), "802", 800, 1_100);
+        let judged = AsOf::Judged(20 * S);
+        assert!(t.is_system_man_cache_writer(801, judged));
+        assert!(
+            !t.is_system_man_cache_writer(802, judged),
+            "its own uid, a user's"
+        );
+    }
+
+    /// Third review of #475 (M9): a walk does not take a fork for an event
+    /// before the fork's start — the pid named another process then.
+    #[test]
+    fn a_walk_does_not_take_a_fork_for_an_event_before_its_start() {
+        let proc = TempDir::new().unwrap();
+        write_exe(proc.path(), 700, "/usr/sbin/sshd");
+        write_status(proc.path(), 700, 1);
+        write_started(proc.path(), "700", 1, 100);
+        write_exe(proc.path(), 701, "/usr/bin/bash");
+        write_status(proc.path(), 701, 700);
+        write_started(proc.path(), "701", 700, 110);
+        let t = AuthSessionTracker::live_on(proc.path(), 0);
+        assert_eq!(t.seed_from_proc(), 2);
+        write_exe(proc.path(), 703, "/usr/bin/bash");
+        write_status(proc.path(), 703, 701);
+        write_started(proc.path(), "703", 701, 220_000);
+        assert!(t.is_auth_mediated(703, AsOf::Judged(2_300 * S)));
+        assert!(
+            !t.is_auth_mediated(703, AsOf::Judged(2_100 * S)),
+            "an event before the fork's start"
+        );
+        assert_eq!(t.exec_identity(703, AsOf::Judged(2_100 * S)), None);
+    }
+
+    /// Third review of #475 (the reviewer's RR4): at the hard bound the
+    /// entries go from the uid holding the most among the processes
+    /// executed since the start, oldest first — a user's flood of live
+    /// processes pushes out its own, never the seeded daemon, root's job
+    /// or another user's shell.
+    #[test]
+    fn the_hard_bound_drops_the_most_numerous_user_s_entries_first() {
+        let proc = TempDir::new().unwrap();
+        write_exe(proc.path(), 1, "/usr/lib/systemd/systemd");
+        write_status(proc.path(), 1, 0);
+        write_started(proc.path(), "1", 0, 1);
+        write_exe(proc.path(), 500, "/usr/sbin/clamd");
+        write_status(proc.path(), 500, 1);
+        write_started(proc.path(), "500", 1, 100);
+        let t = AuthSessionTracker::new(proc.path()).with_bounds(4, 8, std::time::Duration::ZERO);
+        assert_eq!(t.seed_from_proc(), 2);
+        t.ingest_exec(600, 1, "/usr/sbin/cron", &[], 5 * S, 5 * S, 0);
+        t.ingest_exec(610, 1, "/usr/bin/bash", &[], 6 * S, 6 * S, 1001);
+        for i in 0..10u32 {
+            let at = u64::from(10 + i) * S;
+            t.ingest_exec(1_000 + i, 1, "/usr/bin/sleep", &[], at, at, 1000);
+        }
+        assert_eq!(t.entry_count(), 8);
+        assert_eq!(t.evicted_live(), 6);
+        for pid in [1, 500, 600, 610, 1_006, 1_009] {
+            assert!(t.holds(pid), "{pid} kept");
+        }
+        assert!(!t.holds(1_000) && !t.holds(1_005));
+        assert_eq!(
+            t.exec_identity(500, AsOf::Judged(30 * S)).map(|i| i.exe),
+            Some(PathBuf::from("/usr/sbin/clamd"))
         );
     }
 
