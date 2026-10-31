@@ -909,6 +909,14 @@ pub struct StatusResponse {
     /// unsigned reply, one byte); `None` from an agent older than the field.
     #[serde(default)]
     pub event_bus: Option<EventBusStatus>,
+    /// R12b (lab PR 269): stage 5 per queue — each class's decisions timed
+    /// from their record's kernel time against the class's budget — and
+    /// the floods of P0 capped per uid (the third review of #471's C3).
+    /// Appended after `event_bus` (whose queue rows an older `nn-admin`
+    /// decodes unchanged); telemetry (`None` in the unsigned reply, one
+    /// byte); `None` from an agent older than the field.
+    #[serde(default)]
+    pub event_bus_decision: Option<EventBusDecisionStatus>,
 }
 
 /// Lab PR 267 (R12a): the priority event bus in `nn-admin status --key`.
@@ -959,6 +967,42 @@ pub struct BusQueueStatus {
     pub latency_p50_us: Option<u64>,
     pub latency_p99_us: Option<u64>,
     pub latency_max_us: Option<u64>,
+}
+
+/// R12b (lab PR 269): stage 5 and the per-uid cap of P0's floods in
+/// `nn-admin status --key` ([`StatusResponse::event_bus_decision`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventBusDecisionStatus {
+    /// The queues, P0 first.
+    pub queues: Vec<BusDecisionDelay>,
+    /// The floods of P0 (refused operations, `bpf()` calls) queued per uid
+    /// and kind each second; the rest are counted (`capped`), not queued.
+    pub cap_per_uid: u32,
+}
+
+/// One queue's decisions, timed from their record's kernel time
+/// ([`EventBusDecisionStatus::queues`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusDecisionDelay {
+    /// `P0` … `P3`.
+    pub priority: String,
+    /// The class's budget: a decision later than this after the kernel
+    /// recorded the event is counted late (microseconds).
+    pub budget_us: u64,
+    /// Decisions timed, and those whose event had no record time to time
+    /// them from (a UDP flow's row).
+    pub timed: u64,
+    pub untimed: u64,
+    /// The delay, record to the end of its decision (µs): p50, p99, the
+    /// largest; `None` before the first.
+    pub delay_p50_us: Option<u64>,
+    pub delay_p99_us: Option<u64>,
+    pub delay_max_us: Option<u64>,
+    /// Decisions later than the budget (stage 5's count).
+    pub over_budget: u64,
+    /// P0: the floods counted past their uid's cap, not queued; 0
+    /// elsewhere.
+    pub capped: u64,
 }
 
 /// One stage of an event's path ([`EventBusStatus::stages`]).
@@ -1085,6 +1129,7 @@ impl StatusResponse {
             execpol_map_recorded_total: None,
             execq_script_refused_total: None,
             event_bus: None,
+            event_bus_decision: None,
         }
     }
 
@@ -2184,6 +2229,7 @@ mod tests {
             execpol_map_recorded_total: None,
             execq_script_refused_total: None,
             event_bus: None,
+            event_bus_decision: None,
         }));
     }
 
@@ -2255,6 +2301,7 @@ mod tests {
             execpol_map_recorded_total: None,
             execq_script_refused_total: None,
             event_bus: None,
+            event_bus_decision: None,
         }));
     }
 
@@ -2507,6 +2554,7 @@ mod tests {
             execpol_map_recorded_total: None,
             execq_script_refused_total: None,
             event_bus: None,
+            event_bus_decision: None,
         }));
     }
 
@@ -2607,6 +2655,7 @@ mod tests {
             execpol_map_recorded_total: None,
             execq_script_refused_total: None,
             event_bus: None,
+            event_bus_decision: None,
         }
     }
 
@@ -2703,14 +2752,44 @@ mod tests {
         });
         let a = postcard::to_allocvec(&without).unwrap();
         let b = postcard::to_allocvec(&with).unwrap();
-        assert_eq!(a.last(), Some(&0), "the absent field's tag");
-        assert!(b.starts_with(&a[..a.len() - 1]) && b.len() > a.len());
+        // the two appended fields' tags: R12a's bus, R12b's decision delay
+        assert!(a.ends_with(&[0, 0]), "the absent fields' tags");
+        assert!(b.starts_with(&a[..a.len() - 2]) && b.len() > a.len());
+        assert_eq!(b.last(), Some(&0), "R12b's field, absent");
         assert_eq!(postcard::from_bytes::<StatusResponse>(&b).unwrap(), with);
         let public = StatusResponse::public(PostureKind::Observing, false, None, None, None);
         assert_eq!(public.event_bus, None);
         let mut only_bus = public.clone();
         only_bus.event_bus = with.event_bus.clone();
         assert!(!only_bus.telemetry_withheld(), "the bus is telemetry");
+        // R12b (lab PR 269): stage 5 and the cap, appended after the bus —
+        // every byte before it as R12a sent them (an R12a `nn-admin` reads
+        // the queues unchanged and ignores the rest)
+        let mut with_delay = with.clone();
+        with_delay.event_bus_decision = Some(EventBusDecisionStatus {
+            queues: vec![BusDecisionDelay {
+                priority: "P0".to_string(),
+                budget_us: 100_000,
+                timed: 3,
+                untimed: 0,
+                delay_p50_us: Some(150),
+                delay_p99_us: Some(1_100),
+                delay_max_us: Some(1_200),
+                over_budget: 1,
+                capped: 13,
+            }],
+            cap_per_uid: 256,
+        });
+        let c = postcard::to_allocvec(&with_delay).unwrap();
+        assert!(c.starts_with(&b[..b.len() - 1]) && c.len() > b.len());
+        assert_eq!(
+            postcard::from_bytes::<StatusResponse>(&c).unwrap(),
+            with_delay
+        );
+        assert_eq!(public.event_bus_decision, None);
+        let mut only_delay = public.clone();
+        only_delay.event_bus_decision = with_delay.event_bus_decision.clone();
+        assert!(!only_delay.telemetry_withheld(), "stage 5 is telemetry");
     }
 
     /// Lab PR 218: the new fields are telemetry — the unsigned reply sends
@@ -3224,8 +3303,8 @@ mod tests {
     /// public, passed through by the unsigned reply — and an `nn-admin` of
     /// lab PR 213 reads every byte before it (the two fields follow lab PR
     /// 215's; the fields appended after them — lab PR 218's four, 219's
-    /// and 222's one each, 223's ten, 224's four, 225's seven, 226's ten —
-    /// are `None` in a public reply).
+    /// and 222's one each, 223's ten, 224's four, 225's seven, 226's ten,
+    /// 267's and 269's one each — are `None` in a public reply).
     #[test]
     fn the_status_carries_the_isolation_per_family() {
         let public = StatusResponse::public(PostureKind::Combat, false, None, None, Some(true))
@@ -3244,8 +3323,8 @@ mod tests {
         // PR 218's four, lab PR 219's `exploit_guard`, lab PR 222's
         // `cow_guard`, lab PR 223's ten `execq_*`, lab PR 224's four
         // counters, lab PR 225's seven, lab PR 226's ten, lab PR 267's
-        // `event_bus`.
-        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1;
+        // `event_bus`, lab PR 269's `event_bus_decision`.
+        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
@@ -4022,10 +4101,14 @@ mod tests {
             "00000021031111111111111111111111111111111111111111111111111111111111111111";
         // Lab PR 267 (R12a): one byte longer — the `None` of the appended
         // `event_bus` (telemetry, withheld here); every byte before it is
-        // the lab PR 240 pin's.
+        // the lab PR 240 pin's. R12b (lab PR 269): one byte longer again —
+        // the `None` of the appended `event_bus_decision` (telemetry,
+        // withheld here); every byte before it is R12a's pin (the length
+        // prefix 0x4c → 0x4d).
         const STATUS_RESPONSE: &str = concat!(
-            "0000004c050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
+            "0000004d050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
             "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "00",
         );
         const SHUTDOWN_REQUEST: &str = concat!(
             "0000007a0602abababababababababababababababababababababababababababababababab808f",

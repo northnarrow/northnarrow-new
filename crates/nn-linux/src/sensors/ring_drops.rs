@@ -273,12 +273,25 @@ fn raise_telemetry_loss(posture: &OnceLock<PostureSink>, lost: &[(&'static str, 
 /// [`raise_telemetry_loss`] for the events `source` lost (lab PR 267: `event
 /// bus` queues as well as security rings), with the same exemptions.
 pub(crate) fn raise_loss(posture: &OnceLock<PostureSink>, lost: &[(&str, u64)], source: &str) {
-    let Some(sink) = posture.get() else { return };
     let what = lost
         .iter()
         .map(|(r, d)| format!("{r} {d}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let reason = format!("{source} events dropped in {SAMPLE_SECS} s: {what}");
+    raise_signal_loss(posture, &what, source, &reason);
+}
+
+/// `TelemetryLoss` with its own `reason` (R12b: the bus's cap of root's
+/// floods, events counted but not judged one by one); not inside a
+/// trusted-installer window or a package transaction, as [`raise_loss`].
+pub(crate) fn raise_signal_loss(
+    posture: &OnceLock<PostureSink>,
+    what: &str,
+    source: &str,
+    reason: &str,
+) {
+    let Some(sink) = posture.get() else { return };
     if sink.installer.as_ref().is_some_and(|i| i.is_window_open()) {
         info!(lost = %what, source, "event drops during a trusted-installer window — posture not raised");
         return;
@@ -287,10 +300,9 @@ pub(crate) fn raise_loss(posture: &OnceLock<PostureSink>, lost: &[(&str, u64)], 
         info!(lost = %what, source, "event drops during a package transaction — posture not raised");
         return;
     }
-    let reason = format!("{source} events dropped in {SAMPLE_SECS} s: {what}");
     if let Some(state) = sink
         .posture
-        .raise_signal(nn_model::posture_types::TriggerType::TelemetryLoss, &reason)
+        .raise_signal(nn_model::posture_types::TriggerType::TelemetryLoss, reason)
     {
         warn!(
             state = %state.kind(),

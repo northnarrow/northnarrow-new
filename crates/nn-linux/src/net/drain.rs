@@ -1709,7 +1709,7 @@ mod tests {
         process_close_record(&raw, &tracker, &dns, Some(&db), &lineage, &mut gate, &tx).await;
         drop(tx);
         let mut sent = Vec::new();
-        while let Some(Event::NetFlow(nf)) = rx.recv().await.map(|r| r.event) {
+        while let Some(Event::NetFlow(nf)) = rx.recv().await.map(|r| r.envelope.event) {
             sent.push(nf.dst_addr.to_string());
         }
         assert_eq!(
@@ -2039,7 +2039,7 @@ mod tests {
         drop(tx);
 
         let mut names = Vec::new();
-        while let Some(ev) = rx.recv().await.map(|r| r.event) {
+        while let Some(ev) = rx.recv().await.map(|r| r.envelope.event) {
             match ev {
                 Event::NetFlow(nf) => names.push(("flow", nf.proto, nf.comm)),
                 Event::NetListener(l) => names.push(("listener", l.proto, l.comm)),
@@ -2122,7 +2122,7 @@ mod tests {
         group_commit(None, None);
         drop(tx);
         let mut seen = Vec::new();
-        while let Some(ev) = rx.recv().await.map(|r| r.event) {
+        while let Some(ev) = rx.recv().await.map(|r| r.envelope.event) {
             match ev {
                 Event::NetFlow(nf) => seen.push(("flow", nf.proto, nf.dst_port)),
                 Event::NetListener(l) => seen.push(("listener", l.proto, l.bind_port)),

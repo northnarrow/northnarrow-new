@@ -2468,6 +2468,7 @@ fn telemetry_withheld(out: &StatusOutcome) -> bool {
         && out.defense_tamper_total.is_none()
         && out.execpol_state.is_none()
         && out.event_bus.is_none()
+        && out.event_bus_decision.is_none()
 }
 
 /// The line that replaces the telemetry in an unsigned reply.
@@ -3116,7 +3117,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"event_bus\":{},\"telemetry_signed\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"event_bus\":{},\"event_bus_decision\":{},\"telemetry_signed\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -3168,6 +3169,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             execpol_json(out),
             // Lab PR 267 (R12a).
             serde_json::to_string(&out.event_bus).unwrap_or_else(|_| "null".to_string()),
+            serde_json::to_string(&out.event_bus_decision).unwrap_or_else(|_| "null".to_string()),
             out.telemetry_signed,
         );
         return;
@@ -3272,6 +3274,10 @@ fn print_status(out: &StatusOutcome, json: bool) {
     for line in event_bus_lines(out.event_bus.as_ref(), tty) {
         println!("{line}");
     }
+    // R12b (lab PR 269): stage 5 per queue, the floods of P0 capped per uid.
+    for line in event_bus_decision_lines(out.event_bus_decision.as_ref(), tty) {
+        println!("{line}");
+    }
     println!("{}", deny_fail_open_line(out, tty));
     // Lab PR 222: the copy-on-first-write guard.
     for line in cow_guard_lines(out.cow_guard.as_ref()) {
@@ -3341,6 +3347,54 @@ fn event_bus_lines(
         out.push(format!(
             "{label}{} {:<21} {total} ({})",
             st.stage, st.name, st.source
+        ));
+    }
+    out
+}
+
+/// R12b (lab PR 269): the decision's delay per queue (stage 5) — the
+/// class's budget, the decisions timed from their record's kernel time (and
+/// those with no time), p50/p99/max, those over the budget — and P0's
+/// floods capped per uid. Nothing from an agent older than the field (the
+/// event bus's own line says so for an agent older than the bus).
+fn event_bus_decision_lines(
+    d: Option<&nn_proto::admin_protocol::EventBusDecisionStatus>,
+    tty: bool,
+) -> Vec<String> {
+    let Some(d) = d else {
+        return Vec::new();
+    };
+    let us = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |v| format!("{v} µs"));
+    let mut out = Vec::new();
+    for (i, q) in d.queues.iter().enumerate() {
+        let label = if i == 0 {
+            "decision delay    : "
+        } else {
+            "                    "
+        };
+        let late = if q.over_budget == 0 {
+            colorize("0", "32", tty)
+        } else {
+            colorize(&q.over_budget.to_string(), "31", tty)
+        };
+        let capped = if q.priority == "P0" {
+            format!(
+                "; {} capped (past {} per uid a second)",
+                q.capped, d.cap_per_uid
+            )
+        } else {
+            String::new()
+        };
+        out.push(format!(
+            "{label}{} budget {} ms: {} timed from the kernel's record ({} untimed), p50 {} p99 {} \
+             max {}, {late} over budget{capped}",
+            q.priority,
+            q.budget_us / 1_000,
+            q.timed,
+            q.untimed,
+            us(q.delay_p50_us),
+            us(q.delay_p99_us),
+            us(q.delay_max_us),
         ));
     }
     out
@@ -5206,6 +5260,7 @@ mod flow_sock_line_tests {
             execpol_map_recorded_total: None,
             execq_script_refused_total: None,
             event_bus: None,
+            event_bus_decision: None,
             telemetry_signed: true,
         }
     }

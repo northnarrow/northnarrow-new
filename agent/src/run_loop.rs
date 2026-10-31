@@ -90,7 +90,7 @@ pub(crate) async fn run(
                     for exec in &received.overtaken {
                         engine.observe_arrival(exec);
                     }
-                    let e = received.event;
+                    let e = received.envelope.event;
                     // Tappa 10.8 telemetry probe: every event is offered to
                     // the probe tracker before the decision engine (R11c, lab
                     // PR 264: the probe the late binding started).

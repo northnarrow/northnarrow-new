@@ -436,6 +436,18 @@ pub(crate) fn wire(
     sensor
         .bus_losses()
         .bind_posture(posture.clone(), Some(Arc::clone(installer_override)));
+    // R12b (lab PR 269), the third review of #471's C5: the denials the bus
+    // coalesced into one queued, or capped per uid (C3), are counted as
+    // NN-L-AT-001's held records, and the capped records about the agent's
+    // own BPF objects as NN-L-BPF-002's — each rule's next record of the uid
+    // and its signed `detections_held` rows tell every attempt.
+    {
+        use northnarrow_agent::decision::Rule as _;
+        sensor.bus_losses().bind_held_budget(
+            northnarrow_agent::decision::rules::anti_tamper::NnLAt001AntiTamperDenial.id(),
+            northnarrow_agent::decision::rules::bpf::BPF002_ID,
+        );
+    }
 
     // FIM-009 self-upgrade (§15.1): late-bind the audit-chain writer to
     // the trusted-installer override so its close/expiry records chain.

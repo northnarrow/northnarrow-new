@@ -64,7 +64,7 @@ fn start_open_sensor(
     posture: &PostureMachine,
 ) {
     use northnarrow_agent::sensors::open_sensor::{
-        pump, refresh, take_ringbuf, warn_refused_carveouts, DepthCapLog, OpenSensorMaps,
+        refresh, spawn_pump, take_ringbuf, warn_refused_carveouts, DepthCapLog, OpenSensorMaps,
         RuleHealth, RuleInputs, RuleSet, RULE_CAPACITY,
     };
     if mode == FileOpenSensor::Tracepoint {
@@ -106,8 +106,18 @@ fn start_open_sensor(
             return;
         }
     };
-    let handle = tokio::spawn(pump(ring, sensor.event_tx()));
-    sensor.register_pump_handle(northnarrow_agent::sensors::open_sensor::PUMP_LABEL, handle);
+    // R12b (lab PR 269): the pump on a thread of its own, the bus's source
+    // `open_sensor`, sending in batches.
+    let pump = match spawn_pump(ring, &sensor.event_tx(), &tokio::runtime::Handle::current()) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "file-open sensor: its pump's thread did not start — keeping sys_enter_openat");
+            open_tracepoint_fallback(sensor);
+            open_sensor_on_tracepoint(sensor, &format!("its pump did not start ({e})"));
+            return;
+        }
+    };
+    sensor.register_pump_thread(northnarrow_agent::sensors::open_sensor::PUMP_LABEL, pump);
     if let Err(e) = maps.arm(true) {
         warn!(error = %e, "file-open sensor: arming failed — keeping sys_enter_openat");
         open_tracepoint_fallback(sensor);
@@ -691,25 +701,39 @@ pub(crate) fn start(
                             let watched_paths_for_drain = watched_paths_handle.clone();
                             // Review 76: only package-manager drift is paced.
                             let lineage_for_drain = lineage.clone();
-                            let event_tx = sensor.event_tx();
+                            let event_tx = sensor.event_tx_for("fim_drain");
                             let audit_for_drain = audit_log.clone();
-                            let handle = tokio::spawn(async move {
-                                let outcome = drain_loop(
-                                    rb,
-                                    inode_map_for_drain,
-                                    baseline_cache_for_drain,
-                                    drift_db,
-                                    classifier,
-                                    rate_limiter_clone,
-                                    watched_paths_for_drain,
-                                    lineage_for_drain,
-                                    event_tx,
-                                )
-                                .await;
-                                drain_ended("fim", outcome, audit_for_drain.as_ref());
-                            });
-                            sensor.register_pump_handle("fim_drain", handle);
-                            info!("fim: drain loop spawned");
+                            // Review of #474: on a thread of its own, as
+                            // the pumps (`nn-fim_drain`)
+                            let spawned = northnarrow_agent::sensors::pump::spawn_drain_thread(
+                                "fim_drain",
+                                move || async move {
+                                    let outcome = drain_loop(
+                                        rb,
+                                        inode_map_for_drain,
+                                        baseline_cache_for_drain,
+                                        drift_db,
+                                        classifier,
+                                        rate_limiter_clone,
+                                        watched_paths_for_drain,
+                                        lineage_for_drain,
+                                        event_tx,
+                                    )
+                                    .await;
+                                    drain_ended("fim", outcome, audit_for_drain.as_ref());
+                                },
+                            );
+                            match spawned {
+                                Ok(t) => {
+                                    sensor.register_pump_thread("fim_drain", t);
+                                    info!("fim: drain loop spawned on a thread of its own");
+                                }
+                                Err(e) => warn!(
+                                    error = %e,
+                                    "fim: the drain's thread could not start — kernel drift \
+                                     events will be dropped"
+                                ),
+                            }
                         }
                         Err(e) => {
                             warn!(

@@ -1350,6 +1350,46 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- The ring pumps on threads of their own, sending in batches (lab PR 269,
+  Wave 4 phase 2, R12b-1 of the restructure plan;
+  `docs/architecture/EVENT_BUS.md` §2a–2c, §5). Each ring's pump — the
+  process-spawn, file-open, exec-check, connect, DNS, `fs_protect`,
+  module-load, io_uring and `bpf()` rings, the exploit guard's and the LSM
+  file-open sensor's — is an OS thread (`nn-<ring>`) that blocks in
+  `poll(2)` on its ring and sends what it read in batches of at most 256
+  events, those that find room queued with one round of the queue's lock
+  (the FIM and network drains run on threads of their own too, each with a
+  runtime of its own);
+  on R12a a pump was a task of the runtime sending one event at a time,
+  and a ring fell behind on a saturated guest while no send had waited
+  (EXP-13e). A dead pump thread stops the agent as a dead task did
+  (SNS-001). A woken thread may wait a scheduler slice on a saturated CPU,
+  about the time one process's loop of refused operations fills the
+  `fs_protect` ring the object declares (1,024 denials): the loader sizes
+  that ring at 256 KiB (4,096; the eBPF object unchanged). The queues hold envelopes (`nn_core::bus::Envelope`: the
+  source and its sequence, the class, the record's kernel time, the
+  process). Stage 5 of the losses is counted: each decision timed from its
+  record's kernel time against its class's budget (P0 100 ms, P1 250 ms,
+  P2 1 s, P3 500 ms), the late ones in `nn-admin status --key` (a new
+  appended status field, `event_bus_decision`: the unsigned status frame
+  one byte longer) and a WARN a sample. The tamper events a process can
+  repeat at will (refused operations, `bpf()` calls) are queued at most
+  256 a second per uid and target — each refused operation on each target,
+  each `bpf()` command (1,024 for the `bpf()` records about the agent's own
+  objects, NN-L-BPF-002's) —, and NN-L-BPF-001's commands (a program
+  loaded, attached, a link made) are never capped (the review of #474: a
+  program load inside a burst of its uid's other `bpf()` calls went
+  unjudged); the rest is counted in signed `event_bus_capped` rows, every
+  key with its count, and the status; root's floods capped raise the
+  posture's `TelemetryLoss`; a full table of keys queues a new one
+  uncapped, counted — a `bpf()` flood no longer takes two thirds of the
+  consumer (third review of #471, C3). A batch a pump read and the closed
+  bus refused is counted in the stop row. The denials the bus
+  coalesced or capped are counted as NN-L-AT-001's held records, the capped
+  records about the agent's own BPF objects as NN-L-BPF-002's (their next
+  record's `suppressed_before`, their signed `detections_held` rows: C5).
+  The nn-admin matrix's status lines gain the decision delay per queue;
+  EXP-13's harness reads them, the capped rows and the C5 accounting.
 - The priority event bus replaces the one channel between the sensors and
   the event loop (lab PR 267, Wave 4 phase 2, R12a of the restructure plan;
   `docs/architecture/EVENT_BUS.md`). Every source — the nine ring pumps,

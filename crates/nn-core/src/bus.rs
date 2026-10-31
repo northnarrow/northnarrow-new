@@ -23,10 +23,15 @@
 //! event loop, every event still goes through `process_event` the way it
 //! did; only the order between classes can differ (a property test checks
 //! that every interleaving consistent with per-class FIFO gives the same
-//! verdicts on the golden corpus: `agent/src/decision/golden.rs`). The
-//! decision thread without `await` is R12b; the response dispatcher, the
-//! signed `telemetry_loss` rows and the loss counters of stages 5 to 8 are
-//! R12b and R12c ([`LossStage`]).
+//! verdicts on the golden corpus: `agent/src/decision/golden.rs`).
+//!
+//! R12b (lab PR 269): the queues hold [`Envelope`]s (source, sequence,
+//! the record's kernel time, the process); the decision's delay is timed
+//! from that kernel time against its class's budget ([`DECISION_BUDGET_NS`],
+//! stage 5 of [`LossStage`]); the events that can flood P0 are capped per
+//! uid and second ([`FloodCap`], the third review of #471's C3). The
+//! response dispatcher, the signed `telemetry_loss` rows and the loss
+//! counters of stages 6 to 8 are R12c's.
 
 use std::collections::VecDeque;
 
@@ -581,34 +586,524 @@ impl LatencyHistogram {
 
 /// A source of events — an adapter's sensor, a drain — by its place in the
 /// boot's sources, which the sensor contract names
-/// ([`crate::contract::ClassContract::source`], R13).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// ([`crate::contract::ClassContract::source`], R13). R12b (lab PR 269):
+/// the bus numbers its senders in the order they are named; 0 is a sender
+/// no source named (the tests', a clone of the bus's first sender).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct SourceId(pub u16);
 
 /// An event on the bus, with what orders it: in its class, the order its
-/// source read it in (FIFO); between classes, its time and its process
-/// (plan §3.4). R12a's queues hold the event itself (the runtime adds the
-/// time it was queued); this envelope is for the decision thread of R12b,
-/// which orders the classes by `ts_ns` and `key`.
+/// source read it in (FIFO: `seq`); between classes, its time and its
+/// process (plan §3.4). R12b (lab PR 269): the queues hold envelopes — the
+/// sender stamps each event with its source, its place in the source's
+/// sends, its class, the kernel's time of its record ([`record_time_ns`],
+/// stage 5's clock) and the process it is about ([`actor_of`]).
 #[derive(Debug, Clone)]
 pub struct Envelope {
     /// The source that read it.
     pub source: SourceId,
-    /// Its place in its source's reads.
+    /// Its place in its source's sends (from 1; gaps where the source's
+    /// events were coalesced, capped or dropped).
     pub seq: u64,
     /// Its class: the queue it waits in.
     pub class: EventClass,
-    /// The kernel's time of the event (`CLOCK_MONOTONIC` ns).
+    /// The kernel's time of its record (`CLOCK_MONOTONIC` ns,
+    /// [`record_time_ns`]); 0 when the event has none the decision's delay
+    /// can be measured from.
     pub ts_ns: u64,
-    /// The process it is about.
+    /// The process it is about: the boot, its pid, its start when the
+    /// record names it (0 otherwise).
     pub key: ProcessKey,
     /// The event.
     pub event: Event,
 }
 
+impl Envelope {
+    /// `event` from `source`, its `seq`-th send, on the boot `boot_id`.
+    pub fn new(source: SourceId, seq: u64, boot_id: [u8; 16], event: Event) -> Self {
+        let (tgid, start_ns) = actor_of(&event);
+        Self {
+            source,
+            seq,
+            class: class_of(&event),
+            ts_ns: record_time_ns(&event),
+            key: ProcessKey {
+                boot_id,
+                tgid,
+                start_ns,
+            },
+            event,
+        }
+    }
+
+    /// Its queue.
+    pub fn priority(&self) -> Priority {
+        Priority::of(self.class)
+    }
+}
+
+/// R12b (lab PR 269): the kernel's time of the record an event was made
+/// from (`CLOCK_MONOTONIC` ns, `bpf_ktime_get_ns`), the time stage 5
+/// measures the decision's delay from (review #471 B2: the bus timed from
+/// its push). Every variant named. A flow's row by its phase: a TCP flow's
+/// closed row from its close, an open-phase row from when it was observed
+/// (`observed_ns`: the connect, a refused connect, the snapshot's time);
+/// 0 — not timed — for a UDP flow's row, which closes a window of sends
+/// the drain holds by design.
+pub fn record_time_ns(event: &Event) -> u64 {
+    use nn_model::telemetry::FlowPhase;
+    match event {
+        Event::ProcessSpawn { timestamp_ns, .. }
+        | Event::FileOpen { timestamp_ns, .. }
+        | Event::MassWrite { timestamp_ns, .. }
+        | Event::FileBurst { timestamp_ns, .. }
+        | Event::DefenderSignal { timestamp_ns, .. }
+        | Event::ExecCheck { timestamp_ns, .. }
+        | Event::ModuleLoad { timestamp_ns, .. }
+        | Event::BpfSyscall { timestamp_ns, .. }
+        | Event::IoUring { timestamp_ns, .. }
+        | Event::TcpConnect { timestamp_ns, .. }
+        | Event::DnsQuery { timestamp_ns, .. }
+        | Event::FsProtectDenial { timestamp_ns, .. }
+        | Event::CanaryTripped { timestamp_ns, .. }
+        | Event::DnsFlood { timestamp_ns, .. }
+        | Event::SensorFlood { timestamp_ns, .. }
+        | Event::ExploitPostcondition { timestamp_ns, .. } => *timestamp_ns,
+        Event::Fim(fe) => fe.timestamp_ns,
+        Event::NetListener(nl) => nl.timestamp_ns,
+        Event::NetFlow(nf) => match nf.phase {
+            FlowPhase::Connect | FlowPhase::Denied | FlowPhase::Snapshot => nf.observed_ns,
+            FlowPhase::Closed if nf.proto == 6 => nf.end_ns,
+            FlowPhase::Closed => 0,
+        },
+    }
+}
+
+/// R12b (lab PR 269): the process an event is about — its pid, and its
+/// start (`CLOCK_MONOTONIC` ns) when the record names it, else 0: the
+/// envelope's [`ProcessKey`]. Every variant named.
+pub fn actor_of(event: &Event) -> (u32, u64) {
+    match event {
+        Event::ProcessSpawn { pid, start_ns, .. } => (*pid, *start_ns),
+        Event::NetFlow(nf) => (nf.pid, nf.proc_start_ns),
+        Event::FileOpen { pid, .. }
+        | Event::MassWrite { pid, .. }
+        | Event::FileBurst { pid, .. }
+        | Event::DefenderSignal { pid, .. }
+        | Event::ExecCheck { pid, .. }
+        | Event::BpfSyscall { pid, .. }
+        | Event::IoUring { pid, .. }
+        | Event::TcpConnect { pid, .. }
+        | Event::DnsQuery { pid, .. }
+        | Event::FsProtectDenial { pid, .. }
+        | Event::DnsFlood { pid, .. }
+        | Event::SensorFlood { pid, .. }
+        | Event::ExploitPostcondition { pid, .. } => (*pid, 0),
+        Event::ModuleLoad { loader_pid, .. } => (*loader_pid, 0),
+        Event::CanaryTripped { accessor_pid, .. } => (*accessor_pid, 0),
+        Event::Fim(fe) => (fe.modifier_pid, 0),
+        Event::NetListener(nl) => (nl.pid, 0),
+    }
+}
+
+// ── stage 5: the decision's delay ────────────────────────────────────
+
+/// R12b (lab PR 269), stage 5: how late a class's decision may come,
+/// counted from the kernel's time of its record ([`record_time_ns`]) to the
+/// end of its judgement; a later one is counted as over its budget (plan
+/// §3.4: the decision's delay, per class).
+/// - P0 tamper, 100 ms: drained first (two thirds of the consumer or more);
+///   on R12a the bursts' first records were judged 0.2–5 ms after the
+///   burst began under EXP-13's flood, where the one channel took 0.5 s.
+/// - P1 process, 250 ms: the exec quarantine holds a process until its exec
+///   is judged, and every later event of the process is judged on it.
+/// - P2 file, 1 s: the opens' share leaves a file event at most 2,048 opens
+///   behind (≈ 0.3–1.2 s under a flood, `FILE_OPEN_SHARE`).
+/// - P3 network, 500 ms: a refused or blocklisted connect is judged while
+///   the connection is young (NET-001's kills came 13–27 ms after the
+///   connect under EXP-13c).
+pub const DECISION_BUDGET_NS: [u64; QUEUES] =
+    [100_000_000, 250_000_000, 1_000_000_000, 500_000_000];
+
+/// One queue's decisions, timed from their record (stage 5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecisionDelay {
+    /// The delays of the timed decisions.
+    pub delay: LatencyHistogram,
+    /// Decided later than the queue's budget.
+    pub over_budget: u64,
+    /// Decided with no record time to measure from ([`record_time_ns`] 0).
+    pub untimed: u64,
+}
+
+impl DecisionDelay {
+    /// A decision of a record timed `ts_ns`, ended at `now_ns` (the same
+    /// clock), against `budget_ns`; `true` when it was over the budget. A
+    /// record without a time is counted as untimed; one timed after `now_ns`
+    /// (no such record: a clock read before the record's) as no delay.
+    pub fn record(&mut self, ts_ns: u64, now_ns: u64, budget_ns: u64) -> bool {
+        if ts_ns == 0 {
+            self.untimed += 1;
+            return false;
+        }
+        let delay = now_ns.saturating_sub(ts_ns);
+        self.delay.record_ns(delay);
+        let over = delay > budget_ns;
+        if over {
+            self.over_budget += 1;
+        }
+        over
+    }
+}
+
+// ── C3: the floods of P0, capped per uid ─────────────────────────────
+
+/// Third review of #471, C3 (R12b, lab PR 269): of the events that can
+/// flood P0 ([`floods_p0`]), each uid gets this many queued a second per
+/// kind (refused operations, `bpf()` calls); the rest of its second is
+/// counted, not queued — in a signed row (uid, count, the first processes
+/// named) and the status. Under the shares a flood that keeps P0 full takes
+/// two thirds of the consumer; capped, a uid's flood takes at most this
+/// many decisions a second (EXP-13's consumer judged ~7,000 to ~17,000):
+/// any user's `fork` + `bpf()` loop on 6.x (one record per new process and
+/// command a second, refused with EPERM), root's loop of new processes'
+/// refused `chmod`s. Legitimate traffic is far below it: the kernel keeps
+/// one `bpf()` record per process and command a second, and a refused
+/// operation outside an attack is rare. Another uid's events have their
+/// own allowance — a flood by one never caps another's — and a repeat of a
+/// queued denial is coalesced before it is counted here.
+pub const FLOOD_CAP_PER_UID: u32 = 256;
+/// The cap's window: [`FLOOD_CAP_PER_UID`] per uid and kind each second.
+pub const FLOOD_CAP_WINDOW_NS: u64 = 1_000_000_000;
+/// The keys ([`CapKey`]: kind, uid and target) the cap keeps. Full, the
+/// keys whose window has ended and that hold nothing to sign go first. A
+/// new key that still finds no room is queued uncapped — judged like any
+/// P0 event, or, when P0 itself is full, dropped by the bus with its signed
+/// `event_bus_drop` row and `TelemetryLoss`: never set aside uncounted and
+/// unjudged. It is counted ([`FloodCap::take_overflow`]) and signed in the
+/// next capped row, and raises the posture's `TelemetryLoss` (review of
+/// #474: the policy for a full table).
+pub const FLOOD_CAP_KEYS: usize = 4096;
+/// The kinds of process (`comm` and action) a capped key names between
+/// two rows (its count covers them all).
+pub const FLOOD_CAP_SAMPLES: usize = 8;
+
+/// Review of #474: the `bpf()` commands the cap never holds back —
+/// NN-L-BPF-001's (a program loaded, attached, a link made). Each is judged
+/// whatever else the same uid sends; a burst of them is bounded by P0's
+/// shares and its wait for room, as on R12a.
+pub const NEVER_CAPPED_BPF: [u32; 3] = [
+    common::bpf_cmd::BPF_PROG_LOAD,
+    common::bpf_cmd::BPF_PROG_ATTACH,
+    common::bpf_cmd::BPF_LINK_CREATE,
+];
+
+/// R12b: the allowance of a uid's `bpf()` records about the agent's own
+/// objects ([`FloodKind::BpfOwn`]: a handle to one of its maps, programs or
+/// links taken by id, a write handle on one of its maps — NN-L-BPF-002's
+/// tampering), a second: four times [`FLOOD_CAP_PER_UID`]. The lab's soak
+/// found the sampler's `bpftool map dump`s of the agent's maps making
+/// ~450 such records in a second as root; capped at 256 with the other
+/// `bpf()` calls, BPF-002 lost them. Still a cap: a fork loop of
+/// `bpf(BPF_MAP_GET_FD_BY_ID, <an agent map>)` by any user takes at most
+/// this many decisions a second.
+pub const FLOOD_CAP_OWN_PER_UID: u32 = 4 * FLOOD_CAP_PER_UID;
+
+/// Which flood of P0 an event is ([`floods_p0`]); each kind has its own
+/// allowance per uid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FloodKind {
+    /// `FsProtectDenial`: a refused operation on a protected inode, or a
+    /// refused signal or ptrace of a protected process.
+    Denial,
+    /// `BpfSyscall`: a `bpf()` call the LSM hook saw, but those of
+    /// [`FloodKind::BpfOwn`].
+    Bpf,
+    /// `BpfSyscall` about the agent's own objects (the kernel's
+    /// `foreign_get_fd`, `foreign_map_write`): NN-L-BPF-002's, with a larger
+    /// allowance ([`FLOOD_CAP_OWN_PER_UID`]).
+    BpfOwn,
+}
+
+impl FloodKind {
+    /// The kind of `event`, `None` when it does not flood P0.
+    pub fn of(event: &Event) -> Option<(FloodKind, u32)> {
+        use common::wire::{BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE};
+        match event {
+            Event::FsProtectDenial { uid, .. } => Some((FloodKind::Denial, *uid)),
+            Event::BpfSyscall { uid, cmd, .. }
+                if matches!(*cmd, BPF_CMD_FOREIGN_GET_FD | BPF_CMD_FOREIGN_MAP_WRITE) =>
+            {
+                Some((FloodKind::BpfOwn, *uid))
+            }
+            Event::BpfSyscall { uid, .. } => Some((FloodKind::Bpf, *uid)),
+            _ => None,
+        }
+    }
+
+    /// As the signed row and the status name it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            FloodKind::Denial => "FsProtectDenial",
+            FloodKind::Bpf => "BpfSyscall",
+            FloodKind::BpfOwn => "BpfSyscall (the agent's own objects)",
+        }
+    }
+}
+
+/// What, inside a kind and a uid, the cap counts apart (review of #474):
+/// each refused operation on each target, each `bpf()` command — one
+/// target's or command's burst never holds back another's event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CapTarget {
+    /// A refused operation on one target (`target_dev`, `target_ino`: an
+    /// inode, or the process of a refused signal or ptrace).
+    Denial {
+        operation: nn_model::FsProtectOperation,
+        dev: u64,
+        ino: u64,
+    },
+    /// A `bpf()` command (uapi, or a synthetic `BPF_CMD_*`).
+    Bpf { cmd: u32 },
+}
+
+/// The cap's key: the kind of flood, the actor's uid, and its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CapKey {
+    pub kind: FloodKind,
+    pub uid: u32,
+    pub target: CapTarget,
+}
+
+impl CapKey {
+    /// The key `event` is counted under, `None` when the cap never holds it
+    /// back: not a flood of P0, or one of [`NEVER_CAPPED_BPF`].
+    pub fn of(event: &Event) -> Option<CapKey> {
+        let (kind, uid) = FloodKind::of(event)?;
+        let target = match event {
+            Event::FsProtectDenial {
+                operation,
+                target_dev,
+                target_ino,
+                ..
+            } => CapTarget::Denial {
+                operation: *operation,
+                dev: *target_dev,
+                ino: *target_ino,
+            },
+            Event::BpfSyscall { cmd, .. } => {
+                if NEVER_CAPPED_BPF.contains(cmd) {
+                    return None;
+                }
+                CapTarget::Bpf { cmd: *cmd }
+            }
+            _ => return None,
+        };
+        Some(CapKey { kind, uid, target })
+    }
+
+    /// As the signed row names the target.
+    pub fn target_json(&self) -> serde_json::Value {
+        match self.target {
+            CapTarget::Denial {
+                operation,
+                dev,
+                ino,
+            } => serde_json::json!({
+                "operation": operation.to_string(),
+                "target_dev": dev,
+                "target_ino": ino,
+            }),
+            CapTarget::Bpf { cmd } => serde_json::json!({
+                "cmd": common::wire::bpf_cmd_name(cmd),
+            }),
+        }
+    }
+}
+
+/// One process a capped key names: its pid, its `comm`, and what it did
+/// (a refused operation and its target, a `bpf()` command).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapSample {
+    pub pid: u32,
+    pub comm: String,
+    pub what: String,
+}
+
+/// What one key ([`CapKey`]) had capped since the last row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capped {
+    pub kind: FloodKind,
+    pub uid: u32,
+    pub target: CapTarget,
+    /// Events counted, not queued.
+    pub count: u64,
+    /// Bus time (ns) of the first and the last.
+    pub first_ns: u64,
+    pub last_ns: u64,
+    /// What the flood is made of: the first process of each distinct
+    /// `comm` and action among them (at most [`FLOOD_CAP_SAMPLES`]) — a
+    /// fork loop of one program is one, another program's attempt inside
+    /// the flood is named apart.
+    pub samples: Vec<CapSample>,
+}
+
+#[derive(Debug)]
+struct CapWindow {
+    started_ns: u64,
+    queued: u32,
+    pending: Option<Capped>,
+}
+
+/// C3's cap ([`FLOOD_CAP_PER_UID`]): per key ([`CapKey`]: kind, uid,
+/// target), a window of a second that lets the first events through and
+/// counts the rest. Pure: the caller passes the time.
+#[derive(Debug)]
+pub struct FloodCap {
+    per_uid: u32,
+    window_ns: u64,
+    keys: usize,
+    windows: std::collections::HashMap<CapKey, CapWindow>,
+    total: u64,
+    /// Queued uncapped because the table was full, since the last
+    /// [`Self::take_overflow`], and the uids among them that were root's.
+    overflow: u64,
+    overflow_root: bool,
+    overflow_total: u64,
+}
+
+impl Default for FloodCap {
+    fn default() -> Self {
+        Self::new(FLOOD_CAP_PER_UID, FLOOD_CAP_WINDOW_NS, FLOOD_CAP_KEYS)
+    }
+}
+
+impl FloodCap {
+    /// A cap of `per_uid` per `window_ns`, keeping at most `keys` pairs.
+    pub fn new(per_uid: u32, window_ns: u64, keys: usize) -> Self {
+        Self {
+            per_uid,
+            window_ns: window_ns.max(1),
+            keys: keys.max(1),
+            windows: std::collections::HashMap::new(),
+            total: 0,
+            overflow: 0,
+            overflow_root: false,
+            overflow_total: 0,
+        }
+    }
+
+    /// The event of `key` at `now_ns`: `true` it may be queued (counted in
+    /// its key's allowance), `false` it is over it — counted, `sample`
+    /// naming its process while the key names fewer than
+    /// [`FLOOD_CAP_SAMPLES`] kinds (`comm` and action). A full table queues
+    /// a new key uncapped and counts it ([`FLOOD_CAP_KEYS`]).
+    pub fn admit(&mut self, key: CapKey, now_ns: u64, sample: impl FnOnce() -> CapSample) -> bool {
+        let kind = key.kind;
+        if !self.windows.contains_key(&key) && self.windows.len() >= self.keys {
+            self.prune(now_ns);
+            if self.windows.len() >= self.keys {
+                self.overflow += 1;
+                self.overflow_total += 1;
+                self.overflow_root |= key.uid == 0;
+                return true;
+            }
+        }
+        let window_ns = self.window_ns;
+        let w = self.windows.entry(key).or_insert(CapWindow {
+            started_ns: now_ns,
+            queued: 0,
+            pending: None,
+        });
+        if now_ns.saturating_sub(w.started_ns) >= window_ns {
+            w.started_ns = now_ns;
+            w.queued = 0;
+        }
+        let allowance = match kind {
+            FloodKind::BpfOwn => self.per_uid.saturating_mul(4),
+            FloodKind::Denial | FloodKind::Bpf => self.per_uid,
+        };
+        if w.queued < allowance {
+            w.queued += 1;
+            return true;
+        }
+        let p = w.pending.get_or_insert_with(|| Capped {
+            kind,
+            uid: key.uid,
+            target: key.target,
+            count: 0,
+            first_ns: now_ns,
+            last_ns: now_ns,
+            samples: Vec::new(),
+        });
+        p.count += 1;
+        p.last_ns = now_ns;
+        if p.samples.len() < FLOOD_CAP_SAMPLES {
+            let s = sample();
+            if !p
+                .samples
+                .iter()
+                .any(|x| x.comm == s.comm && x.what == s.what)
+            {
+                p.samples.push(s);
+            }
+        }
+        self.total += 1;
+        false
+    }
+
+    /// An event [`Self::admit`] let through that was not queued after all
+    /// (the bus dropped it, or the batch's fast path handed it to the slow
+    /// one, which admits it again): its place in the allowance is given back.
+    pub fn refund(&mut self, key: CapKey) {
+        if let Some(w) = self.windows.get_mut(&key) {
+            w.queued = w.queued.saturating_sub(1);
+        }
+    }
+
+    /// The events queued uncapped because the table was full, since the
+    /// last call, and whether root's were among them; and since boot.
+    pub fn take_overflow(&mut self) -> (u64, bool, u64) {
+        let out = (self.overflow, self.overflow_root, self.overflow_total);
+        self.overflow = 0;
+        self.overflow_root = false;
+        out
+    }
+
+    /// Every event capped since boot.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// What was capped since the last call, per key — every key that
+    /// capped something —, the most first; the keys start counting again.
+    pub fn take_pending(&mut self) -> Vec<Capped> {
+        let mut out: Vec<Capped> = self
+            .windows
+            .values_mut()
+            .filter_map(|w| w.pending.take())
+            .collect();
+        out.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then((a.kind, a.uid, a.target).cmp(&(b.kind, b.uid, b.target)))
+        });
+        out
+    }
+
+    /// Forget the pairs whose window ended and that hold nothing to sign.
+    fn prune(&mut self, now_ns: u64) {
+        let window_ns = self.window_ns;
+        self.windows
+            .retain(|_, w| w.pending.is_some() || now_ns.saturating_sub(w.started_ns) < window_ns);
+    }
+}
+
 /// Where on its path an event can be lost (plan §3.4), in the order it
-/// meets them. R12a counts 1 to 4 (`nn-admin status`); 5 is R12b's (the
-/// decision thread's budget per class), 6 to 8 R12c's and later lots'.
+/// meets them. R12a counts 1 to 4 (`nn-admin status`), R12b (lab PR 269)
+/// 5 (the decision's delay from the record's kernel time against its
+/// class's budget, [`DECISION_BUDGET_NS`]); 6 to 8 are R12c's and later
+/// lots'.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LossStage {
     /// 1. The kernel's ring was full (`RING_DROPS`).
@@ -1155,6 +1650,403 @@ mod tests {
         ] {
             assert_eq!(class_of(&trip(kind, ty)), class, "{kind:?}");
         }
+    }
+
+    fn bpf(pid: u32, uid: u32) -> Event {
+        Event::BpfSyscall {
+            pid,
+            uid,
+            comm: "loop".into(),
+            cmd: 0,
+            arg: 0,
+            timestamp_ns: 7,
+        }
+    }
+
+    fn denial_of(pid: u32, uid: u32) -> Event {
+        Event::FsProtectDenial {
+            pid,
+            uid,
+            comm: "chmod".into(),
+            target_dev: 1,
+            target_ino: 2,
+            operation: nn_model::FsProtectOperation::Setattr,
+            timestamp_ns: 9,
+        }
+    }
+
+    /// A key of `kind` by `uid` on one fixed target (a `bpf(BPF_MAP_CREATE)`,
+    /// a handle on an agent object, a `chmod` of inode 1:2).
+    fn key(kind: FloodKind, uid: u32) -> CapKey {
+        let target = match kind {
+            FloodKind::Denial => CapTarget::Denial {
+                operation: nn_model::FsProtectOperation::Setattr,
+                dev: 1,
+                ino: 2,
+            },
+            FloodKind::Bpf => CapTarget::Bpf { cmd: 0 },
+            FloodKind::BpfOwn => CapTarget::Bpf {
+                cmd: common::wire::BPF_CMD_FOREIGN_GET_FD,
+            },
+        };
+        CapKey { kind, uid, target }
+    }
+
+    fn sample(pid: u32) -> CapSample {
+        CapSample {
+            pid,
+            comm: format!("c{pid}"),
+            what: String::new(),
+        }
+    }
+
+    /// C3 (R12b): each uid gets its allowance a second per kind; the rest
+    /// of the second is counted with its processes named; the next second
+    /// starts again; another uid and the other kind are not capped by it.
+    #[test]
+    fn the_floods_of_p0_are_capped_per_uid_and_second() {
+        let mut cap = FloodCap::new(3, 1_000, 16);
+        let admitted: Vec<bool> = (0..5u32)
+            .map(|i| cap.admit(key(FloodKind::Bpf, 1000), 10 + u64::from(i), || sample(i)))
+            .collect();
+        assert_eq!(admitted, [true, true, true, false, false]);
+        // another uid, the other kind: their own allowance
+        assert!(cap.admit(key(FloodKind::Bpf, 1001), 20, || sample(9)));
+        assert!(cap.admit(key(FloodKind::Denial, 1000), 20, || sample(9)));
+        // the window's end (exclusive): still capped at 1_009, not at 1_010
+        assert!(!cap.admit(key(FloodKind::Bpf, 1000), 1_009, || sample(5)));
+        assert!(cap.admit(key(FloodKind::Bpf, 1000), 1_010, || sample(6)));
+        assert_eq!(cap.total(), 3);
+        let rows = cap.take_pending();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let r = &rows[0];
+        assert_eq!((r.kind, r.uid, r.count), (FloodKind::Bpf, 1000, 3));
+        assert_eq!((r.first_ns, r.last_ns), (13, 1_009));
+        let pids: Vec<u32> = r.samples.iter().map(|s| s.pid).collect();
+        assert_eq!(pids, [3, 4, 5]);
+        assert!(cap.take_pending().is_empty(), "taken once");
+        // a refund gives one place back
+        assert!(cap.admit(key(FloodKind::Bpf, 1000), 1_011, || sample(7)));
+        assert!(cap.admit(key(FloodKind::Bpf, 1000), 1_012, || sample(7)));
+        assert!(!cap.admit(key(FloodKind::Bpf, 1000), 1_013, || sample(7)));
+        cap.refund(key(FloodKind::Bpf, 1000));
+        assert!(cap.admit(key(FloodKind::Bpf, 1000), 1_014, || sample(7)));
+    }
+
+    /// The cap's samples name what the flood is made of: one process per
+    /// distinct `comm` and action — a fork loop of one program is one
+    /// sample, another program's attempt inside it its own — at most
+    /// [`FLOOD_CAP_SAMPLES`]; the production allowance is
+    /// [`FLOOD_CAP_PER_UID`] a second.
+    #[test]
+    fn a_capped_pair_names_distinct_processes() {
+        let mut one = FloodCap::new(1, 1_000, 16);
+        let loop_of = |pid: u32, comm: &str| CapSample {
+            pid,
+            comm: comm.into(),
+            what: "setattr 1:2".into(),
+        };
+        assert!(one.admit(key(FloodKind::Denial, 0), 0, || loop_of(1, "forkloop")));
+        for pid in 2..50 {
+            assert!(!one.admit(key(FloodKind::Denial, 0), 1, || loop_of(pid, "forkloop")));
+        }
+        assert!(!one.admit(key(FloodKind::Denial, 0), 2, || loop_of(77, "rm")));
+        let rows = one.take_pending();
+        let named: Vec<(u32, &str)> = rows[0]
+            .samples
+            .iter()
+            .map(|s| (s.pid, s.comm.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            [(2, "forkloop"), (77, "rm")],
+            "the loop once, the other program apart"
+        );
+        let mut cap = FloodCap::default();
+        let per = FLOOD_CAP_PER_UID;
+        for i in 0..per {
+            assert!(cap.admit(key(FloodKind::Denial, 0), u64::from(i), || sample(i)));
+        }
+        for i in 0..40u32 {
+            assert!(!cap.admit(key(FloodKind::Denial, 0), 500_000_000, || sample(i % 20)));
+        }
+        let rows = cap.take_pending();
+        assert_eq!(rows[0].count, 40);
+        assert_eq!(rows[0].samples.len(), FLOOD_CAP_SAMPLES);
+        let mut pids: Vec<u32> = rows[0].samples.iter().map(|s| s.pid).collect();
+        pids.dedup();
+        assert_eq!(pids.len(), FLOOD_CAP_SAMPLES);
+        assert!(
+            cap.admit(key(FloodKind::Denial, 0), FLOOD_CAP_WINDOW_NS + 1, || {
+                sample(0)
+            }),
+            "a second later"
+        );
+    }
+
+    /// A full table forgets the pairs with nothing to sign whose window
+    /// ended; a new pair that finds no room is queued, never capped.
+    #[test]
+    fn a_full_cap_table_never_caps_a_new_uid() {
+        let mut cap = FloodCap::new(1, 100, 2);
+        assert!(cap.admit(key(FloodKind::Bpf, 1), 0, || sample(1)));
+        assert!(
+            !cap.admit(key(FloodKind::Bpf, 1), 1, || sample(1)),
+            "uid 1 capped"
+        );
+        assert!(cap.admit(key(FloodKind::Bpf, 2), 1, || sample(2)));
+        // full: uid 3 finds no room yet (uid 1 has a row to sign, uid 2's
+        // window runs) — queued uncapped, again and again
+        assert!(cap.admit(key(FloodKind::Bpf, 3), 2, || sample(3)));
+        assert!(cap.admit(key(FloodKind::Bpf, 3), 3, || sample(3)));
+        // uid 2's window ends: it goes, uid 3 takes its place
+        assert!(cap.admit(key(FloodKind::Bpf, 3), 200, || sample(3)));
+        assert!(
+            !cap.admit(key(FloodKind::Bpf, 3), 201, || sample(3)),
+            "uid 3 counted now"
+        );
+        assert_eq!(cap.take_pending().len(), 2);
+        // the two queued for want of a slot are counted, uid 3's (not root)
+        assert_eq!(cap.take_overflow(), (2, false, 2));
+        assert_eq!(cap.take_overflow(), (0, false, 2), "taken once");
+        // root's overflow is said apart (the posture's signal)
+        let mut full = FloodCap::new(1, 100, 1);
+        assert!(full.admit(key(FloodKind::Bpf, 5), 0, || sample(5)));
+        assert!(full.admit(key(FloodKind::Bpf, 0), 1, || sample(0)));
+        assert_eq!(full.take_overflow(), (1, true, 1));
+    }
+
+    /// Review of #474: inside a uid the cap counts each command and each
+    /// (operation, target) apart, and never holds back NN-L-BPF-001's
+    /// commands — one command's or target's burst never keeps another's
+    /// event from its judgement; every key that capped something is
+    /// reported with its count.
+    #[test]
+    fn each_command_and_target_has_its_own_allowance() {
+        use common::bpf_cmd::{BPF_LINK_CREATE, BPF_MAP_CREATE, BPF_PROG_ATTACH, BPF_PROG_LOAD};
+        let call = |cmd: u32| Event::BpfSyscall {
+            pid: 7,
+            uid: 0,
+            comm: "c".into(),
+            cmd,
+            arg: 0,
+            timestamp_ns: 1,
+        };
+        for cmd in [BPF_PROG_LOAD, BPF_PROG_ATTACH, BPF_LINK_CREATE] {
+            assert_eq!(CapKey::of(&call(cmd)), None, "cmd {cmd} is never capped");
+        }
+        let map = CapKey::of(&call(BPF_MAP_CREATE)).expect("a map create is counted");
+        assert_eq!(
+            map.target,
+            CapTarget::Bpf {
+                cmd: BPF_MAP_CREATE
+            }
+        );
+        let mut cap = FloodCap::new(3, 1_000, 16);
+        let n = |cap: &mut FloodCap, k: CapKey| {
+            (0..10u32)
+                .filter(|i| cap.admit(k, 10, || sample(*i)))
+                .count()
+        };
+        assert_eq!(n(&mut cap, map), 3);
+        // another command of the same uid (`BPF_MAP_LOOKUP_ELEM`, 1), keyed
+        // apart by `CapKey::of` itself (the final mutation AN2)
+        let other = CapKey::of(&call(1)).expect("a lookup is counted");
+        assert_eq!(other.target, CapTarget::Bpf { cmd: 1 });
+        assert_ne!(other, map);
+        assert_eq!(n(&mut cap, other), 3, "another command: its own allowance");
+        let on = |ino: u64| {
+            CapKey::of(&Event::FsProtectDenial {
+                pid: 1,
+                uid: 0,
+                comm: "chmod".into(),
+                target_dev: 1,
+                target_ino: ino,
+                operation: nn_model::FsProtectOperation::Setattr,
+                timestamp_ns: 1,
+            })
+            .unwrap()
+        };
+        assert_eq!(n(&mut cap, on(2)), 3);
+        assert_eq!(n(&mut cap, on(3)), 3, "another target: its own allowance");
+        let rows = cap.take_pending();
+        assert_eq!(rows.len(), 4, "every key that capped: {rows:?}");
+        assert!(rows.iter().all(|r| r.count == 7 && r.uid == 0));
+        assert_eq!(cap.total(), 28);
+        assert_eq!(
+            map.target_json(),
+            serde_json::json!({"cmd": common::wire::bpf_cmd_name(BPF_MAP_CREATE)})
+        );
+        assert_eq!(on(3).target_json()["target_ino"], 3);
+    }
+
+    /// R12b (the lab's soak): a uid's `bpf()` records about the agent's own
+    /// objects (NN-L-BPF-002's) have an allowance of their own, four times
+    /// the others' — a burst of `bpftool map dump`s of the agent's maps is
+    /// not capped with the uid's other calls, and a flood of them still is.
+    #[test]
+    fn the_agent_s_own_objects_have_an_allowance_of_their_own() {
+        use common::wire::{BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE};
+        let own = |cmd| Event::BpfSyscall {
+            pid: 1,
+            uid: 0,
+            comm: "bpftool".into(),
+            cmd,
+            arg: 7,
+            timestamp_ns: 1,
+        };
+        assert_eq!(
+            FloodKind::of(&own(BPF_CMD_FOREIGN_GET_FD)),
+            Some((FloodKind::BpfOwn, 0))
+        );
+        assert_eq!(
+            FloodKind::of(&own(BPF_CMD_FOREIGN_MAP_WRITE)),
+            Some((FloodKind::BpfOwn, 0))
+        );
+        assert_eq!(FloodKind::of(&own(0)), Some((FloodKind::Bpf, 0)));
+        assert_eq!(FLOOD_CAP_OWN_PER_UID, 4 * FLOOD_CAP_PER_UID);
+        let mut cap = FloodCap::new(3, 1_000, 16);
+        let n = |cap: &mut FloodCap, kind| {
+            (0..20u32)
+                .filter(|i| cap.admit(key(kind, 0), u64::from(*i), || sample(*i)))
+                .count()
+        };
+        assert_eq!(n(&mut cap, FloodKind::Bpf), 3, "the other calls' allowance");
+        assert_eq!(n(&mut cap, FloodKind::BpfOwn), 12, "four times it, apart");
+        assert_eq!(n(&mut cap, FloodKind::Denial), 3);
+    }
+
+    /// Only the events that flood P0 have a kind; their uid is the actor's.
+    #[test]
+    fn the_flood_kinds_are_the_floods_of_p0() {
+        assert_eq!(FloodKind::of(&bpf(1, 1000)), Some((FloodKind::Bpf, 1000)));
+        assert_eq!(
+            FloodKind::of(&denial_of(1, 0)),
+            Some((FloodKind::Denial, 0))
+        );
+        assert!(floods_p0(&bpf(1, 1)) && floods_p0(&denial_of(1, 1)));
+        let open = Event::FileOpen {
+            pid: 1,
+            uid: 0,
+            gid: 0,
+            comm: String::new(),
+            filename: String::new(),
+            flags: 0,
+            timestamp_ns: 0,
+            path_from_user: false,
+            kernel_class: 0,
+        };
+        assert_eq!(FloodKind::of(&open), None);
+    }
+
+    /// Stage 5 (R12b): the decision's delay from the record's kernel time,
+    /// against the budget; a record without a time is counted apart.
+    #[test]
+    fn the_decision_delay_is_timed_from_the_record() {
+        let mut d = DecisionDelay::default();
+        assert!(
+            !d.record(1_000, 1_000 + 100, 100),
+            "at the budget: not over"
+        );
+        assert!(d.record(1_000, 1_000 + 101, 100), "past it");
+        assert!(!d.record(0, 5_000, 100), "untimed");
+        assert!(
+            !d.record(9_000, 5_000, 100),
+            "a record after the clock read"
+        );
+        assert_eq!((d.over_budget, d.untimed, d.delay.count()), (1, 1, 3));
+        assert_eq!(d.delay.max_us(), 0);
+        let mut d = DecisionDelay::default();
+        d.record(1, 1 + 250_000_000, DECISION_BUDGET_NS[1]);
+        assert_eq!(d.delay.max_us(), 250_000);
+        assert_eq!(d.over_budget, 0, "P1's budget is 250 ms");
+        // the budgets: P0 the tightest
+        assert!(DECISION_BUDGET_NS[0] < DECISION_BUDGET_NS[1]);
+        assert!(DECISION_BUDGET_NS[1] < DECISION_BUDGET_NS[3]);
+        assert!(DECISION_BUDGET_NS[3] < DECISION_BUDGET_NS[2]);
+    }
+
+    /// The envelope: the class, the record's time, the actor and its start
+    /// when the record names it; a flow's row by its phase.
+    #[test]
+    fn an_envelope_carries_the_class_the_record_s_time_and_the_process() {
+        let e = Envelope::new(SourceId(3), 42, [7; 16], denial_of(55, 0));
+        assert_eq!(
+            (e.source, e.seq, e.class),
+            (SourceId(3), 42, EventClass::Tamper)
+        );
+        assert_eq!(e.ts_ns, 9);
+        assert_eq!(
+            (e.key.boot_id, e.key.tgid, e.key.start_ns),
+            ([7; 16], 55, 0)
+        );
+        assert_eq!(e.priority(), Priority::P0);
+        let spawn = Event::ProcessSpawn {
+            pid: 9,
+            ppid: 1,
+            uid: 0,
+            gid: 0,
+            comm: String::new(),
+            filename: String::new(),
+            timestamp_ns: 500,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+            start_ns: 499,
+            parent_is_kthread: false,
+            exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        };
+        let e = Envelope::new(SourceId(1), 1, [0; 16], spawn);
+        assert_eq!((e.ts_ns, e.key.tgid, e.key.start_ns), (500, 9, 499));
+        use nn_model::telemetry::{FlowPhase, NetFlowEvent};
+        let flow = |phase, proto, observed_ns| {
+            let any = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+            Event::NetFlow(NetFlowEvent {
+                start_ns: 10,
+                end_ns: 20,
+                family: 2,
+                src_addr: any,
+                src_port: 0,
+                dst_addr: any,
+                dst_port: 0,
+                proto,
+                pid: 4,
+                uid: 0,
+                comm: String::new(),
+                exe: None,
+                proc_start_ns: 3,
+                bytes_sent: 0,
+                bytes_recv: 0,
+                resolved_hostname: None,
+                tls_fingerprint: None,
+                flow_id: String::new(),
+                close_reason: 0,
+                phase,
+                observed_ns,
+            })
+        };
+        assert_eq!(
+            record_time_ns(&flow(FlowPhase::Closed, 6, 0)),
+            20,
+            "a TCP close"
+        );
+        assert_eq!(record_time_ns(&flow(FlowPhase::Connect, 6, 10)), 10);
+        assert_eq!(record_time_ns(&flow(FlowPhase::Denied, 6, 11)), 11);
+        assert_eq!(
+            record_time_ns(&flow(FlowPhase::Snapshot, 6, 15)),
+            15,
+            "its time"
+        );
+        assert_eq!(
+            record_time_ns(&flow(FlowPhase::Closed, 17, 0)),
+            0,
+            "a UDP window"
+        );
+        assert_eq!(actor_of(&flow(FlowPhase::Closed, 6, 0)), (4, 3));
+        assert_eq!(actor_of(&bpf(8, 1000)), (8, 0));
     }
 
     /// The histogram's quantiles stay within a bucket (12.5 %) of the value

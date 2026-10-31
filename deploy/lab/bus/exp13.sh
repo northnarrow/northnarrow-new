@@ -24,6 +24,7 @@
 #   [--settle S] [--key FILE] [--stall-secs N]
 #   [--net-rate R] [--dns-rate D] [--net-port P] [--probes N]
 #   [--stage-read] [--bpf-flood-procs N] [--denial-flood-procs N]
+#   [--bpf-flood-uid U] [--progload-probes N]
 # --flood-secs 0: no flood. --stall-secs N (a lab build: debug-trigger): the
 # event loop is first made to stand still N seconds
 # (/run/northnarrow/debug-stall-loop, lab PR 216), and the bursts start when
@@ -47,7 +48,12 @@
 # (EXP-13d) runs N loops of fork() + bpf(BPF_MAP_CREATE) as the lab user,
 # --denial-flood-procs N (EXP-13e) N loops of fork() + a refused chmod of
 # the target as root, through the flood's time, each in a unit of its own;
-# --flood-procs 0 keeps the open flood off. The agent's threads' CPU time
+# --flood-procs 0 keeps the open flood off. Review of #474 (lot 269):
+# --bpf-flood-uid 0 runs the bpf() loops as root instead, and
+# --progload-probes N, spread over the flood, N root processes that each
+# load a two-instruction socket filter (`nn-exp13 progload`): the summary
+# counts each one's NN-L-BPF-001 record — the check that the cap never
+# keeps a program load from its judgement. The agent's threads' CPU time
 # and the host's CPU pressure (/proc/pressure/cpu) are read before and
 # after (cpu-before.txt, cpu-after.txt).
 # Output (DIR, default /var/lib/nn-exp13/<UTC stamp>): status-before.json,
@@ -62,7 +68,7 @@ export LC_ALL=C
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT= FLOOD_SECS=40 FLOOD_PROCS=4 THREADS=32 BURSTS=8 BURST_SIZE=1500 BURST_GAP_MS=3000
 SETTLE=75 KEY= STALL=0 NET_RATE=0 DNS_RATE=0 NET_PORT=18099 PROBES=0
-STAGE_READ=0 BPF_PROCS=0 DENIAL_PROCS=0
+STAGE_READ=0 BPF_PROCS=0 DENIAL_PROCS=0 BPF_UID= PROGLOAD=0
 DET=/var/lib/northnarrow/detections/detections.jsonl
 AUDIT=/etc/northnarrow/audit.log
 TARGET=/etc/northnarrow/admin.pub
@@ -89,6 +95,8 @@ while (($#)); do
         --stage-read) STAGE_READ=1; shift ;;
         --bpf-flood-procs) BPF_PROCS=${2:?}; shift 2 ;;
         --denial-flood-procs) DENIAL_PROCS=${2:?}; shift 2 ;;
+        --bpf-flood-uid) BPF_UID=${2:?}; shift 2 ;;
+        --progload-probes) PROGLOAD=${2:?}; shift 2 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -211,10 +219,23 @@ dur=$((FLOOD_SECS > 0 ? FLOOD_SECS : 30))
 if ((BPF_PROCS > 0)); then
     systemctl stop nn-exp13-bpfflood.service 2>/dev/null
     systemctl reset-failed nn-exp13-bpfflood.service 2>/dev/null
-    systemd-run --quiet --unit=nn-exp13-bpfflood --uid="$USER_NAME" \
+    as=(--uid="$USER_NAME")
+    [[ $BPF_UID == 0 ]] && as=()
+    systemd-run --quiet --unit=nn-exp13-bpfflood "${as[@]}" \
         -p StandardOutput="file:$OUT/bpfflood.txt" -p StandardError="file:$OUT/bpfflood.err" \
         "$LIBEXEC/nn-exp13-flood" bpfflood "$dur" "$BPF_PROCS" || die "the bpf flood did not start"
     units+=(nn-exp13-bpfflood.service)
+fi
+: > "$OUT/progload.txt"
+if ((PROGLOAD > 0)); then
+    gap_s=$(awk -v d="$dur" -v n="$PROGLOAD" 'BEGIN { printf "%.3f", d / (n + 1) }')
+    systemctl stop nn-exp13-progload.service 2>/dev/null
+    systemctl reset-failed nn-exp13-progload.service 2>/dev/null
+    systemd-run --quiet --unit=nn-exp13-progload \
+        -p StandardOutput="file:$OUT/progload.txt" -p StandardError="file:$OUT/progload.err" \
+        /bin/bash -c "for i in \$(seq 1 $PROGLOAD); do sleep $gap_s; $LIBEXEC/nn-exp13-probe progload; done" \
+        || die "the program-load probes did not start"
+    units+=(nn-exp13-progload.service)
 fi
 if ((DENIAL_PROCS > 0)); then
     systemctl stop nn-exp13-denialflood.service 2>/dev/null
@@ -306,7 +327,7 @@ for line in open(out + "/detections.jsonl", errors="replace"):
     suppressed += int(r.get("suppressed_before") or 0)
 recs.sort()
 
-held, bus_rows, ring_rows, coalesced = 0, [], [], 0
+held, bus_rows, ring_rows, coalesced, capped, capped_rows = 0, [], [], 0, 0, []
 for line in open(out + "/audit.jsonl", errors="replace"):
     try:
         r = json.loads(line)
@@ -324,6 +345,12 @@ for line in open(out + "/audit.jsonl", errors="replace"):
         bus_rows.append(extra)
     elif op == "event_bus_coalesced":
         coalesced += int(extra.get("repeats_since_last_row") or 0)
+    elif op == "event_bus_capped":
+        # R12b (lab PR 269, C3): P0's floods counted past their uid's cap
+        capped_rows.append(extra)
+        for f in extra.get("floods") or []:
+            if f.get("event") == "FsProtectDenial":
+                capped += int(f.get("capped") or 0)
     elif op == "ringbuf_drop":
         ring_rows.append(extra)
 
@@ -406,10 +433,33 @@ def cpu_delta(a, b):
     psi = {k: {"total_ms": round((pb[k]["total"] - pa.get(k, {}).get("total", 0)) / 1000), "avg10_after": pb[k].get("avg10")} for k in pb}
     return {"agent_cpu_s_by_thread": threads, "agent_cpu_s": round(sum(threads.values()), 2), "cpu_pressure": psi}
 
+def progload():
+    """Review of #474: each program-load probe and its NN-L-BPF-001 records."""
+    out_p = []
+    for f in lines_of("progload.txt"):
+        if len(f) == 4 and f[0] == "progload":
+            pid = int(f[1])
+            hits = [1 for _, names, _ in recs_by_pid.get(pid, []) if any(n.startswith("NN-L-BPF-001") for n in names)]
+            out_p.append({"pid": pid, "fd": int(f[2]), "errno": int(f[3]), "records": len(hits)})
+    return {"sent": len(out_p), "judged": sum(1 for p in out_p if p["records"]), "probes": out_p}
+
 def helper_line(name, tag):
     f = next((f for f in lines_of(name) if f and f[0] == tag), None)
     return None if f is None else [int(x) for x in f[1:]]
 ring_names = sorted(set((before or {}).get("ringbuf_drops") or {}) | set((after or {}).get("ringbuf_drops") or {}))
+# R12b (lab PR 269): stage 5 per queue, and P0's floods capped per uid
+# (`event_bus_decision`); on such a build the denials the bus coalesced or
+# capped are counted as NN-L-AT-001's held records (C5): the rule's own
+# ledger (records + held) tells every attempt.
+def dec(s):
+    q = ((s or {}).get("event_bus_decision") or {}).get("queues") or []
+    return {x["priority"]: x for x in q}
+db, da = dec(before), dec(after)
+c5 = bool(da)
+def dd(p, k):
+    if p not in da or da[p].get(k) is None:
+        return None
+    return da[p][k] - (db.get(p, {}).get(k, 0) if k in ("timed", "untimed", "over_budget", "capped") else 0)
 
 summary = {
     "net_load": None if net_line is None else {"connected": int(net_line[1]), "failed": int(net_line[2]), "dns_sent": int(net_line[3])},
@@ -417,23 +467,31 @@ summary = {
     "probes_stage": probes("stage", ("NN-L-CHAIN-002", "NN-L-NET-008")),
     "probes_stage_by_class": per_class("stage", {"exec": ("R00",), "file": ("NN-L-FIM-",), "net": ("NN-L-CHAIN-", "NN-L-NET-008")}),
     "bpfflood": helper_line("bpfflood.txt", "bpfflood"),
+    "progload_probes": progload(),
     "denialflood": helper_line("denialflood.txt", "denialflood"),
     "cpu_flood": cpu_delta("cpu-before.txt", "cpu-flood-end.txt"),
     "ring_drops_delta_all": {r: delta(r) for r in ring_names},
     "attempts_refused": attempts, "attempts_allowed": allowed, "tamper_rc": tamper_rc,
     "at001_records": len(recs), "at001_suppressed_before": suppressed, "at001_held_reported": held,
     "at001_coalesced": coalesced,
-    "at001_accounted": len(recs) + held + coalesced,
+    "at001_capped": capped,
+    "held_counts_bus_repeats": c5,
+    "at001_accounted": len(recs) + held + (0 if c5 else coalesced),
     "ring_drops_delta": {r: delta(r) for r in ("fs_protect", "open_sensor", "task_denial_rate", "exec", "fim")},
     "first_record_latency_ms": lat,
     "event_bus": None if not ba else {p: {k: qd(p, k) for k in ("enqueued", "dropped", "waited", "aged", "ahead", "decided", "max_depth", "max_wait_us", "recent_max_wait_us", "send_wait_max_us", "latency_p50_us", "latency_p99_us", "latency_max_us")} for p in sorted(ba)},
     "event_bus_drop_rows": bus_rows, "ringbuf_drop_rows": ring_rows,
+    "decision_delay": None if not da else {p: {k: dd(p, k) for k in ("budget_us", "timed", "untimed", "over_budget", "capped", "delay_p50_us", "delay_p99_us", "delay_max_us")} for p in sorted(da)},
+    "event_bus_capped_rows": capped_rows,
     "flood": open(out + "/flood.txt").read().split("\n") if True else None,
     "flood_secs_measured": round((t_flood_end - t_start) / 1e9, 1),
 }
 json.dump(summary, open(out + "/summary.json", "w"), indent=1)
 print("refused attempts   :", attempts, "(allowed:", allowed, ")")
-print("AT-001 recorded    :", len(recs), "records +", held, "held (budget, signed detections_held) +", coalesced, "coalesced (signed event_bus_coalesced) =", len(recs) + held + coalesced)
+if c5:
+    print("AT-001 recorded    :", len(recs), "records +", held, "held (signed detections_held: the budget's, and the bus's", coalesced, "coalesced and", capped, "capped) =", len(recs) + held)
+else:
+    print("AT-001 recorded    :", len(recs), "records +", held, "held (budget, signed detections_held) +", coalesced, "coalesced (signed event_bus_coalesced) =", len(recs) + held + coalesced)
 print("ring drops (delta) :", summary["ring_drops_delta"])
 print("first record (ms)  :", lat)
 if summary["event_bus"]:
@@ -442,6 +500,10 @@ if summary["event_bus"]:
 else:
     print("bus                : (this agent has no event bus)")
 print("event_bus_drop rows:", len(bus_rows), "ringbuf_drop rows:", len(ring_rows))
+if summary["decision_delay"]:
+    for p, v in summary["decision_delay"].items():
+        print("decision", p, ":", v)
+    print("event_bus_capped rows:", len(capped_rows))
 print("flood              :", " | ".join(x for x in summary["flood"] if x))
 if summary["net_load"] or summary["probes_net001"]["sent"]:
     print("net load           :", summary["net_load"])
@@ -450,6 +512,9 @@ if summary["net_load"] or summary["probes_net001"]["sent"]:
         print(k.ljust(19) + ":", v["judged"], "of", v["sent"], "judged,", v["killed_while_connecting"], "killed while connecting; latency ms", [p["latency_ms"] for p in v["probes"]])
     print("ring drops (all)   :", summary["ring_drops_delta_all"])
     print("stage by class     :", summary["probes_stage_by_class"])
+if summary["progload_probes"]["sent"]:
+    pl = summary["progload_probes"]
+    print("progload probes    :", pl["judged"], "of", pl["sent"], "with an NN-L-BPF-001 record;", [(p["pid"], p["fd"] >= 0, p["records"]) for p in pl["probes"]])
 if summary["bpfflood"] or summary["denialflood"]:
     print("bpf flood          :", summary["bpfflood"], "(children, refused, allowed, other)")
     print("denial flood       :", summary["denialflood"], "(children, refused, allowed, other)")

@@ -1276,7 +1276,7 @@ fn the_event_loop_wires_the_bus_as_modelled() {
         !code[each..teach].contains('}'),
         "observe_arrival is the loop over the overtaken execs"
     );
-    let event = at("let e = received.event;", arm);
+    let event = at("let e = received.envelope.event;", arm);
     let judge = at("process_event(", arm);
     assert!(
         teach < event && event < judge,

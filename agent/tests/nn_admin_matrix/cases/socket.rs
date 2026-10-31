@@ -242,7 +242,7 @@ pub fn full_status() -> StatusResponse {
         "event_bus": {
             "queues": [
                 {"priority": "P0", "class": "tamper", "capacity": 1024,
-                 "when_full": "wait 50 ms, then drop for FsProtectDenial (repeats within 1 s coalesced); other tamper events wait, 64 slots kept from denials and bpf() calls",
+                 "when_full": "wait 50 ms, then drop for FsProtectDenial (repeats within 1 s coalesced); other tamper events wait, 64 slots kept from denials and bpf() calls; denials past 256 a second per uid, operation and target, bpf() calls past 256 per uid and command (1024 for those about the agent's own objects; program loads, attaches and link creations never) counted, not queued",
                  "enqueued": 12, "dropped": 0,
                  "depth": 0, "max_depth": 3, "max_wait_us": 41, "recent_max_wait_us": 0, "waited": 0,
                  "send_wait_max_us": 0, "ahead": 0, "coalesced": 1499,
@@ -276,8 +276,8 @@ pub fn full_status() -> StatusResponse {
                  "source": "RejectThrottle: malformed records"},
                 {"stage": 4, "name": "bus queue", "total": 98,
                  "source": "the event bus, per queue"},
-                {"stage": 5, "name": "decision delay", "total": null,
-                 "source": "not counted yet: R12b"},
+                {"stage": 5, "name": "decision delay", "total": 7,
+                 "source": "decisions later than their class's budget, from the record's kernel time"},
                 {"stage": 6, "name": "response queue", "total": null,
                  "source": "not counted yet: R12c"},
                 {"stage": 7, "name": "evidence writer queue", "total": null,
@@ -285,6 +285,24 @@ pub fn full_status() -> StatusResponse {
                 {"stage": 8, "name": "export", "total": null,
                  "source": "not counted yet: R12c, the telemetry_loss rows; R15, the export"}
             ]
+        },
+        // R12b (lab PR 269): stage 5 per queue, P0's floods capped per uid.
+        "event_bus_decision": {
+            "queues": [
+                {"priority": "P0", "budget_us": 100000, "timed": 12, "untimed": 0,
+                 "delay_p50_us": 150, "delay_p99_us": 1100, "delay_max_us": 1200,
+                 "over_budget": 0, "capped": 13},
+                {"priority": "P1", "budget_us": 250000, "timed": 798, "untimed": 0,
+                 "delay_p50_us": 60, "delay_p99_us": 2500, "delay_max_us": 3500,
+                 "over_budget": 0, "capped": 0},
+                {"priority": "P2", "budget_us": 1000000, "timed": 81808, "untimed": 0,
+                 "delay_p50_us": 30, "delay_p99_us": 410000, "delay_max_us": 1400000,
+                 "over_budget": 7, "capped": 0},
+                {"priority": "P3", "budget_us": 500000, "timed": 30, "untimed": 10,
+                 "delay_p50_us": null, "delay_p99_us": null, "delay_max_us": null,
+                 "over_budget": 0, "capped": 0}
+            ],
+            "cap_per_uid": 256
         }
     });
     for (k, x) in fill.as_object().unwrap() {
