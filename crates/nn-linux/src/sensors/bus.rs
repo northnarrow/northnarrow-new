@@ -326,10 +326,25 @@ struct State {
     /// The `FileOpen`s queued in P2 that count against the opens' cap
     /// (second review of #471, R-E: not the whole of P2).
     opens: usize,
+    /// R12b: the last queue time given ([`State::stamp`]).
+    last_push_ns: u64,
     /// R12b: per source, the last sequence taken (FIFO per source inside a
     /// class: a debug check at the take).
     #[cfg(debug_assertions)]
     last_taken: std::collections::HashMap<(SourceId, usize), u64>,
+}
+
+impl State {
+    /// R12b: an event's queue time — the bus's clock, later than every
+    /// earlier push's: the events of one batch, queued under one lock, keep
+    /// their order in time (the hand-over of the execs an event overtook
+    /// compares those times: an exec of a batch reached the bus before the
+    /// batch's later events).
+    fn stamp(&mut self, now_ns: u64) -> u64 {
+        let t = now_ns.max(self.last_push_ns + 1);
+        self.last_push_ns = t;
+        t
+    }
 }
 
 struct Inner {
@@ -541,6 +556,7 @@ fn build(specs: [QueueSpec; QUEUES], boot_id: [u8; 16], cap: FloodCap) -> (BusSe
             send_wait_max_ns: [0; QUEUES],
             recent_max_wait_ns: [0; QUEUES],
             opens: 0,
+            last_push_ns: 0,
             #[cfg(debug_assertions)]
             last_taken: Default::default(),
         }),
@@ -809,7 +825,8 @@ impl BusSender {
                     freed[p.index()] += 1;
                     continue;
                 }
-                if st.queues.push(p, now, r.env).is_err() {
+                let at = st.stamp(now);
+                if st.queues.push(p, at, r.env).is_err() {
                     // A permit is a slot: never here. Counted, never silent.
                     st.queues.note_dropped(p);
                     freed[p.index()] += 1;
@@ -919,7 +936,8 @@ impl BusSender {
                 return Ok(());
             }
             let now = inner.now_ns();
-            if st.queues.push(p, now, env).is_err() {
+            let at = st.stamp(now);
+            if st.queues.push(p, at, env).is_err() {
                 // A permit is a slot: never here. Counted, never silent.
                 st.queues.note_dropped(p);
                 drop(st);
@@ -3230,5 +3248,28 @@ mod tests {
         assert_eq!(parse_boot_id("0f1e"), None);
         assert_eq!(parse_boot_id("zz1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"), None);
         assert_eq!(read_boot_id().len(), 16);
+    }
+
+    /// R12b: an exec and a later event queued in one batch — one round of
+    /// the lock — keep their order in time: the event, taken ahead of the
+    /// exec, hands it over (lab PR 267's barrier).
+    #[test]
+    fn a_batch_s_exec_is_handed_over_by_the_batch_s_later_event() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = channel();
+        tx.send_batch_blocking(rt.handle(), vec![spawn(4242), denial(4242), spawn(4243)])
+            .unwrap();
+        let r = rx.try_recv().unwrap();
+        assert!(matches!(r.envelope.event, Event::FsProtectDenial { .. }));
+        let handed: Vec<u32> = r.overtaken.iter().map(pid_of).collect();
+        assert_eq!(
+            handed,
+            [4242],
+            "the exec before it in the batch, not the one after"
+        );
     }
 }
