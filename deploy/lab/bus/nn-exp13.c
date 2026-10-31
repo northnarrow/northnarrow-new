@@ -32,6 +32,12 @@
  *       A probe of the three classes from one process: prints "connect <t0>
  *       <pid>", reads <file> (a decoy credential: the FIM credential-read
  *       rules), then connects as `connect` does.
+ *   progload
+ *       Review of #474 (lot 269): the check that NN-L-BPF-001 judges a
+ *       program load inside a capped flood of its uid's bpf() calls: one
+ *       bpf(BPF_PROG_LOAD) of a two-instruction socket filter (r0 = 0;
+ *       exit), the program closed at once. Prints "progload <pid> <fd or
+ *       -1> <errno>".
  *   bpfflood <seconds> <procs>
  *       EXP-13d (second review of #471, R-A): <procs> loops of fork() + a
  *       child's bpf(BPF_MAP_CREATE) with an array map of one entry, then
@@ -325,6 +331,27 @@ static int bpf_child(const char *unused)
     return errno == EPERM || errno == EACCES ? 1 : 2;
 }
 
+static int prog_load(void)
+{
+    struct bpf_insn insns[2];
+    memset(insns, 0, sizeof insns);
+    insns[0].code = BPF_ALU64 | BPF_MOV | BPF_K; /* r0 = 0 */
+    insns[1].code = BPF_JMP | BPF_EXIT;
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof attr);
+    attr.prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
+    attr.insn_cnt = 2;
+    attr.insns = (unsigned long)insns;
+    attr.license = (unsigned long)"GPL";
+    long fd = syscall(SYS_bpf, BPF_PROG_LOAD, &attr, sizeof attr);
+    int err = fd < 0 ? errno : 0;
+    printf("progload %d %ld %d\n", (int)getpid(), fd, err);
+    fflush(stdout);
+    if (fd >= 0)
+        close((int)fd);
+    return 0;
+}
+
 static int chmod_child(const char *file)
 {
     struct stat st;
@@ -366,6 +393,8 @@ int main(int argc, char **argv)
 {
     if (argc == 5 && strcmp(argv[1], "readconnect") == 0)
         return read_connect(argv[2], argv[3], atoi(argv[4]));
+    if (argc == 2 && strcmp(argv[1], "progload") == 0)
+        return prog_load();
     if (argc == 4 && strcmp(argv[1], "bpfflood") == 0)
         return floods("bpfflood", atoi(argv[2]), atoi(argv[3]), bpf_child, NULL);
     if (argc == 5 && strcmp(argv[1], "denialflood") == 0)
@@ -381,6 +410,6 @@ int main(int argc, char **argv)
     fprintf(stderr, "usage: %s flood <secs> <threads> <file>... | tamper <bursts> <size> <gap-ms> <file>"
                     " | net <secs> <connects/s> <port> <dns/s> | connect <ip> <port>"
                     " | readconnect <file> <ip> <port> | bpfflood <secs> <procs>"
-                    " | denialflood <secs> <procs> <file>\n", argv[0]);
+                    " | denialflood <secs> <procs> <file> | progload\n", argv[0]);
     return 2;
 }

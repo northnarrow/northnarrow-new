@@ -24,6 +24,7 @@
 #   [--settle S] [--key FILE] [--stall-secs N]
 #   [--net-rate R] [--dns-rate D] [--net-port P] [--probes N]
 #   [--stage-read] [--bpf-flood-procs N] [--denial-flood-procs N]
+#   [--bpf-flood-uid U] [--progload-probes N]
 # --flood-secs 0: no flood. --stall-secs N (a lab build: debug-trigger): the
 # event loop is first made to stand still N seconds
 # (/run/northnarrow/debug-stall-loop, lab PR 216), and the bursts start when
@@ -47,7 +48,12 @@
 # (EXP-13d) runs N loops of fork() + bpf(BPF_MAP_CREATE) as the lab user,
 # --denial-flood-procs N (EXP-13e) N loops of fork() + a refused chmod of
 # the target as root, through the flood's time, each in a unit of its own;
-# --flood-procs 0 keeps the open flood off. The agent's threads' CPU time
+# --flood-procs 0 keeps the open flood off. Review of #474 (lot 269):
+# --bpf-flood-uid 0 runs the bpf() loops as root instead, and
+# --progload-probes N, spread over the flood, N root processes that each
+# load a two-instruction socket filter (`nn-exp13 progload`): the summary
+# counts each one's NN-L-BPF-001 record — the check that the cap never
+# keeps a program load from its judgement. The agent's threads' CPU time
 # and the host's CPU pressure (/proc/pressure/cpu) are read before and
 # after (cpu-before.txt, cpu-after.txt).
 # Output (DIR, default /var/lib/nn-exp13/<UTC stamp>): status-before.json,
@@ -62,7 +68,7 @@ export LC_ALL=C
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT= FLOOD_SECS=40 FLOOD_PROCS=4 THREADS=32 BURSTS=8 BURST_SIZE=1500 BURST_GAP_MS=3000
 SETTLE=75 KEY= STALL=0 NET_RATE=0 DNS_RATE=0 NET_PORT=18099 PROBES=0
-STAGE_READ=0 BPF_PROCS=0 DENIAL_PROCS=0
+STAGE_READ=0 BPF_PROCS=0 DENIAL_PROCS=0 BPF_UID= PROGLOAD=0
 DET=/var/lib/northnarrow/detections/detections.jsonl
 AUDIT=/etc/northnarrow/audit.log
 TARGET=/etc/northnarrow/admin.pub
@@ -89,6 +95,8 @@ while (($#)); do
         --stage-read) STAGE_READ=1; shift ;;
         --bpf-flood-procs) BPF_PROCS=${2:?}; shift 2 ;;
         --denial-flood-procs) DENIAL_PROCS=${2:?}; shift 2 ;;
+        --bpf-flood-uid) BPF_UID=${2:?}; shift 2 ;;
+        --progload-probes) PROGLOAD=${2:?}; shift 2 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -211,10 +219,23 @@ dur=$((FLOOD_SECS > 0 ? FLOOD_SECS : 30))
 if ((BPF_PROCS > 0)); then
     systemctl stop nn-exp13-bpfflood.service 2>/dev/null
     systemctl reset-failed nn-exp13-bpfflood.service 2>/dev/null
-    systemd-run --quiet --unit=nn-exp13-bpfflood --uid="$USER_NAME" \
+    as=(--uid="$USER_NAME")
+    [[ $BPF_UID == 0 ]] && as=()
+    systemd-run --quiet --unit=nn-exp13-bpfflood "${as[@]}" \
         -p StandardOutput="file:$OUT/bpfflood.txt" -p StandardError="file:$OUT/bpfflood.err" \
         "$LIBEXEC/nn-exp13-flood" bpfflood "$dur" "$BPF_PROCS" || die "the bpf flood did not start"
     units+=(nn-exp13-bpfflood.service)
+fi
+: > "$OUT/progload.txt"
+if ((PROGLOAD > 0)); then
+    gap_s=$(awk -v d="$dur" -v n="$PROGLOAD" 'BEGIN { printf "%.3f", d / (n + 1) }')
+    systemctl stop nn-exp13-progload.service 2>/dev/null
+    systemctl reset-failed nn-exp13-progload.service 2>/dev/null
+    systemd-run --quiet --unit=nn-exp13-progload \
+        -p StandardOutput="file:$OUT/progload.txt" -p StandardError="file:$OUT/progload.err" \
+        /bin/bash -c "for i in \$(seq 1 $PROGLOAD); do sleep $gap_s; $LIBEXEC/nn-exp13-probe progload; done" \
+        || die "the program-load probes did not start"
+    units+=(nn-exp13-progload.service)
 fi
 if ((DENIAL_PROCS > 0)); then
     systemctl stop nn-exp13-denialflood.service 2>/dev/null
@@ -412,6 +433,16 @@ def cpu_delta(a, b):
     psi = {k: {"total_ms": round((pb[k]["total"] - pa.get(k, {}).get("total", 0)) / 1000), "avg10_after": pb[k].get("avg10")} for k in pb}
     return {"agent_cpu_s_by_thread": threads, "agent_cpu_s": round(sum(threads.values()), 2), "cpu_pressure": psi}
 
+def progload():
+    """Review of #474: each program-load probe and its NN-L-BPF-001 records."""
+    out_p = []
+    for f in lines_of("progload.txt"):
+        if len(f) == 4 and f[0] == "progload":
+            pid = int(f[1])
+            hits = [1 for _, names, _ in recs_by_pid.get(pid, []) if any(n.startswith("NN-L-BPF-001") for n in names)]
+            out_p.append({"pid": pid, "fd": int(f[2]), "errno": int(f[3]), "records": len(hits)})
+    return {"sent": len(out_p), "judged": sum(1 for p in out_p if p["records"]), "probes": out_p}
+
 def helper_line(name, tag):
     f = next((f for f in lines_of(name) if f and f[0] == tag), None)
     return None if f is None else [int(x) for x in f[1:]]
@@ -436,6 +467,7 @@ summary = {
     "probes_stage": probes("stage", ("NN-L-CHAIN-002", "NN-L-NET-008")),
     "probes_stage_by_class": per_class("stage", {"exec": ("R00",), "file": ("NN-L-FIM-",), "net": ("NN-L-CHAIN-", "NN-L-NET-008")}),
     "bpfflood": helper_line("bpfflood.txt", "bpfflood"),
+    "progload_probes": progload(),
     "denialflood": helper_line("denialflood.txt", "denialflood"),
     "cpu_flood": cpu_delta("cpu-before.txt", "cpu-flood-end.txt"),
     "ring_drops_delta_all": {r: delta(r) for r in ring_names},
@@ -480,6 +512,9 @@ if summary["net_load"] or summary["probes_net001"]["sent"]:
         print(k.ljust(19) + ":", v["judged"], "of", v["sent"], "judged,", v["killed_while_connecting"], "killed while connecting; latency ms", [p["latency_ms"] for p in v["probes"]])
     print("ring drops (all)   :", summary["ring_drops_delta_all"])
     print("stage by class     :", summary["probes_stage_by_class"])
+if summary["progload_probes"]["sent"]:
+    pl = summary["progload_probes"]
+    print("progload probes    :", pl["judged"], "of", pl["sent"], "with an NN-L-BPF-001 record;", [(p["pid"], p["fd"] >= 0, p["records"]) for p in pl["probes"]])
 if summary["bpfflood"] or summary["denialflood"]:
     print("bpf flood          :", summary["bpfflood"], "(children, refused, allowed, other)")
     print("denial flood       :", summary["denialflood"], "(children, refused, allowed, other)")
