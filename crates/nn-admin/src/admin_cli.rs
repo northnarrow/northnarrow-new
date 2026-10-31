@@ -253,6 +253,10 @@ pub struct StatusOutcome {
     /// stage (`StatusResponse::event_bus`; `None` from an older agent or
     /// the unsigned reply).
     pub event_bus: Option<nn_proto::admin_protocol::EventBusStatus>,
+    /// R12b (lab PR 269): stage 5 per queue and the floods of P0 capped
+    /// per uid (`StatusResponse::event_bus_decision`; `None` from an older
+    /// agent or the unsigned reply).
+    pub event_bus_decision: Option<nn_proto::admin_protocol::EventBusDecisionStatus>,
     /// External audit ASK-009 (lab PR 213): the reply of the signed
     /// telemetry verb (`--key`). `false` for the unsigned `status`, whose
     /// telemetry fields the agent leaves `None` — withheld, not unknown.
@@ -508,6 +512,7 @@ fn status_outcome(resp: nn_proto::admin_protocol::StatusResponse, signed: bool) 
         execpol_map_recorded_total: resp.execpol_map_recorded_total,
         execq_script_refused_total: resp.execq_script_refused_total,
         event_bus: resp.event_bus,
+        event_bus_decision: resp.event_bus_decision,
         telemetry_signed: signed,
     }
 }
@@ -3794,6 +3799,7 @@ mod tests {
                     execpol_map_recorded_total: Some(18),
                     execq_script_refused_total: Some(19),
                     event_bus: None,
+                    event_bus_decision: None,
                 }),
             );
         });

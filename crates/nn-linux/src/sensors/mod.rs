@@ -23,6 +23,8 @@ pub mod exec;
 pub mod flow_sock;
 pub mod multiplexer;
 pub mod open_sensor;
+/// R12b (lab PR 269): the ring pumps on threads of their own.
+pub mod pump;
 pub mod reject;
 pub mod ring_drops;
 

@@ -306,7 +306,7 @@ for line in open(out + "/detections.jsonl", errors="replace"):
     suppressed += int(r.get("suppressed_before") or 0)
 recs.sort()
 
-held, bus_rows, ring_rows, coalesced = 0, [], [], 0
+held, bus_rows, ring_rows, coalesced, capped, capped_rows = 0, [], [], 0, 0, []
 for line in open(out + "/audit.jsonl", errors="replace"):
     try:
         r = json.loads(line)
@@ -324,6 +324,12 @@ for line in open(out + "/audit.jsonl", errors="replace"):
         bus_rows.append(extra)
     elif op == "event_bus_coalesced":
         coalesced += int(extra.get("repeats_since_last_row") or 0)
+    elif op == "event_bus_capped":
+        # R12b (lab PR 269, C3): P0's floods counted past their uid's cap
+        capped_rows.append(extra)
+        for f in extra.get("floods") or []:
+            if f.get("event") == "FsProtectDenial":
+                capped += int(f.get("capped") or 0)
     elif op == "ringbuf_drop":
         ring_rows.append(extra)
 
@@ -410,6 +416,19 @@ def helper_line(name, tag):
     f = next((f for f in lines_of(name) if f and f[0] == tag), None)
     return None if f is None else [int(x) for x in f[1:]]
 ring_names = sorted(set((before or {}).get("ringbuf_drops") or {}) | set((after or {}).get("ringbuf_drops") or {}))
+# R12b (lab PR 269): stage 5 per queue, and P0's floods capped per uid
+# (`event_bus_decision`); on such a build the denials the bus coalesced or
+# capped are counted as NN-L-AT-001's held records (C5): the rule's own
+# ledger (records + held) tells every attempt.
+def dec(s):
+    q = ((s or {}).get("event_bus_decision") or {}).get("queues") or []
+    return {x["priority"]: x for x in q}
+db, da = dec(before), dec(after)
+c5 = bool(da)
+def dd(p, k):
+    if p not in da or da[p].get(k) is None:
+        return None
+    return da[p][k] - (db.get(p, {}).get(k, 0) if k in ("timed", "untimed", "over_budget", "capped") else 0)
 
 summary = {
     "net_load": None if net_line is None else {"connected": int(net_line[1]), "failed": int(net_line[2]), "dns_sent": int(net_line[3])},
@@ -423,17 +442,24 @@ summary = {
     "attempts_refused": attempts, "attempts_allowed": allowed, "tamper_rc": tamper_rc,
     "at001_records": len(recs), "at001_suppressed_before": suppressed, "at001_held_reported": held,
     "at001_coalesced": coalesced,
-    "at001_accounted": len(recs) + held + coalesced,
+    "at001_capped": capped,
+    "held_counts_bus_repeats": c5,
+    "at001_accounted": len(recs) + held + (0 if c5 else coalesced),
     "ring_drops_delta": {r: delta(r) for r in ("fs_protect", "open_sensor", "task_denial_rate", "exec", "fim")},
     "first_record_latency_ms": lat,
     "event_bus": None if not ba else {p: {k: qd(p, k) for k in ("enqueued", "dropped", "waited", "aged", "ahead", "decided", "max_depth", "max_wait_us", "recent_max_wait_us", "send_wait_max_us", "latency_p50_us", "latency_p99_us", "latency_max_us")} for p in sorted(ba)},
     "event_bus_drop_rows": bus_rows, "ringbuf_drop_rows": ring_rows,
+    "decision_delay": None if not da else {p: {k: dd(p, k) for k in ("budget_us", "timed", "untimed", "over_budget", "capped", "delay_p50_us", "delay_p99_us", "delay_max_us")} for p in sorted(da)},
+    "event_bus_capped_rows": capped_rows,
     "flood": open(out + "/flood.txt").read().split("\n") if True else None,
     "flood_secs_measured": round((t_flood_end - t_start) / 1e9, 1),
 }
 json.dump(summary, open(out + "/summary.json", "w"), indent=1)
 print("refused attempts   :", attempts, "(allowed:", allowed, ")")
-print("AT-001 recorded    :", len(recs), "records +", held, "held (budget, signed detections_held) +", coalesced, "coalesced (signed event_bus_coalesced) =", len(recs) + held + coalesced)
+if c5:
+    print("AT-001 recorded    :", len(recs), "records +", held, "held (signed detections_held: the budget's, and the bus's", coalesced, "coalesced and", capped, "capped) =", len(recs) + held)
+else:
+    print("AT-001 recorded    :", len(recs), "records +", held, "held (budget, signed detections_held) +", coalesced, "coalesced (signed event_bus_coalesced) =", len(recs) + held + coalesced)
 print("ring drops (delta) :", summary["ring_drops_delta"])
 print("first record (ms)  :", lat)
 if summary["event_bus"]:
@@ -442,6 +468,10 @@ if summary["event_bus"]:
 else:
     print("bus                : (this agent has no event bus)")
 print("event_bus_drop rows:", len(bus_rows), "ringbuf_drop rows:", len(ring_rows))
+if summary["decision_delay"]:
+    for p, v in summary["decision_delay"].items():
+        print("decision", p, ":", v)
+    print("event_bus_capped rows:", len(capped_rows))
 print("flood              :", " | ".join(x for x in summary["flood"] if x))
 if summary["net_load"] or summary["probes_net001"]["sent"]:
     print("net load           :", summary["net_load"])

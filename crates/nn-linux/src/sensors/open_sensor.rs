@@ -1368,35 +1368,51 @@ pub(crate) fn decode_batch<'a>(
     (d.records, d.rejected)
 }
 
-/// Drain the ring onto the agent's event bus until the receiver goes
-/// away.
-pub async fn pump(ring: RingBuf<MapData>, tx: crate::sensors::bus::BusSender) {
-    let mut fd = match crate::async_fd::register(ring) {
-        Ok(fd) => fd,
-        Err(e) => {
-            warn!(error = %e, "open sensor: cannot poll its ring — no file-open events");
-            return;
-        }
-    };
+/// The open sensor's pump (R12b, lab PR 269: a thread of its own, the
+/// bus's source `open_sensor`): drain the ring onto the agent's event bus
+/// until the receiver goes away ([`pump`]).
+pub fn spawn_pump(
+    ring: RingBuf<MapData>,
+    tx: &crate::sensors::bus::BusSender,
+    rt: &tokio::runtime::Handle,
+) -> std::io::Result<crate::sensors::pump::PumpThread> {
+    let tx = tx.for_source(PUMP_LABEL);
+    let rt = rt.clone();
+    crate::sensors::pump::PumpThread::spawn(PUMP_LABEL, move |stop| {
+        let mut ring = ring;
+        pump(&mut ring, &tx, &rt, stop);
+        Ok(())
+    })
+}
+
+/// Drain the ring onto the agent's event bus until the receiver goes away
+/// or the stop flag is set: each pass's records — at most
+/// [`crate::sensors::pump::PASS_MAX`] — decoded, the signals to a security
+/// tool first ([`send_order`]), sent in batches of at most
+/// [`crate::sensors::bus::BATCH_MAX`] events (R12b).
+pub fn pump(
+    ring: &mut dyn crate::sensors::pump::RingSource,
+    tx: &crate::sensors::bus::BusSender,
+    rt: &tokio::runtime::Handle,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    use crate::sensors::bus::BATCH_MAX;
+    use crate::sensors::pump::{PASS_MAX, POLL_MS};
     let mut mounts = MountTable::load();
     let size = std::mem::size_of::<OpenRecordRaw>();
     let mut reject = RejectThrottle::new();
+    let mut out: Vec<Event> = Vec::with_capacity(BATCH_MAX + 8);
     loop {
-        let mut guard = match fd.readable_mut().await {
-            Ok(g) => g,
-            Err(e) => {
-                warn!(error = %e, "open sensor: ring wait failed");
-                return;
-            }
-        };
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let mut batch = BatchDecoder::default();
-        {
-            let rb = guard.get_inner_mut();
-            while let Some(item) = rb.next() {
-                batch.push(&item);
+        while batch.records.len() + batch.rejected.len() < PASS_MAX {
+            if !ring.next_record(&mut |item| batch.push(item)) {
+                break;
             }
         }
-        guard.clear_ready();
+        let read = batch.records.len() + batch.rejected.len();
         // External audit SNS-008: a short record is counted and WARNed
         // (coalesced), like every other pump's, not skipped at debug level.
         for got in &batch.rejected {
@@ -1412,10 +1428,26 @@ pub async fn pump(ring: RingBuf<MapData>, tx: crate::sensors::bus::BusSender) {
                 tx.note_open_dropped();
                 continue;
             }
-            for ev in events_of(r, &mut mounts) {
-                if tx.send(ev).await.is_err() {
-                    return;
-                }
+            out.extend(events_of(r, &mut mounts));
+            if out.len() >= BATCH_MAX
+                && tx
+                    .send_batch_blocking(rt, std::mem::take(&mut out))
+                    .is_err()
+            {
+                return;
+            }
+        }
+        if !out.is_empty()
+            && tx
+                .send_batch_blocking(rt, std::mem::take(&mut out))
+                .is_err()
+        {
+            return;
+        }
+        if read < PASS_MAX {
+            if let Err(e) = ring.wait(POLL_MS) {
+                warn!(error = %e, "open sensor: ring wait failed");
+                return;
             }
         }
     }
@@ -1434,11 +1466,11 @@ pub(crate) fn open_only(r: &OpenRecordRaw) -> bool {
         && !(matches!(r.flags & 0b11, 1 | 2) && r.reason & guarded != 0)
 }
 
-/// The order a batch's records are sent in (review #471 M2): the signals
+/// The order a pass's records are sent in (review #471 M2): the signals
 /// to a security tool (P0, tamper) first, then the file records in the
 /// ring's order. A file record other than an open waits for room on a full
-/// P2 (review 75), and the pump with it: a signal read in the same batch
-/// behind it does not wait too. (One read in a later batch still can, while
+/// P2 (review 75), and the pump with it: a signal read in the same pass
+/// behind it does not wait too. (One read in a later pass still can, while
 /// P2 is full of file events other than opens: `EVENT_BUS.md`, Open.)
 pub(crate) fn send_order(records: &[OpenRecordRaw]) -> impl Iterator<Item = &OpenRecordRaw> {
     let signal = |r: &&OpenRecordRaw| r.reason & open_reason::DEFENDER_SIGNAL != 0;

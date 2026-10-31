@@ -140,7 +140,7 @@ pub(crate) fn start(
             let flow_tracker_for_drain = Arc::clone(&flow_tracker);
             let dns_cache_for_drain = Arc::clone(&dns_cache);
             let lineage_for_net = lineage.clone();
-            let event_tx = sensor.event_tx();
+            let event_tx = sensor.event_tx_for("net_drain");
             let close_rb = net_bufs.close_rb;
             let listen_rb = net_bufs.listen_rb;
             let udp_rb = net_bufs.udp_rb;

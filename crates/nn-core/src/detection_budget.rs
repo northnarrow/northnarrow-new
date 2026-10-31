@@ -236,6 +236,27 @@ impl DetectionBudget {
         }
     }
 
+    /// `n` detections coalesced at once ([`Self::count_coalesced_at`] `n`
+    /// times, one subject): R12b (lab PR 269), the denials the event bus
+    /// coalesced or capped, counted as NN-L-AT-001's held records.
+    pub fn count_coalesced_many_at(
+        &self,
+        rule: &str,
+        uid: u32,
+        n: u64,
+        now: Instant,
+        sample: impl FnOnce() -> (String, String),
+    ) {
+        if n == 0 {
+            return;
+        }
+        if let Some(bucket) = self.inner.lock().bucket(rule, uid, now) {
+            bucket.hold(sample);
+            bucket.held_since_record += n - 1;
+            bucket.held_since_report += n - 1;
+        }
+    }
+
     /// Take the counts and samples held since the last call.
     pub fn take_held(&self) -> Vec<Held> {
         let mut g = self.inner.lock();
@@ -270,6 +291,17 @@ pub fn admit(rule: &str, uid: u32, sample: impl FnOnce() -> (String, String)) ->
 /// [`DetectionBudget::count_coalesced_at`] on the process-wide budget, now.
 pub fn count_coalesced(rule: &str, uid: u32, sample: impl FnOnce() -> (String, String)) {
     BUDGET.count_coalesced_at(rule, uid, Instant::now(), sample)
+}
+
+/// [`DetectionBudget::count_coalesced_many_at`] on the process-wide budget,
+/// now.
+pub fn count_coalesced_many(
+    rule: &str,
+    uid: u32,
+    n: u64,
+    sample: impl FnOnce() -> (String, String),
+) {
+    BUDGET.count_coalesced_many_at(rule, uid, n, Instant::now(), sample)
 }
 
 /// [`DetectionBudget::take_held`] on the process-wide budget: what the
@@ -403,6 +435,31 @@ mod tests {
             }
         );
         assert_eq!(records(&b, "EVA-002", 0, BURST, t0), BURST - 2);
+    }
+
+    /// R12b (C5): `n` coalesced at once count as `n` held — in the next
+    /// record's `suppressed_before` and the report — without the budget.
+    #[test]
+    fn many_coalesced_at_once_count_as_many_held() {
+        let b = DetectionBudget::default();
+        let t0 = Instant::now();
+        b.count_coalesced_many_at("AT-001", 0, 1_499, t0, || {
+            ("chmod".into(), "chmod (pid 9)".into())
+        });
+        b.count_coalesced_many_at("AT-001", 0, 0, t0, nos);
+        assert_eq!(
+            b.admit_at("AT-001", 0, t0, nos),
+            Admit::Record {
+                suppressed_before: 1_499
+            },
+            "the budget not spent: the next one is recorded, carrying them"
+        );
+        let held = b.take_held();
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            (held[0].count, &held[0].samples[..]),
+            (1_499, &["chmod (pid 9)".to_string()][..])
+        );
     }
 
     #[test]

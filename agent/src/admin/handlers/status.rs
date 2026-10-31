@@ -120,6 +120,35 @@ fn telemetry_status(
         execq_script_refused_total: Some(execq.script_refused),
         // Lab PR 267 (R12a): the event bus and the losses by stage.
         event_bus: handles.event_bus.as_ref().map(event_bus_status),
+        // R12b (lab PR 269): stage 5 per queue, the floods of P0 capped.
+        event_bus_decision: handles.event_bus.as_ref().map(event_bus_decision),
+    }
+}
+
+/// R12b (lab PR 269): each queue's decisions timed from their record's
+/// kernel time against the class's budget (stage 5), and P0's floods
+/// capped per uid.
+fn event_bus_decision(
+    bus: &crate::sensors::bus::BusStats,
+) -> nn_proto::admin_protocol::EventBusDecisionStatus {
+    use nn_proto::admin_protocol::{BusDecisionDelay, EventBusDecisionStatus};
+    EventBusDecisionStatus {
+        queues: bus
+            .snapshot()
+            .iter()
+            .map(|q| BusDecisionDelay {
+                priority: q.priority.label().to_string(),
+                budget_us: q.delay_budget_us,
+                timed: q.delay_timed,
+                untimed: q.delay_untimed,
+                delay_p50_us: q.delay_p50_us,
+                delay_p99_us: q.delay_p99_us,
+                delay_max_us: q.delay_max_us,
+                over_budget: q.over_budget,
+                capped: q.capped,
+            })
+            .collect(),
+        cap_per_uid: nn_core::bus::FLOOD_CAP_PER_UID,
     }
 }
 

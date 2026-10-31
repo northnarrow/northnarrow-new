@@ -1,4 +1,4 @@
-//! Single-owner eBPF object loader + per-ringbuf pump tasks.
+//! Single-owner eBPF object loader + per-ringbuf pumps.
 //!
 //! Loads the compiled eBPF object once, attaches all six programs
 //! (one tracepoint exec + two syscall tracepoints + three kprobes),
@@ -7,7 +7,10 @@
 //! class of events, taken by priority ([`crate::sensors::bus`]), in place
 //! of the one `mpsc` channel of 4,096 events every pump shared; the agent
 //! main loop reads it through [`SensorMultiplexer::next_event`] and stays
-//! oblivious to which sensor produced what.
+//! oblivious to which sensor produced what. R12b (lab PR 269): each ring's
+//! pump is a thread of its own that sends in batches
+//! ([`crate::sensors::pump`]), each a source of the bus with its own
+//! sequence ([`BusSender::for_source`]).
 //!
 //! Tappa 10 N9 — [`Self::start_with_net`] additionally attaches the
 //! three N2 network observation programs (`inet_csk_listen_start`
@@ -39,6 +42,8 @@ use nn_model::Event;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
+
+use crate::sensors::pump::{run_ring, Pump, PumpThread, RingSource, PASS_MAX, POLL_MS};
 
 use crate::net::dns_cache::DnsCache;
 use crate::net::flow_tracker::{FlowTracker, TcpConnectInfo};
@@ -142,8 +147,8 @@ pub struct SensorMultiplexer<G> {
     /// Every long-lived task that moves telemetry (ring pumps, drains, the
     /// open-sensor rule refresher), by label. External audit SNS-001: the
     /// main loop polls [`Self::finished_pumps`]; a task that ended is a
-    /// blind spot and stops the agent.
-    pumps: Vec<(&'static str, JoinHandle<()>)>,
+    /// blind spot and stops the agent. R12b: the ring pumps are threads.
+    pumps: Vec<(&'static str, Pump)>,
     /// Lab PR 267 (R12a): the event bus's receiving end.
     rx: BusReceiver,
     /// Tappa 9 C8: cloneable handle to the same event bus the sensor
@@ -484,44 +489,95 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             .as_ref()
             .map_or_else(AuthSessionTracker::for_host, |w| w.lineage.clone());
 
+        // R12b (lab PR 269): each ring's pump on a thread of its own, a
+        // source of the bus of its own; a wait for room runs on the
+        // runtime's timers.
+        let rt = tokio::runtime::Handle::current();
         let pumps = vec![
             (
                 "process_spawn",
-                spawn_pump::<ProcessSpawnRaw>("process_spawn", process_spawn_rb, tx.clone()),
+                Pump::Thread(spawn_ring_pump::<ProcessSpawnRaw>(
+                    "process_spawn",
+                    process_spawn_rb,
+                    &tx,
+                    &rt,
+                    no_carry::<ProcessSpawnRaw>,
+                )?),
             ),
             (
                 "file_open",
-                spawn_pump::<FileOpenRaw>("file_open", file_open_rb, tx.clone()),
+                Pump::Thread(spawn_ring_pump::<FileOpenRaw>(
+                    "file_open",
+                    file_open_rb,
+                    &tx,
+                    &rt,
+                    no_carry::<FileOpenRaw>,
+                )?),
             ),
             (
                 "exec_check",
-                spawn_pump::<ExecCheckRaw>("exec_check", exec_check_rb, tx.clone()),
+                Pump::Thread(spawn_ring_pump::<ExecCheckRaw>(
+                    "exec_check",
+                    exec_check_rb,
+                    &tx,
+                    &rt,
+                    no_carry::<ExecCheckRaw>,
+                )?),
             ),
             (
                 "tcp_connect",
-                spawn_tcp_connect_pump(tcp_connect_rb, flow_tracker_for_tcp, tx.clone()),
+                Pump::Thread(spawn_tcp_connect_pump(
+                    tcp_connect_rb,
+                    flow_tracker_for_tcp,
+                    &tx,
+                    &rt,
+                )?),
             ),
             (
                 "dns_query",
-                spawn_dns_query_pump(dns_query_rb, dns_cache_for_dns, lineage_for_dns, tx.clone()),
+                Pump::Thread(spawn_dns_query_pump(
+                    dns_query_rb,
+                    dns_cache_for_dns,
+                    lineage_for_dns,
+                    &tx,
+                    &rt,
+                )?),
             ),
             (
                 "fs_protect",
-                spawn_pump::<FsProtectDenialRaw>("fs_protect", fs_protect_rb, tx.clone()),
+                Pump::Thread(spawn_ring_pump::<FsProtectDenialRaw>(
+                    "fs_protect",
+                    fs_protect_rb,
+                    &tx,
+                    &rt,
+                    no_carry::<FsProtectDenialRaw>,
+                )?),
             ),
             (
                 "module_load",
-                spawn_module_load_pump(module_load_rb, tx.clone()),
+                Pump::Thread(spawn_module_load_pump(module_load_rb, &tx, &rt)?),
             ),
-            ("io_uring", spawn_iouring_pump(iouring_rb, tx.clone())),
+            (
+                "io_uring",
+                Pump::Thread(spawn_iouring_pump(iouring_rb, &tx, &rt)?),
+            ),
             (
                 "bpf_syscall",
-                spawn_pump::<BpfSyscallRaw>("bpf_syscall", bpf_syscall_rb, tx.clone()),
+                Pump::Thread(spawn_ring_pump::<BpfSyscallRaw>(
+                    "bpf_syscall",
+                    bpf_syscall_rb,
+                    &tx,
+                    &rt,
+                    no_carry::<BpfSyscallRaw>,
+                )?),
             ),
             // Lab PR 267 (R12a): the bus's drops, WARNed, signed, raised.
             (
                 BUS_LOSSES_LABEL,
-                crate::sensors::bus::spawn_loss_recorder(tx.stats(), bus_losses.clone()),
+                Pump::Task(crate::sensors::bus::spawn_loss_recorder(
+                    tx.stats(),
+                    bus_losses.clone(),
+                )),
             ),
         ];
 
@@ -593,6 +649,13 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         self.event_tx.clone()
     }
 
+    /// R12b (lab PR 269): a sender of the bus for the source `name` (the
+    /// FIM and network drains, the open sensor): its envelopes name it,
+    /// with a sequence of its own.
+    pub fn event_tx_for(&self, name: &'static str) -> BusSender {
+        self.event_tx.for_source(name)
+    }
+
     /// Lab PR 267 (R12a): the event bus's counts per queue, for the status.
     pub fn bus_stats(&self) -> BusStats {
         self.rx.stats()
@@ -626,7 +689,13 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     /// multiplexer so `Drop` aborts it alongside the sensor pumps, and
     /// [`Self::finished_pumps`] reports it if it ends.
     pub fn register_pump_handle(&mut self, label: &'static str, handle: JoinHandle<()>) {
-        self.pumps.push((label, handle));
+        self.pumps.push((label, Pump::Task(handle)));
+    }
+
+    /// R12b (lab PR 269): register a pump on a thread of its own (the open
+    /// sensor's), as [`Self::register_pump_handle`] a task.
+    pub fn register_pump_thread(&mut self, label: &'static str, pump: PumpThread) {
+        self.pumps.push((label, Pump::Thread(pump)));
     }
 
     /// External audit SNS-001: the labels of the telemetry tasks that have
@@ -645,7 +714,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         let mut found = false;
         for (l, h) in &self.pumps {
             if *l == label {
-                h.abort();
+                h.stop();
                 found = true;
             }
         }
@@ -673,12 +742,15 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         variant: crate::sensors::epg::Variant,
     ) -> std::result::Result<crate::sensors::epg::ExploitGuard, String> {
         let (ring, guard) = crate::sensors::epg::attach(&mut self.ebpf, variant)?;
-        let handle = spawn_pump::<common::wire::epg::EpgEventRaw>(
+        let pump = spawn_ring_pump::<common::wire::epg::EpgEventRaw>(
             crate::sensors::epg::PUMP_LABEL,
             ring,
-            self.event_tx.clone(),
-        );
-        self.register_pump_handle(crate::sensors::epg::PUMP_LABEL, handle);
+            &self.event_tx,
+            &tokio::runtime::Handle::current(),
+            no_carry::<common::wire::epg::EpgEventRaw>,
+        )
+        .map_err(|e| format!("its pump's thread did not start: {e:#}"))?;
+        self.register_pump_thread(crate::sensors::epg::PUMP_LABEL, pump);
         Ok(guard)
     }
 
@@ -707,14 +779,14 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
 impl<G> Drop for SensorMultiplexer<G> {
     fn drop(&mut self) {
         for (_, h) in self.pumps.drain(..) {
-            h.abort();
+            h.stop();
         }
     }
 }
 
 /// Labels of the finished handles (a dead pump, see
 /// [`SensorMultiplexer::finished_pumps`]).
-fn finished(pumps: &[(&'static str, JoinHandle<()>)]) -> Vec<&'static str> {
+fn finished(pumps: &[(&'static str, Pump)]) -> Vec<&'static str> {
     pumps
         .iter()
         .filter(|(_, h)| h.is_finished())
@@ -917,56 +989,86 @@ fn take_ringbuf(ebpf: &mut Ebpf, name: &str) -> Result<RingBuf<MapData>> {
     RingBuf::try_from(map).map_err(|e| anyhow!("expected `{name}` to be a RINGBUF: {e}"))
 }
 
-fn spawn_pump<T>(label: &'static str, rb: RingBuf<MapData>, tx: BusSender) -> JoinHandle<()>
-where
-    T: Pod,
-    for<'a> Event: From<&'a T>,
-{
-    tokio::spawn(async move {
-        if let Err(e) = pump::<T>(label, rb, tx).await {
-            error!(label, error = %e, "ringbuf pump failed");
-        }
-    })
+/// A record that carries no other event.
+fn no_carry<T>(_: &T, e: Event) -> (Event, [Option<Event>; 2]) {
+    (e, [None, None])
 }
 
-async fn pump<T>(label: &'static str, rb: RingBuf<MapData>, tx: BusSender) -> std::io::Result<()>
+/// R12b (lab PR 269): a ring's pump on a thread of its own, a source of
+/// the bus named `label`: each record of type `T` made into its event, and
+/// `after` makes it final and adds the events it carries (External audit
+/// EBPF-013: the floods a budgeted record reports), sent in batches
+/// ([`run_ring`]).
+fn spawn_ring_pump<T>(
+    label: &'static str,
+    rb: RingBuf<MapData>,
+    tx: &BusSender,
+    rt: &tokio::runtime::Handle,
+    mut after: impl FnMut(&T, Event) -> (Event, [Option<Event>; 2]) + Send + 'static,
+) -> Result<PumpThread>
 where
     T: Pod,
     for<'a> Event: From<&'a T>,
 {
-    pump_with(label, rb, tx, |_, e| (e, [None, None])).await
+    let tx = tx.for_source(label);
+    let rt = rt.clone();
+    let pump = PumpThread::spawn(label, move |stop| {
+        let mut rb = rb;
+        let mut decode =
+            |bytes: &[u8], out: &mut Vec<Event>| match bytemuck::try_from_bytes::<T>(bytes) {
+                Ok(raw) => {
+                    let (event, carried) = after(raw, Event::from(raw));
+                    out.push(event);
+                    out.extend(carried.into_iter().flatten());
+                    true
+                }
+                Err(_) => false,
+            };
+        run_ring(
+            label,
+            std::mem::size_of::<T>(),
+            &mut rb,
+            &tx,
+            &rt,
+            stop,
+            &mut decode,
+        )
+    })
+    .with_context(|| format!("starting the {label} pump's thread"))?;
+    Ok(pump)
 }
 
 /// External audit EBPF-013: io_uring records, followed by the
 /// [`Event::SensorFlood`]s a ring creation carries (creations the kernel's
 /// record budgets held back since the process's previous one).
-fn spawn_iouring_pump(rb: RingBuf<MapData>, tx: BusSender) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let floods = |raw: &IoUringRaw, e: Event| (e, nn_model::io_uring_floods(raw));
-        if let Err(e) = pump_with("io_uring", rb, tx, floods).await {
-            error!(label = "io_uring", error = %e, "ringbuf pump failed");
-        }
-    })
+fn spawn_iouring_pump(
+    rb: RingBuf<MapData>,
+    tx: &BusSender,
+    rt: &tokio::runtime::Handle,
+) -> Result<PumpThread> {
+    let floods = |raw: &IoUringRaw, e: Event| (e, nn_model::io_uring_floods(raw));
+    spawn_ring_pump("io_uring", rb, tx, rt, floods)
 }
 
 /// External audit PROC-005: module loads, their path made absolute — the
 /// kernel's walk stops at the root of the `.ko`'s filesystem, which is put
 /// back on its mount point ([`module_path_on_host`]).
-fn spawn_module_load_pump(rb: RingBuf<MapData>, tx: BusSender) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut mounts = crate::sensors::open_sensor::MountTable::load();
-        let place = move |raw: &ModuleLoadRaw, mut e: Event| {
-            if let Event::ModuleLoad { path: Some(p), .. } = &mut e {
-                if raw.path_truncated == 0 {
-                    *p = module_path_on_host(&mut mounts, (raw.root_dev, raw.root_ino), p);
-                }
+fn spawn_module_load_pump(
+    rb: RingBuf<MapData>,
+    tx: &BusSender,
+    rt: &tokio::runtime::Handle,
+) -> Result<PumpThread> {
+    let mut mounts: Option<crate::sensors::open_sensor::MountTable> = None;
+    let place = move |raw: &ModuleLoadRaw, mut e: Event| {
+        if let Event::ModuleLoad { path: Some(p), .. } = &mut e {
+            if raw.path_truncated == 0 {
+                let m = mounts.get_or_insert_with(crate::sensors::open_sensor::MountTable::load);
+                *p = module_path_on_host(m, (raw.root_dev, raw.root_ino), p);
             }
-            (e, [None, None])
-        };
-        if let Err(e) = pump_with("module_load", rb, tx, place).await {
-            error!(label = "module_load", error = %e, "ringbuf pump failed");
         }
-    })
+        (e, [None, None])
+    };
+    spawn_ring_pump("module_load", rb, tx, rt, place)
 }
 
 /// A module path relative to its filesystem's root, on the host: under the
@@ -984,50 +1086,6 @@ pub(crate) fn module_path_on_host(
     }
 }
 
-async fn pump_with<T>(
-    label: &'static str,
-    rb: RingBuf<MapData>,
-    tx: BusSender,
-    // The record's event, then any events it carries (External audit
-    // EBPF-013: the floods a budgeted record reports).
-    mut after: impl FnMut(&T, Event) -> (Event, [Option<Event>; 2]),
-) -> std::io::Result<()>
-where
-    T: Pod,
-    for<'a> Event: From<&'a T>,
-{
-    let mut async_fd = crate::async_fd::register(rb)?;
-    let mut reject = RejectThrottle::new();
-    loop {
-        let mut guard = async_fd.readable_mut().await?;
-        let inner = guard.get_inner_mut();
-        let mut drained = 0u32;
-        while let Some(item) = inner.next() {
-            drained += 1;
-            let bytes: &[u8] = item.as_ref();
-            match bytemuck::try_from_bytes::<T>(bytes) {
-                Ok(raw) => {
-                    let (event, carried) = after(raw, Event::from(raw));
-                    if tx.send(event).await.is_err() {
-                        return Ok(());
-                    }
-                    for extra in carried.into_iter().flatten() {
-                        if tx.send(extra).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                }
-                Err(_e) => reject.record(label, std::mem::size_of::<T>(), bytes.len()),
-            }
-        }
-        guard.clear_ready();
-        if drained == 0 {
-            reject.flush_idle(label, std::mem::size_of::<T>());
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-    }
-}
-
 // ── Tappa 10 N9 — feeder-aware TcpConnect + DnsQuery pumps ───────────
 
 /// What the connect pump feeds and reads: the flow tracker, the image of
@@ -1039,20 +1097,24 @@ struct ConnectWiring {
     dns_cache: Arc<DnsCache>,
 }
 
+/// The connect pump (R12b: a thread of its own, a source of the bus).
 fn spawn_tcp_connect_pump(
     rb: RingBuf<MapData>,
-    flow_tracker: Option<ConnectWiring>,
-    tx: BusSender,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(e) = pump_tcp_connect(rb, flow_tracker, tx).await {
-            error!(error = %e, "tcp_connect pump failed");
-        }
+    wiring: Option<ConnectWiring>,
+    tx: &BusSender,
+    rt: &tokio::runtime::Handle,
+) -> Result<PumpThread> {
+    let tx = tx.for_source("tcp_connect");
+    let rt = rt.clone();
+    PumpThread::spawn("tcp_connect", move |stop| {
+        let mut rb = rb;
+        pump_tcp_connect(&mut rb, wiring, &tx, &rt, stop)
     })
+    .context("starting the tcp_connect pump's thread")
 }
 
 /// Lab PR 246: held by the connect pump while it runs, so the net drain's
-/// closes wait for the connects it announces ([`send_connect`]) — and
+/// closes wait for the connects it announces ([`send_connects`]) — and
 /// stop waiting when it ends.
 struct ConnectPumpClaim(Arc<Mutex<FlowTracker>>);
 
@@ -1069,52 +1131,64 @@ impl Drop for ConnectPumpClaim {
     }
 }
 
-/// One connect record on the bus ([`connect_events`], in order), then,
-/// lab PR 246, announced to the flow tracker: its close, held by the net
-/// drain until then, follows it on the bus. `false` when the bus is
-/// closed.
-async fn send_connect(raw: &TcpConnectRaw, wiring: Option<&ConnectWiring>, tx: &BusSender) -> bool {
-    for event in connect_events(raw, wiring) {
-        if tx.send(event).await.is_err() {
+/// Connect records on the bus ([`connect_events`], in order, in batches),
+/// then, lab PR 246, announced to the flow tracker: each one's close, held
+/// by the net drain until then, follows it on the bus. `false` when the
+/// bus is closed.
+fn send_connects(
+    raws: &[TcpConnectRaw],
+    wiring: Option<&ConnectWiring>,
+    tx: &BusSender,
+    rt: &tokio::runtime::Handle,
+) -> bool {
+    for chunk in raws.chunks(crate::sensors::bus::BATCH_MAX / 2) {
+        let events: Vec<Event> = chunk
+            .iter()
+            .flat_map(|raw| connect_events(raw, wiring))
+            .collect();
+        if tx.send_batch_blocking(rt, events).is_err() {
             return false;
         }
-    }
-    if let Some(w) = wiring {
-        w.flow_tracker
-            .lock()
-            .announce(&FlowTracker::corr_id(raw.timestamp_ns, raw.sk_ptr));
+        if let Some(w) = wiring {
+            let mut tracker = w.flow_tracker.lock();
+            for raw in chunk {
+                tracker.announce(&FlowTracker::corr_id(raw.timestamp_ns, raw.sk_ptr));
+            }
+        }
     }
     true
 }
 
-async fn pump_tcp_connect(
-    rb: RingBuf<MapData>,
+fn pump_tcp_connect(
+    ring: &mut dyn RingSource,
     flow_tracker: Option<ConnectWiring>,
-    tx: BusSender,
+    tx: &BusSender,
+    rt: &tokio::runtime::Handle,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()> {
-    let mut async_fd = crate::async_fd::register(rb)?;
     let mut reject = RejectThrottle::new();
     let mut batch: Vec<TcpConnectRaw> = Vec::new();
     let _claim = flow_tracker
         .as_ref()
         .map(|w| ConnectPumpClaim::new(&w.flow_tracker));
+    let size = std::mem::size_of::<TcpConnectRaw>();
     loop {
-        let mut guard = async_fd.readable_mut().await?;
-        let inner = guard.get_inner_mut();
-        let mut drained = 0u32;
-        while let Some(item) = inner.next() {
-            drained += 1;
-            let bytes: &[u8] = item.as_ref();
-            match bytemuck::try_from_bytes::<TcpConnectRaw>(bytes) {
-                Ok(raw) => batch.push(*raw),
-                Err(_e) => reject.record(
-                    "tcp_connect",
-                    std::mem::size_of::<TcpConnectRaw>(),
-                    bytes.len(),
-                ),
-            }
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
         }
-        guard.clear_ready();
+        let mut read = 0usize;
+        while read < PASS_MAX {
+            let got = ring.next_record(
+                &mut |bytes| match bytemuck::try_from_bytes::<TcpConnectRaw>(bytes) {
+                    Ok(raw) => batch.push(*raw),
+                    Err(_e) => reject.record("tcp_connect", size, bytes.len()),
+                },
+            );
+            if !got {
+                break;
+            }
+            read += 1;
+        }
         // Lab PR 229: the connect-time rows name the destination's DNS name
         // once the DNS pump has read the queries made before these
         // connects (`DnsIngest`); read later, a query was not there yet.
@@ -1122,16 +1196,15 @@ async fn pump_tcp_connect(
             flow_tracker.as_ref(),
             batch.iter().map(|r| r.timestamp_ns).max(),
         ) {
-            w.dns_cache.ingest().caught_up(newest).await;
+            rt.block_on(w.dns_cache.ingest().caught_up(newest));
         }
-        for raw in batch.drain(..) {
-            if !send_connect(&raw, flow_tracker.as_ref(), &tx).await {
-                return Ok(());
-            }
+        if !send_connects(&batch, flow_tracker.as_ref(), tx, rt) {
+            return Ok(());
         }
-        if drained == 0 {
-            reject.flush_idle("tcp_connect", std::mem::size_of::<TcpConnectRaw>());
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        batch.clear();
+        if read < PASS_MAX {
+            reject.flush_idle("tcp_connect", size);
+            ring.wait(POLL_MS)?;
         }
     }
 }
@@ -1148,7 +1221,7 @@ async fn pump_tcp_connect(
 ///   row, with the image named now and the DNS name of its destination,
 ///   for the rules that need no byte count to judge it while it is open.
 ///   Once both are on the bus the pump announces the connect (lab PR 246,
-///   [`send_connect`]): the net drain holds its close until then.
+///   [`send_connects`]): the net drain holds its close until then.
 ///   Without net wiring (the exec sensor's live test) only the
 ///   `TcpConnect`.
 fn connect_events(raw: &TcpConnectRaw, wiring: Option<&ConnectWiring>) -> Vec<Event> {
@@ -1321,12 +1394,18 @@ fn nss_events(
     })
 }
 
+/// The DNS pump (R12b: a thread of its own, a source of the bus). Its pass
+/// answers the lookups' requests (lab PR 229, `DnsIngest::wanted`) as well
+/// as its ring's records, so the thread runs the pump's own loop on the
+/// runtime's reactor (`Handle::block_on`): woken by either, it sends a
+/// pass's events in batches.
 fn spawn_dns_query_pump(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
     lineage: AuthSessionTracker,
-    tx: BusSender,
-) -> JoinHandle<()> {
+    tx: &BusSender,
+    rt: &tokio::runtime::Handle,
+) -> Result<PumpThread> {
     // Lab PR 229: the DNS attributions of the net drain and the connect
     // pump wait for this pump's passes while it runs (`DnsIngest`) —
     // claimed here, before any of them can read a record, and released
@@ -1334,12 +1413,13 @@ fn spawn_dns_query_pump(
     let claim = dns_cache
         .as_ref()
         .map(|c| crate::net::dns_cache::IngestClaim::new(Arc::clone(c)));
-    tokio::spawn(async move {
+    let tx = tx.for_source("dns_query");
+    let rt = rt.clone();
+    PumpThread::spawn("dns_query", move |stop| {
         let _claim = claim;
-        if let Err(e) = pump_dns_query(rb, dns_cache, lineage, tx).await {
-            error!(error = %e, "dns_query pump failed");
-        }
+        rt.block_on(pump_dns_query(rb, dns_cache, lineage, tx, stop))
     })
+    .context("starting the dns_query pump's thread")
 }
 
 async fn pump_dns_query(
@@ -1347,6 +1427,7 @@ async fn pump_dns_query(
     dns_cache: Option<Arc<DnsCache>>,
     lineage: AuthSessionTracker,
     tx: BusSender,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()> {
     let mut async_fd = crate::async_fd::register(rb)?;
     let mut reject = RejectThrottle::new();
@@ -1358,7 +1439,11 @@ async fn pump_dns_query(
     // and the cache, behind the send of the one before it (the outbox lab
     // PR 229 kept for that is gone).
     let mut outbox: VecDeque<Event> = VecDeque::new();
+    let mut check_stop = tokio::time::interval(std::time::Duration::from_millis(POLL_MS as u64));
     loop {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         let step = tokio::select! {
             r = async_fd.readable_mut() => {
                 let mut guard = r?;
@@ -1378,6 +1463,7 @@ async fn pump_dns_query(
                     None => std::future::pending().await,
                 }
             } => DnsStep::Asked,
+            _ = check_stop.tick() => DnsStep::Tick,
         };
         match step {
             // a lookup asked for a pass: the ring is read, ready or not
@@ -1394,10 +1480,12 @@ async fn pump_dns_query(
                 reject.flush_idle("dns_query", std::mem::size_of::<DnsQueryRaw>());
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
-            DnsStep::Read => {}
+            DnsStep::Read | DnsStep::Tick => {}
         }
-        for event in outbox.drain(..) {
-            if tx.send(event).await.is_err() {
+        // R12b: a pass's events in batches
+        while !outbox.is_empty() {
+            let n = outbox.len().min(crate::sensors::bus::BATCH_MAX);
+            if tx.send_batch(outbox.drain(..n).collect()).await.is_err() {
                 return Ok(());
             }
         }
@@ -1412,6 +1500,8 @@ enum DnsStep {
     Idle,
     /// A lookup asked for a pass.
     Asked,
+    /// R12b: the stop flag's check.
+    Tick,
 }
 
 /// One pass over the DNS ring, to empty: each record's events into
@@ -1486,16 +1576,16 @@ mod tests {
         let returned = tokio::spawn(async {});
         let panicked = tokio::spawn(async { panic!("pump panicked") });
         let pumps = vec![
-            ("exec_check", running),
-            ("fs_protect", returned),
-            ("open_sensor", panicked),
+            ("exec_check", Pump::Task(running)),
+            ("fs_protect", Pump::Task(returned)),
+            ("open_sensor", Pump::Task(panicked)),
         ];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while finished(&pumps).len() < 2 && std::time::Instant::now() < deadline {
             tokio::task::yield_now().await;
         }
         assert_eq!(finished(&pumps), vec!["fs_protect", "open_sensor"]);
-        pumps[0].1.abort();
+        pumps[0].1.stop();
     }
 
     fn wiring(lineage: AuthSessionTracker) -> ConnectWiring {
@@ -1565,8 +1655,13 @@ mod tests {
     /// `TcpConnect` and its connect-time row are on the bus, so the close
     /// the net drain holds for it follows both there. While the pump's
     /// claim is held a close waits; when the pump ends, none does.
-    #[tokio::test]
-    async fn a_connect_is_announced_after_its_events_are_on_the_bus() {
+    #[test]
+    fn a_connect_is_announced_after_its_events_are_on_the_bus() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
         let w = wiring(AuthSessionTracker::new(tmp.path()));
         let claim = ConnectPumpClaim::new(&w.flow_tracker);
@@ -1580,13 +1675,13 @@ mod tests {
         let corr = FlowTracker::corr_id(raw.timestamp_ns, raw.sk_ptr);
         assert!(!w.flow_tracker.lock().close_may_proceed(&corr));
         let (tx, mut rx) = crate::sensors::bus::channel();
-        assert!(send_connect(&raw, Some(&w), &tx).await);
+        assert!(send_connects(&[raw], Some(&w), &tx, rt.handle()));
         assert!(matches!(
-            rx.try_recv().map(|r| r.event),
+            rx.try_recv().map(|r| r.envelope.event),
             Some(Event::TcpConnect { pid: 4700, .. })
         ));
         assert!(matches!(
-            rx.try_recv().map(|r| r.event),
+            rx.try_recv().map(|r| r.envelope.event),
             Some(Event::NetFlow(_))
         ));
         assert!(w.flow_tracker.lock().close_may_proceed(&corr));
@@ -1598,7 +1693,7 @@ mod tests {
         // A closed bus: not announced.
         drop(rx);
         raw.timestamp_ns = 40_000;
-        assert!(!send_connect(&raw, Some(&w), &tx).await);
+        assert!(!send_connects(&[raw], Some(&w), &tx, rt.handle()));
     }
 
     /// Lab PR 224 (CM-02 c): a record of the `socket_connect` deny is its
