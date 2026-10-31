@@ -1361,15 +1361,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   the watch, which asks and hands it back answered to the decision
   thread), the
   trusted-installer window's expiry its tick's, a canary trip's access row
-  and registry mark written by `nn-canary-log`, a kernel module's package
-  ownership asked by the module-load pump and kept for R018. The responses
-  still run on the decision thread (R12c). A ratchet keeps blocking I/O
-  off the decision path (`xtask/tests/decision_path_io.rs`). The lineage
-  takes the judgement's time as a parameter (`AsOf`; the thread-local
-  `judged_at` is gone), and in a judgement a pid its cache does not hold is
-  not known — not read from `/proc` — unless its process started before
-  the agent (R-F). The process-wide cache of systemd's answer is gone (the
-  snapshot keeps it).
+  and registry mark written by `nn-canary-log` (a full queue holds a trip
+  at most 100 ms, then its rows are counted), a kernel module's package
+  ownership asked by the module-load pump and kept for R018. What is still
+  I/O on the decision thread is listed in `EVENT_BUS.md` §2d: the responses
+  (R12c), the ransomware tracker's sampler on a burst, the per-rule
+  policy's exemption facts, a canary trip's reader. A ratchet, over a list
+  that includes the responses' code, keeps any more off the decision path
+  (`xtask/tests/decision_path_io.rs`). The lineage takes the judgement's
+  time as a parameter (`AsOf`; the thread-local `judged_at` is gone), and
+  in a judgement a pid its cache does not hold is not known — never read
+  from `/proc` (R-F); the agent's start enters the processes already
+  running into the cache once the exec sensors are attached, so the boot's
+  daemons and older sessions are known (review of #475). The process-wide
+  cache of systemd's answer is gone (the snapshot keeps it).
 - The ring pumps on threads of their own, sending in batches (lab PR 269,
   Wave 4 phase 2, R12b-1 of the restructure plan;
   `docs/architecture/EVENT_BUS.md` §2a–2c, §5). Each ring's pump — the

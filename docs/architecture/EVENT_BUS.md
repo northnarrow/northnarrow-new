@@ -263,29 +263,53 @@ What blocked the decision is off it:
 - a canary trip's access row and its registry mark are written by a thread
   of their own (`nn-canary-log`, `Detector::with_writer`), in the order
   DEC-011 and lab PR 260 fixed; the first trip is decided at once, a later
-  access before the mark is not one; a full queue (1,024) holds the
-  decision as the inline write did;
+  access before the mark is not one; a full queue (1,024) holds a trip at
+  most `CANARY_QUEUE_WAIT` (100 ms), then its rows are counted
+  (`Detector::unwritten`, per canary, WARNed, and at the stop) while its
+  event goes on to the rules (review of #475: a writer that stopped writing
+  held the decision, and the stop);
 - a kernel module's package ownership (R018) is asked by the module-load
   pump when it reads the load (`ModuleOwners::refresh`: dpkg's lists, or an
   `rpm -qf` process) and kept per file; R018 judges the load on that
   answer.
 
-The responses a decision runs still run on its thread, in order, before
-the next event — the executor's kills and their verify retries (R12a's loop
-awaited them on the blocking pool); their dispatcher is R12c's. A guard
-keeps blocking I/O off the decision path (`xtask/tests/decision_path_io.rs`):
-the decision thread's own code — `process_event.rs`, `decision_loop` —
-holds no `await`, no file or `/proc` access, no process, no sleep, no
-`block_in_place`; and every other file of the code the decision calls into
-(the rule engine, the posture and its lineage, the ladder, the canary
+What the decision thread still does that is I/O, exactly (review of #475:
+"no blocking I/O" was not exact):
+- the responses a decision runs, in order, before the next event — the
+  executor and what it calls: a kill's cgroup made, frozen, killed and
+  removed, its verify retries (up to 50 ms), `/proc` reads, the
+  quarantine's copy and its synced ledger, the containment ledger, the
+  outbound block and the throttle's cgroup files (R12a's loop awaited them
+  on the blocking pool); their dispatcher is R12c's;
+- the ransomware tracker's sampler of a burst's files (their entropy, the
+  copies) and its trust of the writer's executable (a digest, the package
+  that owns it) — on a mass-write or rename burst only; R12c's dispatcher of
+  slow work;
+- the per-rule policy's exemption facts (a process's uid, cgroup and
+  executable from `/proc`, a pidfile), read once per process and cached;
+- a canary trip's reader, one readlink of `/proc/<pid>/exe`, on a trip
+  only, and a trip's wait for room in the writer's full queue (≤ 100 ms);
+- the security-tool detector's registration of a tool (its start and
+  executable from `/proc`), at the tool's exec only;
+- in a judgement, a process's start (`/proc/<pid>/stat`, POS-003's check of
+  a reused pid) — never its image (§3).
+
+A guard keeps any more off the decision path
+(`xtask/tests/decision_path_io.rs`, run by `cargo test`): the decision
+thread's own code — `process_event.rs`, `decision_loop` — holds no
+`await`, no file or `/proc` access, no process, no sleep, no
+`block_in_place`; every other file of the code the decision calls into —
+the rule engine, the posture and its lineage, the ladder, the canary
 detector, the correlation buffer, the budget, the ransomware and
 impairment trackers, the copy-on-write guard, the detection sink, the
-telemetry probe) is a ratchet: each file's I/O sites are counted and listed
-with why they are not the decision's blocking I/O or which lot takes them
-off (the ransomware tracker's sampler, the per-rule policy's exemption
-facts, the ancestry tree's `/proc` fallback, the canary trip's reader read
-by `/proc/<pid>/exe`); a new site, or a count above its pin, fails `cargo
-test`, and a count below it fails until the pin is lowered.
+telemetry probe, and (review of #475) the responses' code under
+`crates/nn-linux/src/response` — is a ratchet: each file's I/O sites are
+counted and listed with why; a new site, or a count above its pin, fails,
+and a count below it fails until the pin is lowered. It is lexical: it
+counts markers in the files of its list (the reviewer's mutation K9, a read
+planted in `Executor::execute_for_started`, failed only once the responses'
+code was on the list) — code the decision reaches outside the list is not
+seen, and the list is kept by hand.
 
 ## 3. The take order
 
@@ -348,13 +372,22 @@ after the fact (a connect's image, NETR-008; a flow's start), `Now` outside
 any judgement (an admin verb, a response, a ladder step). A lookup cannot
 be made "outside the scope" any more, so none can fall back to the latest
 exec unseen (R12a caught that only by its pinned sources). In a judgement a
-pid the spawn cache does not hold is not known — not read from `/proc`,
-which shows the present image — unless its process started before the agent
-(`judged_from_proc`: its exec could never be seen; the boot's daemons, a
-session older than a restart of the agent — strict R-F left the COMBAT
-their descendants reach unlocked after every restart, the posture golden
-case `eva-installer-window`); a process the agent saw start whose exec it
-does not hold (dropped by P1, evicted, not yet read) stays not known.
+pid the spawn cache does not hold is not known — never read from `/proc`,
+which shows the present image. The processes running when the agent starts
+are in the cache: once the exec sensors are attached the start scans
+`/proc` and enters each (`seed_from_proc`: the image it runs, at time 0 —
+it has run it since before any exec could be seen —, its start, parent and
+uid; a pid already held left alone, a deleted image not entered). The
+boot's daemons and a session older than a restart of the agent are known
+that way (without it, strict R-F left the COMBAT their descendants reach
+unlocked after every restart: the posture golden case
+`eva-installer-window`), and an exec such a process runs later is a later
+entry, the scanned image its past. R12b-2's first version read `/proc`
+instead for a process older than the agent, which could judge an event of
+it on an image executed after the event (review of #475: a canary read,
+then a backup tool's exec, the read judged as the tool's). A process the
+agent saw start whose exec it does not hold (dropped by P1, evicted, not
+yet read) is not known.
 `in_package_transaction` walks the tree as of the event; the replay judges
 every event as the decision thread does.
 
@@ -505,15 +538,12 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   NN-L-AT-001's held records (§5; C5). R12b-2: the decision thread without
   `await` and the blocking I/O taken off it, with its ratchet (§2d; review
   #471 B4); R-F (§3: the time a parameter, an `Absent` pid not known in a
-  judgement unless older than the agent).
+  judgement; the running processes entered at the start).
 - **Open after R12b** — the responses still run on the decision thread
-  (R12c's dispatcher); the decision path's I/O the ratchet lists (§2d): the
-  ransomware tracker's sampler of a burst's files, the per-rule policy's
-  exemption facts (read once per process), the ancestry tree's `/proc`
-  fallback (R-F's next step), a canary trip's reader read by
-  `/proc/<pid>/exe`; R-F's remainder — a process older than the agent that
-  executes another image after an event, judged before that exec is read;
-  R-B: the history is three execs deep — an event followed by four execs of
+  (R12c's dispatcher); the decision path's I/O the ratchet lists (§2d: the
+  ransomware tracker's sampler and trust, the per-rule policy's exemption
+  facts, a canary trip's reader, the security-tool detector's registration),
+  and the guard's list kept by hand (lexical); R-B: the history is three execs deep — an event followed by four execs of
   its process before it is judged reads "not known", and a walk stops at a
   "not known" hop although its parent is known (a deeper history, the walk
   on from the parent, facts kept past the cache's eviction); the property
