@@ -474,7 +474,6 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &posture,
         &combat,
         &canary_detector,
-        &installer_override,
         &detection_sink,
         &audit_log,
         &telemetry_probe,

@@ -1034,6 +1034,27 @@ pub struct Received {
     pub overtaken: Vec<Event>,
 }
 
+/// What [`BusReceiver::recv_blocking`] got.
+#[derive(Debug)]
+pub enum Recv {
+    /// An event, the execs it overtook taught to the lineage.
+    Event(Box<Received>),
+    /// None within the wait.
+    Idle,
+    /// Every sender is gone and the queues are empty.
+    Closed,
+}
+
+/// The lineage taught the execs `r` overtook (lab PR 267).
+fn teach(r: Received, lineage: Option<&AuthSessionTracker>) -> Received {
+    if let Some(l) = lineage {
+        for e in &r.overtaken {
+            l.ingest_spawn_event(e);
+        }
+    }
+    r
+}
+
 /// What the event loop reads from: the one consumer.
 pub struct BusReceiver {
     inner: Arc<Inner>,
@@ -1069,18 +1090,33 @@ impl BusReceiver {
     }
 
     /// [`Self::recv`], the lineage first taught the execs the event
-    /// overtook (made absolute as the event loop makes them,
-    /// `exe_identity::resolve`) — the bus's barrier for the process lineage
-    /// (lab PR 267).
+    /// overtook — the bus's barrier for the process lineage (lab PR 267).
+    /// R12b: their paths were made absolute in their pump
+    /// (`exe_identity::resolve`), so the receiver reads no `/proc` (review
+    /// #471 B4).
     pub async fn recv_with(&mut self, lineage: Option<&AuthSessionTracker>) -> Option<Received> {
-        let mut r = self.recv().await?;
-        for e in &mut r.overtaken {
-            crate::sensors::exe_identity::resolve(e);
-            if let Some(l) = lineage {
-                l.ingest_spawn_event(e);
-            }
+        let r = self.recv().await?;
+        Some(teach(r, lineage))
+    }
+
+    /// R12b (lab PR 269): the decision thread's [`Self::recv_with`] — the
+    /// next event, waiting at most `wait` (on the runtime's timers, the
+    /// calling thread blocked meanwhile). [`Recv::Idle`] when none came,
+    /// [`Recv::Closed`] once every sender is gone and the queues are empty.
+    pub fn recv_blocking(
+        &mut self,
+        rt: &tokio::runtime::Handle,
+        lineage: Option<&AuthSessionTracker>,
+        wait: Duration,
+    ) -> Recv {
+        if let Some(r) = self.try_recv() {
+            return Recv::Event(Box::new(teach(r, lineage)));
         }
-        Some(r)
+        match rt.block_on(async { tokio::time::timeout(wait, self.recv()).await }) {
+            Ok(Some(r)) => Recv::Event(Box::new(teach(r, lineage))),
+            Ok(None) => Recv::Closed,
+            Err(_) => Recv::Idle,
+        }
     }
 
     /// The next event if one is queued.
@@ -3588,6 +3624,64 @@ mod tests {
             [4242],
             "the exec before it in the batch, not the one after"
         );
+    }
+
+    /// R12b: the decision thread's wait — an event at once, `Idle` after
+    /// the wait with none, `Closed` once every sender is gone and the
+    /// queues are empty; the execs an event overtook taught to the lineage.
+    #[test]
+    fn the_decision_thread_s_receive_waits_then_idles_or_ends() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        let (tx, mut rx) = channel();
+        // the decision thread enters the runtime's context (its judgement's
+        // tasks); its wait still blocks on the runtime
+        let _entered = rt.enter();
+        let started = Instant::now();
+        assert!(matches!(
+            rx.recv_blocking(rt.handle(), Some(&lineage), Duration::from_millis(30)),
+            Recv::Idle
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(25));
+        tx.send_batch_blocking(rt.handle(), vec![spawn(4242), denial(4242)])
+            .unwrap();
+        match rx.recv_blocking(rt.handle(), Some(&lineage), Duration::from_secs(5)) {
+            Recv::Event(r) => {
+                assert!(matches!(r.envelope.event, Event::FsProtectDenial { .. }));
+                assert_eq!(r.overtaken.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(lineage.image_path(4242).as_deref(), Some("/bin/sh"));
+        // a sender that comes later wakes the wait
+        let tx2 = tx.clone();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            let rt2 = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt2.block_on(tx2.send(open(9))).unwrap();
+        });
+        assert!(matches!(
+            rx.recv_blocking(rt.handle(), None, Duration::from_secs(5)),
+            Recv::Event(_)
+        ));
+        late.join().unwrap();
+        drop(tx);
+        // the exec, then the end
+        assert!(matches!(
+            rx.recv_blocking(rt.handle(), None, Duration::from_secs(5)),
+            Recv::Event(_)
+        ));
+        assert!(matches!(
+            rx.recv_blocking(rt.handle(), None, Duration::from_secs(5)),
+            Recv::Closed
+        ));
     }
 
     /// R12b: a batch wakes the receiver waiting for an event (the event

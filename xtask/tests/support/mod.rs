@@ -510,3 +510,69 @@ pub fn module_map() -> ModuleMap {
     }
     map
 }
+
+// ── production code (R11c, lab PR 264: global_state.rs; R12b, lab PR 269:
+// shared with decision_path_io.rs) ──
+
+/// A test file: `tests.rs`, `*_tests.rs`.
+pub fn is_test_file(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    name == "tests.rs" || name.ends_with("_tests.rs")
+}
+
+/// `code` (comments blanked) with its test items blanked: each item under
+/// `#[cfg(test)]` or `#[cfg(any(test, …))]` — a module's or a block's
+/// braces, or up to its `;` — newlines kept.
+pub fn production(code: &str) -> String {
+    let mut out = code.as_bytes().to_vec();
+    let mut from = 0;
+    while let Some(at) = find_test_cfg(code, from) {
+        let rest = &code[at..];
+        // the item: past the attribute, to its closing brace or `;`
+        let attr_end = at + rest.find(']').map_or(rest.len(), |i| i + 1);
+        let item = &code[attr_end..];
+        let brace = item.find('{');
+        let semi = item.find(';');
+        let end = match (brace, semi) {
+            (Some(b), Some(s)) if s < b => attr_end + s + 1,
+            (Some(b), _) => attr_end + b + matching_brace(&item[b..]),
+            (None, Some(s)) => attr_end + s + 1,
+            (None, None) => code.len(),
+        };
+        for c in &mut out[at..end] {
+            if *c != b'\n' {
+                *c = b' ';
+            }
+        }
+        from = end;
+    }
+    String::from_utf8(out).expect("ASCII blanks keep UTF-8")
+}
+
+/// The next `#[cfg(test)]` / `#[cfg(any(test` at or after `from`.
+fn find_test_cfg(code: &str, from: usize) -> Option<usize> {
+    let a = code[from..].find("#[cfg(test)]").map(|i| from + i);
+    let b = code[from..].find("#[cfg(any(test").map(|i| from + i);
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The length up to and including the brace that closes `s`'s first `{`.
+pub fn matching_brace(s: &str) -> usize {
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    s.len()
+}

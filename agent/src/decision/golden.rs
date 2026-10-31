@@ -1253,8 +1253,11 @@ fn assert_fifo_order(lanes: &[usize], order: &[usize]) {
 /// models, and what the bus's own tests cannot see — the engine's rules
 /// learn the execs an event overtook (`Received::overtaken`) before the
 /// event is judged, and when the loop ends the bus is stopped: what it
-/// still holds counted and signed, every drop signed. The loop needs the
-/// whole agent to run, so its source is pinned (comments left out).
+/// still holds counted and signed, every drop signed. R12b (lab PR 269):
+/// the judging is the decision thread's (`decision_loop`), its delay
+/// counted after the judgement; the loop stops the thread and joins it,
+/// and waits for the canary trips' writer, before the bus is stopped. The loop needs the whole agent to run, so its
+/// source is pinned (comments left out).
 #[test]
 fn the_event_loop_wires_the_bus_as_modelled() {
     let src = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/run_loop.rs"));
@@ -1269,9 +1272,11 @@ fn the_event_loop_wires_the_bus_as_modelled() {
             .map(|i| from + i)
             .unwrap_or_else(|| panic!("run_loop.rs: `{what}` not found after byte {from}"))
     };
-    let arm = at("Some(received) => {", 0);
+    // the decision thread
+    let thread = at("fn decision_loop(", 0);
+    let arm = at("Recv::Event(received) => {", thread);
     let each = at("for exec in &received.overtaken {", arm);
-    let teach = at("engine.observe_arrival(exec);", each);
+    let teach = at("p.engine.observe_arrival(exec);", each);
     assert!(
         !code[each..teach].contains('}'),
         "observe_arrival is the loop over the overtaken execs"
@@ -1282,13 +1287,30 @@ fn the_event_loop_wires_the_bus_as_modelled() {
         teach < event && event < judge,
         "taught before the event is judged"
     );
-    let stop = at("sensor.stop_bus();", judge);
+    let decided = at("rx.decided();", judge);
+    assert!(
+        !code[judge..decided].contains("Recv::"),
+        "the delay counted after the judgement, in the same arm"
+    );
+    // the loop: the thread stopped and joined, then the bus stopped
+    let run = at("pub(crate) async fn run(", 0);
+    let spawn = at("decision_loop(&mut rx", run);
+    let stopped = at("ctl.stop.store(true, Ordering::Release);", spawn);
+    let joined = at("decider.join()", stopped);
+    let back = at("sensor.restore_receiver(rx);", joined);
+    let flushed = at("d.flush(", back);
+    let stop = at("sensor.stop_bus();", flushed);
     let reported = at("Stopped {", stop);
     assert!(
-        code[judge..stop].contains("break;") && !code[stop..reported].contains("break;"),
-        "the bus is stopped after the loop, before the stop is reported"
+        stop < reported && reported < thread,
+        "the bus is stopped after the thread is joined, before the stop is reported"
     );
     assert_eq!(code.matches("sensor.stop_bus();").count(), 1);
+    assert_eq!(
+        code.matches("process_event(").count(),
+        1,
+        "one judging site"
+    );
 }
 
 /// Review #471 A1, R12b (R-F of its second review): each event is judged

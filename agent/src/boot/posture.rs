@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 use super::cli::Cli;
 use super::evidence::AuditHandle;
 use super::tasks::{spawn_shutdown_exe_refresh, spawn_watchdog_exempt_refresh, WatchdogAudit};
-use crate::pipeline::{systemd_state, HostStopping};
+use crate::pipeline::{systemd_watch, HostStopping, SystemdSnapshot};
 
 /// What [`machine`] built.
 pub(crate) struct Posture {
@@ -333,6 +333,9 @@ pub(crate) struct Combat {
     /// R11c (lab PR 264): systemd reported the host as stopping (the event
     /// loop reads it; process-wide until then).
     pub(crate) host_stopping: HostStopping,
+    /// R12b (lab PR 269): systemd's state, as the systemd watch last read
+    /// it — what the decision judges a relayed signal on without waiting.
+    pub(crate) systemd: SystemdSnapshot,
     /// R11c (lab PR 264): the copy-on-first-write guard of this boot (the
     /// event loop, the admin socket and the stop use it; process-wide until
     /// then).
@@ -504,20 +507,16 @@ pub(crate) fn ladder(
     // and runs until systemd-shutdown's final stage. Ask systemd every 2 s
     // whether the host is stopping: from then on the shutdown's own traffic
     // (logs truncated, services killed, the console written) must not drive
-    // the posture or the ladder. Detection goes on.
+    // the posture or the ladder. Detection goes on. R12b (lab PR 269): the
+    // answer is the snapshot the decision judges a relayed signal on, and
+    // the watch asks at once when the decision wants a newer one.
+    let systemd = SystemdSnapshot::default();
     if std::path::Path::new(northnarrow_agent::systemd_state::PRIVATE_SOCKET).exists() {
-        let ladder_stop = Arc::clone(&ladder);
-        let stopping_watch = host_stopping.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(2));
-            loop {
-                tick.tick().await;
-                if systemd_state().await.as_deref() == Some("stopping") {
-                    stopping_watch.stand_down(&ladder_stop);
-                    break;
-                }
-            }
-        });
+        tokio::spawn(systemd_watch(
+            systemd.clone(),
+            host_stopping.clone(),
+            Arc::clone(&ladder),
+        ));
     }
 
     // Tappa 8 A8: shutdown signal — the dispatcher fires it on a
@@ -532,6 +531,7 @@ pub(crate) fn ladder(
         debug_guard,
         shutdown_signal,
         host_stopping,
+        systemd,
         cow_guard,
     }
 }

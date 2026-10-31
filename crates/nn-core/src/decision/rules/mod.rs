@@ -23,7 +23,7 @@ pub mod epg;
 pub mod evasion;
 pub mod impact;
 pub mod iouring;
-pub(crate) mod module_provenance;
+pub mod module_provenance;
 pub mod net;
 pub mod net_fanout;
 mod r001_exec_from_tmp;

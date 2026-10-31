@@ -366,6 +366,24 @@ pub struct Detector<H: CanaryHost> {
     indexes: Arc<Mutex<CanaryIndexes<H>>>,
     /// This host's addresses, for the wildcard network canaries.
     local_addrs: H::LocalAddrs,
+    /// R12b (lab PR 269, plan §3.4): the writer's queue — the trips' access
+    /// rows and registry marks, written off the decision thread
+    /// ([`Self::with_writer`]); none: written in [`Self::process_event`],
+    /// as before (the tests, the replay).
+    writer: Option<std::sync::mpsc::SyncSender<TripWrite>>,
+    /// The canaries whose first trip was decided and is not yet in the
+    /// registry (the writer's) — or could not be marked there: a later
+    /// access is not a first trip (it holds for this run).
+    decided: Mutex<std::collections::HashSet<String>>,
+    /// Trips queued and not yet written ([`Self::flush`]).
+    queued: std::sync::atomic::AtomicUsize,
+}
+
+/// R12b: one trip for the writer — its access row, and whether it is the
+/// canary's first (its registry mark).
+#[derive(Debug, Clone)]
+pub struct TripWrite {
+    pub draft: CanaryAccessDraft,
 }
 
 impl<H: CanaryHost> Detector<H> {
@@ -381,6 +399,94 @@ impl<H: CanaryHost> Detector<H> {
             access_log,
             indexes,
             local_addrs: H::LocalAddrs::default(),
+            writer: None,
+            decided: Mutex::new(std::collections::HashSet::new()),
+            queued: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// R12b (lab PR 269): the trips' access rows and registry marks go to
+    /// `queue` — a writer that calls [`Self::write_trip`] for each, in order
+    /// — instead of being written in [`Self::process_event`] (the
+    /// decision's: no chain write on its thread). A full queue holds the
+    /// decision until the writer takes one, as the inline write did.
+    pub fn with_writer(mut self, queue: std::sync::mpsc::SyncSender<TripWrite>) -> Self {
+        self.writer = Some(queue);
+        self
+    }
+
+    /// The writer's work for one trip, as [`Self::process_event`] did it
+    /// inline (external audit DEC-011, lab PR 260): the access row
+    /// appended — always, every access is in the chain — then, for a first
+    /// trip, the registry's mark naming that row. A failed write is
+    /// reported; the trip event went out already.
+    pub fn write_trip(&self, job: TripWrite) {
+        let canary_id = job.draft.canary_id.clone();
+        let first_trip = job.draft.first_trip;
+        let mut reg = self.registry.lock();
+        let access_entry_hash = self.append_row(job.draft);
+        if first_trip {
+            self.mark(&mut reg, &canary_id, access_entry_hash);
+        }
+        drop(reg);
+        self.queued
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Wait until the writer has written every trip queued, at most
+    /// `within` (the stop's: the rows in the chain before the agent ends).
+    /// `false` when some were left.
+    pub fn flush(&self, within: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
+        while self.queued.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            if started.elapsed() >= within {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// The access row, its `entry_hash` (`None`: not written, reported).
+    fn append_row(&self, draft: CanaryAccessDraft) -> Option<String> {
+        let canary_id = draft.canary_id.clone();
+        let mut log = self.access_log.lock();
+        match H::append_access(&mut log, draft) {
+            Ok(entry_hash) => Some(entry_hash),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    canary_id = %canary_id,
+                    "canary access log append failed — trip event still emitted, \
+                     chain entry missing"
+                );
+                None
+            }
+        }
+    }
+
+    /// The registry's mark of a first trip, naming its access row.
+    fn mark(&self, reg: &mut H::Registry, canary_id: &str, access_entry_hash: Option<String>) {
+        let access_row_written = access_entry_hash.is_some();
+        match H::mark_tripped(reg, canary_id, access_entry_hash) {
+            Ok(_) => {
+                self.decided.lock().remove(canary_id);
+            }
+            Err(e) => {
+                // Lab PR 260: the next start records a trip its access
+                // row holds.
+                let after_a_restart = if access_row_written {
+                    "the next start records it from its access row"
+                } else {
+                    "its access row is missing too: a restart re-arms the canary"
+                };
+                error!(
+                    error = %format!("{e:#}"),
+                    canary_id = %canary_id,
+                    after_a_restart,
+                    "canary trip not recorded in the registry — it holds for this run"
+                );
+            }
         }
     }
 
@@ -536,54 +642,57 @@ impl<H: CanaryHost> Detector<H> {
         // first_trip), then record the trip in the registry with that
         // row's hash. A failed write is reported and the event is still
         // emitted. Lab PR 260: the access row is the trip's commit, the
-        // registry's row names it (see the module doc).
+        // registry's row names it (see the module doc). R12b (lab PR 269):
+        // with a writer, the row and the mark are the writer's, in that
+        // order ([`Self::write_trip`]); the first trip is decided here, and
+        // a later access before the mark is not one.
         let first_trip = {
             let mut reg = self.registry.lock();
-            let first_trip = H::is_armed(&reg, &canary_id);
-            let access_entry_hash = {
-                let mut log = self.access_log.lock();
-                match H::append_access(
-                    &mut log,
-                    CanaryAccessDraft {
-                        canary_id: canary_id.clone(),
-                        canary_name: canary_name.clone(),
-                        canary_type: canary_type_tag,
-                        access_kind,
-                        accessor_pid,
-                        accessor_uid,
-                        accessor_comm: accessor_comm.clone(),
-                        accessor_exe: accessor_exe.clone(),
-                        first_trip,
-                    },
-                ) {
-                    Ok(entry_hash) => Some(entry_hash),
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            canary_id = %canary_id,
-                            "canary access log append failed — trip event still emitted, \
-                             chain entry missing"
-                        );
-                        None
+            let first_trip = {
+                let mut decided = self.decided.lock();
+                let first = H::is_armed(&reg, &canary_id) && !decided.contains(&canary_id);
+                if first {
+                    decided.insert(canary_id.clone());
+                }
+                first
+            };
+            let draft = CanaryAccessDraft {
+                canary_id: canary_id.clone(),
+                canary_name: canary_name.clone(),
+                canary_type: canary_type_tag,
+                access_kind,
+                accessor_pid,
+                accessor_uid,
+                accessor_comm: accessor_comm.clone(),
+                accessor_exe: accessor_exe.clone(),
+                first_trip,
+            };
+            match &self.writer {
+                Some(queue) => {
+                    drop(reg);
+                    self.queued
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if queue
+                        .send(TripWrite {
+                            draft: draft.clone(),
+                        })
+                        .is_err()
+                    {
+                        // the writer is gone: written here, as before
+                        self.queued
+                            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                        let mut reg = self.registry.lock();
+                        let hash = self.append_row(draft);
+                        if first_trip {
+                            self.mark(&mut reg, &canary_id, hash);
+                        }
                     }
                 }
-            };
-            if first_trip {
-                let access_row_written = access_entry_hash.is_some();
-                if let Err(e) = H::mark_tripped(&mut reg, &canary_id, access_entry_hash) {
-                    // Lab PR 260: the next start records a trip its access
-                    // row holds.
-                    let after_a_restart = if access_row_written {
-                        "the next start records it from its access row"
-                    } else {
-                        "its access row is missing too: a restart re-arms the canary"
-                    };
-                    error!(
-                        error = %format!("{e:#}"),
-                        canary_id = %canary_id,
-                        after_a_restart,
-                        "canary trip not recorded in the registry — it holds for this run"
-                    );
+                None => {
+                    let access_entry_hash = self.append_row(draft);
+                    if first_trip {
+                        self.mark(&mut reg, &canary_id, access_entry_hash);
+                    }
                 }
             }
             first_trip

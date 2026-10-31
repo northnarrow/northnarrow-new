@@ -245,12 +245,31 @@ pub(crate) fn start(
                                 read_forward, "canary indexes rebuilt from registry"
                             );
                         }
-                        let detector =
-                            Arc::new(northnarrow_agent::canary::detector::Detector::new(
+                        // R12b (lab PR 269, plan §3.4): the trips' access
+                        // rows and registry marks are written by a thread
+                        // of their own, in order, not on the decision's.
+                        let (trips, written) = std::sync::mpsc::sync_channel(CANARY_WRITER_QUEUE);
+                        let detector = Arc::new(
+                            northnarrow_agent::canary::detector::Detector::new(
                                 registry.clone(),
                                 access_log,
                                 indexes.clone(),
-                            ));
+                            )
+                            .with_writer(trips),
+                        );
+                        let writer = Arc::clone(&detector);
+                        if let Err(e) = std::thread::Builder::new()
+                            .name("nn-canary-log".to_string())
+                            .spawn(move || {
+                                for job in written {
+                                    writer.write_trip(job);
+                                }
+                            })
+                        {
+                            // no writer: the detector writes inline (its
+                            // send fails once the queue's receiver is gone)
+                            warn!(error = %e, "canary: the access writer's thread did not start — trips are written by the decision");
+                        }
                         let admin_state = Arc::new(admin_socket::CanaryAdminState {
                             fim_watch,
                             registry,
@@ -271,6 +290,11 @@ pub(crate) fn start(
         canary_detector,
     }
 }
+
+/// R12b (lab PR 269): the canary trips queued for their writer at most; a
+/// full queue holds the decision until the writer takes one (a flood of
+/// canary reads: as the inline write did).
+const CANARY_WRITER_QUEUE: usize = 1024;
 
 /// Lab PR 260: the boot's record of the trips the canary access log holds
 /// and the registry does not ([`Registry::unrecorded_trips`]), before the

@@ -1,7 +1,17 @@
 //! The event loop (Wave 4 restructure, R11a, lab PR 261: from `main.rs`):
 //! the sensors' events through the pipeline, the telemetry tasks' liveness,
 //! the signals and the admin shutdown; the lab builds' triggers.
+//!
+//! R12b (lab PR 269, plan §3.4): the decision runs on a thread of its own,
+//! `nn-decision` ([`decision_loop`]) — it takes each event from the bus
+//! (blocked, not awaiting), judges it ([`process_event`], no `await`) and
+//! counts its delay; this task keeps the rest: the signals, the admin
+//! shutdown, the telemetry tasks' liveness (SNS-001), the lab triggers.
+//! Either end ends the other: a stop here stops the thread, the bus closed
+//! (or the thread's end) stops the loop here; the thread is joined before
+//! the bus is stopped and the stop reported.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,6 +19,7 @@ use northnarrow_agent::correlation::CorrelationBuffer;
 use northnarrow_agent::decision::RuleEngine;
 use northnarrow_agent::posture::PostureMachine;
 use northnarrow_agent::response::Executor;
+use northnarrow_agent::sensors::bus::{BusReceiver, Recv};
 use northnarrow_agent::sensors::SensorMultiplexer;
 use tracing::{error, info, warn};
 
@@ -26,9 +37,50 @@ pub(crate) struct Stopped {
     pub(crate) loop_started: Instant,
 }
 
-/// The event loop: every event offered to the telemetry probe, then
-/// [`process_event`]; every 5 s the telemetry tasks checked (SNS-001); a
-/// signal or the admin shutdown ends it.
+/// What the decision thread judges with (the event loop's handles).
+struct Pipeline<'a> {
+    engine: &'a RuleEngine,
+    executor: &'a Executor,
+    correlation: &'a CorrelationBuffer,
+    posture: &'a PostureMachine,
+    combat: &'a Combat,
+    canary_detector: &'a Option<Arc<northnarrow_agent::canary::detector::Detector>>,
+    detection_sink: &'a Option<northnarrow_agent::detection_store::DetectionSink>,
+    telemetry_probe: &'a Option<northnarrow_agent::telemetry_probe::TelemetryProbe>,
+    expected_denial: &'a northnarrow_agent::boot::deny_selftest::ExpectedDenial,
+}
+
+/// R12b: between the event loop and its decision thread.
+#[derive(Default)]
+struct DecisionControl {
+    /// The loop stops: the thread ends at its next turn.
+    stop: AtomicBool,
+    /// The thread ended (the bus closed, or a panic): the loop stops.
+    ended: tokio::sync::Notify,
+    /// `debug-trigger` builds: the seconds the decision is to stand still
+    /// (lab PR 216's `debug-stall-loop`, read by the loop's check).
+    #[cfg(feature = "debug-trigger")]
+    stall_secs: std::sync::atomic::AtomicU64,
+}
+
+/// Wakes the loop when the decision thread ends, however it ends.
+struct Ended<'a>(&'a DecisionControl);
+
+impl Drop for Ended<'_> {
+    fn drop(&mut self) {
+        self.0.ended.notify_one();
+    }
+}
+
+/// How long the decision thread waits for an event before it looks at its
+/// stop flag and counts a round of the loop (lab PR 216: the watchdog's
+/// progress check).
+const DECISION_IDLE: Duration = Duration::from_millis(500);
+
+/// The event loop: every 5 s the telemetry tasks checked (SNS-001); a
+/// signal or the admin shutdown ends it. The events are judged on the
+/// decision thread ([`decision_loop`]): each offered to the telemetry
+/// probe, then [`process_event`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     _armed: Armed,
@@ -41,100 +93,210 @@ pub(crate) async fn run(
     posture: &PostureMachine,
     combat: &Combat,
     canary_detector: &Option<Arc<northnarrow_agent::canary::detector::Detector>>,
-    installer_override: &Arc<
-        northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
-    >,
     detection_sink: &Option<northnarrow_agent::detection_store::DetectionSink>,
     audit_log: &AuditHandle,
     telemetry_probe: &Option<northnarrow_agent::telemetry_probe::TelemetryProbe>,
     expected_denial: &northnarrow_agent::boot::deny_selftest::ExpectedDenial,
     signals: &mut Signals,
 ) -> Stopped {
+    // Why the event loop ended — written as the signed `agent_stop` entry
+    // below; a run that never writes it is reported by the next boot.
+    let loop_started = std::time::Instant::now();
+    let Some(mut rx) = sensor.take_receiver() else {
+        error!("event bus: no receiver to judge from — stopping");
+        return Stopped {
+            stop_reason: "sensor_pump_exited",
+            loop_started,
+        };
+    };
+    let lineage = sensor.lineage();
+    // R12b: a relayed signal the decision hands to the systemd watch comes
+    // back on the bus.
+    combat
+        .systemd
+        .bind_bus(sensor.event_tx_for("systemd_watch"));
+    let pipeline = Pipeline {
+        engine,
+        executor,
+        correlation,
+        posture,
+        combat,
+        canary_detector,
+        detection_sink,
+        telemetry_probe,
+        expected_denial,
+    };
+    let rt = tokio::runtime::Handle::current();
+    let ctl = DecisionControl::default();
+    // The decision thread borrows the event loop's handles: a scoped thread,
+    // this task's worker handed to the runtime meanwhile (`block_in_place`);
+    // the loop below runs on this thread (`Handle::block_on`).
+    let stop_reason = northnarrow_agent::runtime::off_the_runtime(|| {
+        std::thread::scope(|s| {
+            let decider = std::thread::Builder::new()
+                .name("nn-decision".to_string())
+                .spawn_scoped(s, || {
+                    let _ended = Ended(&ctl);
+                    let _rt = rt.enter();
+                    decision_loop(&mut rx, lineage.as_ref(), &rt, &ctl, &pipeline)
+                });
+            let decider = match decider {
+                Ok(d) => d,
+                Err(e) => {
+                    error!(error = %e, "the decision thread did not start — stopping");
+                    return "decision_thread_failed";
+                }
+            };
+            let reason = rt.block_on(watch_loop(cli, sensor, combat, audit_log, signals, &ctl));
+            ctl.stop.store(true, Ordering::Release);
+            match decider.join() {
+                Ok(()) => reason,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        })
+    });
+    // Lab PR 267 (R12a), review #471 M3: the bus is closed, the events it
+    // still held counted in a signed row, and every drop not in a signed
+    // row yet signed, before the stop is (a queue's window does not hold
+    // it back). R12b: the receiver back from the joined decision thread.
+    sensor.restore_receiver(rx);
+    // R12b: the canary trips judged are in their chain before the stop.
+    if let Some(d) = canary_detector {
+        if !d.flush(Duration::from_secs(5)) {
+            warn!("canary: trips still queued for their access rows at the stop");
+        }
+    }
+    sensor.stop_bus();
+    Stopped {
+        stop_reason,
+        loop_started,
+    }
+}
+
+/// R12b (lab PR 269): the decision thread — each event taken from the bus
+/// (the execs it overtook taught to the lineage by the receiver, to the
+/// rules here, before it is judged), offered to the telemetry probe, judged
+/// ([`process_event`]), its delay counted; a round of the loop counted for
+/// the watchdog at least every [`DECISION_IDLE`]. Ends on the loop's stop,
+/// or when the bus is closed and empty.
+fn decision_loop(
+    rx: &mut BusReceiver,
+    lineage: Option<&northnarrow_agent::posture::lineage::AuthSessionTracker>,
+    rt: &tokio::runtime::Handle,
+    ctl: &DecisionControl,
+    p: &Pipeline<'_>,
+) {
     let Combat {
         ladder,
+        host_stopping,
+        systemd,
+        cow_guard,
+        ..
+    } = p.combat;
+    loop {
+        if ctl.stop.load(Ordering::Acquire) {
+            return;
+        }
+        // Lab PR 216: one round of the loop, for the watchdog's progress
+        // check — the bus's wait brings a round at least every
+        // `DECISION_IDLE` on an idle host, so a count that stands still is
+        // a decision thread that does.
+        northnarrow_agent::loop_progress::tick();
+        #[cfg(feature = "debug-trigger")]
+        debug_stall_decision(ctl);
+        match rx.recv_blocking(rt, lineage, DECISION_IDLE) {
+            Recv::Event(received) => {
+                let received = *received;
+                // Lab PR 267 (R12a): a tamper event taken ahead of execs
+                // still queued brings them; the lineage has learned them,
+                // the engine's rules learn them here, so the event is
+                // judged on the process tree of every exec that reached the
+                // bus before it (they are judged in their own turn, which
+                // then changes nothing there).
+                for exec in &received.overtaken {
+                    p.engine.observe_arrival(exec);
+                }
+                let e = received.envelope.event;
+                // Tappa 10.8 telemetry probe: every event is offered to the
+                // probe tracker before the decision engine (R11c, lab PR
+                // 264: the probe the late binding started).
+                if let Some(probe) = p.telemetry_probe {
+                    probe.observe(&e);
+                }
+                process_event(
+                    p.engine,
+                    p.executor,
+                    p.correlation,
+                    p.posture,
+                    ladder,
+                    // Tappa 9.5 K6: detector handle wired in. When the
+                    // canary subsystem boot failed (missing signing key,
+                    // registry open error), canary_detector is None and
+                    // process_event short-circuits to the source event
+                    // without canary filtering.
+                    p.canary_detector.as_deref(),
+                    // Tappa 9.0.a: detection-persistence sink (off the hot path).
+                    p.detection_sink.as_ref(),
+                    p.expected_denial,
+                    host_stopping,
+                    systemd,
+                    cow_guard,
+                    e,
+                );
+                // Lab PR 267: the event's latency, queue to decision; R12b:
+                // its delay from the record's kernel time (stage 5).
+                rx.decided();
+            }
+            Recv::Idle => {}
+            Recv::Closed => {
+                warn!("sensor pump exited; shutting down");
+                return;
+            }
+        }
+    }
+}
+
+/// The event loop's own part: the telemetry tasks' liveness (SNS-001)
+/// every 5 s, the lab triggers, the signals, the admin shutdown, the
+/// decision thread's end. Returns why it ended.
+async fn watch_loop(
+    #[cfg_attr(not(feature = "debug-trigger"), allow(unused_variables))] cli: &Cli,
+    sensor: &SensorMultiplexer,
+    combat: &Combat,
+    audit_log: &AuditHandle,
+    signals: &mut Signals,
+    ctl: &DecisionControl,
+) -> &'static str {
+    let Combat {
         #[cfg(feature = "debug-trigger")]
         debug_guard,
         shutdown_signal,
-        host_stopping,
-        cow_guard,
+        ..
     } = combat;
     let Signals {
         sigint,
         sigterm,
         sighup,
     } = signals;
-    // Why the event loop ended — written as the signed `agent_stop` entry
-    // below; a run that never writes it is reported by the next boot.
-    let loop_started = std::time::Instant::now();
-    #[allow(unused_assignments)]
-    let mut stop_reason = "unknown";
     // External audit SNS-001: a telemetry task that ended (a dead ring
     // pump, a drain, the open-sensor rule refresher) is checked for here;
-    // `next_event()` can never report it.
+    // the bus can never report it.
     let mut pump_check = tokio::time::interval(PUMP_CHECK_PERIOD);
     pump_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        // Lab PR 216: one round of the loop, for the watchdog's progress
-        // check — `pump_check` brings a round at least every 5 s on an idle
-        // host, so a count that stands still is a loop that does.
-        northnarrow_agent::loop_progress::tick();
         tokio::select! {
-            evt = sensor.next_event() => match evt {
-                Some(received) => {
-                    // Lab PR 267 (R12a): a tamper event taken ahead of execs
-                    // still queued brings them; the lineage has learned
-                    // them, the engine's rules learn them here, so the
-                    // event is judged on the process tree of every exec
-                    // that reached the bus before it (they are judged in
-                    // their own turn, which then changes nothing there).
-                    for exec in &received.overtaken {
-                        engine.observe_arrival(exec);
-                    }
-                    let e = received.envelope.event;
-                    // Tappa 10.8 telemetry probe: every event is offered to
-                    // the probe tracker before the decision engine (R11c, lab
-                    // PR 264: the probe the late binding started).
-                    if let Some(probe) = telemetry_probe {
-                        probe.observe(&e);
-                    }
-                    process_event(
-                    engine,
-                    executor,
-                    correlation,
-                    posture,
-                    ladder,
-                    // Tappa 9.5 K6: detector handle wired in. When
-                    // the canary subsystem boot above failed
-                    // (missing signing key, registry open error),
-                    // canary_detector is None and process_event
-                    // short-circuits to the source event without
-                    // canary filtering.
-                    canary_detector.as_deref(),
-                    // FIM-009 self-upgrade (§15.1): lazy TTL expiry sweep.
-                    installer_override,
-                    // Tappa 9.0.a: detection-persistence sink (off the hot path).
-                    detection_sink.as_ref(),
-                    expected_denial,
-                    host_stopping,
-                    cow_guard,
-                    e,
-                ).await;
-                    // Lab PR 267: the event's latency, queue to decision.
-                    sensor.decided();
-                }
-                None => {
-                    warn!("sensor pump exited; shutting down");
-                    stop_reason = "sensor_pump_exited";
-                    break;
-                }
-            },
+            () = ctl.ended.notified() => {
+                // the decision thread ended: the bus closed (every sender
+                // gone), or it panicked (the join below rethrows)
+                return "sensor_pump_exited";
+            }
             _ = pump_check.tick() => {
                 #[cfg(feature = "debug-trigger")]
                 debug_abort_pump(sensor, &cli.admin_socket);
                 #[cfg(feature = "debug-trigger")]
                 debug_protected_query(debug_guard, &cli.admin_socket);
                 #[cfg(feature = "debug-trigger")]
-                debug_stall_loop(&cli.admin_socket);
+                debug_stall_loop(&cli.admin_socket, ctl);
                 let dead = sensor.finished_pumps();
                 if !dead.is_empty() {
                     // A blind sensor is not hidden behind a silent restart:
@@ -154,34 +316,31 @@ pub(crate) async fn run(
                         ),
                         false,
                     );
-                    stop_reason = "sensor_pump_exited";
-                    break;
+                    return "sensor_pump_exited";
                 }
             }
             _ = sigint.recv() => {
                 info!("SIGINT received; shutting down");
-                stop_reason = "sigint";
-                break;
+                return "sigint";
             }
             _ = sigterm.recv() => {
                 // External audit EBPF-001: PID 1's SIGTERM reaches the agent
                 // only inside a signed trusted-installer window or from
                 // `systemd-shutdown`, the last stage of a shutdown.
-                stop_reason = if pid1_is_systemd_shutdown() { "system_shutdown" } else { "sigterm" };
-                info!(reason = stop_reason, "SIGTERM received; shutting down");
-                break;
+                let reason = if pid1_is_systemd_shutdown() { "system_shutdown" } else { "sigterm" };
+                info!(reason, "SIGTERM received; shutting down");
+                return reason;
             }
             _ = sighup.recv() => {
                 info!("SIGHUP received; shutting down");
-                stop_reason = "sighup";
-                break;
+                return "sighup";
             }
             // Tappa 8 A8: admin-authorised graceful shutdown. The
             // dispatcher has already (a) verified the
             // ShutdownRequest quorum, (b) written the on-disk
             // marker the watchdog will honour, and (c) replied
             // Success to the client BEFORE firing this signal.
-            // Breaking the loop runs the existing shutdown
+            // Ending the loop runs the existing shutdown
             // sequence (pid_file removal, admin socket
             // unlink), then main() returns Ok(()) and the
             // process exits 0.
@@ -202,19 +361,9 @@ pub(crate) async fn run(
                      beginning graceful exit (COMBAT state preserved \
                      across restart per design §10.3 step 4)"
                 );
-                stop_reason = "admin_shutdown";
-                break;
+                return "admin_shutdown";
             }
         }
-    }
-    // Lab PR 267 (R12a), review #471 M3: the bus is closed, the events it
-    // still held counted in a signed row, and every drop not in a signed
-    // row yet signed, before the stop is (a queue's window does not hold
-    // it back).
-    sensor.stop_bus();
-    Stopped {
-        stop_reason,
-        loop_started,
     }
 }
 
@@ -259,12 +408,13 @@ fn debug_protected_query(
 }
 
 /// `debug-trigger` builds only: a file `debug-stall-loop` next to the admin
-/// socket, holding a number of seconds (at most 600), blocks the event loop
-/// that long — the admin socket, on other workers, keeps answering. Lab
-/// check of lab PR 216: the watchdog must see the loop stand still
-/// (`event_loop_stalled`) and recover the agent.
+/// socket, holding a number of seconds (at most 600), makes the decision
+/// thread stand still that long (R12b: the decision's own thread; the
+/// event loop and the admin socket keep answering). Lab check of lab PR
+/// 216: the watchdog must see the loop stand still (`event_loop_stalled`)
+/// and recover the agent; EXP-13b's stalled loop.
 #[cfg(feature = "debug-trigger")]
-fn debug_stall_loop(admin_socket: &std::path::Path) {
+fn debug_stall_loop(admin_socket: &std::path::Path, ctl: &DecisionControl) {
     let Some(dir) = admin_socket.parent() else {
         return;
     };
@@ -274,11 +424,21 @@ fn debug_stall_loop(admin_socket: &std::path::Path) {
     };
     let _ = std::fs::remove_file(&trigger);
     let secs = text.trim().parse::<u64>().unwrap_or(0).min(600);
-    warn!(
-        secs,
-        "debug-trigger: the event loop stalls on request (lab test of lab PR 216)"
-    );
-    std::thread::sleep(Duration::from_secs(secs));
+    ctl.stall_secs.store(secs, Ordering::Release);
+}
+
+/// `debug-trigger` builds only: the decision thread stands still the
+/// seconds `debug-stall-loop` asked for (lab PR 216's check, EXP-13b).
+#[cfg(feature = "debug-trigger")]
+fn debug_stall_decision(ctl: &DecisionControl) {
+    let secs = ctl.stall_secs.swap(0, Ordering::AcqRel);
+    if secs > 0 {
+        warn!(
+            secs,
+            "debug-trigger: the decision thread stalls on request (lab test of lab PR 216)"
+        );
+        std::thread::sleep(Duration::from_secs(secs));
+    }
 }
 
 /// `debug-trigger` builds only: a file `debug-abort-pump` next to the admin

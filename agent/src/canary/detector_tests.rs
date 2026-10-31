@@ -1100,3 +1100,80 @@ fn a_network_canary_with_no_ip_address_is_not_indexed() {
         .process_event(&connect_to("127.0.0.1", 4444, 1, 1))
         .is_none());
 }
+
+/// R12b (lab PR 269): with a writer, a trip's access row and registry mark
+/// are the writer's — none written by `process_event` itself (the
+/// decision's thread) — and the writer writes them as the inline path did
+/// (the first trip's row named by the registry); a second access before
+/// the writer ran is not a first trip; `flush` waits for the queue.
+#[test]
+fn a_trip_s_rows_are_the_writer_s() {
+    let dir = TempDir::new().unwrap();
+    let (detector, registry) = build_detector(&dir);
+    let id = deploy_file_canary(&registry, &detector, "/tmp/decoy-w.txt", "c");
+    let (trips, written) = std::sync::mpsc::sync_channel(8);
+    let detector = Arc::new(detector.with_writer(trips));
+    let first = detector.process_event(&fim_event_on("/tmp/decoy-w.txt", 4242));
+    let second = detector.process_event(&fim_event_on("/tmp/decoy-w.txt", 4243));
+    let flag = |e: &Option<Event>| match e {
+        Some(Event::CanaryTripped { first_trip, .. }) => *first_trip,
+        e => panic!("not a trip: {e:?}"),
+    };
+    assert!(
+        flag(&first) && !flag(&second),
+        "one first trip, decided at once"
+    );
+    assert!(
+        access_rows(&dir).is_empty(),
+        "nothing written on the decision's thread"
+    );
+    assert!(!registry.lock().get(&id).unwrap().tripped, "not marked yet");
+    assert!(
+        !detector.flush(std::time::Duration::from_millis(20)),
+        "two queued"
+    );
+    let writer = Arc::clone(&detector);
+    let t = std::thread::spawn(move || {
+        for job in written.try_iter() {
+            writer.write_trip(job);
+        }
+    });
+    t.join().unwrap();
+    assert!(detector.flush(std::time::Duration::from_millis(20)));
+    let rows = access_rows(&dir);
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].first_trip && !rows[1].first_trip);
+    let state = registry.lock().get(&id).unwrap();
+    assert!(state.tripped);
+    assert_eq!(
+        state.first_trip_access_hash.as_deref(),
+        Some(rows[0].entry_hash.as_str()),
+        "the registry names the first trip's row (DEC-011)"
+    );
+    // a third access: not a first trip (the registry says so now)
+    let third = detector.process_event(&fim_event_on("/tmp/decoy-w.txt", 4244));
+    assert!(!flag(&third));
+}
+
+/// R12b: a writer that is gone (its queue's receiver dropped) — the trip
+/// is written by `process_event` itself, as before.
+#[test]
+fn a_trip_is_written_inline_when_its_writer_is_gone() {
+    let dir = TempDir::new().unwrap();
+    let (detector, registry) = build_detector(&dir);
+    let id = deploy_file_canary(&registry, &detector, "/tmp/decoy-g.txt", "c");
+    let (trips, written) = std::sync::mpsc::sync_channel(8);
+    drop(written);
+    let detector = detector.with_writer(trips);
+    let first = detector.process_event(&fim_event_on("/tmp/decoy-g.txt", 4242));
+    assert!(matches!(
+        first,
+        Some(Event::CanaryTripped {
+            first_trip: true,
+            ..
+        })
+    ));
+    assert_eq!(access_rows(&dir).len(), 1);
+    assert!(registry.lock().get(&id).unwrap().tripped);
+    assert!(detector.flush(std::time::Duration::from_millis(5)));
+}
