@@ -422,7 +422,31 @@ impl Host {
         for p in &case.procs {
             host.start(p.clone());
         }
+        host.write_self(case);
         host
+    }
+
+    /// R12b (R-F): the agent's own `/proc/self/stat`, its start a tick
+    /// after the case's processes — they ran before the agent (a host whose
+    /// agent restarted under its sessions), their execs could never be
+    /// seen, and in a judgement the lineage reads them from `/proc`; a
+    /// process the stream starts is the agent's to see.
+    fn write_self(&self, case: &Case) {
+        let tick = 1_000_000_000 / USER_HZ;
+        let ticks = case
+            .procs
+            .iter()
+            .map(|p| p.start_ns / tick)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let d = self.proc_root.join("self");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("stat"),
+            format!("1 (northnarrow-age) S 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"),
+        )
+        .unwrap();
     }
 
     fn note(&self, v: Value) {

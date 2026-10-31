@@ -1806,6 +1806,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             CachedAt::LaterOnly => return None,
             CachedAt::Absent => (None, false),
         };
+        let absent = cached.is_none();
         if let Some(e) = cached {
             if past || self.entry_is_current(pid, &e) || self.reused_after(pid, as_of) {
                 return Some(Hop {
@@ -1820,8 +1821,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 });
             }
         }
-        if as_of.is_judged() {
-            // R-F: in a judgement `/proc` would show the present image
+        if as_of.is_judged() && !(absent && self.predates_observer(pid)) {
+            // R-F: in a judgement `/proc` would show the present image — of
+            // a process the agent saw start (`judged_from_proc`)
             return None;
         }
         let (ppid, exe, uid) = self.lookup_proc(pid)?;
@@ -2088,7 +2090,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 });
             }
             CachedAt::LaterOnly => return None,
-            CachedAt::Absent if as_of.is_judged() => return None,
+            CachedAt::Absent if !self.judged_from_proc(pid, as_of) => return None,
             CachedAt::Absent => {}
         }
         let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
@@ -2128,11 +2130,27 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 return Some(e.exe.to_string_lossy().into_owned())
             }
             CachedAt::LaterOnly => return None,
-            CachedAt::Absent if as_of.is_judged() => return None,
+            CachedAt::Absent if !self.judged_from_proc(pid, as_of) => return None,
             CachedAt::Absent => {}
         }
         let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
         Some(exe.to_string_lossy().into_owned())
+    }
+
+    /// R-F, as R12b keeps it: whether a pid the spawn cache does not hold
+    /// may be read from `/proc` as of `as_of`. Outside a judgement, yes (as
+    /// before). In a judgement, only for a process that started before the
+    /// agent ([`Self::predates_observer`]): its exec could never be seen —
+    /// the boot's daemons, a login session older than a restart of the
+    /// agent — and `/proc` is all there is (strict R-F left the COMBAT their
+    /// descendants reach unlocked after every restart of the agent). A
+    /// process the agent saw start whose exec the cache does not hold (an
+    /// exec dropped by P1, evicted, or not yet read) is not known: `/proc`
+    /// would show its present image. What is left: a process older than
+    /// the agent that executes another image after the event, judged before
+    /// that exec is read.
+    fn judged_from_proc(&self, pid: u32, as_of: AsOf) -> bool {
+        !as_of.is_judged() || self.predates_observer(pid)
     }
 
     /// External audit SNS-014: the image `pid` ran at `at_ns`
@@ -2531,6 +2549,50 @@ mod tests {
         assert_eq!(AsOf::live(0), AsOf::Now);
         assert_eq!(AsOf::judged(7), AsOf::Judged(7));
         assert_eq!(AsOf::live(7), AsOf::Live(7));
+    }
+
+    /// R-F as R12b keeps it: in a judgement `/proc` answers for a pid the
+    /// cache does not hold only when its process started before the agent
+    /// (its exec could never be seen: the boot's daemons, a session older
+    /// than a restart of the agent); a process the agent saw start whose
+    /// exec it does not hold is not known — its walk stops there too.
+    #[test]
+    fn a_process_older_than_the_agent_is_read_from_proc_in_a_judgement() {
+        let proc = TempDir::new().unwrap();
+        write_started(proc.path(), "self", 1, 500);
+        // the session's shell, older than the agent; a tool started since
+        write_exe(proc.path(), 4800, "/usr/bin/bash");
+        write_status(proc.path(), 4800, 1);
+        write_started(proc.path(), "4800", 1, 400);
+        write_exe(proc.path(), 4801, "/usr/bin/restic");
+        write_status(proc.path(), 4801, 4800);
+        write_started(proc.path(), "4801", 4800, 600);
+        let t = AuthSessionTracker::new(proc.path());
+        let judged = AsOf::Judged(20 * S);
+        assert_eq!(
+            t.exec_identity(4800, judged).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/bash")),
+            "older than the agent: /proc"
+        );
+        assert_eq!(
+            t.image_path_as(4800, judged).as_deref(),
+            Some("/usr/bin/bash")
+        );
+        assert_eq!(
+            t.exec_identity(4801, judged),
+            None,
+            "started since: not known"
+        );
+        assert_eq!(t.image_path_as(4801, judged), None);
+        // the started-since tool, cached, walks up to the older shell
+        t.ingest_exec(4801, 4800, "/usr/bin/restic", &[], 10 * S, 9 * S, 1000);
+        let ids = t
+            .lineage_identities(4801, judged)
+            .expect("the walk reaches the shell");
+        assert!(
+            ids.iter().any(|(_, i)| i.exe == Path::new("/usr/bin/bash")),
+            "{ids:?}"
+        );
     }
 
     /// R12b (R-F) with POS-003: in a judgement a cached exec of a pid that
