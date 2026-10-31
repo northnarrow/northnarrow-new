@@ -1002,12 +1002,16 @@ fn process_canary_exec_triggers_canary_tripped_event_and_combat() {
     // Process canary path can be created post-spawn — sched_process_exec
     // is a tracepoint, not a WATCHED_PATHS-gated LSM hook; the K3
     // detector matches via the registry's exe_index after deploy.
+    use std::os::unix::process::ExitStatusExt;
     let tmp = tempfile::tempdir().expect("decoy tempdir");
     let decoy = tmp.path().join("decoy_helper");
-    // Real ELF at the deployment path so the exec doesn't ENOENT.
-    // /bin/true is the smallest exec-and-return-0 binary on
-    // every distribution we target.
-    std::fs::copy("/bin/true", &decoy).expect("seed decoy process binary");
+    // Real ELF at the deployment path so the exec doesn't ENOENT. Lab PR
+    // 269: a copy of /bin/sleep, alive until the response reaches it — with
+    // /bin/true the exec raced NN-L-CANARY-002's KillProcessTree (the
+    // decision on a thread of its own killed it before it returned 0 on
+    // ubuntu2204: "decoy exec failed"); the kill is the rule's response,
+    // asserted below as the network canary's is.
+    std::fs::copy("/bin/sleep", &decoy).expect("seed decoy process binary");
     let mut perms = std::fs::metadata(&decoy).expect("stat decoy").permissions();
     use std::os::unix::fs::PermissionsExt;
     perms.set_mode(0o755);
@@ -1018,11 +1022,12 @@ fn process_canary_exec_triggers_canary_tripped_event_and_combat() {
     assert_eq!(canary_id.len(), 32);
 
     // Trip: exec the canary binary.
-    let status = Command::new(&decoy)
+    let mut child = Command::new(&decoy)
+        .arg("30")
         .stdout(Stdio::null())
-        .status()
+        .spawn()
         .expect("spawn decoy process for canary trip");
-    assert!(status.success(), "decoy exec failed");
+    let child_pid = u64::from(child.id());
 
     let rows = fx.wait_access(1);
     assert_eq!(
@@ -1051,6 +1056,29 @@ fn process_canary_exec_triggers_canary_tripped_event_and_combat() {
         row["accessor_comm"].as_str().is_some_and(|s| !s.is_empty()),
         "accessor_comm should be populated"
     );
+    assert_eq!(row["accessor_pid"].as_u64(), Some(child_pid), "{row}");
+
+    // The rule's record and its response: the decoy killed (SIGKILL)
+    // during its sleep.
+    let rec = common::wait_jsonl_row(
+        &fx.detections_log,
+        ACCESS_LOG_POLL_TIMEOUT,
+        "NN-L-CANARY-002 record of the decoy",
+        |r| {
+            r["rule_id"].as_str() == Some("NN-L-CANARY-002_ProcessExec")
+                && r["principal"]["pid"].as_u64() == Some(child_pid)
+        },
+    );
+    assert_eq!(rec["severity"], "Critical", "record: {rec}");
+    assert!(
+        rec["response"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("KillProcessTree")),
+        "record: {rec}"
+    );
+    let status = wait_exit(&mut child, Duration::from_secs(10))
+        .expect("the decoy must be killed during its 30 s sleep");
+    assert_eq!(status.signal(), Some(9), "{status:?}");
 }
 
 // ── Test 3: refresh re-arms a tripped canary for repeat trips ───────
