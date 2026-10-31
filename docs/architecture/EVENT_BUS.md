@@ -428,9 +428,14 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   userland cap (§2c) bounds the consumer's share, a kernel budget would
   bound the ring's.
 - **Open after R12b-1** — the FIM and network drains stay tasks of the
-  runtime that send one event at a time (they are no flood's source in the
-  EXP-13 family); the DNS pump's thread runs its loop on the runtime's
-  reactor (its pass answers the lookups' requests).
+  runtime that send one event at a time; in the lab's EXP-13c the FIM ring
+  dropped records in one run of three on the final tip (none in `main`'s
+  three; two of four on `main`'s code in R12a's lab), with no send of the
+  bus waiting: the FIM drain's move to a thread is the next candidate. The
+  DNS pump's thread runs its loop on the runtime's reactor (its pass
+  answers the lookups' requests). The `fs_protect` ring is sized at load
+  for a pump thread's wake-up on a saturated CPU (§2a); the other rings
+  keep the object's sizes.
 - **R12c** — the response dispatcher by severity, its queue (stage 6);
   no action without a signed record (intent, then outcome); the budget
   never limits an action's record; the evidence writer's queue (stage 7);
