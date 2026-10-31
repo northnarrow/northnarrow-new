@@ -225,10 +225,15 @@ fn count(code: &str) -> usize {
     sites
 }
 
-/// The site counts of every file of the scan (to fill [`KNOWN`]).
+/// The site counts of every file of the scan (to fill [`KNOWN`]): a no-op
+/// unless `NN_PRINT_IO_COUNTS=1` (an ignored helper, run by hand when the
+/// table moves).
 #[test]
-#[ignore = "prints the counts; run by hand when the table moves"]
+#[ignore = "prints the counts; NN_PRINT_IO_COUNTS=1, run by hand when the table moves"]
 fn print_the_counts() {
+    if std::env::var("NN_PRINT_IO_COUNTS").as_deref() != Ok("1") {
+        return;
+    }
     for (file, text) in path_code(&repo_root()) {
         let n = count(&text);
         if n > 0 {
