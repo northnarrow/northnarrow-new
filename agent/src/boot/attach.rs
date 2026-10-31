@@ -191,6 +191,15 @@ pub(crate) async fn load(
         }
     };
     boot.done(BootStep::Sensors)?;
+    // Review of #475 (R-F): the processes already running, entered into the
+    // lineage once the exec sensors are attached (an exec from now on is
+    // seen): a judgement never reads `/proc` for a process the cache does
+    // not hold, and a process older than the agent is known by this scan.
+    let seeded = lineage.seed_from_proc();
+    info!(
+        seeded,
+        "lineage: the running processes entered at the start"
+    );
     info!(
         sensors =
             "process_spawn, file_open, exec_check, tcp_connect_v4, tcp_connect_v6, dns_query, \

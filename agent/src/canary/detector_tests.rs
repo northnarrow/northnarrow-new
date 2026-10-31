@@ -1177,3 +1177,47 @@ fn a_trip_is_written_inline_when_its_writer_is_gone() {
     assert!(registry.lock().get(&id).unwrap().tripped);
     assert!(detector.flush(std::time::Duration::from_millis(5)));
 }
+
+/// Review of #475: a writer that stopped writing (its queue full) holds
+/// the decision at most `CANARY_QUEUE_WAIT` per trip: the trip's event
+/// still goes out, its rows are counted as not written (per canary), and
+/// the stop's flush returns within its bound.
+#[test]
+fn a_full_writer_queue_holds_a_trip_at_most_its_wait_and_counts_it() {
+    use nn_core::canary::detector::CANARY_QUEUE_WAIT;
+    let dir = TempDir::new().unwrap();
+    let (detector, registry) = build_detector(&dir);
+    let id = deploy_file_canary(&registry, &detector, "/tmp/decoy-f.txt", "c");
+    // a queue of one that nobody reads
+    let (trips, _written) = std::sync::mpsc::sync_channel(1);
+    let detector = detector.with_writer(trips);
+    let first = detector.process_event(&fim_event_on("/tmp/decoy-f.txt", 4242));
+    assert!(matches!(
+        first,
+        Some(Event::CanaryTripped {
+            first_trip: true,
+            ..
+        })
+    ));
+    let started = std::time::Instant::now();
+    let second = detector.process_event(&fim_event_on("/tmp/decoy-f.txt", 4243));
+    let held = started.elapsed();
+    assert!(
+        matches!(second, Some(Event::CanaryTripped { .. })),
+        "the event goes on to the rules"
+    );
+    assert!(held >= CANARY_QUEUE_WAIT, "it waited for room: {held:?}");
+    assert!(
+        held < CANARY_QUEUE_WAIT * 5,
+        "and no longer than its wait: {held:?}"
+    );
+    let (per, total) = detector.unwritten();
+    assert_eq!(total, 1);
+    assert_eq!(per.get(&id), Some(&1));
+    let started = std::time::Instant::now();
+    assert!(
+        !detector.flush(std::time::Duration::from_millis(50)),
+        "one row still queued"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}

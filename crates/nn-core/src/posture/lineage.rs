@@ -991,6 +991,70 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         );
     }
 
+    /// Review of #475 (R-F): enter every process running now into the
+    /// spawn cache, as the agent's start does once its sensors are
+    /// attached — each as an exec of the image `/proc` shows it running,
+    /// at time 0 (it has run that image since before any exec could be
+    /// seen), with its own start (`/proc/<pid>/stat`) and its parent and
+    /// real uid (`status`), an interpreter's script from its `cmdline`. A
+    /// pid the cache already holds (its exec seen since the attach) is
+    /// left alone; a deleted image is not entered. From then on a judgement
+    /// never needs `/proc` for a process older than the agent: an exec it
+    /// runs later becomes a later entry and the seeded one its past, so
+    /// an event before that exec is read is judged on the image it ran.
+    /// Returns how many processes it entered.
+    pub fn seed_from_proc(&self) -> usize {
+        let Ok(dir) = H::read_dir(&self.inner.proc_root) else {
+            return 0;
+        };
+        let tick = H::clock_tick_ns();
+        let suspended = self.suspended_ns();
+        let mut seeded = 0;
+        for entry in dir.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid == 0 || self.holds(pid) {
+                continue;
+            }
+            let Some((ppid, exe, uid)) = self.lookup_proc(pid) else {
+                continue;
+            };
+            let Some(ticks) = self.proc_start_ticks(pid) else {
+                continue;
+            };
+            let start_ns = ticks.saturating_mul(tick).saturating_sub(suspended).max(1);
+            let script = self.proc_script(pid, &exe).map(String::into_boxed_str);
+            let exe = exe.to_string_lossy().into_owned();
+            // the pid may have been entered by an exec since the check
+            if self.holds(pid) {
+                continue;
+            }
+            self.ingest_inner(
+                pid,
+                ppid,
+                &exe,
+                false,
+                script,
+                0,
+                start_ns,
+                uid.unwrap_or(0),
+            );
+            seeded += 1;
+        }
+        seeded
+    }
+
+    /// The spawn cache holds an exec of `pid`.
+    fn holds(&self, pid: u32) -> bool {
+        let s = self.inner.state.read();
+        s.map.contains_key(&pid) || s.daemons.contains_key(&pid)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn ingest_inner(
         &self,
@@ -1806,7 +1870,6 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             CachedAt::LaterOnly => return None,
             CachedAt::Absent => (None, false),
         };
-        let absent = cached.is_none();
         if let Some(e) = cached {
             if past || self.entry_is_current(pid, &e) || self.reused_after(pid, as_of) {
                 return Some(Hop {
@@ -1821,9 +1884,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 });
             }
         }
-        if as_of.is_judged() && !(absent && self.predates_observer(pid)) {
-            // R-F: in a judgement `/proc` would show the present image — of
-            // a process the agent saw start (`judged_from_proc`)
+        if as_of.is_judged() {
+            // R-F: in a judgement `/proc` would show the present image; the
+            // processes older than the agent are in the cache from the
+            // start's scan ([`Self::seed_from_proc`])
             return None;
         }
         let (ppid, exe, uid) = self.lookup_proc(pid)?;
@@ -2137,20 +2201,17 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         Some(exe.to_string_lossy().into_owned())
     }
 
-    /// R-F, as R12b keeps it: whether a pid the spawn cache does not hold
-    /// may be read from `/proc` as of `as_of`. Outside a judgement, yes (as
-    /// before). In a judgement, only for a process that started before the
-    /// agent ([`Self::predates_observer`]): its exec could never be seen —
-    /// the boot's daemons, a login session older than a restart of the
-    /// agent — and `/proc` is all there is (strict R-F left the COMBAT their
-    /// descendants reach unlocked after every restart of the agent). A
-    /// process the agent saw start whose exec the cache does not hold (an
-    /// exec dropped by P1, evicted, or not yet read) is not known: `/proc`
-    /// would show its present image. What is left: a process older than
-    /// the agent that executes another image after the event, judged before
-    /// that exec is read.
-    fn judged_from_proc(&self, pid: u32, as_of: AsOf) -> bool {
-        !as_of.is_judged() || self.predates_observer(pid)
+    /// R-F: whether a pid the spawn cache does not hold may be read from
+    /// `/proc` as of `as_of` — outside a judgement only. In a judgement a
+    /// process the cache does not hold is not known: `/proc` would show its
+    /// present image, which it may have executed since the event (review of
+    /// #475: a process older than the agent that reads a canary, then
+    /// executes a backup tool, judged before that exec is read, was judged
+    /// as the tool). The processes running when the agent starts are in
+    /// the cache from the start's scan ([`Self::seed_from_proc`]), so the
+    /// boot's daemons and a session older than a restart are known.
+    fn judged_from_proc(&self, _pid: u32, as_of: AsOf) -> bool {
+        !as_of.is_judged()
     }
 
     /// External audit SNS-014: the image `pid` ran at `at_ns`
@@ -2551,13 +2612,16 @@ mod tests {
         assert_eq!(AsOf::live(7), AsOf::Live(7));
     }
 
-    /// R-F as R12b keeps it: in a judgement `/proc` answers for a pid the
-    /// cache does not hold only when its process started before the agent
-    /// (its exec could never be seen: the boot's daemons, a session older
-    /// than a restart of the agent); a process the agent saw start whose
-    /// exec it does not hold is not known — its walk stops there too.
+    /// Review of #475 (R-F): in a judgement `/proc` never answers for a pid
+    /// the cache does not hold, a process older than the agent included;
+    /// the start's scan enters every running process instead, so the
+    /// boot's daemons and an older session are known, and an exec it runs
+    /// later is a later entry, the scanned image its past. The reviewer's
+    /// case: a process older than the agent reads a canary, then executes a
+    /// backup tool; the read, judged before that exec is read, is the old
+    /// image's — never the tool's, as `/proc` shows it by then.
     #[test]
-    fn a_process_older_than_the_agent_is_read_from_proc_in_a_judgement() {
+    fn a_process_older_than_the_agent_is_known_from_the_start_s_scan() {
         let proc = TempDir::new().unwrap();
         write_started(proc.path(), "self", 1, 500);
         // the session's shell, older than the agent; a tool started since
@@ -2570,29 +2634,72 @@ mod tests {
         let t = AuthSessionTracker::new(proc.path());
         let judged = AsOf::Judged(20 * S);
         assert_eq!(
+            t.exec_identity(4800, judged),
+            None,
+            "not in the cache: not known, even older than the agent"
+        );
+        assert_eq!(t.image_path_as(4800, judged), None);
+        assert_eq!(
+            t.exec_identity(4800, AsOf::Now).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/bash")),
+            "outside a judgement: /proc, as before"
+        );
+        // an exec seen since the attach is left alone by the scan
+        t.ingest_exec(4801, 4800, "/usr/bin/restic", &[], 10 * S, 9 * S, 1000);
+        assert_eq!(t.seed_from_proc(), 1, "the shell; the tool already held");
+        assert_eq!(
             t.exec_identity(4800, judged).map(|i| i.exe),
             Some(PathBuf::from("/usr/bin/bash")),
-            "older than the agent: /proc"
+            "the scanned shell"
         );
-        assert_eq!(
-            t.image_path_as(4800, judged).as_deref(),
-            Some("/usr/bin/bash")
-        );
-        assert_eq!(
-            t.exec_identity(4801, judged),
-            None,
-            "started since: not known"
-        );
-        assert_eq!(t.image_path_as(4801, judged), None);
-        // the started-since tool, cached, walks up to the older shell
-        t.ingest_exec(4801, 4800, "/usr/bin/restic", &[], 10 * S, 9 * S, 1000);
         let ids = t
             .lineage_identities(4801, judged)
-            .expect("the walk reaches the shell");
+            .expect("the walk reaches the scanned shell");
         assert!(
             ids.iter().any(|(_, i)| i.exe == Path::new("/usr/bin/bash")),
             "{ids:?}"
         );
+        // the shell executes the backup tool after the read; the read is
+        // judged before that exec is read: the shell's, not /proc's tool
+        write_exe(proc.path(), 4800, "/usr/bin/restic");
+        assert_eq!(
+            t.exec_identity(4800, judged).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/bash")),
+            "the image it ran, never the one /proc shows now"
+        );
+        // once that exec is read: before it the shell, after it the tool
+        t.ingest_exec(4800, 1, "/usr/bin/restic", &[], 30 * S, 4 * S, 1000);
+        assert_eq!(
+            t.exec_identity(4800, judged).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/bash"))
+        );
+        assert_eq!(
+            t.exec_identity(4800, AsOf::Judged(40 * S)).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/restic"))
+        );
+        // a deleted image is not entered; a second scan enters nothing new
+        write_exe(proc.path(), 4802, "/tmp/x (deleted)");
+        write_status(proc.path(), 4802, 1);
+        write_started(proc.path(), "4802", 1, 450);
+        assert_eq!(t.seed_from_proc(), 0);
+        assert_eq!(t.exec_identity(4802, judged), None);
+    }
+
+    /// The reviewer's mutation K5: a process `/proc` shows started at the
+    /// agent's own tick did not start before it (`p < o`, not `<=`) — a
+    /// process the agent may have seen start is not taken for an older one.
+    #[test]
+    fn a_process_started_at_the_agent_s_tick_does_not_predate_it() {
+        let proc = TempDir::new().unwrap();
+        write_started(proc.path(), "self", 1, 500);
+        write_started(proc.path(), "41", 1, 499);
+        write_started(proc.path(), "42", 1, 500);
+        write_started(proc.path(), "43", 1, 501);
+        let t = AuthSessionTracker::new(proc.path());
+        assert!(t.predates_observer(41));
+        assert!(!t.predates_observer(42), "the same tick: not before");
+        assert!(!t.predates_observer(43));
+        assert!(!t.predates_observer(44), "not shown: not before");
     }
 
     /// R12b (R-F) with POS-003: in a judgement a cached exec of a pid that

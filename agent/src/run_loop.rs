@@ -160,6 +160,15 @@ pub(crate) async fn run(
         if !d.flush(Duration::from_secs(5)) {
             warn!("canary: trips still queued for their access rows at the stop");
         }
+        let (per_canary, unwritten) = d.unwritten();
+        if unwritten > 0 {
+            warn!(
+                unwritten,
+                canaries = per_canary.len(),
+                "canary: trips whose access rows the full writer's queue did not take (counted, \
+                 their events judged)"
+            );
+        }
     }
     sensor.stop_bus();
     Stopped {

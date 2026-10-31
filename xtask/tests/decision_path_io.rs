@@ -86,6 +86,10 @@ const PATH: &[&str] = &[
     "crates/nn-core/src/detection_budget.rs",
     "crates/nn-core/src/impact",
     "crates/nn-core/src/impair",
+    // Review of #475 (its mutation K9): the responses the decision thread
+    // carries out itself until R12c's dispatcher — the executor and what it
+    // calls (kills, cgroups, quarantine, isolation)
+    "crates/nn-linux/src/response",
 ];
 
 /// The files of [`PATH`] that hold markers: how many sites, and why.
@@ -125,11 +129,12 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/canary/detector.rs",
-        2,
+        3,
         "the trip's evidence of its reader (`H::accessor_exe`: a readlink of the reader's \
-         /proc/<pid>/exe, on a canary trip only, the reader possibly short-lived) and the \
-         stop's wait for the writer (`flush`, the event loop's) — the access row and the \
-         registry's mark are the writer's (R12b)",
+         /proc/<pid>/exe, on a canary trip only, the reader possibly short-lived), the stop's \
+         wait for the writer (`flush`, the event loop's), and a trip's wait for room in the \
+         writer's full queue, at most `CANARY_QUEUE_WAIT` (100 ms), then counted (review of \
+         #475) — the access row and the registry's mark are the writer's (R12b)",
     ),
     (
         "crates/nn-core/src/decision/catalogue/process.rs",
@@ -185,16 +190,60 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        14,
+        15,
         "the lineage's /proc reads for the lookups outside a judgement (`AsOf::Now`, \
-         `AsOf::Live`: the pumps', the admin's, the responses'), its boot-time reads, and — in a \
-         judgement — a process's start (`/proc/<pid>/stat`, POS-003's reuse check) and the \
-         image of a process older than the agent only (R-F, `judged_from_proc`)",
+         `AsOf::Live`: the pumps', the admin's, the responses'), its boot-time reads (the \
+         start's scan of the running processes, `seed_from_proc`), and — in a judgement — a \
+         process's start (`/proc/<pid>/stat`, POS-003's reuse check); never a process's image \
+         in a judgement (R-F, review of #475)",
     ),
     (
         "crates/nn-core/src/posture/triggers.rs",
         1,
         "a `/proc` path in a trigger's evidence text, no read",
+    ),
+    // Review of #475 (K9): the responses, carried out on the decision
+    // thread until R12c's dispatcher takes them off it
+    (
+        "crates/nn-linux/src/response/block_outbound.rs",
+        5,
+        "a response (R12c): the outbound block's cgroup and `/proc` reads, its rule file",
+    ),
+    (
+        "crates/nn-linux/src/response/caps_preflight.rs",
+        7,
+        "a response's preflight (R12c): the target's capabilities and status in `/proc`",
+    ),
+    (
+        "crates/nn-linux/src/response/containment.rs",
+        8,
+        "a response (R12c): the containment ledger appended and synced, `/proc` reads",
+    ),
+    (
+        "crates/nn-linux/src/response/kill.rs",
+        19,
+        "a response (R12c): the kill's cgroup made, frozen, killed and removed, its wait for the \
+         freeze, `/proc` reads",
+    ),
+    (
+        "crates/nn-linux/src/response/mod.rs",
+        3,
+        "a response (R12c): a target's path on the host, `/proc` reads",
+    ),
+    (
+        "crates/nn-linux/src/response/proc_ref.rs",
+        4,
+        "a response (R12c): the target process pinned by its `/proc` entry",
+    ),
+    (
+        "crates/nn-linux/src/response/quarantine.rs",
+        35,
+        "a response (R12c): the quarantine's copy, its ledger synced, `/proc` reads",
+    ),
+    (
+        "crates/nn-linux/src/response/throttle.rs",
+        3,
+        "a response (R12c): the throttle's cgroup files",
     ),
 ];
 
@@ -359,6 +408,22 @@ fn the_decision_path_s_io_is_a_ratchet() {
 #[test]
 fn the_rules_fail_on_planted_violations() {
     let mut code = path_code(&repo_root());
+    // the review of #475's mutation K9: a blocking read in the executor the
+    // decision thread calls (`execute_for_started`) is a new site
+    let ex = "crates/nn-linux/src/response/executor.rs".to_string();
+    let mut planted = code.clone();
+    let text = planted.get_mut(&ex).expect("the executor is on the path");
+    let at = text.find("fn execute_for_started(").unwrap();
+    let open = at + text[at..].find('{').unwrap();
+    text.insert_str(
+        open + 1,
+        "\n let _ = std::fs::read_to_string(\"/proc/self/status\");\n",
+    );
+    let v = ratchet_violations(&planted);
+    assert!(
+        v.len() == 1 && v[0].contains("executor.rs") && v[0].contains("new"),
+        "{v:#?}"
+    );
     // rule 1: an await, a /proc read in process_event; a sleep in the
     // decision loop
     let pe = "agent/src/pipeline/process_event.rs".to_string();

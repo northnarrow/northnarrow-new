@@ -377,7 +377,21 @@ pub struct Detector<H: CanaryHost> {
     decided: Mutex<std::collections::HashSet<String>>,
     /// Trips queued and not yet written ([`Self::flush`]).
     queued: std::sync::atomic::AtomicUsize,
+    /// Review of #475: the trips whose rows were not queued — the writer's
+    /// queue still full after [`CANARY_QUEUE_WAIT`] —, per canary, and in
+    /// all ([`Self::unwritten`]); the trip event goes out all the same.
+    unwritten: Mutex<std::collections::BTreeMap<String, u64>>,
+    unwritten_total: std::sync::atomic::AtomicU64,
 }
+
+/// Review of #475: how long a trip waits for room in the writer's full
+/// queue before its rows are counted instead of written — the decision is
+/// never held longer per trip, and a writer that stopped writing never
+/// holds the decision (nor the stop).
+pub const CANARY_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The canaries [`Detector::unwritten`] names at most (the rest in the total).
+const UNWRITTEN_KEYS: usize = 256;
 
 /// R12b: one trip for the writer — its access row, and whether it is the
 /// canary's first (its registry mark).
@@ -402,6 +416,60 @@ impl<H: CanaryHost> Detector<H> {
             writer: None,
             decided: Mutex::new(std::collections::HashSet::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
+            unwritten: Mutex::new(std::collections::BTreeMap::new()),
+            unwritten_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Review of #475: the trips whose rows the full writer's queue did not
+    /// take, per canary (at most [`UNWRITTEN_KEYS`] named) and in all since
+    /// the start.
+    pub fn unwritten(&self) -> (std::collections::BTreeMap<String, u64>, u64) {
+        (
+            self.unwritten.lock().clone(),
+            self.unwritten_total
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// Queue `job` for the writer: at once, or after waiting for room at
+    /// most [`CANARY_QUEUE_WAIT`]. `Err(job)`: the writer is gone (write it
+    /// here); `Ok(false)`: still full — counted, not written.
+    fn queue_trip(
+        &self,
+        queue: &std::sync::mpsc::SyncSender<TripWrite>,
+        job: TripWrite,
+    ) -> Result<bool, TripWrite> {
+        use std::sync::mpsc::TrySendError;
+        let started = std::time::Instant::now();
+        let mut job = job;
+        loop {
+            match queue.try_send(job) {
+                Ok(()) => return Ok(true),
+                Err(TrySendError::Disconnected(j)) => return Err(j),
+                Err(TrySendError::Full(j)) => {
+                    if started.elapsed() >= CANARY_QUEUE_WAIT {
+                        let id = j.draft.canary_id.clone();
+                        let mut un = self.unwritten.lock();
+                        if un.len() < UNWRITTEN_KEYS || un.contains_key(&id) {
+                            *un.entry(id.clone()).or_default() += 1;
+                        }
+                        let total = self
+                            .unwritten_total
+                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                            + 1;
+                        warn!(
+                            canary_id = %id,
+                            unwritten_total = total,
+                            "canary: the access writer's queue stayed full — this trip's rows are \
+                             counted, not written (its event goes on to the rules)"
+                        );
+                        return Ok(false);
+                    }
+                    job = j;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
         }
     }
 
@@ -409,7 +477,8 @@ impl<H: CanaryHost> Detector<H> {
     /// `queue` — a writer that calls [`Self::write_trip`] for each, in order
     /// — instead of being written in [`Self::process_event`] (the
     /// decision's: no chain write on its thread). A full queue holds the
-    /// decision until the writer takes one, as the inline write did.
+    /// decision at most [`CANARY_QUEUE_WAIT`] a trip, then the trip's rows
+    /// are counted ([`Self::unwritten`]) instead (review of #475).
     pub fn with_writer(mut self, queue: std::sync::mpsc::SyncSender<TripWrite>) -> Self {
         self.writer = Some(queue);
         self
@@ -672,19 +741,27 @@ impl<H: CanaryHost> Detector<H> {
                     drop(reg);
                     self.queued
                         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    if queue
-                        .send(TripWrite {
+                    match self.queue_trip(
+                        queue,
+                        TripWrite {
                             draft: draft.clone(),
-                        })
-                        .is_err()
-                    {
-                        // the writer is gone: written here, as before
-                        self.queued
-                            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                        let mut reg = self.registry.lock();
-                        let hash = self.append_row(draft);
-                        if first_trip {
-                            self.mark(&mut reg, &canary_id, hash);
+                        },
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            // counted (`unwritten`), not queued
+                            self.queued
+                                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                        }
+                        Err(_) => {
+                            // the writer is gone: written here, as before
+                            self.queued
+                                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                            let mut reg = self.registry.lock();
+                            let hash = self.append_row(draft);
+                            if first_trip {
+                                self.mark(&mut reg, &canary_id, hash);
+                            }
                         }
                     }
                 }
