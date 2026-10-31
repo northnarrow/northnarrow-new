@@ -55,7 +55,7 @@ use crate::config::overlay::{self, DefaultsSource, Shipped};
 use crate::content_host::ContentHost;
 use crate::decision::host::DecisionHost;
 use crate::posture::host::PostureHost;
-use crate::posture::lineage::{AuthSessionTracker, ExecIdentity};
+use crate::posture::lineage::{AsOf, AuthSessionTracker, ExecIdentity};
 
 /// Deploy location of the list.
 pub const SECURITY_TOOLS_V1: &str = "/etc/northnarrow/security-tools.v1";
@@ -638,7 +638,8 @@ impl<H: DecisionHost> DefenseDetector<H> {
             let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
                 continue;
             };
-            if let Some(id) = self.lineage.exec_identity(pid) {
+            // the boot's scan (and its rescans): the processes running now
+            if let Some(id) = self.lineage.exec_identity(pid, AsOf::Now) {
                 if let Some(t) = self.tools.tool_of_process(&id) {
                     let name = t.name.clone();
                     self.register(pid, &name);
@@ -676,8 +677,9 @@ impl<H: DecisionHost> DefenseDetector<H> {
     }
 
     /// The tool `pid` was registered as (unless the pid now names another
-    /// process), or runs now.
-    fn defender(&self, pid: u32) -> Option<String> {
+    /// process), or ran as of `as_of` (R12b, R-F: the judged event's time;
+    /// in a judgement the spawn cache only).
+    fn defender(&self, pid: u32, as_of: AsOf) -> Option<String> {
         if let Some((t, start)) = self.defenders.lock().get(&pid) {
             match start_ticks::<H>(&self.proc_root, pid) {
                 // Gone (the signal ended it), or still the same process.
@@ -686,7 +688,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
                 _ => {}
             }
         }
-        let id = self.lineage.exec_identity(pid)?;
+        let id = self.lineage.exec_identity(pid, as_of)?;
         self.tools.tool_of_process(&id).map(|t| t.name.clone())
     }
 
@@ -706,6 +708,8 @@ impl<H: DecisionHost> DefenseDetector<H> {
     }
 
     fn assess_once(&self, event: &Event) -> Option<Finding> {
+        // R12b (R-F): the lineage as of the event's own time
+        let as_of = AsOf::of_event(event);
         let (rule, tool, what, pid, filename, ts) = match event {
             Event::ProcessSpawn {
                 pid,
@@ -725,7 +729,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
                     self.schedule_rescan(Instant::now());
                     return None;
                 }
-                let (rule, tool, what) = self.spawn_finding(&id, argv)?;
+                let (rule, tool, what) = self.spawn_finding(&id, argv, as_of)?;
                 (rule, tool, what, *pid, image, *timestamp_ns)
             }
             Event::DefenderSignal {
@@ -735,7 +739,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
                 timestamp_ns,
                 ..
             } => {
-                let tool = self.defender(*target_pid)?;
+                let tool = self.defender(*target_pid, as_of)?;
                 (
                     EvaRule::Killed,
                     tool.clone(),
@@ -775,7 +779,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
             .sanctioned(event, pid, ts)
             .or_else(|| self.own_units_in_window(rule, &tool, &what));
         let suspicious = if sanctioned.is_none() {
-            self.suspicious(pid)
+            self.suspicious(pid, as_of)
         } else {
             None
         };
@@ -864,6 +868,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
         &self,
         id: &ExecIdentity,
         argv: &[String],
+        as_of: AsOf,
     ) -> Option<(EvaRule, String, String)> {
         let prog = program_name(id, argv);
         let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
@@ -902,7 +907,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
             }
             for a in args.iter().filter(|a| !a.starts_with('-')) {
                 if let Ok(target) = a.parse::<u32>() {
-                    if let Some(tool) = self.defender(target) {
+                    if let Some(tool) = self.defender(target, as_of) {
                         return Some((
                             EvaRule::Killed,
                             tool.clone(),
@@ -955,16 +960,17 @@ impl<H: DecisionHost> DefenseDetector<H> {
     /// Package transaction, administrator's interactive session, or a
     /// configuration-management actor.
     fn sanctioned(&self, event: &Event, pid: u32, ts: u64) -> Option<String> {
+        // R12b (R-F): as of the event's time
         let package = match event {
             Event::Fim(fe) => self
                 .lineage
-                .is_package_transaction_write(fe.modifier_pid, fe.timestamp_ns),
-            _ => self.lineage.in_package_transaction(pid, ts),
+                .is_package_transaction_write(fe.modifier_pid, AsOf::judged(fe.timestamp_ns)),
+            _ => self.lineage.in_package_transaction(pid, AsOf::judged(ts)),
         };
         if package {
             return Some("in a package transaction run by root".to_string());
         }
-        if self.lineage.is_interactive_admin(pid) {
+        if self.lineage.is_interactive_admin(pid, AsOf::judged(ts)) {
             return Some(format!(
                 "in an administrator's interactive sudo/su session (login uid {})",
                 self.lineage
@@ -972,7 +978,11 @@ impl<H: DecisionHost> DefenseDetector<H> {
                     .map_or_else(|| "?".to_string(), |u| u.to_string())
             ));
         }
-        if let Some(actor) = self.actors.as_ref().and_then(|a| a.actor_of(pid)) {
+        if let Some(actor) = self
+            .actors
+            .as_ref()
+            .and_then(|a| a.actor_of(pid, AsOf::judged(ts)))
+        {
             return Some(format!(
                 "run under {}, a configuration-management actor of process-comm-allowlist",
                 actor.display()
@@ -983,8 +993,8 @@ impl<H: DecisionHost> DefenseDetector<H> {
 
     /// The nearest hop of `pid`'s lineage that runs from a staging
     /// directory, or a deleted or memory-only executable.
-    fn suspicious(&self, pid: u32) -> Option<(u32, String)> {
-        let hops = self.lineage.lineage_identities(pid)?;
+    fn suspicious(&self, pid: u32, as_of: AsOf) -> Option<(u32, String)> {
+        let hops = self.lineage.lineage_identities(pid, as_of)?;
         hops.into_iter().find_map(|(p, id)| {
             let exe = id.exe.to_string_lossy().into_owned();
             let script = id.script.clone().unwrap_or_default();

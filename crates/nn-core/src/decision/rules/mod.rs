@@ -395,7 +395,8 @@ pub(crate) fn judge_actor<H: PostureHost>(
     if *uid != 0 || !crate::posture::lineage::in_system_tree(exe.path_or(filename)) {
         return verdict;
     }
-    let Some(actor) = allowlist.actor_of(*pid) else {
+    let Some(actor) = allowlist.actor_of(*pid, crate::posture::lineage::AsOf::of_event(event))
+    else {
         return verdict;
     };
     Verdict {

@@ -201,13 +201,6 @@ const STATICS: &[Kept] = &[
         "verdicts given at a connect, `net status`",
     ),
     kept(
-        "crates/nn-core/src/posture/lineage.rs",
-        "JUDGED_AT",
-        Scratch,
-        "a thread-local: the time of the event being judged (lab PR 267, review #471 A1), set \
-         and restored around its synchronous judgement (`lineage::judged_at`)",
-    ),
-    kept(
         "crates/nn-core/src/decision/response_policy.rs",
         "HELD",
         Scratch,
@@ -496,11 +489,6 @@ const STATICS: &[Kept] = &[
 /// The free functions the start calls that name a static of their module,
 /// and why each may: `module::function`.
 const START_CALLS: &[(&str, &str)] = &[
-    (
-        "lineage::judged_at",
-        "scopes the lineage lookups of one event's synchronous judgement to its time (a \
-         thread-local set and restored within the call, lab PR 267)",
-    ),
     (
         "loop_progress::start",
         "fixes the event loop's heartbeat origin at the process's start",

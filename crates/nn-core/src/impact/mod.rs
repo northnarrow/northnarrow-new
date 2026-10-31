@@ -259,8 +259,10 @@ impl<H: DecisionHost> RansomTracker<H> {
     }
 
     fn judge(&self, event: &Event, pid: u32, ts: u64) -> Assessment {
-        let lineage = self.lineage.lineage_identities(pid);
-        let package_tx = self.lineage.in_package_transaction(pid, ts);
+        // R-F: the lineage as of the burst's own time
+        let as_of = crate::posture::lineage::AsOf::judged(ts);
+        let lineage = self.lineage.lineage_identities(pid, as_of);
+        let package_tx = self.lineage.in_package_transaction(pid, as_of);
         let owned = |p: &std::path::Path| self.owners.owned(p);
         let mut a = Assessment {
             writer: pid,

@@ -1291,28 +1291,39 @@ fn the_event_loop_wires_the_bus_as_modelled() {
     assert_eq!(code.matches("sensor.stop_bus();").count(), 1);
 }
 
-/// Review #471 A1: the event loop judges each event as of its own time,
-/// as the replay this test runs does (`replay::decide`): the canary
+/// Review #471 A1, R12b (R-F of its second review): each event is judged
+/// as of its own time, as the replay this test runs does
+/// (`replay::decide`) — by the judges themselves, explicitly: the canary
 /// detector, the posture, the ladder, the copy-on-write guard and the
-/// engine all inside `judged_at(at, ..)`, `at` the event's
-/// `event_time_ns`. The loop's pipeline needs the whole agent, so its
-/// source is pinned (comments left out).
+/// engine are given the event judged, and every lineage lookup they make
+/// takes its time from it (`AsOf::of_event`, `AsOf::judged(<its time>)`).
+/// R12a scoped them with a thread-local around the calls (`judged_at`),
+/// which a call made outside the scope missed (the N6 mutation); there is
+/// no scope any more to miss. What replaces the check:
+/// - the loop gives the five judges the event itself, and no scope;
+/// - the lineage has no thread-local time;
+/// - the judging code (`nn-core`'s decision, posture, canary, impair,
+///   impact, FIM and allowlist modules) names no lookup that is not the
+///   judged event's — `AsOf::Now`, `AsOf::Live`, `image_path(…)` (now),
+///   `image_path_at(…)` (a pump's read) — but the listed ones, each with
+///   its reason: a new one fails here until it is the event's time or
+///   listed. The behaviour is the property test's and the lineage's unit
+///   tests'.
 #[test]
 fn the_event_loop_judges_each_event_as_of_its_time() {
-    let src = include_str!(concat!(
+    let strip = |src: &str| -> String {
+        let code = src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .map_or(src, |end| &src[..end]);
+        code.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let code = strip(include_str!(concat!(
         env!("NN_REPO_ROOT"),
         "/agent/src/pipeline/process_event.rs"
-    ));
-    let code: String = src
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(
-        code.matches("let at = event_time_ns(&event);").count(),
-        1,
-        "the judged time is the event's"
-    );
+    )));
     let calls = [
         ".process_event(&event)",
         "posture.observe(&event",
@@ -1321,21 +1332,85 @@ fn the_event_loop_judges_each_event_as_of_its_time() {
         "engine.decide(&event)",
     ];
     for call in calls {
-        let sites: Vec<usize> = code.match_indices(call).map(|(i, _)| i).collect();
-        assert!(!sites.is_empty(), "process_event.rs: no `{call}`");
-        for i in sites {
-            let scope = code[..i].rfind("judged_at(at, ||");
-            let stmt = code[..i].rfind(';').unwrap_or(0);
-            assert!(
-                scope.is_some_and(|j| j > stmt),
-                "`{call}` at byte {i} is judged outside `judged_at(at, ..)`"
-            );
+        assert!(code.contains(call), "process_event.rs: no `{call}`");
+    }
+    assert!(
+        !code.contains("judged_at") && !code.contains("AsOf::Now") && !code.contains("AsOf::Live"),
+        "process_event.rs scopes no judgement and names no other time"
+    );
+    let lineage = strip(include_str!(concat!(
+        env!("NN_REPO_ROOT"),
+        "/crates/nn-core/src/posture/lineage.rs"
+    )));
+    assert!(
+        !lineage.contains("thread_local!") && !lineage.contains("JUDGED_AT"),
+        "the lineage keeps no time per thread"
+    );
+    // (file under crates/nn-core/src, what, how many, why)
+    const OUTSIDE_THE_EVENT: &[(&str, &str, usize, &str)] = &[(
+        "impair/mod.rs",
+        "AsOf::Now",
+        1,
+        "scan_proc: the security tools' processes running now (the boot's scan, a rescan)",
+    )];
+    const NOT_THE_EVENT: [&str; 6] = [
+        "AsOf::Now",
+        "AsOf::Live",
+        "AsOf::live(",
+        ".image_path(",
+        ".image_path_at(",
+        ".image_at(",
+    ];
+    let root = std::path::Path::new(concat!(env!("NN_REPO_ROOT"), "/crates/nn-core/src"));
+    let mut files = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap().map(|e| e.unwrap().path()) {
+            if e.is_dir() {
+                dirs.push(e);
+            } else if e.extension().is_some_and(|x| x == "rs") {
+                files.push(e);
+            }
         }
     }
+    let judging = [
+        "decision/",
+        "posture/",
+        "canary/",
+        "impair/",
+        "impact/",
+        "fim/rules.rs",
+        "config/comm_allowlist.rs",
+    ];
+    let mut found = Vec::new();
+    for f in &files {
+        let rel = f.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+        let name = f.file_name().unwrap().to_string_lossy().into_owned();
+        if !judging.iter().any(|j| rel.starts_with(j))
+            || rel == "posture/lineage.rs"
+            || name == "tests.rs"
+            || name.ends_with("_tests.rs")
+        {
+            continue;
+        }
+        let code = strip(&std::fs::read_to_string(f).unwrap());
+        for what in NOT_THE_EVENT {
+            let n = code.matches(what).count();
+            if n > 0 {
+                found.push((rel.clone(), what, n));
+            }
+        }
+    }
+    found.sort();
+    let mut listed: Vec<(String, &str, usize)> = OUTSIDE_THE_EVENT
+        .iter()
+        .map(|(f, w, n, _)| (f.to_string(), *w, *n))
+        .collect();
+    listed.sort();
     assert_eq!(
-        code.matches("judged_at(").count(),
-        code.matches("judged_at(at, ||").count(),
-        "every scope is the event's time"
+        found, listed,
+        "a lookup of the judging code that is not as of the judged event: make it the event's \
+         time, or list it with its reason"
     );
 }
 

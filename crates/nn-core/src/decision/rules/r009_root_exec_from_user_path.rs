@@ -44,9 +44,11 @@ impl<H: PostureHost> R009RootExecFromUserPath<H> {
     }
 
     fn sanctioned(&self, pid: u32, exec_ns: u64) -> bool {
-        self.lineage
-            .as_ref()
-            .is_some_and(|l| l.is_interactive_admin(pid) || l.in_package_transaction(pid, exec_ns))
+        self.lineage.as_ref().is_some_and(|l| {
+            // R-F: as of the exec
+            let as_of = crate::posture::lineage::AsOf::judged(exec_ns);
+            l.is_interactive_admin(pid, as_of) || l.in_package_transaction(pid, as_of)
+        })
     }
 }
 

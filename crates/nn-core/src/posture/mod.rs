@@ -485,7 +485,8 @@ impl<H: DecisionHost> PostureMachine<H> {
             let mut ledger = self.inner.corroboration.lock();
             ledger.prune(now);
             if ledger.has_pending() {
-                ledger.resolve_pending(|pid| self.inner.triggers.place_writer(pid));
+                let as_of = crate::posture::lineage::AsOf::of_event(event);
+                ledger.resolve_pending(|pid| self.inner.triggers.place_writer(pid, as_of));
             }
         }
 

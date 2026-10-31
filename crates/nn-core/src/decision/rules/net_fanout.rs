@@ -433,8 +433,9 @@ impl<H: PostureHost> FanoutContext<H> {
         out
     }
 
-    /// `pid` is the agent, or it (or an ancestor) runs a fan-out program.
-    fn is_exempt(&self, pid: u32) -> bool {
+    /// `pid` is the agent, or it (or an ancestor) runs a fan-out program
+    /// — as of `at_ns`, the sample's time (R-F).
+    fn is_exempt(&self, pid: u32, at_ns: u64) -> bool {
         if pid == self.agent_pid {
             return true;
         }
@@ -444,7 +445,9 @@ impl<H: PostureHost> FanoutContext<H> {
         let mut names: Vec<&str> = DEFAULT_FANOUT_EXEMPT.to_vec();
         names.extend(self.config.exempt.iter().map(String::as_str));
         lineage
-            .actor_in_lineage(pid, |id| id.is_client(&names))
+            .actor_in_lineage(pid, crate::posture::lineage::AsOf::judged(at_ns), |id| {
+                id.is_client(&names)
+            })
             .is_some()
     }
 }
@@ -533,7 +536,7 @@ impl<H: PostureHost> Rule for NnLNet026ScanFanOut<H> {
             }
             let exempt = *w
                 .exempt
-                .get_or_insert_with(|| self.ctx.is_exempt(key.pid()));
+                .get_or_insert_with(|| self.ctx.is_exempt(key.pid(), s.ts));
             if exempt {
                 continue;
             }
@@ -637,7 +640,7 @@ impl<H: PostureHost> Rule for NnLNet027OutboundAuthBruteforce<H> {
             }
             let exempt = *w
                 .exempt
-                .get_or_insert_with(|| self.ctx.is_exempt(key.pid()));
+                .get_or_insert_with(|| self.ctx.is_exempt(key.pid(), s.ts));
             if exempt {
                 continue;
             }

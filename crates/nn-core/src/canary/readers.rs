@@ -134,9 +134,12 @@ impl<H: PostureHost> CanaryReaders<H> {
     }
 
     /// The executable (or script) `pid` runs when it is a reader, else
-    /// `None` — also when what it runs cannot be told any more.
-    pub fn reader(&self, pid: u32) -> Option<String> {
-        let id = self.identity.as_ref()?.exec_identity(pid)?;
+    /// `None` — also when what it runs cannot be told any more. As of
+    /// `as_of` (R12b, R-F: the trip's time — a reader that executes
+    /// `restic` after the read is no reader; in a judgement the spawn cache
+    /// only).
+    pub fn reader(&self, pid: u32, as_of: crate::posture::lineage::AsOf) -> Option<String> {
+        let id = self.identity.as_ref()?.exec_identity(pid, as_of)?;
         let mut entries: Vec<&str> = CANARY_READERS.to_vec();
         entries.extend(self.extra.iter().map(String::as_str));
         if !id.is_client(&entries) {
@@ -184,16 +187,36 @@ mod tests {
         );
         t.ingest_spawn_with_argv(4103, 1, "/usr/bin/tar", &["tar".into()], 1);
         let r = CanaryReaders::new(BTreeSet::new(), t);
-        assert_eq!(r.reader(4100).as_deref(), Some("/usr/bin/restic"));
-        assert_eq!(r.reader(4101), None, "a copy outside the system trees");
         assert_eq!(
-            r.reader(4102).as_deref(),
+            r.reader(4100, crate::posture::lineage::AsOf::Now)
+                .as_deref(),
+            Some("/usr/bin/restic")
+        );
+        assert_eq!(
+            r.reader(4101, crate::posture::lineage::AsOf::Now),
+            None,
+            "a copy outside the system trees"
+        );
+        assert_eq!(
+            r.reader(4102, crate::posture::lineage::AsOf::Now)
+                .as_deref(),
             Some("/usr/bin/borg"),
             "a script, by name"
         );
-        assert_eq!(r.reader(4103), None, "tar is the operator's to add");
-        assert_eq!(r.reader(4199), None, "unknown pid");
-        assert_eq!(CanaryReaders::none().reader(4100), None);
+        assert_eq!(
+            r.reader(4103, crate::posture::lineage::AsOf::Now),
+            None,
+            "tar is the operator's to add"
+        );
+        assert_eq!(
+            r.reader(4199, crate::posture::lineage::AsOf::Now),
+            None,
+            "unknown pid"
+        );
+        assert_eq!(
+            CanaryReaders::none().reader(4100, crate::posture::lineage::AsOf::Now),
+            None
+        );
     }
 
     #[test]
@@ -203,8 +226,8 @@ mod tests {
         t.ingest_spawn_with_argv(4201, 1, "/opt/acme-backup/bin/agent", &["agent".into()], 1);
         let extra: BTreeSet<String> = ["tar".to_string(), "/opt/acme-backup/".to_string()].into();
         let r = CanaryReaders::new(extra, t);
-        assert!(r.reader(4200).is_some());
-        assert!(r.reader(4201).is_some());
+        assert!(r.reader(4200, crate::posture::lineage::AsOf::Now).is_some());
+        assert!(r.reader(4201, crate::posture::lineage::AsOf::Now).is_some());
     }
 
     #[test]

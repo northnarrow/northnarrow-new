@@ -89,7 +89,12 @@ impl<H: PostureHost> Rule for NnLIou001IoUringRingCreated<H> {
         else {
             return None;
         };
-        let judgement = judge(&self.allowlist, *pid, comm);
+        let judgement = judge(
+            &self.allowlist,
+            *pid,
+            comm,
+            crate::posture::lineage::AsOf::of_event(event),
+        );
         if judgement == Judgement::Allowed {
             return None;
         }
@@ -152,7 +157,12 @@ impl<H: PostureHost> Rule for NnLIou002IoUringFileAndNetwork<H> {
         if last_class & (FILE_CLASSES | NET_CLASSES) == 0 {
             return None;
         }
-        let judgement = judge(&self.allowlist, *pid, comm);
+        let judgement = judge(
+            &self.allowlist,
+            *pid,
+            comm,
+            crate::posture::lineage::AsOf::of_event(event),
+        );
         if judgement == Judgement::Allowed {
             return None;
         }
@@ -179,8 +189,13 @@ impl<H: PostureHost> Rule for NnLIou002IoUringFileAndNetwork<H> {
 /// External audit NETR-003 class: the known servers and the operator
 /// allowlist judged on what the kernel ran, not on the `comm` a process
 /// names itself.
-fn judge<H: PostureHost>(allowlist: &CommAllowlist<H>, pid: u32, comm: &str) -> Judgement {
-    allowlist.judge_with(pid, comm, KNOWN_IOURING_PROGRAMS)
+fn judge<H: PostureHost>(
+    allowlist: &CommAllowlist<H>,
+    pid: u32,
+    comm: &str,
+    as_of: crate::posture::lineage::AsOf,
+) -> Judgement {
+    allowlist.judge_with(pid, comm, KNOWN_IOURING_PROGRAMS, as_of)
 }
 
 /// The two io_uring rules, sharing the process comm allowlist.

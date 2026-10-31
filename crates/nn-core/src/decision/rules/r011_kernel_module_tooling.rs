@@ -425,6 +425,8 @@ mod tests {
             ppid,
             uid: u,
             argv,
+            timestamp_ns,
+            start_ns,
             ..
         } = &mut e
         {
@@ -432,6 +434,9 @@ mod tests {
             *ppid = 400;
             *u = uid;
             *argv = a;
+            // R12b (R-F): the exec event is the one the lineage holds — its
+            // judgement looks the lineage up as of its own time
+            (*timestamp_ns, *start_ns) = (50, 45);
         }
         e
     }
@@ -471,8 +476,18 @@ mod tests {
             "/usr/sbin/modprobe",
             0,
         );
-        if let Event::ProcessSpawn { pid, ppid, uid, .. } = &mut e {
-            (*pid, *ppid, *uid) = (700, 600, 0);
+        if let Event::ProcessSpawn {
+            pid,
+            ppid,
+            uid,
+            timestamp_ns,
+            start_ns,
+            ..
+        } = &mut e
+        {
+            // R12b (R-F): as of the payload's own exec (70), where apt (60)
+            // is in the lineage — POS-003 alone keeps it from vouching
+            (*pid, *ppid, *uid, *timestamp_ns, *start_ns) = (700, 600, 0, 70, 30);
         }
         let v = shipped_with(t).evaluate(&e).expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcess);

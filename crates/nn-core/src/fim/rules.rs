@@ -2399,10 +2399,10 @@ impl<H: PostureHost> Rule for PackageManaged<H> {
         let Event::Fim(fe) = event else {
             return Some(verdict);
         };
-        if !self
-            .lineage
-            .is_package_transaction_write(fe.modifier_pid, fe.timestamp_ns)
-        {
+        if !self.lineage.is_package_transaction_write(
+            fe.modifier_pid,
+            crate::posture::lineage::AsOf::judged(fe.timestamp_ns),
+        ) {
             return Some(verdict);
         }
         Some(Verdict {
@@ -2476,7 +2476,10 @@ impl<H: PostureHost> Rule for InteractiveAdmin<H> {
         let Event::Fim(fe) = event else {
             return Some(verdict);
         };
-        if !self.lineage.is_interactive_admin(fe.modifier_pid) {
+        if !self.lineage.is_interactive_admin(
+            fe.modifier_pid,
+            crate::posture::lineage::AsOf::judged(fe.timestamp_ns),
+        ) {
             return Some(verdict);
         }
         Some(Verdict {
@@ -2550,7 +2553,10 @@ impl<H: PostureHost> Rule for OwnClient<H> {
         let Event::Fim(fe) = event else {
             return Some(verdict);
         };
-        let identity = self.lineage.exec_identity(fe.modifier_pid);
+        let identity = self.lineage.exec_identity(
+            fe.modifier_pid,
+            crate::posture::lineage::AsOf::judged(fe.timestamp_ns),
+        );
         // A client reading another user's store (`aws` pointed at their
         // credentials file) is theft with the right tool: Q8 still acts.
         if !is_foreign_read(fe)
@@ -2633,7 +2639,10 @@ impl<H: PostureHost> Rule for AccountTool<H> {
         let Event::Fim(fe) = event else {
             return Some(verdict);
         };
-        let Some(id) = self.lineage.exec_identity(fe.modifier_pid) else {
+        let Some(id) = self.lineage.exec_identity(
+            fe.modifier_pid,
+            crate::posture::lineage::AsOf::judged(fe.timestamp_ns),
+        ) else {
             return Some(verdict);
         };
         if !id.is_client(ACCOUNT_TOOLS) {
@@ -5715,7 +5724,7 @@ mod tests {
             (ResponseAction::KillProcess, Severity::High)
         );
         assert!(!v.reasoning.contains("package manager"), "{}", v.reasoning);
-        assert!(lineage.is_system_daemon_mediated(920));
+        assert!(lineage.is_system_daemon_mediated(920, crate::posture::lineage::AsOf::Now));
         assert!(!crate::posture::lineage::PACKAGE_MANAGER_EXES.contains(&"/usr/bin/mandb"));
     }
 
@@ -5756,8 +5765,10 @@ mod tests {
         );
         // apt-get (100) still runs, but the nearest package manager is the
         // finished dpkg: no cover from it.
-        assert!(!lineage.is_package_transaction_write(300, t0 + 120 * s));
-        assert!(lineage.is_package_transaction_write(100, t0 + 120 * s));
+        assert!(!lineage
+            .is_package_transaction_write(300, crate::posture::lineage::AsOf::live(t0 + 120 * s)));
+        assert!(lineage
+            .is_package_transaction_write(100, crate::posture::lineage::AsOf::live(t0 + 120 * s)));
     }
 
     /// NN-AUD-284: a short `dpkg -i` that exited before any walk found it

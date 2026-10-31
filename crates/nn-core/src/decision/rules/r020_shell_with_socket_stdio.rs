@@ -166,7 +166,11 @@ pub fn shape<H: PostureHost>(
             return Some(StdioShellShape::Outbound);
         }
         if *ppid == 1
-            || parent_is_launcher(*ppid, lineage)
+            || parent_is_launcher(
+                *ppid,
+                lineage,
+                crate::posture::lineage::AsOf::of_event(event),
+            )
             || (stdio.parent.stdin_or_stdout_inet() && !stdio.parent.outbound)
         {
             return None;
@@ -176,8 +180,12 @@ pub fn shape<H: PostureHost>(
     (is_shell && stdio.parent.outbound).then_some(StdioShellShape::ParentOutbound)
 }
 
-fn parent_is_launcher<H: PostureHost>(ppid: u32, lineage: Option<&AuthSessionTracker<H>>) -> bool {
-    let Some(id) = lineage.and_then(|l| l.exec_identity(ppid)) else {
+fn parent_is_launcher<H: PostureHost>(
+    ppid: u32,
+    lineage: Option<&AuthSessionTracker<H>>,
+    as_of: crate::posture::lineage::AsOf,
+) -> bool {
+    let Some(id) = lineage.and_then(|l| l.exec_identity(ppid, as_of)) else {
         return false;
     };
     crate::posture::lineage::in_system_tree(&id.exe.to_string_lossy())

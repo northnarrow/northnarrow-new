@@ -80,8 +80,12 @@ pub const NETFLOW_COMM_ALLOWLIST_SHIPPED: Shipped<'static> = Shipped::new(
 
 /// Lab PR 224 (CM-02 d): what a process's lineage holds that revokes a
 /// conditional entry's exemption for it ([`CommAllowlist::with_conditional`]):
-/// `Some(what)` names the precursor, `None` keeps the exemption.
-pub type PrecursorCheck = std::sync::Arc<dyn Fn(u32) -> Option<&'static str> + Send + Sync>;
+/// `Some(what)` names the precursor, `None` keeps the exemption. The
+/// lineage as of the [`crate::posture::lineage::AsOf`] it is given (R12b,
+/// R-F: the judged event's time).
+pub type PrecursorCheck = std::sync::Arc<
+    dyn Fn(u32, crate::posture::lineage::AsOf) -> Option<&'static str> + Send + Sync,
+>;
 
 /// Lab PR 224: the conditional entries and their check.
 #[derive(Clone)]
@@ -245,18 +249,30 @@ impl<H: PostureHost> CommAllowlist<H> {
     /// process in `pid`'s lineage whose exec identity is an entry (as
     /// [`Self::judge_exec`] judges one), on the lineage walk POS-003
     /// orders; its executable. `None` without an identity source (tests,
-    /// the boot-time rule set) or when there is none.
-    pub fn actor_of(&self, pid: u32) -> Option<std::path::PathBuf> {
+    /// the boot-time rule set) or when there is none. The lineage as of
+    /// `as_of` (R12b, R-F: the judged event's time).
+    pub fn actor_of(
+        &self,
+        pid: u32,
+        as_of: crate::posture::lineage::AsOf,
+    ) -> Option<std::path::PathBuf> {
         let tracker = self.identity.as_ref()?;
         let entries: Vec<&str> = self.entries.iter().map(String::as_str).collect();
-        tracker.actor_in_lineage(pid, |id| id.is_client(&entries))
+        tracker.actor_in_lineage(pid, as_of, |id| id.is_client(&entries))
     }
 
     /// [`Self::judge`] with a rule's built-in clients, `known`: program
     /// names matched on the executable alone
     /// ([`crate::posture::lineage::ExecIdentity::is_known_binary`]), and on
-    /// `comm` when the identity cannot be read.
-    pub fn judge_with(&self, pid: u32, comm: &str, known: &[&str]) -> Judgement {
+    /// `comm` when the identity cannot be read. The identity as of `as_of`
+    /// (R12b, R-F: the judged event's time).
+    pub fn judge_with(
+        &self,
+        pid: u32,
+        comm: &str,
+        known: &[&str],
+        as_of: crate::posture::lineage::AsOf,
+    ) -> Judgement {
         let named = self.entries.contains(comm) || known.contains(&comm);
         let Some(tracker) = &self.identity else {
             return if named {
@@ -266,13 +282,13 @@ impl<H: PostureHost> CommAllowlist<H> {
             };
         };
         let entries: Vec<&str> = self.entries.iter().map(String::as_str).collect();
-        match tracker.exec_identity(pid) {
+        match tracker.exec_identity(pid, as_of) {
             Some(id) if id.is_client(&entries) || id.is_known_binary(known) => {
                 // Lab PR 224: a transfer tool is exempt, not what drives it.
                 if let Some(c) = &self.conditional {
                     let names: Vec<&str> = c.names.iter().map(String::as_str).collect();
                     if id.is_client(&names) {
-                        if let Some(precursor) = (c.check)(pid) {
+                        if let Some(precursor) = (c.check)(pid, as_of) {
                             return Judgement::Revoked { precursor };
                         }
                     }
@@ -287,8 +303,8 @@ impl<H: PostureHost> CommAllowlist<H> {
 
     /// How the allowlist applies to process `pid` named `comm`
     /// ([`Judgement`]). Without an identity source, `comm` decides.
-    pub fn judge(&self, pid: u32, comm: &str) -> Judgement {
-        self.judge_with(pid, comm, &[])
+    pub fn judge(&self, pid: u32, comm: &str, as_of: crate::posture::lineage::AsOf) -> Judgement {
+        self.judge_with(pid, comm, &[], as_of)
     }
 
     /// `true` if `comm` is allowlisted. The kernel-reported comm is
@@ -503,21 +519,30 @@ mod tests {
         let known = ["nginx"];
         // no tracker (tests, tools): comm decides, as before
         let bare = CommAllowlist::default();
-        assert_eq!(bare.judge_with(11, "nginx", &known), Judgement::Allowed);
         assert_eq!(
-            bare.judge_with(11, "evil", &known),
+            bare.judge_with(11, "nginx", &known, crate::posture::lineage::AsOf::Now),
+            Judgement::Allowed
+        );
+        assert_eq!(
+            bare.judge_with(11, "evil", &known, crate::posture::lineage::AsOf::Now),
             Judgement::Denied { claimed: false }
         );
         let al = CommAllowlist::default().with_identity(t);
-        assert_eq!(al.judge_with(10, "nginx", &known), Judgement::Allowed);
         assert_eq!(
-            al.judge_with(11, "nginx", &known),
+            al.judge_with(10, "nginx", &known, crate::posture::lineage::AsOf::Now),
+            Judgement::Allowed
+        );
+        assert_eq!(
+            al.judge_with(11, "nginx", &known, crate::posture::lineage::AsOf::Now),
             Judgement::Denied { claimed: true }
         );
         // gone before it was seen: named, so recorded rather than acted on
-        assert_eq!(al.judge_with(12, "nginx", &known), Judgement::Unverified);
         assert_eq!(
-            al.judge_with(12, "evil", &known),
+            al.judge_with(12, "nginx", &known, crate::posture::lineage::AsOf::Now),
+            Judgement::Unverified
+        );
+        assert_eq!(
+            al.judge_with(12, "evil", &known, crate::posture::lineage::AsOf::Now),
             Judgement::Denied { claimed: false }
         );
     }

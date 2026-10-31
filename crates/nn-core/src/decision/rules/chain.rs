@@ -251,7 +251,9 @@ fn package_mediated<H: PostureHost>(
     pid: u32,
     event_ns: u64,
 ) -> bool {
-    lineage.is_some_and(|l| l.in_package_transaction(pid, event_ns))
+    lineage.is_some_and(|l| {
+        l.in_package_transaction(pid, crate::posture::lineage::AsOf::judged(event_ns))
+    })
 }
 
 // ── NN-L-CHAIN-001 — credential read → egress ────────────────────────
