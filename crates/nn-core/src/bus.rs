@@ -1849,10 +1849,11 @@ mod tests {
                 .count()
         };
         assert_eq!(n(&mut cap, map), 3);
-        let other = CapKey {
-            target: CapTarget::Bpf { cmd: 2 },
-            ..map
-        };
+        // another command of the same uid (`BPF_MAP_LOOKUP_ELEM`, 1), keyed
+        // apart by `CapKey::of` itself (the final mutation AN2)
+        let other = CapKey::of(&call(1)).expect("a lookup is counted");
+        assert_eq!(other.target, CapTarget::Bpf { cmd: 1 });
+        assert_ne!(other, map);
         assert_eq!(n(&mut cap, other), 3, "another command: its own allowance");
         let on = |ino: u64| {
             CapKey::of(&Event::FsProtectDenial {
