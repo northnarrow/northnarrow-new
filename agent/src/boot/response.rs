@@ -18,6 +18,9 @@ pub(crate) struct Response {
     /// The exec quarantine's copy of the executor's configuration.
     pub(crate) execq_exec_cfg: ExecutorConfig,
     pub(crate) executor: Executor,
+    /// R12c (lab PR 270): the `actions` chain's writer — every action's
+    /// signed intent and outcome; bound to its log by the stores' phase.
+    pub(crate) journal: northnarrow_agent::response::journal::ActionJournal,
     pub(crate) correlation: CorrelationBuffer,
     pub(crate) isolator: Option<Arc<NetworkIsolator>>,
 }
@@ -129,6 +132,13 @@ pub(crate) fn build(
     // Lab PR 223: the exec quarantine vaults block-listed files.
     let execq_exec_cfg = exec_cfg.clone();
     let executor = Executor::with_config(exec_cfg);
+    // R12c (lab PR 270): no action without a signed record — the journal
+    // every action's ticket comes from (its log opens with the stores).
+    let journal = northnarrow_agent::response::journal::ActionJournal::late();
+    info!(
+        run = journal.run(),
+        "actions journal: this run's id (its rows name it)"
+    );
     // External audit CMB-019: a kill cgroup an earlier agent left in the
     // middle of a kill (its tree frozen) is finished and removed.
     if !detect_only {
@@ -225,6 +235,7 @@ pub(crate) fn build(
         legacy_isolation_removed,
         execq_exec_cfg,
         executor,
+        journal,
         correlation,
         isolator,
     })

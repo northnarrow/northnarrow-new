@@ -73,10 +73,12 @@ impl RulesetOnce {
 }
 
 /// Public entry point used by [`super::Executor::execute`].
+/// R12c (lab PR 270): only for an action whose intent is signed (`_intent`).
 pub fn block_outbound_for_pid(
     pid: u32,
     protected: &HashSet<u32>,
     cfg: &ExecutorConfig,
+    _intent: &super::journal::Intent,
 ) -> ExecutionOutcome {
     if pid == 0 {
         return ExecutionOutcome::Refused {
@@ -361,7 +363,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = cfg_for(&tmp);
         let protected: HashSet<u32> = HashSet::new();
-        let out = block_outbound_for_pid(1234, &protected, &cfg);
+        let out = block_outbound_for_pid(
+            1234,
+            &protected,
+            &cfg,
+            &super::super::journal::test_intent(),
+        );
         assert!(
             matches!(out, ExecutionOutcome::WouldExecute { pid: 1234 }),
             "{out:?}"
@@ -376,7 +383,8 @@ mod tests {
         let cfg = cfg_for(&tmp);
         let mut protected: HashSet<u32> = HashSet::new();
         protected.insert(1);
-        let out = block_outbound_for_pid(1, &protected, &cfg);
+        let out =
+            block_outbound_for_pid(1, &protected, &cfg, &super::super::journal::test_intent());
         assert!(matches!(
             out,
             ExecutionOutcome::Refused {
@@ -550,7 +558,12 @@ mod tests {
         };
         let origin = super::super::containment::origin_of(pid).unwrap();
         assert!(origin.ends_with(&format!("{unit}.service")), "{origin}");
-        let blocked = block_outbound_for_pid(pid, &HashSet::new(), &cfg);
+        let blocked = block_outbound_for_pid(
+            pid,
+            &HashSet::new(),
+            &cfg,
+            &super::super::journal::test_intent(),
+        );
         assert!(
             matches!(blocked, ExecutionOutcome::Blocked { .. }),
             "{blocked:?}"

@@ -167,6 +167,9 @@ pub struct Settings {
     pub exec_cfg: Option<ExecutorConfig>,
     /// The ctime offsets resolved: identities may be cached.
     pub ctime: bool,
+    /// R12c (lab PR 270): its kills and quarantines are actions — each
+    /// one's signed intent before, its outcome after.
+    pub journal: crate::response::journal::ActionJournal,
 }
 
 // ── one held exec ───────────────────────────────────────────────────
@@ -839,17 +842,34 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                     Err(e) => format!("resume failed: {e}"),
                 },
                 Action::Kill if !alive => "already ended".to_string(),
-                Action::Kill => match p.proc_ref.signal(libc::SIGKILL) {
-                    Ok(()) => {
-                        COUNTERS.killed.fetch_add(1, Ordering::Relaxed);
-                        if held {
-                            "killed while held".to_string()
-                        } else {
-                            "killed".to_string()
+                Action::Kill => {
+                    // R12c (lab PR 270): the kill's signed intent first.
+                    let intent = self.intent("KillProcess", pid, &p.path);
+                    match p.proc_ref.signal(libc::SIGKILL) {
+                        Ok(()) => {
+                            COUNTERS.killed.fetch_add(1, Ordering::Relaxed);
+                            let text = if held {
+                                "killed while held".to_string()
+                            } else {
+                                "killed".to_string()
+                            };
+                            intent.finish(
+                                crate::response::journal::ActionResult::Success,
+                                text.clone(),
+                                None,
+                            );
+                            text
+                        }
+                        Err(e) => {
+                            intent.finish(
+                                crate::response::journal::ActionResult::Failure,
+                                "kill failed".to_string(),
+                                Some(e.to_string()),
+                            );
+                            format!("kill failed: {e}")
                         }
                     }
-                    Err(e) => format!("kill failed: {e}"),
-                },
+                }
             }
         };
         if enforce && o.action == Action::Kill && o.quarantine {
@@ -877,7 +897,19 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             Err(e) => return format!("not quarantined ({e})"),
         };
         use crate::response::ExecutionOutcome as X;
-        match crate::response::quarantine::quarantine_handle(&handle, p.raw.pid, cfg) {
+        // R12c (lab PR 270): the quarantine's signed intent first.
+        let intent = self.intent("Quarantine", p.raw.pid, &p.path);
+        let outcome =
+            crate::response::quarantine::quarantine_handle(&handle, p.raw.pid, cfg, &intent);
+        let (result, text, reason) =
+            crate::response::journal_outcome(&crate::response::ExecutionReport {
+                action: nn_model::ResponseAction::Quarantine,
+                primary: outcome.clone(),
+                additional: Vec::new(),
+                elapsed: std::time::Duration::from_micros(1),
+            });
+        intent.finish(result, text, reason);
+        match outcome {
             X::Quarantined { vault_id, .. } => {
                 COUNTERS.quarantined.fetch_add(1, Ordering::Relaxed);
                 format!("quarantined (vault {vault_id})")
@@ -890,6 +922,24 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             X::Failed { errno, .. } => format!("quarantine failed (errno {errno})"),
             other => format!("quarantine: {other:?}"),
         }
+    }
+
+    /// R12c (lab PR 270): the signed intent of one of the exec quarantine's
+    /// actions on `pid` (whose exec of `path` it held).
+    fn intent(&self, response: &str, pid: u32, path: &str) -> crate::response::journal::Intent {
+        let mut i = crate::response::journal::ActionIntent::named("exec_quarantine", response, pid);
+        i.severity = "high".into();
+        i.why = vec![super::RULE_ID.to_string()];
+        let mut d = format!("exec of {path}");
+        if d.len() > 200 {
+            let mut cut = 200;
+            while !d.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            d.truncate(cut);
+        }
+        i.detail = Some(d);
+        self.s.journal.intent(i)
     }
 
     /// The cache, the known digests, the counters and the record.

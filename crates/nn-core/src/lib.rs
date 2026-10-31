@@ -175,6 +175,9 @@ pub mod response {
     // The detect-only gate, the quarantine's cap, the cgroup and nftables
     // names the actions use.
     pub mod config;
+    // R12c (lab PR 270): the response dispatcher's queue (stage 6) — by
+    // severity, in order per process, bounded, never dropping silently.
+    pub mod dispatch;
 }
 
 /// The agent's anti-tamper content (R07, lab PR 247): the COMBAT management

@@ -388,6 +388,9 @@ struct Inner {
     /// and the sources' names by id.
     next_source: AtomicU16,
     sources: Mutex<Vec<&'static str>>,
+    /// R12c (lab PR 270): a [`BusWaker`] asked the receiver's wait to end
+    /// (the dispatcher of slow work has an event ready for the decision).
+    woken: AtomicBool,
 }
 
 impl Inner {
@@ -584,6 +587,7 @@ fn build(specs: [QueueSpec; QUEUES], boot_id: [u8; 16], cap: FloodCap) -> (BusSe
         boot_id,
         next_source: AtomicU16::new(1),
         sources: Mutex::new(vec!["(unnamed)"]),
+        woken: AtomicBool::new(false),
     });
     (
         BusSender {
@@ -1045,6 +1049,19 @@ pub enum Recv {
     Closed,
 }
 
+/// R12c (lab PR 270): ends the receiver's wait ([`BusReceiver::waker`]).
+#[derive(Clone)]
+pub struct BusWaker(Arc<Inner>);
+
+impl BusWaker {
+    /// The receiver's wait ends with [`Recv::Idle`] (at once if it waits,
+    /// at its next wait otherwise).
+    pub fn wake(&self) {
+        self.0.woken.store(true, Ordering::Release);
+        self.0.ready.notify_one();
+    }
+}
+
 /// The lineage taught the execs `r` overtook (lab PR 267).
 fn teach(r: Received, lineage: Option<&AuthSessionTracker>) -> Received {
     if let Some(l) = lineage {
@@ -1102,7 +1119,8 @@ impl BusReceiver {
     /// R12b (lab PR 269): the decision thread's [`Self::recv_with`] — the
     /// next event, waiting at most `wait` (on the runtime's timers, the
     /// calling thread blocked meanwhile). [`Recv::Idle`] when none came,
-    /// [`Recv::Closed`] once every sender is gone and the queues are empty.
+    /// or (R12c, lab PR 270) a [`BusWaker`] ended the wait; [`Recv::Closed`]
+    /// once every sender is gone and the queues are empty.
     pub fn recv_blocking(
         &mut self,
         rt: &tokio::runtime::Handle,
@@ -1112,11 +1130,35 @@ impl BusReceiver {
         if let Some(r) = self.try_recv() {
             return Recv::Event(Box::new(teach(r, lineage)));
         }
-        match rt.block_on(async { tokio::time::timeout(wait, self.recv()).await }) {
-            Ok(Some(r)) => Recv::Event(Box::new(teach(r, lineage))),
+        match rt.block_on(async { tokio::time::timeout(wait, self.recv_or_woken()).await }) {
+            Ok(Some(Some(r))) => Recv::Event(Box::new(teach(r, lineage))),
+            Ok(Some(None)) => Recv::Idle,
             Ok(None) => Recv::Closed,
             Err(_) => Recv::Idle,
         }
+    }
+
+    /// [`Self::recv`], or `Some(None)` as soon as a [`BusWaker`] asks.
+    async fn recv_or_woken(&mut self) -> Option<Option<Received>> {
+        loop {
+            if let Some(r) = self.try_recv() {
+                return Some(Some(r));
+            }
+            if self.inner.senders.load(Ordering::Acquire) == 0 {
+                return self.try_recv().map(Some);
+            }
+            if self.inner.woken.swap(false, Ordering::AcqRel) {
+                return Some(None);
+            }
+            self.inner.ready.notified().await;
+        }
+    }
+
+    /// R12c (lab PR 270): a handle that ends the receiver's current (or
+    /// next) wait — the dispatcher of slow work's, when it hands an event
+    /// back to the decision thread.
+    pub fn waker(&self) -> BusWaker {
+        BusWaker(Arc::clone(&self.inner))
     }
 
     /// The next event if one is queued.
@@ -1371,12 +1413,14 @@ const BUDGET_SLOTS: [u32; 4] = [
 /// pumps' counters have them (`ring_drops`, `reject`), 4 the bus's queues
 /// (`queues`: the drops), 5 the decisions later than their class's budget
 /// from their record's kernel time (R12b, lab PR 269: `queues`' over
-/// budget); 6 to 8 not counted yet — R12c the response and the evidence
-/// writer's queues and the signed `telemetry_loss` rows, R15 the export.
+/// budget); 6 and 7 (R12c, lab PR 270) the response dispatcher's and the
+/// evidence writers' (`dispatch`: `(stage 6, stage 7)`, `None` without a
+/// dispatcher — tests); 8 not counted yet — R15, the export.
 pub fn loss_stages(
     ring: &[(&'static str, u64)],
     rejected: u64,
     queues: &[QueueSnapshot],
+    dispatch: Option<(u64, u64)>,
 ) -> Vec<StageCount> {
     let budget: Vec<&str> = BUDGET_SLOTS
         .iter()
@@ -1426,20 +1470,22 @@ pub fn loss_stages(
         StageCount {
             stage: 6,
             name: "response queue",
-            total: None,
-            source: "not counted yet: R12c",
+            total: dispatch.map(|d| d.0),
+            source: "responses decided and not run: displaced or refused by the full response \
+                     queue, or queued at the stop (each signed in the actions chain)",
         },
         StageCount {
             stage: 7,
             name: "evidence writer queue",
-            total: None,
-            source: "not counted yet: R12c",
+            total: dispatch.map(|d| d.1),
+            source: "detection records dropped or refused, action rows not in their chain, \
+                     canary rows not written",
         },
         StageCount {
             stage: 8,
             name: "export",
             total: None,
-            source: "not counted yet: R12c, the telemetry_loss rows; R15, the export",
+            source: "not counted yet: R15, the export",
         },
     ]
 }
@@ -2421,7 +2467,7 @@ mod tests {
             ("task_denial_rate", 1),
             ("open_sensor", 3),
         ];
-        let st = loss_stages(&ring, 4, &queues);
+        let st = loss_stages(&ring, 4, &queues, None);
         let totals: Vec<(u8, Option<u64>)> = st.iter().map(|s| (s.stage, s.total)).collect();
         assert_eq!(
             totals,
@@ -2436,14 +2482,63 @@ mod tests {
                 (8, None)
             ]
         );
-        assert!(st[4].source.contains("budget") && st[5].source.contains("R12c"));
+        assert!(st[4].source.contains("budget") && st[5].source.contains("not run"));
+        // R12c (lab PR 270): stages 6 and 7, the dispatcher's
+        let st = loss_stages(&ring, 4, &queues, Some((3, 9)));
+        assert_eq!((st[5].stage, st[5].total), (6, Some(3)));
+        assert_eq!((st[6].stage, st[6].total), (7, Some(9)));
+        assert_eq!(st[7].total, None, "the export is R15's");
         queues[1].over_budget = 3;
         queues[3].over_budget = 2;
         assert_eq!(
-            loss_stages(&ring, 4, &queues)[4].total,
+            loss_stages(&ring, 4, &queues, None)[4].total,
             Some(5),
             "the late decisions"
         );
+    }
+
+    /// R12c (lab PR 270): a waker ends the decision's wait at once — the
+    /// wait returns idle, no event lost — and a wake before the wait ends
+    /// the next one.
+    #[test]
+    fn a_waker_ends_the_receiver_s_wait() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = channel();
+        let waker = rx.waker();
+        let w = waker.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            w.wake();
+        });
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            rx.recv_blocking(rt.handle(), None, Duration::from_secs(10)),
+            Recv::Idle
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "woken, not timed out"
+        );
+        t.join().unwrap();
+        // woken before the wait: the next wait ends at once
+        waker.wake();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            rx.recv_blocking(rt.handle(), None, Duration::from_secs(10)),
+            Recv::Idle
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // an event still comes first
+        waker.wake();
+        rt.block_on(tx.send(spawn(1))).unwrap();
+        assert!(matches!(
+            rx.recv_blocking(rt.handle(), None, Duration::from_secs(10)),
+            Recv::Event(_)
+        ));
     }
 
     /// The recorder: a WARN for each sample with drops; P0 signed at once,
@@ -3585,7 +3680,7 @@ mod tests {
             assert_eq!((q.delay_timed, q.delay_untimed, q.over_budget), (2, 1, 1));
             assert!(q.delay_max_us.unwrap() >= 500_000, "{q:?}");
             assert_eq!(q.delay_budget_us, DECISION_BUDGET_NS[0] / 1_000);
-            let stages = loss_stages(&[], 0, &rx.stats().snapshot());
+            let stages = loss_stages(&[], 0, &rx.stats().snapshot(), None);
             assert_eq!((stages[4].stage, stages[4].total), (5, Some(1)));
             let mut rec = LossRecorder::default();
             assert_eq!(rec.late([1, 0, 0, 0]), [(Priority::P0, 1, 1)]);

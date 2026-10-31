@@ -312,6 +312,7 @@ fn world(cfg: ScanConfig, policy: Policy, budget_ms: u64, vault: bool) -> World 
             hung_after: Duration::from_millis(budget_ms),
             exec_cfg: vault.then_some(exec_cfg),
             ctime: true,
+            journal: crate::response::journal::ActionJournal::memory(),
         },
         ledger,
     )

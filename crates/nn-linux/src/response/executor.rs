@@ -11,8 +11,8 @@ use nn_model::ResponseAction;
 use tracing::warn;
 
 use super::{
-    block_outbound, kill, proc_ref::ProcRef, quarantine, throttle, ExecutionOutcome,
-    ExecutionReport, ExecutorConfig,
+    block_outbound, journal::Intent, kill, proc_ref::ProcRef, quarantine, throttle,
+    ExecutionOutcome, ExecutionReport, ExecutorConfig,
 };
 
 /// Hard floor on PIDs we're willing to touch. Anything below this is
@@ -224,14 +224,35 @@ impl Executor {
 
     /// Run a verdict's `action`: [`Self::execute`], except the actions
     /// that act on the verdict's file rather than on its process
-    /// (review 86: [`ResponseAction::StripFileCapability`]).
+    /// (review 86: [`ResponseAction::StripFileCapability`]). R12c (lab PR
+    /// 270): every acting entry point takes the action's [`Intent`] — the
+    /// ticket only a signed intent row gives.
     pub fn execute_for(
         &self,
         action: ResponseAction,
         target_pid: u32,
         filename: &str,
+        intent: &Intent,
     ) -> ExecutionReport {
-        self.execute_for_started(action, target_pid, 0, 0, filename)
+        self.execute_for_started(action, target_pid, 0, 0, filename, intent)
+    }
+
+    /// What a Log decision "runs": nothing — no process captured, no host
+    /// touched (R12c, lab PR 270: not an action, so no intent).
+    pub fn log_report(&self, target_pid: u32) -> ExecutionReport {
+        ExecutionReport {
+            action: ResponseAction::Log,
+            primary: if self.config.dry_run {
+                ExecutionOutcome::WouldExecute { pid: target_pid }
+            } else {
+                ExecutionOutcome::Refused {
+                    pid: target_pid,
+                    reason: "Log action — no execution required",
+                }
+            },
+            additional: Vec::new(),
+            elapsed: Duration::from_micros(1),
+        }
     }
 
     /// [`Self::execute_for`] for the process the verdict's event reported:
@@ -246,14 +267,15 @@ impl Executor {
         start_ns: u64,
         seen_ns: u64,
         filename: &str,
+        intent: &Intent,
     ) -> ExecutionReport {
         if !matches!(action, ResponseAction::StripFileCapability) || self.config.dry_run {
-            return self.execute_started(action, target_pid, start_ns, seen_ns);
+            return self.execute_started(action, target_pid, start_ns, seen_ns, intent);
         }
         let start = Instant::now();
         ExecutionReport {
             action,
-            primary: super::file_caps::strip(filename, target_pid),
+            primary: super::file_caps::strip(filename, target_pid, intent),
             additional: Vec::new(),
             elapsed: clamp_elapsed(start.elapsed()),
         }
@@ -262,12 +284,17 @@ impl Executor {
     /// Review 87: quarantine the binary `handle` holds, which backed `pid`
     /// (already killed; external audit CMB-001: opened before the kill, the
     /// inode itself, not a path). Detect-only reports `WouldExecute`.
-    pub fn quarantine_handle(&self, handle: &quarantine::ExeHandle, pid: u32) -> ExecutionReport {
+    pub fn quarantine_handle(
+        &self,
+        handle: &quarantine::ExeHandle,
+        pid: u32,
+        intent: &Intent,
+    ) -> ExecutionReport {
         let start = Instant::now();
         let primary = if self.config.dry_run {
             ExecutionOutcome::WouldExecute { pid }
         } else {
-            let o = quarantine::quarantine_handle(handle, pid, &self.config);
+            let o = quarantine::quarantine_handle(handle, pid, &self.config, intent);
             self.record_quarantine(pid, &o);
             o
         };
@@ -281,8 +308,13 @@ impl Executor {
 
     /// Run `action` against `target_pid` — the process it names now.
     /// Always returns; never panics.
-    pub fn execute(&self, action: ResponseAction, target_pid: u32) -> ExecutionReport {
-        self.execute_started(action, target_pid, 0, 0)
+    pub fn execute(
+        &self,
+        action: ResponseAction,
+        target_pid: u32,
+        intent: &Intent,
+    ) -> ExecutionReport {
+        self.execute_started(action, target_pid, 0, 0, intent)
     }
 
     /// [`Self::execute`] for the process its event reported: started at
@@ -295,9 +327,10 @@ impl Executor {
         target_pid: u32,
         start_ns: u64,
         seen_ns: u64,
+        intent: &Intent,
     ) -> ExecutionReport {
         let target = Self::capture(&action, target_pid, start_ns, seen_ns);
-        self.execute_on(action, &target)
+        self.execute_on(action, &target, intent)
     }
 
     /// A kill acts on a process captured by its pidfd (external audit
@@ -320,7 +353,12 @@ impl Executor {
     /// Run `action` against the process `target` holds (external audit
     /// CMB-004: the COMBAT ladder captures its offenders when it
     /// attributes them). Always returns; never panics.
-    pub fn execute_on(&self, action: ResponseAction, target: &ProcRef) -> ExecutionReport {
+    pub fn execute_on(
+        &self,
+        action: ResponseAction,
+        target: &ProcRef,
+        intent: &Intent,
+    ) -> ExecutionReport {
         let target_pid = target.pid();
         let start = Instant::now();
         let mut additional: Vec<ExecutionOutcome> = Vec::new();
@@ -431,7 +469,7 @@ impl Executor {
                     pid: target_pid,
                     reason: "Log action — no execution required",
                 },
-                ResponseAction::KillProcess => kill::kill_ref(target, &self.protected),
+                ResponseAction::KillProcess => kill::kill_ref(target, &self.protected, intent),
                 ResponseAction::KillProcessTree => {
                     // The same guard for every pid the walk reaps, not
                     // only for the attributed root (combat-avail-2).
@@ -440,7 +478,8 @@ impl Executor {
                         std::sync::atomic::AtomicU64::new(0);
                     let n = KILL_CGROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let scope = self.config.kill_cgroup_dir(n);
-                    let (p, kids) = kill::kill_tree(target, &self.protected, &spared, Some(&scope));
+                    let (p, kids) =
+                        kill::kill_tree(target, &self.protected, &spared, Some(&scope), intent);
                     additional = kids;
                     p
                 }
@@ -449,6 +488,7 @@ impl Executor {
                         target_pid,
                         &self.protected,
                         &self.config,
+                        intent,
                     );
                     if matches!(o, ExecutionOutcome::Blocked { .. }) && !self.config.dry_run {
                         self.record_contain(target_pid, "blocked");
@@ -464,12 +504,14 @@ impl Executor {
                         target_pid,
                         &self.protected,
                         &self.config,
+                        intent,
                     );
                     self.record_quarantine(target_pid, &o);
                     o
                 }
                 ResponseAction::ThrottleProcess => {
-                    let o = throttle::throttle_pid(target_pid, &self.protected, &self.config);
+                    let o =
+                        throttle::throttle_pid(target_pid, &self.protected, &self.config, intent);
                     if matches!(o, ExecutionOutcome::Throttled { .. }) && !self.config.dry_run {
                         self.record_contain(target_pid, "throttled");
                     }

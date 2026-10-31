@@ -114,6 +114,7 @@ impl AdminHost for AgentAdminHost {
             status_events: det.join("status_events.jsonl"),
             netflow: state_dir.join("netflow.jsonl"),
             fim_drift: state_dir.join("fim_drift.jsonl"),
+            actions: det.join("actions.jsonl"),
         }
     }
 

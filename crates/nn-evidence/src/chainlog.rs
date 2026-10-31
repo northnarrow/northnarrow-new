@@ -783,6 +783,8 @@ impl ProtectionManager for NoProtection {
 pub const FIM_DRIFT_CAP_ENV: &str = "NN_FIM_DRIFT_CAP_BYTES";
 pub const DETECTIONS_CAP_ENV: &str = "NN_DETECTIONS_CAP_BYTES";
 pub const STATUS_EVENTS_CAP_ENV: &str = "NN_STATUS_EVENTS_CAP_BYTES";
+/// R12c (lab PR 270): the `actions` chain's.
+pub const ACTIONS_CAP_ENV: &str = "NN_ACTIONS_CAP_BYTES";
 
 /// Lowest cap an environment override may set. External audit MAIN-004:
 /// any `u64` used to be taken, so a one-line drop-in could rotate the

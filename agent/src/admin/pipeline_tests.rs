@@ -2135,14 +2135,22 @@ fn a_signed_policy_set_applies_at_once_to_the_engine_the_posture_and_the_executo
         }
         let d = engine.decide(e).expect("R020 matches");
         let outcomes: Vec<(ResponseAction, ExecutionOutcome)> = if d.responses.is_empty() {
-            let r = executor.execute(ResponseAction::Log, target);
+            let r = executor.log_report(target);
             vec![(r.action, r.primary)]
         } else {
             d.responses
                 .iter()
                 .map(|r| {
-                    let report =
-                        executor.execute_for_started(r.action.clone(), target, 0, 0, &r.filename);
+                    let report = executor.execute_for_started(
+                        r.action.clone(),
+                        target,
+                        0,
+                        0,
+                        &r.filename,
+                        &crate::response::journal::ActionJournal::memory().intent(
+                            crate::response::journal::ActionIntent::named("test", "test", 0),
+                        ),
+                    );
                     (report.action, report.primary)
                 })
                 .collect()

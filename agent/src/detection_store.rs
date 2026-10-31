@@ -348,10 +348,36 @@ fn errno_text(errno: i32) -> String {
 
 // ── sink + writer ───────────────────────────────────────────────────
 
+/// A record in the queue, with when it was queued (stage 7's wait).
+struct Queued {
+    at: std::time::Instant,
+    record: DetectionRecord,
+}
+
+/// R12c (lab PR 270): stage 7, the evidence writer's queue — its counts
+/// for `nn-admin status` and the signed `telemetry_loss` rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SinkStats {
+    pub capacity: u64,
+    /// Records in it now, and the most it held.
+    pub depth: u64,
+    pub max_depth: u64,
+    /// Records of a response that ran admitted past the capacity (the
+    /// queue full of them), and dropped past twice the capacity.
+    pub over_cap: u64,
+    pub dropped: u64,
+    pub dropped_acted: u64,
+    /// Queue to the chain, the longest (µs), and records appended.
+    pub wait_max_us: u64,
+    pub written: u64,
+    /// Appends the chain refused (the record lost, counted).
+    pub append_failed: u64,
+}
+
 /// Shared state between the [`DetectionSink`] handles and the writer
 /// task.
 struct SinkInner {
-    queue: Mutex<VecDeque<DetectionRecord>>,
+    queue: Mutex<VecDeque<Queued>>,
     notify: Notify,
     /// Last assigned id (seeded from the persisted tail). The next id is
     /// `fetch_add(1) + 1`, so a fresh store hands out `1, 2, 3, …`.
@@ -363,6 +389,13 @@ struct SinkInner {
     /// before.
     drops: Mutex<DropWindow>,
     cap: usize,
+    /// R12c (lab PR 270): stage 7's counts.
+    max_depth: AtomicU64,
+    over_cap: AtomicU64,
+    dropped_acted: AtomicU64,
+    wait_max_us: AtomicU64,
+    written: AtomicU64,
+    append_failed: AtomicU64,
     /// Lab PR 225: the agent's security-tool judge, whose sanction a
     /// security-tool finding's record names (R11c, lab PR 264: given at the
     /// open; it was the process-wide detector `impair::publish` set).
@@ -429,6 +462,18 @@ impl DetectionSink {
     /// severity (external audit NN-AUD-111: a flood of Low verdicts used to
     /// evict a High canary read queued before it); an incoming logged
     /// record of a lower severity than every queued one is dropped itself.
+    ///
+    /// R12c (lab PR 270), stage 7's policy: a record of a response that
+    /// ran is not dropped for another such record while the queue holds
+    /// less than twice its capacity — the queue full of them takes it past
+    /// the capacity (`over_cap`; an acting decision is never held by the
+    /// record budget now, and their rate is the response dispatcher's).
+    /// Past twice the capacity (a writer that stopped writing) the oldest
+    /// goes, counted (`dropped_acted`) and signed as every drop: the
+    /// action's own intent and outcome rows are in the `actions` chain,
+    /// written by the dispatcher, not through this queue — a drop here
+    /// never hides an action, only its detection's context.
+    ///
     /// Each drop is noted for the signed report. Wakes the writer. Holds
     /// the queue lock only for the push — the fsync happens on the writer
     /// task, never here.
@@ -436,33 +481,75 @@ impl DetectionSink {
         {
             let mut q = self.inner.queue.lock();
             if q.len() >= self.inner.cap {
-                self.inner.dropped.fetch_add(1, Ordering::Relaxed);
                 let victim = q
                     .iter()
                     .enumerate()
-                    .filter(|(_, r)| !r.acted())
-                    .min_by_key(|(i, r)| (severity_rank(r.severity), *i))
-                    .map(|(i, r)| (i, severity_rank(r.severity)));
+                    .filter(|(_, r)| !r.record.acted())
+                    .min_by_key(|(i, r)| (severity_rank(r.record.severity), *i))
+                    .map(|(i, r)| (i, severity_rank(r.record.severity)));
                 let gone = match victim {
                     Some((i, rank)) if record.acted() || severity_rank(record.severity) >= rank => {
-                        q.remove(i)
+                        q.remove(i).map(|g| g.record)
                     }
                     Some(_) => None,
                     None if !record.acted() => None,
-                    None => q.pop_front(),
+                    // only records of responses that ran: past the cap,
+                    // up to twice it
+                    None if q.len() < self.inner.cap.saturating_mul(2) => {
+                        self.inner.over_cap.fetch_add(1, Ordering::Relaxed);
+                        q.push_back(Queued {
+                            at: std::time::Instant::now(),
+                            record,
+                        });
+                        self.inner
+                            .max_depth
+                            .fetch_max(q.len() as u64, Ordering::Relaxed);
+                        drop(q);
+                        self.inner.notify.notify_one();
+                        return;
+                    }
+                    None => q.pop_front().map(|g| g.record),
                 };
+                self.inner.dropped.fetch_add(1, Ordering::Relaxed);
                 let mut drops = self.inner.drops.lock();
                 match gone {
-                    Some(r) => drops.note(&r),
+                    Some(r) => {
+                        if r.acted() {
+                            self.inner.dropped_acted.fetch_add(1, Ordering::Relaxed);
+                        }
+                        drops.note(&r)
+                    }
                     None => {
                         drops.note(&record);
                         return;
                     }
                 }
             }
-            q.push_back(record);
+            q.push_back(Queued {
+                at: std::time::Instant::now(),
+                record,
+            });
+            self.inner
+                .max_depth
+                .fetch_max(q.len() as u64, Ordering::Relaxed);
         }
         self.inner.notify.notify_one();
+    }
+
+    /// R12c (lab PR 270): stage 7's counts.
+    pub fn stats(&self) -> SinkStats {
+        let i = &self.inner;
+        SinkStats {
+            capacity: i.cap as u64,
+            depth: i.queue.lock().len() as u64,
+            max_depth: i.max_depth.load(Ordering::Relaxed),
+            over_cap: i.over_cap.load(Ordering::Relaxed),
+            dropped: i.dropped.load(Ordering::Relaxed),
+            dropped_acted: i.dropped_acted.load(Ordering::Relaxed),
+            wait_max_us: i.wait_max_us.load(Ordering::Relaxed),
+            written: i.written.load(Ordering::Relaxed),
+            append_failed: i.append_failed.load(Ordering::Relaxed),
+        }
     }
 
     /// External audit NN-AUD-111: take what was dropped since the last
@@ -641,21 +728,53 @@ impl DetectionSink {
 
     #[cfg(test)]
     fn queue_snapshot(&self) -> Vec<u64> {
-        self.inner.queue.lock().iter().map(|r| r.id).collect()
+        self.inner
+            .queue
+            .lock()
+            .iter()
+            .map(|r| r.record.id)
+            .collect()
+    }
+
+    /// The records queued, oldest first (tests: the dispatcher's).
+    #[cfg(test)]
+    pub(crate) fn queued_for_test(&self) -> Vec<DetectionRecord> {
+        self.inner
+            .queue
+            .lock()
+            .iter()
+            .map(|q| q.record.clone())
+            .collect()
     }
 
     #[cfg(test)]
-    fn for_test(cap: usize, seed_last_id: u64) -> Self {
+    pub(crate) fn for_test(cap: usize, seed_last_id: u64) -> Self {
         DetectionSink {
-            inner: Arc::new(SinkInner {
-                queue: Mutex::new(VecDeque::new()),
-                notify: Notify::new(),
-                last_id: AtomicU64::new(seed_last_id),
-                dropped: AtomicU64::new(0),
-                drops: Mutex::new(DropWindow::default()),
-                cap,
-                defense: None,
-            }),
+            inner: Arc::new(SinkInner::new(cap, seed_last_id, None)),
+        }
+    }
+}
+
+impl SinkInner {
+    fn new(
+        cap: usize,
+        seed_last_id: u64,
+        defense: Option<Arc<crate::impair::DefenseDetector>>,
+    ) -> Self {
+        SinkInner {
+            queue: Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+            last_id: AtomicU64::new(seed_last_id),
+            dropped: AtomicU64::new(0),
+            drops: Mutex::new(DropWindow::default()),
+            cap,
+            max_depth: AtomicU64::new(0),
+            over_cap: AtomicU64::new(0),
+            dropped_acted: AtomicU64::new(0),
+            wait_max_us: AtomicU64::new(0),
+            written: AtomicU64::new(0),
+            append_failed: AtomicU64::new(0),
+            defense,
         }
     }
 }
@@ -686,15 +805,7 @@ pub fn open(
         .with_context(|| format!("opening detection chainlog {}", active_path.display()))?;
     // Seed AFTER open so any torn-tail repair has already run.
     let seed = seed_last_id(active_path);
-    let inner = Arc::new(SinkInner {
-        queue: Mutex::new(VecDeque::new()),
-        notify: Notify::new(),
-        last_id: AtomicU64::new(seed),
-        dropped: AtomicU64::new(0),
-        drops: Mutex::new(DropWindow::default()),
-        cap: queue_cap,
-        defense,
-    });
+    let inner = Arc::new(SinkInner::new(queue_cap, seed, defense));
     let handle = spawn_writer(log, Arc::clone(&inner));
     info!(
         target: "detection_store",
@@ -721,19 +832,26 @@ fn spawn_writer(
             inner.notify.notified().await;
             // Drain everything queued so far under a brief lock; append
             // (and fsync) outside the lock so producers never wait on I/O.
-            let batch: Vec<DetectionRecord> = {
+            let batch: Vec<Queued> = {
                 let mut q = inner.queue.lock();
                 q.drain(..).collect()
             };
-            for record in batch {
+            for Queued { at, record } in batch {
                 let id = record.id;
+                // R12c (lab PR 270): stage 7's wait, queue to chain
+                inner
+                    .wait_max_us
+                    .fetch_max(at.elapsed().as_micros() as u64, Ordering::Relaxed);
                 if let Err(e) = log.append(record) {
+                    inner.append_failed.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         target: "detection_store",
                         error = %e,
                         id,
                         "detection chainlog append failed (record lost)",
                     );
+                } else {
+                    inner.written.fetch_add(1, Ordering::Relaxed);
                 }
             }
             // Surface backpressure drops once per change, off the hot path.
@@ -1495,7 +1613,7 @@ mod tests {
             evidence.clone(),
             0,
         );
-        let record = sink.inner.queue.lock().pop_front().unwrap();
+        let record = sink.inner.queue.lock().pop_front().unwrap().record;
         assert_eq!(record.execq.as_ref(), Some(&evidence));
         assert_eq!(record.mitre.technique, ["T1204.002"]);
         assert_eq!(record.mitre.tactic, ["TA0002"]);
@@ -1969,13 +2087,15 @@ mod tests {
 
     #[test]
     fn enqueue_drops_oldest_when_full() {
-        // cap = 2, no writer draining: pushing 3 records must drop the
-        // OLDEST (id 1) and keep the two freshest (ids 2, 3).
+        // cap = 2, no writer draining: pushing 3 logged records must drop
+        // the OLDEST (id 1) and keep the two freshest (ids 2, 3).
         let sink = DetectionSink::for_test(2, 0);
+        let mut logged = sample_verdict();
+        logged.action = ResponseAction::Log;
         for _ in 0..3 {
             sink.record_rule(
                 &sample_event(),
-                &sample_verdict(),
+                &logged,
                 &[],
                 PostureKind::Observing,
                 "none".to_string(),
@@ -1984,6 +2104,37 @@ mod tests {
         }
         assert_eq!(sink.queue_snapshot(), vec![2, 3], "freshest two retained");
         assert_eq!(sink.dropped(), 1, "exactly one (oldest) dropped");
+    }
+
+    /// R12c (lab PR 270), stage 7: records of responses that ran are taken
+    /// past the capacity (up to twice it), then the oldest goes — counted,
+    /// and the counts are stage 7's.
+    #[test]
+    fn records_of_actions_go_past_the_capacity_then_the_oldest_is_dropped() {
+        let sink = DetectionSink::for_test(2, 0);
+        for _ in 0..5 {
+            sink.record_rule(
+                &sample_event(),
+                &sample_verdict(),
+                &[],
+                PostureKind::Observing,
+                "KillProcess".to_string(),
+                0,
+            );
+        }
+        assert_eq!(sink.queue_snapshot(), vec![2, 3, 4, 5]);
+        let s = sink.stats();
+        assert_eq!(
+            (
+                s.capacity,
+                s.depth,
+                s.max_depth,
+                s.over_cap,
+                s.dropped,
+                s.dropped_acted
+            ),
+            (2, 4, 4, 2, 1, 1)
+        );
     }
 
     /// Review 75: a flood of logged verdicts must not evict the record of
@@ -2014,9 +2165,12 @@ mod tests {
         assert_eq!(sink.queue_snapshot(), vec![1, 3, 5]);
         push(&logged, "none"); // 6: only kills queued → 6 is dropped
         assert_eq!(sink.queue_snapshot(), vec![1, 3, 5]);
-        push(&kill, "KillProcess"); // 7: only kills → the oldest goes
-        assert_eq!(sink.queue_snapshot(), vec![3, 5, 7]);
-        assert_eq!(sink.dropped(), 4);
+        // R12c (lab PR 270), stage 7: only kills queued — the kill goes
+        // past the capacity (up to twice it), none of them dropped
+        push(&kill, "KillProcess"); // 7
+        assert_eq!(sink.queue_snapshot(), vec![1, 3, 5, 7]);
+        assert_eq!(sink.dropped(), 3);
+        assert_eq!(sink.stats().over_cap, 1);
     }
 
     /// External audit NN-AUD-111: among logged-only records a full queue
@@ -2094,7 +2248,9 @@ mod tests {
         };
         sink.report_drops(Some(&log));
         assert!(entries().is_empty(), "no drops, no entry");
-        for _ in 0..5 {
+        // R12c (lab PR 270): kills go past the capacity, up to twice it
+        // (4): the next three drop the oldest three
+        for _ in 0..7 {
             push();
         }
         sink.report_drops(Some(&log));
@@ -2179,7 +2335,7 @@ mod tests {
         let q = sink.inner.queue.lock();
         let lines: Vec<String> = q
             .iter()
-            .map(|r| serde_json::to_string(r).unwrap())
+            .map(|r| serde_json::to_string(&r.record).unwrap())
             .collect();
         assert!(!lines[0].contains("suppressed_before"));
         assert!(lines[1].ends_with(",\"suppressed_before\":7}"));
@@ -2418,7 +2574,13 @@ mod tests {
         guarded.set_tree_guard(std::sync::Arc::new(move |p: u32| {
             (p == pid).then_some("ssh-service(sshd)")
         }));
-        let r = guarded.execute(ResponseAction::KillProcess, pid);
+        let r = guarded.execute(
+            ResponseAction::KillProcess,
+            pid,
+            &crate::response::journal::ActionJournal::memory().intent(
+                crate::response::journal::ActionIntent::named("test", "test", 0),
+            ),
+        );
         assert_eq!(
             describe_response(&r),
             "KillProcess (refused: ssh-service(sshd))"
@@ -2429,12 +2591,24 @@ mod tests {
         );
 
         let exec = Executor::with_config(cfg);
-        let r = exec.execute(ResponseAction::KillProcess, pid);
+        let r = exec.execute(
+            ResponseAction::KillProcess,
+            pid,
+            &crate::response::journal::ActionJournal::memory().intent(
+                crate::response::journal::ActionIntent::named("test", "test", 0),
+            ),
+        );
         assert_eq!(describe_response(&r), "KillProcess");
         assert_eq!(sleeper.wait().unwrap().signal(), Some(libc::SIGKILL));
 
         // A PID above any pid_max: nothing to kill.
-        let r = exec.execute(ResponseAction::KillProcess, 999_999_999);
+        let r = exec.execute(
+            ResponseAction::KillProcess,
+            999_999_999,
+            &crate::response::journal::ActionJournal::memory().intent(
+                crate::response::journal::ActionIntent::named("test", "test", 0),
+            ),
+        );
         assert_eq!(describe_response(&r), "KillProcess (already gone)");
     }
 

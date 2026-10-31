@@ -18,6 +18,9 @@ pub use nn_core::response::config;
 pub mod containment;
 pub mod executor;
 pub mod file_caps;
+// R12c (lab PR 270): no action without a signed record — the actions
+// chain's writer and the ticket an action needs.
+pub mod journal;
 pub mod kill;
 pub mod network_isolation;
 pub mod proc_ref;
@@ -106,6 +109,90 @@ pub struct ExecutionReport {
     pub primary: ExecutionOutcome,
     pub additional: Vec<ExecutionOutcome>,
     pub elapsed: Duration,
+}
+
+/// R12c (lab PR 270): an action's report as its signed outcome — the
+/// result, the report as text, and why when it is not a success. A kill
+/// tree that left a descendant running (not killed, spared, beyond a walk
+/// cut short) is a partial success.
+pub fn journal_outcome(
+    report: &ExecutionReport,
+) -> (journal::ActionResult, String, Option<String>) {
+    use journal::ActionResult as R;
+    let (mut result, mut reason) = match &report.primary {
+        ExecutionOutcome::Killed { .. }
+        | ExecutionOutcome::Blocked { .. }
+        | ExecutionOutcome::Quarantined { .. }
+        | ExecutionOutcome::CapabilityStripped { .. } => (R::Success, None),
+        ExecutionOutcome::Throttled {
+            cpu_max_pct,
+            io_weight,
+            memory_high_bytes,
+            ..
+        } => {
+            if cpu_max_pct.is_some() && io_weight.is_some() && memory_high_bytes.is_some() {
+                (R::Success, None)
+            } else {
+                (
+                    R::Partial,
+                    Some("a limit could not be set (read back none)".to_string()),
+                )
+            }
+        }
+        ExecutionOutcome::WouldExecute { .. } => (
+            R::WouldExecute,
+            Some("detect-only: approved, not enforced".to_string()),
+        ),
+        ExecutionOutcome::AlreadyGone { .. } => {
+            (R::NotRun, Some("the target was already gone".to_string()))
+        }
+        ExecutionOutcome::Refused { reason, .. } => (R::Failure, Some((*reason).to_string())),
+        ExecutionOutcome::PermissionDenied { errno, .. } => (
+            R::Failure,
+            Some(format!(
+                "permission denied: {}",
+                std::io::Error::from_raw_os_error(*errno)
+            )),
+        ),
+        ExecutionOutcome::Failed { errno, .. } => (
+            R::Failure,
+            Some(if *errno == libc::ETIMEDOUT {
+                "still running after the kill's wait".to_string()
+            } else if *errno == 0 {
+                "failed".to_string()
+            } else {
+                std::io::Error::from_raw_os_error(*errno).to_string()
+            }),
+        ),
+        ExecutionOutcome::TreeTruncated { limit, .. } => (
+            R::Partial,
+            Some(format!("the tree walk stopped at {limit} descendants")),
+        ),
+    };
+    let mut text = format!("{:?}", report.primary);
+    if !report.additional.is_empty() {
+        let left = report
+            .additional
+            .iter()
+            .filter(|o| {
+                !matches!(
+                    o,
+                    ExecutionOutcome::Killed { .. }
+                        | ExecutionOutcome::AlreadyGone { .. }
+                        | ExecutionOutcome::WouldExecute { .. }
+                )
+            })
+            .count();
+        text.push_str(&format!(
+            "; {} descendant(s), {left} not contained",
+            report.additional.len()
+        ));
+        if left > 0 && result == R::Success {
+            result = R::Partial;
+            reason = Some(format!("{left} descendant(s) not contained"));
+        }
+    }
+    (result, text, reason)
 }
 
 /// Reviews 86 and 87: the host's view of `path`, for a response that

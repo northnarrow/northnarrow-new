@@ -376,6 +376,18 @@ pub(crate) struct Cli {
     )]
     pub(crate) status_events_file: PathBuf,
 
+    /// R12c (lab PR 270): configurable path of the signed `actions` chain —
+    /// every response's intent before it acts and its outcome after
+    /// (default `/var/lib/northnarrow/detections/actions.jsonl`, sibling of
+    /// the detection log). Same per-test override rationale as
+    /// `--detections-file`.
+    #[arg(
+        long = "actions-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::response::journal::DEFAULT_ACTIONS_LOG_PATH,
+    )]
+    pub(crate) actions_file: PathBuf,
+
     /// Tappa 9.5 K2 / K6: configurable path of the chained canary
     /// registry log. Tests override this to a tempdir so each test
     /// run gets a fresh chain. Missing file means an empty registry
@@ -852,6 +864,7 @@ impl Cli {
                 p.status_events,
                 p.netflow,
                 p.fim_drift,
+                p.actions,
                 self.fim_baseline_file.clone(),
                 self.netflow_listeners_file.clone(),
             ],
@@ -896,6 +909,7 @@ impl Cli {
             status_events: self.status_events_file.clone(),
             netflow: self.netflow_file.clone(),
             fim_drift: self.fim_drift_file.clone(),
+            actions: self.actions_file.clone(),
         }
     }
 
@@ -1047,6 +1061,7 @@ mod tests {
                 "/etc/northnarrow/audit.log",
                 "/var/lib/northnarrow/canaries.jsonl",
                 "/var/lib/northnarrow/canary_access.jsonl",
+                "/var/lib/northnarrow/detections/actions.jsonl",
                 "/var/lib/northnarrow/detections/detections.jsonl",
                 "/var/lib/northnarrow/detections/status_events.jsonl",
                 "/var/lib/northnarrow/fim_baseline.jsonl",
@@ -1082,6 +1097,7 @@ mod tests {
             ("--chain-heads-file", "h/chain_heads.json"),
             ("--detections-file", "c/detections.jsonl"),
             ("--status-events-file", "c/status_events.jsonl"),
+            ("--actions-file", "c/actions.jsonl"),
             ("--netflow-file", "c/netflow.jsonl"),
             ("--netflow-listeners-file", "c/netflow_listeners.jsonl"),
             ("--fim-baseline-file", "f/fim_baseline.jsonl"),
@@ -1094,7 +1110,8 @@ mod tests {
         let cli = Cli::try_parse_from(&args).expect("a test's command line");
         let ids = cli.identity_paths();
         assert_eq!(ids.heads, d.join("h/chain_heads.json"));
-        assert_eq!(ids.chains.len(), 9);
+        // R12c (lab PR 270): the actions chain is the tenth
+        assert_eq!(ids.chains.len(), 10);
         assert!(
             ids.chains.iter().all(|c| c.starts_with(&d)),
             "{:?}",

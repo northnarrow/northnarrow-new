@@ -647,7 +647,12 @@ fn detect_only_rows_name_the_trigger_and_offender_and_nothing_acts() {
     assert!(exec.config().dry_run, "for_test is detect-only");
     let log = SignedLog::new();
     let ladder = Arc::new(CombatLadder::new(
-        Box::new(super::SystemActuator::new(exec, None, true)),
+        Box::new(super::SystemActuator::new(
+            exec,
+            None,
+            true,
+            crate::response::journal::ActionJournal::memory(),
+        )),
         log.evidence(),
         Box::new(NoProtectedProcs),
         LadderConfig::default(),

@@ -324,7 +324,14 @@ pub struct AdminHandles {
     /// Lab PR 267 (R12a): the event bus's counts per queue, for the signed
     /// status (`None`: no bus — tests).
     pub event_bus: Option<crate::sensors::bus::BusStats>,
+    /// R12c (lab PR 270): stages 6 and 7 — the response dispatcher, the
+    /// actions chain, the evidence writer's queue (`None`: none — tests).
+    pub response_dispatch: Option<ResponseDispatchSource>,
 }
+
+/// R12c (lab PR 270): where the status reads stages 6 and 7.
+pub type ResponseDispatchSource =
+    Arc<dyn Fn() -> nn_proto::admin_protocol::ResponseDispatchStatus + Send + Sync>;
 
 /// External audit NN-AUD-082 — the files the read verbs serve, from the
 /// agent's command line (`--fim-drift-file`, `--netflow-file`,

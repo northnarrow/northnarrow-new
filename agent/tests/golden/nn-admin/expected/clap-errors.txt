@@ -3524,7 +3524,7 @@ exit: 2
 (empty)
 --- stderr
 | error: invalid value 'journal' for '--log <LOG>'
-|   [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, all]
+|   [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, actions, all]
 |
 | For more information, try '--help'.
 
@@ -3535,7 +3535,7 @@ exit: 2
 (empty)
 --- stderr
 | error: invalid value 'Audit' for '--log <LOG>'
-|   [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, all]
+|   [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, actions, all]
 |
 |   tip: a similar value exists: 'audit'
 |

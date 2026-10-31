@@ -174,9 +174,30 @@ impl Recorder for SinkRecorder {
             return;
         };
         let uid = crate::detection_payload::Principal::from_event(&rec.event).uid;
-        let admit = crate::detection_budget::admit(RULE_ID, uid, || {
-            crate::detection_payload::held_sample(&rec.event)
-        });
+        // R12c (lab PR 270; plan §3.4): a kill or a quarantine is an action —
+        // its record is never held by the budget (its line is).
+        let admit = if rec.verdict.action != nn_model::ResponseAction::Log {
+            let a = crate::detection_budget::admit_acted(RULE_ID, uid);
+            if !a.lines {
+                sink.record_execq(
+                    &rec.event,
+                    &rec.verdict,
+                    (self.posture)(),
+                    rec.response,
+                    &rec.attack,
+                    rec.evidence,
+                    a.suppressed_before,
+                );
+                return;
+            }
+            crate::detection_budget::Admit::Record {
+                suppressed_before: a.suppressed_before,
+            }
+        } else {
+            crate::detection_budget::admit(RULE_ID, uid, || {
+                crate::detection_payload::held_sample(&rec.event)
+            })
+        };
         if let crate::detection_budget::Admit::Record { suppressed_before } = admit {
             warn!(
                 rule = RULE_ID,

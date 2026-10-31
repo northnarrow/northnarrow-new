@@ -1,0 +1,504 @@
+//! R12c (lab PR 270): the response dispatcher — every action path writes
+//! its signed intent before the action and its outcome after; the decision
+//! never waits; a full queue never drops silently; the stop answers what is
+//! left.
+
+use std::time::{Duration, Instant};
+
+use nn_core::decision::combine::{Applied, Response, RuleMatch};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
+use northnarrow_agent::decision::combine::Decision;
+use northnarrow_agent::detection_store::{DetectionRecord, DetectionSink};
+use northnarrow_agent::response::journal::{ActionJournal, ActionResult, ActionRow};
+use northnarrow_agent::response::{Executor, ExecutorConfig};
+
+use super::*;
+
+fn event(pid: u32) -> Event {
+    Event::ProcessSpawn {
+        pid,
+        ppid: 1,
+        uid: 1000,
+        gid: 1000,
+        comm: "payload".to_string(),
+        filename: "/tmp/payload".to_string(),
+        timestamp_ns: 123,
+        argv: Vec::new(),
+        parent_comm: String::new(),
+        parent_start_ns: 0,
+        start_ns: 0,
+        parent_is_kthread: false,
+        exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
+        stdio: Default::default(),
+    }
+}
+
+fn verdict(rule: &str, action: ResponseAction, severity: Severity, pid: u32) -> Verdict {
+    Verdict {
+        rule_id: rule.to_string(),
+        rule_name: rule.to_string(),
+        category: "test".to_string(),
+        action,
+        severity,
+        reasoning: "test".to_string(),
+        event_pid: pid,
+        event_filename: "/tmp/payload".to_string(),
+        timestamp_ns: 123,
+    }
+}
+
+/// A decision of `rule` (leaked: the engine's rule ids are static) running
+/// `action` on `pid`, of `severity`.
+fn decided(rule: &str, action: ResponseAction, severity: Severity, pid: u32) -> Arc<Decided> {
+    let rule: &'static str = Box::leak(rule.to_string().into_boxed_str());
+    let v = verdict(rule, action.clone(), severity, pid);
+    let decision = Decision {
+        verdict: v.clone(),
+        primary: 0,
+        matches: vec![RuleMatch {
+            index: 0,
+            rule_id: rule,
+            attack: &[],
+            verdict: v,
+            applied: Applied::Builtin,
+            held: None,
+            held_action: None,
+            builtin_action: action.clone(),
+            switch_held: false,
+        }],
+        responses: vec![Response {
+            action,
+            pid,
+            filename: "/tmp/payload".to_string(),
+            timestamp_ns: 123,
+            rule_id: rule,
+            also: Vec::new(),
+        }],
+    };
+    Decided::new(
+        event(pid),
+        decision,
+        nn_model::posture_types::PostureKind::Observing,
+        0,
+        true,
+    )
+}
+
+fn dispatcher(dry_run: bool, cap: usize) -> (Dispatcher, ActionJournal, DetectionSink) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ExecutorConfig::for_test(tmp.path());
+    cfg.dry_run = dry_run;
+    // the config's paths stay valid for the test's life
+    std::mem::forget(tmp);
+    let journal = ActionJournal::memory();
+    let sink = DetectionSink::for_test(4096, 0);
+    let d = Dispatcher::start_with(
+        Executor::with_config(cfg),
+        journal.clone(),
+        Followups {
+            sink: Some(sink.clone()),
+            cow: northnarrow_agent::cow::CowGuard::off_for_test(),
+        },
+        None,
+        cap,
+    );
+    (d, journal, sink)
+}
+
+fn submit_one(d: &Dispatcher, x: &Arc<Decided>) {
+    d.submit(ResponseJob::of(x, None, 0, 0));
+}
+
+/// The rows of one action: its intent, then its outcome, in this run.
+fn pairs(
+    rows: &[northnarrow_agent::response::journal::ActionRecord],
+) -> Vec<(u64, String, ActionResult)> {
+    let mut out = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        if r.row != ActionRow::Intent {
+            continue;
+        }
+        let o = rows[i..]
+            .iter()
+            .find(|o| o.row == ActionRow::Outcome && o.action == r.action && o.run == r.run)
+            .unwrap_or_else(|| panic!("intent {} has no outcome after it: {rows:#?}", r.action));
+        out.push((
+            r.action,
+            r.intent.as_ref().unwrap().response.clone(),
+            o.outcome.as_ref().unwrap().result,
+        ));
+    }
+    out
+}
+
+/// Every acting response a decision can run goes through the dispatcher
+/// with its intent row written before the action and its outcome after,
+/// and the decision's detection record follows its outcome. Detect-only:
+/// approved, not enforced — the rows say so.
+#[test]
+fn every_rule_response_writes_its_intent_then_its_outcome() {
+    let (d, journal, sink) = dispatcher(true, 64);
+    let actions = [
+        ResponseAction::KillProcess,
+        ResponseAction::KillProcessTree,
+        ResponseAction::BlockOutbound,
+        ResponseAction::Quarantine,
+        ResponseAction::ThrottleProcess,
+        ResponseAction::StripFileCapability,
+    ];
+    for (i, a) in actions.iter().enumerate() {
+        submit_one(
+            &d,
+            &decided(
+                &format!("NN-L-T-{i}"),
+                a.clone(),
+                Severity::High,
+                5000 + i as u32,
+            ),
+        );
+    }
+    d.stop(Duration::from_secs(5));
+    let rows = journal.rows();
+    let p = pairs(&rows);
+    assert_eq!(p.len(), actions.len(), "{rows:#?}");
+    for a in &actions {
+        assert!(p.iter().any(|(_, r, _)| r == &format!("{a:?}")), "{a:?}");
+    }
+    assert!(p
+        .iter()
+        .all(|(_, _, result)| *result == ActionResult::WouldExecute));
+    // every intent before its own outcome, and each record written after
+    let records: Vec<DetectionRecord> = sink.queued_for_test();
+    assert_eq!(records.len(), actions.len());
+    assert!(
+        records.iter().all(|r| r.response.contains("detect-only")),
+        "{records:#?}"
+    );
+    let st = d.status();
+    assert_eq!(
+        (st.executed, st.journal.intents, st.journal.outcomes),
+        (6, 6, 6)
+    );
+    assert_eq!(st.journal.in_flight, 0);
+    assert_eq!(st.queue.lost(), 0);
+}
+
+/// A real kill (a child of the test, no privilege needed): intent, the
+/// SIGKILL, the outcome `success`; the record says the kill ran.
+#[test]
+fn a_kill_runs_between_its_intent_and_its_outcome() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (d, journal, sink) = dispatcher(false, 64);
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-KILL",
+            ResponseAction::KillProcess,
+            Severity::Critical,
+            pid,
+        ),
+    );
+    d.stop(Duration::from_secs(5));
+    assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    let rows = journal.rows();
+    assert_eq!(
+        rows.iter().map(|r| r.row).collect::<Vec<_>>(),
+        [ActionRow::Intent, ActionRow::Outcome]
+    );
+    let i = rows[0].intent.as_ref().unwrap();
+    assert_eq!(
+        (i.response.as_str(), i.pid, i.severity.as_str()),
+        ("KillProcess", pid, "critical")
+    );
+    assert_eq!(i.why, ["NN-L-T-KILL"]);
+    assert_eq!(
+        rows[1].outcome.as_ref().unwrap().result,
+        ActionResult::Success
+    );
+    assert_eq!(sink.queued_for_test()[0].response, "KillProcess");
+}
+
+/// The decision never waits for the executor: with the dispatcher's thread
+/// stalled, a flood of submissions returns at once — the queue takes what
+/// fits, a more severe response displaces a less severe one, the rest is
+/// refused — and every response not run is answered (its record says so),
+/// counted per severity and signed in an overflow row. None is dropped
+/// silently: queued + not run = submitted.
+#[test]
+fn the_decision_never_waits_and_a_full_queue_drops_nothing_silently() {
+    let (d, journal, sink) = dispatcher(true, 8);
+    let hold = d.shared.hold.lock();
+    // the thread takes the first job and stalls on the hold
+    submit_one(
+        &d,
+        &decided("NN-L-T-0", ResponseAction::KillProcess, Severity::Low, 7000),
+    );
+    let t0 = Instant::now();
+    while d.status().queue.taken == 0 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the thread took nothing"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let started = Instant::now();
+    for i in 1..=50u32 {
+        let sev = if i % 10 == 0 {
+            Severity::Critical
+        } else {
+            Severity::Low
+        };
+        submit_one(
+            &d,
+            &decided(
+                &format!("NN-L-T-{i}"),
+                ResponseAction::KillProcess,
+                sev,
+                7000 + i,
+            ),
+        );
+    }
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(500),
+        "50 submissions took {took:?}"
+    );
+    let st = d.status();
+    assert_eq!(st.queue.depth.iter().sum::<u64>(), 8, "full");
+    // 45 Low + 5 Critical: the Criticals displaced Lows, the rest refused
+    assert_eq!(st.queue.displaced, [5, 0, 0, 0]);
+    assert_eq!(st.queue.refused, [37, 0, 0, 0]);
+    // the 42 not run are answered at once: their records are written
+    let not_run = sink.queued_for_test();
+    assert_eq!(not_run.len(), 42);
+    assert!(
+        not_run.iter().all(|r| r.response.contains("not run")),
+        "{not_run:#?}"
+    );
+    drop(hold);
+    d.stop(Duration::from_secs(5));
+    let st = d.status();
+    assert_eq!(st.executed, 9, "the one taken and the eight queued ran");
+    assert_eq!(st.queue.submitted, 51);
+    assert_eq!(st.queue.queued + st.queue.merged + st.queue.lost(), 51 + 5);
+    let records = sink.queued_for_test();
+    assert_eq!(records.len(), 51, "every decision has its record");
+    // the overflow row names them, signed
+    let rows = journal.rows();
+    let over: Vec<_> = rows
+        .iter()
+        .filter(|r| r.row == ActionRow::Overflow)
+        .collect();
+    assert!(!over.is_empty(), "{rows:#?}");
+    let o = over[0].overflow.as_ref().unwrap();
+    assert_eq!(o.displaced, [5, 0, 0, 0]);
+    assert_eq!(o.refused, [37, 0, 0, 0]);
+    assert_eq!(o.total, 42);
+    assert!(!o.samples.is_empty());
+    assert_eq!(pairs(&rows).len(), 9);
+}
+
+/// A later response for the same process never overtakes an earlier one:
+/// a Low throttle then a Critical kill of the same pid run in that order,
+/// both before another process's High block that was queued between them.
+#[test]
+fn a_process_s_responses_run_in_the_order_they_were_decided() {
+    let (d, journal, _sink) = dispatcher(true, 64);
+    let hold = d.shared.hold.lock();
+    submit_one(
+        &d,
+        &decided("NN-L-T-A", ResponseAction::Log, Severity::Low, 8000),
+    );
+    let t0 = Instant::now();
+    while d.status().queue.taken == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-B",
+            ResponseAction::ThrottleProcess,
+            Severity::Low,
+            8001,
+        ),
+    );
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-C",
+            ResponseAction::BlockOutbound,
+            Severity::High,
+            8002,
+        ),
+    );
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-D",
+            ResponseAction::KillProcess,
+            Severity::Critical,
+            8001,
+        ),
+    );
+    drop(hold);
+    d.stop(Duration::from_secs(5));
+    let order: Vec<(String, u32)> = journal
+        .rows()
+        .iter()
+        .filter(|r| r.row == ActionRow::Intent)
+        .map(|r| {
+            let i = r.intent.as_ref().unwrap();
+            (i.response.clone(), i.pid)
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            ("Log".to_string(), 8000),
+            ("ThrottleProcess".to_string(), 8001),
+            ("KillProcess".to_string(), 8001),
+            ("BlockOutbound".to_string(), 8002),
+        ]
+    );
+}
+
+/// The stop: what is still queued past its wait is answered "not run: the
+/// agent stopped", counted and signed in an overflow row — never left
+/// unanswered.
+#[test]
+fn the_stop_answers_what_it_could_not_run() {
+    let (d, journal, sink) = dispatcher(true, 64);
+    let hold = d.shared.hold.lock();
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-0",
+            ResponseAction::KillProcess,
+            Severity::High,
+            9000,
+        ),
+    );
+    let t0 = Instant::now();
+    while d.status().queue.taken == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for i in 1..5u32 {
+        submit_one(
+            &d,
+            &decided(
+                &format!("NN-L-T-{i}"),
+                ResponseAction::KillProcess,
+                Severity::High,
+                9000 + i,
+            ),
+        );
+    }
+    // the stop waits 50 ms while the thread is held, then answers the rest
+    let stopper = {
+        let d = d.clone();
+        std::thread::spawn(move || d.stop(Duration::from_millis(50)))
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    drop(hold);
+    stopper.join().unwrap();
+    let st = d.status();
+    assert_eq!((st.executed, st.not_run_at_stop), (1, 4), "{st:?}");
+    assert_eq!(sink.queued_for_test().len(), 5, "every decision answered");
+    let rows = journal.rows();
+    let o = rows
+        .iter()
+        .find(|r| r.row == ActionRow::Overflow)
+        .and_then(|r| r.overflow.clone())
+        .expect("the stop's overflow row");
+    assert_eq!(o.queued_at_stop, st.not_run_at_stop);
+    assert!(!st.running);
+}
+
+/// A dispatcher whose thread is not running answers every response "not
+/// run", counts it — never runs it on the caller's thread.
+#[test]
+fn without_its_thread_nothing_runs_on_the_decision_thread() {
+    let (d, journal, sink) = dispatcher(false, 64);
+    d.stop(Duration::from_millis(10));
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-X",
+            ResponseAction::KillProcess,
+            Severity::Critical,
+            child.id(),
+        ),
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "not killed by the caller"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(d.status().not_run_down, 1);
+    assert!(sink.queued_for_test()[0].response.contains("not running"));
+    assert!(journal.rows().iter().all(|r| r.row != ActionRow::Intent));
+}
+
+/// A repeat of a queued response of the same process merges into it: one
+/// action, both decisions' records answered by its outcome.
+#[test]
+fn a_repeat_merges_and_answers_both_decisions() {
+    let (d, journal, sink) = dispatcher(true, 64);
+    let hold = d.shared.hold.lock();
+    submit_one(
+        &d,
+        &decided("NN-L-T-0", ResponseAction::Log, Severity::Low, 100),
+    );
+    let t0 = Instant::now();
+    while d.status().queue.taken == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-1",
+            ResponseAction::KillProcessTree,
+            Severity::High,
+            4242,
+        ),
+    );
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-2",
+            ResponseAction::KillProcessTree,
+            Severity::Critical,
+            4242,
+        ),
+    );
+    drop(hold);
+    d.stop(Duration::from_secs(5));
+    let st = d.status();
+    assert_eq!((st.queue.merged, st.executed), (1, 2));
+    let p = pairs(&journal.rows());
+    assert_eq!(p.len(), 2);
+    let kill = journal
+        .rows()
+        .into_iter()
+        .find(|r| r.row == ActionRow::Intent && r.intent.as_ref().unwrap().pid == 4242)
+        .unwrap();
+    let i = kill.intent.unwrap();
+    assert_eq!(i.why, ["NN-L-T-1", "NN-L-T-2"]);
+    assert_eq!(i.severity, "critical");
+    assert_eq!(sink.queued_for_test().len(), 3);
+}

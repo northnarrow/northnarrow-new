@@ -418,7 +418,9 @@ impl NetworkIsolator {
     /// its outcome is in the report, the signed record and `nn-admin
     /// status`, and a v6 failure is retried by the ladder like a v4 one. Both
     /// legs are attempted whatever the other's outcome.
-    pub fn engage(&self) -> IsolationReport {
+    /// R12c (lab PR 270): only for an action whose intent is signed
+    /// (`_intent`: the COMBAT ladder's ISOLATE).
+    pub fn engage(&self, _intent: &crate::response::journal::Intent) -> IsolationReport {
         let v4 = match self.build_engaged_ruleset() {
             Ok((ruleset, carved)) => self.engage_family(Family::V4, &ruleset, &carved),
             Err(e) => {
@@ -1445,7 +1447,7 @@ mod tests {
             return;
         };
         v6.fail("restore");
-        let report = iso.engage();
+        let report = iso.engage(&crate::response::journal::test_intent());
         assert!(report.engaged(), "{report:?}");
         assert!(!report.complete(), "a family failed: {report:?}");
         assert_eq!(report.v4, FamilyOutcome::Done);
@@ -1457,7 +1459,7 @@ mod tests {
         assert!(v4.has_chain() && !v6.has_chain());
         // the retry, once ip6tables works: both isolated, one jump each
         v6.heal("restore");
-        let report = iso.engage();
+        let report = iso.engage(&crate::response::journal::test_intent());
         assert!(report.complete(), "{report:?}");
         assert!(iso.is_isolated(Family::V6));
         assert_eq!(
@@ -1479,7 +1481,9 @@ mod tests {
         let Some((iso, v4, v6)) = fake_isolator() else {
             return;
         };
-        assert!(iso.engage().complete());
+        assert!(iso
+            .engage(&crate::response::journal::test_intent())
+            .complete());
         v4.fail("D");
         let report = iso.release(mint_unlock_token());
         assert!(!report.complete(), "{report:?}");
@@ -1508,7 +1512,9 @@ mod tests {
         assert!(!iso.is_engaged());
         assert!(!v4.has_chain());
         // and a v6 teardown failure is a failure too (it was a WARN)
-        assert!(iso.engage().complete());
+        assert!(iso
+            .engage(&crate::response::journal::test_intent())
+            .complete());
         v6.fail("D");
         let report = iso.release(mint_unlock_token());
         assert!(failure(&report.v6).contains("still isolated"), "{report:?}");
@@ -1527,7 +1533,7 @@ mod tests {
         v4.fail("hang");
         v6.fail("hang");
         let start = std::time::Instant::now();
-        let report = iso.engage();
+        let report = iso.engage(&crate::response::journal::test_intent());
         assert!(!report.engaged());
         assert!(
             failure(&report.v4).contains("did not exit within"),
@@ -1583,7 +1589,7 @@ mod tests {
         };
         let iso =
             NetworkIsolator::new_with_bin(combat_rules_path(), restore.clone(), no_chain).unwrap();
-        let err = failure(&iso.engage().v4);
+        let err = failure(&iso.engage(&crate::response::journal::test_intent()).v4);
         assert!(err.contains("NOT isolated"), "{err}");
         for gap in [
             "no NORTHNARROW_COMBAT chain",
@@ -1598,7 +1604,7 @@ mod tests {
         let truebin = PathBuf::from("/bin/true");
         if truebin.exists() {
             let iso = NetworkIsolator::new_with_bin(combat_rules_path(), restore, truebin).unwrap();
-            let err = failure(&iso.engage().v4);
+            let err = failure(&iso.engage(&crate::response::journal::test_intent()).v4);
             assert!(err.contains("no catch-all DROP"), "{err}");
             assert!(!iso.is_engaged());
         }
@@ -1612,7 +1618,9 @@ mod tests {
         let Some(iso) = mock_success_isolator() else {
             return;
         };
-        assert!(iso.engage().complete());
+        assert!(iso
+            .engage(&crate::response::journal::test_intent())
+            .complete());
         assert!(iso.is_engaged());
         let truebin = PathBuf::from("/bin/true");
         if !truebin.exists() {
@@ -1622,7 +1630,9 @@ mod tests {
             iptables_bin: Bin::Fixed(truebin),
             ..iso
         };
-        assert!(!iso.engage().engaged());
+        assert!(!iso
+            .engage(&crate::response::journal::test_intent())
+            .engaged());
         assert!(
             !iso.is_isolated(Family::V4),
             "the host is no longer isolated"
@@ -1645,7 +1655,7 @@ mod tests {
             ip6tables_bin: Bin::Fixed(truebin),
             ..iso
         };
-        let report = iso.engage();
+        let report = iso.engage(&crate::response::journal::test_intent());
         assert!(report.engaged(), "v4 isolated: {report:?}");
         assert!(!report.complete());
         assert!(failure(&report.v6).contains("no catch-all DROP"));
@@ -1747,11 +1757,19 @@ mod tests {
             None => return,
         };
         assert!(!iso.is_engaged(), "fresh isolator must not be engaged");
-        assert!(iso.engage().complete(), "first engage");
+        assert!(
+            iso.engage(&crate::response::journal::test_intent())
+                .complete(),
+            "first engage"
+        );
         assert!(iso.is_engaged());
         // Second engage: still complete, still engaged. Idempotent at the
         // observable-state level.
-        assert!(iso.engage().complete(), "second engage");
+        assert!(
+            iso.engage(&crate::response::journal::test_intent())
+                .complete(),
+            "second engage"
+        );
         assert!(iso.is_engaged());
     }
 
@@ -1767,7 +1785,7 @@ mod tests {
         let iso =
             NetworkIsolator::new_with_bin(combat_rules_path(), bin, PathBuf::from("/bin/true"))
                 .unwrap();
-        let err = failure(&iso.engage().v4);
+        let err = failure(&iso.engage(&crate::response::journal::test_intent()).v4);
         assert!(
             err.contains("failed") && err.contains("NOT isolated"),
             "unexpected error: {err}"
@@ -1800,7 +1818,11 @@ mod tests {
             return;
         };
         let iso = NetworkIsolator::new_with_bin(combat_rules_path(), restore, iptables).unwrap();
-        assert!(iso.engage().engaged(), "the restore succeeded: engaged");
+        assert!(
+            iso.engage(&crate::response::journal::test_intent())
+                .engaged(),
+            "the restore succeeded: engaged"
+        );
         assert!(iso.is_engaged(), "the host is isolated: reported so");
         // a failed restore is still not engaged
         let bin = PathBuf::from("/bin/false");
@@ -1808,7 +1830,9 @@ mod tests {
             let failed =
                 NetworkIsolator::new_with_bin(combat_rules_path(), bin, PathBuf::from("/bin/true"))
                     .unwrap();
-            assert!(!failed.engage().engaged());
+            assert!(!failed
+                .engage(&crate::response::journal::test_intent())
+                .engaged());
             assert!(!failed.is_engaged());
         }
     }
@@ -1888,7 +1912,9 @@ mod tests {
         let Some((iso, _v4, _v6)) = fake_isolator() else {
             return;
         };
-        assert!(iso.engage().complete());
+        assert!(iso
+            .engage(&crate::response::journal::test_intent())
+            .complete());
         assert!(iso.is_engaged());
         assert!(iso.release(mint_unlock_token()).complete());
         assert!(!iso.is_engaged(), "release must clear the isolation state");
@@ -1901,7 +1927,9 @@ mod tests {
         let Some((iso, _v4, _v6)) = fake_isolator() else {
             return;
         };
-        assert!(iso.engage().complete());
+        assert!(iso
+            .engage(&crate::response::journal::test_intent())
+            .complete());
         assert!(iso.release(mint_unlock_token()).complete(), "first release");
         assert!(
             iso.release(mint_unlock_token()).complete(),

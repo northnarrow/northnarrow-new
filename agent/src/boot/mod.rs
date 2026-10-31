@@ -291,6 +291,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         legacy_isolation_removed,
         execq_exec_cfg,
         executor,
+        journal,
         correlation,
         isolator,
     } = response::build(
@@ -334,6 +335,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     let combat = posture::ladder(
         &cli,
         &executor,
+        &journal,
         &isolator,
         detect_only,
         &audit_log,
@@ -368,6 +370,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &audit_log,
         &defense_detector,
         &signing_key,
+        &journal,
     );
     let fim_admin_state = fim::start(
         &cli,
@@ -406,6 +409,17 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         chain_store,
         &signing_key,
     );
+    // R12c (lab PR 270): the response dispatcher — the decisions'
+    // responses run on its thread, each with its signed intent and outcome.
+    let dispatcher = crate::pipeline::dispatch::Dispatcher::start(
+        executor.clone(),
+        journal.clone(),
+        crate::pipeline::dispatch::Followups {
+            sink: detection_sink.clone(),
+            cow: combat.cow_guard.clone(),
+        },
+        Some(posture.clone()),
+    );
     // R11c (lab PR 264): the boot's signed capability manifest, signed by
     // the run phase and read by the admin socket's status.
     let capability_manifest = northnarrow_agent::boot::manifest::SignedManifest::default();
@@ -435,6 +449,10 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             overlay_gate: Some(Arc::clone(&overlay_gate)),
             ja3_entries,
             event_bus: Some(sensor.bus_stats()),
+            response_dispatch: Some(
+                dispatcher
+                    .status_source(canary_detector.clone(), Some(Arc::clone(&ransom_tracker))),
+            ),
         },
     );
     let tasks::Tasks {
@@ -449,6 +467,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &detection_sink,
         &audit_log,
         execq_exec_cfg,
+        &journal,
         execpol_mode,
         exec_guards,
     )?;
@@ -478,6 +497,8 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &audit_log,
         &telemetry_probe,
         &expected_denial,
+        &dispatcher,
+        &ransom_tracker,
         &mut signals,
     )
     .await;
@@ -840,8 +861,9 @@ mod tests {
             .contains("checks::KeyVerdict::Decided(decision) => decision,"));
         // each phase that signs takes copies of the one key (the network
         // phase through a closure it calls for each of its two logs)
+        // R12c (lab PR 270): the stores' third copy signs the actions chain
         for (phase, copies) in [
-            ("evidence::stores(", 2),
+            ("evidence::stores(", 3),
             ("fim::start(", 2),
             ("canary::start(", 2),
             ("net::start(", 1),

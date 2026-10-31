@@ -67,6 +67,7 @@ exit: 0
 | OK      status_events    /var/lib/northnarrow/detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      netflow          /var/lib/northnarrow/netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        /var/lib/northnarrow/fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      actions          /var/lib/northnarrow/detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            /etc/northnarrow/chain_heads.json: no head anchor to compare with
 --- stderr
 (empty)

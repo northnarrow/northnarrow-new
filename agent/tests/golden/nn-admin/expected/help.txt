@@ -943,7 +943,7 @@ exit: 0
 | Usage: nn-admin chain verify [OPTIONS]
 |
 | Options:
-|       --log <LOG>                      A chain to verify; repeat for several. Default: all [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, all]
+|       --log <LOG>                      A chain to verify; repeat for several. Default: all [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, actions, all]
 |       --state-dir <STATE_DIR>          The state directory holding the canary chains and the rotating logs (`detections/` below it) [default: /var/lib/northnarrow]
 |       --audit-log <AUDIT_LOG>          The audit log [default: /etc/northnarrow/audit.log]
 |       --heads <HEADS>                  The head anchor (default: `chain_heads.json` next to `--audit-log`)

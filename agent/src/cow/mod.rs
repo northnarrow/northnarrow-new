@@ -89,9 +89,24 @@ pub struct CowGuard {
     detect_only: bool,
     /// Processes a ransomware signal named, by pid.
     signals: Arc<Mutex<HashMap<u32, Signal>>>,
+    /// R12c (lab PR 270): the automatic restore is an action — its signed
+    /// intent before, its outcome after (the admin verb's restore is the
+    /// operator's, signed by the admin socket).
+    journal: crate::response::journal::ActionJournal,
 }
 
 impl CowGuard {
+    /// Tests: a guard that is off (R12c: the dispatcher's tests).
+    #[cfg(test)]
+    pub(crate) fn off_for_test() -> Self {
+        CowGuard {
+            state: GuardState::Off,
+            detect_only: false,
+            signals: Arc::default(),
+            journal: crate::response::journal::ActionJournal::memory(),
+        }
+    }
+
     /// What [`boot`] decided.
     pub fn state(&self) -> &GuardState {
         &self.state
@@ -131,11 +146,13 @@ pub fn boot(
     audit: Option<Arc<parking_lot::Mutex<AuditLog>>>,
     pin_root: Option<PathBuf>,
     detect_only: bool,
+    journal: crate::response::journal::ActionJournal,
 ) -> CowGuard {
     CowGuard {
         state: boot_inner(overlay, tracker, audit, pin_root),
         detect_only,
         signals: Arc::default(),
+        journal,
     }
 }
 
@@ -390,6 +407,7 @@ fn on_neutralized(guard: &CowGuard, offenders: Vec<ProcId>, source: String) {
         return;
     }
     let rt = Arc::clone(rt);
+    let journal = guard.journal.clone();
     let spawned = std::thread::Builder::new()
         .name("nn-cow-restore".into())
         .spawn(move || {
@@ -401,6 +419,17 @@ fn on_neutralized(guard: &CowGuard, offenders: Vec<ProcId>, source: String) {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
+            // R12c (lab PR 270): the restore's signed intent before it
+            // writes a file, its outcome after.
+            let mut why = crate::response::journal::ActionIntent::named(
+                "copy_on_write",
+                "Restore",
+                pids.first().copied().unwrap_or(0),
+            );
+            why.severity = "critical".into();
+            why.why = vec![source.clone()];
+            why.detail = Some(format!("offenders {pids:?}, {} copies", entries.len()));
+            let intent = journal.intent(why);
             let report = rt.store.restore(
                 &Selector {
                     roots: offenders,
@@ -412,6 +441,26 @@ fn on_neutralized(guard: &CowGuard, offenders: Vec<ProcId>, source: String) {
                 },
             );
             log_report(&report, &source);
+            let result = if report.refusal.is_some() {
+                crate::response::journal::ActionResult::Failure
+            } else if report.refused > 0 || report.skipped > 0 {
+                crate::response::journal::ActionResult::Partial
+            } else {
+                crate::response::journal::ActionResult::Success
+            };
+            intent.finish(
+                result,
+                format!(
+                    "{} restored, {} recreated, {} kept both, {} unchanged, {} refused, {} skipped",
+                    report.restored,
+                    report.recreated,
+                    report.kept_both,
+                    report.unchanged,
+                    report.refused,
+                    report.skipped
+                ),
+                report.refusal.clone(),
+            );
             rt.store.sign(
                 "cow_guard",
                 serde_json::json!({
@@ -495,6 +544,7 @@ mod tests {
             state,
             detect_only: false,
             signals: Arc::default(),
+            journal: crate::response::journal::ActionJournal::memory(),
         }
     }
 

@@ -18,7 +18,8 @@ const XATTR_NAME_CAPS: &str = "security.capability";
 /// Remove the capability from `path`, through the host's view of it
 /// ([`super::host_path`]: the agent's own mounts are read-only). `pid` is
 /// the process that set it, carried into the outcome for the audit trail.
-pub fn strip(path: &str, pid: u32) -> ExecutionOutcome {
+/// R12c (lab PR 270): only for an action whose intent is signed (`_intent`).
+pub fn strip(path: &str, pid: u32, _intent: &super::journal::Intent) -> ExecutionOutcome {
     let Ok(name) = CString::new(XATTR_NAME_CAPS) else {
         return ExecutionOutcome::Failed {
             pid,
@@ -49,7 +50,11 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_reported_not_claimed() {
-        match strip("/nonexistent/nn-review-86", 4242) {
+        match strip(
+            "/nonexistent/nn-review-86",
+            4242,
+            &super::super::journal::test_intent(),
+        ) {
             ExecutionOutcome::Failed { pid, errno } => {
                 assert_eq!(pid, 4242);
                 assert_eq!(errno, libc::ENOENT);
@@ -62,7 +67,7 @@ mod tests {
     fn a_file_without_a_capability_is_already_stripped() {
         let f = tempfile::NamedTempFile::new().unwrap();
         let path = f.path().to_str().unwrap();
-        match strip(path, 1) {
+        match strip(path, 1, &super::super::journal::test_intent()) {
             // ENODATA, or ENOTSUP on a filesystem without xattrs.
             ExecutionOutcome::CapabilityStripped { .. } | ExecutionOutcome::Failed { .. } => {}
             other => panic!("unexpected {other:?}"),

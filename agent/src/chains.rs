@@ -52,6 +52,8 @@ pub struct ChainPaths {
     pub status_events: PathBuf,
     pub netflow: PathBuf,
     pub fim_drift: PathBuf,
+    /// R12c (lab PR 270): the signed record of the agent's actions.
+    pub actions: PathBuf,
 }
 
 impl Default for ChainPaths {
@@ -64,6 +66,7 @@ impl Default for ChainPaths {
             status_events: crate::detection_store::DEFAULT_STATUS_EVENTS_LOG_PATH.into(),
             netflow: crate::admin_socket::DEFAULT_NETFLOW_JSONL_PATH.into(),
             fim_drift: crate::fim::drain::DEFAULT_DRIFT_LOG_PATH.into(),
+            actions: crate::response::journal::DEFAULT_ACTIONS_LOG_PATH.into(),
         }
     }
 }
@@ -114,6 +117,12 @@ impl ChainPaths {
             ChainTarget::rotating::<crate::fim::drain::FimDriftPayload, LinuxHost>(
                 "fim_drift",
                 &self.fim_drift,
+            ),
+            // R12c (lab PR 270): last, so the order of the chains before it
+            // is the one the head anchors of earlier runs hold.
+            ChainTarget::rotating::<crate::response::journal::ActionRecord, LinuxHost>(
+                "actions",
+                &self.actions,
             ),
         ]
     }
@@ -352,6 +361,7 @@ mod tests {
             status_events: p("status_events.jsonl"),
             netflow: p("netflow.jsonl"),
             fim_drift: p("fim_drift.jsonl"),
+            actions: p("actions.jsonl"),
         }
     }
 
