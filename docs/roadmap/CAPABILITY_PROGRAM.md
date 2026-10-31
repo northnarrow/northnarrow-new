@@ -3728,3 +3728,42 @@ only in the table below, in the same PR as the evidence.
     flood keeps a second process of the same uid and kind at 256 a second
     with it (named in the signed row); R12b-2 (#475).
   - Lab: on our own guests, at most two up — ubuntu2404 (6.8.0-147, QEMU for Windows with WHPX, 4 vCPU, 7.9 GiB) for the EXP-13 family, the overhead and `tamper-check`; ubuntu2204 (5.15.0-198, the same) for the soak pair; `test-ignored` on both —, `main` 28ecf720, the first tip b82d5ae2 and the final tip 303ae02b, each exported into one tree path per guest, built in the guest (release, `test-privileged,debug-trigger`) and installed fresh; the eBPF object the same bytes for every build (d248970b… on 6.8, 82d64fa9… on 5.15). EXP-13e ×3 per build (8 root processes' `fork` + refused `chmod` of `admin.pub`, 40 s, with 500 connects/s, 20 DNS queries/s, 6 NET-001 and 6 staged probes and the 8 bursts of 1,500): `fs_protect` ring drops `main` 575, 865, 3,176 (mean 1,539, max 3,176), the first tip 0, 0, 0, the final tip 0, 0, 0 (R12a's own lab: `main` c209e353 mean 265, R12a's tip mean 1,085); on the tips the agent's CPU ~12.3 s in the flood's 40 s against 36.7 s (P0 queued 256 a second of uid 0, ~690,000 a run capped and signed in 5 rows), no queue drop, no send that waited, NET-001 6/6 in every run of every build, every refused attempt accounted (AT-001's records + held, + coalesced on `main`, + the ring's drops). EXP-13 and 13c ×3 per build (a uid-1000 open flood of 4 × 32 threads with the 8 bursts of 1,500, each from one root process; 13c with the network load and probes): `fs_protect` ring drops `main` 183, 0, 0 and 11, 0, 0, the first tip 313 and 159 (one run each: a pump thread woken on a saturated CPU, the finding fixed above), the final tip 0, 0, 0 and 0, 0, 0, every burst's 12,000 accounted; the FIM ring (a task's) dropped 12,072 records in one 13c run of the final tip, none in `main`'s three (R12a's lab: two of four on this code). EXP-13d (8 uid-1000 `fork` + `bpf(BPF_MAP_CREATE)` loops, refused): no drop of `fs_protect` on any build; `main` judged every one of 558,188 calls (20.3 s of CPU), the tips queued 256 a second and capped the rest (640,511 and 693,702 a run, ~12 s of CPU), NET-001 6/6 on each. EXP-13b (the loop stalled 4 s, a burst of 3,000): 1 record + 2,999 held on the tips (C5) against 1 + 2,999 coalesced on `main`, no drop. Overhead within noise (`main` / the first tip: open +27.8 / +28.5 %, wopen +31.1 / +29.9 %, exec +4.6 / +11.7 %, connect +40.4 / +29.7 %, udp +15.3 / +14.1 %, dns +13.0 / +12.6 %). Soak pair on ubuntu2204, each a fresh install, 0.78 h of the same load: RSS 27.9 → 54.0 MB (`main`) and 31.8 → 55.6 MB (the first tip), threads 9 → 22 and 20 → 28 (12 pump threads; the runtime's 7 → 20 and 7 → 15), no restart, no ring or bus drop, WARN/ERROR lines 2,345 and 2,180 (one ERROR each: the lab's admin key on the host); the tip's 4 capped rows were the own-object finding above (768 records), and stage 5 counted P3 decisions later than 500 ms after their record (106 of 43,497, up to 2.9 s; none in R12b-2's soak) while P1's 310,215 and P2's 16,921 stayed within a few ms but the boot's backlog. `test-ignored` (the first tip): 79 suites, 94 passed, 0 failed on both guests, the tests' agents' 52 chain checks `result="ok"`; `tamper-check`: the first tip's 75 outcomes and verdicts those of `main`, case by case (72 OK, C27 and C57c the known gaps, C64 the recorded deviation). The final tip's code is part of R12b-2's final tip, whose `test-ignored` (both guests) and `tamper-check` are in its note. Host gates on 303ae02b (`CARGO_BUILD_JOBS=4`, `--locked`): build-ebpf, clippy ×4 `-D warnings`, fmt, 74 suites 3,288 passed 0 failed 16 ignored, the privileged no-run, attack-coverage, `golden` ×5 (54 files the same bytes, the tree clean), MSRV 1.89, the fuzz replay (13 targets), portable-core (5 targets), lockfiles unchanged. Mutations on the new code, each alone: 33 of 33 caught (the cap, its allowance by kind and its refund; stage 5's timing, total and WARN; the envelope's flow time; the batch's coalescing, window, cap, drops, wake-up and stamp; C5's held counts; the pump's batch, pass bound, wait and stop; the open sensor's order and cap; the ring's size) — A14 (a batch not waking the receiver) survived the first run and has its test (`tmp/r12b-lab/`).
+  - Independent review of #474 ("merge after X"), fixed in the lot: C3
+    held back events the rules must see — a program load, the 257th
+    `bpf()` call of its uid in a second of map creates, was never queued,
+    so NN-L-BPF-001 never judged it: the cap's key is now (kind, uid,
+    target) — each `bpf()` command, each refused operation on each target
+    —, NN-L-BPF-001's commands (load, attach, link create) are never
+    capped, every capped key is signed with its count (rows of at most 256
+    keys), a full table of keys queues a new one uncapped and counts it
+    (judged, or dropped and signed by the bus: never unjudged and
+    uncounted), and root's floods capped raise the posture's
+    `TelemetryLoss`; the refund when the batch's fast path hands an event
+    to the slow one is tested (the reviewer's K3); a batch a pump read and
+    the closed bus refused is counted in the stop row; the verifier check
+    loads the ring at the agent's size; the FIM and network drains run on
+    threads of their own, each with a one-thread runtime. Attribution, as
+    measured: EXP-13e's zero is not the threads' — `main` with the same
+    256 KiB ring (a lab-only build) lost 0, 0, 0 too, at the same CPU
+    (36.6 s); C3 cuts the agent's CPU in that flood to ~12.5 s and its
+    decisions of uid 0 from ~14,000 to 256 a second per key; the threaded
+    pumps alone made EXP-13 and 13c worse (313 and 159 against 183 and 11)
+    until the ring was sized.
+  - Lab after the review (round f on ubuntu2404, clean installs; the host
+    ran the mutation suites through it): the final code 07480c40 —
+    EXP-13e 0, 0, 0 (`main` 575, 865, 3,176; a lab-only `main` with the
+    256 KiB ring 0, 0, 0 at 36.6 s of CPU against the final code's
+    12.2–12.7 s), EXP-13 0, 0, 0 (`main` 183, 0, 0; `main` with the ring
+    0, 0, 0), EXP-13c ×5 0 `fs_protect` and 0 FIM drops in each, with
+    every thread's CPU (`nn-fim_drain` ~11.5 s of the flood's, the
+    decision ~32 s; `main` 8 runs: `fs_protect` 11, 0, 0, 0, 0, 140, 0, 0,
+    FIM none — round h repeats `main`'s five under the same load:
+    59, 0, 0, 0, 0 — no FIM drop in any of `main`'s 13 runs), EXP-13d no drop (706,892 capped, 12.1 s), EXP-13b
+    1 + 2,999 held; the C3 check (8 root `fork` + `bpf(BPF_MAP_CREATE)`
+    loops with 6 root program loads spread over them): 6 of 6 loads with
+    an NN-L-BPF-001 record in each of two runs (`main` 6 of 6), the capped
+    rows naming uid 0's `map_create` key with its count; the ring read
+    back at 262,144 bytes. Gates on 5dab2c77: build-ebpf, clippy ×4 `-D warnings`, fmt, 74 suites 3,293 passed 0 failed 16 ignored, the privileged no-run, attack-coverage, `golden` ×5 (54 files the same bytes, the tree clean), MSRV 1.89, the fuzz replay (13 targets), portable-core (5 targets), lockfiles unchanged. Mutations on the
+    final code: 44 of 44 caught (the reviewer's K2 and K3 among them; AN2,
+    every `bpf()` command keyed as one, survived the run and has a
+    stronger test). The overhead and the soak were not run again.
