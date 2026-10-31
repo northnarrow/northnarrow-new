@@ -229,7 +229,12 @@ fn respond_to_access<H: PostureHost>(
         CanaryAccessKind::FileOpen => {
             let reader = view
                 .first_trip
-                .then(|| readers.reader(view.accessor_pid))
+                .then(|| {
+                    readers.reader(
+                        view.accessor_pid,
+                        crate::posture::lineage::AsOf::judged(view.timestamp_ns),
+                    )
+                })
                 .flatten();
             respond(rule, view, reasoning, reader)
         }

@@ -60,6 +60,14 @@ impl RingDrops {
     ) {
         let _ = self.posture.set(PostureSink { posture, installer });
     }
+
+    /// Third review of #475: `TelemetryLoss` for signals lost outside the
+    /// rings and the bus (the lineage's hard bound dropped the entries of
+    /// live processes, whose events are then judged "not known"), with the
+    /// same exemptions; nothing before the posture is bound.
+    pub fn raise_loss_signal(&self, what: &str, source: &str, reason: &str) {
+        raise_signal_loss(&self.posture, what, source, reason);
+    }
 }
 
 fn audit_drop(audit: &LateAudit, ring: &str, dropped: u64, total: u64) {

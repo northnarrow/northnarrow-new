@@ -37,7 +37,7 @@ use super::corroboration::Scope;
 use super::escalation_allow::{AllowTrigger, EscalationAllowList};
 use super::exempt::ExemptPids;
 use super::host::{PostureAgent, PostureHost};
-use super::lineage::AuthSessionTracker;
+use super::lineage::{AsOf, AuthSessionTracker};
 use crate::decision::host::DecisionHost;
 
 /// The recent events the triggers scan, borrowed (review 72). The
@@ -560,7 +560,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
     /// a trigger.
     pub fn session_scope(&self, event: &Event) -> Scope {
         match event_owner_pid(event) {
-            Some(pid) => self.scope_of(pid),
+            Some(pid) => self.scope_of(pid, AsOf::of_event(event)),
             None => Scope::Unattributed,
         }
     }
@@ -572,9 +572,9 @@ impl<H: DecisionHost> TriggerDetector<H> {
     /// their evidence by running part of it in a container they start (or
     /// in a cgroup of their delegated subtree named like one); two signals
     /// inside one container still corroborate.
-    fn scope_of(&self, pid: u32) -> Scope {
-        let workload = self.auth.session_workload(pid);
-        match (workload, self.auth.session_loginuid(pid)) {
+    fn scope_of(&self, pid: u32, as_of: AsOf) -> Scope {
+        let workload = self.auth.session_workload(pid, as_of);
+        match (workload, self.auth.session_loginuid(pid, as_of)) {
             (Some(w), _) if w.container => Scope::Workload(w.path),
             (_, Some(uid)) => Scope::Login(uid),
             (Some(w), None) => Scope::Workload(w.path),
@@ -591,20 +591,21 @@ impl<H: DecisionHost> TriggerDetector<H> {
     /// for any other event.
     pub fn admin_change_status(&self, event: &Event) -> Option<bool> {
         match event {
-            Event::FileOpen { pid, flags, .. } if is_write_open(*flags) => {
-                self.auth.interactive_admin_status(*pid)
-            }
+            Event::FileOpen { pid, flags, .. } if is_write_open(*flags) => self
+                .auth
+                .interactive_admin_status(*pid, AsOf::of_event(event)),
             _ => Some(false),
         }
     }
 
     /// Review 52: a pending writer placed —
     /// [`AuthSessionTracker::interactive_admin_status`] and its session's
-    /// scope — or `None` while it still cannot be.
-    pub fn place_writer(&self, pid: u32) -> Option<(bool, Scope)> {
+    /// scope — or `None` while it still cannot be. As of `as_of` (R12b,
+    /// R-F: the event whose round places it).
+    pub fn place_writer(&self, pid: u32, as_of: AsOf) -> Option<(bool, Scope)> {
         self.auth
-            .interactive_admin_status(pid)
-            .map(|admin| (admin, self.scope_of(pid)))
+            .interactive_admin_status(pid, as_of)
+            .map(|admin| (admin, self.scope_of(pid, as_of)))
     }
 
     /// Inspect `(event, recent)` and return every trigger raised.
@@ -1091,6 +1092,8 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
         return false;
     };
     let by_kernel = kernel_class_says(filename, *kernel_class, open_reason::SENSITIVE);
+    // R12b (R-F): the reader's lineage as of the open
+    let as_of = AsOf::of_event(focal);
     // root (uid=0) is excluded — its accesses are routine.
     if *uid == 0 {
         return false;
@@ -1099,7 +1102,7 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
     // as well, before any other check — a web shell running as www-data
     // reading `/etc/shadow` raised nothing. It is judged on its own terms.
     if *uid < 1000 {
-        return service_uid_credential_read(*pid, filename, by_kernel, auth);
+        return service_uid_credential_read(*pid, filename, by_kernel, auth, as_of);
     }
     // T7.13 — an authentication chain opens /etc/shadow (or
     // /etc/gshadow) under the caller's uid: the LSM file_open hook can
@@ -1117,7 +1120,7 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
     // it opened: a shell of an SSH or desktop session, and whatever it
     // runs (cat, less, cp, a /tmp binary, a shell one-liner), still fires
     // below.
-    if auth.is_credential_reader(*pid) {
+    if auth.is_credential_reader(*pid, as_of) {
         return false;
     }
     // BUG-018 (tactical) — systemd-user@<uid>.service children
@@ -1195,14 +1198,15 @@ fn service_uid_credential_read<H: PostureHost>(
     filename: &str,
     by_kernel: bool,
     auth: &AuthSessionTracker<H>,
+    as_of: AsOf,
 ) -> bool {
     let credential = SERVICE_UID_CREDENTIAL_FILES
         .iter()
         .any(|f| filename == *f || (by_kernel && filename.ends_with(f)));
-    if !credential || auth.is_credential_reader(pid) {
+    if !credential || auth.is_credential_reader(pid, as_of) {
         return false;
     }
-    auth.image_path(pid)
+    auth.image_path_as(pid, as_of)
         .is_none_or(|image| reads_like_a_tool(&image))
 }
 
@@ -1330,7 +1334,7 @@ fn staging_exec<H: PostureAgent>(
     if !crate::decision::rules::is_staging_path(image) {
         return None;
     }
-    if auth.in_package_transaction(pid, ts) {
+    if auth.in_package_transaction(pid, AsOf::judged(ts)) {
         return Some(StagedExec::Plain);
     }
     let unlinked = exe.has(exe_flags::DELETED) || exe.has(exe_flags::MEMFD);
@@ -1389,7 +1393,7 @@ fn confirmed_intrusion<H: PostureHost>(
         // encryption in place — do.
         // Recorded, not silent: the kernel reports a crossing once per
         // window per process.
-        if !*overwrites && auth.is_auth_mediated(*pid) {
+        if !*overwrites && auth.is_auth_mediated(*pid, AsOf::judged(*timestamp_ns)) {
             tracing::info!(
                 pid = *pid,
                 comm = %nn_model::log_escape::Escaped(comm),
@@ -1491,7 +1495,7 @@ fn confirmed_intrusion<H: PostureHost>(
             // flags but not whether the file existed): a session's opens
             // that may create (`O_CREAT`) do not count, its opens of an
             // existing file to write do.
-            let session = auth.is_auth_mediated(*focal_pid);
+            let session = auth.is_auth_mediated(*focal_pid, AsOf::judged(*focal_ts));
             let counted = |f: u32| !session || f & O_CREAT == 0;
             if !counted(*flags) {
                 return false;
@@ -1587,10 +1591,12 @@ fn mass_write_exempt<H: PostureHost>(
     path: &str,
     path_from_user: bool,
 ) -> bool {
-    auth.in_package_transaction(pid, ts_ns)
-        || auth.is_system_man_cache_writer(pid)
-        || auth.is_npm_cli_writer(pid)
-        || auth.is_user_container_storage_write(pid, ts_ns, path, path_from_user)
+    // R12b (R-F): as of the write
+    let as_of = AsOf::judged(ts_ns);
+    auth.in_package_transaction(pid, as_of)
+        || auth.is_system_man_cache_writer(pid, as_of)
+        || auth.is_npm_cli_writer(pid, as_of)
+        || auth.is_user_container_storage_write(pid, as_of, path, path_from_user)
 }
 
 /// One mass-write WARN per pid per window (review entry 37). Returns true
@@ -1651,8 +1657,13 @@ fn persistence_mechanism<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
     // forked under `mandb` raised nothing. A package manager a user runs:
     // within that user's container storage only (a unit a rootless build
     // installs in its image), never a host path.
-    if auth.in_package_transaction(*pid, *timestamp_ns)
-        || auth.is_user_container_storage_write(*pid, *timestamp_ns, filename, *path_from_user)
+    if auth.in_package_transaction(*pid, AsOf::judged(*timestamp_ns))
+        || auth.is_user_container_storage_write(
+            *pid,
+            AsOf::judged(*timestamp_ns),
+            filename,
+            *path_from_user,
+        )
     {
         return false;
     }
@@ -3602,6 +3613,33 @@ mod tests {
             hits.contains(&TriggerType::SensitiveFileAccess),
             "BUG-012 security guard: /etc/shadow read MUST still fire \
              SensitiveFileAccess after FIM Opened drop, got {hits:?}"
+        );
+    }
+
+    /// R12b (R-F): a credential read is judged on the reader as of the
+    /// read — a process that read /etc/shadow as `cat` and executed `sudo`
+    /// afterwards (its exec ingested before the read is judged) is no
+    /// authentication chain at the read: SensitiveFileAccess fires; the
+    /// same process as `sudo` at the read is the PAM stack's open.
+    #[test]
+    fn a_credential_read_is_judged_on_the_reader_as_of_the_read() {
+        use super::super::exempt::ExemptPids;
+        use super::super::lineage::AuthSessionTracker;
+        const S: u64 = 1_000_000_000;
+        let auth = AuthSessionTracker::new("/this/path/does/not/exist");
+        auth.ingest_exec(31400, 1, "/usr/bin/cat", &[], 10 * S, 9 * S, 1000);
+        auth.ingest_exec(31400, 1, "/usr/bin/sudo", &[], 30 * S, 9 * S, 1000);
+        let det = TriggerDetector::with_exempt_and_auth(ExemptPids::default(), auth);
+        let read_at = |ts| file_open(31400, 1000, "/etc/shadow", 0, ts);
+        assert!(
+            det.detect(&read_at(20 * S), &[])
+                .contains(&TriggerType::SensitiveFileAccess),
+            "read as cat: fires, the later sudo vouches for nothing"
+        );
+        assert!(
+            !det.detect(&read_at(40 * S), &[])
+                .contains(&TriggerType::SensitiveFileAccess),
+            "read as sudo: the authentication chain's own open"
         );
     }
 

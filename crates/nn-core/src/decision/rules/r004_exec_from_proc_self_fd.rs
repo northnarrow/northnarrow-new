@@ -118,18 +118,23 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
     /// manager), or a `systemd --user` manager told by what the kernel
     /// executed for the parent, never by its `comm`, which the parent sets
     /// for itself with `prctl(PR_SET_NAME)`.
-    fn parented_by_systemd(&self, ppid: u32) -> bool {
+    fn parented_by_systemd(&self, ppid: u32, as_of: crate::posture::lineage::AsOf) -> bool {
         ppid == 1
             || self.lineage.as_ref().is_some_and(|l| {
-                l.exec_identity(ppid)
+                l.exec_identity(ppid, as_of)
                     .is_some_and(|id| id.script.is_none() && id.is_client(&["systemd"]))
             })
     }
 
     /// Tracepoint mode: a `/proc/self/fd` exec that is the legitimate
     /// launch of a systemd unit (both signals).
-    fn is_systemd_executor_launch(&self, ppid: u32, argv: &[String]) -> bool {
-        Self::argv0_is_the_executor(argv) && self.parented_by_systemd(ppid)
+    fn is_systemd_executor_launch(
+        &self,
+        ppid: u32,
+        argv: &[String],
+        as_of: crate::posture::lineage::AsOf,
+    ) -> bool {
+        Self::argv0_is_the_executor(argv) && self.parented_by_systemd(ppid, as_of)
     }
 }
 
@@ -178,7 +183,13 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
             // Tracepoint mode: the path heuristic. Tappa 10.6.5: systemd's
             // fexecve(/proc/self/fd/N) of systemd-executor launches every
             // unit; it is exempt, on argv[0] exactly and a systemd parent.
-            if !via_fd || self.is_systemd_executor_launch(*ppid, argv) {
+            if !via_fd
+                || self.is_systemd_executor_launch(
+                    *ppid,
+                    argv,
+                    crate::posture::lineage::AsOf::of_event(event),
+                )
+            {
                 return None;
             }
         }

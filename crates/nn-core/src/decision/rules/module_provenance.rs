@@ -15,10 +15,20 @@
 //! database is [`Provenance::Unknown`], judged as before. Paths are compared
 //! with `/usr` dropped: a merged-`/usr` host reports `/usr/lib/modules`
 //! while packages list `/lib/modules`.
+//!
+//! R12b (lab PR 269, plan §3.4: "module_provenance usa una cache di
+//! `PackageOwnership`"): the package database is asked by the module-load
+//! pump, on its own thread, when it reads the load's record
+//! ([`ModuleOwners::refresh`]: a `stat` of dpkg's status, its lists, or an
+//! `rpm -qf` process), and the answer is kept per file ([`OWNERSHIP`]); R018
+//! judges the load on that answer ([`ModuleOwners::of`]) — no file read, no
+//! process on the decision's thread. A file no pump asked about (the
+//! replay, the tests) is asked about there, as before.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::SystemTime;
 
 use parking_lot::Mutex;
@@ -37,6 +47,15 @@ pub enum Provenance {
     /// No package database to ask (not a dpkg or rpm host).
     Unknown,
 }
+
+/// R12b (lab PR 269): the package database's answers the module-load pump
+/// asked for, per (host root, module file without `/usr`) — the latest for
+/// each file, which R018 judges the load the pump read on. A host fact,
+/// one per process; bounded ([`OWNERSHIP_KEYS`]: full, it starts again).
+static OWNERSHIP: LazyLock<parking_lot::Mutex<HashMap<(PathBuf, String), Provenance>>> =
+    LazyLock::new(Default::default);
+/// The files [`OWNERSHIP`] keeps answers for at most.
+pub const OWNERSHIP_KEYS: usize = 4096;
 
 /// R08b (lab PR 251): `H` is the host whose `rpm` it asks and whose work
 /// it keeps off the async runtime ([`DecisionHost`]; the agent's is
@@ -65,12 +84,30 @@ impl<H: DecisionHost> ModuleOwners<H> {
         }
     }
 
-    /// Who installed the module file at `path` (absolute, on the host).
-    /// The rule engine runs on the runtime: the first lookup reads every
-    /// dpkg list, and `rpm -qf` is a process to wait for, so both run off
-    /// its worker.
+    /// Who installed the module file at `path` (absolute, on the host):
+    /// R12b, the answer the module-load pump asked for when it read the
+    /// load ([`Self::refresh`]); a file no pump asked about is asked about
+    /// here — the first lookup reads every dpkg list, and `rpm -qf` is a
+    /// process to wait for, so both run off the runtime's worker.
     pub fn of(&self, path: &str) -> Provenance {
+        let key = (self.root.clone(), without_usr(path));
+        if let Some(p) = OWNERSHIP.lock().get(&key) {
+            return *p;
+        }
         H::off_the_runtime(|| self.lookup(path))
+    }
+
+    /// R12b (lab PR 269): ask the package database who installed `path`
+    /// now, and keep the answer for the decision ([`Self::of`]) — the
+    /// module-load pump's call, on its own thread, for every load it reads.
+    pub fn refresh(&self, path: &str) -> Provenance {
+        let p = self.lookup(path);
+        let mut kept = OWNERSHIP.lock();
+        if kept.len() >= OWNERSHIP_KEYS {
+            kept.clear();
+        }
+        kept.insert((self.root.clone(), without_usr(path)), p);
+        p
     }
 
     fn lookup(&self, path: &str) -> Provenance {
@@ -265,6 +302,37 @@ mod tests {
         assert_eq!(
             o.of("/lib/modules/6.8.0-1-generic/updates/dkms/nvidia-uvm.ko.zst"),
             Provenance::Dkms
+        );
+    }
+
+    /// R12b: the answer the pump asked for is the one the rule reads —
+    /// without the database (here: the answer kept while the database says
+    /// otherwise until the next refresh, as the pump's next read of a load
+    /// of the file would refresh it).
+    #[test]
+    fn the_rule_reads_the_answer_the_pump_asked_for() {
+        let t = dpkg_host();
+        let owners = ModuleOwners::new(t.path());
+        let hand = "/lib/modules/6.8.0-1-generic/extra/rk.ko";
+        assert_eq!(owners.refresh(hand), Provenance::Unowned);
+        // the database changes (a package now lists it): the decision still
+        // reads the answer of the load's time, without asking
+        let info = t.path().join("var/lib/dpkg/info");
+        std::fs::write(info.join("rk.list"), format!("{hand}\n")).unwrap();
+        std::fs::write(
+            t.path().join("var/lib/dpkg/status"),
+            "Package: rk\nchanged\n",
+        )
+        .unwrap();
+        assert_eq!(owners.of(hand), Provenance::Unowned, "the pump's answer");
+        // the pump's next read asks again
+        assert_eq!(owners.refresh(hand), Provenance::Package);
+        assert_eq!(owners.of(hand), Provenance::Package);
+        // another root's answers are its own
+        let other = dpkg_host();
+        assert_eq!(
+            ModuleOwners::new(other.path()).of(hand),
+            Provenance::Unowned
         );
     }
 

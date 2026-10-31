@@ -108,5 +108,11 @@ pub(crate) fn stop(
         // External audit SNS-001: a failure, not a clean stop.
         anyhow::bail!("a sensor pump exited; the agent stopped so the watchdog restarts it");
     }
+    if stop_reason == "decision_thread_failed" {
+        // R12b: no thread to judge on — a failure, not a clean stop.
+        anyhow::bail!(
+            "the decision thread did not start; the agent stopped so the watchdog restarts it"
+        );
+    }
     Ok(())
 }

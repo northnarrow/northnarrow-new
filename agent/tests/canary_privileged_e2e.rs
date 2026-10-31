@@ -699,6 +699,226 @@ fn file_canary_open_triggers_canary_tripped_event_and_combat() {
     );
 }
 
+/// Review of #475: an anti-malware daemon running since before the agent
+/// (the start's scan enters it into the lineage) is still CANARY-001's
+/// reader after 2,100 execs of other processes — the lineage keeps a live
+/// process's entry (it was a FIFO of 2,048 that pushed it out, and the
+/// daemon was killed at its first read of a canary). The daemon here is a
+/// copy of bash named `clamd` in a system tree, started before the agent,
+/// that reads the decoy from its own process (a builtin's redirection)
+/// when the test tells it to: the access is recorded and signed, the rule
+/// records it High, and the daemon is not killed.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn a_reader_daemon_older_than_the_agent_stays_spared_after_2100_execs() {
+    let _eni = EniIptablesGuard::install();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let decoy = tmp.path().join("decoy_backup_keys.txt");
+    let go = tmp.path().join("go");
+    assert!(Command::new("mkfifo")
+        .arg(&go)
+        .status()
+        .expect("mkfifo")
+        .success());
+    // the daemon: /usr/local/lib/<dir>/clamd, a copy of bash (removed at the end)
+    let dir = PathBuf::from(format!(
+        "/usr/local/lib/nn-e2e-clamd-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("the daemon's directory");
+    struct Gone(PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _gone = Gone(dir.clone());
+    let clamd = dir.join("clamd");
+    std::fs::copy("/bin/bash", &clamd).expect("seed the daemon's binary");
+    let mut daemon = Command::new(&clamd)
+        .arg("-c")
+        .arg(format!(
+            "read -r _ < '{}'; read -r _ < '{}'; sleep 30",
+            go.display(),
+            decoy.display()
+        ))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the daemon");
+    let pid = daemon.id();
+
+    // the agent starts after it: its start's scan enters the daemon
+    let fx = CanaryFixture::setup(&[]);
+    // 2,100 execs of other processes
+    for _ in 0..2_100 {
+        let _ = Command::new("/bin/true").status();
+    }
+    let canary_id = fx.deploy_file_canary("honeypot-backup", &decoy);
+    assert_eq!(canary_id.len(), 32);
+    // the daemon reads the decoy
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&go)
+        .and_then(|mut f| f.write_all(b"go\n"))
+        .expect("tell the daemon to read");
+    let rows = fx.wait_access(1);
+    assert_eq!(
+        rows[0]["accessor_pid"].as_u64(),
+        Some(u64::from(pid)),
+        "{rows:?}"
+    );
+    assert_eq!(rows[0]["first_trip"].as_bool(), Some(true));
+    let rec = common::wait_jsonl_row(
+        &fx.detections_log,
+        ACCESS_LOG_POLL_TIMEOUT,
+        "NN-L-CANARY-001 record of the daemon",
+        |r| {
+            r["rule_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("NN-L-CANARY-001"))
+                && r["principal"]["pid"].as_u64() == Some(u64::from(pid))
+        },
+    );
+    assert_eq!(
+        rec["severity"], "High",
+        "a reader's read is recorded: {rec}"
+    );
+    assert!(
+        !rec["response"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("KillProcessTree")),
+        "the reader is not killed: {rec}"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        daemon.try_wait().expect("try_wait").is_none(),
+        "the daemon still runs"
+    );
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
+/// Third review of #475 (X1): an anti-malware daemon started after the
+/// agent as a `Type=forking` unit — its process executes, forks the daemon
+/// and exits, the daemon reparented to pid 1 before any sweep of the
+/// lineage — is CANARY-001's reader once the sweep found its parent gone:
+/// the read is recorded High and the daemon is not killed. The daemon is a
+/// copy of bash named `clamd` in a system tree whose subshell (a fork, no
+/// exec) reads the decoy from its own process when the test tells it to,
+/// after one sweep's period.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn a_type_forking_reader_daemon_started_after_the_agent_stays_spared() {
+    let _eni = EniIptablesGuard::install();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let decoy = tmp.path().join("decoy_backup_keys.txt");
+    let go = tmp.path().join("go");
+    let pid_file = PathBuf::from(format!(
+        "/run/nn-e2e-clamd-forking-{}.pid",
+        std::process::id()
+    ));
+    assert!(Command::new("mkfifo")
+        .arg(&go)
+        .status()
+        .expect("mkfifo")
+        .success());
+    let dir = PathBuf::from(format!(
+        "/usr/local/lib/nn-e2e-clamd-forking-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("the daemon's directory");
+    let unit = format!("nn-e2e-clamd-forking-{}", std::process::id());
+    struct Gone(PathBuf, String, PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = Command::new("systemctl")
+                .args(["stop", &self.1])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_file(&self.2);
+        }
+    }
+    let _gone = Gone(dir.clone(), unit.clone(), pid_file.clone());
+    let clamd = dir.join("clamd");
+    std::fs::copy("/bin/bash", &clamd).expect("seed the daemon's binary");
+
+    // the agent first: the daemon starts after it
+    let fx = CanaryFixture::setup(&[]);
+    // the unit's process forks the daemon (a subshell), writes its pid, exits
+    let started = Command::new("systemd-run")
+        .arg(format!("--unit={unit}"))
+        .args(["--collect", "-p", "Type=forking"])
+        .args(["-p", &format!("PIDFile={}", pid_file.display())])
+        .arg(&clamd)
+        .arg("-c")
+        .arg(format!(
+            "( read -r _ < '{go}'; read -r _ < '{decoy}'; read -r _ < '{go}' ) & echo $! > '{pid}'; exit 0",
+            go = go.display(),
+            decoy = decoy.display(),
+            pid = pid_file.display()
+        ))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("systemd-run");
+    assert!(started.success(), "the Type=forking unit started");
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("the daemon's pid file")
+        .trim()
+        .parse()
+        .expect("a pid");
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("the daemon runs");
+    let ppid = stat
+        .rsplit_once(')')
+        .and_then(|(_, r)| r.split_whitespace().nth(1))
+        .expect("its parent");
+    assert_eq!(ppid, "1", "reparented to pid 1: {stat}");
+    // one sweep of the lineage's period (5 s) and a margin
+    std::thread::sleep(Duration::from_secs(7));
+    let canary_id = fx.deploy_file_canary("honeypot-backup", &decoy);
+    assert_eq!(canary_id.len(), 32);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&go)
+        .and_then(|mut f| f.write_all(b"go\n"))
+        .expect("tell the daemon to read");
+    let rows = fx.wait_access(1);
+    assert_eq!(
+        rows[0]["accessor_pid"].as_u64(),
+        Some(u64::from(pid)),
+        "{rows:?}"
+    );
+    let rec = common::wait_jsonl_row(
+        &fx.detections_log,
+        ACCESS_LOG_POLL_TIMEOUT,
+        "NN-L-CANARY-001 record of the daemon",
+        |r| {
+            r["rule_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("NN-L-CANARY-001"))
+                && r["principal"]["pid"].as_u64() == Some(u64::from(pid))
+        },
+    );
+    assert_eq!(
+        rec["severity"], "High",
+        "a reader's read is recorded: {rec}"
+    );
+    assert!(
+        !rec["response"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("KillProcessTree")),
+        "the reader is not killed: {rec}"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the daemon still runs"
+    );
+}
+
 /// External audit DEC-001 and DEC-003: a file canary deployed at runtime
 /// in a directory the FIM path list does not cover trips, and still trips
 /// after the agent restarts — the boot used to publish an empty
@@ -1002,12 +1222,16 @@ fn process_canary_exec_triggers_canary_tripped_event_and_combat() {
     // Process canary path can be created post-spawn — sched_process_exec
     // is a tracepoint, not a WATCHED_PATHS-gated LSM hook; the K3
     // detector matches via the registry's exe_index after deploy.
+    use std::os::unix::process::ExitStatusExt;
     let tmp = tempfile::tempdir().expect("decoy tempdir");
     let decoy = tmp.path().join("decoy_helper");
-    // Real ELF at the deployment path so the exec doesn't ENOENT.
-    // /bin/true is the smallest exec-and-return-0 binary on
-    // every distribution we target.
-    std::fs::copy("/bin/true", &decoy).expect("seed decoy process binary");
+    // Real ELF at the deployment path so the exec doesn't ENOENT. Lab PR
+    // 269: a copy of /bin/sleep, alive until the response reaches it — with
+    // /bin/true the exec raced NN-L-CANARY-002's KillProcessTree (the
+    // decision on a thread of its own killed it before it returned 0 on
+    // ubuntu2204: "decoy exec failed"); the kill is the rule's response,
+    // asserted below as the network canary's is.
+    std::fs::copy("/bin/sleep", &decoy).expect("seed decoy process binary");
     let mut perms = std::fs::metadata(&decoy).expect("stat decoy").permissions();
     use std::os::unix::fs::PermissionsExt;
     perms.set_mode(0o755);
@@ -1018,11 +1242,12 @@ fn process_canary_exec_triggers_canary_tripped_event_and_combat() {
     assert_eq!(canary_id.len(), 32);
 
     // Trip: exec the canary binary.
-    let status = Command::new(&decoy)
+    let mut child = Command::new(&decoy)
+        .arg("30")
         .stdout(Stdio::null())
-        .status()
+        .spawn()
         .expect("spawn decoy process for canary trip");
-    assert!(status.success(), "decoy exec failed");
+    let child_pid = u64::from(child.id());
 
     let rows = fx.wait_access(1);
     assert_eq!(
@@ -1051,6 +1276,29 @@ fn process_canary_exec_triggers_canary_tripped_event_and_combat() {
         row["accessor_comm"].as_str().is_some_and(|s| !s.is_empty()),
         "accessor_comm should be populated"
     );
+    assert_eq!(row["accessor_pid"].as_u64(), Some(child_pid), "{row}");
+
+    // The rule's record and its response: the decoy killed (SIGKILL)
+    // during its sleep.
+    let rec = common::wait_jsonl_row(
+        &fx.detections_log,
+        ACCESS_LOG_POLL_TIMEOUT,
+        "NN-L-CANARY-002 record of the decoy",
+        |r| {
+            r["rule_id"].as_str() == Some("NN-L-CANARY-002_ProcessExec")
+                && r["principal"]["pid"].as_u64() == Some(child_pid)
+        },
+    );
+    assert_eq!(rec["severity"], "Critical", "record: {rec}");
+    assert!(
+        rec["response"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("KillProcessTree")),
+        "record: {rec}"
+    );
+    let status = wait_exit(&mut child, Duration::from_secs(10))
+        .expect("the decoy must be killed during its 30 s sleep");
+    assert_eq!(status.signal(), Some(9), "{status:?}");
 }
 
 // ── Test 3: refresh re-arms a tripped canary for repeat trips ───────

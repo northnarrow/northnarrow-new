@@ -191,6 +191,20 @@ pub(crate) async fn load(
         }
     };
     boot.done(BootStep::Sensors)?;
+    // Review of #475 (R-F): the processes already running, entered into the
+    // lineage once the exec sensors are attached (an exec from now on is
+    // seen): a judgement never reads `/proc` for a process the cache does
+    // not hold, and a process older than the agent is known by this scan.
+    let seeded = lineage.seed_from_proc();
+    info!(
+        seeded,
+        "lineage: the running processes entered at the start"
+    );
+    // Review of #475: the lineage's sweep, a thread of its own (off the
+    // decision thread): the cached processes that exited marked (their
+    // entries dropped only past the cache's size and their grace), the
+    // forks of cached processes that run their image entered.
+    spawn_lineage_sweep(lineage.clone(), sensor.ring_drops().clone());
     info!(
         sensors =
             "process_spawn, file_open, exec_check, tcp_connect_v4, tcp_connect_v6, dns_query, \
@@ -389,5 +403,89 @@ pub(crate) fn record_own_prog_ids(path: Option<&std::path::Path>, ebpf: &aya::Eb
             "own BPF program ids NOT recorded — install.sh --upgrade and uninstall.sh wait on the \
              list written earlier this boot, or fall back to waiting for no LSM program on the host"
         ),
+    }
+}
+
+/// Review of #475: how often the lineage's sweep runs.
+const LINEAGE_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Review of #475: [`AuthSessionTracker::sweep`] every
+/// [`LINEAGE_SWEEP_EVERY`] on a thread of its own (`nn-lineage-sweep`); a
+/// live process's entry dropped at the cache's hard bound is WARNed.
+fn spawn_lineage_sweep(
+    lineage: AuthSessionTracker,
+    losses: nn_linux::sensors::ring_drops::RingDrops,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("nn-lineage-sweep".to_string())
+        .spawn(move || {
+            let mut evicted_live = 0;
+            loop {
+                std::thread::sleep(LINEAGE_SWEEP_EVERY);
+                let r = lineage.sweep();
+                if r.evicted_live > evicted_live {
+                    let dropped = r.evicted_live - evicted_live;
+                    warn!(
+                        dropped,
+                        total = r.evicted_live,
+                        entries = r.entries,
+                        "lineage: entries of processes not known to have exited dropped at the \
+                         cache's hard bound — their events are judged \"not known\""
+                    );
+                    // third review of #475: a signal lost, as a full cap table
+                    let what = format!("lineage entries of live processes {dropped}");
+                    losses.raise_loss_signal(
+                        &what,
+                        "lineage hard bound",
+                        &format!(
+                            "lineage: {what} dropped at the cache's hard bound — their events \
+                             are judged \"not known\""
+                        ),
+                    );
+                    evicted_live = r.evicted_live;
+                }
+                debug!(
+                    gone = r.gone,
+                    forks = r.forks,
+                    orphans = r.orphans,
+                    entries = r.entries,
+                    "lineage: sweep"
+                );
+            }
+        });
+    if let Err(e) = spawned {
+        warn!(
+            error = %e,
+            "lineage: the sweep's thread did not start — exited processes' entries are not \
+             released, forks not entered"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Review of #475: the start enters the running processes into the
+    /// lineage once the sensors are attached, and starts its sweep — read
+    /// from the production code (the posture replay seeds its own host, so
+    /// no other test would notice either call gone).
+    #[test]
+    fn the_start_seeds_the_lineage_after_the_attach_and_sweeps_it() {
+        let src = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/attach.rs"));
+        let code = &src[..src.find("#[cfg(test)]").expect("the tests")];
+        let attached = code
+            .find("boot.done(BootStep::Sensors)?;")
+            .expect("the sensors' step");
+        let seeded = code
+            .find("let seeded = lineage.seed_from_proc();")
+            .expect("the start's scan");
+        let swept = code
+            .find("spawn_lineage_sweep(lineage.clone(), sensor.ring_drops().clone());")
+            .expect("the sweep started");
+        assert!(attached < seeded && seeded < swept);
+        assert!(code.contains("let r = lineage.sweep();"));
+        // third review of #475: the hard bound's drops of live processes'
+        // entries raise the posture, not only a WARN
+        let sweep = &code[code.find("fn spawn_lineage_sweep(").expect("the sweep")..];
+        assert!(sweep.contains("losses.raise_loss_signal("));
     }
 }

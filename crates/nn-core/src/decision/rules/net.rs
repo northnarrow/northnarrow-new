@@ -1399,7 +1399,11 @@ fn common_port_service<H: PostureHost>(
         return None;
     }
     let identity = match lineage {
-        Some(t) => t.exec_identity(nl.pid),
+        // R-F: as of the listener's own time
+        Some(t) => t.exec_identity(
+            nl.pid,
+            crate::posture::lineage::AsOf::judged(nl.timestamp_ns),
+        ),
         None => match nl.exe.as_deref() {
             Some(exe) => Some(crate::posture::lineage::ExecIdentity {
                 exe: exe.into(),
@@ -1481,7 +1485,11 @@ impl<H: PostureHost> Rule for NnLNet006UncommonListener<H> {
         if common == Some(true) {
             return None;
         }
-        let judged = self.allowlist.judge(nl.pid, &nl.comm);
+        let judged = self.allowlist.judge(
+            nl.pid,
+            &nl.comm,
+            crate::posture::lineage::AsOf::of_event(event),
+        );
         if judged == Judgement::Allowed {
             return None;
         }
@@ -1555,7 +1563,11 @@ impl<H: PostureHost> Rule for NnLNet007Rfc1918FromUnusualProc<H> {
         if !Self::is_internal(&nf.dst_addr) {
             return None;
         }
-        let judged = self.allowlist.judge(nf.pid, &nf.comm);
+        let judged = self.allowlist.judge(
+            nf.pid,
+            &nf.comm,
+            crate::posture::lineage::AsOf::of_event(event),
+        );
         if judged == Judgement::Allowed {
             return None;
         }
@@ -1663,18 +1675,20 @@ impl<H: PostureHost> Rule for NnLNet008OutboundFromTmpExec<H> {
         let exe = match nf.exe.as_deref() {
             Some(exe) => exe,
             None => {
-                looked_up = self.lineage.as_ref()?.image_path(nf.pid)?;
+                // R-F: as of the flow (its connect), the cache only
+                looked_up = self
+                    .lineage
+                    .as_ref()?
+                    .image_path_as(nf.pid, crate::posture::lineage::AsOf::of_event(event))?;
                 looked_up.as_str()
             }
         };
         if !crate::decision::rules::is_staging_path(exe) {
             return None;
         }
-        if self
-            .lineage
-            .as_ref()
-            .is_some_and(|l| l.in_package_transaction(nf.pid, nf.start_ns))
-        {
+        if self.lineage.as_ref().is_some_and(|l| {
+            l.in_package_transaction(nf.pid, crate::posture::lineage::AsOf::judged(nf.start_ns))
+        }) {
             return Some(net_verdict(
                 self,
                 ResponseAction::Log,
@@ -1816,7 +1830,11 @@ impl<H: PostureHost> Rule for NnLNet009ByteAnomaly<H> {
                 nf.dst_addr,
                 nf.dst_port
             );
-            let judged = self.allowlist.judge(nf.pid, &nf.comm);
+            let judged = self.allowlist.judge(
+                nf.pid,
+                &nf.comm,
+                crate::posture::lineage::AsOf::of_event(event),
+            );
             if judged == Judgement::Allowed {
                 return None;
             }
@@ -1836,7 +1854,11 @@ impl<H: PostureHost> Rule for NnLNet009ByteAnomaly<H> {
         if nf.bytes_sent <= HIGH_VOLUME_BYTES_SENT {
             return None;
         }
-        let judged = self.allowlist.judge(nf.pid, &nf.comm);
+        let judged = self.allowlist.judge(
+            nf.pid,
+            &nf.comm,
+            crate::posture::lineage::AsOf::of_event(event),
+        );
         if judged == Judgement::Allowed {
             return None;
         }
@@ -1900,7 +1922,11 @@ impl<H: PostureHost> Rule for NnLNet010OutboundToHighRiskC2Port<H> {
         if !HIGH_RISK_C2_PORTS.contains(&nf.dst_port) {
             return None;
         }
-        let judged = self.allowlist.judge(nf.pid, &nf.comm);
+        let judged = self.allowlist.judge(
+            nf.pid,
+            &nf.comm,
+            crate::posture::lineage::AsOf::of_event(event),
+        );
         if judged == Judgement::Allowed {
             return None;
         }
@@ -1966,7 +1992,11 @@ impl<H: PostureHost> Rule for NnLNet011PlaintextCredService<H> {
         if !PLAINTEXT_CRED_PORTS.contains(&nf.dst_port) {
             return None;
         }
-        let judged = self.allowlist.judge(nf.pid, &nf.comm);
+        let judged = self.allowlist.judge(
+            nf.pid,
+            &nf.comm,
+            crate::posture::lineage::AsOf::of_event(event),
+        );
         if judged == Judgement::Allowed {
             return None;
         }
@@ -2044,7 +2074,11 @@ impl<H: PostureHost> Rule for NnLNet013Beacon<H> {
         // exec identity, once a beacon is seen (it costs more than a comm
         // lookup per flow). A trusted periodic client's flows now seed the
         // window too; the window is bounded.
-        let judged = self.allowlist.judge(nf.pid, &nf.comm);
+        let judged = self.allowlist.judge(
+            nf.pid,
+            &nf.comm,
+            crate::posture::lineage::AsOf::of_event(event),
+        );
         if judged == Judgement::Allowed {
             return None;
         }
@@ -2118,7 +2152,11 @@ impl<H: PostureHost> Rule for NnLNet018Rfc1918LateralPort<H> {
         if !LATERAL_MOVEMENT_PORTS.contains(&nf.dst_port) {
             return None;
         }
-        let judged = self.allowlist.judge(nf.pid, &nf.comm);
+        let judged = self.allowlist.judge(
+            nf.pid,
+            &nf.comm,
+            crate::posture::lineage::AsOf::of_event(event),
+        );
         if judged == Judgement::Allowed {
             return None;
         }
@@ -2205,7 +2243,11 @@ impl<H: PostureHost> Rule for NnLNet019WildcardListener<H> {
         if common == Some(true) {
             return None;
         }
-        let judged = self.allowlist.judge(nl.pid, &nl.comm);
+        let judged = self.allowlist.judge(
+            nl.pid,
+            &nl.comm,
+            crate::posture::lineage::AsOf::of_event(event),
+        );
         if judged == Judgement::Allowed {
             return None;
         }
@@ -3835,12 +3877,10 @@ mod tests {
     #[test]
     fn net_008_judges_the_connecting_process_image() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dir = tmp.path().join("4242");
-        std::fs::create_dir(&dir).unwrap();
-        crate::posture::host::testing::symlink("/dev/shm/dropper (deleted)", dir.join("exe"))
-            .unwrap();
         let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
-        let rule = NnLNet008OutboundFromTmpExec::new(Some(lineage));
+        // the dropper's exec, cached before the flow's connect (1 000 ns)
+        lineage.ingest_spawn(4242, 1, "/dev/shm/dropper", 500);
+        let rule = NnLNet008OutboundFromTmpExec::new(Some(lineage.clone()));
         let v = rule
             .evaluate(&flow_from(None, 4242, 8080))
             .expect("the staged image connects");
@@ -3850,6 +3890,28 @@ mod tests {
         // judged like any port; an unknown process is not guessed at
         assert!(rule.evaluate(&flow_from(None, 4242, 53)).is_some());
         assert!(rule.evaluate(&flow_from(None, 4243, 8080)).is_none());
+        // R12b (R-F): a process only `/proc` shows (no exec event cached:
+        // a forked child of the dropper) is named at its connect by the
+        // connect pump, which reads `/proc` while it runs
+        // (`AsOf::Live`, NETR-008: the row's `exe`); the judgement itself
+        // never reads `/proc`, whose image may be a later one — with no
+        // image in the row the process is not known
+        let dir = tmp.path().join("4244");
+        std::fs::create_dir(&dir).unwrap();
+        crate::posture::host::testing::symlink("/dev/shm/dropper (deleted)", dir.join("exe"))
+            .unwrap();
+        assert_eq!(
+            lineage.image_path_at(4244, 1_000).as_deref(),
+            Some("/dev/shm/dropper (deleted)"),
+            "the pump's read names it"
+        );
+        assert!(rule
+            .evaluate(&flow_from(Some("/dev/shm/dropper (deleted)"), 4244, 8080))
+            .is_some_and(|v| v.action == ResponseAction::KillProcess));
+        assert!(
+            rule.evaluate(&flow_from(None, 4244, 8080)).is_none(),
+            "inside the judgement: not known, no /proc"
+        );
     }
 
     /// External audit NETR-008: the review-49 carve-out — a package
@@ -4441,7 +4503,7 @@ mod tests {
                 .with_identity(lineage)
                 .with_conditional(
                     super::super::transfer_tools::TRANSFER_TOOLS,
-                    Arc::new(|pid| (pid == 8101).then_some("an exec from a staging directory")),
+                    Arc::new(|pid, _| (pid == 8101).then_some("an exec from a staging directory")),
                 ),
         );
         let rule = NnLNet010OutboundToHighRiskC2Port::new(allow);

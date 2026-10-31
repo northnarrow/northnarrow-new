@@ -163,8 +163,11 @@ pub struct SensorMultiplexer<G> {
     /// main loop polls [`Self::finished_pumps`]; a task that ended is a
     /// blind spot and stops the agent. R12b: the ring pumps are threads.
     pumps: Vec<(&'static str, Pump)>,
-    /// Lab PR 267 (R12a): the event bus's receiving end.
-    rx: BusReceiver,
+    /// Lab PR 267 (R12a): the event bus's receiving end — R12b: the
+    /// decision thread's while it runs ([`Self::take_receiver`]).
+    rx: Option<BusReceiver>,
+    /// The bus's counts (the receiver's, kept while it is taken).
+    bus_stats: BusStats,
     /// Tappa 9 C8: cloneable handle to the same event bus the sensor
     /// pumps feed. The FIM drain loop (also spawned at agent boot) clones
     /// this to push `Event::Fim` items into the same main-loop receiver —
@@ -518,7 +521,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     process_spawn_rb,
                     &tx,
                     &rt,
-                    no_carry::<ProcessSpawnRaw>,
+                    resolved::<ProcessSpawnRaw>,
                 )?),
             ),
             (
@@ -538,7 +541,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     exec_check_rb,
                     &tx,
                     &rt,
-                    no_carry::<ExecCheckRaw>,
+                    resolved::<ExecCheckRaw>,
                 )?),
             ),
             (
@@ -602,7 +605,8 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             Self {
                 ebpf,
                 pumps,
-                rx,
+                bus_stats: rx.stats(),
+                rx: Some(rx),
                 event_tx: tx,
                 bus_losses,
                 lineage: lineage_for_bus,
@@ -675,7 +679,25 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
 
     /// Lab PR 267 (R12a): the event bus's counts per queue, for the status.
     pub fn bus_stats(&self) -> BusStats {
-        self.rx.stats()
+        self.bus_stats.clone()
+    }
+
+    /// R12b (lab PR 269): the bus's receiving end, for the decision thread
+    /// (given back with [`Self::restore_receiver`] before the stop);
+    /// `None` while taken.
+    pub fn take_receiver(&mut self) -> Option<BusReceiver> {
+        self.rx.take()
+    }
+
+    /// R12b: the receiver back from the decision thread.
+    pub fn restore_receiver(&mut self, rx: BusReceiver) {
+        self.rx = Some(rx);
+    }
+
+    /// R12b: the lineage the receiver teaches the execs an event overtook
+    /// (the net wiring's; none without it).
+    pub fn lineage(&self) -> Option<AuthSessionTracker> {
+        self.lineage.clone()
     }
 
     /// Lab PR 267 (R12a): the bus's loss recorder, whose audit log and
@@ -688,7 +710,9 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     /// Lab PR 267 (R12a): the event the loop took last is decided (its
     /// latency, queue to decision, is counted).
     pub fn decided(&mut self) {
-        self.rx.decided();
+        if let Some(rx) = self.rx.as_mut() {
+            rx.decided();
+        }
     }
 
     /// Review #471 M3: the event loop stops — the bus takes no event any
@@ -696,7 +720,14 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     /// counted in a signed `event_bus_stop` row, and every drop not yet
     /// signed is signed ([`BusLosses::stop`]). The counts, P0 first.
     pub fn stop_bus(&mut self) -> [u64; nn_core::bus::QUEUES] {
-        let queued = self.rx.close();
+        let Some(rx) = self.rx.as_mut() else {
+            // the receiver is still the decision thread's (a caller that did
+            // not give it back): nothing to close or count here
+            warn!("event bus: stopped while its receiver was not given back — no stop row");
+            debug_assert!(false, "stop_bus without the receiver");
+            return [0; nn_core::bus::QUEUES];
+        };
+        let queued = rx.close();
         // Review of #474: the pump threads end (a batch they read and the
         // closed bus refuses is counted), at most two of their waits, so
         // the stop row counts it too
@@ -714,7 +745,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        self.bus_losses.stop(&self.rx.stats(), queued);
+        self.bus_losses.stop(&self.bus_stats, queued);
         queued
     }
 
@@ -762,7 +793,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     /// which the lineage has learned already; the event loop teaches the
     /// engine's rules (`RuleEngine::observe_arrival`) before judging it.
     pub async fn next_event(&mut self) -> Option<Received> {
-        self.rx.recv_with(self.lineage.as_ref()).await
+        self.rx.as_mut()?.recv_with(self.lineage.as_ref()).await
     }
 
     /// Lab PR 219: attach the exploit post-condition guard (detect mode)
@@ -1028,6 +1059,17 @@ fn no_carry<T>(_: &T, e: Event) -> (Event, [Option<Event>; 2]) {
     (e, [None, None])
 }
 
+/// R12b (lab PR 269, plan §3.4: the normalisation in the adapter): an
+/// exec's path made absolute in its pump, right after the kernel recorded
+/// it ([`crate::sensors::exe_identity::resolve`]: the mount table, and
+/// `/proc/<pid>/exe` for a relative path) — every exec delivered, before
+/// the bus; the decision reads no `/proc` for it, and the receiver hands
+/// over execs already resolved (review #471 B4).
+fn resolved<T>(_: &T, mut e: Event) -> (Event, [Option<Event>; 2]) {
+    crate::sensors::exe_identity::resolve(&mut e);
+    (e, [None, None])
+}
+
 /// R12b (lab PR 269): a ring's pump on a thread of its own, a source of
 /// the bus named `label`: each record of type `T` made into its event, and
 /// `after` makes it final and adds the events it carries (External audit
@@ -1093,16 +1135,38 @@ fn spawn_module_load_pump(
     rt: &tokio::runtime::Handle,
 ) -> Result<PumpThread> {
     let mut mounts: Option<crate::sensors::open_sensor::MountTable> = None;
-    let place = move |raw: &ModuleLoadRaw, mut e: Event| {
-        if let Event::ModuleLoad { path: Some(p), .. } = &mut e {
-            if raw.path_truncated == 0 {
-                let m = mounts.get_or_insert_with(crate::sensors::open_sensor::MountTable::load);
-                *p = module_path_on_host(m, (raw.root_dev, raw.root_ino), p);
-            }
-        }
-        (e, [None, None])
+    // R12b (lab PR 269): who installed the module file, asked here — the
+    // package database's I/O on this thread — and kept for R018's judgement
+    // (`ModuleOwners::refresh`).
+    let owners = ModuleOwners::default();
+    let place = move |raw: &ModuleLoadRaw, e: Event| {
+        let m = mounts.get_or_insert_with(crate::sensors::open_sensor::MountTable::load);
+        (placed(raw, e, m, &owners), [None, None])
     };
     spawn_ring_pump("module_load", rb, tx, rt, place)
+}
+
+/// The module-load pump's package database (R12b).
+type ModuleOwners =
+    nn_core::decision::rules::module_provenance::ModuleOwners<crate::chain_host_linux::LinuxHost>;
+
+/// A module load as the pump sends it: its path on the host's mount point
+/// (external audit PROC-005) and, R12b, who installed the file asked now
+/// and kept for R018 ([`ModuleOwners::refresh`]) — a path the kernel cut
+/// is neither.
+fn placed(
+    raw: &ModuleLoadRaw,
+    mut e: Event,
+    mounts: &mut crate::sensors::open_sensor::MountTable,
+    owners: &ModuleOwners,
+) -> Event {
+    if let Event::ModuleLoad { path: Some(p), .. } = &mut e {
+        if raw.path_truncated == 0 {
+            *p = module_path_on_host(mounts, (raw.root_dev, raw.root_ino), p);
+            owners.refresh(p);
+        }
+    }
+    e
 }
 
 /// A module path relative to its filesystem's root, on the host: under the
@@ -1577,6 +1641,52 @@ mod module_path_tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
 
+    /// R12b (lab PR 269): the module-load pump places the path and asks
+    /// the package database who installed the file, keeping the answer R018
+    /// judges the load on (no database read on the decision's thread).
+    #[test]
+    fn the_module_load_pump_asks_who_installed_the_file() {
+        use nn_core::decision::rules::module_provenance::Provenance;
+        let host = tempfile::tempdir().unwrap();
+        let info = host.path().join("var/lib/dpkg/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(host.path().join("var/lib/dpkg/status"), "Package: x\n").unwrap();
+        let owners = ModuleOwners::new(host.path());
+        let mut mounts = crate::sensors::open_sensor::MountTable::load();
+        let m = std::fs::metadata("/").unwrap();
+        let mut raw = ModuleLoadRaw::zeroed();
+        raw.root_dev = crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev());
+        raw.root_ino = m.ino();
+        let load = |path: &str| Event::ModuleLoad {
+            method: nn_model::ModuleLoadMethod::Finit,
+            loader_pid: 1,
+            loader_uid: 0,
+            loader_comm: "insmod".into(),
+            parent_comm: "sh".into(),
+            parent_is_kthread: false,
+            path: Some(path.into()),
+            timestamp_ns: 0,
+        };
+        let rk = "/lib/modules/6.8.0-1-generic/extra/k269-rk.ko";
+        let e = placed(&raw, load(rk), &mut mounts, &owners);
+        assert!(matches!(&e, Event::ModuleLoad { path: Some(p), .. } if p == rk));
+        // the database now lists it: the rule reads the pump's answer
+        std::fs::write(info.join("rk.list"), format!("{rk}\n")).unwrap();
+        assert_eq!(owners.of(rk), Provenance::Unowned, "asked by the pump");
+        // a cut path is not asked about
+        raw.path_truncated = 1;
+        let cut = "/lib/modules/x/k269-cut.ko";
+        let _ = placed(&raw, load(cut), &mut mounts, &owners);
+        std::fs::write(info.join("cut.list"), format!("{cut}\n")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(host.path().join("var/lib/dpkg/status"), "Package: cut\n").unwrap();
+        assert_eq!(
+            owners.of(cut),
+            Provenance::Package,
+            "no answer kept: asked here"
+        );
+    }
+
     /// External audit PROC-005: a module path is put on its filesystem's
     /// mount point; a filesystem no mount shows is no module directory.
     #[test]
@@ -1620,6 +1730,38 @@ mod tests {
         }
         assert_eq!(finished(&pumps), vec!["fs_protect", "open_sensor"]);
         pumps[0].1.stop();
+    }
+
+    /// R12b (lab PR 269): the exec pumps make an exec's path absolute
+    /// before the bus (`resolved`): the string normalised when it is
+    /// absolute and the kernel resolved none.
+    #[test]
+    fn an_exec_is_resolved_in_its_pump() {
+        let spawn = Event::ProcessSpawn {
+            pid: u32::MAX - 7,
+            ppid: 1,
+            uid: 0,
+            gid: 0,
+            comm: "ls".into(),
+            filename: "/usr/bin/./../bin/ls".into(),
+            timestamp_ns: 1,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+            start_ns: 1,
+            parent_is_kthread: false,
+            exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        };
+        let raw = ProcessSpawnRaw::zeroed();
+        let (out, carried) = resolved(&raw, spawn);
+        assert!(carried.iter().all(Option::is_none));
+        let Event::ProcessSpawn { exe, .. } = out else {
+            panic!("{out:?}");
+        };
+        assert_eq!(exe.path, "/usr/bin/ls");
     }
 
     fn wiring(lineage: AuthSessionTracker) -> ConnectWiring {

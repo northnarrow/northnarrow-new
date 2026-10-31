@@ -59,8 +59,13 @@ pub const KNOWN_BPF_PROGRAMS: &[&str] = &[
 /// External audit NETR-003 class: the known tooling and the operator
 /// allowlist judged on what the kernel ran, not on the `comm` a process
 /// names itself.
-fn judge<H: PostureHost>(allowlist: &CommAllowlist<H>, pid: u32, comm: &str) -> Judgement {
-    allowlist.judge_with(pid, comm, KNOWN_BPF_PROGRAMS)
+fn judge<H: PostureHost>(
+    allowlist: &CommAllowlist<H>,
+    pid: u32,
+    comm: &str,
+    as_of: crate::posture::lineage::AsOf,
+) -> Judgement {
+    allowlist.judge_with(pid, comm, KNOWN_BPF_PROGRAMS, as_of)
 }
 
 pub struct NnLBpf001BpfProgramLoaded<H: PostureHost> {
@@ -101,7 +106,12 @@ impl<H: PostureHost> Rule for NnLBpf001BpfProgramLoaded<H> {
         if !matches!(*cmd, BPF_PROG_LOAD | BPF_PROG_ATTACH | BPF_LINK_CREATE) {
             return None;
         }
-        let judgement = judge(&self.allowlist, *pid, comm);
+        let judgement = judge(
+            &self.allowlist,
+            *pid,
+            comm,
+            crate::posture::lineage::AsOf::of_event(event),
+        );
         if judgement == Judgement::Allowed {
             return None;
         }
@@ -175,7 +185,12 @@ impl<H: PostureHost> Rule for NnLBpf002BpfForeignHandleOrDetach<H> {
         // Touching the agent's own objects is never exempt: a listed tool
         // doing it is still tampering.
         let judgement = if detach {
-            judge(&self.allowlist, *pid, comm)
+            judge(
+                &self.allowlist,
+                *pid,
+                comm,
+                crate::posture::lineage::AsOf::of_event(event),
+            )
         } else {
             Judgement::Denied { claimed: false }
         };

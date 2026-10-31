@@ -1350,6 +1350,46 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- The decision on a thread of its own, without `await` (lab PR 269, Wave 4
+  phase 2, R12b-2 of the restructure plan; `docs/architecture/EVENT_BUS.md`
+  §2d, §3). `nn-decision` takes each event from the bus, judges it and
+  counts its delay; the event loop's task keeps the signals, the admin
+  shutdown and the telemetry tasks' liveness. Off the decision: an exec's
+  path made absolute in its pump (every exec; the receiver reads no
+  `/proc`), systemd's state a snapshot the systemd watch refreshes (a
+  relayed signal judged on an answer at most a second old, else handed to
+  the watch, which asks and hands it back answered to the decision
+  thread), the
+  trusted-installer window's expiry its tick's, a canary trip's access row
+  and registry mark written by `nn-canary-log` (a full queue holds a trip
+  at most 100 ms, then its rows are counted), a kernel module's package
+  ownership asked by the module-load pump and kept for R018. What is still
+  I/O on the decision thread is listed in `EVENT_BUS.md` §2d: the responses
+  (R12c), the ransomware tracker's sampler on a burst, the per-rule
+  policy's exemption facts, a canary trip's reader. A ratchet, over a list
+  that includes the responses' code, keeps any more off the decision path
+  (`xtask/tests/decision_path_io.rs`). The lineage takes the judgement's
+  time as a parameter (`AsOf`; the thread-local `judged_at` is gone), and
+  in a judgement a pid its cache does not hold is not known — never read
+  from `/proc` (R-F); the agent's start enters the processes already
+  running into the cache once the exec sensors are attached, so the boot's
+  daemons and older sessions are known (review of #475). The process-wide
+  cache of systemd's answer is gone (the snapshot keeps it). The lineage's
+  cache is bounded by process lifetime — a sweep thread marks the exited
+  processes, only their entries are dropped past 2,048 (after a grace), a
+  live one's never for newer ones — and a fork that never executes runs its
+  parent's image while `/proc/<pid>/exe` is that file (the re-review of
+  #475: a daemon pushed out by 2,048 other execs was killed at its first
+  read of a canary). A full cap table raises `TelemetryLoss` for any uid
+  and releases an ended key first; a stuck canary writer costs one wait.
+  After the third review of #475: a daemon that forks and exits after the
+  start (`Type=forking`, `daemon()`) is its image's orphan once the sweep
+  found its parent gone; a pid reused by a fork is no longer judged as the
+  dead process's image (a session's subshell stays auth-mediated); the
+  hard bound drops the most numerous account's entries first, whatever its
+  class, and raises `TelemetryLoss`; the released cap keys are bounded,
+  their counts summed. An adopted orphan runs its image from the sweep's
+  instant only (the final check of #475).
 - The ring pumps on threads of their own, sending in batches (lab PR 269,
   Wave 4 phase 2, R12b-1 of the restructure plan;
   `docs/architecture/EVENT_BUS.md` §2a–2c, §5). Each ring's pump — the

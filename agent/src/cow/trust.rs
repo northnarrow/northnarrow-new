@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 
-use crate::posture::lineage::{in_system_tree, is_interpreter, AuthSessionTracker, ExecIdentity};
+use crate::posture::lineage::{
+    in_system_tree, is_interpreter, AsOf, AuthSessionTracker, ExecIdentity,
+};
 
 /// Editors and the version-control client: programs a person runs to
 /// change their own files. Generic tools (`cp`, `dd`, `tar`, `rsync`,
@@ -244,12 +246,14 @@ impl TrustFilter {
                 return std::sync::Arc::clone(info);
             }
         }
-        let lineage = self.tracker.lineage_identities(tgid);
+        // The fanotify reader judges the writer now, at its open (no event
+        // of the bus: `AsOf::Now`, `/proc` on a cache miss).
+        let lineage = self.tracker.lineage_identities(tgid, AsOf::Now);
         let writers: Vec<&str> = self.writers.iter().map(String::as_str).collect();
         let trust = judge(
             lineage.as_deref(),
             &writers,
-            self.tracker.in_package_transaction(tgid, 0),
+            self.tracker.in_package_transaction(tgid, AsOf::Now),
         );
         let program = lineage
             .as_ref()
@@ -471,7 +475,7 @@ mod tests {
             15,
             1000,
         );
-        let l = t.lineage_identities(300).unwrap();
+        let l = t.lineage_identities(300, AsOf::Now).unwrap();
         assert_eq!(l.len(), 2);
         assert_eq!(l[0].0, 300);
         assert_eq!(l[0].1.script.as_deref(), Some("/home/u/sim.py"));

@@ -134,9 +134,12 @@ impl<H: PostureHost> CanaryReaders<H> {
     }
 
     /// The executable (or script) `pid` runs when it is a reader, else
-    /// `None` — also when what it runs cannot be told any more.
-    pub fn reader(&self, pid: u32) -> Option<String> {
-        let id = self.identity.as_ref()?.exec_identity(pid)?;
+    /// `None` — also when what it runs cannot be told any more. As of
+    /// `as_of` (R12b, R-F: the trip's time — a reader that executes
+    /// `restic` after the read is no reader; in a judgement the spawn cache
+    /// only).
+    pub fn reader(&self, pid: u32, as_of: crate::posture::lineage::AsOf) -> Option<String> {
+        let id = self.identity.as_ref()?.exec_identity(pid, as_of)?;
         let mut entries: Vec<&str> = CANARY_READERS.to_vec();
         entries.extend(self.extra.iter().map(String::as_str));
         if !id.is_client(&entries) {
@@ -184,16 +187,36 @@ mod tests {
         );
         t.ingest_spawn_with_argv(4103, 1, "/usr/bin/tar", &["tar".into()], 1);
         let r = CanaryReaders::new(BTreeSet::new(), t);
-        assert_eq!(r.reader(4100).as_deref(), Some("/usr/bin/restic"));
-        assert_eq!(r.reader(4101), None, "a copy outside the system trees");
         assert_eq!(
-            r.reader(4102).as_deref(),
+            r.reader(4100, crate::posture::lineage::AsOf::Now)
+                .as_deref(),
+            Some("/usr/bin/restic")
+        );
+        assert_eq!(
+            r.reader(4101, crate::posture::lineage::AsOf::Now),
+            None,
+            "a copy outside the system trees"
+        );
+        assert_eq!(
+            r.reader(4102, crate::posture::lineage::AsOf::Now)
+                .as_deref(),
             Some("/usr/bin/borg"),
             "a script, by name"
         );
-        assert_eq!(r.reader(4103), None, "tar is the operator's to add");
-        assert_eq!(r.reader(4199), None, "unknown pid");
-        assert_eq!(CanaryReaders::none().reader(4100), None);
+        assert_eq!(
+            r.reader(4103, crate::posture::lineage::AsOf::Now),
+            None,
+            "tar is the operator's to add"
+        );
+        assert_eq!(
+            r.reader(4199, crate::posture::lineage::AsOf::Now),
+            None,
+            "unknown pid"
+        );
+        assert_eq!(
+            CanaryReaders::none().reader(4100, crate::posture::lineage::AsOf::Now),
+            None
+        );
     }
 
     #[test]
@@ -203,8 +226,8 @@ mod tests {
         t.ingest_spawn_with_argv(4201, 1, "/opt/acme-backup/bin/agent", &["agent".into()], 1);
         let extra: BTreeSet<String> = ["tar".to_string(), "/opt/acme-backup/".to_string()].into();
         let r = CanaryReaders::new(extra, t);
-        assert!(r.reader(4200).is_some());
-        assert!(r.reader(4201).is_some());
+        assert!(r.reader(4200, crate::posture::lineage::AsOf::Now).is_some());
+        assert!(r.reader(4201, crate::posture::lineage::AsOf::Now).is_some());
     }
 
     #[test]
@@ -230,5 +253,87 @@ mod tests {
         assert!(r.extra.is_empty(), "refused whole");
         let r = CanaryReaders::load(&content("# the nightly backup\n+tar\n"), t);
         assert!(r.extra.contains("tar"));
+    }
+
+    /// Review of #475: an anti-malware daemon running since before the
+    /// agent (the start's scan entered it) is still a reader in a
+    /// judgement after 2,100 execs of other processes — the cache keeps a
+    /// live process's entry, so CANARY-001's reader exemption holds and
+    /// the daemon is not killed at its first read of a canary.
+    #[test]
+    fn a_daemon_older_than_the_agent_stays_a_reader_after_2100_other_execs() {
+        use crate::posture::lineage::AsOf;
+        const S: u64 = 1_000_000_000;
+        let (dir, t) = tracker();
+        let d = dir.path().join("500");
+        std::fs::create_dir_all(&d).unwrap();
+        crate::posture::host::testing::symlink("/usr/sbin/clamd", d.join("exe")).unwrap();
+        std::fs::write(
+            d.join("status"),
+            "Name:\tclamd\nPid:\t500\nPPid:\t1\nUid:\t0\t0\t0\t0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("stat"),
+            "500 (clamd) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n",
+        )
+        .unwrap();
+        assert_eq!(t.seed_from_proc(), 1);
+        for i in 0..2_100u64 {
+            t.ingest_exec(
+                10_000 + i as u32,
+                1,
+                "/usr/bin/true",
+                &[],
+                (10 + i) * S,
+                (10 + i) * S,
+                0,
+            );
+        }
+        t.sweep();
+        let r = CanaryReaders::new(BTreeSet::new(), t);
+        assert_eq!(
+            r.reader(500, AsOf::Judged(3_000 * S)).as_deref(),
+            Some("/usr/sbin/clamd")
+        );
+    }
+
+    /// Third review of #475 (X1): an anti-malware daemon started after the
+    /// agent that forks and exits (`Type=forking`) — its child reparented to
+    /// pid 1 — is a reader once the sweep found its parent gone: CANARY-001's
+    /// exemption holds for the daemon that does the reading.
+    #[test]
+    fn a_daemon_that_forked_after_the_agent_s_start_is_a_reader_once_swept() {
+        use crate::posture::lineage::AsOf;
+        const S: u64 = 1_000_000_000;
+        let (dir, t) = tracker();
+        t.ingest_exec(500, 1, "/usr/sbin/clamd", &[], 10 * S, 10 * S, 0);
+        let d = dir.path().join("501");
+        std::fs::create_dir_all(&d).unwrap();
+        crate::posture::host::testing::symlink("/usr/sbin/clamd", d.join("exe")).unwrap();
+        std::fs::write(
+            d.join("status"),
+            "Name:\tclamd\nPid:\t501\nPPid:\t1\nUid:\t0\t0\t0\t0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("stat"),
+            "501 (clamd) S 1 501 501 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 1005 0 0\n",
+        )
+        .unwrap();
+        assert_eq!(t.sweep().orphans, 1);
+        let r = CanaryReaders::new(BTreeSet::new(), t);
+        // a read after the sweep (an orphan counts from its instant)
+        use crate::posture::host::PostureHost as _;
+        assert_eq!(
+            r.reader(501, AsOf::Judged(TestHost::monotonic_ns()))
+                .as_deref(),
+            Some("/usr/sbin/clamd")
+        );
+        assert_eq!(
+            r.reader(501, AsOf::Judged(20 * S)),
+            None,
+            "before the sweep"
+        );
     }
 }

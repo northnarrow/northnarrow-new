@@ -33,7 +33,7 @@ mod support;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use support::{repo_root, rs_files, strip_comments};
+use support::{is_test_file, matching_brace, production, repo_root, rs_files, strip_comments};
 
 /// Why a static is one per process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,12 +179,6 @@ const STATICS: &[Kept] = &[
         HostFact,
         "whether `/proc/1/root` is reachable",
     ),
-    kept(
-        "agent/src/pipeline/mod.rs",
-        "LAST",
-        HostFact,
-        "systemd's state, kept a second for the event loop's and the shutdown watch's asks",
-    ),
     // ── nn-core ──
     kept(
         "crates/nn-core/src/detection_budget.rs",
@@ -199,13 +193,6 @@ const STATICS: &[Kept] = &[
         "CONNECT_VERDICTS",
         Telemetry,
         "verdicts given at a connect, `net status`",
-    ),
-    kept(
-        "crates/nn-core/src/posture/lineage.rs",
-        "JUDGED_AT",
-        Scratch,
-        "a thread-local: the time of the event being judged (lab PR 267, review #471 A1), set \
-         and restored around its synchronous judgement (`lineage::judged_at`)",
     ),
     kept(
         "crates/nn-core/src/decision/response_policy.rs",
@@ -369,6 +356,14 @@ const STATICS: &[Kept] = &[
         "the exploit guard's counters of the one eBPF object, as sampled",
     ),
     kept(
+        "crates/nn-core/src/decision/rules/module_provenance.rs",
+        "OWNERSHIP",
+        HostFact,
+        "R12b (lab PR 269): the package database's answer for each kernel module file the \
+         module-load pump read a load of, which R018 judges the load on (one host, one package \
+         database; bounded, asked again at every load)",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/exe_identity.rs",
         "MOUNTS",
         HostFact,
@@ -497,11 +492,6 @@ const STATICS: &[Kept] = &[
 /// and why each may: `module::function`.
 const START_CALLS: &[(&str, &str)] = &[
     (
-        "lineage::judged_at",
-        "scopes the lineage lookups of one event's synchronous judgement to its time (a \
-         thread-local set and restored within the call, lab PR 267)",
-    ),
-    (
         "loop_progress::start",
         "fixes the event loop's heartbeat origin at the process's start",
     ),
@@ -560,10 +550,6 @@ const START_CALLS: &[(&str, &str)] = &[
         "arms the kernel's connect deny of the one eBPF object",
     ),
     (
-        "exe_identity::resolve",
-        "an exec event's path made absolute with the host's mount table",
-    ),
-    (
         "btf_revalidate::resolved",
         "the running kernel's offsets, for the manifest",
     ),
@@ -578,10 +564,6 @@ const START_CALLS: &[(&str, &str)] = &[
     (
         "log_escape::stdout_ansi",
         "the logger's setup: whether the process's stdout is a terminal",
-    ),
-    (
-        "systemd_state",
-        "asks systemd's state (kept a second): the event loop's and the shutdown watch's",
     ),
 ];
 
@@ -603,69 +585,6 @@ fn agent_dirs(root: &Path) -> Vec<String> {
     crates.sort();
     dirs.extend(crates);
     dirs
-}
-
-/// A test file: `tests.rs`, `*_tests.rs`.
-fn is_test_file(rel: &str) -> bool {
-    let name = rel.rsplit('/').next().unwrap_or(rel);
-    name == "tests.rs" || name.ends_with("_tests.rs")
-}
-
-/// `code` (comments blanked) with its test items blanked: each item under
-/// `#[cfg(test)]` or `#[cfg(any(test, …))]` — a module's or a block's
-/// braces, or up to its `;` — newlines kept.
-fn production(code: &str) -> String {
-    let mut out = code.as_bytes().to_vec();
-    let mut from = 0;
-    while let Some(at) = find_test_cfg(code, from) {
-        let rest = &code[at..];
-        // the item: past the attribute, to its closing brace or `;`
-        let attr_end = at + rest.find(']').map_or(rest.len(), |i| i + 1);
-        let item = &code[attr_end..];
-        let brace = item.find('{');
-        let semi = item.find(';');
-        let end = match (brace, semi) {
-            (Some(b), Some(s)) if s < b => attr_end + s + 1,
-            (Some(b), _) => attr_end + b + matching_brace(&item[b..]),
-            (None, Some(s)) => attr_end + s + 1,
-            (None, None) => code.len(),
-        };
-        for c in &mut out[at..end] {
-            if *c != b'\n' {
-                *c = b' ';
-            }
-        }
-        from = end;
-    }
-    String::from_utf8(out).expect("ASCII blanks keep UTF-8")
-}
-
-/// The next `#[cfg(test)]` / `#[cfg(any(test` at or after `from`.
-fn find_test_cfg(code: &str, from: usize) -> Option<usize> {
-    let a = code[from..].find("#[cfg(test)]").map(|i| from + i);
-    let b = code[from..].find("#[cfg(any(test").map(|i| from + i);
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
-}
-
-/// The length up to and including the brace that closes `s`'s first `{`.
-fn matching_brace(s: &str) -> usize {
-    let mut depth = 0usize;
-    for (i, c) in s.char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return i + 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    s.len()
 }
 
 /// The statics of `code` (production code): their names, in order. A

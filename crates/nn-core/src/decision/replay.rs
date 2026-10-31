@@ -136,14 +136,13 @@ pub fn decide<H: DecisionHost>(
     event: &Event,
 ) -> Value {
     lineage.ingest_spawn_event(event);
-    // Lab PR 267 (review #471 A1): judged as of the event's own time, as
-    // `process_event` judges it.
-    crate::posture::lineage::judged_at(crate::posture::lineage::event_time_ns(event), || {
-        decide_now(engine, event)
-    })
+    // Lab PR 267 (review #471 A1), R12b (R-F): each judge looks the
+    // lineage up as of the event's own time, which it takes from the event
+    // (`AsOf::of_event`), as `process_event` judges it.
+    decide_now(engine, event)
 }
 
-/// [`decide`] without the ingest, as of the scope the caller set.
+/// [`decide`] without the ingest.
 fn decide_now<H: DecisionHost>(engine: &RuleEngine<H>, event: &Event) -> Value {
     match event {
         Event::FsProtectDenial { .. } => {

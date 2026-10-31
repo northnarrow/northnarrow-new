@@ -1253,8 +1253,11 @@ fn assert_fifo_order(lanes: &[usize], order: &[usize]) {
 /// models, and what the bus's own tests cannot see — the engine's rules
 /// learn the execs an event overtook (`Received::overtaken`) before the
 /// event is judged, and when the loop ends the bus is stopped: what it
-/// still holds counted and signed, every drop signed. The loop needs the
-/// whole agent to run, so its source is pinned (comments left out).
+/// still holds counted and signed, every drop signed. R12b (lab PR 269):
+/// the judging is the decision thread's (`decision_loop`), its delay
+/// counted after the judgement; the loop stops the thread and joins it,
+/// and waits for the canary trips' writer, before the bus is stopped. The loop needs the whole agent to run, so its
+/// source is pinned (comments left out).
 #[test]
 fn the_event_loop_wires_the_bus_as_modelled() {
     let src = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/run_loop.rs"));
@@ -1269,50 +1272,88 @@ fn the_event_loop_wires_the_bus_as_modelled() {
             .map(|i| from + i)
             .unwrap_or_else(|| panic!("run_loop.rs: `{what}` not found after byte {from}"))
     };
-    let arm = at("Some(received) => {", 0);
+    // the decision thread: one judging site, `judge`, the probe first
+    let thread = at("fn decision_loop(", 0);
+    let judge_fn = at("let judge = |e: nn_model::Event| {", thread);
+    let probe = at("probe.observe(&e);", judge_fn);
+    let judging = at("process_event(", probe);
+    let answered = at("for e in systemd.take_answered() {", judging);
+    assert!(
+        code[answered..].find("judge(e);").is_some(),
+        "a signal the systemd watch answered is judged"
+    );
+    let arm = at("Recv::Event(received) => {", answered);
     let each = at("for exec in &received.overtaken {", arm);
-    let teach = at("engine.observe_arrival(exec);", each);
+    let teach = at("p.engine.observe_arrival(exec);", each);
     assert!(
         !code[each..teach].contains('}'),
         "observe_arrival is the loop over the overtaken execs"
     );
     let event = at("let e = received.envelope.event;", arm);
-    let judge = at("process_event(", arm);
+    let judge = at("judge(e);", event);
     assert!(
         teach < event && event < judge,
         "taught before the event is judged"
     );
-    let stop = at("sensor.stop_bus();", judge);
+    let decided = at("rx.decided();", judge);
+    assert!(
+        !code[judge..decided].contains("Recv::"),
+        "the delay counted after the judgement, in the same arm"
+    );
+    // the loop: the thread stopped and joined, then the bus stopped
+    let run = at("pub(crate) async fn run(", 0);
+    let spawn = at("decision_loop(&mut rx", run);
+    let stopped = at("ctl.stop.store(true, Ordering::Release);", spawn);
+    let joined = at("decider.join()", stopped);
+    let back = at("sensor.restore_receiver(rx);", joined);
+    let flushed = at("d.flush(", back);
+    let stop = at("sensor.stop_bus();", flushed);
     let reported = at("Stopped {", stop);
     assert!(
-        code[judge..stop].contains("break;") && !code[stop..reported].contains("break;"),
-        "the bus is stopped after the loop, before the stop is reported"
+        stop < reported && reported < thread,
+        "the bus is stopped after the thread is joined, before the stop is reported"
     );
     assert_eq!(code.matches("sensor.stop_bus();").count(), 1);
+    assert_eq!(
+        code.matches("process_event(").count(),
+        1,
+        "one judging site"
+    );
 }
 
-/// Review #471 A1: the event loop judges each event as of its own time,
-/// as the replay this test runs does (`replay::decide`): the canary
+/// Review #471 A1, R12b (R-F of its second review): each event is judged
+/// as of its own time, as the replay this test runs does
+/// (`replay::decide`) — by the judges themselves, explicitly: the canary
 /// detector, the posture, the ladder, the copy-on-write guard and the
-/// engine all inside `judged_at(at, ..)`, `at` the event's
-/// `event_time_ns`. The loop's pipeline needs the whole agent, so its
-/// source is pinned (comments left out).
+/// engine are given the event judged, and every lineage lookup they make
+/// takes its time from it (`AsOf::of_event`, `AsOf::judged(<its time>)`).
+/// R12a scoped them with a thread-local around the calls (`judged_at`),
+/// which a call made outside the scope missed (the N6 mutation); there is
+/// no scope any more to miss. What replaces the check:
+/// - the loop gives the five judges the event itself, and no scope;
+/// - the lineage has no thread-local time;
+/// - the judging code (`nn-core`'s decision, posture, canary, impair,
+///   impact, FIM and allowlist modules) names no lookup that is not the
+///   judged event's — `AsOf::Now`, `AsOf::Live`, `image_path(…)` (now),
+///   `image_path_at(…)` (a pump's read) — but the listed ones, each with
+///   its reason: a new one fails here until it is the event's time or
+///   listed. The behaviour is the property test's and the lineage's unit
+///   tests'.
 #[test]
 fn the_event_loop_judges_each_event_as_of_its_time() {
-    let src = include_str!(concat!(
+    let strip = |src: &str| -> String {
+        let code = src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .map_or(src, |end| &src[..end]);
+        code.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let code = strip(include_str!(concat!(
         env!("NN_REPO_ROOT"),
         "/agent/src/pipeline/process_event.rs"
-    ));
-    let code: String = src
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(
-        code.matches("let at = event_time_ns(&event);").count(),
-        1,
-        "the judged time is the event's"
-    );
+    )));
     let calls = [
         ".process_event(&event)",
         "posture.observe(&event",
@@ -1321,21 +1362,85 @@ fn the_event_loop_judges_each_event_as_of_its_time() {
         "engine.decide(&event)",
     ];
     for call in calls {
-        let sites: Vec<usize> = code.match_indices(call).map(|(i, _)| i).collect();
-        assert!(!sites.is_empty(), "process_event.rs: no `{call}`");
-        for i in sites {
-            let scope = code[..i].rfind("judged_at(at, ||");
-            let stmt = code[..i].rfind(';').unwrap_or(0);
-            assert!(
-                scope.is_some_and(|j| j > stmt),
-                "`{call}` at byte {i} is judged outside `judged_at(at, ..)`"
-            );
+        assert!(code.contains(call), "process_event.rs: no `{call}`");
+    }
+    assert!(
+        !code.contains("judged_at") && !code.contains("AsOf::Now") && !code.contains("AsOf::Live"),
+        "process_event.rs scopes no judgement and names no other time"
+    );
+    let lineage = strip(include_str!(concat!(
+        env!("NN_REPO_ROOT"),
+        "/crates/nn-core/src/posture/lineage.rs"
+    )));
+    assert!(
+        !lineage.contains("thread_local!") && !lineage.contains("JUDGED_AT"),
+        "the lineage keeps no time per thread"
+    );
+    // (file under crates/nn-core/src, what, how many, why)
+    const OUTSIDE_THE_EVENT: &[(&str, &str, usize, &str)] = &[(
+        "impair/mod.rs",
+        "AsOf::Now",
+        1,
+        "scan_proc: the security tools' processes running now (the boot's scan, a rescan)",
+    )];
+    const NOT_THE_EVENT: [&str; 6] = [
+        "AsOf::Now",
+        "AsOf::Live",
+        "AsOf::live(",
+        ".image_path(",
+        ".image_path_at(",
+        ".image_at(",
+    ];
+    let root = std::path::Path::new(concat!(env!("NN_REPO_ROOT"), "/crates/nn-core/src"));
+    let mut files = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap().map(|e| e.unwrap().path()) {
+            if e.is_dir() {
+                dirs.push(e);
+            } else if e.extension().is_some_and(|x| x == "rs") {
+                files.push(e);
+            }
         }
     }
+    let judging = [
+        "decision/",
+        "posture/",
+        "canary/",
+        "impair/",
+        "impact/",
+        "fim/rules.rs",
+        "config/comm_allowlist.rs",
+    ];
+    let mut found = Vec::new();
+    for f in &files {
+        let rel = f.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+        let name = f.file_name().unwrap().to_string_lossy().into_owned();
+        if !judging.iter().any(|j| rel.starts_with(j))
+            || rel == "posture/lineage.rs"
+            || name == "tests.rs"
+            || name.ends_with("_tests.rs")
+        {
+            continue;
+        }
+        let code = strip(&std::fs::read_to_string(f).unwrap());
+        for what in NOT_THE_EVENT {
+            let n = code.matches(what).count();
+            if n > 0 {
+                found.push((rel.clone(), what, n));
+            }
+        }
+    }
+    found.sort();
+    let mut listed: Vec<(String, &str, usize)> = OUTSIDE_THE_EVENT
+        .iter()
+        .map(|(f, w, n, _)| (f.to_string(), *w, *n))
+        .collect();
+    listed.sort();
     assert_eq!(
-        code.matches("judged_at(").count(),
-        code.matches("judged_at(at, ||").count(),
-        "every scope is the event's time"
+        found, listed,
+        "a lookup of the judging code that is not as of the judged event: make it the event's \
+         time, or list it with its reason"
     );
 }
 

@@ -422,7 +422,32 @@ impl Host {
         for p in &case.procs {
             host.start(p.clone());
         }
+        host.write_self(case);
         host
+    }
+
+    /// R12b: the agent's own `/proc/self/stat`, its start a tick after the
+    /// case's processes — they ran before the agent (a host whose agent
+    /// restarted under its sessions), their execs could never be seen: the
+    /// start's scan enters them into the lineage (review of #475, R-F), and
+    /// a lookup outside a judgement that reads `/proc` holds them valid
+    /// (`held_validly`); a process the stream starts is the agent's to see.
+    fn write_self(&self, case: &Case) {
+        let tick = 1_000_000_000 / USER_HZ;
+        let ticks = case
+            .procs
+            .iter()
+            .map(|p| p.start_ns / tick)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let d = self.proc_root.join("self");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("stat"),
+            format!("1 (northnarrow-age) S 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"),
+        )
+        .unwrap();
     }
 
     fn note(&self, v: Value) {
@@ -995,6 +1020,10 @@ impl Replay {
         let host = Arc::new(Host::new(case, &proc_root));
         let fixture = Path::new(GOLDEN_DIR).join("host");
         let lineage = AuthSessionTracker::new(&proc_root).with_host_root(&fixture);
+        // Review of #475 (R-F): the agent's start enters the processes
+        // already running into the lineage (`seed_from_proc`); the case's
+        // processes are those
+        lineage.seed_from_proc();
 
         // The signed audit log and its key (`boot`: the agent's). Lab PR
         // 249: a fixed key, the replay's clock and the replayed agent's pid,

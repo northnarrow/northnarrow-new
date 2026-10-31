@@ -12,31 +12,35 @@ use northnarrow_agent::posture::PostureMachine;
 use northnarrow_agent::response::Executor;
 use tracing::{debug, error, info, warn};
 
-use nn_core::posture::lineage::{event_time_ns, judged_at};
-
-use super::{systemd_state, HostStopping};
+use super::{HostStopping, SystemdAnswer, SystemdSnapshot};
 
 /// Categorise + log + evaluate + (maybe) execute.
 ///
 /// Tappa 4 ships five sensors; Tappa 2 rules only match `ProcessSpawn`,
 /// so non-spawn events flow through as DEBUG telemetry and bypass the
-/// engine. The kill syscalls + verify retries can sleep up to 50 ms,
-/// so any execution dispatch goes through `spawn_blocking`.
+/// engine.
 ///
 /// Tappa 6: every event also lands in the correlation buffer, the recent
 /// events the posture triggers read. An event no rule matches gets no
 /// verdict: the LLM advisor that judged such execs was removed in Wave 4
 /// (lab PR 214).
+///
+/// R12b (lab PR 269, plan §3.4): the decision thread's — no `await`, and no
+/// blocking I/O of its own (the guard: xtask `decision_path_io`): an
+/// exec's path is made absolute in its pump, systemd's state is the watch's
+/// snapshot, the trusted-installer window's expiry is its tick's (external
+/// audit ATP-003), the canary's access row its writer's. The responses a
+/// decision runs still run here, in order, before the next event (the kill
+/// syscalls and their verify retries, up to 50 ms): their dispatcher is
+/// R12c's.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn process_event(
+pub(crate) fn process_event(
     engine: &RuleEngine,
     executor: &Executor,
     correlation: &CorrelationBuffer,
     posture: &PostureMachine,
     ladder: &northnarrow_agent::combat::CombatLadder,
     canary_detector: Option<&northnarrow_agent::canary::detector::Detector>,
-    // FIM-009 self-upgrade (§15.1): consulted for lazy TTL expiry.
-    installer_override: &northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
     // Tappa 9.0.a: detection-persistence sink. `None` ⇒ not persisting
     // this boot (e.g. signing key / store open failed at startup). All
     // record calls are off the hot path (bounded queue + writer task).
@@ -46,6 +50,8 @@ pub(crate) async fn process_event(
     // host's stop, the copy-on-first-write guard.
     expected_denial: &northnarrow_agent::boot::deny_selftest::ExpectedDenial,
     host_stopping: &HostStopping,
+    // R12b (lab PR 269): systemd's state, the watch's snapshot.
+    systemd: &SystemdSnapshot,
     cow_guard: &northnarrow_agent::cow::CowGuard,
     event: Event,
 ) {
@@ -55,21 +61,17 @@ pub(crate) async fn process_event(
     if expected_denial.take(&event) {
         return;
     }
-    // Tappa 10.9 step 2: an exec event's path made absolute before any
-    // consumer reads it (review 61).
-    let mut event = event;
-    northnarrow_agent::sensors::exe_identity::resolve(&mut event);
+    // Tappa 10.9 step 2: an exec event's path is absolute before any
+    // consumer reads it (review 61) — R12b: made so in its pump
+    // (`multiplexer::resolved`), right after the kernel recorded it.
     // Lab PR 223: the exec quarantine resumes a held process only once
     // this exec has been judged — dropped at the end of this function,
     // after a kill the rules decided was carried out.
     let _execq_judged = northnarrow_agent::execq::SpawnGuard::for_event(&event);
-    // FIM-009 self-upgrade (§15.1): lazy TTL expiry on the event path —
-    // if a trusted-installer window has passed its deadline, close it
-    // (re-engage the FS pin + audit) before handling this event. A cheap
-    // no-op (a single atomic load) when no window is open. No timer:
-    // detection already expires exactly at the deadline via the rule's
-    // own is_window_open() read; this sweep re-syncs the kernel map.
-    installer_override.close_if_expired(Instant::now());
+    // FIM-009 self-upgrade (§15.1): a trusted-installer window past its
+    // deadline is closed by its tick (external audit ATP-003, every second;
+    // the kernel's grant ends at the deadline by itself, and the rule reads
+    // the window's own deadline) — R12b: no longer swept here.
 
     // External audit EBPF-001: while systemd stops the host, its SIGTERM to
     // the agent and the watchdog is refused until `systemd-shutdown` (the
@@ -83,7 +85,19 @@ pub(crate) async fn process_event(
         ..
     } = &event
     {
-        let state = systemd_state().await;
+        // R12b (lab PR 269): the watch's answer, at most a second old; an
+        // older one hands the event to the watch, which asks systemd and
+        // sends it back on the bus (`SystemdSnapshot`).
+        let state = match systemd.judge(&event, Instant::now()) {
+            SystemdAnswer::Judge(state) => state,
+            SystemdAnswer::Deferred => {
+                debug!(
+                    signal = sig,
+                    target, "signal relayed by systemd: judged once systemd has answered"
+                );
+                return;
+            }
+        };
         if state.as_deref() == Some("stopping") {
             info!(
                 signal = sig,
@@ -115,11 +129,13 @@ pub(crate) async fn process_event(
     //
     // When `canary_detector` is `None` (early-boot path
     // before K6 wires the Detector handle), this is a no-op.
-    // Lab PR 267 (review #471 A1): the event is judged on the lineage as of
-    // its own time — on the priority bus an exec of its process may have
-    // been taken, or handed over, ahead of it ([`judged_at`]).
-    let at = event_time_ns(&event);
-    let event = match judged_at(at, || canary_detector.and_then(|d| d.process_event(&event))) {
+    // Lab PR 267 (review #471 A1), R12b (R-F): the event is judged on the
+    // lineage as of its own time — on the priority bus an exec of its
+    // process may have been taken, or handed over, ahead of it. Each judge
+    // takes that time from the event itself
+    // (`nn_core::posture::lineage::AsOf::of_event`), explicitly: no scope
+    // set around the calls.
+    let event = match canary_detector.and_then(|d| d.process_event(&event)) {
         Some(canary_event) => canary_event,
         None => event,
     };
@@ -143,11 +159,7 @@ pub(crate) async fn process_event(
     // exec burst). Nothing pushes to the buffer until this returns.
     let host_stopping = host_stopping.is_stopping();
     if let Some((new_state, firing_trigger)) = (!host_stopping)
-        .then(|| {
-            judged_at(at, || {
-                correlation.with_recent(|recent| posture.observe(&event, recent))
-            })
-        })
+        .then(|| correlation.with_recent(|recent| posture.observe(&event, recent)))
         .flatten()
     {
         // BUG-015 observability: include the firing TriggerType so
@@ -176,11 +188,11 @@ pub(crate) async fn process_event(
     // spawning children DURING INVESTIGATE pre-empts the time-bound
     // deadline and advances straight to NEUTRALIZE.
     if !host_stopping && ladder.current_stage().is_some() {
-        judged_at(at, || ladder.observe(&event, Instant::now()));
+        ladder.observe(&event, Instant::now());
     }
     // Lab PR 222: a mass rewrite of existing files flags its writer for the
     // copy-on-first-write guard (a ransomware verdict's offender).
-    judged_at(at, || cow_guard.observe_event(&event));
+    cow_guard.observe_event(&event);
     // Lab PR 224: an open flow's rows (its connect, its snapshots, a
     // refused connect) are for the rules; the correlation buffer keeps its
     // `TcpConnect` and its closed row, as before.
@@ -587,7 +599,7 @@ pub(crate) async fn process_event(
     // Lab PR 236 (multi-match): every rule judged the event; the decision
     // names the primary rule and every match, and runs, per target, the
     // strongest response the per-rule policy allows.
-    if let Some(decision) = judged_at(at, || engine.decide(&event)) {
+    if let Some(decision) = engine.decide(&event) {
         let verdict = &decision.verdict;
         // Review 75: every verdict is acted on; its log lines and its
         // record count against the primary rule's budget for the acting uid.
@@ -640,7 +652,6 @@ pub(crate) async fn process_event(
             ));
         }
         for response in &decision.responses {
-            let exec = executor.clone();
             let action = response.action.clone();
             let target_pid = response.pid;
             let target_file = response.filename.clone();
@@ -649,20 +660,21 @@ pub(crate) async fn process_event(
             } else {
                 (0, 0)
             };
-            let report = match tokio::task::spawn_blocking(move || {
-                exec.execute_for_started(
+            // R12b: on the decision thread, in order (the dispatcher that
+            // takes them off it is R12c's); a panic in the executor is
+            // caught and logged, as its task's was.
+            let report = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                executor.execute_for_started(
                     action,
                     target_pid,
                     target_start_ns,
                     target_seen_ns,
                     &target_file,
                 )
-            })
-            .await
-            {
+            })) {
                 Ok(r) => r,
-                Err(e) => {
-                    warn!(error = %e, "executor task join failed");
+                Err(_) => {
+                    warn!("executor panicked — this decision's other responses are not run");
                     return;
                 }
             };

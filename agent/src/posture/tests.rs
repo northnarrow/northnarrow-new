@@ -1416,12 +1416,15 @@ fn admin_change_after_another_signal_reaches_combat() {
 /// in flight when its write is read: the change is recorded pending.
 /// Placed when the next signal arrives (sudo in its lineage, the shell
 /// that ran it still running with a terminal), it corroborates nothing.
+/// R12b (R-F): the exec (99) came before the write (100) and is read
+/// after it — the placement looks the lineage up as of the round's event,
+/// from the spawn cache alone.
 #[test]
 fn exited_admin_writer_is_placed_before_it_corroborates() {
     let (_tmp, m) = admin_session_machine();
     let _ = m.observe(&file_open(740, 0, "/etc/ssh/sshd_config", 1, 100), &[]);
     assert_eq!(m.current_kind(), PostureKind::Engaged);
-    let _ = m.observe(&spawn(740, 710, "tee", "/usr/bin/tee", 101), &[]);
+    let _ = m.observe(&spawn(740, 710, "tee", "/usr/bin/tee", 99), &[]);
     let (ef, er) = exfil_burst(810);
     let _ = m.observe(&ef, &er);
     assert_eq!(m.current_kind(), PostureKind::Engaged);
@@ -1433,7 +1436,7 @@ fn exited_admin_writer_is_placed_before_it_corroborates() {
 fn exited_writer_without_sudo_still_corroborates() {
     let (_tmp, m) = admin_session_machine();
     let _ = m.observe(&file_open(840, 0, "/etc/ssh/sshd_config", 1, 100), &[]);
-    let _ = m.observe(&spawn(840, 700, "sh", "/usr/bin/sh", 101), &[]);
+    let _ = m.observe(&spawn(840, 700, "sh", "/usr/bin/sh", 99), &[]);
     let (ef, er) = exfil_burst(810);
     let _ = m.observe(&ef, &er);
     assert_eq!(m.current_kind(), PostureKind::Combat);

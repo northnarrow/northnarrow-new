@@ -26,9 +26,9 @@ EXP-13e).
 R12a gives each class of events a queue of its own. The event loop takes
 from them by priority; a flood of opens fills the file queue, which drops
 its new opens, and the tamper queue is taken first, its pump never waiting
-behind the opens. The decision itself is unchanged: the one event loop
-still judges every event through `process_event`; the decision thread
-without `await` is R12b's second part, the response dispatcher R12c (§7).
+behind the opens. R12a left the decision unchanged — the one event loop
+judged every event through `process_event`; R12b (§2d) puts it on a thread
+of its own without `await`, the response dispatcher is R12c (§7).
 
 ## 2. The classes
 
@@ -215,8 +215,14 @@ queues a new key uncapped: it is judged like any P0 event, or — P0 itself
 full — dropped by the bus with its own signed `event_bus_drop` row and
 `TelemetryLoss`; never set aside uncounted and unjudged. Those events are
 counted and signed in the next capped row
-(`queued_uncapped_table_full`), and root's among them raise the posture as
-above. Holding them back instead would let a burst over many targets hide
+(`queued_uncapped_table_full`) and raise the posture's `TelemetryLoss`
+whatever their uids (the re-review of #475: a full table is anomalous by
+itself). Before it queues a new key uncapped, a full table releases the key
+whose second ended longest ago, its count kept for the next row; past
+4,096 released keys their counts are summed per kind and uid (a row's
+`released_keys` target), past 4,096 sums per kind for the rest of the uids
+(uid 4294967295) — the third review of #475: a row names a bounded number
+of keys and keeps every count. Holding them back instead would let a burst over many targets hide
 the rest of the second's events of every new key; queued, the flood falls
 back to R12a's bounds (the shares, P0's reserve of 64 slots).
 
@@ -227,6 +233,93 @@ and the key's 256 a second keep the posture and the ladder on the flood. A
 root fork loop's (EXP-13e) and any user's `bpf()` loop's (EXP-13d) share of
 the consumer falls from two thirds to 256 decisions a second per target or
 command.
+
+## 2d. The decision thread (R12b-2)
+
+The decision runs on an OS thread of its own, `nn-decision`
+(`agent/src/run_loop.rs`, `decision_loop`): it takes each event from the bus
+(`BusReceiver::recv_blocking`, blocked on the bus's wait, at most 500 ms
+before it looks at its stop and counts a round for the watchdog's progress
+check), teaches the rules the execs it overtook, offers it to the telemetry
+probe, judges it (`process_event`, a plain function: no `await`) and counts
+its delay (stage 5). The event loop's task keeps the rest — the signals,
+the admin shutdown, the telemetry tasks' liveness (SNS-001), the lab
+triggers — and either end ends the other: a stop there stops the thread; a
+closed bus, or the thread's end (a panic is rethrown at the join), stops
+the loop. The thread is joined, and the canary trips' writer waited for,
+before the bus is stopped and its stop row signed. `debug-stall-loop` (lab
+PR 216, EXP-13b) stalls the decision thread.
+
+What blocked the decision is off it:
+- an exec's path is made absolute in its pump (`exe_identity::resolve`: the
+  mount table, `/proc/<pid>/exe` for a relative path), right after the
+  kernel recorded it — every exec, not only the handed-over ones (the
+  receiver no longer reads `/proc`: review #471 B4);
+- systemd's state is a snapshot (`SystemdSnapshot`) the systemd watch
+  refreshes every 2 s: a signal PID 1 relayed (EBPF-001) is judged on an
+  answer at most a second old; an older one hands the event to the watch,
+  which asks systemd at once and hands it back answered — the decision
+  thread judges it at its next turn (within its half-second wait), once
+  (not through the bus: a denial sent again would be coalesced into the one
+  already judged, or capped); without systemd's socket the answer is
+  "none", as the question's was. R12a's event loop awaited systemd's answer
+  up to a second;
+- the trusted-installer window's expiry is its tick's (external audit
+  ATP-003, every second), not swept at every event;
+- a canary trip's access row and its registry mark are written by a thread
+  of their own (`nn-canary-log`, `Detector::with_writer`), in the order
+  DEC-011 and lab PR 260 fixed; the first trip is decided at once, a later
+  access before the mark is not one; a full queue (1,024) holds a trip at
+  most `CANARY_QUEUE_WAIT` (100 ms), then its rows are counted
+  (`Detector::unwritten`, per canary, WARNed, and at the stop) while its
+  event goes on to the rules (review of #475: a writer that stopped writing
+  held the decision, and the stop);
+- a kernel module's package ownership (R018) is asked by the module-load
+  pump when it reads the load (`ModuleOwners::refresh`: dpkg's lists, or an
+  `rpm -qf` process) and kept per file; R018 judges the load on that
+  answer.
+
+What the decision thread still does that is I/O, exactly (review of #475:
+"no blocking I/O" was not exact):
+- the responses a decision runs, in order, before the next event — the
+  executor and what it calls: a kill's cgroup made, frozen, killed and
+  removed, its verify retries (up to 50 ms), `/proc` reads, the
+  quarantine's copy and its synced ledger, the containment ledger, the
+  outbound block and the throttle's cgroup files (R12a's loop awaited them
+  on the blocking pool); their dispatcher is R12c's;
+- the ransomware tracker's sampler of a burst's files (their entropy, the
+  copies) and its trust of the writer's executable (a digest, the package
+  that owns it) — on a mass-write or rename burst only; R12c's dispatcher of
+  slow work;
+- the per-rule policy's exemption facts (a process's uid, cgroup and
+  executable from `/proc`, a pidfile), read once per process and cached;
+- a canary trip's reader, one readlink of `/proc/<pid>/exe`, on a trip
+  only, and a trip's wait for room in the writer's full queue (≤ 100 ms);
+- the security-tool detector's registration of a tool (its start and
+  executable from `/proc`), at the tool's exec only;
+- in a judgement, a process's start (`/proc/<pid>/stat`, POS-003's check of
+  a reused pid, and a cached exec checked against the process its pid
+  names now), and for a pid the lineage does not hold a fork's parent,
+  start, executable and uid (`/proc/<pid>/stat`, `exe`, `status`) — the
+  parent's cached image accepted only when `exe` is that file, never the
+  image `/proc` shows instead (§3).
+
+A guard keeps any more off the decision path
+(`xtask/tests/decision_path_io.rs`, run by `cargo test`): the decision
+thread's own code — `process_event.rs`, `decision_loop` — holds no
+`await`, no file or `/proc` access, no process, no sleep, no
+`block_in_place`; every other file of the code the decision calls into —
+the rule engine, the posture and its lineage, the ladder, the canary
+detector, the correlation buffer, the budget, the ransomware and
+impairment trackers, the copy-on-write guard, the detection sink, the
+telemetry probe, and (review of #475) the responses' code under
+`crates/nn-linux/src/response` — is a ratchet: each file's I/O sites are
+counted and listed with why; a new site, or a count above its pin, fails,
+and a count below it fails until the pin is lowered. It is lexical: it
+counts markers in the files of its list (the reviewer's mutation K9, a read
+planted in `Executor::execute_for_started`, failed only once the responses'
+code was on the list) — code the decision reaches outside the list is not
+seen, and the list is kept by hand.
 
 ## 3. The take order
 
@@ -277,16 +370,93 @@ event was judged on the image of the later exec: a canary reader that then
 execs `restic` was exempt as restic's, a `/tmp` program's credential read
 and connect fell in the package carve-out once the process exec'd `dpkg`,
 a listener was judged on the later `nginx`. The lineage keeps the last
-three execs of a pid with their spawn times and answers as of a time:
-`lineage::judged_at(ts, ..)` scopes every lookup of one event's judgement to
-the event's own time (`event_time_ns`: its kernel timestamp, a flow's
-connect), the `*_at(pid, ts)` lookups take it explicitly, and an exec later
-than the time is "not known" — never the later image, never `/proc`; an
-exec of the process a pid was reused from answers only for a time before
-the current process started.
-`in_package_transaction` walks the tree as of the event. The event loop and
-the replay judge every event inside `judged_at`; the network drains' image
-fallbacks ask as of the flow's start.
+three execs of a pid with their spawn times and answers as of a time, an
+exec later than the time "not known" — never the later image, never
+`/proc`; an exec of the process a pid was reused from answers only for a
+time before the current process started. R12b (R-F, the second review of
+#471): the time is a parameter of every lookup, not a thread-local scope —
+`lineage::AsOf`: `Judged(ts)` for the judgement of an event (each judge
+takes it from the event itself, `AsOf::of_event`: its kernel timestamp, a
+flow's connect), `Live(ts)` for a pump or drain reading a record right
+after the fact (a connect's image, NETR-008; a flow's start), `Now` outside
+any judgement (an admin verb, a response, a ladder step). A lookup cannot
+be made "outside the scope" any more, so none can fall back to the latest
+exec unseen (R12a caught that only by its pinned sources). In a judgement a
+pid the spawn cache does not hold is not known — never read from `/proc`,
+which shows the present image. The processes running when the agent starts
+are in the cache: once the exec sensors are attached the start scans
+`/proc` and enters each (`seed_from_proc`: the image it runs, at time 0 —
+it has run it since before any exec could be seen —, its start, parent and
+uid; a pid already held left alone, a deleted image not entered). The
+boot's daemons and a session older than a restart of the agent are known
+that way (without it, strict R-F left the COMBAT their descendants reach
+unlocked after every restart: the posture golden case
+`eva-installer-window`), and an exec such a process runs later is a later
+entry, the scanned image its past. R12b-2's first version read `/proc`
+instead for a process older than the agent, which could judge an event of
+it on an image executed after the event (review of #475: a canary read,
+then a backup tool's exec, the read judged as the tool's).
+
+The re-review of #475 found strict R-F with a cache of 2,048 entries kept
+first in, first out unsafe: 2,048 execs of other processes pushed out a
+live daemon's entry — a `clamd` the scan entered became not known, its
+read of a canary was no reader's and the daemon was killed; a fork that
+never executes (a maintainer script's subshell, a cron worker, a prefork
+backend) was not known at all. So:
+- the cache is bounded by process lifetime: a thread of its own
+  (`nn-lineage-sweep`, every 5 s) marks the cached processes that exited
+  (or whose pid names another process now); past 2,048 entries only marked
+  ones past a 30-s grace are dropped, a live process's never for newer
+  ones; past 32,768 entries a gone process's go first, then the oldest of
+  the uid holding the most among the processes executed since the start,
+  whatever the uid's class (the start's scan's last), counted
+  (`evicted_live`), WARNed and raising the posture's `TelemetryLoss` (the
+  third review of #475 and its final check: an account's flood of live
+  processes — a user's, or a webshell's as `www-data` — pushes out its own
+  entries, not the boot's daemons nor a person's session);
+- a fork runs its parent's image while `/proc` says so (`fork_entry`): for
+  a pid the cache does not hold, its parent and start from
+  `/proc/<pid>/stat` (no exec changes them), its parent's image as of that
+  start (cached, or itself such a fork), accepted only when
+  `/proc/<pid>/exe` is that very file — a fork that executed something
+  else since stays not known; an event before the fork's start is not its;
+  the sweep enters the running forks of cached processes, so a daemon's
+  child outlives its parent's entry; the start is read again after the
+  exe, so a reuse between the reads mixes no two processes.
+
+The third review of #475 found two holes of the same family:
+- a process that daemonizes after the agent's start (`Type=forking`,
+  `daemon()`: the parent executes, forks and exits within milliseconds,
+  the child reparented to pid 1) was compared with pid 1's image and never
+  known. The sweep enters it as the orphan of a cached process it found
+  gone (`orphan_entry`): reparented to pid 1 or to a subreaper among that
+  process's ancestors, started no earlier than its exec, running that very
+  file; every gone process of that image it could descend from must have
+  run the same script. Its parent stays the one `/proc` shows. It runs
+  that image from the sweep's instant only — the adoption is an inference
+  about the present (the final check of #475: an attacker who ran a reader
+  any user may run and let it exit, then executes it again with that exec
+  still queued across a sweep, does not get the events before the exec
+  judged as the reader's). Before that sweep (at most 5 s after its
+  parent's exit) it is not known;
+- a pid reused by a fork while the dead process's entry was cached
+  answered with the dead process's image, and the walk stopped at it. A
+  cached exec whose process is not the one the pid names now (another
+  start in `/proc/<pid>/stat`), at a time that process may already have
+  existed, answers as not held (`cached_live`): a fork of its parent in a
+  judgement, `/proc` outside one; for a time before the reuse it is still
+  what the pid ran. The sweep marks the pid and enters the fork.
+
+A process the agent saw start whose exec it does not hold (dropped by P1,
+or not yet read) and whose image is not its parent's, nor that of a gone
+process it was orphaned from, is not known. What stays (§7): a fork that
+executes another image and then executes its parent's again (RR3) is
+judged as its parent's image for the events in between when neither exec
+is held at the judgement (both still in the ring, or dropped and counted);
+a fork the sweep entered whose later exec is lost is judged as its
+parent's image (RR5, as any process whose later exec is lost).
+`in_package_transaction` walks the tree as of the event; the replay judges
+every event as the decision thread does.
 
 ## 4. Ordering safety: the property test
 
@@ -427,46 +597,55 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
 
 ## 7. What is next
 
-- **R12b, done in its first part (lab PR 269, R12b-1)**: the ring pumps on
-  threads of their own with batched sends (§2a; EXP-13e ×3 per build: the
-  lot's note in `docs/roadmap/CAPABILITY_PROGRAM.md`); the envelope (§2b);
-  stage 5 against a budget per class (§5; review #471 B2); the per-uid cap
-  of P0's floods (§2c; the third review's C3); the coalesced and capped
-  denials in NN-L-AT-001's held records (§5; C5).
-- **R12b, its second part (R12b-2)** — the decision thread without
-  `await`: `exe_identity::resolve` in the pumps (the bus's receiver does it
-  for the execs it hands over: review #471 B4), the systemd state as a
-  snapshot, `close_if_expired` on a tick, the canary append through the
-  writer's queue, a cache of `PackageOwnership` for module provenance, a
-  guard against blocking I/O on the decision path; R-F (the judgement time
-  as an explicit parameter, an `Absent` pid not known inside a judgement);
-  R-B if it fits.
+- **R12b, done (lab PR 269)** — R12b-1: the ring pumps on threads of their
+  own with batched sends (§2a; EXP-13e ×3 per build: the lot's note in
+  `docs/roadmap/CAPABILITY_PROGRAM.md`), the envelope (§2b), stage 5 against
+  a budget per class (§5; review #471 B2), the per-uid cap of P0's floods
+  (§2c; the third review's C3), the coalesced and capped denials in
+  NN-L-AT-001's held records (§5; C5). R12b-2: the decision thread without
+  `await` and the blocking I/O taken off it, with its ratchet (§2d; review
+  #471 B4); R-F (§3: the time a parameter, an `Absent` pid not known in a
+  judgement; the running processes entered at the start; after the reviews
+  of #475 the cache bounded by process lifetime, forks and a daemon's
+  orphans running their parent's image, a pid reused by a fork not the dead
+  process's).
+- **Open after R12b** — the responses still run on the decision thread
+  (R12c's dispatcher); the decision path's I/O the ratchet lists (§2d: the
+  ransomware tracker's sampler and trust, the per-rule policy's exemption
+  facts, a canary trip's reader, the security-tool detector's registration),
+  and the guard's list kept by hand (lexical); R-B: the history is three execs deep — an event followed by four execs of
+  its process before it is judged reads "not known", and a walk stops at a
+  "not known" hop although its parent is known (a deeper history, the walk
+  on from the parent, facts kept past the cache's eviction); the property
+  test over the posture corpus (the posture's buffer and triggers see the
+  loop's order; R12a's test covers verdicts only); the FIM and network
+  drains send one event at a time (on threads of their own since the
+  review of #474); the DNS pump's thread runs its loop on the runtime's
+  reactor; the `fs_protect` ring is sized at load for a pump thread's
+  wake-up on a saturated CPU (§2a), the other rings keep the object's
+  sizes; a burst of NN-L-BPF-001's commands is uncapped (§2c). The
+  lineage (§3, the third review of #475): RR3, a fork that executes Y and
+  then its parent's image X again, is judged as X for Y's events when
+  neither exec is held at the judgement (low: it needs code running in a
+  fork of an exempt image, and both execs still in the ring or dropped,
+  which is counted); RR5, a fork the sweep entered whose later exec is lost
+  is judged as its parent's image; the structural fix for both and for a
+  daemon's orphan before the sweep (≤ 5 s) is an exec identity the kernel
+  keeps per task (task storage written at `bprm_committed`, copied at fork,
+  read by pidfd). The start's scan can enter the image of an exec it reads
+  before that exec's event arrives (milliseconds, at the start only). The
+  session and workload attribution (`lookup_cache`: the login uid and the
+  cgroup a walk reads) still takes a cached exec without checking it against
+  the process its pid names now, so a pid reused by a fork can take the dead
+  process's parent there (older than R12b).
 - **Open after review #471** — B1: the property test compares the
   strongest verdict per rule and process (§4); B5: "(agent predates the
   bus)" in `nn-admin status` is reachable only against an agent older than
-  R12a (the matrix shows it through its mock); B7: the soak's thread count,
-  measured again in the comparable pair (the lot's note: R12b adds eleven
-  pump threads); M2: the signals to a security tool on a ring of their own
-  (eBPF, not in R12b).
-- **Open after the second review of #471** — R-B: the history is three
-  execs deep — an event followed by four execs of its process before it is
-  judged reads "not known" (an exemption then does not apply; a rule that
-  wants a positive image, the transfer tools' staged ancestor or NET-008's
-  fallback, does not fire), and a walk stops at a "not known" hop although
-  its parent is known: a deeper history, the walk on from the parent,
-  facts of a process kept past the cache's eviction. R-C (eBPF, wire): a
-  FIM `Modified` carries its close's time, not its write's — a file kept
-  open across an `exec dpkg` falls in the package carve-out (on `main`
-  too). A kernel budget per uid for the `bpf` hook's records (stage 2): the
-  userland cap (§2c) bounds the consumer's share, a kernel budget would
-  bound the ring's.
-- **Open after R12b-1** — the FIM and network drains send one event at a
-  time (their loops await between events); the DNS pump's thread runs its
-  loop on the runtime's reactor (its pass answers the lookups' requests).
-  The `fs_protect` ring is sized at load for a pump thread's wake-up on a
-  saturated CPU (§2a); the other rings keep the object's sizes. A burst of
-  NN-L-BPF-001's commands is uncapped (§2c): it falls back to R12a's
-  bounds.
+  R12a (the matrix shows it through its mock); M2: the signals to a
+  security tool on a ring of their own (eBPF). R-C (eBPF, wire): a FIM
+  `Modified` carries its close's time, not its write's. A kernel budget per
+  uid for the `bpf` hook's records (stage 2): the userland cap (§2c) bounds
+  the consumer's share, a kernel budget would bound the ring's.
 - **R12c** — the response dispatcher by severity, its queue (stage 6);
   no action without a signed record (intent, then outcome); the budget
   never limits an action's record; the evidence writer's queue (stage 7);

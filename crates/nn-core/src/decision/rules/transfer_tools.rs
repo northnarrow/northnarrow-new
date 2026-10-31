@@ -84,12 +84,15 @@ pub(crate) fn is_shell_base(base: &str) -> bool {
 }
 
 /// What in `pid`'s lineage makes a transfer tool a dropper's instrument
-/// (module docs), at `now_ns`; `None` when nothing does.
+/// (module docs), at `now_ns` (the store's window); the lineage's images
+/// as of `as_of` (R12b, R-F: the judged event's time). `None` when
+/// nothing does.
 pub fn precursor_of<H: PostureHost>(
     store: &Mutex<CorrelationStore<H>>,
     lineage: &AuthSessionTracker<H>,
     pid: u32,
     now_ns: u64,
+    as_of: crate::posture::lineage::AsOf,
 ) -> Option<&'static str> {
     let (held, ancestors) = {
         let store = store.lock();
@@ -112,10 +115,10 @@ pub fn precursor_of<H: PostureHost>(
     }
     let mut shell_below = false;
     for hop in ancestors.iter().take(MAX_HOPS) {
-        let Some(id) = lineage.exec_identity(hop.pid) else {
+        let Some(id) = lineage.exec_identity(hop.pid, as_of) else {
             // Gone or deleted: `image_path` still names a staged image.
             if lineage
-                .image_path(hop.pid)
+                .image_path_as(hop.pid, as_of)
                 .is_some_and(|p| crate::decision::rules::is_staging_path(&p))
             {
                 return Some("a staging-directory image among its ancestors");
@@ -148,7 +151,7 @@ pub fn precursor_check<H: PostureHost>(
     store: Arc<Mutex<CorrelationStore<H>>>,
     lineage: AuthSessionTracker<H>,
 ) -> PrecursorCheck {
-    Arc::new(move |pid| precursor_of(&store, &lineage, pid, H::monotonic_ns()))
+    Arc::new(move |pid, as_of| precursor_of(&store, &lineage, pid, H::monotonic_ns(), as_of))
 }
 
 #[cfg(test)]
@@ -181,7 +184,10 @@ mod tests {
     fn a_clean_lineage_keeps_the_exemption() {
         let (_t, l) = lineage_of(&[(10, 1, "/usr/bin/bash"), (11, 10, "/usr/bin/curl")]);
         let s = store_of(&[(11, 10)]);
-        assert_eq!(precursor_of(&s, &l, 11, 1_000), None);
+        assert_eq!(
+            precursor_of(&s, &l, 11, 1_000, crate::posture::lineage::AsOf::Now),
+            None
+        );
     }
 
     #[test]
@@ -189,7 +195,7 @@ mod tests {
         let (_t, l) = lineage_of(&[(20, 1, "/tmp/.x/dropper"), (21, 20, "/usr/bin/curl")]);
         let s = store_of(&[(21, 20)]);
         assert_eq!(
-            precursor_of(&s, &l, 21, 1_000),
+            precursor_of(&s, &l, 21, 1_000, crate::posture::lineage::AsOf::Now),
             Some("a staging-directory image among its ancestors")
         );
         s.lock().record(
@@ -201,7 +207,7 @@ mod tests {
             900,
         );
         assert_eq!(
-            precursor_of(&s, &l, 21, 1_000),
+            precursor_of(&s, &l, 21, 1_000, crate::posture::lineage::AsOf::Now),
             Some("an exec from a staging directory")
         );
     }
@@ -219,7 +225,7 @@ mod tests {
             500,
         );
         assert_eq!(
-            precursor_of(&s, &l, 31, 1_000),
+            precursor_of(&s, &l, 31, 1_000, crate::posture::lineage::AsOf::Now),
             Some("a credential-store read")
         );
     }
@@ -236,10 +242,13 @@ mod tests {
         ]);
         let s = store_of(&[(41, 40), (42, 41), (51, 50), (52, 51)]);
         assert_eq!(
-            precursor_of(&s, &l, 42, 1_000),
+            precursor_of(&s, &l, 42, 1_000, crate::posture::lineage::AsOf::Now),
             Some("a shell started by an exposed network service")
         );
-        assert_eq!(precursor_of(&s, &l, 52, 1_000), None);
+        assert_eq!(
+            precursor_of(&s, &l, 52, 1_000, crate::posture::lineage::AsOf::Now),
+            None
+        );
     }
 
     #[test]

@@ -2027,8 +2027,14 @@ pub fn process_drift(
     // have their own per-rule budget (`detection_budget`).
     // External audit NN-AUD-284: the package carve-out's own test — the
     // package managers proper, during their transaction.
-    let package_managed =
-        lineage.is_some_and(|l| l.is_package_transaction_write(raw.modifier_pid, raw.timestamp_ns));
+    // R12b (R-F): the drain reads the record after the fact
+    // (`AsOf::Live`, `/proc` on a cache miss), as before.
+    let package_managed = lineage.is_some_and(|l| {
+        l.is_package_transaction_write(
+            raw.modifier_pid,
+            crate::posture::lineage::AsOf::live(raw.timestamp_ns),
+        )
+    });
     let (skipped, skip_reason) = if package_managed {
         match rate_limiter.try_consume(severity) {
             Ok(()) => (false, String::new()),
