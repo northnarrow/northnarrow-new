@@ -1241,44 +1241,42 @@ impl<H: PostureHost> AuthSessionTracker<H> {
 
     /// Third review of #475: the entry the hard bound drops. A gone
     /// process's first, whatever its grace; else the oldest entry of the
-    /// uid holding the most among the processes executed since the start —
-    /// users' (above [`SYSTEM_UID_MAX`]) before system accounts' —, so a
-    /// flood of one user's live processes pushes out that user's own; the
-    /// processes the start's scan entered (the boot's daemons, an older
-    /// session) last.
+    /// uid holding the most among the processes executed since the start,
+    /// whatever the uid's class (the final check of #475: a flood as
+    /// `www-data` pushes out its own entries, not a person's session) — a
+    /// flood of one account's live processes pushes out that account's
+    /// own; the processes the start's scan entered (the boot's daemons, an
+    /// older session) last.
     fn hard_victim(s: &mut InnerState) -> Option<u32> {
         while let Some(p) = s.exited_order.pop_front() {
             if s.exited.contains_key(&p) && s.map.contains_key(&p) {
                 return Some(p);
             }
         }
-        for system in [false, true] {
-            while let Some(uid) = s
-                .uid_count
-                .iter()
-                .filter(|(u, _)| (**u <= SYSTEM_UID_MAX) == system)
-                .max_by_key(|(u, c)| (**c, std::cmp::Reverse(**u)))
-                .map(|(u, _)| *u)
-            {
-                let mut found = None;
-                if let Some(q) = s.by_uid.get_mut(&uid) {
-                    while let Some(p) = q.pop_front() {
-                        s.by_uid_len = s.by_uid_len.saturating_sub(1);
-                        if s.map
-                            .get(&p)
-                            .is_some_and(|e| e.spawn_ns != 0 && e.uid == uid)
-                        {
-                            found = Some(p);
-                            break;
-                        }
+        while let Some(uid) = s
+            .uid_count
+            .iter()
+            .max_by_key(|(u, c)| (**c, std::cmp::Reverse(**u)))
+            .map(|(u, _)| *u)
+        {
+            let mut found = None;
+            if let Some(q) = s.by_uid.get_mut(&uid) {
+                while let Some(p) = q.pop_front() {
+                    s.by_uid_len = s.by_uid_len.saturating_sub(1);
+                    if s.map
+                        .get(&p)
+                        .is_some_and(|e| e.spawn_ns != 0 && e.uid == uid)
+                    {
+                        found = Some(p);
+                        break;
                     }
                 }
-                if found.is_some() {
-                    return found;
-                }
-                // a count without an entry in order (not expected): dropped
-                s.uid_count.remove(&uid);
             }
+            if found.is_some() {
+                return found;
+            }
+            // a count without an entry in order (not expected): dropped
+            s.uid_count.remove(&uid);
         }
         while let Some(p) = s.order.pop_front() {
             if s.map.contains_key(&p) {
@@ -1474,7 +1472,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// gone process of the image it could descend from must have run the
     /// same script (an interpreter's), else not known. Its parent stays the
     /// one `/proc` shows (a walk from it learns nothing of the gone
-    /// process's session); its uid is its own.
+    /// process's session); its uid is its own. It runs that image from the
+    /// sweep's instant only (the final check of #475): what it did before
+    /// is not known.
     fn orphan_entry(&self, pid: u32, gone: &HashMap<PathBuf, Vec<Entry>>) -> Option<Entry> {
         if gone.is_empty() || pid <= 1 {
             return None;
@@ -1514,7 +1514,12 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         Some(Entry {
             ppid,
             exe,
-            spawn_ns: start_ns,
+            // final check of #475 (RRd2): an inference about the present —
+            // `/proc` shows that image now —, so it counts from the sweep's
+            // instant, not from the process's start: an exec of that image
+            // still queued at the sweep (the candidate's image an attacker
+            // ran and let exit) never covers the events before it
+            spawn_ns: H::monotonic_ns().max(start_ns),
             start_ns,
             argv_npm_cli: first.argv_npm_cli,
             script: first.script.clone(),
@@ -4361,16 +4366,23 @@ mod tests {
         );
         let r = t.sweep();
         assert_eq!((r.gone, r.orphans), (1, 1));
+        // known from the sweep's instant on (the final check of #475)
+        let after = AsOf::Judged(H::monotonic_ns());
         assert_eq!(
-            t.exec_identity(501, judged).map(|i| i.exe),
+            t.exec_identity(501, after).map(|i| i.exe),
             Some(PathBuf::from("/usr/sbin/clamd"))
         );
         assert_eq!(
-            t.image_path_as(501, judged).as_deref(),
+            t.image_path_as(501, after).as_deref(),
             Some("/usr/sbin/clamd")
         );
+        assert_eq!(
+            t.exec_identity(501, judged),
+            None,
+            "an event before the sweep: still not known"
+        );
         for pid in [502, 503, 504] {
-            assert_eq!(t.exec_identity(pid, judged), None, "{pid}");
+            assert_eq!(t.exec_identity(pid, after), None, "{pid}");
         }
         // two gone interpreters of different scripts: which one is not known
         let proc = TempDir::new().unwrap();
@@ -4399,7 +4411,7 @@ mod tests {
         write_started(proc.path(), "620", 1, 1_200);
         let r = t.sweep();
         assert_eq!((r.gone, r.orphans), (2, 0));
-        assert_eq!(t.exec_identity(620, judged), None);
+        assert_eq!(t.exec_identity(620, AsOf::Judged(H::monotonic_ns())), None);
         // one gone interpreter: its script
         let proc = TempDir::new().unwrap();
         let t = AuthSessionTracker::live_on(proc.path(), 0);
@@ -4417,7 +4429,7 @@ mod tests {
         write_started(proc.path(), "620", 1, 1_200);
         assert_eq!(t.sweep().orphans, 1);
         assert_eq!(
-            t.exec_identity(620, judged)
+            t.exec_identity(620, AsOf::Judged(H::monotonic_ns()))
                 .and_then(|i| i.script)
                 .as_deref(),
             Some("/opt/a.py")
@@ -4594,6 +4606,67 @@ mod tests {
             t.exec_identity(500, AsOf::Judged(30 * S)).map(|i| i.exe),
             Some(PathBuf::from("/usr/sbin/clamd"))
         );
+    }
+
+    /// Final check of #475 (the reviewer's RRd2, production mode): a fork
+    /// that reads a canary as bash, then executes a reader any user may run
+    /// (`clamscan`) whose earlier run the attacker let exit, its exec still
+    /// queued across a sweep, is adopted as that reader's orphan from the
+    /// sweep's instant only — the read before its exec, judged after the
+    /// sweep and after the exec is read, is not known (it was `clamscan`, a
+    /// reader: recorded, not killed).
+    #[test]
+    fn an_orphan_adopted_by_the_sweep_does_not_cover_its_events_before_it() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::live_on(proc.path(), 0);
+        // the shell S (600), a user's
+        t.ingest_exec(600, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+        write_exe(proc.path(), 600, "/usr/bin/bash");
+        write_status_uid(proc.path(), 600, 1, 1000);
+        write_started(proc.path(), "600", 1, 500);
+        // S ran clamscan (610) at 10 s, which exited
+        t.ingest_exec(610, 600, "/usr/bin/clamscan", &[], 10 * S, 10 * S, 1000);
+        // A (620), forked by S at 12 s, read a canary at 12.5 s as bash,
+        // executed clamscan at 13 s: that exec still queued at the sweep
+        write_exe(proc.path(), 620, "/usr/bin/clamscan");
+        write_status_uid(proc.path(), 620, 600, 1000);
+        write_started(proc.path(), "620", 600, 1_200);
+        let r = t.sweep();
+        assert_eq!(
+            (r.gone, r.orphans),
+            (1, 1),
+            "adopted, as the sibling of the gone run"
+        );
+        t.ingest_exec(620, 600, "/usr/bin/clamscan", &[], 13 * S, 12 * S, 1000);
+        let read = AsOf::Judged(12 * S + S / 2);
+        assert_eq!(t.exec_identity(620, read), None, "the read before its exec");
+        assert_eq!(t.image_path_as(620, read), None);
+        // after its exec it runs clamscan
+        assert_eq!(
+            t.image_path_as(620, AsOf::Judged(14 * S)).as_deref(),
+            Some("/usr/bin/clamscan")
+        );
+    }
+
+    /// Final check of #475: at the hard bound a system account's flood (a
+    /// webshell as `www-data`) pushes out its own entries, not a person's
+    /// session — the uid holding the most entries goes first, whatever its
+    /// class.
+    #[test]
+    fn a_system_account_s_flood_pushes_out_its_own_entries_not_a_person_s() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path()).with_bounds(4, 8, std::time::Duration::ZERO);
+        // a person's session (uid 1000): a shell and a command
+        t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+        t.ingest_exec(701, 700, "/usr/bin/vim", &[], 6 * S, 6 * S, 1000);
+        for i in 0..10u32 {
+            let at = u64::from(10 + i) * S;
+            t.ingest_exec(2_000 + i, 1, "/usr/bin/sh", &[], at, at, 33);
+        }
+        assert_eq!(t.entry_count(), 8);
+        assert_eq!(t.evicted_live(), 4);
+        assert!(t.holds(700) && t.holds(701), "the person's session kept");
+        assert!(!t.holds(2_000) && t.holds(2_009));
     }
 
     #[test]

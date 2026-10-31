@@ -323,9 +323,17 @@ mod tests {
         .unwrap();
         assert_eq!(t.sweep().orphans, 1);
         let r = CanaryReaders::new(BTreeSet::new(), t);
+        // a read after the sweep (an orphan counts from its instant)
+        use crate::posture::host::PostureHost as _;
         assert_eq!(
-            r.reader(501, AsOf::Judged(20 * S)).as_deref(),
+            r.reader(501, AsOf::Judged(TestHost::monotonic_ns()))
+                .as_deref(),
             Some("/usr/sbin/clamd")
+        );
+        assert_eq!(
+            r.reader(501, AsOf::Judged(20 * S)),
+            None,
+            "before the sweep"
         );
     }
 }
