@@ -3272,4 +3272,29 @@ mod tests {
             "the exec before it in the batch, not the one after"
         );
     }
+
+    /// R12b: a batch wakes the receiver waiting for an event (the event
+    /// loop's `recv`), as a send does.
+    #[test]
+    fn a_batch_wakes_a_waiting_receiver() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = channel();
+        let waiting = rt.spawn(async move {
+            let r = rx.recv().await;
+            (r.map(|r| pid_of(&r.envelope.event)), rx)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        tx.send_batch_blocking(rt.handle(), vec![spawn(77)])
+            .unwrap();
+        let (got, _rx) = rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), waiting).await })
+            .expect("the batch woke the receiver")
+            .unwrap();
+        assert_eq!(got, Some(77));
+        drop(tx);
+    }
 }
