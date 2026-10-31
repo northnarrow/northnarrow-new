@@ -151,8 +151,12 @@ queries made before its connects (lab PR 229) and announces each connect
 after its batch is on the bus (lab PR 246); the DNS pump answers the
 lookups' requests for a pass as well as its ring, so its thread runs the
 pump's own loop on the runtime's reactor (`Handle::block_on`). The FIM and
-network drains stay tasks (their work is the drift log and the flows'
-ledger). A pump never ends while the agent runs: one that ended — returned,
+network drains (their loops are async: they await the bus, the DNS and
+connect barriers, their periodic steps) run on threads of their own too
+(`nn-fim_drain`, `nn-net_drain`; review of #474), each with a runtime of
+its own — one thread, its own reactor and timers (`spawn_drain_thread`) —
+so the kernel's wake-up for their rings reaches that thread instead of a
+worker of the agent's runtime. A pump never ends while the agent runs: one that ended — returned,
 failed, panicked, or stopped by the lab's `debug-abort-pump` — is a blind
 spot the event loop finds within 5 s (SNS-001) and the agent stops, as
 before. Each pump and drain is a source of the bus with a sequence of its
@@ -171,33 +175,58 @@ names it). Inside a class the take order is each source's order (the debug
 builds check it at every take); stage 5 times the decision from the
 record's time (§5).
 
-## 2c. The floods of P0, capped per uid (R12b, the third review of #471's C3)
+## 2c. The floods of P0, capped per uid and target (R12b, the third review of #471's C3, the review of #474)
 
 Under the shares a flood that keeps P0 full takes two thirds of the
 consumer (§3). The two tamper events a process can repeat at will —
 `floods_p0`: a refused operation (root; no kernel budget) and a `bpf()`
 call (any user on 6.x) — are queued at most `FLOOD_CAP_PER_UID` (256) a
-second per uid and kind (`FloodCap`) — the records about the agent's own
-BPF objects (a handle to one of its maps, programs or links taken by id, a
-write handle on one of its maps: NN-L-BPF-002's tampering) a kind of their
-own with four times the allowance (`FLOOD_CAP_OWN_PER_UID`, 1,024: the
-lab's soak saw the sampler's `bpftool map dump`s of the agent's maps make
-~450 in a second as root, which a cap of 256 kept from BPF-002); the rest
-of that uid's second is counted, not queued: in the status (`capped`) and in a signed
-`event_bus_capped` row each sample (per uid and kind the count, its first
-and last time, and what the flood is made of — the first process of each
-distinct `comm` and action, at most 8: a fork loop of one program is one,
-another program's attempt inside the flood is named apart), with a WARN.
-A repeat of a queued denial is coalesced before the cap counts it; another
-uid's events have their own allowance (a flood by one never caps another's);
-the kinds are counted apart; a full table of uids (4,096) queues a new uid
-uncapped. The capped denials are counted as NN-L-AT-001's held records, the
-capped records about the agent's own objects as NN-L-BPF-002's (C5, §5). What it costs: inside a flooding uid, another program's refused
-operation in the same second is counted and named, not judged on its own —
-the kernel refused it, and the uid's 256 a second keep the posture and the
-ladder on the flood. A root fork loop's (EXP-13e) and any user's `bpf()`
-loop's (EXP-13d) share of the consumer falls from two thirds to 256
-decisions a second.
+second per key (`FloodCap`, `CapKey`): the kind, the uid, and the target —
+each refused operation on each target (operation, device, inode: a
+signal's or a ptrace's target process), each `bpf()` command. One target's
+or command's burst never holds back another's event: the review of #474
+showed a program load, the 257th `bpf()` call of its uid in a second of
+`BPF_MAP_CREATE`s, never queued and never judged by NN-L-BPF-001 when the
+key was the uid alone. NN-L-BPF-001's commands — a program loaded,
+attached, a link made (`NEVER_CAPPED_BPF`) — are never capped: each is
+judged; a burst of them is bounded by P0's shares and its wait for room,
+as on R12a. The records about the agent's own BPF objects (a handle to one
+of its maps, programs or links taken by id, a write handle on one of its
+maps: NN-L-BPF-002's tampering) are a kind of their own with four times the
+allowance (`FLOOD_CAP_OWN_PER_UID`, 1,024: the lab's soak saw the sampler's
+`bpftool map dump`s of the agent's maps make ~450 in a second as root,
+which a cap of 256 kept from BPF-002).
+
+The rest of a key's second is counted, not queued: in the status
+(`capped`) and in signed `event_bus_capped` rows each sample — every key
+that capped something, with its count, its first and last time and what
+it is made of (the first process of each distinct `comm` and action, at
+most 8 per key; the count covers them all), in rows of at most 256 keys,
+each naming its part — with a WARN per uid and kind. A repeat of a queued
+denial is coalesced before the cap counts it. The capped denials are
+counted as NN-L-AT-001's held records, the capped records about the
+agent's own objects as NN-L-BPF-002's (C5, §5). Root's floods capped raise
+the posture's `TelemetryLoss` (ALERTED; not inside a trusted-installer
+window or a package transaction): the cap is itself a signal.
+
+A full table of keys (`FLOOD_CAP_KEYS`, 4,096 keys active in the same
+second; those whose second ended and that hold nothing to sign go first)
+queues a new key uncapped: it is judged like any P0 event, or — P0 itself
+full — dropped by the bus with its own signed `event_bus_drop` row and
+`TelemetryLoss`; never set aside uncounted and unjudged. Those events are
+counted and signed in the next capped row
+(`queued_uncapped_table_full`), and root's among them raise the posture as
+above. Holding them back instead would let a burst over many targets hide
+the rest of the second's events of every new key; queued, the flood falls
+back to R12a's bounds (the shares, P0's reserve of 64 slots).
+
+What it costs: inside a key's burst, another process's refused operation on
+the same target, or its `bpf()` call of the same command, in the same
+second is counted and named, not judged on its own — the kernel refused it,
+and the key's 256 a second keep the posture and the ladder on the flood. A
+root fork loop's (EXP-13e) and any user's `bpf()` loop's (EXP-13d) share of
+the consumer falls from two thirds to 256 decisions a second per target or
+command.
 
 ## 3. The take order
 
@@ -337,7 +366,10 @@ At the stop (review #471 M3) the event loop closes the bus
 refused, and what the queues still hold is counted in a signed
 `event_bus_stop` row (`queued_at_stop` per queue) and WARNed — not judged,
 never silent — with every drop not yet in a row signed whatever its
-window.
+window. A batch a pump had read and the closed bus refused is counted in
+the same row (`refused_at_close`, review of #474): the stop asks the pump
+threads to end and waits for them (at most two of their waits) before it
+signs.
 
 Coalesced denials (§2) are not lost: each sample signs the repeats counted
 since the last row (`event_bus_coalesced`: the key — pid, operation, inode
@@ -386,7 +418,8 @@ memory is given back when a queue above 1,024 runs empty; one lock per
 batch of up to 256 events and per take (R12b); the hand-over scans P1 only
 when an event of another queue is taken, each queued event once; the
 lineage keeps three execs per pid (its cache's bound is unchanged). R12b:
-eleven pump threads (blocked in `poll(2)` when their ring is empty), the
+eleven pump threads (blocked in `poll(2)` when their ring is empty) and
+the two drains' (each with a one-thread runtime of its own), the
 `fs_protect` ring's 192 KiB more of kernel memory, the envelope's 40 bytes
 per queued event, the cap's table (at most 4,096 uids
 and kinds). The lab's numbers (overhead, latency per class, the
@@ -427,15 +460,13 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   too). A kernel budget per uid for the `bpf` hook's records (stage 2): the
   userland cap (§2c) bounds the consumer's share, a kernel budget would
   bound the ring's.
-- **Open after R12b-1** — the FIM and network drains stay tasks of the
-  runtime that send one event at a time; in the lab's EXP-13c the FIM ring
-  dropped records in one run of three on the final tip (none in `main`'s
-  three; two of four on `main`'s code in R12a's lab), with no send of the
-  bus waiting: the FIM drain's move to a thread is the next candidate. The
-  DNS pump's thread runs its loop on the runtime's reactor (its pass
-  answers the lookups' requests). The `fs_protect` ring is sized at load
-  for a pump thread's wake-up on a saturated CPU (§2a); the other rings
-  keep the object's sizes.
+- **Open after R12b-1** — the FIM and network drains send one event at a
+  time (their loops await between events); the DNS pump's thread runs its
+  loop on the runtime's reactor (its pass answers the lookups' requests).
+  The `fs_protect` ring is sized at load for a pump thread's wake-up on a
+  saturated CPU (§2a); the other rings keep the object's sizes. A burst of
+  NN-L-BPF-001's commands is uncapped (§2c): it falls back to R12a's
+  bounds.
 - **R12c** — the response dispatcher by severity, its queue (stage 6);
   no action without a signed record (intent, then outcome); the budget
   never limits an action's record; the evidence writer's queue (stage 7);

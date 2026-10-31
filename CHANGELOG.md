@@ -1357,7 +1357,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   module-load, io_uring and `bpf()` rings, the exploit guard's and the LSM
   file-open sensor's — is an OS thread (`nn-<ring>`) that blocks in
   `poll(2)` on its ring and sends what it read in batches of at most 256
-  events, those that find room queued with one round of the queue's lock;
+  events, those that find room queued with one round of the queue's lock
+  (the FIM and network drains run on threads of their own too, each with a
+  runtime of its own);
   on R12a a pump was a task of the runtime sending one event at a time,
   and a ring fell behind on a saturated guest while no send had waited
   (EXP-13e). A dead pump thread stops the agent as a dead task did
@@ -1372,11 +1374,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   appended status field, `event_bus_decision`: the unsigned status frame
   one byte longer) and a WARN a sample. The tamper events a process can
   repeat at will (refused operations, `bpf()` calls) are queued at most
-  256 a second per uid and kind (1,024 for the `bpf()` records about the
-  agent's own objects, NN-L-BPF-002's), the rest counted in a signed
-  `event_bus_capped` row (the uid, the count, the first process of each
-  distinct program) and the status — a `bpf()` flood no longer takes two
-  thirds of the consumer (third review of #471, C3). The denials the bus
+  256 a second per uid and target — each refused operation on each target,
+  each `bpf()` command (1,024 for the `bpf()` records about the agent's own
+  objects, NN-L-BPF-002's) —, and NN-L-BPF-001's commands (a program
+  loaded, attached, a link made) are never capped (the review of #474: a
+  program load inside a burst of its uid's other `bpf()` calls went
+  unjudged); the rest is counted in signed `event_bus_capped` rows, every
+  key with its count, and the status; root's floods capped raise the
+  posture's `TelemetryLoss`; a full table of keys queues a new one
+  uncapped, counted — a `bpf()` flood no longer takes two thirds of the
+  consumer (third review of #471, C3). A batch a pump read and the closed
+  bus refused is counted in the stop row. The denials the bus
   coalesced or capped are counted as NN-L-AT-001's held records, the capped
   records about the agent's own BPF objects as NN-L-BPF-002's (their next
   record's `suppressed_before`, their signed `detections_held` rows: C5).
