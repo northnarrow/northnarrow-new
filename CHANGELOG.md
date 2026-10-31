@@ -1369,12 +1369,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   appended status field, `event_bus_decision`: the unsigned status frame
   one byte longer) and a WARN a sample. The tamper events a process can
   repeat at will (refused operations, `bpf()` calls) are queued at most
-  256 a second per uid and kind, the rest counted in a signed
+  256 a second per uid and kind (1,024 for the `bpf()` records about the
+  agent's own objects, NN-L-BPF-002's), the rest counted in a signed
   `event_bus_capped` row (the uid, the count, the first process of each
   distinct program) and the status — a `bpf()` flood no longer takes two
   thirds of the consumer (third review of #471, C3). The denials the bus
-  coalesced or capped are counted as NN-L-AT-001's held records (its next
-  record's `suppressed_before`, its signed `detections_held` rows: C5).
+  coalesced or capped are counted as NN-L-AT-001's held records, the capped
+  records about the agent's own BPF objects as NN-L-BPF-002's (their next
+  record's `suppressed_before`, their signed `detections_held` rows: C5).
   The nn-admin matrix's status lines gain the decision delay per queue;
   EXP-13's harness reads them, the capped rows and the C5 accounting.
 - The priority event bus replaces the one channel between the sensors and

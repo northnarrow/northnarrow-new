@@ -242,7 +242,7 @@ pub fn full_status() -> StatusResponse {
         "event_bus": {
             "queues": [
                 {"priority": "P0", "class": "tamper", "capacity": 1024,
-                 "when_full": "wait 50 ms, then drop for FsProtectDenial (repeats within 1 s coalesced); other tamper events wait, 64 slots kept from denials and bpf() calls; denials and bpf() calls past 256 per uid a second counted, not queued",
+                 "when_full": "wait 50 ms, then drop for FsProtectDenial (repeats within 1 s coalesced); other tamper events wait, 64 slots kept from denials and bpf() calls; denials and bpf() calls past 256 per uid a second (1024 for those about the agent's own objects) counted, not queued",
                  "enqueued": 12, "dropped": 0,
                  "depth": 0, "max_depth": 3, "max_wait_us": 41, "recent_max_wait_us": 0, "waited": 0,
                  "send_wait_max_us": 0, "ahead": 0, "coalesced": 1499,

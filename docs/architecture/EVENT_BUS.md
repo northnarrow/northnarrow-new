@@ -167,8 +167,13 @@ Under the shares a flood that keeps P0 full takes two thirds of the
 consumer (§3). The two tamper events a process can repeat at will —
 `floods_p0`: a refused operation (root; no kernel budget) and a `bpf()`
 call (any user on 6.x) — are queued at most `FLOOD_CAP_PER_UID` (256) a
-second per uid and kind (`FloodCap`); the rest of that uid's second is
-counted, not queued: in the status (`capped`) and in a signed
+second per uid and kind (`FloodCap`) — the records about the agent's own
+BPF objects (a handle to one of its maps, programs or links taken by id, a
+write handle on one of its maps: NN-L-BPF-002's tampering) a kind of their
+own with four times the allowance (`FLOOD_CAP_OWN_PER_UID`, 1,024: the
+lab's soak saw the sampler's `bpftool map dump`s of the agent's maps make
+~450 in a second as root, which a cap of 256 kept from BPF-002); the rest
+of that uid's second is counted, not queued: in the status (`capped`) and in a signed
 `event_bus_capped` row each sample (per uid and kind the count, its first
 and last time, and what the flood is made of — the first process of each
 distinct `comm` and action, at most 8: a fork loop of one program is one,
@@ -176,8 +181,8 @@ another program's attempt inside the flood is named apart), with a WARN.
 A repeat of a queued denial is coalesced before the cap counts it; another
 uid's events have their own allowance (a flood by one never caps another's);
 the kinds are counted apart; a full table of uids (4,096) queues a new uid
-uncapped. The capped denials are counted as NN-L-AT-001's held records (C5,
-§5). What it costs: inside a flooding uid, another program's refused
+uncapped. The capped denials are counted as NN-L-AT-001's held records, the
+capped records about the agent's own objects as NN-L-BPF-002's (C5, §5). What it costs: inside a flooding uid, another program's refused
 operation in the same second is counted and named, not judged on its own —
 the kernel refused it, and the uid's 256 a second keep the posture and the
 ladder on the flood. A root fork loop's (EXP-13e) and any user's `bpf()`

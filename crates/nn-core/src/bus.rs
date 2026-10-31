@@ -783,21 +783,44 @@ pub const FLOOD_CAP_KEYS: usize = 4096;
 /// two rows.
 pub const FLOOD_CAP_SAMPLES: usize = 8;
 
-/// Which flood of P0 an event is ([`floods_p0`]).
+/// R12b: the allowance of a uid's `bpf()` records about the agent's own
+/// objects ([`FloodKind::BpfOwn`]: a handle to one of its maps, programs or
+/// links taken by id, a write handle on one of its maps — NN-L-BPF-002's
+/// tampering), a second: four times [`FLOOD_CAP_PER_UID`]. The lab's soak
+/// found the sampler's `bpftool map dump`s of the agent's maps making
+/// ~450 such records in a second as root; capped at 256 with the other
+/// `bpf()` calls, BPF-002 lost them. Still a cap: a fork loop of
+/// `bpf(BPF_MAP_GET_FD_BY_ID, <an agent map>)` by any user takes at most
+/// this many decisions a second.
+pub const FLOOD_CAP_OWN_PER_UID: u32 = 4 * FLOOD_CAP_PER_UID;
+
+/// Which flood of P0 an event is ([`floods_p0`]); each kind has its own
+/// allowance per uid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FloodKind {
     /// `FsProtectDenial`: a refused operation on a protected inode, or a
     /// refused signal or ptrace of a protected process.
     Denial,
-    /// `BpfSyscall`: a `bpf()` call the LSM hook saw.
+    /// `BpfSyscall`: a `bpf()` call the LSM hook saw, but those of
+    /// [`FloodKind::BpfOwn`].
     Bpf,
+    /// `BpfSyscall` about the agent's own objects (the kernel's
+    /// `foreign_get_fd`, `foreign_map_write`): NN-L-BPF-002's, with a larger
+    /// allowance ([`FLOOD_CAP_OWN_PER_UID`]).
+    BpfOwn,
 }
 
 impl FloodKind {
     /// The kind of `event`, `None` when it does not flood P0.
     pub fn of(event: &Event) -> Option<(FloodKind, u32)> {
+        use common::wire::{BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE};
         match event {
             Event::FsProtectDenial { uid, .. } => Some((FloodKind::Denial, *uid)),
+            Event::BpfSyscall { uid, cmd, .. }
+                if matches!(*cmd, BPF_CMD_FOREIGN_GET_FD | BPF_CMD_FOREIGN_MAP_WRITE) =>
+            {
+                Some((FloodKind::BpfOwn, *uid))
+            }
             Event::BpfSyscall { uid, .. } => Some((FloodKind::Bpf, *uid)),
             _ => None,
         }
@@ -808,6 +831,7 @@ impl FloodKind {
         match self {
             FloodKind::Denial => "FsProtectDenial",
             FloodKind::Bpf => "BpfSyscall",
+            FloodKind::BpfOwn => "BpfSyscall (the agent's own objects)",
         }
     }
 }
@@ -903,7 +927,11 @@ impl FloodCap {
             w.started_ns = now_ns;
             w.queued = 0;
         }
-        if w.queued < self.per_uid {
+        let allowance = match kind {
+            FloodKind::BpfOwn => self.per_uid.saturating_mul(4),
+            FloodKind::Denial | FloodKind::Bpf => self.per_uid,
+        };
+        if w.queued < allowance {
             w.queued += 1;
             return true;
         }
@@ -1656,6 +1684,42 @@ mod tests {
             "uid 3 counted now"
         );
         assert_eq!(cap.take_pending().len(), 2);
+    }
+
+    /// R12b (the lab's soak): a uid's `bpf()` records about the agent's own
+    /// objects (NN-L-BPF-002's) have an allowance of their own, four times
+    /// the others' — a burst of `bpftool map dump`s of the agent's maps is
+    /// not capped with the uid's other calls, and a flood of them still is.
+    #[test]
+    fn the_agent_s_own_objects_have_an_allowance_of_their_own() {
+        use common::wire::{BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE};
+        let own = |cmd| Event::BpfSyscall {
+            pid: 1,
+            uid: 0,
+            comm: "bpftool".into(),
+            cmd,
+            arg: 7,
+            timestamp_ns: 1,
+        };
+        assert_eq!(
+            FloodKind::of(&own(BPF_CMD_FOREIGN_GET_FD)),
+            Some((FloodKind::BpfOwn, 0))
+        );
+        assert_eq!(
+            FloodKind::of(&own(BPF_CMD_FOREIGN_MAP_WRITE)),
+            Some((FloodKind::BpfOwn, 0))
+        );
+        assert_eq!(FloodKind::of(&own(0)), Some((FloodKind::Bpf, 0)));
+        assert_eq!(FLOOD_CAP_OWN_PER_UID, 4 * FLOOD_CAP_PER_UID);
+        let mut cap = FloodCap::new(3, 1_000, 16);
+        let n = |cap: &mut FloodCap, kind| {
+            (0..20u32)
+                .filter(|i| cap.admit(kind, 0, u64::from(*i), || sample(*i)))
+                .count()
+        };
+        assert_eq!(n(&mut cap, FloodKind::Bpf), 3, "the other calls' allowance");
+        assert_eq!(n(&mut cap, FloodKind::BpfOwn), 12, "four times it, apart");
+        assert_eq!(n(&mut cap, FloodKind::Denial), 3);
     }
 
     /// Only the events that flood P0 have a kind; their uid is the actor's.

@@ -1246,10 +1246,11 @@ fn when_full_text(p: Priority, w: WhenFull, open_cap: usize) -> String {
         (Priority::P0, WhenFull::Wait { .. }) => format!(
             "{} for FsProtectDenial (repeats within 1 s coalesced); other tamper events wait, \
              {} slots kept from denials and bpf() calls; denials and bpf() calls past {} per uid \
-             a second counted, not queued",
+             a second ({} for those about the agent's own objects) counted, not queued",
             w.describe(),
             core_bus::P0_RESERVE,
-            core_bus::FLOOD_CAP_PER_UID
+            core_bus::FLOOD_CAP_PER_UID,
+            core_bus::FLOOD_CAP_OWN_PER_UID
         ),
         (Priority::P2, WhenFull::DropNew) => format!(
             "drop the new FileOpen (past {open_cap} opens queued); write-opens of CRITICAL/PERSIST \
@@ -1372,10 +1373,13 @@ pub struct BusLosses {
     held: Arc<OnceLock<HeldSink>>,
 }
 
-/// Where the denials the bus coalesced or capped are counted as the
-/// records NN-L-AT-001 held back (the third review's C5): `(uid, count,
-/// (subject key, subject text))`.
-pub type HeldSink = Arc<dyn Fn(u32, u64, (String, String)) + Send + Sync>;
+/// Where the tamper records the bus did not queue are counted as the
+/// records of the rule that judges them held back (the third review's C5):
+/// `(kind, uid, count, (subject key, subject text))` — the coalesced and
+/// capped denials ([`FloodKind::Denial`]: NN-L-AT-001's), the capped
+/// records about the agent's own BPF objects ([`FloodKind::BpfOwn`]:
+/// NN-L-BPF-002's).
+pub type HeldSink = Arc<dyn Fn(FloodKind, u32, u64, (String, String)) + Send + Sync>;
 
 impl BusLosses {
     /// R12b, the third review's C5: count the denials the bus did not queue
@@ -1389,9 +1393,16 @@ impl BusLosses {
     }
 
     /// [`Self::bind_held`] on the process-wide record budget
-    /// ([`nn_core::detection_budget`]) for `rule` (NN-L-AT-001's id).
-    pub fn bind_held_budget(&self, rule: &'static str) {
-        self.bind_held(Arc::new(move |uid, n, sample| {
+    /// ([`nn_core::detection_budget`]): the denials as `denials`' (NN-L-AT-001's
+    /// id), the records about the agent's own BPF objects as `own_bpf`'s
+    /// (NN-L-BPF-002's id: it judges every one of them, never exempt).
+    pub fn bind_held_budget(&self, denials: &'static str, own_bpf: &'static str) {
+        self.bind_held(Arc::new(move |kind, uid, n, sample| {
+            let rule = match kind {
+                FloodKind::Denial => denials,
+                FloodKind::BpfOwn => own_bpf,
+                FloodKind::Bpf => return,
+            };
             nn_core::detection_budget::count_coalesced_many(rule, uid, n, || sample)
         }));
     }
@@ -1632,13 +1643,14 @@ fn sign_coalesced(stats: &BusStats, losses: &BusLosses) {
     if let Some(held) = losses.held.get() {
         for (k, w) in &keys {
             held(
+                FloodKind::Denial,
                 w.uid,
                 w.repeats,
                 (w.comm.clone(), held_text(&w.comm, k.pid)),
             );
         }
         for (uid, (n, text)) in &evicted_held {
-            held(*uid, *n, (text.clone(), text.clone()));
+            held(FloodKind::Denial, *uid, *n, (text.clone(), text.clone()));
         }
     }
     let named: Vec<serde_json::Value> = keys
@@ -1706,12 +1718,12 @@ fn sign_capped(stats: &BusStats, losses: &BusLosses) {
         return;
     }
     if let Some(held) = losses.held.get() {
-        for c in pending.iter().filter(|c| c.kind == FloodKind::Denial) {
+        for c in pending.iter().filter(|c| c.kind != FloodKind::Bpf) {
             let name = c
                 .samples
                 .first()
                 .map_or_else(String::new, |s| held_text(&s.comm, s.pid));
-            held(c.uid, c.count, (name.clone(), name));
+            held(c.kind, c.uid, c.count, (name.clone(), name));
         }
     }
     let since: u64 = pending.iter().map(|c| c.count).sum();
@@ -3086,7 +3098,7 @@ mod tests {
             let losses = BusLosses::default();
             losses.bind_audit_log(Some(log));
             let h = Arc::clone(&held);
-            losses.bind_held(Arc::new(move |uid, n, _| h.lock().push((uid, n))));
+            losses.bind_held(Arc::new(move |_, uid, n, _| h.lock().push((uid, n))));
             record(&rx.stats(), &losses, Sample::Tick);
             let got = rows(dir.path(), &path, CAPPED_AUDIT_OP);
             assert_eq!(got.len(), 1, "{got:?}");
@@ -3146,7 +3158,8 @@ mod tests {
             let losses = BusLosses::default();
             losses.bind_audit_log(Some(log));
             let h = Arc::clone(&held);
-            losses.bind_held(Arc::new(move |uid, n, (_, text)| {
+            losses.bind_held(Arc::new(move |kind, uid, n, (_, text)| {
+                assert_eq!(kind, FloodKind::Denial);
                 h.lock().push((uid, n, text))
             }));
             record(&rx.stats(), &losses, Sample::Tick);
@@ -3161,6 +3174,51 @@ mod tests {
             );
             record(&rx.stats(), &losses, Sample::Tick);
             assert_eq!(held.lock().len(), 2, "counted once");
+        })
+        .await
+    }
+
+    /// R12b (the lab's soak): a uid's records about the agent's own BPF
+    /// objects are capped apart, with four times the allowance, and the
+    /// capped ones are counted as NN-L-BPF-002's held records; the uid's
+    /// other `bpf()` calls are no rule's held records.
+    #[tokio::test]
+    async fn the_capped_records_about_the_agent_s_objects_are_bpf_002_s() {
+        within(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (log, _) = audit_log(dir.path());
+            let (tx, rx) = channel_capped(SPECS, 2);
+            let call = |pid: u32, cmd: u32| Event::BpfSyscall {
+                pid,
+                uid: 0,
+                comm: "bpftool".into(),
+                cmd,
+                arg: 7,
+                timestamp_ns: 0,
+            };
+            let own = common::wire::BPF_CMD_FOREIGN_GET_FD;
+            tx.send_batch((0..10).map(|p| call(p, own)).collect())
+                .await
+                .unwrap();
+            tx.send_batch((10..15).map(|p| call(p, 0)).collect())
+                .await
+                .unwrap();
+            let snap = rx.stats().snapshot();
+            assert_eq!(snap[0].stats.enqueued, 8 + 2, "8 own (4 x 2), 2 others");
+            assert_eq!(snap[0].capped, 2 + 3);
+            let held: Arc<Mutex<Vec<(FloodKind, u32, u64)>>> = Arc::default();
+            let losses = BusLosses::default();
+            losses.bind_audit_log(Some(log));
+            let h = Arc::clone(&held);
+            losses.bind_held(Arc::new(move |kind, uid, n, _| {
+                h.lock().push((kind, uid, n))
+            }));
+            record(&rx.stats(), &losses, Sample::Tick);
+            assert_eq!(
+                *held.lock(),
+                [(FloodKind::BpfOwn, 0, 2)],
+                "only the own objects'"
+            );
         })
         .await
     }

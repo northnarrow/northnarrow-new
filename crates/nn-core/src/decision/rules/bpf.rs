@@ -128,6 +128,10 @@ impl<H: PostureHost> Rule for NnLBpf001BpfProgramLoaded<H> {
     }
 }
 
+/// NN-L-BPF-002's id (R12b: the bus counts the records about the agent's
+/// own objects it capped as this rule's held records).
+pub const BPF002_ID: &str = "NN-L-BPF-002_BpfForeignHandleOrDetach";
+
 pub struct NnLBpf002BpfForeignHandleOrDetach<H: PostureHost> {
     allowlist: Arc<CommAllowlist<H>>,
 }
@@ -140,7 +144,7 @@ impl<H: PostureHost> NnLBpf002BpfForeignHandleOrDetach<H> {
 
 impl<H: PostureHost> Rule for NnLBpf002BpfForeignHandleOrDetach<H> {
     fn id(&self) -> &'static str {
-        "NN-L-BPF-002_BpfForeignHandleOrDetach"
+        BPF002_ID
     }
     fn name(&self) -> &'static str {
         "Handle to the agent's BPF objects, or a program/link detach, by an unlisted process"
