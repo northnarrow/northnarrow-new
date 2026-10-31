@@ -2632,6 +2632,19 @@ mod tests {
             "it ran at the event's time and is not the cached one: not known"
         );
         assert!(!t.in_package_transaction(4800, AsOf::Judged(20 * S)));
+        // R12b: the same, the agent started at 30 s — the process `/proc`
+        // shows is older than the agent, but the cache holds an exec of the
+        // pid that `/proc` contradicts: still not known (the older process's
+        // exception is for a pid the cache does not hold)
+        let t = AuthSessionTracker::live_on(proc.path(), 0);
+        write_started(proc.path(), "self", 1, 3_000);
+        t.ingest_exec(4800, 1, "/usr/bin/dpkg", &[], 6 * S, 5 * S, 0);
+        assert_eq!(
+            t.lineage_identities(4800, AsOf::Judged(20 * S))
+                .map(|l| l[0].1.exe.clone()),
+            None,
+            "a cached exec /proc contradicts: not its /proc image"
+        );
     }
 
     #[test]
