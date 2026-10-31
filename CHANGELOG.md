@@ -1386,8 +1386,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   start (`Type=forking`, `daemon()`) is its image's orphan once the sweep
   found its parent gone; a pid reused by a fork is no longer judged as the
   dead process's image (a session's subshell stays auth-mediated); the
-  hard bound drops the most numerous user's entries first and raises
-  `TelemetryLoss`; the released cap keys are bounded, their counts summed.
+  hard bound drops the most numerous account's entries first, whatever its
+  class, and raises `TelemetryLoss`; the released cap keys are bounded,
+  their counts summed. An adopted orphan runs its image from the sweep's
+  instant only (the final check of #475).
 - The ring pumps on threads of their own, sending in batches (lab PR 269,
   Wave 4 phase 2, R12b-1 of the restructure plan;
   `docs/architecture/EVENT_BUS.md` §2a–2c, §5). Each ring's pump — the

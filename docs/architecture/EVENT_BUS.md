@@ -408,11 +408,12 @@ backend) was not known at all. So:
   (or whose pid names another process now); past 2,048 entries only marked
   ones past a 30-s grace are dropped, a live process's never for newer
   ones; past 32,768 entries a gone process's go first, then the oldest of
-  the uid holding the most among the processes executed since the start
-  (users' before system accounts'; the start's scan's last), counted
+  the uid holding the most among the processes executed since the start,
+  whatever the uid's class (the start's scan's last), counted
   (`evicted_live`), WARNed and raising the posture's `TelemetryLoss` (the
-  third review of #475: a user's flood of live processes pushes out its
-  own entries, not the boot's daemons);
+  third review of #475 and its final check: an account's flood of live
+  processes — a user's, or a webshell's as `www-data` — pushes out its own
+  entries, not the boot's daemons nor a person's session);
 - a fork runs its parent's image while `/proc` says so (`fork_entry`): for
   a pid the cache does not hold, its parent and start from
   `/proc/<pid>/stat` (no exec changes them), its parent's image as of that
@@ -431,8 +432,13 @@ The third review of #475 found two holes of the same family:
   gone (`orphan_entry`): reparented to pid 1 or to a subreaper among that
   process's ancestors, started no earlier than its exec, running that very
   file; every gone process of that image it could descend from must have
-  run the same script. Its parent stays the one `/proc` shows. Until the
-  sweep after its parent's exit (at most 5 s) it is not known;
+  run the same script. Its parent stays the one `/proc` shows. It runs
+  that image from the sweep's instant only — the adoption is an inference
+  about the present (the final check of #475: an attacker who ran a reader
+  any user may run and let it exit, then executes it again with that exec
+  still queued across a sweep, does not get the events before the exec
+  judged as the reader's). Before that sweep (at most 5 s after its
+  parent's exit) it is not known;
 - a pid reused by a fork while the dead process's entry was cached
   answered with the dead process's image, and the walk stopped at it. A
   cached exec whose process is not the one the pid names now (another
@@ -627,7 +633,11 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   daemon's orphan before the sweep (≤ 5 s) is an exec identity the kernel
   keeps per task (task storage written at `bprm_committed`, copied at fork,
   read by pidfd). The start's scan can enter the image of an exec it reads
-  before that exec's event arrives (milliseconds, at the start only).
+  before that exec's event arrives (milliseconds, at the start only). The
+  session and workload attribution (`lookup_cache`: the login uid and the
+  cgroup a walk reads) still takes a cached exec without checking it against
+  the process its pid names now, so a pid reused by a fork can take the dead
+  process's parent there (older than R12b).
 - **Open after review #471** — B1: the property test compares the
   strongest verdict per rule and process (§4); B5: "(agent predates the
   bus)" in `nn-admin status` is reachable only against an agent older than

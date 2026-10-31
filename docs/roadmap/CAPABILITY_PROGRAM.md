@@ -3819,9 +3819,13 @@ only in the table below, in the same PR as the evidence.
     between when neither exec is held) and RR5 (a swept fork whose later
     exec is lost judged as its parent's image) — the structural fix is an
     exec identity the kernel keeps per task; past 32,768 cached entries
-    live ones are dropped (the most numerous user's first; counted, WARNed,
-    `TelemetryLoss`); the start's scan can enter the image of an exec it
-    reads before that exec's event arrives (milliseconds at the start);
+    live ones are dropped (the most numerous account's first, whatever its
+    class; counted, WARNed, `TelemetryLoss`); the start's scan can enter
+    the image of an exec it reads before that exec's event arrives
+    (milliseconds at the start); the session and workload attribution
+    (`lookup_cache`) still takes a cached exec unchecked against the pid's
+    present process (a reused pid can take the dead one's parent there;
+    older than R12b);
     R-B and the property test over the posture corpus not done; the
     self-integrity check's window for a freeze that starts right after a
     round (C15 on the first tip).
@@ -3883,10 +3887,15 @@ only in the table below, in the same PR as the evidence.
     judgement; a session's subshell stays auth-mediated, a regression
     against `main` before); the reviewer's surviving mutations M5, M6,
     M9, M11 have their tests; the start is read again after the exe; the
-    hard bound drops the most numerous user's entries first, the start's
-    scan's last, and raises `TelemetryLoss`; the keys a full cap table
-    releases are bounded, their counts summed per kind and uid. RR3 and
-    RR5 stay open (above).
+    hard bound drops the most numerous account's entries first, whatever
+    its class (the final check: a webshell's flood as `www-data` does not
+    push out a person's session), the start's scan's last, and raises
+    `TelemetryLoss`; the keys a full cap table releases are bounded, their
+    counts summed per kind and uid. The final check of #475 (merge after a
+    one-line fix): an adopted orphan runs its image from the sweep's
+    instant, not from its start (RRd2: an attacker's read before its own
+    queued exec of a reader any user may run, judged as that reader's). RR3
+    and RR5 stay open (above).
   - R12b-2 — lab after the reviews (our own guests, fresh installs):
     round m (ubuntu2404, the final code e01cb609): `test-ignored` 80
     suites, 97 passed, 0 failed, the 54 chain checks `ok` — a `Type=forking`
@@ -3922,3 +3931,13 @@ only in the table below, in the same PR as the evidence.
     8977f0b3: set C 15 of 15 (CN1, the start's `seed_from_proc` call
     removed, among them), set B 21 of 21 applicable, R-F's own 9 of 9
     applicable.
+  - R12b-2 — after the final check (217af285): gates — build-ebpf, clippy
+    ×4 `-D warnings`, fmt, 75 suites 3,327 passed 0 failed 17 ignored, the
+    privileged no-run, attack-coverage, `golden` ×5 (54 files the same
+    bytes), MSRV 1.89, fuzz (13), portable-core (5), lockfiles unchanged;
+    mutations 4 of 4 (the orphan counted from its start — the reviewer's
+    RRd2 —, users before system accounts at the hard bound, and two of set
+    D's again); round n (ubuntu2404): `test-ignored` 80 suites, 97 passed,
+    0 failed, the 54 chain checks `ok`, the `Type=forking` reader daemon
+    (the test waits one sweep's period, 7 s, by design) `Log` High, not
+    killed.
