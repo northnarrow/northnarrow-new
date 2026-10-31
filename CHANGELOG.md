@@ -1350,6 +1350,25 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- The decision on a thread of its own, without `await` (lab PR 269, Wave 4
+  phase 2, R12b-2 of the restructure plan; `docs/architecture/EVENT_BUS.md`
+  §2d, §3). `nn-decision` takes each event from the bus, judges it and
+  counts its delay; the event loop's task keeps the signals, the admin
+  shutdown and the telemetry tasks' liveness. Off the decision: an exec's
+  path made absolute in its pump (every exec; the receiver reads no
+  `/proc`), systemd's state a snapshot the systemd watch refreshes (a
+  relayed signal judged on an answer at most a second old, else handed to
+  the watch, which asks and sends it back on the bus), the
+  trusted-installer window's expiry its tick's, a canary trip's access row
+  and registry mark written by `nn-canary-log`, a kernel module's package
+  ownership asked by the module-load pump and kept for R018. The responses
+  still run on the decision thread (R12c). A ratchet keeps blocking I/O
+  off the decision path (`xtask/tests/decision_path_io.rs`). The lineage
+  takes the judgement's time as a parameter (`AsOf`; the thread-local
+  `judged_at` is gone), and in a judgement a pid its cache does not hold is
+  not known — not read from `/proc` — unless its process started before
+  the agent (R-F). The process-wide cache of systemd's answer is gone (the
+  snapshot keeps it).
 - The ring pumps on threads of their own, sending in batches (lab PR 269,
   Wave 4 phase 2, R12b-1 of the restructure plan;
   `docs/architecture/EVENT_BUS.md` §2a–2c, §5). Each ring's pump — the
