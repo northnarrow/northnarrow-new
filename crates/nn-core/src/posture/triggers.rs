@@ -3616,6 +3616,33 @@ mod tests {
         );
     }
 
+    /// R12b (R-F): a credential read is judged on the reader as of the
+    /// read — a process that read /etc/shadow as `cat` and executed `sudo`
+    /// afterwards (its exec ingested before the read is judged) is no
+    /// authentication chain at the read: SensitiveFileAccess fires; the
+    /// same process as `sudo` at the read is the PAM stack's open.
+    #[test]
+    fn a_credential_read_is_judged_on_the_reader_as_of_the_read() {
+        use super::super::exempt::ExemptPids;
+        use super::super::lineage::AuthSessionTracker;
+        const S: u64 = 1_000_000_000;
+        let auth = AuthSessionTracker::new("/this/path/does/not/exist");
+        auth.ingest_exec(31400, 1, "/usr/bin/cat", &[], 10 * S, 9 * S, 1000);
+        auth.ingest_exec(31400, 1, "/usr/bin/sudo", &[], 30 * S, 9 * S, 1000);
+        let det = TriggerDetector::with_exempt_and_auth(ExemptPids::default(), auth);
+        let read_at = |ts| file_open(31400, 1000, "/etc/shadow", 0, ts);
+        assert!(
+            det.detect(&read_at(20 * S), &[])
+                .contains(&TriggerType::SensitiveFileAccess),
+            "read as cat: fires, the later sudo vouches for nothing"
+        );
+        assert!(
+            !det.detect(&read_at(40 * S), &[])
+                .contains(&TriggerType::SensitiveFileAccess),
+            "read as sudo: the authentication chain's own open"
+        );
+    }
+
     /// BUG-012: /etc/login.defs was the new addition to
     /// SENSITIVE_FILES (the FIM_OPENED_SUPPRESS_PATHS list includes
     /// it, so the posture trigger MUST cover it or coverage is lost).
