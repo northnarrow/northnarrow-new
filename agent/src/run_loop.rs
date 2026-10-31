@@ -110,11 +110,6 @@ pub(crate) async fn run(
         };
     };
     let lineage = sensor.lineage();
-    // R12b: a relayed signal the decision hands to the systemd watch comes
-    // back on the bus.
-    combat
-        .systemd
-        .bind_bus(sensor.event_tx_for("systemd_watch"));
     let pipeline = Pipeline {
         engine,
         executor,
@@ -193,9 +188,41 @@ fn decision_loop(
         cow_guard,
         ..
     } = p.combat;
+    // One event judged: offered to the telemetry probe (Tappa 10.8: every
+    // event before the decision engine; R11c, lab PR 264: the probe the late
+    // binding started), then `process_event`.
+    let judge = |e: nn_model::Event| {
+        if let Some(probe) = p.telemetry_probe {
+            probe.observe(&e);
+        }
+        process_event(
+            p.engine,
+            p.executor,
+            p.correlation,
+            p.posture,
+            ladder,
+            // Tappa 9.5 K6: detector handle wired in. When the canary
+            // subsystem boot failed (missing signing key, registry open
+            // error), canary_detector is None and process_event
+            // short-circuits to the source event without canary filtering.
+            p.canary_detector.as_deref(),
+            // Tappa 9.0.a: detection-persistence sink (off the hot path).
+            p.detection_sink.as_ref(),
+            p.expected_denial,
+            host_stopping,
+            systemd,
+            cow_guard,
+            e,
+        );
+    };
     loop {
         if ctl.stop.load(Ordering::Acquire) {
             return;
+        }
+        // R12b: the signals PID 1 relayed that the decision handed to the
+        // systemd watch, judged now on its answer (`SystemdSnapshot`).
+        for e in systemd.take_answered() {
+            judge(e);
         }
         // Lab PR 216: one round of the loop, for the watchdog's progress
         // check — the bus's wait brings a round at least every
@@ -217,32 +244,7 @@ fn decision_loop(
                     p.engine.observe_arrival(exec);
                 }
                 let e = received.envelope.event;
-                // Tappa 10.8 telemetry probe: every event is offered to the
-                // probe tracker before the decision engine (R11c, lab PR
-                // 264: the probe the late binding started).
-                if let Some(probe) = p.telemetry_probe {
-                    probe.observe(&e);
-                }
-                process_event(
-                    p.engine,
-                    p.executor,
-                    p.correlation,
-                    p.posture,
-                    ladder,
-                    // Tappa 9.5 K6: detector handle wired in. When the
-                    // canary subsystem boot failed (missing signing key,
-                    // registry open error), canary_detector is None and
-                    // process_event short-circuits to the source event
-                    // without canary filtering.
-                    p.canary_detector.as_deref(),
-                    // Tappa 9.0.a: detection-persistence sink (off the hot path).
-                    p.detection_sink.as_ref(),
-                    p.expected_denial,
-                    host_stopping,
-                    systemd,
-                    cow_guard,
-                    e,
-                );
+                judge(e);
                 // Lab PR 267: the event's latency, queue to decision; R12b:
                 // its delay from the record's kernel time (stage 5).
                 rx.decided();

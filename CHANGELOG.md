@@ -1358,7 +1358,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   path made absolute in its pump (every exec; the receiver reads no
   `/proc`), systemd's state a snapshot the systemd watch refreshes (a
   relayed signal judged on an answer at most a second old, else handed to
-  the watch, which asks and sends it back on the bus), the
+  the watch, which asks and hands it back answered to the decision
+  thread), the
   trusted-installer window's expiry its tick's, a canary trip's access row
   and registry mark written by `nn-canary-log`, a kernel module's package
   ownership asked by the module-load pump and kept for R018. The responses

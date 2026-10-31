@@ -73,11 +73,13 @@ const DEFERRED_MAX: usize = 64;
 /// The systemd watch ([`systemd_watch`]) refreshes it every 2 s. A relayed
 /// signal judged on an answer older than [`SYSTEMD_FRESH`] is handed to the
 /// watch instead ([`Self::judge`] → [`SystemdAnswer::Deferred`]), which asks
-/// systemd at once and sends the event back on the bus (its source
-/// `systemd_watch`): judged then on the new answer — once; handed back a
-/// second time it is judged on what the snapshot holds. Without a watch
-/// (no systemd socket) nothing is handed over: the answer is "none", as the
-/// question's was.
+/// systemd at once and hands it back answered ([`Self::take_answered`]):
+/// the decision thread judges it at its next turn (within its idle wait,
+/// half a second) on the new answer — once; handed back a second time it is
+/// judged on what the snapshot holds. Not through the bus: a denial sent
+/// again would be coalesced into the one already judged, or capped. Without
+/// a watch (no systemd socket) nothing is handed over: the answer is
+/// "none", as the question's was.
 #[derive(Clone, Default)]
 pub(crate) struct SystemdSnapshot(std::sync::Arc<SnapshotInner>);
 
@@ -89,14 +91,13 @@ struct SnapshotInner {
     watched: std::sync::atomic::AtomicBool,
     /// The decision wants a newer answer.
     wanted: tokio::sync::Notify,
-    /// Signals handed to the watch, to send back once it asked.
+    /// Signals handed to the watch, to hand back once it asked.
     deferred: parking_lot::Mutex<Vec<nn_model::Event>>,
-    /// The ones sent back (their record's time and target), judged on the
-    /// snapshot as it is when they come back.
+    /// The ones it handed back, answered, for the decision thread.
+    answered: parking_lot::Mutex<Vec<nn_model::Event>>,
+    /// Their identities (record's time and target): judged on the snapshot
+    /// as it is when they come back, never handed over again.
     handed: parking_lot::Mutex<std::collections::HashSet<(u64, u64, u64)>>,
-    /// Where the watch sends them back (the bus, bound at the event loop's
-    /// start).
-    bus: std::sync::OnceLock<northnarrow_agent::sensors::bus::BusSender>,
 }
 
 /// What the decision judges a relayed signal on ([`SystemdSnapshot::judge`]).
@@ -124,8 +125,7 @@ impl SystemdSnapshot {
         if self.0.handed.lock().remove(&key) {
             return latest();
         }
-        if !self.0.watched.load(std::sync::atomic::Ordering::Acquire) || self.0.bus.get().is_none()
-        {
+        if !self.0.watched.load(std::sync::atomic::Ordering::Acquire) {
             return latest();
         }
         {
@@ -139,9 +139,10 @@ impl SystemdSnapshot {
         SystemdAnswer::Deferred
     }
 
-    /// The bus the watch sends the deferred signals back on.
-    pub(crate) fn bind_bus(&self, tx: northnarrow_agent::sensors::bus::BusSender) {
-        let _ = self.0.bus.set(tx);
+    /// The signals the watch handed back answered, for the decision thread
+    /// to judge (each once).
+    pub(crate) fn take_answered(&self) -> Vec<nn_model::Event> {
+        std::mem::take(&mut *self.0.answered.lock())
     }
 
     /// Store an answer asked at `at`.
@@ -167,7 +168,7 @@ fn signal_key(event: &nn_model::Event) -> (u64, u64, u64) {
 /// the decision asks, systemd's state into the snapshot; once systemd
 /// stops the host, the ladder stood down (the shutdown's own traffic must
 /// not drive the posture or the ladder); the relayed signals the decision
-/// handed over sent back on the bus after the answer.
+/// handed over handed back answered.
 pub(crate) async fn systemd_watch(
     snapshot: SystemdSnapshot,
     stopping: HostStopping,
@@ -208,15 +209,13 @@ where
         if back.is_empty() {
             continue;
         }
-        let Some(tx) = snapshot.0.bus.get() else {
-            continue;
-        };
-        for event in back {
-            snapshot.0.handed.lock().insert(signal_key(&event));
-            if tx.send(event).await.is_err() {
-                return;
+        {
+            let mut handed = snapshot.0.handed.lock();
+            for event in &back {
+                handed.insert(signal_key(event));
             }
         }
+        snapshot.0.answered.lock().extend(back);
     }
 }
 
@@ -264,12 +263,10 @@ mod tests {
             SystemdAnswer::Judge(Some("stopping".into())),
             "stale, but no watch to ask: the latest"
         );
-        // a watch with a bus: handed over, once
+        // a watch: handed over, once
         snap.0
             .watched
             .store(true, std::sync::atomic::Ordering::Release);
-        let (tx, _rx) = northnarrow_agent::sensors::bus::channel();
-        snap.bind_bus(tx);
         assert_eq!(snap.judge(&relayed(2), later), SystemdAnswer::Deferred);
         assert_eq!(snap.0.deferred.lock().len(), 1);
         // the watch sent it back: judged on the snapshot as it is then
@@ -297,14 +294,12 @@ mod tests {
     }
 
     /// R12b: the watch asks systemd when the decision wants a newer answer
-    /// — not only at its tick — sends the handed signals back on the bus
-    /// after the answer, each to be judged then, and stands the ladder down
-    /// once the answer is "stopping".
+    /// — not only at its tick — hands the signals back answered (for the
+    /// decision thread, each once, never handed over again), and stands the
+    /// ladder down once the answer is "stopping".
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_watch_answers_the_decision_and_sends_the_signal_back() {
+    async fn the_watch_answers_the_decision_and_hands_the_signal_back() {
         let snap = SystemdSnapshot::default();
-        let (tx, mut rx) = northnarrow_agent::sensors::bus::channel();
-        snap.bind_bus(tx.for_source("systemd_watch"));
         let answer = std::sync::Arc::new(parking_lot::Mutex::new(Some("running".to_string())));
         let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stood_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -344,26 +339,33 @@ mod tests {
             snap.judge(&relayed(7), Instant::now()),
             SystemdAnswer::Deferred
         );
-        let back = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("sent back")
-            .unwrap();
+        let started = Instant::now();
+        let back = loop {
+            let answered = snap.take_answered();
+            if !answered.is_empty() {
+                break answered;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "handed back");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(back.len(), 1);
         assert!(matches!(
-            back.envelope.event,
+            back[0],
             nn_model::Event::FsProtectDenial {
                 timestamp_ns: 7,
                 ..
             }
         ));
+        assert!(snap.take_answered().is_empty(), "taken once");
         assert_eq!(
             asked.load(std::sync::atomic::Ordering::Acquire),
             2,
             "asked at once"
         );
         assert_eq!(
-            snap.judge(&back.envelope.event, Instant::now()),
+            snap.judge(&back[0], Instant::now() + Duration::from_secs(5)),
             SystemdAnswer::Judge(Some("stopping".into())),
-            "judged on the new answer"
+            "judged on the watch's answer, even late; not handed over again"
         );
         assert!(
             stood_down.load(std::sync::atomic::Ordering::Acquire),

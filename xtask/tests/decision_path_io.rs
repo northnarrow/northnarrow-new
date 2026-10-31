@@ -99,11 +99,10 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "agent/src/pipeline/mod.rs",
-        7,
-        "the systemd watch's (a task): its question to systemd off the runtime's worker and \
-         its sends of the deferred signals back on the bus; `pid1_is_systemd_shutdown` reads \
-         `/proc/1/comm` at a SIGTERM (the event loop's task) — the decision reads the \
-         watch's snapshot",
+        6,
+        "the systemd watch's (a task): its question to systemd off the runtime's worker, awaited \
+         with a bound; `pid1_is_systemd_shutdown` reads `/proc/1/comm` at a SIGTERM (the event \
+         loop's task) — the decision reads the watch's snapshot",
     ),
     (
         "agent/src/cow/mod.rs",

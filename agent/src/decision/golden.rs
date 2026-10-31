@@ -1272,9 +1272,17 @@ fn the_event_loop_wires_the_bus_as_modelled() {
             .map(|i| from + i)
             .unwrap_or_else(|| panic!("run_loop.rs: `{what}` not found after byte {from}"))
     };
-    // the decision thread
+    // the decision thread: one judging site, `judge`, the probe first
     let thread = at("fn decision_loop(", 0);
-    let arm = at("Recv::Event(received) => {", thread);
+    let judge_fn = at("let judge = |e: nn_model::Event| {", thread);
+    let probe = at("probe.observe(&e);", judge_fn);
+    let judging = at("process_event(", probe);
+    let answered = at("for e in systemd.take_answered() {", judging);
+    assert!(
+        code[answered..].find("judge(e);").is_some(),
+        "a signal the systemd watch answered is judged"
+    );
+    let arm = at("Recv::Event(received) => {", answered);
     let each = at("for exec in &received.overtaken {", arm);
     let teach = at("p.engine.observe_arrival(exec);", each);
     assert!(
@@ -1282,7 +1290,7 @@ fn the_event_loop_wires_the_bus_as_modelled() {
         "observe_arrival is the loop over the overtaken execs"
     );
     let event = at("let e = received.envelope.event;", arm);
-    let judge = at("process_event(", arm);
+    let judge = at("judge(e);", event);
     assert!(
         teach < event && event < judge,
         "taught before the event is judged"

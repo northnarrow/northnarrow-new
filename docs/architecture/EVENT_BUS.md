@@ -252,10 +252,12 @@ What blocked the decision is off it:
 - systemd's state is a snapshot (`SystemdSnapshot`) the systemd watch
   refreshes every 2 s: a signal PID 1 relayed (EBPF-001) is judged on an
   answer at most a second old; an older one hands the event to the watch,
-  which asks systemd at once and sends the event back on the bus (its
-  source `systemd_watch`) — judged then, once; without systemd's socket
-  the answer is "none", as the question's was. R12a's event loop awaited
-  systemd's answer up to a second;
+  which asks systemd at once and hands it back answered — the decision
+  thread judges it at its next turn (within its half-second wait), once
+  (not through the bus: a denial sent again would be coalesced into the one
+  already judged, or capped); without systemd's socket the answer is
+  "none", as the question's was. R12a's event loop awaited systemd's answer
+  up to a second;
 - the trusted-installer window's expiry is its tick's (external audit
   ATP-003, every second), not swept at every event;
 - a canary trip's access row and its registry mark are written by a thread
