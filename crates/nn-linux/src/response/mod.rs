@@ -111,6 +111,34 @@ pub struct ExecutionReport {
     pub elapsed: Duration,
 }
 
+/// R12c-3 (lab PR 270): the calling thread's nice value raised by `by`
+/// (at most 19) — a response worker yields the CPU to the decision thread
+/// and the sensors' pumps when they contend (EXP-13r: eight workers walking
+/// `/proc` on a 4-CPU guest made 1,247 decisions late). Linux keeps a nice
+/// value per thread. Returns the new value.
+pub fn lower_this_thread(by: i32) -> std::io::Result<i32> {
+    // SAFETY: gettid(2) takes no argument and cannot fail.
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::id_t;
+    // SAFETY: getpriority(2) reads two integers; -1 is also a valid nice
+    // value, told from an error by errno (cleared first).
+    let now = unsafe {
+        *libc::__errno_location() = 0;
+        libc::getpriority(libc::PRIO_PROCESS, tid)
+    };
+    if now == -1 && std::io::Error::last_os_error().raw_os_error() != Some(0) {
+        return Err(std::io::Error::last_os_error());
+    }
+    let nice = (now + by).min(19);
+    // SAFETY: setpriority(2) reads three integers and changes only this
+    // thread's nice value (raising it needs no privilege).
+    let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, nice) };
+    if rc == 0 {
+        Ok(nice)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// R12c (lab PR 270): an action's report as its signed outcome — the
 /// result, the report as text, and why when it is not a success. A kill
 /// tree that left a descendant running (not killed, spared, beyond a walk

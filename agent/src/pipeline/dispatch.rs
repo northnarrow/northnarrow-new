@@ -62,6 +62,9 @@ pub(crate) const WORKERS_ENV: &str = "NN_RESPONSE_WORKERS";
 /// `stalled` row, `TelemetryLoss`, and a spare worker so that the other
 /// processes' responses do not wait behind it.
 pub(crate) const STALL_AFTER: Duration = Duration::from_secs(10);
+/// R12c-3: the workers' nice value, above the agent's own by this much —
+/// below the decision thread and the pumps when the CPU is short.
+pub(crate) const WORKER_NICE: i32 = 5;
 /// How often the stall watch looks.
 const STALL_WATCH_EVERY: Duration = Duration::from_millis(500);
 
@@ -884,6 +887,9 @@ fn spawn_worker(s: &Arc<Shared>, name: String, spare: bool) -> bool {
 /// intent, the action, its outcome; the process freed for its next job.
 fn work(s: &Shared, slot: &Slot, spare: bool) {
     let _exit = Exit(s, !spare);
+    if let Err(e) = northnarrow_agent::response::lower_this_thread(WORKER_NICE) {
+        warn!(error = %e, "a response worker keeps the decision thread's CPU priority");
+    }
     let mut unsynced = 0usize;
     loop {
         let t = {
