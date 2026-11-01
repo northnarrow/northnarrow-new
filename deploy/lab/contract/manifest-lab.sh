@@ -101,7 +101,11 @@ wait_ssh() { # within
 # `up` waits for `bpf` in the active LSM list, which a boot without it never
 # shows: then it is left to give up on its own (its own timeout, the guest
 # left running) while the ssh wait here goes on.
+UP_PID=
 reboot_guest() { # nobpf|bpf
+  # an earlier `up` still waiting would boot the guest again beside this
+  # one's: it ends first (its own timeout)
+  if [[ -n $UP_PID ]]; then wait "$UP_PID" 2>/dev/null; UP_PID=; fi
   g 'sudo systemctl reboot' >/dev/null 2>&1
   if [[ $(cat "$ROOT/accel" 2>/dev/null) == whpx ]]; then
     for _ in $(seq 1 60); do
@@ -110,6 +114,7 @@ reboot_guest() { # nobpf|bpf
     done
     if [[ $1 == nobpf ]]; then
       NN_LAB_BOOT_TIMEOUT=300 "$LAB" up > "$OUT/up-$1.log" 2>&1 &
+      UP_PID=$!
     else
       NN_LAB_BOOT_TIMEOUT=600 "$LAB" up > "$OUT/up-$1.log" 2>&1
     fi
@@ -267,6 +272,7 @@ print("L%s; not invoked: %s; on a fallback: %s; bpf_lsm %s" % (m["trust_level"],
 fi
 
 sleep 10
+if [[ -n $UP_PID ]]; then wait "$UP_PID" 2>/dev/null; fi
 kill "$WPID" 2>/dev/null; trap - EXIT
 {
   echo "manifest lab ($PHASE) on $D: $fails step(s) failed"
