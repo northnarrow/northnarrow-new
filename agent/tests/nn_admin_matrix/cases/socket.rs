@@ -316,7 +316,7 @@ pub fn full_status() -> StatusResponse {
         "wait_p50_us": 90, "wait_p99_us": 41000, "wait_max_us": 52000,
         "executed": 116, "execution_max_us": 48000,
         "intents": 116, "outcomes": 115, "unwritten": 0, "interrupted_at_boot": 1,
-        "abandoned": 0, "overflow_rows": 2, "in_flight": 1,
+        "abandoned": 0, "overflow_rows": 2, "in_flight": 1, "sync_failed": 0,
         "evidence_capacity": 1024, "evidence_depth": 0, "evidence_max_depth": 1300,
         "evidence_over_cap": 276, "evidence_dropped": 2, "evidence_dropped_acted": 0,
         "evidence_wait_max_us": 8000, "evidence_written": 4100, "evidence_append_failed": 0,

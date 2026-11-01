@@ -142,6 +142,19 @@ pub struct ActionOutcome {
     pub reason: Option<String>,
     /// From the intent to the outcome (µs).
     pub elapsed_us: u64,
+    /// The re-check of #476: `false` when the action's intent row is not in
+    /// the chain (the journal could not take it: logged whole at ERROR and
+    /// counted) — the gap named where the outcome is. Written only then.
+    #[serde(default = "intent_in_chain", skip_serializing_if = "is_in_chain")]
+    pub intent_written: bool,
+}
+
+fn intent_in_chain() -> bool {
+    true
+}
+
+fn is_in_chain(written: &bool) -> bool {
+    *written
 }
 
 /// What an [`ActionRow::Overflow`] row says: the responses decided and not
@@ -257,6 +270,7 @@ mod tests {
                 outcome: "Killed { pid: 4242 }".into(),
                 reason: None,
                 elapsed_us: 4_000,
+                intent_written: true,
             }),
             overflow: None,
             noted_by: None,
@@ -275,6 +289,15 @@ mod tests {
             serde_json::to_string(&outcome("00112233aabbccdd", 7, ActionRow::Outcome)).unwrap(),
             r#"{"row":"outcome","run":"00112233aabbccdd","action":7,"ts":"2026-10-31T23:59:00.004000Z","outcome":{"result":"success","outcome":"Killed { pid: 4242 }","elapsed_us":4000}}"#
         );
+        // the re-check of #476: an outcome whose intent is not in the chain
+        let mut gap = outcome("00112233aabbccdd", 9, ActionRow::Outcome);
+        gap.outcome.as_mut().unwrap().intent_written = false;
+        let line = serde_json::to_string(&gap).unwrap();
+        assert!(
+            line.ends_with(r#""elapsed_us":4000,"intent_written":false}}"#),
+            "{line}"
+        );
+        assert_eq!(serde_json::from_str::<ActionRecord>(&line).unwrap(), gap);
         let mut i = outcome("00112233aabbccdd", 8, ActionRow::Interrupted);
         i.outcome.as_mut().unwrap().result = ActionResult::Unknown;
         i.noted_by = Some("ffeeddccbbaa9988".into());

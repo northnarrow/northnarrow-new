@@ -739,63 +739,244 @@ fn the_overflow_row_counts_a_displaced_response_in_its_severity() {
     assert!(o.samples[0].contains("pid 4401"), "{o:?}");
 }
 
-/// Review of #476: a kill takes its process's queued throttle out — the
-/// throttle's decision is answered "superseded", its record says so, and
-/// nothing is counted lost; the kill runs.
-#[test]
-fn a_kill_supersedes_its_process_s_queued_throttle() {
-    let (d, journal, sink) = dispatcher(true, 64);
-    let hold = d.shared.hold.lock();
-    submit_one(
-        &d,
-        &decided(
-            "NN-L-T-0",
-            ResponseAction::KillProcess,
-            Severity::High,
-            4500,
-        ),
+/// A dispatcher on `executor`.
+fn dispatcher_on(executor: Executor, cap: usize) -> (Dispatcher, ActionJournal, DetectionSink) {
+    let journal = ActionJournal::memory();
+    let sink = DetectionSink::for_test(4096, 0);
+    let d = Dispatcher::start_with(
+        executor,
+        journal.clone(),
+        Followups {
+            sink: Some(sink.clone()),
+            cow: northnarrow_agent::cow::CowGuard::off_for_test(),
+        },
+        None,
+        cap,
     );
+    (d, journal, sink)
+}
+
+/// Wait until the dispatcher took a job (its thread held).
+fn until_taken(d: &Dispatcher) {
     let t0 = Instant::now();
     while d.status().queue.taken == 0 {
         assert!(t0.elapsed() < Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+/// The intents of `rows`: (response, pid), in order.
+fn intents_of(rows: &[northnarrow_agent::response::journal::ActionRecord]) -> Vec<(String, u32)> {
+    rows.iter()
+        .filter(|r| r.row == ActionRow::Intent)
+        .map(|r| {
+            let i = r.intent.as_ref().unwrap();
+            (i.response.clone(), i.pid)
+        })
+        .collect()
+}
+
+/// Review of #476: a kill that killed supersedes its process's throttle
+/// taken in the same batch — the throttle's intent is answered "not run:
+/// superseded", its record says so, nothing is counted lost.
+#[test]
+fn a_kill_that_killed_supersedes_its_process_s_throttle() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (d, journal, sink) = dispatcher(false, 64);
+    let hold = d.shared.hold.lock();
+    submit_one(
+        &d,
+        &decided("NN-L-T-0", ResponseAction::Log, Severity::Low, 4500),
+    );
+    until_taken(&d);
     submit_one(
         &d,
         &decided(
             "NN-L-T-T",
             ResponseAction::ThrottleProcess,
             Severity::Low,
-            4501,
+            pid,
         ),
     );
     submit_one(
         &d,
         &decided(
             "NN-L-T-K",
-            ResponseAction::KillProcessTree,
+            ResponseAction::KillProcess,
             Severity::Critical,
-            4501,
+            pid,
         ),
-    );
-    let recs = sink.queued_for_test();
-    assert_eq!(recs.len(), 1, "the throttle answered at once");
-    assert!(
-        recs[0].response.contains("superseded"),
-        "{:?}",
-        recs[0].response
     );
     drop(hold);
     d.stop(Duration::from_secs(5));
+    assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    let rows = journal.rows();
+    assert_eq!(
+        intents_of(&rows),
+        [
+            ("Log".to_string(), 4500),
+            ("KillProcess".to_string(), pid),
+            ("ThrottleProcess".to_string(), pid)
+        ],
+        "the kill first"
+    );
+    let throttle = rows
+        .iter()
+        .rfind(|r| r.row == ActionRow::Outcome)
+        .and_then(|r| r.outcome.clone())
+        .unwrap();
+    assert_eq!(throttle.result, ActionResult::NotRun);
+    assert!(throttle.reason.unwrap().contains("superseded"));
+    let rec = sink
+        .queued_for_test()
+        .into_iter()
+        .find(|r| r.response.contains("superseded"));
+    assert!(rec.is_some(), "the throttle's record says so");
+    let st = d.status();
+    assert_eq!((st.superseded_in_batch, st.queue.lost()), (1, 0));
+}
+
+/// The same, the throttle still queued when the kill killed (behind a
+/// batch of more severe jobs): taken out of the queue, answered, no intent.
+#[test]
+fn a_kill_that_killed_takes_its_process_s_queued_throttle_out() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (d, journal, sink) = dispatcher(false, 64);
+    let hold = d.shared.hold.lock();
+    submit_one(
+        &d,
+        &decided("NN-L-T-0", ResponseAction::Log, Severity::Low, 4600),
+    );
+    until_taken(&d);
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-T",
+            ResponseAction::ThrottleProcess,
+            Severity::Low,
+            pid,
+        ),
+    );
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-K",
+            ResponseAction::KillProcess,
+            Severity::Critical,
+            pid,
+        ),
+    );
+    // the kill and fifteen High jobs fill the next batch; the throttle waits
+    for i in 0..15 {
+        submit_one(
+            &d,
+            &decided(
+                &format!("NN-L-T-H{i}"),
+                ResponseAction::Log,
+                Severity::High,
+                4601 + i,
+            ),
+        );
+    }
+    drop(hold);
+    d.stop(Duration::from_secs(5));
+    let _ = child.wait();
+    assert!(
+        !intents_of(&journal.rows())
+            .iter()
+            .any(|(r, _)| r == "ThrottleProcess"),
+        "never run"
+    );
+    assert!(sink
+        .queued_for_test()
+        .iter()
+        .any(|r| r.response.contains("superseded")));
     let st = d.status();
     assert_eq!((st.queue.superseded, st.queue.lost()), (1, 0));
-    let ran: Vec<String> = journal
-        .rows()
+}
+
+/// The re-check of #476: a kill that did not kill — the host-critical
+/// guard refused it (sshd, the watchdog, the agent's stack) — supersedes
+/// nothing: the same process's block runs after it, through the executor
+/// (which decides on it as on any block). So a process the agent cannot
+/// kill (EPERM, a cgroup that will not die) still loses its network.
+#[test]
+fn a_kill_that_did_not_kill_lets_its_process_s_block_run() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ExecutorConfig::for_test(tmp.path());
+    cfg.dry_run = false;
+    let executor = Executor::with_config(cfg);
+    executor.set_tree_guard(std::sync::Arc::new(move |p: u32| {
+        (p == pid).then_some("ssh-service(sshd)")
+    }));
+    let (d, journal, sink) = dispatcher_on(executor, 64);
+    let hold = d.shared.hold.lock();
+    submit_one(
+        &d,
+        &decided("NN-L-T-0", ResponseAction::Log, Severity::Low, 4700),
+    );
+    until_taken(&d);
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-B",
+            ResponseAction::BlockOutbound,
+            Severity::Low,
+            pid,
+        ),
+    );
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-K",
+            ResponseAction::KillProcess,
+            Severity::Critical,
+            pid,
+        ),
+    );
+    drop(hold);
+    d.stop(Duration::from_secs(5));
+    assert!(child.try_wait().unwrap().is_none(), "not killed");
+    let _ = child.kill();
+    let _ = child.wait();
+    let rows = journal.rows();
+    assert_eq!(
+        intents_of(&rows),
+        [
+            ("Log".to_string(), 4700),
+            ("KillProcess".to_string(), pid),
+            ("BlockOutbound".to_string(), pid)
+        ]
+    );
+    let block = rows
         .iter()
-        .filter(|r| r.row == ActionRow::Intent)
-        .map(|r| r.intent.as_ref().unwrap().response.clone())
-        .collect();
-    assert_eq!(ran, ["KillProcess", "KillProcessTree"]);
+        .rfind(|r| r.row == ActionRow::Outcome)
+        .and_then(|r| r.outcome.clone())
+        .unwrap();
+    assert!(
+        !block.reason.as_deref().unwrap_or("").contains("superseded"),
+        "{block:?}"
+    );
+    assert!(!sink
+        .queued_for_test()
+        .iter()
+        .any(|r| r.response.contains("superseded")));
+    let st = d.status();
+    assert_eq!(st.superseded_in_batch + st.queue.superseded, 0);
 }
 
 /// The thread's end is seen: running until the stop, not after.

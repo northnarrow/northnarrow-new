@@ -120,6 +120,9 @@ pub struct JournalCounts {
     pub overflow_rows: u64,
     /// Actions between their intent and their outcome now.
     pub in_flight: u64,
+    /// fsyncs of the chain that failed (its rows written, whether on the
+    /// disk not known).
+    pub sync_failed: u64,
 }
 
 #[derive(Default)]
@@ -131,6 +134,7 @@ struct Counters {
     abandoned: AtomicU64,
     overflow_rows: AtomicU64,
     in_flight: AtomicU64,
+    sync_failed: AtomicU64,
 }
 
 struct Inner {
@@ -251,6 +255,7 @@ impl ActionJournal {
                         "the agent stopped between the action's intent and its outcome".to_string(),
                     ),
                     elapsed_us: 0,
+                    intent_written: true,
                 }),
                 overflow: None,
                 noted_by: Some(self.inner.run.clone()),
@@ -327,7 +332,10 @@ impl ActionJournal {
             });
         }
         if durable {
-            self.commit(w);
+            // on the disk before the action, whoever's fsync is under way
+            // (the re-check of #476: another thread's detached fsync may
+            // not have finished)
+            self.commit_with(w, true);
         }
         out
     }
@@ -372,17 +380,27 @@ impl ActionJournal {
 
     /// The fsync of the rows written so far, done after `w` is released:
     /// the other writers do not wait for the disk.
-    fn commit(&self, mut w: MutexGuard<'_, Writer>) {
+    fn commit(&self, w: MutexGuard<'_, Writer>) {
+        self.commit_with(w, false)
+    }
+
+    /// [`Self::commit`]; `always`: the fsync even when the writer counts
+    /// its rows synced — another thread's detached fsync of them may still
+    /// be under way, and the caller's action waits for the disk.
+    fn commit_with(&self, mut w: MutexGuard<'_, Writer>, always: bool) {
         let path = match &mut *w {
-            Writer::Log(log) => log.detach_sync(),
+            Writer::Log(log) => log
+                .detach_sync()
+                .or_else(|| always.then(|| log.active_path().to_path_buf())),
             _ => None,
         };
         drop(w);
         if let Some(path) = path {
             if let Err(e) = crate::chainlog::sync_detached(&path) {
+                // the rows are in the chain; whether on the disk is not known
                 self.inner
                     .counters
-                    .unwritten
+                    .sync_failed
                     .fetch_add(1, Ordering::Relaxed);
                 error!(
                     target: "response.journal",
@@ -411,6 +429,7 @@ impl ActionJournal {
             abandoned: c.abandoned.load(Ordering::Relaxed),
             overflow_rows: c.overflow_rows.load(Ordering::Relaxed),
             in_flight: c.in_flight.load(Ordering::Relaxed),
+            sync_failed: c.sync_failed.load(Ordering::Relaxed),
         }
     }
 
@@ -507,6 +526,7 @@ impl Intent {
                 outcome,
                 reason,
                 elapsed_us,
+                intent_written: self.written,
             },
             durable,
         );
@@ -536,6 +556,7 @@ impl Drop for Intent {
                 outcome: format!("{}: not known", self.what),
                 reason: Some("the action ended without an outcome".to_string()),
                 elapsed_us: self.started.elapsed().as_micros() as u64,
+                intent_written: self.written,
             },
             true,
         );
@@ -714,6 +735,22 @@ mod tests {
         );
         let c = j.counts();
         assert_eq!((c.intents, c.outcomes, c.unwritten), (0, 0, 4));
+        // the re-check of #476: the chain opened between an intent and its
+        // outcome — the outcome says its intent is not in the chain
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("actions.jsonl");
+        let j = ActionJournal::late();
+        let i = j.intent(intent_row("KillProcess", 11));
+        j.bind(log_at(&active, &dir.path().join("k"), u64::MAX), &active);
+        i.finish(ActionResult::Success, "Killed".into(), None);
+        let w = j.intent(intent_row("KillProcess", 12));
+        w.finish(ActionResult::Success, "Killed".into(), None);
+        let flags: Vec<bool> = read_rows(&active)
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.outcome.as_ref().map(|o| o.intent_written))
+            .collect();
+        assert_eq!(flags, [false, true]);
     }
 
     /// A row the chain refuses (its file gone, a directory in its place) is

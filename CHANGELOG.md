@@ -1357,8 +1357,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   and judges the next event; the dispatcher takes them by severity (once
   the oldest job waited 500 ms, one take in four is it), each process's in
   the order they were decided (priority inheritance; a process is its pid
-  and its start), a kill before its process's queued jobs and superseding
-  its queued throttles and blocks, a repeat of a process's last queued
+  and its start), a kill before its process's queued jobs (once it killed,
+  superseding its process's throttles and blocks; a kill that did not kill
+  leaves them to run), a repeat of a process's last queued
   response merged into it; a full queue (1,024) displaces a less severe
   response or refuses the new one — never a Critical kill, which goes past
   the capacity (up to 4×, counted) — answered at once ("not run"),

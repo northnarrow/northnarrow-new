@@ -22,13 +22,16 @@
 //!   same process raises that process's turn (priority inheritance), and
 //!   the strip runs first, then the quarantine. One thread takes: two jobs
 //!   of one process never run at once.
-//! - **A kill goes first and supersedes** (review of #476). A kill of a
-//!   process is placed before that process's queued jobs, and its queued
-//!   throttles and blocks ([`DispatchJob::superseded_by_kill`]) are taken
-//!   out — handed back ([`ResponseQueue::take_superseded`]) and answered
-//!   "superseded by a kill": a kill never waits behind what it makes
-//!   pointless (the priority inversion of a kill behind its own process's
-//!   throttle), and a quarantine or a strip of the process runs after it.
+//! - **A kill goes first** (review of #476). A kill of a process is placed
+//!   before that process's queued jobs: it never waits behind its own
+//!   process's throttle (the priority inversion), and a quarantine or a
+//!   strip of the process runs after it. Once the kill *succeeded* (the
+//!   process killed, or already gone) the caller takes out the process's
+//!   queued throttles and blocks ([`DispatchJob::superseded_by_kill`],
+//!   [`ResponseQueue::supersede`]) and answers them "superseded"; a kill
+//!   that did not kill (a protected process, EPERM, a cgroup that would not
+//!   die) leaves them to run — the re-check of #476: a compromised daemon
+//!   the guard will not kill must still lose its network.
 //! - **A repeat merges.** A job of the same process and the same action as
 //!   the process's last queued job (a process that tripped two rules, or
 //!   one rule twice, before its kill ran) is merged into it
@@ -117,8 +120,9 @@ pub trait DispatchJob {
     fn is_kill(&self) -> bool {
         false
     }
-    /// Pointless once its process is killed (a throttle, a block): a kill
-    /// of the process takes it out of the queue.
+    /// Pointless once its process is killed (a throttle, a block): taken
+    /// out after a kill of the process succeeded ([`ResponseQueue::
+    /// supersede`]).
     fn superseded_by_kill(&self) -> bool {
         false
     }
@@ -161,7 +165,8 @@ pub struct DispatchStats {
     pub queued: u64,
     pub merged: u64,
     /// Critical kills a full queue took past its capacity; jobs a kill of
-    /// their process took out (answered "superseded", not a loss).
+    /// their process that succeeded took out (answered "superseded", not a
+    /// loss).
     pub over_cap: u64,
     pub superseded: u64,
     /// Jobs not run: displaced by a more severe one, refused when full —
@@ -196,8 +201,6 @@ struct Entry<K, J> {
 /// The response queue (see the module's doc).
 pub struct ResponseQueue<K, J> {
     cap: usize,
-    /// Jobs a kill took out, for the caller to answer.
-    superseded: Vec<J>,
     next_seq: u64,
     /// Every queued job by its sequence number (the oldest first).
     jobs: BTreeMap<u64, Entry<K, J>>,
@@ -214,7 +217,6 @@ impl<K: Eq + Hash + Clone, J: DispatchJob> ResponseQueue<K, J> {
     pub fn new(cap: usize) -> Self {
         Self {
             cap: cap.max(1),
-            superseded: Vec::new(),
             next_seq: 1,
             jobs: BTreeMap::new(),
             lanes: Default::default(),
@@ -235,35 +237,35 @@ impl<K: Eq + Hash + Clone, J: DispatchJob> ResponseQueue<K, J> {
         self.jobs.is_empty()
     }
 
-    /// The jobs the last submits' kills took out (to be answered).
-    pub fn take_superseded(&mut self) -> Vec<J> {
-        std::mem::take(&mut self.superseded)
+    /// After a kill of the process `key` succeeded: its queued throttles
+    /// and blocks, taken out (counted `superseded`) for the caller to
+    /// answer. Never before the kill ran: a kill that did not kill leaves
+    /// them to run.
+    pub fn supersede(&mut self, key: &K) -> Vec<J> {
+        let gone: Vec<u64> = self
+            .by_key
+            .get(key)
+            .map(|q| {
+                q.iter()
+                    .copied()
+                    .filter(|s| self.jobs[s].job.superseded_by_kill())
+                    .collect()
+            })
+            .unwrap_or_default();
+        gone.into_iter()
+            .map(|s| {
+                self.stats.superseded += 1;
+                self.remove(s).job
+            })
+            .collect()
     }
 
     /// Submit `job` for the process `key`, of `severity`, at `now_ns`.
-    /// Never blocks; see [`Submitted`] (and [`Self::take_superseded`]).
+    /// Never blocks; see [`Submitted`].
     pub fn submit(&mut self, key: K, severity: Severity, now_ns: u64, job: J) -> Submitted<J> {
         self.stats.submitted += 1;
         let lane = lane_of(severity);
         let kill = job.is_kill();
-        if kill {
-            // a kill takes out its process's queued throttles and blocks
-            let gone: Vec<u64> = self
-                .by_key
-                .get(&key)
-                .map(|q| {
-                    q.iter()
-                        .copied()
-                        .filter(|s| self.jobs[s].job.superseded_by_kill())
-                        .collect()
-                })
-                .unwrap_or_default();
-            for s in gone {
-                let e = self.remove(s);
-                self.stats.superseded += 1;
-                self.superseded.push(e.job);
-            }
-        }
         // A repeat of the process's last queued job (its first, for a kill)
         // is merged into it.
         let candidate = self
@@ -509,39 +511,58 @@ mod tests {
         assert_eq!(q.stats().inherited, 1);
     }
 
-    /// Review of #476: a kill goes before its process's queued jobs and
-    /// takes out its throttles and blocks (handed back, answered
-    /// "superseded"); its quarantine runs after it; another process's jobs
-    /// are untouched.
+    /// Review of #476: a kill goes before its process's queued jobs (its
+    /// quarantine runs after it; another process's jobs are untouched);
+    /// once it killed, the caller takes out its throttles and blocks
+    /// (handed back once, answered "superseded") — the re-check of #476:
+    /// never before, so a kill that did not kill leaves them to run.
     #[test]
     fn a_kill_goes_first_and_supersedes_its_process_s_throttle_and_block() {
+        let submit_all = |q: &mut ResponseQueue<u32, J>| {
+            q.submit(7, L, 0, j(7, "throttle", 1));
+            q.submit(7, M, 0, j(7, "quarantine", 2));
+            q.submit(7, L, 0, j(7, "block", 3));
+            q.submit(8, L, 0, j(8, "throttle", 4));
+            assert!(matches!(
+                q.submit(7, H, 0, j(7, "kill", 5)),
+                Submitted::Queued(_)
+            ));
+            // a second kill of 7 merges into the first (its process's first job)
+            assert!(matches!(
+                q.submit(7, C, 0, j(7, "kill", 6)),
+                Submitted::Merged(_)
+            ));
+        };
+        // the kill killed
         let mut q = ResponseQueue::new(16);
-        q.submit(7, L, 0, j(7, "throttle", 1));
-        q.submit(7, M, 0, j(7, "quarantine", 2));
-        q.submit(7, L, 0, j(7, "block", 3));
-        q.submit(8, L, 0, j(8, "throttle", 4));
-        assert!(matches!(
-            q.submit(7, H, 0, j(7, "kill", 5)),
-            Submitted::Queued(_)
-        ));
+        submit_all(&mut q);
+        let t = q.take(1).unwrap();
+        assert_eq!((t.job.pid, t.job.action), (7, "kill"));
+        assert_eq!(t.job.decisions, [5, 6]);
         let gone: Vec<u32> = q
-            .take_superseded()
+            .supersede(&7)
             .iter()
             .flat_map(|j| j.decisions.clone())
             .collect();
         assert_eq!(gone, [1, 3]);
-        assert!(q.take_superseded().is_empty(), "handed back once");
-        // a second kill of 7 merges into the first (its process's first job)
-        assert!(matches!(
-            q.submit(7, C, 0, j(7, "kill", 6)),
-            Submitted::Merged(_)
-        ));
-        let t = q.take(1).unwrap();
-        assert_eq!((t.job.pid, t.job.action), (7, "kill"));
-        assert_eq!(t.job.decisions, [5, 6]);
+        assert!(q.supersede(&7).is_empty(), "handed back once");
         assert_eq!(order(&mut q, 1), [(7, "quarantine"), (8, "throttle")]);
         let s = q.stats();
         assert_eq!((s.superseded, s.merged, s.lost()), (2, 1, 0));
+        // the kill did not kill: nothing taken out, everything runs after it
+        let mut q = ResponseQueue::new(16);
+        submit_all(&mut q);
+        assert_eq!(q.take(1).unwrap().job.action, "kill");
+        assert_eq!(
+            order(&mut q, 1),
+            [
+                (7, "throttle"),
+                (7, "quarantine"),
+                (7, "block"),
+                (8, "throttle")
+            ]
+        );
+        assert_eq!(q.stats().superseded, 0);
     }
 
     /// Review of #476 (X2): a full queue of Critical jobs refuses no
@@ -601,6 +622,14 @@ mod tests {
                 now += r % 50_000_000;
                 if r % 3 == 0 {
                     if let Some(t) = q.take(now) {
+                        // a kill that killed (one in two) supersedes
+                        if t.job.action == "kill" && (r >> 40) % 2 == 0 {
+                            gone.extend(
+                                q.supersede(&t.job.pid)
+                                    .into_iter()
+                                    .flat_map(|j| j.decisions),
+                            );
+                        }
                         taken.entry(t.job.pid).or_default().extend(&t.job.decisions);
                     }
                     continue;
@@ -615,7 +644,6 @@ mod tests {
                     }
                     other => panic!("room for all: {other:?}"),
                 }
-                gone.extend(q.take_superseded().into_iter().flat_map(|j| j.decisions));
             }
             while let Some(t) = q.take(now) {
                 taken.entry(t.job.pid).or_default().extend(&t.job.decisions);

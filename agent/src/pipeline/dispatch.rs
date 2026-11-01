@@ -42,7 +42,8 @@ use nn_model::posture_types::PostureKind;
 use nn_model::{Event, ResponseAction, Severity};
 use northnarrow_agent::decision::combine::Decision;
 use northnarrow_agent::response::journal::{
-    ActionIntent, ActionJournal, ActionOverflow, Intent, JournalCounts, OVERFLOW_SAMPLES,
+    ActionIntent, ActionJournal, ActionOverflow, ActionResult, Intent, JournalCounts,
+    OVERFLOW_SAMPLES,
 };
 use northnarrow_agent::response::{ExecutionOutcome, ExecutionReport, Executor};
 use parking_lot::{Condvar, Mutex};
@@ -357,6 +358,8 @@ pub(crate) struct DispatchStatus {
     /// Not run at the stop, and while the thread did not run (stage 6).
     pub(crate) not_run_at_stop: u64,
     pub(crate) not_run_down: u64,
+    /// Throttles and blocks taken with their process's kill, which killed.
+    pub(crate) superseded_in_batch: u64,
     pub(crate) journal: JournalCounts,
     /// The dispatcher's thread runs.
     pub(crate) running: bool,
@@ -376,6 +379,9 @@ struct Shared {
     not_run_at_stop: AtomicU64,
     /// Submitted while the thread was not running.
     not_run_down: AtomicU64,
+    /// Throttles and blocks taken in the same batch as their process's
+    /// kill, which killed: answered superseded, not run.
+    superseded_in_batch: AtomicU64,
     /// A batch is being run.
     busy: AtomicBool,
     running: AtomicBool,
@@ -439,6 +445,7 @@ impl Dispatcher {
             execution_max_us: AtomicU64::new(0),
             not_run_at_stop: AtomicU64::new(0),
             not_run_down: AtomicU64::new(0),
+            superseded_in_batch: AtomicU64::new(0),
             busy: AtomicBool::new(false),
             running: AtomicBool::new(false),
             epoch: Instant::now(),
@@ -483,7 +490,6 @@ impl Dispatcher {
         let s = &self.shared;
         // (the job, why, its lane, displaced)
         let mut not_run: Vec<(ResponseJob, &'static str, usize, bool)> = Vec::new();
-        let mut superseded = Vec::new();
         if !s.running.load(Ordering::Acquire) {
             s.not_run_down
                 .fetch_add(jobs.len() as u64, Ordering::Relaxed);
@@ -506,15 +512,8 @@ impl Dispatcher {
                     }
                 }
             }
-            superseded = q.take_superseded();
             drop(q);
             s.ready.notify_one();
-        }
-        // a kill's process's throttles and blocks: answered, not a loss
-        for job in superseded {
-            for (d, slot) in &job.answers {
-                answer(d, *slot, job.not_run(NOT_RUN_SUPERSEDED), &s.followups);
-            }
         }
         if not_run.is_empty() {
             return;
@@ -557,6 +556,7 @@ impl Dispatcher {
             execution_max_us: s.execution_max_us.load(Ordering::Relaxed),
             not_run_at_stop: s.not_run_at_stop.load(Ordering::Relaxed),
             not_run_down: s.not_run_down.load(Ordering::Relaxed),
+            superseded_in_batch: s.superseded_in_batch.load(Ordering::Relaxed),
             journal: s.journal.counts(),
             running: s.running.load(Ordering::Acquire),
         }
@@ -605,7 +605,7 @@ impl Dispatcher {
             queued: q.queued,
             merged: q.merged,
             over_cap: q.over_cap,
-            superseded: q.superseded,
+            superseded: q.superseded + st.superseded_in_batch,
             displaced: q.displaced.to_vec(),
             refused: q.refused.to_vec(),
             not_run_other: st.not_run_at_stop + st.not_run_down,
@@ -624,6 +624,7 @@ impl Dispatcher {
             abandoned: j.abandoned,
             overflow_rows: j.overflow_rows,
             in_flight: j.in_flight,
+            sync_failed: j.sync_failed,
             evidence_capacity: e.capacity,
             evidence_depth: e.depth,
             evidence_max_depth: e.max_depth,
@@ -757,8 +758,34 @@ fn run(s: &Shared) {
                 .map(|t| t.job.intent(t.severity, t.waited_ns))
                 .collect(),
         );
+        // the processes a kill of this batch killed
+        let mut killed: Vec<(u32, u64)> = Vec::new();
         for (t, intent) in batch.into_iter().zip(intents) {
-            let report = run_one(s, &t.job, intent);
+            let key = (t.job.pid, t.job.start_ns);
+            let report = if t.job.superseded_by_kill() && killed.contains(&key) {
+                // behind its process's kill in this batch, and the kill
+                // killed: its intent answered, not run
+                s.superseded_in_batch.fetch_add(1, Ordering::Relaxed);
+                intent.finish_deferred(
+                    ActionResult::NotRun,
+                    format!("{:?} pid {}: not run", t.job.action, t.job.pid),
+                    Some(NOT_RUN_SUPERSEDED.to_string()),
+                );
+                t.job.not_run(NOT_RUN_SUPERSEDED)
+            } else {
+                run_one(s, &t.job, intent)
+            };
+            if t.job.is_kill() && killed_it(&report) {
+                // the re-check of #476: only a kill that killed supersedes
+                // its process's throttles and blocks still queued
+                killed.push(key);
+                let gone = s.queue.lock().supersede(&key);
+                for job in gone {
+                    for (d, slot) in &job.answers {
+                        answer(d, *slot, job.not_run(NOT_RUN_SUPERSEDED), &s.followups);
+                    }
+                }
+            }
             for (d, slot) in &t.job.answers {
                 answer(d, *slot, report.clone(), &s.followups);
             }
@@ -769,6 +796,14 @@ fn run(s: &Shared) {
             write_overflow(s, false);
         }
     }
+}
+
+/// The process is dead: killed now, or gone before.
+fn killed_it(report: &ExecutionReport) -> bool {
+    matches!(
+        report.primary,
+        ExecutionOutcome::Killed { .. } | ExecutionOutcome::AlreadyGone { .. }
+    )
 }
 
 /// Run one response with its ticket; its outcome row (synced with the

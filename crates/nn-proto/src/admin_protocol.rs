@@ -977,6 +977,9 @@ pub struct ResponseDispatchStatus {
     pub abandoned: u64,
     pub overflow_rows: u64,
     pub in_flight: u64,
+    /// fsyncs of the actions chain that failed (its rows written; whether
+    /// on the disk not known).
+    pub sync_failed: u64,
     /// Stage 7, the detection writer's queue: its capacity, depth and the
     /// most it held, records of actions taken past the capacity, records
     /// dropped (of them, of actions), the longest wait queue to chain (µs),
@@ -2921,6 +2924,7 @@ mod tests {
             abandoned: 0,
             overflow_rows: 0,
             in_flight: 0,
+            sync_failed: 0,
             evidence_capacity: 1024,
             evidence_depth: 0,
             evidence_max_depth: 3,

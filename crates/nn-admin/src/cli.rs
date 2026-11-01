@@ -3472,13 +3472,14 @@ fn response_dispatch_lines(
         format!(
             "  actions chain   : {} intents, {} outcomes, {} in flight; {} rows not in the chain \
              (logged at ERROR); {} intents of an earlier run without an outcome (interrupted); {} \
-             abandoned",
+             abandoned; {} syncs failed",
             d.intents,
             d.outcomes,
             d.in_flight,
             red(d.unwritten),
             red(d.interrupted_at_boot),
             red(d.abandoned),
+            red(d.sync_failed),
         ),
         format!(
             "evidence writer   : {} slots, depth {} (max {}), {} records of actions past the \

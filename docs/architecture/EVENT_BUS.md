@@ -358,11 +358,16 @@ lock, never a wait — and the thread takes them:
   quarantine its thread: a rule's response and a ladder step on the same
   process are not ordered between them, as before R12c;
 - **a kill goes first** (review of #476): a kill of a process is placed
-  before that process's queued jobs, and takes out its queued throttles
-  and blocks — each answered `not run: superseded by a kill of the same
-  process` and counted (`superseded`; not a loss: the kill does more) —
-  so a kill never waits behind what it makes pointless; the process's
-  quarantine or strip runs after it;
+  before that process's queued jobs, so it never waits behind what it
+  would make pointless; the process's quarantine or strip runs after it.
+  Once the kill *killed* (the process killed, or already gone), its
+  process's throttles and blocks still queued — or taken in the same
+  batch behind it — are answered `not run: superseded by a kill of the
+  same process` and counted (`superseded`; not a loss). A kill that did
+  not kill (the host-critical guard, EPERM, a cgroup that would not die)
+  supersedes nothing: they run after it (the re-check of #476: a
+  compromised process the agent cannot kill must still lose its network
+  or its CPU);
 - **a repeat merges**: a job of the same process (pid and start), action
   and — but for a kill — file as the process's *last* queued job (its
   first, for a kill) is merged into it (a process that tripped two rules,
@@ -406,7 +411,11 @@ before them slowed the kills on a busy disk and guarded only against a
 crash of the host, which ends their effect too). Every fsync is done
 outside the writer's lock (`RotatingChainLog::detach_sync`), so the
 ladder, the exec quarantine and the restore do not wait behind the
-dispatcher's. The chain:
+dispatcher's; an intent synced before its action always fsyncs itself
+(another thread's detached fsync may still be under way). A failed fsync
+is counted apart (`syncs failed`: the row is in the chain, whether on the
+disk is not known), and an outcome whose intent the chain could not take
+says so (`intent_written: false`). The chain:
 (`/var/lib/northnarrow/detections/actions.jsonl`, a rotating chain beside
 the detection log, KIND `actions`: `nn_evidence::action_payload`, its rows
 pinned; `docs/operator/EVIDENCE_CHAINS.md`). Its writer

@@ -1216,6 +1216,12 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         Ok(())
     }
 
+    /// The active file (R12c, lab PR 270: a caller's own fsync of it,
+    /// [`sync_detached`]).
+    pub fn active_path(&self) -> &Path {
+        &self.active_path
+    }
+
     /// R12c (lab PR 270): the fsync of the lines [`Self::append_deferred`]
     /// wrote, left to the caller, who does it with [`sync_detached`] once it
     /// no longer holds whatever guards this writer (other writers of the
