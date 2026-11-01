@@ -4375,6 +4375,25 @@ only in the table below, in the same PR as the evidence.
     across the restart, restored to the hash before; test-ignored 82
     suites, 97 passed, 0 failed on each guest. Both guests left clean and
     off.
+  - Re-check of #479 (X1 and X2 confirmed; "merge after two small
+    fixes"): a worse state's change row is signed at once
+    (`CapabilityManifest::worsens_from`: a source in a worse state, gone or
+    new and not `ok`, a probe's word turned `gap` or `stale`, a line new
+    in `missing`, `fallbacks`, the degradations, the content or the deny
+    hooks' missing ones, fewer deny hooks, a lower trust level), unless
+    the same state was signed within the minute (an oscillation); a better
+    state's waits for the minute — a real loss's row no longer waits up to
+    a minute, nor dies with a crash in it. A contract change is a NOTICE
+    only when the agent's version, the contract's version and the kernel's
+    release (the beat carries the last two now) each advanced or stayed:
+    one going backwards, or not known to be newer, is DEGRADED "the sensor
+    contract changed backwards". `fs_protect`'s `evidence: self_test` is
+    said to be one deny hook of sixteen. Gates on 0267bd27: 77 suites,
+    3,460 passed, 0 failed, 17 ignored, every gate (gates7 found a test of
+    the manifest racing a module-mate's degradation, now worse and signed
+    at once: the module's manifest tests hold one lock). Mutations: set E
+    28 of 28 (ME10, a source back and not `ok`, survived the first run: a
+    test added); 104 of 104 in the lot. No lab: unit-level changes.
   - Open: the health class has no event yet; the probe exercises three
     sources (process spawn, file open, DNS), the ten others are judged from
     their attach, the LSM's state and their pump only (`evidence:
