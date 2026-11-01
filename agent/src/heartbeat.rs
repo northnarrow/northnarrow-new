@@ -528,6 +528,75 @@ mod tests {
             .any(|h| h.chain == "audit" && h.seq.is_some()));
     }
 
+    /// The last beat's head of the actions chain.
+    fn actions_head(path: &Path) -> BeatHead {
+        let lines = export_lines(path, 1).unwrap();
+        let last: crate::chainlog::ChainLine<HeartbeatRecord> =
+            serde_json::from_str(lines.last().unwrap()).unwrap();
+        last.payload
+            .heads
+            .into_iter()
+            .find(|h| h.chain == "actions")
+            .expect("the actions chain's head")
+    }
+
+    /// Review of #476: each beat names the actions chain's head — its
+    /// position (the active file's number, its length) and its hash, as
+    /// the journal has it; it grows with the chain.
+    #[test]
+    fn beats_name_the_actions_chain_s_head() {
+        use crate::response::journal::{ActionIntent, ActionJournal, ActionResult};
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("agent.sig.key");
+        let key = || crate::keys::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let active = dir.path().join("actions.jsonl");
+        let journal = ActionJournal::late();
+        journal.bind(
+            ActionJournal::open_log(
+                &active,
+                key(),
+                crate::chainlog::RotationConfig {
+                    size_cap_bytes: u64::MAX,
+                    max_archives: 8,
+                    file_mode: 0o600,
+                },
+                Arc::new(crate::chainlog::NoProtection),
+            )
+            .unwrap(),
+            &active,
+        );
+        let act = |pid| {
+            journal
+                .intent(ActionIntent::named("test", "KillProcess", pid))
+                .finish(ActionResult::Success, "Killed".into(), None)
+        };
+        act(1);
+        let mut s = sources();
+        s.journal = journal.clone();
+        let path = dir.path().join("heartbeat.jsonl");
+        let hb = Heartbeat::open(
+            &path,
+            key(),
+            Arc::new(crate::chainlog::NoProtection),
+            false,
+            s,
+        );
+        let first = actions_head(&path);
+        let (file, bytes, hash) = journal.head().unwrap();
+        assert_eq!(
+            (first.file, first.bytes, first.hash.clone()),
+            (Some(file), Some(bytes), hash)
+        );
+        assert_eq!(bytes, std::fs::metadata(&active).unwrap().len());
+        act(2);
+        hb.beat(BeatKind::Beat, None);
+        let second = actions_head(&path);
+        assert_eq!(second.file, first.file);
+        assert!(second.bytes > first.bytes, "{second:?} {first:?}");
+        assert_ne!(second.hash, first.hash);
+        assert!(!second.went_back(&first) && first.went_back(&second));
+    }
+
     /// The verifier end to end (`nn-admin heartbeat watch`'s check, its
     /// state file): beats on time are OK, the same chain again is OK with no
     /// new beat, an older copy of the chain is a replay.
