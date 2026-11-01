@@ -63,6 +63,8 @@ fn beat_m(seq: u64, s: i64, h: &str, revision: u64, settled: bool) -> HeartbeatR
         revision,
         settled,
         contract: Some("c1".repeat(32)),
+        contract_version: Some(1),
+        kernel: Some("6.8.0-147-generic".into()),
     });
     b
 }
@@ -967,11 +969,158 @@ fn a_contract_change_alone_is_a_notice() {
     b.capabilities.as_mut().unwrap().contract = Some("c2".repeat(32));
     c.push(b);
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(91), &cfg());
-    // beat 3 (c1) and beat 4 (c2): the contract went back and forth — said
-    // twice; the capabilities changed — DEGRADED
+    // beat 3 (c1, agent 0.0.1 after 0.0.2) went backwards — DEGRADED (the
+    // re-check of #479); beat 4 (c2, the same versions): a notice; the
+    // capabilities changed — DEGRADED
     assert_eq!(kinds(&r), ["DEGRADED"]);
-    assert_eq!(r.notices.len(), 2, "{r:?}");
+    assert_eq!(r.notices.len(), 1, "{r:?}");
+    let Alert::Degraded(d) = &r.alerts[0] else {
+        unreachable!()
+    };
+    assert!(
+        d.contains("the sensor contract changed backwards: c2c2c2c2c2c2c2c2 → c1c1c1c1c1c1c1c1")
+            && d.contains("agent 0.0.2 → 0.0.1 (older)")
+            && d.contains("the capability manifest changed"),
+        "{d}"
+    );
     // the first check anchors the contract too: no notice
     let r = check(Ok(&c.lines()), &c.pk, None, at(91), &cfg());
     assert!(r.notices.is_empty() && r.alerts.is_empty(), "{r:?}");
+}
+
+/// The re-check of #479: a contract change is a notice only when the
+/// agent's version, the contract's version and the kernel's release each
+/// advanced or stayed; one going backwards (a downgrade, an older kernel),
+/// or a release not known to be newer, is DEGRADED.
+#[test]
+fn a_contract_going_backwards_is_degraded() {
+    let with = |seq: u64, c: &str, agent: &str, version: u32, kernel: &str| {
+        let mut b = beat_m(seq, 30 * seq as i64, "a", 1, true);
+        b.version = agent.into();
+        let m = b.capabilities.as_mut().unwrap();
+        m.contract = Some(c.repeat(32));
+        m.contract_version = Some(version);
+        m.kernel = Some(kernel.into());
+        b
+    };
+    let mut c = Chain::new();
+    c.push(with(1, "c1", "0.0.2", 1, "6.8.0-147-generic"));
+    let mut s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    assert_eq!(
+        s.manifest_versions,
+        Some(ContractSeen {
+            agent: "0.0.2".into(),
+            contract_version: Some(1),
+            kernel: Some("6.8.0-147-generic".into()),
+        })
+    );
+    // (beat, its contract, agent, contract version, kernel, what is said)
+    let steps: [(&str, &str, u32, &str, Option<&str>); 6] = [
+        (
+            "c2",
+            "0.0.1",
+            1,
+            "6.8.0-147-generic",
+            Some("agent 0.0.2 → 0.0.1 (older)"),
+        ),
+        ("c3", "0.0.3", 1, "6.8.0-147-generic", None),
+        (
+            "c4",
+            "0.0.3",
+            1,
+            "6.8.0-140-generic",
+            Some("kernel 6.8.0-147-generic → 6.8.0-140-generic (older)"),
+        ),
+        ("c5", "0.0.3", 1, "6.8.0-150-generic", None),
+        (
+            "c6",
+            "0.0.3",
+            0,
+            "6.8.0-150-generic",
+            Some("contract version 1 → 0 (older)"),
+        ),
+        (
+            "c7",
+            "0.0.3",
+            1,
+            "6.8.0-150-lowlatency",
+            Some("kernel 6.8.0-150-generic → 6.8.0-150-lowlatency (not known to be newer)"),
+        ),
+    ];
+    for (i, (contract, agent, version, kernel, said)) in steps.into_iter().enumerate() {
+        let seq = i as u64 + 2;
+        c.push(with(seq, contract, agent, version, kernel));
+        let r = check(
+            Ok(&c.lines()),
+            &c.pk,
+            Some(&s),
+            at(30 * seq as i64 + 1),
+            &cfg(),
+        );
+        match said {
+            Some(back) => {
+                assert_eq!(kinds(&r), ["DEGRADED"], "{contract}: {r:?}");
+                assert!(r.notices.is_empty(), "{contract}: {r:?}");
+                let Alert::Degraded(d) = &r.alerts[0] else {
+                    unreachable!()
+                };
+                assert!(
+                    d.starts_with("the sensor contract changed backwards") && d.contains(back),
+                    "{contract}: {d}"
+                );
+            }
+            None => {
+                assert!(r.alerts.is_empty(), "{contract}, forward: {r:?}");
+                assert_eq!(r.notices.len(), 1, "{contract}: {r:?}");
+                assert!(r.notices[0].starts_with("the sensor contract changed:"));
+            }
+        }
+        s = r.state.unwrap();
+    }
+}
+
+/// The re-check of #479: releases compared part by part, numbers as
+/// numbers; a part that differs and is not a number on both sides is not
+/// an order.
+#[test]
+fn releases_are_ordered_part_by_part() {
+    use std::cmp::Ordering::*;
+    let cases = [
+        ("0.0.2", "0.0.1", Some(Greater)),
+        ("0.0.1", "0.0.2", Some(Less)),
+        ("0.10.0", "0.9.9", Some(Greater)),
+        ("0.0.1", "0.0.1", Some(Equal)),
+        ("6.8.0-150-generic", "6.8.0-147-generic", Some(Greater)),
+        ("5.15.0-202-generic", "6.8.0-147-generic", Some(Less)),
+        ("6.8.0-147-generic", "6.8.0-147-lowlatency", None),
+        ("6.8.0.1", "6.8.0", Some(Greater)),
+        ("6.8.0", "6.8.0.1", Some(Less)),
+        ("6.8.0-rc1", "6.8.0", None),
+        ("1.0.0-rc2", "1.0.0-rc1", None),
+    ];
+    for (a, b, want) in cases {
+        assert_eq!(release_order(a, b), want, "{a} vs {b}");
+    }
+    let seen = ContractSeen {
+        agent: "0.0.2".into(),
+        contract_version: Some(1),
+        kernel: Some("6.8.0-147-generic".into()),
+    };
+    assert!(contract_backwards(&seen, &seen).is_empty());
+    let older_agent_without_fields = ContractSeen {
+        agent: "0.0.2".into(),
+        contract_version: None,
+        kernel: None,
+    };
+    assert_eq!(
+        contract_backwards(&seen, &older_agent_without_fields),
+        [
+            "kernel 6.8.0-147-generic → (not said) (not known to be newer)",
+            "contract version 1 → (not said)"
+        ]
+    );
+    // nothing known before: nothing to compare
+    assert!(contract_backwards(&older_agent_without_fields, &seen).is_empty());
 }
