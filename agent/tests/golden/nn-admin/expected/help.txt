@@ -1078,7 +1078,9 @@ exit: 0
 |       --max-silence-secs <MAX_SILENCE_SECS>
 |           No newer beat for this long is silence (default: two of the beats' intervals plus 15 s)
 |       --max-skew-secs <MAX_SKEW_SECS>
-|           A beat stamped further in the future is not believed [default: 30]
+|           A beat stamped further ahead of this host's clock is DEGRADED (the agent's clock ahead) [default: 30]
+|       --reanchor
+|           Start again from the newest beat when the state file cannot be read (without it, an unreadable state is an error: exit 3)
 |   -h, --help
 |           Print help
 --- stderr

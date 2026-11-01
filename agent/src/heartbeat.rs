@@ -710,23 +710,24 @@ mod tests {
             state: dir.path().join("state/watch.json"),
             every: None,
             cfg: nn_evidence::heartbeat::WatchConfig::default(),
+            reanchor: false,
         };
-        let r = nn_admin::heartbeat::check_once(&w);
+        let r = nn_admin::heartbeat::check_once(&w).unwrap();
         assert!(r.anchored && r.alerts.is_empty(), "{r:?}");
         assert!(w.state.exists(), "the state is kept");
         hb.beat(BeatKind::Beat, None);
-        let r = nn_admin::heartbeat::check_once(&w);
+        let r = nn_admin::heartbeat::check_once(&w).unwrap();
         assert!(
             !r.anchored && r.alerts.is_empty() && r.new_beats == 1,
             "{r:?}"
         );
-        let r = nn_admin::heartbeat::check_once(&w);
+        let r = nn_admin::heartbeat::check_once(&w).unwrap();
         assert!(r.alerts.is_empty() && r.new_beats == 0, "{r:?}");
         let replay = nn_admin::heartbeat::Watch {
             source: nn_admin::heartbeat::Source::File(old),
             ..w.clone()
         };
-        let r = nn_admin::heartbeat::check_once(&replay);
+        let r = nn_admin::heartbeat::check_once(&replay).unwrap();
         assert_eq!(r.exit_code(), 12, "{r:?}");
     }
 }

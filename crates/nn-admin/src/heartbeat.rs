@@ -62,7 +62,15 @@ pub struct Watch {
     pub state: PathBuf,
     pub every: Option<Duration>,
     pub cfg: WatchConfig,
+    /// Start again from the newest beat when the state cannot be read
+    /// (review of #478: never silently — an unreadable state would accept a
+    /// rollback as the first beat).
+    pub reanchor: bool,
 }
+
+/// The exit code of a verifier that cannot verify: its state unreadable
+/// (and no `--reanchor`), or not written.
+pub const EXIT_STATE: u8 = 3;
 
 /// The default state file: `$HOME/.local/state/nn-heartbeat/<key>.json`.
 pub fn default_state(pubkey: &VerifyingKey) -> PathBuf {
@@ -137,8 +145,16 @@ fn run_with_timeout(cmd: &str, timeout: Duration) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-fn read_state(path: &Path) -> Option<WatchState> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+/// The state: `Ok(None)` when there is none yet (the first check anchors),
+/// `Err` when it is there and cannot be read or decoded.
+fn read_state(path: &Path) -> Result<Option<WatchState>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| format!("{}: not a state ({e})", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
 }
 
 /// The state written whole or not at all (a temporary file renamed over).
@@ -155,12 +171,25 @@ fn write_state(path: &Path, s: &WatchState) -> std::io::Result<()> {
 }
 
 /// One check: fetch, verify, print, keep the state. Returns its result.
-pub fn check_once(w: &Watch) -> CheckResult {
-    let last = read_state(&w.state);
+pub fn check_once(w: &Watch) -> Result<CheckResult, String> {
+    let now = nn_evidence::audit::format_ts(chrono::Utc::now());
+    let last = match read_state(&w.state) {
+        Ok(s) => s,
+        Err(why) if w.reanchor => {
+            println!("{now} NOTE the state {why} — re-anchored (--reanchor)");
+            None
+        }
+        Err(why) => {
+            println!(
+                "{now} ERROR the state {why} — not re-anchored: run once with --reanchor to start \
+                 again from the newest beat"
+            );
+            return Err(why);
+        }
+    };
     let fetched = fetch(&w.source);
     let lines = fetched.as_deref().map_err(String::as_str);
     let r = check(lines, &w.pubkey, last.as_ref(), chrono::Utc::now(), &w.cfg);
-    let now = nn_evidence::audit::format_ts(chrono::Utc::now());
     if r.alerts.is_empty() {
         let s = r.state.as_ref();
         println!(
@@ -181,21 +210,25 @@ pub fn check_once(w: &Watch) -> CheckResult {
     if let Some(s) = &r.state {
         if last.as_ref() != Some(s) {
             if let Err(e) = write_state(&w.state, s) {
-                eprintln!("heartbeat watch: the state {}: {e}", w.state.display());
+                println!(
+                    "{now} ERROR the state {} not written: {e}",
+                    w.state.display()
+                );
+                return Err(format!("{}: {e}", w.state.display()));
             }
         }
     }
-    r
+    Ok(r)
 }
 
 /// `heartbeat watch`: once (the exit code is the most severe alert's), or
 /// every `w.every` until stopped.
 pub fn watch(w: &Watch) -> ExitCode {
     match w.every {
-        None => {
-            let r = check_once(w);
-            ExitCode::from(u8::try_from(r.exit_code()).unwrap_or(1))
-        }
+        None => match check_once(w) {
+            Ok(r) => ExitCode::from(u8::try_from(r.exit_code()).unwrap_or(1)),
+            Err(_) => ExitCode::from(EXIT_STATE),
+        },
         Some(every) => loop {
             let started = Instant::now();
             let _ = check_once(w);
@@ -245,9 +278,41 @@ mod tests {
             degradations: Vec::new(),
             heads: Default::default(),
             stopped: false,
+            seen_at: "2026-11-01T10:00:01.000000Z".into(),
+            uptime_ms: 1,
         };
         write_state(&p, &s).unwrap();
-        assert_eq!(read_state(&p), Some(s));
+        assert_eq!(read_state(&p), Ok(Some(s)));
         assert!(!p.with_extension("json.tmp").exists());
+        assert_eq!(read_state(&dir.path().join("none.json")), Ok(None));
+    }
+
+    /// Review of #478: a state there and unreadable is an error (exit 3),
+    /// never a silent re-anchor that would take a rollback for the first
+    /// beat; `--reanchor` starts again on purpose.
+    #[test]
+    fn a_corrupt_state_is_an_error_unless_reanchored() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.json");
+        std::fs::write(&state, b"{ not json").unwrap();
+        let file = dir.path().join("export.jsonl");
+        std::fs::write(&file, b"").unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let mut w = Watch {
+            pubkey: key.verifying_key(),
+            source: Source::File(file),
+            state: state.clone(),
+            every: None,
+            cfg: WatchConfig::default(),
+            reanchor: false,
+        };
+        assert!(check_once(&w).is_err());
+        assert_eq!(
+            std::fs::read(&state).unwrap(),
+            b"{ not json",
+            "left as it was"
+        );
+        w.reanchor = true;
+        assert!(check_once(&w).is_ok());
     }
 }

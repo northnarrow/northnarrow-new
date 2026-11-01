@@ -1292,6 +1292,30 @@ exit: 2
 |
 | For more information, try '--help'.
 
+### clap.heartbeat.watch.reanchor.given-twice
+$ nn-admin heartbeat watch --reanchor --reanchor
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--reanchor' cannot be used multiple times
+|
+| Usage: nn-admin heartbeat watch [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.watch.reanchor.with-a-value
+$ nn-admin heartbeat watch --reanchor=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--reanchor' found; no more were expected
+|
+| Usage: nn-admin heartbeat watch --reanchor
+|
+| For more information, try '--help'.
+
 ### clap.fim.unknown-flag
 $ nn-admin fim --no-such-flag
 exit: 2

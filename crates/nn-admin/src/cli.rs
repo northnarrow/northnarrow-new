@@ -962,9 +962,14 @@ enum HeartbeatCmd {
         /// beats' intervals plus 15 s).
         #[arg(long = "max-silence-secs")]
         max_silence_secs: Option<u64>,
-        /// A beat stamped further in the future is not believed.
+        /// A beat stamped further ahead of this host's clock is DEGRADED
+        /// (the agent's clock ahead).
         #[arg(long = "max-skew-secs", default_value_t = 30)]
         max_skew_secs: u64,
+        /// Start again from the newest beat when the state file cannot be
+        /// read (without it, an unreadable state is an error: exit 3).
+        #[arg(long = "reanchor")]
+        reanchor: bool,
     },
 }
 
@@ -1821,6 +1826,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                     every,
                     max_silence_secs,
                     max_skew_secs,
+                    reanchor,
                 },
         } => {
             let hex = match (agent_pubkey, agent_pubkey_file) {
@@ -1852,6 +1858,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                             max_skew_secs,
                             ..nn_evidence::heartbeat::WatchConfig::default()
                         },
+                        reanchor,
                     })
                 }
                 (Err(e), _) | (_, Err(e)) => {

@@ -194,6 +194,14 @@ pub struct WatchState {
     pub heads: BTreeMap<String, BeatHead>,
     /// The last beat was a stop.
     pub stopped: bool,
+    /// Review of #478 (X1): when the verifier first saw that beat — on the
+    /// verifier's clock: the freshness bound is measured from it, never
+    /// from the host's clock — and the beat's own `uptime_ms` (lateness
+    /// within a run, on the agent's monotonic clock).
+    #[serde(default)]
+    pub seen_at: String,
+    #[serde(default)]
+    pub uptime_ms: u64,
 }
 
 /// One alert, by kind (the most severe first in [`Alert::rank`]).
@@ -360,7 +368,7 @@ pub fn check(
     let silent_if_old = |out: &mut CheckResult, why: &str| {
         if let Some(l) = last {
             let bound = silence_bound(cfg, l.interval_secs);
-            if let Some(t) = parse_ts(&l.ts) {
+            if let Some(t) = parse_ts(&l.seen_at).or_else(|| parse_ts(&l.ts)) {
                 let age = (now - t).num_seconds();
                 out.age_secs = Some(age);
                 if age > bound as i64 {
@@ -449,22 +457,20 @@ pub fn check(
             return out;
         }
     }
+    // Review of #478 (X1): the host's clock orders nothing and alerts
+    // nothing grave — the beats are ordered by their numbers and links; a
+    // time that goes back or runs ahead of the verifier's is DEGRADED.
+    let mut clock = Vec::new();
     let newest_ts = parse_ts(&newest.ts);
-    let Some(newest_ts) = newest_ts else {
-        out.alerts.push(Alert::Tampered(format!(
-            "beat {} has no readable time",
-            newest.seq
-        )));
-        return out;
-    };
-    if (newest_ts - now).num_seconds() > cfg.max_skew_secs as i64 {
-        out.alerts.push(Alert::Tampered(format!(
-            "beat {} is stamped {} s in the future (bound {} s)",
+    match newest_ts {
+        None => clock.push(format!("beat {} has no readable time", newest.seq)),
+        Some(t) if (t - now).num_seconds() > cfg.max_skew_secs as i64 => clock.push(format!(
+            "the agent's clock is {} s ahead of the verifier's (beat {}; bound {} s)",
+            (t - now).num_seconds(),
             newest.seq,
-            (newest_ts - now).num_seconds(),
             cfg.max_skew_secs
-        )));
-        return out;
+        )),
+        Some(_) => {}
     }
     // against what was seen last
     if let Some(l) = last {
@@ -476,13 +482,15 @@ pub fn check(
             )));
             return out;
         }
-        if let Some(lt) = parse_ts(&l.ts) {
-            if newest_ts < lt {
-                out.alerts.push(Alert::Replay(format!(
-                    "the newest beat (seq {}) is stamped before the last seen (seq {})",
-                    newest.seq, l.seq
-                )));
-                return out;
+        if let (Some(lt), Some(nt)) = (parse_ts(&l.ts), newest_ts) {
+            if nt < lt && newest.seq > l.seq {
+                clock.push(format!(
+                    "the agent's clock went back: beat {} is stamped {} s before beat {} seen \
+                     (its numbers and links in order)",
+                    newest.seq,
+                    (lt - nt).num_seconds(),
+                    l.seq
+                ));
             }
         }
         // the beat seen last must be in what was fetched (or just before it)
@@ -558,7 +566,12 @@ pub fn check(
         Some(l) => newest.seq.saturating_sub(l.seq),
         None => 1,
     };
-    let age = (now - newest_ts).num_seconds();
+    // freshness on the verifier's clock: since it first saw the newest beat
+    let seen_at = match last {
+        Some(l) if newest.seq == l.seq => parse_ts(&l.seen_at).unwrap_or(now),
+        _ => now,
+    };
+    let age = (now - seen_at).num_seconds();
     out.age_secs = Some(age);
     let bound = silence_bound(cfg, newest.interval_secs);
     if newest.kind == BeatKind::Stop {
@@ -641,32 +654,35 @@ pub fn check(
     // back (the lab's freeze: restarted after ~70 s, under the silence
     // bound).
     if let Some(l) = last {
-        let mut prev = parse_ts(&l.ts).map(|t| (l.seq, t, l.stopped));
+        // (seq, uptime, a stop, its run): lateness on the agent's monotonic
+        // clock (review of #478: never its wall clock)
+        let mut prev = (l.seq, l.uptime_ms, l.stopped, l.run.as_str());
         for (_, b) in beats.iter().filter(|(_, b)| b.seq > l.seq) {
-            let t = parse_ts(&b.ts);
-            if let (Some((ps, pt, stopped)), Some(t)) = (prev, t) {
-                let gap = (t - pt).num_seconds();
-                if b.seq == ps + 1 && b.kind == BeatKind::Start && !stopped {
-                    degraded.push(format!(
-                        "the agent restarted without a clean stop: run {} began {gap} s after \
-                         beat {ps}, with no stop beat between (killed, crashed, or frozen and \
-                         restarted)",
-                        b.run
-                    ));
-                } else if b.seq == ps + 1
-                    && b.kind != BeatKind::Start
-                    && gap > (b.interval_secs + LATE_BEAT_SLACK_SECS) as i64
-                {
-                    degraded.push(format!(
-                        "beat {} came {gap} s after beat {ps} (every {} s): the agent stood \
-                         still — frozen, or starved",
-                        b.seq, b.interval_secs
-                    ));
-                }
+            let (ps, pu, stopped, prun) = prev;
+            if b.seq == ps + 1 && b.kind == BeatKind::Start && !stopped {
+                degraded.push(format!(
+                    "the agent restarted without a clean stop: run {} began after beat {ps}, \
+                     with no stop beat between (killed, crashed, or frozen and restarted)",
+                    b.run
+                ));
+            } else if b.seq == ps + 1
+                && b.kind != BeatKind::Start
+                && b.run == prun
+                && pu != 0
+                && b.uptime_ms.saturating_sub(pu) > (b.interval_secs + LATE_BEAT_SLACK_SECS) * 1000
+            {
+                degraded.push(format!(
+                    "beat {} came {} s after beat {ps} (every {} s, the agent's uptime): the \
+                     agent stood still — frozen, or starved",
+                    b.seq,
+                    b.uptime_ms.saturating_sub(pu) / 1000,
+                    b.interval_secs
+                ));
             }
-            prev = t.map(|t| (b.seq, t, b.kind == BeatKind::Stop));
+            prev = (b.seq, b.uptime_ms, b.kind == BeatKind::Stop, b.run.as_str());
         }
     }
+    degraded.extend(clock);
     if newest.kind != BeatKind::Stop
         && newest.decision_since_last_ms > cfg.stall_intervals * newest.interval_secs * 1000
     {
@@ -727,6 +743,8 @@ pub fn check(
             .map(|h| (h.chain.clone(), h.clone()))
             .collect(),
         stopped: newest.kind == BeatKind::Stop,
+        seen_at: crate::audit::format_ts(seen_at),
+        uptime_ms: newest.uptime_ms,
     });
     out
 }

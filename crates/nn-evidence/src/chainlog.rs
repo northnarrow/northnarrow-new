@@ -1216,6 +1216,12 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         Ok(())
     }
 
+    /// The archives this chain keeps (R12c-2: an archive within them that
+    /// is missing was removed, not evicted).
+    pub fn max_archives(&self) -> usize {
+        self.cfg.max_archives
+    }
+
     /// The active file (R12c, lab PR 270: a caller's own fsync of it,
     /// [`sync_detached`]).
     pub fn active_path(&self) -> &Path {

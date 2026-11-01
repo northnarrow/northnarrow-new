@@ -52,13 +52,26 @@ most severe alert's:
 
 | Exit | Alert | When | What to do |
 |---|---|---|---|
-| 13 | `TAMPERED` | a line does not verify (altered, or signed with another key), or is stamped in the future | treat the host as compromised: its chain was edited, or the key was replaced |
+| 13 | `TAMPERED` | a line does not verify (altered, or signed with another key) | treat the host as compromised: its chain was edited, or the key was replaced (after a planned key change, see below) |
 | 12 | `REPLAY` | a beat older than one already seen, a fork of one, or a chain's head went back (the audit log's row, the actions chain's position: a tail cut, a rotation undone, a rewrite) or is gone from the beat (the chain did not open on the host), or the agent no longer finds in its actions chain the head its previous beat named (`kept: false`: cut or rewritten) | the chain was rolled back or an old export replayed: the host or the channel is lying |
-| 11 | `BROKEN` | the chain does not link, or beats are missing | beats were removed; fetch more lines (`export --count`) to tell a short fetch from a removal |
-| 10 | `SILENT` | no newer beat for two intervals plus 15 s (75 s by default; `--max-silence-secs`), or the source could not be read past that | the agent stopped, froze or was killed, the host is down, or the network is cut — go and look |
+| 11 | `BROKEN` | the chain does not link, or beats are missing | beats were removed — or the export was short of them: on the host, `sudo nn-admin heartbeat export --count 500` shows more (the forced command always exports the default 64) |
+| 10 | `SILENT` | no new beat for two intervals plus 15 s (75 s by default; `--max-silence-secs`) on the **verifier's** clock — since it first saw the newest beat — or the source could not be read past that | the agent stopped, froze or was killed, the host is down, or the network is cut — go and look |
 | 15 | `STOPPED` | the agent's signed `stop` beat (an admin shutdown, a host shutdown), and every check while it stays stopped | expected only during maintenance |
 | 14 | `LOSS` | a stage's loss grew since the last beat seen | `nn-admin status --key` on the host: which stage, which queue |
-| 16 | `DEGRADED` | a new run whose start beat follows no stop beat (the agent killed, crashed, or frozen and restarted by the watchdog — however soon it came back), a beat late after the one before it in one run (more than its interval + 15 s: the agent stood still — frozen, starved — for less than the silence bound), the decision thread stood still for two intervals, a telemetry gap, an action row not in its chain, an action interrupted between intent and outcome, a new degradation | `nn-admin status --key`, the audit log's rows |
+| 16 | `DEGRADED` | the agent's clock gone back, or ahead of the verifier's past `--max-skew-secs`; a new run whose start beat follows no stop beat (the agent killed, crashed, or frozen and restarted by the watchdog — however soon it came back), a beat late after the one before it in one run (more than its interval + 15 s: the agent stood still — frozen, starved — for less than the silence bound), the decision thread stood still for two intervals, a telemetry gap, an action row not in its chain, an action interrupted between intent and outcome, a new degradation | `nn-admin status --key`, the audit log's rows |
+
+The host's clock decides nothing grave (review of #478): beats are
+ordered by their numbers and links; a beat stamped before the one seen
+(an RTC behind after a reboot) or ahead of the verifier's clock by more
+than `--max-skew-secs` is `DEGRADED` ("the agent's clock went back",
+"… is N s ahead"), never `REPLAY` or `TAMPERED`; freshness is the
+verifier's own clock, and a late beat within a run is measured on the
+agent's `uptime_ms`.
+
+A state file that is there and cannot be read or decoded stops the
+verifier (exit 3): it never re-anchors silently, which would take a
+rolled-back chain for its first beat. `--reanchor` starts again from the
+newest beat, on purpose.
 
 The first check of a new state file **anchors**: it takes the newest beat
 that verifies as the start (say `OK … (anchored: first beat seen)`) and
@@ -67,6 +80,22 @@ alerts on nothing the run counted before it. Compare that beat's
 restart of the agent is a `start` beat of a new `run`: its counters start
 again from zero, and it is not an alert (an action it found interrupted
 is).
+
+## Operating it
+
+- **Planned maintenance** (an upgrade, a reboot): the agent's `stop` beat
+  is `STOPPED` at every check while it is stopped — a page every 30 s
+  with `OnFailure=`. Stop the verifier's timer for the window
+  (`systemctl stop nn-heartbeat-web01.timer`) and start it after; the
+  first check then sees the new run's `start` beat after the `stop`: no
+  alert.
+- **A key change** (the agent's signing key replaced): every check is
+  `TAMPERED` until the verifier has the new public key, and the lines of
+  the export signed before the change keep failing until they leave it
+  (64 beats, about 32 minutes). In a maintenance window: install the new
+  `agent.sig.pub`, and when the window ends run once with `--reanchor`.
+- **A reinstall, or the chains removed**: the beats start again from 1 —
+  `REPLAY` (and a head gone). Check the host, then `--reanchor`.
 
 ## Setting it up
 
@@ -141,6 +170,21 @@ copy of the chain read from shared storage works too (`--from-file`).
   what an isolated host is.
 
 ## What it does not prove
+
+**Whoever holds the agent's key can forge everything** — every beat, its
+`kept`, the chains' heads and the counters, from any host. The signature
+proves the key, not the host's honesty; only an attestation the host
+cannot forge (a TPM quote of the measured boot and the agent, the Keylime
+model) closes that, and it is future work.
+
+**`kept` protects the tail, not the middle**: a row between two heads the
+beats named, rewritten with one of the same length, leaves the position and
+the previous head intact — only `sudo nn-admin chain verify` on the host
+sees it (its signature fails), until R15 exports the chains off the host.
+
+The verifier runs `nn-admin heartbeat export` as root through `sudo` on
+the agent's host; a chain readable by a dedicated group would remove that
+(its file is 0600 root, under the agent's protection): open.
 
 The signature proves which key wrote a beat, not that the host is honest:
 an attacker who reads the agent's key (root that gets past the anti-tamper

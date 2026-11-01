@@ -74,6 +74,15 @@ impl Chain {
     }
 
     fn keyed(key_path: Option<std::path::PathBuf>) -> Self {
+        Self::keyed_capped(key_path, u64::MAX)
+    }
+
+    /// A chain that rotates past `cap` bytes.
+    fn capped(cap: u64) -> Self {
+        Self::keyed_capped(None, cap)
+    }
+
+    fn keyed_capped(key_path: Option<std::path::PathBuf>, cap: u64) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("heartbeat.jsonl");
         let key_path = key_path.unwrap_or_else(|| dir.path().join("k"));
@@ -83,7 +92,7 @@ impl Chain {
             &path,
             key,
             RotationConfig {
-                size_cap_bytes: u64::MAX,
+                size_cap_bytes: cap,
                 max_archives: 4,
                 file_mode: 0o600,
             },
@@ -136,7 +145,8 @@ fn beats_on_time_raise_nothing() {
     c.push(beat(4, 120));
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(125), &cfg());
     assert!(r.alerts.is_empty(), "{r:?}");
-    assert_eq!((r.new_beats, r.age_secs), (1, Some(5)));
+    // (the age on the verifier's clock: since it first saw the beat)
+    assert_eq!((r.new_beats, r.age_secs), (1, Some(0)));
     // the same tail again, still fresh: nothing new, nothing wrong
     let s = r.state.unwrap();
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(140), &cfg());
@@ -152,16 +162,17 @@ fn silence_alerts_after_two_intervals() {
     let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
         .state
         .unwrap();
-    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(75), &cfg());
-    assert!(r.alerts.is_empty(), "within the bound: {r:?}");
+    // (on the verifier's clock: from at(1), when it first saw beat 1)
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(76), &cfg());
+    assert!(r.alerts.is_empty(), "within the bound: {r:?}");
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(77), &cfg());
     assert_eq!(kinds(&r), ["SILENT"]);
     assert_eq!(r.exit_code(), 10);
     let r = check(
         Err("ssh: connect timed out"),
         &c.pk,
         Some(&s),
-        at(76),
+        at(77),
         &cfg(),
     );
     assert_eq!(kinds(&r), ["SILENT"]);
@@ -181,7 +192,7 @@ fn silence_alerts_after_two_intervals() {
         ..cfg()
     };
     assert_eq!(
-        kinds(&check(Ok(&c.lines()), &c.pk, Some(&s), at(11), &tight)),
+        kinds(&check(Ok(&c.lines()), &c.pk, Some(&s), at(12), &tight)),
         ["SILENT"]
     );
 }
@@ -371,14 +382,20 @@ fn degraded_health_alerts() {
     assert!(r.alerts[0].detail().contains("interrupted"), "{r:?}");
 }
 
-/// A beat stamped in the future is not believed; the most severe alert
-/// gives the exit code.
+/// A beat stamped in the future: the agent's clock ahead of the
+/// verifier's — DEGRADED, never TAMPERED (review of #478, X1: an NTP
+/// misconfigured is not a compromise); the most severe alert gives the
+/// exit code.
 #[test]
 fn a_future_beat_and_the_exit_code_order() {
     let mut c = Chain::new();
     c.push(beat(1, 600));
     let r = check(Ok(&c.lines()), &c.pk, None, at(0), &cfg());
-    assert_eq!(kinds(&r), ["TAMPERED"]);
+    assert_eq!(kinds(&r), ["DEGRADED"], "{r:?}");
+    assert!(
+        r.alerts[0].detail().contains("ahead of the verifier's"),
+        "{r:?}"
+    );
     let r = CheckResult {
         alerts: vec![
             Alert::Degraded(String::new()),
@@ -463,10 +480,12 @@ fn a_chain_rebuilt_with_the_key_is_seen() {
     }
     let r = check(Ok(&renum.lines()), &c.pk, Some(&s3), at(131), &cfg());
     assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
-    // the next beat, in order and linked, stamped before the beat seen
+    // the next beat, in order and linked, stamped before the beat seen:
+    // the agent's clock went back — DEGRADED, not REPLAY (review of #478)
     c.push(beat(4, 50));
     let r = check(Ok(&c.lines()), &c.pk, Some(&s3), at(62), &cfg());
-    assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+    assert_eq!(kinds(&r), ["DEGRADED"], "{r:?}");
+    assert!(r.alerts[0].detail().contains("clock went back"), "{r:?}");
 }
 
 /// Review of #476: the actions chain's head is in each beat (its position
@@ -657,4 +676,120 @@ fn a_head_is_held_only_by_its_own_line() {
     std::fs::write(&p, format!("{a}\n")).unwrap();
     assert!(!holds_line_ending_at(&p, end, "bbbb").unwrap());
     assert!(holds_line_ending_at(&dir.path().join("none"), 1, "x").is_err());
+}
+
+/// Review of #478 (X1): the host's clock decides nothing grave. A reboot
+/// with the RTC 40 s behind (a clean stop at 100 s, the next run's start
+/// stamped 60 s; numbers and links in order): DEGRADED "clock went back",
+/// not REPLAY. The host's clock 40 s ahead of the verifier's: DEGRADED,
+/// not TAMPERED. An NTP step between two beats (their stamps 200 s apart,
+/// their uptimes 30 s): no late beat — lateness is the agent's uptime.
+/// Silence is the verifier's clock: a host clock far ahead does not keep a
+/// dead agent "fresh".
+#[test]
+fn the_host_s_clock_decides_nothing_grave() {
+    let mut c = Chain::new();
+    c.push(beat(1, 70));
+    let mut stop = beat(2, 100);
+    stop.kind = BeatKind::Stop;
+    stop.stop_reason = Some("host shutdown".into());
+    c.push(stop);
+    let s = check(Ok(&c.lines()), &c.pk, None, at(101), &cfg())
+        .state
+        .unwrap();
+    let mut start = beat(3, 60);
+    start.kind = BeatKind::Start;
+    start.run = "bbbbbbbbbbbbbbbb".into();
+    start.uptime_ms = 1_000;
+    c.push(start);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(130), &cfg());
+    assert_eq!(kinds(&r), ["DEGRADED"], "{r:?}");
+    assert!(r.alerts[0].detail().contains("clock went back"), "{r:?}");
+    // the host's clock ahead
+    let s = r.state.unwrap();
+    let mut ahead = beat(4, 200);
+    ahead.run = "bbbbbbbbbbbbbbbb".into();
+    ahead.uptime_ms = 31_000;
+    c.push(ahead);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(160), &cfg());
+    assert_eq!(kinds(&r), ["DEGRADED"], "{r:?}");
+    assert!(
+        r.alerts[0].detail().contains("ahead of the verifier's"),
+        "{r:?}"
+    );
+    // an NTP step: stamps far apart, uptimes 30 s apart — not late
+    let s = r.state.unwrap();
+    let mut stepped = beat(5, 400);
+    stepped.run = "bbbbbbbbbbbbbbbb".into();
+    stepped.uptime_ms = 61_000;
+    c.push(stepped);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(400), &cfg());
+    assert!(r.alerts.is_empty(), "{r:?}");
+    // the agent dead, its last beat stamped in the far future: silent on
+    // the verifier's clock all the same
+    let s = r.state.unwrap();
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(400 + 76), &cfg());
+    assert_eq!(kinds(&r), ["SILENT"], "{r:?}");
+}
+
+/// Review of #478 (its V2): an export right after the chain rotated — a
+/// short active file — reads the newest archive's tail too: the verifier
+/// sees the beats it missed linked through the rotation's terminator, not
+/// a false BROKEN.
+#[test]
+fn an_export_after_a_rotation_links_through_it() {
+    let mut c = Chain::capped(4 * 1024);
+    c.push(beat(1, 0));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let mut i = 2;
+    while crate::chainlog::archives_newest_first(&c.path).is_empty() {
+        c.push(beat(i, 30 * (i as i64 - 1)));
+        i += 1;
+    }
+    c.push(beat(i, 30 * (i as i64 - 1)));
+    let active = std::fs::read_to_string(&c.path).unwrap().lines().count();
+    assert!(active < 16, "a short active file: {active}");
+    let raw: Vec<Vec<u8>> = tail_lines(&c.path, 64)
+        .unwrap()
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
+    assert!(raw.len() > active, "the archive's tail read too");
+    let r = check(
+        Ok(&raw),
+        &c.pk,
+        Some(&s),
+        at(30 * (i as i64 - 1) + 1),
+        &cfg(),
+    );
+    assert!(
+        !r.alerts.iter().any(|a| matches!(a, Alert::Broken(_))),
+        "{r:?}"
+    );
+    assert_eq!(r.new_beats, i - 1, "{r:?}");
+}
+
+/// Review of #478 (its V5): the audit log's head at the same row with
+/// another hash — the row rewritten — is REPLAY.
+#[test]
+fn an_audit_head_rewritten_at_the_same_row_alerts() {
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let mut b = beat(2, 30);
+    b.heads[0].seq = Some(101);
+    b.heads[0].hash = "ee".repeat(32);
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(31), &cfg());
+    assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+    assert!(
+        r.alerts[0]
+            .detail()
+            .contains("audit chain's head went back"),
+        "{r:?}"
+    );
 }
