@@ -339,13 +339,17 @@ decision's responses to its queue
 (`nn_core::response::dispatch::ResponseQueue`, stage 6) — a push under a
 lock, never a wait — and a pool of workers takes them (R12c-3: the threads
 `nn-response-<n>`, eight by default, `NN_RESPONSE_WORKERS`, 1 to 32). A
-worker takes one response at a time, of a process with no response running
-(the queue marks the process running until the worker is done with it):
-different processes' responses run at once, one process's one at a time.
-A worker runs at a nice value five above the agent's, so on a short CPU
-the decision thread and the pumps keep theirs (the first pool, at the
-same priority, made 1,247 P1 decisions late in EXP-13r on a 4-CPU guest);
-and a kill tree whose root has no child (its threads' `children` files,
+worker takes one response at a time, of a pid with no response running
+(the queue marks the pid running until the worker is done with it):
+different pids' responses run at once, one pid's one at a time — keyed by
+the pid alone (review of #477: the process's start is known only for an
+exec's event, so one process was two keys and two workers acted on it at
+once; a pid reused by another process now waits behind the old one's
+responses, harmlessly). The decision thread runs at a nice value five
+below the agent's (a higher CPU priority: the first pool, at the same
+priority, made 1,247 P1 decisions late in EXP-13r on a 4-CPU guest; the
+review of #477 had the workers' priority left as the agent's, not lowered
+below the user's processes); and a kill tree whose root has no child (its threads' `children` files,
 read once it is inside the kill cgroup, where any later child is born)
 skips the `/proc` walks that each cost ~50 ms of CPU with EXP-13r's 400
 processes alive. EXP-13r's 400 kill trees waited at most 2.0 and 4.1 s
@@ -360,13 +364,13 @@ thread. The queue's order:
   the queue became first in, first out, 185 of 400 takes passing over a
   more severe job);
 - **in order per process** (a later response for the same process never
-  overtakes an earlier one): a process is its pid *and* its start (a
-  process that reused a pid is another one — review of #476, X1); each
-  process's jobs are kept in the order they were decided, and a take runs
+  overtakes an earlier one): each pid's jobs are kept in the order they
+  were decided, and a take runs
   the *oldest* job of the process the lane names — a Critical quarantine
   decided after a Low strip of the same process raises that process's turn
   (priority inheritance) and the strip runs first, then the quarantine.
-  One thread takes, so two jobs of one process never run at once. The
+  The pid is marked running while one of its jobs runs, so two jobs of
+  one process never run at once. The
   COMBAT ladder keeps its own worker (external audit CMB-007) and the exec
   quarantine its thread: a rule's response and a ladder step on the same
   process are not ordered between them, as before R12c;
@@ -374,14 +378,17 @@ thread. The queue's order:
   before that process's queued jobs, so it never waits behind what it
   would make pointless; the process's quarantine or strip runs after it.
   Once the kill *killed* (the process killed, or already gone), its
-  process's throttles and blocks still queued — or taken in the same
-  batch behind it — are answered `not run: superseded by a kill of the
-  same process` and counted (`superseded`; not a loss). A kill that did
+  process's throttles and blocks still queued — the same process: its
+  start known and equal (review of #477; a response whose start is not
+  known is superseded by nothing, it runs after the kill) — are answered
+  `not run: superseded by a kill of the same process` and counted (`superseded`; not a loss). A kill that did
   not kill (the host-critical guard, EPERM, a cgroup that would not die)
   supersedes nothing: they run after it (the re-check of #476: a
   compromised process the agent cannot kill must still lose its network
   or its CPU);
-- **a repeat merges**: a job of the same process (pid and start), action
+- **a repeat merges**: a job of the same process (pid and start — known:
+  a response whose start is not known merges with nothing, review of
+  #477, as #476's X1 for an exec's), action
   and — but for a kill — file as the process's *last* queued job (its
   first, for a kill) is merged into it (a process that tripped two rules,
   or one twice, before its kill ran) — one action, both decisions answered

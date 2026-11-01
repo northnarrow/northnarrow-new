@@ -430,7 +430,7 @@ fn journal_outcome_says_what_each_outcome_is() {
 fn a_thread_lowers_its_own_priority_only() {
     // SAFETY: getpriority(2) of this thread.
     let before = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
-    let theirs = std::thread::spawn(|| super::lower_this_thread(5).unwrap())
+    let theirs = std::thread::spawn(|| super::renice_this_thread(5).unwrap())
         .join()
         .unwrap();
     assert_eq!(theirs, (before + 5).min(19));

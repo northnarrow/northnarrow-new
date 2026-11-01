@@ -144,6 +144,11 @@ pub(crate) async fn run(
             let decider = std::thread::Builder::new()
                 .name("nn-decision".to_string())
                 .spawn_scoped(s, || {
+                    // R12c-3 (review of #477): the decision thread above the
+                    // response workers and the pumps when the CPU is short
+                    if let Err(e) = northnarrow_agent::response::renice_this_thread(DECISION_NICE) {
+                        warn!(error = %e, "the decision thread keeps the agent's CPU priority");
+                    }
                     let _ended = Ended(&ctl);
                     let _rt = rt.enter();
                     decision_loop(&mut rx, lineage.as_ref(), &rt, &ctl, &pipeline)
@@ -488,6 +493,10 @@ fn debug_hang_next_action(admin_socket: &std::path::Path, dispatcher: &Dispatche
     warn!("debug-trigger: the next response's action hangs past the stall bound");
     dispatcher.hang_next_action();
 }
+
+/// R12c-3 (review of #477): the decision thread's nice value, below the
+/// agent's own by this much (a higher CPU priority).
+const DECISION_NICE: i32 = -5;
 
 /// External audit SNS-001: how often the main loop checks that every
 /// telemetry task still runs.

@@ -126,6 +126,12 @@ pub trait DispatchJob {
     fn superseded_by_kill(&self) -> bool {
         false
     }
+    /// The same process as `other` beyond the queue's key (a pid that names
+    /// one process at a time): a kill of it supersedes `other` only then
+    /// (review of #477: a pid reused by another process).
+    fn same_process(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 /// What became of a submitted job.
@@ -257,14 +263,17 @@ impl<K: Eq + Hash + Clone, J: DispatchJob> ResponseQueue<K, J> {
     /// and blocks, taken out (counted `superseded`) for the caller to
     /// answer. Never before the kill ran: a kill that did not kill leaves
     /// them to run.
-    pub fn supersede(&mut self, key: &K) -> Vec<J> {
+    pub fn supersede(&mut self, key: &K, kill: &J) -> Vec<J> {
         let gone: Vec<u64> = self
             .by_key
             .get(key)
             .map(|q| {
                 q.iter()
                     .copied()
-                    .filter(|s| self.jobs[s].job.superseded_by_kill())
+                    .filter(|s| {
+                        let j = &self.jobs[s].job;
+                        j.superseded_by_kill() && kill.same_process(j)
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -578,12 +587,15 @@ mod tests {
         assert_eq!((t.job.pid, t.job.action), (7, "kill"));
         assert_eq!(t.job.decisions, [5, 6]);
         let gone: Vec<u32> = q
-            .supersede(&7)
+            .supersede(&7, &j(7, "kill", 0))
             .iter()
             .flat_map(|j| j.decisions.clone())
             .collect();
         assert_eq!(gone, [1, 3]);
-        assert!(q.supersede(&7).is_empty(), "handed back once");
+        assert!(
+            q.supersede(&7, &j(7, "kill", 0)).is_empty(),
+            "handed back once"
+        );
         assert_eq!(order(&mut q, 1), [(7, "quarantine"), (8, "throttle")]);
         let s = q.stats();
         assert_eq!((s.superseded, s.merged, s.lost()), (2, 1, 0));
@@ -687,7 +699,7 @@ mod tests {
                         // a kill that killed (one in two) supersedes
                         if t.job.action == "kill" && (r >> 40) % 2 == 0 {
                             gone.extend(
-                                q.supersede(&t.job.pid)
+                                q.supersede(&t.job.pid, &t.job)
                                     .into_iter()
                                     .flat_map(|j| j.decisions),
                             );

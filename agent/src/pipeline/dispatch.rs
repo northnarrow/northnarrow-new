@@ -62,9 +62,6 @@ pub(crate) const WORKERS_ENV: &str = "NN_RESPONSE_WORKERS";
 /// `stalled` row, `TelemetryLoss`, and a spare worker so that the other
 /// processes' responses do not wait behind it.
 pub(crate) const STALL_AFTER: Duration = Duration::from_secs(10);
-/// R12c-3: the workers' nice value, above the agent's own by this much —
-/// below the decision thread and the pumps when the CPU is short.
-pub(crate) const WORKER_NICE: i32 = 5;
 /// How often the stall watch looks.
 const STALL_WATCH_EVERY: Duration = Duration::from_millis(500);
 
@@ -139,15 +136,22 @@ pub(crate) struct ResponseJob {
 }
 
 impl DispatchJob for ResponseJob {
-    /// The same action on the same process — its pid *and* its start (a
-    /// process that reused the pid is another one: review of #476, X1) —
-    /// and, but for a kill, the same file (two strips of two files are two
-    /// actions).
+    /// The same action on the same process — its pid *and* its start,
+    /// known (a process that reused the pid is another one: review of
+    /// #476, X1; the start is 0, not known, for every response but an
+    /// exec's — review of #477: then never merged, a second kill costs an
+    /// `AlreadyGone`) — and, but for a kill, the same file (two strips of
+    /// two files are two actions).
     fn same_action(&self, other: &Self) -> bool {
         self.action == other.action
-            && self.pid == other.pid
-            && self.start_ns == other.start_ns
+            && self.same_process(other)
             && (self.is_kill() || self.file == other.file)
+    }
+
+    /// The same process, its start known and equal (review of #477): a
+    /// kill supersedes only that process's throttles and blocks.
+    fn same_process(&self, other: &Self) -> bool {
+        self.pid == other.pid && self.start_ns != 0 && self.start_ns == other.start_ns
     }
 
     fn is_kill(&self) -> bool {
@@ -396,7 +400,10 @@ pub(crate) struct DispatchStatus {
 }
 
 struct Shared {
-    queue: Mutex<ResponseQueue<(u32, u64), ResponseJob>>,
+    /// Keyed by pid (review of #477): one pid's responses never run at
+    /// once nor out of order, whichever event — knowing the start or not —
+    /// decided them; a reused pid waits behind the old one's, harmlessly.
+    queue: Mutex<ResponseQueue<u32, ResponseJob>>,
     ready: Condvar,
     stop: AtomicBool,
     executor: Executor,
@@ -439,7 +446,7 @@ struct Shared {
     /// Tests: the action on this pid hangs (after its intent) until this
     /// goes back to 0 — a stalled action.
     #[cfg(test)]
-    hang_pid: std::sync::atomic::AtomicU32,
+    hang_pids: Mutex<std::collections::HashSet<u32>>,
 }
 
 /// R12c-3: what one worker runs now (the stall watch reads it).
@@ -549,7 +556,7 @@ impl Dispatcher {
             #[cfg(test)]
             panic_next: AtomicBool::new(false),
             #[cfg(test)]
-            hang_pid: std::sync::atomic::AtomicU32::new(0),
+            hang_pids: Mutex::new(std::collections::HashSet::new()),
         });
         let mut started = 0;
         for n in 0..workers {
@@ -602,8 +609,9 @@ impl Dispatcher {
             let now = s.now_ns();
             let mut q = s.queue.lock();
             for (sev, job) in jobs {
-                // a process is its pid and its start (review of #476, X1)
-                match q.submit((job.pid, job.start_ns), sev, now, job) {
+                // keyed by pid (review of #477); merged only for a known
+                // and equal start (`same_action`: #476's X1)
+                match q.submit(job.pid, sev, now, job) {
                     Submitted::Queued(_) | Submitted::Merged(_) => {}
                     Submitted::Displacing(_, d) => {
                         let lane = lane_of_job(&d);
@@ -887,9 +895,6 @@ fn spawn_worker(s: &Arc<Shared>, name: String, spare: bool) -> bool {
 /// intent, the action, its outcome; the process freed for its next job.
 fn work(s: &Shared, slot: &Slot, spare: bool) {
     let _exit = Exit(s, !spare);
-    if let Err(e) = northnarrow_agent::response::lower_this_thread(WORKER_NICE) {
-        warn!(error = %e, "a response worker keeps the decision thread's CPU priority");
-    }
     let mut unsynced = 0usize;
     loop {
         let t = {
@@ -934,7 +939,7 @@ fn work(s: &Shared, slot: &Slot, spare: bool) {
         s.active.fetch_add(1, Ordering::AcqRel);
         #[cfg(test)]
         drop(s.hold.lock());
-        let key = (t.job.pid, t.job.start_ns);
+        let key = t.job.pid;
         let intent = s.journal.intent(t.job.intent(t.severity, t.waited_ns));
         slot.action.store(intent.number(), Ordering::Relaxed);
         *slot.what.lock() = t.job.sample();
@@ -952,7 +957,7 @@ fn work(s: &Shared, slot: &Slot, spare: bool) {
             if t.job.is_kill() && killed_it(&report) {
                 // the re-check of #476: only a kill that killed supersedes
                 // its process's throttles and blocks still queued
-                q.supersede(&key)
+                q.supersede(&key, &t.job)
             } else {
                 Vec::new()
             }
@@ -1043,7 +1048,7 @@ fn killed_it(report: &ExecutionReport) -> bool {
 fn run_one(s: &Shared, job: &ResponseJob, intent: Intent) -> ExecutionReport {
     let started = Instant::now();
     #[cfg(test)]
-    while s.hang_pid.load(Ordering::Acquire) == job.pid {
+    while s.hang_pids.lock().contains(&job.pid) {
         std::thread::sleep(Duration::from_millis(5));
     }
     #[cfg(feature = "debug-trigger")]
