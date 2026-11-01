@@ -11,7 +11,7 @@
 //! - `qname_wire_end` reports an end inside the buffer, just past a root
 //!   label (the Kani property, on buffers longer than the proof's).
 use libfuzzer_sys::fuzz_target;
-use northnarrow_agent::net::dns_cache::{parse_a_records, parse_aaaa_records};
+use nn_parse::dns_records::{parse_a_records, parse_aaaa_records};
 use nn_parse::dns_qname::{QnameLabel, QnameLabels, decode_dns_qname, qname_wire_end};
 
 /// The labels a decoded name spells, `\DDD` turned back into bytes.

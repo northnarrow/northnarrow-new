@@ -161,7 +161,15 @@ The connect pump waits, per batch, for the DNS pump's pass over the
 queries made before its connects (lab PR 229) and announces each connect
 after its batch is on the bus (lab PR 246); the DNS pump answers the
 lookups' requests for a pass as well as its ring, so its thread runs the
-pump's own loop on the runtime's reactor (`Handle::block_on`). The FIM and
+pump's own loop on the runtime's reactor (`Handle::block_on`). R14b
+([the process model](PROCESS_MODEL.md)): a pass's records are copied off
+the ring, their names decoded by the parse worker in batches whose worst
+answer fits a 64 KiB frame (250 ms each at most), then the pass's events
+built and the DNS cache fed — the lookups' barrier ends after that, as
+before. The pump does not read a name's bytes itself: while the worker is
+down or disabled its events carry no name (`qname_partial`, the
+socket-buffer sensor's type unknown), the cache is not fed, and the names
+are counted and said in the journal at most every 10 s. The FIM and
 network drains (their loops are async: they await the bus, the DNS and
 connect barriers, their periodic steps) run on threads of their own too
 (`nn-fim_drain`, `nn-net_drain`; review of #474), each with a runtime of

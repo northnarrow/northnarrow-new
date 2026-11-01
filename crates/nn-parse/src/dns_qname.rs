@@ -49,6 +49,26 @@ pub fn decode_dns_qname(buf: &[u8]) -> String {
     out
 }
 
+/// R14b (lab PR 229's `nss_query_name`, moved from nn-linux's DNS sensor
+/// into the parse worker's crate): the name of an NSS record — the text a
+/// process passed to systemd-resolved's NSS module, as the kernel copied
+/// it — in the presentation form [`decode_dns_qname`] gives a wire name:
+/// up to its first NUL, the root dot of an absolute name dropped, a byte
+/// outside printable ASCII (and `\`) as `\DDD`. Empty for an empty name.
+pub fn nss_presentation(bytes: &[u8]) -> String {
+    let bytes = bytes.split(|&b| b == 0).next().unwrap_or(&[]);
+    let bytes = bytes.strip_suffix(b".").unwrap_or(bytes);
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if (32..=126).contains(&b) && b != b'\\' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("\\{b:03}"));
+        }
+    }
+    out
+}
+
 /// One label of a DNS label-encoded name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QnameLabel<'a> {
@@ -124,6 +144,18 @@ pub fn qname_wire_end(buf: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R14b: the NSS text's presentation form (lab PR 229's rules).
+    #[test]
+    fn an_nss_name_is_its_text_escaped() {
+        assert_eq!(nss_presentation(b"example.com"), "example.com");
+        assert_eq!(nss_presentation(b"example.com."), "example.com");
+        assert_eq!(nss_presentation(b"a\x00junk"), "a");
+        assert_eq!(nss_presentation(b"a\\b\x01\xff"), "a\\092b\\001\\255");
+        assert_eq!(nss_presentation(b""), "");
+        assert_eq!(nss_presentation(b"."), "");
+        assert_eq!(nss_presentation(b"\x00"), "");
+    }
 
     #[test]
     fn decode_dns_qname_handles_basic_name() {

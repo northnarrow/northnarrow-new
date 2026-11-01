@@ -47,6 +47,8 @@ pub(crate) struct Attached {
     /// side, for the trust level and the manifest, and the degraded states,
     /// signed by the attest phase (process-wide statics until then).
     pub(crate) anti_tamper: northnarrow_agent::anti_tamper::AttachReport,
+    /// R14b: the workers' supervisor, started at the head of this phase.
+    pub(crate) workers: nn_linux::worker::Workers,
 }
 
 /// `BootPhase::Attach`: the eBPF object loads and the sensors attach
@@ -71,7 +73,12 @@ pub(crate) async fn load(
     refusals: &refusal::Context<'_>,
     audit: &mut checks::AuditOpen,
     bpf_lsm: &northnarrow_agent::boot::lsm::BpfLsm,
+    image: std::io::Result<nn_linux::worker::SelfImage>,
 ) -> Result<Attached> {
+    // R14b (plan §3.1, §3.5): the workers first — the parse worker ready
+    // when the DNS pump's first records come; its pid registered once the
+    // deny hooks below are attached (`super::workers::arm`).
+    let workers = super::workers::start(cli, image);
     // Process-lineage cache shared by the posture triggers and the FIM
     // rules' package-manager carve-out (review 49): "does this writer
     // descend from dpkg/rpm/dnf?". Fed from Event::ProcessSpawn by the
@@ -107,6 +114,8 @@ pub(crate) async fn load(
         // kernel without `bpf` in its active LSM list: the exec and file-open
         // sensors take their tracepoints (an LSM program would never run)
         lsm_absent: matches!(bpf_lsm, northnarrow_agent::boot::lsm::BpfLsm::Absent { .. }),
+        // R14b: the DNS pump's names go to the parse worker
+        parse: Some(workers.clone()),
         ..Default::default()
     };
     // Lab PR 223 (EXPERIMENTAL): the exec quarantine's mode, before the
@@ -269,6 +278,9 @@ pub(crate) async fn load(
         }
     };
     boot.done(BootStep::AntiTamper)?;
+    // R14b: this boot's hooks attached, the map pinned: the workers' pids go
+    // there from now on, the running one at once
+    super::workers::arm(&workers);
     // Lab PR 219: the exploit post-condition guard, attached before the
     // agent's programs are recorded as its own (DEP-006), in detect mode
     // until the no-enforcement gate is resolved below. Off or unavailable
@@ -307,6 +319,7 @@ pub(crate) async fn load(
         exploit_guard_degraded,
         exploit_guard,
         anti_tamper,
+        workers,
     })
 }
 

@@ -450,7 +450,9 @@ struct Slot {
 
 struct Shared {
     launcher: Arc<dyn Launcher>,
-    roles: Arc<dyn PidRoles>,
+    /// R14b: given at construction, or later ([`Workers::arm_roles`]) once
+    /// this boot's deny hooks are attached.
+    roles: Mutex<Arc<dyn PidRoles>>,
     report: Report,
     slots: Vec<Slot>,
     stop: AtomicBool,
@@ -508,7 +510,7 @@ impl Workers {
             .collect();
         let me = Self(Arc::new(Shared {
             launcher: cfg.launcher,
-            roles: cfg.roles,
+            roles: Mutex::new(cfg.roles),
             report: cfg.report,
             slots,
             stop: AtomicBool::new(false),
@@ -548,6 +550,30 @@ impl Workers {
                     std::thread::sleep(pace);
                 }
             })
+    }
+
+    fn roles(&self) -> Arc<dyn PidRoles> {
+        Arc::clone(&self.0.roles.lock())
+    }
+
+    /// R14b: where the workers' pids go from now on — this boot's deny
+    /// hooks, attached and pinned after the workers started (a worker
+    /// starts before the sensors, so the first DNS records find it ready).
+    /// The pid of each running worker is registered at once. Until then a
+    /// worker is not in `PROTECTED_PIDS` (killable by root, never exempt):
+    /// an earlier boot's hooks, which read any entry as both roles, never
+    /// see one.
+    pub fn arm_roles(&self, roles: Arc<dyn PidRoles>) {
+        *self.0.roles.lock() = Arc::clone(&roles);
+        for slot in &self.0.slots {
+            let s = slot.s.lock();
+            if s.child.is_some() && s.pid != 0 {
+                if let Err(e) = roles.register_worker(s.pid) {
+                    warn!(worker = slot.kind.name(), pid = s.pid, error = %e,
+                        "the worker's pid is not in PROTECTED_PIDS: the deny hooks do not defend it");
+                }
+            }
+        }
     }
 
     fn slot(&self, kind: WorkerKind) -> Option<&Slot> {
@@ -599,7 +625,7 @@ impl Workers {
                 stderr,
             }) => {
                 let pid = child.id();
-                if let Err(e) = self.0.roles.register_worker(pid) {
+                if let Err(e) = self.roles().register_worker(pid) {
                     // still sandboxed; only root's signals reach it now
                     warn!(worker = kind.name(), pid, error = %e,
                         "the worker's pid is not in PROTECTED_PIDS: the deny hooks do not defend it");
@@ -997,7 +1023,7 @@ impl Workers {
     /// then reaped; one whose eviction fails stays a zombie (its pid taken)
     /// until it succeeds, reported once, signed.
     fn bury(&self, kind: WorkerKind, s: &mut SlotState) {
-        let roles = Arc::clone(&self.0.roles);
+        let roles = self.roles();
         let mut failed: Vec<(u32, String)> = Vec::new();
         s.graveyard.retain_mut(|g| {
             if ended(g.pid).is_none() {

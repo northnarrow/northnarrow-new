@@ -18,17 +18,28 @@
 //! - a message decoded encodes back to the bytes that decode to itself.
 //!
 //! The first byte chooses the request an answer is checked against (its
-//! two low bits) and its size (the rest), or the kernel's Landlock ABI a
-//! hello is checked against; the rest is the worker's packet.
+//! two low bits), its size (the next four), a name's form (the two high
+//! bits: wire, NSS text, wire with its end asked for), or the kernel's
+//! Landlock ABI a hello is checked against; the rest is the worker's
+//! packet.
 use libfuzzer_sys::fuzz_target;
 use nn_proto::ipc::{
     alpn_display, check_hello, check_response, decode, encode, max_qname_out,
-    min_dns_answer_bytes, Answer, Expected, FromWorker, QnameIn, Request, SniOut, TlsOut,
+    min_dns_answer_bytes, Answer, Expected, FromWorker, QnameForm, QnameIn, Request, SniOut, TlsOut,
     ToWorker, WorkerKind, LANDLOCK_ABI_KNOWN, MAX_ALPN, MAX_TLS_FIELD,
 };
 
 fn lower_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A name's form, from the selector's two high bits.
+fn form(sel: u8) -> QnameForm {
+    match sel >> 6 {
+        1 => QnameForm::Nss,
+        2 => QnameForm::WireFindEnd,
+        _ => QnameForm::Wire,
+    }
 }
 
 /// The request an answer is checked against.
@@ -45,8 +56,8 @@ fn request(sel: u8, answer: &Answer) -> Request {
             Request::DnsNames(
                 (0..n)
                     .map(|_| QnameIn {
-                        bytes: vec![0; (size & 0x1f) * 8],
-                        find_end: sel & 0x80 != 0,
+                        bytes: vec![0; (size & 0xf) * 8],
+                        form: form(sel),
                     })
                     .collect(),
             )
@@ -66,8 +77,12 @@ fn accepted_answer(req: &Request, answer: &Answer) {
                 assert!(o.name.len() <= max_qname_out(i.bytes.len()), "{o:?}");
                 let body = o.name.strip_suffix('…').unwrap_or(&o.name);
                 assert!(body.bytes().all(|b| (0x20..=0x7e).contains(&b)), "{o:?}");
+                assert!(i.form != QnameForm::Nss || !o.name.ends_with('…'), "{o:?}");
                 if let Some(e) = o.end {
-                    assert!(i.find_end && e != 0 && usize::from(e) <= i.bytes.len(), "{o:?}");
+                    assert!(
+                        i.form == QnameForm::WireFindEnd && e != 0 && usize::from(e) <= i.bytes.len(),
+                        "{o:?}"
+                    );
                 }
             }
         }

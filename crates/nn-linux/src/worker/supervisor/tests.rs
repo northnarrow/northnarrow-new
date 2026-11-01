@@ -321,7 +321,7 @@ fn tick_until(w: &Workers, want: Health) -> bool {
 fn names() -> Request {
     Request::DnsNames(vec![QnameIn {
         bytes: b"\x07example\x03com\x00".to_vec(),
-        find_end: false,
+        form: nn_proto::ipc::QnameForm::Wire,
     }])
 }
 
@@ -350,6 +350,42 @@ fn an_honest_worker_serves_and_its_pid_is_registered_then_evicted() {
         Err(WorkerError::Unavailable(Health::Stopped))
     );
     assert!(f.reports.lock().is_empty());
+}
+
+/// R14b: a worker started before the deny hooks is registered when they are
+/// armed, and its successors at their start.
+#[test]
+fn roles_armed_later_register_the_running_worker() {
+    let early = Arc::new(Recorder::default());
+    let reports: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let r = Arc::clone(&reports);
+    let w = Workers::new(Config {
+        launcher: Arc::new(Scripted {
+            script: Script::DieOnRequest,
+            launches: AtomicU32::new(0),
+        }),
+        roles: early.clone(),
+        report: Arc::new(move |s: &str, d: &str| r.lock().push((s.into(), d.into()))),
+        kinds: vec![WorkerKind::Parse],
+        debug_dir: None,
+    });
+    assert!(tick_until(&w, Health::Ready));
+    let first = w.status()[0].pid.unwrap();
+    let armed = Arc::new(Recorder::default());
+    w.arm_roles(armed.clone());
+    assert_eq!(*armed.registered.lock(), vec![first]);
+    // the next worker goes to the armed roles, and the dead one leaves them
+    let _ = w.request(WorkerKind::Parse, &names(), Duration::from_secs(2));
+    assert_eq!(*armed.evicted.lock(), vec![first]);
+    assert!(tick_until(&w, Health::Ready));
+    let second = w.status()[0].pid.unwrap();
+    assert_eq!(*armed.registered.lock(), vec![first, second]);
+    assert_eq!(
+        early.evicted.lock().len(),
+        0,
+        "nothing goes to the earlier roles"
+    );
+    w.stop();
 }
 
 #[test]

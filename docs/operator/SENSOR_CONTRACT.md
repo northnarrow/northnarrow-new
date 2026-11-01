@@ -80,6 +80,14 @@ the heartbeat's.
 decision from the event it replaces, which has that event's source and
 class.
 
+R14b: a `dns_query` event's name is decoded by the agent's parse worker
+(`WORKERS.md`), not by the agent's core. While the worker is down or
+disabled the events still come, with no name (`qname_partial`), and the
+core does not decode them itself: the DNS rules that match on a name are
+silent, the connects that follow are not attributed to a name, and the
+telemetry probe's DNS round finds a gap (`dns_query`'s `probe: gap`), which
+the manifest signs as any other.
+
 ## 4. The capability manifest
 
 At every boot, before `READY=1`, the agent signs what it runs with against

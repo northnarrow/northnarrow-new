@@ -12,7 +12,7 @@ Operator side: [`docs/operator/WORKERS.md`](../operator/WORKERS.md).
 | Process | Identity | Capabilities | Confinement | Holds |
 |---|---|---|---|---|
 | `northnarrow-agent`, the **core** | root; its pid in `PROTECTED_PIDS` as **protected and exempt** (`0x03`) | the unit's bounding set | the unit (`ProtectSystem=strict`, `NoNewPrivileges=true`, `LimitCORE=0`…); no Landlock: it acts on any path through `/proc/1/root` | the eBPF loader and links, the keys, the decision, the posture, the COMBAT ladder, the actuators, the signer and the chains, the admin server, the workers' supervisor |
-| the **`parse` worker** | `northnarrow-worker`; its pid **protected, not exempt** (`0x02`) | none: effective, permitted, inheritable and ambient sets empty; `no_new_privs` | seccomp allowlist; Landlock: every filesystem right handled with no rule, TCP bind/connect (ABI ≥ 4), signals and abstract sockets scoped (ABI ≥ 6); not dumpable; `RLIMIT_NPROC` 0, `RLIMIT_CORE` 0, 8 descriptors, 512 MiB of address space | nn-parse's parsers (R14b) |
+| the **`parse` worker** | `northnarrow-worker`; its pid **protected, not exempt** (`0x02`) | none: effective, permitted, inheritable and ambient sets empty; `no_new_privs` | seccomp allowlist; Landlock: every filesystem right handled with no rule, TCP bind/connect (ABI ≥ 4), signals and abstract sockets scoped (ABI ≥ 6); not dumpable; `RLIMIT_NPROC` 0, `RLIMIT_CORE` 0, 8 descriptors, 512 MiB of address space | nn-parse's parsers: the DNS pump's names (R14b, §6a) |
 | the watchdog | unchanged (root, `CAP_BPF`, `CAP_SYS_PTRACE`); `0x03` | | | |
 | `nn-admin` | the operator | | | public keys only |
 
@@ -214,6 +214,43 @@ The capability manifest carries each kind (`workers`): its state (`ready`,
 `restarting`, `disabled`, `unavailable`, `stopped`), why, the kernel's
 Landlock ABI as the core read it, and the sandbox level the worker declared.
 A worse state is signed at once as a `capability_manifest_change`.
+
+## 6a. What the parse worker parses (R14b)
+
+The core runs no parser of hostile bytes: nn-parse's parsers run in the
+parse worker only (`xtask/tests/no_parsing_in_the_core.rs`: the core's
+production sources name `nn_parse` nowhere but the worker's side).
+
+- **DNS query names.** The DNS pump copies a pass's records off the ring,
+  asks the worker for their names (`Request::DnsNames`, a name's `form`:
+  the `udp_sendmsg` sensor's wire name, the socket-buffer sensor's wire
+  bytes with the end of the name asked for, an NSS record's text), in
+  batches whose worst answer fits a frame, 250 ms each at most, then builds
+  the events from the answers the core checked. The socket-buffer sensor's
+  query type is the two bytes after the end the worker found (bounded by
+  the core to the record's bytes). Without an answer — the worker starting,
+  restarting, disabled, out of time — an event carries no name
+  (`qname_partial`), the DNS cache is not fed, and the names are counted
+  and said in the journal; the telemetry probe's DNS round finds a gap and
+  the capability manifest says so.
+- **The TLS ClientHello and DNS answers** have no producer in this build
+  (no sensor captures them); `nn_linux::worker::parse::ParseClient`'s
+  `client_hello` and `dns_answers` are the one way a producer reaches
+  them. The agent's `net::tls_parser` and nn-linux's DNS answer
+  re-exports are gone (the fuzz targets name nn-parse).
+
+**The boot.** The workers start at the head of the attach phase, before the
+sensors, so the DNS pump's first records find the worker ready; a worker's
+pid is registered in `PROTECTED_PIDS` once this boot's deny hooks are
+attached (`Workers::arm_roles`) — never in an earlier boot's map, whose
+hooks would read any entry as both roles. Until then the worker is not
+protected (root could kill it; the core would start another) and never
+exempt.
+
+**The cost**, measured in the lab (`docs/roadmap/CAPABILITY_PROGRAM.md`,
+lot 272): one round trip per pass of the DNS ring over a `SOCK_SEQPACKET`
+pair, and the worker's CPU; the overhead and soak scripts count the
+worker's CPU and memory with the agent's.
 
 ## 7. The compromised worker
 

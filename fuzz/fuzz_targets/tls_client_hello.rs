@@ -8,7 +8,7 @@
 //!   that starts with `t`;
 //! - a hello inside one record parses as that record's fragment alone.
 use libfuzzer_sys::fuzz_target;
-use northnarrow_agent::net::tls_parser::{
+use nn_parse::tls::{
     compute_ja3, compute_ja3_raw, compute_ja4, parse_client_hello,
 };
 

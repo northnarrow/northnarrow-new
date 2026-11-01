@@ -8,7 +8,7 @@ sandbox, for the work that reads bytes an attacker writes. The design is
 
 | Worker | What it does | Since |
 |---|---|---|
-| `parse` | nn-parse's parsers: the DNS query names, DNS answers, the TLS ClientHello | R14a (started), R14b (the parsing moves in) |
+| `parse` | nn-parse's parsers: the DNS query names (every DNS event's name), DNS answers, the TLS ClientHello | R14a (started), R14b (the parsing moved in) |
 
 ## 1. The `northnarrow-worker` account
 
@@ -161,7 +161,11 @@ otherwise at most one a minute, the others counted into it).
 
 After **five failures in a row** the worker's kind is **disabled**: the
 agent does without what it gives — and **never does that parsing in its own
-process instead**. It keeps starting workers at its backoff; one that stays
+process instead**. For the parse worker that means: DNS events without a
+name (`qname_partial`), no DNS attribution of the connects that follow
+them, the DNS rules that match on names silent, the telemetry probe's DNS
+round a gap (the manifest's `dns_query` source says it) and a journal line
+at most every 10 s (`DNS names left without a decode`). It keeps starting workers at its backoff; one that stays
 up 60 s enables the kind again. The manifest's state (`ready`,
 `restarting`, `disabled`, `unavailable`) changes with a signed
 `capability_manifest_change` row, a worse state at once; `nn-admin status

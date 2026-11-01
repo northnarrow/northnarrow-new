@@ -44,8 +44,10 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-/// The protocol's version: a worker that says another one is refused.
-pub const IPC_VERSION: u16 = 1;
+/// The protocol's version: a worker that says another one is refused. 2
+/// (R14b): a name's `form` (an NSS record's text), the parse worker's names
+/// in production.
+pub const IPC_VERSION: u16 = 2;
 
 /// Largest packet either side sends or accepts (plan §3.5: 64 KiB).
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -275,13 +277,25 @@ pub struct WorkerHello {
     pub sandbox: SandboxLevel,
 }
 
-/// One QNAME to decode: its wire bytes as the kernel copied them.
+/// One DNS name to decode, as the kernel copied it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QnameIn {
     pub bytes: Vec<u8>,
-    /// The record came from the socket-buffer sensor: the bytes run past
-    /// the name, and its end (where the query type follows) is asked for.
-    pub find_end: bool,
+    pub form: QnameForm,
+}
+
+/// What a name's bytes are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QnameForm {
+    /// A query's name in wire form (the `udp_sendmsg` sensor's copy).
+    Wire,
+    /// A query's name in wire form with what follows it (the socket-buffer
+    /// sensor's copy): its end, where the query type follows, is asked for.
+    WireFindEnd,
+    /// R14b: the text a process passed to systemd-resolved's NSS module
+    /// (`dns_flags::NSS`), to its first NUL: its presentation form, empty
+    /// when the name is.
+    Nss,
 }
 
 /// A decoded QNAME.
@@ -712,9 +726,12 @@ pub fn check_response(req: &Request, answer: &Answer) -> Result<(), Violation> {
                 if !qname_chars_ok(&o.name) {
                     return Err(Violation::Bounds("dns_names: name characters"));
                 }
+                if i.form == QnameForm::Nss && o.name.ends_with('…') {
+                    return Err(Violation::Bounds("dns_names: an NSS name has no pointer"));
+                }
                 match o.end {
                     None => {}
-                    Some(_) if !i.find_end => {
+                    Some(_) if i.form != QnameForm::WireFindEnd => {
                         return Err(Violation::Bounds("dns_names: an end not asked for"))
                     }
                     Some(e) if usize::from(e) > i.bytes.len() || e == 0 => {
@@ -959,7 +976,7 @@ mod tests {
         let req = Request::DnsNames(vec![
             QnameIn {
                 bytes: vec![0x01; MAX_QNAME_IN],
-                find_end: false
+                form: QnameForm::Wire
             };
             n
         ]);
@@ -979,7 +996,7 @@ mod tests {
         if let Request::DnsNames(v) = &mut over {
             v.push(QnameIn {
                 bytes: vec![0x01; MAX_QNAME_IN],
-                find_end: false,
+                form: QnameForm::Wire,
             });
         }
         assert!(over.check().is_err(), "one more does not");
@@ -989,7 +1006,7 @@ mod tests {
             req: Request::DnsNames(vec![
                 QnameIn {
                     bytes: vec![0xff; 120],
-                    find_end: true
+                    form: QnameForm::WireFindEnd
                 };
                 MAX_BATCH
             ]),
@@ -1003,7 +1020,7 @@ mod tests {
         assert!(Request::DnsNames(vec![
             QnameIn {
                 bytes: vec![],
-                find_end: false
+                form: QnameForm::Wire
             };
             MAX_BATCH + 1
         ])
@@ -1011,7 +1028,7 @@ mod tests {
         .is_err());
         assert!(Request::DnsNames(vec![QnameIn {
             bytes: vec![1; MAX_QNAME_IN + 1],
-            find_end: false
+            form: QnameForm::Wire
         }])
         .check()
         .is_err());
@@ -1028,7 +1045,11 @@ mod tests {
     fn q(bytes: &[u8], find_end: bool) -> QnameIn {
         QnameIn {
             bytes: bytes.to_vec(),
-            find_end,
+            form: if find_end {
+                QnameForm::WireFindEnd
+            } else {
+                QnameForm::Wire
+            },
         }
     }
 
@@ -1079,6 +1100,19 @@ mod tests {
             Ok(())
         );
         assert!(bad(Answer::Pong).is_err());
+    }
+
+    /// R14b: an NSS name is text: no pointer, no end.
+    #[test]
+    fn nss_results_are_checked() {
+        let req = Request::DnsNames(vec![QnameIn {
+            bytes: b"example.com".to_vec(),
+            form: QnameForm::Nss,
+        }]);
+        let ok = Answer::DnsNames(vec![name("example.com", None)]);
+        assert_eq!(check_response(&req, &ok), Ok(()));
+        assert!(check_response(&req, &Answer::DnsNames(vec![name("a…", None)])).is_err());
+        assert!(check_response(&req, &Answer::DnsNames(vec![name("a", Some(1))])).is_err());
     }
 
     #[test]

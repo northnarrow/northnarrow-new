@@ -478,7 +478,7 @@ fn beneath_the_filter_each_layer_refuses_what_the_kernel_lets_it() {
 fn names() -> Request {
     Request::DnsNames(vec![QnameIn {
         bytes: b"\x07example\x03com\x00".to_vec(),
-        find_end: false,
+        form: nn_proto::ipc::QnameForm::Wire,
     }])
 }
 
