@@ -262,8 +262,30 @@ def map_pids(text):
         if isinstance(key, list):
             key = int.from_bytes(bytes(int(b, 16) for b in key), "little")
         pids.append(int(key))
-    stale = [p for p in pids if (ident(str(p)) or ("",))[0] not in PROTECTED_COMMS]
+    stale = [p for p in pids if not live_entry(p)]
     return pids, stale
+
+def parent_of(pid):
+    try:
+        with open("/proc/%s/stat" % pid) as f:
+            text = f.read()
+        return int(text[text.rindex(")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+def live_entry(pid):
+    # a live agent or watchdog; R14a (lot 272): or a worker of a live agent
+    # (its child under the worker's name, `nn-worker-<kind>`), registered
+    # with the worker's role
+    cur = ident(str(pid))
+    if cur is None:
+        return False
+    if cur[0] in PROTECTED_COMMS:
+        return True
+    if cur[0].startswith("nn-worker-"):
+        parent = parent_of(pid)
+        return parent is not None and (ident(str(parent)) or ("",))[0] == "northnarrow-age"
+    return False
 
 def cmd_map_pids():
     try:
@@ -587,6 +609,8 @@ def selftest():
             {"formatted": {"key": gone, "value": 1}}]
     pids, stale = map_pids(json.dumps(keys))
     check(pids == [os.getpid(), gone] and stale == pids, "map-pids parse and stale test")
+    # R14a: a process under a worker's name whose parent is no agent is stale
+    check(not live_entry(os.getpid()) and not live_entry(gone), "a worker only as an agent's child")
     # evidence from the signed records (NN-AUD-413): a forged comm, a
     # file name that holds "op=signal", a journal entry another unit or
     # writer made, a level word inside a field: none of them counts
@@ -1489,7 +1513,8 @@ elif selected C30 || selected C61; then
         echo "C30 PROTECTED_INODES across an agent restart → $n1 → $n2 entries; $v" >&2
     fi
     if selected C61; then
-        # "total=N stale=M[ pids=…]": stale = no live agent or watchdog at that PID
+        # "total=N stale=M[ pids=…]": stale = no live agent, watchdog or
+        # agent's worker (R14a) at that PID
         t1=$(sed -n 's/^total=\([0-9]*\).*/\1/p' <<<"$p1"); t2=$(sed -n 's/^total=\([0-9]*\).*/\1/p' <<<"$p2")
         s2=$(sed -n 's/.* stale=\([0-9]*\).*/\1/p' <<<"$p2")
         if [[ -z "$t1" || -z "$t2" || -z "$s2" ]]; then v="DEVIATION (map unreadable: '$p1' / '$p2')"; fail=1
