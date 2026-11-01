@@ -77,7 +77,7 @@ wait_alert() {
   local since=$1 kind=$2 within=$3 t
   local end=$((SECONDS + within))
   while ((SECONDS < end)); do
-    t=$(awk -v s="$since" -v k="ALERT $kind" '$1 >= s && index($0, k) {print $1; exit}' "$OUT/watch.log")
+    t=$(awk -v s="$since" -v k="ALERT ($kind)" '$1 >= s && $0 ~ k {print $1; exit}' "$OUT/watch.log")
     [[ -n $t ]] && { echo "$t"; return 0; }
     sleep 1
   done
@@ -122,8 +122,11 @@ echo live > "$MODE"; wait_ok "$(now)" 30 || true
 # 2. a beat altered on the way
 scenario tamper TAMPERED 30 sh -c "echo tamper > '$MODE'"
 echo live > "$MODE"; wait_ok "$(now)" 30 || true
-# 3. the agent frozen (its cgroup), thawed after the alert
-scenario freeze SILENT 180 g 'sudo systemctl freeze northnarrow-agent'
+# 3. the agent frozen (its cgroup), thawed after the alert — SILENT past
+#    the bound, or, when the watchdog ends the freeze first (it restarts a
+#    frozen agent: round i, ~72 s), DEGRADED: a new run with no stop beat,
+#    or a beat late after the one before it
+scenario freeze 'SILENT|DEGRADED' 180 g 'sudo systemctl freeze northnarrow-agent'
 g 'sudo systemctl thaw northnarrow-agent'; wait_ok "$(now)" 120 || true
 # 4. the network cut: SSH dropped in the guest for 150 s
 scenario netcut SILENT 180 g 'sudo systemd-run --quiet --on-active=150 iptables -D INPUT -p tcp --dport 22 -j DROP && sudo iptables -I INPUT -p tcp --dport 22 -j DROP'
