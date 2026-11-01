@@ -55,7 +55,7 @@ step() { # name start result(ok|FAIL: …)
 
 KEY=$(g 'for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r $k && { echo $k; break; }; done' | tr -d '\r')
 [[ -n $KEY ]] || { echo "no lab admin key on the guest" >&2; exit 1; }
-AUDIT=/var/lib/northnarrow/audit.log
+AUDIT=/etc/northnarrow/audit.log
 GRUB_CFG=/etc/default/grub.d/99-nn-bpf-lsm.cfg
 DROPIN_DIR=/etc/systemd/system/northnarrow-agent.service.d
 DROPIN=$DROPIN_DIR/zz-r13-lab-degraded.conf
@@ -243,7 +243,7 @@ print("L%s; not invoked: %s; on a fallback: %s; bpf_lsm %s" % (m["trust_level"],
     step degraded-start "$t" "FAIL: the degraded start did not settle"
   fi
   if a=$(wait_manifest_alert "$t" 240); then
-    step verifier-nobpf "$t" "ok: DEGRADED at $a: $(grep -m1 'capability manifest changed' "$OUT/watch.log" | cut -c1-200)"
+    step verifier-nobpf "$t" "ok: DEGRADED at $a: $(grep "^$a" "$OUT/watch.log" | grep -o 'the capability manifest changed[^;]*' | head -1)"
   else
     step verifier-nobpf "$t" "FAIL: no manifest alert within 240 s"
   fi
