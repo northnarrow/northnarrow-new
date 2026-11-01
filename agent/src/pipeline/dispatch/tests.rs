@@ -645,6 +645,10 @@ fn a_kill_of_a_reused_pid_is_not_merged_into_the_old_owner_s() {
         .collect();
     assert_eq!(starts, [1_000, 9_000]);
     assert_eq!(sink.queued_for_test().len(), 2);
+    // the same action on the same pid is a repeat only for the same start
+    let job = |d: &Arc<Decided>, start| ResponseJob::of(d, Some(4242), start, start).remove(0).1;
+    assert!(!job(&a, 1_000).same_action(&job(&b, 9_000)));
+    assert!(job(&a, 1_000).same_action(&job(&b, 1_000)));
 }
 
 /// Review of #476 (its mutation K11): two strips of one process's two
