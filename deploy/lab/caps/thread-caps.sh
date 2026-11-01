@@ -51,7 +51,17 @@ FILTER='comm ~ "nn-*" || comm ~ "tokio-runtime*" || comm ~ "northnarrow-ag*"'
 UNIT_IDS="101 311 246 320 175 313 176 167 168 169 165 166 155 323 304"
 DECISION_IDS="126 59 322 321 101 310 311 438"
 ors() { local f= i; for i in "$@"; do f="$f${f:+ || }id == $i"; done; echo "$f"; }
-CALLS="(($FILTER) && ($(ors $UNIT_IDS))) || (comm == \"nn-decision\" && ($(ors $DECISION_IDS)))"
+# the programs the agent starts run under the unit's filter too
+CHILDREN='comm == "nft" || comm ~ "iptables*" || comm ~ "ip6tables*" || comm ~ "xtables*" || comm == "rpm" || comm ~ "northnarrow-sca*"'
+CALLS="(($FILTER || $CHILDREN) && ($(ors $UNIT_IDS))) || (comm == \"nn-decision\" && ($(ors $DECISION_IDS)))"
+# who a name is: the lab's own tools match nn-* too
+WHO='function who(t) {
+    if (t ~ /^(nn-admin|nn-link-probe|nn-iou-probe|nn-modld|nn-exp13)/) return "lab tool"
+    if (t ~ /^(nft|iptables|ip6tables|xtables|rpm|northnarrow-sca)/) return "agent child"
+    if (t ~ /^nn-worker-/) return "worker"
+    return "agent"
+}'
+
 
 # x86_64: cap_capable(cred, ns, cap, opts) — cap in %dx, opts in %cx
 probes_off() {
@@ -70,6 +80,10 @@ start)
     grep -qw cap_capable /proc/kallsyms || die "cap_capable not in kallsyms"
     probes_off
     echo 8192 > "$T/buffer_size_kb"
+    # the names of the sys_enter lines come from the trace's pid → name
+    # cache: large enough for an exec storm (set back at stop)
+    cat "$T/saved_cmdlines_size" > "$DIR/cmdlines.old" 2>/dev/null
+    echo 32768 > "$T/saved_cmdlines_size" 2>/dev/null || echo 8192 > "$T/saved_cmdlines_size"
     echo > "$T/trace"
     # the name from the event itself ($comm): the trace's own pid → name
     # cache forgets names under an exec storm
@@ -99,8 +113,9 @@ stop)
     fi
     grep -h overrun "$T"/per_cpu/cpu*/stats 2>/dev/null | awk '{s+=$2} END {print s+0}' > "$DIR/overrun"
     probes_off
+    [[ -s $DIR/cmdlines.old ]] && cat "$DIR/cmdlines.old" > "$T/saved_cmdlines_size"
     date -u +%FT%TZ > "$DIR/stopped"
-    awk '
+    awk "$WHO"'
         BEGIN {
             split("CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER FSETID KILL SETGID SETUID SETPCAP LINUX_IMMUTABLE NET_BIND_SERVICE NET_BROADCAST NET_ADMIN NET_RAW IPC_LOCK IPC_OWNER SYS_MODULE SYS_RAWIO SYS_CHROOT SYS_PTRACE SYS_PACCT SYS_ADMIN SYS_BOOT SYS_NICE SYS_RESOURCE SYS_TIME SYS_TTY_CONFIG MKNOD LEASE AUDIT_WRITE AUDIT_CONTROL SETFCAP MAC_OVERRIDE MAC_ADMIN SYSLOG WAKE_ALARM BLOCK_SUSPEND AUDIT_READ PERFMON BPF CHECKPOINT_RESTORE", n, " ")
             for (i = 1; i <= 41; i++) name[i - 1] = n[i]
@@ -131,24 +146,24 @@ stop)
             k = pend[TID]; delete pend[TID]; seen[k] = 1
             if (ret == "0") g[k]++; else d[k]++
         }
-        END { for (k in seen) printf "%s\t%d\t%d\n", k, g[k], d[k] }
-    ' "$DIR/trace.raw" | sort > "$DIR/checks.tsv"
-    { printf 'thread\tcapability\tkind\tgranted\trefused\n'; cat "$DIR/checks.tsv"; } > "$DIR/checks.tsv.new"
+        END { for (k in seen) { split(k, kk, "\t"); printf "%s\t%s\t%d\t%d\n", who(kk[1]), k, g[k], d[k] } }
+    ' "$DIR/trace.raw" | sort -t "$(printf '\t')" -k2 > "$DIR/checks.tsv"
+    { printf 'who\tthread\tcapability\tkind\tgranted\trefused\n'; cat "$DIR/checks.tsv"; } > "$DIR/checks.tsv.new"
     mv "$DIR/checks.tsv.new" "$DIR/checks.tsv"
     # sys_enter: "NR <id> (args)"; the thread's name from the trace's cache
-    awk '
+    awk "$WHO"'
         / sys_enter: NR / {
             f = $1; sub(/-[0-9]+$/, "", f); sub(/-[0-9]+$/, "-*", f)
             for (i = 2; i <= NF; i++) if ($i == "NR") { n[f "\t" $(i + 1)]++; break }
         }
-        END { for (k in n) printf "%s\t%d\n", k, n[k] }
+        END { for (k in n) { split(k, kk, "\t"); printf "%s\t%s\t%d\n", who(kk[1]), k, n[k] } }
     ' "$DIR/trace.raw" | sort > "$DIR/calls.tsv"
-    { printf 'thread\tsyscall\tcalls\n'; cat "$DIR/calls.tsv"; } > "$DIR/calls.tsv.new"
+    { printf 'who\tthread\tsyscall\tcalls\n'; cat "$DIR/calls.tsv"; } > "$DIR/calls.tsv.new"
     mv "$DIR/calls.tsv.new" "$DIR/calls.tsv"
     echo "refused calls made: $(($(wc -l < "$DIR/calls.tsv") - 1)) kinds"
     cat "$DIR/calls.tsv"
     echo "$(wc -l < "$DIR/trace.raw") trace lines, $(cat "$DIR/overrun") lost; refused audited checks:"
-    awk -F'\t' 'NR > 1 && $3 == "audited" && $5 > 0' "$DIR/checks.tsv"
+    awk -F'\t' 'NR > 1 && $4 == "audited" && $6 > 0' "$DIR/checks.tsv"
     ;;
 census)
     TAG=${3:-now}
