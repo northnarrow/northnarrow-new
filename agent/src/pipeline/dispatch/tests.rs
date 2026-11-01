@@ -599,3 +599,12 @@ fn responses_not_run_raise_telemetry_loss() {
         nn_model::posture_types::PostureKind::Alerted
     );
 }
+
+/// The thread's end is seen: running until the stop, not after.
+#[test]
+fn the_dispatcher_says_whether_its_thread_runs() {
+    let (d, _journal, _sink) = dispatcher(true, 8);
+    assert!(d.is_running());
+    d.stop(Duration::from_millis(10));
+    assert!(!d.is_running());
+}

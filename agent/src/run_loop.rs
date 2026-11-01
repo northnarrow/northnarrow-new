@@ -324,7 +324,7 @@ async fn watch_loop(
     audit_log: &AuditHandle,
     signals: &mut Signals,
     ctl: &DecisionControl,
-    #[cfg_attr(not(feature = "debug-trigger"), allow(unused_variables))] dispatcher: &Dispatcher,
+    dispatcher: &Dispatcher,
 ) -> &'static str {
     let Combat {
         #[cfg(feature = "debug-trigger")]
@@ -358,6 +358,18 @@ async fn watch_loop(
                 debug_stall_loop(&cli.admin_socket, ctl);
                 #[cfg(feature = "debug-trigger")]
                 debug_crash_mid_action(&cli.admin_socket, dispatcher);
+                // R12c (lab PR 270): the response dispatcher's thread ended —
+                // no response runs (each is answered "not run" and counted);
+                // as a dead pump: signed, and the agent stops for a restart.
+                if !dispatcher.is_running() {
+                    error!("the response dispatcher's thread ended — stopping so the watchdog restarts the agent");
+                    attest_degraded_at(
+                        audit_log.as_ref(),
+                        "response dispatcher exited (responses were not run; the agent stops for a watchdog restart)",
+                        false,
+                    );
+                    return "response_dispatcher_exited";
+                }
                 let dead = sensor.finished_pumps();
                 if !dead.is_empty() {
                     // A blind sensor is not hidden behind a silent restart:

@@ -506,6 +506,11 @@ impl Dispatcher {
         s.ready.notify_one();
     }
 
+    /// Its thread runs (false once it ended: the stop's, or a panic).
+    pub(crate) fn is_running(&self) -> bool {
+        self.shared.running.load(Ordering::Acquire)
+    }
+
     /// The counts.
     pub(crate) fn status(&self) -> DispatchStatus {
         let s = &self.shared;
@@ -665,8 +670,24 @@ fn lane_of_job(job: &ResponseJob) -> usize {
         .unwrap_or(0)
 }
 
+/// Marks the thread not running however it ends (a panic outside the
+/// executor's — which is caught —, the stop): from then on a response is
+/// answered "not run" and counted, and the event loop stops the agent
+/// (`Dispatcher::is_running`, as for a dead sensor pump).
+struct Exit<'a>(&'a Shared);
+
+impl Drop for Exit<'_> {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::Release);
+        if std::thread::panicking() {
+            error!("the response dispatcher's thread panicked — responses no longer run");
+        }
+    }
+}
+
 /// The dispatcher's thread: a batch at a time, intents first.
 fn run(s: &Shared) {
+    let _exit = Exit(s);
     loop {
         let batch: Vec<TakenJob<ResponseJob>> = {
             let mut q = s.queue.lock();
