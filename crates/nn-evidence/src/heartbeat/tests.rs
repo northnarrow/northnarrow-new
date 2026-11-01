@@ -596,16 +596,36 @@ fn a_late_beat_says_the_agent_stood_still() {
     c.push(b);
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(401), &cfg());
     assert!(r.alerts.is_empty(), "{r:?}");
+    // a clean stop and the next run's start, both new in one fetch: not a
+    // death either
+    let s = r.state.unwrap();
+    c.push(beat(7, 430));
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(431), &cfg());
+    assert!(r.alerts.is_empty(), "{r:?}");
+    let s = r.state.unwrap();
+    let mut stop = beat(8, 440);
+    stop.kind = BeatKind::Stop;
+    stop.run = "bbbbbbbbbbbbbbbb".into();
+    stop.stop_reason = Some("admin_shutdown".into());
+    c.push(stop);
+    let mut b = beat(9, 450);
+    b.kind = BeatKind::Start;
+    b.run = "dddddddddddddddd".into();
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(451), &cfg());
+    assert!(r.alerts.is_empty(), "{r:?}");
     // a restart with no stop beat before it (killed, crashed, frozen and
     // restarted by the watchdog — the lab's freeze): DEGRADED, however
     // soon it came back
     let s = r.state.unwrap();
-    c.push(beat(7, 430));
-    let mut b = beat(8, 470);
+    let mut b = beat(10, 470);
+    b.run = "dddddddddddddddd".into();
+    c.push(b);
+    let mut b = beat(11, 480);
     b.kind = BeatKind::Start;
     b.run = "cccccccccccccccc".into();
     c.push(b);
-    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(471), &cfg());
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(481), &cfg());
     assert_eq!(kinds(&r), ["DEGRADED"], "{r:?}");
     assert!(
         r.alerts[0].detail().contains("without a clean stop"),
