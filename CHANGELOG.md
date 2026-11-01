@@ -38,8 +38,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `ok` rests on (`evidence`), and the probe's word goes `stale` when its
   rounds stop; the capabilities hash leaves out the contract's terms
   (`contract_hash`: an upgrade alone is a `NOTICE` of the verifier's, not
-  DEGRADED); change rows are signed at most once a minute, every change
-  counted, the terms by reference.
+  DEGRADED; the agent's version, the contract's version or the kernel's
+  release going backwards is DEGRADED); a change row for a worse state is
+  signed at once, one for a better state (or a state signed within the
+  minute) at most once a minute, every change counted, the terms by
+  reference.
 - The signed heartbeat and its minimal external verifier (lab PR 270, Wave
   4 phase 2, R12c-2 of the restructure plan; report 06 INI-14;
   `docs/operator/HEARTBEAT.md`, `docs/architecture/EVENT_BUS.md` §5). A beat

@@ -98,7 +98,7 @@ What R13 adds to the row (`manifest_version` 2):
 |---|---|
 | `sensors[].took` | how the attach code took each attach point: `whole`, `partial` (with what did not attach), `fallback`, `off`, `absent` |
 | `contract_version`, `contract_hash` | the contract's version (1), and the hash of its terms, the agent's version and the kernel's release |
-| `sources` | one entry per source: `source`, `classes`, `attach` (as the boot noted it, `not attached` without), `on` (`primary`, `fallback`, `none`), `state`, `why` (the boot's reasons and the degradations recorded about it), `probe` (the telemetry probe's word: `pending`, `seen`, `gap`, `stale`; absent for a source it does not exercise), `evidence` (what its `ok` rests on: `probe`, `self_test`, `attach_only`), `terms` (its contract, as in §3: in the boot's row; a change's row names them by `contract_hash`) |
+| `sources` | one entry per source: `source`, `classes`, `attach` (as the boot noted it, `not attached` without), `on` (`primary`, `fallback`, `none`), `state`, `why` (the boot's reasons and the degradations recorded about it), `probe` (the telemetry probe's word: `pending`, `seen`, `gap`, `stale`; absent for a source it does not exercise), `evidence` (what its `ok` rests on: `probe`, `self_test`, `attach_only`; `fs_protect`'s `self_test` is the deny self-test's one hook, `task_kill`, of the sixteen: the other fifteen rest on their attach), `terms` (its contract, as in §3: in the boot's row; a change's row names them by `contract_hash`) |
 | `classes` | one entry per class: its queue, capacity, full-queue policy, decision budget, sources, strongest verdict, worst failure, loss stages, and `state`, the worst of its sources' |
 | `fallbacks` | each source on a fallback, with its attach point |
 | `missing` | each deny or observe hook not attached, and each source not `ok` (with its first reason) |
@@ -141,22 +141,36 @@ its own row kept), the telemetry probe's first round, a gap, its end, its
 word going stale, an adapter that ended, a shipped list given way to its
 built-in copy. The running agent builds the manifest every 5 s (and for
 each status and each beat): a change shows at once in the status and the
-beats; its `capability_manifest_change` row is signed at most once a minute
-— the changes in between folded into it, counted (`changes`) and named,
-even those undone before the row —, and at once for an adapter that ended
-and at the stop.
+beats. Its `capability_manifest_change` row is signed **at once** when the
+state is worse — a source in a worse state or gone, a probe's word turned
+`gap` or `stale`, a line new in `missing`, `fallbacks`, the degradations,
+the content or the deny hooks' missing ones, fewer deny hooks, a lower
+trust level — unless the same state was signed within the minute (an
+oscillation): a real loss's row does not wait, nor die with a crash in the
+minute. A better state's row, and an oscillation's, is signed at most once
+a minute — the changes in between folded into it, counted (`changes`) and
+named, even those undone before the row —; an adapter that ended and the
+stop sign at once.
 
 ## 5. Off the host
 
 Every heartbeat carries the newest view as `capabilities`: its `hash`, the
-last `revision` signed, `settled` and `contract` (`HEARTBEAT.md`). `nn-admin
-heartbeat watch` remembers the last settled hash it saw and says
+last `revision` signed, `settled`, `contract`, `contract_version` and
+`kernel` (`HEARTBEAT.md`). `nn-admin heartbeat watch` remembers the last
+settled hash it saw and says
 **`DEGRADED`** when a settled hash differs from it — "the capability
 manifest changed" (within a run) or "… changed across a restart" (a new run
 that attaches otherwise: an LSM list without `bpf`, a sensor on its
 fallback, a probe gone silent or stale) — naming both hashes and the
 revision. A change of `contract` alone — an upgrade, a new kernel — is a
-**`NOTICE`** line, no alert: a fleet's upgrade does not page anyone. A run
+**`NOTICE`** line, no alert: a fleet's upgrade does not page anyone. The
+beat carries the contract's version and the kernel's release beside it, and
+the verifier checks that they and the agent's version each advanced or
+stayed: one going backwards (a downgrade to an older agent, whose terms may
+be weaker; a boot on an older kernel) or one not known to be newer (a
+kernel's other flavour, a pre-release tag) is **`DEGRADED`** "the sensor
+contract changed backwards", naming it. Two builds that carry the same
+versions are told apart by the hash alone: a `NOTICE`. A run
 whose manifest has not settled 120 s after its start, and a beat without
 the field after beats that had it, are `DEGRADED` too. The first check
 anchors what it sees. On the host, `nn-admin capabilities --key` names the
@@ -173,16 +187,18 @@ child is the agent's own binary run with `--telemetry-probe`, which a root
 watching the execs can recognise and serve, re-arming what it disarmed for
 the probe's few milliseconds; kprobes can be switched off as a whole through
 debugfs (`/sys/kernel/debug/kprobes/enabled`); and the ten sources the probe
-does not exercise (`evidence: attach_only`, the deny hooks' `self_test` one
-hook at the boot) are never verified again after their attach. Against a
+does not exercise (`evidence: attach_only`; `fs_protect`'s `self_test` is
+one deny hook of sixteen, at the boot) are never verified again after their
+attach. Against a
 root on the host the deny hooks (the agent's own files, maps and processes)
 and the heartbeat's verifier off the host are the defence: the manifest
 says what the agent can see, not what it cannot.
 
 **Worst-case delays** for a probed source blinded at random: its next
 round within 72 s (60 s, +20 % jitter), its deadline 5 s, the next build
-5 s — about **82 s to the signed row** (one more minute when another change
-row was signed in the minute before: the rows are coalesced); then the
+5 s — about **82 s to the signed row** (a worse state is signed at that
+build, whatever row came before it; an oscillation already signed in the
+minute waits for the next row); then the
 next beat (30 s) and the verifier's next check (its timer, 30 s in the
 example of `HEARTBEAT.md`) — about **2.4 minutes to `DEGRADED`** off the
 host. A probe whose rounds stop is `stale` after 149 s. For the sources the

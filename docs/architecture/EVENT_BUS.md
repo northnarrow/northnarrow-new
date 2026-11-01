@@ -951,8 +951,10 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   loses; an LSM opt-in configured without `bpf` is said inert; each source
   says what its `ok` rests on (`evidence`); the probe's word goes `stale`
   when its rounds stop; the capabilities hash leaves out the contract's
-  terms (`contract_hash`, a NOTICE off the host when it changes alone);
-  change rows at most once a minute, every change counted.
+  terms (`contract_hash`, a NOTICE off the host when it changes alone and
+  no version went backwards, DEGRADED when one did); a worse state's change
+  row at once, a better state's at most once a minute, every change
+  counted.
 - **Open after R13** — the health class has no event yet (the manifest,
   the probe and the beats carry the sensors' health); the probe exercises
   three sources (process spawn, file open, DNS): the other ten are judged
