@@ -17,7 +17,8 @@
 # `systemctl freeze`/`thaw` of the agent's unit (frozen), SSH dropped in the
 # guest's firewall for 150 s with the removal scheduled inside it (the
 # network cut), SIGTERM to the watchdog and the agent through a trusted-
-# installer window (the stop: its signed stop beat), and their start again.
+# installer window (the stop: its signed stop beat), the actions chain's
+# last row cut while it is stopped (the cut tail), and their start again.
 # Output: watch.log (every line the verifier printed, UTC-stamped),
 # scenarios.tsv (scenario, start, first expected alert, seconds), and
 # summary.txt. Exit 0 when every scenario alerted as expected.
@@ -121,10 +122,20 @@ g 'sudo systemctl thaw northnarrow-agent'; wait_ok "$(now)" 120 || true
 # 4. the network cut: SSH dropped in the guest for 150 s
 scenario netcut SILENT 180 g 'sudo systemd-run --quiet --on-active=150 iptables -D INPUT -p tcp --dport 22 -j DROP && sudo iptables -I INPUT -p tcp --dport 22 -j DROP'
 wait_ok "$(now)" 240 || true
-# 5. the agent stopped (SIGTERM through a trusted-installer window): its
-#    signed stop beat; then started again (a start beat, a new run)
+# 5. actions in the actions chain (a process exec'd from /tmp, killed by
+#    R001), and a beat that names the chain's new head
+g 'cp /bin/sleep /tmp/nn-hb-kill && { /tmp/nn-hb-kill 30 & } ; sleep 3; rm -f /tmp/nn-hb-kill' >/dev/null 2>&1 || true
+sleep 40
+# 6. the agent stopped (SIGTERM through a trusted-installer window): its
+#    signed stop beat
 scenario stop STOPPED 60 g 'k=$(for f in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r $f && { echo $f; break; }; done); sudo /usr/local/bin/nn-admin trusted-installer-grant --key $k --window-secs 120 >/dev/null && sudo systemctl kill -s SIGTERM northnarrow-watchdog && sleep 1 && sudo systemctl kill -s SIGTERM northnarrow-agent'
-g 'sudo systemctl start northnarrow-agent northnarrow-watchdog'; wait_ok "$(now)" 120 || true
+# 7. while it is stopped (the window still open), the actions chain's last
+#    row cut from its active file — root removing the record of an action
+#    — then the agent started again: its start beat names a head behind
+#    the one seen (or none, if the cut chain does not open)
+scenario cut-tail REPLAY 120 g 'sudo python3 -I -c "import os; p=\"/var/lib/northnarrow/detections/actions.jsonl\"; d=open(p,\"rb\").read().rstrip(b\"\\n\"); i=d.rfind(b\"\\n\"); os.truncate(p, i + 1 if i >= 0 else 0); print(os.path.getsize(p))"; sudo systemctl start northnarrow-agent northnarrow-watchdog'
+g 'sudo systemctl start northnarrow-agent northnarrow-watchdog' >/dev/null 2>&1 || true
+wait_ok "$(now)" 120 || true
 sleep 10
 kill "$WPID" 2>/dev/null; trap - EXIT
 {

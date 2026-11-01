@@ -511,17 +511,26 @@ pub fn check(
             }
         }
         for (chain, seen) in &l.heads {
-            if let Some(h) = newest.heads.iter().find(|h| &h.chain == chain) {
-                if h.went_back(seen) {
-                    out.alerts.push(Alert::Replay(format!(
-                        "the {chain} chain's head went back: {} {} seen, now {} {} (a tail \
-                         cut from the chain, or the chain rolled back, on the host)",
-                        seen.at(),
-                        short(&seen.hash),
-                        h.at(),
-                        short(&h.hash)
-                    )));
-                }
+            let Some(h) = newest.heads.iter().find(|h| &h.chain == chain) else {
+                // a chain whose head was in the beats is gone from them: the
+                // agent could not open it (cut, removed, its key refused)
+                out.alerts.push(Alert::Replay(format!(
+                    "the {chain} chain's head, {} {} seen, is not in the beat any more (the \
+                     chain not open on the host: cut, removed, or refused)",
+                    seen.at(),
+                    short(&seen.hash)
+                )));
+                continue;
+            };
+            if h.went_back(seen) {
+                out.alerts.push(Alert::Replay(format!(
+                    "the {chain} chain's head went back: {} {} seen, now {} {} (a tail cut \
+                     from the chain, or the chain rolled back, on the host)",
+                    seen.at(),
+                    short(&seen.hash),
+                    h.at(),
+                    short(&h.hash)
+                )));
             }
         }
     } else {

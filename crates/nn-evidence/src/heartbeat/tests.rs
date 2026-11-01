@@ -518,6 +518,19 @@ fn a_tail_cut_from_the_actions_chain_alerts() {
     let back = build(Some(actions(3, 9_500, 5)));
     let r = check(Ok(&back.lines()), &c.pk, Some(&s), at(91), &cfg());
     assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+    // the head gone from the beat (the chain did not open on the host)
+    let mut gone = beat(4, 90);
+    gone.heads.retain(|h| h.chain != "actions");
+    let mut gone_chain = Chain::sharing_key(&base);
+    for (i, &(f, b, h)) in heads.iter().enumerate() {
+        let mut x = beat(i as u64 + 1, 30 * i as i64);
+        x.heads.push(actions(f, b, h));
+        gone_chain.push(x);
+    }
+    gone_chain.push(gone);
+    let r = check(Ok(&gone_chain.lines()), &c.pk, Some(&s), at(91), &cfg());
+    assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+    assert!(r.alerts[0].detail().contains("not in the beat"), "{r:?}");
     // grown again: fine
     let ok = build(Some(actions(4, 900, 6)));
     let r = check(Ok(&ok.lines()), &c.pk, Some(&s), at(91), &cfg());

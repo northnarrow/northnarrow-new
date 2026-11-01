@@ -53,7 +53,7 @@ most severe alert's:
 | Exit | Alert | When | What to do |
 |---|---|---|---|
 | 13 | `TAMPERED` | a line does not verify (altered, or signed with another key), or is stamped in the future | treat the host as compromised: its chain was edited, or the key was replaced |
-| 12 | `REPLAY` | a beat older than one already seen, a fork of one, or a chain's head went back (the audit log's row, the actions chain's position: a tail cut, a rotation undone, a rewrite) | the chain was rolled back or an old export replayed: the host or the channel is lying |
+| 12 | `REPLAY` | a beat older than one already seen, a fork of one, or a chain's head went back (the audit log's row, the actions chain's position: a tail cut, a rotation undone, a rewrite) or is gone from the beat (the chain did not open on the host) | the chain was rolled back or an old export replayed: the host or the channel is lying |
 | 11 | `BROKEN` | the chain does not link, or beats are missing | beats were removed; fetch more lines (`export --count`) to tell a short fetch from a removal |
 | 10 | `SILENT` | no newer beat for two intervals plus 15 s (75 s by default; `--max-silence-secs`), or the source could not be read past that | the agent stopped, froze or was killed, the host is down, or the network is cut — go and look |
 | 15 | `STOPPED` | the agent's signed `stop` beat (an admin shutdown, a host shutdown), and every check while it stays stopped | expected only during maintenance |
