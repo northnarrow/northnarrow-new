@@ -939,11 +939,52 @@ fn read_trim(path: &Path) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// R14c: the process's confinement the unit sets, as [`limits`] names it:
+/// `no_new_privs` (`NoNewPrivileges=`), the seccomp mode (2: a filter —
+/// `SystemCallFilter=`, `SystemCallArchitectures=`, `LockPersonality=`),
+/// the core size limit (`LimitCORE=`, and the agent's own at its start).
+const LIMIT_NNP: &str = "agent no_new_privs";
+const LIMIT_SECCOMP: &str = "agent seccomp";
+const LIMIT_CORE: &str = "agent core limit";
+
+/// `field` of a `/proc/<pid>/status` body.
+fn status_field(status: &str, field: &str) -> Option<String> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))
+        .map(|v| v.trim().to_string())
+}
+
+/// The soft core size limit of a `/proc/<pid>/limits` body.
+fn core_limit(limits: &str) -> Option<String> {
+    limits
+        .lines()
+        .find_map(|l| l.strip_prefix("Max core file size"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(str::to_string)
+}
+
 /// `oom_score_adj` and cgroup limits, as `name → value`.
 fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
     let mut v = Vec::new();
     if let Some(x) = read_trim(Path::new("/proc/self/oom_score_adj")) {
         v.push(("agent oom_score_adj".to_string(), x));
+    }
+    // R14c: the process's (its first thread's: the decision thread's own
+    // filter is that thread's)
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for (name, field) in [(LIMIT_NNP, "NoNewPrivs"), (LIMIT_SECCOMP, "Seccomp")] {
+            if let Some(x) = status_field(&status, field) {
+                v.push((name.to_string(), x));
+            }
+        }
+    }
+    if let Some(x) = std::fs::read_to_string("/proc/self/limits")
+        .ok()
+        .as_deref()
+        .and_then(core_limit)
+    {
+        v.push((LIMIT_CORE.to_string(), x));
     }
     if let Some(pid) = read_trim(watchdog_pidfile).and_then(|p| p.parse::<u32>().ok()) {
         if let Some(x) = read_trim(&PathBuf::from(format!("/proc/{pid}/oom_score_adj"))) {
@@ -1311,6 +1352,35 @@ fn expected_limits(cap_binds: bool) -> Vec<ExpectedLimit> {
     if unit_directive(AGENT_UNIT, "CPUQuota").is_none() {
         push("agent cpu.max", Some("max 100000".to_string()), false);
     }
+    // R14c: the unit's confinement of the process
+    push(
+        LIMIT_NNP,
+        matches!(
+            unit_directive(AGENT_UNIT, "NoNewPrivileges"),
+            Some("true" | "yes")
+        )
+        .then(|| "1".to_string()),
+        true,
+    );
+    push(
+        LIMIT_SECCOMP,
+        [
+            "SystemCallFilter",
+            "SystemCallArchitectures",
+            "LockPersonality",
+        ]
+        .iter()
+        .any(|k| unit_directive(AGENT_UNIT, k).is_some())
+        .then(|| "2".to_string()),
+        true,
+    );
+    push(
+        LIMIT_CORE,
+        unit_directive(AGENT_UNIT, "LimitCORE")
+            .filter(|v| *v == "0")
+            .map(str::to_string),
+        true,
+    );
     // The watchdog registers later: compared when it first can be read.
     push(
         LIMIT_WATCHDOG_OOM,
@@ -2990,6 +3060,9 @@ mod tests {
                 want("agent memory.max", "11811160064", true),
                 want("agent pids.max", "512", true),
                 want("agent cpu.max", "max 100000", false),
+                want(LIMIT_NNP, "1", true),
+                want(LIMIT_SECCOMP, "2", true),
+                want(LIMIT_CORE, "0", true),
                 want("watchdog oom_score_adj", "-900", false),
             ]
         );
@@ -3013,6 +3086,9 @@ mod tests {
             ("agent pids.max", "512"),
             ("agent cpu.max", "max 100000"),
             ("agent cgroup.freeze", "0"),
+            (LIMIT_NNP, "1"),
+            (LIMIT_SECCOMP, "2"),
+            (LIMIT_CORE, "0"),
         ]);
         let f = w.observe(&boot, &expected_limits(true));
         let got: Vec<(&str, &str)> = f.iter().map(|x| (x.kind, x.detail.as_str())).collect();
@@ -3054,6 +3130,9 @@ mod tests {
                 ("agent memory.max", "11811160064"),
                 ("agent memory.high", "9663676416"),
                 ("agent pids.max", "512"),
+                (LIMIT_NNP, "1"),
+                (LIMIT_SECCOMP, "2"),
+                (LIMIT_CORE, "0"),
             ]));
             v.extend(lim(extra));
             v
@@ -3158,6 +3237,9 @@ mod tests {
                 ("agent memory.max", "11811160064"),
                 ("agent memory.high", "9663676416"),
                 ("agent pids.max", "512"),
+                (LIMIT_NNP, "1"),
+                (LIMIT_SECCOMP, "2"),
+                (LIMIT_CORE, "0"),
             ])
         };
         for (binds, ok, other) in [(false, "0", "-500"), (true, "-500", "0")] {
@@ -3202,9 +3284,99 @@ mod tests {
             "agent memory.max",
             "agent pids.max",
             "watchdog oom_score_adj",
+            LIMIT_NNP,
+            LIMIT_SECCOMP,
+            LIMIT_CORE,
         ] {
             assert!(names.iter().any(|n| n == want), "{want} missing: {names:?}");
         }
+    }
+
+    /// R14c: the unit's hardening is expected of the process — no new
+    /// privileges, a seccomp filter, no core — and read as the kernel
+    /// shows it.
+    #[test]
+    fn the_unit_s_confinement_is_expected_and_read() {
+        let want: Vec<(String, String)> = expected_limits(true)
+            .into_iter()
+            .filter(|e| [LIMIT_NNP, LIMIT_SECCOMP, LIMIT_CORE].contains(&e.name.as_str()))
+            .map(|e| {
+                assert!(e.required, "{}", e.name);
+                (e.name, e.value)
+            })
+            .collect();
+        assert_eq!(
+            want,
+            [
+                (LIMIT_NNP.to_string(), "1".to_string()),
+                (LIMIT_SECCOMP.to_string(), "2".to_string()),
+                (LIMIT_CORE.to_string(), "0".to_string()),
+            ]
+        );
+        for key in [
+            "SystemCallFilter",
+            "SystemCallArchitectures",
+            "LockPersonality",
+        ] {
+            assert!(unit_directive(AGENT_UNIT, key).is_some(), "{key}");
+        }
+        let status = "Name:\tnorthnarrow-age\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t3\n";
+        assert_eq!(status_field(status, "NoNewPrivs").as_deref(), Some("1"));
+        assert_eq!(status_field(status, "Seccomp").as_deref(), Some("2"));
+        assert_eq!(
+            status_field(status, "Seccomp_filters").as_deref(),
+            Some("3")
+        );
+        assert_eq!(status_field(status, "CapEff"), None);
+        let limits = "Limit                     Soft Limit           Hard Limit           Units     \n\
+                      Max cpu time              unlimited            unlimited            seconds   \n\
+                      Max core file size        0                    0                    bytes     \n";
+        assert_eq!(core_limit(limits).as_deref(), Some("0"));
+        assert_eq!(core_limit("Max cpu time unlimited\n"), None);
+        // this process: the fields are there
+        let own = limits_for_test();
+        assert!(own.iter().any(|(n, _)| n == LIMIT_CORE), "{own:?}");
+        assert!(own.iter().any(|(n, _)| n == LIMIT_SECCOMP), "{own:?}");
+        assert!(own.iter().any(|(n, _)| n == LIMIT_NNP), "{own:?}");
+    }
+
+    /// R14c: a process found without its confinement at boot — a filter
+    /// gone, `no_new_privs` off, a core limit raised — is drift against the
+    /// unit.
+    #[test]
+    fn a_process_without_the_unit_s_confinement_is_drift() {
+        let host = |nnp: &str, sec: &str, core: &str| {
+            lim(&[
+                ("agent oom_score_adj", "-500"),
+                ("agent cgroup", AGENT_UNIT_CGROUP),
+                ("agent memory.max", "11811160064"),
+                ("agent memory.high", "9663676416"),
+                ("agent pids.max", "512"),
+                (LIMIT_NNP, nnp),
+                (LIMIT_SECCOMP, sec),
+                (LIMIT_CORE, core),
+            ])
+        };
+        let mut w = LimitWatch::default();
+        assert!(w
+            .observe(&host("1", "2", "0"), &expected_limits(true))
+            .is_empty());
+        let mut w = LimitWatch::default();
+        let f = w.observe(&host("0", "0", "unlimited"), &expected_limits(true));
+        let got: Vec<&str> = f.iter().map(|x| x.detail.as_str()).collect();
+        assert_eq!(
+            got,
+            [
+                "agent core limit: expected 0 (unit), found unlimited",
+                "agent no_new_privs: expected 1 (unit), found 0",
+                "agent seccomp: expected 2 (unit), found 0",
+            ]
+        );
+        assert!(f.iter().all(|x| x.kind == "limit_unexpected"));
+    }
+
+    fn limits_for_test() -> Vec<(String, String)> {
+        limits(Path::new("/nonexistent/watchdog.pid"))
     }
 
     /// Lab PR 230 (D0 of the dependency plan): the overlay hash the

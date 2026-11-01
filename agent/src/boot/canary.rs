@@ -261,6 +261,8 @@ pub(crate) fn start(
                         if let Err(e) = std::thread::Builder::new()
                             .name("nn-canary-log".to_string())
                             .spawn(move || {
+                                // R14c (plan §3.1): the writer's capabilities
+                                nn_linux::caps::enter_or_report(nn_linux::caps::Role::Writer);
                                 for job in written {
                                     writer.write_trip(job);
                                 }

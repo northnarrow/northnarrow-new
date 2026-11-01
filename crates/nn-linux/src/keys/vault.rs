@@ -55,9 +55,12 @@ pub(crate) const HEADER_LEN: usize = RECORD_MAGIC.len() + 1;
 #[derive(Clone)]
 pub struct Vault(Arc<Inner>);
 
+/// The master key in its locked mapping, shared by the vault's clones.
+type MasterKey = Arc<Locked<Zeroizing<[u8; 32]>>>;
+
 struct Inner {
     path: PathBuf,
-    key: parking_lot::Mutex<Option<Arc<Locked<Zeroizing<[u8; 32]>>>>>,
+    key: parking_lot::Mutex<Option<MasterKey>>,
 }
 
 impl std::fmt::Debug for Vault {

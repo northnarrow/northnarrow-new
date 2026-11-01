@@ -429,6 +429,14 @@ anti-tamper observe hooks and degraded starts, JA3 without producer, no
 `nft`, FIM coverage, the admin socket…) go through the same
 registry and keep their shape.
 
+Lot 272 added `worker_parse` (R14a: the parse worker disabled after five
+failures in a row, its sandbox weaker than the kernel allows, a protocol
+violation — `WORKERS.md`) and `thread_caps` (R14c: a thread of the core
+left with more capabilities than its role, its seccomp filter refused,
+the loader's window not set, or the errands thread not started —
+`docs/architecture/PROCESS_MODEL.md` §8; the agent runs, with the core's
+capabilities on that thread).
+
 An operator's choice of a weaker sensor (`--exec-sensor tracepoint`,
 `--file-open-sensor tracepoint`, `--dns-sensor sendmsg`) is recorded too:
 the trust level says what runs, not why.

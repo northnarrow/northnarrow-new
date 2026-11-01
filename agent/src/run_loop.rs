@@ -150,6 +150,9 @@ pub(crate) async fn run(
                     if let Err(e) = northnarrow_agent::response::renice_this_thread(DECISION_NICE) {
                         warn!(error = %e, "the decision thread keeps the agent's CPU priority");
                     }
+                    // R14c (plan §3.1): its capabilities, for good, and its
+                    // seccomp filter (no capset, execve, bpf)
+                    nn_linux::caps::enter_or_report(nn_linux::caps::Role::Decision);
                     let _ended = Ended(&ctl);
                     let _rt = rt.enter();
                     decision_loop(&mut rx, lineage.as_ref(), &rt, &ctl, &pipeline)

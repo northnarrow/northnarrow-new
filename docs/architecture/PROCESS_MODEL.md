@@ -11,7 +11,7 @@ Operator side: [`docs/operator/WORKERS.md`](../operator/WORKERS.md).
 
 | Process | Identity | Capabilities | Confinement | Holds |
 |---|---|---|---|---|
-| `northnarrow-agent`, the **core** | root; its pid in `PROTECTED_PIDS` as **protected and exempt** (`0x03`) | the unit's bounding set | the unit (`ProtectSystem=strict`, `NoNewPrivileges=true`, `LimitCORE=0`…); no Landlock: it acts on any path through `/proc/1/root` | the eBPF loader and links, the keys, the decision, the posture, the COMBAT ladder, the actuators, the signer and the chains, the admin server, the workers' supervisor |
+| `northnarrow-agent`, the **core** | root; its pid in `PROTECTED_PIDS` as **protected and exempt** (`0x03`) | the unit's bounding set; per thread, each role's effective set (R14c, §8) | the unit (`ProtectSystem=strict`, `NoNewPrivileges=true`, `LimitCORE=0`, a system-call denylist, native calls only, the personality locked: §10); the decision thread's own seccomp filter (§8); no Landlock: it acts on any path through `/proc/1/root` | the eBPF loader and links, the keys (§9), the decision, the posture, the COMBAT ladder, the actuators, the signer and the chains, the admin server, the workers' supervisor |
 | the **`parse` worker** | `northnarrow-worker`; its pid **protected, not exempt** (`0x02`) | none: effective, permitted, inheritable and ambient sets empty; `no_new_privs` | seccomp allowlist; Landlock: every filesystem right handled with no rule, TCP bind/connect (ABI ≥ 4), signals and abstract sockets scoped (ABI ≥ 6); not dumpable; `RLIMIT_NPROC` 0, `RLIMIT_CORE` 0, 8 descriptors, 512 MiB of address space | nn-parse's parsers: the DNS pump's names (R14b, §6a) |
 | the watchdog | unchanged (root, `CAP_BPF`, `CAP_SYS_PTRACE`); `0x03` | | | |
 | `nn-admin` | the operator | | | public keys only |
@@ -105,8 +105,8 @@ upgrade unlinks it). Any one fact off and R004 judges the exec as before.
    (Landlock has no right for them on these ABIs, or the distribution's
    settings decide): the harness asserts each one killed (§7).
 
-The core takes no Landlock ruleset (it acts on any path), and seccomp only
-per thread in R14c.
+The core takes no Landlock ruleset (it acts on any path); its seccomp is
+the unit's (§10) and, on the decision thread, a filter of its own (§8).
 
 ## 4. The kernel's roles (`common::wire::pid_role`)
 
@@ -306,3 +306,90 @@ a guest: its identity and limits, the roles in `PROTECTED_PIDS`, a root
 `kill -9` refused, the roles' meaning in the hooks (a root shell registered
 with no role, the worker's or the agent's), crash, hang, kill and crash-loop
 faults.
+
+## 8. The core's threads and their capabilities (R14c, `nn_linux::caps`)
+
+The unit's `CapabilityBoundingSet=` is the process's ceiling. Linux keeps
+the effective, permitted and inheritable sets per thread: `capset(2)`
+changes the calling thread only, and a thread starts with its creator's.
+Each thread with a role keeps effective only what the role needs, from
+its first line (`caps::enter`, said in the journal: `thread capabilities:
+role …`):
+
+| Role | Threads | Effective | Permitted | Why |
+|---|---|---|---|---|
+| decision | `nn-decision` | `CAP_SYS_PTRACE` | the same, for good | it reads `/proc/<pid>/exe` of the process it judges (the rules' trusted actor, the COMBAT guard, the lineage), which `ptrace_may_access` refuses for another user's or a more privileged process without it |
+| actuator | `nn-response-*`, `nn-response-watch` | `CAP_KILL CAP_NET_ADMIN CAP_SETFCAP CAP_DAC_OVERRIDE CAP_SYS_PTRACE` | the bounding set | kill, `pidfd_send_signal`, `cgroup.kill`; nft and iptables; the strip; quarantine; `/proc/1/root` and the target's `/proc/<pid>/exe` (plan §3.2's own entry for `CAP_SYS_PTRACE`) |
+| writer | `nn-canary-log` | `CAP_LINUX_IMMUTABLE` | the bounding set | the state directory's `chattr +i` lifted for a new chain file |
+| supervisor | `nn-workers` | `CAP_SETUID CAP_SETGID CAP_KILL CAP_BPF` | the bounding set | the worker's account, set in the child before `exec`; the worker's signals (another user); its pid's role in `PROTECTED_PIDS` |
+| loader | the start's thread while the eBPF object loads, its programs attach and its maps are pinned (`caps::lower`) | `CAP_BPF CAP_PERFMON` (and `CAP_SYS_ADMIN` where the Debian drop-in grants it) | the bounding set | load, attach, pin; tracepoint attach under `perf_event_paranoid` 3 |
+| errands | `nn-errands` | `CAP_BPF` | the bounding set | what the decision's filter refuses it, done for it (below) |
+
+Every other thread — tokio's runtime, the sensors' pumps, the admin
+server's tasks, the chain writers that run on the runtime, the exec
+guards, the copy-on-first-write guard — keeps the bounding set effective.
+A runtime thread starts with the sets of the thread that made it start (a
+role's thread's `spawn_blocking`); the runtime's start hook
+(`caps::restore_core`) gives it the core's back, and so do the pumps,
+which start inside the loader's window. Only the decision gives up its
+permitted set, and it starts no thread.
+
+**The decision's filter** (`caps::filter`, on that thread only, no
+`TSYNC`): `capset`, `execve`, `execveat`, `bpf`, and — because it keeps
+`CAP_SYS_PTRACE` to read `/proc` — `ptrace`, `process_vm_readv`,
+`process_vm_writev`, `pidfd_getfd` fail with `EPERM` (on x86_64 under
+their x32 numbers too). `EPERM`, not a kill: a crafted event that steers
+the decision into one of them must not become a way to stop the agent.
+Two things the decision did itself need two of them: the module
+provenance rule's and the impact trust's `rpm -qf` on an RPM host, and
+the security tools' detector registering a tool's new process in
+`DEFENDER_PIDS`. They are its **errands** (`caps::errands`): done on
+`nn-errands`, a thread the start makes before the decision runs, the
+decision waiting for the answer as it waited for the call.
+
+**What this is not.** The threads share one address space: a thread's set
+is no wall against code that runs in the process — the worker's process
+is that wall (§1–§7). A thread's set bounds what that thread's own calls
+can do: a flaw that steers the decision into an `execve`, a `bpf` or a
+`capset`, or into another thread's action (a kill, an nft rule, a
+`chattr`), meets `EPERM`.
+
+**Measured** (`deploy/lab/caps/thread-caps.sh`): LAB-PENDING
+
+A thread left with more than its role (its sets not changed, its filter
+refused) is a signed degradation (`thread_caps`): the agent runs.
+
+## 9. The keys (R14c, `nn_linux::keys`)
+
+The evidence signing key and the quarantine's master key are loaded once,
+at the start, into the **key store** (`KeyStore`): not `Clone`, it hands
+out an `Arc<dyn Signer>` and the `Vault` (seal, open) — never the bytes.
+Each key lives in a mapping of its own (`keys::locked::Locked`):
+`mlock`ed (never swapped), `MADV_DONTDUMP` (out of any core dump, beside
+the process's `PR_SET_DUMPABLE 0` and the unit's `LimitCORE=0`), and on
+drop zeroed byte by byte before it is unlocked and unmapped; the decoded
+key file is zeroized after its move. The master key is read the first
+time the vault is used (the quarantine), into the same kind of mapping.
+Only `nn_linux::keys` names `SigningKey` and the vault's AES key
+(`xtask/tests/keys_in_one_place.rs`).
+
+## 10. The unit's hardening (R14c)
+
+`deploy/systemd/northnarrow-agent.service`, beside what it had
+(`NoNewPrivileges=true`, `ProtectSystem=strict`, `LimitCORE=0`, the
+bounding set):
+
+- `SystemCallFilter=~ptrace process_vm_writev kexec_load kexec_file_load
+  init_module finit_module delete_module swapon swapoff reboot mount
+  umount2 pivot_root userfaultfd open_by_handle_at` with
+  `SystemCallErrorNumber=EPERM` — for the agent and every program it
+  starts (nft, iptables-restore, rpm, the scanner, the workers; a
+  worker's own filter still kills on its first forbidden call);
+- `SystemCallArchitectures=native` (no x32 or i386 entry);
+- `LockPersonality=yes`.
+
+Validated in the lab: LAB-PENDING. The
+self-integrity round expects the process's `no_new_privs` 1, its seccomp
+mode 2 and its core limit 0 from the unit (`limit_unexpected` otherwise;
+`docs/operator/INSTALL_UPGRADE_UNINSTALL.md`).
+

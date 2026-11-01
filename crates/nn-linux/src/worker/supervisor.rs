@@ -543,6 +543,8 @@ impl Workers {
         std::thread::Builder::new()
             .name(SUPERVISOR_THREAD.to_string())
             .spawn(move || {
+                // R14c (plan §3.1): the supervisor's capabilities
+                crate::caps::enter_or_report(crate::caps::Role::Supervisor);
                 while !me.0.stop.load(Ordering::Acquire) {
                     #[cfg(feature = "debug-trigger")]
                     me.debug_triggers();

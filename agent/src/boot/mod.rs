@@ -164,6 +164,9 @@ pub fn main() -> Result<()> {
     // advisor's worker count first; the advisor was removed in lab PR 214.)
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // R14c (plan §3.1): a runtime thread holds the core's capabilities,
+        // whichever thread made it start (a role's thread's `spawn_blocking`)
+        .on_thread_start(nn_linux::caps::restore_core)
         .build()
         .context("building the tokio runtime")?
         .block_on(run(cli, undumpable, image))
@@ -181,6 +184,17 @@ async fn run(
     // before it produced and returns what the ones after it read; what the
     // agent keeps until it stops is this function's, as it was.
     logging::init(&cli, undumpable);
+    // R14c (plan §3.1): the decision's errands — what its filter refuses it
+    // (an `rpm` query, a `DEFENDER_PIDS` entry) — on a thread started now,
+    // from this thread's sets, before the decision thread runs.
+    if let Err(e) = nn_linux::caps::errands::start() {
+        let detail = format!(
+            "the errands thread did not start ({e}): the decision's rpm queries and \
+             DEFENDER_PIDS entries are refused by its filter"
+        );
+        tracing::error!("{detail}");
+        nn_linux::boot::degradation::report("thread_caps", &detail);
+    }
     let preflight::Preflight {
         refused,
         mut boot,
