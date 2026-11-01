@@ -861,7 +861,7 @@ mod tests {
             }
         }
         found.sort();
-        let keys = "crates/nn-linux/src/keys.rs".to_string();
+        let keys = "crates/nn-linux/src/keys/mod.rs".to_string();
         let checks = "crates/nn-linux/src/boot/checks.rs".to_string();
         assert_eq!(
             found,
@@ -881,7 +881,7 @@ mod tests {
         );
         let here = include_str!(concat!(
             env!("NN_REPO_ROOT"),
-            "/crates/nn-linux/src/keys.rs"
+            "/crates/nn-linux/src/keys/mod.rs"
         ));
         let here = &here[..here.find("\n#[cfg(test)]\nmod tests {").unwrap()];
         assert!(here.contains(
