@@ -4129,3 +4129,35 @@ only in the table below, in the same PR as the evidence.
     failed, every other gate green; mutations 41 of 41 (the six survivors
     of set B, MW6/MC1, MC2 caught once their tests were written);
     identity as `main`'s.
+  - R12c-2 — review of #478 ("merge after two small fixes"), ead52778:
+    X1, the host's clock alone decided the gravest alerts (a restart with
+    the RTC behind was REPLAY, a clock ahead of the verifier's TAMPERED):
+    beats are ordered by their numbers and links only; a beat stamped
+    before the one seen, or ahead of the verifier's clock past
+    `--max-skew-secs`, is DEGRADED; freshness on the verifier's clock from
+    when it first saw the newest beat (`seen_at` in its state), a late
+    beat within a run on `uptime_ms`. X2, `kept` missed a removed archive
+    (`holds` turned the missing file into "not known"): a file the chain
+    keeps (the active one, an archive within the retention) that is
+    missing is `kept: false`, REPLAY. An unreadable verifier state is exit
+    3, never a silent re-anchor (`--reanchor` on purpose). Tests for the
+    reviewer's V2 (the export across a rotation — no bug, untested) and V5
+    (the audit head rewritten at its row). `HEARTBEAT.md`: the key forges
+    everything (attestation is future work), `kept` covers the tail not
+    the middle, maintenance, a key change, a reinstall, `export --count`
+    on the host. Gates on ead52778: 77 suites 3,407 passed 0 failed, every
+    other gate green; mutations B10 5 of 5, B11 (V2, V5) 2 of 2; identity
+    as `main`'s. Lab (rounds l, ubuntu2204, the verifier on the WSL host):
+    the guest's clock 40 s ahead DEGRADED ("ahead of the verifier's") in
+    15.0 s, then back 40 s DEGRADED ("clock went back") in 20.1 s, a clean stop with the clock set 40 s behind and
+    a start STOPPED in 3.8 s then DEGRADED in 8.8 s — no REPLAY or
+    TAMPERED in any of the three (round l1: 15.8, 14.4, 8.7 s); the
+    actions chain's newest archive removed 6.8 s after a beat (the chain
+    at 1 MiB for the run, rotated right after the beat) REPLAY ("no longer
+    holds the head") at the next beat, 23.4 s after the removal (round
+    l1 left that case unrun: the archive glob expanded in the lab user's
+    shell, which cannot read the directory; fixed in the script).
+  - R12c-2 — open: `STOPPED` repeats at every check while stopped (the
+    doc: stop the verifier's timer for a maintenance window); the chain
+    readable by a dedicated group instead of `sudo`; `export --count`
+    through the forced command; the stall counts of R12c-3 in the beat.
