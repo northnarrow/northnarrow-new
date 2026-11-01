@@ -64,6 +64,7 @@ use rand::TryRng;
 use tracing::{debug, error, info, warn};
 
 use crate::audit::{AuditEntryDraft, AuditLog};
+use nn_core::contract::manifest::ProbeState;
 
 /// Seconds between rounds; `0` disables the probe.
 pub const INTERVAL_ENV: &str = "NN_TELEMETRY_PROBE_SECS";
@@ -135,6 +136,31 @@ pub struct TelemetryProbe {
 }
 
 impl TelemetryProbe {
+    /// R13 (lab PR 271): the probe's word on each sensor it exercises, for
+    /// the capability manifest — `Pending` until the first round ends, then
+    /// `Gap` while the sensor is in a gap, else `Seen`.
+    pub fn states(&self) -> Vec<(String, ProbeState)> {
+        let st = self.tracker.lock();
+        Sensor::ALL
+            .iter()
+            .map(|s| {
+                let state = if st.rounds == 0 {
+                    ProbeState::Pending
+                } else if st.in_gap[*s as usize] {
+                    ProbeState::Gap
+                } else {
+                    ProbeState::Seen
+                };
+                (s.name().to_string(), state)
+            })
+            .collect()
+    }
+
+    /// Rounds ended since the start.
+    pub fn rounds(&self) -> u64 {
+        self.tracker.lock().rounds
+    }
+
     /// Event tap: called for every event before the decision engine.
     pub fn observe(&self, event: &Event) {
         let mut st = self.tracker.lock();
@@ -322,7 +348,10 @@ async fn run_round(tracker: &Arc<Mutex<State>>, audit_log: Option<&Arc<Mutex<Aud
     let _ = std::fs::remove_file(&file);
     let (seen, in_gap_before) = {
         let mut st = tracker.lock();
-        let seen = st.round.take().map(|r| r.seen).unwrap_or([false; 3]);
+        #[allow(unused_mut)]
+        let mut seen = st.round.take().map(|r| r.seen).unwrap_or([false; 3]);
+        #[cfg(feature = "debug-trigger")]
+        debug_blind(&mut seen);
         st.rounds += 1;
         let before = st.in_gap;
         for s in Sensor::ALL {
@@ -360,6 +389,30 @@ async fn run_round(tracker: &Arc<Mutex<State>>, audit_log: Option<&Arc<Mutex<Aud
                 );
                 audit(audit_log, AUDIT_OP_GAP, s, &nonce, latency_ms);
             }
+        }
+    }
+}
+
+/// `debug-trigger` builds only (R13, lab PR 271: the lab's runtime change
+/// of the capability manifest): while `/run/northnarrow/debug-probe-blind`
+/// names a probed sensor (`exec`, `file_open`, `dns`; whitespace between
+/// several), each round counts that sensor's event as not seen — a gap,
+/// signed as one, until the file goes.
+#[cfg(feature = "debug-trigger")]
+fn debug_blind(seen: &mut [bool; 3]) {
+    let Some(dir) = std::path::Path::new(PROBE_DIR).parent() else {
+        return;
+    };
+    let Ok(names) = std::fs::read_to_string(dir.join("debug-probe-blind")) else {
+        return;
+    };
+    for s in Sensor::ALL {
+        if names.split_whitespace().any(|n| n == s.name()) {
+            seen[s as usize] = false;
+            warn!(
+                sensor = s.name(),
+                "debug-trigger: the telemetry probe counts this sensor as silent"
+            );
         }
     }
 }
@@ -450,6 +503,32 @@ pub fn dns_probe_packet(name: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R13 (lab PR 271): the probe's word for the manifest — pending until
+    /// a round ends, then each sensor seen or in its gap.
+    #[test]
+    fn the_probe_s_word_on_each_sensor() {
+        let probe = TelemetryProbe {
+            tracker: Arc::new(Mutex::new(State::default())),
+        };
+        let words = |p: &TelemetryProbe| -> Vec<ProbeState> {
+            p.states().into_iter().map(|(_, s)| s).collect()
+        };
+        assert_eq!(words(&probe), [ProbeState::Pending; 3]);
+        let names: Vec<String> = probe.states().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["exec", "file_open", "dns"]);
+        assert_eq!(probe.rounds(), 0);
+        {
+            let mut st = probe.tracker.lock();
+            st.rounds = 1;
+            st.in_gap = [false, false, true];
+        }
+        assert_eq!(
+            words(&probe),
+            [ProbeState::Seen, ProbeState::Seen, ProbeState::Gap]
+        );
+        assert_eq!(probe.rounds(), 1);
+    }
 
     fn spawn_event(argv: &[&str]) -> Event {
         Event::ProcessSpawn {

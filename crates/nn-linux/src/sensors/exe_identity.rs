@@ -42,20 +42,43 @@ fn offsets_resolved() -> Option<&'static str> {
     None
 }
 
-/// Attach the exec sensor: the LSM program when wanted (`want_lsm`:
-/// `--exec-sensor lsm`, the default) and loadable, else `sys_enter_execve`
-/// (`attach_tracepoint`, from the multiplexer), noted in `points`. Returns
-/// which one runs ([`EXEC_LSM_PROGRAM`]: the LSM one).
+/// Which exec sensor the start wants: the LSM program, or the tracepoint
+/// and why (R13, lab PR 271: the operator's choice, or `bpf` not in the
+/// active LSM list).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Lsm,
+    Tracepoint(&'static str),
+}
+
+/// The mode of `--exec-sensor` (`want_lsm`) on a kernel whose active LSM
+/// list has (`lsm_absent` false) or lacks `bpf`.
+pub fn mode(want_lsm: bool, lsm_absent: bool) -> Mode {
+    match (want_lsm, lsm_absent) {
+        (false, _) => Mode::Tracepoint("chosen with --exec-sensor tracepoint"),
+        (true, true) => Mode::Tracepoint(crate::sensors::contract::BPF_LSM_ABSENT),
+        (true, false) => Mode::Lsm,
+    }
+}
+
+/// Attach the exec sensor: the LSM program when wanted ([`Mode::Lsm`]:
+/// `--exec-sensor lsm`, the default, on a kernel that runs BPF LSM
+/// programs) and loadable, else `sys_enter_execve` (`attach_tracepoint`,
+/// from the multiplexer), noted in `points`. Returns which one runs
+/// ([`EXEC_LSM_PROGRAM`]: the LSM one).
 pub fn attach(
     ebpf: &mut Ebpf,
-    want_lsm: bool,
+    mode: Mode,
     points: &AttachPoints,
     attach_tracepoint: impl FnOnce(&mut Ebpf) -> Result<()>,
 ) -> Result<&'static str> {
-    if !want_lsm {
-        info!("exec sensor: tracepoint mode (--exec-sensor tracepoint) — sys_enter_execve");
+    if let Mode::Tracepoint(why) = mode {
+        info!(
+            reason = why,
+            "exec sensor: tracepoint mode — sys_enter_execve"
+        );
         attach_tracepoint(ebpf)?;
-        tracepoint_fallback(points, "chosen with --exec-sensor tracepoint");
+        tracepoint_fallback(points, why);
         return Ok("sys_enter_execve");
     }
     if let Some(missing) = offsets_resolved() {
@@ -217,6 +240,26 @@ fn lexically_normal(path: &str) -> String {
 mod tests {
     use super::*;
     use nn_model::ExeIdentity;
+
+    /// R13 (lab PR 271): the LSM program only when wanted on a kernel that
+    /// runs BPF LSM programs; else the tracepoint, and why.
+    #[test]
+    fn the_exec_sensor_s_mode() {
+        assert_eq!(mode(true, false), Mode::Lsm);
+        assert_eq!(
+            mode(true, true),
+            Mode::Tracepoint(crate::sensors::contract::BPF_LSM_ABSENT)
+        );
+        assert_eq!(
+            mode(false, false),
+            Mode::Tracepoint("chosen with --exec-sensor tracepoint")
+        );
+        assert_eq!(
+            mode(false, true),
+            mode(false, false),
+            "the operator's choice first"
+        );
+    }
 
     fn spawn_with(exe: ExeIdentity) -> Event {
         Event::ProcessSpawn {

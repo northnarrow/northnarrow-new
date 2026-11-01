@@ -106,6 +106,7 @@ pub(crate) async fn run(
     dispatcher: &Dispatcher,
     ransom_tracker: &Arc<northnarrow_agent::impact::RansomTracker>,
     signals: &mut Signals,
+    capability_manifest: &northnarrow_agent::boot::manifest::SignedManifest,
 ) -> Stopped {
     // Why the event loop ended — written as the signed `agent_stop` entry
     // below; a run that never writes it is reported by the next boot.
@@ -161,7 +162,14 @@ pub(crate) async fn run(
                 }
             };
             let reason = rt.block_on(watch_loop(
-                cli, sensor, combat, audit_log, signals, &ctl, dispatcher,
+                cli,
+                sensor,
+                combat,
+                audit_log,
+                signals,
+                &ctl,
+                dispatcher,
+                capability_manifest,
             ));
             ctl.stop.store(true, Ordering::Release);
             match decider.join() {
@@ -322,6 +330,7 @@ fn decision_loop(
 /// The event loop's own part: the telemetry tasks' liveness (SNS-001)
 /// every 5 s, the lab triggers, the signals, the admin shutdown, the
 /// decision thread's end. Returns why it ended.
+#[allow(clippy::too_many_arguments)]
 async fn watch_loop(
     #[cfg_attr(not(feature = "debug-trigger"), allow(unused_variables))] cli: &Cli,
     sensor: &SensorMultiplexer,
@@ -330,6 +339,7 @@ async fn watch_loop(
     signals: &mut Signals,
     ctl: &DecisionControl,
     dispatcher: &Dispatcher,
+    capability_manifest: &northnarrow_agent::boot::manifest::SignedManifest,
 ) -> &'static str {
     let Combat {
         #[cfg(feature = "debug-trigger")]
@@ -389,6 +399,9 @@ async fn watch_loop(
                         pumps = %names,
                         "sensor pump exited — its telemetry is lost; stopping so the watchdog restarts the agent"
                     );
+                    // R13 (lab PR 271): the sources whose adapter ended, in
+                    // a signed revision of the capability manifest
+                    capability_manifest.adapters_terminated(&dead);
                     attest_degraded_at(
                         audit_log.as_ref(),
                         &format!(

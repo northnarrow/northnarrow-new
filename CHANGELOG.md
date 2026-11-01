@@ -6,6 +6,31 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- The sensor contract and the signed capability manifest's revisions (lab
+  PR 271, Wave 4 phase 2, R13 of the restructure plan; report 06 INI-09,
+  R4-01, EXP-37; `docs/operator/SENSOR_CONTRACT.md`). Each of the thirteen
+  sources of the event bus declares its attach point and fallbacks, its
+  synchronous verdict (none, a kernel deny, a user-space deadline; and the
+  opt-in ones), its failure semantics (fail-open, fail-closed, blind), its
+  kernel budgets and their counters, its truncations with their real bytes
+  (argv 511, a DNS query 288 in wire form, a path component 31…) and the
+  rings that count its losses; each class of events derives its contract
+  from its sources and the bus (queue, full-queue policy, decision budget,
+  loss stages). Tests fail when a kind of event, a class, a pump, a drain
+  or an attach point has no entry, when a truncation is not the wire's
+  bound or a budget not the eBPF program's constant. The capability
+  manifest (`manifest_version` 2) states each source's attach, state and
+  why, the telemetry probe's word, each class, the fallbacks in use, what
+  is missing or not invoked and the shipped lists not in force from their
+  file; the running agent builds it again every 5 s and signs each change
+  as a `capability_manifest_change` row (the next revision, what changed,
+  the hash before). `nn-admin status --key` shows the newest revision (its
+  trust level and degradations are the status's) and `nn-admin
+  capabilities --key` all of it; every heartbeat carries its hash
+  (`capabilities`) and `nn-admin heartbeat watch` says `DEGRADED` when a
+  settled hash changes, within a run or across a restart. On a kernel
+  without `bpf` in its active LSM list, under the degraded-mode opt-in, the
+  exec and file-open sensors take their tracepoints, each signed.
 - The signed heartbeat and its minimal external verifier (lab PR 270, Wave
   4 phase 2, R12c-2 of the restructure plan; report 06 INI-14;
   `docs/operator/HEARTBEAT.md`, `docs/architecture/EVENT_BUS.md` §5). A beat

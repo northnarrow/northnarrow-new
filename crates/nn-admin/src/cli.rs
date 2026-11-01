@@ -3020,10 +3020,16 @@ fn capability_lines(v: &serde_json::Value) -> Vec<String> {
     };
     let mut lines = vec![
         format!(
-            "signed row        : {} (audit chain, op capability_manifest)",
+            "signed row        : {} (audit chain, op {})",
             v["entry_hash"]
                 .as_str()
-                .unwrap_or("(not signed: no audit log)")
+                .unwrap_or("(not signed: no audit log)"),
+            // R13: a revision signed while the agent runs is a change's row
+            if m["revision"].as_u64().unwrap_or(0) > 0 {
+                "capability_manifest_change"
+            } else {
+                "capability_manifest"
+            }
         ),
         format!("trust level       : L{}", s("trust_level")),
     ];
@@ -3086,6 +3092,197 @@ fn capability_lines(v: &serde_json::Value) -> Vec<String> {
     let d = list("degradations");
     lines.push(format!("degradations      : {}", d.len()));
     lines.extend(d.into_iter().map(|l| format!("  - {l}")));
+    lines.extend(contract_lines(m));
+    lines
+}
+
+/// R13 (lab PR 271): the manifest's revision, each source and class
+/// against the sensor contract, the fallbacks, what is missing, the shipped
+/// lists not in force from their file. Nothing for a manifest older than
+/// the contract.
+fn contract_lines(m: &serde_json::Value) -> Vec<String> {
+    let Some(sources) = m["sources"].as_array() else {
+        return vec![
+            "contract          : (none: an agent older than the sensor contract)".to_string(),
+        ];
+    };
+    let text = |v: &serde_json::Value| clean(v.as_str().unwrap_or("?"));
+    let mut lines = vec![format!(
+        "revision          : {} — hash {}{}; telemetry probe {}{}",
+        m["revision"],
+        text(&m["hash"]),
+        m["previous_hash"]
+            .as_str()
+            .map(|p| format!(", the one before {}", clean(p)))
+            .unwrap_or_default(),
+        text(&m["telemetry_probe"]),
+        if m["settled"] == true {
+            ""
+        } else {
+            " (first round pending)"
+        }
+    )];
+    for c in m["change"].as_array().into_iter().flatten() {
+        lines.push(format!("  - changed: {}", text(c)));
+    }
+    lines.push(format!(
+        "contract          : version {}",
+        m["contract_version"]
+    ));
+    for s in sources {
+        let probe = s["probe"]
+            .as_str()
+            .map(|p| format!(" [probe {p}]"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "source            : {:<14} {:<22} {}{probe}",
+            text(&s["source"]),
+            text(&s["state"]).replace('_', " "),
+            text(&s["attach"])
+        ));
+        for w in s["why"].as_array().into_iter().flatten() {
+            lines.push(format!("  - {}", text(w)));
+        }
+    }
+    for c in m["classes"].as_array().into_iter().flatten() {
+        let srcs: Vec<String> = c["sources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(text)
+            .collect();
+        let stages: Vec<String> = c["loss_counters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|n| n.to_string())
+            .collect();
+        lines.push(format!(
+            "class             : {} — {} {} events ({}), decision within {} ms; {}; sync \
+             verdict {}; failure {}; losses counted at stages {}",
+            text(&c["class"]),
+            text(&c["queue"]),
+            c["queue_capacity"],
+            text(&c["when_full"]),
+            c["decision_budget_ms"],
+            if srcs.is_empty() {
+                "no source".to_string()
+            } else {
+                format!(
+                    "sources {} ({})",
+                    srcs.join(", "),
+                    c["state"].as_str().unwrap_or("-").replace('_', " ")
+                )
+            },
+            text(&c["sync_verdict"]),
+            c["on_failure"].as_str().unwrap_or("-").replace('_', "-"),
+            if stages.is_empty() {
+                "-".to_string()
+            } else {
+                stages.join(", ")
+            }
+        ));
+    }
+    for (k, label) in [
+        ("fallbacks", "fallback          : "),
+        ("missing", "missing           : "),
+        ("content", "content           : "),
+    ] {
+        for x in m[k].as_array().into_iter().flatten() {
+            lines.push(format!("{label}{}", text(x)));
+        }
+    }
+    lines
+}
+
+/// R13 (lab PR 271): `status --json`'s `capabilities`: the newest
+/// revision's number, hash and row, whether it settled, the fallbacks and
+/// what is missing (`null` without a manifest or before the contract).
+fn manifest_status_json(out: &StatusOutcome) -> String {
+    let v = out
+        .capability_manifest
+        .as_deref()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok());
+    let Some(v) = v.filter(|v| v["manifest"]["sources"].is_array()) else {
+        return "null".to_string();
+    };
+    let m = &v["manifest"];
+    serde_json::json!({
+        "revision": m["revision"],
+        "hash": m["hash"],
+        "entry_hash": v["entry_hash"],
+        "settled": m["settled"],
+        "fallbacks": m["fallbacks"],
+        "missing": m["missing"],
+    })
+    .to_string()
+}
+
+/// R13 (lab PR 271): `status --key`'s lines of the signed capability
+/// manifest: its newest revision, the sources on a fallback and what is
+/// missing (`nn-admin capabilities --key` prints it whole).
+fn manifest_status_lines(out: &StatusOutcome, tty: bool) -> Vec<String> {
+    let Some(text) = out.capability_manifest.as_deref() else {
+        return vec![
+            "capabilities      : (not reported: the agent predates the manifest, or its boot has \
+             not signed it yet)"
+                .to_string(),
+        ];
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return vec![
+            "capabilities      : (the agent sent a manifest that is not JSON)".to_string(),
+        ];
+    };
+    let m = &v["manifest"];
+    let Some(sources) = m["sources"].as_array() else {
+        return vec![
+            "capabilities      : the boot's manifest, older than the sensor contract — nn-admin \
+             capabilities --key"
+                .to_string(),
+        ];
+    };
+    let count = |state: &str| sources.iter().filter(|s| s["state"] == state).count();
+    let ok = count("ok") + count("standby");
+    let fallbacks = m["fallbacks"].as_array().map_or(0, Vec::len);
+    let missing = m["missing"].as_array().map_or(0, Vec::len);
+    let hash = m["hash"].as_str().unwrap_or("");
+    let summary = format!(
+        "{ok} of {} sources ok, {fallbacks} on a fallback, {missing} missing or not invoked",
+        sources.len()
+    );
+    let mut lines = vec![format!(
+        "capabilities      : revision {} (hash {}{}, signed row {}) — {}; nn-admin \
+         capabilities --key lists them",
+        m["revision"],
+        clean(&hash[..hash.len().min(16)]),
+        if m["settled"] == true {
+            ""
+        } else {
+            ", telemetry probe pending"
+        },
+        v["entry_hash"]
+            .as_str()
+            .map(|h| clean(&h[..h.len().min(16)]))
+            .unwrap_or_else(|| "none: no audit log".to_string()),
+        if fallbacks + missing > 0 {
+            colorize(&summary, "33", tty)
+        } else {
+            summary
+        }
+    )];
+    for (k, label) in [("fallbacks", "fallback"), ("missing", "missing")] {
+        for x in m[k].as_array().into_iter().flatten() {
+            lines.push(format!("  - {label}: {}", clean(x.as_str().unwrap_or("?"))));
+        }
+    }
+    for c in m["change"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "  - changed in revision {}: {}",
+            m["revision"],
+            clean(c.as_str().unwrap_or("?"))
+        ));
+    }
     lines
 }
 
@@ -3246,7 +3443,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"telemetry_signed\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"telemetry_signed\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -3300,6 +3497,8 @@ fn print_status(out: &StatusOutcome, json: bool) {
             serde_json::to_string(&out.event_bus).unwrap_or_else(|_| "null".to_string()),
             serde_json::to_string(&out.event_bus_decision).unwrap_or_else(|_| "null".to_string()),
             serde_json::to_string(&out.response_dispatch).unwrap_or_else(|_| "null".to_string()),
+            // R13 (lab PR 271).
+            manifest_status_json(out),
             out.telemetry_signed,
         );
         return;
@@ -3342,6 +3541,10 @@ fn print_status(out: &StatusOutcome, json: bool) {
         // degraded.
         println!("{}", trust_line(out, tty));
         for line in degradation_lines(out) {
+            println!("{line}");
+        }
+        // R13 (lab PR 271): the signed capability manifest's newest revision.
+        for line in manifest_status_lines(out, tty) {
             println!("{line}");
         }
         println!("{}", exploit_guard_line(out, tty));
@@ -5370,8 +5573,9 @@ mod quorum_help_tests {
 mod flow_sock_line_tests {
     use super::{
         capability_lines, combat_evidence_line, degradation_lines, deny_fail_open_line,
-        encrypted_flow_lines, exploit_guard_line, flow_sock_line, open_flow_lines,
-        response_mode_line, telemetry_withheld, trust_line, withheld_line,
+        encrypted_flow_lines, exploit_guard_line, flow_sock_line, manifest_status_json,
+        manifest_status_lines, open_flow_lines, response_mode_line, telemetry_withheld, trust_line,
+        withheld_line,
     };
     use crate::admin_cli::StatusOutcome;
 
@@ -5755,6 +5959,109 @@ mod flow_sock_line_tests {
             assert!(text.contains(want), "missing `{want}` in:\n{text}");
         }
         assert!(!text.contains("bpffs"), "only the warnings: {text}");
+        assert!(
+            text.contains("contract          : (none: an agent older than the sensor contract)"),
+            "{text}"
+        );
+    }
+
+    /// R13 (lab PR 271): the manifest of a boot without `bpf` in its LSM
+    /// list, after a change — its revision, sources, classes, fallbacks and
+    /// what is missing in `capabilities`; the summary in `status --key` and
+    /// `status --json`.
+    #[test]
+    fn capabilities_and_status_print_the_contract_and_the_revision() {
+        let manifest = serde_json::json!({
+            "manifest_version": 2, "agent_version": "0.0.1", "kernel": "6.8.0",
+            "btf": true, "btf_offsets_resolved": 41, "btf_offsets_drifted": 0,
+            "btf_offsets_absent": [], "active_lsms": "capability,apparmor",
+            "bpf_lsm": "absent",
+            "deny_hooks": {"expected": 19, "attached": 19, "missing": [], "observe_missing": []},
+            "deny_self_test": "not_denied", "bpf_guard": "enforce",
+            "sensors": [], "host_hardening": [], "detect_only": false,
+            "degradations": [], "trust_level": 0, "trust_reasons": [],
+            "contract_version": 1,
+            "sources": [
+                {"source": "fs_protect", "classes": ["tamper"], "attach": "lsm: 19 of 19 deny hooks",
+                 "on": "primary", "state": "attached_not_invoked",
+                 "why": ["bpf is not in the active LSM list (capability,apparmor)"],
+                 "terms": {}},
+                {"source": "exec_check", "classes": ["process"],
+                 "attach": "tracepoint:syscalls/sys_enter_execve (user memory)",
+                 "on": "fallback", "state": "ok", "probe": "seen", "terms": {}}
+            ],
+            "classes": [
+                {"class": "tamper", "queue": "P0", "queue_capacity": 1024,
+                 "when_full": "wait 50 ms, then drop", "decision_budget_ms": 100,
+                 "sources": ["fs_protect"], "sync_verdict": "kernel deny on LSM task_kill",
+                 "on_failure": "fail_open", "loss_counters": [1, 2, 3, 4, 5],
+                 "state": "attached_not_invoked"},
+                {"class": "health", "queue": "P0", "queue_capacity": 1024,
+                 "when_full": "wait 50 ms, then drop", "decision_budget_ms": 100,
+                 "sources": [], "sync_verdict": "none", "loss_counters": []}
+            ],
+            "fallbacks": ["exec_check: tracepoint:syscalls/sys_enter_execve (user memory)"],
+            "missing": ["fs_protect: attached, not invoked (lsm: 19 of 19 deny hooks)"],
+            "content": ["netflow-blocklist (/x.v1): unavailable"],
+            "telemetry_probe": "every 60 s", "settled": true,
+            "revision": 2, "hash": "0123456789abcdef0123", "previous_hash": "fedc",
+            "change": ["source dns_query: telemetry probe seen → gap"]
+        });
+        let v = serde_json::json!({"entry_hash": "abcdef0123456789ff", "manifest": manifest});
+        let text = capability_lines(&v).join("\n");
+        for want in [
+            "signed row        : abcdef0123456789ff (audit chain, op capability_manifest_change)",
+            "revision          : 2 — hash 0123456789abcdef0123, the one before fedc; telemetry probe every 60 s",
+            "  - changed: source dns_query: telemetry probe seen → gap",
+            "contract          : version 1",
+            "source            : fs_protect     attached not invoked   lsm: 19 of 19 deny hooks",
+            "  - bpf is not in the active LSM list (capability,apparmor)",
+            "exec_check     ok                     tracepoint:syscalls/sys_enter_execve (user memory) [probe seen]",
+            "class             : tamper — P0 1024 events (wait 50 ms, then drop), decision within 100 ms; sources fs_protect (attached not invoked); sync verdict kernel deny on LSM task_kill; failure fail-open; losses counted at stages 1, 2, 3, 4, 5",
+            "class             : health — P0 1024 events (wait 50 ms, then drop), decision within 100 ms; no source; sync verdict none; failure -; losses counted at stages -",
+            "fallback          : exec_check: tracepoint:syscalls/sys_enter_execve (user memory)",
+            "missing           : fs_protect: attached, not invoked (lsm: 19 of 19 deny hooks)",
+            "content           : netflow-blocklist (/x.v1): unavailable",
+        ] {
+            assert!(text.contains(want), "missing `{want}` in:\n{text}");
+        }
+        let mut o = outcome(None, None, None);
+        assert!(manifest_status_lines(&o, false)[0].contains("not reported"));
+        assert_eq!(manifest_status_json(&o), "null");
+        o.capability_manifest = Some(v.to_string());
+        let l = manifest_status_lines(&o, false);
+        assert_eq!(
+            l,
+            [
+                "capabilities      : revision 2 (hash 0123456789abcdef, signed row abcdef0123456789) — 1 of 2 sources ok, 1 on a fallback, 1 missing or not invoked; nn-admin capabilities --key lists them",
+                "  - fallback: exec_check: tracepoint:syscalls/sys_enter_execve (user memory)",
+                "  - missing: fs_protect: attached, not invoked (lsm: 19 of 19 deny hooks)",
+                "  - changed in revision 2: source dns_query: telemetry probe seen → gap",
+            ]
+        );
+        let j: serde_json::Value = serde_json::from_str(&manifest_status_json(&o)).unwrap();
+        assert_eq!(j["revision"], 2);
+        assert_eq!(j["entry_hash"], "abcdef0123456789ff");
+        assert_eq!(
+            j["missing"][0],
+            "fs_protect: attached, not invoked (lsm: 19 of 19 deny hooks)"
+        );
+        let mut pending = v.clone();
+        pending["manifest"]["settled"] = false.into();
+        pending["entry_hash"] = serde_json::Value::Null;
+        o.capability_manifest = Some(pending.to_string());
+        let l = manifest_status_lines(&o, false);
+        assert!(
+            l[0].contains("telemetry probe pending, signed row none: no audit log"),
+            "{l:?}"
+        );
+        let mut old = v.clone();
+        old["manifest"].as_object_mut().unwrap().remove("sources");
+        o.capability_manifest = Some(old.to_string());
+        assert!(manifest_status_lines(&o, false)[0].contains("older than the sensor contract"));
+        assert_eq!(manifest_status_json(&o), "null");
+        o.capability_manifest = Some("{".to_string());
+        assert!(manifest_status_lines(&o, false)[0].contains("not JSON"));
     }
 
     /// Lab PR 219: the exploit guard's line, a full task map said loudly.

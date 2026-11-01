@@ -280,6 +280,9 @@ mod tests {
             stopped: false,
             seen_at: "2026-11-01T10:00:01.000000Z".into(),
             uptime_ms: 1,
+            manifest_hash: Some("cd".repeat(32)),
+            manifest_revision: Some(2),
+            manifest_run: Some("r".into()),
         };
         write_state(&p, &s).unwrap();
         assert_eq!(read_state(&p), Ok(Some(s)));

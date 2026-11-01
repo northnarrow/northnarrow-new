@@ -14,6 +14,9 @@
 /// event loop.
 pub mod bus;
 pub mod connect_deny;
+/// R13 (lab PR 271): the sensor contract's Linux values, one entry per
+/// source of the bus.
+pub mod contract;
 pub mod dns_sensor;
 pub mod ebpf_object;
 /// Lab PR 219: the exploit post-condition guard (loader, mode, counters).

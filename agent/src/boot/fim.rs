@@ -28,7 +28,7 @@ use super::response::attest_legacy_isolation_removed;
 fn open_sensor_on_tracepoint(sensor: &SensorMultiplexer, why: &str) {
     sensor.attach_points().note(
         "file_open",
-        "tracepoint:syscalls/sys_enter_openat (user memory)",
+        northnarrow_agent::sensors::contract::OPEN_TRACEPOINT_NOTE,
     );
     northnarrow_agent::boot::degradation::report(
         "file_open_sensor",
@@ -70,6 +70,15 @@ fn start_open_sensor(
     if mode == FileOpenSensor::Tracepoint {
         info!("file-open sensor: tracepoint mode (--file-open-sensor tracepoint) — every open reaches userland");
         open_sensor_on_tracepoint(sensor, "chosen with --file-open-sensor tracepoint");
+        return;
+    }
+    // R13 (lab PR 271): `bpf` not in the active LSM list (a start under the
+    // degraded-mode opt-in) — the LSM sensor would attach and never run, so
+    // `sys_enter_openat` keeps the file opens
+    if sensor.lsm_absent() {
+        warn!("file-open sensor: bpf is not in the active LSM list — keeping sys_enter_openat");
+        open_tracepoint_fallback(sensor);
+        open_sensor_on_tracepoint(sensor, northnarrow_agent::sensors::contract::BPF_LSM_ABSENT);
         return;
     }
     if !fim_attached.contains(&northnarrow_agent::fim::attach::OPEN_SENSOR_PROGRAM) {
@@ -124,9 +133,10 @@ fn start_open_sensor(
         open_sensor_on_tracepoint(sensor, &format!("arming failed ({e})"));
         return;
     }
-    sensor
-        .attach_points()
-        .note("file_open", "lsm:file_open (FIM observer)");
+    sensor.attach_points().note(
+        "file_open",
+        northnarrow_agent::sensors::contract::OPEN_LSM_NOTE,
+    );
     // Lab PR 249: the posture's own switch (it was process-wide).
     posture.set_kernel_mass_write(true);
     // Armed: the old tracepoint (every openat to userland) goes. Its link

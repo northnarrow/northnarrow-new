@@ -647,6 +647,54 @@ impl DenyReport {
     }
 }
 
+/// R13 (lab PR 271): the anti-tamper attach's sensors as the capability
+/// manifest lists them — the deny hooks (the `fs_protect` source), the
+/// module-load observers and the `bpf()` observer — from what the attach
+/// reported (a missing observe hook is `<program>: <why>`).
+pub fn attach_notes(deny: &DenyReport) -> Vec<(&'static str, String)> {
+    let lost = |program: &str| {
+        deny.observe_missing
+            .iter()
+            .find(|m| m.starts_with(&format!("{program}: ")))
+            .cloned()
+    };
+    let deny_note = if deny.attached == 0 {
+        format!(
+            "not attached: none of the {} deny hooks ({})",
+            deny.expected,
+            deny.missing.first().map(String::as_str).unwrap_or("-")
+        )
+    } else {
+        format!(
+            "lsm: {} of {} deny hooks attached and armed",
+            deny.attached, deny.expected
+        )
+    };
+    let missing: Vec<String> = filesystem::MODULE_LOAD_PROGRAMS
+        .iter()
+        .filter_map(|(p, _)| lost(p))
+        .collect();
+    let hooks: Vec<&str> = filesystem::MODULE_LOAD_PROGRAMS
+        .iter()
+        .filter(|(p, _)| lost(p).is_none())
+        .map(|(_, h)| *h)
+        .collect();
+    let module_note = match (hooks.is_empty(), missing.is_empty()) {
+        (true, _) => format!("not attached: {}", missing.join("; ")),
+        (false, true) => format!("lsm:{}", hooks.join("+")),
+        (false, false) => format!("lsm:{} only ({})", hooks.join("+"), missing.join("; ")),
+    };
+    let bpf_note = match lost(bpf_defense::OBSERVE_PROGRAM) {
+        Some(why) => format!("not attached: {why}"),
+        None => format!("lsm:{}", bpf_defense::OBSERVE_HOOK),
+    };
+    vec![
+        ("deny_hooks", deny_note),
+        ("module_load", module_note),
+        ("bpf_syscall", bpf_note),
+    ]
+}
+
 fn named(entries: &[(&'static str, String)]) -> Vec<String> {
     entries.iter().map(|(p, e)| format!("{p}: {e}")).collect()
 }
@@ -1248,6 +1296,63 @@ pub fn evict_protected_observer(bpffs_root: Option<&Path>, pid: u32) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R13 (lab PR 271): the anti-tamper attach's notes for the manifest —
+    /// the deny hooks counted, a missing observe hook named, none attached.
+    #[test]
+    fn the_attach_notes_say_what_attached() {
+        let all = DenyReport {
+            expected: 19,
+            attached: 19,
+            missing: Vec::new(),
+            observe_missing: Vec::new(),
+        };
+        assert_eq!(
+            attach_notes(&all),
+            [
+                (
+                    "deny_hooks",
+                    "lsm: 19 of 19 deny hooks attached and armed".to_string()
+                ),
+                (
+                    "module_load",
+                    "lsm:kernel_read_file+kernel_load_data".to_string()
+                ),
+                ("bpf_syscall", "lsm:bpf".to_string()),
+            ]
+        );
+        let partial = DenyReport {
+            expected: 19,
+            attached: 0,
+            missing: vec!["task_kill: refused".to_string()],
+            observe_missing: vec![
+                "module_load_data_observe: no BTF".to_string(),
+                "bpf_syscall_observe: refused".to_string(),
+                "role_exit: x".to_string(),
+            ],
+        };
+        let n = attach_notes(&partial);
+        assert_eq!(
+            n[0].1,
+            "not attached: none of the 19 deny hooks (task_kill: refused)"
+        );
+        assert_eq!(
+            n[1].1,
+            "lsm:kernel_read_file only (module_load_data_observe: no BTF)"
+        );
+        assert_eq!(n[2].1, "not attached: bpf_syscall_observe: refused");
+        let none = DenyReport {
+            observe_missing: vec![
+                "module_read_file_observe: a".to_string(),
+                "module_load_data_observe: b".to_string(),
+            ],
+            ..all
+        };
+        assert_eq!(
+            attach_notes(&none)[1].1,
+            "not attached: module_read_file_observe: a; module_load_data_observe: b"
+        );
+    }
 
     /// Lab PR 218: the trust level and the manifest read the deny side as
     /// the health line counts it — hooks, not failed steps.

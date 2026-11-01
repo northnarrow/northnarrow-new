@@ -6,14 +6,10 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 
-/// One sensor and where it is attached.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SensorEntry {
-    pub sensor: String,
-    pub attach: String,
-}
+/// One sensor and where it is attached (R13, lab PR 271: the contract's
+/// type, nn-core's; it was declared here).
+pub use nn_core::contract::manifest::SensorEntry;
 
 /// The attach points of one eBPF object's sensors (R11c, lab PR 264: the
 /// multiplexer that loads the object makes it, the loader and the sensors

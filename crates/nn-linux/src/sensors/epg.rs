@@ -128,6 +128,23 @@ pub const LITE_LSM: &[(&str, &str)] = &[
     ("epg_lite_file_open", "file_open"),
 ];
 
+/// R13 (lab PR 271): the variant's attach points as the capability
+/// manifest lists them (the sensor contract's `exploit_guard` entry: lite
+/// on its LSM use points, strict on `fentry`).
+pub const fn attach_note(v: Variant) -> &'static str {
+    match v {
+        Variant::Lite => {
+            "lsm:capable+bprm_check_security+file_open, fentry:commit_creds+switch_task_namespaces\
+             +set_fs_root, tp_btf:sched_process_exit+sched_process_fork (lite)"
+        }
+        Variant::Strict => {
+            "fentry:commit_creds+switch_task_namespaces+set_fs_root(+chroot_fs_refs), \
+             raw_tp:sched_process_exit+sys_exit+sys_enter (strict)"
+        }
+        Variant::Off => "off (--exploit-guard off)",
+    }
+}
+
 /// The first kernel whose BPF memory allocator makes strict's map (not
 /// preallocated) safe in a raw tracepoint.
 const STRICT_MIN_KERNEL: (u8, u8) = (6, 1);

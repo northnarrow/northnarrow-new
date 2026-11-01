@@ -140,6 +140,12 @@ pub struct LoadPlan {
     pub dns_skb: bool,
     /// The exploit guard's task maps.
     pub epg_task_maps: crate::sensors::epg::TaskMaps,
+    /// R13 (lab PR 271): `bpf` is not in the active LSM list (the boot's
+    /// gate let the start go on under the degraded-mode opt-in): a BPF LSM
+    /// program attaches and never runs, so the exec sensor takes
+    /// `sys_enter_execve` (and the start's file-open sensor its tracepoint),
+    /// the reason signed with each.
+    pub lsm_absent: bool,
 }
 
 impl Default for LoadPlan {
@@ -149,6 +155,7 @@ impl Default for LoadPlan {
             open_tracepoint: false,
             dns_skb: true,
             epg_task_maps: crate::sensors::epg::TaskMaps::default(),
+            lsm_absent: false,
         }
     }
 }
@@ -196,6 +203,9 @@ pub struct SensorMultiplexer<G> {
     /// sensor armed ([`Self::dns_mode`]); process-wide until then.
     attach_points: crate::boot::manifest::AttachPoints,
     dns_mode: crate::sensors::dns_sensor::DnsMode,
+    /// R13 (lab PR 271): the load plan's `lsm_absent`, for the start's
+    /// file-open sensor.
+    lsm_absent: bool,
 }
 
 impl<G: ExecGuards> SensorMultiplexer<G> {
@@ -363,7 +373,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         // the BPF link self-check covers whichever runs.
         let exec_program = crate::sensors::exe_identity::attach(
             &mut ebpf,
-            plan.exec_lsm,
+            crate::sensors::exe_identity::mode(plan.exec_lsm, plan.lsm_absent),
             &attach_points,
             |ebpf| attach_tracepoint(ebpf, "sys_enter_execve", "syscalls", "sys_enter_execve"),
         )?;
@@ -616,6 +626,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 bpf_guard,
                 attach_points,
                 dns_mode,
+                lsm_absent: plan.lsm_absent,
             },
             net_bufs,
         ))
@@ -632,6 +643,12 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     /// `udp_sendmsg` fallback's degradation).
     pub fn dns_mode(&self) -> crate::sensors::dns_sensor::DnsMode {
         self.dns_mode
+    }
+
+    /// R13 (lab PR 271): `bpf` is not in the active LSM list (the load
+    /// plan's): the start's file-open sensor keeps its tracepoint.
+    pub fn lsm_absent(&self) -> bool {
+        self.lsm_absent
     }
 
     /// R11c (lab PR 264): the BPF guard's record of this object's own
@@ -806,7 +823,21 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         _verified: &crate::boot::IntegrityVerified,
         variant: crate::sensors::epg::Variant,
     ) -> std::result::Result<crate::sensors::epg::ExploitGuard, String> {
-        let (ring, guard) = crate::sensors::epg::attach(&mut self.ebpf, variant)?;
+        // R13 (lab PR 271): its attach point in the manifest, or why none
+        let (ring, guard) = match crate::sensors::epg::attach(&mut self.ebpf, variant) {
+            Ok(attached) => attached,
+            Err(why) => {
+                let note = if variant == crate::sensors::epg::Variant::Off {
+                    why.clone()
+                } else {
+                    format!("not attached: {why}")
+                };
+                self.attach_points.note("exploit_guard", &note);
+                return Err(why);
+            }
+        };
+        self.attach_points
+            .note("exploit_guard", crate::sensors::epg::attach_note(variant));
         let pump = spawn_ring_pump::<common::wire::epg::EpgEventRaw>(
             crate::sensors::epg::PUMP_LABEL,
             ring,
@@ -814,7 +845,12 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             &tokio::runtime::Handle::current(),
             no_carry::<common::wire::epg::EpgEventRaw>,
         )
-        .map_err(|e| format!("its pump's thread did not start: {e:#}"))?;
+        .map_err(|e| {
+            let why = format!("its pump's thread did not start: {e:#}");
+            self.attach_points
+                .note("exploit_guard", &format!("not attached: {why}"));
+            why
+        })?;
         self.register_pump_thread(crate::sensors::epg::PUMP_LABEL, pump);
         Ok(guard)
     }
@@ -837,7 +873,16 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         pids: &[u32],
         keep: &[crate::anti_tamper::ExeIdentity],
     ) -> Result<crate::anti_tamper::AttachReport> {
-        crate::anti_tamper::attach(verified, &mut self.ebpf, &self.bpf_guard, pids, keep)
+        let report =
+            crate::anti_tamper::attach(verified, &mut self.ebpf, &self.bpf_guard, pids, keep)?;
+        // R13 (lab PR 271): the deny hooks and the two observe sensors of
+        // the anti-tamper attach, in the manifest's attach points
+        if let Some(deny) = &report.deny {
+            for (sensor, note) in crate::anti_tamper::attach_notes(deny) {
+                self.attach_points.note(sensor, &note);
+            }
+        }
+        Ok(report)
     }
 }
 

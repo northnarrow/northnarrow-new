@@ -359,6 +359,76 @@ pub fn capability_manifest() -> String {
     .to_string()
 }
 
+/// R13 (lab PR 271): a revision signed while the agent runs, on a kernel
+/// without `bpf` in its active LSM list — each source and class against the
+/// sensor contract, the fallbacks, what is missing, a list given way to its
+/// built-in copy, what changed (one attach point with an escape sequence:
+/// printed escaped).
+pub fn capability_manifest_r13() -> String {
+    let terms = json!({
+        "attach": "lsm:", "fallbacks": [], "sync_verdict": "kernel deny on LSM task_kill",
+        "on_failure": "fail_open", "on_failure_detail": "counted", "kernel_budgets": [],
+        "truncations": ["comm 15 B (not marked)"], "rings": ["fs_protect"],
+        "loss_counters": [1, 2, 3, 4, 5]
+    });
+    json!({
+        "entry_hash": "cd".repeat(32),
+        "manifest": {
+            "manifest_version": 2, "agent_version": "0.0.1", "kernel": "6.8.0-matrix",
+            "btf": true, "btf_offsets_resolved": 116, "btf_offsets_drifted": 0,
+            "btf_offsets_absent": [],
+            "active_lsms": "lockdown,capability,landlock,yama,apparmor",
+            "bpf_lsm": "absent",
+            "deny_hooks": {"expected": 19, "attached": 19, "missing": [], "observe_missing": []},
+            "deny_self_test": "not_denied", "bpf_guard": "enforce",
+            "sensors": [{"sensor": "exec", "attach": "tracepoint:syscalls/sys_enter_execve (user memory)"}],
+            "host_hardening": [], "detect_only": false,
+            "degradations": ["bpf_lsm: anti-tamper: no enforcement"],
+            "trust_level": 0, "trust_reasons": ["`bpf` is not in the active LSM list"],
+            "contract_version": 1,
+            "sources": [
+                {"source": "fs_protect", "classes": ["tamper"],
+                 "attach": "lsm: 19 of 19 deny hooks attached and armed", "on": "primary",
+                 "state": "attached_not_invoked",
+                 "why": ["bpf is not in the active LSM list: its BPF LSM programs attach and the kernel never runs them"],
+                 "terms": terms},
+                {"source": "exec_check", "classes": ["process"],
+                 "attach": "tracepoint:syscalls/sys_enter_execve (user memory)\u{1b}[31m",
+                 "on": "fallback", "state": "ok", "terms": terms},
+                {"source": "process_spawn", "classes": ["process"],
+                 "attach": "tracepoint:sched/sched_process_exec", "on": "primary",
+                 "state": "ok", "probe": "seen", "terms": terms},
+                {"source": "dns_query", "classes": ["network"],
+                 "attach": "kprobe:udp_send_skb+udp_v6_send_skb", "on": "primary",
+                 "state": "attached_not_invoked", "probe": "gap",
+                 "why": ["telemetry probe: its dns event did not reach the pipeline"],
+                 "terms": terms}
+            ],
+            "classes": [
+                {"class": "tamper", "queue": "P0", "queue_capacity": 1024,
+                 "when_full": "wait 50 ms, then drop", "decision_budget_ms": 100,
+                 "sources": ["fs_protect"], "sync_verdict": "kernel deny on LSM task_kill",
+                 "on_failure": "fail_open", "loss_counters": [1, 2, 3, 4, 5],
+                 "state": "attached_not_invoked"},
+                {"class": "health", "queue": "P0", "queue_capacity": 1024,
+                 "when_full": "wait 50 ms, then drop", "decision_budget_ms": 100,
+                 "sources": [], "sync_verdict": "none (the event reports what happened)",
+                 "loss_counters": [], "note": "no event is of this class yet"}
+            ],
+            "fallbacks": ["exec_check: tracepoint:syscalls/sys_enter_execve (user memory)"],
+            "missing": [
+                "fs_protect: attached, not invoked (lsm: 19 of 19 deny hooks attached and armed) — bpf is not in the active LSM list",
+                "dns_query: attached, not invoked (kprobe:udp_send_skb+udp_v6_send_skb) — telemetry probe: its dns event did not reach the pipeline"
+            ],
+            "content": ["netflow-blocklist (/usr/share/northnarrow/netflow-blocklist.v1): unavailable (not found) — the copy built into the agent is in force"],
+            "telemetry_probe": "every 60 s", "settled": true,
+            "revision": 3, "hash": "ef".repeat(32), "previous_hash": "01".repeat(32),
+            "change": ["source dns_query: ok on its attach point (kprobe:udp_send_skb+udp_v6_send_skb) → attached, not invoked on its attach point (kprobe:udp_send_skb+udp_v6_send_skb)", "source dns_query: telemetry probe seen → gap"]
+        }
+    })
+    .to_string()
+}
+
 fn public_status(posture: PostureKind, combat: bool) -> StatusResponse {
     if combat {
         StatusResponse::public(
@@ -521,6 +591,12 @@ pub fn verbs() -> Vec<Verb> {
         ];
         if name.starts_with("capabilities") {
             success.push(("manifest-not-json".to_string(), telemetry(Some(not_json))));
+        }
+        // R13 (lab PR 271): a revision of the sensor contract's manifest
+        if !name.starts_with("net-") {
+            let mut r13 = full_status();
+            r13.capability_manifest = Some(capability_manifest_r13());
+            success.push(("contract-revision".to_string(), telemetry(Some(r13))));
         }
         v.push(Verb {
             name: name.to_string(),

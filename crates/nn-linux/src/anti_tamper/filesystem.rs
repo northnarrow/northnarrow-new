@@ -480,7 +480,7 @@ pub(crate) const OPTIONAL_LSM_PROGRAMS: &[(&str, &str)] = &[
 /// NOTE: temporarily attached here to reuse the `reattach_fresh`
 /// machinery with `btf` + `pin_root` in scope; moves to a dedicated
 /// module-load sensor when the ring consumer + rule land in stage 2.
-const MODULE_LOAD_PROGRAMS: &[(&str, &str)] = &[
+pub(crate) const MODULE_LOAD_PROGRAMS: &[(&str, &str)] = &[
     ("module_read_file_observe", "kernel_read_file"),
     ("module_load_data_observe", "kernel_load_data"),
 ];

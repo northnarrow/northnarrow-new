@@ -156,7 +156,31 @@ pub struct HeartbeatRecord {
     /// A `stop` beat's reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// R13 (lab PR 271): the signed capability manifest's newest revision
+    /// (`None`: an agent older than R13, or before its boot signed it).
+    /// Not `manifest`: a chain line's top-level key of its rotation
+    /// records, reserved by the chain log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<BeatManifest>,
 }
+
+/// R13 (lab PR 271): what a beat carries of the capability manifest — the
+/// hash of what the agent runs with (`CapabilityManifest::content_hash`),
+/// the revision it is (0: the boot's), and whether the telemetry probe has
+/// had its word on every probed source (`settled`: before its first round
+/// the manifest says "pending", a hash a verifier does not compare).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeatManifest {
+    pub hash: String,
+    pub revision: u64,
+    pub settled: bool,
+}
+
+/// A run's manifest not settled this long after its start is DEGRADED: the
+/// probe's first round ends 25 s after the start at most
+/// (`FIRST_ROUND_SECS` + `DEADLINE_SECS`); two minutes leave room for a
+/// round skipped.
+pub const MANIFEST_SETTLE_SECS: u64 = 120;
 
 /// Degradations named in a beat at most.
 pub const MAX_DEGRADATIONS: usize = 16;
@@ -202,6 +226,16 @@ pub struct WatchState {
     pub seen_at: String,
     #[serde(default)]
     pub uptime_ms: u64,
+    /// R13 (lab PR 271): the hash of the last settled capability manifest
+    /// seen (across runs: a change at a restart is a change), its revision
+    /// and its run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_revision: Option<u64>,
+    /// The run whose beat carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_run: Option<String>,
 }
 
 /// One alert, by kind (the most severe first in [`Alert::rank`]).
@@ -223,7 +257,8 @@ pub enum Alert {
     /// The counters show loss since the last beat seen.
     Loss(String),
     /// The agent's health degraded (a stalled decision, a probe gap, a new
-    /// degradation, an action row not written, an interrupted action).
+    /// degradation, an action row not written, an interrupted action, R13:
+    /// its capability manifest changed or did not settle).
     Degraded(String),
 }
 
@@ -723,6 +758,67 @@ pub fn check(
                 .join("; ")
         ));
     }
+    // R13 (lab PR 271): the capability manifest — a settled hash other
+    // than the last one seen is a change of what the agent runs with
+    // (within a run, or across a restart); every new beat is read, so a
+    // change undone before this check is still seen. A run whose manifest
+    // has not settled long after its start, and a manifest gone from the
+    // beats, are DEGRADED too.
+    let mut manifest_hash = last.and_then(|l| l.manifest_hash.clone());
+    let mut manifest_revision = last.and_then(|l| l.manifest_revision);
+    let mut manifest_run = last
+        .and_then(|l| l.manifest_run.clone())
+        .unwrap_or_default();
+    let fresh: Vec<&HeartbeatRecord> = match last {
+        Some(l) => beats
+            .iter()
+            .map(|(_, b)| *b)
+            .filter(|b| b.seq > l.seq)
+            .collect(),
+        None => vec![newest],
+    };
+    for b in fresh {
+        match &b.capabilities {
+            Some(m) if m.settled => {
+                if let Some(seen) = manifest_hash.as_deref() {
+                    if seen != m.hash && last.is_some() {
+                        degraded.push(format!(
+                            "the capability manifest changed{}: {} → {} (revision {} of run {}; nn-admin \
+                             capabilities --key names the change, signed capability_manifest_change)",
+                            if b.run != manifest_run { " across a restart" } else { "" },
+                            short(seen),
+                            short(&m.hash),
+                            m.revision,
+                            b.run
+                        ));
+                    }
+                }
+                manifest_hash = Some(m.hash.clone());
+                manifest_revision = Some(m.revision);
+                manifest_run = b.run.clone();
+            }
+            Some(_)
+                if b.kind != BeatKind::Stop
+                    && b.uptime_ms > MANIFEST_SETTLE_SECS * 1000
+                    && b.seq == newest.seq =>
+            {
+                degraded.push(format!(
+                    "the capability manifest has not settled {} s after the start (the \
+                     telemetry probe's first round not ended)",
+                    b.uptime_ms / 1000
+                ));
+            }
+            Some(_) => {}
+            None if manifest_hash.is_some() && b.seq == newest.seq => {
+                degraded.push(
+                    "the beat carries no capability manifest any more (an agent older than \
+                     R13, or its boot did not sign one)"
+                        .to_string(),
+                );
+            }
+            None => {}
+        }
+    }
     if !degraded.is_empty() {
         out.alerts.push(Alert::Degraded(degraded.join("; ")));
     }
@@ -745,6 +841,9 @@ pub fn check(
         stopped: newest.kind == BeatKind::Stop,
         seen_at: crate::audit::format_ts(seen_at),
         uptime_ms: newest.uptime_ms,
+        manifest_hash,
+        manifest_revision,
+        manifest_run: Some(manifest_run).filter(|r| !r.is_empty()),
     });
     out
 }
