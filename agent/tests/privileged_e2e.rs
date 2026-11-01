@@ -1190,8 +1190,16 @@ fn audit_verify_e2e() {
     let ops: Vec<(String, String)> = entries
         .iter()
         .filter(|e| {
-            !["integrity_drift", "chain_numbering_started", "chain_verify"]
-                .contains(&e["op"].as_str().unwrap_or_default())
+            // R12c-2 (lab PR 270): the heartbeat's `telemetry_loss` rows
+            // come with its beats, on their own clock, as the background
+            // chain check's do (the heartbeat's tests read them)
+            ![
+                "integrity_drift",
+                "chain_numbering_started",
+                "chain_verify",
+                "telemetry_loss",
+            ]
+            .contains(&e["op"].as_str().unwrap_or_default())
         })
         .map(|e| {
             (

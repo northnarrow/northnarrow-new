@@ -434,6 +434,23 @@ impl CanaryFixture {
     }
 
     /// The registry rows of `canary_id`.
+    /// The canary's Trip rows, once there are `n` (the canary writer
+    /// appends them on its own thread, after the access row: R12b).
+    fn wait_trips(&self, canary_id: &str, n: usize) -> Vec<serde_json::Value> {
+        let deadline = Instant::now() + ACCESS_LOG_POLL_TIMEOUT;
+        loop {
+            let trips: Vec<_> = self
+                .registry_rows(canary_id)
+                .into_iter()
+                .filter(|r| r["action"].as_str() == Some("trip"))
+                .collect();
+            if trips.len() >= n || Instant::now() >= deadline {
+                return trips;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
     fn registry_rows(&self, canary_id: &str) -> Vec<serde_json::Value> {
         common::read_jsonl_strict(&self.canary_registry)
             .into_iter()
@@ -960,11 +977,7 @@ fn file_canary_deployed_at_runtime_survives_an_agent_restart() {
         Some(false),
         "a canary tripped before the restart is not a first trip after it: {rows:?}"
     );
-    let trips: Vec<_> = fx
-        .registry_rows(&canary_id)
-        .into_iter()
-        .filter(|r| r["action"].as_str() == Some("trip"))
-        .collect();
+    let trips = fx.wait_trips(&canary_id, 1);
     assert_eq!(trips.len(), 1, "one Trip row: {trips:?}");
     assert_eq!(
         trips[0]["first_trip_access_hash"].as_str(),
@@ -1486,11 +1499,7 @@ fn network_canary_connect_trips_canary_003_and_kills_the_connector() {
         .expect("the connecting shell must be killed during its 30 s sleep");
     assert_eq!(status.signal(), Some(9), "{status:?}");
 
-    let trips: Vec<_> = fx
-        .registry_rows(&canary_id)
-        .into_iter()
-        .filter(|r| r["action"].as_str() == Some("trip"))
-        .collect();
+    let trips = fx.wait_trips(&canary_id, 1);
     assert_eq!(trips.len(), 1, "one Trip row: {trips:?}");
     assert_eq!(
         trips[0]["first_trip_access_hash"].as_str(),
