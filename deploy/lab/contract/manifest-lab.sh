@@ -217,8 +217,11 @@ H0=$(cat "$OUT/hash-normal" 2>/dev/null)
 if [[ $PHASE == partial ]]; then
   # the review of #479: a fallback that covers less is partial
   t=$(now)
-  g "sudo mkdir -p $DROPIN_DIR && sudo sh -c 'printf \"[Service]\nEnvironment=NN_FILE_OPEN_SENSOR=tracepoint\n\" > $DROPIN_DIR/zz-r13-lab-partial.conf' && sudo systemctl daemon-reload" > "$OUT/partial-dropin.txt" 2>&1
-  if stop_agent && start_agent && wait_settled partial 180; then
+  # the unit's drop-ins are protected: written and removed with the agent
+  # stopped, inside the trusted-installer window stop_agent grants
+  if stop_agent \
+    && g "sudo mkdir -p $DROPIN_DIR && sudo sh -c 'printf \"[Service]\nEnvironment=NN_FILE_OPEN_SENSOR=tracepoint\n\" > $DROPIN_DIR/zz-r13-lab-partial.conf' && sudo systemctl daemon-reload" > "$OUT/partial-dropin.txt" 2>&1 \
+    && start_agent && wait_settled partial 180; then
     sum=$(python3 -I -c 'import json, sys
 m = json.load(open(sys.argv[1]))["manifest"]
 s = {x["source"]: x for x in m["sources"]}
@@ -238,8 +241,11 @@ print("open_sensor %s on %s (%s); file_open %s probe %s evidence %s" % (o["state
     step verifier-partial "$t" "FAIL: no manifest alert within 240 s"
   fi
   t=$(now)
-  g "sudo rm -f $DROPIN_DIR/zz-r13-lab-partial.conf && sudo rmdir --ignore-fail-on-non-empty $DROPIN_DIR; sudo systemctl daemon-reload" >/dev/null 2>&1
-  if stop_agent && start_agent && wait_settled partial-back 180; then
+  if ! stop_agent \
+    || ! g "sudo rm -f $DROPIN_DIR/zz-r13-lab-partial.conf && sudo rmdir --ignore-fail-on-non-empty $DROPIN_DIR; sudo systemctl daemon-reload; ! test -e $DROPIN_DIR/zz-r13-lab-partial.conf" > "$OUT/partial-back-dropin.txt" 2>&1; then
+    step partial-back "$t" "FAIL: the drop-in was not removed ($(tr '\n' ' ' < "$OUT/partial-back-dropin.txt"))"
+    start_agent
+  elif start_agent && wait_settled partial-back 180; then
     h=$(field partial-back hash)
     step partial-back "$t" "$([[ $h == "$H0" ]] && echo ok || echo FAIL): hash $h (normal $H0)"
   else
@@ -273,7 +279,9 @@ if [[ $PHASE == stale ]]; then
     step verifier-stale "$t" "FAIL: no manifest alert within 300 s"
   fi
   t=$(now)
-  g 'sudo rm -f /run/northnarrow/debug-probe-skip'
+  if ! g 'sudo rm -f /run/northnarrow/debug-probe-skip && ! test -e /run/northnarrow/debug-probe-skip' >/dev/null 2>&1; then
+    step stale-trigger-removed "$t" "FAIL: /run/northnarrow/debug-probe-skip is still there"
+  fi
   if a=$(wait_manifest_alert "$t" 240); then
     caps stale-back; rows stale
     step verifier-stale-back "$t" "ok: DEGRADED at $a (seen again: hash $(field stale-back hash))"
