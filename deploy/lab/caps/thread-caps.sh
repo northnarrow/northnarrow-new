@@ -55,11 +55,13 @@ CALLS="(($FILTER) && ($(ors $UNIT_IDS))) || (comm == \"nn-decision\" && ($(ors $
 
 # x86_64: cap_capable(cred, ns, cap, opts) — cap in %dx, opts in %cx
 probes_off() {
-    echo 0 > "$T/events/raw_syscalls/sys_enter/enable" 2>/dev/null
-    echo 0 > "$T/events/raw_syscalls/sys_enter/filter" 2>/dev/null
-    echo 0 > "$T/events/nncap/enable" 2>/dev/null
-    echo '-:nncap/c' >> "$T/kprobe_events" 2>/dev/null
-    echo '-:nncap/r' >> "$T/kprobe_events" 2>/dev/null
+    echo 0 > "$T/events/raw_syscalls/sys_enter/enable"
+    echo 0 > "$T/events/raw_syscalls/sys_enter/filter"
+    if [[ -e $T/events/nncap/enable ]]; then
+        echo 0 > "$T/events/nncap/enable"
+        echo '-:nncap/c' >> "$T/kprobe_events"
+        echo '-:nncap/r' >> "$T/kprobe_events"
+    fi
 }
 
 case "$CMD" in
@@ -85,8 +87,8 @@ start)
     echo "tracing cap_capable for the agent's threads into $DIR/trace.raw (reader $(cat "$DIR/reader.pid"))"
     ;;
 stop)
-    echo 0 > "$T/events/nncap/enable" 2>/dev/null
-    echo 0 > "$T/events/raw_syscalls/sys_enter/enable" 2>/dev/null
+    [[ -e $T/events/nncap/enable ]] && echo 0 > "$T/events/nncap/enable"
+    echo 0 > "$T/events/raw_syscalls/sys_enter/enable"
     sleep 1
     # the reader started above, by its pid, only if it is still that cat
     if [[ -s $DIR/reader.pid ]]; then
