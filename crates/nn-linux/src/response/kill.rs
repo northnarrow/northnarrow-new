@@ -456,7 +456,12 @@ fn kill_tree_in_cgroup(
 /// `/proc/<pid>/task/<tid>/children` empty (CONFIG_PROC_CHILDREN). `None`
 /// when they cannot be read: the caller walks `/proc` instead.
 fn has_no_children(pid: u32) -> Option<bool> {
-    let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    has_no_children_in(Path::new("/proc"), pid)
+}
+
+/// [`has_no_children`] under `proc` (tests: a tree of their own).
+fn has_no_children_in(proc: &Path, pid: u32) -> Option<bool> {
+    let tasks = std::fs::read_dir(proc.join(pid.to_string()).join("task")).ok()?;
     for t in tasks {
         let children = std::fs::read_to_string(t.ok()?.path().join("children")).ok()?;
         if !children.trim().is_empty() {
@@ -743,6 +748,17 @@ mod tests {
         assert_eq!(has_no_children(sh.id()), Some(false));
         assert_eq!(has_no_children(kids[0]), Some(true));
         assert_eq!(has_no_children(u32::MAX), None, "no such process");
+        // a kernel without CONFIG_PROC_CHILDREN: not known, never "none"
+        let fake = tempfile::tempdir().unwrap();
+        let task = fake.path().join("42/task/42");
+        std::fs::create_dir_all(&task).unwrap();
+        assert_eq!(has_no_children_in(fake.path(), 42), None);
+        std::fs::write(task.join("children"), "").unwrap();
+        assert_eq!(has_no_children_in(fake.path(), 42), Some(true));
+        let other = fake.path().join("42/task/43");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("children"), "77 ").unwrap();
+        assert_eq!(has_no_children_in(fake.path(), 42), Some(false));
         for k in &kids {
             let _ = std::process::Command::new("kill")
                 .arg("-9")
