@@ -346,6 +346,15 @@ fn landlock_restrict(level: &mut SandboxLevel) -> Result<(), SandboxError> {
         RulesetStatus::PartiallyEnforced => LandlockEnforced::Partial,
         RulesetStatus::NotEnforced => LandlockEnforced::None,
     };
+    declare(level, abi, enforced);
+    Ok(())
+}
+
+/// What a Landlock ruleset that handles every right the crate knows, with
+/// no rule, denies at the kernel's `abi` and `enforced` state: files from
+/// ABI 1, TCP from 4, signals and abstract sockets from 6 — declared from
+/// the ABI the kernel gave, never assumed.
+pub fn declare(level: &mut SandboxLevel, abi: u8, enforced: LandlockEnforced) {
     level.landlock_abi = abi;
     level.landlock = if abi == 0 {
         LandlockEnforced::None
@@ -356,7 +365,6 @@ fn landlock_restrict(level: &mut SandboxLevel) -> Result<(), SandboxError> {
     level.fs_denied = on && abi >= 1;
     level.net_denied = on && abi >= 4;
     level.scoped = on && abi >= 6;
-    Ok(())
 }
 
 /// The Landlock ABI of the running kernel, as `landlock_create_ruleset`'s

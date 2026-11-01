@@ -454,6 +454,21 @@ mod tests {
                 deleted(2049, 77)
             ))
             .is_some());
+        // facts that would name root (an account lookup refuses root: never
+        // built so) never exempt a root exec
+        let root = R004ExecFromProcSelfFd::default().with_own_launch(Some(OwnWorkerLaunch {
+            uid: 0,
+            ..own.clone()
+        }));
+        assert!(root
+            .evaluate(&launch(
+                900,
+                0,
+                "/proc/self/fd/64",
+                &argv,
+                Default::default()
+            ))
+            .is_some());
         // and an agent pid of 0 never matches
         let zero = R004ExecFromProcSelfFd::default().with_own_launch(Some(OwnWorkerLaunch {
             agent_pid: 0,

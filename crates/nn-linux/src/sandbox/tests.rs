@@ -379,3 +379,30 @@ fn landlock_denies_tcp_and_signals_where_the_kernel_has_them() {
     );
     drop(listener);
 }
+
+/// The level declared on each lab kernel's ABI (5.15: 1, 6.1: 2, 6.8: 4,
+/// 6.12: 6), and none without Landlock or with nothing enforced.
+#[test]
+fn the_level_is_declared_from_the_kernels_abi() {
+    use nn_proto::ipc::LandlockEnforced::{Full, None as NotEnforced, Partial};
+    let decl = |abi, enforced| {
+        let mut l = SandboxLevel::default();
+        declare(&mut l, abi, enforced);
+        (
+            l.landlock_abi,
+            l.landlock,
+            l.fs_denied,
+            l.net_denied,
+            l.scoped,
+        )
+    };
+    assert_eq!(decl(0, Full), (0, NotEnforced, false, false, false));
+    assert_eq!(decl(1, Partial), (1, Partial, true, false, false));
+    assert_eq!(decl(2, Partial), (2, Partial, true, false, false));
+    assert_eq!(decl(3, Partial), (3, Partial, true, false, false));
+    assert_eq!(decl(4, Partial), (4, Partial, true, true, false));
+    assert_eq!(decl(5, Partial), (5, Partial, true, true, false));
+    assert_eq!(decl(6, Full), (6, Full, true, true, true));
+    assert_eq!(decl(9, Full), (9, Full, true, true, true));
+    assert_eq!(decl(4, NotEnforced), (4, NotEnforced, false, false, false));
+}

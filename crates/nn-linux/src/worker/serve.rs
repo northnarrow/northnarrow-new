@@ -331,6 +331,49 @@ mod tests {
         assert_eq!(out[3].name, "a\\046\\092.\\255");
     }
 
+    /// A ClientHello (one TLS record) with `alpn` ALPN names.
+    fn client_hello_with_alpn(alpn: usize) -> Vec<u8> {
+        let mut list = Vec::new();
+        for i in 0..alpn {
+            list.push(1u8);
+            list.push(b'a' + (i % 26) as u8);
+        }
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&0x0010u16.to_be_bytes());
+        ext.extend_from_slice(&((list.len() + 2) as u16).to_be_bytes());
+        ext.extend_from_slice(&(list.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&list);
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0); // session id
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&0x1301u16.to_be_bytes());
+        body.extend_from_slice(&[1, 0]); // compression: null
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+        let mut hs = vec![1u8];
+        hs.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        hs.extend_from_slice(&body);
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    /// More ALPN names than an answer may carry: the worker keeps the
+    /// protocol's bound (an honest worker never looks like a lying one).
+    #[test]
+    fn a_hello_with_too_many_alpn_names_is_answered_within_bounds() {
+        let req = Request::TlsClientHello(client_hello_with_alpn(MAX_ALPN + 10));
+        let a = answer(&req);
+        assert_eq!(check_response(&req, &a), Ok(()), "{a:?}");
+        match a {
+            Answer::Tls(TlsOut::Complete { alpn, .. }) => assert_eq!(alpn.len(), MAX_ALPN),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn a_request_out_of_bounds_is_refused_not_parsed() {
         let r = Request::DnsNames(vec![]);

@@ -1226,6 +1226,10 @@ fn a_worker_worse_or_gone_or_less_sandboxed_is_worse_and_named() {
             .iter()
             .any(|l| l.starts_with("worker parse: sandbox ")));
     }
+    // a lower ABI alone (the same flags: 4 and 5 deny the same) is worse
+    let five = with_worker(&base, WorkerState::Ready, Some(level(5)));
+    assert!(ready.worsens_from(&five), "ABI 5 → 4");
+    assert!(!five.worsens_from(&ready));
     let scoped = with_worker(&base, WorkerState::Ready, Some(level(6)));
     assert!(!scoped.worsens_from(&ready), "more sandbox is better");
     assert!(ready.worsens_from(&scoped), "and back is worse");
