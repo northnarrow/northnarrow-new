@@ -120,18 +120,29 @@ const PATH: &[&str] = &[
     // more (rule 1b: it submits them to the dispatcher's thread).
 ];
 
-/// R12c (lab PR 270): files under [`PATH`]'s directories that run on
-/// threads of their own, not the decision's — their I/O is theirs.
-const OFF_PATH: &[(&str, &str)] = &[
+/// R12c (lab PR 270): functions of [`PATH`]'s files that run on threads of
+/// their own (or at the start and the stop), not the decision's — their I/O
+/// is theirs; the rest of the file is scanned (review of #476: the
+/// decision thread's side of those files — `Dispatcher::submit`, `answer`,
+/// `SlowWork::defer`, `take_ready` — is in [`NONE`]).
+const OFF_PATH: &[(&str, &[&str], &str)] = &[
     (
         "agent/src/pipeline/dispatch.rs",
+        &[
+            "pub(crate) fn start_with(",
+            "pub(crate) fn stop(",
+            "fn run(",
+            "fn run_one(",
+            "fn write_overflow(",
+        ],
         "the response dispatcher's thread (`nn-response`): each response's signed intent, the \
-         action, its signed outcome — the decision thread only submits",
+         action, its signed outcome; its start and its stop",
     ),
     (
         "agent/src/pipeline/slow.rs",
+        &["pub(crate) fn start(", "pub(crate) fn stop(", "fn run("],
         "the dispatcher of slow work's thread (`nn-slow-work`): the ransomware tracker's sampler \
-         and trust — the decision thread only defers a burst and judges it prepared",
+         and trust; its start and its stop",
     ),
 ];
 
@@ -258,6 +269,18 @@ const KNOWN: &[(&str, usize, &str)] = &[
 const NONE: &[(&str, Option<&str>)] = &[
     ("agent/src/pipeline/process_event.rs", None),
     ("agent/src/run_loop.rs", Some("fn decision_loop(")),
+    // R12c (lab PR 270; review of #476): what the decision thread calls of
+    // the dispatchers' files
+    (
+        "agent/src/pipeline/dispatch.rs",
+        Some("pub(crate) fn submit("),
+    ),
+    ("agent/src/pipeline/dispatch.rs", Some("fn answer(")),
+    ("agent/src/pipeline/slow.rs", Some("pub(crate) fn defer(")),
+    (
+        "agent/src/pipeline/slow.rs",
+        Some("pub(crate) fn take_ready("),
+    ),
 ];
 
 /// The sites in `code`: each stretch of text one or more markers cover
@@ -324,11 +347,18 @@ fn path_code(root: &Path) -> BTreeMap<String, String> {
                 .unwrap()
                 .to_string_lossy()
                 .replace('\\', "/");
-            if is_test_file(&rel) || OFF_PATH.iter().any(|(f, _)| *f == rel) {
+            if is_test_file(&rel) {
                 continue;
             }
             let text = std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("{rel}: {e}"));
-            out.insert(rel, production(&strip_comments(&text)));
+            let mut text = production(&strip_comments(&text));
+            for (_, heads, _) in OFF_PATH.iter().filter(|(f, _, _)| *f == rel) {
+                for h in *heads {
+                    let body = function(&text, h).to_string();
+                    text = text.replacen(&body, "", 1);
+                }
+            }
+            out.insert(rel, text);
         }
     }
     out
@@ -427,9 +457,12 @@ fn the_decision_thread_runs_no_action() {
     let code = path_code(&repo_root());
     let v = decision_thread_actions(&code);
     assert!(v.is_empty(), "{v:#?}");
-    for (f, why) in OFF_PATH {
+    for (f, heads, why) in OFF_PATH {
         assert!(repo_root().join(f).is_file(), "{f}: listed, not on disk");
-        assert!(why.len() > 20, "{f}: say why");
+        assert!(
+            !heads.is_empty() && why.len() > 20,
+            "{f}: say which and why"
+        );
     }
     // the decision submits its responses, and reports a Log decision
     // without the executor's acting entry points
@@ -482,6 +515,25 @@ fn the_rules_fail_on_planted_violations() {
     let v = decision_thread_actions(&planted);
     assert!(v.len() == 1 && v[0].contains(".intent("), "{v:?}");
     assert!(decision_thread_actions(&code).is_empty());
+    // review of #476: the decision thread's side of the dispatchers' files
+    // is scanned — a read planted in `Dispatcher::submit`, an action in
+    // `SlowWork::defer`
+    let dp = "agent/src/pipeline/dispatch.rs".to_string();
+    let mut planted = code.clone();
+    let text = planted.get_mut(&dp).unwrap();
+    let at = text.find("pub(crate) fn submit(").unwrap();
+    let open = at + text[at..].find('{').unwrap();
+    text.insert_str(open + 1, "\n let _ = std::fs::read(p);\n");
+    let v = decision_thread_violations(&planted);
+    assert!(v.len() == 1 && v[0].contains("fn submit("), "{v:?}");
+    let sl = "agent/src/pipeline/slow.rs".to_string();
+    let mut planted = code.clone();
+    let text = planted.get_mut(&sl).unwrap();
+    let at = text.find("pub(crate) fn defer(").unwrap();
+    let open = at + text[at..].find('{').unwrap();
+    text.insert_str(open + 1, "\n e.kill_tree(pid);\n");
+    let v = decision_thread_actions(&planted);
+    assert!(v.len() == 1 && v[0].contains("kill_tree("), "{v:?}");
     // rule 1: an await, a /proc read in process_event; a sleep in the
     // decision loop
     let pe = "agent/src/pipeline/process_event.rs".to_string();

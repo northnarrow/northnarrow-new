@@ -15,24 +15,36 @@
 //!   backlog of 350 made the queue first in, first out).
 //! - **In order per process** (the brief: "a later response for the same
 //!   process never overtakes an earlier one"). The queue keeps each
-//!   process's jobs (its [`ResponseQueue`] key) in the order they were
-//!   submitted, and a take runs the *oldest* job of the process the lane
-//!   names: a Critical kill decided after a Low throttle of the same
-//!   process raises that process's turn (priority inheritance), and the
-//!   throttle runs first, then the kill. One thread takes: two jobs of one
-//!   process never run at once.
+//!   process's jobs (its [`ResponseQueue`] key: the process's pid *and*
+//!   start, so a process that reused a pid is another process) in the order
+//!   they were submitted, and a take runs the *oldest* job of the process
+//!   the lane names: a Critical quarantine decided after a Low strip of the
+//!   same process raises that process's turn (priority inheritance), and
+//!   the strip runs first, then the quarantine. One thread takes: two jobs
+//!   of one process never run at once.
+//! - **A kill goes first and supersedes** (review of #476). A kill of a
+//!   process is placed before that process's queued jobs, and its queued
+//!   throttles and blocks ([`DispatchJob::superseded_by_kill`]) are taken
+//!   out — handed back ([`ResponseQueue::take_superseded`]) and answered
+//!   "superseded by a kill": a kill never waits behind what it makes
+//!   pointless (the priority inversion of a kill behind its own process's
+//!   throttle), and a quarantine or a strip of the process runs after it.
 //! - **A repeat merges.** A job of the same process and the same action as
 //!   the process's last queued job (a process that tripped two rules, or
 //!   one rule twice, before its kill ran) is merged into it
 //!   ([`DispatchJob::absorb`]): one action, both decisions answered by its
 //!   outcome — not a second kill of a process already dead. Only into the
-//!   last queued job of the process, so the order is the submissions'.
+//!   last queued job of the process (its first, for a kill: a kill goes
+//!   first), so the order is the submissions'.
 //! - **A full queue** ([`RESPONSE_QUEUE_CAP`] jobs) never blocks the
 //!   decision and never drops silently: the newest job of the least severe
 //!   lane below the new job's severity is displaced (returned to the
-//!   caller, which answers its decisions "not run" and counts it), or, when
-//!   every queued job is at least as severe, the new job is refused
-//!   (returned, answered and counted the same way). The dispatcher signs
+//!   caller, which answers its decisions "not run" and counts it); when
+//!   every queued job is at least as severe, a Critical kill is queued past
+//!   the capacity (counted `over_cap`, up to [`OVER_CAP_FACTOR`] times it —
+//!   review of #476: a full queue must not lose the kill of the payload to
+//!   a flood of decoys), and any other new job is refused (returned,
+//!   answered and counted the same way). The dispatcher signs
 //!   the displaced and refused jobs in its next `overflow` row and the
 //!   posture's `TelemetryLoss` is raised: a response not run is a loss the
 //!   operator sees, never one nobody hears of.
@@ -49,6 +61,10 @@ use crate::bus::LatencyHistogram;
 /// responses): with each event's paths and arguments bounded, a full queue
 /// holds a few MiB.
 pub const RESPONSE_QUEUE_CAP: usize = 1_024;
+
+/// A full queue takes Critical kills past its capacity up to this many
+/// times it (a hard bound: memory), counted `over_cap`.
+pub const OVER_CAP_FACTOR: usize = 4;
 
 /// The oldest job, once it waited this long, has a take by age (aging).
 pub const STARVATION_NS: u64 = 500_000_000;
@@ -96,6 +112,16 @@ pub trait DispatchJob {
     fn same_action(&self, other: &Self) -> bool;
     /// Take `other`'s decisions: one action answers both.
     fn absorb(&mut self, other: Self);
+    /// A kill: placed before its process's queued jobs, never refused by a
+    /// full queue when Critical.
+    fn is_kill(&self) -> bool {
+        false
+    }
+    /// Pointless once its process is killed (a throttle, a block): a kill
+    /// of the process takes it out of the queue.
+    fn superseded_by_kill(&self) -> bool {
+        false
+    }
 }
 
 /// What became of a submitted job.
@@ -134,6 +160,10 @@ pub struct DispatchStats {
     pub submitted: u64,
     pub queued: u64,
     pub merged: u64,
+    /// Critical kills a full queue took past its capacity; jobs a kill of
+    /// their process took out (answered "superseded", not a loss).
+    pub over_cap: u64,
+    pub superseded: u64,
     /// Jobs not run: displaced by a more severe one, refused when full —
     /// per lane (Low … Critical). Stage 6's loss.
     pub displaced: [u64; LANES],
@@ -166,6 +196,8 @@ struct Entry<K, J> {
 /// The response queue (see the module's doc).
 pub struct ResponseQueue<K, J> {
     cap: usize,
+    /// Jobs a kill took out, for the caller to answer.
+    superseded: Vec<J>,
     next_seq: u64,
     /// Every queued job by its sequence number (the oldest first).
     jobs: BTreeMap<u64, Entry<K, J>>,
@@ -182,6 +214,7 @@ impl<K: Eq + Hash + Clone, J: DispatchJob> ResponseQueue<K, J> {
     pub fn new(cap: usize) -> Self {
         Self {
             cap: cap.max(1),
+            superseded: Vec::new(),
             next_seq: 1,
             jobs: BTreeMap::new(),
             lanes: Default::default(),
@@ -202,13 +235,43 @@ impl<K: Eq + Hash + Clone, J: DispatchJob> ResponseQueue<K, J> {
         self.jobs.is_empty()
     }
 
+    /// The jobs the last submits' kills took out (to be answered).
+    pub fn take_superseded(&mut self) -> Vec<J> {
+        std::mem::take(&mut self.superseded)
+    }
+
     /// Submit `job` for the process `key`, of `severity`, at `now_ns`.
-    /// Never blocks; see [`Submitted`].
+    /// Never blocks; see [`Submitted`] (and [`Self::take_superseded`]).
     pub fn submit(&mut self, key: K, severity: Severity, now_ns: u64, job: J) -> Submitted<J> {
         self.stats.submitted += 1;
         let lane = lane_of(severity);
-        // A repeat of the process's last queued job is merged into it.
-        if let Some(&last) = self.by_key.get(&key).and_then(|q| q.back()) {
+        let kill = job.is_kill();
+        if kill {
+            // a kill takes out its process's queued throttles and blocks
+            let gone: Vec<u64> = self
+                .by_key
+                .get(&key)
+                .map(|q| {
+                    q.iter()
+                        .copied()
+                        .filter(|s| self.jobs[s].job.superseded_by_kill())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for s in gone {
+                let e = self.remove(s);
+                self.stats.superseded += 1;
+                self.superseded.push(e.job);
+            }
+        }
+        // A repeat of the process's last queued job (its first, for a kill)
+        // is merged into it.
+        let candidate = self
+            .by_key
+            .get(&key)
+            .and_then(|q| if kill { q.front() } else { q.back() })
+            .copied();
+        if let Some(last) = candidate {
             if let Some(e) = self.jobs.get_mut(&last) {
                 if e.job.same_action(&job) {
                     e.job.absorb(job);
@@ -234,6 +297,13 @@ impl<K: Eq + Hash + Clone, J: DispatchJob> ResponseQueue<K, J> {
                     self.stats.displaced[e.lane] += 1;
                     displaced = Some(e.job);
                 }
+                None if kill
+                    && lane == LANES - 1
+                    && self.jobs.len() < self.cap.saturating_mul(OVER_CAP_FACTOR) =>
+                {
+                    // a Critical kill is never refused: past the capacity
+                    self.stats.over_cap += 1;
+                }
                 None => {
                     self.stats.refused[lane] += 1;
                     return Submitted::Refused(job);
@@ -243,7 +313,12 @@ impl<K: Eq + Hash + Clone, J: DispatchJob> ResponseQueue<K, J> {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.lanes[lane].insert(seq);
-        self.by_key.entry(key.clone()).or_default().push_back(seq);
+        let q = self.by_key.entry(key.clone()).or_default();
+        if kill {
+            q.push_front(seq);
+        } else {
+            q.push_back(seq);
+        }
         self.jobs.insert(
             seq,
             Entry {
@@ -365,6 +440,12 @@ mod tests {
         fn absorb(&mut self, other: Self) {
             self.decisions.extend(other.decisions);
         }
+        fn is_kill(&self) -> bool {
+            self.action == "kill"
+        }
+        fn superseded_by_kill(&self) -> bool {
+            matches!(self.action, "throttle" | "block")
+        }
     }
 
     fn j(pid: u32, action: &'static str, d: u32) -> J {
@@ -407,25 +488,91 @@ mod tests {
     }
 
     /// The brief: a later response for the same process never overtakes an
-    /// earlier one — the Critical kill decided after the Low throttle of
-    /// pid 7 raises 7's turn, and the throttle runs first, then the kill,
-    /// both before pid 8's High.
+    /// earlier one — the Critical quarantine decided after the Low strip of
+    /// pid 7 raises 7's turn, and the strip runs first, then the
+    /// quarantine, both before pid 8's High.
     #[test]
     fn a_later_response_for_a_process_never_overtakes_an_earlier_one() {
         let mut q = ResponseQueue::new(16);
-        q.submit(7, L, 0, j(7, "throttle", 1));
+        q.submit(7, L, 0, j(7, "strip", 1));
         q.submit(8, H, 0, j(8, "block", 2));
-        q.submit(7, C, 0, j(7, "kill", 3));
+        q.submit(7, C, 0, j(7, "quarantine", 3));
+        let t = q.take(1).unwrap();
+        assert_eq!((t.job.pid, t.job.action, t.inherited), (7, "strip", true));
+        assert_eq!(t.severity, L, "it keeps its own severity in the record");
         let t = q.take(1).unwrap();
         assert_eq!(
             (t.job.pid, t.job.action, t.inherited),
-            (7, "throttle", true)
+            (7, "quarantine", false)
         );
-        assert_eq!(t.severity, L, "it keeps its own severity in the record");
-        let t = q.take(1).unwrap();
-        assert_eq!((t.job.pid, t.job.action, t.inherited), (7, "kill", false));
         assert_eq!(order(&mut q, 1), [(8, "block")]);
         assert_eq!(q.stats().inherited, 1);
+    }
+
+    /// Review of #476: a kill goes before its process's queued jobs and
+    /// takes out its throttles and blocks (handed back, answered
+    /// "superseded"); its quarantine runs after it; another process's jobs
+    /// are untouched.
+    #[test]
+    fn a_kill_goes_first_and_supersedes_its_process_s_throttle_and_block() {
+        let mut q = ResponseQueue::new(16);
+        q.submit(7, L, 0, j(7, "throttle", 1));
+        q.submit(7, M, 0, j(7, "quarantine", 2));
+        q.submit(7, L, 0, j(7, "block", 3));
+        q.submit(8, L, 0, j(8, "throttle", 4));
+        assert!(matches!(
+            q.submit(7, H, 0, j(7, "kill", 5)),
+            Submitted::Queued(_)
+        ));
+        let gone: Vec<u32> = q
+            .take_superseded()
+            .iter()
+            .flat_map(|j| j.decisions.clone())
+            .collect();
+        assert_eq!(gone, [1, 3]);
+        assert!(q.take_superseded().is_empty(), "handed back once");
+        // a second kill of 7 merges into the first (its process's first job)
+        assert!(matches!(
+            q.submit(7, C, 0, j(7, "kill", 6)),
+            Submitted::Merged(_)
+        ));
+        let t = q.take(1).unwrap();
+        assert_eq!((t.job.pid, t.job.action), (7, "kill"));
+        assert_eq!(t.job.decisions, [5, 6]);
+        assert_eq!(order(&mut q, 1), [(7, "quarantine"), (8, "throttle")]);
+        let s = q.stats();
+        assert_eq!((s.superseded, s.merged, s.lost()), (2, 1, 0));
+    }
+
+    /// Review of #476 (X2): a full queue of Critical jobs refuses no
+    /// Critical kill — it goes past the capacity (counted), up to
+    /// OVER_CAP_FACTOR times it; a Critical job that is not a kill, and a
+    /// High kill, are refused as before.
+    #[test]
+    fn a_full_queue_never_refuses_a_critical_kill() {
+        let mut q = ResponseQueue::new(2);
+        q.submit(1, C, 0, j(1, "quarantine", 1));
+        q.submit(2, C, 0, j(2, "kill", 2));
+        assert!(matches!(
+            q.submit(3, C, 0, j(3, "kill", 3)),
+            Submitted::Queued(_)
+        ));
+        assert!(matches!(
+            q.submit(4, C, 0, j(4, "quarantine", 4)),
+            Submitted::Refused(_)
+        ));
+        assert!(matches!(
+            q.submit(5, H, 0, j(5, "kill", 5)),
+            Submitted::Refused(_)
+        ));
+        for pid in 6..=11 {
+            q.submit(pid, C, 0, j(pid, "kill", pid));
+        }
+        assert_eq!(q.len(), 2 * OVER_CAP_FACTOR, "the hard bound");
+        let s = q.stats();
+        assert_eq!(s.over_cap, 6);
+        assert_eq!(s.refused, [0, 0, 1, 2], "past the hard bound, refused");
+        assert_eq!(s.max_depth, 8);
     }
 
     /// Every interleaving of submissions keeps each process's order (a
@@ -440,11 +587,13 @@ mod tests {
             seed
         };
         let sevs = [L, M, H, C];
-        let actions = ["kill", "block", "throttle", "quarantine"];
+        let actions = ["kill", "block", "throttle", "quarantine", "strip"];
         for round in 0..200 {
             let mut q: ResponseQueue<u32, J> = ResponseQueue::new(64);
             let mut submitted: HashMap<u32, Vec<u32>> = HashMap::new();
             let mut taken: HashMap<u32, Vec<u32>> = HashMap::new();
+            let mut gone: Vec<u32> = Vec::new();
+            let mut action_of: HashMap<u32, &'static str> = HashMap::new();
             let mut d = 0;
             let mut now = 0;
             for _ in 0..(20 + round % 40) {
@@ -458,21 +607,45 @@ mod tests {
                 }
                 d += 1;
                 let pid = (r >> 8) as u32 % 5;
-                let job = j(pid, actions[(r >> 16) as usize % 4], d);
-                match q.submit(pid, sevs[(r >> 24) as usize % 4], now, job) {
+                let action = actions[(r >> 16) as usize % actions.len()];
+                action_of.insert(d, action);
+                match q.submit(pid, sevs[(r >> 24) as usize % 4], now, j(pid, action, d)) {
                     Submitted::Queued(_) | Submitted::Merged(_) => {
                         submitted.entry(pid).or_default().push(d)
                     }
                     other => panic!("room for all: {other:?}"),
                 }
+                gone.extend(q.take_superseded().into_iter().flat_map(|j| j.decisions));
             }
             while let Some(t) = q.take(now) {
                 taken.entry(t.job.pid).or_default().extend(&t.job.decisions);
             }
+            // only throttles and blocks are superseded, each once
+            assert!(gone
+                .iter()
+                .all(|d| matches!(action_of[d], "throttle" | "block")));
             for (pid, ds) in &submitted {
-                // a merged decision runs with the job it joined, which is
-                // the process's last queued: the order is the submissions'
-                assert_eq!(taken.get(pid), Some(ds), "round {round}, pid {pid}");
+                let got = taken.get(pid).cloned().unwrap_or_default();
+                // every decision taken or superseded, once
+                let mut all: Vec<u32> = got
+                    .iter()
+                    .chain(gone.iter().filter(|d| ds.contains(d)))
+                    .copied()
+                    .collect();
+                all.sort_unstable();
+                let mut want = ds.clone();
+                want.sort_unstable();
+                assert_eq!(all, want, "round {round}, pid {pid}");
+                // the jobs that are not kills keep the submissions' order (a
+                // merged decision runs with the job it joined, the process's
+                // last queued); kills go first
+                let others = |v: &[u32]| -> Vec<u32> {
+                    v.iter()
+                        .copied()
+                        .filter(|d| action_of[d] != "kill" && !gone.contains(d))
+                        .collect()
+                };
+                assert_eq!(others(&got), others(ds), "round {round}, pid {pid}");
             }
         }
     }
@@ -491,13 +664,16 @@ mod tests {
         assert_eq!(t.severity, C, "raised to the more severe decision's lane");
         // not into an earlier job of the process: that would reorder
         let mut q = ResponseQueue::new(16);
-        q.submit(9, M, 0, j(9, "kill", 1));
-        q.submit(9, M, 0, j(9, "block", 2));
+        q.submit(9, M, 0, j(9, "quarantine", 1));
+        q.submit(9, M, 0, j(9, "strip", 2));
         assert!(matches!(
-            q.submit(9, M, 0, j(9, "kill", 3)),
+            q.submit(9, M, 0, j(9, "quarantine", 3)),
             Submitted::Queued(_)
         ));
-        assert_eq!(order(&mut q, 1), [(9, "kill"), (9, "block"), (9, "kill")]);
+        assert_eq!(
+            order(&mut q, 1),
+            [(9, "quarantine"), (9, "strip"), (9, "quarantine")]
+        );
         assert_eq!(q.stats().merged, 0);
     }
 

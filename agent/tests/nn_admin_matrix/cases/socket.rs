@@ -310,7 +310,7 @@ pub fn full_status() -> StatusResponse {
     // macro's recursion limit).
     let dispatch = json!({
         "running": true, "capacity": 1024, "depth": [0, 1, 0, 2], "max_depth": 40,
-        "submitted": 120, "queued": 119, "merged": 3,
+        "submitted": 120, "queued": 119, "merged": 3, "over_cap": 2, "superseded": 4,
         "displaced": [2, 0, 0, 0], "refused": [1, 0, 0, 0], "not_run_other": 1,
         "taken": 116, "inherited": 2, "aged": 1,
         "wait_p50_us": 90, "wait_p99_us": 41000, "wait_max_us": 52000,

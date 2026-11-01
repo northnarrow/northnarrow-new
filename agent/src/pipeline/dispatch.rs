@@ -62,6 +62,8 @@ pub(crate) const NOT_RUN_REFUSED: &str =
     "not run: the response queue was full of responses at least as severe";
 pub(crate) const NOT_RUN_STOPPED: &str = "not run: the agent stopped before it";
 pub(crate) const NOT_RUN_NO_DISPATCHER: &str = "not run: the response dispatcher is not running";
+pub(crate) const NOT_RUN_SUPERSEDED: &str =
+    "not run: superseded by a kill of the same process decided after it";
 
 /// One decision whose responses the dispatcher runs: what its detection
 /// record needs once every response has its outcome.
@@ -111,8 +113,29 @@ pub(crate) struct ResponseJob {
 }
 
 impl DispatchJob for ResponseJob {
+    /// The same action on the same process — its pid *and* its start (a
+    /// process that reused the pid is another one: review of #476, X1) —
+    /// and, but for a kill, the same file (two strips of two files are two
+    /// actions).
     fn same_action(&self, other: &Self) -> bool {
-        self.action == other.action && self.pid == other.pid && self.file == other.file
+        self.action == other.action
+            && self.pid == other.pid
+            && self.start_ns == other.start_ns
+            && (self.is_kill() || self.file == other.file)
+    }
+
+    fn is_kill(&self) -> bool {
+        matches!(
+            self.action,
+            ResponseAction::KillProcess | ResponseAction::KillProcessTree
+        )
+    }
+
+    fn superseded_by_kill(&self) -> bool {
+        matches!(
+            self.action,
+            ResponseAction::ThrottleProcess | ResponseAction::BlockOutbound
+        )
     }
 
     fn absorb(&mut self, other: Self) {
@@ -340,7 +363,7 @@ pub(crate) struct DispatchStatus {
 }
 
 struct Shared {
-    queue: Mutex<ResponseQueue<u32, ResponseJob>>,
+    queue: Mutex<ResponseQueue<(u32, u64), ResponseJob>>,
     ready: Condvar,
     stop: AtomicBool,
     executor: Executor,
@@ -460,6 +483,7 @@ impl Dispatcher {
         let s = &self.shared;
         // (the job, why, its lane, displaced)
         let mut not_run: Vec<(ResponseJob, &'static str, usize, bool)> = Vec::new();
+        let mut superseded = Vec::new();
         if !s.running.load(Ordering::Acquire) {
             s.not_run_down
                 .fetch_add(jobs.len() as u64, Ordering::Relaxed);
@@ -470,7 +494,8 @@ impl Dispatcher {
             let now = s.now_ns();
             let mut q = s.queue.lock();
             for (sev, job) in jobs {
-                match q.submit(job.pid, sev, now, job) {
+                // a process is its pid and its start (review of #476, X1)
+                match q.submit((job.pid, job.start_ns), sev, now, job) {
                     Submitted::Queued(_) | Submitted::Merged(_) => {}
                     Submitted::Displacing(_, d) => {
                         let lane = lane_of_job(&d);
@@ -481,8 +506,15 @@ impl Dispatcher {
                     }
                 }
             }
+            superseded = q.take_superseded();
             drop(q);
             s.ready.notify_one();
+        }
+        // a kill's process's throttles and blocks: answered, not a loss
+        for job in superseded {
+            for (d, slot) in &job.answers {
+                answer(d, *slot, job.not_run(NOT_RUN_SUPERSEDED), &s.followups);
+            }
         }
         if not_run.is_empty() {
             return;
@@ -572,6 +604,8 @@ impl Dispatcher {
             submitted: q.submitted,
             queued: q.queued,
             merged: q.merged,
+            over_cap: q.over_cap,
+            superseded: q.superseded,
             displaced: q.displaced.to_vec(),
             refused: q.refused.to_vec(),
             not_run_other: st.not_run_at_stop + st.not_run_down,

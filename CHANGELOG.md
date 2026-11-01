@@ -1356,17 +1356,22 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   submits a decision's responses to the response dispatcher (`nn-response`)
   and judges the next event; the dispatcher takes them by severity (once
   the oldest job waited 500 ms, one take in four is it), each process's in
-  the order they were decided (priority inheritance), a repeat of a
-  process's last queued response merged into it; a full queue (1,024)
-  displaces a less severe response or refuses the new one — answered at
-  once ("not run"), counted per severity (stage 6), signed in an
-  `overflow` row, raising
+  the order they were decided (priority inheritance; a process is its pid
+  and its start), a kill before its process's queued jobs and superseding
+  its queued throttles and blocks, a repeat of a process's last queued
+  response merged into it; a full queue (1,024) displaces a less severe
+  response or refuses the new one — never a Critical kill, which goes past
+  the capacity (up to 4×, counted) — answered at once ("not run"),
+  counted per severity (stage 6), signed in an `overflow` row, raising
   `TelemetryLoss`; at the stop what is left after 2 s is answered and
   signed the same way. Every action the agent carries out on its own
   decision — a rule's response, the COMBAT ladder's soft block and
   release, kill trees, quarantines and isolation, the exec quarantine's
   kill and quarantine, the copy-on-write guard's automatic restore —
-  writes a signed `intent` row, synced, before it acts and a signed
+  writes a signed `intent` row before it acts (synced before it when its
+  effect outlives a restart of the host — a quarantine, a strip, a
+  restore; with the outcome otherwise; every fsync outside the writer's
+  lock) and a signed
   `outcome` row after (`success`, `failure`, `partial`, `would_execute`,
   `not_run`, `abandoned`) into the new `actions` chain
   (`/var/lib/northnarrow/detections/actions.jsonl`, `--actions-file`,

@@ -943,6 +943,11 @@ pub struct ResponseDispatchStatus {
     pub submitted: u64,
     pub queued: u64,
     pub merged: u64,
+    /// Critical kills the full queue took past its capacity (never
+    /// refused); throttles and blocks a kill of their process superseded
+    /// (answered so, not a loss).
+    pub over_cap: u64,
+    pub superseded: u64,
     /// Not run (stage 6), per severity: displaced by a more severe one
     /// from the full queue, refused by it; and not run because the agent
     /// stopped or the dispatcher was down.
@@ -2896,6 +2901,8 @@ mod tests {
             submitted: 12,
             queued: 11,
             merged: 1,
+            over_cap: 0,
+            superseded: 0,
             displaced: vec![0, 0, 0, 0],
             refused: vec![0, 0, 0, 0],
             not_run_other: 0,

@@ -52,6 +52,17 @@ fn verdict(rule: &str, action: ResponseAction, severity: Severity, pid: u32) -> 
 /// A decision of `rule` (leaked: the engine's rule ids are static) running
 /// `action` on `pid`, of `severity`.
 fn decided(rule: &str, action: ResponseAction, severity: Severity, pid: u32) -> Arc<Decided> {
+    decided_on(rule, action, severity, pid, "/tmp/payload")
+}
+
+/// [`decided`], its response on `file`.
+fn decided_on(
+    rule: &str,
+    action: ResponseAction,
+    severity: Severity,
+    pid: u32,
+    file: &str,
+) -> Arc<Decided> {
     let rule: &'static str = Box::leak(rule.to_string().into_boxed_str());
     let v = verdict(rule, action.clone(), severity, pid);
     let decision = Decision {
@@ -71,7 +82,7 @@ fn decided(rule: &str, action: ResponseAction, severity: Severity, pid: u32) -> 
         responses: vec![Response {
             action,
             pid,
-            filename: "/tmp/payload".to_string(),
+            filename: file.to_string(),
             timestamp_ns: 123,
             rule_id: rule,
             also: Vec::new(),
@@ -314,8 +325,10 @@ fn the_decision_never_waits_and_a_full_queue_drops_nothing_silently() {
 }
 
 /// A later response for the same process never overtakes an earlier one:
-/// a Low throttle then a Critical kill of the same pid run in that order,
-/// both before another process's High block that was queued between them.
+/// a Low strip then a Critical quarantine of the same pid run in that
+/// order, both before another process's High block that was queued between
+/// them (a kill goes first instead:
+/// `a_kill_supersedes_its_process_s_queued_throttle`).
 #[test]
 fn a_process_s_responses_run_in_the_order_they_were_decided() {
     let (d, journal, _sink) = dispatcher(true, 64);
@@ -333,7 +346,7 @@ fn a_process_s_responses_run_in_the_order_they_were_decided() {
         &d,
         &decided(
             "NN-L-T-B",
-            ResponseAction::ThrottleProcess,
+            ResponseAction::StripFileCapability,
             Severity::Low,
             8001,
         ),
@@ -351,7 +364,7 @@ fn a_process_s_responses_run_in_the_order_they_were_decided() {
         &d,
         &decided(
             "NN-L-T-D",
-            ResponseAction::KillProcess,
+            ResponseAction::Quarantine,
             Severity::Critical,
             8001,
         ),
@@ -371,8 +384,8 @@ fn a_process_s_responses_run_in_the_order_they_were_decided() {
         order,
         [
             ("Log".to_string(), 8000),
-            ("ThrottleProcess".to_string(), 8001),
-            ("KillProcess".to_string(), 8001),
+            ("StripFileCapability".to_string(), 8001),
+            ("Quarantine".to_string(), 8001),
             ("BlockOutbound".to_string(), 8002),
         ]
     );
@@ -598,6 +611,187 @@ fn responses_not_run_raise_telemetry_loss() {
         posture.current_kind(),
         nn_model::posture_types::PostureKind::Alerted
     );
+}
+
+/// Review of #476 (X1): a process that reused a pid is another process —
+/// its kill is not merged into the queued kill of the pid's earlier owner
+/// (which would run with the old start, find it gone, and leave the new
+/// process alive). Each kill runs with its own process's start.
+#[test]
+fn a_kill_of_a_reused_pid_is_not_merged_into_the_old_owner_s() {
+    let (d, journal, sink) = dispatcher(true, 64);
+    let a = decided(
+        "NN-L-T-A",
+        ResponseAction::KillProcess,
+        Severity::High,
+        4242,
+    );
+    let b = decided(
+        "NN-L-T-B",
+        ResponseAction::KillProcess,
+        Severity::High,
+        4242,
+    );
+    let mut jobs = ResponseJob::of(&a, Some(4242), 1_000, 1_000);
+    jobs.extend(ResponseJob::of(&b, Some(4242), 9_000, 9_000));
+    d.submit(jobs);
+    d.stop(Duration::from_secs(5));
+    assert_eq!(d.status().queue.merged, 0);
+    let starts: Vec<u64> = journal
+        .rows()
+        .iter()
+        .filter(|r| r.row == ActionRow::Intent)
+        .map(|r| r.intent.as_ref().unwrap().start_ns)
+        .collect();
+    assert_eq!(starts, [1_000, 9_000]);
+    assert_eq!(sink.queued_for_test().len(), 2);
+}
+
+/// Review of #476 (its mutation K11): two strips of one process's two
+/// files are two actions, not one merged.
+#[test]
+fn two_strips_of_two_files_are_two_actions() {
+    let (d, journal, _sink) = dispatcher(true, 64);
+    let a = decided_on(
+        "NN-L-T-S1",
+        ResponseAction::StripFileCapability,
+        Severity::High,
+        4300,
+        "/usr/local/bin/a",
+    );
+    let b = decided_on(
+        "NN-L-T-S2",
+        ResponseAction::StripFileCapability,
+        Severity::High,
+        4300,
+        "/usr/local/bin/b",
+    );
+    let mut jobs = ResponseJob::of(&a, None, 0, 0);
+    jobs.extend(ResponseJob::of(&b, None, 0, 0));
+    d.submit(jobs);
+    d.stop(Duration::from_secs(5));
+    let files: Vec<Option<String>> = journal
+        .rows()
+        .iter()
+        .filter(|r| r.row == ActionRow::Intent)
+        .map(|r| r.intent.as_ref().unwrap().file.clone())
+        .collect();
+    assert_eq!(
+        files,
+        [
+            Some("/usr/local/bin/a".to_string()),
+            Some("/usr/local/bin/b".to_string())
+        ]
+    );
+}
+
+/// Review of #476 (its mutation K5): the overflow row names each
+/// displaced response's severity — a Medium kill displaced by a Critical
+/// one is counted Medium.
+#[test]
+fn the_overflow_row_counts_a_displaced_response_in_its_severity() {
+    let (d, journal, _sink) = dispatcher(true, 1);
+    let hold = d.shared.hold.lock();
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-H",
+            ResponseAction::KillProcess,
+            Severity::High,
+            4400,
+        ),
+    );
+    let t0 = Instant::now();
+    while d.status().queue.taken == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-M",
+            ResponseAction::KillProcess,
+            Severity::Medium,
+            4401,
+        ),
+    );
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-C",
+            ResponseAction::KillProcess,
+            Severity::Critical,
+            4402,
+        ),
+    );
+    drop(hold);
+    d.stop(Duration::from_secs(5));
+    let o = journal
+        .rows()
+        .iter()
+        .find_map(|r| r.overflow.clone())
+        .expect("an overflow row");
+    assert_eq!(o.displaced, [0, 1, 0, 0]);
+    assert!(o.samples[0].contains("pid 4401"), "{o:?}");
+}
+
+/// Review of #476: a kill takes its process's queued throttle out — the
+/// throttle's decision is answered "superseded", its record says so, and
+/// nothing is counted lost; the kill runs.
+#[test]
+fn a_kill_supersedes_its_process_s_queued_throttle() {
+    let (d, journal, sink) = dispatcher(true, 64);
+    let hold = d.shared.hold.lock();
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-0",
+            ResponseAction::KillProcess,
+            Severity::High,
+            4500,
+        ),
+    );
+    let t0 = Instant::now();
+    while d.status().queue.taken == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-T",
+            ResponseAction::ThrottleProcess,
+            Severity::Low,
+            4501,
+        ),
+    );
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-K",
+            ResponseAction::KillProcessTree,
+            Severity::Critical,
+            4501,
+        ),
+    );
+    let recs = sink.queued_for_test();
+    assert_eq!(recs.len(), 1, "the throttle answered at once");
+    assert!(
+        recs[0].response.contains("superseded"),
+        "{:?}",
+        recs[0].response
+    );
+    drop(hold);
+    d.stop(Duration::from_secs(5));
+    let st = d.status();
+    assert_eq!((st.queue.superseded, st.queue.lost()), (1, 0));
+    let ran: Vec<String> = journal
+        .rows()
+        .iter()
+        .filter(|r| r.row == ActionRow::Intent)
+        .map(|r| r.intent.as_ref().unwrap().response.clone())
+        .collect();
+    assert_eq!(ran, ["KillProcess", "KillProcessTree"]);
 }
 
 /// The thread's end is seen: running until the stop, not after.

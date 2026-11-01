@@ -7,13 +7,23 @@
 //! engage, the outbound block's release and the exec quarantine's kill all
 //! take one, and only [`ActionJournal::intent`] (or
 //! [`ActionJournal::intents`]) makes one — after it has appended the signed
-//! [`ActionRow::Intent`] row and synced it. [`Intent::finish`] appends the
+//! [`ActionRow::Intent`] row. The row is written (`write(2)`) before the
+//! action, so it survives a crash of the agent; it is on the disk (fsync)
+//! before the action only when the action's effect outlives a restart of
+//! the host — a quarantine, a capability strip, a restore
+//! ([`synced_before_action`]); a kill's, a block's, a throttle's, an
+//! isolation's is synced with its outcome (review of #476: the fsync before
+//! them slowed the kills on a busy disk and protected only against a crash
+//! of the host, which ends their effect too). Every fsync is done outside
+//! the writer's lock, so the ladder, the exec quarantine and the restore do
+//! not wait behind the dispatcher's. [`Intent::finish`] appends the
 //! [`ActionRow::Outcome`] row; an intent dropped without one (a panic in the
 //! action) appends an [`ActionResult::Abandoned`] outcome itself. So no code
 //! can act without the intent written first, and no intent stays without an
 //! answer while the agent runs.
 //!
-//! When the journal cannot take a row — not open yet, its log refused at
+//! So the invariant is: no action without an **attempt** at a signed
+//! record. When the journal cannot take a row — not open yet, its log refused at
 //! the start (no key), a write that fails — the action still runs (external
 //! audit CMB-027's rule: whoever fills the disk must not stop the
 //! containment): the row is logged whole at ERROR (the journal's line is its
@@ -32,7 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use rand::Rng;
 use tracing::{error, warn};
 
@@ -58,6 +68,25 @@ pub use crate::chainlog::ACTIONS_CAP_ENV;
 
 /// Audit op of the start's report of intents without an outcome.
 pub const INTERRUPTED_AUDIT_OP: &str = "response_interrupted";
+
+/// Whether an action's intent row is synced (on the disk) before the
+/// action, not only written: when its effect outlives a restart of the host
+/// (a quarantine, a capability strip, a restore — and any action not named
+/// here). A kill, a block, a throttle, an isolation and a release end with
+/// the host; their intent is written before them (it survives a crash of
+/// the agent) and synced with their outcome.
+pub fn synced_before_action(response: &str) -> bool {
+    !matches!(
+        response,
+        "KillProcess"
+            | "KillProcessTree"
+            | "BlockOutbound"
+            | "ThrottleProcess"
+            | "FullNetworkIsolation"
+            | "Isolate"
+            | "Release"
+    )
+}
 
 /// Bytes of a file the start's scan reads at most (its tail).
 const SCAN_BYTES: u64 = 32 * 1024 * 1024;
@@ -237,11 +266,12 @@ impl ActionJournal {
                 .counters
                 .interrupted
                 .fetch_add(1, Ordering::Relaxed);
-            write_row(&mut w, &self.inner.counters, row, true);
+            write_row(&mut w, &self.inner.counters, row);
             recovery
                 .interrupted
                 .push(format!("run {} action {}: {what}", open.run, open.action));
         }
+        self.commit(w);
         recovery
     }
 
@@ -251,17 +281,19 @@ impl ActionJournal {
         *self.inner.writer.lock() = Writer::Off(why.to_string());
     }
 
-    /// The intent of one action, written and synced: the ticket the action
-    /// needs.
+    /// The intent of one action, written (and synced when
+    /// [`synced_before_action`]): the ticket the action needs.
     pub fn intent(&self, intent: ActionIntent) -> Intent {
         self.intents(vec![intent])
             .pop()
             .expect("one intent for one row")
     }
 
-    /// The intents of several actions, written with one sync (the
-    /// dispatcher's batch): the tickets, in order.
+    /// The intents of several actions (the dispatcher's batch), written —
+    /// with one sync when one of them is [`synced_before_action`]: the
+    /// tickets, in order.
     pub fn intents(&self, intents: Vec<ActionIntent>) -> Vec<Intent> {
+        let durable = intents.iter().any(|i| synced_before_action(&i.response));
         let mut w = self.inner.writer.lock();
         let mut out = Vec::with_capacity(intents.len());
         for i in intents {
@@ -277,7 +309,7 @@ impl ActionJournal {
                 overflow: None,
                 noted_by: None,
             };
-            let written = write_row(&mut w, &self.inner.counters, row, false);
+            let written = write_row(&mut w, &self.inner.counters, row);
             if written {
                 self.inner.counters.intents.fetch_add(1, Ordering::Relaxed);
             }
@@ -294,7 +326,9 @@ impl ActionJournal {
                 what,
             });
         }
-        sync(&mut w, &self.inner.counters);
+        if durable {
+            self.commit(w);
+        }
         out
     }
 
@@ -311,17 +345,52 @@ impl ActionJournal {
             noted_by: None,
         };
         let mut w = self.inner.writer.lock();
-        if write_row(&mut w, &self.inner.counters, row, true) {
+        if write_row(&mut w, &self.inner.counters, row) {
             self.inner
                 .counters
                 .overflow_rows
                 .fetch_add(1, Ordering::Relaxed);
         }
+        self.commit(w);
     }
 
-    /// Sync the outcomes [`Intent::finish_deferred`] wrote.
+    /// Sync the rows written without one (the outcomes
+    /// [`Intent::finish_deferred`] wrote, the intents of actions not
+    /// [`synced_before_action`]).
     pub fn sync(&self) {
-        sync(&mut self.inner.writer.lock(), &self.inner.counters);
+        self.commit(self.inner.writer.lock());
+    }
+
+    /// fsyncs of the chain's active file by this journal (introspection,
+    /// tests).
+    pub fn fsyncs(&self) -> u64 {
+        match &*self.inner.writer.lock() {
+            Writer::Log(log) => log.fsyncs(),
+            _ => 0,
+        }
+    }
+
+    /// The fsync of the rows written so far, done after `w` is released:
+    /// the other writers do not wait for the disk.
+    fn commit(&self, mut w: MutexGuard<'_, Writer>) {
+        let path = match &mut *w {
+            Writer::Log(log) => log.detach_sync(),
+            _ => None,
+        };
+        drop(w);
+        if let Some(path) = path {
+            if let Err(e) = crate::chainlog::sync_detached(&path) {
+                self.inner
+                    .counters
+                    .unwritten
+                    .fetch_add(1, Ordering::Relaxed);
+                error!(
+                    target: "response.journal",
+                    error = %format!("{e:#}"),
+                    "the actions chain's sync failed — its last rows may not be on the disk"
+                );
+            }
+        }
     }
 
     /// The rows a memory journal holds (empty for the signed chain's).
@@ -357,8 +426,13 @@ impl ActionJournal {
             noted_by: None,
         };
         let mut w = self.inner.writer.lock();
-        if write_row(&mut w, &self.inner.counters, row, durable) {
+        if write_row(&mut w, &self.inner.counters, row) {
             self.inner.counters.outcomes.fetch_add(1, Ordering::Relaxed);
+        }
+        if durable {
+            self.commit(w);
+        } else {
+            drop(w);
         }
         let in_flight = &self.inner.counters.in_flight;
         let mut n = in_flight.load(Ordering::Relaxed);
@@ -474,26 +548,19 @@ pub(crate) fn test_intent() -> Intent {
     ActionJournal::memory().intent(ActionIntent::named("test", "test", 0))
 }
 
-/// Append `row`; `durable`: synced before this returns. A row the writer
-/// cannot take is logged whole at ERROR and counted. Returns whether it is
-/// in the chain (or the memory journal).
-fn write_row(w: &mut Writer, counters: &Counters, row: ActionRecord, durable: bool) -> bool {
+/// Append `row`, written, not synced (the caller's [`ActionJournal::commit`]
+/// syncs). A row the writer cannot take is logged whole at ERROR and
+/// counted. Returns whether it is in the chain (or the memory journal).
+fn write_row(w: &mut Writer, counters: &Counters, row: ActionRecord) -> bool {
     let why = match w {
         Writer::Memory(rows) => {
             rows.push(row);
             return true;
         }
-        Writer::Log(log) => {
-            let res = if durable {
-                log.append(row.clone())
-            } else {
-                log.append_deferred(row.clone())
-            };
-            match res {
-                Ok(_) => return true,
-                Err(e) => format!("{e:#}"),
-            }
-        }
+        Writer::Log(log) => match log.append_deferred(row.clone()) {
+            Ok(_) => return true,
+            Err(e) => format!("{e:#}"),
+        },
         Writer::Late => "the actions chain is not open yet".to_string(),
         Writer::Off(why) => why.clone(),
     };
@@ -507,19 +574,6 @@ fn write_row(w: &mut Writer, counters: &Counters, row: ActionRecord, durable: bo
          action proceeds"
     );
     false
-}
-
-fn sync(w: &mut Writer, counters: &Counters) {
-    if let Writer::Log(log) = w {
-        if let Err(e) = log.sync() {
-            counters.unwritten.fetch_add(1, Ordering::Relaxed);
-            error!(
-                target: "response.journal",
-                error = %format!("{e:#}"),
-                "the actions chain's sync failed — its last rows may not be on the disk"
-            );
-        }
-    }
 }
 
 /// The rows of the chain's newest archive and active file, in chain order
@@ -747,5 +801,109 @@ mod tests {
         assert_eq!(kinds, [Intent, Outcome, Intent, Interrupted]);
         assert_eq!(rows[3].noted_by.as_deref(), Some(second.run()));
         assert_eq!(rows[3].run, rows[2].run);
+    }
+
+    fn log_at(active: &Path, key_path: &Path, cap: u64) -> Log {
+        ActionJournal::open_log(
+            active,
+            crate::keys::AgentSigningKey::load_or_bootstrap(key_path).unwrap(),
+            crate::chainlog::RotationConfig {
+                size_cap_bytes: cap,
+                max_archives: 8,
+                file_mode: 0o600,
+            },
+            Arc::new(crate::chainlog::NoProtection),
+        )
+        .unwrap()
+    }
+
+    /// The crash after a rotation: the intent left without its outcome is
+    /// in the newest archive by the next start, which still finds it
+    /// (review of #476, its mutation K2).
+    #[test]
+    fn an_intent_rotated_into_the_archive_is_found_at_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("actions.jsonl");
+        let key_path = dir.path().join("agent.sig.key");
+        let first = ActionJournal::late();
+        first.bind(log_at(&active, &key_path, 16 * 1024), &active);
+        std::mem::forget(first.intent(intent_row("KillProcessTree", 300)));
+        let mut pid = 1000;
+        while crate::chainlog::archives_newest_first(&active).is_empty() {
+            first.intent(intent_row("KillProcess", pid)).finish(
+                ActionResult::Success,
+                "Killed".into(),
+                None,
+            );
+            pid += 1;
+        }
+        assert!(
+            !std::fs::read_to_string(&active)
+                .unwrap()
+                .contains("\"pid\":300"),
+            "the intent is in the archive, not the active file"
+        );
+        let second = ActionJournal::late();
+        let rec = second.bind(log_at(&active, &key_path, 16 * 1024), &active);
+        assert_eq!(rec.interrupted.len(), 1, "{rec:?}");
+        assert!(
+            rec.interrupted[0].contains("KillProcessTree pid 300"),
+            "{rec:?}"
+        );
+    }
+
+    /// Review of #476: a kill's intent is written before the kill (another
+    /// reader of the file sees it: a crash of the agent keeps it) and
+    /// synced with its outcome; a quarantine's is synced before it.
+    #[test]
+    fn a_kill_s_intent_is_synced_with_its_outcome_a_quarantine_s_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("actions.jsonl");
+        let j = ActionJournal::late();
+        j.bind(log_at(&active, &dir.path().join("k"), u64::MAX), &active);
+        let f0 = j.fsyncs();
+        let kill = j.intent(intent_row("KillProcess", 1));
+        assert_eq!(j.fsyncs(), f0, "not synced before the kill");
+        let rows = read_rows(&active).unwrap();
+        assert!(
+            rows.iter()
+                .any(|r| r.row == ActionRow::Intent && r.action == kill.number()),
+            "written before the kill"
+        );
+        kill.finish(ActionResult::Success, "Killed".into(), None);
+        assert_eq!(j.fsyncs(), f0 + 1, "synced with its outcome");
+        let q = j.intent(intent_row("Quarantine", 2));
+        assert_eq!(j.fsyncs(), f0 + 2, "synced before the quarantine");
+        q.finish(ActionResult::Success, "Quarantined".into(), None);
+        // a batch with one action that outlives the host: one sync for all
+        let batch = j.intents(vec![
+            intent_row("KillProcessTree", 3),
+            intent_row("StripFileCapability", 4),
+        ]);
+        assert_eq!(j.fsyncs(), f0 + 4);
+        for t in batch {
+            t.finish_deferred(ActionResult::Success, "done".into(), None);
+        }
+        j.sync();
+        assert_eq!(j.fsyncs(), f0 + 5);
+        for r in [
+            "Quarantine",
+            "StripFileCapability",
+            "Restore",
+            "SomethingNew",
+        ] {
+            assert!(synced_before_action(r), "{r}");
+        }
+        for r in [
+            "KillProcess",
+            "KillProcessTree",
+            "BlockOutbound",
+            "ThrottleProcess",
+            "FullNetworkIsolation",
+            "Isolate",
+            "Release",
+        ] {
+            assert!(!synced_before_action(r), "{r}");
+        }
     }
 }

@@ -3435,8 +3435,9 @@ fn response_dispatch_lines(
     vec![
         format!(
             "response dispatch : {}; {} slots, depth {} (low/medium/high/critical; max {}); {} \
-             submitted, {} queued, {} merged; taken {} ({} in their process's order, {} by age), \
-             wait p50 {} p99 {} max {}; {} run (longest {} µs)",
+             submitted, {} queued ({} Critical kills past the capacity), {} merged, {} \
+             superseded by a kill; taken {} ({} in their process's order, {} by age), wait p50 {} \
+             p99 {} max {}; {} run (longest {} µs)",
             if d.running {
                 "running".to_string()
             } else {
@@ -3447,7 +3448,9 @@ fn response_dispatch_lines(
             d.max_depth,
             d.submitted,
             d.queued,
+            d.over_cap,
             d.merged,
+            d.superseded,
             d.taken,
             d.inherited,
             d.aged,

@@ -58,9 +58,11 @@ self-integrity check) holds the record of every action the agent carries
 out on its own decision — a rule's response, a step of the COMBAT ladder
 (the soft egress block and its release, a kill tree, a quarantine, the
 isolation), an exec quarantine's kill or quarantine, the copy-on-write
-guard's automatic restore. **No action without a signed record**: each
-action's `intent` row is written and synced before it acts, and its
-`outcome` row after (`success`, `failure`, `partial`, `would_execute`
+guard's automatic restore. **No action without a signed record** (without
+an attempt at one: below): each action's `intent` row is written before it
+acts — synced before it when the action outlives a restart of the host (a
+quarantine, a capability strip, a restore), with the outcome otherwise (a
+kill, a block, a throttle, the isolation) — and its `outcome` row after (`success`, `failure`, `partial`, `would_execute`
 in detect-only, `not_run`, `abandoned` when the code holding it panicked).
 The two share `run` (the agent run, 16 hex digits, named in the start's
 journal: `actions journal: this run's id`) and `action` (its number in the
@@ -70,8 +72,9 @@ killed between the two: whether that action took effect is not known; the
 same start signs a `response_interrupted` audit row naming them and
 `nn-admin status --key` counts them (`intents of an earlier run without an
 outcome`). An `overflow` row names the responses decided and never run —
-displaced or refused by the full response queue, or still queued at the
-stop (stage 6). `sudo nn-admin chain verify --log actions` verifies it;
+displaced or refused by the full response queue (a Critical kill is never
+refused: it goes past the capacity), or still queued at the stop (stage
+6). `sudo nn-admin chain verify --log actions` verifies it;
 the record budget never limits it. A row the chain could not take (the
 log not open: no key, a write refused) is logged whole at ERROR (`an
 action's row is NOT in the signed actions chain — this line is its

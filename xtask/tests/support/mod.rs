@@ -522,7 +522,9 @@ pub fn is_test_file(rel: &str) -> bool {
 
 /// `code` (comments blanked) with its test items blanked: each item under
 /// `#[cfg(test)]` or `#[cfg(any(test, …))]` — a module's or a block's
-/// braces, or up to its `;` — newlines kept.
+/// braces, or up to its `;`; a struct's field or a struct literal's (`name:
+/// …`) up to its `,` (R12c, lab PR 270: a field ran to the next `{` or `;`
+/// and blanked production code after it) — newlines kept.
 pub fn production(code: &str) -> String {
     let mut out = code.as_bytes().to_vec();
     let mut from = 0;
@@ -531,6 +533,16 @@ pub fn production(code: &str) -> String {
         // the item: past the attribute, to its closing brace or `;`
         let attr_end = at + rest.find(']').map_or(rest.len(), |i| i + 1);
         let item = &code[attr_end..];
+        if let Some(len) = field_len(item) {
+            let end = attr_end + len;
+            for c in &mut out[at..end] {
+                if *c != b'\n' {
+                    *c = b' ';
+                }
+            }
+            from = end;
+            continue;
+        }
         let brace = item.find('{');
         let semi = item.find(';');
         let end = match (brace, semi) {
@@ -547,6 +559,40 @@ pub fn production(code: &str) -> String {
         from = end;
     }
     String::from_utf8(out).expect("ASCII blanks keep UTF-8")
+}
+
+/// When `item` is a field (`[pub] name: …`, of a struct or a struct
+/// literal): its length up to and including its `,` (or up to the `}`
+/// that closes its struct), brackets nested.
+fn field_len(item: &str) -> Option<usize> {
+    let t = item.trim_start();
+    let lead = item.len() - t.len();
+    let t2 = t
+        .strip_prefix("pub(crate) ")
+        .or_else(|| t.strip_prefix("pub "))
+        .unwrap_or(t);
+    let name = t2
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(0);
+    if name == 0 || t2.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+    let after = t2[name..].trim_start();
+    if !after.starts_with(':') || after.starts_with("::") {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, c) in item[lead..].char_indices() {
+        match c {
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '>' => depth -= 1,
+            '}' if depth == 0 => return Some(lead + i),
+            '}' => depth -= 1,
+            ',' if depth == 0 => return Some(lead + i + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The next `#[cfg(test)]` / `#[cfg(any(test` at or after `from`.

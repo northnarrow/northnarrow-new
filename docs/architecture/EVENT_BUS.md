@@ -347,23 +347,36 @@ lock, never a wait — and the thread takes them:
   the queue became first in, first out, 185 of 400 takes passing over a
   more severe job);
 - **in order per process** (a later response for the same process never
-  overtakes an earlier one): each process's jobs are kept in the order
-  they were decided, and a take runs the *oldest* job of the process the
-  lane names — a Critical kill decided after a Low throttle of the same
-  process raises that process's turn (priority inheritance) and the
-  throttle runs first, then the kill. One thread takes, so two jobs of one
-  process never run at once. The COMBAT ladder keeps its own worker
-  (external audit CMB-007) and the exec quarantine its thread: a rule's
-  response and a ladder step on the same process are not ordered between
-  them, as before R12c;
-- **a repeat merges**: a job of the same process, action and file as the
-  process's *last* queued job (a process that tripped two rules, or one
-  twice, before its kill ran) is merged into it — one action, both
-  decisions answered by its outcome, the lane raised to the more severe;
+  overtakes an earlier one): a process is its pid *and* its start (a
+  process that reused a pid is another one — review of #476, X1); each
+  process's jobs are kept in the order they were decided, and a take runs
+  the *oldest* job of the process the lane names — a Critical quarantine
+  decided after a Low strip of the same process raises that process's turn
+  (priority inheritance) and the strip runs first, then the quarantine.
+  One thread takes, so two jobs of one process never run at once. The
+  COMBAT ladder keeps its own worker (external audit CMB-007) and the exec
+  quarantine its thread: a rule's response and a ladder step on the same
+  process are not ordered between them, as before R12c;
+- **a kill goes first** (review of #476): a kill of a process is placed
+  before that process's queued jobs, and takes out its queued throttles
+  and blocks — each answered `not run: superseded by a kill of the same
+  process` and counted (`superseded`; not a loss: the kill does more) —
+  so a kill never waits behind what it makes pointless; the process's
+  quarantine or strip runs after it;
+- **a repeat merges**: a job of the same process (pid and start), action
+  and — but for a kill — file as the process's *last* queued job (its
+  first, for a kill) is merged into it (a process that tripped two rules,
+  or one twice, before its kill ran) — one action, both decisions answered
+  by its outcome, the lane raised to the more severe;
 - **a full queue** (`RESPONSE_QUEUE_CAP`, 1,024 jobs) never blocks the
   decision and never drops silently: the newest job of the least severe
-  lane below the new job's severity is displaced, or — every queued job at
-  least as severe — the new job is refused. Either is answered at once (its
+  lane below the new job's severity is displaced; when every queued job is
+  at least as severe, a **Critical kill is never refused** — it is queued
+  past the capacity (counted `over_cap`), up to four times it
+  (`OVER_CAP_FACTOR`, a hard bound: review of #476, X2 — decoys that keep
+  the queue full of Critical kills must not get the payload's kill
+  refused) — and any other new job is refused. A displaced or refused job
+  is answered at once (its
   decision's detection record says `not run: the response queue was full…`),
   counted per severity (stage 6), named in the next signed `overflow` row of
   the actions chain (at most one a second, and at the stop) and raises the
@@ -379,24 +392,35 @@ The decision's detection record follows its responses' outcomes, as before
 copy-on-first-write guard hears a ransomware rule's kill once it ran (the
 writer is flagged at the decision, as before).
 
-**No action without a signed record** (plan §3.4). Every action the agent
-carries out on the host on its own decision writes a signed `intent` row
-before it acts — synced before the action — and a signed `outcome` row
-after it, into the `actions` chain
+**No action without a signed record** (plan §3.4) — precisely, without an
+**attempt** at one: every action the agent carries out on the host on its
+own decision writes a signed `intent` row before it acts and a signed
+`outcome` row after it, into the `actions` chain; when the chain cannot
+take a row the action still proceeds (below). The intent row is written
+(`write(2)`: it survives a crash of the agent) before every action, and
+synced (on the disk) before the action when the action's effect outlives
+a restart of the host — a quarantine, a capability strip, a restore
+(`journal::synced_before_action`); a kill's, a block's, a throttle's, an
+isolation's intent is synced with its outcome (review of #476: the fsync
+before them slowed the kills on a busy disk and guarded only against a
+crash of the host, which ends their effect too). Every fsync is done
+outside the writer's lock (`RotatingChainLog::detach_sync`), so the
+ladder, the exec quarantine and the restore do not wait behind the
+dispatcher's. The chain:
 (`/var/lib/northnarrow/detections/actions.jsonl`, a rotating chain beside
 the detection log, KIND `actions`: `nn_evidence::action_payload`, its rows
 pinned; `docs/operator/EVIDENCE_CHAINS.md`). Its writer
 (`nn_linux::response::journal::ActionJournal`) makes the only ticket an
 action can run with: an `Intent`, made by `ActionJournal::intent` (or
-`intents`, a batch with one sync) after the intent row, its fields private;
+`intents`, a batch) after the intent row, its fields private;
 `Intent::finish` writes the outcome, and an intent dropped unanswered (a
 panic in the action) writes an `abandoned` outcome itself. Every acting
 entry point takes one — the executor's (`execute_on`, `execute_for_started`,
 `quarantine_handle`, …), the low-level kills, block, throttle, quarantine
 and strip, the isolator's `engage` —, so no caller compiles without the
 intent written first. Bracketed this way: a rule's responses (the
-dispatcher: a batch's intents with one sync, then each action and its
-outcome, the batch's outcomes synced), the COMBAT ladder's soft egress
+dispatcher: a batch's intents, then each action and its outcome, the
+batch's rows synced), the COMBAT ladder's soft egress
 block and its release, each offender's kill tree, each binary's quarantine
 and the isolation (`SystemActuator`; the ladder's own signed stage rows in
 the audit log still say why: evidence before enforcement), the exec
@@ -411,7 +435,11 @@ kernel's own refusals (the deny hooks; their records are Log-only
 detections) and the exploit guard's SIGKILL in the kernel (its detection
 record, never held by the budget — below); the operator's verbs
 (`nn-admin release`, `remediate`, `unlock`: the admin socket signs each
-request and its result); the watchdog's restart of the agent.
+request and its result); the watchdog's restart of the agent. One action
+of the agent's own is signed in the audit log only, not in the actions
+chain: at the start, the teardown of a COMBAT isolation a crashed run left
+behind (`reconcile_stale_chain`, `boot/posture.rs`; MAIN-013) — it lifts a
+containment rather than imposing one, before the actions chain is bound.
 
 A row the chain cannot take — not open yet, its log refused at the start
 (no key), a write that fails — is logged whole at ERROR (the journal's line
@@ -757,8 +785,10 @@ and kinds). R12c: two threads (the response dispatcher's and the
 dispatcher of slow work's, both blocked when idle), the response queue (at
 most 1,024 jobs, each holding its decision's event and decision, shared by
 the decision's responses), the actions chain (16 MiB × 8 archives at most;
-two rows per action, about 600 bytes, one fsync per batch of intents and
-one per batch of outcomes). The lab's numbers (overhead, latency per class, the
+two rows per action, about 600 bytes; one fsync per batch of rows, and one
+more before a batch that holds a quarantine, a strip or a restore; the
+response queue past its capacity only for Critical kills, at most four
+times it). The lab's numbers (overhead, latency per class, the
 soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
 
 ## 7. What is next
