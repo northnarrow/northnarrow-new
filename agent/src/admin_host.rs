@@ -99,7 +99,10 @@ impl AdminHost for AgentAdminHost {
     }
 
     fn verifying_key_of_signing_key(&self, path: &Path) -> anyhow::Result<VerifyingKey> {
-        crate::audit::read_signing_key(path).map(|key| key.verifying_key())
+        // R14c: the public half only
+        crate::audit::public_half(path)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .ok_or_else(|| anyhow::anyhow!("no signing key at {}", path.display()))
     }
 
     /// Where the agent keeps its chains under its state directory (was

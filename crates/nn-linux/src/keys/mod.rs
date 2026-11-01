@@ -1,6 +1,18 @@
-//! The agent's signing key: the Ed25519 key that signs every chain it
-//! writes, on disk (`/etc/northnarrow/agent.sig.key`, 0400) and its public
-//! half next to it (`agent.sig.pub`, 0444).
+//! The agent's keys, in one place (Wave 4 restructure, R14c — plan §3.3):
+//! the Ed25519 key that signs every chain it writes, on disk
+//! (`/etc/northnarrow/agent.sig.key`, 0400) and its public half next to it
+//! (`agent.sig.pub`, 0444); the quarantine vault's master key
+//! (`/etc/northnarrow/master.key`, 0600; [`vault`]).
+//!
+//! R14c: [`KeyStore`] (the start's key, decided by the preflight — lab PR
+//! 268's `BootKey` — and the vault's) holds each key once, in memory of its
+//! own ([`locked::Locked`]: `mlock`, `MADV_DONTDUMP`, zeroed when dropped),
+//! in a process that is not dumpable (`PR_SET_DUMPABLE 0`) under a unit with
+//! `LimitCORE=0`. It is not `Clone` and gives out handles only: an
+//! [`AgentSigningKey`] (`Arc` of the one key: it signs, it never shows its
+//! bytes; [`Signer`]) and a [`vault::Vault`] (it seals and opens records).
+//! `xtask/tests/keys_in_one_place.rs` holds every other production source of
+//! the core to naming neither the key types nor the key files' readers.
 //!
 //! Wave 4 restructure, R04a (lab PR 241): from `crate::audit`, unchanged
 //! (plan R04a: "AgentSigningKey si separa dal formato"; it becomes nn-linux's
@@ -12,11 +24,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-
-pub(crate) mod vault;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, SECRET_KEY_LENGTH};
+use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey, SECRET_KEY_LENGTH};
 use rand::rngs::SysRng;
 use rand::TryRng;
 use tracing::{info, warn};
@@ -24,6 +35,19 @@ use tracing::{info, warn};
 use crate::audit::PARENT_DIR_MODE;
 use crate::boot::checks::{KeyDecision, KeyPresent};
 use crate::chain_host::ChainSigner;
+
+pub mod locked;
+pub mod vault;
+
+use locked::Locked;
+pub use vault::Vault;
+
+/// R14c: what a holder of the agent's key can do with it — sign, and say
+/// its public half. No method gives the secret.
+pub trait Signer: Send + Sync + std::fmt::Debug {
+    fn sign(&self, msg: &[u8]) -> Signature;
+    fn verifying_key(&self) -> VerifyingKey;
+}
 
 /// Default location of the agent's audit-log signing key. Stored
 /// as exactly 32 lowercase-hex bytes + `\n` so an operator can
@@ -54,8 +78,45 @@ const SIGNING_KEY_HEX_LEN: usize = SECRET_KEY_LENGTH * 2;
 /// secret bytes never accidentally leak through `Debug` or
 /// `Display` derives. `Drop` zeroisation is owned by
 /// `ed25519-dalek`'s `zeroize` feature in its standard build.
+///
+/// R14c: a handle — the key itself is in the [`KeyStore`]'s locked memory,
+/// once; a clone of this shares it (an `Arc`), it never copies it.
+#[derive(Clone)]
 pub struct AgentSigningKey {
-    inner: SigningKey,
+    inner: Arc<Locked<SigningKey>>,
+}
+
+impl AgentSigningKey {
+    /// The key moved into memory of its own (`mlock`, `MADV_DONTDUMP`). A
+    /// lock the kernel refuses (`RLIMIT_MEMLOCK`) is said, not fatal.
+    fn locked(key: SigningKey) -> Result<Self> {
+        let inner = Locked::new(key).context("mapping the signing key's memory")?;
+        if !inner.locked() || !inner.dontdump() {
+            warn!(
+                target: "audit.signing_key",
+                locked = inner.locked(),
+                dontdump = inner.dontdump(),
+                "the signing key's memory is not locked or not out of the core dumps"
+            );
+        }
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// The key's memory is locked in RAM and out of the core dumps.
+    pub fn protected(&self) -> (bool, bool) {
+        (self.inner.locked(), self.inner.dontdump())
+    }
+}
+
+impl Signer for AgentSigningKey {
+    fn sign(&self, msg: &[u8]) -> Signature {
+        AgentSigningKey::sign(self, msg)
+    }
+    fn verifying_key(&self) -> VerifyingKey {
+        AgentSigningKey::verifying_key(self)
+    }
 }
 
 // Manual Debug: never print the secret bytes. We expose the
@@ -76,7 +137,7 @@ impl AgentSigningKey {
     /// The review of #468, R4: the tests' door — test builds only (`test`,
     /// and `test-util`, a dev-dependency feature: no build of the binaries
     /// has it). The start decides its key once, in its preflight, and loads
-    /// it once ([`BootKey`]: [`Self::load_existing`], or [`Self::mint_first`]
+    /// it once ([`KeyStore`]: [`Self::load_existing`], or [`Self::mint_first`]
     /// on a first install); nothing else mints one.
     ///
     /// Errors are the same shape as
@@ -213,8 +274,8 @@ impl AgentSigningKey {
 }
 
 fn mint_signing_key() -> Result<SigningKey> {
-    let mut secret = [0u8; SECRET_KEY_LENGTH];
-    SysRng.try_fill_bytes(&mut secret).map_err(|e| {
+    let mut secret = zeroize::Zeroizing::new([0u8; SECRET_KEY_LENGTH]);
+    SysRng.try_fill_bytes(&mut *secret).map_err(|e| {
         anyhow!("the OS random source failed to provide entropy for signing key: {e}")
     })?;
     Ok(SigningKey::from_bytes(&secret))
@@ -237,13 +298,52 @@ pub fn read_verifying_key(path: &Path) -> Result<VerifyingKey> {
         .map_err(|e| anyhow!("{}: not an Ed25519 key: {e}", path.display()))
 }
 
+/// R14c: the tests' doors of this module, which a glob re-exports where a
+/// crate re-exports this module's names (empty outside the tests and the
+/// `test-util` builds of the agent's tests: no build of the binaries has
+/// them).
+pub mod test_doors {
+    #[cfg(any(test, feature = "test-util"))]
+    pub use super::read_signing_key;
+}
+
+/// R14c: the public half of the signing key at `path`, for a reader that
+/// verifies and never signs (the rollback floor's scan at boot, nn-admin's
+/// host): the key's own half when its file can be read — the key parsed
+/// here and dropped at once, zeroized — else the half published beside it
+/// (`agent.sig.pub`), which a restart under the previous instance's hooks
+/// (they close the key to it) can read. `Ok(None)`: there is no key.
+pub fn public_half(path: &Path) -> Result<Option<VerifyingKey>, String> {
+    let own = read_key_file(path)
+        .map_err(|e| (e.kind() == std::io::ErrorKind::NotFound, anyhow!(e)))
+        .and_then(|(raw, _)| {
+            let raw = zeroize::Zeroizing::new(raw);
+            parse_signing_key(&raw)
+                .map(|k| k.verifying_key())
+                .map_err(|e| (false, e))
+        });
+    match own {
+        Ok(v) => Ok(Some(v)),
+        Err((true, _)) => Ok(None),
+        Err((false, e)) => read_verifying_key(&verifying_key_path(path))
+            .map(Some)
+            .map_err(|p| {
+                format!(
+                    "the agent signing key is unreadable ({e:#}) and so is its public half ({p:#})"
+                )
+            }),
+    }
+}
+
 /// The private key at `path`, read and parsed — never minted (legacy
-/// verification on a host without `agent.sig.pub`).
+/// verification on a host without `agent.sig.pub`). R14c: the tests' (the
+/// fixed keys of the format pins); the start's key is the [`KeyStore`]'s,
+/// and a reader that only verifies takes [`public_half`].
+#[cfg(any(test, feature = "test-util"))]
 pub fn read_signing_key(path: &Path) -> Result<AgentSigningKey> {
     let (raw, _) = read_key_file(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(AgentSigningKey {
-        inner: parse_signing_key(&raw)?,
-    })
+    let raw = zeroize::Zeroizing::new(raw);
+    AgentSigningKey::locked(parse_signing_key(&raw)?)
 }
 
 /// The longest key file read: the key is 64 hex characters and a newline.
@@ -316,7 +416,8 @@ fn parse_signing_key(raw: &str) -> Result<SigningKey> {
         }
         _ => anyhow!("signing key is not valid hex"),
     })?;
-    let mut secret = [0u8; SECRET_KEY_LENGTH];
+    let bytes = zeroize::Zeroizing::new(bytes);
+    let mut secret = zeroize::Zeroizing::new([0u8; SECRET_KEY_LENGTH]);
     secret.copy_from_slice(&bytes);
     Ok(SigningKey::from_bytes(&secret))
 }
@@ -331,6 +432,7 @@ fn loaded(
 ) -> Result<AgentSigningKey> {
     let (content, opened) =
         read.map_err(|e| anyhow!(e).context(format!("reading {}", path.display())))?;
+    let content = zeroize::Zeroizing::new(content);
     if let Some(seen) = seen.filter(|s| *s != opened) {
         return Err(anyhow!(
             "agent signing key {} is not the file the start's check found there (device {} \
@@ -358,7 +460,7 @@ fn loaded(
         path = %path.display(),
         "reusing existing agent signing key"
     );
-    let key = AgentSigningKey { inner: key };
+    let key = AgentSigningKey::locked(key)?;
     key.publish_verifying_key(path);
     Ok(key)
 }
@@ -386,7 +488,7 @@ fn mint_at(path: &Path) -> Result<AgentSigningKey> {
         path = %path.display(),
         "bootstrapped fresh agent signing key"
     );
-    let key = AgentSigningKey { inner: key };
+    let key = AgentSigningKey::locked(key)?;
     key.publish_verifying_key(path);
     Ok(key)
 }
@@ -495,10 +597,7 @@ impl ChainSigner for AgentSigningKey {
 /// signing key if readable, else its published public half. (From
 /// `crate::chain_anchor`, R04a, lab PR 241: it reads key files.)
 pub fn boot_verifying_key(signing_key_file: &Path) -> Option<VerifyingKey> {
-    match read_signing_key(signing_key_file) {
-        Ok(k) => Some(k.verifying_key()),
-        Err(_) => read_verifying_key(&verifying_key_path(signing_key_file)).ok(),
-    }
+    public_half(signing_key_file).ok().flatten()
 }
 
 /// The review of #468, R4: the agent's signing key for one start — decided
@@ -522,10 +621,14 @@ pub fn boot_verifying_key(signing_key_file: &Path) -> Option<VerifyingKey> {
 /// ([`Self::load`], right after the start registered with the previous
 /// agent's hooks), or a refusal's signature when the preflight refused the
 /// start (no state file is bootstrapped then, review #466 F8).
+///
+/// R14c: and the vault's master key — one store for the start's keys, not
+/// `Clone`, handing out handles only ([`Self::signer`], [`Self::vault`]).
 #[derive(Debug)]
-pub struct BootKey {
+pub struct KeyStore {
     path: PathBuf,
     slot: std::sync::Mutex<Slot>,
+    vault: Vault,
 }
 
 #[derive(Debug)]
@@ -541,7 +644,7 @@ enum Slot {
     Failed(String),
 }
 
-/// Why [`BootKey::signer`] gives no key.
+/// Why [`KeyStore::signer`] gives no key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoKey {
     /// The key's file cannot be opened by this process (`EACCES`): the
@@ -562,14 +665,19 @@ impl std::fmt::Display for NoKey {
 
 impl std::error::Error for NoKey {}
 
-impl BootKey {
+impl KeyStore {
     /// The start's key, at the path the preflight decided on and as it
     /// decided it (nothing read yet; the review of #473, B1: the path is the
     /// decision's, not one the caller names).
+    ///
+    /// R14c: with the quarantine vault's key at its configured path
+    /// (`nn_core`'s `ExecutorConfig`'s, `/etc/northnarrow/master.key`),
+    /// loaded at its first use.
     pub fn decided(decision: KeyDecision) -> Self {
-        BootKey {
+        KeyStore {
             path: decision.path().to_path_buf(),
             slot: std::sync::Mutex::new(Slot::Decided(decision)),
+            vault: Vault::at(&nn_core::response::config::ExecutorConfig::default().master_key_file),
         }
     }
 
@@ -577,9 +685,10 @@ impl BootKey {
     /// agent's tests (`test-util`: no build of the binaries has it).
     #[cfg(any(test, feature = "test-util"))]
     pub fn loaded_for_tests(path: &Path) -> Result<Self> {
-        Ok(BootKey {
+        Ok(KeyStore {
             path: path.to_path_buf(),
             slot: std::sync::Mutex::new(Slot::Loaded(AgentSigningKey::load_or_bootstrap(path)?)),
+            vault: Vault::at(&path.with_file_name("master.key")),
         })
     }
 
@@ -598,9 +707,19 @@ impl BootKey {
     /// A copy of the start's one key, for one chain (loaded at the first
     /// use, [`Self::load`]); or why there is none.
     pub fn signer(&self) -> Result<AgentSigningKey, NoKey> {
-        self.with_loaded(|k| AgentSigningKey {
-            inner: k.inner.clone(),
-        })
+        self.with_loaded(AgentSigningKey::clone)
+    }
+
+    /// R14c: the same handle, as the trait object a holder that only signs
+    /// takes.
+    pub fn dyn_signer(&self) -> Result<Arc<dyn Signer>, NoKey> {
+        self.with_loaded(|k| Arc::new(k.clone()) as Arc<dyn Signer>)
+    }
+
+    /// R14c: the quarantine vault's key (loaded at its first use, then held
+    /// here; [`Vault`]).
+    pub fn vault(&self) -> Vault {
+        self.vault.clone()
     }
 
     /// The verifying key of the start's key, once it is loaded (no load).
@@ -717,6 +836,13 @@ mod tests {
             second.inner.to_bytes(),
             "second load must return the persisted key bytes"
         );
+        // R14c: one copy of the key, in locked memory out of the dumps
+        assert!(first.protected().1, "MADV_DONTDUMP");
+        let a = first.clone();
+        assert!(
+            Arc::ptr_eq(&a.inner, &first.inner),
+            "a clone shares the key"
+        );
     }
 
     #[test]
@@ -772,7 +898,7 @@ mod tests {
     /// but the start's one load. In every source of the workspace's crates,
     /// their tests left out (`tests/`, `tests.rs`, `*_tests.rs`, a
     /// `#[cfg(test)] mod` and what follows it, comments): `mint_first(` is
-    /// named twice, both here — its definition and [`BootKey`]'s one call —;
+    /// named twice, both here — its definition and [`KeyStore`]'s one call —;
     /// a [`crate::boot::checks::FirstInstall`] is built only by the check
     /// that decides (and its test door); the key's writers are called from
     /// here alone; and the tests' minting door, `load_or_bootstrap`, is
@@ -898,7 +1024,7 @@ mod tests {
             .rfind("#[cfg(any(test, feature = \"test-util\"))]\n    pub fn loaded_for_tests(")
             .is_some_and(|at| !here[at..door].contains("\n    }\n")));
         // the one call of the mint is the start's key's
-        let boot_key = &here[here.find("impl BootKey {").unwrap()..];
+        let boot_key = &here[here.find("impl KeyStore {").unwrap()..];
         assert!(boot_key.contains("AgentSigningKey::mint_first(first)"));
     }
 

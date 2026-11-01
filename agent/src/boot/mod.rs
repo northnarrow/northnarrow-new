@@ -314,6 +314,13 @@ async fn run(
         &lineage,
         own_launch,
     );
+    // R14c (plan §3.3): the quarantine vault's key is the key store's: the
+    // executor, the exec quarantine and the restore verbs seal and open
+    // through its vault, and none of them holds the key.
+    let exec_cfg = northnarrow_agent::response::config::ExecutorConfig {
+        vault: Some(Arc::new(signing_key.vault())),
+        ..exec_cfg
+    };
     let response::Response {
         legacy_isolation_removed,
         execq_exec_cfg,
@@ -856,7 +863,7 @@ mod tests {
             for later in [
                 "checks::ebpf_object(",
                 "preregister_self(",
-                "BootKey::decided(",
+                "KeyStore::decided(",
                 "signing_key.load()",
                 "agent_id::resolve(",
             ] {
@@ -865,7 +872,7 @@ mod tests {
         }
         // the key decided right after its check, loaded once the start
         // registered with the previous agent's hooks, before the identity
-        assert!(at("BootKey::decided(") < at("checks::ebpf_object("));
+        assert!(at("KeyStore::decided(") < at("checks::ebpf_object("));
         assert!(at("preregister_self(") < at("signing_key.load()"));
         assert!(at("signing_key.load()") < at("agent_id::resolve("));
         let selftest = at("boot::deny_selftest::run(");
@@ -915,7 +922,7 @@ mod tests {
 
     /// The review of #468, R4 (the ratchet): the start decides its signing
     /// key once and loads it once. The preflight makes the one
-    /// `BootKey` from `checks::signing_identity`'s decision, the state
+    /// `KeyStore` from `checks::signing_identity`'s decision, the state
     /// bootstrap loads it, and every phase that signs — the audit check,
     /// the refusals, the attest phase, the anchor, the stores, FIM, the
     /// canaries, the network logs — takes a copy of that one key
@@ -937,9 +944,9 @@ mod tests {
                 "the start loads a key of its own: `{other}`"
             );
         }
-        assert_eq!(sources.matches("BootKey::decided(").count(), 1);
+        assert_eq!(sources.matches("KeyStore::decided(").count(), 1);
         assert!(function(PHASES[1].1, PHASES[1].2)
-            .contains("let signing_key = northnarrow_agent::keys::BootKey::decided(decision);"));
+            .contains("let signing_key = northnarrow_agent::keys::KeyStore::decided(decision);"));
         assert_eq!(sources.matches("signing_key.load()").count(), 1);
         assert!(function(PHASES[2].1, PHASES[2].2).contains("signing_key.load()"));
         // the one decision is the check's

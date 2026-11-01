@@ -102,20 +102,8 @@ impl RollbackFloor {
     /// (`agent.sig.pub`), which the same hooks keep from being rewritten.
     pub fn scan(audit_log: &Path, signing_key_file: &Path) -> Self {
         let started = std::time::Instant::now();
-        let key = match crate::audit::read_signing_key(signing_key_file) {
-            Ok(k) => Ok(Some(k.verifying_key())),
-            Err(e) if not_found(&e) => Ok(None),
-            Err(e) => {
-                let public = crate::audit::verifying_key_path(signing_key_file);
-                crate::audit::read_verifying_key(&public)
-                    .map(Some)
-                    .map_err(|p| {
-                        format!(
-                            "the agent signing key is unreadable ({e:#}) and so is its public half ({p:#})"
-                        )
-                    })
-            }
-        };
+        // R14c: the public half only (the key store holds the key)
+        let key = crate::audit::public_half(signing_key_file);
         let floor = Self::scan_with(audit_log, key, unix_now());
         tracing::info!(
             verified = floor.verified,
@@ -475,12 +463,6 @@ fn chain_lines(bytes: &[u8]) -> Vec<&[u8]> {
         }
     }
     lines
-}
-
-fn not_found(e: &anyhow::Error) -> bool {
-    e.root_cause()
-        .downcast_ref::<std::io::Error>()
-        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn unix_now() -> u64 {

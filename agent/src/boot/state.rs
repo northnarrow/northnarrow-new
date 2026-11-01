@@ -29,7 +29,7 @@ pub(crate) fn bootstrap(
     cli: &Cli,
     heads_file: &std::path::Path,
     preflight_refused: bool,
-    signing_key: &northnarrow_agent::keys::BootKey,
+    signing_key: &northnarrow_agent::keys::KeyStore,
 ) -> StateReady {
     // External audit EBPF-015: the predecessor's pinned deny hooks refuse
     // a new entry in the agent's directories to a process not yet
@@ -297,7 +297,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cli = cli(dir.path());
         let heads = dir.path().join("chain_heads.json");
-        let key = northnarrow_agent::keys::BootKey::decided(
+        let key = northnarrow_agent::keys::KeyStore::decided(
             northnarrow_agent::boot::checks::KeyDecision::first_install_for_tests(
                 &cli.signing_key_file,
             ),
@@ -336,7 +336,7 @@ mod tests {
         let mut boot = northnarrow_agent::boot::BootSequence::for_tests();
         let decision =
             northnarrow_agent::boot::checks::KeyDecision::present_for_tests(&cli.signing_key_file);
-        let key = northnarrow_agent::keys::BootKey::decided(decision);
+        let key = northnarrow_agent::keys::KeyStore::decided(decision);
         let public = northnarrow_agent::keys::verifying_key_path(&cli.signing_key_file);
         std::fs::remove_file(&cli.signing_key_file).unwrap();
         std::fs::remove_file(&public).unwrap();

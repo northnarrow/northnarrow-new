@@ -10,10 +10,12 @@
 //!     └── <uuid>.meta     (JSON metadata, mode 0600)
 //! ```
 //!
-//! Crypto:
+//! Crypto (R14c: the key store's, `crate::keys::vault` — this module seals
+//! and opens records through [`ExecutorConfig::vault`] and never holds the
+//! key):
 //! - Master key: 32 random bytes at [`ExecutorConfig::master_key_file`],
-//!   created mode 0600 on first use, kept in memory wrapped in
-//!   `Zeroizing<[u8; 32]>` so it gets wiped on drop.
+//!   created mode 0600 on first use, then held by the key store in memory
+//!   of its own (`mlock`, `MADV_DONTDUMP`, zeroed when dropped).
 //! - Per-file derivation: HKDF-SHA256 with the format's salt and per-file
 //!   info equal to the vault id. This means a leaked file-key can decrypt
 //!   only its own ciphertext.
@@ -51,15 +53,16 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use super::{config::ExecutorConfig, ExecutionOutcome};
-// R14c: the records' crypto, moved into the key store's module
-use crate::keys::vault::{
-    bad_record, load_or_init_master_key, open, open_v1, record_format, seal_v2, NONCE_LEN,
-    RECORD_V2,
-};
-#[cfg(test)]
-use crate::keys::vault::{derive_file_key, derive_file_key_v2, open_v2, seal, HEADER_LEN};
-#[cfg(test)]
-use zeroize::Zeroizing;
+use crate::keys::vault::{bad_record, record_format, RECORD_V2};
+
+/// R14c: the vault `cfg` seals and opens through — the key store's
+/// ([`ExecutorConfig::vault`]), or, in a configuration without it (the
+/// tests'), one for its path.
+fn vault_of(cfg: &ExecutorConfig) -> std::sync::Arc<dyn nn_core::response::config::VaultKey> {
+    cfg.vault
+        .clone()
+        .unwrap_or_else(|| std::sync::Arc::new(crate::keys::Vault::at(&cfg.master_key_file)))
+}
 
 /// Paths that are NEVER quarantined, whatever the verdict says.
 ///
@@ -226,6 +229,7 @@ impl ExeHandle {
         (self.dev, self.ino)
     }
 }
+const NONCE_LEN: usize = 12;
 
 /// Public entry point: encrypt the binary backing `target_pid` and
 /// remove the original file.
@@ -451,11 +455,11 @@ pub fn restore(vault_id: &str, out_path: &Path, cfg: &ExecutorConfig) -> std::io
         return Err(std::io::Error::other("vault file too short"));
     }
 
-    let master = load_or_init_master_key(cfg)?;
+    let vault = vault_of(cfg);
     let plaintext = match declared_format(&meta)? {
         // Written before lab PR 238: a v1 record, read as one whatever its
         // first (random) bytes are.
-        None => open_v1(&master, vault_id, &bin)?,
+        None => zeroize::Zeroizing::new(vault.open_v1(vault_id, &bin)?),
         Some(declared) => {
             let found = record_format(&bin)?;
             if found != declared {
@@ -467,7 +471,7 @@ pub fn restore(vault_id: &str, out_path: &Path, cfg: &ExecutorConfig) -> std::io
                     ),
                 ));
             }
-            open(&master, vault_id, &bin)?
+            zeroize::Zeroizing::new(vault.open(vault_id, &bin)?)
         }
     };
     drop(bin);
@@ -610,11 +614,11 @@ fn quarantine_file_after_check(
 
     // Encrypt.
     let vault_id = uuid::Uuid::new_v4().simple().to_string();
-    let master = load_or_init_master_key(cfg)?;
     let mut nonce = [0u8; NONCE_LEN];
     crate::os_rng::OsRng.fill_bytes(&mut nonce);
-    let record = seal_v2(&master, &vault_id, &nonce, &content)
-        .map_err(|e| QuarantineError::Crypto(format!("encrypt: {e}")))?;
+    let record = vault_of(cfg)
+        .seal(&vault_id, &nonce, &content)
+        .map_err(|e| QuarantineError::Crypto(format!("{e}")))?;
 
     // Lay out the vault.
     let vault_dir = cfg.quarantine_dir.join("vault");
@@ -926,7 +930,17 @@ fn declared_format(meta: &serde_json::Value) -> std::io::Result<Option<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // R14c: the record crypto is the key store's vault's (its pinned
+    // vectors still checked here, against what the quarantine writes)
+    use crate::keys::vault::{
+        derive_file_key, derive_file_key_v2, open, open_v1, open_v2, seal, seal_v2, HEADER_LEN,
+    };
     use tempfile::TempDir;
+    use zeroize::Zeroizing;
+
+    fn load_or_init_master_key(cfg: &ExecutorConfig) -> std::io::Result<Zeroizing<[u8; 32]>> {
+        crate::keys::vault::load_or_init_master_key(&cfg.master_key_file)
+    }
 
     fn cfg_for(tmp: &TempDir) -> ExecutorConfig {
         let mut c = ExecutorConfig::for_test(tmp.path());

@@ -15,6 +15,20 @@
 //! its path.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// R14c (plan §3.3): the quarantine vault's key, held by the agent's key
+/// store (nn-linux's `keys::Vault`): the executor seals and opens records
+/// through it and never holds the key.
+pub trait VaultKey: Send + Sync + std::fmt::Debug {
+    /// A record (the current format) of `content` for the entry
+    /// `vault_id`.
+    fn seal(&self, vault_id: &str, nonce: &[u8; 12], content: &[u8]) -> std::io::Result<Vec<u8>>;
+    /// The content of a record, in the format its first bytes name.
+    fn open(&self, vault_id: &str, record: &[u8]) -> std::io::Result<Vec<u8>>;
+    /// The content of a v1 record (an entry whose `.meta` names no format).
+    fn open_v1(&self, vault_id: &str, record: &[u8]) -> std::io::Result<Vec<u8>>;
+}
 
 #[derive(Clone, Debug)]
 pub struct ExecutorConfig {
@@ -23,6 +37,10 @@ pub struct ExecutorConfig {
     pub quarantine_dir: PathBuf,
     /// 32-byte master key. Generated mode 0600 if absent.
     pub master_key_file: PathBuf,
+    /// R14c: the key store's vault (its key at [`Self::master_key_file`]).
+    /// `None`: the executor's actions build one for the path at each use
+    /// (the tests').
+    pub vault: Option<Arc<dyn VaultKey>>,
     /// Cap on file size (bytes) we'll quarantine in one go. Bigger
     /// targets get a `Failed { errno = EFBIG }` outcome.
     pub quarantine_max_bytes: u64,
@@ -142,6 +160,7 @@ impl ExecutorConfig {
         Self {
             quarantine_dir: tmp_root.join("quarantine"),
             master_key_file: tmp_root.join("master.key"),
+            vault: None,
             isolation_flag_file: tmp_root.join("isolated"),
             containment_file: tmp_root.join("containment.json"),
             cgroup_root: tmp_root.join("cgroup"),
@@ -190,6 +209,7 @@ impl Default for ExecutorConfig {
         Self {
             quarantine_dir: PathBuf::from("/var/lib/northnarrow/quarantine"),
             master_key_file: PathBuf::from("/etc/northnarrow/master.key"),
+            vault: None,
             quarantine_max_bytes: 100 * 1024 * 1024,
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             cgroup_slice: "northnarrow.slice".into(),

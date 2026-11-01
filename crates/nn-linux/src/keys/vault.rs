@@ -1,10 +1,30 @@
-//! The quarantine vault's records (Wave 4 restructure, R14c — plan §3.3):
-//! the crypto of lab PRs 230 and 238, moved here from `response::quarantine`
-//! as it was (the items made visible to the crate; their bodies unchanged).
+//! The quarantine vault's key and its records (Wave 4 restructure, R14c —
+//! plan §3.3; the crypto lab PR 230 and 238 wrote, moved here from
+//! `response::quarantine` unchanged).
+//!
+//! [`Vault`] is the [`super::KeyStore`]'s handle on the master key: 32
+//! random bytes at the configured path (`/etc/northnarrow/master.key`,
+//! 0600), created at the first use as before, read once, then held in
+//! memory of its own ([`super::locked::Locked`]: `mlock`, `MADV_DONTDUMP`,
+//! zeroed when dropped). The quarantine seals and opens records through it
+//! (`nn_core::response::config::VaultKey`) and never holds the key; a
+//! configuration without the store's vault (the tests') gets one for its
+//! path.
+//!
+//! The records:
+//! - **v2**, written since lab PR 238: `"NNQV" ‖ 0x02 ‖ nonce (12) ‖
+//!   ciphertext ‖ tag (16)`, AES-256-GCM under HKDF-SHA256 of the master
+//!   key, salt `"northnarrow-quarantine-v2"`, info the vault id; the header
+//!   and the vault id authenticated with it;
+//! - **v1**, written before: `nonce (12) ‖ ciphertext ‖ tag (16)`, salt
+//!   `"northnarrow-quarantine-v1"`, the vault id as associated data. Read,
+//!   never written.
 
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -13,10 +33,10 @@ use rand::Rng;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::response::config::ExecutorConfig;
+use super::locked::Locked;
 
 /// The nonce of a record.
-pub(crate) const NONCE_LEN: usize = 12;
+pub const NONCE_LEN: usize = 12;
 
 /// HKDF salt of the v1 record (no header: the salt was the only version).
 pub(crate) const KDF_SALT: &[u8] = b"northnarrow-quarantine-v1";
@@ -26,16 +46,105 @@ pub(crate) const KDF_SALT_V2: &[u8] = b"northnarrow-quarantine-v2";
 pub(crate) const RECORD_MAGIC: [u8; 4] = *b"NNQV";
 /// The format the quarantine writes (lab PR 238), the byte after
 /// [`RECORD_MAGIC`] and the `.meta`'s `format`.
-pub(crate) const RECORD_V2: u8 = 2;
+pub const RECORD_V2: u8 = 2;
 /// [`RECORD_MAGIC`] and the version byte.
 pub(crate) const HEADER_LEN: usize = RECORD_MAGIC.len() + 1;
 
-/// Load the 32-byte master key. Generate + write mode 0600 on first
-/// use.
-pub(crate) fn load_or_init_master_key(
-    cfg: &ExecutorConfig,
-) -> std::io::Result<Zeroizing<[u8; 32]>> {
-    if let Ok(bytes) = fs::read(&cfg.master_key_file) {
+/// The vault's master key, held once ([`super::KeyStore::vault`]); a
+/// clone shares it.
+#[derive(Clone)]
+pub struct Vault(Arc<Inner>);
+
+struct Inner {
+    path: PathBuf,
+    key: parking_lot::Mutex<Option<Arc<Locked<Zeroizing<[u8; 32]>>>>>,
+}
+
+impl std::fmt::Debug for Vault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Vault")
+            .field("path", &self.0.path)
+            .field("loaded", &self.0.key.lock().is_some())
+            .finish()
+    }
+}
+
+impl Vault {
+    /// The vault whose master key is at `path` (nothing read yet).
+    pub fn at(path: &Path) -> Self {
+        Self(Arc::new(Inner {
+            path: path.to_path_buf(),
+            key: parking_lot::Mutex::new(None),
+        }))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0.path
+    }
+
+    /// The master key: read (or created) at the first use, then held.
+    fn master(&self) -> std::io::Result<Arc<Locked<Zeroizing<[u8; 32]>>>> {
+        let mut slot = self.0.key.lock();
+        if let Some(k) = slot.as_ref() {
+            return Ok(Arc::clone(k));
+        }
+        let k = Arc::new(Locked::new(load_or_init_master_key(&self.0.path)?)?);
+        *slot = Some(Arc::clone(&k));
+        Ok(k)
+    }
+
+    /// A v2 record of `content` for the entry `vault_id`.
+    pub fn seal_v2(
+        &self,
+        vault_id: &str,
+        nonce: &[u8; NONCE_LEN],
+        content: &[u8],
+    ) -> std::io::Result<Vec<u8>> {
+        let master = self.master()?;
+        seal_v2(&master, vault_id, nonce, content)
+            .map_err(|e| std::io::Error::other(format!("encrypt: {e}")))
+    }
+
+    /// The content of a record in the format its first bytes name.
+    pub fn open(&self, vault_id: &str, bin: &[u8]) -> std::io::Result<Zeroizing<Vec<u8>>> {
+        let master = self.master()?;
+        open(&master, vault_id, bin)
+    }
+
+    /// A v1 record's content (an entry whose `.meta` names no format).
+    pub fn open_v1(&self, vault_id: &str, bin: &[u8]) -> std::io::Result<Zeroizing<Vec<u8>>> {
+        let master = self.master()?;
+        open_v1(&master, vault_id, bin)
+    }
+
+    /// R14c: the key is held, locked in RAM and out of the core dumps
+    /// (`None`: not used yet).
+    pub fn protected(&self) -> Option<(bool, bool)> {
+        self.0
+            .key
+            .lock()
+            .as_ref()
+            .map(|k| (k.locked(), k.dontdump()))
+    }
+}
+
+impl nn_core::response::config::VaultKey for Vault {
+    fn seal(&self, vault_id: &str, nonce: &[u8; 12], content: &[u8]) -> std::io::Result<Vec<u8>> {
+        self.seal_v2(vault_id, nonce, content)
+    }
+    fn open(&self, vault_id: &str, record: &[u8]) -> std::io::Result<Vec<u8>> {
+        Vault::open(self, vault_id, record).map(|z| z.to_vec())
+    }
+    fn open_v1(&self, vault_id: &str, record: &[u8]) -> std::io::Result<Vec<u8>> {
+        Vault::open_v1(self, vault_id, record).map(|z| z.to_vec())
+    }
+}
+
+/// Load the 32-byte master key at `path`. Generate + write mode 0600 on
+/// first use (the quarantine's `load_or_init_master_key` until R14c).
+pub(crate) fn load_or_init_master_key(path: &Path) -> std::io::Result<Zeroizing<[u8; 32]>> {
+    if let Ok(bytes) = fs::read(path) {
+        let bytes = Zeroizing::new(bytes);
         if bytes.len() == 32 {
             let mut k = Zeroizing::new([0u8; 32]);
             k.copy_from_slice(&bytes);
@@ -43,11 +152,11 @@ pub(crate) fn load_or_init_master_key(
         }
         return Err(std::io::Error::other(format!(
             "master key at {} has wrong length {}",
-            cfg.master_key_file.display(),
+            path.display(),
             bytes.len()
         )));
     }
-    if let Some(parent) = cfg.master_key_file.parent() {
+    if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut k = Zeroizing::new([0u8; 32]);
@@ -56,7 +165,7 @@ pub(crate) fn load_or_init_master_key(
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&cfg.master_key_file)?;
+        .open(path)?;
     f.write_all(&*k)?;
     f.sync_all()?;
     Ok(k)

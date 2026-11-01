@@ -32,7 +32,7 @@ pub(crate) fn start(
     chain_store: Arc<
         parking_lot::Mutex<northnarrow_agent::decision::correlation::CorrelationStore>,
     >,
-    signing_key: &northnarrow_agent::keys::BootKey,
+    signing_key: &northnarrow_agent::keys::KeyStore,
 ) {
     // ── Tappa 10 N9 — net drain subsystem boot ─────────────────────
     //

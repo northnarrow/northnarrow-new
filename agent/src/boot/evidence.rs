@@ -63,7 +63,7 @@ pub(crate) fn attest(
     dns_mode: northnarrow_agent::sensors::dns_sensor::DnsMode,
     caps_degraded: Vec<String>,
     audit: checks::AuditOpen,
-    signing_key: &northnarrow_agent::keys::BootKey,
+    signing_key: &northnarrow_agent::keys::KeyStore,
 ) -> Result<Attested> {
     // Lab PR 218: the signed audit log right after the self-test, before
     // the subsystems below load (the blocklists, the rules, the response
@@ -378,7 +378,7 @@ pub(crate) fn wire(
     installer_override: &Arc<
         northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
     >,
-    signing_key: &northnarrow_agent::keys::BootKey,
+    signing_key: &northnarrow_agent::keys::KeyStore,
 ) -> Wired {
     // Tappa 10.8 BPF self-defence: the link self-check needs the audit log,
     // which did not exist when the hooks attached.
@@ -477,7 +477,7 @@ pub(crate) struct Stores {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn heartbeat(
     cli: &Cli,
-    signing_key: &northnarrow_agent::keys::BootKey,
+    signing_key: &northnarrow_agent::keys::KeyStore,
     protection: std::sync::Arc<dyn northnarrow_agent::chainlog::ProtectionManager>,
     rotation_on: bool,
     audit_log: &AuditHandle,
@@ -562,7 +562,7 @@ pub(crate) fn stores(
     chain_anchor: &AnchorHandle,
     audit_log: &AuditHandle,
     defense_detector: &Arc<northnarrow_agent::impair::DefenseDetector>,
-    signing_key: &northnarrow_agent::keys::BootKey,
+    signing_key: &northnarrow_agent::keys::KeyStore,
     journal: &northnarrow_agent::response::journal::ActionJournal,
 ) -> Stores {
     // BUG-026: ONE shared StateDirProtection for the rotating on-disk logs
@@ -888,7 +888,7 @@ pub(crate) fn drain_ended(
 /// this boot found (before this boot appends anything). Reports a removed
 /// anchor first ([`northnarrow_agent::chain_anchor::BootCheck::heads_missing`]).
 fn start_chain_anchor(
-    signing_key: &northnarrow_agent::keys::BootKey,
+    signing_key: &northnarrow_agent::keys::KeyStore,
     heads_file: &std::path::Path,
     targets: &[northnarrow_agent::chain_anchor::ChainTarget],
     boot: &mut northnarrow_agent::chain_anchor::BootCheck,

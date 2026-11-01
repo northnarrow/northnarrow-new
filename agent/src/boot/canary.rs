@@ -22,7 +22,7 @@ pub(crate) fn start(
     agent_id: [u8; 16],
     audit_log: &AuditHandle,
     fim_admin_state: &Option<Arc<admin_socket::FimAdminState>>,
-    signing_key: &northnarrow_agent::keys::BootKey,
+    signing_key: &northnarrow_agent::keys::KeyStore,
 ) -> Canary {
     // ── Tappa 9.5 K6 — canary subsystem boot ───────────────────────
     //
