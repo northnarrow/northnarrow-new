@@ -129,14 +129,17 @@ const OFF_PATH: &[(&str, &[&str], &str)] = &[
     (
         "agent/src/pipeline/dispatch.rs",
         &[
-            "pub(crate) fn start_with(",
+            "fn start_inner(",
+            "fn spawn_worker(",
             "pub(crate) fn stop(",
-            "fn run(",
+            "fn work(",
+            "fn watch_stalls(",
             "fn run_one(",
             "fn write_overflow(",
         ],
-        "the response dispatcher's thread (`nn-response`): each response's signed intent, the \
-         action, its signed outcome; its start and its stop",
+        "the response dispatcher's workers (`nn-response-<n>`) and stall watch: each \
+         response's signed intent, the action, its signed outcome, a stall's row; their start \
+         and their stop",
     ),
     (
         "agent/src/pipeline/slow.rs",

@@ -1350,6 +1350,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- The responses run by a pool of workers keyed by process (lab PR 270,
+  R12c-3; `docs/architecture/EVENT_BUS.md` §2e): eight workers
+  (`nn-response-<n>`, `NN_RESPONSE_WORKERS`, 1 to 32) take one response at
+  a time of a process with none running — different processes' responses
+  at once, one process's one at a time and in order. An action still
+  running after 10 s is stalled: a signed `stalled` row in the actions
+  chain, a WARN, `TelemetryLoss`, the status's count, and a spare worker so
+  the other responses do not wait behind it. The actions chain gains
+  `run_started` and `run_ended` rows: a run without its `run_ended`
+  crashed, and the next start reads back to its `run_started` for its open
+  intents (an intent more than one rotation back); the boot signs its
+  `response_interrupted` audit row before the interrupted rows, so a crash
+  between them reports them again. `nn-admin status --key` shows the
+  workers, spares, actions running and stalls.
 - The responses off the decision thread, and no action without a signed
   record (lab PR 270, Wave 4 phase 2, R12c-1 of the restructure plan;
   `docs/architecture/EVENT_BUS.md` §2d, §2e, §5). The decision thread

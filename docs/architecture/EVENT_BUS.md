@@ -334,10 +334,18 @@ its synced ledger, the outbound block and the throttle's cgroup files: one
 slow response held every later decision back. Now the decision hands them
 over and judges the next event.
 
-**The dispatcher** (`pipeline::dispatch`, the thread `nn-response`). The
-decision thread submits a decision's responses to its queue
+**The dispatcher** (`pipeline::dispatch`). The decision thread submits a
+decision's responses to its queue
 (`nn_core::response::dispatch::ResponseQueue`, stage 6) — a push under a
-lock, never a wait — and the thread takes them:
+lock, never a wait — and a pool of workers takes them (R12c-3: the threads
+`nn-response-<n>`, eight by default, `NN_RESPONSE_WORKERS`, 1 to 32). A
+worker takes one response at a time, of a process with no response running
+(the queue marks the process running until the worker is done with it):
+different processes' responses run at once, one process's one at a time —
+an action spends most of its time waiting on the kernel (a cgroup frozen,
+killed and verified), so the pool shortens a burst's wait about as many
+times as it has workers (the single thread of R12c-1 kept EXP-13r's 400
+kills waiting up to 14–19 s). The queue's order:
 - **by severity**: four lanes, Critical first; once the oldest job waited
   `STARVATION_NS` (500 ms), one take in four (`AGED_TAKE_EVERY`) is it,
   whatever its lane, so a flood of Critical kills cannot hold a Low
@@ -386,11 +394,22 @@ lock, never a wait — and the thread takes them:
   counted per severity (stage 6), named in the next signed `overflow` row of
   the actions chain (at most one a second, and at the stop) and raises the
   posture's `TelemetryLoss`;
-- **at the stop** the thread runs what is queued for at most `STOP_WAIT`
+- **a stalled action** (R12c-3): one still running after `STALL_AFTER`
+  (10 s) — a quarantine's copy on a filesystem that hangs, a cgroup or
+  firewall write that does not return — is seen by the stall watch
+  (`nn-response-watch`): a signed `stalled` row names its intent (not its
+  answer: the outcome row still comes when it ends), a WARN, the count
+  (`stalled now`, `since the start`), `TelemetryLoss`, and a spare worker
+  (at most one per stalled action, at most the pool's size), so the other
+  processes' responses do not wait behind it; the spare goes once the
+  stall is over;
+- **at the stop** the workers run what is queued for at most `STOP_WAIT`
   (2 s); what is left is answered `not run: the agent stopped`, counted and
-  signed in a last `overflow` row; a dispatcher whose thread did not start
-  answers every response so (`not run: the response dispatcher is not
-  running`), never running it on the decision thread.
+  signed in a last `overflow` row, and the run's `run_ended` row is
+  signed; a worker still in a stalled action is left (named in a WARN), not
+  waited for. A dispatcher whose workers did not start answers every
+  response so (`not run: the response dispatcher is not running`), never
+  running it on the decision thread.
 
 The decision's detection record follows its responses' outcomes, as before
 (written by whichever thread answers the decision's last response), and the
@@ -456,12 +475,20 @@ is its record) and counted (`unwritten`); the action still runs (external
 audit CMB-027: whoever fills the disk must not stop the containment).
 
 **A crash between intent and outcome** leaves the intent without its
-outcome. The next start reads the chain's newest archive and active file
-(`ActionJournal::bind`, before any action can run) and answers each intent
-of an earlier run with no outcome by an `interrupted` row (the intent's run
-and number, `result: unknown`, the run that found it), WARNs, counts it
-(`nn-admin status --key`: `intents of an earlier run without an outcome`)
-and signs a `response_interrupted` audit row naming them. The lab build's
+outcome. The next start reads the chain (`ActionJournal::bind`, before any
+action can run): its newest archive and active file, and — when the last
+run there has neither its `run_ended` row (a clean stop) nor its
+`run_started` (R12c-3: it crashed with its start further back) — the older
+archives one by one until that run's `run_started` (an intent more than
+one rotation back is still found). The boot signs a
+`response_interrupted` audit row naming each intent of an earlier run with
+no outcome, *then* the journal answers each by an `interrupted` row (the
+intent's run and number, `result: unknown`, the run that found it), WARNs,
+counts it (`nn-admin status --key`: `intents of an earlier run without an
+outcome`) and signs this run's `run_started` row (`ActionJournal::
+start_run`): a crash between the two leaves the intents open, and the next
+start reports them again — an interrupted row never lacks its audit
+row. The lab build's
 `debug-crash-mid-action` aborts the agent after its next action and before
 its outcome row (EXP-13r `--crash`).
 

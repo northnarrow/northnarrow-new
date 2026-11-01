@@ -136,7 +136,7 @@ const UNTICKETED: &[(&str, Sites)] = &[
 /// Functions that make tickets and hand them to another that answers them.
 const HANDED_ON: &[(&str, &str, &str)] = &[(
     "agent/src/pipeline/dispatch.rs",
-    "fn run(",
+    "fn work(",
     "run_one(s, &t.job, intent)",
 )];
 

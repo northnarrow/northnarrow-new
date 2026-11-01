@@ -71,7 +71,12 @@ an earlier run that has no outcome — the agent stopped, crashed or was
 killed between the two: whether that action took effect is not known; the
 same start signs a `response_interrupted` audit row naming them and
 `nn-admin status --key` counts them (`intents of an earlier run without an
-outcome`). An `overflow` row names the responses decided and never run —
+outcome`). R12c-3: a `stalled` row names an action still running past the stall
+bound (10 s; its intent's number, how long so far — its outcome row still
+comes when it ends); a `run_started` row opens each run (after the start
+answered the earlier runs' open intents) and a `run_ended` row closes a
+clean stop: a run without its `run_ended` crashed, and the next start reads
+back to its `run_started`. An `overflow` row names the responses decided and never run —
 displaced or refused by the full response queue (a Critical kill is never
 refused: it goes past the capacity), or still queued at the stop (stage
 6). `sudo nn-admin chain verify --log actions` verifies it;
