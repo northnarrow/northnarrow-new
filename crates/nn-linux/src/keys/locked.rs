@@ -140,12 +140,23 @@ mod tests {
         assert!(l.dontdump(), "MADV_DONTDUMP");
         let addr = l.ptr.as_ptr() as usize;
         assert_eq!(addr % 4096, 0, "a mapping of its own");
-        // /proc/self/smaps: the mapping is locked when mlock succeeded
+        // /proc/self/smaps: the area holding it (the kernel may have merged
+        // it with a neighbour of the same flags) is out of the dumps, and
+        // locked when mlock succeeded
         let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
-        let head = format!("{addr:x}-");
+        let holds = |line: &str| {
+            let range = line.split_whitespace().next().unwrap_or("");
+            let Some((a, b)) = range.split_once('-') else {
+                return false;
+            };
+            match (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) {
+                (Ok(a), Ok(b)) => a <= addr && addr < b,
+                _ => false,
+            }
+        };
         let block: Vec<&str> = smaps
             .split('\n')
-            .skip_while(|line| !line.starts_with(&head))
+            .skip_while(|line| !holds(line))
             .take(30)
             .collect();
         assert!(!block.is_empty(), "the mapping is listed");
