@@ -583,3 +583,45 @@ fn every_source_and_attach_point_the_code_starts_has_a_contract_entry() {
         "the FIM observers' note moved"
     );
 }
+
+/// The review of #479: the stop's beat signs the change still pending (at
+/// most one row a minute, none left unsigned at a clean stop).
+#[test]
+fn the_stop_beat_signs_what_is_pending() {
+    let m = SignedManifest::default();
+    m.arm(None, inputs(active(), SelfTestOutcome::Denied));
+    settle(&m);
+    let before = m.current().unwrap().revision;
+    m.0.lock().terminated.push("net_drain".into());
+    let dir = tempfile::tempdir().unwrap();
+    let key =
+        crate::keys::AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
+    let hb = crate::heartbeat::Heartbeat::open(
+        &dir.path().join("heartbeat.jsonl"),
+        key,
+        Arc::new(crate::chainlog::NoProtection),
+        false,
+        crate::heartbeat::Sources {
+            agent_id: [7; 16],
+            run: "1234567890abcdef".into(),
+            posture: crate::posture::PostureMachine::new(),
+            ladder: None,
+            manifest: Some(m.clone()),
+            bus: None,
+            dispatch: None,
+            journal: crate::response::journal::ActionJournal::memory(),
+            audit: None,
+            probe_on: false,
+        },
+    );
+    let view = m.current().unwrap();
+    assert_eq!(
+        view.unsigned_changes, 1,
+        "the start beat saw it, within the minute"
+    );
+    assert_eq!(view.revision, before);
+    hb.stop("test");
+    let now = m.current().unwrap();
+    assert_eq!(now.unsigned_changes, 0);
+    assert_eq!(now.revision, before + 1, "signed by the stop");
+}
