@@ -108,6 +108,9 @@ struct Writer {
     unwritten: u64,
     /// The loss signed last, and when.
     loss_row: Option<(Vec<Option<u64>>, Instant)>,
+    /// The actions chain's head the last beat named (at the start: the
+    /// last run's last beat's), read back at each beat (`kept`).
+    actions_head: Option<Head>,
 }
 
 /// The heartbeat (see the module's doc). Cheap to clone.
@@ -153,7 +156,8 @@ impl Heartbeat {
                 None
             }
         };
-        let next_seq = last_seq(path) + 1;
+        let (last, actions_head) = last_beat(path);
+        let next_seq = last + 1;
         let hb = Self {
             inner: Arc::new(Mutex::new(Writer {
                 log,
@@ -161,6 +165,7 @@ impl Heartbeat {
                 beats: 0,
                 unwritten: 0,
                 loss_row: None,
+                actions_head,
             })),
             sources: Arc::new(sources),
             interval: interval_from_env(),
@@ -224,18 +229,34 @@ impl Heartbeat {
                 ..BeatHead::default()
             });
         }
-        if let Some((file, bytes, hash)) = s.journal.head() {
+        let named = self.inner.lock().actions_head.clone();
+        let now_head = s.journal.head();
+        if let Some((file, bytes, hash)) = now_head.clone() {
+            // the head the last beat named, still in the chain? (the review
+            // of #476: a tail cut, even one appended past, is seen off the
+            // host)
+            let kept = named.and_then(|(f, b, h)| s.journal.holds(f, b, &h));
+            if kept == Some(false) {
+                error!(
+                    "the actions chain no longer holds the head the last beat named — its tail \
+                     was cut or rewritten (signed in this beat)"
+                );
+            }
             heads.push(BeatHead {
                 chain: "actions".into(),
                 file: Some(file),
                 bytes: Some(bytes),
                 hash,
+                kept,
                 ..BeatHead::default()
             });
         }
         let mut degradations = crate::boot::degradation::snapshot();
         degradations.truncate(MAX_DEGRADATIONS);
         let mut w = self.inner.lock();
+        if now_head.is_some() {
+            w.actions_head = now_head;
+        }
         let record = HeartbeatRecord {
             kind,
             seq: w.next_seq,
@@ -371,7 +392,12 @@ fn sign_loss(
 
 /// The last beat's number in the chain at `path` (its active file, else its
 /// newest archive); 0 for none.
-fn last_seq(path: &Path) -> u64 {
+/// A chain's head as a beat names it: file, bytes, hash.
+type Head = (u64, u64, String);
+
+/// The chain's last beat: its number (0: none), and the actions chain's
+/// head it named.
+fn last_beat(path: &Path) -> (u64, Option<Head>) {
     let mut files = vec![path.to_path_buf()];
     files.extend(
         crate::chainlog::archives_newest_first(path)
@@ -379,21 +405,32 @@ fn last_seq(path: &Path) -> u64 {
             .take(1),
     );
     for f in files {
-        if let Some(seq) = last_seq_in(&f) {
-            return seq;
+        if let Some(found) = last_beat_in(&f) {
+            return found;
         }
     }
-    0
+    (0, None)
 }
 
-fn last_seq_in(path: &PathBuf) -> Option<u64> {
+fn last_beat_in(path: &PathBuf) -> Option<(u64, Option<Head>)> {
     let text = std::fs::read_to_string(path).ok()?;
     text.lines().rev().find_map(|l| {
         let v: serde_json::Value = serde_json::from_str(l).ok()?;
         if v.get("rotate").is_some() {
             return None;
         }
-        v.get("seq")?.as_u64()
+        let seq = v.get("seq")?.as_u64()?;
+        let head = v.get("heads").and_then(|h| h.as_array()).and_then(|heads| {
+            heads.iter().find_map(|h| {
+                (h.get("chain")?.as_str()? == "actions").then_some(())?;
+                Some((
+                    h.get("file")?.as_u64()?,
+                    h.get("bytes")?.as_u64()?,
+                    h.get("hash")?.as_str()?.to_string(),
+                ))
+            })
+        });
+        Some((seq, head))
     })
 }
 
@@ -595,6 +632,56 @@ mod tests {
         assert!(second.bytes > first.bytes, "{second:?} {first:?}");
         assert_ne!(second.hash, first.hash);
         assert!(!second.went_back(&first) && first.went_back(&second));
+        assert_eq!(second.kept, Some(true), "the first beat's head still there");
+        // the review of #476: the tail cut on the host, then rows appended
+        // past the cut — the next beat says the head it named is gone
+        let len = std::fs::metadata(&active).unwrap().len();
+        let text = std::fs::read(&active).unwrap();
+        let body = &text[..text.len() - 1];
+        let cut = body.iter().rposition(|b| *b == b'\n').unwrap() + 1;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&active)
+            .unwrap();
+        f.set_len(cut as u64).unwrap();
+        drop(f);
+        let journal2 = ActionJournal::late();
+        journal2.bind(
+            ActionJournal::open_log(
+                &active,
+                key(),
+                crate::chainlog::RotationConfig {
+                    size_cap_bytes: u64::MAX,
+                    max_archives: 8,
+                    file_mode: 0o600,
+                },
+                Arc::new(crate::chainlog::NoProtection),
+            )
+            .unwrap(),
+            &active,
+        );
+        for pid in 3..6 {
+            journal2
+                .intent(ActionIntent::named("test", "KillProcess", pid))
+                .finish(ActionResult::Success, "Killed".into(), None);
+        }
+        assert!(
+            std::fs::metadata(&active).unwrap().len() > len,
+            "past the cut"
+        );
+        let mut s2 = sources();
+        s2.journal = journal2;
+        drop(hb);
+        let hb = Heartbeat::open(
+            &path,
+            key(),
+            Arc::new(crate::chainlog::NoProtection),
+            false,
+            s2,
+        );
+        let third = actions_head(&path);
+        assert_eq!(third.kept, Some(false), "{third:?}");
+        drop(hb);
     }
 
     /// The verifier end to end (`nn-admin heartbeat watch`'s check, its

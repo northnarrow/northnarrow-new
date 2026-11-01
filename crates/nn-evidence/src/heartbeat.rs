@@ -79,6 +79,13 @@ pub struct BeatHead {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
     pub hash: String,
+    /// Whether the chain still holds the head the agent's previous beat
+    /// named (a rotating chain: the agent reads it back at each beat, and
+    /// at the start from the last run's last beat). `false`: its tail was
+    /// cut or rewritten since — even if rows appended after it carried the
+    /// position past the one a verifier saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept: Option<bool>,
 }
 
 impl BeatHead {
@@ -264,6 +271,10 @@ impl Alert {
         }
     }
 }
+
+/// A beat this much later than its interval after the one before it (in
+/// one run) is late: the agent stood still (DEGRADED).
+pub const LATE_BEAT_SLACK_SECS: u64 = 15;
 
 /// The verifier's bounds.
 #[derive(Debug, Clone, Copy)]
@@ -522,7 +533,14 @@ pub fn check(
                 )));
                 continue;
             };
-            if h.went_back(seen) {
+            if h.kept == Some(false) {
+                out.alerts.push(Alert::Replay(format!(
+                    "the {chain} chain no longer holds the head the agent's previous beat named \
+                     (its tail cut or rewritten on the host), now {} {}",
+                    h.at(),
+                    short(&h.hash)
+                )));
+            } else if h.went_back(seen) {
                 out.alerts.push(Alert::Replay(format!(
                     "the {chain} chain's head went back: {} {} seen, now {} {} (a tail cut \
                      from the chain, or the chain rolled back, on the host)",
@@ -613,6 +631,30 @@ pub fn check(
         )));
     }
     let mut degraded = Vec::new();
+    // A beat late after the one before it, in one run: the agent stood
+    // still for a while — frozen, or starved — though less than the
+    // silence bound (the lab's `systemctl freeze`, ended by the watchdog
+    // after ~70 s: no SILENT at 75 s, only this).
+    if let Some(l) = last {
+        let mut prev = parse_ts(&l.ts).map(|t| (l.seq, t));
+        for (_, b) in beats.iter().filter(|(_, b)| b.seq > l.seq) {
+            let t = parse_ts(&b.ts);
+            if let (Some((ps, pt)), Some(t)) = (prev, t) {
+                let gap = (t - pt).num_seconds();
+                if b.seq == ps + 1
+                    && b.kind != BeatKind::Start
+                    && gap > (b.interval_secs + LATE_BEAT_SLACK_SECS) as i64
+                {
+                    degraded.push(format!(
+                        "beat {} came {gap} s after beat {ps} (every {} s): the agent stood \
+                         still — frozen, or starved",
+                        b.seq, b.interval_secs
+                    ));
+                }
+            }
+            prev = t.map(|t| (b.seq, t));
+        }
+    }
     if newest.kind != BeatKind::Stop
         && newest.decision_since_last_ms > cfg.stall_intervals * newest.interval_secs * 1000
     {

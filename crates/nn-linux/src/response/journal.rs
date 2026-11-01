@@ -426,6 +426,23 @@ impl ActionJournal {
         }
     }
 
+    /// R12c-2: whether the chain still holds the head (`file`, `bytes`,
+    /// `hash`) its [`Self::head`] named earlier — `false`: its tail was cut
+    /// or rewritten since (`None`: not bound, or the file not readable).
+    pub fn holds(&self, file: u64, bytes: u64, hash: &str) -> Option<bool> {
+        let path = match &*self.inner.writer.lock() {
+            Writer::Log(log) => {
+                if file == log.position().0 {
+                    log.active_path().to_path_buf()
+                } else {
+                    crate::chainlog::archive_path_for(log.active_path(), file)
+                }
+            }
+            _ => return None,
+        };
+        crate::chainlog::holds_line_ending_at(&path, bytes, hash).ok()
+    }
+
     /// The rows a memory journal holds (empty for the signed chain's).
     pub fn rows(&self) -> Vec<ActionRecord> {
         match &*self.inner.writer.lock() {

@@ -35,7 +35,7 @@ carries:
 | `loss` | the events lost at each stage of their path since the run started — stages 1 to 7: the kernel's ring, the kernel's budget, the decoder, the bus's queues, the decision's delay, the response queue, the evidence writers ([the event bus, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/architecture/EVENT_BUS.md)) |
 | `actions` | the actions chain's intents and outcomes, rows it could not take, intents of an earlier run found interrupted, actions in flight (`EVIDENCE_CHAINS.md`, the actions chain) |
 | `probe_gaps` | the telemetry probe's gaps since the run started (`null`: the probe is off) |
-| `heads` | the audit chain's head (its row number and hash) and the actions chain's (its position — `file`, the number its active file will have as an archive, and `bytes`, its length — and hash; with `actions.in_flight` and `actions.unwritten`): a chain rolled back on the host, or a tail cut from the actions chain (an intent removed), shows as a head that went back |
+| `heads` | the audit chain's head (its row number and hash) and the actions chain's (its position — `file`, the number its active file will have as an archive, and `bytes`, its length — and hash, and `kept`: whether the chain still holds the head the agent's previous beat named, read back at each beat and at the start from the last run's last beat; with `actions.in_flight` and `actions.unwritten`): a chain rolled back on the host, or a tail cut from the actions chain (an intent removed) — even with rows appended past the cut — shows as a head that went back or is no longer kept |
 
 Beside the beats, the agent signs a **`telemetry_loss`** row in the audit
 log: the loss of every stage, its total since the run started and what it
@@ -53,12 +53,12 @@ most severe alert's:
 | Exit | Alert | When | What to do |
 |---|---|---|---|
 | 13 | `TAMPERED` | a line does not verify (altered, or signed with another key), or is stamped in the future | treat the host as compromised: its chain was edited, or the key was replaced |
-| 12 | `REPLAY` | a beat older than one already seen, a fork of one, or a chain's head went back (the audit log's row, the actions chain's position: a tail cut, a rotation undone, a rewrite) or is gone from the beat (the chain did not open on the host) | the chain was rolled back or an old export replayed: the host or the channel is lying |
+| 12 | `REPLAY` | a beat older than one already seen, a fork of one, or a chain's head went back (the audit log's row, the actions chain's position: a tail cut, a rotation undone, a rewrite) or is gone from the beat (the chain did not open on the host), or the agent no longer finds in its actions chain the head its previous beat named (`kept: false`: cut or rewritten) | the chain was rolled back or an old export replayed: the host or the channel is lying |
 | 11 | `BROKEN` | the chain does not link, or beats are missing | beats were removed; fetch more lines (`export --count`) to tell a short fetch from a removal |
 | 10 | `SILENT` | no newer beat for two intervals plus 15 s (75 s by default; `--max-silence-secs`), or the source could not be read past that | the agent stopped, froze or was killed, the host is down, or the network is cut — go and look |
 | 15 | `STOPPED` | the agent's signed `stop` beat (an admin shutdown, a host shutdown), and every check while it stays stopped | expected only during maintenance |
 | 14 | `LOSS` | a stage's loss grew since the last beat seen | `nn-admin status --key` on the host: which stage, which queue |
-| 16 | `DEGRADED` | the decision thread stood still for two intervals, a telemetry gap, an action row not in its chain, an action interrupted between intent and outcome, a new degradation | `nn-admin status --key`, the audit log's rows |
+| 16 | `DEGRADED` | a beat late after the one before it in one run (more than its interval + 15 s: the agent stood still — frozen, starved — for less than the silence bound), the decision thread stood still for two intervals, a telemetry gap, an action row not in its chain, an action interrupted between intent and outcome, a new degradation | `nn-admin status --key`, the audit log's rows |
 
 The first check of a new state file **anchors**: it takes the newest beat
 that verifies as the start (say `OK … (anchored: first beat seen)`) and

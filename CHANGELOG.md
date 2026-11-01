@@ -15,7 +15,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   runs, with the loss of stages 1 to 7, the actions chain's counts, the
   telemetry probe's gaps, the decision thread's progress, the posture, the
   ladder's stage, the trust level, the degradations and the heads of the
-  audit and actions chains; a `start` beat opens each run, a `stop` beat
+  audit and actions chains (the actions chain's position and hash, and
+  whether it still holds the head the previous beat named — a cut tail is
+  REPLAY off the host, even with rows appended past it); a `start` beat opens each run, a `stop` beat
   (with its reason) closes a clean stop. `nn-admin heartbeat export` prints
   the newest lines as on disk (an SSH forced command); `nn-admin heartbeat
   watch`, run on another host with the agent's public key, verifies

@@ -531,8 +531,56 @@ fn a_tail_cut_from_the_actions_chain_alerts() {
     let r = check(Ok(&gone_chain.lines()), &c.pk, Some(&s), at(91), &cfg());
     assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
     assert!(r.alerts[0].detail().contains("not in the beat"), "{r:?}");
+    // cut, then appended past the position seen: the agent's own read-back
+    // says the head it named is gone
+    let mut cut_past = actions(4, 5_000, 7);
+    cut_past.kept = Some(false);
+    let r = check(
+        Ok(&build(Some(cut_past)).lines()),
+        &c.pk,
+        Some(&s),
+        at(91),
+        &cfg(),
+    );
+    assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+    assert!(r.alerts[0].detail().contains("no longer holds"), "{r:?}");
     // grown again: fine
     let ok = build(Some(actions(4, 900, 6)));
     let r = check(Ok(&ok.lines()), &c.pk, Some(&s), at(91), &cfg());
+    assert!(r.alerts.is_empty(), "{r:?}");
+}
+
+/// The lab's freeze (ended by the watchdog before the silence bound): a
+/// beat 71 s after the one before it, every 30 s, is DEGRADED; a new run's
+/// start beat after a long gap is not (a restart).
+#[test]
+fn a_late_beat_says_the_agent_stood_still() {
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    c.push(beat(2, 30));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(31), &cfg())
+        .state
+        .unwrap();
+    c.push(beat(3, 101));
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(102), &cfg());
+    assert_eq!(kinds(&r), ["DEGRADED"], "{r:?}");
+    assert!(
+        r.alerts[0]
+            .detail()
+            .contains("beat 3 came 71 s after beat 2"),
+        "{r:?}"
+    );
+    // on time again: nothing
+    let s = r.state.unwrap();
+    c.push(beat(4, 131));
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(132), &cfg());
+    assert!(r.alerts.is_empty(), "{r:?}");
+    // a restart: a start beat, a new run, long after — no stall
+    let s = r.state.unwrap();
+    let mut b = beat(5, 400);
+    b.kind = BeatKind::Start;
+    b.run = "bbbbbbbbbbbbbbbb".into();
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(401), &cfg());
     assert!(r.alerts.is_empty(), "{r:?}");
 }
