@@ -4098,6 +4098,30 @@ only in the table below, in the same PR as the evidence.
     mutations 12 of 12 (MC8 first written as an equivalent mutant; MK2
     caught once the children check took a proc tree of its own);
     identity: the eBPF object and `posture_demo` as `main`'s.
-  - R12c-3 — open: the second EXP-13r run's tail (4.1 s) and late P3
-    decisions; the stall counts not in the heartbeat yet (R12c-2's own
-    PR); the ticket passed by value.
+  - R12c-3 — review of #477 ("merge after one fix"), fb471460: one
+    process sat in the queue under two keys — (pid, 0) from a kernel
+    alert, (pid, start) from an exec's event — so two workers could act on
+    it at once; the queue's key is the pid alone now (a reused pid waits
+    behind the old process's responses), and a repeat merges and a kill
+    supersedes only when both starts are known (non-zero) and equal.
+    Tests: one pid's responses never at once whatever their start, kills
+    of a pid with an unknown start not merged, such a kill superseding
+    nothing, a spare that panics stopping the dispatcher (R9), the spares
+    bounded by the pool (R13). The CPU contention: the decision thread at
+    nice −5 (`DECISION_NICE`, `renice_this_thread`), the workers at the
+    agent's priority (no longer +5). Round k (ubuntu2404, fb471460, a
+    fresh install): EXP-13r ×2 400/400 `success`, P1, P2 and P3 0 over
+    budget in both runs (round g2: 90 P3 late), the queue's wait p50
+    0.11 s, max 0.67 and 1.6 s (g2: 2.0 and 4.1 s — the target under 2 s
+    met in both); `--hang`: the `stalled` row 10.0 s after the intent,
+    the twenty kills beside it within 33 ms; `--crash`: `interrupted` 3.4 s
+    after the restart, then `run_started`; `test-ignored` 82 suites 97
+    passed 0 failed, the boot's chain checks `ok`. Gates on fb471460: 77
+    suites 3,392 passed 0 failed, every other gate green; mutations of the
+    fix 4 of 4 (16 of 16 for R12c-3).
+  - R12c-3 — open: `CPUWeight=` in the unit (the decision thread's nice
+    is per thread; a weight would hold against other services); a stall
+    watch for the ladder's, the exec quarantine's and the CoW restore's
+    threads; an explicit "pool exhausted" state (every worker and spare
+    stalled); the stall counts not in the heartbeat yet (R12c-2's own PR);
+    the ticket passed by value.

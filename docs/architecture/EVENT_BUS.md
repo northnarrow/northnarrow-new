@@ -349,12 +349,13 @@ responses, harmlessly). The decision thread runs at a nice value five
 below the agent's (a higher CPU priority: the first pool, at the same
 priority, made 1,247 P1 decisions late in EXP-13r on a 4-CPU guest; the
 review of #477 had the workers' priority left as the agent's, not lowered
-below the user's processes); and a kill tree whose root has no child (its threads' `children` files,
-read once it is inside the kill cgroup, where any later child is born)
-skips the `/proc` walks that each cost ~50 ms of CPU with EXP-13r's 400
-processes alive. EXP-13r's 400 kill trees waited at most 2.0 and 4.1 s
-in the queue (p50 0.23 and 0.29 s), against 13–19 s for R12c-1's single
-thread. The queue's order:
+below the user's processes); and a kill tree whose root has no child (its
+threads' `children` files, read once it is inside the kill cgroup, where
+any later child is born) skips the `/proc` walks that each cost ~50 ms of CPU with EXP-13r's 400
+processes alive. EXP-13r's 400 kill trees waited at most 0.67 and 1.6 s
+in the queue (p50 0.11 s; round k), against 13–19 s for R12c-1's single
+thread, with no decision of any class late (the workers at +5 instead,
+round g2: 2.0 and 4.1 s, 90 P3 decisions late). The queue's order:
 - **by severity**: four lanes, Critical first; once the oldest job waited
   `STARVATION_NS` (500 ms), one take in four (`AGED_TAKE_EVERY`) is it,
   whatever its lane, so a flood of Critical kills cannot hold a Low
