@@ -24,6 +24,8 @@
 # The verifier runs in the background through a phase, its state in
 # <out-dir>/state.json, kept between the phases (run `normal`, then `nobpf`,
 # in one directory: the verifier sees the change across the reboots).
+# Under QEMU for Windows a guest's reboot ends QEMU (-no-reboot):
+# `nn-lab.sh up` boots it again (reboot_guest).
 # Output: watch.log (UTC-stamped), steps.tsv (step, start, end, result),
 # the manifests (caps-<tag>.json), the manifest rows of the audit log
 # (rows-<tag>.jsonl), status-<tag>.txt, summary.txt. Exit 0 when every
@@ -93,6 +95,26 @@ wait_ssh() { # within
     sleep 5
   done
   return 1
+}
+# A reboot of the guest. Under QEMU for Windows (WHPX) QEMU runs with
+# -no-reboot, so the guest's reboot ends it: `nn-lab.sh up` boots it again.
+# `up` waits for `bpf` in the active LSM list, which a boot without it never
+# shows: then it is left to give up on its own (its own timeout, the guest
+# left running) while the ssh wait here goes on.
+reboot_guest() { # nobpf|bpf
+  g 'sudo systemctl reboot' >/dev/null 2>&1
+  if [[ $(cat "$ROOT/accel" 2>/dev/null) == whpx ]]; then
+    for _ in $(seq 1 60); do
+      "$LAB" status 2>&1 | grep -q 'stopped' && break
+      sleep 3
+    done
+    if [[ $1 == nobpf ]]; then
+      NN_LAB_BOOT_TIMEOUT=300 "$LAB" up > "$OUT/up-$1.log" 2>&1 &
+    else
+      NN_LAB_BOOT_TIMEOUT=600 "$LAB" up > "$OUT/up-$1.log" 2>&1
+    fi
+  fi
+  wait_ssh 600
 }
 
 # the verifier on this host: the guest's export over the lab's SSH
@@ -179,9 +201,9 @@ if [[ $PHASE == nobpf ]]; then
   caps before; H0=$(field before hash)
   # the guest's lsm= without bpf, kept aside to restore
   t=$(now)
-  g "sudo cp -a $GRUB_CFG $GRUB_CFG.r13-lab && sudo sed -i 's/,bpf\\([\" ]\\)/\\1/' $GRUB_CFG && grep -c ',bpf' $GRUB_CFG; cat $GRUB_CFG; sudo update-grub >/dev/null 2>&1 && echo grub-updated" > "$OUT/grub-nobpf.txt" 2>&1
-  g 'sudo systemctl reboot' >/dev/null 2>&1
-  if wait_ssh 400; then
+  # (a copy kept once: a run cut short and run again keeps the first)
+  g "sudo test -e $GRUB_CFG.r13-lab || sudo cp -a $GRUB_CFG $GRUB_CFG.r13-lab; sudo sed -i 's/,bpf\\([\" ]\\)/\\1/' $GRUB_CFG && grep -c ',bpf' $GRUB_CFG; cat $GRUB_CFG; sudo update-grub >/dev/null 2>&1 && echo grub-updated" > "$OUT/grub-nobpf.txt" 2>&1
+  if reboot_guest nobpf; then
     lsm=$(g 'cat /sys/kernel/security/lsm' | tr -d '\r')
     step reboot-nobpf "$t" "$([[ $lsm != *bpf* ]] && echo ok || echo FAIL): active LSMs $lsm"
   else
@@ -223,8 +245,7 @@ print("L%s; not invoked: %s; on a fallback: %s; bpf_lsm %s" % (m["trust_level"],
   # restore: the unit, the guest's lsm=, a reboot
   t=$(now)
   g "sudo rm -f $DROPIN && sudo rmdir --ignore-fail-on-non-empty $DROPIN_DIR; sudo cp -a $GRUB_CFG.r13-lab $GRUB_CFG && sudo rm -f $GRUB_CFG.r13-lab && cat $GRUB_CFG && sudo update-grub >/dev/null 2>&1 && sudo systemctl daemon-reload && echo restored" > "$OUT/grub-restored.txt" 2>&1
-  g 'sudo systemctl reboot' >/dev/null 2>&1
-  if wait_ssh 400; then
+  if reboot_guest bpf; then
     lsm=$(g 'cat /sys/kernel/security/lsm' | tr -d '\r')
     step reboot-restored "$t" "$([[ $lsm == *bpf* ]] && echo ok || echo FAIL): active LSMs $lsm"
   else
