@@ -423,6 +423,10 @@ struct Shared {
     /// before its outcome (the lab's crash between intent and outcome).
     #[cfg(feature = "debug-trigger")]
     crash_mid_action: AtomicBool,
+    /// `debug-trigger` builds: the next action hangs past the stall bound
+    /// before it acts (the lab's stalled action, R12c-3).
+    #[cfg(feature = "debug-trigger")]
+    hang_next_action: AtomicBool,
     /// Tests: held, it stalls a worker before its next intent.
     #[cfg(test)]
     hold: Mutex<()>,
@@ -535,6 +539,8 @@ impl Dispatcher {
             epoch: Instant::now(),
             #[cfg(feature = "debug-trigger")]
             crash_mid_action: AtomicBool::new(false),
+            #[cfg(feature = "debug-trigger")]
+            hang_next_action: AtomicBool::new(false),
             #[cfg(test)]
             hold: Mutex::new(()),
             #[cfg(test)]
@@ -747,6 +753,13 @@ impl Dispatcher {
     #[cfg(feature = "debug-trigger")]
     pub(crate) fn crash_after_next_action(&self) {
         self.shared.crash_mid_action.store(true, Ordering::Release);
+    }
+
+    /// `debug-trigger` builds: the next action hangs past the stall bound
+    /// (5 s more) before it acts (lab: the stalled action, R12c-3).
+    #[cfg(feature = "debug-trigger")]
+    pub(crate) fn hang_next_action(&self) {
+        self.shared.hang_next_action.store(true, Ordering::Release);
     }
 
     /// The stop: run what is queued for at most `wait`, answer the rest
@@ -1026,6 +1039,15 @@ fn run_one(s: &Shared, job: &ResponseJob, intent: Intent) -> ExecutionReport {
     #[cfg(test)]
     while s.hang_pid.load(Ordering::Acquire) == job.pid {
         std::thread::sleep(Duration::from_millis(5));
+    }
+    #[cfg(feature = "debug-trigger")]
+    if s.hang_next_action.swap(false, Ordering::AcqRel) {
+        warn!(
+            pid = job.pid,
+            "debug-trigger: this action hangs past the stall bound before it acts (lab test of \
+             R12c-3: a stalled action, signed, the other responses not held)"
+        );
+        std::thread::sleep(s.stall_after + Duration::from_secs(5));
     }
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         s.executor.execute_for_started(

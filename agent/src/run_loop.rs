@@ -358,6 +358,8 @@ async fn watch_loop(
                 debug_stall_loop(&cli.admin_socket, ctl);
                 #[cfg(feature = "debug-trigger")]
                 debug_crash_mid_action(&cli.admin_socket, dispatcher);
+                #[cfg(feature = "debug-trigger")]
+                debug_hang_next_action(&cli.admin_socket, dispatcher);
                 // R12c (lab PR 270): the response dispatcher's thread ended —
                 // no response runs (each is answered "not run" and counted);
                 // as a dead pump: signed, and the agent stops for a restart.
@@ -452,16 +454,39 @@ fn off_the_runtime_stop(dispatcher: &Dispatcher) {
 /// and outcome — the next start must report the intent as interrupted).
 #[cfg(feature = "debug-trigger")]
 fn debug_crash_mid_action(admin_socket: &std::path::Path, dispatcher: &Dispatcher) {
-    let Some(dir) = admin_socket.parent() else {
-        return;
-    };
-    let trigger = dir.join("debug-crash-mid-action");
-    if std::fs::symlink_metadata(&trigger).is_err() {
+    if !debug_trigger(admin_socket, "debug-crash-mid-action") {
         return;
     }
-    let _ = std::fs::remove_file(&trigger);
     warn!("debug-trigger: the agent aborts after its next action, before the outcome row");
     dispatcher.crash_after_next_action();
+}
+
+/// `debug-trigger` builds only: whether the trigger file `name` is next to
+/// the admin socket (taken: removed).
+#[cfg(feature = "debug-trigger")]
+fn debug_trigger(admin_socket: &std::path::Path, name: &str) -> bool {
+    let Some(dir) = admin_socket.parent() else {
+        return false;
+    };
+    let trigger = dir.join(name);
+    if std::fs::symlink_metadata(&trigger).is_err() {
+        return false;
+    }
+    let _ = std::fs::remove_file(&trigger);
+    true
+}
+
+/// `debug-trigger` builds only: a file `debug-hang-next-action` next to the
+/// admin socket makes the next response's action hang past the stall bound
+/// before it acts (R12c-3, lab PR 270: the stall watch signs it, a spare
+/// worker takes the other responses).
+#[cfg(feature = "debug-trigger")]
+fn debug_hang_next_action(admin_socket: &std::path::Path, dispatcher: &Dispatcher) {
+    if !debug_trigger(admin_socket, "debug-hang-next-action") {
+        return;
+    }
+    warn!("debug-trigger: the next response's action hangs past the stall bound");
+    dispatcher.hang_next_action();
 }
 
 /// External audit SNS-001: how often the main loop checks that every
