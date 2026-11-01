@@ -305,6 +305,15 @@ pub mod response;
 // agent's `runtime`).
 pub mod runtime;
 
+// R14a (plan §3.1, §3.5): the workers' sandbox — Landlock and the seccomp
+// allowlist (the `landlock` and `seccompiler` crates), the hardening before
+// them, and the level a worker declares.
+pub mod sandbox;
+
+// R14a (plan §3.5): the workers — the agent's binary as `--worker <kind>`,
+// unprivileged and sandboxed — and the core's supervisor of them.
+pub mod worker;
+
 // Lab PR 265 (review of #468 R1, R3): the one `mountinfo` reader, byte by
 // byte, of the start's mount check and the self-integrity watcher.
 pub mod mountinfo;

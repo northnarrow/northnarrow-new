@@ -54,8 +54,16 @@ type it can be forged by `unsafe` code — the guarantee is safe Rust's.
 | 2. attach | the eBPF object loads (and pins its maps); the sensors; the deny hooks (`anti_tamper::attach`) | sensors, deny hooks |
 | 3. self-test | one deny hook exercised against the agent (section 3) | self-test |
 | 4. attest | the signed audit log, opened in the preflight, takes `agent_boot`; every degradation found so far is signed (section 4) | `agent_boot`, boot degradations |
-| 5. subsystems | the blocklists, the rule engine, the response executor, the posture, the FIM observers and the file-open sensor, the drains, the admin socket | — |
+| 5. subsystems | the blocklists, the rule engine, the response executor, the posture, the FIM observers and the file-open sensor, the drains, the admin socket; R14a: the workers' supervisor, which starts the `parse` worker (`docs/operator/WORKERS.md`) once the deny hooks are attached and `PROTECTED_PIDS` is pinned | — |
 | 6. run | the capability manifest and the trust level are signed (sections 5 and 6); `READY=1`; the event loop | capability manifest |
+
+R14a: before any phase — before the runtime is built — the agent opens
+its own binary (`/proc/self/exe`, read-only) and keeps the descriptor: its
+workers are started from it (`/proc/self/fd/N`), so an upgrade that
+replaces the file on disk never starts a worker of another version than
+the agent that runs. A process started as `northnarrow-agent --worker
+<kind> --ipc-fd 3` runs none of these phases: its sandbox first, then its
+work ([the process model](https://github.com/northnarrow/northnarrow-new/blob/main/docs/architecture/PROCESS_MODEL.md)).
 
 A refusal in the preflight leaves the kernel as it was: nothing is loaded,
 nothing pinned, no hook attached, and the start's registration in the
@@ -473,6 +481,7 @@ hash-chained: `nn-admin audit verify` checks it), whose `extra` is:
 | `degradations` | section 4, as of the boot |
 | `trust_level`, `trust_reasons` | section 5, and why it is below L3 |
 | `contract_version`, `sources`, `classes`, `fallbacks`, `missing`, `content`, `telemetry_probe`, `settled`, `revision`, `hash`, `previous_hash`, `change` | R13 (lab PR 271): each source of the event bus and each class against the sensor contract, the fallbacks in use, what is missing or not invoked, the shipped lists not in force from their file, and the revision — `SENSOR_CONTRACT.md` §4 |
+| `workers` | R14a: each worker kind (`parse`), its state (`ready`, `restarting`, `disabled`, `unavailable`, `stopped`) and why, the kernel's Landlock ABI as the agent read it, and the sandbox level its worker declared — `WORKERS.md` §3 |
 
 R13 (lab PR 271): the manifest is not the boot's alone any more. The
 running agent builds it again every 5 s (and for each status and each

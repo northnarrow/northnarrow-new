@@ -79,6 +79,7 @@ pub(crate) mod refusal;
 pub(crate) mod response;
 pub(crate) mod state;
 pub(crate) mod tasks;
+pub(crate) mod workers;
 
 /// R09b shim (lab PR 254; plan §4.1 rule 2, removed in R17): the phases,
 /// the integrity proof and the degradations of a run are nn-linux's, with
@@ -94,6 +95,16 @@ pub use nn_linux::boot::{
 /// The agent daemon (R11a, lab PR 261: `main.rs`'s `main`): the command
 /// line and its one-shot modes, then the runtime and `run`.
 pub fn main() -> Result<()> {
+    // R14a (plan §3.5): a worker — this binary, started by the core as
+    // `--worker <kind> --ipc-fd 3` — runs nothing of the agent's. Its
+    // sandbox first (`nn_linux::worker::serve`), before a command line is
+    // parsed, a log opened or a runtime built.
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--worker") {
+        let args: Vec<String> = std::env::args_os()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        std::process::exit(nn_linux::worker::serve::main(&args));
+    }
     let cli = Cli::parse();
     if cli.build_features {
         let features = northnarrow_agent::build_info::build_features();
@@ -142,6 +153,11 @@ pub fn main() -> Result<()> {
     // runtime and before any key is read; reported once logging is up.
     let undumpable = northnarrow_agent::process_hardening::forbid_core_dumps();
     northnarrow_agent::loop_progress::start();
+    // R14a (plan §3.5): the binary this process runs, opened now, before
+    // anything else: the workers start from this descriptor
+    // (`/proc/self/fd/N`), so an upgrade that replaces the file on disk
+    // never starts a worker of another version than its core.
+    let image = nn_linux::worker::SelfImage::open_own();
 
     // The runtime is the one `#[tokio::main]` built: multi-thread, every
     // driver. (External audit LLMR-009 built it by hand to pin the LLM
@@ -150,12 +166,16 @@ pub fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("building the tokio runtime")?
-        .block_on(run(cli, undumpable))
+        .block_on(run(cli, undumpable, image))
 }
 
 /// The start: its phases in their order, the event loop, the stop (R11a,
 /// lab PR 261: `main.rs`'s `run`).
-async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
+async fn run(
+    cli: Cli,
+    undumpable: std::io::Result<()>,
+    image: std::io::Result<nn_linux::worker::SelfImage>,
+) -> Result<()> {
     // Wave 4 restructure, R11a (lab PR 261): the start in typed phases,
     // called in the order their code always ran. Each takes what the phases
     // before it produced and returns what the ones after it read; what the
@@ -287,6 +307,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &audit_log,
         &dns_cache,
         &lineage,
+        workers::own_launch(&image),
     );
     let response::Response {
         legacy_isolation_removed,
@@ -480,6 +501,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         .filter_map(|(on, k)| on.then_some(k))
         .collect()
     };
+    // R14a (plan §3.5): the workers, once the deny hooks are attached and
+    // PROTECTED_PIDS is pinned.
+    let workers = workers::start(&cli, image);
     let tasks::Tasks {
         execq_handle,
         execpol_handle,
@@ -511,6 +535,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &overlay_gate,
         sensor.pump_labels(),
         opt_ins,
+        &workers,
     )?;
     // R12c-2 (lab PR 270): the signed heartbeat, once the agent is armed —
     // its `start` beat first, then one every interval; the stop writes its
@@ -559,6 +584,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     .await;
     crate::shutdown::stop(
         &cli,
+        &workers,
         &heartbeat,
         execq_handle,
         execpol_handle,
@@ -730,6 +756,11 @@ mod tests {
         (
             "admin::start(",
             include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/admin.rs")),
+            "pub(crate) fn start(",
+        ),
+        (
+            "workers::start(",
+            include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/workers.rs")),
             "pub(crate) fn start(",
         ),
         (

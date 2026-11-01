@@ -277,6 +277,8 @@ pub fn shipped_rules() -> Vec<ShippedRule> {
             crate::posture::lineage::AuthSessionTracker::default(),
             None,
         )),
+        // R14a: no worker launch to know here
+        None,
     );
     let direct: [Box<dyn Rule>; 3] = [
         Box::new(rules::anti_tamper::NnLAt001AntiTamperDenial),

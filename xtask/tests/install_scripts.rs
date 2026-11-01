@@ -2276,3 +2276,150 @@ fn the_package_scripts_run_the_health_check() {
         assert!(out.status.success(), "{s}: {out:?}");
     }
 }
+
+/// R14a: run `body` (a block of an install script) under bash with stub
+/// `getent`, `useradd`, `userdel` that record their calls; `present`: the
+/// accounts the host already has, `tools`: whether useradd/userdel exist.
+fn accounts_run(case: &str, body: &str, present: &[&str], tools: bool) -> (Run, Vec<String>) {
+    let dir = case_dir(case);
+    let stub = dir.join("stub");
+    fs::create_dir_all(&stub).unwrap();
+    for u in present {
+        fs::write(dir.join(format!("user.{u}")), "").unwrap();
+    }
+    write_exec(
+        &stub.join("getent"),
+        r#"[ "$1" = passwd ] && [ -e "$NN_TEST_DIR/user.$2" ]"#,
+    );
+    if tools {
+        write_exec(
+            &stub.join("useradd"),
+            r#"echo "useradd $*" >> "$NN_TEST_DIR/calls"; for u; do :; done; : > "$NN_TEST_DIR/user.$u""#,
+        );
+        write_exec(
+            &stub.join("userdel"),
+            r#"echo "userdel $*" >> "$NN_TEST_DIR/calls"; rm -f "$NN_TEST_DIR/user.$1""#,
+        );
+    }
+    // `command -v` must not find the host's own tools
+    let path = if tools {
+        format!("{}:/usr/bin:/bin", stub.display())
+    } else {
+        format!("{}", stub.display())
+    };
+    let out = Command::new("/bin/bash")
+        .arg("-c")
+        .arg(format!(
+            "set -euo pipefail\nlog() {{ echo \"$*\"; }}\n{body}\necho \"RESULT ok\"\n"
+        ))
+        .env("PATH", path)
+        .env("NN_TEST_DIR", &dir)
+        .output()
+        .expect("bash runs");
+    let calls: Vec<String> = fs::read_to_string(dir.join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let left = ["northnarrow-scan", "northnarrow-worker"]
+        .iter()
+        .filter(|u| dir.join(format!("user.{u}")).exists())
+        .map(|u| u.to_string())
+        .collect();
+    (
+        Run {
+            status: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+            calls,
+        },
+        left,
+    )
+}
+
+/// The account lines of install.sh after the block: its two calls.
+fn install_accounts_body() -> String {
+    let text = read("deploy/install.sh");
+    let block = block("deploy/install.sh", "system_users");
+    let after = &text[text.find("# <<< system_users").unwrap() + "# <<< system_users".len()..];
+    let calls: String = after
+        .lines()
+        .skip(1)
+        .take_while(|l| l.starts_with("ensure_system_user") || l.starts_with("    \""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("SCAN_USER=northnarrow-scan\nWORKER_USER=northnarrow-worker\n{block}\n{calls}")
+}
+
+/// R14a: install.sh creates the workers' account as it creates the
+/// scanner's — a system user, its own group, no home, no shell — once, in a
+/// full install and the packages' configure step alike (the block runs in
+/// both); an account that exists is kept; without useradd it warns and the
+/// install goes on.
+#[test]
+fn install_creates_the_worker_and_scanner_accounts() {
+    let body = install_accounts_body();
+    let (r, left) = accounts_run("accounts-new", &body, &[], true);
+    assert!(r.stdout.contains("RESULT ok"), "{r:#?}");
+    assert_eq!(left, ["northnarrow-scan", "northnarrow-worker"]);
+    for u in ["northnarrow-scan", "northnarrow-worker"] {
+        let call = r
+            .calls
+            .iter()
+            .find(|c| c.ends_with(&format!(" {u}")))
+            .unwrap_or_else(|| panic!("no useradd for {u}: {r:#?}"));
+        for flag in [
+            "--system",
+            "--user-group",
+            "--no-create-home",
+            "--home-dir /nonexistent",
+            "--shell",
+        ] {
+            assert!(call.contains(flag), "{u}: {flag} in {call}");
+        }
+        assert!(call.contains("nologin"), "{call}");
+    }
+    let (r, _) = accounts_run("accounts-kept", &body, &["northnarrow-worker"], true);
+    assert!(r.stdout.contains("RESULT ok"), "{r:#?}");
+    assert_eq!(r.calls.len(), 1, "only the missing one: {r:#?}");
+    assert!(r.calls[0].ends_with(" northnarrow-scan"));
+    let (r, left) = accounts_run("accounts-no-useradd", &body, &[], false);
+    assert!(r.stdout.contains("RESULT ok"), "{r:#?}");
+    assert!(left.is_empty());
+    assert!(r.stderr.contains("no northnarrow-worker account"), "{r:#?}");
+    // the block is reached in the configure mode too: after the full
+    // mode's binary switch, before the units start
+    let text = read("deploy/install.sh");
+    let at = text.find("# >>> system_users").unwrap();
+    assert!(
+        text.find("if [[ $MODE == configure ]]; then\n    # Migration")
+            .unwrap()
+            < at
+    );
+    assert!(
+        at < text
+            .rfind("start_units \"${UNITS_TO_RESTART[@]}\"")
+            .unwrap()
+    );
+}
+
+/// R14a: uninstall.sh removes both accounts (their own groups with them),
+/// and only the ones that exist.
+#[test]
+fn uninstall_removes_the_worker_and_scanner_accounts() {
+    let body = block("deploy/uninstall.sh", "remove_users");
+    let (r, left) = accounts_run(
+        "accounts-removed",
+        &body,
+        &["northnarrow-scan", "northnarrow-worker"],
+        true,
+    );
+    assert!(r.stdout.contains("RESULT ok"), "{r:#?}");
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(
+        r.calls,
+        ["userdel northnarrow-scan", "userdel northnarrow-worker"]
+    );
+    let (r, _) = accounts_run("accounts-one-left", &body, &["northnarrow-worker"], true);
+    assert_eq!(r.calls, ["userdel northnarrow-worker"]);
+}

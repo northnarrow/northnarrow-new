@@ -207,10 +207,12 @@ fn enforce() -> bool {
     }
 }
 
+/// The caller is the agent or the watchdog (R14a: exempt; a worker is
+/// not, and gets none of the agent's BPF objects).
 #[inline(always)]
-fn caller_is_protected() -> bool {
+fn caller_is_exempt() -> bool {
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    unsafe { crate::task_kill::PROTECTED_PIDS.get(&tgid).is_some() }
+    crate::task_kill::is_exempt_pid(tgid)
 }
 
 /// Map, program and link ids live in three separate kernel id spaces, so
@@ -562,7 +564,7 @@ unsafe fn try_bpf_map_guard(ctx: &LsmContext) -> i32 {
             return 0;
         }
     };
-    if !is_own_kind(id, OWN_KIND_MAP) || caller_is_protected() || fresh_instance_may_load() {
+    if !is_own_kind(id, OWN_KIND_MAP) || caller_is_exempt() || fresh_instance_may_load() {
         return 0;
     }
     if enforce() {
@@ -585,7 +587,7 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     // Only the commands worth a record (`bpf_cmd::observed`); the hot ones
     // (MAP_LOOKUP/UPDATE from bpftool, OBJ_GET_INFO, PROG_RUN) and the
     // `*_GET_NEXT_ID` enumerations, which give no handle, are not reported.
-    if !observed(cmd) || caller_is_protected() {
+    if !observed(cmd) || caller_is_exempt() {
         return 0;
     }
     // bpf_attr is uapi-stable: the first u32 of the union is prog_type

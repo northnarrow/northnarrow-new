@@ -382,8 +382,11 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void, hook: u32) -> 
     // every other in-family FS-mutation path (audit log
     // append, agent.sig.key rotation on re-install, etc.)
     // while denying every unrelated root caller.
+    // R14a: exempt callers only (the agent and the watchdog); a worker is
+    // protected but not exempt, so it is denied the keys and the protected
+    // paths as any other process is (plan §3.3).
     let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    if crate::task_kill::PROTECTED_PIDS.get(&caller_tgid).is_some() {
+    if crate::task_kill::is_exempt_pid(caller_tgid) {
         return false;
     }
     emit_denial(operation, key);

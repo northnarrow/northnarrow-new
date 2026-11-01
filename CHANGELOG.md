@@ -6,6 +6,36 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- The agent's unprivileged workers: the sandbox, the worker model, the
+  core/worker channel and the kernel's roles (lot 272, Wave 4 phase 2, R14a
+  of the restructure plan, §3.1, §3.3, §3.5; report 06 INI-19;
+  `docs/operator/WORKERS.md`, `docs/architecture/PROCESS_MODEL.md`). The
+  agent starts a `parse` worker: its own binary, from the descriptor it
+  opened at boot (`/proc/self/fd/N`: an upgrade never starts a worker of
+  another version), as the new `northnarrow-worker` account (install.sh
+  and the packages' configure step create it, uninstall.sh removes it),
+  with `no_new_privs`, no capability, not dumpable, no process, no core,
+  8 descriptors. The worker enters its sandbox before anything else
+  (`nn_linux::sandbox`): Landlock at the kernel's ABI — every path denied
+  from ABI 1, TCP from 4, signals and abstract sockets from 6 — and a
+  seccomp allowlist that kills it on any other call (the `landlock` 0.4.7
+  and `seccompiler` 0.5.0 crates, pure Rust, pinned). It talks to the core
+  over a `SOCK_SEQPACKET` pair (`nn_proto::ipc`): postcard frames of at
+  most 64 KiB, no descriptor, a hello the core checks (version, pid,
+  account, the sandbox it declares), request ids, every result checked
+  again by the core (counts, lengths, alphabets). A worker that breaks the
+  protocol, hangs or dies is killed, its pid taken out of `PROTECTED_PIDS`
+  and started again after a backoff; five failures in a row disable it
+  (signed); the core never does a worker's parsing itself. In the kernel a
+  `PROTECTED_PIDS` entry now holds roles: the agent and the watchdog are
+  protected and exempt (`0x03`), a worker protected and not exempt
+  (`0x02`): the deny hooks defend it and deny it the keys and the
+  protected paths (an entry an earlier version wrote, `1`, keeps both
+  roles). The capability manifest carries each worker's state and the
+  sandbox level it declared (`workers`). R004 knows the agent's own worker
+  launch. A compromised-worker harness (lab builds) proves every forbidden
+  call killed by the filter, each layer beneath it refusing what the
+  kernel lets it, every protocol attack refused.
 - The sensor contract and the signed capability manifest's revisions (lab
   PR 271, Wave 4 phase 2, R13 of the restructure plan; report 06 INI-09,
   R4-01, EXP-37; `docs/operator/SENSOR_CONTRACT.md`). Each of the thirteen

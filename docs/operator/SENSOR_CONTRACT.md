@@ -106,6 +106,7 @@ What R13 adds to the row (`manifest_version` 2):
 | `telemetry_probe`, `settled` | the probe's period (`off`), and whether its first round has ended (before it, every probed source is `pending`) |
 | `degradations`, `trust_level`, `trust_reasons` | as before, now of this revision — the status shows these |
 | `revision`, `hash`, `previous_hash`, `change`, `changes` | the revision (0 at the boot), its capabilities hash, the hash of the revision before it, what changed (one line each) and how many changes the row folds; the running view (`status`, `capabilities`) adds `unsigned_changes`, the changes not signed yet |
+| `workers` | R14a (`WORKERS.md`): each worker kind, its `state` (`ready`, `restarting`, `disabled`, `unavailable`, `stopped`), `why`, `kernel_landlock_abi`, and the `sandbox` its worker declared (the Landlock ABI and what it enforced, the seccomp filter, `no_new_privs`, the account, the capability sets). A worse state — a kind disabled, unavailable, gone, or a worker sandboxed less than before — is signed at once like a source's; a worker's restart that ends within the 5 s between two builds changes nothing |
 
 The **states** of a source:
 

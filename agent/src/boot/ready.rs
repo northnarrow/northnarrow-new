@@ -34,6 +34,7 @@ pub(crate) fn arm(
     overlay_gate: &std::sync::Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
     pumps: Vec<&'static str>,
     opt_ins: Vec<&'static str>,
+    workers: &nn_linux::worker::Workers,
 ) -> Result<Armed> {
     // Lab PR 218 (external review G-12): every attach of this boot is done.
     // The capability manifest — kernel, BTF, LSMs, deny hooks, self-test,
@@ -88,6 +89,7 @@ pub(crate) fn arm(
             fallbacks: Vec::new(),
             missing: Vec::new(),
             content: Vec::new(),
+            workers: Vec::new(),
             telemetry_probe: String::new(),
             settled: false,
             revision: 0,
@@ -106,6 +108,7 @@ pub(crate) fn arm(
             content: Some(std::sync::Arc::clone(overlay_gate)),
             pumps: Some(pumps.iter().map(|p| p.to_string()).collect()),
             opt_ins: opt_ins.iter().map(|k| k.to_string()).collect(),
+            workers: Some(workers.clone()),
         };
         capability_manifest.arm(audit_log.as_ref(), inputs);
         match capability_manifest.current() {

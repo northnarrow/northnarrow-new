@@ -595,6 +595,67 @@ pub fn class_entries(contract: &[SourceContract], sources: &[SourceEntry]) -> Ve
         .collect()
 }
 
+/// R14a (plan §3.1, §3.5): a worker kind's state, as the manifest states it
+/// (the supervisor's `Health`, without the transient start).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerState {
+    /// A worker serves.
+    Ready,
+    /// Between two workers: one died or is starting, within the backoff.
+    Restarting,
+    /// Failures in a row: its requests are refused (the core does without
+    /// what it gives) until a worker stays up.
+    Disabled,
+    /// It cannot be started (no account, no image).
+    Unavailable,
+    /// The agent stopped it.
+    Stopped,
+}
+
+impl WorkerState {
+    pub fn name(self) -> &'static str {
+        match self {
+            WorkerState::Ready => "ready",
+            WorkerState::Restarting => "restarting",
+            WorkerState::Disabled => "disabled",
+            WorkerState::Unavailable => "unavailable",
+            WorkerState::Stopped => "stopped",
+        }
+    }
+
+    /// Worse is higher (a change to a higher rank is signed at once).
+    pub fn rank(self) -> u8 {
+        match self {
+            WorkerState::Ready => 0,
+            WorkerState::Restarting => 1,
+            WorkerState::Stopped => 2,
+            WorkerState::Disabled => 3,
+            WorkerState::Unavailable => 4,
+        }
+    }
+}
+
+/// R14a: a worker kind of this boot, its state and the sandbox its workers
+/// enter on this kernel — declared as the worker measured it, never
+/// assumed (plan §5 risk 8: the Landlock ABI is 1 on 5.15, 2 on 6.1, 4 on
+/// 6.8, 6 on 6.12).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerEntry {
+    /// `parse`.
+    pub kind: String,
+    pub state: WorkerState,
+    /// Why it is disabled or unavailable.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+    /// The kernel's Landlock ABI as the core read it at boot (0: none).
+    pub kernel_landlock_abi: u8,
+    /// The level the running (or the last ready) worker declared in its
+    /// hello, which the core checked; `None` before the first one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<nn_proto::ipc::SandboxLevel>,
+}
+
 /// What this boot runs with (lab PR 218), and since R13 each source and
 /// class against its contract, the revision, its hashes and what changed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -641,6 +702,9 @@ pub struct CapabilityManifest {
     /// copy built into the agent, or a file edited by hand).
     #[serde(default)]
     pub content: Vec<String>,
+    /// R14a: the workers (plan §3.1), their state and their sandbox level.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workers: Vec<WorkerEntry>,
     /// R13: the telemetry probe's period (`off` when switched off), and
     /// whether its first round has ended (`settled`: the manifest states
     /// the self-test's word on every probed source).
@@ -713,6 +777,7 @@ impl CapabilityManifest {
         c.fallbacks.sort();
         c.missing.sort();
         c.content.sort();
+        c.workers.sort_by(|a, b| a.kind.cmp(&b.kind));
         for s in &mut c.sources {
             s.terms = None;
             s.why.sort();
@@ -815,6 +880,38 @@ impl CapabilityManifest {
             &mut out,
         );
         added(&self.content, &before.content, "content", &mut out);
+        for w in &self.workers {
+            match before.workers.iter().find(|b| b.kind == w.kind) {
+                Some(b) if b.state != w.state => out.push(format!(
+                    "worker {}: {} → {}{}",
+                    w.kind,
+                    b.state.name(),
+                    w.state.name(),
+                    if w.why.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", w.why)
+                    }
+                )),
+                Some(b) if b.sandbox != w.sandbox => out.push(format!(
+                    "worker {}: sandbox {} → {}",
+                    w.kind,
+                    b.sandbox
+                        .as_ref()
+                        .map_or_else(|| "unknown".to_string(), |l| l.summary()),
+                    w.sandbox
+                        .as_ref()
+                        .map_or_else(|| "unknown".to_string(), |l| l.summary())
+                )),
+                Some(_) => {}
+                None => out.push(format!("worker {}: new ({})", w.kind, w.state.name())),
+            }
+        }
+        for b in &before.workers {
+            if !self.workers.iter().any(|w| w.kind == b.kind) {
+                out.push(format!("worker {}: gone", b.kind));
+            }
+        }
         if self.deny_hooks != before.deny_hooks {
             out.push(format!(
                 "deny hooks: {} of {} → {} of {}",
@@ -875,6 +972,32 @@ impl CapabilityManifest {
             )
             || self.deny_hooks.attached < before.deny_hooks.attached
             || self.trust_level < before.trust_level
+            || self.workers_worsen_from(before)
+    }
+
+    /// R14a: a worker kind in a worse state, gone, or sandboxed less than
+    /// before (a Landlock level, the seccomp filter).
+    fn workers_worsen_from(&self, before: &CapabilityManifest) -> bool {
+        let weaker = |a: &nn_proto::ipc::SandboxLevel, b: &nn_proto::ipc::SandboxLevel| {
+            a.landlock_abi < b.landlock_abi
+                || (b.fs_denied && !a.fs_denied)
+                || (b.net_denied && !a.net_denied)
+                || (b.scoped && !a.scoped)
+                || (b.seccomp && !a.seccomp)
+        };
+        self.workers
+            .iter()
+            .any(|w| match before.workers.iter().find(|b| b.kind == w.kind) {
+                Some(b) => {
+                    w.state.rank() > b.state.rank()
+                        || matches!((&w.sandbox, &b.sandbox), (Some(a), Some(b)) if weaker(a, b))
+                }
+                None => w.state.rank() > 0,
+            })
+            || before
+                .workers
+                .iter()
+                .any(|b| !self.workers.iter().any(|w| w.kind == b.kind))
     }
 
     /// Every probed source has the probe's word (or the probe is off).

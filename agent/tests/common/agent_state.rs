@@ -439,9 +439,57 @@ fn unique() -> u128 {
         .unwrap_or(0)
 }
 
+/// R14a: the account the agent starts its workers as
+/// (`northnarrow-worker`; install.sh creates it). A test agent on a host
+/// where the agent was never installed (the CI's KVM guest) would run
+/// without its parse worker, a signed degradation every test would see:
+/// created here as install.sh creates it, once, through the real sudo.
+/// Panics when it cannot be had.
+pub fn ensure_worker_account() {
+    const USER: &str = "northnarrow-worker";
+    let present = || {
+        Command::new("getent")
+            .args(["passwd", USER])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if present() {
+        return;
+    }
+    let nologin = if Path::new("/usr/sbin/nologin").exists() {
+        "/usr/sbin/nologin"
+    } else {
+        "/sbin/nologin"
+    };
+    let status = Command::new(SUDO)
+        .args([
+            "useradd",
+            "--system",
+            "--user-group",
+            "--no-create-home",
+            "--home-dir",
+            "/nonexistent",
+            "--shell",
+            nologin,
+            "--comment",
+            "NorthNarrow agent workers",
+            USER,
+        ])
+        .stdin(Stdio::null())
+        .status()
+        .expect("spawn sudo useradd");
+    assert!(
+        status.success() || present(),
+        "could not create the {USER} account"
+    );
+}
+
 /// `sudo install -D -m 755 -o root -g root <this build> <path>`; panics
-/// when it fails.
+/// when it fails. R14a: and the workers' account is there.
 fn install_at(path: &Path) {
+    ensure_worker_account();
     let src = agent_build();
     let status = Command::new(SUDO)
         .args(["install", "-D", "-m", "755", "-o", "root", "-g", "root"])

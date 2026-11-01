@@ -850,6 +850,7 @@ fn manifest_of(f: &SourceFacts) -> CapabilityManifest {
         fallbacks,
         missing,
         content: Vec::new(),
+        workers: Vec::new(),
         telemetry_probe: "every 60 s".into(),
         settled: false,
         contract_hash: String::new(),

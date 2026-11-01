@@ -14,6 +14,10 @@
 # agent_alive / wd_alive say whether a live process was found, and
 # map_pct is the fullest sampled map's occupancy of its max_entries.
 #
+# R14a: the agent's parse worker (its child running its binary, comm
+# `nn-worker-parse`): worker_pid, its RSS and CPU — the parsing it does is
+# the agent's cost, and a worker restart is a pid change of its own.
+#
 # External audit ASK-009 (lab PR 213): the unsigned `nn-admin status` no
 # longer carries the ring-drop counter; it is read signed, with the lab's
 # admin key ($SOAK_ADMIN_KEY, else the first readable of
@@ -55,6 +59,18 @@ for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do
 done
 [ -n "$ADMIN_KEY" ] || echo "sample.sh: no admin key (SOAK_ADMIN_KEY, /root/northnarrow-admin.key): the ring drops are not read" >&2
 prev_ticks=0; prev_time=0; hz=$(getconf CLK_TCK)
+wprev_ticks=0; wprev_time=0; wprev_pid=0
+# The agent's worker of `comm` (its child), or 0.
+worker_pid() { # agent-pid comm
+    local t
+    [ "$1" != 0 ] || { echo 0; return; }
+    for t in /proc/[0-9]*; do
+        [ "$(awk '{print $4}' "$t/stat" 2>/dev/null)" = "$1" ] || continue
+        [ "$(cat "$t/comm" 2>/dev/null)" = "$2" ] || continue
+        echo "${t#/proc/}"; return
+    done
+    echo 0
+}
 # map sizes are sampled every MAP_EVERY samples (see the loop)
 MAP_EVERY=${SOAK_MAP_EVERY:-15}
 MAP_N=0
@@ -113,7 +129,18 @@ while [ ! -e "$SOAK_DIR/stop" ]; do
         drops=$(/usr/local/bin/nn-admin status --key "$ADMIN_KEY" --json 2>>"$SOAK_DIR/sample.err" | grep -oE '"ringbuf_drops_total": *[0-9]+' | grep -oE '[0-9]+$' || true)
     fi
     gi=$(cat "$SOAK_DIR/generate.iter" 2>/dev/null || echo 0)
-    echo "$now,$pid,$rss,$vsz,$cpu,$thr,$fds,$wdrss,$ar,$wr,$jw,$je,$cb,$det,$sts,$aud,$fim,$fs,$us,$fd,$pp,$drops,$gi,$alive,$wdalive,$mp" >> "$OUT"
+    wpid=$(worker_pid "$pid" nn-worker-parse)
+    wrss=0; wcpu=0
+    if [ "$wpid" != 0 ] && [ -r "/proc/$wpid/stat" ]; then
+        wrss=$(awk '/^VmRSS/{print $2+0}' "/proc/$wpid/status" 2>/dev/null || echo 0)
+        wticks=$(awk '{print $14+$15}' "/proc/$wpid/stat")
+        if [ "$wpid" = "$wprev_pid" ] && [ "$wprev_time" != 0 ] && [ "$now" -gt "$wprev_time" ]; then
+            wcpu=$(( (wticks - wprev_ticks) * 100 / hz / (now - wprev_time) ))
+            [ "$wcpu" -lt 0 ] && wcpu=0
+        fi
+        wprev_ticks=$wticks; wprev_time=$now; wprev_pid=$wpid
+    fi
+    echo "$now,$pid,$rss,$vsz,$cpu,$thr,$fds,$wdrss,$ar,$wr,$jw,$je,$cb,$det,$sts,$aud,$fim,$fs,$us,$fd,$pp,$drops,$gi,$alive,$wdalive,$mp,$wpid,$wrss,$wcpu" >> "$OUT"
     sleep "$INTERVAL"
 done
 rm -f "$SOAK_DIR/sample.pid"

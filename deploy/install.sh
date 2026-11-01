@@ -252,6 +252,8 @@ NN_ADMIN_BIN="$TARGET_DIR/nn-admin"
 # unless the agent runs with --exec-quarantine.
 SCAN_BIN="$TARGET_DIR/northnarrow-scan"
 SCAN_USER=northnarrow-scan
+# R14a: the account of the agent's workers (created below).
+WORKER_USER=northnarrow-worker
 AGENT_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-agent.service"
 WATCHDOG_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-watchdog.service"
 # Lab PR 216: the watchdog unit's OnFailure= handler (records that systemd
@@ -1673,30 +1675,42 @@ for f in "$BIN_DIR/northnarrow-agent" "$BIN_DIR/northnarrow-watchdog" "$BIN_DIR/
 done
 fi
 
-# Lab PR 223 (EXPERIMENTAL exec quarantine): the account the agent drops
-# its scanner to — a system user with its own group, no home, no shell,
-# never root. It costs nothing while the guard is off; without it the guard
-# refuses to start (a signed degradation), the agent itself runs.
-# >>> scan_user
-ensure_scan_user() {
-    if getent passwd "$SCAN_USER" >/dev/null; then
+# The agent's unprivileged accounts — system users, each with its own group,
+# no home, no shell, never root:
+# - Lab PR 223 (EXPERIMENTAL exec quarantine): `northnarrow-scan`, the
+#   account the agent drops its scanner to. It costs nothing while the guard
+#   is off; without it the guard refuses to start (a signed degradation).
+# - R14a (plan §3.1, §3.5): `northnarrow-worker`, the account of the
+#   agent's workers (its parse worker: the parsers of hostile bytes, in a
+#   seccomp and Landlock sandbox; docs/operator/WORKERS.md). Without it no
+#   worker starts: a signed degradation, and the agent does without what the
+#   worker gives — it never parses those bytes itself.
+# Both are created before the units start, in a full install and in the
+# packages' configure step alike; uninstall.sh removes them.
+# >>> system_users
+ensure_system_user() {   # <name> <comment> <what is without it>
+    local name=$1 comment=$2 without=$3
+    if getent passwd "$name" >/dev/null; then
         return 0
     fi
     local nologin=/usr/sbin/nologin
     [[ -x $nologin ]] || nologin=/sbin/nologin
     if ! command -v useradd >/dev/null 2>&1; then
-        echo "install.sh: WARNING: useradd not found — no $SCAN_USER account; the exec quarantine cannot start its scanner" >&2
+        echo "install.sh: WARNING: useradd not found — no $name account; $without" >&2
         return 0
     fi
     if useradd --system --user-group --no-create-home --home-dir /nonexistent \
-        --shell "$nologin" --comment "NorthNarrow exec quarantine scanner" "$SCAN_USER"; then
-        echo "install.sh: created the system account $SCAN_USER (exec quarantine scanner)"
+        --shell "$nologin" --comment "$comment" "$name"; then
+        echo "install.sh: created the system account $name ($comment)"
     else
-        echo "install.sh: WARNING: could not create $SCAN_USER — the exec quarantine cannot start its scanner" >&2
+        echo "install.sh: WARNING: could not create $name — $without" >&2
     fi
 }
-# <<< scan_user
-ensure_scan_user
+# <<< system_users
+ensure_system_user "$SCAN_USER" "NorthNarrow exec quarantine scanner" \
+    "the exec quarantine cannot start its scanner"
+ensure_system_user "$WORKER_USER" "NorthNarrow agent workers" \
+    "the agent cannot start its workers (a signed degradation: their enrichment is off)"
 
 # Debian-family kernels carry a distro patch that makes
 # kernel.perf_event_paranoid=3 (their default) require CAP_SYS_ADMIN for

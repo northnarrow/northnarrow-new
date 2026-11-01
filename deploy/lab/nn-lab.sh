@@ -903,7 +903,11 @@ if sudo test -d /sys/fs/bpf/northnarrow; then
         sudo systemctl kill --signal=SIGKILL "$u" 2>/dev/null
         sudo systemctl reset-failed "$u" 2>/dev/null
     done
-    sudo pkill -9 -f "northnarrow-agent-e2etes[t]|northnarrow-watchdog-e2etes[t]" 2>/dev/null
+    # The fixtures' agents and watchdogs left behind, by the binary each
+    # runs (/proc/<pid>/exe), never by a name in a command line: since R14a
+    # the agent's workers run its binary too (as `northnarrow-agent --worker
+    # parse`), and a fixture agent's workers go with it here.
+    sudo bash -c 'for d in /proc/[0-9]*; do e=$(readlink "$d/exe" 2>/dev/null) || continue; case "$e" in */northnarrow-agent-e2etest-*|*/northnarrow-watchdog-e2etest-*) kill -9 "${d#/proc/}" 2>/dev/null ;; esac; done'
     sudo rm -rf /sys/fs/bpf/northnarrow 2>/dev/null
     sudo test -d /sys/fs/bpf/northnarrow && echo PINS_PROTECTED
     # tamper-check leftovers (protected while an agent ran; the window is open now)
@@ -1772,6 +1776,11 @@ cmd_soak() {
                 # counts as alive when it found a pid); one dead sample is a
                 # respawn gap, two in a row or the last one is a dead agent
                 al[n] = (NF >= 24) ? $24 : (pid[n] != 0); wa[n] = (NF >= 25) ? $25 : 1; mp[n] = (NF >= 26) ? $26 : 0
+                # R14a: the parse worker (a sampler without the columns: none)
+                wp[n] = (NF >= 29) ? $27 : 0; wrss[n] = (NF >= 29) ? $28 : 0; wcpu[n] = (NF >= 29) ? $29 : 0
+                if (wp[n] != 0 && wp[n] != lastwp) { if (lastwp != 0) wpchanges++; lastwp = wp[n] }
+                if (NF >= 29 && wp[n] == 0) wdown++
+                if (wrss[n] > wrssmax) wrssmax = wrss[n]; if (wcpu[n] > wcpumax) wcpumax = wcpu[n]; wcpusum += wcpu[n]
                 if (al[n] == 0) { deadrun++; if (deadrun > maxdead) maxdead = deadrun } else deadrun = 0
                 if (wa[n] == 0) { wdrun++; if (wdrun > maxwd) maxwd = wdrun } else wdrun = 0
                 if (mp[n] > mpmax) mpmax = mp[n]
@@ -1801,6 +1810,8 @@ cmd_soak() {
                 if (dr[n] - dr[1] > maxdrops) fail = fail "; ring-buffer drops +" (dr[n]-dr[1]) " > " maxdrops
                 else if (dr[n] - dr[1] > 0) warn = warn "; ring-buffer drops +" (dr[n]-dr[1])
                 if (cb[n] > 0) warn = warn "; " cb[n] " COMBAT journal line(s)"
+                if (wpchanges > 0) warn = warn "; parse worker restarted " wpchanges "×"
+                if (wdown > 0) warn = warn "; " wdown " sample(s) without a parse worker"
                 if (jw[n] > 0) warn = warn "; " jw[n] " journal WARN line(s)"
                 verdict = (fail == "") ? "PASS" : "FAIL"
                 printf "# nn-lab soak — %s — %s\n\n", distro, verdict
@@ -1818,7 +1829,8 @@ cmd_soak() {
                 printf "| audit.log (KB) | %.0f | %.0f | — | |\n", aud[1]/1024, aud[n]/1024
                 printf "| fim_drift.jsonl (KB) | %.0f | %.0f | — | |\n", fim[1]/1024, fim[n]/1024
                 printf "| map FLOW_SOCK_MAP / UDP_UNCONNECTED_SEEN / FIM_DIRTY_INODES | %d / %d / %d | %d / %d / %d | %d / %d / %d | PROTECTED_PIDS %d |\n", fs[1], us[1], fdm[1], fs[n], us[n], fdm[n], fsmax, usmax, fdmmax, pp[n]
-                printf "| ring-buffer drops (cumulative) | %d | %d | — | |\n\n", dr[1], dr[n]
+                printf "| ring-buffer drops (cumulative) | %d | %d | — | |\n", dr[1], dr[n]
+                printf "| parse worker RSS (MB) / CPU %% | %.1f / %d | %.1f / %d | %.1f / %d | avg CPU %.1f, restarts (pid changes) %d, samples without it %d |\n\n", wrss[1]/1024, wcpu[1], wrss[n]/1024, wcpu[n], wrssmax/1024, wcpumax, wcpusum/n, wpchanges, wdown
                 if (fail != "") printf "**FAIL**: %s\n\n", substr(fail, 3)
                 if (warn != "") printf "Notes: %s\n\n", substr(warn, 3)
                 printf "| agent / watchdog alive (samples) | %d / %d | %d / %d | — | longest gap %d / %d, fullest map %d%% |\n", al[1], wa[1], al[n], wa[n], maxdead, maxwd, mpmax
@@ -2029,7 +2041,12 @@ for u in northnarrow-agent northnarrow-watchdog; do
     st=$(systemctl is-active "$u" 2>/dev/null || true)
     [[ "$st" == inactive || "$st" == "" ]] || { echo "FAIL: $u is $st"; fail=1; }
 done
-if pgrep -f "northnarrow-(agent|watchdog)" >/dev/null; then echo "FAIL: northnarrow process still running"; fail=1; fi
+# R14a: by the binary each process runs, not a name in a command line: an
+# agent's worker (`northnarrow-agent --worker parse`, as northnarrow-worker)
+# left behind is a NorthNarrow process too, whatever its comm.
+left=$(for d in /proc/[0-9]*; do e=$(sudo readlink "$d/exe" 2>/dev/null) || continue; case "${e##*/}" in northnarrow-agent*|northnarrow-watchdog*) echo "${d#/proc/}:${e}";; esac; done)
+if [[ -n $left ]]; then echo "FAIL: northnarrow process still running: $left"; fail=1; fi
+if getent passwd northnarrow-worker >/dev/null || getent passwd northnarrow-scan >/dev/null; then echo "FAIL: an agent account is left (northnarrow-worker / northnarrow-scan)"; fail=1; fi
 (( fail == 0 )) && echo "uninstall-check: OK (host clean)"
 # Bring the guest back: fresh install (new keys — the purge removed them).
 sudo ./deploy/install.sh --source-tree >/tmp/nn-reinstall.log 2>&1 || { echo "FAIL: reinstall after purge failed"; tail -20 /tmp/nn-reinstall.log; exit 1; }

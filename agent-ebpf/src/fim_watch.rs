@@ -264,7 +264,9 @@ unsafe fn is_watched(key: &InodeKey) -> bool {
 #[inline(always)]
 pub(crate) fn caller_is_in_family() -> bool {
     let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    unsafe { crate::task_kill::PROTECTED_PIDS.get(&caller_tgid).is_some() }
+    // R14a: the agent and the watchdog (exempt); a worker's access is
+    // observed like any other process's.
+    crate::task_kill::is_exempt_pid(caller_tgid)
 }
 
 /// Reserve a slot in [`FS_FIM_EVENTS`], populate the

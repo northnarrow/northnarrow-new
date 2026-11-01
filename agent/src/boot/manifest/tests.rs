@@ -46,6 +46,7 @@ fn base() -> CapabilityManifest {
         fallbacks: Vec::new(),
         missing: Vec::new(),
         content: Vec::new(),
+        workers: Vec::new(),
         telemetry_probe: String::new(),
         settled: false,
         contract_hash: String::new(),
@@ -111,6 +112,7 @@ fn inputs(bpf_lsm: BpfLsm, self_test: SelfTestOutcome) -> Inputs {
                 .collect(),
         ),
         opt_ins: Vec::new(),
+        workers: None,
     }
 }
 
