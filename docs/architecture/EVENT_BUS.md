@@ -954,7 +954,7 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   deny's fail-open is not counted (no `DENY_FAIL_OPEN` slot: an eBPF
   change); a FIM or network drain that does not start is a WARN, not a
   signed degradation; the manifest's `terms` repeat the contract in every
-  revision (about 17 KiB a row).
+  revision (about 16 KiB a row).
 - **Open after R12c-2** — the self-test as a synthetic event through the
   sensors, the bus, the rules and a dry response into a signed row (the
   telemetry probe's gaps are in the beat; the dry response is not); the

@@ -400,6 +400,18 @@ fn a_gap_an_off_a_missing_and_an_ended_source() {
     let e = source_entries(&sample(), &f);
     assert_eq!(entry(&e, "open_sensor").state, SourceState::Ok);
     assert_eq!(entry(&e, "open_sensor").probe, Some(ProbeState::Pending));
+    // the standby source in charge with its probe's gap: not invoked, why
+    let mut f = healthy();
+    f.notes[0] = note(
+        "file_open",
+        "tracepoint:syscalls/sys_enter_openat (user memory)",
+    );
+    f.probe[0].1 = ProbeState::Gap;
+    let e = source_entries(&sample(), &f);
+    let tp = entry(&e, "file_open");
+    assert_eq!(tp.state, SourceState::AttachedNotInvoked);
+    assert_eq!(tp.probe, Some(ProbeState::Gap));
+    assert!(tp.why.iter().any(|w| w.contains("telemetry_gap")), "{tp:?}");
     // the standby source in charge, then its probe's gap and its end
     let mut f = healthy();
     f.notes[0] = note(
@@ -528,6 +540,37 @@ fn a_change_is_named_line_by_line() {
     );
 }
 
+/// A fallback whose note begins as the attach point's (the process-spawn
+/// tracepoint without its probes) is a fallback, not the attach point.
+#[test]
+fn a_fallback_that_begins_as_the_attach_point_is_a_fallback() {
+    let mut spawn = DNS;
+    spawn.source = "process_spawn";
+    spawn.sensors = &["process_spawn"];
+    spawn.attach = "tracepoint:sched/sched_process_exec";
+    spawn.fallbacks = &[Fallback {
+        attach: "tracepoint:sched/sched_process_exec (no standard-stream probes",
+        when: "the verifier refuses the probes",
+        costs: "R020 off",
+    }];
+    spawn.probe = None;
+    let mut f = healthy();
+    f.notes.push(note(
+        "process_spawn",
+        "tracepoint:sched/sched_process_exec (no standard-stream probes: R020 off)",
+    ));
+    let e = source_entries(&[spawn], &f);
+    assert_eq!(
+        (e[0].on, e[0].state),
+        (AttachedOn::Fallback, SourceState::Ok)
+    );
+    f.notes.pop();
+    f.notes
+        .push(note("process_spawn", "tracepoint:sched/sched_process_exec"));
+    let e = source_entries(&[spawn], &f);
+    assert_eq!(e[0].on, AttachedOn::Primary);
+}
+
 /// The manifest's JSON reads back (the agent's signed row is it).
 #[test]
 fn the_manifest_round_trips() {
@@ -560,3 +603,25 @@ fn the_manifest_round_trips() {
     let back: CapabilityManifest = serde_json::from_value(old).unwrap();
     assert!(back.sources.is_empty() && back.revision == 0);
 }
+
+/// R13: the manifest as the audit row's `extra` carries it (a change's
+/// row: revision 1), pinned — its fields' names, order and shape, and the
+/// content hash over them (a change of either is a change of what every
+/// reader of the audit chain reads, and of every beat's hash).
+#[test]
+fn the_manifest_row_and_its_hash_are_pinned() {
+    let mut f = healthy();
+    f.probe[1].1 = ProbeState::Gap;
+    let mut m = manifest_of(&f);
+    m.sources.retain(|s| s.source == "dns_query");
+    m.classes.retain(|c| c.class == EventClass::Network);
+    m.hash = m.content_hash();
+    m.revision = 1;
+    m.previous_hash = Some("ab".repeat(32));
+    m.change = vec!["source dns_query: telemetry probe seen → gap".into()];
+    assert_eq!(m.hash, MANIFEST_HASH);
+    assert_eq!(serde_json::to_string(&m).unwrap(), MANIFEST_JSON);
+}
+
+const MANIFEST_HASH: &str = "a1ff68da189b87b37b854826e4ffcaf99fb5a762a44cb50d039e5bff1000028e";
+const MANIFEST_JSON: &str = r#"{"manifest_version":2,"agent_version":"0.0.1","kernel":"6.8.0","btf":true,"btf_offsets_resolved":40,"btf_offsets_drifted":0,"btf_offsets_absent":[],"active_lsms":"capability,bpf","bpf_lsm":"active","deny_hooks":{"expected":0,"attached":0,"missing":[],"observe_missing":[]},"deny_self_test":"denied","bpf_guard":"enforce","sensors":[{"sensor":"file_open","attach":"lsm:file_open (FIM observer)"},{"sensor":"deny_hooks","attach":"lsm: 16 of 16 deny hooks"},{"sensor":"dns","attach":"kprobe:udp_send_skb+udp_v6_send_skb"},{"sensor":"dns_nss","attach":"uprobe:libnss_resolve.so.2"},{"sensor":"exploit_guard","attach":"lsm:capable+bprm_check_security"}],"host_hardening":[],"detect_only":false,"degradations":["b","a"],"trust_level":3,"trust_reasons":[],"contract_version":1,"sources":[{"source":"dns_query","classes":["network"],"attach":"kprobe:udp_send_skb+udp_v6_send_skb","on":"primary","state":"attached_not_invoked","why":["telemetry probe: its dns event did not reach the pipeline within the round's deadline (signed telemetry_gap)"],"probe":"gap","terms":{"attach":"kprobe:udp_send_skb","fallbacks":[],"sync_verdict":"none (the event reports what happened)","on_failure":"blind","on_failure_detail":"","kernel_budgets":[],"truncations":[],"rings":["dns"],"loss_counters":[1,3,4,5]}}],"classes":[{"class":"network","queue":"P3","queue_capacity":8192,"when_full":"drop the new event","decision_budget_ms":500,"sources":["dns_query"],"sync_verdict":"none (the event reports what happened)","on_failure":"blind","loss_counters":[1,3,4,5],"state":"attached_not_invoked"}],"fallbacks":[],"missing":["dns_query: attached, not invoked (kprobe:udp_send_skb+udp_v6_send_skb) — telemetry probe: its dns event did not reach the pipeline within the round's deadline (signed telemetry_gap)"],"content":[],"telemetry_probe":"every 60 s","settled":true,"revision":1,"hash":"a1ff68da189b87b37b854826e4ffcaf99fb5a762a44cb50d039e5bff1000028e","previous_hash":"abababababababababababababababababababababababababababababababab","change":["source dns_query: telemetry probe seen → gap"]}"#;

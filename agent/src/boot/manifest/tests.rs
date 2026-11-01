@@ -155,6 +155,11 @@ fn a_change_while_running_is_a_signed_revision() {
         ),
     );
     let first = m.current().unwrap();
+    // the status reply carries it whole, in a frame of at most 64 KiB
+    // (`nn_proto::admin_protocol`): the manifest keeps well under half
+    let json = m.current_json().unwrap();
+    assert!(json.len() < 32 * 1024, "{} bytes", json.len());
+    eprintln!("manifest: {} bytes", json.len());
     assert_eq!(
         first.sources.len(),
         nn_linux::sensors::contract::SOURCES.len()

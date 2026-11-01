@@ -57,7 +57,9 @@ on:
     # eBPF crate, the files the agent embeds (configs/, deploy/systemd/, the
     # COMBAT recovery guide) or the tests read (configs/, deploy/, fuzz/:
     # the agent's seed test, seen since its path is NN_REPO_ROOT's, lab PR
-    # 239), the toolchain and lockfile, the lab scripts, and this workflow.
+    # 239; the sensor contract's operator page, held to the contract by
+    # nn-linux's test, lab PR 271), the toolchain and lockfile, the lab
+    # scripts, and this workflow.
     # xtask/tests/lab_ci.rs derives that list from the repository and fails
     # when a filter is missing or names a path that no longer exists.
     paths:
@@ -75,6 +77,7 @@ on:
       - deploy/**
       - fuzz/**
       - docs/operator/COMBAT_RECOVERY.md
+      - docs/operator/SENSOR_CONTRACT.md
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
