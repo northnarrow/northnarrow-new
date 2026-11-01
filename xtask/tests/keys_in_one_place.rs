@@ -159,7 +159,8 @@ fn the_key_store_is_not_clone_and_hands_out_handles() {
     let vault = strip_comments(
         &fs::read_to_string(repo_root().join("crates/nn-linux/src/keys/vault.rs")).unwrap(),
     );
-    assert!(vault.contains("key: parking_lot::Mutex<Option<Arc<Locked<Zeroizing<[u8; 32]>>>>>,"));
+    assert!(vault.contains("type MasterKey = Arc<Locked<Zeroizing<[u8; 32]>>>;"));
+    assert!(vault.contains("key: parking_lot::Mutex<Option<MasterKey>>,"));
 }
 
 #[test]

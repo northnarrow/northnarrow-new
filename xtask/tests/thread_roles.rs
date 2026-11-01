@@ -19,7 +19,7 @@ fn source(rel: &str) -> String {
 }
 
 /// The text of `src` from `anchor` on, `lines` lines of it.
-fn after<'a>(src: &'a str, rel: &str, anchor: &str, lines: usize) -> String {
+fn after(src: &str, rel: &str, anchor: &str, lines: usize) -> String {
     let at = src
         .find(anchor)
         .unwrap_or_else(|| panic!("{rel}: `{anchor}` not found"));
