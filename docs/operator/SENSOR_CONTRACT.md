@@ -114,7 +114,7 @@ The **states** of a source:
 | `standby` | attached and inert by design: the fallback of a source that runs on its own (the `file_open` tracepoint while `open_sensor` runs) |
 | `disabled_by_admin` | switched off by the operator (`--exploit-guard off`) |
 | `attached_not_invoked` | attached, and not running: its BPF LSM programs do not run (`bpf` not in the active LSM list, or the deny self-test's signal was delivered), or the telemetry probe's event did not reach the pipeline |
-| `unavailable` | nothing attached on this host (with why) |
+| `unavailable` | nothing attached on this host (with why), or attached with no pump or drain started to read it |
 | `adapter_terminated` | its pump or drain ended: the agent stops for the watchdog's restart, and signs this revision first |
 
 A source's **losses** are not a state of the manifest: they are counted by
