@@ -63,9 +63,20 @@ struct Chain {
 
 impl Chain {
     fn new() -> Self {
+        Self::keyed(None)
+    }
+
+    /// Another chain signed with `other`'s key (a chain rebuilt by whoever
+    /// holds the key).
+    fn sharing_key(other: &Chain) -> Self {
+        Self::keyed(Some(other._dir.path().join("k")))
+    }
+
+    fn keyed(key_path: Option<std::path::PathBuf>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("heartbeat.jsonl");
-        let key = TestKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
+        let key_path = key_path.unwrap_or_else(|| dir.path().join("k"));
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pk = key.verifying_key();
         let log = RotatingChainLog::open(
             &path,
@@ -293,6 +304,7 @@ fn loss_alerts_against_the_last_beat_seen() {
     let mut b = beat(2, 30);
     b.loss[4] = Some(3);
     b.loss[3] = Some(7);
+    b.loss[0] = Some(2);
     c.push(b);
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(31), &cfg());
     assert_eq!(kinds(&r), ["LOSS"]);
@@ -306,13 +318,13 @@ fn loss_alerts_against_the_last_beat_seen() {
     let mut b = beat(3, 60);
     b.run = "bbbbbbbbbbbbbbbb".into();
     b.kind = BeatKind::Start;
-    b.loss[0] = Some(2);
+    b.loss[0] = Some(1);
     c.push(b);
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(61), &cfg());
     assert_eq!(kinds(&r), ["LOSS"]);
     assert!(
-        r.alerts[0].detail().contains("stage 1 (kernel ring) +2"),
-        "{r:?}"
+        r.alerts[0].detail().contains("stage 1 (kernel ring) +1"),
+        "the new run's 1 is its own loss, though the old run had counted 2: {r:?}"
     );
 }
 
@@ -384,4 +396,58 @@ fn beat_rows_are_pinned() {
     );
     use crate::chainlog::ChainPayload;
     assert_eq!(HeartbeatRecord::KIND, "heartbeat");
+}
+
+/// Whoever holds the key can sign beats; what such a chain cannot do unseen:
+/// continue the beat seen without linking to it, splice two chains at
+/// contiguous numbers, skip a number, number its beats below the one seen,
+/// or stamp its next beat before the one seen.
+#[test]
+fn a_chain_rebuilt_with_the_key_is_seen() {
+    let mut c = Chain::new();
+    for i in 1..=3 {
+        c.push(beat(i, 30 * i as i64 - 30));
+    }
+    let s = check(Ok(&c.lines()[..1]), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    // another chain, the same key, the same numbers: its beat 2 does not
+    // link to the beat 1 seen
+    let mut other = Chain::sharing_key(&c);
+    let mut b = beat(1, 0);
+    b.posture = "alerted".into();
+    other.push(b);
+    other.push(beat(2, 30));
+    other.push(beat(3, 60));
+    let r = check(Ok(&other.lines()[1..]), &c.pk, Some(&s), at(61), &cfg());
+    assert_eq!(kinds(&r), ["BROKEN"], "{r:?}");
+    // a fetched tail spliced from the two chains at contiguous numbers
+    let lines = c.lines();
+    let spliced = vec![lines[0].clone(), lines[1].clone(), other.lines()[2].clone()];
+    let r = check(Ok(&spliced), &c.pk, None, at(61), &cfg());
+    assert_eq!(kinds(&r), ["BROKEN"], "{r:?}");
+    // a gap in the numbers of a chain that links
+    let mut gap = Chain::new();
+    gap.push(beat(1, 0));
+    gap.push(beat(2, 30));
+    gap.push(beat(4, 60));
+    let r = check(Ok(&gap.lines()), &gap.pk, None, at(61), &cfg());
+    assert_eq!(kinds(&r), ["BROKEN"], "{r:?}");
+    // beats numbered from 1 again, stamped after the beat seen, their heads
+    // ahead: older only by number
+    let s3 = check(Ok(&c.lines()), &c.pk, None, at(61), &cfg())
+        .state
+        .unwrap();
+    let mut renum = Chain::sharing_key(&c);
+    for (i, t) in [(1, 100), (2, 130)] {
+        let mut b = beat(i, t);
+        b.heads[0].seq = Some(200 + i);
+        renum.push(b);
+    }
+    let r = check(Ok(&renum.lines()), &c.pk, Some(&s3), at(131), &cfg());
+    assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+    // the next beat, in order and linked, stamped before the beat seen
+    c.push(beat(4, 50));
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s3), at(62), &cfg());
+    assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
 }
