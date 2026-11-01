@@ -595,11 +595,9 @@ pub(crate) fn start(
                 {
                     use northnarrow_agent::boot::manifest::Took;
                     let all = northnarrow_agent::fim::attach::FIM_OBSERVE_PROGRAMS;
-                    let missing: Vec<String> = all
-                        .iter()
-                        .map(|(p, _)| p.to_string())
-                        .filter(|p| !fim_attached.contains(&p.as_str()))
-                        .collect();
+                    // the open sensor's program is the file_open observer
+                    let missing =
+                        northnarrow_agent::fim::attach::observe_programs_missing(&fim_attached);
                     let (attach, took) = if fim_attached.is_empty() {
                         (
                             format!("not attached: none of the {} observe programs", all.len()),
