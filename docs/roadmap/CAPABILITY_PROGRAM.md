@@ -3941,3 +3941,80 @@ only in the table below, in the same PR as the evidence.
     0 failed, the 54 chain checks `ok`, the `Type=forking` reader daemon
     (the test waits one sweep's period, 7 s, by design) `Log` High, not
     killed.
+- **Lab PR 270 — R12c-1: the response dispatcher off the decision
+  thread; no action without a signed record (Wave 4 Phase 2, R12c of the
+  restructure plan, §3.4, HIGH risk; part 1 of 2, R12c-2 the signed
+  `telemetry_loss` rows and heartbeat; no level changes).**
+  - Why two PRs: R12c-1 changes who acts and what every action leaves
+    behind (the risk of the lot); R12c-2 (stacked on it) adds what a
+    reader on another host can check — the loss rows and the heartbeat
+    with its verifier — with its own gates, lab and review.
+  - What was wrong: the decision thread ran each decision's responses
+    itself before the next event (a kill's cgroup with its verify retries,
+    the quarantine's copy and synced ledger, the block's and the throttle's
+    cgroup files), and the ransomware tracker's sampler and trust ran
+    there too; no record tied an action to what was being done when the
+    agent crashed, and an acting decision's record could be held by the
+    per-rule budget. EXP-13r on `main` b201bd20 (new, below): the decision
+    of P1 events up to 13.9 s and 14.5 s late, 14,932 and 18,632 records
+    lost in the kernel's rings while it acted.
+  - What changed (`docs/architecture/EVENT_BUS.md` §2e, §5–§7;
+    `docs/operator/EVIDENCE_CHAINS.md`, the actions chain): the response
+    dispatcher (`pipeline::dispatch`, thread `nn-response`; the queue
+    `nn_core::response::dispatch`, stage 6) — four severity lanes, 500 ms
+    aging, per-process order by priority inheritance, repeats merged, a
+    full queue (1,024) displacing a less severe job or refusing the new
+    one, each answered `not run`, counted, signed in an `overflow` row and
+    raising `TelemetryLoss`; a dead dispatcher thread stops the agent for
+    the watchdog (signed). The `actions` chain (rotating, signed, KIND
+    `actions`): an `intent` row synced before every action of the agent's
+    own decision and an `outcome` row after it; the `Intent` ticket every
+    acting entry point requires, made only by the journal
+    (`xtask/tests/action_records.rs` keeps it so); an intent left without
+    its outcome by a crash answered by an `interrupted` row and a signed
+    `response_interrupted` audit row at the next start. An acting
+    decision's record is never budget-held (`admit_acted`); stage 7 keeps
+    the records of actions up to twice the writer queue's capacity. The
+    ransomware sampler and trust on `nn-slow-work` (`pipeline::slow`), the
+    decision woken when a burst is prepared. The I/O guard's rule 1b: no
+    acting call in the decision thread's code.
+  - Found by the lab and fixed in the lot: aging took every job older than
+    500 ms first, so under EXP-13r's backlog the response queue was first
+    in, first out (185 of 400 takes passed over a more severe job); one
+    take in four goes by age now (7710d5be). A dispatcher thread that ends
+    is seen and stops the agent (cd5b7868).
+  - Lab (round a, our own guests): ubuntu2404 (6.8.0-147, QEMU/WHPX, 4
+    vCPU) `main` b201bd20 and the first tip 594d0661, each built in the
+    guest and installed fresh. EXP-13r (new, `deploy/lab/bus/responses.sh`:
+    200 execs from `/tmp` killed by R001 and 200 connects to a blocklisted
+    address killed by NET-001, with the EXP-13 load, 30 s) ×2: `main` P1
+    decisions over budget 6,339 and 6,478 (up to 13.9 and 14.5 s), stage 1
+    lost 14,932 and 18,632, stage 4 1,711 and 1,922; the tip 0 and 0 over
+    budget (P1 p99 7.7 and 6.7 ms), stages 1–7 nothing lost, 400 intents
+    and 400 `success` outcomes in each run, none unanswered; the actions
+    themselves waited in the response queue (p50 9.4 s, max 14.2 s: one
+    kill tree at a time, ~35 ms each — `main`'s same backlog, now off the
+    decision). The crash (`debug-crash-mid-action`): the intent written,
+    the agent aborted after the kill, restarted by the watchdog, and 3.5 s
+    later an `interrupted` row and a signed `response_interrupted` audit
+    row named the intent. EXP-13 ×3, 13c ×3, 13d, 13e ×3: no `fs_protect`
+    or FIM drop on either build; 13b 3,000 accounted on both; NET-001
+    probes' records median 19.7 ms (`main`) and 23.1 ms (the tip; three of
+    42 at 138–219 ms in two flood runs, cause not isolated). Overhead within
+    noise (open +29.1 / +18.8 %, wopen +33.1 / +22.6 %, exec +8.3 / +9.3 %,
+    connect +15.1 / +10.1 %, udp +19.1 / +13.7 %, dns +15.2 / +14.5 %).
+    Soak on ubuntu2204 (`main`, 0.8 h): RSS 32.4 → 56.8 MB, 24 threads, no
+    restart, no ring or bus drop. Identity: the eBPF object and
+    `posture_demo` (29 lines) the same bytes for `main`, 02b6077b and
+    R12c-2's 08972539. Host gates on 7710d5be: build-ebpf, clippy ×4, fmt,
+    77 suites 3,370 passed 0 failed 17 ignored, the privileged no-run,
+    attack-coverage, `golden` ×5 (54 files the same bytes), MSRV, fuzz
+    (13), portable-core (5), lockfiles unchanged. Mutations 42 of 42 (35 of
+    39 first; the four survivors' tests, 4 of 4; aging's share and the
+    thread's end, 3 of 3). The tip's soak, `tamper-check` and
+    `test-ignored` were running when the PR opened (its description).
+  - Open: the actions run one at a time (a pool keyed by process is next);
+    whether the intent row must be synced before the action or only
+    written (kept synced); the ladder's and the exec quarantine's threads
+    not ordered against the dispatcher's responses for one process (as
+    before).
