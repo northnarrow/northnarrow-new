@@ -97,6 +97,12 @@ pub const STATE_FLAGS: &[StateFlag] = &[
         what: "the actions chain (each response's intent and outcome), its archives and manifest",
     },
     StateFlag {
+        flag: "--heartbeat-file",
+        file: "heartbeat.jsonl",
+        shared: false,
+        what: "the heartbeat chain, its archives and manifest",
+    },
+    StateFlag {
         flag: "--netflow-file",
         file: "netflow.jsonl",
         shared: false,
@@ -307,6 +313,9 @@ impl AgentState {
     }
     pub fn actions(&self) -> PathBuf {
         self.path("--actions-file")
+    }
+    pub fn heartbeat(&self) -> PathBuf {
+        self.path("--heartbeat-file")
     }
     pub fn netflow(&self) -> PathBuf {
         self.path("--netflow-file")

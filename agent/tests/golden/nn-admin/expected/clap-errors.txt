@@ -1144,6 +1144,178 @@ exit: 2
 |
 | For more information, try '--help'.
 
+### clap.heartbeat.unknown-flag
+$ nn-admin heartbeat --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin heartbeat <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.unknown-subcommand
+$ nn-admin heartbeat nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin heartbeat <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.export.unknown-flag
+$ nn-admin heartbeat export --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin heartbeat export [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.export.file.missing-value
+$ nn-admin heartbeat export --file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--file <FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.export.count.missing-value
+$ nn-admin heartbeat export --count
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--count <COUNT>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.watch.unknown-flag
+$ nn-admin heartbeat watch --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin heartbeat watch [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.watch.agent-pubkey.missing-value
+$ nn-admin heartbeat watch --agent-pubkey
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-pubkey <AGENT_PUBKEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.watch.agent-pubkey-file.missing-value
+$ nn-admin heartbeat watch --agent-pubkey-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-pubkey-file <AGENT_PUBKEY_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.watch.from-cmd.missing-value
+$ nn-admin heartbeat watch --from-cmd
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--from-cmd <FROM_CMD>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.watch.from-file.missing-value
+$ nn-admin heartbeat watch --from-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--from-file <FROM_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.watch.state.missing-value
+$ nn-admin heartbeat watch --state
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--state <STATE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.watch.every.missing-value
+$ nn-admin heartbeat watch --every
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--every <EVERY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.watch.max-silence-secs.missing-value
+$ nn-admin heartbeat watch --max-silence-secs
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--max-silence-secs <MAX_SILENCE_SECS>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.watch.max-skew-secs.missing-value
+$ nn-admin heartbeat watch --max-skew-secs
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--max-skew-secs <MAX_SKEW_SECS>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.watch.reanchor.given-twice
+$ nn-admin heartbeat watch --reanchor --reanchor
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--reanchor' cannot be used multiple times
+|
+| Usage: nn-admin heartbeat watch [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.heartbeat.watch.reanchor.with-a-value
+$ nn-admin heartbeat watch --reanchor=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--reanchor' found; no more were expected
+|
+| Usage: nn-admin heartbeat watch --reanchor
+|
+| For more information, try '--help'.
+
 ### clap.fim.unknown-flag
 $ nn-admin fim --no-such-flag
 exit: 2
@@ -3524,7 +3696,7 @@ exit: 2
 (empty)
 --- stderr
 | error: invalid value 'journal' for '--log <LOG>'
-|   [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, actions, all]
+|   [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, actions, heartbeat, all]
 |
 | For more information, try '--help'.
 
@@ -3535,7 +3707,7 @@ exit: 2
 (empty)
 --- stderr
 | error: invalid value 'Audit' for '--log <LOG>'
-|   [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, actions, all]
+|   [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, actions, heartbeat, all]
 |
 |   tip: a similar value exists: 'audit'
 |

@@ -164,6 +164,8 @@ pub mod fuzz_api;
 /// R09c shim: the host hardening checks (`nn-admin host-check`, the boot's
 /// warnings, the capability manifest's table) are nn-linux's.
 pub use nn_linux::host_hardening;
+/// R12c-2 (lab PR 270): the signed heartbeat and the `telemetry_loss` rows.
+pub mod heartbeat;
 pub mod impact;
 pub mod impair;
 /// R09c shim: the boot's check of the installed binaries and the embedded

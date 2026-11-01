@@ -173,6 +173,18 @@ pub(crate) fn bootstrap(
              journal's open (and unprotected this boot)"
         );
     }
+    // R12c-2 (lab PR 270): the heartbeat chain — the same rationale.
+    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_chain_log(
+        &cli.heartbeat_file,
+        "heartbeat",
+    ) {
+        warn!(
+            error = %e,
+            path = %cli.heartbeat_file.display(),
+            "heartbeat log bootstrap failed pre-attach — file will be lazily created at its \
+             open (and unprotected this boot)"
+        );
+    }
     // Tappa 9.5 K7: bootstrap the two canary state logs pre-attach
     // for the same reason as the FIM logs — STATE_PROTECTED_FILES
     // needs an inode to register against before LSM hooks come up.
@@ -265,6 +277,7 @@ mod tests {
             ("--detections-file", "detections/detections.jsonl"),
             ("--status-events-file", "detections/status_events.jsonl"),
             ("--actions-file", "detections/actions.jsonl"),
+            ("--heartbeat-file", "heartbeat.jsonl"),
             ("--canary-registry-file", "canary_registry.jsonl"),
             ("--canary-access-file", "canary_access.jsonl"),
             ("--netflow-file", "netflow.jsonl"),

@@ -476,6 +476,50 @@ impl ActionJournal {
         }
     }
 
+    /// The chain's head — its position (the number its active file will
+    /// have as an archive, the bytes in it) and its last row's entry hash:
+    /// the heartbeat's commitment of the head (R12c-2; review of #476: a
+    /// tail cut from the chain shows off the host). `None` before the log
+    /// is bound.
+    pub fn head(&self) -> Option<(u64, u64, String)> {
+        match &*self.inner.writer.lock() {
+            Writer::Log(log) => {
+                let (file, bytes) = log.position();
+                Some((file, bytes, log.last_hash().to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    /// R12c-2: whether the chain still holds the head (`file`, `bytes`,
+    /// `hash`) its [`Self::head`] named earlier — `false`: its tail was cut
+    /// or rewritten since (`None`: not bound, or the file not readable).
+    pub fn holds(&self, file: u64, bytes: u64, hash: &str) -> Option<bool> {
+        // (the file, and whether the chain must still have it: the active
+        // file, or an archive within those it keeps — review of #478, X2)
+        let (path, kept) = match &*self.inner.writer.lock() {
+            Writer::Log(log) => {
+                let now = log.position().0;
+                if file == now {
+                    (log.active_path().to_path_buf(), true)
+                } else {
+                    let kept = file < now && now - file <= log.max_archives() as u64;
+                    (
+                        crate::chainlog::archive_path_for(log.active_path(), file),
+                        kept,
+                    )
+                }
+            }
+            _ => return None,
+        };
+        match crate::chainlog::holds_line_ending_at(&path, bytes, hash) {
+            Ok(held) => Some(held),
+            // a file the chain keeps, gone: removed — the head not held
+            Err(_) if kept && std::fs::symlink_metadata(&path).is_err() => Some(false),
+            Err(_) => None,
+        }
+    }
+
     /// The rows a memory journal holds (empty for the signed chain's).
     pub fn rows(&self) -> Vec<ActionRecord> {
         match &*self.inner.writer.lock() {
@@ -1038,6 +1082,66 @@ mod tests {
             Arc::new(crate::chainlog::NoProtection),
         )
         .unwrap()
+    }
+
+    /// Review of #478 (X2): a head the chain named, rotated into an
+    /// archive, is held there; the archive removed (within those the chain
+    /// keeps), it is not — never "not known".
+    #[test]
+    fn a_head_in_a_removed_archive_is_not_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("actions.jsonl");
+        let j = ActionJournal::late();
+        j.bind(log_at(&active, &dir.path().join("k"), 16 * 1024), &active);
+        j.intent(intent_row("KillProcess", 1))
+            .finish(ActionResult::Success, "Killed".into(), None);
+        let (file, bytes, hash) = j.head().unwrap();
+        let mut pid = 10;
+        while crate::chainlog::archives_newest_first(&active).is_empty() {
+            j.intent(intent_row("KillProcess", pid)).finish(
+                ActionResult::Success,
+                "Killed".into(),
+                None,
+            );
+            pid += 1;
+        }
+        assert!(j.head().unwrap().0 > file, "rotated");
+        assert_eq!(j.holds(file, bytes, &hash), Some(true), "in the archive");
+        let archive = crate::chainlog::archive_path_for(&active, file);
+        std::fs::remove_file(&archive).unwrap();
+        assert_eq!(
+            j.holds(file, bytes, &hash),
+            Some(false),
+            "the archive removed"
+        );
+        // a file the chain no longer keeps (evicted, one archive kept):
+        // not known
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("actions.jsonl");
+        let j = ActionJournal::late();
+        let log = ActionJournal::open_log(
+            &active,
+            crate::keys::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap(),
+            crate::chainlog::RotationConfig {
+                size_cap_bytes: 16 * 1024,
+                max_archives: 1,
+                file_mode: 0o600,
+            },
+            Arc::new(crate::chainlog::NoProtection),
+        )
+        .unwrap();
+        j.bind(log, &active);
+        j.intent(intent_row("KillProcess", 1))
+            .finish(ActionResult::Success, "Killed".into(), None);
+        let (file, bytes, hash) = j.head().unwrap();
+        while j.head().unwrap().0 < file + 2 {
+            j.intent(intent_row("KillProcess", 2)).finish(
+                ActionResult::Success,
+                "Killed".into(),
+                None,
+            );
+        }
+        assert_eq!(j.holds(file, bytes, &hash), None, "evicted, not removed");
     }
 
     /// The crash after a rotation: the intent left without its outcome is

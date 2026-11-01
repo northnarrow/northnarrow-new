@@ -1689,6 +1689,13 @@ pub fn bootstrap_status_events_log(status_events_log_path: &Path) -> Result<()> 
 /// R12c (lab PR 270): bootstrap the `actions` chain's active file pre-attach
 /// (a zero-byte placeholder, root only), as the status-event log beside it.
 pub fn bootstrap_actions_log(actions_log_path: &Path) -> Result<()> {
+    bootstrap_chain_log(actions_log_path, "actions")
+}
+
+/// R12c-2 (lab PR 270): bootstrap a rotating chain's active file pre-attach
+/// (`what`: its name in the log line) — a zero-byte placeholder, root only,
+/// so PROTECTED_INODES has an inode to register at attach time.
+pub fn bootstrap_chain_log(actions_log_path: &Path, what: &str) -> Result<()> {
     if actions_log_path.exists() {
         return Ok(());
     }
@@ -1707,10 +1714,11 @@ pub fn bootstrap_actions_log(actions_log_path: &Path) -> Result<()> {
         .write(true)
         .mode(crate::chainlog::STATE_LOG_FILE_MODE)
         .open(actions_log_path)
-        .with_context(|| format!("creating actions log {}", actions_log_path.display()))?;
+        .with_context(|| format!("creating {what} log {}", actions_log_path.display()))?;
     info!(
         path = %actions_log_path.display(),
-        "anti-tamper FS: actions log bootstrapped (zero-byte placeholder for PROTECTED_INODES)"
+        log = what,
+        "anti-tamper FS: chain log bootstrapped (zero-byte placeholder for PROTECTED_INODES)"
     );
     Ok(())
 }

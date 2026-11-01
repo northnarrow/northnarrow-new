@@ -140,6 +140,11 @@ pub const WEAKENING_ENV: &[(&str, WeakensWith)] = &[
     (crate::chainlog::DETECTIONS_CAP_ENV, any_value),
     (crate::chainlog::STATUS_EVENTS_CAP_ENV, any_value),
     (crate::chainlog::ACTIONS_CAP_ENV, any_value),
+    // R12c-2 (lab PR 270): beats spaced out beyond the default.
+    (
+        crate::heartbeat_config::INTERVAL_ENV,
+        crate::heartbeat_config::interval_weakens,
+    ),
     // External audit PROC-015 (NN-AUD-302): a demo-tappa5 build enforces
     // its demo rules R901..R904 under this variable (in any other build
     // nothing reads it, so it is not reported there).

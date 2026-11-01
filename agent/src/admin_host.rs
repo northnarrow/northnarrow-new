@@ -115,6 +115,7 @@ impl AdminHost for AgentAdminHost {
             netflow: state_dir.join("netflow.jsonl"),
             fim_drift: state_dir.join("fim_drift.jsonl"),
             actions: det.join("actions.jsonl"),
+            heartbeat: state_dir.join("heartbeat.jsonl"),
         }
     }
 

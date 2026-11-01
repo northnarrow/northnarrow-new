@@ -85,6 +85,15 @@ log not open: no key, a write refused) is logged whole at ERROR (`an
 action's row is NOT in the signed actions chain — this line is its
 record`) and counted (`rows not in the chain`); the action still runs.
 
+### The heartbeat chain (R12c-2, lab PR 270)
+
+`/var/lib/northnarrow/heartbeat.jsonl` (`--heartbeat-file`; 4 MiB × 4
+archives) holds a signed beat every 30 s (`NN_HEARTBEAT_SECS`): numbered
+across runs, with the loss of every stage, the actions chain's counts and
+the heads of the audit and actions chains. It is verified with the others
+(`sudo nn-admin chain verify --log heartbeat`) and read from another host
+by `nn-admin heartbeat watch` — `HEARTBEAT.md`.
+
 ## Exit codes of the verifiers
 
 Stable (scripts may rely on them; external audit MAIN-014, EVD-017, lab
@@ -136,7 +145,7 @@ audit EVD-007, EVD-008, EVD-023):
 
 | Lines | Pre-image signed | The bytes on disk |
 |---|---|---|
-| rotating logs (detections, status events, netflow, FIM drift, actions): data lines, terminators and manifest rows with `fmt_ver` 3 — every line this version writes | `SHA-256("northnarrow/chainlog/<log>/<line type>/v3\0" ‖ prev_hash ‖ line)`, `<log>` one of `detections`, `status_events`, `netflow`, `fim_drift`, `actions`, `<line type>` `data`, `terminator` or `manifest` | must be the canonical serialisation of the line |
+| rotating logs (detections, status events, netflow, FIM drift, actions, heartbeat): data lines, terminators and manifest rows with `fmt_ver` 3 — every line this version writes | `SHA-256("northnarrow/chainlog/<log>/<line type>/v3\0" ‖ prev_hash ‖ line)`, `<log>` one of `detections`, `status_events`, `netflow`, `fim_drift`, `actions`, `heartbeat`, `<line type>` `data`, `terminator` or `manifest` | must be the canonical serialisation of the line |
 | the same logs, lines without `fmt_ver` or with `fmt_ver` 2 (written before this version) | `SHA-256(prev_hash ‖ line)`, the same for every log and line type | not checked; counted |
 | `audit.log`, `canaries.jsonl`, `canary_access.jsonl`, numbered rows (`seq`, lab PR 160 on) | `SHA-256("northnarrow/audit/v2\0"` (or `canary-registry`, `canary-access`) `‖ prev_hash ‖ row)` | must be the canonical serialisation of the row |
 | the same files, rows without `seq` | `SHA-256(prev_hash ‖ row)` | not checked; counted |

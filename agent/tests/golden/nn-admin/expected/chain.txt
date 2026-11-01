@@ -12,6 +12,7 @@ exit: 0
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 (empty)
@@ -36,6 +37,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  audit            audit.log: chain_rewritten: no line with that hash ends there; the head anchored at 2026-10-22T08:00:00.000000Z ends at byte 1234 (row 2, entry_hash abababababababababababababababababababababababababababababababab): the file was rewritten
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -52,6 +54,7 @@ exit: 0
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: 1 head(s) anchored at 2025-06-15T15:06:40.000000Z, all reached
 --- stderr
 (empty)
@@ -68,6 +71,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  audit            audit.log: chain_truncated: the file is 1150 bytes; the head anchored at 2025-06-15T15:06:40.000000Z ends at byte 1692 (row 2, entry_hash 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1): rows were cut from its end
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -84,6 +88,7 @@ exit: 0
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            anchors/heads.json: 1 head(s) anchored at 2025-06-15T15:06:40.000000Z, all reached
 --- stderr
 (empty)
@@ -100,6 +105,7 @@ exit: 0
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            absent.json: no head anchor to compare with
 --- stderr
 (empty)
@@ -116,6 +122,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  chain_heads      chain_heads.json: chain_heads_unverified: the head anchor holds no genuine snapshot (slot 0: key must be a string at line 1 column 2)
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -132,6 +139,7 @@ exit: 0
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 (empty)
@@ -148,6 +156,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -164,6 +173,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -180,6 +190,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -196,6 +207,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -212,6 +224,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -228,6 +241,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -244,6 +258,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -260,6 +275,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -284,6 +300,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -363,6 +380,7 @@ exit: 0
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 12 records, 5 archive(s) from seq 1, 1 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 (empty)
@@ -405,6 +423,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl.manifest.jsonl: entry 0: signature invalid (its entry_hash recomputes: the line is as it was written, but this agent's key did not sign it — another key did, or it was forged)
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -421,6 +440,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl: entry 0: entry_hash mismatch (recomputed ccbfcc2a73a802efa444f2b13d4636e49af89832e7b9ff32ab66a244ce798d77, stored 757d8b3c585d1cc7994026c9b45252fea36384cd15ca680b2747111e51685bd2)
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -437,6 +457,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl: entry 0: prev_hash 757d8b3c585d1cc7994026c9b45252fea36384cd15ca680b2747111e51685bd2 != expected 1d2141114991ffcf07fb0046bfbb8b9e24076735f00aedcfa6f5dad33714ed0b
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: chain_truncated: the file is 675 bytes; the head checkpointed in the manifest (generation 6) ends at byte 1350 (entry_hash 70ce0cad2207532c79283e5d06d63ff5917f48d248cbfdb70b49b0f7fcf1e09a): rows were cut from its end
 --- stderr
 | chain: 2 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -453,6 +474,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl: malformed line 1: data decode: EOF while parsing a string at line 1 column 660
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: chain_truncated: the file is 1335 bytes; the head checkpointed in the manifest (generation 6) ends at byte 1350 (entry_hash 70ce0cad2207532c79283e5d06d63ff5917f48d248cbfdb70b49b0f7fcf1e09a): rows were cut from its end
 --- stderr
 | chain: 2 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -469,6 +491,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl: malformed line 0: data decode: expected value at line 1 column 1
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: chain_rewritten: no line with that hash ends there; the head checkpointed in the manifest (generation 6) ends at byte 1350 (entry_hash 70ce0cad2207532c79283e5d06d63ff5917f48d248cbfdb70b49b0f7fcf1e09a): the file was rewritten
 --- stderr
 | chain: 2 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -485,6 +508,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: evicted prefix seq 1 not corroborated by the manifest
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -501,6 +525,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl.000001: entry 0: entry_hash mismatch (recomputed 0f2a6b869035e2abaf63c1aaab6d71c12a869761eb451a8cecf92415140522c4, stored 98e8aecf8718820719fccea54dc7180535d912dff86b60670d104e8bee9553d1)
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -517,6 +542,7 @@ exit: 0
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        ./fim_drift.jsonl: 12 records, 5 archive(s) from seq 1, 0 checkpoint(s) reachable
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 (empty)
@@ -533,6 +559,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl.manifest.jsonl: entry 0: entry_hash mismatch (recomputed 522dc0fe33f83e1f5884aef466f7ee3caf98d070fc403b54acf7a3b967d8cd87, stored 6cbdb023d22c8423885ca545b52a8174071f7b9c502312dc3b6e7e9870485f58)
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -557,6 +584,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl: entry 0: a v3 line not in its canonical form (the bytes on disk are not what the agent wrote: a key added, reordered or re-spelled)
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: chain_rewritten: no line with that hash ends there; the head checkpointed in the manifest (generation 6) ends at byte 1350 (entry_hash 70ce0cad2207532c79283e5d06d63ff5917f48d248cbfdb70b49b0f7fcf1e09a): the file was rewritten
 --- stderr
 | chain: 2 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -573,6 +601,7 @@ exit: 8
 | OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | BROKEN  fim_drift        ./fim_drift.jsonl: file ./fim_drift.jsonl: entry 0: prev_hash 1d2141114991ffcf07fb0046bfbb8b9e24076735f00aedcfa6f5dad33714ed0b != expected 0000000000000000000000000000000000000000000000000000000000000000
 | OK      actions          ./detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        ./heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 | chain: 1 problem(s) — evidence missing or altered; see the operator runbook (docs/operator/EVIDENCE_CHAINS.md)
@@ -605,6 +634,7 @@ exit: 0
 | OK      netflow          no/such/netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      fim_drift        no/such/fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      actions          no/such/detections/actions.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heartbeat        no/such/heartbeat.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
 | OK      heads            chain_heads.json: no head anchor to compare with
 --- stderr
 (empty)

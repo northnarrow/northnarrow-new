@@ -1216,10 +1216,25 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         Ok(())
     }
 
+    /// The archives this chain keeps (R12c-2: an archive within them that
+    /// is missing was removed, not evicted).
+    pub fn max_archives(&self) -> usize {
+        self.cfg.max_archives
+    }
+
     /// The active file (R12c, lab PR 270: a caller's own fsync of it,
     /// [`sync_detached`]).
     pub fn active_path(&self) -> &Path {
         &self.active_path
+    }
+
+    /// R12c-2 (lab PR 270; review of #476): where the chain's head is — the
+    /// number the active file will have as an archive, and the bytes in it.
+    /// Together they only grow while the chain is appended to (a rotation
+    /// raises the first and starts the second again), across a reopen too:
+    /// a tail cut from the active file, or a rotation undone, goes back.
+    pub fn position(&self) -> (u64, u64) {
+        (self.next_seq, self.active_bytes)
     }
 
     /// R12c (lab PR 270): the fsync of the lines [`Self::append_deferred`]
@@ -1700,6 +1715,41 @@ fn list_archive_seqs(active: &Path) -> Result<Vec<u64>> {
 
 fn scan_max_archive_seq(active: &Path) -> Result<Option<u64>> {
     Ok(list_archive_seqs(active)?.into_iter().max())
+}
+
+/// R12c-2 (lab PR 270): whether the chain file at `path` still holds, as
+/// the line that ends at byte `bytes`, the line whose entry hash is
+/// `entry_hash` — a head named earlier still in the chain (`false`: the
+/// tail was cut or rewritten since, whatever was appended after). `Err`:
+/// the file cannot be read.
+pub fn holds_line_ending_at(path: &Path, bytes: u64, entry_hash: &str) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    if bytes == 0 {
+        return Ok(true);
+    }
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let len = f.metadata()?.len();
+    if len < bytes {
+        return Ok(false);
+    }
+    let from = bytes.saturating_sub(64 * 1024);
+    f.seek(SeekFrom::Start(from))?;
+    let mut buf = vec![0u8; (bytes - from) as usize];
+    f.read_exact(&mut buf)?;
+    if buf.last() != Some(&b'\n') {
+        return Ok(false);
+    }
+    let body = &buf[..buf.len() - 1];
+    let line = match body.iter().rposition(|b| *b == b'\n') {
+        Some(i) => &body[i + 1..],
+        None if from == 0 => body,
+        None => return Ok(false),
+    };
+    let v: serde_json::Value = match serde_json::from_slice(line) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
+    Ok(v.get("entry_hash").and_then(|h| h.as_str()) == Some(entry_hash))
 }
 
 /// R12c (lab PR 270): the fsync [`RotatingChainLog::detach_sync`] left to

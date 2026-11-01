@@ -809,7 +809,18 @@ stage of an event's path (plan §3.4):
 | 5 decision delay | the decisions over their class's budget, from the record's kernel time | R12b |
 | 6 response queue | responses decided and not run: displaced or refused by the full queue, queued at the stop, the dispatcher down (each signed in an `overflow` row) | R12c |
 | 7 evidence writer queue | detection records dropped or refused by the chain, action rows not in their chain, canary rows not written | R12c |
-| 8 export | — | R15 (R12c-2: the signed `telemetry_loss` rows and the heartbeat carry stages 1 to 7) |
+| 8 export | — | R15 |
+
+**Signed off the host's word (R12c-2).** Stages 1 to 7 are signed together:
+a `telemetry_loss` row in the audit log (each stage's total since the run
+started and what it lost since the last row) at a change, at most once a
+minute, and once an hour with no change (the zero signed too), and at the
+stop; and in every beat of the signed heartbeat (`loss`, with the actions
+chain's counts, the probe's gaps, the decision thread's progress and the
+heads of the audit and actions chains), which a verifier on another host
+reads and alerts on (`nn-admin heartbeat watch`,
+`docs/operator/HEARTBEAT.md`: silence, a broken chain, a replay or a
+rollback, a tampered beat, loss, a stop, degraded health).
 
 `nn-admin status --key` shows stages 6 and 7 in detail
 (`StatusResponse::response_dispatch`, appended after `event_bus_decision`):
@@ -907,5 +918,17 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   it); the per-rule policy's exemption facts, a canary trip's reader and
   the security-tool detector's registration are still read on the decision
   thread (§2d).
-- **R12c-2** — signed `telemetry_loss` rows aggregating every stage, then
-  the heartbeat and its minimal external verifier (INI-14).
+- **R12c-2, done (lab PR 270)** — the signed `telemetry_loss` rows of
+  stages 1 to 7 (§5), the signed heartbeat (a chain of its own, a beat
+  every 30 s, numbered across runs, carrying the stages' loss, the actions
+  chain's counts, the probe's gaps, the decision's progress, the posture,
+  the degradations and the heads of the audit and actions chains; a `start`
+  and a `stop` beat), and its minimal external verifier (`nn-admin
+  heartbeat export` on the host through an SSH forced command, `nn-admin
+  heartbeat watch` on another host; `docs/operator/HEARTBEAT.md`).
+- **Open after R12c-2** — the self-test as a synthetic event through the
+  sensors, the bus, the rules and a dry response into a signed row (the
+  telemetry probe's gaps are in the beat; the dry response is not); the
+  beat's signature proves which key wrote it, not the host's honesty — a
+  TPM quote (R2-12) and an off-host anchor of every chain's head (R15's
+  export) are the next steps; stage 8 (the export) is R15's.
