@@ -47,6 +47,23 @@ pub const MAX_FRAME: usize = 64 * 1024;
 /// Most items one batched request may carry.
 pub const MAX_BATCH: usize = 512;
 
+/// The most a batch of names may need of its answer's frame: each name's
+/// longest decode ([`max_qname_out`]) and its encoding's overhead
+/// ([`NAME_OVERHEAD`]), within [`MAX_FRAME`] less [`FRAME_MARGIN`]. A request
+/// whose worst answer would not fit a frame is refused before it is sent:
+/// an honest worker can always answer what it is asked.
+pub const fn worst_answer(name_bytes: usize) -> usize {
+    max_qname_out(name_bytes) + NAME_OVERHEAD
+}
+
+/// The bytes postcard spends on one name's answer beyond its text (the
+/// string's length, the end's option and value), rounded up.
+pub const NAME_OVERHEAD: usize = 8;
+
+/// The frame's room kept for the envelope (the response's id, the variant
+/// tags, the vector's length).
+pub const FRAME_MARGIN: usize = 64;
+
 /// Longest QNAME input: the kernel's record holds `QNAME_WIRE_LEN` (288)
 /// bytes; the bound leaves room for a larger record without letting a
 /// request carry more than a name.
@@ -303,6 +320,15 @@ impl Request {
                 }
                 if names.iter().any(|q| q.bytes.len() > MAX_QNAME_IN) {
                     return Err(Violation::Bounds("dns_names: a name's bytes"));
+                }
+                // its worst answer fits a frame
+                if names
+                    .iter()
+                    .map(|q| worst_answer(q.bytes.len()))
+                    .sum::<usize>()
+                    > MAX_FRAME - FRAME_MARGIN
+                {
+                    return Err(Violation::Bounds("dns_names: the answer's frame"));
                 }
                 Ok(())
             }
@@ -744,6 +770,36 @@ mod tests {
             req: Request::DnsAnswers(vec![0; MAX_FRAME]),
         };
         assert!(encode(&huge).is_err());
+        // the worst answer to a request the bounds allow fits a frame: every
+        // name escaped byte by byte, and a pointer
+        let n = (MAX_FRAME - FRAME_MARGIN) / worst_answer(MAX_QNAME_IN);
+        let req = Request::DnsNames(vec![
+            QnameIn {
+                bytes: vec![0x01; MAX_QNAME_IN],
+                find_end: false
+            };
+            n
+        ]);
+        assert!(req.check().is_ok());
+        let worst = FromWorker::Response(Response {
+            id: u64::MAX,
+            answer: Answer::DnsNames(vec![
+                QnameOut {
+                    name: "\\001".repeat(MAX_QNAME_IN) + "…",
+                    end: Some(u16::MAX)
+                };
+                n
+            ]),
+        });
+        assert!(encode(&worst).is_ok(), "the worst answer fits");
+        let mut over = req.clone();
+        if let Request::DnsNames(v) = &mut over {
+            v.push(QnameIn {
+                bytes: vec![0x01; MAX_QNAME_IN],
+                find_end: false,
+            });
+        }
+        assert!(over.check().is_err(), "one more does not");
         // the largest request the bounds allow fits a frame
         let names = ToWorker {
             id: u64::MAX,
