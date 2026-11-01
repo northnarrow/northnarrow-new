@@ -608,3 +608,24 @@ fn the_dispatcher_says_whether_its_thread_runs() {
     d.stop(Duration::from_millis(10));
     assert!(!d.is_running());
 }
+
+/// The event loop stops the agent when the dispatcher's thread ended (as
+/// for a dead pump), and the stop is a failure: pinned in the sources (the
+/// loop's check is the watch's, not a unit's).
+#[test]
+fn a_dead_dispatcher_stops_the_agent() {
+    let rl = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/run_loop.rs"));
+    let watch = &rl[rl.find("async fn watch_loop(").expect("watch_loop")..];
+    let check = watch
+        .find("if !dispatcher.is_running() {")
+        .expect("the watch checks the dispatcher");
+    let reason = watch[check..]
+        .find("return \"response_dispatcher_exited\";")
+        .expect("and stops");
+    assert!(
+        watch[check..check + reason].contains("attest_degraded_at("),
+        "signed"
+    );
+    let sd = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/shutdown.rs"));
+    assert!(sd.contains("if stop_reason == \"response_dispatcher_exited\" {"));
+}
