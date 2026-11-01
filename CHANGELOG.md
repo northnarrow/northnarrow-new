@@ -1352,9 +1352,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ### Changed
 - The responses run by a pool of workers keyed by process (lab PR 270,
   R12c-3; `docs/architecture/EVENT_BUS.md` §2e): eight workers
-  (`nn-response-<n>`, `NN_RESPONSE_WORKERS`, 1 to 32) take one response at
-  a time of a process with none running — different processes' responses
-  at once, one process's one at a time and in order. An action still
+  (`nn-response-<n>`, `NN_RESPONSE_WORKERS`, 1 to 32, at a nice value five
+  above the agent's) take one response at a time of a process with none
+  running — different processes' responses at once, one process's one at
+  a time and in order; a kill tree whose root has no child skips the
+  `/proc` walks. An action still
   running after 10 s is stalled: a signed `stalled` row in the actions
   chain, a WARN, `TelemetryLoss`, the status's count, and a spare worker so
   the other responses do not wait behind it. The actions chain gains

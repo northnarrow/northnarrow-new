@@ -341,11 +341,16 @@ lock, never a wait — and a pool of workers takes them (R12c-3: the threads
 `nn-response-<n>`, eight by default, `NN_RESPONSE_WORKERS`, 1 to 32). A
 worker takes one response at a time, of a process with no response running
 (the queue marks the process running until the worker is done with it):
-different processes' responses run at once, one process's one at a time —
-an action spends most of its time waiting on the kernel (a cgroup frozen,
-killed and verified), so the pool shortens a burst's wait about as many
-times as it has workers (the single thread of R12c-1 kept EXP-13r's 400
-kills waiting up to 14–19 s). The queue's order:
+different processes' responses run at once, one process's one at a time.
+A worker runs at a nice value five above the agent's, so on a short CPU
+the decision thread and the pumps keep theirs (the first pool, at the
+same priority, made 1,247 P1 decisions late in EXP-13r on a 4-CPU guest);
+and a kill tree whose root has no child (its threads' `children` files,
+read once it is inside the kill cgroup, where any later child is born)
+skips the `/proc` walks that each cost ~50 ms of CPU with EXP-13r's 400
+processes alive. EXP-13r's 400 kill trees waited at most 2.0 and 4.1 s
+in the queue (p50 0.23 and 0.29 s), against 13–19 s for R12c-1's single
+thread. The queue's order:
 - **by severity**: four lanes, Critical first; once the oldest job waited
   `STARVATION_NS` (500 ms), one take in four (`AGED_TAKE_EVERY`) is it,
   whatever its lane, so a flood of Critical kills cannot hold a Low
