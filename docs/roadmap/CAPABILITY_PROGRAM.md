@@ -4011,10 +4011,51 @@ only in the table below, in the same PR as the evidence.
     attack-coverage, `golden` ×5 (54 files the same bytes), MSRV, fuzz
     (13), portable-core (5), lockfiles unchanged. Mutations 42 of 42 (35 of
     39 first; the four survivors' tests, 4 of 4; aging's share and the
-    thread's end, 3 of 3). The tip's soak, `tamper-check` and
-    `test-ignored` were running when the PR opened (its description).
-  - Open: the actions run one at a time (a pool keyed by process is next);
-    whether the intent row must be synced before the action or only
-    written (kept synced); the ladder's and the exec quarantine's threads
-    not ordered against the dispatcher's responses for one process (as
-    before).
+    thread's end, 3 of 3).
+  - Independent review of #476 ("merge after X"), fixed in the lot
+    (537cf086, e058d1e8): a kill of a process that reused a pid was merged
+    into the queued kill of the pid's old owner and left the new process
+    alive — a process is its pid and its start now (X1); a full queue of
+    Critical jobs refused a new Critical kill — a Critical kill goes past
+    the capacity now, counted, up to four times it (X2); the intent row is
+    written before every action (it survives a crash of the agent) and
+    synced before it only for a quarantine, a strip or a restore, every
+    fsync of the journal outside its lock; a kill goes before its
+    process's queued jobs and supersedes its throttles and blocks; the
+    I/O guard excludes the dispatchers' thread functions, not their files
+    (the guards' `production()` no longer hides code after a
+    `#[cfg(test)]` field); §2e says "an attempt at a signed record" and
+    names `reconcile_stale_chain`; the reviewer's surviving mutations K2,
+    K5, K11 have their tests.
+  - Lab after the review (round c, ubuntu2404, e058d1e8, a fresh
+    install): EXP-13r ×2 — 400 intents and 400 `success` outcomes in each
+    run, none unanswered, P1 0 over budget, stages 1–4, 6 and 7 nothing
+    lost (P3 16 decisions over budget in the second run, stage 5); the
+    queue's wait p50 7.3 and 9.4 s, max 13.4 and 18.8 s, 68 and 67 takes
+    by age past a more severe job (185 before the fix) — the actions still
+    one at a time (~35 ms a kill tree, up to 371 ms under the load): the
+    pool of R12c-3. The crash: the kill's intent written, not synced, the
+    agent aborted, restarted, the `interrupted` row and the audit row 4.2 s
+    later. EXP-13c ×3 and 13e ×3: no `fs_protect` or FIM drop; NET-001's
+    record median 22.3 ms over 36 probes (`main` 19.2 ms, the first tip
+    23.8 ms), one at 426 ms and one at 95 ms in the first 13c run (the
+    first tip had three at 138–219 ms with the fsync before the kill: the
+    outliers are the one executor thread under the flood, not the fsync).
+    `test-ignored`: 82 suites, 97 passed, 0 failed, the 54 chain checks
+    `ok`.
+    Host gates on e058d1e8: build-ebpf, clippy ×4, fmt, 77 suites 3,378
+    passed 0 failed 17 ignored, the privileged no-run, attack-coverage,
+    `golden` ×5, MSRV, fuzz (13), portable-core (5), lockfiles unchanged.
+    Mutations of the fixes 16 of 16 (15 first; MX1 — only `same_action`'s
+    start — caught once `same_action` was tested directly). Round a's last
+    results (594d0661): `tamper-check` 72 OK, C27 and C57c the known gaps,
+    C64 the recorded deviation, case by case those of R12b-2's final;
+    `test-ignored` 81 suites, 97 passed, 0 failed, the 54 chain checks
+    `ok`; the soak (ubuntu2204, a fresh install, the same 0.8 h load as `main`'s): RSS 33.0 → 57.3 MB (`main` 32.4 → 56.8), 26 threads throughout (`main` 24: the dispatcher's and the slow work's), no restart, no ring or bus drop, P1 10 decisions over budget of 312,014 (the boot's backlog), 1,871 WARN/ERROR lines (`main` 1,929; one ERROR each: the lab's admin key on the host).
+  - Open (R12c-3, after this merges): a pool of response workers keyed by
+    process (EXP-13r's wait under 2 s), a stall detector for an action
+    that hangs, `run_started`/`run_ended` rows for the crash report's edge
+    cases; the batch limited to the most severe lane; the ticket passed by
+    value.
+  - Open: the ladder's and the exec quarantine's threads not ordered
+    against the dispatcher's responses for one process (as before R12c).
