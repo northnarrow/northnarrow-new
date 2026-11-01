@@ -156,7 +156,109 @@ pub struct HeartbeatRecord {
     /// A `stop` beat's reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// R13 (lab PR 271): the signed capability manifest's newest revision
+    /// (`None`: an agent older than R13, or before its boot signed it).
+    /// Not `manifest`: a chain line's top-level key of its rotation
+    /// records, reserved by the chain log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<BeatManifest>,
 }
+
+/// R13 (lab PR 271): what a beat carries of the capability manifest — the
+/// hash of what the agent runs with (`CapabilityManifest::content_hash`),
+/// the revision it is (0: the boot's), and whether the telemetry probe has
+/// had its word on every probed source (`settled`: before its first round
+/// the manifest says "pending", a hash a verifier does not compare).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeatManifest {
+    pub hash: String,
+    pub revision: u64,
+    pub settled: bool,
+    /// The hash of the contract's terms, the agent's version and the
+    /// kernel's release (the review of #479): a change of it alone is an
+    /// upgrade, a NOTICE of the verifier's, not an alert — when nothing
+    /// went backwards (the re-check of #479).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<String>,
+    /// The contract's version and the kernel's release it was hashed with
+    /// (the re-check of #479: the verifier checks that they, and the beat's
+    /// agent `version`, do not go backwards).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
+}
+
+/// The versions a run's contract was hashed with, as the verifier last saw
+/// them (the re-check of #479).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContractSeen {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
+}
+
+/// The order of two releases (an agent's version, a kernel's release):
+/// compared part by part (split at `.`, `-`, `+`, `~`, `_`), numbers as
+/// numbers; `None` when they differ in a part that is not a number on both
+/// sides (a kernel's flavour, a pre-release tag), or one has more parts
+/// and they are not all numbers — not known to be a step forward.
+pub fn release_order(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let parts = |s: &str| -> Vec<String> {
+        s.split(['.', '-', '+', '~', '_'])
+            .map(str::to_string)
+            .collect()
+    };
+    let (pa, pb) = (parts(a), parts(b));
+    for (x, y) in pa.iter().zip(pb.iter()) {
+        match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(m), Ok(n)) if m != n => return Some(m.cmp(&n)),
+            (Ok(_), Ok(_)) => {}
+            _ if x != y => return None,
+            _ => {}
+        }
+    }
+    let rest = |p: &[String]| p.iter().all(|x| x.parse::<u64>().is_ok());
+    match pa.len().cmp(&pb.len()) {
+        Ordering::Equal => Some(Ordering::Equal),
+        Ordering::Greater if rest(&pa[pb.len()..]) => Some(Ordering::Greater),
+        Ordering::Less if rest(&pb[pa.len()..]) => Some(Ordering::Less),
+        _ => None,
+    }
+}
+
+/// What went backwards (or is not known to have gone forward) from
+/// `before` to `now`: one phrase each, empty when every one advanced or
+/// stayed (the re-check of #479).
+pub fn contract_backwards(before: &ContractSeen, now: &ContractSeen) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut release = |what: &str, a: &str, b: &str| match release_order(b, a) {
+        Some(std::cmp::Ordering::Less) => out.push(format!("{what} {a} → {b} (older)")),
+        None => out.push(format!("{what} {a} → {b} (not known to be newer)")),
+        Some(_) => {}
+    };
+    release("agent", &before.agent, &now.agent);
+    if let Some(k) = &before.kernel {
+        release("kernel", k, now.kernel.as_deref().unwrap_or("(not said)"));
+    }
+    if let Some(v) = before.contract_version {
+        match now.contract_version {
+            Some(w) if w >= v => {}
+            Some(w) => out.push(format!("contract version {v} → {w} (older)")),
+            None => out.push(format!("contract version {v} → (not said)")),
+        }
+    }
+    out
+}
+
+/// A run's manifest not settled this long after its start is DEGRADED: the
+/// probe's first round ends 25 s after the start at most
+/// (`FIRST_ROUND_SECS` + `DEADLINE_SECS`); two minutes leave room for a
+/// round skipped.
+pub const MANIFEST_SETTLE_SECS: u64 = 120;
 
 /// Degradations named in a beat at most.
 pub const MAX_DEGRADATIONS: usize = 16;
@@ -202,6 +304,22 @@ pub struct WatchState {
     pub seen_at: String,
     #[serde(default)]
     pub uptime_ms: u64,
+    /// R13 (lab PR 271): the hash of the last settled capability manifest
+    /// seen (across runs: a change at a restart is a change), its revision
+    /// and its run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_revision: Option<u64>,
+    /// The run whose beat carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_run: Option<String>,
+    /// The contract's hash last seen (the review of #479).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_contract: Option<String>,
+    /// The versions it was hashed with (the re-check of #479).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_versions: Option<ContractSeen>,
 }
 
 /// One alert, by kind (the most severe first in [`Alert::rank`]).
@@ -223,7 +341,8 @@ pub enum Alert {
     /// The counters show loss since the last beat seen.
     Loss(String),
     /// The agent's health degraded (a stalled decision, a probe gap, a new
-    /// degradation, an action row not written, an interrupted action).
+    /// degradation, an action row not written, an interrupted action, R13:
+    /// its capability manifest changed or did not settle).
     Degraded(String),
 }
 
@@ -318,6 +437,9 @@ pub struct CheckResult {
     pub age_secs: Option<i64>,
     /// No state before: the newest beat is the anchor.
     pub anchored: bool,
+    /// What is worth saying and is no alert (the review of #479: the sensor
+    /// contract changed — an upgrade, a new kernel).
+    pub notices: Vec<String>,
 }
 
 impl CheckResult {
@@ -364,6 +486,7 @@ pub fn check(
         new_beats: 0,
         age_secs: None,
         anchored: false,
+        notices: Vec::new(),
     };
     let silent_if_old = |out: &mut CheckResult, why: &str| {
         if let Some(l) = last {
@@ -723,6 +846,109 @@ pub fn check(
                 .join("; ")
         ));
     }
+    // R13 (lab PR 271): the capability manifest — a settled hash other
+    // than the last one seen is a change of what the agent runs with
+    // (within a run, or across a restart); every new beat is read, so a
+    // change undone before this check is still seen. A run whose manifest
+    // has not settled long after its start, and a manifest gone from the
+    // beats, are DEGRADED too.
+    let mut manifest_hash = last.and_then(|l| l.manifest_hash.clone());
+    let mut manifest_revision = last.and_then(|l| l.manifest_revision);
+    let mut manifest_run = last
+        .and_then(|l| l.manifest_run.clone())
+        .unwrap_or_default();
+    let mut manifest_contract = last.and_then(|l| l.manifest_contract.clone());
+    let mut manifest_versions = last.and_then(|l| l.manifest_versions.clone());
+    let fresh: Vec<&HeartbeatRecord> = match last {
+        Some(l) => beats
+            .iter()
+            .map(|(_, b)| *b)
+            .filter(|b| b.seq > l.seq)
+            .collect(),
+        None => vec![newest],
+    };
+    for b in fresh {
+        match &b.capabilities {
+            Some(m) if m.settled => {
+                // the contract first: its change alone is an upgrade, when
+                // nothing went backwards (the re-check of #479)
+                if let Some(c) = &m.contract {
+                    let versions = ContractSeen {
+                        agent: b.version.clone(),
+                        contract_version: m.contract_version,
+                        kernel: m.kernel.clone(),
+                    };
+                    if let Some(seen) = manifest_contract.as_deref() {
+                        if seen != c && last.is_some() {
+                            let back = manifest_versions
+                                .as_ref()
+                                .map(|v| contract_backwards(v, &versions))
+                                .unwrap_or_default();
+                            if back.is_empty() {
+                                out.notices.push(format!(
+                                    "the sensor contract changed: {} → {} (run {}, agent {}): \
+                                     an upgrade or a new kernel — the capabilities are \
+                                     compared on their own",
+                                    short(seen),
+                                    short(c),
+                                    b.run,
+                                    b.version
+                                ));
+                            } else {
+                                degraded.push(format!(
+                                    "the sensor contract changed backwards: {} → {} (run {}): \
+                                     {} — a downgrade or an older kernel, its terms weaker \
+                                     than the ones seen",
+                                    short(seen),
+                                    short(c),
+                                    b.run,
+                                    back.join(", ")
+                                ));
+                            }
+                        }
+                    }
+                    manifest_contract = Some(c.clone());
+                    manifest_versions = Some(versions);
+                }
+                if let Some(seen) = manifest_hash.as_deref() {
+                    if seen != m.hash && last.is_some() {
+                        degraded.push(format!(
+                            "the capability manifest changed{}: {} → {} (revision {} of run {}; nn-admin \
+                             capabilities --key names the change, signed capability_manifest_change)",
+                            if b.run != manifest_run { " across a restart" } else { "" },
+                            short(seen),
+                            short(&m.hash),
+                            m.revision,
+                            b.run
+                        ));
+                    }
+                }
+                manifest_hash = Some(m.hash.clone());
+                manifest_revision = Some(m.revision);
+                manifest_run = b.run.clone();
+            }
+            Some(_)
+                if b.kind != BeatKind::Stop
+                    && b.uptime_ms > MANIFEST_SETTLE_SECS * 1000
+                    && b.seq == newest.seq =>
+            {
+                degraded.push(format!(
+                    "the capability manifest has not settled {} s after the start (the \
+                     telemetry probe's first round not ended)",
+                    b.uptime_ms / 1000
+                ));
+            }
+            Some(_) => {}
+            None if manifest_hash.is_some() && b.seq == newest.seq => {
+                degraded.push(
+                    "the beat carries no capability manifest any more (an agent older than \
+                     R13, or its boot did not sign one)"
+                        .to_string(),
+                );
+            }
+            None => {}
+        }
+    }
     if !degraded.is_empty() {
         out.alerts.push(Alert::Degraded(degraded.join("; ")));
     }
@@ -745,6 +971,11 @@ pub fn check(
         stopped: newest.kind == BeatKind::Stop,
         seen_at: crate::audit::format_ts(seen_at),
         uptime_ms: newest.uptime_ms,
+        manifest_hash,
+        manifest_revision,
+        manifest_run: Some(manifest_run).filter(|r| !r.is_empty()),
+        manifest_contract,
+        manifest_versions,
     });
     out
 }

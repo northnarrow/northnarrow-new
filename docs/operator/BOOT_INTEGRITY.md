@@ -351,6 +351,12 @@ the existing one already means "start below the expected protection" and is
 already watched); refuse an unreadable list too (the self-test measures the
 same thing directly).
 
+R13 (lab PR 271): under the opt-in the exec sensor and the file-open
+sensor take their tracepoints (`sys_enter_execve`, `sys_enter_openat`,
+each a signed degradation: "bpf is not in the active LSM list"), and the
+capability manifest states every source whose LSM programs do not run as
+`attached_not_invoked` (`SENSOR_CONTRACT.md` §6).
+
 Enable `bpf` as `KERNEL_COMPATIBILITY.md` ("Enabling the bpf LSM")
 describes: add it to the list the kernel runs, never write a fixed list.
 
@@ -443,7 +449,8 @@ them. The host's own hardening (lockdown, Secure Boot, IMA, module
 signatures, kexec — `nn-admin host-check`) is not part of the level: it is
 listed next to it in the manifest. `nn-admin status --key` shows the level
 recomputed with the degradations recorded since the boot (a sensor that
-degrades later lowers it); the manifest keeps the boot's.
+degrades later lowers it): R13, the newest signed revision of the manifest
+(section 6).
 
 ## 6. The capability manifest
 
@@ -453,7 +460,7 @@ hash-chained: `nn-admin audit verify` checks it), whose `extra` is:
 
 | Field | Content |
 |---|---|
-| `manifest_version` | 1 |
+| `manifest_version` | 2 (R13; 1 before it) |
 | `agent_version`, `kernel` | the agent's version, `/proc/sys/kernel/osrelease` |
 | `btf`, `btf_offsets_resolved`, `btf_offsets_drifted`, `btf_offsets_absent` | `/sys/kernel/btf/vmlinux` present; the offsets resolved from it |
 | `active_lsms`, `bpf_lsm` | the active LSM list; `active`, `absent` or `unknown` |
@@ -465,6 +472,19 @@ hash-chained: `nn-admin audit verify` checks it), whose `extra` is:
 | `detect_only` | the response mode |
 | `degradations` | section 4, as of the boot |
 | `trust_level`, `trust_reasons` | section 5, and why it is below L3 |
+| `contract_version`, `sources`, `classes`, `fallbacks`, `missing`, `content`, `telemetry_probe`, `settled`, `revision`, `hash`, `previous_hash`, `change` | R13 (lab PR 271): each source of the event bus and each class against the sensor contract, the fallbacks in use, what is missing or not invoked, the shipped lists not in force from their file, and the revision — `SENSOR_CONTRACT.md` §4 |
+
+R13 (lab PR 271): the manifest is not the boot's alone any more. The
+running agent builds it again every 5 s (and for each status and each
+heartbeat) from the boot's measurements and what changed since — a
+degradation recorded, the telemetry probe's rounds, an adapter that ended,
+a shipped list given way to — and signs each change as a
+`capability_manifest_change` row: the next revision, whole, with what
+changed and the hash of the revision before it. `nn-admin status --key`'s
+trust level and degradations are the newest revision's (one truth: what
+the status shows is signed), and every heartbeat carries its hash
+(`HEARTBEAT.md`). The sensor contract and how to read the manifest:
+`SENSOR_CONTRACT.md`.
 
 Read it from the running agent with `nn-admin capabilities --key <key>`
 (`--json` prints `{"entry_hash": …, "manifest": {…}}`, the row's hash and

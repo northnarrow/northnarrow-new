@@ -61,6 +61,7 @@ pub(crate) struct Attached {
 /// fails refuses the start, signed (`refusals`, into `audit`, the log the
 /// integrity phase opened); what attached before it stays pinned — the deny
 /// hooks that did attach keep protecting the agent's files.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn load(
     cli: &Cli,
     boot: &mut BootSequence,
@@ -69,6 +70,7 @@ pub(crate) async fn load(
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
     refusals: &refusal::Context<'_>,
     audit: &mut checks::AuditOpen,
+    bpf_lsm: &northnarrow_agent::boot::lsm::BpfLsm,
 ) -> Result<Attached> {
     // Process-lineage cache shared by the posture triggers and the FIM
     // rules' package-manager carve-out (review 49): "does this writer
@@ -101,6 +103,10 @@ pub(crate) async fn load(
         open_tracepoint: cli.file_open_sensor == FileOpenSensor::Tracepoint,
         // Tappa 10.9 step 3: which DNS sensor the multiplexer attaches.
         dns_skb: cli.dns_sensor == DnsSensor::Skb,
+        // R13 (lab PR 271): a start under the degraded-mode opt-in on a
+        // kernel without `bpf` in its active LSM list: the exec and file-open
+        // sensors take their tracepoints (an LSM program would never run)
+        lsm_absent: matches!(bpf_lsm, northnarrow_agent::boot::lsm::BpfLsm::Absent { .. }),
         ..Default::default()
     };
     // Lab PR 223 (EXPERIMENTAL): the exec quarantine's mode, before the

@@ -30,11 +30,17 @@ pub(crate) fn arm(
     audit_log: &AuditHandle,
     capability_manifest: &northnarrow_agent::boot::manifest::SignedManifest,
     attach_points: &northnarrow_agent::boot::manifest::AttachPoints,
+    telemetry_probe: &Option<northnarrow_agent::telemetry_probe::TelemetryProbe>,
+    overlay_gate: &std::sync::Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    pumps: Vec<&'static str>,
+    opt_ins: Vec<&'static str>,
 ) -> Result<Armed> {
     // Lab PR 218 (external review G-12): every attach of this boot is done.
     // The capability manifest — kernel, BTF, LSMs, deny hooks, self-test,
     // sensors, host hardening, degradations — and the trust level are
-    // signed before systemd hears the agent is ready.
+    // signed before systemd hears the agent is ready. R13 (lab PR 271):
+    // with each source and class against the sensor contract, from the
+    // boot's measurements the manifest keeps to build its later revisions.
     boot.enter(BootPhase::Run)?;
     {
         use northnarrow_agent::boot::manifest;
@@ -42,14 +48,7 @@ pub(crate) fn arm(
         // the phases hand it on (process-wide statics until then).
         let deny = anti_tamper.deny.clone().unwrap_or_default();
         let resolved = northnarrow_agent::anti_tamper::btf_revalidate::resolved();
-        let trust =
-            northnarrow_agent::boot::trust::current(Some(trust_inputs)).unwrap_or_else(|| {
-                northnarrow_agent::boot::trust::Trust {
-                    level: northnarrow_agent::boot::trust::TrustLevel::L0,
-                    reasons: vec!["the boot measured nothing".to_string()],
-                }
-            });
-        let m = manifest::CapabilityManifest {
+        let base = manifest::CapabilityManifest {
             manifest_version: manifest::MANIFEST_VERSION,
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             kernel: manifest::kernel_release(),
@@ -74,27 +73,59 @@ pub(crate) fn arm(
                 "observe"
             }
             .to_string(),
-            sensors: attach_points.list(),
+            sensors: Vec::new(),
             host_hardening: manifest::host_checks(&host_checks),
             detect_only,
-            degradations: northnarrow_agent::boot::degradation::snapshot(),
-            trust_level: trust.level.as_u8(),
-            trust_reasons: trust.reasons.clone(),
+            degradations: Vec::new(),
+            trust_level: 0,
+            trust_reasons: Vec::new(),
+            contract_version: 0,
+            contract_hash: String::new(),
+            changes: 0,
+            unsigned_changes: 0,
+            sources: Vec::new(),
+            classes: Vec::new(),
+            fallbacks: Vec::new(),
+            missing: Vec::new(),
+            content: Vec::new(),
+            telemetry_probe: String::new(),
+            settled: false,
+            revision: 0,
+            hash: String::new(),
+            previous_hash: None,
+            change: Vec::new(),
         };
-        if trust.level < northnarrow_agent::boot::trust::TrustLevel::L3 {
-            warn!(
-                trust_level = trust.level.name(),
-                meaning = trust.level.meaning(),
-                reasons = %trust.reasons.join("; "),
-                "trust level below L3"
-            );
-        } else {
-            info!(
-                trust_level = trust.level.name(),
+        let inputs = manifest::Inputs {
+            base,
+            bpf_lsm: bpf_lsm_state,
+            self_test,
+            trust: trust_inputs.clone(),
+            attach_points: attach_points.clone(),
+            probe: telemetry_probe.clone(),
+            probe_every: northnarrow_agent::telemetry_probe::interval_from_env(),
+            content: Some(std::sync::Arc::clone(overlay_gate)),
+            pumps: Some(pumps.iter().map(|p| p.to_string()).collect()),
+            opt_ins: opt_ins.iter().map(|k| k.to_string()).collect(),
+        };
+        capability_manifest.arm(audit_log.as_ref(), inputs);
+        match capability_manifest.current() {
+            Some(m) if m.trust_level < northnarrow_agent::boot::trust::TrustLevel::L3.as_u8() => {
+                warn!(
+                    trust_level = %format!("L{}", m.trust_level),
+                    reasons = %m.trust_reasons.join("; "),
+                    fallbacks = %m.fallbacks.join("; "),
+                    missing = %m.missing.join("; "),
+                    "trust level below L3"
+                )
+            }
+            Some(_) => info!(
+                trust_level = "L3",
                 "trust level L3: every mandatory deny hook attached and self-tested, nothing degraded"
-            );
+            ),
+            None => {}
         }
-        capability_manifest.sign(audit_log.as_ref(), m);
+        // R13: a change from now on is signed as the next revision
+        capability_manifest.spawn_watcher();
     }
     boot.done(BootStep::CapabilityManifest)?;
     northnarrow_agent::boot::degradation::mark_boot_over();

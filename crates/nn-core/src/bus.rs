@@ -37,6 +37,8 @@ use std::collections::VecDeque;
 
 use nn_model::{CanaryAccessKind, Event, EventClass, ProcessKey};
 
+use crate::contract::EventKind;
+
 /// A priority of the bus; [`Priority::P0`] is drained first. Plan §3.4:
 /// tamper (with the sensors' health) at P0, a process's life at P1, files at
 /// P2, the network at P3. Every queue is taken by its weight
@@ -130,12 +132,6 @@ impl Priority {
 ///   by the event loop, not carried on the bus); its queue is P0's.
 pub fn class_of(event: &Event) -> EventClass {
     match event {
-        Event::FsProtectDenial { .. }
-        | Event::BpfSyscall { .. }
-        | Event::ModuleLoad { .. }
-        | Event::SensorFlood { .. }
-        | Event::DefenderSignal { .. }
-        | Event::ExploitPostcondition { .. } => EventClass::Tamper,
         // Made by the canary detector inside the consumer from the source
         // event it replaces: the class of that event.
         Event::CanaryTripped { access_kind, .. } => match access_kind {
@@ -143,18 +139,11 @@ pub fn class_of(event: &Event) -> EventClass {
             CanaryAccessKind::ProcessExec => EventClass::Process,
             CanaryAccessKind::NetworkConnect => EventClass::Network,
         },
-        Event::ProcessSpawn { .. } | Event::ExecCheck { .. } | Event::IoUring { .. } => {
-            EventClass::Process
-        }
-        Event::Fim(_)
-        | Event::MassWrite { .. }
-        | Event::FileOpen { .. }
-        | Event::FileBurst { .. } => EventClass::File,
-        Event::TcpConnect { .. }
-        | Event::DnsQuery { .. }
-        | Event::DnsFlood { .. }
-        | Event::NetFlow(_)
-        | Event::NetListener(_) => EventClass::Network,
+        // R13 (lab PR 271): every other kind's class is the sensor
+        // contract's (`EventKind::class`, one exhaustive list); a kind
+        // without one would wait at P0, the queue that never drops it
+        // silently — none has.
+        _ => EventKind::of(event).class().unwrap_or(EventClass::Tamper),
     }
 }
 
@@ -586,7 +575,7 @@ impl LatencyHistogram {
 
 /// A source of events — an adapter's sensor, a drain — by its place in the
 /// boot's sources, which the sensor contract names
-/// ([`crate::contract::ClassContract::source`], R13). R12b (lab PR 269):
+/// ([`crate::contract::SourceContract::source`], R13: by its label). R12b (lab PR 269):
 /// the bus numbers its senders in the order they are named; 0 is a sender
 /// no source named (the tests', a clone of the bus's first sender).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
@@ -1185,7 +1174,8 @@ impl FloodCap {
 /// 5 (the decision's delay from the record's kernel time against its
 /// class's budget, [`DECISION_BUDGET_NS`]); 6 to 8 are R12c's and later
 /// lots'.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LossStage {
     /// 1. The kernel's ring was full (`RING_DROPS`).
     KernelRing,

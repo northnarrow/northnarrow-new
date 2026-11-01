@@ -59,7 +59,10 @@ pub struct Sources {
     pub run: String,
     pub posture: crate::posture::PostureMachine,
     pub ladder: Option<Arc<crate::combat::CombatLadder>>,
-    pub trust: Option<crate::boot::trust::TrustInputs>,
+    /// R13 (lab PR 271): the signed capability manifest — the beat's trust
+    /// level and degradations are its newest revision's, and the beat
+    /// carries its hash.
+    pub manifest: Option<crate::boot::manifest::SignedManifest>,
     pub bus: Option<crate::sensors::bus::BusStats>,
     pub dispatch: Option<crate::admin_socket::ResponseDispatchSource>,
     pub journal: crate::response::journal::ActionJournal,
@@ -251,7 +254,22 @@ impl Heartbeat {
                 ..BeatHead::default()
             });
         }
-        let mut degradations = crate::boot::degradation::snapshot();
+        // R13: the newest revision of the capability manifest (built again
+        // first: a change is signed before the beat names it)
+        let manifest = s.manifest.as_ref().and_then(|m| {
+            // the stop signs what is pending (the review of #479: at most
+            // one change row a minute, none left unsigned)
+            if kind == BeatKind::Stop {
+                m.flush();
+            } else {
+                m.refresh();
+            }
+            m.current()
+        });
+        let mut degradations = match &manifest {
+            Some(m) => m.degradations.clone(),
+            None => crate::boot::degradation::snapshot(),
+        };
         degradations.truncate(MAX_DEGRADATIONS);
         let mut w = self.inner.lock();
         if now_head.is_some() {
@@ -273,8 +291,7 @@ impl Heartbeat {
                 .as_ref()
                 .and_then(|l| l.current_stage())
                 .map(|st| st.as_str().to_string()),
-            trust_level: crate::boot::trust::current(s.trust.as_ref())
-                .map(|t| t.level.name().to_string()),
+            trust_level: manifest.as_ref().map(|m| format!("L{}", m.trust_level)),
             degradations,
             decision_rounds: progress.iterations,
             decision_since_last_ms: progress.since_last_ms,
@@ -289,6 +306,7 @@ impl Heartbeat {
             probe_gaps: s.probe_on.then(crate::telemetry_probe::gaps_total),
             heads,
             stop_reason: stop_reason.map(str::to_string),
+            capabilities: s.manifest.as_ref().and_then(|m| m.beat()),
         };
         let written = match &mut w.log {
             Some(log) => match log.append(record) {
@@ -447,7 +465,7 @@ mod tests {
             run: "1234567890abcdef".into(),
             posture: crate::posture::PostureMachine::new(),
             ladder: None,
-            trust: None,
+            manifest: None,
             bus: None,
             dispatch: None,
             journal: crate::response::journal::ActionJournal::memory(),

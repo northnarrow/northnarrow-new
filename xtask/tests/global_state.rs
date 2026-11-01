@@ -542,6 +542,10 @@ const START_CALLS: &[(&str, &str)] = &[
         "the trust level counts the run's degradations",
     ),
     (
+        "degradation::entries",
+        "the manifest's sources name the run's degradations about them (R13)",
+    ),
+    (
         "fs_type::take_identity_report",
         "the boot's record of the filesystems keyed on, taken once",
     ),

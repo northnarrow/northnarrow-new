@@ -51,7 +51,22 @@ fn beat(seq: u64, s: i64) -> HeartbeatRecord {
             ..BeatHead::default()
         }],
         stop_reason: None,
+        capabilities: None,
     }
+}
+
+/// A beat carrying a capability manifest of hash `h` (R13).
+fn beat_m(seq: u64, s: i64, h: &str, revision: u64, settled: bool) -> HeartbeatRecord {
+    let mut b = beat(seq, s);
+    b.capabilities = Some(BeatManifest {
+        hash: h.repeat(64 / h.len()),
+        revision,
+        settled,
+        contract: Some("c1".repeat(32)),
+        contract_version: Some(1),
+        kernel: Some("6.8.0-147-generic".into()),
+    });
+    b
 }
 
 /// A chain of beats on disk, and its lines.
@@ -406,6 +421,7 @@ fn a_future_beat_and_the_exit_code_order() {
         new_beats: 0,
         age_secs: None,
         anchored: false,
+        notices: Vec::new(),
     };
     assert_eq!(r.exit_code(), 10, "silence is more severe than loss");
 }
@@ -792,4 +808,319 @@ fn an_audit_head_rewritten_at_the_same_row_alerts() {
             .contains("audit chain's head went back"),
         "{r:?}"
     );
+}
+
+/// R13 (lab PR 271): a settled capability manifest whose hash moves is
+/// DEGRADED, within a run or across a restart; the first check anchors it;
+/// an unsettled one is not compared, and is DEGRADED only past its bound.
+#[test]
+fn a_capability_manifest_change_is_degraded() {
+    let mut c = Chain::new();
+    c.push(beat_m(1, 0, "a", 0, false));
+    c.push(beat_m(2, 30, "b", 1, true));
+    let r = check(Ok(&c.lines()), &c.pk, None, at(31), &cfg());
+    assert!(r.alerts.is_empty(), "the first check anchors: {r:?}");
+    let s = r.state.unwrap();
+    assert_eq!(s.manifest_hash.as_deref(), Some("b".repeat(64).as_str()));
+    assert_eq!(s.manifest_revision, Some(1));
+    // the same hash again: quiet
+    c.push(beat_m(3, 60, "b", 1, true));
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(61), &cfg());
+    assert!(r.alerts.is_empty(), "{r:?}");
+    let s = r.state.unwrap();
+    // a runtime change (a probe's gap): DEGRADED, naming both hashes
+    c.push(beat_m(4, 90, "c", 2, true));
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(91), &cfg());
+    assert_eq!(kinds(&r), ["DEGRADED"]);
+    let d = r.alerts[0].detail();
+    assert!(
+        d.contains("the capability manifest changed: bbbbbbbbbbbbbbbb → cccccccccccccccc")
+            && d.contains("revision 2")
+            && !d.contains("across a restart"),
+        "{d}"
+    );
+    assert_eq!(r.exit_code(), 16);
+    let s = r.state.unwrap();
+    // a change and its undoing between two checks: still seen
+    c.push(beat_m(5, 120, "d", 3, true));
+    c.push(beat_m(6, 150, "c", 4, true));
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(151), &cfg());
+    assert_eq!(kinds(&r), ["DEGRADED"]);
+    let d = r.alerts[0].detail();
+    assert!(
+        d.contains("→ dddd") && d.contains("dddddddddddddddd → cccc"),
+        "{d}"
+    );
+    let s = r.state.unwrap();
+    // a clean stop and a new run: its unsettled start beat is not compared;
+    // its settled hash, another one, is a change across the restart
+    let mut stop = beat_m(7, 160, "c", 4, true);
+    stop.kind = BeatKind::Stop;
+    stop.stop_reason = Some("sigterm".into());
+    c.push(stop);
+    let mut start = beat_m(8, 170, "e", 0, false);
+    start.kind = BeatKind::Start;
+    start.run = "bbbbbbbbbbbbbbbb".into();
+    start.uptime_ms = 500;
+    c.push(start);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(171), &cfg());
+    assert!(
+        !r.alerts.iter().any(|a| a.detail().contains("manifest")),
+        "unsettled: not compared {r:?}"
+    );
+    let s = r.state.unwrap();
+    assert_eq!(s.manifest_hash.as_deref(), Some("c".repeat(64).as_str()));
+    let mut b = beat_m(9, 200, "f", 1, true);
+    b.run = "bbbbbbbbbbbbbbbb".into();
+    b.uptime_ms = 30_500;
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(201), &cfg());
+    assert_eq!(kinds(&r), ["DEGRADED"]);
+    assert!(
+        r.alerts[0].detail().contains("changed across a restart"),
+        "{r:?}"
+    );
+    // the same settled hash after a restart: quiet
+    let s = r.state.unwrap();
+    let mut b = beat_m(10, 230, "f", 1, true);
+    b.run = "bbbbbbbbbbbbbbbb".into();
+    b.uptime_ms = 60_500;
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(231), &cfg());
+    assert!(r.alerts.is_empty(), "{r:?}");
+}
+
+/// R13: a manifest that does not settle within its bound, and a beat that
+/// no longer carries one, are DEGRADED.
+#[test]
+fn an_unsettled_or_missing_manifest_is_degraded() {
+    let mut c = Chain::new();
+    c.push(beat_m(1, 0, "a", 0, true));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let mut b = beat_m(2, 30, "a", 0, false);
+    b.uptime_ms = MANIFEST_SETTLE_SECS * 1000;
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(31), &cfg());
+    assert!(r.alerts.is_empty(), "within its bound: {r:?}");
+    let s = r.state.unwrap();
+    let mut b = beat_m(3, 60, "a", 0, false);
+    b.uptime_ms = MANIFEST_SETTLE_SECS * 1000 + 1;
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(61), &cfg());
+    assert_eq!(kinds(&r), ["DEGRADED"]);
+    assert!(r.alerts[0].detail().contains("has not settled"), "{r:?}");
+    let s = r.state.unwrap();
+    c.push(beat(4, 90));
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(91), &cfg());
+    assert_eq!(kinds(&r), ["DEGRADED"]);
+    assert!(
+        r.alerts[0]
+            .detail()
+            .contains("no capability manifest any more"),
+        "{r:?}"
+    );
+    // a beat without one, and no manifest ever seen: nothing to say
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    c.push(beat(2, 30));
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(31), &cfg());
+    assert!(r.alerts.is_empty(), "{r:?}");
+    assert_eq!(r.state.unwrap().manifest_hash, None);
+}
+
+/// The review of #479: the sensor contract's hash changing alone (an
+/// upgrade, a new kernel) is a notice, not an alert; with the capabilities
+/// it is both.
+#[test]
+fn a_contract_change_alone_is_a_notice() {
+    let mut c = Chain::new();
+    c.push(beat_m(1, 0, "a", 1, true));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    assert_eq!(
+        s.manifest_contract.as_deref(),
+        Some("c1".repeat(32).as_str())
+    );
+    let mut b = beat_m(2, 30, "a", 1, true);
+    b.capabilities.as_mut().unwrap().contract = Some("c2".repeat(32));
+    b.version = "0.0.2".into();
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(31), &cfg());
+    assert!(r.alerts.is_empty(), "an upgrade alone: {r:?}");
+    assert_eq!(r.exit_code(), 0);
+    assert_eq!(r.notices.len(), 1, "{r:?}");
+    assert!(
+        r.notices[0]
+            .starts_with("the sensor contract changed: c1c1c1c1c1c1c1c1 → c2c2c2c2c2c2c2c2")
+            && r.notices[0].contains("agent 0.0.2"),
+        "{r:?}"
+    );
+    let s = r.state.unwrap();
+    // the same contract again: nothing to say
+    // beat 3 carries c1 again (the helper's), beat 4 c2
+    c.push(beat_m(3, 60, "a", 1, true));
+    let mut b = beat_m(4, 90, "b", 2, true);
+    b.capabilities.as_mut().unwrap().contract = Some("c2".repeat(32));
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(91), &cfg());
+    // beat 3 (c1, agent 0.0.1 after 0.0.2) went backwards — DEGRADED (the
+    // re-check of #479); beat 4 (c2, the same versions): a notice; the
+    // capabilities changed — DEGRADED
+    assert_eq!(kinds(&r), ["DEGRADED"]);
+    assert_eq!(r.notices.len(), 1, "{r:?}");
+    let Alert::Degraded(d) = &r.alerts[0] else {
+        unreachable!()
+    };
+    assert!(
+        d.contains("the sensor contract changed backwards: c2c2c2c2c2c2c2c2 → c1c1c1c1c1c1c1c1")
+            && d.contains("agent 0.0.2 → 0.0.1 (older)")
+            && d.contains("the capability manifest changed"),
+        "{d}"
+    );
+    // the first check anchors the contract too: no notice
+    let r = check(Ok(&c.lines()), &c.pk, None, at(91), &cfg());
+    assert!(r.notices.is_empty() && r.alerts.is_empty(), "{r:?}");
+}
+
+/// The re-check of #479: a contract change is a notice only when the
+/// agent's version, the contract's version and the kernel's release each
+/// advanced or stayed; one going backwards (a downgrade, an older kernel),
+/// or a release not known to be newer, is DEGRADED.
+#[test]
+fn a_contract_going_backwards_is_degraded() {
+    let with = |seq: u64, c: &str, agent: &str, version: u32, kernel: &str| {
+        let mut b = beat_m(seq, 30 * seq as i64, "a", 1, true);
+        b.version = agent.into();
+        let m = b.capabilities.as_mut().unwrap();
+        m.contract = Some(c.repeat(32));
+        m.contract_version = Some(version);
+        m.kernel = Some(kernel.into());
+        b
+    };
+    let mut c = Chain::new();
+    c.push(with(1, "c1", "0.0.2", 1, "6.8.0-147-generic"));
+    let mut s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    assert_eq!(
+        s.manifest_versions,
+        Some(ContractSeen {
+            agent: "0.0.2".into(),
+            contract_version: Some(1),
+            kernel: Some("6.8.0-147-generic".into()),
+        })
+    );
+    // (beat, its contract, agent, contract version, kernel, what is said)
+    let steps: [(&str, &str, u32, &str, Option<&str>); 6] = [
+        (
+            "c2",
+            "0.0.1",
+            1,
+            "6.8.0-147-generic",
+            Some("agent 0.0.2 → 0.0.1 (older)"),
+        ),
+        ("c3", "0.0.3", 1, "6.8.0-147-generic", None),
+        (
+            "c4",
+            "0.0.3",
+            1,
+            "6.8.0-140-generic",
+            Some("kernel 6.8.0-147-generic → 6.8.0-140-generic (older)"),
+        ),
+        ("c5", "0.0.3", 1, "6.8.0-150-generic", None),
+        (
+            "c6",
+            "0.0.3",
+            0,
+            "6.8.0-150-generic",
+            Some("contract version 1 → 0 (older)"),
+        ),
+        (
+            "c7",
+            "0.0.3",
+            1,
+            "6.8.0-150-lowlatency",
+            Some("kernel 6.8.0-150-generic → 6.8.0-150-lowlatency (not known to be newer)"),
+        ),
+    ];
+    for (i, (contract, agent, version, kernel, said)) in steps.into_iter().enumerate() {
+        let seq = i as u64 + 2;
+        c.push(with(seq, contract, agent, version, kernel));
+        let r = check(
+            Ok(&c.lines()),
+            &c.pk,
+            Some(&s),
+            at(30 * seq as i64 + 1),
+            &cfg(),
+        );
+        match said {
+            Some(back) => {
+                assert_eq!(kinds(&r), ["DEGRADED"], "{contract}: {r:?}");
+                assert!(r.notices.is_empty(), "{contract}: {r:?}");
+                let Alert::Degraded(d) = &r.alerts[0] else {
+                    unreachable!()
+                };
+                assert!(
+                    d.starts_with("the sensor contract changed backwards") && d.contains(back),
+                    "{contract}: {d}"
+                );
+            }
+            None => {
+                assert!(r.alerts.is_empty(), "{contract}, forward: {r:?}");
+                assert_eq!(r.notices.len(), 1, "{contract}: {r:?}");
+                assert!(r.notices[0].starts_with("the sensor contract changed:"));
+            }
+        }
+        s = r.state.unwrap();
+    }
+}
+
+/// The re-check of #479: releases compared part by part, numbers as
+/// numbers; a part that differs and is not a number on both sides is not
+/// an order.
+#[test]
+fn releases_are_ordered_part_by_part() {
+    use std::cmp::Ordering::*;
+    let cases = [
+        ("0.0.2", "0.0.1", Some(Greater)),
+        ("0.0.1", "0.0.2", Some(Less)),
+        ("0.10.0", "0.9.9", Some(Greater)),
+        ("0.0.1", "0.0.1", Some(Equal)),
+        ("6.8.0-150-generic", "6.8.0-147-generic", Some(Greater)),
+        ("5.15.0-202-generic", "6.8.0-147-generic", Some(Less)),
+        ("6.8.0-147-generic", "6.8.0-147-lowlatency", None),
+        ("6.8.0.1", "6.8.0", Some(Greater)),
+        ("6.8.0", "6.8.0.1", Some(Less)),
+        ("6.8.0-rc1", "6.8.0", None),
+        ("1.0.0-rc2", "1.0.0-rc1", None),
+    ];
+    for (a, b, want) in cases {
+        assert_eq!(release_order(a, b), want, "{a} vs {b}");
+    }
+    let seen = ContractSeen {
+        agent: "0.0.2".into(),
+        contract_version: Some(1),
+        kernel: Some("6.8.0-147-generic".into()),
+    };
+    assert!(contract_backwards(&seen, &seen).is_empty());
+    let older_agent_without_fields = ContractSeen {
+        agent: "0.0.2".into(),
+        contract_version: None,
+        kernel: None,
+    };
+    assert_eq!(
+        contract_backwards(&seen, &older_agent_without_fields),
+        [
+            "kernel 6.8.0-147-generic → (not said) (not known to be newer)",
+            "contract version 1 → (not said)"
+        ]
+    );
+    // nothing known before: nothing to compare
+    assert!(contract_backwards(&older_agent_without_fields, &seen).is_empty());
 }

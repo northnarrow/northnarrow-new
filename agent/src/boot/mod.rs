@@ -230,6 +230,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &overlay_gate,
         &refusals,
         &mut audit,
+        &bpf_lsm_state,
     )
     .await?;
     let attach::SelfTested {
@@ -444,7 +445,6 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &exempt,
         northnarrow_agent::admin_socket::AdminHandles {
             rule_policy,
-            trust_inputs: Some(trust_inputs.clone()),
             capability_manifest: capability_manifest.clone(),
             ransom_tracker: Some(Arc::clone(&ransom_tracker)),
             defense_detector: Some(Arc::clone(&defense_detector)),
@@ -458,6 +458,28 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             ),
         },
     );
+    // R13 (the review of #479): the opt-ins configured whose verdict an LSM
+    // program gives — the manifest says them inert without the BPF LSM
+    let opt_ins: Vec<&'static str> = {
+        use northnarrow_agent::sensors::contract as c;
+        [
+            (
+                execq_mode == northnarrow_agent::execq::Mode::Enforce,
+                c::OPT_IN_EXEC_QUARANTINE,
+            ),
+            (
+                execpol_mode == northnarrow_agent::execpol::Mode::Enforce,
+                c::OPT_IN_EXEC_POLICY,
+            ),
+            (
+                cli.net_connect_deny && !detect_only,
+                c::OPT_IN_NET_CONNECT_DENY,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(on, k)| on.then_some(k))
+        .collect()
+    };
     let tasks::Tasks {
         execq_handle,
         execpol_handle,
@@ -485,6 +507,10 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &audit_log,
         &capability_manifest,
         sensor.attach_points(),
+        &telemetry_probe,
+        &overlay_gate,
+        sensor.pump_labels(),
+        opt_ins,
     )?;
     // R12c-2 (lab PR 270): the signed heartbeat, once the agent is armed —
     // its `start` beat first, then one every interval; the stop writes its
@@ -500,7 +526,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             run: journal.run().to_string(),
             posture: posture.clone(),
             ladder: Some(Arc::clone(&combat.ladder)),
-            trust: Some(trust_inputs.clone()),
+            manifest: Some(capability_manifest.clone()),
             bus: Some(sensor.bus_stats()),
             dispatch: Some(
                 dispatcher
@@ -528,6 +554,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &dispatcher,
         &ransom_tracker,
         &mut signals,
+        &capability_manifest,
     )
     .await;
     crate::shutdown::stop(
@@ -829,7 +856,9 @@ mod tests {
             at("RuleEngine::with_default_rules_and_net(") > at("boot.enter(BootPhase::Subsystems)"),
             "the rule engine in the subsystems phase, after the audit log"
         );
-        let manifest = at("capability_manifest.sign(");
+        // R13 (lab PR 271): the manifest built from the boot's inputs and
+        // signed (`SignedManifest::arm`, revision 0)
+        let manifest = at("capability_manifest.arm(");
         assert!(manifest > at("boot.enter(BootPhase::Run)"));
         assert!(manifest < at("sd_notify::ready()"));
         assert!(at("boot.done(BootStep::CapabilityManifest)") > manifest);
@@ -1101,7 +1130,7 @@ mod tests {
             1
         );
         assert!(release > main.find("sd_notify::ready()").expect("READY"));
-        assert!(release > main.find("capability_manifest.sign(").expect("manifest"));
+        assert!(release > main.find("capability_manifest.arm(").expect("manifest"));
     }
 
     /// Lab PR 231: only free memory goes back: what is still allocated is

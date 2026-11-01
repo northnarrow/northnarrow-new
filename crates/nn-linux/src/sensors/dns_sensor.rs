@@ -17,7 +17,8 @@ use nn_model::Event;
 use nn_parse::dns_qname::{decode_dns_qname, qname_wire_end};
 use tracing::{info, warn};
 
-use crate::boot::manifest::AttachPoints;
+use crate::boot::manifest::{AttachPoints, Took};
+use crate::sensors::contract::attach as A;
 use crate::sensors::exe_identity::verifier_tail;
 
 /// The socket-buffer programs in the eBPF object and their kernel functions.
@@ -89,7 +90,7 @@ pub fn attach(
     // phase's (external audit EBPF-006, `!skb`); the manifest names it.
     let sendmsg = |ebpf: &mut Ebpf| -> Result<DnsMode> {
         attach_kprobe(ebpf, SENDMSG_PROGRAM, SENDMSG_PROGRAM)?;
-        points.note("dns", "kprobe:udp_sendmsg (user memory, IPv4 only)");
+        points.note("dns", A::DNS_SENDMSG, Took::Fallback);
         Ok(DnsMode::default())
     };
     if !want_skb {
@@ -125,7 +126,7 @@ pub fn attach(
                 "DNS sensor armed on {SKB4_SYMBOL} + {SKB6_SYMBOL}: the kernel's copy of the \
                  query, IPv4 and IPv6 (Tappa 10.9 step 3)"
             );
-            points.note("dns", "kprobe:udp_send_skb+udp_v6_send_skb");
+            points.note("dns", A::DNS_SKB, Took::Whole);
         }
         Err(e) => {
             warn!(
@@ -133,7 +134,13 @@ pub fn attach(
                 "DNS sensor armed on {SKB4_SYMBOL} only: {SKB6_SYMBOL} could not be attached — DNS \
                  queries to IPv6 resolvers are NOT observed"
             );
-            points.note("dns", "kprobe:udp_send_skb (IPv4 only)");
+            points.note(
+                "dns",
+                A::DNS_SKB_V4,
+                Took::Partial {
+                    missing: vec![format!("{SKB6_SYMBOL}: {IPV6_NOT_OBSERVED}")],
+                },
+            );
             // Lab PR 218 (external audit App.D C-13): signed, not only a WARN.
             crate::boot::degradation::report("dns_sensor", IPV6_NOT_OBSERVED);
         }
@@ -200,7 +207,7 @@ pub fn attach_nss(ebpf: &mut Ebpf, points: &AttachPoints) {
     let libs = nss_libraries();
     if libs.is_empty() {
         info!("DNS sensor: no {NSS_LIBRARY} on this host — no NSS lookups to attribute");
-        points.note("dns_nss", "none (no libnss_resolve)");
+        points.note("dns_nss", "none (no libnss_resolve)", Took::Absent);
         return;
     }
     let prog: &mut aya::programs::UProbe = match ebpf
@@ -213,7 +220,7 @@ pub fn attach_nss(ebpf: &mut Ebpf, points: &AttachPoints) {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "DNS sensor: NSS lookups are not attributed");
-            points.note("dns_nss", "not attached");
+            points.note("dns_nss", "not attached", Took::Absent);
             return;
         }
     };
@@ -222,7 +229,11 @@ pub fn attach_nss(ebpf: &mut Ebpf, points: &AttachPoints) {
             error = %verifier_tail(&anyhow::Error::from(e)),
             "DNS sensor: the NSS uprobe was refused — NSS lookups are not attributed"
         );
-        points.note("dns_nss", "not attached");
+        points.note(
+            "dns_nss",
+            "not attached: the uprobe was refused",
+            Took::Absent,
+        );
         return;
     }
     let mut attached = Vec::new();
@@ -240,7 +251,7 @@ pub fn attach_nss(ebpf: &mut Ebpf, points: &AttachPoints) {
         }
     }
     if attached.is_empty() {
-        points.note("dns_nss", "not attached");
+        points.note("dns_nss", "not attached", Took::Absent);
         return;
     }
     info!(
@@ -248,7 +259,11 @@ pub fn attach_nss(ebpf: &mut Ebpf, points: &AttachPoints) {
         "DNS sensor: uprobe on systemd-resolved's NSS module — names resolved through it \
          attribute the connects that follow (lab PR 229)"
     );
-    points.note("dns_nss", &format!("uprobe:{}", attached.join("+")));
+    points.note(
+        "dns_nss",
+        &format!("uprobe:{}", attached.join("+")),
+        Took::Whole,
+    );
 }
 
 /// Review 78: users of the local resolvers, whose forwarded queries the

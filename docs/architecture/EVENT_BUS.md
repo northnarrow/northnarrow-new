@@ -41,7 +41,11 @@ record".
 
 Every `Event` variant has its class, by an exhaustive match
 (`nn_core::bus::class_of`: a new variant does not compile until it is
-placed). Each class has its queue (`Priority::of`):
+placed; R13, lab PR 271: the class is the sensor contract's,
+`nn_core::contract::EventKind::class`, and `class_of` reads it). Each class
+has its queue (`Priority::of`), and since R13 its contract — its sources'
+attach points, verdicts, failure semantics, budgets, truncations and loss
+counters (`docs/operator/SENSOR_CONTRACT.md`):
 
 | Queue | Class | Events | Capacity | Full queue |
 |---|---|---|---|---|
@@ -926,6 +930,45 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   and a `stop` beat), and its minimal external verifier (`nn-admin
   heartbeat export` on the host through an SSH forced command, `nn-admin
   heartbeat watch` on another host; `docs/operator/HEARTBEAT.md`).
+- **R13, done (lab PR 271)** — the sensor contract: per source of the
+  bus (`nn_linux::sensors::contract::SOURCES`, thirteen) its attach point
+  and fallbacks, synchronous verdict (and the opt-in ones), failure
+  semantics, kernel budgets, truncations with their bytes and the rings
+  that count its losses; per class (`nn_core::contract::class_contracts`)
+  its queue, full-queue policy, decision budget and the stages that count
+  its losses; tests that fail for a kind of event, a class, a pump, a drain
+  or an attach note without its entry. The capability manifest built from
+  the real attaches and the telemetry probe's rounds, each source's state
+  (`ok`, `standby`, `disabled_by_admin`, `attached_not_invoked`,
+  `unavailable`, `adapter_terminated`) and why, signed at the boot and at
+  every change (`capability_manifest_change`); the status's trust level
+  and degradations are its newest revision's; every beat carries its hash
+  and the verifier says `DEGRADED` when it changes. Without `bpf` in the
+  active LSM list (the degraded-mode opt-in) the exec and file-open sensors
+  take their tracepoints. After the review of #479: `ok` only for an attach
+  its code noted whole, exactly the contract's (`partial`, `unknown`
+  otherwise); a fallback that covers less is `partial` with the events it
+  loses; an LSM opt-in configured without `bpf` is said inert; each source
+  says what its `ok` rests on (`evidence`); the probe's word goes `stale`
+  when its rounds stop; the capabilities hash leaves out the contract's
+  terms (`contract_hash`, a NOTICE off the host when it changes alone and
+  no version went backwards, DEGRADED when one did); a worse state's change
+  row at once, a better state's at most once a minute, every change
+  counted.
+- **Open after R13** — the health class has no event yet (the manifest,
+  the probe and the beats carry the sensors' health); the probe exercises
+  three sources (process spawn, file open, DNS): the other ten are judged
+  from their attach and their pump's liveness only (`evidence:
+  attach_only`), and the deny self-test exercises one deny hook
+  (`task_kill`) of sixteen — the follow-ups: a loopback `connect()`, a
+  harmless `bpf()`, an `io_uring_setup`, a FIM write and a second deny hook
+  in the probe; a periodic check that the BPF links are still attached;
+  `/sys/kernel/debug/kprobes/enabled` protected; a probe child harder to
+  recognise (the probe holds against a naive or accidental blinding, not an
+  adaptive root, `docs/operator/SENSOR_CONTRACT.md` §5a); the opt-in connect
+  deny's fail-open is not counted (no `DENY_FAIL_OPEN` slot: an eBPF
+  change); a FIM or network drain that does not start is a WARN, not a
+  registry degradation (the manifest says `unavailable`).
 - **Open after R12c-2** — the self-test as a synthetic event through the
   sensors, the bus, the rules and a dry response into a signed row (the
   telemetry probe's gaps are in the beat; the dry response is not); the

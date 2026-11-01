@@ -479,6 +479,7 @@ exit: 0
 | trust level       : L2 (enforcing and verified, degraded) — BTF offsets drifted: 5
 | degradations      : 1 this run (each signed in the audit log)
 |   - bpf_lsm: anti-tamper: no enforcement
+| capabilities      : the boot's manifest, older than the sensor contract — nn-admin capabilities --key
 | exploit guard     : strict detect (experimental) — 12 calls judged, 30 skipped (fully privileged), 1 anomalies, 0 killed; 2 task(s) untracked (task map full: their calls are not judged)
 | exec quarantine   : observe — held 1, resumed 1, killed 0 (0 quarantined), default policy 0, known identity 3, known content 2, not held 9, scanner deaths 0, scripts refused 0
 | ransomware        : 0 decisive (NN-L-IMP-001), 4 shapes counted, 1 trusted bursts not counted, 8 entropy samplings

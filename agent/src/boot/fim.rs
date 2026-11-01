@@ -28,7 +28,8 @@ use super::response::attest_legacy_isolation_removed;
 fn open_sensor_on_tracepoint(sensor: &SensorMultiplexer, why: &str) {
     sensor.attach_points().note(
         "file_open",
-        "tracepoint:syscalls/sys_enter_openat (user memory)",
+        northnarrow_agent::sensors::contract::OPEN_TRACEPOINT_NOTE,
+        northnarrow_agent::boot::manifest::Took::Fallback,
     );
     northnarrow_agent::boot::degradation::report(
         "file_open_sensor",
@@ -70,6 +71,15 @@ fn start_open_sensor(
     if mode == FileOpenSensor::Tracepoint {
         info!("file-open sensor: tracepoint mode (--file-open-sensor tracepoint) — every open reaches userland");
         open_sensor_on_tracepoint(sensor, "chosen with --file-open-sensor tracepoint");
+        return;
+    }
+    // R13 (lab PR 271): `bpf` not in the active LSM list (a start under the
+    // degraded-mode opt-in) — the LSM sensor would attach and never run, so
+    // `sys_enter_openat` keeps the file opens
+    if sensor.lsm_absent() {
+        warn!("file-open sensor: bpf is not in the active LSM list — keeping sys_enter_openat");
+        open_tracepoint_fallback(sensor);
+        open_sensor_on_tracepoint(sensor, northnarrow_agent::sensors::contract::BPF_LSM_ABSENT);
         return;
     }
     if !fim_attached.contains(&northnarrow_agent::fim::attach::OPEN_SENSOR_PROGRAM) {
@@ -124,9 +134,11 @@ fn start_open_sensor(
         open_sensor_on_tracepoint(sensor, &format!("arming failed ({e})"));
         return;
     }
-    sensor
-        .attach_points()
-        .note("file_open", "lsm:file_open (FIM observer)");
+    sensor.attach_points().note(
+        "file_open",
+        northnarrow_agent::sensors::contract::OPEN_LSM_NOTE,
+        northnarrow_agent::boot::manifest::Took::Whole,
+    );
     // Lab PR 249: the posture's own switch (it was process-wide).
     posture.set_kernel_mass_write(true);
     // Armed: the old tracepoint (every openat to userland) goes. Its link
@@ -578,14 +590,32 @@ pub(crate) fn start(
                 // lab PR 264: in the map's own slot, no longer a process-wide
                 // setter the late binding called).
                 inode_map.bind_audit_log(audit_log.clone());
-                sensor.attach_points().note(
-                    "fim_observers",
-                    &format!(
-                        "lsm: {} of {} observe programs",
-                        fim_attached.len(),
-                        northnarrow_agent::fim::attach::FIM_OBSERVE_PROGRAMS.len()
-                    ),
-                );
+                // R13 (the review of #479, X1): whole only with every
+                // observe program; otherwise the ones that did not attach
+                {
+                    use northnarrow_agent::boot::manifest::Took;
+                    let all = northnarrow_agent::fim::attach::FIM_OBSERVE_PROGRAMS;
+                    // the open sensor's program is the file_open observer
+                    let missing =
+                        northnarrow_agent::fim::attach::observe_programs_missing(&fim_attached);
+                    let (attach, took) = if fim_attached.is_empty() {
+                        (
+                            format!("not attached: none of the {} observe programs", all.len()),
+                            Took::Absent,
+                        )
+                    } else if missing.is_empty() {
+                        (
+                            northnarrow_agent::sensors::contract::attach::FIM_OBSERVERS.to_string(),
+                            Took::Whole,
+                        )
+                    } else {
+                        (
+                            northnarrow_agent::sensors::contract::attach::FIM_OBSERVERS.to_string(),
+                            Took::Partial { missing },
+                        )
+                    };
+                    sensor.attach_points().note("fim_observers", &attach, took);
+                }
                 // External audit FIMP-011: a FIM that attached no observer, or
                 // watches nothing, sees no file change at all. Said in the
                 // signed audit chain, not only in an INFO among the boot lines.

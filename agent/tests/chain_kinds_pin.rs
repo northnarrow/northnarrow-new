@@ -111,9 +111,51 @@ fn the_heartbeat_chain_s_line_is_pinned() {
             },
         ],
         stop_reason: None,
+        capabilities: None,
     };
     assert_eq!(first_line(row), HEARTBEAT_LINE);
 }
+
+/// R13 (lab PR 271): a beat carrying the capability manifest's newest
+/// revision — the field appended last, absent from a beat without it (the
+/// line above, unchanged).
+#[test]
+fn the_heartbeat_chain_s_line_with_capabilities_is_pinned() {
+    use nn_evidence::heartbeat::{BeatActions, BeatKind, BeatManifest, HeartbeatRecord};
+    let row = HeartbeatRecord {
+        kind: BeatKind::Beat,
+        seq: 2,
+        ts: "2026-11-01T10:00:30.000000Z".into(),
+        agent_id: "11".repeat(16),
+        run: "00112233aabbccdd".into(),
+        boot_id: "b007".into(),
+        uptime_ms: 31_500,
+        interval_secs: 30,
+        version: "0.0.1".into(),
+        posture: "observing".into(),
+        combat_stage: None,
+        trust_level: Some("L3".into()),
+        degradations: Vec::new(),
+        decision_rounds: 63,
+        decision_since_last_ms: 120,
+        loss: vec![Some(0); 7],
+        actions: BeatActions::default(),
+        probe_gaps: Some(0),
+        heads: Vec::new(),
+        stop_reason: None,
+        capabilities: Some(BeatManifest {
+            hash: "ef".repeat(32),
+            revision: 1,
+            settled: true,
+            contract: Some("c0".repeat(32)),
+            contract_version: Some(1),
+            kernel: Some("6.8.0-147-generic".into()),
+        }),
+    };
+    assert_eq!(first_line(row), HEARTBEAT_CAPABILITIES_LINE);
+}
+
+const HEARTBEAT_CAPABILITIES_LINE: &str = r#"{"kind":"beat","seq":2,"ts":"2026-11-01T10:00:30.000000Z","agent_id":"11111111111111111111111111111111","run":"00112233aabbccdd","boot_id":"b007","uptime_ms":31500,"interval_secs":30,"version":"0.0.1","posture":"observing","trust_level":"L3","degradations":[],"decision_rounds":63,"decision_since_last_ms":120,"loss":[0,0,0,0,0,0,0],"actions":{"intents":0,"outcomes":0,"unwritten":0,"interrupted_at_boot":0,"in_flight":0},"probe_gaps":0,"heads":[],"capabilities":{"hash":"efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef","revision":1,"settled":true,"contract":"c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0","contract_version":1,"kernel":"6.8.0-147-generic"},"fmt_ver":3,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"d16d3e21aa720e5450b444abe2969766de51352db6d9bba41c9a16624bb0f5c7","agent_sig":"JGt3nFWNkwQUOXpcRX5Tg5ZICDB0Lpq+GTvve2oqJuzNc/LdMIC9s1SXm4Uyv7bwMc1pdgxDv6Is4cJl17xjCg=="}"#;
 
 const HEARTBEAT_LINE: &str = r#"{"kind":"start","seq":1,"ts":"2026-11-01T10:00:00.000000Z","agent_id":"11111111111111111111111111111111","run":"00112233aabbccdd","boot_id":"b007","uptime_ms":1500,"interval_secs":30,"version":"0.0.1","posture":"observing","trust_level":"L3","degradations":[],"decision_rounds":3,"decision_since_last_ms":120,"loss":[0,0,0,0,1,null,null],"actions":{"intents":0,"outcomes":0,"unwritten":0,"interrupted_at_boot":0,"in_flight":0},"probe_gaps":0,"heads":[{"chain":"audit","seq":41,"hash":"abababababababababababababababababababababababababababababababab"},{"chain":"actions","file":3,"bytes":8192,"hash":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}],"fmt_ver":3,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"0f492909639aaf122a90140c45bb3cc259c41428211d8671524b3aff0ba0d909","agent_sig":"wMXMw/j7E4ct3AQvjMCm0QTwbm0uqy5uG64SF4o5OHlv78dGkJEJ84++0/GKCOl+oFGrXz0cFC/t+cvgyLieDg=="}"#;
 

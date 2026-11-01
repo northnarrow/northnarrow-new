@@ -34,8 +34,9 @@ pub mod bus;
 /// final symlink and blocks on no FIFO.
 pub mod content_host;
 
-/// The sensor contract's types: a skeleton for the signed contract (R08c,
-/// lab PR 252; plan §3.6, R13).
+/// The sensor contract: what each class of events and each source of the
+/// bus is promised, and the capability manifest the boot signs against it
+/// (R08c's skeleton, lab PR 252; R13, lab PR 271; plan §3.6).
 pub mod contract;
 
 // The bounded buffer of recent events the posture's triggers count over

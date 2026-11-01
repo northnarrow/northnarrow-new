@@ -204,6 +204,10 @@ pub fn check_once(w: &Watch) -> Result<CheckResult, String> {
             }
         );
     }
+    // R13 (the review of #479): an upgrade's contract change, said, no alert
+    for n in &r.notices {
+        println!("{now} NOTICE {n}");
+    }
     for a in &r.alerts {
         println!("{now} ALERT {} {}", a.kind(), a.detail());
     }
@@ -280,6 +284,15 @@ mod tests {
             stopped: false,
             seen_at: "2026-11-01T10:00:01.000000Z".into(),
             uptime_ms: 1,
+            manifest_hash: Some("cd".repeat(32)),
+            manifest_revision: Some(2),
+            manifest_run: Some("r".into()),
+            manifest_contract: Some("ef".repeat(32)),
+            manifest_versions: Some(nn_evidence::heartbeat::ContractSeen {
+                agent: "0.0.1".into(),
+                contract_version: Some(1),
+                kernel: Some("6.8.0-147-generic".into()),
+            }),
         };
         write_state(&p, &s).unwrap();
         assert_eq!(read_state(&p), Ok(Some(s)));

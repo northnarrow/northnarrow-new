@@ -35,6 +35,7 @@ carries:
 | `loss` | the events lost at each stage of their path since the run started — stages 1 to 7: the kernel's ring, the kernel's budget, the decoder, the bus's queues, the decision's delay, the response queue, the evidence writers ([the event bus, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/architecture/EVENT_BUS.md)) |
 | `actions` | the actions chain's intents and outcomes, rows it could not take, intents of an earlier run found interrupted, actions in flight (`EVIDENCE_CHAINS.md`, the actions chain) |
 | `probe_gaps` | the telemetry probe's gaps since the run started (`null`: the probe is off) |
+| `capabilities` | R13 (lab PR 271): the capability manifest's newest view — its capabilities `hash`, the last `revision` signed (0: the boot's), `settled` (the telemetry probe's first round has ended) and `contract` (the hash of the sensor contract's terms, the agent's version and the kernel's release), with `contract_version` and `kernel` (the versions the verifier checks do not go backwards); absent from an agent older than R13 (`SENSOR_CONTRACT.md` §4, §5) |
 | `heads` | the audit chain's head (its row number and hash) and the actions chain's (its position — `file`, the number its active file will have as an archive, and `bytes`, its length — and hash, and `kept`: whether the chain still holds the head the agent's previous beat named, read back at each beat and at the start from the last run's last beat; with `actions.in_flight` and `actions.unwritten`): a chain rolled back on the host, or a tail cut from the actions chain (an intent removed) — even with rows appended past the cut — shows as a head that went back or is no longer kept |
 
 Beside the beats, the agent signs a **`telemetry_loss`** row in the audit
@@ -47,7 +48,11 @@ change, once an hour (a zero signed too); and at the stop.
 `nn-admin heartbeat watch` fetches the newest lines of the chain, verifies
 each one with the agent's public key and compares with what it verified
 last (its state file). One line per check: `OK seq=… new=… age=…s`, or one
-`ALERT <KIND> <detail>` per alert. Run once (a timer), its exit code is the
+`ALERT <KIND> <detail>` per alert; R13: a `NOTICE <detail>` line, no alert
+and no exit code, when the sensor contract's hash changed alone (an upgrade
+of the agent, a new kernel) and the agent's version, the contract's version
+and the kernel's release each advanced or stayed — one going backwards is
+`DEGRADED`. Run once (a timer), its exit code is the
 most severe alert's:
 
 | Exit | Alert | When | What to do |
@@ -58,7 +63,7 @@ most severe alert's:
 | 10 | `SILENT` | no new beat for two intervals plus 15 s (75 s by default; `--max-silence-secs`) on the **verifier's** clock — since it first saw the newest beat — or the source could not be read past that | the agent stopped, froze or was killed, the host is down, or the network is cut — go and look |
 | 15 | `STOPPED` | the agent's signed `stop` beat (an admin shutdown, a host shutdown), and every check while it stays stopped | expected only during maintenance |
 | 14 | `LOSS` | a stage's loss grew since the last beat seen | `nn-admin status --key` on the host: which stage, which queue |
-| 16 | `DEGRADED` | the agent's clock gone back, or ahead of the verifier's past `--max-skew-secs`; a new run whose start beat follows no stop beat (the agent killed, crashed, or frozen and restarted by the watchdog — however soon it came back), a beat late after the one before it in one run (more than its interval + 15 s: the agent stood still — frozen, starved — for less than the silence bound), the decision thread stood still for two intervals, a telemetry gap, an action row not in its chain, an action interrupted between intent and outcome, a new degradation | `nn-admin status --key`, the audit log's rows |
+| 16 | `DEGRADED` | the agent's clock gone back, or ahead of the verifier's past `--max-skew-secs`; a new run whose start beat follows no stop beat (the agent killed, crashed, or frozen and restarted by the watchdog — however soon it came back), a beat late after the one before it in one run (more than its interval + 15 s: the agent stood still — frozen, starved — for less than the silence bound), the decision thread stood still for two intervals, a telemetry gap, an action row not in its chain, an action interrupted between intent and outcome, a new degradation; R13: the capability manifest changed — a settled `capabilities.hash` other than the last one seen, within a run or across a restart (`bpf` gone from `lsm=`, a sensor partial or on a fallback, a probe's gap or its word stale) — or not settled 120 s after the start, or gone from the beats; the sensor contract changed backwards (`capabilities.contract` with an older agent `version`, `contract_version` or `kernel` than the last seen, or one not known to be newer); an upgrade alone is a `NOTICE`, not this | `nn-admin status --key`, `nn-admin capabilities --key` (what changed), the audit log's rows |
 
 The host's clock decides nothing grave (review of #478): beats are
 ordered by their numbers and links; a beat stamped before the one seen
@@ -197,3 +202,13 @@ TPM quote of the measured boot and the agent (the Keylime model; report
 beat (R15's export). The self-test that pushes a synthetic event through
 the sensors, the bus, the rules and a dry response into a signed row is not
 in the beat yet (the telemetry probe's gaps are); it is open.
+
+**The capability manifest's hash is the agent's own word** (R13): it
+changes when the agent sees a change — a hook not attached, a fallback, the
+telemetry probe's event not arriving or its rounds stopping. The probe
+finds a sensor blinded naively or by accident; a root on the host that
+recognises the probe's child (the agent's own binary, `--telemetry-probe`)
+and serves it, or that blinds a source the probe does not exercise while
+leaving its attach in place, changes nothing the beats carry
+(`SENSOR_CONTRACT.md` §5a, with the worst-case delays: about 82 s to the
+signed row, about 2.4 minutes to `DEGRADED` for a probed source).

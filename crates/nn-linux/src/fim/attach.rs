@@ -161,6 +161,22 @@ pub fn coverage_shortfall(
     })
 }
 
+/// R13 (lab r2 of #479): the observe programs that did not attach, by
+/// name. The file-open sensor's program stands in for
+/// `fim_file_open_observe` on the same hook (see
+/// [`attach_observe_programs`]), so it counts as that observer.
+pub fn observe_programs_missing(attached: &[&str]) -> Vec<String> {
+    FIM_OBSERVE_PROGRAMS
+        .iter()
+        .map(|(p, _)| *p)
+        .filter(|p| {
+            !attached.contains(p)
+                && !(*p == "fim_file_open_observe" && attached.contains(&OPEN_SENSOR_PROGRAM))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// Attach the six FIM observe programs via [`attach_transient`].
 /// Each program is loaded against its hook (the BTF lookup
 /// produces the verifier-required type info) and attached;
@@ -692,6 +708,43 @@ mod tests {
         assert_eq!(coverage_shortfall(10, 10, 90, 125), None);
         // an empty list was attested where it was loaded (FIMR-001)
         assert_eq!(coverage_shortfall(10, 10, 0, 0), None);
+    }
+
+    /// R13 (lab r2 of #479): the open sensor's program is the file_open
+    /// observer, so a FIM with it is whole; the others still count.
+    #[test]
+    fn the_open_sensor_program_stands_in_for_the_file_open_observer() {
+        let all: Vec<&str> = super::FIM_OBSERVE_PROGRAMS
+            .iter()
+            .map(|(p, _)| *p)
+            .collect();
+        assert!(super::observe_programs_missing(&all).is_empty());
+        let with_sensor: Vec<&str> = all
+            .iter()
+            .map(|p| {
+                if *p == "fim_file_open_observe" {
+                    super::OPEN_SENSOR_PROGRAM
+                } else {
+                    p
+                }
+            })
+            .collect();
+        assert!(super::observe_programs_missing(&with_sensor).is_empty());
+        let without_open: Vec<&str> = all
+            .iter()
+            .copied()
+            .filter(|p| *p != "fim_file_open_observe")
+            .collect();
+        assert_eq!(
+            super::observe_programs_missing(&without_open),
+            vec!["fim_file_open_observe".to_string()]
+        );
+        // the sensor's program covers only its own hook
+        let sensor_only = [super::OPEN_SENSOR_PROGRAM];
+        assert_eq!(
+            super::observe_programs_missing(&sensor_only).len(),
+            super::FIM_OBSERVE_PROGRAMS.len() - 1
+        );
     }
 
     use super::*;

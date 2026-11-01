@@ -22,8 +22,12 @@ fn telemetry_status(
     let evidence = response_state.map(|s| (s.combat_evidence)());
     let encrypted = crate::net::blind_spots::encrypted_flows();
     // R11c (lab PR 264): the boot's results the start handed the socket
-    // (they were process-wide statics the start set).
-    let trust = crate::boot::trust::current(handles.trust_inputs.as_ref());
+    // (they were process-wide statics the start set). R13 (lab PR 271): the
+    // trust level and the degradations are the capability manifest's
+    // newest revision, built again first (a change is signed before the
+    // status shows it).
+    handles.capability_manifest.refresh();
+    let manifest = handles.capability_manifest.current();
     let execq = crate::execq::snapshot();
     let ransom = handles.ransom_tracker.as_ref().map(|t| t.counts());
     let defense = handles.defense_detector.as_ref().map(|d| d.counts());
@@ -74,9 +78,12 @@ fn telemetry_status(
             .map(|_| crate::anti_tamper::fail_open::snapshot_nonzero()),
         // Lab PR 218: the trust level now, the degradations of this run and
         // the boot's signed capability manifest.
-        trust_level: trust.as_ref().map(|t| t.level.as_u8()),
-        trust_reasons: trust.map(|t| t.reasons),
-        degradations: Some(crate::boot::degradation::snapshot()),
+        trust_level: manifest.as_ref().map(|m| m.trust_level),
+        trust_reasons: manifest.as_ref().map(|m| m.trust_reasons.clone()),
+        degradations: Some(match &manifest {
+            Some(m) => m.degradations.clone(),
+            None => crate::boot::degradation::snapshot(),
+        }),
         capability_manifest: handles.capability_manifest.current_json(),
         // Lab PR 219: the exploit post-condition guard.
         exploit_guard: Some(crate::sensors::epg::status()),

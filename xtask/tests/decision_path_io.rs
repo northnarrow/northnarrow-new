@@ -181,9 +181,10 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/telemetry_probe.rs",
-        13,
-        "the probe's own task (its marker files, sleeps, child processes); `observe` matches \
-         an event in memory",
+        14,
+        "the probe's own task (its marker files, sleeps, child processes; R13, lab PR 271: in \
+         debug-trigger builds the lab's `debug-probe-blind` file, read once a round); `observe` \
+         matches an event in memory",
     ),
     (
         "crates/nn-core/src/canary/detector.rs",

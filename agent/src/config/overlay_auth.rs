@@ -177,6 +177,10 @@ pub struct OverlayGate {
     /// The path each overlay kind was verified at this boot
     /// ([`configured_path`]).
     configured: Mutex<HashMap<OverlayKind, PathBuf>>,
+    /// R13 (lab PR 271): the shipped lists not in force from their file —
+    /// the copy built into the agent, or a file edited by hand — one line
+    /// each, for the capability manifest ([`Self::defaults_in_force`]).
+    defaults: Mutex<Vec<String>>,
 }
 
 impl std::fmt::Debug for OverlayGate {
@@ -235,6 +239,7 @@ impl OverlayGate {
             audit_log: Mutex::new(None),
             pending: Mutex::new(Vec::new()),
             configured: Mutex::new(HashMap::new()),
+            defaults: Mutex::new(Vec::new()),
         }
     }
 
@@ -417,6 +422,10 @@ impl OverlayGate {
     /// `integrity_drift` (`default_list_unavailable`), like a refused
     /// overlay: the host no longer runs on the list it was installed with.
     pub fn report_default_unavailable(&self, list: &str, path: &Path, reason: &str) {
+        self.note_default(format!(
+            "{list} ({}): unavailable ({reason}) — the copy built into the agent is in force",
+            path.display()
+        ));
         self.record_entry(drift_entry(serde_json::json!({
             "kind": "default_list_unavailable",
             "detail": format!("{list} ({}): {reason}", path.display()),
@@ -443,6 +452,10 @@ impl OverlayGate {
         } else {
             "not applied, the copy built into the agent is in force".to_string()
         };
+        self.note_default(format!(
+            "{list} ({}): no list NorthNarrow shipped (sha256 {sha256}) — {outcome}",
+            path.display()
+        ));
         self.record_entry(drift_entry(serde_json::json!({
             "kind": "default_list_modified",
             "detail": format!(
@@ -496,6 +509,24 @@ impl OverlayGate {
             Some(l) => append(&l, draft),
             None => self.pending.lock().push(draft),
         }
+    }
+
+    /// R13 (lab PR 271): a shipped list not in force from its file, for the
+    /// capability manifest (once).
+    fn note_default(&self, line: String) {
+        let mut d = self.defaults.lock();
+        if !d.contains(&line) {
+            d.push(line);
+        }
+    }
+
+    /// R13 (lab PR 271): the shipped lists not in force from their file this
+    /// run ([`Self::report_default_unavailable`],
+    /// [`Self::report_default_modified`]): the capability manifest's
+    /// `content`, signed with it — the gate's rows say when, the manifest
+    /// says what is in force.
+    pub fn defaults_in_force(&self) -> Vec<String> {
+        self.defaults.lock().clone()
     }
 
     /// A signed audit row of the gate's (lab PR 236: `rule_policy_loaded`,
