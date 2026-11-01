@@ -55,7 +55,7 @@ g 'cat > ~/exp13/responses.sh' < ./deploy/lab/bus/responses.sh
 for i in 1 2 3; do
   g "sudo bash ~/exp13/responses.sh --out /var/lib/nn-exp13r/clock-fill-$i --kills 400 --flows 0 --load-secs 0 --settle 10" >> "$OUT/setup.log" 2>&1
 done
-g "sudo ls -l $ACT* | cat" >> "$OUT/setup.log" 2>&1
+g "sudo sh -c 'ls -l $ACT*'" >> "$OUT/setup.log" 2>&1
 sleep "${NN_HB_SETTLE:-60}"
 
 STATE=$OUT/state.json; rm -f "$STATE"
@@ -103,19 +103,48 @@ scenario clock-back 'ALERT DEGRADED .*clock went back' 90 g 'sudo date -s "-40 s
 scenario restart-behind 'ALERT DEGRADED .*clock went back' 120 g "$STOP; sudo date -s '-40 seconds' >/dev/null; $START"
 g 'sudo date -s "+40 seconds" >/dev/null'
 sleep 40
-# 4. the actions chain's newest archive removed while the agent runs: right
-#    after a beat, a burst that rotates the chain, the archive removed
-#    before the next beat
-t0=$(now)
+# 4. the actions chain's newest archive removed while the agent runs: the
+#    active file filled near its cap; right after a beat, a burst that
+#    rotates it — the head that beat named now in the newest archive — and
+#    that archive removed before the next beat, which reads the head back.
+#    (The guest's shell cannot read the chain's directory: every listing
+#    runs under sudo, globs included.)
+CAP=1048576
+newest() { g "sudo find ${ACT%/*} -maxdepth 1 -name '${ACT##*/}.[0-9]*' ! -name '*.manifest*' -printf '%f\\n' | sort | tail -1" 2>/dev/null | tr -d '\r'; }
+size() { g "sudo stat -c %s $ACT" 2>/dev/null | tr -d '\r'; }
+burst() { g "sudo bash ~/exp13/responses.sh --out /var/lib/nn-exp13r/clock-rot-$1 --kills $2 --flows 0 --load-secs 0 --settle $3" >> "$OUT/setup.log" 2>&1; }
+for i in 1 2 3 4 5 6; do
+  z=$(size); k=$(( (CAP - 160000 - z) / 1100 ))
+  echo "fill $i: active $z bytes, burst $k" >> "$OUT/setup.log"
+  ((k < 20)) && break
+  ((k > 400)) && k=400
+  burst fill-$i "$k" 10
+done
+z=$(size); before=$(newest)
+echo "before the beat: active $z bytes, newest archive '$before'" >> "$OUT/setup.log"
 last=$(awk '$2 == "OK" {print $3}' "$OUT/watch.log" | tail -1)
 while [[ $(awk '$2 == "OK" {print $3}' "$OUT/watch.log" | tail -1) == "$last" ]]; do sleep 1; done
-before=$(g "ls $ACT.* 2>/dev/null | grep -c '\.[0-9]*$' || true" 2>/dev/null | tr -d '\r')
-g "sudo bash ~/exp13/responses.sh --out /var/lib/nn-exp13r/clock-rot --kills 800 --flows 0 --load-secs 0 --settle 3" >> "$OUT/setup.log" 2>&1
-g "n=\$(sudo ls $ACT.* 2>/dev/null | grep -E '\\.[0-9]+\$' | sort -t. -k3 -n | tail -1); echo removing \$n; $GRANT && sudo rm -f \$n" >> "$OUT/setup.log" 2>&1
-if t=$(wait_alert "$t0" 'ALERT REPLAY .*no longer holds' 90); then
+t0=$(now)
+burst rot 300 15 &
+BPID=$!
+removed=
+for _ in $(seq 1 25); do
+  n=$(newest)
+  if [[ -n $n && $n != "$before" ]]; then
+    g "$GRANT && sudo rm -f ${ACT%/*}/$n && echo removed $n at \$(date -u +%T.%N)" >> "$OUT/setup.log" 2>&1 && removed=$n
+    break
+  fi
+  sleep 1
+done
+wait "$BPID"
+echo "rotated to '$n', removed '$removed' ($(secs "$t0" "$(now)") s after the beat seen)" >> "$OUT/setup.log"
+if [[ -z $removed ]]; then
+  printf 'archive-removed\t%s\t-\tNO ROTATION within 25 s of the beat (newest before: %s)\t-\n' "$t0" "$before" >> "$TSV"
+  fails=$((fails + 1))
+elif t=$(wait_alert "$t0" 'ALERT REPLAY .*no longer holds' 90); then
   printf 'archive-removed\t%s\t%s\t%s\t-\n' "$t0" "$t" "$(secs "$t0" "$t")" >> "$TSV"
 else
-  printf 'archive-removed\t%s\t-\tNO ALERT within 90 s (archives before: %s)\t-\n' "$t0" "$before" >> "$TSV"
+  printf 'archive-removed\t%s\t-\tNO ALERT within 90 s (%s removed)\t-\n' "$t0" "$removed" >> "$TSV"
   fails=$((fails + 1))
 fi
 sleep 10
