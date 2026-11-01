@@ -4068,3 +4068,64 @@ only in the table below, in the same PR as the evidence.
     value.
   - Open: the ladder's and the exec quarantine's threads not ordered
     against the dispatcher's responses for one process (as before R12c).
+  - R12c-2 (part 2 of 2, stacked on R12c-1) — what was wrong: everything
+    the agent signs proves something only to a reader off the host, and
+    no such reader had anything to watch: an agent stopped, frozen, killed
+    or blinded was seen only by looking at the host, and the loss of
+    stages 1–7 was in `nn-admin status`, never in a signed row (report 06,
+    INI-14).
+  - R12c-2 — what changed (`docs/operator/HEARTBEAT.md`,
+    `docs/architecture/EVENT_BUS.md` §5, §7; `EVIDENCE_CHAINS.md`, the
+    heartbeat chain): a beat every 30 s (`NN_HEARTBEAT_SECS`, 5 to 300,
+    never off; longer than 30 s a weakening for the self-integrity check)
+    on a chain of its own (`/var/lib/northnarrow/heartbeat.jsonl`, KIND
+    `heartbeat`, 4 MiB × 4), numbered across runs, carrying the loss of
+    stages 1–7, the actions chain's counts, the probe's gaps, the decision
+    thread's progress, the posture, stage, trust, degradations and the
+    audit and actions chains' heads; a `start` beat per run, a `stop` beat
+    at a clean stop. Signed `telemetry_loss` audit rows (each stage's total
+    and its loss since the last row: at a change at most once a minute,
+    hourly with none, at the stop). `nn-admin heartbeat export` (the newest
+    lines as on disk, for an SSH forced command) and `nn-admin heartbeat
+    watch` (on another host, with the agent's public key and a state file:
+    signatures, links, numbers, freshness, a rollback of a chain's head;
+    exit 10 silent, 11 broken, 12 replay, 13 tampered, 14 loss, 15
+    stopped, 16 degraded). The transport is a pull over SSH through a
+    forced command (no listener added to the agent's host, no egress, the
+    channel not trusted for integrity — every beat signed end to end;
+    `HEARTBEAT.md`, "Why this transport").
+  - R12c-2 — after the review of #476: the beat carries the actions
+    chain's head (its position — the active file's archive number and
+    length — its hash, and whether the chain still holds the head the
+    previous beat named, read back at each beat and at the start); the
+    verifier alerts REPLAY when that head goes back, is gone from the beat
+    or is no longer held, and DEGRADED for a new run with no stop beat
+    before it (the agent killed, crashed, or frozen and restarted) and for
+    a beat late after the one before it in one run.
+  - R12c-2 — lab (our own guests, fresh installs): the verifier on the WSL host pulling the
+    beats over SSH from ubuntu2204 (rounds h–j): a replayed export REPLAY
+    in 5.0 s, a beat altered on the way TAMPERED in 4.2 s, the network cut
+    SILENT in 66.7 s, the agent stopped STOPPED in 6.5 s, the actions
+    chain's last row cut while it was stopped REPLAY in 4.9 s after the
+    start ("no longer holds the head"), the agent frozen DEGRADED in 55.7 s
+    — the watchdog restarted it after ~69 s, under the silence bound, so
+    the alert is the new run without a stop beat. The rounds found the
+    gaps those last three alerts close (round h: a cut tail with rows
+    appended past it and a freeze under the bound went unalerted; round
+    i: the freeze ended by a restart). No regression
+    (round d, ubuntu2404, this branch before the review's additions): the
+    EXP-13 family with no `fs_protect` or FIM drop, NET-001's record median
+    17.8 ms over 36 probes, EXP-13r's 400 intents answered with P1 0 over
+    budget, overhead within noise (open +27.9 %, wopen +32.0 %, exec
+    +8.9 %, connect +12.0 %, udp +15.4 %, dns +14.1 %; `main` +29.1, +33.1,
+    +8.3, +15.1, +19.1, +15.2), `tamper-check` 72 OK with the known gaps and
+    deviation (C30: one more protected entry, the heartbeat chain). Soak
+    (round c, ubuntu2204, 0.8 h): RSS 31.1 → 55.1 MB (`main` 32.4 → 56.8),
+    26 threads, no restart, no drop. `test-ignored` found two races in the
+    privileged tests (the heartbeat's `telemetry_loss` rows in the audit
+    test's fixed sequence; the canary writer's Trip row read before it was
+    appended), fixed: then 82 suites, 97 passed, 0 failed, 53 chain checks
+    `ok` on ubuntu2204. Host gates on c3e853c3: 77 suites 3,402 passed 0
+    failed, every other gate green; mutations 41 of 41 (the six survivors
+    of set B, MW6/MC1, MC2 caught once their tests were written);
+    identity as `main`'s.
