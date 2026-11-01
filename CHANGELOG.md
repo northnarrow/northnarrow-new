@@ -6,6 +6,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- The parsers in the worker (lot 272, Wave 4 phase 2, R14b of the
+  restructure plan, §3.1, §3.5): the DNS pump's query names are decoded by
+  the `parse` worker, in batches of at most 512 names whose worst answer
+  fits a frame, with a 250 ms deadline; the core checks every answer
+  against its request and never decodes a name itself — a name the worker
+  did not answer (starting, restarting, disabled, out of time) is an event
+  with no name, counted and said at most every 10 s. The TLS ClientHello
+  and the DNS answers' parsers are reachable from the core only through
+  the worker (`ParseClient`); the agent's own copies of them are gone
+  (`xtask/tests/no_parsing_in_the_core.rs`). The channel's version is 2.
 - The agent's unprivileged workers: the sandbox, the worker model, the
   core/worker channel and the kernel's roles (lot 272, Wave 4 phase 2, R14a
   of the restructure plan, §3.1, §3.3, §3.5; report 06 INI-19;
