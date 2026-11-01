@@ -60,6 +60,10 @@ esac
 EOF
 chmod +x "$OUT/fetch.sh"
 "$OUT/fetch.sh" > "$OUT/old-export.jsonl" || { echo "the first fetch failed" >&2; exit 1; }
+# the start's backlog first (a fresh install's first minute: its late
+# decisions are stage 5's loss, which the verifier would report — the
+# first round saw `ALERT LOSS … stage 5 (decision delay) +11` there)
+sleep "${NN_HB_SETTLE:-120}"
 
 STATE=$OUT/state.json; rm -f "$STATE"
 "$NNADMIN" heartbeat watch --agent-pubkey-file "$OUT/agent.pub" --from-cmd "$OUT/fetch.sh" \
@@ -70,7 +74,8 @@ now() { date -u +%FT%T.%6NZ; }
 TSV=$OUT/scenarios.tsv; printf 'scenario\tstart\talert\tseconds\n' > "$TSV"
 # the first ALERT of kind $2 at or after $1 within $3 s: its line's time
 wait_alert() {
-  local since=$1 kind=$2 within=$3 end=$((SECONDS + within)) t
+  local since=$1 kind=$2 within=$3 t
+  local end=$((SECONDS + within))
   while ((SECONDS < end)); do
     t=$(awk -v s="$since" -v k="ALERT $kind" '$1 >= s && index($0, k) {print $1; exit}' "$OUT/watch.log")
     [[ -n $t ]] && { echo "$t"; return 0; }
@@ -79,7 +84,8 @@ wait_alert() {
   return 1
 }
 wait_ok() {
-  local since=$1 within=$2 end=$((SECONDS + within))
+  local since=$1 within=$2
+  local end=$((SECONDS + within))
   while ((SECONDS < end)); do
     awk -v s="$since" '$1 >= s && $2 == "OK" {f=1} END {exit !f}' "$OUT/watch.log" && return 0
     sleep 1
