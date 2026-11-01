@@ -58,7 +58,7 @@ most severe alert's:
 | 10 | `SILENT` | no newer beat for two intervals plus 15 s (75 s by default; `--max-silence-secs`), or the source could not be read past that | the agent stopped, froze or was killed, the host is down, or the network is cut — go and look |
 | 15 | `STOPPED` | the agent's signed `stop` beat (an admin shutdown, a host shutdown), and every check while it stays stopped | expected only during maintenance |
 | 14 | `LOSS` | a stage's loss grew since the last beat seen | `nn-admin status --key` on the host: which stage, which queue |
-| 16 | `DEGRADED` | a beat late after the one before it in one run (more than its interval + 15 s: the agent stood still — frozen, starved — for less than the silence bound), the decision thread stood still for two intervals, a telemetry gap, an action row not in its chain, an action interrupted between intent and outcome, a new degradation | `nn-admin status --key`, the audit log's rows |
+| 16 | `DEGRADED` | a new run whose start beat follows no stop beat (the agent killed, crashed, or frozen and restarted by the watchdog — however soon it came back), a beat late after the one before it in one run (more than its interval + 15 s: the agent stood still — frozen, starved — for less than the silence bound), the decision thread stood still for two intervals, a telemetry gap, an action row not in its chain, an action interrupted between intent and outcome, a new degradation | `nn-admin status --key`, the audit log's rows |
 
 The first check of a new state file **anchors**: it takes the newest beat
 that verifies as the start (say `OK … (anchored: first beat seen)`) and

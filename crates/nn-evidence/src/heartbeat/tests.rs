@@ -322,10 +322,15 @@ fn loss_alerts_against_the_last_beat_seen() {
     b.loss[0] = Some(1);
     c.push(b);
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(61), &cfg());
-    assert_eq!(kinds(&r), ["LOSS"]);
+    // (no stop beat before the new run: also DEGRADED, the agent died)
+    assert_eq!(kinds(&r), ["LOSS", "DEGRADED"]);
     assert!(
         r.alerts[0].detail().contains("stage 1 (kernel ring) +1"),
         "the new run's 1 is its own loss, though the old run had counted 2: {r:?}"
+    );
+    assert!(
+        r.alerts[1].detail().contains("without a clean stop"),
+        "{r:?}"
     );
 }
 
@@ -575,14 +580,37 @@ fn a_late_beat_says_the_agent_stood_still() {
     c.push(beat(4, 131));
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(132), &cfg());
     assert!(r.alerts.is_empty(), "{r:?}");
-    // a restart: a start beat, a new run, long after — no stall
+    // a clean restart: a stop beat, then a start beat of a new run, long
+    // after — STOPPED, then nothing more (no stall, no death)
     let s = r.state.unwrap();
-    let mut b = beat(5, 400);
+    let mut stop = beat(5, 140);
+    stop.kind = BeatKind::Stop;
+    stop.stop_reason = Some("admin_shutdown".into());
+    c.push(stop);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(141), &cfg());
+    assert_eq!(kinds(&r), ["STOPPED"], "{r:?}");
+    let s = r.state.unwrap();
+    let mut b = beat(6, 400);
     b.kind = BeatKind::Start;
     b.run = "bbbbbbbbbbbbbbbb".into();
     c.push(b);
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(401), &cfg());
     assert!(r.alerts.is_empty(), "{r:?}");
+    // a restart with no stop beat before it (killed, crashed, frozen and
+    // restarted by the watchdog — the lab's freeze): DEGRADED, however
+    // soon it came back
+    let s = r.state.unwrap();
+    c.push(beat(7, 430));
+    let mut b = beat(8, 470);
+    b.kind = BeatKind::Start;
+    b.run = "cccccccccccccccc".into();
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(471), &cfg());
+    assert_eq!(kinds(&r), ["DEGRADED"], "{r:?}");
+    assert!(
+        r.alerts[0].detail().contains("without a clean stop"),
+        "{r:?}"
+    );
 }
 
 /// The read-back of a head (`chainlog::holds_line_ending_at`): the line

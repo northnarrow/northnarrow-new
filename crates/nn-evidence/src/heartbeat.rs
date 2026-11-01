@@ -635,13 +635,25 @@ pub fn check(
     // still for a while — frozen, or starved — though less than the
     // silence bound (the lab's `systemctl freeze`, ended by the watchdog
     // after ~70 s: no SILENT at 75 s, only this).
+    // A new run whose start beat follows a beat that was not a stop: the
+    // last run ended without its stop beat — the agent was killed, crashed,
+    // or was frozen and restarted by the watchdog — however quickly it came
+    // back (the lab's freeze: restarted after ~70 s, under the silence
+    // bound).
     if let Some(l) = last {
-        let mut prev = parse_ts(&l.ts).map(|t| (l.seq, t));
+        let mut prev = parse_ts(&l.ts).map(|t| (l.seq, t, l.stopped));
         for (_, b) in beats.iter().filter(|(_, b)| b.seq > l.seq) {
             let t = parse_ts(&b.ts);
-            if let (Some((ps, pt)), Some(t)) = (prev, t) {
+            if let (Some((ps, pt, stopped)), Some(t)) = (prev, t) {
                 let gap = (t - pt).num_seconds();
-                if b.seq == ps + 1
+                if b.seq == ps + 1 && b.kind == BeatKind::Start && !stopped {
+                    degraded.push(format!(
+                        "the agent restarted without a clean stop: run {} began {gap} s after \
+                         beat {ps}, with no stop beat between (killed, crashed, or frozen and \
+                         restarted)",
+                        b.run
+                    ));
+                } else if b.seq == ps + 1
                     && b.kind != BeatKind::Start
                     && gap > (b.interval_secs + LATE_BEAT_SLACK_SECS) as i64
                 {
@@ -652,7 +664,7 @@ pub fn check(
                     ));
                 }
             }
-            prev = t.map(|t| (b.seq, t));
+            prev = t.map(|t| (b.seq, t, b.kind == BeatKind::Stop));
         }
     }
     if newest.kind != BeatKind::Stop
