@@ -13,6 +13,8 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod vault;
+
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, SECRET_KEY_LENGTH};
 use rand::rngs::SysRng;
