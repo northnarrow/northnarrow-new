@@ -338,9 +338,14 @@ over and judges the next event.
 decision thread submits a decision's responses to its queue
 (`nn_core::response::dispatch::ResponseQueue`, stage 6) — a push under a
 lock, never a wait — and the thread takes them:
-- **by severity**: four lanes, Critical first; a job that waited
-  `STARVATION_NS` (500 ms) is taken next whatever its lane, so a flood of
-  Critical kills cannot hold a Low throttle back for ever;
+- **by severity**: four lanes, Critical first; once the oldest job waited
+  `STARVATION_NS` (500 ms), one take in four (`AGED_TAKE_EVERY`) is it,
+  whatever its lane, so a flood of Critical kills cannot hold a Low
+  throttle back for ever — and the other three go by severity, so a backlog
+  of old jobs cannot hold a new Critical kill back behind all of them (the
+  first build took every old job first: in EXP-13r's backlog of ~350 kills
+  the queue became first in, first out, 185 of 400 takes passing over a
+  more severe job);
 - **in order per process** (a later response for the same process never
   overtakes an earlier one): each process's jobs are kept in the order
   they were decided, and a take runs the *oldest* job of the process the

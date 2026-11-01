@@ -609,6 +609,46 @@ fn the_dispatcher_says_whether_its_thread_runs() {
     assert!(!d.is_running());
 }
 
+/// A thread that ended outside a stop (a panic) is seen: not running, every
+/// later response answered "not run" at once and counted, the response it
+/// left queued answered at the stop — nothing runs, nothing is lost.
+#[test]
+fn a_dispatcher_whose_thread_ended_runs_nothing_more() {
+    let (d, journal, sink) = dispatcher(true, 64);
+    d.shared.panic_next.store(true, Ordering::Release);
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-P",
+            ResponseAction::KillProcess,
+            Severity::High,
+            9100,
+        ),
+    );
+    let t0 = Instant::now();
+    while d.is_running() {
+        assert!(t0.elapsed() < Duration::from_secs(5), "the end not seen");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-Q",
+            ResponseAction::KillProcess,
+            Severity::High,
+            9101,
+        ),
+    );
+    assert_eq!(d.status().not_run_down, 1);
+    assert_eq!(sink.queued_for_test().len(), 1, "answered at once");
+    assert!(sink.queued_for_test()[0].response.contains("not running"));
+    d.stop(Duration::from_millis(10));
+    let st = d.status();
+    assert_eq!((st.executed, st.not_run_at_stop), (0, 1), "{st:?}");
+    assert_eq!(sink.queued_for_test().len(), 2, "every decision answered");
+    assert!(journal.rows().iter().all(|r| r.row != ActionRow::Intent));
+}
+
 /// The event loop stops the agent when the dispatcher's thread ended (as
 /// for a dead pump), and the stop is a failure: pinned in the sources (the
 /// loop's check is the watch's, not a unit's).

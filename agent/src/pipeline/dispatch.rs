@@ -364,6 +364,9 @@ struct Shared {
     /// Tests: held, it stalls the thread before its next batch's intents.
     #[cfg(test)]
     hold: Mutex<()>,
+    /// Tests: the thread panics at its next batch (its end seen).
+    #[cfg(test)]
+    panic_next: AtomicBool,
 }
 
 impl Shared {
@@ -420,6 +423,8 @@ impl Dispatcher {
             crash_mid_action: AtomicBool::new(false),
             #[cfg(test)]
             hold: Mutex::new(()),
+            #[cfg(test)]
+            panic_next: AtomicBool::new(false),
         });
         let thread = {
             let shared = Arc::clone(&shared);
@@ -701,6 +706,10 @@ fn run(s: &Shared) {
                     write_overflow(s, false);
                     q = s.queue.lock();
                 }
+            }
+            #[cfg(test)]
+            if s.panic_next.swap(false, Ordering::AcqRel) {
+                panic!("test: the response dispatcher's thread panics");
             }
             s.busy.store(true, Ordering::Release);
             let now = s.now_ns();

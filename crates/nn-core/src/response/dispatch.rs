@@ -6,9 +6,13 @@
 //! queue: bounded, taken by severity, each process's responses in the order
 //! they were decided, and a full queue that never drops an action silently.
 //!
-//! - **By severity.** Four lanes, Critical first. A job that waited
-//!   [`STARVATION_NS`] goes next whatever its lane (aging): a flood of
-//!   Critical kills cannot hold a Low throttle back for ever.
+//! - **By severity.** Four lanes, Critical first. Aging: once the oldest
+//!   job waited [`STARVATION_NS`], one take in [`AGED_TAKE_EVERY`] is it,
+//!   whatever its lane — a flood of Critical kills cannot hold a Low
+//!   throttle back for ever, and a backlog of old jobs cannot hold a new
+//!   Critical kill back behind all of them (the more severe lanes keep the
+//!   other takes; lab PR 270's EXP-13r: with every old job taken first, a
+//!   backlog of 350 made the queue first in, first out).
 //! - **In order per process** (the brief: "a later response for the same
 //!   process never overtakes an earlier one"). The queue keeps each
 //!   process's jobs (its [`ResponseQueue`] key) in the order they were
@@ -46,8 +50,11 @@ use crate::bus::LatencyHistogram;
 /// holds a few MiB.
 pub const RESPONSE_QUEUE_CAP: usize = 1_024;
 
-/// A job that waited this long is taken next whatever its lane (aging).
+/// The oldest job, once it waited this long, has a take by age (aging).
 pub const STARVATION_NS: u64 = 500_000_000;
+
+/// At most one take in this many is by age; the others go by severity.
+pub const AGED_TAKE_EVERY: u32 = 4;
 
 /// The lanes, by severity: index 0 is Low, 3 Critical.
 pub const LANES: usize = 4;
@@ -166,6 +173,8 @@ pub struct ResponseQueue<K, J> {
     lanes: [BTreeSet<u64>; LANES],
     /// Each process's jobs, in submission order.
     by_key: HashMap<K, VecDeque<u64>>,
+    /// Takes since the last one by age (aging's share).
+    since_aged: u32,
     stats: DispatchStats,
 }
 
@@ -177,6 +186,7 @@ impl<K: Eq + Hash + Clone, J: DispatchJob> ResponseQueue<K, J> {
             jobs: BTreeMap::new(),
             lanes: Default::default(),
             by_key: HashMap::new(),
+            since_aged: AGED_TAKE_EVERY - 1,
             stats: DispatchStats {
                 capacity: cap.max(1) as u64,
                 ..DispatchStats::default()
@@ -254,10 +264,17 @@ impl<K: Eq + Hash + Clone, J: DispatchJob> ResponseQueue<K, J> {
 
     /// The next job to run at `now_ns`: the oldest job of the process the
     /// most severe lane's oldest job is of — or, when the oldest job of all
-    /// waited [`STARVATION_NS`], that job's process's oldest (itself).
+    /// waited [`STARVATION_NS`] and none of the last [`AGED_TAKE_EVERY`]` -
+    /// 1` takes was by age, that job's process's oldest (itself).
     pub fn take(&mut self, now_ns: u64) -> Option<TakenJob<J>> {
         let (&oldest, oe) = self.jobs.iter().next()?;
-        let aged = now_ns.saturating_sub(oe.enqueued_ns) >= STARVATION_NS;
+        let aged = self.since_aged + 1 >= AGED_TAKE_EVERY
+            && now_ns.saturating_sub(oe.enqueued_ns) >= STARVATION_NS;
+        self.since_aged = if aged {
+            0
+        } else {
+            self.since_aged.saturating_add(1)
+        };
         let named = if aged {
             oldest
         } else {
@@ -536,6 +553,26 @@ mod tests {
         assert_eq!((t.job.pid, t.aged), (1, true));
         assert_eq!(q.take(STARVATION_NS).unwrap().job.pid, 101);
         assert_eq!(q.stats().aged, 1);
+    }
+
+    /// Aging's share: a backlog of old Low jobs gets one take in
+    /// AGED_TAKE_EVERY, a new Critical job the others — it does not wait
+    /// behind the whole backlog (lab PR 270, EXP-13r).
+    #[test]
+    fn a_backlog_of_old_jobs_leaves_the_severe_ones_their_turns() {
+        let mut q = ResponseQueue::new(64);
+        for i in 0..20 {
+            q.submit(i, L, 0, j(i, "throttle", 1 + i));
+        }
+        for i in 0..5 {
+            q.submit(100 + i, C, 2 * STARVATION_NS, j(100 + i, "kill", 100 + i));
+        }
+        let order: Vec<u32> = std::iter::from_fn(|| q.take(2 * STARVATION_NS))
+            .take(10)
+            .map(|t| t.job.pid)
+            .collect();
+        assert_eq!(order, [0, 100, 101, 102, 1, 103, 104, 2, 3, 4]);
+        assert_eq!(q.stats().aged, 2, "the Low jobs taken past a Critical one");
     }
 
     /// The counts: depth per lane, the wait from queue to take, the drain.

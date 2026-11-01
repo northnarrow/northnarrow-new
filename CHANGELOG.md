@@ -1354,12 +1354,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   record (lab PR 270, Wave 4 phase 2, R12c-1 of the restructure plan;
   `docs/architecture/EVENT_BUS.md` §2d, §2e, §5). The decision thread
   submits a decision's responses to the response dispatcher (`nn-response`)
-  and judges the next event; the dispatcher takes them by severity (a job
-  that waited 500 ms next whatever its lane), each process's in the order
-  they were decided (priority inheritance), a repeat of a process's last
-  queued response merged into it; a full queue (1,024) displaces a less
-  severe response or refuses the new one — answered at once ("not run"),
-  counted per severity (stage 6), signed in an `overflow` row, raising
+  and judges the next event; the dispatcher takes them by severity (once
+  the oldest job waited 500 ms, one take in four is it), each process's in
+  the order they were decided (priority inheritance), a repeat of a
+  process's last queued response merged into it; a full queue (1,024)
+  displaces a less severe response or refuses the new one — answered at
+  once ("not run"), counted per severity (stage 6), signed in an
+  `overflow` row, raising
   `TelemetryLoss`; at the stop what is left after 2 s is answered and
   signed the same way. Every action the agent carries out on its own
   decision — a rule's response, the COMBAT ladder's soft block and
