@@ -81,10 +81,17 @@ the core read it:
 ```
 nn-admin capabilities --key <admin key> --json | jq '.manifest.workers'
 [{"kind":"parse","state":"ready","kernel_landlock_abi":4,
-  "sandbox":{"landlock_abi":4,"landlock":"Full","fs_denied":true,"net_denied":true,
+  "sandbox":{"landlock_abi":4,"landlock":"Partial","fs_denied":true,"net_denied":true,
              "scoped":false,"seccomp":true,"no_new_privs":true,"dumpable":false,
              "uid":998,"gid":998,"groups":0,"cap_eff":0,…}}]
 ```
+
+`landlock` is `Partial` on every kernel of the lab: the worker asks for
+the rights of the newest ABI its build knows (9), and the kernel enforces
+those its own ABI has — `fs_denied`, `net_denied` and `scoped` say which
+(measured: `Partial`, `fs_denied` only on Ubuntu 22.04's ABI 1; `Partial`,
+`fs_denied` and `net_denied` on Ubuntu 24.04's ABI 4). `Full` takes a kernel
+with ABI 9.
 
 A kernel without Landlock is no error: the filter is the worker's
 confinement there, and the manifest says `landlock_abi 0`.
