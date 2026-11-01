@@ -35,22 +35,44 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nn_core::response::dispatch::{
-    lane_of, severity_name, DispatchJob, DispatchStats, ResponseQueue, Submitted, TakenJob, LANES,
+    lane_of, severity_name, DispatchJob, DispatchStats, ResponseQueue, Submitted, LANES,
     RESPONSE_QUEUE_CAP,
 };
 use nn_model::posture_types::PostureKind;
 use nn_model::{Event, ResponseAction, Severity};
 use northnarrow_agent::decision::combine::Decision;
 use northnarrow_agent::response::journal::{
-    ActionIntent, ActionJournal, ActionOverflow, ActionResult, Intent, JournalCounts,
-    OVERFLOW_SAMPLES,
+    ActionIntent, ActionJournal, ActionOverflow, Intent, JournalCounts, OVERFLOW_SAMPLES,
 };
 use northnarrow_agent::response::{ExecutionOutcome, ExecutionReport, Executor};
 use parking_lot::{Condvar, Mutex};
 use tracing::{error, info, warn};
 
-/// Responses taken at once: their intents written with one sync.
-pub(crate) const BATCH: usize = 16;
+/// R12c-3: a worker syncs the rows it wrote unsynced (the outcomes, the
+/// intents of actions that end with the host) when it finds no work, and
+/// at least every this many actions.
+pub(crate) const SYNC_EVERY: usize = 16;
+/// R12c-3: the response workers (`NN_RESPONSE_WORKERS`, 1 to
+/// [`MAX_WORKERS`]): different processes' responses run at once, one
+/// process's one at a time and in order (the queue's).
+pub(crate) const DEFAULT_WORKERS: usize = 8;
+pub(crate) const MAX_WORKERS: usize = 32;
+pub(crate) const WORKERS_ENV: &str = "NN_RESPONSE_WORKERS";
+/// R12c-3: an action still running after this long is stalled — a signed
+/// `stalled` row, `TelemetryLoss`, and a spare worker so that the other
+/// processes' responses do not wait behind it.
+pub(crate) const STALL_AFTER: Duration = Duration::from_secs(10);
+/// How often the stall watch looks.
+const STALL_WATCH_EVERY: Duration = Duration::from_millis(500);
+
+/// The workers `NN_RESPONSE_WORKERS` asks for (1 to [`MAX_WORKERS`];
+/// unset, empty or not a number: [`DEFAULT_WORKERS`]).
+pub(crate) fn workers_from_env() -> usize {
+    std::env::var(WORKERS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(DEFAULT_WORKERS, |n| n.clamp(1, MAX_WORKERS))
+}
 /// How long the stop runs what is still queued.
 pub(crate) const STOP_WAIT: Duration = Duration::from_secs(2);
 /// Overflow rows at most this often (and at the stop).
@@ -114,15 +136,22 @@ pub(crate) struct ResponseJob {
 }
 
 impl DispatchJob for ResponseJob {
-    /// The same action on the same process — its pid *and* its start (a
-    /// process that reused the pid is another one: review of #476, X1) —
-    /// and, but for a kill, the same file (two strips of two files are two
-    /// actions).
+    /// The same action on the same process — its pid *and* its start,
+    /// known (a process that reused the pid is another one: review of
+    /// #476, X1; the start is 0, not known, for every response but an
+    /// exec's — review of #477: then never merged, a second kill costs an
+    /// `AlreadyGone`) — and, but for a kill, the same file (two strips of
+    /// two files are two actions).
     fn same_action(&self, other: &Self) -> bool {
         self.action == other.action
-            && self.pid == other.pid
-            && self.start_ns == other.start_ns
+            && self.same_process(other)
             && (self.is_kill() || self.file == other.file)
+    }
+
+    /// The same process, its start known and equal (review of #477): a
+    /// kill supersedes only that process's throttles and blocks.
+    fn same_process(&self, other: &Self) -> bool {
+        self.pid == other.pid && self.start_ns != 0 && self.start_ns == other.start_ns
     }
 
     fn is_kill(&self) -> bool {
@@ -358,15 +387,23 @@ pub(crate) struct DispatchStatus {
     /// Not run at the stop, and while the thread did not run (stage 6).
     pub(crate) not_run_at_stop: u64,
     pub(crate) not_run_down: u64,
-    /// Throttles and blocks taken with their process's kill, which killed.
-    pub(crate) superseded_in_batch: u64,
     pub(crate) journal: JournalCounts,
+    /// R12c-3: the workers (and spares running now), actions running now,
+    /// actions stalled now and since the start.
+    pub(crate) workers: u64,
+    pub(crate) spares: u64,
+    pub(crate) active: u64,
+    pub(crate) stalled_now: u64,
+    pub(crate) stalled: u64,
     /// The dispatcher's thread runs.
     pub(crate) running: bool,
 }
 
 struct Shared {
-    queue: Mutex<ResponseQueue<(u32, u64), ResponseJob>>,
+    /// Keyed by pid (review of #477): one pid's responses never run at
+    /// once nor out of order, whichever event — knowing the start or not —
+    /// decided them; a reused pid waits behind the old one's, harmlessly.
+    queue: Mutex<ResponseQueue<u32, ResponseJob>>,
     ready: Condvar,
     stop: AtomicBool,
     executor: Executor,
@@ -377,25 +414,51 @@ struct Shared {
     executed: AtomicU64,
     execution_max_us: AtomicU64,
     not_run_at_stop: AtomicU64,
-    /// Submitted while the thread was not running.
+    /// Submitted while the workers were not running.
     not_run_down: AtomicU64,
-    /// Throttles and blocks taken in the same batch as their process's
-    /// kill, which killed: answered superseded, not run.
-    superseded_in_batch: AtomicU64,
-    /// A batch is being run.
-    busy: AtomicBool,
+    /// R12c-3: the pool — its size, the spares started for stalled
+    /// actions, the actions running now, each worker's slot (what it runs,
+    /// since when), the stalls, the threads (joined at the stop).
+    workers: usize,
+    spares: AtomicUsize,
+    active: AtomicUsize,
+    slots: Mutex<Vec<Arc<Slot>>>,
+    stalled_now: AtomicUsize,
+    stalled: AtomicU64,
+    stall_after: Duration,
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     running: AtomicBool,
     epoch: Instant,
     /// `debug-trigger` builds: abort the process after the next action and
     /// before its outcome (the lab's crash between intent and outcome).
     #[cfg(feature = "debug-trigger")]
     crash_mid_action: AtomicBool,
-    /// Tests: held, it stalls the thread before its next batch's intents.
+    /// `debug-trigger` builds: the next action hangs past the stall bound
+    /// before it acts (the lab's stalled action, R12c-3).
+    #[cfg(feature = "debug-trigger")]
+    hang_next_action: AtomicBool,
+    /// Tests: held, it stalls a worker before its next intent.
     #[cfg(test)]
     hold: Mutex<()>,
-    /// Tests: the thread panics at its next batch (its end seen).
+    /// Tests: a worker panics before its next job (its end seen).
     #[cfg(test)]
     panic_next: AtomicBool,
+    /// Tests: the action on this pid hangs (after its intent) until this
+    /// goes back to 0 — a stalled action.
+    #[cfg(test)]
+    hang_pids: Mutex<std::collections::HashSet<u32>>,
+}
+
+/// R12c-3: what one worker runs now (the stall watch reads it).
+#[derive(Default)]
+struct Slot {
+    /// When its action began (ns since the epoch; 0: idle).
+    since_ns: AtomicU64,
+    /// Its intent's number, and what it is.
+    action: AtomicU64,
+    what: Mutex<String>,
+    /// Its stall signed.
+    stalled: AtomicBool,
 }
 
 impl Shared {
@@ -409,20 +472,27 @@ impl Shared {
 #[derive(Clone)]
 pub(crate) struct Dispatcher {
     shared: Arc<Shared>,
-    thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 impl Dispatcher {
-    /// Start the dispatcher's thread (`nn-response`). Without it (the thread
-    /// could not start) a submitted response is answered "not run", counted
-    /// and signed — never run on the decision thread.
+    /// Start the dispatcher's workers (`nn-response-<n>`, [`workers_from_env`]
+    /// of them) and its stall watch. Without them (no thread could start) a
+    /// submitted response is answered "not run", counted and signed — never
+    /// run on the decision thread.
     pub(crate) fn start(
         executor: Executor,
         journal: ActionJournal,
         followups: Followups,
         posture: Option<northnarrow_agent::posture::PostureMachine>,
     ) -> Self {
-        Self::start_with(executor, journal, followups, posture, RESPONSE_QUEUE_CAP)
+        Self::start_with(
+            executor,
+            journal,
+            followups,
+            posture,
+            RESPONSE_QUEUE_CAP,
+            workers_from_env(),
+        )
     }
 
     pub(crate) fn start_with(
@@ -431,7 +501,29 @@ impl Dispatcher {
         followups: Followups,
         posture: Option<northnarrow_agent::posture::PostureMachine>,
         capacity: usize,
+        workers: usize,
     ) -> Self {
+        Self::start_inner(
+            executor,
+            journal,
+            followups,
+            posture,
+            capacity,
+            workers,
+            STALL_AFTER,
+        )
+    }
+
+    fn start_inner(
+        executor: Executor,
+        journal: ActionJournal,
+        followups: Followups,
+        posture: Option<northnarrow_agent::posture::PostureMachine>,
+        capacity: usize,
+        workers: usize,
+        stall_after: Duration,
+    ) -> Self {
+        let workers = workers.clamp(1, MAX_WORKERS);
         let shared = Arc::new(Shared {
             queue: Mutex::new(ResponseQueue::new(capacity)),
             ready: Condvar::new(),
@@ -445,41 +537,58 @@ impl Dispatcher {
             execution_max_us: AtomicU64::new(0),
             not_run_at_stop: AtomicU64::new(0),
             not_run_down: AtomicU64::new(0),
-            superseded_in_batch: AtomicU64::new(0),
-            busy: AtomicBool::new(false),
+            workers,
+            spares: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            slots: Mutex::new(Vec::new()),
+            stalled_now: AtomicUsize::new(0),
+            stalled: AtomicU64::new(0),
+            stall_after,
+            threads: Mutex::new(Vec::new()),
             running: AtomicBool::new(false),
             epoch: Instant::now(),
             #[cfg(feature = "debug-trigger")]
             crash_mid_action: AtomicBool::new(false),
+            #[cfg(feature = "debug-trigger")]
+            hang_next_action: AtomicBool::new(false),
             #[cfg(test)]
             hold: Mutex::new(()),
             #[cfg(test)]
             panic_next: AtomicBool::new(false),
+            #[cfg(test)]
+            hang_pids: Mutex::new(std::collections::HashSet::new()),
         });
-        let thread = {
-            let shared = Arc::clone(&shared);
-            std::thread::Builder::new()
-                .name("nn-response".into())
-                .spawn(move || run(&shared))
-        };
-        let thread = match thread {
-            Ok(t) => {
-                shared.running.store(true, Ordering::Release);
-                Some(t)
+        let mut started = 0;
+        for n in 0..workers {
+            if spawn_worker(&shared, format!("nn-response-{n}"), false) {
+                started += 1;
             }
-            Err(e) => {
-                error!(
-                    error = %e,
-                    "the response dispatcher's thread did not start — responses will NOT run \
-                     (each counted and signed as not run)"
-                );
-                None
-            }
-        };
-        Self {
-            shared,
-            thread: Arc::new(Mutex::new(thread)),
         }
+        if started == workers {
+            shared.running.store(true, Ordering::Release);
+            let watch = Arc::clone(&shared);
+            match std::thread::Builder::new()
+                .name("nn-response-watch".into())
+                .spawn(move || watch_stalls(&watch))
+            {
+                Ok(t) => shared.threads.lock().push(t),
+                Err(e) => warn!(
+                    error = %e,
+                    "the response dispatcher's stall watch did not start — a hanging action \
+                     is not reported"
+                ),
+            }
+        } else {
+            error!(
+                started,
+                workers,
+                "the response dispatcher's workers did not all start — responses will NOT run \
+                 (each counted and signed as not run)"
+            );
+            shared.stop.store(true, Ordering::Release);
+            shared.ready.notify_all();
+        }
+        Self { shared }
     }
 
     /// Hand `jobs` to the queue: never waits. A response the full queue
@@ -500,8 +609,9 @@ impl Dispatcher {
             let now = s.now_ns();
             let mut q = s.queue.lock();
             for (sev, job) in jobs {
-                // a process is its pid and its start (review of #476, X1)
-                match q.submit((job.pid, job.start_ns), sev, now, job) {
+                // keyed by pid (review of #477); merged only for a known
+                // and equal start (`same_action`: #476's X1)
+                match q.submit(job.pid, sev, now, job) {
                     Submitted::Queued(_) | Submitted::Merged(_) => {}
                     Submitted::Displacing(_, d) => {
                         let lane = lane_of_job(&d);
@@ -513,7 +623,7 @@ impl Dispatcher {
                 }
             }
             drop(q);
-            s.ready.notify_one();
+            s.ready.notify_all();
         }
         if not_run.is_empty() {
             return;
@@ -556,8 +666,12 @@ impl Dispatcher {
             execution_max_us: s.execution_max_us.load(Ordering::Relaxed),
             not_run_at_stop: s.not_run_at_stop.load(Ordering::Relaxed),
             not_run_down: s.not_run_down.load(Ordering::Relaxed),
-            superseded_in_batch: s.superseded_in_batch.load(Ordering::Relaxed),
             journal: s.journal.counts(),
+            workers: s.workers as u64,
+            spares: s.spares.load(Ordering::Relaxed) as u64,
+            active: s.active.load(Ordering::Relaxed) as u64,
+            stalled_now: s.stalled_now.load(Ordering::Relaxed) as u64,
+            stalled: s.stalled.load(Ordering::Relaxed),
             running: s.running.load(Ordering::Acquire),
         }
     }
@@ -605,7 +719,7 @@ impl Dispatcher {
             queued: q.queued,
             merged: q.merged,
             over_cap: q.over_cap,
-            superseded: q.superseded + st.superseded_in_batch,
+            superseded: q.superseded,
             displaced: q.displaced.to_vec(),
             refused: q.refused.to_vec(),
             not_run_other: st.not_run_at_stop + st.not_run_down,
@@ -625,6 +739,11 @@ impl Dispatcher {
             overflow_rows: j.overflow_rows,
             in_flight: j.in_flight,
             sync_failed: j.sync_failed,
+            workers: st.workers,
+            spares: st.spares,
+            active: st.active,
+            stalled_now: st.stalled_now,
+            stalled: st.stalled,
             evidence_capacity: e.capacity,
             evidence_depth: e.depth,
             evidence_max_depth: e.max_depth,
@@ -647,16 +766,25 @@ impl Dispatcher {
         self.shared.crash_mid_action.store(true, Ordering::Release);
     }
 
+    /// `debug-trigger` builds: the next action hangs past the stall bound
+    /// (5 s more) before it acts (lab: the stalled action, R12c-3).
+    #[cfg(feature = "debug-trigger")]
+    pub(crate) fn hang_next_action(&self) {
+        self.shared.hang_next_action.store(true, Ordering::Release);
+    }
+
     /// The stop: run what is queued for at most `wait`, answer the rest
-    /// "not run: the agent stopped" (counted, signed), end the thread.
+    /// "not run: the agent stopped" (counted, signed), end the workers —
+    /// a worker whose action hangs is left (named), not waited for — and
+    /// sign the run's end.
     pub(crate) fn stop(&self, wait: Duration) {
         let s = &self.shared;
         let deadline = Instant::now() + wait;
         while Instant::now() < deadline {
-            if s.queue.lock().is_empty() && !s.busy.load(Ordering::Acquire) {
+            if s.queue.lock().is_empty() && s.active.load(Ordering::Acquire) == 0 {
                 break;
             }
-            s.ready.notify_one();
+            s.ready.notify_all();
             std::thread::park_timeout(Duration::from_millis(10));
         }
         s.stop.store(true, Ordering::Release);
@@ -680,14 +808,26 @@ impl Dispatcher {
             }
         }
         s.ready.notify_all();
-        if let Some(t) = self.thread.lock().take() {
-            if t.join().is_err() {
-                error!("the response dispatcher's thread panicked");
+        let threads: Vec<_> = std::mem::take(&mut *s.threads.lock());
+        let joined_by = Instant::now() + Duration::from_secs(2);
+        for t in threads {
+            while !t.is_finished() && Instant::now() < joined_by {
+                std::thread::park_timeout(Duration::from_millis(10));
+            }
+            if t.is_finished() {
+                if t.join().is_err() {
+                    error!("a response dispatcher thread panicked");
+                }
+            } else {
+                warn!(
+                    thread = t.thread().name().unwrap_or("?"),
+                    "a response worker is still in its action at the stop — left running"
+                );
             }
         }
         s.running.store(false, Ordering::Release);
         write_overflow(s, true);
-        s.journal.sync();
+        s.journal.end_run();
     }
 }
 
@@ -710,90 +850,186 @@ fn lane_of_job(job: &ResponseJob) -> usize {
         .unwrap_or(0)
 }
 
-/// Marks the thread not running however it ends (a panic outside the
-/// executor's — which is caught —, the stop): from then on a response is
-/// answered "not run" and counted, and the event loop stops the agent
-/// (`Dispatcher::is_running`, as for a dead sensor pump).
-struct Exit<'a>(&'a Shared);
+/// Marks the dispatcher not running when a worker ends (a panic outside
+/// the executor's — which is caught —, the stop): from then on a response
+/// is answered "not run" and counted, and the event loop stops the agent
+/// (`Dispatcher::is_running`, as for a dead sensor pump). A spare that
+/// ends because it is no longer needed changes nothing.
+struct Exit<'a>(&'a Shared, bool);
 
 impl Drop for Exit<'_> {
     fn drop(&mut self) {
-        self.0.running.store(false, Ordering::Release);
-        if std::thread::panicking() {
-            error!("the response dispatcher's thread panicked — responses no longer run");
+        let panicking = std::thread::panicking();
+        if self.1 || panicking {
+            self.0.running.store(false, Ordering::Release);
+        }
+        if panicking {
+            error!("a response dispatcher worker panicked — responses no longer run");
         }
     }
 }
 
-/// The dispatcher's thread: a batch at a time, intents first.
-fn run(s: &Shared) {
-    let _exit = Exit(s);
+/// Start one worker (`spare`: one the stall watch added); false when its
+/// thread did not start.
+fn spawn_worker(s: &Arc<Shared>, name: String, spare: bool) -> bool {
+    let slot = Arc::new(Slot::default());
+    s.slots.lock().push(Arc::clone(&slot));
+    let me = Arc::clone(s);
+    match std::thread::Builder::new()
+        .name(name)
+        .spawn(move || work(&me, &slot, spare))
+    {
+        Ok(t) => {
+            s.threads.lock().push(t);
+            true
+        }
+        Err(e) => {
+            error!(error = %e, "a response worker did not start");
+            false
+        }
+    }
+}
+
+/// A worker: the next job of a process with none running (the queue's
+/// order: by severity, aging, each process's oldest first), its signed
+/// intent, the action, its outcome; the process freed for its next job.
+fn work(s: &Shared, slot: &Slot, spare: bool) {
+    let _exit = Exit(s, !spare);
+    let mut unsynced = 0usize;
     loop {
-        let batch: Vec<TakenJob<ResponseJob>> = {
+        let t = {
             let mut q = s.queue.lock();
-            while q.is_empty() {
+            loop {
                 if s.stop.load(Ordering::Acquire) {
+                    drop(q);
+                    if unsynced > 0 {
+                        s.journal.sync();
+                    }
+                    return;
+                }
+                #[cfg(test)]
+                if !q.is_empty() && s.panic_next.swap(false, Ordering::AcqRel) {
+                    panic!("test: a response worker panics");
+                }
+                if let Some(t) = q.take(s.now_ns()) {
+                    break t;
+                }
+                // nothing free: this worker's rows to the disk, then wait
+                if unsynced > 0 {
+                    drop(q);
+                    s.journal.sync();
+                    unsynced = 0;
+                    q = s.queue.lock();
+                    continue;
+                }
+                if spare && s.spares.load(Ordering::Acquire) > s.stalled_now.load(Ordering::Acquire)
+                {
+                    // the stall it stood in for is over
+                    s.spares.fetch_sub(1, Ordering::AcqRel);
                     return;
                 }
                 let _ = s.ready.wait_for(&mut q, Duration::from_millis(500));
-                if q.is_empty() && overflow_due(s) {
+                if overflow_due(s) {
                     drop(q);
                     write_overflow(s, false);
                     q = s.queue.lock();
                 }
             }
-            #[cfg(test)]
-            if s.panic_next.swap(false, Ordering::AcqRel) {
-                panic!("test: the response dispatcher's thread panics");
-            }
-            s.busy.store(true, Ordering::Release);
-            let now = s.now_ns();
-            std::iter::from_fn(|| q.take(now)).take(BATCH).collect()
         };
+        s.active.fetch_add(1, Ordering::AcqRel);
         #[cfg(test)]
         drop(s.hold.lock());
-        let intents = s.journal.intents(
-            batch
-                .iter()
-                .map(|t| t.job.intent(t.severity, t.waited_ns))
-                .collect(),
-        );
-        // the processes a kill of this batch killed
-        let mut killed: Vec<(u32, u64)> = Vec::new();
-        for (t, intent) in batch.into_iter().zip(intents) {
-            let key = (t.job.pid, t.job.start_ns);
-            let report = if t.job.superseded_by_kill() && killed.contains(&key) {
-                // behind its process's kill in this batch, and the kill
-                // killed: its intent answered, not run
-                s.superseded_in_batch.fetch_add(1, Ordering::Relaxed);
-                intent.finish_deferred(
-                    ActionResult::NotRun,
-                    format!("{:?} pid {}: not run", t.job.action, t.job.pid),
-                    Some(NOT_RUN_SUPERSEDED.to_string()),
-                );
-                t.job.not_run(NOT_RUN_SUPERSEDED)
-            } else {
-                run_one(s, &t.job, intent)
-            };
+        let key = t.job.pid;
+        let intent = s.journal.intent(t.job.intent(t.severity, t.waited_ns));
+        slot.action.store(intent.number(), Ordering::Relaxed);
+        *slot.what.lock() = t.job.sample();
+        slot.since_ns.store(s.now_ns().max(1), Ordering::Release);
+        let report = run_one(s, &t.job, intent);
+        slot.since_ns.store(0, Ordering::Release);
+        if slot.stalled.swap(false, Ordering::AcqRel) {
+            s.stalled_now.fetch_sub(1, Ordering::AcqRel);
+            info!(what = %slot.what.lock(), "a stalled response action ended");
+        }
+        unsynced += 1;
+        let gone = {
+            let mut q = s.queue.lock();
+            q.done(&key);
             if t.job.is_kill() && killed_it(&report) {
                 // the re-check of #476: only a kill that killed supersedes
                 // its process's throttles and blocks still queued
-                killed.push(key);
-                let gone = s.queue.lock().supersede(&key);
-                for job in gone {
-                    for (d, slot) in &job.answers {
-                        answer(d, *slot, job.not_run(NOT_RUN_SUPERSEDED), &s.followups);
-                    }
-                }
+                q.supersede(&key, &t.job)
+            } else {
+                Vec::new()
             }
-            for (d, slot) in &t.job.answers {
-                answer(d, *slot, report.clone(), &s.followups);
+        };
+        s.ready.notify_all();
+        for job in gone {
+            for (d, slot) in &job.answers {
+                answer(d, *slot, job.not_run(NOT_RUN_SUPERSEDED), &s.followups);
             }
         }
-        s.journal.sync();
-        s.busy.store(false, Ordering::Release);
+        for (d, n) in &t.job.answers {
+            answer(d, *n, report.clone(), &s.followups);
+        }
+        s.active.fetch_sub(1, Ordering::AcqRel);
+        if unsynced >= SYNC_EVERY {
+            s.journal.sync();
+            unsynced = 0;
+        }
         if overflow_due(s) {
             write_overflow(s, false);
+        }
+    }
+}
+
+/// R12c-3: the stall watch — an action running past the stall bound is
+/// signed (`stalled` row: its intent's number, what, how long),
+/// WARNed, counted, raises `TelemetryLoss`, and gets a spare worker, so
+/// the other processes' responses do not wait behind it (at most one spare
+/// per stalled action, at most the pool's size of them).
+fn watch_stalls(s: &Arc<Shared>) {
+    while !s.stop.load(Ordering::Acquire) {
+        std::thread::park_timeout(STALL_WATCH_EVERY);
+        let now = s.now_ns();
+        let slots: Vec<Arc<Slot>> = s.slots.lock().clone();
+        for slot in slots {
+            let since = slot.since_ns.load(Ordering::Acquire);
+            if since == 0 || now.saturating_sub(since) < s.stall_after.as_nanos() as u64 {
+                continue;
+            }
+            if slot.stalled.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            let busy = Duration::from_nanos(now.saturating_sub(since));
+            let what = slot.what.lock().clone();
+            let action = slot.action.load(Ordering::Relaxed);
+            s.stalled_now.fetch_add(1, Ordering::AcqRel);
+            s.stalled.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                action,
+                what = %what,
+                secs = busy.as_secs(),
+                "a response action is still running past the stall bound — signed, a spare \
+                 worker takes the other responses"
+            );
+            s.journal.stalled(action, &what, busy);
+            if let Some(p) = &s.posture {
+                let reason = format!("a response action stalled ({what}, {} s)", busy.as_secs());
+                if let Some(state) =
+                    p.raise_signal(nn_model::posture_types::TriggerType::TelemetryLoss, &reason)
+                {
+                    warn!(state = %state.kind(), trigger = "TelemetryLoss", "POSTURE TRANSITION");
+                }
+            }
+            if s.spares.load(Ordering::Acquire) < s.workers
+                && s.spares.load(Ordering::Acquire) < s.stalled_now.load(Ordering::Acquire)
+            {
+                let n = s.spares.fetch_add(1, Ordering::AcqRel);
+                if !spawn_worker(s, format!("nn-response-s{n}"), true) {
+                    s.spares.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            s.ready.notify_all();
         }
     }
 }
@@ -811,6 +1047,19 @@ fn killed_it(report: &ExecutionReport) -> bool {
 /// itself abandoned — and the response reads failed.
 fn run_one(s: &Shared, job: &ResponseJob, intent: Intent) -> ExecutionReport {
     let started = Instant::now();
+    #[cfg(test)]
+    while s.hang_pids.lock().contains(&job.pid) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    #[cfg(feature = "debug-trigger")]
+    if s.hang_next_action.swap(false, Ordering::AcqRel) {
+        warn!(
+            pid = job.pid,
+            "debug-trigger: this action hangs past the stall bound before it acts (lab test of \
+             R12c-3: a stalled action, signed, the other responses not held)"
+        );
+        std::thread::sleep(s.stall_after + Duration::from_secs(5));
+    }
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         s.executor.execute_for_started(
             job.action.clone(),

@@ -166,6 +166,8 @@ pub struct Recovery {
     /// Each intent of an earlier run without an outcome: its run, number,
     /// response and target, as answered by an interrupted row.
     pub interrupted: Vec<String>,
+    /// The same: (run, action, what), for [`ActionJournal::start_run`].
+    pub open: Vec<(String, u64, String)>,
     /// Why the scan could not read the chain (`None`: it read it).
     pub unread: Option<String>,
 }
@@ -227,25 +229,41 @@ impl ActionJournal {
     /// outcome is answered by an [`ActionRow::Interrupted`] row and WARNed.
     pub fn bind(&self, log: Log, active: &Path) -> Recovery {
         let mut recovery = Recovery::default();
-        let rows = match read_rows(active) {
+        let rows = match read_back(active) {
             Ok(rows) => rows,
             Err(e) => {
                 recovery.unread = Some(e);
                 Vec::new()
             }
         };
-        let mut w = self.inner.writer.lock();
-        *w = Writer::Log(Box::new(log));
+        *self.inner.writer.lock() = Writer::Log(Box::new(log));
         for open in unanswered_intents(&rows, &self.inner.run) {
             let what = open
                 .intent
                 .as_ref()
                 .map(|i| format!("{} pid {} ({})", i.response, i.pid, i.why.join(", ")))
                 .unwrap_or_else(|| "an action".to_string());
+            recovery
+                .interrupted
+                .push(format!("run {} action {}: {what}", open.run, open.action));
+            recovery.open.push((open.run.clone(), open.action, what));
+        }
+        recovery
+    }
+
+    /// R12c-3: the run's start, once the boot signed its audit row of
+    /// `recovery` (`response_interrupted`): each open intent of an earlier
+    /// run answered by an interrupted row (WARNed, counted), then this
+    /// run's `run_started` row. A crash before this leaves the intents
+    /// open: the next start reports them again — the audit row is never
+    /// missing for an interrupted row (the re-check of #476).
+    pub fn start_run(&self, recovery: &Recovery) {
+        let mut w = self.inner.writer.lock();
+        for (run, action, what) in &recovery.open {
             let row = ActionRecord {
                 row: ActionRow::Interrupted,
-                run: open.run.clone(),
-                action: open.action,
+                run: run.clone(),
+                action: *action,
                 ts: nn_evidence::clock::stamp(self.inner.clock.as_ref()),
                 intent: None,
                 outcome: Some(ActionOutcome {
@@ -261,9 +279,9 @@ impl ActionJournal {
                 noted_by: Some(self.inner.run.clone()),
             };
             warn!(
-                run = %open.run,
-                action = open.action,
-                what = %Escaped(&what),
+                run = %run,
+                action = *action,
+                what = %Escaped(what),
                 "an action of an earlier run has its intent and no outcome: the agent stopped \
                  between the two — whether it took effect is not known (signed interrupted row)"
             );
@@ -272,12 +290,59 @@ impl ActionJournal {
                 .interrupted
                 .fetch_add(1, Ordering::Relaxed);
             write_row(&mut w, &self.inner.counters, row);
-            recovery
-                .interrupted
-                .push(format!("run {} action {}: {what}", open.run, open.action));
         }
+        let started = self.run_row(ActionRow::RunStarted);
+        write_row(&mut w, &self.inner.counters, started);
         self.commit(w);
-        recovery
+    }
+
+    /// R12c-3: the run's last row, at a clean stop (synced).
+    pub fn end_run(&self) {
+        let mut w = self.inner.writer.lock();
+        let ended = self.run_row(ActionRow::RunEnded);
+        write_row(&mut w, &self.inner.counters, ended);
+        self.commit(w);
+    }
+
+    /// R12c-3: action `action` still running after `busy` (the stall
+    /// bound): a signed `stalled` row — not its answer; its outcome row
+    /// comes when it ends.
+    pub fn stalled(&self, action: u64, what: &str, busy: std::time::Duration) {
+        let row = ActionRecord {
+            row: ActionRow::Stalled,
+            run: self.inner.run.clone(),
+            action,
+            ts: nn_evidence::clock::stamp(self.inner.clock.as_ref()),
+            intent: None,
+            outcome: Some(ActionOutcome {
+                result: ActionResult::Unknown,
+                outcome: format!("{what}: still running"),
+                reason: Some(format!(
+                    "running for {} s, past the stall bound",
+                    busy.as_secs()
+                )),
+                elapsed_us: busy.as_micros() as u64,
+                intent_written: true,
+            }),
+            overflow: None,
+            noted_by: None,
+        };
+        let mut w = self.inner.writer.lock();
+        write_row(&mut w, &self.inner.counters, row);
+        self.commit(w);
+    }
+
+    fn run_row(&self, row: ActionRow) -> ActionRecord {
+        ActionRecord {
+            row,
+            run: self.inner.run.clone(),
+            action: 0,
+            ts: nn_evidence::clock::stamp(self.inner.clock.as_ref()),
+            intent: None,
+            outcome: None,
+            overflow: None,
+            noted_by: None,
+        }
     }
 
     /// The log could not be opened (`why`): every row from now on is logged
@@ -601,6 +666,52 @@ fn write_row(w: &mut Writer, counters: &Counters, row: ActionRecord) -> bool {
 /// (each file's last [`SCAN_BYTES`]). Decoded only: the chain's own checks
 /// (the boot check, `nn-admin chain verify`) prove them; the scan only
 /// pairs intents with their answers.
+/// R12c-3: the rows the start's scan needs — the newest archive and the
+/// active file, and, when the last run there has neither its `run_ended`
+/// (a clean stop) nor its `run_started` (it crashed: its start is further
+/// back), the older archives one by one until its `run_started` (the
+/// review of #476: an intent more than one rotation back). Bounded by the
+/// archives kept.
+fn read_back(active: &Path) -> Result<Vec<ActionRecord>, String> {
+    let archives = crate::chainlog::archives_newest_first(active);
+    let mut rows = read_file(active)?;
+    for (n, a) in archives.iter().enumerate() {
+        if n >= 1 {
+            let last_run = rows.last().map(|r| r.run.clone());
+            let complete = last_run.is_none_or(|run| {
+                rows.iter().any(|r| {
+                    r.run == run && matches!(r.row, ActionRow::RunStarted | ActionRow::RunEnded)
+                })
+            });
+            if complete {
+                break;
+            }
+        }
+        let mut older = read_file(a)?;
+        older.append(&mut rows);
+        rows = older;
+    }
+    Ok(rows)
+}
+
+/// The rows of one file of the chain (its last [`SCAN_BYTES`]); none when
+/// it is not there.
+fn read_file(f: &Path) -> Result<Vec<ActionRecord>, String> {
+    let bytes = match read_tail(f) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", f.display())),
+    };
+    Ok(bytes
+        .split(|b| *b == b'\n')
+        .filter_map(|line| {
+            serde_json::from_slice::<crate::chainlog::ChainLine<ActionRecord>>(line).ok()
+        })
+        .map(|l| l.payload)
+        .collect())
+}
+
+#[cfg(test)]
 fn read_rows(active: &Path) -> Result<Vec<ActionRecord>, String> {
     let mut files: Vec<std::path::PathBuf> = crate::chainlog::archives_newest_first(active)
         .into_iter()
@@ -811,14 +922,17 @@ mod tests {
         // run 1: one action answered, one cut short (the process "dies":
         // the ticket is leaked, as a SIGKILL leaves it)
         let first = ActionJournal::late();
-        assert_eq!(first.bind(open(key()), &active), Recovery::default());
+        let rec = first.bind(open(key()), &active);
+        assert_eq!(rec, Recovery::default());
+        first.start_run(&rec);
         first.intent(intent_row("KillProcess", 100)).finish(
             ActionResult::Success,
             "Killed".into(),
             None,
         );
         std::mem::forget(first.intent(intent_row("KillProcessTree", 200)));
-        // run 2: the start answers it
+        // run 2: the start finds it; the boot signs its audit row, then the
+        // run's start answers it
         let second = ActionJournal::late();
         let rec = second.bind(open(key()), &active);
         assert_eq!(rec.interrupted.len(), 1, "{rec:?}");
@@ -826,18 +940,90 @@ mod tests {
             rec.interrupted[0].contains("KillProcessTree pid 200"),
             "{rec:?}"
         );
+        assert_eq!(second.counts().interrupted_at_boot, 0, "not answered yet");
+        second.start_run(&rec);
         assert_eq!(second.counts().interrupted_at_boot, 1);
+        second.end_run();
         // run 3: nothing left unanswered
         let third = ActionJournal::late();
         assert_eq!(third.bind(open(key()), &active), Recovery::default());
-        // the chain holds intent, outcome, intent, interrupted (+ run 2's
-        // own rows: none)
+        // the chain: run 1's start, intent, outcome, intent; run 2's
+        // interrupted row, its start, its end
         let rows = read_rows(&active).unwrap();
         let kinds: Vec<ActionRow> = rows.iter().map(|r| r.row).collect();
         use ActionRow::*;
-        assert_eq!(kinds, [Intent, Outcome, Intent, Interrupted]);
-        assert_eq!(rows[3].noted_by.as_deref(), Some(second.run()));
-        assert_eq!(rows[3].run, rows[2].run);
+        assert_eq!(
+            kinds,
+            [
+                RunStarted,
+                Intent,
+                Outcome,
+                Intent,
+                Interrupted,
+                RunStarted,
+                RunEnded
+            ]
+        );
+        assert_eq!(rows[4].noted_by.as_deref(), Some(second.run()));
+        assert_eq!(rows[4].run, rows[3].run);
+        assert_eq!(rows[5].run, second.run());
+    }
+
+    /// R12c-3: a run that crashed before its start answered the open
+    /// intents (after the boot's audit row) leaves them open — the next
+    /// start finds them again; never an interrupted row without its audit
+    /// row.
+    #[test]
+    fn a_crash_before_the_run_started_leaves_the_intents_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("actions.jsonl");
+        let key_path = dir.path().join("k");
+        let first = ActionJournal::late();
+        let rec = first.bind(log_at(&active, &key_path, u64::MAX), &active);
+        first.start_run(&rec);
+        std::mem::forget(first.intent(intent_row("KillProcessTree", 300)));
+        let second = ActionJournal::late();
+        let rec = second.bind(log_at(&active, &key_path, u64::MAX), &active);
+        assert_eq!(rec.interrupted.len(), 1);
+        // (the second run dies here, before `start_run`)
+        let third = ActionJournal::late();
+        let rec = third.bind(log_at(&active, &key_path, u64::MAX), &active);
+        assert_eq!(rec.interrupted.len(), 1, "still open: {rec:?}");
+    }
+
+    /// R12c-3 (the review of #476): a run that crashed with its intent
+    /// more than one rotation back — the start reads back to that run's
+    /// `run_started`, however many archives ago.
+    #[test]
+    fn an_intent_two_rotations_back_is_found_at_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("actions.jsonl");
+        let key_path = dir.path().join("k");
+        let first = ActionJournal::late();
+        let rec = first.bind(log_at(&active, &key_path, 16 * 1024), &active);
+        first.start_run(&rec);
+        std::mem::forget(first.intent(intent_row("KillProcessTree", 400)));
+        let mut pid = 2000;
+        while crate::chainlog::archives_newest_first(&active).len() < 3 {
+            first.intent(intent_row("KillProcess", pid)).finish(
+                ActionResult::Success,
+                "Killed".into(),
+                None,
+            );
+            pid += 1;
+        }
+        let second = ActionJournal::late();
+        let rec = second.bind(log_at(&active, &key_path, 16 * 1024), &active);
+        assert_eq!(rec.interrupted.len(), 1, "{rec:?}");
+        assert!(rec.interrupted[0].contains("KillProcessTree pid 400"));
+        // a run that ended cleanly: its start not looked for further back
+        second.start_run(&rec);
+        second.end_run();
+        let third = ActionJournal::late();
+        assert_eq!(
+            third.bind(log_at(&active, &key_path, 16 * 1024), &active),
+            Recovery::default()
+        );
     }
 
     fn log_at(active: &Path, key_path: &Path, cap: u64) -> Log {

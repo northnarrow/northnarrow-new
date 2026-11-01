@@ -44,6 +44,18 @@ pub enum ActionRow {
     /// Responses decided and never run: displaced or refused by the full
     /// queue, or still queued when the agent stopped (stage 6).
     Overflow,
+    /// R12c-3: an action still running past the stall bound (its intent's
+    /// `action`; `outcome.result` `unknown`, how long so far) — not an
+    /// answer: its outcome row still comes when it ends.
+    Stalled,
+    /// R12c-3: a run's first row, once the start answered the earlier
+    /// runs' open intents.
+    RunStarted,
+    /// R12c-3: a run's last row, at a clean stop. A run with a
+    /// `run_started` and no `run_ended` crashed: the next start reads back
+    /// to its `run_started` for its open intents, however many rotations
+    /// ago.
+    RunEnded,
 }
 
 /// What became of an action ([`ActionOutcome::result`]).
@@ -224,7 +236,10 @@ pub fn unanswered_intents<'a>(
             ActionRow::Outcome | ActionRow::Interrupted => {
                 answered.insert((r.run.clone(), r.action));
             }
-            ActionRow::Overflow => {}
+            ActionRow::Overflow
+            | ActionRow::Stalled
+            | ActionRow::RunStarted
+            | ActionRow::RunEnded => {}
         }
     }
     open.retain(|r| r.run != current && !answered.contains(&(r.run.clone(), r.action)));
@@ -289,6 +304,39 @@ mod tests {
             serde_json::to_string(&outcome("00112233aabbccdd", 7, ActionRow::Outcome)).unwrap(),
             r#"{"row":"outcome","run":"00112233aabbccdd","action":7,"ts":"2026-10-31T23:59:00.004000Z","outcome":{"result":"success","outcome":"Killed { pid: 4242 }","elapsed_us":4000}}"#
         );
+        // R12c-3: a stall, a run's start and end
+        let mut st = outcome("00112233aabbccdd", 9, ActionRow::Stalled);
+        {
+            let o = st.outcome.as_mut().unwrap();
+            o.result = ActionResult::Unknown;
+            o.outcome = "KillProcessTree pid 4242 (R001): still running".into();
+            o.reason = Some("running for 10 s, past the stall bound".into());
+            o.elapsed_us = 10_000_000;
+        }
+        assert_eq!(
+            serde_json::to_string(&st).unwrap(),
+            r#"{"row":"stalled","run":"00112233aabbccdd","action":9,"ts":"2026-10-31T23:59:00.004000Z","outcome":{"result":"unknown","outcome":"KillProcessTree pid 4242 (R001): still running","reason":"running for 10 s, past the stall bound","elapsed_us":10000000}}"#
+        );
+        for (row, name) in [
+            (ActionRow::RunStarted, "run_started"),
+            (ActionRow::RunEnded, "run_ended"),
+        ] {
+            let mut r = outcome("00112233aabbccdd", 0, row);
+            r.outcome = None;
+            assert_eq!(
+                serde_json::to_string(&r).unwrap(),
+                format!(
+                    r#"{{"row":"{name}","run":"00112233aabbccdd","action":0,"ts":"2026-10-31T23:59:00.004000Z"}}"#
+                )
+            );
+        }
+        // a stall answers nothing; nor does a run's start or end
+        let open = [
+            intent("aa", 1),
+            outcome("aa", 1, ActionRow::Stalled),
+            outcome("aa", 0, ActionRow::RunStarted),
+        ];
+        assert_eq!(unanswered_intents(&open, "bb").len(), 1);
         // the re-check of #476: an outcome whose intent is not in the chain
         let mut gap = outcome("00112233aabbccdd", 9, ActionRow::Outcome);
         gap.outcome.as_mut().unwrap().intent_written = false;
