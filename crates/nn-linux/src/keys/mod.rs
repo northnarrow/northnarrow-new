@@ -786,6 +786,25 @@ mod tests {
         (dir, key_path, log_path)
     }
 
+    /// R14c: a reader that verifies takes the key's public half — the
+    /// key's own when it can be read, the published half when the key file
+    /// cannot be (the hooks close it to a restarting instance; here a file
+    /// that does not parse) — and no key is `None`, not an error.
+    #[test]
+    fn the_public_half_of_a_key_of_an_unreadable_key_and_of_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key_path = dir.path().join("agent.sig.key");
+        assert_eq!(public_half(&key_path), Ok(None), "no key");
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let half = key.verifying_key();
+        assert_eq!(public_half(&key_path), Ok(Some(half)));
+        fs::remove_file(&key_path).unwrap();
+        fs::write(&key_path, "not a key").unwrap();
+        assert_eq!(public_half(&key_path), Ok(Some(half)), "the published half");
+        fs::remove_file(verifying_key_path(&key_path)).unwrap();
+        assert!(public_half(&key_path).is_err(), "neither readable");
+    }
+
     /// External audit EVD-001: the agent publishes the public half next to
     /// its key (0444), rewrites it when it says something else, and a
     /// reader gets the same verifying key from it.

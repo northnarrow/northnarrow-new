@@ -120,7 +120,10 @@ fn the_core_s_threads_get_the_core_s_set() {
         .find("nn_linux::caps::errands::start()")
         .expect("the errands thread started");
     let attach = boot.find("attach::load(").expect("the attach phase");
-    assert!(errands < attach, "the errands thread starts before the attach");
+    assert!(
+        errands < attach,
+        "the errands thread starts before the attach"
+    );
 }
 
 /// What the decision's filter refuses it is its errands: the rpm query

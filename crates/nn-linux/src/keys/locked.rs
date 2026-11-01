@@ -104,16 +104,26 @@ impl<T> Drop for Locked<T> {
         // mapping is unlocked and unmapped (nothing refers to it after).
         unsafe {
             std::ptr::drop_in_place(self.ptr.as_ptr());
-            for i in 0..self.map_len {
-                std::ptr::write_volatile(base.add(i), 0u8);
-            }
-            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+            wipe(base, self.map_len);
             if self.locked {
                 libc::munlock(base.cast(), self.map_len);
             }
             libc::munmap(base.cast(), self.map_len);
         }
     }
+}
+
+/// Every byte of `len` bytes at `base` zeroed, with volatile writes the
+/// compiler cannot elide.
+///
+/// # Safety
+/// `base` points to `len` writable bytes.
+unsafe fn wipe(base: *mut u8, len: usize) {
+    for i in 0..len {
+        // SAFETY: within the `len` writable bytes the caller vouches for.
+        unsafe { std::ptr::write_volatile(base.add(i), 0u8) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 impl<T> std::fmt::Debug for Locked<T> {
@@ -166,6 +176,21 @@ mod tests {
             assert!(vm_flags.contains(" lo"), "{vm_flags}");
         }
         drop(l);
+    }
+
+    /// The drop's wipe: every byte zeroed (the mapping's own bytes cannot
+    /// be read after its unmap; the wipe is the same code on a buffer).
+    #[test]
+    fn the_wipe_zeroes_every_byte() {
+        let mut buf = [0xa5u8; 4096 + 3];
+        // SAFETY: the buffer's own bytes.
+        unsafe { wipe(buf.as_mut_ptr(), buf.len()) };
+        assert!(buf.iter().all(|b| *b == 0));
+        let mut part = [0x5au8; 16];
+        // SAFETY: the first 8 of the buffer's bytes.
+        unsafe { wipe(part.as_mut_ptr(), 8) };
+        assert_eq!(part[..8], [0u8; 8]);
+        assert_eq!(part[8..], [0x5au8; 8]);
     }
 
     #[test]

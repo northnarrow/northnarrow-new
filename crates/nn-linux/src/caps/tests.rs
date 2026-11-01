@@ -225,6 +225,18 @@ fn a_role_s_effective_set_is_exactly_its_own_and_the_core_s_comes_back() {
         if !all.contains(cap::BPF) || !all.contains(cap::SYS_ADMIN) {
             return 98; // a namespace without every capability: nothing to measure
         }
+        // an inheritable set left by whoever started the thread (the
+        // namespace's owner holds CAP_SETPCAP): a role leaves none
+        let held = this_thread().unwrap();
+        if set_this_thread(ThreadCaps {
+            inheritable: CapSet::of(&[cap::KILL, cap::BPF]),
+            ..held
+        })
+        .is_err()
+            || this_thread().map(|t| t.inheritable).ok() != Some(CapSet::of(&[cap::KILL, cap::BPF]))
+        {
+            return 14;
+        }
         // the actuator: its set effective, the rest permitted
         let e = match enter(Role::Actuator) {
             Ok(e) => e,
@@ -234,7 +246,7 @@ fn a_role_s_effective_set_is_exactly_its_own_and_the_core_s_comes_back() {
         {
             return 2;
         }
-        if !e.missing.is_empty() || e.filter.is_some() {
+        if !e.missing.is_empty() || e.filter.is_some() || !e.after.inheritable.is_empty() {
             return 3;
         }
         // a thread it starts has its set; the core's back with restore_core

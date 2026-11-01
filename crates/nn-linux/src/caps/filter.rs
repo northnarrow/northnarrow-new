@@ -78,14 +78,10 @@ pub fn program() -> io::Result<BpfProgram> {
     BpfProgram::try_from(filter).map_err(invalid)
 }
 
-/// `PR_SET_NO_NEW_PRIVS` (the unit sets it for the process; a run outside
-/// it needs it for a filter without `CAP_SYS_ADMIN`), then the filter, on
-/// the calling thread only.
+/// The filter, on the calling thread only. `seccompiler::apply_filter`
+/// sets `PR_SET_NO_NEW_PRIVS` first (the unit sets it for the process; a
+/// run outside it needs it for a filter without `CAP_SYS_ADMIN`).
 pub fn install_decision() -> io::Result<()> {
-    // SAFETY: prctl with integer arguments.
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
     let prog = program()?;
     seccompiler::apply_filter(&prog).map_err(|e| io::Error::other(e.to_string()))
 }

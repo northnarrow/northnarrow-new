@@ -365,3 +365,33 @@ pub(crate) fn open_v2(
         .map_err(|e| std::io::Error::other(format!("decrypt: {e}")))?;
     Ok(Zeroizing::new(plaintext))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R14c: the master key is read once, at the vault's first use, and
+    /// held: a record sealed then still opens after the file is gone (a
+    /// vault that read the file again would make a new key and refuse it),
+    /// and the key is locked and out of the dumps when the kernel lets it.
+    #[test]
+    fn the_master_key_is_read_once_and_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("master.key");
+        let vault = Vault::at(&path);
+        assert_eq!(vault.protected(), None, "nothing read before the first use");
+        let record = vault.seal_v2("q-1", &[7u8; NONCE_LEN], b"payload").unwrap();
+        assert!(path.exists(), "the key made at the first use");
+        let (_, dontdump) = vault.protected().expect("held");
+        assert!(dontdump);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(&*vault.open("q-1", &record).unwrap(), b"payload");
+        // a clone shares the key it holds
+        let twin = vault.clone();
+        assert_eq!(&*twin.open("q-1", &record).unwrap(), b"payload");
+        assert!(!path.exists(), "not read, not made again");
+        // another vault on the same path reads the file it finds: a new key
+        let other = Vault::at(&path);
+        assert!(other.open("q-1", &record).is_err());
+    }
+}
