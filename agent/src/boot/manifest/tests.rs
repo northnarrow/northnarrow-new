@@ -92,6 +92,12 @@ fn inputs(bpf_lsm: BpfLsm, self_test: SelfTestOutcome) -> Inputs {
         probe: None,
         probe_every: None,
         content: None,
+        pumps: Some(
+            nn_linux::sensors::contract::SOURCES
+                .iter()
+                .map(|s| s.source.to_string())
+                .collect(),
+        ),
     }
 }
 

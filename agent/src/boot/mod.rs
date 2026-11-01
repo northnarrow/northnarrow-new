@@ -487,6 +487,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         sensor.attach_points(),
         &telemetry_probe,
         &overlay_gate,
+        sensor.pump_labels(),
     )?;
     // R12c-2 (lab PR 270): the signed heartbeat, once the agent is armed —
     // its `start` beat first, then one every interval; the stop writes its

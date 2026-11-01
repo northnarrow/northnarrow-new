@@ -32,6 +32,7 @@ pub(crate) fn arm(
     attach_points: &northnarrow_agent::boot::manifest::AttachPoints,
     telemetry_probe: &Option<northnarrow_agent::telemetry_probe::TelemetryProbe>,
     overlay_gate: &std::sync::Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    pumps: Vec<&'static str>,
 ) -> Result<Armed> {
     // Lab PR 218 (external review G-12): every attach of this boot is done.
     // The capability manifest — kernel, BTF, LSMs, deny hooks, self-test,
@@ -99,6 +100,7 @@ pub(crate) fn arm(
             probe: telemetry_probe.clone(),
             probe_every: northnarrow_agent::telemetry_probe::interval_from_env(),
             content: Some(std::sync::Arc::clone(overlay_gate)),
+            pumps: Some(pumps.iter().map(|p| p.to_string()).collect()),
         };
         capability_manifest.arm(audit_log.as_ref(), inputs);
         match capability_manifest.current() {

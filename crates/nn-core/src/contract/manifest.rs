@@ -233,6 +233,9 @@ pub struct SourceFacts {
     pub degradations: Vec<(String, String)>,
     /// The sources whose adapter ended.
     pub terminated: Vec<String>,
+    /// The sources whose pump or drain the start registered (`None`: not
+    /// known): one on its attach point without it reads nothing.
+    pub running: Option<Vec<String>>,
 }
 
 impl SourceFacts {
@@ -352,6 +355,17 @@ fn source_entry(
         // a note the contract does not know: not its attach point
         (None, Some(n)) => (n.to_string(), AttachedOn::Fallback, SourceState::Ok),
     };
+    // attached, and nothing reads its ring: its pump or drain did not start
+    // (a fallback is another source's adapter, a standby one's or none)
+    if on == AttachedOn::Primary
+        && facts
+            .running
+            .as_ref()
+            .is_some_and(|r| !r.iter().any(|x| x == c.source))
+    {
+        state = SourceState::Unavailable;
+        why.push("its pump or drain did not start: nothing reads its ring".to_string());
+    }
     let lsm_hook_runs_here = on == AttachedOn::Primary && c.needs_bpf_lsm;
     if lsm_hook_runs_here && facts.lsm_runs == Some(false) {
         state = SourceState::AttachedNotInvoked;

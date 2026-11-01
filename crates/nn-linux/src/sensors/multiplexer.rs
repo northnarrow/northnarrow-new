@@ -780,6 +780,13 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         self.pumps.push((label, Pump::Thread(pump)));
     }
 
+    /// R13 (lab PR 271): the labels of every pump and drain registered (the
+    /// capability manifest's sources whose adapter runs; a source on its
+    /// attach point without one reads nothing).
+    pub fn pump_labels(&self) -> Vec<&'static str> {
+        self.pumps.iter().map(|(l, _)| *l).collect()
+    }
+
     /// External audit SNS-001: the labels of the telemetry tasks that have
     /// ended (returned, failed or panicked). They never end while the agent
     /// runs, so any entry is a sensor gone blind. `next_event()` cannot

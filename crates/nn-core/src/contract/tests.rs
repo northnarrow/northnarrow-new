@@ -148,6 +148,7 @@ fn healthy() -> SourceFacts {
         ],
         degradations: Vec::new(),
         terminated: Vec::new(),
+        running: None,
     }
 }
 
@@ -538,6 +539,38 @@ fn a_change_is_named_line_by_line() {
         other.changes_from(&before),
         ["the manifest changed (nn-admin capabilities shows it)"]
     );
+}
+
+/// A source on its attach point whose pump or drain the start did not
+/// register reads nothing: unavailable, with why; one on a fallback, off or
+/// standby is not judged by it, and an unknown list judges nothing.
+#[test]
+fn a_source_without_its_pump_is_unavailable() {
+    let mut f = healthy();
+    f.running = Some(vec!["fs_protect".into(), "exploit_guard".into()]);
+    let e = source_entries(&sample(), &f);
+    let dns = entry(&e, "dns_query");
+    assert_eq!(dns.state, SourceState::Unavailable);
+    assert!(
+        dns.why.iter().any(|w| w.contains("did not start")),
+        "{dns:?}"
+    );
+    assert_eq!(entry(&e, "fs_protect").state, SourceState::Ok);
+    assert_eq!(entry(&e, "file_open").state, SourceState::Standby);
+    f.notes[0] = note(
+        "file_open",
+        "tracepoint:syscalls/sys_enter_openat (user memory)",
+    );
+    let e = source_entries(&sample(), &f);
+    assert_eq!(
+        entry(&e, "open_sensor").state,
+        SourceState::Ok,
+        "on its fallback"
+    );
+    let mut f = healthy();
+    f.running = None;
+    let e = source_entries(&sample(), &f);
+    assert_eq!(entry(&e, "dns_query").state, SourceState::Ok);
 }
 
 /// A fallback whose note begins as the attach point's (the process-spawn

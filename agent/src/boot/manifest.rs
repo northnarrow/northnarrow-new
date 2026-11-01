@@ -101,6 +101,8 @@ pub struct Inputs {
     /// The shipped lists given way to the copy built into the agent, or
     /// edited by hand (`report_builtin_defaults`, through the overlay gate).
     pub content: Option<Arc<crate::config::overlay_auth::OverlayGate>>,
+    /// The pumps and drains the start registered (`None`: not known).
+    pub pumps: Option<Vec<String>>,
 }
 
 /// Whether the BPF LSM programs run, and why not (`None`: not known).
@@ -152,6 +154,7 @@ fn build(inputs: &Inputs, terminated: &[String]) -> CapabilityManifest {
             .map(|d| (d.source, d.detail))
             .collect(),
         terminated: terminated.to_vec(),
+        running: inputs.pumps.clone(),
     };
     let contract = &nn_linux::sensors::contract::SOURCES;
     m.sources = source_entries(contract, &facts);
