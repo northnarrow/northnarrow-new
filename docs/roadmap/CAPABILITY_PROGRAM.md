@@ -4333,13 +4333,60 @@ only in the table below, in the same PR as the evidence.
     rewritten, B 2 of 2 for a source without its pump). Identity against
     `main` 973e3356 (one checkout path): the eBPF object 81c9df98… and
     `posture_demo` 909a38dc… (29 lines) the same.
+  - Review of #479 ("merge after two small fixes"), fixed in the lot:
+    X1 — a note was matched by its prefix and an unknown one read as a
+    fallback `ok` (12 of 16 deny hooks, the DNS sensor without IPv6 and a
+    worded failure of the exploit guard all read `ok`): the attach code
+    says how it took each attach point (`Took`: whole, partial with what is
+    missing, fallback, off, absent) and a source is `ok` only on its exact
+    attach point taken whole (or a kernel's other name, `also`) or an
+    equivalent fallback — `partial` and `unknown` otherwise; the deny hooks
+    not attached tested in `missing` (K5), the unknown branch never masking
+    an error (K8). X2 — a probe round that never started left `seen` in
+    place: the word goes `stale` (149 s at 60 s), a change, DEGRADED off the
+    host. The coordinator's: fallbacks that cover less `partial` with the
+    event kinds lost (open_sensor on the tracepoint: MassWrite, FileBurst,
+    DefenderSignal; exec_check: no exe identity, no guards); the lite
+    exploit guard without `bpf` `partial`; LSM opt-ins configured without
+    `bpf` said inert; `evidence` per source (probe, self_test,
+    attach_only); the capabilities hash without the terms, the build or the
+    kernel, `contract_hash` beside it (a NOTICE of the verifier's when it
+    changes alone); change rows at most once a minute, every change
+    counted, the terms by reference; the operator page says what the probe
+    does not hold against (an adaptive root) and the worst-case delays.
+    Found by the lab's round r2 and fixed: a healthy host's `fim_drain`
+    read `partial` (with the file-open sensor, `fim_file_open_sensor` is
+    the file_open observer: `fim::attach::observe_programs_missing`), and
+    the lab script removed its partial drop-in before the trusted-installer
+    window. Gates on 3914e4f8: 77 suites, 3,456 passed, 0 failed, 17
+    ignored, every gate (golden ×5, MSRV, fuzz 13, portable 5). Mutations:
+    set C 24 of 24 on 80977e1d (K5, K8, X1, X2, the fallbacks, the LSM's
+    part, the inert opt-ins, the evidence, the two hashes, the rows, the
+    stop's flush, the NOTICE), set D 3 of 3 (the FIM observers); 76 of 76
+    in the lot. Lab round r3 on 3914e4f8: 6.8 — 12 sources `ok` and
+    `file_open` `standby`, the same hash through two restarts, the probe
+    blinded and back, `open_sensor` `partial` on the tracepoint with its
+    lost kinds and back, the probe's rounds stopped (`stale`) and back,
+    each a DEGRADED off the host; a lab-only build that changes only a
+    term: the same capabilities hash, a NOTICE, no DEGRADED; 5.15 — the
+    normal phase again, then `lsm=` without `bpf`: the start refused and
+    signed, the degraded start at L0 (four sources not invoked;
+    `exec_check`, `open_sensor` and `exploit_guard` `partial`), DEGRADED
+    across the restart, restored to the hash before; test-ignored 82
+    suites, 97 passed, 0 failed on each guest. Both guests left clean and
+    off.
   - Open: the health class has no event yet; the probe exercises three
     sources (process spawn, file open, DNS), the ten others are judged from
-    their attach, the LSM's state and their pump only, and the deny
-    self-test exercises one deny hook (`task_kill`) of sixteen; the opt-in
+    their attach, the LSM's state and their pump only (`evidence:
+    attach_only`), and the deny self-test exercises one deny hook
+    (`task_kill`) of sixteen — R13's follow-ups: a loopback `connect()`, a
+    harmless `bpf()`, an `io_uring_setup`, a FIM write and a second deny
+    hook in the probe; a periodic check that the BPF links are still
+    attached; `/sys/kernel/debug/kprobes/enabled` protected; a probe child
+    harder to recognise; the opt-in
     connect deny's fail-open is not counted (no `DENY_FAIL_OPEN` slot: an
     eBPF change); a FIM or network drain that does not start is not a
-    registry degradation (the manifest says `unavailable`); each revision
-    repeats the contract's terms (about 17 KiB a row); the verifier's
-    "across a restart" is named from the run of the last settled hash it
-    kept.
+    registry degradation (the manifest says `unavailable`); the boot's row
+    carries the contract's terms (about 17 KiB), a change's row names them
+    by `contract_hash`; the verifier's "across a restart" is named from the
+    run of the last settled hash it kept.
