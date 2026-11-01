@@ -302,3 +302,79 @@ fn a_privileged_or_grouped_caller_is_refused() {
         ));
     }
 }
+
+static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// A TCP connect to 127.0.0.1:`PORT`: 0 through, 1 `EACCES`, 2 another
+/// error.
+fn connect_local() -> i32 {
+    // SAFETY: plain syscalls on our own socket and a local address.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        let sa = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: PORT.load(std::sync::atomic::Ordering::SeqCst).to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from(std::net::Ipv4Addr::LOCALHOST).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        let rc = libc::connect(
+            fd,
+            &sa as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as u32,
+        );
+        libc::close(fd);
+        if rc == 0 {
+            0
+        } else if io::Error::last_os_error().raw_os_error() == Some(libc::EACCES) {
+            1
+        } else {
+            2
+        }
+    }
+}
+
+/// Signal 0 to the parent: 0 through, 1 `EPERM`, 2 another error.
+fn signal_parent() -> i32 {
+    // SAFETY: an existence probe of our parent.
+    if unsafe { libc::kill(libc::getppid(), 0) } == 0 {
+        0
+    } else if io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+        1
+    } else {
+        2
+    }
+}
+
+/// Landlock's network and scope rights, where the kernel has them: a TCP
+/// connect to a listener of this process (ABI ≥ 4) and a signal to it
+/// (ABI ≥ 6) are refused in a restricted child, and go through without
+/// the ruleset.
+#[test]
+fn landlock_denies_tcp_and_signals_where_the_kernel_has_them() {
+    let abi = kernel_landlock_abi();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    PORT.store(
+        listener.local_addr().unwrap().port(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let s = in_child(
+        || {
+            let mut level = SandboxLevel::default();
+            landlock_restrict(&mut level).is_ok()
+        },
+        || connect_local() * 10 + signal_parent(),
+    );
+    assert!(libc::WIFEXITED(s), "status {s:#x}");
+    let code = libc::WEXITSTATUS(s);
+    assert_eq!(code / 10, i32::from(abi >= 4), "connect on ABI {abi}");
+    assert_eq!(code % 10, i32::from(abi >= 6), "signal on ABI {abi}");
+    // without the ruleset both go through
+    let s = in_child(|| true, || connect_local() * 10 + signal_parent());
+    assert!(
+        libc::WIFEXITED(s) && libc::WEXITSTATUS(s) == 0,
+        "status {s:#x}"
+    );
+    drop(listener);
+}
