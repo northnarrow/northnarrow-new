@@ -4218,3 +4218,128 @@ only in the table below, in the same PR as the evidence.
     threads; an explicit "pool exhausted" state (every worker and spare
     stalled); the stall counts not in the heartbeat yet (R12c-2's own PR);
     the ticket passed by value.
+- **Lab PR 271 — R13: the sensor contract and the signed capability
+  manifest's revisions (Wave 4 Phase 2, R13 of the restructure plan, §3.6;
+  report 06 INI-09, R4-01, EXP-37; MEDIUM risk; no level changes).**
+  - What was wrong: what each source of the event bus promised — where its
+    events come from, what decides before the operation completes, what
+    its failure means, what the kernel holds back, what its records cut,
+    where its losses are counted — was in comments and in the code's
+    constants, nowhere a test or an operator could read it whole. The
+    boot's capability manifest (lab PR 218) listed the attach notes and the
+    degradations once, at the boot; a sensor lost later, a fallback taken,
+    the telemetry probe's gap changed nothing signed in it; the status's
+    trust level and degradations were computed apart from it
+    (`trust_inputs`, the registry), the shipped lists given way to their
+    built-in copy (`report_builtin_defaults`) were rows of the overlay
+    gate's only; and a kernel without `bpf` in `lsm=` under the
+    degraded-mode opt-in left the exec and file-open sensors on LSM
+    programs that never run.
+  - What changed (`docs/operator/SENSOR_CONTRACT.md`, new;
+    `docs/architecture/EVENT_BUS.md` §2, §7; `BOOT_INTEGRITY.md` §2, §5, §6;
+    `HEARTBEAT.md`): the contract — nn-core's `contract` (`EventKind`, one
+    macro for the enum and its list; `SourceContract`; the class contracts
+    derived from the sources and the bus's queues and budgets; `check`:
+    every kind and class has its source; `bus::class_of` reads
+    `EventKind::class`), nn-linux's `sensors::contract::SOURCES` with the
+    thirteen sources' Linux values (the truncations made of the wire's
+    constants, the kernel budgets held to the eBPF programs' constants by
+    a test that reads them, the page held to the table by another); a test
+    of the agent's that reads the code's pumps, drains and attach notes:
+    each must have its entry. The manifest (`MANIFEST_VERSION` 2, its type
+    nn-core's `contract::manifest::CapabilityManifest`, the plan's §2.3):
+    each source's attach (primary, fallback, none), state (`ok`,
+    `standby`, `disabled_by_admin`, `attached_not_invoked`, `unavailable`,
+    `adapter_terminated`) and why, the probe's word, its terms; each
+    class; the fallbacks; what is missing or not invoked; the shipped
+    lists not in force from their file; the revision, its content hash
+    and the one before. `SignedManifest` builds it at the boot from the
+    boot's measurements (revision 0, `capability_manifest`) and again every
+    5 s, for each status and each beat: a change is signed as
+    `capability_manifest_change` with what changed; an adapter that ended
+    is a revision before the stop; a source on its attach point whose pump
+    did not start is `unavailable`. One truth: `status --key`'s trust level
+    and degradations and every beat's are the newest revision's (no
+    `trust_inputs` handle), `attest_degraded*` and every degradation feed
+    it through the registry (their `subsystem_degraded` rows as they were),
+    `report_builtin_defaults` through the overlay gate (`default_list_*`
+    rows as they were), the anti-tamper attach's report (the former
+    `take_degraded_boot_details`) through its deny section and notes. The
+    heartbeat carries `capabilities` (hash, revision, settled); `nn-admin
+    heartbeat watch` says DEGRADED when a settled hash changes — within a
+    run or across a restart —, when a run does not settle within 120 s, or
+    when the field goes. Without `bpf` in the active LSM list under the
+    opt-in, the exec and file-open sensors take their tracepoints, each
+    signed. Lab: `deploy/lab/contract/manifest-lab.sh` (normal, nobpf).
+  - Pins: the manifest's row (a change's, revision 1) and its content hash
+    (`the_manifest_row_and_its_hash_are_pinned`, nn-core); the heartbeat's
+    line with `capabilities` (`chain_kinds_pin`; the line without it
+    unchanged); the existing rows' formats (`subsystem_degraded`,
+    `default_list_*`, `agent_boot`) unchanged. nn-admin's matrix
+    regenerated: `status --key` prints a `capabilities` line (and its
+    fallbacks, what is missing, the last change), `status --json` a
+    `capabilities` object, `capabilities` the revision, the contract, the
+    sources, the classes, the fallbacks, what is missing and the content
+    (`contract: (none …)` for an older agent's manifest); a case with an R13
+    manifest added.
+  - Lab (our own QEMU guests under QEMU for Windows; the manifest lab,
+    `deploy/lab/contract/manifest-lab.sh`, with `nn-admin heartbeat watch`
+    run on the WSL host against the guest's beats). ubuntu2404 (6.8, main
+    973e3356 then the tip 574afb7b): the manifest 17.3 KiB, revision 0 at
+    the boot, revision 1 when the probe's first round settled it (`pending →
+    seen` on process_spawn, open_sensor, dns_query), 13 of 13 sources `ok`
+    (file_open `standby`), L3; the same hash (78ae2c74…) after two clean
+    restarts, no manifest alert; `debug-probe-blind dns`: revision 2
+    (`dns_query` attached, not invoked; probe gap) and DEGRADED off the host
+    25.7 s after the trigger, removed: revision 3, the hash before, DEGRADED
+    89.9 s after (a probe round is 48–72 s); EXP-13 and EXP-13e ×1 main vs
+    tip: 12,000 of 12,000 refused attempts accounted both, ring drops 0, P0
+    over budget 0 (main 3), 13e's capped and coalesced as main's; overhead
+    ×3 (medians), tip no worse than main on any workload (open +28.6 % vs
+    +31.2 %, exec +8.9 % vs +16.6 %, connect +12.3 % vs +33.5 %; the host
+    under gates and mutations for both); `tamper-check` as main's (72 OK,
+    C27 and C57c the known gaps, C64 the recorded deviation);
+    `test-ignored` 82 suites 97 passed 0 failed. ubuntu2204 (5.15, the
+    tip): the manifest (0c629a1f…), the same after two restarts, the probe
+    blinded and restored (DEGRADED 29.9 s and 58.7 s after); then `lsm=`
+    without `bpf` (the guest's grub drop-in, a reboot): every start refused
+    and signed (`agent_boot` refused, `refused_by: bpf_lsm`, four boots
+    while the guest came up), then the opt-in (a unit drop-in): the start
+    at L0 — `fs_protect`, `module_load`, `bpf_syscall`, `exploit_guard`
+    and `fim_drain` attached, not invoked (why: bpf not in the active LSM
+    list), `exec_check` and `open_sensor` on their tracepoints, `file_open`
+    carrying the opens, the probe seeing exec, file open and DNS on them;
+    signed `subsystem_degraded` (`bpf_lsm`, `exec_sensor`,
+    `file_open_sensor`), `weakening_env`, `unit_dropin`; `status --key`
+    showing it; the verifier DEGRADED "the capability manifest changed
+    across a restart" (0c629a1f → 41ff88df) 35 s after the start; the guest
+    restored (the drop-in gone, `lsm=` with `bpf`, a reboot): the hash back
+    to 0c629a1f…, L3, DEGRADED "changed across a restart" (41ff88df →
+    0c629a1f); `test-ignored` 82 suites 97 passed 0 failed. Found by the
+    lab and fixed in the lot: a guest's reboot under QEMU for Windows ends
+    QEMU (`-no-reboot`; the script reboots through `nn-lab.sh up`, one at
+    a time), and the script read the audit log at the wrong path (the
+    refusal check said FAIL: the refusals were read by hand,
+    `r13-lab/b/manifest/nobpf-audit-rows.jsonl`); the resumed nobpf run had
+    no hash before to compare (the agent refused at its start), the hash
+    after is the normal phase's. The guests left with the tip installed and
+    running, `lsm=` with `bpf`, no drop-in, powered off.
+  - Gates on fd0f9e52 (the code): 77 suites 3,449 passed 0 failed 17
+    ignored, `build-ebpf`, the four clippy runs, fmt, the privileged
+    no-run, attack coverage, golden ×5 (54 files, the same bytes, tree
+    clean), MSRV 1.89, fuzz replay (13 targets), portable (5 targets),
+    lockfiles unchanged. Mutations: 49 of 49 caught (set A 44 of 47 — MB3,
+    MB8 survived, MD4 did not compile —, A2 3 of 3 with their tests and MD4
+    rewritten, B 2 of 2 for a source without its pump). Identity against
+    `main` 973e3356 (one checkout path): the eBPF object 81c9df98… and
+    `posture_demo` 909a38dc… (29 lines) the same.
+  - Open: the health class has no event yet; the probe exercises three
+    sources (process spawn, file open, DNS), the ten others are judged from
+    their attach, the LSM's state and their pump only, and the deny
+    self-test exercises one deny hook (`task_kill`) of sixteen; the opt-in
+    connect deny's fail-open is not counted (no `DENY_FAIL_OPEN` slot: an
+    eBPF change); a FIM or network drain that does not start is not a
+    registry degradation (the manifest says `unavailable`); each revision
+    repeats the contract's terms (about 17 KiB a row); the verifier's
+    "across a restart" is named from the run of the last settled hash it
+    kept.
