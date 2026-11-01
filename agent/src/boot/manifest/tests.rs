@@ -315,6 +315,65 @@ fn a_change_while_running_is_a_signed_revision() {
     crate::audit::verify_chain(&rows, &pk).expect("the chain verifies");
     let beat = m.beat().unwrap();
     assert_eq!(beat.revision, rev2);
+    // the versions the verifier checks do not go backwards (the re-check
+    // of #479)
+    assert_eq!(beat.contract.as_deref(), Some(first.contract_hash.as_str()));
+    assert_eq!(beat.contract_version, Some(first.contract_version));
+    assert_eq!(beat.kernel.as_deref(), Some(first.kernel.as_str()));
+}
+
+/// The re-check of #479: a worse state right after a row is signed at
+/// once; a better one waits for the minute; the same worse state again
+/// within a minute of its row (an oscillation, the boot's own state among
+/// them) waits too, and once that minute has passed it is signed at once
+/// again.
+#[test]
+fn a_worse_state_is_signed_at_once_a_better_one_waits() {
+    // the boot without net_drain's pump: net_drain unavailable at revision 0
+    let mut i = inputs(active(), SelfTestOutcome::Denied);
+    let all = i.pumps.clone().unwrap();
+    let without: Vec<String> = all.iter().filter(|p| *p != "net_drain").cloned().collect();
+    i.pumps = Some(without.clone());
+    let m = SignedManifest::default();
+    m.arm(None, i);
+    let boot = m.current().unwrap();
+    let t0 = std::time::Instant::now();
+    let pumps = |p: &Vec<String>| m.0.lock().inputs.as_mut().unwrap().pumps = Some(p.clone());
+    // better (its pump back): folded; worse again, the boot's state within
+    // its minute: folded
+    pumps(&all);
+    assert_eq!(m.refresh_at(t0, false), None, "better: waits");
+    pumps(&without);
+    assert_eq!(
+        m.refresh_at(t0, false),
+        None,
+        "the boot's state again: waits"
+    );
+    assert_eq!(m.current().unwrap().unsigned_changes, 2);
+    // signed by the minute's row (forced here at t0 + 50 s): the boot's state
+    pumps(&all);
+    let rev = m
+        .refresh_at(t0 + Duration::from_secs(50), true)
+        .expect("the row");
+    assert_eq!(rev, boot.revision + 1);
+    let healthy = m.current().unwrap();
+    // worse right after that row, its state last signed over a minute ago
+    // (the boot's): at once
+    pumps(&without);
+    assert_eq!(
+        m.refresh_at(t0 + Duration::from_secs(70), false),
+        Some(rev + 1),
+        "worse, right after a row: at once"
+    );
+    let row = m.current().unwrap();
+    assert_eq!(row.hash, boot.hash);
+    assert_eq!(row.previous_hash.as_deref(), Some(healthy.hash.as_str()));
+    // better within the minute: waits; worse again (signed at 70 s): waits
+    pumps(&all);
+    assert_eq!(m.refresh_at(t0 + Duration::from_secs(80), false), None);
+    pumps(&without);
+    assert_eq!(m.refresh_at(t0 + Duration::from_secs(90), false), None);
+    assert_eq!(m.current().unwrap().unsigned_changes, 2);
 }
 
 /// The review of #479 and its re-check: a worse state is signed at once;
