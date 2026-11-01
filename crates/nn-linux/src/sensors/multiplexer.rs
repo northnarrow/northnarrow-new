@@ -2136,6 +2136,43 @@ mod tests {
         assert!(matches!(event, Event::DnsQuery { exe: None, .. }));
     }
 
+    /// R14b: a query's name feeds the connect attribution only when the
+    /// parse worker decoded it; a query the worker did not answer (an event
+    /// with no name) leaves the cache as it was.
+    #[test]
+    fn a_query_without_a_decode_leaves_the_attribution_alone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        let cache = DnsCache::default();
+        let mut raw = DnsQueryRaw::zeroed();
+        raw.pid = 4800;
+        raw.timestamp_ns = 7_000;
+        raw.family = 2;
+        let name = b"\x03bar\x13northnarrow-e2etest\x07invalid\x00";
+        raw.query_name[..name.len()].copy_from_slice(name);
+        raw.qname_len = name.len() as u16;
+        let (event, _) = dns_events(&raw, None, &lineage, Some(&cache));
+        assert!(
+            matches!(&event, Event::DnsQuery { query_name, qname_partial: true, .. } if query_name.is_empty()),
+            "{event:?}"
+        );
+        assert_eq!(cache.lookup_for_connect(4800, 8_000, 0), None);
+        let decoded =
+            crate::worker::serve::answer(&nn_proto::ipc::Request::DnsNames(vec![name_request(
+                &raw,
+            )]));
+        let nn_proto::ipc::Answer::DnsNames(mut v) = decoded else {
+            panic!("{decoded:?}")
+        };
+        let d = v.remove(0);
+        assert_eq!(d.name, "bar.northnarrow-e2etest.invalid");
+        let _ = dns_events(&raw, Some(&d), &lineage, Some(&cache));
+        assert_eq!(
+            cache.lookup_for_connect(4800, 8_000, 0).as_deref(),
+            Some("bar.northnarrow-e2etest.invalid")
+        );
+    }
+
     /// Lab PR 229: a name asked through systemd-resolved's NSS module (no
     /// datagram: the Debian 13 shape) attributes the asking process's
     /// connect. It is no `Event::DnsQuery`, and the forwarder
