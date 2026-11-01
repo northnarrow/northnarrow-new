@@ -53,7 +53,10 @@ DECISION_IDS="126 59 322 321 101 310 311 438"
 ors() { local f= i; for i in "$@"; do f="$f${f:+ || }id == $i"; done; echo "$f"; }
 # the programs the agent starts run under the unit's filter too
 CHILDREN='comm == "nft" || comm ~ "iptables*" || comm ~ "ip6tables*" || comm ~ "xtables*" || comm == "rpm" || comm ~ "northnarrow-sca*"'
-CALLS="(($FILTER || $CHILDREN) && ($(ors $UNIT_IDS))) || (comm == \"nn-decision\" && ($(ors $DECISION_IDS)))"
+# the lab's own tools (nn-* too) left out of the calls: a short-lived
+# process's name is often not in the trace's name cache when it is printed
+LABTOOLS='comm != "nn-admin" && comm != "nn-link-probe" && comm != "nn-iou-probe" && comm != "nn-modld" && comm != "nn-exp13"'
+CALLS="((($FILTER || $CHILDREN) && $LABTOOLS) && ($(ors $UNIT_IDS))) || (comm == \"nn-decision\" && ($(ors $DECISION_IDS)))"
 # who a name is: the lab's own tools match nn-* too
 WHO='function who(t) {
     if (t ~ /^(nn-admin|nn-link-probe|nn-iou-probe|nn-modld|nn-exp13)/) return "lab tool"
