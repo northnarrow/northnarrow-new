@@ -4,7 +4,7 @@
 # the HOST. Our own lab guests only (nn-lab.sh's), the agent installed from
 # the tree with the lab's features (debug-trigger).
 #
-# usage: manifest-lab.sh <out-dir> normal|nobpf [nn-admin]   (from the
+# usage: manifest-lab.sh <out-dir> normal|partial|stale|contract|nobpf [nn-admin]   (from the
 #        tree's root, NN_LAB_DISTRO naming the guest; nn-admin: a host build
 #        of this tree's, default target/release/nn-admin)
 #
@@ -14,6 +14,16 @@
 #     /run/northnarrow/debug-probe-blind names `dns`) and restored: each a
 #     signed `capability_manifest_change` and a DEGRADED of the verifier,
 #     the restarts none.
+#   partial — (the review of #479) the file-open sensor on its tracepoint
+#     (a unit drop-in, NN_FILE_OPEN_SENSOR=tracepoint): `open_sensor`
+#     partial with the event kinds it loses, `file_open` carrying the opens,
+#     DEGRADED off the host; the drop-in removed: the hash back.
+#   stale — (X2) the probe's rounds stopped (debug-trigger:
+#     /run/northnarrow/debug-probe-skip): the probed sources `stale`
+#     (unknown), DEGRADED; removed: seen again, DEGRADED back.
+#   contract — after the lab driver installed a build whose contract's terms
+#     differ (and nothing else): a NOTICE of the verifier's, no manifest
+#     alert.
 #   nobpf — the guest's lsm= without `bpf` (its grub drop-in edited, a
 #     reboot): the start refused, signed; then the degraded-mode opt-in (a
 #     unit drop-in, NN_ANTI_TAMPER_ALLOW_DEGRADED=1): the start, its manifest
@@ -157,6 +167,7 @@ if [[ $PHASE == normal ]]; then
     step settled "$t" "FAIL: not settled within 150 s"
   fi
   H0=$(field normal-0 hash)
+  echo "$H0" > "$OUT/hash-normal"
   sleep 40   # the verifier anchors on a settled beat
   # two clean restarts: the same settled hash, no manifest alert
   for i in 1 2; do
@@ -202,8 +213,97 @@ print(s["state"], s.get("probe"), "| change:", "; ".join(m.get("change", [])))' 
   g "sudo -n /usr/local/bin/nn-admin status --key $KEY" > "$OUT/status-normal.txt" 2>&1
 fi
 
+H0=$(cat "$OUT/hash-normal" 2>/dev/null)
+if [[ $PHASE == partial ]]; then
+  # the review of #479: a fallback that covers less is partial
+  t=$(now)
+  g "sudo mkdir -p $DROPIN_DIR && sudo sh -c 'printf \"[Service]\nEnvironment=NN_FILE_OPEN_SENSOR=tracepoint\n\" > $DROPIN_DIR/zz-r13-lab-partial.conf' && sudo systemctl daemon-reload" > "$OUT/partial-dropin.txt" 2>&1
+  if stop_agent && start_agent && wait_settled partial 180; then
+    sum=$(python3 -I -c 'import json, sys
+m = json.load(open(sys.argv[1]))["manifest"]
+s = {x["source"]: x for x in m["sources"]}
+o, f = s["open_sensor"], s["file_open"]
+print("open_sensor %s on %s (%s); file_open %s probe %s evidence %s" % (o["state"], o["on"], " | ".join(o.get("why", [])), f["state"], f.get("probe"), f.get("evidence")))' "$OUT/caps-partial.json")
+    if [[ $sum == "open_sensor partial on fallback"*"MassWrite, FileBurst, DefenderSignal"*"file_open ok"* ]]; then
+      step partial "$t" "ok: $sum"
+    else
+      step partial "$t" "FAIL: $sum"
+    fi
+  else
+    step partial "$t" "FAIL: the agent did not restart and settle ($(cat "$OUT/partial-dropin.txt" | tr '\n' ' '))"
+  fi
+  if a=$(wait_manifest_alert "$t" 240); then
+    step verifier-partial "$t" "ok: DEGRADED at $a"
+  else
+    step verifier-partial "$t" "FAIL: no manifest alert within 240 s"
+  fi
+  t=$(now)
+  g "sudo rm -f $DROPIN_DIR/zz-r13-lab-partial.conf && sudo rmdir --ignore-fail-on-non-empty $DROPIN_DIR; sudo systemctl daemon-reload" >/dev/null 2>&1
+  if stop_agent && start_agent && wait_settled partial-back 180; then
+    h=$(field partial-back hash)
+    step partial-back "$t" "$([[ $h == "$H0" ]] && echo ok || echo FAIL): hash $h (normal $H0)"
+  else
+    step partial-back "$t" "FAIL: the agent did not restart and settle"
+  fi
+  if a=$(wait_manifest_alert "$t" 240); then
+    step verifier-partial-back "$t" "ok: DEGRADED at $a (back)"
+  else
+    step verifier-partial-back "$t" "FAIL: no manifest alert within 240 s"
+  fi
+fi
+
+if [[ $PHASE == stale ]]; then
+  # the review of #479, X2: the probe's rounds stopped
+  t=$(now)
+  g "sudo sh -c 'touch /run/northnarrow/debug-probe-skip'"
+  ok=
+  for _ in $(seq 1 60); do
+    caps stale
+    if [[ $(field stale sources.0.probe) == stale ]]; then ok=1; break; fi
+    sleep 5
+  done
+  if [[ -n $ok ]]; then
+    step stale "$t" "ok: process_spawn $(field stale sources.0.state), probe $(field stale sources.0.probe); $(field stale unsigned_changes) change(s) not signed yet, revision $(field stale revision)"
+  else
+    step stale "$t" "FAIL: the probe's word not stale within 300 s"
+  fi
+  if a=$(wait_manifest_alert "$t" 300); then
+    step verifier-stale "$t" "ok: DEGRADED at $a"
+  else
+    step verifier-stale "$t" "FAIL: no manifest alert within 300 s"
+  fi
+  t=$(now)
+  g 'sudo rm -f /run/northnarrow/debug-probe-skip'
+  if a=$(wait_manifest_alert "$t" 240); then
+    caps stale-back; rows stale
+    step verifier-stale-back "$t" "ok: DEGRADED at $a (seen again: hash $(field stale-back hash))"
+  else
+    step verifier-stale-back "$t" "FAIL: no manifest alert within 240 s"
+  fi
+fi
+
+if [[ $PHASE == contract ]]; then
+  # an upgrade whose contract's terms differ, and nothing else: a NOTICE
+  t=$(now)
+  if wait_settled contract 180; then
+    sleep 80   # two beats seen by the verifier
+    notice=$(awk -v s="$t" '$1 >= s && /NOTICE the sensor contract changed/' "$OUT/watch.log" | head -1)
+    alert=$(awk -v s="$t" '$1 >= s && /capability manifest changed/' "$OUT/watch.log" | head -1)
+    if [[ -n $notice && -z $alert && $(field contract hash) == "$H0" ]]; then
+      step contract "$t" "ok: the same capabilities hash, a NOTICE, no manifest alert: $(echo "$notice" | cut -c1-180)"
+    else
+      step contract "$t" "FAIL: notice [$notice] alert [$alert] hash $(field contract hash) (normal $H0)"
+    fi
+  else
+    step contract "$t" "FAIL: the agent did not settle"
+  fi
+fi
+
 if [[ $PHASE == nobpf ]]; then
   caps before; H0=$(field before hash)
+  [[ -n $H0 ]] || H0=$(cat "$OUT/hash-normal" 2>/dev/null)
+  # the refusals signed before this boot (an earlier run's) are not this one's
+  R0=$(g "sudo grep -a -c refused_by $AUDIT" | tr -d '\r')
   # the guest's lsm= without bpf, kept aside to restore
   t=$(now)
   # (a copy kept once: a run cut short and run again keeps the first)
@@ -217,9 +317,10 @@ if [[ $PHASE == nobpf ]]; then
   # the start refused, signed
   sleep 30
   t=$(now)
-  g "systemctl is-active northnarrow-agent; sudo tail -n 40 $AUDIT | grep -a -E 'refused_by|\"bpf_lsm\"' | tail -n 3" > "$OUT/refused.txt" 2>&1
-  if grep -q 'refused_by' "$OUT/refused.txt" && grep -q 'bpf_lsm' "$OUT/refused.txt"; then
-    step refused "$t" "ok: the start refused, signed (agent_boot refused_by bpf_lsm)"
+  g "systemctl is-active northnarrow-agent; sudo grep -a -E 'refused_by|\"bpf_lsm\"' $AUDIT | tail -n 4" > "$OUT/refused.txt" 2>&1
+  R1=$(g "sudo grep -a -c refused_by $AUDIT" | tr -d '\r')
+  if ((${R1:-0} > ${R0:-0})) && grep -q 'refused_by' "$OUT/refused.txt" && grep -q 'bpf_lsm' "$OUT/refused.txt"; then
+    step refused "$t" "ok: the start refused, signed ($((R1 - R0)) agent_boot refused_by bpf_lsm since the reboot)"
   else
     step refused "$t" "FAIL: no signed refusal (refused.txt)"
   fi
