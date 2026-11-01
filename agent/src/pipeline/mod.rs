@@ -6,7 +6,12 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
+// R12c (lab PR 270): the response dispatcher.
+pub(crate) mod dispatch;
 pub(crate) mod process_event;
+// R12c (lab PR 270): the dispatcher of slow work (the ransomware tracker's
+// sampler and trust).
+pub(crate) mod slow;
 
 /// External audit EBPF-001: systemd (PID 1 itself, `SO_PEERCRED`) reported
 /// the host as stopping — no posture escalation and no ladder until the

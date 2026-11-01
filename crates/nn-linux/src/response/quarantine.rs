@@ -237,10 +237,12 @@ const NONCE_LEN: usize = 12;
 
 /// Public entry point: encrypt the binary backing `target_pid` and
 /// remove the original file.
+/// R12c (lab PR 270): only for an action whose intent is signed (`intent`).
 pub fn quarantine_process_binary(
     target_pid: u32,
     protected: &HashSet<u32>,
     cfg: &ExecutorConfig,
+    intent: &super::journal::Intent,
 ) -> ExecutionOutcome {
     if target_pid == 0 {
         return ExecutionOutcome::Refused {
@@ -266,14 +268,20 @@ pub fn quarantine_process_binary(
             };
         }
     };
-    quarantine_handle(&handle, target_pid, cfg)
+    quarantine_handle(&handle, target_pid, cfg, intent)
 }
 
 /// Review 87: encrypt the binary `handle` holds into the vault and remove
 /// it. `pid` is the process it backed, for the outcome. The combat
 /// ladder's NEUTRALIZE opens the binary before it kills the process (after
 /// the kill `/proc/<pid>/exe` is gone) and quarantines it here.
-pub fn quarantine_handle(handle: &ExeHandle, pid: u32, cfg: &ExecutorConfig) -> ExecutionOutcome {
+/// R12c (lab PR 270): only for an action whose intent is signed (`_intent`).
+pub fn quarantine_handle(
+    handle: &ExeHandle,
+    pid: u32,
+    cfg: &ExecutorConfig,
+    _intent: &super::journal::Intent,
+) -> ExecutionOutcome {
     let target_pid = pid;
     let original_str = match handle.current_path() {
         Some(p) => p.to_string_lossy().into_owned(),
@@ -1600,8 +1608,11 @@ mod tests {
         .unwrap();
         // Another vault's executor quarantines (PID 0: refused, and
         // recorded with the repairs it takes).
-        let report = super::super::Executor::with_config(other.clone())
-            .execute(nn_model::ResponseAction::Quarantine, 0);
+        let report = super::super::Executor::with_config(other.clone()).execute(
+            nn_model::ResponseAction::Quarantine,
+            0,
+            &super::super::journal::test_intent(),
+        );
         assert!(
             matches!(report.primary, ExecutionOutcome::Refused { pid: 0, .. }),
             "{:?}",

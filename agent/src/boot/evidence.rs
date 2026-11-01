@@ -469,10 +469,55 @@ pub(crate) struct Stores {
     pub(crate) detection_admin_state: Option<Arc<admin_socket::DetectionAdminState>>,
 }
 
+/// R12c (lab PR 270): the start's report of the intents an earlier run left
+/// without an outcome — a signed `response_interrupted` row naming them
+/// (each is also answered by an interrupted row in the actions chain).
+fn attest_interrupted(
+    audit_log: &AuditHandle,
+    recovery: &northnarrow_agent::response::journal::Recovery,
+) {
+    if let Some(why) = &recovery.unread {
+        warn!(error = %why, "the actions chain's start scan could not read it");
+    }
+    if recovery.interrupted.is_empty() {
+        return;
+    }
+    warn!(
+        count = recovery.interrupted.len(),
+        "actions of an earlier run have their intent and no outcome — the agent stopped between \
+         the two; whether they took effect is not known"
+    );
+    let Some(log) = audit_log.as_ref() else {
+        return;
+    };
+    let shown: Vec<&String> = recovery.interrupted.iter().take(32).collect();
+    let draft = northnarrow_agent::audit::AuditEntryDraft {
+        op: northnarrow_agent::response::journal::INTERRUPTED_AUDIT_OP.to_string(),
+        extra: serde_json::json!({
+            "count": recovery.interrupted.len(),
+            "actions": shown,
+            "detail": "intents of an earlier run without their outcome: the agent stopped \
+                       between the action's intent and its outcome",
+        }),
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: "detected".to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
+    };
+    if let Err(e) = log.lock().append(draft) {
+        warn!(error = %e, "recording the interrupted actions in the audit log failed");
+    }
+}
+
 /// The state directory's protection (BUG-026) and the rotation it lets the
 /// logs have (append-only without it), the stale chain's compatibility
 /// line, the head anchor in the same dance; the detection log, its writer
 /// and its reporter; the status-event log the detection triage writes.
+/// R12c (lab PR 270): the actions chain, bound to the journal.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stores(
     cli: &Cli,
     sensor: &mut SensorMultiplexer,
@@ -481,6 +526,7 @@ pub(crate) fn stores(
     audit_log: &AuditHandle,
     defense_detector: &Arc<northnarrow_agent::impair::DefenseDetector>,
     signing_key: &northnarrow_agent::keys::BootKey,
+    journal: &northnarrow_agent::response::journal::ActionJournal,
 ) -> Stores {
     // BUG-026: ONE shared StateDirProtection for the rotating on-disk logs
     // under /var/lib/northnarrow (netflow + fim_drift share its dance
@@ -619,6 +665,58 @@ pub(crate) fn stores(
             }
         }
     };
+
+    // R12c (lab PR 270; plan §3.4): the `actions` chain — every action's
+    // signed intent before it acts and its outcome after — beside the
+    // detection log, with its budget (16 MiB × 8 archives, overridable via
+    // NN_ACTIONS_CAP_BYTES, never below 1 MiB). The journal the executor's
+    // callers already hold is bound to it here (no action runs before the
+    // event loop); its open answers the intents an earlier run left without
+    // an outcome. Degrade-not-fail: a log that does not open leaves every
+    // action's rows in the journal at ERROR, counted — the actions still
+    // run (CMB-027).
+    {
+        use northnarrow_agent::response::journal as j;
+        let cap_bytes = northnarrow_agent::chainlog::cap_from_env(
+            j::ACTIONS_CAP_ENV,
+            j::DEFAULT_ACTIONS_CAP_BYTES,
+        );
+        let rotation = northnarrow_agent::chainlog::RotationConfig {
+            size_cap_bytes: cap(cap_bytes),
+            max_archives: j::DEFAULT_ACTIONS_MAX_ARCHIVES,
+            file_mode: northnarrow_agent::chainlog::STATE_LOG_FILE_MODE,
+        };
+        match signing_key
+            .signer()
+            .map_err(|e| format!("the agent signing key: {e}"))
+            .and_then(|key| {
+                j::ActionJournal::open_log(
+                    &cli.actions_file,
+                    key,
+                    rotation,
+                    rotation_protection.clone(),
+                )
+                .map_err(|e| format!("{e:#}"))
+            }) {
+            Ok(log) => {
+                let recovery = journal.bind(log, &cli.actions_file);
+                attest_interrupted(audit_log, &recovery);
+            }
+            Err(why) => {
+                tracing::error!(
+                    error = %why,
+                    path = %cli.actions_file.display(),
+                    "the actions chain did not open — every action's intent and outcome are \
+                     logged at ERROR instead (the actions still run)"
+                );
+                attest_degraded(
+                    audit_log.as_ref(),
+                    &format!("actions chain not open: {why} (action rows in the journal only)"),
+                );
+                journal.bind_off(&why);
+            }
+        }
+    }
 
     // Review 75: detections held back by the per-rule budget, reported.
     // External audit NN-AUD-111: started once the detection store exists,

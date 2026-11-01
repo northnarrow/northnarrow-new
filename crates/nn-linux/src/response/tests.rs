@@ -28,7 +28,7 @@ fn executor_protected_set_includes_init_and_self() {
 #[test]
 fn execute_log_action_is_a_noop_refusal() {
     let exec = Executor::new();
-    let report = exec.execute(ResponseAction::Log, 12345);
+    let report = exec.execute(ResponseAction::Log, 12345, &super::journal::test_intent());
     match report.primary {
         ExecutionOutcome::Refused { pid: 12345, reason } => assert!(reason.contains("Log action")),
         other => panic!("unexpected outcome: {other:?}"),
@@ -58,7 +58,7 @@ fn detect_only_suppresses_every_action_with_would_execute() {
         ResponseAction::Quarantine,
         ResponseAction::ThrottleProcess,
     ] {
-        let report = exec.execute(action.clone(), pid);
+        let report = exec.execute(action.clone(), pid, &super::journal::test_intent());
         assert_eq!(
             report.primary,
             ExecutionOutcome::WouldExecute { pid },
@@ -91,15 +91,25 @@ fn module_dry_run_branches_return_would_execute() {
     let table: [(&str, ExecutionOutcome); 3] = [
         (
             "block_outbound_for_pid",
-            super::block_outbound::block_outbound_for_pid(pid, &none, &cfg),
+            super::block_outbound::block_outbound_for_pid(
+                pid,
+                &none,
+                &cfg,
+                &super::journal::test_intent(),
+            ),
         ),
         (
             "throttle_pid",
-            super::throttle::throttle_pid(pid, &none, &cfg),
+            super::throttle::throttle_pid(pid, &none, &cfg, &super::journal::test_intent()),
         ),
         (
             "quarantine_handle",
-            super::quarantine::quarantine_handle(&handle, pid, &cfg),
+            super::quarantine::quarantine_handle(
+                &handle,
+                pid,
+                &cfg,
+                &super::journal::test_intent(),
+            ),
         ),
     ];
     for (what, out) in table {
@@ -121,7 +131,11 @@ fn host_wide_isolation_is_refused_outside_the_ladder() {
             dry_run,
             ..super::ExecutorConfig::default()
         });
-        let report = exec.execute(ResponseAction::FullNetworkIsolation, 4321);
+        let report = exec.execute(
+            ResponseAction::FullNetworkIsolation,
+            4321,
+            &super::journal::test_intent(),
+        );
         assert_eq!(
             report.primary,
             ExecutionOutcome::Refused {
@@ -138,7 +152,11 @@ fn execute_refuses_pid_below_protection_floor() {
     let exec = Executor::new();
     // PID 50 is below the floor (100) — must be refused even with a
     // Kill action.
-    let report = exec.execute(ResponseAction::KillProcess, 50);
+    let report = exec.execute(
+        ResponseAction::KillProcess,
+        50,
+        &super::journal::test_intent(),
+    );
     match report.primary {
         ExecutionOutcome::Refused { pid: 50, reason } => {
             assert!(reason.contains("protection floor"), "{reason}")
@@ -150,7 +168,11 @@ fn execute_refuses_pid_below_protection_floor() {
 #[test]
 fn execute_kill_on_nonexistent_pid_returns_already_gone() {
     let exec = Executor::new();
-    let report = exec.execute(ResponseAction::KillProcess, 999_999_997);
+    let report = exec.execute(
+        ResponseAction::KillProcess,
+        999_999_997,
+        &super::journal::test_intent(),
+    );
     assert!(
         matches!(
             report.primary,
@@ -180,7 +202,11 @@ fn kills_a_real_long_running_process() {
     std::thread::sleep(Duration::from_millis(50));
 
     let exec = Executor::new();
-    let report = exec.execute(ResponseAction::KillProcess, pid);
+    let report = exec.execute(
+        ResponseAction::KillProcess,
+        pid,
+        &super::journal::test_intent(),
+    );
     assert!(
         matches!(report.primary, ExecutionOutcome::Killed { pid: p } if p == pid),
         "{:?}",
@@ -206,7 +232,11 @@ fn kills_an_already_dead_process_reports_already_gone() {
     std::thread::sleep(Duration::from_millis(50));
 
     let exec = Executor::new();
-    let report = exec.execute(ResponseAction::KillProcess, pid);
+    let report = exec.execute(
+        ResponseAction::KillProcess,
+        pid,
+        &super::journal::test_intent(),
+    );
     assert!(
         matches!(report.primary, ExecutionOutcome::AlreadyGone { pid: p } if p == pid),
         "{:?}",
@@ -229,7 +259,11 @@ fn kills_a_process_tree() {
     std::thread::sleep(Duration::from_millis(150));
 
     let exec = Executor::new();
-    let report = exec.execute(ResponseAction::KillProcessTree, bash_pid);
+    let report = exec.execute(
+        ResponseAction::KillProcessTree,
+        bash_pid,
+        &super::journal::test_intent(),
+    );
     assert!(
         matches!(report.primary, ExecutionOutcome::Killed { pid: p } if p == bash_pid),
         "primary = {:?}",
@@ -286,7 +320,7 @@ fn host_critical_guard_applies_to_every_pid_scoped_action() {
         (ResponseAction::BlockOutbound, GUARDED),
         (ResponseAction::ThrottleProcess, GUARDED),
     ] {
-        let report = exec.execute(action.clone(), pid);
+        let report = exec.execute(action.clone(), pid, &super::journal::test_intent());
         assert_eq!(
             report.primary,
             ExecutionOutcome::Refused {
@@ -302,15 +336,90 @@ fn host_critical_guard_applies_to_every_pid_scoped_action() {
     assert!(super::proc_ref::ProcRef::open(live).is_live());
     let _ = sleeper.kill();
     let _ = sleeper.wait();
-    let report = exec.execute(ResponseAction::KillProcess, GUARDED);
+    let report = exec.execute(
+        ResponseAction::KillProcess,
+        GUARDED,
+        &super::journal::test_intent(),
+    );
     assert_eq!(
         report.primary,
         ExecutionOutcome::AlreadyGone { pid: GUARDED }
     );
     // Not a process action: the guard has nothing to say.
-    let report = exec.execute(ResponseAction::Log, GUARDED);
+    let report = exec.execute(ResponseAction::Log, GUARDED, &super::journal::test_intent());
     assert!(matches!(
         report.primary,
         ExecutionOutcome::Refused { reason, .. } if reason.contains("Log action")
     ));
+}
+
+/// R12c (lab PR 270): an action's report as its signed outcome — each
+/// outcome's result, and a kill tree with a descendant left running is a
+/// partial success, never a success.
+#[test]
+fn journal_outcome_says_what_each_outcome_is() {
+    use super::journal::ActionResult as R;
+    let report = |primary, additional| super::ExecutionReport {
+        action: ResponseAction::KillProcessTree,
+        primary,
+        additional,
+        elapsed: Duration::from_micros(1),
+    };
+    let r = |primary| super::journal_outcome(&report(primary, Vec::new())).0;
+    assert_eq!(r(ExecutionOutcome::Killed { pid: 1 }), R::Success);
+    assert_eq!(r(ExecutionOutcome::Blocked { pid: 1 }), R::Success);
+    assert_eq!(
+        r(ExecutionOutcome::WouldExecute { pid: 1 }),
+        R::WouldExecute
+    );
+    assert_eq!(r(ExecutionOutcome::AlreadyGone { pid: 1 }), R::NotRun);
+    assert_eq!(
+        r(ExecutionOutcome::Refused {
+            pid: 1,
+            reason: "PID is protected"
+        }),
+        R::Failure
+    );
+    assert_eq!(
+        r(ExecutionOutcome::Failed {
+            pid: 1,
+            errno: libc::ETIMEDOUT
+        }),
+        R::Failure
+    );
+    assert_eq!(
+        r(ExecutionOutcome::PermissionDenied { pid: 1, errno: 1 }),
+        R::Failure
+    );
+    assert_eq!(
+        r(ExecutionOutcome::TreeTruncated { pid: 1, limit: 9 }),
+        R::Partial
+    );
+    assert_eq!(
+        r(ExecutionOutcome::Throttled {
+            pid: 1,
+            cpu_max_pct: Some(10),
+            io_weight: None,
+            memory_high_bytes: Some(1)
+        }),
+        R::Partial
+    );
+    let (res, text, reason) = super::journal_outcome(&report(
+        ExecutionOutcome::Killed { pid: 1 },
+        vec![
+            ExecutionOutcome::Killed { pid: 2 },
+            ExecutionOutcome::Refused {
+                pid: 3,
+                reason: "ssh-service(sshd)",
+            },
+        ],
+    ));
+    assert_eq!(res, R::Partial);
+    assert!(text.contains("2 descendant(s), 1 not contained"), "{text}");
+    assert_eq!(reason.as_deref(), Some("1 descendant(s) not contained"));
+    let (res, _, reason) = super::journal_outcome(&report(
+        ExecutionOutcome::Killed { pid: 1 },
+        vec![ExecutionOutcome::AlreadyGone { pid: 2 }],
+    ));
+    assert_eq!((res, reason), (R::Success, None));
 }

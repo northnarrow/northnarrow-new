@@ -174,9 +174,30 @@ impl Recorder for SinkRecorder {
             return;
         };
         let uid = crate::detection_payload::Principal::from_event(&rec.event).uid;
-        let admit = crate::detection_budget::admit(RULE_ID, uid, || {
-            crate::detection_payload::held_sample(&rec.event)
-        });
+        // R12c (lab PR 270; plan §3.4): a kill or a quarantine is an action —
+        // its record is never held by the budget (its line is).
+        let admit = if rec.verdict.action != nn_model::ResponseAction::Log {
+            let a = crate::detection_budget::admit_acted(RULE_ID, uid);
+            if !a.lines {
+                sink.record_execq(
+                    &rec.event,
+                    &rec.verdict,
+                    (self.posture)(),
+                    rec.response,
+                    &rec.attack,
+                    rec.evidence,
+                    a.suppressed_before,
+                );
+                return;
+            }
+            crate::detection_budget::Admit::Record {
+                suppressed_before: a.suppressed_before,
+            }
+        } else {
+            crate::detection_budget::admit(RULE_ID, uid, || {
+                crate::detection_payload::held_sample(&rec.event)
+            })
+        };
         if let crate::detection_budget::Admit::Record { suppressed_before } = admit {
             warn!(
                 rule = RULE_ID,
@@ -230,6 +251,56 @@ mod tests {
             timestamp_ns: 9,
             exe: Default::default(),
         }
+    }
+
+    /// R12c (lab PR 270): an exec quarantine's kill is an action — its
+    /// record is written past the record budget (120 of one uid, the burst
+    /// 100); an observe-mode resume (Log) is held past it.
+    #[test]
+    fn a_kill_s_record_is_never_held_by_the_budget() {
+        use crate::detection_store::DetectionSink;
+        let sink = DetectionSink::for_test(4096, 0);
+        let rec = SinkRecorder {
+            sink: Some(sink.clone()),
+            audit: None,
+            posture: Box::new(|| nn_model::posture_types::PostureKind::Observing),
+        };
+        let o = decide(&Policy::default(), &Basis::Scanned(ScanVerdict::Malicious));
+        let with_uid = |uid: u32| {
+            let mut e = event();
+            if let Event::ExecCheck { uid: u, .. } = &mut e {
+                *u = uid;
+            }
+            e
+        };
+        let ev = || evidence(None, &o, true, true, 12, class::TMP, &[]);
+        for _ in 0..120 {
+            rec.detection(ExecqRecord::new(
+                with_uid(77_003),
+                "/tmp/nn-x",
+                &o,
+                ev(),
+                "killed while held".into(),
+                "elf64-x86_64-exec",
+            ));
+        }
+        assert_eq!(sink.queued_for_test().len(), 120, "every kill recorded");
+        let resume = decide(&Policy::default(), &Basis::Scanned(ScanVerdict::Clean));
+        for _ in 0..120 {
+            rec.detection(ExecqRecord::new(
+                with_uid(77_004),
+                "/tmp/nn-y",
+                &resume,
+                evidence(None, &resume, true, true, 12, class::TMP, &[]),
+                "resumed".into(),
+                "elf64-x86_64-exec",
+            ));
+        }
+        let logged = sink.queued_for_test().len() - 120;
+        assert!(
+            logged <= crate::detection_budget::BURST as usize,
+            "{logged}"
+        );
     }
 
     #[test]

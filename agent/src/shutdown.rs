@@ -108,6 +108,12 @@ pub(crate) fn stop(
         // External audit SNS-001: a failure, not a clean stop.
         anyhow::bail!("a sensor pump exited; the agent stopped so the watchdog restarts it");
     }
+    if stop_reason == "response_dispatcher_exited" {
+        // R12c (lab PR 270): no thread to run the responses — a failure.
+        anyhow::bail!(
+            "the response dispatcher's thread ended; the agent stopped so the watchdog restarts it"
+        );
+    }
     if stop_reason == "decision_thread_failed" {
         // R12b: no thread to judge on — a failure, not a clean stop.
         anyhow::bail!(

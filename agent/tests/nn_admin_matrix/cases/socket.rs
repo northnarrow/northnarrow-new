@@ -278,12 +278,12 @@ pub fn full_status() -> StatusResponse {
                  "source": "the event bus, per queue"},
                 {"stage": 5, "name": "decision delay", "total": 7,
                  "source": "decisions later than their class's budget, from the record's kernel time"},
-                {"stage": 6, "name": "response queue", "total": null,
-                 "source": "not counted yet: R12c"},
-                {"stage": 7, "name": "evidence writer queue", "total": null,
-                 "source": "not counted yet: R12c"},
+                {"stage": 6, "name": "response queue", "total": 4,
+                 "source": "responses decided and not run: displaced or refused by the full response queue, or queued at the stop (each signed in the actions chain)"},
+                {"stage": 7, "name": "evidence writer queue", "total": 3,
+                 "source": "detection records dropped or refused, action rows not in their chain, canary rows not written"},
                 {"stage": 8, "name": "export", "total": null,
-                 "source": "not counted yet: R12c, the telemetry_loss rows; R15, the export"}
+                 "source": "not counted yet: R15, the export"}
             ]
         },
         // R12b (lab PR 269): stage 5 per queue, P0's floods capped per uid.
@@ -305,9 +305,27 @@ pub fn full_status() -> StatusResponse {
             "cap_per_uid": 256
         }
     });
+    // R12c (lab PR 270): stages 6 and 7 — the response dispatcher, the
+    // actions chain, the evidence writer's queue (a json! of its own: the
+    // macro's recursion limit).
+    let dispatch = json!({
+        "running": true, "capacity": 1024, "depth": [0, 1, 0, 2], "max_depth": 40,
+        "submitted": 120, "queued": 119, "merged": 3, "over_cap": 2, "superseded": 4,
+        "displaced": [2, 0, 0, 0], "refused": [1, 0, 0, 0], "not_run_other": 1,
+        "taken": 116, "inherited": 2, "aged": 1,
+        "wait_p50_us": 90, "wait_p99_us": 41000, "wait_max_us": 52000,
+        "executed": 116, "execution_max_us": 48000,
+        "intents": 116, "outcomes": 115, "unwritten": 0, "interrupted_at_boot": 1,
+        "abandoned": 0, "overflow_rows": 2, "in_flight": 1, "sync_failed": 0,
+        "evidence_capacity": 1024, "evidence_depth": 0, "evidence_max_depth": 1300,
+        "evidence_over_cap": 276, "evidence_dropped": 2, "evidence_dropped_acted": 0,
+        "evidence_wait_max_us": 8000, "evidence_written": 4100, "evidence_append_failed": 0,
+        "canary_unwritten": 1, "ransomware_prepared": 6, "ransomware_inline": 0
+    });
     for (k, x) in fill.as_object().unwrap() {
         v[k] = x.clone();
     }
+    v["response_dispatch"] = dispatch;
     serde_json::from_value(v).unwrap()
 }
 

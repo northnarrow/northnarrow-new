@@ -350,6 +350,7 @@ pub(crate) struct Combat {
 pub(crate) fn ladder(
     cli: &Cli,
     executor: &Executor,
+    journal: &northnarrow_agent::response::journal::ActionJournal,
     isolator: &Option<Arc<NetworkIsolator>>,
     detect_only: bool,
     audit_log: &AuditHandle,
@@ -375,6 +376,9 @@ pub(crate) fn ladder(
                 executor.clone(),
                 isolator.clone(),
                 detect_only,
+                // R12c (lab PR 270): each of the ladder's actions bracketed
+                // by its signed intent and outcome.
+                journal.clone(),
             )),
             Box::new(northnarrow_agent::combat::AuditEvidence::new(
                 audit_log.clone(),
@@ -472,6 +476,7 @@ pub(crate) fn ladder(
         audit_log.clone(),
         northnarrow_agent::anti_tamper::prepare_pin_root().map(|p| p.to_path_buf()),
         detect_only,
+        journal.clone(),
     );
     match cow_guard.state() {
         northnarrow_agent::cow::GuardState::Off => {

@@ -783,6 +783,8 @@ impl ProtectionManager for NoProtection {
 pub const FIM_DRIFT_CAP_ENV: &str = "NN_FIM_DRIFT_CAP_BYTES";
 pub const DETECTIONS_CAP_ENV: &str = "NN_DETECTIONS_CAP_BYTES";
 pub const STATUS_EVENTS_CAP_ENV: &str = "NN_STATUS_EVENTS_CAP_BYTES";
+/// R12c (lab PR 270): the `actions` chain's.
+pub const ACTIONS_CAP_ENV: &str = "NN_ACTIONS_CAP_BYTES";
 
 /// Lowest cap an environment override may set. External audit MAIN-004:
 /// any `u64` used to be taken, so a one-line drop-in could rotate the
@@ -1212,6 +1214,27 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         self.unsynced = false;
         self.fsyncs += 1;
         Ok(())
+    }
+
+    /// The active file (R12c, lab PR 270: a caller's own fsync of it,
+    /// [`sync_detached`]).
+    pub fn active_path(&self) -> &Path {
+        &self.active_path
+    }
+
+    /// R12c (lab PR 270): the fsync of the lines [`Self::append_deferred`]
+    /// wrote, left to the caller, who does it with [`sync_detached`] once it
+    /// no longer holds whatever guards this writer (other writers of the
+    /// chain do not wait behind a slow disk's fsync). The lines count as
+    /// synced from here; `None` when none wait. A rotation in between
+    /// synced them already (its terminator's fsync).
+    pub fn detach_sync(&mut self) -> Option<PathBuf> {
+        if !self.unsynced {
+            return None;
+        }
+        self.unsynced = false;
+        self.fsyncs += 1;
+        Some(self.active_path.clone())
     }
 
     /// Whether lines written by [`Self::append_deferred`] wait for an fsync.
@@ -1677,6 +1700,17 @@ fn list_archive_seqs(active: &Path) -> Result<Vec<u64>> {
 
 fn scan_max_archive_seq(active: &Path) -> Result<Option<u64>> {
     Ok(list_archive_seqs(active)?.into_iter().max())
+}
+
+/// R12c (lab PR 270): the fsync [`RotatingChainLog::detach_sync`] left to
+/// its caller — of `path`, the chain's active file then.
+pub fn sync_detached(path: &Path) -> Result<()> {
+    let f = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening chainlog {} for fsync", path.display()))?;
+    f.sync_all()
+        .with_context(|| format!("fsync {}", path.display()))
 }
 
 /// The sealed archives of `active`, newest first (highest seq first: the

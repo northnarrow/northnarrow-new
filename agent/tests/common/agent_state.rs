@@ -91,6 +91,12 @@ pub const STATE_FLAGS: &[StateFlag] = &[
         what: "the triage status chain, its archives and manifest",
     },
     StateFlag {
+        flag: "--actions-file",
+        file: "actions.jsonl",
+        shared: false,
+        what: "the actions chain (each response's intent and outcome), its archives and manifest",
+    },
+    StateFlag {
         flag: "--netflow-file",
         file: "netflow.jsonl",
         shared: false,
@@ -298,6 +304,9 @@ impl AgentState {
     }
     pub fn status_events(&self) -> PathBuf {
         self.path("--status-events-file")
+    }
+    pub fn actions(&self) -> PathBuf {
+        self.path("--actions-file")
     }
     pub fn netflow(&self) -> PathBuf {
         self.path("--netflow-file")

@@ -917,6 +917,103 @@ pub struct StatusResponse {
     /// byte); `None` from an agent older than the field.
     #[serde(default)]
     pub event_bus_decision: Option<EventBusDecisionStatus>,
+    /// R12c (lab PR 270): stage 6 — the response dispatcher's queue, what
+    /// it ran and what it did not, the `actions` chain's rows (every
+    /// action's signed intent and outcome) — and stage 7, the evidence
+    /// writer's queue. Appended after `event_bus_decision`; telemetry
+    /// (`None` in the unsigned reply, one byte); `None` from an agent older
+    /// than the field.
+    #[serde(default)]
+    pub response_dispatch: Option<ResponseDispatchStatus>,
+}
+
+/// R12c (lab PR 270): stages 6 and 7 in `nn-admin status --key`
+/// ([`StatusResponse::response_dispatch`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseDispatchStatus {
+    /// The dispatcher's thread runs.
+    pub running: bool,
+    /// Responses the queue holds at most, and holds now per severity
+    /// (low, medium, high, critical); the most it held.
+    pub capacity: u64,
+    pub depth: Vec<u64>,
+    pub max_depth: u64,
+    /// Responses submitted, queued, merged into a queued one of the same
+    /// process and action.
+    pub submitted: u64,
+    pub queued: u64,
+    pub merged: u64,
+    /// Critical kills the full queue took past its capacity (never
+    /// refused); throttles and blocks a kill of their process superseded
+    /// (answered so, not a loss).
+    pub over_cap: u64,
+    pub superseded: u64,
+    /// Not run (stage 6), per severity: displaced by a more severe one
+    /// from the full queue, refused by it; and not run because the agent
+    /// stopped or the dispatcher was down.
+    pub displaced: Vec<u64>,
+    pub refused: Vec<u64>,
+    pub not_run_other: u64,
+    /// Taken; of them, run before a more severe one of the same process
+    /// (its order kept), and taken by age.
+    pub taken: u64,
+    pub inherited: u64,
+    pub aged: u64,
+    /// Queue to start of the action (µs): p50, p99, the largest.
+    pub wait_p50_us: Option<u64>,
+    pub wait_p99_us: Option<u64>,
+    pub wait_max_us: Option<u64>,
+    /// Responses run, and the longest run (µs).
+    pub executed: u64,
+    pub execution_max_us: u64,
+    /// The `actions` chain: intent and outcome rows written, rows it could
+    /// not take (logged at ERROR instead), intents of an earlier run found
+    /// without an outcome at the start, intents a panic left unanswered,
+    /// overflow rows, actions between their intent and their outcome now.
+    pub intents: u64,
+    pub outcomes: u64,
+    pub unwritten: u64,
+    pub interrupted_at_boot: u64,
+    pub abandoned: u64,
+    pub overflow_rows: u64,
+    pub in_flight: u64,
+    /// fsyncs of the actions chain that failed (its rows written; whether
+    /// on the disk not known).
+    pub sync_failed: u64,
+    /// Stage 7, the detection writer's queue: its capacity, depth and the
+    /// most it held, records of actions taken past the capacity, records
+    /// dropped (of them, of actions), the longest wait queue to chain (µs),
+    /// records written, appends refused.
+    pub evidence_capacity: u64,
+    pub evidence_depth: u64,
+    pub evidence_max_depth: u64,
+    pub evidence_over_cap: u64,
+    pub evidence_dropped: u64,
+    pub evidence_dropped_acted: u64,
+    pub evidence_wait_max_us: u64,
+    pub evidence_written: u64,
+    pub evidence_append_failed: u64,
+    /// Canary access rows the canary writer's full queue did not take.
+    pub canary_unwritten: u64,
+    /// The dispatcher of slow work: ransomware bursts whose assessment was
+    /// prepared off the decision thread, and judged with their I/O where
+    /// they were asked (its queue full, or the stop).
+    pub ransomware_prepared: u64,
+    pub ransomware_inline: u64,
+}
+
+impl ResponseDispatchStatus {
+    /// Stage 6's count: responses decided and not run.
+    pub fn stage6(&self) -> u64 {
+        self.displaced.iter().sum::<u64>() + self.refused.iter().sum::<u64>() + self.not_run_other
+    }
+
+    /// Stage 7's count: evidence the writers lost — detection records
+    /// dropped or refused by the chain, action rows not in their chain,
+    /// canary rows not written.
+    pub fn stage7(&self) -> u64 {
+        self.evidence_dropped + self.evidence_append_failed + self.unwritten + self.canary_unwritten
+    }
 }
 
 /// Lab PR 267 (R12a): the priority event bus in `nn-admin status --key`.
@@ -1130,6 +1227,7 @@ impl StatusResponse {
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
+            response_dispatch: None,
         }
     }
 
@@ -2230,6 +2328,7 @@ mod tests {
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
+            response_dispatch: None,
         }));
     }
 
@@ -2302,6 +2401,7 @@ mod tests {
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
+            response_dispatch: None,
         }));
     }
 
@@ -2555,6 +2655,7 @@ mod tests {
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
+            response_dispatch: None,
         }));
     }
 
@@ -2656,6 +2757,7 @@ mod tests {
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
+            response_dispatch: None,
         }
     }
 
@@ -2752,10 +2854,11 @@ mod tests {
         });
         let a = postcard::to_allocvec(&without).unwrap();
         let b = postcard::to_allocvec(&with).unwrap();
-        // the two appended fields' tags: R12a's bus, R12b's decision delay
-        assert!(a.ends_with(&[0, 0]), "the absent fields' tags");
-        assert!(b.starts_with(&a[..a.len() - 2]) && b.len() > a.len());
-        assert_eq!(b.last(), Some(&0), "R12b's field, absent");
+        // the three appended fields' tags: R12a's bus, R12b's decision
+        // delay, R12c's response dispatch (lab PR 270)
+        assert!(a.ends_with(&[0, 0, 0]), "the absent fields' tags");
+        assert!(b.starts_with(&a[..a.len() - 3]) && b.len() > a.len());
+        assert!(b.ends_with(&[0, 0]), "R12b's and R12c's fields, absent");
         assert_eq!(postcard::from_bytes::<StatusResponse>(&b).unwrap(), with);
         let public = StatusResponse::public(PostureKind::Observing, false, None, None, None);
         assert_eq!(public.event_bus, None);
@@ -2781,7 +2884,7 @@ mod tests {
             cap_per_uid: 256,
         });
         let c = postcard::to_allocvec(&with_delay).unwrap();
-        assert!(c.starts_with(&b[..b.len() - 1]) && c.len() > b.len());
+        assert!(c.starts_with(&b[..b.len() - 2]) && c.len() > b.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&c).unwrap(),
             with_delay
@@ -2790,6 +2893,66 @@ mod tests {
         let mut only_delay = public.clone();
         only_delay.event_bus_decision = with_delay.event_bus_decision.clone();
         assert!(!only_delay.telemetry_withheld(), "stage 5 is telemetry");
+        // R12c (lab PR 270): stages 6 and 7, appended after the decision's
+        // delay — every byte before it as R12b sent them
+        let mut with_dispatch = with_delay.clone();
+        with_dispatch.response_dispatch = Some(ResponseDispatchStatus {
+            running: true,
+            capacity: 1024,
+            depth: vec![0, 0, 1, 0],
+            max_depth: 9,
+            submitted: 12,
+            queued: 11,
+            merged: 1,
+            over_cap: 0,
+            superseded: 0,
+            displaced: vec![0, 0, 0, 0],
+            refused: vec![0, 0, 0, 0],
+            not_run_other: 0,
+            taken: 10,
+            inherited: 1,
+            aged: 0,
+            wait_p50_us: Some(80),
+            wait_p99_us: Some(700),
+            wait_max_us: Some(750),
+            executed: 10,
+            execution_max_us: 4_200,
+            intents: 10,
+            outcomes: 10,
+            unwritten: 0,
+            interrupted_at_boot: 1,
+            abandoned: 0,
+            overflow_rows: 0,
+            in_flight: 0,
+            sync_failed: 0,
+            evidence_capacity: 1024,
+            evidence_depth: 0,
+            evidence_max_depth: 3,
+            evidence_over_cap: 0,
+            evidence_dropped: 2,
+            evidence_dropped_acted: 0,
+            evidence_wait_max_us: 900,
+            evidence_written: 40,
+            evidence_append_failed: 0,
+            canary_unwritten: 1,
+            ransomware_prepared: 4,
+            ransomware_inline: 0,
+        });
+        let d = postcard::to_allocvec(&with_dispatch).unwrap();
+        assert!(d.starts_with(&c[..c.len() - 1]) && d.len() > c.len());
+        assert_eq!(
+            postcard::from_bytes::<StatusResponse>(&d).unwrap(),
+            with_dispatch
+        );
+        let r = with_dispatch.response_dispatch.as_ref().unwrap();
+        assert_eq!((r.stage6(), r.stage7()), (0, 3));
+        assert_eq!(public.response_dispatch, None);
+        let mut only_dispatch = public.clone();
+        only_dispatch.response_dispatch = with_dispatch.response_dispatch.clone();
+        assert!(
+            !only_dispatch.telemetry_withheld(),
+            "stages 6 and 7 are telemetry"
+        );
     }
 
     /// Lab PR 218: the new fields are telemetry — the unsigned reply sends
@@ -3323,8 +3486,9 @@ mod tests {
         // PR 218's four, lab PR 219's `exploit_guard`, lab PR 222's
         // `cow_guard`, lab PR 223's ten `execq_*`, lab PR 224's four
         // counters, lab PR 225's seven, lab PR 226's ten, lab PR 267's
-        // `event_bus`, lab PR 269's `event_bus_decision`.
-        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1;
+        // `event_bus`, lab PR 269's `event_bus_decision`, lab PR 270's
+        // `response_dispatch`.
+        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
@@ -4105,10 +4269,12 @@ mod tests {
         // the `None` of the appended `event_bus_decision` (telemetry,
         // withheld here); every byte before it is R12a's pin (the length
         // prefix 0x4c → 0x4d).
+        // R12c (lab PR 270): one byte longer (0x4d -> 0x4e) — the absent
+        // tag of `response_dispatch`, appended last.
         const STATUS_RESPONSE: &str = concat!(
-            "0000004d050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
+            "0000004e050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
             "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "00",
+            "0000",
         );
         const SHUTDOWN_REQUEST: &str = concat!(
             "0000007a0602abababababababababababababababababababababababababababababababab808f",

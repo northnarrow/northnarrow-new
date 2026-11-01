@@ -562,6 +562,11 @@ const START_CALLS: &[(&str, &str)] = &[
         "a detection against the process's one detection log's budget",
     ),
     (
+        "detection_budget::admit_acted",
+        "R12c (lab PR 270): an acting detection against the same budget — its record \
+         always written, its journal lines the budget's",
+    ),
+    (
         "log_escape::stdout_ansi",
         "the logger's setup: whether the process's stdout is a terminal",
     ),

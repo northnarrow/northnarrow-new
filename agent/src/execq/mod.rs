@@ -408,6 +408,8 @@ pub struct StartDeps {
     pub hashes_source: String,
     pub recorder: Box<dyn controller::Recorder>,
     pub exec_cfg: crate::response::config::ExecutorConfig,
+    /// R12c (lab PR 270): the `actions` chain's writer.
+    pub journal: crate::response::journal::ActionJournal,
 }
 
 /// The running controller.
@@ -470,6 +472,7 @@ pub fn start(
             hung_after: cfg.budget.max(HUNG_AFTER),
             exec_cfg: Some(deps.exec_cfg),
             ctime: ctime_resolved(),
+            journal: deps.journal,
         },
         &LEDGER,
     );

@@ -159,7 +159,16 @@ fn detect_only_wins_over_a_lifted_ceiling() {
         .unwrap();
     let r = &d.responses[0];
     assert_eq!(r.action, ResponseAction::KillProcess);
-    let report = exec.execute_for_started(r.action.clone(), child.id(), 0, 0, &r.filename);
+    let report = exec.execute_for_started(
+        r.action.clone(),
+        child.id(),
+        0,
+        0,
+        &r.filename,
+        &crate::response::journal::ActionJournal::memory().intent(
+            crate::response::journal::ActionIntent::named("test", "test", 0),
+        ),
+    );
     assert_eq!(
         report.primary,
         crate::response::ExecutionOutcome::WouldExecute { pid: child.id() }
@@ -186,7 +195,16 @@ fn detect_only_overrides_an_enforced_kill() {
         .spawn()
         .unwrap();
     let r = &d.responses[0];
-    let report = exec.execute_for_started(r.action.clone(), child.id(), 0, 0, &r.filename);
+    let report = exec.execute_for_started(
+        r.action.clone(),
+        child.id(),
+        0,
+        0,
+        &r.filename,
+        &crate::response::journal::ActionJournal::memory().intent(
+            crate::response::journal::ActionIntent::named("test", "test", 0),
+        ),
+    );
     assert_eq!(
         report.primary,
         crate::response::ExecutionOutcome::WouldExecute { pid: child.id() }

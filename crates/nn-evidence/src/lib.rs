@@ -18,6 +18,9 @@
 
 #![forbid(unsafe_code)]
 
+/// The signed record of the agent's actions: intent before, outcome after
+/// (R12c, lab PR 270; plan §3.4).
+pub mod action_payload;
 /// The tamper-evident audit chain (was the agent's `audit`).
 pub mod audit;
 /// Completeness of the chains: row numbers, file heads, the head anchor, the

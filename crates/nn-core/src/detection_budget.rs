@@ -79,6 +79,19 @@ impl Admit {
     }
 }
 
+/// R12c (lab PR 270; plan §3.4: "the budget limits only journal lines and
+/// Log-only detections, never an action's record"): what the budget says
+/// of a detection whose decision acts. Its record is always written —
+/// `suppressed_before` carries the pair's detections held since its
+/// previous record — and only its journal lines follow the budget
+/// (`lines`; `first`: the budget has just run out, worth one WARN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Acted {
+    pub suppressed_before: u64,
+    pub lines: bool,
+    pub first: bool,
+}
+
 struct Bucket {
     tokens: u32,
     refilled: Instant,
@@ -220,6 +233,38 @@ impl DetectionBudget {
         }
     }
 
+    /// R12c (lab PR 270): a detection whose decision acts ([`Acted`]): it
+    /// spends the pair's budget as any detection (a flood of them still
+    /// leaves the journal to the budget), and is recorded whether or not
+    /// a token was left — never counted as held.
+    pub fn admit_acted_at(&self, rule: &str, uid: u32, now: Instant) -> Acted {
+        let mut g = self.inner.lock();
+        let Some(bucket) = g.bucket(rule, uid, now) else {
+            return Acted {
+                suppressed_before: 0,
+                lines: true,
+                first: false,
+            };
+        };
+        let suppressed_before = std::mem::take(&mut bucket.held_since_record);
+        if bucket.tokens > 0 {
+            bucket.tokens -= 1;
+            Acted {
+                suppressed_before,
+                lines: true,
+                first: false,
+            }
+        } else {
+            let first = !bucket.throttled;
+            bucket.throttled = true;
+            Acted {
+                suppressed_before,
+                lines: false,
+                first,
+            }
+        }
+    }
+
     /// A detection its rule coalesced into an earlier record of the same
     /// action: counted as one held back (the next record of the pair, the
     /// reporter's entry), the pair's budget not spent. Not counted when
@@ -288,6 +333,11 @@ pub fn admit(rule: &str, uid: u32, sample: impl FnOnce() -> (String, String)) ->
     BUDGET.admit_at(rule, uid, Instant::now(), sample)
 }
 
+/// [`DetectionBudget::admit_acted_at`] on the process-wide budget, now.
+pub fn admit_acted(rule: &str, uid: u32) -> Acted {
+    BUDGET.admit_acted_at(rule, uid, Instant::now())
+}
+
 /// [`DetectionBudget::count_coalesced_at`] on the process-wide budget, now.
 pub fn count_coalesced(rule: &str, uid: u32, sample: impl FnOnce() -> (String, String)) {
     BUDGET.count_coalesced_at(rule, uid, Instant::now(), sample)
@@ -316,6 +366,49 @@ mod tests {
 
     fn nos() -> (String, String) {
         (String::new(), String::new())
+    }
+
+    /// R12c (lab PR 270): an acting detection is recorded past the budget
+    /// — only its journal lines are held — and carries the pair's held
+    /// count; it is never counted as held itself.
+    #[test]
+    fn an_acting_detection_is_always_recorded() {
+        let b = DetectionBudget::default();
+        let t0 = Instant::now();
+        for _ in 0..BURST {
+            assert!(b.admit_at("R", 7, t0, nos).record());
+        }
+        // the Log-only ones are held now
+        assert_eq!(b.admit_at("R", 7, t0, nos), Admit::Hold { first: true });
+        assert_eq!(b.admit_at("R", 7, t0, nos), Admit::Hold { first: false });
+        // an acting one is recorded, carrying the two held, its lines held
+        assert_eq!(
+            b.admit_acted_at("R", 7, t0),
+            Acted {
+                suppressed_before: 2,
+                lines: false,
+                first: false
+            }
+        );
+        let a = b.admit_acted_at("R", 7, t0);
+        assert_eq!((a.suppressed_before, a.lines), (0, false));
+        let held = b.take_held();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].count, 2, "the acting ones are not held");
+        // a fresh pair: lines too, spending its budget
+        let b = DetectionBudget::default();
+        for i in 0..BURST {
+            let a = b.admit_acted_at("K", 1, t0);
+            assert!(a.lines, "{i}");
+        }
+        let a = b.admit_acted_at("K", 1, t0);
+        assert_eq!((a.lines, a.first), (false, true));
+        assert!(
+            !b.admit_at("K", 1, t0, nos).record(),
+            "it spent the pair's budget"
+        );
+        // after a refill, lines again
+        assert!(b.admit_acted_at("K", 1, t0 + REFILL).lines);
     }
 
     fn records(b: &DetectionBudget, rule: &str, uid: u32, n: u32, now: Instant) -> u32 {

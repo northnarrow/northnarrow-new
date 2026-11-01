@@ -47,6 +47,7 @@ pub(crate) fn start(
     detection_sink: &Option<northnarrow_agent::detection_store::DetectionSink>,
     audit_log: &AuditHandle,
     execq_exec_cfg: ExecutorConfig,
+    journal: &northnarrow_agent::response::journal::ActionJournal,
     execpol_mode: northnarrow_agent::execpol::Mode,
     exec_guards: northnarrow_agent::exec_guards::AgentExecGuards,
 ) -> Result<Tasks> {
@@ -127,6 +128,7 @@ pub(crate) fn start(
                 hashes_source,
                 recorder: Box::new(recorder),
                 exec_cfg: execq_exec_cfg,
+                journal: journal.clone(),
             },
         ) {
             Ok(h) => Some(h),

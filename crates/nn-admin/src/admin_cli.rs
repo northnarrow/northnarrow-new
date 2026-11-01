@@ -257,6 +257,11 @@ pub struct StatusOutcome {
     /// per uid (`StatusResponse::event_bus_decision`; `None` from an older
     /// agent or the unsigned reply).
     pub event_bus_decision: Option<nn_proto::admin_protocol::EventBusDecisionStatus>,
+    /// R12c (lab PR 270): stages 6 and 7 — the response dispatcher, the
+    /// actions chain, the evidence writer's queue
+    /// (`StatusResponse::response_dispatch`; `None` from an older agent or
+    /// the unsigned reply).
+    pub response_dispatch: Option<nn_proto::admin_protocol::ResponseDispatchStatus>,
     /// External audit ASK-009 (lab PR 213): the reply of the signed
     /// telemetry verb (`--key`). `false` for the unsigned `status`, whose
     /// telemetry fields the agent leaves `None` — withheld, not unknown.
@@ -513,6 +518,7 @@ fn status_outcome(resp: nn_proto::admin_protocol::StatusResponse, signed: bool) 
         execq_script_refused_total: resp.execq_script_refused_total,
         event_bus: resp.event_bus,
         event_bus_decision: resp.event_bus_decision,
+        response_dispatch: resp.response_dispatch,
         telemetry_signed: signed,
     }
 }
@@ -3800,6 +3806,7 @@ mod tests {
                     execq_script_refused_total: Some(19),
                     event_bus: None,
                     event_bus_decision: None,
+                    response_dispatch: None,
                 }),
             );
         });

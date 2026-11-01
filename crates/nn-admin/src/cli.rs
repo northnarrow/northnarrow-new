@@ -917,6 +917,9 @@ enum ChainName {
     StatusEvents,
     Netflow,
     FimDrift,
+    // R12c (lab PR 270): the agent's actions, intent and outcome (a plain
+    // comment: a doc comment would make clap's help of every value long).
+    Actions,
     All,
 }
 
@@ -930,6 +933,7 @@ impl ChainName {
             ChainName::StatusEvents => "status_events",
             ChainName::Netflow => "netflow",
             ChainName::FimDrift => "fim_drift",
+            ChainName::Actions => "actions",
             ChainName::All => return None,
         })
     }
@@ -2469,6 +2473,7 @@ fn telemetry_withheld(out: &StatusOutcome) -> bool {
         && out.execpol_state.is_none()
         && out.event_bus.is_none()
         && out.event_bus_decision.is_none()
+        && out.response_dispatch.is_none()
 }
 
 /// The line that replaces the telemetry in an unsigned reply.
@@ -3117,7 +3122,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"event_bus\":{},\"event_bus_decision\":{},\"telemetry_signed\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"telemetry_signed\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -3170,6 +3175,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             // Lab PR 267 (R12a).
             serde_json::to_string(&out.event_bus).unwrap_or_else(|_| "null".to_string()),
             serde_json::to_string(&out.event_bus_decision).unwrap_or_else(|_| "null".to_string()),
+            serde_json::to_string(&out.response_dispatch).unwrap_or_else(|_| "null".to_string()),
             out.telemetry_signed,
         );
         return;
@@ -3276,6 +3282,11 @@ fn print_status(out: &StatusOutcome, json: bool) {
     }
     // R12b (lab PR 269): stage 5 per queue, the floods of P0 capped per uid.
     for line in event_bus_decision_lines(out.event_bus_decision.as_ref(), tty) {
+        println!("{line}");
+    }
+    // R12c (lab PR 270): stage 6 (the response dispatcher, the actions
+    // chain) and stage 7 (the evidence writer's queue).
+    for line in response_dispatch_lines(out.response_dispatch.as_ref(), tty) {
         println!("{line}");
     }
     println!("{}", deny_fail_open_line(out, tty));
@@ -3398,6 +3409,97 @@ fn event_bus_decision_lines(
         ));
     }
     out
+}
+
+/// R12c (lab PR 270): the response dispatcher's lines of `status --key` —
+/// its queue by severity, what it ran and did not (stage 6), the `actions`
+/// chain's rows (every action's signed intent and outcome; intents of an
+/// earlier run found without an outcome), and the evidence writer's queue
+/// (stage 7). Nothing from an agent older than the field.
+fn response_dispatch_lines(
+    d: Option<&nn_proto::admin_protocol::ResponseDispatchStatus>,
+    tty: bool,
+) -> Vec<String> {
+    let Some(d) = d else {
+        return Vec::new();
+    };
+    let us = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |v| format!("{v} µs"));
+    let red = |n: u64| {
+        if n == 0 {
+            colorize("0", "32", tty)
+        } else {
+            colorize(&n.to_string(), "31", tty)
+        }
+    };
+    let lanes = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join("/");
+    vec![
+        format!(
+            "response dispatch : {}; {} slots, depth {} (low/medium/high/critical; max {}); {} \
+             submitted, {} queued ({} Critical kills past the capacity), {} merged, {} \
+             superseded by a kill; taken {} ({} in their process's order, {} by age), wait p50 {} \
+             p99 {} max {}; {} run (longest {} µs)",
+            if d.running {
+                "running".to_string()
+            } else {
+                colorize("NOT running", "31", tty)
+            },
+            d.capacity,
+            lanes(&d.depth),
+            d.max_depth,
+            d.submitted,
+            d.queued,
+            d.over_cap,
+            d.merged,
+            d.superseded,
+            d.taken,
+            d.inherited,
+            d.aged,
+            us(d.wait_p50_us),
+            us(d.wait_p99_us),
+            us(d.wait_max_us),
+            d.executed,
+            d.execution_max_us,
+        ),
+        format!(
+            "  not run         : {} (displaced {}, refused {}, stop or down {}) — each signed in an \
+             overflow row ({} rows)",
+            red(d.stage6()),
+            lanes(&d.displaced),
+            lanes(&d.refused),
+            d.not_run_other,
+            d.overflow_rows,
+        ),
+        format!(
+            "  actions chain   : {} intents, {} outcomes, {} in flight; {} rows not in the chain \
+             (logged at ERROR); {} intents of an earlier run without an outcome (interrupted); {} \
+             abandoned; {} syncs failed",
+            d.intents,
+            d.outcomes,
+            d.in_flight,
+            red(d.unwritten),
+            red(d.interrupted_at_boot),
+            red(d.abandoned),
+            red(d.sync_failed),
+        ),
+        format!(
+            "evidence writer   : {} slots, depth {} (max {}), {} records of actions past the \
+             capacity; {} dropped ({} of actions), {} appends refused, longest wait {} µs, {} \
+             written; canary rows unwritten {}; ransomware bursts prepared off the decision \
+             thread {}, judged on it {}",
+            d.evidence_capacity,
+            d.evidence_depth,
+            d.evidence_max_depth,
+            d.evidence_over_cap,
+            red(d.evidence_dropped),
+            d.evidence_dropped_acted,
+            red(d.evidence_append_failed),
+            d.evidence_wait_max_us,
+            d.evidence_written,
+            red(d.canary_unwritten),
+            d.ransomware_prepared,
+            red(d.ransomware_inline),
+        ),
+    ]
 }
 
 /// Lab PR 222: the guard's lines of `status --key`.
@@ -5261,6 +5363,7 @@ mod flow_sock_line_tests {
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
+            response_dispatch: None,
             telemetry_signed: true,
         }
     }

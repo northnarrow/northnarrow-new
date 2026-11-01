@@ -1,5 +1,7 @@
 //! Wave 4 restructure, R12b (lab PR 269; plan §3.4): the decision path
 //! without `await` and without blocking I/O — and a ratchet so it stays so.
+//! R12c (lab PR 270): the responses and the ransomware tracker's I/O off it
+//! — rule 1b, and the response code off the path.
 //!
 //! The decision runs on a thread of its own (`agent/src/run_loop.rs`,
 //! `decision_loop`), and judges each event in `process_event`
@@ -12,9 +14,14 @@
 //! 1. **None, by name**: the decision thread's own code — the whole of
 //!    `process_event.rs` and the `decision_loop` function — holds no I/O
 //!    marker ([`MARKERS`]): no `.await`, no file or `/proc` read, no
-//!    process, no sleep, no `block_in_place`. The responses a decision runs
-//!    (the executor's kills, R12c's dispatcher to come) are calls of the
-//!    executor, not markers.
+//!    process, no sleep, no `block_in_place`.
+//!
+//!    Rule 1b, **no action, by name** (R12c, lab PR 270): that same code
+//!    calls no acting entry point of the executor, the isolator or the
+//!    actions journal ([`ACTING`]) — a decision's responses are submitted
+//!    to the response dispatcher (`pipeline::dispatch`, its own thread),
+//!    which signs each one's intent, runs it and signs its outcome; a Log
+//!    decision's report is `Executor::log_report`, which touches nothing.
 //! 2. **A ratchet** over the code the decision calls into to judge an event
 //!    ([`PATH`]: the rule engine, the posture and its lineage, the ladder,
 //!    the canary detector, the correlation buffer, the record budget, the
@@ -70,6 +77,28 @@ const MARKERS: &[&str] = &[
     ".sync_data(",
 ];
 
+/// R12c (lab PR 270): what acts — the executor's acting entry points, the
+/// isolator's, the low-level actions, the journal's tickets. None of it in
+/// the decision thread's own code (rule 1b).
+const ACTING: &[&str] = &[
+    "execute_for_started(",
+    "execute_started(",
+    "execute_on(",
+    ".execute(",
+    "execute_for(",
+    "quarantine_handle(",
+    "quarantine_process_binary(",
+    ".engage(",
+    "kill_ref(",
+    "kill_tree(",
+    "kill_process(",
+    "block_outbound_for_pid(",
+    "throttle_pid(",
+    "file_caps::strip(",
+    ".intent(",
+    ".intents(",
+];
+
 /// The code the decision calls into to judge an event (directories and
 /// files).
 const PATH: &[&str] = &[
@@ -86,20 +115,46 @@ const PATH: &[&str] = &[
     "crates/nn-core/src/detection_budget.rs",
     "crates/nn-core/src/impact",
     "crates/nn-core/src/impair",
-    // Review of #475 (its mutation K9): the responses the decision thread
-    // carries out itself until R12c's dispatcher — the executor and what it
-    // calls (kills, cgroups, quarantine, isolation)
-    "crates/nn-linux/src/response",
+    // R12c (lab PR 270): `crates/nn-linux/src/response` (the review of
+    // #475's K9) left the list — the decision thread runs no response any
+    // more (rule 1b: it submits them to the dispatcher's thread).
+];
+
+/// R12c (lab PR 270): functions of [`PATH`]'s files that run on threads of
+/// their own (or at the start and the stop), not the decision's — their I/O
+/// is theirs; the rest of the file is scanned (review of #476: the
+/// decision thread's side of those files — `Dispatcher::submit`, `answer`,
+/// `SlowWork::defer`, `take_ready` — is in [`NONE`]).
+const OFF_PATH: &[(&str, &[&str], &str)] = &[
+    (
+        "agent/src/pipeline/dispatch.rs",
+        &[
+            "pub(crate) fn start_with(",
+            "pub(crate) fn stop(",
+            "fn run(",
+            "fn run_one(",
+            "fn write_overflow(",
+        ],
+        "the response dispatcher's thread (`nn-response`): each response's signed intent, the \
+         action, its signed outcome; its start and its stop",
+    ),
+    (
+        "agent/src/pipeline/slow.rs",
+        &["pub(crate) fn start(", "pub(crate) fn stop(", "fn run("],
+        "the dispatcher of slow work's thread (`nn-slow-work`): the ransomware tracker's sampler \
+         and trust; its start and its stop",
+    ),
 ];
 
 /// The files of [`PATH`] that hold markers: how many sites, and why.
 const KNOWN: &[(&str, usize, &str)] = &[
     (
         "agent/src/run_loop.rs",
-        10,
+        13,
         "the event loop's task, not the decision thread: the lab builds' trigger files read \
-         and the stall's sleep (`debug_*`, debug-trigger builds), the thread scope run off the \
-         runtime's worker, `/proc/1/comm` at a SIGTERM; `decision_loop` holds none (rule 1)",
+         and the stall's sleep (`debug_*`, debug-trigger builds; R12c: the crash between an \
+         action's intent and its outcome), the thread scope and the dispatcher's stop run off \
+         the runtime's worker, `/proc/1/comm` at a SIGTERM; `decision_loop` holds none (rule 1)",
     ),
     (
         "agent/src/pipeline/mod.rs",
@@ -162,14 +217,16 @@ const KNOWN: &[(&str, usize, &str)] = &[
     (
         "crates/nn-core/src/impact/mod.rs",
         4,
-        "the ransomware tracker's sampler of a burst's files (entropy, copies): on a mass \
-         write or rename burst only — left for R12c's dispatcher of slow work",
+        "the ransomware tracker's sampler of a burst's files (entropy, copies) — R12c (lab PR \
+         270): run by the dispatcher of slow work (`RansomTracker::prepare` on `nn-slow-work`); \
+         the decision thread judges a burst once its assessment is prepared and primed, and \
+         judges one itself only when that queue is full (counted: `ransomware_inline`)",
     ),
     (
         "crates/nn-core/src/impact/trust.rs",
         5,
-        "the ransomware tracker's trust of the writer's executable (its digest, the package \
-         that owns it): on a burst only — left for R12c",
+        "the ransomware tracker's trust of the writer's executable (the package that owns it): \
+         R12c (lab PR 270), with the sampler, on the dispatcher of slow work's thread",
     ),
     (
         "crates/nn-core/src/impair/mod.rs",
@@ -206,55 +263,24 @@ const KNOWN: &[(&str, usize, &str)] = &[
         1,
         "a `/proc` path in a trigger's evidence text, no read",
     ),
-    // Review of #475 (K9): the responses, carried out on the decision
-    // thread until R12c's dispatcher takes them off it
-    (
-        "crates/nn-linux/src/response/block_outbound.rs",
-        5,
-        "a response (R12c): the outbound block's cgroup and `/proc` reads, its rule file",
-    ),
-    (
-        "crates/nn-linux/src/response/caps_preflight.rs",
-        7,
-        "a response's preflight (R12c): the target's capabilities and status in `/proc`",
-    ),
-    (
-        "crates/nn-linux/src/response/containment.rs",
-        8,
-        "a response (R12c): the containment ledger appended and synced, `/proc` reads",
-    ),
-    (
-        "crates/nn-linux/src/response/kill.rs",
-        19,
-        "a response (R12c): the kill's cgroup made, frozen, killed and removed, its wait for the \
-         freeze, `/proc` reads",
-    ),
-    (
-        "crates/nn-linux/src/response/mod.rs",
-        3,
-        "a response (R12c): a target's path on the host, `/proc` reads",
-    ),
-    (
-        "crates/nn-linux/src/response/proc_ref.rs",
-        4,
-        "a response (R12c): the target process pinned by its `/proc` entry",
-    ),
-    (
-        "crates/nn-linux/src/response/quarantine.rs",
-        35,
-        "a response (R12c): the quarantine's copy, its ledger synced, `/proc` reads",
-    ),
-    (
-        "crates/nn-linux/src/response/throttle.rs",
-        3,
-        "a response (R12c): the throttle's cgroup files",
-    ),
 ];
 
 /// The code the decision thread runs itself: none of it may hold a marker.
 const NONE: &[(&str, Option<&str>)] = &[
     ("agent/src/pipeline/process_event.rs", None),
     ("agent/src/run_loop.rs", Some("fn decision_loop(")),
+    // R12c (lab PR 270; review of #476): what the decision thread calls of
+    // the dispatchers' files
+    (
+        "agent/src/pipeline/dispatch.rs",
+        Some("pub(crate) fn submit("),
+    ),
+    ("agent/src/pipeline/dispatch.rs", Some("fn answer(")),
+    ("agent/src/pipeline/slow.rs", Some("pub(crate) fn defer(")),
+    (
+        "agent/src/pipeline/slow.rs",
+        Some("pub(crate) fn take_ready("),
+    ),
 ];
 
 /// The sites in `code`: each stretch of text one or more markers cover
@@ -325,7 +351,14 @@ fn path_code(root: &Path) -> BTreeMap<String, String> {
                 continue;
             }
             let text = std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("{rel}: {e}"));
-            out.insert(rel, production(&strip_comments(&text)));
+            let mut text = production(&strip_comments(&text));
+            for (_, heads, _) in OFF_PATH.iter().filter(|(f, _, _)| *f == rel) {
+                for h in *heads {
+                    let body = function(&text, h).to_string();
+                    text = text.replacen(&body, "", 1);
+                }
+            }
+            out.insert(rel, text);
         }
     }
     out
@@ -349,6 +382,26 @@ fn decision_thread_violations(code: &BTreeMap<String, String>) -> Vec<String> {
             .unwrap_or_else(|| panic!("{file} is not in the decision path's scan"));
         let body = f.map_or(text.as_str(), |h| function(text, h));
         let found = which(body);
+        if !found.is_empty() {
+            out.push(format!("{file} {}: {found:?}", f.unwrap_or("")));
+        }
+    }
+    out
+}
+
+/// Rule 1b's violations (R12c, lab PR 270): `(where, acting calls)`.
+fn decision_thread_actions(code: &BTreeMap<String, String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (file, f) in NONE {
+        let text = code
+            .get(*file)
+            .unwrap_or_else(|| panic!("{file} is not in the decision path's scan"));
+        let body = f.map_or(text.as_str(), |h| function(text, h));
+        let found: Vec<(&str, usize)> = ACTING
+            .iter()
+            .map(|m| (*m, body.matches(m).count()))
+            .filter(|(_, n)| *n > 0)
+            .collect();
         if !found.is_empty() {
             out.push(format!("{file} {}: {found:?}", f.unwrap_or("")));
         }
@@ -396,6 +449,34 @@ fn the_decision_thread_awaits_nothing_and_does_no_blocking_io() {
     assert!(v.is_empty(), "{v:#?}");
 }
 
+/// Rule 1b (R12c, lab PR 270): the decision thread's own code runs no
+/// action — its responses are the dispatcher's; and the files that run on
+/// other threads are named, each with its reason, and exist.
+#[test]
+fn the_decision_thread_runs_no_action() {
+    let code = path_code(&repo_root());
+    let v = decision_thread_actions(&code);
+    assert!(v.is_empty(), "{v:#?}");
+    for (f, heads, why) in OFF_PATH {
+        assert!(repo_root().join(f).is_file(), "{f}: listed, not on disk");
+        assert!(
+            !heads.is_empty() && why.len() > 20,
+            "{f}: say which and why"
+        );
+    }
+    // the decision submits its responses, and reports a Log decision
+    // without the executor's acting entry points
+    let pe = &code["agent/src/pipeline/process_event.rs"];
+    assert!(
+        pe.contains("dispatcher.submit("),
+        "the responses go to the dispatcher"
+    );
+    assert!(
+        pe.contains("executor.log_report("),
+        "a Log decision's report"
+    );
+}
+
 /// Rule 2: no new blocking-I/O site in the code the decision calls into;
 /// the pins are the code's.
 #[test]
@@ -412,22 +493,47 @@ fn the_decision_path_s_io_is_a_ratchet() {
 #[test]
 fn the_rules_fail_on_planted_violations() {
     let mut code = path_code(&repo_root());
-    // the review of #475's mutation K9: a blocking read in the executor the
-    // decision thread calls (`execute_for_started`) is a new site
-    let ex = "crates/nn-linux/src/response/executor.rs".to_string();
+    // the review of #475's mutation K9, R12c: the decision thread running a
+    // response itself again (`execute_for_started`) — rule 1b
+    let pe = "agent/src/pipeline/process_event.rs".to_string();
     let mut planted = code.clone();
-    let text = planted.get_mut(&ex).expect("the executor is on the path");
-    let at = text.find("fn execute_for_started(").unwrap();
-    let open = at + text[at..].find('{').unwrap();
-    text.insert_str(
-        open + 1,
-        "\n let _ = std::fs::read_to_string(\"/proc/self/status\");\n",
-    );
-    let v = ratchet_violations(&planted);
+    planted
+        .get_mut(&pe)
+        .unwrap()
+        .push_str("\nfn k9(e: &Executor) { e.execute_for_started(a, 1, 0, 0, \"\", &i); }\n");
+    let v = decision_thread_actions(&planted);
     assert!(
-        v.len() == 1 && v[0].contains("executor.rs") && v[0].contains("new"),
+        v.len() == 1 && v[0].contains("execute_for_started("),
         "{v:#?}"
     );
+    let rl = "agent/src/run_loop.rs".to_string();
+    let mut planted = code.clone();
+    let text = planted.get_mut(&rl).unwrap();
+    let at = text.find("fn decision_loop(").unwrap();
+    let open = at + text[at..].find('{').unwrap();
+    text.insert_str(open + 1, "\n let t = journal.intent(row);\n");
+    let v = decision_thread_actions(&planted);
+    assert!(v.len() == 1 && v[0].contains(".intent("), "{v:?}");
+    assert!(decision_thread_actions(&code).is_empty());
+    // review of #476: the decision thread's side of the dispatchers' files
+    // is scanned — a read planted in `Dispatcher::submit`, an action in
+    // `SlowWork::defer`
+    let dp = "agent/src/pipeline/dispatch.rs".to_string();
+    let mut planted = code.clone();
+    let text = planted.get_mut(&dp).unwrap();
+    let at = text.find("pub(crate) fn submit(").unwrap();
+    let open = at + text[at..].find('{').unwrap();
+    text.insert_str(open + 1, "\n let _ = std::fs::read(p);\n");
+    let v = decision_thread_violations(&planted);
+    assert!(v.len() == 1 && v[0].contains("fn submit("), "{v:?}");
+    let sl = "agent/src/pipeline/slow.rs".to_string();
+    let mut planted = code.clone();
+    let text = planted.get_mut(&sl).unwrap();
+    let at = text.find("pub(crate) fn defer(").unwrap();
+    let open = at + text[at..].find('{').unwrap();
+    text.insert_str(open + 1, "\n e.kill_tree(pid);\n");
+    let v = decision_thread_actions(&planted);
+    assert!(v.len() == 1 && v[0].contains("kill_tree("), "{v:?}");
     // rule 1: an await, a /proc read in process_event; a sleep in the
     // decision loop
     let pe = "agent/src/pipeline/process_event.rs".to_string();

@@ -12,6 +12,7 @@ use northnarrow_agent::posture::PostureMachine;
 use northnarrow_agent::response::Executor;
 use tracing::{debug, error, info, warn};
 
+use super::dispatch::{Decided, Dispatcher, ResponseJob};
 use super::{HostStopping, SystemdAnswer, SystemdSnapshot};
 
 /// Categorise + log + evaluate + (maybe) execute.
@@ -29,10 +30,11 @@ use super::{HostStopping, SystemdAnswer, SystemdSnapshot};
 /// blocking I/O of its own (the guard: xtask `decision_path_io`): an
 /// exec's path is made absolute in its pump, systemd's state is the watch's
 /// snapshot, the trusted-installer window's expiry is its tick's (external
-/// audit ATP-003), the canary's access row its writer's. The responses a
-/// decision runs still run here, in order, before the next event (the kill
-/// syscalls and their verify retries, up to 50 ms): their dispatcher is
-/// R12c's.
+/// audit ATP-003), the canary's access row its writer's. R12c (lab PR 270):
+/// the responses a decision runs are handed to the response dispatcher
+/// (`dispatch`: a queue push, never a wait), which signs each one's intent
+/// before it acts and its outcome after; an acting decision's record is
+/// never held by the record budget.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_event(
     engine: &RuleEngine,
@@ -53,6 +55,8 @@ pub(crate) fn process_event(
     // R12b (lab PR 269): systemd's state, the watch's snapshot.
     systemd: &SystemdSnapshot,
     cow_guard: &northnarrow_agent::cow::CowGuard,
+    // R12c (lab PR 270): where the decision's responses go.
+    dispatcher: &Dispatcher,
     event: Event,
 ) {
     // Lab PR 218: the deny self-test's own refused signal is the boot's
@@ -464,12 +468,25 @@ pub(crate) fn process_event(
             use northnarrow_agent::decision::rules::epg;
             let rule = epg::rule_for(&event);
             let verdict = rule.and_then(|r| r.evaluate(&event));
+            // R12c (lab PR 270): a task the kernel killed is an action —
+            // its record is never held by the budget (its lines are).
             let admit = match &verdict {
+                Some(v) if *killed => {
+                    let a = budget_admit_acted(&v.rule_id, *uid);
+                    if a.lines {
+                        Admit::Record {
+                            suppressed_before: a.suppressed_before,
+                        }
+                    } else {
+                        Admit::Hold { first: false }
+                    }
+                }
                 Some(v) => budget_admit(&v.rule_id, *uid, &event),
                 None => Admit::Record {
                     suppressed_before: 0,
                 },
             };
+            let record_anyway = *killed;
             if admit.record() {
                 error!(
                     pid, tid, uid, comm = %Escaped(comm),
@@ -480,23 +497,28 @@ pub(crate) fn process_event(
                 );
             }
             if let Some(verdict) = verdict {
-                if let Admit::Record { suppressed_before } = admit {
-                    warn!(
-                        rule = %verdict.rule_id,
-                        severity = ?verdict.severity,
-                        reasoning = %Escaped(&verdict.reasoning),
-                        "VERDICT (rule)"
-                    );
-                    if let Some(sink) = detection_sink {
-                        sink.record_rule(
-                            &event,
-                            &verdict,
-                            rule.map_or(&[][..], |r| r.attack()),
-                            posture.current_kind(),
-                            epg::response_line(&event),
-                            suppressed_before,
+                let recorded = match admit {
+                    Admit::Record { suppressed_before } => {
+                        warn!(
+                            rule = %verdict.rule_id,
+                            severity = ?verdict.severity,
+                            reasoning = %Escaped(&verdict.reasoning),
+                            "VERDICT (rule)"
                         );
+                        Some(suppressed_before)
                     }
+                    Admit::Hold { .. } if record_anyway => Some(0),
+                    Admit::Hold { .. } => None,
+                };
+                if let (Some(suppressed_before), Some(sink)) = (recorded, detection_sink) {
+                    sink.record_rule(
+                        &event,
+                        &verdict,
+                        rule.map_or(&[][..], |r| r.attack()),
+                        posture.current_kind(),
+                        epg::response_line(&event),
+                        suppressed_before,
+                    );
                 }
             }
             return;
@@ -603,9 +625,20 @@ pub(crate) fn process_event(
         let verdict = &decision.verdict;
         // Review 75: every verdict is acted on; its log lines and its
         // record count against the primary rule's budget for the acting uid.
+        // R12c (lab PR 270; plan §3.4): a decision that acts is always
+        // recorded — the budget holds only its journal lines.
         let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
-        let admit = budget_admit(&verdict.rule_id, uid, &event);
-        if admit.record() {
+        let acts = !decision.responses.is_empty();
+        let (record, lines, suppressed_before) = if acts {
+            let a = budget_admit_acted(&verdict.rule_id, uid);
+            (true, a.lines, a.suppressed_before)
+        } else {
+            match budget_admit(&verdict.rule_id, uid, &event) {
+                Admit::Record { suppressed_before } => (true, true, suppressed_before),
+                Admit::Hold { .. } => (false, false, 0),
+            }
+        };
+        if lines {
             let also: Vec<&str> = decision
                 .matches
                 .iter()
@@ -637,100 +670,59 @@ pub(crate) fn process_event(
             }
         }
 
+        // Lab PR 222: a ransomware rule's match flags its writer for the
+        // copy-on-first-write guard now; the dispatcher tells it the kill
+        // that neutralized it once the kill ran.
+        for m in &decision.matches {
+            cow_guard.after_rule_response(m.rule_id, m.verdict.event_pid, false);
+        }
+        if !acts {
+            // A Log decision runs nothing: no action, so no intent.
+            if record {
+                let report = executor.log_report(verdict.event_pid);
+                if lines {
+                    info!(
+                        action = ?report.action,
+                        primary = ?report.primary,
+                        additional_count = report.additional.len(),
+                        elapsed_us = report.elapsed.as_micros() as u64,
+                        "EXECUTED"
+                    );
+                }
+                // Tappa 9.0.a: persist the rule detection (off the hot path).
+                if let Some(sink) = detection_sink {
+                    sink.record_decision(
+                        &event,
+                        &decision,
+                        posture.current_kind(),
+                        northnarrow_agent::detection_store::describe_response(&report),
+                        suppressed_before,
+                    );
+                }
+            }
+            return;
+        }
         // External audit CMB-004: what the event says about the process
         // the verdict is about — its start (an exec), the event's time — so
         // a kill does not reach a process that took the PID after the event.
         let owner = northnarrow_agent::posture::triggers::event_owner_pid(&event);
         let (owner_start_ns, owner_seen_ns) =
             northnarrow_agent::posture::triggers::event_owner_seen(&event);
-        let mut reports = Vec::new();
-        if decision.responses.is_empty() {
-            // A Log decision runs nothing: no blocking task for it.
-            reports.push((
-                None,
-                executor.execute(nn_model::ResponseAction::Log, verdict.event_pid),
-            ));
-        }
-        for response in &decision.responses {
-            let action = response.action.clone();
-            let target_pid = response.pid;
-            let target_file = response.filename.clone();
-            let (target_start_ns, target_seen_ns) = if owner == Some(target_pid) {
-                (owner_start_ns, owner_seen_ns)
-            } else {
-                (0, 0)
-            };
-            // R12b: on the decision thread, in order (the dispatcher that
-            // takes them off it is R12c's); a panic in the executor is
-            // caught and logged, as its task's was.
-            let report = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                executor.execute_for_started(
-                    action,
-                    target_pid,
-                    target_start_ns,
-                    target_seen_ns,
-                    &target_file,
-                )
-            })) {
-                Ok(r) => r,
-                Err(_) => {
-                    warn!("executor panicked — this decision's other responses are not run");
-                    return;
-                }
-            };
-            reports.push((Some(response), report));
-        }
-        // Lab PR 222: a ransomware rule's match flags its writer, and a kill
-        // of that process (whichever matched rule's response it was)
-        // neutralized it.
-        for m in &decision.matches {
-            let pid = m.verdict.event_pid;
-            let neutralized = reports.iter().any(|(r, report)| {
-                r.is_some_and(|r| r.pid == pid)
-                    && matches!(
-                        report.primary,
-                        northnarrow_agent::response::ExecutionOutcome::Killed { .. }
-                            | northnarrow_agent::response::ExecutionOutcome::AlreadyGone { .. }
-                    )
-            });
-            cow_guard.after_rule_response(m.rule_id, pid, neutralized);
-        }
-        if let Admit::Record { suppressed_before } = admit {
-            for (_, report) in &reports {
-                info!(
-                    action = ?report.action,
-                    primary = ?report.primary,
-                    additional_count = report.additional.len(),
-                    elapsed_us = report.elapsed.as_micros() as u64,
-                    "EXECUTED"
-                );
-            }
-            // Tappa 9.0.a: persist the rule detection (off the hot path).
-            if let Some(sink) = detection_sink {
-                let response = match reports.as_slice() {
-                    [(_, only)] => northnarrow_agent::detection_store::describe_response(only),
-                    many => many
-                        .iter()
-                        .map(|(r, report)| {
-                            format!(
-                                "{} (pid {}, {})",
-                                northnarrow_agent::detection_store::describe_response(report),
-                                r.map_or(verdict.event_pid, |r| r.pid),
-                                r.map_or("", |r| r.rule_id)
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                };
-                sink.record_decision(
-                    &event,
-                    &decision,
-                    posture.current_kind(),
-                    response,
-                    suppressed_before,
-                );
-            }
-        }
+        // R12c: the responses to the dispatcher — signed intent, the
+        // action, signed outcome, then the record — off this thread.
+        let decided = Decided::new(
+            event,
+            decision,
+            posture.current_kind(),
+            suppressed_before,
+            lines,
+        );
+        dispatcher.submit(ResponseJob::of(
+            &decided,
+            owner,
+            owner_start_ns,
+            owner_seen_ns,
+        ));
     }
 }
 
@@ -753,6 +745,24 @@ fn budget_admit(rule: &str, uid: u32, event: &Event) -> Admit {
     admit
 }
 
+/// R12c (lab PR 270): [`detection_budget::admit_acted`] — an acting
+/// decision is always recorded; the WARN when its (rule, uid) runs out of
+/// budget for journal lines.
+fn budget_admit_acted(rule: &str, uid: u32) -> detection_budget::Acted {
+    let a = detection_budget::admit_acted(rule, uid);
+    if a.first {
+        warn!(
+            rule,
+            uid,
+            burst = detection_budget::BURST,
+            "detections of this rule and uid exceed the record budget: their responses run and \
+             their records and action rows are written; one journal line per second, until the \
+             rate falls"
+        );
+    }
+    a
+}
+
 /// Render a 16-byte address according to family (`2` = AF_INET → first
 /// 4 bytes; `10` = AF_INET6 → full v6).
 fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
@@ -761,5 +771,225 @@ fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
         nn_model::netaddr::canonical_ip(family, bytes).to_string()
     } else {
         format!("family={family}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use nn_model::Event;
+    use northnarrow_agent::response::journal::{ActionJournal, ActionRow};
+    use northnarrow_agent::response::{Executor, ExecutorConfig};
+
+    use super::*;
+    use crate::pipeline::dispatch::{Dispatcher, Followups};
+
+    fn exec_from_tmp(pid: u32, uid: u32) -> Event {
+        Event::ProcessSpawn {
+            pid,
+            ppid: 1,
+            uid,
+            gid: uid,
+            comm: "payload".to_string(),
+            filename: "/tmp/nn-r12c-test/payload".to_string(),
+            timestamp_ns: 1_000 + u64::from(pid),
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+            start_ns: 0,
+            parent_is_kthread: false,
+            exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        }
+    }
+
+    /// R12c (lab PR 270; plan §3.4): the decision hands its responses to
+    /// the dispatcher, and an acting decision is recorded past the record
+    /// budget — its journal lines held, never its record nor its action's
+    /// rows. 150 execs from /tmp of one uid (NN-L-R001, KillProcessTree;
+    /// the budget's burst is 100): 150 detection records, 150 intents each
+    /// answered by its outcome (detect-only: none touches the host).
+    #[test]
+    fn an_acting_decision_is_dispatched_and_recorded_past_the_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exec = Executor::with_config(ExecutorConfig::for_test(tmp.path()));
+        assert!(exec.config().dry_run);
+        let journal = ActionJournal::memory();
+        let sink = northnarrow_agent::detection_store::DetectionSink::for_test(4096, 0);
+        let cow = northnarrow_agent::cow::CowGuard::off_for_test();
+        let dispatcher = Dispatcher::start(
+            exec.clone(),
+            journal.clone(),
+            Followups {
+                sink: Some(sink.clone()),
+                cow: cow.clone(),
+            },
+            None,
+        );
+        let engine = RuleEngine::with_default_rules();
+        let correlation = CorrelationBuffer::with_default_capacity();
+        let posture = PostureMachine::new();
+        let ladder = northnarrow_agent::combat::CombatLadder::new(
+            Box::new(northnarrow_agent::combat::SystemActuator::new(
+                exec.clone(),
+                None,
+                true,
+                journal.clone(),
+            )),
+            Box::new(northnarrow_agent::combat::AuditEvidence::new(None)),
+            Box::new(northnarrow_agent::combat::NoProtectedProcs),
+            northnarrow_agent::combat::LadderConfig::default(),
+        );
+        let expected = northnarrow_agent::boot::deny_selftest::ExpectedDenial::default();
+        let stopping = HostStopping::default();
+        let systemd = SystemdSnapshot::default();
+        // a uid of this test's own: the budget is the process's
+        let uid = 77_001;
+        for i in 0..150u32 {
+            process_event(
+                &engine,
+                &exec,
+                &correlation,
+                &posture,
+                &ladder,
+                None,
+                Some(&sink),
+                &expected,
+                &stopping,
+                &systemd,
+                &cow,
+                &dispatcher,
+                exec_from_tmp(910_000 + i, uid),
+            );
+        }
+        dispatcher.stop(Duration::from_secs(10));
+        let records = sink.queued_for_test();
+        let r001: Vec<_> = records
+            .iter()
+            .filter(|r| format!("{:?}", r.verdict).contains("KillProcessTree"))
+            .collect();
+        assert_eq!(r001.len(), 150, "every acting decision is recorded");
+        assert!(
+            r001.iter().all(|r| r.response.contains("detect-only")),
+            "{r001:#?}"
+        );
+        let rows = journal.rows();
+        let rule_intents: Vec<_> = rows
+            .iter()
+            .filter(|r| {
+                r.row == ActionRow::Intent && r.intent.as_ref().is_some_and(|i| i.source == "rule")
+            })
+            .collect();
+        assert_eq!(rule_intents.len(), 150, "an intent per response");
+        for i in &rule_intents {
+            assert!(
+                rows.iter()
+                    .any(|o| o.row == ActionRow::Outcome && o.run == i.run && o.action == i.action),
+                "intent {} unanswered",
+                i.action
+            );
+        }
+        let st = dispatcher.status();
+        assert_eq!(st.queue.lost(), 0);
+        // recorded, so never counted as held (the signed detections_held
+        // rows count what was not recorded)
+        let held = northnarrow_agent::detection_budget::take_held();
+        assert!(
+            !held.iter().any(|h| h.uid == uid),
+            "an acting decision counted held: {held:?}"
+        );
+    }
+
+    /// R12c (lab PR 270): the exploit guard's kills in the kernel are
+    /// recorded whatever the budget (120 of them, past its burst of 100);
+    /// a Log decision runs nothing — no intent — and is recorded within it.
+    #[test]
+    fn the_kernel_s_kills_are_recorded_past_the_budget_and_a_log_decision_runs_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // enforcing: nothing here acts (the kernel killed, `nc` is logged)
+        let exec = Executor::with_config(ExecutorConfig {
+            dry_run: false,
+            ..ExecutorConfig::for_test(tmp.path())
+        });
+        let journal = ActionJournal::memory();
+        let sink = northnarrow_agent::detection_store::DetectionSink::for_test(4096, 0);
+        let cow = northnarrow_agent::cow::CowGuard::off_for_test();
+        let dispatcher = Dispatcher::start(
+            exec.clone(),
+            journal.clone(),
+            Followups {
+                sink: Some(sink.clone()),
+                cow: cow.clone(),
+            },
+            None,
+        );
+        let engine = RuleEngine::with_default_rules();
+        let correlation = CorrelationBuffer::with_default_capacity();
+        let posture = PostureMachine::new();
+        let ladder = northnarrow_agent::combat::CombatLadder::new(
+            Box::new(northnarrow_agent::combat::SystemActuator::new(
+                exec.clone(),
+                None,
+                true,
+                journal.clone(),
+            )),
+            Box::new(northnarrow_agent::combat::AuditEvidence::new(None)),
+            Box::new(northnarrow_agent::combat::NoProtectedProcs),
+            northnarrow_agent::combat::LadderConfig::default(),
+        );
+        let expected = northnarrow_agent::boot::deny_selftest::ExpectedDenial::default();
+        let stopping = HostStopping::default();
+        let systemd = SystemdSnapshot::default();
+        let judge = |e: Event| {
+            process_event(
+                &engine,
+                &exec,
+                &correlation,
+                &posture,
+                &ladder,
+                None,
+                Some(&sink),
+                &expected,
+                &stopping,
+                &systemd,
+                &cow,
+                &dispatcher,
+                e,
+            )
+        };
+        use nn_core::decision::rules::epg::testutil::epg_event;
+        for _ in 0..120 {
+            judge(epg_event(nn_model::EpgKind::CredNoMechanism, true));
+        }
+        let mut nc = exec_from_tmp(7_777, 77_002);
+        if let Event::ProcessSpawn { comm, filename, .. } = &mut nc {
+            *comm = "nc".to_string();
+            *filename = "/usr/bin/nc".to_string();
+        }
+        judge(nc);
+        dispatcher.stop(Duration::from_secs(10));
+        let records = sink.queued_for_test();
+        let killed = records
+            .iter()
+            .filter(|r| r.response.contains("killed in kernel"))
+            .count();
+        assert_eq!(killed, 120, "every kernel kill recorded");
+        let nc_records: Vec<_> = records
+            .iter()
+            .filter(|r| r.principal.pid == 7_777)
+            .collect();
+        assert_eq!(nc_records.len(), 1, "{records:#?}");
+        assert_eq!(
+            nc_records[0].response, "none",
+            "a Log decision runs nothing"
+        );
+        assert!(
+            journal.rows().is_empty(),
+            "no action: no intent ({:#?})",
+            journal.rows()
+        );
     }
 }

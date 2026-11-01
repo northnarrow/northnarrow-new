@@ -28,8 +28,10 @@ use crate::boot::evidence::{attest_degraded_at, AuditHandle};
 use crate::boot::posture::Combat;
 use crate::boot::ready::Armed;
 use crate::boot::tasks::Signals;
+use crate::pipeline::dispatch::{Dispatcher, STOP_WAIT};
 use crate::pipeline::pid1_is_systemd_shutdown;
 use crate::pipeline::process_event::process_event;
+use crate::pipeline::slow::SlowWork;
 
 /// Why the event loop ended (the signed `agent_stop`), and when it began.
 pub(crate) struct Stopped {
@@ -48,6 +50,10 @@ struct Pipeline<'a> {
     detection_sink: &'a Option<northnarrow_agent::detection_store::DetectionSink>,
     telemetry_probe: &'a Option<northnarrow_agent::telemetry_probe::TelemetryProbe>,
     expected_denial: &'a northnarrow_agent::boot::deny_selftest::ExpectedDenial,
+    /// R12c (lab PR 270): where the decisions' responses go.
+    dispatcher: &'a Dispatcher,
+    /// R12c (lab PR 270): where the ransomware tracker's I/O runs.
+    slow: &'a SlowWork,
 }
 
 /// R12b: between the event loop and its decision thread.
@@ -97,6 +103,8 @@ pub(crate) async fn run(
     audit_log: &AuditHandle,
     telemetry_probe: &Option<northnarrow_agent::telemetry_probe::TelemetryProbe>,
     expected_denial: &northnarrow_agent::boot::deny_selftest::ExpectedDenial,
+    dispatcher: &Dispatcher,
+    ransom_tracker: &Arc<northnarrow_agent::impact::RansomTracker>,
     signals: &mut Signals,
 ) -> Stopped {
     // Why the event loop ended — written as the signed `agent_stop` entry
@@ -110,6 +118,9 @@ pub(crate) async fn run(
         };
     };
     let lineage = sensor.lineage();
+    // R12c (lab PR 270): the dispatcher of slow work, waking the decision's
+    // wait when a burst is prepared.
+    let slow = SlowWork::start(Arc::clone(ransom_tracker), Some(rx.waker()));
     let pipeline = Pipeline {
         engine,
         executor,
@@ -120,6 +131,8 @@ pub(crate) async fn run(
         detection_sink,
         telemetry_probe,
         expected_denial,
+        dispatcher,
+        slow: &slow,
     };
     let rt = tokio::runtime::Handle::current();
     let ctl = DecisionControl::default();
@@ -142,7 +155,9 @@ pub(crate) async fn run(
                     return "decision_thread_failed";
                 }
             };
-            let reason = rt.block_on(watch_loop(cli, sensor, combat, audit_log, signals, &ctl));
+            let reason = rt.block_on(watch_loop(
+                cli, sensor, combat, audit_log, signals, &ctl, dispatcher,
+            ));
             ctl.stop.store(true, Ordering::Release);
             match decider.join() {
                 Ok(()) => reason,
@@ -155,6 +170,9 @@ pub(crate) async fn run(
     // row yet signed, before the stop is (a queue's window does not hold
     // it back). R12b: the receiver back from the joined decision thread.
     sensor.restore_receiver(rx);
+    // R12c (lab PR 270): the responses decided are run (at most
+    // `STOP_WAIT`) or signed as not run before the stop.
+    off_the_runtime_stop(dispatcher);
     // R12b: the canary trips judged are in their chain before the stop.
     if let Some(d) = canary_detector {
         if !d.flush(Duration::from_secs(5)) {
@@ -221,16 +239,28 @@ fn decision_loop(
             host_stopping,
             systemd,
             cow_guard,
+            p.dispatcher,
             e,
         );
     };
     loop {
         if ctl.stop.load(Ordering::Acquire) {
+            // R12c: the bursts still with the dispatcher of slow work are
+            // judged before the thread ends (their I/O here, at the stop)
+            for e in p.slow.stop() {
+                judge(e);
+            }
             return;
         }
         // R12b: the signals PID 1 relayed that the decision handed to the
         // systemd watch, judged now on its answer (`SystemdSnapshot`).
         for e in systemd.take_answered() {
+            judge(e);
+        }
+        // R12c (lab PR 270): the bursts the dispatcher of slow work
+        // prepared — their assessment memoised, then judged.
+        for (e, a) in p.slow.take_ready() {
+            p.slow.tracker().prime(&e, a);
             judge(e);
         }
         // Lab PR 216: one round of the loop, for the watchdog's progress
@@ -253,6 +283,20 @@ fn decision_loop(
                     p.engine.observe_arrival(exec);
                 }
                 let e = received.envelope.event;
+                // R12c (lab PR 270): a burst whose assessment is not
+                // prepared goes to the dispatcher of slow work; it comes
+                // back prepared and is judged at a later turn
+                let e = if p.slow.tracker().needs_preparing(&e) {
+                    match p.slow.defer(e) {
+                        Ok(()) => {
+                            rx.decided();
+                            continue;
+                        }
+                        Err(e) => *e,
+                    }
+                } else {
+                    e
+                };
                 judge(e);
                 // Lab PR 267: the event's latency, queue to decision; R12b:
                 // its delay from the record's kernel time (stage 5).
@@ -261,6 +305,9 @@ fn decision_loop(
             Recv::Idle => {}
             Recv::Closed => {
                 warn!("sensor pump exited; shutting down");
+                for e in p.slow.stop() {
+                    judge(e);
+                }
                 return;
             }
         }
@@ -277,6 +324,7 @@ async fn watch_loop(
     audit_log: &AuditHandle,
     signals: &mut Signals,
     ctl: &DecisionControl,
+    dispatcher: &Dispatcher,
 ) -> &'static str {
     let Combat {
         #[cfg(feature = "debug-trigger")]
@@ -308,6 +356,20 @@ async fn watch_loop(
                 debug_protected_query(debug_guard, &cli.admin_socket);
                 #[cfg(feature = "debug-trigger")]
                 debug_stall_loop(&cli.admin_socket, ctl);
+                #[cfg(feature = "debug-trigger")]
+                debug_crash_mid_action(&cli.admin_socket, dispatcher);
+                // R12c (lab PR 270): the response dispatcher's thread ended —
+                // no response runs (each is answered "not run" and counted);
+                // as a dead pump: signed, and the agent stops for a restart.
+                if !dispatcher.is_running() {
+                    error!("the response dispatcher's thread ended — stopping so the watchdog restarts the agent");
+                    attest_degraded_at(
+                        audit_log.as_ref(),
+                        "response dispatcher exited (responses were not run; the agent stops for a watchdog restart)",
+                        false,
+                    );
+                    return "response_dispatcher_exited";
+                }
                 let dead = sensor.finished_pumps();
                 if !dead.is_empty() {
                     // A blind sensor is not hidden behind a silent restart:
@@ -376,6 +438,30 @@ async fn watch_loop(
             }
         }
     }
+}
+
+/// R12c (lab PR 270): the dispatcher's stop waits (at most `STOP_WAIT`)
+/// for the responses still queued — off the runtime's worker.
+fn off_the_runtime_stop(dispatcher: &Dispatcher) {
+    northnarrow_agent::runtime::off_the_runtime(|| dispatcher.stop(STOP_WAIT));
+}
+
+/// `debug-trigger` builds only: a file `debug-crash-mid-action` next to the
+/// admin socket makes the agent abort after its next response's action and
+/// before its outcome row (R12c, lab PR 270: the lab's crash between intent
+/// and outcome — the next start must report the intent as interrupted).
+#[cfg(feature = "debug-trigger")]
+fn debug_crash_mid_action(admin_socket: &std::path::Path, dispatcher: &Dispatcher) {
+    let Some(dir) = admin_socket.parent() else {
+        return;
+    };
+    let trigger = dir.join("debug-crash-mid-action");
+    if std::fs::symlink_metadata(&trigger).is_err() {
+        return;
+    }
+    let _ = std::fs::remove_file(&trigger);
+    warn!("debug-trigger: the agent aborts after its next action, before the outcome row");
+    dispatcher.crash_after_next_action();
 }
 
 /// External audit SNS-001: how often the main loop checks that every

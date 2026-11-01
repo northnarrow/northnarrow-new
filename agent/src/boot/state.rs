@@ -161,6 +161,18 @@ pub(crate) fn bootstrap(
              created on first triage (and unprotected this boot)"
         );
     }
+    // R12c (lab PR 270): the actions chain, beside the detection log — the
+    // same inode-registration rationale.
+    if let Err(e) =
+        northnarrow_agent::anti_tamper::filesystem::bootstrap_actions_log(&cli.actions_file)
+    {
+        warn!(
+            error = %e,
+            path = %cli.actions_file.display(),
+            "actions log bootstrap failed pre-attach — file will be lazily created at the \
+             journal's open (and unprotected this boot)"
+        );
+    }
     // Tappa 9.5 K7: bootstrap the two canary state logs pre-attach
     // for the same reason as the FIM logs — STATE_PROTECTED_FILES
     // needs an inode to register against before LSM hooks come up.
@@ -252,6 +264,7 @@ mod tests {
             ("--fim-drift-file", "fim_drift.jsonl"),
             ("--detections-file", "detections/detections.jsonl"),
             ("--status-events-file", "detections/status_events.jsonl"),
+            ("--actions-file", "detections/actions.jsonl"),
             ("--canary-registry-file", "canary_registry.jsonl"),
             ("--canary-access-file", "canary_access.jsonl"),
             ("--netflow-file", "netflow.jsonl"),

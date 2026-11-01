@@ -1686,6 +1686,35 @@ pub fn bootstrap_status_events_log(status_events_log_path: &Path) -> Result<()> 
     Ok(())
 }
 
+/// R12c (lab PR 270): bootstrap the `actions` chain's active file pre-attach
+/// (a zero-byte placeholder, root only), as the status-event log beside it.
+pub fn bootstrap_actions_log(actions_log_path: &Path) -> Result<()> {
+    if actions_log_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = actions_log_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            DirBuilder::new()
+                .mode(STATE_DIR_MODE)
+                .recursive(true)
+                .create(parent)
+                .with_context(|| format!("creating actions-log parent dir {}", parent.display()))?;
+        }
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(crate::chainlog::STATE_LOG_FILE_MODE)
+        .open(actions_log_path)
+        .with_context(|| format!("creating actions log {}", actions_log_path.display()))?;
+    info!(
+        path = %actions_log_path.display(),
+        "anti-tamper FS: actions log bootstrapped (zero-byte placeholder for PROTECTED_INODES)"
+    );
+    Ok(())
+}
+
 /// Tappa 8 A14 (B4): bootstrap an empty audit.log file if it
 /// doesn't exist yet, so PROTECTED_INODES has an inode to
 /// register at attach time. Idempotent: a present file is

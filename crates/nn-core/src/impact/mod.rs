@@ -150,6 +150,11 @@ pub struct RansomCounters {
     pub trusted: AtomicU64,
     /// Entropy samplings run.
     pub samplings: AtomicU64,
+    /// R12c (lab PR 270): assessments prepared off the decision thread
+    /// (the dispatcher of slow work), and judged where they were asked
+    /// (the replays, the tests, a full slow-work queue).
+    pub prepared: AtomicU64,
+    pub inline: AtomicU64,
 }
 
 /// A snapshot of [`RansomCounters`].
@@ -159,6 +164,8 @@ pub struct RansomCounts {
     pub signals: u64,
     pub trusted: u64,
     pub samplings: u64,
+    pub prepared: u64,
+    pub inline: u64,
 }
 
 #[derive(Debug, Default)]
@@ -218,37 +225,89 @@ impl<H: DecisionHost> RansomTracker<H> {
             signals: self.counters.signals.load(Ordering::Relaxed),
             trusted: self.counters.trusted.load(Ordering::Relaxed),
             samplings: self.counters.samplings.load(Ordering::Relaxed),
+            prepared: self.counters.prepared.load(Ordering::Relaxed),
+            inline: self.counters.inline.load(Ordering::Relaxed),
         }
     }
 
-    /// The assessment of `event`: `None` for an event that is no burst.
-    pub fn assess(&self, event: &Event) -> Option<Arc<Assessment>> {
-        let (pid, ts, tag) = match event {
+    /// The memo's key of a burst event; `None` for an event that is no burst.
+    fn key_of(event: &Event) -> Option<(u32, u64, u8)> {
+        match event {
             Event::MassWrite {
                 pid,
                 timestamp_ns,
                 overwrites,
                 ..
-            } => (*pid, *timestamp_ns, u8::from(*overwrites)),
+            } => Some((*pid, *timestamp_ns, u8::from(*overwrites))),
             Event::FileBurst {
                 pid,
                 timestamp_ns,
                 kind,
                 ..
-            } => (
+            } => Some((
                 *pid,
                 *timestamp_ns,
                 match kind {
                     FileBurstKind::RenameExtension => 2,
                     FileBurstKind::Unlink => 3,
                 },
-            ),
-            _ => return None,
+            )),
+            _ => None,
+        }
+    }
+
+    /// R12c (lab PR 270): `event` is a burst whose assessment is not
+    /// memoised yet — the decision thread hands it to the dispatcher of
+    /// slow work ([`Self::prepare`]) before it judges it.
+    pub fn needs_preparing(&self, event: &Event) -> bool {
+        let Some(key) = Self::key_of(event) else {
+            return false;
         };
-        let key = (pid, ts, tag);
+        !self.state.lock().memo.iter().any(|(k, _)| *k == key)
+    }
+
+    /// R12c (lab PR 270): the assessment of `event` with its I/O — the
+    /// sampler of the burst's files (entropy, the copies) and the trust of
+    /// the writer (its executable's package, its lineage's) — computed off
+    /// the decision thread, by the dispatcher of slow work; not memoised:
+    /// the decision thread memoises it ([`Self::prime`]) right before it
+    /// judges the event, so the posture and the rules read this answer.
+    /// The shapes it counts are the actor's window's, in the order the
+    /// bursts are prepared — the bus's order of the file class.
+    pub fn prepare(&self, event: &Event) -> Option<Arc<Assessment>> {
+        let (pid, ts, _) = Self::key_of(event)?;
+        self.counters.prepared.fetch_add(1, Ordering::Relaxed);
+        Some(Arc::new(self.judge(event, pid, ts)))
+    }
+
+    /// R12c (lab PR 270): memoise the assessment [`Self::prepare`] made for
+    /// `event` — on the decision thread, right before it judges the event.
+    pub fn prime(&self, event: &Event, a: Arc<Assessment>) {
+        let Some(key) = Self::key_of(event) else {
+            return;
+        };
+        let mut st = self.state.lock();
+        if st.memo.iter().any(|(k, _)| *k == key) {
+            return;
+        }
+        if st.memo.len() >= MEMO_CAP {
+            st.memo.pop_front();
+        }
+        st.memo.push_back((key, a));
+    }
+
+    /// The assessment of `event`: `None` for an event that is no burst.
+    /// R12c (lab PR 270): the agent's decision thread finds it memoised —
+    /// prepared off the thread ([`Self::prepare`], [`Self::prime`]); judged
+    /// here (with its I/O) in the replays and the tests, or when the
+    /// dispatcher of slow work could not take it (counted, `inline`).
+    pub fn assess(&self, event: &Event) -> Option<Arc<Assessment>> {
+        let key = Self::key_of(event)?;
+        let (pid, ts, _) = key;
         if let Some((_, a)) = self.state.lock().memo.iter().find(|(k, _)| *k == key) {
             return Some(Arc::clone(a));
         }
+        self.counters.inline.fetch_add(1, Ordering::Relaxed);
         let a = Arc::new(self.judge(event, pid, ts));
         let mut st = self.state.lock();
         if st.memo.len() >= MEMO_CAP {

@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
+use super::journal::Intent;
 use super::proc_ref::{proc_stat, ProcRef};
 use super::ExecutionOutcome;
 
@@ -45,18 +46,26 @@ const KILL_WAIT: Duration = Duration::from_millis(500);
 
 /// Kill exactly one PID (the process it names now). Verifies the target
 /// is gone post-kill.
-pub fn kill_process(pid: u32, protected: &HashSet<u32>) -> ExecutionOutcome {
+/// R12c (lab PR 270): only for an action whose intent is signed (`intent`).
+pub fn kill_process(pid: u32, protected: &HashSet<u32>, intent: &Intent) -> ExecutionOutcome {
     if pid == 0 {
         return ExecutionOutcome::Refused {
             pid,
             reason: "PID 0 invalid",
         };
     }
-    kill_ref(&ProcRef::open(pid), protected)
+    kill_ref(&ProcRef::open(pid), protected, intent)
 }
 
-/// Kill exactly the process `target` holds (external audit CMB-004).
-pub fn kill_ref(target: &ProcRef, protected: &HashSet<u32>) -> ExecutionOutcome {
+/// Kill exactly the process `target` holds (external audit CMB-004). R12c
+/// (lab PR 270): only for an action whose intent is signed (`intent`).
+pub fn kill_ref(target: &ProcRef, protected: &HashSet<u32>, _intent: &Intent) -> ExecutionOutcome {
+    kill_one(target, protected)
+}
+
+/// [`kill_ref`]'s work: the tree's kills call it for each process of an
+/// action whose intent is signed.
+fn kill_one(target: &ProcRef, protected: &HashSet<u32>) -> ExecutionOutcome {
     let pid = target.pid();
     if pid == 0 {
         return ExecutionOutcome::Refused {
@@ -102,8 +111,9 @@ pub fn kill_ref(target: &ProcRef, protected: &HashSet<u32>) -> ExecutionOutcome 
 pub fn kill_process_tree(
     root_pid: u32,
     protected: &HashSet<u32>,
+    intent: &Intent,
 ) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
-    kill_process_tree_guarded(root_pid, protected, &|_| None)
+    kill_process_tree_guarded(root_pid, protected, &|_| None, intent)
 }
 
 /// [`kill_process_tree`] with an extra per-pid guard consulted for EVERY
@@ -118,11 +128,12 @@ pub fn kill_process_tree_guarded(
     root_pid: u32,
     protected: &HashSet<u32>,
     guard: &dyn Fn(u32) -> Option<&'static str>,
+    intent: &Intent,
 ) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
     if root_pid <= 1 {
         return refuse_root(root_pid);
     }
-    kill_tree(&ProcRef::open(root_pid), protected, guard, None)
+    kill_tree(&ProcRef::open(root_pid), protected, guard, None, intent)
 }
 
 fn refuse_root(root_pid: u32) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
@@ -139,11 +150,13 @@ fn refuse_root(root_pid: u32) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
 /// directory to create, e.g. `northnarrow.slice/blocked.scope/
 /// neutralize-<n>`), through that cgroup (external audit CMB-019);
 /// without it, or where the cgroup cannot be used, process by process.
+/// R12c (lab PR 270): only for an action whose intent is signed (`intent`).
 pub fn kill_tree(
     root: &ProcRef,
     protected: &HashSet<u32>,
     guard: &dyn Fn(u32) -> Option<&'static str>,
     scope: Option<&Path>,
+    _intent: &Intent,
 ) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
     // Hard floor: PID 0 (the kernel's own parent in the /proc ppid map)
     // and PID 1 (init) can never be a tree root. The /proc walk below
@@ -201,7 +214,7 @@ fn kill_tree_by_pid(
             pid: root_pid,
             reason,
         },
-        None => kill_ref(root, protected),
+        None => kill_one(root, protected),
     };
 
     let mut outcomes = Vec::with_capacity(descendants.len() + 1);
@@ -214,7 +227,7 @@ fn kill_tree_by_pid(
             None => {
                 let child = ProcRef::open(child_pid);
                 if child.start_ticks() == Some(start) {
-                    kill_ref(&child, protected)
+                    kill_one(&child, protected)
                 } else if let Some(errno) = child.capture_errno() {
                     // not captured (the agent out of descriptors): it may
                     // still run
@@ -355,7 +368,7 @@ fn kill_tree_in_cgroup(
                 }
                 Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
                 // not moved: killed on its own
-                Err(_) => others.push(kill_ref(&child, protected)),
+                Err(_) => others.push(kill_one(&child, protected)),
             }
         }
         new
@@ -389,7 +402,7 @@ fn kill_tree_in_cgroup(
     let primary = if root.wait_exit(EXIT_WAIT) {
         ExecutionOutcome::Killed { pid: root_pid }
     } else {
-        kill_ref(root, protected)
+        kill_one(root, protected)
     };
     let mut outcomes = check_members(&members);
     outcomes.extend(others);
@@ -624,13 +637,21 @@ mod tests {
 
     #[test]
     fn refuses_pid_zero() {
-        let out = kill_process(0, &protected_with(&[]));
+        let out = kill_process(
+            0,
+            &protected_with(&[]),
+            &super::super::journal::test_intent(),
+        );
         assert!(matches!(out, ExecutionOutcome::Refused { pid: 0, .. }));
     }
 
     #[test]
     fn refuses_protected_pid_one() {
-        let out = kill_process(1, &protected_with(&[]));
+        let out = kill_process(
+            1,
+            &protected_with(&[]),
+            &super::super::journal::test_intent(),
+        );
         assert!(matches!(
             out,
             ExecutionOutcome::Refused {
@@ -643,7 +664,11 @@ mod tests {
     #[test]
     fn refuses_own_pid() {
         let own = std::process::id();
-        let out = kill_process(own, &protected_with(&[]));
+        let out = kill_process(
+            own,
+            &protected_with(&[]),
+            &super::super::journal::test_intent(),
+        );
         assert!(
             matches!(out, ExecutionOutcome::Refused { reason: "PID is protected", .. } if matches!(out, ExecutionOutcome::Refused { pid, .. } if pid == own))
         );
@@ -652,7 +677,11 @@ mod tests {
     #[test]
     fn returns_already_gone_for_nonexistent_pid() {
         // PID 999_999_999 is well above the kernel's PID limit — guaranteed absent.
-        let out = kill_process(999_999_999, &protected_with(&[]));
+        let out = kill_process(
+            999_999_999,
+            &protected_with(&[]),
+            &super::super::journal::test_intent(),
+        );
         assert!(matches!(
             out,
             ExecutionOutcome::AlreadyGone { pid: 999_999_999 }
@@ -686,9 +715,12 @@ mod tests {
     fn kill_tree_guard_spares_descendants() {
         let (mut sh, kids) = shell_with_two_sleepers();
         let (spared, killed) = (kids[0], kids[1]);
-        let (primary, rest) = kill_process_tree_guarded(sh.id(), &protected_with(&[]), &|pid| {
-            (pid == spared).then_some("host-critical (test guard)")
-        });
+        let (primary, rest) = kill_process_tree_guarded(
+            sh.id(),
+            &protected_with(&[]),
+            &|pid| (pid == spared).then_some("host-critical (test guard)"),
+            &super::super::journal::test_intent(),
+        );
         assert!(
             matches!(primary, ExecutionOutcome::Killed { pid } if pid == sh.id()),
             "{primary:?}"
@@ -716,7 +748,13 @@ mod tests {
         let (mut sh, kids) = shell_with_two_sleepers();
         // a capture of an earlier holder of the shell's PID, since exited
         let earlier = ProcRef::for_test(sh.id(), Some(1));
-        let (primary, rest) = kill_tree(&earlier, &protected_with(&[]), &|_| None, None);
+        let (primary, rest) = kill_tree(
+            &earlier,
+            &protected_with(&[]),
+            &|_| None,
+            None,
+            &super::super::journal::test_intent(),
+        );
         assert!(
             matches!(primary, ExecutionOutcome::AlreadyGone { pid } if pid == sh.id()),
             "{primary:?}"
@@ -771,7 +809,11 @@ mod tests {
                 let _ = harmless.wait();
                 continue;
             }
-            let outcome = kill_ref(&captured, &HashSet::new());
+            let outcome = kill_ref(
+                &captured,
+                &HashSet::new(),
+                &super::super::journal::test_intent(),
+            );
             assert!(
                 matches!(outcome, ExecutionOutcome::AlreadyGone { .. }),
                 "{outcome:?}"
@@ -1013,14 +1055,22 @@ mod tests {
     fn kill_tree_refuses_pid_zero_without_walking() {
         // PID 0's /proc "children" are init + kthreadd: walking them
         // would enumerate the whole host. Must refuse with NO outcomes.
-        let (primary, rest) = kill_process_tree(0, &protected_with(&[]));
+        let (primary, rest) = kill_process_tree(
+            0,
+            &protected_with(&[]),
+            &super::super::journal::test_intent(),
+        );
         assert!(matches!(primary, ExecutionOutcome::Refused { pid: 0, .. }));
         assert!(rest.is_empty(), "no descendant may be touched: {rest:?}");
     }
 
     #[test]
     fn kill_tree_refuses_pid_one_without_walking() {
-        let (primary, rest) = kill_process_tree(1, &protected_with(&[]));
+        let (primary, rest) = kill_process_tree(
+            1,
+            &protected_with(&[]),
+            &super::super::journal::test_intent(),
+        );
         assert!(matches!(primary, ExecutionOutcome::Refused { pid: 1, .. }));
         assert!(rest.is_empty(), "no descendant may be touched: {rest:?}");
     }

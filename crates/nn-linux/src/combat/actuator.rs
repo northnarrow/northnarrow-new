@@ -32,15 +32,23 @@ pub use nn_core::combat::actuator::{
 use super::offender::ProcFacts;
 use crate::anti_tamper::network_isolate::NetworkIsolator;
 use crate::chain_host_linux::LinuxHost;
+use crate::response::journal::{ActionIntent, ActionJournal, ActionResult, Intent};
 use crate::response::proc_ref::ProcRef;
 use crate::response::quarantine::ExeHandle;
 use crate::response::{block_outbound, ExecutionOutcome, ExecutionReport, Executor};
 
 /// Production actuator: real executor + optional network isolator.
+///
+/// R12c (lab PR 270): every action it carries out — a soft egress block and
+/// its release, each offender's kill tree, each binary's quarantine, the
+/// isolation — is bracketed by the `actions` chain: a signed intent row
+/// before, the outcome after (`journal`). The ladder's own signed stage
+/// rows (the audit log: evidence before enforcement, CMB-027) say why.
 pub struct SystemActuator {
     executor: Executor,
     isolator: Option<Arc<NetworkIsolator>>,
     detect_only: bool,
+    journal: ActionJournal,
 }
 
 impl SystemActuator {
@@ -48,12 +56,28 @@ impl SystemActuator {
         executor: Executor,
         isolator: Option<Arc<NetworkIsolator>>,
         detect_only: bool,
+        journal: ActionJournal,
     ) -> Self {
         Self {
             executor,
             isolator,
             detect_only,
+            journal,
         }
+    }
+
+    /// The signed intent of one of the ladder's actions.
+    fn intent(&self, response: &str, pid: u32, stage: &str) -> Intent {
+        let mut i = ActionIntent::named("combat", response, pid);
+        i.severity = "critical".to_string();
+        i.why = vec![format!("COMBAT {stage}")];
+        self.journal.intent(i)
+    }
+
+    /// An executor report as the action's signed outcome.
+    fn finish(intent: Intent, report: &ExecutionReport) {
+        let (result, text, reason) = crate::response::journal_outcome(report);
+        intent.finish(result, text, reason);
     }
 
     /// Map a kill outcome to "did we contain this offender?". `Killed` /
@@ -217,7 +241,11 @@ impl CombatActuator<LinuxHost> for SystemActuator {
             }
             return SoftBlock::NotNeeded("process already exited");
         }
-        let report = self.executor.execute(ResponseAction::BlockOutbound, pid);
+        let intent = self.intent("BlockOutbound", pid, "INVESTIGATE: soft egress block");
+        let report = self
+            .executor
+            .execute(ResponseAction::BlockOutbound, pid, &intent);
+        Self::finish(intent, &report);
         info!(
             target: "combat.actuator",
             pid,
@@ -236,8 +264,24 @@ impl CombatActuator<LinuxHost> for SystemActuator {
             info!(target: "combat.actuator", pid, "soft egress not released: the process has exited");
             return;
         }
+        let intent = self.intent("Release", pid, "stand-down: soft egress released");
         let released =
             block_outbound::release_blocked_pid(pid, target.start_ticks(), self.executor.config());
+        match &released {
+            Ok(block_outbound::Release::Released) => {
+                intent.finish(ActionResult::Success, "released".to_string(), None)
+            }
+            Ok(block_outbound::Release::Skipped(why)) => intent.finish(
+                ActionResult::NotRun,
+                "left as it is".to_string(),
+                Some((*why).to_string()),
+            ),
+            Err(e) => intent.finish(
+                ActionResult::Failure,
+                "release failed".to_string(),
+                Some(e.to_string()),
+            ),
+        }
         if let Ok(r) = &released {
             self.executor.record_release(pid, "blocked", r);
         }
@@ -285,7 +329,11 @@ impl CombatActuator<LinuxHost> for SystemActuator {
         let mut outcomes: Vec<OffenderOutcome> = Vec::with_capacity(offenders.len());
         for r in offenders {
             let pid = r.pid();
-            let report = self.executor.execute_on(ResponseAction::KillProcessTree, r);
+            let intent = self.intent("KillProcessTree", pid, "NEUTRALIZE");
+            let report = self
+                .executor
+                .execute_on(ResponseAction::KillProcessTree, r, &intent);
+            Self::finish(intent, &report);
             let (contained, kill) = Self::kill_outcome(&report);
             if contained {
                 info!(
@@ -322,7 +370,9 @@ impl CombatActuator<LinuxHost> for SystemActuator {
                 Some(handle) => match done.iter().find(|(k, _)| *k == handle.key()) {
                     Some((_, first)) => format!("same binary as pid {first}"),
                     None => {
-                        let report = self.executor.quarantine_handle(&handle, pid);
+                        let intent = self.intent("Quarantine", pid, "NEUTRALIZE");
+                        let report = self.executor.quarantine_handle(&handle, pid, &intent);
+                        Self::finish(intent, &report);
                         done.push((handle.key(), pid));
                         Self::quarantine_text(pid, &report.primary)
                     }
@@ -346,7 +396,22 @@ impl CombatActuator<LinuxHost> for SystemActuator {
         }
         match &self.isolator {
             Some(iso) => {
-                let report = iso.engage();
+                let intent = self.intent("Isolate", 0, "ISOLATE");
+                let report = iso.engage(&intent);
+                let (result, reason) = if report.complete() {
+                    (ActionResult::Success, None)
+                } else if report.engaged() {
+                    (
+                        ActionResult::Partial,
+                        Some("a family is not isolated (the ladder retries)".to_string()),
+                    )
+                } else {
+                    (
+                        ActionResult::Failure,
+                        Some("the host is not isolated (the ladder retries)".to_string()),
+                    )
+                };
+                intent.finish(result, report.summary("isolated"), reason);
                 if !report.engaged() {
                     tracing::error!(
                         target: "combat.actuator",
@@ -491,7 +556,7 @@ mod tests {
         exec.set_tree_guard(std::sync::Arc::new(move |pid: u32| {
             (pid == child).then_some("test-guard")
         }));
-        let actuator = SystemActuator::new(exec, None, false);
+        let actuator = SystemActuator::new(exec, None, false, ActionJournal::memory());
         let outcome = actuator
             .neutralize(&[Arc::new(ProcRef::open(parent.id()))])
             .outcome();
@@ -540,7 +605,7 @@ mod tests {
         exec.set_tree_guard(std::sync::Arc::new(move |pid: u32| {
             (pid == spared).then_some("test-guard")
         }));
-        let actuator = SystemActuator::new(exec, None, false);
+        let actuator = SystemActuator::new(exec, None, false, ActionJournal::memory());
         let report = actuator.neutralize(&[
             Arc::new(ProcRef::open(first.id())),
             Arc::new(ProcRef::open(second.id())),
@@ -626,7 +691,12 @@ mod tests {
             ..ExecutorConfig::for_test(&tmp.path().join("state"))
         };
         let vault = cfg.quarantine_dir.join("vault");
-        let actuator = SystemActuator::new(Executor::with_config(cfg), None, false);
+        let actuator = SystemActuator::new(
+            Executor::with_config(cfg),
+            None,
+            false,
+            ActionJournal::memory(),
+        );
         let report = actuator.neutralize(&[Arc::new(ProcRef::open(pid))]);
         assert!(
             matches!(report.outcome(), NeutralizeOutcome::Contained),

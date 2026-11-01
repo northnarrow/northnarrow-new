@@ -28,6 +28,8 @@ fn telemetry_status(
     let ransom = handles.ransom_tracker.as_ref().map(|t| t.counts());
     let defense = handles.defense_detector.as_ref().map(|d| d.counts());
     let execpol = crate::execpol::snapshot();
+    // R12c (lab PR 270): stages 6 and 7, read once for both fields.
+    let dispatch = handles.response_dispatch.as_ref().map(|f| f());
     StatusResponse {
         posture: posture.current_kind(),
         network_isolation_engaged: isolator.is_engaged(),
@@ -119,9 +121,14 @@ fn telemetry_status(
         execpol_map_recorded_total: Some(execpol.map_recorded),
         execq_script_refused_total: Some(execq.script_refused),
         // Lab PR 267 (R12a): the event bus and the losses by stage.
-        event_bus: handles.event_bus.as_ref().map(event_bus_status),
+        event_bus: handles
+            .event_bus
+            .as_ref()
+            .map(|b| event_bus_status(b, dispatch.as_ref())),
         // R12b (lab PR 269): stage 5 per queue, the floods of P0 capped.
         event_bus_decision: handles.event_bus.as_ref().map(event_bus_decision),
+        // R12c (lab PR 270): stages 6 and 7.
+        response_dispatch: dispatch,
     }
 }
 
@@ -157,6 +164,7 @@ fn event_bus_decision(
 /// counted yet).
 fn event_bus_status(
     bus: &crate::sensors::bus::BusStats,
+    dispatch: Option<&nn_proto::admin_protocol::ResponseDispatchStatus>,
 ) -> nn_proto::admin_protocol::EventBusStatus {
     use nn_proto::admin_protocol::{BusQueueStatus, EventBusStatus, LossStageCount};
     let queues = bus.snapshot();
@@ -164,6 +172,7 @@ fn event_bus_status(
         &crate::sensors::ring_drops::snapshot(),
         crate::sensors::reject::total(),
         &queues,
+        dispatch.map(|d| (d.stage6(), d.stage7())),
     );
     EventBusStatus {
         queues: queues

@@ -33,7 +33,13 @@ pub const IO_WEIGHT: u16 = 10;
 /// Effective CPU cap reported in [`ExecutionOutcome::Throttled`].
 pub const CPU_MAX_PCT: u8 = 10;
 
-pub fn throttle_pid(pid: u32, protected: &HashSet<u32>, cfg: &ExecutorConfig) -> ExecutionOutcome {
+/// R12c (lab PR 270): only for an action whose intent is signed (`_intent`).
+pub fn throttle_pid(
+    pid: u32,
+    protected: &HashSet<u32>,
+    cfg: &ExecutorConfig,
+    _intent: &super::journal::Intent,
+) -> ExecutionOutcome {
     if pid == 0 {
         return ExecutionOutcome::Refused {
             pid,
@@ -284,7 +290,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = dry_cfg(&tmp);
         let protected = HashSet::new();
-        let out = throttle_pid(4242, &protected, &cfg);
+        let out = throttle_pid(
+            4242,
+            &protected,
+            &cfg,
+            &super::super::journal::test_intent(),
+        );
         assert!(
             matches!(out, ExecutionOutcome::WouldExecute { pid: 4242 }),
             "{out:?}"
@@ -305,7 +316,12 @@ mod tests {
         let dir = cfg.throttled_cgroup_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("cgroup.procs"), b"").unwrap();
-        let out = throttle_pid(std::process::id() + 1_000_000, &HashSet::new(), &cfg);
+        let out = throttle_pid(
+            std::process::id() + 1_000_000,
+            &HashSet::new(),
+            &cfg,
+            &super::super::journal::test_intent(),
+        );
         assert!(
             matches!(out, ExecutionOutcome::Failed { errno, .. } if errno == libc::EOPNOTSUPP),
             "{out:?}"
@@ -373,7 +389,7 @@ mod tests {
         let cfg = dry_cfg(&tmp);
         let mut protected = HashSet::new();
         protected.insert(7);
-        let out = throttle_pid(7, &protected, &cfg);
+        let out = throttle_pid(7, &protected, &cfg, &super::super::journal::test_intent());
         assert!(matches!(
             out,
             ExecutionOutcome::Refused {

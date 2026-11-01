@@ -139,6 +139,7 @@ pub const WEAKENING_ENV: &[(&str, WeakensWith)] = &[
     (crate::chainlog::FIM_DRIFT_CAP_ENV, any_value),
     (crate::chainlog::DETECTIONS_CAP_ENV, any_value),
     (crate::chainlog::STATUS_EVENTS_CAP_ENV, any_value),
+    (crate::chainlog::ACTIONS_CAP_ENV, any_value),
     // External audit PROC-015 (NN-AUD-302): a demo-tappa5 build enforces
     // its demo rules R901..R904 under this variable (in any other build
     // nothing reads it, so it is not reported there).

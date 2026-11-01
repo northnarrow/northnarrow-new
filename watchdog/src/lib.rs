@@ -4205,6 +4205,7 @@ mod tests {
                 execq_script_refused_total: None,
                 event_bus: None,
                 event_bus_decision: None,
+                response_dispatch: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

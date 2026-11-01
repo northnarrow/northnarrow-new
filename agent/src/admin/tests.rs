@@ -209,7 +209,13 @@ async fn end_to_end_unlock_cycle_clears_combat() {
     // built with the real rules path + system iptables-restore,
     // which on a test machine without root will fail. Skip this
     // particular test if the engage shell-out fails.)
-    if !h.isolator.engage().engaged() {
+    if !h
+        .isolator
+        .engage(&crate::response::journal::ActionJournal::memory().intent(
+            crate::response::journal::ActionIntent::named("test", "test", 0),
+        ))
+        .engaged()
+    {
         eprintln!("iptables-restore unavailable / not root; skipping end-to-end test");
         return;
     }
@@ -998,6 +1004,7 @@ fn audit_chains_rotate_keys_add_emissions_and_skips_non_auditable() {
         execq_script_refused_total: None,
         event_bus: None,
         event_bus_decision: None,
+        response_dispatch: None,
     });
     emit_audit_for(
         &status_req,
@@ -2390,7 +2397,14 @@ fn dispatch_response_status_lists_contained_and_quarantined() {
     let payload = dir.path().join("dropper");
     std::fs::write(&payload, b"bad bytes").unwrap();
     let handle = crate::response::quarantine::ExeHandle::open(&payload).unwrap();
-    let out = crate::response::quarantine::quarantine_handle(&handle, 4242, &state.config);
+    let out = crate::response::quarantine::quarantine_handle(
+        &handle,
+        4242,
+        &state.config,
+        &crate::response::journal::ActionJournal::memory().intent(
+            crate::response::journal::ActionIntent::named("test", "test", 0),
+        ),
+    );
     assert!(matches!(
         out,
         crate::response::ExecutionOutcome::Quarantined { .. }
@@ -2574,7 +2588,14 @@ fn dispatch_response_restore_is_gated_and_restores() {
     std::fs::write(&payload, b"bad bytes").unwrap();
     let handle = crate::response::quarantine::ExeHandle::open(&payload).unwrap();
     let crate::response::ExecutionOutcome::Quarantined { vault_id, .. } =
-        crate::response::quarantine::quarantine_handle(&handle, 4242, &state.config)
+        crate::response::quarantine::quarantine_handle(
+            &handle,
+            4242,
+            &state.config,
+            &crate::response::journal::ActionJournal::memory().intent(
+                crate::response::journal::ActionIntent::named("test", "test", 0),
+            ),
+        )
     else {
         panic!("not quarantined");
     };

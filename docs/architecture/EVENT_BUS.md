@@ -1,11 +1,16 @@
 # The event bus
 
-*Wave 4 restructure, R12a (lab PR 267) and R12b (lab PR 269). Plan:
-`w4-restructure-plan` §3.4 and the R12 line. Code: `crates/nn-core/src/bus.rs`
-(the portable half: classes, queues, take order, the envelope, the
-decision's budget, the per-uid cap) and `crates/nn-linux/src/sensors/bus.rs`
-(the runtime: senders, batches, waits, receiver, loss recorder);
-`crates/nn-linux/src/sensors/pump.rs` (the pumps' threads, R12b).*
+*Wave 4 restructure, R12a (lab PR 267), R12b (lab PR 269) and R12c (lab PR
+270). Plan: `w4-restructure-plan` §3.4 and the R12 line. Code:
+`crates/nn-core/src/bus.rs` (the portable half: classes, queues, take order,
+the envelope, the decision's budget, the per-uid cap) and
+`crates/nn-linux/src/sensors/bus.rs` (the runtime: senders, batches, waits,
+receiver, loss recorder); `crates/nn-linux/src/sensors/pump.rs` (the pumps'
+threads, R12b); R12c: `crates/nn-core/src/response/dispatch.rs` (the
+response queue, stage 6), `agent/src/pipeline/dispatch.rs` (the response
+dispatcher), `agent/src/pipeline/slow.rs` (the dispatcher of slow work),
+`crates/nn-linux/src/response/journal.rs` and
+`crates/nn-evidence/src/action_payload.rs` (the actions chain).*
 
 ## 1. Why
 
@@ -28,7 +33,9 @@ from them by priority; a flood of opens fills the file queue, which drops
 its new opens, and the tamper queue is taken first, its pump never waiting
 behind the opens. R12a left the decision unchanged — the one event loop
 judged every event through `process_event`; R12b (§2d) puts it on a thread
-of its own without `await`, the response dispatcher is R12c (§7).
+of its own without `await`; R12c (§2e) takes the responses off it — the
+response dispatcher — with the invariant "no action without a signed
+record".
 
 ## 2. The classes
 
@@ -280,17 +287,9 @@ What blocked the decision is off it:
   answer.
 
 What the decision thread still does that is I/O, exactly (review of #475:
-"no blocking I/O" was not exact):
-- the responses a decision runs, in order, before the next event — the
-  executor and what it calls: a kill's cgroup made, frozen, killed and
-  removed, its verify retries (up to 50 ms), `/proc` reads, the
-  quarantine's copy and its synced ledger, the containment ledger, the
-  outbound block and the throttle's cgroup files (R12a's loop awaited them
-  on the blocking pool); their dispatcher is R12c's;
-- the ransomware tracker's sampler of a burst's files (their entropy, the
-  copies) and its trust of the writer's executable (a digest, the package
-  that owns it) — on a mass-write or rename burst only; R12c's dispatcher of
-  slow work;
+"no blocking I/O" was not exact; R12c took off it the responses — the
+response dispatcher, §2e — and the ransomware tracker's sampler and trust —
+the dispatcher of slow work, §2e):
 - the per-rule policy's exemption facts (a process's uid, cgroup and
   executable from `/proc`, a pidfile), read once per process and cached;
 - a canary trip's reader, one readlink of `/proc/<pid>/exe`, on a trip
@@ -308,18 +307,209 @@ A guard keeps any more off the decision path
 (`xtask/tests/decision_path_io.rs`, run by `cargo test`): the decision
 thread's own code — `process_event.rs`, `decision_loop` — holds no
 `await`, no file or `/proc` access, no process, no sleep, no
-`block_in_place`; every other file of the code the decision calls into —
-the rule engine, the posture and its lineage, the ladder, the canary
-detector, the correlation buffer, the budget, the ransomware and
-impairment trackers, the copy-on-write guard, the detection sink, the
-telemetry probe, and (review of #475) the responses' code under
-`crates/nn-linux/src/response` — is a ratchet: each file's I/O sites are
-counted and listed with why; a new site, or a count above its pin, fails,
-and a count below it fails until the pin is lowered. It is lexical: it
-counts markers in the files of its list (the reviewer's mutation K9, a read
-planted in `Executor::execute_for_started`, failed only once the responses'
-code was on the list) — code the decision reaches outside the list is not
-seen, and the list is kept by hand.
+`block_in_place` (rule 1), and (R12c, rule 1b) calls no acting entry point
+— the executor's, the low-level kills, block, throttle, quarantine and
+strip, the isolator's engage, the actions journal's tickets: its responses
+are submitted to the dispatcher, and a Log decision's report is
+`Executor::log_report`, which touches nothing (the reviewer's mutation K9
+of #475, the executor called from `process_event` again, now fails rule
+1b); every other file of the code the decision calls into — the rule
+engine, the posture and its lineage, the ladder, the canary detector, the
+correlation buffer, the budget, the ransomware and impairment trackers,
+the copy-on-write guard, the detection sink, the telemetry probe — is a
+ratchet: each file's I/O sites are counted and listed with why; a new
+site, or a count above its pin, fails, and a count below it fails until
+the pin is lowered. The response code under `crates/nn-linux/src/response`
+left the list with R12c (it runs on the dispatcher's thread), and so did
+the two dispatchers' own files (`OFF_PATH`, each with its reason). It is
+lexical: it counts markers in the files of its list — code the decision
+reaches outside the list is not seen, and the list is kept by hand.
+
+## 2e. The response dispatcher, and no action without a signed record (R12c)
+
+Until R12c the decision thread ran each decision's responses itself, in
+order, before the next event — a kill's cgroup made, frozen, killed and
+removed with its verify retries (up to 50 ms), the quarantine's copy and
+its synced ledger, the outbound block and the throttle's cgroup files: one
+slow response held every later decision back. Now the decision hands them
+over and judges the next event.
+
+**The dispatcher** (`pipeline::dispatch`, the thread `nn-response`). The
+decision thread submits a decision's responses to its queue
+(`nn_core::response::dispatch::ResponseQueue`, stage 6) — a push under a
+lock, never a wait — and the thread takes them:
+- **by severity**: four lanes, Critical first; once the oldest job waited
+  `STARVATION_NS` (500 ms), one take in four (`AGED_TAKE_EVERY`) is it,
+  whatever its lane, so a flood of Critical kills cannot hold a Low
+  throttle back for ever — and the other three go by severity, so a backlog
+  of old jobs cannot hold a new Critical kill back behind all of them (the
+  first build took every old job first: in EXP-13r's backlog of ~350 kills
+  the queue became first in, first out, 185 of 400 takes passing over a
+  more severe job);
+- **in order per process** (a later response for the same process never
+  overtakes an earlier one): a process is its pid *and* its start (a
+  process that reused a pid is another one — review of #476, X1); each
+  process's jobs are kept in the order they were decided, and a take runs
+  the *oldest* job of the process the lane names — a Critical quarantine
+  decided after a Low strip of the same process raises that process's turn
+  (priority inheritance) and the strip runs first, then the quarantine.
+  One thread takes, so two jobs of one process never run at once. The
+  COMBAT ladder keeps its own worker (external audit CMB-007) and the exec
+  quarantine its thread: a rule's response and a ladder step on the same
+  process are not ordered between them, as before R12c;
+- **a kill goes first** (review of #476): a kill of a process is placed
+  before that process's queued jobs, so it never waits behind what it
+  would make pointless; the process's quarantine or strip runs after it.
+  Once the kill *killed* (the process killed, or already gone), its
+  process's throttles and blocks still queued — or taken in the same
+  batch behind it — are answered `not run: superseded by a kill of the
+  same process` and counted (`superseded`; not a loss). A kill that did
+  not kill (the host-critical guard, EPERM, a cgroup that would not die)
+  supersedes nothing: they run after it (the re-check of #476: a
+  compromised process the agent cannot kill must still lose its network
+  or its CPU);
+- **a repeat merges**: a job of the same process (pid and start), action
+  and — but for a kill — file as the process's *last* queued job (its
+  first, for a kill) is merged into it (a process that tripped two rules,
+  or one twice, before its kill ran) — one action, both decisions answered
+  by its outcome, the lane raised to the more severe;
+- **a full queue** (`RESPONSE_QUEUE_CAP`, 1,024 jobs) never blocks the
+  decision and never drops silently: the newest job of the least severe
+  lane below the new job's severity is displaced; when every queued job is
+  at least as severe, a **Critical kill is never refused** — it is queued
+  past the capacity (counted `over_cap`), up to four times it
+  (`OVER_CAP_FACTOR`, a hard bound: review of #476, X2 — decoys that keep
+  the queue full of Critical kills must not get the payload's kill
+  refused) — and any other new job is refused. A displaced or refused job
+  is answered at once (its
+  decision's detection record says `not run: the response queue was full…`),
+  counted per severity (stage 6), named in the next signed `overflow` row of
+  the actions chain (at most one a second, and at the stop) and raises the
+  posture's `TelemetryLoss`;
+- **at the stop** the thread runs what is queued for at most `STOP_WAIT`
+  (2 s); what is left is answered `not run: the agent stopped`, counted and
+  signed in a last `overflow` row; a dispatcher whose thread did not start
+  answers every response so (`not run: the response dispatcher is not
+  running`), never running it on the decision thread.
+
+The decision's detection record follows its responses' outcomes, as before
+(written by whichever thread answers the decision's last response), and the
+copy-on-first-write guard hears a ransomware rule's kill once it ran (the
+writer is flagged at the decision, as before).
+
+**No action without a signed record** (plan §3.4) — precisely, without an
+**attempt** at one: every action the agent carries out on the host on its
+own decision writes a signed `intent` row before it acts and a signed
+`outcome` row after it, into the `actions` chain; when the chain cannot
+take a row the action still proceeds (below). The intent row is written
+(`write(2)`: it survives a crash of the agent) before every action, and
+synced (on the disk) before the action when the action's effect outlives
+a restart of the host — a quarantine, a capability strip, a restore
+(`journal::synced_before_action`); a kill's, a block's, a throttle's, an
+isolation's intent is synced with its outcome (review of #476: the fsync
+before them slowed the kills on a busy disk and guarded only against a
+crash of the host, which ends their effect too). Every fsync is done
+outside the writer's lock (`RotatingChainLog::detach_sync`), so the
+ladder, the exec quarantine and the restore do not wait behind the
+dispatcher's; an intent synced before its action always fsyncs itself
+(another thread's detached fsync may still be under way). A failed fsync
+is counted apart (`syncs failed`: the row is in the chain, whether on the
+disk is not known), and an outcome whose intent the chain could not take
+says so (`intent_written: false`). The chain:
+(`/var/lib/northnarrow/detections/actions.jsonl`, a rotating chain beside
+the detection log, KIND `actions`: `nn_evidence::action_payload`, its rows
+pinned; `docs/operator/EVIDENCE_CHAINS.md`). Its writer
+(`nn_linux::response::journal::ActionJournal`) makes the only ticket an
+action can run with: an `Intent`, made by `ActionJournal::intent` (or
+`intents`, a batch) after the intent row, its fields private;
+`Intent::finish` writes the outcome, and an intent dropped unanswered (a
+panic in the action) writes an `abandoned` outcome itself. Every acting
+entry point takes one — the executor's (`execute_on`, `execute_for_started`,
+`quarantine_handle`, …), the low-level kills, block, throttle, quarantine
+and strip, the isolator's `engage` —, so no caller compiles without the
+intent written first. Bracketed this way: a rule's responses (the
+dispatcher: a batch's intents, then each action and its outcome, the
+batch's rows synced), the COMBAT ladder's soft egress
+block and its release, each offender's kill tree, each binary's quarantine
+and the isolation (`SystemActuator`; the ladder's own signed stage rows in
+the audit log still say why: evidence before enforcement), the exec
+quarantine's kill and quarantine, the copy-on-write guard's automatic
+restore. `xtask/tests/action_records.rs` fails when an acting entry point
+loses its ticket, when anything but the journal could make one, when one of
+the actions outside those entry points (a signal the exec quarantine sends
+itself, the soft block's release, the automatic restore) is made from
+another place or without its ticket made and answered, and when a function
+makes a ticket it never answers. Not actions of the agent's decision: the
+kernel's own refusals (the deny hooks; their records are Log-only
+detections) and the exploit guard's SIGKILL in the kernel (its detection
+record, never held by the budget — below); the operator's verbs
+(`nn-admin release`, `remediate`, `unlock`: the admin socket signs each
+request and its result); the watchdog's restart of the agent. One action
+of the agent's own is signed in the audit log only, not in the actions
+chain: at the start, the teardown of a COMBAT isolation a crashed run left
+behind (`reconcile_stale_chain`, `boot/posture.rs`; MAIN-013) — it lifts a
+containment rather than imposing one, before the actions chain is bound.
+
+A row the chain cannot take — not open yet, its log refused at the start
+(no key), a write that fails — is logged whole at ERROR (the journal's line
+is its record) and counted (`unwritten`); the action still runs (external
+audit CMB-027: whoever fills the disk must not stop the containment).
+
+**A crash between intent and outcome** leaves the intent without its
+outcome. The next start reads the chain's newest archive and active file
+(`ActionJournal::bind`, before any action can run) and answers each intent
+of an earlier run with no outcome by an `interrupted` row (the intent's run
+and number, `result: unknown`, the run that found it), WARNs, counts it
+(`nn-admin status --key`: `intents of an earlier run without an outcome`)
+and signs a `response_interrupted` audit row naming them. The lab build's
+`debug-crash-mid-action` aborts the agent after its next action and before
+its outcome row (EXP-13r `--crash`).
+
+**The budget never limits an action's record** (plan §3.4: "the budget
+limits only journal lines and Log-only detections"). A decision that acts
+is always recorded (`detection_budget::admit_acted`: it spends the
+(rule, uid)'s budget as any detection, so a flood of them still leaves the
+journal to the budget, and is recorded whether or not a token was left;
+only its `VERDICT`/`EXECUTED` lines are held). So are the exploit guard's
+kills in the kernel and the exec quarantine's kills and quarantines. The
+action's own intent and outcome rows never pass through the budget.
+
+**Stage 7, the evidence writer's queue** (the detection store's bounded
+queue between the decision and its writer task). Its policy for the records
+of actions changes: a full queue still evicts the records that were only
+logged first (lowest severity, oldest first), but a record of an action is
+no longer dropped for another one while the queue holds less than twice its
+capacity — the queue full of them takes it past the capacity (`over_cap`;
+their rate is the dispatcher's, their records never held by the budget
+now). Past twice the capacity (a writer that stopped writing) the oldest
+goes, counted (`dropped_acted`) and signed as every drop
+(`detections_dropped`): the action's own intent and outcome rows are in the
+actions chain, written by the dispatcher, not through this queue — a drop
+here never hides an action, only its detection's context. Counted: depth,
+the most it held, records past the capacity, drops (of actions), appends
+the chain refused, the longest wait queue to chain. The canary writer's
+rows not written (R12b) are stage 7's too.
+
+**The dispatcher of slow work** (`pipeline::slow`, the thread
+`nn-slow-work`). A mass-write or rename/unlink burst is judged on what the
+burst left behind and on who wrote it: the ransomware tracker samples the
+burst's files (their entropy, the copies beside the deleted originals) and
+judges the writer's trust (its executable's package, its lineage's). When
+the decision thread takes a burst whose assessment is not prepared
+(`RansomTracker::needs_preparing`) it hands the event over (a queue push)
+and takes the next event; the thread prepares the assessment
+(`RansomTracker::prepare`, with its I/O, not memoised), queues the event
+back and ends the decision's wait (`BusWaker`: the bus's receiver returns
+from its wait at once); the decision thread memoises it
+(`RansomTracker::prime`) and judges the event at its next turn — the
+posture and the rules read the prepared answer. One thread, FIFO: the
+bursts are prepared in the order the decision took them, so an actor's
+window of shapes adds them up in the file class's order, as before; every
+lineage lookup is as of the burst's own time (R-F), so what the decision
+judged in between changes nothing there. A full queue (256) leaves the
+burst to the decision thread, which judges it with its I/O (counted:
+`ransomware_inline`, WARNed); at the stop the bursts still with it are
+judged before the decision thread ends.
 
 ## 3. The take order
 
@@ -577,9 +767,17 @@ stage of an event's path (plan §3.4):
 | 3 decode | `RejectThrottle` | SNS-008 |
 | 4 bus queue | the bus, per queue | R12a |
 | 5 decision delay | the decisions over their class's budget, from the record's kernel time | R12b |
-| 6 response queue | — | R12c |
-| 7 evidence writer queue | — | R12c |
-| 8 export | — | R12c (signed `telemetry_loss` rows), R15 |
+| 6 response queue | responses decided and not run: displaced or refused by the full queue, queued at the stop, the dispatcher down (each signed in an `overflow` row) | R12c |
+| 7 evidence writer queue | detection records dropped or refused by the chain, action rows not in their chain, canary rows not written | R12c |
+| 8 export | — | R15 (R12c-2: the signed `telemetry_loss` rows and the heartbeat carry stages 1 to 7) |
+
+`nn-admin status --key` shows stages 6 and 7 in detail
+(`StatusResponse::response_dispatch`, appended after `event_bus_decision`):
+the dispatcher's queue per severity, what it ran and did not, its waits,
+the actions chain's rows (intents, outcomes, in flight, rows not in the
+chain, intents of an earlier run without an outcome, abandoned), the
+evidence writer's queue, and the ransomware bursts prepared off the
+decision thread and judged on it.
 
 ## 6. What it costs
 
@@ -592,7 +790,14 @@ eleven pump threads (blocked in `poll(2)` when their ring is empty) and
 the two drains' (each with a one-thread runtime of its own), the
 `fs_protect` ring's 192 KiB more of kernel memory, the envelope's 40 bytes
 per queued event, the cap's table (at most 4,096 uids
-and kinds). The lab's numbers (overhead, latency per class, the
+and kinds). R12c: two threads (the response dispatcher's and the
+dispatcher of slow work's, both blocked when idle), the response queue (at
+most 1,024 jobs, each holding its decision's event and decision, shared by
+the decision's responses), the actions chain (16 MiB × 8 archives at most;
+two rows per action, about 600 bytes; one fsync per batch of rows, and one
+more before a batch that holds a quarantine, a strip or a restore; the
+response queue past its capacity only for Critical kills, at most four
+times it). The lab's numbers (overhead, latency per class, the
 soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
 
 ## 7. What is next
@@ -646,8 +851,21 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   `Modified` carries its close's time, not its write's. A kernel budget per
   uid for the `bpf` hook's records (stage 2): the userland cap (§2c) bounds
   the consumer's share, a kernel budget would bound the ring's.
-- **R12c** — the response dispatcher by severity, its queue (stage 6);
-  no action without a signed record (intent, then outcome); the budget
-  never limits an action's record; the evidence writer's queue (stage 7);
-  signed `telemetry_loss` rows aggregating every stage, then the heartbeat
-  (INI-14).
+- **R12c-1, done (lab PR 270)** — the response dispatcher (§2e: by
+  severity, in order per process, bounded, a full queue answered, counted
+  and signed — stage 6), no action without a signed record (the `actions`
+  chain: intent before, outcome after; the `Intent` ticket every acting
+  entry point takes; a crash between the two reported at the next start),
+  the budget never limiting an action's record, the evidence writer's queue
+  (stage 7), the dispatcher of slow work (the ransomware tracker's sampler
+  and trust off the decision thread), the guards (rule 1b of the decision
+  path's, `xtask/tests/action_records.rs`).
+- **Open after R12c-1** — the order between a rule's response and a step
+  of the COMBAT ladder on the same process (two workers, as before R12c);
+  the actions chain's rows are retained as the detection log's (16 MiB × 8
+  archives: a flood of actions rotates the oldest out, the manifest signing
+  it); the per-rule policy's exemption facts, a canary trip's reader and
+  the security-tool detector's registration are still read on the decision
+  thread (§2d).
+- **R12c-2** — signed `telemetry_loss` rows aggregating every stage, then
+  the heartbeat and its minimal external verifier (INI-14).
