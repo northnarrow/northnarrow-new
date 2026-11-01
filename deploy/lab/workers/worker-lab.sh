@@ -11,7 +11,9 @@ LAB=./deploy/lab/nn-lab.sh
 [[ -x $LAB ]] || { echo "run from the tree's root" >&2; exit 2; }
 mkdir -p "$OUT"
 "$LAB" ssh "mkdir -p ~/nn-workers-lab" >/dev/null
-"$LAB" ssh "cat > ~/nn-workers-lab/worker-guest.sh" < deploy/lab/workers/worker-guest.sh
+# the guest script next to this one (a driver run against another tree's
+# nn-lab.sh still sends its own)
+"$LAB" ssh "cat > ~/nn-workers-lab/worker-guest.sh" < "$(dirname "$0")/worker-guest.sh"
 fails=0
 for phase in "$@"; do
     "$LAB" ssh "sudo bash ~/nn-workers-lab/worker-guest.sh $phase /var/lib/nn-workers-lab/$phase" > "$OUT/$phase.log" 2>&1

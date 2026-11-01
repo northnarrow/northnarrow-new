@@ -109,30 +109,53 @@ roles)
     check role-agent "agent 0x03 (protected, exempt)" test "$(role_of "$A0")" = 03
     [ -n "$WD" ] && check role-watchdog "watchdog 0x03" test "$(role_of "$WD")" = 03
     check role-worker "worker 0x02 (protected, not exempt)" test "$(role_of "$W")" = 02
-    if kill -9 "$W" 2>/dev/null; then bad kill-worker "a root kill -9 of the worker went through"
-    else pass kill-worker "a root kill -9 of the worker refused (task_kill: protected)"; fi
+    # Each attempt is a disposable child of its own, the actor the agent
+    # answers (a refused signal or open is an anti-tamper denial: COMBAT,
+    # NEUTRALIZE kills the actor), never this script. Exit 0: it went
+    # through; 1: refused; killed: refused, and the actor neutralized.
+    attempt() { # <out-name> <bash code>; prints went|refused|refused+killed
+        bash -c "$2" > /dev/null 2>&1
+        local rc=$?
+        case $rc in
+            0) echo went ;;
+            1) echo refused ;;
+            137) echo refused+killed ;;
+            *) echo "rc=$rc" ;;
+        esac
+    }
+    got=$(attempt kill-worker "kill -9 $W 2>/dev/null && exit 0 || exit 1")
+    check kill-worker "a root kill -9 of the worker: $got (task_kill: protected)" test "${got%%+*}" = refused
+    sleep 2
     check worker-alive "the worker lives on" test "$(worker)" = "$W"
-    # The roles' meaning in the hooks: a root shell, registered with each
+    # The roles' meaning in the hooks: a root shell registered with each
     # role in turn (a lab build: the BPF guard observes, bpftool may write
-    # the map), reads the agent's key and signals the agent (SIGCONT).
-    for role in none 02 03; do
+    # the map) reads the agent's key, or signals the agent (SIGCONT) — a
+    # bash builtin each time, so the registered pid is the one that acts.
+    role_attempt() { # <role|none> <what> <bash code>
+        local role=$1 fifo sp rc
         fifo=$(mktemp -u /tmp/nn-roles.XXXXXX); mkfifo -m 600 "$fifo"
-        bash -c "read _ < '$fifo'
-            if head -c1 /etc/northnarrow/agent.sig.key > /dev/null 2>&1; then echo read=ok; else echo read=denied; fi
-            if kill -CONT $A0 2> /dev/null; then echo signal=ok; else echo signal=denied; fi" > "$OUT/role-$role.txt" &
+        bash -c "read _ < '$fifo'; $3" > /dev/null 2>&1 &
         sp=$!
         [ "$role" = none ] || bpftool map update pinned "$PINS" key hex $(le "$sp") value hex "$role"
         echo go > "$fifo"
-        wait "$sp"
+        wait "$sp"; rc=$?
         [ "$role" = none ] || bpftool map delete pinned "$PINS" key hex $(le "$sp") 2>/dev/null
         rm -f "$fifo"
-        got=$(tr '\n' ' ' < "$OUT/role-$role.txt")
+        case $rc in 0) echo went ;; 1) echo refused ;; 137) echo refused+killed ;; *) echo "rc=$rc" ;; esac
+    }
+    for role in none 02 03; do
+        r=$(role_attempt "$role" read "if read -r -n1 _x < /etc/northnarrow/agent.sig.key; then exit 0; else exit 1; fi")
+        s=$(role_attempt "$role" signal "kill -CONT $A0 2>/dev/null && exit 0 || exit 1")
+        echo "role $role: read the key $r, signal the agent $s" | tee "$OUT/role-$role.txt"
         case "$role" in
-            03) want="read=ok signal=ok " ;;
-            *) want="read=denied signal=denied " ;;
+            03) check "role-$role" "role 03 (the agent's): read $r, signal $s" test "$r $s" = "went went" ;;
+            *) check "role-$role" "role $role: read $r, signal $s" test "${r%%+*} ${s%%+*}" = "refused refused" ;;
         esac
-        check "role-$role" "a root shell with role $role: $got" test "$got" = "$want"
+        sleep 2
     done
+    # the denials above put the agent in COMBAT (NEUTRALIZE): released with
+    # the lab's key, as an operator would
+    "$NNADMIN" unlock --key "$KEY" > "$OUT/unlock.txt" 2>&1 || true
     check manifest-state "the manifest's parse worker: ready" test "$(worker_entry state)" = ready
     check manifest-seccomp "its sandbox: seccomp" test "$(worker_entry sandbox.seccomp)" = true
     check manifest-uid "its sandbox: the worker's uid" test "$(worker_entry sandbox.uid)" = "$(id -u northnarrow-worker)"
