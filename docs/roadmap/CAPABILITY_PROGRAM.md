@@ -4161,3 +4161,60 @@ only in the table below, in the same PR as the evidence.
     doc: stop the verifier's timer for a maintenance window); the chain
     readable by a dedicated group instead of `sudo`; `export --count`
     through the forced command; the stall counts of R12c-3 in the beat.
+  - R12c-3 (the third PR, after #476) — what changed: a pool of response
+    workers keyed by process (eight, `NN_RESPONSE_WORKERS` 1–32, each at a
+    nice value five above the agent's): the queue marks a process running
+    while one of its responses runs, so different processes' responses
+    run at once and one process's one at a time, in order (#476's kill
+    first and supersede kept); a kill tree whose root has no child skips
+    the `/proc` walks; a stall watch signs a `stalled` row for an action
+    still running after 10 s, raises `TelemetryLoss` and starts a spare
+    worker; `run_started` and `run_ended` rows, the start reading back to
+    the `run_started` of a run that did not end, the boot's audit row
+    before the interrupted rows.
+  - R12c-3 — lab (round g on bec13ac4, round g2 on fec704ed, ubuntu2404,
+    fresh installs): the first pool (eight workers at the agent's
+    priority, every kill tree walking `/proc`) cut EXP-13r's queue wait to
+    5.1 and 5.6 s but made 1,247 P1 decisions late in its first run —
+    fixed (the workers' nice, the childless kill tree); then EXP-13r ×2:
+    400 intents and 400 `success` outcomes each, P1 0 over budget, the
+    queue's wait p50 0.23 and 0.29 s, max 2.0 and 4.1 s (target under
+    2 s: the first run), the second run's P3 decisions 90 over budget (up
+    to 3.5 s); EXP-13c ×3 and 13e ×3: no `fs_protect` or FIM drop,
+    NET-001's record median 13.1 ms, max 19.0 ms over 36 probes (`main`
+    19.2 / 27.0 ms, R12c-1 22.3 / 426 ms); `--hang`: the stalled row 10.5 s
+    after the hung kill's intent, the twenty kills beside it each answered
+    within 19 ms, the hung one's outcome at 15.0 s, the spare gone after;
+    `--crash`: the audit row, then the `interrupted` row 3.4 s after the
+    restart, then the new run's `run_started`. `test-ignored`: 82 suites, 97 passed, 0 failed, the 54 chain checks `ok`. Host gates on
+    273ad1a4: 77 suites 3,387 passed 0 failed, every other gate green;
+    mutations 12 of 12 (MC8 first written as an equivalent mutant; MK2
+    caught once the children check took a proc tree of its own);
+    identity: the eBPF object and `posture_demo` as `main`'s.
+  - R12c-3 — review of #477 ("merge after one fix"), fb471460: one
+    process sat in the queue under two keys — (pid, 0) from a kernel
+    alert, (pid, start) from an exec's event — so two workers could act on
+    it at once; the queue's key is the pid alone now (a reused pid waits
+    behind the old process's responses), and a repeat merges and a kill
+    supersedes only when both starts are known (non-zero) and equal.
+    Tests: one pid's responses never at once whatever their start, kills
+    of a pid with an unknown start not merged, such a kill superseding
+    nothing, a spare that panics stopping the dispatcher (R9), the spares
+    bounded by the pool (R13). The CPU contention: the decision thread at
+    nice −5 (`DECISION_NICE`, `renice_this_thread`), the workers at the
+    agent's priority (no longer +5). Round k (ubuntu2404, fb471460, a
+    fresh install): EXP-13r ×2 400/400 `success`, P1, P2 and P3 0 over
+    budget in both runs (round g2: 90 P3 late), the queue's wait p50
+    0.11 s, max 0.67 and 1.6 s (g2: 2.0 and 4.1 s — the target under 2 s
+    met in both); `--hang`: the `stalled` row 10.0 s after the intent,
+    the twenty kills beside it within 33 ms; `--crash`: `interrupted` 3.4 s
+    after the restart, then `run_started`; `test-ignored` 82 suites 97
+    passed 0 failed, the boot's chain checks `ok`. Gates on fb471460: 77
+    suites 3,392 passed 0 failed, every other gate green; mutations of the
+    fix 4 of 4 (16 of 16 for R12c-3).
+  - R12c-3 — open: `CPUWeight=` in the unit (the decision thread's nice
+    is per thread; a weight would hold against other services); a stall
+    watch for the ladder's, the exec quarantine's and the CoW restore's
+    threads; an explicit "pool exhausted" state (every worker and spare
+    stalled); the stall counts not in the heartbeat yet (R12c-2's own PR);
+    the ticket passed by value.

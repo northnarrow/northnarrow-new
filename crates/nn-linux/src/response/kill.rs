@@ -373,18 +373,28 @@ fn kill_tree_in_cgroup(
         }
         new
     };
-    for _ in 0..MAX_MOVE_PASSES {
-        if sweep(&mut members, &mut others) == 0 {
-            break;
+    // R12c-3 (lab PR 270): a root with no child — its threads' `children`
+    // files, read once it is inside the cgroup, where a child it forks from
+    // now on is born — has no descendant outside it: the /proc walks (each
+    // reads every process's `stat`, ~50 ms of CPU a kill with EXP-13r's 400
+    // processes alive) are skipped, and the cgroup's kill reaches it all.
+    let childless = has_no_children(root_pid) == Some(true) && root.still_named_by_pid();
+    if !childless {
+        for _ in 0..MAX_MOVE_PASSES {
+            if sweep(&mut members, &mut others) == 0 {
+                break;
+            }
         }
     }
     // Frozen (since the root moved in), sweep until nothing more is moved
     // (a child forked by a process not yet moved when the last walk read
     // it), then kill everything inside.
     let _ = wait_cgroup_event(dir, "frozen 1", FREEZE_WAIT);
-    for _ in 0..MAX_MOVE_PASSES {
-        if sweep(&mut members, &mut others) == 0 {
-            break;
+    if !childless {
+        for _ in 0..MAX_MOVE_PASSES {
+            if sweep(&mut members, &mut others) == 0 {
+                break;
+            }
         }
     }
     if let Err(e) = std::fs::write(dir.join("cgroup.kill"), "1") {
@@ -440,6 +450,25 @@ fn kill_tree_in_cgroup(
         "kill tree: the tree was frozen and killed in a cgroup of its own"
     );
     Ok((primary, outcomes))
+}
+
+/// R12c-3: whether process `pid` has no child now — every thread's
+/// `/proc/<pid>/task/<tid>/children` empty (CONFIG_PROC_CHILDREN). `None`
+/// when they cannot be read: the caller walks `/proc` instead.
+fn has_no_children(pid: u32) -> Option<bool> {
+    has_no_children_in(Path::new("/proc"), pid)
+}
+
+/// [`has_no_children`] under `proc` (tests: a tree of their own).
+fn has_no_children_in(proc: &Path, pid: u32) -> Option<bool> {
+    let tasks = std::fs::read_dir(proc.join(pid.to_string()).join("task")).ok()?;
+    for t in tasks {
+        let children = std::fs::read_to_string(t.ok()?.path().join("children")).ok()?;
+        if !children.trim().is_empty() {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// After the cgroup's kill, each member by its identity. One still
@@ -711,6 +740,35 @@ mod tests {
 
     /// combat-avail-2: a guarded descendant is spared and reported, the
     /// unguarded ones are still killed.
+    /// R12c-3: a process with children, and one without, by their
+    /// threads' `children` files.
+    #[test]
+    fn a_process_with_no_child_is_seen_as_such() {
+        let (mut sh, kids) = shell_with_two_sleepers();
+        assert_eq!(has_no_children(sh.id()), Some(false));
+        assert_eq!(has_no_children(kids[0]), Some(true));
+        assert_eq!(has_no_children(u32::MAX), None, "no such process");
+        // a kernel without CONFIG_PROC_CHILDREN: not known, never "none"
+        let fake = tempfile::tempdir().unwrap();
+        let task = fake.path().join("42/task/42");
+        std::fs::create_dir_all(&task).unwrap();
+        assert_eq!(has_no_children_in(fake.path(), 42), None);
+        std::fs::write(task.join("children"), "").unwrap();
+        assert_eq!(has_no_children_in(fake.path(), 42), Some(true));
+        let other = fake.path().join("42/task/43");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("children"), "77 ").unwrap();
+        assert_eq!(has_no_children_in(fake.path(), 42), Some(false));
+        for k in &kids {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(k.to_string())
+                .status();
+        }
+        let _ = sh.kill();
+        let _ = sh.wait();
+    }
+
     #[test]
     fn kill_tree_guard_spares_descendants() {
         let (mut sh, kids) = shell_with_two_sleepers();

@@ -334,10 +334,28 @@ its synced ledger, the outbound block and the throttle's cgroup files: one
 slow response held every later decision back. Now the decision hands them
 over and judges the next event.
 
-**The dispatcher** (`pipeline::dispatch`, the thread `nn-response`). The
-decision thread submits a decision's responses to its queue
+**The dispatcher** (`pipeline::dispatch`). The decision thread submits a
+decision's responses to its queue
 (`nn_core::response::dispatch::ResponseQueue`, stage 6) — a push under a
-lock, never a wait — and the thread takes them:
+lock, never a wait — and a pool of workers takes them (R12c-3: the threads
+`nn-response-<n>`, eight by default, `NN_RESPONSE_WORKERS`, 1 to 32). A
+worker takes one response at a time, of a pid with no response running
+(the queue marks the pid running until the worker is done with it):
+different pids' responses run at once, one pid's one at a time — keyed by
+the pid alone (review of #477: the process's start is known only for an
+exec's event, so one process was two keys and two workers acted on it at
+once; a pid reused by another process now waits behind the old one's
+responses, harmlessly). The decision thread runs at a nice value five
+below the agent's (a higher CPU priority: the first pool, at the same
+priority, made 1,247 P1 decisions late in EXP-13r on a 4-CPU guest; the
+review of #477 had the workers' priority left as the agent's, not lowered
+below the user's processes); and a kill tree whose root has no child (its
+threads' `children` files, read once it is inside the kill cgroup, where
+any later child is born) skips the `/proc` walks that each cost ~50 ms of CPU with EXP-13r's 400
+processes alive. EXP-13r's 400 kill trees waited at most 0.67 and 1.6 s
+in the queue (p50 0.11 s; round k), against 13–19 s for R12c-1's single
+thread, with no decision of any class late (the workers at +5 instead,
+round g2: 2.0 and 4.1 s, 90 P3 decisions late). The queue's order:
 - **by severity**: four lanes, Critical first; once the oldest job waited
   `STARVATION_NS` (500 ms), one take in four (`AGED_TAKE_EVERY`) is it,
   whatever its lane, so a flood of Critical kills cannot hold a Low
@@ -347,13 +365,13 @@ lock, never a wait — and the thread takes them:
   the queue became first in, first out, 185 of 400 takes passing over a
   more severe job);
 - **in order per process** (a later response for the same process never
-  overtakes an earlier one): a process is its pid *and* its start (a
-  process that reused a pid is another one — review of #476, X1); each
-  process's jobs are kept in the order they were decided, and a take runs
+  overtakes an earlier one): each pid's jobs are kept in the order they
+  were decided, and a take runs
   the *oldest* job of the process the lane names — a Critical quarantine
   decided after a Low strip of the same process raises that process's turn
   (priority inheritance) and the strip runs first, then the quarantine.
-  One thread takes, so two jobs of one process never run at once. The
+  The pid is marked running while one of its jobs runs, so two jobs of
+  one process never run at once. The
   COMBAT ladder keeps its own worker (external audit CMB-007) and the exec
   quarantine its thread: a rule's response and a ladder step on the same
   process are not ordered between them, as before R12c;
@@ -361,14 +379,17 @@ lock, never a wait — and the thread takes them:
   before that process's queued jobs, so it never waits behind what it
   would make pointless; the process's quarantine or strip runs after it.
   Once the kill *killed* (the process killed, or already gone), its
-  process's throttles and blocks still queued — or taken in the same
-  batch behind it — are answered `not run: superseded by a kill of the
-  same process` and counted (`superseded`; not a loss). A kill that did
+  process's throttles and blocks still queued — the same process: its
+  start known and equal (review of #477; a response whose start is not
+  known is superseded by nothing, it runs after the kill) — are answered
+  `not run: superseded by a kill of the same process` and counted (`superseded`; not a loss). A kill that did
   not kill (the host-critical guard, EPERM, a cgroup that would not die)
   supersedes nothing: they run after it (the re-check of #476: a
   compromised process the agent cannot kill must still lose its network
   or its CPU);
-- **a repeat merges**: a job of the same process (pid and start), action
+- **a repeat merges**: a job of the same process (pid and start — known:
+  a response whose start is not known merges with nothing, review of
+  #477, as #476's X1 for an exec's), action
   and — but for a kill — file as the process's *last* queued job (its
   first, for a kill) is merged into it (a process that tripped two rules,
   or one twice, before its kill ran) — one action, both decisions answered
@@ -386,11 +407,22 @@ lock, never a wait — and the thread takes them:
   counted per severity (stage 6), named in the next signed `overflow` row of
   the actions chain (at most one a second, and at the stop) and raises the
   posture's `TelemetryLoss`;
-- **at the stop** the thread runs what is queued for at most `STOP_WAIT`
+- **a stalled action** (R12c-3): one still running after `STALL_AFTER`
+  (10 s) — a quarantine's copy on a filesystem that hangs, a cgroup or
+  firewall write that does not return — is seen by the stall watch
+  (`nn-response-watch`): a signed `stalled` row names its intent (not its
+  answer: the outcome row still comes when it ends), a WARN, the count
+  (`stalled now`, `since the start`), `TelemetryLoss`, and a spare worker
+  (at most one per stalled action, at most the pool's size), so the other
+  processes' responses do not wait behind it; the spare goes once the
+  stall is over;
+- **at the stop** the workers run what is queued for at most `STOP_WAIT`
   (2 s); what is left is answered `not run: the agent stopped`, counted and
-  signed in a last `overflow` row; a dispatcher whose thread did not start
-  answers every response so (`not run: the response dispatcher is not
-  running`), never running it on the decision thread.
+  signed in a last `overflow` row, and the run's `run_ended` row is
+  signed; a worker still in a stalled action is left (named in a WARN), not
+  waited for. A dispatcher whose workers did not start answers every
+  response so (`not run: the response dispatcher is not running`), never
+  running it on the decision thread.
 
 The decision's detection record follows its responses' outcomes, as before
 (written by whichever thread answers the decision's last response), and the
@@ -456,12 +488,20 @@ is its record) and counted (`unwritten`); the action still runs (external
 audit CMB-027: whoever fills the disk must not stop the containment).
 
 **A crash between intent and outcome** leaves the intent without its
-outcome. The next start reads the chain's newest archive and active file
-(`ActionJournal::bind`, before any action can run) and answers each intent
-of an earlier run with no outcome by an `interrupted` row (the intent's run
-and number, `result: unknown`, the run that found it), WARNs, counts it
-(`nn-admin status --key`: `intents of an earlier run without an outcome`)
-and signs a `response_interrupted` audit row naming them. The lab build's
+outcome. The next start reads the chain (`ActionJournal::bind`, before any
+action can run): its newest archive and active file, and — when the last
+run there has neither its `run_ended` row (a clean stop) nor its
+`run_started` (R12c-3: it crashed with its start further back) — the older
+archives one by one until that run's `run_started` (an intent more than
+one rotation back is still found). The boot signs a
+`response_interrupted` audit row naming each intent of an earlier run with
+no outcome, *then* the journal answers each by an `interrupted` row (the
+intent's run and number, `result: unknown`, the run that found it), WARNs,
+counts it (`nn-admin status --key`: `intents of an earlier run without an
+outcome`) and signs this run's `run_started` row (`ActionJournal::
+start_run`): a crash between the two leaves the intents open, and the next
+start reports them again — an interrupted row never lacks its audit
+row. The lab build's
 `debug-crash-mid-action` aborts the agent after its next action and before
 its outcome row (EXP-13r `--crash`).
 

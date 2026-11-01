@@ -122,6 +122,7 @@ fn dispatcher_with(
         },
         posture,
         cap,
+        1,
     );
     (d, journal, sink)
 }
@@ -229,7 +230,7 @@ fn a_kill_runs_between_its_intent_and_its_outcome() {
     let rows = journal.rows();
     assert_eq!(
         rows.iter().map(|r| r.row).collect::<Vec<_>>(),
-        [ActionRow::Intent, ActionRow::Outcome]
+        [ActionRow::Intent, ActionRow::Outcome, ActionRow::RunEnded]
     );
     let i = rows[0].intent.as_ref().unwrap();
     assert_eq!(
@@ -525,24 +526,17 @@ fn a_repeat_merges_and_answers_both_decisions() {
         assert!(t0.elapsed() < Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(1));
     }
-    submit_one(
-        &d,
-        &decided(
-            "NN-L-T-1",
-            ResponseAction::KillProcessTree,
-            Severity::High,
-            4242,
-        ),
-    );
-    submit_one(
-        &d,
-        &decided(
-            "NN-L-T-2",
-            ResponseAction::KillProcessTree,
-            Severity::Critical,
-            4242,
-        ),
-    );
+    // the process's start known (an exec's event): a repeat merges
+    let started = |rule: &str, sev| {
+        ResponseJob::of(
+            &decided(rule, ResponseAction::KillProcessTree, sev, 4242),
+            Some(4242),
+            77_000,
+            77_000,
+        )
+    };
+    d.submit(started("NN-L-T-1", Severity::High));
+    d.submit(started("NN-L-T-2", Severity::Critical));
     drop(hold);
     d.stop(Duration::from_secs(5));
     let st = d.status();
@@ -643,12 +637,16 @@ fn a_kill_of_a_reused_pid_is_not_merged_into_the_old_owner_s() {
         .filter(|r| r.row == ActionRow::Intent)
         .map(|r| r.intent.as_ref().unwrap().start_ns)
         .collect();
-    assert_eq!(starts, [1_000, 9_000]);
+    // (one pid, one queue key since the review of #477: the later kill goes
+    // first, as any kill does — each with its own process's start)
+    assert_eq!(starts, [9_000, 1_000]);
     assert_eq!(sink.queued_for_test().len(), 2);
     // the same action on the same pid is a repeat only for the same start
     let job = |d: &Arc<Decided>, start| ResponseJob::of(d, Some(4242), start, start).remove(0).1;
     assert!(!job(&a, 1_000).same_action(&job(&b, 9_000)));
     assert!(job(&a, 1_000).same_action(&job(&b, 1_000)));
+    // a start not known is no process's: never a repeat (review of #477)
+    assert!(!job(&a, 0).same_action(&job(&b, 0)));
 }
 
 /// Review of #476 (its mutation K11): two strips of one process's two
@@ -752,6 +750,7 @@ fn dispatcher_on(executor: Executor, cap: usize) -> (Dispatcher, ActionJournal, 
         },
         None,
         cap,
+        1,
     );
     (d, journal, sink)
 }
@@ -763,6 +762,23 @@ fn until_taken(d: &Dispatcher) {
         assert!(t0.elapsed() < Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+/// The start of process `pid` as an exec's event gives it (its `/proc`
+/// start, in ns).
+fn start_ns_of(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let after = &stat[stat.rfind(')').unwrap() + 2..];
+    let ticks: u64 = after.split_whitespace().nth(19).unwrap().parse().unwrap();
+    // SAFETY: sysconf has no preconditions.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+    ticks * (1_000_000_000 / hz)
+}
+
+/// Submit `x`'s responses with the start of `pid` known (an exec's event).
+fn submit_started(d: &Dispatcher, x: &Arc<Decided>, pid: u32) {
+    let start = start_ns_of(pid);
+    d.submit(ResponseJob::of(x, Some(pid), start, start));
 }
 
 /// The intents of `rows`: (response, pid), in order.
@@ -777,8 +793,8 @@ fn intents_of(rows: &[northnarrow_agent::response::journal::ActionRecord]) -> Ve
 }
 
 /// Review of #476: a kill that killed supersedes its process's throttle
-/// taken in the same batch — the throttle's intent is answered "not run:
-/// superseded", its record says so, nothing is counted lost.
+/// still queued behind it — never run, its record says "superseded",
+/// nothing is counted lost; the kill ran first.
 #[test]
 fn a_kill_that_killed_supersedes_its_process_s_throttle() {
     use std::os::unix::process::ExitStatusExt;
@@ -794,7 +810,7 @@ fn a_kill_that_killed_supersedes_its_process_s_throttle() {
         &decided("NN-L-T-0", ResponseAction::Log, Severity::Low, 4500),
     );
     until_taken(&d);
-    submit_one(
+    submit_started(
         &d,
         &decided(
             "NN-L-T-T",
@@ -802,8 +818,9 @@ fn a_kill_that_killed_supersedes_its_process_s_throttle() {
             Severity::Low,
             pid,
         ),
+        pid,
     );
-    submit_one(
+    submit_started(
         &d,
         &decided(
             "NN-L-T-K",
@@ -811,6 +828,7 @@ fn a_kill_that_killed_supersedes_its_process_s_throttle() {
             Severity::Critical,
             pid,
         ),
+        pid,
     );
     drop(hold);
     d.stop(Duration::from_secs(5));
@@ -818,27 +836,16 @@ fn a_kill_that_killed_supersedes_its_process_s_throttle() {
     let rows = journal.rows();
     assert_eq!(
         intents_of(&rows),
-        [
-            ("Log".to_string(), 4500),
-            ("KillProcess".to_string(), pid),
-            ("ThrottleProcess".to_string(), pid)
-        ],
-        "the kill first"
+        [("Log".to_string(), 4500), ("KillProcess".to_string(), pid)],
+        "the kill first, the throttle never"
     );
-    let throttle = rows
-        .iter()
-        .rfind(|r| r.row == ActionRow::Outcome)
-        .and_then(|r| r.outcome.clone())
-        .unwrap();
-    assert_eq!(throttle.result, ActionResult::NotRun);
-    assert!(throttle.reason.unwrap().contains("superseded"));
     let rec = sink
         .queued_for_test()
         .into_iter()
         .find(|r| r.response.contains("superseded"));
     assert!(rec.is_some(), "the throttle's record says so");
     let st = d.status();
-    assert_eq!((st.superseded_in_batch, st.queue.lost()), (1, 0));
+    assert_eq!((st.queue.superseded, st.queue.lost()), (1, 0));
 }
 
 /// The same, the throttle still queued when the kill killed (behind a
@@ -857,7 +864,7 @@ fn a_kill_that_killed_takes_its_process_s_queued_throttle_out() {
         &decided("NN-L-T-0", ResponseAction::Log, Severity::Low, 4600),
     );
     until_taken(&d);
-    submit_one(
+    submit_started(
         &d,
         &decided(
             "NN-L-T-T",
@@ -865,8 +872,9 @@ fn a_kill_that_killed_takes_its_process_s_queued_throttle_out() {
             Severity::Low,
             pid,
         ),
+        pid,
     );
-    submit_one(
+    submit_started(
         &d,
         &decided(
             "NN-L-T-K",
@@ -874,6 +882,7 @@ fn a_kill_that_killed_takes_its_process_s_queued_throttle_out() {
             Severity::Critical,
             pid,
         ),
+        pid,
     );
     // the kill and fifteen High jobs fill the next batch; the throttle waits
     for i in 0..15 {
@@ -930,7 +939,7 @@ fn a_kill_that_did_not_kill_lets_its_process_s_block_run() {
         &decided("NN-L-T-0", ResponseAction::Log, Severity::Low, 4700),
     );
     until_taken(&d);
-    submit_one(
+    submit_started(
         &d,
         &decided(
             "NN-L-T-B",
@@ -938,8 +947,9 @@ fn a_kill_that_did_not_kill_lets_its_process_s_block_run() {
             Severity::Low,
             pid,
         ),
+        pid,
     );
-    submit_one(
+    submit_started(
         &d,
         &decided(
             "NN-L-T-K",
@@ -947,6 +957,7 @@ fn a_kill_that_did_not_kill_lets_its_process_s_block_run() {
             Severity::Critical,
             pid,
         ),
+        pid,
     );
     drop(hold);
     d.stop(Duration::from_secs(5));
@@ -976,7 +987,7 @@ fn a_kill_that_did_not_kill_lets_its_process_s_block_run() {
         .iter()
         .any(|r| r.response.contains("superseded")));
     let st = d.status();
-    assert_eq!(st.superseded_in_batch + st.queue.superseded, 0);
+    assert_eq!(st.queue.superseded, 0);
 }
 
 /// The thread's end is seen: running until the stop, not after.
@@ -1047,4 +1058,343 @@ fn a_dead_dispatcher_stops_the_agent() {
     );
     let sd = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/shutdown.rs"));
     assert!(sd.contains("if stop_reason == \"response_dispatcher_exited\" {"));
+}
+
+/// R12c-3: a dispatcher of `workers`, stalls after `stall_after`, on a
+/// detect-only executor.
+fn pool(workers: usize, stall_after: Duration) -> (Dispatcher, ActionJournal, DetectionSink) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ExecutorConfig::for_test(tmp.path());
+    cfg.dry_run = true;
+    std::mem::forget(tmp);
+    let journal = ActionJournal::memory();
+    let sink = DetectionSink::for_test(4096, 0);
+    let d = Dispatcher::start_inner(
+        Executor::with_config(cfg),
+        journal.clone(),
+        Followups {
+            sink: Some(sink.clone()),
+            cow: northnarrow_agent::cow::CowGuard::off_for_test(),
+        },
+        None,
+        64,
+        workers,
+        stall_after,
+    );
+    (d, journal, sink)
+}
+
+/// Wait for `cond`, at most 5 s.
+fn until(what: &str, cond: impl Fn() -> bool) {
+    let t0 = Instant::now();
+    while !cond() {
+        assert!(t0.elapsed() < Duration::from_secs(5), "{what}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// R12c-3 (the pool): different processes' responses run at once — one
+/// process's action hanging does not hold another's back — and one
+/// process's run one at a time, in order: its second waits for its first.
+#[test]
+fn the_pool_runs_processes_at_once_and_each_process_in_order() {
+    let (d, journal, _sink) = pool(4, Duration::from_secs(600));
+    d.shared.hang_pids.lock().insert(5100);
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-A1",
+            ResponseAction::KillProcess,
+            Severity::High,
+            5100,
+        ),
+    );
+    until("5100's first action under way", || {
+        d.status().active == 1 && intents_of(&journal.rows()).len() == 1
+    });
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-A2",
+            ResponseAction::Quarantine,
+            Severity::Critical,
+            5100,
+        ),
+    );
+    submit_one(
+        &d,
+        &decided("NN-L-T-B", ResponseAction::KillProcess, Severity::Low, 5200),
+    );
+    until("5200 ran beside the hanging 5100", || {
+        journal
+            .rows()
+            .iter()
+            .any(|r| r.row == ActionRow::Outcome && r.action == 2)
+    });
+    let pids: Vec<u32> = intents_of(&journal.rows()).iter().map(|i| i.1).collect();
+    assert_eq!(pids, [5100, 5200], "5100's second waits for its first");
+    d.shared.hang_pids.lock().clear();
+    d.stop(Duration::from_secs(5));
+    assert_eq!(
+        intents_of(&journal.rows()),
+        [
+            ("KillProcess".to_string(), 5100),
+            ("KillProcess".to_string(), 5200),
+            ("Quarantine".to_string(), 5100)
+        ]
+    );
+}
+
+/// R12c-3: an action running past the stall bound is signed (a `stalled`
+/// row naming its intent — not its answer), counted, and a spare worker
+/// runs the other responses meanwhile; when it ends, its outcome comes and
+/// the spare goes.
+#[test]
+fn a_stalled_action_is_signed_and_does_not_freeze_the_others() {
+    let (d, journal, sink) = pool(1, Duration::from_millis(100));
+    d.shared.hang_pids.lock().insert(5300);
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-S",
+            ResponseAction::KillProcess,
+            Severity::High,
+            5300,
+        ),
+    );
+    until("the stall signed", || {
+        journal.rows().iter().any(|r| r.row == ActionRow::Stalled)
+    });
+    let stalled = journal
+        .rows()
+        .into_iter()
+        .find(|r| r.row == ActionRow::Stalled)
+        .unwrap();
+    assert_eq!(stalled.action, 1, "the hanging action's intent");
+    assert_eq!(d.status().stalled_now, 1);
+    submit_one(
+        &d,
+        &decided("NN-L-T-O", ResponseAction::KillProcess, Severity::Low, 5400),
+    );
+    until("the spare ran 5400", || {
+        sink.queued_for_test()
+            .iter()
+            .any(|r| r.principal.pid == 5400)
+    });
+    assert_eq!(d.status().spares, 1);
+    d.shared.hang_pids.lock().clear();
+    until("the stalled action ended", || d.status().stalled_now == 0);
+    until("its outcome", || {
+        journal
+            .rows()
+            .iter()
+            .any(|r| r.row == ActionRow::Outcome && r.action == 1)
+    });
+    until("the spare went", || d.status().spares == 0);
+    let st = d.status();
+    assert_eq!((st.stalled, st.queue.lost()), (1, 0));
+    d.stop(Duration::from_secs(5));
+}
+
+/// Review of #477 (its X, 1): one pid's responses never run at once, the
+/// start known for one (an exec's event) and not for the other (a
+/// connect's) — the pid is the queue's key.
+#[test]
+fn one_pid_s_responses_never_run_at_once_whatever_their_start() {
+    let (d, journal, _sink) = pool(2, Duration::from_secs(600));
+    d.shared.hang_pids.lock().insert(5500);
+    let throttle = decided(
+        "NN-L-T-T",
+        ResponseAction::ThrottleProcess,
+        Severity::Low,
+        5500,
+    );
+    d.submit(ResponseJob::of(&throttle, Some(5500), 5_000, 5_000));
+    until("the throttle under way", || d.status().active == 1);
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-K",
+            ResponseAction::KillProcess,
+            Severity::Critical,
+            5500,
+        ),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        intents_of(&journal.rows()).len(),
+        1,
+        "the kill waits for the throttle of its pid"
+    );
+    assert_eq!(d.status().active, 1);
+    d.shared.hang_pids.lock().clear();
+    d.stop(Duration::from_secs(5));
+    assert_eq!(
+        intents_of(&journal.rows()),
+        [
+            ("ThrottleProcess".to_string(), 5500),
+            ("KillProcess".to_string(), 5500)
+        ]
+    );
+}
+
+/// Review of #477 (its X, 2): two kills of one pid, their start not known
+/// (not an exec's event), are not merged — the second may be of a process
+/// that reused the pid; it runs on its own (a second kill of the same
+/// process costs an `AlreadyGone`).
+#[test]
+fn kills_of_a_pid_whose_start_is_not_known_are_not_merged() {
+    let (d, journal, _sink) = dispatcher(true, 64);
+    let mut jobs = ResponseJob::of(
+        &decided(
+            "NN-L-T-A",
+            ResponseAction::KillProcess,
+            Severity::High,
+            4600,
+        ),
+        None,
+        0,
+        0,
+    );
+    jobs.extend(ResponseJob::of(
+        &decided(
+            "NN-L-T-B",
+            ResponseAction::KillProcess,
+            Severity::High,
+            4600,
+        ),
+        None,
+        0,
+        0,
+    ));
+    d.submit(jobs);
+    d.stop(Duration::from_secs(5));
+    assert_eq!(d.status().queue.merged, 0);
+    assert_eq!(intents_of(&journal.rows()).len(), 2);
+}
+
+/// Review of #477 (its X, 3): a kill that killed, its start not known,
+/// supersedes nothing — the throttle queued under the same pid may be of a
+/// process that reused it, and runs.
+#[test]
+fn a_kill_whose_start_is_not_known_supersedes_nothing() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (d, journal, _sink) = dispatcher(false, 64);
+    let hold = d.shared.hold.lock();
+    submit_one(
+        &d,
+        &decided("NN-L-T-0", ResponseAction::Log, Severity::Low, 4700),
+    );
+    until_taken(&d);
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-T",
+            ResponseAction::ThrottleProcess,
+            Severity::Low,
+            pid,
+        ),
+    );
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-K",
+            ResponseAction::KillProcess,
+            Severity::Critical,
+            pid,
+        ),
+    );
+    drop(hold);
+    d.stop(Duration::from_secs(5));
+    let _ = child.wait();
+    assert_eq!(
+        intents_of(&journal.rows()),
+        [
+            ("Log".to_string(), 4700),
+            ("KillProcess".to_string(), pid),
+            ("ThrottleProcess".to_string(), pid)
+        ],
+        "the kill first, then the throttle (on the dead process)"
+    );
+    assert_eq!(d.status().queue.superseded, 0);
+}
+
+/// Review of #477 (its R9): a spare that panics stops the dispatcher as a
+/// worker does — the agent stops for the watchdog's restart.
+#[test]
+fn a_spare_that_panics_stops_the_dispatcher() {
+    let (d, _journal, _sink) = pool(1, Duration::from_millis(100));
+    d.shared.hang_pids.lock().insert(5800);
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-S",
+            ResponseAction::KillProcess,
+            Severity::High,
+            5800,
+        ),
+    );
+    until("a spare for the stall", || d.status().spares == 1);
+    assert!(d.is_running());
+    d.shared.panic_next.store(true, Ordering::Release);
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-P",
+            ResponseAction::KillProcess,
+            Severity::High,
+            5801,
+        ),
+    );
+    until("the dispatcher seen down", || !d.is_running());
+    d.shared.hang_pids.lock().clear();
+    d.stop(Duration::from_secs(5));
+}
+
+/// Review of #477 (its R13): the spares are bounded by the pool's size —
+/// more stalls than that leave them stalled, signed, not more threads.
+#[test]
+fn the_spares_are_bounded_by_the_pool() {
+    let (d, journal, _sink) = pool(1, Duration::from_millis(100));
+    {
+        let mut h = d.shared.hang_pids.lock();
+        h.insert(5900);
+        h.insert(5901);
+    }
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-1",
+            ResponseAction::KillProcess,
+            Severity::High,
+            5900,
+        ),
+    );
+    until("a spare", || d.status().spares == 1);
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-2",
+            ResponseAction::KillProcess,
+            Severity::High,
+            5901,
+        ),
+    );
+    until("both stalled", || d.status().stalled_now == 2);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(d.status().spares, 1, "no more spares than workers");
+    assert_eq!(
+        journal
+            .rows()
+            .iter()
+            .filter(|r| r.row == ActionRow::Stalled)
+            .count(),
+        2
+    );
+    d.shared.hang_pids.lock().clear();
+    d.stop(Duration::from_secs(5));
 }

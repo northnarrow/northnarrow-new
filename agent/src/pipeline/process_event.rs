@@ -986,8 +986,12 @@ mod tests {
             nc_records[0].response, "none",
             "a Log decision runs nothing"
         );
+        // R12c-3: the run's end is the journal's one row (the stop's)
         assert!(
-            journal.rows().is_empty(),
+            journal
+                .rows()
+                .iter()
+                .all(|r| r.row == northnarrow_agent::response::journal::ActionRow::RunEnded),
             "no action: no intent ({:#?})",
             journal.rows()
         );

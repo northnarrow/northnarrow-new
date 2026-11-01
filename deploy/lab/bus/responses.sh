@@ -25,6 +25,12 @@
 # in the actions chain, and the `response_interrupted` row of the audit log
 # (from the files: the signed rows, never journal text).
 #
+# --hang (R12c-3): the lab build's `debug-hang-next-action`: the next
+# action hangs past the stall bound (10 s, 5 s more) before it acts — one
+# R001 exec takes it — then --kills more execs: their kills must run on the
+# other workers meanwhile; the summary names the signed `stalled` row and
+# when each kill's outcome came.
+#
 # Output (DIR, default /var/lib/nn-exp13r/<UTC stamp>): status-before.json,
 # status-after.json, actions-new.jsonl, audit-new.jsonl, summary.json.
 # Exit: 0 measured, 1 a check failed, 2 usage or not a lab guest.
@@ -32,7 +38,7 @@ set -u -o pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export LC_ALL=C
 
-OUT= KILLS=200 FLOWS=200 LOAD_SECS=30 SETTLE=20 CRASH=0 RESTART_WAIT=180 KEY=
+OUT= KILLS=200 FLOWS=200 LOAD_SECS=30 SETTLE=20 CRASH=0 HANG=0 RESTART_WAIT=180 KEY=
 ACTIONS=/var/lib/northnarrow/detections/actions.jsonl
 AUDIT=/etc/northnarrow/audit.log
 RUNDIR=/run/northnarrow
@@ -47,6 +53,7 @@ while (($#)); do
         --load-secs) LOAD_SECS=${2:?}; shift 2 ;;
         --settle) SETTLE=${2:?}; shift 2 ;;
         --crash) CRASH=1; shift ;;
+        --hang) HANG=1; shift ;;
         --restart-wait) RESTART_WAIT=${2:?}; shift 2 ;;
         --key) KEY=${2:?}; shift 2 ;;
         *) die "unknown argument: $1" ;;
@@ -105,6 +112,22 @@ if ((CRASH)); then
     runuser -u "$USER_NAME" -- "$STAGE/nn-exp13r-crash" 300 &
     echo "crash $!" >> "$PIDS"
     sleep 1
+elif ((HANG)); then
+    : > "$RUNDIR/debug-hang-next-action"
+    sleep 7   # the event loop reads its triggers every 5 s
+    cp /bin/sleep "$STAGE/nn-exp13r-hang"
+    chmod 0755 "$STAGE/nn-exp13r-hang"
+    runuser -u "$USER_NAME" -- "$STAGE/nn-exp13r-hang" 300 &
+    echo "hang $!" >> "$PIDS"
+    sleep 2
+    for i in $(seq 1 "$KILLS"); do
+        cp /bin/sleep "$STAGE/nn-exp13r-k$i"
+    done
+    chmod 0755 "$STAGE"/nn-exp13r-k*
+    for i in $(seq 1 "$KILLS"); do
+        runuser -u "$USER_NAME" -- "$STAGE/nn-exp13r-k$i" 300 &
+        echo "kill $!" >> "$PIDS"
+    done
 else
     # the burst: the R001 execs and the NET-001 connects, at once
     for i in $(seq 1 "$KILLS"); do
@@ -171,6 +194,10 @@ def rows(name):
         pass
     return r
 
+def ts_s(ts):
+    import datetime
+    return datetime.datetime.strptime(ts[:26], "%Y-%m-%dT%H:%M:%S.%f").timestamp()
+
 def status(name):
     try:
         with open(os.path.join(out, name)) as f:
@@ -213,6 +240,12 @@ summary = {
     "decision_delay_after": delay(after),
     "stages_after": stages(after),
     "dispatch_after": (after or {}).get("response_dispatch"),
+    # R12c-3: the stalled rows (the action they name, when), and when each
+    # outcome came after its intent (ms): the kills beside a stalled one
+    "stalled_rows": [{"action": r["action"], "ts": r["ts"]} for r in actions if r["row"] == "stalled"],
+    "outcome_after_intent_ms": sorted(
+        round((ts_s(answers[k]["ts"]) - ts_s(intents[k]["ts"])) * 1000, 1)
+        for k in intents if k in answers and answers[k]["row"] == "outcome"),
 }
 with open(os.path.join(out, "summary.json"), "w") as f:
     json.dump(summary, f, indent=1, sort_keys=True)

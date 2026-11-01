@@ -737,7 +737,10 @@ pub(crate) fn stores(
             }) {
             Ok(log) => {
                 let recovery = journal.bind(log, &cli.actions_file);
+                // R12c-3: the audit row first, then the interrupted rows and
+                // the run's start — a crash in between reports them again
                 attest_interrupted(audit_log, &recovery);
+                journal.start_run(&recovery);
             }
             Err(why) => {
                 tracing::error!(

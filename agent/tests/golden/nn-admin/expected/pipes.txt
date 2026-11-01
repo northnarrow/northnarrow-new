@@ -503,7 +503,7 @@ exit: 0
 |                     P1 budget 250 ms: 798 timed from the kernel's record (0 untimed), p50 60 µs p99 2500 µs max 3500 µs, 0 over budget
 |                     P2 budget 1000 ms: 81808 timed from the kernel's record (0 untimed), p50 30 µs p99 410000 µs max 1400000 µs, 7 over budget
 |                     P3 budget 500 ms: 30 timed from the kernel's record (10 untimed), p50 - p99 - max -, 0 over budget
-| response dispatch : running; 1024 slots, depth 0/1/0/2 (low/medium/high/critical; max 40); 120 submitted, 119 queued (2 Critical kills past the capacity), 3 merged, 4 superseded by a kill; taken 116 (2 in their process's order, 1 by age), wait p50 90 µs p99 41000 µs max 52000 µs; 116 run (longest 48000 µs)
+| response dispatch : running; 8 workers (1 spares), 2 actions running, 1 stalled now (1 since the start); 1024 slots, depth 0/1/0/2 (low/medium/high/critical; max 40); 120 submitted, 119 queued (2 Critical kills past the capacity), 3 merged, 4 superseded by a kill; taken 116 (2 in their process's order, 1 by age), wait p50 90 µs p99 41000 µs max 52000 µs; 116 run (longest 48000 µs)
 |   not run         : 4 (displaced 2/0/0/0, refused 1/0/0/0, stop or down 1) — each signed in an overflow row (2 rows)
 |   actions chain   : 116 intents, 115 outcomes, 1 in flight; 0 rows not in the chain (logged at ERROR); 1 intents of an earlier run without an outcome (interrupted); 0 abandoned; 0 syncs failed
 | evidence writer   : 1024 slots, depth 0 (max 1300), 276 records of actions past the capacity; 2 dropped (0 of actions), 0 appends refused, longest wait 8000 µs, 4100 written; canary rows unwritten 1; ransomware bursts prepared off the decision thread 6, judged on it 0

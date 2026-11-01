@@ -3558,7 +3558,8 @@ fn response_dispatch_lines(
     let lanes = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join("/");
     vec![
         format!(
-            "response dispatch : {}; {} slots, depth {} (low/medium/high/critical; max {}); {} \
+            "response dispatch : {}; {} workers ({} spares), {} actions running, {} stalled now \
+             ({} since the start); {} slots, depth {} (low/medium/high/critical; max {}); {} \
              submitted, {} queued ({} Critical kills past the capacity), {} merged, {} \
              superseded by a kill; taken {} ({} in their process's order, {} by age), wait p50 {} \
              p99 {} max {}; {} run (longest {} µs)",
@@ -3567,6 +3568,11 @@ fn response_dispatch_lines(
             } else {
                 colorize("NOT running", "31", tty)
             },
+            d.workers,
+            d.spares,
+            d.active,
+            red(d.stalled_now),
+            d.stalled,
             d.capacity,
             lanes(&d.depth),
             d.max_depth,

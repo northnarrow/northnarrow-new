@@ -52,7 +52,7 @@
 //!   posture's `TelemetryLoss` is raised: a response not run is a loss the
 //!   operator sees, never one nobody hears of.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 
 use nn_model::Severity;
@@ -125,6 +125,12 @@ pub trait DispatchJob {
     /// supersede`]).
     fn superseded_by_kill(&self) -> bool {
         false
+    }
+    /// The same process as `other` beyond the queue's key (a pid that names
+    /// one process at a time): a kill of it supersedes `other` only then
+    /// (review of #477: a pid reused by another process).
+    fn same_process(&self, _other: &Self) -> bool {
+        true
     }
 }
 
@@ -208,6 +214,10 @@ pub struct ResponseQueue<K, J> {
     lanes: [BTreeSet<u64>; LANES],
     /// Each process's jobs, in submission order.
     by_key: HashMap<K, VecDeque<u64>>,
+    /// R12c-3: the processes whose job is running now (a take marks one,
+    /// [`Self::done`] clears it). A take skips them: one process's jobs
+    /// never run at once, in order, whatever the number of workers.
+    running: HashSet<K>,
     /// Takes since the last one by age (aging's share).
     since_aged: u32,
     stats: DispatchStats,
@@ -221,6 +231,7 @@ impl<K: Eq + Hash + Clone, J: DispatchJob> ResponseQueue<K, J> {
             jobs: BTreeMap::new(),
             lanes: Default::default(),
             by_key: HashMap::new(),
+            running: HashSet::new(),
             since_aged: AGED_TAKE_EVERY - 1,
             stats: DispatchStats {
                 capacity: cap.max(1) as u64,
@@ -237,18 +248,32 @@ impl<K: Eq + Hash + Clone, J: DispatchJob> ResponseQueue<K, J> {
         self.jobs.is_empty()
     }
 
+    /// R12c-3: the process `key`'s job taken last has run (its outcome
+    /// written): its next job may be taken.
+    pub fn done(&mut self, key: &K) {
+        self.running.remove(key);
+    }
+
+    /// Processes with a job running now.
+    pub fn running(&self) -> usize {
+        self.running.len()
+    }
+
     /// After a kill of the process `key` succeeded: its queued throttles
     /// and blocks, taken out (counted `superseded`) for the caller to
     /// answer. Never before the kill ran: a kill that did not kill leaves
     /// them to run.
-    pub fn supersede(&mut self, key: &K) -> Vec<J> {
+    pub fn supersede(&mut self, key: &K, kill: &J) -> Vec<J> {
         let gone: Vec<u64> = self
             .by_key
             .get(key)
             .map(|q| {
                 q.iter()
                     .copied()
-                    .filter(|s| self.jobs[s].job.superseded_by_kill())
+                    .filter(|s| {
+                        let j = &self.jobs[s].job;
+                        j.superseded_by_kill() && kill.same_process(j)
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -343,10 +368,19 @@ impl<K: Eq + Hash + Clone, J: DispatchJob> ResponseQueue<K, J> {
     /// most severe lane's oldest job is of — or, when the oldest job of all
     /// waited [`STARVATION_NS`] and none of the last [`AGED_TAKE_EVERY`]` -
     /// 1` takes was by age, that job's process's oldest (itself).
+    ///
+    /// R12c-3 (the pool): only the jobs of processes with no job running
+    /// ([`Self::done`] not yet called for their last take) are candidates;
+    /// `None` when every queued job's process has one running. The process
+    /// taken is marked running until [`Self::done`].
     pub fn take(&mut self, now_ns: u64) -> Option<TakenJob<J>> {
-        let (&oldest, oe) = self.jobs.iter().next()?;
+        let (oldest, oldest_ns) = self
+            .jobs
+            .iter()
+            .find(|(_, e)| !self.running.contains(&e.key))
+            .map(|(s, e)| (*s, e.enqueued_ns))?;
         let aged = self.since_aged + 1 >= AGED_TAKE_EVERY
-            && now_ns.saturating_sub(oe.enqueued_ns) >= STARVATION_NS;
+            && now_ns.saturating_sub(oldest_ns) >= STARVATION_NS;
         self.since_aged = if aged {
             0
         } else {
@@ -357,10 +391,16 @@ impl<K: Eq + Hash + Clone, J: DispatchJob> ResponseQueue<K, J> {
         } else {
             (0..LANES)
                 .rev()
-                .find_map(|l| self.lanes[l].first().copied())
-                .expect("a queued job is in a lane")
+                .find_map(|l| {
+                    self.lanes[l]
+                        .iter()
+                        .copied()
+                        .find(|s| !self.running.contains(&self.jobs[s].key))
+                })
+                .expect("a free job is in a lane")
         };
         let key = self.jobs[&named].key.clone();
+        self.running.insert(key.clone());
         let first = *self
             .by_key
             .get(&key)
@@ -463,8 +503,15 @@ mod tests {
     const M: Severity = Severity::Medium;
     const L: Severity = Severity::Low;
 
+    /// A take by a single worker: the job, its process done at once.
+    fn take1(q: &mut ResponseQueue<u32, J>, now: u64) -> Option<TakenJob<J>> {
+        let t = q.take(now)?;
+        q.done(&t.job.pid);
+        Some(t)
+    }
+
     fn order(q: &mut ResponseQueue<u32, J>, now: u64) -> Vec<(u32, &'static str)> {
-        std::iter::from_fn(|| q.take(now).map(|t| (t.job.pid, t.job.action))).collect()
+        std::iter::from_fn(|| take1(q, now).map(|t| (t.job.pid, t.job.action))).collect()
     }
 
     /// The most severe first; FIFO in a lane.
@@ -499,10 +546,10 @@ mod tests {
         q.submit(7, L, 0, j(7, "strip", 1));
         q.submit(8, H, 0, j(8, "block", 2));
         q.submit(7, C, 0, j(7, "quarantine", 3));
-        let t = q.take(1).unwrap();
+        let t = take1(&mut q, 1).unwrap();
         assert_eq!((t.job.pid, t.job.action, t.inherited), (7, "strip", true));
         assert_eq!(t.severity, L, "it keeps its own severity in the record");
-        let t = q.take(1).unwrap();
+        let t = take1(&mut q, 1).unwrap();
         assert_eq!(
             (t.job.pid, t.job.action, t.inherited),
             (7, "quarantine", false)
@@ -536,23 +583,26 @@ mod tests {
         // the kill killed
         let mut q = ResponseQueue::new(16);
         submit_all(&mut q);
-        let t = q.take(1).unwrap();
+        let t = take1(&mut q, 1).unwrap();
         assert_eq!((t.job.pid, t.job.action), (7, "kill"));
         assert_eq!(t.job.decisions, [5, 6]);
         let gone: Vec<u32> = q
-            .supersede(&7)
+            .supersede(&7, &j(7, "kill", 0))
             .iter()
             .flat_map(|j| j.decisions.clone())
             .collect();
         assert_eq!(gone, [1, 3]);
-        assert!(q.supersede(&7).is_empty(), "handed back once");
+        assert!(
+            q.supersede(&7, &j(7, "kill", 0)).is_empty(),
+            "handed back once"
+        );
         assert_eq!(order(&mut q, 1), [(7, "quarantine"), (8, "throttle")]);
         let s = q.stats();
         assert_eq!((s.superseded, s.merged, s.lost()), (2, 1, 0));
         // the kill did not kill: nothing taken out, everything runs after it
         let mut q = ResponseQueue::new(16);
         submit_all(&mut q);
-        assert_eq!(q.take(1).unwrap().job.action, "kill");
+        assert_eq!(take1(&mut q, 1).unwrap().job.action, "kill");
         assert_eq!(
             order(&mut q, 1),
             [
@@ -563,6 +613,30 @@ mod tests {
             ]
         );
         assert_eq!(q.stats().superseded, 0);
+    }
+
+    /// R12c-3 (the pool): a process with a job running is skipped — the
+    /// next free process's job is taken instead, whatever its lane — and
+    /// its next job is taken only once the first is done; with every
+    /// queued process running, nothing is taken.
+    #[test]
+    fn a_process_with_a_job_running_waits_for_it() {
+        let mut q = ResponseQueue::new(16);
+        q.submit(7, C, 0, j(7, "kill", 1));
+        q.submit(7, C, 0, j(7, "quarantine", 2));
+        q.submit(8, L, 0, j(8, "throttle", 3));
+        let a = q.take(1).unwrap();
+        assert_eq!((a.job.pid, a.job.action), (7, "kill"));
+        let b = q.take(1).unwrap();
+        assert_eq!((b.job.pid, b.job.action), (8, "throttle"), "7 is running");
+        assert!(q.take(1).is_none(), "7 and 8 running");
+        assert_eq!(q.running(), 2);
+        q.done(&7);
+        let c = q.take(1).unwrap();
+        assert_eq!((c.job.pid, c.job.action), (7, "quarantine"));
+        q.done(&8);
+        q.done(&7);
+        assert!(q.is_empty() && q.running() == 0);
     }
 
     /// Review of #476 (X2): a full queue of Critical jobs refuses no
@@ -621,11 +695,11 @@ mod tests {
                 let r = next();
                 now += r % 50_000_000;
                 if r % 3 == 0 {
-                    if let Some(t) = q.take(now) {
+                    if let Some(t) = take1(&mut q, now) {
                         // a kill that killed (one in two) supersedes
                         if t.job.action == "kill" && (r >> 40) % 2 == 0 {
                             gone.extend(
-                                q.supersede(&t.job.pid)
+                                q.supersede(&t.job.pid, &t.job)
                                     .into_iter()
                                     .flat_map(|j| j.decisions),
                             );
@@ -645,7 +719,7 @@ mod tests {
                     other => panic!("room for all: {other:?}"),
                 }
             }
-            while let Some(t) = q.take(now) {
+            while let Some(t) = take1(&mut q, now) {
                 taken.entry(t.job.pid).or_default().extend(&t.job.decisions);
             }
             // only throttles and blocks are superseded, each once
@@ -687,7 +761,7 @@ mod tests {
         q.submit(10, H, 0, j(10, "kill", 2));
         assert_eq!(q.submit(9, C, 0, j(9, "kill", 3)), Submitted::Merged(1));
         assert_eq!(q.len(), 2);
-        let t = q.take(1).unwrap();
+        let t = take1(&mut q, 1).unwrap();
         assert_eq!(t.job.decisions, vec![1, 3]);
         assert_eq!(t.severity, C, "raised to the more severe decision's lane");
         // not into an earlier job of the process: that would reorder
@@ -752,10 +826,10 @@ mod tests {
         for i in 0..10 {
             q.submit(100 + i, C, 1, j(100 + i, "kill", 10 + i));
         }
-        assert_eq!(q.take(STARVATION_NS - 1).unwrap().job.pid, 100);
-        let t = q.take(STARVATION_NS).unwrap();
+        assert_eq!(take1(&mut q, STARVATION_NS - 1).unwrap().job.pid, 100);
+        let t = take1(&mut q, STARVATION_NS).unwrap();
         assert_eq!((t.job.pid, t.aged), (1, true));
-        assert_eq!(q.take(STARVATION_NS).unwrap().job.pid, 101);
+        assert_eq!(take1(&mut q, STARVATION_NS).unwrap().job.pid, 101);
         assert_eq!(q.stats().aged, 1);
     }
 
@@ -771,7 +845,7 @@ mod tests {
         for i in 0..5 {
             q.submit(100 + i, C, 2 * STARVATION_NS, j(100 + i, "kill", 100 + i));
         }
-        let order: Vec<u32> = std::iter::from_fn(|| q.take(2 * STARVATION_NS))
+        let order: Vec<u32> = std::iter::from_fn(|| take1(&mut q, 2 * STARVATION_NS))
             .take(10)
             .map(|t| t.job.pid)
             .collect();
@@ -786,7 +860,7 @@ mod tests {
         q.submit(1, C, 1_000_000, j(1, "kill", 1));
         q.submit(2, L, 1_000_000, j(2, "throttle", 2));
         assert_eq!(q.stats().depth, [1, 0, 0, 1]);
-        let t = q.take(4_000_000).unwrap();
+        let t = take1(&mut q, 4_000_000).unwrap();
         assert_eq!(t.waited_ns, 3_000_000);
         let s = q.stats();
         assert_eq!(s.depth, [1, 0, 0, 0]);

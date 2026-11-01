@@ -980,6 +980,14 @@ pub struct ResponseDispatchStatus {
     /// fsyncs of the actions chain that failed (its rows written; whether
     /// on the disk not known).
     pub sync_failed: u64,
+    /// R12c-3: the response workers, the spares started for stalled
+    /// actions, the actions running now, the actions stalled now (past the
+    /// stall bound) and since the start.
+    pub workers: u64,
+    pub spares: u64,
+    pub active: u64,
+    pub stalled_now: u64,
+    pub stalled: u64,
     /// Stage 7, the detection writer's queue: its capacity, depth and the
     /// most it held, records of actions taken past the capacity, records
     /// dropped (of them, of actions), the longest wait queue to chain (µs),
@@ -2925,6 +2933,11 @@ mod tests {
             overflow_rows: 0,
             in_flight: 0,
             sync_failed: 0,
+            workers: 8,
+            spares: 0,
+            active: 0,
+            stalled_now: 0,
+            stalled: 0,
             evidence_capacity: 1024,
             evidence_depth: 0,
             evidence_max_depth: 3,

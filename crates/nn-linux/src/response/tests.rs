@@ -423,3 +423,17 @@ fn journal_outcome_says_what_each_outcome_is() {
     ));
     assert_eq!((res, reason), (R::Success, None));
 }
+
+/// R12c-3: a thread's nice value raised (by its own call, on its own
+/// thread), the caller's left as it was.
+#[test]
+fn a_thread_lowers_its_own_priority_only() {
+    // SAFETY: getpriority(2) of this thread.
+    let before = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    let theirs = std::thread::spawn(|| super::renice_this_thread(5).unwrap())
+        .join()
+        .unwrap();
+    assert_eq!(theirs, (before + 5).min(19));
+    // SAFETY: getpriority(2) of this thread.
+    assert_eq!(unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }, before);
+}
