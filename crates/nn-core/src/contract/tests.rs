@@ -913,6 +913,12 @@ fn a_worse_state_is_told_from_a_better_one() {
     gone.sources.pop();
     assert!(gone.worsens_from(&m));
     assert!(!m.worsens_from(&gone), "it came back ok");
+    let mut back_unknown = m.clone();
+    back_unknown.sources.last_mut().unwrap().state = SourceState::Unknown;
+    assert!(
+        back_unknown.worsens_from(&gone),
+        "it came back, not ok (nothing else said it)"
+    );
     // one line new in each list, fewer deny hooks, a lower trust level
     let worse: [fn(&mut CapabilityManifest); 9] = [
         |x| x.missing.push("new".into()),

@@ -5,6 +5,12 @@ use crate::boot::lsm::BpfLsm;
 use crate::boot::trust::TrustInputs;
 use nn_core::contract::manifest::{AttachedOn, SourceState};
 
+/// The degradation registry is the process's: a degradation one of these
+/// tests reports is a worse state for every manifest built at that moment,
+/// signed at once (the re-check of #479). The tests that build a manifest
+/// run one at a time.
+static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 fn base() -> CapabilityManifest {
     CapabilityManifest {
         manifest_version: MANIFEST_VERSION,
@@ -129,6 +135,7 @@ fn settle(m: &SignedManifest) {
 /// verifies.
 #[test]
 fn the_manifest_is_a_signed_row_of_the_audit_chain() {
+    let _serial = SERIAL.lock();
     let dir = tempfile::tempdir().unwrap();
     let (log, pk) = open_log(dir.path());
     let current = SignedManifest::default();
@@ -168,6 +175,7 @@ fn the_manifest_is_a_signed_row_of_the_audit_chain() {
 /// signs nothing.
 #[test]
 fn a_change_while_running_is_a_signed_revision() {
+    let _serial = SERIAL.lock();
     let dir = tempfile::tempdir().unwrap();
     let (log, pk) = open_log(dir.path());
     let m = SignedManifest::default();
@@ -329,6 +337,7 @@ fn a_change_while_running_is_a_signed_revision() {
 /// again.
 #[test]
 fn a_worse_state_is_signed_at_once_a_better_one_waits() {
+    let _serial = SERIAL.lock();
     // the boot without net_drain's pump: net_drain unavailable at revision 0
     let mut i = inputs(active(), SelfTestOutcome::Denied);
     let all = i.pumps.clone().unwrap();
@@ -382,6 +391,7 @@ fn a_worse_state_is_signed_at_once_a_better_one_waits() {
 /// hash the one before them all; the stop signs what is pending.
 #[test]
 fn a_change_undone_within_the_minute_is_still_counted() {
+    let _serial = SERIAL.lock();
     let m = SignedManifest::default();
     m.arm(None, inputs(active(), SelfTestOutcome::Denied));
     settle(&m);
@@ -420,6 +430,7 @@ fn a_change_undone_within_the_minute_is_still_counted() {
 /// `missing` (the review of #479, K5).
 #[test]
 fn without_the_bpf_lsm_the_manifest_says_which_hooks_do_not_run() {
+    let _serial = SERIAL.lock();
     let m = SignedManifest::default();
     let mut i = inputs(
         BpfLsm::Absent {
@@ -499,6 +510,7 @@ fn without_the_bpf_lsm_the_manifest_says_which_hooks_do_not_run() {
 /// manifest's content (the overlay gate's record of it).
 #[test]
 fn a_default_list_in_force_is_the_manifest_s_content() {
+    let _serial = SERIAL.lock();
     let dir = tempfile::tempdir().unwrap();
     let admin_pub = dir.path().join("admin.pub");
     let gate = Arc::new(crate::config::overlay_auth::OverlayGate::new(
@@ -686,6 +698,7 @@ fn every_source_and_attach_point_the_code_starts_has_a_contract_entry() {
 /// most one row a minute, none left unsigned at a clean stop).
 #[test]
 fn the_stop_beat_signs_what_is_pending() {
+    let _serial = SERIAL.lock();
     let m = SignedManifest::default();
     m.arm(None, inputs(active(), SelfTestOutcome::Denied));
     settle(&m);
