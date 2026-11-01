@@ -1192,12 +1192,17 @@ fn audit_verify_e2e() {
         .filter(|e| {
             // R12c-2 (lab PR 270): the heartbeat's `telemetry_loss` rows
             // come with its beats, on their own clock, as the background
-            // chain check's do (the heartbeat's tests read them)
+            // chain check's do (the heartbeat's tests read them). R13 (lab
+            // PR 271): so do the capability manifest's changes — the
+            // telemetry probe's first round, 20 s after the start, is one
+            // (the manifest's tests read them); the boot's own row stays
+            // in the list below.
             ![
                 "integrity_drift",
                 "chain_numbering_started",
                 "chain_verify",
                 "telemetry_loss",
+                "capability_manifest_change",
             ]
             .contains(&e["op"].as_str().unwrap_or_default())
         })
