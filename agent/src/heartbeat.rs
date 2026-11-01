@@ -477,4 +477,97 @@ mod tests {
         // the export's last two lines
         assert_eq!(export_lines(&path, 2).unwrap().len(), 2);
     }
+
+    /// The `telemetry_loss` rows: the run's baseline at its first beat, none
+    /// for a beat within the minute with nothing changed, one at the stop —
+    /// signed in the audit log.
+    #[test]
+    fn telemetry_loss_rows_are_signed_at_the_start_and_the_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("agent.sig.key");
+        let key = || crate::keys::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let audit_path = dir.path().join("audit.log");
+        let audit = Arc::new(Mutex::new(
+            crate::audit::AuditLog::open(&audit_path, key(), [1; 16]).unwrap(),
+        ));
+        let mut src = sources();
+        src.audit = Some(Arc::clone(&audit));
+        let hb = Heartbeat::open(
+            &dir.path().join("heartbeat.jsonl"),
+            key(),
+            Arc::new(crate::chainlog::NoProtection),
+            false,
+            src,
+        );
+        hb.beat(BeatKind::Beat, None);
+        hb.stop("sigterm");
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&audit_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|r: &serde_json::Value| r["op"] == TELEMETRY_LOSS_OP)
+            .collect();
+        let at: Vec<&str> = rows
+            .iter()
+            .map(|r| r["extra"]["at"].as_str().unwrap())
+            .collect();
+        assert_eq!(at, ["start", "stop"], "{rows:#?}");
+        assert_eq!(rows[0]["extra"]["stages"].as_array().unwrap().len(), 7);
+        assert_eq!(rows[0]["extra"]["run"], "1234567890abcdef");
+        // the beats name the audit chain's head
+        let lines = export_lines(&dir.path().join("heartbeat.jsonl"), 10).unwrap();
+        let last: crate::chainlog::ChainLine<HeartbeatRecord> =
+            serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert!(last
+            .payload
+            .heads
+            .iter()
+            .any(|h| h.chain == "audit" && h.seq.is_some()));
+    }
+
+    /// The verifier end to end (`nn-admin heartbeat watch`'s check, its
+    /// state file): beats on time are OK, the same chain again is OK with no
+    /// new beat, an older copy of the chain is a replay.
+    #[test]
+    fn the_verifier_reads_the_chain_and_keeps_its_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("heartbeat.jsonl");
+        let key_path = dir.path().join("agent.sig.key");
+        let key = || crate::keys::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let pk = key().verifying_key();
+        let hb = Heartbeat::open(
+            &path,
+            key(),
+            Arc::new(crate::chainlog::NoProtection),
+            false,
+            sources(),
+        );
+        let old = dir.path().join("old.jsonl");
+        std::fs::copy(&path, &old).unwrap();
+        hb.beat(BeatKind::Beat, None);
+        let w = nn_admin::heartbeat::Watch {
+            pubkey: pk,
+            source: nn_admin::heartbeat::Source::File(path.clone()),
+            state: dir.path().join("state/watch.json"),
+            every: None,
+            cfg: nn_evidence::heartbeat::WatchConfig::default(),
+        };
+        let r = nn_admin::heartbeat::check_once(&w);
+        assert!(r.anchored && r.alerts.is_empty(), "{r:?}");
+        assert!(w.state.exists(), "the state is kept");
+        hb.beat(BeatKind::Beat, None);
+        let r = nn_admin::heartbeat::check_once(&w);
+        assert!(
+            !r.anchored && r.alerts.is_empty() && r.new_beats == 1,
+            "{r:?}"
+        );
+        let r = nn_admin::heartbeat::check_once(&w);
+        assert!(r.alerts.is_empty() && r.new_beats == 0, "{r:?}");
+        let replay = nn_admin::heartbeat::Watch {
+            source: nn_admin::heartbeat::Source::File(old),
+            ..w.clone()
+        };
+        let r = nn_admin::heartbeat::check_once(&replay);
+        assert_eq!(r.exit_code(), 12, "{r:?}");
+    }
 }
