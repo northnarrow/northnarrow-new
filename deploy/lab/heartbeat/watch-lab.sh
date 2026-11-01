@@ -42,7 +42,9 @@ cat > "$OUT/fetch.sh" <<EOF
 #!/usr/bin/env bash
 # the verifier's source: the guest's export over SSH, or what the mode says
 live() { ssh -i "$ROOT/id_ed25519" -p $PORT -o BatchMode=yes -o ConnectTimeout=5 \\
-  -o UserKnownHostsFile="$DIR/known_hosts" -o GlobalKnownHostsFile=/dev/null \\
+  -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$DIR/known_hosts" \\
+  -o GlobalKnownHostsFile=/dev/null -o HostKeyAlias=nn-lab-$D -o HostKeyAlgorithms=ssh-ed25519 \\
+  -o CheckHostIP=no -o LogLevel=ERROR \\
   nn@127.0.0.1 'sudo -n /usr/local/bin/nn-admin heartbeat export --count 64'; }
 case \$(cat "$MODE") in
   replay) cat "$OUT/old-export.jsonl" ;;
