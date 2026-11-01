@@ -232,12 +232,32 @@ pub struct KernelBudget {
 /// An attach point a source falls back to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Fallback {
-    /// As the boot notes it (its prefix).
+    /// As the boot notes it, whole (the review of #479, X1: matched
+    /// exactly, never by a prefix).
     pub attach: &'static str,
     /// When it is taken.
     pub when: &'static str,
     /// What it costs.
     pub costs: &'static str,
+    /// It covers what the attach point covers: the source is `ok` on it.
+    /// Otherwise the source is `partial` on it, with what it costs and the
+    /// kinds of events it no longer sends (`lost`).
+    pub equivalent: bool,
+    pub lost: &'static [EventKind],
+}
+
+/// A verdict an operator's opt-in adds to a source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct OptIn {
+    pub verdict: SyncVerdict,
+    /// The opt-in, as an operator sets it.
+    pub when: &'static str,
+    /// Its key in the boot's list of the opt-ins configured
+    /// (`SourceFacts::opt_ins`).
+    pub key: &'static str,
+    /// It runs in a BPF LSM program: without `bpf` in the active LSM list
+    /// it is configured and inert (the review of #479).
+    pub needs_bpf_lsm: bool,
 }
 
 /// What a source of the bus is promised (plan §3.6).
@@ -250,17 +270,24 @@ pub struct SourceContract {
     pub sensors: &'static [&'static str],
     /// The kinds of the events it sends.
     pub events: &'static [EventKind],
-    /// Its attach point as the boot notes it (a prefix of the note).
+    /// Its attach point, whole, as the boot notes it; and the same attach
+    /// point under another kernel's names (`also`). A note is `ok` only
+    /// when its attach code says it took it whole and the note is one of
+    /// these exactly (the review of #479, X1).
     pub attach: &'static str,
+    pub also: &'static [&'static str],
     /// Its programs are BPF LSM programs: without `bpf` in the active LSM
     /// list they attach and never run.
     pub needs_bpf_lsm: bool,
+    /// What of it still runs without the BPF LSM, when part of it does
+    /// (then `partial`, not `attached_not_invoked`).
+    pub lsm_part: Option<&'static str>,
     /// Where it goes when the attach point is not there or not wanted.
     pub fallbacks: &'static [Fallback],
     /// What decides before the operation completes, as shipped; and the
-    /// verdict an operator's opt-in adds, with the opt-in.
+    /// verdict an operator's opt-in adds.
     pub sync_verdict: SyncVerdict,
-    pub opt_in_verdict: Option<(SyncVerdict, &'static str)>,
+    pub opt_in: Option<OptIn>,
     /// What a failure of it means, and what the agent does then.
     pub on_failure: FailureMode,
     pub on_failure_detail: &'static str,
@@ -272,6 +299,8 @@ pub struct SourceContract {
     pub rings: &'static [&'static str],
     /// The telemetry probe's sensor that exercises it, if any.
     pub probe: Option<&'static str>,
+    /// The deny self-test exercises it (one of its hooks, at the boot).
+    pub self_tested: bool,
     /// The degradation registry's sources that are about it (their entries
     /// are the manifest's reasons for its state).
     pub degradation_sources: &'static [&'static str],
@@ -448,6 +477,26 @@ pub fn check(sources: &[SourceContract]) -> Vec<String> {
             problems.push(format!(
                 "source {} needs the BPF LSM but its attach is {}",
                 s.source, s.attach
+            ));
+        }
+        for f in s.fallbacks {
+            if f.equivalent && !f.lost.is_empty() {
+                problems.push(format!(
+                    "source {}: the fallback {} is equivalent and loses events",
+                    s.source, f.attach
+                ));
+            }
+            if f.lost.iter().any(|k| !s.events.contains(k)) {
+                problems.push(format!(
+                    "source {}: the fallback {} loses a kind the source does not send",
+                    s.source, f.attach
+                ));
+            }
+        }
+        if s.lsm_part.is_some() && !s.needs_bpf_lsm {
+            problems.push(format!(
+                "source {}: part of it without the BPF LSM, and it needs none",
+                s.source
             ));
         }
         if let Some(other) = s.standby_for {

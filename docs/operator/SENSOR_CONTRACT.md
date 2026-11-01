@@ -69,9 +69,9 @@ the heartbeat's.
 | `dns_query` | DnsQuery, DnsFlood | `kprobe:udp_send_skb+udp_v6_send_skb` (and `dns_nss`, a uprobe on `libnss_resolve`); `kprobe:udp_sendmsg` with `--dns-sensor sendmsg` or without what the socket-buffer programs need (the name read from the sender's memory, IPv4 only) | none | blind | 64 queries at once then 128 a second per process, 2,048 then 1,024 per user (`dns_rate`) | query 288 B wire form (`qname_partial`, `NONLINEAR`), 252 B on the fallback, comm 15 B | `dns` |
 | `fs_protect` | FsProtectDenial | `lsm:` the 16 deny hooks (and `inode_set_acl`, `inode_remove_acl`, `file_ioctl_compat` where the kernel has them) | **kernel deny** | **fail-open**: a hook that cannot read what it needs lets the operation through, counted per hook and signed (`deny_fail_open`); a missing hook, `bpf` not in the LSM list or a delivered self-test signal refuses the start unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1` | refused signals, ptraces, kexecs: one record per caller and operation a second, 50 a second per CPU (`task_denial_rate`) | comm 15 B | `fs_protect` |
 | `module_load` | ModuleLoad | `lsm:kernel_read_file+kernel_load_data` | none | blind | — | module path 31 B per component (`path_truncated`), comm 15 B | `module_load` |
-| `io_uring` | IoUring, SensorFlood | `tracepoint:io_uring/io_uring_create+io_uring_submit_req` (or `_sqe`); `create only` without a submit tracepoint | none | blind | ring creations 64 then 128 a second per process, 512 then 256 per user; submissions one record a second per process (`io_uring_rate`) | comm 15 B | `io_uring` |
+| `io_uring` | IoUring, SensorFlood | `tracepoint:io_uring/io_uring_create+io_uring_submit_req` (or `_sqe`); without a submit tracepoint `partial` | none | blind | ring creations 64 then 128 a second per process, 512 then 256 per user; submissions one record a second per process (`io_uring_rate`) | comm 15 B | `io_uring` |
 | `bpf_syscall` | BpfSyscall | `lsm:bpf` | none (the same hook's refusals of the agent's links are `fs_protect`'s) | blind | one record per process and command a second (not counted) | comm 15 B | `bpf` |
-| `exploit_guard` | ExploitPostcondition | lite: `lsm:capable+bprm_check_security+file_open` with `fentry` and `tp_btf` hooks; strict (`--exploit-guard strict`): `fentry` and raw tracepoints | none; enforce: SIGKILL before the call returns | blind | 4 reports per task (the rest counted by the kernel) | comm 15 B | `exploit_guard` |
+| `exploit_guard` | ExploitPostcondition | lite: `lsm:capable+bprm_check_security+file_open` with `fentry` and `tp_btf` hooks; strict (`--exploit-guard strict`, an equivalent fallback): `fentry` and raw tracepoints | none; enforce: SIGKILL before the call returns | blind | 4 reports per task (the rest counted by the kernel) | comm 15 B | `exploit_guard` |
 | `open_sensor` | FileOpen, Fim, MassWrite, FileBurst, DefenderSignal | `lsm:file_open` (the FIM observer); its fallback is the `file_open` source's tracepoint (`--file-open-sensor tracepoint`, a failure to arm, or `bpf` not in the active LSM list): every open reaches userland, no mass writes, bursts, security-tool signals or FIM `Opened` records | none | blind | a read-only open repeated within 1 s is not recorded (by design) | path 31 B per component, 16 components (`path_truncated`), a renamed name's first 31 B, comm 15 B | `open_sensor` |
 | `fim_drain` | Fim | `lsm:` the FIM observe programs | none | blind | 8,192 inodes with a write pending (`fim_dirty_full`) | child name 63 B (`FIM_CHILD_TRUNCATED`), comm 15 B | `fim` |
 | `net_drain` | NetFlow, NetListener, SensorFlood | `kprobe:inet_csk_listen_start, fexit:tcp_close, kprobe:udp_sendmsg(+udpv6_sendmsg)` | none | blind | `listen()` 64 then 128 a second per process, 512 then 256 per user; UDP one row a second per destination (`listen_rate`) | comm 15 B | `tcp_close`, `listen`, `udp` |
@@ -96,23 +96,26 @@ What R13 adds to the row (`manifest_version` 2):
 
 | Field | Content |
 |---|---|
-| `contract_version` | the contract's version (1) |
-| `sources` | one entry per source: `source`, `classes`, `attach` (as the boot noted it, `not attached` without), `on` (`primary`, `fallback`, `none`), `state`, `why` (the boot's reasons and the degradations recorded about it), `probe` (the telemetry probe's word: `pending`, `seen`, `gap`; absent for a source it does not exercise), `terms` (its contract, as in §3) |
+| `sensors[].took` | how the attach code took each attach point: `whole`, `partial` (with what did not attach), `fallback`, `off`, `absent` |
+| `contract_version`, `contract_hash` | the contract's version (1), and the hash of its terms, the agent's version and the kernel's release |
+| `sources` | one entry per source: `source`, `classes`, `attach` (as the boot noted it, `not attached` without), `on` (`primary`, `fallback`, `none`), `state`, `why` (the boot's reasons and the degradations recorded about it), `probe` (the telemetry probe's word: `pending`, `seen`, `gap`, `stale`; absent for a source it does not exercise), `evidence` (what its `ok` rests on: `probe`, `self_test`, `attach_only`), `terms` (its contract, as in §3: in the boot's row; a change's row names them by `contract_hash`) |
 | `classes` | one entry per class: its queue, capacity, full-queue policy, decision budget, sources, strongest verdict, worst failure, loss stages, and `state`, the worst of its sources' |
 | `fallbacks` | each source on a fallback, with its attach point |
 | `missing` | each deny or observe hook not attached, and each source not `ok` (with its first reason) |
 | `content` | the shipped lists not in force from their file: the copy built into the agent took over, or the file was edited by hand (the overlay gate's `default_list_*` rows say when) |
 | `telemetry_probe`, `settled` | the probe's period (`off`), and whether its first round has ended (before it, every probed source is `pending`) |
 | `degradations`, `trust_level`, `trust_reasons` | as before, now of this revision — the status shows these |
-| `revision`, `hash`, `previous_hash`, `change` | the revision (0 at the boot), its hash, the hash of the revision before it, and what changed, one line each |
+| `revision`, `hash`, `previous_hash`, `change`, `changes` | the revision (0 at the boot), its capabilities hash, the hash of the revision before it, what changed (one line each) and how many changes the row folds; the running view (`status`, `capabilities`) adds `unsigned_changes`, the changes not signed yet |
 
 The **states** of a source:
 
 | State | Meaning |
 |---|---|
-| `ok` | attached and running (on its attach point or a fallback), and the probe saw it or does not exercise it |
+| `ok` | its attach code took the contract's attach point whole — that note exactly, never a prefix of it — or an equivalent fallback; its pump runs; its BPF LSM programs run when it has some; the probe saw it or does not exercise it |
 | `standby` | attached and inert by design: the fallback of a source that runs on its own (the `file_open` tracepoint while `open_sensor` runs) |
 | `disabled_by_admin` | switched off by the operator (`--exploit-guard off`) |
+| `partial` | part of it runs: a hook of it not attached (12 of 16 deny hooks; the DNS sensor without `udp_v6_send_skb`), a fallback that covers less (`open_sensor` on the tracepoint: no `MassWrite`, `FileBurst`, `DefenderSignal`, no FIM `Opened` records, the path read from the caller's memory; `exec_check` on `sys_enter_execve`: no executable identity, no exec guards), part of it an LSM program that does not run (the lite exploit guard without `bpf`), an opt-in configured that cannot run (`--exec-policy enforce`, `--exec-quarantine enforce`, `--net-connect-deny` without `bpf`) — what is missing in `why` |
+| `unknown` | not known: an attach note the contract does not know, or one that does not say how it attached; the telemetry probe's word `stale` (no round ended for two of its longest intervals and its deadline: 149 s at 60 s) |
 | `attached_not_invoked` | attached, and not running: its BPF LSM programs do not run (`bpf` not in the active LSM list, or the deny self-test's signal was delivered), or the telemetry probe's event did not reach the pipeline |
 | `unavailable` | nothing attached on this host (with why), or attached with no pump or drain started to read it |
 | `adapter_terminated` | its pump or drain ended: the agent stops for the watchdog's restart, and signs this revision first |
@@ -122,30 +125,69 @@ stage, signed in `telemetry_loss` rows and carried by every beat
 ([the event bus, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/architecture/EVENT_BUS.md)). A manifest that changed at every lost record would say
 nothing about what is attached.
 
-The **hash** is the SHA-256 of the manifest's JSON without its revision
-fields, its unordered lists sorted: two starts that attach the same way on
-the same host have the same hash, and the telemetry probe's first round
-changes it once (`pending` to `seen`). A change of any capability changes
-it.
+**Two hashes.** `hash` is the SHA-256 of the capabilities: the manifest
+without its revision fields, without the contract's terms, without what an
+upgrade or a new kernel changes by itself (the agent's version, the
+kernel's release, the offsets counted, the host checks' values), its
+unordered lists sorted. Two starts that attach the same way have the same
+hash; the telemetry probe's first round changes it once (`pending` to
+`seen`); a change of a capability changes it, an upgrade alone does not.
+`contract_hash` covers the terms, the contract's and the agent's versions
+and the kernel's release: what an upgrade changes.
 
-What signs a revision: a degradation recorded after the boot (a drain that
-ended, a fallback, a stream not persisted — every `subsystem_degraded`, its
-own row kept), the telemetry probe's first round, a gap and its end, an
-adapter that ended, a shipped list given way to its built-in copy.
+**What signs a revision**: a degradation recorded after the boot (a drain
+that ended, a fallback, a stream not persisted — every `subsystem_degraded`,
+its own row kept), the telemetry probe's first round, a gap, its end, its
+word going stale, an adapter that ended, a shipped list given way to its
+built-in copy. The running agent builds the manifest every 5 s (and for
+each status and each beat): a change shows at once in the status and the
+beats; its `capability_manifest_change` row is signed at most once a minute
+— the changes in between folded into it, counted (`changes`) and named,
+even those undone before the row —, and at once for an adapter that ended
+and at the stop.
 
 ## 5. Off the host
 
-Every heartbeat carries the newest revision as `capabilities`: its `hash`,
-its `revision` and `settled` (`HEARTBEAT.md`). `nn-admin heartbeat watch`
-remembers the last settled hash it saw and says **`DEGRADED`** when a
-settled hash differs from it — "the capability manifest changed" (within a
-run) or "… changed across a restart" (a new run that attaches otherwise:
-another kernel, an LSM list without `bpf`, a sensor on its fallback) —
-naming both hashes and the revision. A run whose manifest has not settled
-120 s after its start, and a beat without the field after beats that had
-it, are `DEGRADED` too. The first check anchors the hash it sees. On the
-host, `nn-admin capabilities --key` names the change; the audit log holds
-each revision.
+Every heartbeat carries the newest view as `capabilities`: its `hash`, the
+last `revision` signed, `settled` and `contract` (`HEARTBEAT.md`). `nn-admin
+heartbeat watch` remembers the last settled hash it saw and says
+**`DEGRADED`** when a settled hash differs from it — "the capability
+manifest changed" (within a run) or "… changed across a restart" (a new run
+that attaches otherwise: an LSM list without `bpf`, a sensor on its
+fallback, a probe gone silent or stale) — naming both hashes and the
+revision. A change of `contract` alone — an upgrade, a new kernel — is a
+**`NOTICE`** line, no alert: a fleet's upgrade does not page anyone. A run
+whose manifest has not settled 120 s after its start, and a beat without
+the field after beats that had it, are `DEGRADED` too. The first check
+anchors what it sees. On the host, `nn-admin capabilities --key` names the
+change; the audit log holds each revision.
+
+## 5a. What the probe proves, and what it does not
+
+The telemetry probe makes one exec, one file open and one DNS datagram a
+minute and checks that each reaches the pipeline. It finds a sensor blinded
+**naively or by accident** — a hook detached, a ring no longer read, a
+kprobe disarmed for all, a layout broken by a kernel update, its own rounds
+stopped (`stale`). It does not hold against **an adaptive root**: the probe
+child is the agent's own binary run with `--telemetry-probe`, which a root
+watching the execs can recognise and serve, re-arming what it disarmed for
+the probe's few milliseconds; kprobes can be switched off as a whole through
+debugfs (`/sys/kernel/debug/kprobes/enabled`); and the ten sources the probe
+does not exercise (`evidence: attach_only`, the deny hooks' `self_test` one
+hook at the boot) are never verified again after their attach. Against a
+root on the host the deny hooks (the agent's own files, maps and processes)
+and the heartbeat's verifier off the host are the defence: the manifest
+says what the agent can see, not what it cannot.
+
+**Worst-case delays** for a probed source blinded at random: its next
+round within 72 s (60 s, +20 % jitter), its deadline 5 s, the next build
+5 s — about **82 s to the signed row** (one more minute when another change
+row was signed in the minute before: the rows are coalesced); then the
+next beat (30 s) and the verifier's next check (its timer, 30 s in the
+example of `HEARTBEAT.md`) — about **2.4 minutes to `DEGRADED`** off the
+host. A probe whose rounds stop is `stale` after 149 s. For the sources the
+probe does not exercise there is no such bound: their blinding by a root
+that leaves the attach in place is not seen.
 
 ## 6. A kernel without `bpf` in `lsm=` (EXP-37)
 
@@ -162,8 +204,12 @@ mode**, trust level L0, and
   LSM list");
 - states in the manifest every source whose programs are LSM programs and
   have no fallback as `attached_not_invoked` with why: `fs_protect` (no
-  deny runs: no self-defence), `module_load`, `bpf_syscall`,
-  `exploit_guard` (lite), `fim_drain`;
+  deny runs: no self-defence), `module_load`, `bpf_syscall`, `fim_drain`;
+  the lite exploit guard as `partial` (its `fentry` and `tp_btf` hooks run,
+  its LSM use points do not); `exec_check` and `open_sensor` as `partial` on
+  their fallbacks (what each loses named); an opt-in configured that needs
+  an LSM program (`--exec-policy enforce`, `--exec-quarantine enforce`,
+  `--net-connect-deny`) as inert, its source `partial`;
 - signs the boot's `subsystem_degraded` (`source: bpf_lsm`) and its manifest,
   and every beat carries a manifest hash that is not the one a verifier saw
   while the host ran `bpf`: `DEGRADED` off the host.

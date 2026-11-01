@@ -257,7 +257,13 @@ impl Heartbeat {
         // R13: the newest revision of the capability manifest (built again
         // first: a change is signed before the beat names it)
         let manifest = s.manifest.as_ref().and_then(|m| {
-            m.refresh();
+            // the stop signs what is pending (the review of #479: at most
+            // one change row a minute, none left unsigned)
+            if kind == BeatKind::Stop {
+                m.flush();
+            } else {
+                m.refresh();
+            }
             m.current()
         });
         let mut degradations = match &manifest {

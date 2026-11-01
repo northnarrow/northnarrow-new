@@ -204,6 +204,10 @@ pub fn check_once(w: &Watch) -> Result<CheckResult, String> {
             }
         );
     }
+    // R13 (the review of #479): an upgrade's contract change, said, no alert
+    for n in &r.notices {
+        println!("{now} NOTICE {n}");
+    }
     for a in &r.alerts {
         println!("{now} ALERT {} {}", a.kind(), a.detail());
     }
@@ -283,6 +287,7 @@ mod tests {
             manifest_hash: Some("cd".repeat(32)),
             manifest_revision: Some(2),
             manifest_run: Some("r".into()),
+            manifest_contract: Some("ef".repeat(32)),
         };
         write_state(&p, &s).unwrap();
         assert_eq!(read_state(&p), Ok(Some(s)));

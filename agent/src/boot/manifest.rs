@@ -45,14 +45,20 @@ pub const AUDIT_OP: &str = "capability_manifest";
 /// R13: the audit op of a revision signed while the agent runs.
 pub const CHANGE_OP: &str = "capability_manifest_change";
 /// R13: how often the running agent builds its manifest again (a change
-/// is signed within this, plus the registry's own flush of a report made
+/// is seen within this, plus the registry's own flush of a report made
 /// without the audit log, `degradation::FLUSH_PERIOD`).
 pub const REFRESH_PERIOD: Duration = Duration::from_secs(5);
+/// R13 (the review of #479, cost): change rows are signed at most this
+/// often — the changes between two rows folded into the next, each counted
+/// (`changes`) and named (`change`); an adapter that ended, and the stop,
+/// sign at once. The running view (the status, the beats) shows a change at
+/// once (`unsigned_changes` until its row).
+pub const CHANGE_ROW_EVERY: Duration = Duration::from_secs(60);
 
 /// The manifest's types, nn-core's since R13 (the plan's
 /// `contract::CapabilityManifest`).
 pub use nn_core::contract::manifest::{
-    CapabilityManifest, DenyHooks, HostCheck, SensorEntry, MANIFEST_VERSION,
+    CapabilityManifest, DenyHooks, HostCheck, SensorEntry, Took, MANIFEST_VERSION,
 };
 
 /// R09b shim (lab PR 254; plan §4.1 rule 2, removed in R17): the sensors'
@@ -103,6 +109,8 @@ pub struct Inputs {
     pub content: Option<Arc<crate::config::overlay_auth::OverlayGate>>,
     /// The pumps and drains the start registered (`None`: not known).
     pub pumps: Option<Vec<String>>,
+    /// The opt-ins configured (`nn_linux::sensors::contract::OPT_IN_*`).
+    pub opt_ins: Vec<String>,
 }
 
 /// Whether the BPF LSM programs run, and why not (`None`: not known).
@@ -155,6 +163,7 @@ fn build(inputs: &Inputs, terminated: &[String]) -> CapabilityManifest {
             .collect(),
         terminated: terminated.to_vec(),
         running: inputs.pumps.clone(),
+        opt_ins: inputs.opt_ins.clone(),
     };
     let contract = &nn_linux::sensors::contract::SOURCES;
     m.sources = source_entries(contract, &facts);
@@ -170,10 +179,13 @@ fn build(inputs: &Inputs, terminated: &[String]) -> CapabilityManifest {
         _ => "off".to_string(),
     };
     m.settled = m.probe_settled();
+    m.contract_hash = m.contract_hash_now();
     m.revision = 0;
-    m.hash = String::new();
+    m.hash = m.content_hash();
     m.previous_hash = None;
     m.change = Vec::new();
+    m.changes = 0;
+    m.unsigned_changes = 0;
     m
 }
 
@@ -181,8 +193,14 @@ fn build(inputs: &Inputs, terminated: &[String]) -> CapabilityManifest {
 struct Live {
     inputs: Option<Inputs>,
     audit: Option<Arc<Mutex<AuditLog>>>,
-    /// The newest revision and its row's `entry_hash` (`None`: not signed).
+    /// The newest view (the status's, the beats') and the `entry_hash` of
+    /// the last row signed (`None`: not signed).
     current: Option<(CapabilityManifest, Option<String>)>,
+    /// The last revision signed, and when.
+    signed: Option<(CapabilityManifest, std::time::Instant)>,
+    /// The changes since it, folded into the next row.
+    pending: u64,
+    pending_lines: Vec<String>,
     terminated: Vec<String>,
 }
 
@@ -204,11 +222,17 @@ impl SignedManifest {
         manifest.revision = 0;
         manifest.previous_hash = None;
         manifest.change = Vec::new();
+        manifest.changes = 0;
+        manifest.unsigned_changes = 0;
+        manifest.contract_hash = manifest.contract_hash_now();
         manifest.hash = manifest.content_hash();
         let entry_hash = sign(audit_log, &manifest);
         let mut live = self.0.lock();
         live.audit = audit_log.cloned();
+        live.signed = Some((manifest.clone(), std::time::Instant::now()));
         live.current = Some((manifest, entry_hash.clone()));
+        live.pending = 0;
+        live.pending_lines.clear();
         entry_hash
     }
 
@@ -220,30 +244,71 @@ impl SignedManifest {
         self.sign(audit_log, m)
     }
 
-    /// R13: build the manifest again; when its hash moved, sign the change
-    /// (op [`CHANGE_OP`]) as the next revision. Returns that revision.
+    /// R13: build the manifest again. A change shows at once in the
+    /// running view and is signed as the next revision (op [`CHANGE_OP`])
+    /// when [`CHANGE_ROW_EVERY`] has passed since the last row — the
+    /// changes in between folded into it, counted and named, even those
+    /// undone before it. Returns the revision signed, if one was.
     pub fn refresh(&self) -> Option<u64> {
+        self.refresh_at(std::time::Instant::now(), false)
+    }
+
+    /// [`Self::refresh`], signing what is pending now whatever the time
+    /// since the last row (an adapter that ended, the stop).
+    pub fn flush(&self) -> Option<u64> {
+        self.refresh_at(std::time::Instant::now(), true)
+    }
+
+    fn refresh_at(&self, now: std::time::Instant, force: bool) -> Option<u64> {
         let mut live = self.0.lock();
         let inputs = live.inputs.as_ref()?;
-        let mut m = build(inputs, &live.terminated);
-        let (before, _) = live.current.as_ref()?;
-        let hash = m.content_hash();
-        if hash == before.hash {
+        let built = build(inputs, &live.terminated);
+        let (view, entry_hash) = live.current.clone()?;
+        let (signed, signed_at) = live.signed.clone()?;
+        if built.hash != view.hash {
+            let lines = built.changes_from(&view);
+            live.pending += 1;
+            for l in lines {
+                if !live.pending_lines.contains(&l) {
+                    live.pending_lines.push(l);
+                }
+            }
+            let mut v = built.clone();
+            v.revision = signed.revision;
+            v.previous_hash = Some(signed.hash.clone());
+            v.change = live.pending_lines.clone();
+            v.unsigned_changes = live.pending;
+            warn!(
+                hash = %v.hash,
+                change = %v.change.join("; "),
+                "the capability manifest changed (signed capability_manifest_change within {} s)",
+                CHANGE_ROW_EVERY.as_secs()
+            );
+            live.current = Some((v, entry_hash.clone()));
+        }
+        if live.pending == 0
+            || (!force && now.saturating_duration_since(signed_at) < CHANGE_ROW_EVERY)
+        {
             return None;
         }
-        m.change = m.changes_from(before);
-        m.revision = before.revision + 1;
-        m.previous_hash = Some(before.hash.clone());
-        m.hash = hash;
+        let mut row = built;
+        row.revision = signed.revision + 1;
+        row.previous_hash = Some(signed.hash.clone());
+        row.change = std::mem::take(&mut live.pending_lines);
+        row.changes = std::mem::take(&mut live.pending);
+        row.unsigned_changes = 0;
         warn!(
-            revision = m.revision,
-            hash = %m.hash,
-            change = %m.change.join("; "),
-            "the capability manifest changed (signed capability_manifest_change)"
+            revision = row.revision,
+            hash = %row.hash,
+            changes = row.changes,
+            change = %row.change.join("; "),
+            "the capability manifest's change signed (capability_manifest_change)"
         );
-        let entry_hash = sign_change(live.audit.as_ref(), &m);
-        let revision = m.revision;
-        live.current = Some((m, entry_hash));
+        // the terms by the contract's hash (the boot's row carries them)
+        let entry_hash = sign_change(live.audit.as_ref(), &row.without_terms());
+        let revision = row.revision;
+        live.signed = Some((row.clone(), now));
+        live.current = Some((row, entry_hash));
         Some(revision)
     }
 
@@ -258,7 +323,7 @@ impl SignedManifest {
                 }
             }
         }
-        self.refresh()
+        self.flush()
     }
 
     /// The newest revision for `nn-admin capabilities`: one JSON object,
@@ -275,8 +340,9 @@ impl SignedManifest {
         self.0.lock().current.as_ref().map(|(m, _)| m.clone())
     }
 
-    /// R13: what a heartbeat carries of it — the newest revision's hash,
-    /// its number, and whether the telemetry probe has had its word.
+    /// R13: what a heartbeat carries of it — the newest view's capabilities
+    /// hash, the last revision signed, whether the telemetry probe has had
+    /// its word, and the contract's hash (an upgrade's, the review of #479).
     pub fn beat(&self) -> Option<BeatManifest> {
         let live = self.0.lock();
         let (m, _) = live.current.as_ref()?;
@@ -284,6 +350,7 @@ impl SignedManifest {
             hash: m.hash.clone(),
             revision: m.revision,
             settled: m.settled,
+            contract: Some(m.contract_hash.clone()),
         })
     }
 

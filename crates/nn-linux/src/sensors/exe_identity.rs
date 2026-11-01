@@ -17,7 +17,8 @@ use nn_model::Event;
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
-use crate::boot::manifest::AttachPoints;
+use crate::boot::manifest::{AttachPoints, Took};
+use crate::sensors::contract::attach as A;
 use crate::sensors::open_sensor::MountTable;
 
 /// The LSM program in the eBPF object.
@@ -99,7 +100,7 @@ pub fn attach(
                 program = EXEC_LSM_PROGRAM,
                 "exec sensor armed on LSM bprm_check_security (Tappa 10.9 step 2)"
             );
-            points.note("exec", "lsm:bprm_check_security");
+            points.note("exec", A::EXEC_LSM, Took::Whole);
             Ok(EXEC_LSM_PROGRAM)
         }
         Err(e) => {
@@ -122,7 +123,7 @@ pub const EXEC_TRACEPOINT_DEGRADED: &str = "exec sensor on sys_enter_execve: the
      read from the caller's memory (it can differ from the file the kernel runs)";
 
 fn tracepoint_fallback(points: &AttachPoints, why: &str) {
-    points.note("exec", "tracepoint:syscalls/sys_enter_execve (user memory)");
+    points.note("exec", A::EXEC_TRACEPOINT, Took::Fallback);
     crate::boot::degradation::report(
         "exec_sensor",
         &format!("{EXEC_TRACEPOINT_DEGRADED} — {why}"),

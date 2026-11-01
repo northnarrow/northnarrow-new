@@ -945,12 +945,25 @@ soak) are in the lot's note of `docs/roadmap/CAPABILITY_PROGRAM.md`.
   and degradations are its newest revision's; every beat carries its hash
   and the verifier says `DEGRADED` when it changes. Without `bpf` in the
   active LSM list (the degraded-mode opt-in) the exec and file-open sensors
-  take their tracepoints.
+  take their tracepoints. After the review of #479: `ok` only for an attach
+  its code noted whole, exactly the contract's (`partial`, `unknown`
+  otherwise); a fallback that covers less is `partial` with the events it
+  loses; an LSM opt-in configured without `bpf` is said inert; each source
+  says what its `ok` rests on (`evidence`); the probe's word goes `stale`
+  when its rounds stop; the capabilities hash leaves out the contract's
+  terms (`contract_hash`, a NOTICE off the host when it changes alone);
+  change rows at most once a minute, every change counted.
 - **Open after R13** — the health class has no event yet (the manifest,
   the probe and the beats carry the sensors' health); the probe exercises
   three sources (process spawn, file open, DNS): the other ten are judged
-  from their attach and their pump's liveness only, and the deny self-test
-  exercises one deny hook (`task_kill`) of sixteen; the opt-in connect
+  from their attach and their pump's liveness only (`evidence:
+  attach_only`), and the deny self-test exercises one deny hook
+  (`task_kill`) of sixteen — the follow-ups: a loopback `connect()`, a
+  harmless `bpf()`, an `io_uring_setup`, a FIM write and a second deny hook
+  in the probe; a periodic check that the BPF links are still attached;
+  `/sys/kernel/debug/kprobes/enabled` protected; a probe child harder to
+  recognise (the probe holds against a naive or accidental blinding, not an
+  adaptive root, `docs/operator/SENSOR_CONTRACT.md` §5a); the opt-in connect
   deny's fail-open is not counted (no `DENY_FAIL_OPEN` slot: an eBPF
   change); a FIM or network drain that does not start is a WARN, not a
   registry degradation (the manifest says `unavailable`); the manifest's

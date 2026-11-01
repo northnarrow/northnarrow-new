@@ -174,6 +174,11 @@ pub struct BeatManifest {
     pub hash: String,
     pub revision: u64,
     pub settled: bool,
+    /// The hash of the contract's terms, the agent's version and the
+    /// kernel's release (the review of #479): a change of it alone is an
+    /// upgrade, a NOTICE of the verifier's, not an alert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<String>,
 }
 
 /// A run's manifest not settled this long after its start is DEGRADED: the
@@ -236,6 +241,9 @@ pub struct WatchState {
     /// The run whose beat carried it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_run: Option<String>,
+    /// The contract's hash last seen (the review of #479).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_contract: Option<String>,
 }
 
 /// One alert, by kind (the most severe first in [`Alert::rank`]).
@@ -353,6 +361,9 @@ pub struct CheckResult {
     pub age_secs: Option<i64>,
     /// No state before: the newest beat is the anchor.
     pub anchored: bool,
+    /// What is worth saying and is no alert (the review of #479: the sensor
+    /// contract changed — an upgrade, a new kernel).
+    pub notices: Vec<String>,
 }
 
 impl CheckResult {
@@ -399,6 +410,7 @@ pub fn check(
         new_beats: 0,
         age_secs: None,
         anchored: false,
+        notices: Vec::new(),
     };
     let silent_if_old = |out: &mut CheckResult, why: &str| {
         if let Some(l) = last {
@@ -769,6 +781,7 @@ pub fn check(
     let mut manifest_run = last
         .and_then(|l| l.manifest_run.clone())
         .unwrap_or_default();
+    let mut manifest_contract = last.and_then(|l| l.manifest_contract.clone());
     let fresh: Vec<&HeartbeatRecord> = match last {
         Some(l) => beats
             .iter()
@@ -780,6 +793,23 @@ pub fn check(
     for b in fresh {
         match &b.capabilities {
             Some(m) if m.settled => {
+                // the contract first: its change alone is an upgrade
+                if let Some(c) = &m.contract {
+                    if let Some(seen) = manifest_contract.as_deref() {
+                        if seen != c && last.is_some() {
+                            out.notices.push(format!(
+                                "the sensor contract changed: {} → {} (run {}, agent {}): an \
+                                 upgrade or a new kernel — the capabilities are compared on \
+                                 their own",
+                                short(seen),
+                                short(c),
+                                b.run,
+                                b.version
+                            ));
+                        }
+                    }
+                    manifest_contract = Some(c.clone());
+                }
                 if let Some(seen) = manifest_hash.as_deref() {
                     if seen != m.hash && last.is_some() {
                         degraded.push(format!(
@@ -844,6 +874,7 @@ pub fn check(
         manifest_hash,
         manifest_revision,
         manifest_run: Some(manifest_run).filter(|r| !r.is_empty()),
+        manifest_contract,
     });
     out
 }

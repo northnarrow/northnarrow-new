@@ -50,11 +50,12 @@ use crate::net::flow_tracker::{FlowTracker, TcpConnectInfo};
 use crate::posture::lineage::AuthSessionTracker;
 use crate::sensors::bus::{BusLosses, BusReceiver, BusSender, BusStats, Received};
 
-/// The DNS record's decode (R09b, lab PR 254: nn-model's until then).
-use crate::sensors::dns_sensor::{nss_query_name, query_event};
 /// eBPF object embedded once in [`crate::sensors::ebpf_object`] (the
 /// single embed site + boot preflight). Re-used here so this loader and
 /// the Tappa 1 [`super::exec`] loader load byte-identical bytes.
+use crate::boot::manifest::Took;
+/// The DNS record's decode (R09b, lab PR 254: nn-model's until then).
+use crate::sensors::dns_sensor::{nss_query_name, query_event};
 use crate::sensors::ebpf_object::EBPF_BYTES;
 use crate::sensors::reject::RejectThrottle;
 
@@ -363,9 +364,11 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         if plan.open_tracepoint {
             crate::sensors::open_sensor::set_tracepoint_emitting(&mut ebpf, true)?;
         }
+        // the open sensor's fallback until the start arms its LSM sensor
         attach_points.note(
             "file_open",
-            "tracepoint:syscalls/sys_enter_openat (user memory)",
+            crate::sensors::contract::attach::OPEN_TRACEPOINT,
+            Took::Fallback,
         );
         // Tappa 10.9 step 2: the exec sensor on LSM `bprm_check_security`
         // (`--exec-sensor`), or `sys_enter_execve` when the LSM program
@@ -403,11 +406,21 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     attach_points.note(
                         "io_uring",
                         &format!("tracepoint:io_uring/io_uring_create+{name}"),
+                        Took::Whole,
                     );
                 }
                 Err(e) => {
                     warn!(error = format!("{e:#}"), "io_uring submit tracepoint not attached — ring creations are still observed");
-                    attach_points.note("io_uring", "tracepoint:io_uring/io_uring_create only");
+                    attach_points.note(
+                        "io_uring",
+                        crate::sensors::contract::attach::IO_URING_CREATE,
+                        Took::Partial {
+                            missing: vec![format!(
+                                "io_uring_submit_req/io_uring_submit_sqe ({e}): the operations \
+                                 submitted through a ring are not observed"
+                            )],
+                        },
+                    );
                     // Lab PR 218 (P0 C-13): a fallback is signed, not only a WARN.
                     crate::boot::degradation::report(
                         "io_uring_sensor",
@@ -421,7 +434,11 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     error = format!("{e:#}"),
                     "io_uring tracepoints not available (CONFIG_IO_URING off?) — the asynchronous I/O channel is NOT observed on this kernel"
                 );
-                attach_points.note("io_uring", "not attached");
+                attach_points.note(
+                    "io_uring",
+                    &format!("not attached: no io_uring tracepoint ({e})"),
+                    Took::Absent,
+                );
                 crate::boot::degradation::report(
                     "io_uring_sensor",
                     "no io_uring tracepoint on this kernel: the asynchronous I/O channel is not \
@@ -431,7 +448,11 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         }
         attach_kprobe(&mut ebpf, "tcp_v4_connect", "tcp_v4_connect")?;
         attach_kprobe(&mut ebpf, "tcp_v6_connect", "tcp_v6_connect")?;
-        attach_points.note("tcp_connect", "kprobe:tcp_v4_connect+tcp_v6_connect");
+        attach_points.note(
+            "tcp_connect",
+            crate::sensors::contract::attach::TCP_CONNECT,
+            Took::Whole,
+        );
         // Tappa 10.9 step 3: the socket-buffer DNS sensor, or `udp_sendmsg`.
         let dns_mode = crate::sensors::dns_sensor::attach(
             &mut ebpf,
@@ -461,7 +482,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             // Review 68: datagrams to IPv6 destinations. Soft: a kernel
             // without IPv6 has nothing to observe there.
             let udp6 = match attach_kprobe(&mut ebpf, "udpv6_sendmsg_outbound", "udpv6_sendmsg") {
-                Ok(()) => "+udpv6_sendmsg",
+                Ok(()) => None,
                 Err(e) => {
                     warn!(
                         error = format!("{e:#}"),
@@ -471,13 +492,25 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                         "net_sensor",
                         "udpv6_sendmsg not attached: UDP flows to IPv6 destinations are not observed",
                     );
-                    ""
+                    Some(format!(
+                        "udpv6_sendmsg ({e:#}): UDP flows to IPv6 destinations are not observed"
+                    ))
                 }
             };
-            attach_points.note(
-                "net_flows",
-                &format!("kprobe:inet_csk_listen_start, fexit:tcp_close, kprobe:udp_sendmsg{udp6}"),
-            );
+            match udp6 {
+                None => attach_points.note(
+                    "net_flows",
+                    crate::sensors::contract::attach::NET_FLOWS,
+                    Took::Whole,
+                ),
+                Some(missing) => attach_points.note(
+                    "net_flows",
+                    crate::sensors::contract::attach::NET_FLOWS_V4,
+                    Took::Partial {
+                        missing: vec![missing],
+                    },
+                ),
+            }
             let close_rb = take_ringbuf(&mut ebpf, "NET_FLOW_CLOSE_EVENTS")?;
             let listen_rb = take_ringbuf(&mut ebpf, "NET_LISTEN_EVENTS")?;
             let udp_rb = take_ringbuf(&mut ebpf, "NET_UDP_EVENTS")?;
@@ -834,17 +867,28 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         let (ring, guard) = match crate::sensors::epg::attach(&mut self.ebpf, variant) {
             Ok(attached) => attached,
             Err(why) => {
-                let note = if variant == crate::sensors::epg::Variant::Off {
-                    why.clone()
+                if variant == crate::sensors::epg::Variant::Off {
+                    self.attach_points.note("exploit_guard", &why, Took::Off);
                 } else {
-                    format!("not attached: {why}")
-                };
-                self.attach_points.note("exploit_guard", &note);
+                    self.attach_points.note(
+                        "exploit_guard",
+                        &format!("not attached: {why}"),
+                        Took::Absent,
+                    );
+                }
                 return Err(why);
             }
         };
-        self.attach_points
-            .note("exploit_guard", crate::sensors::epg::attach_note(variant));
+        // strict is lite's equivalent fallback (an operator's choice)
+        self.attach_points.note(
+            "exploit_guard",
+            crate::sensors::epg::attach_note(variant),
+            if variant == crate::sensors::epg::Variant::Strict {
+                Took::Fallback
+            } else {
+                Took::Whole
+            },
+        );
         let pump = spawn_ring_pump::<common::wire::epg::EpgEventRaw>(
             crate::sensors::epg::PUMP_LABEL,
             ring,
@@ -854,8 +898,11 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         )
         .map_err(|e| {
             let why = format!("its pump's thread did not start: {e:#}");
-            self.attach_points
-                .note("exploit_guard", &format!("not attached: {why}"));
+            self.attach_points.note(
+                "exploit_guard",
+                &format!("not attached: {why}"),
+                Took::Absent,
+            );
             why
         })?;
         self.register_pump_thread(crate::sensors::epg::PUMP_LABEL, pump);
@@ -885,8 +932,8 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         // R13 (lab PR 271): the deny hooks and the two observe sensors of
         // the anti-tamper attach, in the manifest's attach points
         if let Some(deny) = &report.deny {
-            for (sensor, note) in crate::anti_tamper::attach_notes(deny) {
-                self.attach_points.note(sensor, &note);
+            for (sensor, note, took) in crate::anti_tamper::attach_notes(deny) {
+                self.attach_points.note(sensor, &note, took);
             }
         }
         Ok(report)
@@ -983,14 +1030,19 @@ fn attach_exec_tracepoint(
         .with_context(|| format!("program {program} is not a tracepoint"))?;
     prog.attach("sched", "sched_process_exec")
         .with_context(|| perf_attach_hint("attaching tracepoint sched/sched_process_exec"))?;
-    attach_points.note(
-        "process_spawn",
-        if program == WITH_STDIO {
-            "tracepoint:sched/sched_process_exec"
-        } else {
-            "tracepoint:sched/sched_process_exec (no standard-stream probes: R020 off)"
-        },
-    );
+    if program == WITH_STDIO {
+        attach_points.note(
+            "process_spawn",
+            crate::sensors::contract::attach::PROCESS_SPAWN,
+            Took::Whole,
+        );
+    } else {
+        attach_points.note(
+            "process_spawn",
+            crate::sensors::contract::attach::PROCESS_SPAWN_NO_STDIO,
+            Took::Fallback,
+        );
+    }
     Ok(())
 }
 

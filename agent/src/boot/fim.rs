@@ -29,6 +29,7 @@ fn open_sensor_on_tracepoint(sensor: &SensorMultiplexer, why: &str) {
     sensor.attach_points().note(
         "file_open",
         northnarrow_agent::sensors::contract::OPEN_TRACEPOINT_NOTE,
+        northnarrow_agent::boot::manifest::Took::Fallback,
     );
     northnarrow_agent::boot::degradation::report(
         "file_open_sensor",
@@ -136,6 +137,7 @@ fn start_open_sensor(
     sensor.attach_points().note(
         "file_open",
         northnarrow_agent::sensors::contract::OPEN_LSM_NOTE,
+        northnarrow_agent::boot::manifest::Took::Whole,
     );
     // Lab PR 249: the posture's own switch (it was process-wide).
     posture.set_kernel_mass_write(true);
@@ -588,14 +590,34 @@ pub(crate) fn start(
                 // lab PR 264: in the map's own slot, no longer a process-wide
                 // setter the late binding called).
                 inode_map.bind_audit_log(audit_log.clone());
-                sensor.attach_points().note(
-                    "fim_observers",
-                    &format!(
-                        "lsm: {} of {} observe programs",
-                        fim_attached.len(),
-                        northnarrow_agent::fim::attach::FIM_OBSERVE_PROGRAMS.len()
-                    ),
-                );
+                // R13 (the review of #479, X1): whole only with every
+                // observe program; otherwise the ones that did not attach
+                {
+                    use northnarrow_agent::boot::manifest::Took;
+                    let all = northnarrow_agent::fim::attach::FIM_OBSERVE_PROGRAMS;
+                    let missing: Vec<String> = all
+                        .iter()
+                        .map(|(p, _)| p.to_string())
+                        .filter(|p| !fim_attached.contains(&p.as_str()))
+                        .collect();
+                    let (attach, took) = if fim_attached.is_empty() {
+                        (
+                            format!("not attached: none of the {} observe programs", all.len()),
+                            Took::Absent,
+                        )
+                    } else if missing.is_empty() {
+                        (
+                            northnarrow_agent::sensors::contract::attach::FIM_OBSERVERS.to_string(),
+                            Took::Whole,
+                        )
+                    } else {
+                        (
+                            northnarrow_agent::sensors::contract::attach::FIM_OBSERVERS.to_string(),
+                            Took::Partial { missing },
+                        )
+                    };
+                    sensor.attach_points().note("fim_observers", &attach, took);
+                }
                 // External audit FIMP-011: a FIM that attached no observer, or
                 // watches nothing, sees no file change at all. Said in the
                 // signed audit chain, not only in an INFO among the boot lines.

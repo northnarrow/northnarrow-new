@@ -3107,14 +3107,23 @@ fn contract_lines(m: &serde_json::Value) -> Vec<String> {
         ];
     };
     let text = |v: &serde_json::Value| clean(v.as_str().unwrap_or("?"));
+    let count = |k: &str| m[k].as_u64().unwrap_or(0);
     let mut lines = vec![format!(
-        "revision          : {} — hash {}{}; telemetry probe {}{}",
+        "revision          : {} — hash {}{}{}{}; telemetry probe {}{}",
         m["revision"],
         text(&m["hash"]),
         m["previous_hash"]
             .as_str()
             .map(|p| format!(", the one before {}", clean(p)))
             .unwrap_or_default(),
+        match count("changes") {
+            0 => String::new(),
+            n => format!(", {n} change(s) in its row"),
+        },
+        match count("unsigned_changes") {
+            0 => String::new(),
+            n => format!(", {n} change(s) since, signed within a minute"),
+        },
         text(&m["telemetry_probe"]),
         if m["settled"] == true {
             ""
@@ -3126,16 +3135,26 @@ fn contract_lines(m: &serde_json::Value) -> Vec<String> {
         lines.push(format!("  - changed: {}", text(c)));
     }
     lines.push(format!(
-        "contract          : version {}",
-        m["contract_version"]
+        "contract          : version {}{}",
+        m["contract_version"],
+        m["contract_hash"]
+            .as_str()
+            .filter(|h| !h.is_empty())
+            .map(|h| format!(", hash {}", clean(h)))
+            .unwrap_or_default()
     ));
     for s in sources {
         let probe = s["probe"]
             .as_str()
             .map(|p| format!(" [probe {p}]"))
             .unwrap_or_default();
+        // the review of #479: what its `ok` rests on
+        let evidence = s["evidence"]
+            .as_str()
+            .map(|e| format!(" [rests on: {}]", e.replace('_', " ")))
+            .unwrap_or_default();
         lines.push(format!(
-            "source            : {:<14} {:<22} {}{probe}",
+            "source            : {:<14} {:<22} {}{probe}{evidence}",
             text(&s["source"]),
             text(&s["state"]).replace('_', " "),
             text(&s["attach"])
@@ -3212,6 +3231,8 @@ fn manifest_status_json(out: &StatusOutcome) -> String {
         "hash": m["hash"],
         "entry_hash": v["entry_hash"],
         "settled": m["settled"],
+        "unsigned_changes": m["unsigned_changes"].as_u64().unwrap_or(0),
+        "contract_hash": m["contract_hash"],
         "fallbacks": m["fallbacks"],
         "missing": m["missing"],
     })
@@ -3248,14 +3269,21 @@ fn manifest_status_lines(out: &StatusOutcome, tty: bool) -> Vec<String> {
     let missing = m["missing"].as_array().map_or(0, Vec::len);
     let hash = m["hash"].as_str().unwrap_or("");
     let summary = format!(
-        "{ok} of {} sources ok, {fallbacks} on a fallback, {missing} missing or not invoked",
+        "{ok} of {} sources ok, {fallbacks} on a fallback, {missing} missing, partial, not known \
+         or not invoked",
         sources.len()
     );
+    let pending = m["unsigned_changes"].as_u64().unwrap_or(0);
     let mut lines = vec![format!(
-        "capabilities      : revision {} (hash {}{}, signed row {}) — {}; nn-admin \
+        "capabilities      : revision {} (hash {}{}{}, signed row {}) — {}; nn-admin \
          capabilities --key lists them",
         m["revision"],
         clean(&hash[..hash.len().min(16)]),
+        if pending > 0 {
+            format!(", {pending} change(s) not signed yet")
+        } else {
+            String::new()
+        },
         if m["settled"] == true {
             ""
         } else {
@@ -3278,8 +3306,12 @@ fn manifest_status_lines(out: &StatusOutcome, tty: bool) -> Vec<String> {
     }
     for c in m["change"].as_array().into_iter().flatten() {
         lines.push(format!(
-            "  - changed in revision {}: {}",
-            m["revision"],
+            "  - changed {}: {}",
+            if pending > 0 {
+                "since".to_string()
+            } else {
+                format!("in revision {}", m["revision"])
+            },
             clean(c.as_str().unwrap_or("?"))
         ));
     }
@@ -5988,7 +6020,7 @@ mod flow_sock_line_tests {
                  "terms": {}},
                 {"source": "exec_check", "classes": ["process"],
                  "attach": "tracepoint:syscalls/sys_enter_execve (user memory)",
-                 "on": "fallback", "state": "ok", "probe": "seen", "terms": {}}
+                 "on": "fallback", "state": "ok", "probe": "seen", "evidence": "probe", "terms": {}}
             ],
             "classes": [
                 {"class": "tamper", "queue": "P0", "queue_capacity": 1024,
@@ -6005,18 +6037,19 @@ mod flow_sock_line_tests {
             "content": ["netflow-blocklist (/x.v1): unavailable"],
             "telemetry_probe": "every 60 s", "settled": true,
             "revision": 2, "hash": "0123456789abcdef0123", "previous_hash": "fedc",
+            "contract_hash": "c0ffee", "changes": 3,
             "change": ["source dns_query: telemetry probe seen → gap"]
         });
         let v = serde_json::json!({"entry_hash": "abcdef0123456789ff", "manifest": manifest});
         let text = capability_lines(&v).join("\n");
         for want in [
             "signed row        : abcdef0123456789ff (audit chain, op capability_manifest_change)",
-            "revision          : 2 — hash 0123456789abcdef0123, the one before fedc; telemetry probe every 60 s",
+            "revision          : 2 — hash 0123456789abcdef0123, the one before fedc, 3 change(s) in its row; telemetry probe every 60 s",
             "  - changed: source dns_query: telemetry probe seen → gap",
-            "contract          : version 1",
+            "contract          : version 1, hash c0ffee",
             "source            : fs_protect     attached not invoked   lsm: 19 of 19 deny hooks",
             "  - bpf is not in the active LSM list (capability,apparmor)",
-            "exec_check     ok                     tracepoint:syscalls/sys_enter_execve (user memory) [probe seen]",
+            "exec_check     ok                     tracepoint:syscalls/sys_enter_execve (user memory) [probe seen] [rests on: probe]",
             "class             : tamper — P0 1024 events (wait 50 ms, then drop), decision within 100 ms; sources fs_protect (attached not invoked); sync verdict kernel deny on LSM task_kill; failure fail-open; losses counted at stages 1, 2, 3, 4, 5",
             "class             : health — P0 1024 events (wait 50 ms, then drop), decision within 100 ms; no source; sync verdict none; failure -; losses counted at stages -",
             "fallback          : exec_check: tracepoint:syscalls/sys_enter_execve (user memory)",
@@ -6033,7 +6066,7 @@ mod flow_sock_line_tests {
         assert_eq!(
             l,
             [
-                "capabilities      : revision 2 (hash 0123456789abcdef, signed row abcdef0123456789) — 1 of 2 sources ok, 1 on a fallback, 1 missing or not invoked; nn-admin capabilities --key lists them",
+                "capabilities      : revision 2 (hash 0123456789abcdef, signed row abcdef0123456789) — 1 of 2 sources ok, 1 on a fallback, 1 missing, partial, not known or not invoked; nn-admin capabilities --key lists them",
                 "  - fallback: exec_check: tracepoint:syscalls/sys_enter_execve (user memory)",
                 "  - missing: fs_protect: attached, not invoked (lsm: 19 of 19 deny hooks)",
                 "  - changed in revision 2: source dns_query: telemetry probe seen → gap",
@@ -6054,6 +6087,29 @@ mod flow_sock_line_tests {
         assert!(
             l[0].contains("telemetry probe pending, signed row none: no audit log"),
             "{l:?}"
+        );
+        // a change not signed yet (at most one row a minute)
+        let mut pending = v.clone();
+        pending["manifest"]["unsigned_changes"] = 2.into();
+        o.capability_manifest = Some(pending.to_string());
+        let l = manifest_status_lines(&o, false);
+        assert!(
+            l[0].contains("hash 0123456789abcdef, 2 change(s) not signed yet, signed row"),
+            "{l:?}"
+        );
+        assert!(
+            l.last().unwrap().starts_with("  - changed since: "),
+            "{l:?}"
+        );
+        let j: serde_json::Value = serde_json::from_str(&manifest_status_json(&o)).unwrap();
+        assert_eq!(
+            (j["unsigned_changes"].as_u64(), j["contract_hash"].as_str()),
+            (Some(2), Some("c0ffee"))
+        );
+        let text = capability_lines(&pending).join("\n");
+        assert!(
+            text.contains(", 3 change(s) in its row, 2 change(s) since, signed within a minute;"),
+            "{text}"
         );
         let mut old = v.clone();
         old["manifest"].as_object_mut().unwrap().remove("sources");

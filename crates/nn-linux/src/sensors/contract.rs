@@ -18,8 +18,15 @@ use common::wire::{
     ARGV_LEN, FILENAME_LEN, FIM_CHILD_NAME_LEN, QNAME_LEN, QNAME_WIRE_LEN, TASK_COMM_LEN,
 };
 use nn_core::contract::{
-    EventKind as K, FailureMode, Fallback, KernelBudget, SourceContract, SyncVerdict, Truncation,
+    EventKind as K, FailureMode, Fallback, KernelBudget, OptIn, SourceContract, SyncVerdict,
+    Truncation,
 };
+
+/// The opt-ins the boot says are configured (`SourceFacts::opt_ins`; the
+/// agent's start reads its command line).
+pub const OPT_IN_EXEC_QUARANTINE: &str = "exec_quarantine_enforce";
+pub const OPT_IN_EXEC_POLICY: &str = "exec_policy_enforce";
+pub const OPT_IN_NET_CONNECT_DENY: &str = "net_connect_deny";
 
 /// `comm`: the kernel's 16 bytes, NUL included.
 const COMM: Truncation = Truncation {
@@ -28,9 +35,40 @@ const COMM: Truncation = Truncation {
     marked: "not marked: the kernel's own bound",
 };
 
+/// The attach points as the boot notes them, whole (the review of #479,
+/// X1: the manifest reads a source `ok` only from its attach code's own
+/// `Took::Whole` on exactly one of these, or a known fallback).
+pub mod attach {
+    pub const PROCESS_SPAWN: &str = "tracepoint:sched/sched_process_exec";
+    pub const PROCESS_SPAWN_NO_STDIO: &str =
+        "tracepoint:sched/sched_process_exec (no standard-stream probes: R020 off)";
+    pub const EXEC_LSM: &str = "lsm:bprm_check_security";
+    pub const EXEC_TRACEPOINT: &str = "tracepoint:syscalls/sys_enter_execve (user memory)";
+    pub const TCP_CONNECT: &str = "kprobe:tcp_v4_connect+tcp_v6_connect";
+    pub const DNS_SKB: &str = "kprobe:udp_send_skb+udp_v6_send_skb";
+    /// Part of [`DNS_SKB`]: `udp_v6_send_skb` not attached.
+    pub const DNS_SKB_V4: &str = "kprobe:udp_send_skb";
+    pub const DNS_SENDMSG: &str = "kprobe:udp_sendmsg (user memory, IPv4 only)";
+    pub const DENY_HOOKS: &str = "lsm:deny hooks";
+    pub const MODULE_LOAD: &str = "lsm:kernel_read_file+kernel_load_data";
+    pub const BPF_OBSERVER: &str = "lsm:bpf";
+    pub const IO_URING_REQ: &str = "tracepoint:io_uring/io_uring_create+io_uring_submit_req";
+    pub const IO_URING_SQE: &str = "tracepoint:io_uring/io_uring_create+io_uring_submit_sqe";
+    /// Part of the io_uring sensor: no submit tracepoint.
+    pub const IO_URING_CREATE: &str = "tracepoint:io_uring/io_uring_create";
+    pub const FIM_OBSERVERS: &str = "lsm:FIM observe programs";
+    pub const NET_FLOWS: &str =
+        "kprobe:inet_csk_listen_start, fexit:tcp_close, kprobe:udp_sendmsg+udpv6_sendmsg";
+    /// Part of [`NET_FLOWS`]: `udpv6_sendmsg` not attached.
+    pub const NET_FLOWS_V4: &str =
+        "kprobe:inet_csk_listen_start, fexit:tcp_close, kprobe:udp_sendmsg";
+    pub const OPEN_LSM: &str = "lsm:file_open (FIM observer)";
+    pub const OPEN_TRACEPOINT: &str = "tracepoint:syscalls/sys_enter_openat (user memory)";
+}
+
 /// The file-open sensor's notes: the LSM sensor's and the tracepoint's.
-pub const OPEN_LSM_NOTE: &str = "lsm:file_open (FIM observer)";
-pub const OPEN_TRACEPOINT_NOTE: &str = "tracepoint:syscalls/sys_enter_openat (user memory)";
+pub const OPEN_LSM_NOTE: &str = attach::OPEN_LSM;
+pub const OPEN_TRACEPOINT_NOTE: &str = attach::OPEN_TRACEPOINT;
 
 /// Why a BPF LSM program on its attach point does not run: `bpf` is not in
 /// the active LSM list (R13: the exec and file-open sensors take their
@@ -54,22 +92,28 @@ pub const SOURCES: [SourceContract; 13] = [
         source: "process_spawn",
         sensors: &["process_spawn"],
         events: &[K::ProcessSpawn],
-        attach: "tracepoint:sched/sched_process_exec",
+        attach: attach::PROCESS_SPAWN,
+        also: &[],
         needs_bpf_lsm: false,
+        lsm_part: None,
         fallbacks: &[Fallback {
-            attach: "tracepoint:sched/sched_process_exec (no standard-stream probes",
+            attach: attach::PROCESS_SPAWN_NO_STDIO,
             when: "the kernel's verifier refuses the standard-stream probes",
             costs: "R020 cannot fire (stdio_probe)",
+            equivalent: false,
+            lost: &[],
         }],
         sync_verdict: SyncVerdict::None,
-        opt_in_verdict: Some((
-            SyncVerdict::UserDeadline {
+        opt_in: Some(OptIn {
+            verdict: SyncVerdict::UserDeadline {
                 deadline_ms: 2_000,
                 holds: "the exec quarantine stops the process until its exec is judged; \
                         the deadline's default policy resumes it",
             },
-            "--execq enforce (experimental; 100 to 10,000 ms)",
-        )),
+            when: "--exec-quarantine enforce (experimental; 100 to 10,000 ms)",
+            key: OPT_IN_EXEC_QUARANTINE,
+            needs_bpf_lsm: true,
+        }),
         on_failure: FailureMode::Blind,
         on_failure_detail: "its attach failing refuses the start (signed); its pump ending is \
              found within 5 s, signed and stops the agent for the watchdog's restart",
@@ -94,6 +138,7 @@ pub const SOURCES: [SourceContract; 13] = [
         ],
         rings: &["exec"],
         probe: Some("exec"),
+        self_tested: false,
         degradation_sources: &["stdio_probe"],
         standby_for: None,
     },
@@ -101,11 +146,13 @@ pub const SOURCES: [SourceContract; 13] = [
         source: "file_open",
         sensors: &[],
         events: &[K::FileOpen],
-        attach: "tracepoint:syscalls/sys_enter_openat",
+        attach: attach::OPEN_TRACEPOINT,
+        also: &[],
         needs_bpf_lsm: false,
+        lsm_part: None,
         fallbacks: &[],
         sync_verdict: SyncVerdict::None,
-        opt_in_verdict: None,
+        opt_in: None,
         on_failure: FailureMode::Blind,
         on_failure_detail: "attached at every start and inert while the LSM file-open sensor \
              runs; its attach failing refuses the start (signed); its pump ending stops the agent \
@@ -121,6 +168,7 @@ pub const SOURCES: [SourceContract; 13] = [
         ],
         rings: &["file_open"],
         probe: Some("file_open"),
+        self_tested: false,
         degradation_sources: &[],
         standby_for: Some("open_sensor"),
     },
@@ -128,23 +176,29 @@ pub const SOURCES: [SourceContract; 13] = [
         source: "exec_check",
         sensors: &["exec"],
         events: &[K::ExecCheck],
-        attach: "lsm:bprm_check_security",
+        attach: attach::EXEC_LSM,
+        also: &[],
         needs_bpf_lsm: true,
+        lsm_part: None,
         fallbacks: &[Fallback {
-            attach: "tracepoint:syscalls/sys_enter_execve",
+            attach: attach::EXEC_TRACEPOINT,
             when: "--exec-sensor tracepoint, a linux_binprm offset missing, the LSM program \
                    refused, or bpf not in the active LSM list",
             costs: "the executed path read from the caller's memory (it can differ from the file \
                     the kernel runs); no executable identity; the exec quarantine and the exec \
                     policy have no kernel half",
+            equivalent: false,
+            lost: &[],
         }],
         sync_verdict: SyncVerdict::None,
-        opt_in_verdict: Some((
-            SyncVerdict::KernelDeny {
+        opt_in: Some(OptIn {
+            verdict: SyncVerdict::KernelDeny {
                 hooks: "LSM bprm_check_security (the exec policy refuses with EACCES)",
             },
-            "--exec-policy enforce (experimental)",
-        )),
+            when: "--exec-policy enforce (experimental)",
+            key: OPT_IN_EXEC_POLICY,
+            needs_bpf_lsm: true,
+        }),
         on_failure: FailureMode::Blind,
         on_failure_detail: "the LSM program refused or not runnable: sys_enter_execve, signed \
              (exec_sensor); that attach failing too refuses the start; its pump ending stops the \
@@ -165,6 +219,7 @@ pub const SOURCES: [SourceContract; 13] = [
         ],
         rings: &["exec_check"],
         probe: None,
+        self_tested: false,
         degradation_sources: &["exec_sensor", "exec_policy"],
         standby_for: None,
     },
@@ -172,16 +227,20 @@ pub const SOURCES: [SourceContract; 13] = [
         source: "tcp_connect",
         sensors: &["tcp_connect"],
         events: &[K::TcpConnect, K::NetFlow],
-        attach: "kprobe:tcp_v4_connect",
+        attach: attach::TCP_CONNECT,
+        also: &[],
         needs_bpf_lsm: false,
+        lsm_part: None,
         fallbacks: &[],
         sync_verdict: SyncVerdict::None,
-        opt_in_verdict: Some((
-            SyncVerdict::KernelDeny {
+        opt_in: Some(OptIn {
+            verdict: SyncVerdict::KernelDeny {
                 hooks: "LSM socket_connect (a connect to a blocklisted destination, EPERM)",
             },
-            "--net-connect-deny (never armed in detect-only)",
-        )),
+            when: "--net-connect-deny (never armed in detect-only)",
+            key: OPT_IN_NET_CONNECT_DENY,
+            needs_bpf_lsm: true,
+        }),
         on_failure: FailureMode::Blind,
         on_failure_detail: "its attach failing refuses the start (signed); the opt-in connect \
              deny not armed is signed (net_connect_deny), and it lets a connect through when it \
@@ -191,6 +250,7 @@ pub const SOURCES: [SourceContract; 13] = [
         truncations: &[COMM],
         rings: &["tcp_connect"],
         probe: None,
+        self_tested: false,
         degradation_sources: &["net_connect_deny"],
         standby_for: None,
     },
@@ -198,16 +258,20 @@ pub const SOURCES: [SourceContract; 13] = [
         source: "dns_query",
         sensors: &["dns", "dns_nss"],
         events: &[K::DnsQuery, K::DnsFlood],
-        attach: "kprobe:udp_send_skb",
+        attach: attach::DNS_SKB,
+        also: &[],
         needs_bpf_lsm: false,
+        lsm_part: None,
         fallbacks: &[Fallback {
-            attach: "kprobe:udp_sendmsg",
+            attach: attach::DNS_SENDMSG,
             when: "--dns-sensor sendmsg, or what the socket-buffer programs need missing",
             costs: "the name read from the sender's memory, which it can rewrite before the \
                     kernel sends it; IPv4 only",
+            equivalent: false,
+            lost: &[],
         }],
         sync_verdict: SyncVerdict::None,
-        opt_in_verdict: None,
+        opt_in: None,
         on_failure: FailureMode::Blind,
         on_failure_detail: "IPv6 not attached is signed (dns_sensor); the udp_sendmsg attach \
              failing refuses the start; its pump ending stops the agent within 5 s (signed)",
@@ -232,6 +296,7 @@ pub const SOURCES: [SourceContract; 13] = [
         ],
         rings: &["dns"],
         probe: Some("dns"),
+        self_tested: false,
         degradation_sources: &["dns_sensor"],
         standby_for: None,
     },
@@ -239,13 +304,15 @@ pub const SOURCES: [SourceContract; 13] = [
         source: "fs_protect",
         sensors: &["deny_hooks"],
         events: &[K::FsProtectDenial],
-        attach: "lsm:",
+        attach: attach::DENY_HOOKS,
+        also: &[],
         needs_bpf_lsm: true,
+        lsm_part: None,
         fallbacks: &[],
         sync_verdict: SyncVerdict::KernelDeny {
             hooks: DENY_HOOK_LIST,
         },
-        opt_in_verdict: None,
+        opt_in: None,
         on_failure: FailureMode::FailOpen,
         on_failure_detail: "a hook that cannot read what it needs lets the operation through, \
              counted per hook and signed (deny_fail_open); a missing deny hook, bpf not in the \
@@ -261,6 +328,7 @@ pub const SOURCES: [SourceContract; 13] = [
         truncations: &[COMM],
         rings: &["fs_protect"],
         probe: None,
+        self_tested: true,
         degradation_sources: &["anti_tamper", "bpf_lsm", "deny_self_test"],
         standby_for: None,
     },
@@ -268,11 +336,13 @@ pub const SOURCES: [SourceContract; 13] = [
         source: "module_load",
         sensors: &["module_load"],
         events: &[K::ModuleLoad],
-        attach: "lsm:kernel_read_file",
+        attach: attach::MODULE_LOAD,
+        also: &[],
         needs_bpf_lsm: true,
+        lsm_part: None,
         fallbacks: &[],
         sync_verdict: SyncVerdict::None,
-        opt_in_verdict: None,
+        opt_in: None,
         on_failure: FailureMode::Blind,
         on_failure_detail: "not attached: signed (anti_tamper's observe hooks), the module-load \
              rule blind; its pump ending stops the agent within 5 s (signed)",
@@ -287,6 +357,7 @@ pub const SOURCES: [SourceContract; 13] = [
         ],
         rings: &["module_load"],
         probe: None,
+        self_tested: false,
         degradation_sources: &[],
         standby_for: None,
     },
@@ -294,15 +365,13 @@ pub const SOURCES: [SourceContract; 13] = [
         source: "io_uring",
         sensors: &["io_uring"],
         events: &[K::IoUring, K::SensorFlood],
-        attach: "tracepoint:io_uring/io_uring_create+",
+        attach: attach::IO_URING_REQ,
+        also: &[attach::IO_URING_SQE],
         needs_bpf_lsm: false,
-        fallbacks: &[Fallback {
-            attach: "tracepoint:io_uring/io_uring_create only",
-            when: "no submit tracepoint on this kernel",
-            costs: "the operations submitted through a ring are not observed",
-        }],
+        lsm_part: None,
+        fallbacks: &[],
         sync_verdict: SyncVerdict::None,
-        opt_in_verdict: None,
+        opt_in: None,
         on_failure: FailureMode::Blind,
         on_failure_detail: "no tracepoint (CONFIG_IO_URING off): not attached, signed \
              (io_uring_sensor); its pump ending stops the agent within 5 s (signed)",
@@ -315,6 +384,7 @@ pub const SOURCES: [SourceContract; 13] = [
         truncations: &[COMM],
         rings: &["io_uring"],
         probe: None,
+        self_tested: false,
         degradation_sources: &["io_uring_sensor"],
         standby_for: None,
     },
@@ -322,11 +392,13 @@ pub const SOURCES: [SourceContract; 13] = [
         source: "bpf_syscall",
         sensors: &["bpf_syscall"],
         events: &[K::BpfSyscall],
-        attach: "lsm:bpf",
+        attach: attach::BPF_OBSERVER,
+        also: &[],
         needs_bpf_lsm: true,
+        lsm_part: None,
         fallbacks: &[],
         sync_verdict: SyncVerdict::None,
-        opt_in_verdict: None,
+        opt_in: None,
         on_failure: FailureMode::Blind,
         on_failure_detail: "not attached: signed (anti_tamper's observe hooks); the same hook's \
              refusals of the agent's own links are fs_protect's; its pump ending stops the agent \
@@ -338,6 +410,7 @@ pub const SOURCES: [SourceContract; 13] = [
         truncations: &[COMM],
         rings: &["bpf"],
         probe: None,
+        self_tested: false,
         degradation_sources: &[],
         standby_for: None,
     },
@@ -345,20 +418,29 @@ pub const SOURCES: [SourceContract; 13] = [
         source: "exploit_guard",
         sensors: &["exploit_guard"],
         events: &[K::ExploitPostcondition],
-        attach: "lsm:capable",
+        attach: crate::sensors::epg::attach_note(crate::sensors::epg::Variant::Lite),
+        also: &[],
         needs_bpf_lsm: true,
+        lsm_part: Some(
+            "its fentry and tp_btf hooks run; its LSM use points (capable, bprm_check_security, \
+             file_open) do not",
+        ),
         fallbacks: &[Fallback {
-            attach: "fentry:commit_creds",
+            attach: crate::sensors::epg::attach_note(crate::sensors::epg::Variant::Strict),
             when: "--exploit-guard strict",
             costs: "every system call's exit judged (more overhead); no LSM hook",
+            equivalent: true,
+            lost: &[],
         }],
         sync_verdict: SyncVerdict::None,
-        opt_in_verdict: Some((
-            SyncVerdict::KernelDeny {
+        opt_in: Some(OptIn {
+            verdict: SyncVerdict::KernelDeny {
                 hooks: "the post-condition hooks: SIGKILL before the call returns",
             },
-            "enforce (--exploit-guard-response; never in detect-only)",
-        )),
+            when: "enforce (--exploit-guard-response; never in detect-only)",
+            key: "exploit_guard_enforce",
+            needs_bpf_lsm: false,
+        }),
         on_failure: FailureMode::Blind,
         on_failure_detail: "off or not attached: nothing of it attached, signed (exploit_guard); \
              its kill does not depend on its ring; its pump ending stops the agent within 5 s \
@@ -370,6 +452,7 @@ pub const SOURCES: [SourceContract; 13] = [
         truncations: &[COMM],
         rings: &["exploit_guard"],
         probe: None,
+        self_tested: false,
         degradation_sources: &["exploit_guard"],
         standby_for: None,
     },
@@ -383,18 +466,22 @@ pub const SOURCES: [SourceContract; 13] = [
             K::FileBurst,
             K::DefenderSignal,
         ],
-        attach: "lsm:file_open",
+        attach: attach::OPEN_LSM,
+        also: &[],
         needs_bpf_lsm: true,
+        lsm_part: None,
         fallbacks: &[Fallback {
-            attach: "tracepoint:syscalls/sys_enter_openat",
+            attach: attach::OPEN_TRACEPOINT,
             when: "--file-open-sensor tracepoint, its FIM observer, maps, ring, pump or arming \
                    failing, or bpf not in the active LSM list",
             costs: "every open reaches userland with its path read from the caller's memory \
                     (the file_open source); mass writes, rename and unlink bursts, signals to \
                     security tools and FIM Opened records are not produced",
+            equivalent: false,
+            lost: &[K::MassWrite, K::FileBurst, K::DefenderSignal],
         }],
         sync_verdict: SyncVerdict::None,
-        opt_in_verdict: None,
+        opt_in: None,
         on_failure: FailureMode::Blind,
         on_failure_detail: "failing to arm: the file_open source's tracepoint, signed \
              (file_open_sensor); a rule not written is signed; its pump ending stops the agent \
@@ -425,6 +512,7 @@ pub const SOURCES: [SourceContract; 13] = [
         ],
         rings: &["open_sensor"],
         probe: Some("file_open"),
+        self_tested: false,
         degradation_sources: &["file_open_sensor"],
         standby_for: None,
     },
@@ -432,11 +520,13 @@ pub const SOURCES: [SourceContract; 13] = [
         source: "fim_drain",
         sensors: &["fim_observers"],
         events: &[K::Fim],
-        attach: "lsm:",
+        attach: attach::FIM_OBSERVERS,
+        also: &[],
         needs_bpf_lsm: true,
+        lsm_part: None,
         fallbacks: &[],
         sync_verdict: SyncVerdict::None,
-        opt_in_verdict: None,
+        opt_in: None,
         on_failure: FailureMode::Blind,
         on_failure_detail: "observers not attached: a signed coverage shortfall; its loop \
              ending is signed (drain_ended) and stops the agent within 5 s",
@@ -455,6 +545,7 @@ pub const SOURCES: [SourceContract; 13] = [
         ],
         rings: &["fim"],
         probe: None,
+        self_tested: false,
         degradation_sources: &[],
         standby_for: None,
     },
@@ -462,11 +553,13 @@ pub const SOURCES: [SourceContract; 13] = [
         source: "net_drain",
         sensors: &["net_flows"],
         events: &[K::NetFlow, K::NetListener, K::SensorFlood],
-        attach: "kprobe:inet_csk_listen_start",
+        attach: attach::NET_FLOWS,
+        also: &[],
         needs_bpf_lsm: false,
+        lsm_part: None,
         fallbacks: &[],
         sync_verdict: SyncVerdict::None,
-        opt_in_verdict: None,
+        opt_in: None,
         on_failure: FailureMode::Blind,
         on_failure_detail: "its attach failing refuses the start; udpv6_sendmsg not attached \
              is signed (net_sensor); a log that does not open is signed (net_drain) and the \
@@ -481,6 +574,7 @@ pub const SOURCES: [SourceContract; 13] = [
         truncations: &[COMM],
         rings: &["tcp_close", "listen", "udp"],
         probe: None,
+        self_tested: false,
         degradation_sources: &["net_sensor", "net_drain"],
         standby_for: None,
     },

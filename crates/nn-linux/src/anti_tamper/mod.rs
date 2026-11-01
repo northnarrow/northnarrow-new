@@ -650,8 +650,12 @@ impl DenyReport {
 /// R13 (lab PR 271): the anti-tamper attach's sensors as the capability
 /// manifest lists them — the deny hooks (the `fs_protect` source), the
 /// module-load observers and the `bpf()` observer — from what the attach
-/// reported (a missing observe hook is `<program>: <why>`).
-pub fn attach_notes(deny: &DenyReport) -> Vec<(&'static str, String)> {
+/// reported (a missing observe hook is `<program>: <why>`), each with how
+/// it was taken (the review of #479, X1: part of the deny hooks is
+/// `Partial` with the hooks and steps missing, never whole).
+pub fn attach_notes(deny: &DenyReport) -> Vec<(&'static str, String, crate::boot::manifest::Took)> {
+    use crate::boot::manifest::Took;
+    use crate::sensors::contract::attach as A;
     let lost = |program: &str| {
         deny.observe_missing
             .iter()
@@ -659,16 +663,25 @@ pub fn attach_notes(deny: &DenyReport) -> Vec<(&'static str, String)> {
             .cloned()
     };
     let deny_note = if deny.attached == 0 {
-        format!(
-            "not attached: none of the {} deny hooks ({})",
-            deny.expected,
-            deny.missing.first().map(String::as_str).unwrap_or("-")
+        (
+            format!(
+                "not attached: none of the {} deny hooks ({})",
+                deny.expected,
+                deny.missing.first().map(String::as_str).unwrap_or("-")
+            ),
+            Took::Absent,
         )
+    } else if deny.missing.is_empty() && deny.attached == deny.expected {
+        (A::DENY_HOOKS.to_string(), Took::Whole)
     } else {
-        format!(
-            "lsm: {} of {} deny hooks attached and armed",
-            deny.attached, deny.expected
-        )
+        let mut missing = deny.missing.clone();
+        if missing.is_empty() {
+            missing.push(format!(
+                "{} of {} deny hooks attached",
+                deny.attached, deny.expected
+            ));
+        }
+        (A::DENY_HOOKS.to_string(), Took::Partial { missing })
     };
     let missing: Vec<String> = filesystem::MODULE_LOAD_PROGRAMS
         .iter()
@@ -680,18 +693,24 @@ pub fn attach_notes(deny: &DenyReport) -> Vec<(&'static str, String)> {
         .map(|(_, h)| *h)
         .collect();
     let module_note = match (hooks.is_empty(), missing.is_empty()) {
-        (true, _) => format!("not attached: {}", missing.join("; ")),
-        (false, true) => format!("lsm:{}", hooks.join("+")),
-        (false, false) => format!("lsm:{} only ({})", hooks.join("+"), missing.join("; ")),
+        (true, _) => (
+            format!("not attached: {}", missing.join("; ")),
+            Took::Absent,
+        ),
+        (false, true) => (A::MODULE_LOAD.to_string(), Took::Whole),
+        (false, false) => (
+            format!("lsm:{}", hooks.join("+")),
+            Took::Partial { missing },
+        ),
     };
     let bpf_note = match lost(bpf_defense::OBSERVE_PROGRAM) {
-        Some(why) => format!("not attached: {why}"),
-        None => format!("lsm:{}", bpf_defense::OBSERVE_HOOK),
+        Some(why) => (format!("not attached: {why}"), Took::Absent),
+        None => (A::BPF_OBSERVER.to_string(), Took::Whole),
     };
     vec![
-        ("deny_hooks", deny_note),
-        ("module_load", module_note),
-        ("bpf_syscall", bpf_note),
+        ("deny_hooks", deny_note.0, deny_note.1),
+        ("module_load", module_note.0, module_note.1),
+        ("bpf_syscall", bpf_note.0, bpf_note.1),
     ]
 }
 
@@ -1301,6 +1320,7 @@ mod tests {
     /// the deny hooks counted, a missing observe hook named, none attached.
     #[test]
     fn the_attach_notes_say_what_attached() {
+        use crate::boot::manifest::Took;
         let all = DenyReport {
             expected: 19,
             attached: 19,
@@ -1310,16 +1330,42 @@ mod tests {
         assert_eq!(
             attach_notes(&all),
             [
-                (
-                    "deny_hooks",
-                    "lsm: 19 of 19 deny hooks attached and armed".to_string()
-                ),
+                ("deny_hooks", "lsm:deny hooks".to_string(), Took::Whole),
                 (
                     "module_load",
-                    "lsm:kernel_read_file+kernel_load_data".to_string()
+                    "lsm:kernel_read_file+kernel_load_data".to_string(),
+                    Took::Whole
                 ),
-                ("bpf_syscall", "lsm:bpf".to_string()),
+                ("bpf_syscall", "lsm:bpf".to_string(), Took::Whole),
             ]
+        );
+        // the review of #479, X1: part of the deny hooks is partial
+        let some = DenyReport {
+            expected: 16,
+            attached: 12,
+            missing: vec!["inode_link: no BTF".to_string()],
+            observe_missing: Vec::new(),
+        };
+        assert_eq!(
+            attach_notes(&some)[0],
+            (
+                "deny_hooks",
+                "lsm:deny hooks".to_string(),
+                Took::Partial {
+                    missing: vec!["inode_link: no BTF".to_string()]
+                }
+            )
+        );
+        let counted = DenyReport {
+            expected: 16,
+            attached: 15,
+            ..DenyReport::default()
+        };
+        assert_eq!(
+            attach_notes(&counted)[0].2,
+            Took::Partial {
+                missing: vec!["15 of 16 deny hooks attached".to_string()]
+            }
         );
         let partial = DenyReport {
             expected: 19,
@@ -1333,14 +1379,25 @@ mod tests {
         };
         let n = attach_notes(&partial);
         assert_eq!(
-            n[0].1,
-            "not attached: none of the 19 deny hooks (task_kill: refused)"
+            (n[0].1.as_str(), &n[0].2),
+            (
+                "not attached: none of the 19 deny hooks (task_kill: refused)",
+                &Took::Absent
+            )
         );
         assert_eq!(
-            n[1].1,
-            "lsm:kernel_read_file only (module_load_data_observe: no BTF)"
+            (n[1].1.as_str(), &n[1].2),
+            (
+                "lsm:kernel_read_file",
+                &Took::Partial {
+                    missing: vec!["module_load_data_observe: no BTF".to_string()]
+                }
+            )
         );
-        assert_eq!(n[2].1, "not attached: bpf_syscall_observe: refused");
+        assert_eq!(
+            (n[2].1.as_str(), &n[2].2),
+            ("not attached: bpf_syscall_observe: refused", &Took::Absent)
+        );
         let none = DenyReport {
             observe_missing: vec![
                 "module_read_file_observe: a".to_string(),
@@ -1349,8 +1406,13 @@ mod tests {
             ..all
         };
         assert_eq!(
-            attach_notes(&none)[1].1,
-            "not attached: module_read_file_observe: a; module_load_data_observe: b"
+            attach_notes(&none)[1],
+            (
+                "module_load",
+                "not attached: module_read_file_observe: a; module_load_data_observe: b"
+                    .to_string(),
+                Took::Absent
+            )
         );
     }
 

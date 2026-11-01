@@ -30,7 +30,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`capabilities`) and `nn-admin heartbeat watch` says `DEGRADED` when a
   settled hash changes, within a run or across a restart. On a kernel
   without `bpf` in its active LSM list, under the degraded-mode opt-in, the
-  exec and file-open sensors take their tracepoints, each signed.
+  exec and file-open sensors take their tracepoints, each signed. A source
+  is `ok` only when its attach code noted the contract's attach point whole
+  (exactly; `partial` with what is missing, `unknown` otherwise), a
+  fallback that covers less is `partial` with the events it loses, an LSM
+  opt-in configured without `bpf` is said inert, each source says what its
+  `ok` rests on (`evidence`), and the probe's word goes `stale` when its
+  rounds stop; the capabilities hash leaves out the contract's terms
+  (`contract_hash`: an upgrade alone is a `NOTICE` of the verifier's, not
+  DEGRADED); change rows are signed at most once a minute, every change
+  counted, the terms by reference.
 - The signed heartbeat and its minimal external verifier (lab PR 270, Wave
   4 phase 2, R12c-2 of the restructure plan; report 06 INI-14;
   `docs/operator/HEARTBEAT.md`, `docs/architecture/EVENT_BUS.md` §5). A beat

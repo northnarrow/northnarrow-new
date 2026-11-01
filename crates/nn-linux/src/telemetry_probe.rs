@@ -121,8 +121,9 @@ struct State {
     /// Sensors currently in a gap (an audit entry was written; the next
     /// hit writes `telemetry_restored`).
     in_gap: [bool; 3],
-    /// Rounds completed.
+    /// Rounds completed, and when the last one ended.
     rounds: u64,
+    last_round: Option<Instant>,
 }
 
 static GAPS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -133,18 +134,42 @@ static GAPS_TOTAL: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct TelemetryProbe {
     tracker: Arc<Mutex<State>>,
+    /// The rounds' period and the probe's start (the review of #479, X2:
+    /// its word goes stale when no round ends).
+    every: Duration,
+    started: Instant,
+}
+
+/// How long the probe's word holds without a round ending (the review of
+/// #479, X2): two of its longest intervals (the ±20 % jitter's top) and
+/// the round's deadline — 149 s at the default 60 s. A round that never
+/// starts (its file not written, the random source failing, the child not
+/// spawned) leaves nothing ended: past this the word is `Stale`.
+pub fn stale_after(every: Duration) -> Duration {
+    every * 12 / 5 + Duration::from_secs(DEADLINE_SECS)
 }
 
 impl TelemetryProbe {
     /// R13 (lab PR 271): the probe's word on each sensor it exercises, for
     /// the capability manifest — `Pending` until the first round ends, then
-    /// `Gap` while the sensor is in a gap, else `Seen`.
+    /// `Gap` while the sensor is in a gap, else `Seen`; `Stale` for all when
+    /// no round has ended for [`stale_after`] (the review of #479, X2).
     pub fn states(&self) -> Vec<(String, ProbeState)> {
+        self.states_at(Instant::now())
+    }
+
+    fn states_at(&self, now: Instant) -> Vec<(String, ProbeState)> {
         let st = self.tracker.lock();
+        let quiet_since = st
+            .last_round
+            .unwrap_or(self.started + Duration::from_secs(FIRST_ROUND_SECS));
+        let stale = now.saturating_duration_since(quiet_since) > stale_after(self.every);
         Sensor::ALL
             .iter()
             .map(|s| {
-                let state = if st.rounds == 0 {
+                let state = if stale {
+                    ProbeState::Stale
+                } else if st.rounds == 0 {
                     ProbeState::Pending
                 } else if st.in_gap[*s as usize] {
                     ProbeState::Gap
@@ -271,6 +296,8 @@ pub fn spawn(audit_log: Option<Arc<Mutex<AuditLog>>>) -> Option<TelemetryProbe> 
     let tracker = Arc::new(Mutex::new(State::default()));
     let probe = TelemetryProbe {
         tracker: Arc::clone(&tracker),
+        every,
+        started: Instant::now(),
     };
     info!(
         every_secs = every.as_secs(),
@@ -290,6 +317,10 @@ pub fn spawn(audit_log: Option<Arc<Mutex<AuditLog>>>) -> Option<TelemetryProbe> 
 }
 
 async fn run_round(tracker: &Arc<Mutex<State>>, audit_log: Option<&Arc<Mutex<AuditLog>>>) {
+    #[cfg(feature = "debug-trigger")]
+    if debug_skip() {
+        return;
+    }
     let Some(nonce) = make_nonce() else {
         warn!("telemetry probe: the OS random source failed — round skipped");
         return;
@@ -353,6 +384,7 @@ async fn run_round(tracker: &Arc<Mutex<State>>, audit_log: Option<&Arc<Mutex<Aud
         #[cfg(feature = "debug-trigger")]
         debug_blind(&mut seen);
         st.rounds += 1;
+        st.last_round = Some(Instant::now());
         let before = st.in_gap;
         for s in Sensor::ALL {
             st.in_gap[s as usize] = !seen[s as usize];
@@ -391,6 +423,21 @@ async fn run_round(tracker: &Arc<Mutex<State>>, audit_log: Option<&Arc<Mutex<Aud
             }
         }
     }
+}
+
+/// `debug-trigger` builds only (R13, the review of #479, X2: the lab's
+/// round that never starts): while `/run/northnarrow/debug-probe-skip`
+/// exists, each round returns before it starts, as one whose probe file
+/// cannot be written.
+#[cfg(feature = "debug-trigger")]
+fn debug_skip() -> bool {
+    let skip = std::path::Path::new(PROBE_DIR)
+        .parent()
+        .is_some_and(|d| d.join("debug-probe-skip").exists());
+    if skip {
+        warn!("debug-trigger: the telemetry probe's round does not start");
+    }
+    skip
 }
 
 /// `debug-trigger` builds only (R13, lab PR 271: the lab's runtime change
@@ -508,8 +555,11 @@ mod tests {
     /// a round ends, then each sensor seen or in its gap.
     #[test]
     fn the_probe_s_word_on_each_sensor() {
+        let every = Duration::from_secs(60);
         let probe = TelemetryProbe {
             tracker: Arc::new(Mutex::new(State::default())),
+            every,
+            started: Instant::now(),
         };
         let words = |p: &TelemetryProbe| -> Vec<ProbeState> {
             p.states().into_iter().map(|(_, s)| s).collect()
@@ -518,16 +568,49 @@ mod tests {
         let names: Vec<String> = probe.states().into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, ["exec", "file_open", "dns"]);
         assert_eq!(probe.rounds(), 0);
+        let now = Instant::now();
         {
             let mut st = probe.tracker.lock();
             st.rounds = 1;
             st.in_gap = [false, false, true];
+            st.last_round = Some(now);
         }
         assert_eq!(
             words(&probe),
             [ProbeState::Seen, ProbeState::Seen, ProbeState::Gap]
         );
         assert_eq!(probe.rounds(), 1);
+        // the review of #479, X2: no round ended for two of its longest
+        // intervals and the deadline — stale, whatever it said last
+        assert_eq!(stale_after(every), Duration::from_secs(149));
+        let at = |d: Duration| -> Vec<ProbeState> {
+            probe
+                .states_at(now + d)
+                .into_iter()
+                .map(|(_, s)| s)
+                .collect()
+        };
+        assert_eq!(at(stale_after(every))[0], ProbeState::Seen, "at the bound");
+        assert_eq!(
+            at(stale_after(every) + Duration::from_secs(1)),
+            [ProbeState::Stale; 3]
+        );
+        // a probe whose first round never ends goes stale past its first
+        // round's time and the bound
+        let never = TelemetryProbe {
+            tracker: Arc::new(Mutex::new(State::default())),
+            every,
+            started: now,
+        };
+        let first = Duration::from_secs(FIRST_ROUND_SECS);
+        assert_eq!(
+            never.states_at(now + first + stale_after(every))[0].1,
+            ProbeState::Pending
+        );
+        assert_eq!(
+            never.states_at(now + first + stale_after(every) + Duration::from_secs(1))[0].1,
+            ProbeState::Stale
+        );
     }
 
     fn spawn_event(argv: &[&str]) -> Event {

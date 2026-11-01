@@ -394,14 +394,16 @@ pub fn capability_manifest_r13() -> String {
                  "terms": terms},
                 {"source": "exec_check", "classes": ["process"],
                  "attach": "tracepoint:syscalls/sys_enter_execve (user memory)\u{1b}[31m",
-                 "on": "fallback", "state": "ok", "terms": terms},
+                 "on": "fallback", "state": "partial", "evidence": "attach_only",
+                 "why": ["on its fallback: the executed path read from the caller's memory; no executable identity"],
+                 "terms": terms},
                 {"source": "process_spawn", "classes": ["process"],
                  "attach": "tracepoint:sched/sched_process_exec", "on": "primary",
-                 "state": "ok", "probe": "seen", "terms": terms},
+                 "state": "ok", "probe": "seen", "evidence": "probe", "terms": terms},
                 {"source": "dns_query", "classes": ["network"],
                  "attach": "kprobe:udp_send_skb+udp_v6_send_skb", "on": "primary",
-                 "state": "attached_not_invoked", "probe": "gap",
-                 "why": ["telemetry probe: its dns event did not reach the pipeline"],
+                 "state": "unknown", "probe": "stale", "evidence": "attach_only",
+                 "why": ["telemetry probe: no round has ended for two of its intervals — its word on dns is stale"],
                  "terms": terms}
             ],
             "classes": [
@@ -418,12 +420,15 @@ pub fn capability_manifest_r13() -> String {
             "fallbacks": ["exec_check: tracepoint:syscalls/sys_enter_execve (user memory)"],
             "missing": [
                 "fs_protect: attached, not invoked (lsm: 19 of 19 deny hooks attached and armed) — bpf is not in the active LSM list",
-                "dns_query: attached, not invoked (kprobe:udp_send_skb+udp_v6_send_skb) — telemetry probe: its dns event did not reach the pipeline"
+                "exec_check: partial (tracepoint:syscalls/sys_enter_execve (user memory)) — on its fallback: the executed path read from the caller's memory; no executable identity",
+                "dns_query: unknown (kprobe:udp_send_skb+udp_v6_send_skb) — telemetry probe: no round has ended for two of its intervals — its word on dns is stale"
             ],
             "content": ["netflow-blocklist (/usr/share/northnarrow/netflow-blocklist.v1): unavailable (not found) — the copy built into the agent is in force"],
             "telemetry_probe": "every 60 s", "settled": true,
+            "contract_hash": "c0".repeat(32),
             "revision": 3, "hash": "ef".repeat(32), "previous_hash": "01".repeat(32),
-            "change": ["source dns_query: ok on its attach point (kprobe:udp_send_skb+udp_v6_send_skb) → attached, not invoked on its attach point (kprobe:udp_send_skb+udp_v6_send_skb)", "source dns_query: telemetry probe seen → gap"]
+            "changes": 2, "unsigned_changes": 1,
+            "change": ["source dns_query: ok on its attach point (kprobe:udp_send_skb+udp_v6_send_skb) → unknown on its attach point (kprobe:udp_send_skb+udp_v6_send_skb)", "source dns_query: telemetry probe seen → stale"]
         }
     })
     .to_string()

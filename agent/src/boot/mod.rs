@@ -458,6 +458,28 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             ),
         },
     );
+    // R13 (the review of #479): the opt-ins configured whose verdict an LSM
+    // program gives — the manifest says them inert without the BPF LSM
+    let opt_ins: Vec<&'static str> = {
+        use northnarrow_agent::sensors::contract as c;
+        [
+            (
+                execq_mode == northnarrow_agent::execq::Mode::Enforce,
+                c::OPT_IN_EXEC_QUARANTINE,
+            ),
+            (
+                execpol_mode == northnarrow_agent::execpol::Mode::Enforce,
+                c::OPT_IN_EXEC_POLICY,
+            ),
+            (
+                cli.net_connect_deny && !detect_only,
+                c::OPT_IN_NET_CONNECT_DENY,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(on, k)| on.then_some(k))
+        .collect()
+    };
     let tasks::Tasks {
         execq_handle,
         execpol_handle,
@@ -488,6 +510,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &telemetry_probe,
         &overlay_gate,
         sensor.pump_labels(),
+        opt_ins,
     )?;
     // R12c-2 (lab PR 270): the signed heartbeat, once the agent is armed —
     // its `start` beat first, then one every interval; the stop writes its

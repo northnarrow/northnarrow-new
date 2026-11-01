@@ -62,6 +62,7 @@ fn beat_m(seq: u64, s: i64, h: &str, revision: u64, settled: bool) -> HeartbeatR
         hash: h.repeat(64 / h.len()),
         revision,
         settled,
+        contract: Some("c1".repeat(32)),
     });
     b
 }
@@ -418,6 +419,7 @@ fn a_future_beat_and_the_exit_code_order() {
         new_beats: 0,
         age_secs: None,
         anchored: false,
+        notices: Vec::new(),
     };
     assert_eq!(r.exit_code(), 10, "silence is more severe than loss");
 }
@@ -927,4 +929,49 @@ fn an_unsettled_or_missing_manifest_is_degraded() {
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(31), &cfg());
     assert!(r.alerts.is_empty(), "{r:?}");
     assert_eq!(r.state.unwrap().manifest_hash, None);
+}
+
+/// The review of #479: the sensor contract's hash changing alone (an
+/// upgrade, a new kernel) is a notice, not an alert; with the capabilities
+/// it is both.
+#[test]
+fn a_contract_change_alone_is_a_notice() {
+    let mut c = Chain::new();
+    c.push(beat_m(1, 0, "a", 1, true));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    assert_eq!(
+        s.manifest_contract.as_deref(),
+        Some("c1".repeat(32).as_str())
+    );
+    let mut b = beat_m(2, 30, "a", 1, true);
+    b.capabilities.as_mut().unwrap().contract = Some("c2".repeat(32));
+    b.version = "0.0.2".into();
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(31), &cfg());
+    assert!(r.alerts.is_empty(), "an upgrade alone: {r:?}");
+    assert_eq!(r.exit_code(), 0);
+    assert_eq!(r.notices.len(), 1, "{r:?}");
+    assert!(
+        r.notices[0]
+            .starts_with("the sensor contract changed: c1c1c1c1c1c1c1c1 → c2c2c2c2c2c2c2c2")
+            && r.notices[0].contains("agent 0.0.2"),
+        "{r:?}"
+    );
+    let s = r.state.unwrap();
+    // the same contract again: nothing to say
+    // beat 3 carries c1 again (the helper's), beat 4 c2
+    c.push(beat_m(3, 60, "a", 1, true));
+    let mut b = beat_m(4, 90, "b", 2, true);
+    b.capabilities.as_mut().unwrap().contract = Some("c2".repeat(32));
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(91), &cfg());
+    // beat 3 (c1) and beat 4 (c2): the contract went back and forth — said
+    // twice; the capabilities changed — DEGRADED
+    assert_eq!(kinds(&r), ["DEGRADED"]);
+    assert_eq!(r.notices.len(), 2, "{r:?}");
+    // the first check anchors the contract too: no notice
+    let r = check(Ok(&c.lines()), &c.pk, None, at(91), &cfg());
+    assert!(r.notices.is_empty() && r.alerts.is_empty(), "{r:?}");
 }
