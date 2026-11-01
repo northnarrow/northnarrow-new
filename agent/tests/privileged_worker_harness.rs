@@ -123,8 +123,15 @@ fn listeners() -> (
     String,
 ) {
     use std::os::linux::net::SocketAddrExt;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
     let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let name = format!("nn-worker-harness-{}", std::process::id());
+    // a name of its own each call (a test may hold two sets at once)
+    let name = format!(
+        "nn-worker-harness-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    );
     let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
     let unix = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
     (tcp, unix, name)
