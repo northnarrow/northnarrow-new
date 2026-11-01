@@ -894,6 +894,13 @@ mod tests {
         }
         let st = dispatcher.status();
         assert_eq!(st.queue.lost(), 0);
+        // recorded, so never counted as held (the signed detections_held
+        // rows count what was not recorded)
+        let held = northnarrow_agent::detection_budget::take_held();
+        assert!(
+            !held.iter().any(|h| h.uid == uid),
+            "an acting decision counted held: {held:?}"
+        );
     }
 
     /// R12c (lab PR 270): the exploit guard's kills in the kernel are

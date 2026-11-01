@@ -662,6 +662,39 @@ mod tests {
         assert_eq!((c.intents, c.outcomes, c.unwritten), (0, 0, 4));
     }
 
+    /// A row the chain refuses (its file gone, a directory in its place) is
+    /// counted unwritten, logged whole — and the ticket still made: the
+    /// action runs (CMB-027).
+    #[test]
+    fn a_row_the_chain_refuses_is_counted_unwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("actions.jsonl");
+        let key_path = dir.path().join("agent.sig.key");
+        let log = ActionJournal::open_log(
+            &active,
+            crate::keys::AgentSigningKey::load_or_bootstrap(&key_path).unwrap(),
+            crate::chainlog::RotationConfig {
+                size_cap_bytes: u64::MAX,
+                max_archives: 8,
+                file_mode: 0o600,
+            },
+            Arc::new(crate::chainlog::NoProtection),
+        )
+        .unwrap();
+        let j = ActionJournal::late();
+        j.bind(log, &active);
+        j.intent(intent_row("KillProcess", 1))
+            .finish(ActionResult::Success, "Killed".into(), None);
+        assert_eq!(j.counts().unwritten, 0);
+        std::fs::remove_file(&active).unwrap();
+        std::fs::create_dir(&active).unwrap();
+        let i = j.intent(intent_row("KillProcess", 2));
+        assert!(!i.written(), "the chain refused it");
+        i.finish(ActionResult::Success, "Killed".into(), None);
+        let c = j.counts();
+        assert_eq!((c.intents, c.outcomes, c.unwritten), (1, 1, 2));
+    }
+
     /// The start finds an earlier run's intent without its outcome in the
     /// signed chain, answers it with an interrupted row, and a third start
     /// finds nothing more to answer.

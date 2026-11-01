@@ -461,6 +461,42 @@ fn without_its_thread_nothing_runs_on_the_decision_thread() {
     assert!(journal.rows().iter().all(|r| r.row != ActionRow::Intent));
 }
 
+/// A decision with two responses (two targets) is answered once, when both
+/// ran: one record naming both outcomes; an intent and an outcome each.
+#[test]
+fn a_decision_s_record_waits_for_all_its_responses() {
+    let (d, journal, sink) = dispatcher(true, 64);
+    let x = decided(
+        "NN-L-T-2R",
+        ResponseAction::KillProcess,
+        Severity::High,
+        4100,
+    );
+    // a second response of the same decision, on another target
+    let x = {
+        let mut x = Arc::try_unwrap(x).ok().unwrap();
+        let mut r = x.decision.responses[0].clone();
+        r.pid = 4101;
+        r.action = ResponseAction::BlockOutbound;
+        x.decision.responses.push(r);
+        Decided::new(x.event, x.decision, x.posture, 0, true)
+    };
+    submit_one(&d, &x);
+    d.stop(Duration::from_secs(5));
+    let records = sink.queued_for_test();
+    assert_eq!(
+        records.len(),
+        1,
+        "one record for the decision: {records:#?}"
+    );
+    assert!(
+        records[0].response.contains("pid 4100") && records[0].response.contains("pid 4101"),
+        "{}",
+        records[0].response
+    );
+    assert_eq!(pairs(&journal.rows()).len(), 2);
+}
+
 /// A repeat of a queued response of the same process merges into it: one
 /// action, both decisions' records answered by its outcome.
 #[test]
