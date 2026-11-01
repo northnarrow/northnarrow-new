@@ -577,6 +577,7 @@ fn chain_verify_reports_the_chains_after_an_archive_without_terminator() {
         netflow: dir.path().join("netflow.jsonl"),
         fim_drift: dir.path().join("fim_drift.jsonl"),
         actions: det.join("actions.jsonl"),
+        heartbeat: dir.path().join("heartbeat.jsonl"),
     };
     let lines = run_chain_verify(&paths, &dir.path().join("heads.json"), &[], &pubkey);
     let by = |c: &str| lines.iter().find(|l| l.chain == c).cloned();

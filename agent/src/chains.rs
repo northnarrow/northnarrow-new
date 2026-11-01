@@ -54,6 +54,8 @@ pub struct ChainPaths {
     pub fim_drift: PathBuf,
     /// R12c (lab PR 270): the signed record of the agent's actions.
     pub actions: PathBuf,
+    /// R12c-2 (lab PR 270): the signed heartbeat.
+    pub heartbeat: PathBuf,
 }
 
 impl Default for ChainPaths {
@@ -67,6 +69,7 @@ impl Default for ChainPaths {
             netflow: crate::admin_socket::DEFAULT_NETFLOW_JSONL_PATH.into(),
             fim_drift: crate::fim::drain::DEFAULT_DRIFT_LOG_PATH.into(),
             actions: crate::response::journal::DEFAULT_ACTIONS_LOG_PATH.into(),
+            heartbeat: crate::heartbeat::DEFAULT_HEARTBEAT_LOG_PATH.into(),
         }
     }
 }
@@ -123,6 +126,10 @@ impl ChainPaths {
             ChainTarget::rotating::<crate::response::journal::ActionRecord, LinuxHost>(
                 "actions",
                 &self.actions,
+            ),
+            ChainTarget::rotating::<nn_evidence::heartbeat::HeartbeatRecord, LinuxHost>(
+                "heartbeat",
+                &self.heartbeat,
             ),
         ]
     }
@@ -362,6 +369,7 @@ mod tests {
             netflow: p("netflow.jsonl"),
             fim_drift: p("fim_drift.jsonl"),
             actions: p("actions.jsonl"),
+            heartbeat: p("heartbeat.jsonl"),
         }
     }
 

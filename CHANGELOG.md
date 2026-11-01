@@ -6,6 +6,25 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- The signed heartbeat and its minimal external verifier (lab PR 270, Wave
+  4 phase 2, R12c-2 of the restructure plan; report 06 INI-14;
+  `docs/operator/HEARTBEAT.md`, `docs/architecture/EVENT_BUS.md` §5). A beat
+  every 30 s (`NN_HEARTBEAT_SECS`, 5 to 300, never off) appended to a chain
+  of its own (`/var/lib/northnarrow/heartbeat.jsonl`, `--heartbeat-file`,
+  signed and chained, 4 MiB × 4 archives): numbered across the agent's
+  runs, with the loss of stages 1 to 7, the actions chain's counts, the
+  telemetry probe's gaps, the decision thread's progress, the posture, the
+  ladder's stage, the trust level, the degradations and the heads of the
+  audit and actions chains; a `start` beat opens each run, a `stop` beat
+  (with its reason) closes a clean stop. `nn-admin heartbeat export` prints
+  the newest lines as on disk (an SSH forced command); `nn-admin heartbeat
+  watch`, run on another host with the agent's public key, verifies
+  signatures, links, numbers and freshness against its state file and
+  alerts — exit 10 silent (two intervals and 15 s), 11 broken, 12 replay or
+  rollback, 13 tampered, 14 loss, 15 stopped, 16 degraded — once (a timer)
+  or `--every N`. Signed `telemetry_loss` rows in the audit log: every
+  stage's total and what it lost since the last row, at a change at most
+  once a minute, hourly with none, and at the stop.
 - nn-admin's output matrix, committed (lab PR 266, Wave 4, test
   infrastructure; `docs/validation/GOLDEN_REPLAY.md` §8). Lab PRs 259 and
   263 proved "nn-admin's output identical to `main`" with 1,964 cases run

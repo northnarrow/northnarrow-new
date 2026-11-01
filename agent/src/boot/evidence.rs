@@ -469,6 +469,43 @@ pub(crate) struct Stores {
     pub(crate) detection_admin_state: Option<Arc<admin_socket::DetectionAdminState>>,
 }
 
+/// R12c-2 (lab PR 270): the signed heartbeat — its chain opened with a copy
+/// of the start's one key, the run's `start` beat written, the periodic
+/// beats spawned (`northnarrow_agent::heartbeat`). Without the key no beat
+/// is written: a signed degradation, and the silence a verifier off the
+/// host sees.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn heartbeat(
+    cli: &Cli,
+    signing_key: &northnarrow_agent::keys::BootKey,
+    protection: std::sync::Arc<dyn northnarrow_agent::chainlog::ProtectionManager>,
+    rotation_on: bool,
+    audit_log: &AuditHandle,
+    sources: northnarrow_agent::heartbeat::Sources,
+) -> Option<northnarrow_agent::heartbeat::Heartbeat> {
+    match signing_key.signer() {
+        Ok(key) => {
+            let hb = northnarrow_agent::heartbeat::Heartbeat::open(
+                &cli.heartbeat_file,
+                key,
+                protection,
+                rotation_on,
+                sources,
+            );
+            hb.spawn();
+            Some(hb)
+        }
+        Err(e) => {
+            error!(error = %e, "the heartbeat needs the agent signing key — no beat this run");
+            attest_degraded(
+                audit_log.as_ref(),
+                &format!("heartbeat off: the signing key did not load ({e})"),
+            );
+            None
+        }
+    }
+}
+
 /// R12c (lab PR 270): the start's report of the intents an earlier run left
 /// without an outcome — a signed `response_interrupted` row naming them
 /// (each is also answered by an interrupted row in the actions chain).

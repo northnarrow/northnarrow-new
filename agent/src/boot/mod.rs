@@ -372,6 +372,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &signing_key,
         &journal,
     );
+    // R12c-2 (lab PR 270): the heartbeat's chain rotates as the others.
+    let heartbeat_protection = rotation_protection.clone();
+    let heartbeat_rotation = state_protection.is_some();
     let fim_admin_state = fim::start(
         &cli,
         agent_id,
@@ -483,6 +486,31 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &capability_manifest,
         sensor.attach_points(),
     )?;
+    // R12c-2 (lab PR 270): the signed heartbeat, once the agent is armed —
+    // its `start` beat first, then one every interval; the stop writes its
+    // `stop` beat.
+    let heartbeat = evidence::heartbeat(
+        &cli,
+        &signing_key,
+        heartbeat_protection,
+        heartbeat_rotation,
+        &audit_log,
+        northnarrow_agent::heartbeat::Sources {
+            agent_id,
+            run: journal.run().to_string(),
+            posture: posture.clone(),
+            ladder: Some(Arc::clone(&combat.ladder)),
+            trust: Some(trust_inputs.clone()),
+            bus: Some(sensor.bus_stats()),
+            dispatch: Some(
+                dispatcher
+                    .status_source(canary_detector.clone(), Some(Arc::clone(&ransom_tracker))),
+            ),
+            journal: journal.clone(),
+            audit: audit_log.clone(),
+            probe_on: telemetry_probe.is_some(),
+        },
+    );
     let stopped = crate::run_loop::run(
         armed,
         &cli,
@@ -504,6 +532,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     .await;
     crate::shutdown::stop(
         &cli,
+        &heartbeat,
         execq_handle,
         execpol_handle,
         sensor.bpf_guard(),
@@ -902,7 +931,8 @@ mod tests {
         .filter(|c| !c.is_whitespace())
         .collect();
         assert!(run.contains("mutboot,signing_key,"));
-        assert_eq!(run.matches("&signing_key").count(), 9, "{run}");
+        // R12c-2 (lab PR 270): the tenth, the heartbeat's
+        assert_eq!(run.matches("&signing_key").count(), 10, "{run}");
     }
 
     /// R11b (lab PR 262): every refusal of the start goes through

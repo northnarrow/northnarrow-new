@@ -472,6 +472,17 @@ enum Cmd {
         sub: ChainCmd,
     },
 
+    /// R12c-2 — the agent's signed heartbeat (a beat every 30 s). `heartbeat
+    /// export` prints the newest lines of its chain as on disk (for an SSH
+    /// forced command on the agent's host); `heartbeat watch`, run on
+    /// ANOTHER host, verifies them with the agent's public key and alerts
+    /// on silence, a broken chain, a replay, a tampered beat, loss, a stop
+    /// or degraded health (docs/operator/HEARTBEAT.md).
+    Heartbeat {
+        #[command(subcommand)]
+        sub: HeartbeatCmd,
+    },
+
     /// Tappa 9 C6 — FIM operator surface. `fim baseline` queues
     /// a re-compute of the watched-paths SHA-256 baseline
     /// (signed payload, single-sig `fim-manage` role per §13 Q6).
@@ -907,6 +918,56 @@ enum AuditCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum HeartbeatCmd {
+    /// Print the newest lines of the heartbeat chain, exactly as on disk
+    /// (the verifier's input).
+    Export {
+        /// The chain's active file.
+        #[arg(long = "file", default_value = "/var/lib/northnarrow/heartbeat.jsonl")]
+        file: PathBuf,
+        /// Lines to print.
+        #[arg(long = "count", default_value_t = crate::heartbeat::DEFAULT_EXPORT_LINES)]
+        count: usize,
+    },
+    /// Verify the agent's heartbeat from another host: fetch the newest
+    /// lines (`--from-cmd`, run with `sh -c`, e.g. an SSH pull through a
+    /// forced command; or `--from-file`), check signatures, chain, numbers
+    /// and freshness against the last check (`--state`), print `OK …` or
+    /// one `ALERT <KIND> …` line per alert. Once: exit 0, or the most
+    /// severe alert's code (10 silent, 11 broken, 12 replay, 13 tampered,
+    /// 14 loss, 15 stopped, 16 degraded); with `--every` until stopped.
+    Watch {
+        /// The agent's public key, 64 hex characters (its `agent.sig.pub`).
+        #[arg(long = "agent-pubkey", conflicts_with = "agent_pubkey_file")]
+        agent_pubkey: Option<String>,
+        /// A file holding it (a copy of the agent's `agent.sig.pub`).
+        #[arg(long = "agent-pubkey-file")]
+        agent_pubkey_file: Option<PathBuf>,
+        /// A command printing the newest lines (`nn-admin heartbeat export`
+        /// on the agent's host), run with `sh -c`, killed after 30 s.
+        #[arg(long = "from-cmd", conflicts_with = "from_file")]
+        from_cmd: Option<String>,
+        /// An exported file instead.
+        #[arg(long = "from-file")]
+        from_file: Option<PathBuf>,
+        /// What the last check verified (default
+        /// `$HOME/.local/state/nn-heartbeat/<key>.json`).
+        #[arg(long = "state")]
+        state: Option<PathBuf>,
+        /// Check every this many seconds, until stopped (default: once).
+        #[arg(long = "every")]
+        every: Option<u64>,
+        /// No newer beat for this long is silence (default: two of the
+        /// beats' intervals plus 15 s).
+        #[arg(long = "max-silence-secs")]
+        max_silence_secs: Option<u64>,
+        /// A beat stamped further in the future is not believed.
+        #[arg(long = "max-skew-secs", default_value_t = 30)]
+        max_skew_secs: u64,
+    },
+}
+
 /// The chains `nn-admin chain verify --log` names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum ChainName {
@@ -920,6 +981,8 @@ enum ChainName {
     // R12c (lab PR 270): the agent's actions, intent and outcome (a plain
     // comment: a doc comment would make clap's help of every value long).
     Actions,
+    // R12c-2: the signed heartbeat.
+    Heartbeat,
     All,
 }
 
@@ -934,6 +997,7 @@ impl ChainName {
             ChainName::Netflow => "netflow",
             ChainName::FimDrift => "fim_drift",
             ChainName::Actions => "actions",
+            ChainName::Heartbeat => "heartbeat",
             ChainName::All => return None,
         })
     }
@@ -1743,6 +1807,59 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Cmd::Heartbeat {
+            sub: HeartbeatCmd::Export { file, count },
+        } => crate::heartbeat::export(&file, count),
+        Cmd::Heartbeat {
+            sub:
+                HeartbeatCmd::Watch {
+                    agent_pubkey,
+                    agent_pubkey_file,
+                    from_cmd,
+                    from_file,
+                    state,
+                    every,
+                    max_silence_secs,
+                    max_skew_secs,
+                },
+        } => {
+            let hex = match (agent_pubkey, agent_pubkey_file) {
+                (Some(h), _) => Ok(h),
+                (None, Some(f)) => std::fs::read_to_string(&f)
+                    .map(|t| t.trim().to_string())
+                    .map_err(|e| format!("{}: {e}", f.display())),
+                (None, None) => Err("--agent-pubkey or --agent-pubkey-file is required".into()),
+            };
+            let pubkey = hex.and_then(|h| {
+                crate::admin_cli::load_audit_pubkey(host, Some(&h), std::path::Path::new(""))
+                    .map_err(|e| format!("{e:#}"))
+            });
+            let source = match (from_cmd, from_file) {
+                (Some(c), _) => Ok(crate::heartbeat::Source::Command(c)),
+                (None, Some(f)) => Ok(crate::heartbeat::Source::File(f)),
+                (None, None) => Err("--from-cmd or --from-file is required".to_string()),
+            };
+            match (pubkey, source) {
+                (Ok(pubkey), Ok(source)) => {
+                    let state = state.unwrap_or_else(|| crate::heartbeat::default_state(&pubkey));
+                    crate::heartbeat::watch(&crate::heartbeat::Watch {
+                        pubkey,
+                        source,
+                        state,
+                        every: every.map(|s| std::time::Duration::from_secs(s.max(1))),
+                        cfg: nn_evidence::heartbeat::WatchConfig {
+                            max_silence_secs,
+                            max_skew_secs,
+                            ..nn_evidence::heartbeat::WatchConfig::default()
+                        },
+                    })
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("heartbeat watch: {e}");
+                    ExitCode::from(2)
+                }
+            }
+        }
         Cmd::Fim {
             sub:
                 FimCmd::Baseline {

@@ -388,6 +388,18 @@ pub(crate) struct Cli {
     )]
     pub(crate) actions_file: PathBuf,
 
+    /// R12c-2 (lab PR 270): configurable path of the signed heartbeat chain
+    /// (default `/var/lib/northnarrow/heartbeat.jsonl`): a beat every
+    /// `NN_HEARTBEAT_SECS` (30 s) that a verifier on another host reads
+    /// (`nn-admin heartbeat export` / `watch`). Same per-test override
+    /// rationale as `--detections-file`.
+    #[arg(
+        long = "heartbeat-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::heartbeat::DEFAULT_HEARTBEAT_LOG_PATH,
+    )]
+    pub(crate) heartbeat_file: PathBuf,
+
     /// Tappa 9.5 K2 / K6: configurable path of the chained canary
     /// registry log. Tests override this to a tempdir so each test
     /// run gets a fresh chain. Missing file means an empty registry
@@ -865,6 +877,7 @@ impl Cli {
                 p.netflow,
                 p.fim_drift,
                 p.actions,
+                p.heartbeat,
                 self.fim_baseline_file.clone(),
                 self.netflow_listeners_file.clone(),
             ],
@@ -910,6 +923,7 @@ impl Cli {
             netflow: self.netflow_file.clone(),
             fim_drift: self.fim_drift_file.clone(),
             actions: self.actions_file.clone(),
+            heartbeat: self.heartbeat_file.clone(),
         }
     }
 
@@ -1066,6 +1080,7 @@ mod tests {
                 "/var/lib/northnarrow/detections/status_events.jsonl",
                 "/var/lib/northnarrow/fim_baseline.jsonl",
                 "/var/lib/northnarrow/fim_drift.jsonl",
+                "/var/lib/northnarrow/heartbeat.jsonl",
                 "/var/lib/northnarrow/netflow.jsonl",
                 "/var/lib/northnarrow/netflow_listeners.jsonl",
             ]
@@ -1098,6 +1113,7 @@ mod tests {
             ("--detections-file", "c/detections.jsonl"),
             ("--status-events-file", "c/status_events.jsonl"),
             ("--actions-file", "c/actions.jsonl"),
+            ("--heartbeat-file", "c/heartbeat.jsonl"),
             ("--netflow-file", "c/netflow.jsonl"),
             ("--netflow-listeners-file", "c/netflow_listeners.jsonl"),
             ("--fim-baseline-file", "f/fim_baseline.jsonl"),
@@ -1110,8 +1126,9 @@ mod tests {
         let cli = Cli::try_parse_from(&args).expect("a test's command line");
         let ids = cli.identity_paths();
         assert_eq!(ids.heads, d.join("h/chain_heads.json"));
-        // R12c (lab PR 270): the actions chain is the tenth
-        assert_eq!(ids.chains.len(), 10);
+        // R12c (lab PR 270): the actions chain is the tenth, R12c-2's
+        // heartbeat the eleventh
+        assert_eq!(ids.chains.len(), 11);
         assert!(
             ids.chains.iter().all(|c| c.starts_with(&d)),
             "{:?}",

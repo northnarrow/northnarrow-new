@@ -206,6 +206,8 @@ pub mod impair {
 pub mod install_manifest;
 
 // The agent's signing key and its files (R09a; was the agent's `keys`).
+/// R12c-2 (lab PR 270): the heartbeat's period.
+pub mod heartbeat_config;
 pub mod keys;
 
 /// Network (R09a, lab PR 253): the DNS pump's ingest, and the DNS cache

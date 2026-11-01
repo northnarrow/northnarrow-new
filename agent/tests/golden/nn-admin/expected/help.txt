@@ -24,6 +24,7 @@ exit: 2
 |   rotate-keys              Tappa 8 A13 — atomically add or revoke an admin key in `/etc/northnarrow/admin.pub` (design §7.2 + §7.3). Both `add` and `revoke` need a 2-of-N quorum signed by two distinct installed admin keys, at least one of them carrying the `rotate-keys` role; the other may be any installed key, whatever its roles (design §3.3) — custody every installed key as a control credential. `add` grants only roles one of the two signers holds. On success the agent rewrites the file via tmpfile + `rename(2)` and reloads its in-memory key set so the next challenge already sees the change
 |   audit                    Tappa 8 A12 — read or verify the tamper-evident audit log (design §9). Two subcommands: `read` streams entries from the on-disk JSONL log, `verify` runs the SHA-256 hash chain + per-entry Ed25519 signature recomputation through `northnarrow_agent::audit::verify_chain`
 |   chain                    External audit NN-AUD-112 (lab PR 160) — verify every signed chain in full, offline: the audit log and the canary chains (hashes, signatures, links, row numbers), the rotating logs with their archives, manifest and checkpoints, then the files against the signed head anchor. Exits 8 when a chain is broken or shorter than its anchored head, 0 when everything verifies. Reads the files directly (root: they are 0600 or under 0700 directories)
+|   heartbeat                R12c-2 — the agent's signed heartbeat (a beat every 30 s). `heartbeat export` prints the newest lines of its chain as on disk (for an SSH forced command on the agent's host); `heartbeat watch`, run on ANOTHER host, verifies them with the agent's public key and alerts on silence, a broken chain, a replay, a tampered beat, loss, a stop or degraded health (docs/operator/HEARTBEAT.md)
 |   fim                      Tappa 9 C6 — FIM operator surface. `fim baseline` queues a re-compute of the watched-paths SHA-256 baseline (signed payload, single-sig `fim-manage` role per §13 Q6). `fim report [--since <unix-ts>]` reads the chained drift log (signed payload, single-sig `fim-read` role)
 |   canary                   Tappa 9.5 K6 — deception canary operator surface. `canary deploy` installs a new canary (File / Process / Network / Credential variants), `canary list` streams the chained registry log, `canary burn` permanently retires a canary, `canary refresh` re-renders the on-disk artefact. Authorisation: `canary-read` for `list`; `canary-manage` for `deploy` / `burn` / `refresh` (§12 Q7 SPLIT lock-in)
 |   net                      Tappa 10 N7 — network observability operator surface. `net flows` reads the chained netflow log, `net listeners` snapshots active listeners, `net resolve <ip>` looks up DNS attribution, `net fingerprint --flow-id <hex>` dumps JA3/JA4. All four are `Role::NetRead` (1-of-N quorum per §13 Q6)
@@ -76,6 +77,7 @@ exit: 0
 |   rotate-keys              Tappa 8 A13 — atomically add or revoke an admin key in `/etc/northnarrow/admin.pub` (design §7.2 + §7.3). Both `add` and `revoke` need a 2-of-N quorum signed by two distinct installed admin keys, at least one of them carrying the `rotate-keys` role; the other may be any installed key, whatever its roles (design §3.3) — custody every installed key as a control credential. `add` grants only roles one of the two signers holds. On success the agent rewrites the file via tmpfile + `rename(2)` and reloads its in-memory key set so the next challenge already sees the change
 |   audit                    Tappa 8 A12 — read or verify the tamper-evident audit log (design §9). Two subcommands: `read` streams entries from the on-disk JSONL log, `verify` runs the SHA-256 hash chain + per-entry Ed25519 signature recomputation through `northnarrow_agent::audit::verify_chain`
 |   chain                    External audit NN-AUD-112 (lab PR 160) — verify every signed chain in full, offline: the audit log and the canary chains (hashes, signatures, links, row numbers), the rotating logs with their archives, manifest and checkpoints, then the files against the signed head anchor. Exits 8 when a chain is broken or shorter than its anchored head, 0 when everything verifies. Reads the files directly (root: they are 0600 or under 0700 directories)
+|   heartbeat                R12c-2 — the agent's signed heartbeat (a beat every 30 s). `heartbeat export` prints the newest lines of its chain as on disk (for an SSH forced command on the agent's host); `heartbeat watch`, run on ANOTHER host, verifies them with the agent's public key and alerts on silence, a broken chain, a replay, a tampered beat, loss, a stop or degraded health (docs/operator/HEARTBEAT.md)
 |   fim                      Tappa 9 C6 — FIM operator surface. `fim baseline` queues a re-compute of the watched-paths SHA-256 baseline (signed payload, single-sig `fim-manage` role per §13 Q6). `fim report [--since <unix-ts>]` reads the chained drift log (signed payload, single-sig `fim-read` role)
 |   canary                   Tappa 9.5 K6 — deception canary operator surface. `canary deploy` installs a new canary (File / Process / Network / Credential variants), `canary list` streams the chained registry log, `canary burn` permanently retires a canary, `canary refresh` re-renders the on-disk artefact. Authorisation: `canary-read` for `list`; `canary-manage` for `deploy` / `burn` / `refresh` (§12 Q7 SPLIT lock-in)
 |   net                      Tappa 10 N7 — network observability operator surface. `net flows` reads the chained netflow log, `net listeners` snapshots active listeners, `net resolve <ip>` looks up DNS attribution, `net fingerprint --flow-id <hex>` dumps JA3/JA4. All four are `Role::NetRead` (1-of-N quorum per §13 Q6)
@@ -943,7 +945,7 @@ exit: 0
 | Usage: nn-admin chain verify [OPTIONS]
 |
 | Options:
-|       --log <LOG>                      A chain to verify; repeat for several. Default: all [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, actions, all]
+|       --log <LOG>                      A chain to verify; repeat for several. Default: all [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, actions, heartbeat, all]
 |       --state-dir <STATE_DIR>          The state directory holding the canary chains and the rotating logs (`detections/` below it) [default: /var/lib/northnarrow]
 |       --audit-log <AUDIT_LOG>          The audit log [default: /etc/northnarrow/audit.log]
 |       --heads <HEADS>                  The head anchor (default: `chain_heads.json` next to `--audit-log`)
@@ -966,6 +968,135 @@ $ nn-admin help chain verify
 exit: 0
 --- stdout
 (the same bytes as in help.chain.verify.long)
+--- stderr
+(empty)
+
+### help.heartbeat.long
+$ nn-admin heartbeat --help
+exit: 0
+--- stdout
+| R12c-2 — the agent's signed heartbeat (a beat every 30 s). `heartbeat export` prints the newest lines of its chain as on disk (for an SSH forced command on the agent's host); `heartbeat watch`, run on ANOTHER host, verifies them with the agent's public key and alerts on silence, a broken chain, a replay, a tampered beat, loss, a stop or degraded health (docs/operator/HEARTBEAT.md)
+|
+| Usage: nn-admin heartbeat <COMMAND>
+|
+| Commands:
+|   export  Print the newest lines of the heartbeat chain, exactly as on disk (the verifier's input)
+|   watch   Verify the agent's heartbeat from another host: fetch the newest lines (`--from-cmd`, run with `sh -c`, e.g. an SSH pull through a forced command; or `--from-file`), check signatures, chain, numbers and freshness against the last check (`--state`), print `OK …` or one `ALERT <KIND> …` line per alert. Once: exit 0, or the most severe alert's code (10 silent, 11 broken, 12 replay, 13 tampered, 14 loss, 15 stopped, 16 degraded); with `--every` until stopped
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+--- stderr
+(empty)
+
+### help.heartbeat.short
+$ nn-admin heartbeat -h
+exit: 0
+--- stdout
+(the same bytes as in help.heartbeat.long)
+--- stderr
+(empty)
+
+### help.heartbeat.subcommand
+$ nn-admin help heartbeat
+exit: 0
+--- stdout
+(the same bytes as in help.heartbeat.long)
+--- stderr
+(empty)
+
+### help.heartbeat.without-subcommand
+$ nn-admin heartbeat
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| R12c-2 — the agent's signed heartbeat (a beat every 30 s). `heartbeat export` prints the newest lines of its chain as on disk (for an SSH forced command on the agent's host); `heartbeat watch`, run on ANOTHER host, verifies them with the agent's public key and alerts on silence, a broken chain, a replay, a tampered beat, loss, a stop or degraded health (docs/operator/HEARTBEAT.md)
+|
+| Usage: nn-admin heartbeat <COMMAND>
+|
+| Commands:
+|   export  Print the newest lines of the heartbeat chain, exactly as on disk (the verifier's input)
+|   watch   Verify the agent's heartbeat from another host: fetch the newest lines (`--from-cmd`, run with `sh -c`, e.g. an SSH pull through a forced command; or `--from-file`), check signatures, chain, numbers and freshness against the last check (`--state`), print `OK …` or one `ALERT <KIND> …` line per alert. Once: exit 0, or the most severe alert's code (10 silent, 11 broken, 12 replay, 13 tampered, 14 loss, 15 stopped, 16 degraded); with `--every` until stopped
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+
+### help.heartbeat.export.long
+$ nn-admin heartbeat export --help
+exit: 0
+--- stdout
+| Print the newest lines of the heartbeat chain, exactly as on disk (the verifier's input)
+|
+| Usage: nn-admin heartbeat export [OPTIONS]
+|
+| Options:
+|       --file <FILE>    The chain's active file [default: /var/lib/northnarrow/heartbeat.jsonl]
+|       --count <COUNT>  Lines to print [default: 64]
+|   -h, --help           Print help
+--- stderr
+(empty)
+
+### help.heartbeat.export.short
+$ nn-admin heartbeat export -h
+exit: 0
+--- stdout
+(the same bytes as in help.heartbeat.export.long)
+--- stderr
+(empty)
+
+### help.heartbeat.export.subcommand
+$ nn-admin help heartbeat export
+exit: 0
+--- stdout
+(the same bytes as in help.heartbeat.export.long)
+--- stderr
+(empty)
+
+### help.heartbeat.watch.long
+$ nn-admin heartbeat watch --help
+exit: 0
+--- stdout
+| Verify the agent's heartbeat from another host: fetch the newest lines (`--from-cmd`, run with `sh -c`, e.g. an SSH pull through a forced command; or `--from-file`), check signatures, chain, numbers and freshness against the last check (`--state`), print `OK …` or one `ALERT <KIND> …` line per alert. Once: exit 0, or the most severe alert's code (10 silent, 11 broken, 12 replay, 13 tampered, 14 loss, 15 stopped, 16 degraded); with `--every` until stopped
+|
+| Usage: nn-admin heartbeat watch [OPTIONS]
+|
+| Options:
+|       --agent-pubkey <AGENT_PUBKEY>
+|           The agent's public key, 64 hex characters (its `agent.sig.pub`)
+|       --agent-pubkey-file <AGENT_PUBKEY_FILE>
+|           A file holding it (a copy of the agent's `agent.sig.pub`)
+|       --from-cmd <FROM_CMD>
+|           A command printing the newest lines (`nn-admin heartbeat export` on the agent's host), run with `sh -c`, killed after 30 s
+|       --from-file <FROM_FILE>
+|           An exported file instead
+|       --state <STATE>
+|           What the last check verified (default `$HOME/.local/state/nn-heartbeat/<key>.json`)
+|       --every <EVERY>
+|           Check every this many seconds, until stopped (default: once)
+|       --max-silence-secs <MAX_SILENCE_SECS>
+|           No newer beat for this long is silence (default: two of the beats' intervals plus 15 s)
+|       --max-skew-secs <MAX_SKEW_SECS>
+|           A beat stamped further in the future is not believed [default: 30]
+|   -h, --help
+|           Print help
+--- stderr
+(empty)
+
+### help.heartbeat.watch.short
+$ nn-admin heartbeat watch -h
+exit: 0
+--- stdout
+(the same bytes as in help.heartbeat.watch.long)
+--- stderr
+(empty)
+
+### help.heartbeat.watch.subcommand
+$ nn-admin help heartbeat watch
+exit: 0
+--- stdout
+(the same bytes as in help.heartbeat.watch.long)
 --- stderr
 (empty)
 

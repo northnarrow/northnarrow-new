@@ -1,0 +1,480 @@
+//! Wave 4 restructure, R12c-2 (lab PR 270; plan §3.4, report 06 INI-14):
+//! the signed heartbeat and the signed `telemetry_loss` rows.
+//!
+//! **The heartbeat.** Every [`DEFAULT_INTERVAL_SECS`] (`NN_HEARTBEAT_SECS`,
+//! 5 to 300; never off) a task of its own appends a beat
+//! ([`nn_evidence::heartbeat::HeartbeatRecord`]) to the `heartbeat` chain
+//! (`/var/lib/northnarrow/heartbeat.jsonl`, `--heartbeat-file`: rotating, 4
+//! MiB × 4 archives, signed with the agent's key, each line chained to the
+//! one before): its number (continuing across runs), the time, the run, the
+//! loss counters of stages 1 to 7, the actions chain's counts, the telemetry
+//! probe's gaps, the decision thread's progress, the posture, the ladder's
+//! stage, the trust level, the degradations, and the heads of the audit and
+//! actions chains. The run's first beat is a `start` beat; a clean stop
+//! writes a `stop` beat with its reason ([`Heartbeat::stop`]). A verifier on
+//! another host (`nn-admin heartbeat watch`, `docs/operator/HEARTBEAT.md`)
+//! reads the newest lines (`nn-admin heartbeat export`, through an SSH
+//! forced command) and alerts on silence, a broken chain, a replay, a
+//! tampered beat, loss, a stop, degraded health.
+//!
+//! **`telemetry_loss`.** At each beat the loss of every stage (1 to 7: the
+//! kernel's ring and budget, the decoder, the bus's queues, the decision's
+//! delay, the response queue, the evidence writers) is compared with the
+//! last signed row: a change is signed in the audit log
+//! (`telemetry_loss`, the totals since the run started and what each stage
+//! lost since the last row) at most once a minute; with no change, one row
+//! an hour says so (the count of zero signed too).
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use nn_evidence::heartbeat::{BeatActions, BeatHead, BeatKind, HeartbeatRecord, MAX_DEGRADATIONS};
+use parking_lot::Mutex;
+use tracing::{error, info, warn};
+
+use crate::audit::{AuditEntryDraft, AuditLog};
+
+/// The heartbeat chain's active file.
+pub const DEFAULT_HEARTBEAT_LOG_PATH: &str = "/var/lib/northnarrow/heartbeat.jsonl";
+/// The beats' period (nn-linux's: the self-integrity check reports a
+/// weakening value).
+pub use nn_linux::heartbeat_config::{
+    interval_from_env, interval_weakens, DEFAULT_INTERVAL_SECS, INTERVAL_ENV,
+};
+/// The chain's rotation: 4 MiB × 4 archives (a beat ≈ 1 KiB: days of
+/// beats at 30 s).
+pub const HEARTBEAT_CAP_BYTES: u64 = 4 * 1024 * 1024;
+pub const HEARTBEAT_MAX_ARCHIVES: usize = 4;
+/// Audit op of a loss row.
+pub const TELEMETRY_LOSS_OP: &str = "telemetry_loss";
+/// A changed loss is signed at most this often; an unchanged one this
+/// often.
+const LOSS_ROW_EVERY_CHANGED: Duration = Duration::from_secs(60);
+const LOSS_ROW_EVERY_UNCHANGED: Duration = Duration::from_secs(3600);
+
+/// What a beat reads, each from its owner.
+pub struct Sources {
+    pub agent_id: [u8; 16],
+    pub run: String,
+    pub posture: crate::posture::PostureMachine,
+    pub ladder: Option<Arc<crate::combat::CombatLadder>>,
+    pub trust: Option<crate::boot::trust::TrustInputs>,
+    pub bus: Option<crate::sensors::bus::BusStats>,
+    pub dispatch: Option<crate::admin_socket::ResponseDispatchSource>,
+    pub journal: crate::response::journal::ActionJournal,
+    pub audit: Option<Arc<Mutex<AuditLog>>>,
+    pub probe_on: bool,
+}
+
+/// The loss of stages 1 to 7 now (`None`: a stage not counted here).
+fn loss_now(s: &Sources) -> Vec<Option<u64>> {
+    let dispatch = s.dispatch.as_ref().map(|f| f());
+    let queues = s.bus.as_ref().map(|b| b.snapshot()).unwrap_or_default();
+    let stages = crate::sensors::bus::loss_stages(
+        &crate::sensors::ring_drops::snapshot(),
+        crate::sensors::reject::total(),
+        &queues,
+        dispatch.as_ref().map(|d| (d.stage6(), d.stage7())),
+    );
+    let mut out: Vec<Option<u64>> = stages
+        .into_iter()
+        .filter(|st| (1..=7).contains(&st.stage))
+        .map(|st| st.total)
+        .collect();
+    if s.bus.is_none() {
+        // no bus (tests): stages 4 and 5 are not counted
+        for i in [3usize, 4] {
+            if let Some(x) = out.get_mut(i) {
+                *x = None;
+            }
+        }
+    }
+    out.resize(7, None);
+    out
+}
+
+/// The kernel's boot id.
+fn boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+struct Writer {
+    log: Option<crate::chainlog::RotatingChainLog<HeartbeatRecord>>,
+    next_seq: u64,
+    beats: u64,
+    unwritten: u64,
+    /// The loss signed last, and when.
+    loss_row: Option<(Vec<Option<u64>>, Instant)>,
+}
+
+/// The heartbeat (see the module's doc). Cheap to clone.
+#[derive(Clone)]
+pub struct Heartbeat {
+    inner: Arc<Mutex<Writer>>,
+    sources: Arc<Sources>,
+    interval: Duration,
+    started: Instant,
+    boot_id: Arc<String>,
+}
+
+impl Heartbeat {
+    /// Open the chain at `path` (signed with `key`) and write the run's
+    /// `start` beat. A chain that does not open leaves the heartbeat off
+    /// (an ERROR and a signed degradation; the verifier off the host sees
+    /// the silence).
+    pub fn open(
+        path: &Path,
+        key: crate::keys::AgentSigningKey,
+        protection: Arc<dyn crate::chainlog::ProtectionManager>,
+        rotation_on: bool,
+        sources: Sources,
+    ) -> Self {
+        let cfg = crate::chainlog::RotationConfig {
+            size_cap_bytes: if rotation_on {
+                HEARTBEAT_CAP_BYTES
+            } else {
+                u64::MAX
+            },
+            max_archives: HEARTBEAT_MAX_ARCHIVES,
+            file_mode: crate::chainlog::STATE_LOG_FILE_MODE,
+        };
+        let log = match crate::chainlog::RotatingChainLog::open(path, key, cfg, protection) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                error!(
+                    error = %format!("{e:#}"),
+                    path = %path.display(),
+                    "the heartbeat chain did not open — no beat this run (a verifier off the \
+                     host sees the silence)"
+                );
+                None
+            }
+        };
+        let next_seq = last_seq(path) + 1;
+        let hb = Self {
+            inner: Arc::new(Mutex::new(Writer {
+                log,
+                next_seq,
+                beats: 0,
+                unwritten: 0,
+                loss_row: None,
+            })),
+            sources: Arc::new(sources),
+            interval: interval_from_env(),
+            started: Instant::now(),
+            boot_id: Arc::new(boot_id()),
+        };
+        hb.beat(BeatKind::Start, None);
+        hb
+    }
+
+    /// The beats' period.
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Beats written this run, and beats the chain refused.
+    pub fn counts(&self) -> (u64, u64) {
+        let w = self.inner.lock();
+        (w.beats, w.unwritten)
+    }
+
+    /// Run the periodic beats on the runtime.
+    pub fn spawn(&self) {
+        let hb = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(hb.interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // the start beat was the first
+            loop {
+                tick.tick().await;
+                let h = hb.clone();
+                // the chain's append (an fsync) and the reads off the
+                // runtime's worker
+                let _ = tokio::task::spawn_blocking(move || h.beat(BeatKind::Beat, None)).await;
+            }
+        });
+        info!(
+            interval_secs = self.interval.as_secs(),
+            "heartbeat armed — a signed beat every interval (nn-admin heartbeat export / watch)"
+        );
+    }
+
+    /// A clean stop's last beat, with its reason.
+    pub fn stop(&self, reason: &str) {
+        self.beat(BeatKind::Stop, Some(reason));
+    }
+
+    /// Write one beat (and the loss row when due).
+    pub fn beat(&self, kind: BeatKind, stop_reason: Option<&str>) {
+        let s = &self.sources;
+        let loss = loss_now(s);
+        let j = s.journal.counts();
+        let progress = crate::loop_progress::snapshot();
+        let mut heads = Vec::new();
+        if let Some(a) = &s.audit {
+            let a = a.lock();
+            heads.push(BeatHead {
+                chain: "audit".into(),
+                seq: a.rows().checked_sub(1),
+                hash: a.last_hash().to_string(),
+            });
+        }
+        if let Some(h) = s.journal.head() {
+            heads.push(BeatHead {
+                chain: "actions".into(),
+                seq: None,
+                hash: h,
+            });
+        }
+        let mut degradations = crate::boot::degradation::snapshot();
+        degradations.truncate(MAX_DEGRADATIONS);
+        let mut w = self.inner.lock();
+        let record = HeartbeatRecord {
+            kind,
+            seq: w.next_seq,
+            ts: crate::detection_store::now_ts(),
+            agent_id: hex::encode(s.agent_id),
+            run: s.run.clone(),
+            boot_id: self.boot_id.as_str().to_string(),
+            uptime_ms: self.started.elapsed().as_millis() as u64,
+            interval_secs: self.interval.as_secs(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            posture: s.posture.current_kind().as_str().to_ascii_lowercase(),
+            combat_stage: s
+                .ladder
+                .as_ref()
+                .and_then(|l| l.current_stage())
+                .map(|st| st.as_str().to_string()),
+            trust_level: crate::boot::trust::current(s.trust.as_ref())
+                .map(|t| t.level.name().to_string()),
+            degradations,
+            decision_rounds: progress.iterations,
+            decision_since_last_ms: progress.since_last_ms,
+            loss: loss.clone(),
+            actions: BeatActions {
+                intents: j.intents,
+                outcomes: j.outcomes,
+                unwritten: j.unwritten,
+                interrupted_at_boot: j.interrupted_at_boot,
+                in_flight: j.in_flight,
+            },
+            probe_gaps: s.probe_on.then(crate::telemetry_probe::gaps_total),
+            heads,
+            stop_reason: stop_reason.map(str::to_string),
+        };
+        let written = match &mut w.log {
+            Some(log) => match log.append(record) {
+                Ok(_) => true,
+                Err(e) => {
+                    warn!(error = %format!("{e:#}"), "a heartbeat was not written");
+                    false
+                }
+            },
+            None => false,
+        };
+        if written {
+            w.beats += 1;
+            w.next_seq += 1;
+        } else {
+            w.unwritten += 1;
+        }
+        // telemetry_loss: on a change at most once a minute, unchanged once
+        // an hour; the first beat signs the run's baseline
+        let due = match &w.loss_row {
+            None => true,
+            Some((last, at)) => {
+                (last != &loss && at.elapsed() >= LOSS_ROW_EVERY_CHANGED)
+                    || at.elapsed() >= LOSS_ROW_EVERY_UNCHANGED
+                    || kind == BeatKind::Stop
+            }
+        };
+        if due {
+            let previous = w.loss_row.as_ref().map(|(l, at)| (l.clone(), at.elapsed()));
+            w.loss_row = Some((loss.clone(), Instant::now()));
+            drop(w);
+            sign_loss(s.audit.as_ref(), &s.run, &loss, previous, kind);
+        }
+    }
+}
+
+/// The signed `telemetry_loss` row: every stage's total since the run
+/// started and what it lost since the last row.
+fn sign_loss(
+    audit: Option<&Arc<Mutex<AuditLog>>>,
+    run: &str,
+    loss: &[Option<u64>],
+    previous: Option<(Vec<Option<u64>>, Duration)>,
+    kind: BeatKind,
+) {
+    let names = nn_evidence::heartbeat::STAGE_NAMES;
+    let mut any = false;
+    let stages: Vec<serde_json::Value> = loss
+        .iter()
+        .enumerate()
+        .map(|(i, total)| {
+            let before = previous
+                .as_ref()
+                .and_then(|(p, _)| p.get(i).copied().flatten())
+                .unwrap_or(0);
+            let since = total.map(|t| t.saturating_sub(before));
+            if since.is_some_and(|d| d > 0) {
+                any = true;
+            }
+            serde_json::json!({
+                "stage": i + 1,
+                "name": names.get(i).copied().unwrap_or("?"),
+                "total": total,
+                "since_last_row": since,
+            })
+        })
+        .collect();
+    if any {
+        warn!(
+            stages = %serde_json::Value::from(stages.clone()),
+            "telemetry loss since the last signed row (signed telemetry_loss)"
+        );
+    }
+    let Some(log) = audit else {
+        return;
+    };
+    let draft = AuditEntryDraft {
+        op: TELEMETRY_LOSS_OP.to_string(),
+        extra: serde_json::json!({
+            "run": run,
+            "stages": stages,
+            "window_secs": previous.as_ref().map(|(_, d)| d.as_secs()),
+            "at": match kind {
+                BeatKind::Start => "start",
+                BeatKind::Beat => "beat",
+                BeatKind::Stop => "stop",
+            },
+        }),
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: if any { "detected" } else { "success" }.to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
+    };
+    if let Err(e) = log.lock().append(draft) {
+        warn!(error = %e, "the telemetry_loss row was not written");
+    }
+}
+
+/// The last beat's number in the chain at `path` (its active file, else its
+/// newest archive); 0 for none.
+fn last_seq(path: &Path) -> u64 {
+    let mut files = vec![path.to_path_buf()];
+    files.extend(
+        crate::chainlog::archives_newest_first(path)
+            .into_iter()
+            .take(1),
+    );
+    for f in files {
+        if let Some(seq) = last_seq_in(&f) {
+            return seq;
+        }
+    }
+    0
+}
+
+fn last_seq_in(path: &PathBuf) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().rev().find_map(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).ok()?;
+        if v.get("rotate").is_some() {
+            return None;
+        }
+        v.get("seq")?.as_u64()
+    })
+}
+
+/// `nn-admin heartbeat export`'s read (nn-evidence's).
+pub use nn_evidence::heartbeat::tail_lines as export_lines;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sources() -> Sources {
+        Sources {
+            agent_id: [7; 16],
+            run: "1234567890abcdef".into(),
+            posture: crate::posture::PostureMachine::new(),
+            ladder: None,
+            trust: None,
+            bus: None,
+            dispatch: None,
+            journal: crate::response::journal::ActionJournal::memory(),
+            audit: None,
+            probe_on: false,
+        }
+    }
+
+    /// A start beat at the open, numbered beats after it continuing across
+    /// a restart, a stop beat with its reason; the chain verifies, and the
+    /// export gives its tail as on disk — the verifier's input.
+    #[test]
+    fn beats_are_numbered_chained_and_exported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("heartbeat.jsonl");
+        let key_path = dir.path().join("agent.sig.key");
+        let key = || crate::keys::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let pk = key().verifying_key();
+        let hb = Heartbeat::open(
+            &path,
+            key(),
+            Arc::new(crate::chainlog::NoProtection),
+            false,
+            sources(),
+        );
+        hb.beat(BeatKind::Beat, None);
+        hb.stop("admin_shutdown");
+        assert_eq!(hb.counts(), (3, 0));
+        // the next run continues the numbers
+        let hb = Heartbeat::open(
+            &path,
+            key(),
+            Arc::new(crate::chainlog::NoProtection),
+            false,
+            sources(),
+        );
+        hb.beat(BeatKind::Beat, None);
+        let lines = export_lines(&path, 10).unwrap();
+        assert!(lines.len() >= 5, "{lines:?}");
+        let beats: Vec<HeartbeatRecord> = lines
+            .iter()
+            .filter(|l| !l.starts_with("{\"rotate\""))
+            .map(|l| {
+                serde_json::from_str::<crate::chainlog::ChainLine<HeartbeatRecord>>(l)
+                    .unwrap()
+                    .payload
+            })
+            .collect();
+        let seqs: Vec<u64> = beats.iter().map(|b| b.seq).collect();
+        assert_eq!(seqs, [1, 2, 3, 4, 5]);
+        let kinds: Vec<BeatKind> = beats.iter().map(|b| b.kind).collect();
+        use BeatKind::*;
+        assert_eq!(kinds, [Start, Beat, Stop, Start, Beat]);
+        assert_eq!(beats[2].stop_reason.as_deref(), Some("admin_shutdown"));
+        assert_eq!(beats[0].loss.len(), 7);
+        // the verifier's check accepts the whole tail
+        let raw: Vec<Vec<u8>> = lines.iter().map(|l| l.as_bytes().to_vec()).collect();
+        let r = nn_evidence::heartbeat::check(
+            Ok(&raw),
+            &pk,
+            None,
+            chrono::Utc::now(),
+            &nn_evidence::heartbeat::WatchConfig::default(),
+        );
+        assert!(r.alerts.is_empty(), "{r:?}");
+        assert_eq!(r.state.unwrap().seq, 5);
+        // the export's last two lines
+        assert_eq!(export_lines(&path, 2).unwrap().len(), 2);
+    }
+}

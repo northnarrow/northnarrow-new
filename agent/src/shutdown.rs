@@ -17,6 +17,7 @@ use crate::run_loop::Stopped;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stop(
     cli: &Cli,
+    heartbeat: &Option<northnarrow_agent::heartbeat::Heartbeat>,
     execq_handle: Option<northnarrow_agent::execq::Handle>,
     execpol_handle: Option<northnarrow_agent::execpol::Handle>,
     bpf_guard: &northnarrow_agent::anti_tamper::bpf_defense::BpfGuard,
@@ -29,6 +30,11 @@ pub(crate) fn stop(
         stop_reason,
         loop_started,
     } = stopped;
+    // R12c-2 (lab PR 270): the heartbeat's signed `stop` beat, with the
+    // reason — a verifier off the host tells a stop from a silence.
+    if let Some(hb) = heartbeat {
+        hb.stop(stop_reason);
+    }
     // Lab PR 223: nothing stays held by an agent that stops.
     northnarrow_agent::execq::shutdown(execq_handle);
     // Lab PR 226: the kernel keeps the policy until its programs detach.

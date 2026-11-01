@@ -411,6 +411,15 @@ impl ActionJournal {
         }
     }
 
+    /// The chain's head: the last row's entry hash (R12c-2: the heartbeat's
+    /// commitment of the head); `None` before the log is bound.
+    pub fn head(&self) -> Option<String> {
+        match &*self.inner.writer.lock() {
+            Writer::Log(log) => Some(log.last_hash().to_string()),
+            _ => None,
+        }
+    }
+
     /// The rows a memory journal holds (empty for the signed chain's).
     pub fn rows(&self) -> Vec<ActionRecord> {
         match &*self.inner.writer.lock() {

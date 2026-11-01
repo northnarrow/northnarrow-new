@@ -184,6 +184,11 @@ planned = false
 # `host::Chains` on `ChainPaths`), and the layout under the state
 # directory it named is the agent's implementation's
 "chains" = "northnarrow-agent"
+# R12c-2 (lab PR 270): the heartbeat's writer and the telemetry_loss rows —
+# it reads the agent's handles (the posture, the ladder, the bus, the
+# dispatcher, the journal, the audit log); the beat and the verifier's
+# checks are nn-evidence's (`heartbeat`), the period's knob nn-linux's
+"heartbeat" = "northnarrow-agent"
 # the ladder and its evidence; SystemActuator and the probes of protected
 # and reconcile go to nn-linux (R04c). R08c (lab PR 252): the ladder moved
 # to nn-core — its stages and state machine, its worker, the actuator's and
