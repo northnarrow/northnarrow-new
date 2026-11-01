@@ -15,6 +15,10 @@ fn in_child(setup: impl Fn() -> bool, body: fn() -> i32) -> i32 {
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork");
     if pid == 0 {
+        // the child holds copies of every descriptor of the test process
+        // (other tests' sockets among them): let them go at once, so that
+        // no test sees its peer kept open by this child
+        close_from(3);
         if !setup() {
             // SAFETY: _exit in the child.
             unsafe { libc::_exit(100) };

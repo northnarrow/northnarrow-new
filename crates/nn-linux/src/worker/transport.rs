@@ -171,7 +171,18 @@ mod tests {
         assert_eq!(&buf[..5], b"hello");
         assert_eq!(recv(b.as_raw_fd(), &mut buf, true).unwrap(), Recv::Empty);
         drop(a);
-        assert_eq!(recv(b.as_raw_fd(), &mut buf, true).unwrap(), Recv::Closed);
+        // closed once every copy of `a` is gone: a child another test of
+        // this process forked meanwhile may hold one for a moment
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match recv(b.as_raw_fd(), &mut buf, true).unwrap() {
+                Recv::Closed => break,
+                Recv::Empty if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]

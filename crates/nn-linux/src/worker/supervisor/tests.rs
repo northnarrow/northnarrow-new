@@ -398,6 +398,28 @@ fn a_flood_of_answers_nobody_asked_for_is_caught() {
         .any(|(_, d)| d.contains("no request asked for")));
 }
 
+/// The flood's extra answer is found by the next request too, before it is
+/// sent (no tick in between): a packet nobody asked for is never read as an
+/// answer.
+#[test]
+fn a_left_answer_is_caught_by_the_next_request() {
+    let f = fixture(Script::Unsolicited);
+    assert!(tick_until(&f.workers, Health::Ready));
+    assert!(f
+        .workers
+        .request(WorkerKind::Parse, &names(), Duration::from_secs(2))
+        .is_ok());
+    std::thread::sleep(Duration::from_millis(50));
+    let got = f
+        .workers
+        .request(WorkerKind::Parse, &names(), Duration::from_secs(2));
+    assert!(
+        matches!(&got, Err(WorkerError::Violation(v)) if v.contains("no request asked for")),
+        "{got:?}"
+    );
+    assert_eq!(f.workers.status()[0].violations, 1);
+}
+
 #[test]
 fn a_hung_worker_is_killed_at_its_deadline() {
     let f = fixture(Script::Hang);
