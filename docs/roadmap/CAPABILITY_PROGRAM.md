@@ -4052,6 +4052,15 @@ only in the table below, in the same PR as the evidence.
     C64 the recorded deviation, case by case those of R12b-2's final;
     `test-ignored` 81 suites, 97 passed, 0 failed, the 54 chain checks
     `ok`; the soak (ubuntu2204, a fresh install, the same 0.8 h load as `main`'s): RSS 33.0 → 57.3 MB (`main` 32.4 → 56.8), 26 threads throughout (`main` 24: the dispatcher's and the slow work's), no restart, no ring or bus drop, P1 10 decisions over budget of 312,014 (the boot's backlog), 1,871 WARN/ERROR lines (`main` 1,929; one ERROR each: the lab's admin key on the host).
+  - The re-check of #476 ("merge after one fix", 7c390d51): a kill
+    supersedes its process's throttles and blocks only once it killed —
+    they stay queued behind it, and run when it did not kill (the
+    host-critical guard, EPERM, a cgroup that would not die); a durable
+    intent always fsyncs itself; an outcome whose intent the chain could
+    not take says `intent_written: false`; failed fsyncs counted apart
+    (`sync_failed`). Gates on 7c390d51: 77 suites 3,380 passed 0 failed,
+    every other gate green; mutations of the fix 5 of 5 (63 of 63 for the
+    lot's R12c-1).
   - Open (R12c-3, after this merges): a pool of response workers keyed by
     process (EXP-13r's wait under 2 s), a stall detector for an action
     that hangs, `run_started`/`run_ended` rows for the crash report's edge
