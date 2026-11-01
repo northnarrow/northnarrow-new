@@ -221,13 +221,16 @@ impl Heartbeat {
                 chain: "audit".into(),
                 seq: a.rows().checked_sub(1),
                 hash: a.last_hash().to_string(),
+                ..BeatHead::default()
             });
         }
-        if let Some(h) = s.journal.head() {
+        if let Some((file, bytes, hash)) = s.journal.head() {
             heads.push(BeatHead {
                 chain: "actions".into(),
-                seq: None,
-                hash: h,
+                file: Some(file),
+                bytes: Some(bytes),
+                hash,
+                ..BeatHead::default()
             });
         }
         let mut degradations = crate::boot::degradation::snapshot();

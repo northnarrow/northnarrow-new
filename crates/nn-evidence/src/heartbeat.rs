@@ -63,13 +63,48 @@ pub struct BeatActions {
 }
 
 /// A chain's head at the beat: its row number (when the chain numbers its
-/// rows) and its last entry hash.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// rows: the audit log), or its position (a rotating chain: the actions
+/// chain — review of #476), and its last entry hash.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeatHead {
     pub chain: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
+    /// A rotating chain's position: the number its active file will have
+    /// as an archive, and the bytes in that file (`RotatingChainLog::
+    /// position`). Together they only grow: a tail cut from the chain, or
+    /// a rotation undone, shows as a position that went back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
     pub hash: String,
+}
+
+impl BeatHead {
+    /// Whether this head is behind `seen` (the same chain's, an earlier
+    /// beat's): a lower row number or position, or the same with another
+    /// hash — the chain rolled back or rewritten on the host.
+    pub fn went_back(&self, seen: &BeatHead) -> bool {
+        match (seen.seq, self.seq) {
+            (Some(a), Some(b)) => return b < a || (b == a && self.hash != seen.hash),
+            (Some(_), None) | (None, Some(_)) => return false,
+            (None, None) => {}
+        }
+        match (seen.file.zip(seen.bytes), self.file.zip(self.bytes)) {
+            (Some(a), Some(b)) => b < a || (b == a && self.hash != seen.hash),
+            _ => false,
+        }
+    }
+
+    /// Where it is, for a message.
+    fn at(&self) -> String {
+        match (self.seq, self.file, self.bytes) {
+            (Some(s), _, _) => format!("row {s}"),
+            (None, Some(f), Some(b)) => format!("file {f} at byte {b}"),
+            _ => "-".to_string(),
+        }
+    }
 }
 
 /// One beat of the `heartbeat` chain.
@@ -149,7 +184,7 @@ pub struct WatchState {
     pub probe_gaps: Option<u64>,
     pub degradations: Vec<String>,
     /// The chains' heads, by chain.
-    pub heads: BTreeMap<String, (Option<u64>, String)>,
+    pub heads: BTreeMap<String, BeatHead>,
     /// The last beat was a stop.
     pub stopped: bool,
 }
@@ -475,18 +510,15 @@ pub fn check(
                 }
             }
         }
-        for (chain, (seq, hash)) in &l.heads {
+        for (chain, seen) in &l.heads {
             if let Some(h) = newest.heads.iter().find(|h| &h.chain == chain) {
-                let back = match (seq, h.seq) {
-                    (Some(a), Some(b)) => b < *a || (b == *a && &h.hash != hash),
-                    _ => false,
-                };
-                if back {
+                if h.went_back(seen) {
                     out.alerts.push(Alert::Replay(format!(
-                        "the {chain} chain's head went back: seq {:?} {} seen, now seq {:?} {}",
-                        seq,
-                        short(hash),
-                        h.seq,
+                        "the {chain} chain's head went back: {} {} seen, now {} {} (a tail \
+                         cut from the chain, or the chain rolled back, on the host)",
+                        seen.at(),
+                        short(&seen.hash),
+                        h.at(),
                         short(&h.hash)
                     )));
                 }
@@ -629,7 +661,7 @@ pub fn check(
         heads: newest
             .heads
             .iter()
-            .map(|h| (h.chain.clone(), (h.seq, h.hash.clone())))
+            .map(|h| (h.chain.clone(), h.clone()))
             .collect(),
         stopped: newest.kind == BeatKind::Stop,
     });

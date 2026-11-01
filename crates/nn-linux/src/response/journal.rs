@@ -411,11 +411,17 @@ impl ActionJournal {
         }
     }
 
-    /// The chain's head: the last row's entry hash (R12c-2: the heartbeat's
-    /// commitment of the head); `None` before the log is bound.
-    pub fn head(&self) -> Option<String> {
+    /// The chain's head — its position (the number its active file will
+    /// have as an archive, the bytes in it) and its last row's entry hash:
+    /// the heartbeat's commitment of the head (R12c-2; review of #476: a
+    /// tail cut from the chain shows off the host). `None` before the log
+    /// is bound.
+    pub fn head(&self) -> Option<(u64, u64, String)> {
         match &*self.inner.writer.lock() {
-            Writer::Log(log) => Some(log.last_hash().to_string()),
+            Writer::Log(log) => {
+                let (file, bytes) = log.position();
+                Some((file, bytes, log.last_hash().to_string()))
+            }
             _ => None,
         }
     }

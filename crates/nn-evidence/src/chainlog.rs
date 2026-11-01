@@ -1222,6 +1222,15 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         &self.active_path
     }
 
+    /// R12c-2 (lab PR 270; review of #476): where the chain's head is — the
+    /// number the active file will have as an archive, and the bytes in it.
+    /// Together they only grow while the chain is appended to (a rotation
+    /// raises the first and starts the second again), across a reopen too:
+    /// a tail cut from the active file, or a rotation undone, goes back.
+    pub fn position(&self) -> (u64, u64) {
+        (self.next_seq, self.active_bytes)
+    }
+
     /// R12c (lab PR 270): the fsync of the lines [`Self::append_deferred`]
     /// wrote, left to the caller, who does it with [`sync_detached`] once it
     /// no longer holds whatever guards this writer (other writers of the

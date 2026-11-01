@@ -48,6 +48,7 @@ fn beat(seq: u64, s: i64) -> HeartbeatRecord {
             chain: "audit".into(),
             seq: Some(100 + seq),
             hash: format!("{:064x}", 100 + seq),
+            ..BeatHead::default()
         }],
         stop_reason: None,
     }
@@ -391,8 +392,19 @@ fn a_future_beat_and_the_exit_code_order() {
 #[test]
 fn beat_rows_are_pinned() {
     assert_eq!(
-        serde_json::to_string(&beat(2, 30)).unwrap(),
-        r#"{"kind":"beat","seq":2,"ts":"2026-11-01T10:00:30.000000Z","agent_id":"0011","run":"aaaaaaaaaaaaaaaa","boot_id":"b007","uptime_ms":30000,"interval_secs":30,"version":"0.0.1","posture":"observing","trust_level":"L3","degradations":[],"decision_rounds":120,"decision_since_last_ms":400,"loss":[0,0,0,0,0,0,0],"actions":{"intents":0,"outcomes":0,"unwritten":0,"interrupted_at_boot":0,"in_flight":0},"probe_gaps":0,"heads":[{"chain":"audit","seq":102,"hash":"0000000000000000000000000000000000000000000000000000000000000066"}]}"#
+        serde_json::to_string(&{
+            let mut b = beat(2, 30);
+            b.heads.push(BeatHead {
+                chain: "actions".into(),
+                file: Some(3),
+                bytes: Some(8_192),
+                hash: "cd".repeat(32),
+                ..BeatHead::default()
+            });
+            b
+        })
+        .unwrap(),
+        r#"{"kind":"beat","seq":2,"ts":"2026-11-01T10:00:30.000000Z","agent_id":"0011","run":"aaaaaaaaaaaaaaaa","boot_id":"b007","uptime_ms":30000,"interval_secs":30,"version":"0.0.1","posture":"observing","trust_level":"L3","degradations":[],"decision_rounds":120,"decision_since_last_ms":400,"loss":[0,0,0,0,0,0,0],"actions":{"intents":0,"outcomes":0,"unwritten":0,"interrupted_at_boot":0,"in_flight":0},"probe_gaps":0,"heads":[{"chain":"audit","seq":102,"hash":"0000000000000000000000000000000000000000000000000000000000000066"},{"chain":"actions","file":3,"bytes":8192,"hash":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}]}"#
     );
     use crate::chainlog::ChainPayload;
     assert_eq!(HeartbeatRecord::KIND, "heartbeat");
@@ -450,4 +462,64 @@ fn a_chain_rebuilt_with_the_key_is_seen() {
     c.push(beat(4, 50));
     let r = check(Ok(&c.lines()), &c.pk, Some(&s3), at(62), &cfg());
     assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+}
+
+/// Review of #476: the actions chain's head is in each beat (its position
+/// and hash): a tail cut from it on the host shows as a position that went
+/// back; a rotation (the next file, from its start) does not; the same
+/// position with another hash is a rewrite.
+#[test]
+fn a_tail_cut_from_the_actions_chain_alerts() {
+    let actions = |file: u64, bytes: u64, h: u8| BeatHead {
+        chain: "actions".into(),
+        file: Some(file),
+        bytes: Some(bytes),
+        hash: format!("{h:02x}").repeat(32),
+        ..BeatHead::default()
+    };
+    // grown, then rotated (the next file, from its start): no alert
+    let heads = [(3, 8_192, 1), (3, 9_000, 2), (4, 300, 3)];
+    let base = Chain::new();
+    // the same beats signed with the same key are the same lines
+    let build = |next: Option<BeatHead>| {
+        let mut c = Chain::sharing_key(&base);
+        for (i, &(f, b, h)) in heads.iter().enumerate() {
+            let mut x = beat(i as u64 + 1, 30 * i as i64);
+            x.heads.push(actions(f, b, h));
+            c.push(x);
+        }
+        if let Some(n) = next {
+            let mut x = beat(4, 90);
+            x.heads.push(n);
+            c.push(x);
+        }
+        c
+    };
+    let c = build(None);
+    let lines = c.lines();
+    let mut s = check(Ok(&lines[..1]), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    for n in 2..=3 {
+        let r = check(Ok(&lines[..n]), &c.pk, Some(&s), at(30 * n as i64), &cfg());
+        assert!(r.alerts.is_empty(), "{r:?}");
+        s = r.state.unwrap();
+    }
+    // its tail cut
+    let cut = build(Some(actions(4, 100, 4)));
+    let r = check(Ok(&cut.lines()), &c.pk, Some(&s), at(91), &cfg());
+    assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+    assert!(r.alerts[0].detail().contains("file 4 at byte 100"), "{r:?}");
+    // the same position, another hash: rewritten
+    let rw = build(Some(actions(4, 300, 9)));
+    let r = check(Ok(&rw.lines()), &c.pk, Some(&s), at(91), &cfg());
+    assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+    // a rotation undone
+    let back = build(Some(actions(3, 9_500, 5)));
+    let r = check(Ok(&back.lines()), &c.pk, Some(&s), at(91), &cfg());
+    assert_eq!(kinds(&r), ["REPLAY"], "{r:?}");
+    // grown again: fine
+    let ok = build(Some(actions(4, 900, 6)));
+    let r = check(Ok(&ok.lines()), &c.pk, Some(&s), at(91), &cfg());
+    assert!(r.alerts.is_empty(), "{r:?}");
 }

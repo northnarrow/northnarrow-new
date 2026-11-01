@@ -95,16 +95,26 @@ fn the_heartbeat_chain_s_line_is_pinned() {
         loss: vec![Some(0), Some(0), Some(0), Some(0), Some(1), None, None],
         actions: BeatActions::default(),
         probe_gaps: Some(0),
-        heads: vec![BeatHead {
-            chain: "audit".into(),
-            seq: Some(41),
-            hash: "ab".repeat(32),
-        }],
+        heads: vec![
+            BeatHead {
+                chain: "audit".into(),
+                seq: Some(41),
+                hash: "ab".repeat(32),
+                ..BeatHead::default()
+            },
+            BeatHead {
+                chain: "actions".into(),
+                file: Some(3),
+                bytes: Some(8_192),
+                hash: "cd".repeat(32),
+                ..BeatHead::default()
+            },
+        ],
         stop_reason: None,
     };
     assert_eq!(first_line(row), HEARTBEAT_LINE);
 }
 
-const HEARTBEAT_LINE: &str = r#"{"kind":"start","seq":1,"ts":"2026-11-01T10:00:00.000000Z","agent_id":"11111111111111111111111111111111","run":"00112233aabbccdd","boot_id":"b007","uptime_ms":1500,"interval_secs":30,"version":"0.0.1","posture":"observing","trust_level":"L3","degradations":[],"decision_rounds":3,"decision_since_last_ms":120,"loss":[0,0,0,0,1,null,null],"actions":{"intents":0,"outcomes":0,"unwritten":0,"interrupted_at_boot":0,"in_flight":0},"probe_gaps":0,"heads":[{"chain":"audit","seq":41,"hash":"abababababababababababababababababababababababababababababababab"}],"fmt_ver":3,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"1c97df256a7a9819d89b4ddf324afad90d7b4aa06a3982344e03829bbb21b9d6","agent_sig":"IZCTEuc4zjFXbynYFew0dbTeUXfcJ7FAT9pvpyV66Iw/Pcpq+bfLPC3ND/wVXrE4OQJRre/WiC8ut/WpedAJCA=="}"#;
+const HEARTBEAT_LINE: &str = r#"{"kind":"start","seq":1,"ts":"2026-11-01T10:00:00.000000Z","agent_id":"11111111111111111111111111111111","run":"00112233aabbccdd","boot_id":"b007","uptime_ms":1500,"interval_secs":30,"version":"0.0.1","posture":"observing","trust_level":"L3","degradations":[],"decision_rounds":3,"decision_since_last_ms":120,"loss":[0,0,0,0,1,null,null],"actions":{"intents":0,"outcomes":0,"unwritten":0,"interrupted_at_boot":0,"in_flight":0},"probe_gaps":0,"heads":[{"chain":"audit","seq":41,"hash":"abababababababababababababababababababababababababababababababab"},{"chain":"actions","file":3,"bytes":8192,"hash":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}],"fmt_ver":3,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"0f492909639aaf122a90140c45bb3cc259c41428211d8671524b3aff0ba0d909","agent_sig":"wMXMw/j7E4ct3AQvjMCm0QTwbm0uqy5uG64SF4o5OHlv78dGkJEJ84++0/GKCOl+oFGrXz0cFC/t+cvgyLieDg=="}"#;
 
 const ACTIONS_LINE: &str = r#"{"row":"intent","run":"00112233aabbccdd","action":7,"ts":"2026-10-31T23:59:00.000000Z","intent":{"source":"rule","response":"KillProcessTree","pid":4242,"start_ns":1000000,"severity":"critical","why":["NN-L-CANARY-001"],"queued_us":120},"fmt_ver":3,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"dc9c721c272348656a260e7c88b4faddc291162d8b5530f87ff02c695cb92212","agent_sig":"I/MGmA1RikaJSPM0+hYHHc35Eun2mk9UuH0DhJUh92iBhX2/1mwpvK1G3bsRG+zShfCxNEiwpbnif9tKRlzFBA=="}"#;
