@@ -865,6 +865,76 @@ fn manifest_of(f: &SourceFacts) -> CapabilityManifest {
     m
 }
 
+/// The re-check of #479: a worse state (its row signed at once) told from
+/// a better or an equal one (its row waits for the minute).
+#[test]
+fn a_worse_state_is_told_from_a_better_one() {
+    let m = manifest_of(&healthy());
+    assert!(!m.worsens_from(&m), "the same");
+    let mut r = m.clone();
+    r.degradations.reverse();
+    r.revision = 4;
+    assert!(!r.worsens_from(&m), "an order, a revision: not a state");
+    // the probe's gap, then its stale word: worse each; back: better
+    let mut f = healthy();
+    f.probe[1].1 = ProbeState::Gap;
+    let gap = manifest_of(&f);
+    assert!(gap.worsens_from(&m));
+    assert!(!m.worsens_from(&gap), "back");
+    f.probe[1].1 = ProbeState::Stale;
+    let stale = manifest_of(&f);
+    assert!(stale.worsens_from(&m));
+    assert!(
+        stale.worsens_from(&gap),
+        "the probe stopped: worse than a gap"
+    );
+    assert!(!m.worsens_from(&stale), "back");
+    // the probe's word alone, on a source whose state is already not
+    // invoked (the LSM not running)
+    let mut f = healthy();
+    f.lsm_runs = Some(false);
+    let off = manifest_of(&f);
+    f.probe[0].1 = ProbeState::Gap;
+    let off_gap = manifest_of(&f);
+    assert_eq!(
+        entry(&off.sources, "file_open").state.rank(),
+        entry(&off_gap.sources, "file_open").state.rank(),
+        "the same state"
+    );
+    assert!(off_gap.worsens_from(&off), "its word turned gap");
+    // a source on a lesser fallback: worse; back on its attach point: not
+    let mut f = healthy();
+    set(&mut f, note("dns", DNS_SENDMSG, Took::Fallback));
+    let partial = manifest_of(&f);
+    assert!(partial.worsens_from(&m));
+    assert!(!m.worsens_from(&partial));
+    // a source gone; a new source not ok; a new one ok is not worse
+    let mut gone = m.clone();
+    gone.sources.pop();
+    assert!(gone.worsens_from(&m));
+    assert!(!m.worsens_from(&gone), "it came back ok");
+    // one line new in each list, fewer deny hooks, a lower trust level
+    let worse: [fn(&mut CapabilityManifest); 9] = [
+        |x| x.missing.push("new".into()),
+        |x| x.fallbacks.push("new".into()),
+        |x| x.degradations.push("new".into()),
+        |x| x.content.push("new".into()),
+        |x| x.deny_hooks.missing.push("new".into()),
+        |x| x.deny_hooks.observe_missing.push("new".into()),
+        |x| x.deny_hooks.attached = x.deny_hooks.attached.saturating_sub(1),
+        |x| x.trust_level -= 1,
+        |x| x.sources[0].state = SourceState::Unknown,
+    ];
+    let mut base = m.clone();
+    base.deny_hooks.attached = 16;
+    for (i, w) in worse.iter().enumerate() {
+        let mut x = base.clone();
+        w(&mut x);
+        assert!(x.worsens_from(&base), "change {i}");
+        assert!(!base.worsens_from(&x), "change {i}, back");
+    }
+}
+
 /// The capabilities hash is of what the agent runs with: not of the
 /// revision's fields, not of the contract's terms, not of what an upgrade
 /// or a new kernel changes alone, not of the order of the lists without

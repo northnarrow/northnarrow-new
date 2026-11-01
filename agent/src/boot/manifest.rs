@@ -48,11 +48,14 @@ pub const CHANGE_OP: &str = "capability_manifest_change";
 /// is seen within this, plus the registry's own flush of a report made
 /// without the audit log, `degradation::FLUSH_PERIOD`).
 pub const REFRESH_PERIOD: Duration = Duration::from_secs(5);
-/// R13 (the review of #479, cost): change rows are signed at most this
-/// often — the changes between two rows folded into the next, each counted
-/// (`changes`) and named (`change`); an adapter that ended, and the stop,
-/// sign at once. The running view (the status, the beats) shows a change at
-/// once (`unsigned_changes` until its row).
+/// R13 (the review of #479, cost): change rows for a better state are
+/// signed at most this often — the changes between two rows folded into
+/// the next, each counted (`changes`) and named (`change`). A worse state
+/// (the re-check of #479, `CapabilityManifest::worsens_from`) is signed at
+/// once, unless the same state was signed within this (an oscillation); an
+/// adapter that ended, and the stop, sign at once. The running view (the
+/// status, the beats) shows a change at once (`unsigned_changes` until its
+/// row).
 pub const CHANGE_ROW_EVERY: Duration = Duration::from_secs(60);
 
 /// The manifest's types, nn-core's since R13 (the plan's
@@ -202,6 +205,10 @@ struct Live {
     pending: u64,
     pending_lines: Vec<String>,
     terminated: Vec<String>,
+    /// The capabilities hashes signed within [`CHANGE_ROW_EVERY`], and
+    /// when: a worse state among them is an oscillation, folded into the
+    /// next row (the re-check of #479).
+    recent: Vec<(String, std::time::Instant)>,
 }
 
 /// The signed manifest of this run, its newest revision (R11c, lab PR 264:
@@ -229,7 +236,9 @@ impl SignedManifest {
         let entry_hash = sign(audit_log, &manifest);
         let mut live = self.0.lock();
         live.audit = audit_log.cloned();
-        live.signed = Some((manifest.clone(), std::time::Instant::now()));
+        let now = std::time::Instant::now();
+        live.recent = vec![(manifest.hash.clone(), now)];
+        live.signed = Some((manifest.clone(), now));
         live.current = Some((manifest, entry_hash.clone()));
         live.pending = 0;
         live.pending_lines.clear();
@@ -245,10 +254,13 @@ impl SignedManifest {
     }
 
     /// R13: build the manifest again. A change shows at once in the
-    /// running view and is signed as the next revision (op [`CHANGE_OP`])
-    /// when [`CHANGE_ROW_EVERY`] has passed since the last row — the
-    /// changes in between folded into it, counted and named, even those
-    /// undone before it. Returns the revision signed, if one was.
+    /// running view and is signed as the next revision (op [`CHANGE_OP`]):
+    /// at once when it makes the state worse and that state was not signed
+    /// within [`CHANGE_ROW_EVERY`] (the re-check of #479: a real loss's row
+    /// does not wait, nor die with a crash in the minute); otherwise when
+    /// [`CHANGE_ROW_EVERY`] has passed since the last row — the changes in
+    /// between folded into it, counted and named, even those undone before
+    /// it. Returns the revision signed, if one was.
     pub fn refresh(&self) -> Option<u64> {
         self.refresh_at(std::time::Instant::now(), false)
     }
@@ -265,7 +277,14 @@ impl SignedManifest {
         let built = build(inputs, &live.terminated);
         let (view, entry_hash) = live.current.clone()?;
         let (signed, signed_at) = live.signed.clone()?;
+        live.recent
+            .retain(|(_, at)| now.saturating_duration_since(*at) < CHANGE_ROW_EVERY);
+        let mut at_once = force;
         if built.hash != view.hash {
+            // a worse state not signed within the minute: its row now
+            if built.worsens_from(&view) && !live.recent.iter().any(|(h, _)| *h == built.hash) {
+                at_once = true;
+            }
             let lines = built.changes_from(&view);
             live.pending += 1;
             for l in lines {
@@ -281,13 +300,14 @@ impl SignedManifest {
             warn!(
                 hash = %v.hash,
                 change = %v.change.join("; "),
-                "the capability manifest changed (signed capability_manifest_change within {} s)",
-                CHANGE_ROW_EVERY.as_secs()
+                worse = at_once,
+                "the capability manifest changed (signed capability_manifest_change {})",
+                if at_once { "now" } else { "within a minute" }
             );
             live.current = Some((v, entry_hash.clone()));
         }
         if live.pending == 0
-            || (!force && now.saturating_duration_since(signed_at) < CHANGE_ROW_EVERY)
+            || (!at_once && now.saturating_duration_since(signed_at) < CHANGE_ROW_EVERY)
         {
             return None;
         }
@@ -307,6 +327,7 @@ impl SignedManifest {
         // the terms by the contract's hash (the boot's row carries them)
         let entry_hash = sign_change(live.audit.as_ref(), &row.without_terms());
         let revision = row.revision;
+        live.recent.push((row.hash.clone(), now));
         live.signed = Some((row.clone(), now));
         live.current = Some((row, entry_hash));
         Some(revision)
@@ -351,6 +372,8 @@ impl SignedManifest {
             revision: m.revision,
             settled: m.settled,
             contract: Some(m.contract_hash.clone()),
+            contract_version: Some(m.contract_version),
+            kernel: Some(m.kernel.clone()),
         })
     }
 

@@ -212,44 +212,72 @@ fn a_change_while_running_is_a_signed_revision() {
         None,
         "nothing changed"
     );
-    // a change: in the view at once, not signed within the minute
+    // a worse state (a degradation), right after the last row: signed at
+    // once (the re-check of #479: a real loss's row does not wait)
     let detail = format!("r13 test {}", std::process::id());
     crate::boot::degradation::report("r13_test", &detail);
-    assert_eq!(m.refresh_at(t0, false), None, "within the minute");
-    let view = m.current().unwrap();
-    assert_ne!(view.hash, before.hash);
-    assert_eq!(view.revision, before.revision, "not signed yet");
-    assert!(view.unsigned_changes >= 1);
+    let rev = m
+        .refresh_at(t0, false)
+        .expect("a worse state's row at once");
+    assert_eq!(rev, before.revision + 1);
+    let now = m.current().unwrap();
+    assert_ne!(now.hash, before.hash);
+    assert_eq!(now.previous_hash.as_deref(), Some(before.hash.as_str()));
+    assert_eq!(now.unsigned_changes, 0);
     assert!(
-        view.change
+        now.change
             .contains(&format!("degradation + r13_test: {detail}")),
         "{:?}",
-        view.change
+        now.change
     );
+    assert_eq!(m.beat().unwrap().hash, now.hash, "the beats see it");
+    let worse = now.clone();
+    // an adapter ends (worse: at once), then comes back (better: in the
+    // view at once, its row within the minute)
+    m.0.lock().terminated.push("net_drain".into());
+    let rev_ended = m.refresh_at(t0, false).expect("worse: at once");
+    assert_eq!(rev_ended, rev + 1);
+    let ended = m.current().unwrap();
+    m.0.lock().terminated.clear();
+    assert_eq!(m.refresh_at(t0, false), None, "better: within the minute");
+    let view = m.current().unwrap();
+    assert_eq!(view.hash, worse.hash, "back as it was");
+    assert_eq!(view.revision, rev_ended, "not signed yet");
+    assert_eq!(view.unsigned_changes, 1);
     assert_eq!(
         m.beat().unwrap().hash,
         view.hash,
         "the beats see it at once"
     );
-    // a second change in the same minute, then the row
-    let detail2 = format!("r13 test two {}", std::process::id());
-    crate::boot::degradation::report("r13_test", &detail2);
+    // ended again within the minute: a state signed in it — an
+    // oscillation, folded
+    m.0.lock().terminated.push("net_drain".into());
+    assert_eq!(m.refresh_at(t0, false), None, "an oscillation waits");
+    assert_eq!(m.current().unwrap().hash, ended.hash);
+    m.0.lock().terminated.clear();
     assert_eq!(m.refresh_at(t0, false), None);
-    let rev = m
+    let rev_back = m
         .refresh_at(t0 + CHANGE_ROW_EVERY + Duration::from_secs(1), false)
         .expect("a row past the minute");
-    assert_eq!(rev, before.revision + 1);
+    assert_eq!(rev_back, rev_ended + 1);
     let now = m.current().unwrap();
-    assert_eq!(now.previous_hash.as_deref(), Some(before.hash.as_str()));
-    assert!(now.changes >= 2, "both counted: {}", now.changes);
-    assert_eq!(now.unsigned_changes, 0);
-    for d in [&detail, &detail2] {
-        assert!(
-            now.change.contains(&format!("degradation + r13_test: {d}")),
-            "{:?}",
-            now.change
-        );
-    }
+    assert_eq!(now.hash, worse.hash);
+    assert_eq!(now.previous_hash.as_deref(), Some(ended.hash.as_str()));
+    assert_eq!((now.changes, now.unsigned_changes), (3, 0), "each counted");
+    // a second worse state right after that row: at once again
+    let detail2 = format!("r13 test two {}", std::process::id());
+    crate::boot::degradation::report("r13_test", &detail2);
+    let rev = m
+        .refresh_at(t0 + CHANGE_ROW_EVERY + Duration::from_secs(1), false)
+        .expect("worse, right after a row: at once");
+    assert_eq!(rev, rev_back + 1);
+    let now = m.current().unwrap();
+    assert!(
+        now.change
+            .contains(&format!("degradation + r13_test: {detail2}")),
+        "{:?}",
+        now.change
+    );
     // an adapter that ends: signed at once
     let rev2 = m.adapters_terminated(&["fim_drain"]).expect("a change");
     assert!(rev2 > rev);
@@ -289,9 +317,10 @@ fn a_change_while_running_is_a_signed_revision() {
     assert_eq!(beat.revision, rev2);
 }
 
-/// The review of #479: a change undone before its row is still signed and
-/// counted (the row's hash the one before it); the stop signs what is
-/// pending.
+/// The review of #479 and its re-check: a worse state is signed at once;
+/// the changes after it within the minute (back, worse again: the same
+/// state, an oscillation) are folded into one row, each counted, the row's
+/// hash the one before them all; the stop signs what is pending.
 #[test]
 fn a_change_undone_within_the_minute_is_still_counted() {
     let m = SignedManifest::default();
@@ -300,16 +329,26 @@ fn a_change_undone_within_the_minute_is_still_counted() {
     let before = m.current().unwrap();
     let t0 = std::time::Instant::now();
     m.0.lock().terminated.push("net_drain".into());
-    assert_eq!(m.refresh_at(t0, false), None);
-    m.0.lock().terminated.clear();
-    assert_eq!(m.refresh_at(t0, false), None);
+    assert_eq!(
+        m.refresh_at(t0, false),
+        Some(before.revision + 1),
+        "worse: at once"
+    );
+    for (i, ended) in [false, true, false].into_iter().enumerate() {
+        if ended {
+            m.0.lock().terminated.push("net_drain".into());
+        } else {
+            m.0.lock().terminated.clear();
+        }
+        assert_eq!(m.refresh_at(t0, false), None, "change {i}: folded");
+    }
     let view = m.current().unwrap();
     assert_eq!(view.hash, before.hash, "back as it was");
-    assert_eq!(view.unsigned_changes, 2);
+    assert_eq!(view.unsigned_changes, 3);
     let rev = m.flush().expect("the stop signs it");
     let row = m.current().unwrap();
-    assert_eq!(rev, before.revision + 1);
-    assert_eq!((row.changes, row.hash.as_str()), (2, before.hash.as_str()));
+    assert_eq!(rev, before.revision + 2);
+    assert_eq!((row.changes, row.hash.as_str()), (3, before.hash.as_str()));
     assert_eq!(row.change.len(), 2, "{:?}", row.change);
     assert_eq!(m.flush(), None, "nothing pending");
 }
@@ -591,8 +630,11 @@ fn the_stop_beat_signs_what_is_pending() {
     let m = SignedManifest::default();
     m.arm(None, inputs(active(), SelfTestOutcome::Denied));
     settle(&m);
-    let before = m.current().unwrap().revision;
+    // an adapter ended (signed at once), then back: a better state, its
+    // row within the minute
     m.0.lock().terminated.push("net_drain".into());
+    let before = m.flush().expect("signed");
+    m.0.lock().terminated.clear();
     let dir = tempfile::tempdir().unwrap();
     let key =
         crate::keys::AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();

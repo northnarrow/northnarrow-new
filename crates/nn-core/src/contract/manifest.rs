@@ -842,6 +842,41 @@ impl CapabilityManifest {
         out
     }
 
+    /// The re-check of #479: whether `self` is worse than `before` — a
+    /// source in a worse state, gone, or new and not `ok`; a probe's word
+    /// turned `gap` or `stale`; a line new in `missing`, `fallbacks`, the
+    /// degradations, the content or the deny hooks' missing ones; fewer
+    /// deny hooks attached; a lower trust level. A worse change's row is
+    /// signed at once, a better one's waits for the minute.
+    pub fn worsens_from(&self, before: &CapabilityManifest) -> bool {
+        let sources = self.sources.iter().any(|s| {
+            match before.sources.iter().find(|b| b.source == s.source) {
+                Some(b) => {
+                    s.state.rank() > b.state.rank()
+                        || (matches!(s.probe, Some(ProbeState::Gap | ProbeState::Stale))
+                            && s.probe != b.probe)
+                }
+                None => s.state.rank() > 0,
+            }
+        }) || before
+            .sources
+            .iter()
+            .any(|b| !self.sources.iter().any(|s| s.source == b.source));
+        let new_line = |now: &[String], then: &[String]| now.iter().any(|x| !then.contains(x));
+        sources
+            || new_line(&self.missing, &before.missing)
+            || new_line(&self.fallbacks, &before.fallbacks)
+            || new_line(&self.degradations, &before.degradations)
+            || new_line(&self.content, &before.content)
+            || new_line(&self.deny_hooks.missing, &before.deny_hooks.missing)
+            || new_line(
+                &self.deny_hooks.observe_missing,
+                &before.deny_hooks.observe_missing,
+            )
+            || self.deny_hooks.attached < before.deny_hooks.attached
+            || self.trust_level < before.trust_level
+    }
+
     /// Every probed source has the probe's word (or the probe is off).
     pub fn probe_settled(&self) -> bool {
         !self
