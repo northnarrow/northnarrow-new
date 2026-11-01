@@ -707,7 +707,8 @@ mod tests {
 
     #[test]
     fn every_weaker_hello_is_refused() {
-        let cases: Vec<(&str, fn(&mut WorkerHello))> = vec![
+        type Weaken = fn(&mut WorkerHello);
+        let cases: Vec<(&str, Weaken)> = vec![
             ("version", |h| h.version += 1),
             ("pid", |h| h.pid += 1),
             ("uid", |h| h.sandbox.uid = 0),

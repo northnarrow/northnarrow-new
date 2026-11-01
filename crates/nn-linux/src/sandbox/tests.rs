@@ -115,7 +115,8 @@ fn allowed_calls_run_under_the_parse_filter() {
 #[test]
 fn every_escape_kills_the_process() {
     let prog = parse_filter(3);
-    let cases: [(&str, fn() -> i32); 9] = [
+    type Body = fn() -> i32;
+    let cases: [(&str, Body); 9] = [
         ("openat", || {
             // SAFETY: plain syscall.
             unsafe {
