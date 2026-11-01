@@ -584,3 +584,29 @@ fn a_late_beat_says_the_agent_stood_still() {
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(401), &cfg());
     assert!(r.alerts.is_empty(), "{r:?}");
 }
+
+/// The read-back of a head (`chainlog::holds_line_ending_at`): the line
+/// that ends at the byte named, with the hash named — not any line there.
+#[test]
+fn a_head_is_held_only_by_its_own_line() {
+    use crate::chainlog::holds_line_ending_at;
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("c.jsonl");
+    let a = r#"{"entry_hash":"aaaa"}"#;
+    let b = r#"{"entry_hash":"bbbb"}"#;
+    std::fs::write(&p, format!("{a}\n{b}\n")).unwrap();
+    let end = (a.len() + b.len() + 2) as u64;
+    assert!(holds_line_ending_at(&p, end, "bbbb").unwrap());
+    assert!(holds_line_ending_at(&p, (a.len() + 1) as u64, "aaaa").unwrap());
+    // rewritten in place, the same length: another hash at that byte
+    let b2 = r#"{"entry_hash":"cccc"}"#;
+    std::fs::write(&p, format!("{a}\n{b2}\n")).unwrap();
+    assert!(!holds_line_ending_at(&p, end, "bbbb").unwrap());
+    // cut, then appended past: mid-line at that byte
+    std::fs::write(&p, format!("{a}\n{{\"entry_hash\":\"dddd-longer\"}}\n")).unwrap();
+    assert!(!holds_line_ending_at(&p, end, "bbbb").unwrap());
+    // cut short of it
+    std::fs::write(&p, format!("{a}\n")).unwrap();
+    assert!(!holds_line_ending_at(&p, end, "bbbb").unwrap());
+    assert!(holds_line_ending_at(&dir.path().join("none"), 1, "x").is_err());
+}
