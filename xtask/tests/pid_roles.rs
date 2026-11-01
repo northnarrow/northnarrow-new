@@ -52,13 +52,52 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
     let task_kill = fs::read_to_string(dir.join("task_kill.rs")).unwrap();
     assert!(task_kill.contains("northnarrow_common::wire::pid_role::is_protected(pid_role(tgid))"));
     assert!(task_kill.contains("northnarrow_common::wire::pid_role::is_exempt(pid_role(tgid))"));
-    // every hook asks one of the two
-    let mut asks = 0;
-    for f in rs_files(&dir) {
-        let code = strip_comments(&fs::read_to_string(&f).unwrap());
-        asks += code.matches("is_protected_pid(").count() + code.matches("is_exempt_pid(").count();
+    // each hook asks the right question: a target is protected, a caller
+    // exempt — a caller asked "protected" would make a worker exempt
+    // (`(file, is_protected_pid( calls, is_exempt_pid( calls)`, the
+    // definitions in task_kill.rs counted)
+    for (file, protected, exempt) in [
+        ("task_kill.rs", 2, 3),
+        ("ptrace_check.rs", 1, 1),
+        ("inode_protect.rs", 0, 1),
+        ("bpf_defense.rs", 0, 1),
+        ("fim_watch.rs", 0, 1),
+        ("execq.rs", 0, 2),
+    ] {
+        let code = strip_comments(&fs::read_to_string(dir.join(file)).unwrap());
+        assert_eq!(
+            (
+                code.matches("is_protected_pid(").count(),
+                code.matches("is_exempt_pid(").count()
+            ),
+            (protected, exempt),
+            "{file}: the roles asked"
+        );
     }
-    assert!(asks >= 10, "the hooks ask the roles: {asks}");
+    let mut others = Vec::new();
+    for f in rs_files(&dir) {
+        let name = f.file_name().unwrap().to_string_lossy().to_string();
+        if [
+            "task_kill.rs",
+            "ptrace_check.rs",
+            "inode_protect.rs",
+            "bpf_defense.rs",
+            "fim_watch.rs",
+            "execq.rs",
+        ]
+        .contains(&name.as_str())
+        {
+            continue;
+        }
+        let code = strip_comments(&fs::read_to_string(&f).unwrap());
+        if code.contains("is_protected_pid(") || code.contains("is_exempt_pid(") {
+            others.push(name);
+        }
+    }
+    assert!(
+        others.is_empty(),
+        "a hook not in the table asks the roles: {others:?}"
+    );
 }
 
 #[test]

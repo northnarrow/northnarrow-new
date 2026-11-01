@@ -5,7 +5,7 @@ use nn_model::EventClass;
 use super::manifest::{
     class_entries, fallbacks_and_missing, source_entries, AttachedOn, CapabilityManifest,
     DenyHooks, Evidence, HostCheck, ProbeState, SensorEntry, SourceFacts, SourceState, Took,
-    MANIFEST_VERSION,
+    WorkerEntry, WorkerState, MANIFEST_VERSION,
 };
 use super::*;
 
@@ -1122,3 +1122,118 @@ const MANIFEST_HASHES: (&str, &str) = (
     "3e228be2458b5f5b6055dc11189cf28938e7ba1832acb5e55ca18ee65fa671da",
 );
 const MANIFEST_JSON: &str = r#"{"manifest_version":2,"agent_version":"0.0.1","kernel":"6.8.0","btf":true,"btf_offsets_resolved":40,"btf_offsets_drifted":0,"btf_offsets_absent":[],"active_lsms":"capability,bpf","bpf_lsm":"active","deny_hooks":{"expected":0,"attached":0,"missing":[],"observe_missing":[]},"deny_self_test":"denied","bpf_guard":"enforce","sensors":[{"sensor":"file_open","attach":"lsm:file_open (FIM observer)","took":{"as":"whole"}},{"sensor":"deny_hooks","attach":"lsm:deny hooks","took":{"as":"whole"}},{"sensor":"dns","attach":"kprobe:udp_send_skb+udp_v6_send_skb","took":{"as":"whole"}},{"sensor":"dns_nss","attach":"uprobe:libnss_resolve.so.2","took":{"as":"whole"}},{"sensor":"exploit_guard","attach":"lsm:capable, fentry:commit_creds (lite)","took":{"as":"whole"}},{"sensor":"tcp_connect","attach":"kprobe:tcp_v4_connect+tcp_v6_connect","took":{"as":"whole"}}],"host_hardening":[{"id":"lockdown","status":"warn","value":"[none]"}],"detect_only":false,"degradations":["b","a"],"trust_level":3,"trust_reasons":[],"contract_version":1,"sources":[{"source":"dns_query","classes":["network"],"attach":"kprobe:udp_send_skb+udp_v6_send_skb","on":"primary","state":"attached_not_invoked","why":["telemetry probe: its dns event did not reach the pipeline within the round's deadline (signed telemetry_gap)"],"probe":"gap","evidence":"attach_only"}],"classes":[{"class":"network","queue":"P3","queue_capacity":8192,"when_full":"drop the new event","decision_budget_ms":500,"sources":["dns_query","tcp_connect"],"sync_verdict":"none (the event reports what happened)","on_failure":"blind","loss_counters":[1,3,4,5],"state":"attached_not_invoked"}],"fallbacks":[],"missing":["dns_query: attached, not invoked (kprobe:udp_send_skb+udp_v6_send_skb) — telemetry probe: its dns event did not reach the pipeline within the round's deadline (signed telemetry_gap)"],"content":[],"telemetry_probe":"every 60 s","settled":true,"contract_hash":"3e228be2458b5f5b6055dc11189cf28938e7ba1832acb5e55ca18ee65fa671da","revision":1,"hash":"a718b2c510d027d0e100765799315db68159c50a9b2895b6f8ba506957c00c4f","previous_hash":"abababababababababababababababababababababababababababababababab","change":["source dns_query: telemetry probe seen → gap"],"changes":2}"#;
+
+/// R14a: a worker kind's entry — its state, the sandbox it declared.
+fn with_worker(
+    m: &CapabilityManifest,
+    state: WorkerState,
+    sandbox: Option<nn_proto::ipc::SandboxLevel>,
+) -> CapabilityManifest {
+    let mut m = m.clone();
+    m.workers = vec![WorkerEntry {
+        kind: "parse".to_string(),
+        state,
+        why: String::new(),
+        kernel_landlock_abi: 4,
+        sandbox,
+    }];
+    m.hash = m.content_hash();
+    m
+}
+
+fn level(abi: u8) -> nn_proto::ipc::SandboxLevel {
+    nn_proto::ipc::SandboxLevel {
+        landlock_abi: abi,
+        landlock: nn_proto::ipc::LandlockEnforced::Full,
+        fs_denied: abi >= 1,
+        net_denied: abi >= 4,
+        scoped: abi >= 6,
+        seccomp: true,
+        no_new_privs: true,
+        uid: 990,
+        gid: 990,
+        ..Default::default()
+    }
+}
+
+/// R14a: a worker kind in a worse state, gone, or sandboxed less is a
+/// worse manifest (its row at once), named in `change`; a restart that ends
+/// between two builds changes nothing; a ready worker is in the hash.
+#[test]
+fn a_worker_worse_or_gone_or_less_sandboxed_is_worse_and_named() {
+    let base = manifest_of(&healthy());
+    let ready = with_worker(&base, WorkerState::Ready, Some(level(4)));
+    assert!(!ready.worsens_from(&ready));
+    assert_ne!(
+        ready.content_hash(),
+        base.content_hash(),
+        "the worker is in the hash"
+    );
+    for (state, worse) in [
+        (WorkerState::Restarting, true),
+        (WorkerState::Disabled, true),
+        (WorkerState::Unavailable, true),
+        (WorkerState::Stopped, true),
+    ] {
+        let w = with_worker(&base, state, Some(level(4)));
+        assert_eq!(w.worsens_from(&ready), worse, "{state:?}");
+        assert!(!ready.worsens_from(&w), "{state:?} → ready is better");
+        let lines = w.changes_from(&ready);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("worker parse: ready → ") && l.contains(state.name())),
+            "{state:?}: {lines:?}"
+        );
+    }
+    assert!(WorkerState::Disabled.rank() > WorkerState::Restarting.rank());
+    assert!(WorkerState::Unavailable.rank() > WorkerState::Disabled.rank());
+    // gone: worse and named; new and not ready: worse
+    assert!(base.worsens_from(&ready));
+    assert!(base
+        .changes_from(&ready)
+        .contains(&"worker parse: gone".to_string()));
+    let new_down = with_worker(&base, WorkerState::Unavailable, None);
+    assert!(new_down.worsens_from(&base));
+    assert!(new_down
+        .changes_from(&base)
+        .iter()
+        .any(|l| l == "worker parse: new (unavailable)"));
+    assert!(!ready.worsens_from(&base), "a new ready worker is no loss");
+    // the same state, less sandbox: worse, named
+    for weaker in [
+        level(1),
+        {
+            let mut l = level(4);
+            l.seccomp = false;
+            l
+        },
+        {
+            let mut l = level(4);
+            l.net_denied = false;
+            l
+        },
+        {
+            let mut l = level(4);
+            l.fs_denied = false;
+            l
+        },
+    ] {
+        let w = with_worker(&base, WorkerState::Ready, Some(weaker));
+        assert!(w.worsens_from(&ready), "{w:?}");
+        assert!(w
+            .changes_from(&ready)
+            .iter()
+            .any(|l| l.starts_with("worker parse: sandbox ")));
+    }
+    let scoped = with_worker(&base, WorkerState::Ready, Some(level(6)));
+    assert!(!scoped.worsens_from(&ready), "more sandbox is better");
+    assert!(ready.worsens_from(&scoped), "and back is worse");
+    // the why is shown with the state
+    let mut d = with_worker(&base, WorkerState::Disabled, Some(level(4)));
+    d.workers[0].why = "5 failures in a row".into();
+    assert!(d
+        .changes_from(&ready)
+        .iter()
+        .any(|l| l.ends_with("(5 failures in a row)")));
+}

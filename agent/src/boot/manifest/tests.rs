@@ -741,3 +741,35 @@ fn the_stop_beat_signs_what_is_pending() {
     assert_eq!(now.unsigned_changes, 0);
     assert_eq!(now.revision, before + 1, "signed by the stop");
 }
+
+/// R14a: each worker kind in the manifest — the supervisor's state, why, the
+/// kernel's Landlock ABI; a kind that cannot start is `unavailable` with its
+/// reason, and the stop is `stopped`.
+#[test]
+fn the_workers_entries_say_their_state_and_why() {
+    use nn_core::contract::manifest::WorkerState;
+    use nn_linux::worker::supervisor::{Config, ImageLauncher, NoPidRoles};
+    let w = nn_linux::worker::Workers::new(Config {
+        launcher: Arc::new(ImageLauncher {
+            image: None,
+            account: Err("no user".into()),
+            extra_args: Vec::new(),
+        }),
+        roles: Arc::new(NoPidRoles),
+        report: Arc::new(|_: &str, _: &str| {}),
+        kinds: vec![nn_proto::ipc::WorkerKind::Parse],
+        debug_dir: None,
+    });
+    let e = worker_entries(&w);
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].kind, "parse");
+    assert_eq!(e[0].state, WorkerState::Unavailable);
+    assert!(e[0].why.contains("could not be opened"), "{:?}", e[0].why);
+    assert_eq!(
+        e[0].kernel_landlock_abi,
+        nn_linux::sandbox::kernel_landlock_abi()
+    );
+    assert!(e[0].sandbox.is_none());
+    w.stop();
+    assert_eq!(worker_entries(&w)[0].state, WorkerState::Stopped);
+}
