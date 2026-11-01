@@ -121,7 +121,7 @@ scenario netcut SILENT 180 g 'sudo systemd-run --quiet --on-active=150 iptables 
 wait_ok "$(now)" 240 || true
 # 5. the agent stopped (SIGTERM through a trusted-installer window): its
 #    signed stop beat; then started again (a start beat, a new run)
-scenario stop STOPPED 60 g 'k=$(for f in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r $f && { echo $f; break; }; done); sudo /usr/local/bin/nn-admin trusted-installer-grant --key $k --window-secs 120 --agent-id-file /etc/northnarrow/agent_id --socket /run/northnarrow/admin.sock >/dev/null && sudo systemctl kill -s SIGTERM northnarrow-watchdog && sleep 1 && sudo systemctl kill -s SIGTERM northnarrow-agent'
+scenario stop STOPPED 60 g 'k=$(for f in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r $f && { echo $f; break; }; done); sudo /usr/local/bin/nn-admin trusted-installer-grant --key $k --window-secs 120 >/dev/null && sudo systemctl kill -s SIGTERM northnarrow-watchdog && sleep 1 && sudo systemctl kill -s SIGTERM northnarrow-agent'
 g 'sudo systemctl start northnarrow-agent northnarrow-watchdog'; wait_ok "$(now)" 120 || true
 sleep 10
 kill "$WPID" 2>/dev/null; trap - EXIT
