@@ -64,8 +64,9 @@ admin row of the audit log, follows the run's start rows (`agent_boot`,
 `capability_manifest`, the start beat's `telemetry_loss`). Until then a
 client finds no socket and waits, as install.sh (`ADMIN_SOCKET_WAIT`) and
 the watchdog already did for the boot before it. The stop's rows, in order:
-the capability manifest's pending changes (its stop flush), the stop beat's
-`telemetry_loss at: stop`, `agent_stop` last.
+the event bus's close (its drops not signed yet, then `event_bus_stop` when
+it still held events), the stop beat (the capability manifest's pending
+changes, its `telemetry_loss at: stop`), `agent_stop` last.
 
 R14a: before any phase — before the runtime is built — the agent opens
 its own binary (`/proc/self/exe`, read-only) and keeps the descriptor: its

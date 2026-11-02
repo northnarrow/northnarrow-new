@@ -786,11 +786,11 @@ fn wait_for_marker(path: &Path, deadline: Duration) -> Option<String> {
 /// start beat. The boot binds the admin socket only once the agent is
 /// armed and its start beat is written (`boot::admin`), and this test now
 /// waits for the agent to end (it stops itself on the signed shutdown,
-/// exit 0) and asserts the exact tail the stop writes after the op: the
-/// capability manifest's pending changes signed by the stop's flush (none
-/// or more), the stop beat's `telemetry_loss` (`at: stop`), then
-/// `agent_stop` (`reason: admin_shutdown`), last — never a start row, and
-/// no other row.
+/// exit 0) and asserts the exact tail the stop writes after the op, in its
+/// order: the event bus's close (its unsigned drops, `event_bus_stop` when
+/// it still held events), the stop beat (the capability manifest's pending
+/// changes, its `telemetry_loss` at: stop), `agent_stop` (`reason:
+/// admin_shutdown`) last — never a start row, and no other row.
 #[test]
 fn shutdown_signed_round_trip() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -931,8 +931,15 @@ fn shutdown_signed_round_trip() {
         start_loss < at,
         "the start beat after the shutdown: {audit_body}"
     );
-    // the exact tail: the manifest's pending changes (the stop's flush),
-    // the stop beat's loss row, `agent_stop` last
+    // the exact tail: the stop's rows, in the order the stop writes them —
+    // 1. the event bus's close (`sensor.stop_bus()`): its drops not signed
+    //    yet (`event_bus_drop`, `event_bus_coalesced`, `event_bus_capped`),
+    //    then `event_bus_stop` when it still held events (round i24's run 4:
+    //    ten events queued at the close);
+    // 2. the stop beat (`heartbeat.stop`): the capability manifest's pending
+    //    changes (`capability_manifest_change`, flushed), then its
+    //    `telemetry_loss` (at: stop), exactly one;
+    // 3. `agent_stop` (reason admin_shutdown), last.
     let tail = &rows[at + 1..];
     let shown = || {
         tail.iter()
@@ -940,20 +947,31 @@ fn shutdown_signed_round_trip() {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let changes = tail
-        .iter()
-        .take_while(|r| op(r) == "capability_manifest_change")
-        .count();
-    let rest = &tail[changes..];
+    let mut i = 0;
+    let mut skip = |ops: &[&str], at_most: usize| {
+        let mut n = 0;
+        while i < tail.len() && n < at_most && ops.contains(&op(&tail[i]).as_str()) {
+            i += 1;
+            n += 1;
+        }
+    };
+    skip(
+        &["event_bus_drop", "event_bus_coalesced", "event_bus_capped"],
+        usize::MAX,
+    );
+    skip(&["event_bus_stop"], 1);
+    skip(&["capability_manifest_change"], usize::MAX);
+    let rest = &tail[i..];
     assert_eq!(
         rest.len(),
         2,
-        "the stop's rows after op=shutdown:\n{}",
+        "the stop's rows after op=shutdown (no other row):\n{}",
         shown()
     );
     assert!(
         op(&rest[0]) == "telemetry_loss" && rest[0]["extra"]["at"] == "stop",
-        "the stop beat's telemetry_loss (at: stop) after the manifest's changes:\n{}",
+        "the stop beat's telemetry_loss (at: stop) after the bus's close and the manifest's \
+         changes:\n{}",
         shown()
     );
     assert!(
