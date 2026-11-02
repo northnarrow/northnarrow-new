@@ -1206,6 +1206,17 @@ mod tests {
             alpn: vec![],
         });
         assert!(check_response(&req, &ans).is_err());
+        // a two-byte character as the ALPN pair, everything else in its
+        // place: 36 bytes, refused for not being ASCII alone
+        let ja4 = String::from("t13d1516é_8daaf6152771_e5627efa2ab1");
+        assert_eq!(ja4.len(), 36);
+        let ans = Answer::Tls(TlsOut::Complete {
+            ja3: "0".repeat(32),
+            ja4,
+            sni: SniOut::Absent,
+            alpn: vec![],
+        });
+        assert!(check_response(&req, &ans).is_err());
     }
 
     /// Review of #480 (F9): an ALPN name is printable ASCII as the worker

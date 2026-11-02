@@ -1002,3 +1002,107 @@ fn a_worker_s_process_is_checked_against_its_declaration() {
     }
     assert!(verify_proc("Name:\tx\n", &l).is_err());
 }
+
+/// F7: an honest hello the launcher's view contradicts — the kernel's
+/// Landlock ABI is another, or the process's `/proc` is not what it
+/// declared — is refused, and the worker never serves.
+struct Contradicted {
+    inner: Scripted,
+    kernel_abi: u8,
+    proc_ok: bool,
+}
+
+impl Launcher for Contradicted {
+    fn unavailable(&self) -> Option<String> {
+        None
+    }
+    fn account(&self) -> Option<(u32, u32)> {
+        Some((UID, GID))
+    }
+    fn kernel_landlock_abi(&self) -> u8 {
+        self.kernel_abi
+    }
+    fn launch(&self, kind: WorkerKind) -> std::io::Result<Spawned> {
+        self.inner.launch(kind)
+    }
+    fn verify(&self, _pid: u32, _declared: &SandboxLevel) -> Result<(), String> {
+        if self.proc_ok {
+            Ok(())
+        } else {
+            Err("CapEff 0000000000000020".into())
+        }
+    }
+}
+
+#[test]
+fn a_hello_the_kernel_or_proc_contradicts_is_refused() {
+    let abi = level().landlock_abi;
+    for (kernel_abi, proc_ok, want) in [
+        (abi, true, None),
+        (abi + 2, true, Some("landlock ABI")),
+        (abi, false, Some("its process is not what it declared")),
+    ] {
+        let reports: Arc<Mutex<Vec<String>>> = Arc::default();
+        let r = Arc::clone(&reports);
+        let workers = Workers::new(Config {
+            launcher: Arc::new(Contradicted {
+                inner: Scripted {
+                    script: Script::Honest,
+                    launches: AtomicU32::new(0),
+                },
+                kernel_abi,
+                proc_ok,
+            }),
+            roles: Arc::new(NoPidRoles),
+            report: Arc::new(move |_: &str, d: &str| r.lock().push(d.into())),
+            kinds: vec![WorkerKind::Parse],
+            debug_dir: None,
+        });
+        // ready, or refused: whichever comes first
+        let end = Instant::now() + Duration::from_secs(8);
+        let mut st = workers.status()[0].clone();
+        while Instant::now() < end && st.health != Health::Ready && st.violations == 0 {
+            workers.tick(Instant::now());
+            st = workers.status()[0].clone();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        workers.stop();
+        match want {
+            None => assert_eq!(st.health, Health::Ready, "{st:?}"),
+            Some(why) => {
+                assert!(st.health != Health::Ready && st.violations >= 1, "{st:?}");
+                assert!(
+                    reports.lock().iter().any(|d| d.contains(why)),
+                    "{why}: {:?}",
+                    reports.lock()
+                );
+            }
+        }
+    }
+}
+
+/// F7: the production launcher reads the worker's `/proc/<pid>/status`
+/// itself — here this test process's, which is no worker (no seccomp
+/// filter, no `no_new_privs`), and a pid that does not exist.
+#[test]
+fn the_image_launcher_reads_the_process_s_own_status() {
+    let launcher = ImageLauncher {
+        image: None,
+        account: Err("none".into()),
+        extra_args: Vec::new(),
+    };
+    // SAFETY: getuid and getgid have no preconditions.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let declared = SandboxLevel {
+        uid,
+        gid,
+        ..level()
+    };
+    let me = launcher.verify(std::process::id(), &declared);
+    assert!(me.is_err(), "{me:?}");
+    let gone = launcher.verify(u32::MAX - 1, &declared);
+    assert!(
+        gone.as_ref().is_err_and(|e| e.contains("unreadable")),
+        "{gone:?}"
+    );
+}
