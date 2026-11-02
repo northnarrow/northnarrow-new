@@ -4492,3 +4492,39 @@ only in the table below, in the same PR as the evidence.
     flight on the same worker: one lock, two waits), and a `cargo-deny`
     licence check in CI (the licences of `landlock`, `seccompiler` and
     their dependencies were checked by hand for this lot).
+  - R14b — what changed: the DNS pump's names decoded by the parse worker
+    (batches of at most 512 names whose worst answer fits a frame, 250 ms
+    a batch), every answer checked against its request; without an answer
+    an event with no name (`qname_partial`), no cache feed, the names
+    counted and said — never parsed in the core
+    (`xtask/tests/no_parsing_in_the_core.rs`); the protocol's version 2 (a
+    name's form: wire, wire with its end, an NSS record's text); the TLS
+    ClientHello and DNS answers' parsers reachable only through the
+    worker; the workers started before the sensors, a worker's pid
+    registered once this boot's hooks are attached.
+  - R14b — budget, stated in the lot's log before the measurement (Ubuntu
+    24.04, `main` against the stack's tip, the same scripts): the `dns`
+    overhead within 5 points of `main`'s, the other rows within their
+    noise, the agent's CPU in the dns run at most `main`'s + 150 ms;
+    EXP-13 every check `main` passes, each class's p99 within 1.5×
+    `main`'s; a soak pair of 30 min: RSS growth within `main`'s + 16 MiB,
+    no worker restart, the worker under 2 % CPU, no name left without a
+    decode while it is up.
+  - R14b — lab (as measured): overhead dns +21.5 % → +15.2 % (agent CPU
+    10 → 30 ms, the worker's included), the other rows within 3 points or
+    better; EXP-13 the same checks (12,000 refusals recorded or held, no
+    ring drop, nothing over budget), p99 P0 1.8 → 0.7 ms, P1 0.35 → 1.0
+    ms — 2.9× this run of `main`, outside the ratio stated, within
+    `main`'s own spread on the guest that day (0.35 and 3.1 ms) —, P2 426
+    → 487 ms, P3 7.7 → 0.9 ms; EXP-13c (DNS 200/s, connects 50/s, 12 + 12
+    probes): the DNS events' p99 3.1 → 1.9 ms, NET-001 12 of 12 killed
+    while connecting (median 13.3 → 11.0 ms), the staging probes 12 of
+    12; EXP-13r 400 of 400 `success` on both; the soak pair: RSS +23.9 MB
+    (`main`) and +22.1 MB (tip), CPU 1.9 % and 1.5 %, 0 restarts, the
+    worker 5.2 MB, 0.0 % CPU, 0 restarts, in every sample, no name left
+    without a decode. The worker's `parse` phase (decoded, disabled — a
+    gap said, nothing parsed in the core —, decoded again) 7 of 7 on the
+    four kernels.
+  - R14b — gates on 70508844: 80 suites, 3,520 passed, 0 failed, 17
+    ignored, every gate. Mutations: set B 18 (17 caught; `MB13`, the DNS
+    cache fed without a decode, given a test and caught on the rerun).
