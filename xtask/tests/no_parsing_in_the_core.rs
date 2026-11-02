@@ -9,7 +9,13 @@
 //! nn-evidence — name `nn_parse` nowhere else (test code aside: files of
 //! tests, `#[cfg(test)]` modules, the fuzz harness's own test module). A
 //! fallback that parses in the core when the worker is down would have to
-//! name it.
+//! name it — or call the worker's own code in the core's process: review of
+//! #481 (R14b-3, the reviewer's planting P1) — `worker::serve::answer`
+//! runs the parsers in its caller. It is `pub(crate)`, and no production
+//! source but the worker's names `serve::answer`, nor any of
+//! `worker::serve::` but its entry (`worker::serve::main(`, the worker
+//! mode of `main`); the worker's side re-exports no parser (`pub use
+//! nn_parse`).
 
 mod support;
 
@@ -65,8 +71,11 @@ fn the_core_names_no_parser_outside_the_worker() {
             let n = code.matches("nn_parse").count();
             if WORKER_SIDE.contains(&rel.as_str()) {
                 worker_names += n;
-            } else if n > 0 {
-                bad.push(format!("{rel}: names nn_parse {n} time(s)"));
+                if code.contains("pub use nn_parse") {
+                    bad.push(format!("{rel}: re-exports a parser"));
+                }
+            } else {
+                bad.extend(core_reaches_a_parser(code).map(|why| format!("{rel}: {why}")));
             }
         }
     }
@@ -79,6 +88,28 @@ fn the_core_names_no_parser_outside_the_worker() {
         worker_names >= 4,
         "the worker runs the parsers: {worker_names}"
     );
+}
+
+/// What in a production source of the core reaches a parser in its own
+/// process: nn-parse itself, or the worker's answer (review of #481,
+/// R14b-3).
+fn core_reaches_a_parser(code: &str) -> Option<String> {
+    let parse = code.matches("nn_parse").count();
+    if parse > 0 {
+        return Some(format!("names nn_parse {parse} time(s)"));
+    }
+    if code.contains("serve::answer") {
+        return Some("calls the worker's answer (its parsers) in the core".to_string());
+    }
+    let serve = code.matches("worker::serve::").count();
+    let entry = code.matches("worker::serve::main(").count();
+    if serve > entry {
+        return Some(format!(
+            "reaches worker::serve:: {} time(s) beyond the worker's entry",
+            serve - entry
+        ));
+    }
+    None
 }
 
 /// The DNS pump hands its names to the worker and builds its events from
@@ -110,4 +141,23 @@ fn a_planted_parser_in_the_core_fails() {
     assert!(production(&code).contains("nn_parse"));
     let in_test = format!("fn g() {{}}\n#[cfg(test)]\nmod tests {{\n{planted}}}\n");
     assert!(!production(&strip_comments(&in_test)).contains("nn_parse"));
+    // review of #481 (R14b-3): the reviewer's P1 and its variants
+    for planted in [
+        "fn f(r: &Request) -> Answer { nn_linux::worker::serve::answer(r) }\n",
+        "use nn_linux::worker::serve::answer;\n",
+        "fn f(r: &Request) -> Answer { crate::worker::serve::answer(r) }\n",
+        "use crate::worker::serve;\nfn f(r: &Request) -> Answer { serve::answer(r) }\n",
+        "use nn_linux::worker::serve::*;\n",
+    ] {
+        let code = strip_comments(planted);
+        assert!(
+            core_reaches_a_parser(production(&code)).is_some(),
+            "{planted}"
+        );
+    }
+    // the worker's entry is not a parser
+    assert!(
+        core_reaches_a_parser("std::process::exit(nn_linux::worker::serve::main(&args));")
+            .is_none()
+    );
 }

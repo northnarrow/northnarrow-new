@@ -159,7 +159,7 @@ pub fn serve_loop(fd: RawFd) -> i32 {
 }
 
 /// The answer to one request (the parsers run here, and only here).
-pub fn answer(req: &Request) -> Answer {
+pub(crate) fn answer(req: &Request) -> Answer {
     if req.check().is_err() {
         return Answer::Refused(Refusal::OutOfBounds);
     }

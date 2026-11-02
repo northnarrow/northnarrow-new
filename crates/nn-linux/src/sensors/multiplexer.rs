@@ -1750,11 +1750,23 @@ fn dns_pass(
     } else {
         parse.names(raws.iter().map(name_request).collect())
     };
-    for (raw, d) in raws.iter().zip(decoded.iter()) {
+    // review of #481 (R14b-5): every record gives its event, decoded or
+    // not — never paired off by a shorter list (`names` gives one entry
+    // per name; a mismatch is counted and said, not dropped)
+    if decoded.len() != raws.len() {
+        parse.mismatched += raws.len().abs_diff(decoded.len()) as u64;
+        tracing::warn!(
+            records = raws.len(),
+            decodes = decoded.len(),
+            "the DNS pass got another count of decodes than records: the records without one carry no name"
+        );
+    }
+    for (i, raw) in raws.iter().enumerate() {
+        let d = decoded.get(i).and_then(Option::as_ref);
         if raw.flags & dns_flags::NSS != 0 {
-            outbox.extend(nss_events(raw, d.as_ref(), lineage, dns_cache));
+            outbox.extend(nss_events(raw, d, lineage, dns_cache));
         } else {
-            let (event, flood) = dns_events(raw, d.as_ref(), lineage, dns_cache);
+            let (event, flood) = dns_events(raw, d, lineage, dns_cache);
             outbox.push_back(event);
             outbox.extend(flood);
         }

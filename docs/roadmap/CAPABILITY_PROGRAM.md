@@ -4528,3 +4528,36 @@ only in the table below, in the same PR as the evidence.
   - R14b — gates on 70508844: 80 suites, 3,520 passed, 0 failed, 17
     ignored, every gate. Mutations: set B 18 (17 caught; `MB13`, the DNS
     cache fed without a decode, given a test and caught on the rerun).
+  - R14b — review of #481 (an independent review; its mutations RB1–RB3
+    and planting P1): R14b-1 (a worker answering `Refused` to every batch,
+    or empty names, blinded the DNS with no signature: a refusal of a
+    request the core checked is now a violation — killed, signed — and an
+    empty name is refused where the bytes decode to one, an end where it
+    is not just past a zero byte); R14b-2 (`NAMES_TIMEOUT` was 250 ms, the
+    connects' whole wait for the DNS pass: now 50 ms, under a quarter of
+    it, pinned by a test with a worker answering in 100 ms — RB1); RB3 (a
+    request out of bounds is refused before it is sent: a test, now that
+    the worker's refusal is a violation); R14b-3 (`serve::answer`
+    `pub(crate)`, and `no_parsing_in_the_core` refuses a call of it, any
+    `worker::serve::` but the worker's entry, and a re-export of nn-parse:
+    P1 caught); R14b-4 (the refusal reason is a closed set since #480's
+    F9, and the journal's line of names left undecoded is escaped);
+    R14b-5 (every DNS record gives its event: `ParseClient::names` gives
+    one entry per name whatever a batch's answer holds, `dns_pass` pairs
+    by index and counts a mismatch — RB2's dropped events cannot happen);
+    R14b-6 (the P1 p99 of 2.9×: the agent's delays are over its life, the
+    start's slow decisions included; EXP-13 now reads them after a
+    warm-up of process events — 100 times the class's decisions so far,
+    4,000 to 100,000 — and says whether the start's are under 1 % of the
+    population, and runs are compared by the median of their p99s over
+    alternate runs; the method, not a new measurement). The hostile
+    worker gains `refuse-all`, `empty-names`, `end-off-root`, `slow` (each
+    killed) and `swap` (printed).
+  - R14b — open: the round-trip check of a name against its bytes (the
+    core re-encoding the worker's presentation form, a memory compare: a
+    false but well-formed name passes every bound today — the harness's
+    `swap` prints it); the names left undecoded as a signed
+    `telemetry_loss` row and in `nn-admin status`; a latency histogram of
+    the worker's answers (a high p99 as a degradation); EXP-13 per-run
+    histograms (the status carries quantiles only, and its encoding takes
+    no new field inside a queue's entry).

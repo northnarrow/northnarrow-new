@@ -482,6 +482,14 @@ fn names() -> Request {
     }])
 }
 
+/// A name whose end is asked for (the socket-buffer sensor's).
+fn names_find_end() -> Request {
+    Request::DnsNames(vec![QnameIn {
+        bytes: b"\x07example\x03com\x00\x00\x01".to_vec(),
+        form: nn_proto::ipc::QnameForm::WireFindEnd,
+    }])
+}
+
 /// The signed reports a supervisor made (source, detail).
 type Reports = Arc<parking_lot::Mutex<Vec<(String, String)>>>;
 
@@ -538,13 +546,22 @@ fn protocol_attacks() {
         "second-hello",
         "flood",
         "lie",
+        // review of #481 (R14b-1)
+        "refuse-all",
+        "empty-names",
+        "end-off-root",
     ] {
         let w = workers(&h, &["--hostile", attack]);
         assert!(
             tick_until(&w, |w| w.status()[0].health == Health::Ready),
             "{attack}: the hostile worker's genuine hello"
         );
-        let got = w.request(WorkerKind::Parse, &names(), Duration::from_secs(2));
+        let req = if attack == "end-off-root" {
+            names_find_end()
+        } else {
+            names()
+        };
+        let got = w.request(WorkerKind::Parse, &req, Duration::from_secs(2));
         // the flood answers the request first, then keeps sending: the
         // supervisor's next look finds the answers nobody asked for
         if attack != "flood" {
@@ -567,6 +584,31 @@ fn protocol_attacks() {
         assert_eq!(st.deaths, 1, "{attack}: killed once: {st:?}");
         w.stop();
     }
+    // review of #481 (R14b-2): an answer past the names' deadline is a
+    // hang — the worker killed — never a pass slowed in silence
+    let w = workers(&h, &["--hostile", "slow"]);
+    assert!(tick_until(&w, |w| w.status()[0].health == Health::Ready));
+    let got = w.request(
+        WorkerKind::Parse,
+        &names(),
+        nn_linux::worker::parse::NAMES_TIMEOUT,
+    );
+    assert!(got.is_err(), "slow: {got:?}");
+    tick_until(&w, |w| w.status()[0].deaths >= 1);
+    let st = w.status()[0].clone();
+    assert!(st.hangs >= 1 && st.deaths == 1, "slow: {st:?}");
+    w.stop();
+    // a false but well-formed name: within every bound the core checks —
+    // printed, not asserted (Open: the round-trip check of a name against
+    // its bytes)
+    let w = workers(&h, &["--hostile", "swap"]);
+    assert!(tick_until(&w, |w| w.status()[0].health == Health::Ready));
+    let got = w.request(WorkerKind::Parse, &names(), Duration::from_secs(2));
+    println!(
+        "swap (a false, well-formed name): {got:?}; {:?}",
+        w.status()[0]
+    );
+    w.stop();
     // a hello below its sandbox never makes the worker ready
     let w = workers(&h, &["--hostile", "weak-hello"]);
     assert!(tick_until(&w, |w| w.status()[0].violations >= 1));

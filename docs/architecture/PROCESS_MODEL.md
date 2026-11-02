@@ -219,14 +219,22 @@ A worse state is signed at once as a `capability_manifest_change`.
 
 The core runs no parser of hostile bytes: nn-parse's parsers run in the
 parse worker only (`xtask/tests/no_parsing_in_the_core.rs`: the core's
-production sources name `nn_parse` nowhere but the worker's side).
+production sources name `nn_parse` nowhere but the worker's side, nor the
+worker's own answer, `worker::serve::answer` — `pub(crate)`, the parsers
+in its caller's process — nor anything of `worker::serve::` but the
+worker's entry; review of #481, R14b-3).
 
 - **DNS query names.** The DNS pump copies a pass's records off the ring,
   asks the worker for their names (`Request::DnsNames`, a name's `form`:
   the `udp_sendmsg` sensor's wire name, the socket-buffer sensor's wire
   bytes with the end of the name asked for, an NSS record's text), in
-  batches whose worst answer fits a frame, 250 ms each at most, then builds
-  the events from the answers the core checked. The socket-buffer sensor's
+  batches whose worst answer fits a frame, 50 ms each at most
+  (`NAMES_TIMEOUT`: review of #481, R14b-2 — a quarter of the connects'
+  wait for the pass, `INGEST_WAIT`, at most, pinned by a test; a worker
+  slower than that is a hang, killed and signed, never a pass slowed to the
+  connects' wait in silence), then builds the events from the answers the
+  core checked. Every record gives its event: one decode or none per name,
+  never a shorter list paired off (R14b-5). The socket-buffer sensor's
   query type is the two bytes after the end the worker found (bounded by
   the core to the record's bytes). Without an answer — the worker starting,
   restarting, disabled, out of time — an event carries no name
@@ -238,6 +246,20 @@ production sources name `nn_parse` nowhere but the worker's side).
   `client_hello` and `dns_answers` are the one way a producer reaches
   them. The agent's `net::tls_parser` and nn-linux's DNS answer
   re-exports are gone (the fuzz targets name nn-parse).
+
+**What the core checks of a decode** (`check_response`, review of #481,
+R14b-1): one answer per name, its length and alphabet, an end only where
+asked and just past a zero byte (the root label), no pointer in an NSS
+name, and an empty name only where the bytes allow one (a wire name that
+is empty, starts with its root label or is one byte; an NSS text empty to
+its first NUL) — read from the input's first bytes, never its labels. A
+refusal (`Answer::Refused`) of a request the core checked — it checks
+each before it sends it, with the worker's own check — is a violation: the
+worker is killed and the refusal signed, so a worker cannot blind the DNS
+by refusing. A false but well-formed name (another real name for the
+bytes) is within every bound: the round-trip check — the core re-encoding
+the worker's presentation form and comparing it with the bytes' prefix,
+a memory compare, no parse — is Open.
 
 **The boot.** The workers start at the head of the attach phase, before the
 sensors, so the DNS pump's first records find the worker ready; a worker's

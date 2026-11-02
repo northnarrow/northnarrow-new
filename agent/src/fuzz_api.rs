@@ -543,7 +543,10 @@ mod tests {
                     _ => 1,
                 })
                     .map(|_| QnameIn {
-                        bytes: vec![0; usize::from((sel >> 2) & 0xf) * 8],
+                        // as the fuzz target's `name_bytes`
+                        bytes: (0..usize::from((sel >> 2) & 0xf) * 8)
+                            .map(|i| (i as u8).wrapping_add(sel))
+                            .collect(),
                         form: match sel >> 6 {
                             1 => QnameForm::Nss,
                             2 => QnameForm::WireFindEnd,

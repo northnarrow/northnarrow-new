@@ -177,6 +177,8 @@ up 60 s enables the kind again. The manifest's state (`ready`,
 | `… (SIGSYS: a system call outside its seccomp allowlist)` | the worker tried a call it may not make: a parser taken over by its input, or a bug | keep the journal and the input's time; report it |
 | `… protocol violation: …` | the worker sent what an honest worker never sends | as above |
 | `… protocol violation: N bytes of earlier requests left unread` | the worker stopped reading its channel: the agent never waits on it | as above |
+| `… protocol violation: a checked request refused …`, `… an empty name for a name's bytes`, `… an end not past a root label` | the worker answered what an honest decoder never gives (R14b): a parser taken over by its input | keep the journal and the time; report it |
+| `… hung: no answer to dns_names within 50ms`, often | the worker answers slower than 50 ms a batch: under heavy CPU pressure it is the last served (`nice` 10) | look at the host's load; the names of those passes carry no decode |
 | `… hello refused: landlock below what ABI N gives …` or `… hello refused: its process is not what it declared …` | the worker's sandbox is not what the kernel gives, or its process (`/proc`) is not what it declared | report it with the kernel and `lsm=` |
 | `… spinning: N% of a CPU …` | the worker burnt the CPU with nothing to do | as above |
 | `… pid N could not be taken out of PROTECTED_PIDS …` | the agent keeps the dead worker unreaped (its pid cannot be reused) and tries again | look at the pinned maps (`nn-admin status`) |

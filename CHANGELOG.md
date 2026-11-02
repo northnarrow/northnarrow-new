@@ -9,13 +9,23 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 - The parsers in the worker (lot 272, Wave 4 phase 2, R14b of the
   restructure plan, §3.1, §3.5): the DNS pump's query names are decoded by
   the `parse` worker, in batches of at most 512 names whose worst answer
-  fits a frame, with a 250 ms deadline; the core checks every answer
+  fits a frame, with a 50 ms deadline (review of #481: a quarter of the
+  connects' wait for the DNS pass at most; a slower worker is a hang,
+  killed and signed); the core checks every answer
   against its request and never decodes a name itself — a name the worker
   did not answer (starting, restarting, disabled, out of time) is an event
   with no name, counted and said at most every 10 s. The TLS ClientHello
   and the DNS answers' parsers are reachable from the core only through
   the worker (`ParseClient`); the agent's own copies of them are gone
-  (`xtask/tests/no_parsing_in_the_core.rs`). The channel's version is 2.
+  (`xtask/tests/no_parsing_in_the_core.rs`, which since the review of #481
+  also refuses a call of the worker's own answer in the core). The
+  channel's version is 2. After the review of #481: a refusal of a request
+  the core checked is a protocol violation (the worker killed, signed: a
+  compromised worker can no longer blind the DNS by refusing); an empty
+  name for bytes that decode to one, and an end of a name not just past
+  its root label, are violations too; every DNS record gives its event
+  whatever count of decodes comes back; EXP-13 reads the per-class p99
+  after a warm-up past the agent's start.
 - The agent's unprivileged workers: the sandbox, the worker model, the
   core/worker channel and the kernel's roles (lot 272, Wave 4 phase 2, R14a
   of the restructure plan, §3.1, §3.3, §3.5; report 06 INI-19;

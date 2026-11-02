@@ -415,7 +415,12 @@ pub enum Answer {
         aaaa: Vec<[u8; 16]>,
     },
     /// The request was not served ([`Refusal`]: a closed set, review of
-    /// #480 F9 — no free text from a worker).
+    /// #480 F9 — no free text from a worker). Review of #481 (R14b-1): the
+    /// core checks every request before it sends it ([`Request::check`]),
+    /// and the worker runs the same check, so an honest worker never
+    /// refuses what the core sends: [`check_response`] takes a refusal for
+    /// the lie it is ([`Violation::Refused`]). The worker still answers
+    /// with one when a request is out of bounds (its own defence).
     Refused(Refusal),
 }
 
@@ -482,6 +487,10 @@ pub enum Violation {
     /// requests unread (an honest worker reads a request before it
     /// answers): it would fill the core's send buffer.
     Unread(usize),
+    /// Review of #481 (R14b-1): a request the core had checked was refused
+    /// — an honest worker serves every one; a refusal would leave the
+    /// core's names undecoded without a signature.
+    Refused(Refusal),
 }
 
 impl core::fmt::Display for Violation {
@@ -496,6 +505,7 @@ impl core::fmt::Display for Violation {
             Violation::WrongKind(k) => write!(f, "an answer of the wrong kind to {k}"),
             Violation::Bounds(what) => write!(f, "result out of bounds: {what}"),
             Violation::Unread(n) => write!(f, "{n} bytes of earlier requests left unread"),
+            Violation::Refused(r) => write!(f, "a checked request refused ({r})"),
         }
     }
 }
@@ -639,6 +649,21 @@ pub fn check_hello(h: &WorkerHello, want: &Expected) -> Result<(), Violation> {
     Ok(())
 }
 
+/// Review of #481 (R14b-1): when an honest worker's decode of `i` is the
+/// empty name — read from the input's first bytes only, never its labels:
+/// a wire name that is empty or starts with its root label, or whose
+/// first label is cut to nothing (one byte); an NSS text that is empty to
+/// its first NUL, but for a root dot. Anything else decodes to at least one
+/// character, so an empty answer is a worker blinding the core.
+fn may_be_empty(i: &QnameIn) -> bool {
+    match i.form {
+        QnameForm::Wire | QnameForm::WireFindEnd => {
+            i.bytes.len() < 2 || i.bytes.first() == Some(&0)
+        }
+        QnameForm::Nss => matches!(i.bytes.as_slice(), [] | [0, ..] | [b'.'] | [b'.', 0, ..]),
+    }
+}
+
 /// A decoded name's alphabet: printable ASCII, and `…` (a compression
 /// pointer) only at the end.
 fn qname_chars_ok(name: &str) -> bool {
@@ -712,8 +737,9 @@ pub const fn min_dns_answer_bytes(a: usize, aaaa: usize) -> usize {
 /// answer's kind, its counts and sizes, its strings' alphabets.
 pub fn check_response(req: &Request, answer: &Answer) -> Result<(), Violation> {
     match (req, answer) {
-        // a closed set: nothing to bound
-        (_, Answer::Refused(_)) => Ok(()),
+        // review of #481 (R14b-1): never an honest answer to a request the
+        // core checked (and it checks each one before it sends it)
+        (_, Answer::Refused(r)) => Err(Violation::Refused(*r)),
         (Request::Ping, Answer::Pong) => Ok(()),
         (Request::DnsNames(ins), Answer::DnsNames(outs)) => {
             if ins.len() != outs.len() {
@@ -729,6 +755,11 @@ pub fn check_response(req: &Request, answer: &Answer) -> Result<(), Violation> {
                 if i.form == QnameForm::Nss && o.name.ends_with('…') {
                     return Err(Violation::Bounds("dns_names: an NSS name has no pointer"));
                 }
+                if o.name.is_empty() && !may_be_empty(i) {
+                    return Err(Violation::Bounds(
+                        "dns_names: an empty name for a name's bytes",
+                    ));
+                }
                 match o.end {
                     None => {}
                     Some(_) if i.form != QnameForm::WireFindEnd => {
@@ -736,6 +767,11 @@ pub fn check_response(req: &Request, answer: &Answer) -> Result<(), Violation> {
                     }
                     Some(e) if usize::from(e) > i.bytes.len() || e == 0 => {
                         return Err(Violation::Bounds("dns_names: end past the bytes"))
+                    }
+                    // review of #481 (R14b-1): a name ends just past its
+                    // root label, a zero byte
+                    Some(e) if i.bytes.get(usize::from(e) - 1) != Some(&0) => {
+                        return Err(Violation::Bounds("dns_names: an end not past a root label"))
                     }
                     Some(_) => {}
                 }
@@ -1198,8 +1234,84 @@ mod tests {
         };
         assert!(check_response(&req, &too_many).is_err());
         assert!(check_response(&req, &Answer::Pong).is_err());
+        // review of #481 (R14b-1): a refusal of a checked request is a lie
         for r in [Refusal::OutOfBounds, Refusal::DebugOnly] {
-            assert_eq!(check_response(&req, &Answer::Refused(r)), Ok(()));
+            assert_eq!(
+                check_response(&req, &Answer::Refused(r)),
+                Err(Violation::Refused(r))
+            );
+            for other in [
+                Request::Ping,
+                Request::DnsNames(vec![QnameIn {
+                    bytes: b"\x07example\x03com\x00".to_vec(),
+                    form: QnameForm::Wire,
+                }]),
+                Request::TlsClientHello(vec![0x16]),
+            ] {
+                assert_eq!(
+                    check_response(&other, &Answer::Refused(r)),
+                    Err(Violation::Refused(r))
+                );
+            }
+        }
+    }
+
+    /// Review of #481 (R14b-1): an empty name only where the decode is
+    /// empty, an end only just past a zero byte — the honest decoder's own
+    /// outputs pass.
+    #[test]
+    fn an_empty_name_or_an_end_off_the_root_label_is_refused() {
+        let one = |bytes: &[u8], form: QnameForm, name: &str, end: Option<u16>| {
+            check_response(
+                &Request::DnsNames(vec![QnameIn {
+                    bytes: bytes.to_vec(),
+                    form,
+                }]),
+                &Answer::DnsNames(vec![QnameOut {
+                    name: name.into(),
+                    end,
+                }]),
+            )
+        };
+        use QnameForm::{Nss, Wire, WireFindEnd};
+        // empty, where it may be
+        for (bytes, form) in [
+            (&b""[..], Wire),
+            (b"\x00", Wire),
+            (b"\x00\x00\x01", WireFindEnd),
+            (b"\x05", Wire),
+            (b"", Nss),
+            (b"\x00junk", Nss),
+            (b".", Nss),
+            (b".\x00junk", Nss),
+        ] {
+            assert_eq!(one(bytes, form, "", None), Ok(()), "{bytes:?} {form:?}");
+        }
+        // and where it may not
+        for (bytes, form) in [
+            (&b"\x07example\x03com\x00"[..], Wire),
+            (b"\x07example\x03com\x00\x00\x01", WireFindEnd),
+            (b"\xc0\x0c", Wire),
+            (b"example.com", Nss),
+            (b"a\x00", Nss),
+        ] {
+            assert_eq!(
+                one(bytes, form, "", None),
+                Err(Violation::Bounds(
+                    "dns_names: an empty name for a name's bytes"
+                )),
+                "{bytes:?} {form:?}"
+            );
+        }
+        // the end: just past the root label
+        let q = b"\x07example\x03com\x00\x01\x01";
+        assert_eq!(one(q, WireFindEnd, "example.com", Some(13)), Ok(()));
+        for e in [12, 14, 15] {
+            assert_eq!(
+                one(q, WireFindEnd, "example.com", Some(e)),
+                Err(Violation::Bounds("dns_names: an end not past a root label")),
+                "end {e}"
+            );
         }
     }
 

@@ -10,9 +10,10 @@
 //!   dumpable, another account than root without groups, no capability,
 //!   no core and no process, the kernel's Landlock ABI and every right it
 //!   gives;
-//! - an answer accepted is the request's kind, one name per name asked,
-//!   each in its alphabet and its length, an end only where asked and
-//!   within the bytes; JA3 32 hex digits; JA4 36 ASCII bytes in its
+//! - an answer accepted is the request's kind, never a refusal, one name
+//!   per name asked, each in its alphabet and its length, empty only for
+//!   bytes that decode to none, an end only where asked and just past a
+//!   zero byte; JA3 32 hex digits; JA4 36 ASCII bytes in its
 //!   shape; an SNI a host name; ALPN names printable ASCII, non-empty,
 //!   bounded; no more DNS answers than the bytes can hold;
 //! - a message decoded encodes back to the bytes that decode to itself.
@@ -42,6 +43,12 @@ fn form(sel: u8) -> QnameForm {
     }
 }
 
+/// A name's bytes: `len` of them from the selector (its first byte the
+/// selector itself, so a root label, a cut label or a long name all occur).
+fn name_bytes(sel: u8, len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i as u8).wrapping_add(sel)).collect()
+}
+
 /// The request an answer is checked against.
 fn request(sel: u8, answer: &Answer) -> Request {
     let size = usize::from(sel >> 2);
@@ -56,7 +63,7 @@ fn request(sel: u8, answer: &Answer) -> Request {
             Request::DnsNames(
                 (0..n)
                     .map(|_| QnameIn {
-                        bytes: vec![0; (size & 0xf) * 8],
+                        bytes: name_bytes(sel, (size & 0xf) * 8),
                         form: form(sel),
                     })
                     .collect(),
@@ -69,7 +76,8 @@ fn request(sel: u8, answer: &Answer) -> Request {
 
 fn accepted_answer(req: &Request, answer: &Answer) {
     match (req, answer) {
-        (_, Answer::Refused(_)) => {}
+        // review of #481 (R14b-1): never an honest answer to a checked request
+        (req, Answer::Refused(r)) => panic!("{} refused ({r}) accepted", req.name()),
         (Request::Ping, Answer::Pong) => {}
         (Request::DnsNames(ins), Answer::DnsNames(outs)) => {
             assert_eq!(ins.len(), outs.len());
@@ -78,11 +86,20 @@ fn accepted_answer(req: &Request, answer: &Answer) {
                 let body = o.name.strip_suffix('…').unwrap_or(&o.name);
                 assert!(body.bytes().all(|b| (0x20..=0x7e).contains(&b)), "{o:?}");
                 assert!(i.form != QnameForm::Nss || !o.name.ends_with('…'), "{o:?}");
+                // review of #481 (R14b-1): an empty name only for bytes that
+                // decode to none, an end just past a zero byte
+                if o.name.is_empty() {
+                    assert!(
+                        i.bytes.len() < 2 || i.bytes[0] == 0 || i.form == QnameForm::Nss,
+                        "{o:?}"
+                    );
+                }
                 if let Some(e) = o.end {
                     assert!(
                         i.form == QnameForm::WireFindEnd && e != 0 && usize::from(e) <= i.bytes.len(),
                         "{o:?}"
                     );
+                    assert_eq!(i.bytes[usize::from(e) - 1], 0, "{o:?}");
                 }
             }
         }

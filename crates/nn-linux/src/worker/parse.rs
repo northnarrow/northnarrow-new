@@ -30,8 +30,12 @@ use super::{WorkerError, Workers};
 
 /// A batch of names' deadline: the DNS pump waits at most this for a
 /// pass's decode (a hung worker is killed at it, and the next batches find
-/// it restarting).
-pub const NAMES_TIMEOUT: Duration = Duration::from_millis(250);
+/// it restarting). Review of #481 (R14b-2): well under the connects' wait
+/// for the DNS pass (`net::dns_ingest::INGEST_WAIT`, 250 ms; a quarter at
+/// most, pinned by a test) — a worker slower than this is a hang, signed,
+/// never a pass slowed to the connects' wait in silence. The honest round
+/// trip is about a millisecond.
+pub const NAMES_TIMEOUT: Duration = Duration::from_millis(50);
 /// A ClientHello's or a DNS answer's deadline.
 pub const ONE_TIMEOUT: Duration = Duration::from_millis(250);
 /// The names left without a decode are said at most this often.
@@ -45,6 +49,9 @@ pub struct ParseClient {
     /// Names asked for and decoded, and left without a decode.
     pub decoded: u64,
     pub unparsed: u64,
+    /// Records of a DNS pass paired with no entry of `names` (never, by
+    /// its contract: one entry per name; counted if it ever happened).
+    pub mismatched: u64,
     unparsed_since_log: u64,
     last_log: Option<Instant>,
     last_why: String,
@@ -64,30 +71,50 @@ impl ParseClient {
         let mut out: Vec<Option<QnameOut>> = Vec::with_capacity(n);
         for batch in batches(inputs) {
             let len = batch.len();
-            match self.ask_names(batch) {
-                Ok(decoded) => {
-                    self.decoded += len as u64;
-                    out.extend(decoded.into_iter().map(Some));
-                }
-                Err(why) => {
-                    self.unparsed += len as u64;
-                    self.unparsed_since_log += len as u64;
-                    self.last_why = why;
-                    out.extend(std::iter::repeat_n(None, len));
-                }
-            }
+            let got = self.ask_names(batch);
+            self.fill(&mut out, len, got);
         }
+        debug_assert_eq!(out.len(), n);
         self.maybe_log();
         out
+    }
+
+    /// One batch's decodes into `out`: exactly `len` entries whatever came
+    /// back (review of #481, R14b-5: a short answer never drops a name's
+    /// event — the supervisor refuses one already; this holds without it).
+    fn fill(
+        &mut self,
+        out: &mut Vec<Option<QnameOut>>,
+        len: usize,
+        got: Result<Vec<QnameOut>, String>,
+    ) {
+        let got = match got {
+            Ok(v) if v.len() == len => Ok(v),
+            Ok(v) => Err(format!("{} decodes for {len} names", v.len())),
+            Err(why) => Err(why),
+        };
+        match got {
+            Ok(decoded) => {
+                self.decoded += len as u64;
+                out.extend(decoded.into_iter().map(Some));
+            }
+            Err(why) => {
+                self.unparsed += len as u64;
+                self.unparsed_since_log += len as u64;
+                self.last_why = why;
+                out.extend(std::iter::repeat_n(None, len));
+            }
+        }
     }
 
     fn ask_names(&self, batch: Vec<QnameIn>) -> Result<Vec<QnameOut>, String> {
         let Some(w) = &self.workers else {
             return Err("no parse worker in this run".to_string());
         };
+        // a refusal or an answer of another kind is the supervisor's
+        // violation (the worker killed, signed) before it gets here
         match w.request(WorkerKind::Parse, &Request::DnsNames(batch), NAMES_TIMEOUT) {
             Ok(Answer::DnsNames(v)) => Ok(v),
-            Ok(Answer::Refused(why)) => Err(format!("the worker refused the batch: {why}")),
             Ok(_) => Err("an answer of another kind".to_string()),
             Err(e) => Err(describe(&e)),
         }
@@ -107,7 +134,7 @@ impl ParseClient {
         warn!(
             names = self.unparsed_since_log,
             total = self.unparsed,
-            why = %self.last_why,
+            why = %nn_model::log_escape::Escaped(self.last_why.as_str()),
             "DNS names left without a decode: the parse worker did not answer; their events carry no name (the core does not parse them itself)"
         );
         self.unparsed_since_log = 0;
@@ -221,5 +248,33 @@ mod tests {
         assert_eq!((c.decoded, c.unparsed), (0, 2));
         assert!(c.client_hello(&[0x16]).is_none());
         assert!(c.dns_answers(&[0; 12]).is_none());
+    }
+
+    /// Review of #481 (R14b-5, RB2): a batch answered with fewer or more
+    /// decodes than names leaves every name of it without a decode — one
+    /// entry per name, counted — never a shorter list whose pairing with
+    /// the records would drop events.
+    #[test]
+    fn a_short_or_long_answer_never_drops_a_name() {
+        let mut c = ParseClient::new(None);
+        let name = |s: &str| QnameOut {
+            name: s.into(),
+            end: None,
+        };
+        let mut out = Vec::new();
+        c.fill(&mut out, 3, Ok(vec![name("a")]));
+        c.fill(&mut out, 1, Ok(vec![name("b"), name("c")]));
+        c.fill(&mut out, 2, Ok(Vec::new()));
+        assert_eq!(out, vec![None; 6]);
+        assert_eq!((c.decoded, c.unparsed), (0, 6));
+        assert!(
+            c.last_why.contains("0 decodes for 2 names"),
+            "{}",
+            c.last_why
+        );
+        c.fill(&mut out, 2, Ok(vec![name("d"), name("e")]));
+        assert_eq!(out.len(), 8);
+        assert_eq!(out[6].as_ref().map(|q| q.name.as_str()), Some("d"));
+        assert_eq!((c.decoded, c.unparsed), (2, 6));
     }
 }

@@ -36,6 +36,13 @@ enum Script {
     /// Review of #480 (F2): answers each ping on time (it watches its
     /// queue's length) but never reads a request.
     NoRead,
+    /// Review of #481 (R14b-1): a refusal of every checked request; an
+    /// empty name for a name's bytes; an end that is not just past the
+    /// root label. (R14b-2): the names answered after 100 ms.
+    RefuseAll,
+    EmptyNames,
+    EndOffRoot,
+    SlowNames,
 }
 
 fn level() -> SandboxLevel {
@@ -193,6 +200,37 @@ fn run_script(script: Script, sock: OwnedFd, pid: u32) {
                 ),
                 _ => send(fd, &reply(honest)),
             },
+            Script::RefuseAll => match &msg.req {
+                Request::Ping => send(fd, &reply(honest)),
+                _ => send(
+                    fd,
+                    &reply(Answer::Refused(nn_proto::ipc::Refusal::OutOfBounds)),
+                ),
+            },
+            Script::EmptyNames | Script::EndOffRoot => match &msg.req {
+                Request::DnsNames(n) => send(
+                    fd,
+                    &reply(Answer::DnsNames(
+                        n.iter()
+                            .map(|_| QnameOut {
+                                name: if script == Script::EmptyNames {
+                                    String::new()
+                                } else {
+                                    "example.com".into()
+                                },
+                                end: (script == Script::EndOffRoot).then_some(2),
+                            })
+                            .collect(),
+                    )),
+                ),
+                _ => send(fd, &reply(honest)),
+            },
+            Script::SlowNames => {
+                if matches!(msg.req, Request::DnsNames(_)) {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                send(fd, &reply(honest));
+            }
             Script::TooManyNames => match &msg.req {
                 Request::DnsNames(n) => send(
                     fd,
@@ -325,6 +363,70 @@ fn names() -> Request {
     }])
 }
 
+fn names_find_end() -> Request {
+    Request::DnsNames(vec![QnameIn {
+        bytes: b"\x07example\x03com\x00\x00\x01".to_vec(),
+        form: nn_proto::ipc::QnameForm::WireFindEnd,
+    }])
+}
+
+/// Review of #481 (RB3): a request out of the protocol's bounds never
+/// reaches the worker — the core refuses it before it sends it, so the
+/// worker's refusal (a violation now) is never provoked by the core.
+#[test]
+fn a_request_out_of_bounds_is_refused_before_it_is_sent() {
+    let f = fixture(Script::Honest);
+    assert!(tick_until(&f.workers, Health::Ready));
+    let big = Request::DnsNames(vec![QnameIn {
+        bytes: vec![1; nn_proto::ipc::MAX_QNAME_IN + 1],
+        form: nn_proto::ipc::QnameForm::Wire,
+    }]);
+    let got = f
+        .workers
+        .request(WorkerKind::Parse, &big, Duration::from_secs(2));
+    assert!(matches!(got, Err(WorkerError::Refused(_))), "{got:?}");
+    let st = &f.workers.status()[0];
+    assert_eq!((st.violations, st.deaths), (0, 0), "{st:?}");
+    assert_eq!(st.health, Health::Ready);
+    // and the worker serves the next one
+    assert!(f
+        .workers
+        .request(WorkerKind::Parse, &names(), Duration::from_secs(2))
+        .is_ok());
+}
+
+/// Review of #481 (R14b-2, RB1): a batch of names waits at most
+/// `NAMES_TIMEOUT`, well under the connects' wait for the DNS pass
+/// (`INGEST_WAIT`): a worker that answers in 100 ms is a hang — killed,
+/// signed — and its names have no decode; it never slows the pass to the
+/// connects' wait.
+#[test]
+fn a_slow_worker_is_a_hang_well_before_the_connects_wait() {
+    use crate::worker::parse::{ParseClient, NAMES_TIMEOUT};
+    assert!(
+        NAMES_TIMEOUT * 4 < crate::net::dns_ingest::INGEST_WAIT,
+        "{NAMES_TIMEOUT:?}"
+    );
+    let f = fixture(Script::SlowNames);
+    assert!(tick_until(&f.workers, Health::Ready));
+    let mut parse = ParseClient::new(Some(f.workers.clone()));
+    let q = || QnameIn {
+        bytes: b"\x07example\x03com\x00".to_vec(),
+        form: nn_proto::ipc::QnameForm::Wire,
+    };
+    let t = Instant::now();
+    let got = parse.names(vec![q(), q()]);
+    assert!(
+        t.elapsed() < Duration::from_millis(100),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(got, vec![None, None]);
+    assert_eq!(parse.unparsed, 2);
+    let st = &f.workers.status()[0];
+    assert_eq!((st.hangs, st.deaths), (1, 1), "{st:?}");
+}
+
 #[test]
 fn an_honest_worker_serves_and_its_pid_is_registered_then_evicted() {
     let f = fixture(Script::Honest);
@@ -436,6 +538,18 @@ fn every_protocol_violation_kills_the_worker_and_is_reported() {
         (Script::Descriptor, Request::Ping, "carried a descriptor"),
         (Script::BadCharset, names(), "name characters"),
         (Script::TooManyNames, names(), "one answer per name"),
+        // review of #481 (R14b-1)
+        (Script::RefuseAll, names(), "a checked request refused"),
+        (
+            Script::EmptyNames,
+            names(),
+            "an empty name for a name's bytes",
+        ),
+        (
+            Script::EndOffRoot,
+            names_find_end(),
+            "an end not past a root label",
+        ),
     ] {
         let f = fixture(script);
         assert!(tick_until(&f.workers, Health::Ready), "{script:?}");
