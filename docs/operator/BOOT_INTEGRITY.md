@@ -54,8 +54,18 @@ type it can be forged by `unsafe` code — the guarantee is safe Rust's.
 | 2. attach | the eBPF object loads (and pins its maps); the sensors; the deny hooks (`anti_tamper::attach`) | sensors, deny hooks |
 | 3. self-test | one deny hook exercised against the agent (section 3) | self-test |
 | 4. attest | the signed audit log, opened in the preflight, takes `agent_boot`; every degradation found so far is signed (section 4) | `agent_boot`, boot degradations |
-| 5. subsystems | the blocklists, the rule engine, the response executor, the posture, the FIM observers and the file-open sensor, the drains, the admin socket; R14a: the workers' supervisor, which starts the `parse` worker (`docs/operator/WORKERS.md`) once the deny hooks are attached and `PROTECTED_PIDS` is pinned | — |
-| 6. run | the capability manifest and the trust level are signed (sections 5 and 6); `READY=1`; the event loop | capability manifest |
+| 5. subsystems | the blocklists, the rule engine, the response executor, the posture, the FIM observers and the file-open sensor, the drains, the admin socket's serve loop (built here, bound in phase 6, below); R14a: the workers' supervisor, which starts the `parse` worker (`docs/operator/WORKERS.md`) once the deny hooks are attached and `PROTECTED_PIDS` is pinned | — |
+| 6. run | the capability manifest and the trust level are signed (sections 5 and 6); `READY=1`; the heartbeat's start beat (its `telemetry_loss at: start` row); **then the admin socket is bound**; the event loop | capability manifest |
+
+The admin socket's path appears only once the agent is armed and its start
+beat is written (#482's CI found a signed shutdown answered before the
+run's `telemetry_loss at: start` row): every admin command, and so every
+admin row of the audit log, follows the run's start rows (`agent_boot`,
+`capability_manifest`, the start beat's `telemetry_loss`). Until then a
+client finds no socket and waits, as install.sh (`ADMIN_SOCKET_WAIT`) and
+the watchdog already did for the boot before it. The stop's rows, in order:
+the capability manifest's pending changes (its stop flush), the stop beat's
+`telemetry_loss at: stop`, `agent_stop` last.
 
 R14a: before any phase — before the runtime is built — the agent opens
 its own binary (`/proc/self/exe`, read-only) and keeps the descriptor: its
