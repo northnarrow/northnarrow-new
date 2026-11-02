@@ -449,6 +449,8 @@ fn spawn_lineage_sweep(
     let spawned = std::thread::Builder::new()
         .name("nn-lineage-sweep".to_string())
         .spawn(move || {
+            // review of #482 (R14c-4): the core's set, whoever starts it
+            nn_linux::caps::restore_core();
             let mut evicted_live = 0;
             loop {
                 std::thread::sleep(LINEAGE_SWEEP_EVERY);

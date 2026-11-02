@@ -10,13 +10,21 @@
 //! `AgentSigningKey` that signs, a `Vault` that seals and opens), never a
 //! key. Test code aside: files of tests, modules declared under
 //! `#[cfg(test)]`, a file's `#[cfg(test)]` module.
+//!
+//! Review of #482 (R14c-5, the reviewer's plantings P3, P4, P7, P8): also
+//! the vault made for a path (`Vault::at`: a second reader of the master
+//! key), the key's public half read from its file (`public_half`), the
+//! key file's path (`DEFAULT_SIGNING_KEY_PATH`), and the crypto's own
+//! types under any alias (`AesGcm`, `Aes256`, `Hmac`, `SecretKey`,
+//! `ExpandedSecretKey`) — outside the store only where [`ALLOWED`] says,
+//! that many times, and why.
 
 mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use support::{repo_root, strip_comments};
+use support::{production, repo_root, strip_comments};
 
 const TREES: &[&str] = &[
     "agent/src",
@@ -33,6 +41,50 @@ const NAMES: &[&str] = &[
     "mint_signing_key",
     "load_or_init_master_key",
     "Locked::new",
+    // review of #482 (R14c-5)
+    "Vault::at",
+    "public_half",
+    "DEFAULT_SIGNING_KEY_PATH",
+    "AesGcm",
+    "Aes256",
+    "Hmac",
+    "SecretKey",
+    "ExpandedSecretKey",
+];
+
+/// Review of #482 (R14c-5): the names used outside the store on purpose —
+/// `(file, name, times, why)`; one more use anywhere fails.
+const ALLOWED: &[(&str, &str, usize, &str)] = &[
+    (
+        "agent/src/lib.rs",
+        "public_half",
+        1,
+        "the agent's `audit` shim re-exports it for the two readers below",
+    ),
+    (
+        "agent/src/lib.rs",
+        "DEFAULT_SIGNING_KEY_PATH",
+        1,
+        "the shim's re-export of the path (for the command line's default)",
+    ),
+    (
+        "agent/src/config/overlay_floor.rs",
+        "public_half",
+        1,
+        "the boot's rollback floor, read before the key store exists: the published half",
+    ),
+    (
+        "agent/src/admin_host.rs",
+        "public_half",
+        1,
+        "nn-admin's host verifies a chain in its own process, which has no key store",
+    ),
+    (
+        "agent/src/boot/cli.rs",
+        "DEFAULT_SIGNING_KEY_PATH",
+        1,
+        "the command line's default for --signing-key-file (a path, no read)",
+    ),
 ];
 
 fn rs_files(dir: &Path) -> Vec<PathBuf> {
@@ -40,19 +92,6 @@ fn rs_files(dir: &Path) -> Vec<PathBuf> {
     support::rs_files(dir, &mut out);
     out.sort();
     out
-}
-
-/// The code of `text` before its test module.
-fn production(text: &str) -> &str {
-    [
-        "\n#[cfg(test)]\nmod ",
-        "\n#[cfg(test)]\npub mod ",
-        "\n#[cfg(test)]\npub(crate) mod ",
-    ]
-    .iter()
-    .filter_map(|m| text.find(m))
-    .min()
-    .map_or(text, |at| &text[..at])
 }
 
 /// Every occurrence of `name` as a whole word (`AgentSigningKey` and
@@ -116,11 +155,17 @@ fn the_keys_are_named_in_one_place() {
         let code = strip_comments(&fs::read_to_string(f).unwrap());
         let code = production(&code);
         for n in NAMES {
-            let k = names(code, n);
+            let k = names(&code, n);
+            let allowed = ALLOWED
+                .iter()
+                .find(|(f, name, _, _)| *f == rel && name == n)
+                .map_or(0, |a| a.2);
             if rel.starts_with(KEYS) {
                 in_keys += k;
-            } else if k > 0 {
-                bad.push(format!("{rel}: names `{n}` {k} time(s)"));
+            } else if k != allowed {
+                bad.push(format!(
+                    "{rel}: names `{n}` {k} time(s) (allowed: {allowed})"
+                ));
             }
         }
     }
@@ -166,8 +211,39 @@ fn the_key_store_is_not_clone_and_hands_out_handles() {
 #[test]
 fn a_planted_key_outside_the_store_is_found() {
     let planted = "fn f() { let k = ed25519_dalek::SigningKey::from_bytes(&[0; 32]); }";
-    assert_eq!(names(production(&strip_comments(planted)), "SigningKey"), 1);
+    assert_eq!(
+        names(&production(&strip_comments(planted)), "SigningKey"),
+        1
+    );
+    // review of #482: the reviewer's P3, P4, P7, P8
+    for (planted, name) in [
+        (
+            "fn f() { let k = std::fs::read_to_string(DEFAULT_SIGNING_KEY_PATH); }",
+            "DEFAULT_SIGNING_KEY_PATH",
+        ),
+        (
+            "fn f(p: &Path) { let v = crate::keys::public_half(p); }",
+            "public_half",
+        ),
+        (
+            "type C = aes_gcm::AesGcm<aes_gcm::aes::Aes256, U12>;",
+            "AesGcm",
+        ),
+        ("type C = aes_gcm::AesGcm<aes_gcm::aes::Aes256, U12>;", "Aes256"),
+        (
+            "fn f() { let v = crate::keys::Vault::at(Path::new(\"/etc/northnarrow/master.key\")); }",
+            "Vault::at",
+        ),
+        ("fn f() { let m = hmac::Hmac::<sha2::Sha256>::new_from_slice(k); }", "Hmac"),
+    ] {
+        assert_eq!(names(&production(&strip_comments(planted)), name), 1, "{planted}");
+    }
+    assert_eq!(names("Aes256Gcm", "Aes256"), 0);
+    assert_eq!(names("ExpandedSecretKey", "SecretKey"), 0);
     assert_eq!(names("AgentSigningKey VerifyingKey", "SigningKey"), 0);
     let tested = format!("fn g() {{}}\n#[cfg(test)]\nmod tests {{\n{planted}\n}}\n");
-    assert_eq!(names(production(&strip_comments(&tested)), "SigningKey"), 0);
+    assert_eq!(
+        names(&production(&strip_comments(&tested)), "SigningKey"),
+        0
+    );
 }

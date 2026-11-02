@@ -22,7 +22,7 @@ mod support;
 use std::fs;
 use std::path::PathBuf;
 
-use support::{repo_root, strip_comments};
+use support::{production, repo_root, strip_comments};
 
 const TREES: &[&str] = &[
     "agent/src",
@@ -42,13 +42,6 @@ fn rs_files(dir: &std::path::Path) -> Vec<PathBuf> {
     support::rs_files(dir, &mut out);
     out.sort();
     out
-}
-
-/// The code of `text` without its test module (`#[cfg(test)]` on a `mod`
-/// and what follows it: the convention of this tree, the module last).
-fn production(text: &str) -> &str {
-    text.find("\n#[cfg(test)]\nmod ")
-        .map_or(text, |at| &text[..at])
 }
 
 fn is_test_file(rel: &str) -> bool {
@@ -75,7 +68,7 @@ fn the_core_names_no_parser_outside_the_worker() {
                     bad.push(format!("{rel}: re-exports a parser"));
                 }
             } else {
-                bad.extend(core_reaches_a_parser(code).map(|why| format!("{rel}: {why}")));
+                bad.extend(core_reaches_a_parser(&code).map(|why| format!("{rel}: {why}")));
             }
         }
     }
@@ -151,7 +144,7 @@ fn a_planted_parser_in_the_core_fails() {
     ] {
         let code = strip_comments(planted);
         assert!(
-            core_reaches_a_parser(production(&code)).is_some(),
+            core_reaches_a_parser(&production(&code)).is_some(),
             "{planted}"
         );
     }

@@ -92,6 +92,9 @@ impl Vault {
             return Ok(Arc::clone(k));
         }
         let k = Arc::new(Locked::new(load_or_init_master_key(&self.0.path)?)?);
+        // review of #482 (R14c-3): as the signing key's — signed when the
+        // memory is not locked or not out of the dumps
+        super::report_memory("the vault's master key", k.locked(), k.dontdump());
         *slot = Some(Arc::clone(&k));
         Ok(k)
     }
@@ -131,6 +134,14 @@ impl Vault {
     }
 }
 
+/// A vault for the master key at `path`, for the tests' configurations
+/// without the key store's (`vault_of` in the quarantine); no build of the
+/// binaries has it.
+#[cfg(any(test, feature = "test-util"))]
+pub fn for_tests(path: &Path) -> Vault {
+    Vault::at(path)
+}
+
 impl nn_core::response::config::VaultKey for Vault {
     fn seal(&self, vault_id: &str, nonce: &[u8; 12], content: &[u8]) -> std::io::Result<Vec<u8>> {
         self.seal_v2(vault_id, nonce, content)
@@ -145,19 +156,32 @@ impl nn_core::response::config::VaultKey for Vault {
 
 /// Load the 32-byte master key at `path`. Generate + write mode 0600 on
 /// first use (the quarantine's `load_or_init_master_key` until R14c).
+///
+/// Review of #482 (R14c-7): read as the signing key is
+/// (`super::read_key_bytes`: a regular file, never a wait on a FIFO, at
+/// most 4 KiB, zeroed); an absent file is created; anything else at the
+/// name is an error, never replaced.
 pub(crate) fn load_or_init_master_key(path: &Path) -> std::io::Result<Zeroizing<[u8; 32]>> {
-    if let Ok(bytes) = fs::read(path) {
-        let bytes = Zeroizing::new(bytes);
-        if bytes.len() == 32 {
+    match super::read_key_bytes(path) {
+        Ok(bytes) if bytes.len() == 32 => {
             let mut k = Zeroizing::new([0u8; 32]);
             k.copy_from_slice(&bytes);
             return Ok(k);
         }
-        return Err(std::io::Error::other(format!(
-            "master key at {} has wrong length {}",
-            path.display(),
-            bytes.len()
-        )));
+        Ok(bytes) => {
+            return Err(std::io::Error::other(format!(
+                "master key at {} has wrong length {}",
+                path.display(),
+                bytes.len()
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("master key at {}: {e}", path.display()),
+            ))
+        }
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;

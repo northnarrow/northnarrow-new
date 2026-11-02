@@ -4624,8 +4624,42 @@ only in the table below, in the same PR as the evidence.
     (25 caught; 4 survivors given tests; `MC15` equivalent — seccompiler
     sets `no_new_privs` itself, the redundant call removed, the mutation
     redone; `MC25` a site error, redone): 7 of 7 caught on the rerun.
+  - R14c — review of #482 (an independent review; its mutations RC1–RC5
+    and plantings P3–P8): R14c-1 (the decision's filter did not stop what
+    uid 0 needs no capability for — `/proc/<pid>/mem` opened for writing
+    through `CAP_SYS_PTRACE`, a root file written as its owner, a root
+    process signalled by equal uid: the filter now refuses every writing
+    open and every signal to another process, the lab's trace of the
+    refused calls in the notes below; §8 and the `caps` docs say what it
+    still does not refuse), R14c-2 (the crypto crates' `zeroize` features
+    on — the lockfiles gain dependency edges only; the public half read
+    from `agent.sig.pub`; a key file read into a bounded, zeroed buffer),
+    R14c-3 (a key's memory not locked or not out of the dumps is a signed
+    `key_memory`, the master key's too; RC1 and RC4 given tests), R14c-4
+    (`nn-cow-restore` and every thread the core starts take the core's set
+    or a role, pinned by a source test — P5; a thread that cannot is a
+    signed `thread_caps`; RC3 given a test), R14c-5 (`keys_in_one_place`
+    refuses `Vault::at`, `public_half`, `DEFAULT_SIGNING_KEY_PATH` and the
+    crypto's types outside the store but where it lists them — P3, P4, P7,
+    P8; the quarantine's own master-key fallback is the tests' only;
+    `thread_roles` pins the errands' three callers — P6), R14c-6 (the
+    errands' wait bounded at 2 s, `rpm -qf` at 1.5 s, `--` before its
+    path), R14c-7 (the master key read as the signing key is), RC5 (the
+    x32 twins' numbers tested), MP2 (a second worker kind does not build
+    until `check_hello`'s kind check gets its test). The three source
+    tests cut a file's test code by its `#[cfg(test)]` items, no longer at
+    the first test module's declaration (which left most of the agent's
+    `lib.rs` unchecked).
   - R14c — open: the decision at ∅ behind a `/proc` broker thread; the
     chain writers on threads of their own with `LINUX_IMMUTABLE` only; the
     runtime's tasks narrowed; the lab's R009 flake (on `main` too): right
     after an agent start under the lab's load, R009 can kill the lab's own
-    `install.sh`/`uninstall.sh`.
+    `install.sh`/`uninstall.sh`. From the review of #482: a read-only
+    Landlock domain for the decision thread (the path-changing calls uid 0
+    needs no capability for: `unlink`, `rename`, `chmod`…); a filter rule
+    refusing the decision thread a new thread (`clone` of a thread,
+    `clone3`); a signing thread with a locked, wiped stack (ed25519-dalek
+    leaves `SHA-512(secret)` on the signer's stack); `MADV_WIPEONFORK` on
+    the keys' mappings; typed errands (an enum, not a closure); nn-admin's
+    sources in `keys_in_one_place`; a round of the copy-on-first-write
+    guard under the capability trace.

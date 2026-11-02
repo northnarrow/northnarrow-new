@@ -32,6 +32,27 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`SystemCallArchitectures=native`) and a personality change
   (`LockPersonality=yes`); the self-integrity round expects the process's
   `no_new_privs`, seccomp mode and core limit the unit sets.
+  After the review of #482: the decision thread's filter also refuses a
+  file opened for writing (`open`/`openat` to write, create or truncate,
+  `creat`, `openat2`) and a signal to another process (`kill`, `tgkill`,
+  `rt_sig*queueinfo` to another thread group, `tkill`,
+  `pidfd_send_signal`) — as uid 0 neither needs a capability — and the
+  process model says what it still does not refuse (the other calls that
+  change a root-owned file by its path; reading another process's files
+  through `/proc`); every thread the core starts takes a role or the
+  core's set (the copy-on-first-write guard's restore thread, started by a
+  response worker, kept that worker's set), a thread that cannot is a
+  signed degradation, and a source test pins it; the errands wait at most
+  2 s for an answer and `rpm -qf` at most 1.5 s (`--` before the path);
+  the crypto crates are built with their `zeroize` features (the lockfiles
+  gain dependency edges only: no package, no version); a key's memory not
+  locked or not out of the dumps is a signed degradation (`key_memory`),
+  the master key's too; the master key is read as the signing key is
+  (a regular file, never a FIFO, bounded, zeroed); the signing key's
+  public half is read from `agent.sig.pub`, the private key only on a host
+  without one; no production path reads the master key but the key store;
+  the source tests of the keys, the threads and the parsers no longer stop
+  at the first `#[cfg(test)] mod x;` declaration of a file.
 - The parsers in the worker (lot 272, Wave 4 phase 2, R14b of the
   restructure plan, §3.1, §3.5): the DNS pump's query names are decoded by
   the `parse` worker, in batches of at most 512 names whose worst answer

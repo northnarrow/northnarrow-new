@@ -56,12 +56,28 @@ use super::{config::ExecutorConfig, ExecutionOutcome};
 use crate::keys::vault::{bad_record, record_format, RECORD_V2};
 
 /// R14c: the vault `cfg` seals and opens through — the key store's
-/// ([`ExecutorConfig::vault`]), or, in a configuration without it (the
-/// tests'), one for its path.
-fn vault_of(cfg: &ExecutorConfig) -> std::sync::Arc<dyn nn_core::response::config::VaultKey> {
-    cfg.vault
-        .clone()
-        .unwrap_or_else(|| std::sync::Arc::new(crate::keys::Vault::at(&cfg.master_key_file)))
+/// ([`ExecutorConfig::vault`]). Review of #482 (R14c-5): a configuration
+/// without it reads no master key of its own in the agent's builds — the
+/// quarantine fails, said; the tests' builds make one for its path.
+fn vault_of(
+    cfg: &ExecutorConfig,
+) -> std::io::Result<std::sync::Arc<dyn nn_core::response::config::VaultKey>> {
+    if let Some(v) = &cfg.vault {
+        return Ok(std::sync::Arc::clone(v));
+    }
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        Ok(std::sync::Arc::new(crate::keys::vault::for_tests(
+            &cfg.master_key_file,
+        )))
+    }
+    #[cfg(not(any(test, feature = "test-util")))]
+    {
+        Err(std::io::Error::other(
+            "no vault: the key store's is not in the executor's configuration (the master key \
+             is read by the key store only)",
+        ))
+    }
 }
 
 /// Paths that are NEVER quarantined, whatever the verdict says.
@@ -455,7 +471,7 @@ pub fn restore(vault_id: &str, out_path: &Path, cfg: &ExecutorConfig) -> std::io
         return Err(std::io::Error::other("vault file too short"));
     }
 
-    let vault = vault_of(cfg);
+    let vault = vault_of(cfg)?;
     let plaintext = match declared_format(&meta)? {
         // Written before lab PR 238: a v1 record, read as one whatever its
         // first (random) bytes are.
@@ -616,7 +632,7 @@ fn quarantine_file_after_check(
     let vault_id = uuid::Uuid::new_v4().simple().to_string();
     let mut nonce = [0u8; NONCE_LEN];
     crate::os_rng::OsRng.fill_bytes(&mut nonce);
-    let record = vault_of(cfg)
+    let record = vault_of(cfg)?
         .seal(&vault_id, &nonce, &content)
         .map_err(|e| QuarantineError::Crypto(format!("{e}")))?;
 

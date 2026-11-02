@@ -156,6 +156,158 @@ fn the_decision_thread_cannot_exec_load_or_change_its_sets() {
     assert!(st.success());
 }
 
+/// Review of #482 (R14c-1; the reviewer's temporary test, kept): the
+/// decision thread opens no file for writing — not another process's
+/// `/proc/<pid>/mem` (what its `SYS_PTRACE` would open as uid 0), not a
+/// file it owns — and signals no other process; it still reads, and still
+/// signals itself (an abort). The rest of the process is unaffected.
+#[test]
+fn the_decision_thread_writes_no_file_and_signals_no_other_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("owned");
+    std::fs::write(&file, b"x").unwrap();
+    // a process of ours to aim at (a descendant: Yama's scope 1 lets this
+    // process open its memory without the filter)
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let kid = child.id() as i32;
+    let f2 = file.clone();
+    std::thread::spawn(move || {
+        let e = enter(Role::Decision).unwrap();
+        assert_eq!(e.filter, Some(Ok(())), "{}", e.line());
+        let refused = |r: std::io::Result<std::fs::File>, what: &str| {
+            assert_eq!(
+                r.map(|_| ()).map_err(|e| e.raw_os_error()),
+                Err(Some(libc::EPERM)),
+                "{what}"
+            );
+        };
+        let open = |p: &std::path::Path, w: bool, c: bool, t: bool| {
+            std::fs::OpenOptions::new()
+                .read(!w)
+                .write(w)
+                .create(c)
+                .truncate(t)
+                .open(p)
+        };
+        refused(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("/proc/{kid}/mem")),
+            "another process's memory, read-write",
+        );
+        refused(open(&f2, true, false, false), "a file it owns, write");
+        refused(open(&f2, true, false, true), "truncate");
+        refused(
+            open(&f2.with_file_name("new"), true, true, false),
+            "a new file",
+        );
+        // SAFETY: raw syscalls with local, valid arguments.
+        let rc = |r: libc::c_long| {
+            if r < 0 {
+                io::Error::last_os_error().raw_os_error()
+            } else {
+                None
+            }
+        };
+        let path = std::ffi::CString::new(f2.to_str().unwrap()).unwrap();
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            rc(unsafe { libc::syscall(libc::SYS_creat, path.as_ptr(), 0o600) }),
+            Some(libc::EPERM),
+            "creat"
+        );
+        let how = [0u64; 3]; // open_how: O_RDONLY, no mode, no resolve
+        assert_eq!(
+            rc(unsafe {
+                libc::syscall(
+                    libc::SYS_openat2,
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    how.as_ptr(),
+                    24usize,
+                )
+            }),
+            Some(libc::EPERM),
+            "openat2, whatever it asks"
+        );
+        // what it keeps: reading
+        assert!(open(&f2, false, false, false).is_ok());
+        assert!(std::fs::read_to_string("/proc/self/status").is_ok());
+        assert!(std::fs::read_link(format!("/proc/{kid}/exe")).is_ok());
+        // signals: none to another process or a group, its own allowed
+        let me = std::process::id() as i32;
+        // SAFETY: gettid has no preconditions.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        // SAFETY (below): signal 0 checks only; nothing is delivered.
+        assert_eq!(
+            rc(unsafe { libc::kill(kid, 0) } as libc::c_long),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            rc(unsafe { libc::kill(0, 0) } as libc::c_long),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            rc(unsafe { libc::kill(-1, 0) } as libc::c_long),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            rc(unsafe { libc::syscall(libc::SYS_tgkill, kid, kid, 0) }),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            rc(unsafe { libc::syscall(libc::SYS_tkill, tid, 0) }),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            rc(unsafe { libc::syscall(libc::SYS_pidfd_send_signal, 0, 0, 0usize, 0) }),
+            Some(libc::EPERM)
+        );
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        info.si_code = -1; // SI_QUEUE
+        assert_eq!(
+            rc(unsafe {
+                libc::syscall(
+                    libc::SYS_rt_sigqueueinfo,
+                    kid,
+                    0,
+                    &mut info as *mut libc::siginfo_t,
+                )
+            }),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            rc(unsafe {
+                libc::syscall(
+                    libc::SYS_rt_tgsigqueueinfo,
+                    kid,
+                    kid,
+                    0,
+                    &mut info as *mut libc::siginfo_t,
+                )
+            }),
+            Some(libc::EPERM)
+        );
+        assert_eq!(rc(unsafe { libc::kill(me, 0) } as libc::c_long), None);
+        assert_eq!(
+            rc(unsafe { libc::syscall(libc::SYS_tgkill, me, tid, 0) }),
+            None
+        );
+    })
+    .join()
+    .unwrap();
+    // this thread: not filtered
+    std::fs::write(&file, b"y").unwrap();
+    // SAFETY: signal 0 to our own child.
+    assert_eq!(unsafe { libc::kill(kid, 0) }, 0);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[test]
 fn the_filter_lists_every_refused_call_with_its_x32_twin() {
     let names: Vec<&str> = filter::refused().iter().map(|r| r.1).collect();
@@ -182,6 +334,38 @@ fn the_filter_lists_every_refused_call_with_its_x32_twin() {
         assert_eq!(nr("ptrace (x32)"), 0x4000_0000 | 521);
         assert_eq!(nr("process_vm_readv (x32)"), 0x4000_0000 | 539);
         assert_eq!(nr("process_vm_writev (x32)"), 0x4000_0000 | 540);
+        // the review of #482's RC5: the common numbers' twins too
+        assert_eq!(nr("bpf (x32)"), 0x4000_0000 | 321);
+        assert_eq!(nr("capset (x32)"), 0x4000_0000 | 126);
+        assert_eq!(nr("pidfd_getfd (x32)"), 0x4000_0000 | 438);
+        let always = |n: &str| {
+            filter::refused_always()
+                .iter()
+                .find(|r| r.1 == n)
+                .unwrap()
+                .0
+        };
+        assert_eq!(always("creat (x32)"), 0x4000_0000 | 85);
+        assert_eq!(always("openat2 (x32)"), 0x4000_0000 | 437);
+        let when = |n: &str| filter::refused_when().iter().find(|r| r.1 == n).unwrap().0;
+        assert_eq!(when("rt_sigqueueinfo (x32)"), 0x4000_0000 | 524);
+        assert_eq!(when("rt_tgsigqueueinfo (x32)"), 0x4000_0000 | 536);
+        assert_eq!(when("openat (x32)"), 0x4000_0000 | 257);
+    }
+    // review of #482 (R14c-1): the writing opens and the signals
+    let always: Vec<&str> = filter::refused_always().iter().map(|r| r.1).collect();
+    for n in ["openat2", "tkill", "pidfd_send_signal"] {
+        assert!(always.contains(&n), "{n}");
+    }
+    let when: Vec<&str> = filter::refused_when().iter().map(|r| r.1).collect();
+    for n in [
+        "openat",
+        "kill",
+        "tgkill",
+        "rt_sigqueueinfo",
+        "rt_tgsigqueueinfo",
+    ] {
+        assert!(when.contains(&n), "{n}");
     }
     assert!(filter::program().is_ok());
 }
@@ -376,4 +560,91 @@ fn an_incomplete_role_is_said() {
         "{}",
         d.line()
     );
+}
+
+/// Review of #482 (RC3): a role entered incomplete, or not at all, is a
+/// signed degradation (`thread_caps`) — the registry holds it.
+#[test]
+fn an_incomplete_or_failed_role_is_a_signed_degradation() {
+    let full = CapSet::from_bits(u64::MAX >> 23);
+    let incomplete = Entered {
+        role: Role::Writer,
+        before: ThreadCaps {
+            effective: full,
+            permitted: full,
+            inheritable: CapSet::EMPTY,
+        },
+        after: ThreadCaps {
+            effective: full,
+            permitted: full,
+            inheritable: CapSet::EMPTY,
+        },
+        missing: CapSet::EMPTY,
+        filter: None,
+    };
+    assert!(!incomplete.complete());
+    let name = "nn-rc3-incomplete";
+    assert!(report_entered(name, Role::Writer, Ok(incomplete)).is_some());
+    let failed = "nn-rc3-failed";
+    assert!(report_entered(
+        failed,
+        Role::Writer,
+        Err(io::Error::other("capset refused"))
+    )
+    .is_none());
+    let rows = crate::boot::degradation::entries();
+    for who in [name, failed] {
+        assert!(
+            rows.iter()
+                .any(|d| d.source == "thread_caps" && d.detail.contains(who)),
+            "{who}: {rows:?}"
+        );
+    }
+}
+
+/// Review of #482 (R14c-4): `restore_core`'s judgement — the core's set
+/// taken back; a thread born of one that gave its sets up, or whose sets
+/// cannot be set, said (the caller signs it).
+#[test]
+fn restore_core_takes_the_core_s_set_back_or_says_why_not() {
+    // CHOWN (0) and FOWNER (3): what the CoW guard's restore needs
+    let core = CapSet::of(&[0, 3, cap::KILL, cap::SYS_PTRACE]);
+    let actuator = ThreadCaps {
+        effective: CapSet::of(&[cap::KILL]),
+        permitted: core,
+        inheritable: CapSet::EMPTY,
+    };
+    let mut set_to = None;
+    let got = restore_core_judged(Ok(actuator), Some(core), |t| {
+        set_to = Some(t);
+        Ok(())
+    });
+    assert_eq!(got, None);
+    assert_eq!(set_to.map(|t| t.effective), Some(core));
+    // already the core's: nothing set
+    let whole = ThreadCaps {
+        effective: core,
+        permitted: core,
+        inheritable: CapSet::EMPTY,
+    };
+    assert_eq!(
+        restore_core_judged(Ok(whole), Some(core), |_| panic!("set")),
+        None
+    );
+    // born of the decision thread: permitted SYS_PTRACE only
+    let decided = ThreadCaps {
+        effective: CapSet::of(&[cap::SYS_PTRACE]),
+        permitted: CapSet::of(&[cap::SYS_PTRACE]),
+        inheritable: CapSet::EMPTY,
+    };
+    let why = restore_core_judged(Ok(decided), Some(core), |_| panic!("set")).unwrap();
+    assert!(
+        why.contains("gave its sets up") && why.contains("CHOWN"),
+        "{why}"
+    );
+    // the set refused, the sets unreadable
+    let why =
+        restore_core_judged(Ok(actuator), Some(core), |_| Err(io::Error::other("EPERM"))).unwrap();
+    assert!(why.contains("could not be restored"), "{why}");
+    assert!(restore_core_judged(Err(io::Error::other("x")), Some(core), |_| Ok(())).is_some());
 }

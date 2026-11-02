@@ -28,6 +28,11 @@ use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 use crate::chain_host_linux::LinuxHost;
 use crate::decision::rule_policy::ActorFacts;
 
+/// Review of #482 (R14c-6): the longest an `rpm -qf` may take — under the
+/// errand's own wait ([`crate::caps::errands::ERRAND_WAIT`]).
+const RPM_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+const _: () = assert!(RPM_WAIT.as_millis() < crate::caps::errands::ERRAND_WAIT.as_millis());
+
 impl DecisionHost for LinuxHost {
     fn off_the_runtime<T>(f: impl FnOnce() -> T) -> T {
         crate::runtime::off_the_runtime(f)
@@ -41,13 +46,13 @@ impl DecisionHost for LinuxHost {
         let path = path.to_string();
         crate::caps::errands::run(move || {
             let rpm = crate::trusted_bin::resolve("rpm").map_err(|e| e.to_string())?;
-            let status = rpm
-                .command()
-                .args(["-qf", "--quiet", &path])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            Ok(status.ok().map(|s| s.success()))
+            let mut cmd = rpm.command();
+            // review of #482 (R14c-6): `--` before the path (a path is
+            // never an option), and a deadline (a hung rpm is killed: the
+            // errands thread goes on)
+            cmd.args(["-qf", "--quiet", "--", &path]);
+            let out = crate::bounded_cmd::run_bounded(cmd, None, RPM_WAIT, "rpm -qf");
+            Ok(out.ok().map(|o| o.status.success()))
         })
         .unwrap_or_else(|| Err("the errands thread did not answer".to_string()))
     }

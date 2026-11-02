@@ -433,7 +433,10 @@ Lot 272 added `worker_parse` (R14a: the parse worker disabled after five
 failures in a row, its sandbox weaker than the kernel allows, a protocol
 violation — `WORKERS.md`) and `thread_caps` (R14c: a thread of the core
 left with more capabilities than its role, its seccomp filter refused,
-the loader's window not set, or the errands thread not started —
+the loader's window not set, the errands thread not started, or a thread
+that could not take the core's capabilities back — and `key_memory` (a
+key's memory not locked in RAM or not out of core dumps: raise
+`LimitMEMLOCK`/`RLIMIT_MEMLOCK` if it says `mlock refused`) —
 [the process model](https://github.com/northnarrow/northnarrow-new/blob/main/docs/architecture/PROCESS_MODEL.md) §8; the agent runs, with the core's
 capabilities on that thread).
 

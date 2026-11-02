@@ -304,7 +304,15 @@ impl Role {
     ///   a more privileged process without it. Measured in the lab
     ///   (`deploy/lab/caps/thread-caps.sh`): the one capability the
     ///   decision's checks were granted. Its filter takes away the parts of
-    ///   it that write: `ptrace`, `process_vm_writev`, `pidfd_getfd`.
+    ///   it that reach into a process: `ptrace`, `process_vm_readv`,
+    ///   `process_vm_writev`, `pidfd_getfd` — and (review of #482, R14c-1)
+    ///   every open for writing (a root process's `/proc/<pid>/mem`
+    ///   included) and every signal to another process, which uid 0 needs
+    ///   no capability for. Not refused: the other calls that change a
+    ///   root-owned file by its path (`unlink`, `rename`, `chmod`…), and
+    ///   reading another process's files through `/proc/<pid>/fd`
+    ///   (`docs/architecture/PROCESS_MODEL.md` §8; Open: a read-only
+    ///   Landlock domain for the thread, the `/proc` broker).
     /// - actuator: plan §3.2's actions — `KILL` (kill, `pidfd_send_signal`,
     ///   `cgroup.kill`), `NET_ADMIN` (nft, iptables), `SETFCAP` (the strip),
     ///   `DAC_OVERRIDE` (quarantine) — and `SYS_PTRACE`: quarantine and the
@@ -427,7 +435,19 @@ pub fn enter(role: Role) -> io::Result<Entered> {
 pub fn enter_or_report(role: Role) -> Option<Entered> {
     let thread = std::thread::current();
     let name = thread.name().unwrap_or("?");
-    match enter(role) {
+    report_entered(name, role, enter(role))
+}
+
+/// [`enter_or_report`]'s judgement of what [`enter`] did on thread `name`:
+/// a role taken whole is said in the journal; an incomplete one, or none,
+/// is a signed degradation (`thread_caps`; review of #482, RC3: the signed
+/// path has its test).
+pub(crate) fn report_entered(
+    name: &str,
+    role: Role,
+    entered: io::Result<Entered>,
+) -> Option<Entered> {
+    match entered {
         Ok(e) => {
             if e.complete() {
                 tracing::info!(thread = name, "thread capabilities: {}", e.line());
@@ -454,23 +474,67 @@ pub fn enter_or_report(role: Role) -> Option<Entered> {
 /// (permitted). A runtime thread starts with the sets of the thread that
 /// made it start (`spawn_blocking` from a role's thread); this gives it the
 /// core's back. A thread whose permitted set was given up (one started by
-/// the decision thread, which never starts any) cannot: said, once per
-/// thread, in the journal.
+/// the decision thread, which never starts any) cannot.
+///
+/// Review of #482 (R14c-4): a thread that cannot have the core's set back —
+/// its sets could not be read or set, or its permitted set is less than
+/// the thread group leader's (it was started from the decision thread,
+/// which gave its own up for good) — is a signed degradation
+/// (`thread_caps`), not a journal line only.
 pub fn restore_core() {
-    let Ok(now) = this_thread() else {
-        return;
+    let name = std::thread::current().name().unwrap_or("?").to_string();
+    if let Some(detail) = restore_core_judged(this_thread(), leader_permitted(), set_this_thread) {
+        let detail = format!("thread {name}: {detail}");
+        tracing::error!("thread capabilities: {detail}");
+        crate::boot::degradation::report("thread_caps", &detail);
+    }
+}
+
+/// The thread group leader's permitted set (`/proc/self/status`'s `CapPrm`
+/// is the leader's): the core's.
+fn leader_permitted() -> Option<CapSet> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let hex = status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapPrm:"))?
+        .trim();
+    u64::from_str_radix(hex, 16).ok().map(CapSet::from_bits)
+}
+
+/// What [`restore_core`] did, judged: `None` when the thread holds the
+/// core's set (now or already), else why not.
+pub(crate) fn restore_core_judged(
+    now: io::Result<ThreadCaps>,
+    leader: Option<CapSet>,
+    set: impl FnOnce(ThreadCaps) -> io::Result<()>,
+) -> Option<String> {
+    let now = match now {
+        Ok(n) => n,
+        Err(e) => return Some(format!("its capabilities could not be read ({e})")),
     };
+    if let Some(core) = leader {
+        let lost = core.minus(now.permitted);
+        if !lost.is_empty() {
+            return Some(format!(
+                "started from a thread that gave its sets up: it cannot take the core's back                  (missing {lost}; effective {})",
+                now.effective
+            ));
+        }
+    }
     if now.effective == now.permitted && now.inheritable.is_empty() {
-        return;
+        return None;
     }
     let target = ThreadCaps {
         effective: now.permitted,
         permitted: now.permitted,
         inheritable: CapSet::EMPTY,
     };
-    if let Err(e) = set_this_thread(target) {
-        tracing::error!(error = %e, effective = %now.effective, "a core thread's capabilities could not be restored");
-    }
+    set(target).err().map(|e| {
+        format!(
+            "the core's capabilities could not be restored ({e}); effective {}",
+            now.effective
+        )
+    })
 }
 
 /// The calling thread's effective set lowered to `role`'s (of what it

@@ -288,7 +288,11 @@ impl Runtime {
         let spawn = |name: &str, f: Box<dyn FnOnce() + Send>| {
             std::thread::Builder::new()
                 .name(name.to_string())
-                .spawn(f)
+                .spawn(move || {
+                    // review of #482 (R14c-4): the core's set, whoever starts it
+                    nn_linux::caps::restore_core();
+                    f()
+                })
                 .map(|_| ())
                 .map_err(|e| format!("spawn {name}: {e}"))
         };

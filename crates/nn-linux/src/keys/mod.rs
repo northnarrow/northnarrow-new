@@ -42,6 +42,37 @@ pub mod vault;
 use locked::Locked;
 pub use vault::Vault;
 
+/// Review of #482 (R14c-3): a key's memory not locked in RAM (`mlock`
+/// refused: `RLIMIT_MEMLOCK`) or not out of the core dumps (`MADV_DONTDUMP`
+/// refused) — the signing key's or the vault's master key — is a signed
+/// degradation (`key_memory`), said once per key and state. `true`: it was
+/// reported.
+pub(crate) fn report_memory(which: &str, locked: bool, dontdump: bool) -> bool {
+    match memory_detail(which, locked, dontdump) {
+        Some(detail) => {
+            warn!(target: "audit.signing_key", locked, dontdump, "{detail}");
+            crate::boot::degradation::report("key_memory", &detail);
+            true
+        }
+        None => false,
+    }
+}
+
+/// [`report_memory`]'s text, `None` when the memory is protected.
+pub(crate) fn memory_detail(which: &str, locked: bool, dontdump: bool) -> Option<String> {
+    if locked && dontdump {
+        return None;
+    }
+    let mut not = Vec::new();
+    if !locked {
+        not.push("locked in RAM (mlock refused: RLIMIT_MEMLOCK?) — it may be swapped out");
+    }
+    if !dontdump {
+        not.push("out of core dumps (MADV_DONTDUMP refused)");
+    }
+    Some(format!("{which}'s memory is not {}", not.join(", nor ")))
+}
+
 /// R14c: what a holder of the agent's key can do with it — sign, and say
 /// its public half. No method gives the secret.
 pub trait Signer: Send + Sync + std::fmt::Debug {
@@ -88,17 +119,12 @@ pub struct AgentSigningKey {
 
 impl AgentSigningKey {
     /// The key moved into memory of its own (`mlock`, `MADV_DONTDUMP`). A
-    /// lock the kernel refuses (`RLIMIT_MEMLOCK`) is said, not fatal.
+    /// lock the kernel refuses (`RLIMIT_MEMLOCK`) is not fatal: review of
+    /// #482 (R14c-3) — a signed degradation (`key_memory`), not a journal
+    /// line only.
     fn locked(key: SigningKey) -> Result<Self> {
         let inner = Locked::new(key).context("mapping the signing key's memory")?;
-        if !inner.locked() || !inner.dontdump() {
-            warn!(
-                target: "audit.signing_key",
-                locked = inner.locked(),
-                dontdump = inner.dontdump(),
-                "the signing key's memory is not locked or not out of the core dumps"
-            );
-        }
+        report_memory("the agent's signing key", inner.locked(), inner.dontdump());
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -308,30 +334,42 @@ pub mod test_doors {
 }
 
 /// R14c: the public half of the signing key at `path`, for a reader that
-/// verifies and never signs (the rollback floor's scan at boot, nn-admin's
-/// host): the key's own half when its file can be read — the key parsed
-/// here and dropped at once, zeroized — else the half published beside it
-/// (`agent.sig.pub`), which a restart under the previous instance's hooks
-/// (they close the key to it) can read. `Ok(None)`: there is no key.
+/// verifies and never signs (the rollback floor's scan at boot, before the
+/// key store exists; nn-admin's host, which has none). Review of #482
+/// (R14c-2): the half published beside the key (`agent.sig.pub`) first —
+/// the private key is not read; only a host without one (an install that
+/// predates it) has the key read and parsed here, and dropped at once,
+/// zeroized. A holder of the store asks it ([`KeyStore::verifying_half`]).
+/// `Ok(None)`: there is no key.
 pub fn public_half(path: &Path) -> Result<Option<VerifyingKey>, String> {
-    let own = read_key_file(path)
-        .map_err(|e| (e.kind() == std::io::ErrorKind::NotFound, anyhow!(e)))
-        .and_then(|(raw, _)| {
+    let published = verifying_key_path(path);
+    match fs::symlink_metadata(&published) {
+        Ok(_) => {
+            return read_verifying_key(&published)
+                .map(Some)
+                .map_err(|e| format!("the agent signing key's public half is unreadable ({e:#})"));
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "the agent signing key's public half is unreadable ({e})"
+            ));
+        }
+        Err(_) => {}
+    }
+    // a legacy host: the key's own half
+    match read_key_file(path) {
+        Ok((raw, _)) => {
             let raw = zeroize::Zeroizing::new(raw);
             parse_signing_key(&raw)
-                .map(|k| k.verifying_key())
-                .map_err(|e| (false, e))
-        });
-    match own {
-        Ok(v) => Ok(Some(v)),
-        Err((true, _)) => Ok(None),
-        Err((false, e)) => read_verifying_key(&verifying_key_path(path))
-            .map(Some)
-            .map_err(|p| {
-                format!(
-                    "the agent signing key is unreadable ({e:#}) and so is its public half ({p:#})"
-                )
-            }),
+                .map(|k| Some(k.verifying_key()))
+                .map_err(|e| {
+                    format!("the agent signing key is unreadable ({e:#}) and has no public half")
+                })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "the agent signing key is unreadable ({e}) and has no public half"
+        )),
     }
 }
 
@@ -356,15 +394,57 @@ const MAX_KEY_FILE_BYTES: u64 = 4096;
 /// device (a bind mount of `/dev/null`), a FIFO, a socket, a directory — is
 /// an `InvalidData` error naming what it is.
 fn read_key_file(path: &Path) -> std::io::Result<(String, (u64, u64))> {
+    use std::os::unix::fs::MetadataExt;
+    let f = open_regular(path)?;
+    let meta = f.metadata()?;
+    let opened = (meta.dev(), meta.ino());
+    let mut buf = read_bounded(f)?;
+    if std::str::from_utf8(&buf).is_err() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not UTF-8 text",
+        ));
+    }
+    // the bytes moved, not copied: the caller zeroes the text
+    String::from_utf8(std::mem::take(&mut *buf))
+        .map(|text| (text, opened))
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not UTF-8 text"))
+}
+
+/// A key file's bytes, at most [`MAX_KEY_FILE_BYTES`], read into a buffer
+/// of that size made once (review of #482, R14c-2: no growth, so no copy of
+/// the key left in a freed chunk) and zeroed when dropped.
+fn read_bounded(f: std::fs::File) -> std::io::Result<zeroize::Zeroizing<Vec<u8>>> {
     use std::io::Read;
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(MAX_KEY_FILE_BYTES as usize + 1));
+    f.take(MAX_KEY_FILE_BYTES + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_KEY_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("larger than {MAX_KEY_FILE_BYTES} bytes"),
+        ));
+    }
+    Ok(buf)
+}
+
+/// Review of #482 (R14c-7): a key file opened as the signing key's is —
+/// never waiting on a FIFO (`O_NONBLOCK`), a regular file only, at most
+/// [`MAX_KEY_FILE_BYTES`] — its bytes zeroed when dropped; the vault's
+/// master key is read with it.
+pub(crate) fn read_key_bytes(path: &Path) -> std::io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    let f = open_regular(path)?;
+    read_bounded(f)
+}
+
+/// `path` opened for reading without waiting (`O_NONBLOCK`), refused
+/// unless it is a regular file (`InvalidData`, naming what it is).
+fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::FileTypeExt;
     let f = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)?;
-    let meta = f.metadata()?;
-    let opened = (meta.dev(), meta.ino());
-    let t = meta.file_type();
+    let t = f.metadata()?.file_type();
     if !t.is_file() {
         let what = if t.is_char_device() || t.is_block_device() {
             "a device (a mount over the key's name?)"
@@ -382,17 +462,7 @@ fn read_key_file(path: &Path) -> std::io::Result<(String, (u64, u64))> {
             format!("not a regular file: {what}"),
         ));
     }
-    let mut buf = Vec::new();
-    f.take(MAX_KEY_FILE_BYTES + 1).read_to_end(&mut buf)?;
-    if buf.len() as u64 > MAX_KEY_FILE_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("larger than {MAX_KEY_FILE_BYTES} bytes"),
-        ));
-    }
-    String::from_utf8(buf)
-        .map(|text| (text, opened))
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not UTF-8 text"))
+    Ok(f)
 }
 
 fn parse_signing_key(raw: &str) -> Result<SigningKey> {
@@ -722,6 +792,16 @@ impl KeyStore {
         self.vault.clone()
     }
 
+    /// Review of #482 (R14c-2): the start's key's public half — the loaded
+    /// key's own, else the published half ([`public_half`]: the private key
+    /// read only on a host without one).
+    pub fn verifying_half(&self) -> Result<Option<VerifyingKey>, String> {
+        match self.verifying_key() {
+            Some(v) => Ok(Some(v)),
+            None => public_half(&self.path),
+        }
+    }
+
     /// The verifying key of the start's key, once it is loaded (no load).
     pub fn verifying_key(&self) -> Option<VerifyingKey> {
         match &*self.lock() {
@@ -803,6 +883,38 @@ mod tests {
         assert_eq!(public_half(&key_path), Ok(Some(half)), "the published half");
         fs::remove_file(verifying_key_path(&key_path)).unwrap();
         assert!(public_half(&key_path).is_err(), "neither readable");
+        // review of #482 (R14c-2): a legacy host (no published half) has
+        // the key's own; with one published, the key is not read at all
+        // (here a key file nobody could parse)
+        fs::remove_file(&key_path).unwrap();
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let half = key.verifying_key();
+        fs::remove_file(verifying_key_path(&key_path)).unwrap();
+        assert_eq!(public_half(&key_path), Ok(Some(half)), "legacy: its own");
+        fs::write(verifying_key_path(&key_path), hex::encode(half.to_bytes())).unwrap();
+        fs::remove_file(&key_path).unwrap();
+        fs::write(&key_path, "z".repeat(64)).unwrap();
+        assert_eq!(public_half(&key_path), Ok(Some(half)), "the key unread");
+        // the store's: the published half before the load
+        let store = KeyStore::loaded_for_tests(&dir.path().join("other.key")).unwrap();
+        let own = store.signer().unwrap().verifying_key();
+        assert_eq!(store.verifying_half(), Ok(Some(own)));
+    }
+
+    /// Review of #482 (R14c-3; the review's RC4): a key's memory not
+    /// locked or not out of the dumps is said, and signed.
+    #[test]
+    fn a_key_s_unprotected_memory_is_a_signed_degradation() {
+        assert_eq!(memory_detail("k", true, true), None);
+        let d = memory_detail("the agent's signing key", false, true).unwrap();
+        assert!(d.contains("not locked in RAM"), "{d}");
+        let d = memory_detail("k", true, false).unwrap();
+        assert!(d.contains("out of core dumps"), "{d}");
+        assert!(!report_memory("nn-rc4-protected", true, true));
+        assert!(report_memory("nn-rc4-key", false, true));
+        assert!(crate::boot::degradation::entries()
+            .iter()
+            .any(|e| e.source == "key_memory" && e.detail.contains("nn-rc4-key")));
     }
 
     /// External audit EVD-001: the agent publishes the public half next to

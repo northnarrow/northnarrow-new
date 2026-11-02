@@ -48,9 +48,10 @@ procfs = { version = "0.18", default-features = false }
 parking_lot = "0.12"
 # the response vault (quarantine): AES-GCM, HKDF over SHA-256, the master
 # key zeroized, a vault's id.
-aes-gcm = "0.11"
+aes-gcm = { version = "0.11", features = ["zeroize"] }
 hkdf = "0.13"
-sha2 = "0.11"
+hmac = { version = "0.13", features = ["zeroize"] }
+sha2 = { version = "0.11", features = ["zeroize"] }
 zeroize = { version = "1.8", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }

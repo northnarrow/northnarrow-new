@@ -172,6 +172,17 @@ mod tests {
         assert!(!block.is_empty(), "the mapping is listed");
         let vm_flags = block.iter().find(|l| l.starts_with("VmFlags:")).unwrap();
         assert!(vm_flags.contains(" dd"), "{vm_flags}");
+        // review of #482 (RC1): where the limit allows a page, the lock is
+        // required, not only checked when it happened
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit into a local struct.
+        unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) };
+        if lim.rlim_cur >= 4096 {
+            assert!(l.locked(), "RLIMIT_MEMLOCK {} allows a page", lim.rlim_cur);
+        }
         if l.locked() {
             assert!(vm_flags.contains(" lo"), "{vm_flags}");
         }

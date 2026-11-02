@@ -331,14 +331,33 @@ guards, the copy-on-first-write guard — keeps the bounding set effective.
 A runtime thread starts with the sets of the thread that made it start (a
 role's thread's `spawn_blocking`); the runtime's start hook
 (`caps::restore_core`) gives it the core's back, and so do the pumps,
-which start inside the loader's window. Only the decision gives up its
-permitted set, and it starts no thread.
+which start inside the loader's window, and every other thread the core
+starts — the copy-on-first-write guard's and its restore (review of #482,
+R14c-4: `nn-cow-restore` is started by a response worker, and kept that
+role's set: no `CAP_CHOWN`, no `CAP_FOWNER` for the files it puts back),
+the exec guards, the slow-work and lineage-sweep threads.
+`xtask/tests/thread_roles.rs` holds every production thread of the core to
+a role or `restore_core` in its first lines, or to a listed reason. A
+thread that cannot take the core's set back — its sets unreadable or
+refused, or its permitted set less than the process's (one started by the
+decision thread) — is a signed degradation (`thread_caps`). Only the
+decision gives up its permitted set, and it starts no thread (Open: a
+filter rule refusing it `clone` of a thread, so that this is enforced and
+not only true).
 
 **The decision's filter** (`caps::filter`, on that thread only, no
 `TSYNC`): `capset`, `execve`, `execveat`, `bpf`, and — because it keeps
 `CAP_SYS_PTRACE` to read `/proc` — `ptrace`, `process_vm_readv`,
 `process_vm_writev`, `pidfd_getfd` fail with `EPERM` (on x86_64 under
-their x32 numbers too). `EPERM`, not a kill: a crafted event that steers
+their x32 numbers too). Review of #482 (R14c-1): and so do a file opened
+for writing (`open`/`openat` with `O_WRONLY`, `O_RDWR`, `O_CREAT` or
+`O_TRUNC`; `creat`; `openat2` whatever it asks, its flags being in user
+memory a filter cannot read) and a signal to another process (`kill`,
+`tgkill`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo` to a thread group not the
+agent's, a group included; `tkill` and `pidfd_send_signal` always). The
+decision writes no file and signals no process: the canary is the
+writer's, the detections and the responses go by channels, and the lab's
+trace of its calls saw none (below). `EPERM`, not a kill: a crafted event that steers
 the decision into one of them must not become a way to stop the agent.
 Two things the decision did itself need two of them: the module
 provenance rule's and the impact trust's `rpm -qf` on an RPM host, and
@@ -350,9 +369,33 @@ decision waiting for the answer as it waited for the call.
 **What this is not.** The threads share one address space: a thread's set
 is no wall against code that runs in the process — the worker's process
 is that wall (§1–§7). A thread's set bounds what that thread's own calls
-can do: a flaw that steers the decision into an `execve`, a `bpf` or a
-`capset`, or into another thread's action (a kill, an nft rule, a
-`chattr`), meets `EPERM`.
+can do, and only where the kernel asks for a capability. The core runs as
+uid 0: for another root process, or a root-owned file, the owner's rights
+need none. So (review of #482, R14c-1, corrected here) a flaw that steers
+the decision:
+
+- into an `execve`, a `bpf`, a `capset`, a `ptrace` or a process's memory
+  by `process_vm_*`, an nft rule (`CAP_NET_ADMIN`), a `chattr`
+  (`CAP_LINUX_IMMUTABLE`), a file capability (`CAP_SETFCAP`), or a signal
+  or a file of another user (`CAP_KILL`, `CAP_DAC_OVERRIDE`) — meets
+  `EPERM`, from the filter or the missing capability;
+- into opening a file for writing — a root-owned file by ownership, or
+  another root process's `/proc/<pid>/mem` through its `CAP_SYS_PTRACE` —
+  or a signal to a root process (`kill(2)` by equal uid, no `CAP_KILL`) —
+  meets `EPERM` from the filter (above), not from the capability sets;
+- into the other calls that change a root-owned file by its path —
+  `unlink`, `rename`, `chmod`, `chown`, `truncate`, `link`, `mkdir`… — is
+  **not** refused: uid 0 owns those files. Nor is reading another
+  process's open files through `/proc/<pid>/fd/N` (`CAP_SYS_PTRACE`'s
+  read). Open: a read-only Landlock domain for the decision thread
+  (`landlock_restrict_self` binds the calling thread; ABI ≥ 1 on the
+  lab's four kernels), and the `/proc` broker that would leave it no
+  capability at all;
+- other threads' sets are not its own: the actuator, the writer, the
+  errands and every thread that holds the core's set run programs with
+  root's full sets at their `execve` (nft, iptables, rpm), as before R14c —
+  for those threads the per-thread set is least privilege by default, not
+  a wall (R14c-8).
 
 **Measured** (`deploy/lab/caps/thread-caps.sh`: a kprobe and a kretprobe on
 `cap_capable()` for the agent's threads, by name, through the workers' lab,
@@ -403,6 +446,33 @@ key file is zeroized after its move. The master key is read the first
 time the vault is used (the quarantine), into the same kind of mapping.
 Only `nn_linux::keys` names `SigningKey` and the vault's AES key
 (`xtask/tests/keys_in_one_place.rs`).
+
+After the review of #482:
+
+- a key's mapping that the kernel did not lock (`RLIMIT_MEMLOCK`) or did
+  not leave out of the dumps is a signed degradation (`key_memory`), the
+  signing key's and the master key's alike (R14c-3);
+- the crypto crates are built with their `zeroize` features (`aes-gcm`
+  with `aes`, `ghash`, `polyval`; `hmac`, `sha2`, `digest`,
+  `block-buffer`): the AES key schedule, the GHASH key and the HMAC state
+  the vault's derivation leaves are zeroed when dropped (R14c-2). Not
+  closed: `ed25519-dalek`'s signature computes `SHA-512(secret)` on the
+  stack of the thread that signs, and nothing zeroes that copy upstream
+  (Open: a signing thread with a locked, wiped stack);
+- a key file is read once into a buffer of its maximum size (no growth,
+  no freed copy) zeroed when dropped; the master key is read as the
+  signing key is — a regular file, never a wait on a FIFO, at most 4 KiB
+  (R14c-7);
+- the signing key's public half is read from the half published beside it
+  (`agent.sig.pub`); the private key is read for it only on a host without
+  one (`keys::public_half`; the store's `verifying_half` for a holder of
+  the store);
+- no production path reads the master key but the store: an executor's
+  configuration without the store's vault fails its quarantine, said
+  (`vault_of`; the tests' builds make one), and the source test now also
+  refuses `Vault::at`, `public_half`, `DEFAULT_SIGNING_KEY_PATH` and the
+  crypto's types under any alias outside `keys` but where it lists them
+  (R14c-5).
 
 ## 10. The unit's hardening (R14c)
 

@@ -15,7 +15,13 @@
 #                       how many checks were granted and how many refused;
 #                       <dir>/calls.tsv: per thread group, per refused call,
 #                       how many times it was made (0 lines: none);
-#                       <dir>/overrun: events the trace buffer lost
+#                       <dir>/overrun: events the trace buffer lost;
+#                       <dir>/decision-refused.tsv: the decision thread's
+#                       opens and signals its filter refused (review of
+#                       #482, R14c-1: an EPERM exit of open, openat, creat,
+#                       openat2, kill, tkill, tgkill, rt_sigqueueinfo,
+#                       rt_tgsigqueueinfo, pidfd_send_signal — none is a
+#                       call the thread needed)
 #   census <dir> <tag>  the running agent's threads: name, CapEff, CapPrm,
 #                       Seccomp, NoNewPrivs (<dir>/census-<tag>.tsv)
 #
@@ -50,6 +56,12 @@ FILTER='comm ~ "nn-*" || comm ~ "tokio-runtime*" || comm ~ "northnarrow-ag*"'
 # process_vm_writev 311, pidfd_getfd 438.
 UNIT_IDS="101 311 246 320 175 313 176 167 168 169 165 166 155 323 304"
 DECISION_IDS="126 59 322 321 101 310 311 438"
+# Review of #482 (R14c-1): the decision's filter refuses a writing open and
+# a signal to another process with EPERM, before the call's sys_enter; its
+# sys_exit still fires (ret -1): open 2, openat 257, creat 85, openat2 437,
+# kill 62, tkill 200, tgkill 234, rt_sigqueueinfo 129, rt_tgsigqueueinfo
+# 297, pidfd_send_signal 424
+DECISION_W_IDS="2 257 85 437 62 200 234 129 297 424"
 ors() { local f= i; for i in "$@"; do f="$f${f:+ || }id == $i"; done; echo "$f"; }
 # the programs the agent starts run under the unit's filter too
 CHILDREN='comm == "nft" || comm ~ "iptables*" || comm ~ "ip6tables*" || comm ~ "xtables*" || comm == "rpm" || comm ~ "northnarrow-sca*"'
@@ -70,6 +82,8 @@ WHO='function who(t) {
 probes_off() {
     echo 0 > "$T/events/raw_syscalls/sys_enter/enable"
     echo 0 > "$T/events/raw_syscalls/sys_enter/filter"
+    echo 0 > "$T/events/raw_syscalls/sys_exit/enable"
+    echo 0 > "$T/events/raw_syscalls/sys_exit/filter"
     if [[ -e $T/events/nncap/enable ]]; then
         echo 0 > "$T/events/nncap/enable"
         echo '-:nncap/c' >> "$T/kprobe_events"
@@ -95,17 +109,21 @@ start)
     echo "$FILTER" > "$T/events/nncap/c/filter" || exit 1
     echo "$FILTER" > "$T/events/nncap/r/filter" || exit 1
     echo "$CALLS" > "$T/events/raw_syscalls/sys_enter/filter" || exit 1
+    echo "comm == \"nn-decision\" && ret == -1 && ($(ors $DECISION_W_IDS))" \
+        > "$T/events/raw_syscalls/sys_exit/filter" || exit 1
     : > "$DIR/trace.raw"
     nohup cat "$T/trace_pipe" >> "$DIR/trace.raw" 2>/dev/null &
     echo $! > "$DIR/reader.pid"
     echo 1 > "$T/events/nncap/enable" || exit 1
     echo 1 > "$T/events/raw_syscalls/sys_enter/enable" || exit 1
+    echo 1 > "$T/events/raw_syscalls/sys_exit/enable" || exit 1
     date -u +%FT%TZ > "$DIR/started"
     echo "tracing cap_capable for the agent's threads into $DIR/trace.raw (reader $(cat "$DIR/reader.pid"))"
     ;;
 stop)
     [[ -e $T/events/nncap/enable ]] && echo 0 > "$T/events/nncap/enable"
     echo 0 > "$T/events/raw_syscalls/sys_enter/enable"
+    echo 0 > "$T/events/raw_syscalls/sys_exit/enable"
     sleep 1
     # the reader started above, by its pid, only if it is still that cat
     if [[ -s $DIR/reader.pid ]]; then
@@ -163,6 +181,17 @@ stop)
     ' "$DIR/trace.raw" | sort > "$DIR/calls.tsv"
     { printf 'who\tthread\tsyscall\tcalls\n'; cat "$DIR/calls.tsv"; } > "$DIR/calls.tsv.new"
     mv "$DIR/calls.tsv.new" "$DIR/calls.tsv"
+    # sys_exit: "NR <id> = <ret>": the decision's refused writes and signals
+    awk '
+        / sys_exit: NR / {
+            for (i = 2; i <= NF; i++) if ($i == "NR") { n[$(i + 1) "\t" $(i + 3)]++; break }
+        }
+        END { for (k in n) printf "nn-decision\t%s\t%d\n", k, n[k] }
+    ' "$DIR/trace.raw" | sort > "$DIR/decision-refused.tsv"
+    { printf 'thread\tsyscall\tret\tcalls\n'; cat "$DIR/decision-refused.tsv"; } > "$DIR/decision-refused.tsv.new"
+    mv "$DIR/decision-refused.tsv.new" "$DIR/decision-refused.tsv"
+    echo "the decision's writing opens and foreign signals refused: $(($(wc -l < "$DIR/decision-refused.tsv") - 1)) kinds"
+    cat "$DIR/decision-refused.tsv"
     echo "refused calls made: $(($(wc -l < "$DIR/calls.tsv") - 1)) kinds"
     cat "$DIR/calls.tsv"
     echo "$(wc -l < "$DIR/trace.raw") trace lines, $(cat "$DIR/overrun") lost; refused audited checks:"

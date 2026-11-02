@@ -15,6 +15,7 @@
 
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -24,6 +25,12 @@ static ERRANDS: OnceLock<Mutex<Sender<Job>>> = OnceLock::new();
 
 /// The thread's name.
 pub const THREAD: &str = "nn-errands";
+
+/// Review of #482 (R14c-6): the longest a caller waits for its errand's
+/// answer — the decision thread is the caller: an errand stuck behind
+/// another (a hung `rpm`) never holds it longer. The errand itself goes on;
+/// its late answer is dropped.
+pub const ERRAND_WAIT: Duration = Duration::from_secs(2);
 
 /// Start the errands thread (once; a second call does nothing). An error
 /// when the thread could not start: the errands are then done on their
@@ -53,7 +60,8 @@ pub fn started() -> bool {
 }
 
 /// `f` done on the errands thread, its answer returned; on the caller's
-/// thread when there is none. `None`: the thread is gone, or `f` panicked.
+/// thread when there is none. `None`: the thread is gone, `f` panicked, or
+/// no answer came within [`ERRAND_WAIT`].
 pub fn run<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     let Some(errands) = ERRANDS.get() else {
         return Some(f());
@@ -65,7 +73,7 @@ pub fn run<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<
     if errands.lock().send(job).is_err() {
         return None;
     }
-    rx.recv().ok()
+    rx.recv_timeout(ERRAND_WAIT).ok()
 }
 
 #[cfg(test)]
@@ -83,6 +91,22 @@ mod tests {
         assert_eq!(name.as_deref(), Some(THREAD));
         assert_eq!(run(|| -> u32 { panic!("an errand panics") }), None);
         assert_eq!(run(|| 7), Some(7));
+        // review of #482 (R14c-6): a stuck errand holds its caller at most
+        // ERRAND_WAIT, and the next errand's caller at most that too
+        let t = std::time::Instant::now();
+        assert_eq!(
+            run(|| {
+                std::thread::sleep(ERRAND_WAIT + Duration::from_millis(500));
+                1
+            }),
+            None
+        );
+        assert!(
+            t.elapsed() < ERRAND_WAIT + Duration::from_millis(400),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(run(|| 8), Some(8), "the thread goes on");
         // from a thread the decision's filter holds: the errand still
         // starts a program (the errands thread has no filter)
         let ok = std::thread::spawn(|| {
