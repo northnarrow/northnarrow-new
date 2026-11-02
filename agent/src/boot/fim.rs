@@ -350,7 +350,7 @@ pub(crate) fn start(
     state_protection: &Option<
         std::sync::Arc<northnarrow_agent::anti_tamper::filesystem::StateDirProtection>,
     >,
-    signing_key: &northnarrow_agent::keys::BootKey,
+    signing_key: &northnarrow_agent::keys::KeyStore,
 ) -> Option<Arc<admin_socket::FimAdminState>> {
     let fim_admin_state: Option<Arc<admin_socket::FimAdminState>> = {
         // The signing key + agent_id for FIM: a copy of the start's one

@@ -17,6 +17,15 @@ use super::evidence::{attest_degraded, attest_degraded_at, AnchorHandle, AuditHa
 /// over once a second key was added, ATP-004), the serve loop with the
 /// admin states of FIM, the canaries, the detections, the response verbs
 /// and the read verbs.
+///
+/// The boot's order (#482's CI, ubuntu2404: a signed shutdown answered
+/// before the run's `telemetry_loss at:start` row): the serve loop is
+/// built here, but the socket is **bound only once `armed` says true** —
+/// after `ready::arm` (the boot's `agent_boot` and `capability_manifest`
+/// rows) and the heartbeat's start beat (its `telemetry_loss at:start`
+/// row). No admin command, and so no admin row, can precede the run's
+/// start rows; until then the socket's path does not exist (the watchdog
+/// and install.sh wait for it, as they did for the boot before it).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start(
     cli: &Cli,
@@ -37,6 +46,7 @@ pub(crate) fn start(
     detect_only_source: &Option<String>,
     exempt: &ExemptPids,
     handles: admin_socket::AdminHandles,
+    armed: tokio::sync::watch::Receiver<bool>,
 ) {
     // Optional admin socket: only spawned if admin pubkey config
     // is present. Missing config = no unlock path; the agent still
@@ -131,7 +141,13 @@ pub(crate) fn start(
                 // transient accept error; if it still ends, the admin plane
                 // is gone until a restart — an ERROR and a signed record.
                 let audit_log_on_exit = audit_log.clone();
+                let mut armed = armed;
                 tokio::spawn(async move {
+                    // bound once the agent is armed and its start beat is
+                    // written (above); the boot ending first: never bound
+                    if armed.wait_for(|a| *a).await.is_err() {
+                        return;
+                    }
                     if let Err(e) = admin_socket::serve_with_marker_path(
                         socket_path,
                         auth,

@@ -30,7 +30,7 @@ pub(crate) struct Preflight {
     /// The review of #468, R4: the start's signing key, decided by the
     /// preflight's `signing_identity` and loaded once, at its first use: what
     /// every chain of the start signs with.
-    pub(crate) signing_key: northnarrow_agent::keys::BootKey,
+    pub(crate) signing_key: northnarrow_agent::keys::KeyStore,
     /// Tracepoint fields left on their compiled offset (NN-AUD-098), signed
     /// once the audit log is open.
     pub(crate) tracepoint_degraded: Option<String>,
@@ -85,7 +85,7 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     // The review of #468, R4: the key is decided here, once — there (loaded,
     // never minted) or a first install's (minted once) —, and loaded once,
     // at its first use (the state files' bootstrap): every chain of the
-    // start signs with that one key (`keys::BootKey`), none loads its own.
+    // start signs with that one key (`keys::KeyStore`), none loads its own.
     let decision = match checks::signing_identity(&mut boot, &cli.identity_paths())? {
         checks::KeyVerdict::Decided(decision) => decision,
         checks::KeyVerdict::Refused(why) => {
@@ -96,7 +96,7 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
             );
         }
     };
-    let signing_key = northnarrow_agent::keys::BootKey::decided(decision);
+    let signing_key = northnarrow_agent::keys::KeyStore::decided(decision);
 
     // Boot preflight: prove the embedded eBPF half is real and intact
     // BEFORE doing any work. The build-time staleness guard

@@ -91,6 +91,10 @@ pub mod bounded_cmd;
 // manifest stay in the agent).
 pub mod boot;
 
+// The capabilities of the core's threads: each role's effective set, the
+// decision thread's own seccomp filter (R14c, plan §3.1, §3.2).
+pub mod caps;
+
 // The audit log for what starts before the start binds it: the samplers
 // the eBPF load starts (R11c, lab PR 264: their process-wide setters
 // became this explicit slot).
@@ -195,9 +199,43 @@ pub mod impact {
 /// security tools' processes the decision engine's host fills (cut from
 /// the agent's `impair`; the detector is nn-core's).
 pub mod impair {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    type Kernel = aya::maps::HashMap<aya::maps::MapData, u32, u8>;
+
     /// The kernel map of the tools' processes
     /// ([`DefenseDetector::attach_map`](nn_core::impair::DefenseDetector::attach_map)).
-    pub type DefenderMap = aya::maps::HashMap<aya::maps::MapData, u32, u8>;
+    /// R14c: written on the errands thread ([`crate::caps::errands`]) — a
+    /// tool's exec registers its pid from the decision thread, whose filter
+    /// refuses it `bpf`.
+    #[derive(Clone)]
+    pub struct DefenderMap(Arc<Mutex<Kernel>>);
+
+    impl TryFrom<aya::maps::Map> for DefenderMap {
+        type Error = aya::maps::MapError;
+        fn try_from(map: aya::maps::Map) -> Result<Self, Self::Error> {
+            Ok(Self(Arc::new(Mutex::new(Kernel::try_from(map)?))))
+        }
+    }
+
+    impl DefenderMap {
+        /// `pid` in the map (the errand's answer).
+        pub fn insert(&self, pid: u32) -> Result<(), String> {
+            let m = Arc::clone(&self.0);
+            crate::caps::errands::run(move || m.lock().insert(pid, 1, 0).map_err(|e| e.to_string()))
+                .unwrap_or_else(|| Err("the errands thread did not answer".to_string()))
+        }
+
+        /// `pid` out of the map.
+        pub fn remove(&self, pid: u32) {
+            let m = Arc::clone(&self.0);
+            let _ = crate::caps::errands::run(move || {
+                let _ = m.lock().remove(&pid);
+            });
+        }
+    }
 }
 
 // The boot's check of the installed binaries and the embedded eBPF object

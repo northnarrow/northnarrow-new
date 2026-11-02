@@ -175,7 +175,9 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "agent/src/detection_store.rs",
-        25,
+        // review of #482: 25 counted 21 sites of the file's tests, whose
+        // module the brace matching ended early at a `}` inside a string
+        4,
         "the detection store's writer task, its start and its rotation; the decision's \
          `record_*` build a record and hand it to the bounded queue",
     ),

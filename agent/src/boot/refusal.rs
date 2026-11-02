@@ -66,7 +66,7 @@ use northnarrow_agent::audit::{
 };
 use northnarrow_agent::chain_host_linux::LinuxHost;
 use northnarrow_agent::config::overlay_auth::OverlayGate;
-use northnarrow_agent::keys::BootKey;
+use northnarrow_agent::keys::KeyStore;
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
@@ -141,7 +141,7 @@ pub(crate) struct Context<'a> {
     /// The review of #468, R4: the start's one key, which signs the refusal
     /// as it signs every other row of the start (loaded at this first use
     /// when the preflight refused the start: no state file was bootstrapped).
-    pub(crate) key: &'a BootKey,
+    pub(crate) key: &'a KeyStore,
 }
 
 impl Context<'_> {
@@ -993,14 +993,14 @@ mod tests {
 
     /// The start's key in `dir`, decided as the preflight decides it there:
     /// there (in any form), or a first install.
-    fn start_key(dir: &Path) -> BootKey {
+    fn start_key(dir: &Path) -> KeyStore {
         let path = dir.join("agent.sig.key");
         let decision = if std::fs::symlink_metadata(&path).is_ok() {
             northnarrow_agent::boot::checks::KeyDecision::present_for_tests(&path)
         } else {
             northnarrow_agent::boot::checks::KeyDecision::first_install_for_tests(&path)
         };
-        BootKey::decided(decision)
+        KeyStore::decided(decision)
     }
 
     fn pk(dir: &Path) -> ed25519_dalek::VerifyingKey {
@@ -1027,7 +1027,7 @@ mod tests {
         cli: Cli,
         id: AgentIdentity,
         gate: OverlayGate,
-        key: BootKey,
+        key: KeyStore,
     }
 
     impl Fixture {
@@ -1092,7 +1092,7 @@ mod tests {
         }
     }
 
-    fn refuse_with(cli: &Cli, id: &AgentIdentity, gate: &OverlayGate, key: &BootKey) -> Signed {
+    fn refuse_with(cli: &Cli, id: &AgentIdentity, gate: &OverlayGate, key: &KeyStore) -> Signed {
         let ctx = Context {
             cli,
             identity: id,

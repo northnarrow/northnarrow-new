@@ -164,6 +164,9 @@ pub fn main() -> Result<()> {
     // advisor's worker count first; the advisor was removed in lab PR 214.)
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // R14c (plan §3.1): a runtime thread holds the core's capabilities,
+        // whichever thread made it start (a role's thread's `spawn_blocking`)
+        .on_thread_start(nn_linux::caps::restore_core)
         .build()
         .context("building the tokio runtime")?
         .block_on(run(cli, undumpable, image))
@@ -181,6 +184,17 @@ async fn run(
     // before it produced and returns what the ones after it read; what the
     // agent keeps until it stops is this function's, as it was.
     logging::init(&cli, undumpable);
+    // R14c (plan §3.1): the decision's errands — what its filter refuses it
+    // (an `rpm` query, a `DEFENDER_PIDS` entry) — on a thread started now,
+    // from this thread's sets, before the decision thread runs.
+    if let Err(e) = nn_linux::caps::errands::start() {
+        let detail = format!(
+            "the errands thread did not start ({e}): the decision's rpm queries and \
+             DEFENDER_PIDS entries are refused by its filter"
+        );
+        tracing::error!("{detail}");
+        nn_linux::boot::degradation::report("thread_caps", &detail);
+    }
     let preflight::Preflight {
         refused,
         mut boot,
@@ -314,6 +328,13 @@ async fn run(
         &lineage,
         own_launch,
     );
+    // R14c (plan §3.3): the quarantine vault's key is the key store's: the
+    // executor, the exec quarantine and the restore verbs seal and open
+    // through its vault, and none of them holds the key.
+    let exec_cfg = northnarrow_agent::response::config::ExecutorConfig {
+        vault: Some(Arc::new(signing_key.vault())),
+        ..exec_cfg
+    };
     let response::Response {
         legacy_isolation_removed,
         execq_exec_cfg,
@@ -453,6 +474,10 @@ async fn run(
     // R11c (lab PR 264): the boot's signed capability manifest, signed by
     // the run phase and read by the admin socket's status.
     let capability_manifest = northnarrow_agent::boot::manifest::SignedManifest::default();
+    // The admin socket is bound once the agent is armed and its start beat
+    // written (`admin_armed` below): no admin row before the run's start
+    // rows (#482's CI).
+    let (admin_armed, armed_for_admin) = tokio::sync::watch::channel(false);
     admin::start(
         &cli,
         &isolator,
@@ -483,6 +508,7 @@ async fn run(
                     .status_source(canary_detector.clone(), Some(Arc::clone(&ransom_tracker))),
             ),
         },
+        armed_for_admin,
     );
     // R13 (the review of #479): the opt-ins configured whose verdict an LSM
     // program gives — the manifest says them inert without the BPF LSM
@@ -564,6 +590,9 @@ async fn run(
             probe_on: telemetry_probe.is_some(),
         },
     );
+    // Armed, the start beat written (or the heartbeat off, said): the admin
+    // socket is bound now — every admin row follows the run's start rows.
+    let _ = admin_armed.send(true);
     let stopped = crate::run_loop::run(
         armed,
         &cli,
@@ -856,7 +885,7 @@ mod tests {
             for later in [
                 "checks::ebpf_object(",
                 "preregister_self(",
-                "BootKey::decided(",
+                "KeyStore::decided(",
                 "signing_key.load()",
                 "agent_id::resolve(",
             ] {
@@ -865,7 +894,7 @@ mod tests {
         }
         // the key decided right after its check, loaded once the start
         // registered with the previous agent's hooks, before the identity
-        assert!(at("BootKey::decided(") < at("checks::ebpf_object("));
+        assert!(at("KeyStore::decided(") < at("checks::ebpf_object("));
         assert!(at("preregister_self(") < at("signing_key.load()"));
         assert!(at("signing_key.load()") < at("agent_id::resolve("));
         let selftest = at("boot::deny_selftest::run(");
@@ -915,7 +944,7 @@ mod tests {
 
     /// The review of #468, R4 (the ratchet): the start decides its signing
     /// key once and loads it once. The preflight makes the one
-    /// `BootKey` from `checks::signing_identity`'s decision, the state
+    /// `KeyStore` from `checks::signing_identity`'s decision, the state
     /// bootstrap loads it, and every phase that signs — the audit check,
     /// the refusals, the attest phase, the anchor, the stores, FIM, the
     /// canaries, the network logs — takes a copy of that one key
@@ -937,9 +966,9 @@ mod tests {
                 "the start loads a key of its own: `{other}`"
             );
         }
-        assert_eq!(sources.matches("BootKey::decided(").count(), 1);
+        assert_eq!(sources.matches("KeyStore::decided(").count(), 1);
         assert!(function(PHASES[1].1, PHASES[1].2)
-            .contains("let signing_key = northnarrow_agent::keys::BootKey::decided(decision);"));
+            .contains("let signing_key = northnarrow_agent::keys::KeyStore::decided(decision);"));
         assert_eq!(sources.matches("signing_key.load()").count(), 1);
         assert!(function(PHASES[2].1, PHASES[2].2).contains("signing_key.load()"));
         // the one decision is the check's
@@ -1173,6 +1202,47 @@ mod tests {
             assert!(!released);
         }
         assert!(live.iter().enumerate().all(|(i, v)| *v == i as u64));
+    }
+
+    /// #482's CI (ubuntu2404): a signed shutdown answered before the run's
+    /// `telemetry_loss at:start` row. The boot's order: the admin socket is
+    /// bound only once the agent is armed (`ready::arm`: `agent_boot`,
+    /// `capability_manifest`) and the heartbeat's start beat is written —
+    /// no admin command, so no admin row, before the run's start rows.
+    #[test]
+    fn the_admin_socket_is_bound_after_the_start_beat() {
+        let src = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/mod.rs"));
+        let run = function(src, "async fn run(");
+        let at = |needle: &str| {
+            run.find(needle)
+                .unwrap_or_else(|| panic!("run: `{needle}` not found"))
+        };
+        let gate = at("tokio::sync::watch::channel(false)");
+        assert!(gate < at("admin::start("));
+        assert!(at("admin::start(") < at("ready::arm("));
+        assert!(at("ready::arm(") < at("evidence::heartbeat("));
+        let open = at("admin_armed.send(true)");
+        assert!(
+            open > at("evidence::heartbeat("),
+            "opened before the start beat"
+        );
+        assert!(open < at("crate::run_loop::run("));
+        assert_eq!(run.matches("admin_armed.send(").count(), 1, "opened once");
+        let admin = function(
+            include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/admin.rs")),
+            "pub(crate) fn start(",
+        );
+        let wait = admin
+            .find("armed.wait_for(|a| *a)")
+            .expect("the serve waits");
+        let serve = admin
+            .find("admin_socket::serve_with_marker_path(")
+            .expect("the serve loop");
+        assert!(
+            wait < serve,
+            "the socket is bound before the agent is armed"
+        );
+        assert_eq!(admin.matches("serve_with_marker_path(").count(), 1);
     }
 
     /// External review P0 C-14: the network drain is spawned whatever the

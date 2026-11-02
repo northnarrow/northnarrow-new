@@ -4561,3 +4561,105 @@ only in the table below, in the same PR as the evidence.
     the worker's answers (a high p99 as a degradation); EXP-13 per-run
     histograms (the status carries quantiles only, and its encoding takes
     no new field inside a queue's entry).
+  - R14c — what changed: the key store (`KeyStore`, not `Clone`, handles
+    only: an `Arc<dyn Signer>` and the `Vault`; each key in a locked,
+    undumpable mapping of its own, zeroed on drop; the master key read once
+    and held; `public_half` for the readers that verify; only
+    `nn_linux::keys` names the key types — the vault's crypto moved there
+    in a commit of its own); each thread's own capabilities
+    (`nn_linux::caps`): the decision thread `CAP_SYS_PTRACE` alone, for
+    good, with a seccomp filter of its own refusing `capset`, `execve`,
+    `execveat`, `bpf`, `ptrace`, `process_vm_readv/writev` and
+    `pidfd_getfd` with `EPERM`; the response workers `KILL NET_ADMIN
+    SETFCAP DAC_OVERRIDE SYS_PTRACE`; the canary writer `LINUX_IMMUTABLE`;
+    the supervisor `SETUID SETGID KILL BPF`; the eBPF load `BPF PERFMON`
+    (and `SYS_ADMIN` under the Debian drop-in); `nn-errands` `BPF` for what
+    the decision's filter refuses it (an RPM host's `rpm -qf`,
+    `DEFENDER_PIDS`); every other thread the bounding set (the runtime's
+    start hook, the pumps). The unit: `SystemCallFilter=~…` (the plan's
+    list, `EPERM`), `SystemCallArchitectures=native`,
+    `LockPersonality=yes`; the self-integrity round expects
+    `no_new_privs` 1, seccomp mode 2, core limit 0. Departures from the
+    plan's table, measured: the decision keeps `SYS_PTRACE` (at ∅ the
+    rules' trusted actor, the COMBAT guard and the lineage could not read
+    `/proc/<pid>/exe`), and so do the actuators (`/proc/1/root`, the
+    target's exe).
+  - R14c — lab (as measured; `deploy/lab/caps/thread-caps.sh`, a kprobe
+    and a kretprobe on `cap_capable()` per thread, through the workers'
+    lab, tamper-check and EXP-13r): on Ubuntu 22.04, Ubuntu 24.04, Debian
+    12 and Debian 13 no check a role's thread made for its work was
+    refused — the decision's granted checks all `SYS_PTRACE`, the
+    actuators' `SYS_PTRACE` and `KILL`, the supervisor's `SETUID`,
+    `SETGID`, `KILL` (and `BPF` on 5.15 and 6.1), the errands' `BPF`;
+    refused only capabilities the unit does not grant (as before R14c),
+    the workers' children after `setresuid` (their own `/proc/self/fd`,
+    then allowed), aya's `DEVMAP` feature probe inside the loader's window
+    (`NET_ADMIN`; no devmap in the agent) and, at an agent's exit, the
+    kernel's re-sends of a worker's `PR_SET_PDEATHSIG` from the decision,
+    the errands or the writer (the supervisor's own delivery first,
+    granted). The census showed each role's set, every other thread the
+    bounding set. No agent thread entered a call of the unit's denylist,
+    nor (traced from the Ubuntu 24.04 round on) a program the agent
+    starts; the decision entered only its own `capset` at its role's
+    entry. tamper-check: the same outcomes as `main`'s on Ubuntu 24.04
+    and Debian 12 (75 cases; on Ubuntu 22.04 too but C61, the old
+    script's count, fixed in R14a); on Debian 13 too, with two deviations `main` has there as well (run on `main` on that guest): C31 and C33 — systemd 257 writes the unit's `cgroup.kill` after the agent's `kill(2)` is refused, a kill no task_kill hook sees (a lot of its own). EXP-13r:
+    400 of 400 `success`, nothing left running, on the four; the hang's
+    `stalled` row and 201 of 201 on the four; the crash's `interrupted`
+    row signed by the next run (24.04). The workers' lab 24 + 15 + 7 of
+    46 on the four. test-ignored: 101 passed, 0 failed on Ubuntu 22.04,
+    Ubuntu 24.04, Debian 12 and Debian 13. upgrade-check from `main` OK on
+    24.04 (UPGRADE complete, 19 of 19 deny hooks, the worker up);
+    uninstall-check OK on the four (both
+    accounts removed); its first run on Debian 12 ended as the lab's R009
+    flake does (`uninstall.sh` gone a second after opening its window,
+    after the 25-minute privileged run), the re-run on a fresh boot
+    passed.
+  - R14c — gates on 96412022: every gate but workspace clippy (a needless
+    lifetime in a test) and four xtask tests (a static and a start call
+    not listed, the vault's key type behind an alias, an unshipped
+    document named) — fixed in the next commit, workspace clippy and the
+    222 xtask tests then green; on 83f0c199 (rebased on R14b's final
+    tip) every gate: 82 suites, 3,543 passed, 0 failed, 17 ignored. Mutations: set C 31
+    (25 caught; 4 survivors given tests; `MC15` equivalent — seccompiler
+    sets `no_new_privs` itself, the redundant call removed, the mutation
+    redone; `MC25` a site error, redone): 7 of 7 caught on the rerun.
+  - R14c — review of #482 (an independent review; its mutations RC1–RC5
+    and plantings P3–P8): R14c-1 (the decision's filter did not stop what
+    uid 0 needs no capability for — `/proc/<pid>/mem` opened for writing
+    through `CAP_SYS_PTRACE`, a root file written as its owner, a root
+    process signalled by equal uid: the filter now refuses every writing
+    open and every signal to another process, the lab's trace of the
+    refused calls in the notes below; §8 and the `caps` docs say what it
+    still does not refuse), R14c-2 (the crypto crates' `zeroize` features
+    on — the lockfiles gain dependency edges only; the public half read
+    from `agent.sig.pub`; a key file read into a bounded, zeroed buffer),
+    R14c-3 (a key's memory not locked or not out of the dumps is a signed
+    `key_memory`, the master key's too; RC1 and RC4 given tests), R14c-4
+    (`nn-cow-restore` and every thread the core starts take the core's set
+    or a role, pinned by a source test — P5; a thread that cannot is a
+    signed `thread_caps`; RC3 given a test), R14c-5 (`keys_in_one_place`
+    refuses `Vault::at`, `public_half`, `DEFAULT_SIGNING_KEY_PATH` and the
+    crypto's types outside the store but where it lists them — P3, P4, P7,
+    P8; the quarantine's own master-key fallback is the tests' only;
+    `thread_roles` pins the errands' three callers — P6), R14c-6 (the
+    errands' wait bounded at 2 s, `rpm -qf` at 1.5 s, `--` before its
+    path), R14c-7 (the master key read as the signing key is), RC5 (the
+    x32 twins' numbers tested), MP2 (a second worker kind does not build
+    until `check_hello`'s kind check gets its test). The three source
+    tests cut a file's test code by its `#[cfg(test)]` items, no longer at
+    the first test module's declaration (which left most of the agent's
+    `lib.rs` unchecked).
+  - R14c — open: the decision at ∅ behind a `/proc` broker thread; the
+    chain writers on threads of their own with `LINUX_IMMUTABLE` only; the
+    runtime's tasks narrowed; the lab's R009 flake (on `main` too): right
+    after an agent start under the lab's load, R009 can kill the lab's own
+    `install.sh`/`uninstall.sh`. From the review of #482: a read-only
+    Landlock domain for the decision thread (the path-changing calls uid 0
+    needs no capability for: `unlink`, `rename`, `chmod`…); a filter rule
+    refusing the decision thread a new thread (`clone` of a thread,
+    `clone3`); a signing thread with a locked, wiped stack (ed25519-dalek
+    leaves `SHA-512(secret)` on the signer's stack); `MADV_WIPEONFORK` on
+    the keys' mappings; typed errands (an enum, not a closure); nn-admin's
+    sources in `keys_in_one_place`; a round of the copy-on-first-write
+    guard under the capability trace.

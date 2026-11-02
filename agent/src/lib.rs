@@ -55,8 +55,13 @@ pub use nn_linux::atomic_file;
 pub mod audit {
     pub use nn_evidence::audit::*;
 
+    /// R14c: the tests' fixed keys only (the start's key is the key store's):
+    /// `read_signing_key` in the tests' builds, nothing in the binaries'
+    /// (where the glob names nothing: hence the allow).
+    #[allow(unused_imports)]
+    pub use crate::keys::test_doors::*;
     pub use crate::keys::{
-        read_signing_key, read_verifying_key, verifying_key_path, AgentSigningKey,
+        public_half, read_verifying_key, verifying_key_path, AgentSigningKey,
         DEFAULT_SIGNING_KEY_PATH,
     };
 

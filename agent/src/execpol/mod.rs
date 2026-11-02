@@ -407,7 +407,11 @@ pub fn start(
     set_state(format!("{}{partial}", cfg.mode.as_str()));
     let thread = std::thread::Builder::new()
         .name("nn-execpol".into())
-        .spawn(move || ctl.run(&STOPPING))
+        .spawn(move || {
+            // review of #482 (R14c-4): the core's set, whoever starts it
+            nn_linux::caps::restore_core();
+            ctl.run(&STOPPING)
+        })
         .map_err(|e| format!("controller thread: {e}"))?;
     Ok(Handle { thread })
 }

@@ -894,6 +894,8 @@ fn spawn_worker(s: &Arc<Shared>, name: String, spare: bool) -> bool {
 /// order: by severity, aging, each process's oldest first), its signed
 /// intent, the action, its outcome; the process freed for its next job.
 fn work(s: &Shared, slot: &Slot, spare: bool) {
+    // R14c (plan §3.1): the actuator's capabilities
+    nn_linux::caps::enter_or_report(nn_linux::caps::Role::Actuator);
     let _exit = Exit(s, !spare);
     let mut unsynced = 0usize;
     loop {
@@ -988,6 +990,8 @@ fn work(s: &Shared, slot: &Slot, spare: bool) {
 /// the other processes' responses do not wait behind it (at most one spare
 /// per stalled action, at most the pool's size of them).
 fn watch_stalls(s: &Arc<Shared>) {
+    // R14c (plan §3.1): the actuator's capabilities (it starts the spares)
+    nn_linux::caps::enter_or_report(nn_linux::caps::Role::Actuator);
     while !s.stop.load(Ordering::Acquire) {
         std::thread::park_timeout(STALL_WATCH_EVERY);
         let now = s.now_ns();

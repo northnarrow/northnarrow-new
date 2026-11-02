@@ -6,6 +6,60 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- The agent's threads each keep only their capabilities, its keys in one
+  place, its unit hardened (lot 272, Wave 4 phase 2, R14c of the
+  restructure plan, §3.1–§3.3; `docs/architecture/PROCESS_MODEL.md` §8–§10).
+  Each thread with a role keeps effective only what the role needs
+  (`nn_linux::caps`): the decision thread `CAP_SYS_PTRACE` alone (it reads
+  `/proc/<pid>/exe` of what it judges), given up for good, with a seccomp
+  filter of its own that refuses it `capset`, `execve`, `execveat`, `bpf`,
+  `ptrace`, `process_vm_readv`/`writev` and `pidfd_getfd` (`EPERM`); the
+  response workers `CAP_KILL CAP_NET_ADMIN CAP_SETFCAP CAP_DAC_OVERRIDE
+  CAP_SYS_PTRACE`; the canary writer `CAP_LINUX_IMMUTABLE`; the workers'
+  supervisor `CAP_SETUID CAP_SETGID CAP_KILL CAP_BPF`; the eBPF load
+  `CAP_BPF CAP_PERFMON`; the rest of the core the unit's set. What the
+  decision did that its filter refuses — an RPM host's `rpm -qf`, a
+  security tool's pid into `DEFENDER_PIDS` — is done for it on a thread of
+  its own (`nn-errands`). A thread left with more than its role is a signed
+  degradation (`thread_caps`). The signing key and the quarantine's master
+  key are loaded once into the key store (`KeyStore`): not `Clone`, it
+  gives out a signer and the vault, never the bytes; each key in a mapping
+  of its own, locked in RAM, out of core dumps, zeroed on drop. The unit
+  refuses the agent and what it starts `ptrace`, `process_vm_writev`,
+  `kexec_*`, module loads, swap, `reboot`, `mount`, `umount2`,
+  `pivot_root`, `userfaultfd` and `open_by_handle_at`
+  (`SystemCallFilter=`, `EPERM`), non-native system calls
+  (`SystemCallArchitectures=native`) and a personality change
+  (`LockPersonality=yes`); the self-integrity round expects the process's
+  `no_new_privs`, seccomp mode and core limit the unit sets.
+  After the review of #482: the decision thread's filter also refuses a
+  file opened for writing (`open`/`openat` to write, create or truncate,
+  `creat`, `openat2`) and a signal to another process (`kill`, `tgkill`,
+  `rt_sig*queueinfo` to another thread group, `tkill`,
+  `pidfd_send_signal`) — as uid 0 neither needs a capability — and the
+  process model says what it still does not refuse (the other calls that
+  change a root-owned file by its path; reading another process's files
+  through `/proc`); every thread the core starts takes a role or the
+  core's set (the copy-on-first-write guard's restore thread, started by a
+  response worker, kept that worker's set), a thread that cannot is a
+  signed degradation, and a source test pins it; the errands wait at most
+  2 s for an answer and `rpm -qf` at most 1.5 s (`--` before the path);
+  the crypto crates are built with their `zeroize` features (the lockfiles
+  gain dependency edges only: no package, no version); a key's memory not
+  locked or not out of the dumps is a signed degradation (`key_memory`),
+  the master key's too; the master key is read as the signing key is
+  (a regular file, never a FIFO, bounded, zeroed); the signing key's
+  public half is read from `agent.sig.pub`, the private key only on a host
+  without one; no production path reads the master key but the key store;
+  the source tests of the keys, the threads and the parsers no longer stop
+  at the first `#[cfg(test)] mod x;` declaration of a file. After the
+  re-check of #482: the canary's access writer and the COMBAT ladder's
+  worker never fall back to their caller — the decision thread, whose
+  filter refuses their chain appends and kills — when their thread is
+  missing: their work waits in their queue, a signed degradation
+  (`canary_writer`, `combat_ladder`) says so, and the thread is started
+  again from a runtime thread; a job that panics on either is lost, said,
+  and the thread goes on.
 - The parsers in the worker (lot 272, Wave 4 phase 2, R14b of the
   restructure plan, §3.1, §3.5): the DNS pump's query names are decoded by
   the `parse` worker, in batches of at most 512 names whose worst answer

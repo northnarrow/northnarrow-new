@@ -781,11 +781,16 @@ fn wait_for_marker(path: &Path, deadline: Duration) -> Option<String> {
 /// ShutdownRequest, asserts the shutdown-authorised marker
 /// lands on disk AND a "shutdown" audit row is appended.
 ///
-/// Does NOT wait for agent process exit — the in-process
-/// shutdown signal is the watchdog's responsibility to honour;
-/// here we verify the agent-side contract (marker written +
-/// audit row emitted) only. AgentGuard's drop SIGQUITs the
-/// agent at teardown either way.
+/// #482's CI (ubuntu2404): the audit row after `op=shutdown` was the
+/// run's `telemetry_loss at:start` — the shutdown was answered before the
+/// start beat. The boot binds the admin socket only once the agent is
+/// armed and its start beat is written (`boot::admin`), and this test now
+/// waits for the agent to end (it stops itself on the signed shutdown,
+/// exit 0) and asserts the exact tail the stop writes after the op, in its
+/// order: the event bus's close (its unsigned drops, `event_bus_stop` when
+/// it still held events), the stop beat (the capability manifest's pending
+/// changes, its `telemetry_loss` at: stop), `agent_stop` (`reason:
+/// admin_shutdown`) last — never a start row, and no other row.
 #[test]
 fn shutdown_signed_round_trip() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -811,7 +816,7 @@ fn shutdown_signed_round_trip() {
         "unlock,shutdown",
     );
 
-    let (_guard, paths) =
+    let (mut guard, paths) =
         spawn_agent_b5_with_installs(dir.path(), installed_agent, installed_admin);
 
     // Submit the signed shutdown.
@@ -868,32 +873,112 @@ fn shutdown_signed_round_trip() {
     ::nn_proto::shutdown_marker::verify(&parsed, &exp, |_| false)
         .unwrap_or_else(|e| panic!("the watchdog would refuse the agent's marker: {e}"));
 
-    // Audit row emitted for the op (B5 wiring).
+    // The agent stops itself on the signed shutdown (the event loop ends,
+    // the stop runs, exit 0): its audit chain is complete once it has
+    // exited — the tail is read whole, never mid-stop.
+    let child = guard.0.as_mut().expect("the agent's child");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("wait for the agent") {
+            break st;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent did not stop within 30 s of its signed shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "the agent's exit after the shutdown: {status:?}"
+    );
+    guard.0 = None;
+
+    // Audit row emitted for the op (B5 wiring), then the stop's own rows.
     let audit_body =
         std::fs::read_to_string(&paths.audit_log_file).expect("audit log readable post-shutdown");
-    let lines: Vec<&str> = audit_body.lines().filter(|l| !l.is_empty()).collect();
-    assert!(
-        !lines.is_empty(),
-        "audit log should have ≥ 1 entry after shutdown"
+    let rows: Vec<serde_json::Value> = audit_body
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("audit line is JSON"))
+        .collect();
+    let op = |r: &serde_json::Value| r["op"].as_str().unwrap_or_default().to_string();
+    let shutdowns: Vec<usize> = (0..rows.len())
+        .filter(|i| op(&rows[*i]) == "shutdown")
+        .collect();
+    assert_eq!(shutdowns.len(), 1, "one op=shutdown: {audit_body}");
+    let at = shutdowns[0];
+    assert_eq!(
+        rows[at]["result"], "success",
+        "op=shutdown entry should be result=success: {}",
+        rows[at]
     );
-    // The admin op is the last entry before the agent's own `agent_stop`
-    // (written when the event loop ends, reason `admin_shutdown`); the test
-    // may read the file before or after that final write.
-    let shutdown_idx = lines
+    // the run's start rows all precede the op (the socket was bound after
+    // them): the boot's `agent_boot` and `capability_manifest`, the start
+    // beat's `telemetry_loss`
+    let start_loss = rows
         .iter()
-        .rposition(|l| l.contains("\"op\":\"shutdown\""))
-        .unwrap_or_else(|| panic!("no op=shutdown entry in the audit log: {audit_body}"));
-    let last = lines[shutdown_idx];
-    assert!(
-        last.contains("\"result\":\"success\""),
-        "op=shutdown entry should be result=success: {last}"
-    );
-    for after in &lines[shutdown_idx + 1..] {
-        assert!(
-            after.contains("\"op\":\"agent_stop\"") && after.contains("\"reason\":\"admin_shutdown\""),
-            "only the agent's own agent_stop (reason admin_shutdown) may follow op=shutdown: {after}"
-        );
+        .position(|r| op(r) == "telemetry_loss" && r["extra"]["at"] == "start")
+        .unwrap_or_else(|| panic!("no start beat's telemetry_loss: {audit_body}"));
+    for start in ["agent_boot", "capability_manifest"] {
+        let i = rows
+            .iter()
+            .position(|r| op(r) == start)
+            .unwrap_or_else(|| panic!("no {start}: {audit_body}"));
+        assert!(i < at, "{start} after the shutdown: {audit_body}");
     }
+    assert!(
+        start_loss < at,
+        "the start beat after the shutdown: {audit_body}"
+    );
+    // the exact tail: the stop's rows, in the order the stop writes them —
+    // 1. the event bus's close (`sensor.stop_bus()`): its drops not signed
+    //    yet (`event_bus_drop`, `event_bus_coalesced`, `event_bus_capped`),
+    //    then `event_bus_stop` when it still held events (round i24's run 4:
+    //    ten events queued at the close);
+    // 2. the stop beat (`heartbeat.stop`): the capability manifest's pending
+    //    changes (`capability_manifest_change`, flushed), then its
+    //    `telemetry_loss` (at: stop), exactly one;
+    // 3. `agent_stop` (reason admin_shutdown), last.
+    let tail = &rows[at + 1..];
+    let shown = || {
+        tail.iter()
+            .map(|r| format!("{} {}", op(r), r["extra"]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut i = 0;
+    let mut skip = |ops: &[&str], at_most: usize| {
+        let mut n = 0;
+        while i < tail.len() && n < at_most && ops.contains(&op(&tail[i]).as_str()) {
+            i += 1;
+            n += 1;
+        }
+    };
+    skip(
+        &["event_bus_drop", "event_bus_coalesced", "event_bus_capped"],
+        usize::MAX,
+    );
+    skip(&["event_bus_stop"], 1);
+    skip(&["capability_manifest_change"], usize::MAX);
+    let rest = &tail[i..];
+    assert_eq!(
+        rest.len(),
+        2,
+        "the stop's rows after op=shutdown (no other row):\n{}",
+        shown()
+    );
+    assert!(
+        op(&rest[0]) == "telemetry_loss" && rest[0]["extra"]["at"] == "stop",
+        "the stop beat's telemetry_loss (at: stop) after the bus's close and the manifest's \
+         changes:\n{}",
+        shown()
+    );
+    assert!(
+        op(&rest[1]) == "agent_stop" && rest[1]["extra"]["reason"] == "admin_shutdown",
+        "agent_stop (reason admin_shutdown) last:\n{}",
+        shown()
+    );
     let _ = (priv_a, priv_b);
 }
 

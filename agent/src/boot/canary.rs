@@ -22,7 +22,7 @@ pub(crate) fn start(
     agent_id: [u8; 16],
     audit_log: &AuditHandle,
     fim_admin_state: &Option<Arc<admin_socket::FimAdminState>>,
-    signing_key: &northnarrow_agent::keys::BootKey,
+    signing_key: &northnarrow_agent::keys::KeyStore,
 ) -> Canary {
     // ── Tappa 9.5 K6 — canary subsystem boot ───────────────────────
     //
@@ -257,19 +257,42 @@ pub(crate) fn start(
                             )
                             .with_writer(trips),
                         );
+                        // Review of #482: the writer is supervised — its
+                        // queue's receiver held here, a trip whose write
+                        // panicked counted and said, a thread that did not
+                        // start (or ended) a signed degradation and started
+                        // again every CANARY_WRITER_RESTART from a runtime
+                        // thread; its trips wait in the queue meanwhile,
+                        // never written on the decision's thread.
                         let writer = Arc::clone(&detector);
-                        if let Err(e) = std::thread::Builder::new()
-                            .name("nn-canary-log".to_string())
-                            .spawn(move || {
-                                for job in written {
-                                    writer.write_trip(job);
-                                }
+                        let lost = Arc::clone(&detector);
+                        let supervised = Arc::new(
+                            nn_core::supervised::Supervised::new(
+                                CANARY_WRITER_THREAD,
+                                "canary_writer",
+                                written,
+                                move |job| writer.write_trip(job),
+                            )
+                            .on_lost(move || lost.trip_lost())
+                            // R14c (plan §3.1): the writer's capabilities
+                            .on_start(|| {
+                                nn_linux::caps::enter_or_report(nn_linux::caps::Role::Writer);
                             })
-                        {
-                            // no writer: the detector writes inline (its
-                            // send fails once the queue's receiver is gone)
-                            warn!(error = %e, "canary: the access writer's thread did not start — trips are written by the decision");
-                        }
+                            .reporting(Arc::new(
+                                |source: &str, detail: &str| {
+                                    northnarrow_agent::boot::degradation::report(source, detail);
+                                },
+                            )),
+                        );
+                        supervised.ensure_running();
+                        tokio::spawn(async move {
+                            let mut every = tokio::time::interval(CANARY_WRITER_RESTART);
+                            every.tick().await;
+                            loop {
+                                every.tick().await;
+                                supervised.ensure_running();
+                            }
+                        });
                         let admin_state = Arc::new(admin_socket::CanaryAdminState {
                             fim_watch,
                             registry,
@@ -290,6 +313,12 @@ pub(crate) fn start(
         canary_detector,
     }
 }
+
+/// The canary access writer's thread (R12b; R14c's writer role).
+const CANARY_WRITER_THREAD: &str = "nn-canary-log";
+
+/// Review of #482: how often a missing access writer is started again.
+const CANARY_WRITER_RESTART: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// R12b (lab PR 269): the canary trips queued for their writer at most; a
 /// full queue holds the decision until the writer takes one (a flood of

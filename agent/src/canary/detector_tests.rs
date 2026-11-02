@@ -1155,10 +1155,12 @@ fn a_trip_s_rows_are_the_writer_s() {
     assert!(!flag(&third));
 }
 
-/// R12b: a writer that is gone (its queue's receiver dropped) — the trip
-/// is written by `process_event` itself, as before.
+/// Review of #482: a writer that is gone (its queue's receiver dropped:
+/// the agent stopping) — the trip is NOT written by `process_event`, which
+/// runs on the decision thread, whose filter refuses a chain append; it is
+/// counted unwritten, and its event still goes out.
 #[test]
-fn a_trip_is_written_inline_when_its_writer_is_gone() {
+fn a_trip_is_never_written_inline_when_its_writer_is_gone() {
     let dir = TempDir::new().unwrap();
     let (detector, registry) = build_detector(&dir);
     let id = deploy_file_canary(&registry, &detector, "/tmp/decoy-g.txt", "c");
@@ -1173,9 +1175,84 @@ fn a_trip_is_written_inline_when_its_writer_is_gone() {
             ..
         })
     ));
-    assert_eq!(access_rows(&dir).len(), 1);
-    assert!(registry.lock().get(&id).unwrap().tripped);
+    assert!(access_rows(&dir).is_empty(), "nothing written inline");
+    assert!(!registry.lock().get(&id).unwrap().tripped);
+    let (per, total) = detector.unwritten();
+    assert_eq!((per.get(&id).copied(), total), (Some(1), 1));
     assert!(detector.flush(std::time::Duration::from_millis(5)));
+}
+
+/// Review of #482: the canary's writer, supervised as the agent runs it —
+/// a trip whose write panics is counted (not queued any more: the stop's
+/// flush does not wait for it) and said; the next trip is written; a
+/// writer that could not start leaves the trips queued, and its start
+/// writes them.
+#[test]
+fn the_supervised_writer_survives_a_panic_and_a_late_start() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let dir = TempDir::new().unwrap();
+    let (detector, registry) = build_detector(&dir);
+    let a = deploy_file_canary(&registry, &detector, "/tmp/decoy-p1.txt", "c1");
+    let (trips, written) = std::sync::mpsc::sync_channel(8);
+    let detector = Arc::new(detector.with_writer(trips));
+    let said: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+    let s2 = Arc::clone(&said);
+    let fail = Arc::new(AtomicU32::new(1));
+    let f = Arc::clone(&fail);
+    let (w, lost) = (Arc::clone(&detector), Arc::clone(&detector));
+    // the first trip's write panics (its first access: the mark's)
+    let first = Arc::new(AtomicU32::new(0));
+    let writer = nn_core::supervised::Supervised::new(
+        "nn-canary-log",
+        "canary_writer",
+        written,
+        move |job: nn_core::canary::detector::TripWrite| {
+            if first.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("a write panics");
+            }
+            w.write_trip(job)
+        },
+    )
+    .on_lost(move || lost.trip_lost())
+    .reporting(Arc::new(move |s: &str, d: &str| {
+        s2.lock().push(format!("{s}: {d}"))
+    }))
+    .spawning(Arc::new(
+        move |name: &str, body: Box<dyn FnOnce() + Send>| {
+            if f.load(Ordering::SeqCst) > 0 {
+                f.fetch_sub(1, Ordering::SeqCst);
+                return Err(std::io::Error::other("EAGAIN"));
+            }
+            std::thread::Builder::new()
+                .name(name.to_string())
+                .spawn(body)
+        },
+    ));
+    // the start fails: the trips wait in the queue
+    assert!(!writer.ensure_running());
+    let t1 = detector.process_event(&fim_event_on("/tmp/decoy-p1.txt", 4242));
+    let t2 = detector.process_event(&fim_event_on("/tmp/decoy-p1.txt", 4243));
+    assert!(t1.is_some() && t2.is_some(), "{t1:?} {t2:?}");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(access_rows(&dir).is_empty());
+    // started again: the first access's write panics (lost, counted,
+    // said), the second access's row is written
+    assert!(writer.ensure_running());
+    assert!(detector.flush(std::time::Duration::from_secs(5)));
+    assert_eq!(detector.unwritten().1, 1, "{:?}", said.lock());
+    let rows = access_rows(&dir);
+    assert_eq!(rows.len(), 1, "{:?}", said.lock());
+    assert_eq!(rows[0].accessor_pid, 4243);
+    // the lost write was the first trip's: no mark this run (the next
+    // start's recovery reads the access log, which has none for it)
+    assert!(!registry.lock().get(&a).unwrap().tripped);
+    let said = said.lock().clone();
+    assert!(
+        said.iter()
+            .any(|d| d.starts_with("canary_writer: the nn-canary-log thread could not start")),
+        "{said:?}"
+    );
+    assert!(said.iter().any(|d| d.contains("panicked")), "{said:?}");
 }
 
 /// Review of #475: a writer that stopped writing (its queue full) holds

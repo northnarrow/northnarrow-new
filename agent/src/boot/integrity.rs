@@ -60,7 +60,7 @@ pub(crate) fn check(
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
     early_registration_failed: bool,
     refused: Option<Refusal>,
-    signing_key: &northnarrow_agent::keys::BootKey,
+    signing_key: &northnarrow_agent::keys::KeyStore,
 ) -> Result<Integrity> {
     // R11b (lab PR 262): what signs a refusal before the install manifest
     // is checked (after it, its verdict too); the review of #468, R4: with

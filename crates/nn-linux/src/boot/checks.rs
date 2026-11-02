@@ -140,7 +140,7 @@ fn agent_mounts_decided(
 
 /// What [`signing_identity`] decided (the review of #468, R4): the start's
 /// signing key is decided once, here, and the token is what its one load
-/// takes ([`crate::keys::BootKey`]).
+/// takes ([`crate::keys::KeyStore`]).
 #[derive(Debug)]
 #[must_use]
 pub enum KeyVerdict {
@@ -609,7 +609,7 @@ impl std::fmt::Debug for AuditOpen {
 pub fn audit_log(
     boot: &mut BootSequence,
     path: &Path,
-    key: &crate::keys::BootKey,
+    key: &crate::keys::KeyStore,
     agent_id: [u8; 16],
     closed_by_previous_hooks: bool,
 ) -> Result<AuditCheck, BootOrderError> {
@@ -628,7 +628,7 @@ pub fn audit_log(
 fn audit_log_with(
     boot: &mut BootSequence,
     path: &Path,
-    key: &crate::keys::BootKey,
+    key: &crate::keys::KeyStore,
     agent_id: [u8; 16],
     closed_by_previous_hooks: bool,
     allow_unwritable: Option<&str>,
@@ -657,7 +657,7 @@ fn audit_log_with(
 /// as the attest phase opened it.
 fn open_audit_log(
     path: &Path,
-    key: &crate::keys::BootKey,
+    key: &crate::keys::KeyStore,
     agent_id: [u8; 16],
     closed_by_previous_hooks: bool,
 ) -> AuditOpen {
@@ -1247,13 +1247,13 @@ mod tests {
     }
 
     /// The start's key at `path`, decided a first install.
-    fn first_install(path: &Path) -> crate::keys::BootKey {
-        crate::keys::BootKey::decided(KeyDecision::first_install_for_tests(path))
+    fn first_install(path: &Path) -> crate::keys::KeyStore {
+        crate::keys::KeyStore::decided(KeyDecision::first_install_for_tests(path))
     }
 
     /// The start's key at `path`, decided there.
-    fn present(path: &Path) -> crate::keys::BootKey {
-        crate::keys::BootKey::decided(KeyDecision::present_for_tests(path))
+    fn present(path: &Path) -> crate::keys::KeyStore {
+        crate::keys::KeyStore::decided(KeyDecision::present_for_tests(path))
     }
 
     fn identity_paths(dir: &Path) -> continuity::IdentityPaths {
@@ -1727,7 +1727,9 @@ mod tests {
         let first = crate::keys::AgentSigningKey::load_or_bootstrap(&paths.signing_key).unwrap();
         let public = crate::keys::verifying_key_path(&paths.signing_key);
         let decided = |boot: &mut BootSequence| match decide(boot, &paths) {
-            KeyVerdict::Decided(d @ KeyDecision::KeyPresent(_)) => crate::keys::BootKey::decided(d),
+            KeyVerdict::Decided(d @ KeyDecision::KeyPresent(_)) => {
+                crate::keys::KeyStore::decided(d)
+            }
             other => panic!("{other:?}"),
         };
         // gone, with all the evidence, between the check and the load
@@ -1788,7 +1790,7 @@ mod tests {
         assert_eq!(present.path(), paths.signing_key);
         // the link's end appears, a valid key, after the check
         let planted = crate::keys::AgentSigningKey::load_or_bootstrap(&target).unwrap();
-        let key = crate::keys::BootKey::decided(KeyDecision::KeyPresent(present));
+        let key = crate::keys::KeyStore::decided(KeyDecision::KeyPresent(present));
         let err = key.load().unwrap_err();
         assert!(
             matches!(&err, crate::keys::NoKey::Failed(w) if w.contains("could not look at what its name holds")),
@@ -1824,7 +1826,7 @@ mod tests {
         else {
             panic!("a first install: a leftover temporary file is no identity")
         };
-        let key = crate::keys::BootKey::decided(d);
+        let key = crate::keys::KeyStore::decided(d);
         let minted = key.signer().expect("minted despite the leftover");
         assert!(!tmp.exists(), "the leftover is gone");
         assert_eq!(
@@ -1847,7 +1849,7 @@ mod tests {
         else {
             panic!("a first install")
         };
-        let key = crate::keys::BootKey::decided(d);
+        let key = crate::keys::KeyStore::decided(d);
         assert!(key.load().is_err());
         assert!(!paths.signing_key.exists(), "a key minted");
     }
@@ -1864,7 +1866,7 @@ mod tests {
         else {
             panic!("a first install")
         };
-        let key = crate::keys::BootKey::decided(d);
+        let key = crate::keys::KeyStore::decided(d);
         let minted = key.signer().unwrap();
         assert_eq!(
             crate::keys::read_verifying_key(&crate::keys::verifying_key_path(&paths.signing_key))
@@ -1886,7 +1888,7 @@ mod tests {
             panic!("a first install")
         };
         std::fs::write(&paths.signing_key, "planted\n").unwrap();
-        let key = crate::keys::BootKey::decided(d);
+        let key = crate::keys::KeyStore::decided(d);
         let err = key.load().unwrap_err();
         assert!(
             matches!(&err, crate::keys::NoKey::Failed(w) if w.contains("not replaced, nothing minted")),

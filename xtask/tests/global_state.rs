@@ -400,6 +400,14 @@ const STATICS: &[Kept] = &[
         "the rings' drop counters of the one eBPF object, as sampled",
     ),
     kept(
+        "crates/nn-linux/src/caps/errands.rs",
+        "ERRANDS",
+        Process,
+        "the decision thread's errands (R14c): one thread per process, started by the start's \
+         thread before the decision runs — a thread inherits its creator's capabilities and \
+         filter, so it cannot be made on the decision's first errand",
+    ),
+    kept(
         "crates/nn-linux/src/boot/degradation.rs",
         "REGISTRY",
         Log,
@@ -496,6 +504,11 @@ const START_CALLS: &[(&str, &str)] = &[
         "fixes the event loop's heartbeat origin at the process's start",
     ),
     ("loop_progress::tick", "one round of the event loop"),
+    (
+        "errands::start",
+        "starts the decision thread's errands thread (R14c) from the start's thread, whose \
+         capabilities it inherits: once per process",
+    ),
     (
         "execq::start",
         "starts the exec quarantine's controller (its configuration and kernel objects passed \

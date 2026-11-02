@@ -78,7 +78,11 @@ impl SlowWork {
             let shared = Arc::clone(&shared);
             std::thread::Builder::new()
                 .name("nn-slow-work".into())
-                .spawn(move || run(&shared))
+                .spawn(move || {
+                    // review of #482 (R14c-4): the core's set, whoever starts it
+                    nn_linux::caps::restore_core();
+                    run(&shared)
+                })
         };
         let thread = match thread {
             Ok(t) => Some(t),

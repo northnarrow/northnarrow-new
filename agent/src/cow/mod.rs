@@ -411,6 +411,10 @@ fn on_neutralized(guard: &CowGuard, offenders: Vec<ProcId>, source: String) {
     let spawned = std::thread::Builder::new()
         .name("nn-cow-restore".into())
         .spawn(move || {
+            // review of #482 (R14c-4): started by an actuator's thread, it
+            // would keep that role's set (no CHOWN, no FOWNER: the restore
+            // of a user's files refused) — the core's set back, or signed
+            nn_linux::caps::restore_core();
             // The kill is verified by the response; give the tree a moment
             // to be gone from /proc (a running writer is skipped).
             for _ in 0..50 {

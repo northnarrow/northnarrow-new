@@ -126,6 +126,20 @@ TimeoutStartSec=180s
 # signing key. It is not dumpable either (process_hardening: PR_SET_DUMPABLE
 # 0 and RLIMIT_CORE 0 at its start).
 LimitCORE=0
+# R14c (lot 272, plan §3.1): the system calls this process and every
+# program it starts never make, refused (EPERM, the call's error — not a
+# kill: an agent stopped by one stray call would be a way to stop it);
+# validated in the lab on every supported kernel (deploy/lab/caps/
+# thread-caps.sh: none of them made through the lab's runs). No
+# ptrace or process_vm_writev (the agent reads /proc, it never attaches),
+# no kexec or module load (the agent refuses them to others), no swap,
+# reboot, mount or pivot_root, no userfaultfd, no open_by_handle_at (the
+# copy-on-first-write guard opens by path). Native system calls only (no
+# x32 or i386 entry), and the execution domain locked.
+SystemCallFilter=~ptrace process_vm_writev kexec_load kexec_file_load init_module finit_module delete_module swapon swapoff reboot mount umount2 pivot_root userfaultfd open_by_handle_at
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+LockPersonality=yes
 RuntimeDirectory=northnarrow
 RuntimeDirectoryMode=0700
 # /run/northnarrow is SHARED with the watchdog (watchdog.pid, the A8
@@ -288,9 +302,20 @@ ReadWritePaths=/run/northnarrow /var/lib/northnarrow /etc/northnarrow
 # drop-in northnarrow-agent.service.d/10-debian-perf-paranoid.conf.
 # Lab PR 223 (EXPERIMENTAL exec quarantine): CAP_SETUID and CAP_SETGID
 # let the agent start its scanner as the unprivileged `northnarrow-scan`
-# account (setgroups/setgid/setuid in the child before exec); nothing else
-# uses them. Without them the guard refuses to start (a signed
-# degradation), the agent runs.
+# account (setgroups/setgid/setuid in the child before exec). Without them
+# the guard refuses to start (a signed degradation), the agent runs.
+# R14a (lot 272): the same two start the workers as `northnarrow-worker`
+# (docs/operator/WORKERS.md); nothing else uses them.
+#
+# R14c (lot 272, plan §3.1): this set is the process's ceiling; each of
+# the agent's threads keeps EFFECTIVE only what its role needs
+# (crates/nn-linux/src/caps; docs/architecture/PROCESS_MODEL.md): the
+# decision thread CAP_SYS_PTRACE alone, given up for good, with a seccomp
+# filter of its own (no capset, execve, execveat, bpf); the response
+# workers CAP_KILL CAP_NET_ADMIN CAP_SETFCAP CAP_DAC_OVERRIDE
+# CAP_SYS_PTRACE; the canary writer CAP_LINUX_IMMUTABLE; the workers'
+# supervisor CAP_SETUID CAP_SETGID CAP_KILL CAP_BPF; the eBPF load CAP_BPF
+# CAP_PERFMON; the decision's errands CAP_BPF; the rest the whole set.
 CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_LINUX_IMMUTABLE CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_KILL CAP_SETFCAP CAP_SETUID CAP_SETGID
 
 [Install]

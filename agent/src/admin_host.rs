@@ -99,7 +99,18 @@ impl AdminHost for AgentAdminHost {
     }
 
     fn verifying_key_of_signing_key(&self, path: &Path) -> anyhow::Result<VerifyingKey> {
-        crate::audit::read_signing_key(path).map(|key| key.verifying_key())
+        // R14c: the public half only
+        // `None` is the key file's absence: said as the read said it before
+        // (nn-admin's output, `agent/tests/golden/nn-admin`)
+        crate::audit::public_half(path)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "reading {}: {}",
+                    path.display(),
+                    std::io::Error::from_raw_os_error(libc::ENOENT)
+                )
+            })
     }
 
     /// Where the agent keeps its chains under its state directory (was

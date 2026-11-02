@@ -64,6 +64,9 @@ impl PumpThread {
         let flag = Arc::clone(&stop);
         let name: String = format!("nn-{label}").chars().take(15).collect();
         let handle = std::thread::Builder::new().name(name).spawn(move || {
+            // R14c: a pump starts while the loader's set is the start's
+            // (`caps::lower`): the core's set back
+            crate::caps::restore_core();
             if let Err(e) = body(&flag) {
                 error!(label, error = %e, "ringbuf pump failed");
             }

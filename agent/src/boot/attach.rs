@@ -187,15 +187,26 @@ pub(crate) async fn load(
         cli.exploit_guard_tasks,
         cli.exploit_guard.variant(),
     );
-    let (mut sensor, net_bufs) = match SensorMultiplexer::start_with_net(
-        net_wiring,
-        &plan,
-        &mut exec_guards,
-        verified,
-    )
-    .await
-    .context("starting the sensor multiplexer (with net observation)")
-    {
+    // R14c (plan §3.1): the loader's capabilities while the object loads,
+    // its programs attach and its maps are pinned (this thread, which the
+    // runtime's `block_on` drives alone); the core's back after. The pumps
+    // it starts take the core's at their start.
+    let loader = match nn_linux::caps::lower(nn_linux::caps::Role::Loader) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            let detail = format!(
+                "the loader's capabilities could not be set ({e}): the load runs with the core's"
+            );
+            error!("{detail}");
+            nn_linux::boot::degradation::report("thread_caps", &detail);
+            None
+        }
+    };
+    let started = SensorMultiplexer::start_with_net(net_wiring, &plan, &mut exec_guards, verified)
+        .await
+        .context("starting the sensor multiplexer (with net observation)");
+    drop(loader);
+    let (mut sensor, net_bufs) = match started {
         Ok(started) => started,
         // R11b (lab PR 262): a load or a mandatory sensor's attach that
         // fails refuses the start, signed; it needs the loaded object
@@ -438,6 +449,8 @@ fn spawn_lineage_sweep(
     let spawned = std::thread::Builder::new()
         .name("nn-lineage-sweep".to_string())
         .spawn(move || {
+            // review of #482 (R14c-4): the core's set, whoever starts it
+            nn_linux::caps::restore_core();
             let mut evicted_live = 0;
             loop {
                 std::thread::sleep(LINEAGE_SWEEP_EVERY);

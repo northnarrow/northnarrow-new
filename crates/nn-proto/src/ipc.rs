@@ -141,6 +141,23 @@ pub enum WorkerKind {
     Parse,
 }
 
+/// Review of #482 (the mutation MP2, equivalent while there is one kind):
+/// a hello of another kind than the one started cannot be tested with one
+/// kind. A second kind does not build until it is named here — and its
+/// line is the reminder: `check_hello`'s kind check gets its test (a hello
+/// of the other kind refused) the day it exists.
+const _: () = {
+    const fn one(k: WorkerKind) -> usize {
+        match k {
+            WorkerKind::Parse => 1,
+        }
+    }
+    assert!(
+        one(WorkerKind::Parse) == WorkerKind::ALL.len(),
+        "a second worker kind: test check_hello's kind check (MP2)"
+    );
+};
+
 impl WorkerKind {
     pub const ALL: [WorkerKind; 1] = [WorkerKind::Parse];
 
