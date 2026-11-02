@@ -4409,3 +4409,55 @@ only in the table below, in the same PR as the evidence.
     carries the contract's terms (about 17 KiB), a change's row names them
     by `contract_hash`; the verifier's "across a restart" is named from the
     run of the last settled hash it kept.
+- **Lot 272 — R14: privilege separation, the agent's unprivileged workers
+  (Wave 4 Phase 2, the last step; R14a/b/c of the restructure plan, §3.1,
+  §3.2, §3.3, §3.5; report 06 INI-19; HIGH risk; three stacked PRs).**
+  - R14a — what changed: the agent's own binary, started from the
+    descriptor of `/proc/self/exe` opened at boot (`/proc/self/fd/N`), as
+    the new `northnarrow-worker` account (install, the packages' configure
+    step, uninstall, the privileged tests' helper), runs as a `parse`
+    worker: `no_new_privs`, no capability, not dumpable, no process, no
+    core, 8 descriptors, 512 MiB; Landlock at the kernel's ABI (the
+    `landlock` 0.4.7 crate, best effort, the level declared) and a seccomp
+    allowlist that kills on anything else (`seccompiler` 0.5.0); a
+    `SOCK_SEQPACKET` channel of postcard frames of at most 64 KiB with no
+    descriptor, a checked hello, request ids, every answer bounded by the
+    core; a supervisor with a backoff, a disable after five failures in a
+    row and signed degradations, never parsing in the core;
+    `PROTECTED_PIDS` entries as roles (`0x01` exempt, `0x02` protected:
+    the agent and the watchdog `0x03`, a worker `0x02`, an entry an
+    earlier version wrote, `1`, keeping both); the manifest's `workers`;
+    R004's own launch; a compromised-worker harness; the lab scripts that
+    counted or killed by name reviewed.
+  - R14a — lab (as measured; our own guests): the workers' lab (identity,
+    roles 0x03/0x03/0x02, a root `kill -9` of the worker refused, the
+    roles' meaning in the hooks, the manifest; a crash, a hang, a kill, a
+    crash loop disabled in about 6 s, signed, ready again; the agent's pid
+    and the unit's restarts unchanged) 24 + 15 checks passed on Ubuntu
+    22.04 (5.15, Landlock ABI 1 declared `Partial`, files only), Ubuntu
+    24.04 (6.8, ABI 4, files and TCP), Debian 12 (6.1, ABI 2, files) and
+    Debian 13 (6.12, ABI 6, files, TCP, signals and abstract sockets); the
+    compromised-worker harness 4 of 4 on the four kernels (Ubuntu 22.04 on
+    ca641d69, the others on the stack's tip; beneath the filter, files and
+    exec refused by Landlock and DAC everywhere, TCP from ABI 4, signals
+    and abstract sockets from ABI 6, executable memory refused by the
+    filter alone — as declared); tamper-check: the same outcomes as
+    `main`'s on Ubuntu 24.04 but C61, which counted the worker's entry as
+    stale — the script fixed; EXP-13 the same checks as `main`; overhead
+    ×3 within `main`'s noise (dns +21.5 % → +18.3 %); test-ignored 101
+    passed, 0 failed on Ubuntu 22.04 (on Ubuntu 24.04, 4dc2e1f6: 100 and
+    1, the harness's listener name reused — fixed in ca641d69); upgrade
+    from `main` (by hand: the
+    account created, roles 03/03/02) and uninstall (both accounts removed)
+    clean. A lab flake, on `main` too: right after an agent restart under
+    the lab's load, R009 killed the lab's own `uninstall.sh` (round a2)
+    and `install.sh` (round a's upgrade-check, `main`'s agent); both
+    passed on a settled agent.
+  - R14a — gates on ca641d69: 79 suites, 3,510 passed, 0 failed, 17
+    ignored, every gate (eBPF, clippy ×4, fmt, privileged no-run, attack
+    coverage, golden ×5, MSRV, fuzz 13 targets, portable 5 targets).
+    Mutations: set A 84 (75 caught; 5 survivors given tests; 2 site
+    errors and 2 compile errors redone) and A2 9 (8 caught; `MP2`, the
+    hello's kind, equivalent while there is one kind).
+  - R14a — open: the `export` worker of §3.1 (no exporter yet); Landlock
+    `Full` takes a kernel with ABI 9.
