@@ -80,6 +80,38 @@ pub fn worker_args(kind: WorkerKind) -> [String; 4] {
     ]
 }
 
+/// Review of #480 (F12), in the child before `exec`: its own
+/// `oom_score_adj` [`WORKER_OOM_SCORE_ADJ`] and nice [`WORKER_NICE`] —
+/// raising either needs no privilege. Async-signal-safe: `open`, `write`,
+/// `close`, `setpriority`, no allocation.
+fn yield_first() -> io::Result<()> {
+    // SAFETY: a static NUL-terminated path; a local descriptor written
+    // from a static buffer and closed.
+    unsafe {
+        let fd = libc::open(
+            c"/proc/self/oom_score_adj".as_ptr(),
+            libc::O_WRONLY | libc::O_CLOEXEC,
+        );
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = libc::write(
+            fd,
+            WORKER_OOM_SCORE_ADJ.as_ptr().cast(),
+            WORKER_OOM_SCORE_ADJ.len(),
+        );
+        let err = io::Error::last_os_error();
+        libc::close(fd);
+        if n < 0 {
+            return Err(err);
+        }
+        if libc::setpriority(libc::PRIO_PROCESS, 0, WORKER_NICE) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Start a `kind` worker from `image` as `account`; `extra` arguments
 /// follow (the lab harness's).
 pub fn spawn(
@@ -127,20 +159,8 @@ pub fn spawn(
             };
             check(rc as libc::c_long)?;
             // F12, as root still: the OOM killer's first choice, and a low
-            // priority (failures leave the worker as it was: best effort)
-            let fd = libc::open(
-                c"/proc/self/oom_score_adj".as_ptr(),
-                libc::O_WRONLY | libc::O_CLOEXEC,
-            );
-            check(fd as libc::c_long)?;
-            let n = libc::write(
-                fd,
-                WORKER_OOM_SCORE_ADJ.as_ptr().cast(),
-                WORKER_OOM_SCORE_ADJ.len(),
-            );
-            libc::close(fd);
-            check(n as libc::c_long)?;
-            check(libc::setpriority(libc::PRIO_PROCESS, 0, WORKER_NICE) as libc::c_long)?;
+            // priority (a failure fails the start)
+            yield_first()?;
             check(libc::syscall(
                 libc::SYS_setgroups,
                 0usize,
@@ -174,4 +194,26 @@ pub fn spawn(
         sock: ours,
         stderr: Some(err_read),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review of #480 (F12; the review's mutation N27): the child the core
+    /// starts is the OOM killer's first choice and the scheduler's last —
+    /// without a privilege, so this test's own child shows it.
+    #[test]
+    fn the_child_yields_first() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("cat /proc/self/oom_score_adj; cut -d' ' -f19 /proc/self/stat");
+        // SAFETY: yield_first makes async-signal-safe calls only.
+        unsafe { cmd.pre_exec(yield_first) };
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines, ["1000", "10"], "{text}");
+    }
 }

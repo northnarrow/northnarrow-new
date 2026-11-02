@@ -228,7 +228,7 @@ fn debug_crash() -> Answer {
 }
 
 /// `debug-trigger` builds: the lab's worker hang — it stops answering
-/// (blocked in `recvmsg`, its requests read and dropped) until the core
+/// (blocked in `recvfrom`, its requests read and dropped) until the core
 /// gives up on it and kills it.
 #[cfg(feature = "debug-trigger")]
 fn debug_hang() -> Answer {

@@ -325,6 +325,41 @@ fn every_escape_kills_the_process() {
             unsafe { libc::syscall(libc::SYS_sendto, 3, buf.as_ptr(), 8, 0, 0usize, 0usize) };
             0
         }),
+        // the review's mutations N22, N23: each argument the rules pin
+        ("recvfrom with other flags", || {
+            let mut buf = [0u8; 8];
+            // SAFETY: plain syscall into a local buffer; it does not wait
+            // (MSG_DONTWAIT) if it ever ran.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_recvfrom,
+                    3,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    crate::worker::transport::WORKER_RECV_FLAGS | libc::MSG_DONTWAIT,
+                    0usize,
+                    0usize,
+                )
+            };
+            0
+        }),
+        ("sendto with an address", || {
+            let buf = [0u8; 8];
+            let sa = [0u8; 16];
+            // SAFETY: plain syscall from local buffers.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_sendto,
+                    3,
+                    buf.as_ptr(),
+                    8,
+                    crate::worker::transport::WORKER_SEND_FLAGS,
+                    sa.as_ptr(),
+                    16usize,
+                )
+            };
+            0
+        }),
         // review of #480 (F7): what only the filter refuses on every lab
         // kernel
         ("unshare a user namespace", || {
