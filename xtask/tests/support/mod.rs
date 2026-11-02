@@ -606,19 +606,67 @@ fn find_test_cfg(code: &str, from: usize) -> Option<usize> {
 }
 
 /// The length up to and including the brace that closes `s`'s first `{`.
+/// Braces inside string, raw string and char literals are not counted
+/// (review of #482: a test module whose strings held an unbalanced `{`
+/// was blanked to the end of its file, and what followed it with it).
 pub fn matching_brace(s: &str) -> usize {
+    let b = s.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
     let mut depth = 0usize;
-    for (i, c) in s.char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return i + 1;
-                }
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'r'
+            && (i == 0 || !ident(b[i - 1]))
+            && matches!(b.get(i + 1), Some(b'"') | Some(b'#'))
+        {
+            let mut j = i + 1;
+            while b.get(j) == Some(&b'#') {
+                j += 1;
             }
-            _ => {}
+            if b.get(j) == Some(&b'"') {
+                let mut close = vec![b'"'];
+                close.extend(std::iter::repeat_n(b'#', j - i - 1));
+                i = b[j + 1..]
+                    .windows(close.len())
+                    .position(|w| w == close.as_slice())
+                    .map_or(b.len(), |p| j + 1 + p + close.len());
+                continue;
+            }
+        } else if c == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                if b[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        } else if c == b'\'' {
+            if b.get(i + 1) == Some(&b'\\') {
+                i += 2;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            // `i` follows an ASCII byte: `i + 1` is a char boundary
+            let len = s[i + 1..].chars().next().map_or(1, char::len_utf8);
+            if b.get(i + 1 + len) == Some(&b'\'') {
+                i += 2 + len;
+                continue;
+            }
+        } else if c == b'{' {
+            depth += 1;
+        } else if c == b'}' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return i + 1;
+            }
         }
+        i += 1;
     }
     s.len()
 }
