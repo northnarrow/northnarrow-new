@@ -354,7 +354,38 @@ can do: a flaw that steers the decision into an `execve`, a `bpf` or a
 `capset`, or into another thread's action (a kill, an nft rule, a
 `chattr`), meets `EPERM`.
 
-**Measured** (`deploy/lab/caps/thread-caps.sh`): LAB-PENDING
+**Measured** (`deploy/lab/caps/thread-caps.sh`: a kprobe and a kretprobe on
+`cap_capable()` for the agent's threads, by name, through the workers' lab,
+tamper-check and EXP-13r's burst and hang (and its crash on Ubuntu 24.04);
+Ubuntu 22.04 5.15, Ubuntu 24.04 6.8, Debian 12 6.1, Debian 13 6.12; lot
+272): no capability check a role's thread made for its work was refused.
+The decision thread's granted checks were all `CAP_SYS_PTRACE`; the response
+workers' `CAP_SYS_PTRACE` (their targets' `/proc`) and `CAP_KILL`; the
+supervisor's `CAP_SETUID`, `CAP_SETGID`, `CAP_KILL` and, on 5.15 and 6.1,
+`CAP_BPF` (6.8 and 6.12 check no capability for a map update through a
+descriptor); the errands' `CAP_BPF` (`DEFENDER_PIDS`, on 5.15).
+Refused, and why it does not matter:
+
+- capabilities the unit does not grant, refused before R14c as well: the
+  decision's `CAP_SYS_NICE` (its renice to −5 keeps the agent's priority,
+  as before), `CAP_SYS_ADMIN` probes, `CAP_SYS_RESOURCE`,
+  `CAP_DAC_READ_SEARCH`;
+- a worker's child after its `setresuid`, before its `exec`: the
+  `DAC_OVERRIDE`/`DAC_READ_SEARCH` pair on its own `/proc/self/fd`, which
+  the kernel then allows as the process's own;
+- inside the loader's window, `CAP_NET_ADMIN` for aya's `DEVMAP` feature
+  probe (the agent creates no devmap; with the Debian drop-in the probe's
+  `CAP_SYS_ADMIN` fallback is granted);
+- at an agent's exit, `CAP_KILL` on a role's thread without it (the
+  decision, the errands, the writer): the kernel re-sends a worker's
+  `PR_SET_PDEATHSIG` from each sibling thread the worker is reparented to;
+  the thread that started it (the supervisor, `CAP_KILL`) delivered it
+  first. A worker also exits when its channel closes.
+
+The census (`CapEff`, `CapPrm`, `Seccomp` per thread) shows each role's set
+and every other thread with the bounding set. No agent thread entered a call
+the decision's filter refuses but the decision's own `capset` at its role's
+entry, before its filter.
 
 A thread left with more than its role (its sets not changed, its filter
 refused) is a signed degradation (`thread_caps`): the agent runs.
@@ -388,7 +419,13 @@ bounding set):
 - `SystemCallArchitectures=native` (no x32 or i386 entry);
 - `LockPersonality=yes`.
 
-Validated in the lab: LAB-PENDING. The
+Validated in the lab: through the workers' lab, tamper-check and EXP-13r,
+under the unit, on Ubuntu 22.04, Ubuntu 24.04, Debian 12 and Debian 13, no
+thread of the agent entered one of these calls (`thread-caps.sh`'s
+`calls.tsv`), nor — traced from the Ubuntu 24.04 round on — any program it
+starts (nft, iptables, rpm, the scanner); the one `finit_module` traced was
+tamper-check C58's own module tool. Those runs passed as on `main`
+(tamper-check's outcomes `main`'s). The
 self-integrity round expects the process's `no_new_privs` 1, its seccomp
 mode 2 and its core limit 0 from the unit (`limit_unexpected` otherwise;
 `docs/operator/INSTALL_UPGRADE_UNINSTALL.md`).
