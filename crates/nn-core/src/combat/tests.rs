@@ -1590,3 +1590,64 @@ fn the_neutralize_hook_hears_the_contained_offenders_only() {
         }
     }
 }
+
+/// Review of #482: a ladder whose worker cannot start never runs its steps
+/// on the caller (the decision thread, whose filter refuses the kills and
+/// the chain writes): they wait in the queue, a signed degradation
+/// (`combat_ladder`) says so, and the tick starts the worker — which runs
+/// them, on its own thread.
+#[test]
+fn a_ladder_whose_worker_is_missing_runs_nothing_on_the_caller() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let rec = Recorder::new();
+    let said: Arc<Mutex<Vec<String>>> = Arc::default();
+    let s2 = Arc::clone(&said);
+    let fail = Arc::new(AtomicU32::new(1));
+    let f = Arc::clone(&fail);
+    let l = CombatLadder::new(
+        Box::new(MockActuator {
+            rec: rec.clone(),
+            neutralize_outcome: NeutralizeOutcome::Contained,
+            failing_blocks: Vec::new(),
+            isolate_plan: Default::default(),
+        }),
+        Box::new(MockEvidence { rec: rec.clone() }),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    )
+    .with_degradation_report(Arc::new(move |src: &str, d: &str| {
+        s2.lock().push(format!("{src}: {d}"))
+    }))
+    .with_worker_spawned_by(Arc::new(
+        move |name: &str, body: Box<dyn FnOnce() + Send>| {
+            if f.load(Ordering::SeqCst) > 0 {
+                f.fetch_sub(1, Ordering::SeqCst);
+                return Err(std::io::Error::other("EAGAIN"));
+            }
+            std::thread::Builder::new()
+                .name(name.to_string())
+                .spawn(body)
+        },
+    ));
+    let t0 = Instant::now();
+    l.engage(&entry(Some(100), None), t0);
+    l.observe(&spawn(101, 100), t0); // jump-ahead: a NEUTRALIZE
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        rec.log()
+            .iter()
+            .all(|e| !e.starts_with("neutralize") && !e.starts_with("soft_block")),
+        "a step ran on the caller: {:?}",
+        rec.log()
+    );
+    assert!(
+        said.lock()
+            .iter()
+            .any(|d| d.starts_with("combat_ladder: the nn-combat-ladder thread could not start")),
+        "{:?}",
+        said.lock()
+    );
+    // the tick (a runtime thread in the agent) starts it; the queued steps run
+    l.tick(t0);
+    wait_for(&rec, "neutralize:[100, 101]");
+}

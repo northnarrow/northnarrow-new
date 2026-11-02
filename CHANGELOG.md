@@ -52,7 +52,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   public half is read from `agent.sig.pub`, the private key only on a host
   without one; no production path reads the master key but the key store;
   the source tests of the keys, the threads and the parsers no longer stop
-  at the first `#[cfg(test)] mod x;` declaration of a file.
+  at the first `#[cfg(test)] mod x;` declaration of a file. After the
+  re-check of #482: the canary's access writer and the COMBAT ladder's
+  worker never fall back to their caller — the decision thread, whose
+  filter refuses their chain appends and kills — when their thread is
+  missing: their work waits in their queue, a signed degradation
+  (`canary_writer`, `combat_ladder`) says so, and the thread is started
+  again from a runtime thread; a job that panics on either is lost, said,
+  and the thread goes on.
 - The parsers in the worker (lot 272, Wave 4 phase 2, R14b of the
   restructure plan, §3.1, §3.5): the DNS pump's query names are decoded by
   the `parse` worker, in batches of at most 512 names whose worst answer

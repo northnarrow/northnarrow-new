@@ -369,7 +369,9 @@ pub struct Detector<H: CanaryHost> {
     /// R12b (lab PR 269, plan §3.4): the writer's queue — the trips' access
     /// rows and registry marks, written off the decision thread
     /// ([`Self::with_writer`]); none: written in [`Self::process_event`],
-    /// as before (the tests, the replay).
+    /// as before (the tests, the replay). Review of #482: with a writer,
+    /// never written in [`Self::process_event`] (the agent's writer thread
+    /// is started again when missing, its queue kept meanwhile).
     writer: Option<std::sync::mpsc::SyncSender<TripWrite>>,
     /// The canaries whose first trip was decided and is not yet in the
     /// registry (the writer's) — or could not be marked there: a later
@@ -438,9 +440,36 @@ impl<H: CanaryHost> Detector<H> {
         )
     }
 
+    /// Review of #482: a trip whose write was lost on the writer's thread
+    /// (its job panicked): no longer queued, counted unwritten.
+    pub fn trip_lost(&self) {
+        self.queued
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        let total = self
+            .unwritten_total
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        warn!(
+            unwritten_total = total,
+            "canary: a trip's rows were lost on the access writer's thread (its write panicked)"
+        );
+    }
+
+    /// Count `id`'s trip unwritten (the writer's queue full, or gone).
+    fn count_unwritten(&self, id: &str) -> u64 {
+        let mut un = self.unwritten.lock();
+        if un.len() < UNWRITTEN_KEYS || un.contains_key(id) {
+            *un.entry(id.to_string()).or_default() += 1;
+        }
+        self.unwritten_total
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1
+    }
+
     /// Queue `job` for the writer: at once, or after waiting for room at
-    /// most [`CANARY_QUEUE_WAIT`]. `Err(job)`: the writer is gone (write it
-    /// here); `Ok(false)`: still full — counted, not written.
+    /// most [`CANARY_QUEUE_WAIT`]. `Err(job)`: the writer's queue is gone
+    /// (the agent stopping); `Ok(false)`: still full — counted, not
+    /// written.
     fn queue_trip(
         &self,
         queue: &std::sync::mpsc::SyncSender<TripWrite>,
@@ -464,14 +493,7 @@ impl<H: CanaryHost> Detector<H> {
                         self.writer_stuck
                             .store(true, std::sync::atomic::Ordering::Release);
                         let id = j.draft.canary_id.clone();
-                        let mut un = self.unwritten.lock();
-                        if un.len() < UNWRITTEN_KEYS || un.contains_key(&id) {
-                            *un.entry(id.clone()).or_default() += 1;
-                        }
-                        let total = self
-                            .unwritten_total
-                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                            + 1;
+                        let total = self.count_unwritten(&id);
                         warn!(
                             canary_id = %id,
                             unwritten_total = total,
@@ -767,15 +789,22 @@ impl<H: CanaryHost> Detector<H> {
                             self.queued
                                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         }
-                        Err(_) => {
-                            // the writer is gone: written here, as before
+                        Err(job) => {
+                            // Review of #482: the writer's queue is gone
+                            // (its receiver is held by the agent's writer
+                            // while the agent runs: the stop). Never written
+                            // here: this is the decision thread, whose
+                            // filter refuses a chain append (create +
+                            // append) — counted unwritten instead.
                             self.queued
                                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                            let mut reg = self.registry.lock();
-                            let hash = self.append_row(draft);
-                            if first_trip {
-                                self.mark(&mut reg, &canary_id, hash);
-                            }
+                            let total = self.count_unwritten(&job.draft.canary_id);
+                            warn!(
+                                canary_id = %canary_id,
+                                unwritten_total = total,
+                                "canary: the access writer's queue is gone — this trip's rows are \
+                                 counted, not written (its event goes on to the rules)"
+                            );
                         }
                     }
                 }

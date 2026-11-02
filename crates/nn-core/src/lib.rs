@@ -70,6 +70,9 @@ pub mod impair;
 // lineage, the stack exemption, the operator's two overlays, and what it
 // needs from its host (`posture::host`).
 pub mod posture;
+/// Review of #482: a worker thread whose work never falls back to its
+/// caller (the canary's access writer, the COMBAT ladder's worker).
+pub mod supervised;
 
 /// Configuration content (R07, lab PR 247): the generic `.v1` + `.local`
 /// list loader and what the loaders take from the signed-overlay gate (was

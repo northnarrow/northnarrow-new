@@ -357,7 +357,21 @@ memory a filter cannot read) and a signal to another process (`kill`,
 agent's, a group included; `tkill` and `pidfd_send_signal` always). The
 decision writes no file and signals no process: the canary is the
 writer's, the detections and the responses go by channels, and the lab's
-trace of its calls saw none (below). `EPERM`, not a kill: a crafted event that steers
+trace of its calls saw none (below). Two side paths used to fall back to
+the caller when their thread was missing — the canary's access writer
+(`nn-canary-log`: its trips' rows and registry marks) and the COMBAT
+ladder's worker (`nn-combat-ladder`: kills, nft, the signed stage rows) —
+and, run on the decision thread, would now meet `EPERM`. Since the
+re-check of #482 neither ever runs on its caller
+(`nn_core::supervised::Supervised`): its queue's receiver is held apart
+from the thread; a thread that did not start, or ended, is a signed
+degradation (`canary_writer`, `combat_ladder`) and is started again — the
+canary's writer every 30 s by a runtime task, the ladder's worker by its
+5 s tick, both on runtime threads, never the decision's — with its work
+waiting in its queue meanwhile (beyond the queue: counted and said); a job
+that panics is lost and said, the thread goes on (in builds that unwind:
+the release profile aborts on a panic, and the watchdog starts the agent
+again). `EPERM`, not a kill: a crafted event that steers
 the decision into one of them must not become a way to stop the agent.
 Two things the decision did itself need two of them: the module
 provenance rule's and the impact trust's `rpm -qf` on an RPM host, and
@@ -384,7 +398,7 @@ the decision:
   or a signal to a root process (`kill(2)` by equal uid, no `CAP_KILL`) —
   meets `EPERM` from the filter (above), not from the capability sets;
 - into the other calls that change a root-owned file by its path —
-  `unlink`, `rename`, `chmod`, `chown`, `truncate`, `link`, `mkdir`… — is
+  `unlink`, `rename`, `chmod`, `truncate`, `link`, `mkdir`… — is
   **not** refused: uid 0 owns those files. Nor is reading another
   process's open files through `/proc/<pid>/fd/N` (`CAP_SYS_PTRACE`'s
   read). Open: a read-only Landlock domain for the decision thread

@@ -50,6 +50,9 @@ parking_lot = "0.12"
 # key zeroized, a vault's id.
 aes-gcm = { version = "0.11", features = ["zeroize"] }
 hkdf = "0.13"
+# hmac: no `hmac::` in this crate — a direct dependency only to turn on its
+# `zeroize` feature for hkdf's HMAC state (review of #482, R14c-2: the PRK
+# equals the master key for every file key). Do not remove it as unused.
 hmac = { version = "0.13", features = ["zeroize"] }
 sha2 = { version = "0.11", features = ["zeroize"] }
 zeroize = { version = "1.8", features = ["derive"] }

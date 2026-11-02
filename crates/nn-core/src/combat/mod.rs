@@ -390,6 +390,9 @@ struct Inner<H: CombatHost> {
     /// ransomware tree among them rewrote. Runs on the ladder's worker
     /// after the kill; must not block (the guard spawns its own thread).
     neutralize_hook: Option<NeutralizeHook<H>>,
+    /// Review of #482: where the ladder signs a degradation (its worker
+    /// missing, a step lost). Default: logged only.
+    report: crate::supervised::Report,
 }
 
 /// Lab PR 222: see [`Inner::neutralize_hook`]. R08c (lab PR 252): the
@@ -431,11 +434,19 @@ enum Job<H: CombatHost> {
     },
 }
 
-/// How jobs run: in the caller (unit tests, and the fallback when the
-/// worker thread cannot start) or on the ladder's worker thread.
+/// How jobs run: in the caller (unit tests only: a ladder built without
+/// [`CombatLadder::with_worker`]) or on the ladder's worker thread. Review
+/// of #482: a worker that cannot start, or ended, is never replaced by the
+/// caller — the caller is the decision thread, whose filter refuses the
+/// steps' kills and chain writes — its steps wait in its queue, a signed
+/// degradation says so, and the tick starts it again
+/// ([`crate::supervised::Supervised`]).
 enum Runner<H: CombatHost> {
     Inline,
-    Worker(std::sync::mpsc::SyncSender<Job<H>>),
+    Worker(
+        std::sync::mpsc::SyncSender<Job<H>>,
+        Arc<crate::supervised::Supervised<Job<H>>>,
+    ),
 }
 
 /// Jobs waiting for the worker. An episode queues at most one job per
@@ -473,6 +484,7 @@ impl<H: CombatHost> CombatLadder<H> {
                 cfg,
                 isolation_gate: Box::new(|| true),
                 neutralize_hook: None,
+                report: crate::supervised::log_only(),
             }),
             runner: Runner::Inline,
         }
@@ -504,25 +516,43 @@ impl<H: CombatHost> CombatLadder<H> {
         self
     }
 
-    /// External audit CMB-007: run the side effects on a worker thread of
-    /// their own. Without it (unit tests) they run in the caller.
-    pub fn with_worker(mut self) -> Self {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Job<H>>(QUEUE_DEPTH);
-        let inner = Arc::clone(&self.inner);
-        match std::thread::Builder::new()
-            .name("nn-combat-ladder".into())
-            .spawn(move || {
-                for job in rx {
-                    inner.run(job);
-                }
-            }) {
-            Ok(_) => self.runner = Runner::Worker(tx),
-            Err(e) => tracing::error!(
+    /// Review of #482: sign the ladder's degradations with `report`
+    /// (`source`, `detail`). Call before [`Self::with_worker`].
+    pub fn with_degradation_report(mut self, report: crate::supervised::Report) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.report = report,
+            None => warn!(
                 target: "combat.ladder",
-                error = %e,
-                "COMBAT ladder worker could not start — side effects run on the caller"
+                "degradation report set after the worker started — ignored"
             ),
         }
+        self
+    }
+
+    /// External audit CMB-007: run the side effects on a worker thread of
+    /// their own. Without it (unit tests) they run in the caller. Review
+    /// of #482: a worker that cannot start leaves them queued for it — a
+    /// signed degradation (`combat_ladder`), the tick starts it again —
+    /// never on the caller.
+    pub fn with_worker(self) -> Self {
+        self.with_worker_spawned_by(crate::supervised::spawn_named())
+    }
+
+    /// [`Self::with_worker`] with the tests' start.
+    pub(crate) fn with_worker_spawned_by(mut self, spawn: crate::supervised::Spawn) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Job<H>>(QUEUE_DEPTH);
+        let inner = Arc::clone(&self.inner);
+        let report = Arc::clone(&self.inner.report);
+        let worker = crate::supervised::Supervised::new(
+            "nn-combat-ladder",
+            "combat_ladder",
+            rx,
+            move |job| inner.run(job),
+        )
+        .reporting(report)
+        .spawning(spawn);
+        worker.ensure_running();
+        self.runner = Runner::Worker(tx, Arc::new(worker));
         self
     }
 
@@ -555,16 +585,17 @@ impl<H: CombatHost> CombatLadder<H> {
     /// stage advance (the tick queues the advance again); an episode
     /// opening or a stand-down waits for room.
     fn dispatch(&self, job: Job<H>) {
-        let tx = match &self.runner {
+        let (tx, worker) = match &self.runner {
             Runner::Inline => return self.inner.run(job),
-            Runner::Worker(tx) => tx,
+            Runner::Worker(tx, worker) => (tx, worker),
         };
         // Lab PR 245: an addition is evidence of its own, not a step the
-        // tick queues again.
+        // tick queues again. Review of #482: with no worker running, no
+        // caller waits for room (the queue keeps what fits for its start).
         let must_run = matches!(
             job,
             Job::Investigate { .. } | Job::Added { .. } | Job::StandDown { .. }
-        );
+        ) && worker.running();
         let res = if must_run {
             tx.send(job)
                 .map_err(|e| std::sync::mpsc::TrySendError::Disconnected(e.0))
@@ -581,6 +612,13 @@ impl<H: CombatHost> CombatLadder<H> {
                     target: "combat.ladder",
                     "COMBAT: the ladder's queue is full — a step was dropped (an advance is queued again by the tick)"
                 );
+                if !worker.running() {
+                    (self.inner.report)(
+                        "combat_ladder",
+                        "the ladder's queue is full and its worker is not running: a step was \
+                         dropped",
+                    );
+                }
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => tracing::error!(
                 target: "combat.ladder",
@@ -855,6 +893,12 @@ impl<H: CombatHost> CombatLadder<H> {
     /// Heartbeat: advance the time-bound INVESTIGATE deadline. A no-op
     /// unless engaged and the investigate window has elapsed.
     pub fn tick(&self, now: Instant) {
+        // Review of #482: a worker that could not start, or ended, is
+        // started again here — the tick runs on a runtime thread (the
+        // core's capabilities), never on the decision thread
+        if let Runner::Worker(_, worker) = &self.runner {
+            worker.ensure_running();
+        }
         let due = {
             let mut s = self.inner.state.lock();
             if s.engaged

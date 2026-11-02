@@ -420,6 +420,11 @@ pub(crate) fn ladder(
                 }
             })
         })
+        // Review of #482: its degradations signed (a worker that could not
+        // start: its steps wait for it, never run on the caller)
+        .with_degradation_report(Arc::new(|source: &str, detail: &str| {
+            northnarrow_agent::boot::degradation::report(source, detail);
+        }))
         // External audit CMB-007: the ladder's side effects (nft, cgroup
         // writes, kills, quarantine, iptables, audit) run on a worker of
         // their own, in order — never on the event loop.

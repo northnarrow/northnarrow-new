@@ -55,11 +55,13 @@ fn every_role_s_thread_takes_its_role() {
         4,
         "caps::enter_or_report(nn_linux::caps::Role::Actuator)",
     );
+    // review of #482: the writer is supervised (nn_core::supervised): its
+    // role is the thread's first call (`on_start`)
     requires(
         "agent/src/boot/canary.rs",
-        ".name(\"nn-canary-log\"",
-        6,
-        "caps::enter_or_report(nn_linux::caps::Role::Writer)",
+        "CANARY_WRITER_THREAD,",
+        12,
+        ".on_start(|| {\n                                nn_linux::caps::enter_or_report(nn_linux::caps::Role::Writer);",
     );
     requires(
         "crates/nn-linux/src/worker/supervisor.rs",
