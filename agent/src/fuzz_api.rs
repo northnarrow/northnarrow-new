@@ -450,6 +450,134 @@ mod tests {
         }
     }
 
+    /// R14a, review of #480 (F1): the `ipc_check` seeds — a hello and an
+    /// answer of every kind a worker gives, each accepted by the core's
+    /// checks — and the regression: a JA4 with a two-byte character across
+    /// byte 23, which sliced the `&str` and panicked the core.
+    #[test]
+    fn ipc_check_seeds_are_accepted_and_the_f1_input_refused() {
+        use nn_proto::ipc::{
+            check_hello, check_response, decode, encode, Answer, Expected, FromWorker,
+            LandlockEnforced, QnameIn, QnameOut, Request, Response, SandboxLevel, SniOut, TlsOut,
+            WorkerHello, WorkerKind, IPC_VERSION,
+        };
+        let packet = |sel: u8, m: &FromWorker| {
+            let mut v = vec![sel];
+            v.extend(encode(m).unwrap());
+            v
+        };
+        let answer = |a: Answer| FromWorker::Response(Response { id: 7, answer: a });
+        let hello = FromWorker::Hello(WorkerHello {
+            version: IPC_VERSION,
+            kind: WorkerKind::Parse,
+            pid: 4242,
+            sandbox: SandboxLevel {
+                landlock_abi: 4,
+                landlock: LandlockEnforced::Partial,
+                fs_denied: true,
+                net_denied: true,
+                seccomp: true,
+                no_new_privs: true,
+                uid: 990,
+                gid: 990,
+                nofile: 8,
+                ..SandboxLevel::default()
+            },
+        });
+        let tls = |ja4: &str| {
+            answer(Answer::Tls(TlsOut::Complete {
+                ja3: "0123456789abcdef0123456789abcdef".into(),
+                ja4: ja4.into(),
+                sni: SniOut::Host("example.com".into()),
+                alpn: vec!["h2".into(), "http/1.1".into()],
+            }))
+        };
+        // the selector: the request's kind in the two low bits, its size
+        // above them (a hello: the kernel's Landlock ABI)
+        let seeds = [
+            ("hello-abi4.bin", packet(4 << 2, &hello)),
+            ("pong.bin", packet(0, &answer(Answer::Pong))),
+            (
+                "dns-names.bin",
+                packet(
+                    1 | (4 << 2),
+                    &answer(Answer::DnsNames(vec![QnameOut {
+                        name: "example.com".into(),
+                        end: None,
+                    }])),
+                ),
+            ),
+            (
+                "tls-complete.bin",
+                packet(2 | (8 << 2), &tls("t13d1516h2_8daaf6152771_02713d6af862")),
+            ),
+            (
+                "dns-answers.bin",
+                packet(
+                    3 | (2 << 2),
+                    &answer(Answer::DnsAnswers {
+                        a: vec![[192, 0, 2, 1]],
+                        aaaa: vec![],
+                    }),
+                ),
+            ),
+        ];
+        for (name, bytes) in &seeds {
+            generated("seeds", "ipc_check", name, bytes);
+        }
+        let f1 = format!("t13d1516h2_{}é{}", "a".repeat(11), "a".repeat(12));
+        assert_eq!(f1.len(), 36);
+        let f1 = packet(2 | (8 << 2), &tls(&f1));
+        generated(
+            "regressions",
+            "ipc_check",
+            "review480-f1-ja4-multibyte-at-23.bin",
+            &f1,
+        );
+        // each seed reaches acceptance; the regression is refused
+        let req_for = |sel: u8, a: &Answer| match sel & 3 {
+            0 => Request::Ping,
+            1 => Request::DnsNames(
+                (0..match a {
+                    Answer::DnsNames(o) => o.len(),
+                    _ => 1,
+                })
+                    .map(|_| QnameIn {
+                        bytes: vec![0; usize::from((sel >> 2) & 0x1f) * 8],
+                        find_end: sel & 0x80 != 0,
+                    })
+                    .collect(),
+            ),
+            2 => Request::TlsClientHello(vec![0x16; usize::from(sel >> 2)]),
+            _ => Request::DnsAnswers(vec![0; usize::from(sel >> 2) * 16]),
+        };
+        let verdict = |bytes: &[u8]| {
+            let (sel, p) = bytes.split_first().unwrap();
+            match decode::<FromWorker>(p).unwrap() {
+                FromWorker::Hello(h) => check_hello(
+                    &h,
+                    &Expected {
+                        kind: WorkerKind::Parse,
+                        pid: h.pid,
+                        uid: h.sandbox.uid,
+                        gid: h.sandbox.gid,
+                        kernel_landlock_abi: sel >> 2,
+                    },
+                )
+                .is_ok(),
+                FromWorker::Response(r) => {
+                    check_response(&req_for(*sel, &r.answer), &r.answer).is_ok()
+                }
+            }
+        };
+        for (name, bytes) in inputs("seeds", "ipc_check") {
+            assert!(verdict(&bytes), "{name}");
+        }
+        for (name, bytes) in inputs("regressions", "ipc_check") {
+            assert!(!verdict(&bytes), "{name}");
+        }
+    }
+
     /// Lab PR 224: the resolv.conf seeds name resolvers (both families,
     /// a zone index, an IPv4-mapped one) and skip what is no nameserver.
     #[test]

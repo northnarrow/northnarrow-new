@@ -40,7 +40,6 @@ use aya_ebpf::{
 };
 
 use crate::btf_offsets::TASK_STRUCT_TGID_OFFSET;
-use crate::task_kill::PROTECTED_PIDS;
 use northnarrow_common::wire::FS_OP_PTRACE;
 
 /// BUG-011 (PHASE 15.1): trusted local-observer set. PIDs in this
@@ -128,7 +127,8 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // External audit EBPF-002: a process running the agent's or the
     // watchdog's binary is protected before it registers (its first moments
     // are when it may still take the agent's maps).
-    if PROTECTED_PIDS.get(&target_tgid).is_none()
+    // R14a: a worker is a protected target too (and runs the agent's binary).
+    if !crate::task_kill::is_protected_pid(target_tgid)
         && !crate::bpf_defense::task_runs_own_binary(target as *const u8)
     {
         return 0;
@@ -148,8 +148,10 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // `bpf_get_current_pid_tgid` returns `(tgid << 32) | pid`; we
     // want the tgid (upper 32 bits) to match the task_kill hook's
     // semantics (which checks target *tgid*, not pid).
+    // R14a: an exempt caller only — a worker may not trace the agent, the
+    // watchdog or another worker.
     let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    if PROTECTED_PIDS.get(&caller_tgid).is_some() {
+    if crate::task_kill::is_exempt_pid(caller_tgid) {
         return 0;
     }
 

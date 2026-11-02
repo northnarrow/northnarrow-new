@@ -82,6 +82,7 @@ use aya::{
     },
     Btf, Ebpf,
 };
+pub use common::wire::pid_role;
 use tracing::{error, info, warn};
 
 /// Name of the pinned `PROTECTED_PIDS` map (mirrors the
@@ -550,14 +551,26 @@ impl<T> ProtectedPidsHandle<T>
 where
     T: BorrowMut<MapData>,
 {
-    /// Insert `pid` into `PROTECTED_PIDS`. `BPF_ANY` upsert
-    /// semantics: an entry that already exists is overwritten,
-    /// so re-inserting the same PID after an eviction race is
-    /// fine. Value is always `1u8`; the map's value type is
-    /// `u8` rather than `()` to align with the aya HashMap API.
+    /// Insert `pid` into `PROTECTED_PIDS` as the agent or the watchdog:
+    /// protected and exempt ([`pid_role::AGENT`]). `BPF_ANY` upsert
+    /// semantics: an entry that already exists is overwritten, so
+    /// re-inserting the same PID after an eviction race is fine.
+    ///
+    /// R14a: the value is the pid's roles (`common::wire::pid_role`); it
+    /// was always `1`, which the hooks still read as both roles.
     pub fn insert(&mut self, pid: u32) -> Result<()> {
+        self.insert_role(pid, pid_role::AGENT)
+    }
+
+    /// R14a: insert `pid` with `role` — [`pid_role::WORKER`] for a worker
+    /// of the agent (protected, never exempt). A role that is not a known
+    /// one is refused: no write could make a pid exempt by accident.
+    pub fn insert_role(&mut self, pid: u32, role: u8) -> Result<()> {
+        if role != pid_role::AGENT && role != pid_role::WORKER {
+            return Err(anyhow!("role {role:#x} is not a PROTECTED_PIDS role"));
+        }
         self.map
-            .insert(pid, 1u8, 0)
+            .insert(pid, role, 0)
             .with_context(|| format!("inserting PID {pid} into {PROTECTED_PIDS_MAP_NAME}"))?;
         Ok(())
     }

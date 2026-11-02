@@ -114,6 +114,36 @@ pub struct Inputs {
     pub pumps: Option<Vec<String>>,
     /// The opt-ins configured (`nn_linux::sensors::contract::OPT_IN_*`).
     pub opt_ins: Vec<String>,
+    /// R14a: the workers' supervisor (`None`: no worker in this run).
+    pub workers: Option<nn_linux::worker::Workers>,
+}
+
+/// R14a (plan §3.1, §3.5): each worker kind's entry — its state, and the
+/// sandbox its worker declared (checked by the core) against the kernel's
+/// Landlock ABI read here.
+pub fn worker_entries(
+    workers: &nn_linux::worker::Workers,
+) -> Vec<nn_core::contract::manifest::WorkerEntry> {
+    use nn_core::contract::manifest::{WorkerEntry, WorkerState};
+    use nn_linux::worker::Health;
+    let kernel_landlock_abi = nn_linux::sandbox::kernel_landlock_abi();
+    workers
+        .status()
+        .into_iter()
+        .map(|w| WorkerEntry {
+            kind: w.kind.name().to_string(),
+            state: match w.health {
+                Health::Ready => WorkerState::Ready,
+                Health::Starting | Health::Backoff => WorkerState::Restarting,
+                Health::Disabled => WorkerState::Disabled,
+                Health::Unavailable => WorkerState::Unavailable,
+                Health::Stopped => WorkerState::Stopped,
+            },
+            why: w.why,
+            kernel_landlock_abi,
+            sandbox: w.sandbox,
+        })
+        .collect()
 }
 
 /// Whether the BPF LSM programs run, and why not (`None`: not known).
@@ -181,6 +211,11 @@ fn build(inputs: &Inputs, terminated: &[String]) -> CapabilityManifest {
         (Some(_), Some(every)) => format!("every {} s", every.as_secs()),
         _ => "off".to_string(),
     };
+    m.workers = inputs
+        .workers
+        .as_ref()
+        .map(worker_entries)
+        .unwrap_or_default();
     m.settled = m.probe_settled();
     m.contract_hash = m.contract_hash_now();
     m.revision = 0;

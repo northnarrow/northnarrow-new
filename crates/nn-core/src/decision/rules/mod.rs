@@ -115,7 +115,7 @@ pub(crate) fn is_service_uid(uid: u32) -> bool {
 pub use r001_exec_from_tmp::R001ExecFromTmp;
 pub use r002_exec_from_dev_shm::R002ExecFromDevShm;
 pub use r003_exec_from_var_tmp::R003ExecFromVarTmp;
-pub use r004_exec_from_proc_self_fd::R004ExecFromProcSelfFd;
+pub use r004_exec_from_proc_self_fd::{OwnWorkerLaunch, R004ExecFromProcSelfFd};
 pub use r005_netcat_exec::R005NetcatExec;
 pub use r006_reverse_shell_tooling::R006ReverseShellTooling;
 pub use r007_crypto_miner::R007CryptoMiner;
@@ -163,7 +163,7 @@ pub fn default_rules<H: DecisionHost>() -> Vec<Box<dyn Rule>> {
     // [`default_rules_with_net`] instead, threading the operator-loaded
     // process-comm allowlist in.
     let process_allowlist = Arc::new(CommAllowlist::<H>::default());
-    rules.extend(spawn_rules(Arc::clone(&process_allowlist), None));
+    rules.extend(spawn_rules(Arc::clone(&process_allowlist), None, None));
     rules.extend(module_load_rules::<H>());
     // External audit PROC-014: the io_uring and BPF rules, over the same
     // empty process allowlist (their built-in known programs still apply).
@@ -236,6 +236,8 @@ pub fn default_rules_with_net<H: DecisionHost>(
     // posture shares.
     ransom: Arc<crate::impact::RansomTracker<H>>,
     defense: Arc<crate::impair::DefenseDetector<H>>,
+    // R14a: how the agent starts its own workers (R004 knows the launch).
+    own_launch: Option<OwnWorkerLaunch>,
 ) -> Vec<Box<dyn Rule>> {
     // Tappa 10.5 (D5) — chain rules FIRST (see `default_rules` +
     // the chain.rs module docs for the ordering rationale).
@@ -258,6 +260,7 @@ pub fn default_rules_with_net<H: DecisionHost>(
     rules.extend(spawn_rules(
         Arc::clone(&process_allowlist),
         Some(lineage.clone()),
+        own_launch,
     ));
     rules.extend(module_load_rules::<H>());
     rules.extend(iouring::iouring_rules(Arc::clone(&process_allowlist)));
@@ -431,6 +434,7 @@ pub(crate) fn judge_actor<H: PostureHost>(
 fn spawn_rules<H: PostureHost>(
     allowlist: Arc<CommAllowlist<H>>,
     lineage: Option<crate::posture::lineage::AuthSessionTracker<H>>,
+    own_launch: Option<OwnWorkerLaunch>,
 ) -> Vec<Box<dyn Rule>> {
     let r020 = R020ShellWithSocketStdio::new(Arc::clone(&allowlist), lineage.clone());
     let (r004, r009) = match lineage {
@@ -440,6 +444,8 @@ fn spawn_rules<H: PostureHost>(
         ),
         None => Default::default(),
     };
+    // R14a: the agent's own worker launch is not a fileless exec
+    let r004 = r004.with_own_launch(own_launch);
     let al = || Arc::clone(&allowlist);
     vec![
         // Kills (and R009's exceptions).

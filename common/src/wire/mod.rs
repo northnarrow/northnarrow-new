@@ -1245,6 +1245,72 @@ impl FimDriftRaw {
     }
 }
 
+/// R14a (plan §3.1, §3.3): the value of a `PROTECTED_PIDS` entry — the
+/// roles of a pid the agent registered, read by the deny hooks
+/// (`agent-ebpf`'s `task_kill`, `ptrace_check`, `inode_protect`,
+/// `bpf_defense`, `fim_watch`, `execq`) and written by the agent, the
+/// watchdog (`antitamper-bpf`) and the worker supervisor.
+///
+/// - [`PROTECTED`]: the pid is defended — a signal, a ptrace from a caller
+///   that is not [`EXEMPT`] is refused.
+/// - [`EXEMPT`]: the pid is trusted as a caller — the deny hooks let it
+///   open the keys and the protected paths, signal or trace a protected
+///   pid, use the agent's BPF objects. An exempt pid is protected too.
+///
+/// The agent's core and the watchdog are both ([`AGENT`]); a worker is
+/// protected and NOT exempt ([`WORKER`]): the hooks deny it the keys and
+/// the protected paths, as they deny any other process.
+///
+/// The map's ABI is unchanged (`HashMap<u32, u8>`, the same name, pin and
+/// size): before R14a every entry held `1` and meant both roles; `1` is
+/// [`EXEMPT`]'s bit, so an entry an earlier agent or watchdog wrote still
+/// means both under these hooks. These values are this repository's ABI
+/// between the eBPF object and userland, not a kernel uapi:
+/// `xtask/tests/pid_roles.rs` checks that every lookup of the map in the
+/// eBPF sources goes through [`is_protected`] or [`is_exempt`].
+pub mod pid_role {
+    /// Trusted as a caller (and therefore protected); the only value
+    /// written before R14a.
+    pub const EXEMPT: u8 = 0x01;
+    /// Defended as a target.
+    pub const PROTECTED: u8 = 0x02;
+    /// The agent's core and the watchdog.
+    pub const AGENT: u8 = PROTECTED | EXEMPT;
+    /// A worker of the agent (R14a): defended, never trusted.
+    pub const WORKER: u8 = PROTECTED;
+
+    /// The pid whose entry holds `role` is defended as a target.
+    #[inline(always)]
+    pub const fn is_protected(role: u8) -> bool {
+        role & (PROTECTED | EXEMPT) != 0
+    }
+
+    /// The pid whose entry holds `role` is trusted as a caller.
+    #[inline(always)]
+    pub const fn is_exempt(role: u8) -> bool {
+        role & EXEMPT != 0
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_worker_is_protected_and_never_exempt() {
+            assert!(is_protected(WORKER));
+            assert!(!is_exempt(WORKER));
+            assert!(is_protected(AGENT) && is_exempt(AGENT));
+            // what every entry held before R14a keeps both roles
+            assert!(is_protected(1) && is_exempt(1));
+            // no entry, no role
+            assert!(!is_protected(0) && !is_exempt(0));
+            // an unknown bit grants nothing
+            assert!(!is_protected(0x80) && !is_exempt(0x80));
+            assert_eq!(WORKER & EXEMPT, 0);
+        }
+    }
+}
+
 /// Tappa 10.9 step 0 — sensor-feasibility probe records.
 /// Lab PR 219 — the exploit post-condition guard's record.
 pub mod epg;

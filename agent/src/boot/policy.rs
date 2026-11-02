@@ -40,6 +40,7 @@ pub(crate) struct Policy {
 /// trusted-installer window, the chain rules' store, the network rules'
 /// thresholds, the ransomware tracker and the security-tool detector, the
 /// signed per-rule response policy, the rule engine.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load(
     cli: &Cli,
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
@@ -48,6 +49,7 @@ pub(crate) fn load(
     audit_log: &AuditHandle,
     dns_cache: &Arc<DnsCache>,
     lineage: &AuthSessionTracker,
+    own_launch: Option<nn_core::decision::rules::OwnWorkerLaunch>,
 ) -> Policy {
     // Tappa 10 N9 — load operator-curated netflow blocklists from
     // disk + thread them into the decision engine. Load failures
@@ -394,6 +396,8 @@ pub(crate) fn load(
         net_rule_config,
         Arc::clone(&ransom_tracker),
         Arc::clone(&defense_detector),
+        // R14a: R004 knows the core's own worker launch
+        own_launch,
     )
     .with_policy(rule_policy.clone());
     // External audit PROC-015 / PROC-014: a demo build runs R901..R904

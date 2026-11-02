@@ -130,6 +130,8 @@ impl<H: DecisionHost> RuleEngine<H> {
         // Lab PR 225: shared with the posture.
         ransom: Arc<crate::impact::RansomTracker<H>>,
         defense: Arc<crate::impair::DefenseDetector<H>>,
+        // R14a: how the agent starts its own workers.
+        own_launch: Option<super::rules::OwnWorkerLaunch>,
     ) -> Self {
         let mut e = Self::new();
         for r in default_rules_with_net(
@@ -147,6 +149,7 @@ impl<H: DecisionHost> RuleEngine<H> {
             net_config,
             ransom,
             defense,
+            own_launch,
         ) {
             e.add_rule(r);
         }

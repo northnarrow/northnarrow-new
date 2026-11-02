@@ -355,7 +355,7 @@ pub(crate) unsafe fn forget(task: u64) {
 unsafe fn refuse_script(cand: *const ExecqCandRaw, task: u64) -> bool {
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
-    if crate::task_kill::PROTECTED_PIDS.get(&tgid).is_some() {
+    if crate::task_kill::is_exempt_pid(tgid) {
         return false;
     }
     let now = bpf_ktime_get_ns();
@@ -416,7 +416,7 @@ pub(crate) unsafe fn maybe_stop(task: *const u8) {
     let m = conf(conf_slot::MODE);
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
-    if m == mode::OFF || crate::task_kill::PROTECTED_PIDS.get(&tgid).is_some() {
+    if m == mode::OFF || crate::task_kill::is_exempt_pid(tgid) {
         let _ = EXECQ_CAND.remove(&key);
         return;
     }

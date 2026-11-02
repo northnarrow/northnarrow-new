@@ -35,19 +35,84 @@ use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 use crate::posture::host::PostureHost;
 
+/// R14a (plan §3.5): how the agent starts its own workers — the one
+/// `/proc/self/fd` exec R004 knows to be the agent's. The core runs its
+/// binary from the descriptor it opened at boot (`/proc/self/fd/N`), as
+/// the `northnarrow-worker` account, with the worker's command line; after
+/// an upgrade that file is unlinked, which is the fileless signal of LSM
+/// mode. The launch is the agent's when every fact holds:
+///
+/// - the parent is the agent's core (`ppid`: only the core's own forks have
+///   it as their parent);
+/// - the path is exactly the core's descriptor's, the account the
+///   workers', and the command line exactly a worker's
+///   (`northnarrow-agent --worker <kind> --ipc-fd 3`, a known kind);
+/// - with the exec sensor's identity (LSM mode), what the kernel executed is
+///   the core's own image, `(dev, ino)`, whether unlinked or not.
+///
+/// Without the identity (tracepoint mode) the first two decide.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnWorkerLaunch {
+    pub agent_pid: u32,
+    /// `/proc/self/fd/<n>`.
+    pub exec_path: String,
+    /// `(st_dev, st_ino)` of the core's image.
+    pub image: (u64, u64),
+    /// The `northnarrow-worker` account's uid.
+    pub uid: u32,
+}
+
+impl OwnWorkerLaunch {
+    fn is(
+        &self,
+        ppid: u32,
+        uid: u32,
+        filename: &str,
+        argv: &[String],
+        exe: &nn_model::ExeIdentity,
+    ) -> bool {
+        use common::wire::exe::exe_flags::KNOWN;
+        let argv_ok = matches!(
+            argv,
+            [a0, w, kind, f, three]
+                if a0 == "northnarrow-agent"
+                    && w == "--worker"
+                    && nn_proto::ipc::WorkerKind::from_name(kind).is_some()
+                    && f == "--ipc-fd"
+                    && three == "3"
+        );
+        ppid == self.agent_pid
+            && self.agent_pid != 0
+            && uid == self.uid
+            && uid != 0
+            && filename == self.exec_path
+            && argv_ok
+            && (!exe.has(KNOWN) || (exe.dev, exe.ino) == self.image)
+    }
+}
+
 /// R004 rule. `lineage` resolves a `systemd --user` parent by what the
 /// kernel executed for it (external audit PROC-001); without it (unit
 /// tests) only PID 1 counts as systemd.
 #[derive(Default)]
 pub struct R004ExecFromProcSelfFd<H: PostureHost> {
     lineage: Option<crate::posture::lineage::AuthSessionTracker<H>>,
+    /// R14a: the agent's own worker launch (`None`: no worker).
+    own: Option<OwnWorkerLaunch>,
 }
 
 impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
     pub fn new(lineage: crate::posture::lineage::AuthSessionTracker<H>) -> Self {
         Self {
             lineage: Some(lineage),
+            own: None,
         }
+    }
+
+    /// R14a: this rule knowing the agent's worker launch.
+    pub fn with_own_launch(mut self, own: Option<OwnWorkerLaunch>) -> Self {
+        self.own = own;
+        self
     }
 
     /// True if the path looks like `/proc/self/fd/<n>` or
@@ -157,6 +222,7 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
         let Event::ProcessSpawn {
             filename,
             ppid,
+            uid,
             argv,
             exe,
             ..
@@ -165,6 +231,14 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
             return None;
         };
         use common::wire::exe::exe_flags::{DELETED, KNOWN, MEMFD};
+        // R14a: the core starting its own worker from its boot descriptor
+        if self
+            .own
+            .as_ref()
+            .is_some_and(|o| o.is(*ppid, *uid, filename, argv, exe))
+        {
+            return None;
+        }
         let via_fd = Self::is_proc_fd_path(filename);
         if exe.has(KNOWN) {
             // External audit PROC-001 (NN-AUD-001): with the exec sensor's
@@ -250,6 +324,165 @@ mod tests {
         // a deleted file alone is no memfd (an upgraded binary re-exec'd)
         let event = spawn_exe("x", "/usr/bin/x", "/usr/bin/x", exe_flags::DELETED);
         assert!(R004ExecFromProcSelfFd::default().evaluate(&event).is_none());
+    }
+
+    /// R14a: the core's own worker launch is not fileless — in LSM mode
+    /// only when the kernel executed the core's image (an upgrade unlinked
+    /// it), in tracepoint mode on its exact facts; any one fact off and the
+    /// rule fires as before.
+    #[test]
+    fn the_agents_own_worker_launch_is_known_and_nothing_else() {
+        use crate::decision::rules::testutil::spawn_exe;
+        use common::wire::exe::exe_flags;
+        let own = OwnWorkerLaunch {
+            agent_pid: 900,
+            exec_path: "/proc/self/fd/64".into(),
+            image: (2049, 77),
+            uid: 990,
+        };
+        let rule = R004ExecFromProcSelfFd::default().with_own_launch(Some(own.clone()));
+        let launch =
+            |ppid: u32, uid: u32, path: &str, argv: &[&str], exe: nn_model::ExeIdentity| {
+                let mut e = spawn_exec(path, ppid, "northnarrow-age", argv);
+                if let Event::ProcessSpawn { uid: u, exe: x, .. } = &mut e {
+                    *u = uid;
+                    *x = exe;
+                }
+                e
+            };
+        let argv = ["northnarrow-agent", "--worker", "parse", "--ipc-fd", "3"];
+        let deleted = |dev, ino| {
+            let Event::ProcessSpawn { exe, .. } = spawn_exe(
+                "x",
+                "/proc/self/fd/64",
+                "/usr/local/bin/northnarrow-agent (deleted)",
+                exe_flags::DELETED,
+            ) else {
+                unreachable!()
+            };
+            nn_model::ExeIdentity { dev, ino, ..exe }
+        };
+        // LSM mode, the image unlinked by an upgrade: the agent's own
+        assert!(rule
+            .evaluate(&launch(
+                900,
+                990,
+                "/proc/self/fd/64",
+                &argv,
+                deleted(2049, 77)
+            ))
+            .is_none());
+        // tracepoint mode: on the facts
+        assert!(rule
+            .evaluate(&launch(
+                900,
+                990,
+                "/proc/self/fd/64",
+                &argv,
+                Default::default()
+            ))
+            .is_none());
+        // any fact off: fileless as ever
+        for (what, e) in [
+            (
+                "another image",
+                launch(900, 990, "/proc/self/fd/64", &argv, deleted(2049, 78)),
+            ),
+            (
+                "another parent",
+                launch(901, 990, "/proc/self/fd/64", &argv, Default::default()),
+            ),
+            (
+                "root",
+                launch(900, 0, "/proc/self/fd/64", &argv, Default::default()),
+            ),
+            (
+                "another uid",
+                launch(900, 991, "/proc/self/fd/64", &argv, Default::default()),
+            ),
+            (
+                "another fd",
+                launch(900, 990, "/proc/self/fd/65", &argv, Default::default()),
+            ),
+            (
+                "another command line",
+                launch(
+                    900,
+                    990,
+                    "/proc/self/fd/64",
+                    &["sh", "-c", "x"],
+                    Default::default(),
+                ),
+            ),
+            (
+                "an unknown kind",
+                launch(
+                    900,
+                    990,
+                    "/proc/self/fd/64",
+                    &["northnarrow-agent", "--worker", "shell", "--ipc-fd", "3"],
+                    Default::default(),
+                ),
+            ),
+            (
+                "an extra argument",
+                launch(
+                    900,
+                    990,
+                    "/proc/self/fd/64",
+                    &[
+                        "northnarrow-agent",
+                        "--worker",
+                        "parse",
+                        "--ipc-fd",
+                        "3",
+                        "-x",
+                    ],
+                    Default::default(),
+                ),
+            ),
+        ] {
+            assert!(rule.evaluate(&e).is_some(), "{what}");
+        }
+        // without the facts (no worker), the same launch is fileless
+        assert!(R004ExecFromProcSelfFd::default()
+            .evaluate(&launch(
+                900,
+                990,
+                "/proc/self/fd/64",
+                &argv,
+                deleted(2049, 77)
+            ))
+            .is_some());
+        // facts that would name root (an account lookup refuses root: never
+        // built so) never exempt a root exec
+        let root = R004ExecFromProcSelfFd::default().with_own_launch(Some(OwnWorkerLaunch {
+            uid: 0,
+            ..own.clone()
+        }));
+        assert!(root
+            .evaluate(&launch(
+                900,
+                0,
+                "/proc/self/fd/64",
+                &argv,
+                Default::default()
+            ))
+            .is_some());
+        // and an agent pid of 0 never matches
+        let zero = R004ExecFromProcSelfFd::default().with_own_launch(Some(OwnWorkerLaunch {
+            agent_pid: 0,
+            ..own
+        }));
+        assert!(zero
+            .evaluate(&launch(
+                0,
+                990,
+                "/proc/self/fd/64",
+                &argv,
+                Default::default()
+            ))
+            .is_some());
     }
 
     #[test]

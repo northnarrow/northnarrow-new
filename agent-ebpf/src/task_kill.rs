@@ -68,6 +68,30 @@ const EPERM: c_int = 1;
 #[map]
 pub static PROTECTED_PIDS: HashMap<u32, u8> = HashMap::pinned(16, 0);
 
+/// R14a (plan §3.1): the roles of `tgid` — its `PROTECTED_PIDS` value
+/// (`northnarrow_common::wire::pid_role`), 0 when it has no entry. Every
+/// lookup of the map goes through [`is_protected_pid`] (a target) or
+/// [`is_exempt_pid`] (a caller): a worker is protected, never exempt.
+#[inline(always)]
+pub fn pid_role(tgid: u32) -> u8 {
+    // SAFETY: a lookup in this program's own map; the value is copied out
+    // at once (no reference is kept across a map update).
+    unsafe { PROTECTED_PIDS.get(&tgid).copied().unwrap_or(0) }
+}
+
+/// `tgid` is defended as a target (the agent, the watchdog, a worker).
+#[inline(always)]
+pub fn is_protected_pid(tgid: u32) -> bool {
+    northnarrow_common::wire::pid_role::is_protected(pid_role(tgid))
+}
+
+/// `tgid` is trusted as a caller (the agent and the watchdog; never a
+/// worker).
+#[inline(always)]
+pub fn is_exempt_pid(tgid: u32) -> bool {
+    northnarrow_common::wire::pid_role::is_exempt(pid_role(tgid))
+}
+
 /// External audit EBPF-001: when PID 1 may signal a protected process.
 /// One slot, written by the agent only while a signed trusted-installer
 /// window is open (the units are stopped or restarted with `systemctl`
@@ -135,7 +159,7 @@ unsafe fn observe_defender(target_tgid: u32, sig: c_int) {
     if caller == 1
         || caller == target_tgid
         || DEFENDER_PIDS.get(&caller).is_some()
-        || PROTECTED_PIDS.get(&caller).is_some()
+        || is_exempt_pid(caller)
     {
         return;
     }
@@ -226,7 +250,9 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
     // call. Marked unsafe because the returned reference can be
     // invalidated if the map mutates concurrently — we don't deref
     // it, so the invalidation window is irrelevant here.
-    let is_protected = PROTECTED_PIDS.get(&target_tgid).is_some();
+    // R14a: a worker is protected as a target, as the agent and the
+    // watchdog are.
+    let is_protected = is_protected_pid(target_tgid);
     if !is_protected {
         // Lab PR 225: a stop or kill of another security tool, reported.
         observe_defender(target_tgid, sig);
@@ -234,10 +260,12 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
     }
 
     let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    // Self-signal, or one protected process signalling another (the
+    // Self-signal, or an exempt process signalling a protected one (the
     // watchdog's stuck recovery, the agent's own supervision of the
-    // watchdog). An attacker's shell is in neither set.
-    if caller_tgid == target_tgid || PROTECTED_PIDS.get(&caller_tgid).is_some() {
+    // watchdog and of its workers). An attacker's shell is in neither set;
+    // R14a: a worker is protected, not exempt — it may not signal the
+    // agent, the watchdog or another worker.
+    if caller_tgid == target_tgid || is_exempt_pid(caller_tgid) {
         return 0;
     }
 

@@ -17,6 +17,9 @@ path = "src/lib.rs"
 # so the watchdog binary can consume it WITHOUT pulling the rest of
 # `agent` (tokio, posture machine, decision engine, …).
 aya = { workspace = true }
+# R14a: the roles a `PROTECTED_PIDS` entry holds (`common::wire::pid_role`),
+# the values the eBPF hooks read.
+common = { workspace = true }
 anyhow = { workspace = true }
 libc = "0.2"
 tracing = { workspace = true }

@@ -33,6 +33,11 @@ pub mod watchdog_hold;
 /// PR 223, EXPERIMENTAL; was `common::execq`, lab PR 241).
 pub mod execq;
 
+/// The core ↔ worker protocol (Wave 4 restructure, R14a, plan §3.5): the
+/// hello and its sandbox level, requests and typed results the core checks
+/// again.
+pub mod ipc;
+
 // R03 shims (plan §4.1 rule 2; removed in R17): the paths the moved files
 // name, so they compile as they were in `common`.
 /// `crate::wire::admin_signed_payload`: the module was `common::wire`'s.

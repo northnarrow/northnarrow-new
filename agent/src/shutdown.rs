@@ -17,6 +17,7 @@ use crate::run_loop::Stopped;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stop(
     cli: &Cli,
+    workers: &nn_linux::worker::Workers,
     heartbeat: &Option<northnarrow_agent::heartbeat::Heartbeat>,
     execq_handle: Option<northnarrow_agent::execq::Handle>,
     execpol_handle: Option<northnarrow_agent::execpol::Handle>,
@@ -35,6 +36,9 @@ pub(crate) fn stop(
     if let Some(hb) = heartbeat {
         hb.stop(stop_reason);
     }
+    // R14a: the workers end with their core (they would anyway: their
+    // parent-death signal), their pids out of PROTECTED_PIDS first.
+    workers.stop();
     // Lab PR 223: nothing stays held by an agent that stops.
     northnarrow_agent::execq::shutdown(execq_handle);
     // Lab PR 226: the kernel keeps the policy until its programs detach.

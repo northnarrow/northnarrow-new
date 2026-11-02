@@ -127,3 +127,11 @@ path = "fuzz_targets/rule_policy.rs"
 test = false
 doc = false
 bench = false
+
+# R14a, review of #480 (F1): the core's checks of a worker's packets.
+[[bin]]
+name = "ipc_check"
+path = "fuzz_targets/ipc_check.rs"
+test = false
+doc = false
+bench = false

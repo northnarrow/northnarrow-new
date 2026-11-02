@@ -110,6 +110,11 @@ const HOST_PATH_USERS: &[(&str, &str)] = &[
         "purges the pin root before its agent starts",
     ),
     (
+        "agent/tests/privileged_worker_harness.rs",
+        "R14a: the installed agent's signing key, which a compromised worker tries to read \
+         (and must be refused); it starts no agent and writes nothing there",
+    ),
+    (
         "agent/tests/fim_privileged_e2e.rs",
         "purges the pin root before its agent starts",
     ),

@@ -149,6 +149,7 @@ start_agent_for_window() {
 echo "NorthNarrow uninstall"
 echo "  binaries : $BIN_DIR/{northnarrow-agent,northnarrow-watchdog,nn-admin,northnarrow-scan}"
 echo "  units    : $UNIT_DIR/northnarrow-{agent,watchdog,watchdog-failed}.service"
+echo "  accounts : northnarrow-scan, northnarrow-worker"
 echo "  bpffs    : $BPFFS_ROOT"
 if (( PURGE )); then
     echo "  PURGE    : $ETC_DIR (admin keys, audit chain, agent identity)"
@@ -335,11 +336,17 @@ done
 for b in northnarrow-agent northnarrow-watchdog nn-admin northnarrow-scan; do
     [[ -e "$BIN_DIR/$b" ]] && { log "removing $BIN_DIR/$b"; rm -f "$BIN_DIR/$b"; }
 done
-# Lab PR 223: the exec quarantine scanner's account (it owns no file).
-if getent passwd northnarrow-scan >/dev/null 2>&1 && command -v userdel >/dev/null 2>&1; then
-    log "removing the system account northnarrow-scan"
-    userdel northnarrow-scan 2>/dev/null || log "userdel northnarrow-scan failed — remove it by hand"
-fi
+# The agent's accounts (they own no file): lab PR 223's exec quarantine
+# scanner, R14a's workers. Their processes ended with the agent (a worker
+# dies with its core). userdel removes each one's own group too.
+# >>> remove_users
+for u in northnarrow-scan northnarrow-worker; do
+    if getent passwd "$u" >/dev/null 2>&1 && command -v userdel >/dev/null 2>&1; then
+        log "removing the system account $u"
+        userdel "$u" 2>/dev/null || log "userdel $u failed — remove it by hand"
+    fi
+done
+# <<< remove_users
 for u in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do
     [[ -e "$UNIT_DIR/$u.service" ]] && { log "removing $UNIT_DIR/$u.service"; rm -f "$UNIT_DIR/$u.service"; }
 done
