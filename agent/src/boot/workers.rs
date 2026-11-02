@@ -1,14 +1,16 @@
 //! The workers' start (Wave 4 restructure, R14a — plan §3.1, §3.5;
 //! `docs/architecture/PROCESS_MODEL.md`).
 //!
-//! In the subsystems phase, once the deny hooks are attached and
-//! `PROTECTED_PIDS` is pinned (the attach phase): the supervisor of the
+//! At the head of the attach phase (R14b: before the sensors, so the DNS
+//! pump's first records find the parse worker ready): the supervisor of the
 //! agent's workers (`nn_linux::worker::Workers`) on its own thread, which
 //! starts the `parse` worker — this binary, from the descriptor `main`
-//! opened at boot ([`SelfImage`]), as the `northnarrow-worker` account — and
-//! registers its pid as protected and not exempt. A worker that cannot be
-//! started (no account, no image) is a signed degradation; the agent runs
-//! without what it gives, and never does its work in its own process.
+//! opened at boot ([`SelfImage`]), as the `northnarrow-worker` account. Its
+//! pid is registered as protected and not exempt once this boot's deny
+//! hooks are attached and `PROTECTED_PIDS` is pinned ([`arm`]). A worker
+//! that cannot be started (no account, no image) is a signed degradation;
+//! the agent runs without what it gives, and never does its work in its own
+//! process.
 
 use std::sync::Arc;
 
@@ -45,15 +47,9 @@ pub(crate) fn start(cli: &Cli, image: std::io::Result<SelfImage>) -> Workers {
         }
     };
     let account = WorkerAccount::lookup(WORKER_USER);
-    let pins = std::path::Path::new(antitamper_bpf::DEFAULT_BPFFS_ROOT);
-    let roles: Arc<dyn PidRoles> = if pins.join(antitamper_bpf::PROTECTED_PIDS_MAP_NAME).exists() {
-        Arc::new(PinnedPidRoles {
-            bpffs_root: pins.to_path_buf(),
-        })
-    } else {
-        info!("no pinned PROTECTED_PIDS: the workers' pids are not registered with the deny hooks");
-        Arc::new(NoPidRoles)
-    };
+    // R14b: no role until this boot's deny hooks are attached ([`arm`]):
+    // an earlier boot's pinned hooks read any entry as both roles
+    let roles: Arc<dyn PidRoles> = Arc::new(NoPidRoles);
     let workers = Workers::new(Config {
         launcher: Arc::new(ImageLauncher {
             image,
@@ -74,4 +70,18 @@ pub(crate) fn start(cli: &Cli, image: std::io::Result<SelfImage>) -> Workers {
         );
     }
     workers
+}
+
+/// R14b: this boot's deny hooks are attached and `PROTECTED_PIDS` pinned:
+/// the workers' pids from now on (the running one at once) go there,
+/// protected and not exempt.
+pub(crate) fn arm(workers: &Workers) {
+    let pins = std::path::Path::new(antitamper_bpf::DEFAULT_BPFFS_ROOT);
+    if pins.join(antitamper_bpf::PROTECTED_PIDS_MAP_NAME).exists() {
+        workers.arm_roles(Arc::new(PinnedPidRoles {
+            bpffs_root: pins.to_path_buf(),
+        }));
+    } else {
+        info!("no pinned PROTECTED_PIDS: the workers' pids are not registered with the deny hooks");
+    }
 }

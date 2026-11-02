@@ -16,8 +16,9 @@
 use std::os::fd::RawFd;
 
 use nn_proto::ipc::{
-    alpn_display, decode, encode, Answer, FromWorker, QnameIn, QnameOut, Refusal, Request,
-    Response, SniOut, TlsOut, ToWorker, WorkerHello, WorkerKind, IPC_VERSION, MAX_ALPN, MAX_FRAME,
+    alpn_display, decode, encode, Answer, FromWorker, QnameForm, QnameIn, QnameOut, Refusal,
+    Request, Response, SniOut, TlsOut, ToWorker, WorkerHello, WorkerKind, IPC_VERSION, MAX_ALPN,
+    MAX_FRAME,
 };
 
 use super::transport::{self, Recv};
@@ -158,7 +159,7 @@ pub fn serve_loop(fd: RawFd) -> i32 {
 }
 
 /// The answer to one request (the parsers run here, and only here).
-pub fn answer(req: &Request) -> Answer {
+pub(crate) fn answer(req: &Request) -> Answer {
     if req.check().is_err() {
         return Answer::Refused(Refusal::OutOfBounds);
     }
@@ -182,13 +183,21 @@ pub fn answer(req: &Request) -> Answer {
 }
 
 fn qname(q: &QnameIn) -> QnameOut {
-    let name = nn_parse::dns_qname::decode_dns_qname(&q.bytes);
-    let end = if q.find_end {
-        nn_parse::dns_qname::qname_wire_end(&q.bytes).and_then(|e| u16::try_from(e).ok())
-    } else {
-        None
-    };
-    QnameOut { name, end }
+    use nn_parse::dns_qname as d;
+    match q.form {
+        QnameForm::Nss => QnameOut {
+            name: d::nss_presentation(&q.bytes),
+            end: None,
+        },
+        QnameForm::Wire => QnameOut {
+            name: d::decode_dns_qname(&q.bytes),
+            end: None,
+        },
+        QnameForm::WireFindEnd => QnameOut {
+            name: d::decode_dns_qname(&q.bytes),
+            end: d::qname_wire_end(&q.bytes).and_then(|e| u16::try_from(e).ok()),
+        },
+    }
 }
 
 fn tls(bytes: &[u8]) -> TlsOut {
@@ -296,23 +305,23 @@ mod tests {
             Request::DnsNames(vec![
                 QnameIn {
                     bytes: b"\x07example\x03com\x00\x00\x01".to_vec(),
-                    find_end: true,
+                    form: QnameForm::WireFindEnd,
                 },
                 QnameIn {
                     bytes: vec![0xc0, 0x0c],
-                    find_end: true,
+                    form: QnameForm::WireFindEnd,
                 },
                 QnameIn {
                     bytes: vec![0x3f; 300],
-                    find_end: false,
+                    form: QnameForm::Wire,
                 },
                 QnameIn {
                     bytes: b"\x03a.\\\x01\xff\x00".to_vec(),
-                    find_end: true,
+                    form: QnameForm::WireFindEnd,
                 },
                 QnameIn {
                     bytes: vec![],
-                    find_end: true,
+                    form: QnameForm::WireFindEnd,
                 },
             ]),
             Request::TlsClientHello(vec![0x16, 3, 1, 0, 5, 1, 0, 0, 1, 3]),

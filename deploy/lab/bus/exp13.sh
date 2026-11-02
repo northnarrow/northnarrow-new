@@ -24,7 +24,7 @@
 #   [--settle S] [--key FILE] [--stall-secs N]
 #   [--net-rate R] [--dns-rate D] [--net-port P] [--probes N]
 #   [--stage-read] [--bpf-flood-procs N] [--denial-flood-procs N]
-#   [--bpf-flood-uid U] [--progload-probes N]
+#   [--bpf-flood-uid U] [--progload-probes N] [--warmup-execs N]
 # --flood-secs 0: no flood. --stall-secs N (a lab build: debug-trigger): the
 # event loop is first made to stand still N seconds
 # (/run/northnarrow/debug-stall-loop, lab PR 216), and the bursts start when
@@ -56,6 +56,18 @@
 # keeps a program load from its judgement. The agent's threads' CPU time
 # and the host's CPU pressure (/proc/pressure/cpu) are read before and
 # after (cpu-before.txt, cpu-after.txt).
+# Review of #481 (R14b-6): the per-class decision delays the agent reports
+# (`decision_delay`: p50, p99, max) are over the agent's life, its start
+# included — a handful of decisions of the first second, up to a second
+# late each, are the p99 of a few hundred. So the run first makes
+# --warmup-execs N process events (default `auto`: 100 times the process
+# class's decisions so far, at least 4000, at most 100000; 0: none) — the
+# lab user's /bin/true, in a unit of its own — and the p99 is read POST
+# WARM-UP: the summary's `warmup` gives the class's decisions timed before
+# the warm-up (the start's among them) against all of them, and
+# `p99_past_the_start` is true when those are under 1 % (the p99's rank
+# lies past any of them). Compare runs by the median of their p99s over
+# alternate runs (main, tip, main, …), never one run against one.
 # Output (DIR, default /var/lib/nn-exp13/<UTC stamp>): status-before.json,
 # status-after.json (`nn-admin status --json --key`), tamper.txt (one line
 # per burst), flood.txt, detections.jsonl (the new detection records),
@@ -68,7 +80,7 @@ export LC_ALL=C
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT= FLOOD_SECS=40 FLOOD_PROCS=4 THREADS=32 BURSTS=8 BURST_SIZE=1500 BURST_GAP_MS=3000
 SETTLE=75 KEY= STALL=0 NET_RATE=0 DNS_RATE=0 NET_PORT=18099 PROBES=0
-STAGE_READ=0 BPF_PROCS=0 DENIAL_PROCS=0 BPF_UID= PROGLOAD=0
+STAGE_READ=0 BPF_PROCS=0 DENIAL_PROCS=0 BPF_UID= PROGLOAD=0 WARMUP=auto
 DET=/var/lib/northnarrow/detections/detections.jsonl
 AUDIT=/etc/northnarrow/audit.log
 TARGET=/etc/northnarrow/admin.pub
@@ -97,9 +109,11 @@ while (($#)); do
         --denial-flood-procs) DENIAL_PROCS=${2:?}; shift 2 ;;
         --bpf-flood-uid) BPF_UID=${2:?}; shift 2 ;;
         --progload-probes) PROGLOAD=${2:?}; shift 2 ;;
+        --warmup-execs) WARMUP=${2:?}; shift 2 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
+[[ $WARMUP == auto || $WARMUP =~ ^[0-9]+$ ]] || die "--warmup-execs takes auto or a whole number: $WARMUP"
 for v in FLOOD_SECS FLOOD_PROCS THREADS BURSTS BURST_SIZE BURST_GAP_MS SETTLE STALL NET_RATE DNS_RATE NET_PORT PROBES BPF_PROCS DENIAL_PROCS; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "--${v,,} takes a whole number: ${!v}"
 done
@@ -161,6 +175,28 @@ if ((STAGE_READ)); then
     DECOY=$home/.gnupg/private-keys-v1.d/nn-exp13-decoy.key
     runuser -u "$USER_NAME" -- mkdir -p -m 0700 "$(dirname "$DECOY")"
     runuser -u "$USER_NAME" -- bash -c "printf '(private-key (nn-exp13 decoy))\n' > '$DECOY'"
+fi
+# Review of #481 (R14b-6): the warm-up — process events (P1) past the
+# agent's start, before the run's own status
+status "$OUT/status-warmup-before.json"
+if [[ $WARMUP == auto ]]; then
+    WARMUP=$(python3 -c '
+import json, sys
+try:
+    q = (json.load(open(sys.argv[1])).get("event_bus_decision") or {}).get("queues") or []
+except (OSError, ValueError):
+    q = []
+n = next((x.get("timed", 0) for x in q if x.get("priority") == "P1"), 0)
+print(min(max(100 * n, 4000), 100000))' "$OUT/status-warmup-before.json")
+fi
+echo "exp13: warm-up of $WARMUP process events" | tee -a "$OUT/summary.txt"
+if ((WARMUP > 0)); then
+    systemctl stop nn-exp13-warmup.service 2>/dev/null
+    systemctl reset-failed nn-exp13-warmup.service 2>/dev/null
+    systemd-run --quiet --wait --unit=nn-exp13-warmup --uid="$USER_NAME" \
+        /bin/bash -c "for i in \$(seq 1 $WARMUP); do /bin/true; done" \
+        || echo "exp13: the warm-up did not finish" >&2
+    sleep 2
 fi
 status "$OUT/status-before.json"
 cpu "$OUT/cpu-before.txt"
@@ -486,6 +522,14 @@ summary = {
     "flood": open(out + "/flood.txt").read().split("\n") if True else None,
     "flood_secs_measured": round((t_flood_end - t_start) / 1e9, 1),
 }
+# Review of #481 (R14b-6): the decisions before the warm-up (the agent's
+# start among them) against all of them, per class
+dw = dec(load(out + "/status-warmup-before.json"))
+summary["warmup"] = {p: {"timed_before_warmup": dw.get(p, {}).get("timed", 0),
+                         "timed_after": da[p].get("timed", 0)} for p in sorted(da)}
+for p, v in summary["warmup"].items():
+    v["share_before_warmup"] = round(v["timed_before_warmup"] / v["timed_after"], 4) if v["timed_after"] else None
+    v["p99_past_the_start"] = v["timed_after"] > 0 and v["timed_before_warmup"] < 0.01 * v["timed_after"]
 json.dump(summary, open(out + "/summary.json", "w"), indent=1)
 print("refused attempts   :", attempts, "(allowed:", allowed, ")")
 if c5:
@@ -503,6 +547,8 @@ print("event_bus_drop rows:", len(bus_rows), "ringbuf_drop rows:", len(ring_rows
 if summary["decision_delay"]:
     for p, v in summary["decision_delay"].items():
         print("decision", p, ":", v)
+    for p, v in summary["warmup"].items():
+        print("warm-up", p, ":", v, "(p99 read post warm-up: the start's decisions under 1 %)" if v["p99_past_the_start"] else "(p99 NOT past the start: more warm-up)")
     print("event_bus_capped rows:", len(capped_rows))
 print("flood              :", " | ".join(x for x in summary["flood"] if x))
 if summary["net_load"] or summary["probes_net001"]["sent"]:

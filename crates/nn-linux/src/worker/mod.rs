@@ -15,6 +15,8 @@
 //!   descriptor);
 //! - [`serve`]: the worker's side — the sandbox first, then the hello, then
 //!   the requests;
+//! - [`parse`]: the core's way to the parsers (R14b): the DNS pump's names
+//!   in batches, a ClientHello, a DNS answer — or no decode;
 //! - [`supervisor`]: the core's side — starting, checking the hello,
 //!   requests with a deadline, killing a worker that breaks the protocol,
 //!   hangs or dies, the backoff, the disabled state and its signed
@@ -31,6 +33,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 
+pub mod parse;
 pub mod serve;
 pub mod spawn;
 pub mod supervisor;

@@ -458,8 +458,8 @@ mod tests {
     fn ipc_check_seeds_are_accepted_and_the_f1_input_refused() {
         use nn_proto::ipc::{
             check_hello, check_response, decode, encode, Answer, Expected, FromWorker,
-            LandlockEnforced, QnameIn, QnameOut, Request, Response, SandboxLevel, SniOut, TlsOut,
-            WorkerHello, WorkerKind, IPC_VERSION,
+            LandlockEnforced, QnameForm, QnameIn, QnameOut, Request, Response, SandboxLevel,
+            SniOut, TlsOut, WorkerHello, WorkerKind, IPC_VERSION,
         };
         let packet = |sel: u8, m: &FromWorker| {
             let mut v = vec![sel];
@@ -543,8 +543,15 @@ mod tests {
                     _ => 1,
                 })
                     .map(|_| QnameIn {
-                        bytes: vec![0; usize::from((sel >> 2) & 0x1f) * 8],
-                        find_end: sel & 0x80 != 0,
+                        // as the fuzz target's `name_bytes`
+                        bytes: (0..usize::from((sel >> 2) & 0xf) * 8)
+                            .map(|i| (i as u8).wrapping_add(sel))
+                            .collect(),
+                        form: match sel >> 6 {
+                            1 => QnameForm::Nss,
+                            2 => QnameForm::WireFindEnd,
+                            _ => QnameForm::Wire,
+                        },
                     })
                     .collect(),
             ),
@@ -652,22 +659,16 @@ mod tests {
         assert_eq!(rendered.len(), families.len(), "{rendered:?}");
         // tls_client_hello: parses, with SNI and ALPN
         for (name, bytes) in inputs("seeds", "tls_client_hello") {
-            let hello = crate::net::tls_parser::parse_client_hello(&bytes)
-                .unwrap_or_else(|| panic!("{name}"));
-            assert!(
-                crate::net::tls_parser::extract_sni(&hello).is_some(),
-                "{name}"
-            );
-            assert!(
-                !crate::net::tls_parser::extract_alpn(&hello).is_empty(),
-                "{name}"
-            );
+            let hello =
+                nn_parse::tls::parse_client_hello(&bytes).unwrap_or_else(|| panic!("{name}"));
+            assert!(nn_parse::tls::extract_sni(&hello).is_some(), "{name}");
+            assert!(!nn_parse::tls::extract_alpn(&hello).is_empty(), "{name}");
         }
         // dns_records: A and AAAA answers, and names
         let (mut a, mut aaaa, mut names) = (0, 0, 0);
         for (_, bytes) in inputs("seeds", "dns_records") {
-            a += crate::net::dns_cache::parse_a_records(&bytes).len();
-            aaaa += crate::net::dns_cache::parse_aaaa_records(&bytes).len();
+            a += nn_parse::dns_records::parse_a_records(&bytes).len();
+            aaaa += nn_parse::dns_records::parse_aaaa_records(&bytes).len();
             if nn_parse::dns_qname::qname_wire_end(&bytes).is_some() {
                 names += 1;
             }

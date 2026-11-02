@@ -274,7 +274,9 @@ pub const SOURCES: [SourceContract; 13] = [
         opt_in: None,
         on_failure: FailureMode::Blind,
         on_failure_detail: "IPv6 not attached is signed (dns_sensor); the udp_sendmsg attach \
-             failing refuses the start; its pump ending stops the agent within 5 s (signed)",
+             failing refuses the start; its pump ending stops the agent within 5 s (signed); \
+             R14b: the names are decoded by the parse worker — while it is down or disabled \
+             the events carry no name (qname_partial) and the core does not decode them itself",
         kernel_budgets: &[KernelBudget {
             allows: "64 queries at once, then 128 a second, per process; 2,048 at once, then \
                      1,024 a second, per user (the resolvers' users exempt); each record says \

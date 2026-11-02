@@ -55,9 +55,10 @@ use crate::sensors::bus::{BusLosses, BusReceiver, BusSender, BusStats, Received}
 /// the Tappa 1 [`super::exec`] loader load byte-identical bytes.
 use crate::boot::manifest::Took;
 /// The DNS record's decode (R09b, lab PR 254: nn-model's until then).
-use crate::sensors::dns_sensor::{nss_query_name, query_event};
+use crate::sensors::dns_sensor::{name_request, nss_query_name, query_event};
 use crate::sensors::ebpf_object::EBPF_BYTES;
 use crate::sensors::reject::RejectThrottle;
+use crate::worker::parse::ParseClient;
 
 /// Lab PR 267 (R12a): the loss recorder's label among the telemetry tasks
 /// (a dead recorder would leave the bus's drops unsigned).
@@ -147,6 +148,9 @@ pub struct LoadPlan {
     /// `sys_enter_execve` (and the start's file-open sensor its tracepoint),
     /// the reason signed with each.
     pub lsm_absent: bool,
+    /// R14b (plan §3.1): the parse worker the DNS pump hands its names to
+    /// (`None`: none in this run — every name left without a decode).
+    pub parse: Option<crate::worker::Workers>,
 }
 
 impl Default for LoadPlan {
@@ -157,6 +161,7 @@ impl Default for LoadPlan {
             dns_skb: true,
             epg_task_maps: crate::sensors::epg::TaskMaps::default(),
             lsm_absent: false,
+            parse: None,
         }
     }
 }
@@ -602,6 +607,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     dns_query_rb,
                     dns_cache_for_dns,
                     lineage_for_dns,
+                    ParseClient::new(plan.parse.clone()),
                     &tx,
                     &rt,
                 )?),
@@ -1513,10 +1519,11 @@ fn dns_sender_exe(lineage: &AuthSessionTracker, pid: u32, timestamp_ns: u64) -> 
 /// DNS cache fed), then the `Event::DnsFlood` it carries, if any.
 fn dns_events(
     raw: &DnsQueryRaw,
+    decoded: Option<&nn_proto::ipc::QnameOut>,
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
 ) -> (Event, Option<Event>) {
-    let mut event = query_event(raw);
+    let mut event = query_event(raw, decoded);
     let mut flood = None;
     if let Event::DnsQuery {
         pid,
@@ -1536,7 +1543,9 @@ fn dns_events(
         // leg so a KillProcess verdict never lands on the local stub
         // resolver.
         *exe = dns_sender_exe(lineage, *pid, *timestamp_ns);
-        if let Some(cache) = dns_cache {
+        // R14b: a name only the worker decoded feeds the cache; without
+        // one there is nothing to attribute a connect to
+        if let (Some(cache), false) = (dns_cache, decoded.is_none()) {
             cache.on_dns_query(
                 *pid,
                 query_name.clone(),
@@ -1573,10 +1582,11 @@ fn dns_events(
 /// other would, still goes out.
 fn nss_events(
     raw: &DnsQueryRaw,
+    decoded: Option<&nn_proto::ipc::QnameOut>,
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
 ) -> Option<Event> {
-    if let (Some(cache), Some(name)) = (dns_cache, nss_query_name(raw)) {
+    if let (Some(cache), Some(name)) = (dns_cache, nss_query_name(decoded)) {
         cache.on_dns_query(
             raw.pid,
             name,
@@ -1605,6 +1615,7 @@ fn spawn_dns_query_pump(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
     lineage: AuthSessionTracker,
+    parse: ParseClient,
     tx: &BusSender,
     rt: &tokio::runtime::Handle,
 ) -> Result<PumpThread> {
@@ -1619,7 +1630,7 @@ fn spawn_dns_query_pump(
     let rt = rt.clone();
     PumpThread::spawn("dns_query", move |stop| {
         let _claim = claim;
-        rt.block_on(pump_dns_query(rb, dns_cache, lineage, tx, stop))
+        rt.block_on(pump_dns_query(rb, dns_cache, lineage, parse, tx, stop))
     })
     .context("starting the dns_query pump's thread")
 }
@@ -1628,6 +1639,7 @@ async fn pump_dns_query(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
     lineage: AuthSessionTracker,
+    mut parse: ParseClient,
     tx: BusSender,
     stop: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()> {
@@ -1653,6 +1665,7 @@ async fn pump_dns_query(
                     guard.get_inner_mut(),
                     &lineage,
                     dns_cache.as_deref(),
+                    &mut parse,
                     &mut reject,
                     &mut outbox,
                 );
@@ -1674,6 +1687,7 @@ async fn pump_dns_query(
                     async_fd.get_mut(),
                     &lineage,
                     dns_cache.as_deref(),
+                    &mut parse,
                     &mut reject,
                     &mut outbox,
                 );
@@ -1714,24 +1728,47 @@ fn dns_pass(
     ring: &mut RingBuf<MapData>,
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
+    parse: &mut ParseClient,
     reject: &mut RejectThrottle,
     outbox: &mut VecDeque<Event>,
 ) -> u32 {
     let began_ns = crate::net::dns_cache::monotonic_ns();
     let mut drained = 0u32;
+    // R14b: the pass's records first (copied off the ring), then their
+    // names decoded by the parse worker in batches, then the events
+    let mut raws: Vec<DnsQueryRaw> = Vec::new();
     while let Some(item) = ring.next() {
         drained += 1;
         let bytes: &[u8] = item.as_ref();
         match bytemuck::try_from_bytes::<DnsQueryRaw>(bytes) {
-            Ok(raw) if raw.flags & dns_flags::NSS != 0 => {
-                outbox.extend(nss_events(raw, lineage, dns_cache));
-            }
-            Ok(raw) => {
-                let (event, flood) = dns_events(raw, lineage, dns_cache);
-                outbox.push_back(event);
-                outbox.extend(flood);
-            }
+            Ok(raw) => raws.push(*raw),
             Err(_e) => reject.record("dns_query", std::mem::size_of::<DnsQueryRaw>(), bytes.len()),
+        }
+    }
+    let decoded = if raws.is_empty() {
+        Vec::new()
+    } else {
+        parse.names(raws.iter().map(name_request).collect())
+    };
+    // review of #481 (R14b-5): every record gives its event, decoded or
+    // not — never paired off by a shorter list (`names` gives one entry
+    // per name; a mismatch is counted and said, not dropped)
+    if decoded.len() != raws.len() {
+        parse.mismatched += raws.len().abs_diff(decoded.len()) as u64;
+        tracing::warn!(
+            records = raws.len(),
+            decodes = decoded.len(),
+            "the DNS pass got another count of decodes than records: the records without one carry no name"
+        );
+    }
+    for (i, raw) in raws.iter().enumerate() {
+        let d = decoded.get(i).and_then(Option::as_ref);
+        if raw.flags & dns_flags::NSS != 0 {
+            outbox.extend(nss_events(raw, d, lineage, dns_cache));
+        } else {
+            let (event, flood) = dns_events(raw, d, lineage, dns_cache);
+            outbox.push_back(event);
+            outbox.extend(flood);
         }
     }
     if let Some(cache) = dns_cache {
@@ -2085,7 +2122,7 @@ mod tests {
         raw.pid = 4242;
         raw.held = 3;
         raw.timestamp_ns = 5_000_000_000;
-        let (event, flood) = dns_events(&raw, &lineage, None);
+        let (event, flood) = dns_events(&raw, None, &lineage, None);
         assert!(
             matches!(event, Event::DnsQuery { exe: None, .. }),
             "{event:?}"
@@ -2100,15 +2137,52 @@ mod tests {
         ));
         // the process that holds the pid started before the query: its own
         stat(1);
-        let (event, _) = dns_events(&raw, &lineage, None);
+        let (event, _) = dns_events(&raw, None, &lineage, None);
         let Event::DnsQuery { exe, .. } = event else {
             panic!()
         };
         assert_eq!(exe.as_deref(), Some("/usr/sbin/dnsmasq"));
         // gone
         std::fs::remove_dir_all(&dir).unwrap();
-        let (event, _) = dns_events(&raw, &lineage, None);
+        let (event, _) = dns_events(&raw, None, &lineage, None);
         assert!(matches!(event, Event::DnsQuery { exe: None, .. }));
+    }
+
+    /// R14b: a query's name feeds the connect attribution only when the
+    /// parse worker decoded it; a query the worker did not answer (an event
+    /// with no name) leaves the cache as it was.
+    #[test]
+    fn a_query_without_a_decode_leaves_the_attribution_alone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        let cache = DnsCache::default();
+        let mut raw = DnsQueryRaw::zeroed();
+        raw.pid = 4800;
+        raw.timestamp_ns = 7_000;
+        raw.family = 2;
+        let name = b"\x03bar\x13northnarrow-e2etest\x07invalid\x00";
+        raw.query_name[..name.len()].copy_from_slice(name);
+        raw.qname_len = name.len() as u16;
+        let (event, _) = dns_events(&raw, None, &lineage, Some(&cache));
+        assert!(
+            matches!(&event, Event::DnsQuery { query_name, qname_partial: true, .. } if query_name.is_empty()),
+            "{event:?}"
+        );
+        assert_eq!(cache.lookup_for_connect(4800, 8_000, 0), None);
+        let decoded =
+            crate::worker::serve::answer(&nn_proto::ipc::Request::DnsNames(vec![name_request(
+                &raw,
+            )]));
+        let nn_proto::ipc::Answer::DnsNames(mut v) = decoded else {
+            panic!("{decoded:?}")
+        };
+        let d = v.remove(0);
+        assert_eq!(d.name, "bar.northnarrow-e2etest.invalid");
+        let _ = dns_events(&raw, Some(&d), &lineage, Some(&cache));
+        assert_eq!(
+            cache.lookup_for_connect(4800, 8_000, 0).as_deref(),
+            Some("bar.northnarrow-e2etest.invalid")
+        );
     }
 
     /// Lab PR 229: a name asked through systemd-resolved's NSS module (no
@@ -2127,7 +2201,18 @@ mod tests {
         let name = b"foo.northnarrow-e2etest.invalid.";
         raw.query_name[..name.len()].copy_from_slice(name);
         raw.qname_len = name.len() as u16;
-        assert!(nss_events(&raw, &lineage, Some(&cache)).is_none());
+        // R14b: the worker's decode of the text (its code, run here)
+        let decoded = |raw: &DnsQueryRaw| -> nn_proto::ipc::QnameOut {
+            use nn_proto::ipc::{Answer, Request};
+            match crate::worker::serve::answer(&Request::DnsNames(vec![name_request(raw)])) {
+                Answer::DnsNames(mut v) => v.remove(0),
+                other => panic!("{other:?}"),
+            }
+        };
+        // without a decode nothing feeds the cache
+        assert!(nss_events(&raw, None, &lineage, Some(&cache)).is_none());
+        assert_eq!(cache.lookup_for_connect(4700, 8_000, 0), None);
+        assert!(nss_events(&raw, Some(&decoded(&raw)), &lineage, Some(&cache)).is_none());
         assert_eq!(
             cache.lookup_for_connect(4700, 8_000, 0).as_deref(),
             Some("foo.northnarrow-e2etest.invalid")
@@ -2140,7 +2225,7 @@ mod tests {
         raw.held = 5;
         raw.flags |= dns_flags::RATE_HELD;
         assert!(matches!(
-            nss_events(&raw, &lineage, Some(&cache)),
+            nss_events(&raw, None, &lineage, Some(&cache)),
             Some(Event::DnsFlood {
                 pid: 4700,
                 held: 5,
@@ -2151,7 +2236,7 @@ mod tests {
         let mut empty = DnsQueryRaw::zeroed();
         empty.pid = 4701;
         empty.flags = dns_flags::NSS;
-        assert!(nss_events(&empty, &lineage, Some(&cache)).is_none());
+        assert!(nss_events(&empty, Some(&decoded(&empty)), &lineage, Some(&cache)).is_none());
         assert_eq!(cache.lookup_for_connect(4701, 8_000, 0), None);
     }
 

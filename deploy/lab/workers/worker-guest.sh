@@ -204,7 +204,55 @@ faults)
     journal_since "$T1" | grep -E 'worker|disabled' | tail -40 > "$OUT/journal-loop.txt"
     ;;
 parse)
-    echo "the parse phase comes with R14b"
+    # R14b: the DNS pump's names are the parse worker's. The telemetry
+    # probe's DNS round (R13) is seen only when its name was decoded: with
+    # the worker disabled the core leaves the names undecoded (a WARN), the
+    # probe finds a gap; with the worker back the probe sees it again.
+    probe() { # the manifest's dns_query probe word
+        caps_json | python3 -I -c 'import json, sys
+m = json.load(sys.stdin)["manifest"]
+s = [x for x in m.get("sources", []) if x["source"] == "dns_query"]
+print(s[0].get("probe") if s else "none")'
+    }
+    query() { # a DNS query to the local stub from a python3 of its own
+        python3 -I -c 'import os, socket, struct, sys
+name = sys.argv[1]
+q = struct.pack(">HHHHHH", os.getpid() & 0xFFFF, 0x0100, 1, 0, 0, 0)
+q += b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\0" + struct.pack(">HH", 1, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(1)
+s.sendto(q, ("127.0.0.53", 53))
+try:
+    s.recv(512)
+except OSError:
+    pass' "$1" > /dev/null 2>&1
+    }
+    W=$(wait_worker 30) || { bad worker "no parse worker within 30 s"; exit 1; }
+    end=$((SECONDS + 200)); p=
+    while ((SECONDS < end)); do p=$(probe); [ "$p" = seen ] && break; sleep 5; done
+    check probe-seen "the DNS probe's name decoded and seen ($p)" test "$p" = seen
+    T1=$(date '+%F %T')
+    touch "$RUN/debug-worker-crashloop"
+    end=$((SECONDS + 120)); st=
+    while ((SECONDS < end)); do st=$(worker_entry state); [ "$st" = disabled ] && break; sleep 2; done
+    check disabled "the worker disabled ($st)" test "$st" = disabled
+    for i in $(seq 1 30); do query "nn-r14b-$i-$$.invalid"; done
+    sleep 3
+    j=$(journal_since "$T1")
+    check unparsed "names left without a decode, said (no parsing in the core)" \
+        grep -q 'DNS names left without a decode' <<< "$j"
+    end=$((SECONDS + 200)); p=
+    while ((SECONDS < end)); do p=$(probe); [ "$p" = gap ] && break; sleep 5; done
+    check probe-gap "the DNS probe finds a gap while the worker is disabled ($p)" test "$p" = gap
+    rm -f "$RUN/debug-worker-crashloop"
+    end=$((SECONDS + 180)); st=
+    while ((SECONDS < end)); do st=$(worker_entry state); [ "$st" = ready ] && break; sleep 3; done
+    check enabled "the worker ready again ($st)" test "$st" = ready
+    end=$((SECONDS + 200)); p=
+    while ((SECONDS < end)); do p=$(probe); [ "$p" = seen ] && break; sleep 5; done
+    check probe-back "the DNS probe sees the names again ($p)" test "$p" = seen
+    check agent-same "the agent's pid unchanged" test "$(agent)" = "$A0"
+    journal_since "$T1" | grep -E 'without a decode|worker' | tail -30 > "$OUT/journal-parse.txt"
     ;;
 *) echo "no phase $PHASE" >&2; exit 2 ;;
 esac

@@ -239,12 +239,11 @@ pub mod net {
         /// [`nn_core::net::dns_cache::DnsCache`] with the DNS pump's ingest.
         pub type DnsCache = nn_core::net::dns_cache::DnsCache<DnsIngest>;
 
-        // ── DNS reply parser (nn-parse) ─────────────────────────────────
-        //
-        // R06 of the Wave 4 restructure (lab PR 242): the reply parser and its
-        // tests moved to nn-parse's `dns_records`. Re-exported here for the
-        // paths the fuzz targets and `fuzz_api` name (until R17).
-        pub use nn_parse::dns_records::{parse_a_records, parse_aaaa_records};
+        // R14b (plan §3.1): the reply parsers (nn-parse's `dns_records`
+        // since R06, lab PR 242) are no longer re-exported here: the core
+        // reaches them only through the parse worker
+        // (`crate::worker::parse::ParseClient::dns_answers`); the fuzz
+        // targets name nn-parse.
     }
 
     // The drain of the closed flows, listeners and UDP flows, and the

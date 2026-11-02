@@ -229,6 +229,9 @@ async fn run(
         integrity: (integrity.label(), integrity.provenance()),
         key: &signing_key,
     };
+    // R14a: how this core starts its workers, which R004 knows (read before
+    // the image goes to the workers' start)
+    let own_launch = workers::own_launch(&image);
     let attach::Attached {
         lineage,
         flow_tracker,
@@ -242,6 +245,7 @@ async fn run(
         exploit_guard_degraded,
         exploit_guard,
         anti_tamper,
+        workers,
     } = attach::load(
         &cli,
         &mut boot,
@@ -251,6 +255,7 @@ async fn run(
         &refusals,
         &mut audit,
         &bpf_lsm_state,
+        image,
     )
     .await?;
     let attach::SelfTested {
@@ -307,7 +312,7 @@ async fn run(
         &audit_log,
         &dns_cache,
         &lineage,
-        workers::own_launch(&image),
+        own_launch,
     );
     let response::Response {
         legacy_isolation_removed,
@@ -501,9 +506,6 @@ async fn run(
         .filter_map(|(on, k)| on.then_some(k))
         .collect()
     };
-    // R14a (plan §3.5): the workers, once the deny hooks are attached and
-    // PROTECTED_PIDS is pinned.
-    let workers = workers::start(&cli, image);
     let tasks::Tasks {
         execq_handle,
         execpol_handle,
@@ -756,11 +758,6 @@ mod tests {
         (
             "admin::start(",
             include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/admin.rs")),
-            "pub(crate) fn start(",
-        ),
-        (
-            "workers::start(",
-            include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/workers.rs")),
             "pub(crate) fn start(",
         ),
         (

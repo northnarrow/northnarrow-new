@@ -10,7 +10,8 @@
 //!   - N3 (this commit): [`flow_tracker`] — connect→close state
 //!     machine + per-flow stable ID.
 //!   - N4: `dns_cache` — PID-keyed 5-min TTL DNS-to-flow attribution.
-//!   - N5: `tls_parser` — JA3/JA4/SNI/ALPN from ClientHello.
+//!   - N5: `tls_parser` — JA3/JA4/SNI/ALPN from ClientHello (R14b: in the
+//!     parse worker, `nn_linux::worker::parse`).
 //!
 //! [`NetFlowEvent`]: nn_model::telemetry::NetFlowEvent
 //! [`NetListenerEvent`]: nn_model::telemetry::NetListenerEvent
@@ -37,7 +38,8 @@ pub use nn_core::net::resolvers;
 /// with the rules and the correlation store they read) on the Linux host,
 /// which the drain names.
 pub use nn_linux::net::{blind_spots, dns_cache, dns_ingest, drain, flow_tracker, limiter};
-/// The ClientHello parser (JA3, JA4, SNI, ALPN): nn-parse's `tls` since R06
-/// of the Wave 4 restructure (lab PR 242), re-exported at the path the fuzz
-/// targets and `fuzz_api` name (until R17).
-pub use nn_parse::tls as tls_parser;
+// R14b (plan §3.1): the ClientHello parser (JA3, JA4, SNI, ALPN; nn-parse's
+// `tls` since R06, lab PR 242) is no longer re-exported here as
+// `tls_parser`: the core reaches it only through the parse worker
+// (`nn_linux::worker::parse::ParseClient::client_hello`); the fuzz targets
+// name nn-parse.

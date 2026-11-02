@@ -8,7 +8,7 @@ sandbox, for the work that reads bytes an attacker writes. The design is
 
 | Worker | What it does | Since |
 |---|---|---|
-| `parse` | nn-parse's parsers: the DNS query names, DNS answers, the TLS ClientHello | R14a (started), R14b (the parsing moves in) |
+| `parse` | nn-parse's parsers: the DNS query names (every DNS event's name), DNS answers, the TLS ClientHello | R14a (started), R14b (the parsing moved in) |
 
 ## 1. The `northnarrow-worker` account
 
@@ -161,7 +161,11 @@ otherwise at most one a minute, the others counted into it).
 
 After **five failures in a row** the worker's kind is **disabled**: the
 agent does without what it gives — and **never does that parsing in its own
-process instead**. It keeps starting workers at its backoff; one that stays
+process instead**. For the parse worker that means: DNS events without a
+name (`qname_partial`), no DNS attribution of the connects that follow
+them, the DNS rules that match on names silent, the telemetry probe's DNS
+round a gap (the manifest's `dns_query` source says it) and a journal line
+at most every 10 s (`DNS names left without a decode`). It keeps starting workers at its backoff; one that stays
 up 60 s enables the kind again. The manifest's state (`ready`,
 `restarting`, `disabled`, `unavailable`) changes with a signed
 `capability_manifest_change` row, a worse state at once; `nn-admin status
@@ -173,6 +177,8 @@ up 60 s enables the kind again. The manifest's state (`ready`,
 | `… (SIGSYS: a system call outside its seccomp allowlist)` | the worker tried a call it may not make: a parser taken over by its input, or a bug | keep the journal and the input's time; report it |
 | `… protocol violation: …` | the worker sent what an honest worker never sends | as above |
 | `… protocol violation: N bytes of earlier requests left unread` | the worker stopped reading its channel: the agent never waits on it | as above |
+| `… protocol violation: a checked request refused …`, `… an empty name for a name's bytes`, `… an end not past a root label` | the worker answered what an honest decoder never gives (R14b): a parser taken over by its input | keep the journal and the time; report it |
+| `… hung: no answer to dns_names within 50ms`, often | the worker answers slower than 50 ms a batch: under heavy CPU pressure it is the last served (`nice` 10) | look at the host's load; the names of those passes carry no decode |
 | `… hello refused: landlock below what ABI N gives …` or `… hello refused: its process is not what it declared …` | the worker's sandbox is not what the kernel gives, or its process (`/proc`) is not what it declared | report it with the kernel and `lsm=` |
 | `… spinning: N% of a CPU …` | the worker burnt the CPU with nothing to do | as above |
 | `… pid N could not be taken out of PROTECTED_PIDS …` | the agent keeps the dead worker unreaped (its pid cannot be reused) and tries again | look at the pinned maps (`nn-admin status`) |

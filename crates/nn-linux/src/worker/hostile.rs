@@ -89,6 +89,15 @@ pub const PROTOCOL_ATTACKS: &[&str] = &[
     "lie",
     "weak-hello",
     "spin",
+    // review of #481 (R14b-1, R14b-2): a refusal of a checked request,
+    // an empty name, an end off the root label, a slow answer; and a false
+    // but well-formed name (the core cannot tell it: Open, the round-trip
+    // check)
+    "refuse-all",
+    "empty-names",
+    "end-off-root",
+    "slow",
+    "swap",
 ];
 
 /// Run `attack` (`[noseccomp+]<name>[:<argument>]`); the exit status.
@@ -505,6 +514,44 @@ fn protocol_attack(fd: RawFd, name: &str, level: nn_proto::ipc::SandboxLevel) ->
                     break;
                 }
             }
+        }
+        "refuse-all" => send(
+            fd,
+            &FromWorker::Response(Response {
+                id: msg.id,
+                answer: Answer::Refused(nn_proto::ipc::Refusal::OutOfBounds),
+            }),
+        ),
+        "empty-names" | "end-off-root" | "swap" => {
+            let n = match &msg.req {
+                Request::DnsNames(n) => n.len(),
+                _ => 0,
+            };
+            let out = QnameOut {
+                name: if name == "empty-names" {
+                    String::new()
+                } else {
+                    "evil.example".into()
+                },
+                // past the name's first byte, not its root label
+                end: (name == "end-off-root").then_some(1),
+            };
+            send(
+                fd,
+                &FromWorker::Response(Response {
+                    id: msg.id,
+                    answer: Answer::DnsNames(vec![out; n]),
+                }),
+            );
+        }
+        "slow" => {
+            // past the core's deadline for a batch of names (NAMES_TIMEOUT,
+            // 50 ms), with no sleep call: the filter allows none
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
+            send(fd, &FromWorker::Response(Response { id: msg.id, answer }));
         }
         "lie" => {
             let lie = match &msg.req {
