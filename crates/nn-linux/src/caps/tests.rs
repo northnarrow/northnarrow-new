@@ -621,6 +621,35 @@ fn restore_core_takes_the_core_s_set_back_or_says_why_not() {
     });
     assert_eq!(got, None);
     assert_eq!(set_to.map(|t| t.effective), Some(core));
+    // the review's RC2: an inheritable set left by the creator goes
+    let inheriting = ThreadCaps {
+        inheritable: CapSet::of(&[cap::KILL]),
+        ..actuator
+    };
+    let mut set_to = None;
+    assert_eq!(
+        restore_core_judged(Ok(inheriting), Some(core), |t| {
+            set_to = Some(t);
+            Ok(())
+        }),
+        None
+    );
+    assert_eq!(set_to.map(|t| t.inheritable), Some(CapSet::EMPTY));
+    let whole_but_inheritable = ThreadCaps {
+        effective: core,
+        permitted: core,
+        inheritable: CapSet::of(&[cap::KILL]),
+    };
+    let mut set_to = None;
+    let _ = restore_core_judged(Ok(whole_but_inheritable), Some(core), |t| {
+        set_to = Some(t);
+        Ok(())
+    });
+    assert_eq!(
+        set_to.map(|t| t.inheritable),
+        Some(CapSet::EMPTY),
+        "set even when only that differs"
+    );
     // already the core's: nothing set
     let whole = ThreadCaps {
         effective: core,
