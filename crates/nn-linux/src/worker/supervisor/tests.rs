@@ -2,7 +2,7 @@
 //! which the supervisor kills and reaps) and a thread on the worker's end
 //! of the channel that speaks the protocol honestly or not.
 
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::Command;
 use std::sync::atomic::AtomicU32;
 
@@ -33,6 +33,9 @@ enum Script {
     DieOnRequest,
     BadCharset,
     TooManyNames,
+    /// Review of #480 (F2): answers each ping on time (it watches its
+    /// queue's length) but never reads a request.
+    NoRead,
 }
 
 fn level() -> SandboxLevel {
@@ -113,6 +116,41 @@ fn run_script(script: Script, sock: OwnedFd, pid: u32) {
         _ => {}
     }
     send(fd, &FromWorker::Hello(hello.clone()));
+    if script == Script::NoRead {
+        let mut id = 1u64;
+        let mut seen = 0;
+        loop {
+            let mut q: libc::c_int = 0;
+            // SAFETY: FIONREAD into a local int.
+            if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut q) } != 0 {
+                return;
+            }
+            if q > seen {
+                seen = q;
+                send(
+                    fd,
+                    &FromWorker::Response(Response {
+                        id,
+                        answer: Answer::Pong,
+                    }),
+                );
+                id += 1;
+            } else {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            // the core closed its end: this side's next send fails
+            let mut pfd = libc::pollfd {
+                fd,
+                events: 0,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd, no wait.
+            unsafe { libc::poll(&mut pfd, 1, 0) };
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                return;
+            }
+        }
+    }
     let mut buf = vec![0u8; MAX_FRAME];
     loop {
         let n = match transport::recv(fd, &mut buf, false) {
@@ -185,6 +223,9 @@ impl Launcher for Scripted {
     fn account(&self) -> Option<(u32, u32)> {
         Some((UID, GID))
     }
+    fn kernel_landlock_abi(&self) -> u8 {
+        level().landlock_abi
+    }
     fn launch(&self, _kind: WorkerKind) -> std::io::Result<Spawned> {
         self.launches.fetch_add(1, Ordering::SeqCst);
         // stdio closed: a child left by a failing test holds no pipe of
@@ -199,7 +240,11 @@ impl Launcher for Scripted {
         let pid = child.id();
         let script = self.script;
         std::thread::spawn(move || run_script(script, theirs, pid));
-        Ok(Spawned { child, sock: ours })
+        Ok(Spawned {
+            child,
+            sock: ours,
+            stderr: None,
+        })
     }
 }
 
@@ -460,6 +505,18 @@ fn failures_in_a_row_back_off_then_disable_then_a_stable_worker_enables() {
             tick_until(&f.workers, Health::Ready) || i == DISABLE_AFTER,
             "start {i}"
         );
+        // review of #480 (F6): a pass between the hello and the crash,
+        // well inside STABLE, clears nothing — a "crash after ready"
+        // loop is still disabled
+        let before = f.workers.status()[0].failures;
+        let later = Duration::from_secs(5);
+        assert!(later < PING_EVERY && later < STABLE);
+        f.workers.tick(Instant::now() + later);
+        assert_eq!(
+            f.workers.status()[0].failures,
+            before,
+            "start {i}: not stable yet"
+        );
         let _ = f
             .workers
             .request(WorkerKind::Parse, &names(), Duration::from_secs(2));
@@ -504,6 +561,7 @@ fn a_stable_worker_clears_its_failures_and_enables_its_kind() {
         s.failures = DISABLE_AFTER;
         s.disabled = true;
         s.why = "test".into();
+        f.workers.publish(slot, &s);
     }
     assert_eq!(health(&f.workers), Health::Disabled);
     f.workers.tick(Instant::now() + STABLE);
@@ -568,4 +626,379 @@ fn an_unavailable_launcher_is_reported_once_and_never_started() {
     assert_eq!((st.health, st.starts), (Health::Unavailable, 0));
     assert_eq!(reports.lock().len(), 1);
     assert!(reports.lock()[0].1.starts_with("cannot start"));
+}
+
+/// Review of #480 (F2, the reviewer's probe as a test): a worker that
+/// answers every ping on time and never reads is caught at the second
+/// request (its first left unread), and the core never blocks — not the
+/// supervisor's pass, not the status.
+#[test]
+fn a_worker_that_never_reads_is_a_violation_not_a_stall() {
+    let f = fixture(Script::NoRead);
+    assert!(tick_until(&f.workers, Health::Ready));
+    let w = f.workers.clone();
+    let ticker = std::thread::spawn(move || {
+        for _ in 0..50 {
+            w.tick(Instant::now() + PING_EVERY + Duration::from_millis(1));
+            if w.status()[0].violations > 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    });
+    let end = Instant::now() + Duration::from_secs(10);
+    while !ticker.is_finished() {
+        assert!(Instant::now() < end, "the supervisor's pass is stuck");
+        let t = Instant::now();
+        let _ = f.workers.status();
+        assert!(t.elapsed() < Duration::from_millis(500), "status() waited");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ticker.join().unwrap(), "no violation");
+    let st = &f.workers.status()[0];
+    assert!(st.violations >= 1, "{st:?}");
+    assert!(
+        f.reports
+            .lock()
+            .iter()
+            .any(|(_, d)| d.contains("left unread")),
+        "{:?}",
+        f.reports.lock()
+    );
+}
+
+/// F2: the status is a snapshot — a request holding the worker (a hung
+/// one, until its deadline) never holds the status.
+#[test]
+fn the_status_never_waits_on_a_request() {
+    let f = fixture(Script::Hang);
+    assert!(tick_until(&f.workers, Health::Ready));
+    let w = f.workers.clone();
+    let req =
+        std::thread::spawn(move || w.request(WorkerKind::Parse, &names(), Duration::from_secs(2)));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!req.is_finished(), "the request is still waiting");
+    let t = Instant::now();
+    let st = f.workers.status();
+    assert!(
+        t.elapsed() < Duration::from_millis(100),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(st[0].health, Health::Ready);
+    assert!(matches!(req.join().unwrap(), Err(WorkerError::Timeout)));
+    assert_eq!(
+        f.workers.status()[0].hangs,
+        1,
+        "published after the request"
+    );
+}
+
+/// Review of #480 (F3): a worker that exits on its own is evicted from
+/// `PROTECTED_PIDS` while its pid is still held (a zombie), reaped after.
+#[derive(Default)]
+struct EvictProbe {
+    /// (pid, the pid still existed at the eviction)
+    seen: Mutex<Vec<(u32, bool)>>,
+    /// Evictions refused before one succeeds.
+    refuse: AtomicU32,
+}
+
+impl PidRoles for EvictProbe {
+    fn register_worker(&self, _pid: u32) -> Result<(), String> {
+        Ok(())
+    }
+    fn evict(&self, pid: u32) -> Result<(), String> {
+        // SAFETY: signal 0: existence only (a zombie exists)
+        let exists = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        self.seen.lock().push((pid, exists));
+        if self.refuse.load(Ordering::SeqCst) > 0 {
+            self.refuse.fetch_sub(1, Ordering::SeqCst);
+            return Err("the map refused".into());
+        }
+        Ok(())
+    }
+}
+
+struct ShortLived;
+
+impl Launcher for ShortLived {
+    fn unavailable(&self) -> Option<String> {
+        None
+    }
+    fn account(&self) -> Option<(u32, u32)> {
+        Some((UID, GID))
+    }
+    fn kernel_landlock_abi(&self) -> u8 {
+        level().landlock_abi
+    }
+    fn launch(&self, _kind: WorkerKind) -> std::io::Result<Spawned> {
+        let child = Command::new("sleep")
+            .arg("0.3")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let (ours, theirs) = transport::socketpair()?;
+        let pid = child.id();
+        // the channel stays open (a peer thread holds it): the death is
+        // found by the pass, not by the channel
+        std::thread::spawn(move || run_script(Script::Honest, theirs, pid));
+        Ok(Spawned {
+            child,
+            sock: ours,
+            stderr: None,
+        })
+    }
+}
+
+fn exists(pid: u32) -> bool {
+    // SAFETY: signal 0: existence only.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[test]
+fn a_dead_worker_s_pid_is_evicted_before_it_is_reaped() {
+    let probe = Arc::new(EvictProbe::default());
+    let workers = Workers::new(Config {
+        launcher: Arc::new(ShortLived),
+        roles: probe.clone(),
+        report: Arc::new(|_: &str, _: &str| {}),
+        kinds: vec![WorkerKind::Parse],
+        debug_dir: None,
+    });
+    assert!(tick_until(&workers, Health::Ready));
+    let end = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < end && probe.seen.lock().is_empty() {
+        workers.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let seen = probe.seen.lock().clone();
+    workers.stop();
+    let (pid, held) = *seen.first().expect("an eviction");
+    assert!(
+        held,
+        "pid {pid} was free (reaped) at its eviction: {seen:?}"
+    );
+    assert!(!exists(pid), "reaped after");
+}
+
+#[test]
+fn a_pid_that_cannot_be_evicted_is_kept_unreaped_and_reported() {
+    let probe = Arc::new(EvictProbe::default());
+    probe.refuse.store(3, Ordering::SeqCst);
+    let reports: Arc<Mutex<Vec<String>>> = Arc::default();
+    let r = Arc::clone(&reports);
+    let workers = Workers::new(Config {
+        launcher: Arc::new(ShortLived),
+        roles: probe.clone(),
+        report: Arc::new(move |_: &str, d: &str| r.lock().push(d.into())),
+        kinds: vec![WorkerKind::Parse],
+        debug_dir: None,
+    });
+    assert!(tick_until(&workers, Health::Ready));
+    let end = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < end && probe.seen.lock().len() < 2 {
+        workers.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pid = probe.seen.lock()[0].0;
+    // refused: its pid still held (a zombie), reported once
+    assert!(exists(pid), "the pid must stay taken");
+    let said: Vec<String> = reports
+        .lock()
+        .iter()
+        .filter(|d| d.contains("could not be taken out of PROTECTED_PIDS"))
+        .cloned()
+        .collect();
+    assert_eq!(said.len(), 1, "{:?}", reports.lock());
+    // evicted at a later pass: then reaped
+    let end = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < end && exists(pid) {
+        workers.tick(Instant::now());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    workers.stop();
+    assert!(!exists(pid), "reaped once evicted");
+    assert!(probe.seen.lock().iter().all(|(p, held)| *p != pid || *held));
+}
+
+/// Review of #480 (F12): a worker that burns a CPU while asked nothing but
+/// pings is a hang; one that sleeps is not.
+struct Spinner {
+    spin: bool,
+}
+
+impl Launcher for Spinner {
+    fn unavailable(&self) -> Option<String> {
+        None
+    }
+    fn account(&self) -> Option<(u32, u32)> {
+        Some((UID, GID))
+    }
+    fn kernel_landlock_abi(&self) -> u8 {
+        level().landlock_abi
+    }
+    fn launch(&self, _kind: WorkerKind) -> std::io::Result<Spawned> {
+        let script = if self.spin {
+            "while :; do :; done"
+        } else {
+            "sleep 600"
+        };
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let (ours, theirs) = transport::socketpair()?;
+        let pid = child.id();
+        std::thread::spawn(move || run_script(Script::Honest, theirs, pid));
+        Ok(Spawned {
+            child,
+            sock: ours,
+            stderr: None,
+        })
+    }
+}
+
+#[test]
+fn a_spinning_worker_is_killed_as_a_hang() {
+    for spin in [true, false] {
+        let reports: Arc<Mutex<Vec<String>>> = Arc::default();
+        let r = Arc::clone(&reports);
+        let workers = Workers::new(Config {
+            launcher: Arc::new(Spinner { spin }),
+            roles: Arc::new(NoPidRoles),
+            report: Arc::new(move |_: &str, d: &str| r.lock().push(d.into())),
+            kinds: vec![WorkerKind::Parse],
+            debug_dir: None,
+        });
+        assert!(tick_until(&workers, Health::Ready));
+        let end = Instant::now() + SPIN_WINDOW * 4;
+        while Instant::now() < end && workers.status()[0].hangs == 0 {
+            workers.tick(Instant::now());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let st = workers.status()[0].clone();
+        workers.stop();
+        if spin {
+            assert_eq!(st.hangs, 1, "{st:?}");
+            assert!(
+                reports.lock().iter().any(|d| d.contains("spinning")),
+                "{:?}",
+                reports.lock()
+            );
+        } else {
+            assert_eq!(st.hangs, 0, "a sleeping worker is no spin: {st:?}");
+        }
+    }
+}
+
+/// Review of #480 (F4): a worker's stderr reaches the log escaped, cut, and
+/// at most STDERR_LINES_PER_MINUTE lines a minute.
+#[test]
+fn a_worker_s_stderr_is_escaped_cut_and_rate_limited() {
+    assert_eq!(escape_line(b"plain line"), "plain line");
+    assert_eq!(escape_line(b"<3>forged\x1b[31m"), "<3>forged\\x1b[31m");
+    assert_eq!(escape_line(b"a\\b"), "a\\x5cb");
+    let long = escape_line(&[b'x'; 1000]);
+    assert!(
+        long.len() <= STDERR_LINE_MAX + '…'.len_utf8(),
+        "{}",
+        long.len()
+    );
+    // a pipe of the worker's, drained by a pass
+    let f = fixture(Script::Honest);
+    assert!(tick_until(&f.workers, Health::Ready));
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 into a local array.
+    assert_eq!(
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) },
+        0
+    );
+    // SAFETY: the kernel just returned these descriptors.
+    let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    {
+        let slot = f.workers.slot(WorkerKind::Parse).unwrap();
+        slot.s.lock().stderr = Some(r);
+    }
+    let lines = STDERR_LINES_PER_MINUTE as usize + 7;
+    let mut text = Vec::new();
+    for i in 0..lines {
+        text.extend_from_slice(format!("line {i}\n").as_bytes());
+    }
+    // one line far past the cut, no newline yet
+    text.extend_from_slice(&[b'y'; 3 * STDERR_LINE_MAX]);
+    // SAFETY: write to our pipe.
+    unsafe { libc::write(w.as_raw_fd(), text.as_ptr().cast(), text.len()) };
+    f.workers.tick(Instant::now());
+    let slot = f.workers.slot(WorkerKind::Parse).unwrap();
+    let s = slot.s.lock();
+    assert_eq!(s.err_lines, STDERR_LINES_PER_MINUTE);
+    // the 7 extra lines and the long one's two full cuts
+    assert_eq!(s.err_dropped, 7 + 2);
+    assert!(s.err_partial.len() <= STDERR_LINE_MAX);
+}
+
+/// PDEATHSIG is the forking thread's: production's launcher starts a worker
+/// from the supervisor's thread only.
+#[test]
+fn a_worker_is_started_from_the_supervisor_s_thread_only() {
+    let launcher = ImageLauncher {
+        image: None,
+        account: Err("none".into()),
+        extra_args: vec![],
+    };
+    let err = launcher.launch(WorkerKind::Parse).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    let launcher = Arc::new(launcher);
+    let l = Arc::clone(&launcher);
+    let err = std::thread::Builder::new()
+        .name(SUPERVISOR_THREAD.into())
+        .spawn(move || l.launch(WorkerKind::Parse).unwrap_err())
+        .unwrap()
+        .join()
+        .unwrap();
+    // past the thread's check: no image here
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+}
+
+/// Review of #480 (F7): the kernel's view of a worker against its word.
+#[test]
+fn a_worker_s_process_is_checked_against_its_declaration() {
+    let l = level();
+    let ok = format!(
+        "Name:\tnn-worker-parse\nUid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\n\
+         Groups:\t\nNoNewPrivs:\t1\nSeccomp:\t2\nCapInh:\t0000000000000000\n\
+         CapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\n\
+         CapAmb:\t0000000000000000\n",
+        u = l.uid,
+        g = l.gid
+    );
+    assert_eq!(verify_proc(&ok, &l), Ok(()));
+    for (from, to) in [
+        (
+            format!("Uid:\t{u}\t{u}\t{u}\t{u}", u = l.uid),
+            format!("Uid:\t{u}\t0\t{u}\t{u}", u = l.uid),
+        ),
+        ("Groups:\t".to_string(), "Groups:\t27".to_string()),
+        ("NoNewPrivs:\t1".to_string(), "NoNewPrivs:\t0".to_string()),
+        ("Seccomp:\t2".to_string(), "Seccomp:\t0".to_string()),
+        (
+            "CapEff:\t0000000000000000".to_string(),
+            "CapEff:\t0000000000000020".to_string(),
+        ),
+        (
+            "CapAmb:\t0000000000000000".to_string(),
+            "CapAmb:\t0000000000000001".to_string(),
+        ),
+    ] {
+        let bad = ok.replace(&from, &to);
+        assert_ne!(bad, ok, "{from}");
+        assert!(verify_proc(&bad, &l).is_err(), "{to}");
+    }
+    assert!(verify_proc("Name:\tx\n", &l).is_err());
 }

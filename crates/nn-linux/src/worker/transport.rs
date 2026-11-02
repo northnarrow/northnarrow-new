@@ -1,11 +1,23 @@
 //! The core ↔ worker channel's packets (R14a, plan §3.5): a
 //! `socketpair(AF_UNIX, SOCK_SEQPACKET)`, one message per packet. No
-//! descriptor ever crosses it (`nn_proto::ipc`): a receive gives no control
-//! buffer, so a descriptor sent along is closed by the kernel and the
-//! packet is refused (`MSG_CTRUNC`); a packet larger than the buffer is
-//! refused too (`MSG_TRUNC`, its real length asked for). Used by both
-//! ends: the worker's seccomp filter keeps `recvmsg` and `sendmsg` on its
-//! channel only.
+//! descriptor ever crosses it (`nn_proto::ipc`): the core's receive gives
+//! no control buffer, so a descriptor sent along is closed by the kernel
+//! and the packet is refused (`MSG_CTRUNC`); a packet larger than the
+//! buffer is refused too (`MSG_TRUNC`, its real length asked for).
+//!
+//! The two ends do not use the same calls:
+//!
+//! - the core ([`send`], [`recv`], [`unread`]): `sendmsg` with
+//!   `MSG_DONTWAIT` — review of #480 (F2): a worker that answers on time
+//!   but never reads would fill the core's send buffer, and a blocking send
+//!   held the supervisor (and every reader of its status) for good — and,
+//!   before each send, the bytes of earlier requests the worker left unread
+//!   (`SIOCOUTQ`: a datagram sits in the sender's buffer until its reader
+//!   takes it), which must be none;
+//! - the worker ([`send_to`], [`recv_from`]): `sendto` and `recvfrom` —
+//!   review of #480 (F8): no `msghdr`, so no `SCM_RIGHTS` from its side
+//!   (the UNIX sockets' garbage collector is not its to reach); its seccomp
+//!   filter keeps exactly these two, on its channel, with these flags.
 
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -37,8 +49,16 @@ pub fn socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
-/// Send one packet of at most [`MAX_FRAME`] bytes. `MSG_NOSIGNAL`: a
-/// closed peer is an `EPIPE`, never a `SIGPIPE`.
+/// The worker's send flags: a closed core is an `EPIPE`, never a
+/// `SIGPIPE` (its filter allows `sendto` with exactly these).
+pub const WORKER_SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+/// The worker's receive flags: a packet larger than its buffer gives its
+/// real length (its filter allows `recvfrom` with exactly these).
+pub const WORKER_RECV_FLAGS: libc::c_int = libc::MSG_TRUNC;
+
+/// The core's send of one packet of at most [`MAX_FRAME`] bytes: never
+/// waits (`MSG_DONTWAIT`; `WouldBlock` when the worker left the buffer
+/// full), `MSG_NOSIGNAL`: a closed peer is an `EPIPE`, never a `SIGPIPE`.
 pub fn send(sock: RawFd, bytes: &[u8]) -> io::Result<()> {
     if bytes.len() > MAX_FRAME {
         return Err(io::Error::new(
@@ -56,7 +76,7 @@ pub fn send(sock: RawFd, bytes: &[u8]) -> io::Result<()> {
     msg.msg_iovlen = 1;
     loop {
         // SAFETY: msg describes a live buffer for the duration of the call.
-        let n = unsafe { libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL) };
+        let n = unsafe { libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) };
         if n >= 0 {
             if n as usize != bytes.len() {
                 return Err(io::Error::new(io::ErrorKind::WriteZero, "short packet"));
@@ -68,6 +88,85 @@ pub fn send(sock: RawFd, bytes: &[u8]) -> io::Result<()> {
             return Err(e);
         }
     }
+}
+
+/// The bytes the core sent that its worker has not read yet
+/// (`SIOCOUTQ`): an honest worker reads a request before it answers, so
+/// before the next request this is 0.
+pub fn unread(sock: RawFd) -> io::Result<usize> {
+    let mut n: libc::c_int = 0;
+    // SAFETY: SIOCOUTQ (TIOCOUTQ) writes one int.
+    cvt(unsafe { libc::ioctl(sock, libc::TIOCOUTQ, &mut n) })?;
+    Ok(usize::try_from(n).unwrap_or(0))
+}
+
+/// The worker's send of one packet (blocking: the core reads it within
+/// its deadline or kills the worker).
+pub fn send_to(sock: RawFd, bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "packet too large",
+        ));
+    }
+    loop {
+        // SAFETY: a live buffer, no address (a connected pair).
+        let n = unsafe {
+            libc::sendto(
+                sock,
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                WORKER_SEND_FLAGS,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if n >= 0 {
+            if n as usize != bytes.len() {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "short packet"));
+            }
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// The worker's receive of one packet into `buf` (at least [`MAX_FRAME`]
+/// bytes), blocking. No control buffer at all (the core sends no
+/// descriptor); a packet larger than `buf` is refused, its length known
+/// (`MSG_TRUNC`).
+pub fn recv_from(sock: RawFd, buf: &mut [u8]) -> io::Result<Recv> {
+    debug_assert!(buf.len() >= MAX_FRAME);
+    let n = loop {
+        // SAFETY: a live, writable buffer; no address asked for.
+        let n = unsafe {
+            libc::recvfrom(
+                sock,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                WORKER_RECV_FLAGS,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if n >= 0 {
+            break n as usize;
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    };
+    if n > buf.len() {
+        return Ok(Recv::Refused(Violation::Oversized(n)));
+    }
+    if n == 0 {
+        return Ok(Recv::Closed);
+    }
+    Ok(Recv::Packet(n))
 }
 
 /// What a receive gave.
@@ -248,6 +347,68 @@ mod tests {
         assert_eq!(
             recv(b.as_raw_fd(), &mut buf, true).unwrap(),
             Recv::Refused(Violation::Ancillary)
+        );
+    }
+
+    /// Review of #480 (F2): what the worker has not read stays counted on
+    /// the core's side until it reads it; the core's send never waits, a
+    /// full buffer is `WouldBlock`.
+    #[test]
+    fn unread_bytes_are_seen_and_a_full_buffer_never_blocks_the_core() {
+        let (core, worker) = socketpair().unwrap();
+        assert_eq!(unread(core.as_raw_fd()).unwrap(), 0);
+        send(core.as_raw_fd(), b"request").unwrap();
+        assert!(unread(core.as_raw_fd()).unwrap() > 0, "not read yet");
+        let mut buf = vec![0u8; MAX_FRAME];
+        assert_eq!(
+            recv_from(worker.as_raw_fd(), &mut buf).unwrap(),
+            Recv::Packet(7)
+        );
+        assert_eq!(unread(core.as_raw_fd()).unwrap(), 0, "read: none left");
+        // a worker that never reads: the core's sends fill its buffer and
+        // the next one fails at once
+        let big = vec![0u8; 32 * 1024];
+        let t = Instant::now();
+        let mut sent = 0;
+        let err = loop {
+            match send(core.as_raw_fd(), &big) {
+                Ok(()) => sent += 1,
+                Err(e) => break e,
+            }
+            assert!(sent < 10_000, "never full");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        assert!(sent > 0);
+        assert!(t.elapsed() < Duration::from_secs(2), "it never waited");
+        assert!(unread(core.as_raw_fd()).unwrap() >= big.len());
+    }
+
+    /// The worker's side: `sendto`/`recvfrom`, whole packets, an oversized
+    /// one refused with its length, the core's close seen.
+    #[test]
+    fn the_worker_side_sends_and_receives_whole_packets() {
+        let (core, worker) = socketpair().unwrap();
+        send_to(worker.as_raw_fd(), b"answer").unwrap();
+        let mut buf = vec![0u8; MAX_FRAME];
+        assert_eq!(
+            recv(core.as_raw_fd(), &mut buf, true).unwrap(),
+            Recv::Packet(6)
+        );
+        assert_eq!(&buf[..6], b"answer");
+        // larger than the worker's buffer: refused, its length known
+        let mut small = vec![0u8; MAX_FRAME];
+        let big = vec![1u8; MAX_FRAME];
+        send(core.as_raw_fd(), &big).unwrap();
+        small.truncate(MAX_FRAME);
+        assert_eq!(
+            recv_from(worker.as_raw_fd(), &mut small).unwrap(),
+            Recv::Packet(MAX_FRAME)
+        );
+        assert!(send_to(worker.as_raw_fd(), &vec![0u8; MAX_FRAME + 1]).is_err());
+        drop(core);
+        assert_eq!(
+            recv_from(worker.as_raw_fd(), &mut buf).unwrap(),
+            Recv::Closed
         );
     }
 

@@ -4459,5 +4459,36 @@ only in the table below, in the same PR as the evidence.
     Mutations: set A 84 (75 caught; 5 survivors given tests; 2 site
     errors and 2 compile errors redone) and A2 9 (8 caught; `MP2`, the
     hello's kind, equivalent while there is one kind).
+  - R14a — review of #480 (an independent review; its probes and
+    mutations): F1 (a JA4 with a two-byte character across byte 23
+    sliced a `&str` and panicked the core: byte checks, the two clippy
+    lints denied on the module, the `ipc_check` fuzz target with the input
+    as a regression), F2 (a worker that never read its channel filled the
+    core's send queue and stalled the supervisor and `status()`: the queue
+    checked empty by `SIOCOUTQ` before each request, `MSG_DONTWAIT`, a
+    published status snapshot), F3 (a dead worker was reaped before its
+    pid left `PROTECTED_PIDS`: `waitid(WNOWAIT)`, evict, then reap; a pid
+    that cannot be evicted kept unreaped, signed), F4 (the worker's stderr
+    through the core: escaped, cut, rate-limited), F5 (the harness never
+    tried `mprotect` to executable nor `tgkill` to another pid — the
+    review's mutations RM1 and RM2 survived it: both added), F6 (the
+    60 s re-enable mutation RM16 survived: a tick between ready and the
+    fault), F7 (the harness adds a UNIX socket by path, UDP, a user
+    namespace, `io_uring_setup`, `keyctl`, `perf_event_open`,
+    `userfaultfd`, each killed by the filter on every kernel; the worker
+    measures Landlock after it enters it, the core checks the declaration
+    against the kernel's ABI and the worker's `/proc/<pid>/status`), F8
+    (`sendto`/`recvfrom` with fixed flags in place of `sendmsg`/`recvmsg`),
+    F9 (ALPN printable ASCII, `Refused` a closed set), F11 (install.sh
+    refuses an existing account it would not have created), F12
+    (`oom_score_adj` 1000, `nice` 10, a spinning worker killed as a hang),
+    and `PR_SET_PDEATHSIG` being the forking thread's (workers started from
+    `nn-workers` only).
   - R14a — open: the `export` worker of §3.1 (no exporter yet); Landlock
-    `Full` takes a kernel with ABI 9.
+    `Full` takes a kernel with ABI 9; from the review of #480: F10 (the
+    degradation registry fills with a crash-looping worker's rows at the
+    report rate — how a verifier weighs a row a worker caused), F13
+    (`request()` can take up to twice its deadline when a ping is in
+    flight on the same worker: one lock, two waits), and a `cargo-deny`
+    licence check in CI (the licences of `landlock`, `seccompiler` and
+    their dependencies were checked by hand for this lot).

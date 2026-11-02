@@ -3,21 +3,31 @@
 //!
 //! The `parse` worker keeps (plan §3.1's list, narrowed by its arguments):
 //!
-//! - its channel: `recvmsg` and `sendmsg` on the IPC descriptor only;
+//! - its channel: `recvfrom` and `sendto` on the IPC descriptor only, with
+//!   no address and the transport's own flags (review of #480, F8: no
+//!   `sendmsg`, so no `SCM_RIGHTS` from the worker — the UNIX sockets'
+//!   garbage collector is not its to reach);
 //! - `write` to stderr only (its diagnostics reach the agent's journal);
-//! - memory: `brk`, `mmap` and `mprotect` without `PROT_EXEC`, `munmap`,
-//!   `mremap`, `madvise`; `futex`; `close`;
+//! - memory: `brk`, `mmap` and `mprotect` without `PROT_EXEC` (so no
+//!   writable mapping made executable later either), `munmap`, `mremap`,
+//!   `madvise`; `futex`; `close`;
 //! - `clock_gettime`, `getrandom` (std's hash seeds);
 //! - signal returns and masks (`rt_sigreturn`, `rt_sigprocmask`,
 //!   `sigaltstack`), `restart_syscall`, `sched_yield`;
 //! - an abort: `getpid`, `gettid`, and `tgkill` of itself only;
 //! - `exit`, `exit_group`.
 //!
-//! Everything else — `open*`, `socket`, `connect`, `exec*`, `clone*`,
-//! `fork`, `kill`, `ptrace`, `bpf`, `prctl`, `read` of any file, `mmap` of
-//! executable memory, another architecture's numbers (and x86_64's x32
-//! numbers, which match no rule) — kills the whole process
-//! (`SECCOMP_RET_KILL_PROCESS`): the core sees it die by `SIGSYS`.
+//! Everything else — `open*`, `socket` (TCP, UDP, a UNIX socket by path),
+//! `connect`, `exec*`, `clone*`, `fork`, `unshare` (a user namespace),
+//! `kill`, `tkill`, `tgkill` of another process, `rt_sigqueueinfo`,
+//! `pidfd_send_signal`, `ptrace`, `bpf`, `io_uring_setup`, `keyctl`,
+//! `perf_event_open`, `userfaultfd`, `prctl`, `read` of any file,
+//! `pkey_mprotect`, `sendmsg`/`recvmsg`, executable memory, another
+//! architecture's numbers (and x86_64's x32 numbers, which match no rule)
+//! — kills the whole process (`SECCOMP_RET_KILL_PROCESS`): the core sees
+//! it die by `SIGSYS`. On every lab kernel the filter is the only layer
+//! for UNIX sockets by path (Landlock from ABI 9), UDP, user namespaces,
+//! `io_uring`, `keyctl`, `perf_event_open` and executable memory.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -34,6 +44,9 @@ use seccompiler::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Arg {
     Eq(u8, u64),
+    /// The whole 64-bit argument equals the value (a pointer that must be
+    /// null).
+    Eq64(u8, u64),
     NoExec(u8),
 }
 
@@ -53,8 +66,28 @@ impl Allowlist {
     pub fn parse_worker(ipc_fd: RawFd, self_pid: u32) -> Self {
         let mut a = Self::default();
         let fd = ipc_fd as u64;
-        a.keep(libc::SYS_recvmsg, "recvmsg", vec![Arg::Eq(0, fd)]);
-        a.keep(libc::SYS_sendmsg, "sendmsg", vec![Arg::Eq(0, fd)]);
+        // the transport's worker side (`transport::recv_from`, `send_to`):
+        // its channel, its flags, no address
+        a.keep(
+            libc::SYS_recvfrom,
+            "recvfrom",
+            vec![
+                Arg::Eq(0, fd),
+                Arg::Eq(3, crate::worker::transport::WORKER_RECV_FLAGS as u64),
+                Arg::Eq64(4, 0),
+                Arg::Eq64(5, 0),
+            ],
+        );
+        a.keep(
+            libc::SYS_sendto,
+            "sendto",
+            vec![
+                Arg::Eq(0, fd),
+                Arg::Eq(3, crate::worker::transport::WORKER_SEND_FLAGS as u64),
+                Arg::Eq64(4, 0),
+                Arg::Eq64(5, 0),
+            ],
+        );
         a.keep(libc::SYS_write, "write", vec![Arg::Eq(0, 2)]);
         a.keep(libc::SYS_mmap, "mmap", vec![Arg::NoExec(2)]);
         a.keep(libc::SYS_mprotect, "mprotect", vec![Arg::NoExec(2)]);
@@ -115,6 +148,9 @@ pub fn program(list: &Allowlist) -> io::Result<BpfProgram> {
             .map(|a| match *a {
                 Arg::Eq(i, v) => {
                     SeccompCondition::new(i, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, v)
+                }
+                Arg::Eq64(i, v) => {
+                    SeccompCondition::new(i, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, v)
                 }
                 Arg::NoExec(i) => SeccompCondition::new(
                     i,

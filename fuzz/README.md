@@ -6,7 +6,8 @@ from the kernel ring buffers, the BTF blob, tracefs `format` files, role
 lists from `admin.pub` / the CLI, chain-log lines, the install manifest,
 the COMBAT management carve-out (`combat-allow.cidrs` spliced into
 `combat-rules`), the operator canary templates, the watchdog's
-shutdown marker and the per-rule response policy (`rule-policy.local`). (The `ade_verdict` and `ade_preparse` targets, the LLM
+shutdown marker, the per-rule response policy (`rule-policy.local`) and
+the core's checks of what a worker sends it (R14a). (The `ade_verdict` and `ade_preparse` targets, the LLM
 advisor's output and its pre-parser, left with the advisor in Wave 4, lab
 PR 214.) The base property is
 always **never panic** — reject or report. Each target also asserts what
@@ -27,6 +28,7 @@ audit WDG-R04 to WDG-R08, WDG-014):
 | `canary_template` | a rendered canary keeps no `{{`, a JSON family's is JSON, the same body renders the same |
 | `resolv_conf` | every resolver parsed is the address of a `nameserver` line (zone index dropped), canonical, listed once, at most sixteen; the list rendered as `nameserver` lines parses back to itself (lab PR 224) |
 | `shutdown_marker` | a marker honoured against the fixture carries a shutdown the fixture keys signed (the fuzzer cannot sign: anything else is a forgery accepted), names the agent that exited, has at most the signature cap, two signers including the `shutdown` key, a capped grace, and is refused as a replay once honoured |
+| `ipc_check` | whatever a worker's packet, `decode`, `check_hello` and `check_response` never panic; an accepted hello runs under seccomp, `no_new_privs`, not dumpable, no root id, no group, no capability, no core or process, the kernel's Landlock ABI with every right it gives; an accepted answer is the request's kind, one name per name in its alphabet and length, an end only where asked, JA3 32 hex digits, JA4 36 ASCII bytes in its shape, an SNI a host name, ALPN names printable ASCII and bounded, no more DNS answers than the bytes hold; a decoded message re-encodes to itself; `alpn_display` is printable ASCII within its bound (review of #480, F1) |
 | `rule_policy` | an accepted per-rule policy names only rules the engine decides, by their full id; no exemption by name (`comm`, `name`, `process`, `argv` refuse the file), of uid 0, of an executable outside a root-owned system tree, of a cgroup without a unit; at most 64 exemptions a rule; its rendering parses back to itself; a refusal names a line of the text (lab PR 236) |
 
 `install_manifest` and
@@ -49,7 +51,8 @@ at exit — WDG-R09).
   multicast entries), `canary_template` (DEC-017: an unclosed
   placeholder), `dns_records` (NN-AUD-185: a dot inside a label), `shutdown_marker`
   (AUT-005: nine signatures; AUT-011, declined on ciborium's recursion
-  limit: a payload nested 10,000 deep).
+  limit: a payload nested 10,000 deep), `ipc_check` (review of #480, F1: a
+  JA4 with a two-byte character across byte 23, which panicked the core).
 - `fuzz/corpus/<target>/` — the working corpus, not committed: libFuzzer
   writes new inputs into the first directory it is given, so always put
   the corpus first and the seeds after it.

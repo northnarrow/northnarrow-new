@@ -11,10 +11,20 @@
 //! descriptor close-on-exec (`close_range(4, ~0, CLOSE_RANGE_CLOEXEC)`: the
 //! image's descriptor is resolved by `execve` before the close happens).
 //! The environment is empty, the directory `/`, stdin and stdout
-//! `/dev/null`; stderr is the agent's (its journal).
+//! `/dev/null`. Review of #480: stderr is a pipe the supervisor reads
+//! (F4: a worker writes no line of the agent's journal itself); before the
+//! uid change the child sets its own `oom_score_adj` to 1000 and its nice
+//! to 10 (F12: under memory pressure a worker dies before the core, and it
+//! never takes the CPU from it); a failure of either fails the start.
+
+// The raw `setgroups`/`setresgid`/`setresuid` numbers below are the
+// 32-bit-id calls on these two architectures only (review of #480, INFO):
+// another one must be checked before it builds.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("worker::spawn's raw id system calls are checked for x86_64 and aarch64 only");
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
@@ -28,11 +38,36 @@ pub const IPC_FD: i32 = 3;
 /// `close_range(2)`'s flag: mark close-on-exec instead of closing (5.11).
 const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
 
-/// A started worker: the child and the core's end of its channel.
+/// A started worker: the child, the core's end of its channel, and the
+/// read end of its stderr (non-blocking; `None` for the tests' workers).
 #[derive(Debug)]
 pub struct Spawned {
     pub child: Child,
     pub sock: OwnedFd,
+    pub stderr: Option<OwnedFd>,
+}
+
+/// The worker's `oom_score_adj`: the first the kernel's OOM killer takes.
+pub const WORKER_OOM_SCORE_ADJ: &[u8] = b"1000";
+/// The worker's nice value.
+pub const WORKER_NICE: libc::c_int = 10;
+
+/// A pipe for the worker's stderr: (read end, non-blocking and
+/// close-on-exec; write end, close-on-exec — `Command` puts it on 2).
+fn stderr_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: a valid out-array of two ints.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the kernel just returned these two descriptors to us.
+    let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // SAFETY: fcntl on our own descriptor.
+    unsafe {
+        let fl = libc::fcntl(r.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(r.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+    Ok((r, w))
 }
 
 /// The worker's argument vector after `argv[0]`.
@@ -60,6 +95,7 @@ pub fn spawn(
         ));
     }
     let (ours, theirs) = transport::socketpair()?;
+    let (err_read, err_write) = stderr_pipe()?;
     let raw = theirs.as_raw_fd();
     let (uid, gid) = (account.uid, account.gid);
     // SAFETY: getpid has no preconditions.
@@ -72,7 +108,7 @@ pub fn spawn(
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::from(err_write));
     // SAFETY: async-signal-safe system calls only, in the child between
     // fork and exec; no allocation, no lock.
     unsafe {
@@ -90,6 +126,21 @@ pub fn spawn(
                 libc::dup2(raw, IPC_FD)
             };
             check(rc as libc::c_long)?;
+            // F12, as root still: the OOM killer's first choice, and a low
+            // priority (failures leave the worker as it was: best effort)
+            let fd = libc::open(
+                c"/proc/self/oom_score_adj".as_ptr(),
+                libc::O_WRONLY | libc::O_CLOEXEC,
+            );
+            check(fd as libc::c_long)?;
+            let n = libc::write(
+                fd,
+                WORKER_OOM_SCORE_ADJ.as_ptr().cast(),
+                WORKER_OOM_SCORE_ADJ.len(),
+            );
+            libc::close(fd);
+            check(n as libc::c_long)?;
+            check(libc::setpriority(libc::PRIO_PROCESS, 0, WORKER_NICE) as libc::c_long)?;
             check(libc::syscall(
                 libc::SYS_setgroups,
                 0usize,
@@ -118,5 +169,9 @@ pub fn spawn(
     }
     let child = cmd.spawn()?;
     drop(theirs);
-    Ok(Spawned { child, sock: ours })
+    Ok(Spawned {
+        child,
+        sock: ours,
+        stderr: Some(err_read),
+    })
 }

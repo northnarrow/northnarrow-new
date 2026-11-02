@@ -105,6 +105,12 @@ roles)
     nfd=$(ls "/proc/$W/fd" | wc -l)
     check fds "stdio and its channel only ($nfd)" test "$nfd" -le 4
     check core "not dumpable (no core)" test "$(awk '/^Max core file size/ {print $5}' "/proc/$W/limits")" = 0
+    # review of #480: F12 (the OOM killer's first, the scheduler's last), F4
+    # (its stderr a pipe the agent reads, not the journal's socket)
+    check oom "oom_score_adj 1000" test "$(cat "/proc/$W/oom_score_adj")" = 1000
+    check nice "nice 10" test "$(sed 's/.*) //' "/proc/$W/stat" | awk '{print $17}')" = 10
+    check stderr "stderr a pipe ($(readlink "/proc/$W/fd/2"))" \
+        bash -c "readlink /proc/$W/fd/2 | grep -q '^pipe:'"
     WD=$(cat "$RUN/watchdog.pid" 2>/dev/null)
     check role-agent "agent 0x03 (protected, exempt)" test "$(role_of "$A0")" = 03
     [ -n "$WD" ] && check role-watchdog "watchdog 0x03" test "$(role_of "$WD")" = 03

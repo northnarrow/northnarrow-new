@@ -13,8 +13,28 @@
 //! for (a flood), and pings an idle worker every [`PING_EVERY`] (a hang is
 //! found without traffic). Requests run on the caller's thread
 //! ([`Workers::request`]), one at a time per worker.
+//!
+//! Review of #480:
+//! - F2: nothing waits on a worker for good. The core never sends to a
+//!   worker that left an earlier request unread (`SIOCOUTQ`), and never
+//!   blocks on a send (`MSG_DONTWAIT`): either is a violation. The status
+//!   ([`Workers::status`]: the heartbeat, the manifest, `nn-admin status`)
+//!   is a snapshot each pass publishes, never the lock a request holds.
+//! - F3: a worker's pid leaves `PROTECTED_PIDS` before the pid can be
+//!   reused: a death is seen without reaping (`waitid(…, WNOWAIT)`), the pid
+//!   is evicted, then the zombie is reaped; a pid that could not be evicted
+//!   stays a zombie (no process can take it) until it is, and that is a
+//!   signed degradation.
+//! - F4: a worker's stderr is a pipe the supervisor reads: each line
+//!   escaped, cut, prefixed and rate-limited into the agent's own log — a
+//!   worker writes no line of the agent's journal itself.
+//! - F12: a worker that burns half a CPU over [`SPIN_WINDOW`] while it is
+//!   asked nothing but pings is killed as a hang.
+//! - `PR_SET_PDEATHSIG` is a property of the thread that forks: a worker is
+//!   started from the supervisor's thread only ([`SUPERVISOR_THREAD`]),
+//!   which lives as long as the agent.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::Child;
@@ -34,6 +54,10 @@ use super::spawn::{spawn, Spawned};
 use super::transport::{self, Recv};
 use super::{SelfImage, WorkerAccount};
 
+/// The supervisor's thread: the one thread that starts workers (their
+/// `PR_SET_PDEATHSIG` is that thread's).
+pub const SUPERVISOR_THREAD: &str = "nn-workers";
+
 /// How long a started worker has to say hello.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// An idle worker is pinged this often.
@@ -48,6 +72,21 @@ pub const STABLE: Duration = Duration::from_secs(60);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Failure reports of a kind closer than this are folded into the next.
 pub const REPORT_EVERY: Duration = Duration::from_secs(60);
+/// A ready worker's CPU is measured over this window (F12).
+#[cfg(not(test))]
+pub const SPIN_WINDOW: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub const SPIN_WINDOW: Duration = Duration::from_millis(400);
+/// The CPU share over [`SPIN_WINDOW`], with no request but pings, that is a
+/// spin.
+pub const SPIN_SHARE: f64 = 0.5;
+/// The most lines of a worker's stderr logged per minute; the rest are
+/// counted (F4).
+pub const STDERR_LINES_PER_MINUTE: u32 = 20;
+/// A logged stderr line's longest length, escaped.
+pub const STDERR_LINE_MAX: usize = 200;
+/// How long [`Workers::stop`] waits for a slot before it kills by pid.
+pub const STOP_WAIT: Duration = Duration::from_secs(2);
 
 /// The wait before the next start after `failures` in a row: at once
 /// after the first, then 1, 2, 4… seconds, at most [`MAX_BACKOFF`].
@@ -191,6 +230,18 @@ pub trait Launcher: Send + Sync {
     fn account(&self) -> Option<(u32, u32)>;
     /// Start a `kind` worker: the child and the core's end of its channel.
     fn launch(&self, kind: WorkerKind) -> std::io::Result<Spawned>;
+    /// The kernel's Landlock ABI a worker's hello is checked against
+    /// (review of #480, F7).
+    fn kernel_landlock_abi(&self) -> u8 {
+        crate::sandbox::kernel_landlock_abi()
+    }
+    /// A look of the core's own at a worker whose hello it accepted
+    /// (production's: `/proc/<pid>/status` against the declaration);
+    /// `Err(why)` refuses it. None for the tests' scripted workers, which
+    /// are no sandboxed processes.
+    fn verify(&self, _pid: u32, _declared: &SandboxLevel) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The agent's binary from its boot descriptor, as `northnarrow-worker`
@@ -218,6 +269,19 @@ impl Launcher for ImageLauncher {
         self.account.as_ref().ok().map(|a| (a.uid, a.gid))
     }
     fn launch(&self, kind: WorkerKind) -> std::io::Result<Spawned> {
+        // PR_SET_PDEATHSIG fires when the thread that forked exits: only
+        // the supervisor's thread, which lives as long as the agent, may
+        let here = std::thread::current();
+        if here.name() != Some(SUPERVISOR_THREAD) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "a worker is started from the supervisor's thread ({SUPERVISOR_THREAD}) only, \
+                     not from {:?}: its death signal is that thread's",
+                    here.name()
+                ),
+            ));
+        }
         match (&self.image, &self.account) {
             (Some(image), Ok(account)) => spawn(image, kind, account, &self.extra_args),
             _ => Err(std::io::Error::new(
@@ -226,6 +290,53 @@ impl Launcher for ImageLauncher {
             )),
         }
     }
+    fn verify(&self, pid: u32, declared: &SandboxLevel) -> Result<(), String> {
+        verify_proc(
+            &std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .map_err(|e| format!("/proc/{pid}/status unreadable: {e}"))?,
+            declared,
+        )
+    }
+}
+
+/// Review of #480 (F7): the kernel's view of a worker (`/proc/<pid>/status`)
+/// against what it declared: every uid and gid its account's, no
+/// supplementary group, `no_new_privs`, a seccomp filter, every capability
+/// set empty.
+pub fn verify_proc(status: &str, declared: &SandboxLevel) -> Result<(), String> {
+    let field = |k: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(k)?.strip_prefix(':'))
+            .map(str::trim)
+            .ok_or_else(|| format!("no {k} line"))
+    };
+    let ids = |k: &str, want: u32| -> Result<(), String> {
+        let v = field(k)?;
+        let all: Vec<&str> = v.split_whitespace().collect();
+        if all.len() != 4 || all.iter().any(|x| x.parse::<u32>().ok() != Some(want)) {
+            return Err(format!("{k} {v} (declared {want})"));
+        }
+        Ok(())
+    };
+    ids("Uid", declared.uid)?;
+    ids("Gid", declared.gid)?;
+    if !field("Groups")?.is_empty() {
+        return Err(format!("Groups {}", field("Groups")?));
+    }
+    if field("NoNewPrivs")? != "1" {
+        return Err(format!("NoNewPrivs {}", field("NoNewPrivs")?));
+    }
+    if field("Seccomp")? != "2" {
+        return Err(format!("Seccomp {}", field("Seccomp")?));
+    }
+    for k in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
+        let v = field(k)?;
+        if u64::from_str_radix(v, 16).ok() != Some(0) {
+            return Err(format!("{k} {v}"));
+        }
+    }
+    Ok(())
 }
 
 /// What the supervisor is given.
@@ -265,6 +376,27 @@ struct SlotState {
     buf: Vec<u8>,
     /// `debug-trigger`: every new worker is sent a crash.
     crash_loop: bool,
+    /// F3: workers killed, not reaped yet: their pids leave
+    /// `PROTECTED_PIDS` first.
+    graveyard: Vec<Grave>,
+    /// F4: the read end of the worker's stderr, and the reader's state.
+    stderr: Option<OwnedFd>,
+    err_partial: Vec<u8>,
+    err_window: Option<Instant>,
+    err_lines: u32,
+    err_dropped: u64,
+    /// F12: the CPU ticks at the window's start, and the requests served
+    /// by then (pings aside).
+    cpu_mark: Option<(Instant, u64, u64)>,
+    served: u64,
+}
+
+/// A killed worker awaiting its eviction and its reap.
+struct Grave {
+    child: Child,
+    pid: u32,
+    /// Its failed eviction was reported.
+    reported: bool,
 }
 
 impl SlotState {
@@ -292,6 +424,14 @@ impl SlotState {
             folded: 0,
             buf: vec![0u8; MAX_FRAME],
             crash_loop: false,
+            graveyard: Vec::new(),
+            stderr: None,
+            err_partial: Vec::new(),
+            err_window: None,
+            err_lines: 0,
+            err_dropped: 0,
+            cpu_mark: None,
+            served: 0,
         }
     }
 
@@ -303,6 +443,9 @@ impl SlotState {
 struct Slot {
     kind: WorkerKind,
     s: Mutex<SlotState>,
+    /// F2: what [`Workers::status`] reads — published after every pass,
+    /// request and stop; never held during I/O.
+    snap: Mutex<WorkerStatus>,
 }
 
 struct Shared {
@@ -348,6 +491,19 @@ impl Workers {
             .map(|&kind| Slot {
                 kind,
                 s: Mutex::new(SlotState::new(now)),
+                snap: Mutex::new(WorkerStatus {
+                    kind,
+                    health: Health::Backoff,
+                    pid: None,
+                    starts: 0,
+                    deaths: 0,
+                    violations: 0,
+                    hangs: 0,
+                    failures: 0,
+                    last_exit: String::new(),
+                    why: String::new(),
+                    sandbox: None,
+                }),
             })
             .collect();
         let me = Self(Arc::new(Shared {
@@ -359,13 +515,20 @@ impl Workers {
             debug_dir: cfg.debug_dir,
         }));
         let why = me.unavailable_why();
-        if let Some(why) = why {
-            for slot in &me.0.slots {
-                slot.s.lock().why = why.clone();
+        for slot in &me.0.slots {
+            let mut s = slot.s.lock();
+            if let Some(why) = &why {
+                s.why = why.clone();
                 (me.0.report)(&source(slot.kind), &format!("cannot start: {why}"));
             }
+            me.publish(slot, &s);
         }
         me
+    }
+
+    /// F2: the slot's status for [`Workers::status`].
+    fn publish(&self, slot: &Slot, s: &SlotState) {
+        *slot.snap.lock() = self.status_of(slot.kind, s);
     }
 
     fn unavailable_why(&self) -> Option<String> {
@@ -376,7 +539,7 @@ impl Workers {
     pub fn start(&self) -> std::io::Result<std::thread::JoinHandle<()>> {
         let me = self.clone();
         std::thread::Builder::new()
-            .name("nn-workers".to_string())
+            .name(SUPERVISOR_THREAD.to_string())
             .spawn(move || {
                 while !me.0.stop.load(Ordering::Acquire) {
                     #[cfg(feature = "debug-trigger")]
@@ -396,28 +559,28 @@ impl Workers {
         let mut pace = Duration::from_millis(250);
         for slot in &self.0.slots {
             let mut s = slot.s.lock();
-            if s.stopped {
-                continue;
+            if !s.stopped {
+                self.watch(slot.kind, &mut s, now);
+                self.drain_stderr(slot.kind, &mut s);
+                if s.child.is_some() && s.ready_at.is_none() {
+                    pace = Duration::from_millis(20);
+                }
             }
-            self.watch(slot.kind, &mut s, now);
-            if s.child.is_some() && s.ready_at.is_none() {
-                pace = Duration::from_millis(20);
-            }
+            self.publish(slot, &s);
         }
         pace
     }
 
     fn watch(&self, kind: WorkerKind, s: &mut SlotState, now: Instant) {
+        self.bury(kind, s);
         if self.unavailable_why().is_some() {
             return;
         }
-        // a death the channel has not shown yet
-        if let Some(c) = s.child.as_mut() {
-            if let Ok(Some(_)) = c.try_wait() {
-                let at = if s.ready() { "" } else { " before its hello" };
-                self.fail(kind, s, Fault::Died, &format!("exited{at}"));
-                return;
-            }
+        // a death the channel has not shown yet: seen, not reaped (F3)
+        if s.child.is_some() && ended(s.pid).is_some() {
+            let at = if s.ready() { "" } else { " before its hello" };
+            self.fail(kind, s, Fault::Died, &format!("exited{at}"));
+            return;
         }
         match (s.child.is_some(), s.ready()) {
             (false, _) if now >= s.next_start => self.launch(kind, s, now),
@@ -430,7 +593,11 @@ impl Workers {
     fn launch(&self, kind: WorkerKind, s: &mut SlotState, now: Instant) {
         s.starts += 1;
         match self.0.launcher.launch(kind) {
-            Ok(Spawned { child, sock }) => {
+            Ok(Spawned {
+                child,
+                sock,
+                stderr,
+            }) => {
                 let pid = child.id();
                 if let Err(e) = self.0.roles.register_worker(pid) {
                     // still sandboxed; only root's signals reach it now
@@ -439,9 +606,12 @@ impl Workers {
                 }
                 s.child = Some(child);
                 s.sock = Some(sock);
+                s.stderr = stderr;
+                s.err_partial.clear();
                 s.pid = pid;
                 s.started_at = Some(now);
                 s.ready_at = None;
+                s.cpu_mark = None;
                 info!(worker = kind.name(), pid, "worker started");
             }
             Err(e) => {
@@ -489,9 +659,18 @@ impl Workers {
                     pid: s.pid,
                     uid,
                     gid,
+                    kernel_landlock_abi: self.0.launcher.kernel_landlock_abi(),
                 };
                 if let Err(v) = check_hello(&hello, &want) {
                     return self.violation(kind, s, v);
+                }
+                // F7: the kernel's own view of it, against its word
+                if let Err(why) = self.0.launcher.verify(s.pid, &hello.sandbox) {
+                    return self.violation(
+                        kind,
+                        s,
+                        Violation::Hello(format!("its process is not what it declared: {why}")),
+                    );
                 }
                 info!(
                     worker = kind.name(),
@@ -553,8 +732,38 @@ impl Workers {
                         }),
                     );
                 }
-                Err(_) => {} // already failed and reaped
+                Err(_) => return, // already failed and reaped
             }
+        }
+        self.check_spin(kind, s);
+    }
+
+    /// F12: a worker that burns [`SPIN_SHARE`] of a CPU over
+    /// [`SPIN_WINDOW`] while it is asked nothing but pings is a hang.
+    fn check_spin(&self, kind: WorkerKind, s: &mut SlotState) {
+        let Some(ticks) = cpu_ticks(s.pid) else {
+            return;
+        };
+        let now = Instant::now();
+        match s.cpu_mark {
+            Some((at, t0, served0)) if now.duration_since(at) >= SPIN_WINDOW => {
+                let window = now.duration_since(at).as_secs_f64();
+                let used = ticks.saturating_sub(t0) as f64 / clock_ticks();
+                if s.served == served0 && used >= SPIN_SHARE * window {
+                    let share = (100.0 * used / window).round();
+                    return self.fail(
+                        kind,
+                        s,
+                        Fault::Hang,
+                        &format!(
+                            "spinning: {share}% of a CPU over {window:.1} s, asked nothing but pings"
+                        ),
+                    );
+                }
+                s.cpu_mark = Some((now, ticks, s.served));
+            }
+            Some(_) => {}
+            None => s.cpu_mark = Some((now, ticks, s.served)),
         }
     }
 
@@ -579,7 +788,9 @@ impl Workers {
         if health != Health::Ready {
             return Err(WorkerError::Unavailable(health));
         }
-        self.round_trip(kind, &mut s, req, timeout)
+        let got = self.round_trip(kind, &mut s, req, timeout);
+        self.publish(slot, &s);
+        got
     }
 
     fn round_trip(
@@ -609,6 +820,22 @@ impl Workers {
                 return Err(WorkerError::Died("closed its channel".into()));
             }
         }
+        // F2: an honest worker read every earlier request before it
+        // answered it; one that did not would fill this side's buffer
+        match transport::unread(fd) {
+            Ok(0) => {}
+            Ok(n) => {
+                let v = Violation::Unread(n);
+                let e = WorkerError::Violation(v.to_string());
+                self.violation(kind, s, v);
+                return Err(e);
+            }
+            Err(e) => {
+                let why = format!("SIOCOUTQ: {e}");
+                self.fail(kind, s, Fault::Died, &why);
+                return Err(WorkerError::Died(why));
+            }
+        }
         let id = s.next_id;
         s.next_id += 1;
         let bytes = encode(&ToWorker {
@@ -617,6 +844,13 @@ impl Workers {
         })
         .map_err(WorkerError::Refused)?;
         if let Err(e) = transport::send(fd, &bytes) {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                // the buffer full: never waited on (F2)
+                let v = Violation::Unread(transport::unread(fd).unwrap_or(0));
+                let e = WorkerError::Violation(v.to_string());
+                self.violation(kind, s, v);
+                return Err(e);
+            }
             let why = format!("send: {e}");
             self.fail(kind, s, Fault::Died, &why);
             return Err(WorkerError::Died(why));
@@ -682,6 +916,9 @@ impl Workers {
             return Err(e);
         }
         s.last_use = Instant::now();
+        if !matches!(req, Request::Ping) {
+            s.served += 1;
+        }
         Ok(resp.answer)
     }
 
@@ -696,22 +933,11 @@ impl Workers {
         let was_ready = s.ready();
         s.sock = None;
         s.ready_at = None;
-        let status = match s.child.take() {
-            Some(mut c) => {
-                let _ = c.kill();
-                if s.pid != 0 {
-                    if let Err(e) = self.0.roles.evict(s.pid) {
-                        warn!(worker = kind.name(), pid = s.pid, error = %e,
-                            "the dead worker's pid could not be taken out of PROTECTED_PIDS");
-                    }
-                }
-                match c.wait() {
-                    Ok(st) => describe_exit(st),
-                    Err(e) => format!("status unknown ({e})"),
-                }
-            }
-            None => "not running".to_string(),
-        };
+        s.cpu_mark = None;
+        // its last words, before its pipe goes
+        self.drain_stderr(kind, s);
+        s.stderr = None;
+        let status = self.end_child(kind, s);
         s.pid = 0;
         s.deaths += 1;
         if fault == Fault::Hang {
@@ -735,6 +961,129 @@ impl Workers {
             || status.contains(&format!("exit status {EXIT_SANDBOX}"));
         self.report_failure(kind, s, &detail, at_once);
         self.maybe_disable(kind, s);
+    }
+
+    /// Kill the running worker, wait (briefly) for its death without
+    /// reaping it, then evict its pid and reap it ([`Workers::bury`]): the
+    /// pid is never free while `PROTECTED_PIDS` holds it (F3). Its end in
+    /// words.
+    fn end_child(&self, kind: WorkerKind, s: &mut SlotState) -> String {
+        let Some(mut c) = s.child.take() else {
+            return "not running".to_string();
+        };
+        let pid = s.pid;
+        // a SIGKILL to our own child, not reaped: the pid is still ours
+        let _ = c.kill();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let end = loop {
+            if let Some(end) = ended(pid) {
+                break end;
+            }
+            if Instant::now() >= deadline {
+                break "killed, its end not seen yet".to_string();
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        s.graveyard.push(Grave {
+            child: c,
+            pid,
+            reported: false,
+        });
+        self.bury(kind, s);
+        end
+    }
+
+    /// F3: every dead worker of the graveyard evicted from `PROTECTED_PIDS`,
+    /// then reaped; one whose eviction fails stays a zombie (its pid taken)
+    /// until it succeeds, reported once, signed.
+    fn bury(&self, kind: WorkerKind, s: &mut SlotState) {
+        let roles = Arc::clone(&self.0.roles);
+        let mut failed: Vec<(u32, String)> = Vec::new();
+        s.graveyard.retain_mut(|g| {
+            if ended(g.pid).is_none() {
+                return true; // not dead yet: next pass
+            }
+            match roles.evict(g.pid) {
+                Ok(()) => {
+                    let _ = g.child.wait();
+                    false
+                }
+                Err(e) => {
+                    if !g.reported {
+                        g.reported = true;
+                        failed.push((g.pid, e));
+                    }
+                    true
+                }
+            }
+        });
+        for (pid, e) in failed {
+            let detail = format!(
+                "the dead worker's pid {pid} could not be taken out of PROTECTED_PIDS ({e}): kept \
+                 unreaped — no process can take its pid — and evicted again every pass"
+            );
+            warn!(worker = kind.name(), "{detail}");
+            (self.0.report)(&source(kind), &detail);
+        }
+    }
+
+    /// F4: what the worker wrote to stderr, each line escaped, cut and
+    /// prefixed into the agent's log, at most [`STDERR_LINES_PER_MINUTE`]
+    /// a minute (the rest counted, said once the minute is over).
+    fn drain_stderr(&self, kind: WorkerKind, s: &mut SlotState) {
+        let Some(fd) = s.stderr.as_ref().map(AsRawFd::as_raw_fd) else {
+            return;
+        };
+        let mut chunk = [0u8; 4096];
+        // at most 64 KiB a pass: a worker that writes faster blocks on its
+        // own pipe, and is then a hang
+        for _ in 0..16 {
+            let n = read_nonblocking(fd, &mut chunk);
+            if n == 0 {
+                break;
+            }
+            for &b in chunk.iter().take(n) {
+                if b == b'\n' || s.err_partial.len() >= STDERR_LINE_MAX {
+                    let line = std::mem::take(&mut s.err_partial);
+                    self.log_stderr(kind, s, &line);
+                    if b == b'\n' {
+                        continue;
+                    }
+                }
+                s.err_partial.push(b);
+            }
+        }
+    }
+
+    fn log_stderr(&self, kind: WorkerKind, s: &mut SlotState, line: &[u8]) {
+        let now = Instant::now();
+        if s.err_window
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60))
+        {
+            if s.err_dropped > 0 {
+                warn!(
+                    worker = kind.name(),
+                    dropped = s.err_dropped,
+                    "worker {}: {} line(s) of its stderr not logged (at most {STDERR_LINES_PER_MINUTE} a minute)",
+                    kind.name(),
+                    s.err_dropped
+                );
+            }
+            s.err_window = Some(now);
+            s.err_lines = 0;
+            s.err_dropped = 0;
+        }
+        if s.err_lines >= STDERR_LINES_PER_MINUTE {
+            s.err_dropped += 1;
+            return;
+        }
+        s.err_lines += 1;
+        warn!(
+            worker = kind.name(),
+            "worker {}: {}",
+            kind.name(),
+            escape_line(line)
+        );
     }
 
     fn maybe_disable(&self, kind: WorkerKind, s: &mut SlotState) {
@@ -783,44 +1132,67 @@ impl Workers {
         }
     }
 
-    /// Each kind's state now.
+    fn status_of(&self, kind: WorkerKind, s: &SlotState) -> WorkerStatus {
+        WorkerStatus {
+            kind,
+            health: self.health_of(s),
+            pid: (s.pid != 0).then_some(s.pid),
+            starts: s.starts,
+            deaths: s.deaths,
+            violations: s.violations,
+            hangs: s.hangs,
+            failures: s.failures,
+            last_exit: s.last_exit.clone(),
+            why: s.why.clone(),
+            sandbox: s.hello.as_ref().map(|h| h.sandbox.clone()),
+        }
+    }
+
+    /// Each kind's state as last published (F2: a snapshot — the
+    /// heartbeat, the manifest and `nn-admin status` never wait on a
+    /// worker's I/O).
     pub fn status(&self) -> Vec<WorkerStatus> {
         self.0
             .slots
             .iter()
-            .map(|slot| {
-                let s = slot.s.lock();
-                WorkerStatus {
-                    kind: slot.kind,
-                    health: self.health_of(&s),
-                    pid: (s.pid != 0).then_some(s.pid),
-                    starts: s.starts,
-                    deaths: s.deaths,
-                    violations: s.violations,
-                    hangs: s.hangs,
-                    failures: s.failures,
-                    last_exit: s.last_exit.clone(),
-                    why: s.why.clone(),
-                    sandbox: s.hello.as_ref().map(|h| h.sandbox.clone()),
-                }
-            })
+            .map(|slot| slot.snap.lock().clone())
             .collect()
     }
 
-    /// Stop every worker (the agent stops); no new start after this.
+    /// Stop every worker (the agent stops); no new start after this. A slot
+    /// held past [`STOP_WAIT`] (it should never be: no I/O waits) has its
+    /// worker killed by pid — still our unreaped child, so no other
+    /// process's.
     pub fn stop(&self) {
         self.0.stop.store(true, Ordering::Release);
         for slot in &self.0.slots {
-            let mut s = slot.s.lock();
+            let Some(mut s) = slot.s.try_lock_for(STOP_WAIT) else {
+                if let Some(pid) = slot.snap.lock().pid {
+                    warn!(
+                        worker = slot.kind.name(),
+                        pid, "the worker's slot is held: killed by pid"
+                    );
+                    // SAFETY: SIGKILL to our own child (not reaped while
+                    // the slot is held).
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                }
+                continue;
+            };
             s.stopped = true;
             s.sock = None;
             s.ready_at = None;
-            if let Some(mut c) = s.child.take() {
-                let _ = c.kill();
-                let _ = self.0.roles.evict(s.pid);
-                let _ = c.wait();
+            s.stderr = None;
+            let _ = self.end_child(slot.kind, &mut s);
+            // what is still unburied: once more, with a moment to die
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while !s.graveyard.is_empty() && Instant::now() < deadline {
+                self.bury(slot.kind, &mut s);
+                if !s.graveyard.is_empty() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
             s.pid = 0;
+            self.publish(slot, &s);
         }
     }
 
@@ -854,6 +1226,7 @@ impl Workers {
                 }
             }
         }
+        self.publish(slot, &s);
     }
 }
 
@@ -911,9 +1284,90 @@ fn fault_name(f: Fault) -> &'static str {
     }
 }
 
+/// F3: the child `pid` ended (not reaped: `WNOWAIT`): its end in words;
+/// `None` while it runs (or when it is no child of ours).
+fn ended(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: an all-zero siginfo_t is valid; waitid writes it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waitid on our own child, without reaping it.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    // SAFETY: si_pid and si_status read the fields waitid filled.
+    let (who, status) = unsafe { (info.si_pid(), info.si_status()) };
+    if rc != 0 || who == 0 {
+        return None;
+    }
+    Some(match info.si_code {
+        libc::CLD_EXITED => describe(Some(status), None),
+        _ => describe(None, Some(status)),
+    })
+}
+
+/// Read what a non-blocking descriptor holds now (0: nothing, or its end).
+fn read_nonblocking(fd: RawFd, buf: &mut [u8]) -> usize {
+    // SAFETY: read into a live buffer from our own descriptor.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    usize::try_from(n).unwrap_or(0)
+}
+
+/// A worker's stderr line for the agent's log: printable ASCII, the rest
+/// as `\xHH`, at most [`STDERR_LINE_MAX`] bytes.
+pub fn escape_line(line: &[u8]) -> String {
+    let mut out = String::new();
+    for &b in line {
+        if out.len() >= STDERR_LINE_MAX {
+            out.push('…');
+            break;
+        }
+        if (0x20..=0x7e).contains(&b) && b != b'\\' {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("\\x{b:02x}"));
+        }
+    }
+    out
+}
+
+/// F12: the process's CPU ticks (`utime` + `stime` of `/proc/<pid>/stat`).
+fn cpu_ticks(pid: u32) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    // after the name: state is field 3, utime 14 and stime 15
+    let utime: u64 = f.get(11)?.parse().ok()?;
+    let stime: u64 = f.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
+fn clock_ticks() -> f64 {
+    // SAFETY: sysconf has no preconditions.
+    let t = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if t > 0 {
+        t as f64
+    } else {
+        100.0
+    }
+}
+
 /// An exit status in words, with the worker's own codes named.
 pub fn describe_exit(st: std::process::ExitStatus) -> String {
-    match (st.code(), st.signal()) {
+    describe(st.code(), st.signal())
+}
+
+fn describe(code: Option<i32>, signal: Option<i32>) -> String {
+    match (code, signal) {
         (Some(c), _) => {
             let what = match c {
                 0 => " (its channel closed)",

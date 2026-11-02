@@ -53,6 +53,17 @@ fn section(rel: &str, from: &str, to: &str) -> String {
     text[start..end].to_string()
 }
 
+/// `bash <file>` for a whole install script written into the case's
+/// directory: install.sh is above the kernel's limit of one argument
+/// (`MAX_ARG_STRLEN`, 128 KiB), so never `bash -c <script>`.
+fn script_command(case: &Path, script: &str) -> Command {
+    let file = case.join("install.sh");
+    fs::write(&file, script).unwrap();
+    let mut cmd = Command::new("bash");
+    cmd.arg(file);
+    cmd
+}
+
 /// A fresh directory for one case.
 fn case_dir(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -1041,11 +1052,25 @@ exit 0"#,
         write_exec(&stub.join("sleep"), "exit 0");
         write_exec(&stub.join("chown"), "exit 0");
         write_exec(&stub.join("chattr"), "exit 0");
-        // Lab PR 223: the scanner's system account — never the host's.
+        // Lab PR 223: the scanner's system account — never the host's
+        // (review of #480, F11: the entries a real getent gives, the
+        // account install.sh creates; `id`, login.defs and /proc the
+        // case's own).
         write_exec(
             &stub.join("getent"),
-            r#"[ "$1" = passwd ] && [ "${2:-}" = northnarrow-scan ] && [ -e "$NN_TEST_DIR/scan-user" ]"#,
+            r#"[ -e "$NN_TEST_DIR/scan-user" ] || exit 2
+case $1:${2:-} in
+  passwd:northnarrow-scan|passwd:) echo "northnarrow-scan:x:990:990::/nonexistent:/usr/sbin/nologin" ;;
+  shadow:northnarrow-scan) echo "northnarrow-scan:!:19000::::::" ;;
+  *) exit 2 ;;
+esac"#,
         );
+        write_exec(
+            &stub.join("id"),
+            r#"[ "$1" = -G ] && [ "$2" = northnarrow-scan ] && [ -e "$NN_TEST_DIR/scan-user" ] && echo 990"#,
+        );
+        fs::write(case.join("login.defs"), "UID_MIN 1000\nGID_MIN 1000\n").unwrap();
+        fs::create_dir_all(case.join("proc")).unwrap();
         write_exec(
             &stub.join("useradd"),
             r#"echo "useradd $*" >> "$NN_TEST_DIR/calls"; : > "$NN_TEST_DIR/scan-user""#,
@@ -1274,6 +1299,8 @@ exit 0"#
             .env("ADMIN_SOCKET", r.join("run/admin.sock"))
             .env("PKG_RESTART_FILE", r.join("pkg-restart"))
             .env("NFT_DIRS", r.join("nonft"))
+            .env("LOGIN_DEFS", self.case.join("login.defs"))
+            .env("PROC_ROOT", self.case.join("proc"))
             .env("HEALTH_TIMEOUT", "2")
             .env("LSM_DRAIN_TIMEOUT", "2")
             .env("ADMIN_SOCKET_WAIT", "1");
@@ -1285,11 +1312,8 @@ exit 0"#
         assert_eq!(text.matches("\nrequire_root\n").count(), 1);
         let script = text.replace("\nrequire_root\n", "\n");
         let t = self.case.join(tree);
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c")
-            .arg(script)
-            .arg("install.sh")
-            .args(args)
+        let mut cmd = script_command(&self.case, &script);
+        cmd.args(args)
             .args([
                 "--without-nftables",
                 "--admin-key-out",
@@ -1894,11 +1918,8 @@ impl Lab {
     /// install.sh from a release tree (absolute path), a fresh install.
     fn install_release(&self, tree: &Path, args: &[&str]) -> Run {
         let text = read("deploy/install.sh").replace("\nrequire_root\n", "\n");
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c")
-            .arg(text)
-            .arg("install.sh")
-            .args(args)
+        let mut cmd = script_command(&self.case, &text);
+        cmd.args(args)
             .args([
                 "--without-nftables",
                 "--admin-key-out",
@@ -2132,12 +2153,8 @@ impl Lab {
     fn package(&self, args: &[&str]) -> Run {
         let text = read("deploy/install.sh").replace("\nrequire_root\n", "\n");
         let t = self.case.join("new");
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c")
-            .arg(text)
-            .arg("install.sh")
-            .args(args)
-            .env("REPO_ROOT", &t);
+        let mut cmd = script_command(&self.case, &text);
+        cmd.args(args).env("REPO_ROOT", &t);
         self.env(&mut cmd);
         self.finish(cmd)
     }
@@ -2278,27 +2295,128 @@ fn the_package_scripts_run_the_health_check() {
 }
 
 /// R14a: run `body` (a block of an install script) under bash with stub
-/// `getent`, `useradd`, `userdel` that record their calls; `present`: the
-/// accounts the host already has, `tools`: whether useradd/userdel exist.
+/// `getent`, `id`, `useradd`, `userdel` that record their calls;
+/// `present`: the accounts the host already has, `tools`: whether
+/// useradd/userdel exist. An account present is the one install.sh
+/// creates (uid and gid 990, nologin, a locked password, its own group)
+/// unless [`accounts_run_as`] gives its entries.
 fn accounts_run(case: &str, body: &str, present: &[&str], tools: bool) -> (Run, Vec<String>) {
+    let entries: Vec<(&str, Account)> = present.iter().map(|u| (*u, Account::default())).collect();
+    accounts_run_as(case, body, &entries, tools)
+}
+
+/// An existing account's entries, for the stubs (review of #480, F11).
+#[derive(Clone)]
+struct Account {
+    uid: &'static str,
+    gid: &'static str,
+    shell: &'static str,
+    /// The shadow file's password field (`None`: no shadow entry).
+    shadow: Option<&'static str>,
+    /// `id -G` (`None`: the gid alone).
+    groups: Option<&'static str>,
+}
+
+impl Default for Account {
+    fn default() -> Self {
+        Account {
+            uid: "990",
+            gid: "990",
+            shell: "/usr/sbin/nologin",
+            shadow: Some("!"),
+            groups: None,
+        }
+    }
+}
+
+/// [`accounts_run_as`] with the running agent's pid (`None`: no agent) and
+/// the processes `/proc` holds: (pid, uid, parent).
+fn accounts_run_procs(
+    case: &str,
+    body: &str,
+    present: &[(&str, Account)],
+    agent: Option<u32>,
+    procs: &[(u32, u32, u32)],
+) -> (Run, Vec<String>) {
+    let mut setup = String::new();
+    if let Some(a) = agent {
+        setup.push_str(&format!("echo {a} > \"$NN_TEST_DIR/agent.pid\"\n"));
+    }
+    for (pid, uid, ppid) in procs {
+        setup.push_str(&format!(
+            "mkdir -p \"$NN_TEST_DIR/proc/{pid}\"\n\
+             printf 'Name:\\tx\\nPPid:\\t{ppid}\\nUid:\\t{uid}\\t{uid}\\t{uid}\\t{uid}\\n' \
+             > \"$NN_TEST_DIR/proc/{pid}/status\"\n"
+        ));
+    }
+    accounts_run_as(case, &format!("{setup}{body}"), present, true)
+}
+
+fn accounts_run_as(
+    case: &str,
+    body: &str,
+    present: &[(&str, Account)],
+    tools: bool,
+) -> (Run, Vec<String>) {
     let dir = case_dir(case);
     let stub = dir.join("stub");
     fs::create_dir_all(&stub).unwrap();
-    for u in present {
-        fs::write(dir.join(format!("user.{u}")), "").unwrap();
+    for (u, a) in present {
+        fs::write(
+            dir.join(format!("user.{u}")),
+            format!("{u}:x:{}:{}::/nonexistent:{}\n", a.uid, a.gid, a.shell),
+        )
+        .unwrap();
+        if let Some(pw) = a.shadow {
+            fs::write(
+                dir.join(format!("shadow.{u}")),
+                format!("{u}:{pw}:19000::::::\n"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            dir.join(format!("groups.{u}")),
+            format!("{}\n", a.groups.unwrap_or(a.gid)),
+        )
+        .unwrap();
     }
+    fs::write(dir.join("login.defs"), "UID_MIN 1000\nGID_MIN 1000\n").unwrap();
+    fs::create_dir_all(dir.join("proc")).unwrap();
+    write_exec(
+        &stub.join("systemctl"),
+        r#"[ -e "$NN_TEST_DIR/agent.pid" ] && cat "$NN_TEST_DIR/agent.pid""#,
+    );
     write_exec(
         &stub.join("getent"),
-        r#"[ "$1" = passwd ] && [ -e "$NN_TEST_DIR/user.$2" ]"#,
+        r#"case $1 in
+  passwd) if [ $# = 1 ]; then cat "$NN_TEST_DIR"/user.* 2>/dev/null; true; else
+            [ -e "$NN_TEST_DIR/user.$2" ] && cat "$NN_TEST_DIR/user.$2"; fi ;;
+  shadow) [ -e "$NN_TEST_DIR/shadow.$2" ] && cat "$NN_TEST_DIR/shadow.$2" ;;
+  *) exit 2 ;;
+esac"#,
     );
+    write_exec(
+        &stub.join("id"),
+        r#"[ "$1" = -G ] && [ -e "$NN_TEST_DIR/groups.$2" ] && cat "$NN_TEST_DIR/groups.$2""#,
+    );
+    // the tools the check reads with
+    for t in ["awk", "cut", "cat"] {
+        if let Some(p) = ["/usr/bin", "/bin"]
+            .iter()
+            .map(|d| Path::new(d).join(t))
+            .find(|p| p.exists())
+        {
+            let _ = std::os::unix::fs::symlink(p, stub.join(t));
+        }
+    }
     if tools {
         write_exec(
             &stub.join("useradd"),
-            r#"echo "useradd $*" >> "$NN_TEST_DIR/calls"; for u; do :; done; : > "$NN_TEST_DIR/user.$u""#,
+            r#"echo "useradd $*" >> "$NN_TEST_DIR/calls"; for u; do :; done; echo "$u:x:991:991::/nonexistent:/usr/sbin/nologin" > "$NN_TEST_DIR/user.$u""#,
         );
         write_exec(
             &stub.join("userdel"),
-            r#"echo "userdel $*" >> "$NN_TEST_DIR/calls"; rm -f "$NN_TEST_DIR/user.$1""#,
+            r#"echo "userdel $*" >> "$NN_TEST_DIR/calls"; rm -f "$NN_TEST_DIR/user.$1" "$NN_TEST_DIR/shadow.$1" "$NN_TEST_DIR/groups.$1""#,
         );
     }
     // `command -v` must not find the host's own tools
@@ -2348,7 +2466,219 @@ fn install_accounts_body() -> String {
         .take_while(|l| l.starts_with("ensure_system_user") || l.starts_with("    \""))
         .collect::<Vec<_>>()
         .join("\n");
-    format!("SCAN_USER=northnarrow-scan\nWORKER_USER=northnarrow-worker\n{block}\n{calls}")
+    format!("{}\n{block}\n{calls}", check_accounts_body())
+}
+
+/// Review of #480 (F11): install.sh's check of the accounts that already
+/// exist, and its two calls.
+fn check_accounts_body() -> String {
+    let text = read("deploy/install.sh");
+    let block = block("deploy/install.sh", "system_user_check");
+    let after =
+        &text[text.find("# <<< system_user_check").unwrap() + "# <<< system_user_check".len()..];
+    let calls: String = after
+        .lines()
+        .skip(1)
+        .take_while(|l| l.starts_with("check_system_user"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        calls,
+        "check_system_user \"$SCAN_USER\"\ncheck_system_user \"$WORKER_USER\""
+    );
+    format!(
+        "SCAN_USER=northnarrow-scan\nWORKER_USER=northnarrow-worker\n\
+         LOGIN_DEFS=$NN_TEST_DIR/login.defs\nPROC_ROOT=$NN_TEST_DIR/proc\n{block}\n{calls}"
+    )
+}
+
+/// Review of #480 (F11): an account of the agent's names that exists is
+/// used as it is, so install.sh refuses one it would not have created —
+/// root's ids, a login-range uid or gid, a login shell, a usable password
+/// or none, another group — with a message that names what is wrong, and
+/// before anything on the host changes; the account it creates passes,
+/// and so does one without a shadow entry.
+#[test]
+fn install_refuses_an_existing_account_it_would_not_have_created() {
+    let body = check_accounts_body();
+    let ok = Account::default();
+    let scan = Account {
+        uid: "989",
+        gid: "989",
+        ..ok.clone()
+    };
+    let (r, _) = accounts_run_as(
+        "accounts-check-ok",
+        &body,
+        &[
+            ("northnarrow-scan", scan),
+            ("northnarrow-worker", ok.clone()),
+        ],
+        true,
+    );
+    assert!(r.stdout.contains("RESULT ok"), "{r:#?}");
+    let (r, _) = accounts_run_as(
+        "accounts-check-false-no-shadow",
+        &body,
+        &[(
+            "northnarrow-worker",
+            Account {
+                shell: "/bin/false",
+                shadow: None,
+                ..ok.clone()
+            },
+        )],
+        true,
+    );
+    assert!(r.stdout.contains("RESULT ok"), "{r:#?}");
+    // an upgrade: the running agent's worker runs as the account
+    let (r, _) = accounts_run_procs(
+        "accounts-check-agent-child",
+        &body,
+        &[("northnarrow-worker", ok.clone())],
+        Some(4000),
+        &[(4001, 990, 4000)],
+    );
+    assert!(r.stdout.contains("RESULT ok"), "{r:#?}");
+    // another process as the account (no agent, or not its child), a uid
+    // another account shares
+    for (case, agent, procs, why) in [
+        (
+            "foreign-process",
+            Some(4000),
+            vec![(4001, 990, 4000), (4100, 990, 1)],
+            "process 4100 runs as it and is not the agent's child",
+        ),
+        (
+            "process-no-agent",
+            None,
+            vec![(4001, 990, 4000)],
+            "process 4001 runs as it",
+        ),
+    ] {
+        let (r, _) = accounts_run_procs(
+            &format!("accounts-check-{case}"),
+            &body,
+            &[("northnarrow-worker", ok.clone())],
+            agent,
+            &procs,
+        );
+        assert_eq!(r.status, 1, "{case}: {r:#?}");
+        assert!(r.stderr.contains(why), "{case}: {r:#?}");
+    }
+    let (r, _) = accounts_run_as(
+        "accounts-check-shared-uid",
+        &body,
+        &[
+            ("northnarrow-worker", ok.clone()),
+            ("northnarrow-scan", ok.clone()),
+        ],
+        true,
+    );
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert!(
+        r.stderr.contains("the existing account northnarrow-scan")
+            && r.stderr.contains("uid 990 shared with northnarrow-worker"),
+        "{r:#?}"
+    );
+    let bad: [(&str, Account, &str); 8] = [
+        (
+            "root-uid",
+            Account {
+                uid: "0",
+                ..ok.clone()
+            },
+            "root's",
+        ),
+        (
+            "root-gid",
+            Account {
+                gid: "0",
+                ..ok.clone()
+            },
+            "root's",
+        ),
+        (
+            "login-uid",
+            Account {
+                uid: "1001",
+                ..ok.clone()
+            },
+            "not a system account",
+        ),
+        (
+            "login-gid",
+            Account {
+                gid: "1001",
+                groups: Some("1001"),
+                ..ok.clone()
+            },
+            "not a system account",
+        ),
+        (
+            "shell",
+            Account {
+                shell: "/bin/bash",
+                ..ok.clone()
+            },
+            "its shell is '/bin/bash'",
+        ),
+        (
+            "password",
+            Account {
+                shadow: Some("$6$salt$hash"),
+                ..ok.clone()
+            },
+            "a usable password",
+        ),
+        (
+            "empty-password",
+            Account {
+                shadow: Some(""),
+                ..ok.clone()
+            },
+            "a usable password",
+        ),
+        (
+            "groups",
+            Account {
+                groups: Some("990 27"),
+                ..ok.clone()
+            },
+            "groups '990 27'",
+        ),
+    ];
+    for (case, account, why) in bad {
+        for who in ["northnarrow-worker", "northnarrow-scan"] {
+            let (r, _) = accounts_run_as(
+                &format!("accounts-check-{case}-{who}"),
+                &body,
+                &[(who, account.clone())],
+                true,
+            );
+            assert_eq!(r.status, 1, "{case} {who}: {r:#?}");
+            assert!(!r.stdout.contains("RESULT ok"), "{case} {who}: {r:#?}");
+            assert!(
+                r.stderr.contains(&format!(
+                    "the existing account {who} is not the unprivileged"
+                )) && r.stderr.contains(why)
+                    && r.stderr.contains("Refused"),
+                "{case} {who}: {r:#?}"
+            );
+            assert!(r.calls.is_empty(), "nothing changed: {r:#?}");
+        }
+    }
+    // the check runs before anything on the host changes: in the
+    // preflight, before the transaction and the stop of a running install
+    let text = read("deploy/install.sh");
+    let at = text.find("check_system_user \"$WORKER_USER\"").unwrap();
+    assert!(
+        at < text
+            .find("# Lab PR 220: replacing an install is a transaction")
+            .unwrap()
+    );
+    assert!(at < text.find("\nstop_nn_unit() {").unwrap());
+    assert!(at > text.find("\nrequire_nft\n").unwrap());
 }
 
 /// R14a: install.sh creates the workers' account as it creates the

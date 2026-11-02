@@ -16,8 +16,8 @@
 use std::os::fd::RawFd;
 
 use nn_proto::ipc::{
-    decode, encode, Answer, FromWorker, QnameIn, QnameOut, Request, Response, SniOut, TlsOut,
-    ToWorker, WorkerHello, WorkerKind, IPC_VERSION, MAX_ALPN, MAX_FRAME, MAX_TLS_FIELD,
+    alpn_display, decode, encode, Answer, FromWorker, QnameIn, QnameOut, Refusal, Request,
+    Response, SniOut, TlsOut, ToWorker, WorkerHello, WorkerKind, IPC_VERSION, MAX_ALPN, MAX_FRAME,
 };
 
 use super::transport::{self, Recv};
@@ -127,14 +127,14 @@ fn send(fd: RawFd, msg: &FromWorker) -> Result<(), i32> {
         EXIT_PROTOCOL
     })?;
     // a closed channel: the core is gone, and so is this worker
-    transport::send(fd, &bytes).map_err(|_| 0)
+    transport::send_to(fd, &bytes).map_err(|_| 0)
 }
 
 /// Answer requests until the channel closes.
 pub fn serve_loop(fd: RawFd) -> i32 {
     let mut buf = vec![0u8; MAX_FRAME];
     loop {
-        let n = match transport::recv(fd, &mut buf, false) {
+        let n = match transport::recv_from(fd, &mut buf) {
             Ok(Recv::Packet(n)) => n,
             Ok(Recv::Closed) | Err(_) => return 0,
             Ok(Recv::Empty) => continue,
@@ -159,8 +159,8 @@ pub fn serve_loop(fd: RawFd) -> i32 {
 
 /// The answer to one request (the parsers run here, and only here).
 pub fn answer(req: &Request) -> Answer {
-    if let Err(v) = req.check() {
-        return Answer::Refused(v.to_string());
+    if req.check().is_err() {
+        return Answer::Refused(Refusal::OutOfBounds);
     }
     match req {
         Request::Ping => Answer::Pong,
@@ -204,10 +204,12 @@ fn tls(bytes: &[u8]) -> TlsOut {
                 t::Sni::Host(h) => SniOut::Host(h),
                 t::Sni::NonConforming => SniOut::NonConforming,
             },
-            // the protocol's bounds: no empty name, at most MAX_ALPN
+            // the protocol's bounds: no empty name, printable ASCII
+            // (escaped), at most MAX_TLS_FIELD bytes each, MAX_ALPN names
             alpn: t::extract_alpn(&hello)
-                .into_iter()
-                .filter(|p| !p.is_empty() && p.len() <= MAX_TLS_FIELD)
+                .iter()
+                .filter(|p| !p.is_empty())
+                .map(|p| alpn_display(p.as_bytes()))
                 .take(MAX_ALPN)
                 .collect(),
         },
@@ -222,7 +224,7 @@ fn debug_crash() -> Answer {
 
 #[cfg(not(feature = "debug-trigger"))]
 fn debug_crash() -> Answer {
-    Answer::Refused("debug faults exist only in lab builds".into())
+    Answer::Refused(Refusal::DebugOnly)
 }
 
 /// `debug-trigger` builds: the lab's worker hang — it stops answering
@@ -232,7 +234,7 @@ fn debug_crash() -> Answer {
 fn debug_hang() -> Answer {
     let mut buf = vec![0u8; MAX_FRAME];
     loop {
-        if let Ok(Recv::Closed) | Err(_) = transport::recv(super::spawn::IPC_FD, &mut buf, false) {
+        if let Ok(Recv::Closed) | Err(_) = transport::recv_from(super::spawn::IPC_FD, &mut buf) {
             std::process::exit(0);
         }
     }
@@ -240,7 +242,7 @@ fn debug_hang() -> Answer {
 
 #[cfg(not(feature = "debug-trigger"))]
 fn debug_hang() -> Answer {
-    Answer::Refused("debug faults exist only in lab builds".into())
+    Answer::Refused(Refusal::DebugOnly)
 }
 
 #[cfg(test)]

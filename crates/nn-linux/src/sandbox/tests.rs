@@ -55,8 +55,8 @@ fn install_prepared(prog: &seccompiler::BpfProgram) -> bool {
 fn the_parse_allowlist_keeps_what_the_plan_lists_and_nothing_to_escape_with() {
     let names = Allowlist::parse_worker(3, 1).names();
     for kept in [
-        "recvmsg",
-        "sendmsg",
+        "recvfrom",
+        "sendto",
         "write",
         "close",
         "futex",
@@ -74,8 +74,34 @@ fn the_parse_allowlist_keeps_what_the_plan_lists_and_nothing_to_escape_with() {
         assert!(names.contains(&kept), "{kept} kept");
     }
     for never in [
-        "open", "openat", "socket", "connect", "execve", "execveat", "clone", "clone3", "fork",
-        "kill", "ptrace", "bpf", "prctl", "read", "setuid", "capset",
+        "open",
+        "openat",
+        "socket",
+        "socketpair",
+        "connect",
+        "execve",
+        "execveat",
+        "clone",
+        "clone3",
+        "fork",
+        "unshare",
+        "kill",
+        "tkill",
+        "rt_sigqueueinfo",
+        "pidfd_send_signal",
+        "ptrace",
+        "bpf",
+        "prctl",
+        "read",
+        "setuid",
+        "capset",
+        "recvmsg",
+        "sendmsg",
+        "pkey_mprotect",
+        "io_uring_setup",
+        "keyctl",
+        "perf_event_open",
+        "userfaultfd",
     ] {
         assert!(!names.contains(&never), "{never} not kept");
     }
@@ -107,8 +133,38 @@ fn allowed_calls_run_under_the_parse_filter() {
                 );
                 libc::syscall(libc::SYS_munmap, m, 4096);
                 libc::syscall(libc::SYS_getrandom, buf.as_mut_ptr(), buf.len(), 0);
-                // recvmsg on the channel's number (EBADF here): kept
-                libc::syscall(libc::SYS_recvmsg, 3, std::ptr::null_mut::<u8>(), 0);
+                // the worker's own receive and send on the channel's
+                // number, with its flags and no address (EBADF here): kept
+                libc::syscall(
+                    libc::SYS_recvfrom,
+                    3,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    crate::worker::transport::WORKER_RECV_FLAGS,
+                    0usize,
+                    0usize,
+                );
+                libc::syscall(
+                    libc::SYS_sendto,
+                    3,
+                    buf.as_ptr(),
+                    buf.len(),
+                    crate::worker::transport::WORKER_SEND_FLAGS,
+                    0usize,
+                    0usize,
+                );
+                // a writable mapping made read-only (no PROT_EXEC): kept
+                let m = libc::syscall(
+                    libc::SYS_mmap,
+                    0,
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                libc::syscall(libc::SYS_mprotect, m, 4096, libc::PROT_READ);
+                libc::syscall(libc::SYS_munmap, m, 4096);
             }
             7
         },
@@ -120,7 +176,7 @@ fn allowed_calls_run_under_the_parse_filter() {
 fn every_escape_kills_the_process() {
     let prog = parse_filter(3);
     type Body = fn() -> i32;
-    let cases: [(&str, Body); 9] = [
+    let cases: Vec<(&str, Body)> = vec![
         ("openat", || {
             // SAFETY: plain syscall.
             unsafe {
@@ -181,6 +237,129 @@ fn every_escape_kills_the_process() {
         ("bpf", || {
             // SAFETY: plain syscall.
             unsafe { libc::syscall(libc::SYS_bpf, 0, std::ptr::null::<u8>(), 0) };
+            0
+        }),
+        // review of #480 (F5): W^X — a writable mapping made executable
+        ("mprotect RW then RX", || {
+            // SAFETY: plain syscalls on a mapping of the child's own.
+            unsafe {
+                let m = libc::syscall(
+                    libc::SYS_mmap,
+                    0,
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                libc::syscall(
+                    libc::SYS_mprotect,
+                    m,
+                    4096,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                );
+            }
+            0
+        }),
+        ("pkey_mprotect", || {
+            // SAFETY: plain syscall (no mapping: EINVAL if it ran).
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pkey_mprotect,
+                    0,
+                    4096,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                    -1,
+                )
+            };
+            0
+        }),
+        // review of #480 (F5): a signal to another process by any call
+        ("tgkill another process", || {
+            // SAFETY: plain syscall (signal 0, never delivered).
+            unsafe { libc::syscall(libc::SYS_tgkill, 1, 1, 0) };
+            0
+        }),
+        ("tkill", || {
+            // SAFETY: plain syscall (signal 0).
+            unsafe { libc::syscall(libc::SYS_tkill, 1, 0) };
+            0
+        }),
+        ("rt_sigqueueinfo", || {
+            // SAFETY: plain syscall (no info: EFAULT if it ran).
+            unsafe { libc::syscall(libc::SYS_rt_sigqueueinfo, 1, 0, 0) };
+            0
+        }),
+        ("pidfd_send_signal", || {
+            // SAFETY: plain syscall (no descriptor: EBADF if it ran).
+            unsafe { libc::syscall(libc::SYS_pidfd_send_signal, -1, 0, 0, 0) };
+            0
+        }),
+        // review of #480 (F8): no msghdr from the worker
+        ("sendmsg on the channel", || {
+            // SAFETY: plain syscall.
+            unsafe { libc::syscall(libc::SYS_sendmsg, 3, std::ptr::null::<u8>(), 0) };
+            0
+        }),
+        ("recvfrom with an address", || {
+            let mut buf = [0u8; 8];
+            let mut sa = [0u8; 16];
+            let mut len: libc::socklen_t = 16;
+            // SAFETY: plain syscall into local buffers.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_recvfrom,
+                    3,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    crate::worker::transport::WORKER_RECV_FLAGS,
+                    sa.as_mut_ptr(),
+                    &mut len,
+                )
+            };
+            0
+        }),
+        ("sendto with other flags", || {
+            let buf = [0u8; 8];
+            // SAFETY: plain syscall.
+            unsafe { libc::syscall(libc::SYS_sendto, 3, buf.as_ptr(), 8, 0, 0usize, 0usize) };
+            0
+        }),
+        // review of #480 (F7): what only the filter refuses on every lab
+        // kernel
+        ("unshare a user namespace", || {
+            // SAFETY: plain syscall.
+            unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUSER) };
+            0
+        }),
+        ("io_uring_setup", || {
+            // SAFETY: plain syscall (no params: EFAULT if it ran).
+            unsafe { libc::syscall(libc::SYS_io_uring_setup, 1, 0) };
+            0
+        }),
+        ("keyctl", || {
+            // SAFETY: plain syscall (KEYCTL_GET_KEYRING_ID of the session).
+            unsafe { libc::syscall(libc::SYS_keyctl, 0, -3, 0) };
+            0
+        }),
+        ("perf_event_open", || {
+            // SAFETY: plain syscall (no attr: EFAULT if it ran).
+            unsafe { libc::syscall(libc::SYS_perf_event_open, 0, 0, -1, -1, 0) };
+            0
+        }),
+        ("userfaultfd", || {
+            // SAFETY: plain syscall.
+            unsafe { libc::syscall(libc::SYS_userfaultfd, 0) };
+            0
+        }),
+        ("a UDP socket", || {
+            // SAFETY: plain syscall.
+            unsafe { libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_DGRAM, 0) };
+            0
+        }),
+        ("a UNIX socket (by path)", || {
+            // SAFETY: plain syscall.
+            unsafe { libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0) };
             0
         }),
     ];
@@ -387,11 +566,16 @@ fn landlock_denies_tcp_and_signals_where_the_kernel_has_them() {
 /// The level declared on each lab kernel's ABI (5.15: 1, 6.1: 2, 6.8: 4,
 /// 6.12: 6), and none without Landlock or with nothing enforced.
 #[test]
-fn the_level_is_declared_from_the_kernels_abi() {
+fn the_level_is_declared_from_what_was_measured() {
     use nn_proto::ipc::LandlockEnforced::{Full, None as NotEnforced, Partial};
-    let decl = |abi, enforced| {
+    let all = Measured {
+        fs: true,
+        net: true,
+        scope: true,
+    };
+    let decl = |abi, enforced, m: Measured| {
         let mut l = SandboxLevel::default();
-        declare(&mut l, abi, enforced);
+        declare(&mut l, abi, enforced, m);
         (
             l.landlock_abi,
             l.landlock,
@@ -400,13 +584,65 @@ fn the_level_is_declared_from_the_kernels_abi() {
             l.scoped,
         )
     };
-    assert_eq!(decl(0, Full), (0, NotEnforced, false, false, false));
-    assert_eq!(decl(1, Partial), (1, Partial, true, false, false));
-    assert_eq!(decl(2, Partial), (2, Partial, true, false, false));
-    assert_eq!(decl(3, Partial), (3, Partial, true, false, false));
-    assert_eq!(decl(4, Partial), (4, Partial, true, true, false));
-    assert_eq!(decl(5, Partial), (5, Partial, true, true, false));
-    assert_eq!(decl(6, Full), (6, Full, true, true, true));
-    assert_eq!(decl(9, Full), (9, Full, true, true, true));
-    assert_eq!(decl(4, NotEnforced), (4, NotEnforced, false, false, false));
+    // what was measured is declared, under an enforced ruleset only
+    assert_eq!(decl(0, Full, all), (0, NotEnforced, false, false, false));
+    assert_eq!(
+        decl(4, NotEnforced, all),
+        (4, NotEnforced, false, false, false)
+    );
+    assert_eq!(decl(6, Full, all), (6, Full, true, true, true));
+    let fs_only = Measured {
+        fs: true,
+        ..Measured::default()
+    };
+    assert_eq!(decl(1, Partial, fs_only), (1, Partial, true, false, false));
+    // a measurement below the ABI is declared as measured (the core then
+    // refuses it: `nn_proto::ipc::check_hello`)
+    assert_eq!(decl(4, Partial, fs_only), (4, Partial, true, false, false));
+    assert_eq!(
+        decl(9, Full, Measured::default()),
+        (9, Full, false, false, false)
+    );
+}
+
+/// Review of #480 (F7): the measurement itself, in a restricted child on
+/// this kernel — what its ABI gives, and nothing without the ruleset.
+#[test]
+fn landlock_is_measured_where_the_kernel_has_it() {
+    let abi = kernel_landlock_abi();
+    let pack = |m: Measured| i32::from(m.fs) | i32::from(m.net) << 1 | i32::from(m.scope) << 2;
+    let restricted = in_child(
+        || true,
+        || {
+            let mut level = SandboxLevel::default();
+            if landlock_restrict(&mut level).is_err() {
+                return 100;
+            }
+            i32::from(level.fs_denied)
+                | i32::from(level.net_denied) << 1
+                | i32::from(level.scoped) << 2
+        },
+    );
+    assert!(libc::WIFEXITED(restricted), "status {restricted:#x}");
+    let want = if abi == 0 {
+        0
+    } else {
+        pack(Measured {
+            fs: abi >= 1,
+            net: abi >= 4,
+            scope: abi >= 6,
+        })
+    };
+    assert_eq!(libc::WEXITSTATUS(restricted), want, "ABI {abi}");
+    // without the ruleset nothing is refused
+    let open = in_child(
+        || true,
+        || {
+            let peer = scope_peer();
+            let m = measure_landlock(peer.as_ref());
+            i32::from(m.fs) | i32::from(m.net) << 1 | i32::from(m.scope) << 2
+        },
+    );
+    assert!(libc::WIFEXITED(open), "status {open:#x}");
+    assert_eq!(libc::WEXITSTATUS(open), 0);
 }

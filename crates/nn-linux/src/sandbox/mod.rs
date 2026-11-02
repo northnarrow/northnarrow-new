@@ -20,8 +20,11 @@
 //!    the running kernel's ABI handles, with no rule (no path can be
 //!    opened, created, removed or executed); TCP bind and connect with no
 //!    rule (ABI ≥ 4); signals and abstract UNIX sockets scoped to its own
-//!    domain (ABI ≥ 6). What the kernel enforced is declared — ABI 1 on
-//!    5.15, 2 on 6.1, 4 on 6.8, 6 on 6.12 — never assumed (plan §5 risk 8);
+//!    domain (ABI ≥ 6). What the kernel enforced is **measured** after the
+//!    ruleset binds the worker — a directory opened, a TCP connect to
+//!    loopback, a connect to an abstract socket made before the ruleset
+//!    (review of #480, F7) — and declared: ABI 1 on 5.15, 2 on 6.1, 4 on
+//!    6.8, 6 on 6.12, never assumed (plan §5 risk 8);
 //! 5. last, the seccomp allowlist ([`seccomp`], the `seccompiler` crate):
 //!    any other system call kills the process.
 //!
@@ -322,9 +325,135 @@ fn measure() -> Result<SandboxLevel, SandboxError> {
 /// decides what is enforced (best effort), and the level says which.
 const LANDLOCK_ASK: ABI = ABI::V9;
 
-/// Step 4: Landlock, best effort, declared.
+/// What Landlock refused once it bound the calling thread, measured (review
+/// of #480, F7: not derived from the ABI's number).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Measured {
+    /// A directory (`/`, readable by every account) could not be opened.
+    pub fs: bool,
+    /// A TCP connect to loopback was refused with `EACCES` (Landlock's own
+    /// errno; a closed port says `ECONNREFUSED`).
+    pub net: bool,
+    /// A connect to an abstract socket listening outside the domain (made
+    /// before the ruleset) was refused with `EPERM`.
+    pub scope: bool,
+}
+
+/// The peer of the scope's probe: an abstract listener this thread makes
+/// before it restricts itself, so outside its Landlock domain.
+struct ScopePeer {
+    fd: RawFd,
+    addr: libc::sockaddr_un,
+    len: libc::socklen_t,
+}
+
+impl Drop for ScopePeer {
+    fn drop(&mut self) {
+        // SAFETY: our own descriptor.
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+fn abstract_addr(name: &[u8]) -> (libc::sockaddr_un, libc::socklen_t) {
+    // SAFETY: an all-zero sockaddr_un is valid.
+    let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let n = name.len().min(sa.sun_path.len() - 1);
+    for (dst, src) in sa.sun_path.iter_mut().skip(1).zip(name.iter().take(n)) {
+        *dst = *src as libc::c_char;
+    }
+    let len = std::mem::size_of::<libc::sa_family_t>() + 1 + n;
+    (sa, len as libc::socklen_t)
+}
+
+fn scope_peer() -> Option<ScopePeer> {
+    // a name of its own: this process and the time
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = format!("nn-landlock-probe-{}-{t}", std::process::id());
+    let (addr, len) = abstract_addr(name.as_bytes());
+    // SAFETY: socket, bind and listen on our own descriptor and address.
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return None;
+        }
+        let peer = ScopePeer { fd, addr, len };
+        if libc::bind(fd, (&peer.addr as *const libc::sockaddr_un).cast(), len) != 0
+            || libc::listen(fd, 1) != 0
+        {
+            return None;
+        }
+        Some(peer)
+    }
+}
+
+fn errno() -> i32 {
+    io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// Measure what the domain the calling thread is in refuses.
+fn measure_landlock(peer: Option<&ScopePeer>) -> Measured {
+    // SAFETY (each block): plain system calls on descriptors of our own,
+    // closed at once; static or local addresses.
+    let fs = unsafe {
+        let fd = libc::open(
+            c"/".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
+        if fd >= 0 {
+            libc::close(fd);
+            false
+        } else {
+            errno() == libc::EACCES
+        }
+    };
+    let net = unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            false
+        } else {
+            let sa = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 1u16.to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(std::net::Ipv4Addr::LOCALHOST).to_be(),
+                },
+                sin_zero: [0; 8],
+            };
+            let rc = libc::connect(
+                fd,
+                (&sa as *const libc::sockaddr_in).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            let refused = rc != 0 && errno() == libc::EACCES;
+            libc::close(fd);
+            refused
+        }
+    };
+    let scope = match peer {
+        None => false,
+        Some(p) => unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            if fd < 0 {
+                false
+            } else {
+                let rc = libc::connect(fd, (&p.addr as *const libc::sockaddr_un).cast(), p.len);
+                let refused = rc != 0 && errno() == libc::EPERM;
+                libc::close(fd);
+                refused
+            }
+        },
+    };
+    Measured { fs, net, scope }
+}
+
+/// Step 4: Landlock, best effort; what it refuses measured, then declared.
 fn landlock_restrict(level: &mut SandboxLevel) -> Result<(), SandboxError> {
     let fail = |e: landlock::RulesetError| SandboxError::Step("landlock", e.to_string());
+    let peer = scope_peer();
     let status = landlock::Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(LANDLOCK_ASK))
@@ -346,15 +475,18 @@ fn landlock_restrict(level: &mut SandboxLevel) -> Result<(), SandboxError> {
         RulesetStatus::PartiallyEnforced => LandlockEnforced::Partial,
         RulesetStatus::NotEnforced => LandlockEnforced::None,
     };
-    declare(level, abi, enforced);
+    let measured = measure_landlock(peer.as_ref());
+    drop(peer);
+    declare(level, abi, enforced, measured);
     Ok(())
 }
 
-/// What a Landlock ruleset that handles every right the crate knows, with
-/// no rule, denies at the kernel's `abi` and `enforced` state: files from
-/// ABI 1, TCP from 4, signals and abstract sockets from 6 — declared from
-/// the ABI the kernel gave, never assumed.
-pub fn declare(level: &mut SandboxLevel, abi: u8, enforced: LandlockEnforced) {
+/// The level declared: the kernel's `abi`, the crate's `enforced` state,
+/// and what was `measured` refused. A refusal measured without Landlock
+/// (no ABI, or the ruleset not enforced) is not Landlock's and is not
+/// declared as such; what the core requires of each ABI is its check
+/// (`nn_proto::ipc::check_hello`).
+pub fn declare(level: &mut SandboxLevel, abi: u8, enforced: LandlockEnforced, measured: Measured) {
     level.landlock_abi = abi;
     level.landlock = if abi == 0 {
         LandlockEnforced::None
@@ -362,9 +494,9 @@ pub fn declare(level: &mut SandboxLevel, abi: u8, enforced: LandlockEnforced) {
         enforced
     };
     let on = level.landlock != LandlockEnforced::None;
-    level.fs_denied = on && abi >= 1;
-    level.net_denied = on && abi >= 4;
-    level.scoped = on && abi >= 6;
+    level.fs_denied = on && measured.fs;
+    level.net_denied = on && measured.net;
+    level.scoped = on && measured.scope;
 }
 
 /// The Landlock ABI of the running kernel, as `landlock_create_ruleset`'s

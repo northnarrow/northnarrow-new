@@ -31,14 +31,20 @@ moved by R14.
 2. `socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC)`; then `fork`.
 3. In the child, between `fork` and `exec`, async-signal-safe system
    calls only: the worker's end of the channel on descriptor 3,
-   `setgroups(0)`, `setresgid`, `setresuid` (raw system calls: the child
-   has one thread), `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG(SIGKILL)` (after
-   the uid change, which clears it) and a check that the core still lives,
-   then every descriptor above 3 marked close-on-exec
+   `oom_score_adj` 1000 and `nice` 10 (the first the OOM killer takes,
+   the last the scheduler serves — while the child may still lower its
+   own score; review of #480, F12), `setgroups(0)`, `setresgid`,
+   `setresuid` (raw system calls: the child has one thread),
+   `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG(SIGKILL)` (after the uid
+   change, which clears it) and a check that the core still lives, then
+   every descriptor above 3 marked close-on-exec
    (`close_range(4, ~0, CLOSE_RANGE_CLOEXEC)`: the image's descriptor is
    resolved by `execve` before the close happens). The environment is
-   empty, the directory `/`, stdin and stdout `/dev/null`, stderr the
-   agent's (its journal).
+   empty, the directory `/`, stdin and stdout `/dev/null`, stderr a pipe
+   the supervisor reads (§6; F4: never the agent's journal directly).
+   `PR_SET_PDEATHSIG` belongs to the thread that forked: a worker is
+   started from the supervisor's own thread only (`nn-workers`, which
+   lives as long as the agent); `ImageLauncher` refuses any other.
 4. `execve("/proc/self/fd/N", ["northnarrow-agent", "--worker", "parse",
    "--ipc-fd", "3"])`.
 5. The worker's `main` sees `--worker` before anything else of the
@@ -72,19 +78,32 @@ upgrade unlinks it). Any one fact off and R004 judges the exec as before.
    ambient and bounding sets one capability at a time), the flags, the
    limits — while `/proc` and the system calls that tell are still there;
 4. Landlock (the `landlock` crate, best effort, the newest ABI it knows
-   asked for): what the running kernel's ABI enforced is declared —
+   asked for), then **measured** (review of #480, F7): an abstract UNIX
+   listener is made before the ruleset; after `restrict_self` the worker
+   tries `open("/")` (`EACCES`: the files are denied), a TCP connect to
+   `127.0.0.1:1` (`EACCES`: TCP is denied) and a connect to its own
+   listener (`EPERM`: the scope holds). What it declares —
    `SandboxLevel { landlock_abi, landlock: full|partial|none, fs_denied,
-   net_denied, scoped }`. Ubuntu 22.04's 5.15: ABI 1; Debian 12's 6.1: 2;
-   Ubuntu 24.04's 6.8: 4; Debian 13's 6.12: 6 — when Landlock is in the
-   kernel's `lsm=` (0 otherwise);
+   net_denied, scoped }` — is what was both asked of the kernel and seen
+   to hold. Ubuntu 22.04's 5.15: ABI 1; Debian 12's 6.1: 2; Ubuntu 24.04's
+   6.8: 4; Debian 13's 6.12: 6 — when Landlock is in the kernel's `lsm=`
+   (0 otherwise);
 5. last, the seccomp allowlist (the `seccompiler` crate; kill the process
-   on any other call). The parse worker keeps: `recvmsg` and `sendmsg` on
-   descriptor 3, `write` to descriptor 2, `brk`, `mmap`/`mprotect` without
-   `PROT_EXEC`, `munmap`, `mremap`, `madvise`, `futex`, `close`,
-   `clock_gettime`, `getrandom`, `rt_sigreturn`, `rt_sigprocmask`,
-   `sigaltstack`, `restart_syscall`, `sched_yield`, `getpid`, `gettid`,
-   `tgkill` of itself (an abort), `exit`, `exit_group`. Another
-   architecture's numbers and x86_64's x32 numbers match no rule.
+   on any other call). The parse worker keeps: `recvfrom` on descriptor 3
+   with the flags `MSG_TRUNC` and no address, `sendto` on descriptor 3
+   with `MSG_NOSIGNAL` and no address (F8: no `msghdr`, so no
+   `SCM_RIGHTS` can leave the worker), `write` to descriptor 2, `brk`,
+   `mmap`/`mprotect` without `PROT_EXEC`, `munmap`, `mremap`, `madvise`,
+   `futex`, `close`, `clock_gettime`, `getrandom`, `rt_sigreturn`,
+   `rt_sigprocmask`, `sigaltstack`, `restart_syscall`, `sched_yield`,
+   `getpid`, `gettid`, `tgkill` of itself (an abort), `exit`,
+   `exit_group`. Another architecture's numbers and x86_64's x32 numbers
+   match no rule. Some calls only the filter refuses on every lab kernel
+   — a UNIX socket by path (the D-Bus bus), UDP, a user namespace,
+   `io_uring_setup`, `keyctl`, `perf_event_open`, `userfaultfd`,
+   `pkey_mprotect`, `tkill`, `rt_sigqueueinfo`, `pidfd_send_signal`
+   (Landlock has no right for them on these ABIs, or the distribution's
+   settings decide): the harness asserts each one killed (§7).
 
 The core takes no Landlock ruleset (it acts on any path), and seccomp only
 per thread in R14c.
@@ -130,27 +149,58 @@ core (`PR_SET_PDEATHSIG`).
   The core refuses a version, a kind or a pid it did not start, another
   account, a group, no seccomp filter, no `no_new_privs`, a dumpable
   process, any capability, a core or process limit above 0, a Landlock
-  level the declared ABI cannot give. Landlock itself is declared, not
-  required.
+  level the declared ABI cannot give. Review of #480 (F7): the declared
+  ABI must be the kernel's as the core reads it (capped at the newest the
+  worker's build knows, 9), and every right that ABI gives must be
+  measured — files from 1, TCP from 4, the scope from 6: a worker on a
+  kernel with Landlock that is not under it is refused. The core then
+  reads the worker's `/proc/<pid>/status` itself: the four uids and gids
+  the account's, no supplementary group, `NoNewPrivs 1`, `Seccomp 2`, the
+  inheritable, permitted, effective and ambient sets empty — the kernel's
+  view, not only the worker's word.
 - Requests carry ids the core chose, strictly increasing; a worker answers
   the request it was sent, once. An answer to another id, a second hello, a
   packet between requests (a flood), an answer of another kind, an answer
   out of its bounds (a count, a length, a character outside the result's
   alphabet) is a violation: the worker is killed. The core never parses the
   input itself, so it cannot compare a result with its own; it bounds what
-  a lying worker hands it.
+  a lying worker hands it. An ALPN name is printable ASCII (the worker
+  writes any other byte `\xHH`, F9); a refusal is one of a closed set
+  (`Refusal`), never free text. The checks read bytes, never slice a
+  `&str` at an offset a worker chose (F1: a JA4 with a two-byte character
+  across byte 23 panicked the core): `clippy::string_slice` and
+  `clippy::indexing_slicing` are denied in the module, and the `ipc_check`
+  fuzz target holds every check to "no panic" and to its promises.
+- The core never blocks on a worker (F2): before each request the core's
+  send queue must be empty (`SIOCOUTQ`: a worker that does not read what
+  it was sent is a violation, `Unread`), and the send does not wait
+  (`MSG_DONTWAIT`: a full queue is the same violation).
 
 ## 6. The supervisor (`nn_linux::worker::supervisor`)
 
 One thread (`nn-workers`) starts what is due, reads a starting worker's
 hello (5 s), notices a death, a packet nobody asked for, and pings an idle
 worker every 10 s (2 s deadline). Requests run on the caller's thread, one
-at a time per worker, with the caller's deadline.
+at a time per worker, with the caller's deadline. The status the
+heartbeat, the admin socket and the manifest read is a snapshot each pass
+publishes: it never waits on a request in flight (F2).
 
 A failure — a death, a violation, a hang, a hello late or refused — kills
-the worker, takes its pid out of `PROTECTED_PIDS` (before the reap, so the
-pid cannot be reused meanwhile), reaps it and starts the next one after a
-backoff (at once, then 1, 2, 4… s, at most 60 s). Five failures in a row
+the worker, takes its pid out of `PROTECTED_PIDS` and only then reaps it
+(F3): a death is seen with `waitid(WNOWAIT)`, which leaves the zombie
+holding the pid, so no new process can take a pid the hooks still defend.
+A pid that cannot be taken out stays unreaped (its zombie keeps the pid)
+and is a signed degradation; the supervisor tries again on each pass. The
+next worker starts after a backoff (at once, then 1, 2, 4… s, at most
+60 s).
+
+What a worker writes to stderr reaches the journal through the
+supervisor (F4): each line prefixed `worker parse:`, escaped (a byte
+outside printable ASCII, and the backslash, as `\xHH`), cut at 200 bytes,
+at most 20 lines a minute (the rest counted in one line when the minute is
+over). A worker that burns half a CPU over 10 s while it is asked nothing
+but pings is a hang (F12: what the ping does not find — it answers in
+time and spins between them): killed, and signed like a hang. Five failures in a row
 disable the kind: its requests are refused at once, its signed degradation
 written (`worker_parse: disabled: …`); a worker that then stays up 60 s
 enables it again. A failure is a signed degradation too, at once for a
@@ -172,15 +222,25 @@ starts workers through the core's own spawn path with `--hostile
 <attack>` (`nn_linux::worker::hostile`):
 
 - every forbidden call — the agent's key, a protected or a world-readable
-  file, a new file, a TCP connect, an abstract socket, a signal or a trace
-  of the core, an exec, a fork, `bpf`, `setuid`, executable memory — is
-  killed by the filter (`SIGSYS`);
+  file, a new file, a TCP connect, a UDP datagram, a UNIX socket by path
+  (the D-Bus bus where there is one), an abstract socket, a signal to the
+  core or to init by `kill`, `tgkill`, `tkill`, `rt_sigqueueinfo` or a
+  pidfd, a trace of the core, an exec, a fork, `bpf`, `setuid`,
+  executable memory (`mmap`, `mprotect` of a writable mapping,
+  `pkey_mprotect`), a user namespace, `io_uring_setup`, `keyctl`,
+  `perf_event_open`, `userfaultfd` — is killed by the filter (`SIGSYS`);
 - beneath the filter (`noseccomp+`, the harness only), each layer refuses
   what the kernel lets it: DAC, `RLIMIT_NPROC`, the empty capability sets,
   Landlock by ABI; what no layer below the filter refuses on that kernel is
-  asserted as such and printed;
+  asserted as such and printed; what the distribution's settings decide
+  (user namespaces, `io_uring`, `perf_event_paranoid`, `userfaultfd`, a
+  UNIX socket by path, UDP) is printed, not asserted;
 - every protocol attack after a genuine hello is refused and the worker
-  killed; the core survives and a new worker serves.
+  killed (a descriptor sent along now dies by `SIGSYS`: `sendmsg` is not
+  the worker's); a worker that answers its pings and spins between them is
+  killed as a hang; the core survives and a new worker serves;
+- an honest worker's process, read from outside: the declared level, the
+  kernel's ABI, `oom_score_adj` 1000, `nice` 10, stderr a pipe.
 
 `deploy/lab/workers/worker-lab.sh` checks the installed agent's worker on
 a guest: its identity and limits, the roles in `PROTECTED_PIDS`, a root

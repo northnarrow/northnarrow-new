@@ -32,6 +32,12 @@
 //! refused (`MSG_CTRUNC`). The exec quarantine's scanner (lab PR 223) is
 //! where a descriptor must cross (the file to hash, a sealed memfd for its
 //! configuration): its own protocol, `crate::execq`.
+//!
+//! Review of #480 (F1): a worker's strings are read as bytes only — a
+//! `&str` sliced at an index a lying worker chose panics at a character's
+//! middle, and the agent's release profile aborts on a panic. No slice,
+//! no index here that can panic: the two lints below hold it.
+#![deny(clippy::string_slice, clippy::indexing_slicing)]
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -89,6 +95,40 @@ pub const MAX_TLS_FIELD: usize = 255;
 
 /// Most ALPN names a TLS result carries.
 pub const MAX_ALPN: usize = 64;
+
+/// An ALPN name as a worker hands it on (review of #480, F9): printable
+/// ASCII only — a byte outside `!`..`~` but the space, and the backslash
+/// itself, written `\xHH` — cut to [`MAX_TLS_FIELD`] bytes at a whole
+/// escape. The core accepts nothing else ([`check_response`]): a name it
+/// logs or matches cannot carry a control character or a line break.
+pub fn alpn_display(raw: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::new();
+    for &b in raw {
+        let printable = (0x20..=0x7e).contains(&b) && b != b'\\';
+        let need = if printable { 1 } else { 4 };
+        if out.len() + need > MAX_TLS_FIELD {
+            break;
+        }
+        if printable {
+            out.push(char::from(b));
+        } else {
+            out.push('\\');
+            out.push('x');
+            out.push(char::from(
+                HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0'),
+            ));
+            out.push(char::from(
+                HEX.get(usize::from(b & 0xf)).copied().unwrap_or(b'0'),
+            ));
+        }
+    }
+    out
+}
+
+fn printable_ascii(s: &str) -> bool {
+    s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
 
 /// A worker's kind: what it serves (plan §3.1). The name is its
 /// `--worker` argument.
@@ -360,9 +400,33 @@ pub enum Answer {
         a: Vec<[u8; 4]>,
         aaaa: Vec<[u8; 16]>,
     },
-    /// The request was not served (out of bounds, a debug fault in a
-    /// production build).
-    Refused(String),
+    /// The request was not served ([`Refusal`]: a closed set, review of
+    /// #480 F9 — no free text from a worker).
+    Refused(Refusal),
+}
+
+/// Why a worker did not serve a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Refusal {
+    /// The request was out of the protocol's bounds ([`Request::check`]).
+    OutOfBounds,
+    /// A debug fault asked of a production worker.
+    DebugOnly,
+}
+
+impl Refusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Refusal::OutOfBounds => "out of the protocol's bounds",
+            Refusal::DebugOnly => "debug faults exist only in lab builds",
+        }
+    }
+}
+
+impl core::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Worker → core.
@@ -400,6 +464,10 @@ pub enum Violation {
     WrongKind(&'static str),
     /// A result out of its bounds: a size, a count, a character.
     Bounds(&'static str),
+    /// Review of #480 (F2): the worker left bytes of the core's earlier
+    /// requests unread (an honest worker reads a request before it
+    /// answers): it would fill the core's send buffer.
+    Unread(usize),
 }
 
 impl core::fmt::Display for Violation {
@@ -413,6 +481,7 @@ impl core::fmt::Display for Violation {
             Violation::Unsolicited => write!(f, "a packet no request asked for"),
             Violation::WrongKind(k) => write!(f, "an answer of the wrong kind to {k}"),
             Violation::Bounds(what) => write!(f, "result out of bounds: {what}"),
+            Violation::Unread(n) => write!(f, "{n} bytes of earlier requests left unread"),
         }
     }
 }
@@ -454,7 +523,14 @@ pub struct Expected {
     /// The `northnarrow-worker` account.
     pub uid: u32,
     pub gid: u32,
+    /// The kernel's Landlock ABI as the core read it (review of #480, F7:
+    /// the worker's declaration is checked against it).
+    pub kernel_landlock_abi: u8,
 }
+
+/// The newest Landlock ABI a worker's build asks for (the `landlock`
+/// crate's): a kernel above it gives no more.
+pub const LANDLOCK_ABI_KNOWN: u8 = 9;
 
 /// The core's check of a worker's hello (plan §3.5: the version handshake;
 /// R14a: the sandbox it declares). A worker that entered less than its
@@ -513,6 +589,29 @@ pub fn check_hello(h: &WorkerHello, want: &Expected) -> Result<(), Violation> {
     if s.core != 0 || s.nproc != 0 {
         return bad(alloc::format!("limits core {} nproc {}", s.core, s.nproc));
     }
+    // Review of #480 (F7): the ABI the worker read is the kernel's (as the
+    // core read it), and the rights it measured are the ones that ABI
+    // gives: a worker on a kernel with Landlock that is not under it, or
+    // under less of it, is refused.
+    let abi = want.kernel_landlock_abi.min(LANDLOCK_ABI_KNOWN);
+    if s.landlock_abi != abi {
+        return bad(alloc::format!(
+            "landlock ABI {} declared, the kernel's is {}",
+            s.landlock_abi,
+            want.kernel_landlock_abi
+        ));
+    }
+    if (abi >= 1 && (!s.fs_denied || s.landlock == LandlockEnforced::None))
+        || (abi >= 4 && !s.net_denied)
+        || (abi >= 6 && !s.scoped)
+    {
+        return bad(alloc::format!(
+            "landlock below what ABI {abi} gives (fs {}, net {}, scope {})",
+            s.fs_denied,
+            s.net_denied,
+            s.scoped
+        ));
+    }
     // A Landlock level the kernel's ABI cannot give is a lie.
     if s.landlock_abi == 0 && (s.landlock != LandlockEnforced::None || s.fs_denied) {
         return bad("landlock enforced without an ABI".into());
@@ -543,10 +642,20 @@ fn host_ok(h: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
 }
 
-fn lower_hex(s: &str, len: usize) -> bool {
-    s.len() == len
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+fn lower_hex(b: &[u8], len: usize) -> bool {
+    b.len() == len
+        && b.iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
+/// The bytes of `b` in `r`, or none (never a panic).
+fn span(b: &[u8], r: core::ops::Range<usize>) -> &[u8] {
+    b.get(r).unwrap_or(&[])
+}
+
+/// The byte of `b` at `i`, or 0 (never a panic).
+fn at(b: &[u8], i: usize) -> u8 {
+    b.get(i).copied().unwrap_or(0)
 }
 
 /// JA4 as nn-parse's `compute_ja4` writes it (36 bytes): `t` · the version
@@ -554,18 +663,24 @@ fn lower_hex(s: &str, len: usize) -> bool {
 /// two digits · the ALPN pair (two ASCII bytes, any of them: the reference
 /// implementations print the ends of the first ALPN value as they are) ·
 /// `_` · 12 hex digits · `_` · 12 hex digits.
+///
+/// Bytes only (review of #480, F1): a `&str` sliced at 11 or 23 panics when
+/// a lying worker puts a multi-byte character across that index.
 fn ja4_ok(s: &str) -> bool {
     let b = s.as_bytes();
-    b.len() == 36
-        && b[0] == b't'
-        && b[1..3].iter().all(|x| x.is_ascii_digit() || *x == b's')
-        && (b[3] == b'd' || b[3] == b'i')
-        && b[4..8].iter().all(u8::is_ascii_digit)
-        && b[8..10].iter().all(u8::is_ascii)
-        && b[10] == b'_'
-        && lower_hex(&s[11..23], 12)
-        && b[23] == b'_'
-        && lower_hex(&s[24..36], 12)
+    s.is_ascii()
+        && b.len() == 36
+        && at(b, 0) == b't'
+        && span(b, 1..3)
+            .iter()
+            .all(|x| x.is_ascii_digit() || *x == b's')
+        && (at(b, 3) == b'd' || at(b, 3) == b'i')
+        && span(b, 4..8).iter().all(u8::is_ascii_digit)
+        && span(b, 8..10).len() == 2
+        && at(b, 10) == b'_'
+        && lower_hex(span(b, 11..23), 12)
+        && at(b, 23) == b'_'
+        && lower_hex(span(b, 24..36), 12)
 }
 
 /// The fewest bytes a DNS message with `a` A answers and `aaaa` AAAA
@@ -583,12 +698,8 @@ pub const fn min_dns_answer_bytes(a: usize, aaaa: usize) -> usize {
 /// answer's kind, its counts and sizes, its strings' alphabets.
 pub fn check_response(req: &Request, answer: &Answer) -> Result<(), Violation> {
     match (req, answer) {
-        (_, Answer::Refused(why)) => {
-            if why.len() > 256 {
-                return Err(Violation::Bounds("refused: reason"));
-            }
-            Ok(())
-        }
+        // a closed set: nothing to bound
+        (_, Answer::Refused(_)) => Ok(()),
         (Request::Ping, Answer::Pong) => Ok(()),
         (Request::DnsNames(ins), Answer::DnsNames(outs)) => {
             if ins.len() != outs.len() {
@@ -622,7 +733,7 @@ pub fn check_response(req: &Request, answer: &Answer) -> Result<(), Violation> {
                 sni,
                 alpn,
             } => {
-                if !lower_hex(ja3, 32) {
+                if !lower_hex(ja3.as_bytes(), 32) {
                     return Err(Violation::Bounds("tls: ja3"));
                 }
                 if !ja4_ok(ja4) {
@@ -634,7 +745,9 @@ pub fn check_response(req: &Request, answer: &Answer) -> Result<(), Violation> {
                     }
                 }
                 if alpn.len() > MAX_ALPN
-                    || alpn.iter().any(|p| p.is_empty() || p.len() > MAX_TLS_FIELD)
+                    || alpn
+                        .iter()
+                        .any(|p| p.is_empty() || p.len() > MAX_TLS_FIELD || !printable_ascii(p))
                 {
                     return Err(Violation::Bounds("tls: alpn"));
                 }
@@ -652,6 +765,7 @@ pub fn check_response(req: &Request, answer: &Answer) -> Result<(), Violation> {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::string_slice)]
 mod tests {
     use super::*;
     use alloc::vec;
@@ -690,19 +804,25 @@ mod tests {
             pid: 4242,
             uid: 990,
             gid: 990,
+            kernel_landlock_abi: 4,
         }
     }
 
     #[test]
     fn a_conforming_hello_passes() {
         assert_eq!(check_hello(&hello(), &want()), Ok(()));
-        // no Landlock at all is declared, not refused
+        // no Landlock at all, on a kernel without it, is declared, not
+        // refused
         let mut h = hello();
         h.sandbox.landlock_abi = 0;
         h.sandbox.landlock = LandlockEnforced::None;
         h.sandbox.fs_denied = false;
         h.sandbox.net_denied = false;
-        assert_eq!(check_hello(&h, &want()), Ok(()));
+        let w = Expected {
+            kernel_landlock_abi: 0,
+            ..want()
+        };
+        assert_eq!(check_hello(&h, &w), Ok(()));
     }
 
     #[test]
@@ -743,6 +863,68 @@ mod tests {
         w.kind = WorkerKind::Parse;
         w.uid = 991;
         assert!(check_hello(&hello(), &w).is_err());
+    }
+
+    /// Review of #480 (F7): the worker's Landlock is checked against the
+    /// kernel's ABI as the core reads it — the same ABI, and the rights it
+    /// gives measured as enforced; a right above the ABI is a lie.
+    #[test]
+    fn the_landlock_level_is_checked_against_the_kernel_s_abi() {
+        let at = |kernel: u8, f: fn(&mut SandboxLevel)| {
+            let mut h = hello();
+            f(&mut h.sandbox);
+            let w = Expected {
+                kernel_landlock_abi: kernel,
+                ..want()
+            };
+            check_hello(&h, &w)
+        };
+        assert_eq!(at(4, |_| {}), Ok(()));
+        // a kernel without Landlock: nothing to measure
+        assert_eq!(
+            at(0, |l| {
+                l.landlock_abi = 0;
+                l.landlock = LandlockEnforced::None;
+                l.fs_denied = false;
+                l.net_denied = false;
+            }),
+            Ok(())
+        );
+        // ABI 6: the scope measured too
+        assert_eq!(
+            at(6, |l| {
+                l.landlock_abi = 6;
+                l.scoped = true;
+            }),
+            Ok(())
+        );
+        // a kernel above what the build knows: the build's newest
+        assert_eq!(
+            at(12, |l| {
+                l.landlock_abi = LANDLOCK_ABI_KNOWN;
+                l.scoped = true;
+            }),
+            Ok(())
+        );
+        type Weaken = fn(&mut SandboxLevel);
+        let refused: Vec<(&str, u8, Weaken)> = vec![
+            ("another ABI than the kernel's", 4, |l| l.landlock_abi = 2),
+            ("no Landlock where the kernel has it", 4, |l| {
+                l.landlock_abi = 4;
+                l.landlock = LandlockEnforced::None;
+            }),
+            ("files not denied", 4, |l| l.fs_denied = false),
+            ("TCP not denied from ABI 4", 4, |l| l.net_denied = false),
+            ("no scope at ABI 6", 6, |l| l.landlock_abi = 6),
+            ("TCP claimed at ABI 3", 3, |l| l.landlock_abi = 3),
+            ("scope claimed at ABI 4", 4, |l| l.scoped = true),
+            ("the build's ABI above the kernel's", 12, |l| {
+                l.landlock_abi = 12
+            }),
+        ];
+        for (what, kernel, f) in refused {
+            assert!(matches!(at(kernel, f), Err(Violation::Hello(_))), "{what}");
+        }
     }
 
     #[test]
@@ -982,8 +1164,79 @@ mod tests {
         };
         assert!(check_response(&req, &too_many).is_err());
         assert!(check_response(&req, &Answer::Pong).is_err());
-        assert_eq!(check_response(&req, &Answer::Refused("no".into())), Ok(()));
-        assert!(check_response(&req, &Answer::Refused("x".repeat(257))).is_err());
+        for r in [Refusal::OutOfBounds, Refusal::DebugOnly] {
+            assert_eq!(check_response(&req, &Answer::Refused(r)), Ok(()));
+        }
+    }
+
+    /// Review of #480 (F1, the reviewer's probe): a lying worker's JA4 with
+    /// a two-byte character across byte 23 — a `&str` sliced there panicked
+    /// (`end byte index 23 is not a char boundary`), and the release
+    /// profile aborts on a panic: the agent died. Refused now, as any
+    /// non-ASCII JA4, wherever the character sits.
+    #[test]
+    fn a_ja4_with_a_multibyte_character_is_refused_not_a_panic() {
+        let req = Request::TlsClientHello(vec![0x16]);
+        for at in 0..35 {
+            let mut ja4: Vec<u8> = b"t13d1516h2_8daaf6152771_e5627efa2ab1".to_vec();
+            ja4.truncate(at);
+            let mut s = String::from_utf8(ja4).unwrap();
+            s.push('é');
+            while s.len() < 36 {
+                s.push('a');
+            }
+            let ans = Answer::Tls(TlsOut::Complete {
+                ja3: "0".repeat(32),
+                ja4: s,
+                sni: SniOut::Absent,
+                alpn: vec![],
+            });
+            assert!(check_response(&req, &ans).is_err(), "at {at}");
+        }
+        // the reviewer's string, as given
+        let mut ja4 = String::from("t13d1516h2_");
+        ja4.push_str("aaaaaaaaaaa");
+        ja4.push('é');
+        ja4.push_str("aaaaaaaaaaaa");
+        assert_eq!(ja4.len(), 36);
+        let ans = Answer::Tls(TlsOut::Complete {
+            ja3: "0".repeat(32),
+            ja4,
+            sni: SniOut::Absent,
+            alpn: vec![],
+        });
+        assert!(check_response(&req, &ans).is_err());
+    }
+
+    /// Review of #480 (F9): an ALPN name is printable ASCII as the worker
+    /// hands it on; the core refuses anything else.
+    #[test]
+    fn alpn_names_are_printable_ascii() {
+        assert_eq!(alpn_display(b"h2"), "h2");
+        assert_eq!(alpn_display(b"a b"), "a b");
+        assert_eq!(alpn_display(b"a\nb\\"), "a\\x0ab\\x5c");
+        assert_eq!(alpn_display("é".as_bytes()), "\\xc3\\xa9");
+        let long = alpn_display(&[0u8; 300]);
+        assert_eq!(long.len(), MAX_TLS_FIELD - MAX_TLS_FIELD % 4);
+        assert!(long.bytes().all(|b| (0x20..=0x7e).contains(&b)));
+        assert_eq!(alpn_display(&[b'x'; 300]).len(), MAX_TLS_FIELD);
+        let req = Request::TlsClientHello(vec![0x16]);
+        let with_alpn = |a: &str| {
+            check_response(
+                &req,
+                &Answer::Tls(TlsOut::Complete {
+                    ja3: "0".repeat(32),
+                    ja4: "t13d1516h2_8daaf6152771_e5627efa2ab1".into(),
+                    sni: SniOut::Absent,
+                    alpn: vec![a.into()],
+                }),
+            )
+        };
+        assert_eq!(with_alpn("http/1.1"), Ok(()));
+        assert_eq!(with_alpn(&alpn_display(b"\x00\xff")), Ok(()));
+        assert!(with_alpn("a\nb").is_err());
+        assert!(with_alpn("é").is_err());
+        assert!(with_alpn("\u{7f}").is_err());
     }
 
     #[test]

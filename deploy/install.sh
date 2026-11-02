@@ -254,6 +254,10 @@ SCAN_BIN="$TARGET_DIR/northnarrow-scan"
 SCAN_USER=northnarrow-scan
 # R14a: the account of the agent's workers (created below).
 WORKER_USER=northnarrow-worker
+# Review of #480 (F11): where the system accounts' uid and gid ranges are,
+# and the processes.
+LOGIN_DEFS=${LOGIN_DEFS:-/etc/login.defs}
+PROC_ROOT=${PROC_ROOT:-/proc}
 AGENT_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-agent.service"
 WATCHDOG_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-watchdog.service"
 # Lab PR 216: the watchdog unit's OnFailure= handler (records that systemd
@@ -1308,6 +1312,81 @@ for bait in agent.dev.lock kill_switch.conf maintenance.mode debug_disable.flag 
 done
 # Before anything on the host changes, a running install's stop included.
 require_nft
+
+# Review of #480 (F11): an account of the agent's names that already exists
+# is used as it is — the agent drops its workers and its scanner to it. It
+# must be the account install.sh creates (below): a system account (uid and
+# gid neither 0 nor in the login range of login.defs), no login shell, no
+# usable password, no group but its own, a uid no other account shares, no
+# process running as it but the agent's own children. Anything else — an
+# operator's account, or one an attacker created to take the name — is
+# refused here, before anything on the host is changed.
+# >>> system_user_check
+check_system_user() {   # <name>
+    local name=$1 entry pw groups uid_min gid_min why=""
+    local _n _p uid gid _g _h shell
+    entry=$(getent passwd "$name") || return 0   # absent: created below
+    IFS=: read -r _n _p uid gid _g _h shell <<< "$entry"
+    uid_min=$(awk '$1 == "UID_MIN" { print $2 }' "$LOGIN_DEFS" 2>/dev/null || true)
+    gid_min=$(awk '$1 == "GID_MIN" { print $2 }' "$LOGIN_DEFS" 2>/dev/null || true)
+    [[ $uid_min =~ ^[0-9]+$ ]] || uid_min=1000
+    [[ $gid_min =~ ^[0-9]+$ ]] || gid_min=1000
+    if ! [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ ]] || (( uid == 0 || gid == 0 )); then
+        why="uid $uid, gid $gid: root's"
+    elif (( uid >= uid_min || gid >= gid_min )); then
+        why="uid $uid, gid $gid: not a system account (UID_MIN $uid_min, GID_MIN $gid_min in $LOGIN_DEFS)"
+    else
+        case $shell in
+            */nologin|*/false) ;;
+            *) why="its shell is '$shell', not nologin" ;;
+        esac
+    fi
+    if [[ -z $why ]]; then
+        # a locked password starts with ! or *; an empty one needs none
+        if entry=$(getent shadow "$name"); then
+            pw=$(cut -d: -f2 <<< "$entry")
+        else
+            pw=$_p
+        fi
+        # (`x`: no shadow entry, or a field no hash can equal)
+        case $pw in
+            '!'*|'*'*|x) ;;
+            *) why="a usable password (or none needed)" ;;
+        esac
+    fi
+    if [[ -z $why ]]; then
+        groups=$(id -G "$name" 2>/dev/null || echo "?")
+        [[ $groups == "$gid" ]] || why="groups '$groups', not its own group $gid alone"
+    fi
+    if [[ -z $why ]]; then
+        local others
+        others=$(getent passwd | awk -F: -v u="$uid" -v n="$name" '$3 == u && $1 != n { printf "%s ", $1 }')
+        [[ -z $others ]] || why="uid $uid shared with ${others% }"
+    fi
+    if [[ -z $why ]]; then
+        # an upgrade finds the running agent's workers (or scanner): its
+        # children; any other process as this uid is not the agent's
+        local agent p k v puid ppid
+        agent=$(systemctl show -p MainPID --value northnarrow-agent.service 2>/dev/null || true)
+        [[ $agent =~ ^[1-9][0-9]*$ ]] || agent=none
+        for p in "$PROC_ROOT"/[0-9]*; do
+            puid="" ppid=""
+            { while read -r k v _; do
+                case $k in Uid:) puid=$v ;; PPid:) ppid=$v ;; esac
+              done < "$p/status"; } 2>/dev/null || continue
+            [[ $puid == "$uid" && $ppid != "$agent" ]] || continue
+            why="process ${p##*/} runs as it and is not the agent's child"
+            break
+        done
+    fi
+    if [[ -n $why ]]; then
+        echo "install.sh: the existing account $name is not the unprivileged system account NorthNarrow creates — $why. Refused: remove the account (or make it a locked system account with its own group only and no shell), then install again (docs/operator/WORKERS.md)." >&2
+        exit 1
+    fi
+}
+# <<< system_user_check
+check_system_user "$SCAN_USER"
+check_system_user "$WORKER_USER"
 fi
 
 # Lab PR 220: replacing an install is a transaction ("upgrade transaction" above):

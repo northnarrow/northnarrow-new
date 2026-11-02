@@ -36,6 +36,34 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   launch. A compromised-worker harness (lab builds) proves every forbidden
   call killed by the filter, each layer beneath it refusing what the
   kernel lets it, every protocol attack refused.
+  After the review of #480: the core's checks of a worker's answers read
+  bytes, never slice a string at an offset the worker chose (a JA4 with a
+  two-byte character panicked the core; the module denies
+  `clippy::string_slice` and `clippy::indexing_slicing`, a new fuzz target
+  `ipc_check` holds every check); a worker that stops reading its channel
+  is a violation, never a stall of the core (the send queue checked empty
+  before each request, the send never waits), and the status the
+  heartbeat reads never waits on a request; a dead worker's pid is taken
+  out of `PROTECTED_PIDS` before it is reaped (seen with `waitid(WNOWAIT)`:
+  its zombie holds the pid; one that cannot be taken out stays unreaped,
+  signed); a worker's stderr reaches the journal through the agent,
+  escaped, cut and rate-limited; the worker measures the Landlock rights
+  it declares, the core checks them against the kernel's ABI it reads and
+  checks the worker's `/proc/<pid>/status` against its hello; the worker's
+  channel calls are `sendto`/`recvfrom` with fixed flags and no address
+  (no descriptor can leave it); ALPN names printable ASCII, refusals a
+  closed set; a worker is the OOM killer's first choice (`oom_score_adj`
+  1000) at `nice` 10, and one that spins between its pings is killed as a
+  hang; workers are started from the supervisor's own thread only (their
+  death signal is that thread's); install.sh refuses an existing
+  `northnarrow-worker` or `northnarrow-scan` account that is not the locked
+  system account it creates (a login-range or shared uid, a shell, a
+  password, another group, a process running as it that is not the
+  agent's). The harness adds `mprotect` and
+  `pkey_mprotect` to executable, every signalling call (`tgkill`, `tkill`,
+  `rt_sigqueueinfo`, a pidfd), a UNIX socket by path, UDP, a user
+  namespace, `io_uring_setup`, `keyctl`, `perf_event_open` and
+  `userfaultfd`, each killed by the filter.
 - The sensor contract and the signed capability manifest's revisions (lab
   PR 271, Wave 4 phase 2, R13 of the restructure plan; report 06 INI-09,
   R4-01, EXP-37; `docs/operator/SENSOR_CONTRACT.md`). Each of the thirteen

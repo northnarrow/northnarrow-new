@@ -8,8 +8,12 @@
 //! sandbox, then it does `<attack>` instead of its work. Two families:
 //!
 //! - a system call it should not make — read a key, open or create a file,
-//!   connect out, connect to an abstract socket, signal or trace a
-//!   process, execute, fork, `bpf`, `setuid`, executable memory. Under the
+//!   connect out (TCP, UDP, a UNIX socket by path, an abstract one),
+//!   signal a process by any call (`kill`, `tgkill`, `tkill`,
+//!   `rt_sigqueueinfo`, a pidfd) or trace it, execute, fork, `bpf`,
+//!   `setuid`, executable memory (`mmap`, `mprotect` of a writable mapping,
+//!   `pkey_mprotect`), a user namespace, `io_uring`, `keyctl`,
+//!   `perf_event_open`, `userfaultfd` (review of #480, F5 and F7). Under the
 //!   sandbox each one is killed by the seccomp filter (`SIGSYS`). With the
 //!   prefix `noseccomp+` (this harness only) the worker enters everything
 //!   but the filter, so the layers beneath it answer: the account (DAC),
@@ -20,8 +24,12 @@
 //! - a protocol attack, after a genuine hello, on the core's first request:
 //!   a malformed packet, an oversized one, a descriptor sent along, an
 //!   answer to an id never asked, a second hello, a flood of answers, a
-//!   lie in a result (a name with a newline), a hello below its sandbox.
-//!   The core must refuse each one and kill the worker.
+//!   lie in a result (a name with a newline), a hello below its sandbox,
+//!   a worker spinning on the CPU without a request (review of #480, F12).
+//!   The core must refuse each one and kill the worker. A descriptor sent
+//!   along needs `sendmsg`, which the worker's filter no longer allows
+//!   (F8): that attack now ends by `SIGSYS`, the core's own refusal of a
+//!   descriptor is `transport`'s unit test.
 
 use std::os::fd::RawFd;
 
@@ -55,6 +63,21 @@ pub const SYSCALL_ATTACKS: &[&str] = &[
     "bpf",
     "setuid",
     "mmap-exec",
+    // review of #480 (F5)
+    "mprotect-exec",
+    "pkey-mprotect",
+    "tgkill",
+    "tkill",
+    "rt-sigqueueinfo",
+    "pidfd-signal",
+    // review of #480 (F7): what only the filter refuses on every lab kernel
+    "connect-unix",
+    "udp",
+    "unshare-userns",
+    "io-uring",
+    "keyctl",
+    "perf-event-open",
+    "userfaultfd",
 ];
 pub const PROTOCOL_ATTACKS: &[&str] = &[
     "malformed",
@@ -65,6 +88,7 @@ pub const PROTOCOL_ATTACKS: &[&str] = &[
     "flood",
     "lie",
     "weak-hello",
+    "spin",
 ];
 
 /// Run `attack` (`[noseccomp+]<name>[:<argument>]`); the exit status.
@@ -236,6 +260,156 @@ fn syscall_attack(name: &str, arg: &str) -> Result<(), i32> {
                 ))
             }
             "setuid" => ok(libc::syscall(libc::SYS_setuid, 0)),
+            "mprotect-exec" => {
+                // W^X: a writable mapping made executable afterwards
+                let m = libc::syscall(
+                    libc::SYS_mmap,
+                    0,
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if m == -1 {
+                    return Err(errno());
+                }
+                ok(libc::syscall(
+                    libc::SYS_mprotect,
+                    m,
+                    4096,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                ))
+            }
+            "pkey-mprotect" => {
+                let m = libc::syscall(
+                    libc::SYS_mmap,
+                    0,
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if m == -1 {
+                    return Err(errno());
+                }
+                ok(libc::syscall(
+                    libc::SYS_pkey_mprotect,
+                    m,
+                    4096,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                    -1,
+                ))
+            }
+            "tgkill" | "tkill" | "rt-sigqueueinfo" | "pidfd-signal" => {
+                let pid: i32 = if arg.is_empty() {
+                    libc::getppid()
+                } else {
+                    arg.parse().map_err(|_| libc::EINVAL)?
+                };
+                match name {
+                    "tgkill" => ok(libc::syscall(libc::SYS_tgkill, pid, pid, libc::SIGCONT)),
+                    "tkill" => ok(libc::syscall(libc::SYS_tkill, pid, libc::SIGCONT)),
+                    "rt-sigqueueinfo" => {
+                        let mut info: libc::siginfo_t = std::mem::zeroed();
+                        info.si_signo = libc::SIGCONT;
+                        info.si_code = -1; // SI_QUEUE
+                        ok(libc::syscall(
+                            libc::SYS_rt_sigqueueinfo,
+                            pid,
+                            libc::SIGCONT,
+                            &mut info as *mut libc::siginfo_t,
+                        ))
+                    }
+                    _ => {
+                        let pfd = libc::syscall(libc::SYS_pidfd_open, pid, 0);
+                        ok(pfd)?;
+                        ok(libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            pfd,
+                            libc::SIGCONT,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0,
+                        ))
+                    }
+                }
+            }
+            "connect-unix" => {
+                let fd = libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                ok(fd)?;
+                let mut sa: libc::sockaddr_un = std::mem::zeroed();
+                sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+                let path = if arg.is_empty() {
+                    "/run/dbus/system_bus_socket"
+                } else {
+                    arg
+                };
+                let n = path.len().min(sa.sun_path.len() - 1);
+                for (dst, src) in sa.sun_path.iter_mut().zip(path.as_bytes().iter().take(n)) {
+                    *dst = *src as libc::c_char;
+                }
+                ok(libc::syscall(
+                    libc::SYS_connect,
+                    fd,
+                    &sa as *const libc::sockaddr_un,
+                    std::mem::size_of::<libc::sockaddr_un>(),
+                ))
+            }
+            "udp" => {
+                let addr: std::net::SocketAddrV4 = if arg.is_empty() {
+                    "127.0.0.1:9".parse().map_err(|_| libc::EINVAL)?
+                } else {
+                    arg.parse().map_err(|_| libc::EINVAL)?
+                };
+                let fd = libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_DGRAM, 0);
+                ok(fd)?;
+                let sa = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: addr.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from(*addr.ip()).to_be(),
+                    },
+                    sin_zero: [0; 8],
+                };
+                let b = b"x";
+                ok(libc::syscall(
+                    libc::SYS_sendto,
+                    fd,
+                    b.as_ptr(),
+                    1usize,
+                    0,
+                    &sa as *const libc::sockaddr_in,
+                    std::mem::size_of::<libc::sockaddr_in>(),
+                ))
+            }
+            "unshare-userns" => ok(libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUSER)),
+            "io-uring" => {
+                let mut params = [0u8; 120];
+                ok(libc::syscall(
+                    libc::SYS_io_uring_setup,
+                    1u32,
+                    params.as_mut_ptr(),
+                ))
+            }
+            // KEYCTL_GET_KEYRING_ID of the session keyring, creating it
+            "keyctl" => ok(libc::syscall(libc::SYS_keyctl, 0, -3, 1)),
+            "perf-event-open" => {
+                // a software counter (task clock) of this process
+                let mut attr = [0u8; 128];
+                attr[0..4].copy_from_slice(&1u32.to_ne_bytes()); // PERF_TYPE_SOFTWARE
+                attr[4..8].copy_from_slice(&128u32.to_ne_bytes()); // size
+                attr[8..16].copy_from_slice(&1u64.to_ne_bytes()); // TASK_CLOCK
+                ok(libc::syscall(
+                    libc::SYS_perf_event_open,
+                    attr.as_ptr(),
+                    0,
+                    -1,
+                    -1,
+                    0,
+                ))
+            }
+            "userfaultfd" => ok(libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC)),
             "mmap-exec" => {
                 let m = libc::syscall(
                     libc::SYS_mmap,
@@ -259,21 +433,23 @@ fn syscall_attack(name: &str, arg: &str) -> Result<(), i32> {
 
 fn send(fd: RawFd, m: &FromWorker) {
     if let Ok(b) = encode(m) {
-        let _ = transport::send(fd, &b);
+        let _ = transport::send_to(fd, &b);
     }
 }
 
+/// Bytes as one packet, past the transport's own bound (the oversized
+/// attack): the call the worker's filter keeps.
 fn raw_send(fd: RawFd, bytes: &[u8]) {
-    let iov = libc::iovec {
-        iov_base: bytes.as_ptr() as *mut libc::c_void,
-        iov_len: bytes.len(),
-    };
-    // SAFETY: a zeroed msghdr with one live iovec, on the worker's channel.
+    // SAFETY: a live buffer on the worker's channel, no address.
     unsafe {
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov = &iov as *const _ as *mut _;
-        msg.msg_iovlen = 1;
-        libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL);
+        libc::sendto(
+            fd,
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            transport::WORKER_SEND_FLAGS,
+            std::ptr::null(),
+            0,
+        );
     }
 }
 
@@ -294,7 +470,10 @@ fn protocol_attack(fd: RawFd, name: &str, level: nn_proto::ipc::SandboxLevel) ->
     }
     send(fd, &FromWorker::Hello(hello.clone()));
     let mut buf = vec![0u8; MAX_FRAME];
-    let n = match transport::recv(fd, &mut buf, false) {
+    if name == "spin" {
+        return spin(fd, &mut buf);
+    }
+    let n = match transport::recv_from(fd, &mut buf) {
         Ok(Recv::Packet(n)) => n,
         _ => return 0,
     };
@@ -322,7 +501,7 @@ fn protocol_attack(fd: RawFd, name: &str, level: nn_proto::ipc::SandboxLevel) ->
                     answer: answer.clone(),
                 }));
                 let Ok(b) = b else { break };
-                if transport::send(fd, &b).is_err() {
+                if transport::send_to(fd, &b).is_err() {
                     break;
                 }
             }
@@ -351,12 +530,47 @@ fn protocol_attack(fd: RawFd, name: &str, level: nn_proto::ipc::SandboxLevel) ->
     }
     // wait for the core to end us
     loop {
-        match transport::recv(fd, &mut buf, false) {
+        match transport::recv_from(fd, &mut buf) {
             Ok(Recv::Closed) | Err(_) => return 0,
             _ => {}
         }
     }
 }
+
+/// Review of #480 (F12): a worker that answers every ping in time and
+/// burns the CPU between them — what a ping alone never finds. It spins
+/// [`SPIN_FOR`] after each answer (and after its hello), then waits for
+/// the next packet; the supervisor's spin check must end it.
+fn spin(fd: RawFd, buf: &mut [u8]) -> i32 {
+    loop {
+        let until = std::time::Instant::now() + SPIN_FOR;
+        let mut x = 0u64;
+        while std::time::Instant::now() < until {
+            x = std::hint::black_box(x.wrapping_add(1));
+            std::hint::spin_loop();
+        }
+        let n = match transport::recv_from(fd, buf) {
+            Ok(Recv::Packet(n)) => n,
+            Ok(Recv::Closed) | Err(_) => return 0,
+            Ok(_) => continue,
+        };
+        let Some(msg) = buf.get(..n).and_then(|b| decode::<ToWorker>(b).ok()) else {
+            return 0;
+        };
+        send(
+            fd,
+            &FromWorker::Response(Response {
+                id: msg.id,
+                answer: super::serve::answer(&msg.req),
+            }),
+        );
+    }
+}
+
+/// How long the spinning worker burns the CPU before it reads: less than
+/// the supervisor's ping period, so every ping is answered in time.
+const SPIN_FOR: std::time::Duration = std::time::Duration::from_secs(8);
+const _: () = assert!(SPIN_FOR.as_secs() < super::supervisor::PING_EVERY.as_secs());
 
 fn send_with_fd(fd: RawFd) {
     let payload = encode(&FromWorker::Response(Response {
