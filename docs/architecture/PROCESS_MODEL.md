@@ -240,7 +240,7 @@ starts workers through the core's own spawn path with `--hostile
   the worker's); a worker that answers its pings and spins between them is
   killed as a hang; the core survives and a new worker serves;
 - an honest worker's process, read from outside: the declared level, the
-  kernel's ABI, `oom_score_adj` 1000, `nice` 10, stderr a pipe.
+  kernel's ABI, `oom_score_adj` 1000, `nice` 10.
 
 `deploy/lab/workers/worker-lab.sh` checks the installed agent's worker on
 a guest: its identity and limits, the roles in `PROTECTED_PIDS`, a root
