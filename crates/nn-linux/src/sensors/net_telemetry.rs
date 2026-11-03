@@ -406,18 +406,24 @@ fn ingest_answer(
 }
 
 /// The DNS response pump (a thread of its own, a source of the bus).
+/// `attached`: the sensor's programs attached. Only then does the table say
+/// since when the sensor runs (NN-L-NET-028 judges the connects; without
+/// it every one is unknown) and do the connects wait for its passes.
 pub fn spawn_dns_answer_pump(
     rb: RingBuf<MapData>,
     table: Arc<ResolvedTable>,
+    attached: bool,
     lineage: AuthSessionTracker,
     parse: ParseClient,
     tx: &BusSender,
     rt: &tokio::runtime::Handle,
 ) -> Result<PumpThread> {
-    let claim = crate::net::resolved::ResolvedClaim::new(
-        Arc::clone(&table),
-        crate::net::dns_ingest::monotonic_ns(),
-    );
+    let claim = attached.then(|| {
+        crate::net::resolved::ResolvedClaim::new(
+            Arc::clone(&table),
+            crate::net::dns_ingest::monotonic_ns(),
+        )
+    });
     let tx = tx.for_source("dns_answer");
     let rt = rt.clone();
     PumpThread::spawn("dns_answer", move |stop| {
@@ -559,16 +565,20 @@ fn ingest_hello(
 }
 
 /// The TLS ClientHello pump (a thread of its own, a source of the bus).
+/// `attached`: the sensor's program attached; only then do the closes wait
+/// for its passes.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_tls_pump(
     rb: RingBuf<MapData>,
     ingest: Arc<DnsIngest>,
+    attached: bool,
     flow_tracker: Arc<Mutex<FlowTracker>>,
     lineage: AuthSessionTracker,
     parse: ParseClient,
     tx: &BusSender,
     rt: &tokio::runtime::Handle,
 ) -> Result<PumpThread> {
-    let claim = crate::net::resolved::PumpClaim::new(Arc::clone(&ingest));
+    let claim = attached.then(|| crate::net::resolved::PumpClaim::new(Arc::clone(&ingest)));
     let tx = tx.for_source("tls_hello");
     let rt = rt.clone();
     PumpThread::spawn("tls_hello", move |stop| {

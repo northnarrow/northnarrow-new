@@ -482,6 +482,8 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         // the close + listen ringbufs would fill up + drop events,
         // and the kernel-side observation would waste cycles. Keep
         // start() lean for the existing exec_sensor_live test.
+        // Lot 275: which of the three network sensors attached.
+        let mut net_attached = crate::sensors::net_telemetry::Attached::default();
         let net_bufs = if net.is_some() {
             // Lab PR 229: names resolved through systemd-resolved's NSS
             // module, for the DNS attribution (optional).
@@ -533,7 +535,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             info!("net: N2 BPF programs attached (inet_csk_listen_start kprobe + tcp_close fexit + udp_sendmsg_outbound kprobes on udp_sendmsg and udpv6_sendmsg)");
             // Lot 275 (C07): the inbound connections, the DNS responses and
             // the TLS ClientHellos (soft: each one missing is signed).
-            crate::sensors::net_telemetry::attach(&mut ebpf, &btf, &attach_points);
+            net_attached = crate::sensors::net_telemetry::attach(&mut ebpf, &btf, &attach_points);
             let inbound_rb = take_ringbuf(&mut ebpf, "INBOUND_EVENTS")?;
             Some(NetRingBufs {
                 close_rb,
@@ -685,6 +687,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 Pump::Thread(crate::sensors::net_telemetry::spawn_dns_answer_pump(
                     answer_rb,
                     Arc::clone(&w.resolved),
+                    net_attached.dns_answer,
                     w.lineage.clone(),
                     ParseClient::new(plan.parse.clone()),
                     &tx,
@@ -696,6 +699,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 Pump::Thread(crate::sensors::net_telemetry::spawn_tls_pump(
                     tls_rb,
                     Arc::clone(&w.tls_ingest),
+                    net_attached.tls_hello,
                     Arc::clone(&w.flow_tracker),
                     w.lineage.clone(),
                     ParseClient::new(plan.parse.clone()),

@@ -6,6 +6,49 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Network telemetry, level 2 of C07 (lot 275,
+  `docs/operator/NETWORK_TELEMETRY.md`): three new sources of the bus,
+  each with its sensor-contract entry, its attach state in the signed
+  manifest, its kernel budget, its ring's loss counters (`inbound` /
+  `inbound_rate`, `dns_answer` / `dns_answer_rate`, `tls` / `tls_rate`)
+  and the network class. **Inbound connections** (`net_inbound`): an
+  fexit on `inet_csk_accept` (the program built for this kernel's
+  parameter count — 4 up to 6.9, 2 from 6.10 — read from its BTF) records
+  every accepted connection in the accepting process's context, and
+  `tcp_close` its close, on a ring and a socket map of their own (an
+  inbound flood no longer reaches the outbound flows' ring or evicts their
+  sockets); `Event::NetInbound` rows with the attribution of an outbound
+  flow, the closed ones in `netflow.jsonl` with `"inbound": true`. **DNS
+  responses** (`dns_answer`): an fexit on `udp_recvmsg` / `udpv6_recvmsg`
+  reads every datagram from port 53 from the receiver's buffer (512 bytes);
+  the parse worker decodes the question, the response code and the A,
+  AAAA and CNAME records with their TTLs (IPC version 3; nn-parse's
+  `dns_response`, fuzzed); `Event::DnsAnswer`. **TLS ClientHellos**
+  (`tls_hello`): an fentry on `tcp_sendmsg` copies an outbound flow's first
+  send when it is a ClientHello (4,096 bytes); the parse worker computes
+  JA3, JA4, SNI and ALPN; `Event::TlsClientHello`, and the fingerprint on
+  the flow's snapshots and closed row (`ja3`, `ja4`, `sni` in
+  `netflow.jsonl`). NN-L-NET-003 judges the hello: it can match for the
+  first time, so its kill is held behind the per-rule policy
+  (`NET_003_KILL`); the validation registry's version 4 returns it to the
+  Critical sub-gate (BUG-025 closed).
+- NN-L-NET-028, "no DNS, no connect", per lineage (lot 275): a TCP connect
+  or a UDP send to a public address that neither the process nor an
+  ancestor resolved through the system resolver — no response it received
+  named the address, no name it asked for resolved to it — is recorded:
+  Medium, Low when only another process on the host resolved it; once per
+  process and destination every 10 minutes; its kill (`KillProcess`) held
+  behind the per-rule policy, off by default (`NODNS_KILL`). The state is
+  nn-core's `net::resolved` (the host's names held for their TTL, 300 s at
+  least, a day at most; per-process bindings that last 2 h past each use;
+  an address its own name spells binds nothing); the connect pump and the
+  net drain judge each connect-time and UDP row once the DNS pumps have
+  read the records made before it. Not judged: LAN and the other
+  non-public ranges, the configured resolvers, the addresses of the signed
+  `nodns-allow.local` (a new overlay kind, `nn-admin config overlay set
+  nodns-allow`), and what the agent cannot judge (a process older than the
+  DNS response sensor, a name asked whose response was not seen, DNS
+  records held back, the parse worker not answering).
 - The agent's threads each keep only their capabilities, its keys in one
   place, its unit hardened (lot 272, Wave 4 phase 2, R14c of the
   restructure plan, §3.1–§3.3; `docs/architecture/PROCESS_MODEL.md` §8–§10).
