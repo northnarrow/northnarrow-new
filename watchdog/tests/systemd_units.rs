@@ -167,6 +167,40 @@ fn both_units_give_up_a_refused_stop_quickly_and_never_double_start() {
             Some("yes"),
             "{name}: a manual stop must fail loudly, not report a running unit dead"
         );
+        // Lot 273b (tamper case C78b): an isolate queues no stop job, which
+        // RefuseManualStop= would not refuse and whose refused signals leave
+        // the unit recorded dead while its process runs.
+        assert_eq!(
+            value(&d, "IgnoreOnIsolate"),
+            Some("yes"),
+            "{name}: an isolate must not stop the unit"
+        );
+    }
+}
+
+/// Lot 273b (the review of #489, R2): the agent's unit makes the four
+/// `system.control` directories of both units, empty, before every start,
+/// so that the agent registers them (NOCREATE) and a `set-property`
+/// drop-in there is refused outside a window.
+#[test]
+fn the_agent_unit_makes_both_units_set_property_directories() {
+    let d = directives(&unit("northnarrow-agent.service"));
+    let mkdir = d
+        .iter()
+        .find(|(k, v)| k == "ExecStartPre" && v.contains("system.control"))
+        .map(|(_, v)| v.as_str())
+        .expect("an ExecStartPre making the system.control directories");
+    assert!(mkdir.starts_with("+/bin/mkdir -p "), "{mkdir}");
+    for dir in [
+        "/etc/systemd/system.control/northnarrow-agent.service.d",
+        "/run/systemd/system.control/northnarrow-agent.service.d",
+        "/etc/systemd/system.control/northnarrow-watchdog.service.d",
+        "/run/systemd/system.control/northnarrow-watchdog.service.d",
+    ] {
+        assert!(
+            mkdir.split_whitespace().any(|w| w == dir),
+            "{dir} in {mkdir}"
+        );
     }
 }
 

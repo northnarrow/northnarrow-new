@@ -18,8 +18,8 @@ use common::wire::{
     ARGV_LEN, FILENAME_LEN, FIM_CHILD_NAME_LEN, QNAME_LEN, QNAME_WIRE_LEN, TASK_COMM_LEN,
 };
 use nn_core::contract::{
-    EventKind as K, FailureMode, Fallback, KernelBudget, OptIn, SourceContract, SyncVerdict,
-    Truncation,
+    EventKind as K, FailureMode, Fallback, KernelBudget, OptIn, Overhead, SourceContract,
+    SyncVerdict, Truncation,
 };
 
 /// The opt-ins the boot says are configured (`SourceFacts::opt_ins`; the
@@ -81,10 +81,32 @@ pub const BPF_LSM_ABSENT: &str = "bpf is not in the active LSM list: its BPF LSM
 /// to it).
 const DENY_HOOK_LIST: &str = "LSM task_kill, ptrace_access_check, inode_unlink, inode_rmdir, \
      inode_rename, inode_setattr, file_ioctl, file_open, inode_create, inode_mkdir, inode_mknod, \
-     inode_symlink, inode_link, inode_setxattr, inode_removexattr, bpf_map; inode_set_acl, \
-     inode_remove_acl, file_ioctl_compat where the kernel has them; bpf (the agent's links); \
-     kernel_read_file and kernel_load_data (kexec); the cgroup move guard, inode_permission and \
-     fexit cgroup_procs_write_start, where the kernel has the function in the shape it reads";
+     inode_symlink, inode_link, inode_setxattr, inode_removexattr, bpf_map, file_permission (lot \
+     273b: the write deny); inode_set_acl, inode_remove_acl, file_ioctl_compat where the kernel \
+     has them; bpf (the agent's links); kernel_read_file and kernel_load_data (kexec); the cgroup \
+     move guard, inode_permission, fexit cgroup_procs_write_start and fentry \
+     cgroup_procs_write_finish, where the kernel has the functions in the shape it reads";
+
+/// Lot 273b (the review of #489): the deny hooks' cost on the host where it
+/// is more than noise, as the lab measured it (Ubuntu 24.04, 6.8; A/B
+/// with the programs' links detached and attached in turn,
+/// `docs/roadmap/CAPABILITY_PROGRAM.md`, lot 273b).
+const FS_PROTECT_OVERHEAD: &[Overhead] = &[
+    Overhead {
+        what: "the cgroup move guard (LSM inode_permission): every permission check of a \
+               path walk — the mask test, and one lookup on a write check",
+        cost: "about 59 ns a call (run_time_ns / run_cnt); git status x10 on the lab's \
+               source tree +24 % (88 -> 109 ms), find /usr x3 +5 %, a 2,000-file package \
+               installed and removed within the noise (medians of three A/B rounds)",
+    },
+    Overhead {
+        what: "the write deny (LSM file_permission): every write(2)-family call — one \
+               PROTECTED_INODES lookup and the superblock's magic",
+        cost: "about 96 ns a write call (run_time_ns / run_cnt); the 2,000-file package \
+               installed and removed +9 % (1,134 -> 1,232 ms), git status x10 +14 %, find \
+               /usr within the noise (medians of three A/B rounds)",
+    },
+];
 
 /// Every source of the bus on Linux (a table of the build: a `const`, no
 /// process state).
@@ -119,6 +141,7 @@ pub const SOURCES: [SourceContract; 13] = [
         on_failure_detail: "its attach failing refuses the start (signed); its pump ending is \
              found within 5 s, signed and stops the agent for the watchdog's restart",
         kernel_budgets: &[],
+        overhead: &[],
         truncations: &[
             Truncation {
                 field: "argv",
@@ -159,6 +182,7 @@ pub const SOURCES: [SourceContract; 13] = [
              runs; its attach failing refuses the start (signed); its pump ending stops the agent \
              within 5 s (signed)",
         kernel_budgets: &[],
+        overhead: &[],
         truncations: &[
             Truncation {
                 field: "filename (read from the caller's memory)",
@@ -205,6 +229,7 @@ pub const SOURCES: [SourceContract; 13] = [
              (exec_sensor); that attach failing too refuses the start; its pump ending stops the \
              agent within 5 s (signed)",
         kernel_budgets: &[],
+        overhead: &[],
         truncations: &[
             Truncation {
                 field: "filename",
@@ -248,6 +273,7 @@ pub const SOURCES: [SourceContract; 13] = [
              cannot read the destination, uncounted; its pump ending stops the agent within 5 s \
              (signed)",
         kernel_budgets: &[],
+        overhead: &[],
         truncations: &[COMM],
         rings: &["tcp_connect"],
         probe: None,
@@ -284,6 +310,7 @@ pub const SOURCES: [SourceContract; 13] = [
                      how many were held (DnsFlood)",
             counter: "dns_rate",
         }],
+        overhead: &[],
         truncations: &[
             Truncation {
                 field: "query (socket buffer, wire form)",
@@ -323,11 +350,13 @@ pub const SOURCES: [SourceContract; 13] = [
              (signed) unless NN_ANTI_TAMPER_ALLOW_DEGRADED=1: then L1 or L0, signed; the deny \
              never depends on the record",
         kernel_budgets: &[KernelBudget {
-            allows: "a refused signal, ptrace, kexec or cgroup move: one record per caller and \
-                     operation a second, 50 a second per CPU (every one is refused); inode \
-                     denials have no kernel budget",
+            allows: "a refused signal, ptrace, kexec, cgroup move, oom_score_adj write or (lot \
+                     273b) refused write through a descriptor: one record per caller and \
+                     operation a second, 50 a second per CPU (every one is refused); a refused \
+                     open or other inode operation has no kernel budget",
             counter: "task_denial_rate",
         }],
+        overhead: FS_PROTECT_OVERHEAD,
         truncations: &[COMM],
         rings: &["fs_protect"],
         probe: None,
@@ -350,6 +379,7 @@ pub const SOURCES: [SourceContract; 13] = [
         on_failure_detail: "not attached: signed (anti_tamper's observe hooks), the module-load \
              rule blind; its pump ending stops the agent within 5 s (signed)",
         kernel_budgets: &[],
+        overhead: &[],
         truncations: &[
             Truncation {
                 field: "module path, each component",
@@ -384,6 +414,7 @@ pub const SOURCES: [SourceContract; 13] = [
                      a second per process unless a new class appears",
             counter: "io_uring_rate",
         }],
+        overhead: &[],
         truncations: &[COMM],
         rings: &["io_uring"],
         probe: None,
@@ -410,6 +441,7 @@ pub const SOURCES: [SourceContract; 13] = [
             allows: "one record per process and command a second, the observed commands only",
             counter: "none: a repeat within its second is not recorded",
         }],
+        overhead: &[],
         truncations: &[COMM],
         rings: &["bpf"],
         probe: None,
@@ -452,6 +484,7 @@ pub const SOURCES: [SourceContract; 13] = [
             allows: "4 reports per task",
             counter: "none: the kernel counts the rest (REPORTS_HELD)",
         }],
+        overhead: &[],
         truncations: &[COMM],
         rings: &["exploit_guard"],
         probe: None,
@@ -495,6 +528,7 @@ pub const SOURCES: [SourceContract; 13] = [
                      and target",
             counter: "none: by design, not a loss",
         }],
+        overhead: &[],
         truncations: &[
             Truncation {
                 field: "path, each component",
@@ -538,6 +572,7 @@ pub const SOURCES: [SourceContract; 13] = [
                      write pending at once",
             counter: "fim_dirty_full",
         }],
+        overhead: &[],
         truncations: &[
             Truncation {
                 field: "child name",
@@ -574,6 +609,7 @@ pub const SOURCES: [SourceContract; 13] = [
                      a second per destination",
             counter: "listen_rate",
         }],
+        overhead: &[],
         truncations: &[COMM],
         rings: &["tcp_close", "listen", "udp"],
         probe: None,

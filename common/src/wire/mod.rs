@@ -834,6 +834,24 @@ pub const FS_OP_CGROUP_KILL: u8 = 20;
 /// ancestor slice's): `systemctl freeze`, or a direct write, stops every
 /// process of the cgroup. `target_*` = the file.
 pub const FS_OP_CGROUP_FREEZE: u8 = 21;
+/// Lot 273b: a write of a resource file ([`crate::cgroup_limits`]) of a
+/// protected unit's cgroup or of an ancestor slice's — a write-open by a
+/// caller that is not PID 1, or a write by PID 1 of another value than
+/// the one the file held at its registration (`systemctl set-property`) —
+/// outside a trusted-installer window. `target_*` = the file.
+pub const FS_OP_CGROUP_LIMIT: u8 = 22;
+/// Lot 273b: a write to a cgroup v1 hierarchy (`freezer.state`, a v1
+/// `cgroup.procs` / `tasks`, any controller's file) on a host whose systemd
+/// runs the unified hierarchy, outside a trusted-installer window. A root
+/// can mount the v1 `freezer` there, move the agent into it and freeze it;
+/// the v1 move path checks no inode the move guard sees. `target_*` = the
+/// file.
+pub const FS_OP_CGROUP_V1: u8 = 23;
+/// Lot 273b: a write of a protected process's `/proc/<pid>/oom_score_adj`
+/// (or `oom_adj`): `1000` makes the agent the OOM killer's first choice,
+/// whose SIGKILL no `task_kill` hook sees (`target_ino` = the protected
+/// tgid, `target_dev` = 0).
+pub const FS_OP_OOM_ADJ: u8 = 24;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
@@ -877,6 +895,25 @@ pub const FS_PROTECT_CGROUP_KILL: u8 = 0b10_0000;
 /// `cgroup.freeze`; a refused write-open is signed as
 /// [`FS_OP_CGROUP_FREEZE`].
 pub const FS_PROTECT_CGROUP_FREEZE: u8 = 0b100_0000;
+/// `FS_PROTECT_LIMIT_DIR` (bit7, lot 273b): the inode is a protected
+/// cgroup directory (a unit's or an ancestor slice's) whose resource files
+/// ([`crate::cgroup_limits::LIMIT_FILES`]) are protected by name: a file
+/// that appears later (a controller enabled after the registration) is
+/// protected from its first write. Required by no operation on the
+/// directory itself.
+pub const FS_PROTECT_LIMIT_DIR: u8 = 0b1000_0000;
+
+/// `CGROUP2_SUPER_MAGIC` (include/uapi/linux/magic.h).
+pub const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
+/// `CGROUP_SUPER_MAGIC`: a cgroup v1 hierarchy.
+pub const CGROUP_SUPER_MAGIC: u64 = 0x0027_e0eb;
+/// `PROC_SUPER_MAGIC`.
+pub const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+
+/// Lot 273b: bit of `CGROUP_POLICY[0]` — writes to cgroup v1 hierarchies are
+/// refused outside a trusted-installer window ([`FS_OP_CGROUP_V1`]). The
+/// agent sets it on a host whose systemd runs the unified hierarchy only.
+pub const CGROUP_POLICY_V1_REFUSE: u32 = 0b1;
 /// Slots of the `READ_PROTECTED_INOS` array (inode numbers; 0 = empty).
 pub const READ_PROTECTED_SLOTS: u32 = 4;
 
@@ -901,8 +938,41 @@ pub const fn fs_protect_required(operation: u8) -> u8 {
 /// `flags` although the inode is protected for it — only PID 1 removing a
 /// protected unit's cgroup directory ([`FS_PROTECT_INIT_RMDIR`]). The kernel
 /// deny's test, kept here so it is unit-tested once.
+///
+/// Lot 273b: and PID 1 changing an extended attribute of that directory —
+/// systemd keeps its own on every unit cgroup (`trusted.invocation_id`,
+/// `trusted.delegate`, `user.oomd_avoid` / `user.oomd_omit`,
+/// `trusted.survive_final_kill_signal`) and rewrites them when it realises
+/// a sibling unit (a `systemctl restart` of any service of the slice on
+/// systemd 255): refused, each was a failed write in systemd's log and a
+/// relayed attempt signed for nothing.
 pub const fn fs_protect_init_may(operation: u8, flags: u8, caller_tgid: u32) -> bool {
-    operation == FS_OP_RMDIR && flags & FS_PROTECT_INIT_RMDIR != 0 && caller_tgid == 1
+    (operation == FS_OP_RMDIR || operation == FS_OP_XATTR)
+        && flags & FS_PROTECT_INIT_RMDIR != 0
+        && caller_tgid == 1
+}
+
+/// Lot 273b: whether PID 1's write-open of a protected `cgroup.freeze` is
+/// let through to its write, which is then judged by its value
+/// ([`fs_protect_thaw_value`]): systemd 254 and 255 thaw a unit's slices —
+/// a write of `0` to each `cgroup.freeze` up the tree, the protected
+/// slices' included — at every start and stop of every unit
+/// (`unit_cgroup_freezer_action(u, FREEZER_THAW)`, unconditional there).
+/// Refused at the open, each start and stop on the host was a failed thaw
+/// in systemd's log and a relayed attempt signed. A freeze (`1`) is still
+/// refused, at the write.
+pub const fn fs_protect_init_may_open(denied_op: u8, caller_tgid: u32) -> bool {
+    denied_op == FS_OP_CGROUP_FREEZE && caller_tgid == 1
+}
+
+/// Lot 273b: the one write PID 1 makes to a protected `cgroup.freeze` that
+/// is let through — `0`, a thaw — as the eBPF programs read a write
+/// (`crate::cgroup_limits::limit_value` of its bytes).
+pub const fn fs_protect_thaw_value() -> [u64; 4] {
+    match crate::cgroup_limits::limit_value(b"0") {
+        Some(v) => v,
+        None => [0; 4],
+    }
 }
 
 /// Lot 273: the operation a refused `operation` on an inode carrying
@@ -1692,6 +1762,7 @@ mod tests {
             FS_PROTECT_INIT_RMDIR,
             FS_PROTECT_CGROUP_KILL,
             FS_PROTECT_CGROUP_FREEZE,
+            FS_PROTECT_LIMIT_DIR,
         ];
         for (i, a) in bits.iter().enumerate() {
             assert_eq!(a.count_ones(), 1);
@@ -1701,10 +1772,13 @@ mod tests {
         }
         // Lot 273: the new bits mark, they never require (no operation is
         // refused for carrying one).
-        for op in 1..=FS_OP_CGROUP_FREEZE {
+        for op in 1..=FS_OP_OOM_ADJ {
             let r = fs_protect_required(op);
             assert_eq!(
-                r & (FS_PROTECT_INIT_RMDIR | FS_PROTECT_CGROUP_KILL | FS_PROTECT_CGROUP_FREEZE),
+                r & (FS_PROTECT_INIT_RMDIR
+                    | FS_PROTECT_CGROUP_KILL
+                    | FS_PROTECT_CGROUP_FREEZE
+                    | FS_PROTECT_LIMIT_DIR),
                 0,
                 "op {op}"
             );
@@ -1721,11 +1795,15 @@ mod tests {
         for caller in [0, 2, 1000, u32::MAX] {
             assert!(!fs_protect_init_may(FS_OP_RMDIR, dir, caller), "{caller}");
         }
-        for op in 1..=FS_OP_CGROUP_FREEZE {
-            if op != FS_OP_RMDIR {
+        for op in 1..=FS_OP_OOM_ADJ {
+            if op != FS_OP_RMDIR && op != FS_OP_XATTR {
                 assert!(!fs_protect_init_may(op, dir, 1), "op {op}");
             }
         }
+        // lot 273b: systemd's own xattrs on the unit's cgroup, PID 1's only
+        assert!(fs_protect_init_may(FS_OP_XATTR, dir, 1));
+        assert!(!fs_protect_init_may(FS_OP_XATTR, dir, 4242));
+        assert!(!fs_protect_init_may(FS_OP_XATTR, FS_PROTECT_MUTATE, 1));
         assert!(!fs_protect_init_may(
             FS_OP_RMDIR,
             FS_PROTECT_MUTATE | FS_PROTECT_NOCREATE,
@@ -1754,6 +1832,23 @@ mod tests {
         }
     }
 
+    /// Lot 273b: PID 1 opens a protected cgroup.freeze to write `0` (a
+    /// thaw); nothing else is let through to the write.
+    #[test]
+    fn only_init_may_thaw_through_a_protected_freeze() {
+        assert!(fs_protect_init_may_open(FS_OP_CGROUP_FREEZE, 1));
+        assert!(!fs_protect_init_may_open(FS_OP_CGROUP_FREEZE, 2));
+        for op in [FS_OP_CGROUP_KILL, FS_OP_WRITE, FS_OP_CGROUP_LIMIT] {
+            assert!(!fs_protect_init_may_open(op, 1), "op {op}");
+        }
+        let thaw = fs_protect_thaw_value();
+        assert_eq!(thaw, crate::cgroup_limits::limit_value(b"0").unwrap());
+        assert!(!crate::cgroup_limits::same_value(
+            &crate::cgroup_limits::limit_value(b"1").unwrap(),
+            &thaw
+        ));
+    }
+
     /// The denial codes are distinct: the record carries one byte.
     #[test]
     fn fs_op_codes_are_distinct() {
@@ -1779,6 +1874,9 @@ mod tests {
             FS_OP_CGROUP_MOVE,
             FS_OP_CGROUP_KILL,
             FS_OP_CGROUP_FREEZE,
+            FS_OP_CGROUP_LIMIT,
+            FS_OP_CGROUP_V1,
+            FS_OP_OOM_ADJ,
         ];
         for (i, a) in ops.iter().enumerate() {
             assert_ne!(*a, 0);

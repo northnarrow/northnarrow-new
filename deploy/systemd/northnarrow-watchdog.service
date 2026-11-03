@@ -23,6 +23,12 @@ Wants=northnarrow-agent.service
 # (shutdown) still go through. Maintenance, inside the window: `systemctl
 # kill -s SIGTERM` (install.sh, uninstall.sh; docs/operator §3.7).
 RefuseManualStop=yes
+# Lot 273b (tamper case C78b): `systemctl isolate` of another target
+# queues no stop job for this unit. (A stop job is not a manual stop:
+# RefuseManualStop= does not refuse it; its signals and its cgroup kill are
+# refused by the deny hooks, and systemd would record the unit stopped while
+# its process runs.)
+IgnoreOnIsolate=yes
 # Lab PR 216 (capability C23): the watchdog never stays down. No start
 # limit — systemd retries it forever (Restart=always below, with a backoff
 # growing to 60 s) — and each failed run is visible on its own: the

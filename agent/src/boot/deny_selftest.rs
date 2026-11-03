@@ -31,6 +31,19 @@
 //! self-test never raises COMBAT; any other denial is untouched. R11c (lab
 //! PR 264): [`run`] returns it to the start, which hands it to the event
 //! loop (it was a process-wide `EXPECTED`).
+//!
+//! Lot 273b (the review of #489): the cgroup move guard is attached where
+//! the kernel's BTF has `cgroup_procs_write_start` in its shape — which
+//! does not prove the kernel calls it (an `.isra` / `.constprop` clone, an
+//! LTO build would leave the guard attached and silent). [`run_move`]
+//! exercises it: a child of the agent's binary
+//! (`--move-guard-self-test-target`), registered as a worker (protected,
+//! not exempt), and a second one, not registered
+//! (`--move-guard-self-test`), which writes the first one's pid to the
+//! `cgroup.procs` of a throwaway cgroup at the root of the hierarchy. The
+//! move must be refused (`EPERM`); a move done is the guard attached and
+//! not run, signed as a degradation. Its refusal is taken like the
+//! signal's ([`ExpectedDenial`] holds both).
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -123,16 +136,21 @@ pub fn run_child() -> i32 {
 /// The denial the child's attempt leaves on the evidence ring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Expected {
+    operation: FsProtectOperation,
     child: u32,
+    /// `target_dev` of the record: the signal ([`SELFTEST_SIGNAL`]), 0 for
+    /// a move.
+    detail: u64,
     target: u32,
     from_ns: u64,
     until_ns: u64,
 }
 
-/// The self-test's own denial, which the event loop takes once (R11c, lab
-/// PR 264: what [`run`] returns; clones share it).
+/// The self-tests' own denials, which the event loop takes once each (R11c,
+/// lab PR 264: what [`run`] returns; clones share it; lot 273b: the move
+/// guard's too, [`ExpectedDenial::also`]).
 #[derive(Clone, Debug, Default)]
-pub struct ExpectedDenial(Arc<Mutex<Option<Expected>>>);
+pub struct ExpectedDenial(Arc<Mutex<Vec<Expected>>>);
 
 /// `CLOCK_MONOTONIC` in nanoseconds, the clock of `bpf_ktime_get_ns`.
 fn monotonic_ns() -> u64 {
@@ -147,12 +165,34 @@ fn monotonic_ns() -> u64 {
 
 impl ExpectedDenial {
     fn arm(child: u32, target: u32, from_ns: u64, until_ns: u64) -> Self {
-        Self(Arc::new(Mutex::new(Some(Expected {
+        Self(Arc::new(Mutex::new(vec![Expected {
+            operation: FsProtectOperation::Signal,
             child,
+            detail: SELFTEST_SIGNAL as u64,
             target,
             from_ns,
             until_ns,
-        }))))
+        }])))
+    }
+
+    /// Lot 273b: the move guard's self-test denial too (its mover `child`,
+    /// the moved `target`).
+    fn arm_move(&self, child: u32, target: u32, from_ns: u64, until_ns: u64) {
+        self.0.lock().push(Expected {
+            operation: FsProtectOperation::CgroupMove,
+            child,
+            detail: 0,
+            target,
+            from_ns,
+            until_ns,
+        });
+    }
+
+    /// Lot 273b: the expectations of `other` (the move guard's) added to
+    /// these.
+    pub fn also(&self, other: &ExpectedDenial) {
+        let more = other.0.lock().clone();
+        self.0.lock().extend(more);
     }
 
     /// `true` when `event` is the self-test's own denial (consumed: once).
@@ -162,10 +202,10 @@ impl ExpectedDenial {
     }
 }
 
-fn take_expected_denial(expected: &Mutex<Option<Expected>>, event: &Event) -> bool {
+fn take_expected_denial(expected: &Mutex<Vec<Expected>>, event: &Event) -> bool {
     let Event::FsProtectDenial {
         pid,
-        operation: FsProtectOperation::Signal,
+        operation,
         target_dev,
         target_ino,
         timestamp_ns,
@@ -175,21 +215,22 @@ fn take_expected_denial(expected: &Mutex<Option<Expected>>, event: &Event) -> bo
         return false;
     };
     let mut slot = expected.lock();
-    let Some(e) = *slot else {
+    let Some(i) = slot.iter().position(|e| {
+        *operation == e.operation
+            && *pid == e.child
+            && *target_dev == e.detail
+            && *target_ino == e.target as u64
+            && (e.from_ns..=e.until_ns).contains(timestamp_ns)
+    }) else {
         return false;
     };
-    let matches = *pid == e.child
-        && *target_dev == SELFTEST_SIGNAL as u64
-        && *target_ino == e.target as u64
-        && (e.from_ns..=e.until_ns).contains(timestamp_ns);
-    if matches {
-        *slot = None;
-        info!(
-            child = pid,
-            "deny self-test: its refused signal reached the evidence ring (expected, not an attempt)"
-        );
-    }
-    matches
+    slot.remove(i);
+    info!(
+        child = pid,
+        operation = %operation,
+        "deny self-test: its refused attempt reached the evidence ring (expected, not an attempt)"
+    );
+    true
 }
 
 /// Run the self-test with `exe` (the agent's own binary,
@@ -240,6 +281,188 @@ fn run_command(mut cmd: Command, what: &str) -> (SelfTestOutcome, ExpectedDenial
     // stamped after `until_ns`. The event loop has not started yet.
     let expected = ExpectedDenial::arm(child_pid, target, from_ns, monotonic_ns());
     (outcome, expected)
+}
+
+/// Lot 273b: the move guard's children's flags (hidden from `--help`).
+pub const MOVE_TARGET_FLAG: &str = "--move-guard-self-test-target";
+pub const MOVE_FLAG: &str = "--move-guard-self-test";
+/// The throwaway cgroup the mover writes to, at the hierarchy's root.
+pub const MOVE_SELFTEST_CGROUP: &str = "northnarrow-move-selftest";
+/// How long the target waits to be killed, at most.
+const MOVE_TARGET_LIFETIME_SECS: u32 = 30;
+
+/// The target's side: wait to be killed (an alarm ends it otherwise).
+pub fn run_move_target() -> i32 {
+    // SAFETY: plain libc calls; the default action of SIGALRM ends the
+    // process.
+    unsafe {
+        libc::alarm(MOVE_TARGET_LIFETIME_SECS);
+        loop {
+            libc::pause();
+        }
+    }
+}
+
+/// The mover's side: write `pid` to `procs`, exit with what `write(2)`
+/// said — [`EXIT_DENIED`] for `EPERM`, [`EXIT_DELIVERED`] for a move done.
+pub fn run_move_child(procs: &str, pid: &str) -> i32 {
+    use std::io::Write;
+    if pid.parse::<u32>().is_err() {
+        return EXIT_OTHER;
+    }
+    let mut f = match std::fs::OpenOptions::new().write(true).open(procs) {
+        Ok(f) => f,
+        Err(_) => return EXIT_OTHER,
+    };
+    match f.write_all(pid.as_bytes()) {
+        Ok(()) => EXIT_DELIVERED,
+        Err(e) if e.raw_os_error() == Some(libc::EPERM) => EXIT_DENIED,
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => EXIT_NO_TARGET,
+        Err(_) => EXIT_OTHER,
+    }
+}
+
+/// What [`run_move`] needs of the deny side: the worker role for the
+/// target, and its removal.
+pub trait MoveRoles {
+    fn register(&self, pid: u32) -> Result<(), String>;
+    fn evict(&self, pid: u32) -> Result<(), String>;
+}
+
+/// The pinned `PROTECTED_PIDS` under the bpffs root.
+pub struct PinnedMoveRoles<'a>(pub &'a Path);
+
+impl MoveRoles for PinnedMoveRoles<'_> {
+    fn register(&self, pid: u32) -> Result<(), String> {
+        antitamper_bpf::ProtectedPidsHandle::open(self.0)
+            .and_then(|mut h| h.insert_role(pid, antitamper_bpf::pid_role::WORKER))
+            .map_err(|e| format!("{e:#}"))
+    }
+    fn evict(&self, pid: u32) -> Result<(), String> {
+        antitamper_bpf::ProtectedPidsHandle::open(self.0)
+            .and_then(|mut h| h.evict(pid))
+            .map_err(|e| format!("{e:#}"))
+    }
+}
+
+/// Wait for `child` at most [`CHILD_TIMEOUT`]; its outcome.
+fn reap(child: &mut std::process::Child, what: &str) -> SelfTestOutcome {
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break classify(status.code()),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break SelfTestOutcome::Inconclusive(format!(
+                    "the {what} did not exit within {} s",
+                    CHILD_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => break SelfTestOutcome::Inconclusive(format!("waiting for the {what}: {e}")),
+        }
+    }
+}
+
+/// Lot 273b: the move guard's self-test (the module's text). `exe`: the
+/// agent's binary; `root`: the cgroup v2 hierarchy's mount point. Blocking,
+/// at most [`CHILD_TIMEOUT`] for the mover. The outcome, and the refusal it
+/// leaves for the event loop to take.
+pub fn run_move(
+    exe: &Path,
+    root: &Path,
+    roles: &dyn MoveRoles,
+) -> (SelfTestOutcome, ExpectedDenial) {
+    let expected = ExpectedDenial::default();
+    let dir = root.join(MOVE_SELFTEST_CGROUP);
+    // A leftover of an earlier boot (empty: its processes are gone).
+    let _ = std::fs::remove_dir(&dir);
+    if let Err(e) = std::fs::create_dir(&dir) {
+        return (
+            SelfTestOutcome::Inconclusive(format!("cannot make {}: {e}", dir.display())),
+            expected,
+        );
+    }
+    let quiet = |c: &mut Command| {
+        c.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    };
+    let mut target_cmd = Command::new(exe);
+    target_cmd.arg(MOVE_TARGET_FLAG);
+    quiet(&mut target_cmd);
+    let mut target = match target_cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_dir(&dir);
+            return (
+                SelfTestOutcome::Inconclusive(format!("cannot spawn {MOVE_TARGET_FLAG}: {e}")),
+                expected,
+            );
+        }
+    };
+    let target_pid = target.id();
+    let outcome = match roles.register(target_pid) {
+        Err(e) => SelfTestOutcome::Inconclusive(format!("the target is not protected: {e}")),
+        Ok(()) => {
+            let from_ns = monotonic_ns();
+            let mut mover = Command::new(exe);
+            mover
+                .arg(MOVE_FLAG)
+                .arg(dir.join("cgroup.procs"))
+                .arg(target_pid.to_string());
+            quiet(&mut mover);
+            match mover.spawn() {
+                Err(e) => SelfTestOutcome::Inconclusive(format!("cannot spawn {MOVE_FLAG}: {e}")),
+                Ok(mut child) => {
+                    let outcome = reap(&mut child, "mover");
+                    expected.arm_move(child.id(), target_pid, from_ns, monotonic_ns());
+                    outcome
+                }
+            }
+        }
+    };
+    // The agent is exempt: it ends its own worker-registered child.
+    let _ = target.kill();
+    let _ = target.wait();
+    if let Err(e) = roles.evict(target_pid) {
+        warn!(pid = target_pid, error = %e, "move guard self-test: the target's role not evicted");
+    }
+    let _ = std::fs::remove_dir(&dir);
+    (outcome, expected)
+}
+
+/// Lot 273b: the journal line for the move guard's `outcome`, and the
+/// signed detail when it is not [`SelfTestOutcome::Denied`].
+pub fn report_move(outcome: &SelfTestOutcome) -> Option<String> {
+    match outcome {
+        SelfTestOutcome::Denied => {
+            info!(
+                "move guard self-test: moving a protected process to another cgroup was refused — \
+                 the move guard runs"
+            );
+            None
+        }
+        SelfTestOutcome::NotDenied => {
+            let detail =
+                "anti-tamper cgroup: move guard self-test — a protected process was moved \
+                          to another cgroup: the guard is attached but the kernel does not run it \
+                          (a clone of cgroup_procs_write_start?); a protected process can be moved \
+                          out of its unit's cgroup and killed or frozen there"
+                    .to_string();
+            error!("{detail}");
+            Some(detail)
+        }
+        SelfTestOutcome::Inconclusive(why) => {
+            let detail = format!(
+                "anti-tamper cgroup: move guard self-test inconclusive ({why}): the move guard \
+                 is not verified this boot"
+            );
+            warn!("{detail}");
+            Some(detail)
+        }
+    }
 }
 
 /// The journal line for `outcome`, and the signed detail when it is not
@@ -304,6 +527,67 @@ mod tests {
             operation: FsProtectOperation::Signal,
             timestamp_ns: ts,
         }
+    }
+
+    /// Lot 273b: the move guard's refusal is taken once, beside the
+    /// signal's; a move of another pid, by another child, or a signal from
+    /// the mover, reach the posture.
+    #[test]
+    fn the_move_guards_refusal_is_taken_beside_the_signals() {
+        let sig = SELFTEST_SIGNAL as u64;
+        let expected = ExpectedDenial::arm(4242, 100, 1_000, 2_000);
+        let moves = ExpectedDenial::default();
+        moves.arm_move(5151, 6161, 3_000, 4_000);
+        expected.also(&moves);
+        let mv = |pid, target, ts| Event::FsProtectDenial {
+            pid,
+            uid: 0,
+            comm: "northnarrow-age".to_string(),
+            target_dev: 0,
+            target_ino: target,
+            operation: FsProtectOperation::CgroupMove,
+            timestamp_ns: ts,
+        };
+        for other in [
+            mv(5152, 6161, 3_500),
+            mv(5151, 6162, 3_500),
+            mv(5151, 6161, 4_001),
+            denial(5151, sig, 6161, 3_500),
+        ] {
+            assert!(!expected.take(&other), "{other:?}");
+        }
+        assert!(expected.take(&mv(5151, 6161, 3_500)));
+        assert!(!expected.take(&mv(5151, 6161, 3_500)), "consumed");
+        assert!(expected.take(&denial(4242, sig, 100, 1_500)));
+    }
+
+    /// Lot 273b: the mover's exit statuses are the signal child's, and a
+    /// run with nothing to spawn is inconclusive and leaves no cgroup.
+    #[test]
+    fn the_move_self_test_reads_its_children() {
+        assert_eq!(run_move_child("/nonexistent/cgroup.procs", "1"), EXIT_OTHER);
+        assert_eq!(run_move_child("/dev/null", "x"), EXIT_OTHER);
+        assert_eq!(run_move_child("/dev/null", "1"), EXIT_DELIVERED);
+        struct NoRoles;
+        impl MoveRoles for NoRoles {
+            fn register(&self, _pid: u32) -> Result<(), String> {
+                Ok(())
+            }
+            fn evict(&self, _pid: u32) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let t = tempfile::tempdir().unwrap();
+        let (o, _) = run_move(
+            Path::new("/nonexistent/northnarrow-agent"),
+            t.path(),
+            &NoRoles,
+        );
+        assert!(matches!(o, SelfTestOutcome::Inconclusive(_)), "{o:?}");
+        assert!(!t.path().join(MOVE_SELFTEST_CGROUP).exists());
+        assert!(report_move(&SelfTestOutcome::Denied).is_none());
+        let d = report_move(&SelfTestOutcome::NotDenied).unwrap();
+        assert!(d.contains("attached but the kernel does not run it"), "{d}");
     }
 
     /// The self-test's denial is taken once, and only that one: another

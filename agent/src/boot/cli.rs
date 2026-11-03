@@ -41,6 +41,22 @@ pub(crate) struct Cli {
     #[arg(long = "deny-self-test", hide = true)]
     pub(crate) deny_self_test: bool,
 
+    /// Internal (lot 273b): the move guard's self-test target — a process
+    /// the agent registers as a worker and tries to have moved; it waits to
+    /// be killed (30 s at most).
+    #[arg(long = "move-guard-self-test-target", hide = true)]
+    pub(crate) move_guard_self_test_target: bool,
+
+    /// Internal (lot 273b): the move guard's self-test mover — write PID to
+    /// the given `cgroup.procs`, exit with what write(2) said.
+    #[arg(
+        long = "move-guard-self-test",
+        hide = true,
+        num_args = 2,
+        value_names = ["CGROUP_PROCS", "PID"]
+    )]
+    pub(crate) move_guard_self_test: Option<Vec<String>>,
+
     /// Compatibility check only: resolve every kernel struct offset and
     /// enumerator the eBPF programs need against the given BTF file
     /// (`/sys/kernel/btf/vmlinux` of this or another kernel, or a BTF

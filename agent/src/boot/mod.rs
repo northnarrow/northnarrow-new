@@ -121,6 +121,15 @@ pub fn main() -> Result<()> {
     if cli.deny_self_test {
         std::process::exit(northnarrow_agent::boot::deny_selftest::run_child());
     }
+    if cli.move_guard_self_test_target {
+        std::process::exit(northnarrow_agent::boot::deny_selftest::run_move_target());
+    }
+    if let Some(args) = &cli.move_guard_self_test {
+        std::process::exit(northnarrow_agent::boot::deny_selftest::run_move_child(
+            args.first().map(String::as_str).unwrap_or_default(),
+            args.get(1).map(String::as_str).unwrap_or_default(),
+        ));
+    }
     if let Some(path) = &cli.btf_check {
         std::process::exit(preflight::btf_check(path));
     }

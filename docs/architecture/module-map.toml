@@ -527,6 +527,7 @@ planned = false
 # post-plan (lab PR 215): the deny hooks' fail-open counters
 "fail_open" = "northnarrow-common"
 "ring_drops" = "northnarrow-common"
+"cgroup_limits" = "northnarrow-common"
 # R03 (lab PR 240) moved wire::admin_protocol, wire::admin_signed_payload,
 # admin_quorum, shutdown_marker and watchdog_hold to nn-proto, atomic_file
 # and sd_notify to northnarrow-antitamper-bpf; R02 (lab PR 240) model,

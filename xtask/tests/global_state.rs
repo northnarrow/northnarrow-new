@@ -332,6 +332,18 @@ const STATICS: &[Kept] = &[
         "the inodes this boot registered in the pinned PROTECTED_INODES",
     ),
     kept(
+        "crates/nn-linux/src/anti_tamper/cgroup_guard.rs",
+        "BOOT_VALUE_KEYS",
+        Kernel,
+        "the resource files whose values this boot registered in the pinned LIMIT_VALUES (lot 273b)",
+    ),
+    kept(
+        "crates/nn-linux/src/anti_tamper/cgroup_guard.rs",
+        "REGISTERED_UNITS",
+        Kernel,
+        "the unit cgroups this agent registered, whose values a window's close registers again in the pinned LIMIT_VALUES (lot 273b)",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/connect_deny.rs",
         "ARMED",
         Kernel,

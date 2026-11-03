@@ -229,6 +229,17 @@ pub struct KernelBudget {
     pub counter: &'static str,
 }
 
+/// Lot 273b (the review of #489): what an attach point of a source costs
+/// the host, measured — an explicit budget the manifest signs with the
+/// contract's terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Overhead {
+    /// The program and the calls it runs on.
+    pub what: &'static str,
+    /// What it costs, as the lab measured it.
+    pub cost: &'static str,
+}
+
 /// An attach point a source falls back to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Fallback {
@@ -293,6 +304,9 @@ pub struct SourceContract {
     pub on_failure_detail: &'static str,
     /// The kernel's budgets before its ring (stage 2).
     pub kernel_budgets: &'static [KernelBudget],
+    /// Lot 273b: what its programs cost the host, where it is more than
+    /// noise (the deny hooks on every path walk and every write).
+    pub overhead: &'static [Overhead],
     /// What its records cut.
     pub truncations: &'static [Truncation],
     /// Its rings' `RING_DROPS` slots (stage 1).

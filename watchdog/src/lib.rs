@@ -1682,11 +1682,16 @@ pub fn register_self_pid(bpffs_root: &Path, own_pid: u32) -> Result<()> {
 pub fn register_own_cgroup(bpffs_root: &Path, own_pid: u32) {
     use antitamper_bpf::cgroup_guard::UnitCgroup;
     match antitamper_bpf::cgroup_guard::protect_unit_cgroup(bpffs_root, own_pid) {
-        Ok(UnitCgroup::Service { cgroup, entries }) => info!(
+        Ok(UnitCgroup::Service {
+            cgroup,
+            entries,
+            values,
+        }) => info!(
             target: "watchdog",
             pid = own_pid,
             cgroup = %nn_model::log_escape::Escaped(&cgroup),
             entries = entries.len(),
+            values = values.len(),
             "watchdog unit cgroup registered in PROTECTED_INODES"
         ),
         Ok(UnitCgroup::NotAService { cgroup }) => info!(

@@ -17,36 +17,54 @@
 //! | its `cgroup.procs`, `cgroup.threads` | `MUTATE` | `chown` / `chmod` (a delegation); writes stay open: systemd attaches the unit's processes there |
 //! | each ancestor slice's `cgroup.kill` / `cgroup.freeze` | as the unit's | a kill or freeze of the whole slice, which kills or freezes the unit with it |
 //!
+//! | the unit's directory and each ancestor slice's | `LIMIT_DIR` (lot 273b; the unit's with the flags above) | a write of a resource file in it ([`common::cgroup_limits::LIMIT_FILES`]) but PID 1's of the value the file held at the registration |
+//!
+//! Lot 273b: each resource file there is entered by its directory, not by
+//! itself — one that appears later (a controller enabled after this
+//! registration) is protected from its first write. The value each file
+//! holds now — what PID 1 (systemd realising the unit again, a reload)
+//! may write back — goes into `LIMIT_VALUES`
+//! ([`common::cgroup_limits::limit_value`]); a file without one has the
+//! kernel's default. Any other value is a change of the unit (a
+//! `set-property`), made inside a window. A low `memory.max` is an OOM
+//! kill inside the write, `cpu.max` / `cpu.idle` / `pids.max` starve the
+//! agent as a freeze does; refused, they are signed `cgroup_limit`.
+//!
 //! Not entered: the unit's `cgroup.subtree_control` (systemd rewrites it at
 //! every realisation of the unit; the unit has processes, so no domain
-//! controller can be enabled below it anyway) and the resource files
-//! (`memory.max`, `cpu.max`, `cpu.idle`, `pids.max`, ...: systemd applies
-//! the unit's properties there as PID 1). Not refusing them is an open
-//! residual, lot 273b's scope: a low `memory.max` is an OOM kill inside the
-//! write, `cpu.max` / `cpu.idle` / `pids.max` starve the agent like a
-//! freeze; a change the agent survives is reported as `integrity_drift`.
-//! A move of a protected process out of the cgroup is refused by the
-//! `cgroup_move_*` programs, not by an entry.
+//! controller can be enabled below it anyway). A move of a protected
+//! process out of the cgroup is refused by the `cgroup_move_*` programs,
+//! not by an entry.
 //!
 //! Only a systemd *service* cgroup is protected (`…/<name>.slice/…/<unit>.service`):
 //! the agent started by hand or by a privileged test runs in a login
 //! scope, whose cgroup is not the agent's to defend. Only cgroup v2: a v1
-//! hierarchy root mounts later (the v1 `freezer` is mountable on a pure v2
-//! host too) is not covered yet (lot 273b).
+//! hierarchy (the v1 `freezer` is mountable on a pure v2 host too) is
+//! refused whole where systemd runs the unified hierarchy only
+//! ([`v1_policy`]).
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use aya::maps::{HashMap as AyaHashMap, Map as AyaMap, MapData};
+use common::cgroup_limits::{limit_value, LimitValue, LIMIT_FILES};
 use common::wire::{
     InodeKey, FS_PROTECT_CGROUP_FREEZE, FS_PROTECT_CGROUP_KILL, FS_PROTECT_INIT_RMDIR,
-    FS_PROTECT_MUTATE, FS_PROTECT_NOCREATE, FS_PROTECT_WRITE,
+    FS_PROTECT_LIMIT_DIR, FS_PROTECT_MUTATE, FS_PROTECT_NOCREATE, FS_PROTECT_WRITE,
 };
 
 /// Name of the pinned `PROTECTED_INODES` map (mirrors the `#[map]` in
 /// `agent-ebpf/src/inode_protect.rs`).
 pub const PROTECTED_INODES_MAP_NAME: &str = "PROTECTED_INODES";
+
+/// Lot 273b: name of the pinned `LIMIT_VALUES` map (`InodeKey` → value;
+/// `agent-ebpf/src/cgroup_files.rs`).
+pub const LIMIT_VALUES_MAP_NAME: &str = "LIMIT_VALUES";
+
+/// Lot 273b: name of the pinned `CGROUP_POLICY` array (`[0]`:
+/// `common::wire::CGROUP_POLICY_*` bits).
+pub const CGROUP_POLICY_MAP_NAME: &str = "CGROUP_POLICY";
 
 /// Where the cgroup v2 hierarchy is mounted: the unified layout, then the
 /// hybrid one.
@@ -56,7 +74,12 @@ pub const CGROUP2_MOUNTS: &[&str] = &["/sys/fs/cgroup", "/sys/fs/cgroup/unified"
 pub const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
 
 /// The flags of the unit's directory.
-pub const UNIT_DIR_FLAGS: u8 = FS_PROTECT_MUTATE | FS_PROTECT_NOCREATE | FS_PROTECT_INIT_RMDIR;
+pub const UNIT_DIR_FLAGS: u8 =
+    FS_PROTECT_MUTATE | FS_PROTECT_NOCREATE | FS_PROTECT_INIT_RMDIR | FS_PROTECT_LIMIT_DIR;
+/// Lot 273b: the flags of an ancestor slice's directory — its resource
+/// files protected by name, nothing else (other units' cgroups are made
+/// and removed in it).
+pub const SLICE_DIR_FLAGS: u8 = FS_PROTECT_LIMIT_DIR;
 /// The flags of a protected `cgroup.kill`.
 pub const KILL_FLAGS: u8 = FS_PROTECT_MUTATE | FS_PROTECT_WRITE | FS_PROTECT_CGROUP_KILL;
 /// The flags of a protected `cgroup.freeze`.
@@ -72,14 +95,25 @@ pub struct CgroupEntry {
     pub flags: u8,
 }
 
+/// Lot 273b: the value one resource file holds at the registration
+/// ([`common::cgroup_limits::limit_value`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueEntry {
+    pub path: PathBuf,
+    pub key: InodeKey,
+    pub value: LimitValue,
+}
+
 /// What the cgroup of a process is to the guard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnitCgroup {
     /// A systemd service's cgroup: `cgroup` (as `/proc/<pid>/cgroup` names
-    /// it) and the entries to register.
+    /// it), the entries to register and (lot 273b) the values of the
+    /// resource files there are.
     Service {
         cgroup: String,
         entries: Vec<CgroupEntry>,
+        values: Vec<ValueEntry>,
     },
     /// Not a systemd service's cgroup (a login scope, the root): nothing
     /// to protect.
@@ -96,6 +130,23 @@ impl UnitCgroup {
             UnitCgroup::Service { entries, .. } => entries,
             _ => &[],
         }
+    }
+
+    /// Lot 273b: the values to register (none unless [`UnitCgroup::Service`]).
+    pub fn values(&self) -> &[ValueEntry] {
+        match self {
+            UnitCgroup::Service { values, .. } => values,
+            _ => &[],
+        }
+    }
+
+    /// Every key registered for it, in either map (what a release removes).
+    pub fn keys(&self) -> Vec<InodeKey> {
+        self.entries()
+            .iter()
+            .map(|e| e.key)
+            .chain(self.values().iter().map(|f| f.key))
+            .collect()
     }
 }
 
@@ -198,6 +249,7 @@ pub fn unit_cgroup_at(root: &Path, cgroup: &str) -> UnitCgroup {
         }
     };
     let mut entries = Vec::new();
+    let mut values = Vec::new();
     let mut dir = root.to_path_buf();
     let last = parts.len() - 1;
     for (i, part) in parts.iter().enumerate() {
@@ -212,16 +264,21 @@ pub fn unit_cgroup_at(root: &Path, cgroup: &str) -> UnitCgroup {
         } else {
             &[("cgroup.kill", KILL_FLAGS), ("cgroup.freeze", FREEZE_FLAGS)]
         };
-        if i == last {
-            match entry_of(&dir, UNIT_DIR_FLAGS, true) {
-                Ok(Some(e)) => entries.push(e),
-                Ok(None) => {
-                    return UnitCgroup::Unavailable {
-                        why: format!("{} is gone", dir.display()),
-                    }
+        // The directory: the unit's, or (lot 273b) a slice's, whose
+        // resource files are protected by name.
+        let dir_flags = if i == last {
+            UNIT_DIR_FLAGS
+        } else {
+            SLICE_DIR_FLAGS
+        };
+        match entry_of(&dir, dir_flags, true) {
+            Ok(Some(e)) => entries.push(e),
+            Ok(None) => {
+                return UnitCgroup::Unavailable {
+                    why: format!("{} is gone", dir.display()),
                 }
-                Err(why) => return UnitCgroup::Unavailable { why },
             }
+            Err(why) => return UnitCgroup::Unavailable { why },
         }
         for (name, flags) in files {
             match entry_of(&dir.join(name), *flags, false) {
@@ -230,11 +287,40 @@ pub fn unit_cgroup_at(root: &Path, cgroup: &str) -> UnitCgroup {
                 Err(why) => return UnitCgroup::Unavailable { why },
             }
         }
+        for (name, kind) in LIMIT_FILES {
+            if let Some(f) = value_of(&dir.join(name), kind) {
+                values.push(f);
+            }
+        }
     }
     UnitCgroup::Service {
         cgroup: cgroup.to_string(),
         entries,
+        values,
     }
+}
+
+/// Lot 273b: the value of the resource file at `path` — the text it holds,
+/// its trailing newline cut. `None` when it is not there (its controller
+/// is not enabled), is not a file, or holds more than
+/// [`common::cgroup_limits::LIMIT_TEXT_MAX`] bytes: the kernel's default is
+/// the one write PID 1 may make then. (The value is the file's bytes
+/// whatever its kind.)
+fn value_of(path: &Path, _kind: u8) -> Option<ValueEntry> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let text = std::fs::read(path).ok()?;
+    let value = limit_value(&text)?;
+    Some(ValueEntry {
+        path: path.to_path_buf(),
+        key: InodeKey {
+            dev: stat_dev_to_kernel_dev(meta.dev()),
+            ino: meta.ino(),
+        },
+        value,
+    })
 }
 
 /// The entry of `path` (`lstat`, never a link's target): `Ok(None)` when
@@ -297,7 +383,53 @@ pub fn protect_unit_cgroup(bpffs_root: &Path, pid: u32) -> Result<UnitCgroup> {
             )
         })?;
     }
+    write_values(bpffs_root, unit.values())?;
     Ok(unit)
+}
+
+/// Lot 273b: the values the resource files of the unit cgroup `cgroup`
+/// (as `/proc/<pid>/cgroup` names it) and of its slices hold now, into the
+/// pinned `LIMIT_VALUES` — at the close of a trusted-installer window, so
+/// a change made inside it (a `set-property`) is the value PID 1 may write
+/// back afterwards. Nothing else is registered. The number of values
+/// written; `Ok(0)` when the cgroup is gone or not a service's.
+pub fn refresh_unit_values(bpffs_root: &Path, cgroup: &str) -> Result<usize> {
+    let Some(root) = cgroup2_root() else {
+        return Ok(0);
+    };
+    let unit = unit_cgroup_at(&root, cgroup);
+    write_values(bpffs_root, unit.values())?;
+    Ok(unit.values().len())
+}
+
+/// Lot 273b: the values into the pinned `LIMIT_VALUES`. An agent older
+/// than lot 273b pinned none: nothing to write then (its hooks read no
+/// value).
+fn write_values(bpffs_root: &Path, values: &[ValueEntry]) -> Result<()> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    let pin = bpffs_root.join(LIMIT_VALUES_MAP_NAME);
+    if !pin.exists() {
+        return Ok(());
+    }
+    let data = MapData::from_pin(&pin).with_context(|| {
+        format!(
+            "opening pinned {LIMIT_VALUES_MAP_NAME} at {}",
+            pin.display()
+        )
+    })?;
+    let mut map: AyaHashMap<MapData, Key, LimitValue> = AyaHashMap::try_from(AyaMap::HashMap(data))
+        .with_context(|| format!("{LIMIT_VALUES_MAP_NAME} is not a HashMap<InodeKey, [u64; 4]>"))?;
+    for f in values {
+        map.insert(Key(f.key), f.value, 0).with_context(|| {
+            format!(
+                "registering the value of {} in {LIMIT_VALUES_MAP_NAME}",
+                f.path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Remove `keys` from the pinned `PROTECTED_INODES` (a former watchdog's
@@ -315,7 +447,74 @@ pub fn release_keys(bpffs_root: &Path, keys: &[InodeKey]) -> Result<()> {
     for k in keys {
         let _ = map.remove(&Key(*k));
     }
+    // Lot 273b: and their values.
+    let values = bpffs_root.join(LIMIT_VALUES_MAP_NAME);
+    if values.exists() {
+        let data = MapData::from_pin(&values).with_context(|| {
+            format!(
+                "opening pinned {LIMIT_VALUES_MAP_NAME} at {}",
+                values.display()
+            )
+        })?;
+        let mut map: AyaHashMap<MapData, Key, LimitValue> =
+            AyaHashMap::try_from(AyaMap::HashMap(data)).with_context(|| {
+                format!("{LIMIT_VALUES_MAP_NAME} is not a HashMap<InodeKey, [u64; 4]>")
+            })?;
+        for k in keys {
+            let _ = map.remove(&Key(*k));
+        }
+    }
     Ok(())
+}
+
+/// Lot 273b: whether writes to cgroup v1 hierarchies are refused on this
+/// host — when its systemd runs the unified hierarchy only: the v2
+/// hierarchy at `/sys/fs/cgroup` and no `name=systemd` v1 hierarchy in
+/// `mountinfo`. A hybrid host's systemd writes its v1 hierarchy itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum V1Policy {
+    /// Refused: the v1 hierarchies mounted now (`mount point (options)`),
+    /// whose writers are refused from here on too.
+    Refused { mounted: Vec<String> },
+    /// Not refused, and why (a hybrid or legacy host).
+    NotRefused { why: String },
+}
+
+/// [`V1Policy`] of a host whose `/sys/fs/cgroup` is (`unified`) the v2
+/// hierarchy, from its `mountinfo` text.
+pub fn v1_policy(unified: bool, mountinfo: &str) -> V1Policy {
+    let v1: Vec<(String, String)> = mountinfo
+        .lines()
+        .filter_map(|l| {
+            let (left, right) = l.split_once(" - ")?;
+            let mut r = right.split_whitespace();
+            if r.next()? != "cgroup" {
+                return None;
+            }
+            let _source = r.next();
+            let opts = r.next().unwrap_or("").to_string();
+            let mount = left.split_whitespace().nth(4)?.to_string();
+            Some((mount, opts))
+        })
+        .collect();
+    if !unified {
+        return V1Policy::NotRefused {
+            why: "/sys/fs/cgroup is not the cgroup v2 hierarchy (a hybrid or legacy host): \
+                  systemd writes its cgroup v1 hierarchies"
+                .into(),
+        };
+    }
+    if let Some((m, _)) = v1
+        .iter()
+        .find(|(_, o)| o.split(',').any(|x| x == "name=systemd"))
+    {
+        return V1Policy::NotRefused {
+            why: format!("systemd's cgroup v1 hierarchy is mounted at {m} (a hybrid host)"),
+        };
+    }
+    V1Policy::Refused {
+        mounted: v1.into_iter().map(|(m, o)| format!("{m} ({o})")).collect(),
+    }
 }
 
 #[cfg(test)]
@@ -378,13 +577,19 @@ mod tests {
             "cgroup.freeze",
             "cgroup.procs",
             "cgroup.threads",
-            "memory.max",
         ] {
             std::fs::write(unit.join(f), b"").unwrap();
         }
+        // lot 273b: resource files, by their content
+        std::fs::write(unit.join("memory.max"), b"11811160064\n").unwrap();
+        std::fs::write(unit.join("pids.max"), b"512\n").unwrap();
+        std::fs::write(unit.join("cpu.max"), b"max 100000\n").unwrap();
+        std::fs::write(unit.join("cpu.weight"), b"100\n").unwrap();
+        std::fs::write(unit.join("io.max"), [b'8'; 40]).unwrap();
         // the slice: freeze only (a kernel without cgroup.kill)
         std::fs::write(root.join("system.slice/cgroup.freeze"), b"").unwrap();
         std::fs::write(root.join("system.slice/cgroup.procs"), b"").unwrap();
+        std::fs::write(root.join("system.slice/memory.max"), b"max\n").unwrap();
         let u = unit_cgroup_at(root, "/system.slice/northnarrow-agent.service");
         let got: Vec<(String, u8)> = u
             .entries()
@@ -399,6 +604,7 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                ("system.slice".to_string(), SLICE_DIR_FLAGS),
                 ("system.slice/cgroup.freeze".to_string(), FREEZE_FLAGS),
                 (
                     "system.slice/northnarrow-agent.service".to_string(),
@@ -422,6 +628,52 @@ mod tests {
                 ),
             ]
         );
+        // lot 273b: the values of the resource files there are, as they
+        // hold them; one too long for the deny keeps the default
+        let values: Vec<(String, LimitValue)> = u
+            .values()
+            .iter()
+            .map(|f| {
+                (
+                    f.path.strip_prefix(root).unwrap().display().to_string(),
+                    f.value,
+                )
+            })
+            .collect();
+        let v = |t: &[u8]| limit_value(t).unwrap();
+        assert_eq!(
+            values,
+            vec![
+                ("system.slice/memory.max".to_string(), v(b"max")),
+                (
+                    "system.slice/northnarrow-agent.service/memory.max".to_string(),
+                    v(b"11811160064")
+                ),
+                (
+                    "system.slice/northnarrow-agent.service/pids.max".to_string(),
+                    v(b"512")
+                ),
+                (
+                    "system.slice/northnarrow-agent.service/cpu.weight".to_string(),
+                    v(b"100")
+                ),
+                (
+                    "system.slice/northnarrow-agent.service/cpu.max".to_string(),
+                    v(b"max 100000")
+                ),
+            ]
+        );
+        let m = std::fs::metadata(unit.join("pids.max")).unwrap();
+        let f = u
+            .values()
+            .iter()
+            .find(|f| f.path.ends_with("pids.max"))
+            .unwrap();
+        assert_eq!(
+            (f.key.dev, f.key.ino),
+            (stat_dev_to_kernel_dev(m.dev()), m.ino())
+        );
+        assert_eq!(u.keys().len(), u.entries().len() + u.values().len());
         // each key is the file's own
         let m = std::fs::metadata(unit.join("cgroup.kill")).unwrap();
         let k = u
@@ -455,6 +707,15 @@ mod tests {
             unit_cgroup_at(root, "/system.slice/linked.service"),
             UnitCgroup::Unavailable { .. }
         ));
+        // lot 273b: a link where a resource file is: no value read through
+        // it (the kernel's default stays the one write PID 1 may make)
+        let lu = root.join("system.slice/l.service");
+        std::fs::create_dir_all(&lu).unwrap();
+        std::fs::write(root.join("big"), b"max\n").unwrap();
+        std::os::unix::fs::symlink(root.join("big"), lu.join("memory.max")).unwrap();
+        assert!(unit_cgroup_at(root, "/system.slice/l.service")
+            .values()
+            .is_empty());
         // a link where a control file is: refused, not followed
         let unit = root.join("system.slice/a.service");
         std::fs::create_dir_all(&unit).unwrap();
@@ -472,6 +733,7 @@ mod tests {
         use common::wire::{
             fs_protect_denied_op, fs_protect_init_may, fs_protect_required, FS_OP_CGROUP_FREEZE,
             FS_OP_CGROUP_KILL, FS_OP_MKDIR, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_WRITE,
+            FS_PROTECT_LIMIT_DIR,
         };
         let refused = |op: u8, flags: u8| flags & fs_protect_required(op) != 0;
         // the unit's directory: no rmdir but PID 1's, no child, no chown
@@ -496,6 +758,44 @@ mod tests {
         // not re-owned
         assert!(!refused(FS_OP_WRITE, MEMBERS_FLAGS));
         assert!(refused(FS_OP_SETATTR, MEMBERS_FLAGS));
+        // lot 273b: the unit's and the slices' resource files protected by
+        // name; a slice's directory itself refuses nothing (other units'
+        // cgroups come and go in it)
+        assert_ne!(UNIT_DIR_FLAGS & FS_PROTECT_LIMIT_DIR, 0);
+        assert_eq!(SLICE_DIR_FLAGS, FS_PROTECT_LIMIT_DIR);
+        for op in 1..=common::wire::FS_OP_OOM_ADJ {
+            assert!(!refused(op, SLICE_DIR_FLAGS), "op {op}");
+        }
+    }
+
+    /// Lot 273b: cgroup v1 writes are refused where systemd runs the
+    /// unified hierarchy only — v1 hierarchies mounted anyway are listed —
+    /// and not on a hybrid or legacy host.
+    #[test]
+    fn the_v1_refusal_follows_the_hosts_hierarchy() {
+        let unified =
+            "25 1 0:22 / /sys/fs/cgroup rw,nosuid shared:9 - cgroup2 cgroup2 rw,nsdelegate\n";
+        assert_eq!(
+            v1_policy(true, unified),
+            V1Policy::Refused { mounted: vec![] }
+        );
+        let mounted =
+            format!("{unified}99 1 0:50 / /mnt/f rw,relatime shared:60 - cgroup x rw,freezer\n");
+        assert_eq!(
+            v1_policy(true, &mounted),
+            V1Policy::Refused {
+                mounted: vec!["/mnt/f (rw,freezer)".into()]
+            }
+        );
+        let hybrid = "30 25 0:26 / /sys/fs/cgroup/systemd rw shared:10 - cgroup cgroup rw,xattr,name=systemd\n";
+        assert!(matches!(
+            v1_policy(true, hybrid),
+            V1Policy::NotRefused { why } if why.contains("/sys/fs/cgroup/systemd")
+        ));
+        assert!(matches!(
+            v1_policy(false, unified),
+            V1Policy::NotRefused { .. }
+        ));
     }
 
     #[test]

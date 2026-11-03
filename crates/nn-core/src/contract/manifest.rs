@@ -209,6 +209,9 @@ pub struct SourceTerms {
     pub on_failure: FailureMode,
     pub on_failure_detail: String,
     pub kernel_budgets: Vec<String>,
+    /// Lot 273b: what its programs cost the host ([`super::Overhead`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overhead: Vec<String>,
     pub truncations: Vec<String>,
     pub rings: Vec<String>,
     /// The stages (plan §3.4) that count its losses.
@@ -244,6 +247,11 @@ impl SourceTerms {
                 .kernel_budgets
                 .iter()
                 .map(|b| format!("{} (counted: {})", b.allows, b.counter))
+                .collect(),
+            overhead: c
+                .overhead
+                .iter()
+                .map(|o| format!("{}: {}", o.what, o.cost))
                 .collect(),
             truncations: c
                 .truncations

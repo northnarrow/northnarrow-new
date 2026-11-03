@@ -386,6 +386,30 @@ pub(crate) fn self_test(
     if let Some(detail) = &self_test_detail {
         northnarrow_agent::boot::degradation::report("deny_self_test", detail);
     }
+    // Lot 273b (the review of #489): the cgroup move guard attached is not
+    // the move guard run — a protected child is moved by an unprotected one
+    // and must be refused; a move done, or an unmeasured test, is signed
+    // degraded (the guard is one optional deny set: the start goes on).
+    if anti_tamper.move_guard_attached {
+        let bpffs = std::path::Path::new(northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT);
+        let outcome = match antitamper_bpf::cgroup_guard::cgroup2_root() {
+            Some(root) => {
+                let (outcome, moved) = northnarrow_agent::boot::deny_selftest::run_move(
+                    std::path::Path::new("/proc/self/exe"),
+                    &root,
+                    &northnarrow_agent::boot::deny_selftest::PinnedMoveRoles(bpffs),
+                );
+                expected_denial.also(&moved);
+                outcome
+            }
+            None => northnarrow_agent::boot::deny_selftest::SelfTestOutcome::Inconclusive(
+                "no cgroup v2 hierarchy mounted".to_string(),
+            ),
+        };
+        if let Some(detail) = northnarrow_agent::boot::deny_selftest::report_move(&outcome) {
+            northnarrow_agent::boot::degradation::report("move_guard_self_test", &detail);
+        }
+    }
     let trust_inputs = {
         let deny = anti_tamper.deny.clone().unwrap_or_default();
         northnarrow_agent::boot::trust::TrustInputs {

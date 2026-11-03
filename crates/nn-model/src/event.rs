@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{
     ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw, ADDR_LEN,
-    FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_CGROUP_FREEZE, FS_OP_CGROUP_KILL, FS_OP_CGROUP_MOVE,
-    FS_OP_CREATE, FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_PTRACE,
-    FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_SYMLINK,
-    FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR,
+    FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_CGROUP_FREEZE, FS_OP_CGROUP_KILL, FS_OP_CGROUP_LIMIT,
+    FS_OP_CGROUP_MOVE, FS_OP_CGROUP_V1, FS_OP_CREATE, FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_LINK,
+    FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_OOM_ADJ, FS_OP_PTRACE, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR,
+    FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR,
 };
 
 /// Serde default of `Event::CanaryTripped::first_trip`.
@@ -1006,6 +1006,17 @@ pub enum FsProtectOperation {
     /// Lot 273: a write-open of a protected unit's `cgroup.freeze` (or an
     /// ancestor slice's).
     CgroupFreeze,
+    /// Lot 273b: a write of a resource file (`memory.max`, `cpu.max`,
+    /// `pids.max`, …) of a protected unit's cgroup or of an ancestor
+    /// slice's — any caller's but PID 1's, or PID 1's of another value than
+    /// the one the file held at its registration (`systemctl set-property`).
+    CgroupLimit,
+    /// Lot 273b: a write to a cgroup v1 hierarchy (a v1 `freezer`) on a
+    /// host whose systemd runs the unified hierarchy.
+    CgroupV1,
+    /// Lot 273b: a write of a protected process's `oom_score_adj` /
+    /// `oom_adj`; the target is the protected tgid.
+    OomAdj,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1035,6 +1046,9 @@ impl FsProtectOperation {
             FS_OP_CGROUP_MOVE => Self::CgroupMove,
             FS_OP_CGROUP_KILL => Self::CgroupKill,
             FS_OP_CGROUP_FREEZE => Self::CgroupFreeze,
+            FS_OP_CGROUP_LIMIT => Self::CgroupLimit,
+            FS_OP_CGROUP_V1 => Self::CgroupV1,
+            FS_OP_OOM_ADJ => Self::OomAdj,
             other => Self::Unknown(other),
         }
     }
@@ -1062,6 +1076,9 @@ impl FsProtectOperation {
             Self::CgroupMove => "cgroup_move",
             Self::CgroupKill => "cgroup_kill",
             Self::CgroupFreeze => "cgroup_freeze",
+            Self::CgroupLimit => "cgroup_limit",
+            Self::CgroupV1 => "cgroup_v1",
+            Self::OomAdj => "oom_adj",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -1568,7 +1585,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
-    /// Lot 273: the three cgroup denial codes decode to their own
+    /// Lot 273 (and 273b): the cgroup denial codes decode to their own
     /// operation, with the names the detection and the tamper check print.
     #[test]
     fn fs_protect_cgroup_ops_decode() {
@@ -1589,6 +1606,22 @@ mod tests {
                 FsProtectOperation::CgroupFreeze,
                 "cgroup_freeze",
             ),
+            // Lot 273b
+            (
+                crate::wire::FS_OP_CGROUP_LIMIT,
+                FsProtectOperation::CgroupLimit,
+                "cgroup_limit",
+            ),
+            (
+                crate::wire::FS_OP_CGROUP_V1,
+                FsProtectOperation::CgroupV1,
+                "cgroup_v1",
+            ),
+            (
+                crate::wire::FS_OP_OOM_ADJ,
+                FsProtectOperation::OomAdj,
+                "oom_adj",
+            ),
         ];
         for (byte, op, name) in cases {
             assert_eq!(FsProtectOperation::from_wire(byte), op);
@@ -1596,8 +1629,8 @@ mod tests {
             assert_eq!(op.to_string(), name);
         }
         assert_eq!(
-            FsProtectOperation::from_wire(22),
-            FsProtectOperation::Unknown(22)
+            FsProtectOperation::from_wire(25),
+            FsProtectOperation::Unknown(25)
         );
     }
     use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};

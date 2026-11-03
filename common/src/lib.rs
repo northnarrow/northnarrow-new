@@ -32,6 +32,10 @@ pub mod bpf_cmd;
 /// revalidates against. NOT `std`-gated — the eBPF half needs it with
 /// `default-features = false`.
 pub mod btf_offsets;
+/// Lot 273b: the resource files of the protected cgroups, their values as
+/// stored and compared, shared by the eBPF programs and the agent. NOT
+/// `std`-gated.
+pub mod cgroup_limits;
 /// Exploit post-condition guard (lab PR 219): the decision model the eBPF
 /// programs run and the agent tests. `no_std`, like [`btf_offsets`].
 pub mod epg;
