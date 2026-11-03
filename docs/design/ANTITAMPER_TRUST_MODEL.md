@@ -999,3 +999,219 @@ dns within the noise. Signed in the capability manifest with the
   the lab's observe-mode BPF guard let the case's `bpftool map update`
   through (a release build refuses it); its `--selftest` does not check
   that restore (mutation MD9): the lab does — without it C12 deviates.
+
+## Lot 273c — another process's limits and priorities, PID 1's memory, floors, systemd's copy, the host's drop-ins
+
+**Goal.** What the review of #490 found beyond lot 273b's scope: ways to
+stop or starve the agent that no cgroup file and no signal carries, the
+trust lot 273b put in PID 1's write-backs, and what a registration takes
+for granted.
+
+### What it closes
+
+- **Another process's change of the agent's limits and priorities.**
+  Between two root processes the kernel checks no capability: `prlimit
+  --pid <agent> --cpu=1:1` set a hard `RLIMIT_CPU` below what the agent
+  had used, and the kernel's own SIGKILL — no `task_kill` hook sees it —
+  ended it; `--nofile=0`, `--memlock=0`, a small `--as` break it;
+  `chrt --idle`, `taskset` to one CPU, `renice +19`, `ionice -c 3`
+  starve it. Four new deny hooks refuse them outside a window
+  (`agent-ebpf/src/task_limits.rs`): `task_setrlimit` (`prlimit`),
+  `task_setscheduler` (`sched_setattr`, `sched_setscheduler`,
+  `sched_setaffinity`, `timerslack_ns`), `task_setnice` (`setpriority`)
+  and `task_setioprio` (`ioprio_set`) — when the target is protected (or
+  runs the agent's binary), the caller neither exempt nor the target
+  itself (a process sets its own: the agent's workers do), signed
+  `rlimit`, `sched`, `nice`, `ioprio`. A refused limit is decisive
+  (COMBAT, as a kill); a refused priority is an impairment (ENGAGED): a
+  tuning daemon (`tuned`, `numad`) applying a host-wide profile meets it
+  too, and the ladder must not kill it. Twenty-one deny hooks.
+- **PID 1's memory.** Lot 273b lets PID 1 write back a unit's resource
+  values and thaw a slice on the bytes its `write(2)` carries, read in
+  `file_permission`; the kernel copies them again afterwards. A PID 1
+  whose memory root could write — a tracer, `/proc/1/mem`,
+  `process_vm_writev` — could swap them in between. The ptrace hook now
+  refuses attach-mode access to PID 1 outside a window (signed `ptrace`,
+  target 1); read-mode access (`ps`, `/proc/1/environ`, `/proc/1/maps`)
+  is untouched, and a window lets a debugger attach.
+- **Floors.** A registration took the value a file held as the one PID 1
+  may write back: at a start, the fresh cgroup's (systemd fills it from
+  its own copy of the unit — a refused `set-property` stays there, in
+  memory, until a reload); at a window's close, whatever was written
+  inside it. Now a value below its floor is not registered: the floor is
+  registered first, then written to the file, then read back (PID 1 cannot
+  put the hostile value back in between, its write is no longer the
+  registered one), and the restoration is a signed drift
+  (`limit_floor_restored`; `antitamper-bpf/src/cgroup_floors.rs`). The
+  floors: the agent's unit at least 512 MiB of memory, 256 tasks, half a
+  CPU; the watchdog's what its unit sets (32 MiB, 8 tasks, 10 % of a CPU);
+  a slice 1 GiB, 1024 tasks, one CPU, room for 4096 cgroups 8 deep;
+  everywhere `cpu.weight` 100, `cpu.weight.nice` 0, no `cpu.idle`, no
+  `memory.oom.group`, no `io.max` limit, an I/O weight of 100; a unit's
+  `cpuset.*` its parent's. The watchdog applies them to the agent's fresh
+  cgroup at its start and after every respawn — a `memory.max` that
+  OOM-kills the agent before its attach is the watchdog's to restore.
+- **systemd's copy of a refused `set-property`.** The agent asks systemd
+  for a `daemon-reload` — a SIGHUP to PID 1, once PID 1 is found serving
+  systemd's private socket (`SO_PEERCRED`); signed `systemd_reload` —
+  when PID 1's write of a protected resource file or its new drop-in is
+  refused (at most one every 30 s, a later one kept for after the
+  interval, not dropped; one per target per 10 minutes: a unit whose own
+  file sets a value below a floor would loop), when a window opens
+  (before the maintenance restarts a unit), and after a quarantine
+  (below). Not `Manager.Reload()` on the private socket: systemd lets a
+  caller reload at once only with `CAP_SYS_ADMIN`, which the agent's unit
+  does not grant, and asks polkit for any other — the lab's round 4
+  (Ubuntu 24.04, systemd 255) saw each call wait its whole 30 s timeout,
+  and systemd reload only when the agent closed the connection ("Failed
+  to send queued message … Transport endpoint is not connected", 30
+  times). Root signals PID 1 without a capability.
+- **The host's drop-ins.** `service.d/*.conf` reaches every service, ours
+  too; `slice.d`, `system.slice.d` the slice they run in. The agent's
+  integrity round reads them in `/etc/systemd/system` and
+  `/run/systemd/system` (the agent's unit makes them, empty, and lets the
+  agent write there): a drop-in with a directive that stops, starves,
+  limits or replaces a service (resource control, scheduling, limits,
+  killing, `Exec*`, `Condition*`, mounts, a syscall filter, an
+  `Environment=` of an `NN_` / `LD_` variable) is moved to
+  `/var/lib/northnarrow/quarantine/dropins/`, systemd reloads, and the
+  move is signed (`unit_dropin_quarantined`). Other drop-ins (a timeout, a
+  proxy variable) are left: findings, as before. The vendor directories
+  are the packages': findings only.
+- **cgroup v1, narrowed.** Lot 273b refused every v1 write where systemd
+  runs the unified hierarchy, an old container's `name=systemd` hierarchy
+  too. Now only a hierarchy that binds a controller (`subsys_mask`, read
+  through the superblock's kernfs root: six optional BTF offsets) and
+  only its `cgroup.procs`, `tasks` and `freezer.state` — what moves or
+  freezes a process. A named hierarchy moves and freezes nothing.
+- **More resource files.** `cpuset.cpus`, `cpuset.mems`,
+  `cpuset.cpus.partition` (the agent pinned to one CPU a real-time hog
+  owns), `memory.reclaim` (a forced reclaim, repeated: a thrash; never
+  PID 1's either), `io.weight`, `io.bfq.weight`.
+- **The write deny's cost.** `file_permission` leaves at once on a
+  socket, a pipe or a tty — most writes of a busy host — before its map
+  lookup: no protected file, cgroup file or proc file is anything but a
+  regular file.
+- **PID 1's verdict and the files' classification, judged on the host.**
+  The review's own mutations of lot 273b's write deny that no host test
+  saw: a `return false` before PID 1's comparison (P2: PID 1 writes any
+  value; only the lab's `set-property` flow, C85, caught it) and the
+  superblock's magic masked to 16 bits (P3: every cgroup and proc file
+  left unjudged). Both decisions are now the shared module's pure
+  functions, which the eBPF program calls and the host's tests judge
+  (`northnarrow_common::cgroup_limits::init_write_lets_through`,
+  `special_fs`), and `xtask/tests/cgroup_guard.rs` pins PID 1's arm whole
+  and the magic read as it goes to the classification: P2 and P3, and
+  three variants of each, are caught.
+
+### Systemd and the flows
+
+Measured on the five lab guests (Ubuntu 22.04 / 249, Debian 12 / 252,
+Ubuntu 24.04 / 255, Debian 13 / 257, Ubuntu 26.04 / 259; rounds 4 and 5
+of the lot, the tamper check):
+
+| flow, outside a window unless said | with lot 273c |
+|---|---|
+| `prlimit --pid <agent>` (`--cpu`, `--nofile`, `--as`, `--memlock`), `renice`, `chrt`, `taskset`, `ionice` of a protected process (C89–C94) | refused (`rlimit`, `nice`, `sched`, `ioprio`), signed; any other process unchanged; the agent's workers set their own |
+| a tracer on PID 1, `/proc/1/mem` for writing (C95, C96) | refused (`ptrace`, target 1); inside a window the tracer attaches (C95b) |
+| `ps`, `top`, `lsof`, `/proc/1/environ`, `/proc/1/maps`, `/proc/1/fd` | untouched (read mode) |
+| `/proc/1/stack`, `/proc/1/syscall`, `process_vm_readv` and `pidfd_getfd` on PID 1 | attach mode in the kernel: refused outside a window, like a tracer |
+| `daemon-reexec`, a systemd package upgrade (its maintainer script reexecs) | let through: PID 1's exec is not refused (residual) |
+| `systemctl set-property` of the agent outside a window (C100) | refused at the cgroup file and the drop-in, as in lot 273b; systemd's copy taken back by the agent's reload (a SIGHUP to PID 1): systemd's `MemoryHigh` back to the unit's own value before the case's 75 s on the five (`systemd_reload` signed; on #490's head it stayed at 2 GiB) |
+| `set-property` inside a window, the window closed (C98) | the value kept if at or above its floor; `memory.high` 100 MiB restored to 512 MiB at the close, signed `limit_floor_restored` |
+| the agent restarted inside a window with systemd's copy below the floor (C102) | the fresh cgroup restored to the floor, by the watchdog's check of the respawned agent or by the agent's registration, signed: OK on the five (Debian 13 in round 6); the agent's own registration restored it first each time. On #490's head the fresh cgroup kept 100 MiB, the agent throttled — not up within the case's minute |
+| a window opened | systemd reloaded (`systemd_reload`, "a trusted-installer window opened") |
+| a host drop-in in `service.d` with a dangerous directive (C97) | moved to the quarantine within a round (30 s), systemd reloaded, signed `unit_dropin_quarantined` |
+| a named cgroup v1 hierarchy (`name=…`, no controller; C99) | a move in it let through (lot 273b refused it); a freezer hierarchy refused (C83) |
+| `memory.reclaim` of the agent's unit (C101) | refused (`cgroup_limit`), PID 1's too |
+
+### Cost
+
+Measured on Ubuntu 24.04 (6.8, the lab guest, 4 vCPU), lot 273b's script
+with `kernel.bpf_stats_enabled=0` for the timed rounds (the review of
+#490: the stats add two clock reads to every call, and lot 273b's rounds
+had them on): every program attached (A), the move guard's three links
+removed (B1), the write deny's link removed (B2), three alternated rounds,
+medians:
+
+| workload | A | B1 (no move guard) | B2 (no write deny) |
+|---|---|---|---|
+| `git status` ×10 on the lab's source tree | 98 ms | 87 ms | 85 ms |
+| `find /usr -xdev` ×3 | 770 ms | 752 ms | 754 ms |
+| a 2,000-file package installed and removed (`dpkg`) | 1,123 ms | 1,102 ms | 1,076 ms |
+
+The rounds' spread is of the same order (A's `git status`: 83–100 ms):
+the move guard costs about +13 % on `git status` (lot 273b, the stats on:
++24 %), `find` +2 % (+5 %); the write deny the package +4 % (+9 %). Per
+call (the stats on for one round only, `run_time_ns` / `run_cnt`):
+`cgroup_move_deny` 61.9 ns over 418,082 calls, `protected_write_deny`
+96.3 ns over 102,218, the FIM's `fim_write_intent_observe` on the same
+hook 95.8 ns, `protected_open_deny` 266.4 ns over 55,134. The write
+deny's new exit on a file that is not a regular one, measured on its
+own (the stats on, `k273c-pipe.sh`: 400,000 to 880,000 calls each): a
+write to a pipe 100.3 ns, to a socket 90.7 ns, to a regular file 221.7 ns
+(the lookup and the magic); the FIM's program on the same calls, which
+has no such exit, 178.4, 153.9 and 167.4 ns. The four
+task hooks run only on a `prlimit`, `setpriority`, `sched_set*` or
+`ioprio_set` (802–809 instructions each), nothing on the hot path.
+
+Not done, and why:
+
+- **One program for the write deny and the FIM's on `file_permission`**
+  (the review's second suggestion). The write deny is a deny hook: pinned,
+  its link removed and restored only by a window, its absence a refused
+  start, its self-test at every boot. The FIM's program follows the FIM
+  sensor's configuration (a host without FIM paths, a sensor turned off).
+  One program would either tie a deny hook's presence to the FIM's
+  configuration or keep the FIM's observation attached where it is off,
+  for at most one trampoline entry and one `f_inode` read a call.
+- **A signed "workstation" policy that detaches the move guard** (the
+  review's desktop recommendation: the guard on by default, an explicit
+  opt-out, a recovery at `cgroup_procs_write_finish` instead). It needs a
+  new signed overlay kind, its `nn-admin` verbs, the kernel recovery path
+  (the destination protected at once, the process moved back) and its
+  own review; the guard stays on everywhere, and the cost above is what
+  it costs.
+
+### Residual
+
+- **`daemon-reexec` into a modified systemd binary** is not refused:
+  refusing PID 1's exec leaves the host without an init. The binary
+  (`/usr/lib/systemd/systemd`) is in the FIM's default watch list
+  (`configs/fim-paths.v1`), and a root that replaces it can do what PID 1
+  does: write back the values registered for the units, no other.
+- **PID 1's memory before the agent's first attach** (the initrd, the
+  early boot) is not protected; the attach-mode refusal begins with the
+  agent's start.
+- **A tuning daemon's host-wide profile** (`tuned`, `numad`, `irqbalance`'s
+  affinities) does not reach the protected processes: refused and signed
+  each time (ENGAGED, never COMBAT); every other process takes it.
+- **The quarantine is host-wide.** A drop-in of the host's `service.d`
+  (or `slice.d`, `system.slice.d`) with a resource, scheduling, limit,
+  kill, exec, condition or mount directive is taken from every service it
+  reached, not only from ours; it is kept in the quarantine with where it
+  was, and the move is signed. A limit meant for other services goes in
+  their own `<unit>.d/` directories. A drop-in found at the agent's first
+  start (one the host had before the install) is quarantined the same.
+- **The reload is asked, not awaited.** systemd reloads after the SIGHUP
+  (about a quarter of a second on the lab); a second refusal within 30 s
+  waits for the interval, a refusal of the same file within 10 minutes
+  asks none (a unit whose own file sets a value below a floor would
+  loop): systemd's copy of a repeated `set-property` can stay until the
+  next reload or window, and the fresh cgroup of a restart in between
+  takes it — the floors still apply (the watchdog's check after a
+  respawn, the agent's registration at its start).
+- **Other controller files.** `cpu.uclamp.max`, `memory.swap.max`,
+  `memory.low` / `memory.min` of a sibling are still not refused: none
+  kills the agent or stops it; some slow it.
+- **Starvation from outside the units' settings** — real-time hogs on
+  every CPU, a saturated disk — is not a setting of the agent's: the
+  watchdog's supervision and the integrity round's stall check
+  (`STALL_SLACK_SECS`) see it, no hook refuses it.
+- **A hybrid v1 host** (systemd writes its own v1 hierarchy): no v1 write
+  is refused there, signed as an `anti_tamper` degradation in the
+  capability manifest at every start (lot 273b's, unchanged); the
+  narrowing above applies where systemd runs the unified hierarchy.
+- **A soft-reboot** behaves as lot 273b measured it (outside this lot).
+- **Fail-open.** A task hook that cannot read its target's tgid lets the
+  change through, counted in its `DENY_FAIL_OPEN` slot and signed.

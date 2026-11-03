@@ -664,7 +664,7 @@ not verify, or a file that is not one — recorded and removed`.
   or its ERROR (`… attached but the kernel does not run it`) / WARN
   (`… inconclusive (…)`).
 
-## 9. The units' cgroups (lots 273 and 273b)
+## 9. The units' cgroups (lots 273, 273b and 273c)
 
 The agent's and the watchdog's unit cgroups are part of what the deny
 hooks protect (the mechanism, the systemd versions and the residual:
@@ -737,4 +737,40 @@ signed by what it would have done):
   attempt. PID 1's `0` to a protected `cgroup.freeze` and its xattrs on a
   unit's cgroup directory are let through; its `1` (a freeze) is refused at
   the write.
+
+Lot 273c (the review of #490):
+
+- **Another process's settings of the agent.** `prlimit --pid` (signed
+  `rlimit`; `--cpu=1:1` is a kernel SIGKILL no signal hook sees), `chrt`
+  and `taskset` (`sched`), `renice` (`nice`) and `ionice` (`ioprio`) of a
+  protected process are refused outside a window: four new deny hooks,
+  twenty-one in all. A process changes its own settings freely.
+- **PID 1** is refused to attach-mode ptrace outside a window — a tracer,
+  `/proc/1/mem`, `process_vm_writev` (signed `ptrace`, target 1). Debugging
+  PID 1 takes a window.
+- **Floors.** A resource value below its floor is not registered: the
+  floor is registered, written and read back, and the agent signs
+  `limit_floor_restored` — at the start, at a window's close, and from the
+  watchdog, which checks the agent's fresh cgroup at its start and after a
+  respawn (its restorations signed by the agent, from the watchdog's
+  record). The agent's unit at least 512 MiB, 256 tasks, half a CPU; the
+  watchdog's what its unit sets; a slice 1 GiB, 1024 tasks, one CPU.
+- **systemd's copy.** After a refused PID 1 write of our units (a
+  `set-property` outside a window), at a window's opening and after a
+  quarantine, the agent asks systemd for a `daemon-reload` — a SIGHUP to
+  PID 1, once PID 1 is found serving systemd's private socket (signed
+  `systemd_reload`): systemd's copy of a refused `set-property` no longer
+  waits for an operator's reload.
+- **The host's drop-ins.** A drop-in of `/etc/systemd/system/` or
+  `/run/systemd/system/`'s `service.d`, `slice.d` or `system.slice.d` that
+  limits, starves, replaces or conditions a service (or sets an `NN_` /
+  `LD_` variable) is moved to `/var/lib/northnarrow/quarantine/dropins/`
+  and signed `unit_dropin_quarantined`; a reload follows.
+- **cgroup v1** is refused only where it moves or freezes a process: a
+  hierarchy that binds a controller, its `cgroup.procs`, `tasks` and
+  `freezer.state`. A named hierarchy (an old container's `name=systemd`)
+  works.
+- **More resource files**: `cpuset.cpus`, `cpuset.mems`,
+  `cpuset.cpus.partition`, `memory.reclaim`, `io.weight`,
+  `io.bfq.weight`.
 
