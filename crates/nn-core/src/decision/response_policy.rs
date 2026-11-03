@@ -85,10 +85,10 @@ pub struct Held {
     pub reasoning: String,
     pub switch: &'static str,
     /// Lot 278: held by the posture the event was judged in
-    /// ([`super::posture_floor`]), not by a switch. Such a hold is the
-    /// rule's own record of the event (it caps a later rule's kill of the
-    /// same exec, as R009's sanctioned record does), where a switch's hold
-    /// lets a later rule's response through.
+    /// ([`super::posture_floor`]), not by a switch: what the record's
+    /// reasoning names. For the legacy first match it counts as a switch's
+    /// hold (review of #493, A1): it lets a later rule's response through,
+    /// never stands in for it.
     pub by_posture: bool,
 }
 
