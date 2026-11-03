@@ -344,7 +344,7 @@ mod tests {
         lineage.ingest_exec(
             900,
             800,
-            "/home/ci/nn/deploy/install.sh",
+            "/home/dev/nn/deploy/install.sh",
             &[],
             50 * S,
             50 * S,
@@ -355,7 +355,7 @@ mod tests {
         lineage.ingest_exec(
             901,
             900,
-            "/home/ci/nn/target/release/northnarrow-agent",
+            "/home/dev/nn/target/release/northnarrow-agent",
             &[],
             52 * S,
             52 * S,
@@ -365,7 +365,7 @@ mod tests {
         lineage.ingest_exec(
             902,
             800,
-            "/home/ci/nn/target/release/northnarrow-agent",
+            "/home/dev/nn/target/release/northnarrow-agent",
             &[],
             52 * S,
             52 * S,
@@ -401,7 +401,7 @@ mod tests {
         };
         let rule = R009RootExecFromUserPath::new(lineage.clone())
             .with_installer_window(Some(grant(true, Some(installer))));
-        let agent = "/home/ci/nn/target/release/northnarrow-agent";
+        let agent = "/home/dev/nn/target/release/northnarrow-agent";
         let v = exec(&rule, 901, 900, agent, 52 * S);
         assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::Low));
         assert!(
@@ -410,7 +410,7 @@ mod tests {
             v.reasoning
         );
         // the installer's own exec came before its grant
-        let v = exec(&rule, 900, 800, "/home/ci/nn/deploy/install.sh", 50 * S);
+        let v = exec(&rule, 900, 800, "/home/dev/nn/deploy/install.sh", 50 * S);
         assert_eq!(v.action, ResponseAction::KillProcessTree);
         // a sibling is not the installer's tree
         assert_eq!(

@@ -2325,9 +2325,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// chain first, or when the pid on the walk is a later process (its
     /// start is not the ancestor's).
     pub fn descends_from(&self, pid: u32, as_of: AsOf, ancestor: u32, ancestor_ticks: u64) -> bool {
-        if ancestor <= 1 {
-            return false;
-        }
+        // PID 0 and 1 never match: the walk ends at them
         matches!(
             self.lineage_walk(
                 pid,
@@ -5154,7 +5152,7 @@ mod tests {
         t.ingest_exec(
             901,
             900,
-            "/home/ci/nn/target/release/x",
+            "/home/dev/nn/target/release/x",
             &[],
             52 * S,
             52 * S,
@@ -5219,7 +5217,7 @@ mod tests {
         t.ingest_exec(
             712,
             711,
-            "/home/op/nn/deploy/install.sh",
+            "/home/alice/nn/deploy/install.sh",
             &[],
             10_050 * MS,
             10_045 * MS,
@@ -5235,7 +5233,7 @@ mod tests {
         // the monitor's image must still be the parent's: a fork that runs
         // something else (it executed since, or it was forked before the
         // parent executed sudo) is not sudo's
-        write_exe(tmp.path(), 711, "/home/op/payload");
+        write_exe(tmp.path(), 711, "/home/alice/payload");
         assert!(!t.is_interactive_admin(712, judged));
         // and a fork whose start is past the time judged is not its parent's
         write_exe(tmp.path(), 711, "/usr/bin/sudo");

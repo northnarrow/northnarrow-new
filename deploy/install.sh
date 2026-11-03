@@ -1512,10 +1512,13 @@ wait_own_programs_unloaded() {
 # tree in /tmp —, which the running agent's R009 judges: called only once the
 # trusted-installer window is open (R009 records what the process tree of
 # the installer the window was granted to executes, at Low), or when no agent
-# runs. Not in a subshell of its own: the binary's parent is this script's
-# shell, the window's installer (nn-admin's parent), with no fork between.
+# runs. Not in a function's subshell, and `exec` in the substitution (bash
+# forks a subshell for a substitution with a redirection and runs the command
+# in a child of it): the binary is this script's shell's child, the window's
+# installer (nn-admin's parent), with no fork between that R009's lineage walk
+# would need to read while it still runs.
 tree_version() {
-    new_ver=$("$AGENT_BIN" --version 2>/dev/null) || true
+    new_ver=$(exec "$AGENT_BIN" --version 2>/dev/null) || true
     new_ver=${new_ver%%$'\n'*}
     new_ver=${new_ver:-unknown}
 }

@@ -591,7 +591,7 @@ fn install_executes_the_tree_s_agent_only_in_tree_version() {
     let text = read("deploy/install.sh");
     let body = section("deploy/install.sh", "tree_version() {", "\n}\n");
     assert!(
-        body.contains("new_ver=$(\"$AGENT_BIN\" --version"),
+        body.contains("new_ver=$(exec \"$AGENT_BIN\" --version"),
         "{body}"
     );
     let start = text.find("tree_version() {").unwrap();

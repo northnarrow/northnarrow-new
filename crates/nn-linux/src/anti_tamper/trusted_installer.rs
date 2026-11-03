@@ -840,7 +840,9 @@ mod tests {
         stat(500, 400, 9_000);
         stat(501, 500, 9_100);
         assert_eq!(installer_of_requester(proc.path(), 501), Some((500, 9_000)));
-        // a requester started by init acts for no installer
+        // a requester started by init acts for no installer (init's own
+        // stat readable: the refusal is the rule's, not a missing file)
+        stat(1, 0, 1);
         stat(601, 1, 9_200);
         assert_eq!(installer_of_requester(proc.path(), 601), None);
         stat(602, 0, 9_200);
