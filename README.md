@@ -377,7 +377,7 @@ on-host LLM advisor removed, which also took about 150 crates out of `Cargo.lock
   - [ ] Deception that trips when a decoy is used
   - [ ] A self-test of every sensor, not three of thirteen
   - [ ] Foreign BPF loads and rootkit helpers refused
-  - [ ] The cgroup-exemption fix
+  - [ ] Per-rule exemptions by cgroup or unit that hold only for processes started there: a process moved into an exempt cgroup loses the exemption, and the move is signed
   - [ ] `isolate --ttl`: a signed isolation outside the COMBAT ladder, with an expiry
   - [ ] Kernel lockdown checks
   - [ ] A tag release, verified end to end
