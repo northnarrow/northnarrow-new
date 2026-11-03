@@ -1058,26 +1058,48 @@ for granted.
   refused (at most one every 30 s, a later one kept for after the
   interval, not dropped; one per target per 10 minutes: a unit whose own
   file sets a value below a floor would loop), when a window opens
-  (before the maintenance restarts a unit), and after a quarantine
-  (below). Not `Manager.Reload()` on the private socket: systemd lets a
+  (before the maintenance restarts a unit). Not `Manager.Reload()` on the private socket: systemd lets a
   caller reload at once only with `CAP_SYS_ADMIN`, which the agent's unit
   does not grant, and asks polkit for any other — the lab's round 4
   (Ubuntu 24.04, systemd 255) saw each call wait its whole 30 s timeout,
   and systemd reload only when the agent closed the connection ("Failed
   to send queued message … Transport endpoint is not connected", 30
   times). Root signals PID 1 without a capability.
-- **The host's drop-ins.** `service.d/*.conf` reaches every service, ours
-  too; `slice.d`, `system.slice.d` the slice they run in. The agent's
-  integrity round reads them in `/etc/systemd/system` and
-  `/run/systemd/system` (the agent's unit makes them, empty, and lets the
-  agent write there): a drop-in with a directive that stops, starves,
-  limits or replaces a service (resource control, scheduling, limits,
-  killing, `Exec*`, `Condition*`, mounts, a syscall filter, an
-  `Environment=` of an `NN_` / `LD_` variable) is moved to
-  `/var/lib/northnarrow/quarantine/dropins/`, systemd reloads, and the
-  move is signed (`unit_dropin_quarantined`). Other drop-ins (a timeout, a
-  proxy variable) are left: findings, as before. The vendor directories
-  are the packages': findings only.
+- **The host's drop-ins, judged by their value for our units** (the
+  review of #492, C1). `service.d/*.conf` reaches every service, ours too;
+  `slice.d` and `system.slice.d` the slice they run in — from every
+  directory of the unit search path. What is there is the host's
+  configuration for every other service as well (a global `LimitNOFILE`, a
+  Kubernetes node's `system.slice` reservation, a hardening
+  `SystemCallFilter`, an allocator's `LD_PRELOAD`), so nothing there is
+  moved, written or deleted (`crates/nn-linux/src/host_dropins.rs`): the
+  integrity round judges each directive by what its value does to our
+  units — a resource limit below their floors (the floors table above: a
+  service drop-in against both units', a slice drop-in against the
+  slice's), a finite CPU / address-space / data / file-size limit, fewer
+  than 1024 open files or 64 KiB of locked memory, a nice value above 0,
+  an idle scheduling or I/O class, a narrower CPU set, a kill or OOM
+  semantics other than ours, a condition that fails (or one not evaluated
+  here), an exec line, an `NN_` / `LD_` / `RUST_` / `MALLOC_` / `GLIBC_`
+  variable, another slice or user, another root, a mount over our paths —
+  and signs each such directive as `unit_dropin_harmful` while it is
+  there. Our units' values are held meanwhile by the deny hooks (PID 1's
+  write of a value other than the registered one is refused) and put back
+  to their floors at every registration. Any other drop-in there is the
+  `unit_dropin` alert, as before (now `slice.d` and `system.slice.d` too).
+  A drop-in the host had before the install is judged the same and never
+  touched; moving one would take a signed overlay listing what may be
+  quarantined — the only opt-in the design allows, not part of this lot.
+  The lot's first version moved every drop-in that named one of ~95
+  directives whatever the value, and asked a reload: on a customer host
+  that stripped the host's configuration from every service. While a
+  harmful one is on disk, the agent asks systemd for no reload (signed
+  `systemd_reload` `withheld`): a reload would load it into systemd's
+  copy, and inside a trusted-installer window — where PID 1's writes are
+  let through — onto our units' cgroups. The lab's round 7 measured it:
+  with a `MemoryMax=4K` on `system.slice.d` still on disk, the reload the
+  agent asked at a window's opening set the slice to 4 KiB, and the
+  agent, the watchdog and journald were killed.
 - **cgroup v1, narrowed.** Lot 273b refused every v1 write where systemd
   runs the unified hierarchy, an old container's `name=systemd` hierarchy
   too. Now only a hierarchy that binds a controller (`subsys_mask`, read
@@ -1120,8 +1142,9 @@ of the lot, the tamper check):
 | `systemctl set-property` of the agent outside a window (C100) | refused at the cgroup file and the drop-in, as in lot 273b; systemd's copy taken back by the agent's reload (a SIGHUP to PID 1): systemd's `MemoryHigh` back to the unit's own value before the case's 75 s on the five (`systemd_reload` signed; on #490's head it stayed at 2 GiB) |
 | `set-property` inside a window, the window closed (C98) | the value kept if at or above its floor; `memory.high` 100 MiB restored to 512 MiB at the close, signed `limit_floor_restored` |
 | the agent restarted inside a window with systemd's copy below the floor (C102) | the fresh cgroup restored to the floor, by the watchdog's check of the respawned agent or by the agent's registration, signed: OK on the five (Debian 13 in round 6); the agent's own registration restored it first each time. On #490's head the fresh cgroup kept 100 MiB, the agent throttled — not up within the case's minute |
-| a window opened | systemd reloaded (`systemd_reload`, "a trusted-installer window opened") |
-| a host drop-in in `service.d` with a dangerous directive (C97) | moved to the quarantine within a round (30 s), systemd reloaded, signed `unit_dropin_quarantined` |
+| a window opened | systemd reloaded (`systemd_reload`, "a trusted-installer window opened"); withheld while a harmful host drop-in is on disk |
+| the host's drop-ins (C97): `LimitNOFILE=1048576` and `SystemCallFilter=~@obsolete` in `service.d`, `MemoryMax=4K` in `system.slice.d`, the host's `daemon-reload`, then a window opened | the three left in place; the slice's 4K refused at its `memory.max` (PID 1's write), signed `unit_dropin_harmful` within a round; the other two an alert only (`unit_dropin`); the agent's reloads withheld, the window's too: the slice keeps its value inside it |
+| an operator's own `daemon-reload` inside a window, a harmful host drop-in on disk | applied (PID 1's writes are let through inside a window): remove the drop-in first (residual) |
 | a named cgroup v1 hierarchy (`name=…`, no controller; C99) | a move in it let through (lot 273b refused it); a freezer hierarchy refused (C83) |
 | `memory.reclaim` of the agent's unit (C101) | refused (`cgroup_limit`), PID 1's too |
 
@@ -1186,13 +1209,20 @@ Not done, and why:
 - **A tuning daemon's host-wide profile** (`tuned`, `numad`, `irqbalance`'s
   affinities) does not reach the protected processes: refused and signed
   each time (ENGAGED, never COMBAT); every other process takes it.
-- **The quarantine is host-wide.** A drop-in of the host's `service.d`
-  (or `slice.d`, `system.slice.d`) with a resource, scheduling, limit,
-  kill, exec, condition or mount directive is taken from every service it
-  reached, not only from ours; it is kept in the quarantine with where it
-  was, and the move is signed. A limit meant for other services goes in
-  their own `<unit>.d/` directories. A drop-in found at the agent's first
-  start (one the host had before the install) is quarantined the same.
+- **A harmful host drop-in and an operator's reload inside a window.**
+  The agent withholds its own reloads while one is on disk, but an
+  operator's `daemon-reload` (or a unit's restart) inside a window applies
+  it to our units' cgroups, the slice's included: remove it before the
+  maintenance. Lot 273d: floors held inside a window too, and
+  `northnarrow.slice`.
+- **A harmful host drop-in stays on disk.** Its value is refused at our
+  units' cgroup files and put back to the floors at every registration,
+  but a process setting (a `LimitNOFILE`, a `Nice`, an `ExecStartPre`) or a
+  slice value at boot reaches our units' next start before the agent is
+  there: the signed `unit_dropin_harmful` says so each round, and the
+  operator removes it (inside a window, for a drop-in of ours). Lot 273d:
+  a slice of the units' own (`northnarrow.slice`), which `system.slice.d`
+  no longer reaches, and the signed opt-in list for a quarantine.
 - **The reload is asked, not awaited.** systemd reloads after the SIGHUP
   (about a quarter of a second on the lab); a second refusal within 30 s
   waits for the interval, a refusal of the same file within 10 minutes

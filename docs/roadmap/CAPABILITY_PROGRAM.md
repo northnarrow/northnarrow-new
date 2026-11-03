@@ -51,7 +51,7 @@ number in parentheses is a lab PR.
 | C20 | Automation, playbooks, SOAR | 1 | the automatic COMBAT ladder and the per-rule policy; no playbook, webhook or OpenC2 | 3 |
 | C21 | SIEM integration and export | 0 | no export of the detections ("until R15 exports the chains off the host", `docs/operator/HEARTBEAT.md`); local JSON reads and the heartbeat pull (270) only; no OCSF, syslog or OTLP | 3 |
 | C22 | Backend and multi-host correlation | 0 | the heartbeat's external verifier (270) is not a backend | 3 |
-| C23 | Anti-tamper and self-defence | 2 (provisional) | 21 LSM deny hooks and 6 optional (lot 273: the cgroup move guard; lot 273b: the write deny `file_permission`, the guard's third program; lot 273c: `task_setrlimit`, `task_setscheduler`, `task_setnice`, `task_setioprio`), the fail-opens counted and signed (215); start refused without BPF LSM, a hook's self-test (218); a fail-visible watchdog (216); the signing key decided once at boot (265, 268); unprivileged workers under Landlock and seccomp (272); the signed heartbeat's external verifier sees a stop in 6.5 s (270). Provisional: on systemd 257 and later `systemctl kill -s SIGKILL` stopped the agent through `cgroup.kill` outside a maintenance window, and any root shell could kill, freeze or move the units' cgroups on every kernel (tamper case C31; C33's `systemctl stop` was refused all along — it read C31's kill); closed by lot 273 (#489: the units' cgroups protected, the move guard; C15, C20, C31, C65–C75 refused and signed and C76 allowed inside a window on the five guests); lot 273b (the review of #489): the units' and their slices' resource limits (an OOM kill inside the write, a starvation), a cgroup v1 hierarchy where systemd runs the unified one, a write through a descriptor opened earlier and the protected pids' `oom_score_adj` refused outside a window, the move guard self-tested at every boot (C12, C18, C77–C86); lot 273c (the review of #490): another process's `prlimit`, `renice`, `chrt`, `taskset`, `ionice` of a protected process refused (four deny hooks, 21 in all), PID 1 closed to attach-mode access, no resource value below a floor registered (the agent's start, the watchdog's check of a respawn, a window's close), systemd's copy of a refused `set-property` taken back by a reload, the host's dangerous drop-ins quarantined, cgroup v1 refused only where it moves or freezes (C89–C102), provisional until its review | 3 |
+| C23 | Anti-tamper and self-defence | 2 (provisional) | 21 LSM deny hooks and 6 optional (lot 273: the cgroup move guard; lot 273b: the write deny `file_permission`, the guard's third program; lot 273c: `task_setrlimit`, `task_setscheduler`, `task_setnice`, `task_setioprio`), the fail-opens counted and signed (215); start refused without BPF LSM, a hook's self-test (218); a fail-visible watchdog (216); the signing key decided once at boot (265, 268); unprivileged workers under Landlock and seccomp (272); the signed heartbeat's external verifier sees a stop in 6.5 s (270). Provisional: on systemd 257 and later `systemctl kill -s SIGKILL` stopped the agent through `cgroup.kill` outside a maintenance window, and any root shell could kill, freeze or move the units' cgroups on every kernel (tamper case C31; C33's `systemctl stop` was refused all along — it read C31's kill); closed by lot 273 (#489: the units' cgroups protected, the move guard; C15, C20, C31, C65–C75 refused and signed and C76 allowed inside a window on the five guests); lot 273b (the review of #489): the units' and their slices' resource limits (an OOM kill inside the write, a starvation), a cgroup v1 hierarchy where systemd runs the unified one, a write through a descriptor opened earlier and the protected pids' `oom_score_adj` refused outside a window, the move guard self-tested at every boot (C12, C18, C77–C86); lot 273c (the review of #490): another process's `prlimit`, `renice`, `chrt`, `taskset`, `ionice` of a protected process refused (four deny hooks, 21 in all), PID 1 closed to attach-mode access, no resource value below a floor registered (the agent's start, the watchdog's check of a respawn, a window's close), systemd's copy of a refused `set-property` taken back by a reload, the host's drop-ins judged by their value for our units (never moved), cgroup v1 refused only where it moves or freezes (C89–C102), provisional until its review | 3 |
 | C24 | Offline and air-gapped operation | 2 | the agent's only traffic of its own is the DNS probe to 127.0.0.1:53 (`crates/nn-linux/src/telemetry_probe.rs`); updates are an operator's action; the attestation is verified offline with a bundle (`docs/operator/INSTALL_UPGRADE_UNINSTALL.md`) | 3 |
 | C25 | Data sovereignty | 2 | the telemetry stays on the host; no model in the root process (214); the README's compliance table states design properties, not certifications (its NIS2, GDPR, DORA and CRA badges were removed on 2026-11-03) | 3 |
 | C26 | Open code, licence, inspectability | 2 | Apache-2.0 (`Cargo.toml`), the eBPF object Dual MIT/GPL, a public repository, the module map | 3 |
@@ -5094,16 +5094,16 @@ number in parentheses is a lab PR.
     path-heavy work.
 - **Lot 273c — C23: another process's limits and priorities of the agent
   refused, PID 1 closed to attach-mode access, no resource value below a
-  floor registered, systemd's copy of a refused `set-property` and the
-  host's drop-ins taken back (a security fix; the review of #490).**
+  floor registered, systemd's copy of a refused `set-property` taken
+  back, the host's drop-ins judged by their value for our units (a
+  security fix; the reviews of #490 and #492).**
   - What was open (measured on #490's head 25cff4ca, tamper cases
     C89–C102, Ubuntu 24.04 and Debian 13): `prlimit --pid <agent> --cpu=1:1` ended the
     agent (the kernel's RLIMIT_CPU SIGKILL, no signal hook saw it: nothing
     signed but its successor's `prev_run_abrupt`; C89), `--nofile=0:0` too
     (C90); `renice +19`, `chrt --idle`, `taskset` to one CPU and
     `ionice -c 3` of the agent went through unsigned (C91–C94); a tracer on
-    PID 1 and `/proc/1/mem` for writing went through (C95, C96); a host
-    `service.d` drop-in setting an `NN_` variable stayed (C97); a
+    PID 1 and `/proc/1/mem` for writing went through (C95, C96); a
     `memory.high` of 100 MiB set inside a window stayed after it (C98); a
     move in a named v1 hierarchy was refused (`cgroup_v1`, C99); a refused
     `set-property MemoryHigh=2G` left systemd's copy at 2 GiB (C100);
@@ -5125,9 +5125,15 @@ number in parentheses is a lab PR.
     reload — a SIGHUP to PID 1 once PID 1 is found serving the private
     socket — after a refused PID 1 write of the units (at most one every
     30 s, later ones kept, one per target per 10 minutes), at a window's
-    opening and after a quarantine (signed `systemd_reload`); a host
-    drop-in of `service.d`, `slice.d`, `system.slice.d` with a dangerous
-    directive is quarantined (signed `unit_dropin_quarantined`); cgroup v1
+    opening (signed `systemd_reload`); the host's drop-ins of
+    `service.d`, `slice.d`, `system.slice.d` are never moved or changed
+    (the review of #492, C1: the first version moved every one naming a
+    "dangerous" directive, whatever its value, from every service of the
+    host): a directive whose value harms our units is signed
+    `unit_dropin_harmful` while it is there, any other one is an alert
+    (`unit_dropin`); while a harmful one is on disk the agent's reloads
+    are withheld (round 7: the reload at a window's opening applied a 4K
+    `system.slice` inside the window); cgroup v1
     is refused only in a hierarchy that binds a controller, at
     `cgroup.procs`, `tasks`, `freezer.state` (six optional BTF offsets
     read the hierarchy's `subsys_mask`); `cpuset.*`, `memory.reclaim`,
@@ -5163,13 +5169,23 @@ number in parentheses is a lab PR.
     head's agent killed `install.sh --upgrade` both times
     (`R009_RootExecFromUserPath`, `KillProcessTree` in Observing: the
     lab's known flake, the code before the lot), and the lot was
-    installed fresh. The cost: the trust model's "Lot 273c", Cost.
+    installed fresh. The cost: the trust model's "Lot 273c", Cost. C97,
+    the host's drop-ins, after C1: on #492's head (Ubuntu 24.04, round 7) all
+    three drop-ins of the case — `LimitNOFILE=1048576` and
+    `SystemCallFilter=~@obsolete` in `service.d`, `MemoryMax=4K` in
+    `system.slice.d` — were moved; now (round 8) the three stay, the 4K is
+    refused at the slice (inside a window opened with it on disk too: the
+    agent's reloads withheld) and signed harmful, the other two are alerts.
+    Round 7 also found the window case: with C1's first version, the
+    reload at a window's opening applied the 4K, the slice's services
+    killed — hence the withholding. C85, C98, C100, C102 OK again.
   - Mutations: 30 in three sets on the lot's code, 30 caught. Set G (20): each term of
     the task hooks' check and the rlimit refusal, PID 1's attach mode (off,
     and widened to read mode), the `i_mode` exit inverted, a named v1
     hierarchy refused, the agent's memory floor 0, a restoration always ok,
     the reload's interval dropping instead of deferring and its per-target
-    quiet removed, a quarantine without its reload, `NN_` not dangerous, a
+    quiet removed, the first version's quarantine without its reload and
+    `NN_` not dangerous (both on the code C1 replaced), a
     refused priority made decisive, the pipeline's reload for a limit
     write, two fail-open slots shared, the rlimit op code reused,
     `memory.reclaim` given a default, the respawned agent unchecked. MG9
@@ -5193,8 +5209,9 @@ number in parentheses is a lab PR.
     kernel recovery path, its own review).
   - Open: `daemon-reexec` into a modified systemd binary (PID 1's exec is
     not refused; the FIM watches the binary); PID 1's memory before the
-    first attach; the quarantine is host-wide (other services lose the
-    drop-in too); the reload is asked, not awaited, and a repeated
+    first attach; a harmful host drop-in stays on disk and reaches our
+    units' next start (lot 273d: `northnarrow.slice`, the signed opt-in
+    list for a quarantine); the reload is asked, not awaited, and a repeated
     refusal of one file within 10 minutes asks none (the floors still
     apply at a restart); `cpu.uclamp.max`, `memory.swap.max`, a sibling's
     `memory.low` / `memory.min`; a soft-reboot (lot 273b's residual,

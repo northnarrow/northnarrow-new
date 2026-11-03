@@ -756,16 +756,22 @@ Lot 273c (the review of #490):
   record). The agent's unit at least 512 MiB, 256 tasks, half a CPU; the
   watchdog's what its unit sets; a slice 1 GiB, 1024 tasks, one CPU.
 - **systemd's copy.** After a refused PID 1 write of our units (a
-  `set-property` outside a window), at a window's opening and after a
-  quarantine, the agent asks systemd for a `daemon-reload` — a SIGHUP to
-  PID 1, once PID 1 is found serving systemd's private socket (signed
+  `set-property` outside a window) and at a window's opening, the agent
+  asks systemd for a `daemon-reload` — a SIGHUP to PID 1, once PID 1 is
+  found serving systemd's private socket (signed
   `systemd_reload`): systemd's copy of a refused `set-property` no longer
   waits for an operator's reload.
-- **The host's drop-ins.** A drop-in of `/etc/systemd/system/` or
-  `/run/systemd/system/`'s `service.d`, `slice.d` or `system.slice.d` that
-  limits, starves, replaces or conditions a service (or sets an `NN_` /
-  `LD_` variable) is moved to `/var/lib/northnarrow/quarantine/dropins/`
-  and signed `unit_dropin_quarantined`; a reload follows.
+- **The host's drop-ins** (`service.d`, `slice.d`, `system.slice.d`, in
+  every directory of the unit search path) are the host's configuration
+  and are never moved or changed. A directive whose value harms our units
+  (a limit below their floors, a finite CPU or memory limit, a raised nice
+  value, an idle class, another kill or OOM semantics, a failing
+  condition, an exec line, an `NN_` / `LD_` variable, a mount over our
+  paths) is signed `unit_dropin_harmful` at each round while it is there;
+  any other drop-in there is a `unit_dropin` alert. While a harmful one is
+  on disk the agent asks systemd for no reload (`systemd_reload`
+  `withheld`). Remove it yourself, before any window: it reaches our
+  units' next start, and a `daemon-reload` inside a window applies it.
 - **cgroup v1** is refused only where it moves or freezes a process: a
   hierarchy that binds a controller, its `cgroup.procs`, `tasks` and
   `freezer.state`. A named hierarchy (an old container's `name=systemd`)
