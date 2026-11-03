@@ -1715,7 +1715,16 @@ else
     POST=$(post post_proc "${WDPID:-0}" "${WDSTART:-0}" northnarrow-wat) \
     run_case C65 "systemctl kill -s SIGKILL the watchdog (no window)" denied "deny=signal|deny=cgroup_kill" 0 -- systemctl kill -s SIGKILL northnarrow-watchdog
     WDPID=$(wd_pid); WDSTART=$(proc_start "$WDPID")
-    if selected C66; then
+    # systemd 249 marks the unit `freezing` before it writes cgroup.freeze
+    # and keeps that state when the write is refused: a second `systemctl
+    # freeze` then writes nothing ("Previously requested freezer operation
+    # … still in progress") until the next freezer event of the cgroup — a
+    # case with nothing to refuse, reported as such while the cgroup is not
+    # frozen (252 and later write again, or skip a thaw of a running one)
+    FS0=$(systemctl show -p FreezerState --value northnarrow-agent 2>/dev/null)
+    if selected C66 && [[ -n $FS0 && $FS0 != running && "$(cat "$CGROOT$AG_CG/cgroup.freeze" 2>/dev/null)" == 0 ]]; then
+        skipped_case C66 "systemd's own freezer state of the unit is $FS0 and its cgroup is not frozen: systemd 249 keeps that state after a refused freeze and writes nothing until the next freezer event" 1
+    elif selected C66; then
         CG_FROZEN=$CGROOT$AG_CG/cgroup.freeze
         POST="$(post post_proc "${PID:-0}" "${START:-0}" northnarrow-age) && $(post post_thawed "$CGROOT$AG_CG/cgroup.freeze")" \
         run_case C66 "systemctl freeze the agent (no window)" denied "deny=cgroup_freeze" 0 -- systemctl freeze northnarrow-agent
