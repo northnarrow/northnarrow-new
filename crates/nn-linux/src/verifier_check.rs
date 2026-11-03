@@ -444,6 +444,18 @@ fn optional_reason(name: &str, section: &str, outcome: &Outcome) -> Option<Strin
     if name.starts_with(LAB_PROBE_PREFIX) {
         return Some("sensor-feasibility probe, never loaded by the agent".into());
     }
+    // Lot 275: a fexit built for another kernel's parameter count of its
+    // function (the verifier refuses the slot past the last parameter; the
+    // agent loads the variant built for this kernel's count)
+    if let Some((_, func, _)) = crate::sensors::net_telemetry::ARITY_VARIANTS
+        .iter()
+        .find(|(p, _, _)| *p == name)
+    {
+        let params = btf_revalidate::resolved().and_then(|r| r.param_count(func));
+        if let Some(why) = crate::sensors::net_telemetry::other_arity(name, params) {
+            return Some(why);
+        }
+    }
     if let Outcome::Absent(_) = outcome {
         let hook = section.strip_prefix("lsm/").unwrap_or("");
         if OPTIONAL_DENY_HOOKS.contains(&hook) {

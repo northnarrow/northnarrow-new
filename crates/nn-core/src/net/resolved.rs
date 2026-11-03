@@ -129,6 +129,9 @@ struct Inner {
     /// pid → the last time the kernel held one of its DNS records back.
     held: HashMap<u32, u64>,
     held_order: LazyLru<u32>,
+    /// A DNS record the pumps could not decode (the parse worker down)
+    /// until then: the evidence is incomplete for every process.
+    degraded_until: u64,
     counters: Counters,
 }
 
@@ -356,6 +359,17 @@ impl<I: Default> ResolvedTable<I> {
         }
     }
 
+    /// A DNS record received at `ts_ns` could not be decoded (the parse
+    /// worker did not answer): for [`UNSEEN_WINDOW_SECS`] a connect no
+    /// binding covers is unknown, for every process — the response may
+    /// have named it.
+    pub fn note_undecoded(&self, ts_ns: u64) {
+        let mut g = self.inner.lock();
+        g.degraded_until = g
+            .degraded_until
+            .max(ts_ns.saturating_add(UNSEEN_WINDOW_SECS * SEC));
+    }
+
     /// The addresses `name` resolves to at `now_ns`, through at most
     /// [`MAX_CHAIN`] CNAMEs, with when each stops counting.
     fn addresses_of(g: &Inner, name: &str, now_ns: u64) -> Vec<(IpAddr, u64)> {
@@ -467,6 +481,9 @@ impl<I: Default> ResolvedTable<I> {
             if Self::use_binding(&mut g, *p, *s, addr, now_ns) {
                 return DnsResolution::Lineage;
             }
+        }
+        if now_ns <= g.degraded_until {
+            return DnsResolution::Unknown;
         }
         let since = now_ns.saturating_sub(UNSEEN_WINDOW_SECS * SEC);
         for (p, s) in &members {
@@ -706,6 +723,19 @@ mod tests {
         assert_eq!(t.check(43, 1, C2, T0 + SEC, || vec![(42, 1)]), DnsResolution::Unknown);
         // ... held before the process started are an earlier holder's
         assert_eq!(t.check(42, T0 + 1, C2, T0 + SEC, none), DnsResolution::Unresolved);
+    }
+
+    /// A record the pumps could not decode (the parse worker down): what
+    /// no binding covers is unknown for a while, for every process.
+    #[test]
+    fn an_undecoded_record_makes_the_unbound_unknown_for_a_while() {
+        let t = Table::new();
+        answer(&t, 42, T0, "a.example", &[a("a.example", 60, WEB)]);
+        t.note_undecoded(T0 + SEC);
+        assert_eq!(t.check(7, 1, C2, T0 + 2 * SEC, none), DnsResolution::Unknown);
+        assert_eq!(t.check(42, 1, WEB, T0 + 2 * SEC, none), DnsResolution::Lineage, "bound");
+        let after = T0 + SEC + UNSEEN_WINDOW_SECS * SEC + 1;
+        assert_eq!(t.check(7, 1, C2, after, none), DnsResolution::Unresolved);
     }
 
     /// The process's own binding answers without its lineage being read.

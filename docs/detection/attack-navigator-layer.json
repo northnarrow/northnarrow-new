@@ -1065,7 +1065,7 @@
       "techniqueID": "T1005"
     },
     {
-      "comment": "NN-L-NET-001_OutboundToBlockedIp, NN-L-NET-013_Beacon",
+      "comment": "NN-L-NET-001_OutboundToBlockedIp, NN-L-NET-028_ConnectWithoutDns, NN-L-NET-013_Beacon",
       "enabled": true,
       "metadata": [
         {
@@ -1074,10 +1074,14 @@
         },
         {
           "name": "rule",
+          "value": "NN-L-NET-028_ConnectWithoutDns (unit+lab)"
+        },
+        {
+          "name": "rule",
           "value": "NN-L-NET-013_Beacon (unit)"
         }
       ],
-      "score": 2,
+      "score": 3,
       "showSubtechniques": false,
       "tactic": "command-and-control",
       "techniqueID": "T1071"
@@ -1177,15 +1181,19 @@
       "techniqueID": "T1095"
     },
     {
-      "comment": "NN-L-NET-008_OutboundFromTmpExec",
+      "comment": "NN-L-NET-008_OutboundFromTmpExec, NN-L-NET-028_ConnectWithoutDns",
       "enabled": true,
       "metadata": [
         {
           "name": "rule",
           "value": "NN-L-NET-008_OutboundFromTmpExec (unit)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-NET-028_ConnectWithoutDns (unit+lab)"
         }
       ],
-      "score": 1,
+      "score": 2,
       "showSubtechniques": false,
       "tactic": "command-and-control",
       "techniqueID": "T1105"

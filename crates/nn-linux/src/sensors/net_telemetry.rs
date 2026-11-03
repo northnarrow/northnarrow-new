@@ -315,13 +315,17 @@ fn answer_pass(
         };
         let exe = lineage.image_at(raw.pid, raw.timestamp_ns);
         let (ev, records) = answer_event(raw, decoded.as_ref(), exe);
-        if let Some(q) = &ev.query_name {
-            table.on_answer(&Answer {
+        match &ev.query_name {
+            Some(q) => table.on_answer(&Answer {
                 pid: raw.pid,
                 ts_ns: raw.timestamp_ns,
                 qname: q,
                 records: &records,
-            });
+            }),
+            // not decoded: the worker did not answer (or the bytes are no
+            // response, which is no evidence either way)
+            None if n > 0 && decoded.is_none() => table.note_undecoded(raw.timestamp_ns),
+            None => {}
         }
         if raw.flags & (held_flags::TASK | held_flags::UID) != 0 {
             table.note_held(raw.pid, raw.timestamp_ns);

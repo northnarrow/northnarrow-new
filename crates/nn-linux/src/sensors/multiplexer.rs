@@ -1634,6 +1634,9 @@ fn dns_events(
         if let Some(t) = resolved {
             if decoded.is_some() {
                 t.on_query(*pid, query_name, *timestamp_ns);
+            } else {
+                // the parse worker did not answer: the name is not known
+                t.note_undecoded(*timestamp_ns);
             }
             if raw.held != 0 {
                 t.note_held(*pid, *timestamp_ns);
@@ -1675,8 +1678,10 @@ fn nss_events(
     let name = nss_query_name(decoded);
     // Lot 275: the name asked through systemd-resolved, for the upstream
     // response (received by the resolver) to bind to this process
-    if let (Some(t), Some(name)) = (resolved, name.as_deref()) {
-        t.on_query(raw.pid, name, raw.timestamp_ns);
+    match (resolved, name.as_deref()) {
+        (Some(t), Some(name)) => t.on_query(raw.pid, name, raw.timestamp_ns),
+        (Some(t), None) if decoded.is_none() => t.note_undecoded(raw.timestamp_ns),
+        _ => {}
     }
     if let (Some(t), true) = (resolved, raw.held != 0) {
         t.note_held(raw.pid, raw.timestamp_ns);

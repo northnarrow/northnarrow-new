@@ -36,20 +36,6 @@ pub const PUMP_LABEL: &str = "net_inbound";
 
 const IPPROTO_TCP: u8 = 6;
 
-/// Inbound rows recorded and closes with no recorded accept, since boot
-/// (`nn-admin` status; the lab reads them).
-#[derive(Debug, Default)]
-pub struct InboundCounts {
-    pub accepted: std::sync::atomic::AtomicU64,
-    pub closed: std::sync::atomic::AtomicU64,
-}
-
-/// Process-wide counts.
-pub static COUNTS: InboundCounts = InboundCounts {
-    accepted: std::sync::atomic::AtomicU64::new(0),
-    closed: std::sync::atomic::AtomicU64::new(0),
-};
-
 /// The socket's kernel address in a correlator (bytes 8..16, little
 /// endian): the inbound tracker keys its pending flows as the outbound one.
 fn corr_sk(corr: &[u8; 16]) -> u64 {
@@ -88,9 +74,6 @@ pub fn inbound_events(
                 proc_start_ns: lineage.start_floor_ns(raw.pid).unwrap_or(0),
             };
             if let Some(row) = tracker.on_tcp_connect(&info) {
-                COUNTS
-                    .accepted
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 out.push(Event::NetInbound(row));
             }
             let held = if raw.flags & held_flags::TASK != 0 {
@@ -137,9 +120,6 @@ pub fn inbound_events(
                 if row.exe.is_none() {
                     row.exe = lineage.image_path_at(row.pid, row.start_ns);
                 }
-                COUNTS
-                    .closed
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 closed = Some(row.clone());
                 out.push(Event::NetInbound(row));
             }

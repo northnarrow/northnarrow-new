@@ -383,21 +383,6 @@ pub enum Event {
     /// (NN-L-NET-006) applies the operator-tunable comm + port
     /// allowlist filter.
     NetListener(crate::wire::NetListenerEvent),
-    /// Lot 275 (C07) — an inbound TCP connection, with the same flow
-    /// attribution as an outbound one: its row at the accept
-    /// ([`crate::telemetry::FlowPhase::Connect`], the accepting process)
-    /// and at the close ([`crate::telemetry::FlowPhase::Closed`], the byte
-    /// counters). `src_*` is the peer that connected, `dst_*` the local
-    /// listener's end (the initiator first, as the outbound rows have it).
-    /// A variant of its own: the rules of outbound flows never read it.
-    NetInbound(crate::wire::NetFlowEvent),
-    /// Lot 275 (C07) — a DNS response a process received (the receiver's
-    /// context: the application on a stub-resolver host, the local
-    /// resolver for its upstream leg), decoded by the parse worker.
-    DnsAnswer(crate::telemetry::DnsAnswerEvent),
-    /// Lot 275 (C07) — the TLS ClientHello an outbound flow began with, its
-    /// JA3 and JA4 computed by the parse worker (NN-L-NET-003 judges it).
-    TlsClientHello(crate::telemetry::TlsHelloEvent),
     /// Review 78: DNS queries the kernel held back from one process (its
     /// DNS budget ran out) or from its user (`uid_level`: the user's
     /// budget ran out, across processes). Carried by the process's next
@@ -496,6 +481,22 @@ pub enum Event {
         #[serde(default)]
         rebaselined: bool,
     },
+    /// Lot 275 (C07), appended (the variants before keep their place in
+    /// every encoding) — an inbound TCP connection, with the same flow
+    /// attribution as an outbound one: its row at the accept
+    /// ([`crate::telemetry::FlowPhase::Connect`], the accepting process)
+    /// and at the close ([`crate::telemetry::FlowPhase::Closed`], the byte
+    /// counters). `src_*` is the peer that connected, `dst_*` the local
+    /// listener's end (the initiator first, as the outbound rows have it).
+    /// A variant of its own: the rules of outbound flows never read it.
+    NetInbound(crate::wire::NetFlowEvent),
+    /// Lot 275 (C07) — a DNS response a process received (the receiver's
+    /// context: the application on a stub-resolver host, the local
+    /// resolver for its upstream leg), decoded by the parse worker.
+    DnsAnswer(crate::telemetry::DnsAnswerEvent),
+    /// Lot 275 (C07) — the TLS ClientHello an outbound flow began with, its
+    /// JA3 and JA4 computed by the parse worker (NN-L-NET-003 judges it).
+    TlsClientHello(crate::telemetry::TlsHelloEvent),
 }
 
 /// Lab PR 219: what the exploit post-condition guard found (`epg::kind`).

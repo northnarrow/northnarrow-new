@@ -3065,41 +3065,70 @@ mod tests {
 
     // ── NN-L-NET-003 ─────────────────────────────────────────────
 
+    /// Lot 275: a ClientHello the TLS sensor fingerprinted with `ja3`.
+    fn hello(ja3: Option<&str>, comm: &str) -> Event {
+        Event::TlsClientHello(nn_model::telemetry::TlsHelloEvent {
+            timestamp_ns: 7,
+            pid: 4242,
+            uid: 1000,
+            comm: comm.into(),
+            exe: None,
+            family: 2,
+            dst_addr: v4(8, 8, 8, 8),
+            dst_port: 443,
+            flow_start_ns: 5,
+            outcome: if ja3.is_some() {
+                nn_model::telemetry::TlsHelloOutcome::Complete
+            } else {
+                nn_model::telemetry::TlsHelloOutcome::Incomplete
+            },
+            fingerprint: ja3.map(|j| TlsFingerprint {
+                ja3: j.to_string(),
+                ja3_raw: String::new(),
+                ja4: "t13d1516h2_8daaf6152771_02713d6af862".to_string(),
+                sni: None,
+                alpn: vec![],
+            }),
+            send_len: 512,
+            truncated: false,
+        })
+    }
+
+    /// Lot 275: judged on the ClientHello, Critical, its kill held behind
+    /// the per-rule policy (no fingerprint was produced before: every match
+    /// is new).
     #[test]
     fn net_003_fires_on_ja3_blocklist_match() {
         let hash = "deadbeefcafe00112233445566778899";
         let bl = Arc::new(Ja3Blocklist::from_entries([hash]));
         let rule = NnLNet003BadJa3::new(bl);
-        let mut e = flow(v4(8, 8, 8, 8), 443, "evilbin");
-        if let Event::NetFlow(nf) = &mut e {
-            nf.tls_fingerprint = Some(TlsFingerprint {
-                ja3: hash.to_string(),
-                ja3_raw: "771,...".to_string(),
-                ja4: "t13d_xx".to_string(),
-                sni: None,
-                alpn: vec![],
-            });
-        }
-        let v = rule.evaluate(&e).expect("JA3 hit");
+        crate::decision::response_policy::take_held();
+        let v = rule.evaluate(&hello(Some(hash), "evilbin")).expect("JA3 hit");
         assert_eq!(v.severity, Severity::Critical);
         assert_eq!(v.category, CATEGORY_CRITICAL);
+        assert_eq!(v.action, ResponseAction::Log, "held by default");
+        assert_eq!((v.event_pid, v.timestamp_ns), (4242, 7));
+        let held = crate::decision::response_policy::take_held().expect("held");
+        assert_eq!(held.action, ResponseAction::KillProcessTree);
+        // the flow's rows carry the fingerprint for the netflow log: not
+        // judged again
+        let mut e = flow(v4(8, 8, 8, 8), 443, "evilbin");
+        if let Event::NetFlow(nf) = &mut e {
+            nf.tls_fingerprint = match hello(Some(hash), "evilbin") {
+                Event::TlsClientHello(h) => h.fingerprint,
+                _ => unreachable!(),
+            };
+        }
+        assert!(rule.evaluate(&e).is_none());
     }
 
     #[test]
     fn net_003_does_not_fire_on_unknown_ja3() {
         let bl = Arc::new(Ja3Blocklist::from_entries(["aa".repeat(16)]));
         let rule = NnLNet003BadJa3::new(bl);
-        let mut e = flow(v4(8, 8, 8, 8), 443, "curl");
-        if let Event::NetFlow(nf) = &mut e {
-            nf.tls_fingerprint = Some(TlsFingerprint {
-                ja3: "bb".repeat(16),
-                ja3_raw: "".to_string(),
-                ja4: "".to_string(),
-                sni: None,
-                alpn: vec![],
-            });
-        }
-        assert!(rule.evaluate(&e).is_none());
+        assert!(rule.evaluate(&hello(Some(&"bb".repeat(16)), "curl")).is_none());
+        // an incomplete hello has no fingerprint
+        assert!(rule.evaluate(&hello(None, "curl")).is_none());
     }
 
     // ── NN-L-NET-004 ─────────────────────────────────────────────
@@ -4231,13 +4260,13 @@ mod tests {
     /// external audit EBPF-013 adds NN-L-NET-021).
     /// Future rule additions must update this assertion.
     #[test]
-    fn net_rules_builder_returns_19_rules() {
+    fn net_rules_builder_returns_20_rules() {
         let rules = net_rules_empty();
         assert_eq!(
             rules.len(),
-            19,
+            20,
             "N6 9 + D4 5 + T4.1 DNS-tunnel-entropy 1 + DNS flood 1 + sensor flood 1 \
-             + lab PR 224 fan-out 2 = 19 net rules"
+             + lab PR 224 fan-out 2 + lot 275 no-DNS 1 = 20 net rules"
         );
     }
 
@@ -4300,17 +4329,9 @@ mod tests {
         assert_eq!(v1.severity, Severity::Critical);
         assert_eq!(v1.category, CATEGORY_CRITICAL);
 
-        let mut e = flow(v4(8, 8, 8, 8), 443, "x");
-        if let Event::NetFlow(nf) = &mut e {
-            nf.tls_fingerprint = Some(TlsFingerprint {
-                ja3: "aa".repeat(16),
-                ja3_raw: "".to_string(),
-                ja4: "".to_string(),
-                sni: None,
-                alpn: vec![],
-            });
-        }
-        let v3 = net_003.evaluate(&e).expect("003 fires");
+        let v3 = net_003
+            .evaluate(&hello(Some(&"aa".repeat(16)), "x"))
+            .expect("003 fires");
         assert_eq!(v3.severity, Severity::Critical);
         assert_eq!(v3.category, CATEGORY_CRITICAL);
 

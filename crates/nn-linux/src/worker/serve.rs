@@ -177,9 +177,9 @@ pub(crate) fn answer(req: &Request) -> Answer {
 /// them (nn-parse keeps at most `MAX_DNS_RECORDS`, and its names are the
 /// protocol's alphabet).
 fn dns_answers(bytes: &[u8]) -> Option<nn_proto::ipc::DnsAnswersOut> {
-    use nn_parse::dns_response::{parse_response, AnswerRecord};
+    use nn_parse::dns_response::AnswerRecord;
     use nn_proto::ipc::{DnsAnswersOut, DnsRecordOut};
-    let r = parse_response(bytes)?;
+    let r = nn_parse::dns_response::parse_response(bytes)?;
     Some(DnsAnswersOut {
         qname: r.qname,
         qtype: r.qtype,

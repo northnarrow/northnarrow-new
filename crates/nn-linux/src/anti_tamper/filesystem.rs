@@ -2644,6 +2644,9 @@ mod tests {
                 "security-tools.v1",
                 "exec-policy.local",
                 "exec-policy.local.sig",
+                // Lot 275 — APPENDED.
+                "nodns-allow.local",
+                "nodns-allow.local.sig",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"

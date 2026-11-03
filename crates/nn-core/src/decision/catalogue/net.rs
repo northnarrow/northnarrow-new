@@ -465,4 +465,42 @@ pub(super) const DOCS: &[RuleDoc] = &[
         ],
         attack_note: "Outbound only: the connects are counted, not the credentials tried.",
     },
+    // ── "no DNS, no connect" (lot 275) ─────────────────────────────────
+    RuleDoc {
+        id: "NN-L-NET-028_ConnectWithoutDns",
+        severities: &[Severity::Medium, Severity::Low],
+        actions: &[ResponseAction::KillProcess, ResponseAction::Log],
+        sensors: &[Sensor::Network],
+        data_components: &["DC0082"],
+        observes: "A TCP connect or a UDP send to a public address that neither the process \
+                   nor an ancestor resolved through the system resolver: no DNS response it \
+                   received, and no name it asked for, named the address (Medium; Low when \
+                   only another process on the host resolved it). Judged by the connect pump \
+                   and the net drain from the DNS response sensor's table, once per process and \
+                   destination per 10 minutes. Its kill (`KillProcess`) is held behind the \
+                   per-rule response policy, off by default.",
+        false_positives: "Clients that resolve outside the system resolver — DNS over HTTPS \
+                          in a browser, a resolver of their own, an address from a \
+                          configuration file or handed over by another process; peers \
+                          configured by address (NTP servers, database replicas, package \
+                          mirrors by IP). Not judged: LAN and the other non-public ranges, the \
+                          configured resolvers, the signed `nodns-allow.local`, and every \
+                          process older than the DNS response sensor or whose DNS records \
+                          were lost (unknown).",
+        how_to_test: "On a lab guest, `curl -m 3 http://203.0.113.5/` (a documentation \
+                      address, a literal-IP connect) draws it; `curl -m 3 http://example.com/` \
+                      (resolved) does not (`net-check.sh --only MS28`).",
+        tests: &[
+            "crates/nn-core/src/decision/rules/net_nodns.rs::\
+             a_connect_to_an_unresolved_public_address_is_recorded_its_kill_held",
+            "crates/nn-core/src/decision/rules/net_nodns.rs::lan_resolvers_and_the_allowlist_are_exempt",
+            "crates/nn-core/src/net/resolved.rs::a_process_that_received_the_response_resolved_the_address",
+            "deploy/lab/malsim/net-check.sh::MS28",
+        ],
+        attack_note: "ATT&CK has no technique for a connect without a name lookup; the rule's \
+                      catch is the command and control (T1071) or the second stage (T1105) an \
+                      address written in the implant reaches. A C2 behind a domain is not \
+                      caught: it is pushed into the DNS records, where the DNS rules and the \
+                      operator's blocklists see it.",
+    },
 ];

@@ -9,7 +9,7 @@ The matrix itself is empty by design — V2–V4 populate it.
 
 | File | What it fixes | Version | Rows | sha256 (LF line endings) |
 |---|---|---|---|---|
-| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 3 | 88 | `d1187bf6e2e7f8d236350f29a591bdc083b6e64c51a6f431845db980561fd1a6` |
+| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 4 | 89 | `36f89d2656279f3407001b33a2f3a7bd5d83229bd103151df1e5f14992c2a4dd` |
 | [`v2-techniques.tsv`](v2-techniques.tsv) | the ATT&CK technique rows and their expected outcome | 2 | 62 | `f22ae7a6cf96db925177c4cf1d10ed3af0b70b53587e4b9d4f179cf4f767dbb9` |
 | [`v2-controls.tsv`](v2-controls.tsv) | one evasion row and one benign control per family | 2 | 22 | `f07c7a7f7cd83059f9bdc2f4993e98f87bd27b39a50277b7144b3f7f186162bd` |
 
@@ -62,6 +62,15 @@ Change log:
   `evasion`, High at most: out of the sub-gate), with an evasion and a
   benign control for each new family, CV19..CV22 (lab PR 225, which numbered
   them CV17..CV20). 88 rows, sub-gate 29.
+- `v2-rules.tsv` version 4 (2026-11-03, lot 275, before any V2 run):
+  NN-L-NET-028 ("no DNS, no connect": a TCP connect or UDP send to a public
+  address the process's lineage did not resolve; Medium, Low when another
+  lineage resolved it, its kill held behind the per-rule policy; family
+  `net`, out of the sub-gate), and NN-L-NET-003 back in the Critical
+  sub-gate (`gate critical`): BUG-025 is closed — the TLS ClientHello
+  sensor fingerprints an outbound flow's hello, and the rule judges it
+  (Critical; its kill held behind the per-rule policy, as every match it
+  makes is new). No new technique or control row. 89 rows, sub-gate 30.
 
 ## Gate formulas (§13 Q1, as frozen)
 
@@ -71,8 +80,8 @@ Change log:
 - **Critical sub-gate:** PASS ÷ the rows with `gate = critical`. Gate:
   100 %. The sub-gate holds every rule Q1 names (FIM-001/002/008/010/021/022
   and every CHAIN rule) and every other rule that can issue a Critical
-  verdict on the agent as built: NN-L-NET-003 cannot, inactive until
-  BUG-025 (version 2).
+  verdict on the agent as built (NN-L-NET-003 was out in versions 2 and 3,
+  until BUG-025; back in version 4).
 - **Technique coverage** (reported apart, no gate): the techniques of
   `v2-techniques.tsv` whose every row has an observed detection, denial or
   drift, with evidence, ÷ every technique in the file. A `known-gap` row is
@@ -143,9 +152,9 @@ coverage percentage goes into external material.
 Out of the sub-gate (`gate -`, still in the denominator), with what
 brings each one back:
 
-- `NN-L-NET-003_BadJa3` — inactive until BUG-025: no sensor produces a TLS
-  fingerprint (`FlowTracker::attach_tls` has no caller), so it cannot fire;
-  registry version 2, lab PR 163.
+- None since version 4. `NN-L-NET-003_BadJa3` was out in versions 2 and 3
+  (inactive until BUG-025: no sensor produced a TLS fingerprint); lot 275
+  closed BUG-025 and version 4 returns it.
 
 | rule_id | Q1 | unit | e2e | lab | campaign | status | notes |
 |---|---|---|---|---|---|---|---|
@@ -170,6 +179,7 @@ brings each one back:
 | NN-L-CANARY-003_NetworkConnect | - | `crates/nn-core/src/decision/rules/canary.rs::canary003_fires_on_network_canary_connect` | `agent/tests/canary_privileged_e2e.rs::network_canary_connect_trips_canary_003_and_kills_the_connector` | no proof | no proof | e2e | Lab PR 163: a local connect to the canary's address and port trips it (the connect kprobe; the agent opens no listener, a connection from another host is not seen). The e2e waits for the signed access row, the rule's detection record (Critical, KillProcessTree) and the connecting shell's kill; `agent/src/canary/detector_tests.rs::a_network_canary_trip_draws_canary_003_on_the_connector` runs connect → trip → verdict in process. |
 | NN-L-CANARY-004_CredentialRead | - | `crates/nn-core/src/decision/rules/canary.rs::canary004_fires_on_credential_canary_read` | no proof | no proof | no proof | unit | - |
 | NN-L-NET-001_OutboundToBlockedIp | - | `crates/nn-core/src/decision/rules/net.rs::net_001_fires_on_blocklist_match` | no proof | no proof | no proof | unit | Needs an entry in the operator blocklist on the target. |
+| NN-L-NET-003_BadJa3 | - | `crates/nn-core/src/decision/rules/net.rs::net_003_fires_on_ja3_blocklist_match` | no proof | no proof | no proof | unit | Lot 275 (version 4): judged on the TLS ClientHello event, Critical, its kill held behind the per-rule policy (Log by default, `enforce NN-L-NET-003` gives it back). Needs the client's JA3 in a signed `netflow-ja3-blocklist.local` on the target. |
 | NN-L-CHAIN-001_CredReadThenEgress | yes | `crates/nn-core/src/decision/rules/chain.rs::chain001_fires_on_cred_read_then_egress` | no proof | no proof | no proof | unit | Same-PID form; no e2e. |
 | NN-L-CHAIN-002_TmpExecThenEgress | yes | `crates/nn-core/src/decision/rules/chain.rs::chain002_fires_on_tmp_exec_then_nondns_egress` | `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_exec_then_egress_trips_chain_002` | no proof | no proof | e2e | Negative e2e: `chain_tmp_exec_without_egress_does_not_trip_chain_002`. |
 | NN-L-CHAIN-003_CanaryThenEgress | yes | `crates/nn-core/src/decision/rules/chain.rs::chain003_fires_on_canary_then_egress` | no proof | no proof | no proof | unit | Same-PID form; no e2e. |
@@ -187,12 +197,12 @@ brings each one back:
 | `process` (R001–R018, R020) | 19 | | | | | | |
 | `fim` (NN-L-FIM-001..025) | 25 | | | | | | |
 | `canary` (NN-L-CANARY-001..004) | 4 | | | | | | |
-| `net` (NN-L-NET-*) | 19 | | | | | | |
+| `net` (NN-L-NET-*) | 20 | | | | | | |
 | `io_uring` (NN-L-IOU-001/002) | 2 | | | | | | |
 | `bpf` (NN-L-BPF-001/002) | 2 | | | | | | |
 | `anti-tamper` (NN-L-AT-001) | 1 | | | | | | |
 | `exploit-guard` (NN-L-EPG-001/002) | 2 | | | | | | |
 | `impact` (NN-L-IMP-001/002) | 2 | | | | | | |
 | `evasion` (NN-L-EVA-001..004) | 4 | | | | | | |
-| **Total** | **88** | | | | | | |
-| **Critical sub-gate** | **29** | | | | | | |
+| **Total** | **89** | | | | | | |
+| **Critical sub-gate** | **30** | | | | | | |

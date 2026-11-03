@@ -47,10 +47,10 @@ held to it too (a test reads it for every source and class).
 
 | Class | Queue | When the queue is full | Decision's budget | Sources | Strongest verdict | Worst failure | Loss stages |
 |---|---|---|---|---|---|---|---|
-| tamper | P0, 1,024 events | the source waits 50 ms, then the event is dropped (counted and signed); the rare tamper events wait for room | 100 ms | `fs_protect`, `module_load`, `io_uring` (its `SensorFlood`), `bpf_syscall`, `exploit_guard`, `open_sensor` (its `DefenderSignal`), `net_drain` (its `SensorFlood`) | kernel deny (the deny hooks) | blind | 1, 2, 3, 4, 5 |
+| tamper | P0, 1,024 events | the source waits 50 ms, then the event is dropped (counted and signed); the rare tamper events wait for room | 100 ms | `fs_protect`, `module_load`, `io_uring` (its `SensorFlood`), `bpf_syscall`, `exploit_guard`, `open_sensor` (its `DefenderSignal`), `net_drain`, `net_inbound`, `dns_answer`, `tls_hello` (their `SensorFlood`) | kernel deny (the deny hooks) | blind | 1, 2, 3, 4, 5 |
 | process | P1, 4,096 events | waits 10 ms, then dropped and counted | 250 ms | `process_spawn`, `exec_check`, `io_uring` | none (opt-in: the exec quarantine's deadline, the exec policy's deny) | blind | 1, 2, 3, 4, 5 |
 | file | P2, 8,192 events | a new `FileOpen` dropped and counted; every other file event waits | 1 s | `file_open`, `open_sensor`, `fim_drain` | none | blind | 1, 2, 3, 4, 5 |
-| network | P3, 8,192 events | the new event dropped and counted | 500 ms | `tcp_connect`, `dns_query`, `net_drain` | none (opt-in: the connect deny) | blind | 1, 2, 3, 4, 5 |
+| network | P3, 8,192 events | the new event dropped and counted | 500 ms | `tcp_connect`, `dns_query`, `net_drain`, `net_inbound`, `dns_answer`, `tls_hello` (lot 275) | none (opt-in: the connect deny) | blind | 1, 2, 3, 4, 5 |
 | health | P0's | — | — | none yet | — | — | — |
 
 The health class has no event yet: the sensors' health is the capability
@@ -75,10 +75,23 @@ the heartbeat's.
 | `open_sensor` | FileOpen, Fim, MassWrite, FileBurst, DefenderSignal | `lsm:file_open` (the FIM observer); its fallback is the `file_open` source's tracepoint (`--file-open-sensor tracepoint`, a failure to arm, or `bpf` not in the active LSM list): every open reaches userland, no mass writes, bursts, security-tool signals or FIM `Opened` records | none | blind | a read-only open repeated within 1 s is not recorded (by design) | path 31 B per component, 16 components (`path_truncated`), a renamed name's first 31 B, comm 15 B | `open_sensor` |
 | `fim_drain` | Fim | `lsm:` the FIM observe programs | none | blind | 8,192 inodes with a write pending (`fim_dirty_full`) | child name 63 B (`FIM_CHILD_TRUNCATED`), comm 15 B | `fim` |
 | `net_drain` | NetFlow, NetListener, SensorFlood | `kprobe:inet_csk_listen_start, fexit:tcp_close, kprobe:udp_sendmsg(+udpv6_sendmsg)` | none | blind | `listen()` 64 then 128 a second per process, 512 then 256 per user; UDP one row a second per destination (`listen_rate`) | comm 15 B | `tcp_close`, `listen`, `udp` |
+| `net_inbound` | NetInbound, SensorFlood | `fexit:inet_csk_accept` (the program built for this kernel's parameter count: 4 up to 6.9, 2 from 6.10, read from its BTF), `fexit:tcp_close` (an accepted socket the accept recorded) — lot 275 | none | blind: its attach failing is signed (`net_inbound`) and the agent runs without it; its drain ending stops the agent within 5 s | accepts 256 at once then 512 a second per accepting process, 2,048 then 1,024 per user; a held accept's close is not recorded either (`inbound_rate`) | comm 15 B | `inbound` |
+| `dns_answer` | DnsAnswer, SensorFlood | `fexit:udp_recvmsg+udpv6_recvmsg` (6 parameters up to 5.18, 5 from 5.19), the response read from the receiver's buffer; `udp_recvmsg` alone: partial — lot 275 | none | blind: its attach failing is signed (`dns_answer`), NN-L-NET-028 then judges every connect unknown; its pump ending stops the agent within 5 s | 64 responses at once then 128 a second per process, 2,048 then 1,024 per user, the resolvers' users exempt (`dns_answer_rate`) | response 512 B (`truncated`: the records past the cut are not read), comm 15 B | `dns_answer` |
+| `tls_hello` | TlsClientHello, SensorFlood | `fentry:tcp_sendmsg` on an outbound flow's first send (marked by the connect kprobes), a ClientHello copied from the sender's buffer — lot 275 | none | blind: its attach failing is signed (`tls_hello`), NN-L-NET-003 cannot match; its pump ending stops the agent within 5 s | 64 hellos at once then 32 a second per process, 512 then 256 per user (`tls_rate`) | ClientHello 4096 B (`truncated`: a longer hello is `incomplete`, no fingerprint), comm 15 B | `tls` |
 
 `CanaryTripped` is no source's: the canary detector makes it inside the
 decision from the event it replaces, which has that event's source and
 class.
+
+Lot 275: a `dns_answer` record is decoded, and a `tls_hello` record
+fingerprinted, by the same parse worker; while it is down a response binds
+nothing and NN-L-NET-028 judges unknown (no detection) every connect no
+earlier binding covers, for five minutes after the last record it could not
+decode; a hello's event says `undecoded`. The sender's
+buffer a ClientHello is read from is user memory, read when the send
+begins: a sender can rewrite it meanwhile, as it can shape its hello like
+another client's. A ClientHello sent with the connect (TCP Fast Open) is not
+seen.
 
 R14b: a `dns_query` event's name is decoded by the agent's parse worker
 (`WORKERS.md`), not by the agent's core. While the worker is down or
