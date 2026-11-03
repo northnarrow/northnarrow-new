@@ -323,6 +323,42 @@ mod tests {
         }
     }
 
+    /// Lot 275: the worker's answer to a DNS response carries its question
+    /// and its records; to bytes that are no response, `None`.
+    #[test]
+    fn a_dns_response_is_answered_with_its_question_and_records() {
+        use nn_proto::ipc::{DnsRecordOut, Request};
+        let mut m = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        m.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        m.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 7]);
+        match answer(&Request::DnsAnswers(m.clone())) {
+            Answer::DnsAnswers(Some(out)) => {
+                assert_eq!(
+                    (out.qname.as_str(), out.qtype, out.rcode),
+                    ("example.com", 1, 0)
+                );
+                assert!(out.complete);
+                assert_eq!(
+                    out.records,
+                    vec![DnsRecordOut::A {
+                        name: "example.com".into(),
+                        ttl: 60,
+                        addr: [192, 0, 2, 7]
+                    }]
+                );
+                assert!(nn_proto::ipc::check_response(
+                    &Request::DnsAnswers(m.clone()),
+                    &Answer::DnsAnswers(Some(out))
+                )
+                .is_ok());
+            }
+            other => panic!("{other:?}"),
+        }
+        // a query (QR clear) is no response
+        m[2] = 0x01;
+        assert_eq!(answer(&Request::DnsAnswers(m)), Answer::DnsAnswers(None));
+    }
+
     #[test]
     fn every_answer_is_inside_the_protocol_for_hostile_inputs() {
         let reqs = [
