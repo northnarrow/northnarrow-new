@@ -37,7 +37,10 @@ below). Manual execution, and everything the CI gate leaves out, lives here.
 
 `deploy/lab/nn-lab.sh` turns the prerequisites above into a repeatable
 guest: Ubuntu 24.04 cloud image, kernel 6.8, `lsm=…,bpf` set through
-cloud-init (one automatic reboot), iptables + bpftool + rustup inside,
+cloud-init (one automatic reboot: `up` waits for the guest on the boot
+after it, told apart by the boot id the provisioning boot writes into
+`/var/lib/nn-lab-provisioned`, lab PR 274 — a Debian kernel lists bpf on
+its first boot already), iptables + bpftool + rustup inside,
 SSH on `127.0.0.1:2222`. On Ubuntu `/usr/sbin/bpftool` is only a wrapper
 around `linux-tools-$(uname -r)`: `up` installs that package (again after
 a kernel change), `check` reports `bpftool : missing` when `bpftool

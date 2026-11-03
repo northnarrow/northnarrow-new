@@ -11,7 +11,10 @@
 //! guest's command (its probe reads none, nor does a Windows program), and
 //! under whpx `down` stops QEMU for Windows and the ssh forwarder and says
 //! "stopped" only when both are gone, while `status` names a forwarder a
-//! guest powered off from inside left listening on 127.0.0.1.
+//! guest powered off from inside left listening on 127.0.0.1. Lab PR 274:
+//! `up` returns only for a guest on a boot after its provisioning boot (the
+//! boot id in the lab marker), never in the seconds before cloud-init's
+//! reboot, and a guest that does not get there is named in the error.
 //! Offline: committed files, `bash`, OpenSSH's client tools,
 //! `git`, `python3 -I` and stubs; no guest, nothing privileged, nothing
 //! written outside the target and temporary directories.
@@ -763,6 +766,269 @@ fn nn_lab_has_no_unchecked_guest_connection() {
                 n + 1
             );
         }
+    }
+}
+
+// ── Lab PR 274: a guest past its provisioning boot ──────────────────────
+
+/// A boot id of the provisioning boot, and one of the boot after it.
+const FIRST_BOOT: &str = "0d3c5a7e-6f0b-4c7e-9a51-2b8f4e1c9d10";
+const NEXT_BOOT: &str = "7e2b9f04-1c3d-4a8e-b6f5-90a1d2c3e4f5";
+/// Debian 12's LSM list without an lsm= argument: bpf is in it already.
+const DEBIAN_FIRST_LSM: &str = "lockdown,capability,landlock,yama,apparmor,tomoyo,bpf";
+/// The templates' lsm= list, and Ubuntu's list without it.
+const LAB_LSM: &str = "lockdown,capability,landlock,yama,apparmor,bpf";
+const UBUNTU_FIRST_LSM: &str = "lockdown,capability,landlock,yama,apparmor,ima,evm";
+
+/// The guest-boot block and wait_ssh, with a guest whose answers are the
+/// files `answers/1`, `answers/2`, … in turn (the last one again once they
+/// run out; no file: the connection fails as ssh's does). `vssh` refuses any
+/// command but the block's own facts.
+fn guest_boot_script(dir: &Path, lockdown: &str, body: &str) -> String {
+    let text = read(NN_LAB);
+    let wait = &text[text.find("wait_ssh() {").expect("wait_ssh")..];
+    let wait = &wait[..wait.find("\n}\n").expect("wait_ssh's end") + 3];
+    let tail = &text[text.find("lab_serial_tail() {").expect("lab_serial_tail")..];
+    let tail = &tail[..tail.find("\n}\n").expect("lab_serial_tail's end") + 3];
+    format!(
+        "{prelude}GUEST_NAME=debian12; LOCKDOWN='{lockdown}'; ACCEL=kvm; CI_MODE=0\n\
+         SSH_PORT=2422; SERIAL={serial:?}; KNOWN_HOSTS={kh:?}; ANSWERS={answers:?}\n\
+         echo 'nn-lab-debian12 ssh-ed25519 AAAAtest' > \"$KNOWN_HOSTS\"\n\
+         {block}\n{wait}{tail}\
+         guest_probe() {{ return 0; }}\n\
+         sleep() {{ command sleep 0.01; }}\n\
+         vssh() {{\n\
+             [[ $# == 1 && $1 == \"$GUEST_BOOT_FACTS\" ]] || {{ echo \"unexpected vssh: $*\" >&2; return 99; }}\n\
+             local n; n=$(cat \"$ANSWERS/n\" 2>/dev/null || echo 0)\n\
+             if [[ -e $ANSWERS/$((n + 1)) ]]; then n=$((n + 1)); fi\n\
+             echo \"$n\" > \"$ANSWERS/n\"; echo \"$n\" >> \"$ANSWERS/calls\"\n\
+             [[ -e $ANSWERS/$n ]] || {{ echo 'kex_exchange_identification: read: Connection reset by peer' >&2; return 255; }}\n\
+             cat \"$ANSWERS/$n\"\n\
+         }}\n\
+         {body}\n",
+        prelude = fn_prelude(),
+        serial = dir.join("serial.log").display().to_string(),
+        kh = dir.join("known_hosts").display().to_string(),
+        answers = dir.join("answers").display().to_string(),
+        block = block(NN_LAB, "guest-boot"),
+    )
+}
+
+/// What the guest answers: its boot id, the marker's content (None: no
+/// marker), its active LSMs and its lockdown line.
+fn facts(boot: &str, marker: Option<&str>, lsm: &str, lockdown: &str) -> String {
+    let mut f = format!("boot={boot}\n");
+    if let Some(m) = marker {
+        f.push_str(&format!("provisioned={m}\n"));
+    }
+    f.push_str(&format!("lsm={lsm}\nlockdown={lockdown}\n"));
+    f
+}
+
+fn answers(dir: &Path, seq: &[String]) {
+    let a = dir.join("answers");
+    let _ = fs::remove_dir_all(&a);
+    fs::create_dir_all(&a).unwrap();
+    for (i, f) in seq.iter().enumerate() {
+        fs::write(a.join((i + 1).to_string()), f).unwrap();
+    }
+}
+
+/// The nightly's red Debian guests (23/10-02/11): between the marker and
+/// cloud-init's reboot a Debian guest already lists bpf, and `up` took it
+/// for a guest past the reboot. The provisioning boot is now told by its
+/// id: on that boot the guest is never ready, whatever its LSM list.
+#[test]
+fn a_guest_on_its_provisioning_boot_is_not_ready() {
+    let dir = case_dir("guest-boot-states");
+    let none = "[none] integrity confidentiality";
+    let integrity = "none [integrity] confidentiality";
+    for (case, lockdown, answer, want) in [
+        ("no answer", "", None, 1),
+        (
+            "still provisioning (no marker)",
+            "",
+            Some(facts(FIRST_BOOT, None, DEBIAN_FIRST_LSM, none)),
+            1,
+        ),
+        (
+            "no boot id",
+            "",
+            Some(format!("provisioned={FIRST_BOOT}\nlsm={LAB_LSM}\n")),
+            1,
+        ),
+        (
+            "Debian, before the reboot",
+            "",
+            Some(facts(FIRST_BOOT, Some(FIRST_BOOT), DEBIAN_FIRST_LSM, none)),
+            3,
+        ),
+        (
+            "Ubuntu, before the reboot",
+            "",
+            Some(facts(FIRST_BOOT, Some(FIRST_BOOT), UBUNTU_FIRST_LSM, none)),
+            3,
+        ),
+        (
+            "after the reboot",
+            "",
+            Some(facts(NEXT_BOOT, Some(FIRST_BOOT), LAB_LSM, none)),
+            0,
+        ),
+        (
+            "an older template's empty marker",
+            "",
+            Some(facts(NEXT_BOOT, Some(""), LAB_LSM, none)),
+            0,
+        ),
+        (
+            "rebooted without bpf",
+            "",
+            Some(facts(NEXT_BOOT, Some(FIRST_BOOT), UBUNTU_FIRST_LSM, none)),
+            4,
+        ),
+        (
+            "bpf only as a substring",
+            "",
+            Some(facts(NEXT_BOOT, Some(FIRST_BOOT), "capability,bpfx", none)),
+            4,
+        ),
+        (
+            "lockdown asked, not on",
+            "integrity",
+            Some(facts(NEXT_BOOT, Some(FIRST_BOOT), LAB_LSM, none)),
+            5,
+        ),
+        (
+            "lockdown asked and on",
+            "integrity",
+            Some(facts(NEXT_BOOT, Some(FIRST_BOOT), LAB_LSM, integrity)),
+            0,
+        ),
+        (
+            "lockdown asked, provisioning boot",
+            "integrity",
+            Some(facts(FIRST_BOOT, Some(FIRST_BOOT), LAB_LSM, integrity)),
+            3,
+        ),
+    ] {
+        answers(&dir, answer.as_slice());
+        let script = guest_boot_script(
+            &dir,
+            lockdown,
+            "s=0; guest_boot_state || s=$?; echo \"state=$s\"",
+        );
+        let out = bash(&script, &[], &[]);
+        let t = text(&out);
+        assert!(out.status.success(), "{case}: {t}");
+        assert!(
+            t.contains(&format!("state={want}\n")),
+            "{case}: want {want}: {t}"
+        );
+    }
+}
+
+/// wait_ssh itself: a guest that answers on its provisioning boot first is
+/// waited for until it answers on the next one; a guest that stays on it
+/// ends the wait with an error that says so (not "did not become
+/// reachable"), as do a guest without bpf and one that never answers.
+#[test]
+fn wait_ssh_returns_only_after_the_provisioning_boot() {
+    let dir = case_dir("guest-boot-wait");
+    let none = "[none] integrity confidentiality";
+    let before = facts(FIRST_BOOT, Some(FIRST_BOOT), DEBIAN_FIRST_LSM, none);
+    let after = facts(NEXT_BOOT, Some(FIRST_BOOT), LAB_LSM, none);
+    let script = guest_boot_script(
+        &dir,
+        "",
+        "wait_ssh 30; echo WAIT-OK; tr '\\n' ' ' < \"$ANSWERS/calls\"",
+    );
+
+    // provisioning boot twice, then the reboot: ready at the third answer
+    answers(&dir, &[before.clone(), before.clone(), after.clone()]);
+    let out = bash(&script, &[], &[]);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(
+        t.contains("still on its provisioning boot: waiting for cloud-init's reboot"),
+        "{t}"
+    );
+    assert!(t.contains("guest is up and provisioned"), "{t}");
+    assert!(
+        t.contains("WAIT-OK\n1 2 3 "),
+        "ready at the first answer after the reboot: {t}"
+    );
+
+    // the reboot never comes, bpf never appears, the guest never answers
+    for (seq, says) in [
+        (vec![before.clone()], "is still on its provisioning boot after 2s: cloud-init's power_state reboot did not happen"),
+        (
+            vec![facts(NEXT_BOOT, Some(FIRST_BOOT), UBUNTU_FIRST_LSM, none)],
+            "bpf is not among its active LSMs (/sys/kernel/security/lsm) after 2s",
+        ),
+        (vec![], "guest did not become reachable within 2s"),
+    ] {
+        answers(&dir, &seq);
+        let script = guest_boot_script(&dir, "", "wait_ssh 2; echo WAIT-OK");
+        let out = bash(&script, &[], &[]);
+        let t = text(&out);
+        assert!(!out.status.success(), "{says}: {t}");
+        assert!(!t.contains("WAIT-OK"), "{says}: {t}");
+        assert!(t.contains("nn-lab: ERROR: ") && t.contains(says), "{says}: {t}");
+        assert!(t.contains("; see ") && t.contains("serial.log"), "{says}: {t}");
+    }
+}
+
+/// What the guest is asked, run here: the first line is this host's boot
+/// id, a `provisioned=` line only where the lab marker exists, then the LSM
+/// and lockdown lines (empty where securityfs is not readable).
+#[test]
+fn the_guests_boot_facts_are_its_own() {
+    let script = format!(
+        "{}GUEST_NAME=x; LOCKDOWN=\n{}\nbash -c \"$GUEST_BOOT_FACTS\"",
+        fn_prelude(),
+        block(NN_LAB, "guest-boot")
+    );
+    let out = bash(&script, &[], &[]);
+    let t = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "{}", text(&out));
+    let lines: Vec<&str> = t.lines().collect();
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    assert_eq!(lines[0], format!("boot={}", boot_id.trim()), "{t}");
+    let marker = Path::new("/var/lib/nn-lab-provisioned").exists();
+    assert_eq!(
+        lines.iter().any(|l| l.starts_with("provisioned=")),
+        marker,
+        "{t}"
+    );
+    assert_eq!(lines.len(), if marker { 4 } else { 3 }, "{t}");
+    assert!(lines[lines.len() - 2].starts_with("lsm="), "{t}");
+    assert!(lines[lines.len() - 1].starts_with("lockdown="), "{t}");
+}
+
+/// Every template writes its provisioning boot's id into the lab marker,
+/// whole (a new file renamed over it: never an empty marker on that boot),
+/// as its last runcmd, before the power_state reboot; none `touch`es it.
+#[test]
+fn every_guest_template_records_its_provisioning_boot() {
+    let write =
+        "  - >-\n    cat /proc/sys/kernel/random/boot_id > /var/lib/nn-lab-provisioned.new\n    \
+                 && mv -f /var/lib/nn-lab-provisioned.new /var/lib/nn-lab-provisioned\n";
+    for t in templates() {
+        let text = fs::read_to_string(&t).unwrap();
+        let name = t.display();
+        assert!(
+            !text.contains("touch /var/lib/nn-lab-provisioned"),
+            "{name}"
+        );
+        assert_eq!(text.matches(write).count(), 1, "{name}");
+        let at = text.find(write).unwrap() + write.len();
+        let rest = &text[at..];
+        assert!(
+            rest.trim_start_matches('\n')
+                .starts_with("power_state:\n  mode: reboot\n"),
+            "{name}: the marker is the last runcmd, the reboot right after: {rest}"
+        );
     }
 }
 
