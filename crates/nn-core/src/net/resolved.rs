@@ -298,14 +298,18 @@ impl<I: Default> ResolvedTable<I> {
             *slot = (*slot).max(*until);
             g.addr_order.touch(*addr);
         }
-        // the receiver, and the recent askers of one of the chain's names
+        // the receiver, and the askers of one of the chain's names within
+        // the window either side: an asker before the response waits for
+        // it; one after it (its pump read first) was answered from the
+        // resolver's cache, with these addresses
         let since = a.ts_ns.saturating_sub(ASK_WINDOW_SECS * SEC);
+        let until = a.ts_ns.saturating_add(ASK_WINDOW_SECS * SEC);
         let mut pids: Vec<u32> = vec![a.pid];
         for (n, pid, t) in g.askers.iter().rev() {
             if *t < since {
                 break;
             }
-            if *t <= a.ts_ns && chain.contains(n) && !pids.contains(pid) {
+            if *t <= until && chain.contains(n) && !pids.contains(pid) {
                 pids.push(*pid);
             }
         }
@@ -648,6 +652,18 @@ mod tests {
         answer(&t, RESOLVED, T0, "b.example", &[a("b.example", 30, C2)]);
         t.on_query(77, "B.Example.", T0 + 1);
         assert_eq!(t.check(77, 1, C2, T0 + SEC, none), DnsResolution::Lineage);
+        // an asker whose query was read before an earlier response (the
+        // pumps' order): bound by it, as by a response from a cache
+        t.on_query(55, "c.example", T0 + 2 * SEC);
+        answer(&t, RESOLVED, T0 + SEC, "c.example", &[a("c.example", 30, WEB)]);
+        assert_eq!(t.check(55, 1, WEB, T0 + 3 * SEC, none), DnsResolution::Lineage);
+        // ... but not one that asked past the window after it
+        t.on_query(56, "d.example", T0 + 20 * SEC);
+        answer(&t, RESOLVED, T0, "d.example", &[a("d.example", 30, C2)]);
+        assert_eq!(
+            t.check(56, 1, C2, T0 + 21 * SEC, none),
+            DnsResolution::OtherLineage
+        );
         // an asker outside the window is not bound by the response
         t.on_query(88, "late.example", T0);
         answer(
