@@ -337,6 +337,13 @@ async fn run(
         &lineage,
         own_launch,
     );
+    // Lot 273c (the review of #490): the reloads the agent asks systemd for
+    // (a refused set-property's copy, a window's opening, a quarantined
+    // drop-in), handed to whoever asks.
+    let reloader = northnarrow_agent::systemd_reload::Reloader::start(
+        northnarrow_agent::systemd_state::PRIVATE_SOCKET,
+    );
+    installer_override.set_reloader(reloader.clone());
     // R14c (plan §3.3): the quarantine vault's key is the key store's: the
     // executor, the exec quarantine and the restore verbs seal and open
     // through its vault, and none of them holds the key.
@@ -388,6 +395,7 @@ async fn run(
         &posture,
         &installer_override,
         &signing_key,
+        &reloader,
     );
     let combat = posture::ladder(
         &cli,
@@ -401,6 +409,7 @@ async fn run(
         &ladder_slot,
         &overlay_gate,
         &lineage,
+        &reloader,
     );
     let fim::FimPaths {
         watched_paths_load,

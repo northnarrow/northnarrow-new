@@ -20,6 +20,8 @@
 //! The eBPF programs and the agent share this module: the names, the
 //! values and their comparison are tested once, here.
 
+use crate::wire::{CGROUP2_SUPER_MAGIC, CGROUP_SUPER_MAGIC, PROC_SUPER_MAGIC};
+
 /// Not a protected resource file.
 pub const LIMIT_NONE: u8 = 0;
 /// `max` or a number of bytes / tasks / cgroups, higher is better
@@ -38,9 +40,22 @@ pub const LIMIT_NICE: u8 = 5;
 /// `$MAJ:$MIN key=value ...` (`io.max`): only `max` values (a limit
 /// removed) are no worse.
 pub const LIMIT_IO_MAX: u8 = 6;
+/// Lot 273c (the review of #490): a CPU or memory-node list (`cpuset.cpus`,
+/// `cpuset.mems`): the agent pinned to one CPU a real-time hog owns
+/// starves. Empty by default (the parent's).
+pub const LIMIT_CPU_LIST: u8 = 7;
+/// Lot 273c: `cpuset.cpus.partition` (`member` by default).
+pub const LIMIT_PARTITION: u8 = 8;
+/// Lot 273c: `memory.reclaim`, write-only: every write forces a reclaim
+/// (a thrash of the agent's memory, repeated). Never PID 1's either: no
+/// value to put back.
+pub const LIMIT_RECLAIM: u8 = 9;
+/// Lot 273c: `io.weight` / `io.bfq.weight` (`default 100`, then per
+/// device): a weight of 1 starves the agent's I/O under contention.
+pub const LIMIT_IO_WEIGHT: u8 = 10;
 
 /// The protected resource files and their kinds.
-pub const LIMIT_FILES: [(&str, u8); 11] = [
+pub const LIMIT_FILES: [(&str, u8); 17] = [
     ("memory.max", LIMIT_UNSIGNED_MAX),
     ("memory.high", LIMIT_UNSIGNED_MAX),
     ("pids.max", LIMIT_UNSIGNED_MAX),
@@ -52,6 +67,13 @@ pub const LIMIT_FILES: [(&str, u8); 11] = [
     ("memory.oom.group", LIMIT_FLAG),
     ("cpu.weight.nice", LIMIT_NICE),
     ("io.max", LIMIT_IO_MAX),
+    // Lot 273c (the review of #490)
+    ("cpuset.cpus", LIMIT_CPU_LIST),
+    ("cpuset.mems", LIMIT_CPU_LIST),
+    ("cpuset.cpus.partition", LIMIT_PARTITION),
+    ("memory.reclaim", LIMIT_RECLAIM),
+    ("io.weight", LIMIT_IO_WEIGHT),
+    ("io.bfq.weight", LIMIT_IO_WEIGHT),
 ];
 
 /// The longest name the eBPF programs read (`cgroup.max.descendants`, 22
@@ -162,6 +184,10 @@ pub const fn default_value(kind: u8) -> Option<LimitValue> {
         LIMIT_CPU_MAX => limit_value(b"max 100000"),
         LIMIT_WEIGHT => limit_value(b"100"),
         LIMIT_FLAG | LIMIT_NICE => limit_value(b"0"),
+        // Lot 273c
+        LIMIT_CPU_LIST => limit_value(b""),
+        LIMIT_PARTITION => limit_value(b"member"),
+        LIMIT_IO_WEIGHT => limit_value(b"default 100"),
         _ => None,
     }
 }
@@ -215,6 +241,50 @@ pub const fn same_value(written: &LimitValue, value: &LimitValue) -> bool {
         == 0
 }
 
+/// Whether PID 1's write of a protected resource file goes through
+/// (systemd realising a unit, or a `set-property`'s copy): only when its
+/// bytes could be read (`written`) and put back the value expected there
+/// (`expected`: the registered one, else [`default_value`]). Any other
+/// value, a file without an expected value, a write whose bytes cannot be
+/// read: refused. Pure, so that the host's tests judge what the eBPF
+/// program decides (the review of #490, its P2).
+#[inline(always)]
+pub const fn init_write_lets_through(
+    expected: Option<LimitValue>,
+    written: Option<LimitValue>,
+) -> bool {
+    match (expected, written) {
+        (Some(e), Some(w)) => same_value(&w, &e),
+        _ => false,
+    }
+}
+
+/// The pseudo-filesystems whose files the write deny judges.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpecialFs {
+    /// cgroup v2: a unit's resource files.
+    Cgroup2,
+    /// A cgroup v1 hierarchy.
+    CgroupV1,
+    /// procfs: `oom_score_adj`, `oom_adj`.
+    Proc,
+}
+
+/// The filesystem of a superblock whose `s_magic` is `s_magic`, when the
+/// write deny judges its files. `s_magic` is an `unsigned long`; the
+/// magics are 32-bit, the upper half is ignored. Pure, so that the host's
+/// tests see a wrong mask or magic (the review of #490, its P3: a mask of
+/// 16 bits left every cgroup file unjudged).
+#[inline(always)]
+pub const fn special_fs(s_magic: u64) -> Option<SpecialFs> {
+    match s_magic & 0xffff_ffff {
+        CGROUP2_SUPER_MAGIC => Some(SpecialFs::Cgroup2),
+        CGROUP_SUPER_MAGIC => Some(SpecialFs::CgroupV1),
+        PROC_SUPER_MAGIC => Some(SpecialFs::Proc),
+        _ => None,
+    }
+}
+
 #[inline(always)]
 const fn is_blank(b: u8) -> bool {
     matches!(b, b' ' | b'\n' | b'\t' | b'\r')
@@ -240,10 +310,22 @@ mod tests {
             ("memory.oom.group", LIMIT_FLAG),
             ("cpu.weight.nice", LIMIT_NICE),
             ("io.max", LIMIT_IO_MAX),
+            ("cpuset.cpus", LIMIT_CPU_LIST),
+            ("cpuset.mems", LIMIT_CPU_LIST),
+            ("cpuset.cpus.partition", LIMIT_PARTITION),
+            ("memory.reclaim", LIMIT_RECLAIM),
+            ("io.weight", LIMIT_IO_WEIGHT),
+            ("io.bfq.weight", LIMIT_IO_WEIGHT),
         ] {
             assert_eq!(limit_kind_of(name), kind, "{name}");
         }
-        assert_eq!(LIMIT_FILES.len(), 11);
+        assert_eq!(LIMIT_FILES.len(), 17);
+        // Lot 273c: the defaults systemd writes for a unit that sets none,
+        // and none for memory.reclaim (no value to put back)
+        assert_eq!(default_value(LIMIT_CPU_LIST), limit_value(b""));
+        assert_eq!(default_value(LIMIT_PARTITION), limit_value(b"member"));
+        assert_eq!(default_value(LIMIT_IO_WEIGHT), limit_value(b"default 100"));
+        assert_eq!(default_value(LIMIT_RECLAIM), None);
     }
 
     #[test]
@@ -265,7 +347,11 @@ mod tests {
             "cgroup.kill",
             "cgroup.freeze",
             "",
-            "io.weight",
+            "io.weigh",
+            "io.stat",
+            "cpuset.cpus.effective",
+            "cpuset.mems.effective",
+            "memory.reclaimX",
             "cgroup.max.descendantsX",
             "cgroup.max.descendants.and.more.bytes",
         ] {
@@ -363,5 +449,42 @@ mod tests {
         assert_eq!(default_value(LIMIT_NICE), limit_value(b"0"));
         assert_eq!(default_value(LIMIT_IO_MAX), None);
         assert_eq!(default_value(LIMIT_NONE), None);
+    }
+
+    /// The review of #490, its P2: PID 1 writes only the expected value.
+    #[test]
+    fn init_writes_only_the_value_expected_there() {
+        let max = limit_value(b"max");
+        let four_k = limit_value(b"4096");
+        assert!(init_write_lets_through(max, max));
+        assert!(init_write_lets_through(
+            limit_value(b"536870912"),
+            Some(strip_newline(limit_value(b"536870912\n").unwrap(), 10))
+        ));
+        // another value, a value it could not read, a file without one
+        assert!(!init_write_lets_through(max, four_k));
+        assert!(!init_write_lets_through(limit_value(b"536870912"), four_k));
+        assert!(!init_write_lets_through(max, None));
+        assert!(!init_write_lets_through(None, four_k));
+        assert!(!init_write_lets_through(
+            default_value(LIMIT_IO_MAX),
+            limit_value(b"")
+        ));
+    }
+
+    /// The review of #490, its P3: the three magics, their 32 bits only.
+    #[test]
+    fn the_judged_filesystems_are_found_by_their_32_bit_magic() {
+        assert_eq!(special_fs(0x6367_7270), Some(SpecialFs::Cgroup2));
+        assert_eq!(special_fs(0x0027_e0eb), Some(SpecialFs::CgroupV1));
+        assert_eq!(special_fs(0x9fa0), Some(SpecialFs::Proc));
+        assert_eq!(special_fs(0xffff_ffff_6367_7270), Some(SpecialFs::Cgroup2));
+        // a 16-bit match is not one (tmpfs, ext4, sysfs, a 16-bit cut)
+        assert_eq!(special_fs(0x7270), None);
+        assert_eq!(special_fs(0xe0eb), None);
+        assert_eq!(special_fs(0x0100_9fa0), None);
+        assert_eq!(special_fs(0x0102_1994), None);
+        assert_eq!(special_fs(0xef53), None);
+        assert_eq!(special_fs(0x6265_6572), None);
     }
 }

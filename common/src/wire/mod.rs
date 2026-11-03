@@ -852,6 +852,23 @@ pub const FS_OP_CGROUP_V1: u8 = 23;
 /// whose SIGKILL no `task_kill` hook sees (`target_ino` = the protected
 /// tgid, `target_dev` = 0).
 pub const FS_OP_OOM_ADJ: u8 = 24;
+/// Lot 273c (the review of #490): a resource limit of a protected process
+/// changed by another (`prlimit(2)`, `task_setrlimit`): `--cpu=1:1` is a
+/// SIGKILL from the kernel once the hard limit is passed, which no
+/// `task_kill` hook sees; a small `--as` / `--nofile` / `--memlock` breaks
+/// it (`target_ino` = the protected tgid, `target_dev` = the resource).
+pub const FS_OP_RLIMIT: u8 = 25;
+/// Lot 273c: the scheduling policy, priority or CPU affinity of a protected
+/// process changed by another (`sched_setattr`, `sched_setscheduler`,
+/// `sched_setaffinity`: `task_setscheduler`) — `SCHED_IDLE`, or one busy
+/// CPU, starve it (`target_ino` = the tgid, `target_dev` = 0).
+pub const FS_OP_SCHED: u8 = 26;
+/// Lot 273c: the nice value of a protected process changed by another
+/// (`setpriority`: `task_setnice`; `target_dev` = the nice value).
+pub const FS_OP_NICE: u8 = 27;
+/// Lot 273c: the I/O priority of a protected process changed by another
+/// (`ioprio_set`: `task_setioprio`; `target_dev` = the ioprio value).
+pub const FS_OP_IOPRIO: u8 = 28;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
@@ -1772,7 +1789,7 @@ mod tests {
         }
         // Lot 273: the new bits mark, they never require (no operation is
         // refused for carrying one).
-        for op in 1..=FS_OP_OOM_ADJ {
+        for op in 1..=FS_OP_IOPRIO {
             let r = fs_protect_required(op);
             assert_eq!(
                 r & (FS_PROTECT_INIT_RMDIR
@@ -1795,7 +1812,7 @@ mod tests {
         for caller in [0, 2, 1000, u32::MAX] {
             assert!(!fs_protect_init_may(FS_OP_RMDIR, dir, caller), "{caller}");
         }
-        for op in 1..=FS_OP_OOM_ADJ {
+        for op in 1..=FS_OP_IOPRIO {
             if op != FS_OP_RMDIR && op != FS_OP_XATTR {
                 assert!(!fs_protect_init_may(op, dir, 1), "op {op}");
             }
@@ -1877,6 +1894,10 @@ mod tests {
             FS_OP_CGROUP_LIMIT,
             FS_OP_CGROUP_V1,
             FS_OP_OOM_ADJ,
+            FS_OP_RLIMIT,
+            FS_OP_SCHED,
+            FS_OP_NICE,
+            FS_OP_IOPRIO,
         ];
         for (i, a) in ops.iter().enumerate() {
             assert_ne!(*a, 0);

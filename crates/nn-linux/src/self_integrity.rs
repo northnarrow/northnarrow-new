@@ -1092,6 +1092,17 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
                             "the holding watchdog tried to start the agent again",
                         ),
                         wh::REASON_HOLD_ENDED => ("watchdog_hold", "the watchdog's hold ended"),
+                        // Lot 273c: the agent's fresh cgroup, or the
+                        // watchdog's, restored to its floors by the watchdog.
+                        wh::REASON_LIMIT_FLOOR_RESTORED => (
+                            "limit_floor_restored",
+                            "the watchdog restored a resource value below its floor",
+                        ),
+                        wh::REASON_LIMIT_FLOOR_NOT_RESTORED => (
+                            "limit_floor_not_restored",
+                            "the watchdog found a resource value below its floor and could not \
+                             restore it",
+                        ),
                         _ => ("watchdog_hold", "the watchdog stopped respawning the agent"),
                     };
                     let mut d = format!(
@@ -1623,6 +1634,8 @@ struct Checker {
     watchdog_pidfile: PathBuf,
     own_files: Vec<String>,
     audit_log: Option<Arc<Mutex<AuditLog>>>,
+    /// Lot 273c: the reload a quarantined drop-in asks for.
+    reloader: crate::systemd_reload::Reloader,
 }
 
 impl Checker {
@@ -1789,6 +1802,51 @@ impl Checker {
     fn round(&mut self, at_boot: bool) {
         let findings = self.collect_round();
         self.apply(findings, unix_now(), at_boot);
+        // Lot 273c (the review of #490): a host drop-in that reaches our
+        // units (service.d, slice.d, system.slice.d) with a dangerous
+        // directive, quarantined; systemd reloaded so its copy loses it.
+        let dirs: Vec<&Path> = crate::dropin_quarantine::HOST_DIRS
+            .iter()
+            .map(Path::new)
+            .collect();
+        let moved = crate::dropin_quarantine::quarantine(
+            &dirs,
+            Path::new(crate::dropin_quarantine::QUARANTINE_DIR),
+            unix_now(),
+        );
+        if moved.iter().any(|q| q.to.is_some()) {
+            self.reloader
+                .request(crate::systemd_reload::Reason::Quarantined);
+        }
+        for q in moved {
+            self.report_once(
+                Finding {
+                    kind: if q.to.is_some() {
+                        "unit_dropin_quarantined"
+                    } else {
+                        "unit_dropin_not_quarantined"
+                    },
+                    detail: q.detail(),
+                },
+                at_boot,
+            );
+        }
+        // Lot 273c (the review of #490): resource values the registration
+        // found below their floors and restored (at the attach, at a
+        // window's close): each a signed drift.
+        for r in antitamper_bpf::cgroup_floors::take_restores() {
+            self.report_once(
+                Finding {
+                    kind: if r.ok {
+                        "limit_floor_restored"
+                    } else {
+                        "limit_floor_not_restored"
+                    },
+                    detail: r.detail(),
+                },
+                at_boot,
+            );
+        }
         // External audit WDG-001: shutdown markers the watchdog refused
         // (forged, replayed or stale) while the agent was down.
         let rejected = Path::new(nn_proto::shutdown_marker::REJECTED_PATH);
@@ -1862,6 +1920,7 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
     audit_log: Option<Arc<Mutex<AuditLog>>>,
     watchdog_pidfile: PathBuf,
     overlay_gate: Option<Arc<G>>,
+    reloader: crate::systemd_reload::Reloader,
 ) {
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let mut own_files = Vec::new();
@@ -1881,6 +1940,7 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
         watchdog_pidfile,
         own_files,
         audit_log,
+        reloader,
     };
     for f in weakening_env(&vars) {
         checker.report_once(f, true);
@@ -2101,6 +2161,13 @@ mod tests {
             (wh::REASON_EVENT_LOOP_STALLED, "event_loop_stalled"),
             (wh::REASON_HOLD_RETRY, "watchdog_hold"),
             (wh::REASON_HOLD_ENDED, "watchdog_hold"),
+            // Lot 273c: the watchdog's floor restorations, signed as the
+            // agent's own
+            (wh::REASON_LIMIT_FLOOR_RESTORED, "limit_floor_restored"),
+            (
+                wh::REASON_LIMIT_FLOOR_NOT_RESTORED,
+                "limit_floor_not_restored",
+            ),
         ];
         let body = reasons
             .iter()
@@ -2907,6 +2974,7 @@ mod tests {
             watchdog_pidfile: dir.join("watchdog.pid"),
             own_files: Vec::new(),
             audit_log: Some(Arc::new(Mutex::new(log))),
+            reloader: crate::systemd_reload::Reloader::inert(),
         };
         (checker, path)
     }

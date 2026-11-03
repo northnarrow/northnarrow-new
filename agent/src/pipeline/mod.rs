@@ -103,6 +103,9 @@ struct SnapshotInner {
     /// Their identities (record's time and target): judged on the snapshot
     /// as it is when they come back, never handed over again.
     handed: parking_lot::Mutex<std::collections::HashSet<(u64, u64, u64)>>,
+    /// Lot 273c (the review of #490): the reload a refused PID 1 write of
+    /// our units asks for.
+    reloader: parking_lot::Mutex<Option<northnarrow_agent::systemd_reload::Reloader>>,
 }
 
 /// What the decision judges a relayed signal on ([`SystemdSnapshot::judge`]).
@@ -115,6 +118,18 @@ pub(crate) enum SystemdAnswer {
 }
 
 impl SystemdSnapshot {
+    /// Lot 273c: the reloader the denial arm asks (the start's).
+    pub(crate) fn set_reloader(&self, reloader: northnarrow_agent::systemd_reload::Reloader) {
+        *self.0.reloader.lock() = Some(reloader);
+    }
+
+    /// Lot 273c: ask systemd for a reload (rate-limited by the reloader).
+    pub(crate) fn reload(&self, reason: northnarrow_agent::systemd_reload::Reason) {
+        if let Some(r) = self.0.reloader.lock().as_ref() {
+            r.request(reason);
+        }
+    }
+
     /// The answer for the relayed signal `event` at `now`: a fresh one,
     /// else — the watch running, the event not handed over before, room
     /// for it — [`SystemdAnswer::Deferred`], else the latest answer.

@@ -52,7 +52,7 @@ MODE=run
 # ran every case, the destructive ones too, and an id that names no case ran
 # nothing and printed OK. It takes a list of case ids now, and each one must
 # end up as a row of the table (only_unreported, at the end).
-only_list_ok() { [[ ${1:-} =~ ^C[0-9]{2}[a-z]?(,C[0-9]{2}[a-z]?)*$ ]]; }
+only_list_ok() { [[ ${1:-} =~ ^C([0-9]{2}|[1-9][0-9]{2})[a-z]?(,C([0-9]{2}|[1-9][0-9]{2})[a-z]?)*$ ]]; }  # lot 273c: C100 and later
 while (( $# )); do
     case "$1" in
         --only)
@@ -1205,7 +1205,7 @@ selftest() {
     dup=$(sort <<<"$ids" | uniq -d | tr '\n' ' ')
     t eq "$dup" ""
     # lab PR 206: --only takes case ids only (without a value it ran them all)
-    for p in C01 C01,C55a C59a,C59b,C59c; do t only_list_ok "$p"; done
+    for p in C01 C01,C55a C59a,C59b,C59c C100 C89,C101; do t only_list_ok "$p"; done
     for p in "" C1 c01 C01, ,C01 "C01 C02" "C01;id" C001 --persistence; do t eval "! only_list_ok '$p'"; done
     # a skipped case is a row only for a run that selected it; an --only id
     # no row names is reported; a restore that did not hold is a deviation
@@ -1880,7 +1880,7 @@ fi
 # files are written "0" (a no-op if the open went through: ERANGE for
 # cgroup.kill). Inside a window it is all allowed (C76, at the end).
 if [[ ! -e $CGROOT/cgroup.controllers || -z "$AG_CG" || -z "$WD_CG" ]]; then
-    skipped_case C65,C66,C67,C68,C69,C70,C71,C72,C73,C74,C75,C77a,C77b,C78a,C78b,C78c,C79,C80,C81,C81b,C82,C83,C83b,C84,C85,C86,C87,C88 "no cgroup v2 hierarchy, or a unit without a ControlGroup" 0
+    skipped_case C65,C66,C67,C68,C69,C70,C71,C72,C73,C74,C75,C77a,C77b,C78a,C78b,C78c,C79,C80,C81,C81b,C82,C83,C83b,C84,C85,C86,C87,C88,C89,C90,C91,C92,C93,C94,C95,C95b,C96,C97,C98,C99,C100,C101 "no cgroup v2 hierarchy, or a unit without a ControlGroup" 0
 else
     PID=$(agent_pid); START=$(proc_start "$PID")
     WDPID=$(wd_pid); WDSTART=$(proc_start "$WDPID")
@@ -2232,6 +2232,177 @@ else
             skipped_case C88 "no memory.max in the agent's cgroup" 1
         fi
     fi
+    # ── lot 273c (the review of #490) ──────────────────────────────────
+    # C89-C94: another process's change of the agent's limits, scheduling,
+    # nice value, I/O priority (task_setrlimit, task_setscheduler,
+    # task_setnice, task_setioprio). `prlimit --cpu=1:1` is a SIGKILL from
+    # the kernel (no signal hook sees it); each case puts back what got
+    # through.
+    PID=$(agent_pid); START=$(proc_start "$PID")
+    if selected C89; then
+        POST=$(post post_proc "$PID" "$START" northnarrow-age) \
+        run_case C89 "prlimit --cpu=1:1 of the agent (an RLIMIT_CPU SIGKILL, no window)" denied "deny=rlimit" 0 -- prlimit --pid "$PID" --cpu=1:1
+        PID=$(agent_pid 30); START=$(proc_start "$PID")
+    fi
+    # a case the agent did not survive (its code before the lot: C89's and
+    # C90's limits end it) leaves the next one a new agent to aim at
+    live_agent() { kill -0 "$PID" 2>/dev/null || { PID=$(agent_pid 30); START=$(proc_start "$PID"); }; }
+    if selected C90; then
+        live_agent
+        NOF0=$(prlimit --pid "$PID" --nofile --raw --noheadings 2>/dev/null | awk '{print $2":"$3}')
+        POST=$(post post_proc "$PID" "$START" northnarrow-age) \
+        run_case C90 "prlimit --nofile=0:0 of the agent (no window)" denied "deny=rlimit" 0 -- prlimit --pid "$PID" --nofile=0:0
+        now=$(prlimit --pid "$PID" --nofile --raw --noheadings 2>/dev/null | awk '{print $2":"$3}')
+        [[ -n $NOF0 && "$now" != "$NOF0" ]] && { grant_window 20; prlimit --pid "$PID" --nofile="$NOF0" 2>/dev/null; for i in $(seq 1 30); do window_open || break; sleep 1; done; }
+        # an agent the limit ended took it with it (its successor starts afresh)
+        kill -0 "$PID" 2>/dev/null && restored C90 "the agent's RLIMIT_NOFILE" "$NOF0" "$(prlimit --pid "$PID" --nofile --raw --noheadings 2>/dev/null | awk '{print $2":"$3}')"
+    fi
+    if selected C91; then
+        live_agent
+        NI0=$(ps -o ni= -p "$PID" | tr -d ' ')
+        POST=$(post post_proc "$PID" "$START" northnarrow-age) \
+        run_case C91 "renice +19 of the agent (no window)" denied "deny=nice" 0 -- renice -n 19 -p "$PID"
+        [[ "$(ps -o ni= -p "$PID" | tr -d ' ')" != "$NI0" ]] && { grant_window 20; renice -n "$NI0" -p "$PID" >/dev/null 2>&1; for i in $(seq 1 30); do window_open || break; sleep 1; done; }
+        restored C91 "the agent's nice value" "$NI0" "$(ps -o ni= -p "$PID" | tr -d ' ')"
+    fi
+    if selected C92; then
+        live_agent
+        POL0=$(chrt -p "$PID" 2>/dev/null | head -1 | awk -F': ' '{print $2}')
+        POST=$(post post_proc "$PID" "$START" northnarrow-age) \
+        run_case C92 "chrt --idle (SCHED_IDLE) of the agent (no window)" denied "deny=sched" 0 -- chrt -i -p 0 "$PID"
+        [[ "$(chrt -p "$PID" 2>/dev/null | head -1 | awk -F': ' '{print $2}')" != "$POL0" ]] && { grant_window 20; chrt -o -p 0 "$PID" 2>/dev/null; for i in $(seq 1 30); do window_open || break; sleep 1; done; }
+        restored C92 "the agent's scheduling policy" "$POL0" "$(chrt -p "$PID" 2>/dev/null | head -1 | awk -F': ' '{print $2}')"
+    fi
+    if selected C93; then
+        live_agent
+        AFF0=$(taskset -p "$PID" 2>/dev/null | awk -F': ' '{print $2}')
+        POST=$(post post_proc "$PID" "$START" northnarrow-age) \
+        run_case C93 "taskset (one CPU) of the agent (no window)" denied "deny=sched" 0 -- taskset -p 1 "$PID"
+        [[ "$(taskset -p "$PID" 2>/dev/null | awk -F': ' '{print $2}')" != "$AFF0" ]] && { grant_window 20; taskset -p "$AFF0" "$PID" >/dev/null 2>&1; for i in $(seq 1 30); do window_open || break; sleep 1; done; }
+        restored C93 "the agent's CPU affinity" "$AFF0" "$(taskset -p "$PID" 2>/dev/null | awk -F': ' '{print $2}')"
+    fi
+    if selected C94; then
+        live_agent
+        IO0=$(ionice -p "$PID" 2>/dev/null)
+        POST=$(post post_proc "$PID" "$START" northnarrow-age) \
+        run_case C94 "ionice --class idle of the agent (no window)" denied "deny=ioprio" 0 -- ionice -c 3 -p "$PID"
+        if [[ "$(ionice -p "$PID" 2>/dev/null)" != "$IO0" ]]; then
+            grant_window 20
+            case "$IO0" in none*) ionice -c 0 -p "$PID" ;; best-effort*) ionice -c 2 -n "${IO0##*prio }" -p "$PID" ;; esac 2>/dev/null
+            for i in $(seq 1 30); do window_open || break; sleep 1; done
+        fi
+        restored C94 "the agent's I/O priority" "$IO0" "$(ionice -p "$PID" 2>/dev/null)"
+    fi
+    # C95, C96: PID 1 in attach mode — a tracer (PTRACE_SEIZE: PID 1 is not
+    # stopped; the tracer's exit detaches it) and /proc/1/mem for writing
+    # (opened, nothing written). The deny hooks trust PID 1's write-backs
+    # on the bytes its write(2) carries: its memory must not be root's.
+    if selected C95; then
+        run_case C95 "PTRACE_SEIZE of PID 1 (no window)" denied "deny=ptrace" 0 -- python3 -I -c 'import ctypes,errno,sys
+libc=ctypes.CDLL(None,use_errno=True)
+r=libc.ptrace(0x4206,1,None,None)
+print("seized pid 1" if r==0 else "errno=%s" % errno.errorcode.get(ctypes.get_errno(),"?"))'
+    fi
+    if selected C96; then
+        run_case C96 "/proc/1/mem opened for writing (nothing written, no window)" denied "deny=ptrace" 0 -- nnpy file open-append /proc/1/mem
+    fi
+    # C95b: inside a window a debugger attaches to PID 1 (the same seize,
+    # detached by the tracer's exit), and nothing is refused.
+    if selected C95b; then
+        grant_window 30; sleep 2
+        EV_FORBID="deny=ptrace" run_case C95b "PTRACE_SEIZE of PID 1 inside a trusted-installer window" allowed "" 0 -- python3 -I -c 'import ctypes,errno,sys
+libc=ctypes.CDLL(None,use_errno=True)
+r=libc.ptrace(0x4206,1,None,None)
+print("seized pid 1" if r==0 else "errno=%s" % errno.errorcode.get(ctypes.get_errno(),"?"))'
+        for i in $(seq 1 40); do window_open || break; sleep 1; done
+    fi
+    # C97: a host-wide drop-in that reaches the units (service.d) with a
+    # directive of the dangerous set (here an NN_ variable, harmless to
+    # every other service): quarantined by the agent's integrity round and
+    # systemd reloaded.
+    if selected C97; then
+        D97=/etc/systemd/system/service.d
+        mkdir -p "$D97"
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        printf '[Service]\nEnvironment=NN_LAB_C97=1\n' > "$D97/99-nn-lab-c97.conf" 2>/dev/null
+        for i in $(seq 1 90); do [[ -e $D97/99-nn-lab-c97.conf ]] || break; sleep 1; done
+        sleep 3; ev=$(evidence "$t0" "$a0" "$d0")
+        q=$(ls /var/lib/northnarrow/quarantine/dropins/ 2>/dev/null | grep -c 'nn-lab-c97')
+        if [[ ! -e $D97/99-nn-lab-c97.conf ]] && (( q > 0 )) && echo "$ev" | grep -q "integrity_drift"; then
+            v=OK; st="quarantined"
+        else
+            v="DEVIATION (expected quarantined: file $([[ -e $D97/99-nn-lab-c97.conf ]] && echo present || echo gone), quarantine $q)"; fail=1; st="left"
+        fi
+        rows+=("| C97 | a dangerous drop-in in the host's service.d | $st | $ev | $v |")
+        echo "C97 host service.d drop-in → $st; $ev; $v" >&2
+        rm -f "$D97/99-nn-lab-c97.conf"
+        if (( q > 0 )); then grant_window 20; rm -f /var/lib/northnarrow/quarantine/dropins/*nn-lab-c97*; for i in $(seq 1 30); do window_open || break; sleep 1; done; fi
+        systemctl daemon-reload
+        restored C97 "the lab's drop-in" absent "$([[ -e $D97/99-nn-lab-c97.conf ]] && echo present || echo absent)"
+    fi
+    # C98: a floor — the agent's memory.high set below 512 MiB inside a
+    # window, the window closed: registered again at the floor, written
+    # back, signed.
+    if selected C98 && [[ -e $CGROOT$AG_CG/memory.high ]]; then
+        MH=$CGROOT$AG_CG/memory.high; MH0=$(cat "$MH")
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        grant_window 10; sleep 1; echo 104857600 > "$MH"
+        for i in $(seq 1 40); do window_open || break; sleep 1; done
+        sleep 40; ev=$(evidence "$t0" "$a0" "$d0"); now=$(cat "$MH")
+        if [[ "$now" == 536870912 ]] && echo "$ev" | grep -q "integrity_drift"; then
+            v=OK; st="restored to the floor"
+        else
+            v="DEVIATION (memory.high $now after the window, expected the floor 536870912)"; fail=1; st="left"
+        fi
+        rows+=("| C98 | the agent's memory.high below its floor at a window's close | $st | $ev | $v |")
+        echo "C98 floor at a window's close → $st; $ev; $v" >&2
+        grant_window 15; sleep 1; echo "$MH0" > "$MH"; for i in $(seq 1 40); do window_open || break; sleep 1; done
+        restored C98 "the agent's memory.high" "$MH0" "$(cat "$MH")"
+    fi
+    # C99: a named cgroup v1 hierarchy (no controller: an old container's
+    # name=systemd) — a write to its cgroup.procs is let through (lot 273b
+    # refused every v1 write); a freezer hierarchy stays refused (C83).
+    if selected C99; then
+        V1N=/run/nn-lab-v1n
+        mkdir -p "$V1N"
+        if mount -t cgroup -o none,name=nnlabc99 nnlabc99 "$V1N" 2>/dev/null; then
+            mkdir -p "$V1N/c99"
+            sleep 300 & SL=$!
+            EV_FORBID="deny=cgroup_v1" run_case C99 "a process moved in a named v1 hierarchy (no controller)" allowed "" 0 -- nnpy file write "$V1N/c99/cgroup.procs" "$SL"
+            kill "$SL" 2>/dev/null; wait "$SL" 2>/dev/null
+            rmdir "$V1N/c99" 2>/dev/null; umount "$V1N" 2>/dev/null; rmdir "$V1N" 2>/dev/null
+        else
+            skipped_case C99 "a named v1 hierarchy cannot be mounted here" 1
+        fi
+    fi
+    # C100: a refused set-property: systemd's own copy taken back by the
+    # agent's reload (the copy the unit's next start would apply).
+    if selected C100; then
+        MHP0=$(systemctl show -p MemoryHigh --value northnarrow-agent.service)
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        systemctl set-property --runtime northnarrow-agent.service MemoryHigh=2G >/dev/null 2>&1
+        # the reload waits out the agent's 30 s between two (a refusal is kept, not dropped)
+        for i in $(seq 1 75); do [[ "$(systemctl show -p MemoryHigh --value northnarrow-agent.service)" == "$MHP0" ]] && break; sleep 1; done
+        ev=$(evidence "$t0" "$a0" "$d0"); now=$(systemctl show -p MemoryHigh --value northnarrow-agent.service)
+        if [[ "$now" == "$MHP0" ]] && echo "$ev" | grep -q "systemd_reload"; then
+            v=OK; st="systemd's copy back ($now)"
+        else
+            v="DEVIATION (systemd's MemoryHigh $now, expected $MHP0)"; fail=1; st="left"
+        fi
+        rows+=("| C100 | a refused set-property, systemd's copy taken back by a reload | $st | $ev | $v |")
+        echo "C100 refused set-property's copy → $st; $ev; $v" >&2
+        systemctl daemon-reload
+        restored C100 "systemd's MemoryHigh of the agent" "$MHP0" "$(systemctl show -p MemoryHigh --value northnarrow-agent.service)"
+    fi
+    # C101: memory.reclaim of the agent's unit (a forced reclaim, repeated:
+    # a thrash): refused to everyone.
+    if selected C101; then
+        if [[ -e $CGROOT$AG_CG/memory.reclaim ]]; then
+            run_case C101 "memory.reclaim of the agent's unit (no window)" denied "deny=cgroup_limit" 0 -- nnpy file write "$CGROOT$AG_CG/memory.reclaim" 1M
+        else
+            skipped_case C101 "no memory.reclaim (a kernel before 5.19)" 1
+        fi
+    fi
 fi
 
 # ── vectors the matrix lacked (external audit LAB-004, lab PR 154) ───────
@@ -2579,6 +2750,57 @@ if [[ -z "$ONLY" || ",$ONLY," == *",C76,"* ]]; then
         echo "C76 freeze, move, systemctl kill inside a window → $st; $ev; $v" >&2
         PID=$(agent_pid)
         for i in $(seq 1 40); do window_open || break; sleep 1; done
+    fi
+fi
+
+# Lot 273c (the review of #490): the agent killed (and restarted) inside a
+# window with systemd's copy of its memory.high below the floor (a set-property inside
+# the window): the fresh cgroup takes the copy, and is restored to the
+# floor — by the watchdog's check of the respawned agent or by the agent's
+# own registration at its start — and signed (`limit_floor_restored`; the
+# watchdog's record says "the watchdog restored"). systemd's copy is put
+# back inside the same window.
+if [[ -z "$ONLY" || ",$ONLY," == *",C102,"* ]]; then
+    if [[ ! -e $CGROOT/cgroup.controllers || -z "$AG_CG" || ! -e $CGROOT$AG_CG/memory.high ]]; then
+        skipped_case C102 "no cgroup v2 hierarchy, no ControlGroup or no memory.high for the agent" 0
+    else
+        PID=$(agent_pid)
+        MHP0=$(systemctl show -p MemoryHigh --value northnarrow-agent.service)
+        CTL=/run/systemd/system.control/northnarrow-agent.service.d/50-MemoryHigh.conf
+        CTL_WAS=$([[ -e $CTL ]] && echo present || echo absent)
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        grant_window 240; sleep 2
+        out=$(timeout 60 systemctl set-property --runtime northnarrow-agent.service MemoryHigh=100M 2>&1); rc1=$?
+        # RefuseManualStop=yes: no `systemctl restart`; a kill inside the
+        # window, as C76 (the unit's Restart= and the watchdog bring it back)
+        out2=$(systemctl kill -s SIGKILL northnarrow-agent 2>&1); rc2=$?
+        NEW=""
+        for i in $(seq 1 60); do
+            NEW=$(agent_pid 0) && [[ "$NEW" != "$PID" ]] && break
+            NEW=""; sleep 1
+        done
+        sleep 20; now=$(cat "$CGROOT$AG_CG/memory.high" 2>/dev/null)
+        wd=$(journalctl -q --no-pager -u northnarrow-watchdog --since "$t0" 2>/dev/null | grep -c "a resource value below its floor")
+        # systemd's copy back inside a window (the new agent starts with
+        # none open: the grant above ended with its predecessor)
+        grant_window 60; sleep 2
+        timeout 60 systemctl set-property --runtime northnarrow-agent.service MemoryHigh="$MHP0" >/dev/null 2>&1
+        [[ $CTL_WAS == absent ]] && rm -f "$CTL"
+        systemctl daemon-reload
+        for i in $(seq 1 260); do window_open || break; sleep 1; done
+        sleep 35; ev=$(evidence "$t0" "$a0" "$d0")
+        # systemd up to 256 reports the first process its kill missed (C76)
+        if (( rc2 != 0 )) && [[ -n "$NEW" ]] && ! grep -qE 'Access denied|Operation not permitted|Permission denied' <<<"$out2"; then rc2=0; fi
+        if (( rc1 == 0 && rc2 == 0 )) && [[ -n "$NEW" && "$now" == 536870912 ]] && echo "$ev" | grep -q "integrity_drift"; then
+            v=OK; st="restored to the floor in the fresh cgroup (agent $PID → $NEW; the watchdog's restorations: $wd)"
+        else
+            v="DEVIATION (set-property rc=$rc1, kill rc=$rc2 $(echo "$out2" | head -1 | cut -c1-50 | tr '|' '/'), new agent ${NEW:-none}, memory.high ${now:-?}, expected the floor 536870912)"; fail=1; st="left"
+        fi
+        rows+=("| C102 | the agent restarted inside a window, systemd's memory.high below the floor | $st | $ev | $v |")
+        echo "C102 a restart with a copy below the floor → $st; $ev; $v" >&2
+        PID=$(agent_pid)
+        restored C102 "systemd's MemoryHigh of the agent" "$MHP0" "$(systemctl show -p MemoryHigh --value northnarrow-agent.service)"
+        restored C102 "the runtime drop-in" "$CTL_WAS" "$([[ -e $CTL ]] && echo present || echo absent)"
     fi
 fi
 

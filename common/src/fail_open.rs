@@ -21,7 +21,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted hooks (map size).
-pub const FAIL_OPEN_SLOTS: u32 = 24;
+pub const FAIL_OPEN_SLOTS: u32 = 28;
 
 /// Slot of each deny hook in `DENY_FAIL_OPEN`: the agent's `DENY_HOOKS`,
 /// then its optional deny hooks, then the `bpf` hook (an observer that
@@ -59,6 +59,13 @@ pub mod hook {
     /// Lot 273b: the move guard's third program, which clears a thread's
     /// stashed move when the write ends.
     pub const CGROUP_PROCS_WRITE_FINISH: u32 = 23;
+    /// Lot 273c (the review of #490): another process's change of a
+    /// protected process's limits, scheduling, nice value or I/O priority;
+    /// each counts a target it cannot tell.
+    pub const TASK_SETRLIMIT: u32 = 24;
+    pub const TASK_SETSCHEDULER: u32 = 25;
+    pub const TASK_SETNICE: u32 = 26;
+    pub const TASK_SETIOPRIO: u32 = 27;
 }
 
 /// LSM hook names, indexed by slot (the names `DENY_HOOKS` uses).
@@ -87,6 +94,10 @@ pub const FAIL_OPEN_HOOKS: [&str; FAIL_OPEN_SLOTS as usize] = [
     "cgroup_procs_write_start",
     "file_permission",
     "cgroup_procs_write_finish",
+    "task_setrlimit",
+    "task_setscheduler",
+    "task_setnice",
+    "task_setioprio",
 ];
 
 #[cfg(test)]
@@ -122,11 +133,15 @@ mod tests {
             (hook::CGROUP_PROCS_WRITE_START, "cgroup_procs_write_start"),
             (hook::FILE_PERMISSION, "file_permission"),
             (hook::CGROUP_PROCS_WRITE_FINISH, "cgroup_procs_write_finish"),
+            (hook::TASK_SETRLIMIT, "task_setrlimit"),
+            (hook::TASK_SETSCHEDULER, "task_setscheduler"),
+            (hook::TASK_SETNICE, "task_setnice"),
+            (hook::TASK_SETIOPRIO, "task_setioprio"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");
             assert_eq!(FAIL_OPEN_HOOKS[i], *name);
         }
-        assert_eq!(hook::CGROUP_PROCS_WRITE_FINISH + 1, FAIL_OPEN_SLOTS);
+        assert_eq!(hook::TASK_SETIOPRIO + 1, FAIL_OPEN_SLOTS);
     }
 }

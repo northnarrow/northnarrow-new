@@ -70,6 +70,7 @@ pub mod sd_notify;
 
 /// Lot 273: the protected units' cgroups as `PROTECTED_INODES` entries,
 /// for the agent and the watchdog.
+pub mod cgroup_floors;
 pub mod cgroup_guard;
 
 use std::borrow::{Borrow, BorrowMut};

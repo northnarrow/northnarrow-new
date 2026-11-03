@@ -100,6 +100,12 @@ ExecStartPre=+/bin/mkdir -p /etc/systemd/system.control/northnarrow-agent.servic
 # NOCREATE like its own. A drop-in there would reach the next start's
 # fresh cgroup before the agent is there to refuse it.
 ExecStartPre=+/bin/mkdir -p /etc/systemd/system/northnarrow-watchdog.service.d /run/systemd/system/northnarrow-watchdog.service.d /etc/systemd/system/northnarrow-.service.d /run/systemd/system/northnarrow-.service.d
+# Lot 273c (the review of #490): the host's type- and slice-wide drop-in
+# directories, which reach both units (`service.d`, `slice.d`,
+# `system.slice.d`): made (empty) so that the agent may move a dangerous
+# drop-in found there to its quarantine (ReadWritePaths below) and have
+# systemd reload.
+ExecStartPre=+/bin/mkdir -p /etc/systemd/system/service.d /etc/systemd/system/slice.d /etc/systemd/system/system.slice.d /run/systemd/system/service.d /run/systemd/system/slice.d /run/systemd/system/system.slice.d
 # External audit ATP-014 (NN-AUD-262): an explicit search path, without
 # /usr/local. systemd's default for a service starts with
 # /usr/local/sbin:/usr/local/bin, which the FIM list does not watch, and
@@ -262,7 +268,9 @@ ProtectHome=read-only
 # THIS process: the inode_protect write-deny hooks refuse every other
 # pid (at-authz-1/2), so widening the mount does not widen the attack
 # surface.
-ReadWritePaths=/run/northnarrow /var/lib/northnarrow /etc/northnarrow
+# Lot 273c: and the host drop-in directories the agent quarantines from
+# (`service.d`, `slice.d`, `system.slice.d`; made by ExecStartPre above).
+ReadWritePaths=/run/northnarrow /var/lib/northnarrow /etc/northnarrow -/etc/systemd/system/service.d -/etc/systemd/system/slice.d -/etc/systemd/system/system.slice.d -/run/systemd/system/service.d -/run/systemd/system/slice.d -/run/systemd/system/system.slice.d
 # CapabilityBoundingSet — the agent runs as root (no User=), so this set is
 # the HARD CEILING on its effective caps: a cap not listed is dropped even
 # from root. It is the blast radius if the agent is ever compromised, so it

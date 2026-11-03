@@ -196,6 +196,27 @@ pub(crate) fn register_unit_cgroups(ebpf: &mut Ebpf, pids: &[u32]) -> Result<Cgr
                 for f in &values {
                     register_value(ebpf, &f.key, &f.value)?;
                 }
+                // Lot 273c (the review of #490): a value below its floor —
+                // the fresh cgroup's, systemd's copy of a refused
+                // `set-property` — replaced by the floor: registered, written,
+                // read back; reported at the integrity check.
+                let unit = UnitCgroup::Service {
+                    cgroup: cgroup.clone(),
+                    entries: entries.clone(),
+                    values: Vec::new(),
+                };
+                let due = antitamper_bpf::cgroup_floors::floors_due(
+                    &antitamper_bpf::cgroup_guard::limit_dirs(&unit),
+                );
+                if !due.is_empty() {
+                    let restores = antitamper_bpf::cgroup_floors::restore_floors(due, |k, v| {
+                        register_value(ebpf, k, v)
+                    });
+                    for r in &restores {
+                        warn!(detail = %r.detail(), "anti-tamper cgroup: a resource value below its floor");
+                    }
+                    antitamper_bpf::cgroup_floors::note_restores(&restores);
+                }
                 info!(
                     pid,
                     cgroup = %nn_model::log_escape::Escaped(&cgroup),

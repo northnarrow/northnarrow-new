@@ -128,7 +128,17 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // watchdog's binary is protected before it registers (its first moments
     // are when it may still take the agent's maps).
     // R14a: a worker is a protected target too (and runs the agent's binary).
-    if !crate::task_kill::is_protected_pid(target_tgid)
+    // Lot 273c (the review of #490): and PID 1, in attach mode only — a
+    // debugger, `/proc/1/mem`, `process_vm_writev`. The deny hooks let PID 1
+    // write back a unit's resource values and thaw a slice on the bytes
+    // its `write(2)` carries; a PID 1 whose memory root could write would
+    // swap them between the hook's read and the kernel's. Read-mode
+    // access (`ps`, `/proc/1/environ`) is untouched, and a window lets a
+    // debugger attach.
+    let mode: u32 = ctx.arg(1);
+    let init_attach = target_tgid == 1 && mode & PTRACE_MODE_ATTACH != 0;
+    if !init_attach
+        && !crate::task_kill::is_protected_pid(target_tgid)
         && !crate::bpf_defense::task_runs_own_binary(target as *const u8)
     {
         return 0;
@@ -152,6 +162,9 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // watchdog or another worker.
     let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     if crate::task_kill::is_exempt_pid(caller_tgid) {
+        return 0;
+    }
+    if init_attach && crate::inode_protect::override_active() {
         return 0;
     }
 
@@ -194,7 +207,6 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // /proc/<pid>/mem, process_vm_readv/writev). READ-mode checks are what
     // `ps`, `lsof` and journald (/proc/<pid>/exe) trigger all day, and
     // NOAUDIT asks LSMs explicitly not to report: those stay silent denials.
-    let mode: u32 = ctx.arg(1);
     if mode & PTRACE_MODE_ATTACH != 0 && mode & PTRACE_MODE_NOAUDIT == 0 {
         crate::inode_protect::emit_task_denial(FS_OP_PTRACE, mode as u64, target_tgid);
     }

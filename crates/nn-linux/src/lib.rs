@@ -391,6 +391,8 @@ pub mod shutdown_marker;
 // What systemd reports the host as (`SystemState`), asked over its private
 // socket, whose server must be PID 1 (external audit EBPF-001; R09c, lab PR
 // 257; was the agent's `systemd_state`).
+pub mod dropin_quarantine;
+pub mod systemd_reload;
 pub mod systemd_state;
 
 // The continuous telemetry probe: one known exec, file open and DNS
