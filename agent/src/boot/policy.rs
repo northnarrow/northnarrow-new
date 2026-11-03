@@ -292,6 +292,10 @@ pub(crate) fn load(
                 ..Default::default()
             },
         ),
+        // Lot 275: NN-L-NET-028's signed allowlist, read through the gate
+        // (absent, unsigned or refused: empty — nothing exempt beyond LAN
+        // and the configured resolvers).
+        nodns_allow: Arc::new(nodns_allowlist(overlay_gate, &cli.nodns_allow_local)),
     };
     info!(
         resolvers = ?net_rule_config.resolvers.snapshot(),
@@ -423,6 +427,39 @@ pub(crate) fn load(
         rule_policy,
         ja3_entries,
         engine,
+    }
+}
+
+/// Lot 275: NN-L-NET-028's signed allowlist, as the overlay gate decided
+/// on it: a signed file that parses, else empty (absent, unsigned, refused,
+/// or a file that does not parse: a signed degradation).
+fn nodns_allowlist(
+    gate: &northnarrow_agent::config::overlay_auth::OverlayGate,
+    path: &std::path::Path,
+) -> northnarrow_agent::decision::rules::net_nodns::NoDnsAllowlist {
+    use northnarrow_agent::config::overlay_auth::Verified;
+    use northnarrow_agent::decision::rules::net_nodns::NoDnsAllowlist;
+    match gate.verified(OverlayKind::NoDnsAllow, path) {
+        Verified::Content { path, text } => match NoDnsAllowlist::parse(&text) {
+            Ok(list) => {
+                info!(
+                    path = %path.display(),
+                    entries = list.len(),
+                    "NN-L-NET-028: signed allowlist in force"
+                );
+                list
+            }
+            Err((line, why)) => {
+                let detail = format!(
+                    "{}:{line}: {why} — NN-L-NET-028 runs with no allowlist",
+                    path.display()
+                );
+                error!(detail = %detail, "nodns allowlist refused");
+                northnarrow_agent::boot::degradation::report("nodns_allow", &detail);
+                NoDnsAllowlist::empty()
+            }
+        },
+        _ => NoDnsAllowlist::empty(),
     }
 }
 

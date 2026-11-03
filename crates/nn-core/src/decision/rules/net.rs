@@ -720,28 +720,28 @@ impl Rule for NnLNet003BadJa3 {
         ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::NetFlow(nf) = event else {
+        // Lot 275: judged on the ClientHello the TLS sensor fingerprinted,
+        // once per flow, as soon as it is sent (the flow's closed row
+        // carries the same fingerprint for the netflow log, not judged
+        // again). Its kill is held behind the per-rule policy: no
+        // fingerprint was produced before, so every match is new.
+        let Event::TlsClientHello(h) = event else {
             return None;
         };
-        // Lab PR 224: judged on the closed flow only (byte counts, or a
-        // record the netflow pacing applies to), once.
-        if nf.phase != FlowPhase::Closed {
-            return None;
-        }
-        let fp = nf.tls_fingerprint.as_ref()?;
+        let fp = h.fingerprint.as_ref()?;
         if !self.blocklist.contains(&fp.ja3) {
             return None;
         }
-        Some(net_verdict(
+        Some(crate::decision::response_policy::NET_003_KILL.hold(net_verdict(
             self,
             ResponseAction::KillProcessTree,
             Severity::Critical,
             "TLS JA3 fingerprint matches operator threat-actor \
              blocklist — kill the process tree + posture → COMBAT",
-            nf.pid,
-            nf.comm.clone(),
-            nf.start_ns,
-        ))
+            h.pid,
+            h.comm.clone(),
+            h.timestamp_ns,
+        )))
     }
 }
 
@@ -2735,6 +2735,8 @@ pub fn may_meet_a_kill_rule(
 pub struct NetRuleConfig {
     pub resolvers: Arc<crate::net::resolvers::HostResolvers>,
     pub fanout: Arc<super::net_fanout::FanoutConfig>,
+    /// Lot 275: NN-L-NET-028's signed allowlist (`nodns-allow.local`).
+    pub nodns_allow: Arc<super::net_nodns::NoDnsAllowlist>,
 }
 
 impl Default for NetRuleConfig {
@@ -2744,6 +2746,7 @@ impl Default for NetRuleConfig {
         Self {
             resolvers: crate::net::resolvers::HostResolvers::none(),
             fanout: Arc::new(super::net_fanout::FanoutConfig::default()),
+            nodns_allow: Arc::new(super::net_nodns::NoDnsAllowlist::empty()),
         }
     }
 }
@@ -2832,6 +2835,12 @@ pub fn net_rules<H: DecisionHost>(
     // tier, before the record-only rules; they read connect attempts and
     // UDP rows, which no rule above answers but for a kill.
     rules.extend(fanout);
+    // Lot 275: "no DNS, no connect" — its kill held behind the per-rule
+    // policy; judged on the connect-time and UDP rows the pumps annotate.
+    rules.push(Box::new(super::net_nodns::NnLNet028ConnectWithoutDns::new(
+        Arc::clone(&config.resolvers),
+        Arc::clone(&config.nodns_allow),
+    )));
     rules.extend::<Vec<Box<dyn Rule>>>(vec![
         Box::new(NnLNet011PlaintextCredService::new(Arc::clone(
             &comm_allowlist,

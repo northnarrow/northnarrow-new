@@ -142,6 +142,11 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
         OverlayKind::RulePolicy => {
             crate::decision::rule_policy::parse(text).map_err(|e| anyhow!("{label}: {e}"))?;
         }
+        // Lot 275: every line an address or a CIDR block, none wider than /8.
+        OverlayKind::NoDnsAllow => {
+            crate::decision::rules::net_nodns::NoDnsAllowlist::parse(text)
+                .map_err(|(line, why)| anyhow!("{label}:{line}: {why}"))?;
+        }
     }
     Ok(())
 }

@@ -237,6 +237,9 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     // Lab PR 226 (EXPERIMENTAL): the exec policy and its signature.
     "exec-policy.local",
     "exec-policy.local.sig",
+    // Lot 275: NN-L-NET-028's allowlist and its signature.
+    "nodns-allow.local",
+    "nodns-allow.local.sig",
 ];
 
 /// External audit EVD-001: the subset of [`ETC_WRITE_DENY_FILES`] no

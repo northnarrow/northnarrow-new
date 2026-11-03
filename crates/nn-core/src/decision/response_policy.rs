@@ -164,6 +164,21 @@ pub const FIM_010_MOVED_IN_KILL: PolicySwitch = PolicySwitch::off(
      match added by lab PR 225)",
 );
 
+/// NN-L-NET-028 (lot 275, new rule): the kill of a process that connected
+/// to a public address its lineage did not resolve.
+pub const NODNS_KILL: PolicySwitch = PolicySwitch::off(
+    "the kill of a process that connected to a public address its lineage did not resolve \
+     (NN-L-NET-028, lot 275)",
+);
+
+/// NN-L-NET-003: its kill existed, but no sensor produced a fingerprint
+/// before lot 275, so the rule never matched. A match the TLS ClientHello
+/// sensor makes possible is a wider match: held like the others.
+pub const NET_003_KILL: PolicySwitch = PolicySwitch::off(
+    "the kill of the process tree for a TLS fingerprint in the JA3 blocklist (NN-L-NET-003: its \
+     fingerprints are produced from lot 275)",
+);
+
 /// Every switch, for the tests and the documents.
 pub const ALL: &[PolicySwitch] = &[
     R020_KILL,
@@ -174,6 +189,8 @@ pub const ALL: &[PolicySwitch] = &[
     IMP_001_KILL,
     EVA_KILL,
     FIM_010_MOVED_IN_KILL,
+    NODNS_KILL,
+    NET_003_KILL,
 ];
 
 #[cfg(test)]
