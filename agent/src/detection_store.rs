@@ -352,10 +352,10 @@ fn errno_text(errno: i32) -> String {
 struct Queued {
     at: std::time::Instant,
     record: DetectionRecord,
-    /// Lot 273: the `(pid, comm)` of an anti-tamper denial's caller, whose
-    /// executable the writer reads into the record (off the decision
-    /// thread, which does no `/proc` read).
-    exe_of: Option<(u32, String)>,
+    /// Lot 273: the `(pid, comm, kernel time)` of an anti-tamper denial's
+    /// caller, whose executable the writer reads into the record (off the
+    /// decision thread, which does no `/proc` read).
+    exe_of: Option<(u32, String, u64)>,
 }
 
 /// R12c (lab PR 270): stage 7, the evidence writer's queue — its counts
@@ -404,7 +404,17 @@ struct SinkInner {
     /// security-tool finding's record names (R11c, lab PR 264: given at the
     /// open; it was the process-wide detector `impair::publish` set).
     defense: Option<Arc<crate::impair::DefenseDetector>>,
+    /// Lot 273: how the writer names an anti-tamper denial's caller by
+    /// executable — the agent's process lineage, which holds the exec of a
+    /// process already gone (set once at the start,
+    /// [`DetectionSink::set_exe_resolver`]); without it, `/proc` alone
+    /// ([`caller_exe`]).
+    exe_resolver: std::sync::OnceLock<ExeResolver>,
 }
+
+/// Lot 273: `(pid, the denial's kernel time)` → the executable that pid ran
+/// then, if known.
+pub type ExeResolver = Box<dyn Fn(u32, u64) -> Option<String> + Send + Sync>;
 
 /// Audit op of the signed record of queue drops (external audit NN-AUD-111).
 pub const DROPPED_AUDIT_OP: &str = "detections_dropped";
@@ -487,7 +497,7 @@ impl DetectionSink {
 
     /// [`Self::enqueue`], with the caller whose executable the writer reads
     /// into the record (lot 273).
-    fn enqueue_with(&self, record: DetectionRecord, exe_of: Option<(u32, String)>) {
+    fn enqueue_with(&self, record: DetectionRecord, exe_of: Option<(u32, String, u64)>) {
         let mut exe_of = exe_of;
         {
             let mut q = self.inner.queue.lock();
@@ -669,10 +679,21 @@ impl DetectionSink {
                 .with_attack(attack);
         record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
         let exe_of = match event {
-            Event::FsProtectDenial { pid, comm, .. } => Some((*pid, comm.clone())),
+            Event::FsProtectDenial {
+                pid,
+                comm,
+                timestamp_ns,
+                ..
+            } => Some((*pid, comm.clone(), *timestamp_ns)),
             _ => None,
         };
         self.enqueue_with(record, exe_of);
+    }
+
+    /// Lot 273: how the writer names a denial's caller by executable (the
+    /// start sets the process lineage's; the first one set stays).
+    pub fn set_exe_resolver(&self, resolver: ExeResolver) {
+        let _ = self.inner.exe_resolver.set(resolver);
     }
 
     /// Lab PR 236: record an engine decision — its verdict (the primary
@@ -812,6 +833,7 @@ impl SinkInner {
             written: AtomicU64::new(0),
             append_failed: AtomicU64::new(0),
             defense,
+            exe_resolver: std::sync::OnceLock::new(),
         }
     }
 }
@@ -898,10 +920,16 @@ fn spawn_writer(
                 exe_of,
             } in batch
             {
-                // Lot 273: an anti-tamper denial's caller, by executable.
+                // Lot 273: an anti-tamper denial's caller, by executable:
+                // the lineage's (an exec it saw, the process maybe gone),
+                // else `/proc` while the pid runs the recorded comm.
                 if record.exe.is_none() {
-                    if let Some((pid, comm)) = exe_of {
-                        record.exe = caller_exe(Path::new("/proc"), pid, &comm);
+                    if let Some((pid, comm, ts)) = exe_of {
+                        record.exe = inner
+                            .exe_resolver
+                            .get()
+                            .and_then(|f| f(pid, ts))
+                            .or_else(|| caller_exe(Path::new("/proc"), pid, &comm));
                     }
                 }
                 let id = record.id;
@@ -2695,6 +2723,62 @@ mod tests {
             ),
         );
         assert_eq!(describe_response(&r), "KillProcess (already gone)");
+    }
+
+    /// Lot 273: an anti-tamper denial's row names the caller's executable
+    /// the resolver gives for its pid at its time (the lineage, at the
+    /// start); a rule's row keeps its own (none for a FileOpen here).
+    #[tokio::test]
+    async fn the_writer_names_a_denials_caller_by_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        let (sink, _writer) = open(
+            &path,
+            test_key(),
+            RotationConfig::default(),
+            Arc::new(NoProtection),
+            DEFAULT_QUEUE_CAP,
+            None,
+        )
+        .expect("open detection store");
+        sink.set_exe_resolver(Box::new(|pid, ts| {
+            (pid == 4242 && ts == 77).then(|| "/usr/bin/bash".to_string())
+        }));
+        let denial = |pid: u32, ts: u64| Event::FsProtectDenial {
+            timestamp_ns: ts,
+            pid,
+            uid: 0,
+            comm: "bash".to_string(),
+            target_dev: 1,
+            target_ino: 2,
+            operation: nn_model::FsProtectOperation::CgroupKill,
+        };
+        let mut logged = sample_verdict();
+        logged.action = ResponseAction::Log;
+        // above any pid_max: no process of that pid in /proc either
+        for e in [denial(4242, 77), denial(4_000_000_001, 77)] {
+            sink.record_denial(&e, &logged, &[], PostureKind::Observing, "denied".into(), 0);
+        }
+        let mut lines = Vec::new();
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            lines = std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains("\"cgroup_kill\""))
+                .map(str::to_string)
+                .collect();
+            if lines.len() >= 2 {
+                break;
+            }
+        }
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("\"exe\":\"/usr/bin/bash\""),
+            "{}",
+            lines[0]
+        );
+        assert!(!lines[1].contains("/usr/bin/bash"), "{}", lines[1]);
     }
 
     #[tokio::test]
