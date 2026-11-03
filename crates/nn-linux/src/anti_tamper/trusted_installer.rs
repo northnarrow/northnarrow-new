@@ -530,15 +530,11 @@ impl TrustedInstallerOverride {
     }
 }
 
-/// Write `grant` to slot 0 of the pinned `FS_GRANT` map (a zeroed grant
-/// closes the window). `bpffs_root: None` ⇒ no-op success (no pinned map
-/// this boot; the in-memory detection state still governs the
-/// downgrade). Mirrors the `ProtectedObserversHandle::open` pinned-map
-/// idiom.
-/// Lot 278: the installer a grant's requester acts for — the parent of
-/// `requester` (the `nn-admin` at the other end of the admin socket, its
-/// `SO_PEERCRED` pid): `install.sh` or `uninstall.sh` runs `nn-admin
-/// trusted-installer-grant` itself. Its pid and start (`starttime` of
+/// Lot 278: the installer a grant asked for an installer acts for (review
+/// of #493, note a: `nn-admin trusted-installer-grant --for-installer`) —
+/// the parent of `requester` (the `nn-admin` at the other end of the admin
+/// socket, its `SO_PEERCRED` pid): `install.sh` or `uninstall.sh` runs
+/// `nn-admin trusted-installer-grant` itself. Its pid and start (`starttime` of
 /// `/proc/<ppid>/stat`), read under `proc_root`. `None` when it cannot be
 /// told: the requester is gone, or no longer the child of that process
 /// (read twice), or its parent is PID 1 or 0 (a requester started by init
@@ -568,6 +564,11 @@ fn stat_parent_and_start(proc_root: &Path, pid: u32) -> Option<(u32, u64)> {
     Some((rest.get(1)?.parse().ok()?, rest.get(19)?.parse().ok()?))
 }
 
+/// Write `grant` to slot 0 of the pinned `FS_GRANT` map (a zeroed grant
+/// closes the window). `bpffs_root: None` ⇒ no-op success (no pinned map
+/// this boot; the in-memory detection state still governs the
+/// downgrade). Mirrors the `ProtectedObserversHandle::open` pinned-map
+/// idiom.
 fn write_fs_grant(bpffs_root: Option<&Path>, grant: FsGrant) -> Result<()> {
     let Some(root) = bpffs_root else {
         return Ok(());

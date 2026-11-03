@@ -650,7 +650,11 @@ pub(crate) fn process_event(
     // names the primary rule and every match, and runs, per target, the
     // strongest response the per-rule policy allows. Lot 278: in the
     // posture the event left (observed above) — R009 kills in COMBAT only.
-    if let Some(decision) = engine.decide_in(&event, posture.current_kind()) {
+    // Review of #493 (note b): read once — the record and the response
+    // name the posture the decision was made in (an admin release on
+    // another thread may move it meanwhile).
+    let judged_in = posture.current_kind();
+    if let Some(decision) = engine.decide_in(&event, judged_in) {
         let verdict = &decision.verdict;
         // Review 75: every verdict is acted on; its log lines and its
         // record count against the primary rule's budget for the acting uid.
@@ -723,7 +727,7 @@ pub(crate) fn process_event(
                     sink.record_decision(
                         &event,
                         &decision,
-                        posture.current_kind(),
+                        judged_in,
                         northnarrow_agent::detection_store::describe_response(&report),
                         suppressed_before,
                     );
@@ -739,13 +743,7 @@ pub(crate) fn process_event(
             northnarrow_agent::posture::triggers::event_owner_seen(&event);
         // R12c: the responses to the dispatcher — signed intent, the
         // action, signed outcome, then the record — off this thread.
-        let decided = Decided::new(
-            event,
-            decision,
-            posture.current_kind(),
-            suppressed_before,
-            lines,
-        );
+        let decided = Decided::new(event, decision, judged_in, suppressed_before, lines);
         dispatcher.submit(ResponseJob::of(
             &decided,
             owner,
