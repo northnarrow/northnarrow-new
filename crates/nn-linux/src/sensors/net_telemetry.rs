@@ -418,12 +418,11 @@ pub fn spawn_dns_answer_pump(
     tx: &BusSender,
     rt: &tokio::runtime::Handle,
 ) -> Result<PumpThread> {
-    let claim = attached.then(|| {
-        crate::net::resolved::ResolvedClaim::new(
-            Arc::clone(&table),
-            crate::net::dns_ingest::monotonic_ns(),
-        )
-    });
+    let claim = crate::net::resolved::ResolvedClaim::if_attached(
+        &table,
+        attached,
+        crate::net::dns_ingest::monotonic_ns(),
+    );
     let tx = tx.for_source("dns_answer");
     let rt = rt.clone();
     PumpThread::spawn("dns_answer", move |stop| {
@@ -578,7 +577,7 @@ pub fn spawn_tls_pump(
     tx: &BusSender,
     rt: &tokio::runtime::Handle,
 ) -> Result<PumpThread> {
-    let claim = attached.then(|| crate::net::resolved::PumpClaim::new(Arc::clone(&ingest)));
+    let claim = crate::net::resolved::PumpClaim::if_attached(&ingest, attached);
     let tx = tx.for_source("tls_hello");
     let rt = rt.clone();
     PumpThread::spawn("tls_hello", move |stop| {

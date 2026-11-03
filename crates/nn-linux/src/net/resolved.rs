@@ -28,6 +28,14 @@ impl ResolvedClaim {
         table.set_sensor_since(now_ns.max(1));
         Self(table)
     }
+
+    /// The claim of a pump whose sensor `attached`; none otherwise: the
+    /// table then says no sensor runs (every connect unknown, never an
+    /// alert for want of a response nobody could see) and no connect
+    /// waits for a pump that reads nothing.
+    pub fn if_attached(table: &Arc<ResolvedTable>, attached: bool, now_ns: u64) -> Option<Self> {
+        attached.then(|| Self::new(Arc::clone(table), now_ns))
+    }
 }
 
 impl Drop for ResolvedClaim {
@@ -46,6 +54,11 @@ impl PumpClaim {
     pub fn new(ingest: Arc<DnsIngest>) -> Self {
         ingest.set_pump(true);
         Self(ingest)
+    }
+
+    /// The claim of a pump whose sensor `attached`; none otherwise.
+    pub fn if_attached(ingest: &Arc<DnsIngest>, attached: bool) -> Option<Self> {
+        attached.then(|| Self::new(Arc::clone(ingest)))
     }
 }
 
@@ -172,6 +185,17 @@ mod tests {
         );
         drop(claim);
         assert_eq!(t.sensor_since(), None);
+        // a sensor that did not attach claims nothing: unknown, and a
+        // connect does not wait for its pump
+        assert!(ResolvedClaim::if_attached(&t, false, 3 * S).is_none());
+        assert_eq!(t.sensor_since(), None);
+        let c = ResolvedClaim::if_attached(&t, true, 3 * S).expect("attached");
+        assert_eq!(t.sensor_since(), Some(3 * S));
+        drop(c);
+        let ingest = Arc::new(DnsIngest::default());
+        assert!(PumpClaim::if_attached(&ingest, false).is_none());
+        let p = PumpClaim::if_attached(&ingest, true).expect("attached");
+        drop(p);
         assert_eq!(
             judge(&t, &lineage, 44, 5 * S, C2, 10 * S),
             DnsResolution::Unknown
