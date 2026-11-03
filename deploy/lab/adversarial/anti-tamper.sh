@@ -315,6 +315,47 @@ def cmd_fdlater(path, value, secs):
     print("wrote %r through the earlier descriptor of %s" % (value, path))
     return 0
 
+def cmd_handlewrite(mount, path, value):
+    # the review of #490 (B): <path>'s file handle (name_to_handle_at), the
+    # dentries dropped (drop_caches 2), the file opened again through the
+    # handle (open_by_handle_at: a disconnected dentry, named "/") and
+    # <value> written; what the open and the write said
+    if not path.startswith(mount.rstrip("/") + "/"):
+        print("setup: %r is not under %r" % (path, mount))
+        return 2
+    import ctypes, ctypes.util
+    libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+
+    class FileHandle(ctypes.Structure):
+        _fields_ = [("handle_bytes", ctypes.c_uint), ("handle_type", ctypes.c_int),
+                    ("f_handle", ctypes.c_ubyte * 128)]
+    fh = FileHandle()
+    fh.handle_bytes = 128
+    mount_id = ctypes.c_int()
+    if libc.name_to_handle_at(-100, path.encode(), ctypes.byref(fh), ctypes.byref(mount_id), 0) != 0:
+        print("name_to_handle_at %s: errno=%s (no handle)" % (path, ename(ctypes.get_errno())))
+        return 2
+    mfd = os.open(mount, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with open("/proc/sys/vm/drop_caches", "w") as f:
+            f.write("2")
+        fd = libc.open_by_handle_at(mfd, ctypes.byref(fh), os.O_WRONLY)
+        if fd < 0:
+            print("open_by_handle_at %s: errno=%s (not opened)" % (path, ename(ctypes.get_errno())))
+            return 1
+    finally:
+        os.close(mfd)
+    try:
+        seen = os.readlink("/proc/self/fd/%d" % fd)
+        os.write(fd, value.encode())
+    except OSError as e:
+        print("write %r through the handle of %s: errno=%s" % (value, path, ename(e.errno)))
+        return 1
+    finally:
+        os.close(fd)
+    print("wrote %r through the handle of %s (the descriptor's path: %s)" % (value, path, seen))
+    return 0
+
 def file_id(path, kind):
     st = os.lstat(path)
     out = "%d:%d" % (st.st_dev, st.st_ino)
@@ -780,6 +821,8 @@ def selftest():
     check(rc == 2 and out.startswith("setup:"), "fdlater: a bad delay: %r" % out)
     rc, out = quiet(cmd_fdlater, "/dev/null", "0", "0")
     check(rc == 0 and "wrote" in out, "fdlater writes through its descriptor: %r" % out)
+    rc, out = quiet(cmd_handlewrite, "/sys/fs/cgroup", "/etc/hostname", "x")
+    check(rc == 2 and out.startswith("setup:"), "handlewrite: a path outside the mount: %r" % out)
     rc, out = quiet(cmd_finit, "/nonexistent/nn.ko")
     check(rc == 2 and out.startswith("setup:") and "errno=" not in out and "denied" not in out,
           "a missing input is a setup failure, not a refusal: %r" % out)
@@ -796,7 +839,7 @@ def main(argv):
         "finit": (cmd_finit, 1), "kexec-file": (cmd_kexec_file, 2),
         "kexec-unload": (cmd_kexec_unload, 0), "strip-sig": (cmd_strip_sig, 2),
         "cgmove": (cmd_cgmove, 4), "v1move": (cmd_v1move, 4),
-        "fdlater": (cmd_fdlater, 3),
+        "fdlater": (cmd_fdlater, 3), "handlewrite": (cmd_handlewrite, 3),
     }
     if argv and argv[0] == "file" and len(argv) in (3, 4):
         return cmd_file(*argv[1:])
@@ -1837,7 +1880,7 @@ fi
 # files are written "0" (a no-op if the open went through: ERANGE for
 # cgroup.kill). Inside a window it is all allowed (C76, at the end).
 if [[ ! -e $CGROOT/cgroup.controllers || -z "$AG_CG" || -z "$WD_CG" ]]; then
-    skipped_case C65,C66,C67,C68,C69,C70,C71,C72,C73,C74,C75,C77a,C77b,C78a,C78b,C78c,C79,C80,C81,C81b,C82,C83,C83b,C84,C85,C86 "no cgroup v2 hierarchy, or a unit without a ControlGroup" 0
+    skipped_case C65,C66,C67,C68,C69,C70,C71,C72,C73,C74,C75,C77a,C77b,C78a,C78b,C78c,C79,C80,C81,C81b,C82,C83,C83b,C84,C85,C86,C87,C88 "no cgroup v2 hierarchy, or a unit without a ControlGroup" 0
 else
     PID=$(agent_pid); START=$(proc_start "$PID")
     WDPID=$(wd_pid); WDSTART=$(proc_start "$WDPID")
@@ -2133,6 +2176,61 @@ else
         for i in $(seq 1 40); do window_open || break; sleep 1; done
         restored C85 "the watchdog's pids.max" "${TM0:-}" "$(cat "$CGROOT$WD_CG/pids.max" 2>/dev/null)"
         restored C85 "the watchdog unit's TasksMax" "${TMP0:-}" "$(systemctl show -p TasksMax --value northnarrow-watchdog.service 2>/dev/null)"
+    fi
+    # C87 (the review of #490, A): a drop-in in the watchdog's directories
+    # and in the `northnarrow-.service.d` prefix ones (both units read it):
+    # a `MemoryMax=4K` there would reach the next start's fresh cgroup.
+    # Comment-only files here (harmless if they went through), refused at
+    # their creation (NOCREATE).
+    if selected C87; then
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        made=(); mkd=(); refused=0; tried=0
+        for d in /etc/systemd/system/northnarrow-watchdog.service.d /run/systemd/system/northnarrow-watchdog.service.d \
+                 /etc/systemd/system/northnarrow-.service.d /run/systemd/system/northnarrow-.service.d; do
+            # an agent before the review of #490 makes none of them: a root
+            # shell makes the directory first, as an attacker would
+            [[ -d $d ]] || { mkdir -p "$d" 2>/dev/null && mkd+=("$d"); }
+            [[ -d $d ]] || continue
+            tried=$((tried + 1))
+            if out=$( { printf '# lab C87\n' > "$d/99-nn-lab-c87.conf"; } 2>&1 ) && [[ -e $d/99-nn-lab-c87.conf ]]; then
+                made+=("$d")
+            elif [[ "$(outcome_of "$out" held)" == denied ]]; then
+                refused=$((refused + 1))
+            fi
+        done
+        sleep 4; ev=$(evidence "$t0" "$a0" "$d0")
+        if (( tried == 4 && refused == 4 )) && echo "$ev" | grep -qE "deny=create"; then
+            v=OK; st="denied (4 of 4 directories)"
+        else
+            v="DEVIATION (expected 4 refusals: tried $tried, refused $refused, made in: ${made[*]:-none})"; fail=1
+            st=$([[ ${#made[@]} -gt 0 ]] && echo allowed || echo partial)
+        fi
+        rows+=("| C87 | a drop-in in the watchdog's and the prefix drop-in directories (no window) | $st | $ev | $v |")
+        echo "C87 drop-ins of the watchdog and the prefix → $st; $ev; $v" >&2
+        if (( ${#made[@]} + ${#mkd[@]} )); then
+            grant_window 30
+            for d in "${made[@]}"; do rm -f "$d/99-nn-lab-c87.conf"; done
+            for d in "${mkd[@]}"; do rmdir "$d" 2>/dev/null; done
+            systemctl daemon-reload
+            for i in $(seq 1 40); do window_open || break; sleep 1; done
+        fi
+        left=$(ls /etc/systemd/system/northnarrow-watchdog.service.d/99-nn-lab-c87.conf /run/systemd/system/northnarrow-watchdog.service.d/99-nn-lab-c87.conf \
+               /etc/systemd/system/northnarrow-.service.d/99-nn-lab-c87.conf /run/systemd/system/northnarrow-.service.d/99-nn-lab-c87.conf 2>/dev/null | wc -l)
+        restored C87 "the lab's drop-ins" 0 "$left"
+    fi
+    # C88 (the review of #490, B): the agent's memory.max opened through a
+    # file handle after the dentries were dropped (a disconnected dentry,
+    # no name, its own parent) and its current value written back (no
+    # change if it went through): refused by the file's kernfs node.
+    if selected C88; then
+        MM=$CGROOT$AG_CG/memory.max
+        if [[ -e $MM ]]; then
+            MV=$(cat "$MM" 2>/dev/null)
+            run_case C88 "the agent's memory.max opened by handle after drop_caches, its value written back (no window)" denied "deny=cgroup_limit" 0 -- nnpy handlewrite "$CGROOT" "$MM" "$MV"
+            restored C88 "the agent's memory.max" "$MV" "$(cat "$MM" 2>/dev/null)"
+        else
+            skipped_case C88 "no memory.max in the agent's cgroup" 1
+        fi
     fi
 fi
 

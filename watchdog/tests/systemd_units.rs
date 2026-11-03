@@ -204,6 +204,27 @@ fn the_agent_unit_makes_both_units_set_property_directories() {
     }
 }
 
+/// The review of #490 (A): and the watchdog's drop-in directories and the
+/// `northnarrow-.service.d` prefix ones (both units read the latter), made
+/// empty before every start so that the agent registers them NOCREATE.
+#[test]
+fn the_agent_unit_makes_the_watchdogs_and_the_prefix_drop_in_directories() {
+    let d = directives(&unit("northnarrow-agent.service"));
+    let made: Vec<&str> = d
+        .iter()
+        .filter(|(k, v)| k == "ExecStartPre" && v.starts_with("+/bin/mkdir -p "))
+        .flat_map(|(_, v)| v.split_whitespace())
+        .collect();
+    for dir in [
+        "/etc/systemd/system/northnarrow-watchdog.service.d",
+        "/run/systemd/system/northnarrow-watchdog.service.d",
+        "/etc/systemd/system/northnarrow-.service.d",
+        "/run/systemd/system/northnarrow-.service.d",
+    ] {
+        assert!(made.contains(&dir), "{dir} not made: {made:?}");
+    }
+}
+
 /// External audit DEP-004: an unmet `Condition*` skips a unit and reports
 /// its start job as done — the agent never runs and nothing is failed. An
 /// unmet `Assert*` fails the job but leaves the unit inactive (dead), and

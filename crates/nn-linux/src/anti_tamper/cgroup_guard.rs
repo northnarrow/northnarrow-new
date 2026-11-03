@@ -472,6 +472,22 @@ pub(crate) fn offsets_degraded<'a>(absent: impl IntoIterator<Item = &'a str>) ->
             proc.join(", ")
         ));
     }
+    // The review of #490 (B): the resource files recognised by their
+    // kernfs node, not by a dentry a handle-opened file may not have.
+    let kernfs = any(&[
+        "INODE_I_PRIVATE_OFFSET",
+        "KERNFS_NODE_NAME_OFFSET",
+        "KERNFS_NODE_PARENT_OFFSET",
+        "KERNFS_NODE_ID_OFFSET",
+    ]);
+    if !kernfs.is_empty() {
+        out.push(format!(
+            "anti-tamper cgroup: the units' resource files are recognised by their dentry (the \
+             kernel's BTF has no {}): one opened through a handle (open_by_handle_at) after its \
+             dentry was dropped is not refused unless its value was registered",
+            kernfs.join(", ")
+        ));
+    }
     let regs = any(&[
         "PT_REGS_SI_OFFSET",
         "PT_REGS_DX_OFFSET",
@@ -567,7 +583,7 @@ mod tests {
     /// Lot 273b: an optional offset the kernel lacks is a signed cost.
     #[test]
     fn a_missing_offset_is_a_signed_degradation() {
-        assert!(offsets_degraded(["INODE_I_PRIVATE_OFFSET"]).is_empty());
+        assert!(offsets_degraded(["TASK_STRUCT_TGID_OFFSET"]).is_empty());
         let d = offsets_degraded(["PID_TASKS_OFFSET", "PT_REGS_SI_OFFSET"]);
         assert_eq!(d.len(), 2, "{d:?}");
         assert!(
@@ -578,6 +594,21 @@ mod tests {
             d[1].contains("PID 1's writes") && d[1].contains("PT_REGS_SI_OFFSET"),
             "{d:?}"
         );
+        // The review of #490 (B): without the kernfs node's offsets the
+        // resource files are recognised by their dentry.
+        for name in [
+            "INODE_I_PRIVATE_OFFSET",
+            "KERNFS_NODE_NAME_OFFSET",
+            "KERNFS_NODE_PARENT_OFFSET",
+            "KERNFS_NODE_ID_OFFSET",
+        ] {
+            let d = offsets_degraded([name]);
+            assert_eq!(d.len(), 1, "{name}: {d:?}");
+            assert!(
+                d[0].contains("open_by_handle_at") && d[0].contains(name),
+                "{d:?}"
+            );
+        }
     }
 
     /// Lot 273b (R7): a former watchdog's keys the new one's cgroup does not

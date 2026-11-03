@@ -94,6 +94,12 @@ ExecStartPre=+/bin/mkdir -p /run/systemd/system/northnarrow-agent.service.d
 # refused at the cgroup file; its drop-in would still apply it to the next
 # start's fresh cgroup, before the agent is there.
 ExecStartPre=+/bin/mkdir -p /etc/systemd/system.control/northnarrow-agent.service.d /run/systemd/system.control/northnarrow-agent.service.d /etc/systemd/system.control/northnarrow-watchdog.service.d /run/systemd/system.control/northnarrow-watchdog.service.d
+# The review of #490 (A): the watchdog's drop-in directories and the
+# `northnarrow-.service.d` prefix ones, whose drop-ins apply to both units
+# (systemd 246 and later): made (empty) so that the agent registers them
+# NOCREATE like its own. A drop-in there would reach the next start's
+# fresh cgroup before the agent is there to refuse it.
+ExecStartPre=+/bin/mkdir -p /etc/systemd/system/northnarrow-watchdog.service.d /run/systemd/system/northnarrow-watchdog.service.d /etc/systemd/system/northnarrow-.service.d /run/systemd/system/northnarrow-.service.d
 # External audit ATP-014 (NN-AUD-262): an explicit search path, without
 # /usr/local. systemd's default for a service starts with
 # /usr/local/sbin:/usr/local/bin, which the FIM list does not watch, and

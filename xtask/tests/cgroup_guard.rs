@@ -151,17 +151,49 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         ],
     )
     .unwrap();
+    // The review of #490 (B): the file is recognised by its registered
+    // value or by its kernfs node (name, parent's id), the dentry only
+    // without the node's offsets — a handle-opened file's dentry is
+    // disconnected.
+    in_order(
+        body(&c, "kernfs_node_of"),
+        &[
+            "off_opt!(INODE_I_PRIVATE_OFFSET)",
+            "off_opt!(KERNFS_NODE_NAME_OFFSET)",
+            "off_opt!(KERNFS_NODE_PARENT_OFFSET)",
+            "off_opt!(KERNFS_NODE_ID_OFFSET)",
+            "return Node::NoOffsets;",
+            "bpf_probe_read_kernel_str(w.as_mut_ptr() as *mut c_void, 24, name as *const c_void)",
+            "if len > LIMIT_NAME_MAX {\n        return Node::NotALimit;\n    }",
+            "kn.add(parent_off)",
+            "parent.add(id_off)",
+            "Ok(id) => Node::Read(len, w, id),",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&c, "dentry_name_and_dir"),
+        &[
+            "let kind = limit_kind(len, words);",
+            "if kind == LIMIT_NONE {\n        return None;\n    }",
+            "off!(DENTRY_D_PARENT_OFFSET)",
+            "Some((kind, dir_key))",
+        ],
+    )
+    .unwrap();
     in_order(
         body(&c, "refuse_limit"),
         &[
-            "let kind = limit_kind(len, words);",
-            "if kind == LIMIT_NONE {\n        return false;\n    }",
-            "off!(DENTRY_D_PARENT_OFFSET)",
+            "let registered = LIMIT_VALUES.get(&key).copied();",
+            "Node::Read(len, words, dir_ino) => (\n            limit_kind(len, words),\n            InodeKey {\n                dev: key.dev,\n                ino: dir_ino,\n            },\n        ),",
+            "Node::NoOffsets => match dentry_name_and_dir(file, hook) {",
+            "Node::Unreadable => {\n            crate::fail_open::bump(hook);",
+            "if registered.is_none() {\n        if kind == LIMIT_NONE {\n            return false;\n        }",
             "Some(f) if *f & FS_PROTECT_LIMIT_DIR != 0 => {}",
             "if caller_may(caller) {\n        return false;\n    }",
             "if caller == 1 {",
             "if phase == Phase::Open {\n            return false;\n        }",
-            "None => default_value(kind),",
+            "Some(v) => Some(v),\n            None => default_value(kind),",
             "if let (Some(value), Some(written)) = (value, written_value()) {\n            if same_value(&written, &value) {\n                return false;",
             "sign(phase, FS_OP_CGROUP_LIMIT, key);",
             "true",

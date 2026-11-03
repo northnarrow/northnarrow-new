@@ -38,7 +38,8 @@ use northnarrow_common::wire::{
 
 use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_PATH_OFFSET,
-    INODE_I_SB_OFFSET, PATH_DENTRY_OFFSET, PID_TASKS_OFFSET, PROC_INODE_PID_OFFSET,
+    INODE_I_PRIVATE_OFFSET, INODE_I_SB_OFFSET, KERNFS_NODE_ID_OFFSET, KERNFS_NODE_NAME_OFFSET,
+    KERNFS_NODE_PARENT_OFFSET, PATH_DENTRY_OFFSET, PID_TASKS_OFFSET, PROC_INODE_PID_OFFSET,
     PROC_INODE_VFS_INODE_OFFSET, PT_REGS_DX_OFFSET, PT_REGS_ORIG_AX_OFFSET, PT_REGS_SI_OFFSET,
     QSTR_LEN_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_PID_LINKS_OFFSET,
     TASK_STRUCT_TGID_OFFSET,
@@ -160,28 +161,83 @@ fn caller_may(caller: u32) -> bool {
     crate::task_kill::is_exempt_pid(caller) || crate::inode_protect::override_active()
 }
 
-/// A resource file of a protected cgroup: [`refuse_write`]'s cgroup v2
-/// half.
+/// The review of #490 (B): what the kernfs node behind a cgroup v2
+/// `inode` says of it — its name, packed as [`dentry_name_words`] packs a
+/// dentry's, and its directory's inode number (`kernfs_ino()`: the
+/// parent node's `id`). A handle-opened file (`open_by_handle_at` after
+/// its dentry was dropped) has a disconnected dentry, named `/` and its own
+/// parent; its node has neither changed.
+enum Node {
+    /// `(len, words, the directory's inode number)`.
+    Read(usize, [u64; 3], u64),
+    /// A name the resource files cannot have (empty, longer than
+    /// [`LIMIT_NAME_MAX`]).
+    NotALimit,
+    /// The kernel's BTF lacks one of the optional offsets: the dentry is
+    /// read instead (a signed degradation).
+    NoOffsets,
+    /// A pointer could not be read: a counted fail-open.
+    Unreadable,
+}
+
 #[inline(always)]
-unsafe fn refuse_limit(file: *const c_void, inode: *const c_void, hook: u32, phase: Phase) -> bool {
-    let Some(dentry) = file_dentry(file) else {
-        return false;
+unsafe fn kernfs_node_of(inode: *const c_void) -> Node {
+    let (Some(private), Some(name_off), Some(parent_off), Some(id_off)) = (
+        off_opt!(INODE_I_PRIVATE_OFFSET),
+        off_opt!(KERNFS_NODE_NAME_OFFSET),
+        off_opt!(KERNFS_NODE_PARENT_OFFSET),
+        off_opt!(KERNFS_NODE_ID_OFFSET),
+    ) else {
+        return Node::NoOffsets;
     };
-    let Some((len, words)) = dentry_name_words(dentry) else {
-        return false;
+    let kn = match bpf_probe_read_kernel::<*const u8>((inode as *const u8).add(private) as *const *const u8) {
+        Ok(p) if !p.is_null() => p,
+        _ => return Node::Unreadable,
     };
+    let name = match bpf_probe_read_kernel::<*const u8>(kn.add(name_off) as *const *const u8) {
+        Ok(p) if !p.is_null() => p,
+        _ => return Node::Unreadable,
+    };
+    // Up to its NUL into three zeroed words (never past the string): the
+    // words `northnarrow_common::cgroup_limits::name_words` packs.
+    let mut w = [0u64; 3];
+    let n = generated::bpf_probe_read_kernel_str(w.as_mut_ptr() as *mut c_void, 24, name as *const c_void);
+    if n <= 1 {
+        return Node::NotALimit;
+    }
+    let len = (n - 1) as usize;
+    if len > LIMIT_NAME_MAX {
+        return Node::NotALimit;
+    }
+    let parent = match bpf_probe_read_kernel::<*const u8>(kn.add(parent_off) as *const *const u8) {
+        Ok(p) if !p.is_null() => p,
+        _ => return Node::Unreadable,
+    };
+    match bpf_probe_read_kernel::<u64>(parent.add(id_off) as *const u64) {
+        Ok(id) => Node::Read(len, w, id),
+        Err(_) => Node::Unreadable,
+    }
+}
+
+/// The kind and the directory's key of the resource file `file` from its
+/// dentry — where the kernel's BTF lacks the kernfs offsets (a file opened
+/// through a handle goes through then: a signed degradation). `None`: not
+/// a resource file's name, or unreadable (counted as a fail-open).
+#[inline(always)]
+unsafe fn dentry_name_and_dir(file: *const c_void, hook: u32) -> Option<(u8, InodeKey)> {
+    let dentry = file_dentry(file)?;
+    let (len, words) = dentry_name_words(dentry)?;
     let kind = limit_kind(len, words);
     if kind == LIMIT_NONE {
-        return false;
+        return None;
     }
-    // Its directory: a protected unit's or slice's?
     let parent = match bpf_probe_read_kernel::<*const c_void>(
         (dentry as *const u8).add(off!(DENTRY_D_PARENT_OFFSET)) as *const *const c_void,
     ) {
         Ok(p) if !p.is_null() => p,
         _ => {
             crate::fail_open::bump(hook);
-            return false;
+            return None;
         }
     };
     let dir = match bpf_probe_read_kernel::<*const c_void>(
@@ -190,33 +246,69 @@ unsafe fn refuse_limit(file: *const c_void, inode: *const c_void, hook: u32, pha
         Ok(p) if !p.is_null() => p,
         _ => {
             crate::fail_open::bump(hook);
-            return false;
+            return None;
         }
     };
     let Some(dir_key) = crate::inode_protect::read_inode_key(dir) else {
         crate::fail_open::bump(hook);
+        return None;
+    };
+    Some((kind, dir_key))
+}
+
+/// A resource file of a protected cgroup: [`refuse_write`]'s cgroup v2
+/// half. The file is one when its inode holds a registered value
+/// ([`LIMIT_VALUES`]), or when its kernfs node's name is a resource file's
+/// and its parent node's directory is registered with
+/// `FS_PROTECT_LIMIT_DIR` — the node, not the dentry, which a file opened
+/// through a handle may have disconnected (the review of #490, B).
+#[inline(always)]
+unsafe fn refuse_limit(file: *const c_void, inode: *const c_void, hook: u32, phase: Phase) -> bool {
+    let Some(key) = crate::inode_protect::read_inode_key(inode) else {
+        crate::fail_open::bump(hook);
         return false;
     };
-    match crate::inode_protect::PROTECTED_INODES.get(&dir_key) {
-        Some(f) if *f & FS_PROTECT_LIMIT_DIR != 0 => {}
-        _ => return false,
+    let registered = LIMIT_VALUES.get(&key).copied();
+    let (kind, dir_key) = match kernfs_node_of(inode) {
+        Node::Read(len, words, dir_ino) => (
+            limit_kind(len, words),
+            InodeKey {
+                dev: key.dev,
+                ino: dir_ino,
+            },
+        ),
+        Node::NotALimit => (LIMIT_NONE, InodeKey { dev: 0, ino: 0 }),
+        Node::NoOffsets => match dentry_name_and_dir(file, hook) {
+            Some(found) => found,
+            None => (LIMIT_NONE, InodeKey { dev: 0, ino: 0 }),
+        },
+        Node::Unreadable => {
+            crate::fail_open::bump(hook);
+            (LIMIT_NONE, InodeKey { dev: 0, ino: 0 })
+        }
+    };
+    if registered.is_none() {
+        if kind == LIMIT_NONE {
+            return false;
+        }
+        // Its directory: a protected unit's or slice's?
+        match crate::inode_protect::PROTECTED_INODES.get(&dir_key) {
+            Some(f) if *f & FS_PROTECT_LIMIT_DIR != 0 => {}
+            _ => return false,
+        }
     }
     let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
     if caller_may(caller) {
         return false;
     }
-    let Some(key) = crate::inode_protect::read_inode_key(inode) else {
-        crate::fail_open::bump(hook);
-        return false;
-    };
     if caller == 1 {
         // systemd realising the unit or applying a `set-property`: the
         // open is let through, the value judged at the write.
         if phase == Phase::Open {
             return false;
         }
-        let value = match LIMIT_VALUES.get(&key) {
-            Some(v) => Some(*v),
+        let value = match registered {
+            Some(v) => Some(v),
             None => default_value(kind),
         };
         if let (Some(value), Some(written)) = (value, written_value()) {
