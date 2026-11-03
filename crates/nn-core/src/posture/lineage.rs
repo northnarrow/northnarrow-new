@@ -2331,12 +2331,12 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         Some(hops.into_inner())
     }
 
-    /// Lot 275 (NN-L-NET-028): `pid`'s ancestors on the walk of
-    /// [`Self::actor_in_lineage`] (ordered, POS-003), nearest first —
-    /// `pid` itself not included — each with its start as the spawn cache
-    /// holds it (`CLOCK_MONOTONIC` ns; 0 for a hop read from `/proc`). The
-    /// hops read before a hop that cannot be read; empty when none.
-    pub fn ancestor_starts(&self, pid: u32, as_of: AsOf) -> Vec<(u32, u64)> {
+    /// Lot 275 (NN-L-NET-028): `pid` and its ancestors on the walk of
+    /// [`Self::actor_in_lineage`] (ordered, POS-003), `pid` first, each
+    /// with its start as the spawn cache holds it (`CLOCK_MONOTONIC` ns; 0
+    /// for a hop read from `/proc`). The hops read before a hop that cannot
+    /// be read; empty when `pid`'s own cannot.
+    pub fn lineage_starts(&self, pid: u32, as_of: AsOf) -> Vec<(u32, u64)> {
         let hops = std::cell::RefCell::new(Vec::new());
         let _ = self.lineage_walk(
             pid,
@@ -2348,11 +2348,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             },
             LINEAGE_DEPTH_CAP,
         );
-        let mut v = hops.into_inner();
-        if v.first().is_some_and(|(p, _)| *p == pid) {
-            v.remove(0);
-        }
-        v
+        hops.into_inner()
     }
 
     /// What the kernel executed for a hop: the spawn cache's record, else
@@ -3492,17 +3488,20 @@ mod tests {
     }
 
     #[test]
-    fn ancestor_starts_are_the_lineage_nearest_first_without_the_process() {
+    fn lineage_starts_are_the_process_then_its_ancestors() {
         let proc = TempDir::new().unwrap();
         let t = AuthSessionTracker::new(proc.path());
         t.ingest_spawn(100, 50, "/usr/bin/bash", 1);
         t.ingest_spawn(200, 100, "/usr/bin/python3", 2);
         t.ingest_spawn(300, 200, "/usr/bin/curl", 3);
-        let got = t.ancestor_starts(300, AsOf::Now);
-        assert_eq!(got.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![200, 100]);
-        // a process with no known parent: none
-        assert!(t.ancestor_starts(100, AsOf::Now).is_empty());
-        assert!(t.ancestor_starts(999, AsOf::Now).is_empty());
+        let got = t.lineage_starts(300, AsOf::Now);
+        assert_eq!(got.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![300, 200, 100]);
+        assert_eq!(
+            t.lineage_starts(100, AsOf::Now).iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec![100]
+        );
+        assert!(t.lineage_starts(999, AsOf::Now).is_empty(), "not known");
+        assert!(t.lineage_starts(1, AsOf::Now).is_empty(), "init");
     }
 
     #[test]

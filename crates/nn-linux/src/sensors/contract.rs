@@ -15,7 +15,8 @@
 
 use common::wire::{exe, open_sensor as wos};
 use common::wire::{
-    ARGV_LEN, FILENAME_LEN, FIM_CHILD_NAME_LEN, QNAME_LEN, QNAME_WIRE_LEN, TASK_COMM_LEN,
+    ARGV_LEN, DNS_ANSWER_CAP, FILENAME_LEN, FIM_CHILD_NAME_LEN, QNAME_LEN, QNAME_WIRE_LEN,
+    TASK_COMM_LEN, TLS_HELLO_CAP,
 };
 use nn_core::contract::{
     EventKind as K, FailureMode, Fallback, KernelBudget, OptIn, Overhead, SourceContract,
@@ -63,6 +64,16 @@ pub mod attach {
     pub const NET_FLOWS_V4: &str =
         "kprobe:inet_csk_listen_start, fexit:tcp_close, kprobe:udp_sendmsg";
     pub const OPEN_LSM: &str = "lsm:file_open (FIM observer)";
+    /// Lot 275: the inbound connections (the accept's return, the close of
+    /// a recorded accept).
+    pub const NET_INBOUND: &str = "fexit:inet_csk_accept, fexit:tcp_close (accepted sockets)";
+    /// Lot 275: the DNS responses, read from the receiver's buffer.
+    pub const DNS_ANSWER: &str = "fexit:udp_recvmsg+udpv6_recvmsg (the receiver's buffer)";
+    /// Part of [`DNS_ANSWER`]: `udpv6_recvmsg` not attached.
+    pub const DNS_ANSWER_V4: &str = "fexit:udp_recvmsg (the receiver's buffer)";
+    /// Lot 275: an outbound flow's first send when it is a ClientHello.
+    pub const TLS_HELLO: &str =
+        "fentry:tcp_sendmsg (the sender's buffer, a flow's first send)";
     pub const OPEN_TRACEPOINT: &str = "tracepoint:syscalls/sys_enter_openat (user memory)";
 }
 
@@ -110,7 +121,7 @@ const FS_PROTECT_OVERHEAD: &[Overhead] = &[
 
 /// Every source of the bus on Linux (a table of the build: a `const`, no
 /// process state).
-pub const SOURCES: [SourceContract; 13] = [
+pub const SOURCES: [SourceContract; 16] = [
     SourceContract {
         source: "process_spawn",
         sensors: &["process_spawn"],
@@ -617,6 +628,112 @@ pub const SOURCES: [SourceContract; 13] = [
         degradation_sources: &["net_sensor", "net_drain"],
         standby_for: None,
     },
+    // Lot 275 (C07 1→2): the inbound connections, the DNS responses, the TLS
+    // ClientHellos.
+    SourceContract {
+        source: "net_inbound",
+        sensors: &["net_inbound"],
+        events: &[K::NetInbound, K::SensorFlood],
+        attach: attach::NET_INBOUND,
+        also: &[],
+        needs_bpf_lsm: false,
+        lsm_part: None,
+        fallbacks: &[],
+        sync_verdict: SyncVerdict::None,
+        opt_in: None,
+        on_failure: FailureMode::Blind,
+        on_failure_detail: "its attach failing (no inet_csk_accept of a known parameter count, \
+             or refused) is signed (net_inbound) and the agent runs without it; its drain ending \
+             is signed (drain_ended) and stops the agent within 5 s; the closed rows share the \
+             netflow log, whose failure to open is the net drain's",
+        kernel_budgets: &[KernelBudget {
+            allows: "accepts: 256 at once, then 512 a second, per accepting process; 2,048 at \
+                     once, then 1,024 a second, per user (SensorFlood says so); a held accept's \
+                     close is not recorded either",
+            counter: "inbound_rate",
+        }],
+        overhead: &[],
+        truncations: &[COMM],
+        rings: &["inbound"],
+        probe: None,
+        self_tested: false,
+        degradation_sources: &["net_inbound"],
+        standby_for: None,
+    },
+    SourceContract {
+        source: "dns_answer",
+        sensors: &["dns_answer"],
+        events: &[K::DnsAnswer, K::SensorFlood],
+        attach: attach::DNS_ANSWER,
+        also: &[],
+        needs_bpf_lsm: false,
+        lsm_part: None,
+        fallbacks: &[],
+        sync_verdict: SyncVerdict::None,
+        opt_in: None,
+        on_failure: FailureMode::Blind,
+        on_failure_detail: "its attach failing is signed (dns_answer; udpv6_recvmsg alone: \
+             partial) and the agent runs without it — NN-L-NET-028 then judges every connect \
+             unknown; its pump ending stops the agent within 5 s (signed); R14b: the responses \
+             are decoded by the parse worker — while it is down the events carry no name and no \
+             address, and nothing is bound",
+        kernel_budgets: &[KernelBudget {
+            allows: "64 responses at once, then 128 a second, per process; 2,048 at once, then \
+                     1,024 a second, per user (the resolvers' users exempt); each record says \
+                     how many were held (SensorFlood)",
+            counter: "dns_answer_rate",
+        }],
+        overhead: &[],
+        truncations: &[
+            Truncation {
+                field: "response (the receiver's buffer)",
+                max_bytes: DNS_ANSWER_CAP as u32,
+                marked: "truncated; the records past the cut are not read",
+            },
+            COMM,
+        ],
+        rings: &["dns_answer"],
+        probe: None,
+        self_tested: false,
+        degradation_sources: &["dns_answer"],
+        standby_for: None,
+    },
+    SourceContract {
+        source: "tls_hello",
+        sensors: &["tls_hello"],
+        events: &[K::TlsClientHello, K::SensorFlood],
+        attach: attach::TLS_HELLO,
+        also: &[],
+        needs_bpf_lsm: false,
+        lsm_part: None,
+        fallbacks: &[],
+        sync_verdict: SyncVerdict::None,
+        opt_in: None,
+        on_failure: FailureMode::Blind,
+        on_failure_detail: "its attach failing is signed (tls_hello) and the agent runs \
+             without it (NN-L-NET-003 cannot match); its pump ending stops the agent within 5 s \
+             (signed); R14b: the hellos are fingerprinted by the parse worker — while it is down \
+             the events say undecoded",
+        kernel_budgets: &[KernelBudget {
+            allows: "64 hellos at once, then 32 a second, per process; 512 at once, then 256 a \
+                     second, per user (SensorFlood says so)",
+            counter: "tls_rate",
+        }],
+        overhead: &[],
+        truncations: &[
+            Truncation {
+                field: "ClientHello (the sender's buffer)",
+                max_bytes: TLS_HELLO_CAP as u32,
+                marked: "truncated; a hello past the cut is incomplete, no fingerprint",
+            },
+            COMM,
+        ],
+        rings: &["tls"],
+        probe: None,
+        self_tested: false,
+        degradation_sources: &["tls_hello"],
+        standby_for: None,
+    },
 ];
 
 /// The sources that do not travel the bus as a source of their own and are
@@ -737,6 +854,25 @@ mod tests {
             "udp_sendmsg_outbound.rs",
             "const UDP_EMIT_MIN_INTERVAL_NS: u64 = 1_000_000_000;",
         );
+        // lot 275
+        has("inbound.rs", "const TASK_BURST: u64 = 256;");
+        has("inbound.rs", "task_refill_ns: 1_000_000_000 / 512,");
+        has("inbound.rs", "const UID_BURST: u64 = 2048;");
+        has("inbound.rs", "uid_refill_ns: 1_000_000_000 / 1024,");
+        has("dns_answer.rs", "const TASK_BURST: u64 = 64;");
+        has("dns_answer.rs", "task_refill_ns: 1_000_000_000 / 128,");
+        has("dns_answer.rs", "const UID_BURST: u64 = 2048;");
+        has("dns_answer.rs", "uid_refill_ns: 1_000_000_000 / 1024,");
+        has("tls_hello.rs", "const TASK_BURST: u64 = 64;");
+        has("tls_hello.rs", "task_refill_ns: 1_000_000_000 / 32,");
+        has("tls_hello.rs", "const UID_BURST: u64 = 512;");
+        has("tls_hello.rs", "uid_refill_ns: 1_000_000_000 / 256,");
+        let inb = source("net_inbound").unwrap().kernel_budgets[0].allows;
+        assert!(inb.contains("256 at once, then 512") && inb.contains("2,048 at"));
+        let ans = source("dns_answer").unwrap().kernel_budgets[0].allows;
+        assert!(ans.contains("64 responses at once, then 128") && ans.contains("2,048 at once, then"));
+        let tls = source("tls_hello").unwrap().kernel_budgets[0].allows;
+        assert!(tls.contains("64 hellos at once, then 32") && tls.contains("512 at once, then 256"));
         let dns = source("dns_query").unwrap().kernel_budgets[0].allows;
         assert!(
             dns.contains("64 queries at once, then 128")
@@ -826,5 +962,7 @@ mod tests {
         assert_eq!(t("fim_drain", "child name"), 63);
         assert_eq!(t("module_load", "module path"), 31);
         assert_eq!(t("exec_check", "comm"), 15);
+        assert_eq!(t("dns_answer", "response"), 512);
+        assert_eq!(t("tls_hello", "ClientHello"), 4096);
     }
 }

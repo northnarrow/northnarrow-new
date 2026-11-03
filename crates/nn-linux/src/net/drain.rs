@@ -158,6 +158,12 @@ pub struct NetFlowPayload {
     /// to the rules.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub decision_engine_skipped: bool,
+    /// Lot 275 (C07): an inbound connection's row (`src_*` the peer that
+    /// connected, `dst_*` the local listener's end, `pid` the process that
+    /// accepted it). Written only when `true`: an outbound row, and every
+    /// row written before, carries no such field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inbound: bool,
 }
 
 /// External audit EVD-008 (lab PR 204): the netflow log's name in its v3
@@ -223,6 +229,16 @@ impl NetFlowDb {
     /// [`NETFLOW_SYNC_INTERVAL`] together. `skipped`: the row was held
     /// back from the rules (`decision_engine_skipped`).
     pub fn append(&mut self, ev: &NetFlowEvent, skipped: bool) -> Result<String> {
+        self.append_row(ev, skipped, false)
+    }
+
+    /// Lot 275: [`Self::append`] for an inbound connection's closed row
+    /// (`inbound` in the row).
+    pub fn append_inbound(&mut self, ev: &NetFlowEvent) -> Result<String> {
+        self.append_row(ev, false, true)
+    }
+
+    fn append_row(&mut self, ev: &NetFlowEvent, skipped: bool, inbound: bool) -> Result<String> {
         let payload = NetFlowPayload {
             ts: format_ts(Utc::now()),
             flow_id: ev.flow_id.clone(),
@@ -247,6 +263,7 @@ impl NetFlowDb {
             close_reason: ev.close_reason,
             agent_id: hex::encode(self.agent_id),
             decision_engine_skipped: skipped,
+            inbound,
         };
         self.inner.append_deferred(payload)
     }
@@ -1208,6 +1225,7 @@ mod tests {
                 close_reason: legacy.close_reason,
                 agent_id: legacy.agent_id.clone(),
                 decision_engine_skipped: false,
+                inbound: false,
             },
             fmt_ver: None,
             prev_hash: legacy.prev_hash.clone(),

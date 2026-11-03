@@ -89,6 +89,14 @@ pub struct NetWiring {
     /// External audit NETR-008: names the connecting process's image on
     /// every TCP connect (the spawn cache, `/proc` as fallback).
     pub lineage: crate::posture::lineage::AuthSessionTracker,
+    /// Lot 275 (NN-L-NET-028): which process resolved which address, fed
+    /// by the DNS query and response pumps, read by the connect pump and
+    /// the net drain.
+    pub resolved: Arc<crate::net::resolved::ResolvedTable>,
+    /// Lot 275: how far the TLS ClientHello pump has read its ring (the net
+    /// drain's closes wait for it, so a closed row carries its
+    /// fingerprint).
+    pub tls_ingest: Arc<crate::net::dns_ingest::DnsIngest>,
 }
 
 /// Tappa 10 N9 — ringbufs the multiplexer surfaces back to the
@@ -102,6 +110,9 @@ pub struct NetRingBufs {
     pub listen_rb: RingBuf<MapData>,
     /// Review 73: the UDP flow records, apart from the TCP closes.
     pub udp_rb: RingBuf<MapData>,
+    /// Lot 275 (C07): the inbound connections (accepts and their closes),
+    /// for the inbound drain (`crate::net::inbound`).
+    pub inbound_rb: RingBuf<MapData>,
 }
 
 /// The exec guards' kernel configuration, which the load writes once the
@@ -520,10 +531,15 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             let listen_rb = take_ringbuf(&mut ebpf, "NET_LISTEN_EVENTS")?;
             let udp_rb = take_ringbuf(&mut ebpf, "NET_UDP_EVENTS")?;
             info!("net: N2 BPF programs attached (inet_csk_listen_start kprobe + tcp_close fexit + udp_sendmsg_outbound kprobes on udp_sendmsg and udpv6_sendmsg)");
+            // Lot 275 (C07): the inbound connections, the DNS responses and
+            // the TLS ClientHellos (soft: each one missing is signed).
+            crate::sensors::net_telemetry::attach(&mut ebpf, &btf, &attach_points);
+            let inbound_rb = take_ringbuf(&mut ebpf, "INBOUND_EVENTS")?;
             Some(NetRingBufs {
                 close_rb,
                 listen_rb,
                 udp_rb,
+                inbound_rb,
             })
         } else {
             None
@@ -548,8 +564,19 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             flow_tracker: Arc::clone(&w.flow_tracker),
             lineage: w.lineage.clone(),
             dns_cache: Arc::clone(&w.dns_cache),
+            resolved: Arc::clone(&w.resolved),
         });
         let dns_cache_for_dns = net.as_ref().map(|w| Arc::clone(&w.dns_cache));
+        let resolved_for_dns = net.as_ref().map(|w| Arc::clone(&w.resolved));
+        // Lot 275: the DNS response and TLS ClientHello rings, pumped only
+        // with net wiring (their programs attach only then).
+        let net_telemetry_rbs = match net.as_ref() {
+            Some(_) => Some((
+                take_ringbuf(&mut ebpf, "DNS_ANSWER_EVENTS")?,
+                take_ringbuf(&mut ebpf, "TLS_HELLO_EVENTS")?,
+            )),
+            None => None,
+        };
         // External audit SNS-014: the DNS pump names a sender through the
         // lineage tracker (its spawn cache, `/proc` checked against the
         // query's time); without net wiring, a tracker of its own on `/proc`.
@@ -606,7 +633,8 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 Pump::Thread(spawn_dns_query_pump(
                     dns_query_rb,
                     dns_cache_for_dns,
-                    lineage_for_dns,
+                    resolved_for_dns,
+                    lineage_for_dns.clone(),
                     ParseClient::new(plan.parse.clone()),
                     &tx,
                     &rt,
@@ -649,6 +677,33 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 )),
             ),
         ];
+        let mut pumps = pumps;
+        // Lot 275 (C07): the DNS response and TLS ClientHello pumps.
+        if let (Some(w), Some((answer_rb, tls_rb))) = (net.as_ref(), net_telemetry_rbs) {
+            pumps.push((
+                "dns_answer",
+                Pump::Thread(crate::sensors::net_telemetry::spawn_dns_answer_pump(
+                    answer_rb,
+                    Arc::clone(&w.resolved),
+                    w.lineage.clone(),
+                    ParseClient::new(plan.parse.clone()),
+                    &tx,
+                    &rt,
+                )?),
+            ));
+            pumps.push((
+                "tls_hello",
+                Pump::Thread(crate::sensors::net_telemetry::spawn_tls_pump(
+                    tls_rb,
+                    Arc::clone(&w.tls_ingest),
+                    Arc::clone(&w.flow_tracker),
+                    w.lineage.clone(),
+                    ParseClient::new(plan.parse.clone()),
+                    &tx,
+                    &rt,
+                )?),
+            ));
+        }
 
         Ok((
             Self {
@@ -1303,6 +1358,8 @@ struct ConnectWiring {
     flow_tracker: Arc<Mutex<FlowTracker>>,
     lineage: AuthSessionTracker,
     dns_cache: Arc<DnsCache>,
+    /// Lot 275: the connect-time row's DNS judgement (NN-L-NET-028).
+    resolved: Arc<crate::net::resolved::ResolvedTable>,
 }
 
 /// The connect pump (R12b: a thread of its own, a source of the bus).
@@ -1404,7 +1461,14 @@ fn pump_tcp_connect(
             flow_tracker.as_ref(),
             batch.iter().map(|r| r.timestamp_ns).max(),
         ) {
-            rt.block_on(w.dns_cache.ingest().caught_up(newest));
+            // Lot 275: and once the DNS response pump has read the responses
+            // received before them (NN-L-NET-028's judgement)
+            rt.block_on(async {
+                tokio::join!(
+                    w.dns_cache.ingest().caught_up(newest),
+                    w.resolved.ingest().caught_up(newest)
+                )
+            });
         }
         if !send_connects(&batch, flow_tracker.as_ref(), tx, rt) {
             return Ok(());
@@ -1452,6 +1516,15 @@ fn connect_events(raw: &TcpConnectRaw, wiring: Option<&ConnectWiring>) -> Vec<Ev
         row.resolved_hostname =
             w.dns_cache
                 .lookup_for_connect(row.pid, row.start_ns, row.proc_start_ns);
+        // Lot 275 (NN-L-NET-028): did the lineage resolve the destination
+        row.dns_resolution = crate::net::resolved::judge(
+            &w.resolved,
+            &w.lineage,
+            row.pid,
+            row.proc_start_ns,
+            row.dst_addr,
+            row.start_ns,
+        );
         out.push(Event::NetFlow(row));
     }
     out
@@ -1522,6 +1595,7 @@ fn dns_events(
     decoded: Option<&nn_proto::ipc::QnameOut>,
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
+    resolved: Option<&crate::net::resolved::ResolvedTable>,
 ) -> (Event, Option<Event>) {
     let mut event = query_event(raw, decoded);
     let mut flood = None;
@@ -1554,6 +1628,17 @@ fn dns_events(
                 *timestamp_ns,
             );
         }
+        // Lot 275 (NN-L-NET-028): the name the process asked, for the
+        // response to bind (or the response seen already); a lost record
+        // of it makes its connects' judgement unknown
+        if let Some(t) = resolved {
+            if decoded.is_some() {
+                t.on_query(*pid, query_name, *timestamp_ns);
+            }
+            if raw.held != 0 {
+                t.note_held(*pid, *timestamp_ns);
+            }
+        }
         // Review 78: queries the kernel's DNS budgets held back since this
         // process's previous record.
         if raw.held != 0 {
@@ -1585,8 +1670,18 @@ fn nss_events(
     decoded: Option<&nn_proto::ipc::QnameOut>,
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
+    resolved: Option<&crate::net::resolved::ResolvedTable>,
 ) -> Option<Event> {
-    if let (Some(cache), Some(name)) = (dns_cache, nss_query_name(decoded)) {
+    let name = nss_query_name(decoded);
+    // Lot 275: the name asked through systemd-resolved, for the upstream
+    // response (received by the resolver) to bind to this process
+    if let (Some(t), Some(name)) = (resolved, name.as_deref()) {
+        t.on_query(raw.pid, name, raw.timestamp_ns);
+    }
+    if let (Some(t), true) = (resolved, raw.held != 0) {
+        t.note_held(raw.pid, raw.timestamp_ns);
+    }
+    if let (Some(cache), Some(name)) = (dns_cache, name) {
         cache.on_dns_query(
             raw.pid,
             name,
@@ -1614,6 +1709,7 @@ fn nss_events(
 fn spawn_dns_query_pump(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
+    resolved: Option<Arc<crate::net::resolved::ResolvedTable>>,
     lineage: AuthSessionTracker,
     parse: ParseClient,
     tx: &BusSender,
@@ -1630,7 +1726,7 @@ fn spawn_dns_query_pump(
     let rt = rt.clone();
     PumpThread::spawn("dns_query", move |stop| {
         let _claim = claim;
-        rt.block_on(pump_dns_query(rb, dns_cache, lineage, parse, tx, stop))
+        rt.block_on(pump_dns_query(rb, dns_cache, resolved, lineage, parse, tx, stop))
     })
     .context("starting the dns_query pump's thread")
 }
@@ -1638,6 +1734,7 @@ fn spawn_dns_query_pump(
 async fn pump_dns_query(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
+    resolved: Option<Arc<crate::net::resolved::ResolvedTable>>,
     lineage: AuthSessionTracker,
     mut parse: ParseClient,
     tx: BusSender,
@@ -1665,6 +1762,7 @@ async fn pump_dns_query(
                     guard.get_inner_mut(),
                     &lineage,
                     dns_cache.as_deref(),
+                    resolved.as_deref(),
                     &mut parse,
                     &mut reject,
                     &mut outbox,
@@ -1687,6 +1785,7 @@ async fn pump_dns_query(
                     async_fd.get_mut(),
                     &lineage,
                     dns_cache.as_deref(),
+                    resolved.as_deref(),
                     &mut parse,
                     &mut reject,
                     &mut outbox,
@@ -1728,6 +1827,7 @@ fn dns_pass(
     ring: &mut RingBuf<MapData>,
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
+    resolved: Option<&crate::net::resolved::ResolvedTable>,
     parse: &mut ParseClient,
     reject: &mut RejectThrottle,
     outbox: &mut VecDeque<Event>,
@@ -1764,9 +1864,9 @@ fn dns_pass(
     for (i, raw) in raws.iter().enumerate() {
         let d = decoded.get(i).and_then(Option::as_ref);
         if raw.flags & dns_flags::NSS != 0 {
-            outbox.extend(nss_events(raw, d, lineage, dns_cache));
+            outbox.extend(nss_events(raw, d, lineage, dns_cache, resolved));
         } else {
-            let (event, flood) = dns_events(raw, d, lineage, dns_cache);
+            let (event, flood) = dns_events(raw, d, lineage, dns_cache, resolved);
             outbox.push_back(event);
             outbox.extend(flood);
         }
@@ -1910,6 +2010,7 @@ mod tests {
             flow_tracker: Arc::new(Mutex::new(FlowTracker::default())),
             lineage,
             dns_cache: Arc::new(DnsCache::default()),
+            resolved: Arc::new(crate::net::resolved::ResolvedTable::default()),
         }
     }
 
@@ -2122,7 +2223,7 @@ mod tests {
         raw.pid = 4242;
         raw.held = 3;
         raw.timestamp_ns = 5_000_000_000;
-        let (event, flood) = dns_events(&raw, None, &lineage, None);
+        let (event, flood) = dns_events(&raw, None, &lineage, None, None);
         assert!(
             matches!(event, Event::DnsQuery { exe: None, .. }),
             "{event:?}"
@@ -2137,14 +2238,14 @@ mod tests {
         ));
         // the process that holds the pid started before the query: its own
         stat(1);
-        let (event, _) = dns_events(&raw, None, &lineage, None);
+        let (event, _) = dns_events(&raw, None, &lineage, None, None);
         let Event::DnsQuery { exe, .. } = event else {
             panic!()
         };
         assert_eq!(exe.as_deref(), Some("/usr/sbin/dnsmasq"));
         // gone
         std::fs::remove_dir_all(&dir).unwrap();
-        let (event, _) = dns_events(&raw, None, &lineage, None);
+        let (event, _) = dns_events(&raw, None, &lineage, None, None);
         assert!(matches!(event, Event::DnsQuery { exe: None, .. }));
     }
 
@@ -2163,7 +2264,7 @@ mod tests {
         let name = b"\x03bar\x13northnarrow-e2etest\x07invalid\x00";
         raw.query_name[..name.len()].copy_from_slice(name);
         raw.qname_len = name.len() as u16;
-        let (event, _) = dns_events(&raw, None, &lineage, Some(&cache));
+        let (event, _) = dns_events(&raw, None, &lineage, Some(&cache), None);
         assert!(
             matches!(&event, Event::DnsQuery { query_name, qname_partial: true, .. } if query_name.is_empty()),
             "{event:?}"
@@ -2178,7 +2279,7 @@ mod tests {
         };
         let d = v.remove(0);
         assert_eq!(d.name, "bar.northnarrow-e2etest.invalid");
-        let _ = dns_events(&raw, Some(&d), &lineage, Some(&cache));
+        let _ = dns_events(&raw, Some(&d), &lineage, Some(&cache), None);
         assert_eq!(
             cache.lookup_for_connect(4800, 8_000, 0).as_deref(),
             Some("bar.northnarrow-e2etest.invalid")
@@ -2210,9 +2311,9 @@ mod tests {
             }
         };
         // without a decode nothing feeds the cache
-        assert!(nss_events(&raw, None, &lineage, Some(&cache)).is_none());
+        assert!(nss_events(&raw, None, &lineage, Some(&cache), None).is_none());
         assert_eq!(cache.lookup_for_connect(4700, 8_000, 0), None);
-        assert!(nss_events(&raw, Some(&decoded(&raw)), &lineage, Some(&cache)).is_none());
+        assert!(nss_events(&raw, Some(&decoded(&raw)), &lineage, Some(&cache), None).is_none());
         assert_eq!(
             cache.lookup_for_connect(4700, 8_000, 0).as_deref(),
             Some("foo.northnarrow-e2etest.invalid")
@@ -2225,7 +2326,7 @@ mod tests {
         raw.held = 5;
         raw.flags |= dns_flags::RATE_HELD;
         assert!(matches!(
-            nss_events(&raw, None, &lineage, Some(&cache)),
+            nss_events(&raw, None, &lineage, Some(&cache), None),
             Some(Event::DnsFlood {
                 pid: 4700,
                 held: 5,
@@ -2236,7 +2337,7 @@ mod tests {
         let mut empty = DnsQueryRaw::zeroed();
         empty.pid = 4701;
         empty.flags = dns_flags::NSS;
-        assert!(nss_events(&empty, Some(&decoded(&empty)), &lineage, Some(&cache)).is_none());
+        assert!(nss_events(&empty, Some(&decoded(&empty)), &lineage, Some(&cache), None).is_none());
         assert_eq!(cache.lookup_for_connect(4701, 8_000, 0), None);
     }
 

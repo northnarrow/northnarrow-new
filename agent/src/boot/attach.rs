@@ -95,10 +95,16 @@ pub(crate) async fn load(
     // spawned further down.
     let flow_tracker = Arc::new(parking_lot::Mutex::new(FlowTracker::default()));
     let dns_cache = Arc::new(DnsCache::default());
+    // Lot 275 (C07, NN-L-NET-028): which process resolved which address,
+    // and how far the TLS ClientHello pump has read its ring.
+    let resolved = Arc::new(northnarrow_agent::net::resolved::ResolvedTable::default());
+    let tls_ingest = Arc::new(northnarrow_agent::net::dns_ingest::DnsIngest::default());
     let net_wiring = northnarrow_agent::sensors::multiplexer::NetWiring {
         flow_tracker: Arc::clone(&flow_tracker),
         dns_cache: Arc::clone(&dns_cache),
         lineage: lineage.clone(),
+        resolved: Arc::clone(&resolved),
+        tls_ingest: Arc::clone(&tls_ingest),
     };
     // R11c (lab PR 264): what the load is told — it was set in process-wide
     // switches before the multiplexer started.
