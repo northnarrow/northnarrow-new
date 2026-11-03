@@ -1040,7 +1040,11 @@ fn nn_lab_ci_mode_builds_locked_and_frames_the_gate() {
     assert!(runner.contains("log \"test-ignored run $1 end: $2: exit $rc\""));
     let wait = &text[text.find("wait_ssh() {").unwrap()..];
     let wait = &wait[..wait.find("\n}\n").unwrap()];
-    assert!(wait.contains("lab_serial_tail\n    die \"guest did not become reachable"));
+    // Lab PR 274: the error names the state the guest was last seen in
+    // (xtask/tests/lab_host_safety.rs runs it), after the console.
+    assert!(wait.contains(
+        "lab_serial_tail\n    die \"$(guest_boot_msg \"$boot\" \"${1:-600}\"); see $SERIAL\""
+    ));
 }
 
 /// The download self-test (deploy/lab/lib/verify-download-test.sh), which

@@ -617,8 +617,63 @@ vcargo() {
     vssh "bash -c $(printf '%q' "$inner")"
 }
 
+# >>> guest-boot (xtask/tests/lab_host_safety.rs runs this block)
+# Is the guest past its provisioning boot (lab PR 274)? The templates' last
+# runcmd writes that boot's id into the lab marker, then cloud-init's
+# power_state reboots the guest so that the lsm= line applies. `up` took
+# "the marker is there and the LSM list names bpf" for "past the reboot",
+# but the Debian 12 and 13 kernels list bpf on their first boot already:
+# in the seconds between the marker and the reboot a Debian guest was "up
+# and provisioned", and the reboot cut the next step's connection (`sync`:
+# "Connection reset by peer", `build`: "closed by remote host"). That was
+# every red Debian guest of the nightly from 23/10 to 02/11. The boot id
+# tells the two boots apart on every distro. One connection gathers the
+# facts and they are judged here:
+#   0  ready: provisioned on an earlier boot, bpf among the active LSMs,
+#      and the lockdown mode of a lockdown guest;
+#   1  not yet: no answer, or no marker (cloud-init still provisioning);
+#   3  still on the provisioning boot (cloud-init's reboot to come);
+#   4  rebooted, but bpf is not among the active LSMs;
+#   5  rebooted, but not in lockdown mode $LOCKDOWN.
+# A marker without a boot id comes from a template before lab PR 274
+# (`touch`): runcmd runs once per instance, so that guest rebooted long ago.
+LAB_MARKER=/var/lib/nn-lab-provisioned
+GUEST_BOOT_FACTS="echo \"boot=\$(cat /proc/sys/kernel/random/boot_id)\";
+if [ -e $LAB_MARKER ]; then echo \"provisioned=\$(cat $LAB_MARKER)\"; fi;
+echo \"lsm=\$(cat /sys/kernel/security/lsm 2>/dev/null)\";
+echo \"lockdown=\$(cat /sys/kernel/security/lockdown 2>/dev/null)\""
+guest_boot_state() {
+    local facts line boot="" prov="" has_prov=0 lsm="" lockdown=""
+    facts=$(vssh "$GUEST_BOOT_FACTS" 2>/dev/null </dev/null) || return 1
+    while IFS= read -r line; do
+        case $line in
+            boot=*) boot=${line#boot=} ;;
+            provisioned=*) prov=${line#provisioned=}; has_prov=1 ;;
+            lsm=*) lsm=${line#lsm=} ;;
+            lockdown=*) lockdown=${line#lockdown=} ;;
+        esac
+    done <<<"$facts"
+    if ((!has_prov)) || [[ -z $boot ]]; then return 1; fi
+    if [[ $prov == "$boot" ]]; then return 3; fi
+    if [[ ,$lsm, != *,bpf,* ]]; then return 4; fi
+    if [[ -n ${LOCKDOWN:-} && $lockdown != *"[$LOCKDOWN]"* ]]; then return 5; fi
+    return 0
+}
+guest_boot_msg() {   # <state of guest_boot_state> <seconds waited>
+    case $1 in
+        3) printf '%s' "guest $GUEST_NAME was provisioned but is still on its provisioning boot after $2s:" \
+               " cloud-init's power_state reboot did not happen (the lsm= line applies only after it)" ;;
+        4) printf '%s' "guest $GUEST_NAME rebooted after its provisioning, but bpf is not among its active LSMs" \
+               " (/sys/kernel/security/lsm) after $2s: the template's lsm= line did not apply" ;;
+        5) printf '%s' "guest $GUEST_NAME rebooted after its provisioning, but is not in lockdown mode $LOCKDOWN" \
+               " (/sys/kernel/security/lockdown) after $2s" ;;
+        *) printf '%s' "guest did not become reachable within $2s, or cloud-init did not finish provisioning it" ;;
+    esac
+}
+# <<< guest-boot
+
 wait_ssh() {
-    local deadline=$(( $(date +%s) + ${1:-600} )) said_key=0 said_port=0
+    local deadline=$(( $(date +%s) + ${1:-600} )) said_key=0 said_port=0 said_boot=0 boot=1
     log "waiting for ssh on 127.0.0.1:$SSH_PORT (up to ${1:-600}s; first boot reboots once)…"
     while (( $(date +%s) < deadline )); do
         if [[ $ACCEL == whpx ]] && ! whpx_qemu_running; then
@@ -638,14 +693,19 @@ wait_ssh() {
             if ((rec != 0)); then sleep 5; continue; fi
         fi
         local probe=0
+        boot=1
         guest_probe || probe=$?
         if ((probe == 0)); then
-            # Provisioning done AND we are past the reboot (lsm=bpf active;
-            # on a lockdown guest, the lockdown too: Debian's first boot
-            # already lists bpf)?
-            if vssh "test -f /var/lib/nn-lab-provisioned && grep -q bpf /sys/kernel/security/lsm${LOCKDOWN:+ && grep -q '\\[$LOCKDOWN\\]' /sys/kernel/security/lockdown}" 2>/dev/null </dev/null; then
-                log "guest is up and provisioned"
+            # Provisioning done AND past its reboot (guest_boot_state)?
+            boot=0
+            guest_boot_state || boot=$?
+            if ((boot == 0)); then
+                log "guest is up and provisioned (booted again after its provisioning boot)"
                 return 0
+            fi
+            if ((boot == 3 && !said_boot)); then
+                log "guest provisioned, still on its provisioning boot: waiting for cloud-init's reboot"
+                said_boot=1
             fi
         elif ((probe == 2 && !said_key)); then
             log "$(host_key_mismatch_msg) Still waiting."
@@ -655,7 +715,7 @@ wait_ssh() {
     done
     if ((said_key)); then die "$(host_key_mismatch_msg)"; fi
     lab_serial_tail
-    die "guest did not become reachable within ${1:-600}s; see $SERIAL"
+    die "$(guest_boot_msg "$boot" "${1:-600}"); see $SERIAL"
 }
 
 # CI mode (lab PR 227): the guest's console is the only view of a boot that
