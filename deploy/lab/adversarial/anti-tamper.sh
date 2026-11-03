@@ -2100,11 +2100,18 @@ if [[ -z "$ONLY" || ",$ONLY," == *",C76,"* ]]; then
             NEW=""
         done
         sleep 15; ev=$(evidence "$t0" "$a0" "$d0")
-        if (( rc1 == 0 && rc2 == 0 && rc3 == 0 && rc4 == 0 )) && [[ "$moved" == /nn-lab-c76 && "$back" == "$AG_CG" && -n "$NEW" ]] \
+        # systemd up to 256 kills the unit's processes one by one and reports
+        # the first that failed (the parse worker, gone with the agent:
+        # "Invalid argument" on 255): the kill counts by its effect — the
+        # agent replaced — unless it was refused
+        k_ok=0
+        (( rc4 == 0 )) && k_ok=1
+        if (( rc4 != 0 )) && [[ -n "$NEW" ]] && ! grep -qE 'Access denied|Operation not permitted|Permission denied' <<<"$out4"; then k_ok=1; fi
+        if (( rc1 == 0 && rc2 == 0 && rc3 == 0 && k_ok )) && [[ "$moved" == /nn-lab-c76 && "$back" == "$AG_CG" && -n "$NEW" ]] \
            && echo "$ev" | grep -q prev_run_abrupt && ! echo "$ev" | grep -qE "deny=cgroup_"; then
-            v="OK"; st="allowed (agent $PID → $NEW)"
+            v="OK"; st="allowed (agent $PID → $NEW$( (( rc4 )) && echo "; systemctl kill rc=$rc4: $(echo "$out4" | head -1 | cut -c1-50 | tr '|' '/')"))"
         else
-            v="DEVIATION (inside the window: freeze rc=$rc1, move rc=$rc2 to ${moved:-?}, back rc=$rc3 ${back:-?}, kill rc=$rc4 $(echo "$out$out2$out4" | head -1 | cut -c1-60), new agent ${NEW:-none})"; fail=1; st="denied or not done"
+            v="DEVIATION (inside the window: freeze rc=$rc1, move rc=$rc2 to ${moved:-?}, back rc=$rc3 ${back:-?}, kill rc=$rc4 $(echo "$out4" | head -1 | cut -c1-60), new agent ${NEW:-none})"; fail=1; st="denied or not done"
         fi
         rows+=("| C76 | freeze, move out and back, systemctl kill -s SIGKILL the agent inside a trusted-installer window | $st | $ev | $v |")
         echo "C76 freeze, move, systemctl kill inside a window → $st; $ev; $v" >&2
