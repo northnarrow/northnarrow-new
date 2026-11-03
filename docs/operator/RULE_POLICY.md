@@ -2,8 +2,10 @@
 
 Every detection rule has a built-in response: a record (`Log`), a kill of the
 process or of its tree, a capability stripped from a file. Some kills added by
-lab PRs 219–226 are **held** by default (recorded as an alert, the process left
-running) until an operator turns them on. The per-rule response policy is
+lab PRs 219–226 and lot 275 (NN-L-NET-028's, and NN-L-NET-003's now that its
+TLS fingerprints are produced — `NETWORK_TELEMETRY.md`) are **held** by
+default (recorded as an alert, the process left running) until an operator
+turns them on. The per-rule response policy is
 where you do that, rule by rule, and where you tone a noisy rule down or
 exempt one known program from it. Design:
 https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/MULTI_MATCH_AND_RULE_POLICY.md
