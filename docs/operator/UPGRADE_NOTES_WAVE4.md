@@ -190,12 +190,17 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
   session: fixed). Now: below COMBAT the match is a High record, `held`
   naming the kill and the posture (R001 and R003 likewise on an exec by
   root); in COMBAT, or under `enforce R009`, the tree is killed as before. A
-  trusted-installer grant is made to the installer that asked for it (the
-  process that ran `nn-admin trusted-installer-grant`, by its pid and its
-  start; the agent's journal line `trusted-installer override ARMED` names
-  `granted_to_pid`), and R009 records at Low what that process's tree
-  executes after the grant while the window is open, naming the installer
-  (`INSTALL_UPGRADE_UNINSTALL.md` §2.1). `install.sh --upgrade` opens its
+  trusted-installer grant asked for an installer (`nn-admin
+  trusted-installer-grant --for-installer`, or `NN_GRANT_FOR_INSTALLER=1`,
+  which the scripts pass; a new admin request, which an older agent cannot
+  read — nn-admin then asks for the plain grant) is made to that installer
+  (the process that ran `nn-admin`, by its pid and its start; the agent's
+  journal line `trusted-installer override ARMED` names `granted_to_pid`,
+  the audit row `for_installer` and `installer_pid`), and R009 records at
+  Low what that process's tree executes after the grant while the window is
+  open, naming the installer (`INSTALL_UPGRADE_UNINSTALL.md` §2.1). The
+  tool rules' kills of a root exec from `/tmp` or a home (R011–R013,
+  R017) are unchanged. The decision is recorded in `RULE_POLICY.md` §1. `install.sh --upgrade` opens its
   window before it executes anything from its tree; a refused run executes
   nothing from it.
 

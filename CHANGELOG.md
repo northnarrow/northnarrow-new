@@ -663,6 +663,31 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   kills of the same processes run as before; the nn-admin matrix shows the
   same five records and nothing else. `docs/operator/RULE_POLICY.md` §1,
   `INSTALL_UPGRADE_UNINSTALL.md` §2.1, `UPGRADE_NOTES_WAVE4.md`.
+  The review of #493:
+  - B1: the fork's upper bound lent an interpreter's fork the script its
+    parent executed after forking it (a user's `python3 evil.py` fork
+    passed for borg or dnf). The parent is read at the fork's earliest
+    time; at its tick only when that is "only later" and the parent took
+    one identity in the tick.
+  - A1: the posture hold, counted as R009's own record, held through the
+    legacy ceiling the kills R011, R012, R013 and R017 had on a root exec
+    from `/tmp` or a home. It now counts as a switch's: those kills run in
+    every posture, as before.
+  - The decision of 03/11/2026 is recorded (RULE_POLICY §1): R009 and
+    R001/R003 on root's exec in COMBAT only, a change of the decision of
+    21/10 and POS-015 for these three cases; the way back is `enforce
+    R009`; what is left is a root dropper from `/tmp` below COMBAT, recorded
+    High and not killed.
+  - The window names an installer only when asked for one: `nn-admin
+    trusted-installer-grant --for-installer` (or `NN_GRANT_FOR_INSTALLER=1`,
+    which the scripts pass) sends a new request
+    (`TrustedInstallerGrantForInstallerRequest`), whose audit row says
+    `for_installer` and the installer's pid; a plain grant names none. An
+    older agent closes the connection and nn-admin asks for the plain grant.
+  - The installer is the process with the exact start `/proc` shows for it
+    now: no allowance for the time suspended.
+  - The posture is read once per decision. The static scan of `install.sh`
+    sees every spelling of the tree's binaries.
 - **Security (lot 273c, C23): another process's change of the agent's
   limits and priorities refused, PID 1's memory closed to attach-mode
   access, resource values below a floor never registered, systemd's copy
