@@ -12,17 +12,16 @@
 //! every [`UNPARSED_LOG_EVERY`] in the journal; the worker's failures are
 //! the supervisor's signed degradations.
 //!
-//! The TLS ClientHello and the DNS answers have no producer in this build
-//! (no sensor captures them: `nn_core::net::blocklist::TLS_FINGERPRINT_PRODUCER`);
-//! [`ParseClient::client_hello`] and [`ParseClient::dns_answers`] are the one
-//! way a future one reaches their parsers.
+//! Lot 275: the TLS ClientHello sensor's pump fingerprints each hello through
+//! [`ParseClient::client_hello`], the DNS response sensor's pump decodes each
+//! response through [`ParseClient::dns_answers`] — the one way their bytes
+//! reach a parser.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 use nn_proto::ipc::{
-    worst_answer, Answer, QnameIn, QnameOut, Request, TlsOut, WorkerKind, FRAME_MARGIN, MAX_BATCH,
-    MAX_FRAME,
+    worst_answer, Answer, DnsAnswersOut, QnameIn, QnameOut, Request, TlsOut, WorkerKind,
+    FRAME_MARGIN, MAX_BATCH, MAX_FRAME,
 };
 use tracing::warn;
 
@@ -154,19 +153,17 @@ impl ParseClient {
         }
     }
 
-    /// A DNS response's A and AAAA answers (`None`: the worker did not
-    /// answer).
-    pub fn dns_answers(&self, bytes: &[u8]) -> Option<(Vec<Ipv4Addr>, Vec<Ipv6Addr>)> {
+    /// Lot 275: a DNS response's question and A, AAAA and CNAME records
+    /// (`None`: the worker did not answer; `Some(None)`: the bytes are no
+    /// DNS response).
+    pub fn dns_answers(&self, bytes: &[u8]) -> Option<Option<DnsAnswersOut>> {
         let w = self.workers.as_ref()?;
         match w.request(
             WorkerKind::Parse,
             &Request::DnsAnswers(bytes.to_vec()),
             ONE_TIMEOUT,
         ) {
-            Ok(Answer::DnsAnswers { a, aaaa }) => Some((
-                a.into_iter().map(Ipv4Addr::from).collect(),
-                aaaa.into_iter().map(Ipv6Addr::from).collect(),
-            )),
+            Ok(Answer::DnsAnswers(out)) => Some(out),
             _ => None,
         }
     }

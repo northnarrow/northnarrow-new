@@ -167,19 +167,42 @@ pub(crate) fn answer(req: &Request) -> Answer {
         Request::Ping => Answer::Pong,
         Request::DnsNames(names) => Answer::DnsNames(names.iter().map(qname).collect()),
         Request::TlsClientHello(bytes) => Answer::Tls(tls(bytes)),
-        Request::DnsAnswers(bytes) => Answer::DnsAnswers {
-            a: nn_parse::dns_records::parse_a_records(bytes)
-                .into_iter()
-                .map(|ip| ip.octets())
-                .collect(),
-            aaaa: nn_parse::dns_records::parse_aaaa_records(bytes)
-                .into_iter()
-                .map(|ip| ip.octets())
-                .collect(),
-        },
+        Request::DnsAnswers(bytes) => Answer::DnsAnswers(dns_answers(bytes)),
         Request::DebugCrash => debug_crash(),
         Request::DebugHang => debug_hang(),
     }
+}
+
+/// Lot 275: a DNS response's question and records, as the protocol carries
+/// them (nn-parse keeps at most `MAX_DNS_RECORDS`, and its names are the
+/// protocol's alphabet).
+fn dns_answers(bytes: &[u8]) -> Option<nn_proto::ipc::DnsAnswersOut> {
+    use nn_parse::dns_response::{parse_response, AnswerRecord};
+    use nn_proto::ipc::{DnsAnswersOut, DnsRecordOut};
+    let r = parse_response(bytes)?;
+    Some(DnsAnswersOut {
+        qname: r.qname,
+        qtype: r.qtype,
+        rcode: r.rcode,
+        records: r
+            .answers
+            .into_iter()
+            .map(|a| match a {
+                AnswerRecord::A { name, ttl, addr } => DnsRecordOut::A {
+                    name,
+                    ttl,
+                    addr: addr.octets(),
+                },
+                AnswerRecord::Aaaa { name, ttl, addr } => DnsRecordOut::Aaaa {
+                    name,
+                    ttl,
+                    addr: addr.octets(),
+                },
+                AnswerRecord::Cname { name, ttl, target } => DnsRecordOut::Cname { name, ttl, target },
+            })
+            .collect(),
+        complete: r.complete,
+    })
 }
 
 fn qname(q: &QnameIn) -> QnameOut {

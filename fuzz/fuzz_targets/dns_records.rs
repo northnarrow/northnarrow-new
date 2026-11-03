@@ -9,9 +9,13 @@
 //!   on `.` gives every label byte for byte, so distinct names on the
 //!   wire never decode alike (NN-AUD-185);
 //! - `qname_wire_end` reports an end inside the buffer, just past a root
-//!   label (the Kani property, on buffers longer than the proof's).
+//!   label (the Kani property, on buffers longer than the proof's);
+//! - lot 275, `parse_response`: at most `MAX_RECORDS` records, each at
+//!   least its least wire size inside the message, every name printable
+//!   ASCII of at most 1,020 bytes.
 use libfuzzer_sys::fuzz_target;
 use nn_parse::dns_records::{parse_a_records, parse_aaaa_records};
+use nn_parse::dns_response::{parse_response, AnswerRecord, MAX_RECORDS};
 use nn_parse::dns_qname::{QnameLabel, QnameLabels, decode_dns_qname, qname_wire_end};
 
 /// The labels a decoded name spells, `\DDD` turned back into bytes.
@@ -75,5 +79,27 @@ fuzz_target!(|data: &[u8]| {
     if let Some(end) = qname_wire_end(data) {
         assert!(end >= 1 && end <= data.len());
         assert_eq!(data[end - 1], 0);
+    }
+
+    if let Some(r) = parse_response(data) {
+        assert!(r.answers.len() <= MAX_RECORDS);
+        let least: usize = r
+            .answers
+            .iter()
+            .map(|a| match a {
+                AnswerRecord::A { .. } => 12 + 4,
+                AnswerRecord::Aaaa { .. } => 12 + 16,
+                AnswerRecord::Cname { .. } => 12 + 2,
+            })
+            .sum();
+        assert!(12 + 5 + least <= data.len());
+        let ok = |n: &str| n.len() <= 1020 && n.bytes().all(|b| (0x20..=0x7e).contains(&b));
+        assert!(ok(&r.qname), "{r:?}");
+        for a in &r.answers {
+            assert!(ok(a.name()), "{a:?}");
+            if let AnswerRecord::Cname { target, .. } = a {
+                assert!(ok(target), "{a:?}");
+            }
+        }
     }
 });

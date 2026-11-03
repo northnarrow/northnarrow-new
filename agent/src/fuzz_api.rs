@@ -514,11 +514,19 @@ mod tests {
             (
                 "dns-answers.bin",
                 packet(
-                    3 | (2 << 2),
-                    &answer(Answer::DnsAnswers {
-                        a: vec![[192, 0, 2, 1]],
-                        aaaa: vec![],
-                    }),
+                    // lot 275: 64 bytes, room for the question and the record
+                    3 | (4 << 2),
+                    &answer(Answer::DnsAnswers(Some(nn_proto::ipc::DnsAnswersOut {
+                        qname: "example.com".into(),
+                        qtype: 1,
+                        rcode: 0,
+                        records: vec![nn_proto::ipc::DnsRecordOut::A {
+                            name: "example.com".into(),
+                            ttl: 60,
+                            addr: [192, 0, 2, 1],
+                        }],
+                        complete: true,
+                    }))),
                 ),
             ),
         ];
