@@ -68,6 +68,10 @@ pub mod atomic_file;
 #[cfg(target_os = "linux")]
 pub mod sd_notify;
 
+/// Lot 273: the protected units' cgroups as `PROTECTED_INODES` entries,
+/// for the agent and the watchdog.
+pub mod cgroup_guard;
+
 use std::borrow::{Borrow, BorrowMut};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -78,7 +82,7 @@ use aya::{
     maps::{Array as AyaArray, HashMap as AyaHashMap, Map as AyaMap, MapData},
     programs::{
         links::{FdLink, PinnedLink},
-        Lsm,
+        FExit, Lsm,
     },
     Btf, Ebpf,
 };
@@ -452,6 +456,62 @@ pub fn reattach_fresh(
     })?;
     info!(
         hook = hook_name,
+        "anti-tamper: deny hook re-attached FRESH (attach-before-purge, zero-window) + re-pinned"
+    );
+    Ok(())
+}
+
+/// Lot 273: [`reattach_fresh`] for an `fexit` program of the deny set (the
+/// cgroup move guard's lookup half, on kernel function `function`), under
+/// the same zero-window contract — attach the fresh program, then purge
+/// the prior boot's pins (`prog_<function>`, `link_<function>`), then pin
+/// this boot's. `pin_root == None`: attached for this boot only.
+pub fn reattach_fresh_fexit(
+    ebpf: &mut Ebpf,
+    program_name: &str,
+    function: &str,
+    btf: &Btf,
+    pin_root: Option<&Path>,
+) -> Result<()> {
+    let prog: &mut FExit = ebpf
+        .program_mut(program_name)
+        .ok_or_else(|| anyhow!("program {program_name} missing from eBPF object"))?
+        .try_into()
+        .with_context(|| format!("program {program_name} is not an fexit program"))?;
+    prog.load(function, btf)
+        .with_context(|| format!("verifier rejected fexit program `{program_name}`"))?;
+    let link_id = prog.attach().with_context(|| {
+        format!("attaching fresh fexit program `{program_name}` to `{function}`")
+    })?;
+    let Some(root) = pin_root else {
+        warn!(
+            hook = function,
+            "anti-tamper: deny hook attached WITHOUT pin (no bpffs) — no \
+             cross-restart persistence"
+        );
+        return Ok(());
+    };
+    let (prog_path, link_path) = lsm_pin_paths(root, function);
+    purge_stale_pin(&link_path);
+    purge_stale_pin(&prog_path);
+    prog.pin(&prog_path).with_context(|| {
+        format!(
+            "pinning fresh fexit program `{program_name}` to {}",
+            prog_path.display()
+        )
+    })?;
+    let link = prog
+        .take_link(link_id)
+        .with_context(|| format!("taking ownership of fresh `{function}` fexit link"))?;
+    let fd_link: FdLink = link.into();
+    let _pinned: PinnedLink = fd_link.pin(&link_path).with_context(|| {
+        format!(
+            "pinning fresh fexit link `{function}` to {}",
+            link_path.display()
+        )
+    })?;
+    info!(
+        hook = function,
         "anti-tamper: deny hook re-attached FRESH (attach-before-purge, zero-window) + re-pinned"
     );
     Ok(())

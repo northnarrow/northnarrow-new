@@ -83,7 +83,8 @@ const DENY_HOOK_LIST: &str = "LSM task_kill, ptrace_access_check, inode_unlink, 
      inode_rename, inode_setattr, file_ioctl, file_open, inode_create, inode_mkdir, inode_mknod, \
      inode_symlink, inode_link, inode_setxattr, inode_removexattr, bpf_map; inode_set_acl, \
      inode_remove_acl, file_ioctl_compat where the kernel has them; bpf (the agent's links); \
-     kernel_read_file and kernel_load_data (kexec)";
+     kernel_read_file and kernel_load_data (kexec); the cgroup move guard, inode_permission and \
+     fexit cgroup_procs_write_start, where the kernel has the function in the shape it reads";
 
 /// Every source of the bus on Linux (a table of the build: a `const`, no
 /// process state).
@@ -322,9 +323,9 @@ pub const SOURCES: [SourceContract; 13] = [
              (signed) unless NN_ANTI_TAMPER_ALLOW_DEGRADED=1: then L1 or L0, signed; the deny \
              never depends on the record",
         kernel_budgets: &[KernelBudget {
-            allows: "a refused signal, ptrace or kexec: one record per caller and operation a \
-                     second, 50 a second per CPU (every one is refused); inode denials have no \
-                     kernel budget",
+            allows: "a refused signal, ptrace, kexec or cgroup move: one record per caller and \
+                     operation a second, 50 a second per CPU (every one is refused); inode \
+                     denials have no kernel budget",
             counter: "task_denial_rate",
         }],
         truncations: &[COMM],

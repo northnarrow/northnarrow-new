@@ -20,6 +20,12 @@
 //! | `inode_create`, `inode_mkdir`, `inode_mknod`, `inode_symlink`, `inode_link` | a new entry in a NOCREATE directory |
 //! | `inode_setxattr`, `inode_removexattr` (`inode_set_acl`, `inode_remove_acl` on 6.2+) | an extended attribute or ACL changed on a protected inode |
 //!
+//! Lot 273: the protected units' cgroups are registered here too — the
+//! unit directory (no `rmdir` but PID 1's, no new child, no `chown`), its
+//! `cgroup.kill` / `cgroup.freeze` (and the ancestor slices') against a
+//! write-open, signed as `cgroup_kill` / `cgroup_freeze`. A protected
+//! process moved to another cgroup is `cgroup_guard.rs`'s.
+//!
 //! Note: `chattr` does NOT go through `inode_setattr` — flag changes
 //! travel down the `ioctl(FS_IOC_SETFLAGS)` path, bypassing
 //! `notify_change()`. The `file_ioctl` hook is the only correct
@@ -51,7 +57,8 @@ use aya_ebpf::{
 
 use northnarrow_common::fail_open::hook;
 use northnarrow_common::wire::{
-    fs_protect_required, FsGrant, FsProtectDenialRaw, InodeKey, FS_OP_CREATE, FS_OP_IOCTL,
+    fs_protect_denied_op, fs_protect_init_may, fs_protect_required, FsGrant, FsProtectDenialRaw,
+    InodeKey, FS_OP_CREATE, FS_OP_IOCTL,
     FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
     FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR, READ_PROTECTED_SLOTS,
 };
@@ -389,7 +396,15 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void, hook: u32) -> 
     if crate::task_kill::is_exempt_pid(caller_tgid) {
         return false;
     }
-    emit_denial(operation, key);
+    // Lot 273: PID 1 removes a protected unit's cgroup directory once its
+    // processes are gone (the kernel refuses a populated one), and
+    // systemd-shutdown trims the tree; nothing else is let through here.
+    if fs_protect_init_may(operation, flags, caller_tgid) {
+        return false;
+    }
+    // Lot 273: a refused write-open of a protected `cgroup.kill` or
+    // `cgroup.freeze` is signed by what it would have done.
+    emit_denial(fs_protect_denied_op(operation, flags), key);
     true
 }
 

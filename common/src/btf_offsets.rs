@@ -2004,7 +2004,43 @@ pub const HOOK_ARG_CHECKS: &[HookArgCheck] = &[
     // Lab PR 226: `(file, reqprot, prot, flags)`; the program reads the
     // file and `reqprot` (5.15 to 6.18).
     check("bpf_lsm_mmap_file", 0, "file"),
+    // Lot 273 (`cgroup_guard.rs`): `(inode, mask)`; the program reads the
+    // mask after the inode.
+    check("bpf_lsm_inode_permission", 0, "inode"),
 ];
+
+/// Lot 273: a kernel function an anti-tamper `fexit` program reads the
+/// return value of. The return value sits in the context right after the
+/// parameters, so its slot is the parameter count: the agent attaches the
+/// program only where the running kernel's BTF gives the function exactly
+/// `params` parameters and a pointer to `ret_pointee` back (a prototype of
+/// another shape is not guessed at; the guard is then not attached and its
+/// absence is signed).
+#[derive(Debug, Clone, Copy)]
+pub struct FexitTarget {
+    /// The traced kernel function (a BTF `FUNC`).
+    pub func: &'static str,
+    /// Its parameter count, which is also the return value's slot.
+    pub params: u32,
+    /// The struct the returned pointer points to.
+    pub ret_pointee: &'static str,
+}
+
+/// Lot 273: `struct task_struct *cgroup_procs_write_start(char *buf, bool
+/// threadgroup, <lock state> *)` — three parameters from 5.14 (the lock
+/// state became an `enum cgroup_attach_lock_mode *` on recent kernels, the
+/// same slot), the task a `cgroup.procs` / `cgroup.threads` write moves.
+pub const CGROUP_MOVE_TARGET: FexitTarget = FexitTarget {
+    func: "cgroup_procs_write_start",
+    params: 3,
+    ret_pointee: "task_struct",
+};
+
+/// The context slot of [`CGROUP_MOVE_TARGET`]'s return value.
+pub const CGROUP_MOVE_RET_ARG: usize = CGROUP_MOVE_TARGET.params as usize;
+
+/// Every [`FexitTarget`] the agent checks.
+pub const FEXIT_TARGETS: &[FexitTarget] = &[CGROUP_MOVE_TARGET];
 
 /// Slot 0 value once the agent has written every resolved offset.
 pub const BTF_OFFSETS_MAGIC: u32 = 0xB7F0_0FF5;
@@ -2140,6 +2176,20 @@ mod tests {
                 c.func
             );
         }
-        assert_eq!(HOOK_ARG_CHECKS.len(), 32);
+        assert_eq!(HOOK_ARG_CHECKS.len(), 33);
+    }
+
+    /// Lot 273: the cgroup move guard reads the return value at the slot
+    /// after the parameters, inside the context the programs may read.
+    #[test]
+    fn the_move_guard_reads_the_return_slot() {
+        assert_eq!(CGROUP_MOVE_TARGET.func, "cgroup_procs_write_start");
+        assert_eq!(CGROUP_MOVE_RET_ARG, 3);
+        assert_eq!(CGROUP_MOVE_RET_ARG, CGROUP_MOVE_TARGET.params as usize);
+        assert!((CGROUP_MOVE_RET_ARG as u32) < HOOK_ARG_MAX);
+        assert_eq!(FEXIT_TARGETS.len(), 1);
+        assert!(FEXIT_TARGETS
+            .iter()
+            .all(|t| !t.func.starts_with("bpf_lsm_")));
     }
 }

@@ -58,6 +58,31 @@ pub(crate) fn bootstrap(
             true
         }
     };
+    // Lot 273: the unit cgroup systemd made for this start, in the pinned
+    // PROTECTED_INODES too, so the previous agent's pinned hooks refuse its
+    // cgroup.kill / cgroup.freeze from now on — not only once this boot's
+    // attach registers it again (with the keys this boot keeps).
+    if !early_registration_failed {
+        match northnarrow_agent::anti_tamper::cgroup_guard::preregister_own_cgroup(
+            std::path::Path::new(northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT),
+        ) {
+            Ok(Some(northnarrow_agent::anti_tamper::cgroup_guard::UnitCgroup::Service {
+                cgroup,
+                entries,
+            })) => info!(
+                cgroup = %nn_model::log_escape::Escaped(&cgroup),
+                entries = entries.len(),
+                "anti-tamper cgroup: own unit cgroup registered in the pinned PROTECTED_INODES \
+                 before the bootstraps"
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(
+                error = format!("{e:#}"),
+                "anti-tamper cgroup: early registration of the own unit cgroup failed — the \
+                 attach registers it"
+            ),
+        }
+    }
 
     if preflight_refused {
         warn!(

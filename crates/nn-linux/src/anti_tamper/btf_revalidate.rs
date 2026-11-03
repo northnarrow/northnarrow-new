@@ -38,9 +38,10 @@ use std::fs;
 use std::sync::OnceLock;
 
 use common::btf_offsets::{
-    EnumSpec, HookArgCheck, HookArgSpec, OffsetSpec, BTF_MODULE_STRUCTS, BTF_OFFSETS_ABSENT,
-    BTF_OFFSETS_MAGIC, ENUM_SLOT_TABLE, ENUM_VALUES, HOOK_ARGS, HOOK_ARG_CHECKS, HOOK_ARG_MAX,
-    HOOK_ARG_SLOT_TABLE, REVALIDATE, SLOT_TABLE,
+    EnumSpec, FexitTarget, HookArgCheck, HookArgSpec, OffsetSpec, BTF_MODULE_STRUCTS,
+    BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC, CGROUP_MOVE_TARGET, ENUM_SLOT_TABLE, ENUM_VALUES,
+    FEXIT_TARGETS, HOOK_ARGS, HOOK_ARG_CHECKS, HOOK_ARG_MAX, HOOK_ARG_SLOT_TABLE, REVALIDATE,
+    SLOT_TABLE,
 };
 
 /// The running kernel's BTF, exported by the kernel when built with
@@ -192,6 +193,16 @@ impl ResolvedOffsets {
     /// argument).
     pub fn setattr_dentry_arg(&self) -> Option<u32> {
         self.hook_arg_position("INODE_SETATTR_DENTRY_ARG")
+    }
+
+    /// Lot 273: why the cgroup move guard's fexit target is not in the
+    /// shape its program reads, when it is not (`None`: in that shape, or
+    /// absent from the kernel).
+    pub fn cgroup_move_target_mismatch(&self) -> Option<&str> {
+        self.absent
+            .iter()
+            .find(|m| m.name == CGROUP_MOVE_TARGET.func)
+            .map(|m| m.detail.as_str())
     }
 
     /// Lab PR 174: whether this kernel's BTF has the optional deny hook
@@ -574,9 +585,31 @@ fn resolve_with(
             }),
         }
     }
+    // Lot 273: the cgroup move guard's two programs come together, where
+    // the kernel's BTF has `cgroup_procs_write_start` in the shape the
+    // fexit reads; another shape is recorded and the guard left out.
+    let cgroup_move = match btf.fexit_target_shape(&CGROUP_MOVE_TARGET) {
+        Ok(present) => present,
+        Err(e) => {
+            absent.push(Mismatch {
+                name: CGROUP_MOVE_TARGET.func,
+                struct_name: CGROUP_MOVE_TARGET.func,
+                expected: CGROUP_MOVE_TARGET.params as usize,
+                actual: None,
+                detail: e.to_string(),
+            });
+            false
+        }
+    };
     let optional_deny_hooks = super::OPTIONAL_DENY_HOOKS
         .iter()
-        .map(|h| (*h, btf.has_lsm_hook(h)))
+        .map(|h| {
+            if super::cgroup_guard::GUARD_HOOKS.contains(h) {
+                (*h, cgroup_move)
+            } else {
+                (*h, btf.has_lsm_hook(h))
+            }
+        })
         .collect();
     if missing.is_empty() {
         ResolveOutcome::Resolved(ResolvedOffsets {
@@ -1096,8 +1129,9 @@ enum Ty {
     Ptr { type_id: u32 },
     /// A forward declaration of a struct or union, by name.
     Fwd { name_off: u32 },
-    /// A function prototype: the type of each parameter.
-    FuncProto { params: Vec<u32> },
+    /// A function prototype: the type of each parameter, and (lot 273)
+    /// the return type.
+    FuncProto { params: Vec<u32>, ret: u32 },
     /// An integer type, by name (`char`, for a hook's `const char *`).
     Int { name_off: u32 },
     /// Anything we don't navigate into (int, array, func, …).
@@ -1112,7 +1146,8 @@ struct Btf {
     strings: Vec<u8>,
     name_to_id: HashMap<String, u32>,
     /// Lab PR 164: `bpf_lsm_<hook>` → its FUNC_PROTO type id. Only the
-    /// LSM hook functions are kept (a vmlinux has tens of thousands).
+    /// LSM hook functions are kept (a vmlinux has tens of thousands), and
+    /// (lot 273) the [`FEXIT_TARGETS`] functions.
     lsm_funcs: HashMap<String, u32>,
 }
 
@@ -1244,7 +1279,9 @@ impl Btf {
                 KIND_FWD => types.push(Ty::Fwd { name_off }),
                 KIND_FUNC => {
                     if let Some(nm) = name_of(name_off) {
-                        if nm.starts_with(LSM_FUNC_PREFIX) {
+                        if nm.starts_with(LSM_FUNC_PREFIX)
+                            || FEXIT_TARGETS.iter().any(|t| t.func == nm)
+                        {
                             lsm_funcs.entry(nm).or_insert(size_or_type);
                         }
                     }
@@ -1294,7 +1331,10 @@ impl Btf {
                         params.push(r.u32(p + i * 8 + 4)?);
                     }
                     p += vlen * 8;
-                    types.push(Ty::FuncProto { params });
+                    types.push(Ty::FuncProto {
+                        params,
+                        ret: size_or_type,
+                    });
                 }
                 KIND_DATASEC | KIND_ENUM64 => {
                     p += vlen * 12;
@@ -1334,6 +1374,42 @@ impl Btf {
             .contains_key(&format!("{LSM_FUNC_PREFIX}{hook}"))
     }
 
+    /// Lot 273: whether the kernel has `t.func` in the shape its fexit
+    /// program reads — exactly `t.params` parameters and a pointer to
+    /// `t.ret_pointee` returned. `Ok(false)`: no such function; `Err`: a
+    /// prototype of another shape (not guessed at).
+    fn fexit_target_shape(&self, t: &FexitTarget) -> Result<bool, ResolveError> {
+        let Some(proto) = self.lsm_funcs.get(t.func).copied() else {
+            return Ok(false);
+        };
+        let (params, ret) = match self.types.get(proto as usize) {
+            Some(Ty::FuncProto { params, ret }) => (params, *ret),
+            _ => {
+                return Err(ResolveError::Prototype(format!(
+                    "{}: no function prototype",
+                    t.func
+                )))
+            }
+        };
+        let shape = || self.describe_prototype(t.func, params);
+        if params.len() != t.params as usize {
+            return Err(ResolveError::Prototype(format!(
+                "{}: {} parameters, the program reads the return value after {}",
+                shape(),
+                params.len(),
+                t.params
+            )));
+        }
+        if self.pointee_name(ret) != Some(t.ret_pointee) {
+            return Err(ResolveError::Prototype(format!(
+                "{}: does not return a struct {} *",
+                shape(),
+                t.ret_pointee
+            )));
+        }
+        Ok(true)
+    }
+
     /// Lab PR 164: the parameter types of LSM hook function `func`.
     fn hook_params(&self, func: &str) -> Result<&[u32], ResolveError> {
         let proto = *self
@@ -1341,7 +1417,7 @@ impl Btf {
             .get(func)
             .ok_or_else(|| ResolveError::FuncNotFound(func.to_string()))?;
         match self.types.get(proto as usize) {
-            Some(Ty::FuncProto { params }) => Ok(params),
+            Some(Ty::FuncProto { params, .. }) => Ok(params),
             _ => Err(ResolveError::Prototype(format!(
                 "{func}: no function prototype"
             ))),

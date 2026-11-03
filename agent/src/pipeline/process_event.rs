@@ -435,7 +435,8 @@ pub(crate) fn process_event(
                         "VERDICT (rule)"
                     );
                     if let Some(sink) = detection_sink {
-                        sink.record_rule(
+                        // Lot 273: who, by executable too.
+                        sink.record_denial(
                             &event,
                             &verdict,
                             at001.attack(),

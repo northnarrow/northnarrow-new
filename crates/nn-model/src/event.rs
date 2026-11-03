@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{
     ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw, ADDR_LEN,
-    FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_CREATE, FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_LINK, FS_OP_MKDIR,
-    FS_OP_MKNOD, FS_OP_PTRACE, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_SIGNAL,
-    FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR,
+    FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_CGROUP_FREEZE, FS_OP_CGROUP_KILL, FS_OP_CGROUP_MOVE,
+    FS_OP_CREATE, FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_PTRACE,
+    FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_SYMLINK,
+    FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR,
 };
 
 /// Serde default of `Event::CanaryTripped::first_trip`.
@@ -996,6 +997,15 @@ pub enum FsProtectOperation {
     /// An extended attribute (or, on 6.2+, a POSIX ACL) set or removed on
     /// a protected inode; `security.selinux` is not refused.
     Xattr,
+    /// Lot 273: a protected process moved to another cgroup
+    /// (`cgroup.procs` / `cgroup.threads`); the target is the moved tgid.
+    CgroupMove,
+    /// Lot 273: a write-open of a protected unit's `cgroup.kill` (or an
+    /// ancestor slice's): the kernel kill of the whole cgroup.
+    CgroupKill,
+    /// Lot 273: a write-open of a protected unit's `cgroup.freeze` (or an
+    /// ancestor slice's).
+    CgroupFreeze,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1022,6 +1032,9 @@ impl FsProtectOperation {
             FS_OP_MKDIR => Self::Mkdir,
             FS_OP_MKNOD => Self::Mknod,
             FS_OP_XATTR => Self::Xattr,
+            FS_OP_CGROUP_MOVE => Self::CgroupMove,
+            FS_OP_CGROUP_KILL => Self::CgroupKill,
+            FS_OP_CGROUP_FREEZE => Self::CgroupFreeze,
             other => Self::Unknown(other),
         }
     }
@@ -1046,6 +1059,9 @@ impl FsProtectOperation {
             Self::Mkdir => "mkdir",
             Self::Mknod => "mknod",
             Self::Xattr => "xattr",
+            Self::CgroupMove => "cgroup_move",
+            Self::CgroupKill => "cgroup_kill",
+            Self::CgroupFreeze => "cgroup_freeze",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -1551,6 +1567,38 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+    /// Lot 273: the three cgroup denial codes decode to their own
+    /// operation, with the names the detection and the tamper check print.
+    #[test]
+    fn fs_protect_cgroup_ops_decode() {
+        use crate::wire::{FS_OP_CGROUP_FREEZE, FS_OP_CGROUP_KILL, FS_OP_CGROUP_MOVE};
+        let cases = [
+            (
+                FS_OP_CGROUP_MOVE,
+                FsProtectOperation::CgroupMove,
+                "cgroup_move",
+            ),
+            (
+                FS_OP_CGROUP_KILL,
+                FsProtectOperation::CgroupKill,
+                "cgroup_kill",
+            ),
+            (
+                FS_OP_CGROUP_FREEZE,
+                FsProtectOperation::CgroupFreeze,
+                "cgroup_freeze",
+            ),
+        ];
+        for (byte, op, name) in cases {
+            assert_eq!(FsProtectOperation::from_wire(byte), op);
+            assert_eq!(op.as_str(), name);
+            assert_eq!(op.to_string(), name);
+        }
+        assert_eq!(
+            FsProtectOperation::from_wire(22),
+            FsProtectOperation::Unknown(22)
+        );
     }
     use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};
 

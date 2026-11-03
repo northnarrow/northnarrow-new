@@ -352,6 +352,10 @@ fn errno_text(errno: i32) -> String {
 struct Queued {
     at: std::time::Instant,
     record: DetectionRecord,
+    /// Lot 273: the `(pid, comm)` of an anti-tamper denial's caller, whose
+    /// executable the writer reads into the record (off the decision
+    /// thread, which does no `/proc` read).
+    exe_of: Option<(u32, String)>,
 }
 
 /// R12c (lab PR 270): stage 7, the evidence writer's queue — its counts
@@ -478,6 +482,13 @@ impl DetectionSink {
     /// the queue lock only for the push — the fsync happens on the writer
     /// task, never here.
     fn enqueue(&self, record: DetectionRecord) {
+        self.enqueue_with(record, None)
+    }
+
+    /// [`Self::enqueue`], with the caller whose executable the writer reads
+    /// into the record (lot 273).
+    fn enqueue_with(&self, record: DetectionRecord, exe_of: Option<(u32, String)>) {
+        let mut exe_of = exe_of;
         {
             let mut q = self.inner.queue.lock();
             if q.len() >= self.inner.cap {
@@ -500,6 +511,7 @@ impl DetectionSink {
                         q.push_back(Queued {
                             at: std::time::Instant::now(),
                             record,
+                            exe_of: exe_of.take(),
                         });
                         self.inner
                             .max_depth
@@ -528,6 +540,7 @@ impl DetectionSink {
             q.push_back(Queued {
                 at: std::time::Instant::now(),
                 record,
+                exe_of: exe_of.take(),
             });
             self.inner
                 .max_depth
@@ -636,6 +649,30 @@ impl DetectionSink {
             record.sanction = self.sanction_of(event);
         }
         self.enqueue(record);
+    }
+
+    /// Lot 273: [`Self::record_rule`] for an anti-tamper denial, whose
+    /// record the writer completes with the caller's executable
+    /// ([`caller_exe`]): the kernel's record names the pid, the comm and the
+    /// uid only.
+    pub fn record_denial(
+        &self,
+        event: &Event,
+        verdict: &Verdict,
+        attack: &[AttackRef],
+        posture: PostureKind,
+        response: String,
+        suppressed_before: u64,
+    ) {
+        let mut record =
+            DetectionRecord::from_rule(self.next_id(), now_ts(), event, verdict, posture, response)
+                .with_attack(attack);
+        record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
+        let exe_of = match event {
+            Event::FsProtectDenial { pid, comm, .. } => Some((*pid, comm.clone())),
+            _ => None,
+        };
+        self.enqueue_with(record, exe_of);
     }
 
     /// Lab PR 236: record an engine decision — its verdict (the primary
@@ -822,6 +859,25 @@ pub fn open(
 /// (the only place fsync happens). Append failures are logged, not
 /// fatal — losing one detection must not take down the agent. Runs for
 /// the life of the process.
+/// Lot 273: the executable of the process `pid` of a kernel denial, read
+/// under `proc` while that pid still runs a process of the recorded
+/// `comm` (truncated to 15 bytes as the kernel's is): a pid reused by
+/// another program names nothing. `None` when the process is gone, for
+/// pid 0, or when the link cannot be read. The writer's, off the decision.
+pub(crate) fn caller_exe(proc: &Path, pid: u32, comm: &str) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let dir = proc.join(pid.to_string());
+    let now = std::fs::read_to_string(dir.join("comm")).ok()?;
+    if now.trim_end_matches('\n') != comm {
+        return None;
+    }
+    std::fs::read_link(dir.join("exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 fn spawn_writer(
     mut log: RotatingChainLog<DetectionRecord>,
     inner: Arc<SinkInner>,
@@ -836,7 +892,18 @@ fn spawn_writer(
                 let mut q = inner.queue.lock();
                 q.drain(..).collect()
             };
-            for Queued { at, record } in batch {
+            for Queued {
+                at,
+                mut record,
+                exe_of,
+            } in batch
+            {
+                // Lot 273: an anti-tamper denial's caller, by executable.
+                if record.exe.is_none() {
+                    if let Some((pid, comm)) = exe_of {
+                        record.exe = caller_exe(Path::new("/proc"), pid, &comm);
+                    }
+                }
                 let id = record.id;
                 // R12c (lab PR 270): stage 7's wait, queue to chain
                 inner
@@ -2270,6 +2337,24 @@ mod tests {
         assert_eq!(e[1]["extra"]["count"], 1);
         assert_eq!(e[1]["extra"]["first_id"], 4);
         assert_eq!(e[1]["extra"]["dropped_total"], 4);
+    }
+
+    /// Lot 273: a denial's caller is named by executable only while its
+    /// pid runs the comm the kernel recorded.
+    #[test]
+    fn a_denials_caller_exe_needs_the_same_comm() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("4242");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("comm"), "bash\n").unwrap();
+        std::os::unix::fs::symlink("/usr/bin/bash", p.join("exe")).unwrap();
+        assert_eq!(
+            caller_exe(t.path(), 4242, "bash").as_deref(),
+            Some("/usr/bin/bash")
+        );
+        assert_eq!(caller_exe(t.path(), 4242, "sh"), None);
+        assert_eq!(caller_exe(t.path(), 4243, "bash"), None);
+        assert_eq!(caller_exe(t.path(), 0, "bash"), None);
     }
 
     /// An anti-tamper denial is a Log verdict, but the kernel acted: it

@@ -63,6 +63,8 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
         ("bpf_defense.rs", 0, 1),
         ("fim_watch.rs", 0, 1),
         ("execq.rs", 0, 2),
+        // lot 273: the moved task is a target, the writer a caller
+        ("cgroup_guard.rs", 1, 2),
     ] {
         let code = strip_comments(&fs::read_to_string(dir.join(file)).unwrap());
         assert_eq!(
@@ -84,6 +86,7 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
             "bpf_defense.rs",
             "fim_watch.rs",
             "execq.rs",
+            "cgroup_guard.rs",
         ]
         .contains(&name.as_str())
         {
