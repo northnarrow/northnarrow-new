@@ -1569,10 +1569,20 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if at.is_some_and(|t| start_ns.saturating_sub(2 * tick) > t) {
             return None;
         }
-        let parent = match self.cached_live(ppid, Some(start_ns)) {
+        // Lot 278: the latest time the fork can have happened. `/proc`
+        // rounds the start down to a tick and `start_ns` takes all the time
+        // suspended off it, so a fork in the tick of its parent's exec (sudo
+        // and its monitor) shows a start before that exec: read at
+        // `start_ns`, the parent's image was "only later" and the lineage
+        // was lost. The image read at this bound is the parent's only if
+        // `/proc/<pid>/exe` is still that file (below): a parent that
+        // executed something else after forking `pid` does not lend it the
+        // new image.
+        let forked_by = ticks.saturating_add(2).saturating_mul(tick).max(start_ns);
+        let parent = match self.cached_live(ppid, Some(forked_by)) {
             CachedAt::Current(e) | CachedAt::Past(e) => e,
             CachedAt::LaterOnly => return None,
-            CachedAt::Absent => self.fork_entry(ppid, Some(start_ns), depth + 1)?,
+            CachedAt::Absent => self.fork_entry(ppid, Some(forked_by), depth + 1)?,
         };
         let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
         if exe != parent.exe {
@@ -5093,6 +5103,65 @@ mod tests {
     fn sudo_with_login_and_terminal_is_interactive_admin() {
         let (_tmp, t) = admin_session(34816, 1000);
         assert!(t.is_interactive_admin(200, AsOf::Now));
+    }
+
+    /// Lot 278 (the lab's "R009 flake"): `sudo` with `use_pty` forks a
+    /// monitor (no exec) that forks the command. `/proc` shows the
+    /// monitor's start in clock ticks, rounded down, on the boot clock, less
+    /// the time suspended: a monitor forked in the tick of sudo's exec
+    /// shows a start before that exec. The parent's image at the fork was
+    /// then looked up at that earlier time, found only "later", and the
+    /// judged walk lost the session: an administrator's `sudo
+    /// ./deploy/install.sh` at a terminal was not sanctioned, and R009
+    /// killed it — whether it did depended on the milliseconds between
+    /// sudo's exec and its fork. The parent is read at the latest time the
+    /// fork can have happened; `/proc/<pid>/exe` must still be its image.
+    #[test]
+    fn sudo_s_monitor_forked_in_the_tick_of_sudo_s_exec_keeps_the_session() {
+        const MS: u64 = 1_000_000;
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        // the operator's shell (cached), sudo executed at 10.003 s
+        t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+        t.ingest_exec(
+            710,
+            700,
+            "/usr/bin/sudo",
+            &[],
+            10_003 * MS,
+            10_001 * MS,
+            1000,
+        );
+        // sudo's monitor, forked at 10.008 s: `/proc` shows tick 1000 (10.000 s)
+        write_exe(tmp.path(), 711, "/usr/bin/sudo");
+        write_status(tmp.path(), 711, 710);
+        write_started(tmp.path(), "711", 710, 1_000);
+        // the command, forked by the monitor, executes the script at 10.050 s
+        t.ingest_exec(
+            712,
+            711,
+            "/home/op/nn/deploy/install.sh",
+            &[],
+            10_050 * MS,
+            10_045 * MS,
+            0,
+        );
+        write_loginuid(tmp.path(), 712, 1000);
+        write_stat(tmp.path(), 712, 711, 34816);
+        let judged = AsOf::Judged(10_050 * MS);
+        assert!(
+            t.is_interactive_admin(712, judged),
+            "the monitor runs sudo's image: the session is the administrator's"
+        );
+        // the monitor's image must still be the parent's: a fork that runs
+        // something else (it executed since, or it was forked before the
+        // parent executed sudo) is not sudo's
+        write_exe(tmp.path(), 711, "/home/op/payload");
+        assert!(!t.is_interactive_admin(712, judged));
+        // and a fork whose start is past the time judged is not its parent's
+        write_exe(tmp.path(), 711, "/usr/bin/sudo");
+        write_started(tmp.path(), "711", 710, 1_010);
+        assert!(!t.is_interactive_admin(712, judged));
     }
 
     #[test]
