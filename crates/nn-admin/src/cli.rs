@@ -548,8 +548,8 @@ enum Cmd {
         /// the agent names it as the window's installer, and R009 records
         /// at Low what its own process tree executes from a home or `/tmp`
         /// after the grant, while the window is open. Without it the window
-        /// names no installer. The scripts set NN_GRANT_FOR_INSTALLER=1.
-        #[arg(long = "for-installer", env = "NN_GRANT_FOR_INSTALLER")]
+        /// names no installer. install.sh and uninstall.sh pass it.
+        #[arg(long = "for-installer")]
         for_installer: bool,
     },
 

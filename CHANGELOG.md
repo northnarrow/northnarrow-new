@@ -679,11 +679,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     R009`; what is left is a root dropper from `/tmp` below COMBAT, recorded
     High and not killed.
   - The window names an installer only when asked for one: `nn-admin
-    trusted-installer-grant --for-installer` (or `NN_GRANT_FOR_INSTALLER=1`,
-    which the scripts pass) sends a new request
-    (`TrustedInstallerGrantForInstallerRequest`), whose audit row says
-    `for_installer` and the installer's pid; a plain grant names none. An
-    older agent closes the connection and nn-admin asks for the plain grant.
+    trusted-installer-grant --for-installer` (the scripts pass it when the
+    installed nn-admin knows it — not at the first upgrade from an older
+    release) sends a new request (`TrustedInstallerGrantForInstallerRequest`,
+    production variant 58; the debug-only pair moves to 59/60), whose audit
+    row says `for_installer` and the installer's pid; a plain grant names
+    none. An older agent closes the connection and nn-admin asks for the
+    plain grant.
+  - The second review of #493: a fork of a fork that never executed (G runs
+    `python3 evil.py`, its fork forks the child, then executes `python3
+    /usr/bin/borg`) passed for borg through the one-identity rule. The
+    later exec now answers only for an identity its executable alone decides
+    (no script, no npm entrypoint, no interpreter), the child's live exe
+    being that executable; sudo's monitor is one.
   - The installer is the process with the exact start `/proc` shows for it
     now: no allowance for the time suspended.
   - The posture is read once per decision. The static scan of `install.sh`

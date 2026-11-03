@@ -1829,7 +1829,7 @@ exit: 0
 |       --window-secs <WINDOW_SECS>      Override window in seconds. Clamped to the agent's 600 s ceiling. Keep it short — just long enough to run install.sh and restart the unit [default: 120]
 |       --agent-id-file <AGENT_ID_FILE>  Path to the agent's per-install UUID file (design §6.5) — binds the signed grant to this specific agent install [default: /etc/northnarrow/agent_id]
 |       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
-|       --for-installer                  The grant is for this command's parent, an installer (`install.sh`, `uninstall.sh`, a root shell that will run one): the agent names it as the window's installer, and R009 records at Low what its own process tree executes from a home or `/tmp` after the grant, while the window is open. Without it the window names no installer. The scripts set NN_GRANT_FOR_INSTALLER=1 [env: NN_GRANT_FOR_INSTALLER=]
+|       --for-installer                  The grant is for this command's parent, an installer (`install.sh`, `uninstall.sh`, a root shell that will run one): the agent names it as the window's installer, and R009 records at Low what its own process tree executes from a home or `/tmp` after the grant, while the window is open. Without it the window names no installer. install.sh and uninstall.sh pass it
 |   -h, --help                           Print help
 --- stderr
 (empty)

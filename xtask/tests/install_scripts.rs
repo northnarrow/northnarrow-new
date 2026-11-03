@@ -326,11 +326,28 @@ fi
 exit 0"#,
         );
         write_exec(&stub.join("sleep"), "exit 0");
+        // lot 278: `help trusted-installer-grant` names `--for-installer`
+        // unless `$T/old-nn-admin` exists (an nn-admin older than the flag);
+        // the grant records whether it was asked for an installer
         write_exec(
             &bin.join("nn-admin"),
             r#"echo "nn-admin $1" >> "$NN_TEST_DIR/calls"
+if [ "$1" = help ] && [ "${2:-}" = trusted-installer-grant ]; then
+    [ -e "$NN_TEST_DIR/old-nn-admin" ] || echo "      --for-installer   the grant is for the caller's tree"
+    exit 0
+fi
 if [ "$1" = trusted-installer-grant ]; then
-    grep -q trusted-installer "$3" || exit 1
+    k=; f=0; prev=
+    for a in "$@"; do
+        [ "$prev" = --key ] && k=$a
+        if [ "$a" = --for-installer ]; then
+            [ -e "$NN_TEST_DIR/old-nn-admin" ] && { echo "error: unexpected argument '--for-installer'" >&2; exit 2; }
+            f=1
+        fi
+        prev=$a
+    done
+    grep -q trusted-installer "$k" || exit 1
+    echo "$f" >> "$NN_TEST_DIR/for-installer"
     : > "$NN_TEST_DIR/window"
 fi
 exit 0"#,
@@ -584,10 +601,12 @@ fn install_opens_the_window_before_it_executes_its_tree() {
 
 /// Lot 278: install.sh executes the tree's agent only in `tree_version`,
 /// which runs only where its window is open or no agent judges it (the
-/// harness above), and none of the tree's other binaries at all: no other
-/// line names `$AGENT_BIN`, `$WATCHDOG_BIN`, `$NN_ADMIN_BIN` or
-/// `$SCAN_BIN` — quoted or not, braced or not (review of #493, M12b) — but
-/// to copy it, check it exists, compare its age or print it.
+/// harness above), and none of the tree's other binaries at all: no line
+/// names `$AGENT_BIN`, `$WATCHDOG_BIN`, `$NN_ADMIN_BIN` or `$SCAN_BIN` —
+/// quoted or not, braced or not (review of #493, M12b) — in a command's
+/// place (the line's start, after `;`, `&&`, `||`, `|`, `$(`, `(`, `exec`,
+/// …: second review, M12c/M12d), and a line naming one as an argument
+/// copies it, checks it exists, compares its age or prints it.
 #[test]
 fn install_executes_the_tree_s_agent_only_in_tree_version() {
     let text = read("deploy/install.sh");
@@ -610,35 +629,118 @@ fn install_executes_the_tree_s_agent_only_in_tree_version() {
         if mentions.is_empty() {
             continue;
         }
-        if (start..end).contains(&here) && mentions.iter().all(|(v, _)| *v == "AGENT_BIN") {
-            continue;
+        let in_tree_version = (start..end).contains(&here);
+        for m in &mentions {
+            if m.runs() {
+                assert!(
+                    in_tree_version && m.var == "AGENT_BIN",
+                    "install.sh:{}: runs a binary of the tree: {line}",
+                    n + 1
+                );
+                continue;
+            }
+            let names_it = l.starts_with("install ")
+                || l.starts_with("require_file ")
+                || l.starts_with("for staged in ")
+                || l.starts_with("echo ")
+                || m.after.starts_with(':')
+                || m.after.starts_with(" ]]") && l.contains(" -nt ");
+            assert!(
+                names_it || in_tree_version,
+                "install.sh:{}: may execute a binary of the tree: {line}",
+                n + 1
+            );
         }
-        let names_it = l.starts_with("install ")
-            || l.starts_with("require_file ")
-            || l.starts_with("for staged in ")
-            || l.starts_with("echo ")
-            || mentions.iter().all(|(_, after)| after.starts_with(':'))
-            || mentions.iter().all(|(_, after)| after.starts_with(" ]]")) && l.contains(" -nt ");
-        assert!(
-            names_it,
-            "install.sh:{}: may execute a binary of the tree: {line}",
-            n + 1
-        );
     }
-    // the scan sees every spelling
-    for (line, n) in [
-        ("new_ver=$($AGENT_BIN --version)", 1),
-        ("x=$(\"${AGENT_BIN}\" -V)", 1),
-        ("$NN_ADMIN_BIN status && \"$SCAN_BIN\" -h", 2),
-        ("$AGENT_BINARY_DIR/x", 0),
+    // the scan sees every spelling, and every command's place
+    for (line, runs) in [
+        ("new_ver=$($AGENT_BIN --version)", vec![true]),
+        ("x=$(\"${AGENT_BIN}\" -V)", vec![true]),
+        ("$NN_ADMIN_BIN status && \"$SCAN_BIN\" -h", vec![true, true]),
+        (
+            "echo \"x\"; new_ver=$(\"$AGENT_BIN\" --version)",
+            vec![true],
+        ),
+        ("install -d /tmp && \"$AGENT_BIN\" --version", vec![true]),
+        ("echo \"stale: $AGENT_BIN is older\"", vec![false]),
+        ("install -m 755 \"$AGENT_BIN\" \"$BIN_DIR/x\"", vec![false]),
+        ("\"$SCAN_BIN:northnarrow-scan\"; do", vec![false]),
+        ("$AGENT_BINARY_DIR/x", vec![]),
     ] {
-        assert_eq!(tree_binary_mentions(line).len(), n, "{line}");
+        let got: Vec<bool> = tree_binary_mentions(line)
+            .iter()
+            .map(|m| m.runs())
+            .collect();
+        assert_eq!(got, runs, "{line}");
     }
 }
 
-/// Lot 278 (review of #493, note a): the scripts ask for their windows
-/// for their own tree — every grant they run passes
-/// `NN_GRANT_FOR_INSTALLER=1` — and a grant by hand names no installer.
+/// A tree binary a shell line names, what precedes it and what follows it
+/// (a closing quote skipped).
+struct Mention<'a> {
+    var: &'static str,
+    before: &'a str,
+    after: &'a str,
+}
+
+impl Mention<'_> {
+    /// In a command's place: the line's start, or after a separator or a
+    /// word that starts a command — not a `VAR:name` word of a list.
+    fn runs(&self) -> bool {
+        if self.after.starts_with(':') {
+            return false;
+        }
+        let b = self.before.trim_end().trim_end_matches('"').trim_end();
+        b.is_empty()
+            || ["$(", "(", ";", "&&", "||", "|", "`", "!", "{"]
+                .iter()
+                .any(|s| b.ends_with(s))
+            || [
+                "exec", "then", "do", "else", "eval", "command", "env", "nohup", "sudo",
+            ]
+            .iter()
+            .any(|w| b == *w || b.ends_with(&format!(" {w}")) || b.ends_with(&format!("({w}")))
+    }
+}
+
+/// The tree binaries a shell line names — `$VAR` (not a longer name) or
+/// `${VAR}` — in the order they appear.
+fn tree_binary_mentions(line: &str) -> Vec<Mention<'_>> {
+    let mut out = Vec::new();
+    for var in ["AGENT_BIN", "WATCHDOG_BIN", "NN_ADMIN_BIN", "SCAN_BIN"] {
+        for form in [format!("${{{var}}}"), format!("${var}")] {
+            let mut from = 0;
+            while let Some(i) = line[from..].find(&form) {
+                let at = from + i;
+                let after = &line[at + form.len()..];
+                from = at + form.len();
+                if !form.ends_with('}')
+                    && after
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                out.push((
+                    at,
+                    Mention {
+                        var,
+                        before: &line[..at],
+                        after: after.strip_prefix('"').unwrap_or(after),
+                    },
+                ));
+            }
+        }
+    }
+    out.sort_by_key(|(at, _)| *at);
+    out.into_iter().map(|(_, m)| m).collect()
+}
+
+/// Lot 278 (reviews of #493, note a): the scripts ask for their windows
+/// for their own tree — every grant they run passes `--for-installer` when
+/// the installed nn-admin knows it, and the plain grant when it does not
+/// (the first upgrade to it) — and a grant by hand names no installer.
 #[test]
 fn the_scripts_ask_for_their_windows_as_installers() {
     for script in ["deploy/install.sh", "deploy/uninstall.sh"] {
@@ -652,37 +754,45 @@ fn the_scripts_ask_for_their_windows_as_installers() {
         for l in grants {
             assert!(
                 l.contains(
-                    "NN_GRANT_FOR_INSTALLER=1 \"$BIN_DIR/nn-admin\" trusted-installer-grant"
+                    "\"$BIN_DIR/nn-admin\" trusted-installer-grant ${for_installer[@]+\"${for_installer[@]}\"}"
                 ),
                 "{script}: a grant not for the script's tree: {l}"
             );
         }
+        assert!(
+            text.contains(
+                "$(\"$BIN_DIR/nn-admin\" help trusted-installer-grant 2>/dev/null || true)"
+            ),
+            "{script}: asks the installed nn-admin whether it knows the flag"
+        );
     }
-}
-
-/// The tree binaries a shell line names — `$VAR` (not a longer name) or
-/// `${VAR}` — each with what follows it (a closing quote skipped).
-fn tree_binary_mentions(line: &str) -> Vec<(&'static str, &str)> {
-    let mut out = Vec::new();
-    for var in ["AGENT_BIN", "WATCHDOG_BIN", "NN_ADMIN_BIN", "SCAN_BIN"] {
-        for form in [format!("${{{var}}}"), format!("${var}")] {
-            let mut from = 0;
-            while let Some(i) = line[from..].find(&form) {
-                let after = &line[from + i + form.len()..];
-                from += i + form.len();
-                if !form.ends_with('}')
-                    && after
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
-                    continue;
-                }
-                out.push((var, after.strip_prefix('"').unwrap_or(after)));
-            }
+    // the upgrade's window, asked as the installer — and with an nn-admin
+    // older than the flag, the plain grant (the window still opens)
+    for (old, want) in [(false, "1"), (true, "0")] {
+        let both = ["northnarrow-agent", "northnarrow-watchdog"];
+        let host = Host::new(&format!("install-for-installer-{old}"), &both, true, true);
+        if old {
+            fs::write(host.dir.join("old-nn-admin"), "").unwrap();
         }
+        let r = host.install("full", true, Some("key-role"));
+        assert_eq!(r.status, 0, "{r:#?}");
+        let asked = fs::read_to_string(host.dir.join("for-installer")).unwrap();
+        assert!(
+            asked.lines().all(|l| l == want) && !asked.is_empty(),
+            "{asked:?}"
+        );
+        let host = Host::new(&format!("uninstall-for-installer-{old}"), &both, true, true);
+        if old {
+            fs::write(host.dir.join("old-nn-admin"), "").unwrap();
+        }
+        let r = host.uninstall(false, Some("key-role"));
+        assert_eq!(r.status, 0, "{r:#?}");
+        let asked = fs::read_to_string(host.dir.join("for-installer")).unwrap();
+        assert!(
+            asked.lines().all(|l| l == want) && !asked.is_empty(),
+            "{asked:?}"
+        );
     }
-    out
 }
 
 /// uninstall.sh, same case: the agent is started for the window before

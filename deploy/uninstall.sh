@@ -221,8 +221,16 @@ own_ids=$(read_own_prog_ids)
 # trusted-installer window first, while the agent still answers.
 if [[ -n "$GRANT_KEY" ]] && systemctl is-active --quiet northnarrow-agent.service; then
     log "opening the trusted-installer window (300 s) with $GRANT_KEY"
-    # Lot 278: for this script's own tree (see install.sh)
-    if ! NN_GRANT_FOR_INSTALLER=1 "$BIN_DIR/nn-admin" trusted-installer-grant --key "$GRANT_KEY" --window-secs 300; then
+    # Lot 278: for this script's own tree, when the installed nn-admin knows
+    # the flag (see install.sh)
+    for_installer=()
+    # (read whole, not piped into `grep -q`: under pipefail its early exit
+    # could fail the pipeline)
+    local_help=$("$BIN_DIR/nn-admin" help trusted-installer-grant 2>/dev/null || true)
+    if [[ $local_help == *--for-installer* ]]; then
+        for_installer=(--for-installer)
+    fi
+    if ! "$BIN_DIR/nn-admin" trusted-installer-grant ${for_installer[@]+"${for_installer[@]}"} --key "$GRANT_KEY" --window-secs 300; then
         echo "uninstall.sh: trusted-installer grant REFUSED (key without the trusted-installer role?)" >&2
         (( STARTED_FOR_WINDOW )) &&
             echo "uninstall.sh: the agent started for the window keeps running (its stop needs the window)" >&2

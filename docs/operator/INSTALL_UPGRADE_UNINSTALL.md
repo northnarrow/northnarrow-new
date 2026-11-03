@@ -328,18 +328,21 @@ user-writable path, R009's match. What the running agent does with them:
   administrator's session).
 - **What the script executes from its tree afterwards** (the new agent's
   `--version`) runs after it opened its window: asked for an installer
-  (`nn-admin trusted-installer-grant --for-installer`, or
-  `NN_GRANT_FOR_INSTALLER=1`, which the scripts pass), the agent grants the
-  window to that installer — the process that ran `nn-admin`, by its pid and
+  (`nn-admin trusted-installer-grant --for-installer`, which the scripts
+  pass when the installed nn-admin knows it — not at the first upgrade from
+  an older release, `UPGRADE_NOTES_WAVE4.md`), the agent grants the window
+  to that installer — the process that ran `nn-admin`, by its pid and
   its start — and R009 records, at Low, what that process's own tree
   executes after the grant while the window is open, naming the key, the
   deadline and the installer's pid. A grant asked for by hand without the
   flag names no installer. The
   tree is found by lineage, never by a name or a path: a sibling of the
   installer, a process that took its pid later, or the same exec after the
-  window closed is judged as any other. `install.sh` opens its window before
-  it executes anything from its tree; a refused run (no `--upgrade` over
-  running units) opens none and executes nothing from it.
+  window closed is judged as any other; so is an exec of the tree judged
+  after the installer exited (the installer must show its recorded start in
+  `/proc` when its tree's exec is judged). `install.sh` opens its window
+  before it executes anything from its tree; a refused run (no `--upgrade`
+  over running units) opens none and executes nothing from it.
 - **In COMBAT** R009 kills the script's own exec, as before this lot. To
   upgrade a host in COMBAT from a tree in a home or `/tmp`, open the window
   first from the root shell that will run the script, so that the script is

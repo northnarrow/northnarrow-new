@@ -41,6 +41,15 @@ has the details of each change below.
    test that expected the kill sees the record; `enforce R009` in the
    signed per-rule policy restores it in every posture
    (`RULE_POLICY.md` §1).
+8. **The first upgrade to this release** runs the scripts' windows through
+   the installed nn-admin, the older one, which has no `--for-installer`:
+   that upgrade's window names no installer. Below COMBAT nothing changes
+   (the tree's `--version` is a High record, not killed); in COMBAT the
+   script's own exec is killed anyway (§3). From the next upgrade on, the
+   installed nn-admin is this one and the window covers the script's tree.
+   To upgrade a host in COMBAT, release COMBAT first or install from a
+   tree root owns (`/opt`, `/usr/local/src`), whose execs R009 does not
+   match.
 
 ## 1. The on-host LLM advisor is removed (lab PR 214)
 
@@ -191,9 +200,9 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
   naming the kill and the posture (R001 and R003 likewise on an exec by
   root); in COMBAT, or under `enforce R009`, the tree is killed as before. A
   trusted-installer grant asked for an installer (`nn-admin
-  trusted-installer-grant --for-installer`, or `NN_GRANT_FOR_INSTALLER=1`,
-  which the scripts pass; a new admin request, which an older agent cannot
-  read — nn-admin then asks for the plain grant) is made to that installer
+  trusted-installer-grant --for-installer`, which the scripts pass when the
+  installed nn-admin knows it; a new admin request, which an older agent
+  cannot read — nn-admin then asks for the plain grant) is made to that installer
   (the process that ran `nn-admin`, by its pid and its start; the agent's
   journal line `trusted-installer override ARMED` names `granted_to_pid`,
   the audit row `for_installer` and `installer_pid`), and R009 records at

@@ -28,6 +28,13 @@
 //! takes on the bus. A non-root exec from those directories is killed as
 //! before, in every posture.
 //!
+//! This is the decision of 03/11/2026 (`docs/operator/RULE_POLICY.md` §1,
+//! "Decision record"): for these three cases only, it changes the decision
+//! of 21/10/2026 and external audit POS-015. A posture hold counts as a
+//! switch's for the legacy first match ([`super::combine::apply_policy`]):
+//! it never stands in for another rule's kill of the same exec (R011–R013
+//! and R017 kill a root exec from `/tmp` or a home in every posture).
+//!
 //! **Every other kill in OBSERVING** is listed in [`OBSERVING_KILLS`], with
 //! why it may run there: the kills that existed before Wave 4 (lab PR 214),
 //! which the founder-delegated decision of 21/10/2026 kept as they were
