@@ -584,8 +584,10 @@ fn install_opens_the_window_before_it_executes_its_tree() {
 
 /// Lot 278: install.sh executes the tree's agent only in `tree_version`,
 /// which runs only where its window is open or no agent judges it (the
-/// harness above): no other line executes `$AGENT_BIN` — the copies, the
-/// existence and freshness checks name it, nothing runs it.
+/// harness above), and none of the tree's other binaries at all: no other
+/// line names `$AGENT_BIN`, `$WATCHDOG_BIN`, `$NN_ADMIN_BIN` or
+/// `$SCAN_BIN` — quoted or not, braced or not (review of #493, M12b) — but
+/// to copy it, check it exists, compare its age or print it.
 #[test]
 fn install_executes_the_tree_s_agent_only_in_tree_version() {
     let text = read("deploy/install.sh");
@@ -596,23 +598,67 @@ fn install_executes_the_tree_s_agent_only_in_tree_version() {
     );
     let start = text.find("tree_version() {").unwrap();
     let end = start + body.len();
+    let mut at = 0;
     for (n, line) in text.lines().enumerate() {
-        let at = text.lines().take(n).map(|l| l.len() + 1).sum::<usize>();
+        let here = at;
+        at += line.len() + 1;
         let l = line.trim_start();
-        if (start..end).contains(&at) || l.starts_with('#') || !l.contains("\"$AGENT_BIN\"") {
+        if l.starts_with('#') {
+            continue;
+        }
+        let mentions = tree_binary_mentions(l);
+        if mentions.is_empty() {
+            continue;
+        }
+        if (start..end).contains(&here) && mentions.iter().all(|(v, _)| *v == "AGENT_BIN") {
             continue;
         }
         let names_it = l.starts_with("install ")
             || l.starts_with("require_file ")
             || l.starts_with("for staged in ")
-            || l.contains("-nt \"$AGENT_BIN\"")
-            || l.starts_with("echo ");
+            || l.starts_with("echo ")
+            || mentions.iter().all(|(_, after)| after.starts_with(':'))
+            || mentions.iter().all(|(_, after)| after.starts_with(" ]]")) && l.contains(" -nt ");
         assert!(
             names_it,
-            "install.sh:{}: executes the tree's agent outside tree_version: {line}",
+            "install.sh:{}: may execute a binary of the tree: {line}",
             n + 1
         );
     }
+    // the scan sees every spelling
+    for (line, n) in [
+        ("new_ver=$($AGENT_BIN --version)", 1),
+        ("x=$(\"${AGENT_BIN}\" -V)", 1),
+        ("$NN_ADMIN_BIN status && \"$SCAN_BIN\" -h", 2),
+        ("$AGENT_BINARY_DIR/x", 0),
+    ] {
+        assert_eq!(tree_binary_mentions(line).len(), n, "{line}");
+    }
+}
+
+/// The tree binaries a shell line names — `$VAR` (not a longer name) or
+/// `${VAR}` — each with what follows it (a closing quote skipped).
+fn tree_binary_mentions(line: &str) -> Vec<(&'static str, &str)> {
+    let mut out = Vec::new();
+    for var in ["AGENT_BIN", "WATCHDOG_BIN", "NN_ADMIN_BIN", "SCAN_BIN"] {
+        for form in [format!("${{{var}}}"), format!("${var}")] {
+            let mut from = 0;
+            while let Some(i) = line[from..].find(&form) {
+                let after = &line[from + i + form.len()..];
+                from += i + form.len();
+                if !form.ends_with('}')
+                    && after
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                out.push((var, after.strip_prefix('"').unwrap_or(after)));
+            }
+        }
+    }
+    out
 }
 
 /// uninstall.sh, same case: the agent is started for the window before
