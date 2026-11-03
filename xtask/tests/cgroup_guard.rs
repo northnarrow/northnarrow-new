@@ -134,6 +134,16 @@ fn every_registration_of_the_cgroups_goes_through_the_shared_code() {
     .unwrap();
     // the early start, the refresh, the watchdog
     assert!(code("agent/src/boot/state.rs").contains("cgroup_guard::preregister_own_cgroup("));
+    // the detection writer names a denial's caller from the lineage
+    in_order(
+        &code("agent/src/boot/mod.rs"),
+        &[
+            "} = evidence::stores(",
+            "sink.set_exe_resolver(Box::new(move |pid, ts_ns| {",
+            ".exec_identity(",
+        ],
+    )
+    .unwrap();
     assert!(code("agent/src/boot/tasks.rs").contains("cgroup_guard::protect_watchdog_cgroup("));
     let w = code("watchdog/src/main.rs");
     in_order(
