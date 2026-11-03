@@ -731,30 +731,35 @@ impl<H: DecisionHost> TriggerDetector<H> {
         // External audit EBPF-001: a denial whose sender is PID 1 is a
         // `systemctl` request systemd relayed — refused, recorded, ENGAGED;
         // the requester is unknown, and init is no offender to contain.
+        // Lot 277: a move into an exempt cgroup is no refusal (`CgroupJoin`):
+        // it raises no tamper trigger — it voids the exemption, and what the
+        // moved process does is judged by the rules without it.
         if let Event::FsProtectDenial { pid, operation, .. } = event {
-            hits.push(if *pid == 1 {
-                TriggerType::RelayedTamperAttempt
-            } else if *operation == nn_model::FsProtectOperation::Read {
-                // External audit EVD-001: a refused read of the agent's
-                // signing key is a credential reach (ALERTED), not a
-                // decisive tamper — a backup of /etc meets it too.
-                TriggerType::SensitiveFileAccess
-            } else if matches!(
-                operation,
-                nn_model::FsProtectOperation::Sched
-                    | nn_model::FsProtectOperation::Nice
-                    | nn_model::FsProtectOperation::Ioprio
-            ) {
-                // Lot 273c: a refused change of the agent's scheduling, nice
-                // value or I/O priority is an impairment (ENGAGED), not a
-                // decisive tamper — a tuning daemon (tuned, numad) applying
-                // a host-wide profile meets it too, and the ladder must not
-                // kill it. A limit change (`prlimit --cpu`) is a kill: it
-                // stays decisive.
-                TriggerType::DefenseImpairment
-            } else {
-                TriggerType::AntiTamperDenial
-            });
+            if *operation != nn_model::FsProtectOperation::CgroupJoin {
+                hits.push(if *pid == 1 {
+                    TriggerType::RelayedTamperAttempt
+                } else if *operation == nn_model::FsProtectOperation::Read {
+                    // External audit EVD-001: a refused read of the agent's
+                    // signing key is a credential reach (ALERTED), not a
+                    // decisive tamper — a backup of /etc meets it too.
+                    TriggerType::SensitiveFileAccess
+                } else if matches!(
+                    operation,
+                    nn_model::FsProtectOperation::Sched
+                        | nn_model::FsProtectOperation::Nice
+                        | nn_model::FsProtectOperation::Ioprio
+                ) {
+                    // Lot 273c: a refused change of the agent's scheduling, nice
+                    // value or I/O priority is an impairment (ENGAGED), not a
+                    // decisive tamper — a tuning daemon (tuned, numad) applying
+                    // a host-wide profile meets it too, and the ladder must not
+                    // kill it. A limit change (`prlimit --cpu`) is a kill: it
+                    // stays decisive.
+                    TriggerType::DefenseImpairment
+                } else {
+                    TriggerType::AntiTamperDenial
+                });
+            }
         }
         // Lab PR 162: a tamper of an anti-tamper control-surface file — the
         // match of NN-L-FIM-024, which no workflow produces while the agent
@@ -2230,6 +2235,32 @@ mod tests {
             !hits.contains(&TriggerType::ConfirmedIntrusion),
             "FsProtectDenial must NOT also raise ConfirmedIntrusion now: {hits:?}"
         );
+    }
+
+    /// Lot 277: a move into an exempt cgroup reaches the posture as a
+    /// `CgroupJoin` record: no refusal, so no tamper trigger (PID 1's
+    /// placements are never signed, a root shell's is not decisive) — the
+    /// exemption is void, and the rules judge what the process does.
+    #[test]
+    fn a_move_into_an_exempt_cgroup_raises_no_tamper_trigger() {
+        let det = TriggerDetector::new();
+        for pid in [1, 9999] {
+            let focal = Event::FsProtectDenial {
+                pid,
+                uid: 0,
+                comm: "bash".into(),
+                target_dev: 0x1234,
+                target_ino: 4242,
+                operation: nn_model::FsProtectOperation::CgroupJoin,
+                timestamp_ns: 1,
+            };
+            let hits = det.detect(&focal, &[]);
+            assert!(
+                !hits.contains(&TriggerType::AntiTamperDenial)
+                    && !hits.contains(&TriggerType::RelayedTamperAttempt),
+                "{pid}: {hits:?}"
+            );
+        }
     }
 
     #[test]

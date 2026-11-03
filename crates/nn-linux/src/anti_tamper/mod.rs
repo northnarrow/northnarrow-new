@@ -551,6 +551,28 @@ fn attach_reporting(
         ));
     }
 
+    // Lot 277: the start-in-cgroup tracker (the per-rule policy's
+    // exemptions by cgroup or unit hold for processes started in their
+    // cgroup only). Not a deny hook: without it those exemptions are
+    // refused, a signed degradation.
+    let tracker = crate::cgroup_join::attach(ebpf, &btf);
+    match &tracker {
+        crate::cgroup_join::Tracker::Absent(why) => report.degraded.push(format!(
+            "cgroup exemptions: {} ({why})",
+            crate::cgroup_join::ABSENT_EFFECT
+        )),
+        crate::cgroup_join::Tracker::Attached(marks) => {
+            let gone = marks.sweep(std::path::Path::new("/proc"));
+            if gone > 0 {
+                info!(
+                    removed = gone,
+                    "cgroup exemptions: marks of processes gone while no agent ran removed"
+                );
+            }
+        }
+    }
+    crate::cgroup_join::install(tracker);
+
     // BPF self-defence (Tappa 10.8): map guard (deny) + bpf() observer.
     let bd = bpf_defense::attach(bpf_guard, ebpf, &btf, pin_root);
     for (program, why) in bd.deny_failures {

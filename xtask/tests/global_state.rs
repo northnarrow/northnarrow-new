@@ -345,6 +345,12 @@ const STATICS: &[Kept] = &[
         "the resource files whose values this boot registered in the pinned LIMIT_VALUES (lot 273b)",
     ),
     kept(
+        "crates/nn-linux/src/cgroup_join.rs",
+        "TRACKER",
+        Kernel,
+        "lot 277: the start-in-cgroup tracker this boot attached (its pinned maps) or why not — one eBPF object per agent, read by the exemption check of every engine",
+    ),
+    kept(
         "crates/nn-linux/src/anti_tamper/cgroup_guard.rs",
         "REGISTERED_UNITS",
         Kernel,

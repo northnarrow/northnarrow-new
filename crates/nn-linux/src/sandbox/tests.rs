@@ -681,3 +681,96 @@ fn landlock_is_measured_where_the_kernel_has_it() {
     assert!(libc::WIFEXITED(open), "status {open:#x}");
     assert_eq!(libc::WEXITSTATUS(open), 0);
 }
+
+/// Lot 277: `getdents64` records as the kernel lays them out — `d_ino`,
+/// `d_off`, `d_reclen` at byte 16, `d_type`, the name from byte 19 —
+/// counted without `.` and `..`, names that only begin with a dot kept.
+#[test]
+fn the_thread_count_reads_dirent_records() {
+    fn record(buf: &mut Vec<u8>, name: &str) {
+        let reclen = (19 + name.len() + 1).div_ceil(8) * 8;
+        let start = buf.len();
+        buf.resize(start + reclen, 0);
+        buf[start + 16..start + 18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+        buf[start + 19..start + 19 + name.len()].copy_from_slice(name.as_bytes());
+    }
+    let mut bytes = Vec::new();
+    for name in [".", "..", "4242", "4243", ".x", "..y"] {
+        record(&mut bytes, name);
+    }
+    let mut words = vec![0u64; bytes.len().div_ceil(8)];
+    // SAFETY: the u64 buffer is at least as long as `bytes`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), words.as_mut_ptr().cast(), bytes.len());
+    }
+    assert_eq!(count_dirents(&words, bytes.len()), 4);
+    // a length that ends inside a record counts only the whole ones
+    // before it; a zero record length ends the walk
+    assert_eq!(count_dirents(&words, 24 * 3), 1);
+    assert_eq!(count_dirents(&[0u64; 8], 64), 0);
+}
+
+/// Lot 277: a forked child is its process's only thread, and may enter
+/// (the step passes); this test process runs other threads, so `enter`
+/// refuses it first — before it changed anything of the process (the
+/// privilege check, which would refuse a test runner too, comes after).
+#[test]
+fn a_worker_with_a_second_thread_is_refused_before_anything_changes() {
+    fn alone() -> i32 {
+        match (thread_count(), refuse_threaded()) {
+            (Ok(1), Ok(())) => 0,
+            _ => 1,
+        }
+    }
+    assert!(
+        exited(in_child(|| true, alone), 0),
+        "a forked child counts one thread"
+    );
+
+    let (stop, wait) = std::sync::mpsc::channel::<()>();
+    let other = std::thread::spawn(move || {
+        let _ = wait.recv();
+    });
+    let n = thread_count().expect("/proc/self/task");
+    assert!(n >= 2, "{n} threads");
+    // more threads than one getdents64 batch holds (4 KiB, ~170 entries):
+    // every batch is counted
+    let (park_stop, park_wait) = std::sync::mpsc::channel::<()>();
+    let park_wait = std::sync::Arc::new(std::sync::Mutex::new(park_wait));
+    let parked: Vec<_> = (0..300)
+        .map(|_| {
+            let w = std::sync::Arc::clone(&park_wait);
+            std::thread::spawn(move || {
+                let _ = w.lock().map(|r| r.recv());
+            })
+        })
+        .collect();
+    let many = thread_count().expect("/proc/self/task");
+    // (other tests' threads come and go: at least these 300 and this one)
+    assert!(many > 300, "{many} threads with 300 parked");
+    drop(park_stop);
+    for t in parked {
+        t.join().unwrap();
+    }
+    // SAFETY: prctl with integer arguments.
+    let nnp_before = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+    let nofile_before = getrlimit(libc::RLIMIT_NOFILE);
+    match enter(&Profile::parse(3)) {
+        Err(SandboxError::Threaded(k)) => assert!(k >= 2, "{k}"),
+        other => panic!("expected Threaded, got {other:?}"),
+    }
+    assert!(matches!(refuse_threaded(), Err(SandboxError::Threaded(_))));
+    // SAFETY: prctl with integer arguments.
+    let nnp_after = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+    assert_eq!(nnp_after, nnp_before, "no_new_privs untouched");
+    assert_eq!(
+        getrlimit(libc::RLIMIT_NOFILE),
+        nofile_before,
+        "limits untouched"
+    );
+    assert!(SandboxError::Threaded(n)
+        .to_string()
+        .contains(&format!("{n} threads")));
+    drop(stop);
+    other.join().unwrap();
+}

@@ -66,9 +66,11 @@ pub enum Exemption {
     Uid(u32),
     /// An executable of a root-owned system tree, by path and content.
     Exe { path: String, sha256: [u8; 32] },
-    /// The process's cgroup v2 path (a `.service` or `.scope`).
+    /// The process's cgroup v2 path (a `.service` or `.scope`). Lot 277:
+    /// for a process started in it only ([`ActorFacts::started_in_cgroup`]).
     Cgroup(String),
-    /// The systemd unit of the process's cgroup (`foo.service`).
+    /// The systemd unit of the process's cgroup (`foo.service`). Lot 277:
+    /// for a process started in that cgroup only.
     Unit(String),
 }
 
@@ -554,6 +556,15 @@ pub trait ActorFacts: Send + Sync {
     /// `/proc/<pid>/exe` opened: its path, when it is a root-owned file of
     /// a root-owned tree no one else can write, and its SHA-256.
     fn trusted_exe(&self, pid: u32) -> Option<(String, [u8; 32])>;
+    /// Lot 277: whether `pid` started in the cgroup it runs in — spawned
+    /// into it by systemd, or forked from a process that was — and so may
+    /// be exempt by its cgroup or unit. `Some(false)`: it, or a process it
+    /// was forked from, was moved into a cgroup (`cgroup.procs`) by anyone
+    /// but systemd's placement, or started by `clone3(CLONE_INTO_CGROUP)`
+    /// by anyone but PID 1 (the kernel's marks, `nn_linux::cgroup_join`).
+    /// `None`: not known (no tracker on this kernel, a mark the kernel
+    /// could not take) — not exempt either.
+    fn started_in_cgroup(&self, pid: u32) -> Option<bool>;
 }
 
 /// The unit a cgroup path names: its last `.service` / `.scope` component.
@@ -565,7 +576,10 @@ fn unit_of(cgroup: &str) -> Option<&str> {
 
 /// The exemption among `ex` that covers process `pid` (acting as `uid`
 /// when the event says so), if any. Facts are read only for the kinds
-/// present, at most once each.
+/// present, at most once each. Lot 277: an exemption by cgroup or unit
+/// covers a process of that cgroup only if it started there
+/// ([`ActorFacts::started_in_cgroup`], read once, and only when a cgroup
+/// or a unit matched).
 pub fn exempt(
     ex: &[Exemption],
     pid: u32,
@@ -577,22 +591,31 @@ pub fn exempt(
     }
     let mut uid: Option<Option<u32>> = None;
     let mut cgroup: Option<Option<String>> = None;
+    let mut started: Option<Option<bool>> = None;
     let mut exe: Option<Option<(String, [u8; 32])>> = None;
+    let mut started_here =
+        || *started.get_or_insert_with(|| facts.started_in_cgroup(pid)) == Some(true);
     for e in ex {
         let hit = match e {
             Exemption::Uid(u) => {
                 let got = *uid.get_or_insert_with(|| event_uid.or_else(|| facts.uid(pid)));
                 got == Some(*u)
             }
-            Exemption::Cgroup(c) => cgroup
-                .get_or_insert_with(|| facts.cgroup(pid))
-                .as_deref()
-                .is_some_and(|g| g == c),
-            Exemption::Unit(u) => cgroup
-                .get_or_insert_with(|| facts.cgroup(pid))
-                .as_deref()
-                .and_then(unit_of)
-                .is_some_and(|g| g == u),
+            Exemption::Cgroup(c) => {
+                cgroup
+                    .get_or_insert_with(|| facts.cgroup(pid))
+                    .as_deref()
+                    .is_some_and(|g| g == c)
+                    && started_here()
+            }
+            Exemption::Unit(u) => {
+                cgroup
+                    .get_or_insert_with(|| facts.cgroup(pid))
+                    .as_deref()
+                    .and_then(unit_of)
+                    .is_some_and(|g| g == u)
+                    && started_here()
+            }
             Exemption::Exe { path, sha256 } => exe
                 .get_or_insert_with(|| facts.trusted_exe(pid))
                 .as_ref()
@@ -757,6 +780,8 @@ mod tests {
         uid: Option<u32>,
         cgroup: Option<&'static str>,
         exe: Option<(&'static str, [u8; 32])>,
+        /// Lot 277.
+        started: Option<bool>,
         reads: Mutex<Vec<&'static str>>,
     }
 
@@ -773,6 +798,10 @@ mod tests {
             self.reads.lock().push("exe");
             self.exe.map(|(p, h)| (p.to_string(), h))
         }
+        fn started_in_cgroup(&self, _: u32) -> Option<bool> {
+            self.reads.lock().push("started");
+            self.started
+        }
     }
 
     fn facts() -> Facts {
@@ -780,8 +809,85 @@ mod tests {
             uid: Some(998),
             cgroup: Some("/system.slice/backup.service"),
             exe: Some(("/usr/bin/backup", [7u8; 32])),
+            started: Some(true),
             reads: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Lot 277: an exemption by cgroup or unit holds for a process started
+    /// in the cgroup only — not for one moved into it (or forked from one
+    /// that was), nor where that is not known; the other kinds do not ask.
+    #[test]
+    fn a_cgroup_or_unit_exemption_needs_a_start_in_the_cgroup() {
+        for (started, holds) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let f = Facts { started, ..facts() };
+            for e in [
+                Exemption::Unit("backup.service".into()),
+                Exemption::Cgroup("/system.slice/backup.service".into()),
+            ] {
+                assert_eq!(
+                    exempt(std::slice::from_ref(&e), 42, None, &f).is_some(),
+                    holds,
+                    "{e} with started {started:?}"
+                );
+            }
+            // a uid or exe exemption is the actor's, wherever it started
+            assert!(exempt(&[Exemption::Uid(998)], 42, None, &f).is_some());
+            assert!(exempt(
+                &[Exemption::Exe {
+                    path: "/usr/bin/backup".into(),
+                    sha256: [7; 32],
+                }],
+                42,
+                None,
+                &f
+            )
+            .is_some());
+        }
+        // a moved process exempt by its uid still is, and says so
+        let moved = Facts {
+            started: Some(false),
+            ..facts()
+        };
+        assert_eq!(
+            exempt(
+                &[
+                    Exemption::Unit("backup.service".into()),
+                    Exemption::Uid(998)
+                ],
+                42,
+                None,
+                &moved
+            )
+            .as_deref(),
+            Some("uid 998")
+        );
+        // the start is read once, after a cgroup matched, never before
+        let f = facts();
+        exempt(
+            &[
+                Exemption::Unit("other.service".into()),
+                Exemption::Cgroup("/x/b.service".into()),
+            ],
+            42,
+            None,
+            &f,
+        );
+        assert_eq!(*f.reads.lock(), vec!["cgroup"]);
+        let f = Facts {
+            started: Some(false),
+            ..facts()
+        };
+        exempt(
+            &[
+                Exemption::Unit("backup.service".into()),
+                Exemption::Cgroup("/system.slice/backup.service".into()),
+            ],
+            42,
+            None,
+            &f,
+        );
+        assert_eq!(*f.reads.lock(), vec!["cgroup", "started"]);
     }
 
     #[test]
@@ -816,6 +922,7 @@ mod tests {
             uid: None,
             cgroup: None,
             exe: None,
+            started: None,
             reads: Mutex::new(Vec::new()),
         };
         for e in [

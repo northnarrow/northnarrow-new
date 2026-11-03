@@ -16,7 +16,19 @@
 //! file under `/sys` or `/proc`, except the admin key, `nft` and the
 //! install provenance (external audit DEP-007: how far `install.sh` could
 //! verify the release); [`run_in`] takes a root prefix so tests build a
-//! synthetic tree.
+//! synthetic tree. Each check's id, status and value are signed in the
+//! capability manifest at every boot (`host_hardening`).
+//!
+//! Lot 277: `lockdown=integrity` is the recommendation the table leads
+//! with — without it root can rewrite the running kernel, the agent's
+//! hooks with it, and no hook of the agent can refuse that; kexec counts
+//! its load limits (6.6+); module signing counts `modules_disabled`; and
+//! [`kernel_fixes`] compares the kernel's version with the fixes the
+//! workers' sandbox and the anti-tamper rely on ([`KERNEL_FIXES`], each
+//! version from the kernel's CVE records or the stable changelogs). A
+//! distribution backports fixes without changing the version, so a kernel
+//! whose version is below a fix is `unknown` on a distribution's kernel —
+//! never `ok` — and `warn` only where the version is the upstream one.
 
 use std::path::{Path, PathBuf};
 
@@ -68,7 +80,268 @@ pub fn run_in(root: &Path) -> Vec<Check> {
         nft_tool(root),
         install_provenance(root),
         cgroup_v1(root),
+        kernel_fixes(root),
     ]
+}
+
+/// Lot 277: a kernel fix the workers' sandbox or the anti-tamper relies
+/// on, by the first release of each stable branch that carries it.
+#[derive(Debug, Clone, Copy)]
+pub struct KernelFix {
+    pub cve: &'static str,
+    /// What the bug gives an attacker against the agent.
+    pub what: &'static str,
+    /// The first release with the bug: older kernels are not affected.
+    pub introduced: (u32, u32, u32),
+    /// `(major, minor, sublevel)`: the first release of the `major.minor`
+    /// stable branch with the fix.
+    pub stable: &'static [(u32, u32, u32)],
+    /// The first mainline release with the fix (`major.minor`, every
+    /// later branch has it).
+    pub mainline: (u32, u32),
+    /// Where the versions come from.
+    pub source: &'static str,
+}
+
+/// Lot 277: the fixes [`kernel_fixes`] checks, as published (read on
+/// 2026-11-03):
+///
+/// - CVE-2022-0847 (Dirty Pipe): a page-cache write to any file the caller
+///   can read — the agent's binaries, its configuration. Since 5.8 (commit
+///   f6dd975583bd); fixed in 5.10.102, 5.15.25, 5.16.11 and mainline 5.17
+///   (commit 9d2231c5d74e): <https://dirtypipe.cm4all.com/> and
+///   `ChangeLog-5.10.102`, `-5.15.25`, `-5.16.11`, `-5.17` on
+///   cdn.kernel.org.
+/// - CVE-2022-30594: `PTRACE_SEIZE` sets `PTRACE_O_SUSPEND_SECCOMP`
+///   without the capability — a tracer suspends a seccomp filter. Since
+///   4.3 (commit 13c4a90119d2); fixed in 5.10.110, 5.15.33, 5.16.19,
+///   5.17.2 and mainline 5.18 (commit ee1fee900537): the CVE record
+///   ("before 5.17.2"), `ChangeLog-5.10.110`, `-5.15.33`, `-5.16.19`,
+///   `-5.17.2`, `-5.18`.
+/// - CVE-2024-42318: `keyctl(KEYCTL_SESSION_TO_PARENT)` drops the caller's
+///   Landlock domain (`cred_transfer`). Since 5.13; fixed in 5.15.165,
+///   6.1.103, 6.6.44, 6.10.3 and mainline 6.11: the kernel CNA's record,
+///   `vulns.git` `cve/published/2024/CVE-2024-42318.json`.
+/// - CVE-2025-68736: rights reached through a disconnected directory of a
+///   bind mount. Since 5.13; fixed in 6.1.189, 6.6.143, 6.12.80, 6.18.2
+///   and mainline 6.19 — no 5.15 fix listed: the kernel CNA's record,
+///   `vulns.git` `cve/published/2025/CVE-2025-68736.json`.
+pub const KERNEL_FIXES: &[KernelFix] = &[
+    KernelFix {
+        cve: "CVE-2022-0847",
+        what: "Dirty Pipe: a write into the page cache of any readable file (the agent's binaries)",
+        introduced: (5, 8, 0),
+        stable: &[(5, 10, 102), (5, 15, 25), (5, 16, 11)],
+        mainline: (5, 17),
+        source: "https://dirtypipe.cm4all.com/ ; cdn.kernel.org ChangeLog-5.10.102, -5.15.25, -5.16.11, -5.17",
+    },
+    KernelFix {
+        cve: "CVE-2022-30594",
+        what: "PTRACE_SEIZE suspends a seccomp filter (the workers' last layer)",
+        introduced: (4, 3, 0),
+        stable: &[(5, 10, 110), (5, 15, 33), (5, 16, 19), (5, 17, 2)],
+        mainline: (5, 18),
+        source: "https://www.cve.org/CVERecord?id=CVE-2022-30594 ; cdn.kernel.org ChangeLog-5.10.110, -5.15.33, -5.16.19, -5.17.2, -5.18",
+    },
+    KernelFix {
+        cve: "CVE-2024-42318",
+        what: "keyctl(KEYCTL_SESSION_TO_PARENT) drops a Landlock domain (the workers' filter refuses keyctl)",
+        introduced: (5, 13, 0),
+        stable: &[(5, 15, 165), (6, 1, 103), (6, 6, 44), (6, 10, 3)],
+        mainline: (6, 11),
+        source: "https://git.kernel.org/pub/scm/linux/security/vulns.git/plain/cve/published/2024/CVE-2024-42318.json",
+    },
+    KernelFix {
+        cve: "CVE-2025-68736",
+        what: "Landlock rights through a disconnected directory (the workers hold no filesystem right)",
+        introduced: (5, 13, 0),
+        stable: &[(6, 1, 189), (6, 6, 143), (6, 12, 80), (6, 18, 2)],
+        mainline: (6, 19),
+        source: "https://git.kernel.org/pub/scm/linux/security/vulns.git/plain/cve/published/2025/CVE-2025-68736.json",
+    },
+];
+
+/// Lot 277: what a kernel's version says of one fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixState {
+    /// Older than the bug.
+    NotAffected,
+    /// The version carries the fix (its stable branch's, or mainline's).
+    Fixed,
+    /// The upstream version below the fix, on a kernel whose version is
+    /// the upstream one.
+    Missing,
+    /// The version below the fix on a distribution's kernel, which may
+    /// carry it backported: not known.
+    Unknown,
+}
+
+/// Lot 277: the running kernel's upstream version and whether a
+/// distribution's backports may make the number lag its fixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelVersion {
+    pub version: (u32, u32, u32),
+    /// `osrelease`, and where the upstream version was read when not from
+    /// it (`Ubuntu … 5.15.131`, `Debian 6.1.112-1`).
+    pub release: String,
+    /// The distribution that built it, when its files say so.
+    pub distro: Option<&'static str>,
+}
+
+/// `major.minor[.sublevel]` at the start of `s`.
+fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+    let head: String = s
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let mut it = head.split('.').filter(|p| !p.is_empty());
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    let sub = it.next().map_or(Some(0), |p| p.parse().ok())?;
+    Some((major, minor, sub))
+}
+
+/// Lot 277: the kernel's upstream version — Ubuntu's
+/// `/proc/version_signature` (its last field is the upstream stable
+/// version the kernel is based on), Debian's `Debian <version>` in
+/// `/proc/version` (the one of the kernel's own branch, not the
+/// compiler's), else `osrelease`. A distribution is named when its files
+/// say so, or when `osrelease` keeps a sublevel of 0 behind a suffix (the
+/// enterprise kernels' frozen numbers: `5.14.0-427.el9`).
+pub fn kernel_version(root: &Path) -> Option<KernelVersion> {
+    let osrelease = read(root, "/proc/sys/kernel/osrelease")?;
+    let own = parse_version(&osrelease)?;
+    if let Some(sig) = read(root, "/proc/version_signature") {
+        if let Some(v) = sig.split_whitespace().last().and_then(parse_version) {
+            if (v.0, v.1) == (own.0, own.1) {
+                return Some(KernelVersion {
+                    version: v,
+                    release: format!("{osrelease} ({sig})"),
+                    distro: Some("Ubuntu"),
+                });
+            }
+        }
+    }
+    if let Some(banner) = read(root, "/proc/version") {
+        let debian = banner
+            .match_indices("Debian ")
+            .filter_map(|(i, _)| {
+                let rest = &banner[i + "Debian ".len()..];
+                let v = parse_version(rest)?;
+                ((v.0, v.1) == (own.0, own.1)).then(|| {
+                    let word = rest.split_whitespace().next().unwrap_or_default();
+                    (v, word.to_string())
+                })
+            })
+            .last();
+        if let Some((v, word)) = debian {
+            return Some(KernelVersion {
+                version: v,
+                release: format!("{osrelease} (Debian {word})"),
+                distro: Some("Debian"),
+            });
+        }
+    }
+    let suffix = osrelease
+        .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.')
+        .to_string();
+    let lower = osrelease.to_ascii_lowercase();
+    let distro = if lower.contains(".el") {
+        Some("Red Hat family")
+    } else if lower.contains("-default") || lower.contains("suse") {
+        Some("SUSE")
+    } else if lower.contains("ubuntu") || lower.contains("-generic") {
+        Some("Ubuntu")
+    } else if own.2 == 0 && !suffix.is_empty() && !suffix.starts_with("-rc") {
+        Some("a distribution")
+    } else {
+        None
+    };
+    Some(KernelVersion {
+        version: own,
+        release: osrelease,
+        distro,
+    })
+}
+
+/// Lot 277: what `v` says of `fix`.
+pub fn fix_state(fix: &KernelFix, v: &KernelVersion) -> FixState {
+    let (major, minor, sub) = v.version;
+    if (major, minor, sub) < fix.introduced {
+        return FixState::NotAffected;
+    }
+    if (major, minor) >= fix.mainline {
+        return FixState::Fixed;
+    }
+    let in_branch = fix
+        .stable
+        .iter()
+        .find(|(a, b, _)| (*a, *b) == (major, minor))
+        .is_some_and(|(_, _, s)| sub >= *s);
+    if in_branch {
+        FixState::Fixed
+    } else if v.distro.is_some() {
+        FixState::Unknown
+    } else {
+        FixState::Missing
+    }
+}
+
+/// Lot 277: the running kernel against [`KERNEL_FIXES`]. `ok` when every
+/// fix is in the version (or the kernel predates the bug); `warn` when an
+/// upstream kernel's version lacks one; else `unknown`: a distribution's
+/// kernel whose version is below a fix may carry it backported — its
+/// security tracker says, the version does not.
+fn kernel_fixes(root: &Path) -> Check {
+    let fix = "upgrade to a kernel whose stable branch carries the fix (docs/operator/KERNEL_COMPATIBILITY.md, \"Kernel fix level\"); on a distribution's kernel check its security tracker for each CVE named `unknown` — the agent's workers and anti-tamper rely on these fixes";
+    let Some(v) = kernel_version(root) else {
+        return Check {
+            id: "kernel_fixes",
+            name: "Kernel fixes the sandbox relies on",
+            status: Status::Unknown,
+            value: "osrelease unreadable".to_string(),
+            fix,
+        };
+    };
+    let states: Vec<(&KernelFix, FixState)> =
+        KERNEL_FIXES.iter().map(|f| (f, fix_state(f, &v))).collect();
+    let status = if states.iter().any(|(_, s)| *s == FixState::Missing) {
+        Status::Warn
+    } else if states.iter().any(|(_, s)| *s == FixState::Unknown) {
+        Status::Unknown
+    } else {
+        Status::Ok
+    };
+    let (a, b, c) = v.version;
+    let parts: Vec<String> = states
+        .iter()
+        .map(|(f, s)| {
+            let word = match s {
+                FixState::NotAffected => "not affected",
+                FixState::Fixed => "fixed",
+                FixState::Missing => "MISSING",
+                FixState::Unknown => "unknown",
+            };
+            format!("{} {word}", f.cve)
+        })
+        .collect();
+    let backports = match (v.distro, status) {
+        (Some(d), Status::Unknown) => {
+            format!(" — {d} backports fixes without changing the version")
+        }
+        _ => String::new(),
+    };
+    Check {
+        id: "kernel_fixes",
+        name: "Kernel fixes the sandbox relies on",
+        status,
+        value: format!(
+            "{a}.{b}.{c} from {}: {}{backports}",
+            v.release,
+            parts.join(", ")
+        ),
+        fix,
+    }
 }
 
 /// The cgroup v1 controllers a root can mount on a host whose systemd runs
@@ -321,7 +594,7 @@ fn lockdown(root: &Path) -> Check {
         name: "Kernel lockdown mode",
         status,
         value,
-        fix: "boot with `lockdown=integrity` (Secure Boot enables it on most distros): blocks unsigned modules, kexec of unsigned kernels, /dev/mem and other runtime kernel modification by root",
+        fix: "boot with `lockdown=integrity` (Secure Boot enables it on most distros) — recommended on every host the agent defends: without it root can rewrite the running kernel (an unsigned module, /dev/mem, kexec of an unsigned kernel, a kprobe's write) and remove the agent's hooks with it, which no hook of the agent can refuse",
     }
 }
 
@@ -354,8 +627,15 @@ fn module_sig_enforce(root: &Path) -> Check {
             None
         }
     });
+    // Lot 277: `kernel.modules_disabled=1` (one-way until reboot) refuses
+    // every module load, signed or not.
+    let modules_off = read(root, "/proc/sys/kernel/modules_disabled").as_deref() == Some("1");
     let (status, value) = match read(root, "/sys/module/module/parameters/sig_enforce") {
         Some(v) if v == "Y" => (Status::Ok, v),
+        Some(v) if modules_off => (
+            Status::Ok,
+            format!("{v} (every module load refused: modules_disabled=1)"),
+        ),
         Some(v) => match lockdown_mode {
             Some(mode) => (
                 Status::Ok,
@@ -424,8 +704,25 @@ fn ima(root: &Path) -> Check {
 }
 
 fn kexec_load_disabled(root: &Path) -> Check {
+    // Lot 277: on 6.6+ the load limits — both 0 refuse every load as the
+    // switch does.
+    let limit = |rel: &str| read(root, rel);
+    let limits_zero = limit("/proc/sys/kernel/kexec_load_limit_reboot").as_deref() == Some("0")
+        && limit("/proc/sys/kernel/kexec_load_limit_panic").as_deref() == Some("0");
+    let lockdown_on = read(root, "/sys/kernel/security/lockdown")
+        .is_some_and(|s| s.contains("[integrity]") || s.contains("[confidentiality]"));
     let (status, value) = match read(root, "/proc/sys/kernel/kexec_load_disabled") {
         Some(v) if v == "1" => (Status::Ok, v),
+        Some(v) if limits_zero => (
+            Status::Ok,
+            format!("{v} (kexec_load_limit_reboot and _panic 0: no load left)"),
+        ),
+        Some(v) if lockdown_on => (
+            Status::Warn,
+            format!(
+                "{v} (lockdown refuses an unsigned image; a signed kernel still boots with                  another command line)"
+            ),
+        ),
         Some(v) => (Status::Warn, v),
         None => (
             Status::Unknown,
@@ -562,15 +859,335 @@ mod tests {
             "proc/cgroups",
             b"#subsys_name\thierarchy\tnum_cgroups\tenabled\ncpu\t0\t80\t1\nfreezer\t0\t80\t1\n",
         );
+        w(r, "proc/sys/kernel/osrelease", b"6.19.1\n");
         let checks = run_in(r);
-        assert_eq!(checks.len(), 12);
+        assert_eq!(checks.len(), 13);
         assert_eq!(warn_count(&checks), 0, "{:?}", checks);
         assert!(
             checks.iter().all(|c| c.status == Status::Ok),
             "{:?}",
             checks
         );
-        assert!(render_table(&checks).contains("12 check(s), 0 warning(s)"));
+        assert!(render_table(&checks).contains("13 check(s), 0 warning(s)"));
+    }
+
+    fn kernel(files: &[(&str, &str)]) -> Check {
+        let d = tempfile::tempdir().unwrap();
+        for (rel, body) in files {
+            w(d.path(), rel, body.as_bytes());
+        }
+        kernel_fixes(d.path())
+    }
+
+    /// Lot 277: an upstream kernel's version decides — at or past each
+    /// fix of its branch `ok`, below one `warn` with the CVE named; a
+    /// branch the fix never reached (6.8, 5.14) is below it.
+    #[test]
+    fn an_upstream_kernel_is_judged_by_its_version() {
+        let c = kernel(&[("proc/sys/kernel/osrelease", "6.6.143\n")]);
+        assert_eq!(c.status, Status::Ok, "{}", c.value);
+        assert!(
+            c.value
+                .starts_with("6.6.143 from 6.6.143: CVE-2022-0847 fixed"),
+            "{}",
+            c.value
+        );
+        let c = kernel(&[("proc/sys/kernel/osrelease", "6.6.142\n")]);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.value.contains("CVE-2025-68736 MISSING"), "{}", c.value);
+        assert!(c.value.contains("CVE-2024-42318 fixed"), "{}", c.value);
+        let c = kernel(&[("proc/sys/kernel/osrelease", "6.8.12\n")]);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.value.contains("CVE-2024-42318 MISSING"), "{}", c.value);
+        // 5.15: Dirty Pipe from 5.15.25, CVE-2022-30594 from 5.15.33
+        let c = kernel(&[("proc/sys/kernel/osrelease", "5.15.30\n")]);
+        assert!(c.value.contains("CVE-2022-0847 fixed"), "{}", c.value);
+        assert!(c.value.contains("CVE-2022-30594 MISSING"), "{}", c.value);
+        // older than the bugs: not affected (Landlock from 5.13, Dirty
+        // Pipe from 5.8)
+        let c = kernel(&[("proc/sys/kernel/osrelease", "5.4.300\n")]);
+        assert!(
+            c.value.contains("CVE-2022-0847 not affected"),
+            "{}",
+            c.value
+        );
+        assert!(
+            c.value.contains("CVE-2024-42318 not affected"),
+            "{}",
+            c.value
+        );
+        assert!(c.value.contains("CVE-2022-30594 MISSING"), "{}", c.value);
+        // the mainline release of each fix and every later one
+        let c = kernel(&[("proc/sys/kernel/osrelease", "6.19.0-rc3\n")]);
+        assert_eq!(c.status, Status::Ok, "{}", c.value);
+        assert_eq!(
+            kernel(&[("proc/sys/kernel/osrelease", "7.0.0\n")]).status,
+            Status::Ok
+        );
+        // nothing readable: unknown
+        assert_eq!(kernel(&[]).status, Status::Unknown);
+    }
+
+    /// Lot 277: a distribution's kernel below a fix is `unknown`, never
+    /// `ok`, and never `warn` either: the version cannot say. Ubuntu's
+    /// signature and Debian's banner give the upstream version; a frozen
+    /// enterprise number (`5.14.0-….el9`) gives none past its base.
+    #[test]
+    fn a_distribution_kernel_below_a_fix_is_unknown() {
+        // Ubuntu 22.04: based on 5.15.131 — Dirty Pipe and CVE-2022-30594
+        // fixed upstream, the Landlock fixes not in the number
+        let c = kernel(&[
+            ("proc/sys/kernel/osrelease", "5.15.0-91-generic\n"),
+            (
+                "proc/version_signature",
+                "Ubuntu 5.15.0-91.101-generic 5.15.131\n",
+            ),
+        ]);
+        assert_eq!(c.status, Status::Unknown, "{}", c.value);
+        assert!(
+            c.value
+                .starts_with("5.15.131 from 5.15.0-91-generic (Ubuntu"),
+            "{}",
+            c.value
+        );
+        assert!(
+            c.value
+                .contains("CVE-2022-0847 fixed, CVE-2022-30594 fixed"),
+            "{}",
+            c.value
+        );
+        assert!(c.value.contains("CVE-2024-42318 unknown"), "{}", c.value);
+        assert!(c.value.contains("Ubuntu backports fixes"), "{}", c.value);
+        // without the signature the frozen 5.15.0 says nothing past 5.15.0
+        let c = kernel(&[("proc/sys/kernel/osrelease", "5.15.0-91-generic\n")]);
+        assert_eq!(c.status, Status::Unknown);
+        assert!(c.value.contains("CVE-2022-0847 unknown"), "{}", c.value);
+        // Debian 12: the kernel's own version, not the compiler's
+        let c = kernel(&[
+            ("proc/sys/kernel/osrelease", "6.1.0-26-amd64\n"),
+            (
+                "proc/version",
+                "Linux version 6.1.0-26-amd64 (debian-kernel@lists.debian.org) (gcc-12                  (Debian 12.2.0-14) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP                  PREEMPT_DYNAMIC Debian 6.1.112-1 (2024-09-30)\n",
+            ),
+        ]);
+        assert_eq!(c.status, Status::Unknown, "{}", c.value);
+        assert!(
+            c.value
+                .starts_with("6.1.112 from 6.1.0-26-amd64 (Debian 6.1.112-1)"),
+            "{}",
+            c.value
+        );
+        assert!(c.value.contains("CVE-2024-42318 fixed"), "{}", c.value);
+        assert!(c.value.contains("CVE-2025-68736 unknown"), "{}", c.value);
+        // Debian past every fix of its branch: ok
+        let c = kernel(&[
+            ("proc/sys/kernel/osrelease", "6.1.0-40-amd64\n"),
+            (
+                "proc/version",
+                "Linux version 6.1.0-40-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.190-1\n",
+            ),
+        ]);
+        assert_eq!(c.status, Status::Ok, "{}", c.value);
+        // the kernel's own version, wherever the compiler's stands
+        let c = kernel(&[
+            ("proc/sys/kernel/osrelease", "6.1.0-26-amd64\n"),
+            (
+                "proc/version",
+                "Linux version 6.1.0-26-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.112-1 \
+                 (2024-09-30) (gcc-12 (Debian 12.2.0-14) 12.2.0)\n",
+            ),
+        ]);
+        assert!(c.value.starts_with("6.1.112 from"), "{}", c.value);
+        // a frozen number with no banner (a Debian kernel read without
+        // /proc/version): a distribution's, unknown below a fix; a plain
+        // upstream number of the same branch: warn
+        let c = kernel(&[("proc/sys/kernel/osrelease", "6.1.0-26-amd64\n")]);
+        assert_eq!(c.status, Status::Unknown, "{}", c.value);
+        assert!(c.value.contains("a distribution backports"), "{}", c.value);
+        assert_eq!(
+            kernel(&[("proc/sys/kernel/osrelease", "6.1.0\n")]).status,
+            Status::Warn
+        );
+        // RHEL 9: frozen at 5.14.0, a branch no upstream fix reached
+        let c = kernel(&[(
+            "proc/sys/kernel/osrelease",
+            "5.14.0-427.13.1.el9_4.x86_64\n",
+        )]);
+        assert_eq!(c.status, Status::Unknown, "{}", c.value);
+        assert!(c.value.contains("Red Hat family backports"), "{}", c.value);
+        // a signature of another branch is not this kernel's
+        let c = kernel(&[
+            ("proc/sys/kernel/osrelease", "6.8.12\n"),
+            (
+                "proc/version_signature",
+                "Ubuntu 5.15.0-91.101-generic 5.15.131\n",
+            ),
+        ]);
+        assert_eq!(c.status, Status::Warn, "{}", c.value);
+    }
+
+    /// Lot 277: the table as its sources publish it (read on 2026-11-03,
+    /// `KERNEL_FIXES`'s documentation): a changed version is a change of
+    /// the sources' reading, made here too — and each boundary judged.
+    #[test]
+    fn the_fix_table_is_the_sources() {
+        type Row = (
+            &'static str,
+            (u32, u32, u32),
+            Vec<(u32, u32, u32)>,
+            (u32, u32),
+        );
+        let table: Vec<Row> = KERNEL_FIXES
+            .iter()
+            .map(|f| (f.cve, f.introduced, f.stable.to_vec(), f.mainline))
+            .collect();
+        assert_eq!(
+            table,
+            vec![
+                (
+                    "CVE-2022-0847",
+                    (5, 8, 0),
+                    vec![(5, 10, 102), (5, 15, 25), (5, 16, 11)],
+                    (5, 17)
+                ),
+                (
+                    "CVE-2022-30594",
+                    (4, 3, 0),
+                    vec![(5, 10, 110), (5, 15, 33), (5, 16, 19), (5, 17, 2)],
+                    (5, 18)
+                ),
+                (
+                    "CVE-2024-42318",
+                    (5, 13, 0),
+                    vec![(5, 15, 165), (6, 1, 103), (6, 6, 44), (6, 10, 3)],
+                    (6, 11)
+                ),
+                (
+                    "CVE-2025-68736",
+                    (5, 13, 0),
+                    vec![(6, 1, 189), (6, 6, 143), (6, 12, 80), (6, 18, 2)],
+                    (6, 19)
+                ),
+            ]
+        );
+        let upstream = |v: (u32, u32, u32)| KernelVersion {
+            version: v,
+            release: String::new(),
+            distro: None,
+        };
+        for f in KERNEL_FIXES {
+            for (a, b, s) in f.stable {
+                assert_eq!(
+                    fix_state(f, &upstream((*a, *b, *s))),
+                    FixState::Fixed,
+                    "{}",
+                    f.cve
+                );
+                assert_eq!(
+                    fix_state(f, &upstream((*a, *b, s - 1))),
+                    FixState::Missing,
+                    "{} {a}.{b}.{}",
+                    f.cve,
+                    s - 1
+                );
+            }
+            let (ma, mi) = f.mainline;
+            assert_eq!(
+                fix_state(f, &upstream((ma, mi, 0))),
+                FixState::Fixed,
+                "{}",
+                f.cve
+            );
+            assert_eq!(
+                fix_state(f, &upstream(f.introduced)),
+                FixState::Missing,
+                "{}",
+                f.cve
+            );
+            let (ia, ib, _) = f.introduced;
+            if ib > 0 {
+                assert_eq!(
+                    fix_state(f, &upstream((ia, ib - 1, 999))),
+                    FixState::NotAffected,
+                    "{}",
+                    f.cve
+                );
+            }
+            // a distribution's kernel below the fix: unknown, never ok
+            let distro = KernelVersion {
+                distro: Some("Ubuntu"),
+                ..upstream(f.introduced)
+            };
+            assert_eq!(fix_state(f, &distro), FixState::Unknown, "{}", f.cve);
+        }
+    }
+
+    /// Lot 277: every fix's branches lie between its first affected
+    /// release and its mainline release, sorted, one per branch.
+    #[test]
+    fn the_fix_table_is_consistent() {
+        for f in KERNEL_FIXES {
+            let mut last = (0, 0);
+            for (a, b, s) in f.stable {
+                assert!((*a, *b, *s) > f.introduced, "{}", f.cve);
+                assert!((*a, *b) < f.mainline, "{}", f.cve);
+                assert!((*a, *b) > last, "{}: sorted, one per branch", f.cve);
+                last = (*a, *b);
+            }
+            assert!(
+                f.cve.starts_with("CVE-") && f.source.contains("kernel.org"),
+                "{}",
+                f.cve
+            );
+        }
+        assert_eq!(parse_version("6.8.0-45-generic"), Some((6, 8, 0)));
+        assert_eq!(parse_version("6.19-rc1"), Some((6, 19, 0)));
+        assert_eq!(parse_version("x"), None);
+    }
+
+    /// Lot 277: kexec's load limits (6.6+) at 0 refuse every load; under
+    /// lockdown alone a signed kernel still boots — still a warning.
+    #[test]
+    fn kexec_counts_its_load_limits() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        w(r, "proc/sys/kernel/kexec_load_disabled", b"0\n");
+        assert_eq!(kexec_load_disabled(r).status, Status::Warn);
+        w(
+            r,
+            "sys/kernel/security/lockdown",
+            b"none [integrity] confidentiality\n",
+        );
+        let c = kexec_load_disabled(r);
+        assert_eq!(c.status, Status::Warn);
+        assert!(
+            c.value.contains("a signed kernel still boots"),
+            "{}",
+            c.value
+        );
+        w(r, "proc/sys/kernel/kexec_load_limit_reboot", b"0\n");
+        assert_eq!(
+            kexec_load_disabled(r).status,
+            Status::Warn,
+            "one limit only"
+        );
+        w(r, "proc/sys/kernel/kexec_load_limit_panic", b"0\n");
+        let c = kexec_load_disabled(r);
+        assert_eq!(c.status, Status::Ok);
+        assert!(c.value.contains("no load left"), "{}", c.value);
+    }
+
+    /// Lot 277: `modules_disabled=1` refuses every module load.
+    #[test]
+    fn modules_disabled_counts_as_module_signature_enforcement() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        w(r, "sys/module/module/parameters/sig_enforce", b"N\n");
+        assert_eq!(module_sig_enforce(r).status, Status::Warn);
+        w(r, "proc/sys/kernel/modules_disabled", b"1\n");
+        let c = module_sig_enforce(r);
+        assert_eq!(c.status, Status::Ok);
+        assert!(c.value.contains("modules_disabled=1"), "{}", c.value);
     }
 
     /// Lot 273b: the v1 controllers a root can mount, unless the kernel's
@@ -739,9 +1356,11 @@ mod tests {
         // the Debian 12 lab image has no nftables (CMB-006 lab note)
         assert_eq!(by_id("nft"), Status::Warn);
         assert_eq!(by_id("install_provenance"), Status::Warn);
+        assert_eq!(by_id("kernel_fixes"), Status::Unknown);
         assert_eq!(warn_count(&checks), 8);
         let table = render_table(&checks);
         assert!(table.contains("fix: boot with `lockdown=integrity`"));
+        assert!(table.contains("recommended on every host"));
         assert!(table.contains("mounted 2×"));
         assert!(table.contains("/etc/northnarrow/admin.key"));
     }
