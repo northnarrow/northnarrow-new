@@ -624,9 +624,9 @@ vcargo() {
 # "the marker is there and the LSM list names bpf" for "past the reboot",
 # but the Debian 12 and 13 kernels list bpf on their first boot already:
 # in the seconds between the marker and the reboot a Debian guest was "up
-# and provisioned", and the reboot cut the next step's connection (`sync`:
-# "Connection reset by peer", `build`: "closed by remote host"). That was
-# every red Debian guest of the nightly from 23/10 to 02/11. The boot id
+# and provisioned", and the reboot cut the next step's connection (`sync`
+# or `build`: "Connection reset by peer", "closed by remote host"). That
+# was every red Debian guest of the nightly from 23/10 to 02/11. The boot id
 # tells the two boots apart on every distro. One connection gathers the
 # facts and they are judged here:
 #   0  ready: provisioned on an earlier boot, bpf among the active LSMs,

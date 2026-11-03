@@ -1025,7 +1025,7 @@ fn every_guest_template_records_its_provisioning_boot() {
         let at = text.find(write).unwrap() + write.len();
         let rest = &text[at..];
         assert!(
-            rest.trim_start_matches(|c: char| c == '\n')
+            rest.trim_start_matches('\n')
                 .starts_with("power_state:\n  mode: reboot\n"),
             "{name}: the marker is the last runcmd, the reboot right after: {rest}"
         );

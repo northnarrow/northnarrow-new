@@ -4663,3 +4663,74 @@ only in the table below, in the same PR as the evidence.
     the keys' mappings; typed errands (an enum, not a closure); nn-admin's
     sources in `keys_in_one_place`; a round of the copy-on-first-write
     guard under the capability trace.
+- **Lot 274 — the nightly lab VM gate's red nights (C01; the lab harness
+  and one privileged test, no product change).**
+  - What was wrong: six of the twelve nightly runs of `lab-vm.yml` from
+    22/10 to 02/11 were red. Each was classified from its job log, the
+    guest's serial console and the gate log (the runs' artefacts):
+    - Debian 12 failed at `sync` on 24/10, 28/10, 01/11 and 02/11, and
+      Debian 13 at `build` on 23/10 and 26/10. The cause is in the lab
+      harness. `wait_ssh` took "the lab marker exists and bpf is among the
+      LSMs" for "past cloud-init's reboot". The Debian 12 and 13 kernels
+      list bpf on their first boot already: the `lsm` line of `check` in
+      those jobs is the kernel's default list, not the template's. So `up`
+      said "guest is up and provisioned" in the seconds between the marker
+      (the last runcmd) and the reboot of power_state. The serial console
+      shows cloud-init finishing, then sshd stopping and the reboot, while
+      the next step's ssh was open ("kex_exchange_identification: read:
+      Connection reset by peer", "Connection to 127.0.0.1 closed by remote
+      host"). The gate's Ubuntu guests were not exposed, because their
+      first boot lists no bpf. AlmaLinux 9's default list includes bpf too,
+      so the same window was open in the self-hosted lab.
+    - Ubuntu 26.04 failed on 01/11 and 02/11 at
+      `canary_privileged_e2e::process_canary_exec_triggers_canary_tripped_event_and_combat`
+      (`ExitStatus(unix_wait_status(256))`, "left: None, right: Some(9)").
+      This is a bug in the test, deterministic on that guest since lab PR
+      269 (3daa3a2d, between the green 31/10 and the red 01/11). That PR
+      made the decoy a copy of `/bin/sleep` named `decoy_helper` and
+      asserted its SIGKILL. uutils' multi-call binary picks its utility
+      from the name it is run by: it found none and exited 1 at once. The
+      access row, the record and the KillProcessTree response were all
+      there (the assertions before the kill passed).
+  - What changed: the templates now write the provisioning boot's id
+    (`/proc/sys/kernel/random/boot_id`) into the lab marker, as a new file
+    renamed over it. `nn-lab.sh`'s `guest_boot_state` reads the boot id,
+    the marker, the active LSMs and the lockdown line in one connection.
+    `up` (under KVM and whpx) returns only for a guest on a later boot,
+    with bpf among its LSMs and, on a lockdown guest, its lockdown mode.
+    A marker without an id comes from a template before this lot; that
+    guest rebooted long ago, since runcmd runs once per instance. A guest
+    that does not get there ends the wait, after its console, with an
+    error naming where it stopped: still on its provisioning boot,
+    rebooted without bpf, not in lockdown, or unreachable. The canary
+    test's decoy is now a copy of `/bin/sleep` that keeps the name
+    `sleep`, in the test's own directory (as `response_privileged_e2e`
+    and the execq controller tests already do). Before any agent runs,
+    the test checks that the copy runs as sleep. Every assertion stays as
+    it was.
+  - Evidence: four tests in `xtask/tests/lab_host_safety.rs`. The first
+    covers the block's twelve states, among them the nightly's Debian case
+    (marker and bpf on the provisioning boot), Ubuntu's, an older
+    template's empty marker, bpf as a substring only, and the lockdown
+    cases. The second runs `wait_ssh` itself against a guest that answers
+    twice on its provisioning boot and is ready at the first answer after
+    it, plus its three errors. The third runs the command that gathers
+    the guest's facts on the build host. The fourth checks that every template writes the boot id last,
+    right before the reboot. `xtask/tests/lab_ci.rs` checks the error's
+    shape. Two mutations fail the tests: dropping the boot comparison, and
+    restoring the old readiness check.
+  - Lab, on GitHub-hosted KVM guests (our own CI, nothing else): a
+    manual dispatch of `lab-vm.yml` on this branch, run 41590801439 at
+    0a9fc062, is the nightly's gate on all five guests. It was green on
+    every guest: Ubuntu 22.04 (5.15), Ubuntu 24.04 (6.8), Ubuntu 26.04
+    (7.0), Debian 12 (6.1) and Debian 13 (6.12), each 87 suites, 103
+    passed, 0 failed, 0 expected failures. On Debian 12 the poll landed in
+    the window: at 06:40:21 "guest provisioned, still on its provisioning
+    boot: waiting for cloud-init's reboot", ready at 06:40:36, and `check`
+    then listed the template's LSMs (`…,apparmor,bpf`), not the first
+    boot's. On Ubuntu 26.04, `canary_privileged_e2e` passed 10 of 10.
+    The race needs no local guest to reproduce: the failing nights' own
+    serial consoles show it, and the xtask tests replay it.
+  - Level unchanged (C01 2). Lot 274's docs PR makes C01's row say what
+    the gate is: five guests nightly, green 6 nights of 12 from 22/10 to
+    02/11, every red night caused by the lab or a test.
