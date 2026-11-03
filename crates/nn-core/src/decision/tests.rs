@@ -1587,12 +1587,12 @@ fn the_ceiling_keeps_the_legacy_winners_kill() {
 }
 
 /// Lot 278: below COMBAT, R009's kill of a root exec from a user-writable
-/// path is held by the posture: R009's record (High) names the hold and
-/// keeps the staging rule's kill of the same exec held by the legacy
-/// ceiling — the hold is R009's own record, as its sanctioned one is, not a
-/// switch that lets a later rule's response through. A signed `enforce`
-/// gives R009 its kill back in every posture; `enforce` of R001 alone kills
-/// too (the operator's choice).
+/// path is held by the posture: R009's record (High) names the hold, and
+/// the staging rule's kill of root's exec is held the same way (root's exec
+/// from /tmp is R009's to decide) — the hold is the rule's own record, as
+/// R009's sanctioned one is, not a switch that lets a later rule's response
+/// through. A signed `enforce` gives R009 its kill back in every posture;
+/// `enforce` of R001 alone kills too (the operator's choice).
 #[test]
 fn below_combat_r009_records_and_its_record_holds_the_staging_kill() {
     let exec = spawn_as(0, "payload", "/tmp/payload");
@@ -1612,8 +1612,9 @@ fn below_combat_r009_records_and_its_record_holds_the_staging_kill() {
         .iter()
         .find(|m| m.rule_id == "R001_ExecFromTmp")
         .expect("R001 matched");
-    assert_eq!(r001.held, Some(super::combine::LEGACY_CEILING));
+    assert_eq!(r001.held, Some(super::posture_floor::KILL_FLOORS[1].held));
     assert_eq!(r001.verdict.action, ResponseAction::Log);
+    assert!(!r001.switch_held);
     for posture in [PostureKind::Observing, PostureKind::Engaged] {
         let d = prod("enforce R009_RootExecFromUserPath\n")
             .decide_in(&exec, posture)

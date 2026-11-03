@@ -1359,7 +1359,7 @@ fn the_event_loop_judges_each_event_as_of_its_time() {
         "posture.observe(&event",
         "ladder.observe(&event",
         "cow_guard.observe_event(&event)",
-        "engine.decide(&event)",
+        "engine.decide_in(&event, posture.current_kind())",
     ];
     for call in calls {
         assert!(code.contains(call), "process_event.rs: no `{call}`");

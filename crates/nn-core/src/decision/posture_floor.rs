@@ -18,10 +18,15 @@
 //! (a build's `conftest`, the installer's own exec from an unpacked tree)
 //! raises ENGAGED, for 24 hours (`StagingExec`, never corroboration), so
 //! the second run of the same installer would be killed. COMBAT is reached
-//! on corroborated or decisive evidence only. The record stays High. Its
-//! hold caps the staging rules' kill of the same exec (R001, R003), as its
-//! record of an administrator's session does (PROC-007): root's exec from
-//! those directories is R009's to decide.
+//! on corroborated or decisive evidence only. The record stays High.
+//!
+//! **R001 and R003 on root's exec** wait for COMBAT too: a root exec from
+//! `/tmp` or `/var/tmp` is R009's to decide (PROC-007: "R009 stays ahead of
+//! the staging rules"). They used to reach the same answer through the
+//! legacy ceiling under R009's first match; held by the posture on their
+//! own, their record is the same whatever order a late chain completion
+//! takes on the bus. A non-root exec from those directories is killed as
+//! before, in every posture.
 //!
 //! **Every other kill in OBSERVING** is listed in [`OBSERVING_KILLS`], with
 //! why it may run there: the kills that existed before Wave 4 (lab PR 214),
@@ -37,7 +42,7 @@
 //! rule that can kill must be classified here.
 
 use nn_model::posture_types::PostureKind;
-use nn_model::{ResponseAction, Verdict};
+use nn_model::{Event, ResponseAction, Verdict};
 
 use super::response_policy::hold_below_posture;
 
@@ -50,27 +55,50 @@ pub struct KillFloor {
     pub rule_id: &'static str,
     /// The lowest posture its built-in kill runs in.
     pub floor: PostureKind,
+    /// Only the kill of an exec by root (uid 0): the rule kills any other
+    /// exec in every posture.
+    pub root_only: bool,
     /// What the hold holds, named in the record's reasoning and `held`.
     pub held: &'static str,
 }
 
 /// The rules whose built-in kill needs a posture (lot 278).
-pub const KILL_FLOORS: &[KillFloor] = &[KillFloor {
-    rule_id: R009_ID,
-    floor: PostureKind::Combat,
-    held: "the kill of the root exec's process tree (R009, lot 278)",
-}];
+pub const KILL_FLOORS: &[KillFloor] = &[
+    KillFloor {
+        rule_id: R009_ID,
+        floor: PostureKind::Combat,
+        root_only: false,
+        held: "the kill of the root exec's process tree (R009, lot 278)",
+    },
+    KillFloor {
+        rule_id: "R001_ExecFromTmp",
+        floor: PostureKind::Combat,
+        root_only: true,
+        held: "the kill of root's exec from /tmp: R009's to decide (lot 278)",
+    },
+    KillFloor {
+        rule_id: "R003_ExecFromVarTmp",
+        floor: PostureKind::Combat,
+        root_only: true,
+        held: "the kill of root's exec from /var/tmp: R009's to decide (lot 278)",
+    },
+];
 
 /// The floor of `rule_id`'s built-in kill, if it has one.
 pub fn kill_floor(rule_id: &str) -> Option<&'static KillFloor> {
     KILL_FLOORS.iter().find(|f| f.rule_id == rule_id)
 }
 
-/// `v`, `rule_id`'s verdict on an event judged in `posture`: as the rule
-/// built it, or, for a kill below the rule's floor, held.
-pub fn hold(rule_id: &str, v: Verdict, posture: PostureKind) -> Verdict {
+/// `v`, `rule_id`'s verdict on `event` judged in `posture`: as the rule
+/// built it, or, for a kill below the rule's floor (of an exec by root, for
+/// a floor of root's execs only), held.
+pub fn hold(rule_id: &str, v: Verdict, posture: PostureKind, event: &Event) -> Verdict {
     match kill_floor(rule_id) {
-        Some(f) if is_kill(&v.action) && posture < f.floor => {
+        Some(f)
+            if is_kill(&v.action)
+                && posture < f.floor
+                && (!f.root_only || matches!(event, Event::ProcessSpawn { uid: 0, .. })) =>
+        {
             hold_below_posture(v, f.held, posture, f.floor)
         }
         _ => v,
@@ -100,7 +128,8 @@ pub enum ObservingKill {
 }
 
 /// Every rule of the catalogue whose verdict can be a kill, but those of
-/// [`KILL_FLOORS`]: why its kill may run in OBSERVING.
+/// [`KILL_FLOORS`] whose every kill has a floor: why its kill may run in
+/// OBSERVING (for R001 and R003: a non-root exec's).
 pub const OBSERVING_KILLS: &[(&str, ObservingKill)] = {
     use ObservingKill::*;
     &[
@@ -190,7 +219,8 @@ mod tests {
     }
 
     /// Every rule the catalogue says can kill is either held below a floor
-    /// or listed, with why its kill may run in OBSERVING — once.
+    /// in every case or listed, with why its kill may run in OBSERVING —
+    /// once; a floor of root's execs only is listed too.
     #[test]
     fn every_rule_that_can_kill_is_classified() {
         let can_kill: std::collections::BTreeSet<&str> = catalogue::docs()
@@ -200,12 +230,20 @@ mod tests {
         let mut listed = std::collections::BTreeSet::new();
         for id in KILL_FLOORS
             .iter()
+            .filter(|f| !f.root_only)
             .map(|f| f.rule_id)
             .chain(OBSERVING_KILLS.iter().map(|(id, _)| *id))
         {
             assert!(listed.insert(id), "{id} listed twice");
         }
         assert_eq!(can_kill, listed);
+        for f in KILL_FLOORS.iter().filter(|f| f.root_only) {
+            assert!(
+                OBSERVING_KILLS.iter().any(|(id, _)| *id == f.rule_id),
+                "{}: its non-root kill runs in OBSERVING",
+                f.rule_id
+            );
+        }
     }
 
     /// R009's kill runs in COMBAT only; below it the verdict is a held
@@ -219,7 +257,7 @@ mod tests {
             PostureKind::Engaged,
         ] {
             take_held();
-            let v = hold(R009_ID, kill(R009_ID), posture);
+            let v = hold(R009_ID, kill(R009_ID), posture, &root_exec());
             assert_eq!(v.action, ResponseAction::Log, "{posture}");
             assert_eq!(v.severity, Severity::High);
             assert!(v.reasoning.starts_with("why [held back: the kill"));
@@ -230,26 +268,46 @@ mod tests {
             assert_eq!(h.reasoning, "why");
         }
         take_held();
-        let v = hold(R009_ID, kill(R009_ID), PostureKind::Combat);
+        let v = hold(R009_ID, kill(R009_ID), PostureKind::Combat, &root_exec());
         assert_eq!(v.action, ResponseAction::KillProcessTree);
         assert!(take_held().is_none());
     }
 
-    /// No other rule is held by the posture, and a record stays a record.
+    /// R001 and R003 wait for COMBAT on root's exec only; no other rule is
+    /// held by the posture, and a record stays a record.
     #[test]
     fn only_the_floors_hold() {
         take_held();
+        for rule in ["R001_ExecFromTmp", "R003_ExecFromVarTmp"] {
+            let v = hold(rule, kill(rule), PostureKind::Observing, &user_exec());
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "{rule}");
+            assert!(take_held().is_none());
+            let v = hold(rule, kill(rule), PostureKind::Engaged, &root_exec());
+            assert_eq!(v.action, ResponseAction::Log, "{rule}");
+            assert!(take_held().expect("held").by_posture);
+            let v = hold(rule, kill(rule), PostureKind::Combat, &root_exec());
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "{rule}");
+        }
         let v = hold(
-            "R001_ExecFromTmp",
-            kill("R001_ExecFromTmp"),
+            "R002_ExecFromDevShm",
+            kill("R002_ExecFromDevShm"),
             PostureKind::Observing,
+            &root_exec(),
         );
         assert_eq!(v.action, ResponseAction::KillProcessTree);
         let mut log = kill(R009_ID);
         log.action = ResponseAction::Log;
-        let v = hold(R009_ID, log, PostureKind::Observing);
+        let v = hold(R009_ID, log, PostureKind::Observing, &root_exec());
         assert_eq!(v.action, ResponseAction::Log);
         assert_eq!(v.reasoning, "why");
         assert!(take_held().is_none());
+    }
+
+    fn root_exec() -> Event {
+        crate::decision::rules::testutil::spawn_as(0, "x", "/tmp/x")
+    }
+
+    fn user_exec() -> Event {
+        crate::decision::rules::testutil::spawn_as(1000, "x", "/tmp/x")
     }
 }

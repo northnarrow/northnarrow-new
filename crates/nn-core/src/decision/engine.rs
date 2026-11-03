@@ -297,7 +297,7 @@ impl<H: DecisionHost> RuleEngine<H> {
             let Some(v) = rule.evaluate(event) else {
                 continue;
             };
-            let v = posture_floor::hold(rule.id(), v, posture);
+            let v = posture_floor::hold(rule.id(), v, posture, event);
             let held = response_policy::take_held();
             matched.push(rule.id());
             let facts = &*self.facts;
