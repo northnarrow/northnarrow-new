@@ -5051,6 +5051,34 @@ number in parentheses is a lab PR.
     window's refresh are read by `xtask/tests/cgroup_guard.rs`; the unit
     files' `IgnoreOnIsolate=` and `system.control` directories by
     `watchdog/tests/systemd_units.rs`.
+  - The review of #490 (merge after A and B; the rest to lot 273c): A —
+    the watchdog's drop-in directories and the `northnarrow-.service.d`
+    prefix ones, which apply to both units, were not NOCREATE: on the PR's
+    head the lab made a drop-in in all four (C87), which the next start's
+    fresh cgroup would have taken (a `MemoryMax=4K`: an OOM loop); now the
+    agent's unit makes them, the agent registers them NOCREATE,
+    `uninstall.sh` removes them: 4 of 4 refused (`create`). B — the
+    resource files were recognised by their dentry's name and parent:
+    confirmed on the PR's head, the agent's `memory.max` reopened through
+    `open_by_handle_at` after `drop_caches` (a disconnected dentry, its path
+    `/`) took a write (C88; its own value, harmless there, where 4096
+    would have been the OOM kill); now by the file's kernfs node (its
+    `name`, its parent node's `id`: two optional BTF offsets,
+    `kernfs_node.parent` / `__parent` and `.id`, their absence signed) or by
+    its registered value — refused at the `open_by_handle_at` itself
+    (EPERM, `cgroup_limit`); the node alone, the file's registered value
+    deleted from `LIMIT_VALUES` first (`bpftool`, the lab build's
+    observe-mode guard): refused the same. Ubuntu 24.04, the fix by `upgrade-check`:
+    the verifier 81 of 81 (`protected_write_deny` 4,834
+    instructions), the full tamper check 104 cases, 100 OK (C87, C88
+    with them; C27, C57c, C64, C78c as before), `uninstall-check` and a
+    fresh install, a reboot with both units active. Mutations, set F: 10,
+    9 caught; MF10 (C88's helper without the dropped dentries) is the lab's
+    to see. Gates on the two commits (ff15dcaf): `build-ebpf`, clippy ×4,
+    fmt, `cargo test --workspace` 84 suites, 3,619 passed, 0 failed, 17
+    ignored, the privileged build, `attack-coverage`, golden ×5 (54 files,
+    the same bytes), MSRV, fuzz (14), portable-core (5), lockfiles
+    unchanged.
   - Open: a refused `set-property` still sets systemd's own copy of the
     property until the next `daemon-reload`, and the unit's next start
     applies it (the operator's reload before a restart; lot 273c: the

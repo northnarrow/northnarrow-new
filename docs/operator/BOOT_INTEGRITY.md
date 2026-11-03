@@ -336,10 +336,16 @@ EBPF-015): a new drop-in there — `systemctl edit --runtime`, the drop-in
 above — is refused outside a signed trusted-installer window, and the
 directory cannot be removed or renamed (`systemctl revert
 northnarrow-agent` fails with `EPERM` outside a window). It is one of the
-places systemd reads drop-ins from: the others are the host's
-(`service.d`, the `northnarrow-.service.d` prefix, `system.control` —
-`set-property` writes resource properties there, but any directive placed
-there is read —, the generators', `transient`, the vendor directory). A
+places systemd reads drop-ins from. Since lot 273b the units'
+`system.control` directories are registered the same way, and since the
+review of #490 the watchdog's drop-in directories
+(`/etc/systemd/system/northnarrow-watchdog.service.d` and its `/run`
+twin) and the `northnarrow-.service.d` prefix ones, whose drop-ins apply
+to both units (systemd 246 and later): the agent's unit makes all of them
+(empty) before every start, so a `MemoryMax=4K` dropped there — refused at
+the cgroup file after a reload, but applied to the next start's fresh
+cgroup — is refused at its creation. The others are the host's
+(`service.d`, the generators', `transient`, the vendor directory). A
 drop-in there is a self-integrity finding (`unit_dropin`,
 `unit_shadowed`); a mount it lays on or under the agent's directories is
 refused by the mount table, and one above them by the pins' proof while

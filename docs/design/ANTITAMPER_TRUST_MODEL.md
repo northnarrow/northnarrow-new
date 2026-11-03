@@ -751,7 +751,14 @@ that never evicts, a guard proved to run at every boot.
   directory, so a file that appears later (a controller enabled after the
   registration: the watchdog's `CPUQuota=` enables `cpu` in
   `system.slice` after the agent registered) is protected from its first
-  write. PID 1 writes these files whenever it realises a unit (a start, a
+  write. The name and the directory are the file's kernfs node's (its
+  `name`, its parent node's `id`, the directory's inode number), not its
+  dentry's: a file reopened through a handle (`name_to_handle_at`, the
+  dentries dropped, `open_by_handle_at`) has a disconnected dentry, named
+  `/` and its own parent (the review of #490, B; tamper case C88). A file
+  whose value was registered is recognised by its inode as well; without
+  the node's offsets in the kernel's BTF the dentry is read, a signed
+  degradation. PID 1 writes these files whenever it realises a unit (a start, a
   `set-property`, a reload): its open is let through and its write judged
   — the bytes the `write(2)` / `pwrite64(2)` carries, read from the
   syscall's arguments (`bpf_task_pt_regs`, x86-64), one trailing newline
@@ -784,7 +791,12 @@ that never evicts, a guard proved to run at every boot.
   registers them with `NOCREATE` like its other drop-in directories: a new
   drop-in there is refused outside a window (signed `create`).
   `uninstall.sh` removes them. `systemctl set-property` answers success
-  whatever was refused (below).
+  whatever was refused (below). The review of #490 (A): a drop-in written
+  by hand reaches the next start the same way, so the watchdog's drop-in
+  directories (`/etc/systemd/system/northnarrow-watchdog.service.d`, its
+  `/run` twin) and the `northnarrow-.service.d` prefix ones — whose
+  drop-ins systemd (246 and later) applies to both units — are made by the
+  agent's unit and registered `NOCREATE` too (tamper case C87).
 - **cgroup v1.** At the attach the agent decides from the host
   (`antitamper_bpf::cgroup_guard::v1_policy`): where `/sys/fs/cgroup` is
   the v2 hierarchy and no `name=systemd` v1 hierarchy is mounted (systemd

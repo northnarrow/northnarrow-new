@@ -662,6 +662,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     refuses the write itself to a `FS_PROTECT_WRITE` inode and judges the
     files above at the write, so a descriptor opened before the
     registration writes nothing; one lookup per write, signed rate-limited;
+  - the review of #490: the watchdog's drop-in directories and the
+    `northnarrow-.service.d` prefix ones (both units read them) made by the
+    agent's unit and registered NOCREATE — a hand-written `MemoryMax=4K`
+    there would reach the next start's fresh cgroup (C87); the resource
+    files recognised by their kernfs node (name, parent) or their
+    registered value, not by a dentry a handle-opened file does not have
+    (C88: `open_by_handle_at` after `drop_caches`);
   - a write of a protected process's `oom_score_adj` / `oom_adj` (its pid's
     or a thread's) is refused (`oom_adj`; four new optional BTF offsets,
     their absence signed);

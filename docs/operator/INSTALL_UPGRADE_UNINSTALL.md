@@ -780,7 +780,12 @@ is neither the agent nor the watchdog gets `EPERM` for:
   `/etc/systemd/system/northnarrow-agent.service.d` (Debian family, where
   install.sh makes it), its runtime drop-in directory
   `/run/systemd/system/northnarrow-agent.service.d` (lab PR 265: the unit
-  makes it, empty, before every start), and the bpffs pin root —
+  makes it, empty, before every start), the units' `system.control`
+  directories (lot 273b), the watchdog's drop-in directories under
+  `/etc/systemd/system` and `/run/systemd/system` and the
+  `northnarrow-.service.d` prefix ones, which apply to both units (the
+  review of #490; the agent's unit makes them, empty, before every start;
+  `uninstall.sh` removes them), and the bpffs pin root —
   `op=create`, `mkdir`, `symlink`, `link`, `mknod`;
 - an extended attribute set or removed on any protected inode (`setfattr`,
   `setcap`, `evmctl`, and `setfacl`, which 6.2+ kernels send through their
