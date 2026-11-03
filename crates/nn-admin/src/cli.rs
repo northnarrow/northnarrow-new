@@ -543,13 +543,12 @@ enum Cmd {
         agent_id_file: PathBuf,
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
-        /// Lot 278: the grant is for this command's parent, an installer
+        /// The grant is for this command's parent, an installer
         /// (`install.sh`, `uninstall.sh`, a root shell that will run one):
         /// the agent names it as the window's installer, and R009 records
         /// at Low what its own process tree executes from a home or `/tmp`
         /// after the grant, while the window is open. Without it the window
-        /// names no installer. The scripts pass it through the environment
-        /// (`NN_GRANT_FOR_INSTALLER=1`), which an older nn-admin ignores.
+        /// names no installer. The scripts set NN_GRANT_FOR_INSTALLER=1.
         #[arg(long = "for-installer", env = "NN_GRANT_FOR_INSTALLER")]
         for_installer: bool,
     },
