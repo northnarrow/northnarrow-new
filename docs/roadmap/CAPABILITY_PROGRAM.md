@@ -21,38 +21,44 @@ only in the table below, in the same PR as the evidence.
 
 ## Capabilities
 
-| ID | Capability | Level (2026-10-20) | Target |
-|---|---|---|---|
-| C01 | Linux sensor | 2 | 3 |
-| C02 | Windows sensor | 0 | 3 (user-mode first; a kernel driver needs WHCP signing) |
-| C03 | macOS sensor | 0 | 3 (needs Apple's Endpoint Security entitlement) |
-| C04 | ARM64 support | 0 | 3 |
-| C05 | Process telemetry | 1 | 3 |
-| C06 | File telemetry and FIM | 2 | 3 |
-| C07 | Endpoint network telemetry | 1 | 3 |
-| C08 | Identity and ITDR | 0 | 3 |
-| C09 | Cloud telemetry and posture | 0 | 3 |
-| C10 | Network detection (NDR) | 0 | 3 |
-| C11 | Containers and Kubernetes | 1 | 3 |
-| C12 | Synchronous inline blocking | 1 | 3 |
-| C13 | Malware prevention | 0 | 3 |
-| C14 | Behavioural detection and correlation | 2 | 3 |
-| C15 | Custom rules, declarative format | 1 | 3 |
-| C16 | Structured ATT&CK mapping | 1 | 3 |
-| C17 | Response on processes and files | 2 | 3 |
-| C18 | Host network isolation | 1 | 3 |
-| C19 | Rollback and remediation | 1 | 3 |
-| C20 | Automation, playbooks, SOAR | 1 | 3 |
-| C21 | SIEM integration and export | 0 | 3 |
-| C22 | Backend and multi-host correlation | 0 | 3 |
-| C23 | Anti-tamper and self-defence | 2 | 3 |
-| C24 | Offline and air-gapped operation | 2 | 3 |
-| C25 | Data sovereignty | 2 | 3 |
-| C26 | Open code, licence, inspectability | 2 | 3 |
-| C27 | Product supply-chain security | 1 | 3 |
-| C28 | Safe content release | 1 | 3 |
-| C29 | Independent public validation | 0 | 3 (needs third parties) |
-| C30 | Generative AI and data governance | 2 | 3 |
+Levels as of 2026-11-03: a re-assessment of `main` at `5f8046f3` against
+the code, the notes below and the public CI runs, made apart from the lab
+PRs (not a third party's: C29 is unchanged). Lot 274's note says what
+changed and why. The evidence column names what each level stands on; a
+number in parentheses is a lab PR.
+
+| ID | Capability | Level (2026-11-03) | Evidence | Target |
+|---|---|---|---|---|
+| C01 | Linux sensor | 2 | verified on Ubuntu 22.04, 24.04, 26.04, Debian 12, 13 and AlmaLinux 9 (last verified on 10/10, before Wave 4) (`docs/operator/KERNEL_COMPATIBILITY.md`); the 13-source sensor contract, the signed capability manifest (218, 271); verifier 77 of 77 programs on 6.8 and 6.12 (238); privileged suites in KVM guests, 2 on a pull request, 5 every night (227): green 6 nights of 12 from 22/10 to 02/11, the red ones a lab harness race and a test fixture (lot 274), not the sensor | 3 |
+| C02 | Windows sensor | 0 | no sensor code; `ci.yml` checks the portable crates for Windows targets, which is preparation, not support | 3 (user-mode first; a kernel driver needs WHCP signing) |
+| C03 | macOS sensor | 0 | no sensor code (as C02) | 3 (needs Apple's Endpoint Security entitlement) |
+| C04 | ARM64 support | 0 | aarch64: the portable crates' check only (`ci.yml`); the agent and the eBPF object are built for x86_64 only | 3 |
+| C05 | Process telemetry | 1 | exec only, with argv, parent and `start_ns` (`crates/nn-model/src/event.rs`; the parent's key, 238); no fork, exit or credential-change event (`crates/nn-core/src/contract/mod.rs`): those hooks serve the exploit guard only (219) | 3 |
+| C06 | File telemetry and FIM | 2 | the LSM `file_open` observer and the FIM drain (`docs/operator/SENSOR_CONTRACT.md`); 25 FIM rules (`docs/detection/RULE_CATALOGUE.md`); rename and unlink bursts (225); setattr from 6.9; multi-match (236) | 3 |
+| C07 | Endpoint network telemetry | 1 | outbound TCP connect v4/v6, flows at close, listen, outbound UDP and DNS queries (`SENSOR_CONTRACT.md`; 229); no inbound connection (`agent-ebpf/src/tcp_close.rs` drops passive sockets), no DNS answer, no TLS fingerprint in a flow (the parsers in `crates/nn-linux/src/worker/parse.rs` have no sensor); 224 added verdicts (C12, C14), not telemetry | 3 |
+| C08 | Identity and ITDR | 0 | no authentication event source (the FIM on `authorized_keys`, PAM and sudoers is C06) | 3 |
+| C09 | Cloud telemetry and posture | 0 | no IMDS code, no cloud context | 3 |
+| C10 | Network detection (NDR) | 0 | the beacon and fan-out rules judge the endpoint's own flows (C07, C14); no protocol log | 3 |
+| C11 | Containers and Kubernetes | 1 | the agent on a container host (`docs/operator/CONTAINER_HOST_DEPLOY.md`); R013 and EPG-002 detect an escape to the host; no container or pod id in the records | 3 |
+| C12 | Synchronous inline blocking | 2 | the exec policy at `bprm_check_security`: `-EACCES` per file class and lineage, LD_PRELOAD and LD_AUDIT, `mmap_file`; armed on 4 kernels, MS-01/02/03/32 refused (226); the `socket_connect` deny of the blocklist (224); EPG enforce, SIGKILL in the kernel (219); exec quarantine (223). All EXPERIMENTAL and off by default (`docs/design/EXEC_POLICY.md`); the behaviour proofs on one kernel | 3 |
+| C13 | Malware prevention | 1 | exec quarantine with a confined scanner (223), its signed hash list shipped empty (`docs/design/EXEC_QUARANTINE.md`), the default ELF heuristics resume the process; the exec policy refuses execs from memfd, deleted files and `/dev/shm` (226); EXPERIMENTAL, off by default | 3 |
+| C14 | Behavioural detection and correlation | 2 | 93 rules; the multi-match engine (236); chains with late execs (235, 244); the posture and the COMBAT ladder; golden replay of 29 cases (228, 243); the priority bus: tamper rows lost 3,699 → 0 (267) | 3 |
+| C15 | Custom rules, declarative format | 1 | the rules are compiled Rust; the operator has signed overlays only: per-rule off/audit/alert/enforce with exemptions (`docs/operator/RULE_POLICY.md`, 236), the lists, the exec policy's cells | 3 |
+| C16 | Structured ATT&CK mapping | 2 | `Rule::attack()` is mandatory: 93 of 93 rules on 66 techniques and 12 tactics of ATT&CK 20.0, pinned by the STIX bundle's commit and sha256 (`docs/detection/ATTACK_COVERAGE.md`); `mitre` and `mitre_version` in every record, a revoked or unlisted id fails the tests; the records of 44 rules carried their typed ids on 4 guests (221). The coverage is not measured: 0 `campaign` rows, the V2 campaign not run | 3 |
+| C17 | Response on processes and files | 2 | NEUTRALIZE on every offender, a signed outcome and unlock (217); intent and outcome signed per action, the actions in parallel: 400 kills' longest wait 19 s → 1.6 s (270); the quarantine vault v2 with restore (238) | 3 |
+| C18 | Host network isolation | 1 | ISOLATE per family, IPv4 and IPv6, with read-back, retry and a signed outcome, in the lab on 24.04 only (217); the signed management carve-out (`configs/combat-allow.cidrs`) and unlock; only inside an engaged COMBAT (`docs/operator/COMBAT_RECOVERY.md`) | 3 |
+| C19 | Rollback and remediation | 1 | copy on first write (222; EXPERIMENTAL, off by default): a signed restore of 51 of 51 files on XFS, 50 of 51 on ext4 (over the 16 MiB cap); in-place rewrites only: `x.enc` then an unlink or rename over `x`, and `truncate` by path, are not covered (`docs/design/COPY_ON_FIRST_WRITE.md`); no remediation of persistences | 3 |
+| C20 | Automation, playbooks, SOAR | 1 | the automatic COMBAT ladder and the per-rule policy; no playbook, webhook or OpenC2 | 3 |
+| C21 | SIEM integration and export | 0 | no export of the detections ("until R15 exports the chains off the host", `docs/operator/HEARTBEAT.md`); local JSON reads and the heartbeat pull (270) only; no OCSF, syslog or OTLP | 3 |
+| C22 | Backend and multi-host correlation | 0 | the heartbeat's external verifier (270) is not a backend | 3 |
+| C23 | Anti-tamper and self-defence | 2 (provisional) | 16 LSM deny hooks and 3 optional, the fail-opens counted and signed (215); start refused without BPF LSM, a hook's self-test (218); a fail-visible watchdog (216); the signing key decided once at boot (265, 268); unprivileged workers under Landlock and seccomp (272); the signed heartbeat's external verifier sees a stop in 6.5 s (270). Provisional: on Debian 13 (systemd 257) `systemctl stop` and `kill` stop the agent through `cgroup.kill` outside a maintenance window (tamper cases C31, C33; lot 273 open) | 3 |
+| C24 | Offline and air-gapped operation | 2 | the agent's only traffic of its own is the DNS probe to 127.0.0.1:53 (`crates/nn-linux/src/telemetry_probe.rs`); updates are an operator's action; the attestation is verified offline with a bundle (`docs/operator/INSTALL_UPGRADE_UNINSTALL.md`) | 3 |
+| C25 | Data sovereignty | 2 | the telemetry stays on the host; no model in the root process (214); the README's NIS2, GDPR, DORA and CRA badges are claims, not proofs | 3 |
+| C26 | Open code, licence, inspectability | 2 | Apache-2.0 (`Cargo.toml`), the eBPF object Dual MIT/GPL, a public repository, the module map | 3 |
+| C27 | Product supply-chain security | 1 | SLSA provenance, a CycloneDX SBOM and a signed RPM in `release.yml`; install takes attested trees only (220); dependency audit, Dependabot. No release with assets since 09/10, `release-check` not run in Wave 4, SHA256SUMS and the RPM key not attested | 3 |
+| C28 | Safe content release | 1 | a transactional upgrade with a byte-for-byte rollback (220); signed overlays with an anti-rollback floor; the content is in the binary: no channel, canary or ring | 3 |
+| C29 | Independent public validation | 0 | the public CI runs are "a step towards, not, an independent validation" (227); the V2 matrix is empty (`docs/validation/matrix.md`) | 3 (needs third parties) |
+| C30 | Generative AI and data governance | 0: absent by design, no AI on the host | the on-host LLM advisor and its RAG removed (214); the README's EU AI Act row: "no AI system on the host"; the governance of data is C25's | 3 (off the host only: 214) |
 
 ## Order
 
@@ -4663,3 +4669,74 @@ only in the table below, in the same PR as the evidence.
     the keys' mappings; typed errands (an enum, not a closure); nn-admin's
     sources in `keys_in_one_place`; a round of the copy-on-first-write
     guard under the capability trace.
+- **Lot 274, docs — the capability table realigned with a re-assessment
+  of `main` (every capability; documentation only, no product change).**
+  - What was wrong: the table above still gave the levels of 2026-10-20.
+    Every note since says "Levels unchanged" or "no level changes", so the
+    levels the evidence of the later notes supports were never recorded
+    here, as the rule at the top of this file asks.
+  - What changed: the table's levels are those of a re-assessment of 3/11
+    of `main` at `5f8046f3` (Phase 2 closed) against the code, these notes
+    and their lab numbers, the operator and design documents and the
+    public CI runs. It was made read-only and apart from the lab PRs, but
+    not by a third party (C29 stays 0). It uses this file's scale, and it
+    refuses a 3 without independent validation. Each row now names its
+    evidence, and each citation was checked on `5f8046f3`.
+    - C12 1 → 2. The guest checks the notes of lab PRs 219, 223, 224 and
+      226 owed are in their lab lines: the exec policy armed on four
+      kernels with MS-01, MS-02, MS-03 and MS-32 refused (226), the connect
+      deny armed on four kernels (224), and exec quarantine armed on 5.15,
+      6.1, 6.8 and 6.12 (223). EPG's enforce kill is shown only with the
+      debug build's injection (219). Reservations kept in the row: all of
+      it is EXPERIMENTAL and off by default, and the behaviour proofs ran
+      on one kernel (on 26.04 two EXECENV-002 cases draw no record). The
+      policy has fixed cells, not per-rule inline denials, and
+      `BPF_MAP_FREEZE` is untested. If "present" meant "on by default",
+      C12 would be 1.
+    - C13 0 → 1. Exec quarantine has a confined scanner (223), and the
+      exec policy refuses execs from memfd, deleted files and `/dev/shm`
+      (226). Both are off by default. The signed hash list ships empty,
+      and the default heuristics resume the process. This is partial
+      prevention: no prevention content is distributed, and no detection
+      rate has been measured on a malware corpus.
+    - C16 1 → 2. The mapping is typed for 93 of 93 rules, and the records
+      of 44 rules carried their ids on four guests (221's lab line). It is
+      not 3: the coverage is not measured. There are 0 `campaign` rows,
+      and "lab" in `docs/detection/ATTACK_COVERAGE.md` means a script
+      exists, not that it ran. The V2 campaign never started, and no third
+      party has reviewed the mapping.
+    - C30 2 → 0, absent by design. Lab PR 214 removed the on-host model,
+      and the README says "no AI system on the host". That is this
+      scale's "absent", documented as not supported. It is a decision,
+      not a defect. An AI assistant, if any, would run off the host (the
+      target). The governance of data is C25.
+    - C23 stays 2, provisional. On Debian 13 with systemd 257,
+      `systemctl stop` and `systemctl kill` stop the agent through
+      `cgroup.kill` outside a maintenance window (anti-tamper cases C31
+      and C33). The 2 holds because the watchdog restarts the agent and
+      the heartbeat's external verifier sees the stop. It is to be
+      reviewed when lot 273 closes, or if it finds the same gap on
+      another systemd.
+    - C07 and C19 re-checked, both stay 1. C07 lacks the three items its
+      2 needs: inbound accepted connections, DNS answers, and TLS
+      fingerprints in the flow record (lab PR 224 added verdicts, not
+      telemetry). C19 covers in-place rewrites only: there is no
+      protection before a delete or a rename over a file, and no
+      remediation of persistences.
+    - The other 23 levels are confirmed as they were: C01 2, C02 0,
+      C03 0, C04 0, C05 1, C06 2, C08 0, C09 0, C10 0, C11 1, C14 2,
+      C15 1, C17 2, C18 1, C20 1, C21 0, C22 0, C24 2, C25 2, C26 2,
+      C27 1, C28 1, C29 0.
+  - C01's row says what the nightly gate is: five guests (lab PR 227),
+    green 6 nights of 12 from 22/10 to 02/11. Lot 274's fix PR
+    #487 gives every red night a cause: a race in the lab harness on
+    the Debian guests and a test fixture on Ubuntu 26.04, neither of them
+    in the sensor.
+  - Evidence: no new measurement. The levels follow the evidence already
+    recorded in the notes above and in the files each row names.
+  - Open, the cheapest next steps, each verifiable in the lab: C27 1 → 2
+    (a release from a tag, verified end to end), C18 1 → 2 (a signed
+    isolation verb outside the COMBAT ladder, with an expiry), C21 0 → 1
+    (a signed export of the detections with a cursor), C05 1 → 2 (fork,
+    exit and credential changes as telemetry), C07 1 → 2 (the three items
+    above).
