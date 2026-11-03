@@ -112,6 +112,16 @@ unsafe fn try_accept(newsk: u64) {
     if newsk == 0 || newsk >= 0u64.wrapping_sub(MAX_ERRNO) {
         return;
     }
+    // The fexit's return slot is a `PTR_TO_BTF_ID` (`struct sock *`), and
+    // the verifier refuses arithmetic on it: the correlator splits the
+    // address into bytes (shifts), the 6.8 lab's refusal of lot 275's first
+    // build ("pointer arithmetic with >>= operator prohibited"). A copy
+    // through the probe helper is a plain scalar, the value `tcp_connect`'s
+    // correlator gets from its own probe.
+    let newsk: u64 = match bpf_probe_read_kernel(&newsk as *const u64) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
     let sk_ptr = newsk as *const u8;
     let family: u16 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_FAMILY_OFFSET)) as *const u16) {
         Ok(v) => v,

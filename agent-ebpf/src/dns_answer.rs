@@ -256,8 +256,15 @@ unsafe fn try_answer(ctx: &FExitContext, ret: i32) {
                 }
                 r
             } else {
-                // A variable size the verifier bounds: below the cap.
-                let n = (len as u32) & (DNS_ANSWER_CAP as u32 - 1);
+                // A variable size the verifier bounds: below the cap. The
+                // length goes through the stack first: LLVM knows it is
+                // below the cap here and drops a plain mask, then hands the
+                // helper the sign-extended return value, which the verifier
+                // has no bound for (the 6.8 lab's refusal of lot 275's first
+                // build: "R2 min value is negative"). The volatile read
+                // keeps the mask next to the call.
+                let len32: u32 = len as u32;
+                let n = core::ptr::read_volatile(&len32) & (DNS_ANSWER_CAP as u32 - 1);
                 let r = generated::bpf_probe_read_user(dst, n, base as *const c_void);
                 if r == 0 {
                     (*raw).captured = n as u16;
