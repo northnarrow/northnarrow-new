@@ -655,7 +655,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   a refusal, C33 reads the agent it checks, new C65–C76 (C76 inside a
   window). Not refused (open): the units' resource limits (`memory.max`,
   `cpu.max`, `pids.max`: reported as `integrity_drift`), cgroup v1
-  hierarchies, a thaw outside a window.
+  hierarchies, a thaw outside a window. Cost: the move guard's
+  `inode_permission` program runs on every permission check of a path
+  walk — about −10 % on the lab's open microbenchmark (Ubuntu 24.04). On
+  systemd 249 and 252 a refused `systemctl freeze` leaves the unit
+  `freezing` in systemd's own state (nothing frozen) until the cgroup's
+  next freezer event.
 - The nightly lab VM gate's red nights (lot 274; no product change). Six of
   the twelve nights from 22/10 to 02/11 failed. On every red Debian guest
   (Debian 12 `sync` on 24/10, 28/10, 01/11 and 02/11, Debian 13 `build`

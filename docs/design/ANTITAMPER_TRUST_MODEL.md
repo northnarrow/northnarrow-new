@@ -600,7 +600,19 @@ polkit): the refusal has to be the kernel's.
   that are not PID 1, and make `set-property` of the units a detection.
 - **Thaw.** A thaw is a write-open of `cgroup.freeze` too: outside a
   window it is refused like a freeze. A unit frozen inside a window must
-  be thawed inside one.
+  be thawed inside one. systemd 249 and 252 mark the unit `freezing` (or
+  `thawing`) before they write and keep that state when the write is
+  refused: nothing is frozen, but their next `systemctl freeze`/`thaw`
+  answers "Previously requested freezer operation … still in progress"
+  until the cgroup's next freezer event (a reboot with the unit in that
+  state was clean in the lab); 255 and later write again or skip a thaw
+  of a running cgroup.
+- **Cost.** `inode_permission` runs for every permission check of a path
+  walk; with the guard attached the lab's open microbenchmark lost about
+  10 % of its throughput (Ubuntu 24.04, A/B with the guard's links
+  detached and attached in turn; wopen about 8 %). No cheaper attach point
+  exists in the migration's path: no LSM hook names the moved task, and
+  the functions there are not `fmod_ret` targets.
 - **cgroup v1.** Only the v2 hierarchy is protected; a v1 `freezer` or
   `name=systemd` hierarchy (a hybrid host) is not, and its `cgroup.procs`
   path checks no inode, so the move guard does not see it. A process in no

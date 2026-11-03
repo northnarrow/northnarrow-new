@@ -51,7 +51,7 @@ number in parentheses is a lab PR.
 | C20 | Automation, playbooks, SOAR | 1 | the automatic COMBAT ladder and the per-rule policy; no playbook, webhook or OpenC2 | 3 |
 | C21 | SIEM integration and export | 0 | no export of the detections ("until R15 exports the chains off the host", `docs/operator/HEARTBEAT.md`); local JSON reads and the heartbeat pull (270) only; no OCSF, syslog or OTLP | 3 |
 | C22 | Backend and multi-host correlation | 0 | the heartbeat's external verifier (270) is not a backend | 3 |
-| C23 | Anti-tamper and self-defence | 2 (provisional) | 16 LSM deny hooks and 3 optional, the fail-opens counted and signed (215); start refused without BPF LSM, a hook's self-test (218); a fail-visible watchdog (216); the signing key decided once at boot (265, 268); unprivileged workers under Landlock and seccomp (272); the signed heartbeat's external verifier sees a stop in 6.5 s (270). Provisional: on Debian 13 (systemd 257) `systemctl stop` and `kill` stop the agent through `cgroup.kill` outside a maintenance window (tamper cases C31, C33; lot 273 open) | 3 |
+| C23 | Anti-tamper and self-defence | 2 (provisional) | 16 LSM deny hooks and 5 optional (lot 273: the cgroup move guard's 2), the fail-opens counted and signed (215); start refused without BPF LSM, a hook's self-test (218); a fail-visible watchdog (216); the signing key decided once at boot (265, 268); unprivileged workers under Landlock and seccomp (272); the signed heartbeat's external verifier sees a stop in 6.5 s (270). Provisional: on systemd 257 and later `systemctl kill -s SIGKILL` stopped the agent through `cgroup.kill` outside a maintenance window, and any root shell could kill, freeze or move the units' cgroups on every kernel (tamper case C31; C33's `systemctl stop` was refused all along — it read C31's kill); closed by lot 273 (#489: the units' cgroups protected, the move guard; C15, C20, C31, C65–C75 refused and signed and C76 allowed inside a window on the five guests), provisional until its review | 3 |
 | C24 | Offline and air-gapped operation | 2 | the agent's only traffic of its own is the DNS probe to 127.0.0.1:53 (`crates/nn-linux/src/telemetry_probe.rs`); updates are an operator's action; the attestation is verified offline with a bundle (`docs/operator/INSTALL_UPGRADE_UNINSTALL.md`) | 3 |
 | C25 | Data sovereignty | 2 | the telemetry stays on the host; no model in the root process (214); the README's NIS2, GDPR, DORA and CRA badges are claims, not proofs | 3 |
 | C26 | Open code, licence, inspectability | 2 | Apache-2.0 (`Cargo.toml`), the eBPF object Dual MIT/GPL, a public repository, the module map | 3 |
@@ -4811,3 +4811,119 @@ number in parentheses is a lab PR.
     (a signed export of the detections with a cursor), C05 1 → 2 (fork,
     exit and credential changes as telemetry), C07 1 → 2 (the three items
     above).
+- **Lot 273 — C23: the units' cgroups, kill, freeze and moves refused
+  outside a signed window (a security fix; found by lot 272's Debian 13
+  lab).**
+  - What was open: on systemd 257 and later `systemctl kill -s SIGKILL`
+    of the agent or the watchdog ended in a write to the unit's
+    `cgroup.kill` once `task_kill` had refused the signal to the main
+    process — the kernel killed the cgroup, no signal hook saw it, the
+    watchdog brought the agent back. Every kernel from 5.14 let any root
+    shell do the same, freeze the unit (`cgroup.freeze`, `systemctl
+    freeze`), or move the agent's pid to a cgroup of its own and kill or
+    freeze that one. `RefuseManualStop=yes` held on every version (249 to
+    259): the R14 lab's C33 "stop" was C31's kill read through a stale
+    pid.
+  - What changed: the units' cgroups in `PROTECTED_INODES`
+    (`antitamper_bpf::cgroup_guard`, shared with the watchdog; the unit's
+    directory `MUTATE|NOCREATE|INIT_RMDIR`, its and its slices'
+    `cgroup.kill` / `cgroup.freeze` `MUTATE|WRITE` signed `cgroup_kill` /
+    `cgroup_freeze`, `cgroup.procs`/`threads` `MUTATE`); PID 1 may remove
+    an empty unit cgroup (`fs_protect_init_may`); the move guard (fexit
+    `cgroup_procs_write_start` + LSM `inode_permission`, an optional deny
+    pair selected from the BTF's prototype, `cgroup_move`); registered at
+    the early start, the attach (with the live watchdog's), the watchdog
+    refresh and by the watchdog itself; `NN-L-AT-001` names the three
+    operations; every denial row names its caller's executable (the
+    lineage's, then `/proc`); tamper-check C15/C20 expect a refusal, C33
+    reads the agent it checks, C65–C76 new.
+  - Lab (as measured; our own guests, two at a time): before, `main` 5f8046f3 on the five guests (Ubuntu 22.04 5.15 /
+    systemd 249, Debian 12 6.1 / 252, Ubuntu 24.04 6.8 / 255, Debian 13
+    6.12 / 257, Ubuntu 26.04 7.0 / 259), the lot's probe: `systemctl stop`
+    and `restart` refused on all five; `systemctl kill -s SIGKILL` of the
+    agent or the watchdog refused on 249/252/255 (`kill(2)` per process)
+    and the unit killed on 257/259 ("Killed unit cgroup with SIGKILL on
+    client request"); on all five `systemctl freeze`, `echo 1 >
+    cgroup.freeze`, `echo 1 > cgroup.kill` of either unit, the slice's
+    files opened for writing, a child cgroup, a `chown` of `cgroup.procs`
+    and moving the agent's or the watchdog's pid to another cgroup went
+    through. After, the lot's code on the five: every one of those refused
+    (EPERM or "Access denied"), the agent and the watchdog alive, the
+    stop and restart refused as before; `rmdir` of the unit cgroup EPERM
+    (was EBUSY). The tamper check with the new cases: Debian 13, `main`
+    installed then the lot's code by `upgrade-check` — 87 cases, `main` 70
+    OK, the lot 84 OK (C27, C57c the known gaps, C64 the recorded
+    deviation); the 71 cases the lot does not touch the same outcome and
+    verdict (C30 102 → 118 entries, no growth across a restart); C15, C20,
+    C31, C65–C75 DEVIATION on `main` (allowed, partial, ERANGE, EBUSY) and
+    OK on the lot, C76 (inside a window) OK on both; Ubuntu 24.04 the same
+    picture (`main` 71, the lot 83; 73 the same; C76 failed on both on
+    255 by `systemctl kill`'s exit status, the kill done — the case takes
+    it by its effect now, OK on the re-run); the cgroup cases on Ubuntu
+    26.04 17 of 17, on Ubuntu 22.04 and Debian 12 16 of 17 — C66 found
+    systemd's own freezer state still `freezing` from the probe's refused
+    freeze (249 and 252 keep it: "Previously requested freezer operation
+    … still in progress"), nothing frozen; C66 reports that state now, and
+    on Ubuntu 22.04 fresh it is OK, then N/A after a refusal by hand. The
+    signed rows: `deny=cgroup_kill|cgroup_freeze|cgroup_move|mkdir|rmdir|
+    setattr`, PID 1's relayed requests as `RelayedTamperAttempt`, the
+    caller's executable from the lineage for one-shot processes
+    (`/usr/bin/python3.12`, `/usr/bin/rmdir`, `/usr/bin/bash`; the first
+    build, reading `/proc` in the writer, found them gone). Verifier: 79 of
+    79 programs on 6.8, 6.12 and 7.0, 77 + the two ACL hooks absent on
+    5.15 and 6.1 (`cgroup_move_deny` 285–309 instructions,
+    `cgroup_move_stash` 149–165). `upgrade-check` from `main`: Debian 13
+    and Ubuntu 24.04 OK (deny_attached=21 deny_expected=21, own LSM
+    programs 36 → 37); its first run on 24.04 hit the R009 flake R14
+    recorded (an `install.sh` right after the agent's restart), OK on a
+    settled agent. `uninstall-check` OK on both. test-ignored: Debian 13
+    103 passed, 0 failed; Ubuntu 24.04 103 passed, 0 failed. EXP-13 on
+    both: 12,000 refused attempts, 8 recorded and 11,992 held, ring drops
+    0, P0 none dropped. Host reboot on the five and power-off on Debian 13
+    and Ubuntu 24.04: the stop job's `kill(2)` refused as before ("Failed
+    to kill control group … ignoring"), `systemd-shutdown`'s SIGTERM ended
+    the agent, a signed `agent_stop` `system_shutdown`, the next boot's
+    `agent_boot` "ended clean, reason system_shutdown" (power-off 5–7 s;
+    Ubuntu 22.04's reboot with systemd's freezer state stuck as well).
+    Cost: `overhead` on Ubuntu 24.04 (2 rounds), `main` → the lot: open
+    +28.1 → +37.0 %, wopen +30.2 → +36.3 % (exec, connect, udp, dns within
+    the noise); an A/B on the lot itself (3 rounds, the move guard's links
+    detached and attached in turn): open about −10 %, wopen about −8 % —
+    the `inode_permission` program on every permission check of a path
+    walk. Every guest left off.
+  - Gates: on the code (0723b596) and on the lexical-test and resolver commits
+    (dc9e5a4e), then on the tip rebased on `main` 94c8a79e (e027e33e):
+    `cargo xtask build-ebpf --release`, the four clippy runs `-D warnings`,
+    `fmt --check`, `cargo test --workspace` 83 suites, 3,602 passed, 0
+    failed, 17 ignored, the privileged tests built, `attack-coverage
+    --check`, `cargo xtask golden` five times (54 files, the same bytes,
+    the tree clean), MSRV 1.89, the fuzz replay (14 targets), portable-core
+    (5 targets), lockfiles unchanged. The eBPF object rebuilt: two new
+    programs (`lsm/inode_permission`, `fexit/cgroup_procs_write_start`),
+    one new map (`CGROUP_MOVES`, LRU, not pinned), `DENY_FAIL_OPEN` 20 →
+    22 slots (not pinned); no wire record changed (`FsProtectDenialRaw` 56
+    bytes): three new operation codes (19–21) and three `PROTECTED_INODES`
+    flag bits (4–6) read by the new and the existing deny hooks; new
+    bpffs pins `prog_`/`link_inode_permission` and
+    `prog_`/`link_cgroup_procs_write_start`, purged and re-made like the
+    others at each start.
+  - Mutations: set A 47 (46 caught; MA9 — the `..` component check —
+    equivalent: `.`, `..` and the empty name never end in `.slice` or
+    `.service`, the suffix checks refuse them too; kept as defence in
+    depth), set B 5 of 5 (the executable resolver). The eBPF guard's checks
+    and every registration site are read by `xtask/tests/cgroup_guard.rs`
+    (12 of set A's and 1 of set B's caught there).
+  - Open: the units' resource limits (`memory.max` — an OOM kill —,
+    `cpu.max`, `pids.max`) are reported (`integrity_drift`, C12), not
+    refused: systemd writes them at every realisation, so the refusal has
+    to tell PID 1's own maintenance from a root shell's and make
+    `set-property` of the units a detection; a thaw outside a window is
+    refused like a freeze; cgroup v1 hierarchies (a hybrid host) are not
+    covered; a `cgroup.kill` descriptor opened inside a window stays
+    usable; systemd 249 and 252 keep a unit `freezing`/`thawing` in their
+    own state after a refused freeze or thaw (nothing frozen; their next
+    `systemctl freeze`/`thaw` says "still in progress" until a freezer
+    event); the move guard's cost on path-heavy work (about −10 % on the
+    open microbenchmark): no cheaper attach point exists in the
+    migration's path today (no LSM hook names the moved task; the
+    functions there are not `fmod_ret` targets).
