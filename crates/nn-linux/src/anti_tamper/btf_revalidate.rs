@@ -2940,6 +2940,78 @@ mod tests {
         assert_eq!(optional_hook_gate(Some(&r), "file_ioctl"), None);
     }
 
+    /// Lot 273: the cgroup move guard's pair is selected from the kernel's
+    /// BTF together — where `cgroup_procs_write_start` takes three
+    /// parameters and returns a `struct task_struct *` (the fexit reads the
+    /// return value in the fourth slot) — and neither elsewhere: a function
+    /// of another shape is recorded (signed degraded at the attach), an
+    /// absent one only not attached.
+    #[test]
+    fn the_move_guard_is_selected_from_the_kernels_btf() {
+        fn btf_with(target: Option<(usize, bool)>) -> Btf {
+            let mut b = BtfBuilder::new();
+            let int = b.int("int");
+            let ch = b.int("char");
+            let p_char = b.ptr(ch);
+            let task = b.composite(Some("task_struct"), false, false, &[]);
+            let inode = b.composite(Some("inode"), false, false, &[]);
+            let p_task = b.ptr(task);
+            let p_inode = b.ptr(inode);
+            let p_int = b.ptr(int);
+            b.func("bpf_lsm_inode_permission", int, &[p_inode, int]);
+            if let Some((params, returns_task)) = target {
+                let args = [p_char, int, p_int, int];
+                b.func(
+                    "cgroup_procs_write_start",
+                    if returns_task { p_task } else { int },
+                    &args[..params],
+                );
+            }
+            Btf::parse(&b.build()).expect("cgroup fixture parses")
+        }
+        for (what, target, present, mismatch) in [
+            ("5.14 to 7.0", Some((3, true)), true, None),
+            (
+                "two parameters",
+                Some((2, true)),
+                false,
+                Some("2 parameters"),
+            ),
+            (
+                "four parameters",
+                Some((4, true)),
+                false,
+                Some("4 parameters"),
+            ),
+            (
+                "an int returned",
+                Some((3, false)),
+                false,
+                Some("does not return a struct task_struct"),
+            ),
+            ("no such function", None, false, None),
+        ] {
+            let r = hooks_only(&btf_with(target));
+            for hook in super::super::cgroup_guard::GUARD_HOOKS {
+                assert_eq!(
+                    optional_hook_gate(Some(&r), hook),
+                    Some(present),
+                    "{what}: {hook}"
+                );
+            }
+            match (mismatch, r.cgroup_move_target_mismatch()) {
+                (None, None) => {}
+                (Some(want), Some(got)) => assert!(got.contains(want), "{what}: {got}"),
+                (want, got) => panic!("{what}: {want:?} vs {got:?}"),
+            }
+            // the inode hooks keep their own test
+            assert_eq!(
+                optional_hook_gate(Some(&r), "file_ioctl_compat"),
+                Some(false)
+            );
+        }
+    }
+
     /// Lab PR 174: the compat deny reads the `struct file *` at argument 0,
     /// like `file_ioctl`; checked where the kernel has the hook, a moved one
     /// refuses the start, an absent hook is not counted.
