@@ -1679,7 +1679,7 @@ pub fn register_self_pid(bpffs_root: &Path, own_pid: u32) -> Result<()> {
 /// agent registers it as well once it has verified this pid; a failure
 /// here is logged, not fatal. Outside a systemd service's cgroup (a test, a
 /// watchdog started by hand) nothing is registered.
-pub fn register_own_cgroup(bpffs_root: &Path, own_pid: u32) {
+pub fn register_own_cgroup(bpffs_root: &Path, own_pid: u32, hold_path: &Path, agent_pid: u32) {
     use antitamper_bpf::cgroup_guard::UnitCgroup;
     match antitamper_bpf::cgroup_guard::protect_unit_cgroup(bpffs_root, own_pid) {
         Ok(UnitCgroup::Service {
@@ -1713,6 +1713,64 @@ pub fn register_own_cgroup(bpffs_root: &Path, own_pid: u32) {
             "could not register the watchdog's unit cgroup in PROTECTED_INODES — the agent's \
              refresh registers it"
         ),
+    }
+    // Lot 273c: its own values below their floors, restored.
+    record_floor_restores(hold_path, agent_pid);
+}
+
+/// Lot 273c (the review of #490): the agent's unit cgroup checked by the
+/// watchdog — at its start and after each respawn, the fresh cgroup the
+/// agent was started in: registered (the agent registers it too) and each
+/// resource value below its floor restored (registered, written, read
+/// back; [`antitamper_bpf::cgroup_floors`]). The agent cannot restore a
+/// `memory.max` that OOM-kills it before its attach; the watchdog, in its
+/// own cgroup, can. Each restoration is logged here and recorded at
+/// `hold_path`, which the agent signs at its next round
+/// ([`record_floor_restores`]).
+pub fn check_agent_cgroup(bpffs_root: &Path, agent_pid: u32, hold_path: &Path) {
+    if let Err(e) = antitamper_bpf::cgroup_guard::protect_unit_cgroup(bpffs_root, agent_pid) {
+        warn!(target: "watchdog", agent_pid, error = %format!("{e:#}"), "the agent's unit cgroup not checked");
+    }
+    record_floor_restores(hold_path, agent_pid);
+}
+
+/// Lot 273c: the floor restorations of this process — a WARN each, and a
+/// record at `hold_path` ([`nn_proto::watchdog_hold::REASON_LIMIT_FLOOR_RESTORED`],
+/// `..._NOT_RESTORED`) the agent signs at its next round as
+/// `limit_floor_restored` / `limit_floor_not_restored`, as its own.
+pub fn record_floor_restores(hold_path: &Path, agent_pid: u32) {
+    for r in antitamper_bpf::cgroup_floors::take_restores() {
+        warn!(target: "watchdog.tamper", detail = %r.detail(), restored = r.ok, "a resource value below its floor");
+        let rec = floor_record(&r, agent_pid, unix_now());
+        if let Err(e) = record_hold(hold_path, &rec) {
+            warn!(
+                target: "watchdog.tamper",
+                error = format!("{e:#}"),
+                path = %hold_path.display(),
+                "could not record the floor restoration for the agent's audit chain"
+            );
+        }
+    }
+}
+
+/// The hold record of one floor restoration.
+pub fn floor_record(
+    r: &antitamper_bpf::cgroup_floors::FloorRestore,
+    agent_pid: u32,
+    at: u64,
+) -> nn_proto::watchdog_hold::HoldRecord {
+    use nn_proto::watchdog_hold as wh;
+    wh::HoldRecord {
+        at,
+        agent_pid,
+        reason: if r.ok {
+            wh::REASON_LIMIT_FLOOR_RESTORED
+        } else {
+            wh::REASON_LIMIT_FLOOR_NOT_RESTORED
+        }
+        .to_string(),
+        detail: r.detail(),
+        unit_state: None,
     }
 }
 
@@ -2687,6 +2745,46 @@ mod tests {
     use super::*;
     use clap::Parser;
     use tempfile::TempDir;
+
+    /// Lot 273c: a floor restoration of the watchdog's is a hold record
+    /// the agent signs, restored or not.
+    #[test]
+    fn a_floor_restoration_is_a_record_the_agent_signs() {
+        use antitamper_bpf::cgroup_floors::FloorRestore;
+        use nn_proto::watchdog_hold as wh;
+        let mut r = FloorRestore {
+            path: PathBuf::from("/sys/fs/cgroup/system.slice/northnarrow-agent.service/memory.max"),
+            was: "4096".into(),
+            floor: "536870912".into(),
+            ok: true,
+            why: None,
+        };
+        let rec = floor_record(&r, 77, 1_800_000_000);
+        assert_eq!(rec.reason, wh::REASON_LIMIT_FLOOR_RESTORED);
+        assert_eq!((rec.agent_pid, rec.at), (77, 1_800_000_000));
+        assert!(
+            rec.detail
+                .contains("memory.max: \"4096\" below the floor, restored to \"536870912\""),
+            "{}",
+            rec.detail
+        );
+        r.ok = false;
+        r.why = Some("writing \"536870912\": Permission denied".into());
+        let rec = floor_record(&r, 77, 1_800_000_000);
+        assert_eq!(rec.reason, wh::REASON_LIMIT_FLOOR_NOT_RESTORED);
+        assert!(
+            rec.detail.contains("NOT restored: writing"),
+            "{}",
+            rec.detail
+        );
+        // written where the agent reads its holds
+        let dir = TempDir::new().unwrap();
+        let hold = dir.path().join("watchdog.hold");
+        record_hold(&hold, &rec).unwrap();
+        let back: wh::HoldRecord =
+            serde_json::from_str(std::fs::read_to_string(&hold).unwrap().trim()).unwrap();
+        assert_eq!(back, rec);
+    }
 
     /// Required W2 test 1 — CLI parse. Asserts every flag the
     /// systemd unit file binds (design §10.2) can be parsed

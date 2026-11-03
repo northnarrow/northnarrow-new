@@ -227,6 +227,8 @@ mod shutdown;
 /// R09c shim: the shutdown marker's file (its format is nn-proto's) is
 /// nn-linux's.
 pub use nn_linux::shutdown_marker;
+/// Lot 273c: the reloads the agent asks systemd for are nn-linux's.
+pub use nn_linux::systemd_reload;
 /// R09c shim: what systemd reports the host as, over its private socket,
 /// is nn-linux's.
 pub use nn_linux::systemd_state;

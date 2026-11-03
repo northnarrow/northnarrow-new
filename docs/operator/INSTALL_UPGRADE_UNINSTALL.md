@@ -805,6 +805,32 @@ program, verified by its executable (`agent_stop` reason
 `system_shutdown`). The refused SIGTERM of the stop job is not reported as
 an attempt while systemd reports the host as `stopping`.
 
+Lot 273c (the review of #490): `prlimit`, `renice`, `chrt`, `taskset` and
+`ionice` of the agent, the watchdog or a worker are refused outside a
+window (`rlimit`, `nice`, `sched`, `ioprio`), as is attaching a debugger
+to PID 1 or opening `/proc/1/mem` (`ptrace`). A tuning daemon that applies
+a host-wide profile (`tuned`, `numad`) meets the refusals too: they raise
+the posture to ENGAGED, never COMBAT. A refused `set-property` no longer
+needs the operator's `daemon-reload`: the agent asks systemd for one (a
+SIGHUP to PID 1; at most one every 30 s, a later refusal kept for after the
+interval; signed `systemd_reload`), and again when a window opens. The host's drop-ins in `service.d`, `slice.d` and `system.slice.d`
+reach the units too; the agent never moves or changes them (they are the
+host's configuration for every other service): a directive whose value
+harms our units — a resource limit below their floors, a finite CPU or
+memory limit, fewer than 1024 open files, a raised nice value, an idle
+class, another kill or OOM semantics, a failing condition, an exec line,
+an `NN_` / `LD_` variable, a mount over our paths — is signed
+`unit_dropin_harmful` at every integrity round while it is there, and any
+other drop-in there is an alert (`unit_dropin`). A global `LimitNOFILE`, a
+node's `system.slice` reservation above the slice's floors or a hardening
+`SystemCallFilter` is left alone. A harmful one reaches our units' next
+start: remove it, or scope it to the services it is for (their own
+`<unit>.d/`) — before any trusted-installer window: inside one, a
+`daemon-reload` applies it to the units' cgroups (PID 1's writes are let
+through there), and the agent withholds its own reloads while it is on
+disk (signed `systemd_reload` `withheld`). Debugging PID 1 (`gdb -p 1`, `strace -p 1`, `gcore 1`,
+`/proc/1/mem`) takes a window.
+
 ### 3.8 No new entries in the agent's directories (external audit EBPF-015)
 
 The deny hooks used to refuse removing or changing an entry of a protected

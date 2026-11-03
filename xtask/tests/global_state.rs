@@ -332,6 +332,13 @@ const STATICS: &[Kept] = &[
         "the inodes this boot registered in the pinned PROTECTED_INODES",
     ),
     kept(
+        "antitamper-bpf/src/cgroup_floors.rs",
+        "PENDING",
+        Log,
+        "the floor restorations this process's registrations made, reported once by its \
+         integrity round (the agent) or its journal (the watchdog) (lot 273c)",
+    ),
+    kept(
         "crates/nn-linux/src/anti_tamper/cgroup_guard.rs",
         "BOOT_VALUE_KEYS",
         Kernel,

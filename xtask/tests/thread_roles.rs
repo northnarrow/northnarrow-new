@@ -136,6 +136,11 @@ fn the_core_s_threads_get_the_core_s_set() {
 /// sets.
 const THREADS_WITHOUT_A_CALL: &[(&str, &str, &str)] = &[
     (
+        "crates/nn-linux/src/systemd_reload.rs",
+        ".spawn(move || worker(rx, Path::new(socket), worker_audit))",
+        "the function it runs enters the writer's role first (lot 273c)",
+    ),
+    (
         "agent/src/pipeline/dispatch.rs",
         ".spawn(move || watch_stalls(&watch))",
         "the function it runs enters the actuator's role first (above)",

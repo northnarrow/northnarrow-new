@@ -70,6 +70,17 @@ pub const REASON_HOLD_RETRY: &str = "hold_retry";
 /// detail gives.
 pub const REASON_HOLD_ENDED: &str = "hold_ended";
 
+/// Lot 273c (the review of #490): the watchdog found a resource value of
+/// the agent's fresh cgroup (at its start, after a respawn) or of its own
+/// below its floor and restored it — registered, written, read back
+/// (`antitamper_bpf::cgroup_floors`). The detail is the file, the value
+/// and the floor; the agent signs it as `limit_floor_restored`.
+pub const REASON_LIMIT_FLOOR_RESTORED: &str = "limit_floor_restored";
+
+/// Lot 273c: the same, the value NOT restored (the detail says why); the
+/// agent signs it as `limit_floor_not_restored`.
+pub const REASON_LIMIT_FLOOR_NOT_RESTORED: &str = "limit_floor_not_restored";
+
 /// One hold (or supervision event), as the watchdog records it at
 /// [`HOLD_PATH`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

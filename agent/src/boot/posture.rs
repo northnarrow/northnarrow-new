@@ -359,6 +359,7 @@ pub(crate) fn ladder(
     ladder_slot: &std::sync::OnceLock<Arc<northnarrow_agent::combat::CombatLadder>>,
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
     lineage: &AuthSessionTracker,
+    reloader: &northnarrow_agent::systemd_reload::Reloader,
 ) -> Combat {
     // R11c (lab PR 264): the copy-on-first-write guard the NEUTRALIZE hook
     // tells, filled once the guard has booted below (before, the hook found
@@ -521,6 +522,9 @@ pub(crate) fn ladder(
     // answer is the snapshot the decision judges a relayed signal on, and
     // the watch asks at once when the decision wants a newer one.
     let systemd = SystemdSnapshot::default();
+    // Lot 273c (the review of #490): the reloads that take systemd's copy
+    // of a refused set-property back to the units' files.
+    systemd.set_reloader(reloader.clone());
     if std::path::Path::new(northnarrow_agent::systemd_state::PRIVATE_SOCKET).exists() {
         tokio::spawn(systemd_watch(
             systemd.clone(),
