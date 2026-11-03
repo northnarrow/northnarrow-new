@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use nn_model::posture_types::PostureKind;
 use nn_model::telemetry::FlowPhase;
 use nn_model::{CanaryAccessKind, Event, Verdict};
 use parking_lot::Mutex;
@@ -14,6 +15,7 @@ use super::attack::AttackRef;
 use super::combine::{self, Decision};
 use super::flow_ledger::{self, FlowLedger};
 use super::host::DecisionHost;
+use super::posture_floor;
 use super::response_policy;
 use super::rule_policy::{self, ActorFacts, PolicyHandle};
 
@@ -230,8 +232,21 @@ impl<H: DecisionHost> RuleEngine<H> {
     /// Lab PR 246: a network canary trip owns its connection — the trip is
     /// the connect, NN-L-CANARY-003 answers it — and no rule judges a row
     /// of that connection ([`Self::owned_by_trip`]).
+    ///
+    /// Judged in OBSERVING, the posture the agent starts in: an engine
+    /// without a posture (the tests, the replays) judges as a fresh agent
+    /// does. The agent judges in its posture ([`Self::decide_in`]).
     pub fn decide(&self, event: &Event) -> Option<Decision> {
-        self.decide_inner(event)
+        self.decide_inner(event, PostureKind::Observing)
+    }
+
+    /// Lot 278: [`Self::decide`] in `posture`, the posture the agent judged
+    /// the event in (after the posture observed it): a rule whose built-in
+    /// kill needs a posture ([`posture_floor`]) records the event, the kill
+    /// held, below it — R009 kills in COMBAT only, or under a signed
+    /// `enforce`.
+    pub fn decide_in(&self, event: &Event, posture: PostureKind) -> Option<Decision> {
+        self.decide_inner(event, posture)
     }
 
     /// Lab PR 267 (R12a): `event` is queued on the bus behind an event of a
@@ -245,7 +260,7 @@ impl<H: DecisionHost> RuleEngine<H> {
         }
     }
 
-    fn decide_inner(&self, event: &Event) -> Option<Decision> {
+    fn decide_inner(&self, event: &Event, posture: PostureKind) -> Option<Decision> {
         if let Event::CanaryTripped {
             access_kind: CanaryAccessKind::NetworkConnect,
             accessor_pid,
@@ -282,6 +297,7 @@ impl<H: DecisionHost> RuleEngine<H> {
             let Some(v) = rule.evaluate(event) else {
                 continue;
             };
+            let v = posture_floor::hold(rule.id(), v, posture);
             let held = response_policy::take_held();
             matched.push(rule.id());
             let facts = &*self.facts;

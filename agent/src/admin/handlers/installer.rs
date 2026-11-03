@@ -2,6 +2,7 @@
 //! `admin_socket.rs`): the window an upgrade needs, armed for the signed
 //! span.
 
+use std::path::Path;
 use std::time::Instant;
 
 use tracing::{info, warn};
@@ -10,7 +11,7 @@ use nn_proto::admin_protocol::{AdminResult, TrustedInstallerGrantRequest};
 
 use crate::admin::verify::{signed, Verified};
 use crate::anti_tamper::admin_auth::ConnAuth;
-use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
+use crate::anti_tamper::trusted_installer::{installer_of_requester, TrustedInstallerOverride};
 
 /// FIM-009 self-upgrade (§15.1) — handle one
 /// [`TrustedInstallerGrantRequest`]. Verifies the signed grant (M=1
@@ -24,10 +25,16 @@ use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 /// M=1 today — like COMBAT reactivation — but expressed through the
 /// pipeline's quorum (`verify::Quorum`) so a future hardening can require
 /// co-signers without touching this dispatcher.
+///
+/// Lot 278: the window is granted to the installer that asked for it —
+/// the parent of `requester`, the peer's `SO_PEERCRED` pid
+/// ([`installer_of_requester`]) — so that R009 records, rather than kills,
+/// what that installer's own process tree executes from its source tree.
 pub(in crate::admin) fn dispatch_trusted_installer_grant(
     req: TrustedInstallerGrantRequest,
     auth: &ConnAuth<'_>,
     installer_override: Option<&TrustedInstallerOverride>,
+    requester: u32,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
     // Required distinct signatures (M of N): 1 today, the pipeline's
@@ -37,7 +44,7 @@ pub(in crate::admin) fn dispatch_trusted_installer_grant(
         auth,
         fps_out,
         |r| r,
-        |v| trusted_installer_grant(v, installer_override),
+        |v| trusted_installer_grant(v, installer_override, requester),
     )
 }
 
@@ -45,6 +52,7 @@ pub(in crate::admin) fn dispatch_trusted_installer_grant(
 fn trusted_installer_grant(
     v: Verified<'_, TrustedInstallerGrantRequest>,
     installer_override: Option<&TrustedInstallerOverride>,
+    requester: u32,
 ) -> AdminResult {
     // The op/extra invariant is enforced inside the verify; this pulls
     // the signed window out.
@@ -52,18 +60,22 @@ fn trusted_installer_grant(
 
     match installer_override {
         Some(ov) => {
-            let window = ov.arm_by(
+            let installer = installer_of_requester(Path::new("/proc"), requester);
+            let window = ov.arm_for(
                 window_secs,
                 Instant::now(),
                 v.fingerprints()
                     .first()
                     .map(String::as_str)
                     .unwrap_or("(unknown)"),
+                installer,
             );
             info!(
                 target: "admin.trusted_installer_grant",
                 signer_fp = %v.signer_fp(),
                 window_secs = window.as_secs(),
+                requester,
+                installer_pid = installer.map(|(pid, _)| pid),
                 "trusted-installer override ARMED via signed grant (FIM-009 §15.1)"
             );
             AdminResult::Success

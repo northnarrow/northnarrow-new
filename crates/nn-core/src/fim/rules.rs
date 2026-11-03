@@ -2771,7 +2771,9 @@ mod tests {
     use crate::decision::host::DecisionHost;
     use nn_model::telemetry::FimEvent;
     use std::collections::HashMap;
-    fn fim_rules(installer_override: Arc<bool>) -> Vec<Box<dyn Rule>> {
+    fn fim_rules(
+        installer_override: Arc<crate::posture::host::testing::TestWindow>,
+    ) -> Vec<Box<dyn Rule>> {
         super::fim_rules::<H>(installer_override)
     }
 
@@ -3858,8 +3860,8 @@ mod tests {
     /// An open window, which is exactly what the rule reads. R08b (lab PR
     /// 251): the test host's window is a `bool`; the agent's override,
     /// armed with a future deadline, opens the same way through its host.
-    fn armed_override() -> Arc<bool> {
-        Arc::new(true)
+    fn armed_override() -> Arc<crate::posture::host::testing::TestWindow> {
+        Arc::new(true.into())
     }
 
     /// Inside an OPEN window, a write to the agent's OWN unit is

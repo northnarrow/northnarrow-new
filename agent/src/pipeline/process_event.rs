@@ -621,8 +621,9 @@ pub(crate) fn process_event(
 
     // Lab PR 236 (multi-match): every rule judged the event; the decision
     // names the primary rule and every match, and runs, per target, the
-    // strongest response the per-rule policy allows.
-    if let Some(decision) = engine.decide(&event) {
+    // strongest response the per-rule policy allows. Lot 278: in the
+    // posture the event left (observed above) — R009 kills in COMBAT only.
+    if let Some(decision) = engine.decide_in(&event, posture.current_kind()) {
         let verdict = &decision.verdict;
         // Review 75: every verdict is acted on; its log lines and its
         // record count against the primary rule's budget for the acting uid.

@@ -128,7 +128,7 @@ mod testing {
     use crate::anti_tamper::trusted_installer::WindowGrant;
     use crate::decision::rule_policy::ActorFacts;
     use crate::impact::entropy::{Sample, Sampler};
-    use crate::posture::host::testing::TestHost;
+    use crate::posture::host::testing::{TestHost, TestWindow};
 
     /// No fact of any process can be read: no exemption by uid, cgroup or
     /// executable applies.
@@ -171,13 +171,12 @@ mod testing {
             op(path)
         }
 
-        fn installer_grant(window: &bool) -> Option<WindowGrant> {
-            let _ = window;
-            None
+        fn installer_grant(window: &TestWindow) -> Option<WindowGrant> {
+            window.open.then(|| window.grant.clone()).flatten()
         }
 
-        fn inert_installer_window() -> Arc<bool> {
-            Arc::new(false)
+        fn inert_installer_window() -> Arc<TestWindow> {
+            Arc::new(TestWindow::from(false))
         }
 
         type DefenderMap = BTreeSet<u32>;

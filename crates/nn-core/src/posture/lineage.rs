@@ -2315,6 +2315,41 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         .map(|hop| hop.exe)
     }
 
+    /// Lot 278: `pid` is the process `ancestor` names, or descends from it,
+    /// as of `as_of` — `ancestor` by its pid and its start (`starttime` of
+    /// `/proc/<pid>/stat`, in clock ticks: the process a trusted-installer
+    /// window was granted to, [`crate::anti_tamper::trusted_installer::WindowGrantee`]),
+    /// on the walk of [`Self::actor_in_lineage`] (a parent starts no later
+    /// than its child, POS-003). By lineage only: what any process of the
+    /// tree runs, or is named, is not read. `false` when the walk loses the
+    /// chain first, or when the pid on the walk is a later process (its
+    /// start is not the ancestor's).
+    pub fn descends_from(&self, pid: u32, as_of: AsOf, ancestor: u32, ancestor_ticks: u64) -> bool {
+        if ancestor <= 1 {
+            return false;
+        }
+        matches!(
+            self.lineage_walk(
+                pid,
+                as_of,
+                |hop| hop.pid == ancestor && self.hop_started_at_ticks(hop, ancestor_ticks),
+                LINEAGE_DEPTH_CAP,
+            ),
+            Some(Some(_))
+        )
+    }
+
+    /// `hop` is the process that started at `ticks` (`/proc`'s clock, ticks
+    /// since boot): its cached start shown by those ticks
+    /// ([`Self::ticks_show_start`]); a hop read from `/proc` by what `/proc`
+    /// shows of its pid now.
+    fn hop_started_at_ticks(&self, hop: &Hop, ticks: u64) -> bool {
+        if hop.start_ns != 0 {
+            return self.ticks_show_start(ticks, hop.start_ns);
+        }
+        self.proc_start_ticks(hop.pid) == Some(ticks)
+    }
+
     /// Lab PR 222 (copy on first write): what the kernel executed for `pid`
     /// and for each ancestor on the walk of [`Self::actor_in_lineage`]
     /// (ordered, POS-003: it ends at PID 1, at a hop that started after the

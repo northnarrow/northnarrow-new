@@ -186,7 +186,8 @@ pub fn apply_policy(
 ) -> RuleMatch {
     let mode = policy.mode(rule_id);
     let builtin_action = v.action.clone();
-    let switch_held = held.is_some();
+    // Lot 278: a hold by the posture is the rule's own record, not a switch
+    let switch_held = held.as_ref().is_some_and(|h| !h.by_posture);
     // Named only while the switch still holds the response (built in).
     let mut held_switch = held.as_ref().map(|h| h.switch);
     let held_action = held.as_ref().map(|h| h.action.clone());

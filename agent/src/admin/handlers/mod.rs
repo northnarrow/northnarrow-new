@@ -231,6 +231,7 @@ pub(super) fn dispatch(
                 req,
                 auth,
                 installer_override,
+                client.pid,
                 fps_out,
             ))
         }

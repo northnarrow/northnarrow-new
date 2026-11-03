@@ -87,7 +87,7 @@ use common::wire::{FsGrant, KillGrant};
 // ceiling too, which nn-admin clamps `--window-secs` to (it names no module
 // of nn-linux).
 pub use nn_core::anti_tamper::trusted_installer::{
-    WindowGrant, MAX_TRUSTED_INSTALLER_WINDOW_SECS, OWN_SYSTEMD_UNITS,
+    WindowGrant, WindowGrantee, MAX_TRUSTED_INSTALLER_WINDOW_SECS, OWN_SYSTEMD_UNITS,
 };
 
 /// Userland state of the trusted-installer override. Shared via `Arc`
@@ -238,6 +238,22 @@ impl TrustedInstallerOverride {
     /// fingerprint): the window remembers who opened it, and until when
     /// ([`Self::grant_at`]).
     pub fn arm_by(&self, window_secs: u32, now: Instant, key_id: &str) -> Duration {
+        self.arm_for(window_secs, now, key_id, None)
+    }
+
+    /// Lot 278: [`Self::arm_by`] for the installer `grantee` names (its pid
+    /// and start, [`installer_of_requester`]): the window remembers it,
+    /// with the time of the grant, and R009 records the root execs of that
+    /// process's own tree from a home or `/tmp`, after the grant and while
+    /// the window is open, at Low ([`WindowGrant::grantee`]). A grant
+    /// replaces the previous one's grantee: one installer at a time.
+    pub fn arm_for(
+        &self,
+        window_secs: u32,
+        now: Instant,
+        key_id: &str,
+        grantee: Option<(u32, u64)>,
+    ) -> Duration {
         let max = self.max_window.as_secs().min(u32::MAX as u64) as u32;
         let secs = window_secs.clamp(1, max.max(1));
         let window = Duration::from_secs(secs as u64);
@@ -320,6 +336,11 @@ impl TrustedInstallerOverride {
             inner.grant = Some(WindowGrant {
                 key_id: key_id.to_string(),
                 expires_at: wall.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                grantee: grantee.map(|(pid, start_ticks)| WindowGrantee {
+                    pid,
+                    start_ticks,
+                    granted_ns: monotonic_ns(),
+                }),
             });
         }
         self.armed.store(true, Ordering::SeqCst);
@@ -329,6 +350,7 @@ impl TrustedInstallerOverride {
             requested_secs = window_secs,
             fs_pin_suspended,
             systemctl_stop_granted,
+            granted_to_pid = grantee.map(|(pid, _)| pid),
             "trusted-installer override ARMED (FIM-009 §15.1)"
         );
         window
@@ -497,6 +519,39 @@ impl TrustedInstallerOverride {
 /// this boot; the in-memory detection state still governs the
 /// downgrade). Mirrors the `ProtectedObserversHandle::open` pinned-map
 /// idiom.
+/// Lot 278: the installer a grant's requester acts for — the parent of
+/// `requester` (the `nn-admin` at the other end of the admin socket, its
+/// `SO_PEERCRED` pid): `install.sh` or `uninstall.sh` runs `nn-admin
+/// trusted-installer-grant` itself. Its pid and start (`starttime` of
+/// `/proc/<ppid>/stat`), read under `proc_root`. `None` when it cannot be
+/// told: the requester is gone, or no longer the child of that process
+/// (read twice), or its parent is PID 1 or 0 (a requester started by init
+/// acts for no installer, and the whole host must never be one).
+pub fn installer_of_requester(proc_root: &Path, requester: u32) -> Option<(u32, u64)> {
+    if requester <= 1 {
+        return None;
+    }
+    let (ppid, _) = stat_parent_and_start(proc_root, requester)?;
+    if ppid <= 1 || ppid == requester {
+        return None;
+    }
+    let (_, start_ticks) = stat_parent_and_start(proc_root, ppid)?;
+    // the requester still the child of that process: it waits for this
+    // reply, so a change means another process took its pid
+    if stat_parent_and_start(proc_root, requester)?.0 != ppid {
+        return None;
+    }
+    Some((ppid, start_ticks))
+}
+
+/// `/proc/<pid>/stat`'s parent (field 4) and start (field 22), counted
+/// after the `(comm)` field, which may hold spaces or parentheses.
+fn stat_parent_and_start(proc_root: &Path, pid: u32) -> Option<(u32, u64)> {
+    let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let rest: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    Some((rest.get(1)?.parse().ok()?, rest.get(19)?.parse().ok()?))
+}
+
 fn write_fs_grant(bpffs_root: Option<&Path>, grant: FsGrant) -> Result<()> {
     let Some(root) = bpffs_root else {
         return Ok(());
@@ -744,5 +799,57 @@ mod tests {
         // detection downgrade is acceptable here because nothing wires a
         // dispatcher to inert overrides (default_rules / tests).
         assert!(!ov.is_active_at(Instant::now()), "inert starts disarmed");
+    }
+
+    /// Lot 278: a grant made for an installer names it — its pid and start
+    /// — with the time of the grant, until the window ends; a grant without
+    /// one (`arm_by`) names none.
+    #[test]
+    fn a_grant_names_the_installer_it_was_made_for() {
+        let ov = test_override(600);
+        let before = monotonic_ns();
+        ov.arm_for(60, Instant::now(), "c2e8f3da", Some((4242, 777)));
+        let g = ov.current_grant().expect("open window");
+        let who = g.grantee.expect("an installer");
+        assert_eq!((who.pid, who.start_ticks), (4242, 777));
+        assert!(who.granted_ns >= before && who.granted_ns <= monotonic_ns());
+        ov.arm_by(60, Instant::now(), "c2e8f3da");
+        assert_eq!(ov.current_grant().expect("open").grantee, None);
+        ov.close("test");
+        assert!(ov.current_grant().is_none());
+    }
+
+    /// Lot 278: the installer of a grant is its requester's parent, read
+    /// from `/proc`; never PID 1 or 0, and not known when the requester is
+    /// gone or its parent cannot be read.
+    #[test]
+    fn the_installer_is_the_requester_s_parent() {
+        let proc = tempfile::TempDir::new().unwrap();
+        let stat = |pid: u32, ppid: u32, ticks: u64| {
+            let d = proc.path().join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("stat"),
+                format!(
+                    "{pid} (n (a) b) S {ppid} 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"
+                ),
+            )
+            .unwrap();
+        };
+        // install.sh (500, started at tick 9000) ran nn-admin (501)
+        stat(500, 400, 9_000);
+        stat(501, 500, 9_100);
+        assert_eq!(installer_of_requester(proc.path(), 501), Some((500, 9_000)));
+        // a requester started by init acts for no installer
+        stat(601, 1, 9_200);
+        assert_eq!(installer_of_requester(proc.path(), 601), None);
+        stat(602, 0, 9_200);
+        assert_eq!(installer_of_requester(proc.path(), 602), None);
+        // a requester that is gone, or whose parent is gone
+        assert_eq!(installer_of_requester(proc.path(), 700), None);
+        stat(801, 800, 9_300);
+        assert_eq!(installer_of_requester(proc.path(), 801), None);
+        // PID 1 itself is no requester
+        assert_eq!(installer_of_requester(proc.path(), 1), None);
     }
 }

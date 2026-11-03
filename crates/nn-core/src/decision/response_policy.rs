@@ -61,6 +61,7 @@ impl PolicySwitch {
             action: v.action.clone(),
             reasoning: v.reasoning.clone(),
             switch: self.held,
+            by_posture: false,
         };
         v.reasoning = format!(
             "{} [held back: {} — alert only, by default, until the signed per-rule response \
@@ -83,6 +84,44 @@ pub struct Held {
     pub action: ResponseAction,
     pub reasoning: String,
     pub switch: &'static str,
+    /// Lot 278: held by the posture the event was judged in
+    /// ([`super::posture_floor`]), not by a switch. Such a hold is the
+    /// rule's own record of the event (it caps a later rule's kill of the
+    /// same exec, as R009's sanctioned record does), where a switch's hold
+    /// lets a later rule's response through.
+    pub by_posture: bool,
+}
+
+/// Lot 278: hold `v`'s response because the posture `posture` is below
+/// `floor`, the lowest the rule's built-in kill runs in: its action becomes
+/// `Log`, its reasoning says what was held and why, and the engine is told
+/// ([`take_held`], [`Held::by_posture`]); a signed `enforce` gives the
+/// response back. `v` unchanged when its action is already `Log`.
+pub fn hold_below_posture(
+    mut v: Verdict,
+    held: &'static str,
+    posture: nn_model::posture_types::PostureKind,
+    floor: nn_model::posture_types::PostureKind,
+) -> Verdict {
+    if v.action == ResponseAction::Log {
+        return v;
+    }
+    let original = Held {
+        action: v.action.clone(),
+        reasoning: v.reasoning.clone(),
+        switch: held,
+        by_posture: true,
+    };
+    v.reasoning = format!(
+        "{} [held back: {held} — the posture is {posture}, the kill runs in {floor}, or under a \
+         signed per-rule `enforce`]",
+        v.reasoning
+    );
+    v.action = ResponseAction::Log;
+    HELD.with(|h| {
+        h.borrow_mut().get_or_insert(original);
+    });
+    v
 }
 
 thread_local! {
