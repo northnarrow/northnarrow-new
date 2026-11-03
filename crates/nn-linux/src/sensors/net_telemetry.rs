@@ -727,7 +727,7 @@ mod tests {
                 },
                 DnsRecordOut::A {
                     name: "edge.example".into(),
-                    ttl: 20,
+                    ttl: 50,
                     addr: [198, 51, 100, 7],
                 },
                 DnsRecordOut::Aaaa {
@@ -738,13 +738,18 @@ mod tests {
                         .unwrap()
                         .octets(),
                 },
+                DnsRecordOut::A {
+                    name: "edge.example".into(),
+                    ttl: 20,
+                    addr: [198, 51, 100, 9],
+                },
             ],
             complete: true,
         };
         let (ev, recs) = answer_event(&answer_raw(), Some(&d), Some("/usr/bin/curl".into()));
         assert_eq!(ev.query_name.as_deref(), Some("www.example"));
         assert_eq!(ev.server.to_string(), "127.0.0.53");
-        assert_eq!(ev.addrs.len(), 2);
+        assert_eq!(ev.addrs.len(), 3);
         assert_eq!(
             ev.addrs[1].to_string(),
             "198.51.100.8",
@@ -753,7 +758,7 @@ mod tests {
         assert_eq!(ev.cnames, vec!["edge.example".to_string()]);
         assert_eq!(ev.ttl_secs, 20);
         assert!(!ev.truncated);
-        assert_eq!(recs.len(), 3);
+        assert_eq!(recs.len(), 4);
         // not decoded: no name, nothing for the table; a cut message: truncated
         let mut raw = answer_raw();
         raw.flags = answer_flags::TRUNCATED;

@@ -655,8 +655,17 @@ mod tests {
         // an asker whose query was read before an earlier response (the
         // pumps' order): bound by it, as by a response from a cache
         t.on_query(55, "c.example", T0 + 2 * SEC);
-        answer(&t, RESOLVED, T0 + SEC, "c.example", &[a("c.example", 30, WEB)]);
-        assert_eq!(t.check(55, 1, WEB, T0 + 3 * SEC, none), DnsResolution::Lineage);
+        answer(
+            &t,
+            RESOLVED,
+            T0 + SEC,
+            "c.example",
+            &[a("c.example", 30, WEB)],
+        );
+        assert_eq!(
+            t.check(55, 1, WEB, T0 + 3 * SEC, none),
+            DnsResolution::Lineage
+        );
         // ... but not one that asked past the window after it
         t.on_query(56, "d.example", T0 + 20 * SEC);
         answer(&t, RESOLVED, T0, "d.example", &[a("d.example", 30, C2)]);

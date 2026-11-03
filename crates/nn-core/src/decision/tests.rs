@@ -306,7 +306,7 @@ fn default_engine_pins_all_seventy_nine_rule_ids() {
     ids.dedup();
 
     let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
-    assert_eq!(unique.len(), 85, "all rule IDs must be unique");
+    assert_eq!(unique.len(), 86, "all rule IDs must be unique");
 
     assert_eq!(
         ids,
