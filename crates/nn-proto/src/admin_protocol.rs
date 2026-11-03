@@ -1827,6 +1827,17 @@ pub enum AdminMessage {
     RemediateRansomwareRequest(RemediateRansomwareRequest),
     /// Reply to [`AdminMessage::RemediateRansomwareRequest`].
     RemediateRansomwareResponse(RemediateRansomwareResponse),
+    /// Lot 278 (review of #493, note a): the signed trusted-installer grant
+    /// of [`AdminMessage::TrustedInstallerGrantRequest`], asked for by an
+    /// installer for its own process tree (`nn-admin
+    /// trusted-installer-grant --for-installer`, what `install.sh` and
+    /// `uninstall.sh` pass): the agent also names the requester's parent as
+    /// the window's installer, whose tree R009 records at Low. The plain
+    /// request names none. Replied to with
+    /// [`AdminMessage::TrustedInstallerGrantResult`]. An agent older than
+    /// the variant cannot decode it and closes the connection (`nn-admin`
+    /// then asks for the plain grant).
+    TrustedInstallerGrantForInstallerRequest(TrustedInstallerGrantRequest),
 
     // ── debug-only, LAST (external audit ASK-016, lab PR 170) ─────
     // A `cfg` variant shifts the postcard discriminant of every variant
@@ -2539,6 +2550,7 @@ mod tests {
                 | AdminMessage::NetFingerprintRequest(_)
                 | AdminMessage::NetFingerprintResponse(_)
                 | AdminMessage::TrustedInstallerGrantRequest(_)
+                | AdminMessage::TrustedInstallerGrantForInstallerRequest(_)
                 | AdminMessage::TrustedInstallerGrantResult(_)
                 | AdminMessage::DetectionsRequest(_)
                 | AdminMessage::DetectionsResponse(_)
@@ -3650,6 +3662,16 @@ mod tests {
         ));
         roundtrip(AdminMessage::TrustedInstallerGrantResult(
             AdminResult::Success,
+        ));
+        let payload =
+            SignedPayload::new_trusted_installer_grant([0x45; 32], 1_700_000_001, [0x55; 16], 300);
+        roundtrip(AdminMessage::TrustedInstallerGrantForInstallerRequest(
+            TrustedInstallerGrantRequest {
+                payload,
+                signatures: vec![KeyedSignature {
+                    signature: [0x67; 64],
+                }],
+            },
         ));
     }
 

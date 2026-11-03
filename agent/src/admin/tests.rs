@@ -3508,7 +3508,7 @@ fn dispatch_trusted_installer_grant_arms_on_valid_m1() {
     let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
     let ov = test_override();
     let mut fps = Vec::new();
-    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), 0, &mut fps);
+    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), None, &mut fps);
     assert!(matches!(resp, AdminResult::Success));
     assert!(
         ov.is_window_open(),
@@ -3519,7 +3519,7 @@ fn dispatch_trusted_installer_grant_arms_on_valid_m1() {
         1,
         "signer fingerprint captured for the audit chain"
     );
-    // requester 0 (a peer this namespace cannot see): no installer named
+    // a plain grant (not asked for an installer): no installer named
     assert_eq!(ov.current_grant().expect("open").grantee, None);
 }
 
@@ -3540,7 +3540,7 @@ fn dispatch_trusted_installer_grant_names_the_requester_s_parent() {
     let mut fps = Vec::new();
     // this test process stands for nn-admin: its parent is the installer
     let me = std::process::id();
-    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), me, &mut fps);
+    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), Some(me), &mut fps);
     assert!(matches!(resp, AdminResult::Success));
     let who = ov.current_grant().expect("open").grantee;
     let parent = std::os::unix::process::parent_id();
@@ -3582,7 +3582,7 @@ fn dispatch_trusted_installer_grant_bad_signature_rejected() {
     let req = signed_grant_req(&other, nonce, agent_id, 120, now_unix_secs());
     let ov = test_override();
     let mut fps = Vec::new();
-    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), 0, &mut fps);
+    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), None, &mut fps);
     assert!(matches!(resp, AdminResult::InvalidSignature));
     assert!(
         !ov.is_window_open(),
@@ -3605,7 +3605,7 @@ fn dispatch_trusted_installer_grant_wrong_agent_id_rejected() {
     let req = signed_grant_req(&signing, nonce, [0xff; 16], 120, now_unix_secs());
     let ov = test_override();
     let mut fps = Vec::new();
-    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), 0, &mut fps);
+    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), None, &mut fps);
     assert!(matches!(resp, AdminResult::AgentIdMismatch));
     assert!(!ov.is_window_open());
 }
@@ -3628,12 +3628,12 @@ fn dispatch_trusted_installer_grant_replayed_nonce_rejected() {
     // First presentation succeeds.
     let first = signed_grant_req(&signing, nonce, agent_id, 120, now);
     assert!(matches!(
-        dispatch_trusted_installer_grant(first, &auth, Some(&ov), 0, &mut fps),
+        dispatch_trusted_installer_grant(first, &auth, Some(&ov), None, &mut fps),
         AdminResult::Success
     ));
     // Exact-byte replay (deterministic Ed25519) — nonce already consumed.
     let replay = signed_grant_req(&signing, nonce, agent_id, 120, now);
-    let resp = dispatch_trusted_installer_grant(replay, &auth, Some(&ov), 0, &mut fps);
+    let resp = dispatch_trusted_installer_grant(replay, &auth, Some(&ov), None, &mut fps);
     assert!(matches!(resp, AdminResult::NoPendingChallenge));
 }
 
@@ -3652,7 +3652,7 @@ fn dispatch_trusted_installer_grant_role_denied_without_role() {
     let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
     let ov = test_override();
     let mut fps = Vec::new();
-    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), 0, &mut fps);
+    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), None, &mut fps);
     assert!(matches!(resp, AdminResult::RoleDenied));
     assert!(!ov.is_window_open());
 }
@@ -3673,7 +3673,7 @@ fn dispatch_trusted_installer_grant_skewed_ts_rejected() {
     let req = signed_grant_req(&signing, nonce, agent_id, 120, skewed_ts);
     let ov = test_override();
     let mut fps = Vec::new();
-    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), 0, &mut fps);
+    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), None, &mut fps);
     assert!(matches!(resp, AdminResult::TimestampSkew { .. }));
     assert!(!ov.is_window_open());
 }
@@ -3691,7 +3691,7 @@ fn dispatch_trusted_installer_grant_without_override_unknown_operation() {
     let nonce = auth.issue_challenge().unwrap();
     let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
     let mut fps = Vec::new();
-    let resp = dispatch_trusted_installer_grant(req, &auth, None, 0, &mut fps);
+    let resp = dispatch_trusted_installer_grant(req, &auth, None, None, &mut fps);
     assert!(matches!(resp, AdminResult::UnknownOperation));
 }
 

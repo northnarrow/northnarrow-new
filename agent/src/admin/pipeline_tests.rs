@@ -2316,3 +2316,37 @@ fn golden(part: &str, table: &str) {
         );
     }
 }
+
+/// Lot 278 (review of #493, note a): the grant asked for an installer is
+/// the grant — the same signed payload, quorum and refusals — and its row
+/// says it was for an installer (`for_installer`, and the installer's pid
+/// once a window opened: none here, refused).
+#[test]
+fn a_grant_for_an_installer_is_verified_and_rowed_as_the_grant() {
+    let k = keys();
+    let verbs = verbs();
+    let grant = verbs
+        .iter()
+        .find(|v| v.request == "TrustedInstallerGrantRequest")
+        .expect("the grant's verb");
+    let fx = Fixture::new(&k);
+    let conn = ConnAuth::new(&fx.auth);
+    let nonce = fx.challenge(&conn);
+    let p = payload((grant.extra)(&k), nonce, now_unix_secs(), AGENT_ID);
+    let request =
+        AdminMessage::TrustedInstallerGrantForInstallerRequest(TrustedInstallerGrantRequest {
+            payload: p.clone(),
+            signatures: signatures(&p, &[&k.stranger]),
+        });
+    let reply = fx.serve(&conn, &request);
+    assert_eq!(
+        reply,
+        AdminMessage::TrustedInstallerGrantResult(AdminResult::InvalidSignature)
+    );
+    let row = fx.rows().pop().expect("its row");
+    assert_eq!(row.op, "trusted_installer_grant");
+    assert_eq!(
+        row.extra,
+        json!({ "window_secs": 300, "for_installer": true, "installer_pid": null })
+    );
+}

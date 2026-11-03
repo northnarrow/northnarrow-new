@@ -636,6 +636,30 @@ fn install_executes_the_tree_s_agent_only_in_tree_version() {
     }
 }
 
+/// Lot 278 (review of #493, note a): the scripts ask for their windows
+/// for their own tree — every grant they run passes
+/// `NN_GRANT_FOR_INSTALLER=1` — and a grant by hand names no installer.
+#[test]
+fn the_scripts_ask_for_their_windows_as_installers() {
+    for script in ["deploy/install.sh", "deploy/uninstall.sh"] {
+        let text = read(script);
+        let grants: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim_start().starts_with("echo "))
+            .filter(|l| l.contains("nn-admin\" trusted-installer-grant"))
+            .collect();
+        assert!(!grants.is_empty(), "{script}: no grant");
+        for l in grants {
+            assert!(
+                l.contains(
+                    "NN_GRANT_FOR_INSTALLER=1 \"$BIN_DIR/nn-admin\" trusted-installer-grant"
+                ),
+                "{script}: a grant not for the script's tree: {l}"
+            );
+        }
+    }
+}
+
 /// The tree binaries a shell line names — `$VAR` (not a longer name) or
 /// `${VAR}` — each with what follows it (a closing quote skipped).
 fn tree_binary_mentions(line: &str) -> Vec<(&'static str, &str)> {

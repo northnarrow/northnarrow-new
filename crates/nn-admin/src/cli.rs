@@ -53,12 +53,13 @@ use crate::admin_cli::{
     load_audit_pubkey, run_audit_read, run_audit_verify_expecting, run_canary_burn,
     run_canary_deploy, run_canary_list, run_canary_refresh, run_chain_verify, run_fim_baseline,
     run_fim_report, run_fim_status, run_force_posture, run_init, run_rotate_keys_add,
-    run_rotate_keys_revoke, run_shutdown, run_status, run_trusted_installer_grant, run_unlock,
-    run_verify_keys, AuditVerifyOutcome, CanaryBurnOutcome, CanaryDeployOutcome, CanaryDeploySpec,
-    CanaryListOutcome, CanaryRefreshOutcome, DetectionSetStatusOutcome, ExpectedHead,
-    FimBaselineOutcome, FimReportOutcome, FimStatusOutcome, ForcePostureOutcome, NetJsonlOutcome,
-    NetResolveOutcome, RotateKeysOutcome, ShutdownOutcome, StatusOutcome,
-    TrustedInstallerGrantOutcome, UnlockOutcome, VerifyKeysOutcome, AUDIT_READ_SKIPS_LISTED,
+    run_rotate_keys_revoke, run_shutdown, run_status, run_trusted_installer_grant,
+    run_trusted_installer_grant_for_installer, run_unlock, run_verify_keys, AuditVerifyOutcome,
+    CanaryBurnOutcome, CanaryDeployOutcome, CanaryDeploySpec, CanaryListOutcome,
+    CanaryRefreshOutcome, DetectionSetStatusOutcome, ExpectedHead, FimBaselineOutcome,
+    FimReportOutcome, FimStatusOutcome, ForcePostureOutcome, NetJsonlOutcome, NetResolveOutcome,
+    RotateKeysOutcome, ShutdownOutcome, StatusOutcome, TrustedInstallerGrantOutcome, UnlockOutcome,
+    VerifyKeysOutcome, AUDIT_READ_SKIPS_LISTED,
 };
 use crate::host::{AdminHost, HostChecks as _, OverlayGate as _, RollbackFloor as _};
 
@@ -542,6 +543,15 @@ enum Cmd {
         agent_id_file: PathBuf,
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
+        /// Lot 278: the grant is for this command's parent, an installer
+        /// (`install.sh`, `uninstall.sh`, a root shell that will run one):
+        /// the agent names it as the window's installer, and R009 records
+        /// at Low what its own process tree executes from a home or `/tmp`
+        /// after the grant, while the window is open. Without it the window
+        /// names no installer. The scripts pass it through the environment
+        /// (`NN_GRANT_FOR_INSTALLER=1`), which an older nn-admin ignores.
+        #[arg(long = "for-installer", env = "NN_GRANT_FOR_INSTALLER")]
+        for_installer: bool,
     },
 
     /// External audit CMB-016 — undo what the response layer did:
@@ -2061,6 +2071,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
             window_secs,
             agent_id_file,
             socket,
+            for_installer,
         } => {
             // Clamp client-side to the agent's ceiling (the agent also
             // clamps; this gives the operator a clear message instead
@@ -2073,7 +2084,12 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                      (agent ceiling)"
                 );
             }
-            match run_trusted_installer_grant(&socket, &key, &agent_id_file, clamped) {
+            let run = if for_installer {
+                run_trusted_installer_grant_for_installer
+            } else {
+                run_trusted_installer_grant
+            };
+            match run(&socket, &key, &agent_id_file, clamped) {
                 Ok(outcome) => exit_from_trusted_installer_grant(outcome, clamped),
                 Err(e) => {
                     eprintln!("trusted-installer-grant: {e:#}");

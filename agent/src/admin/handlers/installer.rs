@@ -26,15 +26,20 @@ use crate::anti_tamper::trusted_installer::{installer_of_requester, TrustedInsta
 /// pipeline's quorum (`verify::Quorum`) so a future hardening can require
 /// co-signers without touching this dispatcher.
 ///
-/// Lot 278: the window is granted to the installer that asked for it —
-/// the parent of `requester`, the peer's `SO_PEERCRED` pid
-/// ([`installer_of_requester`]) — so that R009 records, rather than kills,
-/// what that installer's own process tree executes from its source tree.
+/// Lot 278: asked for by an installer for its own tree (`requester`: the
+/// peer's `SO_PEERCRED` pid, from
+/// [`AdminMessage::TrustedInstallerGrantForInstallerRequest`] only — review
+/// of #493, note a), the window is granted to that installer, the
+/// requester's parent ([`installer_of_requester`]), so that R009 records,
+/// rather than kills, what its own process tree executes from its source
+/// tree. A plain grant (`None`) names no installer.
+///
+/// [`AdminMessage::TrustedInstallerGrantForInstallerRequest`]: nn_proto::admin_protocol::AdminMessage::TrustedInstallerGrantForInstallerRequest
 pub(in crate::admin) fn dispatch_trusted_installer_grant(
     req: TrustedInstallerGrantRequest,
     auth: &ConnAuth<'_>,
     installer_override: Option<&TrustedInstallerOverride>,
-    requester: u32,
+    requester: Option<u32>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
     // Required distinct signatures (M of N): 1 today, the pipeline's
@@ -52,7 +57,7 @@ pub(in crate::admin) fn dispatch_trusted_installer_grant(
 fn trusted_installer_grant(
     v: Verified<'_, TrustedInstallerGrantRequest>,
     installer_override: Option<&TrustedInstallerOverride>,
-    requester: u32,
+    requester: Option<u32>,
 ) -> AdminResult {
     // The op/extra invariant is enforced inside the verify; this pulls
     // the signed window out.
@@ -60,7 +65,8 @@ fn trusted_installer_grant(
 
     match installer_override {
         Some(ov) => {
-            let installer = installer_of_requester(Path::new("/proc"), requester);
+            let installer =
+                requester.and_then(|pid| installer_of_requester(Path::new("/proc"), pid));
             let window = ov.arm_for(
                 window_secs,
                 Instant::now(),

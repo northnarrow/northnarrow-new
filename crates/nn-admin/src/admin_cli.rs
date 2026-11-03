@@ -2825,6 +2825,53 @@ pub fn run_trusted_installer_grant(
     agent_id_path: &Path,
     window_secs: u32,
 ) -> Result<TrustedInstallerGrantOutcome> {
+    grant_with(
+        socket,
+        key_path,
+        agent_id_path,
+        window_secs,
+        AdminMessage::TrustedInstallerGrantRequest,
+    )
+}
+
+/// Lot 278 (review of #493, note a): [`run_trusted_installer_grant`] asked
+/// for by an installer for its own process tree (`--for-installer`, what
+/// `install.sh` and `uninstall.sh` pass): the agent names this process's
+/// parent as the window's installer, whose tree R009 records at Low. An
+/// agent older than the request cannot decode it and closes the
+/// connection: the plain grant is asked for then (no installer named), and
+/// the note says so.
+pub fn run_trusted_installer_grant_for_installer(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    window_secs: u32,
+) -> Result<TrustedInstallerGrantOutcome> {
+    match grant_with(
+        socket,
+        key_path,
+        agent_id_path,
+        window_secs,
+        AdminMessage::TrustedInstallerGrantForInstallerRequest,
+    ) {
+        Err(e) if e.downcast_ref::<std::io::Error>().is_some() => {
+            eprintln!(
+                "trusted-installer-grant: the agent did not answer a grant for an installer \
+                 ({e:#}): an agent older than it — asking for the plain grant (no installer named)"
+            );
+            run_trusted_installer_grant(socket, key_path, agent_id_path, window_secs)
+        }
+        other => other,
+    }
+}
+
+fn grant_with(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    window_secs: u32,
+    wrap: fn(nn_proto::admin_protocol::TrustedInstallerGrantRequest) -> AdminMessage,
+) -> Result<TrustedInstallerGrantOutcome> {
     use nn_proto::admin_protocol::TrustedInstallerGrantRequest;
 
     let signing = read_priv_key(key_path)?;
@@ -2850,7 +2897,7 @@ pub fn run_trusted_installer_grant(
 
     write_frame(
         &mut stream,
-        &AdminMessage::TrustedInstallerGrantRequest(TrustedInstallerGrantRequest {
+        &wrap(TrustedInstallerGrantRequest {
             payload,
             signatures: vec![KeyedSignature { signature: sig }],
         }),
@@ -3605,6 +3652,68 @@ mod tests {
 
         let outcome = run_trusted_installer_grant(&socket, &priv_path, &agent_id_path, 120)
             .expect("trusted-installer-grant");
+        assert!(matches!(outcome, TrustedInstallerGrantOutcome::Success));
+        server.join().unwrap();
+    }
+
+    /// Lot 278 (review of #493, note a): `--for-installer` sends the grant
+    /// asked for an installer; an agent older than it closes the connection
+    /// on it, and the plain grant is asked for on a new one.
+    #[test]
+    fn cli_trusted_installer_grant_for_installer_and_its_fallback() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("admin.sock");
+        let priv_path = dir.path().join("admin.key");
+        let agent_id_path = write_agent_id_file(&dir, &[0x33u8; 16]);
+        let signing = SigningKey::generate(&mut OsRng);
+        write_priv_key_file(&priv_path, &signing);
+        let challenge = |stream: &mut UnixStream| {
+            let _ = server_read_frame(stream);
+            server_write_frame(
+                stream,
+                &AdminMessage::Challenge(Challenge { nonce: [7u8; 32] }),
+            );
+        };
+        // an agent that knows the request
+        let server = spawn_mock_server(&socket, move |stream| {
+            challenge(stream);
+            match server_read_frame(stream) {
+                AdminMessage::TrustedInstallerGrantForInstallerRequest(_) => {}
+                other => panic!("expected the grant for an installer, got {other:?}"),
+            }
+            server_write_frame(
+                stream,
+                &AdminMessage::TrustedInstallerGrantResult(AdminResult::Success),
+            );
+        });
+        let outcome =
+            run_trusted_installer_grant_for_installer(&socket, &priv_path, &agent_id_path, 120)
+                .expect("grant");
+        assert!(matches!(outcome, TrustedInstallerGrantOutcome::Success));
+        server.join().unwrap();
+        // an older agent: it closes on the request; the plain one follows
+        std::fs::remove_file(&socket).unwrap();
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().expect("accept");
+            challenge(&mut first);
+            let mut header = [0u8; 4];
+            first.read_exact(&mut header).expect("the request's header");
+            drop(first);
+            let (mut second, _) = listener.accept().expect("accept the plain grant");
+            challenge(&mut second);
+            match server_read_frame(&mut second) {
+                AdminMessage::TrustedInstallerGrantRequest(_) => {}
+                other => panic!("expected the plain grant, got {other:?}"),
+            }
+            server_write_frame(
+                &mut second,
+                &AdminMessage::TrustedInstallerGrantResult(AdminResult::Success),
+            );
+        });
+        let outcome =
+            run_trusted_installer_grant_for_installer(&socket, &priv_path, &agent_id_path, 120)
+                .expect("the plain grant after the fallback");
         assert!(matches!(outcome, TrustedInstallerGrantOutcome::Success));
         server.join().unwrap();
     }

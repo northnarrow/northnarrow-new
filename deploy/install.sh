@@ -1531,7 +1531,10 @@ open_trusted_installer_window() {
         return 1
     fi
     echo "install.sh: opening the trusted-installer window (300 s) with $key"
-    if ! "$BIN_DIR/nn-admin" trusted-installer-grant --key "$key" --window-secs 300; then
+    # Lot 278: for this script's own tree (the agent names this shell the
+    # window's installer, and R009 records what its tree runs from the tree
+    # at Low); an older nn-admin ignores the variable.
+    if ! NN_GRANT_FOR_INSTALLER=1 "$BIN_DIR/nn-admin" trusted-installer-grant --key "$key" --window-secs 300; then
         echo "install.sh: trusted-installer grant REFUSED — the key needs the trusted-installer role on its" >&2
         echo "install.sh: admin.pub line (docs/operator/COMBAT_RECOVERY.md section 1.1)." >&2
         return 1
