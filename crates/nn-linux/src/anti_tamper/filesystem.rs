@@ -99,9 +99,33 @@ pub const PROTECTED_DIR_FLAGS: u8 = FS_PROTECT_MUTATE | FS_PROTECT_NOCREATE;
 /// directories refuses the start, one above them while the previous
 /// agent's pins are there (`boot::checks::agent_mounts`; the review of
 /// #468, R7).
+///
+/// Lot 273b (the review of #489, R2): and the `system.control` directories
+/// of both units, where `systemctl set-property` writes the drop-in that
+/// makes a property stay (`--runtime`: until a reboot; without it: for
+/// good). Refused at the cgroup file, a lowered `MemoryMax=` / `TasksMax=` /
+/// `CPUQuota=` would still be applied to the fresh cgroup of the next
+/// start, before the agent is there to refuse it — an OOM kill or a
+/// starvation at every start. The agent's unit makes the four (empty)
+/// before every start (`ExecStartPre=+/bin/mkdir -p …`).
+///
+/// The review of #490 (A): and the watchdog's drop-in directories, with
+/// the `northnarrow-.service.d` prefix directories, whose drop-ins systemd
+/// (246 and later) applies to both units: a `MemoryMax=4K` there is
+/// refused at the cgroup file after a `daemon-reload`, but applied to the
+/// fresh cgroup at the next start or boot — an OOM loop. Named after our
+/// units only; the agent's unit makes them too.
 pub const NOCREATE_UNIT_DIRS: &[&str] = &[
     "/etc/systemd/system/northnarrow-agent.service.d",
     "/run/systemd/system/northnarrow-agent.service.d",
+    "/etc/systemd/system.control/northnarrow-agent.service.d",
+    "/run/systemd/system.control/northnarrow-agent.service.d",
+    "/etc/systemd/system.control/northnarrow-watchdog.service.d",
+    "/run/systemd/system.control/northnarrow-watchdog.service.d",
+    "/etc/systemd/system/northnarrow-watchdog.service.d",
+    "/run/systemd/system/northnarrow-watchdog.service.d",
+    "/etc/systemd/system/northnarrow-.service.d",
+    "/run/systemd/system/northnarrow-.service.d",
 ];
 
 /// The files inside [`CONFIG_DIR`] that PROTECTED_INODES covers.
@@ -410,6 +434,18 @@ pub const BINARY_AND_UNIT_PATHS: &[&str] = &[
     // Lab PR 265 (review #466 F4-bis): the runtime drop-in directory the
     // unit makes before every start (`NOCREATE_UNIT_DIRS`).
     "/run/systemd/system/northnarrow-agent.service.d",
+    // Lot 273b: the units' `set-property` drop-in directories, which the
+    // agent's unit makes before every start (`NOCREATE_UNIT_DIRS`).
+    "/etc/systemd/system.control/northnarrow-agent.service.d",
+    "/run/systemd/system.control/northnarrow-agent.service.d",
+    "/etc/systemd/system.control/northnarrow-watchdog.service.d",
+    "/run/systemd/system.control/northnarrow-watchdog.service.d",
+    // The review of #490 (A): the watchdog's drop-in directories and the
+    // `northnarrow-.service.d` prefix ones (`NOCREATE_UNIT_DIRS`).
+    "/etc/systemd/system/northnarrow-watchdog.service.d",
+    "/run/systemd/system/northnarrow-watchdog.service.d",
+    "/etc/systemd/system/northnarrow-.service.d",
+    "/run/systemd/system/northnarrow-.service.d",
     // Lab PR 223 (EXPERIMENTAL): the exec quarantine's scanner, in both
     // layouts — a replaced scanner would call every file clean.
     "/usr/local/bin/northnarrow-scan",
@@ -451,6 +487,10 @@ pub(crate) const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("protected_link_deny", "inode_link"),
     ("protected_setxattr_deny", "inode_setxattr"),
     ("protected_removexattr_deny", "inode_removexattr"),
+    // Lot 273b: the write deny — a descriptor opened before its inode was
+    // registered, a protected cgroup's resource file, a cgroup v1 file, a
+    // protected process's `oom_score_adj`.
+    ("protected_write_deny", "file_permission"),
 ];
 
 /// External audit EBPF-015: deny programs for hooks only newer kernels
@@ -2514,9 +2554,9 @@ mod tests {
             super::super::DENY_HOOKS.len(),
             "a hook listed twice"
         );
-        assert_eq!(super::super::LSM_DENY_HOOKS_EXPECTED, 16);
+        assert_eq!(super::super::LSM_DENY_HOOKS_EXPECTED, 17);
         // Lot 273: the optional set is the optional inode hooks and the
-        // cgroup move guard's pair.
+        // cgroup move guard's three programs.
         let optional: BTreeSet<&str> = OPTIONAL_LSM_PROGRAMS
             .iter()
             .map(|(_, hook)| *hook)
@@ -3052,6 +3092,14 @@ mod tests {
                 "/etc/systemd/system/northnarrow-agent.service.d",
                 "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
                 "/run/systemd/system/northnarrow-agent.service.d",
+                "/etc/systemd/system.control/northnarrow-agent.service.d",
+                "/run/systemd/system.control/northnarrow-agent.service.d",
+                "/etc/systemd/system.control/northnarrow-watchdog.service.d",
+                "/run/systemd/system.control/northnarrow-watchdog.service.d",
+                "/etc/systemd/system/northnarrow-watchdog.service.d",
+                "/run/systemd/system/northnarrow-watchdog.service.d",
+                "/etc/systemd/system/northnarrow-.service.d",
+                "/run/systemd/system/northnarrow-.service.d",
                 "/usr/local/bin/northnarrow-scan",
                 "/usr/bin/northnarrow-scan",
             ],
@@ -3213,11 +3261,21 @@ mod tests {
         // Lab PR 265 (the review of #468: the runtime drop-in directory left
         // out of the NOCREATE list went unseen): the unit's two drop-in
         // directories, the persistent and the runtime one.
+        // Lot 273b: and both units' `set-property` drop-in directories.
+        // The review of #490 (A): and the watchdog's and the prefix ones.
         assert_eq!(
             NOCREATE_UNIT_DIRS,
             &[
                 "/etc/systemd/system/northnarrow-agent.service.d",
                 "/run/systemd/system/northnarrow-agent.service.d",
+                "/etc/systemd/system.control/northnarrow-agent.service.d",
+                "/run/systemd/system.control/northnarrow-agent.service.d",
+                "/etc/systemd/system.control/northnarrow-watchdog.service.d",
+                "/run/systemd/system.control/northnarrow-watchdog.service.d",
+                "/etc/systemd/system/northnarrow-watchdog.service.d",
+                "/run/systemd/system/northnarrow-watchdog.service.d",
+                "/etc/systemd/system/northnarrow-.service.d",
+                "/run/systemd/system/northnarrow-.service.d",
             ]
         );
         for d in NOCREATE_UNIT_DIRS {

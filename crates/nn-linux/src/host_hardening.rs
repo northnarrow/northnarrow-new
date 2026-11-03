@@ -67,7 +67,70 @@ pub fn run_in(root: &Path) -> Vec<Check> {
         admin_key(root),
         nft_tool(root),
         install_provenance(root),
+        cgroup_v1(root),
     ]
+}
+
+/// The cgroup v1 controllers a root can mount on a host whose systemd runs
+/// the unified hierarchy, and that stop or confine a process from outside
+/// the v2 tree (lot 273b, the review of #489: the v1 `freezer` freezes the
+/// agent where no v2 hook sees it).
+const V1_CONTROLLERS: [&str; 5] = ["freezer", "devices", "net_cls", "net_prio", "perf_event"];
+
+/// Lot 273b: which of [`V1_CONTROLLERS`] a root can mount as a cgroup v1
+/// hierarchy — every one `/proc/cgroups` lists as enabled, unless the
+/// kernel's command line has `cgroup_no_v1=all` or names it. Where systemd
+/// runs the unified hierarchy the agent refuses writes to a v1 hierarchy
+/// outside a trusted-installer window; the boot option refuses the mount
+/// itself, before the agent is there.
+fn cgroup_v1(root: &Path) -> Check {
+    let cmdline = read(root, "/proc/cmdline").unwrap_or_default();
+    let disabled: Vec<String> = cmdline
+        .split_whitespace()
+        .filter_map(|w| w.strip_prefix("cgroup_no_v1="))
+        .flat_map(|v| v.split(',').map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    let all = disabled.iter().any(|d| d == "all");
+    let (status, value) = match read(root, "/proc/cgroups") {
+        None => (Status::Unknown, "/proc/cgroups unreadable".to_string()),
+        Some(table) => {
+            let enabled: Vec<&str> = table
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    (f.len() >= 4 && f[3] == "1").then(|| f[0])
+                })
+                .collect();
+            let mountable: Vec<&str> = V1_CONTROLLERS
+                .iter()
+                .copied()
+                .filter(|c| enabled.contains(c) && !all && !disabled.iter().any(|d| d == c))
+                .collect();
+            if mountable.is_empty() {
+                (
+                    Status::Ok,
+                    if all {
+                        "cgroup_no_v1=all".to_string()
+                    } else {
+                        "no v1 controller of these mountable".to_string()
+                    },
+                )
+            } else {
+                (
+                    Status::Warn,
+                    format!("mountable as cgroup v1: {}", mountable.join(", ")),
+                )
+            }
+        }
+    };
+    Check {
+        id: "cgroup_v1",
+        name: "cgroup v1 controllers not mountable",
+        status,
+        value,
+        fix: "on a host whose systemd runs the unified cgroup hierarchy, boot with `cgroup_no_v1=all` — a root can mount the v1 freezer, move the agent into it and freeze it (the agent refuses writes to a v1 hierarchy outside a trusted-installer window; the boot option refuses the mount itself)",
+    }
 }
 
 /// External audit DEP-007: the install manifest `install.sh` writes,
@@ -489,15 +552,57 @@ mod tests {
         w(r, "etc/northnarrow/admin.pub", b"ab unlock\n");
         nft_at(r, "usr/sbin/nft");
         w(r, INSTALL_MANIFEST_REL, &manifest("attested", None));
+        w(
+            r,
+            "proc/cmdline",
+            b"BOOT_IMAGE=/vmlinuz root=/dev/sda1 cgroup_no_v1=all\n",
+        );
+        w(
+            r,
+            "proc/cgroups",
+            b"#subsys_name\thierarchy\tnum_cgroups\tenabled\ncpu\t0\t80\t1\nfreezer\t0\t80\t1\n",
+        );
         let checks = run_in(r);
-        assert_eq!(checks.len(), 11);
+        assert_eq!(checks.len(), 12);
         assert_eq!(warn_count(&checks), 0, "{:?}", checks);
         assert!(
             checks.iter().all(|c| c.status == Status::Ok),
             "{:?}",
             checks
         );
-        assert!(render_table(&checks).contains("11 check(s), 0 warning(s)"));
+        assert!(render_table(&checks).contains("12 check(s), 0 warning(s)"));
+    }
+
+    /// Lot 273b: the v1 controllers a root can mount, unless the kernel's
+    /// command line refuses them — all, or by name.
+    #[test]
+    fn cgroup_v1_names_what_root_can_mount() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        assert_eq!(cgroup_v1(r).status, Status::Unknown);
+        w(
+            r,
+            "proc/cgroups",
+            b"#subsys_name\thierarchy\tnum_cgroups\tenabled\ncpu\t0\t80\t1\nfreezer\t0\t80\t1\ndevices\t0\t80\t1\nnet_cls\t0\t1\t0\n",
+        );
+        w(r, "proc/cmdline", b"root=/dev/sda1 quiet\n");
+        let c = cgroup_v1(r);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.value, "mountable as cgroup v1: freezer, devices");
+        w(r, "proc/cmdline", b"root=/dev/sda1 cgroup_no_v1=devices\n");
+        assert_eq!(cgroup_v1(r).value, "mountable as cgroup v1: freezer");
+        w(
+            r,
+            "proc/cmdline",
+            b"root=/dev/sda1 cgroup_no_v1=freezer,devices\n",
+        );
+        assert_eq!(cgroup_v1(r).status, Status::Ok);
+        w(r, "proc/cmdline", b"cgroup_no_v1=all\n");
+        let c = cgroup_v1(r);
+        assert_eq!(
+            (c.status, c.value.as_str()),
+            (Status::Ok, "cgroup_no_v1=all")
+        );
     }
 
     fn manifest(provenance: &str, verify_override: Option<&str>) -> Vec<u8> {

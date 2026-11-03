@@ -39,9 +39,9 @@ use std::sync::OnceLock;
 
 use common::btf_offsets::{
     EnumSpec, FexitTarget, HookArgCheck, HookArgSpec, OffsetSpec, BTF_MODULE_STRUCTS,
-    BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC, CGROUP_MOVE_TARGET, ENUM_SLOT_TABLE, ENUM_VALUES,
-    FEXIT_TARGETS, HOOK_ARGS, HOOK_ARG_CHECKS, HOOK_ARG_MAX, HOOK_ARG_SLOT_TABLE, REVALIDATE,
-    SLOT_TABLE,
+    BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC, CGROUP_MOVE_FINISH, CGROUP_MOVE_TARGET, ENUM_SLOT_TABLE,
+    ENUM_VALUES, FENTRY_TARGETS, FEXIT_TARGETS, HOOK_ARGS, HOOK_ARG_CHECKS, HOOK_ARG_MAX,
+    HOOK_ARG_SLOT_TABLE, REVALIDATE, SLOT_TABLE,
 };
 
 /// The running kernel's BTF, exported by the kernel when built with
@@ -600,6 +600,23 @@ fn resolve_with(
             });
             false
         }
+    };
+    // Lot 273b: and its third program's function, which ends the write.
+    let cgroup_move = cgroup_move && {
+        let present = btf.lsm_funcs.contains_key(CGROUP_MOVE_FINISH);
+        if !present {
+            absent.push(Mismatch {
+                name: CGROUP_MOVE_TARGET.func,
+                struct_name: CGROUP_MOVE_FINISH,
+                expected: 0,
+                actual: None,
+                detail: format!(
+                    "the kernel's BTF has no {CGROUP_MOVE_FINISH}: a stashed move would outlive \
+                     its write"
+                ),
+            });
+        }
+        present
     };
     let optional_deny_hooks = super::OPTIONAL_DENY_HOOKS
         .iter()
@@ -1281,6 +1298,7 @@ impl Btf {
                     if let Some(nm) = name_of(name_off) {
                         if nm.starts_with(LSM_FUNC_PREFIX)
                             || FEXIT_TARGETS.iter().any(|t| t.func == nm)
+                            || FENTRY_TARGETS.iter().any(|f| *f == nm)
                         {
                             lsm_funcs.entry(nm).or_insert(size_or_type);
                         }
@@ -2898,11 +2916,11 @@ mod tests {
     fn file_ioctl_compat_is_selected_from_the_kernels_btf() {
         use super::super::filesystem::{attach_optional, OptionalHook, OPTIONAL_LSM_PROGRAMS};
         for (kernel, compat, acl, expected) in [
-            ("6.8, 6.12", true, true, 16 + 3),
-            ("6.6.15", true, true, 16 + 3),
-            ("6.6.14", false, true, 16 + 2),
-            ("6.1.76, 5.15.149", true, false, 16 + 1),
-            ("6.1.75, 5.15.148", false, false, 16),
+            ("6.8, 6.12", true, true, 17 + 3),
+            ("6.6.15", true, true, 17 + 3),
+            ("6.6.14", false, true, 17 + 2),
+            ("6.1.76, 5.15.149", true, false, 17 + 1),
+            ("6.1.75, 5.15.148", false, false, 17),
         ] {
             let r = hooks_only(&ioctl_btf(compat, acl, 0));
             assert_eq!(
@@ -2946,9 +2964,13 @@ mod tests {
     /// return value in the fourth slot) — and neither elsewhere: a function
     /// of another shape is recorded (signed degraded at the attach), an
     /// absent one only not attached.
+    ///
+    /// Lot 273b: and where `cgroup_procs_write_finish` is there too (the
+    /// third program drops a record at the end of the write); without it
+    /// the guard is not attached, and why is recorded.
     #[test]
     fn the_move_guard_is_selected_from_the_kernels_btf() {
-        fn btf_with(target: Option<(usize, bool)>) -> Btf {
+        fn btf_with(target: Option<(usize, bool)>, finish: bool) -> Btf {
             let mut b = BtfBuilder::new();
             let int = b.int("int");
             let ch = b.int("char");
@@ -2967,31 +2989,44 @@ mod tests {
                     &args[..params],
                 );
             }
+            if finish {
+                b.func("cgroup_procs_write_finish", int, &[p_task, int]);
+            }
             Btf::parse(&b.build()).expect("cgroup fixture parses")
         }
-        for (what, target, present, mismatch) in [
-            ("5.14 to 7.0", Some((3, true)), true, None),
+        for (what, target, finish, present, mismatch) in [
+            ("5.14 to 7.0", Some((3, true)), true, true, None),
             (
                 "two parameters",
                 Some((2, true)),
+                true,
                 false,
                 Some("2 parameters"),
             ),
             (
                 "four parameters",
                 Some((4, true)),
+                true,
                 false,
                 Some("4 parameters"),
             ),
             (
                 "an int returned",
                 Some((3, false)),
+                true,
                 false,
                 Some("does not return a struct task_struct"),
             ),
-            ("no such function", None, false, None),
+            ("no such function", None, true, false, None),
+            (
+                "no write_finish",
+                Some((3, true)),
+                false,
+                false,
+                Some("no cgroup_procs_write_finish"),
+            ),
         ] {
-            let r = hooks_only(&btf_with(target));
+            let r = hooks_only(&btf_with(target, finish));
             for hook in super::super::cgroup_guard::GUARD_HOOKS {
                 assert_eq!(
                     optional_hook_gate(Some(&r), hook),

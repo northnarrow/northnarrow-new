@@ -471,15 +471,12 @@ fn attach_reporting(
     // above (it runs the installed watchdog binary); it registered its
     // cgroup itself at its start, and this boot's prune would otherwise
     // drop those keys until the refresh registers them again.
-    let mut cgroup_pids: Vec<u32> = pids.to_vec();
-    let live = ProtectedPidsHandle::from_ebpf(ebpf).and_then(|h| h.pids());
-    for pid in live.unwrap_or_default() {
-        if !cgroup_pids.contains(&pid)
-            && ExeIdentity::of_process(pid).is_some_and(|id| keep.contains(&id))
-        {
-            cgroup_pids.push(pid);
-        }
-    }
+    let live = ProtectedPidsHandle::from_ebpf(ebpf)
+        .and_then(|h| h.pids())
+        .unwrap_or_default();
+    let cgroup_pids = cgroup_guard::cgroup_pids(pids, &live, |pid| {
+        ExeIdentity::of_process(pid).is_some_and(|id| keep.contains(&id))
+    });
     match cgroup_guard::register_unit_cgroups(ebpf, &cgroup_pids) {
         Ok(reg) => {
             for (pid, why) in reg.unavailable {
@@ -490,6 +487,23 @@ fn attach_reporting(
             }
         }
         Err(e) => deny.infra_failure("cgroup_guard::register_unit_cgroups", format!("{e:#}")),
+    }
+    // Lot 273b: an optional offset of the cgroup files' checks the kernel
+    // lacks is a signed cost.
+    if let Some(r) = btf_revalidate::resolved() {
+        report.degraded.extend(cgroup_guard::offsets_degraded(
+            r.absent.iter().map(|m| m.name),
+        ));
+    }
+    // Lot 273b: cgroup v1 writes refused where systemd runs the unified
+    // hierarchy only; elsewhere signed degraded.
+    match cgroup_guard::arm_v1_policy(ebpf, pin_root) {
+        Ok(cgroup_guard::V1Policy::Refused { .. }) => {}
+        Ok(cgroup_guard::V1Policy::NotRefused { why }) => report.degraded.push(format!(
+            "anti-tamper cgroup: writes to cgroup v1 hierarchies are not refused ({why}): a root \
+             can freeze the agent through a v1 freezer"
+        )),
+        Err(e) => deny.infra_failure("cgroup_guard::arm_v1_policy", format!("{e:#}")),
     }
 
     // Tappa 7 task 5: directory + inode protection. A bootstrap failure
@@ -526,6 +540,7 @@ fn attach_reporting(
     // kernel without it signs the guard's absence.
     let mg = cgroup_guard::attach_move_guard(ebpf, &btf, pin_root);
     deny_expected += mg.present;
+    report.move_guard_attached = mg.present > 0 && mg.failures.is_empty();
     for (program, why) in mg.failures {
         deny.missing_hook(program, why);
     }
@@ -601,6 +616,18 @@ fn attach_reporting(
             "anti-tamper FS: PROTECTED_INODES keys of earlier boots NOT removed"
         ),
     }
+    // Lot 273b: and the values of earlier boots' unit cgroups.
+    match cgroup_guard::prune_stale_values(ebpf) {
+        Ok(0) => {}
+        Ok(removed) => info!(
+            removed,
+            "anti-tamper cgroup: LIMIT_VALUES keys of earlier boots removed"
+        ),
+        Err(e) => warn!(
+            error = format!("{e:#}"),
+            "anti-tamper cgroup: LIMIT_VALUES keys of earlier boots NOT removed"
+        ),
+    }
 
     report_lsm_health(deny_expected, &deny, &observe_failures, report)
 }
@@ -657,6 +684,9 @@ pub struct AttachReport {
     /// is open. The journal line alone was the only trace of a degraded
     /// start.
     pub degraded: Vec<String>,
+    /// Lot 273b: the cgroup move guard's three programs are attached (the
+    /// boot's self-test then checks that it refuses a move).
+    pub move_guard_attached: bool,
 }
 
 /// Lab PR 218: the deny side of this boot's attach, for the trust level and
@@ -771,7 +801,7 @@ fn named(entries: &[(&'static str, String)]) -> Vec<String> {
 /// EBPF-015) and the BPF map guard. External audit TST-009: the
 /// privileged restart test asserts exactly these pins, where it counted
 /// seven LSM programs anywhere on the host.
-pub const DENY_HOOKS: [&str; 16] = [
+pub const DENY_HOOKS: [&str; 17] = [
     TASK_KILL_HOOK,
     PTRACE_HOOK,
     "inode_unlink",
@@ -788,6 +818,8 @@ pub const DENY_HOOKS: [&str; 16] = [
     "inode_setxattr",
     "inode_removexattr",
     bpf_defense::GUARD_HOOK,
+    // Lot 273b: the write deny (`protected_write_deny`).
+    "file_permission",
 ];
 
 /// Deny hooks attached only where the kernel has them
@@ -796,16 +828,17 @@ pub const DENY_HOOKS: [&str; 16] = [
 /// 5.15.149 and 5.10.210, lab PR 174). Each one the kernel has adds one
 /// to the expected deny hooks.
 ///
-/// Lot 273: and the cgroup move guard's pair, attached together where the
-/// kernel's BTF has `cgroup_procs_write_start` in the shape its fexit
-/// reads ([`cgroup_guard`]); where it has not, the guard's absence is
-/// signed degraded.
-pub const OPTIONAL_DENY_HOOKS: [&str; 5] = [
+/// Lot 273: and the cgroup move guard's programs, attached together where
+/// the kernel's BTF has `cgroup_procs_write_start` in the shape its fexit
+/// reads and (lot 273b) `cgroup_procs_write_finish` ([`cgroup_guard`]);
+/// where it has not, the guard's absence is signed degraded.
+pub const OPTIONAL_DENY_HOOKS: [&str; 6] = [
     "inode_set_acl",
     "inode_remove_acl",
     "file_ioctl_compat",
     cgroup_guard::MOVE_DENY_HOOK,
     cgroup_guard::MOVE_STASH_HOOK,
+    cgroup_guard::MOVE_CLEAR_HOOK,
 ];
 
 /// Deny hooks expected on a healthy boot of every supported kernel; the
@@ -1483,8 +1516,8 @@ mod tests {
             &deny,
             &[("module_load_observe", "absent".to_string())],
         );
-        assert_eq!(r.expected, 16);
-        assert_eq!(r.attached, 15, "a failed step is not a missing hook");
+        assert_eq!(r.expected, 17);
+        assert_eq!(r.attached, 16, "a failed step is not a missing hook");
         assert_eq!(r.missing, ["task_kill: verifier", "bpffs pin root: a link"]);
         assert_eq!(r.observe_missing, ["module_load_observe: absent"]);
         let healthy = DenyReport::of(18, &DenyHealth::default(), &[]);
@@ -1523,7 +1556,9 @@ mod tests {
     /// kernel expects.
     #[test]
     fn deny_hooks_expected_include_the_new_entry_and_xattr_denies() {
-        assert_eq!(LSM_DENY_HOOKS_EXPECTED, 2 + 13 + 1);
+        // Lot 273b: the write deny (`file_permission`) is the fourteenth
+        // inode_protect program.
+        assert_eq!(LSM_DENY_HOOKS_EXPECTED, 2 + 14 + 1);
         if std::env::var(ALLOW_DEGRADED_ENV).as_deref() == Ok("1") {
             return;
         }
@@ -1536,20 +1571,20 @@ mod tests {
             &mut AttachReport::default(),
         )
         .expect_err("a missing create deny must refuse to start");
-        assert!(format!("{err:#}").contains("17 of 18"), "{err:#}");
+        assert!(format!("{err:#}").contains("18 of 19"), "{err:#}");
     }
 
     /// External audit ATP-016 (NN-AUD-264): an FS bootstrap failure is the
-    /// thirteen FS deny hooks missing (plus the optional ones the kernel
-    /// has), so the line reads 3 of 16 — task_kill, ptrace, the BPF guard —
-    /// where it read 15 of 16.
+    /// fourteen FS deny hooks missing (plus the optional ones the kernel
+    /// has), so the line reads 3 of 17 — task_kill, ptrace, the BPF guard —
+    /// where it read 16 of 17.
     #[test]
     fn fs_bootstrap_failure_counts_every_fs_hook() {
         if std::env::var(ALLOW_DEGRADED_ENV).as_deref() == Ok("1") {
             return;
         }
         for (in_kernel, expected, attached) in
-            [(None, 16, 3), (Some(false), 16, 3), (Some(true), 19, 3)]
+            [(None, 17, 3), (Some(false), 17, 3), (Some(true), 20, 3)]
         {
             let fs = filesystem::hooks_lost_to_bootstrap_failure(
                 |_| in_kernel,
@@ -1605,7 +1640,7 @@ mod tests {
             )
             .unwrap_err()
         );
-        assert!(msg.contains("16 of 16 deny hooks"), "{msg}");
+        assert!(msg.contains("17 of 17 deny hooks"), "{msg}");
         assert!(msg.contains("2 protection step(s) failed"), "{msg}");
         assert!(
             msg.contains("ptrace_override_boot_zero: pin failed"),
@@ -1625,7 +1660,7 @@ mod tests {
             )
             .unwrap_err()
         );
-        assert!(msg.contains("15 of 16 deny hooks"), "{msg}");
+        assert!(msg.contains("16 of 17 deny hooks"), "{msg}");
         assert!(
             msg.contains("bpf_map_guard: observe mode; own objects"),
             "{msg}"

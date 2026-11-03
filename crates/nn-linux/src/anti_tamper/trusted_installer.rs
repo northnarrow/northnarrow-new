@@ -397,6 +397,10 @@ impl TrustedInstallerOverride {
     /// External audit ATP-012: a zeroing that failed, or that a read-back
     /// does not show, is recorded as such (`close_failed`), not as
     /// "closed"; the kernel's own deadline still ends the window.
+    ///
+    /// Lot 273b: a window that was open ends with the units' resource
+    /// values registered again (`cgroup_guard::refresh_values`): a limit
+    /// changed inside it is what PID 1 may write back afterwards.
     pub fn close(&self, reason: &str) {
         let was_armed = self.armed.swap(false, Ordering::SeqCst);
         {
@@ -433,6 +437,9 @@ impl TrustedInstallerOverride {
             );
         }
         if was_armed {
+            // Lot 273b: a resource limit changed inside the window stays —
+            // its value is the one PID 1 may write back from now on.
+            super::cgroup_guard::refresh_values(self.bpffs_root.as_deref());
             info!(
                 target: "anti_tamper.trusted_installer",
                 reason,

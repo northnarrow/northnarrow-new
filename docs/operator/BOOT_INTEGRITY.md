@@ -336,10 +336,16 @@ EBPF-015): a new drop-in there — `systemctl edit --runtime`, the drop-in
 above — is refused outside a signed trusted-installer window, and the
 directory cannot be removed or renamed (`systemctl revert
 northnarrow-agent` fails with `EPERM` outside a window). It is one of the
-places systemd reads drop-ins from: the others are the host's
-(`service.d`, the `northnarrow-.service.d` prefix, `system.control` —
-`set-property` writes resource properties there, but any directive placed
-there is read —, the generators', `transient`, the vendor directory). A
+places systemd reads drop-ins from. Since lot 273b the units'
+`system.control` directories are registered the same way, and since the
+review of #490 the watchdog's drop-in directories
+(`/etc/systemd/system/northnarrow-watchdog.service.d` and its `/run`
+twin) and the `northnarrow-.service.d` prefix ones, whose drop-ins apply
+to both units (systemd 246 and later): the agent's unit makes all of them
+(empty) before every start, so a `MemoryMax=4K` dropped there — refused at
+the cgroup file after a reload, but applied to the next start's fresh
+cgroup — is refused at its creation. The others are the host's
+(`service.d`, the generators', `transient`, the vendor directory). A
 drop-in there is a self-integrity finding (`unit_dropin`,
 `unit_shadowed`); a mount it lays on or under the agent's directories is
 refused by the mount table, and one above them by the pins' proof while
@@ -458,8 +464,16 @@ capabilities on that thread).
 
 Lot 273 added two anti-tamper ones (section 9): the cgroup move guard not
 attached (the kernel's BTF has no `cgroup_procs_write_start`, or one of
-another shape) and a unit cgroup not protected (a process in no cgroup v2,
-a host without the v2 hierarchy, a cgroup that could not be read).
+another shape — since lot 273b, or no `cgroup_procs_write_finish`) and a
+unit cgroup not protected (a process in no cgroup v2, a host without the v2
+hierarchy, a cgroup that could not be read). Lot 273b added four: the move
+guard attached and not run (`move_guard_self_test`: its boot self-test
+moved a protected process, or could not tell), cgroup v1 writes not
+refused (a hybrid or legacy host, whose systemd writes its own v1
+hierarchy), a protected process's `oom_score_adj` not refused (the
+kernel's BTF lacks one of the four proc offsets), and every PID 1 write
+of a protected resource file refused (no syscall argument offsets: an
+architecture other than x86-64).
 
 An operator's choice of a weaker sensor (`--exec-sensor tracepoint`,
 `--file-open-sensor tracepoint`, `--dns-sensor sendmsg`) is recorded too:
@@ -483,9 +497,11 @@ How far this run's protection is measured, from the boot's own checks:
 | **L1** | enforcement partial or not verified | a mandatory deny hook missing (a start under `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`), or the self-test inconclusive |
 | **L0** | no enforcement | `bpf` not in the active LSMs, the self-test's signal delivered, or no deny hook attached |
 
-The mandatory deny hooks are the 16 of `DENY_HOOKS` plus the optional ones
-the running kernel has (`OPTIONAL_DENY_HOOKS`), as the health line counts
-them — since lot 273 the cgroup move guard's two among them (section 9). The host's own hardening (lockdown, Secure Boot, IMA, module
+The mandatory deny hooks are the 17 of `DENY_HOOKS` (lot 273b's write deny
+on `file_permission` the seventeenth) plus the optional ones the running
+kernel has (`OPTIONAL_DENY_HOOKS`), as the health line counts them — since
+lot 273 the cgroup move guard's programs among them, three since lot 273b
+(section 9). The host's own hardening (lockdown, Secure Boot, IMA, module
 signatures, kexec — `nn-admin host-check`) is not part of the level: it is
 listed next to it in the manifest. `nn-admin status --key` shows the level
 recomputed with the degradations recorded since the boot (a sensor that
@@ -636,8 +652,19 @@ not verify, or a file that is not one — recorded and removed`.
   (a test, an agent started by hand), `anti-tamper cgroup: move guard not
   attached` with the reason, or the fresh re-attach lines of
   `inode_permission` and `cgroup_procs_write_start`.
+- Lot 273b: `… entries=… values=…` on the registration lines (the
+  resource files' values registered), `anti-tamper cgroup: cgroup v1
+  writes refused outside a trusted-installer window (systemd runs the
+  unified hierarchy; …)` or its WARN (`v1 hierarchies are mounted …`,
+  `cgroup v1 writes NOT refused` with the reason), `anti-tamper cgroup:
+  LIMIT_VALUES keys of earlier boots removed removed=…`, the fresh
+  re-attach lines of `file_permission` and `cgroup_procs_write_finish`,
+  and the move guard's self-test: `move guard self-test: moving a
+  protected process to another cgroup was refused — the move guard runs`,
+  or its ERROR (`… attached but the kernel does not run it`) / WARN
+  (`… inconclusive (…)`).
 
-## 9. The units' cgroups (lot 273)
+## 9. The units' cgroups (lots 273 and 273b)
 
 The agent's and the watchdog's unit cgroups are part of what the deny
 hooks protect (the mechanism, the systemd versions and the residual:
@@ -657,30 +684,57 @@ under the previous agent's hooks), then at the attach with the live
 watchdog's, before the deny hooks attach and before the stale-key prune;
 the watchdog registers its own at its start, and the agent's watchdog
 refresh registers a new watchdog's. The move guard attaches with the deny
-hooks: two more in `deny_expected` where the kernel has it, a signed
+hooks: three more in `deny_expected` where the kernel has it, a signed
 degradation where it has not. A process outside a systemd service's cgroup
 — a privileged test's agent, an agent started by hand in a login scope —
 is not protected and not degraded: its cgroup is not the agent's.
 
-Not covered yet (lot 273b's scope; the detail is in the trust model's
-"Residual"):
+Lot 273b (the trust model's "Lot 273b"; outside a window, every refusal
+signed by what it would have done):
 
-- **The units' and their slices' resource limits are not refused.** They
-  are not harmless drift: `memory.max` set below the agent's use is an
-  OOM kill inside the write itself, before the agent can sign anything,
-  and on `system.slice` a persistent OOM loop that also kills every new
-  watchdog; `cpu.max`, `cpu.idle` and `pids.max` starve the agent the way
-  a freeze does, and `pids.max` also makes the actuators' execs fail. A
-  change the agent survives is an `integrity_drift` (`limit_changed`).
-- **cgroup v1 is not covered, on pure v2 hosts too** (to be confirmed in
-  lab, lot 273b). Root can mount the v1 `freezer` (or `devices`,
-  `net_cls`, `net_prio`, `perf_event`) on a host booted without
-  `cgroup_no_v1=all`, move the agent's and the watchdog's pids into it and
-  write `FROZEN` to `freezer.state`; the move guard does not see the v1
-  `cgroup.procs` path. On a pure v2 host, `cgroup_no_v1=all` on the kernel
-  command line refuses the mount.
-- **A descriptor opened before registration keeps working.** The refusal
-  is at open: a write descriptor of `system.slice/cgroup.kill` opened at
-  any time before the agent's first start stays usable for the whole boot,
-  as does one of a unit's `cgroup.kill` opened inside a window.
+- **The units' and their slices' resource limits.** A write of
+  `memory.max`, `memory.high`, `pids.max`, `cpu.max`, `cpu.idle`,
+  `cpu.weight`, `cpu.weight.nice`, `cgroup.max.descendants`,
+  `cgroup.max.depth`, `memory.oom.group` or `io.max` in the unit's
+  directory or a slice's — by name, so a file a controller adds later is
+  protected too — is refused to every caller but PID 1 (`cgroup_limit`). A
+  low `memory.max` is an OOM kill inside the write itself; the others
+  starve the agent as a freeze does. PID 1 may write back the value the
+  file held when its cgroup was registered (systemd realising the unit at
+  a reload, a re-exec): `systemctl set-property` of a unit or its slice
+  that changes a limit, lowering or raising it, is refused outside a
+  window, and so is the drop-in it writes in the units' `system.control`
+  directories (made empty by the agent's unit before every start;
+  `create`). A change made inside a window stays: the values are
+  registered again when it closes. A refused `set-property` still sets
+  systemd's own copy of the property until the next `daemon-reload`,
+  which the unit's next start would apply: run one (no window needed)
+  before restarting a unit after a refused attempt.
+- **cgroup v1.** Where systemd runs the unified hierarchy only (every lab
+  guest), a write to any cgroup v1 hierarchy is refused (`cgroup_v1`): a
+  root could mount the v1 `freezer`, move the agent into it and freeze
+  it. `nn-admin host-check`'s `cgroup_v1` names the v1 controllers root
+  can mount; `cgroup_no_v1=all` on the kernel command line refuses the
+  mount itself.
+- **Descriptors opened earlier.** The write itself is refused now
+  (`file_permission`): a descriptor of a protected file — a slice's
+  `cgroup.kill` opened before the agent's first start, a unit's opened
+  inside a window — writes nothing once the window is closed.
+- **The OOM score.** A write of a protected process's `oom_score_adj` (or
+  `oom_adj`, or a thread's) is refused (`oom_adj`): 1000 made the agent the
+  OOM killer's first victim.
+- **The move guard** consumes a stashed move only at a migration's own
+  check, drops it at the end of every write (a third program), never
+  evicts it, and is checked at every boot by moving a protected child
+  (section 4's `move_guard_self_test`).
+- **An isolate** stops neither unit (`IgnoreOnIsolate=yes`).
+- **systemd's own thaw and xattrs go through** (a regression of lot 273):
+  systemd 254 and 255 (Ubuntu 24.04) write `0` to every slice's
+  `cgroup.freeze` up the tree at each start and stop of any unit, and
+  every version rewrites the xattrs of a slice's unit cgroups; refused, each
+  `systemctl restart` of a service logged "Failed to thaw slice
+  system.slice of unit: Operation not permitted" and signed a relayed
+  attempt. PID 1's `0` to a protected `cgroup.freeze` and its xattrs on a
+  unit's cgroup directory are let through; its `1` (a freeze) is refused at
+  the write.
 

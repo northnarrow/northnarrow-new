@@ -55,9 +55,11 @@ use aya_ebpf::{
 // whole host, and the kernel's "trace_printk() being used" banner on every
 // agent host. Do not put printk back in a hot hook; count in a map instead.
 
+use northnarrow_common::cgroup_limits::same_value;
 use northnarrow_common::fail_open::hook;
 use northnarrow_common::wire::{
-    fs_protect_denied_op, fs_protect_init_may, fs_protect_required, FsGrant, FsProtectDenialRaw,
+    fs_protect_denied_op, fs_protect_init_may, fs_protect_init_may_open, fs_protect_required,
+    fs_protect_thaw_value, FsGrant, FsProtectDenialRaw,
     InodeKey, FS_OP_CREATE, FS_OP_IOCTL,
     FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
     FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR, READ_PROTECTED_SLOTS,
@@ -197,7 +199,7 @@ unsafe fn inode_key(inode: *const c_void, hook: u32) -> Option<InodeKey> {
 /// [`inode_key`]'s reads: `None` when one fails (or the inode has no
 /// superblock, which no live inode lacks).
 #[inline(always)]
-unsafe fn read_inode_key(inode: *const c_void) -> Option<InodeKey> {
+pub(crate) unsafe fn read_inode_key(inode: *const c_void) -> Option<InodeKey> {
     let sb_slot = (inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const *const c_void;
     let sb_ptr = bpf_probe_read_kernel::<*const c_void>(sb_slot).ok()?;
     if sb_ptr.is_null() {
@@ -272,10 +274,25 @@ const TASK_DENIAL_WINDOW_NS: u64 = 1_000_000_000;
 /// mode. The deny itself never depends on this record.
 #[inline(always)]
 pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
+    emit_limited(
+        operation,
+        InodeKey {
+            dev: detail,
+            ino: target_tgid as u64,
+        },
+    );
+}
+
+/// [`emit_denial`] behind the per-caller dedup and the per-CPU budget of
+/// the task denials: a signal loop, a move loop, and (lot 273b) a loop of
+/// writes on a descriptor of a protected file are one record per caller
+/// and operation a second.
+#[inline(always)]
+pub(crate) fn emit_limited(operation: u8, key: InodeKey) {
     let now = unsafe { bpf_ktime_get_ns() };
     let caller = (bpf_get_current_pid_tgid() >> 32) as u64;
-    let key = (caller << 8) | operation as u64;
-    match TASK_DENIAL_SEEN.get_ptr_mut(&key) {
+    let seen = (caller << 8) | operation as u64;
+    match TASK_DENIAL_SEEN.get_ptr_mut(&seen) {
         Some(last) => unsafe {
             if now.wrapping_sub(*last) < TASK_DENIAL_DEDUP_NS {
                 return;
@@ -283,7 +300,7 @@ pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
             *last = now;
         },
         None => {
-            let _ = TASK_DENIAL_SEEN.insert(&key, &now, 0);
+            let _ = TASK_DENIAL_SEEN.insert(&seen, &now, 0);
         }
     }
     let Some(rate) = TASK_DENIAL_RATE.get_ptr_mut(0) else {
@@ -301,19 +318,13 @@ pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
         }
         (*rate)[1] += 1;
     }
-    emit_denial(
-        operation,
-        InodeKey {
-            dev: detail,
-            ino: target_tgid as u64,
-        },
-    );
+    emit_denial(operation, key);
 }
 
 /// Best-effort audit record. Silently drops if the ringbuffer is
 /// full — the deny verdict still fires.
 #[inline(always)]
-fn emit_denial(operation: u8, key: InodeKey) {
+pub(crate) fn emit_denial(operation: u8, key: InodeKey) {
     let mut entry = match FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0) {
         Some(e) => e,
         None => {
@@ -353,10 +364,23 @@ fn emit_denial(operation: u8, key: InodeKey) {
 /// caller's `DENY_FAIL_OPEN` slot (lab PR 215).
 #[inline(always)]
 unsafe fn deny_if_protected(operation: u8, target: *const c_void, hook: u32) -> bool {
+    match protected_verdict(operation, target, hook) {
+        Some((op, key)) => {
+            emit_denial(op, key);
+            true
+        }
+        None => false,
+    }
+}
+
+/// [`deny_if_protected`]'s decision without the record: the operation to
+/// sign and the inode when `operation` on `target` must be refused.
+#[inline(always)]
+unsafe fn protected_verdict(operation: u8, target: *const c_void, hook: u32) -> Option<(u8, InodeKey)> {
     let key = match inode_key(target, hook) {
         Some(k) => k,
         None => {
-            return false;
+            return None;
         }
     };
     // at-authz-1: the map value is a flag-mask. An absent key is not
@@ -370,15 +394,15 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void, hook: u32) -> 
     let flags = match PROTECTED_INODES.get(&key) {
         Some(f) => *f,
         None => {
-            return false;
+            return None;
         }
     };
     let required = fs_protect_required(operation);
     if flags & required == 0 {
-        return false;
+        return None;
     }
     if override_active() {
-        return false;
+        return None;
     }
     // Tappa 8 A14 (B4): caller-side mutual whitelist. If the
     // CALLER's tgid is in `task_kill::PROTECTED_PIDS`, allow the
@@ -394,18 +418,17 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void, hook: u32) -> 
     // paths as any other process is (plan §3.3).
     let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     if crate::task_kill::is_exempt_pid(caller_tgid) {
-        return false;
+        return None;
     }
     // Lot 273: PID 1 removes a protected unit's cgroup directory once its
     // processes are gone (the kernel refuses a populated one), and
     // systemd-shutdown trims the tree; nothing else is let through here.
     if fs_protect_init_may(operation, flags, caller_tgid) {
-        return false;
+        return None;
     }
     // Lot 273: a refused write-open of a protected `cgroup.kill` or
     // `cgroup.freeze` is signed by what it would have done.
-    emit_denial(fs_protect_denied_op(operation, flags), key);
-    true
+    Some((fs_protect_denied_op(operation, flags), key))
 }
 
 // ---------------------------------------------------------------------------
@@ -660,7 +683,72 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
         }
         return 0;
     }
-    if deny_if_protected(FS_OP_WRITE, inode, hook::FILE_OPEN) {
+    if let Some((op, key)) = protected_verdict(FS_OP_WRITE, inode, hook::FILE_OPEN) {
+        // Lot 273b: PID 1's thaw (systemd 254/255 at every start and stop)
+        // is judged at its write, by its value.
+        if !fs_protect_init_may_open(op, (bpf_get_current_pid_tgid() >> 32) as u32) {
+            emit_denial(op, key);
+            return -EPERM;
+        }
+    }
+    // Lot 273b: a protected cgroup's resource file, a cgroup v1 hierarchy,
+    // a protected process's `oom_score_adj`.
+    if crate::cgroup_files::refuse_write(file, inode, hook::FILE_OPEN, crate::cgroup_files::Phase::Open) {
+        return -EPERM;
+    }
+    0
+}
+
+/// Lot 273b — the write deny. `file_open` refuses a write-open of a
+/// protected inode; a descriptor opened before the inode was registered
+/// (one of `system.slice/cgroup.kill` opened before the agent's first
+/// start, one of a unit's opened inside a window or in a fresh cgroup's
+/// first milliseconds) kept writing. `file_permission` runs for every
+/// `write(2)`-family call (`rw_verify_area`, io_uring's writes included)
+/// before anything is written: a write to a `FS_PROTECT_WRITE` inode is
+/// refused like its open, and so is a write to a protected cgroup's
+/// resource file, a cgroup v1 file or a protected process's
+/// `oom_score_adj` (`cgroup_files`), where PID 1's value is judged. One
+/// map lookup per write; reads return at the mask test. Signed
+/// rate-limited per caller (a loop of writes is one record a second).
+#[lsm(hook = "file_permission")]
+pub fn protected_write_deny(ctx: LsmContext) -> i32 {
+    unsafe { try_protected_write_deny(&ctx) }
+}
+
+/// `MAY_WRITE` (include/linux/fs.h).
+const MAY_WRITE: c_int = 0x2;
+
+#[inline(always)]
+unsafe fn try_protected_write_deny(ctx: &LsmContext) -> i32 {
+    // Kernel signature: `int file_permission(struct file *file, int mask)`.
+    let mask: c_int = ctx.arg(1);
+    if mask & MAY_WRITE == 0 {
+        return 0;
+    }
+    let file: *const c_void = ctx.arg(0);
+    if file.is_null() {
+        return 0;
+    }
+    let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
+    let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
+        Ok(p) => p,
+        Err(_) => {
+            crate::fail_open::bump(hook::FILE_PERMISSION);
+            return 0;
+        }
+    };
+    if let Some((op, key)) = protected_verdict(FS_OP_WRITE, inode, hook::FILE_PERMISSION) {
+        // Lot 273b: PID 1's write of `0` to a protected cgroup.freeze — a
+        // thaw — goes through; a freeze is refused here.
+        let thaw = fs_protect_init_may_open(op, (bpf_get_current_pid_tgid() >> 32) as u32)
+            && matches!(crate::cgroup_files::written_value(), Some(v) if same_value(&v, &fs_protect_thaw_value()));
+        if !thaw {
+            emit_limited(op, key);
+            return -EPERM;
+        }
+    }
+    if crate::cgroup_files::refuse_write(file, inode, hook::FILE_PERMISSION, crate::cgroup_files::Phase::Write) {
         return -EPERM;
     }
     0

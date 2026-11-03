@@ -21,7 +21,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted hooks (map size).
-pub const FAIL_OPEN_SLOTS: u32 = 22;
+pub const FAIL_OPEN_SLOTS: u32 = 24;
 
 /// Slot of each deny hook in `DENY_FAIL_OPEN`: the agent's `DENY_HOOKS`,
 /// then its optional deny hooks, then the `bpf` hook (an observer that
@@ -53,6 +53,12 @@ pub mod hook {
     /// and has no read to fail; the fexit counts a task it cannot tell.
     pub const INODE_PERMISSION: u32 = 20;
     pub const CGROUP_PROCS_WRITE_START: u32 = 21;
+    /// Lot 273b: the write deny (`protected_write_deny`): a descriptor
+    /// opened before its inode was registered, a resource file's value.
+    pub const FILE_PERMISSION: u32 = 22;
+    /// Lot 273b: the move guard's third program, which clears a thread's
+    /// stashed move when the write ends.
+    pub const CGROUP_PROCS_WRITE_FINISH: u32 = 23;
 }
 
 /// LSM hook names, indexed by slot (the names `DENY_HOOKS` uses).
@@ -79,6 +85,8 @@ pub const FAIL_OPEN_HOOKS: [&str; FAIL_OPEN_SLOTS as usize] = [
     "bpf",
     "inode_permission",
     "cgroup_procs_write_start",
+    "file_permission",
+    "cgroup_procs_write_finish",
 ];
 
 #[cfg(test)]
@@ -112,11 +120,13 @@ mod tests {
             (hook::BPF, "bpf"),
             (hook::INODE_PERMISSION, "inode_permission"),
             (hook::CGROUP_PROCS_WRITE_START, "cgroup_procs_write_start"),
+            (hook::FILE_PERMISSION, "file_permission"),
+            (hook::CGROUP_PROCS_WRITE_FINISH, "cgroup_procs_write_finish"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");
             assert_eq!(FAIL_OPEN_HOOKS[i], *name);
         }
-        assert_eq!(hook::CGROUP_PROCS_WRITE_START + 1, FAIL_OPEN_SLOTS);
+        assert_eq!(hook::CGROUP_PROCS_WRITE_FINISH + 1, FAIL_OPEN_SLOTS);
     }
 }

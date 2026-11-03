@@ -125,6 +125,28 @@ impl Rule for NnLAt001AntiTamperDenial {
                  cgroup.threads), where it could be killed or frozen through a cgroup nobody \
                  protects"
             ),
+            // Lot 273b: a resource limit that kills or starves the agent
+            // (a low memory.max is an OOM kill inside the write; cpu.max,
+            // cpu.idle, pids.max starve it as a freeze does).
+            FsProtectOperation::CgroupLimit if *pid == 1 => format!(
+                "to change a resource limit of a protected unit's cgroup or of its slice (inode \
+                 {target_dev}:{target_ino}) from the value it started with, on behalf of a \
+                 `systemctl set-property` outside a trusted-installer window"
+            ),
+            FsProtectOperation::CgroupLimit => format!(
+                "to write a resource limit of a protected unit's cgroup or of its slice (inode \
+                 {target_dev}:{target_ino}) — memory.max, cpu.max, pids.max and the like kill \
+                 or starve the agent without a signal"
+            ),
+            FsProtectOperation::CgroupV1 => format!(
+                "to write a cgroup v1 hierarchy (inode {target_dev}:{target_ino}) on a host whose \
+                 systemd runs the unified one — a v1 freezer stops the agent where no v2 hook sees \
+                 it"
+            ),
+            FsProtectOperation::OomAdj => format!(
+                "to change the OOM score of protected pid {target_ino} (oom_score_adj), which would \
+                 make it the OOM killer's first victim — a SIGKILL no signal hook sees"
+            ),
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -191,6 +213,9 @@ mod tests {
             FsProtectOperation::CgroupMove,
             FsProtectOperation::CgroupKill,
             FsProtectOperation::CgroupFreeze,
+            FsProtectOperation::CgroupLimit,
+            FsProtectOperation::CgroupV1,
+            FsProtectOperation::OomAdj,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))
@@ -281,5 +306,16 @@ mod tests {
         let r = relayed(FsProtectOperation::CgroupMove);
         assert!(r.contains("protected pid 709"), "{r}");
         assert!(r.contains("systemd request"), "{r}");
+        // Lot 273b
+        let r = relayed(FsProtectOperation::CgroupLimit);
+        assert!(r.contains("systemctl set-property"), "{r}");
+        assert!(r.contains("from the value it started with"), "{r}");
+        let r = direct(FsProtectOperation::CgroupLimit);
+        assert!(r.contains("memory.max, cpu.max, pids.max"), "{r}");
+        assert!(r.contains("(inode 9:709)"), "{r}");
+        let r = direct(FsProtectOperation::CgroupV1);
+        assert!(r.contains("cgroup v1 hierarchy (inode 9:709)"), "{r}");
+        let r = direct(FsProtectOperation::OomAdj);
+        assert!(r.contains("protected pid 709 (oom_score_adj)"), "{r}");
     }
 }

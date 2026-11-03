@@ -354,6 +354,17 @@ rm -rf "$DROPIN_ROOT/northnarrow-agent.service.d" "$DROPIN_ROOT/northnarrow-watc
 # Lab PR 265: the runtime drop-in directory the unit makes before each start
 # (empty unless a drop-in was added in a window).
 rm -rf "${RUNTIME_DROPIN_ROOT:-/run/systemd/system}/northnarrow-agent.service.d" 2>/dev/null || true
+# Lot 273b: the units' `set-property` drop-in directories the agent's unit
+# makes before each start (empty unless a property was set in a window).
+for d in /etc/systemd/system.control /run/systemd/system.control; do
+    rm -rf "$d/northnarrow-agent.service.d" "$d/northnarrow-watchdog.service.d" 2>/dev/null || true
+done
+# The review of #490 (A): the watchdog's runtime drop-in directory and the
+# `northnarrow-.service.d` prefix ones the agent's unit makes before each
+# start (empty unless a drop-in was added in a window).
+rm -rf "${RUNTIME_DROPIN_ROOT:-/run/systemd/system}/northnarrow-watchdog.service.d" \
+    "${RUNTIME_DROPIN_ROOT:-/run/systemd/system}/northnarrow-.service.d" \
+    "$DROPIN_ROOT/northnarrow-.service.d" 2>/dev/null || true
 if [[ -e "$JOURNALD_NS_CONF" ]]; then
     log "removing $JOURNALD_NS_CONF"
     rm -f "$JOURNALD_NS_CONF"

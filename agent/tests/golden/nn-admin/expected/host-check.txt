@@ -15,7 +15,8 @@ exit: <0, or 2 with the host's warnings: checked>
 | <status>  admin private key off the host   <value>
 | <status>  nftables for COMBAT containment  <value>
 | <status>  release verified at install      <value>
-| 11 check(s), <warnings> warning(s)<, and the anti-tamper note when there are any>
+| <status>  cgroup v1 controllers not mountable <value>
+| 12 check(s), <warnings> warning(s)<, and the anti-tamper note when there are any>
 --- stderr
 (empty)
 
@@ -100,6 +101,13 @@ exit: <0, or 2 with the host's warnings: checked>
 |     "status": "<status>",
 |     "value": "<value>",
 |     "fix": "install from the release tarball (next to the tree, or `--tarball`) with `gh` or `cosign` for its tag-bound attestation (install.sh refuses less without `--allow-unverified`): `checksums`, `manifest`, `source-tree`, `unverified` and `package` mean nothing proved where these binaries were built"
+|   },
+|   {
+|     "id": "cgroup_v1",
+|     "name": "cgroup v1 controllers not mountable",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "on a host whose systemd runs the unified cgroup hierarchy, boot with `cgroup_no_v1=all` — a root can mount the v1 freezer, move the agent into it and freeze it (the agent refuses writes to a v1 hierarchy outside a trusted-installer window; the boot option refuses the mount itself)"
 |   }
 | ]
 --- stderr

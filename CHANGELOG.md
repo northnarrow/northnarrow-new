@@ -621,6 +621,103 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- **Security (lot 273b, C23): what stopped the agent without a signal —
+  its units' resource limits, a cgroup v1 freezer, a descriptor opened
+  earlier, its OOM score — is refused outside a signed trusted-installer
+  window; lot 273's move guard holds without its assumptions; and
+  systemd's own thaw is let through again** (the review of #489;
+  `docs/design/ANTITAMPER_TRUST_MODEL.md`, "Lot 273b";
+  `docs/operator/BOOT_INTEGRITY.md` §9). Measured on the lab before the
+  fix (`main` with lot 273, tamper cases C12, C18, C79–C85): a root shell's
+  `memory.max` of one page OOM-killed the agent inside the write;
+  `pids.max=1` on `system.slice`, `cpu.max` of 0.1 % on the watchdog and
+  `cpu.idle=1` on the agent went through; `systemctl set-property
+  --runtime MemoryMax=4G` lowered the agent's cap and left its drop-in;
+  `systemctl set-property northnarrow-watchdog TasksMax=1` did the same for
+  good; a v1 `freezer` mounted on the five lab guests (all unified, none
+  booted with `cgroup_no_v1=`) took the agent and froze it, unseen by the
+  move guard; a
+  `cgroup.freeze` descriptor opened inside a window wrote after it; and
+  the agent's `oom_score_adj` (its pid's and a thread's) took 900 and 1000.
+  Now:
+  - a write of a resource file (`memory.max`, `memory.high`, `pids.max`,
+    `cpu.max`, `cpu.idle`, `cpu.weight`, `cpu.weight.nice`,
+    `cgroup.max.descendants`, `cgroup.max.depth`, `memory.oom.group`,
+    `io.max`) of the units' cgroups and of their slices — by name, under
+    the directories the agent registers with the new `FS_PROTECT_LIMIT_DIR`
+    — is refused to every caller but PID 1 (`cgroup_limit`); PID 1 may
+    write back the value the file held at the registration (new pinned map
+    `LIMIT_VALUES`), or the kernel's default for a file added later, read
+    from the `write(2)` that carries it (four word compares in the
+    kernel); any other value, a `set-property` lowering or raising a limit,
+    is refused, and so is its drop-in in the units' `system.control`
+    directories, which the agent's unit now makes before every start
+    (NOCREATE; `uninstall.sh` removes them); a change made inside a window
+    stays (the values are registered again at its close);
+  - where systemd runs the unified hierarchy only, any write to a cgroup
+    v1 hierarchy is refused (`cgroup_v1`, the new pinned
+    `CGROUP_POLICY`); a hybrid host signs the degradation; the host check
+    gains `cgroup_v1` (`cgroup_no_v1=all` recommended);
+  - a new deny hook on `file_permission` (`protected_write_deny`, the 17th)
+    refuses the write itself to a `FS_PROTECT_WRITE` inode and judges the
+    files above at the write, so a descriptor opened before the
+    registration writes nothing; one lookup per write, signed rate-limited;
+  - the review of #490: the watchdog's drop-in directories and the
+    `northnarrow-.service.d` prefix ones (both units read them) made by the
+    agent's unit and registered NOCREATE — a hand-written `MemoryMax=4K`
+    there would reach the next start's fresh cgroup (C87); the resource
+    files recognised by their kernfs node (name, parent) or their
+    registered value, not by a dentry a handle-opened file does not have
+    (C88: `open_by_handle_at` after `drop_caches`);
+  - a write of a protected process's `oom_score_adj` / `oom_adj` (its pid's
+    or a thread's) is refused (`oom_adj`; four new optional BTF offsets,
+    their absence signed);
+  - the move guard: a third program (fentry `cgroup_procs_write_finish`)
+    drops a stashed move at the end of every write, the refusal consumes
+    one only on a cgroup v2 `cgroup.procs` / `cgroup.threads`, the stash
+    is a plain 64-entry map that never evicts (an insert it refuses is a
+    counted fail-open), and the boot self-tests it: a protected child of
+    the agent moved by an unprotected one must be refused
+    (`move_guard_self_test` degraded otherwise);
+  - both units carry `IgnoreOnIsolate=yes` (tamper case C78b);
+  - a regression of lot 273: systemd 254 and 255 (Ubuntu 24.04) thaw every
+    unit's slices at each start and stop (a write of `0` to
+    `system.slice/cgroup.freeze`), and every version rewrites a slice's
+    unit cgroups' xattrs when it realises a sibling; refused, every
+    `systemctl restart` of a service on 24.04 logged "Failed to thaw slice
+    system.slice of unit: Operation not permitted" and signed a relayed
+    attempt, and a `set-property` signed an `xattr` refusal on all five
+    lab guests. PID 1's thaw and those xattrs are let
+    through; its freeze is refused at the write (tamper case C86).
+  The attach registers the live watchdog's cgroup through a tested helper
+  (the review's R5), a former watchdog's keys are released through another
+  (R7), and the move guard's constants and conditions are pinned whole
+  (R1, R3, R11, R12). New tamper cases C77a/C77b (a transient scope with
+  the agent's pid, `AttachProcessesToUnit`), C78a/C78b (a `Conflicts=`
+  unit, an isolate), C79–C86; C12 and C18 now expect a refusal. A
+  privileged test (`agent/tests/cgroup_guard_privileged_e2e.rs`) moves the
+  agent (refused), moves after a DAC refusal in a delegated subtree (not
+  contaminated), moves from two threads at once (both refused), writes
+  through an earlier descriptor and the agent's `oom_score_adj` (refused).
+  After, the lot's code on the five guests (Ubuntu 22.04 / 249, Debian 12
+  / 252, Ubuntu 24.04 / 255, Debian 13 / 257, Ubuntu 26.04 / 259): C12,
+  C18, C79–C85 refused and signed, C83/C83b `cgroup_v1`, C82 refused at
+  the write, C86 (a unit of the agent's slice started and stopped) signs
+  nothing, C77a/b and C78a as with lot 273, C78b (an isolate) no stop job;
+  the full tamper check 102 cases, 98 OK on four guests (C27, C57c the
+  known gaps, C64 the recorded deviation, C78c not run), 96 on Ubuntu 26.04
+  (C04b and C58 deviate there with `main` too); `daemon-reload` and `daemon-reexec` sign
+  nothing on any version; a `set-property` made inside a window stays (the
+  values registered again at its close); the move guard's self-test
+  refused its move at every boot. Cost (Ubuntu 24.04, three A/B rounds):
+  the move guard about 59 ns a call, `git status` ×10 +24 %; the write
+  deny about 96 ns a write, a 2,000-file package installed and removed
+  +9 %. Open: a refused `set-property` still sets systemd's own copy of
+  the property until the next `daemon-reload`, which the unit's next start
+  applies (measured; run a reload before restarting a unit after a refused
+  attempt); a soft-reboot leaves both units failed with their processes
+  running (unchanged since before lot 273); other controller files
+  (`cpuset`, `cpu.uclamp.max`, `memory.swap.max`) are not refused.
 - **Security (lot 273, C23): the agent and the watchdog can no longer be
   killed, frozen or moved through their cgroups outside a signed
   trusted-installer window** (`docs/design/ANTITAMPER_TRUST_MODEL.md`,

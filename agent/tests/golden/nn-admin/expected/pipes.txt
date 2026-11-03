@@ -117,7 +117,8 @@ exit: <0, or 2 with the host's warnings: checked>
 | <status>  admin private key off the host   <value>
 | <status>  nftables for COMBAT containment  <value>
 | <status>  release verified at install      <value>
-| 11 check(s), <warnings> warning(s)<, and the anti-tamper note when there are any>
+| <status>  cgroup v1 controllers not mountable <value>
+| 12 check(s), <warnings> warning(s)<, and the anti-tamper note when there are any>
 
 ### pipe.stdout.host-check-json
 $ nn-admin host-check --json
@@ -208,6 +209,13 @@ exit: <0, or 2 with the host's warnings: checked>
 |     "status": "<status>",
 |     "value": "<value>",
 |     "fix": "install from the release tarball (next to the tree, or `--tarball`) with `gh` or `cosign` for its tag-bound attestation (install.sh refuses less without `--allow-unverified`): `checksums`, `manifest`, `source-tree`, `unverified` and `package` mean nothing proved where these binaries were built"
+|   },
+|   {
+|     "id": "cgroup_v1",
+|     "name": "cgroup v1 controllers not mountable",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "on a host whose systemd runs the unified cgroup hierarchy, boot with `cgroup_no_v1=all` — a root can mount the v1 freezer, move the agent into it and freeze it (the agent refuses writes to a v1 hierarchy outside a trusted-installer window; the boot option refuses the mount itself)"
 |   }
 | ]
 
@@ -445,7 +453,7 @@ exit: 0
 | combat stage      : (agent predates the field)
 | last admin action : (none since agent start)
 | telemetry         : withheld from the unsigned status (response mode, COMBAT evidence, ring drops and rejected records, deny fail-opens, trust level, degradations) — `nn-admin status --key <key>` with `audit-read` or `telemetry-read` reads them, signed
-| host hardening : 11 check(s), <the host's warnings: checked>
+| host hardening : 12 check(s), <the host's warnings: checked>
 --- agent
 connection 1
 > {"Status":{}}
@@ -516,7 +524,7 @@ exit: 0
 |   not protected   : budget 1
 |   open latency    : fast path avg - max 0 µs (0), copy path avg - max 0 µs (0)
 |   restores        : 0 run, 0 files restored, 0 kept both, 0 refused
-| host hardening : 11 check(s), <the host's warnings: checked>
+| host hardening : 12 check(s), <the host's warnings: checked>
 --- agent
 connection 1
 > {"ChallengeRequest":{}}

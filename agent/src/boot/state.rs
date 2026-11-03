@@ -69,9 +69,11 @@ pub(crate) fn bootstrap(
             Ok(Some(northnarrow_agent::anti_tamper::cgroup_guard::UnitCgroup::Service {
                 cgroup,
                 entries,
+                values,
             })) => info!(
                 cgroup = %nn_model::log_escape::Escaped(&cgroup),
                 entries = entries.len(),
+                values = values.len(),
                 "anti-tamper cgroup: own unit cgroup registered in the pinned PROTECTED_INODES \
                  before the bootstraps"
             ),

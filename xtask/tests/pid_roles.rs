@@ -65,6 +65,9 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
         ("execq.rs", 0, 2),
         // lot 273: the moved task is a target, the writer a caller
         ("cgroup_guard.rs", 1, 2),
+        // lot 273b: the process an `oom_score_adj` belongs to is a target,
+        // the writer a caller
+        ("cgroup_files.rs", 1, 1),
     ] {
         let code = strip_comments(&fs::read_to_string(dir.join(file)).unwrap());
         assert_eq!(
@@ -87,6 +90,7 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
             "fim_watch.rs",
             "execq.rs",
             "cgroup_guard.rs",
+            "cgroup_files.rs",
         ]
         .contains(&name.as_str())
         {

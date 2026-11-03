@@ -1,0 +1,367 @@
+//! Lot 273b: the resource files of the protected units' cgroups and of
+//! their ancestor slices — which ones are refused, and the one write PID 1
+//! may make.
+//!
+//! A low `memory.max` is an OOM kill inside the write itself; `cpu.max`,
+//! `cpu.idle`, `cpu.weight` and `pids.max` starve the agent as a freeze
+//! does (`pids.max` also stops the actuators' execs); `cgroup.max.*` on a
+//! slice keeps the next start from making its cgroup; `memory.oom.group`
+//! on a slice turns one OOM into the kill of every unit in it; `io.max`
+//! throttles the agent's writes to nothing. The deny hooks refuse a write
+//! of these files in a protected cgroup from anyone but the agent's family
+//! and PID 1 outside a trusted-installer window. systemd writes them as
+//! PID 1 whenever it realises a unit (a start, a `set-property`, a
+//! reload): PID 1's write is let through when it puts back the value the
+//! file held at the registration (what the unit started with), or the
+//! kernel's default for a file that appeared later; any other value — a
+//! `set-property` lowering or raising a limit — is a change of the unit,
+//! made inside a window.
+//!
+//! The eBPF programs and the agent share this module: the names, the
+//! values and their comparison are tested once, here.
+
+/// Not a protected resource file.
+pub const LIMIT_NONE: u8 = 0;
+/// `max` or a number of bytes / tasks / cgroups, higher is better
+/// (`memory.max`, `memory.high`, `pids.max`, `cgroup.max.descendants`,
+/// `cgroup.max.depth`).
+pub const LIMIT_UNSIGNED_MAX: u8 = 1;
+/// A number, higher is better, no `max` (`cpu.weight`, 1 to 10000).
+pub const LIMIT_WEIGHT: u8 = 2;
+/// `$QUOTA $PERIOD` or `max [$PERIOD]` (`cpu.max`): the share of a CPU,
+/// higher is better.
+pub const LIMIT_CPU_MAX: u8 = 3;
+/// `0` or `1`, `0` is better (`cpu.idle`, `memory.oom.group`).
+pub const LIMIT_FLAG: u8 = 4;
+/// A nice value, -20 to 19, lower is better (`cpu.weight.nice`).
+pub const LIMIT_NICE: u8 = 5;
+/// `$MAJ:$MIN key=value ...` (`io.max`): only `max` values (a limit
+/// removed) are no worse.
+pub const LIMIT_IO_MAX: u8 = 6;
+
+/// The protected resource files and their kinds.
+pub const LIMIT_FILES: [(&str, u8); 11] = [
+    ("memory.max", LIMIT_UNSIGNED_MAX),
+    ("memory.high", LIMIT_UNSIGNED_MAX),
+    ("pids.max", LIMIT_UNSIGNED_MAX),
+    ("cgroup.max.descendants", LIMIT_UNSIGNED_MAX),
+    ("cgroup.max.depth", LIMIT_UNSIGNED_MAX),
+    ("cpu.weight", LIMIT_WEIGHT),
+    ("cpu.max", LIMIT_CPU_MAX),
+    ("cpu.idle", LIMIT_FLAG),
+    ("memory.oom.group", LIMIT_FLAG),
+    ("cpu.weight.nice", LIMIT_NICE),
+    ("io.max", LIMIT_IO_MAX),
+];
+
+/// The longest name the eBPF programs read (`cgroup.max.descendants`, 22
+/// bytes, fits): three little-endian words.
+pub const LIMIT_NAME_MAX: usize = 24;
+
+/// `name` as the eBPF programs compare it: its first [`LIMIT_NAME_MAX`]
+/// bytes in three little-endian words, zero past its end.
+pub const fn name_words(name: &[u8]) -> [u64; 3] {
+    let mut w = [0u64; 3];
+    let mut i = 0;
+    while i < name.len() && i < LIMIT_NAME_MAX {
+        w[i / 8] |= (name[i] as u64) << ((i % 8) * 8);
+        i += 1;
+    }
+    w
+}
+
+/// The mask of the bytes of word `word` that lie inside a name of `len`
+/// bytes (the eBPF programs read whole words and clear what follows the
+/// name).
+pub const fn word_mask(len: usize, word: usize) -> u64 {
+    let start = word * 8;
+    if len <= start {
+        0
+    } else if len - start >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << ((len - start) * 8)) - 1
+    }
+}
+
+const fn limit_words() -> [(usize, [u64; 3], u8); LIMIT_FILES.len()] {
+    let mut out = [(0usize, [0u64; 3], LIMIT_NONE); LIMIT_FILES.len()];
+    let mut i = 0;
+    while i < LIMIT_FILES.len() {
+        let (name, kind) = LIMIT_FILES[i];
+        out[i] = (name.len(), name_words(name.as_bytes()), kind);
+        i += 1;
+    }
+    out
+}
+
+/// [`LIMIT_FILES`] as the eBPF programs compare names.
+pub const LIMIT_WORDS: [(usize, [u64; 3], u8); LIMIT_FILES.len()] = limit_words();
+
+/// The kind of the file named by `len` bytes packed in `w`
+/// ([`name_words`]), or [`LIMIT_NONE`].
+#[inline(always)]
+pub fn limit_kind(len: usize, w: [u64; 3]) -> u8 {
+    let mut i = 0;
+    while i < LIMIT_WORDS.len() {
+        let (l, words, kind) = LIMIT_WORDS[i];
+        if l == len && words[0] == w[0] && words[1] == w[1] && words[2] == w[2] {
+            return kind;
+        }
+        i += 1;
+    }
+    LIMIT_NONE
+}
+
+/// [`limit_kind`] of a name (userland and tests).
+pub fn limit_kind_of(name: &str) -> u8 {
+    if name.len() > LIMIT_NAME_MAX {
+        return LIMIT_NONE;
+    }
+    limit_kind(name.len(), name_words(name.as_bytes()))
+}
+
+/// The bytes of a resource file's value the agent keeps (its text, the
+/// trailing newline cut) and the eBPF programs compare: at most 31, the
+/// rest of the 32 zero.
+pub const LIMIT_TEXT_MAX: usize = 31;
+
+/// A resource file's value as `LIMIT_VALUES` stores it and a write is
+/// compared: its text in four little-endian words, zero past its end.
+pub type LimitValue = [u64; 4];
+
+/// `text` as a [`LimitValue`]: the bytes of a write as the eBPF program
+/// reads them (zero past the count), or a file's text with its trailing
+/// blanks cut. `None` past [`LIMIT_TEXT_MAX`] bytes.
+pub const fn limit_value(text: &[u8]) -> Option<LimitValue> {
+    let mut len = text.len();
+    while len > 0 && is_blank(text[len - 1]) {
+        len -= 1;
+    }
+    if len > LIMIT_TEXT_MAX {
+        return None;
+    }
+    let mut v = [0u64; 4];
+    let mut i = 0;
+    while i < len {
+        v[i / 8] |= (text[i] as u64) << ((i % 8) * 8);
+        i += 1;
+    }
+    Some(v)
+}
+
+/// The value a file of `kind` starts with — what PID 1 may write to one
+/// whose value was not registered (it appeared after the registration: a
+/// controller enabled later), and what systemd writes for a unit that
+/// sets nothing there: `max` (`max 100000` for `cpu.max`, the default
+/// period), `cpu.weight` 100, `0` for the flags and the nice value.
+/// `io.max` has none: an empty file, and no write that keeps it so.
+pub const fn default_value(kind: u8) -> Option<LimitValue> {
+    match kind {
+        LIMIT_UNSIGNED_MAX => limit_value(b"max"),
+        LIMIT_CPU_MAX => limit_value(b"max 100000"),
+        LIMIT_WEIGHT => limit_value(b"100"),
+        LIMIT_FLAG | LIMIT_NICE => limit_value(b"0"),
+        _ => None,
+    }
+}
+
+/// `written` (the bytes of a write of `count` bytes, zero past them) with
+/// one trailing newline cleared: systemd writes a cgroup attribute with a
+/// newline appended (`write_string_file()` without
+/// `WRITE_STRING_FILE_AVOID_NEWLINE`: "11811160064\n", "0\n"), while a
+/// registered value is the file's text with its newline cut. No loop and
+/// no variable index (the eBPF verifier): the word holding the last byte
+/// is picked by constant branches.
+#[inline(always)]
+pub const fn strip_newline(written: LimitValue, count: usize) -> LimitValue {
+    let mut v = written;
+    if count == 0 || count > 32 {
+        return v;
+    }
+    let k = count - 1;
+    let shift = (k % 8) * 8;
+    let mask = 0xffu64 << shift;
+    let nl = (b'\n' as u64) << shift;
+    let w = k / 8;
+    if w == 0 {
+        if v[0] & mask == nl {
+            v[0] &= !mask;
+        }
+    } else if w == 1 {
+        if v[1] & mask == nl {
+            v[1] &= !mask;
+        }
+    } else if w == 2 {
+        if v[2] & mask == nl {
+            v[2] &= !mask;
+        }
+    } else if v[3] & mask == nl {
+        v[3] &= !mask;
+    }
+    v
+}
+
+/// Whether a write of `written` (the bytes read from it, zero past its
+/// count, its trailing newline cleared: [`strip_newline`]) puts back
+/// `value`: the same bytes. Four word compares, no loop:
+/// the eBPF verifier walks it in a handful of instructions.
+#[inline(always)]
+pub const fn same_value(written: &LimitValue, value: &LimitValue) -> bool {
+    (written[0] ^ value[0])
+        | (written[1] ^ value[1])
+        | (written[2] ^ value[2])
+        | (written[3] ^ value[3])
+        == 0
+}
+
+#[inline(always)]
+const fn is_blank(b: u8) -> bool {
+    matches!(b, b' ' | b'\n' | b'\t' | b'\r')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The files and their kinds, pinned: a file dropped from the table
+    /// is a file no write of is refused.
+    #[test]
+    fn the_protected_files_are_these() {
+        for (name, kind) in [
+            ("memory.max", LIMIT_UNSIGNED_MAX),
+            ("memory.high", LIMIT_UNSIGNED_MAX),
+            ("pids.max", LIMIT_UNSIGNED_MAX),
+            ("cgroup.max.descendants", LIMIT_UNSIGNED_MAX),
+            ("cgroup.max.depth", LIMIT_UNSIGNED_MAX),
+            ("cpu.weight", LIMIT_WEIGHT),
+            ("cpu.max", LIMIT_CPU_MAX),
+            ("cpu.idle", LIMIT_FLAG),
+            ("memory.oom.group", LIMIT_FLAG),
+            ("cpu.weight.nice", LIMIT_NICE),
+            ("io.max", LIMIT_IO_MAX),
+        ] {
+            assert_eq!(limit_kind_of(name), kind, "{name}");
+        }
+        assert_eq!(LIMIT_FILES.len(), 11);
+    }
+
+    #[test]
+    fn every_file_is_found_by_its_words_and_nothing_else() {
+        for (name, kind) in LIMIT_FILES {
+            assert!(name.len() <= LIMIT_NAME_MAX, "{name}");
+            assert_eq!(limit_kind_of(name), kind, "{name}");
+        }
+        for not in [
+            "memory.ma",
+            "memory.maxx",
+            "memory.min",
+            "memory.low",
+            "memory.current",
+            "cpu.weigh",
+            "cpu.max.burst",
+            "pids.current",
+            "cgroup.procs",
+            "cgroup.kill",
+            "cgroup.freeze",
+            "",
+            "io.weight",
+            "cgroup.max.descendantsX",
+            "cgroup.max.descendants.and.more.bytes",
+        ] {
+            assert_eq!(limit_kind_of(not), LIMIT_NONE, "{not}");
+        }
+        // the words of a name read past its end are cleared by the mask
+        let w = name_words(b"cpu.max\0garbage!");
+        let masked = [
+            w[0] & word_mask(7, 0),
+            w[1] & word_mask(7, 1),
+            w[2] & word_mask(7, 2),
+        ];
+        assert_eq!(limit_kind(7, masked), LIMIT_CPU_MAX);
+        assert_eq!(word_mask(0, 0), 0);
+        assert_eq!(word_mask(8, 0), u64::MAX);
+        assert_eq!(word_mask(9, 1), 0xff);
+        assert_eq!(word_mask(22, 2), 0xffff_ffff_ffff);
+        assert_eq!(word_mask(24, 2), u64::MAX);
+    }
+
+    /// A write puts the value back when its bytes are the value's: a
+    /// change, a longer or shorter value, another number, a newline the
+    /// registration cut (systemd writes none) are another value.
+    #[test]
+    fn a_write_puts_the_value_back_only_byte_for_byte() {
+        let v = limit_value(b"11811160064\n").unwrap();
+        assert!(same_value(&limit_value(b"11811160064").unwrap(), &v));
+        for other in [
+            &b"11811160063"[..],
+            b"1181116006",
+            b"118111600640",
+            b"4294967296",
+            b"max",
+            b"",
+        ] {
+            assert!(!same_value(&limit_value(other).unwrap(), &v), "{other:?}");
+        }
+        // the bytes of a write as the program reads them: zero past the count
+        let mut w = [0u64; 4];
+        for (i, b) in b"11811160064\n".iter().enumerate() {
+            w[i / 8] |= (*b as u64) << ((i % 8) * 8);
+        }
+        assert!(!same_value(&w, &v), "a newline is another value unstripped");
+        // systemd's write, its newline cleared, is the value
+        assert!(same_value(&strip_newline(w, 12), &v));
+        assert_eq!(
+            strip_newline(w, 11),
+            w,
+            "the count says where the newline is"
+        );
+        // at every word's boundary
+        for len in [1usize, 7, 8, 9, 15, 16, 17, 24, 25, 30] {
+            let text: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+            let mut with = text.clone();
+            with.push(b'\n');
+            let mut wv = [0u64; 4];
+            for (i, b) in with.iter().enumerate() {
+                wv[i / 8] |= (*b as u64) << ((i % 8) * 8);
+            }
+            assert!(
+                same_value(&strip_newline(wv, len + 1), &limit_value(&text).unwrap()),
+                "len {len}"
+            );
+        }
+        assert_eq!(
+            strip_newline(limit_value(b"0").unwrap(), 1),
+            limit_value(b"0").unwrap(),
+            "no newline: unchanged"
+        );
+        assert_eq!(strip_newline([1, 2, 3, 4], 0), [1, 2, 3, 4]);
+        let cpu = limit_value(b"10000 100000\n").unwrap();
+        assert!(same_value(&limit_value(b"10000 100000").unwrap(), &cpu));
+        assert!(!same_value(&limit_value(b"1000 1000000").unwrap(), &cpu));
+        // every word is compared: a difference in the third, in the fourth
+        let long = limit_value(b"1234567890123456789012345678901").unwrap();
+        for at in [2usize, 9, 18, 27, 30] {
+            let mut t = *b"1234567890123456789012345678901";
+            t[at] = b'x';
+            assert!(!same_value(&limit_value(&t).unwrap(), &long), "byte {at}");
+        }
+        assert_eq!(limit_value(&[b'1'; 31]).map(|_| ()), Some(()));
+        assert_eq!(limit_value(&[b'1'; 32]), None);
+        assert_eq!(
+            limit_value(b"512 \n\t").unwrap(),
+            limit_value(b"512").unwrap()
+        );
+    }
+
+    #[test]
+    fn the_defaults_are_the_kernels() {
+        assert_eq!(default_value(LIMIT_UNSIGNED_MAX), limit_value(b"max"));
+        assert_eq!(default_value(LIMIT_CPU_MAX), limit_value(b"max 100000"));
+        assert_eq!(default_value(LIMIT_WEIGHT), limit_value(b"100"));
+        assert_eq!(default_value(LIMIT_FLAG), limit_value(b"0"));
+        assert_eq!(default_value(LIMIT_NICE), limit_value(b"0"));
+        assert_eq!(default_value(LIMIT_IO_MAX), None);
+        assert_eq!(default_value(LIMIT_NONE), None);
+    }
+}

@@ -28,24 +28,40 @@
 //!   check of that thread, the migration's, and signs it
 //!   (`FS_OP_CGROUP_MOVE`, rate-limited as a signal is).
 //!
+//! * [`cgroup_move_clear`] (fentry `cgroup_procs_write_finish`, lot 273b)
+//!   drops the thread's record when the write ends, whatever it did.
+//!
 //! The write check runs in the same thread right after the lookup, and the
-//! stash is consumed by it. On a cgroup v1 hierarchy the write path checks
-//! no inode and the move is not refused (the record ages out after
-//! [`STASH_TTL_NS`]); the agent protects cgroup v2 only.
+//! stash is consumed by it. Lot 273b: a record lives only from the lookup
+//! to the end of the write, so a write that never reached the check — a
+//! cgroup v1 write (no inode checked; refused at its open where the host
+//! runs the unified hierarchy only: `cgroup_files`), a write whose
+//! permission check the DAC refused first (an unprivileged writer in a
+//! delegated subtree) — leaves nothing behind; and the check consumes a
+//! record only on a cgroup v2 `cgroup.procs` / `cgroup.threads`, the file
+//! a migration's permission check is made on. Every migration runs under
+//! `cgroup_mutex` (`cgroup_kn_lock_live` before the lookup): at most one
+//! record is live at a time, and the map, which never evicts, has room for
+//! [`MOVE_STASH_ENTRIES`]; an insert it refuses is counted as a fail-open
+//! of the lookup half.
 
 use aya_ebpf::{
-    cty::c_int,
-    helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel},
-    macros::{fexit, lsm, map},
-    maps::LruHashMap,
-    programs::{FExitContext, LsmContext},
+    cty::{c_int, c_void},
+    helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel, generated},
+    macros::{fentry, fexit, lsm, map},
+    maps::HashMap,
+    programs::{FEntryContext, FExitContext, LsmContext},
     EbpfContext,
 };
 use northnarrow_common::btf_offsets::CGROUP_MOVE_RET_ARG;
+use northnarrow_common::cgroup_limits::name_words;
 use northnarrow_common::fail_open::hook;
-use northnarrow_common::wire::FS_OP_CGROUP_MOVE;
+use northnarrow_common::wire::{CGROUP2_SUPER_MAGIC, FS_OP_CGROUP_MOVE};
 
-use crate::btf_offsets::TASK_STRUCT_TGID_OFFSET;
+use crate::btf_offsets::{
+    INODE_I_MODE_OFFSET, INODE_I_PRIVATE_OFFSET, INODE_I_SB_OFFSET, KERNFS_NODE_NAME_OFFSET,
+    SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_TGID_OFFSET,
+};
 
 /// Linux `EPERM`; LSM hooks return `-errno` to deny.
 const EPERM: c_int = 1;
@@ -55,16 +71,28 @@ const MAY_WRITE: c_int = 0x2;
 /// The largest `-errno` an `ERR_PTR` carries (include/linux/err.h).
 const MAX_ERRNO: u64 = 4095;
 /// How long a stashed move waits for its permission check. The check
-/// follows the lookup by microseconds; a record older than this one is the
-/// leftover of a write path that checks nothing (cgroup v1) and is dropped.
+/// follows the lookup by microseconds, and the end of the write drops the
+/// record ([`cgroup_move_clear`]); a record older than this one is refused
+/// nothing (defence in depth: a record whose end was not seen).
 const STASH_TTL_NS: u64 = 1_000_000_000;
 
+/// Capacity of [`CGROUP_MOVES`]. One record is live at a time (migrations
+/// are serialised by `cgroup_mutex`); the bound is explicit, and an insert
+/// past it is counted (`DENY_FAIL_OPEN`, the lookup half's slot) and the
+/// move goes through undecided — never an eviction of a live record.
+const MOVE_STASH_ENTRIES: u32 = 64;
+
 /// The writing thread (`pid_tgid`) → `[protected tgid it moves, ktime of
-/// the lookup]`. LRU: a v1 write leaves its record behind, and records
-/// must never fill the map. Not pinned: the two programs are attached fresh
-/// together every boot, and each pair shares its own object's map.
+/// the lookup]`. A plain hash map (lot 273b: an LRU map's per-CPU free
+/// lists may evict a live record before the map is full). Not pinned: the
+/// three programs are attached fresh together every boot, and they share
+/// their own object's map.
 #[map]
-static CGROUP_MOVES: LruHashMap<u64, [u64; 2]> = LruHashMap::with_max_entries(1024, 0);
+static CGROUP_MOVES: HashMap<u64, [u64; 2]> = HashMap::with_max_entries(MOVE_STASH_ENTRIES, 0);
+
+/// `S_IFMT` / `S_IFREG` (include/uapi/linux/stat.h).
+const S_IFMT: u16 = 0o170000;
+const S_IFREG: u16 = 0o100000;
 
 /// `struct task_struct *cgroup_procs_write_start(char *buf, bool
 /// threadgroup, <lock state> *)` returned: the task a `cgroup.procs` /
@@ -104,21 +132,101 @@ unsafe fn try_cgroup_move_stash(ctx: &FExitContext) {
             return;
         }
     };
-    if !crate::task_kill::is_protected_pid(tgid) {
-        return;
-    }
     let pid_tgid = bpf_get_current_pid_tgid();
-    // The agent and the watchdog manage their own family; a worker is
-    // protected, not exempt (R14a).
-    if crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32) {
-        return;
-    }
-    // Inside a signed trusted-installer window nothing is refused.
-    if crate::inode_protect::override_active() {
+    // Only a protected process moved by a caller outside the agent's
+    // family (a worker is protected, not exempt: R14a), outside a signed
+    // trusted-installer window, is recorded.
+    if !crate::task_kill::is_protected_pid(tgid)
+        || crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32)
+        || crate::inode_protect::override_active()
+    {
         return;
     }
     let rec = [u64::from(tgid), bpf_ktime_get_ns()];
-    let _ = CGROUP_MOVES.insert(&pid_tgid, &rec, 0);
+    if CGROUP_MOVES.insert(&pid_tgid, &rec, 0).is_err() {
+        // Lot 273b: the map is full (it never evicts): counted, and the
+        // move goes through undecided.
+        crate::fail_open::bump(hook::CGROUP_PROCS_WRITE_START);
+    }
+}
+
+/// Lot 273b: `void cgroup_procs_write_finish(struct task_struct *task,
+/// <lock state>)` ends every write `cgroup_procs_write_start` returned a
+/// task for — the move done, refused by the permission check (ours or the
+/// DAC's), or failed — on cgroup v2 and on v1 alike. The thread's record
+/// goes with it: a write that never reached the permission check leaves
+/// nothing for a later check of the thread to consume.
+#[fentry(function = "cgroup_procs_write_finish")]
+pub fn cgroup_move_clear(_ctx: FEntryContext) -> i32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let _ = CGROUP_MOVES.remove(&pid_tgid);
+    0
+}
+
+/// Lot 273b: whether `inode` is the file a migration's permission check is
+/// made on — a `cgroup.procs` (or `cgroup.threads`) of a cgroup v2
+/// hierarchy. Without the kernfs offsets, any regular file of a cgroup v2
+/// hierarchy. A read that fails is no such file.
+#[inline(always)]
+unsafe fn is_cgroup2_members_file(inode: *const c_void) -> bool {
+    if inode.is_null() {
+        return false;
+    }
+    let Ok(sb) = bpf_probe_read_kernel::<*const u8>(
+        (inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const *const u8,
+    ) else {
+        return false;
+    };
+    if sb.is_null() {
+        return false;
+    }
+    let Ok(magic) = bpf_probe_read_kernel::<u64>(sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)) as *const u64)
+    else {
+        return false;
+    };
+    if magic & 0xffff_ffff != CGROUP2_SUPER_MAGIC {
+        return false;
+    }
+    let Ok(mode) = bpf_probe_read_kernel::<u16>((inode as *const u8).add(off!(INODE_I_MODE_OFFSET)) as *const u16)
+    else {
+        return false;
+    };
+    if mode & S_IFMT != S_IFREG {
+        return false;
+    }
+    let (Some(private), Some(name_off)) = (
+        off_opt!(INODE_I_PRIVATE_OFFSET),
+        off_opt!(KERNFS_NODE_NAME_OFFSET),
+    ) else {
+        return true;
+    };
+    let Ok(kn) = bpf_probe_read_kernel::<*const u8>((inode as *const u8).add(private) as *const *const u8)
+    else {
+        return false;
+    };
+    if kn.is_null() {
+        return false;
+    }
+    let Ok(name) = bpf_probe_read_kernel::<*const u8>(kn.add(name_off) as *const *const u8) else {
+        return false;
+    };
+    if name.is_null() {
+        return false;
+    }
+    // "cgroup.procs" (12 bytes) or "cgroup.threads" (14): read up to its
+    // NUL into two zeroed words (never past the string), compared whole.
+    let mut w = [0u64; 2];
+    let n = generated::bpf_probe_read_kernel_str(
+        w.as_mut_ptr() as *mut c_void,
+        16,
+        name as *const c_void,
+    );
+    if n <= 0 {
+        return false;
+    }
+    const PROCS: [u64; 3] = name_words(b"cgroup.procs");
+    const THREADS: [u64; 3] = name_words(b"cgroup.threads");
+    (w[0] == PROCS[0] && w[1] == PROCS[1]) || (w[0] == THREADS[0] && w[1] == THREADS[1])
 }
 
 /// `int inode_permission(struct inode *inode, int mask)`: the next write
@@ -142,6 +250,10 @@ unsafe fn try_cgroup_move_deny(ctx: &LsmContext) -> i32 {
         Some(r) => *r,
         None => return 0,
     };
+    // Lot 273b: consumed only by the check a migration makes.
+    if !is_cgroup2_members_file(ctx.arg(0)) {
+        return 0;
+    }
     let _ = CGROUP_MOVES.remove(&pid_tgid);
     if bpf_ktime_get_ns().wrapping_sub(rec[1]) >= STASH_TTL_NS {
         return 0;
