@@ -137,12 +137,20 @@ fn mask(addr: IpAddr, len: u8) -> IpAddr {
     match addr {
         IpAddr::V4(v4) => {
             let bits = u32::from(v4);
-            let m = if len == 0 { 0 } else { u32::MAX << (32 - u32::from(len)) };
+            let m = if len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - u32::from(len))
+            };
             IpAddr::V4((bits & m).into())
         }
         IpAddr::V6(v6) => {
             let bits = u128::from(v6);
-            let m = if len == 0 { 0 } else { u128::MAX << (128 - u32::from(len)) };
+            let m = if len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - u32::from(len))
+            };
             IpAddr::V6((bits & m).into())
         }
     }
@@ -235,7 +243,11 @@ impl Rule for NnLNet028ConnectWithoutDns {
         if !self.first_in_window(nf) {
             return None;
         }
-        let proto = if nf.proto == IPPROTO_TCP { "TCP" } else { "UDP" };
+        let proto = if nf.proto == IPPROTO_TCP {
+            "TCP"
+        } else {
+            "UDP"
+        };
         let (severity, why) = match nf.dns_resolution {
             DnsResolution::OtherLineage => (
                 Severity::Low,
@@ -325,7 +337,12 @@ mod tests {
     #[test]
     fn another_lineage_s_resolution_is_low() {
         let v = rule()
-            .evaluate(&flow(C2, 6, FlowPhase::Connect, DnsResolution::OtherLineage))
+            .evaluate(&flow(
+                C2,
+                6,
+                FlowPhase::Connect,
+                DnsResolution::OtherLineage,
+            ))
             .unwrap();
         assert_eq!(v.severity, Severity::Low);
         assert!(v.reasoning.contains("another process"));
@@ -376,11 +393,23 @@ mod tests {
     /// signed allowlist are exempt.
     #[test]
     fn lan_resolvers_and_the_allowlist_are_exempt() {
-        for a in ["10.1.2.3", "192.168.0.10", "127.0.0.1", "fd00::1", "100.64.1.1", "169.254.169.254"] {
+        for a in [
+            "10.1.2.3",
+            "192.168.0.10",
+            "127.0.0.1",
+            "fd00::1",
+            "100.64.1.1",
+            "169.254.169.254",
+        ] {
             let addr: IpAddr = a.parse().unwrap();
             assert!(
                 rule()
-                    .evaluate(&flow(addr, 6, FlowPhase::Connect, DnsResolution::Unresolved))
+                    .evaluate(&flow(
+                        addr,
+                        6,
+                        FlowPhase::Connect,
+                        DnsResolution::Unresolved
+                    ))
                     .is_none(),
                 "{a}"
             );
@@ -391,12 +420,22 @@ mod tests {
             Arc::new(NoDnsAllowlist::parse("198.51.100.0/24\n2001:db8:1::/48 # mirror\n").unwrap()),
         );
         assert!(r
-            .evaluate(&flow(resolver, 6, FlowPhase::Connect, DnsResolution::Unresolved))
+            .evaluate(&flow(
+                resolver,
+                6,
+                FlowPhase::Connect,
+                DnsResolution::Unresolved
+            ))
             .is_none());
         for a in ["198.51.100.77", "2001:db8:1::9"] {
             assert!(
-                r.evaluate(&flow(a.parse().unwrap(), 6, FlowPhase::Connect, DnsResolution::Unresolved))
-                    .is_none(),
+                r.evaluate(&flow(
+                    a.parse().unwrap(),
+                    6,
+                    FlowPhase::Connect,
+                    DnsResolution::Unresolved
+                ))
+                .is_none(),
                 "{a}"
             );
         }
@@ -420,20 +459,34 @@ mod tests {
         };
         assert!(r.evaluate(&mk(100 * SEC, C2, 1)).is_some());
         assert!(r.evaluate(&mk(101 * SEC, C2, 1)).is_none());
-        assert!(r.evaluate(&mk(101 * SEC, C2, 2)).is_some(), "another process");
+        assert!(
+            r.evaluate(&mk(101 * SEC, C2, 2)).is_some(),
+            "another process"
+        );
         let other = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6));
-        assert!(r.evaluate(&mk(101 * SEC, other, 1)).is_some(), "another destination");
-        assert!(r.evaluate(&mk((100 + DEDUP_SECS - 1) * SEC, C2, 1)).is_none());
+        assert!(
+            r.evaluate(&mk(101 * SEC, other, 1)).is_some(),
+            "another destination"
+        );
+        assert!(r
+            .evaluate(&mk((100 + DEDUP_SECS - 1) * SEC, C2, 1))
+            .is_none());
         assert!(r.evaluate(&mk((100 + DEDUP_SECS) * SEC, C2, 1)).is_some());
     }
 
     #[test]
     fn the_allowlist_parses_strictly() {
-        let l = NoDnsAllowlist::parse("# mirrors\n203.0.113.7\n198.51.100.0/24\n::ffff:192.0.2.1\n\n2001:db8::/32\n").unwrap();
+        let l = NoDnsAllowlist::parse(
+            "# mirrors\n203.0.113.7\n198.51.100.0/24\n::ffff:192.0.2.1\n\n2001:db8::/32\n",
+        )
+        .unwrap();
         assert_eq!(l.len(), 4);
         assert!(l.contains(&"203.0.113.7".parse().unwrap()));
         assert!(!l.contains(&"203.0.113.8".parse().unwrap()));
-        assert!(l.contains(&"192.0.2.1".parse().unwrap()), "mapped form folded");
+        assert!(
+            l.contains(&"192.0.2.1".parse().unwrap()),
+            "mapped form folded"
+        );
         assert!(l.contains(&"::ffff:198.51.100.200".parse().unwrap()));
         assert!(l.contains(&"2001:db8:ffff::1".parse().unwrap()));
         assert!(!l.contains(&"2001:db9::1".parse().unwrap()));
@@ -449,17 +502,34 @@ mod tests {
             assert_eq!(NoDnsAllowlist::parse(bad).unwrap_err().0, line, "{bad}");
         }
         assert!(NoDnsAllowlist::parse("1.0.0.0/8\n").is_ok());
-        let many: String = (0..=MAX_ALLOW_ENTRIES).map(|i| format!("198.51.{}.{}\n", i / 256, i % 256)).collect();
+        let many: String = (0..=MAX_ALLOW_ENTRIES)
+            .map(|i| format!("198.51.{}.{}\n", i / 256, i % 256))
+            .collect();
         assert!(NoDnsAllowlist::parse(&many).is_err());
         assert!(NoDnsAllowlist::empty().is_empty());
     }
 
     #[test]
     fn mask_clears_the_host_bits() {
-        assert_eq!(mask("203.0.113.77".parse().unwrap(), 24), "203.0.113.0".parse::<IpAddr>().unwrap());
-        assert_eq!(mask("203.0.113.77".parse().unwrap(), 32), "203.0.113.77".parse::<IpAddr>().unwrap());
-        assert_eq!(mask("203.0.113.77".parse().unwrap(), 0), "0.0.0.0".parse::<IpAddr>().unwrap());
-        assert_eq!(mask("2001:db8::1".parse().unwrap(), 32), "2001:db8::".parse::<IpAddr>().unwrap());
-        assert_eq!(mask("2001:db8::1".parse().unwrap(), 0), "::".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            mask("203.0.113.77".parse().unwrap(), 24),
+            "203.0.113.0".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            mask("203.0.113.77".parse().unwrap(), 32),
+            "203.0.113.77".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            mask("203.0.113.77".parse().unwrap(), 0),
+            "0.0.0.0".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            mask("2001:db8::1".parse().unwrap(), 32),
+            "2001:db8::".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            mask("2001:db8::1".parse().unwrap(), 0),
+            "::".parse::<IpAddr>().unwrap()
+        );
     }
 }

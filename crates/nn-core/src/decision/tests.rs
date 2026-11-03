@@ -294,9 +294,9 @@ fn default_engine_pins_all_seventy_nine_rule_ids() {
     let mut ids: Vec<&str> = rules.iter().map(|r| r.id()).collect();
     assert_eq!(
         ids.len(),
-        86,
-        "engine ships 85 rules after the impact and evasion rules (lab PR 225), \
-         R007 in two passes (external audit PROC-010)"
+        87,
+        "engine ships 86 rules after the impact and evasion rules (lab PR 225) and \
+         NN-L-NET-028 (lot 275), R007 in two passes (external audit PROC-010)"
     );
     // External audit PROC-010: R007's two passes share its id; no other
     // id appears twice.

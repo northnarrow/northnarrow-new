@@ -117,21 +117,39 @@ mod tests {
         let proc = tempfile::tempdir().unwrap();
         let lineage = AuthSessionTracker::new(proc.path());
         let lan = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        assert_eq!(judge(&t, &lineage, 42, 5 * S, lan, 10 * S), DnsResolution::NotJudged);
+        assert_eq!(
+            judge(&t, &lineage, 42, 5 * S, lan, 10 * S),
+            DnsResolution::NotJudged
+        );
         // no sensor: unknown
-        assert_eq!(judge(&t, &lineage, 42, 5 * S, C2, 10 * S), DnsResolution::Unknown);
+        assert_eq!(
+            judge(&t, &lineage, 42, 5 * S, C2, 10 * S),
+            DnsResolution::Unknown
+        );
         let claim = ResolvedClaim::new(Arc::clone(&t), 2 * S);
         assert!(t.ingest().covers(0));
         // started after the sensor, nothing resolved: unresolved
-        assert_eq!(judge(&t, &lineage, 42, 5 * S, C2, 10 * S), DnsResolution::Unresolved);
+        assert_eq!(
+            judge(&t, &lineage, 42, 5 * S, C2, 10 * S),
+            DnsResolution::Unresolved
+        );
         // started before it: unknown
-        assert_eq!(judge(&t, &lineage, 42, S, C2, 10 * S), DnsResolution::Unknown);
+        assert_eq!(
+            judge(&t, &lineage, 42, S, C2, 10 * S),
+            DnsResolution::Unknown
+        );
         // start unknown, not in the spawn cache: unknown
-        assert_eq!(judge(&t, &lineage, 42, 0, C2, 10 * S), DnsResolution::Unknown);
+        assert_eq!(
+            judge(&t, &lineage, 42, 0, C2, 10 * S),
+            DnsResolution::Unknown
+        );
         // gone from /proc, its start from the spawn cache
         lineage.ingest_exec(43, 1, "/usr/bin/curl", &[], 4 * S, 3 * S, 0);
         let got = judge(&t, &lineage, 43, 0, C2, 10 * S);
-        assert!(matches!(got, DnsResolution::Unresolved | DnsResolution::Unknown), "{got:?}");
+        assert!(
+            matches!(got, DnsResolution::Unresolved | DnsResolution::Unknown),
+            "{got:?}"
+        );
         // resolved by the process: lineage
         t.on_answer(&Answer {
             pid: 42,
@@ -143,9 +161,15 @@ mod tests {
                 addr: C2,
             }],
         });
-        assert_eq!(judge(&t, &lineage, 42, 5 * S, C2, 10 * S), DnsResolution::Lineage);
+        assert_eq!(
+            judge(&t, &lineage, 42, 5 * S, C2, 10 * S),
+            DnsResolution::Lineage
+        );
         drop(claim);
         assert_eq!(t.sensor_since(), None);
-        assert_eq!(judge(&t, &lineage, 44, 5 * S, C2, 10 * S), DnsResolution::Unknown);
+        assert_eq!(
+            judge(&t, &lineage, 44, 5 * S, C2, 10 * S),
+            DnsResolution::Unknown
+        );
     }
 }

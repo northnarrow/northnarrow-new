@@ -1761,10 +1761,30 @@ mod tests {
         let (tx, mut rx) = crate::sensors::bus::channel();
         for corr in 1..=5u8 {
             let raw = close_raw(1000, 4242, [100, 64, 0, 1], 8080, corr);
-            process_close_record(&raw, &tracker, &dns, &Default::default(), Some(&db), &lineage, &mut gate, &tx).await;
+            process_close_record(
+                &raw,
+                &tracker,
+                &dns,
+                &Default::default(),
+                Some(&db),
+                &lineage,
+                &mut gate,
+                &tx,
+            )
+            .await;
         }
         let raw = close_raw(1000, 4242, [192, 0, 2, 10], 8080, 6);
-        process_close_record(&raw, &tracker, &dns, &Default::default(), Some(&db), &lineage, &mut gate, &tx).await;
+        process_close_record(
+            &raw,
+            &tracker,
+            &dns,
+            &Default::default(),
+            Some(&db),
+            &lineage,
+            &mut gate,
+            &tx,
+        )
+        .await;
         drop(tx);
         let mut sent = Vec::new();
         while let Some(Event::NetFlow(nf)) = rx.recv().await.map(|r| r.envelope.event) {
@@ -1864,7 +1884,17 @@ mod tests {
             .finish();
         {
             let _guard = tracing::subscriber::set_default(sub);
-            process_close_record(&bytes, &tracker, &dns, &Default::default(), Some(&db), &lineage, &mut gate, &tx).await;
+            process_close_record(
+                &bytes,
+                &tracker,
+                &dns,
+                &Default::default(),
+                Some(&db),
+                &lineage,
+                &mut gate,
+                &tx,
+            )
+            .await;
         }
         let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
         let warn: Vec<&str> = text

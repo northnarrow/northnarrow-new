@@ -71,8 +71,16 @@ const MAX_HELD_PIDS: usize = 4096;
 /// One A, AAAA or CNAME record of a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Record {
-    Addr { name: String, ttl: u32, addr: IpAddr },
-    Cname { name: String, ttl: u32, target: String },
+    Addr {
+        name: String,
+        ttl: u32,
+        addr: IpAddr,
+    },
+    Cname {
+        name: String,
+        ttl: u32,
+        target: String,
+    },
 }
 
 /// A decoded response ([`ResolvedTable::on_answer`]).
@@ -251,7 +259,10 @@ impl<I: Default> ResolvedTable<I> {
                     let until = a.ts_ns.saturating_add(hold_ns(*ttl));
                     let n = key(name);
                     let e = g.names.entry(n.clone()).or_default();
-                    let slot = e.addrs.entry(nn_model::netaddr::canonical(*addr)).or_insert(0);
+                    let slot = e
+                        .addrs
+                        .entry(nn_model::netaddr::canonical(*addr))
+                        .or_insert(0);
                     *slot = (*slot).max(until);
                     e.answered_until = e.answered_until.max(until);
                     if !chain.contains(&n) {
@@ -384,10 +395,7 @@ impl<I: Default> ResolvedTable<I> {
                 }
                 if let Some(e) = g.names.get(&n) {
                     for (a, until) in &e.addrs {
-                        if *until >= now_ns
-                            && !name_spells(&n, *a)
-                            && !name_spells(name, *a)
-                        {
+                        if *until >= now_ns && !name_spells(&n, *a) && !name_spells(name, *a) {
                             out.push((*a, *until));
                         }
                     }
@@ -408,10 +416,10 @@ impl<I: Default> ResolvedTable<I> {
     }
 
     fn bind(g: &mut Inner, pid: u32, addr: IpAddr, made_ns: u64, until_ns: u64) {
-        let b = g.bindings.entry((pid, addr)).or_insert(Binding {
-            made_ns,
-            until_ns,
-        });
+        let b = g
+            .bindings
+            .entry((pid, addr))
+            .or_insert(Binding { made_ns, until_ns });
         b.made_ns = b.made_ns.min(made_ns);
         b.until_ns = b.until_ns.max(until_ns);
         g.binding_order.touch((pid, addr));
@@ -434,7 +442,12 @@ impl<I: Default> ResolvedTable<I> {
         }
         if g.names.len() > MAX_NAMES {
             // the expired first; then the soonest to expire
-            let now = g.names.values().map(|e| e.answered_until).max().unwrap_or(0);
+            let now = g
+                .names
+                .values()
+                .map(|e| e.answered_until)
+                .max()
+                .unwrap_or(0);
             let horizon = now.saturating_sub(NAME_FLOOR_SECS * SEC);
             let before = g.names.len();
             g.names.retain(|_, e| e.answered_until >= horizon);
@@ -564,12 +577,24 @@ mod tests {
     #[test]
     fn a_process_that_received_the_response_resolved_the_address() {
         let t = Table::new();
-        answer(&t, 42, T0, "www.example.com", &[a("www.example.com", 60, WEB)]);
+        answer(
+            &t,
+            42,
+            T0,
+            "www.example.com",
+            &[a("www.example.com", 60, WEB)],
+        );
         assert_eq!(t.check(42, 1, WEB, T0 + SEC, none), DnsResolution::Lineage);
         // another process: someone resolved it, not its lineage
-        assert_eq!(t.check(43, 1, WEB, T0 + SEC, none), DnsResolution::OtherLineage);
+        assert_eq!(
+            t.check(43, 1, WEB, T0 + SEC, none),
+            DnsResolution::OtherLineage
+        );
         // an address nobody resolved
-        assert_eq!(t.check(42, 1, C2, T0 + SEC, none), DnsResolution::Unresolved);
+        assert_eq!(
+            t.check(42, 1, C2, T0 + SEC, none),
+            DnsResolution::Unresolved
+        );
     }
 
     /// An ancestor's binding counts; a sibling's does not.
@@ -578,9 +603,15 @@ mod tests {
         let t = Table::new();
         answer(&t, 10, T0, "repo.example", &[a("repo.example", 60, WEB)]);
         let parent = || vec![(10, 1)];
-        assert_eq!(t.check(11, T0 + 1, WEB, T0 + 2, parent), DnsResolution::Lineage);
+        assert_eq!(
+            t.check(11, T0 + 1, WEB, T0 + 2, parent),
+            DnsResolution::Lineage
+        );
         let other = || vec![(12, 1)];
-        assert_eq!(t.check(13, T0 + 1, WEB, T0 + 2, other), DnsResolution::OtherLineage);
+        assert_eq!(
+            t.check(13, T0 + 1, WEB, T0 + 2, other),
+            DnsResolution::OtherLineage
+        );
     }
 
     /// External audit NET-016: a binding made before the process started is
@@ -589,7 +620,10 @@ mod tests {
     fn a_binding_older_than_the_process_is_not_its_own() {
         let t = Table::new();
         answer(&t, 42, T0, "a.example", &[a("a.example", 60, WEB)]);
-        assert_eq!(t.check(42, T0 + 5, WEB, T0 + 10, none), DnsResolution::OtherLineage);
+        assert_eq!(
+            t.check(42, T0 + 5, WEB, T0 + 10, none),
+            DnsResolution::OtherLineage
+        );
         assert_eq!(t.check(42, 0, WEB, T0 + 10, none), DnsResolution::Lineage);
     }
 
@@ -602,7 +636,13 @@ mod tests {
         const RESOLVED: u32 = 500;
         // query first
         t.on_query(42, "api.example", T0);
-        answer(&t, RESOLVED, T0 + 20_000_000, "api.example", &[a("api.example", 30, WEB)]);
+        answer(
+            &t,
+            RESOLVED,
+            T0 + 20_000_000,
+            "api.example",
+            &[a("api.example", 30, WEB)],
+        );
         assert_eq!(t.check(42, 1, WEB, T0 + SEC, none), DnsResolution::Lineage);
         // response first (another pump read it sooner), then the query
         answer(&t, RESOLVED, T0, "b.example", &[a("b.example", 30, C2)]);
@@ -615,10 +655,20 @@ mod tests {
             RESOLVED,
             T0 + (ASK_WINDOW_SECS + 1) * SEC,
             "late.example",
-            &[a("late.example", 30, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)))],
+            &[a(
+                "late.example",
+                30,
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+            )],
         );
         assert_eq!(
-            t.check(88, 1, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)), T0 + 20 * SEC, none),
+            t.check(
+                88,
+                1,
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+                T0 + 20 * SEC,
+                none
+            ),
             DnsResolution::OtherLineage
         );
     }
@@ -639,7 +689,10 @@ mod tests {
         answer(&t, 500, T0, "www.shop.example", &recs);
         // a later lookup of the first name, served from the resolver's cache
         t.on_query(42, "www.shop.example", T0 + 30 * SEC);
-        assert_eq!(t.check(42, 1, WEB, T0 + 31 * SEC, none), DnsResolution::Lineage);
+        assert_eq!(
+            t.check(42, 1, WEB, T0 + 31 * SEC, none),
+            DnsResolution::Lineage
+        );
     }
 
     /// A binding lasts for the TTL (300 s at least), then 2 h past each use.
@@ -648,14 +701,26 @@ mod tests {
         let t = Table::new();
         answer(&t, 42, T0, "ntp.example", &[a("ntp.example", 5, WEB)]);
         // within the 300 s floor
-        assert_eq!(t.check(42, 1, WEB, T0 + 299 * SEC, none), DnsResolution::Lineage);
+        assert_eq!(
+            t.check(42, 1, WEB, T0 + 299 * SEC, none),
+            DnsResolution::Lineage
+        );
         // used: still bound an hour later, and again after that
-        assert_eq!(t.check(42, 1, WEB, T0 + 3_600 * SEC, none), DnsResolution::Lineage);
-        assert_eq!(t.check(42, 1, WEB, T0 + 7_000 * SEC, none), DnsResolution::Lineage);
+        assert_eq!(
+            t.check(42, 1, WEB, T0 + 3_600 * SEC, none),
+            DnsResolution::Lineage
+        );
+        assert_eq!(
+            t.check(42, 1, WEB, T0 + 7_000 * SEC, none),
+            DnsResolution::Lineage
+        );
         // unused past the idle time: gone
         let t2 = Table::new();
         answer(&t2, 42, T0, "x.example", &[a("x.example", 5, WEB)]);
-        assert_eq!(t2.check(42, 1, WEB, T0 + 301 * SEC, none), DnsResolution::Unresolved);
+        assert_eq!(
+            t2.check(42, 1, WEB, T0 + 301 * SEC, none),
+            DnsResolution::Unresolved
+        );
     }
 
     /// "IP in the name": an address its name spells binds nothing.
@@ -674,10 +739,18 @@ mod tests {
             assert!(name_spells(name, addr), "{name}");
             let t = Table::new();
             answer(&t, 42, T0, name, &[a(name, 60, addr)]);
-            assert_eq!(t.check(42, 1, addr, T0 + SEC, none), DnsResolution::Unresolved, "{name}");
+            assert_eq!(
+                t.check(42, 1, addr, T0 + SEC, none),
+                DnsResolution::Unresolved,
+                "{name}"
+            );
             assert_eq!(t.counters().ip_in_name, 1);
         }
-        for (name, addr) in [("www.example.com", C2), ("203-0-113-6.nip.io", C2), ("5.113.0.203.in-addr.arpa", C2)] {
+        for (name, addr) in [
+            ("www.example.com", C2),
+            ("203-0-113-6.nip.io", C2),
+            ("5.113.0.203.in-addr.arpa", C2),
+        ] {
             assert!(!name_spells(name, addr), "{name}");
         }
         // through a CNAME the spelled address binds nothing either
@@ -691,7 +764,10 @@ mod tests {
             a("203-0-113-5.nip.io", 60, C2),
         ];
         answer(&t, 42, T0, "c2.example", &recs);
-        assert_eq!(t.check(42, 1, C2, T0 + SEC, none), DnsResolution::Unresolved);
+        assert_eq!(
+            t.check(42, 1, C2, T0 + SEC, none),
+            DnsResolution::Unresolved
+        );
     }
 
     /// A name the lineage asked whose response was never seen (a resolver's
@@ -703,12 +779,24 @@ mod tests {
         t.on_query(42, "cached.example", T0);
         assert_eq!(t.check(42, 1, C2, T0 + SEC, none), DnsResolution::Unknown);
         // once the response is seen and does not name the address: unresolved
-        answer(&t, 500, T0 + 2 * SEC, "cached.example", &[a("cached.example", 60, WEB)]);
-        assert_eq!(t.check(42, 1, C2, T0 + 3 * SEC, none), DnsResolution::Unresolved);
+        answer(
+            &t,
+            500,
+            T0 + 2 * SEC,
+            "cached.example",
+            &[a("cached.example", 60, WEB)],
+        );
+        assert_eq!(
+            t.check(42, 1, C2, T0 + 3 * SEC, none),
+            DnsResolution::Unresolved
+        );
         // an NXDOMAIN is an answer too
         t.on_query(43, "nope.example", T0);
         answer(&t, 500, T0 + SEC, "nope.example", &[]);
-        assert_eq!(t.check(43, 1, C2, T0 + 2 * SEC, none), DnsResolution::Unresolved);
+        assert_eq!(
+            t.check(43, 1, C2, T0 + 2 * SEC, none),
+            DnsResolution::Unresolved
+        );
         // the old unseen ask no longer counts past the window
         let t = Table::new();
         t.on_query(42, "cached.example", T0);
@@ -720,9 +808,15 @@ mod tests {
         let t = Table::new();
         t.note_held(42, T0);
         assert_eq!(t.check(42, 1, C2, T0 + SEC, none), DnsResolution::Unknown);
-        assert_eq!(t.check(43, 1, C2, T0 + SEC, || vec![(42, 1)]), DnsResolution::Unknown);
+        assert_eq!(
+            t.check(43, 1, C2, T0 + SEC, || vec![(42, 1)]),
+            DnsResolution::Unknown
+        );
         // ... held before the process started are an earlier holder's
-        assert_eq!(t.check(42, T0 + 1, C2, T0 + SEC, none), DnsResolution::Unresolved);
+        assert_eq!(
+            t.check(42, T0 + 1, C2, T0 + SEC, none),
+            DnsResolution::Unresolved
+        );
     }
 
     /// A record the pumps could not decode (the parse worker down): what
@@ -732,8 +826,15 @@ mod tests {
         let t = Table::new();
         answer(&t, 42, T0, "a.example", &[a("a.example", 60, WEB)]);
         t.note_undecoded(T0 + SEC);
-        assert_eq!(t.check(7, 1, C2, T0 + 2 * SEC, none), DnsResolution::Unknown);
-        assert_eq!(t.check(42, 1, WEB, T0 + 2 * SEC, none), DnsResolution::Lineage, "bound");
+        assert_eq!(
+            t.check(7, 1, C2, T0 + 2 * SEC, none),
+            DnsResolution::Unknown
+        );
+        assert_eq!(
+            t.check(42, 1, WEB, T0 + 2 * SEC, none),
+            DnsResolution::Lineage,
+            "bound"
+        );
         let after = T0 + SEC + UNSEEN_WINDOW_SECS * SEC + 1;
         assert_eq!(t.check(7, 1, C2, after, none), DnsResolution::Unresolved);
     }
@@ -757,10 +858,19 @@ mod tests {
     fn families_and_the_mapped_form() {
         let t = Table::new();
         let v6: IpAddr = "2606:4700::1111".parse().unwrap();
-        answer(&t, 42, T0, "one.example", &[a("one.example", 60, v6), a("one.example", 60, WEB)]);
+        answer(
+            &t,
+            42,
+            T0,
+            "one.example",
+            &[a("one.example", 60, v6), a("one.example", 60, WEB)],
+        );
         assert_eq!(t.check(42, 1, v6, T0 + SEC, none), DnsResolution::Lineage);
         let mapped: IpAddr = "::ffff:198.51.100.7".parse().unwrap();
-        assert_eq!(t.check(42, 1, mapped, T0 + SEC, none), DnsResolution::Lineage);
+        assert_eq!(
+            t.check(42, 1, mapped, T0 + SEC, none),
+            DnsResolution::Lineage
+        );
     }
 
     /// The maps stay within their bounds; the evictions are counted.
@@ -769,9 +879,21 @@ mod tests {
         let t = Table::new();
         for i in 0..(MAX_BINDINGS as u32 / 64 + 10) {
             let recs: Vec<Record> = (0..64u32)
-                .map(|j| a("n.example", 60, IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i * 64 + j))))
+                .map(|j| {
+                    a(
+                        "n.example",
+                        60,
+                        IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i * 64 + j)),
+                    )
+                })
                 .collect();
-            answer(&t, i % 7, T0 + u64::from(i), &format!("n{i}.example"), &recs);
+            answer(
+                &t,
+                i % 7,
+                T0 + u64::from(i),
+                &format!("n{i}.example"),
+                &recs,
+            );
         }
         let (b, _, ad) = t.sizes();
         assert!(b <= MAX_BINDINGS, "{b}");

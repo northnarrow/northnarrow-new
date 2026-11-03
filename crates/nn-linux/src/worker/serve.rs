@@ -198,7 +198,9 @@ fn dns_answers(bytes: &[u8]) -> Option<nn_proto::ipc::DnsAnswersOut> {
                     ttl,
                     addr: addr.octets(),
                 },
-                AnswerRecord::Cname { name, ttl, target } => DnsRecordOut::Cname { name, ttl, target },
+                AnswerRecord::Cname { name, ttl, target } => {
+                    DnsRecordOut::Cname { name, ttl, target }
+                }
             })
             .collect(),
         complete: r.complete,

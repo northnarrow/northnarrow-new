@@ -732,16 +732,18 @@ impl Rule for NnLNet003BadJa3 {
         if !self.blocklist.contains(&fp.ja3) {
             return None;
         }
-        Some(crate::decision::response_policy::NET_003_KILL.hold(net_verdict(
-            self,
-            ResponseAction::KillProcessTree,
-            Severity::Critical,
-            "TLS JA3 fingerprint matches operator threat-actor \
+        Some(
+            crate::decision::response_policy::NET_003_KILL.hold(net_verdict(
+                self,
+                ResponseAction::KillProcessTree,
+                Severity::Critical,
+                "TLS JA3 fingerprint matches operator threat-actor \
              blocklist — kill the process tree + posture → COMBAT",
-            h.pid,
-            h.comm.clone(),
-            h.timestamp_ns,
-        )))
+                h.pid,
+                h.comm.clone(),
+                h.timestamp_ns,
+            )),
+        )
     }
 }
 
@@ -3103,7 +3105,9 @@ mod tests {
         let bl = Arc::new(Ja3Blocklist::from_entries([hash]));
         let rule = NnLNet003BadJa3::new(bl);
         crate::decision::response_policy::take_held();
-        let v = rule.evaluate(&hello(Some(hash), "evilbin")).expect("JA3 hit");
+        let v = rule
+            .evaluate(&hello(Some(hash), "evilbin"))
+            .expect("JA3 hit");
         assert_eq!(v.severity, Severity::Critical);
         assert_eq!(v.category, CATEGORY_CRITICAL);
         assert_eq!(v.action, ResponseAction::Log, "held by default");
@@ -3126,7 +3130,9 @@ mod tests {
     fn net_003_does_not_fire_on_unknown_ja3() {
         let bl = Arc::new(Ja3Blocklist::from_entries(["aa".repeat(16)]));
         let rule = NnLNet003BadJa3::new(bl);
-        assert!(rule.evaluate(&hello(Some(&"bb".repeat(16)), "curl")).is_none());
+        assert!(rule
+            .evaluate(&hello(Some(&"bb".repeat(16)), "curl"))
+            .is_none());
         // an incomplete hello has no fingerprint
         assert!(rule.evaluate(&hello(None, "curl")).is_none());
     }

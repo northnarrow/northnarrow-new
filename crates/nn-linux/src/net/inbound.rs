@@ -230,7 +230,10 @@ mod tests {
         assert_eq!(row.pid, 777);
         assert_eq!(row.comm, "nginx");
         assert_eq!(row.src_addr.to_string(), "198.51.100.9");
-        assert_eq!((row.dst_addr.to_string().as_str(), row.dst_port), ("192.0.2.1", 443));
+        assert_eq!(
+            (row.dst_addr.to_string().as_str(), row.dst_port),
+            ("192.0.2.1", 443)
+        );
         let mut c = raw(inbound_kind::CLOSE, 9_000);
         c.pid = 778; // a worker closes it: the row keeps the acceptor
         c.bytes_sent = 4_000;
@@ -240,7 +243,10 @@ mod tests {
         let row = closed.expect("closed row");
         assert_eq!(evs.len(), 1);
         assert_eq!(row.phase, FlowPhase::Closed);
-        assert_eq!((row.pid, row.bytes_sent, row.bytes_recv, row.close_reason), (777, 4_000, 300, 104));
+        assert_eq!(
+            (row.pid, row.bytes_sent, row.bytes_recv, row.close_reason),
+            (777, 4_000, 300, 104)
+        );
         assert_eq!((row.start_ns, row.end_ns), (1_000, 9_000));
         assert_eq!(row.flow_id.len(), 32);
         assert_eq!(t.pending_len(), 0);
@@ -273,7 +279,10 @@ mod tests {
             .collect();
         assert_eq!(
             floods,
-            vec![(FloodSource::Accept, 40, false), (FloodSource::Accept, 7, true)]
+            vec![
+                (FloodSource::Accept, 40, false),
+                (FloodSource::Accept, 7, true)
+            ]
         );
         // a held count without its flag is not reported
         let mut b = raw(inbound_kind::ACCEPT, 3_000);

@@ -1731,7 +1731,9 @@ fn spawn_dns_query_pump(
     let rt = rt.clone();
     PumpThread::spawn("dns_query", move |stop| {
         let _claim = claim;
-        rt.block_on(pump_dns_query(rb, dns_cache, resolved, lineage, parse, tx, stop))
+        rt.block_on(pump_dns_query(
+            rb, dns_cache, resolved, lineage, parse, tx, stop,
+        ))
     })
     .context("starting the dns_query pump's thread")
 }

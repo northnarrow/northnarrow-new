@@ -3495,9 +3495,15 @@ mod tests {
         t.ingest_spawn(200, 100, "/usr/bin/python3", 2);
         t.ingest_spawn(300, 200, "/usr/bin/curl", 3);
         let got = t.lineage_starts(300, AsOf::Now);
-        assert_eq!(got.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![300, 200, 100]);
         assert_eq!(
-            t.lineage_starts(100, AsOf::Now).iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            got.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec![300, 200, 100]
+        );
+        assert_eq!(
+            t.lineage_starts(100, AsOf::Now)
+                .iter()
+                .map(|(p, _)| *p)
+                .collect::<Vec<_>>(),
             vec![100]
         );
         assert!(t.lineage_starts(999, AsOf::Now).is_empty(), "not known");

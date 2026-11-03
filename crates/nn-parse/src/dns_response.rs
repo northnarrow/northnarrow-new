@@ -364,11 +364,14 @@ mod tests {
         name(&mut p, "nope.example");
         p.extend_from_slice(&[0, 28, 0, 1]);
         rr(&mut p, &[0xC0, 12], 16, 5, b"\x03txt"); // TXT: stepped over
-        // CH class A: stepped over
+                                                    // CH class A: stepped over
         p.extend_from_slice(&[0xC0, 12, 0, 1, 0, 3, 0, 0, 0, 5, 0, 4, 1, 2, 3, 4]);
         rr(&mut p, &[0xC0, 12], TYPE_A, 9, &[1, 2, 3]); // a 3-byte A: stepped over
         let r = parse_response(&p).unwrap();
-        assert_eq!((r.qname.as_str(), r.qtype, r.rcode), ("nope.example", 28, 3));
+        assert_eq!(
+            (r.qname.as_str(), r.qtype, r.rcode),
+            ("nope.example", 28, 3)
+        );
         assert!(r.answers.is_empty());
         assert!(r.complete);
     }
@@ -439,10 +442,7 @@ mod tests {
         assert!(read_name(&b, 0).is_some());
         // a dot, a backslash and a control byte inside a label
         let b = [3u8, b'a', b'.', b'\\', 1, 7, 0];
-        assert_eq!(
-            read_name(&b, 0),
-            Some(("a\\046\\092.\\007".into(), 7))
-        );
+        assert_eq!(read_name(&b, 0), Some(("a\\046\\092.\\007".into(), 7)));
     }
 
     /// The records kept are bounded: past them the answer is incomplete.

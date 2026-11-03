@@ -203,6 +203,22 @@ fn attach_fentry(ebpf: &mut Ebpf, program: &str, func: &str, btf: &Btf) -> Resul
     Ok(())
 }
 
+/// What a pump's passes read since its last summary line.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PassStats {
+    /// Records read.
+    pub records: u64,
+    /// Decoded by the parse worker (a response with its question, a
+    /// complete hello).
+    pub decoded: u64,
+    /// The last decoded record, for the summary (escaped when logged).
+    pub last: Option<String>,
+}
+
+/// How often a pump says what it read (INFO, only when it read anything):
+/// the journal shows the sensor alive without a line per record.
+pub const SUMMARY_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
 // ── the DNS response pump ─────────────────────────────────────────────
 
 /// The event of one response record, and the table's input, from the
@@ -270,16 +286,32 @@ pub fn answer_event(
         cnames,
         ttl_secs: ttl.unwrap_or(0),
         datagram_len: raw.datagram_len,
-        truncated: raw.flags & answer_flags::TRUNCATED != 0
-            || decoded.is_some_and(|d| !d.complete),
+        truncated: raw.flags & answer_flags::TRUNCATED != 0 || decoded.is_some_and(|d| !d.complete),
     };
     (ev, records)
 }
 
 /// The floods a record carries (its process's held count, its user's).
-fn floods(source: FloodSource, raw_flags: u8, held: u16, held_uid: u16, pid: u32, uid: u32, comm: &str, ts: u64) -> impl Iterator<Item = Event> {
-    let h = if raw_flags & held_flags::TASK != 0 { u32::from(held) } else { 0 };
-    let hu = if raw_flags & held_flags::UID != 0 { u32::from(held_uid) } else { 0 };
+/// `(held, held_uid)` are the record's counts, read only with their flag.
+fn floods(
+    source: FloodSource,
+    raw_flags: u8,
+    (held, held_uid): (u16, u16),
+    pid: u32,
+    uid: u32,
+    comm: &str,
+    ts: u64,
+) -> impl Iterator<Item = Event> {
+    let h = if raw_flags & held_flags::TASK != 0 {
+        u32::from(held)
+    } else {
+        0
+    };
+    let hu = if raw_flags & held_flags::UID != 0 {
+        u32::from(held_uid)
+    } else {
+        0
+    };
     nn_model::sensor_floods(source, pid, uid, comm, h, hu, ts)
         .into_iter()
         .flatten()
@@ -294,6 +326,7 @@ fn answer_pass(
     parse: &ParseClient,
     reject: &mut RejectThrottle,
     outbox: &mut VecDeque<Event>,
+    stats: &mut PassStats,
 ) -> u32 {
     let size = std::mem::size_of::<DnsAnswerRaw>();
     let mut raws: Vec<DnsAnswerRaw> = Vec::new();
@@ -315,6 +348,15 @@ fn answer_pass(
         };
         let exe = lineage.image_at(raw.pid, raw.timestamp_ns);
         let (ev, records) = answer_event(raw, decoded.as_ref(), exe);
+        stats.records += 1;
+        if let Some(q) = &ev.query_name {
+            stats.decoded += 1;
+            stats.last = Some(format!(
+                "{q} -> {} address(es), rcode {}",
+                ev.addrs.len(),
+                ev.rcode
+            ));
+        }
         match &ev.query_name {
             Some(q) => table.on_answer(&Answer {
                 pid: raw.pid,
@@ -335,8 +377,7 @@ fn answer_pass(
         outbox.extend(floods(
             FloodSource::DnsAnswer,
             raw.flags,
-            raw.held,
-            raw.held_uid,
+            (raw.held, raw.held_uid),
             raw.pid,
             raw.uid,
             &comm,
@@ -355,8 +396,10 @@ pub fn spawn_dns_answer_pump(
     tx: &BusSender,
     rt: &tokio::runtime::Handle,
 ) -> Result<PumpThread> {
-    let claim =
-        crate::net::resolved::ResolvedClaim::new(Arc::clone(&table), crate::net::dns_ingest::monotonic_ns());
+    let claim = crate::net::resolved::ResolvedClaim::new(
+        Arc::clone(&table),
+        crate::net::dns_ingest::monotonic_ns(),
+    );
     let tx = tx.for_source("dns_answer");
     let rt = rt.clone();
     PumpThread::spawn("dns_answer", move |stop| {
@@ -369,7 +412,9 @@ pub fn spawn_dns_answer_pump(
             stop,
             DNS_ANSWER_LABEL,
             std::mem::size_of::<DnsAnswerRaw>(),
-            |ring, reject, outbox| answer_pass(ring, &table, &lineage, &parse, reject, outbox),
+            |ring, reject, outbox, stats| {
+                answer_pass(ring, &table, &lineage, &parse, reject, outbox, stats)
+            },
         ))
     })
     .context("starting the dns_answer pump's thread")
@@ -428,6 +473,7 @@ fn hello_pass(
     parse: &ParseClient,
     reject: &mut RejectThrottle,
     outbox: &mut VecDeque<Event>,
+    stats: &mut PassStats,
 ) -> u32 {
     let size = std::mem::size_of::<TlsHelloRaw>();
     let mut raws: Vec<Box<TlsHelloRaw>> = Vec::new();
@@ -449,9 +495,23 @@ fn hello_pass(
         };
         let exe = lineage.image_at(raw.pid, raw.timestamp_ns);
         let ev = hello_event(raw, out.as_ref(), exe);
+        stats.records += 1;
+        if let Some(fp) = &ev.fingerprint {
+            stats.decoded += 1;
+            stats.last = Some(format!(
+                "{}:{} ja3 {} ja4 {} sni {}",
+                ev.dst_addr,
+                ev.dst_port,
+                fp.ja3,
+                fp.ja4,
+                fp.sni.as_deref().unwrap_or("-")
+            ));
+        }
         if let Some(fp) = &ev.fingerprint {
             if raw.flow_id != [0u8; 16] {
-                flow_tracker.lock().attach_tls_pending(&raw.flow_id, fp.clone());
+                flow_tracker
+                    .lock()
+                    .attach_tls_pending(&raw.flow_id, fp.clone());
             }
         }
         let comm = ev.comm.clone();
@@ -459,8 +519,7 @@ fn hello_pass(
         outbox.extend(floods(
             FloodSource::TlsHello,
             raw.flags,
-            raw.held,
-            raw.held_uid,
+            (raw.held, raw.held_uid),
             raw.pid,
             raw.uid,
             &comm,
@@ -492,7 +551,9 @@ pub fn spawn_tls_pump(
             stop,
             TLS_HELLO_LABEL,
             std::mem::size_of::<TlsHelloRaw>(),
-            |ring, reject, outbox| hello_pass(ring, &flow_tracker, &lineage, &parse, reject, outbox),
+            |ring, reject, outbox, stats| {
+                hello_pass(ring, &flow_tracker, &lineage, &parse, reject, outbox, stats)
+            },
         ))
     })
     .context("starting the tls_hello pump's thread")
@@ -510,11 +571,18 @@ async fn ingest_pump(
     stop: &std::sync::atomic::AtomicBool,
     label: &'static str,
     size: usize,
-    mut pass: impl FnMut(&mut RingBuf<MapData>, &mut RejectThrottle, &mut VecDeque<Event>) -> u32,
+    mut pass: impl FnMut(
+        &mut RingBuf<MapData>,
+        &mut RejectThrottle,
+        &mut VecDeque<Event>,
+        &mut PassStats,
+    ) -> u32,
 ) -> std::io::Result<()> {
     let mut async_fd = crate::async_fd::register(rb)?;
     let mut reject = RejectThrottle::new();
     let mut outbox: VecDeque<Event> = VecDeque::new();
+    let mut stats = PassStats::default();
+    let mut last_summary = std::time::Instant::now();
     let mut check_stop = tokio::time::interval(std::time::Duration::from_millis(POLL_MS as u64));
     loop {
         if stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -524,7 +592,7 @@ async fn ingest_pump(
             r = async_fd.readable_mut() => {
                 let mut guard = r?;
                 let began = crate::net::dns_ingest::monotonic_ns();
-                let drained = pass(guard.get_inner_mut(), &mut reject, &mut outbox);
+                let drained = pass(guard.get_inner_mut(), &mut reject, &mut outbox, &mut stats);
                 guard.clear_ready();
                 ingest.pass_ended(began);
                 if drained == 0 {
@@ -534,10 +602,23 @@ async fn ingest_pump(
             }
             () = ingest.wanted() => {
                 let began = crate::net::dns_ingest::monotonic_ns();
-                pass(async_fd.get_mut(), &mut reject, &mut outbox);
+                pass(async_fd.get_mut(), &mut reject, &mut outbox, &mut stats);
                 ingest.pass_ended(began);
             }
             _ = check_stop.tick() => {}
+        }
+        if last_summary.elapsed() >= SUMMARY_EVERY {
+            if stats.records > 0 {
+                info!(
+                    source = label,
+                    records = stats.records,
+                    decoded = stats.decoded,
+                    last = %nn_model::log_escape::Escaped(stats.last.as_deref().unwrap_or("")),
+                    "network telemetry: records read since the last summary"
+                );
+            }
+            stats = PassStats::default();
+            last_summary = std::time::Instant::now();
         }
         while !outbox.is_empty() {
             let n = outbox.len().min(crate::sensors::bus::BATCH_MAX);
@@ -554,16 +635,26 @@ mod tests {
 
     #[test]
     fn one_variant_per_parameter_count() {
-        assert_eq!(variant_for("inet_csk_accept", 4), Some("inbound_accept_ret4"));
-        assert_eq!(variant_for("inet_csk_accept", 2), Some("inbound_accept_ret2"));
+        assert_eq!(
+            variant_for("inet_csk_accept", 4),
+            Some("inbound_accept_ret4")
+        );
+        assert_eq!(
+            variant_for("inet_csk_accept", 2),
+            Some("inbound_accept_ret2")
+        );
         assert_eq!(variant_for("udp_recvmsg", 6), Some("dns_answer_v4_ret6"));
         assert_eq!(variant_for("udp_recvmsg", 5), Some("dns_answer_v4_ret5"));
         assert_eq!(variant_for("udpv6_recvmsg", 5), Some("dns_answer_v6_ret5"));
         assert_eq!(variant_for("udp_recvmsg", 3), None);
         assert_eq!(variant_for("tcp_sendmsg", 3), None);
         assert_eq!(other_arity("dns_answer_v4_ret6", Some(6)), None);
-        assert!(other_arity("dns_answer_v4_ret6", Some(5)).unwrap().contains("has 5"));
-        assert!(other_arity("inbound_accept_ret2", None).unwrap().contains("no inet_csk_accept"));
+        assert!(other_arity("dns_answer_v4_ret6", Some(5))
+            .unwrap()
+            .contains("has 5"));
+        assert!(other_arity("inbound_accept_ret2", None)
+            .unwrap()
+            .contains("no inet_csk_accept"));
         assert_eq!(other_arity("tcp_close", Some(2)), None, "not a variant");
         // the variants are the eBPF object's programs, each with the slot of
         // its return value after its parameters
@@ -571,7 +662,9 @@ mod tests {
         let src = std::fs::read_to_string(dir.join("inbound.rs")).unwrap()
             + &std::fs::read_to_string(dir.join("dns_answer.rs")).unwrap();
         for (p, _, n) in ARITY_VARIANTS {
-            let at = src.find(&format!("pub fn {p}(ctx: FExitContext)")).unwrap_or_else(|| panic!("{p}"));
+            let at = src
+                .find(&format!("pub fn {p}(ctx: FExitContext)"))
+                .unwrap_or_else(|| panic!("{p}"));
             assert!(src[at..].starts_with(&format!("pub fn {p}(ctx: FExitContext)")));
             let body = &src[at..at + 200];
             assert!(body.contains(&format!("ctx.arg({n})")), "{p}: {body}");
@@ -611,7 +704,10 @@ mod tests {
                 DnsRecordOut::Aaaa {
                     name: "edge.example".into(),
                     ttl: 40,
-                    addr: "::ffff:198.51.100.8".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+                    addr: "::ffff:198.51.100.8"
+                        .parse::<std::net::Ipv6Addr>()
+                        .unwrap()
+                        .octets(),
                 },
             ],
             complete: true,
@@ -620,7 +716,11 @@ mod tests {
         assert_eq!(ev.query_name.as_deref(), Some("www.example"));
         assert_eq!(ev.server.to_string(), "127.0.0.53");
         assert_eq!(ev.addrs.len(), 2);
-        assert_eq!(ev.addrs[1].to_string(), "198.51.100.8", "the mapped form folded");
+        assert_eq!(
+            ev.addrs[1].to_string(),
+            "198.51.100.8",
+            "the mapped form folded"
+        );
         assert_eq!(ev.cnames, vec!["edge.example".to_string()]);
         assert_eq!(ev.ttl_secs, 20);
         assert!(!ev.truncated);
@@ -634,7 +734,11 @@ mod tests {
             complete: false,
             ..d
         };
-        assert!(answer_event(&answer_raw(), Some(&incomplete), None).0.truncated);
+        assert!(
+            answer_event(&answer_raw(), Some(&incomplete), None)
+                .0
+                .truncated
+        );
     }
 
     #[test]
@@ -673,14 +777,29 @@ mod tests {
             sni: SniOut::NonConforming,
             alpn: vec![],
         };
-        assert_eq!(hello_event(&raw, Some(&nc), None).fingerprint.unwrap().sni, None);
+        assert_eq!(
+            hello_event(&raw, Some(&nc), None).fingerprint.unwrap().sni,
+            None
+        );
     }
 
     #[test]
     fn held_counts_count_only_with_their_flags() {
-        let got: Vec<Event> = floods(FloodSource::TlsHello, held_flags::UID, 5, 6, 1, 2, "x", 3).collect();
+        let got: Vec<Event> =
+            floods(FloodSource::TlsHello, held_flags::UID, (5, 6), 1, 2, "x", 3).collect();
         assert_eq!(got.len(), 1);
-        assert!(matches!(&got[0], Event::SensorFlood { held: 6, uid_level: true, source: FloodSource::TlsHello, .. }));
-        assert_eq!(floods(FloodSource::DnsAnswer, 0, 5, 6, 1, 2, "x", 3).count(), 0);
+        assert!(matches!(
+            &got[0],
+            Event::SensorFlood {
+                held: 6,
+                uid_level: true,
+                source: FloodSource::TlsHello,
+                ..
+            }
+        ));
+        assert_eq!(
+            floods(FloodSource::DnsAnswer, 0, (5, 6), 1, 2, "x", 3).count(),
+            0
+        );
     }
 }

@@ -33,6 +33,13 @@
 # MS06N (a systemd Accept=yes service: no R020), MS21 (a sweep, a port
 # scan, repeated SSH connects: NN-L-NET-026 / 027), NEG (apt, git, ssh, a
 # browser-like burst to one host: no Critical, no fan-out record).
+# Lot 275 (C07, NN-L-NET-028): MS28 ("no DNS, no connect": a literal-IP
+# connect to a documentation address over TCP, UDP and IPv6 is recorded,
+# Medium, its kill held; a resolved connect is not; a name that spells its
+# address, nip.io, counts as literal when the guest is online), MS29 (an
+# accepted connection's rows in the netflow log, `inbound`), MS30 (the DNS
+# response sensor's records, its summary line), MS31 (a TLS client's JA3,
+# JA4 and SNI on its flow's closed row).
 # The kills lab PR 224 adds — R020's, the fan-out kill tier, port 53 of a
 # server that is no configured resolver — are held behind the per-rule
 # response policy, off by default (decision of 21/10/2026): those cases
@@ -46,7 +53,7 @@ ONLY=""
 BEFORE=0
 fail=0
 
-usage() { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -322,6 +329,109 @@ if want MS21; then
     ok=1; [[ $n -ge 1 ]] && ok=0
     outcome MS21 $ok "25 connects to 127.0.0.1:22: NET-027 records=$n" "repeated SSH connects draw no rule"
     reset_posture
+fi
+
+# ── MS28: "no DNS, no connect" (lot 275, NN-L-NET-028) ────────────────
+# A documentation address (RFC 5737 / 3849): no LAN uses it, the rule
+# judges it public, and nothing answers there (the connects time out).
+if want MS28; then
+    b=$(det_count)
+    timeout 6 curl -s -m 3 -o /dev/null http://203.0.113.5:18080/ &
+    p=$!; wait $p
+    sleep 2
+    n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --severity Medium --action Log --pid "$p")
+    k=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --action KillProcess)
+    ok=1; [[ $n -ge 1 && $k -eq 0 ]] && ok=0
+    outcome MS28 $ok "a TCP connect to 203.0.113.5 with no lookup: NET-028 records=$n (Medium, Log; kills=$k)" \
+        "a literal-IP connect draws no NET-028"
+    b=$(det_count)
+    python3 -I -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b"nn-ms", ("203.0.113.9", 18081))' &
+    p=$!; wait $p
+    sleep 3
+    n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --pid "$p")
+    ok=1; [[ $n -ge 1 ]] && ok=0
+    outcome MS28 $ok "a UDP send to 203.0.113.9 with no lookup: NET-028 records=$n" "a literal-IP UDP send draws no NET-028"
+    b=$(det_count)
+    timeout 6 curl -s -6 -m 3 -o /dev/null "http://[2001:db8::5]:18080/" &
+    p=$!; wait $p
+    sleep 2
+    n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --pid "$p")
+    ok=1; [[ $n -ge 1 ]] && ok=0
+    outcome MS28 $ok "an IPv6 connect to 2001:db8::5 with no lookup: NET-028 records=$n" "a literal-IPv6 connect draws no NET-028"
+    # a resolved connect: the process received the response (stub) or asked
+    # the name (nss-resolve) — no record
+    if getent ahostsv4 example.com >/dev/null 2>&1; then
+        b=$(det_count)
+        timeout 12 curl -s -4 -m 8 -o /dev/null http://example.com/ &
+        p=$!; wait $p
+        sleep 2
+        n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --pid "$p")
+        ok=1; [[ $n -eq 0 ]] && ok=0
+        outcome MS28 $ok "a connect to example.com, resolved by curl itself: NET-028 records=$n" \
+            "a resolved connect draws NET-028"
+        if getent ahostsv4 203-0-113-5.nip.io >/dev/null 2>&1; then
+            b=$(det_count)
+            timeout 6 curl -s -4 -m 3 -o /dev/null http://203-0-113-5.nip.io:18080/ &
+            p=$!; wait $p
+            sleep 2
+            n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --pid "$p")
+            ok=1; [[ $n -ge 1 ]] && ok=0
+            outcome MS28 $ok "a connect to 203-0-113-5.nip.io (a name that spells its address): NET-028 records=$n" \
+                "a name that only spells its address counts as resolved"
+        else
+            skip MS28 "nip.io does not resolve on this guest: the IP-in-the-name case not run"
+        fi
+    else
+        skip MS28 "example.com does not resolve on this guest: the resolved case not run"
+    fi
+fi
+
+# ── MS29: an inbound connection's rows (lot 275, C07) ─────────────────
+NETFLOW=/var/lib/northnarrow/netflow.jsonl
+if want MS29; then
+    before=$(sudo cat "$NETFLOW" 2>/dev/null | wc -l)
+    listen 0.0.0.0 18275 close 20 || bad MS29 "listener did not start"
+    for _ in 1 2 3; do python3 -I -c 'import socket; s=socket.create_connection(("127.0.0.1", 18275), 3); s.recv(1); s.close()' 2>/dev/null; done
+    sleep 2
+    stop_bg
+    rows=$(sudo tail -n "+$(( before + 1 ))" "$NETFLOW" 2>/dev/null \
+        | jq -c 'select(.inbound == true and .dst_port == 18275)' 2>/dev/null)
+    n=$(printf '%s' "$rows" | grep -c . )
+    acc=$(printf '%s' "$rows" | jq -r '"\(.comm)/\(.pid) from \(.src_addr)"' 2>/dev/null | sort -u | tr '\n' ' ')
+    ok=1; [[ $n -ge 3 && $acc == *python3* ]] && ok=0
+    outcome MS29 $ok "3 connects to a listener on :18275: inbound closed rows=$n, accepted by $acc" \
+        "no inbound rows (accepted connections are not observed)"
+fi
+
+# journal_since T PATTERN: lines of the agent's journal since T matching
+journal_since() { sudo journalctl --namespace=northnarrow -u northnarrow-agent --no-pager -q --since "$1" 2>/dev/null | grep -E "$2"; }
+
+# ── MS30: the DNS response sensor (lot 275, C07) ──────────────────────
+if want MS30; then
+    t0=$(date '+%F %T')
+    for _ in $(seq 5); do getent ahosts example.com >/dev/null 2>&1; getent ahosts localhost.localdomain >/dev/null 2>&1; sleep 1; done
+    line=""
+    for _ in $(seq 75); do
+        line=$(journal_since "$t0" 'source="?dns_answer"?.*records read since the last summary' | tail -1)
+        [[ -n $line ]] && break
+        sleep 1
+    done
+    ok=1; [[ -n $line ]] && ok=0
+    outcome MS30 $ok "the DNS response pump's summary: $(echo "$line" | grep -oE 'records=[0-9]+ decoded=[0-9]+.*' | cut -c1-160)" \
+        "no DNS response recorded"
+fi
+
+# ── MS31: a TLS client's fingerprint on its flow (lot 275, C07) ───────
+if want MS31; then
+    if timeout 15 curl -s -m 10 -o /dev/null https://example.com/ ; then
+        sleep 3
+        row=$(sudo tail -n 400 "$NETFLOW" 2>/dev/null | jq -c 'select(.dst_port == 443 and .sni == "example.com" and .ja3 != null and .ja4 != null)' 2>/dev/null | tail -1)
+        ok=1; [[ -n $row ]] && ok=0
+        outcome MS31 $ok "curl to example.com:443: closed row ja3 $(echo "$row" | jq -r .ja3 2>/dev/null) ja4 $(echo "$row" | jq -r .ja4 2>/dev/null)" \
+            "no fingerprint on the flow's row"
+    else
+        skip MS31 "https://example.com is not reachable from this guest"
+    fi
 fi
 
 # ── NEG: routine network use draws no Critical and no fan-out record ──

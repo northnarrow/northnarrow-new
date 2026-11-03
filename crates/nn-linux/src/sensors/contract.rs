@@ -72,8 +72,7 @@ pub mod attach {
     /// Part of [`DNS_ANSWER`]: `udpv6_recvmsg` not attached.
     pub const DNS_ANSWER_V4: &str = "fexit:udp_recvmsg (the receiver's buffer)";
     /// Lot 275: an outbound flow's first send when it is a ClientHello.
-    pub const TLS_HELLO: &str =
-        "fentry:tcp_sendmsg (the sender's buffer, a flow's first send)";
+    pub const TLS_HELLO: &str = "fentry:tcp_sendmsg (the sender's buffer, a flow's first send)";
     pub const OPEN_TRACEPOINT: &str = "tracepoint:syscalls/sys_enter_openat (user memory)";
 }
 
@@ -870,9 +869,13 @@ mod tests {
         let inb = source("net_inbound").unwrap().kernel_budgets[0].allows;
         assert!(inb.contains("256 at once, then 512") && inb.contains("2,048 at"));
         let ans = source("dns_answer").unwrap().kernel_budgets[0].allows;
-        assert!(ans.contains("64 responses at once, then 128") && ans.contains("2,048 at once, then"));
+        assert!(
+            ans.contains("64 responses at once, then 128") && ans.contains("2,048 at once, then")
+        );
         let tls = source("tls_hello").unwrap().kernel_budgets[0].allows;
-        assert!(tls.contains("64 hellos at once, then 32") && tls.contains("512 at once, then 256"));
+        assert!(
+            tls.contains("64 hellos at once, then 32") && tls.contains("512 at once, then 256")
+        );
         let dns = source("dns_query").unwrap().kernel_budgets[0].allows;
         assert!(
             dns.contains("64 queries at once, then 128")
