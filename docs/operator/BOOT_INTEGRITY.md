@@ -149,7 +149,8 @@ key look absent without unlinking it, which the deny hooks refuse: a bind
 mount over `/etc/northnarrow` on the host (no deny hook covers `mount(2)`),
 or a runtime drop-in (`BindPaths=`, `TemporaryFileSystem=` — with
 `ReadWritePaths=` reset, or systemd keeps the unit's bind of the same path)
-and a `cgroup.kill` of the agent's cgroup (allowed: tamper case C20). The
+and a `cgroup.kill` of the agent's cgroup (allowed then: tamper case C20;
+refused since lot 273 outside a trusted-installer window, section 9). The
 watchdog's respawn then minted a new key, published its public half over
 the old one in the view it saw, and signed every chain under it from then
 on: the signing identity reset, with one INFO line (`bootstrapped fresh
@@ -455,6 +456,11 @@ key's memory not locked in RAM or not out of core dumps: raise
 [the process model](https://github.com/northnarrow/northnarrow-new/blob/main/docs/architecture/PROCESS_MODEL.md) §8; the agent runs, with the core's
 capabilities on that thread).
 
+Lot 273 added two anti-tamper ones (section 9): the cgroup move guard not
+attached (the kernel's BTF has no `cgroup_procs_write_start`, or one of
+another shape) and a unit cgroup not protected (a process in no cgroup v2,
+a host without the v2 hierarchy, a cgroup that could not be read).
+
 An operator's choice of a weaker sensor (`--exec-sensor tracepoint`,
 `--file-open-sensor tracepoint`, `--dns-sensor sendmsg`) is recorded too:
 the trust level says what runs, not why.
@@ -479,7 +485,7 @@ How far this run's protection is measured, from the boot's own checks:
 
 The mandatory deny hooks are the 16 of `DENY_HOOKS` plus the optional ones
 the running kernel has (`OPTIONAL_DENY_HOOKS`), as the health line counts
-them. The host's own hardening (lockdown, Secure Boot, IMA, module
+them — since lot 273 the cgroup move guard's two among them (section 9). The host's own hardening (lockdown, Secure Boot, IMA, module
 signatures, kexec — `nn-admin host-check`) is not part of the level: it is
 listed next to it in the manifest. `nn-admin status --key` shows the level
 recomputed with the degradations recorded since the boot (a sensor that
@@ -621,3 +627,38 @@ not verify, or a file that is not one — recorded and removed`.
   deny hooks run`, or the ERROR / WARN of the other outcomes.
 - `capability manifest of this boot trust_level=… entry_hash=…`, and
   `trust level below L3` with the reasons when it is.
+- Lot 273: `anti-tamper cgroup: own unit cgroup registered in the pinned
+  PROTECTED_INODES before the bootstraps cgroup=… entries=…` (a restart,
+  under the previous agent's hooks), `anti-tamper cgroup: unit cgroup
+  registered in PROTECTED_INODES … pid=… cgroup=… entries=…` at the attach
+  (the agent, the live watchdog), `… watchdog unit cgroup registered …`
+  from the refresh, `… not a systemd service's cgroup — not protected`
+  (a test, an agent started by hand), `anti-tamper cgroup: move guard not
+  attached` with the reason, or the fresh re-attach lines of
+  `inode_permission` and `cgroup_procs_write_start`.
+
+## 9. The units' cgroups (lot 273)
+
+The agent's and the watchdog's unit cgroups are part of what the deny
+hooks protect (the mechanism, the systemd versions and the residual:
+[the anti-tamper trust model](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/ANTITAMPER_TRUST_MODEL.md),
+"Lot 273"). Outside a signed
+trusted-installer window a write-open of the units' `cgroup.kill` or
+`cgroup.freeze` — or of their slices' — is refused (`cgroup_kill`,
+`cgroup_freeze`), so are a child cgroup, a `chown` and an `rmdir` of a
+unit's directory (PID 1's `rmdir` of an empty one is let through), and the
+move of the agent, the watchdog or a worker to another cgroup
+(`cgroup_move`, the move guard). Each refusal is an `NN-L-AT-001`
+detection with the caller's pid, comm, uid and executable.
+
+At the start: the agent's own unit cgroup goes into the pinned
+`PROTECTED_INODES` right after its pid (phase 1's early registration,
+under the previous agent's hooks), then at the attach with the live
+watchdog's, before the deny hooks attach and before the stale-key prune;
+the watchdog registers its own at its start, and the agent's watchdog
+refresh registers a new watchdog's. The move guard attaches with the deny
+hooks: two more in `deny_expected` where the kernel has it, a signed
+degradation where it has not. A process outside a systemd service's cgroup
+— a privileged test's agent, an agent started by hand in a login scope —
+is not protected and not degraded: its cgroup is not the agent's.
+

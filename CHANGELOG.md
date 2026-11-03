@@ -621,6 +621,41 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- **Security (lot 273, C23): the agent and the watchdog can no longer be
+  killed, frozen or moved through their cgroups outside a signed
+  trusted-installer window** (`docs/design/ANTITAMPER_TRUST_MODEL.md`,
+  "Lot 273"; `docs/operator/BOOT_INTEGRITY.md` §9). On systemd 257 and
+  later `systemctl kill -s SIGKILL northnarrow-agent` (or the watchdog)
+  stopped the unit: the `task_kill` hook refused the signal to the main
+  process, and systemd then wrote the unit's `cgroup.kill`, a kernel kill
+  of the whole cgroup no signal hook sees (systemd 249, 252, 255 send
+  `kill(2)` to each process instead, and were refused). Any root shell
+  could do the same on every kernel from 5.14 — `echo 1 > cgroup.kill`,
+  `cgroup.freeze`, `systemctl freeze`, or a move of the agent's pid to a
+  cgroup of its own and a kill of that one. `RefuseManualStop=yes` held:
+  `systemctl stop` and `restart` were refused on every version; the stop
+  the R14 lab reported on Debian 13 was tamper case C33 comparing against
+  the agent C31 had already killed. Now the units' cgroups are in
+  `PROTECTED_INODES` (shared code in `antitamper-bpf`, registered by the
+  agent at its earliest start, at its attach and from its watchdog
+  refresh, and by the watchdog at its start): a write-open of the units'
+  `cgroup.kill` / `cgroup.freeze`, or their slices', is refused and signed
+  `cgroup_kill` / `cgroup_freeze`; a child cgroup, a `chown` and an `rmdir`
+  of a unit's directory are refused (PID 1 may remove an empty one: its
+  prune after a stop, `systemd-shutdown`'s trim). A new move guard — fexit
+  `cgroup_procs_write_start` and LSM `inode_permission`, an optional deny
+  pair attached where the kernel's BTF has the function in the shape it
+  reads — refuses moving a protected process to another cgroup
+  (`cgroup_move`, rate-limited like a signal). Every refusal is an
+  `NN-L-AT-001` detection naming the operation, with the caller's pid,
+  comm, uid and (new for every anti-tamper denial) executable; PID 1's
+  are `RelayedTamperAttempt`, the others `AntiTamperDenial`. Inside a
+  window everything works as before; host reboot and power-off are
+  unchanged. Tamper check: C15 (freeze) and C20 (`cgroup.kill`) now expect
+  a refusal, C33 reads the agent it checks, new C65–C76 (C76 inside a
+  window). Not refused (open): the units' resource limits (`memory.max`,
+  `cpu.max`, `pids.max`: reported as `integrity_drift`), cgroup v1
+  hierarchies, a thaw outside a window.
 - The nightly lab VM gate's red nights (lot 274; no product change). Six of
   the twelve nights from 22/10 to 02/11 failed. On every red Debian guest
   (Debian 12 `sync` on 24/10, 28/10, 01/11 and 02/11, Debian 13 `build`

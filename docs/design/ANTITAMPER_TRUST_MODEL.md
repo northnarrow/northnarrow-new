@@ -482,3 +482,133 @@ first minute, the successor right of EBPF-002), and the registration in
   reported by the integrity check (`unit_dropin`).
 - Kernel-internal attribute writes (IMA/EVM fix-ups through
   `__vfs_setxattr_noperm`) do not reach the hook; they are the kernel's.
+
+## Lot 273 — the units' cgroups: kill, freeze and moves
+
+**Goal.** Outside a signed trusted-installer window no process — PID 1
+included — kills or freezes the agent's or the watchdog's cgroup, or moves
+one of their processes out of it. Inside a window the operator's flows
+(upgrade, uninstall, a restart) work as before.
+
+**What it closed.** The `task_kill` hook sees the signals userland sends
+(`kill(2)`, `tgkill`, `rt_sigqueueinfo`, `pidfd_send_signal`); the kernel
+can end or stop a whole cgroup without one:
+
+- a write of `1` to the cgroup's `cgroup.kill` (5.14+) is a SIGKILL of
+  every process in it, sent by the kernel (`cgroup_kill()`), which no
+  `security_task_kill()` call sees;
+- a write of `1` to `cgroup.freeze` (5.2+) stops every process in it, and
+  a process moved into a frozen cgroup is frozen on arrival;
+- a protected process moved to another cgroup (a write of its pid to that
+  cgroup's `cgroup.procs`) can then be killed or frozen there, through a
+  cgroup nobody protects.
+
+Any root shell could do all three on every lab kernel (5.15 to 7.0).
+systemd made the first one the answer to `systemctl kill -s SIGKILL`:
+
+| systemd | `systemctl kill -s SIGKILL <unit>` (`unit_kill()`, `--kill-whom=all`) |
+|---|---|
+| 249, 252, 255, 256 | `kill(2)` of the main process, then `cg_kill_recursive()` of the rest with a set and a log function — `kill(2)` again, process by process: every one refused by `task_kill` ("Access denied") |
+| 257 and later | the same `kill(2)` of the main process (refused), then, for SIGKILL, `cg_kill_kernel_sigkill()`: a write to the unit's `cgroup.kill` — "Killed unit cgroup with SIGKILL on client request", the agent dead; 258 added `--kill-whom=cgroup` and `--kill-subgroup=`, the same write |
+
+`systemctl stop` and `restart` were never the way in: `RefuseManualStop=yes`
+refuses the job in `bus_unit_queue_job()` on every version (249 to 259 in
+the lab: "Operation refused, … may be requested by dependency only").
+The deviation the R14 lab saw for tamper case C33 on Debian 13 was C31's:
+C31's `systemctl kill -s SIGKILL` had killed the agent through
+`cgroup.kill`, the watchdog had started a new one, and C33 compared against
+the agent it had read before C31. No unit setting refuses `systemctl
+kill` (`RefuseManualStop=` covers jobs, not `KillUnit`; root passes
+polkit): the refusal has to be the kernel's.
+
+### Mechanism
+
+- **The entries** (`antitamper_bpf::cgroup_guard`, shared by the agent
+  and the watchdog): for each protected process in a systemd *service*
+  cgroup (`/<slice>.slice/…/<unit>.service`, cgroup v2), its unit's
+  directory, its `cgroup.kill`, `cgroup.freeze`, `cgroup.procs` and
+  `cgroup.threads`, and each ancestor slice's `cgroup.kill` and
+  `cgroup.freeze`, go into `PROTECTED_INODES` (`lstat`: a link is never
+  followed, a control file that is not a regular file refuses the
+  registration):
+
+  | entry | flags | refused outside a window, by any caller outside the family |
+  |---|---|---|
+  | the unit's directory | `MUTATE`, `NOCREATE`, `INIT_RMDIR` (bit 4) | a child cgroup (`inode_mkdir`), `chown`/`chmod`, a rename, an xattr, an `rmdir` — but PID 1's |
+  | its `cgroup.kill` | `MUTATE`, `WRITE`, `CGROUP_KILL` (bit 5) | a write-open (`file_open`), signed `cgroup_kill` |
+  | its `cgroup.freeze` | `MUTATE`, `WRITE`, `CGROUP_FREEZE` (bit 6) | a write-open, signed `cgroup_freeze` |
+  | its `cgroup.procs`, `cgroup.threads` | `MUTATE` | `chown`/`chmod` (a delegation) |
+  | each ancestor slice's `cgroup.kill`, `cgroup.freeze` | as the unit's | a write-open: a kill or freeze of the slice kills or freezes the unit with it |
+
+  The bits 5 and 6 only name the refusal (`fs_protect_denied_op`); bit 4
+  is the one exemption the deny adds (`fs_protect_init_may`): systemd
+  removes a unit's cgroup once its processes are gone — the kernel refuses
+  to remove a populated one (`EBUSY`) — and `systemd-shutdown` trims the
+  tree at the end of a shutdown. Refusing PID 1 there would leave the
+  directory behind and sign a refused attempt at every restart, for no
+  protection: an `rmdir` never removes a cgroup with a process in it.
+- **The move guard** (`agent-ebpf/src/cgroup_guard.rs`). A move is a write
+  to the *destination's* `cgroup.procs` — any cgroup's — and no LSM hook
+  names the moved task. The migration's permission check does run one:
+  `__cgroup_procs_write()` finds the task (`cgroup_procs_write_start()`),
+  then checks write access to the `cgroup.procs` of the source's and the
+  destination's common ancestor (`cgroup_attach_permissions()` →
+  `cgroup_may_write()` → `inode_permission(MAY_WRITE)`), in the writer's
+  thread, before anything moves. `cgroup_move_stash` (fexit
+  `cgroup_procs_write_start`, the returned task in the fourth context
+  slot) records, for the writing thread, a protected tgid that a caller
+  outside the family moves outside a window; `cgroup_move_deny` (LSM
+  `inode_permission`) refuses that thread's next write check — the
+  migration's —, once, within a second, and signs it (`cgroup_move`,
+  rate-limited per caller like a signal). Every other permission check
+  returns at the mask test or one lookup in a map that holds only refused
+  moves. `cgroup.threads` goes through the same function; `CLONE_INTO_CGROUP`
+  creates a process, it moves none. The guard is an optional deny pair:
+  attached where the kernel's BTF has `cgroup_procs_write_start` with three
+  parameters returning a `struct task_struct *` (5.14 to 7.0: the third
+  parameter, the lock state, changed type, not place), counted in
+  `deny_expected` there; elsewhere not attached and signed degraded.
+- **When.** The agent registers its own unit cgroup at its earliest start
+  (into the pinned map, under its predecessor's hooks, as
+  `preregister_self` does for its pid), again at the attach (the boot's
+  keys, kept by the stale-key prune) with the live watchdog's (the
+  `PROTECTED_PIDS` entry that survived the stale scan), and the watchdog's
+  again whenever its refresh verifies a new watchdog pid; the watchdog
+  registers its own at its start, once it is in `PROTECTED_PIDS`.
+- **Who.** A refused attempt is an `NN-L-AT-001` detection (`operation`
+  `cgroup_kill`, `cgroup_freeze`, `cgroup_move`, `rmdir`, `mkdir`,
+  `setattr`), its principal the pid, comm and uid the kernel recorded, its
+  `exe` the caller's executable as `/proc/<pid>/exe` named it when the
+  writer signed the row (while that pid still ran the recorded comm). A
+  caller that is PID 1 is systemd relaying `systemctl kill` / `freeze`:
+  `RelayedTamperAttempt` (ENGAGED); any other caller `AntiTamperDenial`
+  (COMBAT).
+- **Host shutdown.** Untouched: systemd's stop job sends signals (refused
+  until `systemd-shutdown`, as before), `systemd-shutdown` kills with
+  `kill(2)` (its carve-out) and its cgroup trim is PID 1's `rmdir`. No
+  `cgroup.kill` or `cgroup.freeze` is written on that path (systemd 249 to
+  259).
+
+### Residual
+
+- **Resource limits.** `memory.max`, `memory.high`, `cpu.max`, `pids.max`
+  of the units are not refused: systemd writes them whenever it realises a
+  unit (a start, a `set-property`), and a refusal there would sign
+  systemd's own maintenance. A change is reported (`integrity_drift`,
+  `limit_changed`; tamper case C12). `memory.max` set below the agent's
+  use ends in an OOM kill of the unit — a follow-up: refuse the writers
+  that are not PID 1, and make `set-property` of the units a detection.
+- **Thaw.** A thaw is a write-open of `cgroup.freeze` too: outside a
+  window it is refused like a freeze. A unit frozen inside a window must
+  be thawed inside one.
+- **cgroup v1.** Only the v2 hierarchy is protected; a v1 `freezer` or
+  `name=systemd` hierarchy (a hybrid host) is not, and its `cgroup.procs`
+  path checks no inode, so the move guard does not see it. A process in no
+  v2 cgroup, or a host without one, is a signed degradation.
+- **Handles opened earlier.** A descriptor of `cgroup.kill` opened for
+  writing inside a window (or before the agent registered a fresh unit
+  cgroup) keeps working: the deny is at open, as for every protected file.
+- **The fresh cgroup at a restart.** systemd makes a new unit cgroup for
+  every start; until the new agent's earliest registration (its first
+  milliseconds; on a first boot, until its attach) that cgroup is not
+  protected. The watchdog's: until its own registration at its start.

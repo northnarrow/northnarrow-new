@@ -700,7 +700,16 @@ the adversary this agent is built against. Outside a window `systemctl
 kill` fails with "Access denied"; the attempt is a signed detection
 (NN-L-AT-001, "on behalf of a `systemctl stop` / `kill` / `restart`") and
 raises the posture to ENGAGED — never COMBAT: systemd is the relay, not the
-offender, and the requester is not known.
+offender, and the requester is not known. On systemd 257 and later
+`systemctl kill -s SIGKILL` then writes the unit's `cgroup.kill` (the
+kernel's kill of the whole cgroup, which no signal hook sees): that write
+is refused too and signed `cgroup_kill` (lot 273), as are `systemctl
+freeze` and `systemctl thaw` (`cgroup.freeze`, signed `cgroup_freeze`), a
+child cgroup, an `rmdir` or a `chown` of the unit's cgroup, and moving the
+agent or the watchdog to another cgroup (`cgroup_move`) — by any process,
+root's shell as well as systemd. Inside a window all of it works: the
+maintenance below, and `install.sh`/`uninstall.sh`'s SIGKILL fallback,
+are unchanged. A unit frozen inside a window must be thawed inside one.
 
 To restart, for example after `nn-admin config overlay set`:
 
