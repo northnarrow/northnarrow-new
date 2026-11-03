@@ -270,6 +270,51 @@ def cmd_cgmove(pid, comm, start, procs):
     print("moved %s to %s" % (pid, procs))
     return 0
 
+def cmd_v1move(pid, comm, start, procs):
+    # lot 273b: move process <pid> (checked as cgmove does) into a cgroup v1
+    # hierarchy the case mounted under /run/nn-lab-v1/
+    cur, why = resolve(pid, comm, start)
+    if cur is None:
+        print("target=absent (%s)" % why)
+        return 3
+    if not procs.endswith("/cgroup.procs") or not procs.startswith("/run/nn-lab-v1/"):
+        print("setup: %r is not a cgroup.procs under /run/nn-lab-v1" % procs)
+        return 2
+    try:
+        fd = os.open(procs, os.O_WRONLY | os.O_NOFOLLOW)
+        try:
+            os.write(fd, pid.encode())
+        finally:
+            os.close(fd)
+    except OSError as e:
+        print("move %s to %s: errno=%s" % (pid, procs, ename(e.errno)))
+        return 1
+    print("moved %s to %s" % (pid, procs))
+    return 0
+
+def cmd_fdlater(path, value, secs):
+    # lot 273b: open <path> for writing now (inside a window, before a
+    # registration), write <value> through that descriptor <secs> seconds
+    # later; what the write said
+    if not secs.isdigit() or int(secs) > 300:
+        print("setup: bad delay %r" % secs)
+        return 2
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as e:
+        print("open %s: errno=%s (the descriptor was not opened)" % (path, ename(e.errno)))
+        return 2
+    try:
+        time.sleep(int(secs))
+        os.write(fd, value.encode())
+    except OSError as e:
+        print("write %r through the earlier descriptor of %s: errno=%s" % (value, path, ename(e.errno)))
+        return 1
+    finally:
+        os.close(fd)
+    print("wrote %r through the earlier descriptor of %s" % (value, path))
+    return 0
+
 def file_id(path, kind):
     st = os.lstat(path)
     out = "%d:%d" % (st.st_dev, st.st_ino)
@@ -467,7 +512,7 @@ def cmd_strip_sig(src, dst):
 #                     field — the second of the line — is ERROR
 AT_RULE = "NN-L-AT-001"
 TOKEN = re.compile(r"[A-Za-z0-9_-]{1,80}")
-OPNAME = re.compile(r"[a-z_]{1,40}")
+OPNAME = re.compile(r"[a-z][a-z_0-9]{0,39}")  # lot 273b: `cgroup_v1`
 SGR = re.compile(r"\x1b\[[0-9;]*m")
 AUDIT_MARKS = (("ended", "abrupt", "prev_run_abrupt"),
                ("kind", "unauthorized_overlay", "unauthorized_overlay"),
@@ -715,6 +760,26 @@ def selftest():
     body = b"\x7fELF module"
     signed = body + b"S" * 7 + bytes(8) + (7).to_bytes(4, "big") + MODULE_SIG_MAGIC
     check(strip_signature(signed) == body and strip_signature(body) == body, "module signature stripped")
+    # lot 273b: the v1 move writes only under /run/nn-lab-v1, the earlier
+    # descriptor's delay is bounded, an unopened file is a setup failure
+    v1child = subprocess.Popen(["sleep", "30"])
+    try:
+        for _ in range(100):
+            cur = ident(str(v1child.pid))
+            if cur and cur[0] == "sleep":
+                break
+            time.sleep(0.02)
+        rc, out = quiet(cmd_v1move, str(v1child.pid), "sleep", cur[2], "/sys/fs/cgroup/cgroup.procs")
+        check(rc == 2 and out.startswith("setup:"), "v1move refuses another tree: %r" % out)
+    finally:
+        v1child.kill()
+        v1child.wait()
+    rc, out = quiet(cmd_fdlater, "/nonexistent/x", "0", "1")
+    check(rc == 2 and "errno=ENOENT" in out and "not opened" in out, "fdlater: a file that is not there: %r" % out)
+    rc, out = quiet(cmd_fdlater, "/dev/null", "0", "x")
+    check(rc == 2 and out.startswith("setup:"), "fdlater: a bad delay: %r" % out)
+    rc, out = quiet(cmd_fdlater, "/dev/null", "0", "0")
+    check(rc == 0 and "wrote" in out, "fdlater writes through its descriptor: %r" % out)
     rc, out = quiet(cmd_finit, "/nonexistent/nn.ko")
     check(rc == 2 and out.startswith("setup:") and "errno=" not in out and "denied" not in out,
           "a missing input is a setup failure, not a refusal: %r" % out)
@@ -730,7 +795,8 @@ def main(argv):
         "evidence": (cmd_evidence, 4), "syscall-nr": (cmd_syscall_nr, 1),
         "finit": (cmd_finit, 1), "kexec-file": (cmd_kexec_file, 2),
         "kexec-unload": (cmd_kexec_unload, 0), "strip-sig": (cmd_strip_sig, 2),
-        "cgmove": (cmd_cgmove, 4),
+        "cgmove": (cmd_cgmove, 4), "v1move": (cmd_v1move, 4),
+        "fdlater": (cmd_fdlater, 3),
     }
     if argv and argv[0] == "file" and len(argv) in (3, 4):
         return cmd_file(*argv[1:])
@@ -1363,6 +1429,13 @@ selected C07 && pin_list > "$SCRATCH/pins.before"
 POST=$(post post_pins_kept "$SCRATCH/pins.before") \
 run_case C07 "rm -rf the bpffs pin root" denied "deny=unlink" 0 -- bash -c "rm -rf $PINS"
 run_case C08 "bpftool map update on PROTECTED_PIDS (pinned)" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- bpftool map update pinned "$PINS/PROTECTED_PIDS" key 1 0 0 0 value 1
+# Lot 273b: where the update went through (a lab build's BPF guard only
+# observes), PID 1 is now in the agent's family — every later case of
+# systemd's (C12's set-property) would be let through: take it out again
+if selected C08 && [[ "$BPF_EXPECT" == allowed ]]; then
+    bpftool map delete pinned "$PINS/PROTECTED_PIDS" key 1 0 0 0 >/dev/null 2>&1
+    restored C08 "PID 1 out of PROTECTED_PIDS" absent "$(bpftool map lookup pinned "$PINS/PROTECTED_PIDS" key 1 0 0 0 >/dev/null 2>&1 && echo present || echo absent)"
+fi
 run_case C09 "bpftool link show pinned (link handle)" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_link" 0 -- bpftool link show pinned "$PINS/link_task_kill"
 # ── BPF ecosystem ─────────────────────────────────────────────────────────
 run_case C10 "bpftool feature probe (loads test programs)" allowed "NN-L-BPF-001" 0 -- bash -c "bpftool feature probe kernel >/dev/null"
@@ -1388,17 +1461,39 @@ fi
 # and its cgroup's memory.max must read as before; `--only C12` used to
 # leave the 4G cap in force until some later reload.
 if selected C12; then
-    CG_MEMMAX=/sys/fs/cgroup/system.slice/northnarrow-agent.service/memory.max
+    # Lot 273b: `set-property` of the agent outside a window is refused —
+    # PID 1's write of memory.max below the value the unit started with,
+    # and the drop-in in the unit's system.control directory (NOCREATE).
+    # systemd may answer the client with success and log the failures:
+    # the case is judged by its effect (memory.max and the drop-in as
+    # before, the agent alive) and by the signed refusal.
+    CGROOT=/sys/fs/cgroup
+    AG_CG=$(systemctl show -p ControlGroup --value northnarrow-agent 2>/dev/null)
+    CG_MEMMAX=$CGROOT${AG_CG:-/system.slice/northnarrow-agent.service}/memory.max
+    CTL=/run/systemd/system.control/northnarrow-agent.service.d
     MM0=$(systemctl show -p MemoryMax --value northnarrow-agent.service 2>/dev/null)
     CGMM0=$(cat "$CG_MEMMAX" 2>/dev/null)
-    WAIT=40 run_case C12 "systemctl set-property --runtime MemoryMax (OOM path)" allowed "integrity_drift" 0 -- systemctl set-property --runtime northnarrow-agent.service MemoryMax=4G
-    # resetting the property still leaves an (empty) runtime drop-in behind
-    rm -f /run/systemd/system.control/northnarrow-agent.service.d/50-MemoryMax.conf
+    PID=$(agent_pid); START=$(proc_start "$PID")
+    t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+    sleep 1
+    out=$(timeout 60 systemctl set-property --runtime northnarrow-agent.service MemoryMax=4G 2>&1); rc=$?
+    sleep 6; ev=$(evidence "$t0" "$a0" "$d0")
+    now=$(cat "$CG_MEMMAX" 2>/dev/null)
+    if [[ "$now" == "$CGMM0" && ! -e $CTL/50-MemoryMax.conf ]] && post_proc "${PID:-0}" "${START:-0}" northnarrow-age >/dev/null \
+       && echo "$ev" | grep -qE "deny=cgroup_limit|deny=create"; then
+        v=OK; st="denied (memory.max kept at $now; systemctl rc=$rc$( [[ -n $out ]] && echo ": $(echo "$out" | head -1 | cut -c1-60 | tr '|' '/')"))"
+    else
+        v="DEVIATION (memory.max $CGMM0 -> ${now:-?}, drop-in $([[ -e $CTL/50-MemoryMax.conf ]] && echo present || echo absent), rc=$rc)"; fail=1; st="allowed"
+    fi
+    rows+=("| C12 | systemctl set-property --runtime MemoryMax=4G of the agent (no window) | $st | $ev | $v |")
+    echo "C12 set-property MemoryMax=4G → $st; $ev; $v" >&2
+    # a drop-in that got through, and what a reload makes of it
+    rm -f "$CTL/50-MemoryMax.conf"
     systemctl daemon-reload
-    # a systemd that does not apply the unit's value to a running cgroup at
-    # a reload: write it back where the case changed it
     if [[ -n $CGMM0 && "$(cat "$CG_MEMMAX" 2>/dev/null)" != "$CGMM0" ]]; then
-        echo "$CGMM0" > "$CG_MEMMAX" 2>/dev/null
+        grant_window 30; echo "$CGMM0" > "$CG_MEMMAX" 2>/dev/null
+        # the next case must not run inside that window
+        for i in $(seq 1 40); do window_open || break; sleep 1; done
     fi
     restored C12 "MemoryMax of the unit" "$MM0" "$(systemctl show -p MemoryMax --value northnarrow-agent.service 2>/dev/null)"
     restored C12 "memory.max of its cgroup" "$CGMM0" "$(cat "$CG_MEMMAX" 2>/dev/null)"
@@ -1463,6 +1558,36 @@ post_thawed() {   # <cgroup.freeze>
     [[ "$(cat "$1" 2>/dev/null)" == 0 ]] || { echo "${1%/*} is frozen"; return 1; }
 }
 post_gone() { [[ ! -e "$1" ]] || { echo "$1 exists"; return 1; }; }
+# lot 273b: a cgroup or proc file still holds its value
+post_value() {   # <file> <value>
+    local now; now=$(cat "$1" 2>/dev/null)
+    [[ "$now" == "$2" ]] || { echo "${1##*/} is ${now:-?}, not $2"; return 1; }
+}
+# lot 273b: after a propagated stop (C78), the agent unit active again —
+# a unit systemd left failed or inactive with the agent still running is
+# reset and started (the start finds the running agent's pidfile lock)
+unit_back() {   # <id>
+    local st p i; st=$(systemctl is-active northnarrow-agent 2>/dev/null)
+    if [[ "$st" != active ]]; then
+        p=$(agent_pid 0)
+        echo "    $1: the agent unit is $st (the agent ${p:-not running}) — ended inside a window, the unit started" >&2
+        # systemd relays the signal inside the window (the operator's
+        # path, docs/operator §3.7) — a root shell's own kill would be a
+        # refused tamper of this script, the actor COMBAT ends
+        grant_window 90
+        if [[ -n $p ]]; then
+            systemctl kill -s SIGTERM northnarrow-agent >/dev/null 2>&1
+            for i in $(seq 1 30); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+        fi
+        systemctl reset-failed northnarrow-agent >/dev/null 2>&1
+        systemctl start northnarrow-agent >/dev/null 2>&1
+        for i in $(seq 1 60); do [[ "$(systemctl is-active northnarrow-agent 2>/dev/null)" == active ]] && break; sleep 1; done
+        systemctl is-active --quiet northnarrow-watchdog || systemctl start northnarrow-watchdog >/dev/null 2>&1
+        sleep 20
+        for i in $(seq 1 90); do window_open || break; sleep 1; done
+    fi
+    restored "$1" "the agent unit" active "$(systemctl is-active northnarrow-agent 2>/dev/null)"
+}
 CG=$CGROOT${AG_CG:-/system.slice/northnarrow-agent.service}/cgroup.freeze
 if [[ -w "$CG" ]]; then
     selected C15 && CG_FROZEN=$CG   # thawed by the trap if the run stops here
@@ -1498,7 +1623,12 @@ if selected C18; then
         skipped_case C18 "the agent's oom_score_adj could not be read" 0
     else
         OOM_RESTORE="$PID $(proc_start "$PID") $OOM0"
-        WAIT=40 run_case C18 "raise the agent's oom_score_adj to 900" allowed "integrity_drift" 0 -- bash -c "echo 900 > /proc/$PID/oom_score_adj"
+        # Lot 273b (the review of #489): refused outside a window — 900 or
+        # 1000 makes the agent the OOM killer's first victim, whose SIGKILL
+        # no task_kill hook sees (it was allowed and reported as
+        # integrity_drift)
+        POST="$(post post_proc "$PID" "$(proc_start "$PID")" northnarrow-age) && $(post post_value "/proc/$PID/oom_score_adj" "$OOM0")" \
+        run_case C18 "raise the agent's oom_score_adj to 900 (no window)" denied "deny=oom_adj" 0 -- nnpy file write "/proc/$PID/oom_score_adj" 900
         oom_restore
     fi
 fi
@@ -1707,7 +1837,7 @@ fi
 # files are written "0" (a no-op if the open went through: ERANGE for
 # cgroup.kill). Inside a window it is all allowed (C76, at the end).
 if [[ ! -e $CGROOT/cgroup.controllers || -z "$AG_CG" || -z "$WD_CG" ]]; then
-    skipped_case C65,C66,C67,C68,C69,C70,C71,C72,C73,C74,C75 "no cgroup v2 hierarchy, or a unit without a ControlGroup" 0
+    skipped_case C65,C66,C67,C68,C69,C70,C71,C72,C73,C74,C75,C77a,C77b,C78a,C78b,C78c,C79,C80,C81,C81b,C82,C83,C83b,C84,C85,C86 "no cgroup v2 hierarchy, or a unit without a ControlGroup" 0
 else
     PID=$(agent_pid); START=$(proc_start "$PID")
     WDPID=$(wd_pid); WDSTART=$(proc_start "$WDPID")
@@ -1778,6 +1908,231 @@ else
         run_case C74 "chown the agent's cgroup.procs (a delegation, no window)" denied "deny=setattr" 0 -- nnpy file chown "$CGROOT$AG_CG/cgroup.procs" 65534
         [[ "$(stat -c %u "$CGROOT$AG_CG/cgroup.procs" 2>/dev/null)" == "${OWN0:-0}" ]] || chown "${OWN0:-0}" "$CGROOT$AG_CG/cgroup.procs" 2>/dev/null
         restored C74 "the owner of the agent's cgroup.procs" "${OWN0:-0}" "$(stat -c %u "$CGROOT$AG_CG/cgroup.procs" 2>/dev/null)"
+    fi
+    # ── lot 273b: the moves systemd makes, the stops it propagates ──────
+    # C77: a transient scope with the agent's pid in it (StartTransientUnit
+    # with PIDs=), and the agent attached to an existing unit
+    # (AttachProcessesToUnit, systemd 238+): PID 1 moves the pid, the move
+    # guard refuses it.
+    # systemd answers StartTransientUnit with a job whatever the attach
+    # did: the case is judged by its effect (the agent in its own cgroup)
+    # and by the signed refusal.
+    if selected C77a; then
+        PID=$(agent_pid); START=$(proc_start "$PID")
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        sleep 1
+        out=$(busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager \
+            StartTransientUnit 'ssa(sv)a(sa(sv))' nn-lab-c77.scope fail 1 PIDs au 1 "${PID:-0}" 0 2>&1); rc=$?
+        sleep 4; ev=$(evidence "$t0" "$a0" "$d0")
+        now=$(cg_of "$PID")
+        if [[ "$now" == "$AG_CG" ]] && post_proc "${PID:-0}" "${START:-0}" northnarrow-age >/dev/null && echo "$ev" | grep -q "deny=cgroup_move"; then
+            v=OK; st="denied (the agent kept in $AG_CG; busctl rc=$rc: $(echo "$out" | head -1 | cut -c1-50 | tr '|' '/'))"
+        else
+            v="DEVIATION (the agent in ${now:-?}, busctl rc=$rc)"; fail=1; st="allowed"
+        fi
+        rows+=("| C77a | a transient scope with the agent's pid (StartTransientUnit PIDs=, no window) | $st | $ev | $v |")
+        echo "C77a a transient scope with the agent's pid → $st; $ev; $v" >&2
+        # an agent the scope took is put back (its scope then stopped)
+        if [[ "$(cg_of "$PID")" != "$AG_CG" ]]; then
+            grant_window 30; nnpy cgmove "$PID" northnarrow-age "$START" "$CGROOT$AG_CG/cgroup.procs" >/dev/null 2>&1
+            for i in $(seq 1 40); do window_open || break; sleep 1; done
+        fi
+    fi
+    systemctl stop nn-lab-c77.scope >/dev/null 2>&1; systemctl reset-failed nn-lab-c77.scope >/dev/null 2>&1
+    if selected C77b; then
+        systemd-run --unit=nn-lab-c77b --property=Delegate=yes /bin/sleep 120 >/dev/null 2>&1
+        PID=$(agent_pid); START=$(proc_start "$PID")
+        POST="$(post post_proc "${PID:-0}" "${START:-0}" northnarrow-age) && $(post post_cgroup "${PID:-0}" "$AG_CG")" \
+        run_case C77b "attach the agent's pid to another unit (AttachProcessesToUnit, no window)" denied "deny=cgroup_move" 0 -- \
+            busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager \
+            AttachProcessesToUnit 'ssau' nn-lab-c77b.service "" 1 "${PID:-0}"
+        systemctl stop nn-lab-c77b.service >/dev/null 2>&1; systemctl reset-failed nn-lab-c77b.service >/dev/null 2>&1
+    fi
+    # C78: stops systemd propagates — not a manual stop of the unit, so
+    # RefuseManualStop= does not apply: a started unit with Conflicts= on
+    # the agent, and an isolate to a target that wants every active unit
+    # but the agent and the watchdog. systemd's stop job signals the agent
+    # (refused) and, on 257+, writes its cgroup.kill (refused). The agent
+    # must keep running; systemd's view of the unit is recorded.
+    if selected C78a; then
+        # a stop job, not a manual stop: systemd runs it — the agent must
+        # outlive it (its signals refused, and on 257+ its cgroup.kill);
+        # what systemd then records of the unit is reported
+        PID=$(agent_pid); START=$(proc_start "$PID")
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        sleep 1
+        out=$(systemd-run --unit=nn-lab-c78a --property=Conflicts=northnarrow-agent.service --property=Type=oneshot --property=RemainAfterExit=yes /bin/true 2>&1); rc=$?
+        sleep 15; ev=$(evidence "$t0" "$a0" "$d0")
+        ust="$(systemctl is-active northnarrow-agent 2>/dev/null)/$(systemctl show -p SubState --value northnarrow-agent 2>/dev/null)"
+        if post_proc "${PID:-0}" "${START:-0}" northnarrow-age >/dev/null && echo "$ev" | grep -qE "deny=signal|deny=cgroup_kill"; then
+            v=OK; st="denied (the agent $PID outlived the stop job; systemd records the unit $ust)"
+        else
+            v="DEVIATION (the agent $PID is gone or no refusal signed; the unit $ust)"; fail=1; st="allowed"
+        fi
+        rows+=("| C78a | start a unit with Conflicts=northnarrow-agent.service (no window) | $st | $ev | $v |")
+        echo "C78a a Conflicts= unit → $st; $ev; $v" >&2
+        systemctl stop nn-lab-c78a >/dev/null 2>&1; systemctl reset-failed nn-lab-c78a >/dev/null 2>&1
+        unit_back C78a
+    fi
+    if selected C78b; then
+        T=/run/systemd/system/nn-lab-c78.target
+        { echo "[Unit]"; echo "Description=lab C78b: every active unit but NorthNarrow's"; echo "AllowIsolate=yes"
+          systemctl list-units --state=active --no-legend --plain 2>/dev/null | awk '{print $1}' \
+            | grep -vE '^northnarrow-|\.(device|scope|slice)$|^nn-lab-|^(multi-user|graphical|default)\.target$' | sed 's/^/Wants=/'; } > "$T"
+        systemctl daemon-reload
+        # lot 273b: both units carry IgnoreOnIsolate=yes — systemd queues no
+        # stop for them (without it, C78a's stop job). The target wants
+        # every active unit but NorthNarrow's and the targets that pull
+        # them in (multi-user, graphical): the isolate stops nothing else.
+        PID=$(agent_pid); START=$(proc_start "$PID")
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        sleep 1
+        out=$(systemctl isolate nn-lab-c78.target 2>&1); rc=$?
+        sleep 15; ev=$(evidence "$t0" "$a0" "$d0")
+        ust="$(systemctl is-active northnarrow-agent 2>/dev/null)/$(systemctl show -p SubState --value northnarrow-agent 2>/dev/null)"
+        if post_proc "${PID:-0}" "${START:-0}" northnarrow-age >/dev/null && [[ $ust == active/* ]]; then
+            v=OK; st="denied (the agent $PID kept, the unit $ust: not stopped by the isolate)"
+        else
+            v="DEVIATION (the agent $PID $(post_proc "${PID:-0}" "${START:-0}" northnarrow-age >/dev/null && echo kept || echo gone), the unit $ust)"; fail=1; st="allowed"
+        fi
+        rows+=("| C78b | systemctl isolate a target without NorthNarrow's units (no window) | $st | $ev | $v |")
+        echo "C78b isolate → $st; $ev; $v" >&2
+        systemctl isolate default.target >/dev/null 2>&1 || systemctl isolate multi-user.target >/dev/null 2>&1
+        rm -f "$T"; systemctl daemon-reload
+        unit_back C78b
+    fi
+    # stopping the agent's slice (system.slice) is a propagated stop as
+    # C78a's, and it stops the lab's sshd with it: not run here
+    skipped_case C78c "systemctl stop system.slice: the stop job of C78a's kind, and the guest's sshd is in that slice" 1
+    # C86 (lot 273b): a unit of the agent's slice started and stopped —
+    # systemd 254 and 255 thaw the slices up the tree at every start and
+    # stop (a write of 0 to system.slice/cgroup.freeze) and rewrite their
+    # siblings' cgroup xattrs: PID 1's thaw and xattrs go through, nothing
+    # is refused nor signed
+    if selected C86; then
+        # started, then stopped by systemctl (systemd thaws a realised
+        # unit's slices at its stop on 254/255; its start realises the
+        # slice's other units on 257+)
+        EV_FORBID="deny=cgroup_freeze|deny=xattr|deny=cgroup_limit" \
+        run_case C86 "a unit of the agent's slice started and stopped (systemd's own thaw and xattrs)" allowed "" 0 -- \
+            bash -c 'systemd-run --quiet --unit=nn-lab-c86 /bin/sleep 60 && sleep 2 && systemctl stop nn-lab-c86 && systemctl restart cron 2>/dev/null; true'
+        EV_FORBID=
+        systemctl stop nn-lab-c86 >/dev/null 2>&1; systemctl reset-failed nn-lab-c86 >/dev/null 2>&1
+    fi
+    # ── lot 273b: the units' and slices' resource limits ────────────────
+    if [[ -e $CGROOT$AG_CG/memory.max ]]; then
+        PID=$(agent_pid); START=$(proc_start "$PID")
+        MM0=$(cat "$CGROOT$AG_CG/memory.max" 2>/dev/null)
+        POST="$(post post_proc "${PID:-0}" "${START:-0}" northnarrow-age) && $(post post_value "$CGROOT$AG_CG/memory.max" "$MM0")" \
+        run_case C79 "memory.max of the agent's unit to 1 page (an OOM kill inside the write, no window)" denied "deny=cgroup_limit" 0 -- nnpy file write "$CGROOT$AG_CG/memory.max" 4096
+    else
+        skipped_case C79 "no memory.max in the agent's cgroup (memory controller off)" 1
+    fi
+    if [[ -n "$AG_SLICE" && -e "$CGROOT$AG_SLICE/pids.max" ]]; then
+        PM0=$(cat "$CGROOT$AG_SLICE/pids.max" 2>/dev/null)
+        POST=$(post post_value "$CGROOT$AG_SLICE/pids.max" "$PM0") \
+        run_case C80 "pids.max of the agent's slice ${AG_SLICE} to 1 (no window)" denied "deny=cgroup_limit" 0 -- nnpy file write "$CGROOT$AG_SLICE/pids.max" 1
+        # a write that went through (a build without lot 273b) is undone
+        [[ "$(cat "$CGROOT$AG_SLICE/pids.max" 2>/dev/null)" == "$PM0" ]] || echo "$PM0" > "$CGROOT$AG_SLICE/pids.max" 2>/dev/null
+        restored C80 "the slice's pids.max" "$PM0" "$(cat "$CGROOT$AG_SLICE/pids.max" 2>/dev/null)"
+    else
+        skipped_case C80 "no pids.max in the agent's slice (${AG_SLICE:-root})" 1
+    fi
+    if [[ -e $CGROOT$WD_CG/cpu.max ]]; then
+        CM0=$(cat "$CGROOT$WD_CG/cpu.max" 2>/dev/null)
+        POST=$(post post_value "$CGROOT$WD_CG/cpu.max" "$CM0") \
+        run_case C81 "cpu.max of the watchdog's unit to 0.1 % (no window)" denied "deny=cgroup_limit" 0 -- nnpy file write "$CGROOT$WD_CG/cpu.max" "1000 1000000"
+        [[ "$(cat "$CGROOT$WD_CG/cpu.max" 2>/dev/null)" == "$CM0" ]] || echo "$CM0" > "$CGROOT$WD_CG/cpu.max" 2>/dev/null
+        restored C81 "the watchdog's cpu.max" "$CM0" "$(cat "$CGROOT$WD_CG/cpu.max" 2>/dev/null)"
+    else
+        skipped_case C81 "no cpu.max in the watchdog's cgroup (cpu controller off)" 1
+    fi
+    if [[ -e $CGROOT$AG_CG/cpu.idle ]]; then
+        POST=$(post post_value "$CGROOT$AG_CG/cpu.idle" 0) \
+        run_case C81b "cpu.idle of the agent's unit to 1 (no window)" denied "deny=cgroup_limit" 0 -- nnpy file write "$CGROOT$AG_CG/cpu.idle" 1
+        [[ "$(cat "$CGROOT$AG_CG/cpu.idle" 2>/dev/null)" == 0 ]] || echo 0 > "$CGROOT$AG_CG/cpu.idle" 2>/dev/null
+        restored C81b "the agent's cpu.idle" 0 "$(cat "$CGROOT$AG_CG/cpu.idle" 2>/dev/null)"
+    else
+        skipped_case C81b "no cpu.idle in the agent's cgroup (cpu controller off, or a kernel before 5.15)" 1
+    fi
+    # C82: a descriptor opened inside a window (as one opened before the
+    # agent's first start) writes after it closed: refused at the write.
+    # The agent's cgroup.freeze, written 0 (a no-op if it went through).
+    if selected C82; then
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        grant_window 8; sleep 1
+        out=$(nnpy fdlater "$CGROOT$AG_CG/cgroup.freeze" 0 20 2>&1); rc=$?
+        sleep 3; ev=$(evidence "$t0" "$a0" "$d0")
+        st=$(outcome_of "$out" held)
+        if [[ "$st" == denied ]] && echo "$ev" | grep -qE "deny=cgroup_freeze"; then v=OK; else v="DEVIATION (expected denied: $(echo "$out" | head -1 | cut -c1-80 | tr '|' '/'))"; fail=1; fi
+        rows+=("| C82 | write the agent's cgroup.freeze through a descriptor opened inside a window, after it closed | $st | $ev | $v |")
+        echo "C82 an earlier descriptor of cgroup.freeze → $st; $ev; $v" >&2
+        for i in $(seq 1 30); do window_open || break; sleep 1; done
+    fi
+    # C83: the cgroup v1 freezer (the review of #489, R1): mounted by root on
+    # a host whose systemd runs the unified hierarchy, the agent moved into
+    # it and frozen — refused at the move's and the freeze's write-open.
+    if selected C83; then
+        V1=/run/nn-lab-v1
+        mkdir -p "$V1"
+        if mount -t cgroup -o freezer nn-lab-v1 "$V1" 2>/dev/null; then
+            mkdir -p "$V1/c83" 2>/dev/null
+            PID=$(agent_pid); START=$(proc_start "$PID")
+            POST=$(post post_proc "${PID:-0}" "${START:-0}" northnarrow-age) \
+            run_case C83 "the agent moved into a mounted cgroup v1 freezer (no window)" denied "deny=cgroup_v1" 0 -- nnpy v1move "${PID:-0}" northnarrow-age "${START:-0}" "$V1/c83/cgroup.procs"
+            if [[ -e $V1/c83/freezer.state ]]; then
+                run_case C83b "FROZEN into the v1 freezer's freezer.state (no window)" denied "deny=cgroup_v1" 0 -- nnpy file write "$V1/c83/freezer.state" FROZEN
+                echo THAWED > "$V1/c83/freezer.state" 2>/dev/null
+            fi
+            # back to the v1 root, then gone (a deviation leaves nothing)
+            [[ -n $PID ]] && echo "$PID" > "$V1/cgroup.procs" 2>/dev/null
+            rmdir "$V1/c83" 2>/dev/null; umount "$V1" 2>/dev/null; rmdir "$V1" 2>/dev/null
+            restored C83 "$V1" absent "$(mountpoint -q "$V1" 2>/dev/null && echo mounted || echo absent)"
+        else
+            skipped_case C83,C83b "this kernel mounts no cgroup v1 freezer (cgroup_no_v1=, or v1 built out)" 1
+        fi
+    fi
+    # C84: the agent's oom_score_adj through a thread's
+    # /proc/<pid>/task/<tid> (C18 writes /proc/<pid>): the value is the
+    # process's, the file another
+    PID=$(agent_pid)
+    OA0=$(cat /proc/"${PID:-0}"/oom_score_adj 2>/dev/null)
+    TID=$(ls /proc/"${PID:-0}"/task 2>/dev/null | grep -vx "${PID:-0}" | head -1)
+    if [[ -n $TID ]]; then
+        POST=$(post post_value /proc/"${PID:-0}"/oom_score_adj "${OA0:-0}") \
+        run_case C84 "oom_score_adj of an agent thread to 1000 (/proc/<pid>/task/<tid>, no window)" denied "deny=oom_adj" 0 -- nnpy file write /proc/"${PID:-0}"/task/"$TID"/oom_score_adj 1000
+        [[ "$(cat /proc/"${PID:-0}"/oom_score_adj 2>/dev/null)" == "${OA0:-0}" ]] || echo "${OA0:-0}" > /proc/"${PID:-0}"/oom_score_adj 2>/dev/null
+        restored C84 "the agent's oom_score_adj" "${OA0:-0}" "$(cat /proc/"${PID:-0}"/oom_score_adj 2>/dev/null)"
+    else
+        skipped_case C84 "the agent has one thread" 1
+    fi
+    # C85: a persistent set-property of the watchdog (TasksMax=1 for good,
+    # applied to every later start's fresh cgroup): its drop-in refused
+    if selected C85; then
+        CTLW=/etc/systemd/system.control/northnarrow-watchdog.service.d
+        WDPID=$(wd_pid); WDSTART=$(proc_start "$WDPID")
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        TM0=$(cat "$CGROOT$WD_CG/pids.max" 2>/dev/null)
+        TMP0=$(systemctl show -p TasksMax --value northnarrow-watchdog.service 2>/dev/null)
+        out=$(timeout 60 systemctl set-property northnarrow-watchdog.service TasksMax=1 2>&1); rc=$?
+        sleep 5; ev=$(evidence "$t0" "$a0" "$d0")
+        if [[ ! -e $CTLW/50-TasksMax.conf && "$(cat "$CGROOT$WD_CG/pids.max" 2>/dev/null)" == "$TM0" ]] && echo "$ev" | grep -qE "deny=create|deny=cgroup_limit"; then
+            v=OK; st="denied (no drop-in, pids.max kept at $TM0; systemctl rc=$rc)"
+        else
+            v="DEVIATION (drop-in $([[ -e $CTLW/50-TasksMax.conf ]] && echo present || echo absent), pids.max ${TM0:-?} -> $(cat "$CGROOT$WD_CG/pids.max" 2>/dev/null), rc=$rc)"; fail=1; st="allowed"
+        fi
+        rows+=("| C85 | systemctl set-property TasksMax=1 of the watchdog, for good (no window) | $st | $ev | $v |")
+        echo "C85 persistent set-property of the watchdog → $st; $ev; $v" >&2
+        if [[ -e $CTLW/50-TasksMax.conf ]]; then grant_window 30; rm -f "$CTLW/50-TasksMax.conf"; fi
+        # A refused set-property still sets systemd's own TasksMax (in
+        # memory, until a reload), which the watchdog's next fresh cgroup
+        # would get: the reload takes it back (PID 1 writes the unit's
+        # values, which the guard lets through).
+        systemctl daemon-reload
+        [[ -n $TM0 && "$(cat "$CGROOT$WD_CG/pids.max" 2>/dev/null)" != "$TM0" ]] && { grant_window 30; echo "$TM0" > "$CGROOT$WD_CG/pids.max" 2>/dev/null; }
+        for i in $(seq 1 40); do window_open || break; sleep 1; done
+        restored C85 "the watchdog's pids.max" "${TM0:-}" "$(cat "$CGROOT$WD_CG/pids.max" 2>/dev/null)"
+        restored C85 "the watchdog unit's TasksMax" "${TMP0:-}" "$(systemctl show -p TasksMax --value northnarrow-watchdog.service 2>/dev/null)"
     fi
 fi
 

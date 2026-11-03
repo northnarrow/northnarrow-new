@@ -86,6 +86,12 @@ const HOST_PATH_USERS: &[(&str, &str)] = &[
         "the pin root is what it tests: the pins outlive the agent and its restart reuses them",
     ),
     (
+        "agent/tests/cgroup_guard_privileged_e2e.rs",
+        "the installed /etc/northnarrow/admin.pub, the file the agent write-protects (lot 273b): \
+         its write-open must be refused and a descriptor opened inside a window writes nothing \
+         after it — an empty write, the file never changed",
+    ),
+    (
         "agent/tests/fs_deny_privileged_e2e.rs",
         "the denies of the agent's fixed directories (/etc/northnarrow, \
          /var/lib/northnarrow/detections, the pin root): it creates and removes its own \
