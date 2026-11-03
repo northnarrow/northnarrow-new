@@ -1569,20 +1569,24 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if at.is_some_and(|t| start_ns.saturating_sub(2 * tick) > t) {
             return None;
         }
-        // Lot 278: the latest time the fork can have happened. `/proc`
-        // rounds the start down to a tick and `start_ns` takes all the time
-        // suspended off it, so a fork in the tick of its parent's exec (sudo
-        // and its monitor) shows a start before that exec: read at
-        // `start_ns`, the parent's image was "only later" and the lineage
-        // was lost. The image read at this bound is the parent's only if
-        // `/proc/<pid>/exe` is still that file (below): a parent that
-        // executed something else after forking `pid` does not lend it the
-        // new image.
-        let forked_by = ticks.saturating_add(2).saturating_mul(tick).max(start_ns);
-        let parent = match self.cached_live(ppid, Some(forked_by)) {
+        // The parent's image at the fork's earliest time (`start_ns`). Lot
+        // 278: `/proc` rounds the start down to a tick and `start_ns` takes
+        // all the time suspended off it, so a fork in the tick of its
+        // parent's exec (sudo and its monitor) shows a start before that
+        // exec: the parent's image there is "only later" and the lineage
+        // was lost. Then, and only then, the parent's exec up to the latest
+        // time the fork can have happened (`forked_by`, the boot clock's
+        // start and the two ticks of rounding) answers — if it is the only
+        // identity the parent took in between (review of #493, B1: a
+        // parent that forks and then executes another script of the same
+        // interpreter must not lend the fork that script; the rule of
+        // [`Self::orphan_entry`]). `/proc/<pid>/exe` must still be the image
+        // (below).
+        let forked_by = ticks.saturating_add(2).saturating_mul(tick);
+        let parent = match self.cached_live(ppid, Some(start_ns)) {
             CachedAt::Current(e) | CachedAt::Past(e) => e,
-            CachedAt::LaterOnly => return None,
-            CachedAt::Absent => self.fork_entry(ppid, Some(forked_by), depth + 1)?,
+            CachedAt::LaterOnly => self.only_identity_between(ppid, start_ns, forked_by)?,
+            CachedAt::Absent => self.fork_entry(ppid, Some(start_ns), depth + 1)?,
         };
         let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
         if exe != parent.exe {
@@ -1606,6 +1610,34 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             script: parent.script,
             uid,
         })
+    }
+
+    /// Lot 278 (review of #493, B1): the exec `pid` ran in `(after, by]`
+    /// when every exec the cache holds of it in that span is one identity —
+    /// the same executable, script and npm entrypoint — of a process
+    /// started by `by`; `None` when there is none, or more than one.
+    fn only_identity_between(&self, pid: u32, after: u64, by: u64) -> Option<Entry> {
+        let s = self.inner.state.read();
+        let cur = s.map.get(&pid).or_else(|| s.daemons.get(&pid));
+        let past = s.history.get(&pid).into_iter().flatten();
+        let mut found: Option<&Entry> = None;
+        for e in past.chain(cur) {
+            if e.spawn_ns <= after || e.spawn_ns > by || e.start_ns > by {
+                continue;
+            }
+            match found {
+                None => found = Some(e),
+                Some(f)
+                    if f.exe != e.exe
+                        || f.script != e.script
+                        || f.argv_npm_cli != e.argv_npm_cli =>
+                {
+                    return None
+                }
+                Some(_) => {}
+            }
+        }
+        found.cloned()
     }
 
     /// `/proc/<pid>/stat`'s parent (field 4) and start (field 22), counted
@@ -5136,6 +5168,124 @@ mod tests {
     fn sudo_with_login_and_terminal_is_interactive_admin() {
         let (_tmp, t) = admin_session(34816, 1000);
         assert!(t.is_interactive_admin(200, AsOf::Now));
+    }
+
+    /// Review of #493 (B1): a parent that forks and then executes another
+    /// script of the same interpreter does not lend its fork that script.
+    /// Read at the fork's earliest time, the fork runs `evil.py` (not
+    /// `dnf`, not a canary reader like borg); when both of the parent's
+    /// execs fall after that time, within the fork's tick, the fork is not
+    /// known (two identities); one exec there (sudo's monitor) answers.
+    #[test]
+    fn a_fork_does_not_borrow_its_parent_s_next_script() {
+        const MS: u64 = 1_000_000;
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let fork = |second_at: u64, first_at: u64| {
+            let tmp = TempDir::new().unwrap();
+            let t = AuthSessionTracker::new(tmp.path());
+            t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+            t.ingest_exec(
+                800,
+                700,
+                "/usr/bin/python3",
+                &argv(&["python3", "/home/u/evil.py"]),
+                first_at,
+                9_000 * MS,
+                1000,
+            );
+            // forked at 10.005 s: `/proc` shows tick 1000 (10.000 s)
+            write_exe(tmp.path(), 801, "/usr/bin/python3");
+            write_status(tmp.path(), 801, 800);
+            write_started(tmp.path(), "801", 800, 1_000);
+            t.ingest_exec(
+                800,
+                700,
+                "/usr/bin/python3",
+                &argv(&["python3", "/usr/bin/borg", "serve"]),
+                second_at,
+                9_000 * MS,
+                1000,
+            );
+            (tmp, t)
+        };
+        let judged = AsOf::Judged(10_050 * MS);
+        // evil.py at 9.5 s, then borg at 10.006 s
+        let (_tmp, t) = fork(10_006 * MS, 9_500 * MS);
+        let id = t.exec_identity(801, judged);
+        assert_eq!(
+            id.and_then(|i| i.script).as_deref(),
+            Some("/home/u/evil.py")
+        );
+        let readers = crate::canary::readers::CanaryReaders::new(Default::default(), t.clone());
+        assert_eq!(readers.reader(801, judged), None);
+        // both after the fork's earliest time, two scripts: not known
+        let (_tmp, t) = fork(10_006 * MS, 10_002 * MS);
+        assert_eq!(t.exec_identity(801, judged), None);
+        assert_eq!(readers_of(&t, 801, judged), None);
+        // two execs there of one identity (the same script twice): that one
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+        for at in [10_002 * MS, 10_006 * MS] {
+            t.ingest_exec(
+                800,
+                700,
+                "/usr/bin/python3",
+                &argv(&["python3", "/home/u/evil.py"]),
+                at,
+                9_000 * MS,
+                1000,
+            );
+        }
+        write_exe(tmp.path(), 801, "/usr/bin/python3");
+        write_status(tmp.path(), 801, 800);
+        write_started(tmp.path(), "801", 800, 1_000);
+        let id = t.exec_identity(801, judged);
+        assert_eq!(
+            id.and_then(|i| i.script).as_deref(),
+            Some("/home/u/evil.py")
+        );
+    }
+
+    fn readers_of(t: &AuthSessionTracker, pid: u32, at: AsOf) -> Option<String> {
+        crate::canary::readers::CanaryReaders::new(Default::default(), t.clone()).reader(pid, at)
+    }
+
+    /// Review of #493 (B3): the fork's upper bound is the fork's own tick
+    /// and its rounding — an exec of the parent past it (a tick later) is
+    /// never the fork's image, even as the only one.
+    #[test]
+    fn a_parent_s_exec_after_the_fork_s_tick_is_not_its_image() {
+        const MS: u64 = 1_000_000;
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+        // sudo executed at 10.035 s, 35 ms after the fork's tick 1000
+        t.ingest_exec(
+            710,
+            700,
+            "/usr/bin/sudo",
+            &[],
+            10_035 * MS,
+            10_001 * MS,
+            1000,
+        );
+        write_exe(tmp.path(), 711, "/usr/bin/sudo");
+        write_status(tmp.path(), 711, 710);
+        write_started(tmp.path(), "711", 710, 1_000);
+        t.ingest_exec(
+            712,
+            711,
+            "/home/alice/nn/deploy/install.sh",
+            &[],
+            10_050 * MS,
+            10_045 * MS,
+            0,
+        );
+        write_loginuid(tmp.path(), 712, 1000);
+        write_stat(tmp.path(), 712, 711, 34816);
+        assert!(!t.is_interactive_admin(712, AsOf::Judged(10_050 * MS)));
+        assert_eq!(t.exec_identity(711, AsOf::Judged(10_050 * MS)), None);
     }
 
     /// Lot 278: `descends_from` by pid and start — the process itself or an
