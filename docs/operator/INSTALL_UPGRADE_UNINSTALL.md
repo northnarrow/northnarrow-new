@@ -367,6 +367,7 @@ missing and how to fix it:
 | kexec | `kernel.kexec_load_disabled` = 1 | no kernel swap without a reboot; lockdown alone still lets a signed vendor kernel in through `kexec_file_load`, with any command line (one without `bpf` in `lsm=`, for instance). Since review 82 the running agent refuses every kexec image load itself (below); the setting still covers the time before the agent starts |
 | bpffs | mounted once at `/sys/fs/bpf` | a second bpffs can hide pinned objects from the inventory |
 | nftables | `nft` installed in `/usr/sbin`, `/usr/bin`, `/sbin` or `/bin`, root's and writable by nobody else — the one the agent runs; a copy in `/usr/local` is not used (external audit ATP-014, lab PR 176) | a BlockOutbound verdict and the COMBAT soft egress block (INVESTIGATE) are nftables rules: without `nft` the offender is not contained while the agent analyses it — the agent records a signed `subsystem_degraded` at boot, and each episode records the failure and shortens INVESTIGATE to 10 s. Reported with `--without-nftables` when the install manifest records it (lab PR 165). A WARN like the other rows: the refusal is the installer's (Prerequisites, above) |
+| cgroup v1 controllers | `cgroup_no_v1=all` on the kernel command line (or no `freezer`, `devices`, `net_cls`, `net_prio`, `perf_event` enabled) | lot 273b: on a host whose systemd runs the unified hierarchy, root can still mount a v1 hierarchy of these controllers and freeze the agent through a v1 `freezer`. The running agent refuses every write to a v1 hierarchy outside a window there (section 3.7); the boot option refuses the mount itself, before the agent runs |
 | Release verified at install | `provenance` `checksums` or `attested` in `install-manifest.json` | only these rest on something outside the installed tree (section 5.1); `manifest`, `source-tree`, `unverified` and `package` are reported with the flag that accepted them. The agent boots at every level, so the lab and developer hosts keep working (external audit DEP-007) |
 
 The agent runs unchanged under `lockdown=integrity` (verified on Ubuntu
@@ -704,12 +705,44 @@ offender, and the requester is not known. On systemd 257 and later
 `systemctl kill -s SIGKILL` then writes the unit's `cgroup.kill` (the
 kernel's kill of the whole cgroup, which no signal hook sees): that write
 is refused too and signed `cgroup_kill` (lot 273), as are `systemctl
-freeze` and `systemctl thaw` (`cgroup.freeze`, signed `cgroup_freeze`), a
+freeze` (`cgroup.freeze`, signed `cgroup_freeze`; since lot 273b systemd's
+thaw, a write of `0`, goes through: systemd 254 and 255 thaw every unit's
+slices at each start and stop), a
 child cgroup, an `rmdir` or a `chown` of the unit's cgroup, and moving the
 agent or the watchdog to another cgroup (`cgroup_move`) — by any process,
 root's shell as well as systemd. Inside a window all of it works: the
 maintenance below, and `install.sh`/`uninstall.sh`'s SIGKILL fallback,
 are unchanged. A unit frozen inside a window must be thawed inside one.
+
+Lot 273b: the units' and their slices' resource limits are part of the
+unit. `systemctl set-property` of `northnarrow-agent`, `northnarrow-watchdog`
+or their slice (`system.slice`) that changes `MemoryMax=`, `MemoryHigh=`,
+`TasksMax=`, `CPUQuota=`, `CPUWeight=`, `IOWriteBandwidthMax=` and the like
+— lowering or raising — is refused outside a window: the cgroup write
+(`cgroup_limit`, PID 1 may only write back the value the unit started
+with, as it does at a reload) and the drop-in `set-property` writes in the
+unit's `system.control` directory (`create`; the agent's unit makes the
+four directories of the two units, empty, before every start, and
+`uninstall.sh` removes them). Inside a window it works, and the change
+stays: when the window closes the agent registers the values the files
+hold then, which systemd may write back from then on; a persistent one
+(without `--runtime`) stays for the next starts too — take it back inside
+a window. A refused `set-property` still sets systemd's own copy of the
+property, in memory: `systemctl show` reports the new value, and the
+unit's next start would apply it to its fresh cgroup. After a refused
+attempt (a signed `cgroup_limit` or `create`), run `sudo systemctl
+daemon-reload` (no window needed) before restarting either unit: it takes
+systemd's copy back to the unit's files. (A unit that already restarted
+with the refused value keeps it on systemd 257, whose reload rewrites no
+cgroup attribute: restart it again inside a window after the reload.) A write of a protected process's `oom_score_adj` is refused
+outside a window (`oom_adj`), and, where systemd runs the unified cgroup
+hierarchy, any write to a cgroup v1 hierarchy (`cgroup_v1`). The units
+carry `IgnoreOnIsolate=yes`: `systemctl isolate` of another target (a
+rescue target) leaves them running. A stop systemd propagates from another
+unit (one with `Conflicts=northnarrow-agent.service`) is not a manual stop:
+its signals and its cgroup kill are refused and the agent keeps running,
+but systemd then records the unit as stopped (tamper case C78a; the trust
+model's "Lot 273b" residual).
 
 To restart, for example after `nn-admin config overlay set`:
 

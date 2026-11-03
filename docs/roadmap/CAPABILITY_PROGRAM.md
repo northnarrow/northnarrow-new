@@ -51,7 +51,7 @@ number in parentheses is a lab PR.
 | C20 | Automation, playbooks, SOAR | 1 | the automatic COMBAT ladder and the per-rule policy; no playbook, webhook or OpenC2 | 3 |
 | C21 | SIEM integration and export | 0 | no export of the detections ("until R15 exports the chains off the host", `docs/operator/HEARTBEAT.md`); local JSON reads and the heartbeat pull (270) only; no OCSF, syslog or OTLP | 3 |
 | C22 | Backend and multi-host correlation | 0 | the heartbeat's external verifier (270) is not a backend | 3 |
-| C23 | Anti-tamper and self-defence | 2 (provisional) | 16 LSM deny hooks and 5 optional (lot 273: the cgroup move guard's 2), the fail-opens counted and signed (215); start refused without BPF LSM, a hook's self-test (218); a fail-visible watchdog (216); the signing key decided once at boot (265, 268); unprivileged workers under Landlock and seccomp (272); the signed heartbeat's external verifier sees a stop in 6.5 s (270). Provisional: on systemd 257 and later `systemctl kill -s SIGKILL` stopped the agent through `cgroup.kill` outside a maintenance window, and any root shell could kill, freeze or move the units' cgroups on every kernel (tamper case C31; C33's `systemctl stop` was refused all along — it read C31's kill); closed by lot 273 (#489: the units' cgroups protected, the move guard; C15, C20, C31, C65–C75 refused and signed and C76 allowed inside a window on the five guests), provisional until its review | 3 |
+| C23 | Anti-tamper and self-defence | 2 (provisional) | 17 LSM deny hooks and 6 optional (lot 273: the cgroup move guard; lot 273b: the write deny `file_permission`, the guard's third program), the fail-opens counted and signed (215); start refused without BPF LSM, a hook's self-test (218); a fail-visible watchdog (216); the signing key decided once at boot (265, 268); unprivileged workers under Landlock and seccomp (272); the signed heartbeat's external verifier sees a stop in 6.5 s (270). Provisional: on systemd 257 and later `systemctl kill -s SIGKILL` stopped the agent through `cgroup.kill` outside a maintenance window, and any root shell could kill, freeze or move the units' cgroups on every kernel (tamper case C31; C33's `systemctl stop` was refused all along — it read C31's kill); closed by lot 273 (#489: the units' cgroups protected, the move guard; C15, C20, C31, C65–C75 refused and signed and C76 allowed inside a window on the five guests); lot 273b (the review of #489): the units' and their slices' resource limits (an OOM kill inside the write, a starvation), a cgroup v1 hierarchy where systemd runs the unified one, a write through a descriptor opened earlier and the protected pids' `oom_score_adj` refused outside a window, the move guard self-tested at every boot (C12, C18, C77–C86), provisional until its review | 3 |
 | C24 | Offline and air-gapped operation | 2 | the agent's only traffic of its own is the DNS probe to 127.0.0.1:53 (`crates/nn-linux/src/telemetry_probe.rs`); updates are an operator's action; the attestation is verified offline with a bundle (`docs/operator/INSTALL_UPGRADE_UNINSTALL.md`) | 3 |
 | C25 | Data sovereignty | 2 | the telemetry stays on the host; no model in the root process (214); the README's NIS2, GDPR, DORA and CRA badges are claims, not proofs | 3 |
 | C26 | Open code, licence, inspectability | 2 | Apache-2.0 (`Cargo.toml`), the eBPF object Dual MIT/GPL, a public repository, the module map | 3 |
@@ -4936,3 +4936,131 @@ number in parentheses is a lab PR.
     open microbenchmark): no cheaper attach point exists in the
     migration's path today (no LSM hook names the moved task; the
     functions there are not `fmod_ret` targets).
+- **Lot 273b — C23: what stopped the agent without a signal — the units'
+  resource limits, a cgroup v1 freezer, a descriptor opened earlier, the
+  OOM score — refused outside a signed window; the move guard made to hold
+  (a security fix; the review of #489).**
+  - What was open (measured on `main` 56ce3c3b, lot 273, on the five
+    guests; tamper cases C12, C18, C79–C85): a root shell's `memory.max`
+    of one page OOM-killed the agent inside the write (C79, on all five);
+    `pids.max=1` on `system.slice` (C80), `cpu.max` 0.1 % on the watchdog's
+    unit (C81) and `cpu.idle=1` on the agent's (C81b) went through;
+    `systemctl set-property --runtime MemoryMax=4G` lowered the agent's cap
+    and left its drop-in (C12), `set-property northnarrow-watchdog
+    TasksMax=1` the same for good (C85); a v1 `freezer` mounted at
+    `/run/nn-lab-v1` took the agent's pid and froze it (C83, C83b, on all
+    five: none booted with `cgroup_no_v1=`), unseen by the move guard; a
+    `cgroup.freeze` descriptor opened inside a window wrote after it
+    (C82); the agent's `oom_score_adj` took 900 and a thread's 1000 (C18,
+    C84). And a regression of lot 273: every version's PID 1 rewrites a
+    slice's unit cgroups' xattrs when it realises a sibling (an `xattr`
+    refusal signed on every `set-property`, five guests), and 254/255 thaw
+    the slices at each start and stop of any unit (Ubuntu 24.04: "Failed
+    to thaw slice system.slice of unit: Operation not permitted" at every
+    `systemctl restart`, a relayed attempt signed each time).
+  - What changed: a write deny at the write (`protected_write_deny`, LSM
+    `file_permission`, the 17th deny hook: a descriptor opened earlier
+    writes nothing); the resource files of the units' and their slices'
+    directories (`FS_PROTECT_LIMIT_DIR`, by name) refused to all but PID 1,
+    whose write — its bytes read from the syscall, systemd's newline
+    cleared — must be the value the file held at the registration (pinned
+    `LIMIT_VALUES`) or the kernel's default; the values registered again
+    at a window's close; the units' four `system.control` directories made
+    by the agent's unit and registered `NOCREATE`; any cgroup v1 write
+    refused where systemd runs the unified hierarchy (pinned
+    `CGROUP_POLICY`; the host check's `cgroup_v1`); the protected pids'
+    `oom_score_adj` / `oom_adj` refused (four optional BTF offsets); PID
+    1's thaw (`0`) and its xattrs on unit cgroups let through, its freeze
+    refused at the write; the move guard's third program (fentry
+    `cgroup_procs_write_finish`) drops a record at the end of every write,
+    a record consumed only on a cgroup v2 `cgroup.procs`/`threads`, the
+    stash a non-evicting 64-entry map (an insert refused is a counted
+    fail-open), the guard self-tested at every boot
+    (`move_guard_self_test`); both units `IgnoreOnIsolate=yes`; the cost
+    in the manifest (`fs_protect`'s `overhead`). Tamper cases C12 and C18
+    expect a refusal, C77a/b, C78a/b, C79–C86 new, C08 takes PID 1 back out
+    of `PROTECTED_PIDS`; a privileged test of the move guard, an earlier
+    descriptor and the OOM score.
+  - Lab (as measured; our own guests, two at a time, all left off):
+    before, `main` 56ce3c3b on the five guests (Ubuntu 22.04 5.15 / 249,
+    Debian 12 6.1 / 252, Ubuntu 24.04 6.8 / 255, Debian 13 6.12 / 257,
+    Ubuntu 26.04 7.0 / 259) with the lot's tamper cases: C12, C18,
+    C79–C85 DEVIATION on all five (allowed; C79 "pid … is gone"), C78b
+    recorded the unit dead on 249, 252 and 259, C86 refused PID 1's thaw on
+    252, every `set-property` an `xattr` refusal. After, the lot's code
+    2347c573 (the final commit differs in comments, tests and docs): the
+    sixteen cases OK on all five — C12/C85 `cgroup_limit` + `create`, C18
+    and C84 `oom_adj`, C79–C81b `cgroup_limit`, C82 `cgroup_freeze` at the
+    write, C83/C83b `cgroup_v1`, C78b no stop job, C86 nothing signed; the
+    full tamper check 102 cases, 98 OK on 249, 252, 255 and 257 (C27, C57c
+    the known gaps, C64 the recorded deviation, C78c N/A), 96 on 259:
+    C04b (a ptrace read of `/proc/<agent>/environ`) and C58 (a renamed
+    module tool's load) deviate there with `main` too (its own tamper
+    check on the same guest: the host's, not the lot's).
+    `upgrade-check` from `main`: Debian 13 OK (`deny_attached=23
+    deny_expected=23`, own LSM programs 37 → 38), Ubuntu 24.04 OK after a
+    settle (its first run the lab's R009 flake). `uninstall-check` and a
+    fresh install with a new key (round 1) OK on 24.04 and Debian 13.
+    Verifier: 81 of 81 programs on 6.8, 6.12, 7.0, 79 + the two ACL hooks
+    absent on 5.15 and 6.1 (`protected_write_deny` 3,753–3,925
+    instructions, `cgroup_move_deny` 556–580, `cgroup_move_clear` 9). The
+    move guard's boot self-test refused its move at every start. Flows on
+    the five: `daemon-reload` / `daemon-reexec` sign nothing (249, 252,
+    255, 259 write the units' attributes again, with a newline, cleared
+    now; the lot's first version refused them, round 1); a `set-property`
+    outside a window answers 0, silent, refused at the cgroup and the
+    drop-in; inside one kept, "values=40 units=2" registered again at the
+    close (44 on 249 and 255), the reload after it let through; a refused
+    `MemoryHigh=2G` still in systemd's copy reached the agent's fresh
+    cgroup at a restart inside a window (2 GiB, all five). Soft-reboot on
+    255 and 257, with #482's merge, lot 273 and the lot: identical — both
+    processes survive (pins and links kept), the new userspace's systemd
+    will not start the units while they run (`failed`); 259 records them
+    stopped and waits about 90 s; a reboot after it signs `agent_stop
+    system_shutdown`. test-ignored on Ubuntu 24.04, the lot's code: 89
+    suites, 107 passed, 0 failed (`cgroup_guard_privileged_e2e` 4 of 4;
+    round 1 found its first version writing the tempdir's `--admin-pub`,
+    which nothing protects: it writes the installed one now). Cost: see `ANTITAMPER_TRUST_MODEL.md`, "Lot
+    273b" (the move guard about 59 ns a call, `git status` ×10 +24 %; the
+    write deny about 96 ns a write, a 2,000-file package +9 %; open/wopen
+    +41 % agent off/on). Reboots clean on the five; every guest left off.
+  - Gates: on the code (3aa8439a) and on the three commits on `main`
+    da164d10 (8a6e838a, the tree of the lab's 2347c573 with comments,
+    tests and docs; the eBPF object byte-identical): `cargo xtask
+    build-ebpf --release`, the four clippy runs `-D warnings`, `fmt
+    --check`, `cargo test --workspace` 84 suites, 3,617 passed, 0 failed,
+    17 ignored, the privileged tests built, `attack-coverage --check`,
+    `cargo xtask golden` five times (54 files, the same bytes, the tree
+    clean), MSRV 1.89, the fuzz replay (14 targets), portable-core (5
+    targets), lockfiles unchanged; the fix's commit alone: the xtask tests
+    23 suites, 234 passed. The eBPF object: two new programs
+    (`lsm/file_permission`, `fentry/cgroup_procs_write_finish`), two new
+    pinned maps (`LIMIT_VALUES`, `CGROUP_POLICY`), the stash
+    `CGROUP_MOVES` a 64-entry hash map (was LRU, not pinned),
+    `DENY_FAIL_OPEN` 22 → 24 slots, three op codes (22–24:
+    `cgroup_limit`, `cgroup_v1`, `oom_adj`) and one `PROTECTED_INODES`
+    flag bit (7, `LIMIT_DIR`); the wire record unchanged; new bpffs pins
+    `prog_`/`link_file_permission` and
+    `prog_`/`link_cgroup_procs_write_finish`.
+  - Mutations: 70 in three sets on the lot's code: 67 caught, two the
+    compiler rejects (ML10: the clear hook out of the optional list, MS4:
+    the self-test's refusal arm guarded off — neither builds), one
+    survivor, MD9: the lab script's C08 restore disabled, which its
+    `--selftest` does not see and the lab does (C12 deviates without it,
+    as round 1 showed). The guard's checks, every registration and the
+    window's refresh are read by `xtask/tests/cgroup_guard.rs`; the unit
+    files' `IgnoreOnIsolate=` and `system.control` directories by
+    `watchdog/tests/systemd_units.rs`.
+  - Open: a refused `set-property` still sets systemd's own copy of the
+    property until the next `daemon-reload`, and the unit's next start
+    applies it (the operator's reload before a restart; lot 273c: the
+    agent's own reload); a soft-reboot leaves both units `failed` with
+    their processes running and protecting (since EBPF-001; lot 273c: end
+    at its stop job, or survive the systemd way); a stop propagated from a
+    `Conflicts=` unit records the unit stopped (C78a); `cpuset`,
+    `cpu.uclamp.max`, `memory.swap.max`, a sibling's `memory.low` are not
+    refused; a hybrid v1 host, another architecture than x86-64 and a
+    kernel without the proc offsets are signed degradations; a shared
+    writable mapping opened before a registration and a write in a fresh
+    cgroup's first milliseconds are not seen; the move guard's cost on
+    path-heavy work.
