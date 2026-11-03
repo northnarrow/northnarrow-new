@@ -1077,6 +1077,7 @@ s.close()
     fx.wait_netflow_matching(1, |r| {
         r["dst_port"].as_u64() == Some(C2_PORT as u64)
             && r["dst_addr"].as_str() == Some("127.0.0.1")
+            && r["inbound"].as_bool() != Some(true)
     });
     fx.wait_for_verdict("NN-L-NET-010_OutboundToHighRiskC2Port");
 }
