@@ -1209,14 +1209,14 @@ fn credential_decoys_are_new_at_each_deploy_and_refresh() {
 // ── Test 2: process canary trip → access-log entry with first_trip ──
 
 /// K8 e2e #2 — process canary trip. Materialise a fake binary
-/// at `<tempdir>/decoy_helper` (copy of /bin/true so the exec
-/// returns 0), deploy a process canary at that path, then
-/// `exec`-spawn the path. Assert exactly one row with
+/// at `<tempdir>/sleep` (a copy of /bin/sleep that keeps its name,
+/// alive until the response kills it), deploy a process canary at
+/// that path, then `exec`-spawn the path. Assert exactly one row with
 /// `access_kind = ProcessExec`, `canary_type = Process`,
-/// `first_trip = true`.
+/// `first_trip = true`, and the decoy killed by SIGKILL.
 ///
 /// Why the K3 inline-filter wins over R009: the kernel surfaces
-/// `Event::ProcessSpawn { filename = /tmp/.../decoy_helper, uid=0 }`,
+/// `Event::ProcessSpawn { filename = /tmp/.../sleep, uid=0 }`,
 /// which BOTH (a) the K3 detector's `is_canary_exe` lookup
 /// matches AND (b) R009's `/tmp/`-prefix matcher would match.
 /// Per §12 Q9 INLINE-FILTER lock-in: the detector runs FIRST in
@@ -1237,18 +1237,39 @@ fn process_canary_exec_triggers_canary_tripped_event_and_combat() {
     // detector matches via the registry's exe_index after deploy.
     use std::os::unix::process::ExitStatusExt;
     let tmp = tempfile::tempdir().expect("decoy tempdir");
-    let decoy = tmp.path().join("decoy_helper");
     // Real ELF at the deployment path so the exec doesn't ENOENT. Lab PR
     // 269: a copy of /bin/sleep, alive until the response reaches it — with
     // /bin/true the exec raced NN-L-CANARY-002's KillProcessTree (the
     // decision on a thread of its own killed it before it returned 0 on
     // ubuntu2204: "decoy exec failed"); the kill is the rule's response,
     // asserted below as the network canary's is.
+    //
+    // Lab PR 274: the copy keeps the name `sleep`, in the test's own
+    // directory. /bin/sleep may be a multi-call binary that picks its
+    // utility from the name it is run by (uutils coreutils on Ubuntu 26.04,
+    // the nightly's ubuntu2604 guest): copied as `decoy_helper` it printed
+    // "function/utility not found" and exited 1 at once, before the kill
+    // (the nightly's red 01/11 and 02/11: exit status 1, not SIGKILL). The
+    // canary is matched by its path, so the name changes nothing else.
+    let decoy = tmp.path().join("sleep");
     std::fs::copy("/bin/sleep", &decoy).expect("seed decoy process binary");
     let mut perms = std::fs::metadata(&decoy).expect("stat decoy").permissions();
     use std::os::unix::fs::PermissionsExt;
     perms.set_mode(0o755);
     std::fs::set_permissions(&decoy, perms).expect("chmod decoy");
+    // The fixture's own precondition, checked before any agent runs (so it
+    // trips nothing): the copy runs as sleep. A decoy that exits at once
+    // fails here, saying so, instead of as a missing kill below.
+    let probe = Command::new(&decoy)
+        .arg("0")
+        .stdout(Stdio::null())
+        .status()
+        .expect("spawn the decoy's probe");
+    assert!(
+        probe.success(),
+        "the copy of /bin/sleep at {} does not run as sleep: {probe}",
+        decoy.display()
+    );
 
     let fx = CanaryFixture::setup(&[]);
     let canary_id = fx.deploy_process_canary("honeypot-helper", &decoy, "helper");
@@ -1282,9 +1303,9 @@ fn process_canary_exec_triggers_canary_tripped_event_and_combat() {
     assert_eq!(row["accessor_uid"].as_u64(), Some(0));
     // Process-canary trips capture the accessor's comm — the
     // kernel-side `sched_process_exec` populates this from the
-    // task struct. Don't pin the value (comm may be "decoy_helper"
-    // or "true" depending on how the kernel resolves it) — just
-    // assert it's a non-empty string.
+    // task struct. Don't pin the value (the decoy's file name,
+    // `sleep`, or what the kernel resolves) — just assert it's a
+    // non-empty string.
     assert!(
         row["accessor_comm"].as_str().is_some_and(|s| !s.is_empty()),
         "accessor_comm should be populated"

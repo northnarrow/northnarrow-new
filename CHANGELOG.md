@@ -621,6 +621,28 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- The nightly lab VM gate's red nights (lot 274; no product change). Six of
+  the twelve nights from 22/10 to 02/11 failed. On every red Debian guest
+  (Debian 12 `sync` on 24/10, 28/10, 01/11 and 02/11, Debian 13 `build`
+  on 23/10 and 26/10) `nn-lab.sh up` had said "guest is up and
+  provisioned" on the guest's provisioning boot, in the seconds between
+  cloud-init's marker and its reboot: it took "the marker is there and
+  bpf is among the LSMs" for "past the reboot", and the Debian kernels
+  list bpf on their first boot already. The reboot then cut the next
+  step's connection ("Connection reset by peer", "closed by remote
+  host"). The templates now write the provisioning boot's id into the lab
+  marker (`/var/lib/nn-lab-provisioned`, a new file renamed over it), and
+  `up` returns only for a guest on another boot, with bpf among its LSMs
+  (and its lockdown mode on a lockdown guest); a guest that does not get
+  there ends the wait with an error naming where it stopped (still on its
+  provisioning boot, rebooted without bpf, not in lockdown, unreachable).
+  On Ubuntu 26.04 (01/11, 02/11) the canary test
+  `process_canary_exec_triggers_canary_tripped_event_and_combat` failed
+  since lab PR 269 made its decoy a copy of `/bin/sleep` named
+  `decoy_helper`: uutils' multi-call binary picks its utility from that
+  name, found none and exited 1 before the kill the test asserts. The
+  copy keeps the name `sleep` in the test's own directory, and the test
+  first checks that it runs as sleep.
 - nn-admin's output matrix no longer flakes on a refused connection (lab
   PR 266b, found by lab PR 265's golden runs: `sock.net-status-json.
   refused-connection` read "Connection reset by peer" once in five). A

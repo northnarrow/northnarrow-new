@@ -77,7 +77,12 @@ runcmd:
     "$d/rustup-init" -y --profile minimal --default-toolchain stable;
     rm -rf "$d"'
   - su - nn -c 'echo "source \$HOME/.cargo/env" >> ~/.bashrc'
-  - touch /var/lib/nn-lab-provisioned
+  # The lab marker holds this boot's id (written whole, then renamed):
+  # `nn-lab.sh up` waits for a guest on another boot, past the reboot
+  # below (lab PR 274: a Debian kernel lists bpf on this boot already).
+  - >-
+    cat /proc/sys/kernel/random/boot_id > /var/lib/nn-lab-provisioned.new
+    && mv -f /var/lib/nn-lab-provisioned.new /var/lib/nn-lab-provisioned
 power_state:
   mode: reboot
   message: "nn-lab: rebooting with lsm=...,bpf"
