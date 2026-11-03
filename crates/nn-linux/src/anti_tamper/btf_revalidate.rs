@@ -170,9 +170,22 @@ pub struct ResolvedOffsets {
     /// its program is attached and counted as an expected deny hook;
     /// absent: neither.
     pub optional_deny_hooks: Vec<(&'static str, bool)>,
+    /// Lot 275: the parameter count of each function of
+    /// [`common::btf_offsets::PARAM_COUNT_FUNCS`] this kernel's BTF has;
+    /// the network sensors attach the fexit program built for it.
+    pub func_params: Vec<(&'static str, usize)>,
 }
 
 impl ResolvedOffsets {
+    /// Lot 275: the parameter count of `func` on this kernel, when its BTF
+    /// has the function ([`common::btf_offsets::PARAM_COUNT_FUNCS`] only).
+    pub fn param_count(&self, func: &str) -> Option<usize> {
+        self.func_params
+            .iter()
+            .find(|(f, _)| *f == func)
+            .map(|(_, n)| *n)
+    }
+
     /// Lab PR 164: position of the [`HOOK_ARGS`] entry `name` on this
     /// kernel, or `None` when it was not resolved.
     pub fn hook_arg_position(&self, name: &str) -> Option<u32> {
@@ -628,6 +641,10 @@ fn resolve_with(
             }
         })
         .collect();
+    let func_params = common::btf_offsets::PARAM_COUNT_FUNCS
+        .iter()
+        .filter_map(|f| btf.param_count(f).map(|n| (*f, n)))
+        .collect();
     if missing.is_empty() {
         ResolveOutcome::Resolved(ResolvedOffsets {
             values,
@@ -636,6 +653,7 @@ fn resolve_with(
             modules_not_loaded,
             hook_args_checked,
             optional_deny_hooks,
+            func_params,
         })
     } else {
         ResolveOutcome::Refuse(RefuseReason::Drift(missing))
@@ -1299,6 +1317,7 @@ impl Btf {
                         if nm.starts_with(LSM_FUNC_PREFIX)
                             || FEXIT_TARGETS.iter().any(|t| t.func == nm)
                             || FENTRY_TARGETS.iter().any(|f| *f == nm)
+                            || common::btf_offsets::PARAM_COUNT_FUNCS.contains(&nm.as_str())
                         {
                             lsm_funcs.entry(nm).or_insert(size_or_type);
                         }
@@ -1383,6 +1402,17 @@ impl Btf {
             name_to_id,
             lsm_funcs,
         })
+    }
+
+    /// Lot 275: the parameter count of function `func`
+    /// ([`common::btf_offsets::PARAM_COUNT_FUNCS`]); `None` when the kernel's
+    /// BTF has no such function, or no prototype for it.
+    fn param_count(&self, func: &str) -> Option<usize> {
+        let proto = *self.lsm_funcs.get(func)?;
+        match self.types.get(proto as usize) {
+            Some(Ty::FuncProto { params, .. }) => Some(params.len()),
+            _ => None,
+        }
     }
 
     /// Lab PR 174: whether the kernel has LSM hook `hook` (its
@@ -2742,6 +2772,29 @@ mod tests {
             .find(|(s, _)| *s == slot)
             .expect("slot written")
             .1
+    }
+
+    /// Lot 275: the network sensors' fexit targets' parameter counts are
+    /// read from the BTF — the program built for that count is attached; a
+    /// function the kernel lacks has no count (its sensor is not attached).
+    #[test]
+    fn the_net_fexit_targets_parameter_counts_are_read() {
+        let mut b = BtfBuilder::new();
+        let int = b.int("int");
+        let sock = b.composite(Some("sock"), false, false, &[]);
+        let p_sock = b.ptr(sock);
+        // 6.10+: inet_csk_accept(sk, arg); 5.15: udp_recvmsg with 6
+        b.func("inet_csk_accept", p_sock, &[p_sock, p_sock]);
+        b.func("udp_recvmsg", int, &[p_sock, p_sock, int, int, int, p_sock]);
+        // a function outside the list is not recorded
+        b.func("tcp_sendmsg", int, &[p_sock, p_sock, int]);
+        let btf = Btf::parse(&b.build()).expect("fixture parses");
+        let r = hooks_only(&btf);
+        assert_eq!(r.param_count("inet_csk_accept"), Some(2));
+        assert_eq!(r.param_count("udp_recvmsg"), Some(6));
+        assert_eq!(r.param_count("udpv6_recvmsg"), None, "absent");
+        assert_eq!(r.param_count("tcp_sendmsg"), None, "not a listed target");
+        assert_eq!(r.func_params.len(), 2);
     }
 
     #[test]

@@ -23,6 +23,7 @@ mod cgroup_files;
 mod cgroup_guard;
 mod budget;
 mod comm;
+mod dns_answer;
 mod dns_nss;
 mod dns_query;
 mod dns_skb;
@@ -36,6 +37,7 @@ mod execq;
 mod fail_open;
 mod file_open;
 mod fim_watch;
+mod inbound;
 mod inet_csk_listen;
 mod inode_dev;
 mod inode_protect;
@@ -50,7 +52,9 @@ mod stdio;
 mod task_kill;
 mod tcp_close;
 mod tcp_connect;
+mod tls_hello;
 mod udp_sendmsg_outbound;
+mod uiter;
 mod zero;
 
 use aya_ebpf::{

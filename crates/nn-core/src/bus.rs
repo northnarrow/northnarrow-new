@@ -2159,6 +2159,7 @@ mod tests {
                 close_reason: 0,
                 phase,
                 observed_ns,
+                dns_resolution: Default::default(),
             })
         };
         assert_eq!(

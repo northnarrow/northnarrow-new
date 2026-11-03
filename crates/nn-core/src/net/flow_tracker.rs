@@ -519,6 +519,7 @@ impl<H: DecisionHost> FlowTracker<H> {
             close_reason: 0,
             phase,
             observed_ns,
+            dns_resolution: Default::default(),
         }
     }
 
@@ -575,6 +576,7 @@ impl<H: DecisionHost> FlowTracker<H> {
                 close_reason: 0,
                 phase: FlowPhase::Snapshot,
                 observed_ns: now_ns,
+                dns_resolution: Default::default(),
             });
         }
         SnapshotBatch { flows, deferred }
@@ -639,6 +641,7 @@ impl<H: DecisionHost> FlowTracker<H> {
             close_reason: info.close_reason,
             phase: FlowPhase::Closed,
             observed_ns: 0,
+            dns_resolution: Default::default(),
         })
     }
 
@@ -708,6 +711,7 @@ impl<H: DecisionHost> FlowTracker<H> {
             close_reason: info.close_reason,
             phase: FlowPhase::Closed,
             observed_ns: 0,
+            dns_resolution: Default::default(),
         })
     }
 
@@ -751,6 +755,7 @@ impl<H: DecisionHost> FlowTracker<H> {
             close_reason: 0,
             phase: FlowPhase::Closed,
             observed_ns: 0,
+            dns_resolution: Default::default(),
         }
     }
 

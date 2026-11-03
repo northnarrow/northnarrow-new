@@ -1112,6 +1112,7 @@ fn tcp_row(
             FlowPhase::Closed => 0,
             _ => start_ns,
         },
+        dns_resolution: Default::default(),
     })
 }
 
@@ -1470,6 +1471,7 @@ fn net_flow(pid: u32, dst: [u8; 4], port: u16, proto: u8, ts: u64, sent: u64) ->
         close_reason: 0,
         phase: Default::default(),
         observed_ns: 0,
+        dns_resolution: Default::default(),
     })
 }
 

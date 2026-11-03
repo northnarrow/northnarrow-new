@@ -1901,6 +1901,7 @@ mod tests {
             close_reason: 0,
             phase,
             observed_ns: 75_000_000_000,
+            dns_resolution: Default::default(),
         })
     }
 

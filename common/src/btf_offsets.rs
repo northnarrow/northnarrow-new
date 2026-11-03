@@ -2223,6 +2223,14 @@ pub const CGROUP_MOVE_FINISH: &str = "cgroup_procs_write_finish";
 /// to (presence checked, no argument read).
 pub const FENTRY_TARGETS: &[&str] = &[CGROUP_MOVE_FINISH];
 
+/// Lot 275 (C07): the functions the network sensors' fexit programs trace
+/// whose parameter count changed across the supported kernels — the return
+/// value is the slot after the last parameter. The agent reads each one's
+/// count from the kernel's BTF and attaches the program built for it:
+/// `inet_csk_accept` has 4 parameters up to 6.9 and 2 from 6.10;
+/// `udp_recvmsg` and `udpv6_recvmsg` 6 up to 5.18 and 5 from 5.19.
+pub const PARAM_COUNT_FUNCS: &[&str] = &["inet_csk_accept", "udp_recvmsg", "udpv6_recvmsg"];
+
 /// Slot 0 value once the agent has written every resolved offset.
 pub const BTF_OFFSETS_MAGIC: u32 = 0xB7F0_0FF5;
 /// Map size: the magic slot, one slot per revalidated offset, one per enum

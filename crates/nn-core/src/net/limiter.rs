@@ -248,6 +248,7 @@ mod tests {
             proc_start_ns: 0,
             phase: Default::default(),
             observed_ns: 0,
+            dns_resolution: Default::default(),
         }
     }
 
