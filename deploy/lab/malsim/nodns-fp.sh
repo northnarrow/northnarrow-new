@@ -24,7 +24,10 @@
 #   W6 resolver    dig/getent against the configured resolver (the
 #                  resolver itself is exempt)
 #
-#   bash deploy/lab/malsim/nodns-fp.sh [--only W1,W3] [--out FILE]
+#   bash deploy/lab/malsim/nodns-fp.sh [--only W1,W3] [--out FILE] [--with-podman]
+#
+#   --with-podman  install podman for W5 when no container engine is there,
+#                  and purge it after (the guest left as it was)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 HELPER="$HERE/nn-ms-net.py"
@@ -33,11 +36,13 @@ DET=/var/lib/northnarrow/detections/detections.jsonl
 RULE=NN-L-NET-028_ConnectWithoutDns
 ONLY=""
 OUT=""
+WITH_PODMAN=0
 while [[ $# -gt 0 ]]; do
     case $1 in
         --only) ONLY=${2:-}; shift 2 ;;
         --out) OUT=${2:-}; shift 2 ;;
-        -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --with-podman) WITH_PODMAN=1; shift ;;
+        -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "nodns-fp: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -124,6 +129,15 @@ if want W4 && [[ $online -eq 1 ]]; then
 fi
 
 if want W5 && [[ $online -eq 1 ]]; then
+    installed=0
+    if [[ $WITH_PODMAN -eq 1 ]] && ! command -v podman >/dev/null && ! command -v docker >/dev/null; then
+        if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq podman >"$WORK/podman-install.log" 2>&1; then
+            installed=1
+            echo "INFO podman installed for W5 ($(podman --version 2>/dev/null))"
+        else
+            echo "INFO podman could not be installed: W5 skipped"
+        fi
+    fi
     ran=0
     for eng in podman docker; do
         command -v "$eng" >/dev/null || continue
@@ -136,6 +150,11 @@ if want W5 && [[ $online -eq 1 ]]; then
         fi
     done
     [[ $ran -eq 1 ]] || echo "SKIP W5 no podman or docker on this guest"
+    if [[ $installed -eq 1 ]]; then
+        podman rmi -a -f >/dev/null 2>&1; sudo podman rmi -a -f >/dev/null 2>&1
+        sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq --autoremove podman >/dev/null 2>&1 \
+            && echo "INFO podman purged" || echo "INFO podman purge failed"
+    fi
 fi
 
 if want W6; then
