@@ -177,9 +177,12 @@ const KNOWN: &[(&str, usize, &str)] = &[
         "agent/src/detection_store.rs",
         // review of #482: 25 counted 21 sites of the file's tests, whose
         // module the brace matching ended early at a `}` inside a string
-        4,
+        // lot 273: 4 → 7, the writer's `caller_exe`
+        7,
         "the detection store's writer task, its start and its rotation; the decision's \
-         `record_*` build a record and hand it to the bounded queue",
+         `record_*` build a record and hand it to the bounded queue; lot 273: the writer \
+         reads an anti-tamper denial's caller's executable (`caller_exe`: \
+         `/proc/<pid>/comm` and `exe`) before it signs the record",
     ),
     (
         "crates/nn-linux/src/telemetry_probe.rs",

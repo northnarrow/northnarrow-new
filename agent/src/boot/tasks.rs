@@ -277,6 +277,9 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
         let mut last: Option<u32> = None;
         // A pid the pidfile named while the registered watchdog ran (logged once).
         let mut refused: Option<u32> = None;
+        // Lot 273: the keys of the verified watchdog's unit cgroup in
+        // PROTECTED_INODES (released when the next watchdog's differ).
+        let mut cgroup_keys: Vec<common::wire::InodeKey> = Vec::new();
         // BUG-011 (PHASE 15.1): resolve the bpffs root once. None ⇒
         // no bpffs ⇒ register_protected_observer is a no-op (it
         // logs the degraded mode internally).
@@ -341,6 +344,14 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                 if let Err(e) = northnarrow_agent::anti_tamper::claim_watchdog_role(bpffs_root, p) {
                     debug!(watchdog_pid = p, error = %e, "watchdog role not recorded");
                 }
+                // Lot 273: and its unit cgroup protected — the watchdog
+                // registers it at its start; this covers one that could
+                // not, and a restart's new cgroup.
+                cgroup_keys = northnarrow_agent::anti_tamper::cgroup_guard::protect_watchdog_cgroup(
+                    bpffs_root,
+                    p,
+                    &cgroup_keys,
+                );
             }
             match &resolution {
                 WatchdogResolution::Verified {

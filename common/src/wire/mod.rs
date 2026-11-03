@@ -817,6 +817,23 @@ pub const FS_OP_MKNOD: u8 = 17;
 /// `inode_remove_acl` where the kernel has them). `security.selinux` is
 /// not refused: `restorecon` relabels the agent's files on SELinux hosts.
 pub const FS_OP_XATTR: u8 = 18;
+/// Lot 273: a protected process (the agent, the watchdog, a worker) moved
+/// to another cgroup through `cgroup.procs` / `cgroup.threads`, refused by
+/// the `inode_permission` deny on the migration's permission check
+/// (`target_ino` = the moved tgid, `target_dev` = 0). Moved out of its
+/// unit, the process could be killed or frozen through a cgroup nobody
+/// protects, or frozen by a frozen destination. Rate-limited like a signal.
+pub const FS_OP_CGROUP_MOVE: u8 = 19;
+/// Lot 273: a write-open of a protected unit's `cgroup.kill` (or of an
+/// ancestor slice's), refused by the `file_open` deny: the kernel's
+/// SIGKILL of every process in the cgroup, which no `task_kill` hook sees —
+/// `systemctl kill -s SIGKILL` writes it on systemd 257 and later.
+/// `target_*` = the file.
+pub const FS_OP_CGROUP_KILL: u8 = 20;
+/// Lot 273: a write-open of a protected unit's `cgroup.freeze` (or of an
+/// ancestor slice's): `systemctl freeze`, or a direct write, stops every
+/// process of the cgroup. `target_*` = the file.
+pub const FS_OP_CGROUP_FREEZE: u8 = 21;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
@@ -844,6 +861,22 @@ pub const FS_PROTECT_READ: u8 = 0b100;
 /// its chain sub-directory, the unit drop-in directory, the bpffs pin
 /// root), never on the ordinary parent of a protected file.
 pub const FS_PROTECT_NOCREATE: u8 = 0b1000;
+/// `FS_PROTECT_INIT_RMDIR` (bit4, lot 273): PID 1 may remove this
+/// directory — set only on a protected unit's cgroup directory. systemd
+/// removes a unit's cgroup once its processes are gone (the kernel refuses
+/// to remove a populated one), and `systemd-shutdown` trims the tree at the
+/// end of a shutdown: refusing it would only leave the directory behind and
+/// sign a refused attempt for every restart. Any other caller's `rmdir` is
+/// refused and signed.
+pub const FS_PROTECT_INIT_RMDIR: u8 = 0b1_0000;
+/// `FS_PROTECT_CGROUP_KILL` (bit5, lot 273): the inode is a protected
+/// `cgroup.kill`; a refused write-open is signed as [`FS_OP_CGROUP_KILL`]
+/// rather than [`FS_OP_WRITE`] ([`fs_protect_denied_op`]).
+pub const FS_PROTECT_CGROUP_KILL: u8 = 0b10_0000;
+/// `FS_PROTECT_CGROUP_FREEZE` (bit6, lot 273): the inode is a protected
+/// `cgroup.freeze`; a refused write-open is signed as
+/// [`FS_OP_CGROUP_FREEZE`].
+pub const FS_PROTECT_CGROUP_FREEZE: u8 = 0b100_0000;
 /// Slots of the `READ_PROTECTED_INOS` array (inode numbers; 0 = empty).
 pub const READ_PROTECTED_SLOTS: u32 = 4;
 
@@ -861,6 +894,29 @@ pub const fn fs_protect_required(operation: u8) -> u8 {
             FS_PROTECT_NOCREATE
         }
         _ => FS_PROTECT_MUTATE,
+    }
+}
+
+/// Lot 273: whether `caller_tgid` may do `operation` on an inode carrying
+/// `flags` although the inode is protected for it — only PID 1 removing a
+/// protected unit's cgroup directory ([`FS_PROTECT_INIT_RMDIR`]). The kernel
+/// deny's test, kept here so it is unit-tested once.
+pub const fn fs_protect_init_may(operation: u8, flags: u8, caller_tgid: u32) -> bool {
+    operation == FS_OP_RMDIR && flags & FS_PROTECT_INIT_RMDIR != 0 && caller_tgid == 1
+}
+
+/// Lot 273: the operation a refused `operation` on an inode carrying
+/// `flags` is signed as — a write-open of a protected `cgroup.kill` or
+/// `cgroup.freeze` by what it would have done, any other by itself.
+pub const fn fs_protect_denied_op(operation: u8, flags: u8) -> u8 {
+    if operation != FS_OP_WRITE {
+        operation
+    } else if flags & FS_PROTECT_CGROUP_KILL != 0 {
+        FS_OP_CGROUP_KILL
+    } else if flags & FS_PROTECT_CGROUP_FREEZE != 0 {
+        FS_OP_CGROUP_FREEZE
+    } else {
+        FS_OP_WRITE
     }
 }
 
@@ -1633,12 +1689,68 @@ mod tests {
             FS_PROTECT_WRITE,
             FS_PROTECT_READ,
             FS_PROTECT_NOCREATE,
+            FS_PROTECT_INIT_RMDIR,
+            FS_PROTECT_CGROUP_KILL,
+            FS_PROTECT_CGROUP_FREEZE,
         ];
         for (i, a) in bits.iter().enumerate() {
             assert_eq!(a.count_ones(), 1);
             for b in &bits[i + 1..] {
                 assert_eq!(a & b, 0, "flag bits overlap");
             }
+        }
+        // Lot 273: the new bits mark, they never require (no operation is
+        // refused for carrying one).
+        for op in 1..=FS_OP_CGROUP_FREEZE {
+            let r = fs_protect_required(op);
+            assert_eq!(
+                r & (FS_PROTECT_INIT_RMDIR | FS_PROTECT_CGROUP_KILL | FS_PROTECT_CGROUP_FREEZE),
+                0,
+                "op {op}"
+            );
+        }
+    }
+
+    /// Lot 273: PID 1 may remove a protected unit's cgroup directory, and
+    /// nothing else: not another caller, not another operation, not
+    /// another directory.
+    #[test]
+    fn only_init_removes_a_unit_cgroup_directory() {
+        let dir = FS_PROTECT_MUTATE | FS_PROTECT_NOCREATE | FS_PROTECT_INIT_RMDIR;
+        assert!(fs_protect_init_may(FS_OP_RMDIR, dir, 1));
+        for caller in [0, 2, 1000, u32::MAX] {
+            assert!(!fs_protect_init_may(FS_OP_RMDIR, dir, caller), "{caller}");
+        }
+        for op in 1..=FS_OP_CGROUP_FREEZE {
+            if op != FS_OP_RMDIR {
+                assert!(!fs_protect_init_may(op, dir, 1), "op {op}");
+            }
+        }
+        assert!(!fs_protect_init_may(
+            FS_OP_RMDIR,
+            FS_PROTECT_MUTATE | FS_PROTECT_NOCREATE,
+            1
+        ));
+    }
+
+    /// Lot 273: a refused write-open of `cgroup.kill` / `cgroup.freeze` is
+    /// signed by what it would have done; every other refusal as itself.
+    #[test]
+    fn a_refused_cgroup_write_is_signed_by_its_effect() {
+        let kill = FS_PROTECT_MUTATE | FS_PROTECT_WRITE | FS_PROTECT_CGROUP_KILL;
+        let freeze = FS_PROTECT_MUTATE | FS_PROTECT_WRITE | FS_PROTECT_CGROUP_FREEZE;
+        assert_eq!(fs_protect_denied_op(FS_OP_WRITE, kill), FS_OP_CGROUP_KILL);
+        assert_eq!(
+            fs_protect_denied_op(FS_OP_WRITE, freeze),
+            FS_OP_CGROUP_FREEZE
+        );
+        assert_eq!(
+            fs_protect_denied_op(FS_OP_WRITE, FS_PROTECT_MUTATE | FS_PROTECT_WRITE),
+            FS_OP_WRITE
+        );
+        for op in [FS_OP_SETATTR, FS_OP_UNLINK, FS_OP_RENAME, FS_OP_XATTR] {
+            assert_eq!(fs_protect_denied_op(op, kill), op);
+            assert_eq!(fs_protect_denied_op(op, freeze), op);
         }
     }
 
@@ -1664,6 +1776,9 @@ mod tests {
             FS_OP_MKDIR,
             FS_OP_MKNOD,
             FS_OP_XATTR,
+            FS_OP_CGROUP_MOVE,
+            FS_OP_CGROUP_KILL,
+            FS_OP_CGROUP_FREEZE,
         ];
         for (i, a) in ops.iter().enumerate() {
             assert_ne!(*a, 0);

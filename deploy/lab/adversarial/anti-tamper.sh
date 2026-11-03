@@ -220,6 +220,25 @@ def cmd_file(op, path, arg=None):
                 msg = "read %d byte(s) (not shown)" % len(os.read(fd, 4096))
             finally:
                 os.close(fd)
+        elif op == "write" and arg is not None:
+            # lot 273: a cgroup control file — the open is what the deny
+            # refuses; a value the kernel rejects after it opened (ERANGE)
+            # says it opened
+            fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                os.write(fd, arg.encode())
+            finally:
+                os.close(fd)
+            msg = "wrote %r" % arg
+        elif op == "mkdir":
+            os.mkdir(path)
+            msg = "made"
+        elif op == "rmdir":
+            os.rmdir(path)
+            msg = "removed"
+        elif op == "chown" and arg is not None and arg.isdigit():
+            os.lchown(path, int(arg), -1)
+            msg = "owner set to %s" % arg
         else:
             print("setup: unknown file operation %r" % op)
             return 2
@@ -227,6 +246,28 @@ def cmd_file(op, path, arg=None):
         print("%s %s: errno=%s" % (op, path, ename(e.errno)))
         return 1
     print("%s %s: %s" % (op, path, msg))
+    return 0
+
+def cmd_cgmove(pid, comm, start, procs):
+    # lot 273: move process <pid> (checked by comm and start time, never a
+    # bare pid) into the cgroup whose cgroup.procs is <procs>
+    cur, why = resolve(pid, comm, start)
+    if cur is None:
+        print("target=absent (%s)" % why)
+        return 3
+    if not procs.endswith("/cgroup.procs") or not procs.startswith("/sys/fs/cgroup/"):
+        print("setup: %r is not a cgroup.procs under /sys/fs/cgroup" % procs)
+        return 2
+    try:
+        fd = os.open(procs, os.O_WRONLY | os.O_NOFOLLOW)
+        try:
+            os.write(fd, pid.encode())
+        finally:
+            os.close(fd)
+    except OSError as e:
+        print("move %s to %s: errno=%s" % (pid, procs, ename(e.errno)))
+        return 1
+    print("moved %s to %s" % (pid, procs))
     return 0
 
 def file_id(path, kind):
@@ -595,6 +636,22 @@ def selftest():
         check(rc == 1 and "errno=ENOENT" in out, "errno name reported")
         rc, out = quiet(cmd_fileid, g, "ino")
         check(rc == 1 and out.startswith("missing"), "fileid of a missing file")
+        # lot 273: the cgroup control-file operations, on plain files here
+        with open(f, "w") as fh:
+            fh.write("0")
+        rc, out = quiet(cmd_file, "write", f, "1")
+        check(rc == 0 and open(f).read() == "1", "write writes the value")
+        rc, out = quiet(cmd_file, "write", g, "1")
+        check(rc == 1 and "errno=ENOENT" in out and not os.path.exists(g), "write never creates")
+        sub = os.path.join(d, "sub")
+        rc, out = quiet(cmd_file, "mkdir", sub)
+        check(rc == 0 and os.path.isdir(sub), "mkdir")
+        rc, out = quiet(cmd_file, "rmdir", sub)
+        check(rc == 0 and not os.path.exists(sub), "rmdir")
+        rc, out = quiet(cmd_file, "chown", f, "x")
+        check(rc == 2, "chown takes a numeric uid")
+        rc, out = quiet(cmd_cgmove, str(os.getpid()), "x", "0", "/sys/fs/cgroup/cgroup.procs")
+        check(rc == 3 and out.startswith("target=absent"), "cgmove checks the target's identity")
         if os.geteuid() != 0:
             with open(f, "w") as fh:
                 fh.write("x")
@@ -673,6 +730,7 @@ def main(argv):
         "evidence": (cmd_evidence, 4), "syscall-nr": (cmd_syscall_nr, 1),
         "finit": (cmd_finit, 1), "kexec-file": (cmd_kexec_file, 2),
         "kexec-unload": (cmd_kexec_unload, 0), "strip-sig": (cmd_strip_sig, 2),
+        "cgmove": (cmd_cgmove, 4),
     }
     if argv and argv[0] == "file" and len(argv) in (3, 4):
         return cmd_file(*argv[1:])
@@ -1389,10 +1447,29 @@ fi
 # ── cgroup freezer ────────────────────────────────────────────────────────
 # External audit LAB-017/LAB-026 (lab PR 206): a case whose interface is
 # missing is a row (skipped_case), never left out of the table.
-CG=/sys/fs/cgroup/system.slice/northnarrow-agent.service/cgroup.freeze
+# Lot 273: the units' cgroups are protected (their cgroup.freeze and
+# cgroup.kill, and their slices', refused outside a trusted-installer
+# window; C65-C76 below): a freeze is refused and signed (it was allowed,
+# and seen only as integrity_drift).
+CGROOT=/sys/fs/cgroup
+AG_CG=$(systemctl show -p ControlGroup --value northnarrow-agent 2>/dev/null)
+WD_CG=$(systemctl show -p ControlGroup --value northnarrow-watchdog 2>/dev/null)
+cg_of() { sed -n 's/^0:://p' "/proc/${1:-0}/cgroup" 2>/dev/null; }
+post_cgroup() {   # <pid> <cgroup>: the process is in that cgroup
+    local now; now=$(cg_of "$1")
+    [[ -n "$now" && "$now" == "$2" ]] || { echo "pid $1 is in ${now:-?}, not $2"; return 1; }
+}
+post_thawed() {   # <cgroup.freeze>
+    [[ "$(cat "$1" 2>/dev/null)" == 0 ]] || { echo "${1%/*} is frozen"; return 1; }
+}
+post_gone() { [[ ! -e "$1" ]] || { echo "$1 exists"; return 1; }; }
+CG=$CGROOT${AG_CG:-/system.slice/northnarrow-agent.service}/cgroup.freeze
 if [[ -w "$CG" ]]; then
     selected C15 && CG_FROZEN=$CG   # thawed by the trap if the run stops here
-    WAIT=40 run_case C15 "cgroup v2 freeze of the agent for 45 s" allowed "integrity_drift|agent_boot" 0 -- bash -c "echo 1 > $CG && sleep 45 && echo 0 > $CG"
+    PID=$(agent_pid); START=$(proc_start "$PID")
+    POST="$(post post_proc "${PID:-0}" "${START:-0}" northnarrow-age) && $(post post_thawed "$CG")" \
+    run_case C15 "cgroup v2 freeze of the agent (no window)" denied "deny=cgroup_freeze" 0 -- nnpy file write "$CG" 1
+    [[ "$(cat "$CG" 2>/dev/null)" == 0 ]] || echo 0 > "$CG" 2>/dev/null
     CG_FROZEN=
 elif [[ ! -e /sys/fs/cgroup/cgroup.controllers ]]; then
     skipped_case C15 "no cgroup v2 hierarchy" 1
@@ -1431,12 +1508,15 @@ OVL="$ETC/zz-tamper-$(date +%s).local"
 # External audit EBPF-015: a new entry in /etc/northnarrow is refused.
 run_case C19 "drop a .local overlay in /etc/northnarrow" denied "deny=create" 0 -- bash -c "echo '+evil-implant' > $OVL"
 # ── kills nothing can refuse, saturation, io_uring ────────────────────────
-CGK=/sys/fs/cgroup/system.slice/northnarrow-agent.service/cgroup.kill
+CGK=$CGROOT${AG_CG:-/system.slice/northnarrow-agent.service}/cgroup.kill
 if [[ -w "$CGK" ]]; then
-    # kernel-generated SIGKILL: no task_kill hook on this path. The watchdog
-    # brings the agent back; the new boot must say its predecessor died
-    # without agent_stop.
-    WAIT=25 run_case C20 "cgroup.kill on the agent's unit" allowed "prev_run_abrupt" 0 -- bash -c "echo 1 > $CGK"
+    # kernel-generated SIGKILL: no task_kill hook on this path. Lot 273: the
+    # write-open is refused outside a window and signed cgroup_kill (it
+    # killed the agent; the watchdog brought it back, prev_run_abrupt). A
+    # kill inside a window is C76.
+    PID=$(agent_pid); START=$(proc_start "$PID")
+    POST=$(post post_proc "${PID:-0}" "${START:-0}" northnarrow-age) \
+    WAIT=8 run_case C20 "cgroup.kill on the agent's unit (no window)" denied "deny=cgroup_kill" 0 -- nnpy file write "$CGK" 1
     PID=$(agent_pid)
 fi
 # 20k execs to overflow the exec ring, one exec from /tmp hidden inside:
@@ -1599,6 +1679,10 @@ WDPID=$(wd_pid); WDSTART=$(proc_start "$WDPID")
 POST=$(post post_proc "${WDPID:-0}" "${WDSTART:-0}" northnarrow-wat) \
 run_case C32 "systemctl kill -s SIGSTOP the watchdog (no window)" denied "deny=signal" 0 -- systemctl kill -s SIGSTOP northnarrow-watchdog
 if [[ -z "$ONLY" || ",$ONLY," == *",C33,"* ]]; then
+    # Lot 273: the agent C33 must find running is the one running now (on
+    # systemd 257 a C31 that went through killed the agent, and the
+    # watchdog's restart read as a stop allowed here)
+    PID=$(agent_pid)
     t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
     out=$(timeout 60 systemctl stop northnarrow-agent 2>&1); rc=$?
     sleep 2; ev=$(evidence "$t0" "$a0" "$d0")
@@ -1610,6 +1694,91 @@ if [[ -z "$ONLY" || ",$ONLY," == *",C33,"* ]]; then
     fi
     rows+=("| C33 | systemctl stop the agent (no window) | $st | $ev | $v |")
     echo "C33 systemctl stop the agent (no window) → $st; $ev; $v" >&2
+fi
+
+# ── the units' cgroups (lot 273) ─────────────────────────────────────────
+# systemd 257 and later answer `systemctl kill -s SIGKILL` with a write to
+# the unit's cgroup.kill once the main process refused the signal (C31): a
+# kernel kill no task_kill hook sees. Outside a trusted-installer window
+# the agent's and the watchdog's cgroup.kill and cgroup.freeze (and their
+# slices') are refused, as are a child cgroup, an rmdir and a chown of the
+# unit's cgroup, and a move of the agent or the watchdog to another cgroup
+# (where it could be killed or frozen); every one is signed. A slice's
+# files are written "0" (a no-op if the open went through: ERANGE for
+# cgroup.kill). Inside a window it is all allowed (C76, at the end).
+if [[ ! -e $CGROOT/cgroup.controllers || -z "$AG_CG" || -z "$WD_CG" ]]; then
+    skipped_case C65,C66,C67,C68,C69,C70,C71,C72,C73,C74,C75 "no cgroup v2 hierarchy, or a unit without a ControlGroup" 0
+else
+    PID=$(agent_pid); START=$(proc_start "$PID")
+    WDPID=$(wd_pid); WDSTART=$(proc_start "$WDPID")
+    AG_SLICE=${AG_CG%/*}
+    POST=$(post post_proc "${WDPID:-0}" "${WDSTART:-0}" northnarrow-wat) \
+    run_case C65 "systemctl kill -s SIGKILL the watchdog (no window)" denied "deny=signal|deny=cgroup_kill" 0 -- systemctl kill -s SIGKILL northnarrow-watchdog
+    WDPID=$(wd_pid); WDSTART=$(proc_start "$WDPID")
+    # systemd 249 marks the unit `freezing` before it writes cgroup.freeze
+    # and keeps that state when the write is refused: a second `systemctl
+    # freeze` then writes nothing ("Previously requested freezer operation
+    # … still in progress") until the next freezer event of the cgroup — a
+    # case with nothing to refuse, reported as such while the cgroup is not
+    # frozen (252 and later write again, or skip a thaw of a running one)
+    FS0=$(systemctl show -p FreezerState --value northnarrow-agent 2>/dev/null)
+    if selected C66 && [[ -n $FS0 && $FS0 != running && "$(cat "$CGROOT$AG_CG/cgroup.freeze" 2>/dev/null)" == 0 ]]; then
+        skipped_case C66 "systemd's own freezer state of the unit is $FS0 and its cgroup is not frozen: systemd 249 keeps that state after a refused freeze and writes nothing until the next freezer event" 1
+    elif selected C66; then
+        CG_FROZEN=$CGROOT$AG_CG/cgroup.freeze
+        POST="$(post post_proc "${PID:-0}" "${START:-0}" northnarrow-age) && $(post post_thawed "$CGROOT$AG_CG/cgroup.freeze")" \
+        run_case C66 "systemctl freeze the agent (no window)" denied "deny=cgroup_freeze" 0 -- systemctl freeze northnarrow-agent
+        systemctl thaw northnarrow-agent >/dev/null 2>&1
+        CG_FROZEN=
+    fi
+    POST=$(post post_proc "${WDPID:-0}" "${WDSTART:-0}" northnarrow-wat) \
+    run_case C67 "cgroup.kill on the watchdog's unit (no window)" denied "deny=cgroup_kill" 0 -- nnpy file write "$CGROOT$WD_CG/cgroup.kill" 1
+    WDPID=$(wd_pid); WDSTART=$(proc_start "$WDPID")
+    if selected C75; then
+        CG_FROZEN=$CGROOT$WD_CG/cgroup.freeze
+        POST="$(post post_proc "${WDPID:-0}" "${WDSTART:-0}" northnarrow-wat) && $(post post_thawed "$CGROOT$WD_CG/cgroup.freeze")" \
+        run_case C75 "cgroup.freeze of the watchdog's unit (no window)" denied "deny=cgroup_freeze" 0 -- nnpy file write "$CGROOT$WD_CG/cgroup.freeze" 1
+        [[ "$(cat "$CGROOT$WD_CG/cgroup.freeze" 2>/dev/null)" == 0 ]] || echo 0 > "$CGROOT$WD_CG/cgroup.freeze" 2>/dev/null
+        CG_FROZEN=
+    fi
+    if [[ -n "$AG_SLICE" && -e "$CGROOT$AG_SLICE/cgroup.freeze" ]]; then
+        run_case C68 "cgroup.freeze of the agent's slice ${AG_SLICE} (write 0, no window)" denied "deny=cgroup_freeze" 0 -- nnpy file write "$CGROOT$AG_SLICE/cgroup.freeze" 0
+    else
+        skipped_case C68 "the agent's unit is in no slice with a cgroup.freeze (${AG_SLICE:-root})" 0
+    fi
+    if [[ -n "$AG_SLICE" && -e "$CGROOT$AG_SLICE/cgroup.kill" ]]; then
+        run_case C69 "cgroup.kill of the agent's slice ${AG_SLICE} (write 0, no window)" denied "deny=cgroup_kill" 0 -- nnpy file write "$CGROOT$AG_SLICE/cgroup.kill" 0
+    else
+        skipped_case C69 "the agent's unit is in no slice with a cgroup.kill (${AG_SLICE:-root}; kernel 5.14+)" 0
+    fi
+    # a move out: into a fresh cgroup at the root, moved back if it went
+    MV=$CGROOT/nn-lab-c70
+    if selected_any C70,C71; then mkdir -p "$MV"; fi
+    POST=$(post post_cgroup "${PID:-0}" "$AG_CG") \
+    run_case C70 "move the agent's pid to another cgroup (no window)" denied "deny=cgroup_move" 0 -- nnpy cgmove "${PID:-0}" northnarrow-age "${START:-0}" "$MV/cgroup.procs"
+    if selected C70 && [[ "$(cg_of "$PID")" != "$AG_CG" ]]; then
+        nnpy cgmove "$PID" northnarrow-age "$START" "$CGROOT$AG_CG/cgroup.procs" >/dev/null 2>&1
+        restored C70 "the agent's cgroup" "$AG_CG" "$(cg_of "$PID")"
+    fi
+    POST=$(post post_cgroup "${WDPID:-0}" "$WD_CG") \
+    run_case C71 "move the watchdog's pid to another cgroup (no window)" denied "deny=cgroup_move" 0 -- nnpy cgmove "${WDPID:-0}" northnarrow-wat "${WDSTART:-0}" "$MV/cgroup.procs"
+    if selected C71 && [[ "$(cg_of "$WDPID")" != "$WD_CG" ]]; then
+        nnpy cgmove "$WDPID" northnarrow-wat "$WDSTART" "$CGROOT$WD_CG/cgroup.procs" >/dev/null 2>&1
+        restored C71 "the watchdog's cgroup" "$WD_CG" "$(cg_of "$WDPID")"
+    fi
+    if selected_any C70,C71; then rmdir "$MV" 2>/dev/null; restored C70 "$MV" absent "$([[ -e $MV ]] && echo present || echo absent)"; fi
+    CHILD=$CGROOT$AG_CG/nn-lab-c72
+    POST=$(post post_gone "$CHILD") \
+    run_case C72 "a child cgroup in the agent's unit cgroup (no window)" denied "deny=mkdir" 0 -- nnpy file mkdir "$CHILD"
+    if selected C72 && [[ -d "$CHILD" ]]; then rmdir "$CHILD" 2>/dev/null; fi
+    POST=$(post post_proc "${PID:-0}" "${START:-0}" northnarrow-age) \
+    run_case C73 "rmdir the agent's unit cgroup (no window)" denied "deny=rmdir" 0 -- nnpy file rmdir "$CGROOT$AG_CG"
+    if selected C74; then
+        OWN0=$(stat -c %u "$CGROOT$AG_CG/cgroup.procs" 2>/dev/null)
+        run_case C74 "chown the agent's cgroup.procs (a delegation, no window)" denied "deny=setattr" 0 -- nnpy file chown "$CGROOT$AG_CG/cgroup.procs" 65534
+        [[ "$(stat -c %u "$CGROOT$AG_CG/cgroup.procs" 2>/dev/null)" == "${OWN0:-0}" ]] || chown "${OWN0:-0}" "$CGROOT$AG_CG/cgroup.procs" 2>/dev/null
+        restored C74 "the owner of the agent's cgroup.procs" "${OWN0:-0}" "$(stat -c %u "$CGROOT$AG_CG/cgroup.procs" 2>/dev/null)"
+    fi
 fi
 
 # ── vectors the matrix lacked (external audit LAB-004, lab PR 154) ───────
@@ -1908,6 +2077,56 @@ if [[ -z "$ONLY" || ",$ONLY," == *",C54,"* ]]; then
     rows+=("| C54 | new entries and an xattr inside a trusted-installer window | $st | $ev | $v |")
     echo "C54 new entries and an xattr inside a trusted-installer window → $st; $ev; $v" >&2
     for i in $(seq 1 40); do window_open || break; sleep 1; done
+fi
+
+# Lot 273: inside a trusted-installer window the units' cgroups are the
+# operator's: a freeze and a thaw of the agent, a move out and back, then
+# `systemctl kill -s SIGKILL` (cgroup.kill on systemd 257 and later) — all
+# allowed, nothing refused; the watchdog brings the agent back, and the new
+# boot says its predecessor died without agent_stop.
+if [[ -z "$ONLY" || ",$ONLY," == *",C76,"* ]]; then
+    if [[ ! -e $CGROOT/cgroup.controllers || -z "$AG_CG" ]]; then
+        skipped_case C76 "no cgroup v2 hierarchy, or no ControlGroup for the agent" 0
+    else
+        PID=$(agent_pid); START=$(proc_start "$PID")
+        MV=$CGROOT/nn-lab-c76
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        grant_window 60; sleep 2
+        CG_FROZEN=$CGROOT$AG_CG/cgroup.freeze
+        out=$(bash -c "echo 1 > $CGROOT$AG_CG/cgroup.freeze && sleep 1 && echo 0 > $CGROOT$AG_CG/cgroup.freeze" 2>&1); rc1=$?
+        CG_FROZEN=
+        mkdir -p "$MV"
+        out2=$(nnpy cgmove "$PID" northnarrow-age "$START" "$MV/cgroup.procs" 2>&1); rc2=$?
+        moved=$(cg_of "$PID")
+        nnpy cgmove "$PID" northnarrow-age "$START" "$CGROOT$AG_CG/cgroup.procs" >/dev/null 2>&1; rc3=$?
+        back=$(cg_of "$PID")
+        rmdir "$MV" 2>/dev/null
+        out4=$(systemctl kill -s SIGKILL northnarrow-agent 2>&1); rc4=$?
+        NEW=""
+        for i in $(seq 1 60); do
+            sleep 1
+            NEW=$(agent_pid 0) && [[ "$NEW" != "$PID" ]] && break
+            NEW=""
+        done
+        sleep 15; ev=$(evidence "$t0" "$a0" "$d0")
+        # systemd up to 256 kills the unit's processes one by one and reports
+        # the first that failed (the parse worker, gone with the agent:
+        # "Invalid argument" on 255): the kill counts by its effect — the
+        # agent replaced — unless it was refused
+        k_ok=0
+        (( rc4 == 0 )) && k_ok=1
+        if (( rc4 != 0 )) && [[ -n "$NEW" ]] && ! grep -qE 'Access denied|Operation not permitted|Permission denied' <<<"$out4"; then k_ok=1; fi
+        if (( rc1 == 0 && rc2 == 0 && rc3 == 0 && k_ok )) && [[ "$moved" == /nn-lab-c76 && "$back" == "$AG_CG" && -n "$NEW" ]] \
+           && echo "$ev" | grep -q prev_run_abrupt && ! echo "$ev" | grep -qE "deny=cgroup_"; then
+            v="OK"; st="allowed (agent $PID → $NEW$( (( rc4 )) && echo "; systemctl kill rc=$rc4: $(echo "$out4" | head -1 | cut -c1-50 | tr '|' '/')"))"
+        else
+            v="DEVIATION (inside the window: freeze rc=$rc1, move rc=$rc2 to ${moved:-?}, back rc=$rc3 ${back:-?}, kill rc=$rc4 $(echo "$out4" | head -1 | cut -c1-60), new agent ${NEW:-none})"; fail=1; st="denied or not done"
+        fi
+        rows+=("| C76 | freeze, move out and back, systemctl kill -s SIGKILL the agent inside a trusted-installer window | $st | $ev | $v |")
+        echo "C76 freeze, move, systemctl kill inside a window → $st; $ev; $v" >&2
+        PID=$(agent_pid)
+        for i in $(seq 1 40); do window_open || break; sleep 1; done
+    fi
 fi
 
 report_unreported

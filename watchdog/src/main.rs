@@ -39,11 +39,12 @@ use tracing_subscriber::EnvFilter;
 use northnarrow_watchdog::{
     check_shutdown_marker, evict_dead_agent, harden_self, hold_until_agent_returns,
     log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_exited, process_start_unix,
-    register_self_pid, reinsert_new_agent_pid, sd_notify_ready, sd_notify_status, stuck_recovery,
-    unregister_self_pid, wait_for_agent_death, write_pidfile_atomic, BackoffOutcome, Cli,
-    HoldOutcome, PingOutcome, RestartBackoff, ShutdownCheck, ShutdownVerdict, StatusPingTracker,
-    DEFAULT_AGENT_BIN, HOLD_POLL, PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL,
-    STATUS_PING_TIMEOUT, STUCK_RECOVERY_HARDKILL_GRACE,
+    register_own_cgroup, register_self_pid, reinsert_new_agent_pid, sd_notify_ready,
+    sd_notify_status, stuck_recovery, unregister_self_pid, wait_for_agent_death,
+    write_pidfile_atomic, BackoffOutcome, Cli, HoldOutcome, PingOutcome, RestartBackoff,
+    ShutdownCheck, ShutdownVerdict, StatusPingTracker, DEFAULT_AGENT_BIN, HOLD_POLL,
+    PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
+    STUCK_RECOVERY_HARDKILL_GRACE,
 };
 use northnarrow_watchdog::{
     classify_ping_error, exec_respawn_argv, hold_record_path, off_runtime, ping_ticker, reap_agent,
@@ -223,6 +224,12 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
             "could not register the watchdog PID in PROTECTED_PIDS — no BPF-LSM on this host? \
              stuck recovery will be refused by the task_kill hook until the agent registers us"
         );
+    } else {
+        // Lot 273: this unit's cgroup in PROTECTED_INODES as well (its
+        // cgroup.kill / cgroup.freeze refused outside a trusted-installer
+        // window), at once: the agent's refresh registers it too, up to
+        // 30 s later.
+        register_own_cgroup(&cli.bpffs_root, own_pid);
     }
 
     sd_notify_ready()

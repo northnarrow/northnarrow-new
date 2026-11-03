@@ -170,6 +170,10 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
                     // a missing deny hook refuses the start unless
                     // NN_ANTI_TAMPER_ALLOW_DEGRADED=1.
                     northnarrow_agent::anti_tamper::btf_revalidate::hook_arg_effect(m.struct_name)
+                } else if m.struct_name == common::btf_offsets::CGROUP_MOVE_TARGET.func {
+                    // Lot 273: the move guard's attach point, of another
+                    // shape on this kernel (its absence is signed).
+                    northnarrow_agent::anti_tamper::cgroup_guard::MOVE_GUARD_ABSENT_EFFECT
                 } else {
                     "DNS QNAME decoding needs iov_iter.iter_type + ITER_UBUF/ITER_IOVEC"
                 };
@@ -415,6 +419,11 @@ pub(crate) fn btf_check(path: &std::path::Path) -> i32 {
                     format!(
                         "not attached: {} (the agent starts only with NN_ANTI_TAMPER_ALLOW_DEGRADED=1)",
                         northnarrow_agent::anti_tamper::btf_revalidate::hook_arg_effect(m.struct_name)
+                    )
+                } else if m.struct_name == common::btf_offsets::CGROUP_MOVE_TARGET.func {
+                    format!(
+                        "{} (signed subsystem_degraded)",
+                        northnarrow_agent::anti_tamper::cgroup_guard::MOVE_GUARD_ABSENT_EFFECT
                     )
                 } else {
                     "dependent sensor path disabled".to_string()

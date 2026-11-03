@@ -1672,6 +1672,45 @@ pub fn register_self_pid(bpffs_root: &Path, own_pid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Lot 273: register this watchdog's unit cgroup in the agent's pinned
+/// `PROTECTED_INODES` (`antitamper_bpf::cgroup_guard`): its `cgroup.kill`
+/// and `cgroup.freeze` (and the ancestor slices') refused outside a
+/// trusted-installer window, no child cgroup, no `rmdir` but PID 1's. The
+/// agent registers it as well once it has verified this pid; a failure
+/// here is logged, not fatal. Outside a systemd service's cgroup (a test, a
+/// watchdog started by hand) nothing is registered.
+pub fn register_own_cgroup(bpffs_root: &Path, own_pid: u32) {
+    use antitamper_bpf::cgroup_guard::UnitCgroup;
+    match antitamper_bpf::cgroup_guard::protect_unit_cgroup(bpffs_root, own_pid) {
+        Ok(UnitCgroup::Service { cgroup, entries }) => info!(
+            target: "watchdog",
+            pid = own_pid,
+            cgroup = %nn_model::log_escape::Escaped(&cgroup),
+            entries = entries.len(),
+            "watchdog unit cgroup registered in PROTECTED_INODES"
+        ),
+        Ok(UnitCgroup::NotAService { cgroup }) => info!(
+            target: "watchdog",
+            pid = own_pid,
+            cgroup = %nn_model::log_escape::Escaped(&cgroup),
+            "not in a systemd service's cgroup — the watchdog's cgroup is not protected"
+        ),
+        Ok(UnitCgroup::Unavailable { why }) => warn!(
+            target: "watchdog",
+            pid = own_pid,
+            reason = %why,
+            "the watchdog's unit cgroup is NOT protected"
+        ),
+        Err(e) => warn!(
+            target: "watchdog",
+            pid = own_pid,
+            error = %format!("{e:#}"),
+            "could not register the watchdog's unit cgroup in PROTECTED_INODES — the agent's \
+             refresh registers it"
+        ),
+    }
+}
+
 /// Counterpart of [`register_self_pid`] for a clean shutdown: leave no
 /// stale entry behind (the map holds 16 slots).
 pub fn unregister_self_pid(bpffs_root: &Path, own_pid: u32) -> Result<()> {

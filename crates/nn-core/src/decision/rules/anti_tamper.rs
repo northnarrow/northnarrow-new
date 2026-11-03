@@ -95,6 +95,36 @@ impl Rule for NnLAt001AntiTamperDenial {
                 "to change an extended attribute or ACL of protected inode \
                  {target_dev}:{target_ino}"
             ),
+            // Lot 273: the kernel kill of a whole cgroup, which no signal
+            // hook sees; systemd 257 and later write it for `systemctl kill
+            // -s SIGKILL` once the main process refused the signal.
+            FsProtectOperation::CgroupKill if *pid == 1 => format!(
+                "to kill a protected unit's cgroup through cgroup.kill (inode \
+                 {target_dev}:{target_ino}) on behalf of a `systemctl kill -s SIGKILL` outside \
+                 a trusted-installer window"
+            ),
+            FsProtectOperation::CgroupKill => format!(
+                "to kill every process of a protected unit's cgroup through cgroup.kill (inode \
+                 {target_dev}:{target_ino}), a kernel SIGKILL no signal hook sees"
+            ),
+            FsProtectOperation::CgroupFreeze if *pid == 1 => format!(
+                "to freeze a protected unit's cgroup through cgroup.freeze (inode \
+                 {target_dev}:{target_ino}) on behalf of a `systemctl freeze` outside a \
+                 trusted-installer window"
+            ),
+            FsProtectOperation::CgroupFreeze => format!(
+                "to freeze every process of a protected unit's cgroup through cgroup.freeze \
+                 (inode {target_dev}:{target_ino})"
+            ),
+            FsProtectOperation::CgroupMove if *pid == 1 => format!(
+                "to move protected pid {target_ino} to another cgroup on behalf of a systemd \
+                 request outside a trusted-installer window"
+            ),
+            FsProtectOperation::CgroupMove => format!(
+                "to move protected pid {target_ino} out of its unit's cgroup (cgroup.procs / \
+                 cgroup.threads), where it could be killed or frozen through a cgroup nobody \
+                 protects"
+            ),
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -158,6 +188,9 @@ mod tests {
             FsProtectOperation::Mkdir,
             FsProtectOperation::Mknod,
             FsProtectOperation::Xattr,
+            FsProtectOperation::CgroupMove,
+            FsProtectOperation::CgroupKill,
+            FsProtectOperation::CgroupFreeze,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))
@@ -206,5 +239,47 @@ mod tests {
         let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
         assert!(v.reasoning.contains("systemctl stop"), "{}", v.reasoning);
         assert!(v.reasoning.contains("trusted-installer window"));
+    }
+
+    /// Lot 273: a refused cgroup kill, freeze or move names what it would
+    /// have done — for PID 1 the `systemctl` request it relayed — and a
+    /// move names the protected pid.
+    #[test]
+    fn a_refused_cgroup_operation_names_its_effect() {
+        let relayed = |op| {
+            let mut e = denial(op);
+            if let Event::FsProtectDenial { pid, comm, .. } = &mut e {
+                *pid = 1;
+                *comm = "systemd".into();
+            }
+            NnLAt001AntiTamperDenial
+                .evaluate(&e)
+                .expect("verdict")
+                .reasoning
+        };
+        let direct = |op| {
+            NnLAt001AntiTamperDenial
+                .evaluate(&denial(op))
+                .expect("verdict")
+                .reasoning
+        };
+        let r = relayed(FsProtectOperation::CgroupKill);
+        assert!(r.contains("systemctl kill -s SIGKILL"), "{r}");
+        assert!(r.contains("cgroup.kill (inode 9:709)"), "{r}");
+        let r = direct(FsProtectOperation::CgroupKill);
+        assert!(r.contains("no signal hook sees"), "{r}");
+        assert!(!r.contains("systemctl"), "{r}");
+        let r = relayed(FsProtectOperation::CgroupFreeze);
+        assert!(r.contains("systemctl freeze"), "{r}");
+        let r = direct(FsProtectOperation::CgroupFreeze);
+        assert!(r.contains("cgroup.freeze (inode 9:709)"), "{r}");
+        let r = direct(FsProtectOperation::CgroupMove);
+        assert!(
+            r.contains("protected pid 709 out of its unit's cgroup"),
+            "{r}"
+        );
+        let r = relayed(FsProtectOperation::CgroupMove);
+        assert!(r.contains("protected pid 709"), "{r}");
+        assert!(r.contains("systemd request"), "{r}");
     }
 }

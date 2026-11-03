@@ -420,6 +420,16 @@ async fn run(
         &signing_key,
         &journal,
     );
+    // Lot 273: an anti-tamper denial's row names its caller's executable
+    // from the lineage, which keeps the exec of a process already gone.
+    if let Some(sink) = &detection_sink {
+        let lineage_for_sink = lineage.clone();
+        sink.set_exe_resolver(Box::new(move |pid, ts_ns| {
+            lineage_for_sink
+                .exec_identity(pid, northnarrow_agent::posture::lineage::AsOf::live(ts_ns))
+                .map(|e| e.exe.to_string_lossy().into_owned())
+        }));
+    }
     // R12c-2 (lab PR 270): the heartbeat's chain rotates as the others.
     let heartbeat_protection = rotation_protection.clone();
     let heartbeat_rotation = state_protection.is_some();

@@ -21,11 +21,11 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted hooks (map size).
-pub const FAIL_OPEN_SLOTS: u32 = 20;
+pub const FAIL_OPEN_SLOTS: u32 = 22;
 
 /// Slot of each deny hook in `DENY_FAIL_OPEN`: the agent's `DENY_HOOKS`,
 /// then its optional deny hooks, then the `bpf` hook (an observer that
-/// also refuses link handles).
+/// also refuses link handles), then the cgroup move guard's (lot 273).
 pub mod hook {
     pub const TASK_KILL: u32 = 0;
     pub const PTRACE_ACCESS_CHECK: u32 = 1;
@@ -47,6 +47,12 @@ pub mod hook {
     pub const INODE_REMOVE_ACL: u32 = 17;
     pub const FILE_IOCTL_COMPAT: u32 = 18;
     pub const BPF: u32 = 19;
+    /// Lot 273: the cgroup move guard's two programs (optional deny hooks:
+    /// attached where the kernel's BTF has `cgroup_procs_write_start` in
+    /// the shape the program reads). `inode_permission` decides from a map
+    /// and has no read to fail; the fexit counts a task it cannot tell.
+    pub const INODE_PERMISSION: u32 = 20;
+    pub const CGROUP_PROCS_WRITE_START: u32 = 21;
 }
 
 /// LSM hook names, indexed by slot (the names `DENY_HOOKS` uses).
@@ -71,6 +77,8 @@ pub const FAIL_OPEN_HOOKS: [&str; FAIL_OPEN_SLOTS as usize] = [
     "inode_remove_acl",
     "file_ioctl_compat",
     "bpf",
+    "inode_permission",
+    "cgroup_procs_write_start",
 ];
 
 #[cfg(test)]
@@ -102,11 +110,13 @@ mod tests {
             (hook::INODE_REMOVE_ACL, "inode_remove_acl"),
             (hook::FILE_IOCTL_COMPAT, "file_ioctl_compat"),
             (hook::BPF, "bpf"),
+            (hook::INODE_PERMISSION, "inode_permission"),
+            (hook::CGROUP_PROCS_WRITE_START, "cgroup_procs_write_start"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");
             assert_eq!(FAIL_OPEN_HOOKS[i], *name);
         }
-        assert_eq!(hook::BPF + 1, FAIL_OPEN_SLOTS);
+        assert_eq!(hook::CGROUP_PROCS_WRITE_START + 1, FAIL_OPEN_SLOTS);
     }
 }

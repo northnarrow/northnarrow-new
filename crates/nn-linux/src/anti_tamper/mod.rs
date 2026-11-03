@@ -42,6 +42,8 @@ pub mod bpf_defense;
 /// BUG-036: boot-time revalidation of the compiled-in kernel struct
 /// offsets against the running kernel's BTF (refuse-to-start on drift).
 pub mod btf_revalidate;
+/// Lot 273: the protected units' cgroups (kill, freeze, moves).
+pub mod cgroup_guard;
 /// R07 shim (lab PR 247; plan §4.1 rule 2, removed in R17): the COMBAT
 /// carve-out's list is nn-core's.
 pub use nn_core::anti_tamper::combat_allow;
@@ -462,6 +464,34 @@ fn attach_reporting(
         deny.missing_hook(PTRACE_PROGRAM, format!("{e:#}"));
     }
 
+    // Lot 273: the unit cgroups of the agent and of the live watchdog (and
+    // their ancestor slices' kill and freeze) in PROTECTED_INODES, before
+    // the FS deny hooks attach and before the stale-key prune. The
+    // watchdog is the PROTECTED_PIDS entry that survived the stale scan
+    // above (it runs the installed watchdog binary); it registered its
+    // cgroup itself at its start, and this boot's prune would otherwise
+    // drop those keys until the refresh registers them again.
+    let mut cgroup_pids: Vec<u32> = pids.to_vec();
+    let live = ProtectedPidsHandle::from_ebpf(ebpf).and_then(|h| h.pids());
+    for pid in live.unwrap_or_default() {
+        if !cgroup_pids.contains(&pid)
+            && ExeIdentity::of_process(pid).is_some_and(|id| keep.contains(&id))
+        {
+            cgroup_pids.push(pid);
+        }
+    }
+    match cgroup_guard::register_unit_cgroups(ebpf, &cgroup_pids) {
+        Ok(reg) => {
+            for (pid, why) in reg.unavailable {
+                report.degraded.push(format!(
+                    "anti-tamper cgroup: the unit cgroup of pid {pid} is not protected ({why}): \
+                     a write to its cgroup.kill or cgroup.freeze is not refused"
+                ));
+            }
+        }
+        Err(e) => deny.infra_failure("cgroup_guard::register_unit_cgroups", format!("{e:#}")),
+    }
+
     // Tappa 7 task 5: directory + inode protection. A bootstrap failure
     // (no /var/lib, read-only rootfs, permission denied even as root)
     // means EVERY FS deny hook is absent, so it is counted as a deny
@@ -490,6 +520,21 @@ fn attach_reporting(
     }
     observe_failures.extend(fs.observe_failures);
     deny_expected += fs.optional_present;
+
+    // Lot 273: the cgroup move guard — an optional deny pair, expected
+    // where the kernel's BTF has its attach point in the shape it reads; a
+    // kernel without it signs the guard's absence.
+    let mg = cgroup_guard::attach_move_guard(ebpf, &btf, pin_root);
+    deny_expected += mg.present;
+    for (program, why) in mg.failures {
+        deny.missing_hook(program, why);
+    }
+    if let Some(why) = mg.absent {
+        report.degraded.push(format!(
+            "anti-tamper cgroup: {} ({why})",
+            cgroup_guard::MOVE_GUARD_ABSENT_EFFECT
+        ));
+    }
 
     // BPF self-defence (Tappa 10.8): map guard (deny) + bpf() observer.
     let bd = bpf_defense::attach(bpf_guard, ebpf, &btf, pin_root);
@@ -750,8 +795,18 @@ pub const DENY_HOOKS: [&str; 16] = [
 /// `file_ioctl_compat`, 6.8 and the stable releases 6.7.3, 6.6.15, 6.1.76,
 /// 5.15.149 and 5.10.210, lab PR 174). Each one the kernel has adds one
 /// to the expected deny hooks.
-pub const OPTIONAL_DENY_HOOKS: [&str; 3] =
-    ["inode_set_acl", "inode_remove_acl", "file_ioctl_compat"];
+///
+/// Lot 273: and the cgroup move guard's pair, attached together where the
+/// kernel's BTF has `cgroup_procs_write_start` in the shape its fexit
+/// reads ([`cgroup_guard`]); where it has not, the guard's absence is
+/// signed degraded.
+pub const OPTIONAL_DENY_HOOKS: [&str; 5] = [
+    "inode_set_acl",
+    "inode_remove_acl",
+    "file_ioctl_compat",
+    cgroup_guard::MOVE_DENY_HOOK,
+    cgroup_guard::MOVE_STASH_HOOK,
+];
 
 /// Deny hooks expected on a healthy boot of every supported kernel; the
 /// optional ones a kernel has come on top.

@@ -1977,6 +1977,13 @@ fn register_inode(ebpf: &mut Ebpf, key: &InodeKey, flags: u8) -> Result<()> {
     Ok(())
 }
 
+/// Lot 273: register an inode of a protected unit's cgroup
+/// ([`super::cgroup_guard`]) like the boot's other entries (kept by the
+/// stale-key prune).
+pub(crate) fn register_cgroup_inode(ebpf: &mut Ebpf, key: &InodeKey, flags: u8) -> Result<()> {
+    register_inode(ebpf, key, flags)
+}
+
 fn insert_inode(ebpf: &mut Ebpf, key: &InodeKey, flags: u8) -> Result<()> {
     let map = ebpf
         .map_mut(PROTECTED_INODES_MAP)
@@ -2480,6 +2487,14 @@ mod tests {
         //                = 0x100801
         // MKDEV = (8 << 20) | 257 = 0x800101
         assert_eq!(stat_dev_to_kernel_dev(0x100801), 0x800101);
+        // Lot 273: the cgroup guard's copy (antitamper-bpf, for the
+        // watchdog) is the same encoding.
+        for d in [0x802u64, 0x100801, 0x1f, 0x10_0000_0001] {
+            assert_eq!(
+                antitamper_bpf::cgroup_guard::stat_dev_to_kernel_dev(d),
+                stat_dev_to_kernel_dev(d)
+            );
+        }
     }
 
     /// External audit TST-009: the exported deny set is the hooks
@@ -2500,9 +2515,12 @@ mod tests {
             "a hook listed twice"
         );
         assert_eq!(super::super::LSM_DENY_HOOKS_EXPECTED, 16);
+        // Lot 273: the optional set is the optional inode hooks and the
+        // cgroup move guard's pair.
         let optional: BTreeSet<&str> = OPTIONAL_LSM_PROGRAMS
             .iter()
             .map(|(_, hook)| *hook)
+            .chain(super::super::cgroup_guard::GUARD_HOOKS)
             .collect();
         let exported_optional: BTreeSet<&str> =
             super::super::OPTIONAL_DENY_HOOKS.iter().copied().collect();
