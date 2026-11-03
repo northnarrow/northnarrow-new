@@ -582,6 +582,39 @@ fn install_opens_the_window_before_it_executes_its_tree() {
     assert_eq!((r.called(GRANT), r.called(TREE)), (0, 1), "{r:#?}");
 }
 
+/// Lot 278: install.sh executes the tree's agent only in `tree_version`,
+/// which runs only where its window is open or no agent judges it (the
+/// harness above): no other line executes `$AGENT_BIN` — the copies, the
+/// existence and freshness checks name it, nothing runs it.
+#[test]
+fn install_executes_the_tree_s_agent_only_in_tree_version() {
+    let text = read("deploy/install.sh");
+    let body = section("deploy/install.sh", "tree_version() {", "\n}\n");
+    assert!(
+        body.contains("new_ver=$(\"$AGENT_BIN\" --version"),
+        "{body}"
+    );
+    let start = text.find("tree_version() {").unwrap();
+    let end = start + body.len();
+    for (n, line) in text.lines().enumerate() {
+        let at = text.lines().take(n).map(|l| l.len() + 1).sum::<usize>();
+        let l = line.trim_start();
+        if (start..end).contains(&at) || l.starts_with('#') || !l.contains("\"$AGENT_BIN\"") {
+            continue;
+        }
+        let names_it = l.starts_with("install ")
+            || l.starts_with("require_file ")
+            || l.starts_with("for staged in ")
+            || l.contains("-nt \"$AGENT_BIN\"")
+            || l.starts_with("echo ");
+        assert!(
+            names_it,
+            "install.sh:{}: executes the tree's agent outside tree_version: {line}",
+            n + 1
+        );
+    }
+}
+
 /// uninstall.sh, same case: the agent is started for the window before
 /// anything is disabled; without a key it stops with nothing changed.
 #[test]

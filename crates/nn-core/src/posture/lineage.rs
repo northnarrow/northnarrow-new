@@ -5140,6 +5140,50 @@ mod tests {
         assert!(t.is_interactive_admin(200, AsOf::Now));
     }
 
+    /// Lot 278: `descends_from` by pid and start — the process itself or an
+    /// ancestor; a later process given the pid (another start), a process
+    /// outside the tree, PID 1 and a walk that loses the chain are not.
+    /// Hops read from `/proc` (outside a judgement) are held to the start
+    /// `/proc` shows.
+    #[test]
+    fn descends_from_is_by_pid_and_start() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        // the installer (cached, started at 50 s = tick 5000) and its child
+        t.ingest_exec(900, 800, "/usr/bin/bash", &[], 50 * S + 1, 50 * S, 0);
+        t.ingest_exec(
+            901,
+            900,
+            "/home/ci/nn/target/release/x",
+            &[],
+            52 * S,
+            52 * S,
+            0,
+        );
+        let judged = AsOf::Judged(52 * S);
+        assert!(t.descends_from(901, judged, 900, 5_000));
+        assert!(
+            t.descends_from(900, judged, 900, 5_000),
+            "the installer itself"
+        );
+        assert!(!t.descends_from(901, judged, 900, 7_000), "another start");
+        assert!(!t.descends_from(901, judged, 901 + 1, 5_000), "another pid");
+        assert!(!t.descends_from(901, judged, 1, 0), "never PID 1");
+        assert!(!t.descends_from(901, judged, 0, 0));
+        // outside a judgement, a parent known from /proc only (older than the
+        // agent, as the start's scan finds it): by its start there
+        write_started(tmp.path(), "self", 1, 100_000);
+        write_exe(tmp.path(), 950, "/usr/bin/bash");
+        write_status(tmp.path(), 950, 1);
+        write_started(tmp.path(), "950", 1, 6_000);
+        t.ingest_exec(951, 950, "/tmp/nn/x", &[], 61 * S, 61 * S, 0);
+        assert!(t.descends_from(951, AsOf::Now, 950, 6_000));
+        assert!(
+            !t.descends_from(951, AsOf::Now, 950, 6_001),
+            "/proc shows another start"
+        );
+    }
+
     /// Lot 278 (the lab's "R009 flake"): `sudo` with `use_pty` forks a
     /// monitor (no exec) that forks the command. `/proc` shows the
     /// monitor's start in clock ticks, rounded down, on the boot clock, less

@@ -303,6 +303,26 @@ mod tests {
         assert!(take_held().is_none());
     }
 
+    /// A record is never held: `hold_below_posture` leaves a `Log` as it
+    /// is and tells the engine nothing.
+    #[test]
+    fn a_record_is_not_held_below_a_posture() {
+        take_held();
+        let mut log = kill(R009_ID);
+        log.action = ResponseAction::Log;
+        let v = crate::decision::response_policy::hold_below_posture(
+            log,
+            "x",
+            PostureKind::Observing,
+            PostureKind::Combat,
+        );
+        assert_eq!(
+            (v.action, v.reasoning.as_str()),
+            (ResponseAction::Log, "why")
+        );
+        assert!(take_held().is_none());
+    }
+
     fn root_exec() -> Event {
         crate::decision::rules::testutil::spawn_as(0, "x", "/tmp/x")
     }
