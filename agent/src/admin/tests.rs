@@ -3566,6 +3566,66 @@ fn dispatch_trusted_installer_grant_names_the_requester_s_parent() {
     }
 }
 
+/// Review of #493 (note a; mutation MA2): through the dispatcher, a plain
+/// grant names no installer, whoever asked; the grant asked for an
+/// installer names the requester's parent, and the notes carry its pid for
+/// the audit row.
+#[test]
+fn only_the_grant_for_an_installer_names_one() {
+    use crate::os_rng::OsRng;
+    use ed25519_dalek::SigningKey;
+    let signing = SigningKey::generate(&mut OsRng);
+    let agent_id = [0x1d; 16];
+    let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+    let dir = TempDir::new().unwrap();
+    let isolator = NetworkIsolator::new(rules_path()).unwrap();
+    let posture = PostureMachine::new();
+    let marker = dir.path().join("marker");
+    let me = std::process::id();
+    let parent = std::os::unix::process::parent_id();
+    let client = AuditClient {
+        pid: me,
+        ..fake_client()
+    };
+    for (for_installer, wants) in [(false, None), (true, (parent > 1).then_some(parent))] {
+        let conn = ConnAuth::new(&auth);
+        let nonce = conn.issue_challenge().unwrap();
+        let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
+        let msg = if for_installer {
+            AdminMessage::TrustedInstallerGrantForInstallerRequest(req)
+        } else {
+            AdminMessage::TrustedInstallerGrantRequest(req)
+        };
+        let ov = test_override();
+        let mut notes = DispatchNotes::default();
+        let reply = dispatch(
+            msg,
+            &conn,
+            Wired {
+                installer_override: Some(&ov),
+                ..bare_context(
+                    &posture,
+                    &isolator,
+                    &marker,
+                    &AdminReadPaths::default(),
+                    &AdminHandles::default(),
+                )
+            },
+            &client,
+            &mut Vec::new(),
+            &mut notes,
+        );
+        assert_eq!(
+            reply,
+            AdminMessage::TrustedInstallerGrantResult(AdminResult::Success),
+            "for_installer={for_installer}"
+        );
+        let named = ov.current_grant().expect("open").grantee.map(|g| g.pid);
+        assert_eq!(named, wants, "for_installer={for_installer}");
+        assert_eq!(notes.installer_pid, wants, "for_installer={for_installer}");
+    }
+}
+
 /// A signature from a key NOT in admin.pub is rejected; the override
 /// stays disarmed.
 #[test]
