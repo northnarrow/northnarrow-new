@@ -50,8 +50,8 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CAT
 | `off <rule>` | not recorded, no response (the rule still runs, so chains and windows keep their state) |
 | `exempt <rule> uid <uid>` | that uid's matches of the rule are recorded only (not uid 0) |
 | `exempt <rule> exe <path> sha256 <hex>` | that executable — root-owned, in `/usr`, `/opt`, `/bin`, `/sbin`, `/lib*`, `/snap` or `/nix/store`, every directory up to `/` root-owned, no one else may write it, and its content exactly that digest |
-| `exempt <rule> cgroup <path>` | processes of that cgroup v2 path (it must end in a `.service` or `.scope`) |
-| `exempt <rule> unit <name>` | processes of that systemd unit (`backup.service`) |
+| `exempt <rule> cgroup <path>` | processes of that cgroup v2 path (it must end in a `.service` or `.scope`) **started there** (§2.1) |
+| `exempt <rule> unit <name>` | processes of that systemd unit (`backup.service`) **started there** (§2.1) |
 | `combat-without-corroboration NN-L-IMP-001` | the ransomware trigger reaches COMBAT without a second signal (it never locks COMBAT) |
 
 An exemption is **never** by process name: `comm`, `name`, `process` and
@@ -71,6 +71,68 @@ enforce NN-L-IMP-001
 exempt  NN-L-IMP-001 unit backup.service
 exempt  NN-L-IMP-001 exe /usr/bin/restic sha256 3f1c…(64 hex digits)
 ```
+
+### 2.1 Exemptions by cgroup or unit: started there, not moved there (lot 277)
+
+A cgroup's members are not all what the unit started: root can write its
+own pid into `/sys/fs/cgroup/system.slice/backup.service/cgroup.procs`, or
+start a child there with `clone3(CLONE_INTO_CGROUP)`, and is then "in"
+`backup.service`. Since lot 277 an exemption by `cgroup` or `unit` holds
+only for a process **started in that cgroup**: spawned into it by systemd
+(PID 1), or forked from a process that was.
+
+The kernel tells them apart (`agent-ebpf/src/cgroup_join.rs`, the
+start-in-cgroup tracker). It marks a process that was moved into a cgroup
+by anyone but systemd's placement, or started by `CLONE_INTO_CGROUP` by
+anyone but PID 1. A process it forks after that is marked too, before it
+runs, and the mark goes when its last thread exits. The rule's match of a
+marked process is not exempt by `cgroup` or `unit`. An exemption by `uid` or
+`exe` still covers it: those name the actor, not where it runs. systemd's
+placement is a move PID 1 makes (a unit's process at its start, a scope's
+process, a process systemd was asked to attach), or the move a child of
+PID 1 makes of itself before it ran any program (systemd up to 254 forks,
+the child moves itself, then executes the unit's command). A move that
+changes nothing is no move: systemd 255's executor moves itself after PID 1
+or `CLONE_INTO_CGROUP` already did.
+
+A move into a cgroup an exemption names, by anyone but systemd's placement,
+is a **signed detection**: NN-L-AT-001 with `operation` `cgroup_join`
+(Log, High). It is not refused, and it raises no posture trigger. The record
+names the mover (`principal`, `exe`) and, in `response`, the exemption the
+moved tree lost. The move goes through; what the moved process does is
+judged by the rules without the exemption. The kernel matches the
+destination's whole path against the `cgroup` exemptions and each of its
+components against the `unit` names: a move into a cgroup below an exempt
+unit (`backup.service/sub`) is signed too. A destination longer than 256
+bytes is signed without a name while any such exemption is in force.
+
+Where the exemption is refused:
+
+- on a kernel without the tracker (its targets not in the shape its
+  programs read: `northnarrow-agent --btf-check` prints `tracker
+  cgroup_join`; a signed `subsystem_degraded` "cgroup exemptions" at
+  every start) — every exemption by cgroup or unit;
+- after the kernel could not take a mark (32768 marked processes alive at
+  once; the counter is pinned): every exemption by cgroup or unit, until
+  the host reboots — never one mark lost in silence.
+
+What it does not cover, as measured:
+
+- **A root that changes the unit itself** — a drop-in that rewrites
+  `ExecStart=`, a transient unit given the exempt unit's name where none is
+  loaded, systemd asked over D-Bus to attach a process
+  (`AttachProcessesToUnit`). Those are systemd's placements: the unit
+  exemption trusts the unit's definition. To bind an exemption to a
+  program, use `exe <path> sha256 <hex>` (a rewritten unit runs another
+  digest).
+- A move made while no agent ran (before its first start, or between a
+  stop and the next start: the marks are pinned and outlive a restart, the
+  programs do not run without the agent).
+- A start by `CLONE_INTO_CGROUP` is marked, not signed: the kernel's fork
+  path gives no destination path to match cheaply.
+- The same principle holds for any future exemption by container or
+  workload: a process counts as the workload's when the workload's runtime
+  started it there, never because its cgroup says so.
 
 ## 3. Testing it before it is signed
 

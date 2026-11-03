@@ -1245,3 +1245,87 @@ Not done, and why:
 - **A soft-reboot** behaves as lot 273b measured it (outside this lot).
 - **Fail-open.** A task hook that cannot read its target's tgid lets the
   change through, counted in its `DENY_FAIL_OPEN` slot and signed.
+
+## Lot 277 — an exemption by cgroup is the cgroup's start, not its membership
+
+The per-rule policy may exempt an actor from a rule by its cgroup v2 path
+or its systemd unit (`docs/operator/RULE_POLICY.md` §2.1). Membership of a
+cgroup is not identity: root writes its own pid into an exempt service's
+`cgroup.procs` (or starts a child there with `clone3(CLONE_INTO_CGROUP)`)
+and is then "in" the service — exempt from the rule, killed by nothing.
+Since lot 277 such an exemption holds only for a process **started** in
+the cgroup: spawned into it by systemd, or forked from a process that
+was.
+
+### Mechanism
+
+The kernel decides, not a walk of the lineage afterwards. A walk cannot
+tell a process that a moved process forked and left (reparented to PID 1:
+the orphan of the review of 03/11) from a forking daemon's own child. The
+eBPF programs of `agent-ebpf/src/cgroup_join.rs` keep the pinned map
+`CGROUP_JOINED` (thread-group id → its leader's start time, how, by whom):
+
+- `cgroup_join_mark` (BTF tracepoint `cgroup_attach_task`, which fires
+  after a move through `cgroup.procs` / `cgroup.threads` went through)
+  marks the moved process, unless the move is systemd's placement. That
+  is a move PID 1 makes, or the move a child of PID 1 makes of itself
+  while it still runs PID 1's image (the same `mm->exe_file` as its parent:
+  it executed nothing since the fork; a reparented orphan of another
+  process does not share it). It does not mark a move that changes
+  nothing: `cgroup_join_src` (fexit `cgroup_procs_write_start`) records,
+  for a process moving itself, its cgroup before the move. The agent's
+  family is not marked: it moves processes into its containment cgroups,
+  which no exemption may name.
+- `cgroup_join_born` (fentry `cgroup_post_fork`) marks a child started by
+  `CLONE_INTO_CGROUP` by anyone but PID 1, before it runs.
+- `cgroup_join_fork` (BTF tracepoint `sched_process_fork`) marks a new
+  process forked by a marked one, before its first wake-up. The parent's
+  mark counts only with its leader's start time: a dead process's mark at
+  a reused id passes on nothing.
+- `cgroup_join_exit` (BTF tracepoint `sched_process_exit`) removes the mark
+  when the group's last thread exits (`signal->live` 0), not with its
+  leader, which may exit first.
+
+The exemption check (`nn_core::decision::rule_policy::exempt`) asks
+`ActorFacts::started_in_cgroup` once a cgroup or a unit matched. The
+agent's answer (`nn_linux::cgroup_join`, on the errands thread) is the
+map's: not marked, marked, or not known. Not known means no tracker on
+this kernel, a mark the map could not take, or a failed lookup. Marked and
+not known refuse the exemption. A move into a cgroup an exemption names
+(the policy's cgroup paths and unit names, hashed into
+`CGROUP_EXEMPT_NAMES`) is signed as NN-L-AT-001 `cgroup_join`. It is not
+refused, and the posture is not raised: the move is no tamper with the
+agent, and what the moved process does is judged without the exemption.
+
+Every move runs under `cgroup_mutex` and `cgroup_threadgroup_rwsem`, from
+the lookup to the tracepoint, and a fork takes the rwsem: a fork after a
+move sees the mark.
+
+### Residual
+
+- **Root changes the unit itself.** A drop-in that rewrites `ExecStart=`,
+  a transient unit given the exempt unit's name where none is loaded,
+  systemd asked over D-Bus to attach a process (`AttachProcessesToUnit`):
+  these are systemd's placements, and the unit exemption trusts the
+  unit's definition. An exemption by `exe … sha256` binds to the program.
+- **A move while no agent runs** (before its first start, between a stop
+  and the next start): the programs are attached by the agent, not
+  pinned. The marks are pinned and outlive a restart; the start removes
+  those of processes gone meanwhile.
+- **A start by `CLONE_INTO_CGROUP` is marked, not signed**: the fork path
+  gives no destination path to match.
+- **A full map** (32768 live marked processes; container runtimes' and
+  user managers' processes are marked too) refuses every exemption by
+  cgroup or unit until the host reboots: the counter is pinned, so no
+  mark is lost in silence.
+- **systemd 255 without `CLONE_INTO_CGROUP`** (a glibc older than 2.39):
+  PID 1 moves the executor it spawned, a placement. If the executor's own
+  move came first, the executor had already executed: that move marks
+  it, so the unit's processes lose their exemption (fail closed, a false
+  refusal). Not measured in this lot: its guests ran systemd 249
+  (Ubuntu 22.04, the fork path) and 257 (Debian 13, `CLONE_INTO_CGROUP`),
+  and both kept the exemption of a unit systemd started.
+- **A container or workload context**: any future exemption by container
+  or workload follows the same rule. A process counts as the workload's
+  when the workload's runtime started it there, never because its cgroup
+  says so.

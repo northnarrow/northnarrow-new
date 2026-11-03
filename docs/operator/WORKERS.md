@@ -84,7 +84,12 @@ northnarrow-agent`) or `/run/northnarrow/agent.pid` for the agent, and
 
 ## 3. The sandbox, and how much of it your kernel gives
 
-Every worker, on every kernel: its own account, no supplementary group, no
+Every worker, on every kernel, enters its sandbox as its process's only
+thread (lot 277: it counts the entries of `/proc/self/task` first and
+refuses with more than one — Landlock and `no_new_privs` bind the calling
+thread only, so a thread started before them would keep every right the
+worker gives up; it exits 78, below). Then: its own account, no
+supplementary group, no
 capability, `no_new_privs`, not dumpable, no process (`RLIMIT_NPROC` 0),
 no core, 8 descriptors, 512 MiB of address space, and a **seccomp
 allowlist** that kills it on any system call outside its own few (its
@@ -182,7 +187,7 @@ up 60 s enables the kind again. The manifest's state (`ready`,
 | `… hello refused: landlock below what ABI N gives …` or `… hello refused: its process is not what it declared …` | the worker's sandbox is not what the kernel gives, or its process (`/proc`) is not what it declared | report it with the kernel and `lsm=` |
 | `… spinning: N% of a CPU …` | the worker burnt the CPU with nothing to do | as above |
 | `… pid N could not be taken out of PROTECTED_PIDS …` | the agent keeps the dead worker unreaped (its pid cannot be reused) and tries again | look at the pinned maps (`nn-admin status`) |
-| `… exit status 78 (the sandbox could not be entered)` | the worker refused to run unconfined (the journal line before it says which step) | report it with the kernel and `lsm=` |
+| `… exit status 78 (the sandbox could not be entered)` | the worker refused to run unconfined (the journal line before it says which step; `refusing to enter with N threads` since lot 277: something started a thread before the sandbox) | report it with the kernel and `lsm=` |
 | `worker_parse: disabled: 5 failures in a row …` | the kind is off until a worker stays up 60 s | look at the failures above it |
 
 ## 5. Lab

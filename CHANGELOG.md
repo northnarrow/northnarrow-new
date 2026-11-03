@@ -6,6 +6,40 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Exemptions by cgroup or unit hold only for processes started in their
+  cgroup, the kernel's host checks name the fixes the sandbox relies on,
+  and a worker enters its sandbox single-threaded (lot 277, Wave 4 phase 3,
+  wave 1).
+  - The per-rule policy's `exempt <rule> cgroup|unit` held for any member
+    of the cgroup: root wrote its own pid into an exempt service's
+    `cgroup.procs` and was exempt. Five eBPF programs (the start-in-cgroup
+    tracker) now mark a process moved into a cgroup by anyone but systemd's
+    placement (a move by PID 1, or a fresh child of PID 1 moving itself
+    before its exec), a child started by `clone3(CLONE_INTO_CGROUP)` by
+    anyone but PID 1, and every process either one forks after it. The mark
+    goes with the group's last thread. A marked process is not exempt by
+    cgroup or unit; uid and exe exemptions are unchanged. A move into a
+    cgroup an exemption names is a signed NN-L-AT-001 `cgroup_join` (Log,
+    High; not refused, no posture trigger). A kernel without the tracker's
+    targets refuses every such exemption, a signed `subsystem_degraded`;
+    `--btf-check` prints `tracker cgroup_join`. Two optional offsets
+    (`signal_struct.live`, `kernel_clone_args.flags`) take slots 118–119;
+    the enum, tracepoint and hook-argument slots after them move by two.
+    Residuals as `ANTITAMPER_TRUST_MODEL.md` lists them (a root that
+    rewrites the unit itself is still the unit).
+  - `nn-admin host-check` (and the signed manifest's `host_hardening`):
+    `kernel_fixes` compares the kernel's upstream version (Ubuntu's
+    `version_signature`, Debian's banner, else `osrelease`) with the fixes
+    of CVE-2022-0847, CVE-2022-30594, CVE-2024-42318 and CVE-2025-68736,
+    each branch's version from the kernel CNA's records or the stable
+    changelogs (`KERNEL_COMPATIBILITY.md`, "Kernel fix level"). A
+    distribution's kernel below a fix is `unknown`, never `ok`. `lockdown`
+    recommends `integrity` on every host; `kexec_load_disabled` counts the
+    6.6+ load limits; `module_sig_enforce` counts `modules_disabled=1`.
+  - The worker counts the entries of `/proc/self/task` before its sandbox
+    and refuses to enter with more than one thread (Landlock and
+    `no_new_privs` bind the calling thread only): exit 78. The hostile
+    worker's `threaded` attack checks it in the privileged harness.
 - The agent's threads each keep only their capabilities, its keys in one
   place, its unit hardened (lot 272, Wave 4 phase 2, R14c of the
   restructure plan, §3.1–§3.3; `docs/architecture/PROCESS_MODEL.md` §8–§10).

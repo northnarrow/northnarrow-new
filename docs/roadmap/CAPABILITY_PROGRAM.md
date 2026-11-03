@@ -5218,3 +5218,97 @@ number in parentheses is a lab PR.
     outside this lot); a hybrid v1 host, another architecture than x86-64
     and a kernel without the proc offsets are signed degradations; the
     move guard's cost on path-heavy work.
+- **Lot 277 — C15/C23: an exemption by cgroup or unit holds for a process
+  started in the cgroup; the host check names the kernel fixes the sandbox
+  relies on; a worker enters its sandbox single-threaded (Wave 4 phase 3,
+  wave 1).**
+  - What was open: the per-rule policy's `exempt <rule> cgroup|unit`
+    matched any member of the cgroup (`/proc/<pid>/cgroup`). A root shell
+    that wrote its own pid into an exempt service's `cgroup.procs` was
+    exempt from the rule. `nn-admin host-check` named no kernel fix. The
+    worker never checked that it was its process's only thread before
+    Landlock and `no_new_privs`, which bind the calling thread only.
+  - What changed: five eBPF programs (the start-in-cgroup tracker,
+    `agent-ebpf/src/cgroup_join.rs`) mark a process moved into a cgroup by
+    anyone but systemd's placement. That placement is a move by PID 1, or
+    a fresh child of PID 1 moving itself while it shares PID 1's
+    `mm->exe_file`; a move that changes nothing is no move. They also mark
+    a child started by `clone3(CLONE_INTO_CGROUP)` by anyone but PID 1,
+    and every process either one forks after, before it runs. The mark goes
+    with the group's last thread. A marked process is not exempt by cgroup
+    or unit, and neither is one whose state is not known (no tracker on
+    this kernel, a mark the pinned map could not take). A move into a
+    cgroup an exemption names is a signed NN-L-AT-001 `cgroup_join` (not
+    refused, no posture trigger). The host check gained `kernel_fixes` for
+    CVE-2022-0847, CVE-2022-30594, CVE-2024-42318 and CVE-2025-68736, the
+    versions from the kernel CNA's records and the stable changelogs. A
+    distribution's kernel below a fix is `unknown`, never `ok`.
+    `lockdown=integrity` is recommended on every host; kexec counts its
+    6.6+ load limits; module signing counts `modules_disabled`. The worker
+    counts `/proc/self/task` first and exits 78 with more than one thread.
+  - The lab, as measured (our own QEMU guests, two at a time, left off):
+    - **Ubuntu 22.04** (`5.15.0-202-generic`, systemd 249). The first
+      build's `cgroup_join_mark` was refused by the 5.15 verifier: E2BIG,
+      a component length counted per byte over 256 bytes. The start signed
+      the tracker absent, and every exemption was refused, the control
+      included: fail closed. With the walk keeping no counter,
+      `verifier-check` passed: 84 of 86 programs, the two ACL hooks absent
+      on 5.15, the tracker's five loaded (`cgroup_join_mark` 876
+      instructions). `exempt-check`: MS-23 started by systemd as
+      `nn-lab-exempt.service` was exempt (300 of 300 files, no
+      `cgroup_join` record). A root shell that moved itself into the unit's
+      cgroup (`/proc/self/cgroup` named it) was killed under `enforce
+      NN-L-IMP-001` (20 of 300), and its move was a signed NN-L-AT-001
+      `cgroup_join` naming `unit nn-lab-exempt.service`. Its orphan
+      (reparented to PID 1, in the unit's cgroup) was killed too (20 of
+      300). A move into a cgroup no exemption names was not signed.
+      `host-check` `kernel_fixes`: `unknown`, 5.15.222 from Ubuntu's
+      signature, CVE-2025-68736 not in the version. On the tip before the
+      merge of #492: `test-ignored` 90 suites, 108 passed, 0 failed;
+      tamper-check 103 cases, 100 OK, C27 (no lockdown) and C57c the known
+      gaps, C64 the recorded deviation.
+    - **Debian 13** (`6.12.113+deb13-cloud-amd64`, systemd 257 with
+      `CLONE_INTO_CGROUP`), on the merged tip: `verifier-check` 90 OK
+      (`cgroup_join_mark` 908 instructions); `exempt-check` 8 of 8: the
+      control exempt (300 of 300), the spoof killed (23 of 300) and signed,
+      the orphan killed. The executor's own move after its
+      `CLONE_INTO_CGROUP` start marked nothing. `kernel_fixes`: `ok`, all
+      four in 6.12.113. `test-ignored` 90 suites, 108 passed, 0 failed (the
+      threaded worker refused its sandbox, exit 78, here and on 22.04).
+      Tamper-check against `main` (ebc4916a) on the same guest, 119 rows
+      each: 114 OK on both, the same outcome and verdict on 113 and on the
+      other six but for pids, job ids and an entry count. Both have C27
+      (not run, no lockdown) and C57c as the known gaps, and C64 as the
+      recorded deviation. Both also have C97 (#492's host drop-ins case),
+      DEVIATION with the same text on `main` and on the lot: the 4K
+      drop-in signed harmful, the other two drop-ins' alerts 0 — a finding
+      for #492's case on Debian 13, not this lot's.
+  - Gates on the lot merged with `main` ebc4916a (f8d83e4e, before the
+    commits were squashed: the same tree but the docs): eBPF build, the four clippy runs,
+    fmt, `cargo test --workspace` 85 suites, 3,662 passed, 0 failed (17
+    ignored), privileged tests built, attack-coverage, golden ×5 (54 files,
+    same bytes), MSRV 1.89, fuzz replay (14 targets), portable-core (5
+    targets), lockfiles unchanged.
+  - Mutations, by hand on the new code: 69 distinct, 67 caught, 2 argued
+    equivalent. The equivalent ones are the merge of one hash's kinds (a
+    cgroup path starts with `/`, a unit name has none, so one hash never
+    carries both) and the order of `warn` and `unknown` (a missing fix
+    needs an upstream kernel, an unknown one a distribution's: never both
+    on one kernel). Three survivors of the first set were caught once they
+    had tests: the banner's own Debian version, a frozen number without a
+    banner, and threads past one `getdents64` batch. Five mutations were on
+    the first walk, since replaced; seven were on its successor. The eBPF
+    programs' code is read by `xtask/tests/cgroup_join.rs`, and its twelve
+    mutations were caught there.
+  - Levels: unchanged. C23 stays 2 (provisional): the lot closes a way
+    around the policy, not a new capability. C15 stays 1: the exemptions
+    are the same kinds, bound to a start.
+  - Open: a root that rewrites the exempt unit (a drop-in, a transient
+    unit of that name, systemd's D-Bus attach) gets systemd's placement,
+    and the unit exemption trusts it; `exe … sha256` binds a program. Also
+    open: a move while no agent runs; a `CLONE_INTO_CGROUP` start is marked
+    but not signed; a full map refuses every such exemption until the host
+    reboots; on systemd 255 without `CLONE_INTO_CGROUP`, the executor's
+    own move could beat PID 1's and mark it (a false refusal, not measured
+    here); `kernel_fixes` is `unknown` on a distribution's kernel below a
+    fix, because the version cannot say.
