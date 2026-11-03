@@ -739,6 +739,19 @@ impl<H: DecisionHost> TriggerDetector<H> {
                 // signing key is a credential reach (ALERTED), not a
                 // decisive tamper — a backup of /etc meets it too.
                 TriggerType::SensitiveFileAccess
+            } else if matches!(
+                operation,
+                nn_model::FsProtectOperation::Sched
+                    | nn_model::FsProtectOperation::Nice
+                    | nn_model::FsProtectOperation::Ioprio
+            ) {
+                // Lot 273c: a refused change of the agent's scheduling, nice
+                // value or I/O priority is an impairment (ENGAGED), not a
+                // decisive tamper — a tuning daemon (tuned, numad) applying
+                // a host-wide profile meets it too, and the ladder must not
+                // kill it. A limit change (`prlimit --cpu`) is a kill: it
+                // stays decisive.
+                TriggerType::DefenseImpairment
             } else {
                 TriggerType::AntiTamperDenial
             });

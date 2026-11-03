@@ -1042,6 +1042,18 @@ pub enum FsProtectOperation {
     /// Lot 273b: a write of a protected process's `oom_score_adj` /
     /// `oom_adj`; the target is the protected tgid.
     OomAdj,
+    /// Lot 273c: a protected process's resource limit changed by another
+    /// (`prlimit`); `target_dev` is the resource, the target the tgid.
+    Rlimit,
+    /// Lot 273c: a protected process's scheduling policy, priority or CPU
+    /// affinity changed by another (`chrt`, `taskset`).
+    Sched,
+    /// Lot 273c: a protected process's nice value changed by another
+    /// (`renice`); `target_dev` is the value.
+    Nice,
+    /// Lot 273c: a protected process's I/O priority changed by another
+    /// (`ionice`); `target_dev` is the value.
+    Ioprio,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1074,6 +1086,10 @@ impl FsProtectOperation {
             FS_OP_CGROUP_LIMIT => Self::CgroupLimit,
             FS_OP_CGROUP_V1 => Self::CgroupV1,
             FS_OP_OOM_ADJ => Self::OomAdj,
+            crate::wire::FS_OP_RLIMIT => Self::Rlimit,
+            crate::wire::FS_OP_SCHED => Self::Sched,
+            crate::wire::FS_OP_NICE => Self::Nice,
+            crate::wire::FS_OP_IOPRIO => Self::Ioprio,
             other => Self::Unknown(other),
         }
     }
@@ -1104,6 +1120,10 @@ impl FsProtectOperation {
             Self::CgroupLimit => "cgroup_limit",
             Self::CgroupV1 => "cgroup_v1",
             Self::OomAdj => "oom_adj",
+            Self::Rlimit => "rlimit",
+            Self::Sched => "sched",
+            Self::Nice => "nice",
+            Self::Ioprio => "ioprio",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -1647,6 +1667,19 @@ mod tests {
                 FsProtectOperation::OomAdj,
                 "oom_adj",
             ),
+            // Lot 273c
+            (
+                crate::wire::FS_OP_RLIMIT,
+                FsProtectOperation::Rlimit,
+                "rlimit",
+            ),
+            (crate::wire::FS_OP_SCHED, FsProtectOperation::Sched, "sched"),
+            (crate::wire::FS_OP_NICE, FsProtectOperation::Nice, "nice"),
+            (
+                crate::wire::FS_OP_IOPRIO,
+                FsProtectOperation::Ioprio,
+                "ioprio",
+            ),
         ];
         for (byte, op, name) in cases {
             assert_eq!(FsProtectOperation::from_wire(byte), op);
@@ -1654,8 +1687,8 @@ mod tests {
             assert_eq!(op.to_string(), name);
         }
         assert_eq!(
-            FsProtectOperation::from_wire(25),
-            FsProtectOperation::Unknown(25)
+            FsProtectOperation::from_wire(29),
+            FsProtectOperation::Unknown(29)
         );
     }
     use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};

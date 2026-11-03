@@ -120,6 +120,33 @@ pub(crate) fn process_event(
         );
     }
 
+    // Lot 273c (the review of #490): PID 1's write of a protected resource
+    // file, or its new drop-in, refused — a `systemctl set-property`
+    // outside a window, which still set systemd's own copy of the property
+    // for the unit's next start: a reload takes that copy back to the
+    // unit's files (rate-limited, signed; the denial goes on as before).
+    if let Event::FsProtectDenial {
+        pid: 1,
+        operation,
+        target_dev,
+        target_ino,
+        ..
+    } = &event
+    {
+        let op = match operation {
+            nn_model::FsProtectOperation::CgroupLimit => Some("cgroup_limit"),
+            nn_model::FsProtectOperation::Create => Some("create"),
+            _ => None,
+        };
+        if let Some(op) = op {
+            systemd.reload(northnarrow_agent::systemd_reload::Reason::Refused {
+                op,
+                dev: *target_dev,
+                ino: *target_ino,
+            });
+        }
+    }
+
     // Tappa 9.5 (K3): canary precedence over FIM rules per
     // §12 Q9 OPTION B inline-filter lock-in. The detector
     // checks the event against the deployed canary registry;

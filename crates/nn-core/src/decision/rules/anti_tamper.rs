@@ -147,6 +147,25 @@ impl Rule for NnLAt001AntiTamperDenial {
                 "to change the OOM score of protected pid {target_ino} (oom_score_adj), which would \
                  make it the OOM killer's first victim — a SIGKILL no signal hook sees"
             ),
+            // Lot 273c (the review of #490): a limit, a priority, an
+            // affinity — another process's settings of the agent.
+            FsProtectOperation::Rlimit => format!(
+                "to change resource limit {target_dev} of protected pid {target_ino} (prlimit) — \
+                 an RLIMIT_CPU passed is a SIGKILL from the kernel, a small address space or \
+                 descriptor limit breaks it"
+            ),
+            FsProtectOperation::Sched => format!(
+                "to change the scheduling policy, priority or CPU affinity of protected pid \
+                 {target_ino} (chrt, taskset, sched_setattr) — SCHED_IDLE or one busy CPU \
+                 starves it"
+            ),
+            FsProtectOperation::Nice => format!(
+                "to set the nice value of protected pid {target_ino} to {} (renice)",
+                *target_dev as i64
+            ),
+            FsProtectOperation::Ioprio => format!(
+                "to set the I/O priority of protected pid {target_ino} to {target_dev:#x} (ionice)"
+            ),
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -216,6 +235,10 @@ mod tests {
             FsProtectOperation::CgroupLimit,
             FsProtectOperation::CgroupV1,
             FsProtectOperation::OomAdj,
+            FsProtectOperation::Rlimit,
+            FsProtectOperation::Sched,
+            FsProtectOperation::Nice,
+            FsProtectOperation::Ioprio,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))
@@ -288,6 +311,24 @@ mod tests {
                 .expect("verdict")
                 .reasoning
         };
+        // Lot 273c: another process's limits and priorities of the agent
+        let r = direct(FsProtectOperation::Rlimit);
+        assert!(
+            r.contains("resource limit 9 of protected pid 709 (prlimit)"),
+            "{r}"
+        );
+        let r = direct(FsProtectOperation::Sched);
+        assert!(r.contains("CPU affinity of protected pid 709"), "{r}");
+        let r = direct(FsProtectOperation::Nice);
+        assert!(
+            r.contains("nice value of protected pid 709 to 9 (renice)"),
+            "{r}"
+        );
+        let r = direct(FsProtectOperation::Ioprio);
+        assert!(
+            r.contains("I/O priority of protected pid 709 to 0x9 (ionice)"),
+            "{r}"
+        );
         let r = relayed(FsProtectOperation::CgroupKill);
         assert!(r.contains("systemctl kill -s SIGKILL"), "{r}");
         assert!(r.contains("cgroup.kill (inode 9:709)"), "{r}");

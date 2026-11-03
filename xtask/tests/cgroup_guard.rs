@@ -141,16 +141,25 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
     )
     .unwrap();
     let c = code("agent-ebpf/src/cgroup_files.rs");
+    // The review of #490, its P3 (a 16-bit mask left every file
+    // unjudged): the magic read goes, as read, to the shared module's
+    // classification, which the host's tests judge
+    // (`common::cgroup_limits::special_fs`).
+    let w = body(&c, "refuse_write");
     in_order(
-        body(&c, "refuse_write"),
+        w,
         &[
             "off!(SUPER_BLOCK_S_MAGIC_OFFSET)",
-            "if magic == CGROUP2_SUPER_MAGIC {\n        refuse_limit(file, inode, hook, phase)",
-            "} else if magic == CGROUP_SUPER_MAGIC {\n        refuse_v1(inode, hook, phase)",
-            "} else if magic == PROC_SUPER_MAGIC {\n        refuse_oom_adj(file, inode, phase)",
+            "Ok(m) => m,",
+            "match special_fs(magic) {\n        Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),\n        Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),\n        Some(SpecialFs::Proc) => refuse_oom_adj(file, inode, phase),\n        None => false,\n    }",
         ],
     )
     .unwrap();
+    assert_eq!(
+        w.matches("magic").count(),
+        2,
+        "the magic is read and classified, nothing else:\n{w}"
+    );
     // The review of #490 (B): the file is recognised by its registered
     // value or by its kernfs node (name, parent's id), the dentry only
     // without the node's offsets — a handle-opened file's dentry is
@@ -192,14 +201,25 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
             "Some(f) if *f & FS_PROTECT_LIMIT_DIR != 0 => {}",
             "if caller_may(caller) {\n        return false;\n    }",
             "if caller == 1 {",
-            "if phase == Phase::Open {\n            return false;\n        }",
-            "Some(v) => Some(v),\n            None => default_value(kind),",
-            "if let (Some(value), Some(written)) = (value, written_value()) {\n            if same_value(&written, &value) {\n                return false;",
             "sign(phase, FS_OP_CGROUP_LIMIT, key);",
             "true",
         ],
     )
     .unwrap();
+    // The review of #490, its P2 (a `return false` before the comparison
+    // let PID 1 write any value): PID 1's arm, whole — the open let
+    // through, the write's value judged by the shared module
+    // (`common::cgroup_limits::init_write_lets_through`, its tests).
+    let l = body(&c, "refuse_limit");
+    let at = l.find("if caller == 1 {").expect("PID 1's arm") + "if caller == 1 ".len();
+    let arm = &l[at..at + support::matching_brace(&l[at..])];
+    assert_eq!(
+        arm.split_whitespace().collect::<Vec<_>>().join(" "),
+        "{ if phase == Phase::Open { return false; } let expected = match registered { \
+         Some(v) => Some(v), None => default_value(kind), }; \
+         if init_write_lets_through(expected, written_value()) { return false; } }",
+        "PID 1's arm:\n{arm}"
+    );
     assert!(body(&c, "caller_may").contains(
         "crate::task_kill::is_exempt_pid(caller) || crate::inode_protect::override_active()"
     ));
@@ -438,10 +458,332 @@ fn every_registration_of_the_cgroups_goes_through_the_shared_code() {
         &w,
         &[
             "register_self_pid(&cli.bpffs_root, own_pid)",
-            "register_own_cgroup(&cli.bpffs_root, own_pid)",
+            "register_own_cgroup(\n            &cli.bpffs_root,\n            own_pid,",
         ],
     )
     .unwrap();
     assert!(code("watchdog/src/lib.rs")
         .contains("antitamper_bpf::cgroup_guard::protect_unit_cgroup(bpffs_root, own_pid)"));
+}
+
+/// Lot 273c (the review of #490): another process's change of a protected
+/// process's limits and priorities is refused — the target protected (or
+/// running the agent's binary), the caller neither the target itself nor
+/// exempt, no window — and each of the four hooks refuses with EPERM.
+#[test]
+fn the_task_settings_denies_refuse_another_processs_change() {
+    let t = code("agent-ebpf/src/task_limits.rs");
+    in_order(
+        body(&t, "refuse_task_change"),
+        &[
+            "off!(TASK_STRUCT_TGID_OFFSET)",
+            "crate::fail_open::bump(hook);",
+            "if !crate::task_kill::is_protected_pid(tgid)\n        && !crate::bpf_defense::task_runs_own_binary(task as *const u8)\n    {\n        return false;\n    }",
+            "if caller == tgid\n        || crate::task_kill::is_exempt_pid(caller)\n        || crate::inode_protect::override_active()\n    {\n        return false;\n    }",
+            "crate::inode_protect::emit_task_denial(op, detail, tgid);",
+            "true",
+        ],
+    )
+    .unwrap();
+    for (hook, f, op, slot) in [
+        (
+            "task_setrlimit",
+            "task_setrlimit_deny",
+            "FS_OP_RLIMIT",
+            "hook::TASK_SETRLIMIT",
+        ),
+        (
+            "task_setscheduler",
+            "task_setscheduler_deny",
+            "FS_OP_SCHED",
+            "hook::TASK_SETSCHEDULER",
+        ),
+        (
+            "task_setnice",
+            "task_setnice_deny",
+            "FS_OP_NICE",
+            "hook::TASK_SETNICE",
+        ),
+        (
+            "task_setioprio",
+            "task_setioprio_deny",
+            "FS_OP_IOPRIO",
+            "hook::TASK_SETIOPRIO",
+        ),
+    ] {
+        assert!(
+            t.contains(&format!("#[lsm(hook = \"{hook}\")]\npub fn {f}(")),
+            "{hook}"
+        );
+        let b = body(&t, f);
+        assert!(b.contains(op) && b.contains(slot), "{f}");
+        in_order(b, &["refuse_task_change(", "return -EPERM;", "0"]).unwrap();
+    }
+    // attached as deny hooks, counted
+    let fs = code("crates/nn-linux/src/anti_tamper/filesystem.rs");
+    for (p, h) in [
+        ("task_setrlimit_deny", "task_setrlimit"),
+        ("task_setscheduler_deny", "task_setscheduler"),
+        ("task_setnice_deny", "task_setnice"),
+        ("task_setioprio_deny", "task_setioprio"),
+    ] {
+        assert!(fs.contains(&format!("(\"{p}\", \"{h}\"),")), "{p}");
+    }
+    // PID 1, attach mode only, outside a window
+    let p = code("agent-ebpf/src/ptrace_check.rs");
+    in_order(
+        body(&p, "try_ptrace_access_check"),
+        &[
+            "let init_attach = target_tgid == 1 && mode & PTRACE_MODE_ATTACH != 0;",
+            "if !init_attach\n        && !crate::task_kill::is_protected_pid(target_tgid)",
+            "if crate::task_kill::is_exempt_pid(caller_tgid) {\n        return 0;\n    }",
+            "if init_attach && crate::inode_protect::override_active() {\n        return 0;\n    }",
+            "-EPERM",
+        ],
+    )
+    .unwrap();
+    // the write deny leaves on a file that is not a regular one, before
+    // its lookup
+    let i = code("agent-ebpf/src/inode_protect.rs");
+    in_order(
+        body(&i, "try_protected_write_deny"),
+        &[
+            "off!(INODE_I_MODE_OFFSET)",
+            "if mode & S_IFMT != S_IFREG {\n                return 0;\n            }",
+            "protected_verdict(FS_OP_WRITE, inode, hook::FILE_PERMISSION)",
+        ],
+    )
+    .unwrap();
+    // cgroup v1: a named hierarchy and the other files let through
+    let c = code("agent-ebpf/src/cgroup_files.rs");
+    in_order(
+        body(&c, "refuse_v1"),
+        &[
+            "Some(p) if *p & CGROUP_POLICY_V1_REFUSE != 0 => {}",
+            "if caller_may(caller) {\n        return false;\n    }",
+            "if v1_binds_a_controller(inode) == Some(false) {\n        return false;\n    }",
+            "if v1_moves_or_freezes(inode) == Some(false) {\n        return false;\n    }",
+            "sign(phase, FS_OP_CGROUP_V1, key);",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&c, "v1_binds_a_controller"),
+        &[
+            "off_opt!(SUPER_BLOCK_S_FS_INFO_OFFSET)?",
+            "let info = p(sb, fs_info)?;",
+            "let kroot = p(info, si_root)?;",
+            "let kn = p(kroot, root_kn)?;",
+            "let cgrp = p(kn, kn_priv)?;",
+            "let root = p(cgrp, cg_root)?;",
+            "Some(mask != 0)",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&c, "v1_moves_or_freezes"),
+        &[
+            "name_words(b\"cgroup.procs\")",
+            "name_words(b\"tasks\")",
+            "name_words(b\"freezer.state\")",
+            "Some(is(PROCS) || is(TASKS) || is(FREEZER))",
+        ],
+    )
+    .unwrap();
+}
+
+/// Lot 273c: the reloads the agent asks systemd for — a refused PID 1
+/// write of a resource file or a drop-in (the pipeline), a window's
+/// opening, a quarantine — and the floors at every registration.
+#[test]
+fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
+    let pe = code("agent/src/pipeline/process_event.rs");
+    in_order(
+        &pe,
+        &[
+            "if let Event::FsProtectDenial {\n        pid: 1,\n        operation,",
+            "nn_model::FsProtectOperation::CgroupLimit => Some(\"cgroup_limit\"),",
+            "nn_model::FsProtectOperation::Create => Some(\"create\"),",
+            "systemd.reload(",
+        ],
+    )
+    .unwrap();
+    // The reload is a SIGHUP to PID 1 once PID 1 is found serving
+    // systemd's private socket (lab, round 4: `Manager.Reload()` waits for
+    // polkit without CAP_SYS_ADMIN, its reload came only at the close).
+    let sd = code("crates/nn-linux/src/systemd_state.rs");
+    let r = body(&sd, "reload");
+    in_order(
+        r,
+        &[
+            "let state = system_state(socket, Duration::from_secs(5))?;",
+            "if state == \"stopping\" {",
+            "libc::kill(1, libc::SIGHUP)",
+        ],
+    )
+    .unwrap();
+    assert!(!r.contains("Reload"), "no Manager.Reload() call:\n{r}");
+    // PID 1 serves the socket: the peer check of every exchange
+    in_order(
+        body(&sd, "connect"),
+        &[
+            "let peer = peer_pid(&s)?;",
+            "if peer != 1 {\n        return Err(",
+        ],
+    )
+    .unwrap();
+    // The review of #492 (C1), round 7: no reload while a harmful host
+    // drop-in is on disk (a window's reload applied a 4K system.slice)
+    let rl = code("crates/nn-linux/src/systemd_reload.rs");
+    in_order(
+        body(&rl, "worker"),
+        &[
+            "crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read());",
+            "match outcome(&harms, || crate::systemd_state::reload(socket)) {",
+            "Outcome::Withheld(what) => {",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&rl, "outcome"),
+        &[
+            "if let Some(h) = harms.first() {",
+            "return Outcome::Withheld(",
+            "match reload() {",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(
+            &code("crates/nn-linux/src/anti_tamper/trusted_installer.rs"),
+            "arm_by",
+        ),
+        &[
+            "self.armed.store(true, Ordering::SeqCst);",
+            "r.request(crate::systemd_reload::Reason::WindowOpened);",
+        ],
+    )
+    .unwrap();
+    let si = code("crates/nn-linux/src/self_integrity.rs");
+    in_order(
+        body(&si, "round"),
+        &[
+            "antitamper_bpf::cgroup_floors::take_restores()",
+            "\"limit_floor_restored\"",
+        ],
+    )
+    .unwrap();
+    // The review of #492 (C1): the host's drop-ins judged by their value
+    // for our units, each a finding of the round; none moved, written or
+    // deleted — the module only reads.
+    in_order(
+        body(&si, "collect_round"),
+        &[
+            "c.extend(unit_dropins(&search));",
+            "c.extend(\n            crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read())",
+            "kind: \"unit_dropin_harmful\",",
+        ],
+    )
+    .unwrap();
+    assert!(
+        body(&si, "unit_dropins_with").contains("for (d, _) in crate::host_dropins::TYPE_DIRS {")
+    );
+    let hd = code("crates/nn-linux/src/host_dropins.rs");
+    let hd = &hd[..hd.find("#[cfg(test)]").expect("its tests")];
+    for call in [
+        "fs::rename",
+        "fs::remove_file",
+        "fs::write",
+        "fs::copy",
+        "create_dir",
+        "OpenOptions",
+        "File::create",
+        "Reason::",
+    ] {
+        assert!(!hd.contains(call), "host_dropins.rs only reads: {call}");
+    }
+    assert!(!si.contains("Reason::Quarantined") && !si.contains("dropin_quarantine"));
+    let ab = code("antitamper-bpf/src/cgroup_guard.rs");
+    in_order(
+        body(&ab, "protect_unit_cgroup"),
+        &[
+            "write_values(bpffs_root, unit.values())?;",
+            "floors(bpffs_root, &unit);",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&ab, "refresh_unit_values"),
+        &[
+            "write_values(bpffs_root, unit.values())?;",
+            "floors(bpffs_root, &unit);",
+        ],
+    )
+    .unwrap();
+    let g = code("crates/nn-linux/src/anti_tamper/cgroup_guard.rs");
+    in_order(
+        body(&g, "register_unit_cgroups"),
+        &[
+            "register_value(ebpf, &f.key, &f.value)?;",
+            "antitamper_bpf::cgroup_floors::floors_due(",
+            "antitamper_bpf::cgroup_floors::restore_floors(due, |k, v| {\n                        register_value(ebpf, k, v)\n                    });",
+        ],
+    )
+    .unwrap();
+    // the floor is registered before it is written
+    in_order(
+        body(
+            &code("antitamper-bpf/src/cgroup_floors.rs"),
+            "restore_floors",
+        ),
+        &[
+            "register(&d.key, &value)",
+            "std::fs::write(&d.path,",
+            "std::fs::read_to_string(&d.path)",
+        ],
+    )
+    .unwrap();
+    // the watchdog checks the agent's fresh cgroup at its start and after a
+    // respawn
+    let w = code("watchdog/src/main.rs");
+    assert_eq!(
+        w.matches("northnarrow_watchdog::check_agent_cgroup(")
+            .count(),
+        2
+    );
+    // ... their restorations recorded where the agent signs them, as its
+    // own kinds
+    for (i, _) in w
+        .match_indices("northnarrow_watchdog::check_agent_cgroup(")
+        .chain(w.match_indices("register_own_cgroup(\n"))
+    {
+        let call = &w[i..i + w[i..].find(");").expect("the call's end")];
+        assert!(
+            call.contains("&hold_record_path(&cli.shutdown_marker),"),
+            "{call}"
+        );
+    }
+    let wl = code("watchdog/src/lib.rs");
+    for f in ["check_agent_cgroup", "register_own_cgroup"] {
+        assert!(
+            body(&wl, f).contains("record_floor_restores(hold_path, agent_pid);"),
+            "{f}"
+        );
+    }
+    in_order(
+        body(&wl, "record_floor_restores"),
+        &[
+            "antitamper_bpf::cgroup_floors::take_restores()",
+            "record_hold(hold_path, &rec)",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&code("crates/nn-linux/src/self_integrity.rs"), "watchdog_holds"),
+        &[
+            "wh::REASON_LIMIT_FLOOR_RESTORED => (\n                            \"limit_floor_restored\",",
+            "wh::REASON_LIMIT_FLOOR_NOT_RESTORED => (\n                            \"limit_floor_not_restored\",",
+        ],
+    )
+    .unwrap();
 }

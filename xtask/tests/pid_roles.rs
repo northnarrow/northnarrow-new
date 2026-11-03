@@ -68,6 +68,9 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
         // lot 273b: the process an `oom_score_adj` belongs to is a target,
         // the writer a caller
         ("cgroup_files.rs", 1, 1),
+        // lot 273c: the process whose limits or priorities change is a
+        // target, the caller a caller
+        ("task_limits.rs", 1, 1),
     ] {
         let code = strip_comments(&fs::read_to_string(dir.join(file)).unwrap());
         assert_eq!(
@@ -91,6 +94,7 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
             "execq.rs",
             "cgroup_guard.rs",
             "cgroup_files.rs",
+            "task_limits.rs",
         ]
         .contains(&name.as_str())
         {

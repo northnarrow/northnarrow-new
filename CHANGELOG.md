@@ -664,6 +664,87 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- **Security (lot 273c, C23): another process's change of the agent's
+  limits and priorities refused, PID 1's memory closed to attach-mode
+  access, resource values below a floor never registered, systemd's copy
+  of a refused `set-property` taken back, the host's drop-ins judged by
+  their value for our units** (the reviews of #490 and #492; `docs/design/ANTITAMPER_TRUST_MODEL.md`, "Lot 273c").
+  Measured before the fix (#490's head, tamper cases C89–C102): on Ubuntu 24.04, Debian 13 (round 5) and
+  Ubuntu 22.04 (round 6), `prlimit --pid <agent> --cpu=1:1` ended the
+  agent (the kernel's RLIMIT_CPU SIGKILL, no signal hook saw it: nothing
+  signed but its successor's `prev_run_abrupt`; C89), `--nofile=0:0` too
+  (C90); `renice +19`, `chrt --idle`, `taskset` to one CPU and
+  `ionice -c 3` of the agent went through unsigned (C91–C94); a tracer on
+  PID 1 and `/proc/1/mem` for writing went through (C95, C96); a
+  `memory.high` of 100 MiB set inside a window stayed after it (C98); a
+  move in a named v1 hierarchy was refused (`cgroup_v1`, C99); a refused
+  `set-property MemoryHigh=2G` left systemd's copy at 2 GiB (C100);
+  `memory.reclaim` of the agent's unit was written (C101); the agent
+  killed inside a window with systemd's copy at 100 MiB came back with it
+  in its fresh cgroup, throttled — not up within the case's minute (C102).
+  Now:
+  - four new deny hooks (21 in all): `task_setrlimit` (`prlimit --cpu=1:1`,
+    a kernel SIGKILL no signal hook sees; `--nofile`, `--memlock`, `--as`),
+    `task_setscheduler` (`chrt`, `taskset`), `task_setnice` (`renice`),
+    `task_setioprio` (`ionice`) on a protected process from a caller
+    neither exempt nor the target itself, outside a window; signed
+    `rlimit` (decisive), `sched`, `nice`, `ioprio` (ENGAGED: a tuning daemon
+    meets them too);
+  - PID 1 refused to attach-mode ptrace outside a window (a tracer,
+    `/proc/1/mem`, `process_vm_writev`): the deny hooks trust its
+    write-backs on the bytes its `write(2)` carries;
+  - floors: at every registration (the start, the watchdog's check of the
+    agent's fresh cgroup at its start and after a respawn, a window's
+    close) a value below its floor is replaced — the floor registered, then
+    written, then read back; a signed `limit_floor_restored`;
+  - a `daemon-reload` asked of systemd — a SIGHUP to PID 1, once PID 1 is
+    found serving the private socket (signed `systemd_reload`) — after a
+    refused PID 1 write of our units (rate-limited), at a window's
+    opening (the lot's first `Manager.Reload()` waited for polkit without
+    `CAP_SYS_ADMIN`: on 255 every reload came 30 s late, at the
+    connection's close);
+  - the host's drop-ins of `service.d`, `slice.d`, `system.slice.d` are
+    never moved or changed (the review of #492, C1: the lot's first
+    version moved every one that named a "dangerous" directive, whatever
+    its value — a global `LimitNOFILE`, a node's `system.slice`
+    reservation, a hardening `SystemCallFilter`, from every service): a
+    directive whose value harms our units (below their floors, a finite
+    limit, an idle class, another kill semantics, a failing condition, an
+    exec line, an `NN_` / `LD_` variable, a mount over our paths) is
+    signed `unit_dropin_harmful` while it is there, any other one an
+    alert (`unit_dropin`, now in `slice.d` and `system.slice.d` too); and
+    while a harmful one is on disk the agent asks for no reload
+    (`withheld`: the lab saw the reload at a window's opening apply a
+    `MemoryMax=4K` on `system.slice.d` inside the window, the slice's
+    services killed);
+  - cgroup v1 refused only where it moves or freezes: a hierarchy that
+    binds a controller, its `cgroup.procs`, `tasks`, `freezer.state` (an
+    old container's `name=systemd` works again);
+  - `cpuset.cpus`, `cpuset.mems`, `cpuset.cpus.partition`,
+    `memory.reclaim`, `io.weight`, `io.bfq.weight` protected;
+  - the write deny leaves at once on a socket, a pipe, a tty;
+  - PID 1's verdict and the files' classification are the shared module's
+    pure functions (`init_write_lets_through`, `special_fs`), judged on the
+    host: the review's surviving mutations P2 and P3 are caught.
+  New tamper cases C89–C102 (C95b inside a window). On the five guests (rounds 5 and 6, the lot's code):
+  every new case as expected — C89–C94 refused and signed, C95 and C96
+  refused, C95b let through, C98 and C102 restored to the
+  floor, C99 let through, C100 systemd's copy back by the reload, C101
+  refused (not run on 5.15: no `memory.reclaim`); Debian 13's full tamper
+  check 114 of 119 OK (C27, C57c the known gaps, C64 the recorded
+  deviation, C78c not run, C102's first version — a `systemctl restart`,
+  which the unit's `RefuseManualStop=` refuses — redone with a kill: OK);
+  the verifier 85 of 85 programs on 6.8, 6.12 and 7.0, 83 + the two ACL
+  hooks absent on 5.15 and 6.1. C97, the host's drop-ins, measured after
+  C1: on #492's head (Ubuntu 24.04, round 7) all
+  three drop-ins of the case — `LimitNOFILE=1048576` and
+  `SystemCallFilter=~@obsolete` in `service.d`, `MemoryMax=4K` in
+  `system.slice.d` — were moved; now (round 8) the three stay, the 4K is
+  refused at the slice (inside a window opened with it on disk too: the
+  agent's reloads withheld) and signed harmful, the other two are alerts.
+  Round 7 also found the window case: with C1's first version, the
+  reload at a window's opening applied the 4K, the slice's services
+  killed — hence the withholding. C85, C98, C100, C102 OK again.
 - **Security (lot 273b, C23): what stopped the agent without a signal —
   its units' resource limits, a cgroup v1 freezer, a descriptor opened
   earlier, its OOM score — is refused outside a signed trusted-installer

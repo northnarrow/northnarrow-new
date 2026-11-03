@@ -494,6 +494,14 @@ pub(crate) const LSM_PROGRAMS: &[(&str, &str)] = &[
     // registered, a protected cgroup's resource file, a cgroup v1 file, a
     // protected process's `oom_score_adj`.
     ("protected_write_deny", "file_permission"),
+    // Lot 273c (the review of #490): another process's change of a
+    // protected process's limits (`prlimit --cpu`: a kill no signal hook
+    // sees), scheduling and affinity, nice value, I/O priority
+    // (`agent-ebpf/src/task_limits.rs`).
+    ("task_setrlimit_deny", "task_setrlimit"),
+    ("task_setscheduler_deny", "task_setscheduler"),
+    ("task_setnice_deny", "task_setnice"),
+    ("task_setioprio_deny", "task_setioprio"),
 ];
 
 /// External audit EBPF-015: deny programs for hooks only newer kernels
@@ -2557,7 +2565,7 @@ mod tests {
             super::super::DENY_HOOKS.len(),
             "a hook listed twice"
         );
-        assert_eq!(super::super::LSM_DENY_HOOKS_EXPECTED, 17);
+        assert_eq!(super::super::LSM_DENY_HOOKS_EXPECTED, 21);
         // Lot 273: the optional set is the optional inode hooks and the
         // cgroup move guard's three programs.
         let optional: BTreeSet<&str> = OPTIONAL_LSM_PROGRAMS

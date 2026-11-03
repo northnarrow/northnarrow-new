@@ -50,6 +50,7 @@ mod sensor_probe;
 mod socket_connect;
 mod stdio;
 mod task_kill;
+mod task_limits;
 mod tcp_close;
 mod tcp_connect;
 mod tls_hello;

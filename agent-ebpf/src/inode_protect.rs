@@ -67,7 +67,7 @@ use northnarrow_common::wire::{
 
 use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET, INODE_I_INO_OFFSET,
-    INODE_I_SB_OFFSET, INODE_REMOVEXATTR_DENTRY_ARG_SLOT, INODE_SETATTR_DENTRY_ARG_SLOT,
+    INODE_I_MODE_OFFSET, INODE_I_SB_OFFSET, INODE_REMOVEXATTR_DENTRY_ARG_SLOT, INODE_SETATTR_DENTRY_ARG_SLOT,
     INODE_SETXATTR_DENTRY_ARG_SLOT, SUPER_BLOCK_S_DEV_OFFSET,
 };
 
@@ -718,6 +718,9 @@ pub fn protected_write_deny(ctx: LsmContext) -> i32 {
 
 /// `MAY_WRITE` (include/linux/fs.h).
 const MAY_WRITE: c_int = 0x2;
+/// `S_IFMT` / `S_IFREG` (include/uapi/linux/stat.h).
+const S_IFMT: u16 = 0o170000;
+const S_IFREG: u16 = 0o100000;
 
 #[inline(always)]
 unsafe fn try_protected_write_deny(ctx: &LsmContext) -> i32 {
@@ -738,6 +741,17 @@ unsafe fn try_protected_write_deny(ctx: &LsmContext) -> i32 {
             return 0;
         }
     };
+    // Lot 273c (the review of #490): a socket, a pipe, a tty — most writes
+    // of a busy host — is never protected (every protected file, cgroup
+    // file and proc file is a regular one): out before the map lookup. A
+    // mode that cannot be read goes on to the lookup.
+    if !inode.is_null() {
+        if let Ok(mode) = bpf_probe_read_kernel::<u16>((inode as *const u8).add(off!(INODE_I_MODE_OFFSET)) as *const u16) {
+            if mode & S_IFMT != S_IFREG {
+                return 0;
+            }
+        }
+    }
     if let Some((op, key)) = protected_verdict(FS_OP_WRITE, inode, hook::FILE_PERMISSION) {
         // Lot 273b: PID 1's write of `0` to a protected cgroup.freeze — a
         // thaw — goes through; a freeze is refused here.

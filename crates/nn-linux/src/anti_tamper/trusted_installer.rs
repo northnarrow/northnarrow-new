@@ -122,6 +122,10 @@ pub struct TrustedInstallerOverride {
     /// or a replay's ([`Self::with_clock`]). The kernel grant's deadline
     /// is the kernel's monotonic clock, always.
     clock: Arc<dyn Clock>,
+    /// Lot 273c (the review of #490): the reload asked when a window opens
+    /// (systemd's copy of the units back to their files before the
+    /// maintenance restarts one). Late-bound by the start.
+    reloader: Mutex<Option<crate::systemd_reload::Reloader>>,
 }
 
 #[derive(Default)]
@@ -150,7 +154,13 @@ impl TrustedInstallerOverride {
             audit: Mutex::new(audit),
             max_window,
             clock: Arc::new(SystemClock),
+            reloader: Mutex::new(None),
         }
+    }
+
+    /// Lot 273c: the reloader a window's opening asks (the start's).
+    pub fn set_reloader(&self, reloader: crate::systemd_reload::Reloader) {
+        *self.reloader.lock() = Some(reloader);
     }
 
     /// Lab PR 243: read the time from `clock` — the window's deadline and
@@ -323,6 +333,12 @@ impl TrustedInstallerOverride {
             });
         }
         self.armed.store(true, Ordering::SeqCst);
+        // Lot 273c (the review of #490): systemd's copy of the units back to
+        // their files before the maintenance this window is for restarts
+        // one — a refused `set-property` left its value there.
+        if let Some(r) = self.reloader.lock().as_ref() {
+            r.request(crate::systemd_reload::Reason::WindowOpened);
+        }
         info!(
             target: "anti_tamper.trusted_installer",
             window_secs = secs,

@@ -185,6 +185,12 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
             .await
             .context("opening initial agent pidfd")
             .exit_as(ExitReason::NoAgent)?;
+    // Lot 273c (the review of #490): the agent's cgroup, checked from here.
+    northnarrow_watchdog::check_agent_cgroup(
+        &cli.bpffs_root,
+        agent_pid,
+        &hold_record_path(&cli.shutdown_marker),
+    );
     // Respawn v2 (docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md): on a
     // systemd host the agent is brought back through ITS OWN unit, so
     // it gets the unit's ExecStart argv, cgroup, caps and ProtectHome —
@@ -229,7 +235,12 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
         // cgroup.kill / cgroup.freeze refused outside a trusted-installer
         // window), at once: the agent's refresh registers it too, up to
         // 30 s later.
-        register_own_cgroup(&cli.bpffs_root, own_pid);
+        register_own_cgroup(
+            &cli.bpffs_root,
+            own_pid,
+            &hold_record_path(&cli.shutdown_marker),
+            agent_pid,
+        );
     }
 
     sd_notify_ready()
@@ -553,6 +564,12 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     Ok((new_pid, new_fd)) => {
                         agent_pid = new_pid;
                         agent_pidfd = new_fd;
+                        // Lot 273c: the respawned agent's fresh cgroup.
+                        northnarrow_watchdog::check_agent_cgroup(
+                            &cli.bpffs_root,
+                            new_pid,
+                            &hold_record_path(&cli.shutdown_marker),
+                        );
                         agent_started = process_start_unix(new_pid);
                         new_generation(&current_agent, &mut stuck_rx, new_pid);
                         info!(
