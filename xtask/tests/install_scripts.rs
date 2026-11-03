@@ -390,6 +390,11 @@ exit 0"#,
     /// install.sh from its unit stop to the end of the running-install
     /// part, with `mode` (full, stop) and `--upgrade`/`--grant-key`.
     fn install(&self, mode: &str, upgrade: bool, key: Option<&str>) -> Run {
+        self.install_from(mode, upgrade, key, "$T/bin/northnarrow-agent")
+    }
+
+    /// [`Self::install`] with the tree's agent at `agent_bin`.
+    fn install_from(&self, mode: &str, upgrade: bool, key: Option<&str>, agent_bin: &str) -> Run {
         let body = section(
             "deploy/install.sh",
             "stop_nn_unit() {",
@@ -397,7 +402,7 @@ exit 0"#,
         );
         let prelude = format!(
             "MODE={mode}; UPGRADE={}; GRANT_KEY={}\n\
-             BIN_DIR=$T/bin; AGENT_BIN=$T/bin/northnarrow-agent\n\
+             BIN_DIR=$T/bin; AGENT_BIN={agent_bin}\n\
              PKG_RESTART_FILE=$T/pkg-restart; BPFFS_ROOT=$T/pins",
             u8::from(upgrade),
             key.map(|k| format!("$T/{k}")).unwrap_or_default(),
@@ -531,6 +536,50 @@ fn install_on_a_running_host_is_unchanged() {
     assert_eq!(r.status, 1, "{r:#?}");
     assert!(r.stderr.contains("Re-run with --upgrade"), "{r:#?}");
     assert!(host.pins_left());
+}
+
+/// Lot 278: the upgrade opens the trusted-installer window before it
+/// executes anything from its tree (the new agent's `--version`, which the
+/// running agent's R009 judges): the window is granted to the script's
+/// shell, and R009 records that tree at Low. A refused run (no `--upgrade`)
+/// opens no window and executes nothing from the tree; an install over
+/// stopped units reads the version with no agent left to judge it.
+#[test]
+fn install_opens_the_window_before_it_executes_its_tree() {
+    const TREE: &str = "tree-agent --version";
+    let both = ["northnarrow-agent", "northnarrow-watchdog"];
+    let tree_agent = |host: &Host| {
+        let tree = host.dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        write_exec(
+            &tree.join("northnarrow-agent"),
+            r#"echo "tree-agent $*" >> "$NN_TEST_DIR/calls"; echo 'northnarrow-agent 0.0.2'"#,
+        );
+        "$T/tree/northnarrow-agent"
+    };
+    let host = Host::new("install-window-first", &both, true, true);
+    let bin = tree_agent(&host);
+    let r = host.install_from("full", true, Some("key-role"), bin);
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert_eq!(r.called(TREE), 1, "{r:#?}");
+    assert!(r.index(GRANT) < r.index(TREE), "{r:#?}");
+    assert!(
+        r.stdout
+            .contains("installed: northnarrow-agent 0.0.1 → new: northnarrow-agent 0.0.2"),
+        "{r:#?}"
+    );
+
+    let host = Host::new("install-window-first-refused", &both, true, true);
+    let bin = tree_agent(&host);
+    let r = host.install_from("full", false, None, bin);
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert_eq!((r.called(GRANT), r.called(TREE)), (0, 0), "{r:#?}");
+
+    let host = Host::new("install-window-first-stopped", &[], false, true);
+    let bin = tree_agent(&host);
+    let r = host.install_from("full", false, None, bin);
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert_eq!((r.called(GRANT), r.called(TREE)), (0, 1), "{r:#?}");
 }
 
 /// uninstall.sh, same case: the agent is started for the window before

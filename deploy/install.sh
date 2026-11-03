@@ -1023,8 +1023,7 @@ txn_begin() {
     done
     old_ver=$("$BIN_DIR/northnarrow-agent" --version 2>/dev/null | head -1) || true
     old_ver=${old_ver:-unknown}
-    new_ver=$("$AGENT_BIN" --version 2>/dev/null | head -1) || true
-    new_ver=${new_ver:-unknown}
+    # Lot 278: the new version is read once the window is open (tree_version)
     TXN_T0=$(date '+%F %T')
     TXN_DIR="$UPGRADE_TXN_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$$"
     if ! { install -d -m 0700 -o root -g root "$UPGRADE_TXN_ROOT" && chmod 0700 "$UPGRADE_TXN_ROOT" \
@@ -1508,6 +1507,18 @@ wait_own_programs_unloaded() {
     return 1
 }
 
+# Lot 278: the version of the agent this tree installs, into new_ver. It
+# executes the tree's own binary — from a checkout in a home, an unpacked
+# tree in /tmp —, which the running agent's R009 judges: called only once the
+# trusted-installer window is open (R009 records what the process tree of
+# the installer the window was granted to executes, at Low), or when no agent
+# runs. Not in a subshell of its own: the binary's parent is this script's
+# shell, the window's installer (nn-admin's parent), with no fork between.
+tree_version() {
+    new_ver=$("$AGENT_BIN" --version 2>/dev/null) || true
+    new_ver=${new_ver%%$'\n'*}
+    new_ver=${new_ver:-unknown}
+}
 open_trusted_installer_window() {
     local key=$1
     [[ -r "$key" ]] || { echo "install.sh: --grant-key $key is not readable" >&2; return 1; }
@@ -1636,24 +1647,28 @@ if (( ${#UNITS_TO_RESTART[@]} || STARTED_FOR_WINDOW )); then
         echo "install.sh: Nothing was changed." >&2
         exit 1
     fi
-    old_ver=$("$BIN_DIR/northnarrow-agent" --version 2>/dev/null | head -1 || echo "unknown")
-    if (( STARTED_FOR_WINDOW )); then
-        echo "install.sh: $old_ver started only for the window — stopped again below, not restarted"
-    elif [[ $MODE == full ]]; then
-        new_ver=$("$AGENT_BIN" --version 2>/dev/null | head -1 || echo "unknown")
-        echo "install.sh: UPGRADE — installed: $old_ver → new: $new_ver"
-    else
-        echo "install.sh: stopping $old_ver for the package manager"
-    fi
     # The pin root is in the agent's protected-inode set (review entry 39):
     # only a protected pid or an open trusted-installer window may remove it.
     # Open the window now, while the agent still answers on its socket.
+    # Lot 278: before this script executes anything from its tree (the new
+    # agent's --version below): the window is granted to this shell, and
+    # R009 records what its process tree executes from the tree at Low. The
+    # refusals above open none, and execute nothing from the tree.
     if [[ -n "$GRANT_KEY" ]]; then
         if ! open_trusted_installer_window "$GRANT_KEY"; then
             (( STARTED_FOR_WINDOW )) &&
                 echo "install.sh: the agent started for the window keeps running (its stop needs the window)" >&2
             exit 1
         fi
+    fi
+    old_ver=$("$BIN_DIR/northnarrow-agent" --version 2>/dev/null | head -1 || echo "unknown")
+    if (( STARTED_FOR_WINDOW )); then
+        echo "install.sh: $old_ver started only for the window — stopped again below, not restarted"
+    elif [[ $MODE == full ]]; then
+        tree_version
+        echo "install.sh: UPGRADE — installed: $old_ver → new: $new_ver"
+    else
+        echo "install.sh: stopping $old_ver for the package manager"
     fi
     # External audit DEP-006: the ids of the running agent's programs,
     # read while it still runs.
@@ -1677,6 +1692,11 @@ if (( ${#UNITS_TO_RESTART[@]} || STARTED_FOR_WINDOW )); then
     purge_pin_root || { TXN_REASON="the pin root could not be removed"; exit 1; }
     wait_own_programs_unloaded "$own_ids" || { TXN_REASON="the previous BPF programs did not unload"; exit 1; }
 fi
+fi
+# Lot 278: the new version, for the messages, when no window read it above:
+# an install over stopped units (no agent runs any more to judge the exec).
+if [[ $MODE == full && ${new_ver:-unknown} == unknown ]]; then
+    tree_version
 fi
 
 if [[ $MODE == stop ]]; then
