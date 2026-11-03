@@ -379,6 +379,7 @@ pub(crate) fn wire(
         northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
     >,
     signing_key: &northnarrow_agent::keys::KeyStore,
+    reloader: &northnarrow_agent::systemd_reload::Reloader,
 ) -> Wired {
     // Tappa 10.8 BPF self-defence: the link self-check needs the audit log,
     // which did not exist when the hooks attached.
@@ -453,6 +454,8 @@ pub(crate) fn wire(
     // the trusted-installer override so its close/expiry records chain.
     if let Some(audit) = audit_log.as_ref() {
         installer_override.set_audit_log(Arc::clone(audit));
+        // Lot 273c: and the reloads the agent asks systemd for.
+        reloader.set_audit_log(Arc::clone(audit));
     }
     Wired { telemetry_probe }
 }

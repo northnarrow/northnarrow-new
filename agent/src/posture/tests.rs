@@ -1562,6 +1562,33 @@ fn a_refused_read_of_the_signing_key_alerts_without_combat() {
     assert_eq!(m.current_kind(), PostureKind::Alerted);
 }
 
+/// Lot 273c (the review of #490): a refused change of the agent's
+/// scheduling, nice value or I/O priority raises ENGAGED (a tuning daemon
+/// meets it too), a refused `prlimit` — a kill — reaches COMBAT.
+#[test]
+fn a_refused_priority_change_engages_and_a_refused_rlimit_is_decisive() {
+    for op in [
+        nn_model::FsProtectOperation::Sched,
+        nn_model::FsProtectOperation::Nice,
+        nn_model::FsProtectOperation::Ioprio,
+    ] {
+        let m = PostureMachine::new();
+        let mut e = super::triggers::testutil::fs_protect_denial(7, 1);
+        if let nn_model::Event::FsProtectDenial { operation, .. } = &mut e {
+            *operation = op;
+        }
+        m.observe(&e, &[]);
+        assert_eq!(m.current_kind(), PostureKind::Engaged, "{op}");
+    }
+    let m = PostureMachine::new();
+    let mut e = super::triggers::testutil::fs_protect_denial(7, 1);
+    if let nn_model::Event::FsProtectDenial { operation, .. } = &mut e {
+        *operation = nn_model::FsProtectOperation::Rlimit;
+    }
+    m.observe(&e, &[]);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+}
+
 // ─── External audit POS-015 — a staging-directory exec ──────────────
 
 /// A build in a login session: pip's sdist runs configure, whose

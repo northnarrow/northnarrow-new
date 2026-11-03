@@ -384,7 +384,42 @@ pub fn protect_unit_cgroup(bpffs_root: &Path, pid: u32) -> Result<UnitCgroup> {
         })?;
     }
     write_values(bpffs_root, unit.values())?;
+    // Lot 273c: a value below its floor is replaced by the floor —
+    // registered first, then written (the caller may: the agent, the
+    // watchdog), then read back.
+    floors(bpffs_root, &unit);
     Ok(unit)
+}
+
+/// Lot 273c: the floors of `unit`'s resource directories (the unit's and
+/// its slices'), restored through the pinned `LIMIT_VALUES` and noted for
+/// the caller to report ([`crate::cgroup_floors::take_restores`]).
+fn floors(bpffs_root: &Path, unit: &UnitCgroup) {
+    let due = crate::cgroup_floors::floors_due(&limit_dirs(unit));
+    if due.is_empty() {
+        return;
+    }
+    let restores = crate::cgroup_floors::restore_floors(due, |key, value| {
+        write_values(
+            bpffs_root,
+            &[ValueEntry {
+                path: PathBuf::new(),
+                key: *key,
+                value: *value,
+            }],
+        )
+    });
+    crate::cgroup_floors::note_restores(&restores);
+}
+
+/// Lot 273c: the directories of `unit` registered with
+/// `FS_PROTECT_LIMIT_DIR` (the unit's and its slices').
+pub fn limit_dirs(unit: &UnitCgroup) -> Vec<PathBuf> {
+    unit.entries()
+        .iter()
+        .filter(|e| e.flags & FS_PROTECT_LIMIT_DIR != 0)
+        .map(|e| e.path.clone())
+        .collect()
 }
 
 /// Lot 273b: the values the resource files of the unit cgroup `cgroup`
@@ -399,6 +434,8 @@ pub fn refresh_unit_values(bpffs_root: &Path, cgroup: &str) -> Result<usize> {
     };
     let unit = unit_cgroup_at(&root, cgroup);
     write_values(bpffs_root, unit.values())?;
+    // Lot 273c: and what was left below a floor inside the window.
+    floors(bpffs_root, &unit);
     Ok(unit.values().len())
 }
 

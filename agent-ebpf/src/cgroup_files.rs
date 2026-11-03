@@ -28,18 +28,20 @@ use aya_ebpf::{
     maps::{Array, HashMap},
 };
 use northnarrow_common::cgroup_limits::{
-    default_value, limit_kind, same_value, strip_newline, word_mask, LimitValue, LIMIT_NAME_MAX,
-    LIMIT_NONE, LIMIT_TEXT_MAX,
+    default_value, init_write_lets_through, limit_kind, special_fs, strip_newline, word_mask,
+    LimitValue, SpecialFs, LIMIT_NAME_MAX, LIMIT_NONE, LIMIT_TEXT_MAX,
 };
 use northnarrow_common::wire::{
-    InodeKey, CGROUP2_SUPER_MAGIC, CGROUP_POLICY_V1_REFUSE, CGROUP_SUPER_MAGIC,
-    FS_OP_CGROUP_LIMIT, FS_OP_CGROUP_V1, FS_OP_OOM_ADJ, FS_PROTECT_LIMIT_DIR, PROC_SUPER_MAGIC,
+    InodeKey, CGROUP_POLICY_V1_REFUSE, FS_OP_CGROUP_LIMIT, FS_OP_CGROUP_V1, FS_OP_OOM_ADJ,
+    FS_PROTECT_LIMIT_DIR,
 };
 
 use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_PATH_OFFSET,
-    INODE_I_PRIVATE_OFFSET, INODE_I_SB_OFFSET, KERNFS_NODE_ID_OFFSET, KERNFS_NODE_NAME_OFFSET,
-    KERNFS_NODE_PARENT_OFFSET, PATH_DENTRY_OFFSET, PID_TASKS_OFFSET, PROC_INODE_PID_OFFSET,
+    CGROUP_ROOT_OFFSET, CGROUP_ROOT_SUBSYS_MASK_OFFSET, INODE_I_PRIVATE_OFFSET, INODE_I_SB_OFFSET,
+    KERNFS_NODE_ID_OFFSET, KERNFS_NODE_NAME_OFFSET, KERNFS_NODE_PARENT_OFFSET,
+    KERNFS_NODE_PRIV_OFFSET, KERNFS_ROOT_KN_OFFSET, KERNFS_SUPER_INFO_ROOT_OFFSET,
+    PATH_DENTRY_OFFSET, SUPER_BLOCK_S_FS_INFO_OFFSET, PID_TASKS_OFFSET, PROC_INODE_PID_OFFSET,
     PROC_INODE_VFS_INODE_OFFSET, PT_REGS_DX_OFFSET, PT_REGS_ORIG_AX_OFFSET, PT_REGS_SI_OFFSET,
     QSTR_LEN_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_PID_LINKS_OFFSET,
     TASK_STRUCT_TGID_OFFSET,
@@ -101,16 +103,12 @@ pub(crate) unsafe fn refuse_write(
             return false;
         }
     };
-    // `s_magic` is an `unsigned long`; the magics are 32-bit.
-    let magic = magic & 0xffff_ffff;
-    if magic == CGROUP2_SUPER_MAGIC {
-        refuse_limit(file, inode, hook, phase)
-    } else if magic == CGROUP_SUPER_MAGIC {
-        refuse_v1(inode, hook, phase)
-    } else if magic == PROC_SUPER_MAGIC {
-        refuse_oom_adj(file, inode, phase)
-    } else {
-        false
+    // the classification is the shared module's (the host's tests judge it)
+    match special_fs(magic) {
+        Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),
+        Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),
+        Some(SpecialFs::Proc) => refuse_oom_adj(file, inode, phase),
+        None => false,
     }
 }
 
@@ -307,14 +305,13 @@ unsafe fn refuse_limit(file: *const c_void, inode: *const c_void, hook: u32, pha
         if phase == Phase::Open {
             return false;
         }
-        let value = match registered {
+        let expected = match registered {
             Some(v) => Some(v),
             None => default_value(kind),
         };
-        if let (Some(value), Some(written)) = (value, written_value()) {
-            if same_value(&written, &value) {
-                return false;
-            }
+        // the decision is the shared module's (the host's tests judge it)
+        if init_write_lets_through(expected, written_value()) {
+            return false;
         }
     }
     sign(phase, FS_OP_CGROUP_LIMIT, key);
@@ -369,7 +366,69 @@ unsafe fn written_bytes() -> Option<(LimitValue, u32)> {
     Some((value, n))
 }
 
-/// A cgroup v1 hierarchy: [`refuse_write`]'s v1 half.
+/// Lot 273c (the review of #490): whether the cgroup v1 hierarchy of
+/// `inode` binds a controller — `sb->s_fs_info` (kernfs) → `root` → `kn` →
+/// `priv` (its root cgroup) → `root` → `subsys_mask`. A named hierarchy
+/// (`name=systemd`, an old container's systemd on a v2 host) binds none:
+/// it can move and freeze nothing. `None` without the optional offsets or
+/// on a read that fails: the write is judged as a controller's then.
+#[inline(always)]
+unsafe fn v1_binds_a_controller(inode: *const c_void) -> Option<bool> {
+    let fs_info = off_opt!(SUPER_BLOCK_S_FS_INFO_OFFSET)?;
+    let si_root = off_opt!(KERNFS_SUPER_INFO_ROOT_OFFSET)?;
+    let root_kn = off_opt!(KERNFS_ROOT_KN_OFFSET)?;
+    let kn_priv = off_opt!(KERNFS_NODE_PRIV_OFFSET)?;
+    let cg_root = off_opt!(CGROUP_ROOT_OFFSET)?;
+    let mask_off = off_opt!(CGROUP_ROOT_SUBSYS_MASK_OFFSET)?;
+    let sb = bpf_probe_read_kernel::<*const u8>((inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const *const u8).ok()?;
+    let p = |base: *const u8, off: usize| -> Option<*const u8> {
+        if base.is_null() {
+            return None;
+        }
+        let v = bpf_probe_read_kernel::<*const u8>(base.add(off) as *const *const u8).ok()?;
+        (!v.is_null()).then_some(v)
+    };
+    let info = p(sb, fs_info)?;
+    let kroot = p(info, si_root)?;
+    let kn = p(kroot, root_kn)?;
+    let cgrp = p(kn, kn_priv)?;
+    let root = p(cgrp, cg_root)?;
+    let mask = bpf_probe_read_kernel::<u32>(root.add(mask_off) as *const u32).ok()?;
+    Some(mask != 0)
+}
+
+/// Lot 273c: the v1 files that move a process (`cgroup.procs`, `tasks`)
+/// or freeze it (`freezer.state`), by the kernfs node's name; `None`
+/// without the node's offsets or when the name cannot be read.
+#[inline(always)]
+unsafe fn v1_moves_or_freezes(inode: *const c_void) -> Option<bool> {
+    let private = off_opt!(INODE_I_PRIVATE_OFFSET)?;
+    let name_off = off_opt!(KERNFS_NODE_NAME_OFFSET)?;
+    let kn = bpf_probe_read_kernel::<*const u8>((inode as *const u8).add(private) as *const *const u8).ok()?;
+    if kn.is_null() {
+        return None;
+    }
+    let name = bpf_probe_read_kernel::<*const u8>(kn.add(name_off) as *const *const u8).ok()?;
+    if name.is_null() {
+        return None;
+    }
+    let mut w = [0u64; 3];
+    let n = generated::bpf_probe_read_kernel_str(w.as_mut_ptr() as *mut c_void, 24, name as *const c_void);
+    if n <= 1 {
+        return None;
+    }
+    const PROCS: [u64; 3] = northnarrow_common::cgroup_limits::name_words(b"cgroup.procs");
+    const TASKS: [u64; 3] = northnarrow_common::cgroup_limits::name_words(b"tasks");
+    const FREEZER: [u64; 3] = northnarrow_common::cgroup_limits::name_words(b"freezer.state");
+    let is = |x: [u64; 3]| w[0] == x[0] && w[1] == x[1] && w[2] == x[2];
+    Some(is(PROCS) || is(TASKS) || is(FREEZER))
+}
+
+/// A cgroup v1 hierarchy: [`refuse_write`]'s v1 half. Lot 273c (the review
+/// of #490): refused only where it can move or freeze a process — a
+/// hierarchy that binds a controller, its `cgroup.procs`, `tasks` and
+/// `freezer.state`; a named hierarchy and the other files are let through
+/// (both judged as refusable when the kernel's BTF lacks what tells them).
 #[inline(always)]
 unsafe fn refuse_v1(inode: *const c_void, hook: u32, phase: Phase) -> bool {
     match CGROUP_POLICY.get(0) {
@@ -378,6 +437,12 @@ unsafe fn refuse_v1(inode: *const c_void, hook: u32, phase: Phase) -> bool {
     }
     let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
     if caller_may(caller) {
+        return false;
+    }
+    if v1_binds_a_controller(inode) == Some(false) {
+        return false;
+    }
+    if v1_moves_or_freezes(inode) == Some(false) {
         return false;
     }
     let Some(key) = crate::inode_protect::read_inode_key(inode) else {

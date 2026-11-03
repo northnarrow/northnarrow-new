@@ -82,7 +82,8 @@ pub const BPF_LSM_ABSENT: &str = "bpf is not in the active LSM list: its BPF LSM
 const DENY_HOOK_LIST: &str = "LSM task_kill, ptrace_access_check, inode_unlink, inode_rmdir, \
      inode_rename, inode_setattr, file_ioctl, file_open, inode_create, inode_mkdir, inode_mknod, \
      inode_symlink, inode_link, inode_setxattr, inode_removexattr, bpf_map, file_permission (lot \
-     273b: the write deny); inode_set_acl, inode_remove_acl, file_ioctl_compat where the kernel \
+     273b: the write deny), task_setrlimit, task_setscheduler, task_setnice, task_setioprio (lot \
+     273c: another process's limits and priorities of a protected one); inode_set_acl, inode_remove_acl, file_ioctl_compat where the kernel \
      has them; bpf (the agent's links); kernel_read_file and kernel_load_data (kexec); the cgroup \
      move guard, inode_permission, fexit cgroup_procs_write_start and fentry \
      cgroup_procs_write_finish, where the kernel has the functions in the shape it reads";
@@ -90,21 +91,26 @@ const DENY_HOOK_LIST: &str = "LSM task_kill, ptrace_access_check, inode_unlink, 
 /// Lot 273b (the review of #489): the deny hooks' cost on the host where it
 /// is more than noise, as the lab measured it (Ubuntu 24.04, 6.8; A/B
 /// with the programs' links detached and attached in turn,
-/// `docs/roadmap/CAPABILITY_PROGRAM.md`, lot 273b).
+/// `docs/roadmap/CAPABILITY_PROGRAM.md`, lots 273b and 273c). Lot 273c
+/// (the review of #490): measured again with `kernel.bpf_stats_enabled=0`
+/// (the stats add two clock reads to every call; lot 273b's rounds ran
+/// with them), the per-call cost from one round with them on.
 const FS_PROTECT_OVERHEAD: &[Overhead] = &[
     Overhead {
         what: "the cgroup move guard (LSM inode_permission): every permission check of a \
                path walk — the mask test, and one lookup on a write check",
-        cost: "about 59 ns a call (run_time_ns / run_cnt); git status x10 on the lab's \
-               source tree +24 % (88 -> 109 ms), find /usr x3 +5 %, a 2,000-file package \
-               installed and removed within the noise (medians of three A/B rounds)",
+        cost: "about 62 ns a call (run_time_ns / run_cnt); with the BPF stats off, git status \
+               x10 on the lab's source tree +13 % (87 -> 98 ms), find /usr x3 +2 %, a \
+               2,000-file package installed and removed within the noise (medians of three \
+               A/B rounds; the rounds' spread is of the same order)",
     },
     Overhead {
-        what: "the write deny (LSM file_permission): every write(2)-family call — one \
+        what: "the write deny (LSM file_permission): every write(2)-family call — the \
+               file's i_mode (a socket, a pipe, a tty leave there), then one \
                PROTECTED_INODES lookup and the superblock's magic",
-        cost: "about 96 ns a write call (run_time_ns / run_cnt); the 2,000-file package \
-               installed and removed +9 % (1,134 -> 1,232 ms), git status x10 +14 %, find \
-               /usr within the noise (medians of three A/B rounds)",
+        cost: "about 96 ns a write call to a regular file (run_time_ns / run_cnt); with the BPF \
+               stats off, the 2,000-file package installed and removed +4 % (1,076 -> 1,123 \
+               ms), find /usr within the noise (medians of three A/B rounds)",
     },
 ];
 

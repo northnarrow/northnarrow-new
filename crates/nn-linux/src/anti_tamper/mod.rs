@@ -801,7 +801,7 @@ fn named(entries: &[(&'static str, String)]) -> Vec<String> {
 /// EBPF-015) and the BPF map guard. External audit TST-009: the
 /// privileged restart test asserts exactly these pins, where it counted
 /// seven LSM programs anywhere on the host.
-pub const DENY_HOOKS: [&str; 17] = [
+pub const DENY_HOOKS: [&str; 21] = [
     TASK_KILL_HOOK,
     PTRACE_HOOK,
     "inode_unlink",
@@ -820,6 +820,12 @@ pub const DENY_HOOKS: [&str; 17] = [
     bpf_defense::GUARD_HOOK,
     // Lot 273b: the write deny (`protected_write_deny`).
     "file_permission",
+    // Lot 273c: another process's change of a protected process's limits,
+    // scheduling, nice value and I/O priority.
+    "task_setrlimit",
+    "task_setscheduler",
+    "task_setnice",
+    "task_setioprio",
 ];
 
 /// Deny hooks attached only where the kernel has them
@@ -1516,8 +1522,8 @@ mod tests {
             &deny,
             &[("module_load_observe", "absent".to_string())],
         );
-        assert_eq!(r.expected, 17);
-        assert_eq!(r.attached, 16, "a failed step is not a missing hook");
+        assert_eq!(r.expected, 21);
+        assert_eq!(r.attached, 20, "a failed step is not a missing hook");
         assert_eq!(r.missing, ["task_kill: verifier", "bpffs pin root: a link"]);
         assert_eq!(r.observe_missing, ["module_load_observe: absent"]);
         let healthy = DenyReport::of(18, &DenyHealth::default(), &[]);
@@ -1557,8 +1563,8 @@ mod tests {
     #[test]
     fn deny_hooks_expected_include_the_new_entry_and_xattr_denies() {
         // Lot 273b: the write deny (`file_permission`) is the fourteenth
-        // inode_protect program.
-        assert_eq!(LSM_DENY_HOOKS_EXPECTED, 2 + 14 + 1);
+        // inode_protect program; lot 273c adds the four task-settings denies.
+        assert_eq!(LSM_DENY_HOOKS_EXPECTED, 2 + 14 + 4 + 1);
         if std::env::var(ALLOW_DEGRADED_ENV).as_deref() == Ok("1") {
             return;
         }
@@ -1571,7 +1577,7 @@ mod tests {
             &mut AttachReport::default(),
         )
         .expect_err("a missing create deny must refuse to start");
-        assert!(format!("{err:#}").contains("18 of 19"), "{err:#}");
+        assert!(format!("{err:#}").contains("22 of 23"), "{err:#}");
     }
 
     /// External audit ATP-016 (NN-AUD-264): an FS bootstrap failure is the
@@ -1584,7 +1590,7 @@ mod tests {
             return;
         }
         for (in_kernel, expected, attached) in
-            [(None, 17, 3), (Some(false), 17, 3), (Some(true), 20, 3)]
+            [(None, 21, 3), (Some(false), 21, 3), (Some(true), 24, 3)]
         {
             let fs = filesystem::hooks_lost_to_bootstrap_failure(
                 |_| in_kernel,
@@ -1640,7 +1646,7 @@ mod tests {
             )
             .unwrap_err()
         );
-        assert!(msg.contains("17 of 17 deny hooks"), "{msg}");
+        assert!(msg.contains("21 of 21 deny hooks"), "{msg}");
         assert!(msg.contains("2 protection step(s) failed"), "{msg}");
         assert!(
             msg.contains("ptrace_override_boot_zero: pin failed"),
@@ -1660,7 +1666,7 @@ mod tests {
             )
             .unwrap_err()
         );
-        assert!(msg.contains("16 of 17 deny hooks"), "{msg}");
+        assert!(msg.contains("20 of 21 deny hooks"), "{msg}");
         assert!(
             msg.contains("bpf_map_guard: observe mode; own objects"),
             "{msg}"

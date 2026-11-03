@@ -398,7 +398,12 @@ fn unit_dropins_with(roots: &[&Path], known_dropins: &[(&str, &str)]) -> Vec<Fin
     for root in roots {
         let mut dirs: Vec<PathBuf> = UNITS.iter().map(|u| root.join(format!("{u}.d"))).collect();
         dirs.push(root.join("northnarrow-.service.d"));
-        dirs.push(root.join("service.d"));
+        // the type- and slice-wide ones (lot 273c: slice.d and
+        // system.slice.d reach the units' slice): an alert each, their
+        // values judged by `crate::host_dropins`
+        for (d, _) in crate::host_dropins::TYPE_DIRS {
+            dirs.push(root.join(d));
+        }
         for dir in dirs {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
@@ -1092,6 +1097,17 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
                             "the holding watchdog tried to start the agent again",
                         ),
                         wh::REASON_HOLD_ENDED => ("watchdog_hold", "the watchdog's hold ended"),
+                        // Lot 273c: the agent's fresh cgroup, or the
+                        // watchdog's, restored to its floors by the watchdog.
+                        wh::REASON_LIMIT_FLOOR_RESTORED => (
+                            "limit_floor_restored",
+                            "the watchdog restored a resource value below its floor",
+                        ),
+                        wh::REASON_LIMIT_FLOOR_NOT_RESTORED => (
+                            "limit_floor_not_restored",
+                            "the watchdog found a resource value below its floor and could not \
+                             restore it",
+                        ),
                         _ => ("watchdog_hold", "the watchdog stopped respawning the agent"),
                     };
                     let mut d = format!(
@@ -1714,6 +1730,17 @@ impl Checker {
         let roots = unit_roots(Path::new("/"));
         let search: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
         c.extend(unit_dropins(&search));
+        // Lot 273c (the review of #492, C1): the host's type- and slice-wide
+        // drop-ins whose value harms our units, each a signed drift while
+        // it is there; nothing is moved (`crate::host_dropins`).
+        c.extend(
+            crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read())
+                .into_iter()
+                .map(|h| Finding {
+                    kind: "unit_dropin_harmful",
+                    detail: h.detail(),
+                }),
+        );
         c.extend(unit_shadows(&search));
         c.extend(
             config_overlays(Path::new(CONFIG_DIR))
@@ -1789,6 +1816,22 @@ impl Checker {
     fn round(&mut self, at_boot: bool) {
         let findings = self.collect_round();
         self.apply(findings, unix_now(), at_boot);
+        // Lot 273c (the review of #490): resource values the registration
+        // found below their floors and restored (at the attach, at a
+        // window's close): each a signed drift.
+        for r in antitamper_bpf::cgroup_floors::take_restores() {
+            self.report_once(
+                Finding {
+                    kind: if r.ok {
+                        "limit_floor_restored"
+                    } else {
+                        "limit_floor_not_restored"
+                    },
+                    detail: r.detail(),
+                },
+                at_boot,
+            );
+        }
         // External audit WDG-001: shutdown markers the watchdog refused
         // (forged, replayed or stale) while the agent was down.
         let rejected = Path::new(nn_proto::shutdown_marker::REJECTED_PATH);
@@ -2101,6 +2144,13 @@ mod tests {
             (wh::REASON_EVENT_LOOP_STALLED, "event_loop_stalled"),
             (wh::REASON_HOLD_RETRY, "watchdog_hold"),
             (wh::REASON_HOLD_ENDED, "watchdog_hold"),
+            // Lot 273c: the watchdog's floor restorations, signed as the
+            // agent's own
+            (wh::REASON_LIMIT_FLOOR_RESTORED, "limit_floor_restored"),
+            (
+                wh::REASON_LIMIT_FLOOR_NOT_RESTORED,
+                "limit_floor_not_restored",
+            ),
         ];
         let body = reasons
             .iter()
@@ -2725,6 +2775,30 @@ mod tests {
     /// every directory of the unit search path — `system.attached` and the
     /// generator directories included — and one directory reached by two
     /// spellings counts once.
+    /// Lot 273c (the review of #492, C1): the slice-wide drop-in
+    /// directories reach the units' slice: each drop-in there is an alert
+    /// (the `unit_dropin` finding), its value judged apart
+    /// (`crate::host_dropins`), the file left where it is.
+    #[test]
+    fn the_slice_wide_drop_ins_are_alerts_and_stay() {
+        let root = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for d in ["service.d", "slice.d", "system.slice.d"] {
+            let dir = root.path().join(d);
+            std::fs::create_dir_all(&dir).unwrap();
+            let f = dir.join("50-host.conf");
+            std::fs::write(&f, "[Slice]\nMemoryMax=4G\n").unwrap();
+            files.push(f);
+        }
+        let f = unit_dropins(&[root.path()]);
+        assert_eq!(f.len(), 3, "{f:?}");
+        assert!(f.iter().all(|x| x.kind == "unit_dropin"));
+        assert!(f
+            .iter()
+            .any(|x| x.detail.contains("/system.slice.d/50-host.conf")));
+        assert!(files.iter().all(|f| f.exists()));
+    }
+
     #[test]
     fn dropins_are_read_from_every_directory_of_the_unit_search_path() {
         let root = tempfile::tempdir().unwrap();

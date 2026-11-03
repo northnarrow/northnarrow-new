@@ -2916,11 +2916,11 @@ mod tests {
     fn file_ioctl_compat_is_selected_from_the_kernels_btf() {
         use super::super::filesystem::{attach_optional, OptionalHook, OPTIONAL_LSM_PROGRAMS};
         for (kernel, compat, acl, expected) in [
-            ("6.8, 6.12", true, true, 17 + 3),
-            ("6.6.15", true, true, 17 + 3),
-            ("6.6.14", false, true, 17 + 2),
-            ("6.1.76, 5.15.149", true, false, 17 + 1),
-            ("6.1.75, 5.15.148", false, false, 17),
+            ("6.8, 6.12", true, true, 21 + 3),
+            ("6.6.15", true, true, 21 + 3),
+            ("6.6.14", false, true, 21 + 2),
+            ("6.1.76, 5.15.149", true, false, 21 + 1),
+            ("6.1.75, 5.15.148", false, false, 21),
         ] {
             let r = hooks_only(&ioctl_btf(compat, acl, 0));
             assert_eq!(

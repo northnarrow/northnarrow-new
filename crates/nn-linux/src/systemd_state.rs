@@ -42,6 +42,54 @@ const MAX_MESSAGE: usize = 64 * 1024;
 /// `SystemState` as systemd reports it, through `socket` (normally
 /// [`PRIVATE_SOCKET`]), each read and write bounded by `timeout`.
 pub fn system_state(socket: &Path, timeout: Duration) -> io::Result<String> {
+    let mut s = connect(socket, timeout)?;
+    const SERIAL: u32 = 1;
+    s.write_all(&get_property_call(SERIAL, MANAGER_INTERFACE, "SystemState"))?;
+    loop {
+        let msg = read_message(&mut s)?;
+        if let Some(state) = parse_reply(&msg, SERIAL)? {
+            return Ok(state);
+        }
+    }
+}
+
+/// Lot 273c (the review of #490): a `daemon-reload` — systemd reloads on
+/// a SIGHUP (systemd(1)) — once `socket`, systemd's private socket, is
+/// found served by PID 1: PID 1 is systemd, no other init is signalled. A
+/// refused `set-property` still sets systemd's own copy of the property;
+/// the reload takes that copy back to the unit's files before a start
+/// applies it. The reload is systemd's own, after the signal: not waited
+/// for (it takes a quarter of a second).
+///
+/// Not `Manager.Reload()` on the socket: systemd lets a caller reload at
+/// once only with `CAP_SYS_ADMIN`, which the agent's unit does not grant,
+/// and asks polkit for any other. The lab (lot 273c, round 4: Ubuntu 24.04,
+/// systemd 255) saw every such call wait its whole 30 s timeout, and
+/// systemd reload only once the agent had closed the connection ("Failed
+/// to send queued message ... Transport endpoint is not connected"). Root
+/// signals PID 1 without a capability (same uid).
+pub fn reload(socket: &Path) -> io::Result<()> {
+    // PID 1 serves the socket and answers as systemd: the state it reports,
+    // read in a whole D-Bus exchange (a connection closed after the peer
+    // check alone made PID 1 log "Failed to start new connection bus:
+    // Connection reset by peer" at every reload; round 7). A host that is
+    // stopping is not reloaded.
+    let state = system_state(socket, Duration::from_secs(5))?;
+    if state == "stopping" {
+        return Err(other(
+            "systemd reports the host as stopping: no reload".to_string(),
+        ));
+    }
+    // SAFETY: kill(2) has no memory preconditions.
+    if unsafe { libc::kill(1, libc::SIGHUP) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A connection to systemd's private socket served by PID 1, authenticated
+/// (SASL EXTERNAL) and with fd passing agreed.
+fn connect(socket: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let mut s = UnixStream::connect(socket)?;
     // Only systemd itself answers: a socket mounted over the private one
     // by root would otherwise make the agent believe the host is stopping
@@ -78,14 +126,7 @@ pub fn system_state(socket: &Path, timeout: Duration) -> io::Result<String> {
         return Err(other(format!("D-Bus: fd passing not agreed: {line}")));
     }
     s.write_all(b"BEGIN\r\n")?;
-    const SERIAL: u32 = 1;
-    s.write_all(&get_property_call(SERIAL, MANAGER_INTERFACE, "SystemState"))?;
-    loop {
-        let msg = read_message(&mut s)?;
-        if let Some(state) = parse_reply(&msg, SERIAL)? {
-            return Ok(state);
-        }
-    }
+    Ok(s)
 }
 
 /// The pid of the process that created the listening end (`SO_PEERCRED`).
@@ -342,6 +383,18 @@ fn parse_reply(msg: &[u8], serial: u32) -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 273c: no SIGHUP unless PID 1 serves the socket — another init,
+    /// or a socket mounted over systemd's, is not signalled.
+    #[test]
+    fn a_reload_signals_only_the_init_that_serves_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let e = reload(&path).unwrap_err();
+        assert!(e.to_string().contains("not systemd"), "{e}");
+        assert!(reload(&dir.path().join("none")).is_err());
+    }
 
     /// A reply as systemd builds it: `METHOD_RETURN`, REPLY_SERIAL and
     /// SIGNATURE `v`, body a variant holding `value`.
