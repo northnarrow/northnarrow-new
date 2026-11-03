@@ -2203,7 +2203,15 @@ mod tests {
             refused: 0,
             skipped: 0,
         });
-        assert_eq!(first(&remediated), 57, "the last production variant");
+        assert_eq!(first(&remediated), 57, "RemediateRansomwareResponse");
+        // Lot 278 (review of #493): the grant asked for an installer,
+        // appended after lab PR 222's pair — the last production variant
+        let for_installer =
+            AdminMessage::TrustedInstallerGrantForInstallerRequest(TrustedInstallerGrantRequest {
+                payload: SignedPayload::new_trusted_installer_grant([0; 32], 0, [0; 16], 1),
+                signatures: Vec::new(),
+            });
+        assert_eq!(first(&for_installer), 58, "the last production variant");
         assert_eq!(
             first(&AdminMessage::StatusResponse(StatusResponse::public(
                 PostureKind::Observing,
@@ -2219,9 +2227,9 @@ mod tests {
         {
             assert_eq!(
                 first(&AdminMessage::DebugForcePosture(DebugForcePosture::Combat)),
-                58
+                59
             );
-            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 59);
+            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 60);
         }
     }
 
