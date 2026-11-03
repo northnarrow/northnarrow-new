@@ -1580,12 +1580,26 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         // identity the parent took in between (review of #493, B1: a
         // parent that forks and then executes another script of the same
         // interpreter must not lend the fork that script; the rule of
-        // [`Self::orphan_entry`]). `/proc/<pid>/exe` must still be the image
-        // (below).
+        // [`Self::orphan_entry`]), and only an identity its executable alone
+        // decides (second review of #493: a script, an npm entrypoint, an
+        // interpreter's inline program come from an argv the process
+        // writes, and a fork of a fork that never executed — G runs
+        // `python3 evil.py`, its fork forks the child, then executes
+        // `python3 /usr/bin/borg` — would pass for borg; for an
+        // interpreter's identity the later exec is never used).
+        // `/proc/<pid>/exe` must still be that executable (below, its start
+        // read again): a fork made after the exec runs it; one made before
+        // runs the earlier image, the same file or no answer.
         let forked_by = ticks.saturating_add(2).saturating_mul(tick);
         let parent = match self.cached_live(ppid, Some(start_ns)) {
             CachedAt::Current(e) | CachedAt::Past(e) => e,
-            CachedAt::LaterOnly => self.only_identity_between(ppid, start_ns, forked_by)?,
+            CachedAt::LaterOnly => {
+                let e = self.only_identity_between(ppid, start_ns, forked_by)?;
+                if e.script.is_some() || e.argv_npm_cli || is_interpreter(&e.exe) {
+                    return None;
+                }
+                e
+            }
             CachedAt::Absent => self.fork_entry(ppid, Some(start_ns), depth + 1)?,
         };
         let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
@@ -5222,7 +5236,9 @@ mod tests {
         let (_tmp, t) = fork(10_006 * MS, 10_002 * MS);
         assert_eq!(t.exec_identity(801, judged), None);
         assert_eq!(readers_of(&t, 801, judged), None);
-        // two execs there of one identity (the same script twice): that one
+        // two execs there of one identity (the same script twice): an
+        // interpreter's identity is never taken from the later exec (second
+        // review of #493) — not known
         let tmp = TempDir::new().unwrap();
         let t = AuthSessionTracker::new(tmp.path());
         t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
@@ -5240,15 +5256,97 @@ mod tests {
         write_exe(tmp.path(), 801, "/usr/bin/python3");
         write_status(tmp.path(), 801, 800);
         write_started(tmp.path(), "801", 800, 1_000);
-        let id = t.exec_identity(801, judged);
-        assert_eq!(
-            id.and_then(|i| i.script).as_deref(),
-            Some("/home/u/evil.py")
-        );
+        assert_eq!(t.exec_identity(801, judged), None);
     }
 
     fn readers_of(t: &AuthSessionTracker, pid: u32, at: AsOf) -> Option<String> {
         crate::canary::readers::CanaryReaders::new(Default::default(), t.clone()).reader(pid, at)
+    }
+
+    /// Second review of #493: a fork of a fork that never executed. G (750)
+    /// runs an interpreter's script, its fork P (800) forks C (801) and
+    /// then executes another: P's one exec in C's tick is an interpreter's
+    /// — never C's identity; C is not known, not borg, not npm. An
+    /// executable's own identity (sudo after bash) is taken; a child whose
+    /// live exe cannot be read, or that runs the earlier image, is not.
+    #[test]
+    fn a_fork_of_a_fork_does_not_borrow_the_later_exec_of_an_interpreter() {
+        const MS: u64 = 1_000_000;
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let case = |g_exe: &str, g: &[&str], p_exe: &str, p: &[&str], child_exe: &str| {
+            let tmp = TempDir::new().unwrap();
+            let t = AuthSessionTracker::new(tmp.path());
+            t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+            t.ingest_exec(750, 700, g_exe, &argv(g), 9_000 * MS, 8_900 * MS, 1000);
+            // P (800): G's fork, never executed until 10.006 s
+            write_exe(tmp.path(), 800, g_exe);
+            write_status(tmp.path(), 800, 750);
+            write_started(tmp.path(), "800", 750, 990);
+            // C (801), P's fork at 10.005 s (`/proc`: tick 1000)
+            write_exe(tmp.path(), 801, child_exe);
+            write_status(tmp.path(), 801, 800);
+            write_started(tmp.path(), "801", 800, 1_000);
+            t.ingest_exec(800, 750, p_exe, &argv(p), 10_006 * MS, 9_900 * MS, 1000);
+            (tmp, t)
+        };
+        let judged = AsOf::Judged(10_050 * MS);
+        let py = "/usr/bin/python3";
+        let node = "/usr/bin/node";
+        let npm = "/usr/lib/node_modules/npm/bin/npm-cli.js";
+        let cases: [(&str, &[&str], &str, &[&str]); 4] = [
+            // the same interpreter, the review's case
+            (
+                py,
+                &["python3", "/home/u/evil.py"],
+                py,
+                &["python3", "/usr/bin/borg", "serve"],
+            ),
+            // another interpreter before: the child's exe is the later one's
+            (
+                "/usr/bin/perl",
+                &["perl", "/home/u/evil.pl"],
+                py,
+                &["python3", "/usr/bin/borg"],
+            ),
+            // npm's entrypoint
+            (
+                node,
+                &["node", "/home/u/evil.js"],
+                node,
+                &["node", npm, "ci"],
+            ),
+            // an interpreter's inline program
+            (
+                py,
+                &["python3", "/home/u/evil.py"],
+                py,
+                &["python3", "-c", "pass"],
+            ),
+        ];
+        for (g_exe, g, p_exe, p) in cases {
+            let (_tmp, t) = case(g_exe, g, p_exe, p, p_exe);
+            assert_eq!(t.exec_identity(801, judged), None, "{g:?} then {p:?}");
+            assert_eq!(readers_of(&t, 801, judged), None, "{g:?} then {p:?}");
+            assert!(!t.is_npm_cli_writer(801, judged), "{g:?} then {p:?}");
+        }
+        // an executable's identity (bash, then sudo): taken
+        let (tmp, t) = case(
+            "/usr/bin/bash",
+            &["bash"],
+            "/usr/bin/sudo",
+            &["sudo", "x"],
+            "/usr/bin/sudo",
+        );
+        assert_eq!(
+            t.exec_identity(801, judged).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/sudo"))
+        );
+        // the child's live exe unreadable: not known
+        std::fs::remove_file(tmp.path().join("801").join("exe")).unwrap();
+        assert_eq!(t.exec_identity(801, judged), None);
+        // a child forked before the exec runs the earlier image: not sudo's
+        write_exe(tmp.path(), 801, "/usr/bin/bash");
+        assert_eq!(t.exec_identity(801, judged), None);
     }
 
     /// Review of #493 (B3): the fork's upper bound is the fork's own tick
