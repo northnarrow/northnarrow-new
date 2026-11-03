@@ -2461,6 +2461,10 @@ impl Rule for NnLNet021SensorRecordFlood {
             nn_model::FloodSource::IoUringCreate => {
                 ("io_uring_setup() calls", "io_uring ring-creation records")
             }
+            // Lot 275
+            nn_model::FloodSource::Accept => ("accepted connections", "inbound connection records"),
+            nn_model::FloodSource::DnsAnswer => ("DNS responses", "DNS response records"),
+            nn_model::FloodSource::TlsHello => ("TLS ClientHellos", "ClientHello records"),
         };
         Some(net_verdict(
             self,

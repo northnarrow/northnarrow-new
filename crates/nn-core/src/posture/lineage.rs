@@ -841,8 +841,10 @@ pub fn event_time_ns(event: &Event) -> u64 {
         | Event::SensorFlood { timestamp_ns, .. }
         | Event::ExploitPostcondition { timestamp_ns, .. } => *timestamp_ns,
         Event::Fim(fe) => fe.timestamp_ns,
-        Event::NetFlow(nf) => nf.start_ns,
+        Event::NetFlow(nf) | Event::NetInbound(nf) => nf.start_ns,
         Event::NetListener(nl) => nl.timestamp_ns,
+        Event::DnsAnswer(a) => a.timestamp_ns,
+        Event::TlsClientHello(h) => h.timestamp_ns,
     }
 }
 
