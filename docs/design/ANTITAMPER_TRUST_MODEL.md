@@ -591,13 +591,58 @@ polkit): the refusal has to be the kernel's.
 
 ### Residual
 
-- **Resource limits.** `memory.max`, `memory.high`, `cpu.max`, `pids.max`
-  of the units are not refused: systemd writes them whenever it realises a
-  unit (a start, a `set-property`), and a refusal there would sign
-  systemd's own maintenance. A change is reported (`integrity_drift`,
-  `limit_changed`; tamper case C12). `memory.max` set below the agent's
-  use ends in an OOM kill of the unit — a follow-up: refuse the writers
-  that are not PID 1, and make `set-property` of the units a detection.
+- **Resource limits — open, lot 273b's scope.** The resource files of the
+  units and of their slices (`memory.max`, `memory.high`, `cpu.max`,
+  `cpu.idle`, `pids.max`, ...) are not refused, and they are not "only
+  reported" either: some of them stop the agent as surely as a kill or a
+  freeze.
+  - `memory.max` below the unit's use is an OOM kill inside the write
+    itself (the kernel reclaims and OOM-kills in `memory_max_write`): the
+    agent dies before it can sign a row, and systemd writes the same value
+    again when it restarts the unit. On `system.slice` it is a persistent
+    OOM loop that also kills every new watchdog.
+  - `cpu.max` (a minimal quota), `cpu.idle` and `pids.max` starve the
+    agent the way a freeze does — on a slice, the watchdog with it.
+    `pids.max` also refuses the agent's new threads, the worker's restart
+    and the actuators' execs (`nft`, `iptables`): a response fails without
+    noise.
+
+  A change the agent survives is reported (`integrity_drift`,
+  `limit_changed`; tamper case C12). systemd writes these files as PID 1
+  whenever it realises a unit (a start, a `set-property`), which is why
+  lot 273 did not refuse them. Lot 273b: refuse their write-opens by any
+  caller but PID 1 outside a window, check the value PID 1 writes
+  (`set-property`) against a floor, protect the units' drop-in
+  directories, and refuse writes to the protected pids' `oom_score_adj`.
+- **cgroup v1 — open, to be confirmed in lab (lot 273b).** Only the v2
+  hierarchy is protected, and the gap is not limited to hybrid hosts. The
+  v1 controllers that no v2 hierarchy binds — `freezer`, `devices`,
+  `net_cls`, `net_prio`, `perf_event` (hierarchy 0 in `/proc/cgroups`) —
+  can be mounted by root on a pure v2 host too, unless it booted with
+  `cgroup_no_v1=all`. A root can then move the agent's and the watchdog's
+  pids into a v1 `freezer` cgroup and write `FROZEN` to its
+  `freezer.state`: the v1 `cgroup.procs` path (`__cgroup1_procs_write`)
+  checks the uid and no inode, so the move guard does not see the move,
+  and v1's freeze file is not in the protected set. The effect is the
+  freeze lot 273 refuses on v2 (the processes stay in their v2 unit
+  cgroup, so systemd still shows the unit running). Lot 273b confirms it
+  in the lab and adds the defence: refuse write-opens on a v1 cgroup
+  superblock (`CGROUP_SUPER_MAGIC`) outside a window on hosts booted
+  without v1 hierarchies, and say in the capability manifest whether v1
+  controllers are mountable. On a pure v2 host an operator can refuse the
+  mount itself today with `cgroup_no_v1=all` on the kernel command line.
+  A process in no v2 cgroup, or a host without one, is a signed
+  degradation.
+- **Handles opened earlier — open, lot 273b's scope.** The deny is at
+  open, as for every protected file, so a write descriptor opened before
+  the inode was registered keeps working. That is one of a unit's
+  `cgroup.kill` opened inside a window or in a fresh cgroup's first
+  milliseconds, and — wider — one of `system.slice/cgroup.kill` (or
+  `cgroup.freeze`) opened at any time before the agent's first start (for
+  example by a unit ordered before it): the slice outlives every restart
+  of the agent, so that descriptor stays usable for the whole boot. Lot
+  273b: refuse the write itself on the registered inodes in
+  `file_permission` (one map lookup per write, not per path walk).
 - **Thaw.** A thaw is a write-open of `cgroup.freeze` too: outside a
   window it is refused like a freeze. A unit frozen inside a window must
   be thawed inside one. systemd 249 and 252 mark the unit `freezing` (or
@@ -613,14 +658,10 @@ polkit): the refusal has to be the kernel's.
   detached and attached in turn; wopen about 8 %). No cheaper attach point
   exists in the migration's path: no LSM hook names the moved task, and
   the functions there are not `fmod_ret` targets.
-- **cgroup v1.** Only the v2 hierarchy is protected; a v1 `freezer` or
-  `name=systemd` hierarchy (a hybrid host) is not, and its `cgroup.procs`
-  path checks no inode, so the move guard does not see it. A process in no
-  v2 cgroup, or a host without one, is a signed degradation.
-- **Handles opened earlier.** A descriptor of `cgroup.kill` opened for
-  writing inside a window (or before the agent registered a fresh unit
-  cgroup) keeps working: the deny is at open, as for every protected file.
 - **The fresh cgroup at a restart.** systemd makes a new unit cgroup for
   every start; until the new agent's earliest registration (its first
   milliseconds; on a first boot, until its attach) that cgroup is not
   protected. The watchdog's: until its own registration at its start.
+  With a descriptor opened in that interval (an `inotify` on the slice
+  sees the `mkdir`) it is the case above, closed by the same
+  `file_permission` refusal.

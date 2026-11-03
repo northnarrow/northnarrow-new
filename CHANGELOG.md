@@ -653,9 +653,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   window everything works as before; host reboot and power-off are
   unchanged. Tamper check: C15 (freeze) and C20 (`cgroup.kill`) now expect
   a refusal, C33 reads the agent it checks, new C65–C76 (C76 inside a
-  window). Not refused (open): the units' resource limits (`memory.max`,
-  `cpu.max`, `pids.max`: reported as `integrity_drift`), cgroup v1
-  hierarchies, a thaw outside a window. Cost: the move guard's
+  window). Thaw outside a window: refused like a freeze. Still open (lot
+  273b's scope): the units' and their slices' resource limits are not
+  refused — a low `memory.max` is an OOM kill inside the write itself (on
+  `system.slice` a persistent OOM loop that also kills new watchdogs),
+  `cpu.max`, `cpu.idle` and `pids.max` starve the agent like a freeze
+  (`pids.max` also breaks the actuators' execs); a change the agent
+  survives is an `integrity_drift`. cgroup v1 is not covered, on a pure v2
+  host too: root can mount the v1 `freezer` there, move the pids into it
+  and write `FROZEN`, unseen by the move guard (to be confirmed in lab;
+  `cgroup_no_v1=all` refuses the mount). A write descriptor of
+  `system.slice/cgroup.kill` opened at any time before the agent's first
+  start stays usable. Cost: the move guard's
   `inode_permission` program runs on every permission check of a path
   walk — about −10 % on the lab's open microbenchmark (Ubuntu 24.04). On
   systemd 249 and 252 a refused `systemctl freeze` leaves the unit

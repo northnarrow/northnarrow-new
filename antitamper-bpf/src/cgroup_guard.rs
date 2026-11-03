@@ -11,7 +11,7 @@
 //!
 //! | entry | flags | refused outside a trusted-installer window |
 //! |---|---|---|
-//! | the unit's directory | `MUTATE`, `NOCREATE`, `INIT_RMDIR` | `rmdir` (but PID 1's, see [`FS_PROTECT_INIT_RMDIR`]), a child cgroup, `chown` / `chmod`, a rename, an xattr |
+//! | the unit's directory | `MUTATE`, `NOCREATE`, `INIT_RMDIR` | `rmdir` (but PID 1's, see [`common::wire::FS_PROTECT_INIT_RMDIR`]), a child cgroup, `chown` / `chmod`, a rename, an xattr |
 //! | its `cgroup.kill` | `MUTATE`, `WRITE`, `CGROUP_KILL` | a write-open (signed `cgroup_kill`) |
 //! | its `cgroup.freeze` | `MUTATE`, `WRITE`, `CGROUP_FREEZE` | a write-open (signed `cgroup_freeze`) |
 //! | its `cgroup.procs`, `cgroup.threads` | `MUTATE` | `chown` / `chmod` (a delegation); writes stay open: systemd attaches the unit's processes there |
@@ -20,14 +20,19 @@
 //! Not entered: the unit's `cgroup.subtree_control` (systemd rewrites it at
 //! every realisation of the unit; the unit has processes, so no domain
 //! controller can be enabled below it anyway) and the resource files
-//! (`memory.max`, `cpu.max`, `pids.max`, ...: systemd applies the unit's
-//! properties there; a change is reported as `integrity_drift`, not
-//! refused). A move of a protected process out of the cgroup is refused by
-//! the `cgroup_move_*` programs, not by an entry.
+//! (`memory.max`, `cpu.max`, `cpu.idle`, `pids.max`, ...: systemd applies
+//! the unit's properties there as PID 1). Not refusing them is an open
+//! residual, lot 273b's scope: a low `memory.max` is an OOM kill inside the
+//! write, `cpu.max` / `cpu.idle` / `pids.max` starve the agent like a
+//! freeze; a change the agent survives is reported as `integrity_drift`.
+//! A move of a protected process out of the cgroup is refused by the
+//! `cgroup_move_*` programs, not by an entry.
 //!
 //! Only a systemd *service* cgroup is protected (`…/<name>.slice/…/<unit>.service`):
 //! the agent started by hand or by a privileged test runs in a login
-//! scope, whose cgroup is not the agent's to defend. Only cgroup v2.
+//! scope, whose cgroup is not the agent's to defend. Only cgroup v2: a v1
+//! hierarchy root mounts later (the v1 `freezer` is mountable on a pure v2
+//! host too) is not covered yet (lot 273b).
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};

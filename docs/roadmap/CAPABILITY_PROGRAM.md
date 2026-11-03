@@ -4913,15 +4913,24 @@ number in parentheses is a lab PR.
     depth), set B 5 of 5 (the executable resolver). The eBPF guard's checks
     and every registration site are read by `xtask/tests/cgroup_guard.rs`
     (12 of set A's and 1 of set B's caught there).
-  - Open: the units' resource limits (`memory.max` — an OOM kill —,
-    `cpu.max`, `pids.max`) are reported (`integrity_drift`, C12), not
-    refused: systemd writes them at every realisation, so the refusal has
-    to tell PID 1's own maintenance from a root shell's and make
-    `set-property` of the units a detection; a thaw outside a window is
-    refused like a freeze; cgroup v1 hierarchies (a hybrid host) are not
-    covered; a `cgroup.kill` descriptor opened inside a window stays
-    usable; systemd 249 and 252 keep a unit `freezing`/`thawing` in their
-    own state after a refused freeze or thaw (nothing frozen; their next
+  - Open, lot 273b's scope: the units' and their slices' resource limits
+    are not refused, and are not only reported — a low `memory.max` is an
+    OOM kill inside the write itself (on `system.slice` a persistent OOM
+    loop that also kills new watchdogs), `cpu.max`, `cpu.idle` and
+    `pids.max` starve the agent like a freeze (`pids.max` also breaks the
+    actuators' execs); a change the agent survives is an `integrity_drift`
+    (C12). systemd writes them as PID 1 at every realisation, so lot 273b
+    refuses the other writers and checks the value PID 1 writes. cgroup v1
+    is not covered, on pure v2 hosts too: root can mount the v1 `freezer`
+    (or `devices`, `net_cls`, `net_prio`, `perf_event`), move both pids
+    there and write `FROZEN` to `freezer.state`, and the move guard does
+    not see the v1 `cgroup.procs` path (to be confirmed in lab, lot 273b).
+    A write descriptor of `system.slice/cgroup.kill` opened at any time
+    before the agent's first start stays usable (the refusal is at open),
+    as does one of a unit's opened inside a window. Also open: a thaw
+    outside a window is refused like a freeze; systemd 249 and 252 keep a
+    unit `freezing`/`thawing` in their own state after a refused freeze or
+    thaw (nothing frozen; their next
     `systemctl freeze`/`thaw` says "still in progress" until a freezer
     event); the move guard's cost on path-heavy work (about −10 % on the
     open microbenchmark): no cheaper attach point exists in the

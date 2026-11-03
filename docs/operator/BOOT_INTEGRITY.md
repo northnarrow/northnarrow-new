@@ -662,3 +662,25 @@ degradation where it has not. A process outside a systemd service's cgroup
 — a privileged test's agent, an agent started by hand in a login scope —
 is not protected and not degraded: its cgroup is not the agent's.
 
+Not covered yet (lot 273b's scope; the detail is in the trust model's
+"Residual"):
+
+- **The units' and their slices' resource limits are not refused.** They
+  are not harmless drift: `memory.max` set below the agent's use is an
+  OOM kill inside the write itself, before the agent can sign anything,
+  and on `system.slice` a persistent OOM loop that also kills every new
+  watchdog; `cpu.max`, `cpu.idle` and `pids.max` starve the agent the way
+  a freeze does, and `pids.max` also makes the actuators' execs fail. A
+  change the agent survives is an `integrity_drift` (`limit_changed`).
+- **cgroup v1 is not covered, on pure v2 hosts too** (to be confirmed in
+  lab, lot 273b). Root can mount the v1 `freezer` (or `devices`,
+  `net_cls`, `net_prio`, `perf_event`) on a host booted without
+  `cgroup_no_v1=all`, move the agent's and the watchdog's pids into it and
+  write `FROZEN` to `freezer.state`; the move guard does not see the v1
+  `cgroup.procs` path. On a pure v2 host, `cgroup_no_v1=all` on the kernel
+  command line refuses the mount.
+- **A descriptor opened before registration keeps working.** The refusal
+  is at open: a write descriptor of `system.slice/cgroup.kill` opened at
+  any time before the agent's first start stays usable for the whole boot,
+  as does one of a unit's `cgroup.kill` opened inside a window.
+
