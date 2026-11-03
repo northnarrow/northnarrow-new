@@ -264,6 +264,21 @@ fn every_forbidden_call_is_killed_by_the_seccomp_filter() {
     .exists());
 }
 
+/// Lot 277: a worker that finds a second thread at its sandbox's door
+/// refuses to enter and exits `EXIT_SANDBOX` (Landlock and `no_new_privs`
+/// would bind its calling thread only).
+#[test]
+#[ignore = "root, a lab guest: starts workers as northnarrow-worker"]
+fn a_worker_with_a_second_thread_refuses_its_sandbox() {
+    let h = harness();
+    let st = h.attack(nn_linux::worker::hostile::THREADED);
+    assert_eq!(
+        st.code(),
+        Some(nn_linux::worker::serve::EXIT_SANDBOX),
+        "the threaded worker: {st:?}"
+    );
+}
+
 #[test]
 #[ignore = "root, a lab guest: starts workers as northnarrow-worker"]
 fn beneath_the_filter_each_layer_refuses_what_the_kernel_lets_it() {
