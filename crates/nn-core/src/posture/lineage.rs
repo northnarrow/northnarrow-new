@@ -5349,6 +5349,42 @@ mod tests {
         assert_eq!(t.exec_identity(801, judged), None);
     }
 
+    /// Second review of #493 (mutation R3): the one-identity rule compares
+    /// every field of the identity — two execs of one executable in the
+    /// fork's tick that differ only in npm's entrypoint (`argv[1]`) are two
+    /// identities: not known.
+    #[test]
+    fn two_execs_differing_only_in_npm_s_entrypoint_are_two_identities() {
+        const MS: u64 = 1_000_000;
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+        let npm = "/usr/lib/node_modules/npm/bin/npm-cli.js";
+        t.ingest_exec(
+            710,
+            700,
+            "/usr/bin/sudo",
+            &argv(&["sudo", "-n"]),
+            10_002 * MS,
+            10_001 * MS,
+            1000,
+        );
+        t.ingest_exec(
+            710,
+            700,
+            "/usr/bin/sudo",
+            &argv(&["sudo", npm]),
+            10_006 * MS,
+            10_001 * MS,
+            1000,
+        );
+        write_exe(tmp.path(), 711, "/usr/bin/sudo");
+        write_status(tmp.path(), 711, 710);
+        write_started(tmp.path(), "711", 710, 1_000);
+        assert_eq!(t.exec_identity(711, AsOf::Judged(10_050 * MS)), None);
+    }
+
     /// Review of #493 (B3): the fork's upper bound is the fork's own tick
     /// and its rounding — an exec of the parent past it (a tick later) is
     /// never the fork's image, even as the only one.
