@@ -616,13 +616,43 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     in_order(
         r,
         &[
-            "let peer = peer_pid(&s)?;",
-            "if peer != 1 {\n        return Err(",
+            "let state = system_state(socket, Duration::from_secs(5))?;",
+            "if state == \"stopping\" {",
             "libc::kill(1, libc::SIGHUP)",
         ],
     )
     .unwrap();
     assert!(!r.contains("Reload"), "no Manager.Reload() call:\n{r}");
+    // PID 1 serves the socket: the peer check of every exchange
+    in_order(
+        body(&sd, "connect"),
+        &[
+            "let peer = peer_pid(&s)?;",
+            "if peer != 1 {\n        return Err(",
+        ],
+    )
+    .unwrap();
+    // The review of #492 (C1), round 7: no reload while a harmful host
+    // drop-in is on disk (a window's reload applied a 4K system.slice)
+    let rl = code("crates/nn-linux/src/systemd_reload.rs");
+    in_order(
+        body(&rl, "worker"),
+        &[
+            "crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read());",
+            "match outcome(&harms, || crate::systemd_state::reload(socket)) {",
+            "Outcome::Withheld(what) => {",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&rl, "outcome"),
+        &[
+            "if let Some(h) = harms.first() {",
+            "return Outcome::Withheld(",
+            "match reload() {",
+        ],
+    )
+    .unwrap();
     in_order(
         body(
             &code("crates/nn-linux/src/anti_tamper/trusted_installer.rs"),
@@ -638,13 +668,41 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     in_order(
         body(&si, "round"),
         &[
-            "crate::dropin_quarantine::quarantine(",
-            ".request(crate::systemd_reload::Reason::Quarantined);",
             "antitamper_bpf::cgroup_floors::take_restores()",
             "\"limit_floor_restored\"",
         ],
     )
     .unwrap();
+    // The review of #492 (C1): the host's drop-ins judged by their value
+    // for our units, each a finding of the round; none moved, written or
+    // deleted — the module only reads.
+    in_order(
+        body(&si, "collect_round"),
+        &[
+            "c.extend(unit_dropins(&search));",
+            "c.extend(\n            crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read())",
+            "kind: \"unit_dropin_harmful\",",
+        ],
+    )
+    .unwrap();
+    assert!(
+        body(&si, "unit_dropins_with").contains("for (d, _) in crate::host_dropins::TYPE_DIRS {")
+    );
+    let hd = code("crates/nn-linux/src/host_dropins.rs");
+    let hd = &hd[..hd.find("#[cfg(test)]").expect("its tests")];
+    for call in [
+        "fs::rename",
+        "fs::remove_file",
+        "fs::write",
+        "fs::copy",
+        "create_dir",
+        "OpenOptions",
+        "File::create",
+        "Reason::",
+    ] {
+        assert!(!hd.contains(call), "host_dropins.rs only reads: {call}");
+    }
+    assert!(!si.contains("Reason::Quarantined") && !si.contains("dropin_quarantine"));
     let ab = code("antitamper-bpf/src/cgroup_guard.rs");
     in_order(
         body(&ab, "protect_unit_cgroup"),

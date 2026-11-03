@@ -48,9 +48,6 @@ pub enum Reason {
         ino: u64,
     },
     WindowOpened,
-    /// A host drop-in reaching the units was quarantined
-    /// ([`crate::dropin_quarantine`]): systemd's copy still has it.
-    Quarantined,
 }
 
 impl Reason {
@@ -60,7 +57,6 @@ impl Reason {
                 format!("PID 1's {op} refused on {dev}:{ino} (a set-property outside a window)")
             }
             Self::WindowOpened => "a trusted-installer window opened".to_string(),
-            Self::Quarantined => "a host drop-in reaching the units was quarantined".to_string(),
         }
     }
 }
@@ -85,8 +81,8 @@ pub struct Limiter {
 }
 
 impl Limiter {
-    /// What a request for `reason` at `now` gets. A window or a quarantine
-    /// always reloads now (rare, and their reload must not be lost); a
+    /// What a request for `reason` at `now` gets. A window always reloads
+    /// now (signed, rare, and its reload must not be lost); a
     /// refusal at most once per [`MIN_INTERVAL`] (later, not dropped), and
     /// once per target per [`TARGET_QUIET`].
     pub fn decide(&mut self, reason: &Reason, now: Instant) -> Decision {
@@ -206,22 +202,70 @@ fn worker(rx: Receiver<Reason>, socket: &Path, audit: Arc<Mutex<Option<Arc<Mutex
         };
         // a reload now covers what was pending too
         pending = None;
-        limiter.reloaded(Instant::now());
-        let result = crate::systemd_state::reload(socket);
         let why = reason.text();
-        match &result {
-            Ok(()) => {
-                info!(reason = %why, "systemd asked to reload (SIGHUP, its daemon-reload): its copy of the units becomes their files again")
+        let roots = crate::self_integrity::unit_roots(Path::new("/"));
+        let search: Vec<&Path> = roots.iter().map(|p| p.as_path()).collect();
+        let harms = crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read());
+        match outcome(&harms, || crate::systemd_state::reload(socket)) {
+            Outcome::Withheld(what) => {
+                warn!(reason = %why, withheld = %what, "systemd reload WITHHELD: a host drop-in harmful to our units is on disk, and a reload would apply it (inside a window, through)");
+                record(&audit, &why, "withheld", Some(what));
             }
-            Err(e) => {
-                warn!(reason = %why, error = %e, "systemd reload NOT asked — a refused set-property's copy may stay until the next reload")
+            Outcome::Requested => {
+                limiter.reloaded(Instant::now());
+                info!(reason = %why, "systemd asked to reload (SIGHUP, its daemon-reload): its copy of the units becomes their files again");
+                record(&audit, &why, "requested", None);
+            }
+            Outcome::Failed(e) => {
+                limiter.reloaded(Instant::now());
+                warn!(reason = %why, error = %e, "systemd reload NOT asked — a refused set-property's copy may stay until the next reload");
+                record(&audit, &why, "failed", Some(e));
             }
         }
-        record(&audit, &why, result.as_ref().err().map(|e| e.to_string()));
     }
 }
 
-fn record(slot: &Mutex<Option<Arc<Mutex<AuditLog>>>>, why: &str, error: Option<String>) {
+/// What a reload came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Asked (systemd's SIGHUP sent).
+    Requested,
+    /// Not asked: a host drop-in harmful to our units is on disk
+    /// (`crate::host_dropins`), and a reload would load it into systemd's
+    /// copy — inside a trusted-installer window, where PID 1's writes are
+    /// let through, onto our units' cgroups (the review of #492, C1; the
+    /// lab's round 7 saw a `MemoryMax=4K` on `system.slice.d` applied by
+    /// the window's own reload and the slice's services killed).
+    Withheld(String),
+    /// Asked and failed.
+    Failed(String),
+}
+
+/// The reload of `reload`, unless `harms` holds a harmful drop-in.
+pub fn outcome(
+    harms: &[crate::host_dropins::Harm],
+    reload: impl FnOnce() -> std::io::Result<()>,
+) -> Outcome {
+    if let Some(h) = harms.first() {
+        let more = harms.len() - 1;
+        return Outcome::Withheld(if more == 0 {
+            h.detail()
+        } else {
+            format!("{} (and {more} more)", h.detail())
+        });
+    }
+    match reload() {
+        Ok(()) => Outcome::Requested,
+        Err(e) => Outcome::Failed(e.to_string()),
+    }
+}
+
+fn record(
+    slot: &Mutex<Option<Arc<Mutex<AuditLog>>>>,
+    why: &str,
+    result: &str,
+    error: Option<String>,
+) {
     let audit = slot.lock().clone();
     let Some(audit) = audit else { return };
     let mut log = audit.lock();
@@ -230,11 +274,7 @@ fn record(slot: &Mutex<Option<Arc<Mutex<AuditLog>>>>, why: &str, error: Option<S
         extra: serde_json::json!({ "reason": why, "error": error }),
         key_fp: "agent-self".to_string(),
         cosigner_fps: Vec::new(),
-        result: if error.is_none() {
-            "requested".into()
-        } else {
-            "failed".into()
-        },
+        result: result.to_string(),
         client_pid: log.self_pid(),
         client_uid: 0,
         client_comm: "northnarrow-agent".to_string(),
@@ -272,19 +312,44 @@ mod tests {
         );
         // the same target within its quiet: not again
         assert_eq!(l.decide(&a, t0 + MIN_INTERVAL * 3), Decision::Skip);
-        // a window or a quarantine: now, whatever the interval
+        // a window: now, whatever the interval
         assert_eq!(
             l.decide(&Reason::WindowOpened, t0 + Duration::from_secs(1)),
-            Decision::Now
-        );
-        assert_eq!(
-            l.decide(&Reason::Quarantined, t0 + Duration::from_secs(1)),
             Decision::Now
         );
         // the target after its quiet
         assert_eq!(
             l.decide(&a, t0 + TARGET_QUIET + MIN_INTERVAL),
             Decision::Now
+        );
+    }
+
+    /// The review of #492 (C1), round 7: no reload while a host drop-in
+    /// harmful to our units is on disk — a reload would apply it, inside
+    /// a window onto our units' cgroups; the reload itself is not tried.
+    #[test]
+    fn a_harmful_host_drop_in_withholds_the_reload() {
+        let harm = crate::host_dropins::Harm {
+            path: "/etc/systemd/system/system.slice.d/99-x.conf".into(),
+            directive: "MemoryMax".into(),
+            value: "4K".into(),
+            why: "below the slice's floor".into(),
+            reach: crate::host_dropins::Reach::SystemSlice,
+        };
+        let mut tried = false;
+        let o = outcome(std::slice::from_ref(&harm), || {
+            tried = true;
+            Ok(())
+        });
+        assert!(!tried, "no reload tried");
+        assert!(
+            matches!(&o, Outcome::Withheld(w) if w.contains("99-x.conf sets MemoryMax=4K")),
+            "{o:?}"
+        );
+        assert_eq!(outcome(&[], || Ok(())), Outcome::Requested);
+        assert_eq!(
+            outcome(&[], || Err(std::io::Error::other("no"))),
+            Outcome::Failed("no".into())
         );
     }
 

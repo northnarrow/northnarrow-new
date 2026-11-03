@@ -398,7 +398,12 @@ fn unit_dropins_with(roots: &[&Path], known_dropins: &[(&str, &str)]) -> Vec<Fin
     for root in roots {
         let mut dirs: Vec<PathBuf> = UNITS.iter().map(|u| root.join(format!("{u}.d"))).collect();
         dirs.push(root.join("northnarrow-.service.d"));
-        dirs.push(root.join("service.d"));
+        // the type- and slice-wide ones (lot 273c: slice.d and
+        // system.slice.d reach the units' slice): an alert each, their
+        // values judged by `crate::host_dropins`
+        for (d, _) in crate::host_dropins::TYPE_DIRS {
+            dirs.push(root.join(d));
+        }
         for dir in dirs {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
@@ -1634,8 +1639,6 @@ struct Checker {
     watchdog_pidfile: PathBuf,
     own_files: Vec<String>,
     audit_log: Option<Arc<Mutex<AuditLog>>>,
-    /// Lot 273c: the reload a quarantined drop-in asks for.
-    reloader: crate::systemd_reload::Reloader,
 }
 
 impl Checker {
@@ -1727,6 +1730,17 @@ impl Checker {
         let roots = unit_roots(Path::new("/"));
         let search: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
         c.extend(unit_dropins(&search));
+        // Lot 273c (the review of #492, C1): the host's type- and slice-wide
+        // drop-ins whose value harms our units, each a signed drift while
+        // it is there; nothing is moved (`crate::host_dropins`).
+        c.extend(
+            crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read())
+                .into_iter()
+                .map(|h| Finding {
+                    kind: "unit_dropin_harmful",
+                    detail: h.detail(),
+                }),
+        );
         c.extend(unit_shadows(&search));
         c.extend(
             config_overlays(Path::new(CONFIG_DIR))
@@ -1802,35 +1816,6 @@ impl Checker {
     fn round(&mut self, at_boot: bool) {
         let findings = self.collect_round();
         self.apply(findings, unix_now(), at_boot);
-        // Lot 273c (the review of #490): a host drop-in that reaches our
-        // units (service.d, slice.d, system.slice.d) with a dangerous
-        // directive, quarantined; systemd reloaded so its copy loses it.
-        let dirs: Vec<&Path> = crate::dropin_quarantine::HOST_DIRS
-            .iter()
-            .map(Path::new)
-            .collect();
-        let moved = crate::dropin_quarantine::quarantine(
-            &dirs,
-            Path::new(crate::dropin_quarantine::QUARANTINE_DIR),
-            unix_now(),
-        );
-        if moved.iter().any(|q| q.to.is_some()) {
-            self.reloader
-                .request(crate::systemd_reload::Reason::Quarantined);
-        }
-        for q in moved {
-            self.report_once(
-                Finding {
-                    kind: if q.to.is_some() {
-                        "unit_dropin_quarantined"
-                    } else {
-                        "unit_dropin_not_quarantined"
-                    },
-                    detail: q.detail(),
-                },
-                at_boot,
-            );
-        }
         // Lot 273c (the review of #490): resource values the registration
         // found below their floors and restored (at the attach, at a
         // window's close): each a signed drift.
@@ -1920,7 +1905,6 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
     audit_log: Option<Arc<Mutex<AuditLog>>>,
     watchdog_pidfile: PathBuf,
     overlay_gate: Option<Arc<G>>,
-    reloader: crate::systemd_reload::Reloader,
 ) {
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let mut own_files = Vec::new();
@@ -1940,7 +1924,6 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
         watchdog_pidfile,
         own_files,
         audit_log,
-        reloader,
     };
     for f in weakening_env(&vars) {
         checker.report_once(f, true);
@@ -2792,6 +2775,30 @@ mod tests {
     /// every directory of the unit search path — `system.attached` and the
     /// generator directories included — and one directory reached by two
     /// spellings counts once.
+    /// Lot 273c (the review of #492, C1): the slice-wide drop-in
+    /// directories reach the units' slice: each drop-in there is an alert
+    /// (the `unit_dropin` finding), its value judged apart
+    /// (`crate::host_dropins`), the file left where it is.
+    #[test]
+    fn the_slice_wide_drop_ins_are_alerts_and_stay() {
+        let root = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for d in ["service.d", "slice.d", "system.slice.d"] {
+            let dir = root.path().join(d);
+            std::fs::create_dir_all(&dir).unwrap();
+            let f = dir.join("50-host.conf");
+            std::fs::write(&f, "[Slice]\nMemoryMax=4G\n").unwrap();
+            files.push(f);
+        }
+        let f = unit_dropins(&[root.path()]);
+        assert_eq!(f.len(), 3, "{f:?}");
+        assert!(f.iter().all(|x| x.kind == "unit_dropin"));
+        assert!(f
+            .iter()
+            .any(|x| x.detail.contains("/system.slice.d/50-host.conf")));
+        assert!(files.iter().all(|f| f.exists()));
+    }
+
     #[test]
     fn dropins_are_read_from_every_directory_of_the_unit_search_path() {
         let root = tempfile::tempdir().unwrap();
@@ -2974,7 +2981,6 @@ mod tests {
             watchdog_pidfile: dir.join("watchdog.pid"),
             own_files: Vec::new(),
             audit_log: Some(Arc::new(Mutex::new(log))),
-            reloader: crate::systemd_reload::Reloader::inert(),
         };
         (checker, path)
     }

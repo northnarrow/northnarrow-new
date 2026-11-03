@@ -69,14 +69,16 @@ pub fn system_state(socket: &Path, timeout: Duration) -> io::Result<String> {
 /// to send queued message ... Transport endpoint is not connected"). Root
 /// signals PID 1 without a capability (same uid).
 pub fn reload(socket: &Path) -> io::Result<()> {
-    let s = UnixStream::connect(socket)?;
-    let peer = peer_pid(&s)?;
-    drop(s);
-    if peer != 1 {
-        return Err(other(format!(
-            "{} is served by pid {peer}, not systemd: no reload",
-            socket.display()
-        )));
+    // PID 1 serves the socket and answers as systemd: the state it reports,
+    // read in a whole D-Bus exchange (a connection closed after the peer
+    // check alone made PID 1 log "Failed to start new connection bus:
+    // Connection reset by peer" at every reload; round 7). A host that is
+    // stopping is not reloaded.
+    let state = system_state(socket, Duration::from_secs(5))?;
+    if state == "stopping" {
+        return Err(other(
+            "systemd reports the host as stopping: no reload".to_string(),
+        ));
     }
     // SAFETY: kill(2) has no memory preconditions.
     if unsafe { libc::kill(1, libc::SIGHUP) } != 0 {
@@ -390,7 +392,7 @@ mod tests {
         let path = dir.path().join("private");
         let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let e = reload(&path).unwrap_err();
-        assert!(e.to_string().contains("not systemd: no reload"), "{e}");
+        assert!(e.to_string().contains("not systemd"), "{e}");
         assert!(reload(&dir.path().join("none")).is_err());
     }
 

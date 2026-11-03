@@ -408,7 +408,6 @@ pub(crate) fn wire(
         audit_log.clone(),
         cli.watchdog_pidfile.clone(),
         Some(Arc::clone(overlay_gate)),
-        reloader.clone(),
     );
     // Lab PR 160: the heads re-anchored as they move, and the bounded
     // verification of the rotating logs in the background

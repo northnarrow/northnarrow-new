@@ -2316,29 +2316,50 @@ r=libc.ptrace(0x4206,1,None,None)
 print("seized pid 1" if r==0 else "errno=%s" % errno.errorcode.get(ctypes.get_errno(),"?"))'
         for i in $(seq 1 40); do window_open || break; sleep 1; done
     fi
-    # C97: a host-wide drop-in that reaches the units (service.d) with a
-    # directive of the dangerous set (here an NN_ variable, harmless to
-    # every other service): quarantined by the agent's integrity round and
-    # systemd reloaded.
+    # C97 (the review of #492, C1): the host's type- and slice-wide
+    # drop-ins are the host's configuration for every service — a global
+    # LimitNOFILE and a hardening SystemCallFilter stay untouched (alerts at
+    # most); a MemoryMax=4K on system.slice.d, applied by the host's own
+    # `daemon-reload`, is neutralised for our units (PID 1's write of the
+    # slice refused) and signed `unit_dropin_harmful`; nothing is moved.
     if selected C97; then
-        D97=/etc/systemd/system/service.d
-        mkdir -p "$D97"
+        DS=/etc/systemd/system/service.d; DL=/etc/systemd/system/system.slice.d
+        F1=$DS/99-nn-lab-c97-nofile.conf; F2=$DS/99-nn-lab-c97-scf.conf; F3=$DL/99-nn-lab-c97-mem.conf
+        SMX=$CGROOT/system.slice/memory.max; SMX0=$(cat "$SMX" 2>/dev/null)
+        DS_WAS=$([[ -d $DS ]] && echo present || echo absent); DL_WAS=$([[ -d $DL ]] && echo present || echo absent)
+        mkdir -p "$DS" "$DL"
         t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
-        printf '[Service]\nEnvironment=NN_LAB_C97=1\n' > "$D97/99-nn-lab-c97.conf" 2>/dev/null
-        for i in $(seq 1 90); do [[ -e $D97/99-nn-lab-c97.conf ]] || break; sleep 1; done
-        sleep 3; ev=$(evidence "$t0" "$a0" "$d0")
-        q=$(ls /var/lib/northnarrow/quarantine/dropins/ 2>/dev/null | grep -c 'nn-lab-c97')
-        if [[ ! -e $D97/99-nn-lab-c97.conf ]] && (( q > 0 )) && echo "$ev" | grep -q "integrity_drift"; then
-            v=OK; st="quarantined"
-        else
-            v="DEVIATION (expected quarantined: file $([[ -e $D97/99-nn-lab-c97.conf ]] && echo present || echo gone), quarantine $q)"; fail=1; st="left"
-        fi
-        rows+=("| C97 | a dangerous drop-in in the host's service.d | $st | $ev | $v |")
-        echo "C97 host service.d drop-in → $st; $ev; $v" >&2
-        rm -f "$D97/99-nn-lab-c97.conf"
-        if (( q > 0 )); then grant_window 20; rm -f /var/lib/northnarrow/quarantine/dropins/*nn-lab-c97*; for i in $(seq 1 30); do window_open || break; sleep 1; done; fi
+        printf '[Service]\nLimitNOFILE=1048576\n' > "$F1"
+        printf '[Service]\nSystemCallFilter=~@obsolete\n' > "$F2"
+        printf '[Slice]\nMemoryMax=4K\n' > "$F3"
         systemctl daemon-reload
-        restored C97 "the lab's drop-in" absent "$([[ -e $D97/99-nn-lab-c97.conf ]] && echo present || echo absent)"
+        sleep 45; ev=$(evidence "$t0" "$a0" "$d0")
+        smx=$(cat "$SMX" 2>/dev/null)
+        harm=$(tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep 'unit_dropin_harmful')
+        h3=$(grep -c '99-nn-lab-c97-mem.conf' <<<"$harm"); h12=$(grep -cE '99-nn-lab-c97-(nofile|scf).conf' <<<"$harm")
+        present=0; for f in "$F1" "$F2" "$F3"; do [[ -e $f ]] && present=$((present + 1)); done
+        # round 7: a window opened while the 4K is on disk — the agent's own
+        # reload at the window's opening must not apply it (PID 1's writes
+        # are let through inside a window)
+        grant_window 20; sleep 10; smxw=$(cat "$SMX" 2>/dev/null)
+        for i in $(seq 1 40); do window_open || break; sleep 1; done
+        wh=$(tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep '"systemd_reload"' | grep -c '"withheld"')
+        if (( present == 3 && h3 > 0 && h12 == 0 && wh > 0 )) && [[ "$smx" == "$SMX0" && "$smxw" == "$SMX0" ]] && echo "$ev" | grep -q "deny=cgroup_limit"; then
+            v=OK; st="the three left in place; the slice's 4K refused (memory.max $smx, $smxw inside a window), signed harmful; LimitNOFILE and SystemCallFilter not harmful; the agent's reloads withheld: $wh"
+        else
+            v="DEVIATION (files left $present of 3, system.slice memory.max ${smx:-?} / ${smxw:-?} inside a window (was $SMX0), harmful signed for the 4K $h3, for the other two $h12, reloads withheld $wh)"; fail=1; st="not as expected"
+        fi
+        rows+=("| C97 | the host's drop-ins: LimitNOFILE and SystemCallFilter in service.d, MemoryMax=4K in system.slice.d | $st | $ev | $v |")
+        echo "C97 the host's drop-ins → $st; $ev; $v" >&2
+        # removed BEFORE any window: inside one a reload applies the 4K to
+        # the slice (PID 1's writes are let through there — round 7 lost
+        # the guest's system.slice so); outside one PID 1 writes back the
+        # registered value only
+        rm -f "$F1" "$F2" "$F3"
+        [[ $DS_WAS == absent ]] && rmdir "$DS" 2>/dev/null; [[ $DL_WAS == absent ]] && rmdir "$DL" 2>/dev/null
+        systemctl daemon-reload; sleep 5
+        restored C97 "the lab's drop-ins" absent "$([[ -e $F1 || -e $F2 || -e $F3 ]] && echo present || echo absent)"
+        restored C97 "system.slice's memory.max" "$SMX0" "$(cat "$SMX" 2>/dev/null)"
     fi
     # C98: a floor — the agent's memory.high set below 512 MiB inside a
     # window, the window closed: registered again at the floor, written
