@@ -26,6 +26,10 @@ pub(crate) struct Attached {
     pub(crate) lineage: AuthSessionTracker,
     pub(crate) flow_tracker: Arc<parking_lot::Mutex<FlowTracker>>,
     pub(crate) dns_cache: Arc<DnsCache>,
+    /// Lot 275 (NN-L-NET-028): the resolved table, and the TLS pump's
+    /// ingest the net drain's closes wait on.
+    pub(crate) resolved: Arc<northnarrow_agent::net::resolved::ResolvedTable>,
+    pub(crate) tls_ingest: Arc<northnarrow_agent::net::dns_ingest::DnsIngest>,
     pub(crate) execq_mode: northnarrow_agent::execq::Mode,
     pub(crate) execpol_mode: northnarrow_agent::execpol::Mode,
     /// R11c (lab PR 264): the exec guards the load installed, with their
@@ -327,6 +331,8 @@ pub(crate) async fn load(
         lineage,
         flow_tracker,
         dns_cache,
+        resolved,
+        tls_ingest,
         execq_mode,
         execpol_mode,
         exec_guards,

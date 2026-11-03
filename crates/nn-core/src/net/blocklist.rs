@@ -385,11 +385,11 @@ pub fn parse_blocklist_overlay_text(
 
 // ── JA3 blocklist ────────────────────────────────────────────────────
 
-/// External audit NET-009 (BUG-025): no sensor captures a TLS ClientHello
-/// in this build — `tls_parser` has no caller and every flow row carries
-/// no fingerprint — so NN-L-NET-003 cannot match, whatever the JA3 list
-/// holds. Turned on by the change that adds the producer.
-pub const TLS_FINGERPRINT_PRODUCER: bool = false;
+/// External audit NET-009 (BUG-025): whether this build has a sensor that
+/// captures a TLS ClientHello. Lot 275 added it (`agent-ebpf/src/tls_hello.rs`,
+/// fingerprinted by the parse worker): NN-L-NET-003 can match. A kernel
+/// where it does not attach says so itself (the `tls_hello` degradation).
+pub const TLS_FINGERPRINT_PRODUCER: bool = true;
 
 pub fn ja3_entries_phrase(entries: usize) -> String {
     if entries == 1 {
