@@ -58,7 +58,7 @@ liability before it is a product. NorthNarrow inverts it:
 flowchart LR
     subgraph KERNEL["Linux kernel"]
         direction TB
-        SENS["eBPF sensors · 13 sources<br/>exec · file open · FIM · TCP/UDP flows · DNS<br/>listeners · modules · io_uring · bpf() · exploit guard"]
+        SENS["eBPF sensors · 16 sources<br/>exec · file open · FIM · TCP/UDP flows · inbound · DNS · TLS<br/>listeners · modules · io_uring · bpf() · exploit guard"]
         LSM["BPF-LSM deny hooks<br/>17 + up to 6 optional"]
     end
 
@@ -96,7 +96,7 @@ flowchart LR
 
 | | |
 |---|---|
-| **Sense** | Thirteen sources on tracepoints, kprobes, uprobes, fentry/fexit and BPF-LSM hooks. Each source's attach point, fallbacks, failure mode, budgets, truncations and loss counters are a contract in code, and the agent signs a capability manifest of what really attached, at boot and at every change ([sensor contract](docs/operator/SENSOR_CONTRACT.md)). |
+| **Sense** | Sixteen sources on tracepoints, kprobes, uprobes, fentry/fexit and BPF-LSM hooks. Each source's attach point, fallbacks, failure mode, budgets, truncations and loss counters are a contract in code, and the agent signs a capability manifest of what really attached, at boot and at every change ([sensor contract](docs/operator/SENSOR_CONTRACT.md)). |
 | **Prioritise** | Every event class has its own queue. Tamper (P0) is taken first, so a flood of file opens no longer pushes denials out. A full queue follows its class's policy, and every drop is counted and signed, never silent ([event bus](docs/architecture/EVENT_BUS.md)). |
 | **Decide** | One OS thread with no `await` judges every event against 93 rules, chain correlation and the posture; most of the blocking I/O it used to do now runs elsewhere. There is no AI model on the host: the on-host LLM advisor was removed in Wave 4 ([upgrade notes](docs/operator/UPGRADE_NOTES_WAVE4.md)). |
 | **Act** | Responses go to a dispatcher: eight workers by default, Critical first, one process's responses in order. Each action is a signed intent before it runs and a signed outcome after it. The posture rises from OBSERVING through ALERTED and ENGAGED to COMBAT only on corroborated evidence. COMBAT climbs from INVESTIGATE to NEUTRALIZE to ISOLATE, and only an Ed25519-signed command releases it. |
@@ -251,7 +251,7 @@ but a defence inside the kernel is only as strong as the kernel's integrity:
   Hardware attestation (a TPM quote of the measured boot) is future work
   ([`HEARTBEAT.md`](docs/operator/HEARTBEAT.md#what-it-does-not-prove)).
 - **The capability manifest is the agent's own word.** The telemetry probe exercises 3 of the
-  13 sources, and the boot's deny self-test exercises `task_kill` and the move guard.
+  16 sources, and the boot's deny self-test exercises `task_kill` and the move guard.
 
 **Not verified yet.**
 
@@ -375,7 +375,7 @@ on-host LLM advisor removed, which also took about 150 crates out of `Cargo.lock
   - [ ] Network telemetry (inbound connections, DNS answers, TLS fingerprints) and "no DNS, no connect": a connection to an address no DNS answer gave
   - [ ] Process telemetry: fork, exit and credential changes
   - [ ] Deception that trips when a decoy is used
-  - [ ] A self-test of every sensor, not three of thirteen
+  - [ ] A self-test of every sensor, not three of sixteen
   - [ ] Foreign BPF loads and rootkit helpers refused
   - [ ] Per-rule exemptions by cgroup or unit that hold only for processes started there: a process moved into an exempt cgroup loses the exemption, and the move is signed
   - [ ] `isolate --ttl`: a signed isolation outside the COMBAT ladder, with an expiry
