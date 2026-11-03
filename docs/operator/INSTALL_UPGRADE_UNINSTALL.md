@@ -166,11 +166,13 @@ start — left the host without a working agent. What it does now, in order:
    object travels inside the agent binary; its pins are re-created by
    whichever agent starts. A backup that fails (a full disk) is a refusal,
    with nothing stopped;
-3. records which units are active, prints installed → new version, opens
-   the **trusted-installer window** (300 s) through the running agent's
-   socket with `--grant-key` — a signed, audited grant that lets the next
-   steps touch what the anti-tamper protects (binaries, units,
-   `/etc/northnarrow`, the pin root); then stops the **watchdog first**
+3. records which units are active, opens the **trusted-installer window**
+   (300 s) through the running agent's socket with `--grant-key` — a
+   signed, audited grant that lets the next steps touch what the
+   anti-tamper protects (binaries, units, `/etc/northnarrow`, the pin
+   root), granted to the script itself (§2.1) — and only then executes
+   anything from the tree it installs (the new agent's `--version`, for
+   the installed → new line it prints); then stops the **watchdog first**
    (stopping the agent alone makes the watchdog respawn it), then the agent,
    and checks that neither still runs;
 4. removes `/sys/fs/bpf/northnarrow`: the LSM programs survive agent
@@ -311,6 +313,44 @@ agents that keep the anti-tamper's rules (a failure at each stage, a forged
 health line, a deny-hook shortfall, the pinned-and-dead agent finished by
 `rollback.sh`); on a guest, with a deliberately broken new build, the check
 is owed (lab PR 220).
+
+### 2.1 Automated upgrades, a checkout in a home or a tree in `/tmp` (lot 278)
+
+`install.sh`, `install.sh --upgrade` and `uninstall.sh` are run by root from
+wherever the tree is: a checkout in a home, a release unpacked in `/tmp`, by
+an administrator at a terminal or by automation without one (Ansible
+`become`, cloud-init, a CI job). Each of those is a root exec from a
+user-writable path, R009's match. What the running agent does with them:
+
+- **The script's own exec** comes before any window it can open. Below
+  COMBAT, R009 records it (High) and does not kill it (RULE_POLICY.md §1);
+  run by an administrator's `sudo` at a terminal, the record is Low (an
+  administrator's session).
+- **What the script executes from its tree afterwards** (the new agent's
+  `--version`) runs after it opened its window: the agent grants the window
+  to the installer that asked for it — the process that ran `nn-admin
+  trusted-installer-grant`, by its pid and its start — and R009 records, at
+  Low, what that process's own tree executes after the grant while the
+  window is open, naming the key, the deadline and the installer's pid. The
+  tree is found by lineage, never by a name or a path: a sibling of the
+  installer, a process that took its pid later, or the same exec after the
+  window closed is judged as any other. `install.sh` opens its window before
+  it executes anything from its tree; a refused run (no `--upgrade` over
+  running units) opens none and executes nothing from it.
+- **In COMBAT** R009 kills the script's own exec, as before this lot. To
+  upgrade a host in COMBAT from a tree in a home or `/tmp`, open the window
+  first from the root shell that will run the script, so that the script is
+  that shell's child: `sudo -s`, then `nn-admin trusted-installer-grant --key
+  <key> --window-secs 300`, then `./deploy/install.sh --upgrade --grant-key
+  <key>`. Or install the release where root owns the tree (`/opt`,
+  `/usr/local/src`), or release COMBAT first (`COMBAT_RECOVERY.md`).
+- `enforce R009` in the per-rule policy kills R009's matches in every
+  posture: automation must then run the scripts at a terminal under `sudo`
+  or from a root-owned tree.
+
+The window ends with the agent that granted it: the new agent of an upgrade
+starts with none (it zeroes the grants at every start), and opens it again
+only for a rollback; nothing after the restart executes from the tree.
 
 ## 3. Uninstall
 

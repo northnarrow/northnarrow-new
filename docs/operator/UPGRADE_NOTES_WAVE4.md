@@ -34,6 +34,13 @@ has the details of each change below.
    directory exited 1), and every refusal is a signed `agent_boot` row: a
    monitor that matched exit status 1 sees 78 (§6). A broken audit chain
    now refuses the start before anything is loaded.
+7. R009 (a file in a home, `/tmp` or `/var/tmp` executed by root) no
+   longer kills below COMBAT (lot 278, §3): a root exec it used to kill in
+   OBSERVING, ALERTED or ENGAGED is a High record with the kill held, and
+   R001 and R003 no longer kill an exec by root below COMBAT either. A dashboard or a
+   test that expected the kill sees the record; `enforce R009` in the
+   signed per-rule policy restores it in every posture
+   (`RULE_POLICY.md` §1).
 
 ## 1. The on-host LLM advisor is removed (lab PR 214)
 
@@ -173,6 +180,24 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
   PR 143) or lost as above, and an operator refreshed afterwards, stays
   refreshed: a refresh row that names nothing counts after the first-trip
   rows older than it.
+
+- **R009 kills in COMBAT only; an installer's window covers its own tree
+  (lot 278).** R009 killed root automation run from a checkout or an
+  unpacked tree — `install.sh --upgrade`, `uninstall.sh`, Ansible `become`
+  without a terminal, cloud-init, CI — in OBSERVING too; at a terminal under
+  `sudo` the record was sometimes the kill, depending on the milliseconds
+  between sudo's exec and the fork of its monitor (the lineage lost the
+  session: fixed). Now: below COMBAT the match is a High record, `held`
+  naming the kill and the posture (R001 and R003 likewise on an exec by
+  root); in COMBAT, or under `enforce R009`, the tree is killed as before. A
+  trusted-installer grant is made to the installer that asked for it (the
+  process that ran `nn-admin trusted-installer-grant`, by its pid and its
+  start; the agent's journal line `trusted-installer override ARMED` names
+  `granted_to_pid`), and R009 records at Low what that process's tree
+  executes after the grant while the window is open, naming the installer
+  (`INSTALL_UPGRADE_UNINSTALL.md` §2.1). `install.sh --upgrade` opens its
+  window before it executes anything from its tree; a refused run executes
+  nothing from it.
 
 ## 4. Build and development (source builds only)
 

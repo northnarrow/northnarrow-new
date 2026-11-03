@@ -621,6 +621,48 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- R009 no longer kills root automation run from a source tree outside
+  COMBAT; an installer's trusted-installer window covers its own process
+  tree (lot 278, the false positive of the review of #492, section f).
+  R009 (a file in a home, `/tmp` or `/var/tmp` executed by root) killed
+  `install.sh`, `install.sh --upgrade` and `uninstall.sh` run by automation
+  without a terminal (Ansible `become`, cloud-init, CI) from a checkout or an
+  unpacked tree, in OBSERVING too; and at a terminal under `sudo`, the lab's
+  "R009 flake": `sudo` with `use_pty` forks a monitor that `/proc` shows
+  started before sudo's exec when both fall in one clock tick (the start is
+  rounded down, less the time suspended), and the judged lineage walk
+  (lab PR 269) found sudo's exec "only later" and lost the administrator's
+  session. Now:
+  - the lineage reads a fork's parent at the latest time the fork can have
+    happened (`/proc/<pid>/exe` must still be the parent's image): the
+    session holds whatever the milliseconds between the exec and the fork;
+  - the engine judges an event in the posture the agent judged it in
+    (`RuleEngine::decide_in`); R009's kill runs in COMBAT only, and R001's
+    and R003's kill of an exec by root likewise (a root exec from those
+    directories is R009's to decide). Below COMBAT the record keeps its
+    severity, `held` names the kill and the reasoning the posture; a signed
+    `enforce R009` kills in every posture. Holding the kill in OBSERVING
+    only would not have been enough: any exec from `/tmp` raises ENGAGED for
+    24 hours, so the second run of an installer from an unpacked tree would
+    have been killed. Every other rule that can kill in OBSERVING is listed
+    with why (`posture_floor::OBSERVING_KILLS`: kills from before Wave 4,
+    kept by the decision of 21/10; the exploit guard's and the exec
+    quarantine's opt-ins), held to the rule catalogue by a test;
+  - a trusted-installer grant is made to the installer that asked for it:
+    the parent of the `nn-admin` at the other end of the socket, by its pid
+    and its start (`installer_of_requester`), with the time of the grant.
+    R009 records at Low, naming the key, the deadline and the installer's
+    pid, what that process's own tree executes after the grant while the
+    window is open — by lineage (`AuthSessionTracker::descends_from`), never
+    by a name or a path;
+  - `install.sh` executed the tree's agent (`--version`) before its window
+    opened, and in a refused run too: it now reads the version once the
+    window is open, or after the stop when no agent judges it.
+  Golden: the five root-from-`/tmp` exec records of the corpus are R009's
+  High record with the kill held (and R001's), judged in OBSERVING; the chain
+  kills of the same processes run as before; the nn-admin matrix shows the
+  same five records and nothing else. `docs/operator/RULE_POLICY.md` §1,
+  `INSTALL_UPGRADE_UNINSTALL.md` §2.1, `UPGRADE_NOTES_WAVE4.md`.
 - **Security (lot 273b, C23): what stopped the agent without a signal —
   its units' resource limits, a cgroup v1 freezer, a descriptor opened
   earlier, its OOM score — is refused outside a signed trusted-installer

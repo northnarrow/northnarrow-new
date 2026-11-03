@@ -386,13 +386,17 @@ int main(void) {
 }
 
 /// (b) Lab PR 166: a dropper from `/tmp` that forked before the verdict.
-/// As root (R009) and as `nobody` (R001): the record names the dropper and
-/// `KillProcessTree`, carried out; the dropper died by SIGKILL; its child
-/// is gone too, and the harness, their parent, runs on.
+/// As `nobody` (R001): the record names the dropper and `KillProcessTree`,
+/// carried out; the dropper died by SIGKILL; its child is gone too, and the
+/// harness, their parent, runs on. As root (R009), lot 278: in OBSERVING
+/// (the agent the test starts) the record is R009's High, the kill held —
+/// R009 kills in COMBAT only, or under a signed `enforce` — and the
+/// dropper and its child run on.
 ///
 /// Regression it catches: a single-process kill of the exec — the child
 /// ran on under init with the image from `/tmp` (seen in the lab with
-/// R009, which runs ahead of R001).
+/// R009, which runs ahead of R001); and a root exec from `/tmp` killed in
+/// OBSERVING (the installer run from an unpacked tree, lot 278).
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 #[cfg(feature = "debug-trigger")]
@@ -408,6 +412,7 @@ fn tmp_dropper_forked_child_dies_with_it() {
         (None, "R009_RootExecFromUserPath"),
         (Some(NOBODY), "R001_ExecFromTmp"),
     ] {
+        let held = uid.is_none();
         // Lab PR 269 (review of #475): the decision thread stands still
         // while the dropper starts, so its child exists — it has written its
         // pid — before the verdict, every run (with the decision on a thread
@@ -439,6 +444,33 @@ fn tmp_dropper_forked_child_dies_with_it() {
             "uid {uid:?}; record: {rec}"
         );
         assert_eq!(rec["exe"].as_str(), bin.to_str(), "record: {rec}");
+        if held {
+            // lot 278: detected, High, the kill held in OBSERVING
+            assert_eq!(
+                rec["verdict"],
+                serde_json::json!({"Rule": "Log"}),
+                "record: {rec}"
+            );
+            assert_eq!(rec["severity"], "High", "record: {rec}");
+            assert_eq!(rec["posture_at"], "Observing", "record: {rec}");
+            std::thread::sleep(Duration::from_secs(2));
+            assert!(
+                !common::pid_gone(pid) && !common::pid_gone(child),
+                "the root dropper or its child was killed in OBSERVING; record: {rec}"
+            );
+            // SAFETY: plain kill(2) of the child this test's dropper forked.
+            unsafe { libc::kill(child as i32, libc::SIGKILL) };
+            drop(dropper);
+            let gone = common::wait_until(Duration::from_secs(5), || {
+                processes_of(&bin).is_empty().then_some(())
+            });
+            assert!(
+                gone.is_some(),
+                "the root dropper's processes: {:?}",
+                processes_of(&bin)
+            );
+            continue;
+        }
         assert_eq!(
             rec["verdict"],
             serde_json::json!({"Rule": "KillProcessTree"}),
