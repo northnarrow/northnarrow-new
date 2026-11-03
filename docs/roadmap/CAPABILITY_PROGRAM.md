@@ -5218,3 +5218,49 @@ number in parentheses is a lab PR.
     outside this lot); a hybrid v1 host, another architecture than x86-64
     and a kernel without the proc offsets are signed degradations; the
     move guard's cost on path-heavy work.
+- **Lot 278 — R009 kills in COMBAT only; the installer's window covers its
+  own process tree; the lab's "R009 flake" fixed at its cause (C14, C17;
+  the false positive of the review of #492, section f).**
+  - What was open: R009 (a file in `/home`, `/tmp` or `/var/tmp` executed
+    by root) killed the tree of every root exec outside an administrator's
+    `sudo` at a terminal and a package transaction, in OBSERVING too:
+    `install.sh --upgrade` and `uninstall.sh` run by automation without a
+    terminal from a checkout or an unpacked tree. At a terminal it killed
+    them now and then (the flake of R14, 273, 273b, 273c): `sudo`'s monitor
+    (`use_pty`, a fork without exec) forked in the tick of sudo's exec shows
+    a start before it in `/proc`, and the judged lineage walk (lab PR 269)
+    lost the session.
+  - What changed: a fork's parent read at the latest time of the fork (its
+    image still the parent's); the engine judges in the agent's posture
+    (`decide_in`): R009's kill, and R001's and R003's of an exec by root,
+    run in COMBAT only, the record kept, `enforce R009` restores them; every
+    other rule that can kill in OBSERVING listed with why
+    (`posture_floor::OBSERVING_KILLS`, held to the catalogue: before Wave
+    4, or an opt-in); a trusted-installer grant names the installer (the
+    requester's parent, pid and start) and R009 records its tree at Low
+    after the grant, by lineage; `install.sh` executes nothing from its
+    tree before its window. No capability level moves.
+  - Lab (as measured; Ubuntu 24.04, 6.8 / systemd 255, our own guest, one
+    guest, every case right after an agent restart): before, `main`
+    dc83881b: 812 records, 31 kills, all R009 in OBSERVING (the `/tmp` ones
+    in ENGAGED) — 24 of 60 administrator `sudo ~/prog` at a pty (the flake;
+    36 Low), one `install.sh` (`upgrade-check` 2 of 3), 6 root execs with no
+    terminal; `uninstall-check` 3 of 3; tamper-check 104 cases, 100 OK, C27,
+    C57c, C64, C78c as recorded. After, the lot (9d65882d: the final code
+    but for `tree_version`'s `exec`) by `upgrade-check` from `main`: 3,251
+    records, 0 kills; `upgrade-check` 11 of 11 and `uninstall-check` 10 of
+    10; the pty probe 60 of 60 Low; automation with no terminal (the
+    refusal, `--upgrade`, `uninstall.sh`, a reinstall) from the home ×2 and
+    from `/tmp` ×2: 4 of 4 OK, the scripts' own execs High and not killed
+    (from `/tmp` judged in ENGAGED), the tree's agent Low by the window;
+    root execs with no terminal (`systemd-run`) from the home and `/tmp`:
+    High, not killed; tamper-check: the 104 rows with `main`'s outcomes on
+    the same guest. The final commit (`tree_version`'s `exec`, the merge of
+    #492) was not run on a guest (the slots were taken).
+  - Open: R009 kills the installer's own exec in COMBAT (open the window
+    from the root shell that runs it, `INSTALL_UPGRADE_UNINSTALL.md` §2.1);
+    an install from `/tmp` still raises ENGAGED for 24 hours (the script's
+    `StagingExec`) and leaves R001's Medium record of the tree's agent, its
+    kill held; one installer per window; the privileged test of a root
+    dropper asserts the held record and was not run on a guest in this lot;
+    EPG and EXECQ kill in OBSERVING only on their opt-ins.

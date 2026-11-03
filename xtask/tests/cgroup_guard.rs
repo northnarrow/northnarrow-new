@@ -653,11 +653,14 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         ],
     )
     .unwrap();
+    // lot 278: `arm_by` arms through `arm_for` (the grant's installer)
+    let ti = code("crates/nn-linux/src/anti_tamper/trusted_installer.rs");
+    assert!(
+        body(&ti, "arm_by").contains("self.arm_for(window_secs, now, key_id, None)"),
+        "arm_by arms through arm_for"
+    );
     in_order(
-        body(
-            &code("crates/nn-linux/src/anti_tamper/trusted_installer.rs"),
-            "arm_by",
-        ),
+        body(&ti, "arm_for"),
         &[
             "self.armed.store(true, Ordering::SeqCst);",
             "r.request(crate::systemd_reload::Reason::WindowOpened);",
