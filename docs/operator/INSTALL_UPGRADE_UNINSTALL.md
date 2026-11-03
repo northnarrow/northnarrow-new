@@ -327,11 +327,14 @@ user-writable path, R009's match. What the running agent does with them:
   run by an administrator's `sudo` at a terminal, the record is Low (an
   administrator's session).
 - **What the script executes from its tree afterwards** (the new agent's
-  `--version`) runs after it opened its window: the agent grants the window
-  to the installer that asked for it — the process that ran `nn-admin
-  trusted-installer-grant`, by its pid and its start — and R009 records, at
-  Low, what that process's own tree executes after the grant while the
-  window is open, naming the key, the deadline and the installer's pid. The
+  `--version`) runs after it opened its window: asked for an installer
+  (`nn-admin trusted-installer-grant --for-installer`, or
+  `NN_GRANT_FOR_INSTALLER=1`, which the scripts pass), the agent grants the
+  window to that installer — the process that ran `nn-admin`, by its pid and
+  its start — and R009 records, at Low, what that process's own tree
+  executes after the grant while the window is open, naming the key, the
+  deadline and the installer's pid. A grant asked for by hand without the
+  flag names no installer. The
   tree is found by lineage, never by a name or a path: a sibling of the
   installer, a process that took its pid later, or the same exec after the
   window closed is judged as any other. `install.sh` opens its window before
@@ -340,9 +343,9 @@ user-writable path, R009's match. What the running agent does with them:
 - **In COMBAT** R009 kills the script's own exec, as before this lot. To
   upgrade a host in COMBAT from a tree in a home or `/tmp`, open the window
   first from the root shell that will run the script, so that the script is
-  that shell's child: `sudo -s`, then `nn-admin trusted-installer-grant --key
-  <key> --window-secs 300`, then `./deploy/install.sh --upgrade --grant-key
-  <key>`. Or install the release where root owns the tree (`/opt`,
+  that shell's child: `sudo -s`, then `nn-admin trusted-installer-grant
+  --for-installer --key <key> --window-secs 300`, then `./deploy/install.sh
+  --upgrade --grant-key <key>`. Or install the release where root owns the tree (`/opt`,
   `/usr/local/src`), or release COMBAT first (`COMBAT_RECOVERY.md`).
 - `enforce R009` in the per-rule policy kills R009's matches in every
   posture: automation must then run the scripts at a terminal under `sudo`

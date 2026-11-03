@@ -351,6 +351,14 @@ mod tests {
             0,
         );
         lineage.ingest_exec(900, 800, "/usr/bin/bash", &[], 50 * S + 1, 50 * S, 0);
+        // it runs: `/proc` shows its start (tick 5000)
+        let d = tmp.path().join("900");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("stat"),
+            "900 (bash) S 800 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 5000 0 0\n",
+        )
+        .unwrap();
         // after the grant (at 51 s) the installer runs the new agent's --version
         lineage.ingest_exec(
             901,

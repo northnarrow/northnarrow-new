@@ -58,6 +58,40 @@ matches in every posture, as before:
 enforce R009
 ```
 
+**Decision record (03/11/2026, lot 278).** By the coordinator, with the
+authority the founder delegated; after the independent review of #493.
+- *What:* R009's kill, and R001's and R003's of an exec by root from `/tmp` or
+  `/var/tmp`, run in COMBAT only. That is a default, and it changes, for
+  these three cases only, the decision of 21/10/2026 ("a kill that existed
+  before … is not held") and external audit POS-015 ("R001..R003 still kill
+  the exec, whatever the posture").
+- *Why:* their legitimate matches are frequent and destructive when killed:
+  installers and upgrades from a checkout or `/tmp`, Packer, Terraform
+  remote-exec, Vagrant, Ansible `script:`/`become`, self-extracting
+  installers, CI runners in a home. Against a process that is already root
+  the kill is worth little: it moves the file to `/root`, `/opt` or `/run`,
+  which R009 does not cover.
+- *The way back:* `enforce R009` (and `enforce R001`, `enforce R003`) in
+  the signed per-rule policy kills in every posture.
+- *What is left:* a root dropper run from `/tmp` (or a home) in OBSERVING,
+  ALERTED or ENGAGED is a High record and is not killed. It is killed at its
+  first egress (NN-L-CHAIN-002/005/007, NN-L-NET-008), or in COMBAT. A
+  process recorded in ENGAGED is not killed after the fact when COMBAT comes
+  later, unless it is the ladder's offender. On the priority bus an exec may
+  be judged before an earlier event that brings COMBAT: it is judged in the
+  posture it found.
+
+The hold never stands in for another rule's kill of the same exec. A shell
+copied to `/tmp` or a home (R017), and the module, capability and namespace
+tools (R011, R012, R013), run by root from there, are killed in every
+posture, as before.
+
+Inside an administrator's `sudo` session at a terminal, a package
+transaction or an installer's window (R009's Low record), those rules'
+kills of the same exec are held by the legacy ceiling (R009's record is the
+first match), in COMBAT too. That was so for the session and the package
+transaction before lot 278.
+
 Every other rule whose response can be a kill, and why it may kill in
 OBSERVING, is listed in `crates/nn-core/src/decision/posture_floor.rs`
 (`OBSERVING_KILLS`): the kills that existed before Wave 4, kept as they were

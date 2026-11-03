@@ -2370,14 +2370,14 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     }
 
     /// `hop` is the process that started at `ticks` (`/proc`'s clock, ticks
-    /// since boot): its cached start shown by those ticks
-    /// ([`Self::ticks_show_start`]); a hop read from `/proc` by what `/proc`
-    /// shows of its pid now.
+    /// since boot): `/proc` shows that very start for its pid now — exactly,
+    /// with no allowance for the time suspended (review of #493, note e: a
+    /// later process that took the grantee's pid within that allowance must
+    /// not pass for it; the grantee runs while its tree is judged) — and a
+    /// cached start agrees with it ([`Self::ticks_show_start`]).
     fn hop_started_at_ticks(&self, hop: &Hop, ticks: u64) -> bool {
-        if hop.start_ns != 0 {
-            return self.ticks_show_start(ticks, hop.start_ns);
-        }
         self.proc_start_ticks(hop.pid) == Some(ticks)
+            && (hop.start_ns == 0 || self.ticks_show_start(ticks, hop.start_ns))
     }
 
     /// Lab PR 222 (copy on first write): what the kernel executed for `pid`
@@ -5297,8 +5297,9 @@ mod tests {
     fn descends_from_is_by_pid_and_start() {
         let tmp = TempDir::new().unwrap();
         let t = AuthSessionTracker::new(tmp.path());
-        // the installer (cached, started at 50 s = tick 5000) and its child
+        // the installer (cached, started at 50 s = tick 5000, running) and its child
         t.ingest_exec(900, 800, "/usr/bin/bash", &[], 50 * S + 1, 50 * S, 0);
+        write_started(tmp.path(), "900", 800, 5_000);
         t.ingest_exec(
             901,
             900,
@@ -5315,6 +5316,18 @@ mod tests {
             "the installer itself"
         );
         assert!(!t.descends_from(901, judged, 900, 7_000), "another start");
+        // a process that took the pid within the suspended-time allowance of
+        // the cached start (one tick later) is not the installer
+        write_started(tmp.path(), "900", 800, 5_001);
+        assert!(
+            !t.descends_from(901, judged, 900, 5_000),
+            "/proc shows another start"
+        );
+        write_started(tmp.path(), "900", 800, 5_000);
+        // the installer gone: not known, not its tree
+        std::fs::remove_dir_all(tmp.path().join("900")).unwrap();
+        assert!(!t.descends_from(901, judged, 900, 5_000), "gone");
+        write_started(tmp.path(), "900", 800, 5_000);
         assert!(!t.descends_from(901, judged, 901 + 1, 5_000), "another pid");
         assert!(!t.descends_from(901, judged, 1, 0), "never PID 1");
         assert!(!t.descends_from(901, judged, 0, 0));

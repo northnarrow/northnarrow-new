@@ -16,6 +16,16 @@
 //! strongest response any match allows, so another rule's kill on the same
 //! event still runs.
 //!
+//! **The decision of 03/11/2026 (lot 278; coordinator, delegated by the
+//! founder) changes the rule above for three cases only**: R009's kill,
+//! and R001's and R003's of an exec by root (uid 0) from `/tmp` or
+//! `/var/tmp` — kills that existed before — run in COMBAT only, held by
+//! the posture ([`super::posture_floor`], [`hold_below_posture`]) and not
+//! by a switch; a signed `enforce` gives them back in every posture. A
+//! posture hold counts as a switch's for the legacy first match: it never
+//! stands in for another rule's kill of the same exec (R011–R013, R017
+//! still kill a root exec from those directories in every posture).
+//!
 //! Lab PR 236 wired the switches to the signed per-rule response policy
 //! ([`super::rule_policy`]): the constants below are its built-in defaults.
 //! [`PolicySwitch::hold`] keeps the response it held ([`take_held`]); the
