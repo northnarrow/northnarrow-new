@@ -341,50 +341,68 @@ fn answer_pass(
     }
     for raw in &raws {
         let n = usize::from(raw.captured).min(raw.payload.len());
+        // `None`: the worker did not answer; `Some(None)`: no DNS response
         let decoded = if n == 0 {
-            None
+            Some(None)
         } else {
-            parse.dns_answers(&raw.payload[..n]).flatten()
+            parse.dns_answers(&raw.payload[..n])
         };
         let exe = lineage.image_at(raw.pid, raw.timestamp_ns);
-        let (ev, records) = answer_event(raw, decoded.as_ref(), exe);
-        stats.records += 1;
-        if let Some(q) = &ev.query_name {
+        outbox.extend(ingest_answer(raw, decoded, exe, table, stats));
+    }
+    drained
+}
+
+/// One response record: the table fed (its records bound; an undecoded
+/// one degrading the evidence; held records noted), its events.
+/// `decoded`: `None` when the worker did not answer, `Some(None)` for
+/// bytes that are no DNS response (or none read).
+fn ingest_answer(
+    raw: &DnsAnswerRaw,
+    decoded: Option<Option<DnsAnswersOut>>,
+    exe: Option<String>,
+    table: &ResolvedTable,
+    stats: &mut PassStats,
+) -> Vec<Event> {
+    let worker_answered = decoded.is_some();
+    let decoded = decoded.flatten();
+    let (ev, records) = answer_event(raw, decoded.as_ref(), exe);
+    stats.records += 1;
+    match &ev.query_name {
+        Some(q) => {
             stats.decoded += 1;
             stats.last = Some(format!(
                 "{q} -> {} address(es), rcode {}",
                 ev.addrs.len(),
                 ev.rcode
             ));
-        }
-        match &ev.query_name {
-            Some(q) => table.on_answer(&Answer {
+            table.on_answer(&Answer {
                 pid: raw.pid,
                 ts_ns: raw.timestamp_ns,
                 qname: q,
                 records: &records,
-            }),
-            // not decoded: the worker did not answer (or the bytes are no
-            // response, which is no evidence either way)
-            None if n > 0 && decoded.is_none() => table.note_undecoded(raw.timestamp_ns),
-            None => {}
+            });
         }
-        if raw.flags & (held_flags::TASK | held_flags::UID) != 0 {
-            table.note_held(raw.pid, raw.timestamp_ns);
-        }
-        let comm = ev.comm.clone();
-        outbox.push_back(Event::DnsAnswer(ev));
-        outbox.extend(floods(
-            FloodSource::DnsAnswer,
-            raw.flags,
-            (raw.held, raw.held_uid),
-            raw.pid,
-            raw.uid,
-            &comm,
-            raw.timestamp_ns,
-        ));
+        // the worker did not answer: what the response named is not known
+        None if !worker_answered => table.note_undecoded(raw.timestamp_ns),
+        // no DNS response: no evidence either way
+        None => {}
     }
-    drained
+    if raw.flags & (held_flags::TASK | held_flags::UID) != 0 {
+        table.note_held(raw.pid, raw.timestamp_ns);
+    }
+    let comm = ev.comm.clone();
+    let mut out = vec![Event::DnsAnswer(ev)];
+    out.extend(floods(
+        FloodSource::DnsAnswer,
+        raw.flags,
+        (raw.held, raw.held_uid),
+        raw.pid,
+        raw.uid,
+        &comm,
+        raw.timestamp_ns,
+    ));
+    out
 }
 
 /// The DNS response pump (a thread of its own, a source of the bus).
@@ -494,39 +512,50 @@ fn hello_pass(
             parse.client_hello(&raw.data[..n])
         };
         let exe = lineage.image_at(raw.pid, raw.timestamp_ns);
-        let ev = hello_event(raw, out.as_ref(), exe);
-        stats.records += 1;
-        if let Some(fp) = &ev.fingerprint {
-            stats.decoded += 1;
-            stats.last = Some(format!(
-                "{}:{} ja3 {} ja4 {} sni {}",
-                ev.dst_addr,
-                ev.dst_port,
-                fp.ja3,
-                fp.ja4,
-                fp.sni.as_deref().unwrap_or("-")
-            ));
-        }
-        if let Some(fp) = &ev.fingerprint {
-            if raw.flow_id != [0u8; 16] {
-                flow_tracker
-                    .lock()
-                    .attach_tls_pending(&raw.flow_id, fp.clone());
-            }
-        }
-        let comm = ev.comm.clone();
-        outbox.push_back(Event::TlsClientHello(ev));
-        outbox.extend(floods(
-            FloodSource::TlsHello,
-            raw.flags,
-            (raw.held, raw.held_uid),
-            raw.pid,
-            raw.uid,
-            &comm,
-            raw.timestamp_ns,
-        ));
+        outbox.extend(ingest_hello(raw, out.as_ref(), exe, flow_tracker, stats));
     }
     drained
+}
+
+/// One hello record: its fingerprint attached to its pending flow, its
+/// events.
+fn ingest_hello(
+    raw: &TlsHelloRaw,
+    out: Option<&TlsOut>,
+    exe: Option<String>,
+    flow_tracker: &Mutex<FlowTracker>,
+    stats: &mut PassStats,
+) -> Vec<Event> {
+    let ev = hello_event(raw, out, exe);
+    stats.records += 1;
+    if let Some(fp) = &ev.fingerprint {
+        stats.decoded += 1;
+        stats.last = Some(format!(
+            "{}:{} ja3 {} ja4 {} sni {}",
+            ev.dst_addr,
+            ev.dst_port,
+            fp.ja3,
+            fp.ja4,
+            fp.sni.as_deref().unwrap_or("-")
+        ));
+        if raw.flow_id != [0u8; 16] {
+            flow_tracker
+                .lock()
+                .attach_tls_pending(&raw.flow_id, fp.clone());
+        }
+    }
+    let comm = ev.comm.clone();
+    let mut evs = vec![Event::TlsClientHello(ev)];
+    evs.extend(floods(
+        FloodSource::TlsHello,
+        raw.flags,
+        (raw.held, raw.held_uid),
+        raw.pid,
+        raw.uid,
+        &comm,
+        raw.timestamp_ns,
+    ));
+    evs
 }
 
 /// The TLS ClientHello pump (a thread of its own, a source of the bus).
@@ -781,6 +810,117 @@ mod tests {
             hello_event(&raw, Some(&nc), None).fingerprint.unwrap().sni,
             None
         );
+    }
+
+    /// A response the worker decoded binds its receiver; one it could not
+    /// decode makes the unbound unknown; held records are noted; bytes that
+    /// are no response are no evidence.
+    #[test]
+    fn a_response_record_feeds_the_table() {
+        use nn_model::telemetry::DnsResolution;
+        const S: u64 = 1_000_000_000;
+        let c2: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let out = DnsAnswersOut {
+            qname: "c2.example".into(),
+            qtype: 1,
+            rcode: 0,
+            records: vec![DnsRecordOut::A {
+                name: "c2.example".into(),
+                ttl: 60,
+                addr: [203, 0, 113, 5],
+            }],
+            complete: true,
+        };
+        let t = ResolvedTable::default();
+        let mut stats = PassStats::default();
+        let mut raw = answer_raw();
+        raw.timestamp_ns = 10 * S;
+        let evs = ingest_answer(&raw, Some(Some(out.clone())), None, &t, &mut stats);
+        assert!(matches!(evs.as_slice(), [Event::DnsAnswer(_)]));
+        assert_eq!(t.check(42, 1, c2, 11 * S, Vec::new), DnsResolution::Lineage);
+        assert_eq!((stats.records, stats.decoded), (1, 1));
+        assert!(stats
+            .last
+            .as_deref()
+            .unwrap()
+            .starts_with("c2.example -> 1"));
+        // no DNS response: nothing changes
+        let t = ResolvedTable::default();
+        ingest_answer(&raw, Some(None), None, &t, &mut stats);
+        assert_eq!(
+            t.check(7, 1, c2, 11 * S, Vec::new),
+            DnsResolution::Unresolved
+        );
+        // the worker did not answer: unknown for a while
+        ingest_answer(&raw, None, None, &t, &mut stats);
+        assert_eq!(t.check(7, 1, c2, 11 * S, Vec::new), DnsResolution::Unknown);
+        // held records of the receiver: its connects unknown
+        let t = ResolvedTable::default();
+        let mut held = answer_raw();
+        held.timestamp_ns = 10 * S;
+        held.flags = held_flags::TASK;
+        held.held = 3;
+        let evs = ingest_answer(&held, Some(None), None, &t, &mut stats);
+        assert_eq!(evs.len(), 2, "the event and its flood");
+        assert_eq!(t.check(42, 1, c2, 11 * S, Vec::new), DnsResolution::Unknown);
+        assert_eq!(
+            t.check(43, 1, c2, 11 * S, Vec::new),
+            DnsResolution::Unresolved
+        );
+    }
+
+    /// A hello's fingerprint goes to its pending flow (a flow with no
+    /// correlator, a connect the agent did not see, has none to take it).
+    #[test]
+    fn a_hello_record_s_fingerprint_joins_its_flow() {
+        let tracker = Mutex::new(FlowTracker::default());
+        let info = crate::net::flow_tracker::TcpConnectInfo {
+            start_ns: 77,
+            sk_ptr: 0xabc,
+            family: 2,
+            src_addr: "0.0.0.0".parse().unwrap(),
+            src_port: 0,
+            dst_addr: "198.51.100.7".parse().unwrap(),
+            dst_port: 443,
+            proto: 6,
+            pid: 42,
+            uid: 1000,
+            comm: "curl".into(),
+            exe: None,
+            proc_start_ns: 1,
+        };
+        tracker.lock().on_tcp_connect(&info);
+        let mut raw = TlsHelloRaw::zeroed();
+        raw.flow_id = FlowTracker::corr_id(77, 0xabc);
+        let done = TlsOut::Complete {
+            ja3: "a".repeat(32),
+            ja4: "t13d1516h2_8daaf6152771_02713d6af862".into(),
+            sni: SniOut::Host("example.com".into()),
+            alpn: vec![],
+        };
+        let mut stats = PassStats::default();
+        let evs = ingest_hello(&raw, Some(&done), None, &tracker, &mut stats);
+        assert_eq!(evs.len(), 1);
+        assert_eq!((stats.records, stats.decoded), (1, 1));
+        let snap = tracker.lock().due_snapshots(
+            100,
+            &crate::net::flow_tracker::SnapshotPolicy {
+                interval_ns: 1,
+                min_age_ns: 1,
+                max_per_tick: 4,
+            },
+        );
+        assert_eq!(
+            snap.flows[0]
+                .tls_fingerprint
+                .as_ref()
+                .and_then(|f| f.sni.as_deref()),
+            Some("example.com")
+        );
+        // an incomplete hello: nothing attached, counted undecoded
+        let mut s2 = PassStats::default();
+        ingest_hello(&raw, Some(&TlsOut::Incomplete), None, &tracker, &mut s2);
+        assert_eq!((s2.records, s2.decoded), (1, 0));
     }
 
     #[test]

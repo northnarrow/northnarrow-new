@@ -1477,6 +1477,28 @@ mod tests {
         assert_eq!(line.payload.sni, Some("example.com".to_string()));
     }
 
+    /// Lot 275: an inbound row says so (`"inbound":true`); an outbound row
+    /// carries no such field, as every row written before.
+    #[test]
+    fn an_inbound_row_says_so_and_an_outbound_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("netflow.jsonl");
+        let mut db = open_db(&path);
+        let ev = test_event();
+        db.append(&ev, false).unwrap();
+        db.append_inbound(&ev).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(!lines[0].contains("\"inbound\""), "{}", lines[0]);
+        assert!(lines[1].contains("\"inbound\":true"), "{}", lines[1]);
+        let l1: crate::chainlog::ChainLine<NetFlowPayload> =
+            serde_json::from_str(lines[1]).unwrap();
+        assert!(l1.payload.inbound && !l1.payload.decision_engine_skipped);
+        let l0: crate::chainlog::ChainLine<NetFlowPayload> =
+            serde_json::from_str(lines[0]).unwrap();
+        assert!(!l0.payload.inbound);
+    }
+
     /// A netflow log signed with the key at `<dir>/k.sig`.
     fn open_db(path: &Path) -> NetFlowDb {
         NetFlowDb::open(

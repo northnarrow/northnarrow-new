@@ -368,6 +368,24 @@ mod tests {
         p.extend_from_slice(&[0xC0, 12, 0, 1, 0, 3, 0, 0, 0, 5, 0, 4, 1, 2, 3, 4]);
         rr(&mut p, &[0xC0, 12], TYPE_A, 9, &[1, 2, 3]); // a 3-byte A: stepped over
         let r = parse_response(&p).unwrap();
+        assert!(r.answers.is_empty());
+        // AAAA data of 15 and of 17 bytes: stepped over
+        let mut p = Vec::new();
+        header(&mut p, 0x8180, 1, 2);
+        name(&mut p, "odd.example");
+        p.extend_from_slice(&[0, 28, 0, 1]);
+        rr(&mut p, &[0xC0, 12], TYPE_AAAA, 9, &[7; 15]);
+        rr(&mut p, &[0xC0, 12], TYPE_AAAA, 9, &[7; 17]);
+        let odd = parse_response(&p).unwrap();
+        assert!(odd.answers.is_empty() && odd.complete);
+        let mut p = Vec::new();
+        header(&mut p, 0x8183, 1, 3);
+        name(&mut p, "nope.example");
+        p.extend_from_slice(&[0, 28, 0, 1]);
+        rr(&mut p, &[0xC0, 12], 16, 5, b"\x03txt");
+        p.extend_from_slice(&[0xC0, 12, 0, 1, 0, 3, 0, 0, 0, 5, 0, 4, 1, 2, 3, 4]);
+        rr(&mut p, &[0xC0, 12], TYPE_A, 9, &[1, 2, 3]);
+        let r = parse_response(&p).unwrap();
         assert_eq!(
             (r.qname.as_str(), r.qtype, r.rcode),
             ("nope.example", 28, 3)
@@ -440,6 +458,14 @@ mod tests {
         }
         b.push(0);
         assert!(read_name(&b, 0).is_some());
+        // and one of 62 more: 256, one too many
+        let mut b = Vec::new();
+        for n in [63usize, 63, 63, 62] {
+            b.push(n as u8);
+            b.extend(core::iter::repeat_n(b'a', n));
+        }
+        b.push(0);
+        assert_eq!(read_name(&b, 0), None);
         // a dot, a backslash and a control byte inside a label
         let b = [3u8, b'a', b'.', b'\\', 1, 7, 0];
         assert_eq!(read_name(&b, 0), Some(("a\\046\\092.\\007".into(), 7)));

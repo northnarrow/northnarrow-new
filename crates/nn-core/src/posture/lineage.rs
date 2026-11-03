@@ -3491,13 +3491,14 @@ mod tests {
     fn lineage_starts_are_the_process_then_its_ancestors() {
         let proc = TempDir::new().unwrap();
         let t = AuthSessionTracker::new(proc.path());
-        t.ingest_spawn(100, 50, "/usr/bin/bash", 1);
-        t.ingest_spawn(200, 100, "/usr/bin/python3", 2);
-        t.ingest_spawn(300, 200, "/usr/bin/curl", 3);
+        t.ingest_exec(100, 50, "/usr/bin/bash", &[], 10, 5, 1000);
+        t.ingest_exec(200, 100, "/usr/bin/python3", &[], 20, 15, 1000);
+        t.ingest_exec(300, 200, "/usr/bin/curl", &[], 30, 25, 1000);
         let got = t.lineage_starts(300, AsOf::Now);
         assert_eq!(
-            got.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
-            vec![300, 200, 100]
+            got,
+            vec![(300, 25), (200, 15), (100, 5)],
+            "the cached starts"
         );
         assert_eq!(
             t.lineage_starts(100, AsOf::Now)

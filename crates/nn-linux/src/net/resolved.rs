@@ -133,6 +133,11 @@ mod tests {
             judge(&t, &lineage, 42, 5 * S, C2, 10 * S),
             DnsResolution::Unresolved
         );
+        // at the same instant as the sensor: judged
+        assert_eq!(
+            judge(&t, &lineage, 42, 2 * S, C2, 10 * S),
+            DnsResolution::Unresolved
+        );
         // started before it: unknown
         assert_eq!(
             judge(&t, &lineage, 42, S, C2, 10 * S),
