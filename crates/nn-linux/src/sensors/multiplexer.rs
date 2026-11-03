@@ -2297,6 +2297,142 @@ mod tests {
         );
     }
 
+    /// Lot 275 (NN-L-NET-028): a query's name, decoded, is an ask the
+    /// resolved table binds the response to (a datagram's and an NSS
+    /// lookup's alike); an undecoded one degrades the evidence (unknown for
+    /// a while); a record carrying held queries makes its process's
+    /// connects unknown.
+    #[test]
+    fn the_queries_feed_the_resolved_table() {
+        use nn_model::telemetry::DnsResolution;
+        const S: u64 = 1_000_000_000;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        let c2: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let answer = |t: &crate::net::resolved::ResolvedTable, name: &str| {
+            t.on_answer(&crate::net::resolved::Answer {
+                pid: 1,
+                ts_ns: 2 * S,
+                qname: name,
+                records: &[crate::net::resolved::Record::Addr {
+                    name: name.into(),
+                    ttl: 60,
+                    addr: c2,
+                }],
+            })
+        };
+        let decode = |raw: &DnsQueryRaw| -> nn_proto::ipc::QnameOut {
+            use nn_proto::ipc::{Answer, Request};
+            match crate::worker::serve::answer(&Request::DnsNames(vec![name_request(raw)])) {
+                Answer::DnsNames(mut v) => v.remove(0),
+                other => panic!("{other:?}"),
+            }
+        };
+        // a datagram's query, decoded
+        let mut raw = DnsQueryRaw::zeroed();
+        raw.pid = 4800;
+        raw.timestamp_ns = S;
+        raw.family = 2;
+        raw.flags = dns_flags::SKB;
+        let name = b"\x02c2\x13northnarrow-e2etest\x07invalid\x00\x00\x01\x00\x01";
+        raw.query_name[..name.len()].copy_from_slice(name);
+        raw.qname_len = name.len() as u16;
+        let t = crate::net::resolved::ResolvedTable::default();
+        let d = decode(&raw);
+        let _ = dns_events(&raw, Some(&d), &lineage, None, Some(&t));
+        answer(&t, "c2.northnarrow-e2etest.invalid");
+        assert_eq!(
+            t.check(4800, 1, c2, 3 * S, Vec::new),
+            DnsResolution::Lineage
+        );
+        // the same, not decoded: nothing bound, the evidence degraded
+        let t = crate::net::resolved::ResolvedTable::default();
+        let _ = dns_events(&raw, None, &lineage, None, Some(&t));
+        answer(&t, "c2.northnarrow-e2etest.invalid");
+        assert_eq!(
+            t.check(4800, 1, c2, 3 * S, Vec::new),
+            DnsResolution::Unknown
+        );
+        // an NSS lookup, decoded
+        let mut nss = DnsQueryRaw::zeroed();
+        nss.pid = 4700;
+        nss.flags = dns_flags::NSS;
+        nss.timestamp_ns = S;
+        let text = b"c2.northnarrow-e2etest.invalid.";
+        nss.query_name[..text.len()].copy_from_slice(text);
+        nss.qname_len = text.len() as u16;
+        let t = crate::net::resolved::ResolvedTable::default();
+        let d = decode(&nss);
+        let _ = nss_events(&nss, Some(&d), &lineage, None, Some(&t));
+        answer(&t, "c2.northnarrow-e2etest.invalid");
+        assert_eq!(
+            t.check(4700, 1, c2, 3 * S, Vec::new),
+            DnsResolution::Lineage
+        );
+        // ... not decoded: degraded
+        let t = crate::net::resolved::ResolvedTable::default();
+        let _ = nss_events(&nss, None, &lineage, None, Some(&t));
+        assert_eq!(
+            t.check(4700, 1, c2, 3 * S, Vec::new),
+            DnsResolution::Unknown
+        );
+        // held queries carried by a decoded record (its name answered with
+        // another address): the process unknown; without them, another
+        // lineage's address
+        let web: std::net::IpAddr = "198.51.100.1".parse().unwrap();
+        let held_table = || {
+            let t = crate::net::resolved::ResolvedTable::default();
+            answer(&t, "other.example");
+            t.on_answer(&crate::net::resolved::Answer {
+                pid: 1,
+                ts_ns: 2 * S,
+                qname: "c2.northnarrow-e2etest.invalid",
+                records: &[crate::net::resolved::Record::Addr {
+                    name: "c2.northnarrow-e2etest.invalid".into(),
+                    ttl: 60,
+                    addr: web,
+                }],
+            });
+            t
+        };
+        let d = decode(&raw);
+        let t = held_table();
+        let _ = dns_events(&raw, Some(&d), &lineage, None, Some(&t));
+        assert_eq!(
+            t.check(4800, 1, c2, 3 * S, Vec::new),
+            DnsResolution::OtherLineage
+        );
+        let t = held_table();
+        let mut held = raw;
+        held.held = 9;
+        held.flags |= dns_flags::RATE_HELD;
+        let _ = dns_events(&held, Some(&d), &lineage, None, Some(&t));
+        assert_eq!(
+            t.check(4800, 1, c2, 3 * S, Vec::new),
+            DnsResolution::Unknown
+        );
+        assert_eq!(
+            t.check(4801, 1, c2, 3 * S, Vec::new),
+            DnsResolution::OtherLineage
+        );
+        let d = decode(&nss);
+        let t = held_table();
+        let _ = nss_events(&nss, Some(&d), &lineage, None, Some(&t));
+        assert_eq!(
+            t.check(4700, 1, c2, 3 * S, Vec::new),
+            DnsResolution::OtherLineage
+        );
+        let t = held_table();
+        let mut nheld = nss;
+        nheld.held = 2;
+        nheld.flags |= dns_flags::RATE_HELD;
+        let _ = nss_events(&nheld, Some(&d), &lineage, None, Some(&t));
+        assert_eq!(
+            t.check(4700, 1, c2, 3 * S, Vec::new),
+            DnsResolution::Unknown
+        );
+    }
+
     /// Lab PR 229: a name asked through systemd-resolved's NSS module (no
     /// datagram: the Debian 13 shape) attributes the asking process's
     /// connect. It is no `Event::DnsQuery`, and the forwarder
