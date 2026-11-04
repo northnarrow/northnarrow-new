@@ -1233,6 +1233,39 @@ fn a_hello_the_kernel_or_proc_contradicts_is_refused() {
     }
 }
 
+/// Lot 276 (the review of #499, D1): each kind its account — the export
+/// worker's is its own, never the parse worker's, and none without it.
+#[test]
+fn each_worker_kind_runs_as_its_own_account() {
+    let acct = |name: &str, id: u32| crate::worker::WorkerAccount {
+        name: name.into(),
+        uid: id,
+        gid: id,
+    };
+    let both = ImageLauncher {
+        image: None,
+        account: Ok(acct("northnarrow-worker", 990)),
+        export_account: Ok(acct("northnarrow-export", 989)),
+        extra_args: Vec::new(),
+    };
+    assert_eq!(both.account(WorkerKind::Parse), Some((990, 990)));
+    assert_eq!(both.account(WorkerKind::Export), Some((989, 989)));
+    let no_export = ImageLauncher {
+        export_account: Err("no such user".into()),
+        ..both
+    };
+    assert_eq!(no_export.account(WorkerKind::Parse), Some((990, 990)));
+    assert_eq!(no_export.account(WorkerKind::Export), None);
+    assert_eq!(
+        crate::worker::account_name(WorkerKind::Export),
+        "northnarrow-export"
+    );
+    assert_eq!(
+        crate::worker::account_name(WorkerKind::Parse),
+        "northnarrow-worker"
+    );
+}
+
 /// F7: the production launcher reads the worker's `/proc/<pid>/status`
 /// itself — here this test process's, which is no worker (no seccomp
 /// filter, no `no_new_privs`), and a pid that does not exist.
