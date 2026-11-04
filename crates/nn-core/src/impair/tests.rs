@@ -328,6 +328,12 @@ fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
     )
     .unwrap();
     std::fs::write(info.join("docker.io.list"), "/usr/sbin/dockerd\n").unwrap();
+    // Fedora and RHEL keep the plugins in /usr/libexec/cni
+    std::fs::write(
+        info.join("containernetworking-plugins-rpm.list"),
+        "/usr/libexec/cni/bridge\n",
+    )
+    .unwrap();
     std::fs::write(info.join("podman.list"), "/usr/bin/podman\n").unwrap();
     let det = DefenseDetector::with_proc_root(
         Arc::new(SecurityTools::builtin()),
@@ -381,6 +387,15 @@ fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
         310,
         "/usr/lib/cni/fake",
         &["fake".into()],
+        5 * S,
+        5 * S,
+        0,
+    );
+    l.ingest_exec(
+        312,
+        310,
+        "/usr/libexec/cni/bridge",
+        &["bridge".into()],
         5 * S,
         5 * S,
         0,
@@ -445,6 +460,10 @@ fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
     );
     assert!(run(4004, 300, &["iptables", "-t", "nat", "-F", "DOCKER"]).is_none());
     assert!(run(4005, 310, &["iptables", "-F", "NETAVARK-FORWARD"]).is_none());
+    assert!(
+        run(4006, 312, &cni).is_none(),
+        "the plugin of /usr/libexec/cni"
+    );
     // the same chain by anyone else: a switch-off
     assert!(run(4011, 200, &cni).is_some(), "CNI chain by a shell");
     assert!(run(4012, 320, &cni).is_some(), "an unpackaged plugin");
