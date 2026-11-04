@@ -5615,9 +5615,9 @@ number in parentheses is a lab PR.
     positive") is for the founder, who decides each closure in the UI. No
     run is made green by dismissing.
   - Level unchanged (C27 1).
-- **Lot 279 — R011 judges what a module tool's exec loads; the NET-006
-  listener test waits for both of its records (C14, C11; lot 275's lab and
-  the CI of #493).**
+- **Lot 279 — R011 judges a module tool's command line, and what the exec
+  pump reads at the exec; the NET-006 listener test waits for both of its
+  records (C14, C11; lot 275's lab, the CI of #493, the review of #498).**
   - What was open: R011 killed every exec of `insmod`, `modprobe` or `kmod`
     that no package-manager actor ran and no kernel thread asked for, in
     every posture (a kill from before Wave 4): the `modprobe` rootful
@@ -5626,44 +5626,46 @@ number in parentheses is a lab PR.
     by the same rule the container runtimes', iptables' and kube-proxy's.
     The privileged NET-006 listener test raced its own second record (the
     CI of #493 on Ubuntu 22.04).
-  - What changed: the exec is judged on what it loads
-    (`crates/nn-core/src/decision/rules/module_request.rs`,
-    `kmod_invocation.rs`): the command line read as kmod reads it (the
-    multi-call binary's mode from `argv[0]`, getopt's permutation and long
-    prefixes), the names resolved as libkmod resolves them (configuration
-    aliases, `modules.dep`, `modules.symbols`, `modules.alias`, built-ins by
-    name and by the aliases of `modules.builtin.modinfo` — kmod's
-    `modules.builtin.alias.bin` is depmod's index of them; dependencies and
-    soft dependencies), each file judged: in the running
-    kernel's tree, a regular file, installed by a package or built by DKMS
-    (no package database: listed in the kernel's `modules.order`),
-    `max(mtime, ctime)` not after its owner's last change (the package
-    database, DKMS's registry, the boot), signed while the kernel enforces
-    signatures (an uncompressed image's marker; a compressed one's is the
-    kernel's to check). Vouched for, or a query that inserts nothing: a High
-    record, no kill; anything else killed as before. The exec pump makes
-    the assessment on its thread (no process run there; R12b's shape) and
-    R011 reads it. R018, on the file the kernel reads, stays the backstop
-    for what the exec does not show (`MODPROBE_OPTIONS`, the binary
-    indexes). `OBSERVING_KILLS` unchanged: R011's match narrowed, no kill
-    added. The NET-006 test waits for as many records as listeners it
-    opened, then asserts exactly that many. No capability level moves.
-  - Decisions (04/11/2026): a module copied into
-    `/lib/modules/$(uname -r)/` and `modprobe`d after `depmod` is killed (no
-    package installed it), and its load, if it lands first, is R018's kill
-    of an unowned module by an unexpected loader (the brief). A plain name
-    that resolves to no module of the running kernel, in the tree or among
-    the built-ins (kmod: "not found") — with nothing suspicious beside it:
-    the system's tool, the argv whole, no path, no `-C`/`-d`/`-S`/`--force`,
-    a filesystem the host shows — is recorded, "nothing to load: the name
-    resolves to no module of this kernel"; a load that came about anyway
-    (a race on `modprobe.d` or `depmod`) is R018's on the file the kernel
-    reads (the coordinator, after 24.04's lab: k3s's `nft-expr-counter`).
-    So a copied module `modprobe`d without `depmod` is recorded: kmod finds
-    nothing to load. No directive restores the kill of a vouched-for load
-    (`RULE_POLICY.md` §1).
-  - Lab (as measured; our own guests, lease `k279`; Ubuntu 22.04 5.15.0-202
-    and 24.04 6.8.0-147; on each, `main` 80c8da36 then the lot on the same
+  - What changed: R011 judges the exec on its command line's SYNTAX
+    (`crates/nn-core/src/decision/rules/kmod_invocation.rs`: the multi-call
+    binary's mode from `argv[0]`, getopt's options and long abbreviations)
+    and on what the exec pump read at the exec
+    (`crates/nn-linux/src/sensors/kmod_exec.rs`, kept per exec in
+    `kmod_exec_facts.rs`: the executed file's device and inode against the
+    system's tools', `/proc/<pid>/environ` tied to the exec by a pidfd and
+    the start time). Killed: `insmod`; a `modprobe` argument with a `/` or a
+    `.ko*` suffix; `-C`, `-d`, `-S`, `--force*`, `-o`, `--remove-holders`,
+    `--remove-dependencies` and their abbreviations; any argument starting
+    with `-` after the first name; an option the tool refuses; a `kmod`
+    command but `help`/`list`/`static-nodes`/the version; a program not the
+    system's tool, of another mount namespace; `MODPROBE_OPTIONS` or an
+    environment not read; an argv not read whole. Recorded (High,
+    T1547.006) otherwise. `OBSERVING_KILLS` unchanged: R011's kill narrowed,
+    no kill added. The NET-006 test waits for as many records as listeners
+    it opened, then asserts exactly that many. No capability level moves.
+  - Decisions (04/11/2026, the coordinator, after the independent review of
+    #498): the first design — kmod's lookup emulated (configuration aliases,
+    `modules.dep`, `.symbols`, `.alias`, built-ins, soft dependencies, each
+    file's owner, `max(mtime, ctime)` and signature) — is RETIRED: the
+    review found `--remove-holders`/`--remove-dependencies` read as a
+    removal (kmod 29..34 insert), `modprobe.d`'s `install`/`remove` commands
+    not modelled (a "vouched" or "nothing to load" name running a command
+    as root), an option after the name that `POSIXLY_CORRECT` or
+    `MODPROBE_OPTIONS='--'` turns into a parameter, the exec pump blockable
+    by a FIFO in `/run/modprobe.d`, limits that fell back on the record, an
+    owner's time that root dates forward, a DKMS provenance a `mkdir` fakes.
+    R011 now reads no `modprobe.d`, index or module file. R018 OBSERVES: it
+    records each load the kernel reports and kills the loader of a file
+    outside the module directories or of an unowned module by a loader it
+    does not expect — after the load (its hook denies nothing; `kmod` is in
+    its loader allowlist); it is not a backstop that prevents. Prevention is
+    module signing and lockdown (the host check) and lot 285 (the kernel's
+    deny of an untrusted file). What R011 never saw, as on `main`: a root
+    process that loads a module without any tool (its own
+    `finit_module(2)`), and the commands of root's `modprobe.d`.
+  - Lab of the EARLIER design (retired: the decisions above; as measured;
+    our own guests, lease `k279`; Ubuntu 22.04 5.15.0-202 and 24.04
+    6.8.0-147; on each, `main` 80c8da36 then the lot on the same
     guest after a power cycle; `deploy/lab/malsim/kmod-check.sh` with
     podman, docker.io, k3s with kube-proxy in ipvs mode, zfsutils-linux and
     wireguard-tools installed for the run and removed after; no
@@ -5739,10 +5741,10 @@ number in parentheses is a lab PR.
     24.04 `main` 11, the lot 21). The guests left as found: k3s's
     `/var/lib/rancher` removed on both; on 24.04 podman and
     `/var/lib/containers` were there before these runs and stay.
-  - Open: a packaged module file overwritten in place and followed by any
-    package transaction passes the time check (FIM-008 sees the write; the
-    kernel's signature check refuses it when enforced); a host whose files'
-    ctimes are newer than its last package transaction (an SELinux relabel,
-    a restore) keeps the kill until its next transaction; on an RPM host an
-    out-of-tree module is killed until its first load was seen; the binary
-    indexes and `MODPROBE_OPTIONS` are not read (R018's).
+  - Lab of this design: pending (round i, lease `k279`, both guests).
+  - Open: a module tool exec whose process exits before the exec pump reads
+    its environment is killed (a kill that reaches no one; how often is the
+    lab's to say); `modprobe -S` outside a package transaction (an initramfs
+    build by hand) and a quiet probe written `modprobe <name> -q` are killed,
+    as on `main`; the load itself is prevented only by the kernel's
+    signature policy and lot 285.

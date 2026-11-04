@@ -86,26 +86,31 @@ copied to `/tmp` or a home (R017), and the module, capability and namespace
 tools (R011, R012, R013), run by root from there, are killed in every
 posture, as before.
 
-**R011 judges what is loaded (lot 279, 04/11/2026).** R011's kill existed
-before Wave 4 and stays in `OBSERVING_KILLS` below; lot 279 narrows its
-match and adds no kill. An exec of the system's module tool whose every
-module is vouched for — module names resolved, as kmod resolves them, to
-files of the running kernel's tree that a package installed or DKMS built,
-unchanged since the package database's last change, signed when the kernel
-enforces signatures — or that inserts no module, is a High record
-(T1547.006), not killed, in every posture. Everything else R011 matched is
-killed as before, in every posture: `insmod` of a file, `modprobe` of a path,
-a tree, configuration or kernel version of the caller's (`-d`, `-C`, `-S`),
-a forced load, a module file no package installed or changed since. A plain
-name that resolves to no module of the running kernel (kmod: "not found")
-loads nothing and is recorded ("nothing to load"); with a path, an option or
-a cut argv beside it, killed. Why: the container runtimes, iptables and kube-proxy run
-`modprobe` of the distribution's netfilter, bridge and overlay modules (lot
-275's lab: rootful podman's network killed on Ubuntu 22.04). What is left:
-a load the exec does not show (the environment's `MODPROBE_OPTIONS`, the
-binary indexes) is judged at the load, by R018, on the file the kernel
-reads. No directive restores the kill of a vouched-for load: `enforce R011`
-runs R011's own response, which for it is the record.
+**R011 judges a module tool's command line (lot 279, 04/11/2026).**
+R011's kill existed before Wave 4 and stays in `OBSERVING_KILLS` below; lot
+279 narrows it and adds no kill. An exec of the system's module tool by
+module name — plain names, before the first name only options that move and
+force nothing, no `MODPROBE_OPTIONS` in its environment — is a High record
+(T1547.006), not killed, in every posture. Killed as before, in every
+posture: `insmod`; `modprobe` of a path or a `.ko*` name; `-C`, `-d`, `-S`,
+`--force*`, `-o`, `--remove-holders`, `--remove-dependencies`; any argument
+starting with `-` after the first name (`modprobe <name> -q` included); a
+copy of the tool or a program that is not the system's (by device and
+inode); `MODPROBE_OPTIONS`, or an environment the agent could not read at
+the exec; an argv not read whole. R011 resolves nothing: whether a name
+loads a module, and which, is the kernel's to judge. R018 records the load
+(`kernel_read_file`, the file's path) and kills the loader of a file outside
+the module directories, or of an unowned one by a loader it does not
+expect — after the load: it observes, it does not deny. What prevents a load
+is the kernel's module signature enforcement and lockdown (the host check
+reports both) and lot 285's deny of an untrusted file. What R011 never saw,
+as before: a root process loading a module with its own `finit_module(2)`,
+and the `install`/`remove` commands of root's `modprobe.d`, which run as
+programs the exec rules judge. Why: the container runtimes, kube-proxy and
+k3s run `modprobe` of the distribution's netfilter, bridge and overlay
+modules (lot 275's lab: rootful podman's network killed on Ubuntu 22.04). No
+directive restores the kill of a recorded exec: `enforce R011` runs R011's
+own response, which for it is the record.
 
 Inside an administrator's `sudo` session at a terminal, a package
 transaction or an installer's window (R009's Low record), those rules'

@@ -736,43 +736,35 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
-- R011 judges what a kernel-module tool's exec loads, not the tool's name
-  (lot 279): it killed the `modprobe` rootful podman runs for its netfilter
-  modules (lot 275's lab, Ubuntu 22.04), and every `modprobe` of the
-  container runtimes, iptables and an administrator. An exec of the
-  system's tool (a file of `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`)
-  asking for module names that resolve, as kmod resolves them
-  (configuration aliases, `modules.dep`, `modules.symbols`,
-  `modules.alias`, built-ins by name and by the aliases of
-  `modules.builtin.modinfo`; dependencies and soft dependencies), to files
-  of the running kernel's tree that a package installed or DKMS built (on a
-  host without a package database: the kernel's `modules.order`), none
-  changed since the package database's last change (`max(mtime, ctime)`;
-  DKMS: its registry's, the kernel's tree: the boot), each uncompressed one
-  signed while the kernel enforces signatures — or an invocation that
-  inserts nothing (`-r`, `-n`, `-D`, `-c`, `-R`, `kmod list`, `kmod
-  static-nodes`, kmod run as `lsmod`, a module built into the kernel, a
-  plain name that resolves to no module of this kernel — "nothing to load",
-  kmod answers "not found", as for k3s's `nft-expr-counter` probe on
-  Ubuntu's 6.8) — is a High record, T1547.006, not
-  killed. Killed as before: `insmod` of a file, `modprobe` of a path or a
-  `.ko*` name, `-C`, `-d`, `-S`, `--force*` (with any name), a name kmod
-  refuses or an alias naming a module the tree does not hold, a
-  module file outside the tree, a link or behind a directory linked out of
-  it, unowned (copied into the tree, even after `depmod`), changed after its
-  owner's last change or unsigned under enforcement, a copy of the tool or
-  another program of its name, one in a filesystem the host's mount table
-  does not show, an argv the kernel did not read whole or the tool would
-  refuse. A module file's ctime is the host's to read
-  (`DecisionHost::inode_changed`; the portable core names no OS interface). The exec pump
-  assesses the exec on its own thread (`module_request`, no process run
-  there: an RPM host's ownership is the module-load pump's `rpm -qf`) and
-  R011 judges on its answer. What the exec does not show — the
-  environment's `MODPROBE_OPTIONS`, the binary indexes — can redirect a
-  vouched-for name to another file; that load is R018's, judged on the file
-  the kernel reads (shown by the privileged test: `MODPROBE_OPTIONS="-d
-  /tmp/…"` recorded by R011, killed by R018). `OBSERVING_KILLS` keeps R011
-  as a kill from before Wave 4: its match narrowed, no kill was added.
+- R011 no longer kills an exec of the system's kernel-module tool by module
+  name (lot 279): it killed the `modprobe` rootful podman runs for its
+  netfilter modules (lot 275's lab, Ubuntu 22.04), and every `modprobe` of
+  the container runtimes, kube-proxy, k3s, zfs-load-module and an
+  administrator. R011 judges the command line's syntax and what the exec
+  pump reads at the exec — no `modprobe.d`, index or module file is read
+  (an emulation of kmod's lookup was retired after the review of #498:
+  `--remove-holders` read as a removal, `install`/`remove` commands not
+  modelled, an option after the name under `POSIXLY_CORRECT`, the exec pump
+  blockable by a FIFO in `modprobe.d`). Killed, as before: `insmod`; a
+  `modprobe` argument with a `/` or a `.ko`, `.ko.xz`, `.ko.zst`, `.ko.gz`
+  suffix; `-C`/`--config`, `-d`/`--dirname`, `-S`/`--set-version`,
+  `-f`/`--force*`, `-o`, `--remove-holders`, `--remove-dependencies` (kmod
+  29..34 run the last two as an insertion) and their abbreviations; any
+  argument starting with `-` after the first module name (an option or a
+  parameter as the environment decides); an option the tool refuses; a
+  `kmod` command other than `help`, `list`, `static-nodes`, the version; a
+  program that is not the system's tool (its path, or its device and inode
+  against `/usr/bin/kmod`, `/usr/sbin/modprobe`… as the exec pump stats
+  them), of another mount namespace; `MODPROBE_OPTIONS` in the process's
+  environment, or an environment the exec pump could not read at the exec
+  (`/proc/<pid>/environ` tied to the exec by a pidfd and the start time:
+  gone, empty, another process's); an argv the kernel did not read whole.
+  Recorded otherwise (High, T1547.006, the names said): whether a name
+  loads anything, and what, is the kernel's to judge at the load — R018
+  records it, after the fact (its hook observes and denies nothing); the
+  prevention of a load is module signing, lockdown and lot 285.
+  `OBSERVING_KILLS` keeps R011 as a kill from before Wave 4: its kill
+  narrowed, no kill was added.
 - The privileged test `net_listener_on_uncommon_port_records_event` waits
   for both NN-L-NET-006 records of its pid (lot 279): it found the 8443
   twin's and counted before the 41999 one was appended (the CI of #493 on

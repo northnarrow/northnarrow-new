@@ -41,12 +41,12 @@ has the details of each change below.
    test that expected the kill sees the record; `enforce R009` in the
    signed per-rule policy restores it in every posture
    (`RULE_POLICY.md` §1).
-8. R011 no longer kills a `modprobe` of the distribution's modules (lot
-   279, §3): the container runtimes', iptables' and an administrator's
-   `modprobe` of a module a package installed is a High record. A dashboard
-   or a test that expected the kill of `sudo modprobe dummy` sees the
-   record; `insmod` of a file and `modprobe` of anything no package vouches
-   for are killed as before.
+8. R011 no longer kills an exec of the system's `modprobe` by module name
+   (lot 279, §3): the container runtimes', kube-proxy's, k3s's and an
+   administrator's `modprobe <name>` is a High record. A dashboard or a test
+   that expected the kill of `sudo modprobe dummy` sees the record;
+   `insmod`, `modprobe` of a path, `-C`/`-d`/`-S`/`--force*`, an option
+   after the name and `MODPROBE_OPTIONS` are killed as before.
 9. **The first upgrade to this release** runs the scripts' windows through
    the installed nn-admin, the older one, which has no `--for-installer`:
    that upgrade's window names no installer. Below COMBAT nothing changes
@@ -154,22 +154,22 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
 
 ## 3. Detections and evidence
 
-- **R011 judges what is loaded (lot 279).** An exec of `modprobe` (or
-  `insmod`, `kmod`) by the system's tool, of module names that resolve in
-  the running kernel's tree to files a package installed or DKMS built,
-  unchanged since the package database's last change, is recorded (High,
-  T1547.006, `response: none`), its reasoning naming each module, its file
-  and who installed it; a query that inserts nothing (`modprobe -r`, `-n`,
-  `kmod static-nodes`), a built-in module and a plain name of no module of
-  the running kernel ("nothing to load", the probes of k3s and kube-proxy)
-  too. Everything else is killed as before, the
-  reasoning saying why ("not vouched for: …"). On a host whose module files
-  changed after its last package transaction (an SELinux relabel, a restore
-  from a backup: their ctime is new) every `modprobe` is still killed until
-  the next package transaction. On an RPM host a module file counts as the
-  package's once its first load was seen (the module-load pump's `rpm -qf`);
-  before that an in-tree module is vouched for by the kernel's
-  `modules.order` and the boot, an out-of-tree one is killed.
+- **R011 judges a module tool's command line (lot 279).** An exec of
+  `modprobe` (or `kmod`) by the system's tool, of plain module names with
+  only options that move and force nothing before the first name, and no
+  `MODPROBE_OPTIONS` in its environment, is recorded (High, T1547.006,
+  `response: none`), its reasoning naming the names ("modprobe of 'overlay'");
+  `kmod list`, `static-nodes` and kmod run as `lsmod`, `rmmod`, `modinfo`,
+  `depmod` too. Killed as before, the reasoning saying why ("killed: …"):
+  `insmod`; a path or a `.ko*` name; `-C`, `-d`, `-S`, `--force*`, `-o`,
+  `--remove-holders`, `--remove-dependencies`; an argument starting with
+  `-` after the first name (`modprobe <name> -q`); a copy of the tool or a
+  program whose device and inode are not the system's tool's;
+  `MODPROBE_OPTIONS`, or an environment the agent could not read at the exec
+  (a process that exited before the exec pump read it is killed — a kill
+  that reaches no one); a cut argv. R011 resolves no name and reads no
+  `modprobe.d`: the load itself is R018's record (after the fact) and the
+  kernel's signature policy's refusal.
 
 - **No more advisor detections.** An exec that no rule matches gets no
   detection (it was offered to the model when one was loaded). Rule
