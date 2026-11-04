@@ -443,6 +443,25 @@ mod tests {
         assert!(has_memory(&own));
     }
 
+    /// A pidfd that cannot be opened on a running task (here a thread of
+    /// this test, not a thread-group leader: `EINVAL`) is not "no process
+    /// with its pid": refused, not taken for an exit.
+    #[test]
+    fn a_pidfd_refused_on_a_running_task_is_not_an_exit() {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // SAFETY: gettid has no preconditions.
+            tid_tx.send(unsafe { libc::gettid() } as u32).unwrap();
+            let _ = done_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        let why = refused(environment(Path::new("/proc"), tid, 1));
+        assert!(why.contains("its pidfd could not be opened"), "{why}");
+        done_tx.send(()).unwrap();
+        thread.join().unwrap();
+    }
+
     /// What was read is judged whole: `MODPROBE_OPTIONS` refused whatever
     /// became of the process; an unread environment refused while the
     /// process runs, exited once it is gone; an empty one clean while it
