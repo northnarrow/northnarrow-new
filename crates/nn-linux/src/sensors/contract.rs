@@ -124,6 +124,40 @@ const FS_PROTECT_OVERHEAD: &[Overhead] = &[
     },
 ];
 
+/// Lot 275 (the reviews of #495, D5 and R0): the cost of the three network
+/// sources on their hot paths, as the lab measured it after the response
+/// program's early port test — per call, `run_time_ns / run_cnt` with
+/// `kernel.bpf_stats_enabled=1` for that measurement only
+/// (`deploy/lab/overhead/prog-cost.sh`, its nn-bench workloads; the stats'
+/// two clock reads a call included); and the throughput lost with the
+/// agent on, every source attached, the stats off (`nn-lab.sh overhead 3`,
+/// medians of three rounds). Ubuntu 24.04 (6.8.0-147), lab round 5 of lot
+/// 275; Ubuntu 22.04 (5.15.0-202), round 4, where the workload ran a moment
+/// only (R001 killed it from /tmp: the script was fixed after).
+const DNS_ANSWER_OVERHEAD: &[Overhead] = &[Overhead {
+    what: "the DNS response program (fexit udp_recvmsg / udpv6_recvmsg): every UDP receive of \
+           more than 12 bytes — the source's family and port in one read, the address and the \
+           budgets only for port 53",
+    cost: "about 128 ns a receive of a loopback datagram from another port (6.8; 5.15: about \
+           44 ns over 1,597 calls), 88 ns a call with an empty receive between each (`udp`); \
+           with the stats off, a 64-byte receive loop +20.6 % and a send-and-drain loop +19.7 % \
+           against the agent off (all sources on)",
+}];
+
+const TLS_HELLO_OVERHEAD: &[Overhead] = &[Overhead {
+    what: "the TLS ClientHello program (fentry tcp_sendmsg): every TCP send — one lookup of the \
+           socket's mark, which misses past a flow's first send",
+    cost: "about 121 ns a send (6.8, 200,000 64-byte sends on one connection); with the stats \
+           off, that send loop +9.9 % against the agent off (all sources on)",
+}];
+
+const NET_INBOUND_OVERHEAD: &[Overhead] = &[Overhead {
+    what: "the inbound connection program (fexit inet_csk_accept): every accept — its budgets, \
+           the socket's correlator in its map, a ring record",
+    cost: "about 666 ns an accept (6.8, 20,000 loopback connect/accept/close); with the stats \
+           off, that loop +5.9 % against the agent off (all sources on)",
+}];
+
 /// Every source of the bus on Linux (a table of the build: a `const`, no
 /// process state).
 pub const SOURCES: [SourceContract; 16] = [
@@ -657,7 +691,7 @@ pub const SOURCES: [SourceContract; 16] = [
                      close is not recorded either",
             counter: "inbound_rate",
         }],
-        overhead: &[],
+        overhead: NET_INBOUND_OVERHEAD,
         truncations: &[COMM],
         rings: &["inbound"],
         probe: None,
@@ -688,7 +722,7 @@ pub const SOURCES: [SourceContract; 16] = [
                      how many were held (SensorFlood)",
             counter: "dns_answer_rate",
         }],
-        overhead: &[],
+        overhead: DNS_ANSWER_OVERHEAD,
         truncations: &[
             Truncation {
                 field: "response (the receiver's buffer)",
@@ -724,7 +758,7 @@ pub const SOURCES: [SourceContract; 16] = [
                      second, per user (SensorFlood says so)",
             counter: "tls_rate",
         }],
-        overhead: &[],
+        overhead: TLS_HELLO_OVERHEAD,
         truncations: &[
             Truncation {
                 field: "ClientHello (the sender's buffer)",

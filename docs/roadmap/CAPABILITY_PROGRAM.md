@@ -35,7 +35,7 @@ number in parentheses is a lab PR.
 | C04 | ARM64 support | 0 | aarch64: the portable crates' check only (`ci.yml`); the agent and the eBPF object are built for x86_64 only | 3 |
 | C05 | Process telemetry | 1 | exec only, with argv, parent and `start_ns` (`crates/nn-model/src/event.rs`; the parent's key, 238); no fork, exit or credential-change event (`crates/nn-core/src/contract/mod.rs`): those hooks serve the exploit guard only (219) | 3 |
 | C06 | File telemetry and FIM | 2 | the LSM `file_open` observer and the FIM drain (`docs/operator/SENSOR_CONTRACT.md`); 25 FIM rules (`docs/detection/RULE_CATALOGUE.md`); rename and unlink bursts (225); setattr from 6.9; multi-match (236) | 3 |
-| C07 | Endpoint network telemetry | 1 | outbound TCP connect v4/v6, flows at close, listen, outbound UDP and DNS queries (`SENSOR_CONTRACT.md`; 229); lot 275 (#495): inbound connections, DNS answers and TLS fingerprints in the flow record present, MS28–MS30 passing on 5.15, the 6.8 round of the review's fixes pending — the level moves with it; 224 added verdicts (C12, C14), not telemetry | 3 |
+| C07 | Endpoint network telemetry | 2 | outbound TCP connect v4/v6, flows at close, listen, outbound UDP and DNS queries (`SENSOR_CONTRACT.md`; 229); inbound connections, DNS answers and TLS fingerprints in the flow record (lot 275, #495: `net_inbound`, `dns_answer`, `tls_hello`; MS28–MS31 PASS on 5.15 and 6.8); 224 added verdicts (C12, C14), not telemetry | 3 |
 | C08 | Identity and ITDR | 0 | no authentication event source (the FIM on `authorized_keys`, PAM and sudoers is C06) | 3 |
 | C09 | Cloud telemetry and posture | 0 | no IMDS code, no cloud context | 3 |
 | C10 | Network detection (NDR) | 0 | the beacon and fan-out rules judge the endpoint's own flows (C07, C14); no protocol log | 3 |
@@ -5218,7 +5218,7 @@ number in parentheses is a lab PR.
     outside this lot); a hybrid v1 host, another architecture than x86-64
     and a kernel without the proc offsets are signed degradations; the
     move guard's cost on path-heavy work.
-- **Lot 275 — C07: inbound connections, DNS responses and TLS
+- **Lot 275 — C07 1 → 2: inbound connections, DNS responses and TLS
   ClientHello fingerprints as telemetry; NN-L-NET-028, "no DNS, no
   connect", per lineage (wave 1 of phase 3).**
   - What was missing (the re-assessment of 03/11, C07 at 1): the passive
@@ -5258,6 +5258,29 @@ number in parentheses is a lab PR.
     from 108: its JA3 varies). Registry version 4: out of the Critical
     sub-gate (29). Host code only: the lab's sensors and verifier are not
     concerned.
+  - The independent review of #495 (no blocker) and its second: NN-L-NET-028
+    was not fail-safe as claimed, and is now. Its `enforce` is refused (as
+    NET-003's: by `config overlay set`; at the start the line as `alert`,
+    signed) until it is measured on a wider corpus. D1: an incomplete
+    response (the 512-byte cut, a datagram longer than the buffer, the
+    server's TC bit, a malformed A/AAAA) binds what it read and answers
+    nothing. D2: a connect judged before both DNS pumps read the records
+    made before it is unknown (`judge`'s barrier; the response IPC's
+    deadline 50 ms, a quarter of the wait). D3: a user's held DNS records,
+    and any growth of the DNS rings' and budgets' `RING_DROPS` slots read
+    at each pass (no counters: a loss), degrade the evidence for every
+    process for 5 minutes. D4: only the question's chain binds, and a
+    response binds only its receiver unless a system resolver received it
+    — its executable at its system path, one of the host's resolver users
+    (never root), in init's mount namespace (R1: never a path alone). D5:
+    the response program reads the source's family and port first and the
+    address only for port 53, at most `min(ret, len)` (N1); the three
+    sources declare their measured cost in the contract. R2: a blinding
+    shows — a signed `nodns_coverage_lost` (its cause, the pid or uid that
+    caused it; one a cause every 5 minutes) and the rule's judgements by
+    outcome and unknown reason in every heartbeat (`nodns`). N2: a binding
+    of a process of unknown start is unknown. The reviewers' probes are
+    tests asserting the opposite of what they showed.
   - What the lab found and changed: the first build (2d2b2831) had three
     programs the verifier refused on both kernels — `inbound_accept_ret4`
     (the fexit's return slot is a `PTR_TO_BTF_ID`; the correlator's byte
@@ -5283,7 +5306,14 @@ number in parentheses is a lab PR.
     as checks, while the guest's signed records hold one NN-L-NET-028 for
     each of the four literal connects (Medium, Log) and the DNS response
     pump's summary 30 responses read, 27 decoded in the first minute (read
-    from the host); the checks of f06830d3 on 6.8: round 3, queued for the guest when this note was written; 5.15 (round 3): MS28 5 of 5 (a TCP v4,
+    from the host); 6.8 after both reviews (round 5, 17b30343; verifier
+    90 OK, 0 failing): MS28 5 of 5, MS29 (3 rows), MS30 (32 responses
+    read, 29 decoded in the first minute), MS31 (ja3 0149f47e…, ja4
+    t13d3112h2_…), NEG PASS — round 4 had run on another lot's agent (its
+    install refused over an agent running with no pin root, which the
+    lab's purge did not stop; the harness fixed); 5.15 after the reviews'
+    eBPF change (round 4, 95bac843; verifier 87 OK, 0 failing): MS28 5 of
+    5, MS29, MS30 PASS; 5.15 (round 3): MS28 5 of 5 (a TCP v4,
     a UDP and an IPv6 connect to a documentation address with no lookup:
     one NN-L-NET-028 each, Medium, Log, no kill; `curl http://example.com/`
     none; `203-0-113-5.nip.io`, a name that spells its address, one), MS29
@@ -5299,8 +5329,23 @@ number in parentheses is a lab PR.
     workload rc 0; 0 on 5.15, where the `git clone`'s HTTPS helper died of
     `SIGILL` in libgnutls on the guest's virtual CPU (after its connect)
     and the rootful container did not start (R011 killed podman's
-    `modprobe`). The EXP-13 probe (literal 192.0.2.1) draws NN-L-NET-028,
-    by design. Overhead (`overhead 3`, medians, main → lot 275): 6.8 `udp`
+    `modprobe`); again 0 on 6.8 after both reviews (round 5, W1–W6, every
+    workload rc 0). The EXP-13 probe (literal 192.0.2.1) draws NN-L-NET-028,
+    by design. Cost after the early port test (round 5, 6.8, the
+    contract's overhead entries): per call (BPF stats on) about 128 ns a
+    UDP receive from another port than 53, 121 ns a TCP send, 666 ns an
+    accept; with the stats off `udprecv` +20.6 %, `udp` +19.7 %,
+    `tcpsend` +9.9 %, `connect` +5.9 %. `perf-compare` against the 6.8
+    baseline (40fd666, 21/10): FAIL, 11 regressions, with the agent-off
+    reference itself +4 to +33 % slower (the PC loaded by the other lots'
+    guests, gates and mutations); per workload the agent's share (on ÷
+    off) of this lot's paths is unchanged or lower — `udp_send` 1.274 →
+    1.278, `dns_send` 1.221 → 1.158, `tcp_connect_close` 1.405 → 1.264 —
+    while the file paths moved (`write_open` 1.444 → 1.813, `open` 1.389 →
+    1.696: the deny hooks lots 273b and 273c added on `file_permission`
+    and `inode_permission` since the baseline) and the agent's RSS (+9.5
+    MiB idle) and idle CPU (0.2 → 1.2 %) with them; no baseline of today's
+    `main` was taken. Overhead (`overhead 3`, medians, main → lot 275): 6.8 `udp`
     +17.1 → +22.8 %, `connect` +11.7 → +15.0 %, `dns` +16.5 → +10.5 %, new
     `udprecv` +20.9 %, `tcpsend` +1.9 %; 5.15 `udp` +5.4 → +23.1 %,
     `connect` −8.4 → +15.2 %, `dns` +2.3 → +16.1 %, `udprecv` +22.6 %,
@@ -5325,11 +5370,8 @@ number in parentheses is a lab PR.
     273c's memory-floor cases, whose reload is asked, not awaited; lot 275
     touches no cgroup or anti-tamper code (C97's timing is lot 273d's to
     explain).
-  - Gates on 8aa7359f (the code; the documents after it change no code):
-    `build-ebpf`, clippy ×4, fmt, `cargo test --workspace` 84 suites,
-    3,690 passed, 0 failed, 17 ignored, the privileged build,
-    `attack-coverage`, golden ×5 (54 files, the same bytes), MSRV, fuzz
-    (14), portable-core (5), lockfiles unchanged. Mutations: 78 on the lot's userland code
+  - Gates on @FINALSHA@ (the final tip, merged with `main` 80c8da36):
+    @FINALGATES@. Mutations: 78 on the lot's userland code
     in two sets (66 + 12: the resolved table, the rule and its allowlist,
     the response parser, the IPC check, the pumps' ingest, the attach by
     arity, the lineage walk, the worker), 77 caught, MP3 argued equivalent
@@ -5344,18 +5386,25 @@ number in parentheses is a lab PR.
     or without its line, the source, the strict path demoting, the start's
     two reports) 8 caught. MD7 was first "caught" by a stale eBPF stamp in
     the mutation tree (no test ran): not counted until the start's
-    reporting got its test (`boot::policy`), which catches MD7 and MD8. The eBPF is covered by the lab (verifier, MS28–MS31, the
-    privileged e2e tests), the lab helpers by their selftests.
-  - Level: C07 stays 1 in this note. Inbound connections, DNS answers
-    and TLS fingerprints in the flow record are present and pass MS28–MS30
-    on 5.15; on 6.8 the guest's records show the three, and the checks of
-    f06830d3 (round 3) are queued for the guest. The table moves C07 to 2
-    with that round's MS28–MS30. Not 3 then: one architecture, two
+    reporting got its test (`boot::policy`), which catches MD7 and MD8.
+    The reviews: set E (27, D1–D4 and N2) 27 caught, set F (16, R1–R3) 16
+    caught — MF10 and MF11 once their tests were added; the nn-linux ones
+    counted only from a mutation tree with a fresh eBPF stamp, and a catch
+    only with a failing test named. The eBPF is covered by the lab
+    (verifier, MS28–MS31, the privileged e2e tests), the lab helpers by
+    their selftests.
+  - Level: C07 1 → 2. Inbound connections, DNS answers and TLS
+    fingerprints in the flow record are present and tested in the lab on
+    both kernel classes: MS28–MS30 (and MS31) PASS on 5.15 (round 4) and
+    6.8 (round 5) on the reviews' code. Not 3: one architecture, two
     distributions; `recvmmsg`, a multi-segment iovec, DNS over TCP, DoT
-    and DoH are not read; the response sensor's cost on UDP receives.
-  - Open: the UDP receive cost (the source port read before the address;
-    the exempt users' test before the address); DNS over TCP and
-    `recvmmsg`; the response sensor on `nss-resolve` hosts measured only
-    through the NSS query records; Docker and browsers in the
-    false-positive set; a third kernel class (6.10+, the 2-parameter
-    `inet_csk_accept`).
+    and DoH are not read; NN-L-NET-028's kill is refused until measured on
+    a wider corpus.
+  - Open: the UDP receive cost (about 128 ns a receive; batching the
+    response decodes per pass, as the names are, would also make D2's
+    barrier time out less); DNS over TCP and `recvmmsg`; the response
+    sensor on `nss-resolve` hosts measured only through the NSS query
+    records; Docker and browsers in the false-positive set; a third kernel
+    class (6.10+, the 2-parameter `inet_csk_accept`); a `perf` baseline of
+    today's `main` on an idle PC, against which the lot's figures can be
+    gated; NN-L-NET-003's second predicate.

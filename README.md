@@ -198,15 +198,15 @@ Thirty capabilities, each with a level that changes only together with its evide
 supported kernel. The table in
 [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md) was re-assessed on 2026-11-03
 against `main`, separately from the lab PRs. It is a self-assessment, not a third party's.
-**No capability is at level 3.** Ten are at 2, ten at 1 and ten at 0.
+**No capability is at level 3.** Eleven are at 2, nine at 1 and ten at 0.
 
 <details>
 <summary><b>All thirty levels</b></summary>
 
 | Level | Capabilities |
 |---|---|
-| **2** | C01 Linux sensor · C06 file telemetry and FIM · C12 synchronous inline blocking (experimental, off by default) · C14 behavioural detection and correlation · C16 structured ATT&CK mapping · C17 response on processes and files · C23 anti-tamper and self-defence (*provisional*) · C24 offline and air-gapped operation · C25 data sovereignty · C26 open code and inspectability |
-| **1** | C05 process telemetry (exec only) · C07 endpoint network telemetry · C11 containers · C13 malware prevention · C15 custom rules · C18 host network isolation · C19 rollback · C20 automation · C27 product supply chain · C28 safe content release |
+| **2** | C01 Linux sensor · C06 file telemetry and FIM · C07 endpoint network telemetry · C12 synchronous inline blocking (experimental, off by default) · C14 behavioural detection and correlation · C16 structured ATT&CK mapping · C17 response on processes and files · C23 anti-tamper and self-defence (*provisional*) · C24 offline and air-gapped operation · C25 data sovereignty · C26 open code and inspectability |
+| **1** | C05 process telemetry (exec only) · C11 containers · C13 malware prevention · C15 custom rules · C18 host network isolation · C19 rollback · C20 automation · C27 product supply chain · C28 safe content release |
 | **0** | C02 Windows · C03 macOS · C04 ARM64 · C08 identity / ITDR · C09 cloud · C10 NDR · C21 SIEM export · C22 backend · C29 independent public validation · C30 generative AI on the host (absent by design) |
 
 </details>
@@ -373,7 +373,7 @@ on-host LLM advisor removed, which also took about 150 crates out of `Cargo.lock
 
 - [ ] Lot 273c, in progress: `prlimit` / `RLIMIT_CPU` and scheduler starvation refused outside a window
 - [ ] **Wave 1**
-  - [ ] Network telemetry (inbound connections, DNS answers, TLS fingerprints) and "no DNS, no connect": a connection to an address no DNS answer gave
+  - [x] Network telemetry (inbound connections, DNS answers, TLS fingerprints) and "no DNS, no connect": a connection to an address no DNS answer gave (lot 275; the rule records, its kill refused until measured wider)
   - [ ] Process telemetry: fork, exit and credential changes
   - [ ] Deception that trips when a decoy is used
   - [ ] A self-test of every sensor, not three of sixteen

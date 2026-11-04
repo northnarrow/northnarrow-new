@@ -199,8 +199,10 @@ fail-safe.
   `unit`) spares one program. `enforce NN-L-NET-028` is refused (a policy
   you sign with it is refused; one signed before is applied with the line
   as `alert`, a signed degradation): its kill stays held.
-- **False positives measured** (lot 275's lab before the review of #495,
-  `deploy/lab/malsim/nodns-fp.sh`,
+- **False positives measured** (lot 275's lab, `deploy/lab/malsim/nodns-fp.sh`;
+  again on 6.8 after both reviews of #495 — the system resolver by its
+  executable, its user and the host's mount namespace, `Low` only from it:
+  none, every workload rc 0;
   every NN-L-NET-028 record of a workload's window counted, also under
   another rule's record of the same event): **none** on Ubuntu 24.04 (6.8)
   and 22.04 (5.15) over `apt-get update` and a download-only install, 40
@@ -249,10 +251,16 @@ The UDP receive path is where the cost is: every receive runs the DNS
 response program. Before the review of #495 it read the source's pointer,
 family, port and address before the port's test; from then the family and
 the port in one read and the address only for port 53. The figures above
-are from before; the per-call cost after it, measured in the lab round
-that follows the review (`deploy/lab/overhead/prog-cost.sh`), goes in the
-sensor contract's overhead entries — and so in the signed manifest — with
-that round. The workloads
+are from before. After it (lab round 5, Ubuntu 24.04; the same figures are
+the sensor contract's overhead entries, in the signed manifest):
+
+| program | per call (`run_time_ns / run_cnt`, BPF stats on) | the workload with the agent on (stats off, medians of 3) |
+|---|---|---|
+| `dns_answer` (`udp_recvmsg`) | about 128 ns a receive from another port (88 ns a call with an empty receive between; 5.15: about 44 ns) | `udprecv` +20.6 %, `udp` +19.7 % |
+| `tls_hello` (`tcp_sendmsg`) | about 121 ns a send | `tcpsend` +9.9 % |
+| `net_inbound` (`inet_csk_accept`) | about 666 ns an accept | `connect` +5.9 % |
+
+`deploy/lab/overhead/prog-cost.sh` measures the first column. The workloads
 `udprecv` and `tcpsend` are new with this lot (no `main` figure). The
 rounds are noisy (`connect` on 22.04's `main` run reads −8.4 %); the
 per-run reports are in the capability program's lot 275 note.
