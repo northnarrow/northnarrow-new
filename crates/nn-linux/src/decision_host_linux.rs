@@ -99,6 +99,15 @@ impl DecisionHost for LinuxHost {
     fn notify_flow_waiters(notify: &tokio::sync::Notify) {
         notify.notify_waiters();
     }
+
+    /// Lot 279: `st_ctime` (seconds and nanoseconds); `None` before the
+    /// epoch.
+    fn inode_changed(meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
+        use std::os::unix::fs::MetadataExt;
+        let secs = u64::try_from(meta.ctime()).ok()?;
+        let nanos = u32::try_from(meta.ctime_nsec()).ok()?.min(999_999_999);
+        Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+    }
 }
 
 // ── the exemption facts (from `decision::rule_policy`, R08b) ───────────
@@ -237,6 +246,125 @@ impl ActorFacts for ProcFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 279, R011's module files on the Linux host: their age is
+    /// `max(mtime, ctime)` (the mtime set back does not make a file old),
+    /// a link in the tree or a directory linked out of it is not vouched
+    /// for, a merged `/usr` (`/lib` a link to `usr/lib`) is the tree's own.
+    #[test]
+    fn module_files_are_judged_by_their_inode() {
+        use nn_core::decision::rules::module_request::{Assessment, ModuleRequests};
+        use std::time::{Duration, SystemTime};
+        let rel = "6.8.0-279-generic";
+        let new_host = |merged: bool| {
+            let host = tempfile::tempdir().unwrap();
+            let w = |p: &str, text: &str| {
+                let p = host.path().join(p);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, text).unwrap();
+            };
+            if merged {
+                std::fs::create_dir_all(host.path().join("usr/lib")).unwrap();
+                std::os::unix::fs::symlink("usr/lib", host.path().join("lib")).unwrap();
+            }
+            w("proc/sys/kernel/osrelease", &format!("{rel}\n"));
+            w(
+                &format!("lib/modules/{rel}/kernel/net/nf_tables.ko"),
+                "\x7fELF",
+            );
+            w(&format!("lib/modules/{rel}/kernel/net/dummy.ko"), "\x7fELF");
+            w("tmp/staged/veth.ko", "\x7fELF");
+            w("tmp/rk.ko", "\x7fELF");
+            std::os::unix::fs::symlink(
+                host.path().join("tmp/staged"),
+                host.path().join(format!("lib/modules/{rel}/kernel/linked")),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                host.path().join("tmp/rk.ko"),
+                host.path()
+                    .join(format!("lib/modules/{rel}/kernel/net/lnk.ko")),
+            )
+            .unwrap();
+            let mods = [
+                "kernel/net/nf_tables.ko",
+                "kernel/net/dummy.ko",
+                "kernel/linked/veth.ko",
+                "kernel/net/lnk.ko",
+            ];
+            let dep: String = mods.iter().map(|m| format!("{m}:\n")).collect();
+            w(&format!("lib/modules/{rel}/modules.dep"), &dep);
+            let list: String = mods
+                .iter()
+                .map(|m| format!("/lib/modules/{rel}/{m}\n"))
+                .collect();
+            w("var/lib/dpkg/info/linux-modules.list", &list);
+            w("var/lib/dpkg/status", "Package: linux-modules\n");
+            let later = SystemTime::now() + Duration::from_secs(3600);
+            std::fs::File::options()
+                .write(true)
+                .open(host.path().join("var/lib/dpkg/status"))
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+            host
+        };
+        static PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let assess = |host: &tempfile::TempDir, name: &str| -> Assessment {
+            let n = PID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let e = nn_model::Event::ProcessSpawn {
+                pid: u32::MAX - 2790 - n,
+                ppid: 1,
+                uid: 0,
+                gid: 0,
+                comm: "modprobe".into(),
+                filename: "/sbin/modprobe".into(),
+                timestamp_ns: 2790 + u64::from(n),
+                argv: vec!["/sbin/modprobe".into(), name.into()],
+                parent_comm: "dockerd".into(),
+                parent_start_ns: 0,
+                start_ns: 1,
+                parent_is_kthread: false,
+                exe: Default::default(),
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            };
+            ModuleRequests::<LinuxHost>::new(host.path()).of(&e)
+        };
+        let why = |a: Assessment| match a {
+            Assessment::NotVouched(w) => w,
+            other => panic!("vouched for: {other:?}"),
+        };
+        for merged in [false, true] {
+            let host = new_host(merged);
+            assert!(assess(&host, "nf_tables").records(), "merged /usr {merged}");
+            assert!(why(assess(&host, "lnk")).contains("not a regular file"));
+            assert!(why(assess(&host, "veth")).contains("a link out of"));
+        }
+        // the package database's last change before the files', then the
+        // file's mtime set back a year: its ctime still says when
+        let host = new_host(false);
+        let status = host.path().join("var/lib/dpkg/status");
+        let file = host
+            .path()
+            .join(format!("lib/modules/{rel}/kernel/net/dummy.ko"));
+        let f = std::fs::File::options().write(true).open(&file).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(86_400 * 365))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&status)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
+        let w = why(assess(&host, "dummy"));
+        assert!(
+            w.contains("after the package database's last change"),
+            "{w}"
+        );
+        assert!(LinuxHost::inode_changed(&std::fs::metadata(&file).unwrap()).is_some());
+    }
 
     /// The host's own `/proc`: this test process's facts.
     #[test]

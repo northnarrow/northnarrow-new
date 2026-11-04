@@ -638,10 +638,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   static-nodes`, kmod run as `lsmod`) — is a High record, T1547.006, not
   killed. Killed as before: `insmod` of a file, `modprobe` of a path or a
   `.ko*` name, `-C`, `-d`, `-S`, `--force*`, a name nothing resolves, a
-  module file outside the tree, a link, unowned (copied into the tree, even
-  after `depmod`), changed after its owner's last change or unsigned under
-  enforcement, a copy of the tool or another program of its name, an argv
-  the kernel did not read whole or the tool would refuse. The exec pump
+  module file outside the tree, a link or behind a directory linked out of
+  it, unowned (copied into the tree, even after `depmod`), changed after its
+  owner's last change or unsigned under enforcement, a copy of the tool or
+  another program of its name, one in a filesystem the host's mount table
+  does not show, an argv the kernel did not read whole or the tool would
+  refuse. A module file's ctime is the host's to read
+  (`DecisionHost::inode_changed`; the portable core names no OS interface). The exec pump
   assesses the exec on its own thread (`module_request`, no process run
   there: an RPM host's ownership is the module-load pump's `rpm -qf`) and
   R011 judges on its answer. What the exec does not show — the

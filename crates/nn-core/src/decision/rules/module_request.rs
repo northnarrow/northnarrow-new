@@ -13,8 +13,8 @@
 //! | a query that inserts nothing: `-r`, `-n`, `-D`, `-c`, `-R`, `--show-*`, `-V`, `-h`; `kmod list` / `static-nodes`; kmod run as `lsmod`, `rmmod`, `modinfo`, `depmod`; a usage error | record |
 //! | `insmod` of any file; `modprobe` of a path or a `.ko*` name | kill |
 //! | `-C`, `-d`, `-S` (the caller's configuration, tree root or kernel version), `-f` / `--force-*` | kill |
-//! | a name no index of the running kernel's tree resolves; a file outside it, a link, unowned, changed after its owner's last change, unsigned under enforcement | kill |
-//! | a copy of the tool elsewhere, another program named like it, an argv the kernel did not read whole, an option the tool would refuse | kill |
+//! | a name no index of the running kernel's tree resolves; a file outside it, a link (or behind a directory linked out of it), unowned, changed after its owner's last change, unsigned under enforcement | kill |
+//! | a copy of the tool elsewhere, another program named like it, a program of a filesystem the host's mount table does not show, an argv the kernel did not read whole, an option the tool would refuse | kill |
 //!
 //! **Resolution** follows libkmod's lookup order (`kmod_module_new_from_lookup`):
 //! the aliases of the configuration (`modprobe.d`: `/etc`, `/run`,
@@ -238,6 +238,15 @@ impl<H: DecisionHost> ModuleRequests<H> {
                 common::wire::ARGV_LEN - 1
             ));
         }
+        // the kernel named a file of a filesystem this mount namespace does
+        // not show (another namespace's root): not the host's tool, and its
+        // module tree is not the one read here
+        if !exe.path.is_empty() && exe.root != (0, 0) {
+            return Assessment::NotVouched(format!(
+                "the program ({}) is in a filesystem the host's mount table does not show",
+                exe.path
+            ));
+        }
         let tool = match kmod_invocation::tool_of(exe.path_or(filename), argv) {
             Ok(t) => t,
             Err(why) => return Assessment::NotVouched(why),
@@ -341,6 +350,17 @@ impl<H: DecisionHost> ModuleRequests<H> {
         if !meta.file_type().is_file() {
             return Err("not a regular file (a link or another kind)".to_string());
         }
+        // no directory of the tree on the way is a link elsewhere: the file
+        // is where its path in the tree says (a merged /usr's `/lib` link
+        // is the tree's own, resolved on both sides)
+        let tree_dir = self.root.join(dir.trim_start_matches('/'));
+        let real = std::fs::canonicalize(&on_disk).ok();
+        let expected = std::fs::canonicalize(&tree_dir).ok().map(|d| d.join(rel));
+        if real.is_none() || real != expected {
+            return Err(
+                "a directory on its path is a link out of the running kernel's tree".to_string(),
+            );
+        }
         // the exec pump runs no process (an RPM host's `rpm -qf` is the
         // module-load pump's); the decision's own assessment asks as R018
         let provenance = if fresh {
@@ -358,7 +378,7 @@ impl<H: DecisionHost> ModuleRequests<H> {
                 "built by DKMS, unchanged since its registry's last change",
                 facts
                     .package_db
-                    .max(newest_under(&self.root.join("var/lib/dkms"), 6)),
+                    .max(newest_under::<H>(&self.root.join("var/lib/dkms"), 6)),
                 "DKMS's registry's last change",
             ),
             Provenance::Unknown if tree.order.contains(without_compression(rel)) => (
@@ -385,7 +405,7 @@ impl<H: DecisionHost> ModuleRequests<H> {
         let since = since.ok_or_else(|| {
             format!("{owner} could not be read: nothing to compare its change with")
         })?;
-        let changed = changed_at(&meta).ok_or("its change time could not be read")?;
+        let changed = changed_at::<H>(&meta).ok_or("its change time could not be read")?;
         if changed > since {
             return Err(format!(
                 "changed at {} (mtime/ctime), after {owner} at {}",
@@ -890,31 +910,15 @@ fn read_bounded(path: &Path) -> Option<String> {
 }
 
 /// The last change of a file's content or inode: `max(mtime, ctime)` — a
-/// caller sets the mtime, not the ctime.
-#[cfg(unix)]
-fn changed_at(meta: &std::fs::Metadata) -> Option<SystemTime> {
-    use std::os::unix::fs::MetadataExt;
-    let ctime = u64::try_from(meta.ctime()).ok().map(|s| {
-        SystemTime::UNIX_EPOCH
-            + Duration::new(
-                s,
-                u32::try_from(meta.ctime_nsec())
-                    .unwrap_or(0)
-                    .min(999_999_999),
-            )
-    });
-    meta.modified().ok().max(ctime)
-}
-
-/// Off Unix (the portable build), the content's change only.
-#[cfg(not(unix))]
-fn changed_at(meta: &std::fs::Metadata) -> Option<SystemTime> {
-    meta.modified().ok()
+/// caller sets the mtime, not the ctime (the host's,
+/// [`DecisionHost::inode_changed`]).
+fn changed_at<H: DecisionHost>(meta: &std::fs::Metadata) -> Option<SystemTime> {
+    meta.modified().ok().max(H::inode_changed(meta))
 }
 
 /// The newest change under `dir`, `depth` levels down at most (4,096
 /// entries at most).
-fn newest_under(dir: &Path, depth: usize) -> Option<SystemTime> {
+fn newest_under<H: DecisionHost>(dir: &Path, depth: usize) -> Option<SystemTime> {
     let mut newest: Option<SystemTime> = None;
     let mut stack = vec![(dir.to_path_buf(), depth)];
     let mut seen = 0usize;
@@ -930,7 +934,7 @@ fn newest_under(dir: &Path, depth: usize) -> Option<SystemTime> {
             let Ok(meta) = std::fs::symlink_metadata(e.path()) else {
                 continue;
             };
-            newest = newest.max(changed_at(&meta));
+            newest = newest.max(changed_at::<H>(&meta));
             if meta.is_dir() && left > 1 {
                 stack.push((e.path(), left - 1));
             }
@@ -1019,10 +1023,12 @@ pub(crate) mod fixture {
         /// `rel` (relative to the module tree) written, signed or not, and
         /// listed in modules.dep with `deps`.
         pub fn module(&self, rel: &str, deps: &[&str], signed: bool) -> &Self {
+            // longer than the marker either way: its absence is read, not
+            // a short file's
             let body: &[u8] = if signed {
-                b"\x7fELF...~Module signature appended~\n"
+                b"\x7fELF........................~Module signature appended~\n"
             } else {
-                b"\x7fELF..."
+                b"\x7fELF.........................................................."
             };
             let p = self.path(&format!("lib/modules/{RELEASE}/{rel}"));
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -1203,14 +1209,8 @@ mod tests {
             not_vouched(&a).contains("after the package database's last change"),
             "{a:?}"
         );
-        // the mtime set back changes nothing: the ctime is the inode's
-        let f = std::fs::File::options()
-            .write(true)
-            .open(t.path(&format!("lib/modules/{RELEASE}/{NF}")))
-            .unwrap();
-        f.set_modified(SystemTime::now() - Duration::from_secs(86_400 * 365))
-            .unwrap();
-        assert!(!assess(&t, &modprobe(&["nf_tables"])).records());
+        // (the mtime set back changes nothing, the ctime being the inode's:
+        // the Linux host's, nn-linux's `decision_host_linux` tests)
     }
 
     #[test]
@@ -1293,6 +1293,9 @@ mod tests {
         t.write("run/modprobe.d/a.conf", "alias nf-x \\\n  missing_mod\n");
         let a = assess(&t, &modprobe(&["nf-x"]));
         assert!(not_vouched(&a).contains("does not hold"), "{a:?}");
+        // the continued line names the module on its next line
+        t.write("run/modprobe.d/a.conf", "alias nf-y \\\n  nf_tables\n");
+        assert!(assess(&t, &modprobe(&["nf-y"])).records());
     }
 
     #[test]
@@ -1335,18 +1338,24 @@ mod tests {
         );
         t.index("modules.dep", "kernel/../../../../tmp/up.ko:\n");
         assert!(not_vouched(&assess(&t, &modprobe(&["up"]))).contains("leaves the module tree"));
-        // a link in the tree to a file elsewhere
-        t.write("tmp/rk.ko", "x");
-        let link = t.path(&format!("lib/modules/{RELEASE}/kernel/lnk.ko"));
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(t.path("tmp/rk.ko"), &link).unwrap();
-        t.index("modules.dep", "kernel/lnk.ko:\n");
-        t.packaged(
-            "linux-modules-6.8.0-1-generic",
-            &[NF, NFNL, CRC, "kernel/lnk.ko"],
+        // (a link in the tree, or behind a linked directory: the Linux
+        // host's, nn-linux's `decision_host_linux` tests)
+    }
+
+    /// The kernel named a program of a filesystem the host's mount table
+    /// does not show (a namespace's own root): not vouched for.
+    #[test]
+    fn a_program_of_another_namespace_s_filesystem_is_not_vouched_for() {
+        let t = netfilter_host();
+        let mut e = modprobe(&["nf_tables"]);
+        if let Event::ProcessSpawn { exe, .. } = &mut e {
+            exe.root = (0x801, 2);
+        }
+        let a = assess(&t, &e);
+        assert!(
+            not_vouched(&a).contains("mount table does not show"),
+            "{a:?}"
         );
-        #[cfg(unix)]
-        assert!(not_vouched(&assess(&t, &modprobe(&["lnk"]))).contains("not a regular file"));
     }
 
     #[test]
@@ -1399,7 +1408,11 @@ mod tests {
     fn what_the_kernel_did_not_say_is_not_vouched_for() {
         let t = netfilter_host();
         let no_argv = exec("/sbin/modprobe", "/usr/bin/kmod", &[]);
-        assert!(not_vouched(&assess(&t, &no_argv)).contains("not read"));
+        let why = assess(&t, &no_argv);
+        assert!(
+            not_vouched(&why).contains("no argument was checked"),
+            "{why:?}"
+        );
         let mut e = modprobe(&["nf_tables"]);
         if let Event::ProcessSpawn { argv_truncated, .. } = &mut e {
             *argv_truncated = true;
@@ -1510,6 +1523,8 @@ mod tests {
         assert!(m("a[b", "a[b"), "an unclosed class is a plain [");
         assert!(m("a\\*", "a*") && !m("a\\*", "ab"));
         assert!(m("*", "") && m("a*b*c", "axxbyyc") && !m("a*b*c", "axxbyy"));
+        // a star gives back one character at a time
+        assert!(m("*ab", "aab") && m("*:v*d*", "pci:v1d2"));
         assert_eq!(normalize("nf-tables").as_deref(), Some("nf_tables"));
         assert_eq!(normalize("usb:v[0-9]-x").as_deref(), Some("usb:v[0-9]_x"));
         assert_eq!(normalize("a]b"), None);

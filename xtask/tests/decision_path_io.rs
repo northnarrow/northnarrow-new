@@ -219,10 +219,16 @@ const KNOWN: &[(&str, usize, &str)] = &[
          only for a file no pump asked about (the replay, the tests)",
     ),
     (
+        "crates/nn-core/src/decision/host.rs",
+        1,
+        "lot 279: `DecisionHost::inode_changed` names `std::fs::Metadata` in its signature — a \
+         type, no I/O (its caller stat'ed the file: module_request's, on the exec pump)",
+    ),
+    (
         "crates/nn-core/src/decision/rules/module_request.rs",
-        15,
+        16,
         "lot 279: what a module tool's exec loads — the module tree's indexes, the \
-         configuration, the files' owners, times and signature marker — assessed by the exec \
+         configuration, the files' owners, times, real paths and signature marker — assessed by the exec \
          pump on its thread (`ModuleRequests::refresh`); R011 reads its answer, and assesses \
          itself, off the runtime's worker, only an exec no pump asked about (the replay, the \
          tests)",

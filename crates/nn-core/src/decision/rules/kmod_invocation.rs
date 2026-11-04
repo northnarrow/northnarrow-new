@@ -78,12 +78,13 @@ pub fn tool_of(image: &str, argv: &[String]) -> Result<Tool, String> {
             .strip_prefix(d)
             .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
     });
-    if !in_tool_dir || image.ends_with(" (deleted)") {
+    if !in_tool_dir {
         return Err(format!(
             "{image} is not the system's module tool (it lives outside /usr/bin, /usr/sbin, \
              /bin and /sbin)"
         ));
     }
+    // the exact name: a deleted image (`kmod (deleted)`) is none of them
     let file = basename(image);
     if !matches!(file, "kmod" | "modprobe" | "insmod") {
         return Err(format!("{image} is not the system's module tool"));
@@ -455,10 +456,18 @@ mod tests {
             "/usr/lib/x/modprobe",
             "/usr/sbin/nn-modld",
             "/usr/sbin/modprobe (deleted)",
+            "/usr/bin/kmod (deleted)",
             "modprobe",
             "/usr/bin/",
+            // a subdirectory of a tool directory is not one
+            "/usr/bin/x/modprobe",
+            "/sbin/sub/kmod",
         ] {
             assert!(t(bad, &["modprobe", "x"]).is_err(), "{bad}");
+        }
+        // the other kmod modes' files are no module tool, whatever argv[0]
+        for (image, arg0) in [("/usr/sbin/lsmod", "lsmod"), ("/usr/sbin/depmod", "depmod")] {
+            assert!(t(image, &[arg0]).is_err(), "{image}");
         }
         assert!(t("/usr/bin/kmod", &[]).is_err(), "no argv");
         assert!(t("/usr/bin/kmod", &["modprobe.real", "x"]).is_err());
@@ -491,6 +500,15 @@ mod tests {
         assert_eq!(
             modprobe_of(&["modprobe", "--", "ip_vs"]),
             Invocation::Modules(v(&["ip_vs"]))
+        );
+        // a short option's argument in the same word, or the next one
+        assert_eq!(
+            modprobe_of(&["modprobe", "-w100", "nf_tables"]),
+            Invocation::Modules(v(&["nf_tables"]))
+        );
+        assert_eq!(
+            modprobe_of(&["modprobe", "-w", "100", "nf_tables"]),
+            Invocation::Modules(v(&["nf_tables"]))
         );
     }
 
