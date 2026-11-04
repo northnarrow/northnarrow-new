@@ -110,24 +110,6 @@ impl<H: DecisionHost> ModuleOwners<H> {
         p
     }
 
-    /// Lot 279: the exec pump's question, which must not wait on a
-    /// process — every exec of the host goes through that thread. DKMS's
-    /// registry and dpkg's lists are read in this process (asked now and
-    /// kept, as [`Self::refresh`]); on a host whose database is rpm's, the
-    /// answer kept (the module-load pump's `rpm -qf` of a load of the file),
-    /// else [`Provenance::Unknown`] — no `rpm` run here.
-    pub fn without_a_process(&self, path: &str) -> Provenance {
-        let key = without_usr(path);
-        if self.dkms_built(&key) || self.root.join("var/lib/dpkg/info").is_dir() {
-            return self.refresh(path);
-        }
-        OWNERSHIP
-            .lock()
-            .get(&(self.root.clone(), key))
-            .copied()
-            .unwrap_or(Provenance::Unknown)
-    }
-
     fn lookup(&self, path: &str) -> Provenance {
         let key = without_usr(path);
         if self.dkms_built(&key) {
@@ -372,40 +354,6 @@ mod tests {
         let _ = std::fs::File::open(t.path().join("var/lib/dpkg/status"))
             .and_then(|f| f.set_modified(SystemTime::now() + std::time::Duration::from_secs(5)));
         assert_eq!(o.of(p), Provenance::Package);
-    }
-
-    /// Lot 279: the exec pump's question runs no process — dpkg's lists
-    /// and DKMS's registry are asked afresh; on an rpm host only the answer
-    /// the module-load pump kept is used.
-    #[test]
-    fn the_exec_pump_s_question_runs_no_process() {
-        let t = dpkg_host();
-        let o = ModuleOwners::new(t.path());
-        let packaged = "/lib/modules/6.8.0-1-generic/kernel/drivers/net/e1000e.ko.zst";
-        let later = "/lib/modules/6.8.0-1-generic/kernel/drivers/net/igb.ko";
-        assert_eq!(o.without_a_process(later), Provenance::Unowned);
-        // a package now lists it: asked afresh, not the answer kept
-        std::fs::write(
-            t.path().join("var/lib/dpkg/info/igb.list"),
-            format!("{later}\n"),
-        )
-        .unwrap();
-        let _ = std::fs::File::open(t.path().join("var/lib/dpkg/status"))
-            .and_then(|f| f.set_modified(SystemTime::now() + std::time::Duration::from_secs(5)));
-        assert_eq!(o.without_a_process(later), Provenance::Package);
-        assert_eq!(o.without_a_process(packaged), Provenance::Package);
-        // the host's database becomes rpm's: the answers kept, else Unknown
-        std::fs::remove_dir_all(t.path().join("var/lib/dpkg")).unwrap();
-        std::fs::create_dir_all(t.path().join("var/lib/rpm")).unwrap();
-        assert_eq!(o.without_a_process(packaged), Provenance::Package);
-        assert_eq!(
-            o.without_a_process("/lib/modules/6.8.0-1-generic/kernel/x.ko"),
-            Provenance::Unknown
-        );
-        // DKMS's registry is read here too
-        let dkms = "/lib/modules/6.8.0-1-generic/updates/dkms/zfs.ko";
-        std::fs::create_dir_all(t.path().join("var/lib/dkms/zfs/2.2.2")).unwrap();
-        assert_eq!(o.without_a_process(dkms), Provenance::Dkms);
     }
 
     #[test]

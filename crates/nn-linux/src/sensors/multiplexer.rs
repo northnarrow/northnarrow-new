@@ -577,7 +577,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     process_spawn_rb,
                     &tx,
                     &rt,
-                    spawn_assessed(ModuleRequests::default()),
+                    kmod_read_then_resolved,
                 )?),
             ),
             (
@@ -1188,23 +1188,15 @@ fn resolved<T>(_: &T, mut e: Event) -> (Event, [Option<Event>; 2]) {
     (e, [None, None])
 }
 
-/// Lot 279: the exec pump's own step after [`resolved`] — an exec of a
-/// kernel-module tool is assessed here (what it loads: the module tree's
-/// indexes, the configuration, the files' owners and times, on this
-/// thread) and the answer kept for R011 ([`ModuleRequests::refresh`]).
-fn spawn_assessed(
-    requests: ModuleRequests,
-) -> impl FnMut(&ProcessSpawnRaw, Event) -> (Event, [Option<Event>; 2]) + Send + 'static {
-    move |raw, e| {
-        let (e, carried) = resolved(raw, e);
-        requests.refresh(&e);
-        (e, carried)
-    }
+/// Lot 279: the exec pump's own step — an exec of a kernel-module tool
+/// read first, while the process may still run (its program's device and
+/// inode, its environment: [`crate::sensors::kmod_exec`]) and the facts
+/// kept for R011; then its path made absolute as every exec's
+/// ([`resolved`]).
+fn kmod_read_then_resolved(raw: &ProcessSpawnRaw, e: Event) -> (Event, [Option<Event>; 2]) {
+    crate::sensors::kmod_exec::read_and_keep(&e);
+    resolved(raw, e)
 }
-
-/// The exec pump's module requests (lot 279).
-type ModuleRequests =
-    nn_core::decision::rules::module_request::ModuleRequests<crate::chain_host_linux::LinuxHost>;
 
 /// R12b (lab PR 269): a ring's pump on a thread of its own, a source of
 /// the bus named `label`: each record of type `T` made into its event, and
@@ -1931,82 +1923,64 @@ mod tests {
         assert_eq!(exe.path, "/usr/bin/ls");
     }
 
-    /// Lot 279: the exec pump assesses an exec of a module tool after it
-    /// resolved its path, and keeps the answer R011 judges the exec on (no
-    /// module tree read on the decision's thread); other execs are none of
-    /// its business.
+    /// Lot 279: the exec pump reads an exec of a module tool before it
+    /// resolves its path, and keeps what it read for R011 (no `/proc` read
+    /// on the decision's thread); other execs are none of its business.
     #[test]
-    fn the_exec_pump_assesses_what_a_module_tool_loads() {
-        use nn_core::decision::rules::module_request::Assessment;
-        let host = tempfile::tempdir().unwrap();
-        let w = |rel: &str, text: &str| {
-            let p = host.path().join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, text).unwrap();
-        };
-        let rel = "kernel/drivers/net/dummy.ko";
-        let file = format!("/lib/modules/6.8.0-279-generic/{rel}");
-        w("proc/sys/kernel/osrelease", "6.8.0-279-generic\n");
-        w(&file[1..], "\x7fELF");
-        w(
-            "lib/modules/6.8.0-279-generic/modules.dep",
-            &format!("{rel}:\n"),
-        );
-        w("var/lib/dpkg/info/linux-modules.list", &format!("{file}\n"));
-        w("var/lib/dpkg/status", "Package: linux-modules\n");
-        let status = || {
-            std::fs::File::options()
-                .write(true)
-                .open(host.path().join("var/lib/dpkg/status"))
-                .unwrap()
-        };
-        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
-        status().set_modified(later).unwrap();
-        let exec = |comm: &str, filename: &str, argv: &[&str]| Event::ProcessSpawn {
-            pid: u32::MAX - 279,
+    fn the_exec_pump_reads_a_module_tool_s_exec() {
+        use nn_core::decision::rules::kmod_exec_facts;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .env_clear()
+            .env("MODPROBE_OPTIONS", "-d /tmp/nn-k279")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let mut start = 0;
+        for _ in 0..200 {
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap_or_default();
+            if exe.file_name().is_some_and(|n| n == "sleep") {
+                start = crate::response::proc_ref::proc_start_ns(pid).expect("its start");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_ne!(start, 0, "sleep never ran");
+        let exec = |comm: &str, ts: u64| Event::ProcessSpawn {
+            pid,
             ppid: 1,
             uid: 0,
             gid: 0,
             comm: comm.into(),
-            filename: filename.into(),
-            timestamp_ns: 279,
-            argv: argv.iter().map(|a| a.to_string()).collect(),
+            filename: "/sbin/modprobe".into(),
+            timestamp_ns: ts,
+            argv: vec!["/sbin/modprobe".into(), "dummy".into()],
             parent_comm: "iptables".into(),
             parent_start_ns: 0,
-            start_ns: 1,
+            start_ns: start,
             parent_is_kthread: false,
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
             stdio: Default::default(),
         };
-        let mut pump = spawn_assessed(ModuleRequests::new(host.path()));
         let raw = ProcessSpawnRaw::zeroed();
-        let e = exec(
-            "modprobe",
-            "/sbin/modprobe",
-            &["/sbin/modprobe", "dummy", "-q"],
-        );
-        let (out, carried) = pump(&raw, e);
+        let (out, carried) = kmod_read_then_resolved(&raw, exec("modprobe", 279_001));
         assert!(carried.iter().all(Option::is_none));
-        // the database changes after the pump read the exec: the decision
-        // reads the pump's answer
-        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        status().set_modified(earlier).unwrap();
-        let a = ModuleRequests::new(host.path()).of(&out);
+        let _ = child.kill();
+        let _ = child.wait();
+        // read while it ran: the environment it had at the exec
+        let facts = kmod_exec_facts::of(&out).expect("kept for R011");
         assert!(
-            matches!(&a, Assessment::Vouched(what) if what.contains(rel)),
-            "{a:?}"
+            facts
+                .environment
+                .as_ref()
+                .is_err_and(|w| w.contains("MODPROBE_OPTIONS='-d /tmp/nn-k279'")),
+            "{facts:?}"
         );
-        // not asked about by the pump: assessed where it is judged
-        let mut other = exec("modprobe", "/sbin/modprobe", &["/sbin/modprobe", "dummy"]);
-        if let Event::ProcessSpawn { timestamp_ns, .. } = &mut other {
-            *timestamp_ns = 280;
-        }
-        assert!(!ModuleRequests::new(host.path()).of(&other).records());
         // another program is none of the pump's business
-        let (ls, _) = pump(&raw, exec("ls", "/usr/bin/ls", &["ls"]));
-        assert_eq!(ModuleRequests::new(host.path()).refresh(&ls), None);
+        let (ls, _) = kmod_read_then_resolved(&raw, exec("ls", 279_002));
+        assert_eq!(kmod_exec_facts::of(&ls), None);
     }
 
     fn wiring(lineage: AuthSessionTracker) -> ConnectWiring {

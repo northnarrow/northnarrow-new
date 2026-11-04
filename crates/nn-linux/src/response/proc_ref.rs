@@ -360,7 +360,7 @@ pub(crate) fn stat_start_ticks(stat: &str) -> Option<u64> {
 /// ahead of MONOTONIC by the time the host spent suspended before the
 /// process started: between nothing and all of it so far. Two ticks of
 /// slack for the rounding (the same test as the lineage cache's).
-fn started_at(ticks: u64, start_ns: u64) -> bool {
+pub(crate) fn started_at(ticks: u64, start_ns: u64) -> bool {
     let tick = tick_ns();
     let shown = ticks.saturating_mul(tick);
     let slack = 2 * tick;

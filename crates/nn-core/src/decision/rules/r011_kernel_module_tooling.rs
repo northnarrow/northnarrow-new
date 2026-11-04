@@ -35,21 +35,41 @@
 //! tree, as R001..R003 would ([`super::tool_kill`]); the tool anywhere
 //! else keeps the single-process kill.
 //!
-//! ## What is loaded, not the tool's name (lot 279)
+//! ## By name, the system's tool, nothing moved (lot 279)
 //!
-//! The exec is judged on what it loads ([`super::module_request`]): the
-//! system's tool asked for module names that resolve, as kmod resolves
-//! them, to files of the running kernel's tree that a package installed
-//! (DKMS built, or the kernel's `modules.order` lists on a host without a
-//! package database), unchanged since, signed when the kernel enforces
-//! signatures — or an invocation that inserts nothing (a query, built-in
-//! modules, plain names of no module of this kernel: "nothing to load") —
-//! is RECORDED, High, T1547.006, no kill: rootful podman's `modprobe` of
-//! its netfilter modules was killed (lot 275's lab). Anything else is
-//! killed as before: `insmod` of a file, `modprobe` of a path, a tree,
-//! configuration or version of the caller's, a module file no package
-//! installed or changed since, a copy of the tool, an argv not read whole.
-//! The load itself stays R018's, on the file the kernel reads.
+//! R011 killed every exec of a module tool that no package-manager actor
+//! ran and no kernel thread asked for: the `modprobe` of rootful podman's
+//! netfilter modules among them (lot 275's lab: W5 rc 137 on Ubuntu
+//! 22.04). An exec is now RECORDED (High, T1547.006, no kill) when its
+//! command line asks for modules BY NAME and nothing else could make it
+//! load something the system's tree does not name; killed as before
+//! otherwise. It is judged on the syntax alone — kmod's lookup is not
+//! emulated, no `modprobe.d` or index is read (the coordinator's decision
+//! of 04/11, after the independent review of #498):
+//!
+//! | The exec | R011 |
+//! |---|---|
+//! | `insmod`, whatever its arguments | kill |
+//! | a `modprobe` argument with a `/`, or ending in `.ko`, `.ko.xz`, `.ko.zst`, `.ko.gz` | kill |
+//! | `-C`/`--config`, `-d`/`--dirname`, `-S`/`--set-version`, `-f`/`--force*`, `-o`, `--remove-holders`, `--remove-dependencies` (and the abbreviations `getopt_long` takes) | kill |
+//! | any argument starting with `-` after the first module name; an option the tool refuses | kill |
+//! | a `kmod` command other than `help`, `list`, `static-nodes`, the version | kill |
+//! | not the system's tool: its path outside `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin` or another name, its device and inode not the system's tool's (as the exec pump stats them), a filesystem of another mount namespace | kill |
+//! | `MODPROBE_OPTIONS` in its environment, or an environment the exec pump could not read at the exec | kill |
+//! | an argv the kernel did not read whole | kill |
+//! | otherwise — the system's tool, plain module names, before the first name only options that move and force nothing | record |
+//!
+//! Whether the names load anything, and what, is the kernel's to judge at
+//! the load: R018 records every load (`kernel_read_file`, the file's path
+//! from its dentry) and kills the loader of a file outside the module
+//! directories or of an unowned module by a loader it does not expect —
+//! AFTER the load: its hook observes and denies nothing. The prevention of
+//! a load is module signing and lockdown (the host check) and lot 285 (the
+//! kernel's deny of an untrusted file). What R011 does not see, as before:
+//! a root process that loads a module without any tool (its own
+//! `finit_module(2)`), and a `modprobe.d` `install`/`remove` command, which
+//! runs as the configuration's (root's) command and is judged by the exec
+//! rules as the program it runs.
 
 use std::sync::Arc;
 
@@ -58,32 +78,72 @@ use nn_model::{Event, ResponseAction, Severity, Verdict};
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::host::DecisionHost;
-use crate::decision::rules::module_request::{Assessment, ModuleRequests, KMOD_TOOLS};
+use crate::decision::rules::kmod_exec_facts::{self, KMOD_TOOLS};
+use crate::decision::rules::kmod_invocation::{self, Syntax};
 use crate::decision::{rules::build_verdict, Rule};
+use crate::posture::host::PostureHost;
 
-pub struct R011KernelModuleTooling<H: DecisionHost> {
+pub struct R011KernelModuleTooling<H: PostureHost> {
     allowlist: Arc<CommAllowlist<H>>,
-    /// Lot 279: what the exec loads (the exec pump's assessment).
-    requests: ModuleRequests<H>,
 }
 
-impl<H: DecisionHost> R011KernelModuleTooling<H> {
+impl<H: PostureHost> R011KernelModuleTooling<H> {
     pub fn new(allowlist: Arc<CommAllowlist<H>>) -> Self {
-        Self::with_requests(allowlist, ModuleRequests::default())
-    }
-
-    /// Lot 279: with the module requests of a host root of the caller's
-    /// (a fixture tree in tests).
-    pub fn with_requests(allowlist: Arc<CommAllowlist<H>>, requests: ModuleRequests<H>) -> Self {
-        Self {
-            allowlist,
-            requests,
-        }
+        Self { allowlist }
     }
 }
 
-impl<H: DecisionHost> Rule for R011KernelModuleTooling<H> {
+/// Lot 279: `Ok(what it asks for)` when R011 records the exec of a module
+/// tool, `Err(why)` when it kills it — its command line's syntax, then what
+/// the exec pump read at the exec ([`kmod_exec_facts`]).
+fn judge(event: &Event) -> Result<String, String> {
+    let Event::ProcessSpawn {
+        filename,
+        exe,
+        argv,
+        argv_truncated,
+        ..
+    } = event
+    else {
+        return Err("not an exec".to_string());
+    };
+    if argv.is_empty() {
+        return Err("its argv was not read by the kernel: no argument was checked".to_string());
+    }
+    if *argv_truncated {
+        return Err(format!(
+            "its argv was cut at {} bytes: arguments past the cut were not seen",
+            common::wire::ARGV_LEN - 1
+        ));
+    }
+    // the kernel named a file of a filesystem this mount namespace does not
+    // show (another namespace's root): not the host's tool
+    if !exe.path.is_empty() && exe.root != (0, 0) {
+        return Err(format!(
+            "the program ({}) is in a filesystem the host's mount table does not show (another \
+             mount namespace)",
+            exe.path
+        ));
+    }
+    let tool = kmod_invocation::tool_of(exe.path_or(filename), argv)?;
+    let what = match kmod_invocation::judge(tool, argv) {
+        Syntax::Record(what) => what,
+        Syntax::Kill(why) => return Err(why),
+    };
+    match kmod_exec_facts::of(event) {
+        None => Err(
+            "the exec pump did not read its program and environment at the exec (a replay, or \
+             more execs of module tools in flight than it keeps): neither was checked"
+                .to_string(),
+        ),
+        Some(facts) => match facts.refusal() {
+            Some(why) => Err(why.to_string()),
+            None => Ok(what),
+        },
+    }
+}
+
+impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
     fn id(&self) -> &'static str {
         "R011_KernelModuleTooling"
     }
@@ -155,33 +215,24 @@ impl<H: DecisionHost> Rule for R011KernelModuleTooling<H> {
         if *parent_is_kthread {
             return None;
         }
-        // Lot 279: judged on what the exec loads, not on the tool's name.
-        // Recorded (High, no kill) when every module it loads is vouched
-        // for or it inserts none; killed as before otherwise.
-        let assessment = self.requests.of(event);
-        let image = exe.path_or(filename);
-        let (action, mut reasoning) = match &assessment {
-            Assessment::Vouched(what) => (
+        // Lot 279: judged on the command line's syntax and on what the exec
+        // pump read at the exec — recorded (High, no kill) by name, killed as
+        // before otherwise.
+        let (action, mut reasoning) = match judge(event) {
+            Ok(what) => (
                 ResponseAction::Log,
                 format!(
-                    "Kernel-module tooling ({comm}) exec loading modules of the running \
-                     kernel's tree, each vouched for: {what} — recorded, not killed (lot 279: \
-                     judged on what is loaded; the load itself is R018's) (T1547.006)"
+                    "Kernel-module tooling ({comm}) exec by module name — {what}: the system's \
+                     tool, nothing moved or forced, no MODPROBE_OPTIONS — recorded, not killed \
+                     (lot 279): the load itself is the kernel's to judge (R018 records it; the \
+                     module signature policy) (T1547.006)"
                 ),
             ),
-            Assessment::LoadsNothing(what) => (
-                ResponseAction::Log,
-                format!(
-                    "Kernel-module tooling ({comm}) exec that inserts no module ({what}) — \
-                     recorded, not killed (lot 279) (T1547.006)"
-                ),
-            ),
-            Assessment::NotVouched(why) => (
-                super::tool_kill(image),
+            Err(why) => (
+                super::tool_kill(exe.path_or(filename)),
                 format!(
                     "Kernel-module tooling (insmod/modprobe/kmod) exec — kernel rootkit / \
-                     persistence indicator (T1547.006); posture → ENGAGED — not vouched for: \
-                     {why}"
+                     persistence indicator (T1547.006); posture → ENGAGED — killed: {why}"
                 ),
             ),
         };
@@ -210,55 +261,61 @@ mod tests {
     use crate::decision::rules::testutil::{spawn, spawn_full};
     use nn_model::ResponseAction;
 
-    type ModuleRequests = crate::decision::rules::module_request::ModuleRequests<H>;
-    use crate::decision::rules::module_request::fixture::{exec, modprobe, HostTree};
+    use crate::decision::rules::kmod_exec_facts::{self, ExecFacts};
 
-    /// Lot 279: on a host root with nothing to read (no kernel release, no
-    /// module tree): every name it is asked for is unresolved — the rule
-    /// never reads the test host's own `/lib/modules`.
     fn rule() -> R011KernelModuleTooling {
-        R011KernelModuleTooling::with_requests(
-            Arc::new(CommAllowlist::default()),
-            ModuleRequests::new("/nonexistent-root"),
-        )
+        R011KernelModuleTooling::new(Arc::new(CommAllowlist::default()))
     }
 
-    /// Lot 279: on `t`.
-    fn rule_on(t: &HostTree) -> R011KernelModuleTooling {
-        R011KernelModuleTooling::with_requests(
-            Arc::new(CommAllowlist::default()),
-            ModuleRequests::new(t.root()),
-        )
+    /// Lot 279: a root exec of `exe` as the caller ran it (`filename`),
+    /// with `argv` — each its own (pid, exec time), which the facts of the
+    /// exec pump are kept by.
+    fn exec(filename: &str, exe: &str, argv: &[&str]) -> Event {
+        let comm = filename.rsplit('/').next().unwrap();
+        let mut e = crate::decision::rules::testutil::spawn_exe(comm, filename, exe, 0);
+        if let Event::ProcessSpawn {
+            uid,
+            gid,
+            argv: a,
+            pid,
+            timestamp_ns,
+            parent_comm,
+            ..
+        } = &mut e
+        {
+            (*uid, *gid) = (0, 0);
+            *a = argv.iter().map(|s| s.to_string()).collect();
+            *parent_comm = "bash".to_string();
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (*pid, *timestamp_ns) = (2_790_000 + n, 279_000_000 + u64::from(n));
+        }
+        e
     }
 
-    /// A distribution kernel's netfilter, overlay and dummy modules,
-    /// packaged, and a module copied into the tree by hand.
-    fn distro_host() -> HostTree {
-        let t = HostTree::new();
-        let nf = "kernel/net/netfilter/nf_tables.ko";
-        let nfnl = "kernel/net/netfilter/nfnetlink.ko";
-        let ipt = "kernel/net/ipv4/netfilter/ip_tables.ko";
-        let xt = "kernel/net/netfilter/x_tables.ko";
-        let brnf = "kernel/net/bridge/br_netfilter.ko";
-        let br = "kernel/net/bridge/bridge.ko";
-        let stp = "kernel/net/802/stp.ko";
-        let ovl = "kernel/fs/overlayfs/overlay.ko";
-        let dummy = "kernel/drivers/net/dummy.ko";
-        t.module(nfnl, &[], true)
-            .module(nf, &[nfnl], true)
-            .module(xt, &[], true)
-            .module(ipt, &[xt], true)
-            .module(stp, &[], true)
-            .module(br, &[stp], true)
-            .module(brnf, &[br, stp], true)
-            .module(ovl, &[], true)
-            .module(dummy, &[], true)
-            .module("kernel/drivers/misc/rk.ko", &[], true)
-            .packaged(
-                "linux-modules-6.8.0-1-generic",
-                &[nf, nfnl, ipt, xt, brnf, br, stp, ovl, dummy],
-            );
-        t
+    /// `modprobe <args…>` as xtables and the container runtimes run it.
+    fn modprobe(args: &[&str]) -> Event {
+        let mut argv = vec!["/sbin/modprobe"];
+        argv.extend_from_slice(args);
+        exec("/sbin/modprobe", "/usr/bin/kmod", &argv)
+    }
+
+    /// `e` as the exec pump read it: `facts`.
+    fn read_as(e: Event, facts: ExecFacts) -> Event {
+        kmod_exec_facts::keep(&e, facts);
+        e
+    }
+
+    /// `e` as the exec pump read it: the system's tool, no
+    /// `MODPROBE_OPTIONS`.
+    fn read_ok(e: Event) -> Event {
+        read_as(
+            e,
+            ExecFacts {
+                program: Ok(()),
+                environment: Ok(()),
+            },
+        )
     }
 
     /// Build a ProcessSpawn with explicit `parent_is_kthread`. The
@@ -347,102 +404,68 @@ mod tests {
         assert!(v.reasoning.contains("argv was not read"), "{}", v.reasoning);
     }
 
-    // ─── Lot 279 — judged on what is loaded ─────────────────────────
+    // ─── Lot 279 — by name, the system's tool, nothing moved ────────
 
     /// Lot 275's lab (W5, Ubuntu 22.04): rootful podman's netfilter
-    /// modprobe was killed. The container runtimes' and xtables' shapes —
-    /// module names of the running kernel's packaged tree — are recorded,
-    /// High, T1547.006, no kill.
+    /// modprobe was killed. The container runtimes', xtables', kube-proxy's
+    /// and an administrator's shapes — module names, the system's tool, a
+    /// clean environment — are recorded, High, T1547.006, no kill; so is a
+    /// query, and a name of no module (nothing is resolved: whatever it
+    /// loads is the kernel's to judge).
     #[test]
-    fn container_runtimes_modprobe_of_packaged_modules_is_recorded_not_killed() {
-        let t = distro_host();
-        let r = rule_on(&t);
-        for e in [
-            // libxtables' xtables_insmod: argv[0] the kernel's modprobe path
-            modprobe(&["ip_tables", "-q"]),
-            // docker / libnetwork
-            modprobe(&["-va", "bridge", "br_netfilter"]),
-            exec(
-                "/usr/sbin/modprobe",
-                "/usr/bin/kmod",
-                &["modprobe", "overlay"],
+    fn modprobe_by_name_is_recorded_not_killed() {
+        let r = rule();
+        for (e, what) in [
+            (modprobe(&["ip_tables"]), "modprobe of 'ip_tables'"),
+            (
+                modprobe(&["-va", "bridge", "br_netfilter"]),
+                "modprobe of 'bridge', 'br_netfilter'",
             ),
-            // kube-proxy
-            exec(
-                "/usr/sbin/modprobe",
-                "/usr/bin/kmod",
-                &["modprobe", "--", "nf_tables"],
+            (
+                exec(
+                    "/usr/sbin/modprobe",
+                    "/usr/bin/kmod",
+                    &["modprobe", "overlay"],
+                ),
+                "modprobe of 'overlay'",
             ),
-            // an administrator's `sudo modprobe dummy` (anti-tamper C16)
-            exec(
-                "/usr/sbin/modprobe",
-                "/usr/bin/kmod",
-                &["modprobe", "dummy"],
+            (modprobe(&["--", "ip_vs"]), "modprobe of 'ip_vs'"),
+            (
+                modprobe(&["-q", "--", "nft-expr-counter"]),
+                "modprobe of 'nft-expr-counter'",
+            ),
+            (modprobe(&["dummy"]), "modprobe of 'dummy'"),
+            (modprobe(&["-r", "dummy"]), "modprobe of 'dummy'"),
+            (
+                modprobe(&["nf_conntrack", "hashsize=1024"]),
+                "with 1 parameter",
+            ),
+            (
+                exec("/usr/bin/kmod", "/usr/bin/kmod", &["kmod", "list"]),
+                "kmod list",
+            ),
+            (
+                exec("/usr/bin/kmod", "/usr/bin/kmod", &["lsmod"]),
+                "kmod run as lsmod",
             ),
         ] {
+            let e = read_ok(e);
             let v = r.evaluate(&e).expect("recorded");
             assert_eq!(v.action, ResponseAction::Log, "{e:?}: {}", v.reasoning);
             assert_eq!(v.severity, Severity::High);
             assert_eq!(v.rule_id, "R011_KernelModuleTooling");
-            assert!(v.reasoning.contains("T1547.006"), "{}", v.reasoning);
-            assert!(
-                v.reasoning.contains("installed by a package"),
-                "{}",
-                v.reasoning
-            );
+            for part in [what, "by module name", "T1547.006", "R018", "parent=bash"] {
+                assert!(v.reasoning.contains(part), "{part}: {}", v.reasoning);
+            }
         }
-        // a query records too
-        let v = r.evaluate(&modprobe(&["-r", "dummy"])).expect("recorded");
-        assert_eq!(v.action, ResponseAction::Log);
-        assert!(v.reasoning.contains("inserts no module"), "{}", v.reasoning);
     }
 
-    /// Lot 279: `modprobe nft-expr-counter` (k3s's probe) on a kernel whose
-    /// nf_tables is built in is a built-in's alias — recorded. On a kernel
-    /// where no index holds it (Ubuntu's 6.8.0-147) kmod answers "not
-    /// found": a plain name of no module loads nothing — recorded too, the
-    /// record saying so (the decision of 04/11); with `-d` beside it,
-    /// killed.
+    /// Lot 279: what the command line names is killed whatever the pump
+    /// read — every malicious shape of deploy/lab/malsim/kmod-check.sh and
+    /// the review of #498's (B-1, B-4).
     #[test]
-    fn a_built_in_s_alias_or_a_plain_name_of_no_module_is_recorded() {
-        let t = distro_host();
-        t.index(
-            "modules.builtin",
-            "kernel/net/netfilter/nf_tables_core.ko\n",
-        )
-        .index(
-            "modules.builtin.modinfo",
-            "nf_tables_core.alias=nft-expr-counter\0",
-        );
-        let r = rule_on(&t);
-        let probe = |args: &[&str]| {
-            let mut argv = vec!["modprobe"];
-            argv.extend_from_slice(args);
-            r.evaluate(&exec("/usr/sbin/modprobe", "/usr/bin/kmod", &argv))
-                .expect("a verdict")
-        };
-        let v = probe(&["nft-expr-counter"]);
-        assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
-        assert!(v.reasoning.contains("inserts no module"), "{}", v.reasoning);
-        let v = probe(&["nft-expr-nothing"]);
-        assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
-        assert_eq!(v.severity, Severity::High);
-        assert!(
-            v.reasoning
-                .contains("nothing to load: the name resolves to no module of this kernel"),
-            "{}",
-            v.reasoning
-        );
-        let v = probe(&["-d", "/tmp/root", "nft-expr-nothing"]);
-        assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
-    }
-
-    /// Lot 279: what is still killed — every malicious shape of
-    /// deploy/lab/malsim/kmod-check.sh.
-    #[test]
-    fn what_no_package_vouches_for_is_still_killed() {
-        let t = distro_host();
-        let r = rule_on(&t);
+    fn what_the_command_line_names_is_killed() {
+        let r = rule();
         for (e, why) in [
             (
                 exec(
@@ -450,22 +473,28 @@ mod tests {
                     "/usr/bin/kmod",
                     &["insmod", "/tmp/rk.ko"],
                 ),
-                "insmod loads the file",
+                "insmod loads the file '/tmp/rk.ko'",
             ),
-            (modprobe(&["/tmp/rk.ko"]), "the file"),
-            (modprobe(&["rk"]), "no package installed it"),
-            (
-                modprobe(&["-S", "9.9.9", "not_a_module"]),
-                "from the caller",
-            ),
-            (modprobe(&["-d", "/tmp/root", "dummy"]), "from the caller"),
-            (modprobe(&["-C", "/tmp/m.conf", "dummy"]), "from the caller"),
-            (modprobe(&["--force", "dummy"]), "force"),
             (
                 exec("/usr/bin/kmod", "/usr/bin/kmod", &["insmod", "/tmp/rk.ko"]),
                 "insmod loads the file",
             ),
+            (modprobe(&["/tmp/rk.ko"]), "names a file"),
+            (modprobe(&["rk.ko"]), "names a file"),
+            (modprobe(&["-S", "9.9.9", "dummy"]), "the kernel version"),
+            (modprobe(&["-d", "/tmp/root", "dummy"]), "names a file"),
+            (modprobe(&["-d", "root", "dummy"]), "the module tree's root"),
+            (modprobe(&["-C", "m.conf", "dummy"]), "its configuration"),
+            (modprobe(&["--force", "dummy"]), "force"),
+            (modprobe(&["--remove-holders", "dummy"]), "as an insertion"),
+            (modprobe(&["dummy", "-r"]), "after the module name"),
+            (modprobe(&["dummy", "-q"]), "after the module name"),
+            (
+                exec("/usr/bin/kmod", "/usr/bin/kmod", &["kmod", "insert", "x"]),
+                "not one that loads nothing",
+            ),
         ] {
+            let e = read_ok(e);
             let v = r.evaluate(&e).expect("fires");
             assert_eq!(
                 v.action,
@@ -475,33 +504,93 @@ mod tests {
             );
             assert_eq!(v.severity, Severity::High);
             assert!(v.reasoning.contains(why), "{why}: {}", v.reasoning);
+            assert!(v.reasoning.contains("killed: "), "{}", v.reasoning);
         }
         // a copy of the tool in a staging directory: its tree
         let v = r
-            .evaluate(&exec(
+            .evaluate(&read_ok(exec(
                 "/tmp/modprobe",
                 "/tmp/modprobe",
                 &["modprobe", "dummy"],
-            ))
+            )))
             .expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcessTree);
-        // the packaged file changed after the package database's last change
-        t.db_changed(std::time::SystemTime::now() - std::time::Duration::from_secs(3600));
+        assert!(v.reasoning.contains("not the system's module tool"));
+    }
+
+    /// Lot 279: what the exec pump read at the exec decides the rest — the
+    /// program not the system's tool's file, `MODPROBE_OPTIONS` in the
+    /// environment or an environment not read, or no reading at all (a
+    /// replay): killed, the pump's reason said.
+    #[test]
+    fn what_the_exec_pump_read_is_judged() {
+        let r = rule();
         let v = r.evaluate(&modprobe(&["dummy"])).expect("fires");
-        assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
+        assert_eq!(v.action, ResponseAction::KillProcess);
         assert!(
-            v.reasoning.contains("after the package database"),
+            v.reasoning.contains("the exec pump did not read"),
             "{}",
             v.reasoning
         );
+        for (facts, why) in [
+            (
+                ExecFacts {
+                    program: Err("its device and inode are not the system's tool's".into()),
+                    environment: Ok(()),
+                },
+                "not the system's tool's",
+            ),
+            (
+                ExecFacts {
+                    program: Ok(()),
+                    environment: Err("MODPROBE_OPTIONS='-d /tmp/x' in its environment".into()),
+                },
+                "MODPROBE_OPTIONS='-d /tmp/x'",
+            ),
+            (
+                ExecFacts {
+                    program: Ok(()),
+                    environment: Err("it had exited before its environment was read".into()),
+                },
+                "before its environment was read",
+            ),
+        ] {
+            let v = r
+                .evaluate(&read_as(modprobe(&["dummy"]), facts))
+                .expect("fires");
+            assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
+            assert!(v.reasoning.contains(why), "{why}: {}", v.reasoning);
+        }
+    }
+
+    /// Lot 279: an argv the kernel did not read whole, or a program of a
+    /// filesystem the host's mount table does not show, is killed whatever
+    /// the pump read.
+    #[test]
+    fn a_cut_argv_or_another_namespace_s_program_is_killed() {
+        let mut cut = modprobe(&["dummy"]);
+        if let Event::ProcessSpawn { argv_truncated, .. } = &mut cut {
+            *argv_truncated = true;
+        }
+        let mut other_ns = modprobe(&["dummy"]);
+        if let Event::ProcessSpawn { exe, .. } = &mut other_ns {
+            exe.root = (8, 2);
+        }
+        for (e, why) in [
+            (cut, "its argv was cut at 511 bytes"),
+            (other_ns, "another mount namespace"),
+        ] {
+            let v = rule().evaluate(&read_ok(e)).expect("fires");
+            assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
+            assert!(v.reasoning.contains(why), "{why}: {}", v.reasoning);
+        }
     }
 
     /// Lot 279: the kernel-thread exemption and the allowlist come first,
-    /// as before; a forged kworker parent of an unvouched load is killed.
+    /// as before; a forged kworker parent is killed.
     #[test]
-    fn the_exemptions_come_before_what_is_loaded() {
-        let t = distro_host();
-        let mut e = modprobe(&["rk"]);
+    fn the_exemptions_come_before_the_judgement() {
+        let mut e = modprobe(&["/tmp/rk.ko"]);
         if let Event::ProcessSpawn {
             parent_comm,
             parent_is_kthread,
@@ -511,14 +600,14 @@ mod tests {
             *parent_comm = "kworker/u8:3".to_string();
             *parent_is_kthread = true;
         }
-        assert!(rule_on(&t).evaluate(&e).is_none());
+        assert!(rule().evaluate(&e).is_none());
         if let Event::ProcessSpawn {
             parent_is_kthread, ..
         } = &mut e
         {
             *parent_is_kthread = false;
         }
-        let v = rule_on(&t).evaluate(&e).expect("fires");
+        let v = rule().evaluate(&e).expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcess);
     }
 
@@ -540,10 +629,9 @@ mod tests {
 
     #[test]
     fn allowlisted_comm_is_exempt() {
-        let r = R011KernelModuleTooling::with_requests(
-            Arc::new(CommAllowlist::from_iter_owned(["modprobe".to_string()])),
-            ModuleRequests::new("/nonexistent-root"),
-        );
+        let r = R011KernelModuleTooling::new(Arc::new(CommAllowlist::from_iter_owned([
+            "modprobe".to_string(),
+        ])));
         assert!(r
             .evaluate(&spawn("modprobe", "/usr/sbin/modprobe"))
             .is_none());
@@ -629,10 +717,9 @@ mod tests {
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .map(String::from);
-        R011KernelModuleTooling::with_requests(
-            Arc::new(CommAllowlist::from_iter_owned(entries).with_identity(tracker)),
-            ModuleRequests::new("/nonexistent-root"),
-        )
+        R011KernelModuleTooling::new(Arc::new(
+            CommAllowlist::from_iter_owned(entries).with_identity(tracker),
+        ))
     }
 
     fn argv(a: &[&str]) -> Vec<String> {
@@ -781,10 +868,9 @@ mod tests {
     fn a_target_entry_still_exempts() {
         let dir = tempfile::tempdir().unwrap();
         let t = crate::posture::lineage::AuthSessionTracker::<H>::new(dir.path());
-        let r = R011KernelModuleTooling::with_requests(
-            Arc::new(CommAllowlist::from_iter_owned(["modprobe".to_string()]).with_identity(t)),
-            ModuleRequests::new("/nonexistent-root"),
-        );
+        let r = R011KernelModuleTooling::new(Arc::new(
+            CommAllowlist::from_iter_owned(["modprobe".to_string()]).with_identity(t),
+        ));
         let e = crate::decision::rules::testutil::spawn_exe(
             "modprobe",
             "/usr/sbin/modprobe",

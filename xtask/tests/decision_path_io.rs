@@ -219,21 +219,6 @@ const KNOWN: &[(&str, usize, &str)] = &[
          only for a file no pump asked about (the replay, the tests)",
     ),
     (
-        "crates/nn-core/src/decision/host.rs",
-        1,
-        "lot 279: `DecisionHost::inode_changed` names `std::fs::Metadata` in its signature — a \
-         type, no I/O (its caller stat'ed the file: module_request's, on the exec pump)",
-    ),
-    (
-        "crates/nn-core/src/decision/rules/module_request.rs",
-        16,
-        "lot 279: what a module tool's exec loads — the module tree's indexes, the \
-         configuration, the files' owners, times, real paths and signature marker — assessed by the exec \
-         pump on its thread (`ModuleRequests::refresh`); R011 reads its answer, and assesses \
-         itself, off the runtime's worker, only an exec no pump asked about (the replay, the \
-         tests)",
-    ),
-    (
         "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs",
         1,
         "R004 matches a `/proc/self/fd` path in the exec's string, no read",
@@ -606,12 +591,14 @@ fn the_rules_fail_on_planted_violations() {
         .any(|m| m.contains("lineage.rs") && m.contains("lower the pin")));
 }
 
-/// Lot 279: the exec pump assesses what a module tool's exec loads (its
-/// module tree, configuration and package database read on the pump's
-/// thread), so R011 judges on that answer: the process_spawn pump's step
-/// is `spawn_assessed`, which calls `refresh` after the path's resolution.
+/// Lot 279: the exec pump reads what R011 judges an exec of a module tool
+/// on beside its command line — the executed file's device and inode
+/// against the system's tool, `MODPROBE_OPTIONS` in its environment — on its
+/// own thread, first, while the process may still run: the process_spawn
+/// pump's step is `kmod_read_then_resolved`, which reads and keeps the
+/// facts before it resolves the path. The decision reads no `/proc`.
 #[test]
-fn the_exec_pump_assesses_what_a_module_tool_loads() {
+fn the_exec_pump_reads_a_module_tool_s_exec() {
     let mux = strip_comments(
         &std::fs::read_to_string(repo_root().join("crates/nn-linux/src/sensors/multiplexer.rs"))
             .unwrap(),
@@ -621,17 +608,27 @@ fn the_exec_pump_assesses_what_a_module_tool_loads() {
         .expect("the process_spawn pump")..];
     let pump = &pump[..pump.find(")?),").expect("its end")];
     assert!(
-        pump.contains("spawn_assessed(ModuleRequests::default())"),
-        "the process_spawn pump does not assess module tools' execs: {pump}"
+        pump.contains("kmod_read_then_resolved,"),
+        "the process_spawn pump does not read module tools' execs: {pump}"
     );
-    let step = &mux[mux.find("fn spawn_assessed(").expect("spawn_assessed")..];
+    let step = &mux[mux
+        .find("fn kmod_read_then_resolved(")
+        .expect("kmod_read_then_resolved")..];
     let step = &step[..step.find("\n}\n").expect("its end")];
-    let resolve = step
-        .find("resolved(raw, e)")
-        .expect("the path resolved first");
-    let refresh = step.find("requests.refresh(&e)").expect("then assessed");
-    assert!(
-        resolve < refresh,
-        "assessed before its path was resolved: {step}"
+    let read = step
+        .find("kmod_exec::read_and_keep(&e)")
+        .expect("the exec read and its facts kept");
+    let resolve = step.find("resolved(raw, e)").expect("then resolved");
+    assert!(read < resolve, "read after its path was resolved: {step}");
+    // the core keeps the facts; it reads nothing itself
+    let core = strip_comments(
+        &std::fs::read_to_string(
+            repo_root().join("crates/nn-core/src/decision/rules/kmod_exec_facts.rs"),
+        )
+        .unwrap(),
     );
+    let core = production(&core);
+    for m in MARKERS {
+        assert!(!core.contains(m), "kmod_exec_facts.rs holds {m}");
+    }
 }

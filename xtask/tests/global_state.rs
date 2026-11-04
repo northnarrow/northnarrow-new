@@ -395,12 +395,13 @@ const STATICS: &[Kept] = &[
          database; bounded, asked again at every load)",
     ),
     kept(
-        "crates/nn-core/src/decision/rules/module_request.rs",
-        "REQUESTS",
+        "crates/nn-core/src/decision/rules/kmod_exec_facts.rs",
+        "KEPT",
         HostFact,
-        "lot 279: what each exec of a kernel-module tool the exec pump read loads (its module \
-         names resolved in the running kernel's tree, their owners and times), which R011 judges \
-         the exec on (one host, one module tree; keyed by exec, bounded)",
+        "lot 279: what the exec pump read of each exec of a kernel-module tool at the exec (the \
+         executed file's device and inode against the system's tool, MODPROBE_OPTIONS in its \
+         environment), which R011 judges the exec on (one host; keyed by exec, bounded, the \
+         oldest out first)",
     ),
     kept(
         "crates/nn-linux/src/sensors/exe_identity.rs",

@@ -1,6 +1,7 @@
 #!/bin/bash
-# Lot 279 (R011 judged on what a module tool's exec loads) — the benign
-# corpus and the malicious shapes, measured on a lab guest
+# Lot 279 (R011 judged on a module tool's command line and on what the exec
+# pump read at the exec: the program's device and inode, MODPROBE_OPTIONS) —
+# the benign corpus and the malicious shapes, measured on a lab guest
 # (`deploy/lab/nn-lab.sh ssh 'cd ~/northnarrow && bash deploy/lab/malsim/kmod-check.sh'`).
 # Run as the lab user with sudo, the agent installed and running with its
 # defaults (it acts: a kill is a kill).
@@ -8,9 +9,9 @@
 # For each workload: its exit status, the R011 records its execs drew
 # (recorded / killed, as the primary rule or among `matches`) and R018's
 # (the loads), over the detections written while it ran; the agent's
-# journal lines of R011's verdicts (which tool, which modules, why).
+# journal lines of R011's verdicts (which tool, which names, why).
 #
-# Benign (lot 279: no R011 kill expected):
+# Benign (lot 279: no R011 kill expected — the system's tool by module name):
 #   B1 iptables-legacy  `iptables-legacy -L` with ip_tables not loaded (libxtables' modprobe)
 #   B2 podman           rootful: a container with a published port on the default
 #                       network, then on a network created for it; rootless: a
@@ -23,16 +24,19 @@
 #   B7 admin            `sudo modprobe dummy`, `sudo modprobe -r dummy`
 #   B8 queries          modprobe -n / -D / -c / -R, kmod list, kmod static-nodes
 #   B9 no such module   modprobe of a plain name no module of this kernel has (as k3s
-#                       and kube-proxy probe): nothing to load, recorded (04/11)
+#                       and kube-proxy probe): recorded, by name
 # Malicious (R011 kills each; no file exists to load, so nothing reaches the
 # kernel — the shapes that load are the privileged tests'
 # `r011_records_a_packaged_modprobe_and_kills_an_insmod_from_tmp` and
-# `r011_kills_a_module_copied_into_the_tree_and_r018_catches_what_argv_hides`,
-# under a detect-only agent):
+# `r011_records_a_name_and_kills_a_moved_tree_or_modprobe_options`, under a
+# detect-only agent):
 #   M1 insmod of a /tmp .ko          M2 modprobe of a /tmp .ko path
 #   M3 modprobe -S <a version of the caller's> of a name no tree resolves
 #   M4 modprobe -d <a /tmp tree>      M5 modprobe -C <a /tmp configuration>
 #   M6 a copy of the system's modprobe run from /tmp (a dry run)
+#   M7 modprobe --remove-holders (kmod 29..34 run it as an insertion)
+#   M8 MODPROBE_OPTIONS="-d <a /tmp tree>" in the environment, modprobe dummy
+#   M9 an option after the module name (modprobe <name> -q)
 #
 #   bash deploy/lab/malsim/kmod-check.sh [--only B1,M3] [--out FILE]
 #        [--with-podman] [--with-docker] [--with-k3s] [--with-zfs] [--with-wg]
@@ -50,7 +54,7 @@ while [[ $# -gt 0 ]]; do
         --only) ONLY=${2:-}; shift 2 ;;
         --out) OUT=${2:-}; shift 2 ;;
         --with-podman|--with-docker|--with-k3s|--with-zfs|--with-wg) WITH+="${1#--with-} "; shift ;;
-        -h|--help) sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "kmod-check: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -280,6 +284,9 @@ if want M6; then
     cp "$(readlink -f "$(command -v modprobe)")" "$WORK/modprobe"
     measure M6 kill "a copy of modprobe in /tmp (modprobe -n dummy)" -- sudo "$WORK/modprobe" -n dummy
 fi
+if want M7; then measure M7 kill "modprobe --remove-holders nn_k279_no_such_module" -- sudo modprobe --remove-holders nn_k279_no_such_module; fi
+if want M8; then measure M8 kill "MODPROBE_OPTIONS='-d /tmp/…' modprobe dummy" -- sudo env MODPROBE_OPTIONS="-d $M/root" modprobe dummy; fi
+if want M9; then measure M9 kill "modprobe nn_k279_no_such_module -q (option after the name)" -- sudo modprobe nn_k279_no_such_module -q; fi
 
 echo "== R011 kills over the run: $r011_kills"
 if [[ -n $OUT ]]; then

@@ -106,12 +106,6 @@ pub trait DecisionHost: PostureAgent + ContentHost {
     /// Wake every current waiter of `notify` (the agent:
     /// `Notify::notify_waiters`).
     fn notify_flow_waiters(notify: &Self::FlowNotify);
-
-    /// Lot 279: when the inode of the file `meta` describes last changed
-    /// (its `ctime`, which no caller sets: `utimensat` sets the mtime) —
-    /// R011's age of a module file (the agent: `MetadataExt::ctime`);
-    /// `None` where the host keeps none.
-    fn inode_changed(meta: &std::fs::Metadata) -> Option<std::time::SystemTime>;
 }
 
 /// The engine's own tests: the posture's portable test host
@@ -212,11 +206,5 @@ mod testing {
         type FlowNotify = ();
 
         fn notify_flow_waiters(_notify: &()) {}
-
-        /// No inode time on the portable test host: the content's
-        /// (`mtime`) alone (the ctime is the Linux host's, tested there).
-        fn inode_changed(_meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
-            None
-        }
     }
 }

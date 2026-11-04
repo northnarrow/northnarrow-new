@@ -1,7 +1,11 @@
-//! Lot 279: what an exec of a kernel-module tool asks the tool to do, read
-//! from its command line as the tool reads it (kmod 29..=34: `tools/kmod.c`,
-//! `tools/modprobe.c`, `tools/insmod.c`). No I/O: the names it asks for are
-//! resolved against the module tree by [`super::module_request`].
+//! Lot 279: what an exec of a kernel-module tool asks for, judged on its
+//! command line's SYNTAX alone (kmod 29..=34: `tools/kmod.c`,
+//! `tools/modprobe.c`, `tools/insmod.c`). No I/O and no resolution: R011
+//! does not emulate kmod's lookup (`modprobe.d`, the indexes, the files'
+//! owners and times — the coordinator's decision of 04/11, after the
+//! independent review of #498 found that emulation incomplete in ways that
+//! read loads as "nothing to load"). What the tool's environment and
+//! program are is the exec pump's to read ([`super::kmod_exec_facts`]).
 //!
 //! - **kmod is a multi-call binary**: `insmod`, `modprobe`, `lsmod`, `rmmod`,
 //!   `modinfo` and `depmod` are links to `/usr/bin/kmod`, which runs as the
@@ -10,19 +14,36 @@
 //!   insmod whose `comm` is `kmod`. As `kmod` it runs the subcommand
 //!   `argv[1]` (`help`, `list`, `static-nodes`; `insert`/`remove` in an
 //!   experimental build).
-//! - **modprobe** parses its options with `getopt_long` (GNU: options are
-//!   taken anywhere before `--`, long names by any unambiguous prefix). The
-//!   first operand is the module, the rest its parameters; with `-a` every
-//!   operand is a module.
-//! - **insmod** loads the FILE its first operand names (a path, relative to
-//!   the working directory when it has no `/`).
-//!
-//! What the caller chose is all here: the tool acts on the same `argv`
-//! (the sensor reads it from the new image's argument area at the exec,
-//! before the program runs). What the tool also reads and this does not see
-//! is its environment (`MODPROBE_OPTIONS`, options added in front of these)
-//! and its configuration files; [`super::module_request`] says why a load
-//! they redirect is still judged (R018, on the file the kernel reads).
+//! - **Killed, on the command line alone** (as R011 killed every exec
+//!   before lot 279):
+//!   - `insmod`, whatever its arguments: it loads the FILE it is given;
+//!   - a `modprobe` argument holding a `/`, or ending in `.ko`, `.ko.xz`,
+//!     `.ko.zst` or `.ko.gz`: a file, not a module of the system's tree;
+//!   - the options that take the module tree, the configuration or the
+//!     kernel version from the caller (`-d`/`--dirname`, `-C`/`--config`,
+//!     `-S`/`--set-version`), that force the load past the kernel's checks
+//!     (`-f`, `--force`, `--force-modversion`, `--force-vermagic`), `-o`
+//!     (module-init-tools' rename of the module; kmod refuses it), and
+//!     `--remove-holders` / `--remove-dependencies`, which kmod 29..=34 run
+//!     as an INSERTION (they do not set the removal: the review of #498,
+//!     B-1) — each also by any abbreviation `getopt_long` accepts;
+//!   - an option the tool itself refuses (unknown, ambiguous, its argument
+//!     missing), as before;
+//!   - ANY argument starting with `-` after the first module name.
+//!     `getopt_long` permutes, but `POSIXLY_CORRECT` in the environment
+//!     stops it and `MODPROBE_OPTIONS='--'` ends the options: whether such
+//!     an argument is an option or a module parameter is the environment's
+//!     to say (the review's B-4), so it is not read either way;
+//!   - a module name starting with `-` (after `--`);
+//!   - a `kmod` command other than those that load nothing.
+//! - **Recorded**: `modprobe` of plain module names with, before the first
+//!   name, only options that neither move nor force anything (`-a`, `-r`,
+//!   `-n`, `-q`, `-v`, `-s`, `-i`, `-b`, `-w`, `-R`, `-D`, `-c`,
+//!   `--first-time`, `--show-*`, `-V`, `-h`, `--`); `kmod help`, `list`,
+//!   `static-nodes` and the version; kmod run as `lsmod`, `rmmod`, `modinfo`
+//!   or `depmod` (they insert nothing). Whether the names load anything,
+//!   and what, is the kernel's to judge at the load (R018 records it; the
+//!   module signature policy refuses what it does not trust).
 
 /// The tool an exec runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,17 +57,14 @@ pub enum Tool {
     Other(&'static str),
 }
 
-/// What an invocation asks for.
+/// What R011 makes of an invocation's command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Invocation {
-    /// It loads no module: a query, a removal, a dry run, a usage error.
-    LoadsNothing(String),
-    /// `modprobe` of these module names (or aliases), in order.
-    Modules(Vec<String>),
-    /// It cannot be vouched for without resolving anything: a file to
-    /// load, an option that moves the module tree or forces the load, an
-    /// argument the tool would not parse as this does.
-    Refused(String),
+pub enum Syntax {
+    /// Module names only, nothing moved or forced, or a command that
+    /// inserts nothing: recorded (what it asks for).
+    Record(String),
+    /// Killed (why).
+    Kill(String),
 }
 
 /// The kmod modes `argv[0]` selects (`kmod_compat_cmds`).
@@ -67,11 +85,12 @@ fn basename(path: &str) -> &str {
 ///
 /// The tool must be a file of the system's binary directories named `kmod`,
 /// `modprobe` or `insmod` (a copy elsewhere is the payload, a program of
-/// another name is no module tool). For `kmod` the mode is `argv[0]`'s
-/// basename. A `modprobe` or `insmod` file is a link to kmod on every
-/// distribution this runs on — a hard link shows its own name, not kmod's —
-/// or a tool of that one name: `argv[0]` must name it too, so both readings
-/// agree.
+/// another name is no module tool; that it is the system's FILE is the exec
+/// pump's check, [`super::kmod_exec_facts`]). For `kmod` the mode is
+/// `argv[0]`'s basename. A `modprobe` or `insmod` file is a link to kmod on
+/// every distribution this runs on — a hard link shows its own name, not
+/// kmod's — or a tool of that one name: `argv[0]` must name it too, so both
+/// readings agree.
 pub fn tool_of(image: &str, argv: &[String]) -> Result<Tool, String> {
     let in_tool_dir = TOOL_DIRS.iter().any(|d| {
         image
@@ -113,309 +132,238 @@ pub fn tool_of(image: &str, argv: &[String]) -> Result<Tool, String> {
     })
 }
 
-/// What `tool` run with `argv` (`argv[0]` first) asks for.
-pub fn parse(tool: Tool, argv: &[String]) -> Invocation {
+/// What R011 makes of `tool` run with `argv` (`argv[0]` first).
+pub fn judge(tool: Tool, argv: &[String]) -> Syntax {
     let args = argv.get(1..).unwrap_or_default();
     match tool {
         Tool::Modprobe => modprobe(args),
-        Tool::Insmod => insmod(args),
+        Tool::Insmod => Syntax::Kill(match args.iter().find(|a| !a.starts_with('-')) {
+            Some(file) => {
+                format!("insmod loads the file '{file}' as given, which no module tree resolves")
+            }
+            None => "insmod loads the file it is given, which no module tree resolves".to_string(),
+        }),
         Tool::Kmod => kmod(args),
-        Tool::Other(mode) => Invocation::LoadsNothing(format!("kmod run as {mode}")),
+        Tool::Other(mode) => Syntax::Record(format!("kmod run as {mode}, which inserts nothing")),
     }
 }
 
-/// What one of modprobe's options does to the load.
+/// What one of modprobe's options is to R011.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Effect {
-    /// Every operand is a module (`-a`).
+enum Opt {
+    /// Every operand is a module name (`-a`).
     All,
-    /// Nothing is inserted (a removal, a query, a dry run, the version or
-    /// the help).
-    NoLoad(&'static str),
-    /// The module tree, the configuration or the kernel version the names
-    /// are resolved against is the caller's (`-C`, `-d`, `-S`).
-    Moves(&'static str),
-    /// The kernel's version checks are skipped (`-f` and its long forms).
-    Forces,
-    /// Changes nothing this judges (`-q`, `-v`, `-s`, `-b`, `-i`,
-    /// `--first-time`, `-w` of a removal).
-    Neutral,
+    /// Moves nothing and forces nothing.
+    Plain,
+    /// Killed (why).
+    Kill(&'static str),
 }
+
+const CONFIG: &str = "told to take its configuration from the caller (-C/--config)";
+const DIRNAME: &str = "told to take the module tree's root from the caller (-d/--dirname)";
+const SET_VERSION: &str = "told to take the kernel version from the caller (-S/--set-version)";
+const FORCE: &str = "told to force the load past the kernel's version checks (-f/--force*)";
+const RENAME: &str = "told to rename the module (-o, module-init-tools'; kmod refuses it)";
+const HOLDERS: &str = "given --remove-holders/--remove-dependencies, which kmod 29..34 run as \
+                       an insertion (they do not set the removal)";
 
 /// modprobe's long options (kmod 29..=34), with whether each takes an
 /// argument.
-const MODPROBE_LONG: &[(&str, bool, Effect)] = &[
-    ("all", false, Effect::All),
-    ("remove", false, Effect::NoLoad("a removal")),
-    ("remove-dependencies", false, Effect::NoLoad("a removal")),
-    ("remove-holders", false, Effect::NoLoad("a removal")),
-    ("wait", true, Effect::Neutral),
-    (
-        "resolve-alias",
-        false,
-        Effect::NoLoad("an alias resolved and printed"),
-    ),
-    ("first-time", false, Effect::Neutral),
-    ("ignore-install", false, Effect::Neutral),
-    ("ignore-remove", false, Effect::Neutral),
-    ("use-blacklist", false, Effect::Neutral),
-    ("force", false, Effect::Forces),
-    ("force-modversion", false, Effect::Forces),
-    ("force-vermagic", false, Effect::Forces),
-    (
-        "show-depends",
-        false,
-        Effect::NoLoad("the dependencies printed"),
-    ),
-    (
-        "showconfig",
-        false,
-        Effect::NoLoad("the configuration printed"),
-    ),
-    (
-        "show-config",
-        false,
-        Effect::NoLoad("the configuration printed"),
-    ),
-    (
-        "show-modversions",
-        false,
-        Effect::NoLoad("a module's versions printed"),
-    ),
-    (
-        "dump-modversions",
-        false,
-        Effect::NoLoad("a module's versions printed"),
-    ),
-    (
-        "show-exports",
-        false,
-        Effect::NoLoad("a module's exports printed"),
-    ),
-    ("dry-run", false, Effect::NoLoad("a dry run")),
-    ("show", false, Effect::NoLoad("a dry run")),
-    ("config", true, Effect::Moves("its configuration")),
-    ("dirname", true, Effect::Moves("the module tree's root")),
-    ("set-version", true, Effect::Moves("the kernel version")),
-    ("syslog", false, Effect::Neutral),
-    ("quiet", false, Effect::Neutral),
-    ("verbose", false, Effect::Neutral),
-    ("version", false, Effect::NoLoad("the version printed")),
-    ("help", false, Effect::NoLoad("the help printed")),
+const MODPROBE_LONG: &[(&str, bool, Opt)] = &[
+    ("all", false, Opt::All),
+    ("remove", false, Opt::Plain),
+    ("remove-dependencies", false, Opt::Kill(HOLDERS)),
+    ("remove-holders", false, Opt::Kill(HOLDERS)),
+    ("wait", true, Opt::Plain),
+    ("resolve-alias", false, Opt::Plain),
+    ("first-time", false, Opt::Plain),
+    ("ignore-install", false, Opt::Plain),
+    ("ignore-remove", false, Opt::Plain),
+    ("use-blacklist", false, Opt::Plain),
+    ("force", false, Opt::Kill(FORCE)),
+    ("force-modversion", false, Opt::Kill(FORCE)),
+    ("force-vermagic", false, Opt::Kill(FORCE)),
+    ("show-depends", false, Opt::Plain),
+    ("showconfig", false, Opt::Plain),
+    ("show-config", false, Opt::Plain),
+    ("show-modversions", false, Opt::Plain),
+    ("dump-modversions", false, Opt::Plain),
+    ("show-exports", false, Opt::Plain),
+    ("dry-run", false, Opt::Plain),
+    ("show", false, Opt::Plain),
+    ("config", true, Opt::Kill(CONFIG)),
+    ("dirname", true, Opt::Kill(DIRNAME)),
+    ("set-version", true, Opt::Kill(SET_VERSION)),
+    ("syslog", false, Opt::Plain),
+    ("quiet", false, Opt::Plain),
+    ("verbose", false, Opt::Plain),
+    ("version", false, Opt::Plain),
+    ("help", false, Opt::Plain),
 ];
 
-/// modprobe's short option `c`: whether it takes an argument, what it does.
-fn modprobe_short(c: char) -> Option<(bool, Effect)> {
+/// modprobe's short option `c`: whether it takes an argument, what it is.
+fn modprobe_short(c: char) -> Option<(bool, Opt)> {
     Some(match c {
-        'a' => (false, Effect::All),
-        'r' => (false, Effect::NoLoad("a removal")),
-        'w' => (true, Effect::Neutral),
-        'R' => (false, Effect::NoLoad("an alias resolved and printed")),
-        'i' | 'b' | 's' | 'q' | 'v' => (false, Effect::Neutral),
-        'f' => (false, Effect::Forces),
-        'D' => (false, Effect::NoLoad("the dependencies printed")),
-        'c' => (false, Effect::NoLoad("the configuration printed")),
-        'n' => (false, Effect::NoLoad("a dry run")),
-        'C' => (true, Effect::Moves("its configuration")),
-        'd' => (true, Effect::Moves("the module tree's root")),
-        'S' => (true, Effect::Moves("the kernel version")),
-        'V' => (false, Effect::NoLoad("the version printed")),
-        'h' => (false, Effect::NoLoad("the help printed")),
+        'a' => (false, Opt::All),
+        'w' => (true, Opt::Plain),
+        'r' | 'R' | 'i' | 'b' | 's' | 'q' | 'v' | 'D' | 'c' | 'n' | 'V' | 'h' => {
+            (false, Opt::Plain)
+        }
+        'f' => (false, Opt::Kill(FORCE)),
+        'C' => (true, Opt::Kill(CONFIG)),
+        'd' => (true, Opt::Kill(DIRNAME)),
+        'S' => (true, Opt::Kill(SET_VERSION)),
+        'o' => (true, Opt::Kill(RENAME)),
         _ => return None,
     })
 }
 
-/// A long option as `getopt_long` matches it: the exact name, else the one
-/// option the prefix names (several names of the same meaning are one).
-fn long_option(
-    table: &'static [(&'static str, bool, Effect)],
-    name: &str,
-) -> Result<(bool, Effect), String> {
-    if let Some((_, arg, e)) = table.iter().find(|(n, _, _)| *n == name) {
-        return Ok((*arg, *e));
+/// A long option as `getopt_long` matches it: the exact name, else the
+/// option every name the prefix starts is (several names of one meaning
+/// are one; names of different meanings are ambiguous, which the tool
+/// refuses).
+fn long_option(name: &str) -> Result<(bool, Opt), String> {
+    if let Some((_, arg, o)) = MODPROBE_LONG.iter().find(|(n, _, _)| *n == name) {
+        return Ok((*arg, *o));
     }
-    let mut found: Option<(bool, Effect)> = None;
-    for (n, arg, e) in table {
+    let mut found: Option<(bool, Opt)> = None;
+    for (n, arg, o) in MODPROBE_LONG {
         if n.starts_with(name) {
             match found {
-                Some(f) if f != (*arg, *e) => {
+                Some(f) if f != (*arg, *o) => {
                     return Err(format!("--{name} is ambiguous (the tool refuses it)"));
                 }
-                _ => found = Some((*arg, *e)),
+                _ => found = Some((*arg, *o)),
             }
         }
     }
     found.ok_or_else(|| format!("--{name} is no option of the tool (it refuses it)"))
 }
 
-/// The options' effects (each with its argument, or empty) and the
-/// operands, in order.
-type Parsed = (Vec<(Effect, String)>, Vec<String>);
+/// `true` when `arg` names a file rather than a module: a path, or a
+/// module image's name.
+fn names_a_file(arg: &str) -> bool {
+    arg.contains('/')
+        || [".ko", ".ko.xz", ".ko.zst", ".ko.gz"]
+            .iter()
+            .any(|s| arg.ends_with(s))
+}
 
-/// The options and operands of `args` as `getopt_long` permutes them: the
-/// effects in order, the operands in order. `Err` for what the tool itself
-/// refuses (an unknown or ambiguous option, a missing argument).
-fn getopt(
-    args: &[String],
-    short: impl Fn(char) -> Option<(bool, Effect)>,
-    long: &'static [(&'static str, bool, Effect)],
-) -> Result<Parsed, String> {
-    let mut effects = Vec::new();
-    let mut operands = Vec::new();
+fn modprobe(args: &[String]) -> Syntax {
+    let kill = |why: String| Syntax::Kill(format!("modprobe {why}"));
+    if let Some(f) = args.iter().find(|a| names_a_file(a)) {
+        return kill(format!(
+            "given '{f}', which names a file, not a module of the system's tree"
+        ));
+    }
+    let mut all = false;
+    let mut names: Vec<&str> = Vec::new();
+    let mut parameters = 0usize;
+    let mut options_ended = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--" {
-            operands.extend(it.by_ref().cloned());
-            break;
-        }
-        if let Some(body) = a.strip_prefix("--") {
-            let (name, inline) = match body.split_once('=') {
-                Some((n, v)) => (n, Some(v)),
-                None => (body, None),
-            };
-            let (takes, e) = long_option(long, name)?;
-            let value = match (takes, inline) {
-                (true, Some(v)) => v.to_string(),
-                (true, None) => it
-                    .next()
-                    .cloned()
-                    .ok_or_else(|| format!("--{name} has no argument (the tool refuses it)"))?,
-                (false, Some(_)) => {
-                    return Err(format!("--{name} takes no argument (the tool refuses it)"))
-                }
-                (false, None) => String::new(),
-            };
-            effects.push((e, value));
-            continue;
-        }
-        if a.len() > 1 && a.starts_with('-') {
-            for (i, c) in a[1..].char_indices() {
-                let (takes, e) = short(c)
-                    .ok_or_else(|| format!("-{c} is no option of the tool (it refuses it)"))?;
-                if takes {
-                    let rest = &a[1 + i + c.len_utf8()..];
-                    let value = if rest.is_empty() {
-                        it.next()
-                            .cloned()
-                            .ok_or_else(|| format!("-{c} has no argument (the tool refuses it)"))?
-                    } else {
-                        rest.to_string()
-                    };
-                    effects.push((e, value));
-                    break;
-                }
-                effects.push((e, String::new()));
+        if let Some(first) = names.first() {
+            if a.starts_with('-') {
+                return kill(format!(
+                    "given '{a}' after the module name '{first}': whether it is an option or a \
+                     module parameter is the environment's to say (POSIXLY_CORRECT, \
+                     MODPROBE_OPTIONS='--')"
+                ));
+            }
+            if all {
+                names.push(a);
+            } else {
+                parameters += 1;
             }
             continue;
         }
-        operands.push(a.clone());
+        if !options_ended && a == "--" {
+            options_ended = true;
+            continue;
+        }
+        if !options_ended {
+            if let Some(body) = a.strip_prefix("--") {
+                let (name, inline) = match body.split_once('=') {
+                    Some((n, v)) => (n, Some(v)),
+                    None => (body, None),
+                };
+                let (takes, opt) = match long_option(name) {
+                    Ok(o) => o,
+                    Err(why) => return kill(why),
+                };
+                if let Opt::Kill(why) = opt {
+                    return kill(format!("{why}: '{a}'"));
+                }
+                match (takes, inline) {
+                    (true, None) if it.next().is_none() => {
+                        return kill(format!("--{name} has no argument (the tool refuses it)"))
+                    }
+                    (false, Some(_)) => {
+                        return kill(format!("--{name} takes no argument (the tool refuses it)"))
+                    }
+                    _ => {}
+                }
+                all |= opt == Opt::All;
+                continue;
+            }
+            if a.len() > 1 && a.starts_with('-') {
+                for (i, c) in a[1..].char_indices() {
+                    let Some((takes, opt)) = modprobe_short(c) else {
+                        return kill(format!("-{c} is no option of the tool (it refuses it)"));
+                    };
+                    if let Opt::Kill(why) = opt {
+                        return kill(format!("{why}: '{a}'"));
+                    }
+                    all |= opt == Opt::All;
+                    if takes {
+                        // its argument: the rest of the word, or the next one
+                        if a[1 + i + c.len_utf8()..].is_empty() && it.next().is_none() {
+                            return kill(format!("-{c} has no argument (the tool refuses it)"));
+                        }
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        if a.starts_with('-') {
+            return kill(format!(
+                "given the module name '{a}', which starts with '-'"
+            ));
+        }
+        names.push(a);
     }
-    Ok((effects, operands))
-}
-
-/// `true` when `operand` names a file rather than a module: a path, or a
-/// module image's name.
-fn names_a_file(operand: &str) -> bool {
-    operand.contains('/')
-        || [".ko", ".ko.xz", ".ko.zst", ".ko.gz"]
-            .iter()
-            .any(|s| operand.ends_with(s))
-}
-
-fn modprobe(args: &[String]) -> Invocation {
-    let (effects, operands) = match getopt(args, modprobe_short, MODPROBE_LONG) {
-        Ok(p) => p,
-        Err(why) => return Invocation::Refused(format!("modprobe {why}")),
-    };
-    // Nothing is inserted whatever tree or configuration it reads.
-    if let Some((Effect::NoLoad(what), _)) =
-        effects.iter().find(|(e, _)| matches!(e, Effect::NoLoad(_)))
-    {
-        return Invocation::LoadsNothing(format!("modprobe: {what}"));
-    }
-    if let Some((Effect::Moves(what), value)) =
-        effects.iter().find(|(e, _)| matches!(e, Effect::Moves(_)))
-    {
-        return Invocation::Refused(format!(
-            "modprobe told to take {what} from the caller ('{value}'): the module it loads is \
-             not the one the system's tree names"
-        ));
-    }
-    if effects.iter().any(|(e, _)| *e == Effect::Forces) {
-        return Invocation::Refused(
-            "modprobe told to force the load past the kernel's version checks, which no \
-             module of the running kernel's tree needs"
-                .to_string(),
-        );
-    }
-    let all = effects.iter().any(|(e, _)| *e == Effect::All);
-    let names: Vec<String> = if all {
-        operands
-    } else {
-        operands.into_iter().take(1).collect()
-    };
     if names.is_empty() {
-        return Invocation::LoadsNothing("modprobe: no module named (a usage error)".to_string());
+        return Syntax::Record("modprobe with no module named (a query or a usage error)".into());
     }
-    if let Some(f) = names.iter().find(|n| names_a_file(n)) {
-        return Invocation::Refused(format!(
-            "modprobe asked to load the file '{f}', not a module of the system's tree"
-        ));
-    }
-    Invocation::Modules(names)
-}
-
-/// insmod's options (kmod 29..=34).
-const INSMOD_LONG: &[(&str, bool, Effect)] = &[
-    ("force", false, Effect::Neutral),
-    ("syslog", false, Effect::Neutral),
-    ("verbose", false, Effect::Neutral),
-    ("version", false, Effect::NoLoad("the version printed")),
-    ("help", false, Effect::NoLoad("the help printed")),
-];
-
-fn insmod_short(c: char) -> Option<(bool, Effect)> {
-    Some(match c {
-        'p' | 's' | 'f' | 'v' => (false, Effect::Neutral),
-        'V' => (false, Effect::NoLoad("the version printed")),
-        'h' => (false, Effect::NoLoad("the help printed")),
-        _ => return None,
-    })
-}
-
-fn insmod(args: &[String]) -> Invocation {
-    let (effects, operands) = match getopt(args, insmod_short, INSMOD_LONG) {
-        Ok(p) => p,
-        Err(why) => return Invocation::Refused(format!("insmod {why}")),
-    };
-    if let Some((Effect::NoLoad(what), _)) =
-        effects.iter().find(|(e, _)| matches!(e, Effect::NoLoad(_)))
-    {
-        return Invocation::LoadsNothing(format!("insmod: {what}"));
-    }
-    match operands.first() {
-        Some(file) => Invocation::Refused(format!(
-            "insmod loads the file '{file}' as given, which no module tree resolves"
-        )),
-        None => Invocation::LoadsNothing("insmod: no file named (a usage error)".to_string()),
-    }
+    let quoted: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
+    Syntax::Record(format!(
+        "modprobe of {}{}",
+        quoted.join(", "),
+        match parameters {
+            0 => String::new(),
+            1 => " with 1 parameter".to_string(),
+            n => format!(" with {n} parameters"),
+        }
+    ))
 }
 
 /// `kmod [options] <command>`: getopt with `+` (options stop at the first
 /// operand), then the command.
-fn kmod(args: &[String]) -> Invocation {
+fn kmod(args: &[String]) -> Syntax {
     let Some(first) = args.first() else {
-        return Invocation::LoadsNothing("kmod: no command (a usage error)".to_string());
+        return Syntax::Record("kmod with no command (a usage error)".to_string());
     };
     match first.as_str() {
-        "-h" | "--help" | "help" => Invocation::LoadsNothing("kmod: the help printed".to_string()),
-        "-V" | "--version" => Invocation::LoadsNothing("kmod: the version printed".to_string()),
-        "list" => Invocation::LoadsNothing("kmod list (lsmod)".to_string()),
-        "static-nodes" => Invocation::LoadsNothing(
+        "-h" | "--help" | "help" => Syntax::Record("kmod: the help printed".to_string()),
+        "-V" | "--version" => Syntax::Record("kmod: the version printed".to_string()),
+        "list" => Syntax::Record("kmod list (lsmod)".to_string()),
+        "static-nodes" => Syntax::Record(
             "kmod static-nodes (the device nodes of modules, written for tmpfiles)".to_string(),
         ),
-        other => Invocation::Refused(format!(
-            "kmod command '{other}' is not one that loads nothing (help, list, static-nodes)"
+        other => Syntax::Kill(format!(
+            "kmod command '{other}' is not one that loads nothing (help, list, static-nodes, \
+             the version)"
         )),
     }
 }
@@ -428,8 +376,15 @@ mod tests {
         a.iter().map(|s| s.to_string()).collect()
     }
 
-    fn modprobe_of(a: &[&str]) -> Invocation {
-        parse(Tool::Modprobe, &v(a))
+    fn modprobe_of(a: &[&str]) -> Syntax {
+        judge(Tool::Modprobe, &v(a))
+    }
+
+    fn killed(s: &Syntax) -> Option<&str> {
+        match s {
+            Syntax::Kill(why) => Some(why),
+            Syntax::Record(_) => None,
+        }
     }
 
     #[test]
@@ -473,183 +428,242 @@ mod tests {
         assert!(t("/usr/bin/kmod", &["modprobe.real", "x"]).is_err());
     }
 
+    /// The container runtimes', kube-proxy's, k3s's, DKMS's and an
+    /// administrator's shapes: module names, recorded, the names said.
     #[test]
-    fn modprobe_names_are_the_first_operand_or_all_with_a() {
-        assert_eq!(
-            modprobe_of(&["modprobe", "nf_tables"]),
-            Invocation::Modules(v(&["nf_tables"]))
-        );
-        // xtables_insmod: the option after the name (getopt permutes)
-        assert_eq!(
-            modprobe_of(&["/sbin/modprobe", "ip_tables", "-q"]),
-            Invocation::Modules(v(&["ip_tables"]))
-        );
-        assert_eq!(
-            modprobe_of(&["modprobe", "nf_conntrack", "hashsize=1024"]),
-            Invocation::Modules(v(&["nf_conntrack"]))
-        );
-        // docker: modprobe -va
-        assert_eq!(
-            modprobe_of(&["modprobe", "-va", "bridge", "br_netfilter"]),
-            Invocation::Modules(v(&["bridge", "br_netfilter"]))
-        );
-        assert_eq!(
-            modprobe_of(&["modprobe", "--all", "--quiet", "--", "a", "-b"]),
-            Invocation::Modules(v(&["a", "-b"]))
-        );
-        assert_eq!(
-            modprobe_of(&["modprobe", "--", "ip_vs"]),
-            Invocation::Modules(v(&["ip_vs"]))
-        );
-        // a short option's argument in the same word, or the next one
-        assert_eq!(
-            modprobe_of(&["modprobe", "-w100", "nf_tables"]),
-            Invocation::Modules(v(&["nf_tables"]))
-        );
-        assert_eq!(
-            modprobe_of(&["modprobe", "-w", "100", "nf_tables"]),
-            Invocation::Modules(v(&["nf_tables"]))
-        );
+    fn modprobe_by_name_is_recorded() {
+        for (a, what) in [
+            (&["modprobe", "nf_tables"][..], "modprobe of 'nf_tables'"),
+            (&["/sbin/modprobe", "ip_tables"], "modprobe of 'ip_tables'"),
+            (
+                &["modprobe", "nf_conntrack", "hashsize=1024"],
+                "modprobe of 'nf_conntrack' with 1 parameter",
+            ),
+            (
+                &["modprobe", "-va", "bridge", "br_netfilter"],
+                "modprobe of 'bridge', 'br_netfilter'",
+            ),
+            (
+                &["modprobe", "--all", "--quiet", "a", "b"],
+                "modprobe of 'a', 'b'",
+            ),
+            (&["modprobe", "--", "ip_vs"], "modprobe of 'ip_vs'"),
+            (
+                &["modprobe", "-q", "--", "nft-expr-counter"],
+                "'nft-expr-counter'",
+            ),
+            (&["modprobe", "-w100", "-r", "nf_tables"], "'nf_tables'"),
+            (&["modprobe", "-w", "100", "-r", "nf_tables"], "'nf_tables'"),
+            (&["modprobe", "--wait=100", "-r", "x"], "'x'"),
+            (&["modprobe", "--wait", "100", "-r", "x"], "'x'"),
+            (&["modprobe", "-r", "dummy"], "'dummy'"),
+            (&["modprobe", "-n", "-v", "nf_tables"], "'nf_tables'"),
+            (&["modprobe", "-R", "fs-overlay"], "'fs-overlay'"),
+            (&["modprobe", "-D", "dummy"], "'dummy'"),
+            (&["modprobe", "-ib", "--first-time", "dummy"], "'dummy'"),
+            (&["modprobe", "--show-depends", "ext4"], "'ext4'"),
+            // an abbreviation of options of one meaning is that meaning
+            (&["modprobe", "--show-c", "x"], "'x'"),
+            (&["modprobe", "--qu", "x"], "'x'"),
+            (&["modprobe", "-c"], "no module named"),
+            (&["modprobe", "-V"], "no module named"),
+            (&["modprobe", "--help"], "no module named"),
+            (&["modprobe"], "no module named"),
+            (&["modprobe", "-q"], "no module named"),
+        ] {
+            match modprobe_of(a) {
+                Syntax::Record(w) => assert!(w.contains(what), "{a:?}: {w}"),
+                k => panic!("{a:?}: {k:?}"),
+            }
+        }
     }
 
+    /// The review of #498: the shapes that load what the system's tree does
+    /// not name, or that the environment can turn into one, are killed —
+    /// each by its option, short, long and abbreviated.
     #[test]
-    fn a_file_or_a_moved_tree_is_refused_before_any_lookup() {
-        for a in [
-            &["modprobe", "/tmp/rk.ko"][..],
-            &["modprobe", "./rk"],
-            &["modprobe", "rk.ko"],
-            &["modprobe", "rk.ko.zst"],
-            &["modprobe", "-a", "nf_tables", "rk.ko.xz"],
-            &["modprobe", "-d", "/tmp/root", "nf_tables"],
-            &["modprobe", "-d/tmp/root", "nf_tables"],
-            &["modprobe", "-qd", "/tmp/root", "nf_tables"],
-            &["modprobe", "--dirname=/tmp/root", "nf_tables"],
-            &["modprobe", "--dir", "/tmp/root", "nf_tables"],
-            &["modprobe", "-C", "/tmp/x.conf", "nf_tables"],
-            &["modprobe", "--conf=/tmp/x.conf", "nf_tables"],
-            &["modprobe", "-S", "9.9.9", "nf_tables"],
-            &["modprobe", "--set-version", "9.9.9", "nf_tables"],
-            &["modprobe", "-f", "nf_tables"],
-            &["modprobe", "--force-vermagic", "nf_tables"],
-            &["modprobe", "nf_tables", "--force"],
+    fn a_file_a_moved_tree_a_forced_load_or_holders_is_killed() {
+        for (a, why) in [
+            (&["modprobe", "/tmp/rk.ko"][..], "names a file"),
+            (&["modprobe", "./rk"], "names a file"),
+            (&["modprobe", "rk.ko"], "names a file"),
+            (&["modprobe", "rk.ko.zst"], "names a file"),
+            (&["modprobe", "rk.ko.xz"], "names a file"),
+            (&["modprobe", "rk.ko.gz"], "names a file"),
+            (&["modprobe", "-a", "nf_tables", "rk.ko.xz"], "names a file"),
+            (&["modprobe", "nf_conntrack", "x=/tmp/y"], "names a file"),
+            (
+                &["modprobe", "--dump-modversions", "/tmp/x.ko"],
+                "names a file",
+            ),
+            (&["modprobe", "-d", "root", "nf_tables"], DIRNAME),
+            (&["modprobe", "-droot", "nf_tables"], DIRNAME),
+            (&["modprobe", "-qd", "root", "nf_tables"], DIRNAME),
+            (&["modprobe", "--dirname=root", "nf_tables"], DIRNAME),
+            (&["modprobe", "--dir", "root", "nf_tables"], DIRNAME),
+            (&["modprobe", "-C", "x.conf", "nf_tables"], CONFIG),
+            (&["modprobe", "--conf=x.conf", "nf_tables"], CONFIG),
+            (&["modprobe", "--c", "x.conf", "nf_tables"], CONFIG),
+            (&["modprobe", "-S", "9.9.9", "nf_tables"], SET_VERSION),
+            (&["modprobe", "--set-version", "9.9.9", "x"], SET_VERSION),
+            (&["modprobe", "--se=9.9.9", "x"], SET_VERSION),
+            (
+                &[
+                    "modprobe",
+                    "--all",
+                    "--set-version=6.8.0-1",
+                    "--ignore-install",
+                    "--quiet",
+                    "--show-depends",
+                    "ext4",
+                ],
+                SET_VERSION,
+            ),
+            (&["modprobe", "-f", "nf_tables"], FORCE),
+            (&["modprobe", "-vf", "nf_tables"], FORCE),
+            (&["modprobe", "--force", "x"], FORCE),
+            (&["modprobe", "--force-vermagic", "x"], FORCE),
+            (&["modprobe", "--force-modversion", "x"], FORCE),
+            (&["modprobe", "--forc", "x"], FORCE),
+            (&["modprobe", "-o", "y", "x"], RENAME),
+            (&["modprobe", "--remove-holders", "dummy"], HOLDERS),
+            (&["modprobe", "--remove-dependencies", "dummy"], HOLDERS),
+            (&["modprobe", "--remove-", "dummy"], HOLDERS),
+            (&["modprobe", "--remove-h", "dummy"], HOLDERS),
+            (&["modprobe", "-r", "--remove-holders", "dummy"], HOLDERS),
         ] {
+            let s = modprobe_of(a);
             assert!(
-                matches!(modprobe_of(a), Invocation::Refused(_)),
-                "{a:?}: {:?}",
-                modprobe_of(a)
+                killed(&s).is_some_and(|w| w.contains(why)),
+                "{a:?} ({why}): {s:?}"
+            );
+        }
+    }
+
+    /// The review of #498, B-4: an argument starting with `-` after the
+    /// first name is killed — option or parameter, the environment decides
+    /// (`POSIXLY_CORRECT`, `MODPROBE_OPTIONS='--'`); so is a name that
+    /// starts with `-`.
+    #[test]
+    fn an_argument_starting_with_a_dash_after_the_name_is_killed() {
+        for a in [
+            &["modprobe", "dummy", "-r"][..],
+            &["modprobe", "ip_tables", "-q"],
+            &["modprobe", "dummy", "-n"],
+            &["modprobe", "dummy", "--dry-run"],
+            &["modprobe", "dummy", "-V"],
+            &["modprobe", "dummy", "--"],
+            &["modprobe", "-a", "a", "-b"],
+            &["modprobe", "--all", "--", "a", "-b"],
+            &["modprobe", "nf_conntrack", "hashsize=1", "-v"],
+            &["modprobe", "-r", "dummy", "-w", "100"],
+        ] {
+            let s = modprobe_of(a);
+            assert!(
+                killed(&s).is_some_and(|w| w.contains("after the module name")),
+                "{a:?}: {s:?}"
+            );
+        }
+        for a in [&["modprobe", "--", "-r"][..], &["modprobe", "-"]] {
+            let s = modprobe_of(a);
+            assert!(
+                killed(&s).is_some_and(|w| w.contains("starts with '-'")),
+                "{a:?}: {s:?}"
             );
         }
     }
 
     #[test]
-    fn what_the_tool_itself_refuses_is_refused() {
-        for a in [
-            &["modprobe", "-Z", "x"][..],
-            &["modprobe", "--bogus", "x"],
-            &["modprobe", "--s", "x"],
-            &["modprobe", "-C"],
-            &["modprobe", "--quiet=1", "x"],
+    fn what_the_tool_itself_refuses_is_killed() {
+        for (a, why) in [
+            (&["modprobe", "-Z", "x"][..], "-Z is no option"),
+            (&["modprobe", "--bogus", "x"], "--bogus is no option"),
+            // remove, remove-dependencies, remove-holders: two meanings
+            (&["modprobe", "--remov", "x"], "ambiguous"),
+            (&["modprobe", "--s", "x"], "ambiguous"),
+            (&["modprobe", "--d", "x"], "ambiguous"),
+            (&["modprobe", "-w"], "-w has no argument"),
+            (&["modprobe", "--wait"], "--wait has no argument"),
+            (&["modprobe", "--quiet=1", "x"], "takes no argument"),
         ] {
+            let s = modprobe_of(a);
             assert!(
-                matches!(modprobe_of(a), Invocation::Refused(_)),
-                "{a:?}: {:?}",
-                modprobe_of(a)
+                killed(&s).is_some_and(|w| w.contains(why)),
+                "{a:?} ({why}): {s:?}"
             );
         }
-        // the same meaning under two names is no ambiguity
-        assert!(matches!(
-            modprobe_of(&["modprobe", "--remove-", "x"]),
-            Invocation::LoadsNothing(_)
-        ));
         // an exact name beats its longer neighbours
         assert!(matches!(
             modprobe_of(&["modprobe", "--show", "x"]),
-            Invocation::LoadsNothing(_)
+            Syntax::Record(_)
+        ));
+        assert!(matches!(
+            modprobe_of(&["modprobe", "--remove", "x"]),
+            Syntax::Record(_)
         ));
     }
 
-    /// initramfs-tools' `manual_add_modules`: `modprobe --all --set-version=V
-    /// --ignore-install --quiet --show-depends` inserts nothing, whatever
-    /// version it reads.
     #[test]
-    fn a_query_loads_nothing_whatever_tree_it_reads() {
-        for a in [
-            &[
-                "modprobe",
-                "--all",
-                "--set-version=6.8.0-1",
-                "--ignore-install",
-                "--quiet",
-                "--show-depends",
-                "ext4",
-            ][..],
-            &["modprobe", "-r", "dummy"],
-            &["modprobe", "-rv", "-C", "/tmp/x.conf", "dummy"],
-            &["modprobe", "-n", "-v", "nf_tables"],
-            &["modprobe", "-R", "fs-overlay"],
-            &["modprobe", "-c"],
-            &["modprobe", "--dump-modversions", "/tmp/x.ko"],
-            &["modprobe", "-V"],
-            &["modprobe", "--help"],
-            &["modprobe"],
-            &["modprobe", "-q"],
+    fn insmod_is_always_killed() {
+        let i = |a: &[&str]| judge(Tool::Insmod, &v(a));
+        for (a, file) in [
+            (&["insmod", "/tmp/rk.ko"][..], Some("/tmp/rk.ko")),
+            (&["insmod", "rk.ko"], Some("rk.ko")),
+            (
+                &["insmod", "-f", "/lib/modules/6.8.0/kernel/x.ko"],
+                Some("/lib/"),
+            ),
+            (&["insmod", "nf_tables"], Some("nf_tables")),
+            (&["insmod"], None),
+            (&["insmod", "-V"], None),
         ] {
-            assert!(
-                matches!(modprobe_of(a), Invocation::LoadsNothing(_)),
-                "{a:?}: {:?}",
-                modprobe_of(a)
-            );
+            let s = i(a);
+            let why = killed(&s).unwrap_or_else(|| panic!("{a:?}: {s:?}"));
+            assert!(why.contains("insmod loads the file"), "{why}");
+            if let Some(f) = file {
+                assert!(why.contains(f), "{why}");
+            }
         }
     }
 
     #[test]
-    fn insmod_always_loads_a_file() {
-        let i = |a: &[&str]| parse(Tool::Insmod, &v(a));
-        for a in [
-            &["insmod", "/tmp/rk.ko"][..],
-            &["insmod", "rk.ko"],
-            &["insmod", "-f", "/lib/modules/6.8.0/kernel/x.ko"],
-            &["insmod", "nf_tables"],
-        ] {
-            assert!(matches!(i(a), Invocation::Refused(_)), "{a:?}");
-        }
-        for a in [
-            &["insmod"][..],
-            &["insmod", "-V"],
-            &["insmod", "--help", "x.ko"],
-        ] {
-            assert!(matches!(i(a), Invocation::LoadsNothing(_)), "{a:?}");
-        }
-        assert!(matches!(i(&["insmod", "-Z", "x"]), Invocation::Refused(_)));
-    }
-
-    #[test]
-    fn kmod_s_commands_that_load_nothing() {
-        let k = |a: &[&str]| parse(Tool::Kmod, &v(a));
+    fn kmod_s_commands_that_load_nothing_are_recorded() {
+        let k = |a: &[&str]| judge(Tool::Kmod, &v(a));
         for a in [
             &["kmod", "list"][..],
             &[
                 "kmod",
                 "static-nodes",
                 "--format=tmpfiles",
-                "--output=/run/x",
+                "--output=/run/tmpfiles.d/static-nodes.conf",
             ],
             &["kmod", "-V"],
+            &["kmod", "--version"],
             &["kmod", "help"],
+            &["kmod", "-h"],
+            &["kmod", "--help"],
             &["kmod"],
         ] {
-            assert!(matches!(k(a), Invocation::LoadsNothing(_)), "{a:?}");
+            assert!(matches!(k(a), Syntax::Record(_)), "{a:?}");
         }
         for a in [
             &["kmod", "insert", "x"][..],
             &["kmod", "modprobe", "x"],
             &["kmod", "-x"],
         ] {
-            assert!(matches!(k(a), Invocation::Refused(_)), "{a:?}");
+            assert!(
+                killed(&k(a)).is_some_and(|w| w.contains("not one that loads nothing")),
+                "{a:?}"
+            );
         }
-        assert!(matches!(
-            parse(Tool::Other("lsmod"), &v(&["lsmod"])),
-            Invocation::LoadsNothing(_)
-        ));
+        for mode in ["lsmod", "rmmod", "modinfo", "depmod"] {
+            assert!(
+                matches!(
+                    judge(Tool::Other(mode), &v(&[mode, "x"])),
+                    Syntax::Record(w) if w.contains(mode)
+                ),
+                "{mode}"
+            );
+        }
     }
 }

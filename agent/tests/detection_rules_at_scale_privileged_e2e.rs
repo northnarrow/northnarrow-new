@@ -789,13 +789,14 @@ fn r011_record_of(fx: &Fixture, pid: u32) -> serde_json::Value {
     )
 }
 
-/// Lot 279 — R011 judges what the exec loads. The system's `modprobe` of a
-/// module of the running kernel's packaged tree (`dummy`, as anti-tamper
-/// C16) is recorded, High, no kill: the shape of the container runtimes'
-/// netfilter modprobe that R011 killed (lot 275's lab, W5 rootful podman on
-/// Ubuntu 22.04). An `insmod` of a copy of the same module in /tmp is
-/// killed (detect-only here: the record says what would run). Skipped,
-/// said so, where the kernel has no loadable `dummy`.
+/// Lot 279 — R011 judges the command line's syntax and what the exec pump
+/// read at the exec. The system's `modprobe` by module name (`dummy`, as
+/// anti-tamper C16), its environment clean, is recorded, High, no kill: the
+/// shape of the container runtimes' netfilter modprobe that R011 killed
+/// (lot 275's lab, W5 rootful podman on Ubuntu 22.04). An `insmod` of a
+/// copy of the same module in /tmp is killed (detect-only here: the record
+/// says what would run). Skipped, said so, where the kernel has no loadable
+/// `dummy`.
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn r011_records_a_packaged_modprobe_and_kills_an_insmod_from_tmp() {
@@ -912,21 +913,52 @@ fn run_tool(program: &str, args: &[&str], env: &[(&str, &str)]) -> (u32, bool) {
     (pid, ok)
 }
 
-/// Lot 279 — the malicious shapes the brief names, under the fixture's
-/// detect-only agent (each load lands; the records say what would run):
+/// The agent's VERDICT line of R011 for the exec of `pid` (its reasoning:
+/// the detection record does not carry it), waited for.
+fn r011_line_of(fx: &Fixture, pid: u32) -> String {
+    let pid_field = format!("target_pid={pid} ");
+    let line = || -> Option<String> {
+        std::fs::read_to_string(&fx.agent_log)
+            .ok()?
+            .lines()
+            .find(|l| l.contains("rule=R011_KernelModuleTooling") && l.contains(&pid_field))
+            .map(str::to_string)
+    };
+    common::wait_until(VERDICT_POLL_TIMEOUT, line)
+        .unwrap_or_else(|| panic!("no R011 VERDICT line of {pid} in the agent's log"))
+}
+
+/// The R011 record of `pid` is `verdict`, and its VERDICT line says `why`.
+fn assert_r011(fx: &Fixture, pid: u32, verdict: &str, why: &str) {
+    let rec = r011_record_of(fx, pid);
+    assert_eq!(
+        rec["verdict"],
+        serde_json::json!({ "Rule": verdict }),
+        "record: {rec}"
+    );
+    assert_eq!(rec["severity"], "High", "record: {rec}");
+    let line = r011_line_of(fx, pid);
+    assert!(line.contains(why), "{why}: {line}");
+}
+
+/// Lot 279 — R011 on the syntax and on what the exec pump read, under the
+/// fixture's detect-only agent (each load lands; the records say what would
+/// run):
 ///
 /// - a module copied into the running kernel's tree, `depmod -a`, then
-///   `modprobe`d: resolved, but no package installed it — R011 kills (and
-///   R018, on the load, kills the tree: an unowned module, an unexpected
-///   loader);
-/// - `modprobe -d <a tree in /tmp>`: R011 kills on the option alone;
+///   `modprobe`d by name: R011 RECORDS it (no resolution: whether a name
+///   loads anything, and what, is the kernel's to judge) — and R018 judges
+///   the load the kernel reports, after it: an unowned module by an
+///   unexpected loader, its tree killed once the module is in;
+/// - `modprobe -d <a tree in /tmp>`: R011 kills on the argument alone;
 /// - the same tree through `MODPROBE_OPTIONS`, which the sensor does not
-///   see: R011 records (its argv is the packaged module's name) and R018
-///   kills the load from /tmp — the backstop the module doc of
-///   `module_request` names.
+///   see: R011 kills on the environment the exec pump read at the exec (and
+///   R018 records the load from /tmp, Critical);
+/// - an option after the module name (`modprobe dummy -q`): R011 kills —
+///   whether it is an option is the environment's to say.
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
-fn r011_kills_a_module_copied_into_the_tree_and_r018_catches_what_argv_hides() {
+fn r011_records_a_name_and_kills_a_moved_tree_or_modprobe_options() {
     let ko = Command::new("modinfo")
         .args(["-n", "dummy"])
         .output()
@@ -951,15 +983,15 @@ fn r011_kills_a_module_copied_into_the_tree_and_r018_catches_what_argv_hides() {
     let _eni = EniIptablesGuard::install();
     let fx = Fixture::setup(&[]);
     let _unload = Unload("dummy");
-    let unload = || {
+    let unload = |name: &str| {
         let _ = Command::new("rmmod")
-            .arg("dummy")
+            .arg(name)
             .stderr(Stdio::null())
             .status();
     };
-    unload();
+    unload("dummy");
 
-    // A module copied into the tree by hand, indexed by depmod.
+    // A module copied into the tree by hand, indexed by depmod, by name.
     let copy = PathBuf::from(format!(
         "/lib/modules/{release}/extra/nn_k279_copied{suffix}"
     ));
@@ -974,19 +1006,15 @@ fn r011_kills_a_module_copied_into_the_tree_and_r018_catches_what_argv_hides() {
         "depmod -a"
     );
     let (pid, _) = run_tool("/sbin/modprobe", &["nn_k279_copied"], &[]);
-    let rec = r011_record_of(&fx, pid);
-    assert_eq!(
-        rec["verdict"],
-        serde_json::json!({"Rule": "KillProcess"}),
-        "record: {rec}"
-    );
+    assert_r011(&fx, pid, "Log", "modprobe of 'nn_k279_copied'");
     let r018 = r018_records_of(&fx, pid);
     assert!(
         r018.iter()
             .any(|r| r["verdict"] == serde_json::json!({"Rule": "KillProcessTree"})),
-        "R018 kills the load of an unowned module by modprobe: {r018:?}"
+        "R018 judges the load of an unowned module by modprobe (after it): {r018:?}"
     );
-    unload();
+    unload("nn_k279_copied");
+    unload("dummy");
     drop(_tree);
 
     // A tree staged in /tmp, named by the option, then by the environment.
@@ -1008,27 +1036,27 @@ fn r011_kills_a_module_copied_into_the_tree_and_r018_catches_what_argv_hides() {
         "depmod -b"
     );
     let (pid, _) = run_tool("/sbin/modprobe", &["-d", &root, "dummy"], &[]);
-    let rec = r011_record_of(&fx, pid);
-    assert_eq!(
-        rec["verdict"],
-        serde_json::json!({"Rule": "KillProcess"}),
-        "record: {rec}"
-    );
-    unload();
+    assert_r011(&fx, pid, "KillProcess", "names a file");
+    unload("dummy");
     let opts = format!("-d {root}");
     let (pid, _) = run_tool("/sbin/modprobe", &["dummy"], &[("MODPROBE_OPTIONS", &opts)]);
-    let rec = r011_record_of(&fx, pid);
-    assert_eq!(
-        rec["verdict"],
-        serde_json::json!({"Rule": "Log"}),
-        "the environment is not seen at the exec: {rec}"
+    assert_r011(
+        &fx,
+        pid,
+        "KillProcess",
+        &format!("MODPROBE_OPTIONS='{opts}' in its environment"),
     );
     let r018 = r018_records_of(&fx, pid);
     assert!(
-        r018.iter().any(|r| r["severity"] == "Critical"
-            && r["verdict"] == serde_json::json!({"Rule": "KillProcessTree"})),
-        "R018 kills the load from the staged tree: {r018:?}"
+        r018.iter().any(|r| r["severity"] == "Critical"),
+        "R018 records the load from the staged tree: {r018:?}"
     );
+    unload("dummy");
+
+    // An option after the module name.
+    let (pid, _) = run_tool("/sbin/modprobe", &["dummy", "-q"], &[]);
+    assert_r011(&fx, pid, "KillProcess", "after the module name");
+    unload("dummy");
 }
 
 /// R017 — shell binary from a non-standard path. Install a benign
