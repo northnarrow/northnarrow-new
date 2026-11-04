@@ -51,7 +51,7 @@ number in parentheses is a lab PR.
 | C20 | Automation, playbooks, SOAR | 1 | the automatic COMBAT ladder and the per-rule policy; no playbook, webhook or OpenC2 | 3 |
 | C21 | SIEM integration and export | 0 | no export of the detections ("until R15 exports the chains off the host", `docs/operator/HEARTBEAT.md`); local JSON reads and the heartbeat pull (270) only; no OCSF, syslog or OTLP | 3 |
 | C22 | Backend and multi-host correlation | 0 | the heartbeat's external verifier (270) is not a backend | 3 |
-| C23 | Anti-tamper and self-defence | 2 (provisional) | 21 LSM deny hooks and 6 optional (lot 273: the cgroup move guard; lot 273b: the write deny `file_permission`, the guard's third program; lot 273c: `task_setrlimit`, `task_setscheduler`, `task_setnice`, `task_setioprio`), the fail-opens counted and signed (215); start refused without BPF LSM, a hook's self-test (218); a fail-visible watchdog (216); the signing key decided once at boot (265, 268); unprivileged workers under Landlock and seccomp (272); the signed heartbeat's external verifier sees a stop in 6.5 s (270). Provisional: on systemd 257 and later `systemctl kill -s SIGKILL` stopped the agent through `cgroup.kill` outside a maintenance window, and any root shell could kill, freeze or move the units' cgroups on every kernel (tamper case C31; C33's `systemctl stop` was refused all along — it read C31's kill); closed by lot 273 (#489: the units' cgroups protected, the move guard; C15, C20, C31, C65–C75 refused and signed and C76 allowed inside a window on the five guests); lot 273b (the review of #489): the units' and their slices' resource limits (an OOM kill inside the write, a starvation), a cgroup v1 hierarchy where systemd runs the unified one, a write through a descriptor opened earlier and the protected pids' `oom_score_adj` refused outside a window, the move guard self-tested at every boot (C12, C18, C77–C86); lot 273c (the review of #490): another process's `prlimit`, `renice`, `chrt`, `taskset`, `ionice` of a protected process refused (four deny hooks, 21 in all), PID 1 closed to attach-mode access, no resource value below a floor registered (the agent's start, the watchdog's check of a respawn, a window's close), systemd's copy of a refused `set-property` taken back by a reload, the host's drop-ins judged by their value for our units (never moved), cgroup v1 refused only where it moves or freezes (C89–C102), provisional until its review | 3 |
+| C23 | Anti-tamper and self-defence | 2 (provisional) | 21 LSM deny hooks and 6 optional (lot 273: the cgroup move guard; lot 273b: the write deny `file_permission`, the guard's third program; lot 273c: `task_setrlimit`, `task_setscheduler`, `task_setnice`, `task_setioprio`), the fail-opens counted and signed (215); start refused without BPF LSM, a hook's self-test (218); a fail-visible watchdog (216); the signing key decided once at boot (265, 268); unprivileged workers under Landlock and seccomp (272); the signed heartbeat's external verifier sees a stop in 6.5 s (270). Provisional: on systemd 257 and later `systemctl kill -s SIGKILL` stopped the agent through `cgroup.kill` outside a maintenance window, and any root shell could kill, freeze or move the units' cgroups on every kernel (tamper case C31; C33's `systemctl stop` was refused all along — it read C31's kill); closed by lot 273 (#489: the units' cgroups protected, the move guard; C15, C20, C31, C65–C75 refused and signed and C76 allowed inside a window on the five guests); lot 273b (the review of #489): the units' and their slices' resource limits (an OOM kill inside the write, a starvation), a cgroup v1 hierarchy where systemd runs the unified one, a write through a descriptor opened earlier and the protected pids' `oom_score_adj` refused outside a window, the move guard self-tested at every boot (C12, C18, C77–C86); lot 273c (the review of #490): another process's `prlimit`, `renice`, `chrt`, `taskset`, `ionice` of a protected process refused (four deny hooks, 21 in all), PID 1 closed to attach-mode access, no resource value below a floor registered (the agent's start, the watchdog's check of a respawn, a window's close), systemd's copy of a refused `set-property` taken back by a reload, the host's drop-ins judged by their value for our units (never moved), cgroup v1 refused only where it moves or freezes (C89–C102); lot 273d (the review of #492): the units in a slice of their own (`northnarrow.slice`), the reload confirmed, systemd's copy read before a respawn and instead of a skip, our own drop-ins judged at a window's close, the host's judged precisely and a degradation while harmful, `io.prio.class` and seven critical sysctls refused a harmful value (C78c, C97, C103–C105), provisional until its review | 3 |
 | C24 | Offline and air-gapped operation | 2 | the agent's only traffic of its own is the DNS probe to 127.0.0.1:53 (`crates/nn-linux/src/telemetry_probe.rs`); updates are an operator's action; the attestation is verified offline with a bundle (`docs/operator/INSTALL_UPGRADE_UNINSTALL.md`) | 3 |
 | C25 | Data sovereignty | 2 | the telemetry stays on the host; no model in the root process (214); the README's compliance table states design properties, not certifications (its NIS2, GDPR, DORA and CRA badges were removed on 2026-11-03) | 3 |
 | C26 | Open code, licence, inspectability | 2 | Apache-2.0 (`Cargo.toml`), the eBPF object Dual MIT/GPL, a public repository, the module map | 3 |
@@ -5218,6 +5218,149 @@ number in parentheses is a lab PR.
     outside this lot); a hybrid v1 host, another architecture than x86-64
     and a kernel without the proc offsets are signed degradations; the
     move guard's cost on path-heavy work.
+- **Lot 273d — C23: the units in a slice of their own, a confirmed
+  reload, systemd's copy before a respawn, our own drop-ins at a window's
+  close, the critical sysctls (a security fix; the review of #492 and its
+  focused re-check).**
+  - What was open: lot 273c's units ran in `system.slice`, so a
+    `system.slice.d` drop-in reached them; a reload counted once it was
+    requested, never confirmed; a second refusal of the same file within
+    10 minutes was skipped; the watchdog respawned the agent into
+    systemd's copy of its unit, a one-page `memory.max` killing it at its
+    exec; a file restored to its floor kept the floor until the next
+    window; a drop-in of ours made inside a window stayed and applied at
+    the next reload; the judge of the host's drop-ins used absolute slice
+    floors (a small VM's `MemoryHigh=80%` flagged), any variable, no CPU
+    sets, no conditions; `io.prio.class` was writable; no global sysctl
+    was guarded — `vm.overcommit_*`, `kernel.pid_max`, `threads-max`,
+    `vm.max_map_count`, `sched_rt_runtime_us` abort or starve the agent,
+    and `kernel.ftrace_enabled=0` (R1 of the external review of 04/11, P0)
+    silences the BPF trampolines on 6.0 to 7.2, every deny hook by the
+    kernel's code, with nothing refused, read or signed.
+  - What changed: `northnarrow.slice` for both units (its drop-in
+    directories NOCREATE, the file protected, `RefuseManualStop=`), which
+    `system.slice.d` does not reach; the D-Bus client shared with the
+    watchdog (`antitamper_bpf::systemd_bus`, typed properties, the unit
+    paths), the reload confirmed by `Reloading(false)`, systemd's copy of
+    our units read against the floors (`antitamper_bpf::unit_props`) — a
+    repeated refusal verified instead of skipped, the watchdog's check
+    before each respawn, a file at its floor back to its configured value
+    after a confirmed reload; our units' drop-ins made inside a window
+    judged at its close and quarantined when harmful; the judge of the
+    host's drop-ins moved to `antitamper_bpf::host_dropins` and made
+    precise (relative slice floors, narrowed variables, CPU sets against
+    the online CPUs, conditions on their merits, last assignment, a
+    breaks-the-agent warning), its harmful findings a degradation while
+    they hold (`boot::degradation::withdraw`) and a warning at a window's
+    grant; `io.prio.class` (18 protected files); seven sysctls refused a
+    harmful value in the kernel (op code 29, `sysctl`, ENGAGED) and put
+    back by the integrity round (`sysctl_guard`); R1 of the external
+    review of 04/11 (P0): `kernel.ftrace_enabled` the eighth, every write
+    of it refused outside a window whatever it carries (the coordinator's
+    decision: no value judged, no byte read, so no race; the agent's
+    restore passes by its identity), read at every build of the manifest (`0` or
+    unreadable a signed `ftrace_enabled` degradation) and put back to `1`
+    at a window's close (every guarded sysctl is checked there now) and by
+    the round; our drop-in directories in the agent's `ReadWritePaths=`
+    (the close's quarantine failed with EROFS, found by the lab); the lab
+    script's C95b/C97/C98 wait for a window's end by its signed close, C97
+    says how PID 1 applied the value, C98 sets a value the agent survives;
+    found by the lab and fixed: the write deny did not load on 5.15 and 6.1
+    (`parse_i64`'s loop: a fall-through back-edge their verifier rejects;
+    unrolled, and `no_function_has_a_back_edge_the_5_15_verifier_rejects`
+    checks the object as they do); an upgrade of units started but never
+    enabled passed every check and the next boot started no agent (the
+    lab's install started them without `enable`): `install.sh --upgrade`
+    refuses that, its health check reads the enablement and the default
+    target, a rollback enables the units again, the lab's install enables
+    and its upgrade-check ends with a cold boot and the boot's check.
+  - Lab: on our own QEMU guests — 22.04 (5.15), Debian 12 (6.1), 24.04 (6.8),
+    Debian 13 (6.12, systemd 257), 26.04 (7.0) — each under its lease,
+    rounds 12 to 15.
+    - Round 12 found two defects of the lot, fixed: on 5.15 and 6.1 the
+      verifier refused `protected_write_deny` ("back-edge from insn 4460 to
+      4461", `parse_i64`), so the agent did not start there; on Debian 13
+      the close's quarantine of our drop-ins failed with EROFS (C105, the
+      unit's `ReadWritePaths=`). It also read, in the guests' persistent
+      journals, lot 275's C97 on 5.15: the `daemon-reload` came 7 s into
+      C95b's 30 s window, which the journal alone had called closed.
+    - Round 13 (the lot with main 80c8da36): the verifier on the five
+      kernels, 0 failing (83 of 85 OK and 2 not counted on 5.15 and 6.1,
+      85 of 85 on 6.8, 6.12, 7.0); the cgroup and ftrace cases on 5.15 (38
+      OK) and 6.1 (39 OK, `io.prio.class` N/A there); C97 OK — PID 1
+      writes the drop-in's value at the reload on 6.8 and 7.0 and is
+      refused, on Debian 13 systemd loads it at the reload and writes it
+      only at a start in the slice, refused; C98 OK with a value above the
+      agent's cgroup (115–142 MB); C105 OK (moved, reload confirmed, back
+      to the configured value).
+    - `ftrace_enabled`: C106 (0 outside a window) refused on the five
+      kernels, the signed detection after 0.010–0.011 s; C106a (1) refused;
+      C106b inside a window let through on 6.1–7.0, the manifest's
+      degradation signed after 1–5 s, back to 1 after 6–11 s (the close or
+      the round), `EBUSY` on 5.15; C106c, the run counts of our programs
+      under one load, the switch at 1, 0, 1: BPF-LSM 10,535–13,333 / 0 /
+      9,784–17,490, kprobe 5 / 0 / 5, fentry (`commit_creds`,
+      `switch_task_namespaces`, `tcp_close`) 5–57 / 0 / 5–59 on 6.1, 6.8,
+      6.12 and 7.0, tracepoint programs unchanged; on 5.15 the write was
+      `EBUSY` and nothing stopped. C106r, the declared residual
+      (`sched_rt_runtime_us`, one byte flipped by a second thread, 2,000
+      writes): 72–210 put the harmful value in, 49–228 refused, put back by
+      the round after 12.6–33.8 s.
+    - The upgrade from main 80c8da36 on Debian 13: OK at the first try
+      (27 of 27 deny hooks, 42 own LSM programs, the identity kept). Its
+      reboot then started no unit, and a cold boot on 7.0 neither: the
+      lab's install had started the units without enabling them, and the
+      upgrade kept that. Round 14 on 24.04 measured it: main → main with
+      the units as the lab left them, a cold boot: both inactive; after
+      the operator's `systemctl enable`, the same: the agent up, its pins
+      and LSM programs loaded — main is sound; the lot's `install.sh
+      --upgrade` refused disabled units, nothing changed. Main → the lot by the lot's
+      upgrade-check (round 15, Debian 13, after the operator's enable):
+      the upgrade OK, then its cold boot: the agent and the watchdog
+      active, 73 pin root entries, 42 own LSM programs, "all LSM hooks
+      attached" with 27 of 27 deny hooks.
+    - From round 13 on, every guest was left off and without our agent
+      (the lot's uninstall at the end of each run).
+  - Mutations: set K 24/24 (before R1: the slice, the reload, the copy, the drop-ins,
+    the judge, the sysctls); set L 19/19 (`ftrace_enabled`: the table's
+    entry, the harmful value, the round's restore, the manifest's read, the
+    degradation and its signing and withdrawal, the window's close, the
+    unit's `ReadWritePaths=` and its reader, the detection's text); set M
+    6/6 (every write of `ftrace_enabled` refused: the caller's identity
+    first, its bytes never read, the eBPF's call); set N 2/2 (the unrolled
+    parser, the `check_cfg` emulation); set O 7/7 (the enablement: the
+    refusal, the post-switch check, the rollback's enable, the default
+    target, a runtime enablement, the lab's install, the cold boot) and the
+    cold-boot check's directory (1/1): each caught by a failing test
+  - Gates: on the code of this branch with main 0131394c, `NN_REQUIRE_EBPF_OBJECT=1`
+    (the object built first, its tests never skipped): `cargo xtask
+    build-ebpf --release`; the four clippy runs and `nn-admin`'s, with and
+    without `debug-trigger`, `-D warnings`; `cargo fmt --check`; `cargo
+    test --workspace` 84 suites, 3,696 passed, 0 failed, 17 ignored; the
+    privileged no-run; `nn-proto --features debug-trigger` 61/61;
+    `attack-coverage --check`; `cargo xtask golden` five times (54 files,
+    the same bytes); MSRV 1.89; the fuzz replay (14 targets);
+    `portable-core` (5 targets); lockfiles unchanged
+  - Open: a harmful host drop-in in `slice.d` or `service.d` stays on
+    disk, and an operator's reload inside a window applies it — an
+    accepted residual (the window's opener is trusted, the grant warns;
+    signed: the finding, the degradation, the floors restored at the
+    close; not signed: that it was applied); our own properties put back
+    in systemd's memory without a reload (Wave 2: a `CAP_SYS_ADMIN`
+    thread); a sysctl write through `writev` or io_uring
+    is refused (unread bytes); the window an agent's restart ended is not
+    judged for our own drop-ins; `cpu.uclamp.max`, `memory.swap.max`, a
+    sibling's `memory.low` / `memory.min`; a soft-reboot; a declared
+    residual (the coordinator's decision): the seven sysctls judged by
+    value are judged on the bytes the hook reads before the kernel copies
+    them, so a root writer's second thread can put a harmful value in
+    (measured, C106r on `sched_rt_runtime_us`: 72 to 210 of 2,000 writes
+    put the harmful value in on the five kernels, put back by the round
+    after 12.6 to 33.8 s; signed: each refusal, the round's restore) — lot 280's
+    first item closes it with `cgroup/sysctl` on the root cgroup
+    (`bpf_sysctl_get_new_value`, not carried by ftrace, 5.15 and 6.8, its
+    link protected, this hook kept as the second layer); `ftrace_enabled`
+    is not in it (no write of it judged by value).
 - **Lot 278 — R009 kills in COMBAT only; the installer's window covers its
   own process tree; the lab's "R009 flake" fixed at its cause (C14, C17;
   the false positive of the review of #492, section f).**

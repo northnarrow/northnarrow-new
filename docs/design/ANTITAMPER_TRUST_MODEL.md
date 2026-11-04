@@ -1245,3 +1245,230 @@ Not done, and why:
 - **A soft-reboot** behaves as lot 273b measured it (outside this lot).
 - **Fail-open.** A task hook that cannot read its target's tgid lets the
   change through, counted in its `DENY_FAIL_OPEN` slot and signed.
+
+## Lot 273d — the units' own slice, a confirmed reload, systemd's copy before a respawn, our drop-ins at a window's close, the critical sysctls
+
+**Goal.** The follow-ups of the review of #492 and of its focused re-check:
+what lot 273c left to the next registration or to an operator, and the
+precision its first judge of the host's drop-ins lacked.
+
+### What it closes
+
+- **A slice of the units' own** (`deploy/systemd/northnarrow.slice`; both
+  units `Slice=northnarrow.slice`). `system.slice.d/*.conf` — the host's
+  settings for its system services, a node's reservation, a limit an
+  attacker drops there — no longer reaches the agent and the watchdog; a
+  slice's `slice.d` still does (every slice), judged as before. The
+  slice's own drop-in directories (`/etc`, `/run`, both `system.control`)
+  are made empty by the agent's unit and registered NOCREATE like the
+  units'; the slice file is protected like the unit files; the slice
+  refuses a manual stop and ignores an isolate (`RefuseManualStop=`,
+  `IgnoreOnIsolate=`: `systemctl stop northnarrow.slice` would stop both
+  units). Evaluated sound: the protections are registered by walking the
+  unit's cgroup path upwards (the slice is the units' parent wherever it
+  is), the floors follow the directory's name (a slice's floors), the
+  properties read from systemd name the agent unit's `Slice=`, COMBAT's
+  spared system units accept the slice's path, and an upgrade leaves no
+  stale registration of `system.slice` — every boot prunes the keys it
+  did not register. `install.sh` stages, switches and rolls back the slice
+  with the units; `uninstall.sh` and the packages carry it.
+- **A confirmed reload** (`antitamper_bpf::systemd_bus::reload_verified`,
+  shared with the watchdog). The SIGHUP is sent on a connection to the
+  private socket opened before it — subscribed to the manager's signals
+  without asking — and the reload counts once systemd's `Reloading(false)`
+  arrives; none within 30 s (systemd refuses a reload with less than 16 MB
+  free on `/run`, and from 253 past its `ReloadLimit*`) is a signed
+  `failed` and a degradation (`systemd_reload`), never "requested".
+- **systemd's copy read back** (`antitamper_bpf::unit_props`: the units'
+  and the slice's `MemoryMax`, `MemoryHigh`, `TasksMax`,
+  `CPUQuotaPerSecUSec`, `CPUWeight`, `IOWeight`, over D-Bus without
+  authorization, against the floors). A second refusal of the same file
+  within the 10-minute quiet is verified instead of skipped: a copy still
+  below the floors is reloaded (after the 30-second interval), unless a
+  confirmed reload already found it set by the units' own files — the
+  loop the quiet was for, now a signed degradation while it holds.
+- **The watchdog before each respawn** (`check_systemds_copy`). A
+  `memory.max` of one page in systemd's copy killed the agent at its exec,
+  before any check of its fresh cgroup, and the next respawn took it
+  again. Now the watchdog reads systemd's copy of our units before the
+  start that applies it; a copy below the floors is reloaded (confirmed,
+  read again) unless a harmful host drop-in is on disk, and what it found
+  is a hold record the agent signs (`systemd_copy_below_floor`).
+- **Back to the configured value after a floor.** A file restored to its
+  floor kept it until the next window's close (its configured value, an
+  11 GiB `memory.max`, was a refused write meanwhile). After a confirmed
+  reload — systemd's copy is the units' files again — each file at its
+  floor whose configured value is not below the floor is written with it
+  and its unit's values registered again
+  (`cgroup_guard::back_to_configured`).
+- **Our own drop-ins at a window's close** (`crates/nn-linux/src/own_dropins.rs`).
+  A drop-in made or changed inside a window in our units' or slice's
+  directories (a `set-property` writes `50-<Property>.conf` under
+  `system.control`) stayed after it, and a reload applied it. At the
+  close each is judged as the host's are, against its own unit's floors
+  and semantics: a harmful one is moved to the quarantine — these are our
+  units' files, not the host's — the move is in the window's signed close
+  record (`dropins_quarantined`), and systemd reloads (at most one every
+  30 s: the review's rate limit, which the host's drop-ins no longer
+  need — they are never moved). `install.sh`'s own drop-ins are known by
+  their content and left.
+- **The judge, precise** (the re-check of #492). A slice's floors follow
+  the host: memory a quarter of it, between 544 MiB (the agent's and the
+  watchdog's together) and 1 GiB; a CPU share an eighth of the online
+  CPUs, between half a CPU and one; tasks a quarter of the host's limit,
+  between 264 and 1024 — a small VM's `MemoryHigh=80%`, a `CPUQuota=50%`
+  are not below. Only `NN_` variables and `LD_PRELOAD`, `LD_AUDIT`,
+  `LD_LIBRARY_PATH` are harmful (`MALLOC_ARENA_MAX`, `RUST_LOG`,
+  `GLIBC_TUNABLES` are tuning). `CPUAffinity=` and `AllowedCPUs=` are
+  compared with the online CPUs. The conditions are evaluated on their
+  merits — `Virtualization` (systemd's own, over D-Bus), `Host`,
+  `KernelCommandLine`, `Architecture`, `Security`,
+  `ControlGroupController`, `User`, `Group`, `Capability`, `FirstBoot`,
+  the path ones — and one not evaluated here is an alert, not harmful. A
+  file's last assignment of a key is the one judged (a list's add up, an
+  empty one resets them).
+- **"Would break the agent"**, a separate signed warning
+  (`unit_dropin_breaks_agent`), for the sandbox and capability settings
+  of `service.d` that take what the agent uses: a `SystemCallFilter=`
+  allow list (systemd merges it into the agent's deny list, in that
+  list's mode: its calls are denied to the agent) or a deny list with
+  `bpf`, `perf_event_open` or a group the agent needs; a
+  `CapabilityBoundingSet=~` with one of its capabilities, or an empty one;
+  `ProtectControlGroups=`, `ProtectKernelTunables=`, `ProtectProc=`,
+  `ProcSubset=pid`, `PrivateNetwork=`, `PrivateUsers=`, `PrivatePIDs=`; a
+  `RestrictAddressFamilies=` without `AF_UNIX`, `AF_NETLINK`, `AF_INET`,
+  `AF_INET6`; `IPAddressDeny=any`. The reloads go on.
+- **Visible while it holds.** A harmful host drop-in and a withheld or
+  unconfirmed reload are degradations (`host_dropins`, `systemd_reload`)
+  in `nn-admin status --key`, the capability manifest and the heartbeat —
+  a false positive, which withholds the agent's reloads, is seen too — and
+  are withdrawn when the condition ends (their signed records stay).
+- **The warning at the grant.** A window granted while a harmful drop-in
+  is on disk: `nn-admin trusted-installer-grant` reads the agent's signed
+  status right after the grant (the agent judges the drop-ins at the
+  grant) and prints, before the operator works, that a `daemon-reload`
+  inside the window will kill the agent, the watchdog and journald — the
+  case lot 273c's round 7 measured. A key without `telemetry-read` or
+  `audit-read` gets a hint to look.
+- **`io.prio.class`** (5.14 and later) is a protected resource file
+  (`idle` starves the audit log's writes under contention; floor
+  `no-change`).
+- **The critical sysctls** (`common::cgroup_limits::SYSCTL_FILES`,
+  `crates/nn-linux/src/sysctl_guard.rs`). `vm.overcommit_memory=2` with a
+  ratio below 50 (or `overcommit_kbytes` below 1 GiB) makes the agent's
+  next allocation fail; a `kernel.pid_max` below 32768, a
+  `kernel.threads-max` below 8192 or a `vm.max_map_count` below 65530
+  stop it creating what it runs; `kernel.sched_rt_runtime_us=-1` (or at
+  or past 99 % of the default period) lets a real-time hog own the CPUs.
+  The choice, both: the write deny refuses a write of one of them outside
+  a window when its value is harmful (judged by name on procfs and on the
+  bytes written, `sysctl_write_harmful`; signed `sysctl`, ENGAGED), so the
+  operator's tuning that harms nothing — a raised limit, overcommit 0 or 1
+  — stays possible, and any tuning inside a window; and the integrity
+  round puts back what the kernel could not refuse — a value set at boot
+  (`sysctl.d`) or inside a window — to a safe one (`sysctl_restored`),
+  leaving strict overcommit with a ratio of 50 or more to the operator
+  (`sysctl_strict`, signed).
+- **`kernel.ftrace_enabled`** (R1 of the external review of 04/11; P0). On
+  6.0 to 7.2 a `0` turns every call site ftrace manages back into a NOP,
+  with no error: the BPF trampolines stop — the fentry/fexit sensors, the
+  kprobes on ftrace and, by the kernel's code, the BPF-LSM programs, every
+  deny hook of this document. The lab measured it (C106c, on 6.1, 6.8, 6.12 and 7.0): with the
+switch at 0 our BPF-LSM programs, kprobes and fentry programs ran 0 times
+under a load that ran them thousands of times at 1 (tracepoint programs
+kept running); on 5.15 the write was `EBUSY`. It is the eighth guarded
+  sysctl (`SYSCTL_FTRACE_ENABLED`), and the one of which every write is
+  refused outside a window, whatever it carries (`sysctl_refuses_every_write`,
+  the coordinator's decision of 04/11): no legitimate use of writing it
+  is known — upstream deprecates it and refuses it from 7.3, and a `1`
+  over a `1` changes nothing — and with no value to judge the hook reads
+  no byte, so the race below does not reach it. The agent's own restore
+  passes by its identity (`caller_may`, the agent's family), never by an
+  exception for the name (`sysctl_write_refused`). The switch is also read at every build of the capability
+  manifest (`sysctl_guard::note_ftrace`, 5 s): `0` or unreadable is a
+  signed `ftrace_enabled` degradation while it holds, so the verifier says
+  `DEGRADED`. A `0` set inside a window or at boot is put back to `1` at
+  the window's close (the close record's `sysctls`, a check that now runs
+  for every guarded sysctl) and by the integrity round.
+- **Our own drop-in directories, writable to the agent.** The close's
+  quarantine of a harmful drop-in of ours failed in the installed unit:
+  `ProtectSystem=strict` left `/etc/systemd/system*/northnarrow-*.d` and
+  `/run/systemd/system*/northnarrow-*.d` read-only to the agent, and the
+  signed close record said `NOT moved (Read-only file system)` (the lab's
+  round 11 on Debian 13, C105). The agent's unit lists the fourteen
+  directories in a second `ReadWritePaths=` (each `-`: made by the
+  `ExecStartPre=+` lines); they stay NOCREATE to every other pid.
+
+### Operator notes
+
+- **Debugging PID 1 takes a window**: `gdb -p 1`, `strace -p 1`,
+  `ltrace -p 1`, `gcore 1`, reading `/proc/1/mem` (forensic memory tools),
+  `/proc/1/stack`, `/proc/1/syscall`, `process_vm_readv` and
+  `pidfd_getfd` on PID 1 are attach mode (lot 273c). Read mode — `ps`,
+  `lsof`, `/proc/1/environ`, `/proc/1/maps`, `nsenter -t 1`, `perf -p 1`
+  — needs none.
+- **A window ends with the agent that opened it**, by design
+  (fail-closed): at its start the agent zeroes the pinned grants
+  (`FS_GRANT`, `KILL_GRANT`). A maintenance that restarts the agent asks
+  for a new grant before its next protected step; `install.sh --upgrade`
+  does — its rollback, once the new agent runs, opens the new agent's own
+  window with the same key (`open_trusted_installer_window` in the
+  rollback path) — and after the restart it only checks the units'
+  health.
+- **PID 1's memory through a uprobe** (`bpf_probe_write_user` from a
+  program attached to PID 1) is not refused here: it depends on wave 1's
+  refusal of foreign BPF programs and of the rootkit helpers (the BPF
+  guard), which is what keeps PID 1's write-backs trustworthy on that
+  path.
+
+### Residual
+
+- **Accepted residual (the coordinator's decision): an operator's
+  `daemon-reload` inside a window applies a harmful host drop-in already
+  on disk.** Whoever opens a signed window is trusted, and the grant warns
+  before the work (`nn-admin trusted-installer-grant`, the `host_dropins`
+  degradation). What the agent records of it: the drop-in itself is a
+  signed `unit_dropin_harmful` at every integrity round and a
+  `host_dropins` degradation while it is on disk; at the window's close
+  our units' and slice's values below their floors are put back and each
+  restoration is signed (`limit_floor_restored`). There is no signed
+  record that names the drop-in as *applied* inside the window — only
+  those two. When the value it applies ends the agent inside the window
+  (lot 273c's round 7: a 4 KiB slice), no close runs: the next agent's
+  registration restores the floors at its start (signed the same) and the
+  finding comes back at its first round. The floors are not held inside a
+  window.
+- Not in this lot (Wave 2 backlog, the coordinator's decision): putting
+  back in systemd's memory only our units' properties instead of a whole
+  reload — it needs a thread with `CAP_SYS_ADMIN`, against R14's
+  capabilities per thread.
+- A refused write of a guarded sysctl through a call whose bytes the hook
+  does not read (`writev`, io_uring) is refused, as PID 1's unread write
+  is: such a tool needs a window.
+- **Declared residual (the coordinator's decision of 04/11): the seven
+  sysctls judged by value are judged on the bytes the hook reads, before
+  the kernel copies them** (`file_permission` runs before the sysctl's
+  handler copies the buffer). A root writer with a second thread that
+  changes the bytes in between can put a harmful value in. The lab measured it (C106r: `kernel.sched_rt_runtime_us`, `950000` written
+2,000 times while a second thread flipped one byte to make it `990000`):
+72 to 210 of the 2,000 writes put the harmful value in on 5.15, 6.1, 6.8,
+6.12 and 7.0 (49 to 228 were refused), and the agent put one back after
+12.6 to 33.8 s — its round's next pass.
+  It is seen, not silent: each write the hook reads as harmful is a
+  signed `sysctl` refusal, and the integrity round puts a harmful value
+  back at its next pass (30 s, ±20 %), signed `sysctl_restored`. Lot 280
+  ("the switches that blind") closes it, as its first item: a
+  `cgroup/sysctl` program on the root cgroup, which reads the value the
+  kernel already copied (`bpf_sysctl_get_new_value`) and is not carried
+  by ftrace, verified on 5.15 and 6.8, with its link protected from a
+  detach outside a window and this hook kept as the second layer.
+  `ftrace_enabled` is outside this residual: no write of it is judged by
+  value.
+- `kernel.ftrace_enabled=0` silences the trampolines until it is put back
+  (the manifest's next build signs it, the window's close or the round
+  restores it): what fired nothing meanwhile is not recovered.
+- The window closed by an agent's restart is not judged for our own
+  drop-ins (no close ran): the next window's close does it, and the
+  floors hold meanwhile.
+- `cpu.uclamp.max`, `memory.swap.max`, a sibling's `memory.low` /
+  `memory.min` are still not refused.
