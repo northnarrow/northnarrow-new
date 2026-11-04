@@ -5358,11 +5358,45 @@ number in parentheses is a lab PR.
       (`deploy/lab/bus/nn-exp13.c:135`, `:360`).
     - python 0, actions 0.
     No alert was dismissed. Each is listed with its triage in the PR.
-  - Open: the push run after the merge opens the same 161 alerts on
-    `main`, 70 of them `critical` by CodeQL's rating. A maintainer
-    disposes of them (fixed, or closed with its reason); no run is made
-    green by dismissing. The build scripts and proc-macros of the locked
-    dependency tree run in the analyze step, which holds `security-events:
-    write`, as in GitHub's own default setup. Splitting the upload into a
-    job that runs no repository code would take the write away from them.
+  - After the review of #496:
+    - What was wrong: the analyze step held `security-events: write`
+      while rust-analyzer ran the build scripts and proc-macros of the
+      locked dependency tree, so one of them could upload a SARIF or close
+      alerts through the API. The scan also covered directories that no
+      shipped build contains.
+    - What changed:
+      - `analyze` holds `contents: read` only. It runs init and analyze
+        with `upload: never` and keeps the SARIF as an artifact, as its
+        last step, so only an analysis whose every step passed is kept.
+      - `upload` needs `analyze`, runs unless the run was cancelled, and
+        holds `contents: read` and `security-events: write`. Its steps are
+        a checkout (the alerts' locations are fingerprinted against the
+        files; nothing is built or run), download-artifact and
+        upload-sarif at init's commit, with the same category.
+      - `.github/codeql/codeql-config.yml` ignores the members'
+        integration tests (`agent`, `cli`, `scan`, `watchdog` and `xtask`
+        `/tests`), `fuzz` and `deploy/lab`. That leaves no C/C++ or
+        Python in the scan, so the matrix is `actions` and `rust`.
+      - The dependencies' build scripts can still alter the SARIF in
+        `analyze` before it is kept: what they lose is the write to the
+        API, which reaches other analyses and the alerts' state.
+    - Evidence:
+      - `every_workflow_token_is_read_only_unless_it_publishes` allows
+        that write to codeql.yml's `upload` alone. A job holding it may
+        have no `run:` step and no action other than checkout,
+        download-artifact and upload-sarif.
+      - `codeql_scans_every_language_of_the_tree` checks the two jobs and
+        their permissions, the artifact's name, path and place, upload's
+        steps and inputs, and the config. Its paths-ignore must equal the
+        integration-test directories of the members that have them, plus
+        `fuzz` and `deploy/lab`. The languages must equal those of the
+        tracked files outside those directories.
+      - 69 mutations of the workflow and the config: 39 carried over, 19
+        of the split, 11 of the config. Each one fails a named test.
+  - Open: the first push run after the merge opens 132 alerts on `main`.
+    126 are in test code or the fuzz fixture (64 of them `critical` by
+    CodeQL's rating, fixed test keys and nonces), and 6 are the false
+    positives above. Their list with each reason ("used in tests", "false
+    positive") is for the founder, who decides each closure in the UI. No
+    run is made green by dismissing.
   - Level unchanged (C27 1).

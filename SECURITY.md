@@ -70,14 +70,23 @@ through ENISA's single reporting platform:
 ## Code scanning
 
 CodeQL (GitHub code scanning, `.github/workflows/codeql.yml`) analyses
-every language of the tree with the `security-extended` queries: the Rust
-workspace, `agent-ebpf` and the fuzz harness; the lab's C probes and
-Python helpers under `deploy/lab/`; and the GitHub Actions workflows. It
+every language of what ships, with the `security-extended` queries: the
+Rust of the workspace and `agent-ebpf` (`#[cfg(test)]` modules included)
+and the GitHub Actions workflows. Directories that no shipped build
+contains are not scanned: the crates' integration tests (`*/tests/`), the
+fuzz harness (`fuzz/`) and the lab's tooling (`deploy/lab/`, which holds
+the tree's only C and Python). `.github/codeql/codeql-config.yml` lists
+them, and a repository test keeps that list to such directories. CodeQL
 runs on every pull request to `main`, on every push to `main` and weekly,
 so a query added by a new CodeQL release also runs on an unchanged `main`.
 Each language is analysed without a build (`build-mode: none`). A pull
 request's analysis is diff-informed: it reports the alerts in the lines
 the pull request changes, and the runs on `main` cover the rest.
+
+The job that analyses the code holds a read-only token. The analysis
+runs the build scripts and proc-macros of the dependencies, and none of
+them can write code-scanning results or close an alert. A separate job,
+which builds and runs nothing of the tree, uploads the results.
 
 - An alert is fixed in the code, or triaged in a pull request (real,
   false positive, not applicable) and its fix scheduled; it is not

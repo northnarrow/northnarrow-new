@@ -5,7 +5,8 @@
 //! PROC-015; and the CodeQL code scanning (lot codeql). The tests read
 //! committed files; seven run a local tool and none touches the network:
 //! `codeql_scans_every_language_of_the_tree` lists the tracked files
-//! (`git ls-files`), `prune_script_fails_closed` runs the CI prune
+//! (`git ls-files`) and the members (`cargo metadata --offline`),
+//! `prune_script_fails_closed` runs the CI prune
 //! script under bash with a stub `cargo`, `advisory_exceptions_expire_in_ci`
 //! runs the CI expiry check under bash with a fixed date,
 //! `rust_version_covers_every_locked_dependency` runs `cargo metadata
@@ -459,14 +460,23 @@ fn str_of<'a>(v: &'a serde_yaml_ng::Value, key: &str) -> Option<&'a str> {
 /// default, which can be read/write. Every workflow starts read-only; a
 /// job asks for more only where it publishes: release.yml's `publish`
 /// writes the release, `sign` the attestations (SUP-024: never both), and
-/// codeql.yml's `analyze` its code-scanning results (lot codeql).
+/// codeql.yml's `upload` the code-scanning results (lot codeql), a job that
+/// runs nothing of the tree (review of #496).
 #[test]
 fn every_workflow_token_is_read_only_unless_it_publishes() {
     const WRITE_ALLOWED: [(&str, &str, &str); 4] = [
         (".github/workflows/release.yml", "publish", "contents"),
         (".github/workflows/release.yml", "sign", "id-token"),
         (".github/workflows/release.yml", "sign", "attestations"),
-        (".github/workflows/codeql.yml", "analyze", "security-events"),
+        (".github/workflows/codeql.yml", "upload", "security-events"),
+    ];
+    // Review of #496: a job that may write code-scanning results runs
+    // nothing of the tree (with that token a build script or a proc-macro
+    // could upload a SARIF or close alerts): no `run:` step, only these.
+    const UPLOAD_ONLY: [&str; 3] = [
+        "actions/checkout@",
+        "actions/download-artifact@",
+        "github/codeql-action/upload-sarif@",
     ];
     let mut bad = Vec::new();
     for file in workflow_files() {
@@ -503,6 +513,17 @@ fn every_workflow_token_is_read_only_unless_it_publishes() {
                         .any(|(f, j, s)| *f == name && *j == job && *s == scope)
                 {
                     bad.push(format!("{name}: job {job}: {scope}: write"));
+                }
+                if scope == "security-events" && level.as_str() == Some("write") {
+                    for step in steps(&body) {
+                        let only = str_of(&step, "uses")
+                            .is_some_and(|u| UPLOAD_ONLY.iter().any(|p| u.starts_with(p)));
+                        if step.get("run").is_some() || !only {
+                            bad.push(format!(
+                                "{name}: job {job} may write code-scanning results and runs {step:?}"
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -2855,36 +2876,65 @@ fn the_codeql_language_of_a_file() {
     }
 }
 
-/// The `key: value` mapping of `v` as (key, value) strings, in order.
+/// The `key: value` mapping of `v` as (key, value) strings, in order (a
+/// number or a boolean as YAML writes it).
 fn string_pairs(v: Option<&serde_yaml_ng::Value>) -> Vec<(String, String)> {
+    let scalar = |v: &serde_yaml_ng::Value| match v {
+        serde_yaml_ng::Value::String(s) => s.clone(),
+        serde_yaml_ng::Value::Number(n) => n.to_string(),
+        serde_yaml_ng::Value::Bool(b) => b.to_string(),
+        other => format!("{other:?}"),
+    };
     v.and_then(|m| m.as_mapping())
         .map(|m| {
             m.iter()
-                .map(|(k, v)| {
-                    (
-                        k.as_str().unwrap_or("?").to_string(),
-                        v.as_str().unwrap_or("?").to_string(),
-                    )
-                })
+                .map(|(k, v)| (k.as_str().unwrap_or("?").to_string(), scalar(v)))
                 .collect()
         })
         .unwrap_or_default()
 }
 
-/// Lot codeql: CodeQL analyses every language of the tree, without a build
-/// and with the `security-extended` suite, on every pull request to main
-/// (no path filter: none can skip it), every push to main and weekly. Its
-/// token reads the repository; the analyze job alone may also write the
-/// code-scanning results. The Rust job installs every toolchain the tree
-/// pins (each `rust-toolchain.toml`), fetches every cargo project from its
-/// lockfile and fails if the extraction changed one; the CodeQL bundle the
-/// runner caches is not deleted, and no step is handed a secret.
+fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+    list.iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+const CODEQL_CONFIG: &str = ".github/codeql/codeql-config.yml";
+
+/// Review of #496: what CodeQL does not scan — only directories no
+/// shipped build contains: each workspace member's cargo integration tests
+/// (`<member>/tests`, when it has any), the fuzz harness and the lab's
+/// tooling.
+fn codeql_unshipped_dirs(tracked: &[String]) -> Vec<String> {
+    let mut dirs: Vec<String> = support::members()
+        .into_iter()
+        .map(|m| format!("{}/tests", m.dir))
+        .filter(|d| tracked.iter().any(|f| f.starts_with(&format!("{d}/"))))
+        .collect();
+    dirs.extend(["fuzz".to_string(), "deploy/lab".to_string()]);
+    dirs.sort();
+    dirs
+}
+
+/// Lot codeql: CodeQL analyses every language of what ships, without a
+/// build and with the `security-extended` suite, on every pull request to
+/// main (no path filter: none can skip it), every push to main and
+/// weekly. Its config ignores only the directories no shipped build
+/// contains. Review of #496: the analysis runs with a read-only token and
+/// keeps its SARIF as an artifact; a second job, which runs nothing of the
+/// tree, uploads it with `security-events: write`. The Rust job installs
+/// every toolchain the tree pins (each `rust-toolchain.toml`), fetches
+/// every cargo project from its lockfile and fails if the extraction
+/// changed one; the CodeQL bundle the runner caches is not deleted, and no
+/// step is handed a secret.
 #[test]
 fn codeql_scans_every_language_of_the_tree() {
     const FILE: &str = ".github/workflows/codeql.yml";
     let path = repo_root().join(FILE);
     let text = read(&path);
     let wf = workflow_yaml(&path);
+    let tracked = support::tracked_files();
 
     // When: every pull request and push to main, and a weekly schedule.
     let on = wf.get("on").expect("codeql.yml: `on:`");
@@ -2930,42 +2980,82 @@ fn codeql_scans_every_language_of_the_tree() {
         crons[0]
     );
 
-    // The token: read at the top, security-events: write on analyze alone.
-    let rw = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    };
+    // The token: read everywhere; security-events: write on upload alone.
     assert_eq!(
         string_pairs(wf.get("permissions")),
-        rw(&[("contents", "read")]),
+        pairs(&[("contents", "read")]),
         "{FILE}: top-level permissions"
     );
     let all = jobs(&wf);
     assert_eq!(
         all.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
-        ["analyze"],
-        "{FILE}: one job"
+        ["analyze", "upload"],
+        "{FILE}: the jobs"
     );
-    let job = &all[0].1;
+    let (job, upload) = (&all[0].1, &all[1].1);
     assert_eq!(
         string_pairs(job.get("permissions")),
-        rw(&[("contents", "read"), ("security-events", "write")]),
-        "{FILE}: analyze's permissions"
+        pairs(&[("contents", "read")]),
+        "{FILE}: analyze runs the dependency tree's code: read only"
     );
-    assert!(
-        job.get("timeout-minutes")
-            .and_then(|t| t.as_u64())
-            .is_some(),
-        "{FILE}: analyze has a timeout"
+    assert_eq!(
+        string_pairs(upload.get("permissions")),
+        pairs(&[("contents", "read"), ("security-events", "write")]),
+        "{FILE}: upload's permissions"
     );
-    assert!(
-        job.get("continue-on-error").is_none(),
-        "{FILE}: a failed analysis fails the run"
+    for (name, j) in [("analyze", job), ("upload", upload)] {
+        assert!(
+            j.get("timeout-minutes").and_then(|t| t.as_u64()).is_some(),
+            "{FILE}: {name} has a timeout"
+        );
+        assert!(
+            j.get("continue-on-error").is_none(),
+            "{FILE}: a failed {name} fails the run"
+        );
+    }
+    assert_eq!(
+        str_of(upload, "needs"),
+        Some("analyze"),
+        "{FILE}: upload needs analyze"
+    );
+    assert_eq!(
+        str_of(upload, "if"),
+        Some("${{ !cancelled() }}"),
+        "{FILE}: each language is uploaded even if another one failed"
     );
 
-    // What: every language of the tracked files, each without a build.
+    // What: every language of the shipped tree, each without a build. The
+    // config ignores the unshipped directories and nothing else.
+    let config = workflow_yaml(&repo_root().join(CODEQL_CONFIG));
+    let config_keys: Vec<&str> = config
+        .as_mapping()
+        .map(|m| m.keys().filter_map(|k| k.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        config_keys,
+        ["name", "paths-ignore"],
+        "{CODEQL_CONFIG}: its keys"
+    );
+    let mut ignored: Vec<String> = config
+        .get("paths-ignore")
+        .and_then(|p| p.as_sequence())
+        .map(|p| {
+            p.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let listed = ignored.len();
+    ignored.sort();
+    ignored.dedup();
+    assert_eq!(ignored.len(), listed, "{CODEQL_CONFIG}: a path twice");
+    let unshipped = codeql_unshipped_dirs(&tracked);
+    assert!(unshipped.len() >= 4, "{unshipped:?}");
+    assert_eq!(
+        ignored, unshipped,
+        "{CODEQL_CONFIG}: paths-ignore lists exactly the directories no shipped build contains"
+    );
     let mut scanned = Vec::new();
     let include = job
         .get("strategy")
@@ -2986,8 +3076,9 @@ fn codeql_scans_every_language_of_the_tree() {
     sorted.sort();
     sorted.dedup();
     assert_eq!(sorted.len(), scanned.len(), "{FILE}: a language twice");
-    let present: std::collections::BTreeSet<String> = support::tracked_files()
+    let present: std::collections::BTreeSet<String> = tracked
         .iter()
+        .filter(|f| !ignored.iter().any(|d| f.starts_with(&format!("{d}/"))))
         .filter_map(|f| codeql_language(f))
         .map(str::to_string)
         .collect();
@@ -2995,26 +3086,52 @@ fn codeql_scans_every_language_of_the_tree() {
     assert_eq!(
         sorted,
         present.into_iter().collect::<Vec<_>>(),
-        "{FILE}: the languages scanned are the languages of the tracked files"
+        "{FILE}: the languages scanned are those of the tracked files outside {CODEQL_CONFIG}'s paths-ignore"
+    );
+    let uploaded: Vec<String> = upload
+        .get("strategy")
+        .and_then(|s| s.get("matrix"))
+        .and_then(|m| m.get("language"))
+        .and_then(|l| l.as_sequence())
+        .map(|l| {
+            l.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut uploaded_sorted = uploaded.clone();
+    uploaded_sorted.sort();
+    assert_eq!(
+        uploaded_sorted, sorted,
+        "{FILE}: upload's languages are analyze's"
     );
 
-    // How: init and analyze at one pin, the suite, a category per language.
+    // How: checkout, init, analyze (kept), the artifact last; one pin for
+    // every codeql-action step.
     let job_steps = steps(job);
-    let uses = |prefix: &str| -> (usize, &serde_yaml_ng::Value) {
-        let found: Vec<(usize, &serde_yaml_ng::Value)> = job_steps
+    let uses_in = |all: &[serde_yaml_ng::Value], prefix: &str| -> usize {
+        let found: Vec<usize> = all
             .iter()
             .enumerate()
             .filter(|(_, s)| str_of(s, "uses").is_some_and(|u| u.starts_with(prefix)))
+            .map(|(i, _)| i)
             .collect();
         assert_eq!(found.len(), 1, "{FILE}: one `{prefix}` step");
         found[0]
     };
-    let (checkout, _) = uses("actions/checkout@");
-    let (init_at, init) = uses("github/codeql-action/init@");
-    let (analyze_at, analyze) = uses("github/codeql-action/analyze@");
+    let checkout = uses_in(&job_steps, "actions/checkout@");
+    let init_at = uses_in(&job_steps, "github/codeql-action/init@");
+    let analyze_at = uses_in(&job_steps, "github/codeql-action/analyze@");
+    let keep_at = uses_in(&job_steps, "actions/upload-artifact@");
     assert!(
-        checkout < init_at && init_at < analyze_at,
-        "{FILE}: checkout, then init, then analyze"
+        checkout < init_at && init_at < analyze_at && keep_at == job_steps.len() - 1,
+        "{FILE}: checkout, then init, then analyze; the artifact last"
+    );
+    let (init, analyze, keep) = (
+        &job_steps[init_at],
+        &job_steps[analyze_at],
+        &job_steps[keep_at],
     );
     let pin = |s: &serde_yaml_ng::Value| {
         str_of(s, "uses")
@@ -3029,28 +3146,85 @@ fn codeql_scans_every_language_of_the_tree() {
     let with = |s: &serde_yaml_ng::Value| string_pairs(s.get("with"));
     assert_eq!(
         with(init),
-        rw(&[
+        pairs(&[
             ("languages", "${{ matrix.language }}"),
             ("build-mode", "${{ matrix.build-mode }}"),
+            ("config-file", &format!("./{CODEQL_CONFIG}")),
             ("queries", "security-extended"),
         ]),
         "{FILE}: init's inputs"
     );
+    let category = "/language:${{ matrix.language }}";
+    let analyze_with = with(analyze);
     assert_eq!(
-        with(analyze),
-        rw(&[("category", "/language:${{ matrix.language }}")]),
-        "{FILE}: analyze's inputs (the results are uploaded: no `upload:`)"
+        analyze_with
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>(),
+        ["category", "upload", "output"],
+        "{FILE}: analyze's inputs"
     );
-    for s in [init, analyze] {
+    assert_eq!(analyze_with[0].1, category, "{FILE}: analyze's category");
+    assert_eq!(
+        analyze_with[1].1, "never",
+        "{FILE}: analyze uploads nothing"
+    );
+    let sarif_dir = analyze_with[2].1.clone();
+    let artifact = "codeql-sarif-${{ matrix.language }}";
+    assert_eq!(
+        with(keep),
+        pairs(&[
+            ("name", artifact),
+            ("path", &sarif_dir),
+            ("if-no-files-found", "error"),
+            ("retention-days", "5"),
+        ]),
+        "{FILE}: the artifact holds analyze's SARIF"
+    );
+    for s in [init, analyze, keep] {
         assert!(s.get("continue-on-error").is_none(), "{FILE}: {s:?}");
         assert!(s.get("if").is_none(), "{FILE}: every language runs {s:?}");
     }
 
+    // The upload: checkout, the artifact, upload-sarif; nothing else.
+    let up_steps = steps(upload);
+    assert_eq!(up_steps.len(), 3, "{FILE}: upload's steps");
+    let (co, dl, up) = (&up_steps[0], &up_steps[1], &up_steps[2]);
+    assert!(str_of(co, "uses").is_some_and(|u| u.starts_with("actions/checkout@")));
+    assert_eq!(
+        with(co),
+        pairs(&[("persist-credentials", "false")]),
+        "{FILE}: upload checks out this commit, nothing more"
+    );
+    assert!(str_of(dl, "uses").is_some_and(|u| u.starts_with("actions/download-artifact@")));
+    assert_eq!(
+        with(dl),
+        pairs(&[("name", artifact), ("path", &sarif_dir)]),
+        "{FILE}: upload downloads analyze's artifact"
+    );
+    assert!(
+        str_of(up, "uses").is_some_and(|u| u.starts_with("github/codeql-action/upload-sarif@")),
+        "{FILE}: upload's last step is upload-sarif"
+    );
+    assert_eq!(pin(up), pin(init), "{FILE}: upload-sarif at init's commit");
+    assert_eq!(
+        with(up),
+        pairs(&[("sarif_file", &sarif_dir), ("category", category)]),
+        "{FILE}: upload-sarif's inputs"
+    );
+    for s in &up_steps {
+        assert!(
+            s.get("run").is_none() && s.get("if").is_none() && s.get("continue-on-error").is_none(),
+            "{FILE}: upload {s:?}"
+        );
+    }
+
     // Rust: the pinned toolchains, every lockfile fetched and left as it was.
     let rust_only = |s: &serde_yaml_ng::Value| str_of(s, "if") == Some("matrix.language == 'rust'");
-    let lockfiles: Vec<String> = support::tracked_files()
-        .into_iter()
-        .filter(|f| f == "Cargo.lock" || f.ends_with("/Cargo.lock"))
+    let lockfiles: Vec<String> = tracked
+        .iter()
+        .filter(|f| *f == "Cargo.lock" || f.ends_with("/Cargo.lock"))
+        .cloned()
         .collect();
     assert!(lockfiles.len() >= 3, "{lockfiles:?}");
     let prepare = job_steps[..init_at]
@@ -3059,9 +3233,9 @@ fn codeql_scans_every_language_of_the_tree() {
         .unwrap_or_else(|| panic!("{FILE}: a Rust step before init fetches the dependencies"));
     let lines = script_lines(str_of(prepare, "run").unwrap());
     let has = |line: &str| lines.iter().any(|l| l.trim() == line);
-    let toolchains: Vec<String> = support::tracked_files()
-        .into_iter()
-        .filter(|f| f == "rust-toolchain.toml" || f.ends_with("/rust-toolchain.toml"))
+    let toolchains: Vec<&String> = tracked
+        .iter()
+        .filter(|f| *f == "rust-toolchain.toml" || f.ends_with("/rust-toolchain.toml"))
         .collect();
     assert!(toolchains.len() >= 2, "{toolchains:?}");
     for file in &toolchains {
@@ -3079,12 +3253,14 @@ fn codeql_scans_every_language_of_the_tree() {
         };
         assert!(has(&fetch), "{FILE}: `{fetch}` before init");
     }
-    let check = job_steps[analyze_at + 1..]
+    let check = job_steps[analyze_at + 1..keep_at]
         .iter()
         .find(|s| {
             rust_only(s) && str_of(s, "run").is_some_and(|r| r.contains("git diff --exit-code"))
         })
-        .unwrap_or_else(|| panic!("{FILE}: a Rust step after analyze checks the lockfiles"));
+        .unwrap_or_else(|| {
+            panic!("{FILE}: a Rust step between analyze and the artifact checks the lockfiles")
+        });
     let check = str_of(check, "run").unwrap();
     for lock in &lockfiles {
         assert!(
