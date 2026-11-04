@@ -828,12 +828,17 @@ fn r011_records_a_packaged_modprobe_and_kills_an_insmod_from_tmp() {
     assert!(status.success(), "modprobe dummy: {status}");
     let rec = r011_record_of(&fx, pid);
     assert_eq!(rec["severity"], "High", "record: {rec}");
+    // The verdict is the evidence: a record, not a kill. The fixture's
+    // agent is detect-only, where a Log decision's report is "would
+    // execute" too (`Executor::log_report` under `dry_run`), so `response`
+    // reads as a kill's would (lot 279's lab: this asserted "none" and
+    // failed on both guests with the verdict Log).
     assert_eq!(
         rec["verdict"],
         serde_json::json!({"Rule": "Log"}),
         "record: {rec}"
     );
-    assert_eq!(rec["response"], "none", "record: {rec}");
+    assert_eq!(rec["response"], "suppressed (detect-only)", "record: {rec}");
     let _ = Command::new("rmmod")
         .arg("dummy")
         .stderr(Stdio::null())
