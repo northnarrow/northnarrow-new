@@ -90,12 +90,16 @@ pub fn judge(
     if !nn_model::netaddr::is_public(dst) {
         return DnsResolution::NotJudged;
     }
-    if !caught_up {
-        return DnsResolution::Unknown;
-    }
     let Some(since) = table.sensor_since() else {
+        table.count_unknown(UnknownWhy::Sensor);
         return DnsResolution::Unknown;
     };
+    if !caught_up {
+        // the second review of #495, R2: signed (one a window), counted
+        table.count_unknown(UnknownWhy::Barrier);
+        table.note_coverage_lost(CoverageCause::Barrier, Some(pid), None, ts_ns);
+        return DnsResolution::Unknown;
+    }
     let as_of = AsOf::judged(ts_ns);
     // a process `/proc` no longer shows (a quick connect and exit): its
     // start as the spawn cache knows it
@@ -111,6 +115,7 @@ pub fn judge(
         w.into_iter().filter(|(p, _)| *p != pid).collect()
     });
     if r.not_resolved_by_lineage() && (start == 0 || start < since) {
+        table.count_unknown(UnknownWhy::Older);
         DnsResolution::Unknown
     } else {
         r

@@ -49,6 +49,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   DNS response sensor, a name asked whose response was not seen whole, DNS
   records held back or lost — host-wide for 5 minutes for a user's or a
   ring's —, the DNS pumps not caught up, the parse worker not answering).
+  A blinding shows: a signed `nodns_coverage_lost` audit row (its cause and
+  the pid or uid that caused it, one a cause every 5 minutes) and the
+  heartbeat's `nodns` counters of the rule's judgements by outcome and
+  unknown reason. A system resolver whose response binds other processes
+  is its executable at its system path, one of the resolver users (never
+  root) and the host's mount namespace — never a path alone.
 - The agent's threads each keep only their capabilities, its keys in one
   place, its unit hardened (lot 272, Wave 4 phase 2, R14c of the
   restructure plan, §3.1–§3.3; `docs/architecture/PROCESS_MODEL.md` §8–§10).

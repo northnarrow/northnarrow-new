@@ -114,8 +114,8 @@ pub struct Answer<'a> {
     pub resolver: bool,
 }
 
-/// The system resolvers' executables (review of #495, D4): a response one of
-/// them receives counts host-wide.
+/// The system resolvers' executables (review of #495, D4; its second
+/// review, R1): a response one of them receives counts host-wide.
 pub const SYSTEM_RESOLVER_EXES: &[&str] = &[
     "/usr/lib/systemd/systemd-resolved",
     "/lib/systemd/systemd-resolved",
@@ -123,18 +123,101 @@ pub const SYSTEM_RESOLVER_EXES: &[&str] = &[
     "/usr/bin/dnsmasq",
     "/usr/sbin/nscd",
     "/usr/sbin/unbound",
+    "/usr/sbin/named",
+    "/usr/sbin/pdns_recursor",
+    "/usr/sbin/kresd",
 ];
 
-/// The highest uid of a system account: a resolver runs as one.
-pub const SYSTEM_UID_MAX: u32 = 999;
-
-/// The receiver of a response is a system resolver: its executable (the
+/// The receiver of a response may be a system resolver: its executable (the
 /// image the kernel executed, as the spawn cache knows it) is one of
-/// [`SYSTEM_RESOLVER_EXES`], and it runs as a system uid — so a user's copy
-/// of the program (in a namespace of its own, under another path) is not.
-/// Never by process name.
-pub fn is_system_resolver(exe: Option<&str>, uid: u32) -> bool {
-    uid <= SYSTEM_UID_MAX && exe.is_some_and(|e| SYSTEM_RESOLVER_EXES.contains(&e))
+/// [`SYSTEM_RESOLVER_EXES`], and its uid one of the host's resolver users
+/// (`resolver_uids`: the dedicated accounts of `RESOLVER_USERS` in the
+/// host's `/etc/passwd`), never root. A path alone is never an identity
+/// (the second review of #495, R1): the caller also requires the process to
+/// run in the host's mount namespace, where that path names the host's
+/// file — a container's `/usr/sbin/dnsmasq`, any program at that path in a
+/// namespace of its own, is not one. Never by process name.
+pub fn is_system_resolver(exe: Option<&str>, uid: u32, resolver_uids: &[u32]) -> bool {
+    uid != 0
+        && resolver_uids.contains(&uid)
+        && exe.is_some_and(|e| SYSTEM_RESOLVER_EXES.contains(&e))
+}
+
+/// Why NN-L-NET-028's DNS evidence was lost for every process (the second
+/// review of #495, R2): the cause of a signed `nodns_coverage_lost`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CoverageCause {
+    /// A DNS record the parse worker did not decode.
+    Undecoded,
+    /// A user's DNS records the kernel's budget held back.
+    UserHeld,
+    /// A DNS ring or budget lost records (its `RING_DROPS` slots grew, or
+    /// cannot be read).
+    Losses,
+    /// A connect judged before the DNS pumps had read the records made
+    /// before it (its barrier's wait ended first).
+    Barrier,
+}
+
+impl CoverageCause {
+    pub const ALL: [CoverageCause; 4] = [
+        CoverageCause::Undecoded,
+        CoverageCause::UserHeld,
+        CoverageCause::Losses,
+        CoverageCause::Barrier,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CoverageCause::Undecoded => "undecoded",
+            CoverageCause::UserHeld => "user_held",
+            CoverageCause::Losses => "dns_losses",
+            CoverageCause::Barrier => "barrier",
+        }
+    }
+}
+
+/// A loss of NN-L-NET-028's coverage, to be signed: its cause, the process
+/// or user that caused it when known, when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageLoss {
+    pub cause: CoverageCause,
+    pub pid: Option<u32>,
+    pub uid: Option<u32>,
+    pub ts_ns: u64,
+    /// How long the evidence stays degraded for every process (0: the one
+    /// connect only, a barrier's).
+    pub window_secs: u64,
+}
+
+/// A cause's loss is signed at most this often (the second review of #495,
+/// R2: rate-limited, one per cause per window).
+pub const COVERAGE_RECORD_EVERY_SECS: u64 = UNSEEN_WINDOW_SECS;
+
+/// NN-L-NET-028's judgements by outcome, and the unknown ones by reason
+/// (the second review of #495, R2: carried by the heartbeat).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Judgements {
+    pub lineage: u64,
+    pub other_lineage: u64,
+    pub unresolved: u64,
+    /// The evidence degraded for every process (undecoded, a user's held
+    /// records, DNS losses).
+    pub unknown_degraded: u64,
+    /// The lineage's own DNS records held back.
+    pub unknown_held: u64,
+    /// A name the lineage asked whose response was never seen whole.
+    pub unknown_unseen: u64,
+    /// A binding of a process whose start is not known.
+    pub unknown_start: u64,
+    /// The DNS pumps had not read the records made before the connect.
+    pub unknown_barrier: u64,
+    /// The DNS response sensor does not run.
+    pub unknown_sensor: u64,
+    /// The process predates the sensor, or its start is not known.
+    pub unknown_older: u64,
+    /// `nodns_coverage_lost` records queued to be signed.
+    pub coverage_records: u64,
 }
 
 /// What the table did, for `nn-admin` and the tests.
@@ -158,6 +241,17 @@ struct NameEntry {
     cnames: HashMap<String, u64>,
     /// When the name stops counting as answered.
     answered_until: u64,
+}
+
+/// Why a judgement outside [`ResolvedTable::check`] is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownWhy {
+    /// The DNS response sensor does not run.
+    Sensor,
+    /// The DNS pumps had not caught up.
+    Barrier,
+    /// The process predates the sensor, or its start is not known.
+    Older,
 }
 
 /// What a member's binding of an address says ([`ResolvedTable::check`]).
@@ -197,6 +291,10 @@ struct Inner {
     /// until then: the evidence is incomplete for every process.
     degraded_until: u64,
     counters: Counters,
+    judgements: Judgements,
+    /// Coverage losses to be signed, and when each cause was last queued.
+    coverage: Vec<CoverageLoss>,
+    coverage_last: HashMap<CoverageCause, u64>,
 }
 
 impl std::fmt::Debug for Inner {
@@ -297,6 +395,67 @@ impl<I: Default> ResolvedTable<I> {
 
     pub fn counters(&self) -> Counters {
         self.inner.lock().counters
+    }
+
+    /// NN-L-NET-028's judgements so far.
+    pub fn judgements(&self) -> Judgements {
+        self.inner.lock().judgements
+    }
+
+    /// A judgement made outside [`Self::check`] (the host's: no sensor, the
+    /// barrier, a process older than the sensor), counted.
+    pub fn count_unknown(&self, why: UnknownWhy) {
+        let mut g = self.inner.lock();
+        let j = &mut g.judgements;
+        match why {
+            UnknownWhy::Sensor => j.unknown_sensor += 1,
+            UnknownWhy::Barrier => j.unknown_barrier += 1,
+            UnknownWhy::Older => j.unknown_older += 1,
+        }
+    }
+
+    /// The coverage losses queued since the last call, to be signed.
+    pub fn take_coverage_losses(&self) -> Vec<CoverageLoss> {
+        std::mem::take(&mut self.inner.lock().coverage)
+    }
+
+    /// NN-L-NET-028's evidence is lost for every process from `ts_ns`
+    /// (`window_secs` long; 0: no window, one connect's — the barrier's),
+    /// for `cause`, by `pid` or `uid` when known: queued to be signed at
+    /// most once a cause per [`COVERAGE_RECORD_EVERY_SECS`].
+    pub fn note_coverage_lost(
+        &self,
+        cause: CoverageCause,
+        pid: Option<u32>,
+        uid: Option<u32>,
+        ts_ns: u64,
+    ) {
+        let window_secs = if cause == CoverageCause::Barrier {
+            0
+        } else {
+            UNSEEN_WINDOW_SECS
+        };
+        let mut g = self.inner.lock();
+        if window_secs > 0 {
+            g.degraded_until = g
+                .degraded_until
+                .max(ts_ns.saturating_add(window_secs * SEC));
+        }
+        let due = g
+            .coverage_last
+            .get(&cause)
+            .is_none_or(|last| ts_ns < *last || ts_ns - *last >= COVERAGE_RECORD_EVERY_SECS * SEC);
+        if due {
+            g.coverage_last.insert(cause, ts_ns);
+            g.coverage.push(CoverageLoss {
+                cause,
+                pid,
+                uid,
+                ts_ns,
+                window_secs,
+            });
+            g.judgements.coverage_records += 1;
+        }
     }
 
     /// A response `a.pid` received. Of its records, those of the question's
@@ -491,10 +650,7 @@ impl<I: Default> ResolvedTable<I> {
     /// binding covers is unknown, for every process: a lost response may
     /// have named it.
     pub fn note_undecoded(&self, ts_ns: u64) {
-        let mut g = self.inner.lock();
-        g.degraded_until = g
-            .degraded_until
-            .max(ts_ns.saturating_add(UNSEEN_WINDOW_SECS * SEC));
+        self.note_coverage_lost(CoverageCause::Undecoded, None, None, ts_ns);
     }
 
     /// The addresses `name` resolves to at `now_ns`, through at most
@@ -601,7 +757,10 @@ impl<I: Default> ResolvedTable<I> {
         g.counters.checks += 1;
         let mut start_unknown = false;
         match Self::use_binding(&mut g, pid, start_ns, addr, now_ns) {
-            Bind::Used => return DnsResolution::Lineage,
+            Bind::Used => {
+                g.judgements.lineage += 1;
+                return DnsResolution::Lineage;
+            }
             Bind::StartUnknown => start_unknown = true,
             Bind::None => {}
         }
@@ -611,20 +770,29 @@ impl<I: Default> ResolvedTable<I> {
         let mut g = self.inner.lock();
         for (p, s) in members.iter().skip(1) {
             match Self::use_binding(&mut g, *p, *s, addr, now_ns) {
-                Bind::Used => return DnsResolution::Lineage,
+                Bind::Used => {
+                    g.judgements.lineage += 1;
+                    return DnsResolution::Lineage;
+                }
                 Bind::StartUnknown => start_unknown = true,
                 Bind::None => {}
             }
         }
         // N2: a binding of a member whose start is not known may be an
         // earlier holder's of its pid: neither used nor ignored
-        if start_unknown || now_ns <= g.degraded_until {
+        if start_unknown {
+            g.judgements.unknown_start += 1;
+            return DnsResolution::Unknown;
+        }
+        if now_ns <= g.degraded_until {
+            g.judgements.unknown_degraded += 1;
             return DnsResolution::Unknown;
         }
         let since = now_ns.saturating_sub(UNSEEN_WINDOW_SECS * SEC);
         for (p, s) in &members {
             let from = since.max(*s);
             if g.held.get(p).is_some_and(|t| *t >= from && *t <= now_ns) {
+                g.judgements.unknown_held += 1;
                 return DnsResolution::Unknown;
             }
             let unseen = g.asks.get(p).is_some_and(|q| {
@@ -636,12 +804,15 @@ impl<I: Default> ResolvedTable<I> {
                 })
             });
             if unseen {
+                g.judgements.unknown_unseen += 1;
                 return DnsResolution::Unknown;
             }
         }
         if g.addrs.get(&addr).is_some_and(|until| *until >= now_ns) {
+            g.judgements.other_lineage += 1;
             DnsResolution::OtherLineage
         } else {
+            g.judgements.unresolved += 1;
             DnsResolution::Unresolved
         }
     }
@@ -1285,26 +1456,37 @@ mod tests {
         );
     }
 
-    /// D4: a system resolver is its executable, of the fixed list, run by a
-    /// system uid — never a name, never a user's copy.
+    /// D4 and R1: a system resolver is its executable, of the fixed list,
+    /// run by one of the host's resolver users — never root, never another
+    /// uid, never a name, never a user's copy (the caller adds the host's
+    /// mount namespace).
     #[test]
-    fn a_system_resolver_is_its_executable_and_a_system_uid() {
+    fn a_system_resolver_is_its_executable_and_a_resolver_user() {
+        let users = [101, 120];
         assert!(is_system_resolver(
             Some("/usr/lib/systemd/systemd-resolved"),
-            101
+            101,
+            &users
         ));
-        assert!(is_system_resolver(Some("/usr/sbin/dnsmasq"), 0));
-        assert!(is_system_resolver(
-            Some("/usr/sbin/unbound"),
-            SYSTEM_UID_MAX
-        ));
+        for exe in [
+            "/usr/sbin/named",
+            "/usr/sbin/pdns_recursor",
+            "/usr/sbin/kresd",
+        ] {
+            assert!(is_system_resolver(Some(exe), 120, &users), "{exe}");
+        }
+        // root is no resolver user, even listed
+        assert!(!is_system_resolver(Some("/usr/sbin/dnsmasq"), 0, &[0, 101]));
+        // a system uid that is no resolver user (www-data running dnsmasq)
+        assert!(!is_system_resolver(Some("/usr/sbin/dnsmasq"), 33, &users));
         assert!(!is_system_resolver(
-            Some("/usr/sbin/unbound"),
-            SYSTEM_UID_MAX + 1
+            Some("/home/u/systemd-resolved"),
+            101,
+            &users
         ));
-        assert!(!is_system_resolver(Some("/home/u/systemd-resolved"), 101));
-        assert!(!is_system_resolver(Some("systemd-resolved"), 101));
-        assert!(!is_system_resolver(None, 0));
+        assert!(!is_system_resolver(Some("systemd-resolved"), 101, &users));
+        assert!(!is_system_resolver(None, 101, &users));
+        assert!(!is_system_resolver(Some("/usr/sbin/unbound"), 101, &[]));
     }
 
     /// N2: a binding of an ancestor whose start is not known is neither used
@@ -1333,5 +1515,92 @@ mod tests {
         assert_eq!(t.check(42, 1, C2, end, none), DnsResolution::Unknown);
         assert_eq!(t.check(42, 1, C2, end + 1, none), DnsResolution::Unresolved);
         assert_eq!(t.check(42, 1, C2, T0 - SEC, none), DnsResolution::Unknown);
+    }
+
+    /// The second review of #495, R2: a loss of coverage for every process
+    /// is queued to be signed with its cause and who caused it, at most once
+    /// a cause per window; a barrier's degrades nothing beyond its connect.
+    #[test]
+    fn a_coverage_loss_is_queued_once_a_cause_a_window() {
+        let t = Table::new();
+        t.note_coverage_lost(CoverageCause::UserHeld, Some(42), Some(1000), T0);
+        t.note_coverage_lost(CoverageCause::UserHeld, Some(43), Some(1000), T0 + SEC);
+        t.note_coverage_lost(CoverageCause::Losses, None, None, T0 + SEC);
+        t.note_coverage_lost(CoverageCause::Barrier, Some(44), None, T0 + 2 * SEC);
+        let q = t.take_coverage_losses();
+        assert_eq!(
+            q.iter()
+                .map(|l| (l.cause, l.pid, l.uid, l.window_secs))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    CoverageCause::UserHeld,
+                    Some(42),
+                    Some(1000),
+                    UNSEEN_WINDOW_SECS
+                ),
+                (CoverageCause::Losses, None, None, UNSEEN_WINDOW_SECS),
+                (CoverageCause::Barrier, Some(44), None, 0),
+            ]
+        );
+        assert!(t.take_coverage_losses().is_empty(), "taken once");
+        // a window later: the cause again
+        let next = T0 + COVERAGE_RECORD_EVERY_SECS * SEC;
+        t.note_coverage_lost(CoverageCause::UserHeld, Some(45), Some(1001), next - 1);
+        assert!(
+            t.take_coverage_losses().is_empty(),
+            "still within the window"
+        );
+        t.note_coverage_lost(CoverageCause::UserHeld, Some(45), Some(1001), next);
+        assert_eq!(t.take_coverage_losses().len(), 1);
+        assert_eq!(t.judgements().coverage_records, 4);
+        // the degradation: every process unknown until the window's end
+        assert_eq!(t.check(7, 1, C2, next + SEC, none), DnsResolution::Unknown);
+        // a barrier alone degrades nothing
+        let t = Table::new();
+        t.note_coverage_lost(CoverageCause::Barrier, Some(44), None, T0);
+        assert_eq!(t.check(7, 1, C2, T0 + SEC, none), DnsResolution::Unresolved);
+        assert_eq!(
+            CoverageCause::ALL.map(CoverageCause::as_str),
+            ["undecoded", "user_held", "dns_losses", "barrier"]
+        );
+    }
+
+    /// R2: the judgements, counted by outcome and, the unknown ones, by
+    /// reason.
+    #[test]
+    fn the_judgements_are_counted_by_outcome_and_reason() {
+        let t = Table::new();
+        answer(&t, 10, T0, "a.example", &[a("a.example", 60, WEB)]);
+        assert_eq!(t.check(10, 1, WEB, T0 + 1, none), DnsResolution::Lineage);
+        assert_eq!(
+            t.check(11, 1, WEB, T0 + 1, none),
+            DnsResolution::OtherLineage
+        );
+        assert_eq!(t.check(11, 1, C2, T0 + 1, none), DnsResolution::Unresolved);
+        assert_eq!(t.check(10, 0, WEB, T0 + 1, none), DnsResolution::Unknown);
+        t.on_query(12, "never.example", T0);
+        assert_eq!(t.check(12, 1, C2, T0 + 1, none), DnsResolution::Unknown);
+        t.note_held(13, T0);
+        assert_eq!(t.check(13, 1, C2, T0 + 1, none), DnsResolution::Unknown);
+        t.count_unknown(UnknownWhy::Sensor);
+        t.count_unknown(UnknownWhy::Barrier);
+        t.count_unknown(UnknownWhy::Older);
+        t.note_undecoded(T0);
+        assert_eq!(t.check(14, 1, C2, T0 + 1, none), DnsResolution::Unknown);
+        let j = t.judgements();
+        assert_eq!((j.lineage, j.other_lineage, j.unresolved), (1, 1, 1));
+        assert_eq!(
+            (
+                j.unknown_start,
+                j.unknown_unseen,
+                j.unknown_held,
+                j.unknown_sensor,
+                j.unknown_barrier,
+                j.unknown_older,
+                j.unknown_degraded
+            ),
+            (1, 1, 1, 1, 1, 1, 1)
+        );
     }
 }

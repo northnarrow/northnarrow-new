@@ -700,6 +700,10 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                         common::ring_drops::ring_slot::DNS_ANSWER,
                         common::ring_drops::ring_slot::DNS_ANSWER_RATE,
                     ]),
+                    // the second review of #495, R1: a resolver's uid
+                    crate::sensors::dns_sensor::host_resolver_uids(),
+                    // R2: the coverage losses, signed
+                    ring_drops.audit(),
                     &tx,
                     &rt,
                 )?),
@@ -1674,7 +1678,12 @@ fn dns_events(
             // review of #495, D3: a user's held queries leave every
             // process's evidence incomplete; a process's, its lineage's
             if raw.held != 0 && raw.flags & dns_flags::RATE_HELD_UID != 0 {
-                t.note_undecoded(*timestamp_ns);
+                t.note_coverage_lost(
+                    crate::net::resolved::CoverageCause::UserHeld,
+                    Some(*pid),
+                    Some(*uid),
+                    *timestamp_ns,
+                );
             } else if raw.held != 0 {
                 t.note_held(*pid, *timestamp_ns);
             }
@@ -1722,7 +1731,12 @@ fn nss_events(
     }
     if let (Some(t), true) = (resolved, raw.held != 0) {
         if raw.flags & dns_flags::RATE_HELD_UID != 0 {
-            t.note_undecoded(raw.timestamp_ns);
+            t.note_coverage_lost(
+                crate::net::resolved::CoverageCause::UserHeld,
+                Some(raw.pid),
+                Some(raw.uid),
+                raw.timestamp_ns,
+            );
         } else {
             t.note_held(raw.pid, raw.timestamp_ns);
         }
@@ -1893,7 +1907,12 @@ fn dns_pass<R: crate::sensors::pump::RingSource>(
     // process's or a user's budget) leaves every process's evidence
     // incomplete, whoever lost it
     if let (Some(t), true) = (resolved, losses.grew()) {
-        t.note_undecoded(began_ns);
+        t.note_coverage_lost(
+            crate::net::resolved::CoverageCause::Losses,
+            None,
+            None,
+            began_ns,
+        );
     }
     let mut drained = 0u32;
     // R14b: the pass's records first (copied off the ring), then their

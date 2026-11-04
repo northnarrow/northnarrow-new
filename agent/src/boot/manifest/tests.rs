@@ -731,6 +731,7 @@ fn the_stop_beat_signs_what_is_pending() {
             journal: crate::response::journal::ActionJournal::memory(),
             audit: None,
             probe_on: false,
+            nodns: None,
         },
     );
     let view = m.current().unwrap();

@@ -286,6 +286,12 @@ pub const RESOLVER_USERS: &[&str] = &[
     "knot-resolver",
 ];
 
+/// The uids of [`RESOLVER_USERS`] in the host's `/etc/passwd` (lot 275, the
+/// second review of #495, R1: the DNS response pump's resolver identity).
+pub fn host_resolver_uids() -> Vec<u32> {
+    resolver_uids(&std::fs::read_to_string("/etc/passwd").unwrap_or_default())
+}
+
 /// The uids of [`RESOLVER_USERS`] in a `/etc/passwd` body.
 fn resolver_uids(passwd: &str) -> Vec<u32> {
     passwd

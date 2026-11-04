@@ -326,6 +326,8 @@ fn answer_pass<R: crate::sensors::pump::RingSource>(
     lineage: &AuthSessionTracker,
     parse: &ParseClient,
     losses: &mut crate::sensors::ring_drops::LossWatch,
+    resolver_uids: &[u32],
+    audit: &crate::late_audit::LateAudit,
     reject: &mut RejectThrottle,
     outbox: &mut VecDeque<Event>,
     stats: &mut PassStats,
@@ -334,7 +336,12 @@ fn answer_pass<R: crate::sensors::pump::RingSource>(
     // a process's or a user's budget) leaves every process's evidence
     // incomplete, whoever lost it
     if losses.grew() {
-        table.note_undecoded(crate::net::dns_ingest::monotonic_ns());
+        table.note_coverage_lost(
+            crate::net::resolved::CoverageCause::Losses,
+            None,
+            None,
+            crate::net::dns_ingest::monotonic_ns(),
+        );
     }
     let size = std::mem::size_of::<DnsAnswerRaw>();
     let mut raws: Vec<DnsAnswerRaw> = Vec::new();
@@ -346,6 +353,8 @@ fn answer_pass<R: crate::sensors::pump::RingSource>(
             Err(_) => reject.record(DNS_ANSWER_LABEL, size, bytes.len()),
         }
     }) {}
+    // the second review of #495, R2: what blinded NN-L-NET-028, signed
+    sign_coverage_losses(table, audit);
     for raw in &raws {
         let bytes = captured_payload(raw);
         // `None`: the worker did not answer; `Some(None)`: no DNS response
@@ -355,9 +364,72 @@ fn answer_pass<R: crate::sensors::pump::RingSource>(
             parse.dns_answers(bytes)
         };
         let exe = lineage.image_at(raw.pid, raw.timestamp_ns);
-        outbox.extend(ingest_answer(raw, decoded, exe, table, stats));
+        let resolver =
+            from_system_resolver(lineage, exe.as_deref(), raw.pid, raw.uid, resolver_uids);
+        outbox.extend(ingest_answer(raw, decoded, exe, resolver, table, stats));
     }
     drained
+}
+
+/// Audit op of a loss of NN-L-NET-028's coverage (the second review of
+/// #495, R2).
+pub const COVERAGE_LOST_OP: &str = "nodns_coverage_lost";
+
+/// Sign the coverage losses the table queued (at most one a cause per
+/// window): "NN-L-NET-028 blinded by …", with the process or user when
+/// known. Kept queued until the audit log is bound.
+fn sign_coverage_losses(table: &ResolvedTable, audit: &crate::late_audit::LateAudit) {
+    let Some(log) = audit.get() else { return };
+    for l in table.take_coverage_losses() {
+        warn!(
+            cause = l.cause.as_str(),
+            pid = ?l.pid,
+            uid = ?l.uid,
+            window_secs = l.window_secs,
+            "NN-L-NET-028 blinded: its DNS evidence lost for every process (its connects judged unknown)"
+        );
+        let draft = crate::audit::AuditEntryDraft {
+            op: COVERAGE_LOST_OP.to_string(),
+            extra: serde_json::json!({
+                "rule": crate::decision::rules::net_nodns::RULE_ID,
+                "cause": l.cause.as_str(),
+                "pid": l.pid,
+                "uid": l.uid,
+                "window_secs": l.window_secs,
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "detected".to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
+        };
+        if let Err(e) = log.lock().append(draft) {
+            warn!(
+                error = format!("{e:#}"),
+                "a nodns_coverage_lost audit entry failed"
+            );
+        }
+    }
+}
+
+/// The receiver of a response is a system resolver (the second review of
+/// #495, R1): its executable and its uid ([`is_system_resolver`]), and it
+/// runs in the host's mount namespace, where its executable's path names
+/// the host's file — never a path alone. The namespace is read last, for
+/// the few receivers the first two leave.
+///
+/// [`is_system_resolver`]: crate::net::resolved::is_system_resolver
+fn from_system_resolver(
+    lineage: &AuthSessionTracker,
+    exe: Option<&str>,
+    pid: u32,
+    uid: u32,
+    resolver_uids: &[u32],
+) -> bool {
+    crate::net::resolved::is_system_resolver(exe, uid, resolver_uids)
+        && lineage.in_init_mount_ns(pid)
 }
 
 /// The bytes of a response record the sensor copied: its payload up to
@@ -371,10 +443,12 @@ fn captured_payload(raw: &DnsAnswerRaw) -> &[u8] {
 /// one degrading the evidence; held records noted), its events.
 /// `decoded`: `None` when the worker did not answer, `Some(None)` for
 /// bytes that are no DNS response (or none read).
+/// `resolver`: its receiver is a system resolver ([`from_system_resolver`]).
 fn ingest_answer(
     raw: &DnsAnswerRaw,
     decoded: Option<Option<DnsAnswersOut>>,
     exe: Option<String>,
+    resolver: bool,
     table: &ResolvedTable,
     stats: &mut PassStats,
 ) -> Vec<Event> {
@@ -400,7 +474,7 @@ fn ingest_answer(
                 qname: q,
                 records: &records,
                 complete: !ev.truncated,
-                resolver: crate::net::resolved::is_system_resolver(ev.exe.as_deref(), raw.uid),
+                resolver,
             });
         }
         // the worker did not answer: what the response named is not known
@@ -415,7 +489,12 @@ fn ingest_answer(
     // evidence incomplete (the count rides on whichever record of the user
     // comes next); a process's, its own lineage's
     if raw.flags & held_flags::UID != 0 {
-        table.note_undecoded(raw.timestamp_ns);
+        table.note_coverage_lost(
+            crate::net::resolved::CoverageCause::UserHeld,
+            Some(raw.pid),
+            Some(raw.uid),
+            raw.timestamp_ns,
+        );
     } else if raw.flags & held_flags::TASK != 0 {
         table.note_held(raw.pid, raw.timestamp_ns);
     }
@@ -445,6 +524,8 @@ pub fn spawn_dns_answer_pump(
     lineage: AuthSessionTracker,
     parse: ParseClient,
     mut losses: crate::sensors::ring_drops::LossWatch,
+    resolver_uids: Vec<u32>,
+    audit: crate::late_audit::LateAudit,
     tx: &BusSender,
     rt: &tokio::runtime::Handle,
 ) -> Result<PumpThread> {
@@ -472,6 +553,8 @@ pub fn spawn_dns_answer_pump(
                     &lineage,
                     &parse,
                     &mut losses,
+                    &resolver_uids,
+                    &audit,
                     reject,
                     outbox,
                     stats,
@@ -888,7 +971,7 @@ mod tests {
         let mut stats = PassStats::default();
         let mut raw = answer_raw();
         raw.timestamp_ns = 10 * S;
-        let evs = ingest_answer(&raw, Some(Some(out.clone())), None, &t, &mut stats);
+        let evs = ingest_answer(&raw, Some(Some(out.clone())), None, false, &t, &mut stats);
         assert!(matches!(evs.as_slice(), [Event::DnsAnswer(_)]));
         assert_eq!(t.check(42, 1, c2, 11 * S, Vec::new), DnsResolution::Lineage);
         assert_eq!((stats.records, stats.decoded), (1, 1));
@@ -899,13 +982,13 @@ mod tests {
             .starts_with("c2.example -> 1"));
         // no DNS response: nothing changes
         let t = ResolvedTable::default();
-        ingest_answer(&raw, Some(None), None, &t, &mut stats);
+        ingest_answer(&raw, Some(None), None, false, &t, &mut stats);
         assert_eq!(
             t.check(7, 1, c2, 11 * S, Vec::new),
             DnsResolution::Unresolved
         );
         // the worker did not answer: unknown for a while
-        ingest_answer(&raw, None, None, &t, &mut stats);
+        ingest_answer(&raw, None, None, false, &t, &mut stats);
         assert_eq!(t.check(7, 1, c2, 11 * S, Vec::new), DnsResolution::Unknown);
         // held records of the receiver: its connects unknown
         let t = ResolvedTable::default();
@@ -913,7 +996,7 @@ mod tests {
         held.timestamp_ns = 10 * S;
         held.flags = held_flags::TASK;
         held.held = 3;
-        let evs = ingest_answer(&held, Some(None), None, &t, &mut stats);
+        let evs = ingest_answer(&held, Some(None), None, false, &t, &mut stats);
         assert_eq!(evs.len(), 2, "the event and its flood");
         assert_eq!(t.check(42, 1, c2, 11 * S, Vec::new), DnsResolution::Unknown);
         assert_eq!(
@@ -958,6 +1041,7 @@ mod tests {
                 &raw,
                 Some(Some(one_a("big.example", [198, 51, 100, 1], complete))),
                 None,
+                false,
                 &t,
                 &mut stats,
             );
@@ -978,7 +1062,7 @@ mod tests {
         let mut raw = answer_raw();
         raw.timestamp_ns = 10 * S;
         raw.flags = answer_flags::UNREAD;
-        ingest_answer(&raw, Some(None), None, &t, &mut PassStats::default());
+        ingest_answer(&raw, Some(None), None, false, &t, &mut PassStats::default());
         assert_eq!(t.check(42, 1, a2, 11 * S, Vec::new), DnsResolution::Unknown);
         assert_eq!(
             t.check(43, 1, a2, 11 * S, Vec::new),
@@ -999,7 +1083,7 @@ mod tests {
         raw.timestamp_ns = 10 * S;
         raw.flags = held_flags::UID;
         raw.held_uid = 9;
-        ingest_answer(&raw, Some(None), None, &t, &mut PassStats::default());
+        ingest_answer(&raw, Some(None), None, false, &t, &mut PassStats::default());
         for pid in [42, 43, 4242] {
             assert_eq!(
                 t.check(pid, 1, c2, 11 * S, Vec::new),
@@ -1008,38 +1092,59 @@ mod tests {
         }
     }
 
-    /// Review of #495, D4: a response any process received binds that
-    /// process only; one a system resolver received (its executable and a
-    /// system uid) binds the processes that asked its name, and the name
-    /// counts host-wide.
+    /// Review of #495, D4, and its second review, R1: a response any process
+    /// received binds that process only; one a system resolver received —
+    /// its executable, one of the host's resolver users (never root), in the
+    /// host's mount namespace — binds the processes that asked its name, and
+    /// the name counts host-wide. A rootful container's `/usr/sbin/dnsmasq`
+    /// (its own mount namespace) is no system resolver; nor is root.
     #[test]
     fn only_a_system_resolver_s_response_binds_others() {
         use nn_model::telemetry::DnsResolution;
+        use std::os::unix::fs::symlink;
         const S: u64 = 1_000_000_000;
         let c2: std::net::IpAddr = "203.0.113.5".parse().unwrap();
-        let resolved_exe = Some("/usr/lib/systemd/systemd-resolved".to_string());
-        for (exe, uid, bound) in [
-            (None, 1000, false),
-            (Some("/usr/bin/python3".to_string()), 1000, false),
-            // a user's copy of the resolver's program
-            (resolved_exe.clone(), 1000, false),
-            (resolved_exe.clone(), 101, true),
+        let procs = tempfile::TempDir::new().unwrap();
+        for (pid, ns) in [
+            ("1", "mnt:[4026531841]"),
+            ("500", "mnt:[4026531841]"),
+            ("600", "mnt:[4026532900]"),
         ] {
+            std::fs::create_dir_all(procs.path().join(pid).join("ns")).unwrap();
+            symlink(ns, procs.path().join(pid).join("ns/mnt")).unwrap();
+        }
+        let lineage = AuthSessionTracker::new(procs.path());
+        let users = [101u32];
+        let resolved_exe = "/usr/lib/systemd/systemd-resolved";
+        for (exe, pid, uid, bound) in [
+            (None, 500, 101, false),
+            (Some("/usr/bin/python3"), 500, 101, false),
+            // root runs it: no resolver user
+            (Some(resolved_exe), 500, 0, false),
+            // a resolver user's copy... in a container's own mount namespace
+            (Some("/usr/sbin/dnsmasq"), 600, 101, false),
+            // a uid that is no resolver user
+            (Some(resolved_exe), 500, 1000, false),
+            (Some(resolved_exe), 500, 101, true),
+        ] {
+            let resolver = from_system_resolver(&lineage, exe, pid, uid, &users);
+            assert_eq!(resolver, bound, "{exe:?} {pid} {uid}");
             let t = ResolvedTable::default();
             t.on_query(777, "c2.example", 10 * S - 1);
             let mut raw = answer_raw();
             raw.timestamp_ns = 10 * S;
             raw.uid = uid;
-            raw.pid = 500;
+            raw.pid = pid;
             ingest_answer(
                 &raw,
                 Some(Some(one_a("c2.example", [203, 0, 113, 5], true))),
-                exe.clone(),
+                exe.map(str::to_string),
+                resolver,
                 &t,
                 &mut PassStats::default(),
             );
             assert_eq!(
-                t.check(500, 1, c2, 11 * S, Vec::new),
+                t.check(pid, 1, c2, 11 * S, Vec::new),
                 DnsResolution::Lineage
             );
             let want = if bound {
@@ -1059,6 +1164,14 @@ mod tests {
                 "{exe:?} {uid}"
             );
         }
+        // a process /proc no longer shows (or cannot be read): not the host's
+        assert!(!from_system_resolver(
+            &lineage,
+            Some(resolved_exe),
+            4242,
+            101,
+            &users
+        ));
     }
 
     /// Review of #495, D2: 1,024 responses a second for one user (its
@@ -1100,6 +1213,7 @@ mod tests {
                 &raw,
                 Some(Some(one_a(&name, [203, 0, 113, (i % 250) as u8], true))),
                 None,
+                false,
                 &t,
                 &mut stats,
             );
@@ -1120,6 +1234,7 @@ mod tests {
             &raw,
             Some(Some(one_a("n1023.example", [203, 0, 113, 23], true))),
             None,
+            false,
             &t,
             &mut stats,
         );
@@ -1162,6 +1277,8 @@ mod tests {
                 &lineage,
                 &ParseClient::new(None),
                 &mut losses,
+                &[],
+                &crate::late_audit::LateAudit::new(),
                 &mut RejectThrottle::new(),
                 &mut VecDeque::new(),
                 &mut PassStats::default(),
@@ -1170,6 +1287,61 @@ mod tests {
             let got = t.check(4242, 1, c2, now, Vec::new);
             assert_eq!(got == DnsResolution::Unknown, unknown, "{reads:?}: {got:?}");
         }
+    }
+
+    /// The second review of #495, R2: a burst of one user's queries (its
+    /// held count) blinds NN-L-NET-028 for every process — and leaves a
+    /// signed `nodns_coverage_lost` naming the cause, the pid and the uid,
+    /// once a window; the beat's counters count the blinded judgement.
+    #[test]
+    fn a_blinding_leaves_a_signed_record() {
+        use nn_model::telemetry::DnsResolution;
+        const S: u64 = 1_000_000_000;
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig"))
+            .unwrap();
+        let log = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::audit::AuditLog::open(&dir.path().join("audit.log"), key, [0x64; 16]).unwrap(),
+        ));
+        let audit = crate::late_audit::LateAudit::new();
+        let t = ResolvedTable::default();
+        let c2: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let mut raw = answer_raw();
+        raw.timestamp_ns = 10 * S;
+        raw.pid = 4321;
+        raw.uid = 1001;
+        raw.flags = held_flags::UID;
+        raw.held_uid = 70;
+        ingest_answer(&raw, Some(None), None, false, &t, &mut PassStats::default());
+        // not bound yet: kept for later
+        sign_coverage_losses(&t, &audit);
+        audit.bind(Some(std::sync::Arc::clone(&log)));
+        sign_coverage_losses(&t, &audit);
+        // a second blinding within the window: no second row
+        raw.timestamp_ns = 11 * S;
+        ingest_answer(&raw, Some(None), None, false, &t, &mut PassStats::default());
+        sign_coverage_losses(&t, &audit);
+        let text = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains(COVERAGE_LOST_OP))
+            .collect();
+        assert_eq!(rows.len(), 1, "{text}");
+        for want in [
+            "\"cause\":\"user_held\"",
+            "\"pid\":4321",
+            "\"uid\":1001",
+            "NN-L-NET-028_ConnectWithoutDns",
+        ] {
+            assert!(rows[0].contains(want), "{want}: {}", rows[0]);
+        }
+        // another process's connect: unknown, counted as degraded
+        assert_eq!(
+            t.check(777, 1, c2, 12 * S, Vec::new),
+            DnsResolution::Unknown
+        );
+        assert_eq!(t.judgements().unknown_degraded, 1);
+        assert_eq!(t.judgements().coverage_records, 1);
     }
 
     /// Review of #495, RA5: only the bytes the sensor copied are decoded.

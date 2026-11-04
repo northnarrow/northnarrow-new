@@ -58,7 +58,9 @@ pub struct LossWatch {
 }
 
 impl LossWatch {
-    /// A watch of nothing (no map: a test, a run without the counters).
+    /// A watch with no map (the counters not installed, a signed
+    /// degradation): every pass is a loss (the second review of #495, R3 —
+    /// no counters, no evidence of no loss).
     pub fn none() -> Self {
         Self {
             map: None,
@@ -90,8 +92,9 @@ impl LossWatch {
         Some(sum)
     }
 
-    /// The losses grew since the last call: a loss, or counters that
-    /// cannot be read (no evidence of none). The first read sets the base.
+    /// The losses grew since the last call: a loss, counters that cannot be
+    /// read, or no counters at all (no evidence of none). The first read
+    /// sets the base.
     pub fn grew(&mut self) -> bool {
         #[cfg(test)]
         if let Some(q) = self.script.as_mut() {
@@ -99,7 +102,7 @@ impl LossWatch {
             return self.grew_to(now);
         }
         if self.map.is_none() {
-            return false;
+            return true;
         }
         let now = self.read();
         self.grew_to(now)
@@ -121,6 +124,12 @@ impl LossWatch {
 }
 
 impl RingDrops {
+    /// The audit log's slot the sampler signs with, for the DNS response
+    /// pump's `nodns_coverage_lost` rows (bound with the sampler's).
+    pub fn audit(&self) -> LateAudit {
+        self.audit.clone()
+    }
+
     /// A watch of `slots`, its base read now.
     pub fn loss_watch(&self, slots: &'static [u32]) -> LossWatch {
         let mut w = LossWatch {
@@ -526,16 +535,17 @@ mod tests {
     #[test]
     fn a_loss_watch_sees_growth_and_unreadable_counters() {
         let mut w = LossWatch::none();
-        assert!(!w.grew(), "no map: nothing watched");
+        assert!(w.grew(), "no map: no evidence of no loss (R3)");
+        assert!(w.grew(), "every pass");
         assert!(!w.grew_to(Some(5)), "the base");
         assert!(!w.grew_to(Some(5)));
         assert!(w.grew_to(Some(6)));
         assert!(!w.grew_to(Some(6)));
         assert!(w.grew_to(None), "unreadable: no evidence of none");
         assert!(!w.grew_to(Some(6)));
-        // a watch from the counters with no map
+        // a watch from counters that were not installed: a loss each pass
         let mut w = RingDrops::default().loss_watch(&[1, 2]);
-        assert!(!w.grew());
+        assert!(w.grew());
     }
 
     #[test]

@@ -62,6 +62,11 @@ and how an operator tunes it. The sources' terms are in
   512 bytes past the cut, or than the receiver's buffer (its first records
   are read; it says `truncated`, as for a response with the server's TC
   bit or a malformed record).
+- **A size probe** (`recv(fd, NULL, 0, MSG_PEEK|MSG_TRUNC)`, as systemd's
+  resolver asks a datagram's length): a record with nothing read
+  (`unread`), its receiver's lineage noted as held — the resolver's, whose
+  own connects go to the configured resolvers, not judged (the second
+  review of #495, R4).
 - **Kernels:** `udp_recvmsg` lost its `noblock` parameter in 5.19: six
   parameters before, five after, read from the BTF as for the accept.
 
@@ -108,9 +113,15 @@ bind to the process or an ancestor: no DNS response the lineage received
 (a datagram from port 53, of the question's chain only) named the address,
 and no response a **system resolver** received for a name the lineage asked
 did. A system resolver is its executable — `systemd-resolved`, `dnsmasq`,
-`nscd` or `unbound`, at its path in the system tree — run by a system uid,
-never a process name: any other process's response binds that process
-only.
+`nscd`, `unbound`, `named`, `pdns_recursor` or `kresd`, at its path in the
+system tree — run by one of the host's resolver users (the dedicated
+accounts the DNS budgets exempt; never root), in the host's mount
+namespace, where that path names the host's file (the second review of
+#495, R1: a path alone is never an identity — a container's
+`/usr/sbin/dnsmasq` is not one). Never a process name: any other
+process's response binds that process only. Where no resolver is
+recognized (nscd as root, dnsmasq as `nobody`), the askers stay unknown:
+fail-safe.
 
 - **Verdict:** Medium when nothing bound the address, Low when only a
   system resolver's response for another lineage named it (a shared CDN
@@ -146,7 +157,20 @@ only.
     or budget that lost records; a connect judged before the DNS pumps had
     read the records made before it; the DNS response sensor not running.
     A DNS flood therefore blinds the rule for a while (the floods
-    themselves are NN-L-NET-020's records); it never alerts.
+    themselves are NN-L-NET-020's records); it never alerts — and it shows
+    (the second review of #495, R2): each loss of coverage for every
+    process, and each connect judged before the DNS pumps caught up, is a
+    signed `nodns_coverage_lost` row of the audit log (its `cause` —
+    `undecoded`, `user_held`, `dns_losses`, `barrier` — and the `pid` and
+    `uid` that caused it when known; at most one a cause every 5 minutes),
+    and every beat of the heartbeat carries the rule's judgements by
+    outcome and unknown reason (`nodns`, [HEARTBEAT.md](HEARTBEAT.md)). A
+    burst of queries then a literal-IP connect leaves at least the row
+    "NN-L-NET-028 blinded by `user_held`" or `dns_losses`.
+  - **Severity, measured against the review's rules** (R5): `Low` comes
+    only from a system resolver's response for another lineage; an address
+    handed between processes outside a lineage, when no recognized resolver
+    answered for it within its hold, is `Medium`.
 - **"IP in the name":** an address its own name spells (`1-2-3-4.nip.io`,
   `1.2.3.4.sslip.io`, its hexadecimal form) binds nothing: such a name is a
   connect to that address.
@@ -224,9 +248,11 @@ running, every source on; Ubuntu 24.04 / 22.04 guests):
 The UDP receive path is where the cost is: every receive runs the DNS
 response program. Before the review of #495 it read the source's pointer,
 family, port and address before the port's test; from then the family and
-the port in one read and the address only for port 53 (the figures above
-are from before; the sensor contract's overhead entries, in the signed
-manifest, are from after). The workloads
+the port in one read and the address only for port 53. The figures above
+are from before; the per-call cost after it, measured in the lab round
+that follows the review (`deploy/lab/overhead/prog-cost.sh`), goes in the
+sensor contract's overhead entries — and so in the signed manifest — with
+that round. The workloads
 `udprecv` and `tcpsend` are new with this lot (no `main` figure). The
 rounds are noisy (`connect` on 22.04's `main` run reads −8.4 %); the
 per-run reports are in the capability program's lot 275 note.

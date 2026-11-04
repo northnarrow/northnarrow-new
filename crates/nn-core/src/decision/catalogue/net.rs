@@ -501,7 +501,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           the other non-public ranges, the configured resolvers, the signed \
                           `nodns-allow.local`, and the unknown — a process older than the DNS \
                           response sensor, a response cut or never seen, DNS records lost or \
-                          held back (host-wide for 5 minutes), the DNS pumps not caught up.",
+                          held back (host-wide for 5 minutes), the DNS pumps not caught up. A \
+                          rule blinded so is signed (`nodns_coverage_lost`, its cause and who \
+                          caused it) and counted in every beat (`nodns`).",
         how_to_test: "On a lab guest, `curl -m 3 http://203.0.113.5/` (a documentation \
                       address, a literal-IP connect) draws it; `curl -m 3 http://example.com/` \
                       (resolved) does not (`net-check.sh --only MS28`).",

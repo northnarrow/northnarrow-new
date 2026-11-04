@@ -1930,6 +1930,18 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         false
     }
 
+    /// The second review of #495 (R1): `pid` runs in init's mount namespace
+    /// — the paths it sees are the host's. `false` when either namespace
+    /// cannot be read (the process is gone, or not readable): no evidence
+    /// it is the host's.
+    pub fn in_init_mount_ns(&self, pid: u32) -> bool {
+        let ns = |p: &str| H::read_link(self.inner.proc_root.join(p).join("ns").join("mnt")).ok();
+        match (ns(&pid.to_string()), ns("1")) {
+            (Some(own), Some(init)) => own == init,
+            _ => false,
+        }
+    }
+
     /// Lab PR 175: `pid` runs in a mount namespace other than init's whose
     /// root mount (the last `/` of its `mountinfo`) is an overlay with its
     /// `upperdir` and `workdir` in the container storage of `users`; that

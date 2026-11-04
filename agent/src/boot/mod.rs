@@ -283,6 +283,8 @@ async fn run(
         image,
     )
     .await?;
+    // the second review of #495 (R2): NN-L-NET-028's judgements in the beat
+    let resolved_for_beat = Arc::clone(&resolved);
     let attach::SelfTested {
         self_test,
         expected_denial,
@@ -620,6 +622,7 @@ async fn run(
             journal: journal.clone(),
             audit: audit_log.clone(),
             probe_on: telemetry_probe.is_some(),
+            nodns: Some(resolved_for_beat),
         },
     );
     // Armed, the start beat written (or the heartbeat off, said): the admin
