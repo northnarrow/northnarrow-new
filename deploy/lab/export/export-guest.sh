@@ -541,9 +541,11 @@ phase_protected() {
     local w w2 sender
     w=$(worker_pid)
     rm -f "$OUT/tamper.txt"
+    # systemd expands `$` in a command line itself: `$$` passes one on
+    # (round 8 read `sender=$`)
     systemd-run --unit=nn-k276-tamper --collect --wait --quiet \
         -p StandardOutput="file:$OUT/tamper.txt" -p StandardError="append:$OUT/tamper.txt" \
-        /bin/bash -c "echo sender=\$\$; kill -9 $w; echo kill-rc=\$?; sleep 10; echo sender-alive" >/dev/null 2>&1
+        /bin/bash -c "echo sender=\$\$\$\$; kill -9 $w; echo kill-rc=\$\$?; sleep 10; echo sender-alive" >/dev/null 2>&1
     sleep 3
     w2=$(worker_pid)
     sender=$(sed -n 's/^sender=//p' "$OUT/tamper.txt" | head -1)
