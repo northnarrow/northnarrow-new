@@ -1289,6 +1289,10 @@ mod tests {
         assert!(!assess(&t, &modprobe(&["nf_tables"])).records());
         t.write("etc/modprobe.d/zz.conf", "options nf_tables x=1\n");
         assert!(assess(&t, &modprobe(&["nf_tables"])).records());
+        // the hidden file's alias is not read
+        t.write("lib/modprobe.d/zz.conf", "alias nf_tables x\n");
+        assert!(assess(&t, &modprobe(&["nf_tables"])).records());
+        std::fs::remove_file(t.path("lib/modprobe.d/zz.conf")).unwrap();
         // an alias naming a module the tree does not hold
         t.write("run/modprobe.d/a.conf", "alias nf-x \\\n  missing_mod\n");
         let a = assess(&t, &modprobe(&["nf-x"]));
@@ -1484,6 +1488,21 @@ mod tests {
         dep.set_len(MAX_INDEX_BYTES + 1).unwrap();
         let a = assess(&t, &modprobe(&["nf_tables"]));
         assert!(not_vouched(&a).contains("modules.dep"), "{a:?}");
+    }
+
+    /// The exec pump asks dpkg's lists afresh: an answer the module-load
+    /// pump kept before a package listed the file is not the pump's.
+    #[test]
+    fn the_exec_pump_asks_dpkg_afresh_not_the_answer_kept() {
+        let t = netfilter_host();
+        let late = "kernel/net/late.ko";
+        t.module(late, &[], true);
+        let owners = super::super::module_provenance::ModuleOwners::<H>::new(t.root());
+        let file = format!("/lib/modules/{RELEASE}/{late}");
+        assert_eq!(owners.refresh(&file), Provenance::Unowned);
+        t.packaged("linux-modules-6.8.0-1-generic", &[NF, NFNL, CRC, late]);
+        let a = ModuleRequests::new(t.root()).refresh(&modprobe(&["late"]));
+        assert!(a.as_ref().is_some_and(Assessment::records), "{a:?}");
     }
 
     /// R12b's shape, lot 279: the answer the exec pump made is the one R011
