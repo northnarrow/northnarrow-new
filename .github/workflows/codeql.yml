@@ -1,0 +1,167 @@
+# CodeQL code scanning (advanced setup; the repository's default setup is
+# off, and stays off: GitHub refuses the results of an advanced workflow
+# while it is on).
+#
+# Every language of what ships, each analysed without a build
+# (`build-mode: none`, generally available for Rust since 2025-10-14): the
+# Rust of the workspace and agent-ebpf, `#[cfg(test)]` modules included,
+# and these workflows (`actions`). .github/codeql/codeql-config.yml ignores
+# only what no shipped build contains: the members' integration tests, the
+# fuzz harness and deploy/lab/ (the lab's C probes and Python helpers, the
+# tree's only C and Python). The `security-extended` suite: the default
+# queries and the lower-precision security ones. On every pull request to main, every push
+# to main (the baseline a pull request's alerts are compared with), and
+# weekly, so a new query of a new CodeQL release runs on an unchanged main.
+# A pull request's analysis is complete, not diff-informed (see analyze's
+# env); GitHub flags in the pull request only the alerts it adds.
+# Review of #496: the token that may write code-scanning results never
+# meets the code the analysis runs. rust-analyzer runs the build scripts
+# and proc-macros of the locked dependency tree; with `security-events:
+# write` one of them could upload a SARIF or close alerts through the API.
+# So `analyze` holds `contents: read` only and keeps its SARIF as an
+# artifact (`upload: never`), and `upload`, which checks the tree out for
+# the alerts' locations but builds and runs nothing of it, uploads it.
+# xtask/tests/supply_chain.rs keeps the language list equal to the
+# languages of the tracked files outside the ignored paths, and this
+# file's triggers, suite, jobs and permissions as they are.
+#
+# The results are alerts under Security → Code scanning. An alert is fixed
+# in the code or triaged in a PR; it is never dismissed to make a run green.
+name: CodeQL
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "37 3 * * 3" # Wednesday 03:37 UTC, apart from the nightly lab and CI runs
+
+# A newer push to a pull request supersedes its run; a push to main and the
+# weekly run each queue in a group of their own.
+concurrency:
+  group: codeql-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# External audit SUP-004: the token reads the repository and nothing else;
+# the upload job alone may also write code-scanning results.
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Read only: this job runs the dependency tree's build scripts and
+    # proc-macros (above). A job that sets `permissions:` gets none of the
+    # others.
+    permissions:
+      contents: read
+    # Complete analyses on pull requests too. codeql-action filters a
+    # diff-informed SARIF to the pull request's lines when it uploads it,
+    # in the job that computed the diff; here the upload is another job,
+    # which would send the results of the queries the diff does not
+    # restrict unfiltered (#496: 68 of them, all of one rule) and those it
+    # restricts filtered. Measured on #496: rust 8 min 35 s complete,
+    # 9 min 18 s diff-informed.
+    env:
+      CODEQL_ACTION_DIFF_INFORMED_QUERIES: "false"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+          - language: rust
+            build-mode: none
+
+    steps:
+      # SUP-004: the token is not left in .git/config, where the build
+      # scripts and proc-macros that rust-analyzer runs could read it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Rust only. The extractor runs rust-analyzer, which calls cargo in
+      # each cargo project of the tree (cargo metadata, then the build
+      # scripts and proc-macros). The toolchains are the ones the tree pins
+      # (SUP-015: rust-toolchain.toml, with rust-src for the standard
+      # library's sources; agent-ebpf's own nightly), installed here rather
+      # than by rustup on first use, and the dependencies are fetched from
+      # the committed lockfiles (SUP-016): cargo metadata is not --locked,
+      # and the last step checks that it changed none of them.
+      - name: Install the pinned Rust toolchains and fetch the locked dependencies
+        if: matrix.language == 'rust'
+        run: |
+          rustup toolchain install
+          rustup component add rust-src
+          (cd agent-ebpf && rustup toolchain install)
+          rustup show active-toolchain
+          cargo fetch --locked
+          (cd fuzz && cargo fetch --locked)
+          (cd agent-ebpf && cargo fetch --locked)
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: ./.github/codeql/codeql-config.yml
+          queries: security-extended
+
+      # The SARIF stays in the job: `upload` sends it.
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          category: "/language:${{ matrix.language }}"
+          upload: never
+          output: sarif-results
+
+      - name: The lockfiles are unchanged
+        if: matrix.language == 'rust'
+        run: git diff --exit-code -- Cargo.lock fuzz/Cargo.lock agent-ebpf/Cargo.lock
+
+      # Last: only an analysis whose every step passed is uploaded.
+      - name: Keep the SARIF for the upload job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: codeql-sarif-${{ matrix.language }}
+          path: sarif-results
+          if-no-files-found: error
+          retention-days: 5
+
+  upload:
+    name: CodeQL upload (${{ matrix.language }})
+    needs: analyze
+    # Each language's results go up even when another language's analysis
+    # failed (its own upload then fails: no artifact).
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The only job that may write code-scanning results. It runs no step
+    # of its own: a checkout (the SARIF's locations are fingerprinted
+    # against the files; nothing of the tree is built or run), the
+    # artifact, upload-sarif.
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, rust]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: codeql-sarif-${{ matrix.language }}
+          path: sarif-results
+
+      - name: Upload the SARIF
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          sarif_file: sarif-results
+          category: "/language:${{ matrix.language }}"

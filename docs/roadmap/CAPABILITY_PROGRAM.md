@@ -5295,6 +5295,133 @@ number in parentheses is a lab PR.
     reached yet; the privileged test of a root dropper asserts the held
     record and was not run on a guest in this lot; EPG and EXECQ kill in
     OBSERVING only on their opt-ins.
+- **Lot codeql — CodeQL code scanning on every pull request, every push to
+  `main` and weekly (C27; CI only, no product change; no level changes).**
+  - What was open: no static analysis of the code ran on the repository.
+    Code scanning had never been set up (the API's default setup
+    `not-configured`, no analysis), so neither a pull request nor `main`
+    was checked for the dataflow and API-misuse classes CodeQL finds, in
+    the agent's Rust, the lab's C and Python, or the workflows themselves.
+  - What changed: `.github/workflows/codeql.yml`, an advanced setup (the
+    default setup stays off). The four languages GitHub detects in the tree
+    (`actions`, `c-cpp`, `python`, `rust`), each with `build-mode: none`,
+    with the `security-extended` suite. It runs on `pull_request` to `main`
+    (no path filter), on `push` to `main` and weekly. The token is
+    `contents: read`; the `analyze` job alone adds `security-events:
+    write`. `github/codeql-action` is pinned at v4.39.2 (`1fc58d04…`, the
+    commit of the annotated tag, head of `releases/v4`) and checkout at
+    ci.yml's SHA. The Rust job installs the toolchains the tree pins and
+    fetches the three cargo projects `--locked`, and fails if the
+    extraction changed a lockfile. `SECURITY.md` §Code scanning: an alert
+    is fixed or triaged in a pull request, never dismissed to make a run
+    pass. Private vulnerability reporting is enabled (checked 04/11).
+  - Evidence: `xtask/tests/supply_chain.rs`. The new
+    `codeql_scans_every_language_of_the_tree` derives the languages from
+    the tracked files and compares them with the matrix (a new language in
+    the tree, or one dropped from the scan, fails). It also checks the
+    triggers, the weekly cron, the suite, the inputs of init and analyze,
+    one pin for both, the permissions, the toolchain installs, the locked
+    fetches and the lockfile check of each tracked `rust-toolchain.toml`
+    and `Cargo.lock`, and that the step that frees disk space (it deletes
+    the CodeQL bundle) and any secret stay out. `the_codeql_language_of_a_file`
+    covers the extension map. The permission test allows one write:
+    `security-events` to `analyze`. 39 mutations of the workflow, each
+    failing a named test (after one survivor, agent-ebpf's toolchain
+    install dropped, got its assertion).
+  - Lab: no guest (CI only); GitHub-hosted runners, as measured on PR
+    #496. The PR run at 8b4f29f6 (run 41790833220) was green on all four
+    languages: actions 40 s, c-cpp 60 s (13 source files), python 46 s
+    (5 files), rust 9 min 18 s. The Rust job's toolchains and fetches took
+    22 s; the extraction took 2 min 37 s, read 544 files and found the
+    three cargo manifests. No disk-freeing step was needed. It reported 0
+    alerts, but the run is diff-informed (codeql-action's default on a pull
+    request: 14 diff ranges in 7 files), so it covered the lines the PR
+    changes only. One full analysis of the tree followed: commit 2fd2db6f
+    set `CODEQL_ACTION_DIFF_INFORMED_QUERIES=false` and the next commit
+    reverted it (run 41792146816, rust 8 min 35 s). It reported 161
+    alerts, none of them real:
+    - rust 159. 152 are in test code, not applicable: 64
+      `hard-coded-cryptographic-value` (fixed keys and nonces of
+      deterministic tests) and 88 `cleartext-logging` (assertion and
+      panic messages that print a uid, a verdict's reasoning or a run's
+      output).
+    - Of the 7 in production code, 6 are false positives: three 32-byte
+      nonces zeroed and then filled at once by `OsRng.fill_bytes`, which
+      is getrandom and panics on failure (`admin_cli.rs:3221`,
+      `admin_auth.rs:928`, `quarantine.rs:633`); the vault's versioned
+      HKDF salts over a random master key (`vault.rs:42`, `:44`); and a
+      `getifaddrs` list walked only after its null check
+      (`canary/network.rs:90`). The seventh, the fuzz fixture's seed nonce
+      (`fuzz_api.rs:139`), is not applicable.
+    - c-cpp 2, not applicable: `cpp/toctou-race-condition` in the lab's
+      EXP-13 load generator, which is built in the guest and not shipped
+      (`deploy/lab/bus/nn-exp13.c:135`, `:360`).
+    - python 0, actions 0.
+    No alert was dismissed. Each is listed with its triage in the PR.
+  - After the review of #496:
+    - What was wrong: the analyze step held `security-events: write`
+      while rust-analyzer ran the build scripts and proc-macros of the
+      locked dependency tree, so one of them could upload a SARIF or close
+      alerts through the API. The scan also covered directories that no
+      shipped build contains.
+    - What changed:
+      - `analyze` holds `contents: read` only. It runs init and analyze
+        with `upload: never` and keeps the SARIF as an artifact, as its
+        last step, so only an analysis whose every step passed is kept.
+      - `upload` needs `analyze`, runs unless the run was cancelled, and
+        holds `contents: read` and `security-events: write`. Its steps are
+        a checkout (the alerts' locations are fingerprinted against the
+        files; nothing is built or run), download-artifact and
+        upload-sarif at init's commit, with the same category.
+      - `.github/codeql/codeql-config.yml` ignores the members'
+        integration tests (`agent`, `cli`, `scan`, `watchdog` and `xtask`
+        `/tests`), `fuzz` and `deploy/lab`. That leaves no C/C++ or
+        Python in the scan, so the matrix is `actions` and `rust`.
+      - A pull request's analysis is complete
+        (`CODEQL_ACTION_DIFF_INFORMED_QUERIES=false`). codeql-action
+        filters a diff-informed SARIF to the pull request's lines when it
+        uploads it, and only in the job that computed the diff. The first
+        run of the split (41797976722) therefore uploaded 68
+        `hard-coded-cryptographic-value` results outside the diff, while
+        the queries the diff restricts reported none. The complete
+        analysis took no longer: rust 8 min 35 s against 9 min 18 s.
+      - The dependencies' build scripts can still alter the SARIF in
+        `analyze` before it is kept: what they lose is the write to the
+        API, which reaches other analyses and the alerts' state.
+    - Evidence:
+      - `every_workflow_token_is_read_only_unless_it_publishes` allows
+        that write to codeql.yml's `upload` alone. A job holding it may
+        have no `run:` step and no action other than checkout,
+        download-artifact and upload-sarif.
+      - `codeql_scans_every_language_of_the_tree` checks the two jobs and
+        their permissions, the artifact's name, path and place, upload's
+        steps and inputs, and the config. Its paths-ignore must equal the
+        integration-test directories of the members that have them, plus
+        `fuzz` and `deploy/lab`. The languages must equal those of the
+        tracked files outside those directories.
+      - 72 mutations of the workflow and the config: 39 carried over, 19
+        of the split, 11 of the config and 3 of the env. Each one fails a
+        named test.
+    - Lab, as measured on PR #496 (GitHub-hosted runners, no guest):
+      - Run 41800849727 at 7d76f6c9 was green in all four jobs: analyze
+        actions 49 s and rust 5 min 47 s (466 Rust files extracted, 544
+        before the config); upload 14 s and 17 s.
+      - The analysis key is now `codeql.yml:upload`. The rust analysis
+        has 132 results, exactly the 132 of the full analysis outside the
+        ignored directories, rule and file:line for each. The actions
+        analysis has 0. The PR's CodeQL check reads "No new alerts in code
+        changed by this pull request".
+      - `analyze` logs that codeql-action cannot reach its feature-flag
+        endpoints without `security-events: read`: no experimental
+        features, and the CLI its release ships (2.27.4, as before). That
+        read is not granted to the job that runs dependency code.
+  - Open: the first push run after the merge opens 132 alerts on `main`.
+    126 are in test code or the fuzz fixture (64 of them `critical` by
+    CodeQL's rating, fixed test keys and nonces), and 6 are the false
+    positives above. Their list with each reason ("used in tests", "false
+    positive") is for the founder, who decides each closure in the UI. No
+    run is made green by dismissing.
+  - Level unchanged (C27 1).
 - **Lot 279 — R011 judges what a module tool's exec loads; the NET-006
   listener test waits for both of its records (C14, C11; lot 275's lab and
   the CI of #493).**
