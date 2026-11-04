@@ -6210,6 +6210,27 @@ number in parentheses is a lab PR.
       them TAMPERED (13). An outcome's record: 2,117 bytes without its
       intent's row, 2,687 with it (+570; the five of the run 2,589 to
       2,687). Then off, `uninstall --purge`, the guest powered off clean.
+  - Fourth check of #499 (at 408505e9): P1 and P2 closed, no blocker; two
+    small points, `verify` and the documentation only (no lab):
+    - Q1: an outcome without `intent_raw` is its row's mapping — true, but
+      emptied (class 7001, severity 0, `action ?`) — and a relay can reduce
+      any outcome to it, a critical `KillProcessTree` too, which the record
+      cannot tell from a worker that had not seen the intent. `verify` now
+      says each one (`NOTICE line N: … intent not attached: action A of run
+      R`, with the correlation id) and their count in the `OK` verdict, the
+      exit 0; EXPORT.md §6 says the reduction is possible and how to get the
+      intent back from the actions chain with the public key alone.
+    - Q2: the place words no hash covers passed with any value: `verified`
+      must be `true`, `rotate` is allowed only on a later file's first row
+      and there must be the signed terminator its row's `prev_hash` names —
+      the record's own place and the intent's alike; a bent terminator is
+      now TAMPERED on the record itself.
+    - Tests: the reviewer's (`review499c_own_row_words`, `review499c_intent_raw`
+      cases a to j) and a data row as a first row's terminator. Mutations,
+      run 9: 9 on the notice and the place
+      words, 8 caught by named tests at first; MQ2 (`rotate` taken on any
+      row) survived, got its test, and is caught. CHANGELOG's first paragraph names the worker's account
+      `northnarrow-export`.
   - Level: C21 0 → 1. A signed, verifiable export of the detections and
     the other chains to a file and a SIEM's syslog, off by default,
     measured on two kernels (one with the pin, one without); not 2: no
