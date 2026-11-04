@@ -389,6 +389,11 @@ pub fn require_bpftool() {
 /// when there is no pin at all (nothing protected); `Err` names every pid
 /// bpftool could not evict and why.
 pub fn unprotect_pid(pid: u32) -> Result<(), String> {
+    unprotect_pids(&process_tree(pid))
+}
+
+/// [`unprotect_pid`] for each of `pids` (no walk).
+pub fn unprotect_pids(pids: &[u32]) -> Result<(), String> {
     let pin = protected_pids_pin();
     match Command::new("sudo")
         .arg("test")
@@ -401,7 +406,7 @@ pub fn unprotect_pid(pid: u32) -> Result<(), String> {
         Err(e) => return Err(format!("sudo test -e {}: {e}", pin.display())),
     }
     let mut errors = Vec::new();
-    for p in process_tree(pid) {
+    for &p in pids {
         let out = Command::new("sudo")
             .args(["bpftool", "map", "delete", "pinned"])
             .arg(&pin)
@@ -528,15 +533,24 @@ pub fn try_quit_agent(child: &mut Child, timeout: Duration) -> Result<(), String
             return Ok(());
         }
         let tree = process_tree(root);
-        eviction = unprotect_pid(root);
+        for p in &tree {
+            if !known.contains(p) {
+                known.push(*p);
+            }
+        }
+        // Lot 277 (the 22.04 CI's teardown that outlived 10 s): every pid
+        // this teardown has seen is evicted and signalled, the tree's from
+        // the top: a worker signalled before its agent died was started
+        // again by the agent's supervisor — a new, protected worker whose
+        // `PR_SET_PDEATHSIG` from the evicted agent the task_kill hook
+        // then refused, left running outside the tree. The agent first, so
+        // nothing is started again; a pid seen once (a worker reparented
+        // when its agent died) is evicted and signalled with the rest.
+        eviction = unprotect_pids(&known);
         refused = None;
         let mut sent = Vec::new();
         if eviction.is_ok() {
-            // Leaves first, then sudo itself, so nothing is left to re-spawn.
-            for p in process_tree(root).into_iter().rev() {
-                if !known.contains(&p) {
-                    known.push(p);
-                }
+            for &p in &known {
                 if unsafe { libc::kill(p as i32, libc::SIGQUIT) } != 0 {
                     let e = std::io::Error::last_os_error();
                     sent.push(format!("{p}:{}", e.raw_os_error().unwrap_or(0)));
