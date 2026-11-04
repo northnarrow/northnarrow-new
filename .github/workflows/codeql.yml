@@ -42,6 +42,11 @@ jobs:
     name: CodeQL (${{ matrix.language }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # MEASUREMENT ONLY (lot codeql): one full analysis of the tree on this
+    # pull request instead of the diff-informed one; reverted by the next
+    # commit.
+    env:
+      CODEQL_ACTION_DIFF_INFORMED_QUERIES: "false"
     # `security-events: write` uploads the SARIF of the analysis. A job
     # that sets `permissions:` gets none of the others, so `contents: read`
     # is restated for the checkout.
