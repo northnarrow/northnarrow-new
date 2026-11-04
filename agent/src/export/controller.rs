@@ -116,6 +116,9 @@ impl Running {
 pub fn start(p: Params) -> std::io::Result<Running> {
     let stop = Arc::new(AtomicBool::new(false));
     let s = Arc::clone(&stop);
+    // running from before the thread (which says it ended when it does)
+    let handle = p.handle.clone();
+    handle.set_running(true);
     let join = std::thread::Builder::new()
         .name(THREAD.into())
         .spawn(move || {
@@ -131,7 +134,8 @@ pub fn start(p: Params) -> std::io::Result<Running> {
             }
             let _ended = Ended(p.handle.clone());
             run(p, &s)
-        })?;
+        })
+        .inspect_err(|_| handle.set_running(false))?;
     Ok(Running {
         stop,
         join: Some(join),

@@ -166,10 +166,7 @@ pub fn start_if_on(
         cursors: cursors_path(detections_file),
         handle: handle.clone(),
     }) {
-        Ok(r) => {
-            handle.set_running(true);
-            Some(r)
-        }
+        Ok(r) => Some(r),
         Err(e) => {
             crate::boot::degradation::report(
                 "export",
