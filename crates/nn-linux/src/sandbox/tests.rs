@@ -1145,3 +1145,25 @@ fn the_export_directory_s_rule_grants_regular_files_only() {
         assert!(!r.contains(never), "{never:?}");
     }
 }
+
+/// The export worker's `newfstatat` (the sink's open, the second review of
+/// #499, R3) only from the working directory and never following a link;
+/// the parse worker has none.
+#[test]
+fn the_export_worker_s_stat_never_follows_a_link() {
+    use super::seccomp::Arg;
+    let a = Allowlist::export_worker(3, 1, SOCK, OPEN);
+    let stat: Vec<_> = a.calls.iter().filter(|c| c.1 == "newfstatat").collect();
+    assert_eq!(stat.len(), 1);
+    assert_eq!(stat[0].0, libc::SYS_newfstatat);
+    assert_eq!(
+        stat[0].2,
+        vec![
+            Arg::Eq(0, u64::from(libc::AT_FDCWD as u32)),
+            Arg::Eq(3, libc::AT_SYMLINK_NOFOLLOW as u64),
+        ]
+    );
+    assert!(!Allowlist::parse_worker(3, 1)
+        .names()
+        .contains(&"newfstatat"));
+}

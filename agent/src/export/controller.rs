@@ -487,9 +487,11 @@ fn run(p: Params, stop: &AtomicBool) {
                     );
                     if let Ok(Answer::ExportSetup(out)) = answer {
                         set_up_for = Some(w.starts);
-                        if dir_limits.is_some() && dir_floor.is_none() {
-                            dir_floor =
-                                Some(dir_bytes(std::path::Path::new(nn_proto::ipc::EXPORT_DIR)));
+                        if dir_limits.is_some() {
+                            dir_floor = floor_after_setup(
+                                dir_floor,
+                                std::path::Path::new(nn_proto::ipc::EXPORT_DIR),
+                            );
                         }
                         port_pinned = setup.syslog.as_ref().map(|_| out.port_pinned);
                         for k in &mut sinks {
@@ -805,6 +807,12 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
                 .sum()
         })
         .unwrap_or(0)
+}
+
+/// The directory's floor after a worker's setup: the first setup's bytes,
+/// kept — a worker killed for its directory does not raise it for the next.
+fn floor_after_setup(floor: Option<u64>, dir: &std::path::Path) -> Option<u64> {
+    floor.or_else(|| Some(dir_bytes(dir)))
 }
 
 /// The core's verdict on the export's directory: `None` until the first
@@ -1368,6 +1376,9 @@ mod tests {
         assert!(dir_verdict(d.path(), 3, bound, Some(floor))
             .unwrap()
             .contains("past its bound"));
+        // the floor is the first setup's: a later setup keeps it
+        assert_eq!(floor_after_setup(None, d.path()), Some(dir_bytes(d.path())));
+        assert_eq!(floor_after_setup(Some(7), d.path()), Some(7));
         // and a name the sink does not write, whatever the floor
         std::fs::write(d.path().join("export.jsonl"), b"").unwrap();
         std::fs::write(d.path().join("filler"), b"x").unwrap();
