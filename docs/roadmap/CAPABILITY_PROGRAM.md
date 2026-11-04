@@ -5508,9 +5508,16 @@ number in parentheses is a lab PR.
     is a module (in `modules.dep`, not in `modules.builtin`), no index holds
     the alias (`modules.alias` 0, `modules.builtin.modinfo` 0) and kmod
     itself answers "Module nft-expr-counter not found" (`modprobe -n -v`):
-    an unresolved name, killed (fail-closed, the decision of 04/11); the
-    built-ins' aliases changed nothing there. The malicious shapes 6 of 6
-    killed; every other benign module tool exec recorded.
+    an unresolved name, killed (then fail-closed); the built-ins' aliases
+    changed nothing there. The malicious shapes 6 of 6 killed; every other
+    benign module tool exec recorded. After the coordinator's decision of
+    04/11 (a plain name of no module: recorded, "nothing to load"),
+    4977f3ed on 24.04, a short round (k3s, the plain miss, the malicious
+    shapes): k3s's 9 module tool execs recorded, 0 killed; `modprobe
+    nn_k279_no_such_module` recorded, "nothing to load: the name resolves to
+    no module of this kernel" (modprobe's own exit 1, "not found"); the
+    malicious shapes 6 of 6 killed, among them `modprobe -S 9.9.9` of that
+    same missing name.
   - Measured beside R011, for the Tappa Prove (the kills on a benign corpus;
     not this lot's to change). Every run, on both guests, `main` and the lot
     alike, went to a locked COMBAT and judged most of the corpus there. The
