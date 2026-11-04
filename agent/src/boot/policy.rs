@@ -347,19 +347,9 @@ pub(crate) fn load(
             Verified::Content { path, text } => rp::boot_policy(Some((&path, &text))),
             _ => rp::boot_policy(None),
         };
-        if let Some(detail) = &boot.degraded {
-            error!(detail = %detail, "per-rule policy unreadable — the built-in defaults apply");
-            northnarrow_agent::boot::degradation::report("rule_policy", detail);
-        }
-        // R6 (lot 275): an `enforce` the rule refuses, in a policy signed
-        // before, is taken as `alert`; the rest of the policy is in force.
-        if let Some(detail) = &boot.demoted {
-            error!(
-                detail = %detail,
-                "per-rule policy: enforce refused, applied as alert — the rest of the policy is in force"
-            );
-            northnarrow_agent::boot::degradation::report("rule_policy", detail);
-        }
+        report_boot_policy(&boot, |source, detail| {
+            northnarrow_agent::boot::degradation::report(source, detail);
+        });
         let policy = boot.policy;
         if !policy.is_builtin() {
             warn!(
@@ -493,5 +483,61 @@ pub(crate) fn report_builtin_defaults(
             loaded_anyway,
         } => gate.report_default_modified(list, v1, sha256, builtin_sha256, *loaded_anyway),
         DefaultsSource::Disk | DefaultsSource::Superseded { .. } => {}
+    }
+}
+
+/// The signed degradations of the boot policy (`report` signs one): a
+/// signed file that did not parse (the built-in defaults in force) and, R6
+/// (lot 275), the `enforce` lines a rule refuses, taken as `alert` with the
+/// rest of the policy in force.
+fn report_boot_policy(
+    boot: &northnarrow_agent::decision::rule_policy::BootPolicy,
+    mut report: impl FnMut(&str, &str),
+) {
+    if let Some(detail) = &boot.degraded {
+        error!(detail = %detail, "per-rule policy unreadable — the built-in defaults apply");
+        report("rule_policy", detail);
+    }
+    if let Some(detail) = &boot.demoted {
+        error!(
+            detail = %detail,
+            "per-rule policy: enforce refused, applied as alert — the rest of the policy is in force"
+        );
+        report("rule_policy", detail);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::report_boot_policy;
+    use northnarrow_agent::decision::rule_policy::boot_policy;
+    use std::path::Path;
+
+    /// R6 (lot 275): the start signs a degradation for an `enforce` taken
+    /// as `alert`, and one for a policy that did not parse; none for a
+    /// policy in force as written.
+    #[test]
+    fn the_start_signs_the_policy_degradations() {
+        let path = Path::new("/etc/northnarrow/rule-policy.local");
+        let signed = |text: &str| {
+            let mut got = Vec::new();
+            report_boot_policy(&boot_policy(Some((path, text))), |s, d| {
+                got.push((s.to_string(), d.to_string()))
+            });
+            got
+        };
+        let got = signed("off R008\nenforce NN-L-NET-003\n");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "rule_policy");
+        assert!(
+            got[0]
+                .1
+                .contains("line 2: enforce NN-L-NET-003_BadJa3 refused, applied as alert"),
+            "{got:?}"
+        );
+        let got = signed("bogus x\n");
+        assert_eq!(got.len(), 1);
+        assert!(got[0].1.contains("built-in defaults"), "{got:?}");
+        assert!(signed("off R008\n").is_empty());
     }
 }
