@@ -424,6 +424,18 @@ exit 0"#,
 
     /// [`Self::install`] with the tree's agent at `agent_bin`.
     fn install_from(&self, mode: &str, upgrade: bool, key: Option<&str>, agent_bin: &str) -> Run {
+        self.install_with(mode, upgrade, key, agent_bin, "")
+    }
+
+    /// [`Self::install_from`] with `extra` (shell) set before the run.
+    fn install_with(
+        &self,
+        mode: &str,
+        upgrade: bool,
+        key: Option<&str>,
+        agent_bin: &str,
+        extra: &str,
+    ) -> Run {
         let body = section(
             "deploy/install.sh",
             "stop_nn_unit() {",
@@ -432,7 +444,7 @@ exit 0"#,
         let prelude = format!(
             "MODE={mode}; UPGRADE={}; GRANT_KEY={}\n\
              BIN_DIR=$T/bin; AGENT_BIN={agent_bin}\n\
-             PKG_RESTART_FILE=$T/pkg-restart; BPFFS_ROOT=$T/pins",
+             PKG_RESTART_FILE=$T/pkg-restart; BPFFS_ROOT=$T/pins\n{extra}",
             u8::from(upgrade),
             key.map(|k| format!("$T/{k}")).unwrap_or_default(),
         );
@@ -602,6 +614,137 @@ fn an_upgrade_of_units_the_boot_would_not_start_is_refused() {
     }
 }
 
+/// The re-review of #497 (RR2): the drop-ins of our units' directories
+/// the tree's agent would quarantine are listed and the run refused before
+/// anything is stopped — unless the operator accepts their move
+/// (`--accept-dropin-quarantine`: the tree's agent moves them, then the
+/// upgrade goes on); a move that fails refuses it too. The check runs once
+/// the window is open (R009, lot 278), or with no agent left (an install
+/// over stopped units); a tree agent without the check (an older
+/// release) is a warning.
+#[test]
+fn the_operator_s_drop_ins_the_agent_would_quarantine_refuse_the_run_unless_accepted() {
+    const CHECK: &str = "tree-agent --own-dropins check";
+    const MOVE: &str = "tree-agent --own-dropins quarantine";
+    let both = ["northnarrow-agent", "northnarrow-watchdog"];
+    let d = "/etc/systemd/system/northnarrow-agent.service.d";
+    let tree_agent = |host: &Host, check_rc: u8, move_rc: u8| {
+        let tree = host.dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        write_exec(
+            &tree.join("northnarrow-agent"),
+            &format!(
+                r#"case "$*" in
+    --version) echo 'northnarrow-agent 0.0.2' ;;
+    "--own-dropins check")
+        echo "tree-agent $*" >> "$NN_TEST_DIR/calls"
+        [ {check_rc} = 3 ] && printf '%s\n' \
+            "would move {d}/10-pin.conf: found by the installer's check, sets CPUAffinity=0: fewer than the host's online ones" \
+            "would move {d}/override.conf: found by the installer's check, EnvironmentFile=/etc/default/northnarrow-agent lies outside /etc/northnarrow/"
+        exit {check_rc} ;;
+    "--own-dropins quarantine")
+        echo "tree-agent $*" >> "$NN_TEST_DIR/calls"
+        echo "moved {d}/10-pin.conf -> /var/lib/northnarrow/quarantine/dropins/1-x: found by the installer's check"
+        exit {move_rc} ;;
+esac
+exit 0"#
+            ),
+        );
+        "$T/tree/northnarrow-agent"
+    };
+    let running = |r: &Run, host: &Host, case: &str| {
+        assert!(
+            !r.calls.iter().any(|c| c.starts_with("systemctl kill")),
+            "{case}: {r:#?}"
+        );
+        assert_eq!(
+            fs::read_to_string(host.dir.join("state.northnarrow-agent")).unwrap(),
+            "active\n",
+            "{case}: still running"
+        );
+    };
+    // listed and refused, nothing stopped; the window the run opened named
+    let host = Host::new("install-dropins-refused", &both, true, true);
+    let bin = tree_agent(&host, 3, 0);
+    let r = host.install_from("full", true, Some("key-role"), bin);
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert!(r.index(GRANT) < r.index(CHECK), "{r:#?}");
+    for want in [
+        &format!("install.sh:   {d}/10-pin.conf: found by the installer's check, sets CPUAffinity=0"),
+        &format!("install.sh:   {d}/override.conf: found by the installer's check, EnvironmentFile=/etc/default/northnarrow-agent lies outside"),
+        "REFUSED — remove them",
+        "--accept-dropin-quarantine",
+        "Nothing was changed (the trusted-installer window this run opened ends at its deadline).",
+    ] {
+        assert!(r.stderr.contains(want), "{want}: {r:#?}");
+    }
+    assert_eq!(r.called(MOVE), 0, "{r:#?}");
+    running(&r, &host, "refused");
+
+    // accepted: the tree's agent moves them, the upgrade goes on
+    let host = Host::new("install-dropins-accepted", &both, true, true);
+    let bin = tree_agent(&host, 3, 0);
+    let r = host.install_with(
+        "full",
+        true,
+        Some("key-role"),
+        bin,
+        "ACCEPT_DROPIN_QUARANTINE=1",
+    );
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert!(r.index(CHECK) < r.index(MOVE), "{r:#?}");
+    assert!(
+        r.stdout.contains(&format!(
+            "install.sh: moved {d}/10-pin.conf -> /var/lib/northnarrow/quarantine/dropins/"
+        )),
+        "{r:#?}"
+    );
+
+    // accepted, but a move failed: refused, nothing stopped
+    let host = Host::new("install-dropins-move-failed", &both, true, true);
+    let bin = tree_agent(&host, 3, 1);
+    let r = host.install_with(
+        "full",
+        true,
+        Some("key-role"),
+        bin,
+        "ACCEPT_DROPIN_QUARANTINE=1",
+    );
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert!(r.stderr.contains("a drop-in could not be moved"), "{r:#?}");
+    running(&r, &host, "move failed");
+
+    // none: the upgrade goes on, nothing moved
+    let host = Host::new("install-dropins-none", &both, true, true);
+    let bin = tree_agent(&host, 0, 0);
+    let r = host.install_from("full", true, Some("key-role"), bin);
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert_eq!((r.called(CHECK), r.called(MOVE)), (1, 0), "{r:#?}");
+
+    // an older tree agent with no such check: a warning
+    let host = Host::new("install-dropins-older", &both, true, true);
+    let bin = tree_agent(&host, 2, 0);
+    let r = host.install_from("full", true, Some("key-role"), bin);
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert!(
+        r.stderr
+            .contains("could not judge the drop-ins of its units' directories (exit 2)"),
+        "{r:#?}"
+    );
+
+    // an install over stopped units: checked with no agent to judge the
+    // exec, no window to name
+    let host = Host::new("install-dropins-stopped", &[], false, true);
+    let bin = tree_agent(&host, 3, 0);
+    let r = host.install_from("full", false, None, bin);
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert_eq!(r.called(GRANT), 0, "{r:#?}");
+    assert!(
+        r.stderr.contains("install.sh: Nothing was changed.\n"),
+        "{r:#?}"
+    );
+}
+
 /// A running install still takes the upgrade path: nothing extra started,
 /// both units restarted at the end; without --upgrade it is refused.
 #[test]
@@ -685,8 +828,21 @@ fn install_executes_the_tree_s_agent_only_in_tree_version() {
         body.contains("new_ver=$(exec \"$AGENT_BIN\" --version"),
         "{body}"
     );
+    // the re-review of #497 (RR2): the drop-in check, and the quarantine
+    // the operator accepted, are the tree's agent's too, run the same way
+    assert!(
+        body.contains("DROPINS_FOUND=$(exec \"$AGENT_BIN\" --own-dropins check"),
+        "{body}"
+    );
+    let quarantine = section("deploy/install.sh", "tree_dropins_quarantine() {", "\n}\n");
+    assert!(
+        quarantine.contains("DROPINS_MOVED=$(exec \"$AGENT_BIN\" --own-dropins quarantine"),
+        "{quarantine}"
+    );
     let start = text.find("tree_version() {").unwrap();
     let end = start + body.len();
+    let q_start = text.find("tree_dropins_quarantine() {").unwrap();
+    let q_end = q_start + quarantine.len();
     let mut at = 0;
     for (n, line) in text.lines().enumerate() {
         let here = at;
@@ -699,7 +855,7 @@ fn install_executes_the_tree_s_agent_only_in_tree_version() {
         if mentions.is_empty() {
             continue;
         }
-        let in_tree_version = (start..end).contains(&here);
+        let in_tree_version = (start..end).contains(&here) || (q_start..q_end).contains(&here);
         for m in &mentions {
             if m.runs() {
                 assert!(

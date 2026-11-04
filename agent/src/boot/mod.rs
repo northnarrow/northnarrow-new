@@ -133,6 +133,9 @@ pub fn main() -> Result<()> {
     if let Some(path) = &cli.btf_check {
         std::process::exit(preflight::btf_check(path));
     }
+    if let Some(mode) = &cli.own_dropins {
+        std::process::exit(preflight::own_dropins(mode == "quarantine"));
+    }
     if cli.sensor_feasibility {
         #[cfg(feature = "test-privileged")]
         {

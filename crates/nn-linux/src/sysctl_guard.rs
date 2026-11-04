@@ -171,6 +171,21 @@ pub fn check(root: &Path, mem_total: u64, write: bool) -> Vec<Seen> {
 /// sched_rt_period_us`, the review of #497, D3).
 pub const RT_PERIOD: &str = "/proc/sys/kernel/sched_rt_period_us";
 
+/// What the round puts back for an RT runtime that switches throttling off
+/// under `period` (the re-review of #497, NR3): 95 % of the period, the
+/// kernel's default ratio, computed so it is never 0 — and for a period
+/// too short to hold a runtime below 99 % of it (1 µs), the kernel's
+/// defaults: the period to 1 s first, then the runtime to 950 ms. The
+/// period to write first, if any, and the runtime.
+pub fn rt_restore(period: i64) -> (Option<i64>, i64) {
+    let runtime = period.saturating_mul(95) / 100;
+    if runtime >= 1 {
+        (None, runtime)
+    } else {
+        (Some(1_000_000), 950_000)
+    }
+}
+
 /// [`check`] with the writer given (the tests' failing one, the review of
 /// #497, D5 M1).
 pub fn check_with(
@@ -227,17 +242,27 @@ pub fn check_with(
             });
             continue;
         }
+        let mut first = Ok(());
         let safe = if *kind == SYSCTL_SCHED_RT_RUNTIME {
-            // 95 % of the period, the kernel's default ratio
-            (period.max(1) / 100 * 95).to_string()
+            // 95 % of the period, never 0 (NR3)
+            let (new_period, runtime) = rt_restore(period);
+            if let Some(p) = new_period {
+                first = put(
+                    &root.join(RT_PERIOD.trim_start_matches('/')),
+                    &format!("{p}\n"),
+                );
+            }
+            runtime.to_string()
         } else {
             safe.map(str::to_string)
                 .unwrap_or_else(|| threads_default(mem_total))
         };
-        let r = put(
-            &root.join(path.trim_start_matches('/')),
-            &format!("{safe}\n"),
-        );
+        let r = first.and_then(|()| {
+            put(
+                &root.join(path.trim_start_matches('/')),
+                &format!("{safe}\n"),
+            )
+        });
         out.push(match r {
             Ok(()) => Seen {
                 kind: "sysctl_restored",
@@ -366,6 +391,29 @@ mod tests {
         let none = host(&[("/proc/sys/kernel/sched_rt_runtime_us", "-1\n")]);
         let r = check(none.path(), 16 << 30, true);
         assert!(r[0].detail.ends_with("put back to 950000"), "{r:?}");
+        // the re-review of #497 (NR3): never 0 — a short period's 95 %
+        // (the old period/100*95 was 0 below 100 µs), and for a 1 µs
+        // period the kernel's defaults, the period first
+        let short = host(&[
+            ("/proc/sys/kernel/sched_rt_runtime_us", "-1\n"),
+            ("/proc/sys/kernel/sched_rt_period_us", "50\n"),
+        ]);
+        let r = check(short.path(), 16 << 30, true);
+        assert!(r[0].detail.ends_with("put back to 47"), "{r:?}");
+        let one = host(&[
+            ("/proc/sys/kernel/sched_rt_runtime_us", "1\n"),
+            ("/proc/sys/kernel/sched_rt_period_us", "1\n"),
+        ]);
+        let r = check(one.path(), 16 << 30, true);
+        assert!(r[0].detail.ends_with("put back to 950000"), "{r:?}");
+        let read = |f: &str| std::fs::read_to_string(one.path().join(f)).unwrap();
+        assert_eq!(read("proc/sys/kernel/sched_rt_period_us"), "1000000\n");
+        assert_eq!(read("proc/sys/kernel/sched_rt_runtime_us"), "950000\n");
+        for p in [1_i64, 2, 50, 99, 100, 950_000, 1_000_000, i64::MAX] {
+            let (np, r) = rt_restore(p);
+            assert!(r >= 1, "{p}");
+            assert!(!rt_throttling_off(r, np.unwrap_or(p)), "{p} → {r}");
+        }
     }
 
     /// R1: `ftrace_enabled=0` (set at boot, inside a window) is put back to

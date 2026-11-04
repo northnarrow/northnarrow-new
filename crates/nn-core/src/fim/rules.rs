@@ -48,7 +48,7 @@ use nn_model::telemetry::{FimEvent, FimOp};
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
-use crate::anti_tamper::trusted_installer::OWN_SYSTEMD_UNITS;
+use crate::anti_tamper::trusted_installer::{is_own_unit_dropin, OWN_SYSTEMD_UNITS};
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::Rule;
 use crate::posture::host::PostureHost;
@@ -978,9 +978,12 @@ impl<H: PostureAgent> Rule for NnLFim009SystemdUnitDropped<H> {
         }
         // §15.1: inside an OPEN trusted-installer window, a write to the
         // agent's OWN unit files is an authorised upgrade — downgrade to
-        // an audit Log (recorded, not silenced). Tight scope: any other
-        // unit, or our units with no open window, still trip the kill.
-        if OWN_SYSTEMD_UNITS.contains(&fe.path.as_str())
+        // an audit Log (recorded, not silenced). Lot 273d (round 17's
+        // C111): and to a drop-in of our units — the operator's
+        // configuration, which the window's close judges (`own_dropins`).
+        // Tight scope: any other unit or drop-in, or ours with no open
+        // window, still trip the kill.
+        if (OWN_SYSTEMD_UNITS.contains(&fe.path.as_str()) || is_own_unit_dropin(&fe.path))
             && H::installer_window_open(&self.installer_override)
         {
             return Some(fim_verdict(
@@ -3913,6 +3916,44 @@ mod tests {
             .unwrap();
         assert_eq!(v.action, ResponseAction::KillProcess);
         assert_eq!(v.severity, Severity::High);
+    }
+
+    /// Lot 273d (round 17's C111: the lab case's shell was killed for the
+    /// drop-in it wrote inside a window): a drop-in of our units written
+    /// inside an OPEN window is the operator's configuration — a Log/Low;
+    /// outside one, or another unit's drop-in, or a path that only looks
+    /// like ours, still trips the kill.
+    #[test]
+    fn fim009_lets_a_drop_in_of_our_units_be_written_inside_a_window() {
+        let open = NnLFim009SystemdUnitDropped::new(armed_override());
+        let closed = NnLFim009SystemdUnitDropped::new(H::inert_installer_window());
+        for p in [
+            "/etc/systemd/system/northnarrow-agent.service.d/62-x.conf",
+            "/etc/systemd/system/northnarrow-watchdog.service.d/override.conf",
+            "/etc/systemd/system/northnarrow-.service.d/10-a.conf",
+            "/etc/systemd/system/northnarrow.slice.d/50-MemoryMax.conf",
+            "/usr/lib/systemd/system/northnarrow-agent.service.d/x.conf",
+        ] {
+            let v = open.evaluate(&fim_event(FimOp::Created, p)).unwrap();
+            assert_eq!(
+                (v.action, v.severity),
+                (ResponseAction::Log, Severity::Low),
+                "{p}"
+            );
+            let v = closed.evaluate(&fim_event(FimOp::Created, p)).unwrap();
+            assert_eq!(v.action, ResponseAction::KillProcess, "{p}: no window");
+        }
+        for p in [
+            "/etc/systemd/system/evil.service.d/override.conf",
+            "/etc/systemd/system/northnarrow-agent.service.d/../evil.service",
+            "/etc/systemd/system/northnarrow-agent.service.d/sub/x.conf",
+            "/etc/systemd/system/northnarrow-agent.service.d/x.service",
+            "/etc/systemd/system/northnarrow-agent.service.d/.conf",
+            "/etc/systemd/system/northnarrow-agent.service.dx/x.conf",
+        ] {
+            let v = open.evaluate(&fim_event(FimOp::Created, p)).unwrap();
+            assert_eq!(v.action, ResponseAction::KillProcess, "{p}");
+        }
     }
 
     // ── builder hygiene ─────────────────────────────────────────

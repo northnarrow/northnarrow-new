@@ -153,6 +153,10 @@ AUDIT_GROUP=${NN_AUDIT_GROUP:-}
 # fanotify permission events). keep = leave an installed one in place
 # (refreshed), 1 = install it, 0 = remove it.
 COW_GUARD=keep
+# The re-review of #497 (RR2): drop-ins of our units' directories this
+# release's agent would quarantine are listed and the run refused, unless
+# the operator accepts their move (own_dropins_preflight).
+ACCEPT_DROPIN_QUARANTINE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --upgrade) UPGRADE=1 ;;
@@ -174,6 +178,7 @@ while [[ $# -gt 0 ]]; do
         --audit-group) AUDIT_GROUP=$2; shift ;;
         --cow-guard) COW_GUARD=1 ;;
         --no-cow-guard) COW_GUARD=0 ;;
+        --accept-dropin-quarantine) ACCEPT_DROPIN_QUARANTINE=1 ;;
         -h|--help)
             echo "usage: sudo $0 [--upgrade --grant-key KEY] [--tarball FILE] [--sums FILE] [--attestation BUNDLE]"
             echo "                 [--source-tree | --allow-unverified | --no-verify] [--without-nftables]"
@@ -198,6 +203,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --cow-guard            add the copy-on-first-write drop-in (CAP_SYS_ADMIN, CAP_CHOWN, CAP_FOWNER;"
             echo "                         EXPERIMENTAL; the guard stays off without a signed cow-guard.local)"
             echo "  --no-cow-guard         remove that drop-in"
+            echo "  --accept-dropin-quarantine"
+            echo "                         move the drop-ins of the agent's own unit directories this release's"
+            echo "                         agent judges harmful to /var/lib/northnarrow/quarantine/dropins (without"
+            echo "                         it the run lists them and is refused, nothing changed)"
             echo "  --audit-group GROUP    existing group that may read $ETC_DIR/audit.log and chain_heads.json"
             echo "                         besides root (a log shipper; NN_AUDIT_GROUP too). Kept by later upgrades"
             echo "  The flag that accepted a level below 'attested' is logged (auth.warning), recorded in the"
@@ -1557,6 +1566,63 @@ tree_version() {
     new_ver=$(exec "$AGENT_BIN" --version 2>/dev/null) || true
     new_ver=${new_ver%%$'\n'*}
     new_ver=${new_ver:-unknown}
+    # The re-review of #497 (RR2): the drop-ins of our units' directories
+    # this release's agent would quarantine, every one whatever its age
+    # (its integrity round moves only one changed after its install) —
+    # own_dropins_preflight reads them. Exit 3: some, 0: none, else the
+    # tree's agent has no such check (an older release).
+    DROPINS_RC=0
+    DROPINS_FOUND=$(exec "$AGENT_BIN" --own-dropins check 2>/dev/null) || DROPINS_RC=$?
+}
+# The re-review of #497 (RR2): with --accept-dropin-quarantine, the tree's
+# agent moves them (inside the window, or with no agent left to judge the
+# exec, as tree_version).
+tree_dropins_quarantine() {
+    DROPINS_RC=0
+    DROPINS_MOVED=$(exec "$AGENT_BIN" --own-dropins quarantine 2>&1) || DROPINS_RC=$?
+}
+# Run once, right after tree_version and before anything is stopped or
+# changed: the operator's drop-ins this release's agent would quarantine
+# are listed, and the run refused unless --accept-dropin-quarantine (a
+# silent move of the operator's configuration is not an upgrade's to make).
+DROPINS_CHECKED=0
+DROPINS_RC=0
+DROPINS_FOUND=""
+DROPINS_MOVED=""
+WINDOW_OPENED=0
+own_dropins_preflight() {
+    (( ${DROPINS_CHECKED:-0} )) && return 0
+    DROPINS_CHECKED=1
+    case "${DROPINS_RC:-0}" in
+        0) return 0 ;;
+        3) ;;
+        *)
+            echo "install.sh: WARNING: the tree's agent could not judge the drop-ins of its units' directories (exit $DROPINS_RC): not checked" >&2
+            return 0 ;;
+    esac
+    echo "install.sh: the drop-in directories of the agent's own units hold drop-ins this release's agent quarantines:" >&2
+    while IFS= read -r l; do
+        [[ -n "$l" ]] && echo "install.sh:   ${l#would move }" >&2
+    done <<< "$DROPINS_FOUND"
+    if (( ! ${ACCEPT_DROPIN_QUARANTINE:-0} )); then
+        echo "install.sh: REFUSED — remove them (or move them out of those directories), or re-run with" >&2
+        echo "install.sh: --accept-dropin-quarantine to have them moved to /var/lib/northnarrow/quarantine/dropins" >&2
+        echo "install.sh: (docs/operator/UPGRADE_NOTES_WAVE4.md section 7)." >&2
+        if (( ${WINDOW_OPENED:-0} )); then
+            echo "install.sh: Nothing was changed (the trusted-installer window this run opened ends at its deadline)." >&2
+        else
+            echo "install.sh: Nothing was changed." >&2
+        fi
+        return 1
+    fi
+    tree_dropins_quarantine
+    while IFS= read -r l; do
+        [[ -n "$l" ]] && echo "install.sh: $l"
+    done <<< "$DROPINS_MOVED"
+    if (( DROPINS_RC != 0 )); then
+        echo "install.sh: REFUSED — a drop-in could not be moved (above); nothing else was changed." >&2
+        return 1
+    fi
 }
 open_trusted_installer_window() {
     local key=$1
@@ -1721,12 +1787,21 @@ if (( ${#UNITS_TO_RESTART[@]} || STARTED_FOR_WINDOW )); then
                 echo "install.sh: the agent started for the window keeps running (its stop needs the window)" >&2
             exit 1
         fi
+        WINDOW_OPENED=1
     fi
     old_ver=$("$BIN_DIR/northnarrow-agent" --version 2>/dev/null | head -1 || echo "unknown")
+    if [[ $MODE == full ]]; then
+        # the window is open: R009 records the tree's execs at Low (lot 278)
+        tree_version
+        if ! own_dropins_preflight; then
+            (( STARTED_FOR_WINDOW )) &&
+                echo "install.sh: the agent started for the window keeps running (its stop needs the window)" >&2
+            exit 1
+        fi
+    fi
     if (( STARTED_FOR_WINDOW )); then
         echo "install.sh: $old_ver started only for the window — stopped again below, not restarted"
     elif [[ $MODE == full ]]; then
-        tree_version
         echo "install.sh: UPGRADE — installed: $old_ver → new: $new_ver"
     else
         echo "install.sh: stopping $old_ver for the package manager"
@@ -1758,6 +1833,9 @@ fi
 # an install over stopped units (no agent runs any more to judge the exec).
 if [[ $MODE == full && ${new_ver:-unknown} == unknown ]]; then
     tree_version
+fi
+if [[ $MODE == full ]]; then
+    own_dropins_preflight || exit 1
 fi
 
 if [[ $MODE == stop ]]; then

@@ -129,6 +129,12 @@ pub struct TrustedInstallerOverride {
     /// Lot 273d: when the open window was armed (its close judges our
     /// units' drop-ins made since, `crate::own_dropins`).
     armed_at: Mutex<Option<std::time::SystemTime>>,
+    /// The re-review of #497 (RR1): the protected-inode keys the passes
+    /// over our drop-ins registered — this window's close and the
+    /// integrity round (through [`Self::own_dropin_keys`]) share them, so
+    /// one pass takes out a key another registered once its path no
+    /// longer names it.
+    own_dropin_keys: crate::own_dropins::Registered,
 }
 
 #[derive(Default)]
@@ -159,6 +165,7 @@ impl TrustedInstallerOverride {
             clock: Arc::new(SystemClock),
             reloader: Mutex::new(None),
             armed_at: Mutex::new(None),
+            own_dropin_keys: crate::own_dropins::Registered::default(),
         }
     }
 
@@ -410,6 +417,21 @@ impl TrustedInstallerOverride {
         self.is_active_at(self.clock.now())
     }
 
+    /// The bpffs root its kernel maps are pinned under (`None`: no deny
+    /// hook this boot) — the integrity round's write protection of our
+    /// kept drop-ins opens the protected-inode map there (the re-review of
+    /// #497, RR1).
+    pub fn bpffs_root(&self) -> Option<&Path> {
+        self.bpffs_root.as_deref()
+    }
+
+    /// The keys the passes over our drop-ins registered (the re-review of
+    /// #497, RR1; the round's [`crate::own_dropins::Protector`] shares
+    /// them with this window's close).
+    pub fn own_dropin_keys(&self) -> &crate::own_dropins::Registered {
+        &self.own_dropin_keys
+    }
+
     /// Lab PR 225: the grant of the window open as of `now` — its key id
     /// and its deadline — or `None` when no window is open (never armed,
     /// closed, or past its deadline).
@@ -505,7 +527,8 @@ impl TrustedInstallerOverride {
                 .take()
                 .map(|t| t - std::time::Duration::from_secs(2))
                 .unwrap_or(std::time::UNIX_EPOCH);
-            let moved = own_dropins_at_close(since);
+            let moved =
+                own_dropins_at_close(since, self.bpffs_root.as_deref(), &self.own_dropin_keys);
             if moved.iter().any(|m| m.to.is_some()) {
                 if let Some(r) = self.reloader.lock().as_ref() {
                     r.request(crate::systemd_reload::Reason::OwnDropinQuarantined);
@@ -606,21 +629,34 @@ fn sysctls_at_close() -> Vec<String> {
     .collect()
 }
 
-/// Lot 273d: our units' drop-ins made since `since`, judged on this host.
-fn own_dropins_at_close(since: std::time::SystemTime) -> Vec<crate::own_dropins::Moved> {
+/// Lot 273d: our units' drop-ins made since `since`, judged on this host;
+/// the re-review of #497 (RR1): the ones kept, and the environment files
+/// they name, write-protected (the pinned map under `bpffs_root`).
+fn own_dropins_at_close(
+    since: std::time::SystemTime,
+    bpffs_root: Option<&Path>,
+    keys: &crate::own_dropins::Registered,
+) -> Vec<crate::own_dropins::Moved> {
     let roots = crate::self_integrity::unit_roots(std::path::Path::new("/"));
     let search: Vec<&std::path::Path> = roots.iter().map(|p| p.as_path()).collect();
-    crate::own_dropins::quarantine(
+    let mut protector = crate::own_dropins::Protector::open(bpffs_root, keys);
+    let moved = crate::own_dropins::quarantine(
         &search,
         &crate::host_dropins::HostLimits::read(),
-        since,
+        crate::own_dropins::Pass {
+            since,
+            when: crate::own_dropins::AT_CLOSE,
+        },
         std::path::Path::new(crate::own_dropins::QUARANTINE_DIR),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
         crate::self_integrity::is_known_dropin,
-    )
+        &mut |p| protector.protect(p),
+    );
+    protector.finish();
+    moved
 }
 
 /// Lot 278: the installer a grant asked for an installer acts for (review

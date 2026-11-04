@@ -1683,10 +1683,13 @@ pub struct OwnDropinGuard {
 }
 
 impl Checker {
-    /// The review of #497 (D4): outside a window, every drop-in of our
-    /// units' directories judged again (a kept one may have changed, root
-    /// may write it), the harmful ones quarantined, each a signed record,
-    /// and a reload asked when one moved.
+    /// The review of #497 (D4): outside a window, our units' drop-ins
+    /// judged again — the re-review (RR2): every one changed since the
+    /// agent's install (its binary's ctime, [`crate::own_dropins::install_time`]),
+    /// never one the operator had before it, which `install.sh --upgrade`
+    /// lists and refuses first — the harmful ones quarantined, each a
+    /// signed record, a reload asked when one moved; and (RR1) every one
+    /// kept write-protected, with the environment files it names.
     fn own_dropins_round(&mut self, at_boot: bool) {
         let Some(g) = &self.own_guard else {
             return;
@@ -1694,16 +1697,26 @@ impl Checker {
         if g.window.is_window_open() {
             return;
         }
+        let Some(since) = crate::own_dropins::install_time() else {
+            return;
+        };
         let roots = unit_roots(Path::new("/"));
         let search: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+        let mut protector =
+            crate::own_dropins::Protector::open(g.window.bpffs_root(), g.window.own_dropin_keys());
         let moved = crate::own_dropins::quarantine(
             &search,
             &crate::host_dropins::HostLimits::read(),
-            UNIX_EPOCH,
+            crate::own_dropins::Pass {
+                since,
+                when: crate::own_dropins::AT_ROUND,
+            },
             Path::new(crate::own_dropins::QUARANTINE_DIR),
             unix_now(),
             is_known_dropin,
+            &mut |p| protector.protect(p),
         );
+        protector.finish();
         if moved.iter().any(|m| m.to.is_some()) {
             g.reloader
                 .request(crate::systemd_reload::Reason::OwnDropinQuarantined);

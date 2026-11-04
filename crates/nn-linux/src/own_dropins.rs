@@ -13,6 +13,13 @@
 //! is in the window's signed close record, and systemd reloads (at most
 //! one a [`crate::systemd_reload::MIN_INTERVAL`]). The drop-ins
 //! `install.sh` lays down are known by their content and left.
+//!
+//! The re-review of #497: a drop-in kept, and the environment file under
+//! [`ENV_FILE_DIR`] it names, are write-protected ([`Protector`], RR1);
+//! the integrity round judges again only what changed since the agent's
+//! install ([`install_time`]) — one the operator had before is listed by
+//! `install.sh --upgrade` (the agent's `--own-dropins check`), never moved
+//! by the round (RR2).
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -82,12 +89,64 @@ fn changed_since(meta: &std::fs::Metadata, since: SystemTime) -> bool {
     ct >= s
 }
 
+/// When the running agent was installed: its binary's ctime (`install.sh`
+/// stages it and renames it in, a package unpacks it; outside a window no
+/// one changes it — it is a protected file). The integrity round judges
+/// only our drop-ins changed since (the re-review of #497, RR2). `None`
+/// when it cannot be read: the round then judges none.
+pub fn install_time() -> Option<SystemTime> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata("/proc/self/exe").ok()?;
+    let secs = u64::try_from(meta.ctime()).ok()?;
+    Some(
+        SystemTime::UNIX_EPOCH
+            + std::time::Duration::new(secs, meta.ctime_nsec().clamp(0, 999_999_999) as u32),
+    )
+}
+
+/// The `EnvironmentFile=`s of a drop-in's text, the `-` (optional) taken
+/// off.
+fn env_files(text: &str) -> Vec<String> {
+    effective(directives(text))
+        .into_iter()
+        .filter(|(k, _)| k == "EnvironmentFile")
+        .flat_map(|(_, v)| {
+            v.split_whitespace()
+                .map(|f| f.trim_start_matches('-').to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// `f` names a file under [`ENV_FILE_DIR`]: absolute, inside it, with no
+/// `.` or `..` that could lead out of it.
+fn under_env_dir(f: &str) -> bool {
+    use std::path::Component;
+    let p = Path::new(f);
+    f.starts_with(ENV_FILE_DIR)
+        && p.components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+}
+
+/// `path` is a regular file with one name (`lstat`: a symlink is not).
+pub fn regular_with_one_name(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file() && m.nlink() == 1)
+}
+
 /// Why an entry of our directories is quarantined whatever its directives
 /// say (the review of #497, D4): not a regular file (a symlink systemd
 /// follows to a target outside our directories), a hard link (its content
-/// changes through another name), or an `EnvironmentFile=` outside
-/// [`ENV_FILE_DIR`].
-fn shape_harm(meta: &std::fs::Metadata, from: &Path, text: Option<&str>) -> Option<String> {
+/// changes through another name), an `EnvironmentFile=` outside
+/// [`ENV_FILE_DIR`] — or, the re-review of #497 (RR1), one inside it that
+/// `protect` cannot keep from changing without a window (not a regular
+/// file with one name, or its write protection not registered).
+fn shape_harm(
+    meta: &std::fs::Metadata,
+    from: &Path,
+    text: Option<&str>,
+    protect: &mut dyn FnMut(&Path) -> bool,
+) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     if meta.file_type().is_symlink() {
         let to = std::fs::read_link(from)
@@ -106,39 +165,69 @@ fn shape_harm(meta: &std::fs::Metadata, from: &Path, text: Option<&str>) -> Opti
             meta.nlink()
         ));
     }
-    let text = text?;
-    effective(directives(text))
-        .into_iter()
-        .filter(|(k, _)| k == "EnvironmentFile")
-        .flat_map(|(_, v)| {
-            v.split_whitespace()
-                .map(|f| f.trim_start_matches('-').to_string())
-                .collect::<Vec<_>>()
-        })
-        .find(|f| !f.starts_with(ENV_FILE_DIR))
-        .map(|f| {
-            format!(
+    for f in env_files(text?) {
+        if !under_env_dir(&f) {
+            return Some(format!(
                 "EnvironmentFile={f} lies outside {ENV_FILE_DIR}: its content changes after the judgment"
-            )
-        })
+            ));
+        }
+        if !protect(Path::new(&f)) {
+            return Some(format!(
+                "EnvironmentFile={f} is not a protected regular file with one name: its content changes without a window"
+            ));
+        }
+    }
+    None
 }
 
-/// The harmful drop-ins of our units' directories under `roots`, changed
-/// at or after `since` (by their ctime; the window's opening at its
-/// close, `UNIX_EPOCH` at the integrity round, which judges every one of
-/// them again — a drop-in kept at a close stays writable by root), moved
-/// into `quarantine` (`now`: the name's stamp). `known`: a drop-in
-/// `install.sh` lays down, left. Whatever its directives, a symlink, a
-/// hard link and an `EnvironmentFile=` outside [`ENV_FILE_DIR`] are
-/// quarantined (the review of #497, D4).
-pub fn quarantine(
+/// How a pass over our units' drop-in directories judges.
+#[derive(Debug, Clone, Copy)]
+pub struct Pass<'a> {
+    /// An entry changed (its ctime) at or after it is judged; one changed
+    /// before is only kept protected.
+    pub since: SystemTime,
+    /// How a record names the entries this pass judges.
+    pub when: &'a str,
+}
+
+/// [`Pass::when`] at a window's close (since its opening).
+pub const AT_CLOSE: &str = "made inside the window";
+/// [`Pass::when`] at the integrity round (since the agent's install, the
+/// re-review of #497, RR2: a drop-in the operator had before is never
+/// moved by the round — `install.sh --upgrade` lists it first).
+pub const AT_ROUND: &str = "changed outside a window since the agent was installed";
+/// [`Pass::when`] of the installer's check (every entry).
+pub const AT_CHECK: &str = "found by the installer's check";
+
+/// A harmful entry of our directories, not moved yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Harmful {
+    pub from: PathBuf,
+    pub why: String,
+    /// What the quarantine keeps of it: its bytes, a symlink's target.
+    keep: Vec<u8>,
+}
+
+/// The harmful drop-ins of our units' directories under `roots`: each
+/// entry changed at or after `pass.since` (by its ctime) judged against
+/// its own unit's floors and semantics. `known`: a drop-in `install.sh`
+/// lays down, left. Whatever its directives, a symlink, a hard link and an
+/// `EnvironmentFile=` outside [`ENV_FILE_DIR`] are harmful (the review of
+/// #497, D4), and so is one inside it that `protect` does not hold.
+///
+/// The re-review of #497 (RR1): every entry kept — a regular file with one
+/// name, judged harmless or not judged in this pass — and the
+/// `EnvironmentFile=`s it names under [`ENV_FILE_DIR`] go through
+/// `protect`, which registers their write protection (a [`Protector`]): a
+/// kept drop-in no longer changes without a window. Read-only callers
+/// pass a `protect` that only looks ([`regular_with_one_name`]).
+pub fn harmful(
     roots: &[&Path],
     host: &HostLimits,
-    since: SystemTime,
-    quarantine: &Path,
-    now: u64,
+    pass: Pass<'_>,
     known: impl Fn(&Path, &[u8]) -> bool,
-) -> Vec<Moved> {
+    protect: &mut dyn FnMut(&Path) -> bool,
+) -> Vec<Harmful> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for root in roots {
@@ -160,9 +249,6 @@ pub fn quarantine(
                 let Ok(meta) = std::fs::symlink_metadata(&from) else {
                     continue;
                 };
-                if !changed_since(&meta, since) {
-                    continue;
-                }
                 let regular = meta.file_type().is_file();
                 let bytes = if regular {
                     std::fs::read(&from).ok()
@@ -172,20 +258,24 @@ pub fn quarantine(
                 if regular && bytes.is_none() {
                     continue;
                 }
-                if let Some(b) = &bytes {
-                    if known(&from, b) && meta_nlink(&meta) == 1 {
-                        continue;
-                    }
-                }
                 let text = bytes
                     .as_ref()
                     .map(|b| String::from_utf8_lossy(b).to_string());
-                let when = if since == SystemTime::UNIX_EPOCH {
-                    "found by the integrity round"
-                } else {
-                    "made inside the window"
-                };
-                let why = shape_harm(&meta, &from, text.as_deref())
+                let single = regular && meta_nlink(&meta) == 1;
+                if !changed_since(&meta, pass.since) {
+                    if single {
+                        keep_protected(&from, text.as_deref(), protect);
+                    }
+                    continue;
+                }
+                if let Some(b) = &bytes {
+                    if single && known(&from, b) {
+                        keep_protected(&from, text.as_deref(), protect);
+                        continue;
+                    }
+                }
+                let when = pass.when;
+                let why = shape_harm(&meta, &from, text.as_deref(), protect)
                     .map(|w| format!("{when}, {w}"))
                     .or_else(|| {
                         effective(directives(text.as_deref()?))
@@ -200,22 +290,11 @@ pub fn quarantine(
                             .map(|(k, v, w, _)| format!("{when}, sets {k}={v}: {w}"))
                     });
                 let Some(why) = why else {
+                    keep_protected(&from, text.as_deref(), protect);
                     continue;
                 };
-                let name: String = from
-                    .to_string_lossy()
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                let to = quarantine.join(format!("{now}-{name}"));
                 // a symlink is kept as its target's name, never followed
-                let keep = bytes.clone().unwrap_or_else(|| {
+                let keep = bytes.unwrap_or_else(|| {
                     format!(
                         "symlink -> {}\n",
                         std::fs::read_link(&from)
@@ -224,30 +303,75 @@ pub fn quarantine(
                     )
                     .into_bytes()
                 });
-                let moved = std::fs::create_dir_all(quarantine)
-                    .and_then(|()| std::fs::write(&to, &keep))
-                    .and_then(|()| std::fs::remove_file(&from));
-                out.push(match moved {
-                    Ok(()) => Moved {
-                        from,
-                        to: Some(to),
-                        why,
-                        error: None,
-                    },
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&to);
-                        Moved {
-                            from,
-                            to: None,
-                            why,
-                            error: Some(e.to_string()),
-                        }
-                    }
-                });
+                out.push(Harmful { from, why, keep });
             }
         }
     }
     out
+}
+
+/// A kept drop-in and the `EnvironmentFile=`s it names under
+/// [`ENV_FILE_DIR`], through `protect` (the re-review of #497, RR1).
+fn keep_protected(from: &Path, text: Option<&str>, protect: &mut dyn FnMut(&Path) -> bool) {
+    protect(from);
+    for f in text.map(env_files).unwrap_or_default() {
+        if under_env_dir(&f) {
+            protect(Path::new(&f));
+        }
+    }
+}
+
+/// [`harmful`]'s entries moved into `quarantine` (`now`: the name's
+/// stamp), each one's move or failure.
+pub fn quarantine(
+    roots: &[&Path],
+    host: &HostLimits,
+    pass: Pass<'_>,
+    quarantine: &Path,
+    now: u64,
+    known: impl Fn(&Path, &[u8]) -> bool,
+    protect: &mut dyn FnMut(&Path) -> bool,
+) -> Vec<Moved> {
+    harmful(roots, host, pass, known, protect)
+        .into_iter()
+        .map(|h| move_one(h, quarantine, now))
+        .collect()
+}
+
+fn move_one(h: Harmful, quarantine: &Path, now: u64) -> Moved {
+    let name: String = h
+        .from
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let to = quarantine.join(format!("{now}-{name}"));
+    let moved = std::fs::create_dir_all(quarantine)
+        .and_then(|()| std::fs::write(&to, &h.keep))
+        .and_then(|()| std::fs::remove_file(&h.from));
+    match moved {
+        Ok(()) => Moved {
+            from: h.from,
+            to: Some(to),
+            why: h.why,
+            error: None,
+        },
+        Err(e) => {
+            let _ = std::fs::remove_file(&to);
+            Moved {
+                from: h.from,
+                to: None,
+                why: h.why,
+                error: Some(e.to_string()),
+            }
+        }
+    }
 }
 
 fn meta_nlink(meta: &std::fs::Metadata) -> u64 {
@@ -255,9 +379,199 @@ fn meta_nlink(meta: &std::fs::Metadata) -> u64 {
     meta.nlink()
 }
 
+/// The installer's check (`northnarrow-agent --own-dropins`, the re-review
+/// of #497, RR2): our units' drop-ins under `prefix` (`/` on the host)
+/// against this build's judge, every one whatever its age. `quarantine`
+/// false: each one the agent would quarantine printed as `would move
+/// <path>: <why>`, nothing moved — 3 when there is one, 0 when none.
+/// `quarantine` true (the operator accepted it): each moved into
+/// `quarantine_dir`, `moved <path> -> <to>: <why>` — 1 when one could not
+/// be. An environment file under [`ENV_FILE_DIR`] counts as held when it
+/// is a regular file with one name: the agent protects it at its next pass.
+pub fn installer_check(
+    prefix: &Path,
+    host: &HostLimits,
+    quarantine_dir: &Path,
+    quarantine: bool,
+    now: u64,
+    out: &mut dyn std::io::Write,
+) -> i32 {
+    let roots = crate::self_integrity::unit_roots(prefix);
+    let search: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+    let pass = Pass {
+        since: SystemTime::UNIX_EPOCH,
+        when: AT_CHECK,
+    };
+    let known = crate::self_integrity::is_known_dropin;
+    let mut held = |p: &Path| regular_with_one_name(p);
+    if !quarantine {
+        let found = harmful(&search, host, pass, known, &mut held);
+        for h in &found {
+            let _ = writeln!(out, "would move {}: {}", h.from.display(), h.why);
+        }
+        return if found.is_empty() { 0 } else { 3 };
+    }
+    let moved = self::quarantine(&search, host, pass, quarantine_dir, now, known, &mut held);
+    let mut failed = false;
+    for m in &moved {
+        match &m.to {
+            Some(to) => {
+                let _ = writeln!(
+                    out,
+                    "moved {} -> {}: {}",
+                    m.from.display(),
+                    to.display(),
+                    m.why
+                );
+            }
+            None => {
+                failed = true;
+                let _ = writeln!(out, "NOT moved {}", m.detail());
+            }
+        }
+    }
+    i32::from(failed)
+}
+
+/// The inode keys a [`Protector`] registered itself, by path, across its
+/// passes — the window's close and the integrity round share one
+/// (`TrustedInstallerOverride::own_dropin_keys`): a key whose path no
+/// longer names it is taken out, so a freed inode number never protects
+/// another file. Keys registered at boot are not here and never taken out
+/// by a pass.
+pub type Registered = std::sync::Mutex<std::collections::BTreeMap<PathBuf, (u64, u64)>>;
+
+/// The protected-inode map as a [`Protector`] uses it.
+pub trait InodeMap {
+    fn flags(&self, key: common::wire::InodeKey) -> Option<u8>;
+    fn register(&mut self, key: common::wire::InodeKey, flags: u8) -> anyhow::Result<()>;
+    fn remove(&mut self, key: common::wire::InodeKey) -> anyhow::Result<()>;
+}
+
+impl InodeMap for crate::anti_tamper::filesystem::ProtectedInodesHandle {
+    fn flags(&self, key: common::wire::InodeKey) -> Option<u8> {
+        crate::anti_tamper::filesystem::ProtectedInodesHandle::flags(self, key)
+    }
+    fn register(&mut self, key: common::wire::InodeKey, flags: u8) -> anyhow::Result<()> {
+        crate::anti_tamper::filesystem::ProtectedInodesHandle::register(self, key, flags)
+    }
+    fn remove(&mut self, key: common::wire::InodeKey) -> anyhow::Result<()> {
+        crate::anti_tamper::filesystem::ProtectedInodesHandle::remove(self, key)
+    }
+}
+
+/// The re-review of #497 (RR1): the write protection of the drop-ins a
+/// pass keeps and of the `EnvironmentFile=`s they name under
+/// [`ENV_FILE_DIR`] — `FS_PROTECT_WRITE | FS_PROTECT_MUTATE` in the pinned
+/// protected-inode map, added to what a key already has. Outside a window
+/// root can no longer rewrite them (a `50-CPUQuota.conf` kept at a close
+/// turned into `ExecStartPre=`, applied at the next boot before the agent
+/// runs). A window lifts it as it lifts every protected file's.
+pub struct Protector<'a, M: InodeMap = crate::anti_tamper::filesystem::ProtectedInodesHandle> {
+    map: Option<M>,
+    ours: std::sync::MutexGuard<'a, std::collections::BTreeMap<PathBuf, (u64, u64)>>,
+    kept: std::collections::BTreeMap<PathBuf, (u64, u64)>,
+}
+
+impl<'a> Protector<'a> {
+    /// The pinned map under `bpffs_root` (`None`, or a map that cannot be
+    /// opened: no deny hook protects any file on this host — a regular
+    /// file with one name is then taken as held, the degradation is
+    /// signed elsewhere), with the keys `registered` records.
+    pub fn open(bpffs_root: Option<&Path>, registered: &'a Registered) -> Self {
+        let map = bpffs_root.and_then(|r| {
+            crate::anti_tamper::filesystem::ProtectedInodesHandle::open(r)
+                .map_err(|e| {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "our drop-ins: the protected-inode map cannot be opened — not protected"
+                    )
+                })
+                .ok()
+        });
+        Self::with_map(map, registered)
+    }
+}
+
+impl<'a, M: InodeMap> Protector<'a, M> {
+    /// Over `map`, with the keys `registered` records (held for the pass).
+    pub fn with_map(map: Option<M>, registered: &'a Registered) -> Self {
+        Self {
+            map,
+            ours: registered.lock().unwrap_or_else(|p| p.into_inner()),
+            kept: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// `path` is a regular file with one name, now write-protected.
+    pub fn protect(&mut self, path: &Path) -> bool {
+        use common::wire::{InodeKey, FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        if !meta.file_type().is_file() || meta.nlink() != 1 {
+            return false;
+        }
+        let Some(map) = self.map.as_mut() else {
+            return true;
+        };
+        let key = InodeKey {
+            dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(meta.dev()),
+            ino: meta.ino(),
+        };
+        let had = map.flags(key);
+        let want = had.unwrap_or(0) | FS_PROTECT_WRITE | FS_PROTECT_MUTATE;
+        if had != Some(want) {
+            if let Err(e) = map.register(key, want) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %format!("{e:#}"),
+                    "our drop-ins: write protection not registered"
+                );
+                return false;
+            }
+        }
+        let k = (key.dev, key.ino);
+        if had.is_none() || self.ours.get(path) == Some(&k) {
+            self.kept.insert(path.to_path_buf(), k);
+        }
+        true
+    }
+
+    /// The pass is over: a key a pass registered whose path this one did
+    /// not keep with it is taken out of the map (handed back).
+    pub fn finish(mut self) -> Option<M> {
+        let gone: Vec<(PathBuf, (u64, u64))> = self
+            .ours
+            .iter()
+            .filter(|(p, k)| self.kept.get(*p) != Some(*k))
+            .map(|(p, k)| (p.clone(), *k))
+            .collect();
+        for (p, (dev, ino)) in gone {
+            if !self.kept.values().any(|k| *k == (dev, ino)) {
+                if let Some(map) = self.map.as_mut() {
+                    let _ = map.remove(common::wire::InodeKey { dev, ino });
+                }
+            }
+            self.ours.remove(&p);
+        }
+        let kept = std::mem::take(&mut self.kept);
+        self.ours.extend(kept);
+        self.map.take()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn close(since: SystemTime) -> Pass<'static> {
+        Pass {
+            since,
+            when: AT_CLOSE,
+        }
+    }
 
     fn host() -> HostLimits {
         HostLimits {
@@ -286,10 +600,11 @@ mod tests {
         let r = quarantine(
             &[root.path()],
             &host(),
-            since,
+            close(since),
             q.path(),
             1700000000,
             |p, _| p.ends_with("10-known.conf"),
+            &mut |_| true,
         );
         assert_eq!(r.len(), 1, "{r:?}");
         assert!(r[0]
@@ -302,7 +617,16 @@ mod tests {
         // a drop-in changed before the window is not judged here
         std::fs::write(ag.join("60-old.conf"), "[Service]\nMemoryMax=4K\n").unwrap();
         let later = SystemTime::now() + std::time::Duration::from_secs(60);
-        assert!(quarantine(&[root.path()], &host(), later, q.path(), 1, |_, _| false).is_empty());
+        assert!(quarantine(
+            &[root.path()],
+            &host(),
+            close(later),
+            q.path(),
+            1,
+            |_, _| false,
+            &mut |_| true
+        )
+        .is_empty());
     }
 
     /// The review of #497 (D4): an mtime set back (`touch -d`) does not
@@ -325,7 +649,15 @@ mod tests {
             .set_times(old)
             .unwrap();
         assert!(std::fs::metadata(&f).unwrap().modified().unwrap() < since);
-        let r = quarantine(&[root.path()], &host(), since, q.path(), 1, |_, _| false);
+        let r = quarantine(
+            &[root.path()],
+            &host(),
+            close(since),
+            q.path(),
+            1,
+            |_, _| false,
+            &mut |_| true,
+        );
         assert_eq!(r.len(), 1, "{r:?}");
         assert!(!f.exists());
     }
@@ -357,7 +689,15 @@ mod tests {
             "[Service]\nEnvironmentFile=/etc/northnarrow/agent.env\nMemoryMax=2G\n",
         )
         .unwrap();
-        let r = quarantine(&[root.path()], &host(), since, q.path(), 7, |_, _| false);
+        let r = quarantine(
+            &[root.path()],
+            &host(),
+            close(since),
+            q.path(),
+            7,
+            |_, _| false,
+            &mut |_| true,
+        );
         let why: Vec<String> = r.iter().map(Moved::detail).collect();
         assert_eq!(r.len(), 3, "{why:#?}");
         assert!(
@@ -389,5 +729,305 @@ mod tests {
             kept.iter().any(|k| k.starts_with("symlink -> ")),
             "{kept:?}"
         );
+    }
+
+    /// The re-review of #497 (RR1): a kept drop-in, and the environment
+    /// file under /etc/northnarrow it names, go through `protect` — judged
+    /// in this pass or not; an environment file `protect` does not hold
+    /// (not a regular file with one name, its protection not registered)
+    /// quarantines the drop-in; `..` never leads out of /etc/northnarrow.
+    #[test]
+    fn a_kept_drop_in_and_its_environment_file_are_write_protected() {
+        let root = tempfile::tempdir().unwrap();
+        let q = tempfile::tempdir().unwrap();
+        let ag = root.path().join("northnarrow-agent.service.d");
+        std::fs::create_dir_all(&ag).unwrap();
+        // before the pass: not judged, kept protected all the same
+        std::fs::write(ag.join("40-old.conf"), "[Service]\nCPUQuota=80%\n").unwrap();
+        let since = SystemTime::now() + std::time::Duration::from_secs(60);
+        let mut calls: Vec<PathBuf> = Vec::new();
+        let r = quarantine(
+            &[root.path()],
+            &host(),
+            close(since),
+            q.path(),
+            1,
+            |_, _| false,
+            &mut |p| {
+                calls.push(p.to_path_buf());
+                true
+            },
+        );
+        assert!(r.is_empty(), "{r:?}");
+        assert_eq!(calls, vec![ag.join("40-old.conf")]);
+        // inside the pass: a harmless one with its environment file, one
+        // whose environment file is not held, one that climbs out with ..
+        let since = SystemTime::now() - std::time::Duration::from_secs(5);
+        std::fs::write(
+            ag.join("50-CPUQuota.conf"),
+            "[Service]\nCPUQuota=80%\nEnvironmentFile=/etc/northnarrow/agent.env\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ag.join("51-extra.conf"),
+            "[Service]\nEnvironmentFile=-/etc/northnarrow/extra.env\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ag.join("52-climb.conf"),
+            "[Service]\nEnvironmentFile=/etc/northnarrow/../../var/tmp/nn.env\n",
+        )
+        .unwrap();
+        let mut calls: Vec<PathBuf> = Vec::new();
+        let r = quarantine(
+            &[root.path()],
+            &host(),
+            close(since),
+            q.path(),
+            2,
+            |_, _| false,
+            &mut |p| {
+                calls.push(p.to_path_buf());
+                p != Path::new("/etc/northnarrow/extra.env")
+            },
+        );
+        let why: Vec<String> = r.iter().map(Moved::detail).collect();
+        assert_eq!(r.len(), 2, "{why:#?}");
+        assert!(
+            why[0].contains(
+                "51-extra.conf: made inside the window, EnvironmentFile=/etc/northnarrow/extra.env \
+                 is not a protected regular file with one name"
+            ),
+            "{why:#?}"
+        );
+        assert!(
+            why[1].contains("EnvironmentFile=/etc/northnarrow/../../var/tmp/nn.env lies outside"),
+            "{why:#?}"
+        );
+        assert!(ag.join("50-CPUQuota.conf").exists());
+        // the kept ones and the environment file the kept one names
+        for p in [
+            ag.join("40-old.conf"),
+            ag.join("50-CPUQuota.conf"),
+            PathBuf::from("/etc/northnarrow/agent.env"),
+        ] {
+            assert!(calls.contains(&p), "{p:?} not protected: {calls:#?}");
+        }
+        assert!(!calls.contains(&ag.join("51-extra.conf")), "{calls:#?}");
+        assert!(!calls.contains(&ag.join("52-climb.conf")), "{calls:#?}");
+    }
+
+    /// The re-review of #497 (RR2), with the reviewer's probe: the
+    /// installer's check lists the operator's drop-ins the agent would
+    /// quarantine — an `EnvironmentFile=` outside /etc/northnarrow, a
+    /// `CPUAffinity=` below the online CPUs, an environment file under it
+    /// that is not there to protect — and moves nothing; the integrity
+    /// round, which judges only what changed since the agent's install,
+    /// moves none of them.
+    #[test]
+    fn the_operator_s_drop_ins_from_before_the_install_are_listed_never_moved_by_the_round() {
+        let root = tempfile::tempdir().unwrap();
+        let q = tempfile::tempdir().unwrap();
+        let ag = root.path().join("northnarrow-agent.service.d");
+        std::fs::create_dir_all(&ag).unwrap();
+        let cases = [
+            (
+                "override.conf",
+                "[Service]\nEnvironmentFile=-/etc/default/northnarrow-agent\n",
+            ),
+            ("10-pin.conf", "[Service]\nCPUAffinity=0\n"),
+            ("20-log.conf", "[Service]\nEnvironment=RUST_LOG=info\n"),
+            (
+                "30-ours-env.conf",
+                "[Service]\nEnvironmentFile=/etc/northnarrow/nn-test-absent.env\n",
+            ),
+        ];
+        for (n, t) in cases {
+            std::fs::write(ag.join(n), t).unwrap();
+        }
+        let check = Pass {
+            since: SystemTime::UNIX_EPOCH,
+            when: AT_CHECK,
+        };
+        let listed = harmful(&[root.path()], &host(), check, |_, _| false, &mut |p| {
+            regular_with_one_name(p)
+        });
+        let why: Vec<String> = listed
+            .iter()
+            .map(|h| format!("{}: {}", h.from.display(), h.why))
+            .collect();
+        assert_eq!(listed.len(), 3, "{why:#?}");
+        assert!(
+            why[0].contains("10-pin.conf: found by the installer's check, sets CPUAffinity=0"),
+            "{why:#?}"
+        );
+        assert!(
+            why[1].contains("30-ours-env.conf: found by the installer's check, EnvironmentFile=/etc/northnarrow/nn-test-absent.env is not a protected"),
+            "{why:#?}"
+        );
+        assert!(
+            why[2].contains("override.conf: found by the installer's check, EnvironmentFile=/etc/default/northnarrow-agent lies outside"),
+            "{why:#?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&ag).unwrap().count(),
+            4,
+            "the check moves nothing"
+        );
+        // installed after them: the round moves none, keeps all protected
+        let installed = SystemTime::now() + std::time::Duration::from_secs(1);
+        let mut kept = 0;
+        let r = quarantine(
+            &[root.path()],
+            &host(),
+            Pass {
+                since: installed,
+                when: AT_ROUND,
+            },
+            q.path(),
+            1,
+            |_, _| false,
+            &mut |_| {
+                kept += 1;
+                true
+            },
+        );
+        assert!(r.is_empty(), "{r:?}");
+        // the four, and the environment file under /etc/northnarrow one names
+        assert_eq!(kept, 5);
+        assert_eq!(std::fs::read_dir(&ag).unwrap().count(), 4);
+    }
+
+    #[derive(Default)]
+    struct FakeMap(std::collections::BTreeMap<(u64, u64), u8>);
+
+    impl InodeMap for FakeMap {
+        fn flags(&self, key: common::wire::InodeKey) -> Option<u8> {
+            self.0.get(&(key.dev, key.ino)).copied()
+        }
+        fn register(&mut self, key: common::wire::InodeKey, flags: u8) -> anyhow::Result<()> {
+            self.0.insert((key.dev, key.ino), flags);
+            Ok(())
+        }
+        fn remove(&mut self, key: common::wire::InodeKey) -> anyhow::Result<()> {
+            self.0.remove(&(key.dev, key.ino));
+            Ok(())
+        }
+    }
+
+    fn key(p: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(p).unwrap();
+        (
+            crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
+            m.ino(),
+        )
+    }
+
+    /// The re-review of #497 (RR1): a [`Protector`] adds WRITE|MUTATE to
+    /// what a key has, refuses a link or a missing file, and takes out a
+    /// key it registered once its path no longer names it — never a key
+    /// it found (a boot's).
+    #[test]
+    fn the_protector_adds_write_protection_and_takes_out_only_its_own_stale_keys() {
+        use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_READ, FS_PROTECT_WRITE};
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.conf");
+        let b = d.path().join("b.conf");
+        let boot = d.path().join("boot.conf");
+        for f in [&a, &b, &boot] {
+            std::fs::write(f, "x").unwrap();
+        }
+        std::os::unix::fs::symlink(&a, d.path().join("l.conf")).unwrap();
+        let registered = Registered::default();
+        let mut map = FakeMap::default();
+        map.0.insert(key(&boot), FS_PROTECT_READ);
+        let mut p = Protector::with_map(Some(map), &registered);
+        assert!(p.protect(&a) && p.protect(&b) && p.protect(&boot));
+        assert!(
+            !p.protect(&d.path().join("l.conf")),
+            "a symlink is not held"
+        );
+        std::fs::hard_link(&b, d.path().join("h.conf")).unwrap();
+        assert!(!p.protect(&b), "a hard link is not held");
+        std::fs::remove_file(d.path().join("h.conf")).unwrap();
+        assert!(p.protect(&b));
+        assert!(!p.protect(&d.path().join("absent.conf")));
+        let map = p.finish().unwrap();
+        let wm = FS_PROTECT_WRITE | FS_PROTECT_MUTATE;
+        assert_eq!(map.0.get(&key(&a)), Some(&wm));
+        assert_eq!(map.0.get(&key(&boot)), Some(&(FS_PROTECT_READ | wm)));
+        // the next pass: b is gone (its key taken out), boot is not kept
+        // by this pass (its key, found there, stays)
+        let (ka, kb, kboot) = (key(&a), key(&b), key(&boot));
+        std::fs::remove_file(&b).unwrap();
+        let mut map = FakeMap::default();
+        for (k, f) in [(ka, wm), (kb, wm), (kboot, FS_PROTECT_READ | wm)] {
+            map.0.insert(k, f);
+        }
+        let mut p = Protector::with_map(Some(map), &registered);
+        assert!(p.protect(&a));
+        let map = p.finish().unwrap();
+        assert!(map.0.contains_key(&ka));
+        assert!(!map.0.contains_key(&kb), "b's key taken out");
+        assert!(map.0.contains_key(&kboot), "a key found there stays");
+        let reg = registered.lock().unwrap();
+        assert_eq!(reg.keys().cloned().collect::<Vec<_>>(), vec![a.clone()]);
+    }
+
+    /// The re-review of #497 (RR2): the installer's check lists every
+    /// harmful drop-in whatever its age and moves nothing (exit 3; 0 when
+    /// none); accepted, it moves them (exit 0), the harmless one left.
+    #[test]
+    fn the_installer_s_check_lists_then_moves_what_the_operator_accepted() {
+        let prefix = tempfile::tempdir().unwrap();
+        let q = tempfile::tempdir().unwrap();
+        let ag = prefix
+            .path()
+            .join("etc/systemd/system/northnarrow-agent.service.d");
+        std::fs::create_dir_all(&ag).unwrap();
+        std::fs::write(
+            ag.join("override.conf"),
+            "[Service]\nEnvironmentFile=-/etc/default/northnarrow-agent\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ag.join("20-log.conf"),
+            "[Service]\nEnvironment=RUST_LOG=info\n",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            installer_check(prefix.path(), &host(), q.path(), false, 5, &mut out),
+            3
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(
+            text.starts_with(&format!(
+                "would move {}: found by the installer's check, EnvironmentFile=/etc/default/northnarrow-agent lies outside",
+                ag.join("override.conf").display()
+            )),
+            "{text}"
+        );
+        assert!(ag.join("override.conf").exists(), "the check moves nothing");
+        let mut out = Vec::new();
+        assert_eq!(
+            installer_check(prefix.path(), &host(), q.path(), true, 5, &mut out),
+            0
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with(&format!("moved {} -> ", ag.join("override.conf").display())),
+            "{text}"
+        );
+        assert!(!ag.join("override.conf").exists());
+        assert!(ag.join("20-log.conf").exists());
+        let mut out = Vec::new();
+        assert_eq!(
+            installer_check(prefix.path(), &host(), q.path(), false, 6, &mut out),
+            0
+        );
+        assert!(out.is_empty());
     }
 }

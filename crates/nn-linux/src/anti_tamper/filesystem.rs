@@ -2244,6 +2244,12 @@ impl ProtectedInodesHandle {
             })
     }
 
+    /// The flags `key` has in the map, when it is there (the re-review of
+    /// #497, RR1: a protection added to a key keeps what it had).
+    pub fn flags(&self, key: InodeKey) -> Option<u8> {
+        self.map.get(&AyaInodeKey(key), 0).ok()
+    }
+
     /// Drop a stale inode key (best-effort at the call sites that use it):
     /// after a rename-replace the old inode is freed and its dev/ino could
     /// later be reused by an unrelated, non-protected file.

@@ -83,6 +83,17 @@ pub(crate) struct Cli {
     #[arg(long = "verifier-check", hide = true)]
     pub(crate) verifier_check: bool,
 
+    /// Our units' drop-ins against this build's judge (the re-review of
+    /// #497, RR2), every one of them whatever its age: `check` prints each
+    /// one the agent would quarantine (`would move <path>: <why>`) and
+    /// exits 3 when there is one, 0 when there is none; `quarantine` moves
+    /// them to /var/lib/northnarrow/quarantine/dropins (`moved <path> ->
+    /// <to>: <why>`), exit 1 when one could not be moved. `install.sh
+    /// --upgrade` runs `check` before it changes anything, and
+    /// `quarantine` with `--accept-dropin-quarantine`.
+    #[arg(long = "own-dropins", value_name = "check|quarantine", value_parser = ["check", "quarantine"])]
+    pub(crate) own_dropins: Option<String>,
+
     /// Print the test and debug cargo features this binary was built with
     /// (comma-separated: `debug-trigger`, `demo-tappa5`, `posture-demo`,
     /// `test-privileged`) or `none`, and exit. A release build prints

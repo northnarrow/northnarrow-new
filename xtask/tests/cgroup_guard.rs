@@ -812,7 +812,7 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         &ti,
         &[
             "super::cgroup_guard::refresh_values(self.bpffs_root.as_deref());",
-            "let moved = own_dropins_at_close(since);",
+            "own_dropins_at_close(since, self.bpffs_root.as_deref(), &self.own_dropin_keys);",
             "r.request(crate::systemd_reload::Reason::OwnDropinQuarantined);",
             // R1: the guarded sysctls put back at the close, in its record
             "let sysctls = sysctls_at_close();",
@@ -830,6 +830,18 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     )
     .unwrap();
     assert!(body(&ti, "audit_close").contains("extra[\"sysctls\"] = serde_json::json!(sysctls);"));
+    // the re-review of #497 (RR1): at the close the kept drop-ins are
+    // write-protected (the pinned map), the pass finished (stale keys out)
+    in_order(
+        body(&ti, "own_dropins_at_close"),
+        &[
+            "crate::own_dropins::Protector::open(bpffs_root, keys);",
+            "when: crate::own_dropins::AT_CLOSE,",
+            "&mut |p| protector.protect(p),",
+            "protector.finish();",
+        ],
+    )
+    .unwrap();
     let od = code("crates/nn-linux/src/own_dropins.rs");
     in_order(
         body(&od, "own_dirs"),
@@ -851,14 +863,40 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     // back), never by the mtime; links and outside EnvironmentFile=
     // quarantined whatever they set; the round judges every one again
     // outside a window
-    let q = body(&od, "quarantine");
+    let q = body(&od, "harmful");
     assert!(!q.contains("modified()"), "no selection by mtime");
+    // the re-review of #497 (RR1): an entry kept — not judged in this
+    // pass, install.sh's, or judged harmless — is protected with the
+    // environment files it names
     in_order(
         q,
         &[
             "std::fs::symlink_metadata(&from)",
-            "if !changed_since(&meta, since) {",
-            "shape_harm(&meta, &from, text.as_deref())",
+            "let single = regular && meta_nlink(&meta) == 1;",
+            "if !changed_since(&meta, pass.since) {",
+            "keep_protected(&from, text.as_deref(), protect);",
+            "if single && known(&from, b) {",
+            "keep_protected(&from, text.as_deref(), protect);",
+            "shape_harm(&meta, &from, text.as_deref(), protect)",
+            "let Some(why) = why else {\n                    keep_protected(&from, text.as_deref(), protect);",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&od, "keep_protected"),
+        &[
+            "protect(from);",
+            "if under_env_dir(&f) {",
+            "protect(Path::new(&f));",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&od, "protect"),
+        &[
+            "if !meta.file_type().is_file() || meta.nlink() != 1 {",
+            "let want = had.unwrap_or(0) | FS_PROTECT_WRITE | FS_PROTECT_MUTATE;",
+            "map.register(key, want)",
         ],
     )
     .unwrap();
@@ -869,21 +907,39 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
             "is_symlink()",
             "is_file()",
             "meta.nlink() > 1",
-            "\"EnvironmentFile\"",
-            "!f.starts_with(ENV_FILE_DIR)",
+            "for f in env_files(text?) {",
+            "if !under_env_dir(&f) {",
+            // RR1: one inside /etc/northnarrow held, or the drop-in moved
+            "if !protect(Path::new(&f)) {",
         ],
     )
     .unwrap();
+    assert!(body(&od, "under_env_dir")
+        .contains("matches!(c, Component::RootDir | Component::Normal(_))"));
+    // the re-review of #497 (RR2): the round judges only what changed
+    // since the agent's install — an operator's drop-in from before it is
+    // never moved by the round; (RR1) the ones it keeps are protected
     in_order(
         body(&si, "own_dropins_round"),
         &[
             "if g.window.is_window_open() {\n            return;\n        }",
+            "let Some(since) = crate::own_dropins::install_time() else {",
+            "crate::own_dropins::Protector::open(g.window.bpffs_root(), g.window.own_dropin_keys());",
             "crate::own_dropins::quarantine(",
-            "UNIX_EPOCH,",
+            "when: crate::own_dropins::AT_ROUND,",
+            "&mut |p| protector.protect(p),",
+            "protector.finish();",
             "Reason::OwnDropinQuarantined",
         ],
     )
     .unwrap();
+    assert!(!body(&si, "own_dropins_round").contains("UNIX_EPOCH"));
+    in_order(
+        body(&od, "install_time"),
+        &["std::fs::metadata(\"/proc/self/exe\")", "meta.ctime()"],
+    )
+    .unwrap();
+    assert!(!body(&od, "install_time").contains("mtime"));
     assert!(body(&si, "round").contains("self.own_dropins_round(at_boot);"));
     assert!(code("agent/src/boot/evidence.rs")
         .contains("Some(northnarrow_agent::self_integrity::OwnDropinGuard {"));
@@ -986,4 +1042,52 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         ],
     )
     .unwrap();
+}
+
+/// The re-review of #497 (NR5, NR6): the eBPF CI job runs the `check_cfg`
+/// emulation against the object it built — after the build, with the
+/// object required — and the step fails unless both tests ran and passed
+/// (libtest skips a name it does not find in silence).
+#[test]
+fn the_ebpf_job_runs_the_check_cfg_tests_and_counts_them() {
+    let ci: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        &fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap(),
+    )
+    .unwrap();
+    let steps = ci["jobs"]["ebpf-build"]["steps"]
+        .as_sequence()
+        .expect("ci.yml has the ebpf-build job's steps");
+    let name = |s: &serde_yaml_ng::Value| s["name"].as_str().unwrap_or_default().to_string();
+    let built = steps
+        .iter()
+        .position(|s| name(s) == "cargo xtask build-ebpf")
+        .expect("the job builds the object");
+    let at = steps
+        .iter()
+        .position(|s| name(s).starts_with("eBPF object back-edges"))
+        .expect("the check_cfg step is in the eBPF job");
+    assert!(built < at, "the step runs on the object just built");
+    let step = &steps[at];
+    assert_eq!(step["env"]["NN_REQUIRE_EBPF_OBJECT"].as_str(), Some("1"));
+    let run = step["run"].as_str().unwrap();
+    in_order(
+        run,
+        &[
+            "cargo test --locked -p nn-linux --lib sensors::ebpf_object::tests -- --exact",
+            "sensors::ebpf_object::tests::no_function_has_a_back_edge_the_5_15_verifier_rejects",
+            "sensors::ebpf_object::tests::the_back_edge_emulation_tells_a_fallthrough_from_a_jump",
+            "|| { echo \"$out\"; exit 1; }",
+            "grep -q '^test result: ok\\. 2 passed; 0 failed' <<< \"$out\" || {",
+            "exit 1; }",
+        ],
+    )
+    .unwrap();
+    // both names are tests of the emulation that exist
+    let tests = code("crates/nn-linux/src/sensors/ebpf_object.rs");
+    for t in [
+        "fn no_function_has_a_back_edge_the_5_15_verifier_rejects()",
+        "fn the_back_edge_emulation_tells_a_fallthrough_from_a_jump()",
+    ] {
+        assert!(tests.contains(t), "{t}");
+    }
 }

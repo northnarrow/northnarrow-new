@@ -2910,11 +2910,14 @@ fi
 # ── the review of #497 (lot 273d): the sysctls' judgment, our drop-ins ────
 #   C107  D1: kernel.pid_max written 040000 (octal: the kernel reads 16384)
 #         outside a window — refused, the value kept;
-#   C108  D2: kernel.pid_max written by an io-wq worker (IORING_OP_WRITE
-#         with IOSQE_ASYNC; the process wrote the same bytes to /dev/null
-#         just before, so a worker born at that return carries that write's
-#         registers) — refused (its registers are never read), the value
-#         kept, even for the value it already holds;
+#   C108  D2: kernel.pid_max written by an io-wq worker — the re-review of
+#         #497 (NR1): a worker born OUTSIDE io_uring_enter, at a write(2)'s
+#         return (a READ of an empty pipe linked to the IOSQE_ASYNC WRITE,
+#         the pipe then written with the same bytes: the worker carries
+#         that write(2)'s registers, which the code before D2 read and let
+#         through) — refused (its registers are never read), the value kept,
+#         even for the value it already holds; the probe says when the
+#         worker was not born there (no proof: a deviation);
 #   C109  D3: kernel.sched_rt_period_us written (its own value) outside a
 #         window — refused; then, inside a window, the period cut to the
 #         runtime (throttling off): put back by the close or the round to a
@@ -2935,7 +2938,7 @@ if selected C108; then
     if (( IOU_BUILT )); then
         PM0=$(cat "$PM")
         POST=$(post post_same_text "$PM" "$PM0") \
-        run_case C108 "kernel.pid_max written by an io-wq worker (its own value; no window)" denied "deny=sysctl" 0 -- "$IOU_BIN" --write-async "$PM" "$PM0"
+        run_case C108 "kernel.pid_max written by an io-wq worker born at a write(2)'s return (its own value; no window)" denied "deny=sysctl" 0 -- "$IOU_BIN" --write-linked "$PM" "$PM0"
         restored C108 "kernel.pid_max" "$PM0" "$(cat "$PM")"
     else
         skipped_case C108 "the io_uring probe was not built (io_uring_disabled, or no compiler)" 1
@@ -3001,6 +3004,41 @@ if selected C110; then
     fi
     rm -rf "$OUT"
     restored C110 "the lab's links" absent "$([[ -e $OD/60-nn-lab-c110-link.conf || -L $OD/60-nn-lab-c110-link.conf || -e $OE/61-nn-lab-c110-hard.conf ]] && echo present || echo absent)"
+fi
+# The re-review of #497 (RR1):
+#   C111  a harmless drop-in kept at a window's close, and the environment
+#         file under /etc/northnarrow it names, are write-protected from
+#         then on: each rewritten outside a window (an ExecStartPre=, a
+#         weakening variable) is refused, its content kept.
+if selected C111; then
+    OE=/etc/systemd/system/northnarrow-agent.service.d
+    DF=$OE/62-nn-lab-c111.conf; EF=/etc/northnarrow/nn-lab-c111.env
+    DT=$(printf '[Service]\nEnvironment=RUST_LOG=info\nEnvironmentFile=%s' "$EF")
+    ET='RUST_LOG=info'
+    wait_no_window 90 || echo "C111: an earlier window not seen ended within 90 s" >&2
+    # written beside, then renamed in (round 17 lost this script's shell
+    # to NN-L-FIM-009, which killed a drop-in's writer inside a window too;
+    # its §15.1 exemption now covers our units' drop-ins: the case does not
+    # depend on it)
+    SB=$(mktemp -d /var/tmp/nn-lab-c111.XXXXXX)
+    printf '%s\n' "$ET" > "$SB/env"; printf '%s\n' "$DT" > "$SB/conf"
+    grant_window 12; sleep 2
+    mv "$SB/env" "$EF"; mv "$SB/conf" "$DF"
+    rmdir "$SB"
+    wait_no_window 60 || true
+    sleep 3
+    if [[ -f $DF && -f $EF ]]; then
+        POST=$(post post_same_text "$DF" "$DT") \
+        run_case C111 "a drop-in kept at a window's close, rewritten outside a window (ExecStartPre=)" denied "deny=write" 0 -- nnpy file write "$DF" $'[Service]\nExecStartPre=/bin/true\n'
+        POST=$(post post_same_text "$EF" "$ET") \
+        run_case C111 "the environment file under /etc/northnarrow it names, rewritten outside a window" denied "deny=write" 0 -- nnpy file write "$EF" 'NN_DETECT_ONLY=1'
+    else
+        rows+=("| C111 | a harmless drop-in and its environment file made inside a window | not kept at the close ($([[ -f $DF ]] && echo drop-in) $([[ -f $EF ]] && echo env)) | — | DEVIATION (moved or not made) |")
+        echo "C111 kept drop-in → not kept at the close; DEVIATION" >&2
+        fail=1
+    fi
+    grant_window 10; sleep 1; rm -f "$DF" "$EF"; wait_no_window 60 || true
+    restored C111 "the lab's drop-in and environment file" absent "$([[ -e $DF || -e $EF ]] && echo present || echo absent)"
 fi
 
 # ── vectors the matrix lacked (external audit LAB-004, lab PR 154) ───────
