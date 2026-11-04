@@ -124,10 +124,17 @@ pub(super) const MASS_WRITE_MIN: usize = 20;
 ///   on Ubuntu 22.04, made each udevd worker write
 ///   20 database files new and replace 20 old ones
 ///   by a rename — the replacement shape, ENGAGED
-///   on `systemd-udevd.service`). Device state, not
-///   a user's data; udev rules that persist live in
-///   `/etc/udev` and `/lib/udev`, which the FIM and
-///   persistence rules watch, not here.
+///   on `systemd-udevd.service`). Root-only (udevd's,
+///   0755), on the `/run` tmpfs as `/run/systemd`,
+///   no user's data: device databases, tags, links.
+///   Persistence through udev rules (ATT&CK
+///   T1546.017: `/etc/udev/rules.d`,
+///   `/lib/udev/rules.d`, the volatile
+///   `/run/udev/rules.d` inside this carve-out) is
+///   watched by no rule today — no FIM path, no
+///   persistence prefix: a lot of its own, not this
+///   arm's (a ransomware heuristic, no persistence
+///   detector).
 ///
 /// Deliberately **NOT** excluded:
 /// - `/dev/shm/`    — a real ransomware staging tmpfs. The rest of `/dev`

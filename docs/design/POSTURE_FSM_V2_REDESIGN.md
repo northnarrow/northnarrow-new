@@ -734,9 +734,16 @@ The re-check of #500 added `/run/udev/` to the carve-outs
 the boot's coldplug (`udevadm trigger --action=add` of every device) made
 each systemd-udevd worker write 20 device database files new under
 `/run/udev/data` and replace 20 old ones by a rename — the replacement
-shape, ENGAGED on `systemd-udevd.service`. It is device state, not a
-user's data; the udev rules that persist live in `/etc/udev` and
-`/lib/udev`, which the FIM and persistence rules watch.
+shape, ENGAGED on `systemd-udevd.service`. The directory is root-only
+(udevd's, 0755), on the `/run` tmpfs as `/run/systemd` (a carve-out
+already), and holds no user's data — device databases, tags, links: a
+rename into it from a user's tree fails (`EXDEV`). Persistence through
+udev rules (ATT&CK T1546.017: `/etc/udev/rules.d`, `/lib/udev/rules.d`,
+and the volatile `/run/udev/rules.d` inside this carve-out) is watched
+by no rule today — no FIM path, no persistence prefix, absent from
+`ATTACK_COVERAGE` — and is a lot of its own: the mass-write arm is a
+ransomware heuristic, not a persistence detector, so the carve-out
+neither opens nor closes it.
 
 A repeat (the same file reopened, the same name destroyed again) is not
 counted; an entry the LRU maps evicted counts again (more, never fewer). The
