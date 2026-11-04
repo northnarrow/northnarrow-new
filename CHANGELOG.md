@@ -666,14 +666,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   system's tool (a file of `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`)
   asking for module names that resolve, as kmod resolves them
   (configuration aliases, `modules.dep`, `modules.symbols`,
-  `modules.alias`, built-ins; dependencies and soft dependencies), to files
+  `modules.alias`, built-ins by name and by the aliases of
+  `modules.builtin.modinfo`; dependencies and soft dependencies), to files
   of the running kernel's tree that a package installed or DKMS built (on a
   host without a package database: the kernel's `modules.order`), none
   changed since the package database's last change (`max(mtime, ctime)`;
   DKMS: its registry's, the kernel's tree: the boot), each uncompressed one
   signed while the kernel enforces signatures — or an invocation that
   inserts nothing (`-r`, `-n`, `-D`, `-c`, `-R`, `kmod list`, `kmod
-  static-nodes`, kmod run as `lsmod`) — is a High record, T1547.006, not
+  static-nodes`, kmod run as `lsmod`, a module built into the kernel, as
+  k3s's `modprobe nft-expr-counter` where nf_tables is built in) — is a
+  High record, T1547.006, not
   killed. Killed as before: `insmod` of a file, `modprobe` of a path or a
   `.ko*` name, `-C`, `-d`, `-S`, `--force*`, a name nothing resolves, a
   module file outside the tree, a link or behind a directory linked out of

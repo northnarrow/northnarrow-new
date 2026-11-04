@@ -5438,8 +5438,10 @@ number in parentheses is a lab PR.
     `kmod_invocation.rs`): the command line read as kmod reads it (the
     multi-call binary's mode from `argv[0]`, getopt's permutation and long
     prefixes), the names resolved as libkmod resolves them (configuration
-    aliases, `modules.dep`, `modules.symbols`, `modules.alias`, built-ins;
-    dependencies and soft dependencies), each file judged: in the running
+    aliases, `modules.dep`, `modules.symbols`, `modules.alias`, built-ins by
+    name and by the aliases of `modules.builtin.modinfo` — kmod's
+    `modules.builtin.alias.bin` is depmod's index of them; dependencies and
+    soft dependencies), each file judged: in the running
     kernel's tree, a regular file, installed by a package or built by DKMS
     (no package database: listed in the kernel's `modules.order`),
     `max(mtime, ctime)` not after its owner's last change (the package
@@ -5459,11 +5461,64 @@ number in parentheses is a lab PR.
     it), and its load, if it lands first, is R018's kill of an unowned
     module by an unexpected loader. No directive restores the kill of a
     vouched-for load (`RULE_POLICY.md` §1).
-  - Lab: not run on a guest when this note was written.
+  - Lab (as measured; our own guests, lease `k279`; Ubuntu 22.04 5.15.0-202
+    and 24.04 6.8.0-147; on each, `main` 80c8da36 then the lot on the same
+    guest after a power cycle; `deploy/lab/malsim/kmod-check.sh` with
+    podman, docker.io, k3s with kube-proxy in ipvs mode, zfsutils-linux and
+    wireguard-tools installed for the run and removed after; no
+    `/etc/northnarrow/*.local` before or after). R011's kills over the
+    benign corpus: 22.04 `main` 43 (k3s 38 — 28 run by k3s-server, 10 by
+    systemd —, podman rootless, containerd's `ExecStartPre=-/sbin/modprobe
+    overlay` at docker.io's start, zfs-load-module, `sudo modprobe dummy`,
+    `modprobe -n`), the lot (f6650f8b) 0: iptables-legacy's `ip_tables`,
+    podman rootless's and containerd's `overlay`, k3s's eight (`br_netfilter`,
+    `ip_vs`, `iptable_filter`, `iptable_nat`, `nfnetlink-subsys-11` →
+    `nft_compat`, `nft-chain-2-nat` → `nft_chain_nat`, `overlay`…),
+    zfs-load-module's `zfs`, `modprobe dummy`/`-r dummy` and the queries
+    recorded, each with its module, file and owner; 24.04 `main` 15, the lot
+    (19050626) 1 — k3s-server's `modprobe nft-expr-counter`, a name no index
+    of 6.8.0-147's tree resolves (the counter is part of `nf_tables` there):
+    killed, the brief's fail-closed for an unresolved name. The malicious
+    shapes (insmod of a `/tmp` `.ko`, modprobe of a path, of a name nothing
+    resolves, `-d`, `-C`, a copy of modprobe in `/tmp`): killed, 6 of 6, on
+    `main` and the lot, both guests. Tamper-check, 119 rows: (case, verdict)
+    of the lot = `main`'s on each guest (22.04: 114 OK, C64 DEVIATION, C27
+    C57c KNOWN GAP, C78c C101 N/A; 24.04: 115 OK, the same but C101 run).
+    Test-ignored of the lot on each guest: 109 passed, 1 failed —
+    `r011_records_a_packaged_modprobe_and_kills_an_insmod_from_tmp`, whose
+    verdict was the expected Log but which asserted the response "none" (a
+    detect-only agent renders a Log "suppressed (detect-only)"; the test
+    fixed); `r011_kills_a_module_copied_into_the_tree_and_r018_catches_what_argv_hides`
+    (copied + `depmod` → R011 kill and R018 KillProcessTree;
+    `MODPROBE_OPTIONS="-d /tmp/…"` → R011 record, R018 Critical kill),
+    `process_kernel_module_tooling_trips_r011` and the NET-006 listener test
+    passed on both. @ROUNDG@
+  - Measured beside R011, for the Tappa Prove (the kills on a benign corpus;
+    not this lot's to change). On 22.04 both runs went to a locked COMBAT
+    and judged most of the corpus there: `main` at docker.io's purge
+    (`deb-systemd-helper`'s `rmdir` refused by the anti-tamper hooks,
+    decisive), the lot at rootless podman's image pull — the posture's
+    mass-write count on podman's own storage (`/run/libpod/alive.lck`, the
+    layer locks: ENGAGED; 259 writes to `~/.local/share/containers/storage/libpod/bolt_state.db`:
+    COMBAT, locked), then NEUTRALIZE killed rootless podman's tree (rc 137;
+    intent and outcome signed in the actions chain, the stage transitions in
+    the audit chain; no OOM, not the script's timeout, the container itself
+    exited 0). `main` with its agent installed again does the same (the
+    follow-up round: rc 137, the same ladder); without an agent, 3 rounds of
+    the same sequence rc 0. In those COMBAT windows: NN-L-FIM-009 killed the
+    k3s installer's `touch`, `chmod` and `tee` writing
+    `/etc/systemd/system/k3s.service.env` and `/etc/systemd/system/k3s.service`
+    (`main` 5, the lot 3; each "already gone"); R013 killed k3s's bundled
+    `runc` (`/var/lib/rancher/k3s/data/<hash>/bin/runc`; `main` 4, the lot
+    21). On 24.04 `docker run` failed in both runs (rc 125, the daemon's API
+    closed: EOF). @DOCKER@
   - Open: a packaged module file overwritten in place and followed by any
     package transaction passes the time check (FIM-008 sees the write; the
     kernel's signature check refuses it when enforced); a host whose files'
     ctimes are newer than its last package transaction (an SELinux relabel,
     a restore) keeps the kill until its next transaction; on an RPM host an
     out-of-tree module is killed until its first load was seen; the binary
-    indexes and `MODPROBE_OPTIONS` are not read (R018's).
+    indexes and `MODPROBE_OPTIONS` are not read (R018's); a name nothing
+    resolves, in the tree or among the built-ins, is killed though kmod
+    would load nothing for it (fail-closed, the coordinator's decision of
+    04/11).

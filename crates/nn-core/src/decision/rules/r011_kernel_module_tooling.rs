@@ -396,6 +396,40 @@ mod tests {
         assert!(v.reasoning.contains("inserts no module"), "{}", v.reasoning);
     }
 
+    /// Lot 279, 24.04's lab: k3s's `modprobe nft-expr-counter` on a kernel
+    /// whose nf_tables is built in is a built-in's alias — recorded; a name
+    /// nothing resolves is killed.
+    #[test]
+    fn a_built_in_module_s_alias_is_recorded_an_unknown_name_killed() {
+        let t = distro_host();
+        t.index(
+            "modules.builtin",
+            "kernel/net/netfilter/nf_tables_core.ko\n",
+        )
+        .index(
+            "modules.builtin.modinfo",
+            "nf_tables_core.alias=nft-expr-counter\0",
+        );
+        let r = rule_on(&t);
+        let v = r
+            .evaluate(&exec(
+                "/usr/sbin/modprobe",
+                "/usr/bin/kmod",
+                &["modprobe", "nft-expr-counter"],
+            ))
+            .expect("recorded");
+        assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
+        assert!(v.reasoning.contains("inserts no module"), "{}", v.reasoning);
+        let v = r
+            .evaluate(&exec(
+                "/usr/sbin/modprobe",
+                "/usr/bin/kmod",
+                &["modprobe", "nft-expr-nothing"],
+            ))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
+    }
+
     /// Lot 279: what is still killed — every malicious shape of
     /// deploy/lab/malsim/kmod-check.sh.
     #[test]

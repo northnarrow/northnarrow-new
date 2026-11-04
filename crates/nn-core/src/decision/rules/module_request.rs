@@ -21,8 +21,12 @@
 //! `/usr/local/lib`, `/lib`, `/usr/lib`; a file of an earlier directory
 //! hides one of the same name), then the module names of `modules.dep`,
 //! then `modules.symbols`, `modules.alias` (fnmatch patterns), and the
-//! built-in modules (`modules.builtin`, `modules.builtin.alias`: nothing
-//! to load). Each module's dependencies are `modules.dep`'s (the closure);
+//! built-in modules: by name (`modules.builtin`) and by alias — the
+//! `alias` entries of `modules.builtin.modinfo`, from which depmod writes
+//! the `modules.builtin.alias.bin` kmod reads (kmod 27+,
+//! `kmod_lookup_alias_from_kernel_builtin_file`; depmod writes no text
+//! form of it). A request every name of which is built in inserts nothing:
+//! recorded as a query. Each module's dependencies are `modules.dep`'s (the closure);
 //! its soft dependencies (`softdep` of the configuration and of
 //! `modules.softdep`) are resolved the same way and judged too; a soft
 //! dependency nothing resolves is skipped, as kmod skips it. Names are
@@ -139,7 +143,7 @@ const INDEXES: &[&str] = &[
     "modules.alias",
     "modules.symbols",
     "modules.builtin",
-    "modules.builtin.alias",
+    "modules.builtin.modinfo",
     "modules.softdep",
     "modules.order",
 ];
@@ -255,22 +259,29 @@ impl<H: DecisionHost> ModuleRequests<H> {
             Invocation::LoadsNothing(what) => Assessment::LoadsNothing(what),
             Invocation::Refused(why) => Assessment::NotVouched(why),
             Invocation::Modules(names) => match self.judge(&names, fresh) {
-                Ok(what) => Assessment::Vouched(what),
+                // every name built into the running kernel: modprobe
+                // inserts nothing (kmod: success, no load)
+                Ok((what, true)) => Assessment::LoadsNothing(format!(
+                    "modprobe of built-in modules, nothing to insert: {what}"
+                )),
+                Ok((what, false)) => Assessment::Vouched(what),
                 Err(why) => Assessment::NotVouched(why),
             },
         }
     }
 
     /// Every module `names` load, resolved and vouched for — or why not.
-    fn judge(&self, names: &[String], fresh: bool) -> Result<String, String> {
+    fn judge(&self, names: &[String], fresh: bool) -> Result<(String, bool), String> {
         let facts = HostFacts::read(&self.root)?;
         let mut cached = self.tree.lock();
         let tree = ModuleTree::current(&self.root, &facts.release, &mut cached)?;
         let config = Config::read(&self.root);
         let mut parts = Vec::new();
         let mut judged = HashSet::new();
+        let mut all_builtin = true;
         for name in names {
             let targets = resolve_all(tree, &config, name)?;
+            all_builtin &= targets.iter().all(|t| matches!(t, Target::Builtin(_)));
             let mut what = Vec::new();
             for t in &targets {
                 match t {
@@ -310,10 +321,13 @@ impl<H: DecisionHost> ModuleRequests<H> {
             }
             parts.push(format!("{name} → {}", what.join("; ")));
         }
-        Ok(format!(
-            "{} (the running kernel {}'s tree)",
-            parts.join(" | "),
-            facts.release
+        Ok((
+            format!(
+                "{} (the running kernel {}'s tree)",
+                parts.join(" | "),
+                facts.release
+            ),
+            all_builtin,
         ))
     }
 
@@ -493,7 +507,8 @@ struct ModuleTree {
     /// (normalised pattern, module name) of `modules.symbols`, then
     /// `modules.alias`.
     aliases: Vec<(String, String)>,
-    /// `modules.builtin.alias`.
+    /// The `alias` entries of `modules.builtin.modinfo`: (normalised
+    /// pattern, built-in module).
     builtin_aliases: Vec<(String, String)>,
     /// `modules.softdep`: (module pattern, soft dependencies).
     softdeps: Vec<(String, Vec<String>)>,
@@ -559,7 +574,7 @@ impl ModuleTree {
         for f in ["modules.symbols", "modules.alias"] {
             t.aliases.extend(alias_lines(&lines(f)));
         }
-        t.builtin_aliases = alias_lines(&lines("modules.builtin.alias"));
+        t.builtin_aliases = builtin_modinfo_aliases(&lines("modules.builtin.modinfo"));
         t.builtin = lines("modules.builtin")
             .lines()
             .map(str::trim)
@@ -745,6 +760,18 @@ fn alias_lines(text: &str) -> Vec<(String, String)> {
             let mut w = l.split_whitespace();
             (w.next()? == "alias").then_some(())?;
             Some((normalize(w.next()?)?, normalize(w.next()?)?))
+        })
+        .collect()
+}
+
+/// The `alias` entries of `modules.builtin.modinfo` (`modname.key=value`,
+/// each ended by a NUL), as depmod reads them for `modules.builtin.alias.bin`.
+fn builtin_modinfo_aliases(text: &str) -> Vec<(String, String)> {
+    text.split('\0')
+        .filter_map(|e| {
+            let (module, kv) = e.split_once('.')?;
+            let value = kv.strip_prefix("alias=")?;
+            Some((normalize(value)?, normalize(module)?))
         })
         .collect()
 }
@@ -1267,15 +1294,27 @@ mod tests {
                 "alias symbol:nft_register_obj nf_tables\n",
             )
             .index("modules.builtin", "kernel/fs/ext4/ext4.ko\n")
-            .index("modules.builtin.alias", "alias fs-ext4 ext4\n");
+            .index(
+                "modules.builtin.modinfo",
+                "ext4.license=GPL\0ext4.alias=fs-ext4\0",
+            );
         assert!(assess(&t, &modprobe(&["fs-overlay"])).records());
         assert!(assess(&t, &modprobe(&["symbol:nft_register_obj"])).records());
         let a = assess(&t, &modprobe(&["ext4"]));
         assert!(
-            matches!(&a, Assessment::Vouched(w) if w.contains("built in")),
+            matches!(&a, Assessment::LoadsNothing(w) if w.contains("built in")),
             "{a:?}"
         );
-        assert!(assess(&t, &modprobe(&["fs-ext4"])).records());
+        assert!(matches!(
+            assess(&t, &modprobe(&["fs-ext4"])),
+            Assessment::LoadsNothing(_)
+        ));
+        // a built-in beside a file: the file is judged
+        let a = assess(&t, &modprobe(&["-a", "ext4", "fs-overlay"]));
+        assert!(
+            matches!(&a, Assessment::Vouched(w) if w.contains("built in") && w.contains("overlay.ko")),
+            "{a:?}"
+        );
         // a pattern of modules.alias resolving to an unowned module
         let a = assess(&t, &modprobe(&["pci:v00008086d00001234sv0000"]));
         assert!(not_vouched(&a).contains("no package installed it"), "{a:?}");
@@ -1300,6 +1339,54 @@ mod tests {
         // the continued line names the module on its next line
         t.write("run/modprobe.d/a.conf", "alias nf-y \\\n  nf_tables\n");
         assert!(assess(&t, &modprobe(&["nf-y"])).records());
+    }
+
+    /// The coordinator's case (24.04's lab, k3s): on a kernel whose
+    /// nf_tables is built in, `modprobe nft-expr-counter` names a built-in
+    /// module by an alias of `modules.builtin.modinfo` — kmod succeeds and
+    /// inserts nothing: recorded as a query. A name neither the tree nor the
+    /// built-ins resolve stays unresolved: not vouched for (fail-closed).
+    #[test]
+    fn an_alias_of_a_built_in_module_inserts_nothing() {
+        let t = HostTree::new();
+        t.module("kernel/net/netfilter/nft_compat.ko.zst", &[], true)
+            .packaged("linux-modules-6.8.0-1-generic", &["kernel/net/netfilter/nft_compat.ko.zst"])
+            .index("modules.builtin", "kernel/net/netfilter/nf_tables.ko\nkernel/net/netfilter/nfnetlink.ko\n")
+            .index(
+                "modules.builtin.modinfo",
+                "nfnetlink.license=GPL\0nf_tables.license=GPL\0nf_tables.alias=nfnetlink-subsys-10\0\
+                 nf_tables.alias=nft-expr-counter\0nf_tables.alias=nft-chain-2-*\0",
+            );
+        for name in [
+            "nft-expr-counter",
+            "nft_expr_counter",
+            "nfnetlink-subsys-10",
+            "nft-chain-2-nat",
+        ] {
+            let a = assess(&t, &modprobe(&[name]));
+            assert!(
+                matches!(&a, Assessment::LoadsNothing(w) if w.contains("nf_tables")),
+                "{name}: {a:?}"
+            );
+        }
+        // the alias keys only: another key's value is no alias
+        for other in ["GPL", "license=GPL"] {
+            let a = assess(&t, &modprobe(&[other]));
+            assert!(
+                not_vouched(&a).contains("no module of the running kernel's tree"),
+                "{other}: {a:?}"
+            );
+        }
+        let a = assess(&t, &modprobe(&["nft-expr-nothing"]));
+        assert!(
+            not_vouched(&a).contains("no module of the running kernel's tree"),
+            "{a:?}"
+        );
+        // a built-in by alias beside a module file: the file judged
+        assert!(matches!(
+            assess(&t, &modprobe(&["-a", "nft-expr-counter", "nft_compat"])),
+            Assessment::Vouched(_)
+        ));
     }
 
     #[test]
