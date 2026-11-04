@@ -1253,6 +1253,27 @@ mod tests {
         b["unmapped"]["northnarrow"]["row"]["verified"] = false.into();
         let mut c = base.clone();
         c["unmapped"]["northnarrow"]["row"]["end"] = 1.into();
+        // a genuine terminator, the one its row follows, on a row that is no
+        // later file's first (line 2 of file 2; line 1 of file 1): still
+        // TAMPERED (mutation MQ2 of run 9: the place's line not checked)
+        let t = terminator(&k, "detections", &hash(&rows[2]));
+        let next = row(&k, "detections", 4, &hash(&t));
+        for (f, l) in [(2u64, 2u64), (1, 1)] {
+            let v = mapped("detections", f, l, &next, Some(&t));
+            let r = verify(v.to_string().as_bytes(), &pk).unwrap();
+            assert_eq!(r.exit_code(), 13, "{f}/{l}: {:?}", report_lines(&r));
+            assert!(
+                r.tampered[0].1.contains("no later file's first"),
+                "{:?}",
+                r.tampered
+            );
+        }
+        // and on line 1 of file 2: its place
+        let v = mapped("detections", 2, 1, &next, Some(&t));
+        assert_eq!(
+            verify(v.to_string().as_bytes(), &pk).unwrap().exit_code(),
+            0
+        );
         for (n, v, want) in [("rotate", a, 13), ("verified", b, 13), ("end", c, 0)] {
             let input = [
                 record("detections", 1, 1, &rows[0], "a"),
