@@ -287,4 +287,26 @@ mod tests {
             "AntiTamperDenial (Kernel, Decisive) on FsProtectDenial of pid 4242"
         );
     }
+
+    /// Lot 282: the journal line of a COMBAT entry names what vouched for a
+    /// heuristic (the lab had to read the signed row to learn that podman's
+    /// mass write was corroborated by an `iptables -F`).
+    #[test]
+    fn the_summary_names_the_corroboration() {
+        let mut t = evidence(TriggerType::ConfirmedIntrusion);
+        t.class = EvidenceClass::FileSystem;
+        t.corroborated_by = vec![
+            (TriggerType::DefenseImpairment, EvidenceClass::Execution),
+            (TriggerType::ExploitAttempt, EvidenceClass::Execution),
+        ];
+        let c = CombatCause::Trigger(t);
+        assert!(
+            c.summary().ends_with(
+                ", corroborated by DefenseImpairment (Execution), ExploitAttempt (Execution)"
+            ),
+            "{}",
+            c.summary()
+        );
+        assert!(!c.single_heuristic_arm());
+    }
 }

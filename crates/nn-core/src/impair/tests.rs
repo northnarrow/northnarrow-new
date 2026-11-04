@@ -276,7 +276,17 @@ fn switch_off_commands_need_their_arguments() {
             "{every_chain:?}"
         );
     }
-    // the other listed commands are unchanged: a policy run in full
+    // the other listed commands are unchanged: an operand after a run that
+    // is no flush of iptables still matches (`nft flush ruleset ip`)
+    assert!(h
+        .run(
+            354,
+            200,
+            "/usr/sbin/nft",
+            &["nft", "flush", "ruleset", "ip"]
+        )
+        .is_some());
+    // a policy run in full
     assert!(h
         .run(
             353,

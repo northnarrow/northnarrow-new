@@ -3362,6 +3362,40 @@ mod tests {
         assert!(!det
             .detect(&file_open(800, 0, "/srv/app/o2/1", 2, 41), &recent)
             .contains(&ci));
+        // nineteen files and a twentieth in the focal open: twenty
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(801, 1, "/srv/app/worker", 1), &[]);
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64 - 1))
+            .map(|i| file_open(801, 0, &format!("/srv/app/o3/{i}"), 2, i + 10))
+            .collect();
+        assert!(det
+            .detect(&file_open(801, 0, "/srv/app/o3/x", 2, 41), &recent)
+            .contains(&ci));
+    }
+
+    /// Lot 282: past 1,024 pids the replacement halves are pruned of those
+    /// no later half can pair with (every half older than a window); a half
+    /// that can still pair is kept, an old half beside it notwithstanding.
+    #[test]
+    fn pruning_the_replacement_halves_keeps_what_can_still_pair() {
+        let r = Replacements::default();
+        let w = MASS_WRITE_WINDOW_NS;
+        // pid 1: an old creation, then a recent destruction (no pair yet)
+        assert!(!r.record(1, Half::Created, 0));
+        assert!(!r.record(1, Half::Destroyed, 3 * w));
+        // 1,100 other pids, a little later: the map is pruned on each record
+        for pid in 1000..2100u32 {
+            assert!(!r.record(pid, Half::Created, 3 * w + 2));
+        }
+        // pid 1's recent destruction is still there to pair with
+        assert!(r.record(1, Half::Created, 3 * w + 1));
+        // a pid with nothing recent is gone once the map is pruned
+        assert!(!r.record(7, Half::Created, 0));
+        for pid in 2100..2200u32 {
+            r.record(pid, Half::Created, 10 * w);
+        }
+        assert!(!r.0.lock().contains_key(&7));
+        assert!(r.0.lock().len() < 1_200);
     }
 
     /// Tracepoint mode sees the open flags, not whether the file existed:
