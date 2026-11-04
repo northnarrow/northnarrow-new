@@ -1451,7 +1451,15 @@ mod tests {
             .unwrap()
             .contains("no start of this boot registered"));
         let legacy = PathBuf::from("/b/northnarrow-cgroup-join-v1-63222");
-        let p = plan(root, "B", None, &[legacy.clone()], &ok(1), 1000, None);
+        let p = plan(
+            root,
+            "B",
+            None,
+            std::slice::from_ref(&legacy),
+            &ok(1),
+            1000,
+            None,
+        );
         assert!(!p.adopt && p.dir == d(0) && p.reset.is_some());
         // another boot's state is none
         let p = plan(
