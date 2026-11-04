@@ -427,6 +427,15 @@ mod tests {
         let fake = proc_copy(pid, Some("0"), false);
         let how = exited(environment(fake.path(), pid, start));
         assert!(how.contains("its memory gone"), "{how}");
+        // a read the exit cut short: what was read is no whole environment
+        let fake = proc_copy(pid, Some("0"), false);
+        std::fs::write(
+            fake.path().join(format!("{pid}/environ")),
+            b"PATH=/usr/bin\0FILLER=xxxx",
+        )
+        .unwrap();
+        let how = exited(environment(fake.path(), pid, start));
+        assert!(how.contains("cut short"), "{how}");
         let fake = proc_copy(pid, Some("0"), true);
         let how = exited(environment(fake.path(), pid, start));
         assert!(
@@ -529,6 +538,12 @@ mod tests {
             ] {
                 let why = refused(judged(Ok(()), env, gone));
                 assert!(why.contains(named), "{named}: {why}");
+                let because = if named.starts_with("MODPROBE_OPTIONS") {
+                    "kmod puts it in front of the command line"
+                } else {
+                    "the dynamic linker runs code of the caller's choosing"
+                };
+                assert!(why.contains(because), "{named}: {why}");
             }
             let big = vec![b'x'; MAX_ENVIRON as usize + 1];
             assert!(refused(judged(Ok(()), &big, gone)).contains("larger than"));
