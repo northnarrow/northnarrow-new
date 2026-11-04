@@ -67,6 +67,8 @@ agent_pid() { cat /run/northnarrow/agent.pid 2>/dev/null; }
 # a command line: the workers run the agent's binary)
 worker_pid() { ps --ppid "$(agent_pid)" -o pid=,comm= 2>/dev/null | awk '$2 == "nn-worker-exp" {print $1; exit}'; }
 status_json() { "$NNADMIN" export status --json --key "$KEY" 2>/dev/null; }
+# the agent's own journal (its namespace) and systemd's lines about its unit
+agent_journal() { journalctl --namespace=northnarrow --no-pager "$@" 2>/dev/null; }
 bus_json() { "$NNADMIN" status --json --key "$KEY" 2>/dev/null; }
 
 # the agent restarted inside a trusted-installer window (its unit refuses a
@@ -463,11 +465,14 @@ phase_rotate() {
     check rotate-no-loss "every row across the rotation arrived, none other" test $? -eq 0
     cat "$OUT/compare-rotate.txt"
     check verify-capture-rotate "the capture verifies across the rotation" verify capture-rotate "$CAP"
-    journalctl -u northnarrow-agent --since "-10min" --no-pager 2>/dev/null | grep -ciE 'cursorahead|cursor_ahead' > "$OUT/cursor-ahead.txt"
+    # the agent logs in its journal namespace (`LogNamespace=northnarrow`):
+    # `journalctl -u northnarrow-agent` alone reads systemd's lines only
+    # (rounds 5 to 10 counted there: no note could be seen)
+    agent_journal --since "-10min" | grep -ciE 'cursorahead|cursor_ahead' > "$OUT/cursor-ahead.txt"
     check rotate-no-cursor-ahead "no read went ahead of the chain (cursor_ahead notes: $(cat "$OUT/cursor-ahead.txt"))" bash -c "[ \"\$(cat '$OUT/cursor-ahead.txt')\" = 0 ]"
     # the second review of #499 (R1): the rotation's second window (the
     # archive renamed, the new file not made yet) is no eviction either
-    journalctl -u northnarrow-agent --since "-10min" --no-pager 2>/dev/null | grep -ciE 'Evicted [{]|active file is missing' > "$OUT/evicted.txt"
+    agent_journal --since "-10min" | grep -ciE 'Evicted [{]|active file is missing' > "$OUT/evicted.txt"
     check rotate-no-eviction "no file taken for evicted or missing across the rotation (notes: $(cat "$OUT/evicted.txt"))" bash -c "[ \"\$(cat '$OUT/evicted.txt')\" = 0 ]"
 }
 
@@ -657,7 +662,8 @@ shrink_overlay() {   # <files>
 # one left past the new count, and the core does not take it for the
 # worker's: the worker not killed, the file sink up, no `directory_over`.
 phase_shrink() {
-    local w0 w1 s
+    local w0 w1 s t0
+    t0=$(date +%s)
     # 8 files of 1 MiB, filled past four
     shrink_overlay 8
     s=$(date +%s)
@@ -682,8 +688,8 @@ e = json.load(open(sys.argv[1]))["export"]
 f = [k for k in e["sinks"] if k["sink"] == "file"][0]
 print(e["state"], e["worker"], f["state"], f["faults"], f.get("fault"))
 sys.exit(0 if e["state"] == "on" and e["worker"] == "ready" and f["state"] == "up" and f["faults"] == 0 else 1)' "$OUT/status-shrink.json"
-    journalctl -u northnarrow-agent --since "-1min" --no-pager 2>/dev/null | grep -ciE 'past its bound|directory_over' > "$OUT/shrink-over.txt"
-    check shrink-not-over "no directory past its bound since the start (notes: $(cat "$OUT/shrink-over.txt"))" bash -c "[ \"\$(cat '$OUT/shrink-over.txt')\" = 0 ]"
+    agent_journal --since "@$t0" | grep -iE 'past its bound|directory_over' > "$OUT/shrink-over.txt"
+    check shrink-not-over "the worker never killed for its directory, at 1 MiB from 64 MiB nor at 2 files from 8 ($(wc -l < "$OUT/shrink-over.txt") note(s))" bash -c "[ ! -s '$OUT/shrink-over.txt' ]"
     events 0 50 0
     check shrink-writes "the sinks catch up after the start" caught_up 120
 }

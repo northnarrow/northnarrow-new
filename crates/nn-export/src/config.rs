@@ -40,7 +40,14 @@ pub const MAX_DIR_BYTES: u64 = 4 << 30;
 /// one record past each (a line longer than a file goes whole into an
 /// empty one).
 pub fn dir_bound(f: &FileConfig) -> u64 {
-    f.max_bytes * u64::from(f.max_files) + u64::from(f.max_files) * (1 << 20)
+    u64::from(f.max_files) * file_bound(f)
+}
+
+/// One JSONL file at most: `file_max_bytes` and 1 MiB (the sink rotates
+/// before a line would pass the size; a line longer than a file goes whole
+/// into an empty one).
+pub fn file_bound(f: &FileConfig) -> u64 {
+    f.max_bytes + (1 << 20)
 }
 
 /// Where the overlay lives.

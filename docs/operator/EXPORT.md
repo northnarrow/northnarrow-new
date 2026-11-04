@@ -245,10 +245,12 @@ The parse worker's (`WORKERS.md` §3) with what its sinks need, no more:
   `directory_over` note — the export never fills the disk the chains are
   on. The directory is judged from the first worker's setup of the run (the
   sink's open has cleared what an earlier configuration left, §3), against
-  its bound or, when the files an earlier, larger configuration wrote pass
-  it, against the bytes the directory held at that setup: the honest worker
-  is never killed for them, and a worker killed for its directory does not
-  raise that floor for the next one. What remains: a worker taken over can
+  its bound and, when an earlier configuration wrote larger files, their
+  bytes at that setup: they leave by the sink's rotations while the new
+  files fill the bound, and the honest worker is never killed for them (lot
+  276's tenth lab: a bound raised only to the directory's bytes killed it at
+  its first write); a worker killed for its directory does not raise that
+  allowance for the next one. What remains: a worker taken over can
   write up to its file size limit in each of its descriptors for about a
   second, until the core's next measurement kills it — and again at each
   restart, until the supervisor disables it; the core cannot remove what it

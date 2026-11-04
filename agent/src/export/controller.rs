@@ -424,29 +424,29 @@ fn run(p: Params, stop: &AtomicBool) {
     let mut last_save = Instant::now() - SAVE_EVERY;
     let mut saved_at: Option<String> = None;
     let mut saves = 0u64;
-    let dir_limits = p
-        .configured
-        .config
-        .file
-        .as_ref()
-        .map(|f| (f.max_files, nn_export::config::dir_bound(f)));
+    let dir_limits = p.configured.config.file.as_ref().map(|f| {
+        (
+            f.max_files,
+            nn_export::config::dir_bound(f),
+            nn_export::config::file_bound(f),
+        )
+    });
     let mut dir_checked = Instant::now() - DIR_CHECK_EVERY;
     let mut dir_over: Option<String> = None;
-    // the directory's bytes once the first worker of this run set its sink
-    // up (what an earlier configuration left, past this one's names
-    // cleared by the sink's open): judged from then on
-    let mut dir_floor: Option<u64> = None;
+    // what an earlier, larger configuration's files held when the first
+    // worker of this run set its sink up: judged from then on
+    let mut dir_allowance: Option<u64> = None;
     while !stop.load(Ordering::SeqCst) {
         // the file sink's directory within its bound, or the file sink
         // stops and the worker that wrote past it is killed
-        if let Some((max_files, bound)) = dir_limits {
+        if let Some((max_files, bound, _)) = dir_limits {
             if dir_checked.elapsed() >= DIR_CHECK_EVERY {
                 dir_checked = Instant::now();
                 let now_over = dir_verdict(
                     std::path::Path::new(nn_proto::ipc::EXPORT_DIR),
                     max_files,
                     bound,
-                    dir_floor,
+                    dir_allowance,
                 );
                 if let (Some(why), None) = (&now_over, &dir_over) {
                     warn!(%why, "export: the export's directory past its bound: the worker killed, the file sink stopped");
@@ -487,10 +487,11 @@ fn run(p: Params, stop: &AtomicBool) {
                     );
                     if let Ok(Answer::ExportSetup(out)) = answer {
                         set_up_for = Some(w.starts);
-                        if dir_limits.is_some() {
-                            dir_floor = floor_after_setup(
-                                dir_floor,
+                        if let Some((_, _, per_file)) = dir_limits {
+                            dir_allowance = allowance_after_setup(
+                                dir_allowance,
                                 std::path::Path::new(nn_proto::ipc::EXPORT_DIR),
+                                per_file,
                             );
                         }
                         port_pinned = setup.syslog.as_ref().map(|_| out.port_pinned);
@@ -798,39 +799,48 @@ fn over_bound(dir: &std::path::Path, max_files: u8, bound: u64) -> Option<String
     (total > bound).then(|| format!("{total} bytes, past its bound of {bound}"))
 }
 
-/// The bytes of every entry in `dir` (0 when it cannot be read).
-fn dir_bytes(dir: &std::path::Path) -> u64 {
+/// The bytes of the files in `dir` larger than `per_file` (a file of this
+/// configuration never is: an earlier configuration's with larger files;
+/// 0 when it cannot be read).
+fn oversize_bytes(dir: &std::path::Path, per_file: u64) -> u64 {
     std::fs::read_dir(dir)
         .map(|es| {
             es.flatten()
-                .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                .filter(|len| *len > per_file)
                 .sum()
         })
         .unwrap_or(0)
 }
 
-/// The directory's floor after a worker's setup: the first setup's bytes,
-/// kept — a worker killed for its directory does not raise it for the next.
-fn floor_after_setup(floor: Option<u64>, dir: &std::path::Path) -> Option<u64> {
-    floor.or_else(|| Some(dir_bytes(dir)))
+/// The directory's allowance after a worker's setup: the first setup's
+/// [`oversize_bytes`], kept — a worker killed for its directory does not
+/// raise it for the next.
+fn allowance_after_setup(
+    allowance: Option<u64>,
+    dir: &std::path::Path,
+    per_file: u64,
+) -> Option<u64> {
+    allowance.or_else(|| Some(oversize_bytes(dir, per_file)))
 }
 
 /// The core's verdict on the export's directory: `None` until the first
-/// worker of the run set its sink up (`floor`: the directory's bytes then
-/// — the sink's open has removed what an earlier configuration left past
-/// this one's file count, and rotated an active file past its size), then
-/// [`over_bound`] with the bound never below that floor: files an earlier,
-/// larger configuration wrote leave by the sink's rotations, and the
-/// honest worker is never killed for them (the second review of #499, R3).
-/// The floor is the first setup's alone: a worker killed for its directory
-/// does not raise it for the next one.
+/// worker of the run set its sink up (the sink's open has removed what an
+/// earlier configuration left past this one's file count, and rotated an
+/// active file past its size), then [`over_bound`] against the bound and
+/// the `allowance`: the bytes of the files an earlier configuration wrote
+/// larger than this one's, at that setup. They leave by the sink's
+/// rotations, the new files filling the bound meanwhile: the honest worker
+/// is never killed for them (the second review of #499, R3; lot 276's
+/// tenth lab killed it when the bound was only raised to the directory's
+/// bytes). Without such files the bound is the configuration's alone.
 fn dir_verdict(
     dir: &std::path::Path,
     max_files: u8,
     bound: u64,
-    floor: Option<u64>,
+    allowance: Option<u64>,
 ) -> Option<String> {
-    floor.and_then(|f| over_bound(dir, max_files, bound.max(f)))
+    allowance.and_then(|a| over_bound(dir, max_files, bound.saturating_add(a)))
 }
 
 /// Whether a round with no row to send asks the worker anyway: when rows
@@ -1330,33 +1340,43 @@ mod tests {
             why, None,
             "an honest sink's directory judged past its bound"
         );
-        let floor = dir_bytes(d.path());
-        assert_eq!(dir_verdict(d.path(), 2, 1 << 20, Some(floor)), None);
+        assert_eq!(
+            dir_verdict(
+                d.path(),
+                2,
+                1 << 20,
+                allowance_after_setup(None, d.path(), 15 + (1 << 20))
+            ),
+            None
+        );
     }
 
     /// A signed configuration that lowers `file_max_bytes`: the files the
     /// earlier one wrote pass the new total, and leave by the sink's
-    /// rotations — the directory is judged against the bytes it held at the
-    /// first setup, never below the configured bound; what grows past that
-    /// floor is still judged, and nothing is judged before a setup.
+    /// rotations while the new files fill the bound — the directory is
+    /// judged against the bound and the bytes of those larger files at the
+    /// first setup (lot 276's tenth lab: a bound raised only to the
+    /// directory's bytes killed the honest worker at its first write);
+    /// nothing is judged before a setup, and what passes the two is.
     #[test]
     fn a_smaller_file_size_does_not_condemn_the_honest_worker() {
         let d = tempfile::tempdir().unwrap();
         let line = vec![b'x'; 63];
         let mut s = nn_export::jsonl::JsonlSink::open(d.path(), 4 << 20, 3).unwrap();
         // 46 × 4096 lines of 64 bytes: about 11.5 MiB in the 3 files
-        let batch = vec![line; 4096];
+        let batch = vec![line.clone(); 4096];
         for _ in 0..46 {
             s.write(&batch).unwrap();
         }
         drop(s);
-        // the next start, signed with file_max_bytes = 1 MiB: the bound
+        // the next start, signed with file_max_bytes = 1 MiB
         let small = nn_export::config::FileConfig {
             max_bytes: 1 << 20,
             max_files: 3,
         };
         let bound = nn_export::config::dir_bound(&small);
-        let s =
+        let per_file = nn_export::config::file_bound(&small);
+        let mut s =
             nn_export::jsonl::JsonlSink::open(d.path(), small.max_bytes, small.max_files).unwrap();
         assert_eq!(s.size(), 0, "the active file rotated at the open");
         assert!(
@@ -1368,23 +1388,56 @@ mod tests {
             None,
             "before a setup"
         );
-        let floor = dir_bytes(d.path());
-        assert!(floor > bound);
-        assert_eq!(dir_verdict(d.path(), 3, bound, Some(floor)), None);
-        // a worker that writes past the floor is still judged
-        std::fs::write(d.path().join("export.jsonl"), vec![b'y'; 4096]).unwrap();
-        assert!(dir_verdict(d.path(), 3, bound, Some(floor))
+        let allowance = allowance_after_setup(None, d.path(), per_file);
+        assert!(allowance.unwrap() > 6 << 20, "{allowance:?}");
+        // the honest sink writes on: never judged, until the earlier files
+        // have left
+        for _ in 0..24 {
+            s.write(&vec![line.clone(); 2048]).unwrap();
+            assert_eq!(dir_verdict(d.path(), 3, bound, allowance), None);
+        }
+        assert!(
+            over_bound(d.path(), 3, bound).is_none(),
+            "the earlier files gone"
+        );
+        // the allowance is the first setup's: a later setup keeps it
+        assert_eq!(allowance_after_setup(Some(7), d.path(), per_file), Some(7));
+        // a worker that writes past the bound and the allowance is judged
+        std::fs::write(
+            d.path().join("export.jsonl"),
+            vec![b'y'; (bound + allowance.unwrap()) as usize],
+        )
+        .unwrap();
+        assert!(dir_verdict(d.path(), 3, bound, allowance)
             .unwrap()
             .contains("past its bound"));
-        // the floor is the first setup's: a later setup keeps it
-        assert_eq!(floor_after_setup(None, d.path()), Some(dir_bytes(d.path())));
-        assert_eq!(floor_after_setup(Some(7), d.path()), Some(7));
-        // and a name the sink does not write, whatever the floor
+        // and a name the sink does not write, whatever the allowance
         std::fs::write(d.path().join("export.jsonl"), b"").unwrap();
         std::fs::write(d.path().join("filler"), b"x").unwrap();
-        assert!(dir_verdict(d.path(), 3, bound, Some(u64::MAX))
+        assert!(dir_verdict(d.path(), 3, bound, Some(u64::MAX / 2))
             .unwrap()
             .contains("does not write"));
+    }
+
+    /// The same configuration again (no larger file): no allowance, the
+    /// bound alone.
+    #[test]
+    fn the_same_configuration_again_has_the_bound_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = nn_export::jsonl::JsonlSink::open(d.path(), 1 << 20, 3).unwrap();
+        s.write(&vec![vec![b'x'; 63]; 40_000]).unwrap();
+        drop(s);
+        let f = nn_export::config::FileConfig {
+            max_bytes: 1 << 20,
+            max_files: 3,
+        };
+        let _s = nn_export::jsonl::JsonlSink::open(d.path(), f.max_bytes, f.max_files).unwrap();
+        let allowance = allowance_after_setup(None, d.path(), nn_export::config::file_bound(&f));
+        assert_eq!(allowance, Some(0));
+        let bound = nn_export::config::dir_bound(&f);
+        assert_eq!(dir_verdict(d.path(), 3, bound, allowance), None);
+        std::fs::write(d.path().join("export.jsonl.2"), vec![b'z'; bound as usize]).unwrap();
+        assert!(dir_verdict(d.path(), 3, bound, allowance).is_some());
     }
 
     fn row(line: u64, raw: &[u8]) -> ExportRow {
