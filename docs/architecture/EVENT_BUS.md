@@ -821,9 +821,10 @@ stage of an event's path (plan §3.4):
 | 5 decision delay | the decisions over their class's budget, from the record's kernel time | R12b |
 | 6 response queue | responses decided and not run: displaced or refused by the full queue, queued at the stop, the dispatcher down (each signed in an `overflow` row) | R12c |
 | 7 evidence writer queue | detection records dropped or refused by the chain, action rows not in their chain, canary rows not written | R12c |
-| 8 export | — | R15 |
+| 8 export | the rows the export can no longer deliver: a chain's archive evicted before a sink read it, a row longer than a request carries (`docs/operator/EXPORT.md`) | lot 276 |
 
-**Signed off the host's word (R12c-2).** Stages 1 to 7 are signed together:
+**Signed off the host's word (R12c-2).** Stages 1 to 7 (and 8, the export's,
+since lot 276) are signed together:
 a `telemetry_loss` row in the audit log (each stage's total since the run
 started and what it lost since the last row) at a change, at most once a
 minute, and once an hour with no change (the zero signed too), and at the

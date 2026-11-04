@@ -6,6 +6,44 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- The minimal signed export (lot 276, capability C21, R15's first step;
+  `docs/operator/EXPORT.md`). Off by default; a signed
+  `/etc/northnarrow/export.local` (overlay `export`, `config-manage`) turns
+  it on, at the next start. The signed chains are the write-ahead log: the
+  core's `nn-export` thread (no capability, never the decision thread)
+  reads the rows of the detections, actions, FIM drift, netflow and canary
+  access chains after a cursor per sink and chain, and hands them to a new
+  unprivileged **export worker** (the agent's binary as
+  `northnarrow-worker`, `nn-worker-exp`), which verifies each with the
+  agent's public key, maps it to **OCSF 1.9.0** (Detection Finding, Process,
+  File System and Network Activity, Remediation, Base Event; the schema
+  pinned in `crates/nn-export/ocsf/`, every record validated by the tests)
+  and writes it to a rotating, bounded **JSONL file**
+  (`/var/log/northnarrow/export`) and to **syslog over TLS** (RFC 5424
+  messages in RFC 5425 frames; rustls with the RustCrypto provider, TLS 1.3,
+  X25519, the CA pinned by the signed text). Every record carries its
+  signed row (`raw_data`) and its place and links
+  (`unmapped.northnarrow.row`). At least once: a cursor moves past rows the
+  sink delivered only (file: synced; syslog: acknowledged by the receiver's
+  TCP and settled for a second), and is written atomically
+  (`detections/export-cursors.json`). The worker's sandbox: Landlock with
+  its directory alone and a second layer pinning TCP connect to the
+  receiver's port (ABI ≥ 4, measured, required), seccomp with TCP sockets
+  and its files' calls only. Stage 8 of the loss counters (rows the export
+  can no longer deliver) is counted and signed (`telemetry_loss`, every
+  beat's `loss`); `export_state` rows are signed at the start, at a sink's
+  change and at the stop; the manifest carries `export` (and the worker's
+  `fs_rules`), each beat `export`. New verbs: `nn-admin export status`
+  (signed telemetry) and `nn-admin export verify` (a receiver's check of
+  every record against the agent's key and each chain's continuity). New
+  dependencies (rustls 0.23.46, rustls-rustcrypto 0.0.2-alpha, pinned
+  exactly) with eight RustSEC advisories recorded as not reached
+  (`.cargo/audit.toml`): the receiver's chain is verified by rustls' own
+  rustls-webpki 0.103.16, the provider's key provider loads no private
+  key; the CI charter gate refuses ring and aws-lc in the agent's graph.
+  The supervisor's pass no longer waits on a worker's long request; the
+  IPC's version is 3; the fuzz target `ipc_check` covers the export's
+  answers.
 - Exemptions by cgroup or unit hold only for processes started in their
   cgroup, the kernel's host checks name the fixes the sandbox relies on,
   and a worker enters its sandbox single-threaded (lot 277, Wave 4 phase 3,

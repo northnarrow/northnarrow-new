@@ -49,7 +49,10 @@ release's CycloneDX SBOMs (`*.sbom.cdx.json`); on a checkout,
 the on-host LLM advisor (Wave 4, lab PR 214), the licence expressions of
 the crates the binaries link used only MIT, Apache-2.0 (with or without the
 LLVM exception), BSD-2-Clause, BSD-3-Clause, Zlib, Unicode-3.0 and
-Unlicense.
+Unlicense. Lot 276 (the export's TLS: rustls with the RustCrypto provider,
+`docs/operator/EXPORT.md` §7) adds ISC — rustls-webpki and untrusted are
+ISC alone; rustls offers Apache-2.0, ISC or MIT — a permissive licence
+compatible with Apache-2.0.
 
 ## Licence declarations
 

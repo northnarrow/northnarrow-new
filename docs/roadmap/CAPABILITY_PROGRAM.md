@@ -49,7 +49,7 @@ number in parentheses is a lab PR.
 | C18 | Host network isolation | 1 | ISOLATE per family, IPv4 and IPv6, with read-back, retry and a signed outcome, in the lab on 24.04 only (217); the signed management carve-out (`configs/combat-allow.cidrs`) and unlock; only inside an engaged COMBAT (`docs/operator/COMBAT_RECOVERY.md`) | 3 |
 | C19 | Rollback and remediation | 1 | copy on first write (222; EXPERIMENTAL, off by default): a signed restore of 51 of 51 files on XFS, 50 of 51 on ext4 (over the 16 MiB cap); in-place rewrites only: `x.enc` then an unlink or rename over `x`, and `truncate` by path, are not covered (`docs/design/COPY_ON_FIRST_WRITE.md`); no remediation of persistences | 3 |
 | C20 | Automation, playbooks, SOAR | 1 | the automatic COMBAT ladder and the per-rule policy; no playbook, webhook or OpenC2 | 3 |
-| C21 | SIEM integration and export | 0 | no export of the detections ("until R15 exports the chains off the host", `docs/operator/HEARTBEAT.md`); local JSON reads and the heartbeat pull (270) only; no OCSF, syslog or OTLP | 3 |
+| C21 | SIEM integration and export | 1 (lot 276) | the signed chains exported as OCSF 1.9.0 to rotating JSONL files and to syslog over TLS (RFC 5425), off by default, each record carrying its signed row, checked by `nn-admin export verify` against the agent's key alone; a cursor per chain, at least once, an unprivileged export worker (`docs/operator/EXPORT.md`); measured on Ubuntu 26.04 and Debian 12 (lot 276's note); no application acknowledgement (RELP, OTLP), no reload | 3 |
 | C22 | Backend and multi-host correlation | 0 | the heartbeat's external verifier (270) is not a backend | 3 |
 | C23 | Anti-tamper and self-defence | 2 (provisional) | 21 LSM deny hooks and 6 optional (lot 273: the cgroup move guard; lot 273b: the write deny `file_permission`, the guard's third program; lot 273c: `task_setrlimit`, `task_setscheduler`, `task_setnice`, `task_setioprio`), the fail-opens counted and signed (215); start refused without BPF LSM, a hook's self-test (218); a fail-visible watchdog (216); the signing key decided once at boot (265, 268); unprivileged workers under Landlock and seccomp (272); the signed heartbeat's external verifier sees a stop in 6.5 s (270). Provisional: on systemd 257 and later `systemctl kill -s SIGKILL` stopped the agent through `cgroup.kill` outside a maintenance window, and any root shell could kill, freeze or move the units' cgroups on every kernel (tamper case C31; C33's `systemctl stop` was refused all along — it read C31's kill); closed by lot 273 (#489: the units' cgroups protected, the move guard; C15, C20, C31, C65–C75 refused and signed and C76 allowed inside a window on the five guests); lot 273b (the review of #489): the units' and their slices' resource limits (an OOM kill inside the write, a starvation), a cgroup v1 hierarchy where systemd runs the unified one, a write through a descriptor opened earlier and the protected pids' `oom_score_adj` refused outside a window, the move guard self-tested at every boot (C12, C18, C77–C86); lot 273c (the review of #490): another process's `prlimit`, `renice`, `chrt`, `taskset`, `ionice` of a protected process refused (four deny hooks, 21 in all), PID 1 closed to attach-mode access, no resource value below a floor registered (the agent's start, the watchdog's check of a respawn, a window's close), systemd's copy of a refused `set-property` taken back by a reload, the host's drop-ins judged by their value for our units (never moved), cgroup v1 refused only where it moves or freezes (C89–C102), provisional until its review | 3 |
 | C24 | Offline and air-gapped operation | 2 | the agent's only traffic of its own is the DNS probe to 127.0.0.1:53 (`crates/nn-linux/src/telemetry_probe.rs`); updates are an operator's action; the attestation is verified offline with a bundle (`docs/operator/INSTALL_UPGRADE_UNINSTALL.md`) | 3 |
@@ -5615,3 +5615,162 @@ number in parentheses is a lab PR.
     positive") is for the founder, who decides each closure in the UI. No
     run is made green by dismissing.
   - Level unchanged (C27 1).
+- **Lot 276 — C21: the minimal signed export (OCSF 1.9.0 to JSONL files
+  and to syslog over TLS, each record carrying its signed row; off by
+  default).**
+  - What was open: nothing left the host but the local JSON reads and the
+    heartbeat's pull (lot 270); a SIEM had no record of the agent's, and
+    no way to check one against the chains.
+  - What changed: a signed `export.local` (overlay kind 16,
+    `config-manage`, next start) turns on the export of the five chains
+    (detections, actions, fim_drift, netflow, canary_access) as OCSF 1.9.0
+    records — Detection Finding (2004, with Process Activity 1007 for an
+    exec detection), Remediation 7001–7004 from the actions chain's intent
+    and outcome rows (one `correlation_uid`), File System Activity (1001),
+    Network Activity (4001), a Base Event (0) for any other row — to
+    rotating, bounded JSONL files and to a syslog receiver over TLS
+    (RFC 5424 in RFC 5425 framing; rustls 0.23.46 with rustls-rustcrypto
+    0.0.2-alpha, pinned exactly, TLS 1.3 and X25519 only). Each record's
+    `raw_data` is its signed row verbatim and `unmapped.northnarrow.row`
+    its place and links; `nn-admin export verify` checks a receiver's
+    records against the agent's public key alone (each row's seal, each
+    chain's links, across a rotation through its terminator). The chains
+    are the write-ahead log: the core reads them on its `nn-export`
+    thread and keeps one cursor per sink and chain (file, line, end,
+    `entry_hash`), moved only by the worker's acknowledgement of a row's
+    place — at least once. The worker `export` (R14) holds neither the
+    chains nor the cursors: it receives the rows' bytes, verifies each
+    with the agent's key, maps and sends; its seccomp allowlist and two
+    Landlock layers (its directory at entry; TCP connect pinned to the
+    receiver's port after its setup, ABI ≥ 4, measured) are its own; the
+    core checks every answer against what it sent and kills a worker
+    that lies. A request has a budget of 1 s, the in-flight bytes 1 MiB,
+    a receiver 30 s of stall: no receiver can hold the decision thread
+    or the supervisor (whose tick no longer waits on a slot a request
+    holds). Rows the export can no longer deliver are stage 8 of the
+    loss counters; `nn-admin export status`, the manifest's `export`, the
+    beat's `export` and the signed `export_state` rows say its state.
+    The design's one departure from the plan: the brief's worker held
+    the chains read-only and its cursors; here it holds neither (the
+    chains are root's 0600; a worker that parses a receiver's bytes reads
+    no chain).
+  - Found by the lot's own tests and mutations, fixed in the lot: a TCP
+    acknowledgement alone lost rows when a receiver closed with bytes it
+    had not read (its kernel resets the connection): a row is delivered
+    once acknowledged and the connection still up a second later (the
+    settle); rustls' default 64 KiB send buffer made every record over it
+    fail its write (`Closed`, again and again) — lifted, the sink's own
+    in-flight bound holds what rustls buffers; the CA bundle was read
+    without a bound and through a link; nn-export's test PKI was ignored
+    by `.gitignore` (`*.pem`, `*.key`) and would have failed CI; a row's
+    format is now read as the chain log reads it (no `fmt_ver` or up to 2
+    untagged, 3 under the chain's domain, a later one refused); the
+    narrowed provider's key provider loads no private key (rsa's and
+    ECDSA's private-key code unreachable by construction). The count of an
+    evicted file's rows is the manifest's, a lower bound across a restart
+    (documented). `nn-admin export verify` said OK of an empty capture:
+    `EMPTY`, exit 2.
+  - Found by the lab, fixed in the lot (round 2, Ubuntu 26.04 and Debian
+    12): a chain's backlog made a batch of the WAL one row past
+    `MAX_EXPORT_BYTES`, the core's request was refused by its own check,
+    and the controller set the worker up again on each refusal — on 26.04
+    37,213 faults in 5 s, each setup a new connection and another Landlock
+    layer, until Landlock's 16 and the pin failed (the syslog sink
+    `failed`); on Debian 12 the same rows written again and again
+    (244,942 duplicate records) and the netflow backlog never delivered.
+    Now a batch never passes its bytes, the pin is laid once per worker
+    (a setup again reuses it), and a request the core refused itself sets
+    nothing up again. Round 1 had measured nothing: the lab script put the
+    CA in `/etc/northnarrow` outside a window (the agent refused it) and
+    ran its receiver as root from the lab user's tree; both fixed in the
+    script, and `EXPORT.md` says the CA goes in inside a window.
+  - An expected gap, measured: a receiver that keeps its session, never
+    reads, then dies, loses what its kernel acknowledged (round 2: 5
+    detection rows) — RFC 5425 has no application acknowledgement
+    (`EXPORT.md` §8); the lab's `stall` phase checks the loss is only
+    rows written while it held the connection.
+  - Lab: our own QEMU guests under lease k276, the agent installed as an
+    operator does (`enable --now`) and uninstalled at the end (`--purge`,
+    inside its window), a local receiver of syslog over TLS (the lab's
+    `syslog_receiver`), `deploy/lab/export/export-guest.sh`, start =
+    oldest, both sinks. Round 1 measured nothing (the script: above);
+    round 2 found the defect above; round 3 (c796a0c3) and round 4
+    (510e1100, the slow receiver among the bounded-loss phases):
+    - Ubuntu 26.04 (kernel 7.0, Landlock ABI 8): the worker as
+      `northnarrow-worker`, no capability, `no_new_privs`, its seccomp
+      filter, its directory's rule declared, the receiver's port pinned
+      (`port_pinned` true in the manifest). Round 3: 11,003 chain rows
+      (its whole history) in the capture and in the JSONL files, none
+      missing, none other, every record verified by `nn-admin export
+      verify` (the agent's key, each chain's links); the receiver killed
+      while rows flowed: 11,097 rows, none lost, 10 duplicate records;
+      silent, garbage and chatty receivers: each burst detected, stage 5
+      unchanged (16 → 16), the worker ready, no row lost. Round 4: 50
+      checks, 50 passed (67 rows; 161 through the outage, none lost;
+      stage 5 24 → 24 in every phase).
+    - Debian 12 (kernel 6.1, Landlock ABI 2, no pin: `port_pinned` false):
+      round 4 50 of 50 (56 rows; 150 through the outage, none lost; stage
+      5 20 → 20 in every phase). Round 3's one FAIL, stage 5 20 → 59 in
+      the slow receiver's phase, is not the export's: its syslog sink was
+      idle then (in its backoff since the garbage receiver: 149 rows
+      before and after); round 4's same phase with the sink up against
+      the same receiver: 20 → 20.
+    - The bounded loss (`EXPORT.md` §8), round 4: of the rows written
+      while it held the connection, 42 of 47 (26.04) and 28 of 47
+      (Debian 12) lost behind a receiver reading 512 bytes a second that
+      then died, 43 of 46 and 31 of 46 behind one that never read; none
+      outside those windows.
+    - The cost (a flow-heavy minute, both sinks, round 4): 81,912 rows
+      in 61 s, the worker 12.3 % of a CPU, the core's `nn-export` thread
+      1.85 %, the worker's RSS 11.7 MB (26.04); 44,400 rows in 62 s,
+      6.5 % and 1.05 %, 8.0 MB (Debian 12). The agent's overhead on the
+      hooked operations (`nn-lab.sh overhead 3`, 26.04, round 3) the same
+      with the export off and on, within the noise of a loaded host.
+  - Mutations: 205 in four runs on the lot's code (IPC checks, row
+    verification, the OCSF mapping, the JSONL and syslog sinks, TLS, the
+    WAL reader, the configuration, the core's controller, `nn-admin export
+    verify`, the export's seccomp and Landlock, the supervisor, stage 8,
+    the beat): run 1 100 (87 caught; the nn-export set did not compile —
+    the ignored PKI), run 2 67 (51 caught), run 3 26 (the survivors with
+    their new tests and the sink and configuration sets again: 23
+    caught), run 4 12 (the second lab's fixes and the sites around them:
+    12 caught); each catch a named test failing. Three are argued
+    equivalent: no `fdatasync` (durability
+    across a power loss, which no test without a host crash observes),
+    the TLS 1.2 suites' retain (the provider has none: a test pins it),
+    the pin's measurement replaced by `true` (it differs only on a kernel
+    that does not enforce the Landlock rule it reports). The fuzz target
+    `ipc_check` covers the export's answers and its worker's hello.
+  - Dependencies: 76 entries more in `Cargo.lock` and in
+    `fuzz/Cargo.lock` — nn-export and 75 crates (none removed; ring is in the lockfiles as an optional dependency of
+    rustls-webpki 0.102 and is never built — CI's charter gate now refuses
+    ring, aws-lc-rs and aws-lc-sys in the build): rustls 0.23.46,
+    rustls-webpki 0.103.16 and 0.102.8, rustls-pki-types, untrusted,
+    rustls-rustcrypto 0.0.2-alpha and the RustCrypto generation it is built
+    on (aead, aes, aes-gcm, chacha20, chacha20poly1305, cipher, ctr,
+    ghash, polyval, poly1305, universal-hash, inout, hkdf, hmac, sha2 0.10,
+    digest 0.10, block-buffer, crypto-common, generic-array, signature 2,
+    ecdsa, elliptic-curve, p256, p384, primeorder, sec1, ff, group,
+    rfc6979, crypto-bigint 0.5, base16ct, der, spki, pkcs1, pkcs5, pkcs8,
+    pem-rfc7468, const-oid, rsa 0.9, num-bigint-dig, num-integer,
+    num-iter, libm, ed25519 2, ed25519-dalek 2, curve25519-dalek 4,
+    x25519-dalek 2, fiat-crypto, rand 0.8, rand_chacha, rand_core 0.6,
+    ppv-lite86, getrandom 0.2, cpufeatures, opaque-debug, paste, spin,
+    version_check, the windows-sys/windows-targets family — targets the
+    agent is not built for). Eight advisories in the provider's copies,
+    each an exception in `.cargo/audit.toml` with why it is not reached
+    and the test that holds it (EXPORT.md §7); licences all permissive
+    (Apache-2.0, MIT, ISC).
+  - Level: C21 0 → 1. A signed, verifiable export of the detections and
+    the other chains to a file and a SIEM's syslog, off by default,
+    measured on two kernels (one with the pin, one without); not 2: no
+    application acknowledgement (RELP, OTLP), no backend (C22), the
+    export's configuration at the next start only.
+  - Open: the configuration at the next start only (no reload); syslog's
+    delivery is the receiver's TCP and the settle, no application
+    acknowledgement (RELP, OTLP: R15's rest); no client certificate;
+    Landlock pins the receiver's port, not its address, and nothing below
+    ABI 4 (a per-role `socket_connect` pin in the BPF LSM would); the
+    worker's flows to its receiver are judged by the network rules like
+    any process's; the audit log, the status events and the heartbeat are
+    not exported.
