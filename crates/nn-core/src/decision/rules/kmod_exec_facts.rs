@@ -13,7 +13,8 @@
 //!   (options kmod puts in front of the command line: `-d`, `-C`, `--`…,
 //!   which the sensor does not see) nor the dynamic linker's `LD_PRELOAD`,
 //!   `LD_AUDIT`, `LD_LIBRARY_PATH` (code of the caller's choosing in the
-//!   tool). One read: killed, whatever became of the process. A RUNNING
+//!   tool). One read: killed, whatever became of the process — evidence,
+//!   not a false positive (the coordinator, 04/11). A RUNNING
 //!   process whose environment could not be read, an environment over
 //!   1 MiB, an unknown start: killed, nothing told it apart. A process that
 //!   had EXITED before its environment could be read — no process with its

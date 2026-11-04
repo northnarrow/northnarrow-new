@@ -255,7 +255,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    version; a program that is not the system's tool (its path; its device and \
                    inode not those of the file `/usr/bin/kmod` resolves to), of another mount \
                    namespace; `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or \
-                   `LD_LIBRARY_PATH` in its environment, a running process's environment not \
+                   `LD_LIBRARY_PATH` in its environment (read: killed even if the process has \
+                   since exited — evidence), a running process's environment not \
                    read, over 1 MiB, an unknown start; an argv not read whole. Recorded \
                    otherwise: the system's tool by module name, nothing moved or forced — no \
                    `modprobe.d` or index is read, what the names load is the kernel's to judge \

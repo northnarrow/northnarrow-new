@@ -173,7 +173,8 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
   `-` after the first name (`modprobe <name> -q`); a copy of the tool or a
   program whose device and inode are not those of the file `/usr/bin/kmod`
   resolves to; one of those variables (a root shell with `LD_LIBRARY_PATH`
-  set kills its `modprobe`); a running process whose environment the agent
+  set kills its `modprobe`; read, it is evidence: killed even if the
+  process has since exited, not a false positive); a running process whose environment the agent
   could not read at the exec, an environment over 1 MiB; a cut argv. A
   module tool that had exited before the agent could read its environment
   is recorded, the reasoning saying so ("exited before its environment

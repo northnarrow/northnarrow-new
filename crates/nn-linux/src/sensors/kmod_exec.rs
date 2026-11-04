@@ -14,7 +14,8 @@
 //!   (code of the caller's choosing run in the tool: the re-review, DC-2):
 //!   `/proc/<pid>/environ`, tied to the exec by a pidfd and the process's
 //!   start. Read: refused (R011 kills) — whatever became of the process: it
-//!   is what the exec asked for. A RUNNING process whose environment could
+//!   is evidence of what the exec asked for, not a false positive (the
+//!   coordinator, 04/11). A RUNNING process whose environment could
 //!   not be read, an environment over 1 MiB, an unknown start: refused. A
 //!   process that had EXITED before its environment could be read — no
 //!   process with its pid (`ESRCH`), its pid another process's (its start

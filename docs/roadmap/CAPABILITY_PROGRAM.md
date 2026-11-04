@@ -5880,7 +5880,9 @@ number in parentheses is a lab PR.
     with `-` after the first name; an option the tool refuses; a `kmod`
     command but `help`/`list`/`static-nodes`/the version; a program not the
     system's tool, of another mount namespace; `MODPROBE_OPTIONS`,
-    `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, a running process's
+    `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH` (read: a kill even if the
+    process has since exited — evidence, not a false positive; the
+    coordinator, 04/11), a running process's
     environment not read, over 1 MiB, an unknown start; an argv not read
     whole. Recorded (High, T1547.006) otherwise — a tool that had exited
     before its environment could be read (no process with its pid, its pid

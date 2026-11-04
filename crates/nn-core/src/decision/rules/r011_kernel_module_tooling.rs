@@ -55,7 +55,7 @@
 //! | any argument starting with `-` after the first module name; an option the tool refuses | kill |
 //! | a `kmod` command other than `help`, `list`, `static-nodes`, the version | kill |
 //! | not the system's tool: its path outside `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin` or another name, its device and inode not those of the file `/usr/bin/kmod` resolves to (as the exec pump stats it), a filesystem of another mount namespace | kill |
-//! | `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` in its environment; a running process whose environment the exec pump could not read at the exec; an environment over 1 MiB; an unknown start | kill |
+//! | `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` in its environment (read, it is evidence: killed even if the process has since exited); a running process whose environment the exec pump could not read at the exec; an environment over 1 MiB; an unknown start | kill |
 //! | a process that had exited before the exec pump could read its environment (no process with its pid, its pid another's, a zombie, its memory gone), the rest of it recorded | record, its environment not verified |
 //! | an argv the kernel did not read whole | kill |
 //! | otherwise — the system's tool, plain module names, before the first name only options that move and force nothing | record |

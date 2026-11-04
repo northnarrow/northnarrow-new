@@ -98,7 +98,8 @@ killed, in every posture. Killed as before, in every posture: `insmod`;
 `--remove-holders`, `--remove-dependencies`; any argument starting with `-`
 after the first name (`modprobe <name> -q` included); a copy of the tool or
 a program that is not the system's (its device and inode against the file
-`/usr/bin/kmod` resolves to); one of those variables, a running process
+`/usr/bin/kmod` resolves to); one of those variables (read, it is evidence:
+killed even if the process has since exited), a running process
 whose environment the agent could not read at the exec, an environment over
 1 MiB, an unknown start; an argv not read whole. A tool that had exited
 before the agent could read its environment is recorded, its environment

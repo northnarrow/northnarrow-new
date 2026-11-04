@@ -810,7 +810,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   program that is not the system's tool (its path, or its device and inode
   against the file `/usr/bin/kmod` resolves to, stat'ed by the exec pump),
   of another mount namespace; `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT`
-  or `LD_LIBRARY_PATH` in the process's environment (`/proc/<pid>/environ`
+  or `LD_LIBRARY_PATH` in the process's environment — read, it is evidence:
+  killed even if the process has since exited — (`/proc/<pid>/environ`
   tied to the exec by a pidfd and the start time; an empty one read from
   the running process is one: libxtables runs `modprobe` with none), a
   running process whose environment could not be read, an environment over
