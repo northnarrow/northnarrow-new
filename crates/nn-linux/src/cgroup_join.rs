@@ -512,12 +512,21 @@ pub fn prepare_pins(loader: &mut EbpfLoader<'_>, pin_root: Option<&Path>, entrie
         let state = std::fs::read_to_string(STATE_PATH)
             .ok()
             .and_then(|t| PinState::parse(&t));
+        // A `debug-trigger` build's test of a reset: the registered maps
+        // taken for not the registered ones, so the reset — the epoch with
+        // it — is the production one.
+        let verify = |st: &PinState| {
+            if debug_reset() {
+                return Err("a debug build asked for a reset".to_string());
+            }
+            verify_state(st)
+        };
         let p = plan(
             root,
             &boot_id(),
             state.as_ref(),
             &other_pin_dirs(root, None),
-            &verify_state,
+            &verify,
             entries,
             debug_entries(),
         );
@@ -541,6 +550,16 @@ fn debug_entries() -> Option<u32> {
         return Some(n.clamp(1, common::cgroup_join::PID_LIMIT));
     }
     None
+}
+
+/// A `debug-trigger` build's `NN_DEBUG_CGROUP_JOIN_RESET=1`: this start
+/// resets the marks (the privileged test of the epoch). Never in a release.
+fn debug_reset() -> bool {
+    #[cfg(feature = "debug-trigger")]
+    if std::env::var("NN_DEBUG_CGROUP_JOIN_RESET").as_deref() == Ok("1") {
+        return true;
+    }
+    false
 }
 
 /// The tracker's pin directory this boot, once [`prepare_pins`] chose it.
@@ -1123,6 +1142,18 @@ pub fn pinned_mark(root: &Path, tgid: u32) -> Result<Option<Mark>, String> {
     let md = open_pinned_ro(&pinned_dir(root)?.join(JOINED_MAP))?;
     let map = Joined::try_from(aya::maps::Map::HashMap(md)).map_err(|e| e.to_string())?;
     mark_in(&map, tgid)
+}
+
+/// The third review of #494 (R2-a): the marks' last reset this boot,
+/// `[monotonic, boot time]` ns (`[0, 0]`: none), from the pinned
+/// `CGROUP_JOIN_EPOCH` beside bpffs `root` — a test's, a tool's.
+pub fn pinned_epoch(root: &Path) -> Result<[u64; 2], String> {
+    let md = open_pinned_ro(&pinned_dir(root)?.join(EPOCH_MAP))?;
+    let map = Epoch::try_from(aya::maps::Map::Array(md)).map_err(|e| e.to_string())?;
+    Ok([
+        map.get(&0, 0).map_err(|e| e.to_string())?,
+        map.get(&1, 0).map_err(|e| e.to_string())?,
+    ])
 }
 
 /// Lot 277 (the review of #494, D5): whether `tgid` is "not known" (its

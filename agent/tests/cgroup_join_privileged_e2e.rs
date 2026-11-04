@@ -27,6 +27,10 @@
 //!   marked nor not known), a fork of one of those is too, a unit systemd
 //!   starts meanwhile is neither, and the pid of a "not known" process,
 //!   once it is gone, is a new process's with nothing;
+//! - the third review of #494 (R2-a): after a reset of the marks
+//!   (`NN_DEBUG_CGROUP_JOIN_RESET=1`, a `debug-trigger` build's), a fork of
+//!   a process started before it is not known, and neither a unit systemd
+//!   starts then (PID 1's placement) nor what that unit forks is;
 //! - the third review of #494 (R2-b): a tracker directory planted beside
 //!   the pin root under a name a later start could take, an LRU map in it
 //!   as the marks, is never adopted — the agent keeps its registered pins
@@ -803,6 +807,120 @@ fn a_planted_tracker_directory_is_never_adopted() {
         "the planted directory {planted} left beside the pin root"
     );
     fx.wait_for_log("an unregistered tracker directory beside the pin root removed");
+}
+
+/// Prints its pid; on each line from stdin forks a child that sleeps and
+/// prints the child's pid.
+const FORK_ON_LINE: &str = r#"
+import os, sys, time
+print(os.getpid(), flush=True)
+for _ in sys.stdin:
+    c = os.fork()
+    if c == 0:
+        time.sleep(20)
+        os._exit(0)
+    print(c, flush=True)
+"#;
+
+#[test]
+#[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
+fn a_reset_makes_what_started_before_it_not_known() {
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    // started before the reset
+    let mut before = Command::new("python3")
+        .args(["-I", "-c", FORK_ON_LINE])
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("python3");
+    let mut out = std::io::BufReader::new(before.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("its pid");
+    let fx = Fixture::setup_with(&[("NN_DEBUG_CGROUP_JOIN_RESET", "1")]);
+    fx.wait_for_log("marks reset — every process started before now is not known");
+    let epoch = nn_linux::cgroup_join::pinned_epoch(root()).expect("the epoch");
+    // a fork of a process started before the reset
+    before
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(b"fork\n")
+        .expect("fork");
+    line.clear();
+    out.read_line(&mut line).expect("the child's pid");
+    let child: u32 = line.trim().parse().expect("a pid");
+    let child_state = (mark(child), lost(child));
+    // a unit systemd starts after it, and what that unit forks
+    let unit = "nn-test-join-reset.service";
+    let pidfile = "/run/nn-test-join-reset.child";
+    let _ = std::fs::remove_file(pidfile);
+    let _ = Command::new("systemctl").args(["stop", unit]).status();
+    let st = Command::new("systemd-run")
+        .args([
+            "--quiet",
+            "--collect",
+            "--unit",
+            unit,
+            "-p",
+            "Type=exec",
+            "bash",
+            "-c",
+            &format!("sleep 30 & echo $! > {pidfile}; exec sleep 30"),
+        ])
+        .status()
+        .expect("systemd-run");
+    assert!(st.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let svc_child = loop {
+        if let Some(p) = std::fs::read_to_string(pidfile)
+            .ok()
+            .and_then(|t| t.trim().parse::<u32>().ok())
+        {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "no pid in {pidfile}");
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    let svc = main_pid(unit);
+    let svc_state = (mark(svc), lost(svc));
+    let svc_child_state = (mark(svc_child), lost(svc_child));
+    let _ = Command::new("systemctl").args(["stop", unit]).status();
+    let _ = std::fs::remove_file(pidfile);
+    let _ = before.kill();
+    let _ = before.wait();
+    drop(fx);
+    // the next tests' agents: new maps again, with no epoch (a debug
+    // build's capacity remake), so that this harness's own children are
+    // not "not known" in them
+    let _clean = Fixture::setup_with(&[("NN_DEBUG_CGROUP_JOINED_ENTRIES", "32768")]);
+    assert_eq!(
+        nn_linux::cgroup_join::pinned_epoch(root()).expect("the epoch"),
+        [0, 0],
+        "the cleaning start left an epoch"
+    );
+
+    assert!(
+        epoch[0] > 0 && epoch[1] > 0,
+        "a reset writes its instant: {epoch:?}"
+    );
+    assert_eq!(
+        child_state,
+        (None, true),
+        "a fork of a process started before the reset: not known"
+    );
+    assert_eq!(
+        svc_state,
+        (None, false),
+        "a unit systemd started after the reset (PID 1's placement)"
+    );
+    assert_eq!(
+        svc_child_state,
+        (None, false),
+        "a fork of a process started after the reset"
+    );
 }
 
 /// The main pid of transient unit `unit`.

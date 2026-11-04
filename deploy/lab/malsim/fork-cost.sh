@@ -66,7 +66,7 @@ moved_marked() {   # a root sleeper that moved itself into a throwaway cgroup: i
 }
 prog_stat() {   # <name prefix (15 chars)>: "run_cnt run_time_ns", summed over every program of that name
     sudo bpftool prog show 2>/dev/null | awk -v n="$1" '
-        $0 ~ " name "n" " { for (i=1;i<=NF;i++) { if ($i=="run_time_ns") t+=$(i+1); if ($i=="run_cnt") c+=$(i+1) } }
+        $0 ~ " name "n"[a-z_]* " { for (i=1;i<=NF;i++) { if ($i=="run_time_ns") t+=$(i+1); if ($i=="run_cnt") c+=$(i+1) } }
         END { print c+0, t+0 }'
 }
 sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 5; }

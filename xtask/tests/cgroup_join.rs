@@ -370,8 +370,10 @@ fn the_agent_asks_the_marks_where_it_decides() {
         body(&cj, "prepare_pins"),
         &[
             "std::fs::read_to_string(STATE_PATH)",
+            "if debug_reset() {",
+            "verify_state(st)",
             "let p = plan(",
-            "&verify_state,",
+            "&verify,",
             "usable_dir(&p.dir)?;",
             "for name in PINNED_MAPS {\n            loader.map_pin_path(name, p.dir.join(name));",
         ],
@@ -395,6 +397,15 @@ fn the_agent_asks_the_marks_where_it_decides() {
             "loader.map_max_entries(crate::cgroup_join::JOINED_MAP, joined_entries);",
             "crate::cgroup_join::prepare_pins(&mut loader, pin_root, joined_entries);",
             ".load(EBPF_BYTES)",
+        ],
+    )
+    .unwrap();
+    // a debug build's reset knob: debug-trigger builds only
+    in_order(
+        body(&cj, "debug_reset"),
+        &[
+            "#[cfg(feature = \"debug-trigger\")]",
+            "std::env::var(\"NN_DEBUG_CGROUP_JOIN_RESET\")",
         ],
     )
     .unwrap();
