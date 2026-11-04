@@ -5615,3 +5615,90 @@ number in parentheses is a lab PR.
     positive") is for the founder, who decides each closure in the UI. No
     run is made green by dismissing.
   - Level unchanged (C27 1).
+- **Lot 282 — Tappa Prove P0: the posture ladder no longer reaches COMBAT,
+  nor the ladder kills, on benign workloads (C14, C17; the kernel's counters
+  of C06).**
+  - What was open: lot 279's lab saw rootless podman killed (rc 137) at a
+    host's first image pull. Measured on `main` (0131394c; Ubuntu 22.04,
+    5.15, our own guest), the signed `combat_stage` row gave the chain:
+    `sudo podman run` (first pull) → podman's CNI plugin ran `iptables -t
+    nat -F CNI-…` → NN-L-EVA-002 read "`iptables -F`" → DefenseImpairment
+    (ENGAGED, execution evidence) in the administrator's login scope →
+    podman opened `bolt_state.db` 261 times in a minute → the kernel's
+    overwrite crossing → ConfirmedIntrusion (file-system evidence, root's:
+    privileged) corroborated by it → COMBAT locked → jump-ahead (podman
+    forks) → NEUTRALIZE killed podman's tree. `apt purge podman` reached
+    locked COMBAT from an anti-tamper refusal of `deb-systemd-helper`.
+    `docker pull`: dockerd's ExfiltrationPattern (its registry connections)
+    corroborated by the DefenseImpairment of its own chain flushes → COMBAT,
+    dockerd killed.
+  - What changed: the kernel counts what ransomware does to existing files —
+    a file rewritten once per 60-s window however often it is opened
+    (`OPEN_OVERWRITE_SEEN`), files created apart (`MASS_WRITE` is now the
+    files created), originals destroyed (an unlink, or a rename onto an
+    existing file of 4 KiB or more) once per name (`OPEN_DESTROY_SEEN`) and
+    never a file the same process created in the window (`OPEN_CREATED`);
+    the posture's mass-write arm fires on 20 distinct existing files
+    rewritten in place (40 per cgroup), or on 20 originals destroyed by a
+    process that created 20 files within a window (outside an
+    authenticated session), never on files created, one file rewritten or
+    deletions alone; every shape is file-system evidence; the exemptions
+    kept, an exempt crossing logged with its exemption. An anti-tamper
+    refusal of a package transaction's process raises
+    `PackageTamperRefusal` (ALERTED, never corroboration). The ladder holds
+    its NEUTRALIZE when COMBAT's cause is a heuristic that nothing of
+    another kind vouches for. NN-L-EVA-002 judges a chain's flush by the
+    chain's function and its flusher (a container runtime flushing its own
+    chain — the `iptables`'s parent a runtime program installed by a
+    package — is no switch-off; the host firewall's chains and anyone
+    else's flush still are). `docs/design/POSTURE_FSM_V2_REDESIGN.md` §10.
+  - Lab (as measured; Ubuntu 22.04, 5.15, our own guest, every case on a
+    freshly restarted agent; `main` 0131394c ("before") against the lot
+    as of 5c3e1261 ("after"), on the same guest:
+    | case | before (`main`) | after (the lot) |
+    |---|---|---|
+    | `sudo podman run`, first pull, then cached | COMBAT locked (CI corroborated by DefenseImpairment), podman killed by NEUTRALIZE, rc 137 | no transition, rc 0 |
+    | rootless podman, first pull | ENGAGED (CI on `bolt_state.db`) | no transition |
+    | rootless `podman pull python:3.12-slim`, run, rmi | ENGAGED (CI) | no transition |
+    | `docker pull`, `docker run`, `docker rmi` | ENGAGED (DefenseImpairment) → COMBAT (ExfiltrationPattern), dockerd killed, `docker run` rc 125 | no transition, rc 0 |
+    | k3s install, start, uninstall | ENGAGED (PersistenceMechanism) | ENGAGED (PersistenceMechanism) |
+    | apt reinstall, install, an upgrade | no transition | no transition |
+    | `npm install`, `npm ci`, `npm install` in a session | ENGAGED (CI) | ENGAGED (CI from `npm ci` only: `node_modules` replaced) |
+    | `pip install`, `--force-reinstall` | ENGAGED (CI) | ENGAGED (CI from the reinstall only) |
+    | `git clone` (cpython), checkout of another tree | ENGAGED (CI) | ENGAGED (CI from the checkout only) |
+    | sqlite, one database, 400 commits (DELETE, WAL) | ENGAGED (CI) | no transition |
+    | `tar xf`, `tar xf` over the same tree, `rm -rf` | ENGAGED (CI) | ENGAGED (CI from the extraction over the tree only) |
+    | `apt purge podman` | COMBAT locked (AntiTamperDenial on `deb-systemd-helper`) | ALERTED (PackageTamperRefusal); the NN-L-AT-001 records unchanged |
+    | the ransomware simulation from an SSH session (`sudo`), in place then copy-delete | ENGAGED (CI) | ENGAGED (CI from the in-place run); NN-L-IMP-001 twice: the copy-delete is the tracker's, the arm says "not counted" |
+    No benign case reaches COMBAT or a NEUTRALIZE kill on the lot (on
+    `main`: three COMBAT, podman and dockerd killed). The kills left are the
+    rules': R011 (podman 2, docker 1, k3s 8; the apt case's upgrade of
+    open-iscsi 65, lot 279's), R013 and NN-L-FIM-009 on k3s (lot 283's
+    inventory). MS-23 (`ransom-check`): 14 of 14 PASS on `main` and on the
+    lot — in place and copy-delete NN-L-IMP-001 Critical, the kill held,
+    ENGAGED; the nine negatives without one. The lot's cold boot: agent and
+    watchdog active, 69 pins, 40 LSM programs, at once and 30 s later;
+    `verifier-check` on 5.15: 85 programs, 83 OK, 2 not counted, 0 failing;
+    `open-sensor-check` 14 of 14 PASS with its five new kernel cases (one
+    file rewritten 40 times: no event; 25 distinct files: one; one name
+    deleted 30 times: no burst; 25 temporary files created and deleted: no
+    burst; 25 renames onto originals: one burst). Two intermediate rounds
+    (78b2d99b, f86e8d9e) found what the last fixed: podman's CNI flush still
+    recorded (the parent read from the whole ancestry, which a conmon double
+    fork leaves unplaced) and `pip`/`npm` temporary files counted as
+    originals. `main`'s git case was measured in a run of its own (GnuTLS
+    dies of SIGILL in the WHPX guest without `GNUTLS_CPUID_OVERRIDE=0x1`,
+    set in both). `test-ignored` (every privileged test, as root): 89
+    suites, 108 passed, 0 failed.
+  - Mutations: 67 on the new code (the counters' shared logic, the arm,
+    the transaction's refusal, the ladder's hold, NN-L-EVA-002's runtime
+    rule and its parent lookup, the process's own files), each caught by a
+    named test (four survivors of the first set and a compile error got
+    tests or were redone); the eBPF glue is covered
+    on the guest by `open-sensor-check`.
+  - Open: corroboration is per actor scope, not per process tree (future
+    work); copy-then-delete ransomware run from an SSH shell is the
+    ransomware tracker's, not the mass-write arm's (as before);
+    kube-proxy, Calico and Cilium flush their chains from containers (no
+    host package vouches for them): their flushes stay records.
+  - No capability level moves.
