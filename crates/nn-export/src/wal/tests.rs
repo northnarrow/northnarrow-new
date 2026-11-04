@@ -444,3 +444,136 @@ fn cursors_are_saved_atomically_and_read_back() {
     std::fs::write(&p, b"junk").unwrap();
     assert!(Cursors::load(&p).1.is_some());
 }
+
+/// The review of #499, X1: the writer appends a file's terminator, then
+/// renames the file to its archive. A read in between finds the
+/// terminator and no archive yet: it stops at the last row — no row from
+/// the chain's oldest file, no note — and reads on once the rename is done,
+/// the next file's first row carrying that terminator. The batch it sends
+/// then passes the protocol's check of an honest worker's answer.
+#[test]
+fn a_read_inside_the_rotation_window_waits_for_the_rename() {
+    use nn_proto::ipc::{check_rows_out, ExportRows, ExportRowsOut, ExportSink, SinkState};
+    let d = tempfile::tempdir().unwrap();
+    let active = d.path().join("detections.jsonl");
+    write(&active, 0, 30, 1000, 64);
+    let s = src(&active);
+    let all = read_after::<TestHost>(&s, &Cursor::start_of(1), false, ALL, &pk()).unwrap();
+    let last_file = all.rows.iter().map(|r| r.file).max().unwrap();
+    let archived = last_file - 1;
+    assert!(archived >= 2, "two archives at least");
+    // the window: the last archive back as the active file, its terminator
+    // its last line, the file after it not there yet
+    let arch = chainlog::archive_path_for(&active, archived);
+    let newest = d.path().join("newest");
+    std::fs::rename(&active, &newest).unwrap();
+    std::fs::rename(&arch, &active).unwrap();
+    assert_eq!(current_file(&s), archived);
+    let i = all.rows.iter().rposition(|r| r.file == archived).unwrap();
+    let last = &all.rows[i];
+    let cur = Cursor {
+        file: last.file,
+        line: last.line,
+        end: last.end,
+        hash: all.hashes[i].clone(),
+    };
+    for check in [false, true] {
+        let b = read_after::<TestHost>(&s, &cur, check, ALL, &pk()).unwrap();
+        assert!(
+            b.rows.is_empty(),
+            "{} rows from {:?}",
+            b.rows.len(),
+            b.rows.first().map(|r| r.pos())
+        );
+        assert!(b.notes.is_empty(), "{:?}", b.notes);
+        assert_eq!(b.lost, 0);
+        assert_eq!(b.next.as_ref().map(Cursor::pos), Some(cur.pos()));
+    }
+    // a sink a few rows behind reads up to the terminator, and stops
+    let j = all.rows.iter().position(|r| r.file == archived).unwrap();
+    let from = Cursor {
+        file: all.rows[j].file,
+        line: all.rows[j].line,
+        end: all.rows[j].end,
+        hash: all.hashes[j].clone(),
+    };
+    let b = read_after::<TestHost>(&s, &from, false, ALL, &pk()).unwrap();
+    assert!(b
+        .rows
+        .iter()
+        .all(|r| r.file == archived && r.line > from.line));
+    assert_eq!(b.rows.last().map(|r| r.pos()), Some(last.pos()));
+    assert!(b.notes.is_empty());
+    // the rename done: the next file's first row, with its terminator
+    std::fs::rename(&active, &arch).unwrap();
+    std::fs::rename(&newest, &active).unwrap();
+    let b = read_after::<TestHost>(&s, &cur, true, ALL, &pk()).unwrap();
+    assert!(b.notes.is_empty(), "{:?}", b.notes);
+    let first = &b.rows[0];
+    assert_eq!((first.file, first.line), (archived + 1, 1));
+    let t = std::fs::read(&arch).unwrap();
+    let t_line = t[..t.len() - 1].rsplit(|c| *c == b'\n').next().unwrap();
+    assert_eq!(first.rotate.as_deref(), Some(t_line));
+    // what the core sends then, and an honest worker's answer: accepted
+    let req = ExportRows {
+        sink: ExportSink::File,
+        chain: ExportChain::Detections,
+        rows: b.rows.clone(),
+        budget_ms: 1000,
+    };
+    assert_eq!(req.check(), Ok(()));
+    let end = req.rows.last().unwrap().pos();
+    let out = ExportRowsOut {
+        acked: Some(end),
+        committed: Some(end),
+        records: req.rows.len() as u32,
+        unverified: 0,
+        state: SinkState::Up,
+        fault: None,
+        retry_ms: 0,
+    };
+    assert_eq!(check_rows_out(&req, &out), Ok(()));
+}
+
+/// The review of #499, D3: a blank line in a chain is no row any request
+/// carries — it is lost here, counted and noted; the rows around it go,
+/// and a cursor left on it holds at a start.
+#[test]
+fn a_blank_line_is_lost_counted_and_never_sent() {
+    use nn_proto::ipc::{ExportRows, ExportSink};
+    use std::io::Write as _;
+    let d = tempfile::tempdir().unwrap();
+    let active = d.path().join("detections.jsonl");
+    write(&active, 0, 3, 1 << 20, 4);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&active)
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
+    let s = src(&active);
+    let lim = Limits {
+        rows: MAX_EXPORT_ROWS,
+        bytes: MAX_EXPORT_BYTES,
+    };
+    let b = read_after::<TestHost>(&s, &Cursor::start_of(1), false, lim, &pk()).unwrap();
+    assert_eq!(ns(&b), vec![0, 1, 2]);
+    assert_eq!(b.lost, 1);
+    assert_eq!(b.notes, vec![Note::Blank { file: 1, line: 4 }]);
+    let req = ExportRows {
+        sink: ExportSink::File,
+        chain: ExportChain::Detections,
+        rows: b.rows.clone(),
+        budget_ms: 1000,
+    };
+    assert_eq!(req.check(), Ok(()));
+    // the cursor on the blank line holds at a start: nothing read again
+    let next = b.next.unwrap();
+    assert_eq!((next.line, next.hash.as_str()), (4, ""));
+    let again = read_after::<TestHost>(&s, &next, true, lim, &pk()).unwrap();
+    assert!(
+        again.rows.is_empty() && again.notes.is_empty(),
+        "{:?}",
+        again.notes
+    );
+}

@@ -88,6 +88,9 @@ pub enum Note {
     CursorAhead { file: u64 },
     /// A row longer than a request carries: lost to the export.
     Oversize { file: u64, line: u64, bytes: usize },
+    /// A line no request can carry (empty: no row of a chain is): lost
+    /// to the export, never asked of the worker (the review of #499, D3).
+    Blank { file: u64, line: u64 },
 }
 
 /// One read's result.
@@ -177,6 +180,23 @@ fn archived_rows<H: ChainHost>(src: &Source, file: u64, pk: &VerifyingKey) -> Op
         })
 }
 
+/// Whether archive `file` of a rotating chain is on disk.
+fn archived<H: ChainHost>(src: &Source, file: u64) -> bool {
+    H::open_read_nofollow(&chainlog::archive_path_for(&src.active, file)).is_ok()
+}
+
+/// Whether the byte before `end` in `path` ends a line.
+fn ends_a_line(path: &Path, end: u64) -> bool {
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut b = [0u8; 1];
+    end > 0
+        && f.seek(SeekFrom::Start(end - 1)).is_ok()
+        && f.read_exact(&mut b).is_ok()
+        && b[0] == b'\n'
+}
+
 /// The terminator that sealed archive `file` (its last line), verbatim.
 fn terminator_of<H: ChainHost>(src: &Source, file: u64) -> Option<Vec<u8>> {
     let mut f = H::open_read_nofollow(&chainlog::archive_path_for(&src.active, file)).ok()?;
@@ -252,6 +272,8 @@ pub fn read_after<H: ChainHost>(
     let mut cur = from.clone();
     let mut check = check && cur.end > 0;
     let mut bytes = 0usize;
+    // the terminator this read saw sealing a file: (that file, its bytes)
+    let mut carried: Option<(u64, Vec<u8>)> = None;
     // every file this read crosses, at most this many (an evicted run of
     // files counts as one step)
     for _ in 0..64 {
@@ -301,7 +323,13 @@ pub fn read_after<H: ChainHost>(
             } else {
                 src.active.clone()
             };
-            if !chainlog::holds_line_ending_at(&path, cur.end, &cur.hash).unwrap_or(false) {
+            let holds = if cur.hash.is_empty() {
+                // a line skipped (blank, oversize): its end, a line's end
+                ends_a_line(&path, cur.end)
+            } else {
+                chainlog::holds_line_ending_at(&path, cur.end, &cur.hash).unwrap_or(false)
+            };
+            if !holds {
                 out.notes.push(Note::CursorGone {
                     file: cur.file,
                     line: cur.line,
@@ -314,7 +342,7 @@ pub fn read_after<H: ChainHost>(
         r.seek(SeekFrom::Start(cur.end))
             .map_err(|e| WalError(format!("{}: seek: {e}", src.chain.name())))?;
         let mut buf = Vec::new();
-        let mut sealed = false;
+        let mut sealed: Option<Vec<u8>> = None;
         loop {
             if out.rows.len() >= lim.rows || bytes >= lim.bytes {
                 out.next = Some(cur);
@@ -352,8 +380,21 @@ pub fn read_after<H: ChainHost>(
             }
             let line = &buf[..buf.len() - 1];
             if src.chain.rotates() && line.starts_with(b"{\"rotate\":") {
-                sealed = true;
+                sealed = Some(line.to_vec());
                 break;
+            }
+            if line.is_empty() {
+                // no row of a chain is empty: no request carries one (the
+                // core's check refuses it), so it is lost here, counted
+                cur.line += 1;
+                cur.end += n as u64;
+                cur.hash = String::new();
+                out.lost += 1;
+                out.notes.push(Note::Blank {
+                    file: cur.file,
+                    line: cur.line,
+                });
+                continue;
             }
             // the first row of a file after a rotation carries the
             // terminator that sealed the one before
@@ -361,7 +402,15 @@ pub fn read_after<H: ChainHost>(
                 && cur.line == 0
                 && cur.file > 1
                 && line.len() <= MAX_EXPORT_ROW)
-                .then(|| terminator_of::<H>(src, cur.file - 1))
+                .then(|| {
+                    // the one this read saw sealing the file before, else
+                    // the archive's (the review of #499, D2)
+                    carried
+                        .take()
+                        .filter(|(f, _)| *f + 1 == cur.file)
+                        .map(|(_, t)| t)
+                        .or_else(|| terminator_of::<H>(src, cur.file - 1))
+                })
                 .flatten();
             let size = line.len() + rotate.as_ref().map_or(0, Vec::len);
             // a row that would take the request past its bytes waits for the
@@ -395,7 +444,17 @@ pub fn read_after<H: ChainHost>(
             });
             out.hashes.push(cur.hash.clone());
         }
-        if sealed {
+        if let Some(t) = sealed {
+            // the writer appends the terminator to the active file, then
+            // renames it to its archive: read inside that window, the next
+            // file is not there yet — stop at the last row, read on at the
+            // next round (the review of #499, X1: the read went "ahead" of
+            // the chain and back to its oldest file)
+            if !archived::<H>(src, cur.file) {
+                out.next = Some(cur);
+                return Ok(out);
+            }
+            carried = Some((cur.file, t));
             cur = Cursor::start_of(cur.file + 1);
             continue;
         }

@@ -295,6 +295,9 @@ fn note_json(n: &Note) -> serde_json::Value {
         Note::Oversize { file, line, bytes } => {
             serde_json::json!({"note": "oversize", "file": file, "line": line, "bytes": bytes})
         }
+        Note::Blank { file, line } => {
+            serde_json::json!({"note": "blank", "file": file, "line": line})
+        }
     }
 }
 
