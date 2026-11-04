@@ -60,6 +60,7 @@
 #   deploy/lab/nn-lab.sh execq-check     # lab PR 223 (EXPERIMENTAL): exec quarantine at first sight, six cases, guest put back
 #   deploy/lab/nn-lab.sh malsim-exec-check # lab PR 226 (EXPERIMENTAL): exec policy and exec environment, MS-01/02/03/32 before and after, negatives, guest put back
 #   deploy/lab/nn-lab.sh policy-check    # lab PR 236: the signed per-rule policy — MS-23 held built in, killed under `enforce NN-L-IMP-001` (set live, then at boot), a bad policy refused, back to built in
+#   deploy/lab/nn-lab.sh test-one <target> # lot 277: one privileged test target of the agent on a purged pin root
 #   deploy/lab/nn-lab.sh exempt-check    # lot 277: an exemption by unit holds for MS-23 started by systemd in the unit, not for a root shell moved into its cgroup (nor its orphan): killed, the move signed
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh net-check         # lab PR 224: connect-time network verdicts, reverse shells, outbound fan-out (CM-02/03/14)
@@ -1563,6 +1564,17 @@ cmd_policy_check() {
     vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/policy-check.sh'
 }
 
+cmd_test_one() {
+    # Lot 277 (the review of #494, D5): one privileged test target of the
+    # agent (`nn-lab.sh test-one cgroup_join_privileged_e2e`), on a purged
+    # pin root as test-ignored runs it: the tracker's behaviour test, and
+    # its mutations, without the whole suite.
+    vm_running || die "guest is not running"
+    local t=${1:?test target}
+    lab_purge_pins >/dev/null
+    lab_ignored_run 1/1 "$t" "sudo -E env \"PATH=\$PATH\" cargo test --release $LAB_CARGO_LOCKED -p northnarrow-agent --features test-privileged,debug-trigger --test $t -- --ignored --test-threads=1"
+}
+
 cmd_exempt_check() {
     # Lot 277 (deploy/lab/malsim/exempt-check.sh): the per-rule policy's
     # exemption by unit on MS-23 — exempt when systemd starts it as the
@@ -2286,6 +2298,7 @@ case "${1:-help}" in
     malsim-exec-check) cmd_malsim_exec_check ;;
     policy-check)  cmd_policy_check ;;
     exempt-check)  cmd_exempt_check ;;
+    test-one)      shift; cmd_test_one "$@" ;;
     dns-sensor-check) cmd_dns_sensor_check ;;
     ransom-check)  shift; cmd_ransom_check "$@" ;;
     fim-reuse-check) cmd_fim_reuse_check ;;
