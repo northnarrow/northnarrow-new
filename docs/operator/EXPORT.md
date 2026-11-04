@@ -157,6 +157,11 @@ record, the files the bound.
 
 ## 4. What you see
 
+The state is never "on" for an export that does nothing: `failed` when
+its controller is not running (it did not start, or it ended), `degraded`
+when its worker is disabled, unavailable, or away for more than 30 s — the
+status, the beat and the manifest alike.
+
 ```
 $ sudo nn-admin export status --key ops.key
 export: on

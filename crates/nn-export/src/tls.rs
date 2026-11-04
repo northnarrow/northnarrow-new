@@ -235,8 +235,10 @@ pub(crate) mod tests {
         let (sa, sb) = (a.complete(&pb).unwrap(), b.complete(&pa).unwrap());
         assert_eq!(sa.secret_bytes(), sb.secret_bytes());
         assert_eq!(cfg.alpn_protocols.len(), 0);
-        // TLS 1.3 alone, the receiver's chain checked: the handshakes of
-        // `net::tests` (a TLS 1.2 receiver, another CA's, another name's)
+        // TLS 1.3 alone by construction (rustls built without `tls12`,
+        // `with_protocol_versions(TLS13)`, the suites' retain); the
+        // receiver's chain checked: `net::tests`' handshakes against
+        // another CA's certificate and another name's
     }
 
     #[test]
