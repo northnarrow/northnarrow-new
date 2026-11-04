@@ -84,8 +84,7 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
         &[
             "CGROUP_JOIN_EPOCH.get(0)",
             "if epoch == 0 || ptgid == 1 || family(ptgid) {\n        return false;\n    }",
-            "Some(start) => start < epoch,",
-            "None => true,",
+            "leader_start(parent).unwrap_or(0) < epoch",
         ],
     )
     .unwrap();

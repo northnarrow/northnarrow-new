@@ -222,10 +222,10 @@ unsafe fn before_epoch(parent: u64, ptgid: u32) -> bool {
     if epoch == 0 || ptgid == 1 || family(ptgid) {
         return false;
     }
-    match leader_start(parent) {
-        Some(start) => start < epoch,
-        None => true,
-    }
+    // A start unread is 0, before any epoch. Not a `match` on the Option:
+    // LLVM made it a compare of the start register on the unread path too,
+    // which the 5.15 verifier refused (`R1 !read_ok`: lot 277's lab).
+    leader_start(parent).unwrap_or(0) < epoch
 }
 
 #[inline(always)]
