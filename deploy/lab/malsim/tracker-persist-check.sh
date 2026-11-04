@@ -38,7 +38,6 @@ NNADMIN=$(dirname "$(systemctl show -p ExecStart --value northnarrow-agent | gre
 fail=0
 pass() { printf 'PASS  %s\n' "$*"; }
 bad() { printf 'FAIL  %s\n' "$*"; fail=1; }
-at_tty() { script -qec "$*" /dev/null < /dev/null; }
 mover() {   # <cgroup name> <pid file>: a root sleeper that moved itself
     sudo mkdir -p "/sys/fs/cgroup/$1"
     sudo bash -c "echo \$BASHPID > /sys/fs/cgroup/$1/cgroup.procs && echo \$BASHPID > $2 && exec sleep 900" >/dev/null 2>&1 &
@@ -46,6 +45,24 @@ mover() {   # <cgroup name> <pid file>: a root sleeper that moved itself
     sudo cat "$2"
 }
 mark_of() { sudo python3 -I "$MARKS" mark "$1"; }
+# The units refuse a manual stop (RefuseManualStop); inside the window
+# systemd's signals reach them — as lab_purge_pins stops them.
+units_stop() {
+    local u i
+    for u in northnarrow-watchdog northnarrow-agent; do
+        sudo systemctl kill --signal=SIGTERM "$u" 2>/dev/null
+        for i in $(seq 1 30); do
+            [ -z "$(sudo cat /sys/fs/cgroup/system.slice/$u.service/cgroup.procs 2>/dev/null)" ] && break
+            sleep 0.5
+        done
+        sudo systemctl kill --signal=SIGKILL "$u" 2>/dev/null
+        sudo systemctl reset-failed "$u" 2>/dev/null
+    done
+    sleep 1
+}
+units_start() {
+    sudo systemctl start northnarrow-agent; sleep 6; sudo systemctl start northnarrow-watchdog
+}
 since_start() { sudo journalctl -u northnarrow-agent -b --since "$1" --no-pager -o cat 2>/dev/null; }
 
 sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 5; }
@@ -59,8 +76,7 @@ grep -q "^$p1 moved $p1" <<<"$m" && pass "a root process that moved itself: mark
 
 echo "== 2. the agent stopped: the tracker goes on"
 sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 300 >/dev/null 2>&1 || bad "window refused"
-sudo systemctl stop northnarrow-watchdog northnarrow-agent
-sleep 2
+units_stop
 systemctl is-active --quiet northnarrow-agent && bad "the agent still runs"
 links=$(sudo sh -c "ls $dir0" | grep -c '^link_cgroup_join_')
 [[ $links -eq 5 ]] && pass "agent stopped: the tracker's 5 links still pinned in $dir0" || bad "links pinned: $links"
@@ -71,7 +87,7 @@ grep -q "^$p1 moved" <<<"$m1" && pass "the earlier mark kept while stopped" || b
 
 echo "== 3. the agent started again"
 t3=$(date '+%F %T')
-sudo systemctl start northnarrow-agent; sleep 6; sudo systemctl start northnarrow-watchdog
+units_start
 m1=$(mark_of "$p1"); m2=$(mark_of "$p2"); echo "    $m1"; echo "    $m2"
 grep -q "^$p1 moved" <<<"$m1" && grep -q "^$p2 moved" <<<"$m2" && pass "restart: both marks kept" || bad "restart: [$m1] [$m2]"
 j=$(since_start "$t3")
@@ -80,7 +96,9 @@ grep -q "marks reset" <<<"$j" && bad "restart: marks reset [$(grep 'marks reset'
 
 echo "== 4. install.sh --upgrade (the same build)"
 t4=$(date '+%F %T')
-( cd "$TREE" && at_tty sudo ./deploy/install.sh --source-tree --upgrade --grant-key "$KEY" ) >/tmp/nn277-upgrade.log 2>&1
+# script(1) gives sudo the terminal R009 asks of a root exec from a home
+# directory (as nn-lab.sh upgrade-check does); its typescript is the log.
+( cd "$TREE" && script -qec "sudo ./deploy/install.sh --source-tree --upgrade --grant-key $KEY" /tmp/nn277-upgrade.log < /dev/null > /dev/null 2>&1 ); echo "    install.sh --upgrade: rc $?"
 grep -q "UPGRADE complete — health check passed" /tmp/nn277-upgrade.log && pass "upgrade completed" || bad "upgrade: $(grep -E 'UPGRADE|ROLLBACK|FAIL|still loaded' /tmp/nn277-upgrade.log | tail -3 | tr '\n' ' ')"
 grep -E "waiting for NorthNarrow's BPF programs|still loaded|dropping" /tmp/nn277-upgrade.log | cut -c1-160 | sed 's/^/    /'
 sleep 4
@@ -103,10 +121,10 @@ if sudo touch "$dir1/planted" 2>/dev/null; then bad "a new entry in the tracker'
 
 restart_in_window() {   # <what to do with the agent stopped>
     sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 300 >/dev/null 2>&1 || bad "window refused"
-    sudo systemctl stop northnarrow-watchdog northnarrow-agent; sleep 2
+    units_stop
     eval "$1"
     T=$(date '+%F %T')
-    sudo systemctl start northnarrow-agent; sleep 6; sudo systemctl start northnarrow-watchdog
+    units_start
 }
 
 echo "== 6. kernel.threads-max raised, the agent restarted: no reset (R2-a)"
@@ -114,8 +132,7 @@ tm0=$(cat /proc/sys/kernel/threads-max)
 sudo sysctl -q kernel.threads-max=$((tm0 * 2))
 t6=$(date '+%F %T')
 sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 300 >/dev/null 2>&1
-sudo systemctl restart northnarrow-agent; sleep 6
-sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog
+units_stop; units_start
 dir6=$(sudo python3 -I "$MARKS" dir); m1=$(mark_of "$p1"); echo "    $m1 (dir $dir6)"
 j=$(since_start "$t6")
 [[ $dir6 == "$dir1" ]] && pass "threads-max raised: the same tracker directory" || bad "threads-max: $dir1 → $dir6"

@@ -58,6 +58,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `NN_DEBUG_CGROUP_JOINED_ENTRIES` sizes the marks for the privileged
     test of a full map; the lab's `tracker-persist-check` (an agent stop,
     an upgrade, the pins' protection) and `fork-cost`.
+  - The third review of #494: the tracker's directory is named by schema
+    and generation (`…-cgroup-join-v1.<n>`), not by the marks' size — a
+    larger size asked later keeps the map, a signed note; a start adopts
+    only the directory its predecessor of this boot recorded in
+    `/run/northnarrow/cgroup-join-pins` (protected), each map checked
+    with `BPF_OBJ_GET_INFO_BY_FD` (its id, kind, sizes, flags); anything
+    else — the directory gone between two agents, other maps, a directory
+    nobody recorded, an older schema — is a signed reset after which every
+    process started before it, and its forks, are not known
+    (`CGROUP_JOIN_EPOCH`): restart the exempt services; a symbolic link is
+    never a tracker directory, and a purge does not follow one; a planted
+    directory beside the recorded one is removed, signed.
   - `nn-admin host-check` (and the signed manifest's `host_hardening`):
     `kernel_fixes` compares the kernel's upstream version (Ubuntu's
     `version_signature`, Debian's banner, else `osrelease`) with the fixes

@@ -1329,9 +1329,9 @@ tgid's byte. The first version (the review of #494, D2) counted a lost
 mark in a host-wide counter that refused every exemption by cgroup or
 unit until a reboot, and a preallocated map of 32,768 marks any user's
 fork storm under a marked parent could fill. The marks are now a hash map
-allocated as it is filled (`BPF_F_NO_PREALLOC`), its size set at the
-start to `kernel.pid_max` capped by `kernel.threads-max` (32,768 to
-4,194,304): the live thread groups, one mark each at most, are at most
+allocated as it is filled (`BPF_F_NO_PREALLOC`), its size set when it
+is made — the first start of the boot, or a reset — to `kernel.pid_max`
+capped by `kernel.threads-max` (32,768 to 4,194,304): the live thread groups, one mark each at most, are at most
 `threads-max` (a fork past it fails) and at most `pid_max`. Not
 `pid_max` alone: the hash's bucket array is allocated whole, 16 bytes a
 bucket — 64 MiB at the 4,194,304 systemd sets — where `threads-max`
@@ -1357,32 +1357,64 @@ in that thread's cgroup.
 The programs' links are pinned (`prog_cgroup_join_*`,
 `link_cgroup_join_*`, the review of #494, D6), as the other anti-tamper
 programs are: a stopped agent leaves the tracker marking. Their pins and
-the three maps' (`CGROUP_JOINED`, `CGROUP_JOIN_LOST`,
-`CGROUP_JOIN_STATS`) are in a directory of the tracker's own **beside**
-the pin root, not in it — `/sys/fs/bpf/northnarrow-cgroup-join-v<schema>-<entries>`
-(the re-review of #494, R2). `install.sh --upgrade` purges the pin root
-so that every LSM program detaches (`purge_pin_root`); the review's
-version had the tracker's pins there, so an upgrade dropped every mark
-and a root process moved into an exempt unit before it was exempt again
-after it — the "no gap" of that version held for a restart only. Now
-the purge leaves the tracker's directory: its programs go on marking
-through the upgrade, the new agent reuses its maps and swaps its programs
-for its own, one by one, attach before purge (`cgroup_join_mark` before
-`cgroup_join_src`: the new `mark` reads the new, empty source slot until
-the new `src` runs, so it marks more meanwhile, never less — the
-re-review's N-f). The agent lists the tracker's programs as `kept` in
-`/run/northnarrow/bpf-own-ids`: the upgrade does not wait for them to
-unload. The directory's name carries the maps' layout — the schema
-(`PIN_SCHEMA`, raised with any change to a map's key, value or kind) and
-the marks' entries: a start whose layout differs builds new maps in a new
-directory and removes the old one once its own programs run — a signed
-degradation, "cgroup exemptions: marks reset …", never a silent loss. The
-directory and its pins are protected as the pin root and its pins are
-(`register_bpffs_pins`: no new entry, no unlink, rename or setattr by a
-foreign caller outside the trusted-installer window). `uninstall.sh`
-removes it with the pin root and waits for every program, the kept ones
-included. A kernel that refuses the tracker removes its pins; a host
-without bpffs attaches the programs for the agent's life and warns.
+the four maps' (`CGROUP_JOINED`, `CGROUP_JOIN_LOST`, `CGROUP_JOIN_STATS`,
+`CGROUP_JOIN_EPOCH`) are in a directory of the tracker's own **beside**
+the pin root, not in it (the re-review of #494, R2):
+`/sys/fs/bpf/northnarrow-cgroup-join-v<schema>.<generation>`.
+`install.sh --upgrade` purges the pin root so that every LSM program
+detaches (`purge_pin_root`); the review's version had the tracker's pins
+there, so an upgrade dropped every mark. Now the purge leaves the
+tracker's directory: its programs go on marking through the upgrade, and
+the new agent swaps them for its own, one by one, attach before purge
+(`cgroup_join_mark` before `cgroup_join_src`: the new `mark` reads the new,
+empty source slot until the new `src` runs, so it marks more meanwhile,
+never less — the re-review's N-f). The agent lists the tracker's programs
+as `kept` in `/run/northnarrow/bpf-own-ids`: the upgrade does not wait for
+them to unload; `uninstall.sh` removes the directory with the pin root and
+waits for every program.
+
+**What a start adopts** (the third review of #494, R2-a and R2-b). A start
+registers its pins in `/run/northnarrow/cgroup-join-pins` — the boot's
+id, the directory, each map's id and entries — and the agent protects
+that file like its other files (`register_agent_file`: no write, unlink or
+rename by a foreign caller outside the trusted-installer window), and the
+directory like the pin root (`register_bpffs_pins`). The next start
+adopts only that directory, and only when each of its maps is the one
+registered — `BPF_OBJ_GET_INFO_BY_FD` on a read-only handle: the id, and
+this schema's kind, key and value sizes and flags (a hash with
+`BPF_F_NO_PREALLOC` and nothing else for the marks; never an LRU hash, a
+preallocated one, or one read-only to programs) — with no other file in
+the directory. Anything else is a **reset**: new maps in the next
+generation's directory, the old directory removed once the new programs
+run, a signed degradation "cgroup exemptions: marks reset …" — the
+registered directory gone between two agents ("marks lost between
+agents": the third review's point 3, the window between an upgrade's purge
+of the pin root, with which the deny hooks detach, and the new agent's
+start), maps not the registered ones (a directory planted, before the
+first start or inside the window, with a map whose writer keeps an fd), a
+directory no start of this boot registered, an older schema's (not
+migrated: this is the first schema). A directory that is a symbolic link
+is refused, and removed without being followed (R2-d). A tracker
+directory beside adopted pins that nobody registered (planted under the
+name of a later generation) is removed, signed.
+
+**A reset fails closed** (R2-a). The review's version named the
+directory by the marks' size too, so a `sysctl kernel.threads-max` before
+a restart was a reset, and a reset gave every marked process its
+exemption back. The size is now a capacity fixed when the marks are made:
+a host that asks for more later keeps the map — a signed note, and a
+process past it is not known. A reset writes its instant into
+`CGROUP_JOIN_EPOCH` (`[monotonic, boot time]` ns) once the new programs
+run: a process started before it is not known to the agent (its leader's
+start, `/proc/<pid>/stat`, against the boot-time instant), and a fork of
+one — by anyone but PID 1, whose forks are systemd's placement, and the
+family — makes a child that is not known (`before_epoch`, the leader's
+monotonic start against the monotonic instant). Written after the
+attach, it leaves nothing unseen: a process forked before it started
+before it. The exempt services are then refused until they are restarted
+(`UPGRADE_NOTES_WAVE4.md` §7).
+A kernel that refuses the tracker removes its pins; a host without bpffs
+attaches the programs for the agent's life and warns.
 
 ### Residual
 
@@ -1404,15 +1436,17 @@ without bpffs attaches the programs for the agent's life and warns.
   stale scan: a process given one of them moves unmarked (the re-review's
   N-e; it needs that pid reused while no agent runs). A `cgroup_join`
   record of a move made then reaches no journal; the mark is made.
-- **The tracker's pins removed inside the trusted-installer window**, or
-  between an upgrade's purge of the pin root (the deny hooks detach with
-  it) and the new agent's start: the new agent finds no directory and
-  builds new maps, with no "marks reset" to say so. Both need the window
-  a signed, audited grant opens; a reboot removes them too, with every
-  process.
+- **Inside the trusted-installer window** (a signed, audited grant), or
+  between an upgrade's purge of the pin root and the new agent's start
+  (the deny hooks detach with the purge), root can replace both the
+  tracker's pins and their record in `/run/northnarrow`: a planted map
+  registered by a forged record is adopted. The window trusts its holder.
+  The pins removed then are signed ("marks lost between agents"), and a
+  reboot removes them with every process.
 - **A downgrade to a version before lot 277** leaves the tracker's
   programs attached and marking — harmless, nothing reads the marks —
-  until `uninstall.sh` or a reboot.
+  until `uninstall.sh` or a reboot. (No release pinned them in the pin
+  root itself.)
 - **cgroup's `favordynmods`** (kernel 6.18+, `cgroup_enable_per_threadgroup_rwsem`,
   v6.18 `kernel/cgroup/cgroup.c:1344-1356`, `:3096-3103`): a move takes
   only the target group's rwsem and looks the pid up before it; the
@@ -1425,13 +1459,17 @@ without bpffs attaches the programs for the agent's life and warns.
   field: not seen to fail): the writer's own is set not known, another
   task's — a moved one, a forked child — is only counted, with no group
   to set (the re-review's N-b).
-- **The marks' size is the start's**: `kernel.pid_max` or
-  `kernel.threads-max` raised later leave the map as it was until the
-  next start (a new size: a new directory, marks reset, signed); a fork
+- **The marks' size is the first start's of the boot**: `kernel.pid_max`
+  or `kernel.threads-max` raised later leave the map as it was, a signed
+  note at each start (the third review's R2-a: never a reset); a fork
   storm past `threads-max` by the number of CPUs (the check comes before
   the fork completes) and dead groups' marks take entries too. In every
   case only the groups that ask for a mark become not known — a service
   systemd starts asks for none (the re-review's N-g).
+- **After a reset**, every process started before it — the exempt
+  services among them, and what they fork — is refused an exemption by
+  cgroup or unit until it exits: restart the exempt services. That is the
+  price of failing closed; a reset is signed.
 - **A non-leader thread rewriting its own process into its cgroup**
   (`cgroup.procs` with its tgid, or `0`): the leader moves, not the
   writing thread, so it is marked — a false refusal for a multi-threaded

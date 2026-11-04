@@ -115,15 +115,24 @@ signed without a name while any such exemption is in force.
 
 The tracker's programs and maps are pinned like the other anti-tamper
 programs (the review of #494, D6), in a directory of their own beside the
-pin root: `/sys/fs/bpf/northnarrow-cgroup-join-v<schema>-<entries>` (the
-re-review of #494, R2). Stopping the agent leaves them attached, and the
-marks go on being made and passed on; `install.sh --upgrade` purges the
-pin root and leaves this directory, so the marks outlive an upgrade too;
-a new start attaches its programs before it removes the old links. A
-start whose maps' layout differs (a new schema, a new size) builds new
-maps and removes the old directory: a signed degradation, "cgroup
-exemptions: marks reset …". `uninstall.sh` removes the directory with the
-pin root.
+pin root: `/sys/fs/bpf/northnarrow-cgroup-join-v<schema>.<generation>`
+(the re-review of #494, R2), recorded in
+`/run/northnarrow/cgroup-join-pins`. Stopping the agent leaves them
+attached, and the marks go on being made and passed on; `install.sh
+--upgrade` purges the pin root and leaves this directory, so the marks
+outlive an upgrade too; a new start attaches its programs before it
+removes the old links. A start adopts only the directory its predecessor
+of this boot recorded, each map the one recorded (the third review of
+#494, R2-b). Anything else — the directory gone between two agents, maps
+that are not the recorded ones, a directory nobody recorded, an older
+schema's — is a **reset**: new maps, a signed degradation "cgroup
+exemptions: marks reset …" (or "marks lost between agents"), and every
+process started before that start, with what it forks, is not known —
+refused an exemption by cgroup or unit until it exits. **Restart the
+exempt services** after one. `kernel.pid_max` or `kernel.threads-max`
+raised later is no reset (R2-a): the marks keep their capacity, signed
+as below the host's. `uninstall.sh` removes the directory with the pin
+root.
 
 Where the exemption is refused:
 
@@ -136,10 +145,13 @@ Where the exemption is refused:
   and what it forks after, until its thread group ends (its byte in the
   pinned `CGROUP_JOIN_LOST`, 4 MiB, written with plain stores: the
   re-review of #494, R1); every other process's exemption stands. The
-  marks are sized at the start to hold every thread group the host can run
-  at once (`kernel.pid_max`, capped by `kernel.threads-max`; 32,768 to
-  4,194,304; allocated as they are taken), so a failed insert is a kernel
-  out of memory, not a full map. It is never silent: counted in the start's
+  marks are sized when they are made (the first start of the boot) to
+  hold every thread group the host can run at once (`kernel.pid_max`,
+  capped by `kernel.threads-max`; 32,768 to 4,194,304; allocated as they
+  are taken), so a failed insert is a kernel out of memory or a limit
+  raised since, not a full map of live processes;
+- after a reset of the marks (above): every process started before it, and
+  what it forks, until it exits; It is never silent: counted in the start's
   journal line (`marks lost`). Why per process (the review of #494, D2):
   a state for the whole host, which any user's fork storm might reach,
   would switch off every exemption by cgroup or unit until a reboot;
@@ -182,10 +194,9 @@ What it does not cover, as measured:
   every kind of exemption covers what the process then does — `exe <path>
   sha256 <hex>` too, which is the file's digest, not the memory's.
 - A move made before the agent's first start since the host booted (no
-  program ran). The tracker's directory removed inside the
-  trusted-installer window, or between an upgrade's purge and the new
-  agent's start: new maps, no "marks reset" (the window is a signed,
-  audited grant). On a 6.18+ kernel with cgroup2 mounted `favordynmods`
+  program ran). Inside the trusted-installer window (a signed, audited
+  grant; an upgrade's), root can replace both the tracker's pins and
+  their record: the window trusts its holder. On a 6.18+ kernel with cgroup2 mounted `favordynmods`
   (not systemd's default), a move of a dead group can mark its pid after
   a new process took it: a false refusal. While no agent runs, the last agent's and watchdog's pids
   stay the agent's family until the next start evicts them (pinned

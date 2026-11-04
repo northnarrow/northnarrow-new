@@ -191,8 +191,10 @@ start — left the host without a working agent. What it does now, in order:
    (`/sys/fs/bpf/northnarrow-cgroup-join-v*`, lot 277): the upgrade leaves
    them, its programs go on marking, and the script does not wait for
    them (`kept` in `bpf-own-ids`); the new agent swaps them for its own,
-   or — when the maps' layout changed — builds new ones, a signed "marks
-   reset";
+   or — when the recorded pins are gone or not as recorded, or of an older
+   schema — builds new ones, a signed "marks reset", after which every
+   process started before it is not known: restart the exempt services
+   (`UPGRADE_NOTES_WAVE4.md` §7);
 5. **switches** the binaries and units: each new file is staged next to
    the installed one (`<path>.nn-new`, same directory, same file system),
    compared with its source, then renamed over it (`rename(2)`): every path

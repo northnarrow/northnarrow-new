@@ -44,7 +44,10 @@ int main(int argc, char **argv) {
     return 0;
 }
 C
+# The agent kills a program run from /tmp (R001): the bench goes in a
+# root-owned system tree for the run.
 cc -O2 -o $B $B.c || { echo "FAIL  no C compiler"; exit 1; }
+sudo install -m 0755 $B /usr/local/libexec/nn277-forkbench && rm -f $B && B=/usr/local/libexec/nn277-forkbench
 median() { sort -n | awk '{a[NR]=$1} END {print (NR%2 ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2)}'; }
 CPU=$(( $(nproc) > 1 ? 1 : 0 ))
 bench() { for _ in $(seq 1 "$ROUNDS"); do taskset -c "$CPU" $B "$N"; done; }
@@ -97,7 +100,12 @@ grep -q " -$" <<<"$probe" || { echo "FAIL  the tracker still marks with its link
 off=$(bench | tr '\n' ' '); m_off=$(tr ' ' '\n' <<<"$off" | grep . | median)
 echo "    tracker detached:   $off (median $m_off)"
 t2=$(date '+%F %T')
-sudo systemctl restart northnarrow-agent; sleep 6
+for u in northnarrow-watchdog northnarrow-agent; do
+    sudo systemctl kill --signal=SIGTERM "$u" 2>/dev/null
+    for i in $(seq 1 30); do [ -z "$(sudo cat /sys/fs/cgroup/system.slice/$u.service/cgroup.procs 2>/dev/null)" ] && break; sleep 0.5; done
+    sudo systemctl kill --signal=SIGKILL "$u" 2>/dev/null; sudo systemctl reset-failed "$u" 2>/dev/null
+done
+sudo systemctl start northnarrow-agent; sleep 6
 sudo journalctl -u northnarrow-agent -b --since "$t2" --no-pager -o cat | grep -q "start-in-cgroup tracker is attached" || { echo "FAIL  the tracker did not attach again"; fail=1; }
 probe=$(moved_marked)
 echo "    agent restarted; a move now: [$probe] (attached: marked)"
@@ -106,5 +114,5 @@ on2=$(bench | tr '\n' ' '); m_on2=$(tr ' ' '\n' <<<"$on2" | grep . | median)
 echo "    tracker attached:   $on2 (median $m_on2)"
 echo "RESULT wall: attached $m_on1 / $m_on2 ns, detached $m_off ns a fork + exit + wait (medians of $ROUNDS rounds of $N)"
 sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog
-rm -f $B $B.c
+sudo rm -f /usr/local/libexec/nn277-forkbench; rm -f /tmp/nn277-forkbench /tmp/nn277-forkbench.c
 exit $fail
