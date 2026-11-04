@@ -16,6 +16,16 @@
 //! strongest response any match allows, so another rule's kill on the same
 //! event still runs.
 //!
+//! **The decision of 03/11/2026 (lot 278; coordinator, delegated by the
+//! founder) changes the rule above for three cases only**: R009's kill,
+//! and R001's and R003's of an exec by root (uid 0) from `/tmp` or
+//! `/var/tmp` — kills that existed before — run in COMBAT only, held by
+//! the posture ([`super::posture_floor`], [`hold_below_posture`]) and not
+//! by a switch; a signed `enforce` gives them back in every posture. A
+//! posture hold counts as a switch's for the legacy first match: it never
+//! stands in for another rule's kill of the same exec (R011–R013, R017
+//! still kill a root exec from those directories in every posture).
+//!
 //! Lab PR 236 wired the switches to the signed per-rule response policy
 //! ([`super::rule_policy`]): the constants below are its built-in defaults.
 //! [`PolicySwitch::hold`] keeps the response it held ([`take_held`]); the
@@ -61,6 +71,7 @@ impl PolicySwitch {
             action: v.action.clone(),
             reasoning: v.reasoning.clone(),
             switch: self.held,
+            by_posture: false,
         };
         v.reasoning = format!(
             "{} [held back: {} — alert only, by default, until the signed per-rule response \
@@ -83,6 +94,44 @@ pub struct Held {
     pub action: ResponseAction,
     pub reasoning: String,
     pub switch: &'static str,
+    /// Lot 278: held by the posture the event was judged in
+    /// ([`super::posture_floor`]), not by a switch: what the record's
+    /// reasoning names. For the legacy first match it counts as a switch's
+    /// hold (review of #493, A1): it lets a later rule's response through,
+    /// never stands in for it.
+    pub by_posture: bool,
+}
+
+/// Lot 278: hold `v`'s response because the posture `posture` is below
+/// `floor`, the lowest the rule's built-in kill runs in: its action becomes
+/// `Log`, its reasoning says what was held and why, and the engine is told
+/// ([`take_held`], [`Held::by_posture`]); a signed `enforce` gives the
+/// response back. `v` unchanged when its action is already `Log`.
+pub fn hold_below_posture(
+    mut v: Verdict,
+    held: &'static str,
+    posture: nn_model::posture_types::PostureKind,
+    floor: nn_model::posture_types::PostureKind,
+) -> Verdict {
+    if v.action == ResponseAction::Log {
+        return v;
+    }
+    let original = Held {
+        action: v.action.clone(),
+        reasoning: v.reasoning.clone(),
+        switch: held,
+        by_posture: true,
+    };
+    v.reasoning = format!(
+        "{} [held back: {held} — the posture is {posture}, the kill runs in {floor}, or under a \
+         signed per-rule `enforce`]",
+        v.reasoning
+    );
+    v.action = ResponseAction::Log;
+    HELD.with(|h| {
+        h.borrow_mut().get_or_insert(original);
+    });
+    v
 }
 
 thread_local! {

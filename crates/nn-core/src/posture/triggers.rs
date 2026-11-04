@@ -1325,7 +1325,10 @@ enum StagedExec {
 /// proper executed by root whose run covers the exec), no longer any
 /// `mandb` or package manager in the lineage. Not gated by the auth
 /// lineage: a sudo-spawned process running `/tmp/payload` is raised like
-/// any other. R001..R003 still kill the exec, whatever the posture.
+/// any other. R001..R003 still kill the exec, whatever the posture — but
+/// an exec by root from `/tmp` or `/var/tmp` (R001, R003), as R009's own,
+/// waits for COMBAT: the decision of 03/11/2026, lot 278
+/// ([`crate::decision::posture_floor`]). The trigger raised here is not.
 fn staging_exec<H: PostureAgent>(
     focal: &Event,
     auth: &AuthSessionTracker<H>,

@@ -44,6 +44,26 @@ pub struct WindowGrant {
     pub key_id: String,
     /// The window's deadline, wall clock (UTC, RFC 3339 to the second).
     pub expires_at: String,
+    /// Lot 278: the installer the window was granted to — the process that
+    /// ran `nn-admin trusted-installer-grant` (the requester's parent) —
+    /// when the agent could tell it. R009 records, at Low, what that
+    /// process's own tree executes from a home or `/tmp` while the window
+    /// is open, after the grant: the tree by lineage from that process
+    /// (its pid and its start), never by a name or a path.
+    pub grantee: Option<WindowGrantee>,
+}
+
+/// Lot 278: the process a trusted-installer window was granted to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowGrantee {
+    pub pid: u32,
+    /// Its start, `starttime` (field 22) of `/proc/<pid>/stat`, in clock
+    /// ticks since boot: with the pid, the process itself (a pid reused
+    /// since names another start).
+    pub start_ticks: u64,
+    /// When the window was granted to it (`CLOCK_MONOTONIC` ns, the clock
+    /// of the exec events): what its tree executed before is not covered.
+    pub granted_ns: u64,
 }
 
 /// Hard ceiling on a grant window. A grant whose `window_secs` exceeds

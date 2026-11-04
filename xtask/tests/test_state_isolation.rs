@@ -131,7 +131,9 @@ const HOST_PATH_USERS: &[(&str, &str)] = &[
     ),
     (
         "agent/tests/response_privileged_e2e.rs",
-        "purges the pin root before its agent starts",
+        "purges the pin root before its agent starts; reads the metadata of the host's \
+         rule-policy.local and its .sig before and after each test, to fail one that changed \
+         them (lot 278: its policy goes in its own directory)",
     ),
     (
         "agent/tests/chain_format_pin.rs",
