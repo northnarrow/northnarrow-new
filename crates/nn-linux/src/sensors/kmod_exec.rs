@@ -148,6 +148,13 @@ fn environment(pid: u32, start_ns: u64) -> Result<(), String> {
     if let Err(e) = read {
         return Err(format!("its environment could not be read ({e})"));
     }
+    judged(&env, memory)
+}
+
+/// What an environment read whole (`env`, at most [`MAX_ENVIRON`] + 1
+/// bytes) from a process that showed its memory after the read (`memory`)
+/// says.
+fn judged(env: &[u8], memory: bool) -> Result<(), String> {
     if env.len() as u64 > MAX_ENVIRON {
         return Err(format!(
             "its environment is larger than {MAX_ENVIRON} bytes: not read whole"
@@ -314,6 +321,21 @@ mod tests {
         assert!(!has_memory("4242 no parenthesis"));
         let own = std::fs::read_to_string("/proc/self/stat").unwrap();
         assert!(has_memory(&own));
+    }
+
+    /// An environment read empty is a real one while the process shows its
+    /// memory after the read, an exiting process's otherwise; what is read
+    /// is judged whole.
+    #[test]
+    fn what_was_read_is_judged() {
+        assert_eq!(judged(b"", true), Ok(()));
+        assert!(judged(b"", false).unwrap_err().contains("exiting"));
+        assert_eq!(judged(b"PATH=/bin\0", false), Ok(()));
+        let why = judged(b"PATH=/bin\0MODPROBE_OPTIONS=-C x\0", true).unwrap_err();
+        assert!(why.contains("MODPROBE_OPTIONS='-C x'"), "{why}");
+        let big = vec![b'x'; MAX_ENVIRON as usize + 1];
+        assert!(judged(&big, true).unwrap_err().contains("larger than"));
+        assert_eq!(judged(&big[..MAX_ENVIRON as usize], true), Ok(()));
     }
 
     /// Another user's process, which an unprivileged reader may not read
