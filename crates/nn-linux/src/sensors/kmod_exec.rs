@@ -8,8 +8,11 @@
 //! - whether the process's environment holds `MODPROBE_OPTIONS`, which kmod
 //!   puts in front of its command line and the sensor does not see:
 //!   `/proc/<pid>/environ`, tied to the exec by a pidfd and the process's
-//!   start. Gone before it was read, its pid another's, empty, unreadable:
-//!   said so, and R011 kills (nothing told it apart).
+//!   start. Gone before it was read, its pid another's, exiting (its memory
+//!   gone), unreadable: said so, and R011 kills (nothing told it apart). An
+//!   empty environment read from the running process is one: libxtables
+//!   runs `modprobe` with none (`posix_spawn(…, argv, NULL)`; lot 279's lab,
+//!   iptables-legacy on Ubuntu 24.04).
 //!
 //! On the exec pump's thread, first, before the event goes on the bus, for
 //! the execs whose `comm` is a module tool's only: a dozen `stat`s, one
@@ -134,6 +137,11 @@ fn environment(pid: u32, start_ns: u64) -> Result<(), String> {
     let mut env = Vec::new();
     let read = std::fs::File::open(format!("/proc/{pid}/environ"))
         .and_then(|f| f.take(MAX_ENVIRON + 1).read_to_end(&mut env));
+    // after the read: a process past its exit reads an empty environment
+    // (its memory gone) before its pidfd says it exited
+    let memory = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .is_some_and(|stat| has_memory(&stat));
     if pidfd_exited(&fd) {
         return Err("it exited while its environment was read".to_string());
     }
@@ -145,9 +153,9 @@ fn environment(pid: u32, start_ns: u64) -> Result<(), String> {
             "its environment is larger than {MAX_ENVIRON} bytes: not read whole"
         ));
     }
-    if env.is_empty() {
+    if env.is_empty() && !memory {
         return Err(
-            "its environment read empty (as a process past its exit reads): nothing tells it \
+            "it was exiting when its environment was read (its memory gone): nothing tells it \
              from one that set MODPROBE_OPTIONS"
                 .to_string(),
         );
@@ -163,6 +171,19 @@ fn environment(pid: u32, start_ns: u64) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// `/proc/<pid>/stat` (`stat`) shows a process with its memory: running
+/// (not a zombie), its virtual size (field 23) not 0 — a process past
+/// `exit_mm` shows 0.
+fn has_memory(stat: &str) -> bool {
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    let mut fields = rest.split_whitespace();
+    let state = fields.next().unwrap_or("Z");
+    let vsize = fields.nth(19).and_then(|v| v.parse::<u64>().ok());
+    !matches!(state, "Z" | "X" | "x") && vsize.is_some_and(|v| v > 0)
 }
 
 #[cfg(test)]
@@ -202,8 +223,9 @@ mod tests {
     }
 
     /// The environment is read at the exec: `MODPROBE_OPTIONS` named with
-    /// its value, a clean one passes; a start that is not the exec's, an
-    /// unknown start, a process gone or an empty environment do not.
+    /// its value, a clean one and an empty one (libxtables' modprobe) pass;
+    /// a start that is not the exec's, an unknown start, a process gone or
+    /// exited do not.
     #[test]
     fn the_environment_is_read_from_the_exec_s_process() {
         let clean = sleeper(&[("PATH", "/usr/bin:/bin"), ("LANG", "C")]);
@@ -235,9 +257,9 @@ mod tests {
         assert_eq!(environment(other.id(), started(&other)), Ok(()));
         stop(other);
 
+        // none at all, as libxtables runs modprobe: read, nothing in it
         let empty = sleeper(&[]);
-        let why = environment(empty.id(), started(&empty)).unwrap_err();
-        assert!(why.contains("read empty"), "{why}");
+        assert_eq!(environment(empty.id(), started(&empty)), Ok(()));
         stop(empty);
 
         // exited, not yet reaped (a zombie still holds its pid and start)
@@ -269,6 +291,29 @@ mod tests {
         let why = environment(large.id(), started(&large)).unwrap_err();
         assert!(why.contains("larger than 1048576 bytes"), "{why}");
         stop(large);
+    }
+
+    /// A process past `exit_mm` (its virtual size 0) or a zombie shows no
+    /// memory; a running one does (a `(comm)` with spaces and parentheses
+    /// read whole).
+    #[test]
+    fn a_process_without_its_memory_is_seen_so() {
+        let fields = |state: &str, vsize: &str| {
+            let mut f = vec!["1"; 20];
+            f[0] = state;
+            f.push(vsize);
+            f.push("9");
+            format!("4242 (mod probe) (x) {}", f.join(" "))
+        };
+        assert!(has_memory(&fields("R", "1236992")));
+        assert!(has_memory(&fields("S", "1")));
+        assert!(!has_memory(&fields("R", "0")));
+        assert!(!has_memory(&fields("Z", "1236992")));
+        assert!(!has_memory(&fields("X", "1236992")));
+        assert!(!has_memory(&fields("R", "-")));
+        assert!(!has_memory("4242 no parenthesis"));
+        let own = std::fs::read_to_string("/proc/self/stat").unwrap();
+        assert!(has_memory(&own));
     }
 
     /// Another user's process, which an unprivileged reader may not read

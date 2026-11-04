@@ -758,7 +758,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   them), of another mount namespace; `MODPROBE_OPTIONS` in the process's
   environment, or an environment the exec pump could not read at the exec
   (`/proc/<pid>/environ` tied to the exec by a pidfd and the start time:
-  gone, empty, another process's); an argv the kernel did not read whole.
+  gone, exiting, another process's — an empty one read from the running
+  process is one: libxtables runs `modprobe` with none); an argv the kernel
+  did not read whole.
   Recorded otherwise (High, T1547.006, the names said): whether a name
   loads anything, and what, is the kernel's to judge at the load — R018
   records it, after the fact (its hook observes and denies nothing); the

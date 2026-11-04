@@ -10,9 +10,10 @@
 //! - **the environment**: the process's `/proc/<pid>/environ`, tied to the
 //!   exec by its start time, holds no `MODPROBE_OPTIONS` — options kmod
 //!   puts in front of the command line (`-d`, `-C`, `--`…), which the
-//!   sensor does not see. Present: killed; unreadable or empty (the
-//!   process gone before the pump read it, its pid another's): killed,
-//!   nothing told it apart.
+//!   sensor does not see. Present: killed; unreadable (the process gone
+//!   or exiting before the pump read it, its pid another's): killed,
+//!   nothing told it apart. An empty environment read from the running
+//!   process is one (libxtables runs `modprobe` with none).
 //!
 //! The core reads none of it (nn-linux's `sensors::kmod_exec` does, on the
 //! exec pump's thread, for the execs of a module tool only); the answer is
