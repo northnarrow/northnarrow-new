@@ -334,13 +334,17 @@ fi
 # ── MS28: "no DNS, no connect" (lot 275, NN-L-NET-028) ────────────────
 # A documentation address (RFC 5737 / 3849): no LAN uses it, the rule
 # judges it public, and nothing answers there (the connects time out).
+# The lab's blocklist covers these ranges: NN-L-NET-001 is the record's
+# rule and NN-L-NET-028 one of its `matches` (--in-matches). Each client
+# runs in the foreground of its `&` (no `timeout` wrapper): `$!` is its pid,
+# the record's principal.
 if want MS28; then
     b=$(det_count)
-    timeout 6 curl -s -m 3 -o /dev/null http://203.0.113.5:18080/ &
+    curl -s -m 3 -o /dev/null http://203.0.113.5:18080/ &
     p=$!; wait $p
     sleep 2
-    n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --severity Medium --action Log --pid "$p")
-    k=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --action KillProcess)
+    n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --in-matches --severity Medium --action Log --pid "$p")
+    k=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --in-matches --action KillProcess)
     ok=1; [[ $n -ge 1 && $k -eq 0 ]] && ok=0
     outcome MS28 $ok "a TCP connect to 203.0.113.5 with no lookup: NET-028 records=$n (Medium, Log; kills=$k)" \
         "a literal-IP connect draws no NET-028"
@@ -348,33 +352,33 @@ if want MS28; then
     python3 -I -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b"nn-ms", ("203.0.113.9", 18081))' &
     p=$!; wait $p
     sleep 3
-    n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --pid "$p")
+    n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --in-matches --pid "$p")
     ok=1; [[ $n -ge 1 ]] && ok=0
     outcome MS28 $ok "a UDP send to 203.0.113.9 with no lookup: NET-028 records=$n" "a literal-IP UDP send draws no NET-028"
     b=$(det_count)
-    timeout 6 curl -s -6 -m 3 -o /dev/null "http://[2001:db8::5]:18080/" &
+    curl -s -6 -m 3 -o /dev/null "http://[2001:db8::5]:18080/" &
     p=$!; wait $p
     sleep 2
-    n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --pid "$p")
+    n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --in-matches --pid "$p")
     ok=1; [[ $n -ge 1 ]] && ok=0
     outcome MS28 $ok "an IPv6 connect to 2001:db8::5 with no lookup: NET-028 records=$n" "a literal-IPv6 connect draws no NET-028"
     # a resolved connect: the process received the response (stub) or asked
     # the name (nss-resolve) — no record
     if getent ahostsv4 example.com >/dev/null 2>&1; then
         b=$(det_count)
-        timeout 12 curl -s -4 -m 8 -o /dev/null http://example.com/ &
+        curl -s -4 -m 8 -o /dev/null http://example.com/ &
         p=$!; wait $p
         sleep 2
-        n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --pid "$p")
+        n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --in-matches --pid "$p")
         ok=1; [[ $n -eq 0 ]] && ok=0
         outcome MS28 $ok "a connect to example.com, resolved by curl itself: NET-028 records=$n" \
             "a resolved connect draws NET-028"
         if getent ahostsv4 203-0-113-5.nip.io >/dev/null 2>&1; then
             b=$(det_count)
-            timeout 6 curl -s -4 -m 3 -o /dev/null http://203-0-113-5.nip.io:18080/ &
+            curl -s -4 -m 3 -o /dev/null http://203-0-113-5.nip.io:18080/ &
             p=$!; wait $p
             sleep 2
-            n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --pid "$p")
+            n=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --in-matches --pid "$p")
             ok=1; [[ $n -ge 1 ]] && ok=0
             outcome MS28 $ok "a connect to 203-0-113-5.nip.io (a name that spells its address): NET-028 records=$n" \
                 "a name that only spells its address counts as resolved"
@@ -412,13 +416,16 @@ if want MS30; then
     for _ in $(seq 5); do getent ahosts example.com >/dev/null 2>&1; getent ahosts localhost.localdomain >/dev/null 2>&1; sleep 1; done
     line=""
     for _ in $(seq 75); do
-        line=$(journal_since "$t0" 'source="?dns_answer"?.*records read since the last summary' | tail -1)
+        # the summary's message comes before its fields
+        line=$(journal_since "$t0" 'records read since the last summary.*source="?dns_answer"?' | tail -1)
         [[ -n $line ]] && break
         sleep 1
     done
-    ok=1; [[ -n $line ]] && ok=0
+    # at least one response decoded (its question and records)
+    dec=$(echo "$line" | grep -oE 'decoded=[0-9]+' | cut -d= -f2)
+    ok=1; [[ -n $line && ${dec:-0} -ge 1 ]] && ok=0
     outcome MS30 $ok "the DNS response pump's summary: $(echo "$line" | grep -oE 'records=[0-9]+ decoded=[0-9]+.*' | cut -c1-160)" \
-        "no DNS response recorded"
+        "no DNS response recorded and decoded"
 fi
 
 # ── MS31: a TLS client's fingerprint on its flow (lot 275, C07) ───────

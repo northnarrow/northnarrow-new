@@ -1138,7 +1138,7 @@ fn net_connect_without_dns_is_recorded_and_a_resolved_one_is_not() {
     let resolved = r#"
 import os, socket, struct, sys
 q = struct.pack(">HHHHHH", 0x4e42, 0x0100, 1, 0, 0, 0)
-q += b"resolvednorthnarrow-e2einvalid " + struct.pack(">HH", 1, 1)
+q += b"\x08resolved\x0fnorthnarrow-e2e\x07invalid\x00" + struct.pack(">HH", 1, 1)
 u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 u.settimeout(5)
 u.sendto(q, ("127.0.0.2", 53))

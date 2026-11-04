@@ -228,18 +228,37 @@ def printable(s):
     return "".join(c if c.isprintable() and c != " " else "_" for c in s)
 
 
-def matches(r, rules, severity, action, prefix, pid):
-    if rules and r["rule_id"] not in rules:
-        return False
-    if severity and r.get("severity") != severity:
-        return False
-    if action and action_of(r) != action:
-        return False
+def views(r, in_matches):
+    """(rule, severity, action, pid) of the record, then, with `in_matches`,
+    of each rule its `matches` lists (lot 275: one event that several rules
+    match is one record, under the gravest; NN-L-NET-028 under the lab's
+    blocklist rule NN-L-NET-001 for a documentation address)."""
+    yield r["rule_id"], r.get("severity"), action_of(r), pid_of(r)
+    if not in_matches:
+        return
+    for m in r.get("matches") or []:
+        if not isinstance(m, dict) or not isinstance(m.get("rule_id"), str):
+            continue
+        a = m.get("action")
+        p = m.get("pid")
+        yield (m["rule_id"], m.get("severity"), a if isinstance(a, str) else "?",
+               p if isinstance(p, int) else pid_of(r))
+
+
+def matches(r, rules, severity, action, prefix, pid, in_matches=False):
     if prefix and not network_of(r).startswith(prefix):
         return False
-    if pid is not None and pid_of(r) != pid:
-        return False
-    return True
+    for rule, sev, act, p in views(r, in_matches):
+        if rules and rule not in rules:
+            continue
+        if severity and sev != severity:
+            continue
+        if action and act != action:
+            continue
+        if pid is not None and p != pid:
+            continue
+        return True
+    return False
 
 
 def cmd_records(argv, stdin):
@@ -248,9 +267,14 @@ def cmd_records(argv, stdin):
         return 2
     sub, rest = argv[0], argv[1:]
     rules, severity, action, prefix, pid = [], None, None, None, None
+    in_matches = False
     i = 0
     while i < len(rest):
         flag = rest[i]
+        if flag == "--in-matches":
+            in_matches = True
+            i += 1
+            continue
         if i + 1 >= len(rest):
             print("missing value for %s" % flag, file=sys.stderr)
             return 2
@@ -271,10 +295,10 @@ def cmd_records(argv, stdin):
         i += 2
     recs = records(stdin)
     if sub == "count":
-        print(sum(1 for r in recs if matches(r, rules, severity, action, prefix, pid)))
+        print(sum(1 for r in recs if matches(r, rules, severity, action, prefix, pid, in_matches)))
         return 0
     for r in recs:
-        if matches(r, rules, severity, action, prefix, pid):
+        if matches(r, rules, severity, action, prefix, pid, in_matches):
             print("%s %s %s %d %s" % (printable(r["rule_id"]), printable(str(r.get("severity"))),
                                       printable(action_of(r)), pid_of(r),
                                       printable(network_of(r)) or "-"))
@@ -337,6 +361,24 @@ def selftest():
     check(count(["R020_ShellWithSocketStdio"], None, None, "stdio tcp 127.0.0.1:44401 outbound", 77) == 1,
           "count by every filter")
     check(count(["NN-L-NET-027_OutboundAuthBruteforce"], None, None, None, None) == 0, "no such rule")
+    # lot 275: NN-L-NET-028 under the blocklist rule of the same event
+    merged = records([json.dumps({
+        "rule_id": "NN-L-NET-001_OutboundToBlockedIp", "severity": "Critical",
+        "verdict": {"Rule": "KillProcessTree"}, "principal": {"pid": 4566},
+        "network": "tcp 203.0.113.5:18080 connect",
+        "matches": [
+            {"rule_id": "NN-L-NET-001_OutboundToBlockedIp", "action": "KillProcessTree",
+             "severity": "Critical", "pid": 4566},
+            {"rule_id": "NN-L-NET-028_ConnectWithoutDns", "action": "Log", "severity": "Medium",
+             "pid": 4566, "held_action": "KillProcess"},
+            "not an object",
+        ]})])[0]
+    n28 = ["NN-L-NET-028_ConnectWithoutDns"]
+    check(not matches(merged, n28, None, None, None, None), "a match is not the record's rule by default")
+    check(matches(merged, n28, "Medium", "Log", None, 4566, True), "--in-matches: the match's severity and action")
+    check(not matches(merged, n28, "Critical", None, None, None, True), "--in-matches: not the record's severity")
+    check(not matches(merged, n28, None, "KillProcess", None, None, True), "--in-matches: a held kill is Log")
+    check(not matches(merged, n28, None, None, None, 1, True), "--in-matches: another pid")
     check(action_of({"verdict": "Log"}) == "?", "a verdict that is not an object")
     check(network_of({"network": 3}) == "", "a network that is not a string")
     check(printable("a b\x1b[31m") == "a_b_[31m", "printable")
