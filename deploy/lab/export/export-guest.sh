@@ -4,7 +4,7 @@
 # crates/nn-export/examples/syslog_receiver.rs, built in the guest's tree).
 # Our own lab guests only.
 #
-# usage: export-guest.sh <out-dir> <phase>...  (setup arrive outage hostile slow stall cost off)
+# usage: export-guest.sh <out-dir> <phase>...  (setup arrive outage hostile slow stall rotate rewritten dead cost off)
 #
 #   setup   — a lab CA and a receiver certificate (receiver.lab, 127.0.0.1),
 #             the receiver up (honest), the signed export.local (both sinks,
@@ -442,6 +442,128 @@ sys.exit(0 if not outside else 1)
 PY
     check "$m-loss-bounded" "the rows lost are rows written while the $m receiver held the connection" test $? -eq 0
     cat "$OUT/compare-$m.txt"
+}
+
+# The review of #499 (X1): a chain rotated while the export reads it — the
+# netflow chain (its file 16 MiB) driven past a rotation by connects, both
+# sinks caught up; every row across it arrived, no "cursor ahead".
+phase_rotate() {
+    local n0 n1 s
+    n0=$(ls "$STATE"/netflow.jsonl.[0-9]* 2>/dev/null | wc -l)
+    s=$(date +%s)
+    while [ "$(ls "$STATE"/netflow.jsonl.[0-9]* 2>/dev/null | wc -l)" -le "$n0" ] && [ $(( $(date +%s) - s )) -lt 240 ]; do
+        events 0 200 0
+    done
+    n1=$(ls "$STATE"/netflow.jsonl.[0-9]* 2>/dev/null | wc -l)
+    check rotate-happened "the netflow chain rotated while exported ($n0 -> $n1 archives, $(( $(date +%s) - s )) s)" test "$n1" -gt "$n0"
+    check rotate-caught-up "both sinks caught up after the rotation" caught_up 300
+    chain_rows > "$OUT/chains.json"
+    record_rows "$CAP" > "$OUT/recs-capture-rotate.json"
+    compare capture-after-rotate "$OUT/recs-capture-rotate.json" > "$OUT/compare-rotate.txt"
+    check rotate-no-loss "every row across the rotation arrived, none other" test $? -eq 0
+    cat "$OUT/compare-rotate.txt"
+    check verify-capture-rotate "the capture verifies across the rotation" verify capture-rotate "$CAP"
+    journalctl -u northnarrow-agent --since "-10min" --no-pager 2>/dev/null | grep -ciE 'cursorahead|cursor_ahead' > "$OUT/cursor-ahead.txt"
+    check rotate-no-cursor-ahead "no read went ahead of the chain (cursor_ahead notes: $(cat "$OUT/cursor-ahead.txt"))" bash -c "[ \"\$(cat '$OUT/cursor-ahead.txt')\" = 0 ]"
+}
+
+# The review of #499 (D1, D2): what verify refuses — a record whose OCSF
+# fields were rewritten (its row genuine), a rotation's terminator stripped
+# with the file's last row dropped.
+phase_rewritten() {
+    python3 -I - "$CAP" "$OUT" <<'PY'
+import json, sys
+cap, out = sys.argv[1], sys.argv[2]
+recs = []
+for line in open(cap, encoding="utf-8", errors="replace"):
+    i = line.find("{")
+    if i >= 0:
+        try:
+            recs.append(json.loads(line[i:]))
+        except Exception:
+            pass
+det = [r for r in recs if r.get("unmapped", {}).get("northnarrow", {}).get("row", {}).get("chain") == "detections"]
+v = dict(det[0])
+v["severity_id"] = 1
+v["finding_info"] = {"title": "benign", "uid": "x"}
+open(out + "/rewritten.jsonl", "w").write(json.dumps(v) + "\n")
+# a rotation: the first row of a file after 1 with its terminator, the row before it
+by = {}
+for r in recs:
+    row = r["unmapped"]["northnarrow"]["row"]
+    by.setdefault(row["chain"], {})[(row["file"], row["line"])] = r
+cut = None
+for c, rows in by.items():
+    for (f, l), r in sorted(rows.items()):
+        if l == 1 and f > 1 and r["unmapped"]["northnarrow"]["row"].get("rotate"):
+            prev = [k for k in rows if k[0] == f - 1]
+            if len(prev) >= 2:
+                last = max(prev)
+                keep = [rows[k] for k in sorted(prev) if k != last]
+                nxt = json.loads(json.dumps(r))
+                del nxt["unmapped"]["northnarrow"]["row"]["rotate"]
+                cut = keep + [nxt]
+                break
+    if cut:
+        break
+with open(out + "/cut.jsonl", "w") as f:
+    for r in cut or []:
+        f.write(json.dumps(r) + "\n")
+print("rewritten 1 record; cut:", len(cut or []), "records")
+PY
+    "$NNADMIN" export verify --agent-pubkey-file /etc/northnarrow/agent.sig.pub --file "$OUT/rewritten.jsonl" > "$OUT/verify-rewritten.txt" 2>&1
+    local rc=$?
+    check rewritten-tampered "a record with its fields rewritten: TAMPERED, exit 13 (got $rc)" test "$rc" -eq 13
+    if [ -s "$OUT/cut.jsonl" ]; then
+        "$NNADMIN" export verify --agent-pubkey-file /etc/northnarrow/agent.sig.pub --file "$OUT/cut.jsonl" > "$OUT/verify-cut.txt" 2>&1
+        rc=$?
+        check cut-broken "a file's tail cut, its terminator stripped: BROKEN, exit 11 (got $rc)" test "$rc" -eq 11
+    else
+        fail cut-broken "no rotation in the capture to cut (run phase rotate first)"
+    fi
+    : > "$OUT/empty.jsonl"
+    "$NNADMIN" export verify --agent-pubkey-file /etc/northnarrow/agent.sig.pub --file "$OUT/empty.jsonl" > "$OUT/verify-empty.txt" 2>&1
+    rc=$?
+    check empty-not-ok "an empty capture: EMPTY, exit 2 (got $rc)" test "$rc" -eq 2
+}
+
+# The review of #499 (D4): the export's worker killed again and again
+# (inside a window: its pid is protected) until the supervisor disables it
+# — the status, the manifest and the next beat say degraded, never on.
+phase_dead() {
+    local i w st
+    "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 120 >/dev/null 2>&1
+    for i in $(seq 1 12); do
+        w=$(worker_pid)
+        [ -n "$w" ] && kill -9 "$w" 2>/dev/null
+        sleep 2
+        st=$(status_json | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["export"]["state"])' 2>/dev/null)
+        [ "$st" = degraded ] && break
+    done
+    status_json > "$OUT/status-dead.json"
+    check dead-status "the worker killed until disabled: export status degraded (worker $(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["export"]["worker"])' "$OUT/status-dead.json" 2>/dev/null))" bash -c "[ '$st' = degraded ]"
+    "$NNADMIN" capabilities --json --key "$KEY" > "$OUT/capabilities-dead.json" 2>&1
+    check dead-manifest "the manifest's export entry degraded" python3 -I -c '
+import json,sys
+e = json.load(open(sys.argv[1]))["manifest"].get("export") or {}
+print(e.get("state"), e.get("why"))
+sys.exit(0 if e.get("state") == "degraded" else 1)' "$OUT/capabilities-dead.json"
+    # the next beat (every 30 s)
+    sleep 35
+    "$NNADMIN" heartbeat export --count 1 > "$OUT/beat-dead.txt" 2>&1
+    check dead-beat "the beat says the export degraded" python3 -I -c '
+import json,sys
+line = [l for l in open(sys.argv[1]) if l.startswith("{")][-1]
+e = json.loads(line).get("export") or {}
+print(e.get("state"), e.get("worker"))
+sys.exit(0 if e.get("state") == "degraded" else 1)' "$OUT/beat-dead.txt"
+    # back as before: the agent started again inside a window
+    restart_agent > "$OUT/restart-dead.txt" 2>&1
+    sleep 5
+    check dead-recovered "after a restart: on again, its worker ready" python3 -I -c '
+import json,sys
+e = json.load(sys.stdin)["export"]
+sys.exit(0 if e["state"] == "on" and e["worker"] == "ready" else 1)' < <(status_json)
 }
 
 ticks() { awk '{print $14 + $15}' "$1" 2>/dev/null; }
