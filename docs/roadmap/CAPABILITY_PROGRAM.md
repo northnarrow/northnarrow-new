@@ -5402,6 +5402,19 @@ number in parentheses is a lab PR.
       - 72 mutations of the workflow and the config: 39 carried over, 19
         of the split, 11 of the config and 3 of the env. Each one fails a
         named test.
+    - Lab, as measured on PR #496 (GitHub-hosted runners, no guest):
+      - Run 41800849727 at 7d76f6c9 was green in all four jobs: analyze
+        actions 49 s and rust 5 min 47 s (466 Rust files extracted, 544
+        before the config); upload 14 s and 17 s.
+      - The analysis key is now `codeql.yml:upload`. The rust analysis
+        has 132 results, exactly the 132 of the full analysis outside the
+        ignored directories, rule and file:line for each. The actions
+        analysis has 0. The PR's CodeQL check reads "No new alerts in code
+        changed by this pull request".
+      - `analyze` logs that codeql-action cannot reach its feature-flag
+        endpoints without `security-events: read`: no experimental
+        features, and the CLI its release ships (2.27.4, as before). That
+        read is not granted to the job that runs dependency code.
   - Open: the first push run after the merge opens 132 alerts on `main`.
     126 are in test code or the fuzz fixture (64 of them `critical` by
     CodeQL's rating, fixed test keys and nonces), and 6 are the false
