@@ -16,7 +16,8 @@ exit: <0, or 2 with the host's warnings: checked>
 | <status>  nftables for COMBAT containment  <value>
 | <status>  release verified at install      <value>
 | <status>  cgroup v1 controllers not mountable <value>
-| 12 check(s), <warnings> warning(s)<, and the anti-tamper note when there are any>
+| <status>  Kernel fixes the sandbox relies on <value>
+| 13 check(s), <warnings> warning(s)<, and the anti-tamper note when there are any>
 --- stderr
 (empty)
 
@@ -37,7 +38,7 @@ exit: <0, or 2 with the host's warnings: checked>
 |     "name": "Kernel lockdown mode",
 |     "status": "<status>",
 |     "value": "<value>",
-|     "fix": "boot with `lockdown=integrity` (Secure Boot enables it on most distros): blocks unsigned modules, kexec of unsigned kernels, /dev/mem and other runtime kernel modification by root"
+|     "fix": "boot with `lockdown=integrity` (Secure Boot enables it on most distros) — recommended on every host the agent defends: without it root can rewrite the running kernel (an unsigned module, /dev/mem, kexec of an unsigned kernel, a kprobe's write) and remove the agent's hooks with it, which no hook of the agent can refuse"
 |   },
 |   {
 |     "id": "unprivileged_bpf",
@@ -108,6 +109,13 @@ exit: <0, or 2 with the host's warnings: checked>
 |     "status": "<status>",
 |     "value": "<value>",
 |     "fix": "on a host whose systemd runs the unified cgroup hierarchy, boot with `cgroup_no_v1=all` — a root can mount the v1 freezer, move the agent into it and freeze it (the agent refuses writes to a v1 hierarchy outside a trusted-installer window; the boot option refuses the mount itself)"
+|   },
+|   {
+|     "id": "kernel_fixes",
+|     "name": "Kernel fixes the sandbox relies on",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "upgrade to a kernel whose stable branch carries the fix (docs/operator/KERNEL_COMPATIBILITY.md, \"Kernel fix level\"); on a distribution's kernel check its security tracker for each CVE named `unknown` — the agent's workers and anti-tamper rely on these fixes"
 |   }
 | ]
 --- stderr

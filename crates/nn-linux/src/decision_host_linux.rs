@@ -9,7 +9,8 @@
 //! posture's one ([`LinuxHost`], `chain_host_linux`): one type, the agent's.
 //!
 //! And the per-rule policy's exemption facts read from a `/proc`
-//! ([`ProcFacts`]: a process's uid and cgroup, its executable opened,
+//! ([`ProcFacts`]: a process's uid and cgroup — lot 277: and whether it
+//! started in that cgroup, the kernel's marks — its executable opened,
 //! checked root-owned in a root-owned tree through `st_uid` and the mode
 //! bits, and hashed), cut verbatim from `decision::rule_policy`, whose
 //! `ActorFacts` they implement.
@@ -231,6 +232,12 @@ impl ActorFacts for ProcFacts {
         };
         let digest = self.hash_file(&mut f, key)?;
         Some((path_s, digest))
+    }
+
+    /// Lot 277: the kernel's marks ([`crate::cgroup_join`]); not known
+    /// without the boot's tracker (a test, a tool, a kernel without it).
+    fn started_in_cgroup(&self, pid: u32) -> Option<bool> {
+        crate::cgroup_join::started_in_cgroup(&self.root, pid)
     }
 }
 

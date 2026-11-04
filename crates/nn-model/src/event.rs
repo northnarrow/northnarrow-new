@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{
     ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw, ADDR_LEN,
-    FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_CGROUP_FREEZE, FS_OP_CGROUP_KILL, FS_OP_CGROUP_LIMIT,
-    FS_OP_CGROUP_MOVE, FS_OP_CGROUP_V1, FS_OP_CREATE, FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_LINK,
-    FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_OOM_ADJ, FS_OP_PTRACE, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR,
-    FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR,
+    FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_CGROUP_FREEZE, FS_OP_CGROUP_JOIN, FS_OP_CGROUP_KILL,
+    FS_OP_CGROUP_LIMIT, FS_OP_CGROUP_MOVE, FS_OP_CGROUP_V1, FS_OP_CREATE, FS_OP_IOCTL, FS_OP_KEXEC,
+    FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_OOM_ADJ, FS_OP_PTRACE, FS_OP_READ, FS_OP_RENAME,
+    FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE,
+    FS_OP_XATTR,
 };
 
 /// Serde default of `Event::CanaryTripped::first_trip`.
@@ -1029,6 +1030,13 @@ pub enum FsProtectOperation {
     /// Lot 273c: a protected process's I/O priority changed by another
     /// (`ionice`); `target_dev` is the value.
     Ioprio,
+    /// Lot 277: NOT a refusal — a process moved into a cgroup the per-rule
+    /// policy's exemptions name, by anyone but systemd's placement; the
+    /// target is the moved tgid, `target_dev` the hash of the exemption's
+    /// name (0: a destination too long to hash). The move went through;
+    /// the moved process and what it starts are never exempt by cgroup or
+    /// unit.
+    CgroupJoin,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1065,6 +1073,7 @@ impl FsProtectOperation {
             crate::wire::FS_OP_SCHED => Self::Sched,
             crate::wire::FS_OP_NICE => Self::Nice,
             crate::wire::FS_OP_IOPRIO => Self::Ioprio,
+            FS_OP_CGROUP_JOIN => Self::CgroupJoin,
             other => Self::Unknown(other),
         }
     }
@@ -1099,6 +1108,7 @@ impl FsProtectOperation {
             Self::Sched => "sched",
             Self::Nice => "nice",
             Self::Ioprio => "ioprio",
+            Self::CgroupJoin => "cgroup_join",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -1655,6 +1665,12 @@ mod tests {
                 FsProtectOperation::Ioprio,
                 "ioprio",
             ),
+            // Lot 277
+            (
+                crate::wire::FS_OP_CGROUP_JOIN,
+                FsProtectOperation::CgroupJoin,
+                "cgroup_join",
+            ),
         ];
         for (byte, op, name) in cases {
             assert_eq!(FsProtectOperation::from_wire(byte), op);
@@ -1662,8 +1678,8 @@ mod tests {
             assert_eq!(op.to_string(), name);
         }
         assert_eq!(
-            FsProtectOperation::from_wire(29),
-            FsProtectOperation::Unknown(29)
+            FsProtectOperation::from_wire(30),
+            FsProtectOperation::Unknown(30)
         );
     }
     use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};

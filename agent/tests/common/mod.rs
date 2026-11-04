@@ -428,6 +428,24 @@ pub fn unprotect_pid(pid: u32) -> Result<(), String> {
     }
 }
 
+/// `pid` is a key of the pinned `PROTECTED_PIDS` (`bpftool map lookup`):
+/// `Some(true)` in it, `Some(false)` not, `None` the lookup could not run.
+fn pid_protected(pid: u32) -> Option<bool> {
+    let o = Command::new("sudo")
+        .args(["bpftool", "map", "lookup", "pinned"])
+        .arg(protected_pids_pin())
+        .arg("key")
+        .args(pid_key_bytes(pid))
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if o.status.success() {
+        return Some(true);
+    }
+    let err = String::from_utf8_lossy(&o.stderr);
+    err.contains("No such file or directory").then_some(false)
+}
+
 /// `pid` still exists (signal 0: the task_kill hook lets it through).
 fn pid_alive(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as i32, 0) };
@@ -499,13 +517,20 @@ pub fn try_quit_agent(child: &mut Child, timeout: Duration) -> Result<(), String
     let mut known = process_tree(root);
     let deadline = Instant::now() + timeout;
     let mut eviction: Result<(), String>;
-    let mut refused: Option<(u32, std::io::Error)> = None;
+    let mut refused: Option<(u32, std::io::Error)>;
     let mut signalled = false;
+    // Lot 277 (a teardown that outlived 10 s on 22.04's CI): what each
+    // round saw and did, for the error — the refusal is the LAST round's,
+    // not one an earlier round met and a later one got past.
+    let mut rounds: Vec<String> = Vec::new();
     loop {
         if tree_exited(child, &known)? {
             return Ok(());
         }
+        let tree = process_tree(root);
         eviction = unprotect_pid(root);
+        refused = None;
+        let mut sent = Vec::new();
         if eviction.is_ok() {
             // Leaves first, then sudo itself, so nothing is left to re-spawn.
             for p in process_tree(root).into_iter().rev() {
@@ -514,13 +539,21 @@ pub fn try_quit_agent(child: &mut Child, timeout: Duration) -> Result<(), String
                 }
                 if unsafe { libc::kill(p as i32, libc::SIGQUIT) } != 0 {
                     let e = std::io::Error::last_os_error();
+                    sent.push(format!("{p}:{}", e.raw_os_error().unwrap_or(0)));
                     if e.raw_os_error() != Some(libc::ESRCH) {
                         refused = Some((p, e));
                     }
+                } else {
+                    sent.push(format!("{p}:ok"));
                 }
             }
             signalled = true;
         }
+        rounds.push(format!(
+            "tree {tree:?} eviction {} SIGQUIT [{}]",
+            if eviction.is_ok() { "ok" } else { "failed" },
+            sent.join(" ")
+        ));
         let step = (Instant::now() + Duration::from_millis(500)).min(deadline);
         if wait_tree_exited(child, &known, step)? {
             return Ok(());
@@ -541,11 +574,35 @@ pub fn try_quit_agent(child: &mut Child, timeout: Duration) -> Result<(), String
         (Ok(()), None) if signalled => "SIGQUIT was delivered but it did not exit".to_string(),
         (Ok(()), None) => "no signal could be sent".to_string(),
     };
+    // Each process still there: its state (`D` a core being dumped, `Z`
+    // not reaped), its command line, and whether it is in PROTECTED_PIDS.
+    let alive: Vec<String> = known
+        .iter()
+        .filter_map(|p| {
+            let stat = std::fs::read_to_string(format!("/proc/{p}/stat")).ok()?;
+            let state = stat
+                .rsplit_once(')')
+                .map_or("?", |(_, r)| r.split_whitespace().next().unwrap_or("?"));
+            let cmd = std::fs::read(format!("/proc/{p}/cmdline"))
+                .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
+                .unwrap_or_default();
+            Some(format!(
+                "{p} {state} [{}] protected={:?}",
+                cmd.trim().chars().take(80).collect::<String>(),
+                pid_protected(*p)
+            ))
+        })
+        .collect();
+    let core_pattern = std::fs::read_to_string("/proc/sys/kernel/core_pattern").unwrap_or_default();
+    let last: Vec<&String> = rounds.iter().rev().take(3).collect();
     Err(format!(
         "quit_agent: the agent of sudo pid {root} (tree {known:?}) is still alive {timeout:?} \
-         into teardown: {why}. It keeps running: stop it with a signed `nn-admin shutdown` \
-         or restart the host before more privileged tests run (a leftover agent treats the \
-         next fixtures as an intrusion)."
+         into teardown: {why}. Alive: {alive:?}; the last rounds (newest first): {last:?}; \
+         {} rounds; core_pattern {:?}. It keeps running: stop it with a signed `nn-admin \
+         shutdown` or restart the host before more privileged tests run (a leftover agent \
+         treats the next fixtures as an intrusion).",
+        rounds.len(),
+        core_pattern.trim()
     ))
 }
 

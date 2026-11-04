@@ -379,6 +379,11 @@ fn load_object(bytes: &[u8], level: VerifierLogLevel) -> Result<Ebpf> {
         crate::sensors::multiplexer::FS_PROTECT_RING,
         crate::sensors::multiplexer::FS_PROTECT_RING_BYTES,
     );
+    // Lot 277: the tracker's marks at the size the agent loads them.
+    loader.map_max_entries(
+        crate::cgroup_join::JOINED_MAP,
+        crate::cgroup_join::joined_entries_now(),
+    );
     loader.default_map_pin_directory(PIN_DIR);
     loader.verifier_log_level(level);
     let mut ebpf = loader

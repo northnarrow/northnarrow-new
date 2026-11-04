@@ -100,6 +100,12 @@ pub const PROTOCOL_ATTACKS: &[&str] = &[
     "swap",
 ];
 
+/// Lot 277: the attack made before the sandbox — a second thread started
+/// first, as a library the worker loaded could start one. The worker must
+/// refuse to enter ([`EXIT_SANDBOX`]): Landlock and `no_new_privs` would
+/// bind the calling thread only.
+pub const THREADED: &str = "threaded";
+
 /// Run `attack` (`[noseccomp+]<name>[:<argument>]`); the exit status.
 pub fn run(a: &Args, attack: &str) -> i32 {
     let (no_seccomp, attack) = match attack.strip_prefix("noseccomp+") {
@@ -107,6 +113,12 @@ pub fn run(a: &Args, attack: &str) -> i32 {
         None => (false, attack),
     };
     let (name, arg) = attack.split_once(':').unwrap_or((attack, ""));
+    if name == THREADED {
+        // parked for the worker's whole life: the sandbox must see it
+        std::thread::spawn(|| loop {
+            std::thread::park();
+        });
+    }
     let profile = sandbox::Profile::parse(a.ipc_fd);
     let level = match if no_seccomp {
         sandbox::enter_without_seccomp(&profile)
@@ -136,6 +148,10 @@ pub fn run(a: &Args, attack: &str) -> i32 {
     }
     if PROTOCOL_ATTACKS.contains(&name) {
         return protocol_attack(a.ipc_fd, name, level);
+    }
+    if name == THREADED {
+        eprintln!("hostile worker threaded: the sandbox was entered with a second thread");
+        return SUCCEEDED;
     }
     eprintln!("hostile worker: no attack `{name}`");
     EXIT_USAGE
