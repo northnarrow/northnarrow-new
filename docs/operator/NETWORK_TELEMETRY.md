@@ -208,9 +208,10 @@ fail-safe.
   you sign with it is refused; one signed before is applied with the line
   as `alert`, a signed degradation): its kill stays held.
 - **False positives measured** (lot 275's lab, `deploy/lab/malsim/nodns-fp.sh`;
-  again on 6.8 after both reviews of #495 — the system resolver by its
-  executable, its user and the host's mount namespace, `Low` only from it:
-  none, every workload rc 0;
+  again on 6.8 after both reviews of #495 and its final check — the system
+  resolver by its executable, its user and its image's device and inode
+  (systemd-resolved, in a mount namespace of its own, recognized: lab case
+  MS32), `Low` only from it: none, every workload rc 0;
   every NN-L-NET-028 record of a workload's window counted, also under
   another rule's record of the same event): **none** on Ubuntu 24.04 (6.8)
   and 22.04 (5.15) over `apt-get update` and a download-only install, 40

@@ -5325,6 +5325,16 @@ number in parentheses is a lab PR.
     (3 accepted connections, 3 closed `inbound` rows), MS30 (38 responses
     read, 33 decoded in the first minute), MS31 (`curl https://example.com/`:
     ja3 4ea056e6…, ja4 t13d3113h2_…, sni on the closed row), NEG PASS.
+    6.8 after the final check (C1; round 6, 3060d947, and 6b, 79cb419f):
+    systemd-resolved runs in a mount namespace of its own
+    (`mnt:[4026532305]`, init's `mnt:[4026531841]`) and its image is the
+    host's file (`/proc/<pid>/exe` and `/usr/lib/systemd/systemd-resolved`
+    both 64769:3190); MS32 — a name only it looked up (`resolvectl`, its
+    cache flushed), then one datagram from another process to the address
+    — one NN-L-NET-028 record, Low (`other_lineage`), none Medium: the
+    resolver recognized. MS28 5 of 5, MS29, MS30, MS31, NEG PASS (round
+    6's MS32 had read the judgement from the netflow log, whose rows do
+    not carry it — the check fixed in 79cb419f, the agent unchanged).
     False positives (`nodns-fp.sh`, NN-L-NET-028 records in each workload's
     window, also as a match of another rule's record): 0 on 6.8 over W1–W6
     (`apt-get update` and a download-only install, 40 parallel HTTPS
@@ -5335,7 +5345,8 @@ number in parentheses is a lab PR.
     `SIGILL` in libgnutls on the guest's virtual CPU (after its connect)
     and the rootful container did not start (R011 killed podman's
     `modprobe`); again 0 on 6.8 after both reviews (round 5, W1–W6, every
-    workload rc 0). The EXP-13 probe (literal 192.0.2.1) draws NN-L-NET-028,
+    workload rc 0) and after the final check (round 6, the resolver by its
+    image, W1–W6, every workload rc 0). The EXP-13 probe (literal 192.0.2.1) draws NN-L-NET-028,
     by design. Cost after the early port test (round 5, 6.8, the
     contract's overhead entries): per call (BPF stats on) about 128 ns a
     UDP receive from another port than 53, 121 ns a TCP send, 666 ns an
@@ -5375,10 +5386,11 @@ number in parentheses is a lab PR.
     273c's memory-floor cases, whose reload is asked, not awaited; lot 275
     touches no cgroup or anti-tamper code (C97's timing is lot 273d's to
     explain).
-  - Gates on bd3b1b0f (the lot merged with `main` 80c8da36, #493), and
-    again on the commit that writes this line (it changes nothing else):
+  - Gates on 3060d947 (the final check's code, the lot merged with
+    `main` 80c8da36, #493), and again on the commit that writes this line
+    (79cb419f before it changes a lab check, this one the notes only):
     `build-ebpf --release`; clippy ×4 `-D warnings`; fmt; the workspace's
-    tests, 84 suites, 3,736 passed, 0 failed, 17 ignored; the wire test
+    tests, 84 suites, 3,738 passed, 0 failed, 17 ignored; the wire test
     with `--features debug-trigger`; the map test with
     `NN_REQUIRE_EBPF_OBJECT=1`; the privileged tests built (`--no-run`);
     `attack-coverage --check`; `golden` ×5 (54 files, the same bytes);
@@ -5420,7 +5432,8 @@ number in parentheses is a lab PR.
   - Level: C07 1 → 2. Inbound connections, DNS answers and TLS
     fingerprints in the flow record are present and tested in the lab on
     both kernel classes: MS28–MS30 (and MS31) PASS on 5.15 (round 4) and
-    6.8 (round 5) on the reviews' code. Not 3: one architecture, two
+    6.8 (round 5) on the reviews' code, and on 6.8 again after the final
+    check (rounds 6 and 6b, with MS32: systemd-resolved recognized). Not 3: one architecture, two
     distributions; `recvmmsg`, a multi-segment iovec, DNS over TCP, DoT
     and DoH are not read; NN-L-NET-028's kill is refused until measured on
     a wider corpus.
