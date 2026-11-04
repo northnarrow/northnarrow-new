@@ -44,6 +44,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     (`agent/tests/cgroup_join_privileged_e2e.rs`) and `exempt-check`'s
     threaded case and 200 starts under load. The sensor contract lists the
     tracker and the `cgroup_join` record.
+  - The re-review of #494: the "not known" state is a byte a tgid in a 4
+    MiB preallocated map, written with plain stores (the bit set with a
+    test and an atomic add could be added twice by a fork and a move on
+    two CPUs: the child exempt, the carry into the next tgid); the
+    tracker's maps and links are pinned in a directory of their own beside
+    the pin root (`/sys/fs/bpf/northnarrow-cgroup-join-v<schema>-<entries>`),
+    which `install.sh --upgrade` leaves — the marks outlive an upgrade —
+    and `uninstall.sh` removes; a start whose maps' layout differs builds
+    new ones and signs "marks reset"; the directory is protected like the
+    pin root; `bpf-own-ids` marks the tracker's programs `kept`; the swap
+    attaches `mark` before `src`; a `debug-trigger` build's
+    `NN_DEBUG_CGROUP_JOINED_ENTRIES` sizes the marks for the privileged
+    test of a full map; the lab's `tracker-persist-check` (an agent stop,
+    an upgrade, the pins' protection) and `fork-cost`.
   - `nn-admin host-check` (and the signed manifest's `host_hardening`):
     `kernel_fixes` compares the kernel's upstream version (Ubuntu's
     `version_signature`, Debian's banner, else `osrelease`) with the fixes

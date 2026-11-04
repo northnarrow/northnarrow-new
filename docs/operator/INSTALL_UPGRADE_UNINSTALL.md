@@ -186,7 +186,13 @@ start — left the host without a working agent. What it does now, in order:
    already stopped (external audit DEP-006). Upgrading from an agent that
    predates the list falls back to that count and names what is left;
    without `bpftool` the script checks that the units' processes and the
-   pin root are gone and says the unload itself is not confirmed;
+   pin root are gone and says the unload itself is not confirmed. The
+   start-in-cgroup tracker's pins are not in the pin root
+   (`/sys/fs/bpf/northnarrow-cgroup-join-v*`, lot 277): the upgrade leaves
+   them, its programs go on marking, and the script does not wait for
+   them (`kept` in `bpf-own-ids`); the new agent swaps them for its own,
+   or — when the maps' layout changed — builds new ones, a signed "marks
+   reset";
 5. **switches** the binaries and units: each new file is staged next to
    the installed one (`<path>.nn-new`, same directory, same file system),
    compared with its source, then renamed over it (`rename(2)`): every path
@@ -325,7 +331,9 @@ trusted-installer window (`--grant-key`, same key and
 role as the upgrade) → stop watchdog then agent, then disable both — a
 unit whose stop is refused (no window on a protected host) stops the
 script before anything is disabled or removed (lab PR 194; the units used
-to be disabled first and left running) → drop the pin root and wait for
+to be disabled first and left running) → drop the pin root and the
+start-in-cgroup tracker's directories beside it
+(`/sys/fs/bpf/northnarrow-cgroup-join-v*`) and wait for
 the agent's own BPF programs to unload (the ids in
 `/run/northnarrow/bpf-own-ids`, read before the stop, as in the upgrade;
 other products' LSM programs are left alone) → `chattr -R -i` on state and

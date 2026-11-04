@@ -852,11 +852,15 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY
 starts with a signed `subsystem_degraded` "cgroup exemptions", and every
 exemption by cgroup or unit is refused there. An optional offset absent
 makes the tracker absent (`btf_revalidate`), never a tracker reading a
-sentinel. The programs' links are pinned in `/sys/fs/bpf/northnarrow`
-(`prog_cgroup_join_*`, `link_cgroup_join_*`): they go on marking while
-the agent is stopped. The marks' map is sized at the start to
+sentinel. The programs' links and the three maps are pinned beside the pin root, in
+`/sys/fs/bpf/northnarrow-cgroup-join-v<schema>-<entries>`: they go on
+marking while the agent is stopped and through `install.sh --upgrade`,
+which purges the pin root only. The marks' map is sized at the start to
 `kernel.pid_max` capped by `kernel.threads-max` and allocated as it fills;
-the per-group "not known" bitmap is 512 KiB, preallocated.
+the "not known" map is a byte for each possible tgid, 4 MiB, preallocated.
+On 6.18+ with cgroup2's `favordynmods` (a remount by root; not systemd's
+default) a move no longer waits for a fork: see the trust model's
+residuals.
 
 ## Adding a distro to the lab
 

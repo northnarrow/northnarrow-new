@@ -1308,15 +1308,24 @@ this kernel, a mark the kernel could not keep for **this** group, or a
 failed lookup. Marked and not known refuse the exemption.
 
 A mark the kernel could not keep (the insert failed, the leader's start
-time unread, a clone's flags unread) sets the group's bit in the pinned
-`CGROUP_JOIN_LOST` (preallocated: 4,194,304 bits, 512 KiB) with an atomic
-add; a fork of a group whose bit is set sets the child's. The bit is
-cleared at the tgid's next fork (`cgroup_join_born`), the only clear: a
-clear at the exit could run twice (two threads reading `signal->live` 0)
-and take the bit from the word twice, a borrow into the other groups'
-bits. One event at a time sets or clears a group's bit — the fork that
-makes its tgid, then its moves under `cgroup_mutex` — so the test before
-the add holds. The first version (the review of #494, D2) counted a lost
+time unread, a clone's flags unread, the writing thread's own tgid
+unread) sets the group's byte in the pinned `CGROUP_JOIN_LOST`
+(preallocated: one byte for each of the 4,194,304 possible tgids, 4 MiB)
+to 1; a fork of a group whose byte is set sets the child's. The byte is
+set to 0 at the tgid's next fork (`cgroup_join_born`), before the new
+group runs and before any move can reach it — the only clear (a clear at
+the exit could run for two threads that both read `signal->live` 0).
+Both writes are plain stores, never a read-modify-write (the re-review of
+#494, R1). The review's version kept a bit a tgid, set with a test and an
+atomic add, on the claim that one event at a time touched a group's bit;
+that was false: `sched_process_fork` comes after `cgroup_post_fork` lets
+go of `cgroup_threadgroup_rwsem` (v5.15 `fork.c:2594` after
+`cgroup.c:6145`, v6.8 `fork.c:2912` after `cgroup.c:6498`), so a move of
+the new child by another process can mark it on another CPU at the same
+time. Two adds of the same bit left it clear — the child neither marked
+nor not known, exempt — and carried into the next tgid's. A store of 1
+by any number of CPUs leaves the byte 1, and no store reaches another
+tgid's byte. The first version (the review of #494, D2) counted a lost
 mark in a host-wide counter that refused every exemption by cgroup or
 unit until a reboot, and a preallocated map of 32,768 marks any user's
 fork storm under a marked parent could fill. The marks are now a hash map
@@ -1345,13 +1354,35 @@ take the rwsem (`*threadgroup_locked = pid || threadgroup`, v6.8
 the writer, and a fork by another thread of its process starts its child
 in that thread's cgroup.
 
-The programs' links are pinned (`prog_cgroup_join_*` and
-`link_cgroup_join_*` in `/sys/fs/bpf/northnarrow`, the review of #494,
-D6), as the other anti-tamper programs: a stopped agent leaves the tracker
-marking. A start loads the new programs on the pinned maps, attaches and
-pins each, then removes the old pins: no gap. A kernel that refuses the
-tracker removes stale pins; a host without bpffs attaches the programs
-for the agent's life and warns.
+The programs' links are pinned (`prog_cgroup_join_*`,
+`link_cgroup_join_*`, the review of #494, D6), as the other anti-tamper
+programs are: a stopped agent leaves the tracker marking. Their pins and
+the three maps' (`CGROUP_JOINED`, `CGROUP_JOIN_LOST`,
+`CGROUP_JOIN_STATS`) are in a directory of the tracker's own **beside**
+the pin root, not in it — `/sys/fs/bpf/northnarrow-cgroup-join-v<schema>-<entries>`
+(the re-review of #494, R2). `install.sh --upgrade` purges the pin root
+so that every LSM program detaches (`purge_pin_root`); the review's
+version had the tracker's pins there, so an upgrade dropped every mark
+and a root process moved into an exempt unit before it was exempt again
+after it — the "no gap" of that version held for a restart only. Now
+the purge leaves the tracker's directory: its programs go on marking
+through the upgrade, the new agent reuses its maps and swaps its programs
+for its own, one by one, attach before purge (`cgroup_join_mark` before
+`cgroup_join_src`: the new `mark` reads the new, empty source slot until
+the new `src` runs, so it marks more meanwhile, never less — the
+re-review's N-f). The agent lists the tracker's programs as `kept` in
+`/run/northnarrow/bpf-own-ids`: the upgrade does not wait for them to
+unload. The directory's name carries the maps' layout — the schema
+(`PIN_SCHEMA`, raised with any change to a map's key, value or kind) and
+the marks' entries: a start whose layout differs builds new maps in a new
+directory and removes the old one once its own programs run — a signed
+degradation, "cgroup exemptions: marks reset …", never a silent loss. The
+directory and its pins are protected as the pin root and its pins are
+(`register_bpffs_pins`: no new entry, no unlink, rename or setattr by a
+foreign caller outside the trusted-installer window). `uninstall.sh`
+removes it with the pin root and waits for every program, the kept ones
+included. A kernel that refuses the tracker removes its pins; a host
+without bpffs attaches the programs for the agent's life and warns.
 
 ### Residual
 
@@ -1370,9 +1401,46 @@ for the agent's life and warns.
 - **A move before the agent's first start** since the host booted: no
   program ran. While no agent runs, the last agent's and watchdog's pids
   stay the family in the pinned `PROTECTED_PIDS` until the next start's
-  stale scan: a process given one of them moves unmarked. A
-  `cgroup_join` record of a move made then reaches no journal; the mark
-  is made.
+  stale scan: a process given one of them moves unmarked (the re-review's
+  N-e; it needs that pid reused while no agent runs). A `cgroup_join`
+  record of a move made then reaches no journal; the mark is made.
+- **The tracker's pins removed inside the trusted-installer window**, or
+  between an upgrade's purge of the pin root (the deny hooks detach with
+  it) and the new agent's start: the new agent finds no directory and
+  builds new maps, with no "marks reset" to say so. Both need the window
+  a signed, audited grant opens; a reboot removes them too, with every
+  process.
+- **A downgrade to a version before lot 277** leaves the tracker's
+  programs attached and marking — harmless, nothing reads the marks —
+  until `uninstall.sh` or a reboot.
+- **cgroup's `favordynmods`** (kernel 6.18+, `cgroup_enable_per_threadgroup_rwsem`,
+  v6.18 `kernel/cgroup/cgroup.c:1344-1356`, `:3096-3103`): a move takes
+  only the target group's rwsem and looks the pid up before it; the
+  fork-time clear of a dead group's mark (N5) no longer excludes a move of
+  that dead group, which can mark the tgid after the new owner's fork — a
+  false refusal for that process. Neither systemd 255 nor 257 mounts
+  cgroup2 with `favordynmods`; it takes a remount by root or
+  `CONFIG_CGROUP_FAVOR_DYNMODS` (the re-review's N-a).
+- **A probe that cannot read a task's tgid** (`tgid_of`, a live task's own
+  field: not seen to fail): the writer's own is set not known, another
+  task's — a moved one, a forked child — is only counted, with no group
+  to set (the re-review's N-b).
+- **The marks' size is the start's**: `kernel.pid_max` or
+  `kernel.threads-max` raised later leave the map as it was until the
+  next start (a new size: a new directory, marks reset, signed); a fork
+  storm past `threads-max` by the number of CPUs (the check comes before
+  the fork completes) and dead groups' marks take entries too. In every
+  case only the groups that ask for a mark become not known — a service
+  systemd starts asks for none (the re-review's N-g).
+- **A non-leader thread rewriting its own process into its cgroup**
+  (`cgroup.procs` with its tgid, or `0`): the leader moves, not the
+  writing thread, so it is marked — a false refusal for a multi-threaded
+  service that does so (the re-review's N-d).
+- **The `cgroup_join` records share the task denials' budget** (one a
+  caller and operation a second, 50 a second per CPU): any user moving its
+  own processes into a cgroup of its session named like an exempt unit
+  (`…/app.slice/backup.service`) makes High records — noise in the
+  denials' budget, not a way around the tracker (the re-review's N-h).
 - **A start by `CLONE_INTO_CGROUP` is marked, not signed**: the fork path
   gives no destination path to match.
 - **False refusals, fail-closed**: a `Delegate=yes` service that moves its

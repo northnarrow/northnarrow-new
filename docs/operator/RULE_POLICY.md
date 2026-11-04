@@ -113,10 +113,17 @@ unit (`backup.service/sub`) is signed too. A destination path of 255 bytes
 or more (the kernel's read fills its 256-byte buffer: the path may go on) is
 signed without a name while any such exemption is in force.
 
-The tracker's programs are pinned in `/sys/fs/bpf/northnarrow` like the
-other anti-tamper programs (the review of #494, D6): stopping the agent
-leaves them attached, and the marks go on being made and passed on; a new
-start attaches the new programs before it removes the old links.
+The tracker's programs and maps are pinned like the other anti-tamper
+programs (the review of #494, D6), in a directory of their own beside the
+pin root: `/sys/fs/bpf/northnarrow-cgroup-join-v<schema>-<entries>` (the
+re-review of #494, R2). Stopping the agent leaves them attached, and the
+marks go on being made and passed on; `install.sh --upgrade` purges the
+pin root and leaves this directory, so the marks outlive an upgrade too;
+a new start attaches its programs before it removes the old links. A
+start whose maps' layout differs (a new schema, a new size) builds new
+maps and removes the old directory: a signed degradation, "cgroup
+exemptions: marks reset …". `uninstall.sh` removes the directory with the
+pin root.
 
 Where the exemption is refused:
 
@@ -126,8 +133,9 @@ Where the exemption is refused:
   every start) — every exemption by cgroup or unit;
 - for a process whose mark the kernel could not keep — the insert into the
   marks failed, or the leader's start time could not be read: that process
-  and what it forks after, until its thread group ends (its bit in the
-  pinned `CGROUP_JOIN_LOST`); every other process's exemption stands. The
+  and what it forks after, until its thread group ends (its byte in the
+  pinned `CGROUP_JOIN_LOST`, 4 MiB, written with plain stores: the
+  re-review of #494, R1); every other process's exemption stands. The
   marks are sized at the start to hold every thread group the host can run
   at once (`kernel.pid_max`, capped by `kernel.threads-max`; 32,768 to
   4,194,304; allocated as they are taken), so a failed insert is a kernel
@@ -154,6 +162,9 @@ Refusals that are not an attack (fail-closed, as designed):
 - **systemd 255's order inverted.** If the executor moved itself before PID
   1 moved it (PID 1 kept off the CPU for milliseconds in that window), the
   move is the executor's own and the unit's process is marked.
+- **A thread that is not the leader writing its own process into its
+  cgroup** (`cgroup.procs`, its tgid or `0`): the leader moves, not the
+  writer — marked (the re-review of #494, N-d).
 
 What it does not cover, as measured:
 
@@ -171,7 +182,12 @@ What it does not cover, as measured:
   every kind of exemption covers what the process then does — `exe <path>
   sha256 <hex>` too, which is the file's digest, not the memory's.
 - A move made before the agent's first start since the host booted (no
-  program ran). While no agent runs, the last agent's and watchdog's pids
+  program ran). The tracker's directory removed inside the
+  trusted-installer window, or between an upgrade's purge and the new
+  agent's start: new maps, no "marks reset" (the window is a signed,
+  audited grant). On a 6.18+ kernel with cgroup2 mounted `favordynmods`
+  (not systemd's default), a move of a dead group can mark its pid after
+  a new process took it: a false refusal. While no agent runs, the last agent's and watchdog's pids
   stay the agent's family until the next start evicts them (pinned
   `PROTECTED_PIDS`): a process given one of those pids moves unmarked; and
   the `cgroup_join` record of a move made then reaches no journal (the mark
