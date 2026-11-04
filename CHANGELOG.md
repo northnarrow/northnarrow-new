@@ -35,7 +35,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to a job with no `run:` step and no action other than checkout,
   download-artifact and upload-sarif. `SECURITY.md` §Code scanning;
   private vulnerability reporting is enabled (checked 2026-11-04). A pull
-  request's analysis is diff-informed (codeql-action's default). The first
+  request's analysis is complete. Diff-informed analysis is off, because
+  the upload job cannot filter a diff-informed SARIF to the pull request's
+  lines (`CODEQL_ACTION_DIFF_INFORMED_QUERIES=false`). The first
   full analysis of the tree (PR #496, one measurement commit, reverted)
   found 161 alerts and none real: 152 in test code, 6 false positives in
   production code, the fuzz fixture's seed nonce and 2 in a lab load

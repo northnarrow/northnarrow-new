@@ -2920,10 +2920,11 @@ fn codeql_unshipped_dirs(tracked: &[String]) -> Vec<String> {
 /// Lot codeql: CodeQL analyses every language of what ships, without a
 /// build and with the `security-extended` suite, on every pull request to
 /// main (no path filter: none can skip it), every push to main and
-/// weekly. Its config ignores only the directories no shipped build
-/// contains. Review of #496: the analysis runs with a read-only token and
-/// keeps its SARIF as an artifact; a second job, which runs nothing of the
-/// tree, uploads it with `security-events: write`. The Rust job installs
+/// weekly, a pull request's completely (not diff-informed). Its config
+/// ignores only the directories no shipped build contains. Review of #496:
+/// the analysis runs with a read-only token and keeps its SARIF as an
+/// artifact; a second job, which runs nothing of the tree, uploads it with
+/// `security-events: write`. The Rust job installs
 /// every toolchain the tree pins (each `rust-toolchain.toml`), fetches
 /// every cargo project from its lockfile and fails if the extraction
 /// changed one; the CodeQL bundle the runner caches is not deleted, and no
@@ -2998,6 +2999,12 @@ fn codeql_scans_every_language_of_the_tree() {
         pairs(&[("contents", "read")]),
         "{FILE}: analyze runs the dependency tree's code: read only"
     );
+    assert_eq!(
+        string_pairs(job.get("env")),
+        pairs(&[("CODEQL_ACTION_DIFF_INFORMED_QUERIES", "false")]),
+        "{FILE}: analyze's env: a complete analysis (the upload, in another job, cannot filter a diff-informed one)"
+    );
+    assert!(upload.get("env").is_none(), "{FILE}: upload's env");
     assert_eq!(
         string_pairs(upload.get("permissions")),
         pairs(&[("contents", "read"), ("security-events", "write")]),

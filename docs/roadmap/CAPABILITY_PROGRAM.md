@@ -5377,6 +5377,14 @@ number in parentheses is a lab PR.
         integration tests (`agent`, `cli`, `scan`, `watchdog` and `xtask`
         `/tests`), `fuzz` and `deploy/lab`. That leaves no C/C++ or
         Python in the scan, so the matrix is `actions` and `rust`.
+      - A pull request's analysis is complete
+        (`CODEQL_ACTION_DIFF_INFORMED_QUERIES=false`). codeql-action
+        filters a diff-informed SARIF to the pull request's lines when it
+        uploads it, and only in the job that computed the diff. The first
+        run of the split (41797976722) therefore uploaded 68
+        `hard-coded-cryptographic-value` results outside the diff, while
+        the queries the diff restricts reported none. The complete
+        analysis took no longer: rust 8 min 35 s against 9 min 18 s.
       - The dependencies' build scripts can still alter the SARIF in
         `analyze` before it is kept: what they lose is the write to the
         API, which reaches other analyses and the alerts' state.
@@ -5391,8 +5399,9 @@ number in parentheses is a lab PR.
         integration-test directories of the members that have them, plus
         `fuzz` and `deploy/lab`. The languages must equal those of the
         tracked files outside those directories.
-      - 69 mutations of the workflow and the config: 39 carried over, 19
-        of the split, 11 of the config. Each one fails a named test.
+      - 72 mutations of the workflow and the config: 39 carried over, 19
+        of the split, 11 of the config and 3 of the env. Each one fails a
+        named test.
   - Open: the first push run after the merge opens 132 alerts on `main`.
     126 are in test code or the fuzz fixture (64 of them `critical` by
     CodeQL's rating, fixed test keys and nonces), and 6 are the false

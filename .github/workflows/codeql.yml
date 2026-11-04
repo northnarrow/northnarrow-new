@@ -12,9 +12,8 @@
 # queries and the lower-precision security ones. On every pull request to main, every push
 # to main (the baseline a pull request's alerts are compared with), and
 # weekly, so a new query of a new CodeQL release runs on an unchanged main.
-# A pull request's analysis is diff-informed (codeql-action's default): it
-# reports what the lines the pull request changes bring, not the alerts
-# already on main, which the push and the weekly runs keep.
+# A pull request's analysis is complete, not diff-informed (see analyze's
+# env); GitHub flags in the pull request only the alerts it adds.
 # Review of #496: the token that may write code-scanning results never
 # meets the code the analysis runs. rust-analyzer runs the build scripts
 # and proc-macros of the locked dependency tree; with `security-events:
@@ -59,6 +58,15 @@ jobs:
     # others.
     permissions:
       contents: read
+    # Complete analyses on pull requests too. codeql-action filters a
+    # diff-informed SARIF to the pull request's lines when it uploads it,
+    # in the job that computed the diff; here the upload is another job,
+    # which would send the results of the queries the diff does not
+    # restrict unfiltered (#496: 68 of them, all of one rule) and those it
+    # restricts filtered. Measured on #496: rust 8 min 35 s complete,
+    # 9 min 18 s diff-informed.
+    env:
+      CODEQL_ACTION_DIFF_INFORMED_QUERIES: "false"
     strategy:
       fail-fast: false
       matrix:
