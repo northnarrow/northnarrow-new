@@ -11,8 +11,10 @@
 //! - `qname_wire_end` reports an end inside the buffer, just past a root
 //!   label (the Kani property, on buffers longer than the proof's);
 //! - lot 275, `parse_response`: at most `MAX_RECORDS` records, each at
-//!   least its least wire size inside the message, every name printable
-//!   ASCII of at most 1,020 bytes.
+//!   least its least wire size inside the message (an owner name of one
+//!   byte, the root's — the CI smoke run's crash-8a7b232e, a root-named A
+//!   record, read in 15 bytes; then the 10 fixed bytes and its data), every
+//!   name printable ASCII of at most 1,020 bytes.
 use libfuzzer_sys::fuzz_target;
 use nn_parse::dns_records::{parse_a_records, parse_aaaa_records};
 use nn_parse::dns_response::{parse_response, AnswerRecord, MAX_RECORDS};
@@ -87,9 +89,11 @@ fuzz_target!(|data: &[u8]| {
             .answers
             .iter()
             .map(|a| match a {
-                AnswerRecord::A { .. } => 12 + 4,
-                AnswerRecord::Aaaa { .. } => 12 + 16,
-                AnswerRecord::Cname { .. } => 12 + 2,
+                // the owner's root label, the fixed 10 bytes, the data (a
+                // CNAME's target at least a root label)
+                AnswerRecord::A { .. } => 1 + 10 + 4,
+                AnswerRecord::Aaaa { .. } => 1 + 10 + 16,
+                AnswerRecord::Cname { .. } => 1 + 10 + 1,
             })
             .sum();
         assert!(12 + 5 + least <= data.len());

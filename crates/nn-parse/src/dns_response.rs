@@ -303,6 +303,29 @@ mod tests {
         p
     }
 
+    /// The CI smoke run's crash-8a7b232e (the fuzz property's bound, not
+    /// the parser): a record's owner may be the root, one byte — a question
+    /// for the root and its A record read in 12 + 5 + 15 bytes.
+    #[test]
+    fn a_root_named_record_reads_in_its_least_wire_size() {
+        let mut p = Vec::new();
+        header(&mut p, 0x8180, 1, 1);
+        p.extend_from_slice(&[0, 0, 1, 0, 1]);
+        rr(&mut p, &[0], TYPE_A, 33_068, &[37, 93, 184, 28]);
+        assert_eq!(p.len(), 12 + 5 + 15);
+        let r = parse_response(&p).expect("a response");
+        assert_eq!(r.qname, "");
+        assert!(r.complete);
+        assert_eq!(
+            r.answers,
+            vec![AnswerRecord::A {
+                name: String::new(),
+                ttl: 33_068,
+                addr: Ipv4Addr::new(37, 93, 184, 28)
+            }]
+        );
+    }
+
     #[test]
     fn a_cdn_answer_reads_with_its_chain_and_ttls() {
         let r = parse_response(&cdn_response()).expect("a response");
