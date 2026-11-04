@@ -413,6 +413,35 @@ mod tests {
 
     const SHA: &str = "a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1a3f1";
 
+    /// A JSONL file at most its size and 1 MiB — a line longer than a file
+    /// goes whole into an empty one (the sink's own test) — and the files
+    /// together that, times their count: what the core holds the
+    /// directory to (mutation MF1 of lot 276's run 7: the 1 MiB dropped).
+    #[test]
+    fn a_file_s_bound_holds_a_line_longer_than_the_file() {
+        let f = FileConfig {
+            max_bytes: 64 << 20,
+            max_files: 4,
+        };
+        assert_eq!(file_bound(&f), (64 << 20) + (1 << 20));
+        assert_eq!(dir_bound(&f), 4 * ((64 << 20) + (1 << 20)));
+        // the sink at its smallest size: its files within that bound
+        let d = tempfile::tempdir().unwrap();
+        let small = FileConfig {
+            max_bytes: 1 << 20,
+            max_files: 2,
+        };
+        let mut s =
+            crate::jsonl::JsonlSink::open(d.path(), small.max_bytes, small.max_files).unwrap();
+        s.write(&[vec![b'x'; 2 * nn_proto::ipc::MAX_EXPORT_ROW + (1 << 19)]])
+            .unwrap();
+        s.write(&[vec![b'y'; (1 << 20) - 100]]).unwrap();
+        for e in std::fs::read_dir(d.path()).unwrap() {
+            let len = e.unwrap().metadata().unwrap().len();
+            assert!(len <= file_bound(&small), "{len}");
+        }
+    }
+
     #[test]
     fn off_without_a_file_and_by_default() {
         let c = ExportConfig::parse("").unwrap();
