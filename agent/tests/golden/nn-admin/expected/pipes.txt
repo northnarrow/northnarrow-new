@@ -361,7 +361,6 @@ exit: 0
 |   held: the kill of the staged program that asked a security tool off (NN-L-EVA, lab PR 225)
 |   held: the kill for a rename seen only as a watched directory's new entry (NN-L-FIM-010, a match added by lab PR 225)
 |   held: the kill of a process that connected to a public address its lineage did not resolve (NN-L-NET-028, lot 275)
-|   held: the kill of the process tree for a TLS fingerprint in the JA3 blocklist (NN-L-NET-003: its fingerprints are produced from lot 275)
 
 ### pipe.stdout.policy-test
 $ nn-admin policy test --events events.json --config-dir empty

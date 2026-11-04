@@ -55,22 +55,33 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "NN-L-NET-003_BadJa3",
-        severities: &[Severity::Critical],
-        actions: &[ResponseAction::KillProcessTree],
+        severities: &[Severity::Medium],
+        actions: &[ResponseAction::Log],
         sensors: &[Sensor::Network],
         data_components: &["DC0085"],
-        observes: "An outbound flow whose TLS ClientHello fingerprint (JA3) is in the operator's \
-                   JA3 blocklist (`netflow-ja3-blocklist.{v1,local}`).",
-        false_positives: "A JA3 hash names a TLS library and its settings, not a program: an \
-                          entry shared by a common client (a language runtime's default TLS \
-                          stack) kills every program built on it.",
-        how_to_test: "Cannot be exercised on a guest: no sensor fills a flow's TLS fingerprint \
-                      until BUG-025 (`FlowTracker::attach_tls` has no caller), so the rule \
-                      cannot fire. The unit test gives the flow a fingerprint directly.",
-        tests: &["crates/nn-core/src/decision/rules/net.rs::net_003_fires_on_ja3_blocklist_match"],
+        observes: "An outbound TLS ClientHello whose JA3 or JA4 fingerprint is in the operator's \
+                   fingerprint blocklist (`netflow-ja3-blocklist.{v1,local}`, JA3 and JA4 \
+                   entries), judged as it is sent (the `tls_hello` sensor, lot 275). Recorded, \
+                   never acted on: the signed per-rule policy refuses `enforce` for it.",
+        false_positives: "A fingerprint names a TLS library and its settings, not a program: \
+                          every program on the same stack shares it (a language runtime's \
+                          default client, a common HTTP library), and the fingerprint alone \
+                          finds 6.82 % of malware against 88.68 % with the destination \
+                          (Anderson & McGrew). Hence Medium and no response (R6 of the \
+                          external review of 04/11). A client that permutes its extensions \
+                          (Chrome from 108) has a JA3 that varies: list its JA4.",
+        how_to_test: "`net-check.sh --only MS31`: a `curl https://example.com/` and its \
+                      ClientHello's JA3, JA4 and SNI on the flow's closed row — the fingerprint \
+                      the rule judges; the record of a listed fingerprint is the unit tests' \
+                      (not run in lot 275's lab).",
+        tests: &[
+            "crates/nn-core/src/decision/rules/net.rs::net_003_fires_on_ja3_blocklist_match",
+            "crates/nn-core/src/decision/rules/net.rs::net_003_matches_a_ja4_entry",
+            "crates/nn-core/src/decision/rule_policy.rs::enforce_of_a_fingerprint_rule_is_refused_and_its_other_modes_are_not",
+            "deploy/lab/malsim/net-check.sh::MS31",
+        ],
         attack_note: "TLS C2 is T1573.002 (ATT&CK classes SSL/TLS as asymmetric cryptography). \
-                      Inactive until BUG-025: out of the V2 Critical sub-gate, still in its \
-                      denominator.",
+                      Medium from lot 275: not in the V2 Critical sub-gate, in its denominator.",
     },
     RuleDoc {
         id: "NN-L-NET-004_SuspiciousDnsQname",

@@ -2,9 +2,8 @@
 
 Every detection rule has a built-in response: a record (`Log`), a kill of the
 process or of its tree, a capability stripped from a file. Some kills added by
-lab PRs 219–226 and lot 275 (NN-L-NET-028's, and NN-L-NET-003's now that its
-TLS fingerprints are produced — `NETWORK_TELEMETRY.md`) are **held** by
-default (recorded as an alert, the process left running) until an operator
+lab PRs 219–226 and lot 275 (NN-L-NET-028's — `NETWORK_TELEMETRY.md`) are
+**held** by default (recorded as an alert, the process left running) until an operator
 turns them on. The per-rule response policy is
 where you do that, rule by rule, and where you tone a noisy rule down or
 exempt one known program from it. Design:
@@ -55,6 +54,17 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CAT
 | `exempt <rule> cgroup <path>` | processes of that cgroup v2 path (it must end in a `.service` or `.scope`) |
 | `exempt <rule> unit <name>` | processes of that systemd unit (`backup.service`) |
 | `combat-without-corroboration NN-L-IMP-001` | the ransomware trigger reaches COMBAT without a second signal (it never locks COMBAT) |
+
+`enforce` is **refused** for a rule that matches one attribute many benign
+programs share, until the rule has a second predicate (a destination, an
+executable) to act on: today NN-L-NET-003, a TLS fingerprint (JA3 or JA4)
+in the operator's list (lot 275, R6 of the external review of 04/11; a
+fingerprint names a TLS stack, not a program — `NETWORK_TELEMETRY.md` §3).
+The line refuses the file like any bad line: `nn-admin config overlay set`
+refuses it, and a signed policy that held it before is refused at the
+agent's start, a signed `rule_policy` degradation naming the line, the
+built-in defaults in force. `alert`, `audit`, `off` and `exempt` of the
+rule are accepted.
 
 An exemption is **never** by process name: `comm`, `name`, `process` and
 `argv` refuse the file (any user can name a process `sshd`). When the agent

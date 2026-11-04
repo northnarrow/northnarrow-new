@@ -171,13 +171,10 @@ pub const NODNS_KILL: PolicySwitch = PolicySwitch::off(
      (NN-L-NET-028, lot 275)",
 );
 
-/// NN-L-NET-003: its kill existed, but no sensor produced a fingerprint
-/// before lot 275, so the rule never matched. A match the TLS ClientHello
-/// sensor makes possible is a wider match: held like the others.
-pub const NET_003_KILL: PolicySwitch = PolicySwitch::off(
-    "the kill of the process tree for a TLS fingerprint in the JA3 blocklist (NN-L-NET-003: its \
-     fingerprints are produced from lot 275)",
-);
+// NN-L-NET-003 has no switch: from lot 275 (R6 of the external review of
+// 04/11) a fingerprint match is Medium and `Log`, with no response to hold,
+// and the per-rule policy refuses `enforce` for it
+// (`rule_policy::ENFORCE_REFUSED`).
 
 /// Every switch, for the tests and the documents.
 pub const ALL: &[PolicySwitch] = &[
@@ -190,7 +187,6 @@ pub const ALL: &[PolicySwitch] = &[
     EVA_KILL,
     FIM_010_MOVED_IN_KILL,
     NODNS_KILL,
-    NET_003_KILL,
 ];
 
 #[cfg(test)]

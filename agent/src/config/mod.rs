@@ -200,7 +200,7 @@ mod tests {
             ),
             (
                 "netflow-ja3-blocklist.v1",
-                "3549750f6c1530fc139f9853d173bccb72612b58086392517fa9fe1f3a815870",
+                "30b57bc6d45ae938932eb92f145a0c731a54b109b5ae4b63b35a1b40cc276e1a",
             ),
             (
                 "process-comm-allowlist.v1",

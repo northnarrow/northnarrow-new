@@ -28,10 +28,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   send when it is a ClientHello (4,096 bytes); the parse worker computes
   JA3, JA4, SNI and ALPN; `Event::TlsClientHello`, and the fingerprint on
   the flow's snapshots and closed row (`ja3`, `ja4`, `sni` in
-  `netflow.jsonl`). NN-L-NET-003 judges the hello: it can match for the
-  first time, so its kill is held behind the per-rule policy
-  (`NET_003_KILL`); the validation registry's version 4 returns it to the
-  Critical sub-gate (BUG-025 closed).
+  `netflow.jsonl`). NN-L-NET-003 judges the hello (BUG-025 closed).
 - NN-L-NET-028, "no DNS, no connect", per lineage (lot 275): a TCP connect
   or a UDP send to a public address that neither the process nor an
   ancestor resolved through the system resolver — no response it received
@@ -1832,6 +1829,21 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- NN-L-NET-003: a TLS fingerprint is an attribute, not an identity (lot
+  275, R6 of the external review of 04/11). A ClientHello whose JA3 — or,
+  new, JA4 — is in the operator's fingerprint list
+  (`netflow-ja3-blocklist.{v1,local}`, which accepts both forms) is
+  **Medium** and `Log`, no longer Critical with `KillProcessTree` and
+  COMBAT; its record says the fingerprint names a TLS stack every program
+  on it shares (the fingerprint alone finds 6.82 % of malware, 88.68 % with
+  the destination: Anderson & McGrew). The signed per-rule policy refuses
+  `enforce NN-L-NET-003` until the rule has a second predicate (a
+  destination or an executable): the line refuses the file, and a signed
+  policy that held it is refused at the start, a signed `rule_policy`
+  degradation, the built-in defaults in force. Out of the V2 Critical
+  sub-gate (registry version 4, 29 rows). The shipped
+  `netflow-ja3-blocklist.v1` says so (its earlier text is replaced at
+  install, as every earlier shipped list).
 - The responses run by a pool of workers keyed by process (lab PR 270,
   R12c-3; `docs/architecture/EVENT_BUS.md` §2e): eight workers
   (`nn-response-<n>`, `NN_RESPONSE_WORKERS`, 1 to 32) take one response

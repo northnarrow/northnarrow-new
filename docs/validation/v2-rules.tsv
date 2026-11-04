@@ -16,11 +16,13 @@
 # ransomware rules NN-L-IMP-001 (Critical, in the sub-gate) and NN-L-IMP-002,
 # and the security-tool rules NN-L-EVA-001..004 (lab PR 225: families impact
 # and evasion).
-# version 4 (2026-11-03, lot 275, before any V2 run): NN-L-NET-028 ("no DNS,
-# no connect": a connect to a public address its lineage did not resolve;
-# Medium, its kill held behind the per-rule policy), family net; and
-# NN-L-NET-003 returns to the Critical sub-gate (gate critical): BUG-025 is
-# closed, the TLS ClientHello sensor produces the fingerprints it judges.
+# version 4 (2026-11-03/04, lot 275, before any V2 run): NN-L-NET-028 ("no
+# DNS, no connect": a connect to a public address its lineage did not
+# resolve; Medium, its kill held behind the per-rule policy), family net;
+# BUG-025 is closed (the TLS ClientHello sensor produces the fingerprints
+# NN-L-NET-003 judges), and NN-L-NET-003 is Medium and Log, a fingerprint
+# being an attribute, not an identity (R6 of the external review of 04/11):
+# it cannot issue a Critical verdict and stays out of the sub-gate (gate -).
 #
 # One row per rule the agent can record: the 85 rules the production engine
 # loads (decision::rules::default_rules_with_net) and NN-L-AT-001 and
@@ -39,7 +41,7 @@
 #   gate     critical = in the 100 % Critical sub-gate: every rule design
 #            §13 Q1 names, and every other rule that can issue a Critical
 #            verdict on the agent as built (NN-L-NET-003 out in versions 2
-#            and 3, until BUG-025; back in version 4); - otherwise
+#            and 3, until BUG-025; Medium from version 4); - otherwise
 #   q1       yes = named by Q1 itself (FIM-001/002/008/010/021/022 and every
 #            CHAIN rule); - otherwise
 #   status   in = in the denominator; n/a:<reason> = left out, decided in a
@@ -109,7 +111,7 @@ NN-L-CANARY-003_NetworkConnect	canary	engine	critical	-	in
 NN-L-CANARY-004_CredentialRead	canary	engine	critical	-	in
 NN-L-NET-001_OutboundToBlockedIp	net	engine	critical	-	in
 NN-L-NET-002_OutboundToBlockedTld	net	engine	-	-	in
-NN-L-NET-003_BadJa3	net	engine	critical	-	in
+NN-L-NET-003_BadJa3	net	engine	-	-	in
 NN-L-NET-004_SuspiciousDnsQname	net	engine	-	-	in
 NN-L-NET-005_DnsTxtNullBurst	net	engine	-	-	in
 NN-L-NET-006_UncommonListener	net	engine	-	-	in

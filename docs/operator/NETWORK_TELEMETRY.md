@@ -65,11 +65,17 @@ and how an operator tunes it. The sources' terms are in
   Each is an `Event::TlsClientHello`; the fingerprint is also attached to
   the flow, so its open-flow snapshots and its closed row in the netflow
   log carry `ja3`, `ja4` and `sni`.
-- **Rule:** NN-L-NET-003 (a JA3 in the operator's signed
-  `netflow-ja3-blocklist.local`) judges the hello, Critical. Its kill
-  (`KillProcessTree`) is held behind the per-rule policy: no fingerprint
-  was produced before this lot, so every match it makes is new (the
-  decision of 21/10/2026); `enforce NN-L-NET-003` gives it back.
+- **Rule:** NN-L-NET-003 judges the hello: a JA3 or a JA4 in the
+  operator's signed `netflow-ja3-blocklist.local` (one fingerprint a line,
+  either form; list a client's JA4 when it permutes its extensions, as
+  Chrome does from 108: its JA3 varies). **Medium, recorded, never acted
+  on** (R6 of the external review of 04/11): a fingerprint is an attribute
+  of the TLS stack — a library and its settings — not a program's
+  identity; every program on the same stack shares it, and the fingerprint
+  alone finds 6.82 % of malware against 88.68 % with the destination
+  (Anderson & McGrew). The record says so. The per-rule policy refuses
+  `enforce NN-L-NET-003` until the rule has a second predicate, a
+  destination or an executable ([RULE_POLICY.md](RULE_POLICY.md) §2).
 - **Budget:** 64 hellos at once, then 32 a second, per process; 512, then
   256 a second, per user (`tls_rate`).
 - **Limits:** the bytes are user memory read when the send begins (a

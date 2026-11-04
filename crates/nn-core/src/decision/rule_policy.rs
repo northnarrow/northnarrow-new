@@ -105,6 +105,28 @@ const OUTSIDE_ENGINE: &[&str] = &[
 /// The one rule `combat-without-corroboration` takes.
 pub const RANSOMWARE_RULE: &str = "NN-L-IMP-001_RansomwareEncryption";
 
+/// Lot 275, R6 of the external review of 04/11: the rules `enforce` is
+/// refused for, each with why — a match on one attribute that many benign
+/// programs share, with no second predicate (a destination, an executable)
+/// to act on. The line refuses the file, as any bad line does; a signed
+/// policy that held it before is refused at the agent's start, a signed
+/// degradation, and the built-in defaults apply.
+pub const ENFORCE_REFUSED: &[(&str, &str)] = &[(
+    "NN-L-NET-003_BadJa3",
+    "it matches a TLS fingerprint alone, an attribute of the TLS stack that every program on \
+     the same library and settings shares, not a program's identity (the fingerprint alone \
+     finds 6.82 % of malware, 88.68 % with the destination: Anderson & McGrew); it has no \
+     second predicate, a destination or an executable, to act on — `alert` or `audit` it",
+)];
+
+/// Why `enforce <id>` is refused, if it is.
+pub fn enforce_refused(id: &str) -> Option<&'static str> {
+    ENFORCE_REFUSED
+        .iter()
+        .find(|(r, _)| *r == id)
+        .map(|(_, why)| *why)
+}
+
 /// A parsed policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RulePolicy {
@@ -365,6 +387,11 @@ pub fn parse(text: &str) -> Result<RulePolicy, PolicyError> {
             [kw, rule] if Mode::from_keyword(kw).is_some() => {
                 let mode = Mode::from_keyword(kw).expect("checked");
                 let id = resolve_rule(rule).map_err(err)?;
+                if mode == Mode::Enforce {
+                    if let Some(why) = enforce_refused(id) {
+                        return Err(err(format!("enforce {id} is refused: {why}")));
+                    }
+                }
                 if let Some(prev) = p.modes.insert(id, mode) {
                     return Err(err(format!(
                         "{id} already has a mode ({}): one mode per rule",
@@ -695,6 +722,13 @@ mod tests {
                 "twice",
             ),
             ("enforce R020\x07\n", 1, "control character"),
+            // R6 (lot 275): a fingerprint alone is not an identity
+            ("enforce NN-L-NET-003\n", 1, "enforce NN-L-NET-003_BadJa3 is refused"),
+            (
+                "alert R020\nenforce NN-L-NET-003_BadJa3\n",
+                2,
+                "no second predicate",
+            ),
         ] {
             let e = refused(text);
             assert_eq!(e.line, line, "{text:?}: {e}");
@@ -868,6 +902,43 @@ mod tests {
         let b = boot_policy(None);
         assert!(b.policy.is_builtin());
         assert_eq!(b.policy.source, "built-in defaults");
+    }
+
+    /// R6 (lot 275): a signed policy that enforced NN-L-NET-003 before is
+    /// refused at the start, its reason in the signed degradation, the
+    /// built-in defaults in force; every other mode of the rule is
+    /// accepted, and `enforce` of another rule still is.
+    #[test]
+    fn enforce_of_a_fingerprint_rule_is_refused_and_its_other_modes_are_not() {
+        let b = boot_policy(Some((
+            Path::new("/etc/northnarrow/rule-policy.local"),
+            "off R008\nenforce NN-L-NET-003\n",
+        )));
+        assert!(b.policy.is_builtin(), "the defaults apply");
+        let d = b.degraded.expect("a signed degradation");
+        assert!(
+            d.contains("line 2") && d.contains("NN-L-NET-003_BadJa3") && d.contains("defaults"),
+            "{d}"
+        );
+        for mode in ["alert", "audit", "off"] {
+            let p = parse(&format!("{mode} NN-L-NET-003\n")).unwrap();
+            assert_eq!(
+                p.mode("NN-L-NET-003_BadJa3").map(Mode::keyword),
+                Some(mode),
+                "{mode}"
+            );
+        }
+        assert!(parse("exempt NN-L-NET-003 uid 1000\n").is_ok());
+        assert!(parse("enforce NN-L-NET-028\n").is_ok());
+        assert_eq!(
+            ENFORCE_REFUSED.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            vec!["NN-L-NET-003_BadJa3"]
+        );
+        // every refused id is a rule the policy knows
+        for (id, why) in ENFORCE_REFUSED {
+            assert_eq!(resolve_rule(id), Ok(*id));
+            assert!(!why.is_empty());
+        }
     }
 
     #[test]

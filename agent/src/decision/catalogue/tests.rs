@@ -326,11 +326,12 @@ fn the_catalogue_has_one_complete_entry_per_shipped_rule() {
 
 /// The catalogue's severities agree with the V2 registry's gate: a rule
 /// that can issue a Critical verdict is in the Critical sub-gate (or out
-/// of it with its reason, as NN-L-NET-003 until BUG-025), and a sub-gate
-/// rule that design §13 Q1 does not name is there because it can.
+/// of it with its reason, as NN-L-NET-003 was until BUG-025; Medium from
+/// lot 275), and a sub-gate rule that design §13 Q1 does not name is there
+/// because it can.
 #[test]
 fn the_catalogue_severities_agree_with_the_critical_sub_gate() {
-    const OUT_OF_THE_SUB_GATE: &[&str] = &["NN-L-NET-003_BadJa3"];
+    const OUT_OF_THE_SUB_GATE: &[&str] = &[];
     let mut bad = Vec::new();
     for r in parse_tsv(&read(render::RULES_TSV)) {
         let id = r["rule_id"].as_str();
