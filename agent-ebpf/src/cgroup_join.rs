@@ -13,11 +13,13 @@
 //! and the move a child of PID 1 makes of itself before it ran any program
 //! of its own.
 //!
-//! * [`cgroup_join_src`] (fexit `cgroup_procs_write_start`): for a process
+//! * [`cgroup_join_src`] (fexit `cgroup_procs_write_start`): for a thread
 //!   moving itself, the cgroup it is in before the move — so a move that
-//!   changes nothing (systemd 255's executor moving itself after its parent
-//!   did, or after `CLONE_INTO_CGROUP`) is no move. Every migration runs
-//!   under `cgroup_mutex`, from the lookup to the attach: one slot.
+//!   changes nothing (systemd 255's executor moving itself after PID 1
+//!   did, 256+'s after `CLONE_INTO_CGROUP`) is no move; a move of another
+//!   thread of the writer's process is one (the review of #494, B1). Every
+//!   migration runs under `cgroup_mutex`, from the lookup to the attach:
+//!   one slot.
 //! * [`cgroup_join_mark`] (tracepoint `cgroup_attach_task`, BTF): the
 //!   completed move — marked unless systemd's placement; signed
 //!   ([`FS_OP_CGROUP_JOIN`], rate-limited) when the destination is a
@@ -34,8 +36,10 @@
 //! The agent's family (the agent, the watchdog) moves processes into its
 //! own containment cgroups, which no exemption may name: not marked.
 
+use core::intrinsics::{atomic_xadd, AtomicOrdering};
+
 use aya_ebpf::{
-    helpers::{bpf_get_current_pid_tgid, bpf_probe_read_kernel, generated},
+    helpers::{bpf_get_current_pid_tgid, bpf_get_current_task, bpf_probe_read_kernel, generated},
     macros::{btf_tracepoint, fentry, fexit, map},
     maps::{Array, HashMap, PerCpuArray},
     programs::{BtfTracePointContext, FEntryContext, FExitContext},
@@ -43,9 +47,10 @@ use aya_ebpf::{
 };
 use northnarrow_common::btf_offsets::CGROUP_MOVE_RET_ARG;
 use northnarrow_common::cgroup_join::{
-    fnv_step, pack, placement, Move, CLONE_INTO_CGROUP, EXEMPT_NAMES_ENTRIES, FNV_OFFSET, HOW_BORN_INTO,
-    HOW_INHERITED, HOW_MOVED, JOINED_ENTRIES, NAME_CGROUP, NAME_UNIT, PATH_READ, STAT_INHERITED,
-    STAT_INTO_EXEMPT, STAT_LOST, STAT_ROOTS, STAT_SLOTS,
+    fnv_step, lost_slot, noop, pack, path_read, placement, Move, PathRead, CLONE_INTO_CGROUP,
+    EXEMPT_NAMES_ENTRIES, FNV_OFFSET, HOW_BORN_INTO, HOW_INHERITED, HOW_MOVED, JOINED_ENTRIES,
+    LOST_WORDS, NAME_CGROUP, NAME_UNIT, PATH_READ, STAT_INHERITED, STAT_INTO_EXEMPT, STAT_LOST,
+    STAT_ROOTS, STAT_SLOTS,
 };
 use northnarrow_common::wire::{InodeKey, FS_OP_CGROUP_JOIN};
 
@@ -55,11 +60,25 @@ use crate::btf_offsets::{
     TASK_STRUCT_SIGNAL_OFFSET, TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET,
 };
 
+/// `BPF_F_NO_PREALLOC`: an entry allocated at each mark.
+const BPF_F_NO_PREALLOC: u32 = 1;
+
 /// The marked thread groups: tgid → `[its leader's start time, pack(how,
-/// by whom)]`. Pinned: the marks outlive an agent restart. Never evicts
-/// (a mark refused is counted, [`STAT_LOST`]).
+/// by whom)]`. Pinned with the programs' links: the marks outlive an agent
+/// restart, and are kept while no agent runs. Sized by the agent at its
+/// load to the host's `pid_max` / `threads-max` (the review of #494, D2),
+/// an entry allocated per mark; a mark it cannot take (an allocation that
+/// failed) puts the group in [`CGROUP_JOIN_LOST`].
 #[map]
-pub static CGROUP_JOINED: HashMap<u32, [u64; 2]> = HashMap::pinned(JOINED_ENTRIES, 0);
+pub static CGROUP_JOINED: HashMap<u32, [u64; 2]> =
+    HashMap::pinned(JOINED_ENTRIES, BPF_F_NO_PREALLOC);
+
+/// The review of #494, D2: the thread groups whose mark could not be taken
+/// — one bit per possible tgid, preallocated (512 KiB), so setting one
+/// never fails. Passed on at a fork like a mark, cleared with the group's
+/// last thread: that tree, and only it, is "not known" to the agent.
+#[map]
+pub static CGROUP_JOIN_LOST: Array<u64> = Array::pinned(LOST_WORDS, 0);
 
 /// The tracker's counters ([`northnarrow_common::cgroup_join`]'s `STAT_*`).
 /// Pinned with the marks.
@@ -74,8 +93,9 @@ pub static CGROUP_JOIN_STATS: Array<u64> = Array::pinned(STAT_SLOTS, 0);
 pub static CGROUP_EXEMPT_NAMES: HashMap<u64, u8> = HashMap::with_max_entries(EXEMPT_NAMES_ENTRIES, 0);
 
 /// The write in progress (`cgroup_mutex` serialises them): `[pid_tgid of a
-/// process moving itself, its cgroup id before the move]`, `[0, 0]` for a
-/// move of another process.
+/// thread moving itself, its cgroup id before the move]`, `[0, 0]` for a
+/// move of any other task (the review of #494, B1: another thread of the
+/// writer's process included).
 #[map]
 static CGROUP_JOIN_SRC: Array<[u64; 2]> = Array::with_max_entries(1, 0);
 
@@ -133,11 +153,68 @@ fn family(tgid: u32) -> bool {
     crate::task_kill::is_exempt_pid(tgid)
 }
 
+/// The group's word in [`CGROUP_JOIN_LOST`] and its bit.
+#[inline(always)]
+fn lost_word(tgid: u32) -> Option<(*mut u64, u64)> {
+    let (word, bit) = lost_slot(tgid)?;
+    Some((CGROUP_JOIN_LOST.get_ptr_mut(word)?, bit))
+}
+
+/// `*w & bit`, read once (an aligned 8-byte load is single-copy atomic;
+/// the BPF backend selects no atomic load on the default CPU).
+#[inline(always)]
+unsafe fn has(w: *mut u64, bit: u64) -> bool {
+    core::ptr::read_volatile(w) & bit != 0
+}
+
+/// `*w += v`, atomically (BPF_XADD on every kernel and CPU version; its
+/// result unused).
+#[inline(always)]
+unsafe fn xadd(w: *mut u64, v: u64) {
+    let _ = atomic_xadd::<u64, u64, { AtomicOrdering::Relaxed }>(w, v);
+}
+
+/// The group is "not known": its mark could not be taken. Counted; its bit
+/// set. One event sets a group's bit at a time — its fork, then its moves
+/// under `cgroup_mutex` — so the test before the add holds; the add is
+/// atomic for the other groups' bits of the word.
+#[inline(always)]
+fn lose(tgid: u32) {
+    count(STAT_LOST);
+    if let Some((w, bit)) = lost_word(tgid) {
+        // SAFETY: a word of a preallocated array map.
+        unsafe {
+            if !has(w, bit) {
+                xadd(w, bit);
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn is_lost(tgid: u32) -> bool {
+    // SAFETY: a word of a preallocated array map.
+    lost_word(tgid).is_some_and(|(w, bit)| unsafe { has(w, bit) })
+}
+
+/// The group's bit cleared (its last thread exits).
+#[inline(always)]
+fn found(tgid: u32) {
+    if let Some((w, bit)) = lost_word(tgid) {
+        // SAFETY: a word of a preallocated array map.
+        unsafe {
+            if has(w, bit) {
+                xadd(w, bit.wrapping_neg());
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn mark(tgid: u32, start: u64, how: u8, by: u32) -> bool {
     let rec = [start, pack(how, by)];
     if CGROUP_JOINED.insert(&tgid, &rec, 0).is_err() {
-        count(STAT_LOST);
+        lose(tgid);
         return false;
     }
     true
@@ -167,9 +244,10 @@ unsafe fn try_src(ctx: &FExitContext) {
     if task == 0 || task >= 0u64.wrapping_sub(MAX_ERRNO) {
         return;
     }
-    let pid_tgid = bpf_get_current_pid_tgid();
-    if tgid_of(task) == Some((pid_tgid >> 32) as u32) {
-        *slot = [pid_tgid, generated::bpf_get_current_cgroup_id()];
+    // The review of #494, B1: the writing thread itself, not another thread
+    // of its process (its own cgroup is not the moved task's then).
+    if task == bpf_get_current_task() {
+        *slot = [bpf_get_current_pid_tgid(), generated::bpf_get_current_cgroup_id()];
     }
 }
 
@@ -200,14 +278,21 @@ unsafe fn try_mark(ctx: &BtfTracePointContext) {
         return;
     };
     let Some(start) = leader_start(task) else {
-        count(STAT_LOST);
+        lose(moved);
         return;
     };
-    let unchanged = writer == moved
-        && match CGROUP_JOIN_SRC.get(0) {
-            Some(src) => src[0] == pid_tgid && src[1] == generated::bpf_get_current_cgroup_id(),
-            None => false,
-        };
+    // The review of #494, B1: no move only for the writing thread moving
+    // itself to where it was (`common::cgroup_join::noop`).
+    let (src_this_write, src_id) = match CGROUP_JOIN_SRC.get(0) {
+        Some(src) => (src[0] == pid_tgid, src[1]),
+        None => (false, 0),
+    };
+    let unchanged = noop(
+        task == bpf_get_current_task(),
+        src_this_write,
+        src_id,
+        generated::bpf_get_current_cgroup_id(),
+    );
     let parent = rd_u64(task + off!(TASK_STRUCT_REAL_PARENT_OFFSET) as u64).unwrap_or(0);
     let parent_tgid = if parent == 0 {
         0
@@ -243,7 +328,7 @@ unsafe fn try_mark(ctx: &BtfTracePointContext) {
 /// The hash of the exemption name the destination `path` matches —
 /// `common::cgroup_join::match_destination`'s walk: the whole path a
 /// `cgroup` exemption gives, else the last component a `unit` exemption
-/// gives — `Some(0)` for a path not ended inside [`PATH_READ`] bytes while
+/// gives — `Some(0)` for a path unread or cut at [`PATH_READ`] bytes while
 /// any such exemption is in force, `None` otherwise. The loop keeps no
 /// counter and branches on no value it knows: the 5.15 verifier's states
 /// stay a few per byte (lot 277's lab: a component length counted per byte
@@ -260,18 +345,19 @@ unsafe fn exempt_destination(path: u64) -> Option<u64> {
         PATH_READ as u32,
         path as *const _,
     );
-    if n <= 0 {
-        return Some(0);
+    // The review of #494, D1: a full buffer is a cut path (the helper
+    // writes its NUL in the last byte).
+    match path_read(n) {
+        PathRead::Unread | PathRead::Cut => return Some(0),
+        PathRead::Whole => {}
     }
     let mut full = FNV_OFFSET;
     let mut comp = FNV_OFFSET;
     let mut hit = 0u64;
-    let mut ended = false;
     for i in 0..PATH_READ {
         // SAFETY: `i` < PATH_READ, the buffer's length.
         let b = (*buf)[i];
         if b == 0 {
-            ended = true;
             break;
         }
         full = fnv_step(full, b);
@@ -283,9 +369,6 @@ unsafe fn exempt_destination(path: u64) -> Option<u64> {
         } else {
             comp = fnv_step(comp, b);
         }
-    }
-    if !ended {
-        return Some(0);
     }
     if is_name(comp, NAME_UNIT) {
         hit = comp;
@@ -342,7 +425,7 @@ unsafe fn try_born(ctx: &FEntryContext) {
         return;
     }
     let Some(start) = rd_u64(child + off!(TASK_STRUCT_START_TIME_OFFSET) as u64) else {
-        count(STAT_LOST);
+        lose(tgid);
         return;
     };
     if mark(tgid, start, HOW_BORN_INTO, forker) {
@@ -369,12 +452,14 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) {
     let Some(ptgid) = tgid_of(parent) else {
         return;
     };
-    let Some(rec) = CGROUP_JOINED.get(&ptgid) else {
-        return;
-    };
-    let rec = *rec;
     // The mark is this process's, not a dead one's at the same tgid.
-    if leader_start(parent) != Some(rec[0]) {
+    let marked = match CGROUP_JOINED.get(&ptgid) {
+        Some(rec) => leader_start(parent) == Some(rec[0]),
+        None => false,
+    };
+    // The review of #494, D2: a group not known passes that on too.
+    let lost = is_lost(ptgid);
+    if !marked && !lost {
         return;
     }
     let Some(ctgid) = tgid_of(child) else {
@@ -384,8 +469,12 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) {
     if ctgid == ptgid {
         return;
     }
+    if lost {
+        lose(ctgid);
+        return;
+    }
     let Some(start) = rd_u64(child + off!(TASK_STRUCT_START_TIME_OFFSET) as u64) else {
-        count(STAT_LOST);
+        lose(ctgid);
         return;
     };
     if mark(ctgid, start, HOW_INHERITED, ptgid) {
@@ -411,7 +500,8 @@ unsafe fn try_exit(ctx: &BtfTracePointContext) {
     let Some(tgid) = tgid_of(task) else {
         return;
     };
-    if CGROUP_JOINED.get(&tgid).is_none() {
+    let marked = CGROUP_JOINED.get(&tgid).is_some();
+    if !marked && !is_lost(tgid) {
         return;
     }
     let Some(signal) = rd_u64(task + off!(TASK_STRUCT_SIGNAL_OFFSET) as u64) else {
@@ -421,6 +511,9 @@ unsafe fn try_exit(ctx: &BtfTracePointContext) {
         return;
     }
     if rd_u32(signal + off!(SIGNAL_STRUCT_LIVE_OFFSET) as u64) == Some(0) {
-        let _ = CGROUP_JOINED.remove(&tgid);
+        if marked {
+            let _ = CGROUP_JOINED.remove(&tgid);
+        }
+        found(tgid);
     }
 }

@@ -20,21 +20,99 @@
 //! was asked to attach), and the move a child of PID 1 makes of itself
 //! before it ran any program of its own (systemd up to 254 forks, the
 //! child moves itself, then executes the unit's command). A move that
-//! changes nothing (the process is already there: systemd 255's executor
-//! moving itself after its parent did, or after `CLONE_INTO_CGROUP`) is no
-//! move. Everything else marks.
+//! changes nothing is no move ([`noop`]): the moved task is the writing
+//! thread itself and its cgroup did not change — systemd 255's executor
+//! moving itself after PID 1 did (255 spawns it, then PID 1 attaches it),
+//! or 256+'s after `CLONE_INTO_CGROUP`. Everything else marks — a move of
+//! another thread of the writer's own process included (the review of
+//! #494, B1: a second thread putting its leader into a threaded child
+//! named like an exempt unit).
+//!
+//! A mark the kernel cannot take (an allocation failed) is never a silent
+//! loss and never a host-wide one (the review of #494, D2): the thread
+//! group is set in the preallocated bitmap `CGROUP_JOIN_LOST`
+//! ([`lost_slot`]), passed on at a fork like a mark and cleared with the
+//! group's last thread — that process tree, and only it, is "not known",
+//! and refused an exemption by cgroup or unit.
 
-/// The marked thread groups the map holds at most (a hash map that never
-/// evicts: a mark it cannot take is counted, [`STAT_LOST`], and every
-/// exemption by cgroup or unit is then refused until the agent restarts
-/// on an empty map — never one mark lost in silence).
+/// The marks the object declares (the agent sizes the map at its load to
+/// the host's `kernel.pid_max` and `kernel.threads-max`, the lower:
+/// [`joined_entries`]). The map allocates an entry at each mark
+/// (`BPF_F_NO_PREALLOC`): no more thread groups can be alive than tasks.
 pub const JOINED_ENTRIES: u32 = 32768;
+
+/// `PID_MAX_LIMIT` on 64-bit (include/linux/threads.h): no tgid reaches it.
+pub const PID_LIMIT: u32 = 4 * 1024 * 1024;
+
+/// The bitmap of "not known" thread groups: one bit per possible tgid.
+pub const LOST_WORDS: u32 = PID_LIMIT / 64;
+
+/// Lot 277 (the review of #494, D2): the entries the agent gives the marks
+/// at its load — the host's `pid_max` and `threads-max`, the lower (a fork
+/// past `threads-max` fails, so no more groups can be alive), within
+/// [`JOINED_ENTRIES`] and [`PID_LIMIT`]. A host that raises either later
+/// can mark more groups than the map holds: those are set in the bitmap
+/// (not known), never lost.
+pub fn joined_entries(pid_max: Option<u64>, threads_max: Option<u64>) -> u32 {
+    let n = match (pid_max, threads_max) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => u64::from(PID_LIMIT),
+    };
+    n.clamp(u64::from(JOINED_ENTRIES), u64::from(PID_LIMIT)) as u32
+}
+
+/// The word and the bit of `tgid` in the bitmap, `None` past it (no tgid
+/// is).
+pub const fn lost_slot(tgid: u32) -> Option<(u32, u64)> {
+    if tgid >= PID_LIMIT {
+        return None;
+    }
+    Some((tgid >> 6, 1u64 << (tgid & 63)))
+}
+
+/// Lot 277 (the review of #494, B1): a completed move changed nothing — the
+/// moved task is the writing thread itself (`moved_is_current`), whose
+/// cgroup before the move (`src_id`, recorded for this write: `src_this_write`)
+/// is its cgroup now (`now_id`). A move of another thread of the same
+/// process is a move, whatever the writer's own cgroup.
+pub const fn noop(moved_is_current: bool, src_this_write: bool, src_id: u64, now_id: u64) -> bool {
+    moved_is_current && src_this_write && src_id == now_id
+}
+
+/// What `bpf_probe_read_kernel_str` gave of a destination path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathRead {
+    /// Nothing read.
+    Unread,
+    /// The buffer filled ([`PATH_READ`] bytes, the last its NUL): the path
+    /// may go on — signed without a name while an exemption is in force.
+    Cut,
+    /// The whole path, its NUL inside the buffer.
+    Whole,
+}
+
+/// The review of #494, D1: the helper returns the bytes copied, the NUL
+/// included, and at a full buffer writes the NUL in its last byte and
+/// returns the buffer's size — so a full buffer is the cut, not its last
+/// byte.
+pub const fn path_read(n: i64) -> PathRead {
+    if n <= 0 {
+        PathRead::Unread
+    } else if n as u64 >= PATH_READ as u64 {
+        PathRead::Cut
+    } else {
+        PathRead::Whole
+    }
+}
 
 /// The exemption names the kernel matches a move's destination against
 /// (the per-rule policy's cgroup paths and unit names, hashed).
 pub const EXEMPT_NAMES_ENTRIES: u32 = 1024;
 
 /// Slots of the statistics array (`CGROUP_JOIN_STATS`, pinned).
+/// Marks the kernel could not take (those groups are in the bitmap: not
+/// known), counted.
 pub const STAT_LOST: u32 = 0;
 /// Marks made at a move or a birth (the roots of marked trees).
 pub const STAT_ROOTS: u32 = 1;
@@ -60,9 +138,10 @@ pub const NAME_CGROUP: u8 = 1;
 /// A unit's name (`backup.service`).
 pub const NAME_UNIT: u8 = 2;
 
-/// The bytes of a destination path the kernel hashes; a longer path is
-/// signed with a hash of 0 when any exemption is in force (it may name one
-/// the hash could not see).
+/// The bytes of a destination path the kernel reads, its NUL included; a
+/// path of `PATH_READ - 1` bytes or more is signed with a hash of 0 while
+/// any exemption is in force (it may name one the hash could not see:
+/// [`path_read`]).
 pub const PATH_READ: usize = 256;
 
 /// The mark's second word: who made it (the writer's or the forker's
@@ -233,6 +312,55 @@ mod tests {
         assert_eq!(placement(4242, 4242, 4000, false, false), Move::Mark);
         // already there: no move, whoever writes
         assert_eq!(placement(4242, 4242, 4000, false, true), Move::NoOp);
+    }
+
+    /// The review of #494, B1: no move only for the writing thread moving
+    /// itself to where it is; another thread of its process moved (a
+    /// leader written into a threaded child's `cgroup.threads`) is a move,
+    /// though the writer stays where it was.
+    #[test]
+    fn a_noop_is_the_writing_thread_staying_where_it_is() {
+        assert!(noop(true, true, 7, 7));
+        assert!(!noop(true, true, 7, 8), "the thread moved");
+        assert!(
+            !noop(false, true, 7, 7),
+            "another thread moved, the writer stayed"
+        );
+        assert!(
+            !noop(true, false, 7, 7),
+            "no source recorded for this write"
+        );
+        // and the decision then marks the threaded move of the leader
+        assert_eq!(
+            placement(4242, 4242, 4000, false, noop(false, true, 7, 7)),
+            Move::Mark
+        );
+    }
+
+    /// The review of #494, D1: a full buffer is a cut path, whatever its
+    /// last byte holds (the helper writes the NUL there).
+    #[test]
+    fn a_full_buffer_is_a_cut_path() {
+        assert_eq!(path_read(0), PathRead::Unread);
+        assert_eq!(path_read(-14), PathRead::Unread);
+        assert_eq!(path_read(1), PathRead::Whole);
+        assert_eq!(path_read(PATH_READ as i64 - 1), PathRead::Whole);
+        assert_eq!(path_read(PATH_READ as i64), PathRead::Cut);
+    }
+
+    /// The review of #494, D2: the marks sized from the host, one bitmap bit
+    /// for every possible tgid.
+    #[test]
+    fn the_marks_are_sized_from_the_host_and_every_tgid_has_a_bit() {
+        assert_eq!(joined_entries(Some(4_194_304), Some(62_000)), 62_000);
+        assert_eq!(joined_entries(Some(32_768), Some(1_000_000)), 32_768);
+        assert_eq!(joined_entries(Some(1_000), Some(500)), JOINED_ENTRIES);
+        assert_eq!(joined_entries(None, None), PID_LIMIT);
+        assert_eq!(joined_entries(Some(u64::MAX), None), PID_LIMIT);
+        assert_eq!(lost_slot(0), Some((0, 1)));
+        assert_eq!(lost_slot(65), Some((1, 2)));
+        assert_eq!(lost_slot(PID_LIMIT - 1), Some((LOST_WORDS - 1, 1 << 63)));
+        assert_eq!(lost_slot(PID_LIMIT), None);
     }
 
     #[test]

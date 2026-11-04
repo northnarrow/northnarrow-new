@@ -30,14 +30,15 @@
 //! ran is not seen: the residual is the trust model's
 //! (`docs/design/ANTITAMPER_TRUST_MODEL.md`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use aya::maps::{Array, HashMap, MapData};
+use aya::programs::links::FdLink;
 use aya::programs::{BtfTracePoint, FEntry, FExit};
 use aya::{Btf, Ebpf};
 use common::cgroup_join::{
-    fnv, unpack, NAME_CGROUP, NAME_UNIT, STAT_INTO_EXEMPT, STAT_LOST, STAT_ROOTS,
+    fnv, lost_slot, unpack, NAME_CGROUP, NAME_UNIT, STAT_INTO_EXEMPT, STAT_LOST, STAT_ROOTS,
 };
 use nn_core::decision::rule_policy::{Exemption, RulePolicy};
 use parking_lot::Mutex;
@@ -47,6 +48,8 @@ use crate::anti_tamper::btf_revalidate;
 
 /// The marks (pinned).
 pub const JOINED_MAP: &str = "CGROUP_JOINED";
+/// The "not known" bitmap (pinned).
+pub const LOST_MAP: &str = "CGROUP_JOIN_LOST";
 /// The counters (pinned).
 pub const STATS_MAP: &str = "CGROUP_JOIN_STATS";
 /// The exemptions' names the kernel matches a destination against.
@@ -77,6 +80,7 @@ pub const ABSENT_EFFECT: &str =
      told from the service)";
 
 type Joined = HashMap<MapData, u32, [u64; 2]>;
+type Lost = Array<MapData, u64>;
 type Stats = Array<MapData, u64>;
 type Names = HashMap<MapData, u64, u8>;
 
@@ -84,6 +88,7 @@ type Names = HashMap<MapData, u64, u8>;
 #[derive(Clone)]
 pub struct Marks {
     joined: Arc<Mutex<Joined>>,
+    lost: Arc<Mutex<Lost>>,
     stats: Arc<Mutex<Stats>>,
     names: Arc<Mutex<Names>>,
 }
@@ -96,6 +101,22 @@ pub enum Tracker {
 }
 
 static TRACKER: OnceLock<Tracker> = OnceLock::new();
+
+/// The review of #494, D2: the entries the marks get at the object's load
+/// — the host's `pid_max` and `threads-max`, the lower
+/// (`common::cgroup_join::joined_entries`): no more thread groups can be
+/// alive. A map pinned by an earlier boot keeps its own size.
+pub fn joined_entries_now() -> u32 {
+    let read = |p: &str| {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    common::cgroup_join::joined_entries(
+        read("/proc/sys/kernel/pid_max"),
+        read("/proc/sys/kernel/threads-max"),
+    )
+}
 
 /// The boot's tracker (a second call keeps the first).
 pub fn install(t: Tracker) {
@@ -116,6 +137,18 @@ pub fn unavailable() -> Option<String> {
     }
 }
 
+/// The bpffs pins of program `name` (`prog_<name>`, `link_<name>`: the
+/// tracker's program names, so no pin of the move guard's, which are named
+/// by function, is touched).
+pub fn pin_paths(root: &Path, name: &str) -> (PathBuf, PathBuf) {
+    (
+        root.join(format!("prog_{name}")),
+        root.join(format!("link_{name}")),
+    )
+}
+
+/// Load and attach program `name` on `target`; its link's id, as the
+/// link's owner gives it back to be pinned.
 fn load_attach(
     ebpf: &mut Ebpf,
     btf: &Btf,
@@ -149,6 +182,46 @@ fn load_attach(
     r.map_err(|e| format!("{name} ({target}): {e}"))
 }
 
+/// The review of #494, D6: program `name`'s fresh link and program pinned
+/// in `root` — after the prior boot's pins of that program are removed,
+/// which detaches the prior program only once this one is attached
+/// (attach before purge: never a moment without the tracker). The link
+/// held by the program object goes to the pin.
+fn pin_fresh(ebpf: &mut Ebpf, root: &Path, name: &str, kind: Kind) -> Result<(), String> {
+    let (prog_path, link_path) = pin_paths(root, name);
+    let prog = ebpf
+        .program_mut(name)
+        .ok_or_else(|| format!("program {name} missing from the eBPF object"))?;
+    let fd_link: FdLink = match kind {
+        Kind::FExit => {
+            let p = <&mut FExit>::try_from(prog).map_err(|e| e.to_string())?;
+            let id = p.attach().map_err(|e| format!("{e:#}"))?;
+            p.take_link(id).map_err(|e| format!("{e:#}"))?.into()
+        }
+        Kind::FEntry => {
+            let p = <&mut FEntry>::try_from(prog).map_err(|e| e.to_string())?;
+            let id = p.attach().map_err(|e| format!("{e:#}"))?;
+            p.take_link(id).map_err(|e| format!("{e:#}"))?.into()
+        }
+        Kind::TpBtf => {
+            let p = <&mut BtfTracePoint>::try_from(prog).map_err(|e| e.to_string())?;
+            let id = p.attach().map_err(|e| format!("{e:#}"))?;
+            p.take_link(id).map_err(|e| format!("{e:#}"))?.into()
+        }
+    };
+    antitamper_bpf::purge_stale_pin(&link_path);
+    antitamper_bpf::purge_stale_pin(&prog_path);
+    let prog = ebpf
+        .program_mut(name)
+        .ok_or_else(|| format!("program {name} missing from the eBPF object"))?;
+    prog.pin(&prog_path)
+        .map_err(|e| format!("pinning {name} to {}: {e}", prog_path.display()))?;
+    fd_link
+        .pin(&link_path)
+        .map_err(|e| format!("pinning {name}'s link to {}: {e}", link_path.display()))?;
+    Ok(())
+}
+
 fn unload(ebpf: &mut Ebpf, name: &str, kind: Kind) {
     let Some(prog) = ebpf.program_mut(name) else {
         return;
@@ -164,18 +237,56 @@ fn unload(ebpf: &mut Ebpf, name: &str, kind: Kind) {
 /// on, or that no exit removes, is worse than none: the agent would trust
 /// what it does not see), and take its maps. The tracker's state for the
 /// boot, which the caller [`install`]s.
-pub fn attach(ebpf: &mut Ebpf, btf: &Btf) -> Tracker {
+///
+/// The review of #494, D6: with a bpffs (`pin_root`), each program's link
+/// is pinned as the anti-tamper hooks' are — the tracker keeps marking
+/// while no agent runs (a restart, an upgrade). The five programs are
+/// loaded first and only then attached and pinned one by one, each after
+/// its predecessor of the prior boot is still running: a load refused
+/// leaves the prior boot's pinned tracker as it was.
+pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Tracker {
     if let Some(why) = unavailable() {
         warn!(reason = %why, effect = ABSENT_EFFECT, "cgroup exemptions: tracker not attached");
+        // A prior boot's pinned tracker goes too: no program of an older
+        // agent stays attached where this one would not attach.
+        if let Some(root) = pin_root {
+            for (name, _, _) in &PROGRAMS {
+                let (prog, link) = pin_paths(root, name);
+                antitamper_bpf::purge_stale_pin(&link);
+                antitamper_bpf::purge_stale_pin(&prog);
+            }
+        }
         return Tracker::Absent(why);
     }
-    for (i, (name, kind, target)) in PROGRAMS.iter().enumerate() {
-        if let Err(e) = load_attach(ebpf, btf, name, *kind, target) {
-            for (n, k, _) in &PROGRAMS[..=i] {
-                unload(ebpf, n, *k);
+    match pin_root {
+        None => {
+            for (i, (name, kind, target)) in PROGRAMS.iter().enumerate() {
+                if let Err(e) = load_attach(ebpf, btf, name, *kind, target) {
+                    for (n, k, _) in &PROGRAMS[..=i] {
+                        unload(ebpf, n, *k);
+                    }
+                    warn!(error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker attach FAILED");
+                    return Tracker::Absent(e);
+                }
             }
-            warn!(error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker attach FAILED");
-            return Tracker::Absent(e);
+            warn!("cgroup exemptions: tracker attached WITHOUT pin (no bpffs): not kept while no agent runs");
+        }
+        Some(root) => {
+            for (i, (name, kind, target)) in PROGRAMS.iter().enumerate() {
+                if let Err(e) = load_only(ebpf, btf, name, *kind, target) {
+                    for (n, k, _) in &PROGRAMS[..=i] {
+                        unload(ebpf, n, *k);
+                    }
+                    warn!(error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker load FAILED");
+                    return Tracker::Absent(e);
+                }
+            }
+            for (name, kind, _) in &PROGRAMS {
+                if let Err(e) = pin_fresh(ebpf, root, name, *kind) {
+                    warn!(program = name, error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker attach or pin FAILED");
+                    return Tracker::Absent(e);
+                }
+            }
         }
     }
     let take = |ebpf: &mut Ebpf, name: &str| {
@@ -184,10 +295,12 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf) -> Tracker {
     };
     let maps = (|| -> Result<Marks, String> {
         let joined = Joined::try_from(take(ebpf, JOINED_MAP)?).map_err(|e| e.to_string())?;
+        let lost = Lost::try_from(take(ebpf, LOST_MAP)?).map_err(|e| e.to_string())?;
         let stats = Stats::try_from(take(ebpf, STATS_MAP)?).map_err(|e| e.to_string())?;
         let names = Names::try_from(take(ebpf, NAMES_MAP)?).map_err(|e| e.to_string())?;
         Ok(Marks {
             joined: Arc::new(Mutex::new(joined)),
+            lost: Arc::new(Mutex::new(lost)),
             stats: Arc::new(Mutex::new(stats)),
             names: Arc::new(Mutex::new(names)),
         })
@@ -196,6 +309,7 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf) -> Tracker {
         Ok(m) => {
             info!(
                 programs = PROGRAMS.len(),
+                pinned = pin_root.is_some(),
                 "cgroup exemptions: the start-in-cgroup tracker is attached (moves into a cgroup \
                  and CLONE_INTO_CGROUP starts outside systemd are marked, with what they fork)"
             );
@@ -211,6 +325,31 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf) -> Tracker {
     }
 }
 
+/// Load program `name` on `target` without attaching it.
+fn load_only(
+    ebpf: &mut Ebpf,
+    btf: &Btf,
+    name: &str,
+    kind: Kind,
+    target: &str,
+) -> Result<(), String> {
+    let prog = ebpf
+        .program_mut(name)
+        .ok_or_else(|| format!("program {name} missing from the eBPF object"))?;
+    let r = match kind {
+        Kind::FExit => <&mut FExit>::try_from(prog)
+            .map_err(|e| e.to_string())
+            .and_then(|p| p.load(target, btf).map_err(|e| format!("{e:#}"))),
+        Kind::FEntry => <&mut FEntry>::try_from(prog)
+            .map_err(|e| e.to_string())
+            .and_then(|p| p.load(target, btf).map_err(|e| format!("{e:#}"))),
+        Kind::TpBtf => <&mut BtfTracePoint>::try_from(prog)
+            .map_err(|e| e.to_string())
+            .and_then(|p| p.load(target, btf).map_err(|e| format!("{e:#}"))),
+    };
+    r.map_err(|e| format!("{name} ({target}): {e}"))
+}
+
 /// How a marked process came to be marked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mark {
@@ -223,13 +362,14 @@ pub struct Mark {
 impl Marks {
     /// Lot 277: the exemption check's question for thread group `tgid`, in
     /// one errand (the decision thread's filter refuses `bpf`):
-    /// `Some(true)` not marked, `Some(false)` marked, `None` not known — a
-    /// mark the kernel could not take ([`STAT_LOST`] above 0: any process
-    /// may be one), a failed read, no answer in time.
+    /// `Some(true)` not marked, `Some(false)` marked, `None` not known — the
+    /// group's mark could not be taken (its bit in `CGROUP_JOIN_LOST`: that
+    /// tree only, the review of #494, D2), a failed read, no answer in time.
     pub fn started(&self, tgid: u32) -> Option<bool> {
-        let (joined, stats) = (Arc::clone(&self.joined), Arc::clone(&self.stats));
+        let (joined, lost) = (Arc::clone(&self.joined), Arc::clone(&self.lost));
         crate::caps::errands::run(move || {
-            if stats.lock().get(&STAT_LOST, 0).ok()? != 0 {
+            let (word, bit) = lost_slot(tgid)?;
+            if lost.lock().get(&word, 0).ok()? & bit != 0 {
                 return None;
             }
             match joined.lock().get(&tgid, 0) {

@@ -555,7 +555,7 @@ fn attach_reporting(
     // exemptions by cgroup or unit hold for processes started in their
     // cgroup only). Not a deny hook: without it those exemptions are
     // refused, a signed degradation.
-    let tracker = crate::cgroup_join::attach(ebpf, &btf);
+    let tracker = crate::cgroup_join::attach(ebpf, &btf, pin_root);
     match &tracker {
         crate::cgroup_join::Tracker::Absent(why) => report.degraded.push(format!(
             "cgroup exemptions: {} ({why})",

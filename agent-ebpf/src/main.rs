@@ -14,6 +14,10 @@
 
 #![no_std]
 #![no_main]
+// Lot 277 (the review of #494, D2): `atomic_xadd` for the tracker's bitmap
+// (BPF_XADD; `core::sync::atomic` gives the bpf target no read-modify-write).
+#![feature(core_intrinsics)]
+#![allow(internal_features)]
 #![allow(static_mut_refs)]
 
 #[macro_use]
