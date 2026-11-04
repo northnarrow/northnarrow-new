@@ -5370,8 +5370,18 @@ number in parentheses is a lab PR.
     273c's memory-floor cases, whose reload is asked, not awaited; lot 275
     touches no cgroup or anti-tamper code (C97's timing is lot 273d's to
     explain).
-  - Gates on @FINALSHA@ (the final tip, merged with `main` 80c8da36):
-    @FINALGATES@. Mutations: 78 on the lot's userland code
+  - Gates on bd3b1b0f (the lot merged with `main` 80c8da36, #493), and
+    again on the commit that writes this line (it changes nothing else):
+    `build-ebpf --release`; clippy ×4 `-D warnings`; fmt; the workspace's
+    tests, 84 suites, 3,736 passed, 0 failed, 17 ignored; the wire test
+    with `--features debug-trigger`; the map test with
+    `NN_REQUIRE_EBPF_OBJECT=1`; the privileged tests built (`--no-run`);
+    `attack-coverage --check`; `golden` ×5 (54 files, the same bytes);
+    MSRV 1.89; the fuzz replay (14 targets); the portable core (5
+    targets); the lockfiles unchanged. On the merge alone one test failed,
+    lot 278's `posture_floor` classification (NN-L-NET-003 kills no more;
+    NN-L-NET-028's kill held, its catalogue action `Log`), fixed in
+    bd3b1b0f. Mutations: 78 on the lot's userland code
     in two sets (66 + 12: the resolved table, the rule and its allowlist,
     the response parser, the IPC check, the pumps' ingest, the attach by
     arity, the lineage walk, the worker), 77 caught, MP3 argued equivalent
