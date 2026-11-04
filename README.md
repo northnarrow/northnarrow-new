@@ -257,15 +257,16 @@ but a defence inside the kernel is only as strong as the kernel's integrity:
 
 - **No adversarial campaign proof.** The V2 campaign has not run, so no rule has campaign
   evidence, and no coverage percentage is published until it has
-  ([`docs/validation/matrix.md`](docs/validation/matrix.md)). The JA3 rule cannot fire: no
-  sensor produces a TLS fingerprint yet.
+  ([`docs/validation/matrix.md`](docs/validation/matrix.md)).
 - **No independent validation.** The public CI runs are a step towards it, not a substitute (C29).
 - **No export, no backend.** Evidence stays on the host; only the heartbeat leaves it, by pull
   (C21, C22).
 - **Linux x86_64 only.** No ARM64, no Windows, no macOS (C02 to C04).
 - **No published release with assets.** The signed pipeline exists, but the one tag has no assets.
-- **Partial telemetry.** Exec only, with no fork, exit or credential events (C05). No inbound
-  connections, DNS answers or TLS fingerprints (C07).
+- **Partial telemetry.** Exec only, with no fork, exit or credential events (C05). DNS is read
+  over UDP only: no DNS over TCP, DoT or DoH, and no `recvmmsg` (C07).
+- **A TLS fingerprint is not an identity.** NN-L-NET-003 records a JA3 or JA4 in the operator's
+  list as Medium and never acts on it; `enforce` is refused until it has a second predicate.
 - **Narrow measurements.** Overhead is measured on Ubuntu 24.04 only. One 24-hour soak passed,
   on AlmaLinux 9, before Wave 4.
 - **Prevention is experimental and off by default:** the exec policy, exec quarantine and copy on
