@@ -95,7 +95,8 @@ const DENY_HOOK_LIST: &str = "LSM task_kill, ptrace_access_check, inode_unlink, 
 /// (the review of #490): measured again with `kernel.bpf_stats_enabled=0`
 /// (the stats add two clock reads to every call; lot 273b's rounds ran
 /// with them), the per-call cost from one round with them on. Lot 277: the
-/// start-in-cgroup tracker's work, where it runs; its cost not measured.
+/// start-in-cgroup tracker's work, where it runs, and (the third review of
+/// #494) its cost as the lab measured it.
 const FS_PROTECT_OVERHEAD: &[Overhead] = &[
     Overhead {
         what: "the cgroup move guard (LSM inode_permission): every permission check of a \
@@ -116,11 +117,17 @@ const FS_PROTECT_OVERHEAD: &[Overhead] = &[
     Overhead {
         what: "(lot 277) the start-in-cgroup tracker (tp_btf cgroup_attach_task, \
                sched_process_fork, sched_process_exit; fentry cgroup_post_fork; fexit \
-               cgroup_procs_write_start; their links pinned): every fork and every exit — one \
-               CGROUP_JOINED lookup and one bit of CGROUP_JOIN_LOST, an insert when the parent \
-               is marked; every cgroup migration — the systemd-placement test and a path walk of \
-               at most 255 bytes while an exemption by cgroup or unit is in force",
-        cost: "not measured (lot 277's lab measured no cost)",
+               cgroup_procs_write_start; their links pinned): every fork — a new group's \
+               state cleared, one CGROUP_JOINED lookup, one byte of CGROUP_JOIN_LOST, the \
+               reset's epoch and an insert when the parent is marked — and every exit of a \
+               marked group; every cgroup migration — the systemd-placement test and a path walk \
+               of at most 255 bytes while an exemption by cgroup or unit is in force",
+        cost: "about 0.93 us a fork and its exit on Ubuntu 24.04 (6.8: cgroup_post_fork 469 \
+               ns, sched_process_fork 192 ns, sched_process_exit 272 ns a call) and 0.6 us on \
+               22.04 (5.15: 269, 139 and 187 ns) — run_time_ns / run_cnt over 100,024 calls, \
+               the BPF stats' own clock reads included; a fork + exit + wait of about 140 us \
+               (24.04) and 55 us (22.04) on the lab's guests, the same with the tracker's links \
+               detached within the rounds' spread (medians of five rounds of 20,000)",
     },
 ];
 

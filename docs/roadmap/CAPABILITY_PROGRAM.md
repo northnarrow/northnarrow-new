@@ -5314,6 +5314,103 @@ number in parentheses is a lab PR.
     move could beat PID 1's and mark it (a false refusal, not measured
     here); `kernel_fixes` is `unknown` on a distribution's kernel below a
     fix, because the version cannot say.
+  - The reviews of #494 (three, before the merge), what changed:
+    - The first: B1, a move was a no-op when the *writer's* cgroup did not
+      change, so a second thread writing its leader into `cgroup.threads`
+      moved it unmarked — now only the writing thread moving itself to
+      where it is; D1, a full 256-byte path read is a cut path; D2, a mark
+      the kernel cannot keep makes that tree not known, never every
+      exemption on the host until a reboot, the marks sized from
+      `pid_max`/`threads-max` and allocated as they fill; D3, CVE-2022-30594
+      on 5.4.189 and 4.19.238; D4, systemd 255 has no `CLONE_INTO_CGROUP`
+      (256 does); D5, a privileged behaviour test of the tracker; D6, its
+      links pinned; D7, the kexec text; a `unit` exemption of the agent's
+      containment scopes refused. N5 found on the way: a move of a group
+      already exiting left a mark for the pid's next owner — a new thread
+      group's tgid is now cleared at its fork.
+    - The second: R1, the "not known" bit was set with a test and an atomic
+      add that a fork and a move on two CPUs could add twice (the child
+      exempt, the carry into the next tgid) — a byte a tgid now, plain
+      stores; R2, an upgrade's purge of the pin root dropped the marks —
+      the tracker's maps and links now in a directory of their own beside
+      it, kept by `install.sh --upgrade`, removed by `uninstall.sh`.
+    - The third: R2-a, the directory named by the marks' size made a
+      `sysctl` before a restart a reset, and a reset gave the marked their
+      exemption back — the directory is named by schema and generation,
+      the size a capacity, and a reset fails closed: every process started
+      before it, with what it forks, is not known (`CGROUP_JOIN_EPOCH`);
+      R2-b, an existing directory was adopted unchecked — a start adopts
+      only the directory its predecessor of this boot registered in
+      `/run/northnarrow/cgroup-join-pins` (protected), each map checked with
+      `BPF_OBJ_GET_INFO_BY_FD`; the pins gone between two agents are a
+      signed "marks lost between agents".
+    - Found in the lab on the way: `before_epoch`'s `match` on an unread
+      start became a compare of an unset register, which the 5.15 and 6.8
+      verifiers refused (`R1 !read_ok`, the tracker absent); a dot in the
+      directory's name, which bpffs refuses (`bpf_lookup`: EPERM, the
+      tracker absent) — now `v1_<n>`; a debug build's capacity remake that
+      set an epoch, which made the e2e harness's own children not known.
+  - The lab of the reviews, as measured on the final code (a8d5dc1d;
+    ubuntu2404 6.8.0-147 with systemd 255, ubuntu2204 5.15.0-202 with
+    systemd 249; overlays checked at the start, `enable --now`, the agent
+    uninstalled at the end):
+    - `verifier-check`: 90 of 90 on 6.8, 88 and 2 not counted on 5.15; the
+      tracker's five on both (`cgroup_join_mark` 973 instructions,
+      `cgroup_join_fork` 546, `cgroup_join_born` 386, `cgroup_join_exit`
+      149, `cgroup_join_src` 47). The marks 63,222 (24.04) and 63,170
+      (22.04) entries, `BPF_F_NO_PREALLOC`; the "not known" map 65,536 × 64
+      bytes.
+    - `exempt-check` 14 of 14 on each: the control exempt, the spoof, its
+      orphan and the threaded spoof killed and signed, a move into a
+      cgroup no exemption names marked and not signed; 200 starts of the
+      exempt unit by systemd under busy CPUs and 200 more with PID 1 and
+      the busy loops on one CPU (`taskset -pc 0 1`): 0 marked, on systemd
+      255 and on 249.
+    - `tracker-persist-check` 24 of 24 on each: the marks kept through an
+      agent stop (a move with no agent running marked), a restart and
+      `install.sh --upgrade` (the same directory, no reset); the pins
+      refuse an unlink and a new entry; `threads-max` doubled: no reset,
+      the signed capacity note; an LRU map planted in place of the
+      registered directory: not adopted, a new generation, the planted one
+      removed, the reset signed (`CGROUP_JOINED: id … where … was
+      registered`), the earlier marked process not known; the directory
+      deleted between two agents: "marks lost between agents", not known.
+      Then a cold boot: agent and watchdog active, the pin root populated,
+      our LSM programs loaded, the tracker attached (24.04: 73 pins, 42 LSM
+      programs, 66 own programs loaded; 22.04: 69, 40, 64), the same 30 s
+      later.
+    - The tracker's cost (`fork-cost`, `kernel.bpf_stats_enabled` for the
+      per-call part): about 0.93 µs a fork and its exit on 24.04
+      (`cgroup_post_fork` 469 ns, `sched_process_fork` 192 ns,
+      `sched_process_exit` 272 ns a call, 100,024 calls each) and 0.6 µs on
+      22.04 (269, 139, 187 ns); a fork + exit + wait took about 140 µs on
+      the 24.04 guest and 55 µs on the 22.04 one, the same with the
+      tracker's links detached within the rounds' spread.
+    - `test-ignored` on 24.04: 91 suites, 118 passed, 0 failed — the
+      tracker's nine privileged tests and the threaded worker's among
+      them; on 22.04 the tracker's nine: 9 of 9.
+    - `tamper-check` on 24.04, the tip against `main` 80c8da36 on the same
+      guest: 116 cases each, 115 OK on both, C64 the recorded deviation on
+      both, the verdict and the outcome of every case the same.
+    - The tracker's eBPF mutations against its privileged test on 24.04,
+      caught: N4' (`is_lost` always false), R1's store of 0 and next byte,
+      M2b (no one marked), M3 (even tgids skipped), N5's clear at the fork
+      removed, B1-old in full (both checks back to the rule before B1:
+      `a_threaded_move_of_the_leader_is_marked`), the epoch's PID 1
+      exclusion removed, its compare inverted, the epoch never applied
+      (`a_reset_makes_what_started_before_it_not_known`). B1-old at one
+      check only, either one, survives: each of the two checks closes B1
+      alone (the review's N-c), as designed.
+    - Host mutations on the reviews' code: 22 of 22 (the review's), 18 of
+      18 (R1/R2) and 21 of 21 (the third review's) caught — two only after
+      their tests were strengthened (the uninstall's tracker directories, a
+      foreign file in the registered directory); the agent's own read of a
+      "not known" byte and of a lookup error is held by the shape test (a
+      real map's), its behaviour by the privileged tests.
+  - Gates on the final tip (eBPF, the four clippy runs, fmt, the
+    workspace's tests, the privileged tests built, attack-coverage, golden
+    ×5, MSRV, fuzz replay, portable-core, lockfiles): as PR #494 records
+    them for this commit.
 - **Lot 278 — R009 kills in COMBAT only; the installer's window covers its
   own process tree; the lab's "R009 flake" fixed at its cause (C14, C17;
   the false positive of the review of #492, section f).**
