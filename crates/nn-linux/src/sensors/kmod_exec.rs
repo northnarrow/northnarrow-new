@@ -8,6 +8,9 @@
 //!   (`/usr/sbin/modprobe` → `../bin/kmod`) execute that same file; a file
 //!   of its own under a tool's name (`/usr/bin/modprobe`, where the
 //!   distribution installs none) is not it (the re-review of #498, DC-5);
+//!   `/usr/bin/kmod` and `/bin/kmod` two different files (not one file
+//!   under both names, as a merged `/usr` shows it): neither is (the
+//!   re-check of #498, N-3);
 //! - whether the process's environment holds `MODPROBE_OPTIONS` (which kmod
 //!   puts in front of its command line, and the sensor does not see) or one
 //!   of the dynamic linker's `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`
@@ -23,7 +26,12 @@
 //!   its memory gone, whatever was read then (a read cut by the exit is no
 //!   whole environment: DC-1) — is said so ([`Environment::Exited`]): its
 //!   kill would reach no one (the coordinator's decision of 04/11; R011
-//!   records it, its environment not verified). An empty environment read
+//!   records it, its environment not verified). A leader that exited while
+//!   another thread of its process runs on (`pthread_exit`: a zombie
+//!   without memory, its pidfd not exited) is no exit: the environment is
+//!   read from a running thread's entry (`/proc/<pid>/task/<tid>/environ`)
+//!   and judged — not read whole: refused (the re-check of #498, DC-A; the
+//!   kill reaches the process). An empty environment read
 //!   from the running process is one: libxtables runs `modprobe` with none
 //!   (`posix_spawn(…, argv, NULL)`; lot 279's lab, iptables-legacy on
 //!   Ubuntu 24.04).
@@ -35,12 +43,18 @@
 //! naming a configuration with an `install` command nobody's. A root parent
 //! that traces the tool (`PTRACE_O_TRACEEXEC`) can rewrite its argv and
 //! environment after this reading — root running code of its own, the
-//! residual R011 never covered.
+//! residual R011 never covered. Code injected into the tool (an
+//! `LD_PRELOAD` the pump read too late, `/etc/ld.so.preload`, a tracer) can
+//! also outlive it in a child it forked before exiting: the pump reads the
+//! exited tool (recorded, [`Environment::Exited`]), and R011's kill — the
+//! tool's process alone — would not reach that child, reparented out of
+//! its tree (the re-check of #498, N-1).
 //!
 //! On the exec pump's thread, first, before the event goes on the bus, for
 //! the execs whose `comm` is a module tool's only: a dozen `stat`s, one
-//! pidfd, two small `/proc` reads. No configuration, index or module file
-//! is read.
+//! pidfd, two small `/proc` reads (and its threads' entries when its
+//! leader shows no memory). No configuration, index or module file is
+//! read.
 
 use std::io::Read;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -55,7 +69,8 @@ use crate::anti_tamper::filesystem::stat_dev_to_kernel_dev;
 use crate::response::proc_ref::{pidfd_exited, pidfd_open, started_at, stat_start_ticks};
 
 /// The system's module tool under the host's root: the file `/usr/bin/kmod`
-/// resolves to, or `/bin/kmod`'s where there is no `/usr/bin/kmod`.
+/// resolves to, or `/bin/kmod`'s where there is no `/usr/bin/kmod`; none
+/// when both are there as two different files.
 const KMOD_PATHS: &[&str] = &["usr/bin/kmod", "bin/kmod"];
 
 /// The environment variables that refuse an exec of a module tool: kmod's
@@ -113,11 +128,21 @@ fn program(root: &Path, exe: &ExeIdentity) -> Result<(), String> {
                 .to_string(),
         );
     }
-    let kmod = KMOD_PATHS
+    let kmod: Vec<_> = KMOD_PATHS
         .iter()
-        .find_map(|p| std::fs::metadata(root.join(p)).ok())
-        .map(|m| (stat_dev_to_kernel_dev(m.dev()), m.ino()));
-    if kmod == Some((exe.dev, exe.ino)) {
+        .filter_map(|p| std::fs::metadata(root.join(p)).ok())
+        .map(|m| (stat_dev_to_kernel_dev(m.dev()), m.ino()))
+        .collect();
+    // two files, not one under two names (a merged /usr): neither is the
+    // system's (the re-check of #498, N-3)
+    if kmod.windows(2).any(|two| two[0] != two[1]) {
+        return Err(
+            "/usr/bin/kmod and /bin/kmod are two different files: neither is taken for the \
+             system's module tool"
+                .to_string(),
+        );
+    }
+    if kmod.first() == Some(&(exe.dev, exe.ino)) {
         Ok(())
     } else {
         Err(format!(
@@ -167,13 +192,73 @@ fn environment(proc: &Path, pid: u32, start_ns: u64) -> Environment {
         None => return Environment::Refused("its /proc entry could not be read".to_string()),
     }
     let mut env = Vec::new();
-    let read = std::fs::File::open(proc.join(format!("{pid}/environ")))
-        .and_then(|f| f.take(MAX_ENVIRON + 1).read_to_end(&mut env));
+    let read = read_environ(&proc.join(format!("{pid}/environ")), &mut env);
     // after the read: a process past its exit reads an empty environment
     // (its memory gone) before its pidfd says it exited
     let memory = stat().is_some_and(|stat| has_memory(&stat));
+    if !memory {
+        // its leader's memory gone: the process's exit, or its leader's
+        // alone while another of its threads runs on (DC-A)
+        if let Some(running) = running_thread(proc, pid, &fd) {
+            return running;
+        }
+    }
     let gone = pidfd_exited(&fd) || !memory;
-    judged(read.map(drop), &env, gone)
+    judged(read, &env, gone)
+}
+
+/// `path` (an `environ`) read into `env`: at most [`MAX_ENVIRON`] + 1
+/// bytes.
+fn read_environ(path: &Path, env: &mut Vec<u8>) -> std::io::Result<()> {
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_ENVIRON + 1).read_to_end(env))
+        .map(drop)
+}
+
+/// The re-check of #498, DC-A: the leader of `pid`'s thread group shows no
+/// memory — a leader that left by `pthread_exit` is a zombie, its
+/// environment empty or unreadable, while its process runs on in another
+/// thread, its pidfd not exited (R011's kill reaches that process).
+/// `None` when no thread of it runs with its memory: the process's own exit
+/// (DC-1). Else the environment read from the entry of one that does
+/// (`/proc/<pid>/task/<tid>/environ`: the process's one memory), judged as
+/// a running process's — refused when the threads cannot be listed while
+/// the process has not exited, or that environment cannot be read whole
+/// (the thread, or its process, gone by the end of the read).
+fn running_thread(proc: &Path, pid: u32, fd: &OwnedFd) -> Option<Environment> {
+    let task = proc.join(format!("{pid}/task"));
+    let threads = match std::fs::read_dir(&task) {
+        Ok(threads) => threads,
+        // reaped since: no thread of it runs
+        Err(_) if pidfd_exited(fd) => return None,
+        Err(e) => {
+            return Some(Environment::Refused(format!(
+                "its leader showed no memory and its threads could not be listed ({e})"
+            )))
+        }
+    };
+    let runs = |tid: &std::ffi::OsStr| {
+        std::fs::read_to_string(task.join(tid).join("stat")).is_ok_and(|stat| has_memory(&stat))
+    };
+    let tid = threads
+        .filter_map(Result::ok)
+        .map(|thread| thread.file_name())
+        .find(|tid| runs(tid))?;
+    let mut env = Vec::new();
+    let read = read_environ(&task.join(&tid).join("environ"), &mut env);
+    // after the read: the thread still ran, its process had not exited
+    let whole = runs(&tid) && !pidfd_exited(fd);
+    let tid = tid.to_string_lossy();
+    Some(match judged(read, &env, false) {
+        Environment::Clean if !whole => Environment::Refused(format!(
+            "its leader had exited, and its thread {tid} or its process exited as the thread's \
+             environment was read: not read whole"
+        )),
+        Environment::Refused(why) => Environment::Refused(format!(
+            "{why} (read from its thread {tid}: its leader had exited, the process ran on)"
+        )),
+        clean => clean,
+    })
 }
 
 /// What an environment read (`read`'s outcome; `env`, at most
@@ -308,27 +393,30 @@ mod tests {
         panic!("never a zombie");
     }
 
-    /// A copy of the `/proc` entry of `pid` (its stat as read now, the
-    /// virtual size set to `vsize` when given) under a directory of its
-    /// own, with `environ` an empty file or (`environ_dir`) a directory —
-    /// which no read takes.
-    fn proc_copy(pid: u32, vsize: Option<&str>, environ_dir: bool) -> tempfile::TempDir {
+    /// The stat of `pid` as read now, saying it runs (a zombie's says Z),
+    /// its virtual size set to `vsize` when given.
+    fn stat_running(pid: u32, vsize: Option<&str>) -> String {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
         let (head, rest) = stat.rsplit_once(')').unwrap();
         let mut fields: Vec<&str> = rest.split_whitespace().collect();
         if let Some(v) = vsize {
             fields[20] = v;
         }
-        // a zombie's stat says Z: the copy says it runs
         fields[0] = "S";
+        format!("{head}) {}\n", fields.join(" "))
+    }
+
+    /// A copy of the `/proc` entry of `pid` (its stat as read now, the
+    /// virtual size set to `vsize` when given; its one thread, its leader,
+    /// listed with that stat) under a directory of its own, with `environ`
+    /// an empty file or (`environ_dir`) a directory — which no read takes.
+    fn proc_copy(pid: u32, vsize: Option<&str>, environ_dir: bool) -> tempfile::TempDir {
+        let stat = stat_running(pid, vsize);
         let fake = tempfile::tempdir().unwrap();
         let entry = fake.path().join(pid.to_string());
-        std::fs::create_dir_all(&entry).unwrap();
-        std::fs::write(
-            entry.join("stat"),
-            format!("{head}) {}\n", fields.join(" ")),
-        )
-        .unwrap();
+        std::fs::create_dir_all(entry.join(format!("task/{pid}"))).unwrap();
+        std::fs::write(entry.join("stat"), &stat).unwrap();
+        std::fs::write(entry.join(format!("task/{pid}/stat")), &stat).unwrap();
         if environ_dir {
             std::fs::create_dir_all(entry.join("environ")).unwrap();
         } else {
@@ -579,23 +667,25 @@ mod tests {
     }
 
     /// The program is the system's tool by device and inode: the file
-    /// `/usr/bin/kmod` resolves to (a link to it executes that file), not
-    /// another file — a file of its own under a tool's name included (DC-5)
-    /// — and not an exec the kernel did not describe; `/bin/kmod` where
-    /// there is no `/usr/bin/kmod`.
+    /// `/usr/bin/kmod` resolves to (a link to it executes that file; `/bin`
+    /// a link to `/usr/bin`, a merged `/usr`), not another file — a file of
+    /// its own under a tool's name included (DC-5) — and not an exec the
+    /// kernel did not describe; `/bin/kmod` where there is no
+    /// `/usr/bin/kmod`; none when `/usr/bin/kmod` and `/bin/kmod` are two
+    /// different files (N-3), one file under both names (a hard link) is.
     #[test]
     fn the_program_is_the_system_s_tool_by_device_and_inode() {
         let root = tempfile::tempdir().unwrap();
         let p = |rel: &str| root.path().join(rel);
         std::fs::create_dir_all(p("usr/bin")).unwrap();
         std::fs::create_dir_all(p("usr/sbin")).unwrap();
-        std::fs::create_dir_all(p("bin")).unwrap();
+        // a merged /usr
+        std::os::unix::fs::symlink("usr/bin", p("bin")).unwrap();
         std::fs::write(p("usr/bin/kmod"), b"\x7fELF kmod").unwrap();
         std::os::unix::fs::symlink("../bin/kmod", p("usr/sbin/modprobe")).unwrap();
         std::fs::write(p("usr/bin/copy"), b"\x7fELF kmod").unwrap();
         // where the distribution installs nothing: a file of its own
         std::fs::write(p("usr/bin/modprobe"), b"\x7fELF kmod").unwrap();
-        std::fs::write(p("bin/kmod"), b"\x7fELF another kmod").unwrap();
         let id = |rel: &str, known: bool| {
             let m = std::fs::metadata(p(rel)).unwrap();
             ExeIdentity {
@@ -606,9 +696,10 @@ mod tests {
                 ..Default::default()
             }
         };
-        assert_eq!(program(root.path(), &id("usr/bin/kmod", true)), Ok(()));
-        assert_eq!(program(root.path(), &id("usr/sbin/modprobe", true)), Ok(()));
-        for other in ["usr/bin/copy", "usr/bin/modprobe", "bin/kmod"] {
+        for tool in ["usr/bin/kmod", "usr/sbin/modprobe", "bin/kmod"] {
+            assert_eq!(program(root.path(), &id(tool, true)), Ok(()), "{tool}");
+        }
+        for other in ["usr/bin/copy", "usr/bin/modprobe"] {
             let why = program(root.path(), &id(other, true)).unwrap_err();
             assert!(
                 why.contains("is not the system's module tool"),
@@ -623,7 +714,24 @@ mod tests {
         if raw.dev != stat_dev_to_kernel_dev(raw.dev) {
             assert!(program(root.path(), &raw).is_err());
         }
+        // no merged /usr, /bin/kmod a file of its own beside /usr/bin/kmod:
+        // neither is the system's tool (N-3)
+        std::fs::remove_file(p("bin")).unwrap();
+        std::fs::create_dir_all(p("bin")).unwrap();
+        std::fs::write(p("bin/kmod"), b"\x7fELF another kmod").unwrap();
+        for either in ["usr/bin/kmod", "usr/sbin/modprobe", "bin/kmod"] {
+            let why = program(root.path(), &id(either, true)).unwrap_err();
+            assert!(why.contains("two different files"), "{either}: {why}");
+        }
+        // one file under both names: the system's tool
+        std::fs::remove_file(p("bin/kmod")).unwrap();
+        std::fs::hard_link(p("usr/bin/kmod"), p("bin/kmod")).unwrap();
+        for tool in ["usr/bin/kmod", "bin/kmod"] {
+            assert_eq!(program(root.path(), &id(tool, true)), Ok(()), "{tool}");
+        }
         // no /usr/bin/kmod: /bin/kmod's file
+        std::fs::remove_file(p("bin/kmod")).unwrap();
+        std::fs::write(p("bin/kmod"), b"\x7fELF another kmod").unwrap();
         let bin_kmod = id("bin/kmod", true);
         std::fs::remove_file(p("usr/bin/kmod")).unwrap();
         assert_eq!(program(root.path(), &bin_kmod), Ok(()));
@@ -665,5 +773,270 @@ mod tests {
         );
         assert!(kept.program.is_err(), "no exe described: {kept:?}");
         stop(child);
+    }
+
+    /// The re-check of #498, DC-A, on a copy of a running process's entry
+    /// (its leader without memory, its pidfd not exited) beside its real
+    /// pidfd: a thread with the process's memory is read and judged — a
+    /// variable refused, a clean environment clean, one that cannot be read
+    /// refused; no thread with memory is the process's exit (DC-1); threads
+    /// that cannot be listed: refused while the process runs, its exit once
+    /// its pidfd says so.
+    #[test]
+    fn a_leader_without_memory_is_judged_by_a_running_thread() {
+        let child = sleeper(&[("PATH", "/usr/bin")]);
+        let start = started(&child);
+        let pid = child.id();
+        let tid = pid + 1;
+        // the copy, beside its leader a thread `tid` — with the process's
+        // memory or (`vsize`) not, its environment `environ` or unreadable
+        let with_thread = |vsize: Option<&str>, environ: Option<&[u8]>| {
+            let fake = proc_copy(pid, Some("0"), false);
+            let thread = fake.path().join(format!("{pid}/task/{tid}"));
+            std::fs::create_dir_all(&thread).unwrap();
+            std::fs::write(thread.join("stat"), stat_running(pid, vsize)).unwrap();
+            match environ {
+                Some(env) => std::fs::write(thread.join("environ"), env).unwrap(),
+                None => std::fs::create_dir_all(thread.join("environ")).unwrap(),
+            }
+            fake
+        };
+        let from_thread = format!("(read from its thread {tid}: its leader had exited");
+
+        // its leader alone, without memory: its exit (DC-1)
+        let fake = proc_copy(pid, Some("0"), false);
+        assert!(exited(environment(fake.path(), pid, start)).contains("its memory gone"));
+        // a thread runs on: its environment judged
+        let fake = with_thread(None, Some(b"PATH=/usr/bin\0MODPROBE_OPTIONS=-d /tmp/x\0"));
+        let why = refused(environment(fake.path(), pid, start));
+        assert!(why.contains("MODPROBE_OPTIONS='-d /tmp/x'"), "{why}");
+        assert!(why.contains(&from_thread), "{why}");
+        let fake = with_thread(None, Some(b"LD_PRELOAD=/tmp/x.so\0"));
+        let why = refused(environment(fake.path(), pid, start));
+        assert!(why.contains("LD_PRELOAD='/tmp/x.so'"), "{why}");
+        let fake = with_thread(None, Some(b"PATH=/usr/bin\0"));
+        assert_eq!(environment(fake.path(), pid, start), Environment::Clean);
+        let fake = with_thread(None, None);
+        let why = refused(environment(fake.path(), pid, start));
+        assert!(why.contains("its environment could not be read"), "{why}");
+        assert!(why.contains(&from_thread), "{why}");
+        // its thread without memory too: the process's exit
+        let fake = with_thread(Some("0"), Some(b"LD_PRELOAD=/tmp/x.so\0"));
+        assert!(exited(environment(fake.path(), pid, start)).contains("its memory gone"));
+        // its threads not listed while it runs: refused
+        let fake = proc_copy(pid, Some("0"), false);
+        std::fs::remove_dir_all(fake.path().join(format!("{pid}/task"))).unwrap();
+        let why = refused(environment(fake.path(), pid, start));
+        assert!(why.contains("its threads could not be listed"), "{why}");
+        stop(child);
+
+        // not listed once its pidfd says it exited (a zombie): its exit
+        let (mut z, start) = zombie();
+        let fake = proc_copy(z.id(), Some("0"), false);
+        std::fs::remove_dir_all(fake.path().join(format!("{}/task", z.id()))).unwrap();
+        assert!(exited(environment(fake.path(), z.id(), start)).contains("its memory gone"));
+        z.wait().unwrap();
+    }
+
+    /// DC-A: a running thread's environment read while that thread exits
+    /// (its stat then without memory) or its process does (its pidfd then
+    /// exited) is not read whole — refused, though what was read is clean.
+    /// The thread's `environ` is a FIFO: its writer changes the thread's
+    /// stat or kills the process after the read has opened it, before the
+    /// read can end.
+    #[test]
+    fn a_running_thread_s_environment_cut_by_an_exit_is_refused() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        for process_exits in [false, true] {
+            let mut child = sleeper(&[("PATH", "/usr/bin")]);
+            let start = started(&child);
+            let pid = child.id();
+            let fake = proc_copy(pid, Some("0"), false);
+            let thread = fake.path().join(format!("{pid}/task/{}", pid + 1));
+            std::fs::create_dir_all(&thread).unwrap();
+            let stat = thread.join("stat");
+            std::fs::write(&stat, stat_running(pid, None)).unwrap();
+            let fifo = thread.join("environ");
+            let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: a valid C path; a new FIFO in our own tempdir.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            let without_memory = stat_running(pid, Some("0"));
+            let writer = std::thread::spawn(move || {
+                // open once the read has (a FIFO's writer waits for a reader)
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut w = loop {
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&fifo)
+                    {
+                        Ok(w) => break w,
+                        Err(_) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(1))
+                        }
+                        Err(e) => panic!("the read never opened the thread's environ: {e}"),
+                    }
+                };
+                w.write_all(b"PATH=/usr/bin\0").unwrap();
+                if process_exits {
+                    // SAFETY: a signal to our own child.
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    for _ in 0..2000 {
+                        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                            .unwrap_or_default();
+                        if state
+                            .rsplit_once(')')
+                            .is_some_and(|(_, r)| r.trim_start().starts_with('Z'))
+                        {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                } else {
+                    std::fs::write(&stat, without_memory).unwrap();
+                }
+                // dropped: the read ends
+            });
+            let e = environment(fake.path(), pid, start);
+            let written = writer.join();
+            let _ = child.kill();
+            let _ = child.wait();
+            written.expect("the writer");
+            let why = refused(e);
+            assert!(
+                why.contains("not read whole"),
+                "process exits {process_exits}: {why}"
+            );
+        }
+    }
+
+    /// The helper of `a_leader_that_exited_while_its_thread_runs_has_not_exited`,
+    /// a no-op without `NN_K279_LEADER_EXITS`: run by that test in a process
+    /// of its own (this binary again, with the environment it chose), it
+    /// forks a process whose leader exits while a thread of it sleeps on,
+    /// prints that process's pid and waits for it.
+    #[test]
+    #[ignore = "a helper of a_leader_that_exited_while_its_thread_runs_has_not_exited"]
+    fn a_leader_exits_while_its_thread_runs_helper() {
+        if std::env::var_os("NN_K279_LEADER_EXITS").is_none() {
+            return;
+        }
+        extern "C" fn sleeps_on(_: *mut libc::c_void) -> *mut libc::c_void {
+            // SAFETY: plain libc calls; `_exit` ends the process.
+            unsafe {
+                libc::sleep(60);
+                libc::_exit(0)
+            }
+        }
+        // SAFETY: the child (a copy of this thread alone) makes one thread
+        // and ends its leader by the raw syscall — no unwinding, no atexit;
+        // glibc's fork leaves its allocator and threads usable in the child.
+        let leader = unsafe { libc::fork() };
+        if leader == 0 {
+            // SAFETY: as above.
+            unsafe {
+                let mut thread: libc::pthread_t = 0;
+                if libc::pthread_create(
+                    &mut thread,
+                    std::ptr::null(),
+                    sleeps_on,
+                    std::ptr::null_mut(),
+                ) != 0
+                {
+                    libc::_exit(1);
+                }
+                // the leader alone exits: its process runs on
+                libc::syscall(libc::SYS_exit, 0);
+                libc::_exit(2)
+            }
+        }
+        assert!(leader > 0, "fork: {}", std::io::Error::last_os_error());
+        println!("NN_K279_LEADER {leader}");
+        let mut status = 0;
+        // SAFETY: waits for our own child.
+        unsafe { libc::waitpid(leader, &mut status, 0) };
+    }
+
+    /// The re-check of #498, DC-A, its case `rr3` on a real process: a
+    /// leader that exited (`pthread_exit`; here its raw `exit`) while
+    /// another thread runs on — the leader a zombie without memory, its
+    /// pidfd not exited — is no exit: `MODPROBE_OPTIONS` or `LD_PRELOAD` in
+    /// its environment (read from the running thread) refused — R011's kill
+    /// reaches the process —, a clean environment clean.
+    #[test]
+    fn a_leader_that_exited_while_its_thread_runs_has_not_exited() {
+        use std::io::{BufRead, BufReader};
+        for (var, value) in [
+            ("MODPROBE_OPTIONS", "-d /tmp/x"),
+            ("LD_PRELOAD", "/nonexistent-nn-k279/x.so"),
+            ("PATH", "/usr/bin"),
+        ] {
+            let mut helper = Command::new(std::env::current_exe().expect("this test binary"))
+                .args([
+                    "--exact",
+                    "sensors::kmod_exec::tests::a_leader_exits_while_its_thread_runs_helper",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env_clear()
+                .env(var, value)
+                .env("NN_K279_LEADER_EXITS", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("run the helper");
+            let mut out = BufReader::new(helper.stdout.take().unwrap());
+            let mut line = String::new();
+            let pid = loop {
+                line.clear();
+                if out.read_line(&mut line).unwrap_or(0) == 0 {
+                    break None;
+                }
+                // after libtest's "test … ... " on the same line
+                if let Some((_, pid)) = line.split_once("NN_K279_LEADER ") {
+                    break pid.trim().parse::<u32>().ok();
+                }
+            };
+            // the leader a zombie, its thread running
+            let mut shape = None;
+            for _ in 0..2000 {
+                let Some(pid) = pid else { break };
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                let threads =
+                    std::fs::read_dir(format!("/proc/{pid}/task")).map_or(0, |t| t.count());
+                if stat
+                    .rsplit_once(')')
+                    .is_some_and(|(_, r)| r.trim_start().starts_with('Z'))
+                    && threads == 2
+                {
+                    shape = Some(stat);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let read = pid.zip(shape.as_ref()).map(|(pid, _)| {
+                let start = proc_start_ns(pid).expect("its start");
+                environment(Path::new("/proc"), pid, start)
+            });
+            if let Some(pid) = pid {
+                // SAFETY: a signal to the helper's child, the whole process
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            }
+            let _ = std::io::Read::read_to_end(&mut out, &mut Vec::new());
+            let _ = helper.kill();
+            let _ = helper.wait();
+            let stat = shape.expect("a zombie leader and a running thread");
+            assert!(!has_memory(&stat), "the leader without memory: {stat}");
+            let e = read.expect("read");
+            if var == "PATH" {
+                assert_eq!(e, Environment::Clean);
+            } else {
+                let why = refused(e);
+                assert!(why.contains(&format!("{var}='{value}'")), "{why}");
+                assert!(why.contains("its leader had exited"), "{why}");
+            }
+        }
     }
 }
