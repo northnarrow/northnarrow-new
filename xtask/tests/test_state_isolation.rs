@@ -92,6 +92,11 @@ const HOST_PATH_USERS: &[(&str, &str)] = &[
          after it — an empty write, the file never changed",
     ),
     (
+        "agent/tests/cgroup_join_privileged_e2e.rs",
+        "the pin root's tracker maps (lot 277, the review of #494, D5): the marks the kernel \
+         made, read through a read-only descriptor — nothing there is written",
+    ),
+    (
         "agent/tests/fs_deny_privileged_e2e.rs",
         "the denies of the agent's fixed directories (/etc/northnarrow, \
          /var/lib/northnarrow/detections, the pin root): it creates and removes its own \

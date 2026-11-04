@@ -429,11 +429,53 @@ impl Marks {
     }
 }
 
+/// A pinned map opened read-only (`BPF_OBJ_GET` with `BPF_F_RDONLY`): the
+/// BPF map guard refuses a write handle on the agent's maps to any other
+/// process, and a read needs none.
+fn open_pinned_ro(path: &Path) -> Result<MapData, String> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    const BPF_OBJ_GET: libc::c_long = common::bpf_cmd::BPF_OBJ_GET as libc::c_long;
+    const BPF_F_RDONLY: u32 = 1 << 3;
+    #[repr(C)]
+    struct ObjGet {
+        pathname: u64,
+        bpf_fd: u32,
+        file_flags: u32,
+    }
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    let attr = ObjGet {
+        pathname: c.as_ptr() as u64,
+        bpf_fd: 0,
+        file_flags: BPF_F_RDONLY,
+    };
+    // SAFETY: bpf(BPF_OBJ_GET) with a valid attribute block and a
+    // NUL-terminated path that outlives the call.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_OBJ_GET,
+            &attr as *const ObjGet,
+            std::mem::size_of::<ObjGet>(),
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "BPF_OBJ_GET {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: a descriptor the kernel just gave us, owned from here.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    MapData::from_fd(fd).map_err(|e| e.to_string())
+}
+
 /// Lot 277 (the review of #494, D5): the mark of `tgid` in the pinned map
 /// under bpffs `root` — a privileged test's, a tool's read (the agent's own
 /// goes through [`Marks`]).
 pub fn pinned_mark(root: &Path, tgid: u32) -> Result<Option<Mark>, String> {
-    let md = MapData::from_pin(root.join(JOINED_MAP)).map_err(|e| e.to_string())?;
+    let md = open_pinned_ro(&root.join(JOINED_MAP))?;
     let map = Joined::try_from(aya::maps::Map::HashMap(md)).map_err(|e| e.to_string())?;
     match map.get(&tgid, 0) {
         Ok([_, info]) => {
@@ -449,7 +491,7 @@ pub fn pinned_mark(root: &Path, tgid: u32) -> Result<Option<Mark>, String> {
 /// bit in the pinned bitmap under bpffs `root`).
 pub fn pinned_lost(root: &Path, tgid: u32) -> Result<bool, String> {
     let (word, bit) = lost_slot(tgid).ok_or("no tgid that large")?;
-    let md = MapData::from_pin(root.join(LOST_MAP)).map_err(|e| e.to_string())?;
+    let md = open_pinned_ro(&root.join(LOST_MAP))?;
     let map = Lost::try_from(aya::maps::Map::Array(md)).map_err(|e| e.to_string())?;
     Ok(map.get(&word, 0).map_err(|e| e.to_string())? & bit != 0)
 }

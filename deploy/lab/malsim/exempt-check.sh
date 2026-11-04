@@ -16,8 +16,15 @@
 #     signed NN-L-AT-001 `cgroup_join` naming the exemption;
 #  3) spoof through an orphan: the moved shell forks the simulator and exits
 #     (the simulator is reparented to PID 1) → still not exempt: killed;
-#  4) a root shell that moves itself into a cgroup no exemption names → no
-#     signed record (marked, never signed).
+#  3b) the review of #494, B1: a root process whose second thread writes its
+#     leader into a threaded child of its own session scope named like the
+#     unit (`…/session-N.scope/nn-lab-exempt.service`, `cgroup.threads`) →
+#     the unit by name, but NOT exempt: killed, and signed;
+#  4) a root shell that moves itself into a cgroup no exemption names →
+#     marked (the pinned map, read-only: cgroup-marks.py), no signed record;
+#  5) the review of #494, C: RESTARTS (200) starts of the exempt unit by
+#     systemd under a busy CPU → no main process marked, no root counted for
+#     them.
 # Then the policy files are removed (in a trusted-installer window), the
 # units stopped: the guest is put back.
 set -u
@@ -27,6 +34,8 @@ NNADMIN=$(dirname "$(systemctl show -p ExecStart --value northnarrow-agent | gre
 KEY=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r "$k" && { echo "$k"; break; }; done)
 HERE=$(cd "$(dirname "$0")" && pwd)
 SIM="$HERE/ransom-sim.py"
+MARKS="$HERE/cgroup-marks.py"
+RESTARTS=${RESTARTS:-200}
 UNIT=nn-lab-exempt.service
 CG=/sys/fs/cgroup/system.slice/$UNIT
 OTHER=nn-lab-other.service
@@ -107,12 +116,58 @@ if grep -q "KillProcessTree" <<<"$rec" && ! grep -q "'exempt'" <<<"$rec" && [[ $
     pass "orphan: a process forked from the moved shell is not exempt either — killed ($n of 300)"
 else bad "orphan: locked=$n rec=[$rec]"; fi
 
+echo "== 4b. threaded spoof: a second thread moves its leader into a threaded child named like the unit"
+prepare; b=$(lines "$DET")
+sudo python3 -I - "$SIM" <<'PY'
+import os, sys, threading
+own = [l[3:] for l in open("/proc/self/cgroup").read().splitlines() if l.startswith("0::")][0]
+d = "/sys/fs/cgroup" + own + "/nn-lab-exempt.service"
+os.mkdir(d)
+open(d + "/cgroup.type", "w").write("threaded")
+def mover():
+    with open(d + "/cgroup.threads", "w") as f:
+        f.write(str(os.getpid()))
+t = threading.Thread(target=mover); t.start(); t.join()
+open("/tmp/nn277-thr", "w").write(d + "\n" + open("/proc/%d/cgroup" % os.getpid()).read())
+os.execv(sys.executable, [sys.executable, "-I", sys.argv[1], "inplace"])
+PY
+rc=$?
+sleep 3; n=$(locked); rec=$(since "$DET" "$b" | imp); j=$(since "$DET" "$b" | joins)
+td=$(sudo head -1 /tmp/nn277-thr 2>/dev/null)
+echo "    leader in: $(sudo tail -n +2 /tmp/nn277-thr 2>/dev/null)  sim rc=$rc locked=$n"; echo "$rec" | sed 's/^/    /'; echo "$j" | sed 's/^/    join: /'
+sudo grep -q "/nn-lab-exempt.service" /tmp/nn277-thr && pass "threaded: the leader ran in a cgroup named like the unit" || bad "threaded: [$(sudo cat /tmp/nn277-thr 2>/dev/null)]"
+if grep -q "KillProcessTree" <<<"$rec" && ! grep -q "'exempt'" <<<"$rec" && [[ $n -lt 300 ]]; then
+    pass "threaded: not exempt — killed ($n of 300 files locked)"
+else bad "threaded: rc=$rc locked=$n rec=[$rec]"; fi
+grep -q "NN-L-AT-001" <<<"$j" && grep -q "unit $UNIT" <<<"$j" \
+    && pass "threaded: the move is a signed cgroup_join naming the exemption" || bad "threaded: join [$j]"
+[[ -n $td ]] && for _ in $(seq 1 30); do sudo rmdir "$td" 2>/dev/null && break; sleep 1; done
+
 echo "== 5. a move into a cgroup no exemption names: marked, not signed"
 sudo systemd-run --quiet --collect --unit="$OTHER" -- sleep 600
 sleep 1; b=$(lines "$DET")
-sudo bash -c "echo \$BASHPID > /sys/fs/cgroup/system.slice/$OTHER/cgroup.procs && true"
-sleep 2; j=$(since "$DET" "$b" | joins)
+sudo bash -c "echo \$BASHPID > /sys/fs/cgroup/system.slice/$OTHER/cgroup.procs && echo \$BASHPID > /tmp/nn277-other.pid && sleep 3" &
+sleep 1; opid=$(sudo cat /tmp/nn277-other.pid 2>/dev/null); m=$(sudo python3 -I "$MARKS" mark "$opid")
+wait; sleep 1; j=$(since "$DET" "$b" | joins)
+echo "    $m"
+grep -q " moved $opid" <<<"$m" && pass "a move into $OTHER: the shell marked (moved, by itself)" || bad "other: mark [$m]"
 [[ -z $j ]] && pass "no exemption names $OTHER: no cgroup_join record" || bad "other: join [$j]"
+
+echo "== 6. systemd's placement: $RESTARTS starts of $UNIT under a busy CPU, no mark"
+busy=(); for _ in $(seq 1 "$(nproc)"); do ( while :; do :; done ) & busy+=($!); done
+s0=$(sudo python3 -I "$MARKS" stat); marked=0; noppid=0
+for i in $(seq 1 "$RESTARTS"); do
+    sudo systemctl stop "$UNIT" 2>/dev/null
+    sudo systemd-run --quiet --collect --unit="$UNIT" -- sleep 600
+    mp=$(systemctl show -p MainPID --value "$UNIT")
+    if [[ -z $mp || $mp == 0 ]]; then noppid=$((noppid+1)); continue; fi
+    m=$(sudo python3 -I "$MARKS" mark "$mp")
+    [[ $m == "$mp -" ]] || { marked=$((marked+1)); echo "    round $i: $m"; }
+done
+s1=$(sudo python3 -I "$MARKS" stat)
+kill "${busy[@]}" 2>/dev/null; wait 2>/dev/null
+echo "    stats before: $s0"; echo "    stats after:  $s1"; echo "    $(systemctl --version | head -1); rounds without a main pid: $noppid"
+[[ $marked -eq 0 && $noppid -lt $RESTARTS ]] && pass "placement: $RESTARTS starts by systemd, $marked main processes marked" || bad "placement: $marked of $RESTARTS marked ($noppid without a main pid)"
 
 echo "== put back"
 sudo systemctl stop "$UNIT" "$OTHER" 2>/dev/null
@@ -122,6 +177,6 @@ sudo "$NNADMIN" policy set --file /tmp/rp277-empty.local --key "$KEY" >/dev/null
 sudo "$NNADMIN" debug force-posture observing >/dev/null 2>&1
 sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 120 >/dev/null 2>&1 \
     && sudo rm -f /etc/northnarrow/rule-policy.local /etc/northnarrow/rule-policy.local.sig
-rm -f /tmp/rp277.local /tmp/rp277-empty.local; sudo rm -f /tmp/nn277-cg /tmp/nn277-orphan.out /tmp/nn277-orphan.pid
+rm -f /tmp/rp277.local /tmp/rp277-empty.local; sudo rm -f /tmp/nn277-cg /tmp/nn277-orphan.out /tmp/nn277-orphan.pid /tmp/nn277-thr /tmp/nn277-other.pid
 echo "exempt check: $( ((fail)) && echo FAIL || echo PASS)"
 exit $fail
