@@ -63,7 +63,8 @@ measure() {
     "$@" >"$WORK/$name.log" 2>&1
     local rc=$?
     sleep 4
-    n=$(new_records "$b" | py records count --rule "$RULE")
+    # also under another rule's record of the same event (its `matches`)
+    n=$(new_records "$b" | py records count --rule "$RULE" --in-matches)
     list=$(new_records "$b" | python3 -I -c '
 import json, sys
 for line in sys.stdin:

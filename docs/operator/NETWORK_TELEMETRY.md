@@ -139,19 +139,49 @@ it.
   `off NN-L-NET-028` drops it, `audit NN-L-NET-028` records without
   counting, `exempt NN-L-NET-028 exe <path> sha256 <hex>` (or `uid`,
   `unit`) spares one program; `enforce NN-L-NET-028` arms the held kill.
-- **Known false positives** (measured on the lab's workloads, lot 275 —
-  the capability program (https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md)): clients that resolve outside the
-  system resolver; peers configured by address (NTP servers, database
-  replicas, mirrors by IP); rootless container networking whose helper
-  (`slirp4netns`, `pasta`) connects for a container that resolved inside its
-  own namespace; a ring overflow of the DNS sensors (counted in `dns`,
-  `dns_answer`) that lost a response.
+- **False positives measured** (lot 275's lab, `deploy/lab/malsim/nodns-fp.sh`,
+  every NN-L-NET-028 record of a workload's window counted, also under
+  another rule's record of the same event): **none** on Ubuntu 24.04 (6.8)
+  and 22.04 (5.15) over `apt-get update` and a download-only install, 40
+  parallel HTTPS fetches over 12 hosts and `wget -p` of a page, 30 s of
+  `systemd-timesyncd`, a `git clone` over HTTPS, `apt-get download` from
+  the mirror, a rootful and a rootless podman container fetching over
+  HTTPS, and lookups through the configured resolver (stub `127.0.0.53`,
+  `hosts: files dns`). On 22.04 two of them did not complete, for causes
+  outside this rule: the `git clone`'s HTTPS helper died of `SIGILL` in
+  libgnutls on the guest's virtual CPU (after its connect, which was
+  judged), and the rootful container did not start (R011 killed the
+  `modprobe` podman ran). Not measured: `nss-resolve` hosts, Docker, a
+  resolver other than systemd-resolved, browsers.
+- **Expected false positives** (by design, not measured): clients that
+  resolve outside the system resolver (DoH, a resolver of their own);
+  peers configured by address (NTP servers, database replicas, mirrors by
+  IP); rootless container networking whose helper (`slirp4netns`, `pasta`)
+  connects for a container that resolved inside its own namespace; a ring
+  overflow of the DNS sensors (counted in `dns`, `dns_answer`) that lost a
+  response. Load tools that connect to literal addresses draw it too: the
+  lab's EXP-13 probe does, by design.
 
 ## 6. What it costs
 
 Each source's programs run on hot paths: `tcp_sendmsg` (every TCP send: one
 map lookup that misses after a flow's first send), `udp_recvmsg` (every UDP
-receive: the return value's test and the source port), `inet_csk_accept`
-(every accept). The lab's measurements with the three sources on, against
-`main`, are in the capability program (https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md) (lot 275) and, per
-source, in the capability manifest's terms.
+receive: the return value's test, the source address read and its port
+compared), `inet_csk_accept` (every accept). Measured in lot 275's lab
+(`nn-lab.sh overhead 3`, medians of 3 rounds, throughput lost with the agent
+running, every source on; Ubuntu 24.04 / 22.04 guests):
+
+| workload | 6.8: main | 6.8: lot 275 | 5.15: main | 5.15: lot 275 |
+|---|---|---|---|---|
+| `udp` (64-byte sends, each received) | +17.1 % | +22.8 % | +5.4 % | +23.1 % |
+| `udprecv` (a loopback datagram received) | — | +20.9 % | — | +22.6 % |
+| `tcpsend` (64-byte sends on one connection) | — | +1.9 % | — | +2.8 % |
+| `connect` (connect, accept, close) | +11.7 % | +15.0 % | −8.4 % | +15.2 % |
+| `dns` (queries sent) | +16.5 % | +10.5 % | +2.3 % | +16.1 % |
+
+The UDP receive path is where the cost is: every receive runs the DNS
+response program (most of them stop at the source port). The workloads
+`udprecv` and `tcpsend` are new with this lot (no `main` figure). The
+rounds are noisy (`connect` on 22.04's `main` run reads −8.4 %); the
+per-run reports are in the capability program's lot 275 note.
+
