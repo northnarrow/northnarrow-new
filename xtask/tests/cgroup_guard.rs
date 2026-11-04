@@ -934,6 +934,29 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     )
     .unwrap();
     assert!(!body(&si, "own_dropins_round").contains("UNIX_EPOCH"));
+    // the short re-check of #497: an unreadable install time is said,
+    // signed (NB6); a harmful drop-in from before the install reported,
+    // signed, never moved (RB1)
+    in_order(
+        body(&si, "own_dropins_round"),
+        &[
+            "let Some(since) = crate::own_dropins::install_time() else {",
+            "kind: \"own_dropin_round_skipped\",",
+            "return;",
+            "crate::own_dropins::quarantine(",
+            "crate::own_dropins::nn_settings(&search)",
+            "\"own_dropin_weakening\"",
+            "\"own_dropin_setting\"",
+            "self.report_once(f, at_boot);",
+            "self.record_once(f, at_boot);",
+            "crate::own_dropins::preinstall_harmful(",
+            "kind: \"own_dropin_preinstall_harmful\",",
+        ],
+    )
+    .unwrap();
+    // our drop-ins' environment judged by our judge: NN_ kept, loader harmful
+    assert!(body(&od, "harmful").contains("own_harms(reach, &k, &v, host)"));
+    assert!(body(&od, "own_harms").contains("LOADER_ENV.contains(&n.as_str())"));
     in_order(
         body(&od, "install_time"),
         &["std::fs::metadata(\"/proc/self/exe\")", "meta.ctime()"],
@@ -1090,4 +1113,26 @@ fn the_ebpf_job_runs_the_check_cfg_tests_and_counts_them() {
     ] {
         assert!(tests.contains(t), "{t}");
     }
+}
+
+/// The short re-check of #497 (NB5): the units moved from `system.slice`
+/// to their own `northnarrow.slice`, and the exec policy's kernel side gave
+/// them the UNKNOWN tier instead of SERVICE. Their slice is published and
+/// judged a service slice, as `system.slice` was for them.
+#[test]
+fn the_units_own_slice_is_a_service_tier() {
+    let e = code("agent-ebpf/src/execpol.rs");
+    in_order(
+        body(&e, "tier_of"),
+        &[
+            "let sys = slice(slice_slot::SYSTEM);",
+            "let ours = slice(slice_slot::OURS);",
+            "if cg1 != 0 && (cg1 == sys || cg1 == ours) {",
+            "return tier::SERVICE | sig | tier_sig::SYSTEM_SLICE;",
+        ],
+    )
+    .unwrap();
+    let k = code("agent/src/execpol/kernel.rs");
+    assert!(body(&k, "slice_ids").contains("id(\"northnarrow.slice\")"));
+    assert!(body(&k, "set_slices").contains("self.slices.set(slice_slot::OURS, ours, 0);"));
 }

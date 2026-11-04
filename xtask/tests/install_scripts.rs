@@ -745,6 +745,30 @@ exit 0"#
     );
 }
 
+/// The coordinator's decision on #497's `NN_` drop-ins: the agent's `NN_`
+/// settings in its units' drop-ins are kept configuration — listed by the
+/// upgrade, never a refusal (an operator of the exec policy upgrades).
+#[test]
+fn an_upgrade_lists_the_agent_s_nn_settings_as_kept_configuration() {
+    let both = ["northnarrow-agent", "northnarrow-watchdog"];
+    let host = Host::new("install-dropins-kept", &both, true, true);
+    let tree = host.dir.join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    write_exec(
+        &tree.join("northnarrow-agent"),
+        r#"case "$*" in
+    --version) echo 'northnarrow-agent 0.0.2' ;;
+    "--own-dropins check") echo "would keep NN_EXEC_POLICY=audit set by /etc/systemd/system/northnarrow-agent.service.d/40-policy.conf"; exit 0 ;;
+esac
+exit 0"#,
+    );
+    let r = host.install_from("full", true, Some("key-role"), "$T/tree/northnarrow-agent");
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert!(r.stdout.contains("install.sh: kept configuration in the drop-ins of the agent's own units (each setting signed by the agent):"), "{r:#?}");
+    assert!(r.stdout.contains("install.sh:   NN_EXEC_POLICY=audit set by /etc/systemd/system/northnarrow-agent.service.d/40-policy.conf"), "{r:#?}");
+    assert!(!r.stderr.contains("REFUSED"), "{r:#?}");
+}
+
 /// A running install still takes the upgrade path: nothing extra started,
 /// both units restarted at the end; without --upgrade it is refused.
 #[test]
@@ -1753,6 +1777,8 @@ exec /bin/rm "$@""#
 FAIL={af}; READS_MARKER={marker}
 case "${{1:-}}" in
     --version) echo "northnarrow-agent {v}"; exit 0 ;;
+    --own-dropins) echo "own-dropins ${{2:-}}" >> "$NN_TEST_DIR/own-dropins.calls"
+        [ -s "$NN_TEST_DIR/own-dropins" ] && {{ cat "$NN_TEST_DIR/own-dropins"; exit 3; }}; exit 0 ;;
     __nn_test_boot) ;;
     *) exit 0 ;;
 esac
@@ -2799,6 +2825,37 @@ impl Lab {
         )
         .unwrap();
     }
+}
+
+/// The short re-check of #497 (RB1): a package's configure step runs the
+/// installed agent's drop-in check as a warning — each one named, the
+/// remedy given, nothing moved, the hook not failed.
+#[test]
+fn the_package_configure_step_warns_of_the_drop_ins_the_agent_judges_harmful() {
+    let lab = Lab::new("pkg-dropins");
+    lab.unpacked();
+    let d = "/etc/systemd/system/northnarrow-agent.service.d";
+    fs::write(
+        lab.root.join("own-dropins"),
+        format!("would move {d}/60-env.conf: found by the installer's check, EnvironmentFile=/etc/default/nn lies outside /etc/northnarrow/\n"),
+    )
+    .unwrap();
+    let _ = fs::remove_file(lab.root.join("own-dropins.calls"));
+    let r = lab.package(&["--package-configure"]);
+    assert_eq!(r.status, 0, "the hook never fails on it: {r:#?}");
+    for want in [
+        "install.sh: WARNING: the drop-in directories of the agent's own units hold drop-ins",
+        &format!("install.sh:   {d}/60-env.conf: found by the installer's check, EnvironmentFile=/etc/default/nn"),
+        "UPGRADE_NOTES_WAVE4.md section 9",
+    ] {
+        assert!(r.stderr.contains(want), "{want}: {r:#?}");
+    }
+    assert_eq!(
+        fs::read_to_string(lab.root.join("own-dropins.calls")).unwrap(),
+        "own-dropins check\n",
+        "checked once, never asked to move"
+    );
+    assert!(r.stdout.contains("health check passed"), "{r:#?}");
 }
 
 /// External audit DEP-010 covered a failed operation; lab PR 220 covers the

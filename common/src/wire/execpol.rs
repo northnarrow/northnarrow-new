@@ -128,7 +128,10 @@ pub mod flags {
 pub mod slice_slot {
     pub const SYSTEM: u32 = 0;
     pub const USER: u32 = 1;
-    pub const SLOTS: u32 = 2;
+    /// Lot 273d (the short re-check of #497, NB5): the units' own
+    /// `northnarrow.slice` — a service tier, as `system.slice` was for them.
+    pub const OURS: u32 = 2;
+    pub const SLOTS: u32 = 3;
 }
 
 /// `EXECPOL_IMAGES` value bits: what an executable image (by `(dev, ino)`)

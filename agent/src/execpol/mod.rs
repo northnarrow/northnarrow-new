@@ -391,7 +391,7 @@ pub fn start(
         recorder,
         controller::Settings::for_host(cfg.table.exempt.clone(), cfg.source.clone(), !execq_on),
     );
-    let (system, user) = ctl.refresh(std::time::Instant::now());
+    let (system, user, _ours) = ctl.refresh(std::time::Instant::now());
     if system == 0 && user == 0 {
         note(
             "exec policy: no systemd slice found on a cgroup v2 mount: every caller is \

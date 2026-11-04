@@ -128,6 +128,164 @@ fn under_env_dir(f: &str) -> bool {
             .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
 }
 
+/// The loader's variables: harmful in our units' environment whatever the
+/// window (the coordinator's decision on #497's `NN_` drop-ins).
+pub const LOADER_ENV: &[&str] = crate::host_dropins::DANGEROUS_ENV_NAMES;
+
+/// The `NN_` switches that weaken the agent when a drop-in of ours sets
+/// them — besides [`crate::self_integrity::WEAKENING_ENV`] (the agent's own
+/// start judges those too): a sensor back to its older fallback, the exec
+/// policy off. Each one kept is a High alert, not an informative record.
+pub const WEAKENING_DROPIN_EXTRA: &[(&str, crate::self_integrity::WeakensWith)] = &[
+    ("NN_FILE_OPEN_SENSOR", |v| v.trim() == "tracepoint"),
+    ("NN_EXEC_SENSOR", |v| v.trim() == "tracepoint"),
+    ("NN_DNS_SENSOR", |v| v.trim() == "sendmsg"),
+    ("NN_EXEC_POLICY", |v| v.trim() == "off"),
+];
+
+/// `name=value` weakens the agent ([`WEAKENING_DROPIN_EXTRA`],
+/// [`crate::self_integrity::WEAKENING_ENV`]).
+pub fn nn_weakens(name: &str, value: &str) -> bool {
+    crate::self_integrity::WEAKENING_ENV
+        .iter()
+        .chain(WEAKENING_DROPIN_EXTRA)
+        .any(|(n, weakens)| *n == name && weakens(value))
+}
+
+/// `name=value` assignments of an `Environment=` value (quotes taken off).
+fn env_assignments(v: &str) -> Vec<(String, String)> {
+    v.split_whitespace()
+        .filter_map(|a| {
+            let a = a.trim_matches('"');
+            a.split_once('=')
+                .map(|(n, val)| (n.to_string(), val.to_string()))
+        })
+        .collect()
+}
+
+/// `name=value` lines of an environment file (`export` and blanks taken
+/// off, comments skipped).
+fn env_file_assignments(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let l = l.trim().trim_start_matches("export ").trim();
+            if l.starts_with('#') {
+                return None;
+            }
+            l.split_once('=')
+                .map(|(n, v)| (n.trim().to_string(), v.trim().trim_matches('"').to_string()))
+        })
+        .collect()
+}
+
+/// The judge of one directive of OUR units' drop-ins: the host's
+/// ([`harms`]), except for the environment (the coordinator's decision on
+/// #497's `NN_` drop-ins): a loader variable ([`LOADER_ENV`]) is harmful,
+/// an `NN_` one is the operator's configuration — kept, each one signed
+/// ([`nn_settings`]). An `EnvironmentFile=` is read the same way (it lies
+/// under [`ENV_FILE_DIR`] by then: [`shape_harm`]).
+fn own_harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<String> {
+    match key {
+        "Environment" => env_assignments(value)
+            .into_iter()
+            .find(|(n, _)| LOADER_ENV.contains(&n.as_str()))
+            .map(|(n, _)| format!("{n} set in our units' environment")),
+        "EnvironmentFile" => {
+            let p = value.trim().trim_start_matches('-');
+            let text = std::fs::read_to_string(p).unwrap_or_default();
+            env_file_assignments(&text)
+                .into_iter()
+                .find(|(n, _)| LOADER_ENV.contains(&n.as_str()))
+                .map(|(n, _)| format!("{n} set in our units' environment (from {p})"))
+        }
+        _ => harms(reach, key, value, host),
+    }
+}
+
+/// An `NN_` setting a kept drop-in of ours gives our units.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NnSetting {
+    pub dropin: PathBuf,
+    pub name: String,
+    pub value: String,
+    /// One of the switches that weaken the agent ([`nn_weakens`]).
+    pub weakens: bool,
+}
+
+impl NnSetting {
+    pub fn detail(&self) -> String {
+        format!(
+            "{}={} set by {}{}",
+            self.name,
+            self.value,
+            self.dropin.display(),
+            if self.weakens {
+                " — a switch that weakens the agent"
+            } else {
+                ""
+            }
+        )
+    }
+}
+
+/// The coordinator's decision on #497's `NN_` drop-ins: every `NN_`
+/// setting the regular single-name drop-ins of our directories give our
+/// units — `Environment=` and the `EnvironmentFile=`s under
+/// [`ENV_FILE_DIR`] — for a signed record each (a High alert for one that
+/// weakens the agent).
+pub fn nn_settings(roots: &[&Path]) -> Vec<NnSetting> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for root in roots {
+        for (dir, _) in own_dirs(root) {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            if let Ok(canon) = std::fs::canonicalize(&dir) {
+                if !seen.insert(canon) {
+                    continue;
+                }
+            }
+            let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            files.sort();
+            for from in files {
+                if from.extension().and_then(|x| x.to_str()) != Some("conf")
+                    || !regular_with_one_name(&from)
+                {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&from) else {
+                    continue;
+                };
+                for (k, v) in effective(directives(&text)) {
+                    let pairs = match k.as_str() {
+                        "Environment" => env_assignments(&v),
+                        "EnvironmentFile" => {
+                            let p = v.trim().trim_start_matches('-');
+                            if !under_env_dir(p) {
+                                continue;
+                            }
+                            env_file_assignments(&std::fs::read_to_string(p).unwrap_or_default())
+                        }
+                        _ => continue,
+                    };
+                    for (name, value) in pairs {
+                        if name.starts_with("NN_") {
+                            out.push(NnSetting {
+                                dropin: from.clone(),
+                                weakens: nn_weakens(&name, &value),
+                                name,
+                                value,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `path` is a regular file with one name (`lstat`: a symlink is not).
 pub fn regular_with_one_name(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -198,6 +356,9 @@ pub const AT_CLOSE: &str = "made inside the window";
 pub const AT_ROUND: &str = "changed outside a window since the agent was installed";
 /// [`Pass::when`] of the installer's check (every entry).
 pub const AT_CHECK: &str = "found by the installer's check";
+/// [`Pass::when`] of a harmful drop-in from before the install, which the
+/// round reports and never moves (the short re-check of #497, RB1).
+pub const AT_PREINSTALL: &str = "there before the agent was installed";
 
 /// A harmful entry of our directories, not moved yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,7 +442,7 @@ pub fn harmful(
                         effective(directives(text.as_deref()?))
                             .into_iter()
                             .find_map(|(k, v)| {
-                                harms(reach, &k, &v, host)
+                                own_harms(reach, &k, &v, host)
                                     .map(|w| (k.clone(), v.clone(), w, Kind::Harmful))
                                     .or_else(|| {
                                         breaks(&k, &v).map(|w| (k, v, w, Kind::BreaksAgent))
@@ -319,6 +480,27 @@ fn keep_protected(from: &Path, text: Option<&str>, protect: &mut dyn FnMut(&Path
             protect(Path::new(&f));
         }
     }
+}
+
+/// The short re-check of #497 (RB1): the harmful drop-ins of our
+/// directories older than `installed` (their ctime) — a package install
+/// runs no installer's check, and the round never moves them (RR2) — for
+/// the round to report, signed, with the remedy. Read-only: nothing moved,
+/// nothing registered.
+pub fn preinstall_harmful(
+    roots: &[&Path],
+    host: &HostLimits,
+    installed: SystemTime,
+    known: impl Fn(&Path, &[u8]) -> bool,
+) -> Vec<Harmful> {
+    let pass = Pass {
+        since: SystemTime::UNIX_EPOCH,
+        when: AT_PREINSTALL,
+    };
+    harmful(roots, host, pass, known, &mut |p| regular_with_one_name(p))
+        .into_iter()
+        .filter(|h| std::fs::symlink_metadata(&h.from).is_ok_and(|m| !changed_since(&m, installed)))
+        .collect()
 }
 
 /// [`harmful`]'s entries moved into `quarantine` (`now`: the name's
@@ -409,6 +591,13 @@ pub fn installer_check(
         for h in &found {
             let _ = writeln!(out, "would move {}: {}", h.from.display(), h.why);
         }
+        // the coordinator's decision on #497's `NN_` drop-ins: the agent's
+        // settings are kept configuration, listed, never a refusal
+        for n in nn_settings(&search) {
+            if !found.iter().any(|h| h.from == n.dropin) {
+                let _ = writeln!(out, "would keep {}", n.detail());
+            }
+        }
         return if found.is_empty() { 0 } else { 3 };
     }
     let moved = self::quarantine(&search, host, pass, quarantine_dir, now, known, &mut held);
@@ -440,6 +629,9 @@ pub fn installer_check(
 /// another file. Keys registered at boot are not here and never taken out
 /// by a pass.
 pub type Registered = std::sync::Mutex<std::collections::BTreeMap<PathBuf, (u64, u64)>>;
+
+/// The degradation a [`Protector`] without the protected-inode map signs.
+pub const UNPROTECTED: &str = "own_dropins_unprotected";
 
 /// The protected-inode map as a [`Protector`] uses it.
 pub trait InodeMap {
@@ -474,20 +666,34 @@ pub struct Protector<'a, M: InodeMap = crate::anti_tamper::filesystem::Protected
 }
 
 impl<'a> Protector<'a> {
-    /// The pinned map under `bpffs_root` (`None`, or a map that cannot be
-    /// opened: no deny hook protects any file on this host — a regular
-    /// file with one name is then taken as held, the degradation is
-    /// signed elsewhere), with the keys `registered` records.
+    /// The pinned map under `bpffs_root`, with the keys `registered`
+    /// records. The short re-check of #497 (NB6): without it nothing is
+    /// protected — every [`Self::protect`] says so (fail-closed: an
+    /// environment file is then not held, its drop-in quarantined). A map
+    /// that cannot be opened is a signed degradation ([`UNPROTECTED`])
+    /// until it opens again; no root at all is a boot without deny hooks,
+    /// a degradation of its own.
     pub fn open(bpffs_root: Option<&Path>, registered: &'a Registered) -> Self {
+        // no root: no deny hook this boot, a degradation already signed
         let map = bpffs_root.and_then(|r| {
-            crate::anti_tamper::filesystem::ProtectedInodesHandle::open(r)
-                .map_err(|e| {
-                    tracing::warn!(
-                        error = %format!("{e:#}"),
-                        "our drop-ins: the protected-inode map cannot be opened — not protected"
-                    )
-                })
-                .ok()
+            match crate::anti_tamper::filesystem::ProtectedInodesHandle::open(r) {
+                Ok(m) => {
+                    crate::boot::degradation::withdraw(UNPROTECTED, &[]);
+                    Some(m)
+                }
+                Err(e) => {
+                    let e = format!("{e:#}");
+                    tracing::warn!(error = %e, "our drop-ins: the protected-inode map cannot be opened — not protected");
+                    crate::boot::degradation::report(
+                        UNPROTECTED,
+                        &format!(
+                            "our units' kept drop-ins and their environment files are not \
+                             write-protected: {e}"
+                        ),
+                    );
+                    None
+                }
+            }
         });
         Self::with_map(map, registered)
     }
@@ -513,8 +719,10 @@ impl<'a, M: InodeMap> Protector<'a, M> {
         if !meta.file_type().is_file() || meta.nlink() != 1 {
             return false;
         }
+        // the short re-check of #497 (NB6): no map, nothing protected —
+        // fail-closed (the degradation is signed by `open`)
         let Some(map) = self.map.as_mut() else {
-            return true;
+            return false;
         };
         let key = InodeKey {
             dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(meta.dev()),
@@ -1029,5 +1237,220 @@ mod tests {
             0
         );
         assert!(out.is_empty());
+    }
+
+    /// The short re-check of #497 (RB1), with the reviewer's probe: drop-ins
+    /// from before the install — a symlink to a file outside, an
+    /// `EnvironmentFile=` outside /etc/northnarrow, an `ExecStartPre=` from a
+    /// writable directory — are moved by no round; `preinstall_harmful`
+    /// names each one for the round's signed report, and nothing is moved
+    /// or registered by it. One changed after the install is not in it.
+    #[test]
+    fn a_harmful_drop_in_from_before_the_install_is_reported_not_moved() {
+        let root = tempfile::tempdir().unwrap();
+        let q = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ag = root.path().join("northnarrow-agent.service.d");
+        std::fs::create_dir_all(&ag).unwrap();
+        let target = outside.path().join("x.conf");
+        std::fs::write(&target, "[Service]\nMemoryMax=2G\n").unwrap();
+        std::os::unix::fs::symlink(&target, ag.join("50-link.conf")).unwrap();
+        std::fs::write(
+            ag.join("60-env.conf"),
+            "[Service]\nEnvironmentFile=-/etc/default/nn\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ag.join("70-exec.conf"),
+            "[Service]\nExecStartPre=/var/tmp/x\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ag.join("80-log.conf"),
+            "[Service]\nEnvironment=RUST_LOG=info\n",
+        )
+        .unwrap();
+        let installed = SystemTime::now() + std::time::Duration::from_secs(60);
+        // the round: since the install, nothing moved
+        let moved = quarantine(
+            &[root.path()],
+            &host(),
+            Pass {
+                since: installed,
+                when: AT_ROUND,
+            },
+            q.path(),
+            1,
+            |_, _| false,
+            &mut |_| true,
+        );
+        assert!(moved.is_empty(), "{moved:?}");
+        let found = preinstall_harmful(&[root.path()], &host(), installed, |_, _| false);
+        let why: Vec<String> = found
+            .iter()
+            .map(|h| format!("{}: {}", h.from.display(), h.why))
+            .collect();
+        assert_eq!(found.len(), 3, "{why:#?}");
+        assert!(
+            why[0].contains("50-link.conf: there before the agent was installed, a symlink to"),
+            "{why:#?}"
+        );
+        assert!(why[1].contains("60-env.conf: there before the agent was installed, EnvironmentFile=/etc/default/nn lies outside"), "{why:#?}");
+        assert!(
+            why[2].contains(
+                "70-exec.conf: there before the agent was installed, sets ExecStartPre=/var/tmp/x"
+            ),
+            "{why:#?}"
+        );
+        assert_eq!(std::fs::read_dir(&ag).unwrap().count(), 4, "nothing moved");
+        assert_eq!(std::fs::read_dir(q.path()).unwrap().count(), 0);
+        // installed before them: the round's to judge, not this report's
+        let before = SystemTime::now() - std::time::Duration::from_secs(60);
+        assert!(preinstall_harmful(&[root.path()], &host(), before, |_, _| false).is_empty());
+    }
+
+    /// The short re-check of #497 (NB6): a protector without the map holds
+    /// nothing (fail-closed) — an environment file under /etc/northnarrow
+    /// is then not held, and its drop-in is quarantined.
+    #[test]
+    fn a_protector_without_the_map_holds_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.conf");
+        std::fs::write(&f, "x").unwrap();
+        let registered = Registered::default();
+        let mut p = Protector::<FakeMap>::with_map(None, &registered);
+        assert!(!p.protect(&f));
+        assert!(p.finish().is_none());
+        assert!(registered.lock().unwrap().is_empty());
+    }
+
+    /// The coordinator's decision on #497's `NN_` drop-ins: an `NN_`
+    /// setting made inside a window is the operator's configuration — kept
+    /// at the close, listed for its signed record (a weakening switch
+    /// flagged); a loader variable stays harmful, and so does a drop-in
+    /// that sets an `NN_` variable beside something harmful.
+    #[test]
+    fn an_nn_setting_is_kept_and_named_a_loader_variable_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        let q = tempfile::tempdir().unwrap();
+        let ag = root.path().join("northnarrow-agent.service.d");
+        std::fs::create_dir_all(&ag).unwrap();
+        let since = SystemTime::now() - std::time::Duration::from_secs(5);
+        std::fs::write(
+            ag.join("40-policy.conf"),
+            "[Service]\nEnvironment=NN_EXEC_POLICY=audit\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ag.join("41-off.conf"),
+            "[Service]\nEnvironment=\"NN_FILE_OPEN_SENSOR=tracepoint\" NN_ANTI_TAMPER_ALLOW_DEGRADED=1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ag.join("42-loader.conf"),
+            "[Service]\nEnvironment=LD_PRELOAD=/var/tmp/x.so\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ag.join("43-mixed.conf"),
+            "[Service]\nEnvironment=NN_EXEC_POLICY=audit\nMemoryMax=4K\n",
+        )
+        .unwrap();
+        let r = quarantine(
+            &[root.path()],
+            &host(),
+            close(since),
+            q.path(),
+            1,
+            |_, _| false,
+            &mut |_| true,
+        );
+        let why: Vec<String> = r.iter().map(Moved::detail).collect();
+        assert_eq!(r.len(), 2, "{why:#?}");
+        assert!(why[0].contains("42-loader.conf: made inside the window, sets Environment=LD_PRELOAD=/var/tmp/x.so: LD_PRELOAD set"), "{why:#?}");
+        assert!(
+            why[1].contains("43-mixed.conf: made inside the window, sets MemoryMax=4K"),
+            "{why:#?}"
+        );
+        assert!(ag.join("40-policy.conf").exists() && ag.join("41-off.conf").exists());
+        let n = nn_settings(&[root.path()]);
+        let got: Vec<(String, String, bool)> = n
+            .iter()
+            .map(|s| (s.name.clone(), s.value.clone(), s.weakens))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("NN_EXEC_POLICY".to_string(), "audit".to_string(), false),
+                (
+                    "NN_FILE_OPEN_SENSOR".to_string(),
+                    "tracepoint".to_string(),
+                    true
+                ),
+                (
+                    "NN_ANTI_TAMPER_ALLOW_DEGRADED".to_string(),
+                    "1".to_string(),
+                    true
+                ),
+            ]
+        );
+        assert!(
+            n[1].detail().ends_with("— a switch that weakens the agent"),
+            "{n:?}"
+        );
+        // the installer's check: kept configuration, no refusal
+        let prefix = tempfile::tempdir().unwrap();
+        let pag = prefix
+            .path()
+            .join("etc/systemd/system/northnarrow-agent.service.d");
+        std::fs::create_dir_all(&pag).unwrap();
+        std::fs::copy(ag.join("40-policy.conf"), pag.join("40-policy.conf")).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            installer_check(prefix.path(), &host(), q.path(), false, 2, &mut out),
+            0
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("would keep NN_EXEC_POLICY=audit set by "),
+            "{text}"
+        );
+    }
+
+    /// The weakening switches a drop-in of ours may set: the agent's own
+    /// list and the explicit extra one (a sensor back to its fallback, the
+    /// exec policy off); their other values are plain settings.
+    #[test]
+    fn the_weakening_switches_are_an_explicit_list() {
+        for (n, v) in [
+            ("NN_FILE_OPEN_SENSOR", "tracepoint"),
+            ("NN_EXEC_SENSOR", "tracepoint"),
+            ("NN_DNS_SENSOR", "sendmsg"),
+            ("NN_EXEC_POLICY", "off"),
+            ("NN_ANTI_TAMPER_ALLOW_DEGRADED", "1"),
+            ("NN_AUDIT_ALLOW_UNWRITABLE", "1"),
+            ("NN_DETECT_ONLY", "1"),
+        ] {
+            assert!(nn_weakens(n, v), "{n}={v}");
+        }
+        for (n, v) in [
+            ("NN_FILE_OPEN_SENSOR", "lsm"),
+            ("NN_EXEC_SENSOR", "lsm"),
+            ("NN_DNS_SENSOR", "skb"),
+            ("NN_EXEC_POLICY", "audit"),
+            ("NN_EXEC_POLICY", "enforce"),
+            ("NN_LAB_X", "1"),
+        ] {
+            assert!(!nn_weakens(n, v), "{n}={v}");
+        }
+        assert_eq!(WEAKENING_DROPIN_EXTRA.len(), 4);
+        assert_eq!(LOADER_ENV, &["LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH"]);
+        assert_eq!(
+            env_file_assignments("# c\nexport NN_A=1\nNN_B=\"x\"\n"),
+            vec![
+                ("NN_A".to_string(), "1".to_string()),
+                ("NN_B".to_string(), "x".to_string())
+            ]
+        );
     }
 }

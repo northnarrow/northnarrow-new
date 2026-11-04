@@ -1697,7 +1697,18 @@ impl Checker {
         if g.window.is_window_open() {
             return;
         }
+        // the short re-check of #497 (NB6): said, signed, never silent
         let Some(since) = crate::own_dropins::install_time() else {
+            self.report_once(
+                Finding {
+                    kind: "own_dropin_round_skipped",
+                    detail:
+                        "the agent's install time cannot be read (/proc/self/exe's ctime): our \
+                             units' drop-ins are not judged or protected by the integrity round"
+                            .to_string(),
+                },
+                at_boot,
+            );
             return;
         };
         let roots = unit_roots(Path::new("/"));
@@ -1734,6 +1745,47 @@ impl Checker {
                 at_boot,
             );
         }
+        // the coordinator's decision on #497's `NN_` drop-ins: each `NN_`
+        // setting a kept drop-in of ours gives our units is signed — an
+        // informative record, a High alert for a switch that weakens the
+        // agent — once per setting
+        for n in crate::own_dropins::nn_settings(&search) {
+            let f = Finding {
+                kind: if n.weakens {
+                    "own_dropin_weakening"
+                } else {
+                    "own_dropin_setting"
+                },
+                detail: n.detail(),
+            };
+            if n.weakens {
+                self.report_once(f, at_boot);
+            } else {
+                self.record_once(f, at_boot);
+            }
+        }
+        // the short re-check of #497 (RB1): a harmful drop-in from before
+        // the install (a package's runs no installer's check) is never
+        // moved by the round — reported, signed, with the remedy
+        for h in crate::own_dropins::preinstall_harmful(
+            &search,
+            &crate::host_dropins::HostLimits::read(),
+            since,
+            is_known_dropin,
+        ) {
+            self.report_once(
+                Finding {
+                    kind: "own_dropin_preinstall_harmful",
+                    detail: format!(
+                        "{}: {}; not moved (it predates the install): remove it, or move it out \
+                         inside a trusted-installer window (UPGRADE_NOTES_WAVE4.md §9)",
+                        h.from.display(),
+                        h.why
+                    ),
+                },
+                at_boot,
+            );
+        }
     }
 
     /// This round's mount findings ([`mount_round`] on the live files).
@@ -1758,6 +1810,21 @@ impl Checker {
         self.record_detected(&f, at_boot, 0);
     }
 
+    /// A one-shot record that is no drift (an `NN_` setting of a kept
+    /// drop-in of ours): signed, logged at INFO, reported once.
+    fn record_once(&mut self, f: Finding, at_boot: bool) {
+        if self.once.contains(&f) {
+            return;
+        }
+        if self.once.len() >= MAX_ONCE {
+            self.once.clear();
+        }
+        self.once.insert(f.clone());
+        info!(kind = f.kind, detail = %f.detail, at_boot, "integrity: a setting of ours recorded");
+        let extra = serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": at_boot });
+        self.append(AUDIT_OP, extra, "recorded");
+    }
+
     fn record_detected(&self, f: &Finding, at_boot: bool, reappeared: u32) {
         if f.kind == "bpffs_mount" {
             warn!(kind = f.kind, detail = %f.detail, at_boot, reappeared, "integrity: bpffs mounted outside /sys/fs/bpf");
@@ -1772,6 +1839,9 @@ impl Checker {
         }
         let mut extra =
             serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": at_boot });
+        if f.kind == "own_dropin_weakening" {
+            extra["severity"] = "high".into();
+        }
         if reappeared > 0 {
             extra["reappeared"] = reappeared.into();
         }

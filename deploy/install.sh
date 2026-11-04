@@ -1597,6 +1597,9 @@ WINDOW_OPENED=0
 own_dropins_preflight() {
     (( ${DROPINS_CHECKED:-0} )) && return 0
     DROPINS_CHECKED=1
+    # the coordinator's decision on #497's NN_ drop-ins: the agent's own
+    # settings are kept configuration — listed, never a refusal
+    own_dropins_kept "$DROPINS_FOUND"
     case "${DROPINS_RC:-0}" in
         0) return 0 ;;
         3) ;;
@@ -1606,7 +1609,7 @@ own_dropins_preflight() {
     esac
     echo "install.sh: the drop-in directories of the agent's own units hold drop-ins this release's agent quarantines:" >&2
     while IFS= read -r l; do
-        [[ -n "$l" ]] && echo "install.sh:   ${l#would move }" >&2
+        [[ $l == "would move "* ]] && echo "install.sh:   ${l#would move }" >&2
     done <<< "$DROPINS_FOUND"
     if (( ! ${ACCEPT_DROPIN_QUARANTINE:-0} )); then
         echo "install.sh: REFUSED — remove them (or move them out of those directories), or re-run with" >&2
@@ -1627,6 +1630,34 @@ own_dropins_preflight() {
         echo "install.sh: REFUSED — a drop-in could not be moved (above); nothing else was changed." >&2
         return 1
     fi
+}
+# The short re-check of #497 (RB1): a package's configure step (deb
+# postinst, rpm %post) runs the installed agent's check as a warning — it
+# moves nothing and never fails the hook; the agent's integrity round
+# reports each one signed (own_dropin_preinstall_harmful) and never moves
+# it either.
+# The agent's NN_ settings in its units' drop-ins ("would keep" lines of
+# its check): kept configuration, each one signed by the agent.
+own_dropins_kept() {
+    local l first=1
+    while IFS= read -r l; do
+        [[ $l == "would keep "* ]] || continue
+        (( first )) && echo "install.sh: kept configuration in the drop-ins of the agent's own units (each setting signed by the agent):"
+        first=0
+        echo "install.sh:   ${l#would keep }"
+    done <<< "$1"
+}
+own_dropins_warn() {
+    local found rc=0 l
+    found=$("$BIN_DIR/northnarrow-agent" --own-dropins check 2>/dev/null) || rc=$?
+    own_dropins_kept "$found"
+    (( rc == 3 )) || return 0
+    echo "install.sh: WARNING: the drop-in directories of the agent's own units hold drop-ins this release's agent judges harmful — left in place:" >&2
+    while IFS= read -r l; do
+        [[ $l == "would move "* ]] && echo "install.sh:   ${l#would move }" >&2
+    done <<< "$found"
+    echo "install.sh: remove them, or move them out inside a trusted-installer window (docs/operator/UPGRADE_NOTES_WAVE4.md section 9)." >&2
+    return 0
 }
 open_trusted_installer_window() {
     local key=$1
@@ -1873,6 +1904,7 @@ if [[ $MODE == configure ]]; then
             echo "install.sh: kept enabled: ${was_enabled[*]}"
         fi
     fi
+    own_dropins_warn
 else
 TXN_PHASE=switch
 # Lab PR 220: staged next to the installed files (same directory, same file

@@ -202,9 +202,12 @@ unsafe fn tier_of(task: *const u8) -> u32 {
     if sys == 0 && user == 0 {
         return tier::UNKNOWN | sig | tier_sig::NO_SLICES;
     }
-    // Level 1: the top-level slice the caller's cgroup is under.
+    // Level 1: the top-level slice the caller's cgroup is under. Lot 273d
+    // (the short re-check of #497, NB5): the units' own `northnarrow.slice`
+    // is a service slice, as `system.slice` was for them.
+    let ours = slice(slice_slot::OURS);
     let cg1 = generated::bpf_get_current_ancestor_cgroup_id(1);
-    if cg1 != 0 && cg1 == sys {
+    if cg1 != 0 && (cg1 == sys || cg1 == ours) {
         return tier::SERVICE | sig | tier_sig::SYSTEM_SLICE;
     }
     if cg1 == 0 || cg1 != user {
