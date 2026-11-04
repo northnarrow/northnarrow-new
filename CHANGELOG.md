@@ -63,10 +63,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   every other flow as Outbound. After its second review: a read in the
   rotation's second window (the archive renamed, the new active file not
   made yet) waits there — no eviction, no "ahead" — and a file still
-  missing 30 s later is a signed `active_missing` note; `nn-admin export
-  verify` says PARTIAL (exit 3) for an outcome whose intent its input does
-  not hold (its own fields checked; a rewritten one stays TAMPERED, whose
-  verdict now says which: a row not signed, or a record rewritten); a
+  missing 30 s later is a signed `active_missing` note; an action
+  outcome's record carries its intent's signed row
+  (`unmapped.northnarrow.intent_raw`), so that `nn-admin export verify`
+  checks every record on its own, whatever its input holds around it — the
+  intent's row verified with the key and mapped first, a missing, bent or
+  foreign one with the intent's facts TAMPERED (after its third check: a
+  PARTIAL verdict of the second review depended on the intent being before
+  the outcome in the input); the TAMPERED verdict says which (a row not
+  signed, or a record rewritten); a
   signed configuration with fewer or smaller JSONL files holds from the
   sink's open (the files past the new count removed, regular files only —
   the worker's seccomp gains `newfstatat` without following a link —, an

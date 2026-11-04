@@ -1266,10 +1266,10 @@ enum ExportCmd {
     },
     /// Check exported records (the JSONL file's lines, or a syslog
     /// receiver's messages, one a line) against the agent's public key:
-    /// each record's row signed and named, each chain's rows linked. Exit 0,
-    /// 13 a record that does not verify, 11 a chain that does not follow, 2
-    /// lines that are no record, 3 outcomes whose intent the input does not
-    /// hold (their own fields verified: PARTIAL).
+    /// each record's row signed and named, each record its row's mapping
+    /// (an action's outcome with its intent's signed row), each chain's
+    /// rows linked. Exit 0, 13 a record that does not verify, 11 a chain
+    /// that does not follow, 2 lines that are no record.
     Verify {
         /// The agent's public key, 64 hex characters (its `agent.sig.pub`).
         #[arg(long = "agent-pubkey", conflicts_with = "agent_pubkey_file")]

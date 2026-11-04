@@ -401,9 +401,11 @@ on-host LLM advisor removed, which also took about 150 crates out of `Cargo.lock
 
 - **Vulnerability disclosure:** [`SECURITY.md`](SECURITY.md). Please do not file
   security-sensitive reports as public issues.
-- **No telemetry, no phone-home, no update channel the agent reaches out to.** Updates are an
-  operator action with a signed artefact. The export sends nothing unless the operator signs its
-  overlay, and then only to the operator's own receiver.
+- **No telemetry to the vendor, no phone-home, no update channel the agent reaches out to.**
+  Updates are an operator action with a signed artefact. The one way evidence leaves the host is
+  the signed export, which is off by default: only an overlay the operator signs turns it on, and
+  then it sends only the chains that overlay names, to the operator's own files and receiver
+  ([`docs/operator/EXPORT.md`](docs/operator/EXPORT.md)).
 
 <details>
 <summary><b>Release pipeline, packages, CI and dependencies</b></summary>

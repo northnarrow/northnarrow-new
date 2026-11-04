@@ -246,8 +246,13 @@ fn endpoint(addr: &str, port: Option<u64>) -> Option<Value> {
 }
 
 /// The OCSF mapping's state: the actions chain's intents, so an outcome's
-/// record carries what its intent said (bounded; a worker restarted
-/// between them writes the outcome with what it has).
+/// record carries what its intent said, and the intent's signed row whole
+/// (`unmapped.northnarrow.intent_raw`: `nn-admin export verify` checks it
+/// with the agent's key and maps the outcome again from it, record by
+/// record — the third check of #499). Bounded; a worker that has not seen
+/// the intent (restarted between them, the export started after it, the
+/// intent past [`MAX_INTENTS`]) writes the outcome without its intent's
+/// facts, and without its row.
 #[derive(Debug, Default)]
 pub struct Mapper {
     intents: HashMap<(String, u64), Value>,
@@ -257,66 +262,9 @@ pub struct Mapper {
 /// Intents kept for their outcomes.
 pub const MAX_INTENTS: usize = 4096;
 
-/// An action outcome's record fields that its intent gives (the class by
-/// the intent's response and its activity, the target — process, file,
-/// connection —, the reasons, the severity, the message) besides
-/// `unmapped.northnarrow.intent_row`: a receiver whose capture does not
-/// hold the intent cannot map them again (`nn-admin export verify`'s
-/// PARTIAL; the second review of #499, R2). The rest of the record — its
-/// time, status, detail, duration, command and correlation ids, place,
-/// row — is the outcome's own.
-pub const INTENT_FIELDS: &[&str] = &[
-    "class_uid",
-    "class_name",
-    "category_uid",
-    "category_name",
-    "activity_id",
-    "activity_name",
-    "type_uid",
-    "type_name",
-    "severity_id",
-    "severity",
-    "process",
-    "file",
-    "connection_info",
-    "remediation",
-    "message",
-];
-
-/// `record` without the fields its intent gives ([`INTENT_FIELDS`] and
-/// `unmapped.northnarrow.intent_row`): an outcome's own fields.
-pub fn without_intent_fields(record: &Value) -> Value {
-    let mut v = record.clone();
-    if let Value::Object(m) = &mut v {
-        for k in INTENT_FIELDS {
-            m.remove(*k);
-        }
-        if let Some(Value::Object(nn)) =
-            m.get_mut("unmapped").and_then(|u| u.get_mut("northnarrow"))
-        {
-            nn.remove("intent_row");
-        }
-    }
-    v
-}
-
-/// An actions chain row's `(run, action)` when it is an outcome.
-pub fn outcome_key(raw: &[u8]) -> Option<(String, u64)> {
-    let v: Value = serde_json::from_slice(raw).ok()?;
-    (text(&v, "row").as_deref() == Some("outcome"))
-        .then(|| Some((text(&v, "run")?, uint(&v, "action")?)))
-        .flatten()
-}
-
 impl Mapper {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Whether the intent of action `(run, action)` was mapped (and is
-    /// kept).
-    pub fn has_intent(&self, run: &str, action: u64) -> bool {
-        self.intents.contains_key(&(run.to_string(), action))
     }
 
     /// The records of one row (one or two; never none).
@@ -352,6 +300,13 @@ impl Mapper {
                     let mut kept = intent;
                     if let Value::Object(m) = &mut kept {
                         m.insert("_row".into(), row_ref(row));
+                        // its signed row whole: the outcome carries it (the
+                        // third check of #499: a receiver remaps the
+                        // outcome's facts from the intent it can verify)
+                        m.insert(
+                            "_raw".into(),
+                            json!(String::from_utf8_lossy(row.raw).into_owned()),
+                        );
                     }
                     if self.intents.insert(key.clone(), kept).is_none() {
                         self.order.push_back(key);
@@ -1037,6 +992,9 @@ fn remediation(
     nn.insert("kind".into(), json!(kind));
     if let Some(r @ Value::Object(_)) = intent.get("_row") {
         nn.insert("intent_row".into(), r.clone());
+    }
+    if let Some(raw @ Value::String(_)) = intent.get("_raw") {
+        nn.insert("intent_raw".into(), raw.clone());
     }
     extra.insert(
         "metadata_correlation".into(),

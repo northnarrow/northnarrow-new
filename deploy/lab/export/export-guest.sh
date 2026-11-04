@@ -4,7 +4,7 @@
 # crates/nn-export/examples/syslog_receiver.rs, built in the guest's tree).
 # Our own lab guests only.
 #
-# usage: export-guest.sh <out-dir> <phase>...  (setup arrive outage hostile slow stall rotate rewritten protected partial shrink cost off)
+# usage: export-guest.sh <out-dir> <phase>...  (setup arrive outage hostile slow stall rotate rewritten protected outcome shrink cost off)
 #
 #   setup   — a lab CA and a receiver certificate (receiver.lab, 127.0.0.1),
 #             the receiver up (honest), the signed export.local (both sinks,
@@ -583,15 +583,17 @@ sys.exit(1)' "$STATE/detections/detections.jsonl" "$sender"
         grep -q 'Killed { pid: $sender }' '$STATE/detections/actions.jsonl'"
 }
 
-# The second review of #499 (R2): `export verify` on a capture that holds an
-# action's outcome but not its intent (a file rotated between them, a
-# capture started after the intent) — PARTIAL (exit 3), never TAMPERED; the
-# outcome with its intent OK; the partial outcome with one of its own
-# fields rewritten TAMPERED (13). The actions come from the `protected`
-# phase (the COMBAT ladder's intents and outcomes): run it first.
-phase_partial() {
+# The third check of #499: an action's outcome record carries its intent's
+# signed row (`intent_raw`), and `export verify` checks every record on its
+# own — the actions of a capture whole: OK; the outcome moved before its
+# intent with the intent's facts rewritten: TAMPERED (13); the capture's
+# head cut after the intent: the records left OK on their own, the outcome
+# rewritten TAMPERED. And what the row costs: an outcome's record with and
+# without it. The actions come from the `protected` phase (the COMBAT
+# ladder's intents and outcomes): run it first.
+phase_outcome() {
     local rc
-    check partial-caught-up "both sinks caught up with the actions" caught_up 300
+    check outcome-caught-up "both sinks caught up with the actions" caught_up 300
     python3 -I - "$CAP" "$OUT" <<'PY'
 import json, re, sys
 cap, out = sys.argv[1], sys.argv[2]
@@ -606,38 +608,58 @@ for l in open(cap, errors="replace"):
         pass
 def nn(v):
     return (v.get("unmapped") or {}).get("northnarrow") or {}
-outcomes = [v for v in recs if nn(v).get("kind") == "outcome" and nn(v).get("intent_row")]
-if not outcomes:
-    print("no outcome with its intent in the capture")
+def place(v):
+    r = nn(v)["row"]
+    return (r["file"], r["line"])
+acts = sorted({place(v): v for v in recs if nn(v).get("row", {}).get("chain") == "actions"}.values(), key=place)
+outs = [v for v in acts if nn(v).get("kind") == "outcome" and nn(v).get("intent_raw")]
+def dump(name, vs):
+    with open(f"{out}/{name}", "w") as f:
+        for v in vs:
+            f.write(json.dumps(v, separators=(",", ":")) + "\n")
+if not outs:
+    print("no outcome with its intent row in the capture")
     sys.exit(0)
-o = outcomes[-1]
+o = outs[-1]
 ir = nn(o)["intent_row"]
-intent = [v for v in recs if nn(v).get("kind") == "intent"
-          and nn(v)["row"]["file"] == ir["file"] and nn(v)["row"]["line"] == ir["line"]][:1]
-with open(out + "/partial-whole.jsonl", "w") as f:
-    for v in intent + [o]:
-        f.write(json.dumps(v, separators=(",", ":")) + "\n")
-with open(out + "/partial.jsonl", "w") as f:
-    f.write(json.dumps(o, separators=(",", ":")) + "\n")
-bent = dict(o)
-bent["status_detail"] = "not run: rewritten"
-with open(out + "/partial-bent.jsonl", "w") as f:
-    f.write(json.dumps(bent, separators=(",", ":")) + "\n")
-r = nn(o)["row"]
-print(f"outcome {r['file']}/{r['line']} class {o['class_uid']}, its intent {ir['file']}/{ir['line']} ({len(intent)} record)")
+intent = [v for v in acts if place(v) == (ir["file"], ir["line"])]
+dump("outcome-whole.jsonl", acts)
+bent = json.loads(json.dumps(o))
+bent["severity_id"] = 1
+bent["severity"] = "Informational"
+bent["message"] = "benign"
+if "process" in bent:
+    bent["process"] = {"pid": 1}
+others = [v for v in acts if v is not o]
+dump("outcome-reordered-bent.jsonl", [bent] + others)
+after = [v for v in acts if place(v) > (ir["file"], ir["line"])]
+dump("outcome-head-cut.jsonl", after)
+dump("outcome-head-cut-bent.jsonl", [bent if v is o else v for v in after])
+line = lambda v: len(json.dumps(v, separators=(",", ":")))
+bare = json.loads(json.dumps(o))
+bare["unmapped"]["northnarrow"].pop("intent_raw")
+with open(f"{out}/outcome-cost.txt", "w") as f:
+    f.write(f"outcome {place(o)} class {o['class_uid']}: {line(o)} bytes with its intent row, "
+            f"{line(bare)} without it (+{line(o) - line(bare)}); its intent's row {len(nn(o)['intent_raw'])} bytes; "
+            f"outcomes with the row in the capture: {len(outs)}, sizes {sorted(line(v) for v in outs)}\n")
+print(open(f"{out}/outcome-cost.txt").read().strip())
+print(f"actions records {len(acts)}, after the intent {len(after)}, its intent's record {len(intent)}")
 PY
-    if [ -s "$OUT/partial.jsonl" ]; then
-        "$NNADMIN" export verify --agent-pubkey-file /etc/northnarrow/agent.sig.pub --file "$OUT/partial-whole.jsonl" > "$OUT/verify-partial-whole.txt" 2>&1
+    if [ -s "$OUT/outcome-whole.jsonl" ]; then
+        verify outcome-whole "$OUT/outcome-whole.jsonl"
         rc=$?
-        check partial-whole-ok "the outcome with its intent: OK, exit 0 (got $rc)" test "$rc" -eq 0
-        "$NNADMIN" export verify --agent-pubkey-file /etc/northnarrow/agent.sig.pub --file "$OUT/partial.jsonl" > "$OUT/verify-partial.txt" 2>&1
+        check outcome-whole-ok "the actions whole: OK, exit 0 (got $rc)" test "$rc" -eq 0
+        verify outcome-reordered-bent "$OUT/outcome-reordered-bent.jsonl"
         rc=$?
-        check partial-partial "the outcome without its intent: PARTIAL, exit 3 (got $rc)" bash -c "[ $rc -eq 3 ] && grep -q '^PARTIAL:' '$OUT/verify-partial.txt'"
-        "$NNADMIN" export verify --agent-pubkey-file /etc/northnarrow/agent.sig.pub --file "$OUT/partial-bent.jsonl" > "$OUT/verify-partial-bent.txt" 2>&1
+        check outcome-reordered-bent "the outcome before its intent, the intent's facts rewritten: TAMPERED, exit 13 (got $rc)" test "$rc" -eq 13
+        verify outcome-head-cut "$OUT/outcome-head-cut.jsonl"
         rc=$?
-        check partial-bent "the partial outcome with its own field rewritten: TAMPERED, exit 13 (got $rc)" test "$rc" -eq 13
+        check outcome-head-cut "the head cut after the intent: the records left OK on their own, exit 0 (got $rc)" test "$rc" -eq 0
+        verify outcome-head-cut-bent "$OUT/outcome-head-cut-bent.jsonl"
+        rc=$?
+        check outcome-head-cut-bent "the head cut, the outcome rewritten: TAMPERED, exit 13 (got $rc)" test "$rc" -eq 13
     else
-        fail partial-outcome "no action outcome with its intent in the capture (run the protected phase first)"
+        fail outcome-intent-row "no action outcome with its intent row in the capture (run the protected phase first)"
     fi
 }
 

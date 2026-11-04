@@ -1828,7 +1828,7 @@ exit: 0
 |
 | Commands:
 |   status  The export's configuration, its worker, each sink's state and each chain's cursor, and stage 8 (rows it can no longer deliver). Signed telemetry: give --key (without it the agent withholds it)
-|   verify  Check exported records (the JSONL file's lines, or a syslog receiver's messages, one a line) against the agent's public key: each record's row signed and named, each chain's rows linked. Exit 0, 13 a record that does not verify, 11 a chain that does not follow, 2 lines that are no record, 3 outcomes whose intent the input does not hold (their own fields verified: PARTIAL)
+|   verify  Check exported records (the JSONL file's lines, or a syslog receiver's messages, one a line) against the agent's public key: each record's row signed and named, each record its row's mapping (an action's outcome with its intent's signed row), each chain's rows linked. Exit 0, 13 a record that does not verify, 11 a chain that does not follow, 2 lines that are no record
 |   help    Print this message or the help of the given subcommand(s)
 |
 | Options:
@@ -1864,7 +1864,7 @@ exit: 2
 |
 | Commands:
 |   status  The export's configuration, its worker, each sink's state and each chain's cursor, and stage 8 (rows it can no longer deliver). Signed telemetry: give --key (without it the agent withholds it)
-|   verify  Check exported records (the JSONL file's lines, or a syslog receiver's messages, one a line) against the agent's public key: each record's row signed and named, each chain's rows linked. Exit 0, 13 a record that does not verify, 11 a chain that does not follow, 2 lines that are no record, 3 outcomes whose intent the input does not hold (their own fields verified: PARTIAL)
+|   verify  Check exported records (the JSONL file's lines, or a syslog receiver's messages, one a line) against the agent's public key: each record's row signed and named, each record its row's mapping (an action's outcome with its intent's signed row), each chain's rows linked. Exit 0, 13 a record that does not verify, 11 a chain that does not follow, 2 lines that are no record
 |   help    Print this message or the help of the given subcommand(s)
 |
 | Options:
@@ -1907,7 +1907,7 @@ exit: 0
 $ nn-admin export verify --help
 exit: 0
 --- stdout
-| Check exported records (the JSONL file's lines, or a syslog receiver's messages, one a line) against the agent's public key: each record's row signed and named, each chain's rows linked. Exit 0, 13 a record that does not verify, 11 a chain that does not follow, 2 lines that are no record, 3 outcomes whose intent the input does not hold (their own fields verified: PARTIAL)
+| Check exported records (the JSONL file's lines, or a syslog receiver's messages, one a line) against the agent's public key: each record's row signed and named, each record its row's mapping (an action's outcome with its intent's signed row), each chain's rows linked. Exit 0, 13 a record that does not verify, 11 a chain that does not follow, 2 lines that are no record
 |
 | Usage: nn-admin export verify [OPTIONS]
 |

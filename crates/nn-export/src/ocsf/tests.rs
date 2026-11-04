@@ -356,6 +356,14 @@ fn an_outcome_carries_its_intent() {
         outcome["unmapped"]["northnarrow"]["intent_row"]["line"], 11,
         "the intent's row"
     );
+    // the third check of #499: the intent's signed row whole, verbatim
+    assert_eq!(
+        outcome["unmapped"]["northnarrow"]["intent_raw"],
+        fixtures()[10].1.as_str()
+    );
+    assert!(intent["unmapped"]["northnarrow"]
+        .get("intent_raw")
+        .is_none());
     assert_eq!(intent["status_id"], 99);
     // the detection's facts
     let det = &all[0].2[0];

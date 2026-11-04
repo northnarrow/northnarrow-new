@@ -12,12 +12,14 @@
 //! the first row of the next file carries). A record delivered twice (at
 //! least once) is counted, not refused.
 //!
-//! An action's outcome record carries its intent's facts (its class, its
-//! target, its reasons, its severity, its message): when the intent is not
-//! before it in the capture (a JSONL file rotated between them, a syslog
-//! capture started after the intent), those fields cannot be mapped again
-//! here — the outcome's own fields are checked, the rest said not
-//! verifiable (`PARTIAL`, exit 3; the second review of #499, R2).
+//! Each record is checked on its own, whatever the input holds around it:
+//! an action's outcome mapped with its intent's facts (its class, its
+//! target, its reasons, its severity, its message) carries the intent's
+//! signed row (`unmapped.northnarrow.intent_raw`), checked with the key and
+//! mapped first; one without them is its row's mapping without an intent
+//! (the third check of #499: a verdict that depended on the intent being
+//! before the outcome in the input let a reordered or cut capture rewrite
+//! those fields).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
@@ -67,10 +69,6 @@ pub struct Report {
     pub malformed: Vec<(u64, String)>,
     /// Records whose row does not verify: `(line, why)`.
     pub tampered: Vec<(u64, String)>,
-    /// Outcome records whose intent is not before them in the input: their
-    /// own fields verified, their intent's not verifiable here — `(line,
-    /// which)`.
-    pub partial: Vec<(u64, String)>,
     pub chains: Vec<ChainReport>,
 }
 
@@ -79,8 +77,7 @@ impl Report {
     /// record does not verify (TAMPERED, as `heartbeat watch`); 11: a
     /// chain does not follow (BROKEN); 2: lines that are no record, or no
     /// record at all (an empty capture proves nothing: lot 276's lab took
-    /// one for an OK); 3: every record verifies as far as the input lets
-    /// it — outcomes whose intent it does not hold (PARTIAL).
+    /// one for an OK).
     pub fn exit_code(&self) -> u8 {
         if !self.tampered.is_empty() {
             13
@@ -88,8 +85,6 @@ impl Report {
             11
         } else if !self.malformed.is_empty() || self.records == 0 {
             2
-        } else if !self.partial.is_empty() {
-            3
         } else {
             0
         }
@@ -153,17 +148,13 @@ fn pos_of(v: &serde_json::Value) -> Option<RowRef> {
 /// Whether record `v` is the agent's mapping of its row: the row mapped
 /// again (the record's context — the host's name, the agent's id and
 /// version, from the record — and its place) gives the record, field for
-/// field. An action's outcome maps with its intent's facts when the
-/// worker had seen the intent, without them when it had not (a worker
-/// started after it): either is the agent's. An outcome whose intent this
-/// input has not shown before it: its own fields compared, its intent's
-/// not verifiable here ([`Mapped::Partial`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mapped {
-    Alike,
-    Partial,
-}
-
+/// field. An action's outcome the worker mapped with its intent's facts
+/// carries the intent's signed row and its place: the row must verify with
+/// the agent's key, be this action's intent, and be the row its place
+/// names; it is mapped first, then the outcome. An outcome without it is
+/// its row's mapping without an intent (a worker that had not seen the
+/// intent: restarted between them, the export started after it). Nothing
+/// depends on the records around it in the input.
 #[allow(clippy::too_many_arguments)]
 fn mapped_alike(
     v: &serde_json::Value,
@@ -173,10 +164,11 @@ fn mapped_alike(
     raw: &str,
     rotate: Option<&str>,
     seal: &nn_evidence::row_verify::RowSeal,
-    mappers: &mut BTreeMap<String, nn_export::ocsf::Mapper>,
-) -> Result<Mapped, String> {
-    use nn_export::ocsf::{outcome_key, without_intent_fields, Context, Mapper, Row};
-    let Some(c) = nn_proto::ipc::ExportChain::from_name(chain) else {
+    pk: &VerifyingKey,
+) -> Result<(), String> {
+    use nn_export::ocsf::{Context, Mapper, Row};
+    use nn_proto::ipc::ExportChain;
+    let Some(c) = ExportChain::from_name(chain) else {
         return Err(format!("a chain the export does not know: {chain}"));
     };
     let text = |p: &[&str]| {
@@ -207,35 +199,77 @@ fn mapped_alike(
     // companion's with `/1`
     let base = format!("{}/{chain}/{file}/{line}", ctx.agent_id);
     let n = usize::from(text(&["metadata", "uid"]) == Some(format!("{base}/1")));
-    let mapper = mappers.entry(chain.to_string()).or_default();
-    // an outcome whose intent this input has not shown before it
-    let intent_unseen = outcome_key(raw.as_bytes()).is_some_and(|(run, action)| {
-        c == nn_proto::ipc::ExportChain::Actions && !mapper.has_intent(&run, action)
-    });
-    let again = mapper.map(&ctx, &row);
-    if again.get(n) == Some(v) {
-        return Ok(Mapped::Alike);
+    let mut mapper = Mapper::new();
+    let nn = &v["unmapped"]["northnarrow"];
+    if let Some(intent_raw) = nn.get("intent_raw") {
+        let intent_raw = intent_raw
+            .as_str()
+            .ok_or_else(|| rewritten("its intent row is not a row"))?;
+        let iseal = verify_row(intent_raw.as_bytes(), "actions", pk)
+            .map_err(|e| rewritten(&format!("the intent row it carries does not verify: {e}")))?;
+        let parse = |t: &str| serde_json::from_str::<serde_json::Value>(t).ok();
+        let (Some(i), Some(o)) = (parse(intent_raw), parse(raw)) else {
+            return Err(rewritten(
+                "the intent row it carries is not its action's intent",
+            ));
+        };
+        if c != ExportChain::Actions
+            || o.get("row").and_then(|x| x.as_str()) != Some("outcome")
+            || i.get("row").and_then(|x| x.as_str()) != Some("intent")
+            || i.get("run").is_none()
+            || i.get("run") != o.get("run")
+            || i.get("action").is_none()
+            || i.get("action") != o.get("action")
+        {
+            return Err(rewritten(
+                "the intent row it carries is not its action's intent",
+            ));
+        }
+        let place = &nn["intent_row"];
+        let named = |k: &str| place.get(k).and_then(|x| x.as_str());
+        if named("chain") != Some("actions")
+            || named("entry_hash") != Some(iseal.entry_hash.as_str())
+            || named("prev_hash") != Some(iseal.prev_hash.as_str())
+        {
+            return Err(rewritten("the intent row's place names another row"));
+        }
+        let at = |k: &str| place.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        mapper.map(
+            &ctx,
+            &Row {
+                chain: ExportChain::Actions,
+                file: at("file"),
+                line: at("line"),
+                end: at("end"),
+                raw: intent_raw.as_bytes(),
+                rotate: named("rotate").map(str::as_bytes),
+                verified: place
+                    .get("verified")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false),
+                prev_hash: Some(iseal.prev_hash.clone()),
+                entry_hash: Some(iseal.entry_hash.clone()),
+            },
+        );
     }
-    // an outcome mapped by a worker that had not seen its intent
-    let alone = Mapper::new().map(&ctx, &row);
-    if alone.get(n) == Some(v) {
-        return Ok(Mapped::Alike);
+    if mapper.map(&ctx, &row).get(n) == Some(v) {
+        Ok(())
+    } else {
+        Err(REWRITTEN.to_string())
     }
-    // the worker had seen the intent, this input does not hold it: the
-    // outcome's own fields are its row's, its intent's cannot be told here
-    if intent_unseen
-        && alone
-            .get(n)
-            .is_some_and(|a| without_intent_fields(a) == without_intent_fields(v))
-    {
-        return Ok(Mapped::Partial);
-    }
-    Err(REWRITTEN.to_string())
 }
+
+/// How a record whose row verifies ends its TAMPERED reason: its fields,
+/// or what it carries, are not its row's.
+const REWRITTEN_TAG: &str = "(a record rewritten)";
 
 /// Why a record whose row verifies is TAMPERED: its fields are not its
 /// row's mapping.
 const REWRITTEN: &str = "its OCSF fields are not its row's mapping (a record rewritten)";
+
+fn rewritten(why: &str) -> String {
+    format!("{why} {REWRITTEN_TAG}")
+}
 
 /// Verify every record of `input` with the agent's key.
 pub fn verify(input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report> {
@@ -244,9 +278,6 @@ pub fn verify(input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report>
     let mut records: BTreeMap<String, u64> = BTreeMap::new();
     let mut dups: BTreeMap<String, u64> = BTreeMap::new();
     let mut uids: BTreeSet<String> = BTreeSet::new();
-    // one mapping state per chain, as the worker keeps it (an action's
-    // outcome carries its intent's facts)
-    let mut mappers: BTreeMap<String, nn_export::ocsf::Mapper> = BTreeMap::new();
     for (i, line) in input.lines().enumerate() {
         let line = line?;
         let n = i as u64 + 1;
@@ -299,29 +330,9 @@ pub fn verify(input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report>
         }
         // the OCSF fields are the agent's mapping of the row, or the
         // record was rewritten (the review of #499, D1: they are not signed)
-        match mapped_alike(
-            &v,
-            &chain,
-            file,
-            l,
-            raw,
-            rotate.as_deref(),
-            &seal,
-            &mut mappers,
-        ) {
-            Ok(Mapped::Alike) => {}
-            Ok(Mapped::Partial) => rep.partial.push((
-                n,
-                format!(
-                    "{chain} {file}/{l}: an outcome whose intent is not before it here — its own \
-                     fields verified, its intent's (class, target, reasons, severity, message) \
-                     not verifiable"
-                ),
-            )),
-            Err(why) => {
-                rep.tampered.push((n, format!("{chain} {file}/{l}: {why}")));
-                continue;
-            }
+        if let Err(why) = mapped_alike(&v, &chain, file, l, raw, rotate.as_deref(), &seal, pk) {
+            rep.tampered.push((n, format!("{chain} {file}/{l}: {why}")));
+            continue;
         }
         let duplicate = v
             .get("metadata")
@@ -457,9 +468,7 @@ pub fn report_lines(r: &Report) -> Vec<String> {
     for (n, why) in r.malformed.iter().take(20) {
         out.push(format!("MALFORMED line {n}: {why}"));
     }
-    for (n, why) in r.partial.iter().take(20) {
-        out.push(format!("PARTIAL line {n}: {why}"));
-    }
+
     out.push(match r.exit_code() {
         0 => "OK: every record's row is signed by the agent's key, every chain follows from its \
               first row seen"
@@ -470,7 +479,7 @@ pub fn report_lines(r: &Report) -> Vec<String> {
             let rewritten = r
                 .tampered
                 .iter()
-                .filter(|(_, why)| why.ends_with(REWRITTEN))
+                .filter(|(_, why)| why.ends_with(REWRITTEN_TAG))
                 .count();
             match (rewritten, r.tampered.len() - rewritten) {
                 (_, 0) => "TAMPERED: a record's fields are not its row's mapping (its row is the \
@@ -484,12 +493,6 @@ pub fn report_lines(r: &Report) -> Vec<String> {
                     .to_string(),
             }
         }
-        3 => format!(
-            "PARTIAL: every record's row is signed by the agent's key and every chain follows; \
-             {} outcome record(s) whose intent this input does not hold: their own fields \
-             verified, their intent's not verifiable here",
-            r.partial.len()
-        ),
         11 => "BROKEN: a chain does not follow (rows missing or changed)".to_string(),
         _ if r.malformed.is_empty() => "EMPTY: no export record to verify".to_string(),
         _ => "MALFORMED: lines that are no export record".to_string(),
@@ -939,79 +942,162 @@ mod tests {
         (vec![r1, r2], recs)
     }
 
-    /// The second review of #499 (R2): a genuine outcome record whose
-    /// intent is not in the capture (a JSONL file rotated between them, a
-    /// syslog capture started after the intent) — the worker had seen the
-    /// intent. Its own fields verified, its intent's not verifiable here:
-    /// PARTIAL (3), never TAMPERED; the whole capture: OK.
+    /// The third check of #499: an outcome record verifies on its own — the
+    /// intent's signed row it carries is checked and mapped first — in a
+    /// whole capture, alone (the capture's head cut before its intent),
+    /// or before its intent (reordered); the intent's record alone too.
     #[test]
-    fn review499r_partial_capture_outcome_without_its_intent() {
+    fn an_outcome_verifies_on_its_own_with_the_intent_row_it_carries() {
         let k = SigningKey::from_bytes(&[5; 32]);
-        let (_, recs) = intent_and_outcome(&k);
+        let (rows, recs) = intent_and_outcome(&k);
         assert_eq!(recs[1]["class_uid"], 7003, "the worker had seen the intent");
-        let lines: Vec<String> = recs.iter().map(|v| v.to_string()).collect();
-        let both = verify(lines.join("\n").as_bytes(), &k.verifying_key()).unwrap();
-        assert_eq!(both.exit_code(), 0, "{:?}", report_lines(&both));
-        let partial = verify(lines[1].as_bytes(), &k.verifying_key()).unwrap();
-        let said = report_lines(&partial);
-        assert_eq!(partial.exit_code(), 3, "a genuine record: {said:?}");
-        assert!(partial.tampered.is_empty());
-        assert_eq!(partial.partial.len(), 1);
-        assert!(said.last().unwrap().starts_with("PARTIAL:"), "{said:?}");
-        assert!(
-            said.iter().any(|l| l.starts_with("PARTIAL line 1:")),
-            "{said:?}"
-        );
-        // the outcome before its intent (the intent's record later): its
-        // intent not shown before it
-        let reversed = format!("{}\n{}", lines[1], lines[0]);
         assert_eq!(
-            verify(reversed.as_bytes(), &k.verifying_key())
-                .unwrap()
-                .exit_code(),
-            3
+            recs[1]["unmapped"]["northnarrow"]["intent_raw"],
+            rows[0].as_str()
         );
+        let lines: Vec<String> = recs.iter().map(|v| v.to_string()).collect();
+        for input in [
+            lines.join("\n"),
+            lines[1].clone(),
+            format!("{}\n{}", lines[1], lines[0]),
+            lines[0].clone(),
+        ] {
+            let r = verify(input.as_bytes(), &k.verifying_key()).unwrap();
+            assert_eq!(r.exit_code(), 0, "{input}: {:?}", report_lines(&r));
+        }
     }
 
-    /// A partial outcome whose own fields were rewritten is TAMPERED (13);
-    /// with its intent in the capture, a rewritten intent's field is too.
+    /// The third check of #499 (P1, P2): the intent's facts of an outcome
+    /// rewritten are TAMPERED whatever the input holds around it — the
+    /// outcome moved before its intent (P1: it was PARTIAL, 3), or the
+    /// capture's head cut before the intent (P2).
     #[test]
-    fn a_partial_outcome_rewritten_is_tampered() {
+    fn review499b_partial_is_not_a_way_around_tampered() {
         let k = SigningKey::from_bytes(&[5; 32]);
         let (_, recs) = intent_and_outcome(&k);
-        let own: [fn(&mut serde_json::Value); 5] = [
-            |v| v["status_id"] = 2.into(),
-            |v| v["status"] = "Failure".into(),
-            |v| v["status_detail"] = "not killed".into(),
-            |v| v["time"] = 1.into(),
-            |v| v["duration"] = 1.into(),
+        let mut forged = recs[1].clone();
+        forged["severity_id"] = 1.into();
+        forged["severity"] = "Informational".into();
+        forged["process"] = serde_json::json!({"pid": 1});
+        forged["message"] = "benign".into();
+        forged["remediation"] = serde_json::json!({"desc": "nothing"});
+        // (a) reordered, the intent present later in the same input
+        let reordered = format!("{}\n{}", forged, recs[0]);
+        let r = verify(reordered.as_bytes(), &k.verifying_key()).unwrap();
+        assert_eq!(r.exit_code(), 13, "{:?}", report_lines(&r));
+        // (b) the head cut: the outcome alone, rewritten
+        let r = verify(forged.to_string().as_bytes(), &k.verifying_key()).unwrap();
+        assert_eq!(r.exit_code(), 13, "{:?}", report_lines(&r));
+        assert!(report_lines(&r)
+            .last()
+            .unwrap()
+            .starts_with("TAMPERED: a record's fields are not its row's mapping"));
+    }
+
+    /// The intent row an outcome carries: rewritten inside, another
+    /// action's (signed), its place naming another row, not a row, or gone
+    /// while the intent's facts stay — each TAMPERED; the outcome's own
+    /// fields rewritten too.
+    #[test]
+    fn an_attached_intent_row_rewritten_is_tampered() {
+        let k = SigningKey::from_bytes(&[5; 32]);
+        let (rows, recs) = intent_and_outcome(&k);
+        let other = sealed(
+            &k,
+            "actions",
+            "data",
+            &"0".repeat(64),
+            &rows[0]
+                .split(",\"entry_hash\"")
+                .next()
+                .unwrap()
+                .replace("\"action\":7", "\"action\":8"),
+        );
+        type Bend = Box<dyn Fn(&mut serde_json::Value)>;
+        let bent: [(&str, Bend); 8] = [
+            (
+                "does not verify",
+                Box::new(|v| {
+                    let t = v["unmapped"]["northnarrow"]["intent_raw"]
+                        .as_str()
+                        .unwrap()
+                        .replace("KillProcessTree", "Throttle");
+                    v["unmapped"]["northnarrow"]["intent_raw"] = t.into();
+                }),
+            ),
+            (
+                "not its action's intent",
+                Box::new(move |v| {
+                    v["unmapped"]["northnarrow"]["intent_raw"] = other.clone().into()
+                }),
+            ),
+            (
+                "names another row",
+                Box::new(|v| {
+                    v["unmapped"]["northnarrow"]["intent_row"]["entry_hash"] = "1".repeat(64).into()
+                }),
+            ),
+            (
+                "is not a row",
+                Box::new(|v| v["unmapped"]["northnarrow"]["intent_raw"] = 7.into()),
+            ),
+            (
+                "not its row's mapping",
+                Box::new(|v| {
+                    v["unmapped"]["northnarrow"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("intent_raw");
+                }),
+            ),
+            (
+                "not its row's mapping",
+                Box::new(|v| v["status_id"] = 2.into()),
+            ),
+            (
+                "not its row's mapping",
+                Box::new(|v| v["status_detail"] = "not killed".into()),
+            ),
+            (
+                "not its row's mapping",
+                Box::new(|v| v["duration"] = 1.into()),
+            ),
         ];
-        for (i, f) in own.iter().enumerate() {
+        for (i, (why, f)) in bent.iter().enumerate() {
             let mut v = recs[1].clone();
             f(&mut v);
-            let r = verify(v.to_string().as_bytes(), &k.verifying_key()).unwrap();
-            assert_eq!(r.exit_code(), 13, "case {i}: {:?}", report_lines(&r));
-            assert!(r.partial.is_empty());
-            let said = report_lines(&r);
-            assert!(
-                said.last().unwrap().contains("not its row's mapping"),
-                "{said:?}"
-            );
-            assert!(
-                !said.last().unwrap().contains("row is not signed"),
-                "{said:?}"
-            );
+            for input in [v.to_string(), format!("{}\n{}", recs[0], v)] {
+                let r = verify(input.as_bytes(), &k.verifying_key()).unwrap();
+                let said = report_lines(&r);
+                assert_eq!(r.exit_code(), 13, "case {i}: {said:?}");
+                assert!(r.tampered[0].1.contains(why), "case {i}: {:?}", r.tampered);
+                assert!(
+                    said.last().unwrap().contains("not its row's mapping"),
+                    "case {i}: {said:?}"
+                );
+            }
         }
-        // the intent in the capture: an intent's field rewritten is TAMPERED
-        let mut v = recs[1].clone();
-        v["severity_id"] = 1.into();
-        let both = format!("{}\n{}", recs[0], v);
-        assert_eq!(
-            verify(both.as_bytes(), &k.verifying_key())
-                .unwrap()
-                .exit_code(),
-            13
-        );
+    }
+
+    /// An outcome the worker mapped without its intent (it had not seen
+    /// it: restarted between them, the export started after it) carries no
+    /// intent row and is its row's mapping without one: OK alone; given
+    /// an intent's facts without the row, TAMPERED.
+    #[test]
+    fn an_outcome_mapped_without_its_intent_verifies_as_such() {
+        let k = SigningKey::from_bytes(&[5; 32]);
+        let (rows, _) = intent_and_outcome(&k);
+        let alone = mapped("actions", 1, 2, &rows[1], None);
+        assert!(alone["unmapped"]["northnarrow"].get("intent_raw").is_none());
+        assert!(alone["unmapped"]["northnarrow"].get("intent_row").is_none());
+        assert_eq!(alone["class_uid"], 7001);
+        let r = verify(alone.to_string().as_bytes(), &k.verifying_key()).unwrap();
+        assert_eq!(r.exit_code(), 0, "{:?}", report_lines(&r));
+        let mut forged = alone.clone();
+        forged["class_uid"] = 7003.into();
+        forged["process"] = serde_json::json!({"pid": 4242});
+        let r = verify(forged.to_string().as_bytes(), &k.verifying_key()).unwrap();
+        assert_eq!(r.exit_code(), 13);
     }
 
     #[test]

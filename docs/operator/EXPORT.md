@@ -65,7 +65,7 @@ carries every field of its row:
 |---|---|---|
 | every record | `metadata` (the chain, the row's place), `device` (the **host's name**, the agent's id), the product's version | the host's name |
 | `detections` (default) | `id`, `ts`, `sensor`, `path`, `rule_id`, `rule_name`, `severity`, `verdict`, `confidence`, `mitre`, `principal` (**`pid`, `comm`, `uid`, `ppid`**), **`exe`** (the executable's path), `posture_at`, `response`, `detection_type`, `status`, `suppressed_before`, **`file`** (the path a file sensor saw), **`network`** (the destination of a network detection) | a user id, process names, executable and file paths, a destination address |
-| `actions` (default) | `row`, `run`, `action`, `ts`; an intent's `source`, `response`, **`pid`**, `start_ns`, **`file`**, `severity`, `why`, **`detail`** (the detection's kind and actor), `queued_us`; an outcome's `result`, `outcome`, `reason`, `elapsed_us`; an overflow's counts and its first **`samples`** (`KillProcessTree pid 4242 (rule)`); `noted_by` | process ids, file paths |
+| `actions` (default) | `row`, `run`, `action`, `ts`; an intent's `source`, `response`, **`pid`**, `start_ns`, **`file`**, `severity`, `why`, **`detail`** (the detection's kind and actor), `queued_us`; an outcome's `result`, `outcome`, `reason`, `elapsed_us`; an overflow's counts and its first **`samples`** (`KillProcessTree pid 4242 (rule)`); `noted_by`; an outcome's record repeats its intent's row whole (`intent_raw`, §6) | process ids, file paths |
 | `netflow` (only named) | `ts`, `flow_id`, `start_ns`, `end_ns`, `family`, **`src_addr`, `src_port`, `dst_addr`, `dst_port`**, `proto`, **`pid`, `uid`, `comm`, `exe`**, `bytes_sent`, `bytes_recv`, **`resolved_hostname`**, `ja3`, `ja4`, **`sni`**, `close_reason`, `agent_id`, `decision_engine_skipped`, `inbound` (lot 275: a connection the host accepted) | **who connected where**: per user id, the addresses and the names of what they reached — a browsing history; and the addresses that connected to the host's services |
 | `fim_drift` (only named) | `ts`, **`path`**, `op`, `baseline_sha256`, `new_sha256`, **`modifier_pid`, `modifier_uid`, `modifier_comm`**, `severity`, `decision_engine_skipped`, `skip_reason`, `agent_id`, `attrs` (mode, owner and group before and after) | file paths (a home directory's among them), who changed them |
 | `canary_access` (only named) | `ts`, `canary_id`, `canary_name`, `canary_type`, `access_kind`, **`accessor_pid`, `accessor_uid`, `accessor_comm`, `accessor_exe`**, `first_trip`, `agent_id`, `seq` | who read a decoy (the operator's name for it in `canary_name`, which may be its path, a home directory's among them) |
@@ -250,7 +250,11 @@ The parse worker's (`WORKERS.md` §3) with what its sinks need, no more:
   files fill the bound, and the honest worker is never killed for them (lot
   276's tenth lab: a bound raised only to the directory's bytes killed it at
   its first write); a worker killed for its directory does not raise that
-  allowance for the next one. What remains: a worker taken over can
+  allowance for the next one; the larger files it counts are those present
+  at that setup, whoever wrote them — filler a worker taken over left in
+  an earlier run under the sink's names counts too, bounded by the
+  worker's file size limit (`RLIMIT_FSIZE`, 1 GiB and 1 MiB a file) and
+  gone with the rotations. What remains: a worker taken over can
   write up to its file size limit in each of its descriptors for about a
   second, until the core's next measurement kills it — and again at each
   restart, until the supervisor disables it; the core cannot remove what it
@@ -281,13 +285,26 @@ kept the frames) — and checks:
 - each record's OCSF fields are the agent's mapping of its row: the row is
   mapped again (the mapping of the same `nn-admin` version as the agent)
   and compared, field for field — a record whose fields were rewritten,
-  its row genuine, is `TAMPERED`. An action's outcome carries its intent's
-  facts (its class by the intent's response, the target, the reasons, the
-  severity, the message): when its intent is not before it in the input (a
-  JSONL file rotated between them, a capture started after the intent),
-  those cannot be mapped here — the outcome's own fields (its time, status,
-  detail, duration, ids, place, row) are compared, the rest is said not
-  verifiable (`PARTIAL`): verify the files or captures together;
+  its row genuine, is `TAMPERED`. Each record on its own, whatever the
+  input holds around it (its order, a head or a tail cut): an action's
+  outcome the worker mapped with its intent's facts (its class by the
+  intent's response, the target, the reasons, the severity, the message)
+  carries the intent's signed row, `unmapped.northnarrow.intent_raw` (the
+  actions chain's line verbatim, a JSON string), beside its place,
+  `unmapped.northnarrow.intent_row` (`chain`, `file`, `line`, `end`,
+  `prev_hash`, `entry_hash`, `verified`, `rotate` for a file's first row).
+  `verify` checks that row with the agent's key, that it is this action's
+  intent (`row` `intent`, the outcome's `run` and `action`) and the row its
+  place's hashes name, maps it, then maps the outcome from it: one of those
+  missing, malformed, not signed or not its intent's, with the intent's
+  facts in the record, is `TAMPERED`. An outcome mapped without its intent
+  (the worker had not seen it: restarted between them, the export started
+  after it, the intent past the 4,096 the worker keeps) carries neither and
+  is its row's mapping without an intent (class 7001, activity Unknown, no
+  target). The intent's place (`file`, `line`, `end`) is the record's word,
+  as every record's own place: the chain's links check places. The cost:
+  an outcome's record carries its intent's row once more — lot 276's lab,
+  @COST@;
 - **not covered by the signature**: `device.hostname` (the host's name),
   `device.uid` (the agent's id) and `metadata.product.version` (the agent's
   version) — no row carries them; `verify` maps the row again with them as
@@ -304,9 +321,7 @@ signed by the agent's key, or not the one it names; or fields that are not
 its row's mapping — the verdict says which), 11 a chain that does not
 follow (`BROKEN`: rows missing — an export that was off, a gap the agent's
 stage 8 counted, or rows taken out on the way), 2 lines that are no record,
-or no record at all (`EMPTY`: an empty capture proves nothing), 3 every
-record verified as far as the input lets it — outcomes whose intent it
-does not hold (`PARTIAL`; an outcome's own fields rewritten are still 13).
+or no record at all (`EMPTY`: an empty capture proves nothing).
 The agent's public key: `/etc/northnarrow/agent.sig.pub` on the host,
 copied off it once.
 
