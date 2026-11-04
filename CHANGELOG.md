@@ -43,7 +43,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   key; the CI charter gate refuses ring and aws-lc in the agent's graph.
   The supervisor's pass no longer waits on a worker's long request; the
   IPC's version is 3; the fuzz target `ipc_check` covers the export's
-  answers.
+  answers. After its independent review (#499): a read inside a chain's
+  rotation window waits for the rename (it went "ahead" and back to the
+  chain's oldest file); `nn-admin export verify` maps each row again and
+  refuses a record whose OCSF fields were rewritten, and a rotation
+  without its terminator (`BROKEN`); the export worker runs as an account
+  of its own, `northnarrow-export`, the only one that writes the export's
+  directory; a blank line, or any row a request cannot carry, is lost,
+  counted and signed, never retried forever; the export says `failed` or
+  `degraded`, never `on`, when its controller does not run or its worker
+  is away; the worker's files are bounded (`RLIMIT_FSIZE`, 4 GiB in all,
+  the directory measured by the core); by default only the detections and
+  the actions are exported, the flows, file drift and canary reads each
+  opt-in (`EXPORT.md` §1a lists every field that leaves); X25519 refuses
+  a shared secret of all zeros; the sink's files are 0600.
 - Exemptions by cgroup or unit hold only for processes started in their
   cgroup, the kernel's host checks name the fixes the sandbox relies on,
   and a worker enters its sandbox single-threaded (lot 277, Wave 4 phase 3,
