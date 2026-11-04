@@ -783,6 +783,12 @@ fn over_bound(dir: &std::path::Path, max_files: u8, bound: u64) -> Option<String
     (total > bound).then(|| format!("{total} bytes, past its bound of {bound}"))
 }
 
+/// Whether a round with no row to send asks the worker anyway: when rows
+/// are in flight — the poll that gathers their acknowledgements.
+fn polls(window_empty: bool) -> bool {
+    !window_empty
+}
+
 /// The least a sink down or failed waits before its next request.
 const MIN_SINK_WAIT: Duration = Duration::from_millis(200);
 
@@ -882,14 +888,22 @@ fn round(p: &Params, k: &mut SinkRun, i: usize, set_up_for: &mut Option<u64>) ->
         }
     }
     if rows.is_empty() {
-        if let Some(n) = next_after {
-            if c.window.is_empty() && n != c.cursor {
-                c.cursor = n.clone();
-                c.dirty = true;
+        // rows dropped: the next read starts past them
+        if !dropped.is_empty() {
+            if let Some(n) = &next_after {
+                if c.window.is_empty() && *n != c.cursor {
+                    c.cursor = n.clone();
+                    c.dirty = true;
+                }
+                c.next = n.clone();
             }
-            c.next = n;
         }
-        return false;
+        // nothing in flight: nothing to ask; rows in flight: a request with
+        // no row, the poll that gathers their acknowledgements (lot 276's
+        // fifth lab: without it the syslog sink's rows stayed in flight)
+        if !polls(c.window.is_empty()) {
+            return false;
+        }
     }
     let batch_hashes = hashes;
     let req = ExportRows {
@@ -1156,6 +1170,12 @@ mod tests {
             std::fs::remove_file(d.path().join(bad)).unwrap();
         }
         assert_eq!(over_bound(d.path(), 3, 100), None);
+    }
+
+    #[test]
+    fn rows_in_flight_are_polled_for_their_acknowledgements() {
+        assert!(polls(false), "rows in flight: a poll");
+        assert!(!polls(true), "nothing in flight: no request");
     }
 
     #[test]
