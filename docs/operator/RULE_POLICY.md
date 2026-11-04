@@ -37,6 +37,70 @@ recorded with `held: "legacy_ceiling"`, the action it asked for in
 enforce NN-L-FIM-004
 ```
 
+**Kills that wait for COMBAT (lot 278).** R009 (a file in `/home`, `/tmp` or
+`/var/tmp` executed by root) kills its tree only while the posture is
+COMBAT. Below COMBAT the match keeps its High severity, its signed record and
+its ATT&CK ids; its action is `Log`, `held` names what was held ("the kill of
+the root exec's process tree (R009, lot 278)"), `held_action` the kill, and
+the reasoning the posture the event was judged in. R001 and R003 wait the
+same way for an exec by root (a root exec from `/tmp` or `/var/tmp` is
+R009's to decide); a non-root exec from those directories is killed as
+before, in every posture. Why: R009's legitimate matches are root automation
+run from a checkout or an unpacked tree — `install.sh --upgrade`,
+`uninstall.sh`, Ansible `become` without a terminal, cloud-init, a CI job —
+and the script's own exec comes before any window it can open
+([INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md) §2.1). Holding
+the kill in OBSERVING only would not be enough: any exec from `/tmp` raises
+ENGAGED for 24 hours, so the second run of the same installer would be killed;
+COMBAT is reached on corroborated or decisive evidence only. To kill R009's
+matches in every posture, as before:
+
+```
+enforce R009
+```
+
+**Decision record (03/11/2026, lot 278).** By the coordinator, with the
+authority the founder delegated; after the independent review of #493.
+- *What:* R009's kill, and R001's and R003's of an exec by root from `/tmp` or
+  `/var/tmp`, run in COMBAT only. That is a default, and it changes, for
+  these three cases only, the decision of 21/10/2026 ("a kill that existed
+  before … is not held") and external audit POS-015 ("R001..R003 still kill
+  the exec, whatever the posture").
+- *Why:* their legitimate matches are frequent and destructive when killed:
+  installers and upgrades from a checkout or `/tmp`, Packer, Terraform
+  remote-exec, Vagrant, Ansible `script:`/`become`, self-extracting
+  installers, CI runners in a home. Against a process that is already root
+  the kill is worth little: it moves the file to `/root`, `/opt` or `/run`,
+  which R009 does not cover.
+- *The way back:* `enforce R009` (and `enforce R001`, `enforce R003`) in
+  the signed per-rule policy kills in every posture.
+- *What is left:* a root dropper run from `/tmp` (or a home) in OBSERVING,
+  ALERTED or ENGAGED is a High record and is not killed. It is killed at its
+  first egress (NN-L-CHAIN-002/005/007, NN-L-NET-008), or in COMBAT. A
+  process recorded in ENGAGED is not killed after the fact when COMBAT comes
+  later, unless it is the ladder's offender. On the priority bus an exec may
+  be judged before an earlier event that brings COMBAT: it is judged in the
+  posture it found.
+
+The hold never stands in for another rule's kill of the same exec. A shell
+copied to `/tmp` or a home (R017), and the module, capability and namespace
+tools (R011, R012, R013), run by root from there, are killed in every
+posture, as before.
+
+Inside an administrator's `sudo` session at a terminal, a package
+transaction or an installer's window (R009's Low record), those rules'
+kills of the same exec are held by the legacy ceiling (R009's record is the
+first match), in COMBAT too. That was so for the session and the package
+transaction before lot 278.
+
+Every other rule whose response can be a kill, and why it may kill in
+OBSERVING, is listed in `crates/nn-core/src/decision/posture_floor.rs`
+(`OBSERVING_KILLS`): the kills that existed before Wave 4, kept as they were
+by the decision of 21/10/2026; the exploit guard's kernel kill in enforce
+mode and the exec quarantine's, both opt-ins. A test holds the list to the
+rule catalogue: a new rule that can kill must say where it kills. The kills
+Wave 4 added are held in every posture until `enforce` (above).
+
 ## 2. Writing a policy
 
 `/etc/northnarrow/rule-policy.local`, one directive per line, `#` comments.
@@ -45,7 +109,7 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CAT
 
 | directive | effect |
 |---|---|
-| `enforce <rule>` | the rule's own response, **its held kill included**, above the legacy ceiling |
+| `enforce <rule>` | the rule's own response, **its held kill included** (held by a switch or by the posture, §1), above the legacy ceiling |
 | `alert <rule>` | recorded as an alert (counted for severity), no response |
 | `audit <rule>` | recorded only (no alert line, not counted) |
 | `off <rule>` | not recorded, no response (the rule still runs, so chains and windows keep their state) |
@@ -97,7 +161,8 @@ exempt  NN-L-IMP-001 exe /usr/bin/restic sha256 3f1c…(64 hex digits)
 
 `nn-admin policy test` replays sample events through an offline engine (the
 shipped lists of `--config-dir`, an empty `/proc`) under the candidate and
-prints each decision. Nothing is signed, stored, applied or executed.
+prints each decision, judged as a fresh agent judges, in OBSERVING (R009's
+kill held, §1). Nothing is signed, stored, applied or executed.
 
 ```sh
 nn-admin policy test --policy ./rule-policy.local --events ./sample.jsonl

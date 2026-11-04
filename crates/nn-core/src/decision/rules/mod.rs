@@ -165,7 +165,12 @@ pub fn default_rules<H: DecisionHost>() -> Vec<Box<dyn Rule>> {
     // [`default_rules_with_net`] instead, threading the operator-loaded
     // process-comm allowlist in.
     let process_allowlist = Arc::new(CommAllowlist::<H>::default());
-    rules.extend(spawn_rules(Arc::clone(&process_allowlist), None, None));
+    rules.extend(spawn_rules(
+        Arc::clone(&process_allowlist),
+        None,
+        None,
+        None,
+    ));
     rules.extend(module_load_rules::<H>());
     // External audit PROC-014: the io_uring and BPF rules, over the same
     // empty process allowlist (their built-in known programs still apply).
@@ -263,6 +268,7 @@ pub fn default_rules_with_net<H: DecisionHost>(
         Arc::clone(&process_allowlist),
         Some(lineage.clone()),
         own_launch,
+        Some(Arc::clone(&installer_override)),
     ));
     rules.extend(module_load_rules::<H>());
     rules.extend(iouring::iouring_rules(Arc::clone(&process_allowlist)));
@@ -433,16 +439,19 @@ pub(crate) fn judge_actor<H: PostureHost>(
 ///
 /// `lineage` (production) lets R004 and R009 read a parent's identity;
 /// without it only PID 1 counts as systemd and no session is sanctioned.
-fn spawn_rules<H: PostureHost>(
+/// `installer` (production, lot 278): the trusted-installer window whose
+/// installer's own tree R009 records at Low.
+fn spawn_rules<H: DecisionHost>(
     allowlist: Arc<CommAllowlist<H>>,
     lineage: Option<crate::posture::lineage::AuthSessionTracker<H>>,
     own_launch: Option<OwnWorkerLaunch>,
+    installer: Option<Arc<<H as PostureAgent>::InstallerWindow>>,
 ) -> Vec<Box<dyn Rule>> {
     let r020 = R020ShellWithSocketStdio::new(Arc::clone(&allowlist), lineage.clone());
     let (r004, r009) = match lineage {
         Some(l) => (
             R004ExecFromProcSelfFd::new(l.clone()),
-            R009RootExecFromUserPath::new(l),
+            R009RootExecFromUserPath::new(l).with_installer_window(installer),
         ),
         None => Default::default(),
     };

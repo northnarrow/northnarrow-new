@@ -1359,11 +1359,20 @@ fn the_event_loop_judges_each_event_as_of_its_time() {
         "posture.observe(&event",
         "ladder.observe(&event",
         "cow_guard.observe_event(&event)",
-        "engine.decide(&event)",
+        "let judged_in = posture.current_kind();",
+        "engine.decide_in(&event, judged_in)",
     ];
     for call in calls {
         assert!(code.contains(call), "process_event.rs: no `{call}`");
     }
+    // review of #493 (note b): the record and the responses name the
+    // posture the decision was made in, read once
+    let after = &code[code.find("engine.decide_in(&event, judged_in)").unwrap()..];
+    let end = after.find("\nfn ").unwrap_or(after.len());
+    assert!(
+        !after[..end].contains("posture.current_kind()"),
+        "process_event.rs reads the posture again after the decision"
+    );
     assert!(
         !code.contains("judged_at") && !code.contains("AsOf::Now") && !code.contains("AsOf::Live"),
         "process_event.rs scopes no judgement and names no other time"

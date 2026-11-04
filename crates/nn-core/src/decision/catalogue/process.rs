@@ -190,17 +190,26 @@ pub(super) const DOCS: &[RuleDoc] = &[
         data_components: &["DC0032"],
         observes: "An exec by uid 0 of a file under `/home/`, `/tmp/` or `/var/tmp/`, judged on \
                    the file the kernel executed.",
-        false_positives: "An administrator's sudo/su session at a terminal and a package \
+        false_positives: "An administrator's sudo/su session at a terminal, a package \
                           transaction (a package manager run by root whose run covers the exec) \
-                          are recorded at Low, not killed. Root automation outside both (a \
-                          root cron job or a configuration-management run that executes a file \
-                          from a home or `/tmp`) is killed.",
-        how_to_test: "`cp /bin/true /tmp/nn-r009 && sudo systemd-run --wait /tmp/nn-r009` \
-                      (root, outside a terminal session).",
+                          and the process tree of the installer a trusted-installer window was \
+                          granted to (by lineage from that process, after the grant, while the \
+                          window is open: install.sh, uninstall.sh) are recorded at Low. Root \
+                          automation outside them (a root cron job, a configuration-management \
+                          run or a CI job that executes a file from a home or `/tmp`, the \
+                          installer's own exec) is recorded at High; the kill of its tree runs \
+                          only in COMBAT, or in every posture under a signed `enforce R009` \
+                          (lot 278).",
+        how_to_test: "`cp /bin/sleep /tmp/nn-r009 && sudo systemd-run --wait /tmp/nn-r009 1` \
+                      (root, outside a terminal session): a High record, the kill held below \
+                      COMBAT.",
         tests: &[
             "crates/nn-core/src/decision/rules/r009_root_exec_from_user_path.rs::fires_on_root_in_user_path",
             "crates/nn-core/src/decision/rules/r009_root_exec_from_user_path.rs::\
              sudo_session_at_a_terminal_is_recorded_not_killed",
+            "crates/nn-core/src/decision/rules/r009_root_exec_from_user_path.rs::\
+             the_installer_s_own_tree_is_recorded_inside_its_window",
+            "crates/nn-core/src/decision/posture_floor.rs::r009_kills_in_combat_only",
             "agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it",
         ],
         attack_note: "The rule sees the result, root executing a file a user can write, not \

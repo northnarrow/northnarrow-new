@@ -1555,6 +1555,13 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// event's time — a process that started after it is not the one the
     /// pid named then. Never the image `/proc` shows instead of the
     /// parent's: an exec the cache has not read leaves the pid not known.
+    ///
+    /// Lot 278: the parent's image is read at the fork's earliest time; the
+    /// exec the parent made up to the fork's tick answers only for the
+    /// monitor of an authentication binary (sudo, su, doas, pkexec, …:
+    /// [`AUTH_BINARY_EXES`]) forked in the tick of that binary's exec — the
+    /// one case the upper bound exists for (the lab's R009 flake). Any other
+    /// identity found only later is not known (the reviews of #493).
     fn fork_entry(&self, pid: u32, at: Option<u64>, depth: usize) -> Option<Entry> {
         if pid <= 1 || depth > LINEAGE_DEPTH_CAP {
             return None;
@@ -1571,9 +1578,46 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if at.is_some_and(|t| start_ns.saturating_sub(2 * tick) > t) {
             return None;
         }
+        // The parent's image at the fork's earliest time (`start_ns`). Lot
+        // 278: `/proc` rounds the start down to a tick and `start_ns` takes
+        // all the time suspended off it, so a fork in the tick of its
+        // parent's exec (sudo and its monitor) shows a start before that
+        // exec: the parent's image there is "only later" and the lineage
+        // was lost. Then, and only then, the parent's exec up to the latest
+        // time the fork can have happened (`forked_by`, the boot clock's
+        // start and the two ticks of rounding) answers — if it is the only
+        // identity the parent took in between (review of #493, B1: a
+        // parent that forks and then executes another script of the same
+        // interpreter must not lend the fork that script; the rule of
+        // [`Self::orphan_entry`]), and only an identity its executable alone
+        // decides (second review of #493: a script, an npm entrypoint, an
+        // interpreter's inline program come from an argv the process
+        // writes, and a fork of a fork that never executed — G runs
+        // `python3 evil.py`, its fork forks the child, then executes
+        // `python3 /usr/bin/borg` — would pass for borg; for an
+        // interpreter's identity the later exec is never used).
+        // `/proc/<pid>/exe` must still be that executable (below, its start
+        // read again): a fork made after the exec runs it; one made before
+        // runs the earlier image, the same file or no answer.
+        let forked_by = ticks.saturating_add(2).saturating_mul(tick);
         let parent = match self.cached_live(ppid, Some(start_ns)) {
             CachedAt::Current(e) | CachedAt::Past(e) => e,
-            CachedAt::LaterOnly => return None,
+            CachedAt::LaterOnly => {
+                let e = self.only_identity_between(ppid, start_ns, forked_by)?;
+                // third review of #493: only an authentication binary's
+                // monitor — a child forked before its parent's exec that
+                // executed the same file itself (restic, clamscan: canary
+                // readers) before that exec reached the cache would take
+                // the identity, and nothing tells the two apart
+                if e.script.is_some()
+                    || e.argv_npm_cli
+                    || is_interpreter(&e.exe)
+                    || !is_auth_binary(&e.exe)
+                {
+                    return None;
+                }
+                e
+            }
             CachedAt::Absent => self.fork_entry(ppid, Some(start_ns), depth + 1)?,
         };
         let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
@@ -1598,6 +1642,34 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             script: parent.script,
             uid,
         })
+    }
+
+    /// Lot 278 (review of #493, B1): the exec `pid` ran in `(after, by]`
+    /// when every exec the cache holds of it in that span is one identity —
+    /// the same executable, script and npm entrypoint — of a process
+    /// started by `by`; `None` when there is none, or more than one.
+    fn only_identity_between(&self, pid: u32, after: u64, by: u64) -> Option<Entry> {
+        let s = self.inner.state.read();
+        let cur = s.map.get(&pid).or_else(|| s.daemons.get(&pid));
+        let past = s.history.get(&pid).into_iter().flatten();
+        let mut found: Option<&Entry> = None;
+        for e in past.chain(cur) {
+            if e.spawn_ns <= after || e.spawn_ns > by || e.start_ns > by {
+                continue;
+            }
+            match found {
+                None => found = Some(e),
+                Some(f)
+                    if f.exe != e.exe
+                        || f.script != e.script
+                        || f.argv_npm_cli != e.argv_npm_cli =>
+                {
+                    return None
+                }
+                Some(_) => {}
+            }
+        }
+        found.cloned()
     }
 
     /// `/proc/<pid>/stat`'s parent (field 4) and start (field 22), counted
@@ -2317,6 +2389,39 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             LINEAGE_DEPTH_CAP,
         )?
         .map(|hop| hop.exe)
+    }
+
+    /// Lot 278: `pid` is the process `ancestor` names, or descends from it,
+    /// as of `as_of` — `ancestor` by its pid and its start (`starttime` of
+    /// `/proc/<pid>/stat`, in clock ticks: the process a trusted-installer
+    /// window was granted to, [`crate::anti_tamper::trusted_installer::WindowGrantee`]),
+    /// on the walk of [`Self::actor_in_lineage`] (a parent starts no later
+    /// than its child, POS-003). By lineage only: what any process of the
+    /// tree runs, or is named, is not read. `false` when the walk loses the
+    /// chain first, or when the pid on the walk is a later process (its
+    /// start is not the ancestor's).
+    pub fn descends_from(&self, pid: u32, as_of: AsOf, ancestor: u32, ancestor_ticks: u64) -> bool {
+        // PID 0 and 1 never match: the walk ends at them
+        matches!(
+            self.lineage_walk(
+                pid,
+                as_of,
+                |hop| hop.pid == ancestor && self.hop_started_at_ticks(hop, ancestor_ticks),
+                LINEAGE_DEPTH_CAP,
+            ),
+            Some(Some(_))
+        )
+    }
+
+    /// `hop` is the process that started at `ticks` (`/proc`'s clock, ticks
+    /// since boot): `/proc` shows that very start for its pid now — exactly,
+    /// with no allowance for the time suspended (review of #493, note e: a
+    /// later process that took the grantee's pid within that allowance must
+    /// not pass for it; the grantee runs while its tree is judged) — and a
+    /// cached start agrees with it ([`Self::ticks_show_start`]).
+    fn hop_started_at_ticks(&self, hop: &Hop, ticks: u64) -> bool {
+        self.proc_start_ticks(hop.pid) == Some(ticks)
+            && (hop.start_ns == 0 || self.ticks_show_start(ticks, hop.start_ns))
     }
 
     /// Lab PR 222 (copy on first write): what the kernel executed for `pid`
@@ -5151,6 +5256,406 @@ mod tests {
     fn sudo_with_login_and_terminal_is_interactive_admin() {
         let (_tmp, t) = admin_session(34816, 1000);
         assert!(t.is_interactive_admin(200, AsOf::Now));
+    }
+
+    /// Review of #493 (B1): a parent that forks and then executes another
+    /// script of the same interpreter does not lend its fork that script.
+    /// Read at the fork's earliest time, the fork runs `evil.py` (not
+    /// `dnf`, not a canary reader like borg); when both of the parent's
+    /// execs fall after that time, within the fork's tick, the fork is not
+    /// known (two identities); one exec there (sudo's monitor) answers.
+    #[test]
+    fn a_fork_does_not_borrow_its_parent_s_next_script() {
+        const MS: u64 = 1_000_000;
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let fork = |second_at: u64, first_at: u64| {
+            let tmp = TempDir::new().unwrap();
+            let t = AuthSessionTracker::new(tmp.path());
+            t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+            t.ingest_exec(
+                800,
+                700,
+                "/usr/bin/python3",
+                &argv(&["python3", "/home/u/evil.py"]),
+                first_at,
+                9_000 * MS,
+                1000,
+            );
+            // forked at 10.005 s: `/proc` shows tick 1000 (10.000 s)
+            write_exe(tmp.path(), 801, "/usr/bin/python3");
+            write_status(tmp.path(), 801, 800);
+            write_started(tmp.path(), "801", 800, 1_000);
+            t.ingest_exec(
+                800,
+                700,
+                "/usr/bin/python3",
+                &argv(&["python3", "/usr/bin/borg", "serve"]),
+                second_at,
+                9_000 * MS,
+                1000,
+            );
+            (tmp, t)
+        };
+        let judged = AsOf::Judged(10_050 * MS);
+        // evil.py at 9.5 s, then borg at 10.006 s
+        let (_tmp, t) = fork(10_006 * MS, 9_500 * MS);
+        let id = t.exec_identity(801, judged);
+        assert_eq!(
+            id.and_then(|i| i.script).as_deref(),
+            Some("/home/u/evil.py")
+        );
+        let readers = crate::canary::readers::CanaryReaders::new(Default::default(), t.clone());
+        assert_eq!(readers.reader(801, judged), None);
+        // both after the fork's earliest time, two scripts: not known
+        let (_tmp, t) = fork(10_006 * MS, 10_002 * MS);
+        assert_eq!(t.exec_identity(801, judged), None);
+        assert_eq!(readers_of(&t, 801, judged), None);
+        // two execs there of one identity (the same script twice): an
+        // interpreter's identity is never taken from the later exec (second
+        // review of #493) — not known
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+        for at in [10_002 * MS, 10_006 * MS] {
+            t.ingest_exec(
+                800,
+                700,
+                "/usr/bin/python3",
+                &argv(&["python3", "/home/u/evil.py"]),
+                at,
+                9_000 * MS,
+                1000,
+            );
+        }
+        write_exe(tmp.path(), 801, "/usr/bin/python3");
+        write_status(tmp.path(), 801, 800);
+        write_started(tmp.path(), "801", 800, 1_000);
+        assert_eq!(t.exec_identity(801, judged), None);
+    }
+
+    fn readers_of(t: &AuthSessionTracker, pid: u32, at: AsOf) -> Option<String> {
+        crate::canary::readers::CanaryReaders::new(Default::default(), t.clone()).reader(pid, at)
+    }
+
+    /// Second review of #493: a fork of a fork that never executed. G (750)
+    /// runs an interpreter's script, its fork P (800) forks C (801) and
+    /// then executes another: P's one exec in C's tick is an interpreter's
+    /// — never C's identity; C is not known, not borg, not npm. An
+    /// executable's own identity (sudo after bash) is taken; a child whose
+    /// live exe cannot be read, or that runs the earlier image, is not.
+    #[test]
+    fn a_fork_of_a_fork_does_not_borrow_the_later_exec_of_an_interpreter() {
+        const MS: u64 = 1_000_000;
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let case = |g_exe: &str, g: &[&str], p_exe: &str, p: &[&str], child_exe: &str| {
+            let tmp = TempDir::new().unwrap();
+            let t = AuthSessionTracker::new(tmp.path());
+            t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+            t.ingest_exec(750, 700, g_exe, &argv(g), 9_000 * MS, 8_900 * MS, 1000);
+            // P (800): G's fork, never executed until 10.006 s
+            write_exe(tmp.path(), 800, g_exe);
+            write_status(tmp.path(), 800, 750);
+            write_started(tmp.path(), "800", 750, 990);
+            // C (801), P's fork at 10.005 s (`/proc`: tick 1000)
+            write_exe(tmp.path(), 801, child_exe);
+            write_status(tmp.path(), 801, 800);
+            write_started(tmp.path(), "801", 800, 1_000);
+            t.ingest_exec(800, 750, p_exe, &argv(p), 10_006 * MS, 9_900 * MS, 1000);
+            (tmp, t)
+        };
+        let judged = AsOf::Judged(10_050 * MS);
+        let py = "/usr/bin/python3";
+        let node = "/usr/bin/node";
+        let npm = "/usr/lib/node_modules/npm/bin/npm-cli.js";
+        let cases: [(&str, &[&str], &str, &[&str]); 4] = [
+            // the same interpreter, the review's case
+            (
+                py,
+                &["python3", "/home/u/evil.py"],
+                py,
+                &["python3", "/usr/bin/borg", "serve"],
+            ),
+            // another interpreter before: the child's exe is the later one's
+            (
+                "/usr/bin/perl",
+                &["perl", "/home/u/evil.pl"],
+                py,
+                &["python3", "/usr/bin/borg"],
+            ),
+            // npm's entrypoint
+            (
+                node,
+                &["node", "/home/u/evil.js"],
+                node,
+                &["node", npm, "ci"],
+            ),
+            // an interpreter's inline program
+            (
+                py,
+                &["python3", "/home/u/evil.py"],
+                py,
+                &["python3", "-c", "pass"],
+            ),
+        ];
+        for (g_exe, g, p_exe, p) in cases {
+            let (_tmp, t) = case(g_exe, g, p_exe, p, p_exe);
+            assert_eq!(t.exec_identity(801, judged), None, "{g:?} then {p:?}");
+            assert_eq!(readers_of(&t, 801, judged), None, "{g:?} then {p:?}");
+            assert!(!t.is_npm_cli_writer(801, judged), "{g:?} then {p:?}");
+        }
+        // an executable's identity (bash, then sudo): taken
+        let (tmp, t) = case(
+            "/usr/bin/bash",
+            &["bash"],
+            "/usr/bin/sudo",
+            &["sudo", "x"],
+            "/usr/bin/sudo",
+        );
+        assert_eq!(
+            t.exec_identity(801, judged).map(|i| i.exe),
+            Some(PathBuf::from("/usr/bin/sudo"))
+        );
+        // the child's live exe unreadable: not known
+        std::fs::remove_file(tmp.path().join("801").join("exe")).unwrap();
+        assert_eq!(t.exec_identity(801, judged), None);
+        // a child forked before the exec runs the earlier image: not sudo's
+        write_exe(tmp.path(), 801, "/usr/bin/bash");
+        assert_eq!(t.exec_identity(801, judged), None);
+    }
+
+    /// Third review of #493: the upper bound is for an authentication
+    /// binary's monitor only. A child forked before its parent's exec that
+    /// executed the same binary itself (restic, a canary reader) before its
+    /// own exec reached the cache cannot be told from a fork made after the
+    /// exec: not known, no reader. The monitor of each authentication
+    /// binary in use (sudo, su, doas, pkexec), forked in the tick of its
+    /// exec, keeps that binary's identity.
+    #[test]
+    fn only_an_authentication_binary_s_monitor_takes_the_later_exec() {
+        const MS: u64 = 1_000_000;
+        let monitor = |exe: &str| {
+            let tmp = TempDir::new().unwrap();
+            let t = AuthSessionTracker::new(tmp.path());
+            t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+            // P (710): the shell's fork, executes `exe` at 10.003 s
+            t.ingest_exec(710, 700, exe, &[], 10_003 * MS, 10_001 * MS, 1000);
+            // C (711): forked at 10.008 s (`/proc`: tick 1000), runs `exe`
+            write_exe(tmp.path(), 711, exe);
+            write_status(tmp.path(), 711, 710);
+            write_started(tmp.path(), "711", 710, 1_000);
+            (tmp, t)
+        };
+        let judged = AsOf::Judged(10_030 * MS);
+        // a canary reader's binary: not known, no reader
+        let (_tmp, t) = monitor("/usr/bin/restic");
+        assert_eq!(t.exec_identity(711, judged), None);
+        assert_eq!(readers_of(&t, 711, judged), None);
+        // each authentication binary in use: its monitor keeps its identity
+        for exe in [
+            "/usr/bin/sudo",
+            "/bin/sudo",
+            "/usr/bin/su",
+            "/bin/su",
+            "/usr/bin/doas",
+            "/usr/bin/pkexec",
+        ] {
+            assert!(is_auth_binary(Path::new(exe)), "{exe}");
+            let (_tmp, t) = monitor(exe);
+            assert_eq!(
+                t.exec_identity(711, judged).map(|i| i.exe),
+                Some(PathBuf::from(exe)),
+                "{exe}"
+            );
+        }
+    }
+
+    /// Second review of #493 (mutation R3): the one-identity rule compares
+    /// every field of the identity — two execs of one executable in the
+    /// fork's tick that differ only in npm's entrypoint (`argv[1]`) are two
+    /// identities: not known.
+    #[test]
+    fn two_execs_differing_only_in_npm_s_entrypoint_are_two_identities() {
+        const MS: u64 = 1_000_000;
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+        let npm = "/usr/lib/node_modules/npm/bin/npm-cli.js";
+        t.ingest_exec(
+            710,
+            700,
+            "/usr/bin/sudo",
+            &argv(&["sudo", "-n"]),
+            10_002 * MS,
+            10_001 * MS,
+            1000,
+        );
+        t.ingest_exec(
+            710,
+            700,
+            "/usr/bin/sudo",
+            &argv(&["sudo", npm]),
+            10_006 * MS,
+            10_001 * MS,
+            1000,
+        );
+        write_exe(tmp.path(), 711, "/usr/bin/sudo");
+        write_status(tmp.path(), 711, 710);
+        write_started(tmp.path(), "711", 710, 1_000);
+        assert_eq!(t.exec_identity(711, AsOf::Judged(10_050 * MS)), None);
+    }
+
+    /// Review of #493 (B3): the fork's upper bound is the fork's own tick
+    /// and its rounding — an exec of the parent past it (a tick later) is
+    /// never the fork's image, even as the only one.
+    #[test]
+    fn a_parent_s_exec_after_the_fork_s_tick_is_not_its_image() {
+        const MS: u64 = 1_000_000;
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+        // sudo executed at 10.035 s, 35 ms after the fork's tick 1000
+        t.ingest_exec(
+            710,
+            700,
+            "/usr/bin/sudo",
+            &[],
+            10_035 * MS,
+            10_001 * MS,
+            1000,
+        );
+        write_exe(tmp.path(), 711, "/usr/bin/sudo");
+        write_status(tmp.path(), 711, 710);
+        write_started(tmp.path(), "711", 710, 1_000);
+        t.ingest_exec(
+            712,
+            711,
+            "/home/alice/nn/deploy/install.sh",
+            &[],
+            10_050 * MS,
+            10_045 * MS,
+            0,
+        );
+        write_loginuid(tmp.path(), 712, 1000);
+        write_stat(tmp.path(), 712, 711, 34816);
+        assert!(!t.is_interactive_admin(712, AsOf::Judged(10_050 * MS)));
+        assert_eq!(t.exec_identity(711, AsOf::Judged(10_050 * MS)), None);
+    }
+
+    /// Lot 278: `descends_from` by pid and start — the process itself or an
+    /// ancestor; a later process given the pid (another start), a process
+    /// outside the tree, PID 1 and a walk that loses the chain are not.
+    /// Hops read from `/proc` (outside a judgement) are held to the start
+    /// `/proc` shows.
+    #[test]
+    fn descends_from_is_by_pid_and_start() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        // the installer (cached, started at 50 s = tick 5000, running) and its child
+        t.ingest_exec(900, 800, "/usr/bin/bash", &[], 50 * S + 1, 50 * S, 0);
+        write_started(tmp.path(), "900", 800, 5_000);
+        t.ingest_exec(
+            901,
+            900,
+            "/home/dev/nn/target/release/x",
+            &[],
+            52 * S,
+            52 * S,
+            0,
+        );
+        let judged = AsOf::Judged(52 * S);
+        assert!(t.descends_from(901, judged, 900, 5_000));
+        assert!(
+            t.descends_from(900, judged, 900, 5_000),
+            "the installer itself"
+        );
+        assert!(!t.descends_from(901, judged, 900, 7_000), "another start");
+        // a process that took the pid within the suspended-time allowance of
+        // the cached start (one tick later) is not the installer
+        write_started(tmp.path(), "900", 800, 5_001);
+        assert!(
+            !t.descends_from(901, judged, 900, 5_000),
+            "/proc shows another start"
+        );
+        write_started(tmp.path(), "900", 800, 5_000);
+        // the installer gone: not known, not its tree
+        std::fs::remove_dir_all(tmp.path().join("900")).unwrap();
+        assert!(!t.descends_from(901, judged, 900, 5_000), "gone");
+        write_started(tmp.path(), "900", 800, 5_000);
+        assert!(!t.descends_from(901, judged, 901 + 1, 5_000), "another pid");
+        assert!(!t.descends_from(901, judged, 1, 0), "never PID 1");
+        assert!(!t.descends_from(901, judged, 0, 0));
+        // outside a judgement, a parent known from /proc only (older than the
+        // agent, as the start's scan finds it): by its start there
+        write_started(tmp.path(), "self", 1, 100_000);
+        write_exe(tmp.path(), 950, "/usr/bin/bash");
+        write_status(tmp.path(), 950, 1);
+        write_started(tmp.path(), "950", 1, 6_000);
+        t.ingest_exec(951, 950, "/tmp/nn/x", &[], 61 * S, 61 * S, 0);
+        assert!(t.descends_from(951, AsOf::Now, 950, 6_000));
+        assert!(
+            !t.descends_from(951, AsOf::Now, 950, 6_001),
+            "/proc shows another start"
+        );
+    }
+
+    /// Lot 278 (the lab's "R009 flake"): `sudo` with `use_pty` forks a
+    /// monitor (no exec) that forks the command. `/proc` shows the
+    /// monitor's start in clock ticks, rounded down, on the boot clock, less
+    /// the time suspended: a monitor forked in the tick of sudo's exec
+    /// shows a start before that exec. The parent's image at the fork was
+    /// then looked up at that earlier time, found only "later", and the
+    /// judged walk lost the session: an administrator's `sudo
+    /// ./deploy/install.sh` at a terminal was not sanctioned, and R009
+    /// killed it — whether it did depended on the milliseconds between
+    /// sudo's exec and its fork. The parent is read at the latest time the
+    /// fork can have happened; `/proc/<pid>/exe` must still be its image.
+    #[test]
+    fn sudo_s_monitor_forked_in_the_tick_of_sudo_s_exec_keeps_the_session() {
+        const MS: u64 = 1_000_000;
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        // the operator's shell (cached), sudo executed at 10.003 s
+        t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+        t.ingest_exec(
+            710,
+            700,
+            "/usr/bin/sudo",
+            &[],
+            10_003 * MS,
+            10_001 * MS,
+            1000,
+        );
+        // sudo's monitor, forked at 10.008 s: `/proc` shows tick 1000 (10.000 s)
+        write_exe(tmp.path(), 711, "/usr/bin/sudo");
+        write_status(tmp.path(), 711, 710);
+        write_started(tmp.path(), "711", 710, 1_000);
+        // the command, forked by the monitor, executes the script at 10.050 s
+        t.ingest_exec(
+            712,
+            711,
+            "/home/alice/nn/deploy/install.sh",
+            &[],
+            10_050 * MS,
+            10_045 * MS,
+            0,
+        );
+        write_loginuid(tmp.path(), 712, 1000);
+        write_stat(tmp.path(), 712, 711, 34816);
+        let judged = AsOf::Judged(10_050 * MS);
+        assert!(
+            t.is_interactive_admin(712, judged),
+            "the monitor runs sudo's image: the session is the administrator's"
+        );
+        // the monitor's image must still be the parent's: a fork that runs
+        // something else (it executed since, or it was forked before the
+        // parent executed sudo) is not sudo's
+        write_exe(tmp.path(), 711, "/home/alice/payload");
+        assert!(!t.is_interactive_admin(712, judged));
+        // and a fork whose start is past the time judged is not its parent's
+        write_exe(tmp.path(), 711, "/usr/bin/sudo");
+        write_started(tmp.path(), "711", 710, 1_010);
+        assert!(!t.is_interactive_admin(712, judged));
     }
 
     #[test]

@@ -169,8 +169,10 @@ pub const STATE_FLAGS: &[StateFlag] = &[
 
 /// The agent's other path flags: files it only reads. The test passes its
 /// own (`--combat-rules`, the lists, the templates) or leaves the host's.
-/// A signed `config overlay set` stores the overlay beside `--admin-pub`,
-/// in the test's directory; no suite sends one.
+/// A signed `config overlay set` (or `policy set`) stores the overlay at
+/// the path the agent read it from — the host's when the test leaves the
+/// flag: `response_privileged_e2e` passes its own `--rule-policy-local`
+/// (lot 278); no suite sends another.
 pub const INPUT_FLAGS: &[(&str, &str)] = &[
     ("--btf-check", "a mode: checks a BTF file and exits"),
     ("--combat-rules", "the COMBAT ruleset (IPv4)"),

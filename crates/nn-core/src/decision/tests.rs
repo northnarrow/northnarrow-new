@@ -3,6 +3,7 @@
 //! implementation; these cases pin the behaviour of the engine as a
 //! whole — composition, ordering, and the empty-engine baseline.
 
+use nn_model::posture_types::PostureKind;
 use nn_model::{Event, ResponseAction, Severity};
 
 use super::rules::testutil::{spawn, spawn_as};
@@ -144,12 +145,30 @@ fn root_in_user_path_takes_priority_over_r001() {
     // A root-uid exec from /tmp/ matches both R001 (medium) and R009
     // (high). R009 is registered earlier so it wins.
     let engine = RuleEngine::with_default_rules();
+    let event = spawn_as(0, "payload", "/tmp/payload");
     let v = engine
-        .evaluate(&spawn_as(0, "payload", "/tmp/payload"))
-        .expect("should fire");
+        .decide_in(&event, PostureKind::Combat)
+        .expect("should fire")
+        .verdict;
     assert_eq!(v.rule_id, "R009_RootExecFromUserPath");
     assert_eq!(v.severity, Severity::High);
     assert_eq!(v.action, ResponseAction::KillProcessTree);
+    // Lot 278: below COMBAT R009 records it (High), and its record keeps
+    // R001's kill of the same exec held too: root's exec is R009's
+    for posture in [
+        PostureKind::Observing,
+        PostureKind::Alerted,
+        PostureKind::Engaged,
+    ] {
+        let d = engine.decide_in(&event, posture).expect("should fire");
+        assert_eq!(d.verdict.rule_id, "R009_RootExecFromUserPath", "{posture}");
+        assert_eq!(d.verdict.severity, Severity::High);
+        assert_eq!(d.verdict.action, ResponseAction::Log);
+        assert!(d.responses.is_empty(), "{posture}: {:?}", d.responses);
+    }
+    // `evaluate` judges as a fresh agent does, in OBSERVING
+    let v = engine.evaluate(&event).expect("should fire");
+    assert_eq!(v.action, ResponseAction::Log);
 }
 
 #[test]
@@ -763,7 +782,8 @@ fn spawn_fixtures() -> Vec<Event> {
 #[test]
 fn the_engine_returns_the_strongest_spawn_verdict() {
     for event in spawn_fixtures() {
-        let got = RuleEngine::with_default_rules().decide(&event);
+        // in COMBAT: no rule's kill waits for a posture (lot 278)
+        let got = RuleEngine::with_default_rules().decide_in(&event, PostureKind::Combat);
         let all: Vec<nn_model::Verdict> = default_rules()
             .iter()
             .filter_map(|r| r.evaluate(&event))
@@ -1395,6 +1415,11 @@ fn prod(policy: &str) -> Prod {
 
 impl Prod {
     fn decide(&self, e: &Event) -> Option<super::combine::Decision> {
+        self.decide_in(e, PostureKind::Observing)
+    }
+
+    /// Lot 278: judged in `posture`, as the agent judges.
+    fn decide_in(&self, e: &Event, posture: PostureKind) -> Option<super::combine::Decision> {
         if let Event::ProcessSpawn {
             pid,
             ppid,
@@ -1417,7 +1442,7 @@ impl Prod {
                 *uid,
             );
         }
-        self.engine.decide(e)
+        self.engine.decide_in(e, posture)
     }
 }
 
@@ -1559,11 +1584,124 @@ fn shadow_fim004_is_recorded_and_its_kill_waits_for_enforce() {
 #[test]
 fn the_ceiling_keeps_the_legacy_winners_kill() {
     let d = prod("")
-        .decide(&spawn_as(0, "payload", "/tmp/payload"))
+        .decide_in(&spawn_as(0, "payload", "/tmp/payload"), PostureKind::Combat)
         .expect("a decision");
     assert_eq!(d.verdict.action, ResponseAction::KillProcessTree);
     assert_eq!(d.responses.len(), 1);
     assert!(d.matches.iter().all(|m| m.held.is_none()), "{:?}", ids(&d));
+}
+
+/// Lot 278: below COMBAT, R009's kill of a root exec from a user-writable
+/// path is held by the posture: R009's record (High) names the hold, and
+/// the staging rule's kill of root's exec is held the same way by its own
+/// floor (root's exec from /tmp is R009's to decide). A posture hold lets a
+/// later rule's response through, as a switch's does (review of #493, A1:
+/// below). A signed `enforce` gives R009 its kill back in every posture;
+/// `enforce` of R001 alone kills too (the operator's choice).
+#[test]
+fn below_combat_r009_records_and_its_record_holds_the_staging_kill() {
+    let exec = spawn_as(0, "payload", "/tmp/payload");
+    let d = prod("")
+        .decide_in(&exec, PostureKind::Engaged)
+        .expect("a decision");
+    assert_eq!(d.verdict.rule_id, "R009_RootExecFromUserPath");
+    assert_eq!(d.verdict.action, ResponseAction::Log);
+    assert_eq!(d.verdict.severity, Severity::High);
+    assert!(d.responses.is_empty(), "{:?}", d.responses);
+    let r009 = d.primary();
+    assert_eq!(r009.held, Some(super::posture_floor::KILL_FLOORS[0].held));
+    assert_eq!(r009.held_action, Some(ResponseAction::KillProcessTree));
+    let r001 = d
+        .matches
+        .iter()
+        .find(|m| m.rule_id == "R001_ExecFromTmp")
+        .expect("R001 matched");
+    assert_eq!(r001.held, Some(super::posture_floor::KILL_FLOORS[1].held));
+    assert_eq!(r001.verdict.action, ResponseAction::Log);
+    for posture in [PostureKind::Observing, PostureKind::Engaged] {
+        let d = prod("enforce R009_RootExecFromUserPath\n")
+            .decide_in(&exec, posture)
+            .expect("a decision");
+        assert_eq!(
+            d.verdict.action,
+            ResponseAction::KillProcessTree,
+            "{posture}"
+        );
+        assert_eq!(d.responses.len(), 1);
+        assert!(d
+            .verdict
+            .reasoning
+            .contains("enforced by the signed per-rule policy"));
+    }
+    let d = prod("enforce R001_ExecFromTmp\n")
+        .decide_in(&exec, PostureKind::Observing)
+        .expect("a decision");
+    assert_eq!(d.responses.len(), 1);
+    assert_eq!(d.responses[0].rule_id, "R001_ExecFromTmp");
+}
+
+/// Review of #493 (A1): R009's posture hold never stands in for the kill
+/// another rule had on the same root exec before lot 278 — a shell copied
+/// to /tmp or a home (R017), the module, capability and namespace tools
+/// (R011, R012, R013) run by root from there are killed in every posture,
+/// as on main, R009's and R001's records held beside them.
+#[test]
+fn r009_s_posture_hold_keeps_the_tool_rules_kills_of_a_root_exec() {
+    let p = prod("");
+    for (comm, path, rule) in [
+        ("bash", "/tmp/.x/bash", "R017_ShellFromNonstandardPath"),
+        ("sh", "/home/u/sh", "R017_ShellFromNonstandardPath"),
+        ("insmod", "/tmp/insmod", "R011_KernelModuleTooling"),
+        ("setcap", "/tmp/setcap", "R012_SetcapTooling"),
+        ("nsenter", "/tmp/nsenter", "R013_NamespaceEscapeTooling"),
+    ] {
+        for posture in [
+            PostureKind::Observing,
+            PostureKind::Alerted,
+            PostureKind::Engaged,
+            PostureKind::Combat,
+        ] {
+            let d = p
+                .decide_in(&spawn_as(0, comm, path), posture)
+                .unwrap_or_else(|| panic!("{path}: a decision"));
+            assert!(
+                d.responses
+                    .iter()
+                    .any(|r| (r.rule_id == rule || r.also.contains(&rule))
+                        && matches!(
+                            r.action,
+                            ResponseAction::KillProcess | ResponseAction::KillProcessTree
+                        )),
+                "{path} in {posture}: {rule}'s kill runs: {:?} {:?}",
+                d.responses,
+                ids(&d)
+            );
+            let r009 = d
+                .matches
+                .iter()
+                .find(|m| m.rule_id == "R009_RootExecFromUserPath")
+                .expect("R009 matched");
+            if posture < PostureKind::Combat {
+                assert_eq!(r009.verdict.action, ResponseAction::Log, "{path} {posture}");
+            }
+        }
+    }
+}
+
+/// Review of #493 (note f): in COMBAT the root exec R009 holds below it is
+/// killed — its tree, R009's response, on the production engine.
+#[test]
+fn in_combat_r009_kills_a_root_exec_from_a_home_or_tmp() {
+    let p = prod("");
+    for path in ["/home/u/payload", "/tmp/payload", "/var/tmp/payload"] {
+        let d = p
+            .decide_in(&spawn_as(0, "payload", path), PostureKind::Combat)
+            .expect("a decision");
+        assert_eq!(d.verdict.rule_id, "R009_RootExecFromUserPath", "{path}");
+        assert_eq!(d.responses.len(), 1, "{path}: {:?}", d.responses);
+        assert_eq!(d.responses[0].action, ResponseAction::KillProcessTree);
+        assert_eq!(d.responses[0].rule_id, "R009_RootExecFromUserPath");
+    }
 }
 
 /// NET-007 (Medium) used to win over NET-009 (High): a large internal TCP
