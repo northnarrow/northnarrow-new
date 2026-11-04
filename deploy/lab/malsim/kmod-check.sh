@@ -112,7 +112,7 @@ measure() {
     summary+=("$name|$what|rc $rc|R011 $rec/$kill|R018 $r18/$r18k|$verdict")
     printf '%-3s %-62s rc=%-3s R011 rec=%s kill=%s  R018 rec=%s kill=%s  %s\n' \
         "$name" "$what" "$rc" "$rec" "$kill" "$r18" "$r18k" "$verdict"
-    sudo journalctl -q -o cat -u northnarrow-agent --since "@$t0" 2>/dev/null |
+    sudo journalctl --namespace=northnarrow -q -o cat -u northnarrow-agent --since "@$t0" 2>/dev/null |
         grep -a 'rule=R011_KernelModuleTooling' | sed 's/^.*reasoning=//' | cut -c1-300 |
         sort | uniq -c | head -8 | sed 's/^/       /'
     if [[ $rc -ne 0 ]]; then tail -3 "$WORK/$name.log" | sed 's/^/       | /'; fi
@@ -171,7 +171,7 @@ if want B3 && [[ $online -eq 1 ]]; then
             echo "INFO docker.io installed and its daemon started: R011 rec=$rec kill=$kill R018 rec=$r18 kill=$r18k (the daemon's start)"
             r011_kills=$((r011_kills + kill))
             summary+=("B3|docker.io install + dockerd start|rc 0|R011 $rec/$kill|R018 $r18/$r18k|$([[ $kill -eq 0 ]] && echo PASS || echo FAIL)")
-            sudo journalctl -q -o cat -u northnarrow-agent --since "@$t0" 2>/dev/null |
+            sudo journalctl --namespace=northnarrow -q -o cat -u northnarrow-agent --since "@$t0" 2>/dev/null |
                 grep -a 'rule=R011_KernelModuleTooling' | sed 's/^.*reasoning=//' | cut -c1-300 |
                 sort | uniq -c | head -8 | sed 's/^/       /'
         fi
