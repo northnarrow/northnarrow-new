@@ -60,6 +60,44 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   path alone. A blinding's record is limited by the agent's monotonic
   clock, one a cause every 5 minutes; the beat's `coverage_lost` counts the
   rows queued to be signed.
+- CodeQL code scanning (lot codeql; C27, CI only, no product change):
+  `.github/workflows/codeql.yml`, an advanced setup (the repository's
+  default setup stays off). Every language of what ships — `rust` (the
+  workspace and `agent-ebpf`, `#[cfg(test)]` modules included) and
+  `actions` (the workflows) — is analysed without a build
+  (`build-mode: none`) with the `security-extended` queries. It runs on
+  every pull request to `main`, every push to `main` and weekly
+  (Wednesday 03:37 UTC). `.github/codeql/codeql-config.yml` ignores only
+  what no shipped build contains: the crates' integration tests, `fuzz/`
+  and `deploy/lab/`, which holds the tree's only C and Python. After the
+  review of #496, the `analyze` job holds `contents: read` only, since it
+  runs the dependencies' build scripts and proc-macros. It keeps its SARIF
+  as an artifact (`upload: never`). An `upload` job with no step of its
+  own (checkout, download-artifact, upload-sarif) alone holds
+  `security-events: write`. Every action is pinned by commit SHA
+  (`github/codeql-action` v4.39.2, `1fc58d04…`). The Rust job installs the
+  pinned toolchains (with `rust-src`, and agent-ebpf's nightly), fetches
+  the three cargo projects from their lockfiles (`cargo fetch --locked`)
+  and fails if the extraction changed one. `xtask/tests/supply_chain.rs`:
+  `codeql_scans_every_language_of_the_tree` keeps the config's paths-ignore
+  equal to the members' integration-test directories, `fuzz` and
+  `deploy/lab`, and the language list equal to the languages of the
+  tracked files outside them (`the_codeql_language_of_a_file`). It also
+  keeps the triggers, suite, inputs, jobs, artifact, permissions and pins
+  as they are. `every_workflow_token_is_read_only_unless_it_publishes`
+  allows `security-events: write` to codeql.yml's `upload` alone, and only
+  to a job with no `run:` step and no action other than checkout,
+  download-artifact and upload-sarif. `SECURITY.md` §Code scanning;
+  private vulnerability reporting is enabled (checked 2026-11-04). A pull
+  request's analysis is complete. Diff-informed analysis is off, because
+  the upload job cannot filter a diff-informed SARIF to the pull request's
+  lines (`CODEQL_ACTION_DIFF_INFORMED_QUERIES=false`). The first
+  full analysis of the tree (PR #496, one measurement commit, reverted)
+  found 161 alerts and none real: 152 in test code, 6 false positives in
+  production code, the fuzz fixture's seed nonce and 2 in a lab load
+  generator. They are triaged in the PR, and none was dismissed. The
+  config leaves 132 of them on what ships: 126 in test code or the fuzz
+  fixture, and the 6 false positives.
 - The agent's threads each keep only their capabilities, its keys in one
   place, its unit hardened (lot 272, Wave 4 phase 2, R14c of the
   restructure plan, §3.1–§3.3; `docs/architecture/PROCESS_MODEL.md` §8–§10).

@@ -141,6 +141,28 @@ pub fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     out.sort();
 }
 
+/// The files git tracks, repository-relative (`git ls-files`).
+pub fn tracked_files() -> Vec<String> {
+    let out = Command::new("git")
+        .current_dir(repo_root())
+        .args(["ls-files", "-z"])
+        .output()
+        .expect("git ls-files runs");
+    assert!(out.status.success(), "git ls-files failed");
+    let files: Vec<String> = out
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    assert!(
+        files.len() > 500,
+        "git ls-files lists {} files",
+        files.len()
+    );
+    files
+}
+
 // ── lexing ────────────────────────────────────────────────────────────────
 
 /// `src` with its comments blanked (newlines kept, so line numbers hold);
