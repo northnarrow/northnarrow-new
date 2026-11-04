@@ -17,7 +17,10 @@
 //! - a process whose leader exits first keeps its mark while a thread
 //!   lives, and loses it with the last one;
 //! - systemd's own placement marks nothing: a transient service's main
-//!   process, ten restarts in a row, and a scope's process.
+//!   process, ten restarts in a row, and a scope's process;
+//! - a mark made on a dead group (a zombie's pid written into a cgroup:
+//!   its exit came first) is not the pid's next owner's: the fork of a new
+//!   process at that pid clears it (the review of #494, N5).
 //!
 //! Run (lab guest, units stopped, pins purged — `nn-lab.sh test-ignored`
 //! does both):
@@ -460,6 +463,87 @@ fn the_mark_goes_with_the_last_thread_not_the_leader() {
     );
     let _ = p.wait();
     assert!(wait_gone(me), "the last thread exited: the mark goes");
+}
+
+/// Forks a child that exits at once, waits for it to be a zombie, writes
+/// its pid into argv[1]'s `cgroup.procs` (the move of a group already
+/// dead), prints it; on a line from stdin reaps it, forks again at that pid
+/// (`ns_last_pid`; a few tries: other forks may take it), prints the new
+/// child's pid (0 when the pid was not had), waits for it.
+const DEAD_GROUP: &str = r#"
+import os, sys, time
+z = os.fork()
+if z == 0:
+    os._exit(0)
+for _ in range(500):
+    with open(f"/proc/{z}/stat") as f:
+        if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+            break
+    time.sleep(0.01)
+with open(sys.argv[1] + "/cgroup.procs", "w") as f:
+    f.write(str(z))
+print(z, flush=True)
+sys.stdin.readline()
+os.waitpid(z, 0)
+got = 0
+for _ in range(50):
+    with open("/proc/sys/kernel/ns_last_pid", "w") as f:
+        f.write(str(z - 1))
+    n = os.fork()
+    if n == 0:
+        time.sleep(2)
+        os._exit(0)
+    if n == z:
+        got = n
+        break
+    os.kill(n, 9)
+    os.waitpid(n, 0)
+print(got, flush=True)
+if got:
+    os.waitpid(got, 0)
+"#;
+
+#[test]
+#[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
+fn a_dead_group_s_mark_is_not_the_next_owner_s() {
+    use std::os::unix::process::CommandExt;
+    let _fx = Fixture::setup();
+    let cg = TempCgroup::new("nn-test-join-dead");
+    let mut p = Command::new("python3")
+        .arg("-I")
+        .arg("-c")
+        .arg(DEAD_GROUP)
+        .arg(cg.path())
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn python3");
+    let z = read_pids(&mut p)[0];
+    let planted = wait_mark(z);
+    p.stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(b"go\n")
+        .expect("go");
+    let n = read_pids(&mut p)[0];
+    let next = if n == 0 { None } else { Some(mark(n)) };
+    let _ = p.wait();
+    assert_eq!(
+        planted,
+        Some(Mark {
+            how: HOW_MOVED,
+            by: p.id()
+        }),
+        "the move of a dead group marks its tgid (the case this test is about)"
+    );
+    assert_eq!(n, z, "the pid's next process (ns_last_pid, 50 tries)");
+    assert_eq!(
+        next,
+        Some(None),
+        "a new process at {z} inherited a dead group's mark"
+    );
 }
 
 /// The main pid of transient unit `unit`.

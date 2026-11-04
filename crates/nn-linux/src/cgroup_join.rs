@@ -577,8 +577,8 @@ fn tgid_of(proc_root: &Path, pid: u32) -> Option<u32> {
 /// Lot 277: whether process `pid` started in the cgroup it runs in, for
 /// the exemption check (`ActorFacts::started_in_cgroup`): `Some(true)`
 /// not marked, `Some(false)` marked, `None` not known — no tracker this
-/// boot, a mark the kernel could not take ([`STAT_LOST`] above 0: any
-/// process may be one of those), a lookup that failed. Read on the
+/// boot, a mark the kernel could not take for this group (its bit in
+/// `CGROUP_JOIN_LOST`, [`Marks::started`]), a lookup that failed. Read on the
 /// errands thread; only when an exemption by cgroup or unit would apply.
 pub fn started_in_cgroup(proc_root: &Path, pid: u32) -> Option<bool> {
     let Some(Tracker::Attached(m)) = tracker() else {

@@ -25,9 +25,10 @@
 //!   ([`FS_OP_CGROUP_JOIN`], rate-limited) when the destination is a
 //!   cgroup an exemption names ([`CGROUP_EXEMPT_NAMES`]: the path's hash,
 //!   or one of its components').
-//! * [`cgroup_join_born`] (fentry `cgroup_post_fork`): a child started by
-//!   `clone3(CLONE_INTO_CGROUP)` by anyone but PID 1 — marked before it
-//!   runs.
+//! * [`cgroup_join_born`] (fentry `cgroup_post_fork`): a new thread
+//!   group's tgid cleared of a dead group's state (the review of #494, N5);
+//!   a child started by `clone3(CLONE_INTO_CGROUP)` by anyone but PID 1 —
+//!   marked before it runs.
 //! * [`cgroup_join_fork`] (tracepoint `sched_process_fork`, BTF): a new
 //!   process forked by a marked one is marked, before it runs.
 //! * [`cgroup_join_exit`] (tracepoint `sched_process_exit`, BTF): the mark
@@ -175,9 +176,11 @@ unsafe fn xadd(w: *mut u64, v: u64) {
 }
 
 /// The group is "not known": its mark could not be taken. Counted; its bit
-/// set. One event sets a group's bit at a time — its fork, then its moves
-/// under `cgroup_mutex` — so the test before the add holds; the add is
-/// atomic for the other groups' bits of the word.
+/// set. One event sets or clears a group's bit at a time — the fork that
+/// makes its tgid (`cgroup_post_fork`, then `sched_process_fork`, on the
+/// forking thread, no move between them), then its moves under
+/// `cgroup_mutex` — so the test before the add holds; the add is atomic
+/// for the other groups' bits of the word.
 #[inline(always)]
 fn lose(tgid: u32) {
     count(STAT_LOST);
@@ -197,7 +200,8 @@ fn is_lost(tgid: u32) -> bool {
     lost_word(tgid).is_some_and(|(w, bit)| unsafe { has(w, bit) })
 }
 
-/// The group's bit cleared (its last thread exits).
+/// The group's bit cleared: its tgid is a new thread group's
+/// (`cgroup_join_born`), the only clear — exactly once per fork.
 #[inline(always)]
 fn found(tgid: u32) {
     if let Some((w, bit)) = lost_word(tgid) {
@@ -388,9 +392,16 @@ unsafe fn is_name(hash: u64, kind: u8) -> bool {
 }
 
 /// `void cgroup_post_fork(struct task_struct *child, struct
-/// kernel_clone_args *kargs)`: a child started in a cgroup of its forker's
-/// choosing (`CLONE_INTO_CGROUP`) by anyone but PID 1 is marked; it has
-/// not run yet.
+/// kernel_clone_args *kargs)`, for every fork: a new thread group's tgid
+/// is a pid that was free — what the maps hold at it is a dead group's (a
+/// mark made by a move of a group already exiting, after its exit took the
+/// mark away) and goes, so a pid's next owner does not inherit it (the
+/// review of #494, N5: any user can make such a mark on its own pids); then
+/// a child started in a cgroup of its forker's choosing
+/// (`CLONE_INTO_CGROUP`) by anyone but PID 1 is marked. The child has not
+/// run yet, and no move can touch it before this returns: the fork holds
+/// `cgroup_threadgroup_rwsem` from `cgroup_can_fork` to the end of
+/// `cgroup_post_fork`, and a move of another task takes it for writing.
 #[fentry(function = "cgroup_post_fork")]
 pub fn cgroup_join_born(ctx: FEntryContext) -> i32 {
     unsafe { try_born(&ctx) };
@@ -401,27 +412,37 @@ pub fn cgroup_join_born(ctx: FEntryContext) -> i32 {
 unsafe fn try_born(ctx: &FEntryContext) {
     let child: u64 = ctx.arg(0);
     let kargs: u64 = ctx.arg(1);
-    if child == 0 || kargs == 0 {
+    if child == 0 {
+        return;
+    }
+    let forker = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let Some(tgid) = tgid_of(child) else {
+        count(STAT_LOST);
+        return;
+    };
+    // A thread (`CLONE_THREAD`, a threaded cgroup's too) is its process's:
+    // not a new thread group.
+    if tgid == forker {
+        return;
+    }
+    if CGROUP_JOINED.get(&tgid).is_some() {
+        let _ = CGROUP_JOINED.remove(&tgid);
+    }
+    found(tgid);
+    // Fail closed: a start whose flags cannot be read may be one into a
+    // cgroup.
+    if kargs == 0 {
+        lose(tgid);
         return;
     }
     let Some(flags) = rd_u64(kargs + off!(KERNEL_CLONE_ARGS_FLAGS_OFFSET) as u64) else {
-        count(STAT_LOST);
+        lose(tgid);
         return;
     };
     if flags & CLONE_INTO_CGROUP == 0 {
         return;
     }
-    let forker = (bpf_get_current_pid_tgid() >> 32) as u32;
     if forker == 1 || family(forker) {
-        return;
-    }
-    let Some(tgid) = tgid_of(child) else {
-        count(STAT_LOST);
-        return;
-    };
-    // A thread placed in a threaded cgroup is its process's: not a new
-    // process.
-    if tgid == forker {
         return;
     }
     let Some(start) = rd_u64(child + off!(TASK_STRUCT_START_TIME_OFFSET) as u64) else {
@@ -484,7 +505,9 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) {
 
 /// `sched_process_exit(struct task_struct *p, …)`: the mark goes with the
 /// thread group's last thread (`signal->live`, decremented before the
-/// tracepoint, is 0) — not with its leader, which may exit first.
+/// tracepoint, is 0) — not with its leader, which may exit first. The map
+/// keeps room for the live groups; what a dead tgid still holds goes at
+/// the pid's next fork.
 #[btf_tracepoint(function = "sched_process_exit")]
 pub fn cgroup_join_exit(ctx: BtfTracePointContext) -> i32 {
     unsafe { try_exit(&ctx) };
@@ -500,8 +523,7 @@ unsafe fn try_exit(ctx: &BtfTracePointContext) {
     let Some(tgid) = tgid_of(task) else {
         return;
     };
-    let marked = CGROUP_JOINED.get(&tgid).is_some();
-    if !marked && !is_lost(tgid) {
+    if CGROUP_JOINED.get(&tgid).is_none() {
         return;
     }
     let Some(signal) = rd_u64(task + off!(TASK_STRUCT_SIGNAL_OFFSET) as u64) else {
@@ -510,10 +532,12 @@ unsafe fn try_exit(ctx: &BtfTracePointContext) {
     if signal == 0 {
         return;
     }
+    // Two threads exiting together may both read 0: a second remove finds
+    // nothing. The group's bit in `CGROUP_JOIN_LOST` stays — a dead tgid's,
+    // read by no one — until the pid's next thread group is forked
+    // (`cgroup_join_born`): a clear here could run twice and take the bit
+    // from the word twice.
     if rd_u32(signal + off!(SIGNAL_STRUCT_LIVE_OFFSET) as u64) == Some(0) {
-        if marked {
-            let _ = CGROUP_JOINED.remove(&tgid);
-        }
-        found(tgid);
+        let _ = CGROUP_JOINED.remove(&tgid);
     }
 }

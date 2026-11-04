@@ -94,7 +94,8 @@ const DENY_HOOK_LIST: &str = "LSM task_kill, ptrace_access_check, inode_unlink, 
 /// `docs/roadmap/CAPABILITY_PROGRAM.md`, lots 273b and 273c). Lot 273c
 /// (the review of #490): measured again with `kernel.bpf_stats_enabled=0`
 /// (the stats add two clock reads to every call; lot 273b's rounds ran
-/// with them), the per-call cost from one round with them on.
+/// with them), the per-call cost from one round with them on. Lot 277: the
+/// start-in-cgroup tracker's work, where it runs; its cost not measured.
 const FS_PROTECT_OVERHEAD: &[Overhead] = &[
     Overhead {
         what: "the cgroup move guard (LSM inode_permission): every permission check of a \
@@ -111,6 +112,15 @@ const FS_PROTECT_OVERHEAD: &[Overhead] = &[
         cost: "about 96 ns a write call to a regular file (run_time_ns / run_cnt); with the BPF \
                stats off, the 2,000-file package installed and removed +4 % (1,076 -> 1,123 \
                ms), find /usr within the noise (medians of three A/B rounds)",
+    },
+    Overhead {
+        what: "(lot 277) the start-in-cgroup tracker (tp_btf cgroup_attach_task, \
+               sched_process_fork, sched_process_exit; fentry cgroup_post_fork; fexit \
+               cgroup_procs_write_start; their links pinned): every fork and every exit — one \
+               CGROUP_JOINED lookup and one bit of CGROUP_JOIN_LOST, an insert when the parent \
+               is marked; every cgroup migration — the systemd-placement test and a path walk of \
+               at most 255 bytes while an exemption by cgroup or unit is in force",
+        cost: "not measured (lot 277's lab measured no cost)",
     },
 ];
 
@@ -354,12 +364,17 @@ pub const SOURCES: [SourceContract; 13] = [
              counted per hook and signed (deny_fail_open); a missing deny hook, bpf not in the \
              active LSM list or a deny self-test whose signal is delivered refuses the start \
              (signed) unless NN_ANTI_TAMPER_ALLOW_DEGRADED=1: then L1 or L0, signed; the deny \
-             never depends on the record",
+             never depends on the record; (lot 277) the start-in-cgroup tracker not attached is \
+             signed degraded and no exemption by cgroup or unit applies (fail-closed for the \
+             exemption), a process whose mark could not be kept is not known: no such exemption \
+             for it and what it forks until its thread group ends",
         kernel_budgets: &[KernelBudget {
             allows: "a refused signal, ptrace, kexec, cgroup move, oom_score_adj write or (lot \
                      273b) refused write through a descriptor: one record per caller and \
-                     operation a second, 50 a second per CPU (every one is refused); a refused \
-                     open or other inode operation has no kernel budget",
+                     operation a second, 50 a second per CPU (every one is refused); (lot 277) \
+                     a move into a cgroup an exemption names (cgroup_join, recorded, not \
+                     refused) shares that budget; a refused open or other inode operation has \
+                     no kernel budget",
             counter: "task_denial_rate",
         }],
         overhead: FS_PROTECT_OVERHEAD,

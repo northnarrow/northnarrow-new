@@ -161,18 +161,29 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
         ],
     )
     .unwrap();
-    // CLONE_INTO_CGROUP by anyone but PID 1 and the family, a new process
+    // every new thread group's tgid cleared of a dead group's mark and bit
+    // (the review of #494, N5; its behaviour: the privileged
+    // `a_dead_group_s_mark_is_not_the_next_owner_s`), then CLONE_INTO_CGROUP
+    // by anyone but PID 1 and the family, a new process; flags unread is
+    // not known
     in_order(
         body(&j, "try_born"),
         &[
-            "off!(KERNEL_CLONE_ARGS_FLAGS_OFFSET)",
+            "if tgid == forker {\n        return;\n    }",
+            "if CGROUP_JOINED.get(&tgid).is_some() {\n        let _ = CGROUP_JOINED.remove(&tgid);\n    }\n    found(tgid);",
+            "if kargs == 0 {\n        lose(tgid);\n        return;\n    }",
+            "off!(KERNEL_CLONE_ARGS_FLAGS_OFFSET) as u64) else {\n        lose(tgid);",
             "if flags & CLONE_INTO_CGROUP == 0 {\n        return;\n    }",
             "if forker == 1 || family(forker) {\n        return;\n    }",
-            "if tgid == forker {\n        return;\n    }",
             "if mark(tgid, start, HOW_BORN_INTO, forker) {",
         ],
     )
     .unwrap();
+    assert_eq!(
+        j.matches("found(").count(),
+        2,
+        "the bit cleared at a new group's fork only (its definition and one call)"
+    );
     // a fork of a marked process — the mark this process's, by its
     // leader's start — passes the mark to a new process
     in_order(
@@ -193,16 +204,17 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     in_order(
         body(&j, "try_exit"),
         &[
-            "if !marked && !is_lost(tgid) {\n        return;\n    }",
+            "if CGROUP_JOINED.get(&tgid).is_none() {\n        return;\n    }",
             "off!(TASK_STRUCT_SIGNAL_OFFSET)",
-            "if rd_u32(signal + off!(SIGNAL_STRUCT_LIVE_OFFSET) as u64) == Some(0) {\n        if marked {\n            let _ = CGROUP_JOINED.remove(&tgid);\n        }\n        found(tgid);",
+            "if rd_u32(signal + off!(SIGNAL_STRUCT_LIVE_OFFSET) as u64) == Some(0) {\n        let _ = CGROUP_JOINED.remove(&tgid);\n    }",
         ],
     )
     .unwrap();
+    assert!(!body(&j, "try_exit").contains("found("));
     assert_eq!(
         j.matches("CGROUP_JOINED.remove(").count(),
-        1,
-        "removed at the group's death only"
+        2,
+        "removed at the group's death and at its tgid's next fork only"
     );
     // the start time a mark is keyed with is the leader's
     in_order(
