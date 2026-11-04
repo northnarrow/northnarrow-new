@@ -673,43 +673,57 @@ fn net_listener_on_uncommon_port_records_event() {
         "agent_sig must be present on a chained row"
     );
 
-    // NN-L-NET-006 rule fire: the signed record of this listener. The
-    // record names no port; the principal is this test process, which
-    // opened it, and the listener row carries the same pid.
+    // NN-L-NET-006 rule fire: the signed records of this test process's
+    // listeners. The record names no port; the principal is this test
+    // process, which opened them, and the listener row carries the same pid.
+    //
+    // Lot 279 (CI of #493, ubuntu2204): the test waited for ONE record of
+    // its pid, found the 8443 twin's (recorded since lab PR 186) and counted
+    // before the 41999 one was appended — a race in the test, both verdicts
+    // were in the agent's log. It waits for as many records as listeners it
+    // opened, then asserts exactly that many: neither one may be missing.
     let me = u64::from(std::process::id());
     assert_eq!(row["pid"].as_u64(), Some(me), "listener row: {row}");
-    let rec = common::wait_jsonl_row(
-        &fx.detections_log,
-        JSONL_POLL_TIMEOUT,
-        "NN-L-NET-006 record",
-        |r| r["rule_id"] == NET_006 && r["principal"]["pid"].as_u64() == Some(me),
-    );
-    assert_eq!(rec["severity"], "Medium", "record: {rec}");
-    assert_eq!(
-        rec["verdict"],
-        serde_json::json!({"Rule": "Log"}),
-        "record: {rec}"
-    );
-    assert_eq!(rec["sensor"], "Network", "record: {rec}");
-    assert_eq!(rec["response"], "none", "record: {rec}");
-    if allowlisted {
-        // Lab PR 186 (NETR-015): a common port alone no longer exempts a
-        // listener; only a program installed in a root-owned system tree
-        // does. This test binary is not one, so its 8443 listener is
-        // recorded too (the record names no port; the verdict's reasoning
-        // in the journal does).
-        let records = common::records_of(&fx.detections_log, NET_006);
-        let mine: Vec<_> = records
-            .iter()
+    let expected = if allowlisted { 2 } else { 1 };
+    let mine_of = || -> Vec<serde_json::Value> {
+        common::records_of(&fx.detections_log, NET_006)
+            .into_iter()
             .filter(|r| r["principal"]["pid"].as_u64() == Some(me))
-            .collect();
+            .collect()
+    };
+    let mine = common::wait_until(JSONL_POLL_TIMEOUT, || {
+        let mine = mine_of();
+        (mine.len() >= expected).then_some(mine)
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "{expected} NN-L-NET-006 record(s) of pid {me} within {JSONL_POLL_TIMEOUT:?}; \
+             of this pid: {:?}; all: {:?}",
+            mine_of(),
+            common::records_of(&fx.detections_log, NET_006)
+        )
+    });
+    for rec in &mine {
+        assert_eq!(rec["severity"], "Medium", "record: {rec}");
         assert_eq!(
-            mine.len(),
-            2,
-            "both listeners of this test binary fire NN-L-NET-006, the one on \
-             {ALLOWLISTED_PORT} as a program outside the system trees: {records:?}"
+            rec["verdict"],
+            serde_json::json!({"Rule": "Log"}),
+            "record: {rec}"
         );
+        assert_eq!(rec["sensor"], "Network", "record: {rec}");
+        assert_eq!(rec["response"], "none", "record: {rec}");
     }
+    // Lab PR 186 (NETR-015): a common port alone no longer exempts a
+    // listener; only a program installed in a root-owned system tree does.
+    // This test binary is not one, so its 8443 listener is recorded too
+    // (the record names no port; the verdict's reasoning in the journal
+    // does): both listeners fire NN-L-NET-006, no more.
+    assert_eq!(
+        mine.len(),
+        expected,
+        "each listener of this test binary fires NN-L-NET-006 once (the one on \
+         {ALLOWLISTED_PORT}, when it ran, as a program outside the system trees): {mine:?}"
+    );
 
     // External audit NN-AUD-081/082: the operator verb serves that row,
     // from the file `--netflow-listeners-file` names (it answered
