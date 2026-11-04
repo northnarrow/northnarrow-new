@@ -621,10 +621,11 @@ impl<H: DecisionHost> DefenseDetector<H> {
 
     /// Lot 282: the `iptables` process `pid` was executed by a container
     /// runtime flushing its own chain — its parent (what the kernel
-    /// executed for it) is a runtime program ([`is_runtime_program`]), in a
-    /// system tree, run directly (no interpreter's script) and installed by
-    /// a package. A parent that cannot be read, a shell, an unpackaged
-    /// copy (`/opt/cni/bin`, k3s's bundled tools) vouches for nothing.
+    /// executed for it) is a runtime program ([`is_runtime_program`]: in a
+    /// system tree by construction) installed by a package. A parent that
+    /// cannot be read, a shell, an unpackaged copy (`/opt/cni/bin`, k3s's
+    /// bundled tools) or a host with no package database vouches for
+    /// nothing.
     fn flushed_by_its_runtime(&self, pid: u32, as_of: AsOf) -> bool {
         let Some(hops) = self.lineage.lineage_identities(pid, as_of) else {
             return false;
@@ -632,10 +633,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
         let Some((_, parent)) = hops.get(1) else {
             return false;
         };
-        is_runtime_program(&parent.exe)
-            && parent.script.is_none()
-            && parent.is_installed_program()
-            && self.owners.owned(&parent.exe) == Some(true)
+        is_runtime_program(&parent.exe) && self.owners.owned(&parent.exe) == Some(true)
     }
 
     /// Wire the trusted-installer window (`main.rs`, once): inside a valid

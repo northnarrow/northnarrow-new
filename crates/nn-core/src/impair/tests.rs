@@ -324,7 +324,7 @@ fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
     std::fs::write(root.path().join("var/lib/dpkg/status"), "Package: x\n").unwrap();
     std::fs::write(
         info.join("containernetworking-plugins.list"),
-        "/usr/lib/cni\n/usr/lib/cni/bridge\n/usr/lib/cni/portmap\n",
+        "/usr/lib/cni\n/usr/lib/cni/bridge\n/usr/lib/cni/portmap\n/usr/lib/cni/extra/helper\n",
     )
     .unwrap();
     std::fs::write(info.join("docker.io.list"), "/usr/sbin/dockerd\n").unwrap();
@@ -381,6 +381,16 @@ fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
         310,
         "/usr/lib/cni/fake",
         &["fake".into()],
+        5 * S,
+        5 * S,
+        0,
+    );
+    // a packaged program below the plugins' directory, not in it
+    l.ingest_exec(
+        350,
+        310,
+        "/usr/lib/cni/extra/helper",
+        &["helper".into()],
         5 * S,
         5 * S,
         0,
@@ -443,6 +453,29 @@ fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
         "an unlisted program in the plugins' directory"
     );
     assert!(run(4014, 340, &cni).is_some(), "a script run as the plugin");
+    assert!(
+        run(4015, 350, &cni).is_some(),
+        "a program below the plugins' directory"
+    );
+    // a listed command that is no flush, whatever follows it
+    assert!(run(4016, 311, &["nft", "flush", "ruleset", "CNI-0a1b"]).is_some());
+    // a host with no package database vouches for nothing
+    let bare = TempDir::new().unwrap();
+    let det2 = DefenseDetector::with_proc_root(
+        Arc::new(SecurityTools::builtin()),
+        h.lineage.clone(),
+        None,
+        h._proc.path(),
+    )
+    .with_program_owners(crate::impact::trust::ProgramOwners::new(bare.path()));
+    let argv_s: Vec<String> = cni.iter().map(|a| a.to_string()).collect();
+    let at = 100 * S + 4017;
+    l.ingest_exec(4017, 311, "/usr/sbin/xtables-nft-multi", &argv_s, at, at, 0);
+    let mut e = spawn(4017, 311, "/usr/sbin/xtables-nft-multi", &cni);
+    if let Event::ProcessSpawn { timestamp_ns, .. } = &mut e {
+        *timestamp_ns = at;
+    }
+    assert!(det2.assess(&e).is_some(), "no package database");
     // the firewall's chains, whoever flushes them
     for (k, (ppid, argv)) in [
         (200, &["iptables", "-F", "ufw-user-input"][..]),
