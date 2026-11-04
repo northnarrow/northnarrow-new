@@ -555,11 +555,12 @@ fn attach_reporting(
     // exemptions by cgroup or unit hold for processes started in their
     // cgroup only). Not a deny hook: without it those exemptions are
     // refused, a signed degradation.
-    let (tracker, reset) = crate::cgroup_join::attach(ebpf, &btf, pin_root);
-    // The re-review of #494, R2: marks of before this start dropped (the
-    // maps' layout changed: an upgrade's schema, another size) — never in
-    // silence.
-    if let Some(why) = reset {
+    let (tracker, signed) = crate::cgroup_join::attach(ebpf, &btf, pin_root);
+    // The re-review of #494, R2, and its third review: marks of before this
+    // start dropped (a reset: their pins gone between two agents, not the
+    // ones registered, another schema's) or the marks' capacity below the
+    // host's — never in silence.
+    for why in signed {
         report.degraded.push(format!("cgroup exemptions: {why}"));
     }
     match &tracker {
@@ -642,6 +643,23 @@ fn attach_reporting(
             );
             deny.infra_failure(
                 "filesystem::register_bpffs_pins (tracker)",
+                format!("{e:#}"),
+            );
+        }
+        // The third review of #494 (R2-b): the record of which pins are the
+        // tracker's — the next start adopts nothing else.
+        // Absent when the tracker did not attach or could not register (the
+        // next start then resets: fail closed).
+        let state = std::path::Path::new(crate::cgroup_join::STATE_PATH);
+        if !state.exists() {
+            warn!("anti-tamper FS: no tracker pin state to protect");
+        } else if let Err(e) = filesystem::register_agent_file(ebpf, state) {
+            warn!(
+                error = format!("{e:#}"),
+                "anti-tamper FS: the tracker's pin state NOT protected — rewritable by root"
+            );
+            deny.infra_failure(
+                "filesystem::register_agent_file (tracker state)",
                 format!("{e:#}"),
             );
         }

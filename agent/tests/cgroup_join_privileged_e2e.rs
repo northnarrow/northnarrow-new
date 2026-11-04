@@ -26,7 +26,11 @@
 //!   marked process's forks past the map are "not known" (never neither
 //!   marked nor not known), a fork of one of those is too, a unit systemd
 //!   starts meanwhile is neither, and the pid of a "not known" process,
-//!   once it is gone, is a new process's with nothing.
+//!   once it is gone, is a new process's with nothing;
+//! - the third review of #494 (R2-b): a tracker directory planted beside
+//!   the pin root under a name a later start could take, an LRU map in it
+//!   as the marks, is never adopted — the agent keeps its registered pins
+//!   and removes the planted one, signed.
 //!
 //! Run (lab guest, units stopped, pins purged — `nn-lab.sh test-ignored`
 //! does both):
@@ -224,6 +228,13 @@ fn root() -> &'static Path {
 
 fn mark(pid: u32) -> Option<Mark> {
     pinned_mark(root(), pid).unwrap_or_else(|e| panic!("reading the mark of {pid}: {e}"))
+}
+
+/// The tracker's pins as the running agent registered them.
+fn registered() -> nn_linux::cgroup_join::PinState {
+    let text = std::fs::read_to_string(nn_linux::cgroup_join::STATE_PATH)
+        .expect("the tracker's pin state");
+    nn_linux::cgroup_join::PinState::parse(&text).expect("a whole pin state")
 }
 
 fn lost(pid: u32) -> bool {
@@ -630,11 +641,17 @@ if got:
 fn a_full_map_makes_that_tree_not_known_and_no_one_else() {
     use std::os::unix::process::CommandExt;
     let _fx = Fixture::setup_with(&[("NN_DEBUG_CGROUP_JOINED_ENTRIES", "64")]);
-    let dir = nn_linux::cgroup_join::pinned_dir(root()).expect("the tracker's pin directory");
-    assert!(
-        dir.to_string_lossy().ends_with("-64"),
+    let state = registered();
+    let joined = state
+        .maps
+        .iter()
+        .find(|m| m.name == nn_linux::cgroup_join::JOINED_MAP)
+        .expect("the marks registered");
+    assert_eq!(
+        joined.max_entries,
+        64,
         "the knob sized the marks: {}",
-        dir.display()
+        state.dir.display()
     );
     let cg = TempCgroup::new("nn-test-join-full");
     let mut p = Command::new("python3")
@@ -720,6 +737,72 @@ fn a_full_map_makes_that_tree_not_known_and_no_one_else() {
         Some((None, false)),
         "a new process at {x} inherited the not-known state of a dead group"
     );
+}
+
+/// Pins an LRU hash shaped like the marks (key 4, value 16, 64 entries) at
+/// argv[1]/CGROUP_JOINED, the directory made first; prints the map's fd's
+/// result ("ok").
+const PLANT_LRU: &str = r#"
+import ctypes, os, struct, sys
+SYS_BPF, BPF_MAP_CREATE, BPF_OBJ_PIN, LRU_HASH = 321, 0, 6, 9
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+os.makedirs(sys.argv[1], mode=0o700, exist_ok=True)
+attr = (ctypes.c_uint8 * 128)()
+struct.pack_into("<IIIII", attr, 0, LRU_HASH, 4, 16, 64, 0)
+fd = libc.syscall(SYS_BPF, BPF_MAP_CREATE, ctypes.byref(attr), ctypes.c_uint(128))
+if fd < 0:
+    raise SystemExit("map create: errno %d" % ctypes.get_errno())
+path = ctypes.create_string_buffer((sys.argv[1] + "/CGROUP_JOINED").encode())
+attr = (ctypes.c_uint8 * 128)()
+struct.pack_into("<QI", attr, 0, ctypes.addressof(path), fd)
+if libc.syscall(SYS_BPF, BPF_OBJ_PIN, ctypes.byref(attr), ctypes.c_uint(128)) != 0:
+    raise SystemExit("pin: errno %d" % ctypes.get_errno())
+print("ok", flush=True)
+"#;
+
+#[test]
+#[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
+fn a_planted_tracker_directory_is_never_adopted() {
+    // an agent first, so that the tracker's pins are registered
+    let before = {
+        let _fx = Fixture::setup();
+        registered()
+    };
+    let gen = before
+        .dir
+        .to_string_lossy()
+        .rsplit_once('.')
+        .and_then(|(_, g)| g.parse::<u32>().ok())
+        .expect("a generation");
+    let planted = format!(
+        "{}{}{}.{}",
+        root().display(),
+        ::common::cgroup_join::PIN_DIR_INFIX,
+        ::common::cgroup_join::PIN_SCHEMA,
+        gen + 1
+    );
+    let out = Command::new("python3")
+        .args(["-I", "-c", PLANT_LRU, &planted])
+        .output()
+        .expect("python3");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "ok",
+        "planting: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let fx = Fixture::setup();
+    let after = registered();
+    assert_eq!(
+        after.dir, before.dir,
+        "the registered pins adopted, not the planted ones"
+    );
+    assert!(
+        !Path::new(&planted).exists(),
+        "the planted directory {planted} left beside the pin root"
+    );
+    fx.wait_for_log("an unregistered tracker directory beside the pin root removed");
 }
 
 /// The main pid of transient unit `unit`.

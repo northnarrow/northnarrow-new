@@ -42,8 +42,8 @@ use aya::programs::links::FdLink;
 use aya::programs::{BtfTracePoint, FEntry, FExit};
 use aya::{Btf, Ebpf, EbpfLoader};
 use common::cgroup_join::{
-    fnv, is_pin_dir_of, lost_slot, unpack, LOST_BYTES, NAME_CGROUP, NAME_UNIT, STAT_INTO_EXEMPT,
-    STAT_LOST, STAT_ROOTS,
+    fnv, is_pin_dir_of, lost_slot, parse_pin_dir, unpack, EPOCH_SLOTS, LOST_BYTES, LOST_SLOTS,
+    NAME_CGROUP, NAME_UNIT, PIN_SCHEMA, STAT_INTO_EXEMPT, STAT_LOST, STAT_ROOTS, STAT_SLOTS,
 };
 use nn_core::decision::rule_policy::{Exemption, RulePolicy};
 use parking_lot::Mutex;
@@ -57,8 +57,18 @@ pub const JOINED_MAP: &str = "CGROUP_JOINED";
 pub const LOST_MAP: &str = "CGROUP_JOIN_LOST";
 /// The counters (pinned there).
 pub const STATS_MAP: &str = "CGROUP_JOIN_STATS";
+/// The third review of #494 (R2-a): the last reset's instant (pinned there).
+pub const EPOCH_MAP: &str = "CGROUP_JOIN_EPOCH";
 /// The re-review of #494, R2: the maps pinned in the tracker's directory.
-pub const PINNED_MAPS: [&str; 3] = [JOINED_MAP, LOST_MAP, STATS_MAP];
+pub const PINNED_MAPS: [&str; 4] = [JOINED_MAP, LOST_MAP, STATS_MAP, EPOCH_MAP];
+
+/// The third review of #494 (R2-b): the tracker's pins this boot, as the
+/// start that made or adopted them registered them — the next start adopts
+/// nothing else, and (point 3) one that finds it but not its directory
+/// knows the pins went between two agents. `/run` holds it for this boot
+/// only; the agent protects it like its other files
+/// (`anti_tamper::filesystem::register_agent_file`).
+pub const STATE_PATH: &str = "/run/northnarrow/cgroup-join-pins";
 /// The exemptions' names the kernel matches a destination against.
 pub const NAMES_MAP: &str = "CGROUP_EXEMPT_NAMES";
 
@@ -100,6 +110,7 @@ pub const ABSENT_EFFECT: &str =
 type Joined = HashMap<MapData, u32, [u64; 2]>;
 type Lost = Array<MapData, [u8; LOST_BYTES]>;
 type Stats = Array<MapData, u64>;
+type Epoch = Array<MapData, u64>;
 type Names = HashMap<MapData, u64, u8>;
 
 /// The tracker's maps, for the exemption check, the names and the sweep.
@@ -108,6 +119,7 @@ pub struct Marks {
     joined: Arc<Mutex<Joined>>,
     lost: Arc<Mutex<Lost>>,
     stats: Arc<Mutex<Stats>>,
+    epoch: Arc<Mutex<Epoch>>,
     names: Arc<Mutex<Names>>,
 }
 
@@ -120,10 +132,10 @@ pub enum Tracker {
 
 static TRACKER: OnceLock<Tracker> = OnceLock::new();
 
-/// The tracker's pin directory this boot: `Ok` the directory the loader
-/// pinned the maps in, `Err` why there is none on a bpffs host (the tracker
-/// is then absent); unset without a bpffs ([`prepare_pins`]).
-static PIN_DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+/// The tracker's pins this boot ([`prepare_pins`]): `Ok` the plan the
+/// loader pinned the maps by, `Err` why there is none on a bpffs host (the
+/// tracker is then absent); unset without a bpffs.
+static PLAN: OnceLock<Result<Plan, String>> = OnceLock::new();
 
 /// The review of #494, D2: the entries the marks get at the object's load
 /// — the host's `pid_max` and `threads-max`, the lower
@@ -151,55 +163,434 @@ pub fn joined_entries_now() -> u32 {
     )
 }
 
-/// The re-review of #494, R2: before the object's load, the tracker's pin
-/// directory for `pin_root` and marks of `entries`
-/// (`common::cgroup_join::pin_dir`: beside the root, named by the maps'
-/// layout) — created `0700`, never through a symbolic link — and the
-/// loader told to pin the tracker's maps there ([`PINNED_MAPS`]): a map
-/// pinned there by an earlier start of this boot is reused, else created.
-/// Without a bpffs (`pin_root` `None`) the maps are this process's.
+/// A map of the tracker as a start registered it ([`STATE_PATH`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedMap {
+    pub name: String,
+    pub id: u32,
+    pub max_entries: u32,
+}
+
+/// The tracker's pins as the last start of this boot registered them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinState {
+    /// `/proc/sys/kernel/random/boot_id` of the boot.
+    pub boot: String,
+    pub dir: PathBuf,
+    pub maps: Vec<PinnedMap>,
+}
+
+impl PinState {
+    pub fn render(&self) -> String {
+        let mut out = format!(
+            "# northnarrow-agent: the start-in-cgroup tracker's pins this boot (lot 277)\nboot {}\ndir {}\n",
+            self.boot,
+            self.dir.display()
+        );
+        for m in &self.maps {
+            out.push_str(&format!("map {} {} {}\n", m.name, m.id, m.max_entries));
+        }
+        out
+    }
+
+    /// `None` for anything but a whole state.
+    pub fn parse(text: &str) -> Option<PinState> {
+        let (mut boot, mut dir, mut maps) = (None, None, Vec::new());
+        for line in text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        {
+            let mut w = line.split_whitespace();
+            match (w.next()?, w.next()?) {
+                ("boot", b) => boot = Some(b.to_string()),
+                ("dir", d) => dir = Some(PathBuf::from(d)),
+                ("map", name) => maps.push(PinnedMap {
+                    name: name.to_string(),
+                    id: w.next()?.parse().ok()?,
+                    max_entries: w.next()?.parse().ok()?,
+                }),
+                _ => return None,
+            }
+            if w.next().is_some() {
+                return None;
+            }
+        }
+        Some(PinState {
+            boot: boot?,
+            dir: dir?,
+            maps,
+        })
+    }
+}
+
+/// What a start does with the tracker's pins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// The directory this start pins the maps in.
+    pub dir: PathBuf,
+    /// The registered directory, its maps verified: their marks kept.
+    pub adopt: bool,
+    /// The third review of #494 (R2-a, R2-b, point 3): why the marks of
+    /// before are gone — a signed degradation, and every process started
+    /// before this start's programs is not known (`CGROUP_JOIN_EPOCH`).
+    pub reset: Option<String>,
+    /// Signed, no reset: the marks' capacity below the host's (R2-a).
+    pub note: Option<String>,
+}
+
+/// What `BPF_OBJ_GET_INFO_BY_FD` says of a pinned map.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Seen {
+    pub id: u32,
+    pub kind: Option<aya::maps::MapType>,
+    pub key: u32,
+    pub value: u32,
+    pub max_entries: u32,
+    pub flags: u32,
+}
+
+/// The layout of the tracker's map `name` in this schema: kind, key and
+/// value sizes, entries when fixed, flags.
+fn layout(name: &str) -> Option<(aya::maps::MapType, u32, u32, Option<u32>, u32)> {
+    use aya::maps::MapType;
+    match name {
+        JOINED_MAP => Some((MapType::Hash, 4, 16, None, 1)),
+        LOST_MAP => Some((MapType::Array, 4, LOST_BYTES as u32, Some(LOST_SLOTS), 0)),
+        STATS_MAP => Some((MapType::Array, 4, 8, Some(STAT_SLOTS), 0)),
+        EPOCH_MAP => Some((MapType::Array, 4, 8, Some(EPOCH_SLOTS), 0)),
+        _ => None,
+    }
+}
+
+/// The third review of #494 (R2-b): pinned map `seen` is the one a start
+/// registered (`registered`: its id, its entries) and has this schema's
+/// layout — a hash with `BPF_F_NO_PREALLOC` and nothing else for the
+/// marks, never an LRU one; the arrays at their sizes.
+pub fn verify_map(seen: &Seen, registered: &PinnedMap) -> Result<(), String> {
+    let (kind, key, value, entries, flags) = layout(&registered.name)
+        .ok_or_else(|| format!("{}: not a map of the tracker", registered.name))?;
+    let name = &registered.name;
+    if seen.id != registered.id {
+        return Err(format!(
+            "{name}: id {} where {} was registered",
+            seen.id, registered.id
+        ));
+    }
+    if seen.kind != Some(kind) {
+        return Err(format!("{name}: a {:?} map, not {kind:?}", seen.kind));
+    }
+    if (seen.key, seen.value) != (key, value) {
+        return Err(format!(
+            "{name}: key {} value {} bytes, not {key} and {value}",
+            seen.key, seen.value
+        ));
+    }
+    if seen.flags != flags {
+        return Err(format!("{name}: flags {:#x}, not {flags:#x}", seen.flags));
+    }
+    if seen.max_entries != registered.max_entries || entries.is_some_and(|e| e != seen.max_entries)
+    {
+        return Err(format!(
+            "{name}: {} entries where {} were registered",
+            seen.max_entries, registered.max_entries
+        ));
+    }
+    Ok(())
+}
+
+/// The third review of #494: what a start does with the tracker's pins.
+/// `state` is the registered one (of boot `boot` only), `dirs` every
+/// tracker directory beside `root`, `verify` the check of the registered
+/// directory's maps (the marks' entries when they are as registered),
+/// `wanted` the marks' entries the host asks for, `debug_entries` a
+/// `debug-trigger` build's knob.
+///
+/// * The registered directory, its maps verified, is adopted, whatever the
+///   host's size now (R2-a: the size is a capacity; below the host's, a
+///   signed note — the groups past it are not known).
+/// * Anything else is a reset in the next generation's directory: the
+///   registered one gone (point 3, "marks lost between agents"), its maps
+///   not the registered ones or not of this layout (R2-b), another
+///   schema's (not migrated: the first schema has no older one), a
+///   directory nobody registered — a planted one, or one of a start that
+///   could not register (R2-b).
+/// * No state and no directory: the first start of this boot.
+pub fn plan(
+    root: &Path,
+    boot: &str,
+    state: Option<&PinState>,
+    dirs: &[PathBuf],
+    verify: &dyn Fn(&PinState) -> Result<u32, String>,
+    wanted: u32,
+    debug_entries: Option<u32>,
+) -> Plan {
+    let root_name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parsed = |p: &Path| {
+        p.file_name()
+            .and_then(|n| parse_pin_dir(&root_name, &n.to_string_lossy()))
+    };
+    let state = state.filter(|s| s.boot == boot);
+    let next_gen = dirs
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(state.map(|s| s.dir.as_path()))
+        .filter_map(|p| parsed(p).and_then(|(_, g)| g))
+        .max()
+        .map_or(0, |g| g.saturating_add(1));
+    let next = |reset: Option<String>| Plan {
+        dir: PathBuf::from(common::cgroup_join::pin_dir(
+            &root.to_string_lossy(),
+            next_gen,
+        )),
+        adopt: false,
+        reset,
+        note: None,
+    };
+    let Some(st) = state else {
+        if dirs.is_empty() {
+            return next(None);
+        }
+        let names: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        return next(Some(format!(
+            "marks reset: a tracker directory no start of this boot registered ({}) is not adopted",
+            names.join(", ")
+        )));
+    };
+    let dir = st.dir.display();
+    match parsed(&st.dir) {
+        Some((schema, Some(_))) if schema == PIN_SCHEMA => {}
+        Some((schema, _)) => {
+            return next(Some(format!(
+                "marks reset: the tracker's maps of schema v{schema} ({dir}) are not migrated to \
+                 v{PIN_SCHEMA} (no migration from v{schema})"
+            )))
+        }
+        None => {
+            return next(Some(format!(
+                "marks reset: the registered {dir} is not a tracker directory"
+            )))
+        }
+    }
+    if !dirs.contains(&st.dir) {
+        return next(Some(format!(
+            "marks lost between agents: {dir}, registered by the previous start of this boot, is gone"
+        )));
+    }
+    let entries = match verify(st) {
+        Ok(n) => n,
+        Err(why) => {
+            return next(Some(format!(
+                "marks reset: the registered {dir} does not hold the maps registered ({why})"
+            )))
+        }
+    };
+    if let Some(n) = debug_entries.filter(|n| *n != entries) {
+        return next(Some(format!(
+            "marks reset: a debug build asked for {n} marks, {entries} are pinned"
+        )));
+    }
+    Plan {
+        dir: st.dir.clone(),
+        adopt: true,
+        reset: None,
+        note: (entries < wanted).then(|| {
+            format!(
+                "the marks' capacity ({entries}, fixed when the map was made) is below the host's \
+                 ({wanted}: kernel.pid_max or kernel.threads-max raised since): past it, a process \
+                 asking for a mark is not known"
+            )
+        }),
+    }
+}
+
+/// `/proc/sys/kernel/random/boot_id`.
+fn boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// What `BPF_OBJ_GET_INFO_BY_FD` says of the map pinned at `path` (opened
+/// read-only).
+fn seen_at(path: &Path) -> Result<Seen, String> {
+    let md = open_pinned_ro(path)?;
+    let info = md.info().map_err(|e| e.to_string())?;
+    Ok(Seen {
+        id: info.id(),
+        kind: info.map_type().ok(),
+        key: info.key_size(),
+        value: info.value_size(),
+        max_entries: info.max_entries(),
+        flags: info.map_flags(),
+    })
+}
+
+/// The registered directory's maps, each the one registered in this
+/// layout, no other file but the programs' pins: the marks' entries.
+fn verify_state(st: &PinState) -> Result<u32, String> {
+    if let Some(why) = antitamper_bpf::pin_root_refusal_at(&st.dir) {
+        return Err(why);
+    }
+    let mut entries = None;
+    for name in PINNED_MAPS {
+        let reg = st
+            .maps
+            .iter()
+            .find(|m| m.name == name)
+            .ok_or_else(|| format!("{name} not registered"))?;
+        verify_map(&seen_at(&st.dir.join(name))?, reg)?;
+        if name == JOINED_MAP {
+            entries = Some(reg.max_entries);
+        }
+    }
+    let known = |n: &str| {
+        PINNED_MAPS.contains(&n)
+            || PROGRAMS
+                .iter()
+                .any(|(p, _, _)| n == format!("prog_{p}") || n == format!("link_{p}"))
+    };
+    for e in std::fs::read_dir(&st.dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if !known(&n) {
+            return Err(format!("{n}: not a pin of the tracker"));
+        }
+    }
+    entries.ok_or_else(|| "no marks".to_string())
+}
+
+/// The third review of #494 (R2-d): `dir` usable for the tracker's pins —
+/// never a symbolic link or anything but a directory, created `0700`.
+fn usable_dir(dir: &Path) -> Result<(), String> {
+    if let Some(why) = antitamper_bpf::pin_root_refusal_at(dir) {
+        return Err(why);
+    }
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("creating {}: {e}", dir.display())),
+    }
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
+            if m.permissions().mode() & 0o7777 != 0o700 {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+            Ok(())
+        }
+        Ok(_) => Err(format!("{} is not a directory", dir.display())),
+        Err(e) => Err(format!("{}: {e}", dir.display())),
+    }
+}
+
+/// The re-review of #494 (R2) and its third review: before the object's
+/// load, what this start does with the tracker's pins ([`plan`]) — the
+/// registered directory adopted, its maps verified, or a new one — and the
+/// loader told to pin the tracker's maps there ([`PINNED_MAPS`]). Nothing
+/// is removed here: the agent is not a protected pid yet, and a reset
+/// directory goes once the new programs run ([`attach`]). Without a bpffs
+/// (`pin_root` `None`) the maps are this process's.
 pub fn prepare_pins(loader: &mut EbpfLoader<'_>, pin_root: Option<&Path>, entries: u32) {
     let Some(root) = pin_root else {
         return;
     };
-    let dir = PIN_DIR.get_or_init(|| {
-        let dir = PathBuf::from(common::cgroup_join::pin_dir(
-            &root.to_string_lossy(),
+    let plan = PLAN.get_or_init(|| {
+        let state = std::fs::read_to_string(STATE_PATH)
+            .ok()
+            .and_then(|t| PinState::parse(&t));
+        let p = plan(
+            root,
+            &boot_id(),
+            state.as_ref(),
+            &other_pin_dirs(root, None),
+            &verify_state,
             entries,
-        ));
-        if let Some(why) = antitamper_bpf::pin_root_refusal_at(&dir) {
-            return Err(why);
-        }
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(format!("creating {}: {e}", dir.display())),
-        }
-        match std::fs::symlink_metadata(&dir) {
-            Ok(m) if m.is_dir() => {
-                if m.permissions().mode() & 0o7777 != 0o700 {
-                    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-                }
-                Ok(dir)
-            }
-            Ok(_) => Err(format!("{} is not a directory", dir.display())),
-            Err(e) => Err(format!("{}: {e}", dir.display())),
-        }
+            debug_entries(),
+        );
+        usable_dir(&p.dir)?;
+        Ok(p)
     });
-    if let Ok(dir) = dir {
+    if let Ok(p) = plan {
         for name in PINNED_MAPS {
-            loader.map_pin_path(name, dir.join(name));
+            loader.map_pin_path(name, p.dir.join(name));
         }
     }
 }
 
-/// The tracker's pin directory this boot, once [`prepare_pins`] made it.
+/// A `debug-trigger` build's knob ([`joined_entries_now`]).
+fn debug_entries() -> Option<u32> {
+    #[cfg(feature = "debug-trigger")]
+    if let Some(n) = std::env::var("NN_DEBUG_CGROUP_JOINED_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        return Some(n.clamp(1, common::cgroup_join::PID_LIMIT));
+    }
+    None
+}
+
+/// The tracker's pin directory this boot, once [`prepare_pins`] chose it.
 pub fn pin_dir_now() -> Option<&'static Path> {
-    PIN_DIR
-        .get()
+    PLAN.get()
         .and_then(|r| r.as_ref().ok())
-        .map(PathBuf::as_path)
+        .map(|p| p.dir.as_path())
+}
+
+/// Register this start's pins in [`STATE_PATH`] (atomically, `0600`): the
+/// directory and each map's id and entries, as the kernel gives them.
+fn register_pins(dir: &Path) -> Result<(), String> {
+    let mut maps = Vec::new();
+    for name in PINNED_MAPS {
+        let seen = seen_at(&dir.join(name))?;
+        maps.push(PinnedMap {
+            name: name.to_string(),
+            id: seen.id,
+            max_entries: seen.max_entries,
+        });
+    }
+    let st = PinState {
+        boot: boot_id(),
+        dir: dir.to_path_buf(),
+        maps,
+    };
+    let path = Path::new(STATE_PATH);
+    if let Some(parent) = path.parent() {
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent);
+    }
+    crate::atomic_file::replace(path, st.render().as_bytes(), 0o600).map_err(|e| format!("{e:#}"))
+}
+
+/// The third review of #494 (R2-a): this instant as the marks' last reset
+/// — `[monotonic, boot time]` ns into `CGROUP_JOIN_EPOCH`, once the new
+/// programs run: a process started before it is not known.
+fn set_epoch(ebpf: &mut Ebpf) -> Result<(), String> {
+    let now = |clock| {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: a valid out-parameter for clock_gettime.
+        if unsafe { libc::clock_gettime(clock, &mut ts) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+    };
+    let (mono, boot) = (now(libc::CLOCK_MONOTONIC)?, now(libc::CLOCK_BOOTTIME)?);
+    let map = ebpf
+        .map_mut(EPOCH_MAP)
+        .ok_or_else(|| format!("map {EPOCH_MAP} missing from the eBPF object"))?;
+    let mut arr: Array<&mut MapData, u64> = Array::try_from(map).map_err(|e| e.to_string())?;
+    arr.set(1, boot, 0).map_err(|e| e.to_string())?;
+    arr.set(0, mono, 0).map_err(|e| e.to_string())
 }
 
 /// The tracker pin directories beside `pin_root` other than `keep`: those
@@ -226,6 +617,12 @@ fn other_pin_dirs(pin_root: &Path, keep: Option<&Path>) -> Vec<PathBuf> {
 /// detach), then the rest, then the directory. The agent is a protected
 /// pid by then; a pin it cannot remove is logged.
 fn purge_pin_dir(dir: &Path) {
+    // The third review of #494 (R2-d): a link is removed, never followed
+    // (its target's files are another's).
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink()) {
+        antitamper_bpf::purge_stale_pin(dir);
+        return;
+    }
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|r| r.flatten().map(|e| e.path()).collect())
         .unwrap_or_default();
@@ -383,7 +780,7 @@ fn unload(ebpf: &mut Ebpf, name: &str, kind: Kind) {
 /// the prior boot is still running: a load refused leaves the prior boot's
 /// pinned tracker as it was. A tracker directory of another layout (another
 /// schema, another size) goes once the new programs run: its marks with it.
-pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, Option<String>) {
+pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, Vec<String>) {
     if let Some(why) = unavailable() {
         warn!(reason = %why, effect = ABSENT_EFFECT, "cgroup exemptions: tracker not attached");
         // A prior boot's pinned tracker goes too: no program of an older
@@ -394,48 +791,75 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
                 purge_pin_dir(&d);
             }
         }
-        return (Tracker::Absent(why), None);
+        return (Tracker::Absent(why), Vec::new());
     }
-    let mut reset = None;
-    match (pin_root, PIN_DIR.get()) {
+    let mut signed = Vec::new();
+    match (pin_root, PLAN.get()) {
         (Some(_), Some(Err(why))) => {
             warn!(reason = %why, effect = ABSENT_EFFECT, "cgroup exemptions: tracker pin directory refused");
             return (
                 Tracker::Absent(format!("the tracker's pin directory: {why}")),
-                None,
+                Vec::new(),
             );
         }
-        (Some(root), Some(Ok(dir))) => {
+        (Some(root), Some(Ok(plan))) => {
+            let dir = plan.dir.as_path();
             for (i, (name, kind, target)) in PROGRAMS.iter().enumerate() {
                 if let Err(e) = load_only(ebpf, btf, name, *kind, target) {
                     for (n, k, _) in &PROGRAMS[..=i] {
                         unload(ebpf, n, *k);
                     }
                     warn!(error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker load FAILED");
-                    return (Tracker::Absent(e), None);
+                    return (Tracker::Absent(e), Vec::new());
                 }
             }
             for (name, kind, _) in &PROGRAMS {
                 if let Err(e) = pin_fresh(ebpf, dir, name, *kind) {
                     warn!(program = name, error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker attach or pin FAILED");
-                    return (Tracker::Absent(e), None);
+                    return (Tracker::Absent(e), Vec::new());
                 }
             }
+            // The third review of #494 (R2-a): a reset makes every process
+            // started before this instant not known — written once the new
+            // programs run, so that nothing starts unseen between the two.
+            // Without it the reset would give the marked their exemption
+            // back: no tracker then (fail closed).
+            if let Some(why) = &plan.reset {
+                if let Err(e) = set_epoch(ebpf) {
+                    warn!(error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: the reset's epoch NOT written");
+                    return (
+                        Tracker::Absent(format!("the reset's epoch not written: {e}")),
+                        vec![why.clone()],
+                    );
+                }
+                warn!(reason = %why, "cgroup exemptions: marks reset — every process started before now is not known until it exits");
+                signed.push(format!(
+                    "{why}; every process started before this start is not known (refused an \
+                     exemption by cgroup or unit) until it exits — restart the exempt services"
+                ));
+            }
+            if let Some(note) = &plan.note {
+                warn!(note = %note, "cgroup exemptions: the marks' capacity is below the host's");
+                signed.push(note.clone());
+            }
             purge_legacy_pins(root);
-            let old = other_pin_dirs(root, Some(dir));
-            if !old.is_empty() {
-                let names: Vec<String> = old.iter().map(|d| d.display().to_string()).collect();
-                for d in &old {
+            let others = other_pin_dirs(root, Some(dir));
+            if !others.is_empty() {
+                let names: Vec<String> = others.iter().map(|d| d.display().to_string()).collect();
+                for d in &others {
                     purge_pin_dir(d);
                 }
-                let why = format!(
-                    "marks reset: the tracker's maps of another layout ({}) replaced by {} — the \
-                     marks and the \"not known\" groups of before this start are gone",
-                    names.join(", "),
-                    dir.display()
-                );
-                warn!(reason = %why, "cgroup exemptions: marks reset by an upgrade or a new size");
-                reset = Some(why);
+                if plan.reset.is_none() {
+                    let why = format!(
+                        "an unregistered tracker directory beside the pin root removed ({})",
+                        names.join(", ")
+                    );
+                    warn!(reason = %why, "cgroup exemptions: {why}");
+                    signed.push(why);
+                }
+            }
+            if let Err(e) = register_pins(dir) {
+                warn!(error = %e, "cgroup exemptions: the tracker's pins NOT registered — the next start resets the marks");
             }
         }
         _ => {
@@ -445,7 +869,7 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
                         unload(ebpf, n, *k);
                     }
                     warn!(error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker attach FAILED");
-                    return (Tracker::Absent(e), None);
+                    return (Tracker::Absent(e), Vec::new());
                 }
             }
             warn!("cgroup exemptions: tracker attached WITHOUT pin (no bpffs): not kept while no agent runs");
@@ -459,11 +883,13 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
         let joined = Joined::try_from(take(ebpf, JOINED_MAP)?).map_err(|e| e.to_string())?;
         let lost = Lost::try_from(take(ebpf, LOST_MAP)?).map_err(|e| e.to_string())?;
         let stats = Stats::try_from(take(ebpf, STATS_MAP)?).map_err(|e| e.to_string())?;
+        let epoch = Epoch::try_from(take(ebpf, EPOCH_MAP)?).map_err(|e| e.to_string())?;
         let names = Names::try_from(take(ebpf, NAMES_MAP)?).map_err(|e| e.to_string())?;
         Ok(Marks {
             joined: Arc::new(Mutex::new(joined)),
             lost: Arc::new(Mutex::new(lost)),
             stats: Arc::new(Mutex::new(stats)),
+            epoch: Arc::new(Mutex::new(epoch)),
             names: Arc::new(Mutex::new(names)),
         })
     })();
@@ -475,14 +901,14 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
                 "cgroup exemptions: the start-in-cgroup tracker is attached (moves into a cgroup \
                  and CLONE_INTO_CGROUP starts outside systemd are marked, with what they fork)"
             );
-            (Tracker::Attached(m), reset)
+            (Tracker::Attached(m), signed)
         }
         Err(e) => {
             for (n, k, _) in &PROGRAMS {
                 unload(ebpf, n, *k);
             }
             warn!(error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker maps unavailable");
-            (Tracker::Absent(e), reset)
+            (Tracker::Absent(e), signed)
         }
     }
 }
@@ -527,10 +953,17 @@ impl Marks {
     /// `Some(true)` not marked, `Some(false)` marked, `None` not known — the
     /// group's mark could not be taken (its bit in `CGROUP_JOIN_LOST`: that
     /// tree only, the review of #494, D2), a failed read, no answer in time.
-    pub fn started(&self, tgid: u32) -> Option<bool> {
-        let (joined, lost) = (Arc::clone(&self.joined), Arc::clone(&self.lost));
+    pub fn started(&self, tgid: u32, start_boot_ns: Option<u64>) -> Option<bool> {
+        let (joined, lost, epoch) = (
+            Arc::clone(&self.joined),
+            Arc::clone(&self.lost),
+            Arc::clone(&self.epoch),
+        );
         crate::caps::errands::run(move || {
             if lost_in(&lost.lock(), tgid).ok()? {
+                return None;
+            }
+            if !after_epoch(epoch.lock().get(&1, 0).ok()?, start_boot_ns) {
                 return None;
             }
             mark_in(&joined.lock(), tgid).ok().map(|m| m.is_none())
@@ -579,6 +1012,14 @@ impl Marks {
     }
 }
 
+/// The third review of #494 (R2-a): a process that started at
+/// `start_boot_ns` (boot time) is after the marks' last reset at
+/// `epoch_boot_ns` (0: none this boot). A start unread is not after (fail
+/// closed), and so is one in the reset's clock tick.
+fn after_epoch(epoch_boot_ns: u64, start_boot_ns: Option<u64>) -> bool {
+    epoch_boot_ns == 0 || start_boot_ns.is_some_and(|s| s > epoch_boot_ns)
+}
+
 /// The mark of `tgid` in `joined`: one read, for the agent's answer and a
 /// tool's alike.
 fn mark_in(joined: &Joined, tgid: u32) -> Result<Option<Mark>, String> {
@@ -602,6 +1043,13 @@ fn lost_in(lost: &Lost, tgid: u32) -> Result<bool, String> {
 /// The tracker's pin directory beside pin root `root` (one after a start:
 /// the start removes the others) — a test's, a tool's.
 pub fn pinned_dir(root: &Path) -> Result<PathBuf, String> {
+    if let Some(st) = std::fs::read_to_string(STATE_PATH)
+        .ok()
+        .and_then(|t| PinState::parse(&t))
+        .filter(|st| st.dir.is_dir())
+    {
+        return Ok(st.dir);
+    }
     let mut dirs = other_pin_dirs(root, None);
     match dirs.len() {
         1 => Ok(dirs.remove(0)),
@@ -746,6 +1194,34 @@ pub fn sync_names(policy: &RulePolicy) {
     }
 }
 
+/// When process `pid` started, in boot-time ns: field 22 of
+/// `<proc_root>/<pid>/stat` (clock ticks since boot), after the command's
+/// closing parenthesis.
+fn start_boot_ns(proc_root: &Path, pid: u32) -> Option<u64> {
+    let s = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    start_ticks(&s).map(|t| t.saturating_mul(ns_per_tick()))
+}
+
+/// Field 22 of a `/proc/<pid>/stat` line.
+fn start_ticks(stat: &str) -> Option<u64> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn ns_per_tick() -> u64 {
+    // SAFETY: sysconf has no preconditions.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz > 0 {
+        1_000_000_000 / hz as u64
+    } else {
+        10_000_000
+    }
+}
+
 /// `Tgid:` of `<proc_root>/<pid>/status`.
 fn tgid_of(proc_root: &Path, pid: u32) -> Option<u32> {
     let s = std::fs::read_to_string(proc_root.join(pid.to_string()).join("status")).ok()?;
@@ -765,7 +1241,7 @@ pub fn started_in_cgroup(proc_root: &Path, pid: u32) -> Option<bool> {
         return None;
     };
     let tgid = tgid_of(proc_root, pid)?;
-    m.started(tgid)
+    m.started(tgid, start_boot_ns(proc_root, tgid))
 }
 
 /// The tracker's line for the journal at the start: its counters.
@@ -798,7 +1274,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let root = t.path().join("northnarrow");
         std::fs::create_dir(&root).unwrap();
-        let cur = PathBuf::from(common::cgroup_join::pin_dir(&root.to_string_lossy(), 64));
+        let cur = PathBuf::from(common::cgroup_join::pin_dir(&root.to_string_lossy(), 0));
         let old = t.path().join("northnarrow-cgroup-join-v0-32768");
         let other = t.path().join("northnarrow-cgroup-join-v1-262144");
         for d in [&cur, &old, &other, &t.path().join("northnarrow-other")] {
@@ -834,6 +1310,222 @@ mod tests {
         std::fs::write(&link, "").unwrap();
         purge_legacy_pins(&root);
         assert!(!prog.exists() && !link.exists());
+    }
+
+    fn reg(name: &str, id: u32, max: u32) -> PinnedMap {
+        PinnedMap {
+            name: name.to_string(),
+            id,
+            max_entries: max,
+        }
+    }
+
+    fn seen(id: u32, kind: aya::maps::MapType, key: u32, value: u32, max: u32, flags: u32) -> Seen {
+        Seen {
+            id,
+            kind: Some(kind),
+            key,
+            value,
+            max_entries: max,
+            flags,
+        }
+    }
+
+    /// The third review of #494, R2-b: a pinned map is adopted only as the
+    /// one registered — its id, this schema's kind, sizes and flags (an LRU
+    /// hash, preallocated, read-only to programs, or of other sizes is not).
+    #[test]
+    fn a_pinned_map_is_the_registered_one_or_it_is_not_adopted() {
+        use aya::maps::MapType;
+        let j = reg(JOINED_MAP, 40, 63_222);
+        assert_eq!(
+            verify_map(&seen(40, MapType::Hash, 4, 16, 63_222, 1), &j),
+            Ok(())
+        );
+        for (bad, why) in [
+            (seen(41, MapType::Hash, 4, 16, 63_222, 1), "id 41"),
+            (seen(40, MapType::LruHash, 4, 16, 63_222, 1), "LruHash"),
+            (seen(40, MapType::Hash, 4, 16, 63_222, 0), "flags 0x0"),
+            (
+                seen(40, MapType::Hash, 4, 16, 63_222, 1 | 1 << 7),
+                "flags 0x81",
+            ),
+            (seen(40, MapType::Hash, 8, 16, 63_222, 1), "key 8"),
+            (seen(40, MapType::Hash, 4, 24, 63_222, 1), "value 24"),
+            (seen(40, MapType::Hash, 4, 16, 64, 1), "64 entries"),
+        ] {
+            let e = verify_map(&bad, &j).unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+        }
+        let l = reg(LOST_MAP, 7, LOST_SLOTS);
+        assert_eq!(
+            verify_map(&seen(7, MapType::Array, 4, 64, LOST_SLOTS, 0), &l),
+            Ok(())
+        );
+        assert!(verify_map(&seen(7, MapType::Array, 4, 8, LOST_SLOTS, 0), &l).is_err());
+        // an array registered at another size than this schema's is not one
+        assert!(verify_map(
+            &seen(7, MapType::Array, 4, 64, 64, 0),
+            &reg(LOST_MAP, 7, 64)
+        )
+        .is_err());
+        assert!(verify_map(
+            &seen(9, MapType::Array, 4, 8, EPOCH_SLOTS, 0),
+            &reg(EPOCH_MAP, 9, EPOCH_SLOTS)
+        )
+        .is_ok());
+        assert!(verify_map(&seen(1, MapType::Array, 4, 8, 4, 0), &reg("OTHER", 1, 4)).is_err());
+    }
+
+    #[test]
+    fn the_pin_state_reads_back_what_it_wrote_and_nothing_partial() {
+        let st = PinState {
+            boot: "b0".to_string(),
+            dir: PathBuf::from("/sys/fs/bpf/northnarrow-cgroup-join-v1.3"),
+            maps: vec![reg(JOINED_MAP, 40, 63_222), reg(LOST_MAP, 41, LOST_SLOTS)],
+        };
+        assert_eq!(PinState::parse(&st.render()), Some(st.clone()));
+        for bad in [
+            "dir /x\n",
+            "boot b0\n",
+            "boot b0\ndir /x\nmap CGROUP_JOINED 40\n",
+            "boot b0\ndir /x\nmap CGROUP_JOINED x 1\n",
+            "boot b0\ndir /x\nother 1\n",
+            "boot b0 extra\ndir /x\n",
+        ] {
+            assert_eq!(PinState::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The third review of #494: the plan — adopt only the registered
+    /// directory with its registered maps, whatever the host's size (R2-a);
+    /// anything else a signed reset in the next generation (R2-b, point 3);
+    /// the first start of a boot neither.
+    #[test]
+    fn a_start_adopts_only_the_registered_pins_and_signs_every_reset() {
+        let root = Path::new("/b/northnarrow");
+        let d = |g: u32| PathBuf::from(format!("/b/northnarrow-cgroup-join-v1.{g}"));
+        let st = |dir: PathBuf| PinState {
+            boot: "B".to_string(),
+            dir,
+            maps: vec![],
+        };
+        let ok = |n: u32| move |_: &PinState| Ok::<u32, String>(n);
+        // the first start of a boot
+        let p = plan(root, "B", None, &[], &ok(1), 1000, None);
+        assert_eq!(
+            (p.dir.clone(), p.adopt, p.reset.clone(), p.note.clone()),
+            (d(0), false, None, None)
+        );
+        // adopted, whatever the host asks for now: a smaller capacity is a note
+        let s0 = st(d(0));
+        let p = plan(root, "B", Some(&s0), &[d(0)], &ok(63_222), 63_222, None);
+        assert!(p.adopt && p.reset.is_none() && p.note.is_none() && p.dir == d(0));
+        let p = plan(root, "B", Some(&s0), &[d(0)], &ok(63_222), 100_000, None);
+        assert!(p.adopt && p.reset.is_none(), "a sysctl is no reset (R2-a)");
+        assert!(p.note.unwrap().contains("capacity (63222"));
+        let p = plan(root, "B", Some(&s0), &[d(0)], &ok(63_222), 1_000, None);
+        assert!(p.adopt && p.note.is_none(), "a larger map is kept as it is");
+        // the registered maps not the ones pinned (an LRU map planted in its place)
+        let bad =
+            |_: &PinState| Err::<u32, String>("CGROUP_JOINED: a Some(LruHash) map".to_string());
+        let p = plan(root, "B", Some(&s0), &[d(0)], &bad, 1000, None);
+        assert!(!p.adopt && p.dir == d(1));
+        assert!(p
+            .reset
+            .unwrap()
+            .contains("does not hold the maps registered (CGROUP_JOINED: a Some(LruHash)"));
+        // the registered directory gone between two agents (point 3)
+        let p = plan(root, "B", Some(&st(d(2))), &[], &ok(1), 1000, None);
+        assert_eq!(p.dir, d(3));
+        assert!(p.reset.unwrap().starts_with("marks lost between agents"));
+        // a directory nobody registered — planted with the name a start would
+        // use, or of a start that could not register: never adopted
+        let p = plan(root, "B", None, &[d(0)], &ok(1), 1000, None);
+        assert!(!p.adopt && p.dir == d(1));
+        assert!(p
+            .reset
+            .unwrap()
+            .contains("no start of this boot registered"));
+        let legacy = PathBuf::from("/b/northnarrow-cgroup-join-v1-63222");
+        let p = plan(root, "B", None, &[legacy.clone()], &ok(1), 1000, None);
+        assert!(!p.adopt && p.dir == d(0) && p.reset.is_some());
+        // another boot's state is none
+        let p = plan(
+            root,
+            "B",
+            Some(&PinState {
+                boot: "A".into(),
+                ..s0.clone()
+            }),
+            &[d(0)],
+            &ok(1),
+            1000,
+            None,
+        );
+        assert!(!p.adopt && p.dir == d(1) && p.reset.is_some());
+        // another schema's: not migrated, a reset
+        let p = plan(
+            root,
+            "B",
+            Some(&st(PathBuf::from("/b/northnarrow-cgroup-join-v0.4"))),
+            &[PathBuf::from("/b/northnarrow-cgroup-join-v0.4")],
+            &ok(1),
+            1000,
+            None,
+        );
+        assert!(!p.adopt && p.dir == d(5));
+        assert!(p.reset.unwrap().contains("schema v0"));
+        // a debug build's size is a reset, never the host's
+        let p = plan(root, "B", Some(&s0), &[d(0)], &ok(63_222), 63_222, Some(64));
+        assert!(!p.adopt && p.dir == d(1) && p.reset.unwrap().contains("debug build asked for 64"));
+        let p = plan(root, "B", Some(&s0), &[d(0)], &ok(64), 63_222, Some(64));
+        assert!(p.adopt);
+        // a planted directory of a future generation beside the registered
+        // one is not adopted either: the registered one is
+        let p = plan(root, "B", Some(&s0), &[d(0), d(7)], &ok(10), 10, None);
+        assert!(p.adopt && p.dir == d(0));
+    }
+
+    /// The third review of #494, R2-a: after a reset, a process is "after"
+    /// only when its start is past the reset's; unread is not.
+    #[test]
+    fn a_process_started_before_the_reset_is_not_known() {
+        assert!(after_epoch(0, None));
+        assert!(after_epoch(0, Some(5)));
+        assert!(after_epoch(100, Some(101)));
+        assert!(!after_epoch(100, Some(100)));
+        assert!(!after_epoch(100, Some(7)));
+        assert!(!after_epoch(100, None));
+        let line =
+            "4242 (a (b) c) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 1000 10";
+        assert_eq!(start_ticks(line), Some(98765));
+        assert_eq!(start_ticks("4242 (x"), None);
+    }
+
+    /// The third review of #494, R2-d: a tracker directory that is a
+    /// symbolic link is refused, and a purge removes the link, never what it
+    /// points at.
+    #[test]
+    fn a_symbolic_link_is_never_the_tracker_s_directory() {
+        let t = tempfile::tempdir().unwrap();
+        let target = t.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("CGROUP_JOINED"), "").unwrap();
+        let link = t.path().join("northnarrow-cgroup-join-v1.0");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(usable_dir(&link).unwrap_err().contains("symbolic link"));
+        purge_pin_dir(&link);
+        assert!(!link.exists() && target.join("CGROUP_JOINED").exists());
+        let real = t.path().join("northnarrow-cgroup-join-v1.1");
+        assert_eq!(usable_dir(&real), Ok(()));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        std::fs::write(t.path().join("plain"), "").unwrap();
+        assert!(usable_dir(&t.path().join("plain")).is_err());
     }
 
     /// The policy's cgroup paths and unit names, hashed as the kernel

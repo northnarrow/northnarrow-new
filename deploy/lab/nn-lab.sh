@@ -980,6 +980,9 @@ if sudo test -d /sys/fs/bpf/northnarrow || sudo sh -c 'ls -d /sys/fs/bpf/northna
         sudo rm -rf "$d" 2>/dev/null
         sudo test -d "$d" && echo PINS_PROTECTED
     done
+    # ... and their registration (the third review of #494, R2-b): a purge
+    # is a fresh start, not "marks lost between agents".
+    sudo rm -f /run/northnarrow/cgroup-join-pins 2>/dev/null
     # tamper-check leftovers (protected while an agent ran; the window is open now)
     sudo rm -f /etc/northnarrow/zz-tamper-*.local 2>/dev/null
     sudo rm -rf /run/systemd/system.control/northnarrow-agent.service.d 2>/dev/null

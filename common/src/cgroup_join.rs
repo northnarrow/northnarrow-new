@@ -41,10 +41,14 @@
 //! The tracker's maps and links are pinned in a directory of their own,
 //! next to the agent's pin root and not in it ([`pin_dir`]): an upgrade's
 //! purge of the pin root leaves the marks and the programs (the re-review
-//! of #494, R2). Its name carries the maps' layout — [`PIN_SCHEMA`] and the
-//! marks' entries — so a start whose layout differs builds new maps in a
-//! new directory and removes the old one, a signed degradation ("marks
-//! reset"), never a silent one.
+//! of #494, R2). Its name carries the maps' schema ([`PIN_SCHEMA`]) and a
+//! generation, never their size (the third review of #494, R2-a: a size in
+//! the name made a `sysctl` before a restart a reset, and a reset gave the
+//! marked back their exemption). A start adopts only the directory the
+//! previous start of this boot registered, its maps the ids it registered
+//! in the layout of this schema (R2-b); anything else is a reset — new
+//! maps in the next generation's directory, every process started before
+//! them "not known" ([`EPOCH_SLOTS`]), signed — never a silent loss.
 
 /// The marks the object declares (the agent sizes the map at its load to
 /// the host's `kernel.pid_max` and `kernel.threads-max`, the lower:
@@ -61,36 +65,58 @@ pub const LOST_BYTES: usize = 64;
 /// The entries of `CGROUP_JOIN_LOST`: one byte per possible tgid (4 MiB).
 pub const LOST_SLOTS: u32 = PID_LIMIT / LOST_BYTES as u32;
 
-/// The layout of the tracker's pinned maps (key, value and kind of
-/// `CGROUP_JOINED`, `CGROUP_JOIN_LOST`, `CGROUP_JOIN_STATS`): raised with
-/// any change to one of them, so that a start never reuses maps of another
-/// layout.
+/// The layout of the tracker's pinned maps (key, value, kind and flags of
+/// `CGROUP_JOINED`, `CGROUP_JOIN_LOST`, `CGROUP_JOIN_STATS`,
+/// `CGROUP_JOIN_EPOCH`): raised with any change to one of them, so that a
+/// start never adopts maps of another layout. Not their size: the marks'
+/// entries are a capacity fixed when the map is made (the third review of
+/// #494, R2-a).
 pub const PIN_SCHEMA: u32 = 1;
 
 /// The name's part before the schema of the tracker's pin directory:
-/// `<pin root><PIN_DIR_INFIX><schema>-<entries>`.
+/// `<pin root><PIN_DIR_INFIX><schema>.<generation>`.
 pub const PIN_DIR_INFIX: &str = "-cgroup-join-v";
 
-/// The tracker's pin directory for pin root `root` and marks of `entries`:
-/// `/sys/fs/bpf/northnarrow-cgroup-join-v1-262144`. A sibling of the root,
-/// so a purge of the root leaves it.
+/// `CGROUP_JOIN_EPOCH`: `[CLOCK_MONOTONIC ns, CLOCK_BOOTTIME ns]` of the
+/// last reset of the marks this boot, 0 when none. A process started before
+/// it is "not known" — the agent compares its start (`/proc/<pid>/stat`,
+/// boot time), the kernel a forking parent's leader's start (monotonic)
+/// and passes "not known" on to the child — so that a reset, whatever made
+/// it, gives no marked process back its exemption (the third review of
+/// #494, R2-a). PID 1's own forks are systemd's placement and pass nothing.
+pub const EPOCH_SLOTS: u32 = 2;
+
+/// The tracker's pin directory for pin root `root`, generation `gen`:
+/// `/sys/fs/bpf/northnarrow-cgroup-join-v1.0`. A sibling of the root, so a
+/// purge of the root leaves it.
 #[cfg(feature = "std")]
-pub fn pin_dir(root: &str, entries: u32) -> String {
-    format!("{root}{PIN_DIR_INFIX}{PIN_SCHEMA}-{entries}")
+pub fn pin_dir(root: &str, gen: u32) -> String {
+    format!("{root}{PIN_DIR_INFIX}{PIN_SCHEMA}.{gen}")
 }
 
-/// `name` (a file name in the root's parent) is a tracker pin directory
-/// of pin root `root_name`, whatever its layout.
+/// `name` (a file name in the root's parent) as a tracker pin directory of
+/// pin root `root_name`: its schema and generation — the size-named form of
+/// a build before the third review (`v1-63222`) is one too, generation
+/// `None`.
+pub fn parse_pin_dir(root_name: &str, name: &str) -> Option<(u32, Option<u32>)> {
+    let rest = name.strip_prefix(root_name)?.strip_prefix(PIN_DIR_INFIX)?;
+    let num = |v: &str| {
+        (!v.is_empty() && v.len() <= 10 && v.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| v.parse::<u32>().ok())
+            .flatten()
+    };
+    if let Some((schema, gen)) = rest.split_once('.') {
+        return Some((num(schema)?, Some(num(gen)?)));
+    }
+    let (schema, size) = rest.split_once('-')?;
+    num(size)?;
+    Some((num(schema)?, None))
+}
+
+/// `name` is a tracker pin directory of pin root `root_name`, whatever its
+/// layout or generation.
 pub fn is_pin_dir_of(root_name: &str, name: &str) -> bool {
-    name.strip_prefix(root_name)
-        .and_then(|rest| rest.strip_prefix(PIN_DIR_INFIX))
-        .is_some_and(|rest| {
-            let mut it = rest.splitn(2, '-');
-            let num = |p: Option<&str>| {
-                p.is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-            };
-            num(it.next()) && num(it.next())
-        })
+    parse_pin_dir(root_name, name).is_some()
 }
 
 /// Lot 277 (the review of #494, D2): the entries the agent gives the marks
@@ -419,29 +445,37 @@ mod tests {
         }
     }
 
-    /// The re-review of #494, R2: the tracker's pins beside the pin root,
-    /// named by their layout; an older layout's directory is the root's.
+    /// The re-review of #494, R2, and the third review, R2-a: the tracker's
+    /// pins beside the pin root, named by schema and generation, never by
+    /// size; the size-named directories of before are found too.
     #[test]
-    fn the_tracker_pins_are_named_by_their_layout_beside_the_root() {
+    fn the_tracker_pins_are_named_by_schema_and_generation_beside_the_root() {
         assert_eq!(
-            pin_dir("/sys/fs/bpf/northnarrow", 262_144),
-            format!("/sys/fs/bpf/northnarrow-cgroup-join-v{PIN_SCHEMA}-262144")
+            pin_dir("/sys/fs/bpf/northnarrow", 0),
+            format!("/sys/fs/bpf/northnarrow-cgroup-join-v{PIN_SCHEMA}.0")
         );
-        assert!(!pin_dir("/sys/fs/bpf/northnarrow", 64).starts_with("/sys/fs/bpf/northnarrow/"));
-        for yes in [
-            "northnarrow-cgroup-join-v1-64",
-            "northnarrow-cgroup-join-v0-4194304",
+        assert!(!pin_dir("/sys/fs/bpf/northnarrow", 3).starts_with("/sys/fs/bpf/northnarrow/"));
+        for (name, want) in [
+            ("northnarrow-cgroup-join-v1.0", (1, Some(0))),
+            ("northnarrow-cgroup-join-v2.17", (2, Some(17))),
+            ("northnarrow-cgroup-join-v1-63222", (1, None)),
+            ("northnarrow-cgroup-join-v0-4194304", (0, None)),
         ] {
-            assert!(is_pin_dir_of("northnarrow", yes), "{yes}");
+            assert_eq!(parse_pin_dir("northnarrow", name), Some(want), "{name}");
+            assert!(is_pin_dir_of("northnarrow", name), "{name}");
         }
         for no in [
             "northnarrow",
             "northnarrow-cgroup-join-v1",
+            "northnarrow-cgroup-join-v1.",
             "northnarrow-cgroup-join-v1-",
-            "northnarrow-cgroup-join-vx-64",
+            "northnarrow-cgroup-join-v.1",
+            "northnarrow-cgroup-join-vx.0",
+            "northnarrow-cgroup-join-v1.0x",
             "northnarrow-cgroup-join-v1-64x",
-            "other-cgroup-join-v1-64",
-            "northnarrowx-cgroup-join-v1-64",
+            "northnarrow-cgroup-join-v1.99999999999",
+            "other-cgroup-join-v1.0",
+            "northnarrowx-cgroup-join-v1.0",
         ] {
             assert!(!is_pin_dir_of("northnarrow", no), "{no}");
         }

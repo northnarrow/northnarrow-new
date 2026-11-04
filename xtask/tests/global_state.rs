@@ -352,9 +352,9 @@ const STATICS: &[Kept] = &[
     ),
     kept(
         "crates/nn-linux/src/cgroup_join.rs",
-        "PIN_DIR",
+        "PLAN",
         Kernel,
-        "lot 277 (the re-review of #494, R2): the tracker's pin directory this boot, named before the one eBPF object's load and read by its attach and the pins' registration",
+        "lot 277 (the re-review of #494, R2, and its third review): what this start does with the tracker's pins (the registered directory adopted, or a reset), decided before the one eBPF object's load and read by its attach and the pins' registration",
     ),
     kept(
         "crates/nn-linux/src/anti_tamper/cgroup_guard.rs",

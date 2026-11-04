@@ -74,6 +74,21 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
         !j.contains("::pinned("),
         "no map of the tracker pinned into the pin root"
     );
+    // the third review of #494, R2-a: the last reset's instant, and a
+    // parent started before it (not PID 1, not the family; unread: before)
+    assert!(j.contains(
+        "pub static CGROUP_JOIN_EPOCH: Array<u64> = Array::with_max_entries(EPOCH_SLOTS, 0);"
+    ));
+    in_order(
+        body(&j, "before_epoch"),
+        &[
+            "CGROUP_JOIN_EPOCH.get(0)",
+            "if epoch == 0 || ptgid == 1 || family(ptgid) {\n        return false;\n    }",
+            "Some(start) => start < epoch,",
+            "None => true,",
+        ],
+    )
+    .unwrap();
     assert!(!j.contains("LruHashMap"));
     // the re-review of #494, R1: no read-modify-write of the "not known"
     // state — a byte a tgid, a plain store of 1 or 0
@@ -216,7 +231,9 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
             "let parent: u64 = ctx.arg(0);",
             "let child: u64 = ctx.arg(1);",
             "let marked = match CGROUP_JOINED.get(&ptgid) {\n        Some(rec) => leader_start(parent) == Some(rec[0]),\n        None => false,\n    };",
-            "let lost = is_lost(ptgid);",
+            // the third review of #494, R2-a: a parent started before the
+            // marks' last reset is not known, and passes that on
+            "let lost = is_lost(ptgid) || before_epoch(parent, ptgid);",
             "if !marked && !lost {\n        return;\n    }",
             "if ctgid == ptgid {\n        return;\n    }",
             "if lost {\n        lose(ctgid);\n        return;\n    }",
@@ -277,7 +294,7 @@ fn the_agent_asks_the_marks_where_it_decides() {
         &[
             "let Some(Tracker::Attached(m)) = tracker() else {\n        return None;\n    };",
             "let tgid = tgid_of(proc_root, pid)?;",
-            "m.started(tgid)",
+            "m.started(tgid, start_boot_ns(proc_root, tgid))",
         ],
     )
     .unwrap();
@@ -291,6 +308,8 @@ fn the_agent_asks_the_marks_where_it_decides() {
         &[
             "crate::caps::errands::run(move || {",
             "if lost_in(&lost.lock(), tgid).ok()? {\n                return None;\n            }",
+            // R2-a: started before the marks' last reset, not known
+            "if !after_epoch(epoch.lock().get(&1, 0).ok()?, start_boot_ns) {\n                return None;\n            }",
             "mark_in(&joined.lock(), tgid).ok().map(|m| m.is_none())",
         ],
     )
@@ -317,18 +336,26 @@ fn the_agent_asks_the_marks_where_it_decides() {
             "if let Some(why) = unavailable() {",
             "purge_legacy_pins(root);",
             "purge_pin_dir(&d);",
-            "return (Tracker::Absent(why), None);",
+            "return (Tracker::Absent(why), Vec::new());",
             // the re-review of #494, R2: the tracker's own directory, a
             // refused one is no tracker
             "(Some(_), Some(Err(why))) => {",
             "Tracker::Absent(format!(\"the tracker's pin directory: {why}\")),",
             "if let Err(e) = load_only(ebpf, btf, name, *kind, target) {\n                    for (n, k, _) in &PROGRAMS[..=i] {\n                        unload(ebpf, n, *k);\n                    }",
             "if let Err(e) = pin_fresh(ebpf, dir, name, *kind) {",
-            // the old layout's directory goes after the new programs run,
-            // and says so
-            "let old = other_pin_dirs(root, Some(dir));",
+            // the third review, R2-a: a reset's epoch once the new programs
+            // run, or no tracker; signed with what it means
+            "if let Some(why) = &plan.reset {\n                if let Err(e) = set_epoch(ebpf) {",
+            "Tracker::Absent(format!(\"the reset's epoch not written: {e}\")),",
+            "signed.push(format!(",
+            "if let Some(note) = &plan.note {",
+            // every other tracker directory goes after the new programs
+            // run; an unregistered one beside adopted pins is signed
+            "let others = other_pin_dirs(root, Some(dir));",
             "purge_pin_dir(d);",
-            "reset = Some(why);",
+            "if plan.reset.is_none() {\n                    let why = format!(",
+            // R2-b: the pins registered for the next start
+            "if let Err(e) = register_pins(dir) {",
             "if let Err(e) = load_attach(ebpf, btf, name, *kind, target) {\n                    for (n, k, _) in &PROGRAMS[..=i] {\n                        unload(ebpf, n, *k);\n                    }",
         ],
     )
@@ -338,18 +365,29 @@ fn the_agent_asks_the_marks_where_it_decides() {
     assert!(
         progs.find("\"cgroup_join_mark\"").unwrap() < progs.find("\"cgroup_join_src\"").unwrap()
     );
-    // the loader pins the three maps in the tracker's directory, made
-    // before the load, never through a link
+    // the loader pins the four maps where the plan says (its behaviour:
+    // `plan`'s unit tests), the directory made never through a link
     in_order(
         body(&cj, "prepare_pins"),
         &[
-            "common::cgroup_join::pin_dir(",
-            "antitamper_bpf::pin_root_refusal_at(&dir)",
-            "DirBuilder::new().mode(0o700).create(&dir)",
-            "for name in PINNED_MAPS {\n            loader.map_pin_path(name, dir.join(name));",
+            "std::fs::read_to_string(STATE_PATH)",
+            "let p = plan(",
+            "&verify_state,",
+            "usable_dir(&p.dir)?;",
+            "for name in PINNED_MAPS {\n            loader.map_pin_path(name, p.dir.join(name));",
         ],
     )
     .unwrap();
+    in_order(
+        body(&cj, "verify_state"),
+        &[
+            "antitamper_bpf::pin_root_refusal_at(&st.dir)",
+            "verify_map(&seen_at(&st.dir.join(name))?, reg)?;",
+            "return Err(format!(\"{n}: not a pin of the tracker\"));",
+        ],
+    )
+    .unwrap();
+    assert!(body(&cj, "seen_at").contains("let md = open_pinned_ro(path)?;"));
     let mx = code("crates/nn-linux/src/sensors/multiplexer.rs");
     in_order(
         &mx,
@@ -384,12 +422,15 @@ fn the_agent_asks_the_marks_where_it_decides() {
     in_order(
         &at,
         &[
-            "let (tracker, reset) = crate::cgroup_join::attach(ebpf, &btf, pin_root);",
-            "if let Some(why) = reset {\n        report.degraded.push(format!(\"cgroup exemptions: {why}\"));",
+            "let (tracker, signed) = crate::cgroup_join::attach(ebpf, &btf, pin_root);",
+            "for why in signed {\n        report.degraded.push(format!(\"cgroup exemptions: {why}\"));",
             "crate::cgroup_join::Tracker::Absent(why) => report.degraded.push(format!(",
             "crate::cgroup_join::install(tracker);",
             // the tracker's pins protected like the root's
             "if let Some(dir) = crate::cgroup_join::pin_dir_now() {\n        if let Err(e) = filesystem::register_bpffs_pins(ebpf, dir) {",
+            // the third review, R2-b: and the record of them
+            "let state = std::path::Path::new(crate::cgroup_join::STATE_PATH);",
+            "filesystem::register_agent_file(ebpf, state)",
             "filesystem::prune_stale_inodes(ebpf)",
         ],
     )

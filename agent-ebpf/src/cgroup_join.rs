@@ -47,7 +47,7 @@ use aya_ebpf::{
 use northnarrow_common::btf_offsets::CGROUP_MOVE_RET_ARG;
 use northnarrow_common::cgroup_join::{
     fnv_step, lost_slot, noop, pack, path_read, placement, Move, PathRead, CLONE_INTO_CGROUP,
-    EXEMPT_NAMES_ENTRIES, FNV_OFFSET, HOW_BORN_INTO, HOW_INHERITED, HOW_MOVED, JOINED_ENTRIES,
+    EPOCH_SLOTS, EXEMPT_NAMES_ENTRIES, FNV_OFFSET, HOW_BORN_INTO, HOW_INHERITED, HOW_MOVED, JOINED_ENTRIES,
     LOST_BYTES, LOST_SLOTS, NAME_CGROUP, NAME_UNIT, PATH_READ, STAT_INHERITED, STAT_INTO_EXEMPT, STAT_LOST,
     STAT_ROOTS, STAT_SLOTS,
 };
@@ -89,6 +89,15 @@ pub static CGROUP_JOIN_LOST: Array<[u8; LOST_BYTES]> = Array::with_max_entries(L
 /// Pinned with the marks.
 #[map]
 pub static CGROUP_JOIN_STATS: Array<u64> = Array::with_max_entries(STAT_SLOTS, 0);
+
+/// The third review of #494 (R2-a): `[monotonic ns, boot time ns]` of this
+/// boot's last reset of the marks (`common::cgroup_join::EPOCH_SLOTS`), 0
+/// when none — written by the agent before its programs attach. A fork of
+/// a process whose leader started before it, by anyone but PID 1 and the
+/// family, makes a child that is not known ([`before_epoch`]). Pinned with
+/// the marks.
+#[map]
+pub static CGROUP_JOIN_EPOCH: Array<u64> = Array::with_max_entries(EPOCH_SLOTS, 0);
 
 /// The names the per-rule policy's exemptions by cgroup or unit give
 /// (FNV-1a of a cgroup path, or of a unit's name) → `NAME_CGROUP` /
@@ -196,6 +205,26 @@ fn found(tgid: u32) {
     if let Some(b) = lost_byte(tgid) {
         // SAFETY: a byte of a preallocated array map.
         unsafe { core::ptr::write_volatile(b, 0) };
+    }
+}
+
+/// The third review of #494 (R2-a): thread group `ptgid` (task `parent`)
+/// started before this boot's last reset of the marks — its mark, if it had
+/// one, is gone with the reset, so it is not known, and so is what it
+/// forks. Not PID 1 (systemd's placement) nor the family. A start time
+/// unread is before (fail closed).
+#[inline(always)]
+unsafe fn before_epoch(parent: u64, ptgid: u32) -> bool {
+    let epoch = match CGROUP_JOIN_EPOCH.get(0) {
+        Some(e) => *e,
+        None => return false,
+    };
+    if epoch == 0 || ptgid == 1 || family(ptgid) {
+        return false;
+    }
+    match leader_start(parent) {
+        Some(start) => start < epoch,
+        None => true,
     }
 }
 
@@ -470,8 +499,9 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) {
         Some(rec) => leader_start(parent) == Some(rec[0]),
         None => false,
     };
-    // The review of #494, D2: a group not known passes that on too.
-    let lost = is_lost(ptgid);
+    // The review of #494, D2: a group not known passes that on too — and
+    // (the third review, R2-a) one that started before the last reset.
+    let lost = is_lost(ptgid) || before_epoch(parent, ptgid);
     if !marked && !lost {
         return;
     }

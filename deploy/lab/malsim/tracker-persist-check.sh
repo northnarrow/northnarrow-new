@@ -15,7 +15,19 @@
 #     tracker directory, no "marks reset" in the new start's journal;
 #  5) the tracker's pins refuse root: unlink of a link, a new entry in its
 #     directory (no window open);
-#  6) put back: the sleepers killed, the cgroups removed.
+#  6) the third review of #494, R2-a: kernel.threads-max raised, the agent
+#     restarted → the same directory adopted, the marks kept, a signed
+#     note that the capacity is below the host's — no reset;
+#  7) R2-b: in a trusted-installer window, the registered directory
+#     replaced by one of the same name holding an LRU map as the marks,
+#     the agent restarted → not adopted: a new directory, the planted one
+#     removed, a signed "marks reset", the earlier marked process now
+#     "pre-epoch" (not known);
+#  8) point 3: the registered directory deleted between two agents (the
+#     window again) → a signed "marks lost between agents", the earlier
+#     processes not known;
+#  9) put back: the sleepers killed, the cgroups removed, threads-max as
+#     it was.
 set -u
 PATH=$PATH:/usr/sbin:/sbin
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -89,7 +101,46 @@ else
 fi
 if sudo touch "$dir1/planted" 2>/dev/null; then bad "a new entry in the tracker's directory"; sudo rm -f "$dir1/planted"; else pass "a new entry in the tracker's directory refused"; fi
 
-echo "== 6. put back"
+restart_in_window() {   # <what to do with the agent stopped>
+    sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 300 >/dev/null 2>&1 || bad "window refused"
+    sudo systemctl stop northnarrow-watchdog northnarrow-agent; sleep 2
+    eval "$1"
+    T=$(date '+%F %T')
+    sudo systemctl start northnarrow-agent; sleep 6; sudo systemctl start northnarrow-watchdog
+}
+
+echo "== 6. kernel.threads-max raised, the agent restarted: no reset (R2-a)"
+tm0=$(cat /proc/sys/kernel/threads-max)
+sudo sysctl -q kernel.threads-max=$((tm0 * 2))
+t6=$(date '+%F %T')
+sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 300 >/dev/null 2>&1
+sudo systemctl restart northnarrow-agent; sleep 6
+sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog
+dir6=$(sudo python3 -I "$MARKS" dir); m1=$(mark_of "$p1"); echo "    $m1 (dir $dir6)"
+j=$(since_start "$t6")
+[[ $dir6 == "$dir1" ]] && pass "threads-max raised: the same tracker directory" || bad "threads-max: $dir1 → $dir6"
+grep -q "^$p1 moved" <<<"$m1" && pass "threads-max raised: the mark kept" || bad "threads-max: [$m1]"
+grep -q "marks reset" <<<"$j" && bad "threads-max: a reset [$(grep 'marks reset' <<<"$j" | head -1 | cut -c1-160)]" || pass "threads-max raised: no reset"
+grep -q "capacity is below the host's" <<<"$j" && pass "threads-max raised: the capacity note signed" || bad "threads-max: no capacity note"
+sudo sysctl -q kernel.threads-max="$tm0"
+
+echo "== 7. the registered directory replaced by a planted one, an LRU map in it (R2-b)"
+restart_in_window "sudo rm -rf '$dir6' && sudo python3 -I '$MARKS' plant '$dir6'"
+dir7=$(sudo python3 -I "$MARKS" dir); m1=$(mark_of "$p1"); echo "    $m1 (dir $dir7)"
+j=$(since_start "$T")
+[[ $dir7 != "$dir6" ]] && pass "planted: not adopted, a new directory ($dir7)" || bad "planted: adopted $dir7"
+sudo test -e "$dir6" && bad "planted: $dir6 left" || pass "planted: the planted directory removed"
+grep -q "does not hold the maps registered" <<<"$j" && pass "planted: the reset signed ($(grep -o 'CGROUP_JOINED: [^)]*' <<<"$j" | head -1 | cut -c1-80))" || bad "planted: no signed reset"
+grep -q "^$p1 pre-epoch" <<<"$m1" && pass "planted: the earlier marked process is not known" || bad "planted: [$m1]"
+
+echo "== 8. the registered directory deleted between two agents (point 3)"
+restart_in_window "sudo rm -rf '$dir7'"
+dir8=$(sudo python3 -I "$MARKS" dir); m2=$(mark_of "$p2"); echo "    $m2 (dir $dir8)"
+j=$(since_start "$T")
+grep -q "marks lost between agents" <<<"$j" && pass "deleted: \"marks lost between agents\" signed" || bad "deleted: no signed reset"
+grep -q "^$p2 pre-epoch" <<<"$m2" && pass "deleted: the earlier marked process is not known" || bad "deleted: [$m2]"
+
+echo "== 9. put back"
 sudo kill "$p1" "$p2" 2>/dev/null; wait 2>/dev/null
 for c in nn277-persist-a nn277-persist-b; do for _ in $(seq 1 20); do sudo rmdir "/sys/fs/cgroup/$c" 2>/dev/null && break; sleep 0.5; done; done
 sudo rm -f /tmp/nn277-p1.pid /tmp/nn277-p2.pid /tmp/nn277-rm.err
