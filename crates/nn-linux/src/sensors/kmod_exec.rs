@@ -31,7 +31,10 @@
 //!   without memory, its pidfd not exited) is no exit: the environment is
 //!   read from a running thread's entry (`/proc/<pid>/task/<tid>/environ`)
 //!   and judged — not read whole: refused (the re-check of #498, DC-A; the
-//!   kill reaches the process). An empty environment read
+//!   kill reaches the process); no thread seen with its memory while the
+//!   kernel counts more than one (`Threads:`; threads that each make the
+//!   next and exit slip between the listing and their stat): refused, never
+//!   an exit (DC-B). An empty environment read
 //!   from the running process is one: libxtables runs `modprobe` with none
 //!   (`posix_spawn(…, argv, NULL)`; lot 279's lab, iptables-legacy on
 //!   Ubuntu 24.04).
@@ -219,12 +222,17 @@ fn read_environ(path: &Path, env: &mut Vec<u8>) -> std::io::Result<()> {
 /// memory — a leader that left by `pthread_exit` is a zombie, its
 /// environment empty or unreadable, while its process runs on in another
 /// thread, its pidfd not exited (R011's kill reaches that process).
-/// `None` when no thread of it runs with its memory: the process's own exit
-/// (DC-1). Else the environment read from the entry of one that does
+/// `None` when no thread of it runs: the process's own exit (DC-1) — its
+/// pidfd exited, or none of its listed threads with its memory and the
+/// kernel counting one thread (`Threads:`), its leader. Else the
+/// environment read from the entry of a thread with that memory
 /// (`/proc/<pid>/task/<tid>/environ`: the process's one memory), judged as
-/// a running process's — refused when the threads cannot be listed while
-/// the process has not exited, or that environment cannot be read whole
-/// (the thread, or its process, gone by the end of the read).
+/// a running process's — refused when the threads cannot be listed or
+/// counted while the process has not exited, when none is seen with its
+/// memory while the kernel counts more than one (threads that come and go
+/// slip between the listing and their stat: the re-check of #498, DC-B),
+/// or when that environment cannot be read whole (the thread, or its
+/// process, gone by the end of the read).
 fn running_thread(proc: &Path, pid: u32, fd: &OwnedFd) -> Option<Environment> {
     let task = proc.join(format!("{pid}/task"));
     let threads = match std::fs::read_dir(&task) {
@@ -240,10 +248,27 @@ fn running_thread(proc: &Path, pid: u32, fd: &OwnedFd) -> Option<Environment> {
     let runs = |tid: &std::ffi::OsStr| {
         std::fs::read_to_string(task.join(tid).join("stat")).is_ok_and(|stat| has_memory(&stat))
     };
-    let tid = threads
+    let Some(tid) = threads
         .filter_map(Result::ok)
         .map(|thread| thread.file_name())
-        .find(|tid| runs(tid))?;
+        .find(|tid| runs(tid))
+    else {
+        // none seen running: the process's exit, or threads that each made
+        // the next and exited between the listing and their stat (DC-B)
+        if pidfd_exited(fd) {
+            return None;
+        }
+        return match thread_count(proc, pid) {
+            Some(n) if n <= 1 => None,
+            Some(n) => Some(Environment::Refused(format!(
+                "its leader had exited and its process ran on ({n} threads), none of them seen \
+                 with its memory: its environment not read"
+            ))),
+            None => Some(Environment::Refused(
+                "its leader showed no memory and its threads could not be counted".to_string(),
+            )),
+        };
+    };
     let mut env = Vec::new();
     let read = read_environ(&task.join(&tid).join("environ"), &mut env);
     // after the read: the thread still ran, its process had not exited
@@ -259,6 +284,16 @@ fn running_thread(proc: &Path, pid: u32, fd: &OwnedFd) -> Option<Environment> {
         )),
         clean => clean,
     })
+}
+
+/// The threads the kernel counts in the process `pid` — its leader among
+/// them while it is a zombie (`Threads:` of `/proc/<pid>/status`).
+fn thread_count(proc: &Path, pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(proc.join(format!("{pid}/status"))).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .and_then(|n| n.trim().parse().ok())
 }
 
 /// What an environment read (`read`'s outcome; `env`, at most
@@ -406,16 +441,23 @@ mod tests {
         format!("{head}) {}\n", fields.join(" "))
     }
 
+    /// `status` of a process the kernel counts `threads` threads in.
+    fn status_of(threads: u32) -> String {
+        format!("Name:\tsleep\nState:\tS (sleeping)\nThreads:\t{threads}\nVmPeak:\t1 kB\n")
+    }
+
     /// A copy of the `/proc` entry of `pid` (its stat as read now, the
     /// virtual size set to `vsize` when given; its one thread, its leader,
-    /// listed with that stat) under a directory of its own, with `environ`
-    /// an empty file or (`environ_dir`) a directory — which no read takes.
+    /// listed with that stat and counted in its status) under a directory
+    /// of its own, with `environ` an empty file or (`environ_dir`) a
+    /// directory — which no read takes.
     fn proc_copy(pid: u32, vsize: Option<&str>, environ_dir: bool) -> tempfile::TempDir {
         let stat = stat_running(pid, vsize);
         let fake = tempfile::tempdir().unwrap();
         let entry = fake.path().join(pid.to_string());
         std::fs::create_dir_all(entry.join(format!("task/{pid}"))).unwrap();
         std::fs::write(entry.join("stat"), &stat).unwrap();
+        std::fs::write(entry.join("status"), status_of(1)).unwrap();
         std::fs::write(entry.join(format!("task/{pid}/stat")), &stat).unwrap();
         if environ_dir {
             std::fs::create_dir_all(entry.join("environ")).unwrap();
@@ -775,13 +817,14 @@ mod tests {
         stop(child);
     }
 
-    /// The re-check of #498, DC-A, on a copy of a running process's entry
-    /// (its leader without memory, its pidfd not exited) beside its real
-    /// pidfd: a thread with the process's memory is read and judged — a
+    /// The re-check of #498, DC-A and DC-B, on a copy of a running process's
+    /// entry (its leader without memory, its pidfd not exited) beside its
+    /// real pidfd: a thread with the process's memory is read and judged — a
     /// variable refused, a clean environment clean, one that cannot be read
-    /// refused; no thread with memory is the process's exit (DC-1); threads
-    /// that cannot be listed: refused while the process runs, its exit once
-    /// its pidfd says so.
+    /// refused; no thread seen with memory is the process's exit (DC-1) when
+    /// the kernel counts one thread, refused when it counts more (DC-B) or
+    /// the count cannot be read; threads that cannot be listed: refused
+    /// while the process runs; either is its exit once its pidfd says so.
     #[test]
     fn a_leader_without_memory_is_judged_by_a_running_thread() {
         let child = sleeper(&[("PATH", "/usr/bin")]);
@@ -792,6 +835,7 @@ mod tests {
         // memory or (`vsize`) not, its environment `environ` or unreadable
         let with_thread = |vsize: Option<&str>, environ: Option<&[u8]>| {
             let fake = proc_copy(pid, Some("0"), false);
+            std::fs::write(fake.path().join(format!("{pid}/status")), status_of(2)).unwrap();
             let thread = fake.path().join(format!("{pid}/task/{tid}"));
             std::fs::create_dir_all(&thread).unwrap();
             std::fs::write(thread.join("stat"), stat_running(pid, vsize)).unwrap();
@@ -820,9 +864,21 @@ mod tests {
         let why = refused(environment(fake.path(), pid, start));
         assert!(why.contains("its environment could not be read"), "{why}");
         assert!(why.contains(&from_thread), "{why}");
-        // its thread without memory too: the process's exit
+        // its thread seen without memory while the kernel counts two: the
+        // process runs on, its environment not read (DC-B)
         let fake = with_thread(Some("0"), Some(b"LD_PRELOAD=/tmp/x.so\0"));
+        let why = refused(environment(fake.path(), pid, start));
+        assert!(
+            why.contains("ran on (2 threads), none of them seen"),
+            "{why}"
+        );
+        // the kernel counting one, its leader: the process's exit
+        std::fs::write(fake.path().join(format!("{pid}/status")), status_of(1)).unwrap();
         assert!(exited(environment(fake.path(), pid, start)).contains("its memory gone"));
+        // not counted while it runs: refused
+        std::fs::remove_file(fake.path().join(format!("{pid}/status"))).unwrap();
+        let why = refused(environment(fake.path(), pid, start));
+        assert!(why.contains("its threads could not be counted"), "{why}");
         // its threads not listed while it runs: refused
         let fake = proc_copy(pid, Some("0"), false);
         std::fs::remove_dir_all(fake.path().join(format!("{pid}/task"))).unwrap();
@@ -830,9 +886,12 @@ mod tests {
         assert!(why.contains("its threads could not be listed"), "{why}");
         stop(child);
 
-        // not listed once its pidfd says it exited (a zombie): its exit
+        // not listed, or two counted and none seen with memory, once its
+        // pidfd says it exited (a zombie): its exit
         let (mut z, start) = zombie();
         let fake = proc_copy(z.id(), Some("0"), false);
+        std::fs::write(fake.path().join(format!("{}/status", z.id())), status_of(2)).unwrap();
+        assert!(exited(environment(fake.path(), z.id(), start)).contains("its memory gone"));
         std::fs::remove_dir_all(fake.path().join(format!("{}/task", z.id()))).unwrap();
         assert!(exited(environment(fake.path(), z.id(), start)).contains("its memory gone"));
         z.wait().unwrap();
@@ -911,16 +970,37 @@ mod tests {
         }
     }
 
-    /// The helper of `a_leader_that_exited_while_its_thread_runs_has_not_exited`,
-    /// a no-op without `NN_K279_LEADER_EXITS`: run by that test in a process
-    /// of its own (this binary again, with the environment it chose), it
-    /// forks a process whose leader exits while a thread of it sleeps on,
-    /// prints that process's pid and waits for it.
+    /// The helper of [`LeaderGone`], a no-op without `NN_K279_LEADER_EXITS`:
+    /// run in a process of its own (this binary again, with the environment
+    /// the test chose), it forks a process whose leader exits while its
+    /// threads run on — `sleep`: one thread sleeps; `relay`: threads each
+    /// make the next and exit (the re-check of #498, DC-B), for 30 s at most
+    /// — prints that process's pid and waits for it.
     #[test]
-    #[ignore = "a helper of a_leader_that_exited_while_its_thread_runs_has_not_exited"]
+    #[ignore = "a helper of LeaderGone: a no-op without NN_K279_LEADER_EXITS"]
     fn a_leader_exits_while_its_thread_runs_helper() {
-        if std::env::var_os("NN_K279_LEADER_EXITS").is_none() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let Some(mode) = std::env::var_os("NN_K279_LEADER_EXITS") else {
             return;
+        };
+        static RELAY_UNTIL: AtomicI64 = AtomicI64::new(0);
+        type Start = extern "C" fn(*mut libc::c_void) -> *mut libc::c_void;
+        /// A detached thread running `start`.
+        ///
+        /// # Safety
+        /// `start` must be safe to run on a thread of its own.
+        unsafe fn detached(start: Start) -> bool {
+            // SAFETY: a zeroed attribute initialised before use, destroyed
+            // after; the caller's `start`.
+            unsafe {
+                let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+                libc::pthread_attr_init(&mut attr);
+                libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_DETACHED);
+                let mut thread: libc::pthread_t = 0;
+                let made = libc::pthread_create(&mut thread, &attr, start, std::ptr::null_mut());
+                libc::pthread_attr_destroy(&mut attr);
+                made == 0
+            }
         }
         extern "C" fn sleeps_on(_: *mut libc::c_void) -> *mut libc::c_void {
             // SAFETY: plain libc calls; `_exit` ends the process.
@@ -929,6 +1009,18 @@ mod tests {
                 libc::_exit(0)
             }
         }
+        extern "C" fn relays(_: *mut libc::c_void) -> *mut libc::c_void {
+            // SAFETY: plain libc calls; the next thread runs this function.
+            unsafe {
+                if libc::time(std::ptr::null_mut()) < RELAY_UNTIL.load(Ordering::Relaxed)
+                    && !detached(relays)
+                {
+                    libc::_exit(3);
+                }
+            }
+            std::ptr::null_mut()
+        }
+        let start: Start = if mode == "relay" { relays } else { sleeps_on };
         // SAFETY: the child (a copy of this thread alone) makes one thread
         // and ends its leader by the raw syscall — no unwinding, no atexit;
         // glibc's fork leaves its allocator and threads usable in the child.
@@ -936,14 +1028,8 @@ mod tests {
         if leader == 0 {
             // SAFETY: as above.
             unsafe {
-                let mut thread: libc::pthread_t = 0;
-                if libc::pthread_create(
-                    &mut thread,
-                    std::ptr::null(),
-                    sleeps_on,
-                    std::ptr::null_mut(),
-                ) != 0
-                {
+                RELAY_UNTIL.store(libc::time(std::ptr::null_mut()) + 30, Ordering::Relaxed);
+                if !detached(start) {
                     libc::_exit(1);
                 }
                 // the leader alone exits: its process runs on
@@ -958,20 +1044,18 @@ mod tests {
         unsafe { libc::waitpid(leader, &mut status, 0) };
     }
 
-    /// The re-check of #498, DC-A, its case `rr3` on a real process: a
-    /// leader that exited (`pthread_exit`; here its raw `exit`) while
-    /// another thread runs on — the leader a zombie without memory, its
-    /// pidfd not exited — is no exit: `MODPROBE_OPTIONS` or `LD_PRELOAD` in
-    /// its environment (read from the running thread) refused — R011's kill
-    /// reaches the process —, a clean environment clean.
-    #[test]
-    fn a_leader_that_exited_while_its_thread_runs_has_not_exited() {
-        use std::io::{BufRead, BufReader};
-        for (var, value) in [
-            ("MODPROBE_OPTIONS", "-d /tmp/x"),
-            ("LD_PRELOAD", "/nonexistent-nn-k279/x.so"),
-            ("PATH", "/usr/bin"),
-        ] {
+    /// A process whose leader exited while its threads run on (`mode`, as
+    /// [`a_leader_exits_while_its_thread_runs_helper`] takes it), its
+    /// environment `env`; killed, with its helper, when dropped.
+    struct LeaderGone {
+        helper: Child,
+        out: std::io::BufReader<std::process::ChildStdout>,
+        pid: Option<u32>,
+    }
+
+    impl LeaderGone {
+        fn spawn(env: &[(&str, &str)], mode: &str) -> Self {
+            use std::io::BufRead;
             let mut helper = Command::new(std::env::current_exe().expect("this test binary"))
                 .args([
                     "--exact",
@@ -981,13 +1065,13 @@ mod tests {
                     "--test-threads=1",
                 ])
                 .env_clear()
-                .env(var, value)
-                .env("NN_K279_LEADER_EXITS", "1")
+                .envs(env.iter().copied())
+                .env("NN_K279_LEADER_EXITS", mode)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("run the helper");
-            let mut out = BufReader::new(helper.stdout.take().unwrap());
+            let mut out = std::io::BufReader::new(helper.stdout.take().unwrap());
             let mut line = String::new();
             let pid = loop {
                 line.clear();
@@ -999,37 +1083,64 @@ mod tests {
                     break pid.trim().parse::<u32>().ok();
                 }
             };
-            // the leader a zombie, its thread running
-            let mut shape = None;
+            LeaderGone { helper, out, pid }
+        }
+
+        /// Its leader's stat once it is a zombie, the kernel counting at
+        /// least `threads` threads (its leader among them).
+        fn leader_gone(&self, threads: u64) -> Option<String> {
+            let pid = self.pid?;
             for _ in 0..2000 {
-                let Some(pid) = pid else { break };
                 let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-                let threads =
-                    std::fs::read_dir(format!("/proc/{pid}/task")).map_or(0, |t| t.count());
-                if stat
+                let zombie = stat
                     .rsplit_once(')')
-                    .is_some_and(|(_, r)| r.trim_start().starts_with('Z'))
-                    && threads == 2
-                {
-                    shape = Some(stat);
-                    break;
+                    .is_some_and(|(_, r)| r.trim_start().starts_with('Z'));
+                if zombie && thread_count(Path::new("/proc"), pid).is_some_and(|n| n >= threads) {
+                    return Some(stat);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            let read = pid.zip(shape.as_ref()).map(|(pid, _)| {
-                let start = proc_start_ns(pid).expect("its start");
-                environment(Path::new("/proc"), pid, start)
-            });
-            if let Some(pid) = pid {
+            None
+        }
+    }
+
+    impl Drop for LeaderGone {
+        fn drop(&mut self) {
+            if let Some(pid) = self.pid {
                 // SAFETY: a signal to the helper's child, the whole process
                 unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
             }
-            let _ = std::io::Read::read_to_end(&mut out, &mut Vec::new());
-            let _ = helper.kill();
-            let _ = helper.wait();
-            let stat = shape.expect("a zombie leader and a running thread");
+            let _ = std::io::Read::read_to_end(&mut self.out, &mut Vec::new());
+            let _ = self.helper.kill();
+            let _ = self.helper.wait();
+        }
+    }
+
+    /// The re-check of #498, DC-A, its case `rr3` on a real process: a
+    /// leader that exited (`pthread_exit`; here its raw `exit`) while
+    /// another thread runs on — the leader a zombie without memory, its
+    /// pidfd not exited — is no exit: `MODPROBE_OPTIONS` or `LD_PRELOAD` in
+    /// its environment (read from the running thread) refused — R011's kill
+    /// reaches the process —, a clean environment clean.
+    #[test]
+    fn a_leader_that_exited_while_its_thread_runs_has_not_exited() {
+        for (var, value) in [
+            ("MODPROBE_OPTIONS", "-d /tmp/x"),
+            ("LD_PRELOAD", "/nonexistent-nn-k279/x.so"),
+            ("PATH", "/usr/bin"),
+        ] {
+            let gone = LeaderGone::spawn(&[(var, value)], "sleep");
+            let stat = gone
+                .leader_gone(2)
+                .expect("a zombie leader and a running thread");
             assert!(!has_memory(&stat), "the leader without memory: {stat}");
-            let e = read.expect("read");
+            let pid = gone.pid.unwrap();
+            let e = environment(
+                Path::new("/proc"),
+                pid,
+                proc_start_ns(pid).expect("its start"),
+            );
+            drop(gone);
             if var == "PATH" {
                 assert_eq!(e, Environment::Clean);
             } else {
@@ -1038,5 +1149,47 @@ mod tests {
                 assert!(why.contains("its leader had exited"), "{why}");
             }
         }
+    }
+
+    /// The re-check of #498, DC-B, its case `rr4` on a real process: its
+    /// leader exited, its threads pass on a relay (each makes the next and
+    /// exits) — the process runs on throughout, though a listing of its
+    /// threads may see none of them with its memory. Read again and again
+    /// for 3 s: never an exit, never clean (`MODPROBE_OPTIONS` and
+    /// `LD_PRELOAD` in its environment).
+    #[test]
+    fn a_relay_of_threads_after_its_leader_exited_is_never_an_exit() {
+        let gone = LeaderGone::spawn(
+            &[
+                ("MODPROBE_OPTIONS", "-d /tmp/x"),
+                ("LD_PRELOAD", "/nonexistent-nn-k279/x.so"),
+            ],
+            "relay",
+        );
+        gone.leader_gone(2).expect("a zombie leader and its relay");
+        let pid = gone.pid.unwrap();
+        let start = proc_start_ns(pid).expect("its start");
+        let (mut exited, mut refused, mut clean, mut first) = (0, 0, 0, None);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < until {
+            match environment(Path::new("/proc"), pid, start) {
+                Environment::Exited(how) => {
+                    exited += 1;
+                    first.get_or_insert(how);
+                }
+                Environment::Refused(_) => refused += 1,
+                Environment::Clean => clean += 1,
+            }
+        }
+        // the relay still ran at the end: every read was of a live process
+        let running = gone.leader_gone(2).is_some();
+        drop(gone);
+        assert!(running, "the relay ended early");
+        assert_eq!(
+            (exited, clean),
+            (0, 0),
+            "{refused} refused; the first exit: {first:?}"
+        );
+        assert!(refused > 0);
     }
 }
