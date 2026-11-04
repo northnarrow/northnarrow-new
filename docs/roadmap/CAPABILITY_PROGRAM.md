@@ -5977,15 +5977,60 @@ number in parentheses is a lab PR.
     `file_open` 516 → 1,568, an unlink 270 → 1,147, a rename onto a file
     2,728 → 5,657, a chmod 115 → 351; about 5.1 MB of maps on 6.8) are in
     the design's §10.6.
-  - Mutations: 98 on the new code (67 before the review — the counters'
+  - The re-check of #500 (one blocker; the coordinator's decisions): a
+    copy made by `mknod` and sized to one byte by `truncate(2)` before it
+    is written is a small rewrite to the kernel, and NN-L-IMP-001's (d)
+    took files written from the files-written-new crossing only — the
+    copy+delete `main` saw went dark: the small-file crossing now adds to
+    the actor's files written. The destroyed-originals count leaves out
+    the directories the writes' count does (the parent's class), a
+    creation skips the seen lookup, and only a size change marks a file
+    as having held data. `/run/udev/` became a carve-out, as measured.
+    Lab (as measured): Ubuntu 22.04, one guest — `main` b000a814 with the
+    lot's scripts: MS-23 18 of 18 (the presized copies: ENGAGED and
+    NN-L-IMP-001); the head the re-check read, dd870a16: the udev case
+    (427 devices) without the coldplug line (systemd 249 has no
+    `--type=all`), no crossing; the lot's 79ca9ab3: `verifier-check` 97
+    programs, 92 OK, 5 not counted, 0 failing; MS-23 18 of 18 (the
+    presized copies: ENGAGED and NN-L-IMP-001); `open-sensor-check` 24 of
+    24 (presized copies: one small-file event; 25 files unlinked in the
+    user's own runtime directory: no burst); the boot's coldplug
+    (`udevadm trigger --action=add` of subsystems and devices) made five
+    systemd-udevd workers write and replace 20 database files each under
+    `/run/udev/data`: the replacement shape, ENGAGED on
+    `systemd-udevd.service` — so `/run/udev/` is a carve-out (49988920),
+    and the same case on it: no crossing, no transition. Ubuntu 24.04
+    (6.8.0-147), the lot's 79ca9ab3: the benign corpus, which had not run
+    on 6.8 — no COMBAT, no NEUTRALIZE kill (podman rootful and big no
+    transition, rootless ALERTED by SensitiveFileAccess; docker ENGAGED
+    by ExfiltrationPattern; k3s ENGAGED by PersistenceMechanism, the rules'
+    43 kills; apt none; sqlite none; `apt purge` ALERTED by
+    PackageTamperRefusal, an R011 kill; the arm ENGAGED on `npm ci`, `tar
+    xf` over the tree, `pip install --force-reinstall` and `pip install`
+    too — its `/tmp/pip-unpack` wheels unlinked beside the files it wrote,
+    not seen created by its own process —; the ransomware simulation from
+    a session ENGAGED with NN-L-IMP-001 twice; the udev case (467
+    devices) ENGAGED without the carve-out, and on 49988920 nothing; the
+    git case lost the network on its first run, and on 49988920 — the
+    clone, then a checkout of another tree — ALERTED by
+    SensitiveFileAccess then ENGAGED by the arm on the checkout, as on
+    22.04); `verifier-check` 97 programs, 95 OK, 2
+    not counted, 0 failing; MS-23 18 of 18; `open-sensor-check` 24 of 24.
+    The cost after it is in the design's §10.6 (a chmod 351 → 134 ns on
+    5.15, back to `main`'s 117; the creation and the unlink within the
+    rounds' spread).
+  - Mutations: 110 on the new code (67 before the review — the counters'
     shared logic, the arm, the transaction's refusal, the ladder's hold,
     NN-L-EVA-002's runtime rule and its parent lookup, the process's own
     files —, 31 after it — `write_kind`, the small-file crossing and its
     count, an original destroyed, the cgroup pairing, the session gate,
     tracepoint mode, the refused operations, IMP-001's shape (a), the
-    filter chains, the decoder), each caught by a named test (four
-    survivors of the first set and a compile error got tests or were
-    redone); the eBPF glue is covered on the guest by `open-sensor-check`.
+    filter chains, the decoder —, 12 after the re-check — IMP-001's (d)
+    reading the small-file crossing, `first_write`, `carved_class`,
+    `marks_had_data`, `ATTR_SIZE`, the `/run/udev/` entry), each caught by
+    a named test (four survivors of the first set and a compile error got
+    tests or were redone); the eBPF glue is covered on the guest by
+    `open-sensor-check`.
   - Open: corroboration is per actor scope, not per process tree (future
     work); copy-then-delete ransomware run from an SSH shell is the
     ransomware tracker's, not the mass-write arm's (as before); what

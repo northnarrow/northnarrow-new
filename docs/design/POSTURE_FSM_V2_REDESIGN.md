@@ -995,6 +995,34 @@ process of its unit deletes — reach ENGAGED on `main` and on the lot
 (`ransom-check`, MS-23): on the lot the arm raises each (the small-file
 crossing, the replacement, the replacement paired in the unit's cgroup).
 
+After the re-check of #500 (the same bench; one round per guest, each
+build installed in turn on the same guest — on 22.04 `main` b000a814, the
+head the re-check read, dd870a16, and the lot's 79ca9ab3; on 24.04 the
+latter two), ns a call:
+
+| operation (program) | 22.04 `main` | 22.04 before → after | 24.04 before → after |
+|---|---:|---:|---:|
+| a file created (`fim_file_open_sensor`) | 500 | 1,158 → 1,144 | 2,838 → 1,799 |
+| an existing file rewritten, again | 291 | 311 → 325 | 799 → 684 |
+| an unlink (`fim_unlink_observe`) | 270 | 1,052 → 1,194 | 2,283 → 1,908 |
+| a rename onto an existing file | 2,556 | 5,165 → 5,033 | 8,885 → 8,179 |
+| a chmod (`fim_setattr_observe`) | 117 | 351 → 134 | 930 → 353 |
+
+The chmod is back to `main`'s cost (a size change only marks a file). The
+creation's skipped lookup is within the rounds' spread; the unlink in a
+directory that is no carve-out pays the class lookup (about 140 ns on
+5.15), and in a carve-out stops before every map (daemons' atomic
+replacements under `/run/systemd`; not in the bench). 24.04's "before"
+ran while the 22.04 guest was busy on the same host (its operations took
+twice as long): its differences are no measure of the change. The
+verifier after the re-check: `fim_unlink_observe` 3,331 instructions
+(57,674 verified on 6.8: the directory's class, the walk on a miss),
+`fim_rename_observe` 7,241 (178,006), `fim_setattr_observe` 1,072 (1,278),
+`fim_file_open_sensor` 4,379 (104,801); every program loads on 5.15 and
+6.8. MS-23 with the presized copies (made by `mknod`, truncated to one
+byte, written, the originals deleted): ENGAGED and NN-L-IMP-001 on
+`main` and on the lot, both guests.
+
 ---
 
 **End of design doc.** This is the V2 contract — open questions are
