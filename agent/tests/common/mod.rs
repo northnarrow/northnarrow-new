@@ -540,12 +540,13 @@ pub fn try_quit_agent(child: &mut Child, timeout: Duration) -> Result<(), String
         }
         // Lot 277 (the 22.04 CI's teardown that outlived 10 s): every pid
         // this teardown has seen is evicted and signalled, the tree's from
-        // the top: a worker signalled before its agent died was started
-        // again by the agent's supervisor — a new, protected worker whose
-        // `PR_SET_PDEATHSIG` from the evicted agent the task_kill hook
-        // then refused, left running outside the tree. The agent first, so
-        // nothing is started again; a pid seen once (a worker reparented
-        // when its agent died) is evicted and signalled with the rest.
+        // the top. The 22.04 A/B named the leftover: the move guard's
+        // self-test target (`--move-guard-self-test-target`), a protected
+        // child of the agent that outlived it and left the sudo tree, so a
+        // teardown that signalled only the current tree never reached it
+        // (and its SIGQUIT, while still protected, was refused: EPERM). The
+        // agent first, so nothing is started again; a pid seen once is
+        // evicted and signalled with the rest.
         eviction = unprotect_pids(&known);
         refused = None;
         let mut sent = Vec::new();
