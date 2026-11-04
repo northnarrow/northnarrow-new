@@ -822,13 +822,33 @@ fn main_pid(unit: &str) -> u32 {
 fn systemd_s_own_placement_marks_nothing() {
     let _fx = Fixture::setup();
     let unit = "nn-test-join-svc.service";
-    let _ = Command::new("systemctl").args(["stop", unit]).status();
-    let st = Command::new("systemd-run")
-        .args(["--quiet", "--unit", unit, "-p", "Type=exec", "sleep", "300"])
-        .status()
-        .expect("systemd-run");
-    assert!(st.success());
+    // Ten starts by systemd, each a transient unit of that name started
+    // afresh (as `exempt-check` starts its unit: a restart of a transient
+    // unit failed once on the lab's 24.04, "Job … failed", with nothing
+    // about the tracker).
     for round in 0..10 {
+        let _ = Command::new("systemctl").args(["stop", unit]).status();
+        let _ = Command::new("systemctl")
+            .args(["reset-failed", unit])
+            .status();
+        let out = Command::new("systemd-run")
+            .args([
+                "--quiet",
+                "--collect",
+                "--unit",
+                unit,
+                "-p",
+                "Type=exec",
+                "sleep",
+                "300",
+            ])
+            .output()
+            .expect("systemd-run");
+        assert!(
+            out.status.success(),
+            "round {round}: systemd-run: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let pid = main_pid(unit);
         assert_ne!(pid, 0, "round {round}: no main pid");
         assert_eq!(
@@ -836,11 +856,6 @@ fn systemd_s_own_placement_marks_nothing() {
             None,
             "round {round}: systemd started {pid} in its unit"
         );
-        let st = Command::new("systemctl")
-            .args(["restart", unit])
-            .status()
-            .expect("systemctl restart");
-        assert!(st.success());
     }
     let _ = Command::new("systemctl").args(["stop", unit]).status();
     // a scope's process: systemd attaches it on the caller's request
