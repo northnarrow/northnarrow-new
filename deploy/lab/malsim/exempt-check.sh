@@ -24,7 +24,11 @@
 #     marked (the pinned map, read-only: cgroup-marks.py), no signed record;
 #  5) the review of #494, C: RESTARTS (200) starts of the exempt unit by
 #     systemd under a busy CPU → no main process marked, no root counted for
-#     them.
+#     them;
+#  5b) the re-review of #494 (lab point 1): the same starts with PID 1 and
+#     the busy loops on one CPU (`taskset -pc 0 1`), where PID 1's move of
+#     systemd 255's executor competes with the executor's own → no main
+#     process marked; PID 1's affinity put back.
 # Then the policy files are removed (in a trusted-installer window), the
 # units stopped: the guest is put back.
 set -u
@@ -36,6 +40,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SIM="$HERE/ransom-sim.py"
 MARKS="$HERE/cgroup-marks.py"
 RESTARTS=${RESTARTS:-200}
+RESTARTS_PINNED=${RESTARTS_PINNED:-$RESTARTS}
 UNIT=nn-lab-exempt.service
 CG=/sys/fs/cgroup/system.slice/$UNIT
 OTHER=nn-lab-other.service
@@ -168,6 +173,29 @@ s1=$(sudo python3 -I "$MARKS" stat)
 kill "${busy[@]}" 2>/dev/null; wait 2>/dev/null
 echo "    stats before: $s0"; echo "    stats after:  $s1"; echo "    $(systemctl --version | head -1); rounds without a main pid: $noppid"
 [[ $marked -eq 0 && $noppid -lt $RESTARTS ]] && pass "placement: $RESTARTS starts by systemd, $marked main processes marked" || bad "placement: $marked of $RESTARTS marked ($noppid without a main pid)"
+
+echo "== 6b. the same, PID 1 and the busy loops on CPU 0: $RESTARTS_PINNED starts, no mark"
+mask1=$(sudo taskset -p 1 | awk '{print $NF}')
+restore_pid1() { sudo taskset -p "$mask1" 1 >/dev/null 2>&1; }
+trap restore_pid1 EXIT
+sudo taskset -pc 0 1 >/dev/null
+busy=(); for _ in 1 2; do taskset -c 0 bash -c 'while :; do :; done' & busy+=($!); done
+s0=$(sudo python3 -I "$MARKS" stat); marked=0; noppid=0
+for i in $(seq 1 "$RESTARTS_PINNED"); do
+    sudo systemctl stop "$UNIT" 2>/dev/null
+    sudo systemd-run --quiet --collect --unit="$UNIT" -- sleep 600
+    mp=$(systemctl show -p MainPID --value "$UNIT")
+    if [[ -z $mp || $mp == 0 ]]; then noppid=$((noppid+1)); continue; fi
+    m=$(sudo python3 -I "$MARKS" mark "$mp")
+    [[ $m == "$mp -" ]] || { marked=$((marked+1)); echo "    round $i: $m"; }
+done
+s1=$(sudo python3 -I "$MARKS" stat)
+kill "${busy[@]}" 2>/dev/null; wait 2>/dev/null
+echo "    PID 1 affinity during: $(sudo taskset -p 1 | awk '{print $NF}') (was $mask1)"
+restore_pid1; trap - EXIT
+echo "    PID 1 affinity after: $(sudo taskset -p 1 | awk '{print $NF}')"
+echo "    stats before: $s0"; echo "    stats after:  $s1"; echo "    rounds without a main pid: $noppid"
+[[ $marked -eq 0 && $noppid -lt $RESTARTS_PINNED ]] && pass "placement, PID 1 on the busy CPU: $RESTARTS_PINNED starts by systemd, $marked main processes marked" || bad "placement pinned: $marked of $RESTARTS_PINNED marked ($noppid without a main pid)"
 
 echo "== put back"
 sudo systemctl stop "$UNIT" "$OTHER" 2>/dev/null

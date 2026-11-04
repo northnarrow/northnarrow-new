@@ -6,12 +6,27 @@ agent's BPF map guard refuses a write handle to any other process).
 usage (root): cgroup-marks.py mark PID...   one line per pid:
                   "<pid> moved|born|inherited <by>", "<pid> lost" or "<pid> -"
               cgroup-marks.py stat           "lost N roots N inherited N into_exempt N"
+              cgroup-marks.py dir            the tracker's pin directory
+
+The re-review of #494 (R1, R2): the maps are in the tracker's own pin
+directory beside the pin root (/sys/fs/bpf/northnarrow-cgroup-join-v<schema>-
+<entries>), and CGROUP_JOIN_LOST holds a byte per tgid (64 an entry).
 """
 import ctypes
+import glob
 import struct
 import sys
 
-ROOT = "/sys/fs/bpf/northnarrow"
+PIN_ROOT = "/sys/fs/bpf/northnarrow"
+
+
+def tracker_dir():
+    dirs = sorted(glob.glob(PIN_ROOT + "-cgroup-join-v*-*"))
+    if len(dirs) != 1:
+        raise SystemExit(f"cgroup-marks: {len(dirs)} tracker pin directories: {dirs}")
+    return dirs[0]
+
+
 SYS_BPF = 321  # x86_64
 BPF_MAP_LOOKUP_ELEM = 1
 BPF_OBJ_GET = 7
@@ -23,7 +38,7 @@ libc.syscall.restype = ctypes.c_long
 
 
 def obj_get(name):
-    path = ctypes.create_string_buffer(f"{ROOT}/{name}".encode())
+    path = ctypes.create_string_buffer(f"{tracker_dir()}/{name}".encode())
     attr = (ctypes.c_uint8 * 128)()
     struct.pack_into("<QII", attr, 0, ctypes.addressof(path), 0, BPF_F_RDONLY)
     fd = libc.syscall(SYS_BPF, BPF_OBJ_GET, ctypes.byref(attr), ctypes.c_uint(128))
@@ -42,6 +57,9 @@ def lookup(fd, key, size):
 
 
 def main():
+    if sys.argv[1:2] == ["dir"]:
+        print(tracker_dir())
+        return
     if sys.argv[1:2] == ["stat"]:
         fd = obj_get("CGROUP_JOIN_STATS")
         vals = [struct.unpack("<Q", lookup(fd, struct.pack("<I", i), 8))[0] for i in range(4)]
@@ -50,8 +68,8 @@ def main():
     joined, lost = obj_get("CGROUP_JOINED"), obj_get("CGROUP_JOIN_LOST")
     for p in sys.argv[2:]:
         pid = int(p)
-        word = lookup(lost, struct.pack("<I", pid >> 6), 8)
-        if word and struct.unpack("<Q", word)[0] & (1 << (pid & 63)):
+        entry = lookup(lost, struct.pack("<I", pid // 64), 64)
+        if entry and entry[pid % 64] != 0:
             print(pid, "lost")
             continue
         rec = lookup(joined, struct.pack("<I", pid), 16)

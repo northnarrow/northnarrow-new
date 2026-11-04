@@ -20,7 +20,13 @@
 //!   process, ten restarts in a row, and a scope's process;
 //! - a mark made on a dead group (a zombie's pid written into a cgroup:
 //!   its exit came first) is not the pid's next owner's: the fork of a new
-//!   process at that pid clears it (the review of #494, N5).
+//!   process at that pid clears it (the review of #494, N5);
+//! - the re-review of #494 (its point 3): with the marks' map at 64 entries
+//!   (`NN_DEBUG_CGROUP_JOINED_ENTRIES`, a `debug-trigger` build's knob) a
+//!   marked process's forks past the map are "not known" (never neither
+//!   marked nor not known), a fork of one of those is too, a unit systemd
+//!   starts meanwhile is neither, and the pid of a "not known" process,
+//!   once it is gone, is a new process's with nothing.
 //!
 //! Run (lab guest, units stopped, pins purged — `nn-lab.sh test-ignored`
 //! does both):
@@ -36,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use nn_linux::cgroup_join::{pinned_mark, Mark};
+use nn_linux::cgroup_join::{pinned_lost, pinned_mark, Mark};
 
 mod common;
 use common::agent_state::{AgentState, InstalledAgent, Launch};
@@ -81,6 +87,12 @@ impl Fixture {
     /// An agent whose own files live in a tempdir (as the move guard's
     /// test starts it), once its tracker is attached.
     fn setup() -> Self {
+        Self::setup_with(&[])
+    }
+
+    /// [`Fixture::setup`] with `env` for the agent too (a `debug-trigger`
+    /// build's knobs).
+    fn setup_with(env: &[(&str, &str)]) -> Self {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let dir = tempdir.path().to_path_buf();
         let state = AgentState::new(&dir);
@@ -118,8 +130,9 @@ impl Fixture {
         let agent_log = dir.join("agent.log");
         let log = std::fs::File::create(&agent_log).expect("create agent.log");
         let log_err = log.try_clone().expect("clone log handle");
-        let mut cmd =
-            installed_agent.command(&state, Launch::Sudo, &[common::OWN_DEFAULT_LISTS_ENV]);
+        let mut all_env = vec![common::OWN_DEFAULT_LISTS_ENV];
+        all_env.extend_from_slice(env);
+        let mut cmd = installed_agent.command(&state, Launch::Sudo, &all_env);
         cmd.arg("--combat-rules").arg(&combat);
         for (flag, file) in [
             ("--fim-paths-v1", "fim-paths.v1"),
@@ -211,6 +224,10 @@ fn root() -> &'static Path {
 
 fn mark(pid: u32) -> Option<Mark> {
     pinned_mark(root(), pid).unwrap_or_else(|e| panic!("reading the mark of {pid}: {e}"))
+}
+
+fn lost(pid: u32) -> bool {
+    pinned_lost(root(), pid).unwrap_or_else(|e| panic!("reading the lost byte of {pid}: {e}"))
 }
 
 /// `pid`'s mark once it is there (the writes are synchronous; the read is
@@ -543,6 +560,165 @@ fn a_dead_group_s_mark_is_not_the_next_owner_s() {
         next,
         Some(None),
         "a new process at {z} inherited a dead group's mark"
+    );
+}
+
+/// Moves itself into argv[1], forks 80 children that sleep, then a child X
+/// that forks a grandchild Y; prints its pid, the 80, X and Y. On a line
+/// from stdin kills X and Y, reaps X, prints "done", waits for the 80.
+const FILL_AND_LOSE: &str = r#"
+import os, signal, sys, time
+with open(sys.argv[1] + "/cgroup.procs", "w") as f:
+    f.write(str(os.getpid()))
+kids = []
+for _ in range(80):
+    k = os.fork()
+    if k == 0:
+        time.sleep(30)
+        os._exit(0)
+    kids.append(k)
+r, w = os.pipe()
+x = os.fork()
+if x == 0:
+    os.close(r)
+    y = os.fork()
+    if y == 0:
+        time.sleep(30)
+        os._exit(0)
+    os.write(w, b"%d\n" % y)
+    os.close(w)
+    time.sleep(30)
+    os._exit(0)
+os.close(w)
+y = int(os.read(r, 32).split()[0])
+print(os.getpid(), *kids, x, y, flush=True)
+sys.stdin.readline()
+os.kill(y, signal.SIGKILL)
+os.kill(x, signal.SIGKILL)
+os.waitpid(x, 0)
+print("done", flush=True)
+for k in kids:
+    os.kill(k, signal.SIGKILL)
+    os.waitpid(k, 0)
+"#;
+
+/// Forks at pid argv[1] (`ns_last_pid`, a few tries), prints the child's
+/// pid (0 when the pid was not had), waits for it.
+const REUSE_PID: &str = r#"
+import os, sys, time
+want = int(sys.argv[1])
+got = 0
+for _ in range(50):
+    with open("/proc/sys/kernel/ns_last_pid", "w") as f:
+        f.write(str(want - 1))
+    n = os.fork()
+    if n == 0:
+        time.sleep(2)
+        os._exit(0)
+    if n == want:
+        got = n
+        break
+    os.kill(n, 9)
+    os.waitpid(n, 0)
+print(got, flush=True)
+if got:
+    os.waitpid(got, 0)
+"#;
+
+#[test]
+#[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
+fn a_full_map_makes_that_tree_not_known_and_no_one_else() {
+    use std::os::unix::process::CommandExt;
+    let _fx = Fixture::setup_with(&[("NN_DEBUG_CGROUP_JOINED_ENTRIES", "64")]);
+    let dir = nn_linux::cgroup_join::pinned_dir(root()).expect("the tracker's pin directory");
+    assert!(
+        dir.to_string_lossy().ends_with("-64"),
+        "the knob sized the marks: {}",
+        dir.display()
+    );
+    let cg = TempCgroup::new("nn-test-join-full");
+    let mut p = Command::new("python3")
+        .arg("-I")
+        .arg("-c")
+        .arg(FILL_AND_LOSE)
+        .arg(cg.path())
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn python3");
+    let pids = read_pids(&mut p);
+    assert_eq!(pids.len(), 83);
+    let (me, kids, x, y) = (pids[0], &pids[1..81], pids[81], pids[82]);
+    // a unit systemd starts while the map is full: neither
+    let unit = "nn-test-join-full.service";
+    let _ = Command::new("systemctl").args(["stop", unit]).status();
+    let st = Command::new("systemd-run")
+        .args(["--quiet", "--unit", unit, "-p", "Type=exec", "sleep", "60"])
+        .status()
+        .expect("systemd-run");
+    assert!(st.success());
+    let svc = main_pid(unit);
+    let svc_state = (mark(svc), lost(svc));
+    let _ = Command::new("systemctl").args(["stop", unit]).status();
+    let me_state = (mark(me), lost(me));
+    let kid_states: Vec<(u32, Option<Mark>, bool)> =
+        kids.iter().map(|k| (*k, mark(*k), lost(*k))).collect();
+    let (x_state, y_state) = ((mark(x), lost(x)), (mark(y), lost(y)));
+    p.stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(b"go\n")
+        .expect("go");
+    {
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(p.stdout.as_mut().expect("piped stdout"))
+            .read_line(&mut line)
+            .expect("done");
+        assert_eq!(line.trim(), "done");
+    }
+    // X is gone: its pid, a new process's, is not "not known"
+    let mut r = spawn_py(REUSE_PID, &[&x.to_string()]);
+    let again = read_pids(&mut r)[0];
+    let again_state = (again != 0).then(|| (mark(again), lost(again)));
+    let _ = r.wait();
+    let _ = p.wait();
+
+    assert!(
+        me_state.0.is_some() || me_state.1,
+        "the mover: marked or not known"
+    );
+    let neither: Vec<u32> = kid_states
+        .iter()
+        .filter(|(_, m, l)| m.is_none() && !l)
+        .map(|(k, _, _)| *k)
+        .collect();
+    assert!(
+        neither.is_empty(),
+        "forks of a marked process neither marked nor not known (exempt): {neither:?}"
+    );
+    let marked = kid_states.iter().filter(|(_, m, _)| m.is_some()).count();
+    let lost_n = kid_states.iter().filter(|(_, _, l)| *l).count();
+    assert!(marked <= 64, "{marked} marks in a map of 64");
+    assert!(lost_n >= 16, "past the map, not known: {lost_n} of 80");
+    assert_eq!(x_state, (None, true), "X, forked past the map: not known");
+    assert_eq!(
+        y_state,
+        (None, true),
+        "Y, a fork of a not-known process: not known"
+    );
+    assert_eq!(
+        svc_state,
+        (None, false),
+        "a unit systemd started keeps its standing"
+    );
+    assert_eq!(again, x, "the pid's next process (ns_last_pid, 50 tries)");
+    assert_eq!(
+        again_state,
+        Some((None, false)),
+        "a new process at {x} inherited the not-known state of a dead group"
     );
 }
 

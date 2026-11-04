@@ -61,6 +61,8 @@
 #   deploy/lab/nn-lab.sh malsim-exec-check # lab PR 226 (EXPERIMENTAL): exec policy and exec environment, MS-01/02/03/32 before and after, negatives, guest put back
 #   deploy/lab/nn-lab.sh policy-check    # lab PR 236: the signed per-rule policy — MS-23 held built in, killed under `enforce NN-L-IMP-001` (set live, then at boot), a bad policy refused, back to built in
 #   deploy/lab/nn-lab.sh test-one <target> # lot 277: one privileged test target of the agent on a purged pin root
+#   deploy/lab/nn-lab.sh tracker-persist-check  # lot 277: the tracker's marks outlive an agent stop and install.sh --upgrade; its pins refuse root
+#   deploy/lab/nn-lab.sh fork-cost       # lot 277: the tracker's cost a fork + exit (BPF stats per call; wall clock attached / detached)
 #   deploy/lab/nn-lab.sh exempt-check    # lot 277: an exemption by unit holds for MS-23 started by systemd in the unit, not for a root shell moved into its cgroup (nor its orphan): killed, the move signed
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh net-check         # lab PR 224: connect-time network verdicts, reverse shells, outbound fan-out (CM-02/03/14)
@@ -1592,6 +1594,24 @@ cmd_exempt_check() {
     vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/exempt-check.sh'
 }
 
+cmd_tracker_persist_check() {
+    # Lot 277 (the re-review of #494, R2/D6; deploy/lab/malsim/
+    # tracker-persist-check.sh): the tracker's marks outlive a stop of the
+    # agent and an install.sh --upgrade (the same build), and its pins
+    # refuse root. Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh 'cd ~/northnarrow && bash deploy/lab/malsim/tracker-persist-check.sh'
+}
+
+cmd_fork_cost() {
+    # Lot 277 (the re-review of #494, lab point 4; deploy/lab/malsim/
+    # fork-cost.sh): the tracker's cost a fork and an exit — per call from
+    # the BPF statistics, and wall clock with its links attached and
+    # detached. Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh "cd ~/northnarrow && N=${N:-20000} ROUNDS=${ROUNDS:-5} bash deploy/lab/malsim/fork-cost.sh"
+}
+
 cmd_dns_sensor_check() {
     # Tappa 10.9 step 3 (deploy/lab/dns-sensor/dns-sensor-check.sh): the DNS
     # sensor reads the kernel's copy of the query. NET-004 kills a sender
@@ -2304,6 +2324,8 @@ case "${1:-help}" in
     malsim-exec-check) cmd_malsim_exec_check ;;
     policy-check)  cmd_policy_check ;;
     exempt-check)  cmd_exempt_check ;;
+    tracker-persist-check) cmd_tracker_persist_check ;;
+    fork-cost)     cmd_fork_cost ;;
     test-one)      shift; cmd_test_one "$@" ;;
     dns-sensor-check) cmd_dns_sensor_check ;;
     ransom-check)  shift; cmd_ransom_check "$@" ;;
