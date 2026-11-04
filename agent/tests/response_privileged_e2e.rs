@@ -98,7 +98,6 @@ impl Drop for AgentGuard {
 /// An enforcing agent with every state file in a per-test tempdir, empty
 /// allow/blocklists, no FIM watch.
 struct Fixture {
-    _tempdir: tempfile::TempDir,
     agent_log: PathBuf,
     detections_log: PathBuf,
     _agent_guard: AgentGuard,
@@ -108,6 +107,9 @@ struct Fixture {
     /// Lab PR 269: its admin socket (the debug triggers sit next to it).
     #[cfg_attr(not(feature = "debug-trigger"), allow(dead_code))]
     admin_socket: PathBuf,
+    /// Lot 278: dropped last, once the agent quit — a policy it stored
+    /// there is a protected inode while it runs.
+    _tempdir: tempfile::TempDir,
 }
 
 impl Fixture {
@@ -181,6 +183,7 @@ impl Fixture {
             p
         };
 
+        let rule_policy = dir.join("rule-policy.local");
         let agent_log = dir.join("agent.log");
         let detections_log = state.detections();
         let log = std::fs::File::create(&agent_log).expect("create agent.log");
@@ -194,7 +197,14 @@ impl Fixture {
             .arg("--fim-paths-local")
             .arg(empty("fim-paths.local"))
             .arg("--canary-template-dir")
-            .arg(&templates);
+            .arg(&templates)
+            // Lot 278: the per-rule policy in the test's directory (absent
+            // unless `policy` is set): the host's
+            // /etc/northnarrow/rule-policy.local is neither loaded (the
+            // unsigned overlays are allowed here) nor written by the
+            // `policy set` below.
+            .arg("--rule-policy-local")
+            .arg(&rule_policy);
         for (flag, file) in [
             ("--netflow-blocklist-v1", "netflow-blocklist.v1"),
             ("--netflow-blocklist-local", "netflow-blocklist.local"),
@@ -258,6 +268,11 @@ impl Fixture {
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr),
                 tail(&agent_log)
+            );
+            assert_eq!(
+                std::fs::read_to_string(&rule_policy).ok().as_deref(),
+                Some(policy),
+                "the policy is stored in the test's directory, not the host's"
             );
         }
 
