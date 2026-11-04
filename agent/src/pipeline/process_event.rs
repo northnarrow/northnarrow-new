@@ -309,6 +309,22 @@ pub(crate) fn process_event(
             last = %Escaped(filename),
             "mass write: overwrite threshold crossed by the processes of one cgroup (counted in the kernel)"
         ),
+        // Lot 282: the kernel counts distinct existing files rewritten and
+        // files created apart (it counted write-opens).
+        Event::MassWrite {
+            pid,
+            comm,
+            count,
+            filename,
+            overwrites: true,
+            ..
+        } => info!(
+            pid = *pid,
+            comm = %Escaped(comm),
+            rewritten = *count,
+            last = %Escaped(filename),
+            "mass write: distinct existing files rewritten crossed the threshold (counted in the kernel)"
+        ),
         Event::MassWrite {
             pid,
             comm,
@@ -318,9 +334,9 @@ pub(crate) fn process_event(
         } => info!(
             pid = *pid,
             comm = %Escaped(comm),
-            count = *count,
+            created = *count,
             last = %Escaped(filename),
-            "mass write: write-open threshold crossed (counted in the kernel)"
+            "mass write: files created crossed the threshold (counted in the kernel)"
         ),
         // Lab PR 225: the rename and unlink bursts (NN-L-IMP-001/002 read them).
         Event::FileBurst {
@@ -336,7 +352,7 @@ pub(crate) fn process_event(
             kind = kind.as_str(),
             count = *count,
             last = %Escaped(filename),
-            "file burst: rename or unlink threshold crossed (counted in the kernel)"
+            "file burst: rename or destroyed-originals threshold crossed (counted in the kernel)"
         ),
         // Lab PR 225: NN-L-EVA-003 reports it.
         Event::DefenderSignal {

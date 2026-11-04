@@ -659,6 +659,44 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- The posture no longer reaches COMBAT, and the ladder no longer kills, on
+  benign workloads (lot 282, Tappa Prove P0; `docs/design/
+  POSTURE_FSM_V2_REDESIGN.md` §10). Measured on `main` (Ubuntu 22.04): a
+  host's first `sudo podman run` reached locked COMBAT and NEUTRALIZE killed
+  podman — its CNI plugin's `iptables -F <chain>` was NN-L-EVA-002
+  (`DefenseImpairment`, the administrator's scope), podman's 261 opens of
+  `bolt_state.db` in a minute were the mass-write arm's overwrite crossing;
+  `apt purge podman` reached it from an anti-tamper refusal of
+  `deb-systemd-helper`, which the ladder killed. Now:
+  - the kernel counts what ransomware does to existing files: a file
+    rewritten once per 60-s window however often it is opened
+    (`OPEN_OVERWRITE_SEEN`), files created apart (`MASS_WRITE` is now the
+    files created), and the originals destroyed — an unlink, or a rename
+    onto an existing file of 4 KiB or more — once per name
+    (`OPEN_DESTROY_SEEN`). The mass-write arm of `ConfirmedIntrusion`
+    fires on 20 distinct existing files rewritten in place (40 for a
+    cgroup), or on 20 originals destroyed by a process that created 20
+    files within a window (outside an authenticated session); never on
+    files created alone, one file rewritten again and again, or deletions
+    alone. Tracepoint mode counts distinct files and never an
+    `O_CREAT|O_EXCL` open. Every shape is file-system evidence: none
+    corroborates another. The exempt writers are kept, and an exempt
+    crossing is logged with its exemption;
+  - an anti-tamper refusal of a package transaction's process (judged as
+    R009 judges it) raises `PackageTamperRefusal` (ALERTED, never
+    corroboration) instead of the decisive `AntiTamperDenial`;
+  - the ladder holds its NEUTRALIZE (signed, no kill, no ISOLATE) when
+    COMBAT's cause is a heuristic that no signal of another kind vouches
+    for (`CombatCause::single_heuristic_arm`);
+  - NN-L-EVA-002 no longer records `iptables -F` of one user-defined chain
+    as the firewall switched off.
+  Tests: `common` (the counters' glue: 259 opens of one database, distinct
+  rewrites, files created, a name deleted at every commit), the posture's
+  triggers (the shapes, either order, sessions, exemptions, the
+  transaction's refusal), the ladder (`a_single_heuristic_arm_is_never_killed`),
+  NN-L-EVA-002's chains, and two golden posture cases
+  (`mass-write-arm-alone-engaged`, `package-refusal-alerted`); the lab check
+  `open-sensor-check` gains the kernel's cases.
 - R009 no longer kills root automation run from a source tree outside
   COMBAT; an installer's trusted-installer window covers its own process
   tree (lot 278, the false positive of the review of #492, section f).

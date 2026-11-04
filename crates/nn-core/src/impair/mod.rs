@@ -881,7 +881,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
             } else {
                 prog.iter().any(|p| *p == c.program)
             };
-            named && contains_run(&args, &c.args)
+            named && switches_off(&args, &c.args)
         }) {
             let shown = if c.args.is_empty() {
                 format!("`{}`", c.program)
@@ -1042,13 +1042,32 @@ fn program_name<'a>(id: &'a ExecIdentity, argv: &'a [String]) -> Vec<&'a str> {
     out
 }
 
-/// `args` holds `run` as consecutive arguments (an empty run: always).
-fn contains_run(args: &[&str], run: &[String]) -> bool {
+/// `args` holds the switch-off command `run` as consecutive arguments (an
+/// empty run: always). Lot 282 (Tappa Prove P0): except that a listed
+/// flush (`iptables -F`, `--flush`) followed by the name of a user-defined
+/// chain flushes that one chain, which switches nothing off. Podman's
+/// network setup (its CNI
+/// firewall plugin) flushes the chains it owns (`iptables -t nat -F
+/// CNI-HOSTPORT-…`) at the first run of a host: NN-L-EVA-002 recorded
+/// "`iptables -F`", and the posture's DefenseImpairment, recorded in the
+/// administrator's scope, corroborated podman's own mass write — COMBAT,
+/// locked, and the ladder killed podman (lab 04/11). `iptables -F` alone,
+/// or followed by another option, still flushes every chain of its table,
+/// and a flush of a built-in chain (`-F INPUT`) empties the filtering it
+/// holds: both still switch the firewall off.
+fn switches_off(args: &[&str], run: &[String]) -> bool {
+    const BUILT_IN_CHAINS: &[&str] = &["INPUT", "OUTPUT", "FORWARD", "PREROUTING", "POSTROUTING"];
     if run.is_empty() {
         return true;
     }
-    args.windows(run.len())
-        .any(|w| w.iter().zip(run).all(|(a, b)| *a == b.as_str()))
+    let flush = run.last().is_some_and(|a| a == "-F" || a == "--flush");
+    args.windows(run.len()).enumerate().any(|(i, w)| {
+        w.iter().zip(run).all(|(a, b)| *a == b.as_str())
+            && !(flush
+                && args.get(i + run.len()).is_some_and(|chain| {
+                    !chain.starts_with('-') && !BUILT_IN_CHAINS.contains(chain)
+                }))
+    })
 }
 
 /// `kill -0 …` (an existence probe), `kill -l` (a listing).

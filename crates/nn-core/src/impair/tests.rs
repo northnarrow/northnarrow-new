@@ -247,6 +247,44 @@ fn switch_off_commands_need_their_arguments() {
         .run(345, 200, "/usr/sbin/xtables-nft-multi", &["iptables", "-F"])
         .unwrap();
     assert_eq!(f.tool, "iptables");
+    // Lot 282 (lab 04/11): a flush of ONE chain — podman's CNI firewall
+    // plugin setting up its own chains at a host's first run — switches
+    // nothing off; a flush of every chain of a table still does.
+    for one_chain in [
+        &["iptables", "--wait", "-t", "nat", "-F", "CNI-HOSTPORT-DNAT"][..],
+        &["iptables", "-F", "CNI-FORWARD"][..],
+        &["ip6tables", "-t", "filter", "--flush", "CNI-ADMIN"][..],
+        &["iptables", "-w", "-F", "DOCKER-USER", "-t", "filter"][..],
+    ] {
+        assert!(
+            h.run(348, 200, "/usr/sbin/xtables-nft-multi", one_chain)
+                .is_none(),
+            "{one_chain:?}"
+        );
+    }
+    for every_chain in [
+        &["iptables", "-t", "nat", "-F"][..],
+        &["iptables", "-F", "-t", "filter"][..],
+        &["ip6tables", "--flush"][..],
+        &["iptables", "-w", "-F", "-X"][..],
+        &["iptables", "-F", "INPUT"][..],
+        &["ip6tables", "-t", "nat", "--flush", "POSTROUTING"][..],
+    ] {
+        assert!(
+            h.run(349, 200, "/usr/sbin/xtables-nft-multi", every_chain)
+                .is_some(),
+            "{every_chain:?}"
+        );
+    }
+    // the other listed commands are unchanged: a policy run in full
+    assert!(h
+        .run(
+            353,
+            200,
+            "/usr/sbin/xtables-nft-multi",
+            &["iptables", "-P", "INPUT", "ACCEPT"]
+        )
+        .is_some());
     assert!(h
         .run(346, 200, "/usr/sbin/setenforce", &["setenforce", "0"])
         .is_some());

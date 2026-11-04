@@ -1,0 +1,25 @@
+{
+  "about": "Lot 282 (Tappa Prove P0; lab 04/11 on main: COMBAT locked by `apt purge podman`, the maintainer script killed): an administrator's `sudo apt-get purge` runs dpkg, whose postrm runs deb-systemd-helper (perl); its rmdir of a directory the agent protects is refused — signed by NN-L-AT-001 and already blocked. A refusal of a package transaction's process (a package manager proper executed by root whose run covers it, as R009 judges it): PackageTamperRefusal, ALERTED, never recorded as corroboration — no COMBAT, no ladder. Two minutes later an unpackaged tool of the same session rewrites twenty existing files: the mass-write arm, file-system evidence that nothing of another kind vouches for (the refusal does not): ENGAGED. The same refusal from a root process outside any transaction (a `sudo rmdir` of the session) keeps today's weight: AntiTamperDenial, decisive, COMBAT locked; the ladder investigates and, at the deadline, finds the rmdir gone.",
+  "path": ["ALERTED", "ENGAGED", "COMBAT"],
+  "stages": ["INVESTIGATE", "NEUTRALIZE"],
+  "signed": ["combat_stage", "combat_outcome"],
+  "start_ns": 100000000000,
+  "procs": [
+    {"pid": 7200002, "ppid": 1, "start_ns": 50000000000, "uid": 0, "comm": "sshd", "exe": "/usr/sbin/sshd", "argv": ["sshd: u1000 [priv]"], "loginuid": 1000, "cgroup": "/user.slice/user-1000.slice/session-9.scope"},
+    {"pid": 7200003, "ppid": 7200002, "start_ns": 51000000000, "uid": 1000, "comm": "bash", "exe": "/usr/bin/bash", "argv": ["-bash"], "tty": true}
+  ],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 7200010, "ppid": 7200003, "uid": 1000, "gid": 1000, "comm": "sudo", "filename": "/usr/bin/sudo", "timestamp_ns": 110000000000, "argv": ["sudo", "apt-get", "purge", "-y", "podman"], "parent_comm": "bash", "parent_start_ns": 51000000000, "start_ns": 109999000000, "exe": {"path": "/usr/bin/sudo"}}}},
+    {"event": {"ProcessSpawn": {"pid": 7200011, "ppid": 7200010, "uid": 0, "gid": 0, "comm": "apt-get", "filename": "/usr/bin/apt-get", "timestamp_ns": 110100000000, "argv": ["apt-get", "purge", "-y", "podman"], "parent_comm": "sudo", "parent_start_ns": 109999000000, "start_ns": 110099000000, "exe": {"path": "/usr/bin/apt-get"}}}},
+    {"event": {"ProcessSpawn": {"pid": 7200012, "ppid": 7200011, "uid": 0, "gid": 0, "comm": "dpkg", "filename": "/usr/bin/dpkg", "timestamp_ns": 112000000000, "argv": ["/usr/bin/dpkg", "--status-fd", "33", "--no-triggers", "--force-depends", "--purge", "podman"], "parent_comm": "apt-get", "parent_start_ns": 110099000000, "start_ns": 111999000000, "exe": {"path": "/usr/bin/dpkg"}}}},
+    {"event": {"ProcessSpawn": {"pid": 7200013, "ppid": 7200012, "uid": 0, "gid": 0, "comm": "podman.postrm", "filename": "/var/lib/dpkg/info/podman.postrm", "timestamp_ns": 113000000000, "argv": ["/bin/sh", "/var/lib/dpkg/info/podman.postrm", "purge"], "parent_comm": "dpkg", "parent_start_ns": 111999000000, "start_ns": 112999000000, "exe": {"path": "/usr/bin/dash"}}}},
+    {"event": {"ProcessSpawn": {"pid": 7200014, "ppid": 7200013, "uid": 0, "gid": 0, "comm": "deb-systemd-hel", "filename": "/usr/bin/deb-systemd-helper", "timestamp_ns": 113500000000, "argv": ["/usr/bin/perl", "/usr/bin/deb-systemd-helper", "purge", "podman.service"], "parent_comm": "podman.postrm", "parent_start_ns": 112999000000, "start_ns": 113499000000, "exe": {"path": "/usr/bin/perl"}}}},
+    {"event": {"FsProtectDenial": {"pid": 7200014, "uid": 0, "comm": "deb-systemd-hel", "target_dev": 64770, "target_ino": 131090, "operation": "Rmdir", "timestamp_ns": 113600000000}}},
+    {"event": {"ProcessSpawn": {"pid": 7200020, "ppid": 7200003, "uid": 1000, "gid": 1000, "comm": "tool", "filename": "/home/u/bin/tool", "timestamp_ns": 240000000000, "argv": ["tool", "/home/u/docs"], "parent_comm": "bash", "parent_start_ns": 51000000000, "start_ns": 239999000000, "exe": {"path": "/home/u/bin/tool"}}}},
+    {"event": {"MassWrite": {"pid": 7200020, "uid": 1000, "comm": "tool", "count": 20, "filename": "/home/u/docs/f19.odt", "timestamp_ns": 242000000000, "overwrites": true, "cgroup_window": false}}},
+    {"event": {"ProcessSpawn": {"pid": 7200030, "ppid": 7200003, "uid": 1000, "gid": 1000, "comm": "sudo", "filename": "/usr/bin/sudo", "timestamp_ns": 300000000000, "argv": ["sudo", "rmdir", "/etc/systemd/system/multi-user.target.wants"], "parent_comm": "bash", "parent_start_ns": 51000000000, "start_ns": 299999000000, "exe": {"path": "/usr/bin/sudo"}}}},
+    {"event": {"ProcessSpawn": {"pid": 7200031, "ppid": 7200030, "uid": 0, "gid": 0, "comm": "rmdir", "filename": "/usr/bin/rmdir", "timestamp_ns": 300100000000, "argv": ["rmdir", "/etc/systemd/system/multi-user.target.wants"], "parent_comm": "sudo", "parent_start_ns": 299999000000, "start_ns": 300099000000, "exe": {"path": "/usr/bin/rmdir"}}}},
+    {"event": {"FsProtectDenial": {"pid": 7200031, "uid": 0, "comm": "rmdir", "target_dev": 64770, "target_ino": 131090, "operation": "Rmdir", "timestamp_ns": 300200000000}}},
+    {"wait": {"secs": 40}}
+  ]
+}

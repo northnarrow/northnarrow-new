@@ -1674,6 +1674,7 @@ fn trigger_named(name: &str) -> Option<TriggerType> {
         ExploitPostcondition,
         RansomwareEncryption,
         DefenseImpairment,
+        PackageTamperRefusal,
     ]
     .into_iter()
     .find(|t| t.as_str() == name)

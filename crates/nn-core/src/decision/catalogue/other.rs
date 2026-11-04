@@ -508,17 +508,21 @@ pub(super) const DOCS: &[RuleDoc] = &[
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
         observes: "A listed tool switched off by its own command: `auditctl -e 0` and `-D`, \
-                   `ufw disable`, `setenforce 0`, `nft flush ruleset`, `iptables -F`, \
-                   `aa-teardown`, cloud-agent uninstallers.",
+                   `ufw disable`, `setenforce 0`, `nft flush ruleset`, `iptables -F` (every \
+                   chain of a table, or a built-in one), `aa-teardown`, cloud-agent \
+                   uninstallers.",
         false_positives: "As NN-L-EVA-001. One record per command and process tree (the \
                           children of one parent) within 10 s: `ufw disable` runs dozens of \
                           `iptables -F` through `ufw-init`; the repeats are counted \
                           (`detections_held`, the next record's `suppressed_before`), never on \
-                          the kill path.",
+                          the kill path. Lot 282: a flush of one user-defined chain \
+                          (`iptables -t nat -F CNI-HOSTPORT-…`, podman's network setup at a \
+                          host's first run) switches nothing off and is not recorded.",
         how_to_test: "`ransom-check.sh` MS-25: `auditctl -e 0`, `ufw disable`.",
         tests: &[
             "crates/nn-core/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands",
             "crates/nn-core/src/decision/rules/evasion.rs::eva_002_coalesces_the_iptables_calls_of_one_ufw_disable",
+            "crates/nn-core/src/impair/tests.rs::switch_off_commands_need_their_arguments",
             "crates/nn-core/src/detection_budget.rs::coalesced_repeats_are_counted_without_spending_the_budget",
             "deploy/lab/malsim/ransom-check.sh::MS-25",
         ],

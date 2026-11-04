@@ -333,6 +333,10 @@ pub struct TriggerDetector<H: DecisionHost> {
     /// mass-write arm fired for it — the second factor that makes a
     /// staging exec by the same process `ConfirmedIntrusion`.
     mass_writers: MassWriters,
+    /// Lot 282: per pid, when the kernel last reported it creating files
+    /// and destroying originals — the replacement shape of the mass-write
+    /// arm (copy then delete, write then rename onto the original).
+    replacements: Replacements,
     /// Lab PR 162: the trusted-installer window, once `main.rs` has wired
     /// it ([`Self::set_installer_window`]); inside it a control-surface
     /// tamper does not raise the posture.
@@ -447,6 +451,44 @@ impl MassWriters {
     }
 }
 
+/// Lot 282: one half of the replacement shape, as the kernel reports it
+/// (once per window per process each).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Half {
+    /// The files the process created crossed the threshold
+    /// (`MassWrite { overwrites: false }`).
+    Created,
+    /// The originals it destroyed — unlinked, or replaced by a rename onto
+    /// their name — crossed the threshold (`FileBurst { kind: Unlink }`).
+    Destroyed,
+}
+
+/// Lot 282: per pid, the last time each half of the replacement shape was
+/// reported (pruned of pids older than a window past 1,024, as
+/// [`MassWriters`]).
+#[derive(Debug, Default, Clone)]
+struct Replacements(Arc<parking_lot::Mutex<HashMap<u32, [Option<u64>; 2]>>>);
+
+impl Replacements {
+    /// Record `half` of `pid` at `ts_ns`; whether the other half lies
+    /// within a mass-write window of it, on either side (the rings are
+    /// drained apart, and a writer may delete before it writes).
+    fn record(&self, pid: u32, half: Half, ts_ns: u64) -> bool {
+        let mut g = self.0.lock();
+        if g.len() > 1024 {
+            let cutoff = ts_ns.saturating_sub(MASS_WRITE_WINDOW_NS);
+            g.retain(|_, h| h.iter().flatten().any(|t| *t >= cutoff));
+        }
+        let h = g.entry(pid).or_default();
+        let (mine, other) = match half {
+            Half::Created => (0, 1),
+            Half::Destroyed => (1, 0),
+        };
+        h[mine] = Some(ts_ns);
+        h[other].is_some_and(|t| t.abs_diff(ts_ns) <= MASS_WRITE_WINDOW_NS)
+    }
+}
+
 impl<H: DecisionHost> TriggerDetector<H> {
     pub fn new() -> Self {
         Self::default()
@@ -463,6 +505,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
             mass_write_warned: Arc::default(),
             escalation_allow: Arc::new(EscalationAllowList::empty()),
             mass_writers: MassWriters::default(),
+            replacements: Replacements::default(),
             installer_window: InstallerWindow::default(),
             impact: ImpactHooks::default(),
             kernel_mass_write: Arc::default(),
@@ -480,6 +523,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
             mass_write_warned: Arc::default(),
             escalation_allow: Arc::new(EscalationAllowList::empty()),
             mass_writers: MassWriters::default(),
+            replacements: Replacements::default(),
             installer_window: InstallerWindow::default(),
             impact: ImpactHooks::default(),
             kernel_mass_write: Arc::default(),
@@ -498,6 +542,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
             mass_write_warned: Arc::default(),
             escalation_allow: Arc::new(EscalationAllowList::empty()),
             mass_writers: MassWriters::default(),
+            replacements: Replacements::default(),
             installer_window: InstallerWindow::default(),
             impact: ImpactHooks::default(),
             kernel_mass_write: Arc::default(),
@@ -731,9 +776,29 @@ impl<H: DecisionHost> TriggerDetector<H> {
         // External audit EBPF-001: a denial whose sender is PID 1 is a
         // `systemctl` request systemd relayed — refused, recorded, ENGAGED;
         // the requester is unknown, and init is no offender to contain.
-        if let Event::FsProtectDenial { pid, operation, .. } = event {
+        if let Event::FsProtectDenial {
+            pid,
+            operation,
+            timestamp_ns,
+            ..
+        } = event
+        {
             hits.push(if *pid == 1 {
                 TriggerType::RelayedTamperAttempt
+            } else if self
+                .auth
+                .in_package_transaction(*pid, AsOf::judged(*timestamp_ns))
+            {
+                // Lot 282 (Tappa Prove): a refusal of a package
+                // transaction's process — `deb-systemd-helper` removing a
+                // directory the agent protects while `apt purge` runs — is
+                // signed (NN-L-AT-001) and already blocked. It raises
+                // ALERTED and never corroborates: it locked COMBAT on its
+                // own, and the ladder killed the maintainer script. The
+                // transaction is judged as R009 and the FIM rules judge it
+                // (a package manager proper executed by root whose run
+                // covers the refusal).
+                TriggerType::PackageTamperRefusal
             } else if *operation == nn_model::FsProtectOperation::Read {
                 // External audit EVD-001: a refused read of the agent's
                 // signing key is a credential reach (ALERTED), not a
@@ -786,6 +851,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
             &self.auth,
             &self.mass_write_extras,
             &self.mass_write_warned,
+            &self.replacements,
             self.kernel_mass_write(),
         );
         if mass_write {
@@ -862,9 +928,13 @@ fn within(focal_ts: u64, ts: u64, window_ns: u64) -> bool {
 /// self-lock, are one kind of behaviour.)
 pub fn evidence_class(trigger: TriggerType, event: &Event) -> EvidenceClass {
     match (trigger, event) {
-        (TriggerType::ConfirmedIntrusion, Event::MassWrite { .. } | Event::FileOpen { .. }) => {
-            EvidenceClass::FileSystem
-        }
+        // Lot 282: and its replacement shape, raised on the burst of
+        // originals destroyed — every shape of the arm is one kind of
+        // evidence, so no shape of it corroborates another.
+        (
+            TriggerType::ConfirmedIntrusion,
+            Event::MassWrite { .. } | Event::FileOpen { .. } | Event::FileBurst { .. },
+        ) => EvidenceClass::FileSystem,
         _ => trigger.evidence_class(),
     }
 }
@@ -1370,12 +1440,50 @@ fn staging_exec<H: PostureAgent>(
 
 /// The mass-write arm of `ConfirmedIntrusion` (the exec arm is
 /// [`staging_exec`]).
+///
+/// Lot 282 (Tappa Prove P0): the arm measures what ransomware does to a
+/// user's files — it rewrites or replaces many EXISTING ones — and no
+/// longer how many files a process opens to write. The first `podman pull`
+/// of a host (layers extracted: new files; `bolt_state.db` opened 259 times
+/// in a minute: one file) raised it, then COMBAT, and the ladder killed
+/// podman. The rules, as the kernel counts them (the file-open sensor on
+/// LSM `file_open`, `inode_unlink`, `inode_rename`):
+///
+/// 1. **rewrites** — at least [`MASS_WRITE_MIN`] distinct existing files
+///    of 4 KiB or more opened for writing by one process in 60 s, each file
+///    once however often it is opened (`MassWrite { overwrites: true }`),
+///    or 40 by the processes of one cgroup, each with three or more
+///    (external audit EBPF-011). Counted inside an authenticated session
+///    too (external audit POS-002: encryption in place run from a shell).
+/// 2. **replacement** — at least [`MASS_WRITE_MIN`] distinct originals of
+///    4 KiB or more destroyed (unlinked, or replaced by a rename onto their
+///    name; each name once) by a process that also created at least
+///    [`MASS_WRITE_MIN`] files, the two crossings within a window of each
+///    other in either order (`FileBurst { kind: Unlink }` and
+///    `MassWrite { overwrites: false }`): an encrypted copy written, the
+///    original deleted or replaced. Outside an authenticated session: a
+///    session's new files never counted (POS-002), and a checkout or an
+///    archive extracted over a tree from a shell is this shape.
+/// 3. **never on their own** — files created (an image pulled, a clone,
+///    an archive extracted, a build, a cache filled), one file rewritten
+///    again and again (a database, a state file), originals deleted (`rm
+///    -rf`, a purge, a cache sweep).
+///
+/// Tracepoint mode (no LSM sensor: every open reaches userland, and
+/// whether its file existed is not known): the distinct files one process
+/// opened to write in the window; an open that must create its file
+/// (`O_CREAT | O_EXCL`) never counts, and inside a session no open that
+/// may create one does (POS-002).
+///
+/// The writers [`mass_write_exempt`] names are exempt from every shape.
+#[allow(clippy::too_many_arguments)]
 fn confirmed_intrusion<H: PostureHost>(
     focal: &Event,
     recent: Recent<'_>,
     auth: &AuthSessionTracker<H>,
     mass_write_extras: &[String],
     warned: &parking_lot::Mutex<HashMap<u32, u64>>,
+    replacements: &Replacements,
     kernel_mass_write: bool,
 ) -> bool {
     // BUG-032: the FsProtectDenial arm moved OUT to the Decisive
@@ -1387,67 +1495,181 @@ fn confirmed_intrusion<H: PostureHost>(
     // burst, carve-outs (pseudo-filesystems, /run/systemd, the journal,
     // the operator's extras, the writer's own runtime dir) already
     // applied; the lineage gates below stay here.
-    if let Event::MassWrite {
-        pid,
-        comm,
-        filename,
-        count,
-        timestamp_ns,
-        overwrites,
-        cgroup_window,
-        ..
-    } = focal
-    {
-        if mass_write_exempt(auth, *pid, *timestamp_ns, filename, false) {
-            return false;
+    match focal {
+        Event::MassWrite {
+            pid,
+            comm,
+            filename,
+            count,
+            timestamp_ns,
+            overwrites,
+            cgroup_window,
+            ..
+        } => {
+            let shape = if *overwrites {
+                Shape::Rewrites
+            } else if replacements.record(*pid, Half::Created, *timestamp_ns) {
+                Shape::Replacement
+            } else {
+                tracing::debug!(
+                    pid = *pid,
+                    comm = %nn_model::log_escape::Escaped(comm),
+                    created = *count,
+                    "files created (an extraction, a clone, a build) — not counted on their own; \
+                     with originals destroyed beside them they would be"
+                );
+                return false;
+            };
+            let crossing = Crossing {
+                pid: *pid,
+                comm,
+                filename,
+                count: *count,
+                timestamp_ns: *timestamp_ns,
+                cgroup_window: *cgroup_window,
+            };
+            kernel_arm(auth, warned, &crossing, shape)
         }
-        // External audit POS-002: a process of an authenticated session
-        // (SSH, desktop, a cron job, sudo) was exempt whatever it wrote,
-        // so ransomware run from a session never raised it. Its new files
-        // (a build, a clone, an archive extracted, a browser's cache) still
-        // do not count; its rewrites of existing files — the shape of
-        // encryption in place — do.
-        // Recorded, not silent: the kernel reports a crossing once per
-        // window per process.
-        if !*overwrites && auth.is_auth_mediated(*pid, AsOf::judged(*timestamp_ns)) {
-            tracing::info!(
-                pid = *pid,
-                comm = %nn_model::log_escape::Escaped(comm),
-                filename = %nn_model::log_escape::Escaped(filename),
-                count_within_window = *count,
-                "mass write of new files inside an authenticated session — not counted (a build, \
-                 a clone, an archive extracted); rewriting existing files would be"
-            );
-            return false;
+        Event::FileBurst {
+            pid,
+            comm,
+            kind: nn_model::FileBurstKind::Unlink,
+            count,
+            filename,
+            timestamp_ns,
+            ..
+        } => {
+            if !replacements.record(*pid, Half::Destroyed, *timestamp_ns) {
+                tracing::debug!(
+                    pid = *pid,
+                    comm = %nn_model::log_escape::Escaped(comm),
+                    destroyed = *count,
+                    "originals destroyed with no files created beside them (rm -rf, a purge) — \
+                     not counted"
+                );
+                return false;
+            }
+            let crossing = Crossing {
+                pid: *pid,
+                comm,
+                filename,
+                count: *count,
+                timestamp_ns: *timestamp_ns,
+                cgroup_window: false,
+            };
+            kernel_arm(auth, warned, &crossing, Shape::Replacement)
         }
-        if mass_write_warn_due(warned, *pid, *timestamp_ns) {
-            tracing::warn!(
-                trigger = "ConfirmedIntrusion_MassWrite",
-                focal_pid = *pid,
-                focal_comm = %nn_model::log_escape::Escaped(comm),
-                focal_filename = %nn_model::log_escape::Escaped(filename),
-                count_within_window = *count,
-                overwrites = *overwrites,
-                // External audit EBPF-011: the processes of the writer's
-                // cgroup together (`count` = their overwrites).
-                cgroup_window = *cgroup_window,
-                threshold = if *cgroup_window {
-                    common::wire::open_sensor::OPEN_CG_OVERWRITE_MIN as usize
-                } else {
-                    MASS_WRITE_MIN
-                },
-                window_secs = MASS_WRITE_WINDOW_NS / 1_000_000_000,
-                "mass-write threshold crossed (kernel count) — raising ConfirmedIntrusion (→ ENGAGED; COMBAT only with corroboration)"
-            );
+        // Tracepoint mode: every open reaches userland.
+        Event::FileOpen { .. } if !kernel_mass_write => {
+            tracepoint_arm(focal, recent, auth, mass_write_extras, warned)
         }
-        return true;
+        _ => false,
     }
-    // Mass-write / encryption-pattern: many writes from same pid in
-    // a short window (tracepoint mode: every open reaches userland).
-    if kernel_mass_write {
+}
+
+/// Lot 282: which rule of the arm a kernel crossing meets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// Distinct existing files rewritten in place.
+    Rewrites,
+    /// Originals destroyed by a process that created files beside them.
+    Replacement,
+}
+
+impl Shape {
+    fn as_str(self) -> &'static str {
+        match self {
+            Shape::Rewrites => "existing files rewritten",
+            Shape::Replacement => "originals destroyed and replaced by new files",
+        }
+    }
+}
+
+/// A kernel crossing, as the arm reads it.
+struct Crossing<'a> {
+    pid: u32,
+    comm: &'a str,
+    filename: &'a str,
+    count: u32,
+    timestamp_ns: u64,
+    cgroup_window: bool,
+}
+
+/// The arm on a kernel crossing that meets `shape`: the exempt writers,
+/// then (a replacement) the authenticated session.
+fn kernel_arm<H: PostureHost>(
+    auth: &AuthSessionTracker<H>,
+    warned: &parking_lot::Mutex<HashMap<u32, u64>>,
+    c: &Crossing<'_>,
+    shape: Shape,
+) -> bool {
+    use nn_model::log_escape::Escaped;
+    if let Some(why) = mass_write_exempt(auth, c.pid, c.timestamp_ns, c.filename, false) {
+        // Recorded, not silent (lot 282: the evidence each exemption is
+        // still needed under the arm's measure).
+        tracing::info!(
+            pid = c.pid,
+            comm = %Escaped(c.comm),
+            filename = %Escaped(c.filename),
+            count = c.count,
+            shape = shape.as_str(),
+            exempt = why,
+            "mass-write arm: crossing of an exempt writer — not counted"
+        );
         return false;
     }
-    if let Event::FileOpen {
+    // External audit POS-002: a process of an authenticated session (SSH,
+    // desktop, a cron job, sudo) was exempt whatever it wrote, so
+    // ransomware run from a session never raised it. Its rewrites of
+    // existing files — the shape of encryption in place — count; its new
+    // files never did, and lot 282: neither does a replacement of
+    // originals by new files (a checkout, an archive extracted over a tree).
+    if shape == Shape::Replacement && auth.is_auth_mediated(c.pid, AsOf::judged(c.timestamp_ns)) {
+        tracing::info!(
+            pid = c.pid,
+            comm = %Escaped(c.comm),
+            filename = %Escaped(c.filename),
+            count = c.count,
+            "originals replaced by new files inside an authenticated session — not counted (a \
+             checkout, an archive extracted over a tree); rewriting existing files in place would \
+             be"
+        );
+        return false;
+    }
+    if mass_write_warn_due(warned, c.pid, c.timestamp_ns) {
+        tracing::warn!(
+            trigger = "ConfirmedIntrusion_MassWrite",
+            focal_pid = c.pid,
+            focal_comm = %Escaped(c.comm),
+            focal_filename = %Escaped(c.filename),
+            shape = shape.as_str(),
+            count_within_window = c.count,
+            // External audit EBPF-011: the processes of the writer's
+            // cgroup together (`count` = their distinct rewrites).
+            cgroup_window = c.cgroup_window,
+            threshold = if c.cgroup_window {
+                common::wire::open_sensor::OPEN_CG_OVERWRITE_MIN as usize
+            } else {
+                MASS_WRITE_MIN
+            },
+            window_secs = MASS_WRITE_WINDOW_NS / 1_000_000_000,
+            "mass-write threshold crossed (kernel count) — raising ConfirmedIntrusion (→ ENGAGED; COMBAT only with corroboration)"
+        );
+    }
+    true
+}
+
+/// The arm in tracepoint mode (every write-open reaches userland as a
+/// `FileOpen`): the distinct files `focal`'s process opened to write in
+/// the window, the focal open included.
+fn tracepoint_arm<H: PostureHost>(
+    focal: &Event,
+    recent: Recent<'_>,
+    auth: &AuthSessionTracker<H>,
+    mass_write_extras: &[String],
+    warned: &parking_lot::Mutex<HashMap<u32, u64>>,
+) -> bool {
+    let Event::FileOpen {
         pid: focal_pid,
         comm: focal_comm,
         filename: focal_filename,
@@ -1456,140 +1678,124 @@ fn confirmed_intrusion<H: PostureHost>(
         path_from_user,
         ..
     } = focal
-    {
-        if is_write_open(*flags) {
-            // BUG-014 (P-6) path-class carve-out: a write to a
-            // kernel-RPC pseudo-FS (sysfs cgroupfs, procfs, systemd's
-            // /run state, journald binary log) is not a data write
-            // and should not contribute to the ransomware-shape
-            // mass-write heuristic. See MASS_WRITE_CARVEOUT_PREFIXES
-            // for the full prefix list + per-class rationale. The
-            // focal-event check short-circuits early; the recent-loop
-            // check below mirrors it so an attacker can't pad a
-            // window of real data writes with sysfs noise to dilute
-            // the count.
-            // External audit POS-004: a caller's string, not the opened path.
-            let carved = |f: &str| is_mass_write_carveout_unresolved(f, mass_write_extras);
-            if carved(focal_filename) {
-                return false;
-            }
-            // T7.13 — auth-mediated PIDs (sudo + its children: apt,
-            // systemctl, an editor, …) routinely exceed the mass-write
-            // threshold during legitimate administration.
-            // (ii) — system package-management daemons (snapd, dpkg,
-            // apt, mandb) atomic-churn state files / caches well past
-            // the threshold during routine maintenance; same exe-path
-            // lineage keying. Only the mass-write arm is gated here;
-            // FsProtectDenial and the staging exec still fire for these
-            // PIDs. Lab PR 175: a package transaction's writes, and
-            // mandb's own as a system account ([`mass_write_exempt`]).
-            // FP-2 — `npm install` unpacks a package tarball (+ writes
-            // the ~/.npm content cache) well past the threshold. npm is
-            // a `#!/usr/bin/env node` script, so the writer's exe is the
-            // node interpreter, NOT `/usr/bin/npm` — exactly the
-            // interpreter-exe shape SYSTEM_DAEMON_EXES documents for
-            // unattended-upgrade. `is_npm_cli_writer` therefore gates on
-            // exe ∈ NODE_EXES AND argv[1] = npm-cli.js, a DIRECT focal-pid
-            // check (no lineage): only npm's own node process is exempt,
-            // every other node — and any child install script npm spawns
-            // — still fires. ACCEPTED residual gap: a malicious package's
-            // files, extracted by the genuine npm process, are exempt
-            // from the write-VOLUME signal (a count can't tell a benign
-            // install from a malicious one); supply-chain malice is
-            // caught by the exec / network / persistence arms, not here.
-            // TODO(FP-2 v2): additionally require the write target under
-            // a node_modules path to also fire on npm mass-writing
-            // elsewhere — deferred because npm legitimately mass-writes
-            // its content cache (~/.npm/_cacache) OUTSIDE node_modules,
-            // so a bare node_modules constraint would reintroduce the FP
-            // for the cache-write burst; a correct v2 must allowlist the
-            // (configurable) cache dir too.
-            if mass_write_exempt(auth, *focal_pid, *focal_ts, focal_filename, *path_from_user) {
-                return false;
-            }
-            // External audit POS-002 (tracepoint mode, which sees the open
-            // flags but not whether the file existed): a session's opens
-            // that may create (`O_CREAT`) do not count, its opens of an
-            // existing file to write do.
-            let session = auth.is_auth_mediated(*focal_pid, AsOf::judged(*focal_ts));
-            let counted = |f: u32| !session || f & O_CREAT == 0;
-            if !counted(*flags) {
-                return false;
-            }
-            // Audit `posture-3`: a PAM session (valid loginuid) writing
-            // into ITS OWN `/run/user/<loginuid>/` is session plumbing —
-            // `systemd --user` creating runtime dirs/sockets at login —
-            // not a ransomware burst. Carve exactly that directory out
-            // for this writer; everything else (incl. `/run/user/` of
-            // another uid and `$HOME`) still counts, so the loginuid
-            // signal does not widen trust beyond the runtime dir.
-            let own_runtime_dir = auth
-                .loginuid_of(*focal_pid)
-                .map(|uid| format!("/run/user/{uid}/"));
-            let in_own_runtime =
-                |f: &str| own_runtime_dir.as_deref().is_some_and(|d| f.starts_with(d));
-            if in_own_runtime(focal_filename) {
-                return false;
-            }
-            let mut count = 1usize;
-            for e in recent.iter() {
-                if let Event::FileOpen {
-                    pid,
-                    filename,
-                    flags: f,
-                    timestamp_ns,
-                    ..
-                } = e
-                {
-                    if *pid == *focal_pid
-                        && is_write_open(*f)
-                        && counted(*f)
-                        && !carved(filename)
-                        && !in_own_runtime(filename)
-                        && within(*focal_ts, *timestamp_ns, MASS_WRITE_WINDOW_NS)
-                    {
-                        count += 1;
-                    }
-                }
-            }
-            if count >= MASS_WRITE_MIN {
-                // BUG-015 observability: when the mass-write arm of
-                // confirmed_intrusion fires, surface the focal PID +
-                // comm + the count so operators can identify the
-                // writer (vs. having only `POSTURE TRANSITION
-                // trigger=ConfirmedIntrusion` to go on). Single line
-                // per fire — not in any hot loop, the rule engine
-                // visits at most once per Event::FileOpen.
-                // Review entry 37: once per window per pid — a steady writer
-                // re-crosses the threshold on every event.
-                if mass_write_warn_due(warned, *focal_pid, *focal_ts) {
-                    tracing::warn!(
-                        trigger = "ConfirmedIntrusion_MassWrite",
-                        focal_pid = *focal_pid,
-                        focal_comm = %nn_model::log_escape::Escaped(focal_comm),
-                        focal_filename = %nn_model::log_escape::Escaped(focal_filename),
-                        count_within_window = count,
-                        threshold = MASS_WRITE_MIN,
-                        window_secs = MASS_WRITE_WINDOW_NS / 1_000_000_000,
-                        // BUG-032: this raises ConfirmedIntrusion (COMBAT-tier),
-                        // but as a NeedsCorroboration signal it escalates to
-                        // ENGAGED on its own — COMBAT (auto-isolation) needs a
-                        // second distinct signal. (Pure single-vector ransomware
-                        // tops at ENGAGED unless the sustained knob is on.)
-                        "mass-write threshold crossed — raising ConfirmedIntrusion (→ ENGAGED; COMBAT only with corroboration); further hits of this pid are logged once per window"
-                    );
-                }
-                return true;
+    else {
+        return false;
+    };
+    if !is_write_open(*flags) {
+        return false;
+    }
+    // BUG-014 (P-6) path-class carve-out: a write to a kernel-RPC pseudo-FS
+    // (sysfs cgroupfs, procfs, systemd's /run state, journald binary log)
+    // is not a data write and should not contribute to the ransomware-shape
+    // mass-write heuristic. See MASS_WRITE_CARVEOUT_PREFIXES for the full
+    // prefix list + per-class rationale. The focal-event check
+    // short-circuits early; the recent-loop check below mirrors it so an
+    // attacker can't pad a window of real data writes with sysfs noise to
+    // dilute the count.
+    // External audit POS-004: a caller's string, not the opened path.
+    let carved = |f: &str| is_mass_write_carveout_unresolved(f, mass_write_extras);
+    if carved(focal_filename) {
+        return false;
+    }
+    // T7.13 — auth-mediated PIDs (sudo + its children: apt, systemctl, an
+    // editor, …) routinely exceed the mass-write threshold during
+    // legitimate administration. (ii) — system package-management daemons
+    // (snapd, dpkg, apt, mandb) atomic-churn state files / caches well past
+    // the threshold during routine maintenance. Only the mass-write arm is
+    // gated here; FsProtectDenial and the staging exec still fire for these
+    // PIDs. Lab PR 175: a package transaction's writes, and mandb's own as
+    // a system account ([`mass_write_exempt`]). FP-2 — `npm install` /
+    // `npm ci` (npm is a `#!/usr/bin/env node` script: the writer's exe is
+    // the node interpreter; `is_npm_cli_writer` gates on exe ∈ NODE_EXES
+    // AND argv[1] = npm-cli.js, the focal pid only, so every other node —
+    // and any install script npm spawns — still fires). ACCEPTED residual
+    // gap: a malicious package's files, extracted by the genuine npm
+    // process, are exempt from the write-VOLUME signal; supply-chain malice
+    // is caught by the exec / network / persistence arms, not here.
+    if mass_write_exempt(auth, *focal_pid, *focal_ts, focal_filename, *path_from_user).is_some() {
+        return false;
+    }
+    // External audit POS-002 (tracepoint mode sees the open flags but not
+    // whether the file existed): a session's opens that may create
+    // (`O_CREAT`) do not count, its opens of an existing file to write do.
+    // Lot 282: an open that must create its file (`O_CREAT | O_EXCL`: it
+    // fails on an existing one) never counts, for anyone.
+    let session = auth.is_auth_mediated(*focal_pid, AsOf::judged(*focal_ts));
+    let counted =
+        |f: u32| f & (O_CREAT | O_EXCL) != (O_CREAT | O_EXCL) && (!session || f & O_CREAT == 0);
+    if !counted(*flags) {
+        return false;
+    }
+    // Audit `posture-3`: a PAM session (valid loginuid) writing into ITS
+    // OWN `/run/user/<loginuid>/` is session plumbing — `systemd --user`
+    // creating runtime dirs/sockets at login — not a ransomware burst.
+    // Carve exactly that directory out for this writer; everything else
+    // (incl. `/run/user/` of another uid and `$HOME`) still counts, so the
+    // loginuid signal does not widen trust beyond the runtime dir.
+    let own_runtime_dir = auth
+        .loginuid_of(*focal_pid)
+        .map(|uid| format!("/run/user/{uid}/"));
+    let in_own_runtime = |f: &str| own_runtime_dir.as_deref().is_some_and(|d| f.starts_with(d));
+    if in_own_runtime(focal_filename) {
+        return false;
+    }
+    // Lot 282: distinct files — a database opened again and again is one.
+    let mut files: HashSet<&str> = HashSet::new();
+    files.insert(focal_filename.as_str());
+    for e in recent.iter() {
+        if let Event::FileOpen {
+            pid,
+            filename,
+            flags: f,
+            timestamp_ns,
+            ..
+        } = e
+        {
+            if *pid == *focal_pid
+                && is_write_open(*f)
+                && counted(*f)
+                && !carved(filename)
+                && !in_own_runtime(filename)
+                && within(*focal_ts, *timestamp_ns, MASS_WRITE_WINDOW_NS)
+            {
+                files.insert(filename.as_str());
             }
         }
     }
-    false
+    let count = files.len();
+    if count < MASS_WRITE_MIN {
+        return false;
+    }
+    // BUG-015 observability: when the mass-write arm of confirmed_intrusion
+    // fires, surface the focal PID + comm + the count so operators can
+    // identify the writer (vs. having only `POSTURE TRANSITION
+    // trigger=ConfirmedIntrusion` to go on). Review entry 37: once per
+    // window per pid — a steady writer re-crosses the threshold on every
+    // event.
+    if mass_write_warn_due(warned, *focal_pid, *focal_ts) {
+        tracing::warn!(
+            trigger = "ConfirmedIntrusion_MassWrite",
+            focal_pid = *focal_pid,
+            focal_comm = %nn_model::log_escape::Escaped(focal_comm),
+            focal_filename = %nn_model::log_escape::Escaped(focal_filename),
+            distinct_files_within_window = count,
+            threshold = MASS_WRITE_MIN,
+            window_secs = MASS_WRITE_WINDOW_NS / 1_000_000_000,
+            // BUG-032: this raises ConfirmedIntrusion (COMBAT-tier), but as
+            // a NeedsCorroboration signal it escalates to ENGAGED on its own
+            // — COMBAT (auto-isolation) needs a second distinct signal.
+            "mass-write threshold crossed — raising ConfirmedIntrusion (→ ENGAGED; COMBAT only with corroboration); further hits of this pid are logged once per window"
+        );
+    }
+    true
 }
 
 /// The mass-write arm's writers (review 49 (ii), FP-2): a package
 /// transaction's ([`AuthSessionTracker::in_package_transaction`]), mandb's
 /// own as a system account (its cache rebuild,
-/// [`AuthSessionTracker::is_system_man_cache_writer`]), npm's CLI's own.
+/// [`AuthSessionTracker::is_system_man_cache_writer`]), npm's CLI's own,
+/// and a user's package manager in that user's container storage —
+/// `Some` with which, `None` for any other writer.
 ///
 /// Lab PR 175: it was anything with a package manager or `mandb` in its
 /// lineage. Neither is set-id: a user ran `mandb` (or `dpkg --version`)
@@ -1600,19 +1806,34 @@ fn confirmed_intrusion<H: PostureHost>(
 /// ([`AuthSessionTracker::is_user_container_storage_write`], judged on the
 /// open `path` names: the kernel counts a process's write-opens, and
 /// reports the one that crossed the threshold).
+///
+/// Lot 282: under the arm's measure (rewrites and replacements, never
+/// files created) the creation bursts these were written for no longer
+/// count; each stays for the shape that still does — a package
+/// transaction replaces the files it upgrades, `mandb` replaces each
+/// locale's `index.db` by a rename, `npm ci` deletes `node_modules` and
+/// extracts it again — and an exempt crossing is recorded at INFO, with
+/// the exemption that answered.
 fn mass_write_exempt<H: PostureHost>(
     auth: &AuthSessionTracker<H>,
     pid: u32,
     ts_ns: u64,
     path: &str,
     path_from_user: bool,
-) -> bool {
+) -> Option<&'static str> {
     // R12b (R-F): as of the write
     let as_of = AsOf::judged(ts_ns);
-    auth.in_package_transaction(pid, as_of)
-        || auth.is_system_man_cache_writer(pid, as_of)
-        || auth.is_npm_cli_writer(pid, as_of)
-        || auth.is_user_container_storage_write(pid, as_of, path, path_from_user)
+    if auth.in_package_transaction(pid, as_of) {
+        Some("package transaction")
+    } else if auth.is_system_man_cache_writer(pid, as_of) {
+        Some("man-db cache rebuild")
+    } else if auth.is_npm_cli_writer(pid, as_of) {
+        Some("npm CLI")
+    } else if auth.is_user_container_storage_write(pid, as_of, path, path_from_user) {
+        Some("a user's package manager in their container storage")
+    } else {
+        None
+    }
 }
 
 /// One mass-write WARN per pid per window (review entry 37). Returns true
@@ -1828,6 +2049,9 @@ fn is_write_open(flags: u32) -> bool {
 
 /// `O_CREAT` on Linux (0o100): the open may create the file.
 const O_CREAT: u32 = 0o100;
+/// `O_EXCL` on Linux (0o200): with `O_CREAT`, the open fails on an
+/// existing file — it creates its file (lot 282).
+const O_EXCL: u32 = 0o200;
 
 /// The posture's event builders for tests: its own, and the agent's tests
 /// of the posture (nn-core's `test-util`, R08a, lab PR 250).
@@ -2235,6 +2459,72 @@ mod tests {
         );
     }
 
+    /// Lot 282 (Tappa Prove, lab 04/11 on main: `apt purge podman`): a
+    /// refusal of a package transaction's process — `deb-systemd-helper`,
+    /// a perl script dpkg's maintainer script runs — raises
+    /// `PackageTamperRefusal` (ALERTED, never corroborates), not the
+    /// decisive `AntiTamperDenial` that locked COMBAT and had the ladder
+    /// kill it. The transaction is judged as R009 judges it: a package
+    /// manager proper root executed, whose run covers the refusal. The
+    /// same refusal from a user's own dpkg (`LD_PRELOAD`), from outside the
+    /// transaction's tree, or after it ended keeps today's weight; PID 1's
+    /// relayed signal stays `RelayedTamperAttempt`.
+    #[test]
+    fn a_package_transactions_refusal_is_alerted_not_decisive() {
+        const S: u64 = 1_000_000_000;
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe_by(0, 100, 1, "/usr/bin/apt-get", S), &[]);
+        let _ = det.detect(&spawn_with_exe_by(0, 110, 100, "/usr/bin/dpkg", 2 * S), &[]);
+        let _ = det.detect(&spawn_with_exe_by(0, 120, 110, "/usr/bin/dash", 3 * S), &[]);
+        let _ = det.detect(&spawn_with_exe_by(0, 130, 120, "/usr/bin/perl", 4 * S), &[]);
+        // a user's dpkg (not root): no transaction
+        let _ = det.detect(
+            &spawn_with_exe_by(1000, 200, 1, "/usr/bin/dpkg", 5 * S),
+            &[],
+        );
+        let _ = det.detect(
+            &spawn_with_exe_by(1000, 210, 200, "/usr/bin/perl", 6 * S),
+            &[],
+        );
+        // a root process outside any transaction
+        let _ = det.detect(&spawn_with_exe_by(0, 300, 1, "/usr/bin/rmdir", 7 * S), &[]);
+        let refusal =
+            |pid: u32, op: nn_model::FsProtectOperation, ts: u64| Event::FsProtectDenial {
+                pid,
+                uid: 0,
+                comm: "deb-systemd-hel".into(),
+                target_dev: 64_770,
+                target_ino: 12345,
+                operation: op,
+                timestamp_ns: ts,
+            };
+        use nn_model::FsProtectOperation as Op;
+        for op in [Op::Rmdir, Op::Unlink, Op::Signal, Op::Read, Op::Sched] {
+            assert_eq!(
+                det.detect(&refusal(130, op, 8 * S), &[]),
+                vec![TriggerType::PackageTamperRefusal],
+                "{op:?}"
+            );
+        }
+        assert_eq!(
+            det.detect(&refusal(210, Op::Rmdir, 8 * S), &[]),
+            vec![TriggerType::AntiTamperDenial]
+        );
+        assert_eq!(
+            det.detect(&refusal(300, Op::Rmdir, 8 * S), &[]),
+            vec![TriggerType::AntiTamperDenial]
+        );
+        // the transaction over: dpkg's exec plus the unseen grace, long past
+        assert_eq!(
+            det.detect(&refusal(130, Op::Rmdir, 3_600 * S), &[]),
+            vec![TriggerType::AntiTamperDenial]
+        );
+        assert_eq!(
+            det.detect(&refusal(1, Op::Signal, 8 * S), &[]),
+            vec![TriggerType::RelayedTamperAttempt]
+        );
+    }
+
     #[test]
     fn persistence_fires_on_cron_d_write() {
         let det = TriggerDetector::new();
@@ -2271,7 +2561,7 @@ mod tests {
     fn self_write_burst(pid: u32) -> (Event, Vec<Event>) {
         let path = "/var/lib/northnarrow/fim_drift.jsonl";
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
-            .map(|i| file_open(pid, 0, path, 1, i + 1))
+            .map(|i| file_open(pid, 0, &format!("{path}.{i}"), 1, i + 1))
             .collect();
         let focal = file_open(pid, 0, path, 1, MASS_WRITE_MIN as u64 + 1);
         (focal, recent)
@@ -2722,7 +3012,7 @@ mod tests {
         // 25 write-opens from apt's pid in 60 s — would normally
         // trip ConfirmedIntrusion mass-write arm.
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
-            .map(|i| file_open(200, 0, "/var/cache/apt/x", 1, i + 10))
+            .map(|i| file_open(200, 0, &format!("/var/cache/apt/x.{i}"), 1, i + 10))
             .collect();
         let focal = file_open(200, 0, "/var/cache/apt/x", 1, MASS_WRITE_MIN as u64 + 11);
         let hits = det.detect(&focal, &recent);
@@ -2740,7 +3030,7 @@ mod tests {
         let _ = det.detect(&spawn_with_exe(900, 1, "/usr/bin/zsh", 1), &[]);
 
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
-            .map(|i| file_open(900, 1000, "/home/u/x", 1, i + 10))
+            .map(|i| file_open(900, 1000, &format!("/home/u/x.{i}"), 1, i + 10))
             .collect();
         let focal = file_open(900, 1000, "/home/u/x", 1, MASS_WRITE_MIN as u64 + 11);
         let hits = det.detect(&focal, &recent);
@@ -2777,7 +3067,7 @@ mod tests {
             let det = detector_with_empty_proc();
             let _ = det.detect(&spawn_with_exe(900, 1, "/usr/bin/zsh", 1), &[]);
             let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
-                .map(|i| file_open(900, 1000, "/home/u/x", 1, 1_000 + offset + i))
+                .map(|i| file_open(900, 1000, &format!("/home/u/x.{i}"), 1, 1_000 + offset + i))
                 .collect();
             let hits = det.detect(&focal, &recent);
             assert_eq!(
@@ -2884,9 +3174,28 @@ mod tests {
         }
     }
 
+    /// Lot 282: the kernel's burst of originals destroyed (unlinked, or
+    /// replaced by a rename onto their name), `MASS_UNLINK`.
+    fn destroyed(pid: u32, ts: u64) -> Event {
+        Event::FileBurst {
+            pid,
+            uid: 1000,
+            comm: "x".into(),
+            kind: nn_model::FileBurstKind::Unlink,
+            count: MASS_WRITE_MIN as u32,
+            appended: 0,
+            sources: 0,
+            filename: "/home/u/docs/report.docx".into(),
+            timestamp_ns: ts,
+        }
+    }
+
     /// A process of an SSH session was exempt from the mass-write arm
     /// whatever it wrote. Its new files (a build, a clone) still do not
     /// count; its rewrites of existing files — encryption in place — do.
+    /// Lot 282: outside a session new files alone no longer count either;
+    /// new files with originals destroyed beside them (the replacement
+    /// shape) do, and inside a session they do not.
     #[test]
     fn mass_write_in_an_ssh_session_fires_on_rewrites_not_on_new_files() {
         let det = detector_with_empty_proc();
@@ -2898,6 +3207,11 @@ mod tests {
             !hits.contains(&TriggerType::ConfirmedIntrusion),
             "a session's new files: {hits:?}"
         );
+        let hits = det.detect(&destroyed(400, 10), &[]);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "a session's replacement (a checkout): {hits:?}"
+        );
         let hits = det.detect(&mass_write(400, true, 11), &[]);
         assert!(
             hits.contains(&TriggerType::ConfirmedIntrusion),
@@ -2908,14 +3222,146 @@ mod tests {
         let _ = det.detect(&spawn_with_exe(510, 500, "/usr/bin/cp", 5), &[]);
         let hits = det.detect(&mass_write(510, true, 12), &[]);
         assert!(hits.contains(&TriggerType::ConfirmedIntrusion));
-        // outside any session, new files count as before
+        // outside any session: new files alone do not count, new files with
+        // originals destroyed do
         let _ = det.detect(&spawn_with_exe(600, 1, "/srv/app/worker", 6), &[]);
         let hits = det.detect(&mass_write(600, false, 13), &[]);
-        assert!(hits.contains(&TriggerType::ConfirmedIntrusion));
+        assert!(!hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+        let hits = det.detect(&destroyed(600, 14), &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
         // a package manager stays exempt either way
         let _ = det.detect(&spawn_with_exe_by(0, 700, 500, "/usr/bin/dpkg", 7), &[]);
         let hits = det.detect(&mass_write(700, true, 14), &[]);
         assert!(!hits.contains(&TriggerType::ConfirmedIntrusion));
+        let _ = det.detect(&mass_write(700, false, 15), &[]);
+        let hits = det.detect(&destroyed(700, 16), &[]);
+        assert!(!hits.contains(&TriggerType::ConfirmedIntrusion));
+    }
+
+    /// Lot 282 (lab 04/11, lot 279's podman repro): the first `podman pull`
+    /// of a host — its layers extracted (files created), its database
+    /// rewritten (one file: no overwrite crossing in the kernel any more),
+    /// then `podman rmi` deleting the layers (originals destroyed, no new
+    /// files beside them) — and `rm -rf` of a tree raise no
+    /// `ConfirmedIntrusion`, inside a session or outside one.
+    #[test]
+    fn creation_or_deletion_alone_is_not_a_mass_write() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(600, 1, "/usr/bin/podman", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(610, 1, "/usr/bin/rm", 2), &[]);
+        let ci = TriggerType::ConfirmedIntrusion;
+        for i in 0..5u64 {
+            // a crossing per window, five minutes of a big pull
+            let hits = det.detect(&mass_write(600, false, 10 + i * MASS_WRITE_WINDOW_NS), &[]);
+            assert!(!hits.contains(&ci), "{hits:?}");
+        }
+        // podman rmi, an hour later: deletions, its creations long past
+        let hits = det.detect(&destroyed(600, 3_600 * 1_000_000_000), &[]);
+        assert!(!hits.contains(&ci), "{hits:?}");
+        let hits = det.detect(&destroyed(610, 20), &[]);
+        assert!(!hits.contains(&ci), "rm -rf: {hits:?}");
+    }
+
+    /// Lot 282: the replacement shape — files created and originals
+    /// destroyed by ONE process within a window of each other, in either
+    /// order (the rings are drained apart; a writer may delete first) —
+    /// fires on the second half; two processes' halves never add up, nor
+    /// two halves farther apart than a window.
+    #[test]
+    fn the_replacement_shape_is_one_processs_two_halves_within_a_window() {
+        let det = detector_with_empty_proc();
+        for pid in [600, 610, 620, 630, 640, 650] {
+            let _ = det.detect(&spawn_with_exe(pid, 1, "/srv/app/worker", 1), &[]);
+        }
+        let ci = TriggerType::ConfirmedIntrusion;
+        let w = MASS_WRITE_WINDOW_NS;
+        // created, then destroyed
+        assert!(!det.detect(&mass_write(600, false, 10), &[]).contains(&ci));
+        assert!(det.detect(&destroyed(600, 10 + w), &[]).contains(&ci));
+        // destroyed, then created
+        assert!(!det.detect(&destroyed(610, 10 + w), &[]).contains(&ci));
+        assert!(det.detect(&mass_write(610, false, 10), &[]).contains(&ci));
+        // farther apart than a window
+        assert!(!det.detect(&mass_write(620, false, 10), &[]).contains(&ci));
+        assert!(!det.detect(&destroyed(620, 11 + w), &[]).contains(&ci));
+        // two processes' halves
+        assert!(!det.detect(&mass_write(630, false, 10), &[]).contains(&ci));
+        assert!(!det.detect(&destroyed(640, 11), &[]).contains(&ci));
+        // a rename burst is the ransomware tracker's (NN-L-IMP-002), not a half
+        let renames = Event::FileBurst {
+            pid: 650,
+            uid: 1000,
+            comm: "x".into(),
+            kind: nn_model::FileBurstKind::RenameExtension,
+            count: 20,
+            appended: 20,
+            sources: 0,
+            filename: "/home/u/a.pdf.locked".into(),
+            timestamp_ns: 12,
+        };
+        assert!(!det.detect(&renames, &[]).contains(&ci));
+        assert!(!det.detect(&mass_write(650, false, 13), &[]).contains(&ci));
+    }
+
+    /// Lot 282: every shape of the arm is file-system evidence — the
+    /// rewrites, the replacement (raised on the burst of originals
+    /// destroyed) and the tracepoint count — so no shape of the arm
+    /// corroborates another.
+    #[test]
+    fn every_shape_of_the_mass_write_arm_is_file_system_evidence() {
+        let ci = TriggerType::ConfirmedIntrusion;
+        for e in [
+            mass_write(1, true, 1),
+            mass_write(1, false, 1),
+            destroyed(1, 1),
+            file_open(1, 1000, "/home/u/x", 2, 1),
+        ] {
+            assert_eq!(evidence_class(ci, &e), EvidenceClass::FileSystem, "{e:?}");
+        }
+        // the exec arm stays execution evidence
+        assert_eq!(
+            evidence_class(ci, &spawn_with_exe(1, 0, "/tmp/x", 1)),
+            EvidenceClass::Execution
+        );
+    }
+
+    /// Lot 282: in tracepoint mode the arm counts distinct files — a
+    /// database opened to write again and again is one file — and an open
+    /// that must create its file (`O_CREAT | O_EXCL`) never counts; an open
+    /// that may create one (`O_CREAT | O_TRUNC`) still does outside a
+    /// session (whether its file existed is not known there).
+    #[test]
+    fn tracepoint_mass_write_counts_distinct_files_and_never_exclusive_creates() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(800, 1, "/srv/app/worker", 1), &[]);
+        let ci = TriggerType::ConfirmedIntrusion;
+        let db = "/srv/app/state.db";
+        let recent: Vec<Event> = (0..200u64)
+            .map(|i| file_open(800, 0, db, 2, i + 10))
+            .collect();
+        assert!(!det
+            .detect(&file_open(800, 0, db, 2, 300), &recent)
+            .contains(&ci));
+        let burst = |flags: u32| {
+            let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+                .map(|i| file_open(800, 0, &format!("/srv/app/out/{i}"), flags, i + 10))
+                .collect();
+            det.detect(&file_open(800, 0, "/srv/app/out/x", flags, 400), &recent)
+        };
+        // O_WRONLY | O_CREAT | O_EXCL
+        assert!(!burst(0o301).contains(&ci));
+        // O_WRONLY | O_CREAT | O_TRUNC
+        assert!(burst(0o1101).contains(&ci));
+        // O_RDWR
+        assert!(burst(0o2).contains(&ci));
+        // nineteen files and the focal one again: not twenty
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64 - 1))
+            .map(|i| file_open(800, 0, &format!("/srv/app/o2/{i}"), 2, i + 10))
+            .chain([file_open(800, 0, "/srv/app/o2/0", 2, 40)])
+            .collect();
+        assert!(!det
+            .detect(&file_open(800, 0, "/srv/app/o2/1", 2, 41), &recent)
+            .contains(&ci));
     }
 
     /// Tracepoint mode sees the open flags, not whether the file existed:
@@ -2959,16 +3405,23 @@ mod tests {
     }
 
     /// External audit POS-003 through the detector: a service's child,
-    /// forked before its parent executed sudo, writes many new files —
-    /// it is not sudo's, and it fires.
+    /// forked before its parent executed sudo, writes many new files and
+    /// destroys the originals (lot 282: the shape a session's process
+    /// would not be counted for) — it is not sudo's, and it fires.
     #[test]
     fn a_child_forked_before_its_parent_ran_sudo_is_not_exempt() {
         let det = detector_with_empty_proc();
         let _ = det.detect(&spawn_started(100, 1, "/srv/www/payload", 21, 20), &[]);
         let _ = det.detect(&spawn_started(200, 100, "/srv/www/crypt", 50, 30), &[]);
         let _ = det.detect(&spawn_started(100, 1, "/usr/bin/sudo", 40, 20), &[]);
-        let hits = det.detect(&mass_write(200, false, 60), &[]);
+        let _ = det.detect(&mass_write(200, false, 60), &[]);
+        let hits = det.detect(&destroyed(200, 61), &[]);
         assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+        // the same child forked AFTER the sudo exec is the session's
+        let _ = det.detect(&spawn_started(300, 100, "/srv/www/crypt", 70, 45), &[]);
+        let _ = det.detect(&mass_write(300, false, 80), &[]);
+        let hits = det.detect(&destroyed(300, 81), &[]);
+        assert!(!hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
     }
 
     // ── (ii) — system package-management daemon exemption ───────────
@@ -2990,7 +3443,15 @@ mod tests {
             &[],
         );
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
-            .map(|i| file_open(1096, 0, "/var/lib/snapd/state.json.tmp", 1, i + 10))
+            .map(|i| {
+                file_open(
+                    1096,
+                    0,
+                    &format!("/var/lib/snapd/state.json.tmp.{i}"),
+                    1,
+                    i + 10,
+                )
+            })
             .collect();
         let focal = file_open(
             1096,
@@ -3011,7 +3472,7 @@ mod tests {
         let det = detector_with_empty_proc();
         let _ = det.detect(&spawn_with_exe_by(6, 3096, 1, "/usr/bin/mandb", 1), &[]);
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
-            .map(|i| file_open(3096, 0, "/var/cache/man/de/3096", 1, i + 10))
+            .map(|i| file_open(3096, 0, &format!("/var/cache/man/de/3096.{i}"), 1, i + 10))
             .collect();
         let focal = file_open(
             3096,
@@ -3034,7 +3495,7 @@ mod tests {
         let _ = det.detect(&spawn_with_exe_by(0, 400, 1, "/usr/bin/dpkg", 1), &[]);
         let _ = det.detect(&spawn_with_exe(401, 400, "/bin/sh", 2), &[]);
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
-            .map(|i| file_open(401, 0, "/usr/share/foo/data", 1, i + 10))
+            .map(|i| file_open(401, 0, &format!("/usr/share/foo/data.{i}"), 1, i + 10))
             .collect();
         let focal = file_open(401, 0, "/usr/share/foo/data", 1, MASS_WRITE_MIN as u64 + 11);
         let hits = det.detect(&focal, &recent);
@@ -3051,7 +3512,7 @@ mod tests {
         let det = detector_with_empty_proc();
         let _ = det.detect(&spawn_with_exe(900, 1, "/usr/local/bin/cryptor", 1), &[]);
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
-            .map(|i| file_open(900, 1000, "/home/u/docs/f", 1, i + 10))
+            .map(|i| file_open(900, 1000, &format!("/home/u/docs/f.{i}"), 1, i + 10))
             .collect();
         let focal = file_open(900, 1000, "/home/u/docs/f", 1, MASS_WRITE_MIN as u64 + 11);
         let hits = det.detect(&focal, &recent);
@@ -3096,7 +3557,7 @@ mod tests {
                 file_open(
                     7000,
                     1000,
-                    "/home/alice/.npm-global/lib/node_modules/left-pad/index.js",
+                    &format!("/home/alice/.npm-global/lib/node_modules/left-pad/f{i}.js"),
                     1,
                     i + 10,
                 )
@@ -3127,7 +3588,7 @@ mod tests {
             &[],
         );
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
-            .map(|i| file_open(7100, 1000, "/home/u/docs/f", 1, i + 10))
+            .map(|i| file_open(7100, 1000, &format!("/home/u/docs/f.{i}"), 1, i + 10))
             .collect();
         let focal = file_open(7100, 1000, "/home/u/docs/f", 1, MASS_WRITE_MIN as u64 + 11);
         let hits = det.detect(&focal, &recent);
@@ -3163,7 +3624,7 @@ mod tests {
             &[],
         );
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
-            .map(|i| file_open(7201, 1000, "/home/u/.cache/evil/f", 1, i + 10))
+            .map(|i| file_open(7201, 1000, &format!("/home/u/.cache/evil/f.{i}"), 1, i + 10))
             .collect();
         let focal = file_open(
             7201,
@@ -3363,7 +3824,7 @@ mod tests {
         // tracepoint mode: 2,000 opens, each one judged
         let opens = |path: &str, from: u64| -> (Event, Vec<Event>) {
             let recent = (0..2000u64)
-                .map(|i| file_open(700, me, path, 1, from + i))
+                .map(|i| file_open(700, me, &format!("{path}.{i}"), 1, from + i))
                 .collect();
             (file_open(700, me, path, 1, from + 2000), recent)
         };
@@ -3463,7 +3924,7 @@ mod tests {
         let _ = det.detect(&spawn_with_exe_by(0, 300, 200, "/usr/bin/apt", 3), &[]);
 
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
-            .map(|i| file_open(300, 0, "/var/lib/apt/lists/x", 1, i + 10))
+            .map(|i| file_open(300, 0, &format!("/var/lib/apt/lists/x.{i}"), 1, i + 10))
             .collect();
         let focal = file_open(
             300,
@@ -3489,7 +3950,7 @@ mod tests {
             let _ = det.detect(&spawn_with_exe(i, i + 1, "/bin/cat", i as u64), &[]);
         }
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
-            .map(|i| file_open(1, 1000, "/home/u/x", 1, i + 100))
+            .map(|i| file_open(1, 1000, &format!("/home/u/x.{i}"), 1, i + 100))
             .collect();
         let focal = file_open(1, 1000, "/home/u/x", 1, MASS_WRITE_MIN as u64 + 101);
         let hits = det.detect(&focal, &recent);
@@ -3747,7 +4208,7 @@ mod tests {
     /// test can pick its directory.
     fn write_burst_to(pid: u32, path: &str) -> (Event, Vec<Event>) {
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
-            .map(|i| file_open(pid, 0, path, 1, i + 1))
+            .map(|i| file_open(pid, 0, &format!("{path}.{i}"), 1, i + 1))
             .collect();
         let focal = file_open(pid, 0, path, 1, MASS_WRITE_MIN as u64 + 1);
         (focal, recent)

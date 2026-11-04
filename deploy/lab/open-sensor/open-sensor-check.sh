@@ -141,14 +141,69 @@ else
 fi
 aws_fixture_restore || bad "~/.aws not put back as found (see above)"
 
-# 3. mass write: 25 write-opens counted in the kernel, one event
+# 3. mass write: 25 files created by one process, counted in the kernel,
+# one event (lot 282: the files created, apart from the rewrites)
 mark=$(date '+%Y-%m-%d %H:%M:%S')
 d=$(mktemp -d /var/tmp/nn-open-mw.XXXXXX)
 for i in $(seq 1 25); do : > "$d/f$i"; done
 sleep 3; rm -rf "$d"
-mw=$(journal "$mark" | grep -c "mass write: write-open threshold crossed")
-[[ $mw -eq 1 ]] && pass "one MassWrite event for 25 write-opens (kernel count)" \
-               || bad "$mw MassWrite events for 25 write-opens (expected 1)"
+mw=$(journal "$mark" | grep -c "mass write: files created crossed the threshold")
+[[ $mw -eq 1 ]] && pass "one MassWrite event for 25 files created (kernel count)" \
+               || bad "$mw MassWrite events for 25 files created (expected 1)"
+# 3b. lot 282 (Tappa Prove P0): what the kernel counts is what ransomware
+# does to existing files. One process (this shell: its own redirections, or
+# one python3) each time; files of 8 KiB, over the 4 KiB floor.
+d=$(mktemp -d /var/tmp/nn-open-282.XXXXXX)
+for i in $(seq 1 25); do head -c 8192 /dev/zero > "$d/e$i"; done
+sleep 61   # the creations above in a window of their own
+crossed() { journal "$1" | grep -c "$2"; }
+#   one existing file rewritten 40 times (a database): no crossing at all
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+for i in $(seq 1 40); do : 1<> "$d/e1"; done
+sleep 3
+n=$(crossed "$mark" "mass write: ")
+[[ $n -eq 0 ]] && pass "one existing file rewritten 40 times: no mass-write event (each file once per window)" \
+              || bad "one existing file rewritten 40 times: $n mass-write events (expected 0)"
+sleep 58
+#   25 distinct existing files rewritten in place: one overwrite crossing
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+for i in $(seq 1 25); do : 1<> "$d/e$i"; done
+sleep 3
+n=$(crossed "$mark" "mass write: distinct existing files rewritten crossed")
+[[ $n -eq 1 ]] && pass "25 distinct existing files rewritten: one overwrite event" \
+              || bad "25 distinct existing files rewritten: $n overwrite events (expected 1)"
+#   one name created and deleted 30 times (a journal): no burst; 25
+#   originals replaced by a rename onto their names: one burst of originals
+#   destroyed (and one of files created)
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+python3 -I -c '
+import os, sys
+d = sys.argv[1]
+for i in range(30):
+    with open(os.path.join(d, "db-journal"), "wb") as f:
+        f.write(b"j" * 8192)
+    os.unlink(os.path.join(d, "db-journal"))
+' "$d"
+sleep 3
+n=$(crossed "$mark" "file burst: rename or destroyed-originals threshold crossed")
+[[ $n -eq 0 ]] && pass "one name deleted 30 times: no burst of originals destroyed (each name once per window)" \
+              || bad "one name deleted 30 times: $n bursts (expected 0)"
+sleep 58
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+python3 -I -c '
+import os, sys
+d = sys.argv[1]
+for i in range(1, 26):
+    t = os.path.join(d, ".e%d.tmp" % i)
+    with open(t, "wb") as f:
+        f.write(b"r" * 8192)
+    os.rename(t, os.path.join(d, "e%d" % i))
+' "$d"
+sleep 3
+n=$(journal "$mark" | grep "file burst: rename or destroyed-originals threshold crossed" | grep -c 'kind="\?unlink')
+[[ $n -eq 1 ]] && pass "25 originals replaced by a rename onto their names: one burst of originals destroyed" \
+              || bad "25 originals replaced by a rename: $n bursts of originals destroyed (expected 1)"
+rm -rf "$d"
 
 # 4. persistence: a root write under /etc/cron.d from a shell (not a package
 # manager) raises PersistenceMechanism from the OBSERVING posture

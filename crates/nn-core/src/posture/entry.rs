@@ -152,6 +152,24 @@ impl CombatCause {
         }
     }
 
+    /// Lot 282 (Tappa Prove P0): COMBAT rests on ONE heuristic arm — a
+    /// trigger that needs corroboration, with no signal of another kind of
+    /// evidence vouching for it (none at all, or only repeats of itself:
+    /// the sustained knob). The ladder never kills or quarantines on such a
+    /// cause (POSTURE_FSM_V2 §3, principle 2: multi-signal, not one count
+    /// past a threshold). The posture reaches COMBAT on a heuristic only
+    /// with a signal of another class in the actor's scope, so this is the
+    /// ladder's own check of that rule, at the point of the kill.
+    pub fn single_heuristic_arm(&self) -> bool {
+        match self {
+            CombatCause::Trigger(t) => {
+                t.confidence == Confidence::NeedsCorroboration
+                    && !t.corroborated_by.iter().any(|(_, class)| *class != t.class)
+            }
+            CombatCause::AdminForce { .. } | CombatCause::DebugForce => false,
+        }
+    }
+
     /// One line, for a row's reason and the journal.
     pub fn summary(&self) -> String {
         match self {
@@ -165,6 +183,16 @@ impl CombatCause {
                 );
                 if let Some(pid) = t.event_pid {
                     s.push_str(&format!(" of pid {pid}"));
+                }
+                // Lot 282: what vouched for a heuristic, in the journal
+                // line too (the signed row always carried it).
+                if !t.corroborated_by.is_empty() {
+                    let by: Vec<String> = t
+                        .corroborated_by
+                        .iter()
+                        .map(|(x, c)| format!("{} ({c:?})", x.as_str()))
+                        .collect();
+                    s.push_str(&format!(", corroborated by {}", by.join(", ")));
                 }
                 s
             }

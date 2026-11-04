@@ -17,7 +17,10 @@
 //! - the leaf name, read only when the class says leaves matter;
 //! - write-opens counted per tgid ([`OPEN_WRITES`]), and the rewrites of
 //!   existing files also per cgroup ([`OPEN_CG_WRITES`]), in the global
-//!   function [`nn_open_count_write`].
+//!   function [`nn_open_count_write`]. Lot 282: a file rewritten counts
+//!   once per window ([`OPEN_OVERWRITE_SEEN`]), files created are counted
+//!   apart, and the originals destroyed (unlinked, or replaced by a rename
+//!   onto their name) count once per name ([`OPEN_DESTROY_SEEN`]).
 //!
 //! [`DIR_CLASS_GEN`] invalidates the cache: directory renames
 //! (`fim_rename_observe`) and rule changes by userland bump it; `rmdir`
@@ -43,9 +46,10 @@ use northnarrow_common::wire::open_sensor::{
         FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE, LEAF_CRED, LEAVES_CRED, SUBTREE,
         TREE_CARVEOUT, TREE_CRED, TREE_CRITICAL, TREE_HOME, TREE_PERSIST, TREE_RUNTIME,
     },
-    cgroup_step, kdbx_suffix, name_ext, open_reason, rename_shape_with, rename_step, unlink_step,
-    write_step, ChildRuleKey, DirClass, NameParts, OpenCgKey, OpenCgWindow, OpenRecordRaw,
-    OpenWriteWindow, RenameNames, RenameWindow, UnlinkWindow, CHILD_RULES_MAX, NAME_HEAD_LEN,
+    cgroup_step, first_in_window, kdbx_suffix, name_ext, open_reason, rename_shape_with,
+    rename_step, unlink_step, write_step, ChildRuleKey, DestroySeenKey, DirClass, NameParts,
+    OpenCgKey, OpenCgWindow, OpenRecordRaw, OpenWriteWindow, OverwriteSeenKey, RenameNames,
+    RenameWindow, UnlinkWindow, CHILD_RULES_MAX, NAME_HEAD_LEN,
     NAME_TAIL_LEN, OPEN_CLASSIFY_DEPTH, OPEN_NAME_LEN, OPEN_NAME_RULES_MAX, OPEN_PATH_SLOTS,
     OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX, OPEN_SENSOR_ARMED, RENAME_APPENDED, RENAME_OTHER,
     RUNTIME_UIDS_MAX, UNLINK_MIN_BYTES,
@@ -133,6 +137,17 @@ static OPEN_WRITES: LruHashMap<u32, OpenWriteWindow> = LruHashMap::with_max_entr
 /// forks a fresh worker every few files stays under the per-tgid one).
 #[map]
 static OPEN_CG_WRITES: LruHashMap<OpenCgKey, OpenCgWindow> = LruHashMap::with_max_entries(1024, 0);
+/// Lot 282: the files each tgid rewrote in its current write window (the
+/// value: that window's start). A file's later opens in the window are
+/// plain write-opens, not rewrites of another file: one database rewritten
+/// 259 times was a mass overwrite. An evicted entry counts its file again.
+#[map]
+static OPEN_OVERWRITE_SEEN: LruHashMap<OverwriteSeenKey, u64> = LruHashMap::with_max_entries(16384, 0);
+/// Lot 282: the originals each tgid destroyed in its current unlink window,
+/// by name (the value: that window's start). A name destroyed again (a
+/// journal at every commit, a lock file) is one original.
+#[map]
+static OPEN_DESTROY_SEEN: LruHashMap<DestroySeenKey, u64> = LruHashMap::with_max_entries(16384, 0);
 /// Review 75: the last read-only report per (task, inode)
 /// ([`crate::read_repeat`]).
 #[map]
@@ -437,7 +452,8 @@ unsafe fn loginuid() -> u32 {
 /// runtime directory's owner in the high half), `dentry` the opened file's
 /// dentry, `dev_over` its device with the overwrite flag in bit 63
 /// (`overwrite`: no `FMODE_CREATED`, at least [`OVERWRITE_MIN_BYTES`];
-/// external audit POS-002), `ino` its inode number, `flags_mode` its
+/// external audit POS-002) and the creation flag in bit 62 (lot 282:
+/// `FMODE_CREATED`), `ino` its inode number, `flags_mode` its
 /// `f_flags` and, in the high half, its `f_mode`. When a window crosses
 /// its threshold ([`count_write`]) the record is emitted here — `reason`
 /// the mass-write bits, `count` the window's — unless the writer is the
@@ -453,13 +469,19 @@ unsafe fn loginuid() -> u32 {
 #[inline(never)]
 pub extern "C" fn nn_open_count_write(cls: u64, dentry: u64, dev_over: u64, ino: u64, flags_mode: u64) -> u64 {
     unsafe {
-        let r = count_write(cls as u32, (cls >> 32) as u32, dev_over >> 63 != 0);
+        let key = InodeKey {
+            dev: dev_over & !(3u64 << 62),
+            ino,
+        };
+        let r = count_write(
+            cls as u32,
+            (cls >> 32) as u32,
+            dev_over >> 63 != 0,
+            (dev_over >> 62) & 1 != 0,
+            &key,
+        );
         let reason = r as u32;
         if reason != 0 && !crate::fim_watch::caller_is_in_family() {
-            let key = InodeKey {
-                dev: dev_over & !(1u64 << 63),
-                ino,
-            };
             emit(
                 reason,
                 &key,
@@ -478,9 +500,12 @@ pub extern "C" fn nn_open_count_write(cls: u64, dentry: u64, dev_over: u64, ino:
 /// low half — `MASS_WRITE` / `MASS_OVERWRITE` when the tgid's window
 /// crosses the threshold, `MASS_OVERWRITE_CGROUP` when its cgroup's does,
 /// each once per window — and the count in the high half (the cgroup's
-/// overwrites when that window crossed, else the tgid's write-opens).
+/// overwrites when that window crossed, else the tgid's: the files it
+/// rewrote, or created). Lot 282: `overwrite` counts only for the file's
+/// first rewrite of the window ([`OPEN_OVERWRITE_SEEN`]); `created`: the
+/// open created its file.
 #[inline(always)]
-unsafe fn count_write(cls_bits: u32, cls_uid: u32, overwrite: bool) -> u64 {
+unsafe fn count_write(cls_bits: u32, cls_uid: u32, overwrite: bool, created: bool, key: &InodeKey) -> u64 {
     if cls_bits & TREE_CARVEOUT != 0 {
         return 0;
     }
@@ -489,10 +514,28 @@ unsafe fn count_write(cls_bits: u32, cls_uid: u32, overwrite: bool) -> u64 {
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let now = bpf_ktime_get_ns();
+    let mut overwrite = overwrite;
+    if overwrite {
+        let start = match OPEN_WRITES.get(&tgid) {
+            Some(w) => w.start_for(now),
+            None => now,
+        };
+        let seen = OverwriteSeenKey {
+            tgid,
+            _pad: 0,
+            dev: key.dev,
+            ino: key.ino,
+        };
+        if first_in_window(OPEN_OVERWRITE_SEEN.get(&seen).copied(), start) {
+            let _ = OPEN_OVERWRITE_SEEN.insert(&seen, &start, 0);
+        } else {
+            overwrite = false;
+        }
+    }
     let (mut reason, mut count, cg_add) = match OPEN_WRITES.get_ptr_mut(&tgid) {
-        Some(w) => write_step(&mut *w, overwrite, now),
+        Some(w) => write_step(&mut *w, overwrite, created, now),
         None => {
-            let _ = OPEN_WRITES.insert(&tgid, &OpenWriteWindow::fresh(now, overwrite), 0);
+            let _ = OPEN_WRITES.insert(&tgid, &OpenWriteWindow::fresh(now, overwrite, created), 0);
             (0, 0, 0)
         }
     };
@@ -750,11 +793,12 @@ unsafe fn observe(
     // so states stop merging. The second took `fim_file_open_sensor` past
     // the million instructions.
     if write && regular {
-        let over = mode & FMODE_CREATED == 0 && size >= OVERWRITE_MIN_BYTES;
+        let created = mode & FMODE_CREATED != 0;
+        let over = !created && size >= OVERWRITE_MIN_BYTES;
         let _ = nn_open_count_write(
             u64::from(cls.bits) | (u64::from(cls.uid) << 32),
             dentry as u64,
-            key.dev | (u64::from(over) << 63),
+            key.dev | (u64::from(over) << 63) | (u64::from(created) << 62),
             key.ino,
             u64::from(flags) | (u64::from(mode) << 32),
         );
@@ -1107,6 +1151,13 @@ pub extern "C" fn nn_rename_shape() -> u64 {
 /// [`open_reason::MASS_UNLINK`] once per window. Ransomware that writes an
 /// encrypted copy deletes the original. The agent's own unlinks do not
 /// count. A global BPF function, as [`nn_rename_burst`].
+///
+/// Lot 282: an original destroyed. Also from `inode_rename`
+/// (`fim_watch::fim_rename_observe`) with the rename's NEW dentry: a rename
+/// onto the name of an existing regular file destroys that file (a
+/// negative dentry, a name that did not exist, counts nothing). Each name
+/// once per window ([`OPEN_DESTROY_SEEN`]: the parent dentry and the
+/// name's hash); a name whose hash cannot be read counts every time.
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn nn_unlink_burst(dentry: u64) -> u64 {
@@ -1132,6 +1183,25 @@ unsafe fn unlink_burst(dentry: *const u8) {
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let now = bpf_ktime_get_ns();
+    let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
+    let hash_len =
+        bpf_probe_read_kernel::<u64>(dentry.add(off!(DENTRY_D_NAME_OFFSET)) as *const u64).unwrap_or(0);
+    if !parent.is_null() && hash_len != 0 {
+        let start = match OPEN_UNLINKS.get(&tgid) {
+            Some(w) => w.start_for(now),
+            None => now,
+        };
+        let seen = DestroySeenKey {
+            tgid,
+            _pad: 0,
+            parent: parent as u64,
+            hash_len,
+        };
+        if !first_in_window(OPEN_DESTROY_SEEN.get(&seen).copied(), start) {
+            return;
+        }
+        let _ = OPEN_DESTROY_SEEN.insert(&seen, &start, 0);
+    }
     let count = match OPEN_UNLINKS.get_ptr_mut(&tgid) {
         Some(w) => unlink_step(&mut *w, now),
         None => {

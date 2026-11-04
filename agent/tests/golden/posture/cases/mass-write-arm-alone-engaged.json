@@ -1,0 +1,16 @@
+{
+  "about": "Lot 282 (Tappa Prove P0): the mass-write arm of ConfirmedIntrusion on its own, every shape of it, never reaches COMBAT nor the ladder. An unpackaged worker of a service (no login session, scoped by its unit) rewrites twenty distinct existing files in place (the kernel's overwrite crossing, each file once): ConfirmedIntrusion, file-system evidence, ENGAGED. A window later it rewrites twenty more, then creates twenty files and destroys twenty originals (the replacement shape), and its cgroup's workers cross the cgroup window: the arm again each time, and the ransomware tracker's shapes of the same actor (RansomwareEncryption, file-system evidence too, held behind the policy) — no signal of another kind of evidence in the unit's scope vouches for any of them: ENGAGED still, the ladder never engaged, nothing killed.",
+  "path": ["ENGAGED"],
+  "start_ns": 100000000000,
+  "procs": [
+    {"pid": 7100001, "ppid": 1, "start_ns": 50000000000, "uid": 998, "comm": "worker", "exe": "/srv/app/worker", "argv": ["/srv/app/worker"], "cgroup": "/system.slice/app.service"}
+  ],
+  "items": [
+    {"event": {"MassWrite": {"pid": 7100001, "uid": 998, "comm": "worker", "count": 20, "filename": "/srv/data/reports/q1.docx", "timestamp_ns": 120000000000, "overwrites": true, "cgroup_window": false}}},
+    {"event": {"MassWrite": {"pid": 7100001, "uid": 998, "comm": "worker", "count": 20, "filename": "/srv/data/reports/q2.docx", "timestamp_ns": 181000000000, "overwrites": true, "cgroup_window": false}}},
+    {"event": {"MassWrite": {"pid": 7100001, "uid": 998, "comm": "worker", "count": 20, "filename": "/srv/data/reports/q3.docx.enc", "timestamp_ns": 182000000000, "overwrites": false, "cgroup_window": false}}},
+    {"event": {"FileBurst": {"pid": 7100001, "uid": 998, "comm": "worker", "kind": "Unlink", "count": 20, "appended": 0, "sources": 0, "filename": "/srv/data/reports/q3.docx", "timestamp_ns": 183000000000}}},
+    {"event": {"MassWrite": {"pid": 7100001, "uid": 998, "comm": "worker", "count": 40, "filename": "/srv/data/reports/q4.docx", "timestamp_ns": 250000000000, "overwrites": true, "cgroup_window": true}}},
+    {"wait": {"secs": 60}}
+  ]
+}

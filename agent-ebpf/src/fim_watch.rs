@@ -651,6 +651,10 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
             emit_drift_with_dest(FIM_OP_RENAMED, key, NO_DEST, FIM_RENAME_REPLACED);
         }
     }
+    // Lot 282: a rename onto the name of an existing regular file destroys
+    // that file — an original replaced, counted as its unlink is (a name
+    // that did not exist has a negative dentry, and counts nothing).
+    let _ = crate::open_sensor::nn_unlink_burst(crate::open_sensor::raw_arg(ctx, 3));
     // Lab PR 225: every rename counts toward its process's burst of
     // renames to a new extension, wherever the file is.
     let _ = crate::open_sensor::nn_rename_burst(

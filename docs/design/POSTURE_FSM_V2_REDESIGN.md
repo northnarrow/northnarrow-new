@@ -1,6 +1,9 @@
 # POSTURE_FSM_V2 — Gradient Multi-Signal Posture + Fleet-Level Architecture
 
-**Status:** Design document. NOT implemented. No code changes accompany this doc.
+**Status:** Design document. NOT implemented as a whole; lot 282 (Tappa Prove P0,
+04/11/2026) implemented the parts §10 describes — the mass-write arm's measure (§5.1),
+the anti-tamper refusals of package transactions, and no kill on one heuristic arm
+(Principle 2).
 **Owner:** Phase B redesign track. Implementation scoped across beta → V1.0 → V2.0.
 **Cross-refs:** `BUG-014`, `BUG-017`, `BUG-018` (see `docs/backlog/BUG_CATALOG_DESIGN.md` once
 written); `Tappa 14.3` cloud-broker design (separate doc, pending).
@@ -63,7 +66,8 @@ Detection (`agent/src/posture/triggers.rs`):
      starts with `/tmp/` or `/dev/shm/`.
   3. Mass-write: ≥ `MASS_WRITE_MIN = 20` FileOpen-with-write-flag events
      from the same PID inside a `MASS_WRITE_WINDOW_NS = 60 s` window
-     (lines 50-51).
+     (lines 50-51). (Lot 282: distinct existing files destroyed or
+     replaced, not writes — §10.1.)
 - The mass-write arm is gated by:
   - `ExemptPids::is_exempt` (the agent's own PID + verified watchdog PID)
   - `AuthSessionTracker::is_auth_mediated` (parent-chain walk hitting
@@ -691,6 +695,126 @@ compatible additive change.
 - §8.1 proposes one full release of V1-V2 dual-arbiter for empirical
   comparison. Could be shorter (one minor release) or longer (two
   releases) depending on confidence in the multi-signal calibration.
+
+---
+
+## 10. Implemented in lot 282 (Tappa Prove P0, 04/11/2026)
+
+The lab of lot 279 (Ubuntu 22.04) found the ladder killing podman at a host's
+first `podman pull`, and lot 282's measurement on `main` (same guest) gave the
+chain, signed: `sudo podman run` (first pull) → podman's CNI firewall plugin
+ran `iptables -t nat -F <its own chain>` → NN-L-EVA-002 recorded "`iptables
+-F`" → `DefenseImpairment` (ENGAGED, execution evidence) in the
+administrator's login scope → podman opened `bolt_state.db` 261 times in a
+minute → the mass-write arm's overwrite crossing → `ConfirmedIntrusion`
+(file-system evidence, root's write: privileged), corroborated by the
+`DefenseImpairment` → COMBAT, locked → INVESTIGATE → jump-ahead (podman forks)
+→ NEUTRALIZE killed podman's tree. On the same `main`, `apt purge podman`
+reached locked COMBAT from an anti-tamper refusal of `deb-systemd-helper`
+(its `rmdir` of a protected directory), and the ladder killed it. Three
+changes, and one false positive of NN-L-EVA-002 fixed on the way.
+
+### 10.1 The mass-write arm measures what ransomware does to existing files
+
+Ransomware rewrites or replaces many EXISTING files of a user; image, package
+and build tools create many NEW files, and databases rewrite THE SAME file.
+The arm counts distinct pre-existing files destroyed or replaced, never
+writes. In the kernel (the file-open sensor on LSM `file_open`,
+`inode_unlink`, `inode_rename`; `common/src/wire/open_sensor.rs`):
+
+| counter | counts | once per |
+|---|---|---|
+| rewrites (`MASS_OVERWRITE`) | write-opens of an existing regular file of 4 KiB or more (no `FMODE_CREATED`) | file (`OPEN_OVERWRITE_SEEN`: tgid, device, inode) per 60-s window |
+| files created (`MASS_WRITE`) | write-opens that created their file (`FMODE_CREATED`) | open |
+| originals destroyed (`MASS_UNLINK`) | an unlink of a regular file of 4 KiB or more, or a rename onto the name of one (the target is destroyed) | name (`OPEN_DESTROY_SEEN`: tgid, parent dentry, the name's `hash_len`) per window |
+
+A repeat (the same file reopened, the same name destroyed again) is not
+counted; an entry the LRU maps evicted counts again (more, never fewer). The
+cgroup window (external audit EBPF-011) adds the processes' distinct rewrites.
+The arm (`crates/nn-core/src/posture/triggers.rs`, `confirmed_intrusion`)
+raises `ConfirmedIntrusion` on:
+
+1. **rewrites** — at least 20 distinct existing files rewritten in place by
+   one process in 60 s, or 40 by one cgroup's processes (each with three or
+   more): `MassWrite { overwrites: true }`. Inside an authenticated session
+   too (external audit POS-002: encryption in place run from a shell).
+2. **replacement** — at least 20 distinct originals destroyed by a process
+   that also created at least 20 files, the two crossings within a window of
+   each other, in either order (`FileBurst { kind: Unlink }` and
+   `MassWrite { overwrites: false }`): the encrypted copy written and the
+   original deleted, or the copy renamed onto it. Outside an authenticated
+   session (a session's new files never counted, and a checkout or an
+   archive extracted over a tree from a shell is this shape).
+
+and never on files created alone (an image pulled, a clone, an archive
+extracted, a build, a cache filled), one file rewritten again and again (a
+database, a state file), or originals deleted alone (`rm -rf`, a purge, a
+cache sweep). In tracepoint mode (no LSM sensor; every open reaches userland
+and whether its file existed is unknown) the arm counts the distinct files a
+process opened to write; an open that must create its file (`O_CREAT |
+O_EXCL`) never counts, and inside a session no open that may create one does.
+Every shape is file-system evidence (`triggers::evidence_class`): no shape of
+the arm corroborates another, nor the ransomware tracker's
+`RansomwareEncryption` (file-system evidence too).
+
+The firing set is a subset of the old one in kernel mode: a rewrite crossing
+now needs 20 distinct files where it needed 20 opens, and a replacement
+needs the creation crossing that alone used to fire. The ransomware
+simulation's shapes still fire it (in place: 300 distinct files rewritten;
+copy-delete: 300 originals destroyed beside 300 new files).
+
+The writers the arm exempts are kept, each for the shape that still counts
+it (and an exempt crossing is now recorded at INFO with the exemption that
+answered): a package transaction (it replaces the files it upgrades), the
+man-db cache rebuild as a system account (it replaces each locale's
+`index.db` by a rename), npm's CLI (`npm ci` deletes `node_modules` and
+extracts it again) and a user's package manager in that user's container
+storage. None is by name or path alone.
+
+The kernel counters feed the ransomware tracker too (`crates/nn-core/src/impact`):
+its (a) rewrites are distinct files, its (d) "deletion of originals after
+writing new files" now reads files created (not every write-open) and counts
+a rename onto an original as its deletion.
+
+### 10.2 An anti-tamper refusal of a package transaction never corroborates
+
+A refusal is signed (NN-L-AT-001) and the kernel already blocked it. When the
+refused process belongs to a package transaction — a package manager proper
+(`PACKAGE_MANAGER_EXES`: dpkg, apt, rpm, dnf, …) executed by root whose run
+covers the refusal, judged as R009 and the FIM rules judge it
+(`AuthSessionTracker::in_package_transaction`) — it raises
+`PackageTamperRefusal`: ALERTED, kernel evidence, never written to the
+corroboration ledger (an ALERTED-tier trigger never is), never decisive,
+never locking. A refusal of any other process keeps today's weight
+(`AntiTamperDenial`: decisive, COMBAT locked; PID 1's relayed signal stays
+`RelayedTamperAttempt`). Residual: a malicious package's maintainer script
+run by root through dpkg is refused (the kernel blocks it, the record is
+signed) but no longer brings COMBAT by itself.
+
+### 10.3 COMBAT never kills on one heuristic arm
+
+Principle 2 at the point of the kill: the ladder's NEUTRALIZE does not kill,
+quarantine or isolate when the episode's cause is a heuristic
+(`Confidence::NeedsCorroboration`) that no signal of another kind of evidence
+vouches for (`CombatCause::single_heuristic_arm`: nothing, or only repeats of
+its own kind — the sustained knob). It signs a `combat_stage` row "NEUTRALIZE
+held … one heuristic arm …" and does not escalate to ISOLATE (the offenders
+were spared by choice, not found uncontainable). The posture already reaches
+COMBAT on a heuristic only with a signal of another class in the actor's
+scope (BUG-032, POS-001), so the hold is the ladder's own check of that rule:
+the mass-write arm alone, however often and in whatever shape, stops at
+ENGAGED and never reaches the ladder (golden case
+`mass-write-arm-alone-engaged`). Open: corroboration is per actor scope (a
+login session, a workload), not per process tree — a signal of one process
+of a session vouches for another process of the same session, as the lab's
+`iptables` vouched for podman.
+
+### 10.4 NN-L-EVA-002: a flush of one chain switches nothing off
+
+`iptables -F <user-defined chain>` (and `--flush`) flushes that chain only:
+it is no longer "`iptables -F`" (the corroborator of the lab's COMBAT).
+`iptables -F` alone, followed by another option, or of a built-in chain
+(`INPUT`, `OUTPUT`, `FORWARD`, `PREROUTING`, `POSTROUTING`) still is.
 
 ---
 

@@ -213,6 +213,37 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
   window before it executes anything from its tree; a refused run executes
   nothing from it.
 
+- **The mass-write signal counts files destroyed, not writes; a package
+  transaction's refusal no longer brings COMBAT; no kill on one heuristic
+  (lot 282).** What you see change
+  ([POSTURE_FSM_V2_REDESIGN.md](../design/POSTURE_FSM_V2_REDESIGN.md) §10):
+  - fewer `ConfirmedIntrusion` transitions: image pulls, package and build
+    tools, clones and databases no longer raise it (an image pull on a
+    fresh host reached COMBAT, and the ladder killed podman);
+  - the kernel's mass-write events count differently. `MassWrite` with
+    `overwrites: true` carries in `count` the distinct existing files
+    rewritten (it carried every write-open); with `overwrites: false` it is
+    the files created (it was every write-open, the same file's included);
+    a `FileBurst` of kind `unlink` counts each original once per name and
+    window, a rename onto an existing file of 4 KiB or more included. The
+    agent's journal lines say so: `mass write: distinct existing files
+    rewritten crossed the threshold`, `mass write: files created crossed the
+    threshold`, `file burst: rename or destroyed-originals threshold
+    crossed` (were `mass write: write-open threshold crossed` and `file
+    burst: rename or unlink threshold crossed`); an exempt writer's crossing
+    is an INFO line naming the exemption;
+  - a new posture trigger, `PackageTamperRefusal` (ALERTED), in the
+    journal's `POSTURE TRANSITION` lines, for an anti-tamper refusal of a
+    package transaction's process (it was `AntiTamperDenial`, COMBAT);
+    the refusal's NN-L-AT-001 record is unchanged;
+  - a COMBAT whose cause is one heuristic signal with nothing of another
+    kind vouching for it signs a `combat_stage` row "NEUTRALIZE held" and
+    kills nothing; the journal line of a COMBAT entry now names the signals
+    that corroborated it;
+  - NN-L-EVA-002 is no longer recorded for `iptables -F <chain>` of a
+    user-defined chain.
+  The signed rows written before the upgrade keep their bytes and verify.
+
 ## 4. Build and development (source builds only)
 
 - `cargo xtask ade-demo` and `cargo xtask rag-kb` are gone, so are the

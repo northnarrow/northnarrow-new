@@ -92,6 +92,30 @@ kills of the same exec are held by the legacy ceiling (R009's record is the
 first match), in COMBAT too. That was so for the session and the package
 transaction before lot 278.
 
+**What brings COMBAT, and what the ladder kills (lot 282).** COMBAT is
+where the kills above wait, and where the ladder's NEUTRALIZE kills the
+offender's process tree; on `main` before lot 282 a host's first `podman
+pull` and an `apt purge` reached it. Since lot 282
+([POSTURE_FSM_V2_REDESIGN.md](../design/POSTURE_FSM_V2_REDESIGN.md) §10):
+- the posture's mass-write signal counts distinct existing files rewritten
+  in place, or destroyed (unlinked, or replaced by a rename) by a process
+  that also created files — never files created alone (an image pulled, a
+  clone, an archive extracted, a build), one file rewritten again and again
+  (a database) or files deleted alone (`rm -rf`, a purge);
+- an anti-tamper refusal of a package transaction's process (a package
+  manager root executed, whose run covers it, as R009 judges it) raises
+  ALERTED (`PackageTamperRefusal`) and never vouches for COMBAT; a refusal of
+  any other process still brings COMBAT on its own;
+- the ladder never kills on one heuristic signal: a COMBAT whose cause is a
+  heuristic with no signal of another kind vouching for it holds its
+  NEUTRALIZE (a signed `combat_stage` row, "NEUTRALIZE held"), and does not
+  isolate for it;
+- NN-L-EVA-002 no longer reads `iptables -F <chain>` of a user-defined chain
+  (podman's network setup) as the firewall switched off.
+
+None of this is a policy directive: the per-rule policy does not change it,
+and no `enforce` brings the old behaviour back.
+
 Every other rule whose response can be a kill, and why it may kill in
 OBSERVING, is listed in `crates/nn-core/src/decision/posture_floor.rs`
 (`OBSERVING_KILLS`): the kills that existed before Wave 4, kept as they were
