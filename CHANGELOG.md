@@ -1838,9 +1838,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   on it shares (the fingerprint alone finds 6.82 % of malware, 88.68 % with
   the destination: Anderson & McGrew). The signed per-rule policy refuses
   `enforce NN-L-NET-003` until the rule has a second predicate (a
-  destination or an executable): the line refuses the file, and a signed
-  policy that held it is refused at the start, a signed `rule_policy`
-  degradation, the built-in defaults in force. Out of the V2 Critical
+  destination or an executable): the line refuses a file to be signed
+  (`config overlay set`); in a policy signed before, the start takes only
+  that line as `alert`, the rest of the policy in force, and signs a
+  `rule_policy` degradation naming it ("enforce refused, applied as
+  alert"). Out of the V2 Critical
   sub-gate (registry version 4, 29 rows). The shipped
   `netflow-ja3-blocklist.v1` says so (its earlier text is replaced at
   install, as every earlier shipped list).

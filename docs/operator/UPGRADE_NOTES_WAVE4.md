@@ -34,6 +34,11 @@ has the details of each change below.
    directory exited 1), and every refusal is a signed `agent_boot` row: a
    monitor that matched exit status 1 sees 78 (§6). A broken audit chain
    now refuses the start before anything is loaded.
+7. A signed `rule-policy.local` with `enforce NN-L-NET-003`: from lot 275
+   that line is taken as `alert` at the start, the rest of your policy in
+   force, and the start signs a `rule_policy` degradation naming it (§7).
+   Re-sign the policy without it (`alert NN-L-NET-003`) when convenient:
+   `nn-admin config overlay set` refuses a file that keeps it.
 
 ## 1. The on-host LLM advisor is removed (lab PR 214)
 
@@ -273,3 +278,32 @@ What an operator sees change:
   `/run/northnarrow/boot-refusals/`; it stays until a reboot or until this
   release starts again and records it. An older agent starts unaudited on
   a key that cannot be loaded, as it did.
+
+## 7. NN-L-NET-003: a TLS fingerprint is not an identity (lot 275)
+
+- **What changes.** The TLS ClientHello sensor of lot 275 produces the
+  first real fingerprints, so NN-L-NET-003 matches for the first time. A
+  JA3 — or, new, a JA4 — in `netflow-ja3-blocklist.{v1,local}` is a
+  **Medium** record with no response (`Log`), no longer a Critical
+  `KillProcessTree` with COMBAT: a fingerprint names a TLS library and its
+  settings, which every program on it shares (R6 of the external review
+  of 04/11; `NETWORK_TELEMETRY.md` §3). The list file keeps its name and
+  accepts JA4 entries next to JA3.
+- **A policy that enforced it.** `enforce NN-L-NET-003` is refused until the
+  rule has a second predicate (a destination or an executable). A signed
+  `rule-policy.local` that holds the line is **not** dropped at the start:
+  only that line is taken as `alert`, every other line stays in force, and
+  the start signs a `rule_policy` degradation — "line N: enforce
+  NN-L-NET-003_BadJa3 refused, applied as alert … — the rest of the policy
+  is in force" — which `nn-admin status --key` lists and `policy show`
+  names in the policy's source. `nn-admin config overlay set` refuses a
+  file with the line: replace it with `alert NN-L-NET-003` (or `audit`)
+  and re-sign.
+- **Monitoring.** A rule that matched NN-L-NET-003 as Critical, or its
+  `net_critical` category, sees `Medium` and `net_medium`; it is out of the
+  V2 Critical sub-gate.
+- **Rollback.** An agent from before this release reads the same policy
+  file as before (the line was valid there) and the list's JA3 entries; it
+  skips the JA4 entries at its start (a line it cannot parse, a WARN each)
+  and its `config overlay set` refuses an overlay that has one.
+

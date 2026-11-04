@@ -60,11 +60,14 @@ programs share, until the rule has a second predicate (a destination, an
 executable) to act on: today NN-L-NET-003, a TLS fingerprint (JA3 or JA4)
 in the operator's list (lot 275, R6 of the external review of 04/11; a
 fingerprint names a TLS stack, not a program — `NETWORK_TELEMETRY.md` §3).
-The line refuses the file like any bad line: `nn-admin config overlay set`
-refuses it, and a signed policy that held it before is refused at the
-agent's start, a signed `rule_policy` degradation naming the line, the
-built-in defaults in force. `alert`, `audit`, `off` and `exempt` of the
-rule are accepted.
+In a policy you sign, the line refuses the file like any bad line
+(`nn-admin config overlay set` and `policy-test` say so). In a policy
+signed before the upgrade, the agent's start takes only that line as
+`alert` and keeps the rest of the policy in force — its exemptions, its
+other modes, its switches — and signs a `rule_policy` degradation naming
+the line ("enforce refused, applied as alert"); `policy show` names it in
+the policy's source. `alert`, `audit`, `off` and `exempt` of the rule are
+accepted.
 
 An exemption is **never** by process name: `comm`, `name`, `process` and
 `argv` refuse the file (any user can name a process `sshd`). When the agent

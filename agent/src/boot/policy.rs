@@ -351,6 +351,15 @@ pub(crate) fn load(
             error!(detail = %detail, "per-rule policy unreadable — the built-in defaults apply");
             northnarrow_agent::boot::degradation::report("rule_policy", detail);
         }
+        // R6 (lot 275): an `enforce` the rule refuses, in a policy signed
+        // before, is taken as `alert`; the rest of the policy is in force.
+        if let Some(detail) = &boot.demoted {
+            error!(
+                detail = %detail,
+                "per-rule policy: enforce refused, applied as alert — the rest of the policy is in force"
+            );
+            northnarrow_agent::boot::degradation::report("rule_policy", detail);
+        }
         let policy = boot.policy;
         if !policy.is_builtin() {
             warn!(

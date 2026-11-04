@@ -1141,6 +1141,25 @@ mod tests {
         let b = boot(&gate5, &p5);
         assert!(b.policy.is_builtin());
         assert!(b.degraded.unwrap().contains("line 2"));
+        // R6 (lot 275): `enforce NN-L-NET-003`, signed before this release.
+        // `overlay set` refuses such a file whole; at the start only that
+        // line is taken as `alert`, every other line in force, and the
+        // start's degradation names it.
+        let held = "enforce NN-L-IMP-001\nexempt R020 uid 998\nenforce NN-L-NET-003\n";
+        let e = validate_content(OverlayKind::RulePolicy, held)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("line 3") && e.contains("refused"), "{e}");
+        let (dir6, key6, admin_pub6) = setup("config-manage");
+        let p6 = write_signed(dir6.path(), &key6, OverlayKind::RulePolicy, held, 100);
+        let gate6 = OverlayGate::new(&admin_pub6, AGENT, RollbackFloor::default());
+        let b = boot(&gate6, &p6);
+        assert_eq!(b.degraded, None);
+        assert_eq!(b.policy.mode(IMP), Some(Mode::Enforce));
+        assert_eq!(b.policy.exemptions("R020_ShellWithSocketStdio").len(), 1);
+        assert_eq!(b.policy.mode("NN-L-NET-003_BadJa3"), Some(Mode::Alert));
+        let d = b.demoted.expect("the degradation");
+        assert!(d.contains("line 3: enforce NN-L-NET-003_BadJa3 refused, applied as alert"), "{d}");
     }
 
     /// Lab PR 230 (D0 of the dependency plan): an overlay signed before the
