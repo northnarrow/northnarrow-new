@@ -6175,6 +6175,41 @@ number in parentheses is a lab PR.
       `.2` to `.4` removed at the sink's open, the worker's pid unchanged,
       the file sink up with no fault, no directory note since the phase's
       start; then off, `uninstall --purge`, the guest powered off clean.
+  - Third check of #499 (at 03edb5b1): one blocker, P1 — the PARTIAL of
+    the second review depended on the order of the input: in a whole
+    capture, the outcome's line moved before its intent's with the intent's
+    facts rewritten gave PARTIAL (3), not TAMPERED; P2 — a capture's head
+    cut before the intent made those facts arbitrary. The coordinator's
+    decision, done: an action outcome's record carries its intent's signed
+    row (`unmapped.northnarrow.intent_raw`, beside `intent_row`, its
+    place); `nn-admin export verify` maps each record on its own — that row
+    verified with the agent's key, checked to be this action's intent and
+    the row its place's hashes name, mapped first, then the outcome —, and
+    a row missing, bent, foreign or unsigned with the intent's facts in the
+    record is TAMPERED. PARTIAL and exit 3 are gone; an outcome the worker
+    mapped without its intent (restarted between them, the export started
+    after it) carries neither and is its row's mapping without one. The
+    intent's place (`file`, `line`, `end`) stays the record's word, as
+    every record's own place. Tests: the reviewer's (reordered and
+    rewritten 13; the head cut and rewritten 13), an outcome on its own in
+    every order (0), the attached row bent, another action's or run's,
+    misplaced, not a row, or gone (13), an outcome mapped without its
+    intent (0; given the intent's facts, 13). README's "No telemetry" line
+    is qualified by the signed export; EXPORT.md documents the allowance's
+    residual (N2). Mutations, run 8: 7 on the intent row and the
+    per-record check (the row never used, an unsigned one taken, another
+    run's or action's taken, the place's hash not checked, the verdict
+    never saying "rewritten", the worker carrying no row), 7 caught by
+    named tests.
+    - Lab, round 12 (2993bf5f), Debian 12, under lease k276: 10 steps,
+      the export's 27 checks all passed — on the COMBAT ladder's own
+      actions (the `protected` phase): the actions chain's records whole
+      OK (0); an outcome moved before its intent with its intent's facts
+      rewritten TAMPERED (13); the capture's head cut after the intent,
+      the records left OK on their own (0), the outcome rewritten among
+      them TAMPERED (13). An outcome's record: 2,117 bytes without its
+      intent's row, 2,687 with it (+570; the five of the run 2,589 to
+      2,687). Then off, `uninstall --purge`, the guest powered off clean.
   - Level: C21 0 → 1. A signed, verifiable export of the detections and
     the other chains to a file and a SIEM's syslog, off by default,
     measured on two kernels (one with the pin, one without); not 2: no

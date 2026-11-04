@@ -303,8 +303,11 @@ kept the frames) — and checks:
   is its row's mapping without an intent (class 7001, activity Unknown, no
   target). The intent's place (`file`, `line`, `end`) is the record's word,
   as every record's own place: the chain's links check places. The cost:
-  an outcome's record carries its intent's row once more — lot 276's lab,
-  @COST@;
+  an outcome's record carries its intent's row once more — lot 276's lab
+  (round 12, the COMBAT ladder's outcomes): 2,117 bytes without it, 2,687
+  with it (+570, the intent's row of 502 bytes as a JSON string), five
+  outcomes of 2,589 to 2,687 bytes; the intents' and every other record
+  unchanged;
 - **not covered by the signature**: `device.hostname` (the host's name),
   `device.uid` (the agent's id) and `metadata.product.version` (the agent's
   version) — no row carries them; `verify` maps the row again with them as
