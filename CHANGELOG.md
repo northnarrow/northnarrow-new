@@ -6,6 +6,83 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Exemptions by cgroup or unit hold only for processes started in their
+  cgroup, the kernel's host checks name the fixes the sandbox relies on,
+  and a worker enters its sandbox single-threaded (lot 277, Wave 4 phase 3,
+  wave 1).
+  - The per-rule policy's `exempt <rule> cgroup|unit` held for any member
+    of the cgroup: root wrote its own pid into an exempt service's
+    `cgroup.procs` and was exempt. Five eBPF programs (the start-in-cgroup
+    tracker) now mark a process moved into a cgroup by anyone but systemd's
+    placement (a move by PID 1, or a fresh child of PID 1 moving itself
+    before its exec), a child started by `clone3(CLONE_INTO_CGROUP)` by
+    anyone but PID 1, and every process either one forks after it. The mark
+    goes with the group's last thread. A marked process is not exempt by
+    cgroup or unit; uid and exe exemptions are unchanged. A move into a
+    cgroup an exemption names is a signed NN-L-AT-001 `cgroup_join` (Log,
+    High; not refused, no posture trigger). A kernel without the tracker's
+    targets refuses every such exemption, a signed `subsystem_degraded`;
+    `--btf-check` prints `tracker cgroup_join`. Two optional offsets
+    (`signal_struct.live`, `kernel_clone_args.flags`) take slots 118–119;
+    the enum, tracepoint and hook-argument slots after them move by two.
+    Residuals as `ANTITAMPER_TRUST_MODEL.md` lists them (a root that
+    rewrites the unit itself is still the unit).
+  - The review of #494 before the merge: a move is a no-op only when the
+    writing thread moves itself and its cgroup does not change (a thread
+    writing its leader into `cgroup.threads` was taken for no move); a
+    destination path that fills the 256-byte read is signed without a
+    name; a mark the kernel cannot keep makes that process tree not known
+    (a per-group bit in the pinned 512 KiB `CGROUP_JOIN_LOST`), never every
+    exemption on the host until a reboot; the marks' map is sized to
+    `kernel.pid_max` capped by `kernel.threads-max`, allocated as it fills;
+    a new process's pid starts with no mark a dead group left there; the
+    tracker's links are pinned like the other anti-tamper programs, so it
+    keeps marking while the agent is stopped; the policy refuses a `unit`
+    exemption naming the agent's containment scopes and applies none under
+    `/northnarrow.slice`; CVE-2022-30594's 5.4.189 and 4.19.238 are in the
+    table; a privileged behaviour test of the tracker
+    (`agent/tests/cgroup_join_privileged_e2e.rs`) and `exempt-check`'s
+    threaded case and 200 starts under load. The sensor contract lists the
+    tracker and the `cgroup_join` record.
+  - The re-review of #494: the "not known" state is a byte a tgid in a 4
+    MiB preallocated map, written with plain stores (the bit set with a
+    test and an atomic add could be added twice by a fork and a move on
+    two CPUs: the child exempt, the carry into the next tgid); the
+    tracker's maps and links are pinned in a directory of their own beside
+    the pin root (`/sys/fs/bpf/northnarrow-cgroup-join-v<schema>-<entries>`),
+    which `install.sh --upgrade` leaves — the marks outlive an upgrade —
+    and `uninstall.sh` removes; a start whose maps' layout differs builds
+    new ones and signs "marks reset"; the directory is protected like the
+    pin root; `bpf-own-ids` marks the tracker's programs `kept`; the swap
+    attaches `mark` before `src`; a `debug-trigger` build's
+    `NN_DEBUG_CGROUP_JOINED_ENTRIES` sizes the marks for the privileged
+    test of a full map; the lab's `tracker-persist-check` (an agent stop,
+    an upgrade, the pins' protection) and `fork-cost`.
+  - The third review of #494: the tracker's directory is named by schema
+    and generation (`…-cgroup-join-v1_<n>`), not by the marks' size — a
+    larger size asked later keeps the map, a signed note; a start adopts
+    only the directory its predecessor of this boot recorded in
+    `/run/northnarrow/cgroup-join-pins` (protected), each map checked
+    with `BPF_OBJ_GET_INFO_BY_FD` (its id, kind, sizes, flags); anything
+    else — the directory gone between two agents, other maps, a directory
+    nobody recorded, an older schema — is a signed reset after which every
+    process started before it, and its forks, are not known
+    (`CGROUP_JOIN_EPOCH`): restart the exempt services; a symbolic link is
+    never a tracker directory, and a purge does not follow one; a planted
+    directory beside the recorded one is removed, signed.
+  - `nn-admin host-check` (and the signed manifest's `host_hardening`):
+    `kernel_fixes` compares the kernel's upstream version (Ubuntu's
+    `version_signature`, Debian's banner, else `osrelease`) with the fixes
+    of CVE-2022-0847, CVE-2022-30594, CVE-2024-42318 and CVE-2025-68736,
+    each branch's version from the kernel CNA's records or the stable
+    changelogs (`KERNEL_COMPATIBILITY.md`, "Kernel fix level"). A
+    distribution's kernel below a fix is `unknown`, never `ok`. `lockdown`
+    recommends `integrity` on every host; `kexec_load_disabled` counts the
+    6.6+ load limits; `module_sig_enforce` counts `modules_disabled=1`.
+  - The worker counts the entries of `/proc/self/task` before its sandbox
+    and refuses to enter with more than one thread (Landlock and
+    `no_new_privs` bind the calling thread only): exit 78. The hostile
+    worker's `threaded` attack checks it in the privileged harness.
 - CodeQL code scanning (lot codeql; C27, CI only, no product change):
   `.github/workflows/codeql.yml`, an advanced setup (the repository's
   default setup stays off). Every language of what ships — `rust` (the

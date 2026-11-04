@@ -619,18 +619,30 @@ pub fn write_own_prog_ids(ebpf: &Ebpf, path: &Path) -> Result<usize> {
         }
     }
     progs.sort_unstable();
-    let body = render_own_prog_ids(std::process::id(), &progs);
+    let body = render_own_prog_ids(
+        std::process::id(),
+        &progs,
+        crate::cgroup_join::is_kept_program,
+    );
     crate::atomic_file::replace(path, body.as_bytes(), 0o600)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(progs.len())
 }
 
 /// The body of the [`OWN_IDS_FILE_NAME`] file. The scripts read the first
-/// field of every line that starts with a digit.
-fn render_own_prog_ids(pid: u32, progs: &[(u32, &str)]) -> String {
-    let mut body = format!("# northnarrow-agent pid {pid}: loaded BPF programs (id name)\n");
+/// field of every line that starts with a digit. The re-review of #494,
+/// R2: a program pinned outside the pin root (the start-in-cgroup
+/// tracker's, `kept(name)`) is marked `kept` in a third field —
+/// `install.sh --upgrade` does not wait for it to unload (it outlives the
+/// purge of the pin root on purpose), `uninstall.sh` does.
+fn render_own_prog_ids(pid: u32, progs: &[(u32, &str)], kept: fn(&str) -> bool) -> String {
+    let mut body = format!("# northnarrow-agent pid {pid}: loaded BPF programs (id name [kept])\n");
     for (id, name) in progs {
-        body.push_str(&format!("{id} {name}\n"));
+        if kept(name) {
+            body.push_str(&format!("{id} {name} kept\n"));
+        } else {
+            body.push_str(&format!("{id} {name}\n"));
+        }
     }
     body
 }
@@ -1133,7 +1145,11 @@ mod tests {
     /// field of every line that is a number; the comment line is skipped.
     #[test]
     fn own_prog_ids_file_lists_one_id_per_line() {
-        let body = render_own_prog_ids(4242, &[(17, "task_kill"), (305, "protected_open_deny")]);
+        let body = render_own_prog_ids(
+            4242,
+            &[(17, "task_kill"), (305, "protected_open_deny")],
+            crate::cgroup_join::is_kept_program,
+        );
         let mut lines = body.lines();
         assert!(lines
             .next()
@@ -1148,5 +1164,32 @@ mod tests {
         assert_eq!(ids, vec![17, 305]);
         assert!(body.ends_with("305 protected_open_deny\n"));
         assert_eq!(OWN_IDS_FILE_NAME, "bpf-own-ids");
+    }
+
+    /// The re-review of #494, R2: the tracker's programs are listed, marked
+    /// `kept` (an upgrade does not wait for them; an uninstall does), and
+    /// no other program is.
+    #[test]
+    fn the_tracker_s_programs_are_listed_as_kept() {
+        let body = render_own_prog_ids(
+            7,
+            &[
+                (3, "cgroup_join_mark"),
+                (4, "cgroup_guard_src"),
+                (5, "cgroup_join_exit"),
+                (6, "task_kill"),
+            ],
+            crate::cgroup_join::is_kept_program,
+        );
+        let kept: Vec<&str> = body
+            .lines()
+            .filter(|l| l.split_whitespace().nth(2) == Some("kept"))
+            .collect();
+        assert_eq!(kept, ["3 cgroup_join_mark kept", "5 cgroup_join_exit kept"]);
+        assert!(body.contains("\n4 cgroup_guard_src\n") && body.contains("\n6 task_kill\n"));
+        for (name, _, _) in crate::cgroup_join::PROGRAMS {
+            assert!(crate::cgroup_join::is_kept_program(name));
+        }
+        assert!(!crate::cgroup_join::is_kept_program("cgroup_join"));
     }
 }

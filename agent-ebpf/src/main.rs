@@ -21,6 +21,7 @@ mod btf_offsets;
 mod bpf_defense;
 mod cgroup_files;
 mod cgroup_guard;
+mod cgroup_join;
 mod budget;
 mod comm;
 mod dns_nss;

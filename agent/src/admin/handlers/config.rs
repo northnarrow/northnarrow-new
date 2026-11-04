@@ -96,6 +96,9 @@ fn config_overlay_set(
             let summary = boot.policy.summary();
             let source = boot.policy.source.clone();
             let previous = rule_policy.install(boot.policy);
+            // Lot 277: the new policy's cgroup paths and unit names to the
+            // kernel (a move into one is signed).
+            nn_linux::cgroup_join::sync_names(&rule_policy.current());
             warn!(
                 target: "admin.config_overlay",
                 path = %target.display(),

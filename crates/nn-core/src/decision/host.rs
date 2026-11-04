@@ -150,6 +150,9 @@ mod testing {
         fn trusted_exe(&self, _pid: u32) -> Option<(String, [u8; 32])> {
             None
         }
+        fn started_in_cgroup(&self, _pid: u32) -> Option<bool> {
+            None
+        }
     }
 
     /// Samples nothing: no burst's files are read.
