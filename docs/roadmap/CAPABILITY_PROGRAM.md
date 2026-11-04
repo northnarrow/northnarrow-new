@@ -6045,8 +6045,24 @@ number in parentheses is a lab PR.
       M1–M10): benign kills 0 (k3s's 9 recorded), malicious 10 of 10
       killed — M10 `LD_PRELOAD=/nonexistent.so modprobe …` killed, "the
       dynamic linker runs code of the caller's choosing in the tool".
-    - 22.04 round k (d0f2284f, M10 and test-ignored with the e2e's
-      `LD_PRELOAD` case): queued for the guest's lease.
+    - 22.04 round k, d0f2284f (k3s, B1, B7–B9, M1–M10): benign kills 0
+      (k3s's 9 recorded), malicious 10 of 10 killed. Test-ignored: 91
+      suites, 118 passed, 2 FAILED — both R011 e2e (and the CI's KVM jobs on
+      cd355238, 22.04 and 24.04, the same two): the test's by-name
+      `modprobe dummy` killed, because `cargo test` runs test binaries with
+      `LD_LIBRARY_PATH` set (its target directories and the toolchain's
+      lib, even for a caller with none) and the tool inherited it — DC-2 as
+      written. 77822f1c spawns the tool in the e2e without
+      `MODPROBE_OPTIONS`/`LD_*` (a case sets the one it tests).
+    - Round l, 77822f1c: `test-one` of the e2e target without an install
+      step — every fixture agent but the first failed to start ("never
+      opened admin socket"), 1 passed 17 failed on both guests: the step
+      list's fault.
+    - Round m, 77822f1c (install, `enable --now`, settle, `test-one
+      detection_rules_at_scale_privileged_e2e`, uninstall): 22.04 and 24.04
+      each 18 passed, 0 failed — the three R011 e2e ok (by name recorded,
+      R018 after the load; `-d`, `MODPROBE_OPTIONS`, `-q` after the name,
+      `LD_PRELOAD` killed); the guests left clean.
   - Open: `modprobe -S` outside a package transaction (an initramfs build
     by hand), a quiet probe written `modprobe <name> -q` and a `modprobe`
     run with `LD_LIBRARY_PATH` set are killed; a tool that exits before the
