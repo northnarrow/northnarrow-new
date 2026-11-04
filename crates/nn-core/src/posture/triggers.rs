@@ -118,6 +118,16 @@ pub(super) const MASS_WRITE_MIN: usize = 20;
 ///   category (future R-NN); the mass-write arm
 ///   of confirmed_intrusion would only ever
 ///   catch journald's normal append rhythm here.
+/// - `/run/udev/`       — systemd-udevd's runtime device database (lot
+///   282, the re-check of #500, measured: the
+///   boot's coldplug, `udevadm trigger --action=add`
+///   on Ubuntu 22.04, made each udevd worker write
+///   20 database files new and replace 20 old ones
+///   by a rename — the replacement shape, ENGAGED
+///   on `systemd-udevd.service`). Device state, not
+///   a user's data; udev rules that persist live in
+///   `/etc/udev` and `/lib/udev`, which the FIM and
+///   persistence rules watch, not here.
 ///
 /// Deliberately **NOT** excluded:
 /// - `/dev/shm/`    — a real ransomware staging tmpfs. The rest of `/dev`
@@ -129,8 +139,13 @@ pub(super) const MASS_WRITE_MIN: usize = 20;
 ///   processes legitimately write (lock files, dbus
 ///   sockets). Counted toward mass-write so a
 ///   compromised user session is still detectable.
-pub const MASS_WRITE_CARVEOUT_PREFIXES: &[&str] =
-    &["/sys/", "/proc/", "/run/systemd/", "/run/log/journal/"];
+pub const MASS_WRITE_CARVEOUT_PREFIXES: &[&str] = &[
+    "/sys/",
+    "/proc/",
+    "/run/systemd/",
+    "/run/log/journal/",
+    "/run/udev/",
+];
 
 /// Returns true if `filename` is in a path class the mass-write arm of
 /// `confirmed_intrusion` deliberately ignores (kernel-RPC / system
@@ -4653,6 +4668,26 @@ mod tests {
             !hits.contains(&TriggerType::ConfirmedIntrusion),
             "journald binary log is system state, must not count toward mass-write: {hits:?}"
         );
+    }
+
+    /// Lot 282, the re-check of #500 (measured on Ubuntu 22.04): the boot's
+    /// coldplug made each systemd-udevd worker write and replace 20
+    /// device database files under `/run/udev/data` — device state, not a
+    /// user's data. The kernel leaves the directory out (`TREE_CARVEOUT`,
+    /// from this list); tracepoint mode's count does too.
+    #[test]
+    fn mass_write_excludes_udev_runtime_database() {
+        assert!(MASS_WRITE_CARVEOUT_PREFIXES.contains(&"/run/udev/"));
+        let det = TriggerDetector::with_self_pid(AGENT_PID);
+        let (focal, recent) = write_burst_to(ATTACKER_PID, "/run/udev/data/c4:32");
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "udev's device database is system state: {hits:?}"
+        );
+        // another directory under /run still counts (a user's session)
+        assert!(!is_mass_write_carveout("/run/user/1000/x", &[]));
+        assert!(!is_mass_write_carveout("/run/udevil/x", &[]));
     }
 
     #[test]
