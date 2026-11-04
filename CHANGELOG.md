@@ -872,6 +872,56 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- R011 no longer kills an exec of the system's kernel-module tool by module
+  name (lot 279): it killed the `modprobe` rootful podman runs for its
+  netfilter modules (lot 275's lab, Ubuntu 22.04), and every `modprobe` of
+  the container runtimes, kube-proxy, k3s, zfs-load-module and an
+  administrator. R011 judges the command line's syntax and what the exec
+  pump reads at the exec — no `modprobe.d`, index or module file is read
+  (an emulation of kmod's lookup was retired after the review of #498:
+  `--remove-holders` read as a removal, `install`/`remove` commands not
+  modelled, an option after the name under `POSIXLY_CORRECT`, the exec pump
+  blockable by a FIFO in `modprobe.d`). Killed, as before: `insmod`; a
+  `modprobe` argument with a `/` or a `.ko`, `.ko.xz`, `.ko.zst`, `.ko.gz`
+  suffix; `-C`/`--config`, `-d`/`--dirname`, `-S`/`--set-version`,
+  `-f`/`--force*`, `-o`, `--remove-holders`, `--remove-dependencies` (kmod
+  29..34 run the last two as an insertion) and their abbreviations; any
+  argument starting with `-` after the first module name (an option or a
+  parameter as the environment decides); an option the tool refuses; a
+  `kmod` command other than `help`, `list`, `static-nodes`, the version; a
+  program that is not the system's tool (its path, or its device and inode
+  against the file `/usr/bin/kmod` resolves to, stat'ed by the exec pump;
+  every tool when `/usr/bin/kmod` and `/bin/kmod` are two different files,
+  not one file under both names as a merged `/usr` shows it), of another
+  mount namespace; `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT`
+  or `LD_LIBRARY_PATH` in the process's environment — read, it is evidence:
+  killed even if the process has since exited — (`/proc/<pid>/environ`
+  tied to the exec by a pidfd and the start time; an empty one read from
+  the running process is one: libxtables runs `modprobe` with none), a
+  running process whose environment could not be read, an environment over
+  1 MiB, an unknown start; an argv the kernel did not read whole. A tool
+  that had exited before its environment could be read (no process with its
+  pid, its pid another's, a zombie, its memory gone whatever was read) is
+  recorded, its environment not verified — its kill would reach no one; a
+  tool whose leader exited while another thread runs on (`pthread_exit`)
+  has not exited: its environment is read through the running thread
+  (`/proc/<pid>/task/<tid>/environ`), killed when not read whole or when
+  no thread is seen while the kernel counts more than one (`Threads:`). The
+  environment's check is best effort for a short-lived `modprobe`; code
+  injected into the tool may outlive it in a forked child, which R011's
+  kill of the tool would not reach.
+  Recorded otherwise (High, T1547.006, the names said): what a name loads
+  is the kernel's to judge — its signature policy, lockdown and lot 285
+  prevent a load; R018 judges a load it reports after the fact, with no
+  verdict for a packaged file loaded by a comm of its loader allowlist
+  (`systemd-udevd`, `systemd-modules`, `kmod`) or a kernel thread's child
+  (taking `kmod` out of it goes with lot 285). `OBSERVING_KILLS` keeps R011
+  as a kill from before Wave 4: its kill narrowed, no kill was added.
+- The privileged test `net_listener_on_uncommon_port_records_event` waits
+  for both NN-L-NET-006 records of its pid (lot 279): it found the 8443
+  twin's and counted before the 41999 one was appended (the CI of #493 on
+  Ubuntu 22.04). It waits for as many records as listeners it opened, then
+  asserts exactly that many, and checks each.
 - The privileged tests' fixture teardown no longer waits out its 10 s
   and fails the test (lot 277, after #494's merge: CI's 22.04 privileged
   suites). Its rounds signalled only the processes still under the

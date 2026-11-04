@@ -6247,3 +6247,254 @@ number in parentheses is a lab PR.
     kill of the worker is a tamper attempt: a debug trigger for the export
     worker's faults would give one); the audit log, the status events and
     the heartbeat are not exported.
+- **Lot 279 — R011 judges a module tool's command line, and what the exec
+  pump reads at the exec; the NET-006 listener test waits for both of its
+  records (C14, C11; lot 275's lab, the CI of #493, the review of #498).**
+  - What was open: R011 killed every exec of `insmod`, `modprobe` or `kmod`
+    that no package-manager actor ran and no kernel thread asked for, in
+    every posture (a kill from before Wave 4): the `modprobe` rootful
+    podman runs for its netfilter modules (lot 275's lab, Ubuntu 22.04: W5
+    rc 137, rootless rc 0), an administrator's `sudo modprobe dummy`, and
+    by the same rule the container runtimes', iptables' and kube-proxy's.
+    The privileged NET-006 listener test raced its own second record (the
+    CI of #493 on Ubuntu 22.04).
+  - What changed: R011 judges the exec on its command line's SYNTAX
+    (`crates/nn-core/src/decision/rules/kmod_invocation.rs`: the multi-call
+    binary's mode from `argv[0]`, getopt's options and long abbreviations)
+    and on what the exec pump read at the exec
+    (`crates/nn-linux/src/sensors/kmod_exec.rs`, kept per exec in
+    `kmod_exec_facts.rs`: the executed file's device and inode against the
+    file `/usr/bin/kmod` resolves to, `/proc/<pid>/environ` tied to the exec
+    by a pidfd and the start time). Killed: `insmod`; a `modprobe` argument with a `/` or a
+    `.ko*` suffix; `-C`, `-d`, `-S`, `--force*`, `-o`, `--remove-holders`,
+    `--remove-dependencies` and their abbreviations; any argument starting
+    with `-` after the first name; an option the tool refuses; a `kmod`
+    command but `help`/`list`/`static-nodes`/the version; a program not the
+    system's tool, of another mount namespace; `MODPROBE_OPTIONS`,
+    `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH` (read: a kill even if the
+    process has since exited — evidence, not a false positive; the
+    coordinator, 04/11), a running process's
+    environment not read, over 1 MiB, an unknown start; an argv not read
+    whole. Recorded (High, T1547.006) otherwise — a tool that had exited
+    before its environment could be read (no process with its pid, its pid
+    another's, a zombie, its memory gone whatever was read) noting it, its
+    environment not verified (the coordinator's decision of 04/11: its kill
+    would reach no one; best effort for a short-lived `modprobe`).
+    `OBSERVING_KILLS` unchanged: R011's kill narrowed, no kill added. The NET-006 test waits for as many records as listeners
+    it opened, then asserts exactly that many. No capability level moves.
+  - Decisions (04/11/2026, the coordinator, after the independent review of
+    #498): the first design — kmod's lookup emulated (configuration aliases,
+    `modules.dep`, `.symbols`, `.alias`, built-ins, soft dependencies, each
+    file's owner, `max(mtime, ctime)` and signature) — is RETIRED: the
+    review found `--remove-holders`/`--remove-dependencies` read as a
+    removal (kmod 29..34 insert), `modprobe.d`'s `install`/`remove` commands
+    not modelled (a "vouched" or "nothing to load" name running a command
+    as root), an option after the name that `POSIXLY_CORRECT` or
+    `MODPROBE_OPTIONS='--'` turns into a parameter, the exec pump blockable
+    by a FIFO in `/run/modprobe.d`, limits that fell back on the record, an
+    owner's time that root dates forward, a DKMS provenance a `mkdir` fakes.
+    R011 now reads no `modprobe.d`, index or module file. R018 OBSERVES, it
+    is not a backstop that prevents: after the load (its hook denies
+    nothing) it kills the loader's tree for a file outside the module
+    directories, and for an unowned file in them unless the loader or its
+    parent is in its loader allowlist (`systemd-udevd`, `systemd-modules`,
+    `kmod`: comms), where it is a Log; a packaged file loaded by those, or a
+    load by a kernel thread's child, has no verdict; every load is a journal
+    line. Prevention is module signing and lockdown (the host check) and lot
+    285 (the kernel's deny of an untrusted file; `kmod` out of R018's
+    allowlist goes with its redesign of R018). What R011 never covered, as
+    on `main`: a root process that loads a module without any tool (its own
+    `finit_module(2)`; with comm `kmod` maybe no verdict at all), a root
+    parent tracing the tool and rewriting its argv or environment. The
+    `install`/`remove` commands of root's `modprobe.d` run as programs the
+    exec rules judge — on `main` a user-space `modprobe` was killed first,
+    so this residual is new for it; written with `modprobe.d`'s coverage in
+    `TAPPA9_FIM_TRUST_MODEL.md` (follow-ups: a FIM rule on every
+    `modprobe.d`, a record for a `modprobe`'s children).
+  - The re-review of #498 (52e0467c): no BLOCKING finding; kmod 31 as an
+    oracle on 40,495 argv in two environments — no argv kmod reads as a
+    file, a moved tree or a caller's configuration is recorded. Its five
+    to-fix points, done: a read the exit cut short is no whole environment
+    (exited); `LD_PRELOAD`/`LD_AUDIT`/`LD_LIBRARY_PATH` killed; R018 said as
+    it is (above); the `install`/`remove` residual in the trust model; the
+    system's tool only the file `/usr/bin/kmod` resolves to.
+  - The re-check of #498 (18afcc73): no BLOCKING finding; DC-1–DC-5 closed
+    with named tests, its five mutations caught. Done in cf8c3507: DC-A — a
+    leader that exited by `pthread_exit` while another thread runs on (a
+    zombie without memory, its `environ` empty or unreadable, its pidfd not
+    exited) was read as an exit, R011's record, its `LD_*` or
+    `MODPROBE_OPTIONS` lost; the pump now reads the environment through a
+    thread with the process's memory (`/proc/<pid>/task/<tid>/environ`) and
+    judges it, refused when the threads cannot be listed while the process
+    runs or that read is not whole; a single-threaded process mid-exit
+    (DC-1) stays an exit. N-3 — `/usr/bin/kmod` and `/bin/kmod` two
+    different files: no file is the system's tool, every tool killed as an
+    unknown program (one file under both names, a merged `/usr` or a hard
+    link, is the tool). N-1 — code injected into the tool that forks and
+    lets it exit survives in the child, which a kill of the tool would not
+    reach: written as a residual. Tests: the re-check's case on a real
+    process (the test binary run again forks a process whose leader exits
+    while a thread sleeps on: `MODPROBE_OPTIONS`, `LD_PRELOAD` refused, a
+    clean environment clean), the thread path on a copy of `/proc` beside a
+    real pidfd, a read cut by the thread's or the process's exit (a FIFO
+    `environ`), the two `kmod` files. No guest round for these two: their
+    tests are the unit tests above; the R011 e2e runs in CI's KVM jobs
+    (22.04, 24.04).
+  - The check of 39fcda1c: DC-A and N-3 closed, J19 equivalent. DC-B, done
+    in d56722e1: with a relay of threads (the leader exited, each thread
+    makes the next and exits) the listing could see no thread with the
+    process's memory and the read fell back on an exit — 3,158 of 64,616
+    reads (4.9%) of a process alive throughout. With no thread seen and the
+    pidfd not exited, the pump reads `Threads:` of `/proc/<pid>/status`:
+    more than one, refused, never an exit; not readable, refused; one (a
+    single-threaded process mid-exit, DC-1), its exit. Test: the reviewer's
+    case on a real process (`a_relay_of_threads_after_its_leader_exited_is_never_an_exit`,
+    3 s of reads: never an exit, never clean; it fails without the fix).
+  - Lab of the EARLIER design (retired: the decisions above; as measured;
+    our own guests, lease `k279`; Ubuntu 22.04 5.15.0-202 and 24.04
+    6.8.0-147; on each, `main` 80c8da36 then the lot on the same
+    guest after a power cycle; `deploy/lab/malsim/kmod-check.sh` with
+    podman, docker.io, k3s with kube-proxy in ipvs mode, zfsutils-linux and
+    wireguard-tools installed for the run and removed after; no
+    `/etc/northnarrow/*.local` before or after). R011's kills over the
+    benign corpus: 22.04 `main` 43 (k3s 38 — 28 run by k3s-server, 10 by
+    systemd —, podman rootless, containerd's `ExecStartPre=-/sbin/modprobe
+    overlay` at docker.io's start, zfs-load-module, `sudo modprobe dummy`,
+    `modprobe -n`), the lot (f6650f8b) 0: iptables-legacy's `ip_tables`,
+    podman rootless's and containerd's `overlay`, k3s's eight (`br_netfilter`,
+    `ip_vs`, `iptable_filter`, `iptable_nat`, `nfnetlink-subsys-11` →
+    `nft_compat`, `nft-chain-2-nat` → `nft_chain_nat`, `overlay`…),
+    zfs-load-module's `zfs`, `modprobe dummy`/`-r dummy` and the queries
+    recorded, each with its module, file and owner; 24.04 `main` 15, the lot
+    (19050626) 1 — k3s-server's `modprobe nft-expr-counter`, a name no index
+    of 6.8.0-147's tree resolves (the counter is part of `nf_tables` there):
+    killed, the brief's fail-closed for an unresolved name. The malicious
+    shapes (insmod of a `/tmp` `.ko`, modprobe of a path, of a name nothing
+    resolves, `-d`, `-C`, a copy of modprobe in `/tmp`): killed, 6 of 6, on
+    `main` and the lot, both guests. Tamper-check, 119 rows: (case, verdict)
+    of the lot = `main`'s on each guest (22.04: 114 OK, C64 DEVIATION, C27
+    C57c KNOWN GAP, C78c C101 N/A; 24.04: 115 OK, the same but C101 run).
+    Test-ignored of the lot on each guest: 109 passed, 1 failed —
+    `r011_records_a_packaged_modprobe_and_kills_an_insmod_from_tmp`, whose
+    verdict was the expected Log but which asserted the response "none" (a
+    detect-only agent renders a Log "suppressed (detect-only)"; the test
+    fixed); `r011_kills_a_module_copied_into_the_tree_and_r018_catches_what_argv_hides`
+    (copied + `depmod` → R011 kill and R018 KillProcessTree;
+    `MODPROBE_OPTIONS="-d /tmp/…"` → R011 record, R018 Critical kill),
+    `process_kernel_module_tooling_trips_r011` and the NET-006 listener test
+    passed on both. The final tree (b79f16a8: the test fixed, built-ins'
+    aliases read, origin/main 0131394c merged), on both guests again:
+    test-ignored 89 suites, 110 passed, 0 failed on each, the four tests
+    above ok, none skipped; 24.04's kmod-check: R011's benign kills 1, the
+    same k3s-server `modprobe nft-expr-counter` — on 6.8.0-147 `nf_tables`
+    is a module (in `modules.dep`, not in `modules.builtin`), no index holds
+    the alias (`modules.alias` 0, `modules.builtin.modinfo` 0) and kmod
+    itself answers "Module nft-expr-counter not found" (`modprobe -n -v`):
+    an unresolved name, killed (then fail-closed); the built-ins' aliases
+    changed nothing there. The malicious shapes 6 of 6 killed; every other
+    benign module tool exec recorded. After the coordinator's decision of
+    04/11 (a plain name of no module: recorded, "nothing to load"),
+    4977f3ed on 24.04, a short round (k3s, the plain miss, the malicious
+    shapes): k3s's 9 module tool execs recorded, 0 killed; `modprobe
+    nn_k279_no_such_module` recorded, "nothing to load: the name resolves to
+    no module of this kernel" (modprobe's own exit 1, "not found"); the
+    malicious shapes 6 of 6 killed, among them `modprobe -S 9.9.9` of that
+    same missing name.
+  - Measured beside R011, for the Tappa Prove (the kills on a benign corpus;
+    not this lot's to change). Every run, on both guests, `main` and the lot
+    alike, went to a locked COMBAT and judged most of the corpus there. The
+    escalations: the posture's mass-write count on the container runtimes'
+    own storage (podman's `/run/libpod/alive.lck` and layer locks: ENGAGED;
+    rootless podman's first image pull, 259 writes to
+    `~/.local/share/containers/storage/libpod/bolt_state.db`: COMBAT),
+    corroborated by NN-L-EVA-002's false positive on the runtime's
+    `iptables -F` of its own chain (found, and corrected, by lot 282); on
+    22.04 `main` also an anti-tamper denial (`deb-systemd-helper`'s `rmdir`
+    at podman's purge). Then NEUTRALIZE killed, with intent and outcome
+    signed in the actions chain and the stage transitions in the audit
+    chain: rootless podman's tree (rc 137; no OOM, no systemd-oomd kill, not
+    the script's timeout, the container itself exited 0 — 22.04 the lot 1
+    of 1, `main` 1 of 1, the lot's agent again 1 of 3 rounds, the one with
+    the first image pull, the two with the image cached rc 0 with the
+    posture ENGAGED only; without an agent 3 of 3 rc 0); on 24.04 the
+    daemon's tree at docker.io's start (13 trees killed or already gone, in
+    `main`'s run and the lot's: `docker run` rc 125, the daemon's API
+    closed: EOF). In those COMBAT windows NN-L-FIM-009 killed the k3s
+    installer's `touch`, `chmod` and `tee` writing
+    `/etc/systemd/system/k3s.service.env` and `/etc/systemd/system/k3s.service`
+    (each "already gone"; 22.04 `main` 5, the lot 3; 24.04 `main` 3, the lot
+    4) and R013 k3s's bundled `runc`
+    (`/var/lib/rancher/k3s/data/<hash>/bin/runc`; 22.04 `main` 4, the lot 21;
+    24.04 `main` 11, the lot 21). The guests left as found: k3s's
+    `/var/lib/rancher` removed on both; on 24.04 podman and
+    `/var/lib/containers` were there before these runs and stay.
+  - Lab of this design (as measured; our own guests, lease `k279`; before
+    each round no agent, no pin, no `/etc/northnarrow/*.local`; install,
+    `enable --now`, settle; after it `uninstall.sh --purge`, k3s's
+    `/var/lib/rancher` removed, the guest powered off). R011's kills over
+    `kmod-check.sh`'s measured windows:
+    - Ubuntu 24.04 (6.8.0-147, kmod 31), round i, 7f55af1c, with podman
+      (there before), docker.io, k3s (kube-proxy ipvs), zfsutils-linux:
+      malicious 9 of 9 killed (M1–M6 and the new M7 `--remove-holders`,
+      M8 `MODPROBE_OPTIONS='-d /tmp/…'`, M9 `modprobe <name> -q`); benign
+      recorded — podman rootless's `overlay`, docker.io's start
+      (containerd's `overlay`, fan-net's `vxlan`), k3s's 8 (`br_netfilter`,
+      `ip_vs`, `iptable_filter`, `iptable_nat`, `nfnetlink-subsys-11`,
+      `nft-chain-2-nat`, `nft-expr-counter`, `overlay`), zfs-load-module's
+      `zfs`, `modprobe dummy`/`-r`, the queries, `modprobe
+      nn_k279_no_such_module` — but 1 killed: iptables-legacy's `modprobe`,
+      "its environment read empty". libxtables runs it with
+      `posix_spawn(…, argv, NULL)`: no environment at all, the process
+      alive (the kill landed; `iptables-legacy -L` rc 3). Fixed in
+      16df634f (an empty read from a process that still has its memory is
+      an empty environment). Outside the windows the script's own `kmod
+      --version` was killed "already gone", having exited before the pump
+      read it — the kill that reaches no one the coordinator then ruled a
+      record (52c00fe3). Test-ignored: 91 suites, 120 passed, 0 failed, the
+      lot's four tests ok.
+    - 24.04 round j, 52e0467c (k3s, B1, B7–B9, M1–M9): iptables-legacy's
+      `modprobe ip_tables` recorded (rc 0), k3s's 9 recorded, malicious 9 of
+      9 killed, benign kills 0.
+    - Ubuntu 22.04 (5.15.0-202, kmod 29), round i, 52c00fe3, the full
+      corpus (podman, docker.io, k3s, zfsutils-linux): benign kills 0 —
+      iptables-legacy, podman rootless (its rc 137 is the COMBAT ladder
+      below, not R011), docker.io's start, k3s's 8, zfs ×2, `dummy`/`-r`,
+      the queries, B9 recorded; malicious 9 of 9 killed; no record "exited
+      before its environment could be read" in the windows. Test-ignored:
+      91 suites, 120 passed, 0 failed, the lot's four tests ok (copied +
+      `depmod` by name: R011 record, R018 KillProcessTree after the load;
+      `-d`, `MODPROBE_OPTIONS`, `-q` after the name: R011 kills).
+    - 24.04 round k, d0f2284f (the re-review's fixes; k3s, B1, B7–B9,
+      M1–M10): benign kills 0 (k3s's 9 recorded), malicious 10 of 10
+      killed — M10 `LD_PRELOAD=/nonexistent.so modprobe …` killed, "the
+      dynamic linker runs code of the caller's choosing in the tool".
+    - 22.04 round k, d0f2284f (k3s, B1, B7–B9, M1–M10): benign kills 0
+      (k3s's 9 recorded), malicious 10 of 10 killed. Test-ignored: 91
+      suites, 118 passed, 2 FAILED — both R011 e2e (and the CI's KVM jobs on
+      cd355238, 22.04 and 24.04, the same two): the test's by-name
+      `modprobe dummy` killed, because `cargo test` runs test binaries with
+      `LD_LIBRARY_PATH` set (its target directories and the toolchain's
+      lib, even for a caller with none) and the tool inherited it — DC-2 as
+      written. 77822f1c spawns the tool in the e2e without
+      `MODPROBE_OPTIONS`/`LD_*` (a case sets the one it tests).
+    - Round l, 77822f1c: `test-one` of the e2e target without an install
+      step — every fixture agent but the first failed to start ("never
+      opened admin socket"), 1 passed 17 failed on both guests: the step
+      list's fault.
+    - Round m, 77822f1c (install, `enable --now`, settle, `test-one
+      detection_rules_at_scale_privileged_e2e`, uninstall): 22.04 and 24.04
+      each 18 passed, 0 failed — the three R011 e2e ok (by name recorded,
+      R018 after the load; `-d`, `MODPROBE_OPTIONS`, `-q` after the name,
+      `LD_PRELOAD` killed); the guests left clean.
+  - Open: `modprobe -S` outside a package transaction (an initramfs build
+    by hand), a quiet probe written `modprobe <name> -q` and a `modprobe`
+    run with `LD_LIBRARY_PATH` set are killed; a tool that exits before the
+    exec pump reads its environment is recorded on its command line alone
+    (a burst of execs can make that likelier: `-d` or a path then R018's
+    after the load, `-C` with an `install` nobody's); code injected into the
+    tool can outlive it in a forked child (N-1); the load itself is
+    prevented only by the kernel's signature policy and lot 285. Follow-ups
+    (the re-check's N-2, N-4): the refused variables searched before an
+    error of a read cut by the exit; the e2e's and the lab's
+    `MODPROBE_OPTIONS`/`LD_PRELOAD` kills made deterministic (a preload that
+    sleeps in its constructor).
