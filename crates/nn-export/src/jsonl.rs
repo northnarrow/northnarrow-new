@@ -22,8 +22,9 @@ pub const ACTIVE: &str = "export.jsonl";
 pub const OPEN_FLAGS: libc::c_int =
     libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC | libc::O_NOFOLLOW;
 
-/// The files' mode: the worker's account and its group read them.
-pub const FILE_MODE: libc::mode_t = 0o640;
+/// The files' mode: the worker's account alone (and root) reads them —
+/// whatever the umask (the review of #499, D8).
+pub const FILE_MODE: libc::mode_t = 0o600;
 
 fn errno() -> i32 {
     std::io::Error::last_os_error()
@@ -285,6 +286,31 @@ mod tests {
         s.write(&[b"y".repeat(40)]).unwrap();
         assert_eq!(files(d.path()), vec![("export.jsonl".into(), long())]);
         assert_eq!(s.dropped_files, 0);
+    }
+
+    /// Every file of the sink, the active one and each rotated, is the
+    /// worker's account's alone (0600), whatever the umask.
+    #[test]
+    fn the_files_are_the_worker_s_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        // SAFETY: umask of this test process, restored below.
+        let before = unsafe { libc::umask(0o000) };
+        let mut s = JsonlSink::open(d.path(), 15, 3).unwrap();
+        for n in 0..5u32 {
+            s.write(&[format!("{{\"n\":{n:03}}}").into_bytes()])
+                .unwrap();
+        }
+        // SAFETY: restoring the umask.
+        unsafe { libc::umask(before) };
+        let mut seen = 0;
+        for e in std::fs::read_dir(d.path()).unwrap() {
+            let e = e.unwrap();
+            let mode = e.metadata().unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{:?}", e.file_name());
+            seen += 1;
+        }
+        assert_eq!(seen, 3, "the active file and two rotated");
     }
 
     #[test]

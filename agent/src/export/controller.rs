@@ -699,6 +699,17 @@ fn sendable(
     (kept, kept_hashes, dropped)
 }
 
+/// The least a sink down or failed waits before its next request.
+const MIN_SINK_WAIT: Duration = Duration::from_millis(200);
+
+/// How long a sink down or failed waits: the worker's retry, never less
+/// than [`MIN_SINK_WAIT`] — a sink that says retry at once (a `Failed`
+/// one: 0) would otherwise be asked again and again, the controller never
+/// idle (the review of #499, D8).
+fn sink_wait(retry_ms: u32) -> Duration {
+    Duration::from_millis(u64::from(retry_ms)).max(MIN_SINK_WAIT)
+}
+
 /// Whether a request's error means the worker is set up again: it died,
 /// hung or lied, and the supervisor starts another. Never for a busy slot,
 /// nor for the core's own request out of its bounds (never sent: the
@@ -878,8 +889,7 @@ fn round(p: &Params, k: &mut SinkRun, i: usize, set_up_for: &mut Option<u64>) ->
         // before its first rows): set it up again
         *set_up_for = None;
     } else if out.state == SinkState::Down || out.state == SinkState::Failed {
-        let wait = Duration::from_millis(u64::from(out.retry_ms).max(200));
-        k.until = Some(Instant::now() + wait);
+        k.until = Some(Instant::now() + sink_wait(out.retry_ms));
     }
     moved || !req.rows.is_empty()
 }
@@ -1033,6 +1043,13 @@ mod tests {
             budget_ms: 1000,
         };
         assert_eq!(req.check(), Ok(()));
+    }
+
+    #[test]
+    fn a_sink_down_or_failed_waits_at_least_its_minimum() {
+        assert_eq!(sink_wait(0), Duration::from_millis(200));
+        assert_eq!(sink_wait(150), Duration::from_millis(200));
+        assert_eq!(sink_wait(1001), Duration::from_millis(1001));
     }
 
     #[test]
