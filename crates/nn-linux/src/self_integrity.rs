@@ -1750,15 +1750,12 @@ impl Checker {
         // informative record, a High alert for a switch that weakens the
         // agent — once per setting
         for n in crate::own_dropins::nn_settings(&search) {
+            let (kind, alert) = n.record();
             let f = Finding {
-                kind: if n.weakens {
-                    "own_dropin_weakening"
-                } else {
-                    "own_dropin_setting"
-                },
+                kind,
                 detail: n.detail(),
             };
-            if n.weakens {
+            if alert {
                 self.report_once(f, at_boot);
             } else {
                 self.record_once(f, at_boot);

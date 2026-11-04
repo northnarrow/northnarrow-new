@@ -1649,7 +1649,13 @@ own_dropins_kept() {
 }
 own_dropins_warn() {
     local found rc=0 l
-    found=$("$BIN_DIR/northnarrow-agent" --own-dropins check 2>/dev/null) || rc=$?
+    # the last review of #497 (NC3): a check that hangs never holds a
+    # package hook — a warning after 60 s, the hook goes on
+    found=$(timeout 60 "$BIN_DIR/northnarrow-agent" --own-dropins check 2>/dev/null) || rc=$?
+    if (( rc == 124 )); then
+        echo "install.sh: WARNING: the agent's drop-in check did not answer within 60 s: not checked" >&2
+        return 0
+    fi
     own_dropins_kept "$found"
     (( rc == 3 )) || return 0
     echo "install.sh: WARNING: the drop-in directories of the agent's own units hold drop-ins this release's agent judges harmful — left in place:" >&2

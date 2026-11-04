@@ -224,8 +224,20 @@ pub const OUR_PATHS: &[&str] = &[
 /// (the review of #492): an allocator's or a runtime's tuning
 /// (`MALLOC_ARENA_MAX`, `RUST_LOG`, `GLIBC_TUNABLES`) is not harmful — an
 /// alert at most.
-pub const DANGEROUS_ENV: &[&str] = &["NN_"];
-pub const DANGEROUS_ENV_NAMES: &[&str] = &["LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH"];
+pub const DANGEROUS_ENV: &[&str] = &["NN_", "NORTHNARROW_"];
+/// The loader's variables and (the last review of #497, RC1) those that
+/// point a tool the agent runs elsewhere — the xtables modules, rpm's
+/// configuration — or redirect systemd's notifications: harmful in any
+/// drop-in that reaches our units, ours or the host's.
+pub const DANGEROUS_ENV_NAMES: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "XTABLES_LIBDIR",
+    "IPTABLES_LIB_DIR",
+    "RPM_CONFIGDIR",
+    "NOTIFY_SOCKET",
+];
 
 /// `var` changes the agent.
 pub fn dangerous_env(var: &str) -> bool {

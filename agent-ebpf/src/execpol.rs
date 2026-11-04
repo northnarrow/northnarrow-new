@@ -207,8 +207,12 @@ unsafe fn tier_of(task: *const u8) -> u32 {
     // is a service slice, as `system.slice` was for them.
     let ours = slice(slice_slot::OURS);
     let cg1 = generated::bpf_get_current_ancestor_cgroup_id(1);
-    if cg1 != 0 && (cg1 == sys || cg1 == ours) {
+    if cg1 != 0 && cg1 == sys {
         return tier::SERVICE | sig | tier_sig::SYSTEM_SLICE;
+    }
+    // the last review of #497 (NC2): named as our slice
+    if cg1 != 0 && cg1 == ours {
+        return tier::SERVICE | sig | tier_sig::OUR_SLICE;
     }
     if cg1 == 0 || cg1 != user {
         return tier::UNKNOWN | sig;

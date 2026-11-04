@@ -37,6 +37,10 @@ use std::process::Command;
 /// `PATH` puts it first, and nothing there is the distribution's.
 pub const SYSTEM_BIN_DIRS: [&str; 4] = ["/usr/sbin", "/usr/bin", "/sbin", "/bin"];
 
+/// The `PATH` a [`SystemBin`] runs with: the agent unit's own
+/// (`Environment=PATH=…`), the [`SYSTEM_BIN_DIRS`].
+pub const SYSTEM_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
 /// A system binary the agent may run: found by name in
 /// [`SYSTEM_BIN_DIRS`] and verified (see the module documentation).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,9 +52,16 @@ pub struct SystemBin {
 
 impl SystemBin {
     /// A command running the verified file, `argv[0]` the name looked up.
+    /// The last review of #497 (RC1): with a fixed minimal environment, as
+    /// the workers' — the unit's `PATH` and `LANG=C`, nothing of the
+    /// agent's own (an `XTABLES_LIBDIR`, `IPTABLES_LIB_DIR`, `RPM_CONFIGDIR`
+    /// or `NOTIFY_SOCKET` a drop-in gave it never reaches the tool).
     pub fn command(&self) -> Command {
         let mut cmd = Command::new(&self.exe);
-        cmd.arg0(&self.name);
+        cmd.arg0(&self.name)
+            .env_clear()
+            .env("PATH", SYSTEM_PATH)
+            .env("LANG", "C");
         cmd
     }
 
@@ -472,5 +483,28 @@ mod tests {
         ] {
             assert!(lookup.resolve(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// The last review of #497 (RC1): a system binary runs with the fixed
+    /// minimal environment only — nothing of the agent's (here the test
+    /// runner's `CARGO_*`, standing for an `XTABLES_LIBDIR` or an
+    /// `RPM_CONFIGDIR` a drop-in gave the agent).
+    #[test]
+    fn a_system_binary_never_sees_the_agent_s_environment() {
+        let Ok(bin) = resolve("env") else {
+            return; // no root-owned env(1) on this host
+        };
+        assert!(std::env::vars().any(|(k, _)| k.starts_with("CARGO")));
+        let out = bin.command().output().unwrap();
+        let mut seen: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["LANG=C".to_string(), format!("PATH={SYSTEM_PATH}")]
+        );
     }
 }

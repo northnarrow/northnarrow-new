@@ -128,8 +128,10 @@ fn under_env_dir(f: &str) -> bool {
             .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
 }
 
-/// The loader's variables: harmful in our units' environment whatever the
-/// window (the coordinator's decision on #497's `NN_` drop-ins).
+/// The loader's variables, and those that point a tool the agent runs
+/// elsewhere or redirect systemd's notifications (the last review of #497,
+/// RC1): harmful in our units' environment whatever the window (the
+/// coordinator's decision on #497's `NN_` drop-ins).
 pub const LOADER_ENV: &[&str] = crate::host_dropins::DANGEROUS_ENV_NAMES;
 
 /// The `NN_` switches that weaken the agent when a drop-in of ours sets
@@ -141,7 +143,44 @@ pub const WEAKENING_DROPIN_EXTRA: &[(&str, crate::self_integrity::WeakensWith)] 
     ("NN_EXEC_SENSOR", |v| v.trim() == "tracepoint"),
     ("NN_DNS_SENSOR", |v| v.trim() == "sendmsg"),
     ("NN_EXEC_POLICY", |v| v.trim() == "off"),
+    // the last review of #497 (RC2)
+    ("NN_EXEC_POLICY_NO_ENV", flag_set),
+    ("NN_EXEC_POLICY_NO_MAP", flag_set),
+    ("NN_EXEC_POLICY_PROFILE", |v| v.trim() == "desktop"),
+    ("NN_EXEC_QUARANTINE", |v| v.trim() == "off"),
+    ("NN_EXPLOIT_GUARD", |v| v.trim() == "off"),
+    ("NN_EXPLOIT_GUARD_TASKS", tasks_below_default),
+    ("NN_EXPLOIT_GUARD_RESPONSE", |v| v.trim() == "detect"),
+    ("NN_NET_CONNECT_DENY", |v| {
+        matches!(v.trim(), "0" | "false" | "no" | "off")
+    }),
 ];
+
+/// The agent's `NN_` settings that weaken nothing: each one named, so a
+/// new switch cannot fall among the informative records by oversight (the
+/// last review of #497, NC4 — every `env = "NN_…"` of the agent's command
+/// line is in [`WEAKENING_DROPIN_EXTRA`], [`crate::self_integrity::WEAKENING_ENV`]
+/// or here, a test reads it).
+pub const NEUTRAL_ENV: &[&str] = &[
+    "NN_EXEC_QUARANTINE_BUDGET_MS",
+    "NN_EXEC_QUARANTINE_ON_EXPIRY",
+    "NN_EXEC_QUARANTINE_ON_SUSPICIOUS",
+];
+
+/// A boolean flag set (clap's reading of a `bool` with `env`).
+fn flag_set(v: &str) -> bool {
+    !matches!(v.trim(), "" | "0" | "false" | "no" | "off")
+}
+
+/// An exploit guard's task budget below its default, the host's
+/// `pid_max` (a value that does not parse weakens too).
+fn tasks_below_default(v: &str) -> bool {
+    let pid_max = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .unwrap_or(32_768);
+    v.trim().parse::<u64>().map_or(true, |n| n < pid_max)
+}
 
 /// `name=value` weakens the agent ([`WEAKENING_DROPIN_EXTRA`],
 /// [`crate::self_integrity::WEAKENING_ENV`]).
@@ -213,6 +252,17 @@ pub struct NnSetting {
 }
 
 impl NnSetting {
+    /// Its signed record's kind, and whether it is an alert (High) rather
+    /// than an informative record — a switch that weakens the agent is one
+    /// (the last review of #497, RC3).
+    pub fn record(&self) -> (&'static str, bool) {
+        if self.weakens {
+            ("own_dropin_weakening", true)
+        } else {
+            ("own_dropin_setting", false)
+        }
+    }
+
     pub fn detail(&self) -> String {
         format!(
             "{}={} set by {}{}",
@@ -270,7 +320,7 @@ pub fn nn_settings(roots: &[&Path]) -> Vec<NnSetting> {
                         _ => continue,
                     };
                     for (name, value) in pairs {
-                        if name.starts_with("NN_") {
+                        if name.starts_with("NN_") || name.starts_with("NORTHNARROW_") {
                             out.push(NnSetting {
                                 dropin: from.clone(),
                                 weakens: nn_weakens(&name, &value),
@@ -1443,14 +1493,105 @@ mod tests {
         ] {
             assert!(!nn_weakens(n, v), "{n}={v}");
         }
-        assert_eq!(WEAKENING_DROPIN_EXTRA.len(), 4);
-        assert_eq!(LOADER_ENV, &["LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH"]);
+        assert_eq!(WEAKENING_DROPIN_EXTRA.len(), 12);
+        assert_eq!(
+            LOADER_ENV,
+            &[
+                "LD_PRELOAD",
+                "LD_AUDIT",
+                "LD_LIBRARY_PATH",
+                "XTABLES_LIBDIR",
+                "IPTABLES_LIB_DIR",
+                "RPM_CONFIGDIR",
+                "NOTIFY_SOCKET"
+            ]
+        );
+        // the last review of #497 (RC2)
+        for (n, v) in [
+            ("NN_EXEC_POLICY_NO_ENV", "1"),
+            ("NN_EXEC_POLICY_NO_MAP", "true"),
+            ("NN_EXEC_POLICY_PROFILE", "desktop"),
+            ("NN_EXEC_QUARANTINE", "off"),
+            ("NN_EXPLOIT_GUARD_TASKS", "100"),
+            ("NN_EXPLOIT_GUARD_RESPONSE", "detect"),
+            ("NN_NET_CONNECT_DENY", "0"),
+            ("NORTHNARROW_DRY_RUN", "1"),
+        ] {
+            assert!(nn_weakens(n, v), "{n}={v}");
+        }
+        for (n, v) in [
+            ("NN_EXEC_POLICY_NO_ENV", "0"),
+            ("NN_EXEC_POLICY_PROFILE", "server"),
+            ("NN_EXEC_QUARANTINE", "enforce"),
+            ("NN_EXPLOIT_GUARD_TASKS", "99999999"),
+            ("NN_EXPLOIT_GUARD_RESPONSE", "kill"),
+            ("NN_NET_CONNECT_DENY", "1"),
+        ] {
+            assert!(!nn_weakens(n, v), "{n}={v}");
+        }
         assert_eq!(
             env_file_assignments("# c\nexport NN_A=1\nNN_B=\"x\"\n"),
             vec![
                 ("NN_A".to_string(), "1".to_string()),
                 ("NN_B".to_string(), "x".to_string())
             ]
+        );
+    }
+
+    /// The last review of #497 (NC4): every `NN_` / `NORTHNARROW_` variable
+    /// the agent's and the watchdog's command lines read is classified —
+    /// a weakening switch or a neutral setting — so a new one cannot fall
+    /// among the informative records by oversight.
+    #[test]
+    fn every_nn_variable_of_the_command_line_is_classified() {
+        let weakening: Vec<&str> = crate::self_integrity::WEAKENING_ENV
+            .iter()
+            .chain(WEAKENING_DROPIN_EXTRA)
+            .map(|(n, _)| *n)
+            .collect();
+        let mut seen = 0;
+        for text in [
+            include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/cli.rs")),
+            include_str!(concat!(env!("NN_REPO_ROOT"), "/watchdog/src/main.rs")),
+            include_str!(concat!(env!("NN_REPO_ROOT"), "/watchdog/src/lib.rs")),
+        ] {
+            for part in text.split("env = \"").skip(1) {
+                let name = part.split('"').next().unwrap();
+                if !(name.starts_with("NN_") || name.starts_with("NORTHNARROW_")) {
+                    continue;
+                }
+                seen += 1;
+                assert!(
+                    weakening.contains(&name) || NEUTRAL_ENV.contains(&name),
+                    "{name}: classify it — a switch that weakens the agent \
+                     (WEAKENING_DROPIN_EXTRA) or a neutral setting (NEUTRAL_ENV)"
+                );
+            }
+        }
+        assert!(seen >= 26, "{seen} bindings read");
+    }
+
+    /// The last review of #497 (RC3): a weakening switch is a High alert,
+    /// a plain setting an informative record.
+    #[test]
+    fn a_weakening_switch_is_an_alert_a_setting_a_record() {
+        let s = |name: &str, value: &str| NnSetting {
+            dropin: PathBuf::from("/x.conf"),
+            name: name.to_string(),
+            value: value.to_string(),
+            weakens: nn_weakens(name, value),
+        };
+        assert_eq!(
+            s("NN_EXEC_POLICY", "off").record(),
+            ("own_dropin_weakening", true)
+        );
+        assert_eq!(
+            s("NN_EXEC_POLICY", "audit").record(),
+            ("own_dropin_setting", false)
+        );
+        assert_eq!(
+            s("NORTHNARROW_DRY_RUN", "1").record(),
+            ("own_dropin_weakening", true)
         );
     }
 }

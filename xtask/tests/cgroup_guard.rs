@@ -945,10 +945,8 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
             "return;",
             "crate::own_dropins::quarantine(",
             "crate::own_dropins::nn_settings(&search)",
-            "\"own_dropin_weakening\"",
-            "\"own_dropin_setting\"",
-            "self.report_once(f, at_boot);",
-            "self.record_once(f, at_boot);",
+            "let (kind, alert) = n.record();",
+            "if alert {\n                self.report_once(f, at_boot);\n            } else {\n                self.record_once(f, at_boot);",
             "crate::own_dropins::preinstall_harmful(",
             "kind: \"own_dropin_preinstall_harmful\",",
         ],
@@ -1127,8 +1125,10 @@ fn the_units_own_slice_is_a_service_tier() {
         &[
             "let sys = slice(slice_slot::SYSTEM);",
             "let ours = slice(slice_slot::OURS);",
-            "if cg1 != 0 && (cg1 == sys || cg1 == ours) {",
+            "if cg1 != 0 && cg1 == sys {",
             "return tier::SERVICE | sig | tier_sig::SYSTEM_SLICE;",
+            "if cg1 != 0 && cg1 == ours {",
+            "return tier::SERVICE | sig | tier_sig::OUR_SLICE;",
         ],
     )
     .unwrap();
