@@ -6063,7 +6063,8 @@ number in parentheses is a lab PR.
         missing, none other, every record verified; the netflow chain
         rotated under the export (0 → 1 archive, in 18 s and 51 s): 23,144
         and 23,258 rows, none missing, none other, the capture verified
-        across the rotation, no `cursor_ahead` note; `TAMPERED` (exit 13)
+        across the rotation, every row once (0 duplicate records: a read
+        "ahead" sends the chain again); `TAMPERED` (exit 13)
         for a rewritten record, `BROKEN` (11) for a cut tail without its
         terminator, `EMPTY` (2) for an empty capture. `caught-up` failed
         on both: the poll above.
@@ -6074,7 +6075,7 @@ number in parentheses is a lab PR.
       - Round 7 (abd82e59, the merge with lot 275), Debian 12: setup,
         arrive (111 rows), the rotation (0 → 1 archive in 29 s; 23,769
         rows) and verify's `TAMPERED`, `BROKEN` and `EMPTY` all passed,
-        both sinks caught up, no `cursor_ahead` note.
+        both sinks caught up, every row once.
       - The phase that killed the worker from the guest script until the
         supervisor disabled it (D4) measured nothing in rounds 5 to 7: the
         script ended at its first kill. Round 7's probe found why: that
@@ -6107,6 +6108,73 @@ number in parentheses is a lab PR.
       judges the worker's connect to a receiver at a public address (by
       address, never a name): `EXPORT.md` says to list it in
       `nodns-allow.local`.
+  - Second review of #499 (at e74d77af, after the merge with lot 275): no
+    blocker; three points to fix that the first review's fixes had opened,
+    one test missing, five notes — each closed with its test:
+    - R1: the rotation's second window (the archive renamed, the new
+      active file not made yet) — the read took the current file for
+      "evicted", went on to the next, "ahead", and back to the chain's
+      oldest file. The current file not there is now "nothing for now":
+      the read waits (the reviewer's test); after a rotation the core
+      signs `active_missing` once when the wait passes 30 s — a creation
+      that keeps failing is said, never silent.
+    - R2: `nn-admin export verify` called TAMPERED a genuine action
+      outcome whose intent its input did not hold (a file rotated between
+      them, a capture started after the intent): it now says PARTIAL
+      (exit 3) — the outcome's own fields compared, its intent's (class,
+      target, reasons, severity, message) said not verifiable there; an
+      own field rewritten stays TAMPERED (13), whose verdict now says
+      which (a row not signed, or a record rewritten: it said "not
+      signed" of a signed row).
+    - R3: a signed configuration with fewer JSONL files left the earlier
+      ones, which the core took for a stranger's and killed the honest
+      worker. The sink's open now removes the `export.jsonl.N` at or past
+      the new count (regular files only, read with `newfstatat` without
+      following a link — the export worker's seccomp keeps that one call,
+      its arguments pinned by a test) and rotates an active file past the
+      new size; the core judges the directory from the first setup of the
+      run, against the bound and the bytes of the files an earlier
+      configuration wrote larger than this one's.
+    - R4: the round's poll (lot 276's fifth lab) was decided in `round`
+      itself, its test a tautology (the reviewer's R6 survived): the
+      decision is `plan`, tested; R6, R7 (`MakeSym` in the directory's
+      rule) and R8 (an unreadable file taken as holding the cursor) are
+      caught by named tests.
+    - Notes closed: the netflow rows without `inbound` are Outbound (2);
+      EXPORT.md and RULE_POLICY.md on NN-L-NET-028 and the export worker
+      (a public receiver reached by address, the `enforce` case); the
+      umask test writes in a process of its own; the README's box; the
+      fields no signature covers (`device.hostname`, `device.uid`,
+      `metadata.product.version`) named in EXPORT.md §6. The rest is in
+      the backlog.
+    - Found by the lab's round 10, fixed: the first form of R3 raised the
+      core's bound only to the directory's bytes at the setup — at 64 MiB
+      to 1 MiB files the honest worker was killed at its first write (the
+      directory 52,959,031 bytes for a bound of 52,957,727) and the file
+      sink stopped; the bound now adds those larger files' bytes. And the
+      lab script's counts of `cursor_ahead` and eviction notes read
+      `journalctl -u northnarrow-agent`, which holds systemd's lines only
+      (the agent logs in its journal namespace): rounds 5 to 10 could see
+      no note there. Their rotation results stand on the captures (every
+      row once, 0 duplicate records: a read "ahead" sends the chain
+      again); round 11 counts the notes in the agent's journal.
+    - Mutations, runs 6 and 7 (31 on the second review's fixes and the
+      allowance): 29 caught by named tests at first; MC3 (another file's
+      wait taken as the same) and MF1 (a file's bound without its line's
+      1 MiB) survived, got their tests, and are caught.
+    - Lab: round 11 (ddf3ff45), Debian 12, under lease k276: 10 steps,
+      the export's 39 checks all passed — the rotation under load (0 → 1
+      archive in 32 s; 23,763 rows, none missing, none twice; 0
+      `cursor_ahead`, 0 eviction or `active_missing` notes, counted in the
+      agent's journal), the protection (5 of 5), `verify` on the COMBAT
+      ladder's own intent and outcome (with its intent OK; the outcome
+      alone PARTIAL, 3; its status rewritten TAMPERED, 13), and the file
+      configuration made smaller with a restart each time: from 64 MiB to
+      1 MiB files the 53 MB file kept while eight new ones filled (the
+      allowance) and the worker never killed, then from 8 files to 2 the
+      `.2` to `.4` removed at the sink's open, the worker's pid unchanged,
+      the file sink up with no fault, no directory note since the phase's
+      start; then off, `uninstall --purge`, the guest powered off clean.
   - Level: C21 0 → 1. A signed, verifiable export of the detections and
     the other chains to a file and a SIEM's syslog, off by default,
     measured on two kernels (one with the pin, one without); not 2: no

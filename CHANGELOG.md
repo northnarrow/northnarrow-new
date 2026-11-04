@@ -71,8 +71,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sink's open (the files past the new count removed, regular files only —
   the worker's seccomp gains `newfstatat` without following a link —, an
   active file past the new size rotated), and the core judges the export's
-  directory from the first setup, never below the bytes it held then: the
-  honest worker is no longer killed for an earlier configuration's files.
+  directory from the first setup against its bound and the bytes of the
+  files an earlier configuration wrote larger than this one's: the honest
+  worker is no longer killed for them (lot 276's tenth lab found the first
+  form of this fix killing it).
 - Network telemetry, level 2 of C07 (lot 275,
   `docs/operator/NETWORK_TELEMETRY.md`): three new sources of the bus,
   each with its sensor-contract entry, its attach state in the signed
