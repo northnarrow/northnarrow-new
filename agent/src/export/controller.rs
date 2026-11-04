@@ -26,8 +26,8 @@ use nn_linux::chain_host_linux::LinuxHost;
 use nn_linux::worker::{Health, WorkerError, Workers};
 use nn_proto::admin_protocol::{ExportChainStatus, ExportSinkStatus};
 use nn_proto::ipc::{
-    Answer, ExportAddr, ExportChain, ExportRows, ExportRowsOut, ExportSetup, ExportSink, FileSetup,
-    Request, RowPos, SinkFault, SinkState, SyslogSetup, WorkerKind, MAX_EXPORT_BYTES,
+    Answer, ExportAddr, ExportChain, ExportRow, ExportRows, ExportRowsOut, ExportSetup, ExportSink,
+    FileSetup, Request, RowPos, SinkFault, SinkState, SyslogSetup, WorkerKind, MAX_EXPORT_BYTES,
     MAX_EXPORT_ROWS, MAX_RECORDS_PER_ROW,
 };
 use parking_lot::Mutex;
@@ -650,6 +650,55 @@ fn apply(c: &mut ChainRun, sent: Vec<Sent>, out: &ExportRowsOut) -> Result<Appli
     Ok(Applied { delivered })
 }
 
+/// The rows of a batch a request can carry: each row alone within the
+/// protocol's bounds (`ExportRows::check`), and together; the rest
+/// `(file, line)`, lost. The WAL already holds a batch to them (its bytes,
+/// order, blank lines): this is the core's last check before it sends.
+fn sendable(
+    sink: ExportSink,
+    chain: ExportChain,
+    rows: Vec<ExportRow>,
+    hashes: Vec<String>,
+) -> (Vec<ExportRow>, Vec<String>, Vec<(u64, u64)>) {
+    let alone = |r: &ExportRow| {
+        ExportRows {
+            sink,
+            chain,
+            rows: vec![r.clone()],
+            budget_ms: BUDGET.as_millis() as u32,
+        }
+        .check()
+        .is_ok()
+    };
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut kept_hashes = Vec::with_capacity(rows.len());
+    let mut dropped = Vec::new();
+    for (r, h) in rows.into_iter().zip(hashes) {
+        if alone(&r) {
+            kept.push(r);
+            kept_hashes.push(h);
+        } else {
+            dropped.push((r.file, r.line));
+        }
+    }
+    // together: the longest prefix the check takes (the rest is read again)
+    let together = |rows: &[ExportRow]| {
+        ExportRows {
+            sink,
+            chain,
+            rows: rows.to_vec(),
+            budget_ms: BUDGET.as_millis() as u32,
+        }
+        .check()
+        .is_ok()
+    };
+    while kept.len() > 1 && !together(&kept) {
+        kept.pop();
+        kept_hashes.pop();
+    }
+    (kept, kept_hashes, dropped)
+}
+
 /// Whether a request's error means the worker is set up again: it died,
 /// hung or lied, and the supervisor starts another. Never for a busy slot,
 /// nor for the core's own request out of its bounds (never sent: the
@@ -710,10 +759,48 @@ fn round(p: &Params, k: &mut SinkRun, i: usize, set_up_for: &mut Option<u64>) ->
         }
         return false;
     }
+    // what the protocol's check would refuse is never sent: a row no
+    // request carries is lost here, counted (stage 8) and signed, and the
+    // rest goes — the window holds only what was sent (the review of #499,
+    // D3: a refused request read again every round, the window cleared
+    // under rows the worker still held)
+    let next_after = batch.next.clone();
+    let (rows, hashes, dropped) = sendable(sink, c.src.chain, batch.rows, batch.hashes);
+    if !dropped.is_empty() {
+        c.lost += dropped.len() as u64;
+        for (file, line) in &dropped {
+            warn!(
+                sink = sink.name(),
+                chain = c.src.chain.name(),
+                file,
+                line,
+                "export: a row no request carries, lost"
+            );
+            sign(
+                &p.audit,
+                "detected",
+                serde_json::json!({
+                    "at": "note", "note": "unsendable", "sink": sink.name(),
+                    "chain": c.src.chain.name(), "file": file, "line": line,
+                }),
+            );
+        }
+    }
+    if rows.is_empty() {
+        if let Some(n) = next_after {
+            if c.window.is_empty() && n != c.cursor {
+                c.cursor = n.clone();
+                c.dirty = true;
+            }
+            c.next = n;
+        }
+        return false;
+    }
+    let batch_hashes = hashes;
     let req = ExportRows {
         sink,
         chain: c.src.chain,
-        rows: batch.rows,
+        rows,
         budget_ms: BUDGET.as_millis() as u32,
     };
     let answer = p.workers.request(
@@ -726,10 +813,23 @@ fn round(p: &Params, k: &mut SinkRun, i: usize, set_up_for: &mut Option<u64>) ->
         Ok(_) => return false, // the protocol's check refuses another kind
         Err(e) if !sets_up_again(&e) => {
             if let WorkerError::Refused(why) = &e {
+                // never sent (`sendable` keeps this from happening): the
+                // worker's state did not change, the window stays; the
+                // rows are skipped, counted, so that no round repeats them
                 k.faults += 1;
+                c.lost += req.rows.len() as u64;
                 warn!(sink = sink.name(), chain = c.src.chain.name(), %why, "export: a request out of its bounds was not sent");
-                c.window.clear();
-                c.next = c.cursor.clone();
+                sign(
+                    &p.audit,
+                    "detected",
+                    serde_json::json!({
+                        "at": "note", "note": "unsendable", "sink": sink.name(),
+                        "chain": c.src.chain.name(), "rows": req.rows.len(), "why": why,
+                    }),
+                );
+                if let Some(n) = next_after {
+                    c.next = n;
+                }
             }
             return false;
         }
@@ -745,7 +845,7 @@ fn round(p: &Params, k: &mut SinkRun, i: usize, set_up_for: &mut Option<u64>) ->
     let sent: Vec<Sent> = req
         .rows
         .iter()
-        .zip(batch.hashes)
+        .zip(batch_hashes)
         .map(|(r, h)| Sent {
             pos: r.pos(),
             end: r.end,
@@ -894,6 +994,45 @@ mod tests {
         c.cursor = sent(5).cursor();
         assert!(apply(&mut c, vec![], &out(Some(4), Some(5), 0)).is_ok());
         assert_eq!(c.cursor.pos().line, 5, "the cursor never goes back");
+    }
+
+    #[test]
+    fn a_row_no_request_carries_is_dropped_the_rest_sent() {
+        let row = |line: u64, raw: &[u8]| ExportRow {
+            file: 1,
+            line,
+            end: 100 * line,
+            raw: raw.to_vec(),
+            rotate: None,
+        };
+        let h = |n: usize| (0..n).map(|i| format!("h{i}")).collect::<Vec<_>>();
+        // a blank row in the middle: dropped, the others kept in order
+        let (kept, hashes, dropped) = sendable(
+            ExportSink::File,
+            ExportChain::Detections,
+            vec![row(1, b"{}"), row(2, b""), row(3, b"{}")],
+            h(3),
+        );
+        assert_eq!(kept.iter().map(|r| r.line).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(hashes, ["h0", "h2"]);
+        assert_eq!(dropped, [(1, 2)]);
+        // out of order together: the longest prefix the check takes
+        let (kept, _, dropped) = sendable(
+            ExportSink::File,
+            ExportChain::Detections,
+            vec![row(1, b"{}"), row(3, b"{}"), row(2, b"{}")],
+            h(3),
+        );
+        assert_eq!(kept.iter().map(|r| r.line).collect::<Vec<_>>(), [1, 3]);
+        assert!(dropped.is_empty());
+        // a request of what is kept always passes
+        let req = ExportRows {
+            sink: ExportSink::File,
+            chain: ExportChain::Detections,
+            rows: kept,
+            budget_ms: 1000,
+        };
+        assert_eq!(req.check(), Ok(()));
     }
 
     #[test]
