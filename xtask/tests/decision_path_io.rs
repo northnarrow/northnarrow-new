@@ -256,7 +256,7 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        21,
+        22,
         "the lineage's /proc reads for the lookups outside a judgement (`AsOf::Now`, \
          `AsOf::Live`: the pumps', the admin's, the responses'), its boot-time scan \
          (`seed_from_proc`) and its sweep (`sweep` and its orphans' adoption, \
@@ -265,7 +265,10 @@ const KNOWN: &[(&str, usize, &str)] = &[
          exec checked against the process its pid names now: `cached_live`) and, for a pid \
          the cache does not hold, a fork's parent and start, exe and uid (`fork_entry`: the \
          parent's cached image accepted only when `/proc/<pid>/exe` is that file — the \
-         re-review of #475); never a process's image read as its identity in a judgement",
+         re-review of #475); never a process's image read as its identity in a judgement; \
+         lot 275 (the second review of #495, R1): `in_init_mount_ns`, read by the DNS \
+         response pump only (a response's receiver in the host's mount namespace), not in a \
+         judgement",
     ),
     (
         "crates/nn-core/src/posture/triggers.rs",
