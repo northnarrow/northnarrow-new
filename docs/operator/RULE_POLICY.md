@@ -87,8 +87,8 @@ by anyone but systemd's placement, or started by `CLONE_INTO_CGROUP` by
 anyone but PID 1. A process it forks after that is marked too, before it
 runs, and the mark goes when its last thread exits. A new process starts
 with nothing at its pid, whatever a dead process left there (a move of a
-process already exiting marks after its exit: the review of #494, N5). The rule's match of a
-marked process is not exempt by `cgroup` or `unit`. An exemption by `uid` or
+process already exiting marks after its exit: the review of #494, N5).
+The rule's match of a marked process is not exempt by `cgroup` or `unit`. An exemption by `uid` or
 `exe` still covers it: those name the actor, not where it runs. systemd's
 placement is a move PID 1 makes (a unit's process at its start, a scope's
 process, a process systemd was asked to attach), or the move a child of
