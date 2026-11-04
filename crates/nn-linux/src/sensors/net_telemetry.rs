@@ -320,8 +320,8 @@ fn floods(
 /// One pass over the DNS response ring: each record decoded, the table
 /// fed, its events into `outbox`. Returns the records read.
 #[allow(clippy::too_many_arguments)]
-fn answer_pass(
-    ring: &mut RingBuf<MapData>,
+fn answer_pass<R: crate::sensors::pump::RingSource>(
+    ring: &mut R,
     table: &ResolvedTable,
     lineage: &AuthSessionTracker,
     parse: &ParseClient,
@@ -339,14 +339,13 @@ fn answer_pass(
     let size = std::mem::size_of::<DnsAnswerRaw>();
     let mut raws: Vec<DnsAnswerRaw> = Vec::new();
     let mut drained = 0u32;
-    while let Some(item) = ring.next() {
+    while ring.next_record(&mut |bytes: &[u8]| {
         drained += 1;
-        let bytes: &[u8] = item.as_ref();
         match bytemuck::try_from_bytes::<DnsAnswerRaw>(bytes) {
             Ok(r) => raws.push(*r),
             Err(_) => reject.record(DNS_ANSWER_LABEL, size, bytes.len()),
         }
-    }
+    }) {}
     for raw in &raws {
         let bytes = captured_payload(raw);
         // `None`: the worker did not answer; `Some(None)`: no DNS response
@@ -1131,6 +1130,46 @@ mod tests {
             crate::net::resolved::judge(&t, &lineage, 777, 1, c2, connect, caught),
             DnsResolution::Lineage
         );
+    }
+
+    /// Review of #495, D3: a response lost before the pass (its ring, a
+    /// budget) degrades the evidence host-wide at the pass's start; a pass
+    /// with no loss does not.
+    #[test]
+    fn a_response_pass_after_a_loss_degrades_every_process() {
+        use nn_model::telemetry::DnsResolution;
+        struct Empty;
+        impl crate::sensors::pump::RingSource for Empty {
+            fn next_record(&mut self, _f: &mut dyn FnMut(&[u8])) -> bool {
+                false
+            }
+            fn wait(&mut self, _timeout_ms: i32) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        let c2: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        for (reads, unknown) in [
+            (&[Some(0), Some(3)][..], true),
+            (&[Some(3), Some(3)][..], false),
+        ] {
+            let t = ResolvedTable::default();
+            let mut losses = crate::sensors::ring_drops::LossWatch::scripted(reads);
+            answer_pass(
+                &mut Empty,
+                &t,
+                &lineage,
+                &ParseClient::new(None),
+                &mut losses,
+                &mut RejectThrottle::new(),
+                &mut VecDeque::new(),
+                &mut PassStats::default(),
+            );
+            let now = crate::net::dns_ingest::monotonic_ns();
+            let got = t.check(4242, 1, c2, now, Vec::new);
+            assert_eq!(got == DnsResolution::Unknown, unknown, "{reads:?}: {got:?}");
+        }
     }
 
     /// Review of #495, RA5: only the bytes the sensor copied are decoded.

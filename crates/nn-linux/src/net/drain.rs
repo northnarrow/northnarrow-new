@@ -1645,6 +1645,34 @@ mod tests {
     /// connect's destination, not the port 0 the kernel left on a refused
     /// connect. No wait for a close whose connect is old, is announced,
     /// is a kernel lookup miss, for a UDP record, or with no connect pump.
+    /// Review of #495, D2: the net drain's barrier is reached only when both
+    /// DNS pumps read the records made before the batch's newest; the TLS
+    /// pump's wait does not count for it.
+    #[tokio::test]
+    async fn the_drain_barrier_needs_both_dns_pumps() {
+        let dns = Arc::new(DnsCache::default());
+        let resolved = Arc::new(crate::net::resolved::ResolvedTable::default());
+        let tls = crate::net::dns_ingest::DnsIngest::default();
+        let old = crate::net::dns_ingest::monotonic_ns() - 2_000_000_000;
+        let mut raw = NetFlowCloseRaw::zeroed();
+        raw.timestamp_ns = old;
+        let batch = [raw];
+        assert!(
+            attribution_barrier(&[], &dns, &resolved, None).await,
+            "an empty batch"
+        );
+        assert!(
+            !attribution_barrier(&batch, &dns, &resolved, None).await,
+            "no pump"
+        );
+        let _names = crate::net::dns_cache::IngestClaim::new(Arc::clone(&dns));
+        let _answers = crate::net::resolved::ResolvedClaim::new(Arc::clone(&resolved), 1);
+        dns.ingest().pass_ended(old + 1);
+        assert!(!attribution_barrier(&batch, &dns, &resolved, Some(&tls)).await);
+        resolved.ingest().pass_ended(old + 1);
+        assert!(attribution_barrier(&batch, &dns, &resolved, Some(&tls)).await);
+    }
+
     #[tokio::test]
     async fn a_close_is_held_until_its_connect_is_on_the_bus() {
         use std::time::Instant as StdInstant;

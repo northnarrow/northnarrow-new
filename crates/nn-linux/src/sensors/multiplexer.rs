@@ -1410,6 +1410,19 @@ impl Drop for ConnectPumpClaim {
     }
 }
 
+/// Wait until both DNS pumps have read the records made before `newest`
+/// (the queries for the attribution, the responses for NN-L-NET-028):
+/// `false` when either wait ended first (review of #495, D2).
+fn dns_barrier(w: &ConnectWiring, newest: u64, rt: &tokio::runtime::Handle) -> bool {
+    let (names, answers) = rt.block_on(async {
+        tokio::join!(
+            w.dns_cache.ingest().caught_up(newest),
+            w.resolved.ingest().caught_up(newest)
+        )
+    });
+    names && answers
+}
+
 /// Connect records on the bus ([`connect_events`], in order, in batches),
 /// then, lab PR 246, announced to the flow tracker: each one's close, held
 /// by the net drain until then, follows it on the bus. `false` when the
@@ -1480,13 +1493,7 @@ fn pump_tcp_connect(
             // Lot 275: and once the DNS response pump has read the responses
             // received before them (NN-L-NET-028's judgement). Review of
             // #495, D2: a wait that ended first leaves the judgement unknown.
-            let (names, answers) = rt.block_on(async {
-                tokio::join!(
-                    w.dns_cache.ingest().caught_up(newest),
-                    w.resolved.ingest().caught_up(newest)
-                )
-            });
-            caught_up = names && answers;
+            caught_up = dns_barrier(w, newest, rt);
         }
         if !send_connects(&batch, flow_tracker.as_ref(), caught_up, tx, rt) {
             return Ok(());
@@ -1871,8 +1878,8 @@ enum DnsStep {
 /// is marked in the cache's [`crate::net::dns_cache::DnsIngest`] with the
 /// time it began — every record submitted before it has been read.
 #[allow(clippy::too_many_arguments)]
-fn dns_pass(
-    ring: &mut RingBuf<MapData>,
+fn dns_pass<R: crate::sensors::pump::RingSource>(
+    ring: &mut R,
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
     resolved: Option<&crate::net::resolved::ResolvedTable>,
@@ -1892,14 +1899,13 @@ fn dns_pass(
     // R14b: the pass's records first (copied off the ring), then their
     // names decoded by the parse worker in batches, then the events
     let mut raws: Vec<DnsQueryRaw> = Vec::new();
-    while let Some(item) = ring.next() {
+    while ring.next_record(&mut |bytes: &[u8]| {
         drained += 1;
-        let bytes: &[u8] = item.as_ref();
         match bytemuck::try_from_bytes::<DnsQueryRaw>(bytes) {
             Ok(raw) => raws.push(*raw),
             Err(_e) => reject.record("dns_query", std::mem::size_of::<DnsQueryRaw>(), bytes.len()),
         }
-    }
+    }) {}
     let decoded = if raws.is_empty() {
         Vec::new()
     } else {
@@ -2071,6 +2077,86 @@ mod tests {
 
     /// Lab PR 224 (CM-02 a): a connect becomes its `TcpConnect` and then
     /// its connect-time row (image and DNS name read now) for the rules,
+    /// A ring of the tests: its records, then empty.
+    struct FakeRing(std::collections::VecDeque<Vec<u8>>);
+
+    impl crate::sensors::pump::RingSource for FakeRing {
+        fn next_record(&mut self, f: &mut dyn FnMut(&[u8])) -> bool {
+            match self.0.pop_front() {
+                Some(r) => {
+                    f(&r);
+                    true
+                }
+                None => false,
+            }
+        }
+        fn wait(&mut self, _timeout_ms: i32) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Review of #495, D2: the connect pump's barrier is reached only when
+    /// both DNS pumps have read the records made before the connects — a
+    /// pump not running, or one behind, leaves it unreached.
+    #[test]
+    fn the_connect_barrier_needs_both_dns_pumps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let w = wiring(AuthSessionTracker::new(tmp.path()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // well past the wait: no waiting in the test
+        let old = crate::net::dns_ingest::monotonic_ns() - 2_000_000_000;
+        assert!(!dns_barrier(&w, old, rt.handle()), "no pump runs");
+        let _names = crate::net::dns_cache::IngestClaim::new(Arc::clone(&w.dns_cache));
+        let _answers = crate::net::resolved::ResolvedClaim::new(Arc::clone(&w.resolved), 1);
+        assert!(!dns_barrier(&w, old, rt.handle()), "both behind");
+        w.dns_cache.ingest().pass_ended(old + 1);
+        assert!(
+            !dns_barrier(&w, old, rt.handle()),
+            "the response pump behind"
+        );
+        w.resolved.ingest().pass_ended(old + 1);
+        assert!(dns_barrier(&w, old, rt.handle()));
+        // a connect the queries' pump had not passed
+        assert!(!dns_barrier(&w, old + 2, rt.handle()));
+    }
+
+    /// Review of #495, D3: a DNS query lost before the pass (its ring, a
+    /// budget) degrades the evidence host-wide at the pass's start.
+    #[test]
+    fn a_query_pass_after_a_loss_degrades_every_process() {
+        use nn_model::telemetry::DnsResolution;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        let c2: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        for (reads, unknown) in [
+            (&[Some(5), Some(6)][..], true),
+            (&[Some(5), Some(5)][..], false),
+            (&[Some(5), None][..], true),
+        ] {
+            let t = crate::net::resolved::ResolvedTable::default();
+            let mut losses = crate::sensors::ring_drops::LossWatch::scripted(reads);
+            let mut parse = ParseClient::new(None);
+            let mut reject = RejectThrottle::new();
+            let mut outbox = VecDeque::new();
+            dns_pass(
+                &mut FakeRing(Default::default()),
+                &lineage,
+                None,
+                Some(&t),
+                &mut parse,
+                &mut losses,
+                &mut reject,
+                &mut outbox,
+            );
+            let now = crate::net::dns_ingest::monotonic_ns();
+            let got = t.check(4242, 1, c2, now, Vec::new);
+            assert_eq!(got == DnsResolution::Unknown, unknown, "{reads:?}: {got:?}");
+        }
+    }
+
     /// with the flow pending for its close. The starting tree sent the
     /// `TcpConnect` alone: no rule judged an open flow.
     #[test]

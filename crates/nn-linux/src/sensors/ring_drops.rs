@@ -52,6 +52,9 @@ pub struct LossWatch {
     map: Option<Arc<PerCpuArray<MapData, u64>>>,
     slots: &'static [u32],
     last: Option<u64>,
+    /// Tests: the reads to give, in order, in place of a map's.
+    #[cfg(test)]
+    script: Option<std::collections::VecDeque<Option<u64>>>,
 }
 
 impl LossWatch {
@@ -61,7 +64,19 @@ impl LossWatch {
             map: None,
             slots: &[],
             last: None,
+            #[cfg(test)]
+            script: None,
         }
+    }
+
+    /// Tests: a watch whose reads are `reads`, the first the base.
+    #[cfg(test)]
+    pub fn scripted(reads: &[Option<u64>]) -> Self {
+        let mut w = Self::none();
+        let mut q: std::collections::VecDeque<Option<u64>> = reads.iter().copied().collect();
+        w.last = q.pop_front().flatten();
+        w.script = Some(q);
+        w
     }
 
     /// The slots' sum now; `None` when it cannot be read.
@@ -78,6 +93,11 @@ impl LossWatch {
     /// The losses grew since the last call: a loss, or counters that
     /// cannot be read (no evidence of none). The first read sets the base.
     pub fn grew(&mut self) -> bool {
+        #[cfg(test)]
+        if let Some(q) = self.script.as_mut() {
+            let now = q.pop_front().unwrap_or(self.last);
+            return self.grew_to(now);
+        }
         if self.map.is_none() {
             return false;
         }
@@ -107,6 +127,8 @@ impl RingDrops {
             map: self.map.clone(),
             slots,
             last: None,
+            #[cfg(test)]
+            script: None,
         };
         if w.map.is_some() {
             let now = w.read();
