@@ -1388,7 +1388,15 @@ precision its first judge of the host's drop-ins lacked.
     the agent's own list plus a sensor's fallback and `NN_EXEC_POLICY=off`
     in `WEAKENING_DROPIN_EXTRA`, a High `own_dropin_weakening`); a loader
     variable stays harmful, and `install.sh` lists `NN_` settings as kept
-    configuration. The units' own slice is a service tier for the exec
+    configuration. The last review of #497: the system tools the agent
+    runs (`iptables-restore`, `rpm`, … through `SystemBin`) get a fixed
+    minimal environment (the unit's `PATH`, `LANG=C`), never the agent's —
+    and `XTABLES_LIBDIR`, `IPTABLES_LIB_DIR`, `RPM_CONFIGDIR` and
+    `NOTIFY_SOCKET` are harmful in any drop-in that reaches our units
+    (RC1); every `NN_` variable of the command line is classified as a
+    weakening switch or a neutral setting, a test reads them (RC2, NC4);
+    the exec policy names our slice `northnarrow.slice` (NC2). The units'
+    own slice is a service tier for the exec
     policy, as `system.slice` was for them (`EXECPOL_SLICES[OURS]`, NB5: a
     regression of this lot's slice, fixed).
 - **The judge, precise** (the re-check of #492). A slice's floors follow

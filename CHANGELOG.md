@@ -971,7 +971,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     of our units is configuration again — kept, write-protected, each one
     signed (`own_dropin_setting`, a High `own_dropin_weakening` for a
     switch that weakens the agent), listed by `install.sh` as kept — and
-    only a loader variable gets such a drop-in quarantined.
+    only a loader variable gets such a drop-in quarantined; the system
+    tools the agent runs get a fixed minimal environment, and
+    `XTABLES_LIBDIR`, `IPTABLES_LIB_DIR`, `RPM_CONFIGDIR`, `NOTIFY_SOCKET`
+    are harmful in a drop-in that reaches our units; the weakening
+    switches cover the exec policy's, the exec quarantine's, the exploit
+    guard's and the connect deny's, and every `NN_` variable of the command
+    line is classified.
   Still open (`docs/design/ANTITAMPER_TRUST_MODEL.md`, "Lot 273d",
   Residual): the seven sysctls judged by value are judged on the bytes the
   hook reads before the kernel copies them — a root writer's second thread

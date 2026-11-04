@@ -481,10 +481,18 @@ others. What an operator sees change:
     the drop-in), and a switch that weakens it — `NN_ANTI_TAMPER_ALLOW_DEGRADED`,
     `NN_AUDIT_ALLOW_UNWRITABLE`, `NN_DETECT_ONLY`, a sensor back to its
     fallback (`NN_FILE_OPEN_SENSOR=tracepoint`, `NN_EXEC_SENSOR=tracepoint`,
-    `NN_DNS_SENSOR=sendmsg`), `NN_EXEC_POLICY=off`, the others the agent's
-    own start flags — is a High `own_dropin_weakening`. `install.sh`
-    lists them as kept configuration and never refuses for them. A loader
-    variable (`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`) stays harmful:
+    `NN_DNS_SENSOR=sendmsg`), `NN_EXEC_POLICY=off`, `NN_EXEC_POLICY_NO_ENV`,
+    `NN_EXEC_POLICY_NO_MAP`, `NN_EXEC_POLICY_PROFILE=desktop`,
+    `NN_EXEC_QUARANTINE=off`, `NN_EXPLOIT_GUARD=off`, an
+    `NN_EXPLOIT_GUARD_TASKS` below the host's `pid_max`,
+    `NN_EXPLOIT_GUARD_RESPONSE=detect`, `NN_NET_CONNECT_DENY=0`,
+    `NORTHNARROW_DRY_RUN`, the others the agent's own start flags — is a
+    High `own_dropin_weakening`. `install.sh` lists them as kept
+    configuration and never refuses for them. A loader variable
+    (`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`), or one that points a
+    tool the agent runs elsewhere (`XTABLES_LIBDIR`, `IPTABLES_LIB_DIR`,
+    `RPM_CONFIGDIR`) or redirects systemd's notifications (`NOTIFY_SOCKET`),
+    stays harmful:
     the drop-in is quarantined, and so is one that sets an `NN_` variable
     beside something harmful.
   - A package install or upgrade (`.deb`, `.rpm`) runs the check as a

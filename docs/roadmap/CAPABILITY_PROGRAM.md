@@ -5321,7 +5321,16 @@ number in parentheses is a lab PR.
     NB4). To lot 280: the tracker's marks taken as lost while
     `ftrace_enabled` is 0, `kprobes/enabled`, tracepoints as a channel
     ftrace does not carry (NB1); to the Wave 4 backlog: an `nn-admin`
-    command that ends a window before its deadline (NB2).
+    command that ends a window before its deadline (NB2). The last review
+    of #497: the system tools the agent runs get a clean environment (RC1;
+    the KVM privileged suites' COMBAT cycle runs `iptables-restore` and
+    `iptables` through it on 22.04 and 24.04), every `NN_` switch of the
+    command line classified (RC2, NC4), a weakening switch a High alert
+    (RC3), our slice named in the exec policy (NC2), the postinst check
+    bounded (NC3); round 19 on 24.04 measured NB5 (the slots 88/328/8643
+    with the policy on; rounds 18c's zeros were the lab's `systemctl
+    restart`, which the unit refuses). To the distribution matrix's
+    backlog: `rpm -qf` with the clean environment, on AlmaLinux (not run).
   - Lab: on our own QEMU guests — 22.04 (5.15), Debian 12 (6.1), 24.04 (6.8),
     Debian 13 (6.12, systemd 257), 26.04 (7.0) — each under its lease,
     rounds 12 to 15.
