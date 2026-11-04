@@ -5273,7 +5273,17 @@ number in parentheses is a lab PR.
     lab's install started them without `enable`): `install.sh --upgrade`
     refuses that, its health check reads the enablement and the default
     target, a rollback enables the units again, the lab's install enables
-    and its upgrade-check ends with a cold boot and the boot's check.
+    and its upgrade-check ends with a cold boot and the boot's check; the
+    independent review of #497 (no blocker; D1–D6 fixed): octal and hex
+    spellings refused (the kernel reads base 0), an io-wq worker's write
+    refused unread (its registers are another write's), the RT period
+    refused whatever it carries and the runtime judged against it by the
+    round, our drop-ins selected by ctime (links and an outside
+    `EnvironmentFile=` quarantined, every one judged again at each round),
+    the missing tests (a failed restore, the thresholds' edges, a runtime
+    enablement, an operator's disable kept by a rollback), the `check_cfg`
+    test in the eBPF CI job, the persistent agent drop-in directory made by
+    the unit.
   - Lab: on our own QEMU guests — 22.04 (5.15), Debian 12 (6.1), 24.04 (6.8),
     Debian 13 (6.12, systemd 257), 26.04 (7.0) — each under its lease,
     rounds 12 to 15.

@@ -796,7 +796,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     start (not enabled, or not pulled in by the default target), naming
     `systemctl enable northnarrow-agent northnarrow-watchdog`; its health
     check reads the same after the switch (a failure rolls back), and a
-    rollback enables again the units that were enabled.
+    rollback enables again the units that were enabled;
+  - the review of #497: a sysctl value the kernel reads in another base
+    than 10 (octal `040000`, hex `0x…`) is refused, never judged as the
+    decimal it looks like; a write an io-wq worker runs (io_uring with
+    `IOSQE_ASYNC`, whose registers are another write's) is refused unread;
+    `kernel.sched_rt_period_us` is refused whatever it carries and the
+    round judges the RT runtime against the host's own period (put back to
+    95 % of it); our drop-ins are selected by their ctime, a symlink, a
+    hard link or an `EnvironmentFile=` outside `/etc/northnarrow/` is
+    quarantined whatever it sets, and every drop-in of our directories is
+    judged again at each round outside a window; the unit makes
+    `/etc/systemd/system/northnarrow-agent.service.d` on every host.
   Still open (`docs/design/ANTITAMPER_TRUST_MODEL.md`, "Lot 273d",
   Residual): the seven sysctls judged by value are judged on the bytes the
   hook reads before the kernel copies them — a root writer's second thread

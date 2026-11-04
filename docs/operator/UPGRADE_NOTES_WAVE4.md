@@ -51,6 +51,19 @@ has the details of each change below.
    tree root owns (`/opt`, `/usr/local/src`), whose execs R009 does not
    match.
 
+9. **Guarded sysctls (lot 273d).** Outside a trusted-installer window
+   the agent refuses a write that would abort, starve or blind it (§7):
+   `vm.overcommit_*`, `vm.max_map_count`, `kernel.pid_max`,
+   `kernel.threads-max` and `kernel.sched_rt_runtime_us` by their value;
+   `kernel.ftrace_enabled` and `kernel.sched_rt_period_us` whatever the
+   write carries. A configuration management run or a `sysctl --system`
+   that sets one of them to a harmful value sees the write refused (a
+   signed `sysctl` record); inside a window it goes through and is put
+   back at the window's close or the next integrity round.
+10. **Upgrades refuse units the next boot would not start** (lot 273d,
+   §7): enable them first — `systemctl enable northnarrow-agent
+   northnarrow-watchdog` — then run `install.sh --upgrade` again.
+
 ## 1. The on-host LLM advisor is removed (lab PR 214)
 
 The agent no longer runs a language model. The ADE (Active Defense
@@ -312,3 +325,24 @@ What an operator sees change:
   `/run/northnarrow/boot-refusals/`; it stays until a reboot or until this
   release starts again and records it. An older agent starts unaudited on
   a key that cannot be loaded, as it did.
+
+## 7. Guarded sysctls and the boot enablement (lot 273d)
+
+- **Known limit: tuned's `realtime` profile.** It sets
+  `kernel.sched_rt_runtime_us = -1` (real-time throttling off), which the
+  agent treats as harmful: outside a window the write is refused, and a
+  value set at boot or inside a window is put back (to 95 % of the period)
+  at the window's close and at every integrity round. With this release
+  that profile cannot hold, not even inside a window. A signed opt-out per
+  sysctl is planned (lot 280); until then, a real-time host keeps the
+  kernel's default ratio.
+- **`kernel.ftrace_enabled` and `kernel.sched_rt_period_us`** are refused
+  outside a window whatever the write carries: a tool that writes them,
+  even the value they hold, needs a window.
+- **A value written in another base than 10** (`040000`, `0x10000`) is
+  refused outside a window: write the decimal value.
+- **`install.sh --upgrade`** refuses, before it changes anything, to
+  upgrade running units that are not enabled or not pulled in by the
+  default target ("the next boot would start no agent"); its health check
+  reads the same after the switch, and a failed upgrade's rollback enables
+  again the units that were enabled before it.

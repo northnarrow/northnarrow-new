@@ -1311,7 +1311,17 @@ precision its first judge of the host's drop-ins lacked.
   record (`dropins_quarantined`), and systemd reloads (at most one every
   30 s: the review's rate limit, which the host's drop-ins no longer
   need — they are never moved). `install.sh`'s own drop-ins are known by
-  their content and left.
+  their content and left. The review of #497 (D4): an entry is selected
+  by its ctime (no `touch -d` sets it back; a new hard link or a rename
+  moves it), never by its mtime; a symlink (systemd follows it to a target
+  outside our directories), a hard link and an `EnvironmentFile=` outside
+  `/etc/northnarrow/` are quarantined whatever they set (a symlink kept as
+  its target's name, the target never touched); and since a drop-in kept
+  at a close stays writable by root, the integrity round judges every
+  drop-in of our directories again outside a window, the same way, each
+  move a signed `own_dropin_moved` and a reload asked. The unit now makes
+  `/etc/systemd/system/northnarrow-agent.service.d` too (NOCREATE on every
+  host; it was install.sh's on Debian or with `--cow-guard` only).
 - **The judge, precise** (the re-check of #492). A slice's floors follow
   the host: memory a quarter of it, between 544 MiB (the agent's and the
   watchdog's together) and 1 GiB; a CPU share an eighth of the online
@@ -1358,17 +1368,27 @@ precision its first judge of the host's drop-ins lacked.
   ratio below 50 (or `overcommit_kbytes` below 1 GiB) makes the agent's
   next allocation fail; a `kernel.pid_max` below 32768, a
   `kernel.threads-max` below 8192 or a `vm.max_map_count` below 65530
-  stop it creating what it runs; `kernel.sched_rt_runtime_us=-1` (or at
-  or past 99 % of the default period) lets a real-time hog own the CPUs.
-  The choice, both: the write deny refuses a write of one of them outside
-  a window when its value is harmful (judged by name on procfs and on the
-  bytes written, `sysctl_write_harmful`; signed `sysctl`, ENGAGED), so the
-  operator's tuning that harms nothing — a raised limit, overcommit 0 or 1
-  — stays possible, and any tuning inside a window; and the integrity
-  round puts back what the kernel could not refuse — a value set at boot
-  (`sysctl.d`) or inside a window — to a safe one (`sysctl_restored`),
-  leaving strict overcommit with a ratio of 50 or more to the operator
-  (`sysctl_strict`, signed).
+  stop it creating what it runs; real-time throttling off — a
+  `kernel.sched_rt_runtime_us` of -1, or a runtime at or past 99 % of the
+  period — lets a real-time hog own the CPUs. The choice, both: the write
+  deny refuses a write of one of them outside a window when its value is
+  harmful (judged by name on procfs and on the bytes written,
+  `sysctl_write_harmful`; signed `sysctl`, ENGAGED), so the operator's
+  tuning that harms nothing — a raised limit, overcommit 0 or 1 — stays
+  possible; and the integrity round puts back what the kernel could not
+  refuse — a value set at boot (`sysctl.d`) or inside a window — to a safe
+  one (`sysctl_restored`), leaving strict overcommit with a ratio of 50 or
+  more to the operator (`sysctl_strict`, signed). A harmful value set
+  inside a window lasts until the window's close (every guarded sysctl is
+  checked there) or the round's next pass, not past it. The review of
+  #497: a value the kernel reads in another base than 10 — a leading `0`
+  before a digit (octal: `040000` is 16384), `0x` (hex) — is refused, never
+  judged as the decimal it looks like (D1); `kernel.sched_rt_period_us`
+  is refused whatever it carries, as `ftrace_enabled` (a period at the
+  runtime switches throttling off as `-1` does), and the round judges the
+  runtime against the host's own period (`rt_throttling_off`, both files;
+  the write deny, which cannot read the period, against the default 1 s),
+  putting it back to 95 % of the period (D3).
 - **`kernel.ftrace_enabled`** (R1 of the external review of 04/11; P0). On
   6.0 to 7.2 a `0` turns every call site ftrace manages back into a NOP,
   with no error: the BPF trampolines stop — the fentry/fexit sensors, the
@@ -1442,9 +1462,15 @@ kept running); on 5.15 the write was `EBUSY`. It is the eighth guarded
   back in systemd's memory only our units' properties instead of a whole
   reload — it needs a thread with `CAP_SYS_ADMIN`, against R14's
   capabilities per thread.
-- A refused write of a guarded sysctl through a call whose bytes the hook
-  does not read (`writev`, io_uring) is refused, as PID 1's unread write
-  is: such a tool needs a window.
+- A write of a guarded sysctl whose bytes the hook does not read is
+  refused, as PID 1's unread write is — such a tool needs a window: a
+  `writev`, an io_uring write the submitter's `io_uring_enter` runs inline
+  (the registers name that call, not a write), and — the review of #497
+  (D2) — one an io-wq worker runs: a worker carries its creator's
+  registers (`copy_thread`), so its `IORING_OP_WRITE` would have been
+  judged on another write's bytes; a task with `PF_IO_WORKER` or
+  `PF_KTHREAD` is never read (`regs_are_the_writes`), its write refused and
+  signed.
 - **Declared residual (the coordinator's decision of 04/11): the seven
   sysctls judged by value are judged on the bytes the hook reads, before
   the kernel copies them** (`file_permission` runs before the sysctl's
