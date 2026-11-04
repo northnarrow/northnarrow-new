@@ -21,6 +21,10 @@ nn-proto = { workspace = true }
 # The chains' readers and verifiers (`audit`, `verify_lines`,
 # `chain_anchor`), the OS CSPRNG (`os_rng`), the width of the agent id.
 nn-evidence = { workspace = true }
+# lot 276, the review of #499 (D1): `export verify` maps each record's row
+# again with the agent's own mapping and compares — the OCSF fields are
+# not signed, the row is. Without its `sinks` (no TLS crate here).
+nn-export = { workspace = true }
 # The seam the agent binds (`host`): the gate's decision on an overlay, the
 # overlays' content and signature file, the per-rule policy and the
 # replay's event parser, the COMBAT carve-out, the trusted-installer
@@ -33,6 +37,8 @@ clap = { workspace = true }
 # serde_json with the agent's feature (`float_roundtrip`), so a build of
 # nn-admin alone parses as the agent does.
 serde_json = { version = "1", features = ["float_roundtrip"] }
+# Lot 276: `export verify --json`'s report.
+serde = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
 # Tappa 7 task 7 / Tappa 8: the operator's Ed25519 keys and signatures;
 # `rand_core` lets the OS CSPRNG (`os_rng`) feed `init`'s key generation.
@@ -59,6 +65,8 @@ debug-trigger = ["nn-proto/debug-trigger"]
 
 [dev-dependencies]
 tempfile = "3"
+# `export verify`'s tests sign their rows (the chains' base64).
+base64 = "0.23"
 
 [lints]
 workspace = true

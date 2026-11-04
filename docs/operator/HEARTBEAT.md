@@ -32,11 +32,12 @@ carries:
 | `agent_id`, `run`, `boot_id`, `version` | which agent, which run of it (the actions chain's `run`), which boot of the kernel |
 | `posture`, `combat_stage`, `trust_level`, `degradations` | the agent's state and the degradations it signed this run |
 | `decision_rounds`, `decision_since_last_ms` | the decision thread's progress: a count that stands still is a decision that does |
-| `loss` | the events lost at each stage of their path since the run started — stages 1 to 7: the kernel's ring, the kernel's budget, the decoder, the bus's queues, the decision's delay, the response queue, the evidence writers ([the event bus, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/architecture/EVENT_BUS.md)) |
+| `loss` | the events lost at each stage of their path since the run started — stages 1 to 8: the kernel's ring, the kernel's budget, the decoder, the bus's queues, the decision's delay, the response queue, the evidence writers, and (lot 276) the export's rows it can no longer deliver (`null` without an export configured; seven entries from an older agent) ([the event bus, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/architecture/EVENT_BUS.md), [`EXPORT.md`](EXPORT.md)) |
 | `actions` | the actions chain's intents and outcomes, rows it could not take, intents of an earlier run found interrupted, actions in flight (`EVIDENCE_CHAINS.md`, the actions chain) |
 | `probe_gaps` | the telemetry probe's gaps since the run started (`null`: the probe is off) |
 | `nodns` | lot 275 (the second review of #495, R2): NN-L-NET-028's judgements this run — `lineage`, `other_lineage`, `unresolved`, the `unknown` ones by reason (`degraded`: the DNS evidence lost for every process; `held`, `unseen`, `start`, `barrier`, `sensor`, `older`) and `coverage_lost`, its `nodns_coverage_lost` rows queued to be signed (at most one a cause every 5 minutes; kept queued until the audit log is bound, an `append` that fails logged as a warning — the final check of #495, N4); absent from an agent older than lot 275 (`NETWORK_TELEMETRY.md` §4) |
 | `capabilities` | R13 (lab PR 271): the capability manifest's newest view — its capabilities `hash`, the last `revision` signed (0: the boot's), `settled` (the telemetry probe's first round has ended) and `contract` (the hash of the sensor contract's terms, the agent's version and the kernel's release), with `contract_version` and `kernel` (the versions the verifier checks do not go backwards); absent from an agent older than R13 (`SENSOR_CONTRACT.md` §4, §5) |
+| `export` | lot 276: the export's state (`on`, `off`, `refused`, `failed` — its configuration, or its controller not running —, `degraded` — on, its worker disabled, unavailable or away past 30 s), its worker's health, and each sink's (`up`, `connecting`, `down`, `failed`), the rows it delivered and how far it is behind (bytes); absent without an export configured — `heartbeat watch` says `DEGRADED` when the export is not `on` or a sink `failed` ([`EXPORT.md`](EXPORT.md) §4) |
 | `heads` | the audit chain's head (its row number and hash) and the actions chain's (its position — `file`, the number its active file will have as an archive, and `bytes`, its length — and hash, and `kept`: whether the chain still holds the head the agent's previous beat named, read back at each beat and at the start from the last run's last beat; with `actions.in_flight` and `actions.unwritten`): a chain rolled back on the host, or a tail cut from the actions chain (an intent removed) — even with rows appended past the cut — shows as a head that went back or is no longer kept |
 
 Beside the beats, the agent signs a **`telemetry_loss`** row in the audit
@@ -186,7 +187,9 @@ model) closes that, and it is future work.
 **`kept` protects the tail, not the middle**: a row between two heads the
 beats named, rewritten with one of the same length, leaves the position and
 the previous head intact — only `sudo nn-admin chain verify` on the host
-sees it (its signature fails), until R15 exports the chains off the host.
+sees it (its signature fails) — or, since lot 276, a receiver of the export
+that holds the rows (`nn-admin export verify` checks every row's signature
+and its link; [`EXPORT.md`](EXPORT.md) §6).
 
 The verifier runs `nn-admin heartbeat export` as root through `sudo` on
 the agent's host; a chain readable by a dedicated group would remove that

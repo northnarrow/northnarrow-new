@@ -2423,6 +2423,162 @@ exit: 2
 |
 | For more information, try '--help'.
 
+### clap.export.unknown-flag
+$ nn-admin export --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin export <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.export.unknown-subcommand
+$ nn-admin export nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin export <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.export.status.unknown-flag
+$ nn-admin export status --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin export status [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.export.status.socket.missing-value
+$ nn-admin export status --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.export.status.json.given-twice
+$ nn-admin export status --json --json
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--json' cannot be used multiple times
+|
+| Usage: nn-admin export status [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.export.status.json.with-a-value
+$ nn-admin export status --json=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--json' found; no more were expected
+|
+| Usage: nn-admin export status --json
+|
+| For more information, try '--help'.
+
+### clap.export.status.key.missing-value
+$ nn-admin export status --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.export.status.agent-id-file.missing-value
+$ nn-admin export status --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.export.verify.unknown-flag
+$ nn-admin export verify --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin export verify [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.export.verify.agent-pubkey.missing-value
+$ nn-admin export verify --agent-pubkey
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-pubkey <AGENT_PUBKEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.export.verify.agent-pubkey-file.missing-value
+$ nn-admin export verify --agent-pubkey-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-pubkey-file <AGENT_PUBKEY_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.export.verify.file.missing-value
+$ nn-admin export verify --file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--file <FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.export.verify.json.given-twice
+$ nn-admin export verify --json --json
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--json' cannot be used multiple times
+|
+| Usage: nn-admin export verify [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.export.verify.json.with-a-value
+$ nn-admin export verify --json=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--json' found; no more were expected
+|
+| Usage: nn-admin export verify --json
+|
+| For more information, try '--help'.
+
 ### clap.trusted-installer-grant.unknown-flag
 $ nn-admin trusted-installer-grant --no-such-flag
 exit: 2

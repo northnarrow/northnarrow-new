@@ -34,6 +34,7 @@ exit: 0
 |   fim                      Tappa 9 C6 — FIM operator surface. `fim baseline` queues a re-compute of the watched-paths SHA-256 baseline (signed payload, single-sig `fim-manage` role per §13 Q6). `fim report [--since <unix-ts>]` reads the chained drift log (signed payload, single-sig `fim-read` role)
 |   canary                   Tappa 9.5 K6 — deception canary operator surface. `canary deploy` installs a new canary (File / Process / Network / Credential variants), `canary list` streams the chained registry log, `canary burn` permanently retires a canary, `canary refresh` re-renders the on-disk artefact. Authorisation: `canary-read` for `list`; `canary-manage` for `deploy` / `burn` / `refresh` (§12 Q7 SPLIT lock-in)
 |   net                      Tappa 10 N7 — network observability operator surface. `net flows` reads the chained netflow log, `net listeners` snapshots active listeners, `net resolve <ip>` looks up DNS attribution, `net fingerprint --flow-id <hex>` dumps JA3/JA4. All four are `Role::NetRead` (1-of-N quorum per §13 Q6)
+|   export                   Lot 276 — the export of the signed chains as OCSF 1.9.0 records (a JSONL file, syslog over TLS), turned on by a signed `export.local` (docs/operator/EXPORT.md). `export status` shows it (signed: give --key); `export verify`, run where the records arrive, checks each one's row against the agent's public key and each chain's continuity
 |   trusted-installer-grant  FIM-009 self-upgrade (§15.1) — arm the trusted-installer override for an in-place agent upgrade. Submits a 1-of-N (M=1) quorum-signed grant; the admin.pub line for `--key` MUST carry the `trusted-installer` role. While the window is open the agent's FS pin is suspended (so install.sh can replace the protected binary) AND a write to the agent's OWN systemd units is downgraded from kill to an audit Log. The window is bounded by --window-secs (clamped to the agent's 600 s ceiling) and by the next agent restart. Operator flow: grant → install.sh → `systemctl restart` → signed `fim baseline`
 |   response                 External audit CMB-016 — undo what the response layer did: `response status` lists the processes the agent holds in its containment scopes, the quarantine vault and the COMBAT stage (`audit-read`); `response release` returns a contained process to the cgroup it came from and `response restore` writes a quarantined file back out of the vault (`response-manage`). The agent does the work and records it in the signed audit log
 |   remediate                Lab PR 222 — undo what ransomware rewrote, from the copy-on-first- write journal (`remediate ransomware`, `response-manage`). The agent restores and signs one `cow_restore` row per file
@@ -341,6 +342,7 @@ exit: 0
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 
 ### pipe.stdout.policy-show
 $ nn-admin policy show --file rule-policy.local --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
@@ -517,7 +519,7 @@ exit: 0
 |                     5 decision delay        7 (decisions later than their class's budget, from the record's kernel time)
 |                     6 response queue        4 (responses decided and not run: displaced or refused by the full response queue, or queued at the stop (each signed in the actions chain))
 |                     7 evidence writer queue 3 (detection records dropped or refused, action rows not in their chain, canary rows not written)
-|                     8 export                - (not counted yet: R15, the export)
+|                     8 export                2 (rows the export can no longer deliver: evicted before a sink read them, longer than a request carries (every sink's))
 | decision delay    : P0 budget 100 ms: 12 timed from the kernel's record (0 untimed), p50 150 µs p99 1100 µs max 1200 µs, 0 over budget; 13 capped (past 256 per uid a second)
 |                     P1 budget 250 ms: 798 timed from the kernel's record (0 untimed), p50 60 µs p99 2500 µs max 3500 µs, 0 over budget
 |                     P2 budget 1000 ms: 81808 timed from the kernel's record (0 untimed), p50 30 µs p99 410000 µs max 1400000 µs, 7 over budget

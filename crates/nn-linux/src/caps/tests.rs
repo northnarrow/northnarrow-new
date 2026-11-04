@@ -41,6 +41,7 @@ fn each_role_keeps_its_set() {
     assert_eq!(names(Role::Supervisor), "KILL SETGID SETUID BPF");
     assert_eq!(names(Role::Loader), "SYS_ADMIN PERFMON BPF");
     assert_eq!(names(Role::Errands), "BPF");
+    assert_eq!(names(Role::Export), "none");
     for r in Role::ALL {
         assert_eq!(r.for_good(), r == Role::Decision, "{r}");
         assert!(!r.wants().contains(LINUX_IMMUTABLE) || r == Role::Writer);
@@ -462,7 +463,7 @@ fn a_role_s_effective_set_is_exactly_its_own_and_the_core_s_comes_back() {
             return 8;
         }
         // the writer and the supervisor
-        for r in [Role::Writer, Role::Supervisor, Role::Errands] {
+        for r in [Role::Writer, Role::Supervisor, Role::Errands, Role::Export] {
             match enter(r) {
                 Ok(e) if e.complete() && e.after.effective == r.wants() => {}
                 _ => return 9,

@@ -478,12 +478,16 @@ jobs:
       # next.) The listing is matched, not `cargo tree -i`'s
       # exit status: that fails both for a crate outside the graph and for
       # any other error, so a gate on it would pass when cargo cannot run.
-      - name: "Charter: no onig_sys or zstd-sys in the agent's dependency graph"
+      # Lot 276: the export's TLS is rustls with the RustCrypto provider
+      # (the founder's decision: Rust only) — neither of rustls' C/assembly
+      # providers, ring (in Cargo.lock as an optional dependency of
+      # rustls-webpki that no feature enables) and aws-lc-rs, may be built.
+      - name: "Charter: no onig_sys, zstd-sys, ring or aws-lc in the agent's dependency graph"
         run: |
           set -euo pipefail
           deps=$(cargo tree --locked -p northnarrow-agent -e normal --all-features \
             --target all --prefix none --format '{p}' | sort -u)
-          bad=$(printf '%s\n' "$deps" | awk '$1 == "onig_sys" || $1 == "zstd-sys"')
+          bad=$(printf '%s\n' "$deps" | awk '$1 == "onig_sys" || $1 == "zstd-sys" || $1 == "ring" || $1 == "aws-lc-rs" || $1 == "aws-lc-sys"')
           if [ -n "$bad" ]; then
             echo "::error::C library crate in the agent's dependency graph: $bad"
             for c in $(printf '%s\n' "$bad" | awk '{print $1}' | sort -u); do
@@ -492,4 +496,4 @@ jobs:
             done
             exit 1
           fi
-          echo "onig_sys, zstd-sys: absent ($(printf '%s\n' "$deps" | wc -l) packages checked)"
+          echo "onig_sys, zstd-sys, ring, aws-lc: absent ($(printf '%s\n' "$deps" | wc -l) packages checked)"

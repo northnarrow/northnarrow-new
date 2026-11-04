@@ -103,7 +103,12 @@ pub fn main() -> Result<()> {
         let args: Vec<String> = std::env::args_os()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        std::process::exit(nn_linux::worker::serve::main(&args));
+        // lot 276: the export worker is the agent's composition of
+        // nn-export and nn-linux's sandbox (`northnarrow_agent::export`)
+        std::process::exit(nn_linux::worker::serve::main(
+            &args,
+            northnarrow_agent::export::worker::main,
+        ));
     }
     let cli = Cli::parse();
     if cli.build_features {
@@ -255,6 +260,11 @@ async fn run(
     // R14a: how this core starts its workers, which R004 knows (read before
     // the image goes to the workers' start)
     let own_launch = workers::own_launch(&image);
+    // Lot 276: the export's signed configuration — off without it; on, its
+    // worker starts with the others
+    let export_loaded = northnarrow_agent::export::load(&overlay_gate);
+    let export = northnarrow_agent::export::ExportHandle::new(&export_loaded);
+    northnarrow_agent::export::report_load(&export_loaded);
     let attach::Attached {
         lineage,
         flow_tracker,
@@ -281,6 +291,7 @@ async fn run(
         &mut audit,
         &bpf_lsm_state,
         image,
+        export_loaded.on().is_some(),
     )
     .await?;
     // the second review of #495 (R2): NN-L-NET-028's judgements in the beat
@@ -541,6 +552,7 @@ async fn run(
                 dispatcher
                     .status_source(canary_detector.clone(), Some(Arc::clone(&ransom_tracker))),
             ),
+            export: export.clone(),
         },
         armed_for_admin,
     );
@@ -598,6 +610,7 @@ async fn run(
         sensor.pump_labels(),
         opt_ins,
         &workers,
+        export.clone(),
     )?;
     // R12c-2 (lab PR 270): the signed heartbeat, once the agent is armed —
     // its `start` beat first, then one every interval; the stop writes its
@@ -623,7 +636,20 @@ async fn run(
             audit: audit_log.clone(),
             probe_on: telemetry_probe.is_some(),
             nodns: Some(resolved_for_beat),
+            export: export.clone(),
         },
+    );
+    // Lot 276: the export's thread, once the agent is armed: the chains read
+    // as its log, its worker fed (never the decision thread)
+    let export_running = northnarrow_agent::export::start_if_on(
+        &export_loaded,
+        export.as_ref(),
+        &workers,
+        cli.chain_paths(),
+        signing_key.verifying_key(),
+        agent_id,
+        &audit_log,
+        &cli.detections_file,
     );
     // Armed, the start beat written (or the heartbeat off, said): the admin
     // socket is bound now — every admin row follows the run's start rows.
@@ -650,6 +676,7 @@ async fn run(
     .await;
     crate::shutdown::stop(
         &cli,
+        export_running,
         &workers,
         &heartbeat,
         execq_handle,

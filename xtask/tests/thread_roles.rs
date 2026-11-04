@@ -75,6 +75,13 @@ fn every_role_s_thread_takes_its_role() {
         6,
         "enter_or_report(super::Role::Errands)",
     );
+    // lot 276: the export's thread holds no capability
+    requires(
+        "agent/src/export/controller.rs",
+        ".name(THREAD.into())",
+        4,
+        "caps::enter_or_report(nn_linux::caps::Role::Export)",
+    );
 }
 
 /// The loader's window covers the multiplexer's start, and is closed

@@ -44,12 +44,15 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::ipc_export::*;
+
 /// The protocol's version: a worker that says another one is refused. 2
 /// (R14b): a name's `form` (an NSS record's text), the parse worker's names
 /// in production. 3 (lot 275): a DNS response's answer is the question, the
 /// response code and the A, AAAA and CNAME records with their TTLs
-/// ([`DnsAnswersOut`]), for the DNS response sensor.
-pub const IPC_VERSION: u16 = 3;
+/// ([`DnsAnswersOut`]), for the DNS response sensor. 4 (lot 276): the
+/// export worker's requests and the sandbox's declared filesystem rules.
+pub const IPC_VERSION: u16 = 4;
 
 /// Largest packet either side sends or accepts (plan §3.5: 64 KiB).
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -150,6 +153,10 @@ pub enum WorkerKind {
     /// nn-parse's parsers of hostile bytes: QNAMEs, DNS answers, the TLS
     /// ClientHello.
     Parse,
+    /// Lot 276: the export — the signed rows the core hands it as OCSF
+    /// records, to a JSONL file and to syslog over TLS
+    /// ([`crate::ipc_export`]).
+    Export,
 }
 
 /// Review of #482 (the mutation MP2, equivalent while there is one kind):
@@ -161,20 +168,42 @@ const _: () = {
     const fn one(k: WorkerKind) -> usize {
         match k {
             WorkerKind::Parse => 1,
+            // lot 276: the kind check's test, a hello of the other kind
+            // refused both ways (`a_hello_of_another_kind_is_refused`)
+            WorkerKind::Export => 1,
         }
     }
     assert!(
-        one(WorkerKind::Parse) == WorkerKind::ALL.len(),
-        "a second worker kind: test check_hello's kind check (MP2)"
+        one(WorkerKind::Parse) + one(WorkerKind::Export) == WorkerKind::ALL.len(),
+        "another worker kind: test check_hello's kind check (MP2)"
     );
 };
 
 impl WorkerKind {
-    pub const ALL: [WorkerKind; 1] = [WorkerKind::Parse];
+    pub const ALL: [WorkerKind; 2] = [WorkerKind::Parse, WorkerKind::Export];
 
     pub fn name(self) -> &'static str {
         match self {
             WorkerKind::Parse => "parse",
+            WorkerKind::Export => "export",
+        }
+    }
+
+    /// Its thread's name (`comm`, at most 15 bytes): what `ps -C` and the
+    /// lab's scripts look for.
+    pub fn comm(self) -> &'static str {
+        match self {
+            WorkerKind::Parse => "nn-worker-parse",
+            WorkerKind::Export => "nn-worker-exp",
+        }
+    }
+
+    /// The Landlock filesystem rules its sandbox grants (lot 276): none for
+    /// the parse worker; the export's own directory for its JSONL files.
+    pub fn fs_rules(self) -> &'static [&'static str] {
+        match self {
+            WorkerKind::Parse => &[],
+            WorkerKind::Export => &[EXPORT_DIR_RULE],
         }
     }
 
@@ -182,6 +211,18 @@ impl WorkerKind {
         Self::ALL.into_iter().find(|k| k.name() == s)
     }
 }
+
+/// The directory of the export's JSONL files (lot 276): the only path a
+/// worker's Landlock lets it open, create or remove files under.
+pub const EXPORT_DIR: &str = "/var/log/northnarrow/export";
+
+/// [`EXPORT_DIR`]'s rule as the sandbox declares it.
+/// Lot 276: the JSONL sink's active file in [`EXPORT_DIR`] (rotated ones
+/// `<it>.N`): named here, where the core and the worker both read it.
+pub const EXPORT_FILE: &str = "export.jsonl";
+
+pub const EXPORT_DIR_RULE: &str =
+    "/var/log/northnarrow/export: read, write, create, remove, truncate";
 
 /// How far a Landlock ruleset was enforced (the `landlock` crate's
 /// `RulesetStatus`, in words the manifest prints).
@@ -249,6 +290,13 @@ pub struct SandboxLevel {
     pub nofile: u64,
     pub nproc: u64,
     pub core: u64,
+    /// Lot 276: the paths the Landlock ruleset grants rights beneath, with
+    /// the rights ([`WorkerKind::fs_rules`]): none for the parse worker.
+    /// `fs_denied` still means every other path is denied. (Never skipped
+    /// when empty: postcard frames are not self-describing; `default` reads
+    /// an earlier manifest's JSON.)
+    #[serde(default)]
+    pub fs_rules: Vec<String>,
 }
 
 impl SandboxLevel {
@@ -425,6 +473,10 @@ pub enum Request {
     /// A DNS response: its question and its A, AAAA and CNAME answers (lot
     /// 275).
     DnsAnswers(Vec<u8>),
+    /// Lot 276: the export worker's configuration ([`crate::ipc_export`]).
+    ExportSetup(ExportSetup),
+    /// Lot 276: signed rows to export.
+    ExportRows(ExportRows),
     /// `debug-trigger` builds' faults (the lab's worker crash and hang):
     /// the worker aborts, or stops answering. Last, so the production
     /// variants keep their numbers. A production worker refuses them
@@ -440,6 +492,8 @@ impl Request {
             Request::DnsNames(_) => "dns_names",
             Request::TlsClientHello(_) => "tls_client_hello",
             Request::DnsAnswers(_) => "dns_answers",
+            Request::ExportSetup(_) => "export_setup",
+            Request::ExportRows(_) => "export_rows",
             Request::DebugCrash => "debug_crash",
             Request::DebugHang => "debug_hang",
         }
@@ -473,6 +527,8 @@ impl Request {
             Request::DnsAnswers(b) if b.len() > MAX_DNS_ANSWER_IN => {
                 Err(Violation::Bounds("dns_answers: bytes"))
             }
+            Request::ExportSetup(s) => s.check(),
+            Request::ExportRows(r) => r.check(),
             _ => Ok(()),
         }
     }
@@ -493,6 +549,10 @@ pub enum Answer {
     Tls(TlsOut),
     /// `None`: the bytes are no DNS response.
     DnsAnswers(Option<DnsAnswersOut>),
+    /// Lot 276.
+    ExportSetup(ExportSetupOut),
+    /// Lot 276.
+    ExportRows(ExportRowsOut),
     /// The request was not served ([`Refusal`]: a closed set, review of
     /// #480 F9 — no free text from a worker). Review of #481 (R14b-1): the
     /// core checks every request before it sends it ([`Request::check`]),
@@ -697,6 +757,26 @@ pub fn check_hello(h: &WorkerHello, want: &Expected) -> Result<(), Violation> {
     // gives: a worker on a kernel with Landlock that is not under it, or
     // under less of it, is refused.
     let abi = want.kernel_landlock_abi.min(LANDLOCK_ABI_KNOWN);
+    // lot 276: the filesystem rules are its kind's, or none (a kernel
+    // without Landlock, or the export's directory missing): never another
+    // path
+    if !s
+        .fs_rules
+        .iter()
+        .all(|r| want.kind.fs_rules().contains(&r.as_str()))
+        || (abi == 0 && !s.fs_rules.is_empty())
+    {
+        return bad(alloc::format!(
+            "filesystem rules {:?} (a {} worker may hold {:?})",
+            s.fs_rules,
+            want.kind.name(),
+            want.kind.fs_rules()
+        ));
+    }
+    // lot 276: the export worker's TCP is pinned to its receiver's port by
+    // a Landlock layer of its own after its setup (`ExportSetupOut`), so
+    // its hello does not deny TCP; the parse worker's does
+    let net_required = want.kind != WorkerKind::Export;
     if s.landlock_abi != abi {
         return bad(alloc::format!(
             "landlock ABI {} declared, the kernel's is {}",
@@ -705,7 +785,7 @@ pub fn check_hello(h: &WorkerHello, want: &Expected) -> Result<(), Violation> {
         ));
     }
     if (abi >= 1 && (!s.fs_denied || s.landlock == LandlockEnforced::None))
-        || (abi >= 4 && !s.net_denied)
+        || (abi >= 4 && net_required && !s.net_denied)
         || (abi >= 6 && !s.scoped)
     {
         return bad(alloc::format!(
@@ -914,6 +994,8 @@ pub fn check_response(req: &Request, answer: &Answer) -> Result<(), Violation> {
             }
             Ok(())
         }
+        (Request::ExportSetup(s), Answer::ExportSetup(out)) => check_setup_out(s, out),
+        (Request::ExportRows(r), Answer::ExportRows(out)) => check_rows_out(r, out),
         (req, _) => Err(Violation::WrongKind(req.name())),
     }
 }
@@ -1551,12 +1633,148 @@ mod tests {
         assert!(with_alpn("\u{7f}").is_err());
     }
 
+    /// Review of #482 (MP2), lot 276: with two kinds, a hello of the other
+    /// kind is refused both ways.
+    #[test]
+    fn a_hello_of_another_kind_is_refused() {
+        let mut h = hello();
+        h.kind = WorkerKind::Export;
+        assert!(matches!(check_hello(&h, &want()), Err(Violation::Hello(_))));
+        let w = Expected {
+            kind: WorkerKind::Export,
+            ..want()
+        };
+        assert!(matches!(
+            check_hello(&hello(), &w),
+            Err(Violation::Hello(_))
+        ));
+        // its own kind passes
+        assert_eq!(check_hello(&h, &w), Ok(()));
+    }
+
+    /// Lot 276: a worker's Landlock rules are its kind's — the export's
+    /// directory, or none — and only where the kernel has Landlock; the
+    /// export's hello need not deny TCP (its setup pins it to a port).
+    #[test]
+    fn filesystem_rules_and_tcp_are_judged_by_kind() {
+        let export = Expected {
+            kind: WorkerKind::Export,
+            ..want()
+        };
+        let mut h = hello();
+        h.kind = WorkerKind::Export;
+        h.sandbox.fs_rules = vec![EXPORT_DIR_RULE.to_string()];
+        assert_eq!(check_hello(&h, &export), Ok(()));
+        // none (its directory missing) is less, and declared
+        h.sandbox.fs_rules.clear();
+        assert_eq!(check_hello(&h, &export), Ok(()));
+        // another path, or a wider right, is refused
+        h.sandbox.fs_rules = vec!["/: read".to_string()];
+        assert!(check_hello(&h, &export).is_err());
+        h.sandbox.fs_rules = vec![EXPORT_DIR_RULE.to_string(), "/etc: read".to_string()];
+        assert!(check_hello(&h, &export).is_err());
+        // the parse worker holds no rule
+        let mut p = hello();
+        p.sandbox.fs_rules = vec![EXPORT_DIR_RULE.to_string()];
+        assert!(check_hello(&p, &want()).is_err());
+        // no rule without Landlock
+        let mut none = hello();
+        none.kind = WorkerKind::Export;
+        none.sandbox.landlock_abi = 0;
+        none.sandbox.landlock = LandlockEnforced::None;
+        none.sandbox.fs_denied = false;
+        none.sandbox.net_denied = false;
+        none.sandbox.fs_rules = vec![EXPORT_DIR_RULE.to_string()];
+        let k0 = Expected {
+            kernel_landlock_abi: 0,
+            ..export.clone()
+        };
+        assert!(check_hello(&none, &k0).is_err());
+        none.sandbox.fs_rules.clear();
+        assert_eq!(check_hello(&none, &k0), Ok(()));
+        // TCP: the export may leave it open at its hello, the parse worker
+        // may not
+        let mut open = hello();
+        open.kind = WorkerKind::Export;
+        open.sandbox.net_denied = false;
+        assert_eq!(check_hello(&open, &export), Ok(()));
+        let mut parse_open = hello();
+        parse_open.sandbox.net_denied = false;
+        assert!(check_hello(&parse_open, &want()).is_err());
+        // the rest of the sandbox is required of both
+        open.sandbox.seccomp = false;
+        assert!(check_hello(&open, &export).is_err());
+    }
+
+    /// Lot 276: the export's requests are checked on both sides, and their
+    /// answers against them.
+    #[test]
+    fn export_requests_and_answers_are_checked() {
+        let req = Request::ExportRows(ExportRows {
+            sink: ExportSink::File,
+            chain: ExportChain::Detections,
+            rows: vec![ExportRow {
+                file: 1,
+                line: 1,
+                end: 10,
+                raw: b"{}".to_vec(),
+                rotate: None,
+            }],
+            budget_ms: 100,
+        });
+        assert_eq!(req.check(), Ok(()));
+        assert_eq!(req.name(), "export_rows");
+        let out = ExportRowsOut {
+            acked: Some(RowPos { file: 1, line: 1 }),
+            committed: Some(RowPos { file: 1, line: 1 }),
+            records: 1,
+            unverified: 0,
+            state: SinkState::Up,
+            fault: None,
+            retry_ms: 0,
+        };
+        assert_eq!(
+            check_response(&req, &Answer::ExportRows(out.clone())),
+            Ok(())
+        );
+        assert!(matches!(
+            check_response(&req, &Answer::Pong),
+            Err(Violation::WrongKind("export_rows"))
+        ));
+        assert!(check_response(
+            &req,
+            &Answer::ExportRows(ExportRowsOut {
+                committed: Some(RowPos { file: 1, line: 2 }),
+                ..out
+            })
+        )
+        .is_err());
+        let zero = Request::ExportRows(ExportRows {
+            sink: ExportSink::File,
+            chain: ExportChain::Detections,
+            rows: vec![],
+            budget_ms: 0,
+        });
+        assert!(zero.check().is_err());
+        // a frame round trip
+        let bytes = encode(&ToWorker {
+            id: 9,
+            req: req.clone(),
+        })
+        .unwrap();
+        assert_eq!(decode::<ToWorker>(&bytes), Ok(ToWorker { id: 9, req }));
+    }
+
     #[test]
     fn kinds_have_names() {
         for k in WorkerKind::ALL {
             assert_eq!(WorkerKind::from_name(k.name()), Some(k));
         }
-        assert_eq!(WorkerKind::from_name("export"), None);
+        assert_eq!(WorkerKind::from_name("export"), Some(WorkerKind::Export));
+        assert_eq!(WorkerKind::from_name("exp"), None);
+        for k in WorkerKind::ALL {
+            assert!(k.comm().len() <= 15 && k.comm().starts_with("nn-worker-"));
+        }
         assert!(level().summary().contains("landlock abi 4 full (fs, net)"));
     }
 }

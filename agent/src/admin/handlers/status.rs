@@ -131,11 +131,13 @@ fn telemetry_status(
         event_bus: handles
             .event_bus
             .as_ref()
-            .map(|b| event_bus_status(b, dispatch.as_ref())),
+            .map(|b| event_bus_status(b, dispatch.as_ref(), handles.export.as_ref())),
         // R12b (lab PR 269): stage 5 per queue, the floods of P0 capped.
         event_bus_decision: handles.event_bus.as_ref().map(event_bus_decision),
         // R12c (lab PR 270): stages 6 and 7.
         response_dispatch: dispatch,
+        // Lot 276: the export, stage 8.
+        export: handles.export.as_ref().map(|e| e.status()),
     }
 }
 
@@ -172,6 +174,7 @@ fn event_bus_decision(
 fn event_bus_status(
     bus: &crate::sensors::bus::BusStats,
     dispatch: Option<&nn_proto::admin_protocol::ResponseDispatchStatus>,
+    export: Option<&crate::export::ExportHandle>,
 ) -> nn_proto::admin_protocol::EventBusStatus {
     use nn_proto::admin_protocol::{BusQueueStatus, EventBusStatus, LossStageCount};
     let queues = bus.snapshot();
@@ -180,6 +183,7 @@ fn event_bus_status(
         crate::sensors::reject::total(),
         &queues,
         dispatch.map(|d| (d.stage6(), d.stage7())),
+        export.and_then(crate::export::ExportHandle::lost),
     );
     EventBusStatus {
         queues: queues

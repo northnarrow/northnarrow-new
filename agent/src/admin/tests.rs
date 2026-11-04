@@ -1005,6 +1005,7 @@ fn audit_chains_rotate_keys_add_emissions_and_skips_non_auditable() {
         event_bus: None,
         event_bus_decision: None,
         response_dispatch: None,
+        export: None,
     });
     emit_audit_for(
         &status_req,

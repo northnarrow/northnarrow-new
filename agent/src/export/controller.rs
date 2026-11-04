@@ -1,0 +1,1649 @@
+//! The core's export thread (lot 276): `nn-export`, never the decision
+//! thread, never a lock of the evidence writers'.
+//!
+//! For each sink and each configured chain: read the rows after the
+//! sink's place (`nn_export::wal`, the core reading its own files, the
+//! rows verbatim), hand them to the export worker, apply its answer — the
+//! last row delivered moves the cursor, the last row committed is where
+//! the next request starts. An answer that names a row the core never sent
+//! the worker is a lie: the worker is killed (`Workers::condemn`). The
+//! rows the export can no longer deliver are stage 8, counted and signed.
+//!
+//! What the worker costs the agent is this thread's reads and its waits on
+//! the worker (each request bounded by its budget): the decision, the bus
+//! and the evidence writers never wait on the export.
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use ed25519_dalek::VerifyingKey;
+use nn_export::config::{ExportConfig, Start};
+use nn_export::wal::{self, Cursor, Cursors, Note, Source};
+use nn_linux::chain_host_linux::LinuxHost;
+use nn_linux::worker::{Health, WorkerError, Workers};
+use nn_proto::admin_protocol::{ExportChainStatus, ExportSinkStatus};
+use nn_proto::ipc::{
+    Answer, ExportAddr, ExportChain, ExportRow, ExportRows, ExportRowsOut, ExportSetup, ExportSink,
+    FileSetup, Request, RowPos, SinkFault, SinkState, SyslogSetup, WorkerKind, MAX_EXPORT_BYTES,
+    MAX_EXPORT_ROWS, MAX_RECORDS_PER_ROW,
+};
+use parking_lot::Mutex;
+use tracing::{info, warn};
+
+use super::{Configured, ExportHandle};
+use crate::audit::{AuditEntryDraft, AuditLog};
+
+/// The audit op of the export's signed rows.
+pub const EXPORT_OP: &str = "export_state";
+
+/// The thread's name.
+pub const THREAD: &str = "nn-export";
+
+/// Rows sent and not delivered, per sink and chain: beyond them the core
+/// reads no more, and asks for acknowledgements only.
+pub const MAX_WINDOW: usize = 4096;
+
+/// What the worker may spend on one request, and what the core waits
+/// beyond it before the worker counts as hung.
+pub const BUDGET: Duration = Duration::from_millis(1000);
+pub const MARGIN: Duration = Duration::from_millis(2000);
+
+/// The pause of a round that moved nothing, and of a worker not ready.
+pub const IDLE: Duration = Duration::from_millis(200);
+
+/// Cursors written at most this often (and at the stop).
+pub const SAVE_EVERY: Duration = Duration::from_secs(2);
+
+/// A better state's row waits for this; a worse one is signed at once.
+pub const STATE_ROW_EVERY: Duration = Duration::from_secs(60);
+
+/// The fault in words (the status, the signed rows).
+pub fn fault_text(f: &SinkFault) -> String {
+    match f {
+        SinkFault::NotSetUp => "the worker has had no setup".into(),
+        SinkFault::Connect(e) => format!("connect: {}", std::io::Error::from_raw_os_error(*e)),
+        SinkFault::ConnectTimeout => "no TCP connection in time".into(),
+        SinkFault::HandshakeTimeout => "no TLS session in time".into(),
+        SinkFault::Tls(t) => format!("TLS: {t:?}").to_lowercase(),
+        SinkFault::Closed => "the receiver closed the connection".into(),
+        SinkFault::Io(e) => format!("I/O: {}", std::io::Error::from_raw_os_error(*e)),
+        SinkFault::PeerData => "the receiver sent data".into(),
+        SinkFault::BadTrust => "the CA bundle or the server name is not usable".into(),
+        SinkFault::File(e) => format!("file: {}", std::io::Error::from_raw_os_error(*e)),
+        SinkFault::Pin => "the connects could not be pinned to the receiver's port".into(),
+    }
+}
+
+/// What the thread is given.
+pub struct Params {
+    pub configured: Configured,
+    pub workers: Workers,
+    pub chains: crate::chains::ChainPaths,
+    pub pubkey: VerifyingKey,
+    pub agent_id: [u8; 16],
+    pub audit: Option<Arc<Mutex<AuditLog>>>,
+    pub cursors: PathBuf,
+    pub handle: ExportHandle,
+}
+
+/// The running thread.
+pub struct Running {
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Running {
+    /// Stop it: its cursors written, its stop row signed; waited for at
+    /// most a request's budget and margin.
+    pub fn stop(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(j) = self.join.take() {
+            let until = Instant::now() + BUDGET + MARGIN + Duration::from_secs(1);
+            while !j.is_finished() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if j.is_finished() {
+                let _ = j.join();
+            }
+        }
+    }
+}
+
+/// Start the thread.
+pub fn start(p: Params) -> std::io::Result<Running> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&stop);
+    // running from before the thread (which says it ended when it does)
+    let handle = p.handle.clone();
+    handle.set_running(true);
+    let join = std::thread::Builder::new()
+        .name(THREAD.into())
+        .spawn(move || {
+            // R14c: the export's thread holds no capability
+            nn_linux::caps::enter_or_report(nn_linux::caps::Role::Export);
+            // however it ends (a stop, a panic), the export says it no
+            // longer runs (the review of #499, D4)
+            struct Ended(super::ExportHandle);
+            impl Drop for Ended {
+                fn drop(&mut self) {
+                    self.0.set_running(false);
+                }
+            }
+            let _ended = Ended(p.handle.clone());
+            run(p, &s)
+        })
+        .inspect_err(|_| handle.set_running(false))?;
+    Ok(Running {
+        stop,
+        join: Some(join),
+    })
+}
+
+fn source(chain: ExportChain, paths: &crate::chains::ChainPaths) -> Source {
+    let active = match chain {
+        ExportChain::Detections => paths.detections.clone(),
+        ExportChain::Actions => paths.actions.clone(),
+        ExportChain::FimDrift => paths.fim_drift.clone(),
+        ExportChain::Netflow => paths.netflow.clone(),
+        ExportChain::CanaryAccess => paths.canary_access.clone(),
+    };
+    Source { chain, active }
+}
+
+/// A row sent and not delivered yet.
+#[derive(Debug, Clone)]
+struct Sent {
+    pos: RowPos,
+    end: u64,
+    hash: String,
+}
+
+impl Sent {
+    fn cursor(&self) -> Cursor {
+        Cursor {
+            file: self.pos.file,
+            line: self.pos.line,
+            end: self.end,
+            hash: self.hash.clone(),
+        }
+    }
+}
+
+struct ChainRun {
+    src: Source,
+    cursor: Cursor,
+    /// The cursor came from disk and has not been checked against the
+    /// chain yet.
+    unchecked: bool,
+    window: VecDeque<Sent>,
+    /// Where the next read starts.
+    next: Cursor,
+    lost: u64,
+    dirty: bool,
+    /// The file a read waits for (its active file not there after a
+    /// rotation), since when, and whether that was signed.
+    missing: Option<(u64, Instant, bool)>,
+}
+
+struct SinkRun {
+    sink: ExportSink,
+    target: String,
+    chains: Vec<ChainRun>,
+    until: Option<Instant>,
+    state: Option<SinkState>,
+    fault: Option<SinkFault>,
+    rows: u64,
+    records: u64,
+    unverified: u64,
+    faults: u64,
+    last_delivery: Option<String>,
+    /// The last state signed, and when.
+    signed: Option<(Option<SinkState>, Instant)>,
+}
+
+impl SinkRun {
+    fn lost(&self) -> u64 {
+        self.chains.iter().map(|c| c.lost).sum()
+    }
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+        .to_string()
+}
+
+/// The host's name for RFC 5424 and OCSF's `device` (`-` if none fits).
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| nn_proto::ipc::hostname_ok(h))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn setup_of(p: &Params) -> ExportSetup {
+    let c = &p.configured.config;
+    ExportSetup {
+        agent_id: hex::encode(p.agent_id),
+        hostname: hostname(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        pubkey: p.pubkey.to_bytes(),
+        file: c.file.as_ref().map(|f| FileSetup {
+            max_bytes: f.max_bytes,
+            max_files: f.max_files,
+        }),
+        syslog: c.syslog.as_ref().map(|s| SyslogSetup {
+            addr: match s.addr.ip() {
+                std::net::IpAddr::V4(a) => ExportAddr::V4(a.octets()),
+                std::net::IpAddr::V6(a) => ExportAddr::V6(a.octets()),
+            },
+            port: s.addr.port(),
+            server_name: s.server_name.clone(),
+            ca_pem: p.configured.ca_pem.clone().unwrap_or_default(),
+            facility: s.facility,
+            // the kernel's Landlock handles TCP (ABI 4): the pin is asked
+            // for, and an answer without it refused
+            pin_port: nn_linux::sandbox::kernel_landlock_abi() >= 4,
+        }),
+    }
+}
+
+fn sinks_of(c: &ExportConfig) -> Vec<(ExportSink, String)> {
+    let mut v = Vec::new();
+    if c.file.is_some() {
+        v.push((ExportSink::File, nn_proto::ipc::EXPORT_DIR.to_string()));
+    }
+    if let Some(s) = &c.syslog {
+        v.push((
+            ExportSink::Syslog,
+            format!("{} ({})", s.addr, s.server_name),
+        ));
+    }
+    v
+}
+
+fn sign(audit: &Option<Arc<Mutex<AuditLog>>>, result: &str, extra: serde_json::Value) {
+    let Some(log) = audit else {
+        return;
+    };
+    let draft = AuditEntryDraft {
+        op: EXPORT_OP.to_string(),
+        extra,
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: result.to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
+    };
+    if let Err(e) = log.lock().append(draft) {
+        warn!(error = %e, "an export_state row was not written");
+    }
+}
+
+fn cursors_json(sinks: &[SinkRun]) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for k in sinks {
+        for c in &k.chains {
+            m.insert(
+                wal::key(k.sink, c.src.chain),
+                serde_json::json!([c.cursor.file, c.cursor.line]),
+            );
+        }
+    }
+    serde_json::Value::Object(m)
+}
+
+fn note_json(n: &Note) -> serde_json::Value {
+    match n {
+        Note::Evicted { files, rows } => {
+            serde_json::json!({"note": "evicted", "files": files, "rows": rows})
+        }
+        Note::CursorGone { file, line } => {
+            serde_json::json!({"note": "cursor_gone", "file": file, "line": line})
+        }
+        Note::CursorAhead { file } => serde_json::json!({"note": "cursor_ahead", "file": file}),
+        Note::Oversize { file, line, bytes } => {
+            serde_json::json!({"note": "oversize", "file": file, "line": line, "bytes": bytes})
+        }
+        Note::Blank { file, line } => {
+            serde_json::json!({"note": "blank", "file": file, "line": line})
+        }
+    }
+}
+
+/// The chain's bytes after `c` (how far a sink is behind).
+fn behind(src: &Source, c: &Cursor) -> u64 {
+    let size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    if !src.chain.rotates() {
+        return size(&src.active).saturating_sub(c.end);
+    }
+    let current = wal::current_file(src);
+    let mut total = 0u64;
+    for f in c.file..=current {
+        let p = if f == current {
+            src.active.clone()
+        } else {
+            nn_evidence::chainlog::archive_path_for(&src.active, f)
+        };
+        let s = size(&p);
+        total += if f == c.file {
+            s.saturating_sub(c.end)
+        } else {
+            s
+        };
+    }
+    total
+}
+
+fn state_rank(s: Option<SinkState>) -> u8 {
+    match s {
+        Some(SinkState::Up) => 0,
+        None | Some(SinkState::Off) => 1,
+        Some(SinkState::Connecting) => 2,
+        Some(SinkState::Down) => 3,
+        Some(SinkState::Failed) => 4,
+    }
+}
+
+fn run(p: Params, stop: &AtomicBool) {
+    // the export yields to the agent's own work
+    // SAFETY: setpriority on this thread's id.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 10);
+    }
+    let cfg = p.configured.config.clone();
+    let (mut saved, why) = Cursors::load(&p.cursors);
+    if let Some(why) = &why {
+        warn!(path = %p.cursors.display(), %why, "the export's cursors do not read: the sinks start as configured");
+    }
+    let mut sinks: Vec<SinkRun> = sinks_of(&cfg)
+        .into_iter()
+        .map(|(sink, target)| SinkRun {
+            sink,
+            target,
+            chains: cfg
+                .chains
+                .iter()
+                .map(|&chain| {
+                    let src = source(chain, &p.chains);
+                    let (cursor, unchecked) = match saved.cursors.get(&wal::key(sink, chain)) {
+                        Some(c) => (c.clone(), true),
+                        None => (
+                            wal::initial::<LinuxHost>(&src, cfg.start == Start::Oldest)
+                                .unwrap_or_else(|_| Cursor::start_of(wal::current_file(&src))),
+                            false,
+                        ),
+                    };
+                    ChainRun {
+                        next: cursor.clone(),
+                        src,
+                        cursor,
+                        unchecked,
+                        window: VecDeque::new(),
+                        lost: 0,
+                        dirty: true,
+                        missing: None,
+                    }
+                })
+                .collect(),
+            until: None,
+            state: None,
+            fault: None,
+            rows: 0,
+            records: 0,
+            unverified: 0,
+            faults: 0,
+            last_delivery: None,
+            signed: None,
+        })
+        .collect();
+    let setup = setup_of(&p);
+    info!(config = %cfg.summary(), "export: on");
+    sign(
+        &p.audit,
+        "success",
+        serde_json::json!({
+            "at": "start",
+            "config_sha256": p.configured.sha256,
+            "ocsf_version": nn_export::OCSF_VERSION,
+            "chains": cfg.chains.iter().map(|c| c.name()).collect::<Vec<_>>(),
+            "sinks": sinks.iter().map(|k| format!("{} {}", k.sink.name(), k.target)).collect::<Vec<_>>(),
+            "cursors": cursors_json(&sinks),
+            "cursors_file": why.map(|w| format!("not read: {w}")),
+        }),
+    );
+    let mut set_up_for: Option<u64> = None;
+    let mut setup_warned: Option<Instant> = None;
+    let mut port_pinned = None;
+    let mut last_save = Instant::now() - SAVE_EVERY;
+    let mut saved_at: Option<String> = None;
+    let mut saves = 0u64;
+    let dir_limits = p.configured.config.file.as_ref().map(|f| {
+        (
+            f.max_files,
+            nn_export::config::dir_bound(f),
+            nn_export::config::file_bound(f),
+        )
+    });
+    let mut dir_checked = Instant::now() - DIR_CHECK_EVERY;
+    let mut dir_over: Option<String> = None;
+    // what an earlier, larger configuration's files held when the first
+    // worker of this run set its sink up: judged from then on
+    let mut dir_allowance: Option<u64> = None;
+    while !stop.load(Ordering::SeqCst) {
+        // the file sink's directory within its bound, or the file sink
+        // stops and the worker that wrote past it is killed
+        if let Some((max_files, bound, _)) = dir_limits {
+            if dir_checked.elapsed() >= DIR_CHECK_EVERY {
+                dir_checked = Instant::now();
+                let now_over = dir_verdict(
+                    std::path::Path::new(nn_proto::ipc::EXPORT_DIR),
+                    max_files,
+                    bound,
+                    dir_allowance,
+                );
+                if let (Some(why), None) = (&now_over, &dir_over) {
+                    warn!(%why, "export: the export's directory past its bound: the worker killed, the file sink stopped");
+                    p.workers
+                        .condemn(WorkerKind::Export, "export: its directory past its bound");
+                    sign(
+                        &p.audit,
+                        "detected",
+                        serde_json::json!({"at": "note", "note": "directory_over", "sink": "file", "why": why}),
+                    );
+                }
+                dir_over = now_over;
+            }
+            if dir_over.is_some() {
+                for k in sinks.iter_mut().filter(|k| k.sink == ExportSink::File) {
+                    k.until = Some(Instant::now() + DIR_CHECK_EVERY);
+                    k.state = Some(SinkState::Failed);
+                    k.fault = Some(SinkFault::File(libc::EFBIG));
+                }
+            }
+        }
+        let status = p
+            .workers
+            .status()
+            .into_iter()
+            .find(|w| w.kind == WorkerKind::Export);
+        let worker = status
+            .as_ref()
+            .map_or("unavailable".to_string(), |w| w.health.as_str().to_string());
+        let mut busy = false;
+        match status {
+            Some(w) if w.health == Health::Ready => {
+                if set_up_for != Some(w.starts) {
+                    let answer = p.workers.request(
+                        WorkerKind::Export,
+                        &Request::ExportSetup(setup.clone()),
+                        BUDGET + MARGIN,
+                    );
+                    if let Ok(Answer::ExportSetup(out)) = answer {
+                        set_up_for = Some(w.starts);
+                        if let Some((_, _, per_file)) = dir_limits {
+                            dir_allowance = allowance_after_setup(
+                                dir_allowance,
+                                std::path::Path::new(nn_proto::ipc::EXPORT_DIR),
+                                per_file,
+                            );
+                        }
+                        port_pinned = setup.syslog.as_ref().map(|_| out.port_pinned);
+                        for k in &mut sinks {
+                            k.until = None;
+                            k.state = Some(match k.sink {
+                                ExportSink::File => out.file,
+                                ExportSink::Syslog => out.syslog,
+                            });
+                            for c in &mut k.chains {
+                                c.window.clear();
+                                c.next = c.cursor.clone();
+                            }
+                        }
+                        info!(
+                            worker_starts = w.starts,
+                            ?port_pinned,
+                            "export: worker set up"
+                        );
+                    } else if setup_warned.is_none_or(|t: Instant| t.elapsed() >= STATE_ROW_EVERY) {
+                        // the supervisor kills and reports a worker that
+                        // breaks the protocol; this says why nothing moves
+                        warn!(answer = ?answer.err(), "export: the worker took no setup");
+                        setup_warned = Some(Instant::now());
+                    }
+                }
+                if set_up_for == Some(w.starts) {
+                    for k in &mut sinks {
+                        if k.until.is_some_and(|t| t > Instant::now()) {
+                            continue;
+                        }
+                        k.until = None;
+                        for i in 0..k.chains.len() {
+                            busy |= round(&p, k, i, &mut set_up_for);
+                            if set_up_for.is_none() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        // stage 8 and the published state
+        let total_lost: u64 = sinks.iter().map(SinkRun::lost).sum();
+        let before = p.handle.lost().unwrap_or(0);
+        if total_lost > before {
+            p.handle.add_lost(total_lost - before);
+        }
+        if sinks.iter().flat_map(|k| &k.chains).any(|c| c.dirty)
+            && last_save.elapsed() >= SAVE_EVERY
+        {
+            save(&p, &mut sinks, &mut saved);
+            last_save = Instant::now();
+            saved_at = Some(now_rfc3339());
+            saves += 1;
+        }
+        sign_changes(&p, &mut sinks);
+        p.handle.publish(
+            worker,
+            port_pinned,
+            sinks.iter().map(sink_status).collect(),
+            saved_at.clone(),
+            saves,
+        );
+        if !busy {
+            std::thread::sleep(IDLE);
+        }
+    }
+    save(&p, &mut sinks, &mut saved);
+    sign(
+        &p.audit,
+        "success",
+        serde_json::json!({
+            "at": "stop",
+            "sinks": sinks.iter().map(|k| serde_json::json!({
+                "sink": k.sink.name(),
+                "rows": k.rows,
+                "records": k.records,
+                "unverified": k.unverified,
+                "faults": k.faults,
+                "lost": k.lost(),
+            })).collect::<Vec<_>>(),
+            "cursors": cursors_json(&sinks),
+        }),
+    );
+    info!("export: stopped, cursors written");
+}
+
+fn save(p: &Params, sinks: &mut [SinkRun], saved: &mut Cursors) {
+    for k in sinks.iter_mut() {
+        for c in &mut k.chains {
+            saved
+                .cursors
+                .insert(wal::key(k.sink, c.src.chain), c.cursor.clone());
+            c.dirty = false;
+        }
+    }
+    if let Err(e) = saved.save(&p.cursors) {
+        warn!(path = %p.cursors.display(), error = %e, "the export's cursors were not written");
+    }
+}
+
+fn sink_status(k: &SinkRun) -> ExportSinkStatus {
+    ExportSinkStatus {
+        sink: k.sink.name().to_string(),
+        target: k.target.clone(),
+        state: k.state.map_or("waiting", SinkState::name).to_string(),
+        fault: k.fault.as_ref().map(fault_text),
+        rows: k.rows,
+        records: k.records,
+        unverified: k.unverified,
+        faults: k.faults,
+        lost: k.lost(),
+        last_delivery: k.last_delivery.clone(),
+        chains: k
+            .chains
+            .iter()
+            .map(|c| ExportChainStatus {
+                chain: c.src.chain.name().to_string(),
+                cursor: (c.cursor.line > 0).then_some((c.cursor.file, c.cursor.line)),
+                in_flight: c.window.len() as u64,
+                behind_bytes: behind(&c.src, &c.cursor),
+                lost: c.lost,
+            })
+            .collect(),
+    }
+}
+
+/// A sink's state change signed: a worse one at once, a better one at most
+/// once a minute.
+fn sign_changes(p: &Params, sinks: &mut [SinkRun]) {
+    for k in sinks.iter_mut() {
+        let due = match k.signed {
+            None => k.state.is_some(),
+            Some((s, _)) if s == k.state => false,
+            Some((s, at)) => state_rank(k.state) > state_rank(s) || at.elapsed() >= STATE_ROW_EVERY,
+        };
+        if !due {
+            continue;
+        }
+        let worse = k
+            .signed
+            .is_some_and(|(s, _)| state_rank(k.state) > state_rank(s));
+        sign(
+            &p.audit,
+            if worse { "detected" } else { "success" },
+            serde_json::json!({
+                "at": "sink",
+                "sink": k.sink.name(),
+                "target": k.target,
+                "from": k.signed.and_then(|(s, _)| s).map(SinkState::name),
+                "to": k.state.map(SinkState::name),
+                "fault": k.fault.as_ref().map(fault_text),
+                "rows": k.rows,
+                "records": k.records,
+                "unverified": k.unverified,
+                "lost": k.lost(),
+            }),
+        );
+        if worse {
+            warn!(sink = k.sink.name(), state = ?k.state, fault = ?k.fault, "export: a sink is not delivering");
+        }
+        k.signed = Some((k.state, Instant::now()));
+    }
+}
+
+/// What an answer did to a chain's place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Applied {
+    /// Rows delivered by it: the cursor moved past them.
+    delivered: usize,
+}
+
+/// Apply a worker's answer to the chain's place: `sent`, the rows of the
+/// request it answers, join the window; the rows up to the one acked leave
+/// it and move the cursor; the next read starts after the one committed
+/// (from the cursor when that is none or behind it). `Err`: the answer
+/// names a row the core never gave this worker, or more records than the
+/// rows it delivers can give — a lie, the worker is killed.
+fn apply(c: &mut ChainRun, sent: Vec<Sent>, out: &ExportRowsOut) -> Result<Applied, &'static str> {
+    c.window.extend(sent);
+    let known =
+        |pos: RowPos, c: &ChainRun| pos <= c.cursor.pos() || c.window.iter().any(|s| s.pos == pos);
+    if out.acked.is_some_and(|a| !known(a, c)) || out.committed.is_some_and(|x| !known(x, c)) {
+        c.window.clear();
+        c.next = c.cursor.clone();
+        return Err("export_rows: a row the core did not send");
+    }
+    let delivered = out
+        .acked
+        .map_or(0, |a| c.window.iter().filter(|s| s.pos <= a).count());
+    if u64::from(out.records) > delivered as u64 * u64::from(MAX_RECORDS_PER_ROW) {
+        c.window.clear();
+        c.next = c.cursor.clone();
+        return Err("export_rows: more records than the rows delivered give");
+    }
+    if let Some(a) = out.acked {
+        while c.window.front().is_some_and(|s| s.pos <= a) {
+            if let Some(s) = c.window.pop_front() {
+                c.cursor = s.cursor();
+                c.dirty = true;
+            }
+        }
+    }
+    // the next request starts after the last row committed; rows after it
+    // were not written, and are read again
+    match out.committed {
+        Some(x) if x > c.cursor.pos() => {
+            while c.window.back().is_some_and(|s| s.pos > x) {
+                c.window.pop_back();
+            }
+            c.next = c
+                .window
+                .back()
+                .map_or_else(|| c.cursor.clone(), Sent::cursor);
+        }
+        _ => {
+            c.window.clear();
+            c.next = c.cursor.clone();
+        }
+    }
+    Ok(Applied { delivered })
+}
+
+/// The rows of a batch a request can carry: each row alone within the
+/// protocol's bounds (`ExportRows::check`), and together; the rest
+/// `(file, line)`, lost. The WAL already holds a batch to them (its bytes,
+/// order, blank lines): this is the core's last check before it sends.
+fn sendable(
+    sink: ExportSink,
+    chain: ExportChain,
+    rows: Vec<ExportRow>,
+    hashes: Vec<String>,
+) -> (Vec<ExportRow>, Vec<String>, Vec<(u64, u64)>) {
+    let alone = |r: &ExportRow| {
+        ExportRows {
+            sink,
+            chain,
+            rows: vec![r.clone()],
+            budget_ms: BUDGET.as_millis() as u32,
+        }
+        .check()
+        .is_ok()
+    };
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut kept_hashes = Vec::with_capacity(rows.len());
+    let mut dropped = Vec::new();
+    for (r, h) in rows.into_iter().zip(hashes) {
+        if alone(&r) {
+            kept.push(r);
+            kept_hashes.push(h);
+        } else {
+            dropped.push((r.file, r.line));
+        }
+    }
+    // together: the longest prefix the check takes (the rest is read again)
+    let together = |rows: &[ExportRow]| {
+        ExportRows {
+            sink,
+            chain,
+            rows: rows.to_vec(),
+            budget_ms: BUDGET.as_millis() as u32,
+        }
+        .check()
+        .is_ok()
+    };
+    while kept.len() > 1 && !together(&kept) {
+        kept.pop();
+        kept_hashes.pop();
+    }
+    (kept, kept_hashes, dropped)
+}
+
+/// How often the core measures the export's directory.
+const DIR_CHECK_EVERY: Duration = Duration::from_secs(1);
+
+/// Why the export's directory is past what the file sink may hold (the
+/// review of #499, D5: a worker taken over could fill the chains' disk),
+/// or `None`: its files are the sink's names alone (`export.jsonl`,
+/// `export.jsonl.N`, `N` < `max_files`) and their total within `bound`.
+/// Read as the core's export thread can — no capability: the directory is
+/// world-readable, its files are not.
+fn over_bound(dir: &std::path::Path, max_files: u8, bound: u64) -> Option<String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("{} not readable: {e}", dir.display())),
+    };
+    let mut total = 0u64;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let ours = name == nn_proto::ipc::EXPORT_FILE
+            || name
+                .strip_prefix(nn_proto::ipc::EXPORT_FILE)
+                .and_then(|n| n.strip_prefix('.'))
+                .and_then(|n| n.parse::<u8>().ok())
+                .is_some_and(|n| n >= 1 && n < max_files);
+        if !ours {
+            return Some(format!("a file the sink does not write: {name}"));
+        }
+        total += e.metadata().map(|m| m.len()).unwrap_or(0);
+    }
+    (total > bound).then(|| format!("{total} bytes, past its bound of {bound}"))
+}
+
+/// The bytes of the files in `dir` larger than `per_file` (a file of this
+/// configuration never is: an earlier configuration's with larger files;
+/// 0 when it cannot be read).
+fn oversize_bytes(dir: &std::path::Path, per_file: u64) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|es| {
+            es.flatten()
+                .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                .filter(|len| *len > per_file)
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// The directory's allowance after a worker's setup: the first setup's
+/// [`oversize_bytes`], kept — a worker killed for its directory does not
+/// raise it for the next.
+fn allowance_after_setup(
+    allowance: Option<u64>,
+    dir: &std::path::Path,
+    per_file: u64,
+) -> Option<u64> {
+    allowance.or_else(|| Some(oversize_bytes(dir, per_file)))
+}
+
+/// The core's verdict on the export's directory: `None` until the first
+/// worker of the run set its sink up (the sink's open has removed what an
+/// earlier configuration left past this one's file count, and rotated an
+/// active file past its size), then [`over_bound`] against the bound and
+/// the `allowance`: the bytes of the files an earlier configuration wrote
+/// larger than this one's, at that setup. They leave by the sink's
+/// rotations, the new files filling the bound meanwhile: the honest worker
+/// is never killed for them (the second review of #499, R3; lot 276's
+/// tenth lab killed it when the bound was only raised to the directory's
+/// bytes). Without such files the bound is the configuration's alone.
+fn dir_verdict(
+    dir: &std::path::Path,
+    max_files: u8,
+    bound: u64,
+    allowance: Option<u64>,
+) -> Option<String> {
+    allowance.and_then(|a| over_bound(dir, max_files, bound.saturating_add(a)))
+}
+
+/// Whether a round with no row to send asks the worker anyway: when rows
+/// are in flight — the poll that gathers their acknowledgements.
+fn polls(window_empty: bool) -> bool {
+    !window_empty
+}
+
+/// What a round sends after its read.
+#[derive(Debug)]
+struct Planned {
+    /// The request and its rows' hashes: rows, or none — the poll that
+    /// gathers the acknowledgements of rows in flight. `None`: nothing to
+    /// ask (no row to send, none in flight).
+    send: Option<(ExportRows, Vec<String>)>,
+    /// Rows no request carries (`(file, line)`): lost, to count and sign.
+    dropped: Vec<(u64, u64)>,
+    /// Where the read after this one starts (past the rows read).
+    next_after: Option<Cursor>,
+}
+
+/// The round's decision on what it read (the second review of #499, R4:
+/// the poll lot 276's fifth lab found missing is decided here, tested):
+/// nothing read and nothing in flight moves the cursor past rows skipped
+/// (lost, a cursor gone) and asks nothing; what the protocol's check would
+/// refuse is dropped, never sent (the review of #499, D3); rows in flight
+/// with none to send are polled.
+fn plan(c: &mut ChainRun, sink: ExportSink, batch: wal::Batch) -> Planned {
+    if batch.rows.is_empty() && c.window.is_empty() {
+        if let Some(n) = batch.next {
+            if n != c.cursor {
+                c.cursor = n.clone();
+                c.dirty = true;
+            }
+            c.next = n;
+        }
+        return Planned {
+            send: None,
+            dropped: Vec::new(),
+            next_after: None,
+        };
+    }
+    let next_after = batch.next.clone();
+    let (rows, hashes, dropped) = sendable(sink, c.src.chain, batch.rows, batch.hashes);
+    if rows.is_empty() {
+        // rows dropped: the next read starts past them
+        if !dropped.is_empty() {
+            if let Some(n) = &next_after {
+                if c.window.is_empty() && *n != c.cursor {
+                    c.cursor = n.clone();
+                    c.dirty = true;
+                }
+                c.next = n.clone();
+            }
+        }
+        // nothing in flight: nothing to ask; rows in flight: a request with
+        // no row, the poll that gathers their acknowledgements (lot 276's
+        // fifth lab: without it the syslog sink's rows stayed in flight)
+        if !polls(c.window.is_empty()) {
+            return Planned {
+                send: None,
+                dropped,
+                next_after,
+            };
+        }
+    }
+    Planned {
+        send: Some((
+            ExportRows {
+                sink,
+                chain: c.src.chain,
+                rows,
+                budget_ms: BUDGET.as_millis() as u32,
+            },
+            hashes,
+        )),
+        dropped,
+        next_after,
+    }
+}
+
+/// How long a read may wait for a chain's active file after a rotation
+/// before the export says so, signed: the writer makes it right after the
+/// rename (microseconds); missing this long, its creation failed — never a
+/// silent state (the second review of #499, R1).
+const ACTIVE_MISSING_NOTE: Duration = Duration::from_secs(30);
+
+/// The chain's wait for its active file (`waiting`: the file a read waits
+/// for, `None` when it read on): the file to sign as missing, once per
+/// wait, when the wait has lasted [`ACTIVE_MISSING_NOTE`].
+fn missing_note(c: &mut ChainRun, waiting: Option<u64>, now: Instant) -> Option<u64> {
+    match (waiting, c.missing) {
+        (None, _) => {
+            c.missing = None;
+            None
+        }
+        (Some(f), Some((g, since, noted))) if f == g => {
+            if !noted && now.saturating_duration_since(since) >= ACTIVE_MISSING_NOTE {
+                c.missing = Some((g, since, true));
+                Some(f)
+            } else {
+                None
+            }
+        }
+        (Some(f), _) => {
+            c.missing = Some((f, now, false));
+            None
+        }
+    }
+}
+
+/// The least a sink down or failed waits before its next request.
+const MIN_SINK_WAIT: Duration = Duration::from_millis(200);
+
+/// How long a sink down or failed waits: the worker's retry, never less
+/// than [`MIN_SINK_WAIT`] — a sink that says retry at once (a `Failed`
+/// one: 0) would otherwise be asked again and again, the controller never
+/// idle (the review of #499, D8).
+fn sink_wait(retry_ms: u32) -> Duration {
+    Duration::from_millis(u64::from(retry_ms)).max(MIN_SINK_WAIT)
+}
+
+/// Whether a request's error means the worker is set up again: it died,
+/// hung or lied, and the supervisor starts another. Never for a busy slot,
+/// nor for the core's own request out of its bounds (never sent: the
+/// worker is not at fault — lot 276's lab, where each such setup was a new
+/// connection and the rows on it written again and again; the chain waits
+/// for the next round, from its cursor).
+fn sets_up_again(e: &WorkerError) -> bool {
+    !matches!(e, WorkerError::Busy | WorkerError::Refused(_))
+}
+
+/// One request for one chain of one sink; whether it moved anything.
+fn round(p: &Params, k: &mut SinkRun, i: usize, set_up_for: &mut Option<u64>) -> bool {
+    let sink = k.sink;
+    let c = &mut k.chains[i];
+    let read = c.window.len() < MAX_WINDOW;
+    let batch = if read {
+        match wal::read_after::<LinuxHost>(
+            &c.src,
+            &c.next,
+            c.unchecked,
+            wal::Limits {
+                rows: MAX_EXPORT_ROWS.min(MAX_WINDOW - c.window.len()),
+                bytes: MAX_EXPORT_BYTES,
+            },
+            &p.pubkey,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(chain = c.src.chain.name(), error = %e, "export: the chain was not read");
+                return false;
+            }
+        }
+    } else {
+        wal::Batch::default()
+    };
+    c.unchecked = false;
+    if read {
+        if let Some(file) = missing_note(c, batch.waiting, Instant::now()) {
+            warn!(
+                sink = sink.name(),
+                chain = c.src.chain.name(),
+                file,
+                "export: the chain's active file is missing after its rotation"
+            );
+            sign(
+                &p.audit,
+                "detected",
+                serde_json::json!({
+                    "at": "note", "note": "active_missing", "sink": sink.name(),
+                    "chain": c.src.chain.name(), "file": file,
+                    "secs": ACTIVE_MISSING_NOTE.as_secs(),
+                }),
+            );
+        }
+    }
+    if batch.lost > 0 || !batch.notes.is_empty() {
+        c.lost += batch.lost;
+        for n in &batch.notes {
+            warn!(sink = sink.name(), chain = c.src.chain.name(), note = ?n, "export: the chain moved under the cursor");
+            let mut x = note_json(n);
+            if let Some(o) = x.as_object_mut() {
+                o.insert("at".into(), "note".into());
+                o.insert("sink".into(), sink.name().into());
+                o.insert("chain".into(), c.src.chain.name().into());
+            }
+            sign(&p.audit, "detected", x);
+        }
+    }
+    let Planned {
+        send,
+        dropped,
+        next_after,
+    } = plan(c, sink, batch);
+    if !dropped.is_empty() {
+        c.lost += dropped.len() as u64;
+        for (file, line) in &dropped {
+            warn!(
+                sink = sink.name(),
+                chain = c.src.chain.name(),
+                file,
+                line,
+                "export: a row no request carries, lost"
+            );
+            sign(
+                &p.audit,
+                "detected",
+                serde_json::json!({
+                    "at": "note", "note": "unsendable", "sink": sink.name(),
+                    "chain": c.src.chain.name(), "file": file, "line": line,
+                }),
+            );
+        }
+    }
+    let Some((req, batch_hashes)) = send else {
+        return false;
+    };
+    let answer = p.workers.request(
+        WorkerKind::Export,
+        &Request::ExportRows(req.clone()),
+        BUDGET + MARGIN,
+    );
+    let out = match answer {
+        Ok(Answer::ExportRows(out)) => out,
+        Ok(_) => return false, // the protocol's check refuses another kind
+        Err(e) if !sets_up_again(&e) => {
+            if let WorkerError::Refused(why) = &e {
+                // never sent (`sendable` keeps this from happening): the
+                // worker's state did not change, the window stays; the
+                // rows are skipped, counted, so that no round repeats them
+                k.faults += 1;
+                c.lost += req.rows.len() as u64;
+                warn!(sink = sink.name(), chain = c.src.chain.name(), %why, "export: a request out of its bounds was not sent");
+                sign(
+                    &p.audit,
+                    "detected",
+                    serde_json::json!({
+                        "at": "note", "note": "unsendable", "sink": sink.name(),
+                        "chain": c.src.chain.name(), "rows": req.rows.len(), "why": why,
+                    }),
+                );
+                if let Some(n) = next_after {
+                    c.next = n;
+                }
+            }
+            return false;
+        }
+        Err(e) => {
+            // the worker died, hung or lied: the supervisor starts another,
+            // which gets a setup; this sink starts again from its cursors
+            k.faults += 1;
+            warn!(sink = sink.name(), error = %e, "export: the worker did not answer");
+            *set_up_for = None;
+            return false;
+        }
+    };
+    let sent: Vec<Sent> = req
+        .rows
+        .iter()
+        .zip(batch_hashes)
+        .map(|(r, h)| Sent {
+            pos: r.pos(),
+            end: r.end,
+            hash: h,
+        })
+        .collect();
+    let applied = match apply(c, sent, &out) {
+        Ok(a) => a,
+        Err(why) => {
+            p.workers.condemn(WorkerKind::Export, why);
+            k.faults += 1;
+            *set_up_for = None;
+            return false;
+        }
+    };
+    let moved = applied.delivered > 0;
+    if moved {
+        k.rows += applied.delivered as u64;
+        k.records += u64::from(out.records);
+        k.unverified += u64::from(out.unverified);
+        k.last_delivery = Some(now_rfc3339());
+    }
+    k.state = Some(out.state);
+    k.fault = out.fault;
+    if out.fault.is_some() && !moved {
+        k.faults += 1;
+    }
+    if out.fault == Some(SinkFault::NotSetUp) {
+        // a worker that lost its setup (it cannot: a new worker gets one
+        // before its first rows): set it up again
+        *set_up_for = None;
+    } else if out.state == SinkState::Down || out.state == SinkState::Failed {
+        k.until = Some(Instant::now() + sink_wait(out.retry_ms));
+    }
+    moved || !req.rows.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sent(line: u64) -> Sent {
+        Sent {
+            pos: RowPos { file: 1, line },
+            end: line * 10,
+            hash: format!("{line:064}"),
+        }
+    }
+
+    fn chain() -> ChainRun {
+        ChainRun {
+            src: Source {
+                chain: ExportChain::Detections,
+                active: PathBuf::from("/nonexistent/detections.jsonl"),
+            },
+            cursor: Cursor::start_of(1),
+            unchecked: false,
+            window: VecDeque::new(),
+            next: Cursor::start_of(1),
+            lost: 0,
+            dirty: false,
+            missing: None,
+        }
+    }
+
+    fn out(acked: Option<u64>, committed: Option<u64>, records: u32) -> ExportRowsOut {
+        let at = |l: Option<u64>| l.map(|line| RowPos { file: 1, line });
+        ExportRowsOut {
+            acked: at(acked),
+            committed: at(committed),
+            records,
+            unverified: 0,
+            state: SinkState::Up,
+            fault: None,
+            retry_ms: 0,
+        }
+    }
+
+    /// The window: rows acked leave it and move the cursor, the next read
+    /// starts after the last committed, rows past it are read again.
+    #[test]
+    fn an_answer_moves_the_cursor_and_the_next_read() {
+        let mut c = chain();
+        let a = apply(
+            &mut c,
+            (1..=5).map(sent).collect(),
+            &out(Some(2), Some(4), 3),
+        )
+        .unwrap();
+        assert_eq!(a.delivered, 2);
+        assert_eq!(c.cursor.pos(), RowPos { file: 1, line: 2 });
+        assert_eq!(c.cursor.hash, format!("{:064}", 2));
+        assert_eq!(c.cursor.end, 20);
+        assert!(c.dirty);
+        assert_eq!(
+            c.window.iter().map(|s| s.pos.line).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(c.next.pos(), RowPos { file: 1, line: 4 });
+        // a poll: the rest acked
+        let a = apply(&mut c, vec![], &out(Some(4), Some(4), 2)).unwrap();
+        assert_eq!(a.delivered, 2);
+        assert!(c.window.is_empty());
+        assert_eq!(c.next, c.cursor);
+        // the worker went back (its connection lost): read again from the
+        // cursor
+        let mut c = chain();
+        apply(&mut c, (1..=3).map(sent).collect(), &out(None, Some(3), 0)).unwrap();
+        assert_eq!(c.next.pos().line, 3);
+        let a = apply(&mut c, vec![], &out(None, None, 0)).unwrap();
+        assert_eq!(a.delivered, 0);
+        assert!(c.window.is_empty());
+        assert_eq!(c.next, Cursor::start_of(1));
+    }
+
+    /// A row never sent, or records beyond the rows: a lie.
+    #[test]
+    fn an_answer_beyond_what_was_sent_is_refused() {
+        let mut c = chain();
+        assert!(apply(
+            &mut c,
+            (1..=2).map(sent).collect(),
+            &out(Some(3), Some(3), 0)
+        )
+        .is_err());
+        assert!(c.window.is_empty(), "the window is dropped");
+        let mut c = chain();
+        assert!(apply(&mut c, (1..=2).map(sent).collect(), &out(None, Some(7), 0)).is_err());
+        let mut c = chain();
+        assert!(apply(
+            &mut c,
+            (1..=2).map(sent).collect(),
+            &out(Some(1), Some(2), 3)
+        )
+        .is_err());
+        // two records a row is the most
+        let mut c = chain();
+        assert!(apply(
+            &mut c,
+            (1..=2).map(sent).collect(),
+            &out(Some(2), Some(2), 4)
+        )
+        .is_ok());
+        // a row at or before the cursor is no lie (an ack already applied)
+        let mut c = chain();
+        c.cursor = sent(5).cursor();
+        assert!(apply(&mut c, vec![], &out(Some(4), Some(5), 0)).is_ok());
+        assert_eq!(c.cursor.pos().line, 5, "the cursor never goes back");
+    }
+
+    #[test]
+    fn a_row_no_request_carries_is_dropped_the_rest_sent() {
+        let row = |line: u64, raw: &[u8]| ExportRow {
+            file: 1,
+            line,
+            end: 100 * line,
+            raw: raw.to_vec(),
+            rotate: None,
+        };
+        let h = |n: usize| (0..n).map(|i| format!("h{i}")).collect::<Vec<_>>();
+        // a blank row in the middle: dropped, the others kept in order
+        let (kept, hashes, dropped) = sendable(
+            ExportSink::File,
+            ExportChain::Detections,
+            vec![row(1, b"{}"), row(2, b""), row(3, b"{}")],
+            h(3),
+        );
+        assert_eq!(kept.iter().map(|r| r.line).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(hashes, ["h0", "h2"]);
+        assert_eq!(dropped, [(1, 2)]);
+        // out of order together: the longest prefix the check takes
+        let (kept, _, dropped) = sendable(
+            ExportSink::File,
+            ExportChain::Detections,
+            vec![row(1, b"{}"), row(3, b"{}"), row(2, b"{}")],
+            h(3),
+        );
+        assert_eq!(kept.iter().map(|r| r.line).collect::<Vec<_>>(), [1, 3]);
+        assert!(dropped.is_empty());
+        // a request of what is kept always passes
+        let req = ExportRows {
+            sink: ExportSink::File,
+            chain: ExportChain::Detections,
+            rows: kept,
+            budget_ms: 1000,
+        };
+        assert_eq!(req.check(), Ok(()));
+    }
+
+    #[test]
+    fn the_export_s_directory_is_held_to_its_bound() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(over_bound(&d.path().join("none"), 3, 100), None);
+        std::fs::write(d.path().join("export.jsonl"), [b'a'; 40]).unwrap();
+        std::fs::write(d.path().join("export.jsonl.1"), [b'a'; 40]).unwrap();
+        std::fs::write(d.path().join("export.jsonl.2"), [b'a'; 20]).unwrap();
+        assert_eq!(over_bound(d.path(), 3, 100), None);
+        // one byte more
+        std::fs::write(d.path().join("export.jsonl.2"), [b'a'; 21]).unwrap();
+        assert!(over_bound(d.path(), 3, 100)
+            .unwrap()
+            .contains("past its bound"));
+        // a name the sink does not write, a number past its files
+        std::fs::write(d.path().join("export.jsonl.2"), [b'a'; 1]).unwrap();
+        for bad in [
+            "export.jsonl.3",
+            "filler",
+            "export.jsonl.0",
+            "export.jsonl.x",
+        ] {
+            std::fs::write(d.path().join(bad), b"x").unwrap();
+            let why = over_bound(d.path(), 3, 100).unwrap();
+            assert!(why.contains("does not write"), "{bad}: {why}");
+            std::fs::remove_file(d.path().join(bad)).unwrap();
+        }
+        assert_eq!(over_bound(d.path(), 3, 100), None);
+    }
+
+    /// The second review of #499 (R3): a signed configuration that lowers
+    /// `file_max_files` — the sink's open clears what the earlier one left,
+    /// and the honest sink's directory is within its bound.
+    #[test]
+    fn review499r_fewer_files_after_a_new_configuration() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = nn_export::jsonl::JsonlSink::open(d.path(), 15, 4).unwrap();
+        for n in 0..6u32 {
+            s.write(&[format!("{{\"n\":{n:03}}}").into_bytes()])
+                .unwrap();
+        }
+        drop(s);
+        // the next start, signed with file_max_files = 2
+        let mut s = nn_export::jsonl::JsonlSink::open(d.path(), 15, 2).unwrap();
+        s.write(&[b"{\"n\":999}".to_vec()]).unwrap();
+        let why = over_bound(d.path(), 2, 1 << 20);
+        assert_eq!(
+            why, None,
+            "an honest sink's directory judged past its bound"
+        );
+        assert_eq!(
+            dir_verdict(
+                d.path(),
+                2,
+                1 << 20,
+                allowance_after_setup(None, d.path(), 15 + (1 << 20))
+            ),
+            None
+        );
+    }
+
+    /// A signed configuration that lowers `file_max_bytes`: the files the
+    /// earlier one wrote pass the new total, and leave by the sink's
+    /// rotations while the new files fill the bound — the directory is
+    /// judged against the bound and the bytes of those larger files at the
+    /// first setup (lot 276's tenth lab: a bound raised only to the
+    /// directory's bytes killed the honest worker at its first write);
+    /// nothing is judged before a setup, and what passes the two is.
+    #[test]
+    fn a_smaller_file_size_does_not_condemn_the_honest_worker() {
+        let d = tempfile::tempdir().unwrap();
+        let line = vec![b'x'; 63];
+        let mut s = nn_export::jsonl::JsonlSink::open(d.path(), 4 << 20, 3).unwrap();
+        // 46 × 4096 lines of 64 bytes: about 11.5 MiB in the 3 files
+        let batch = vec![line.clone(); 4096];
+        for _ in 0..46 {
+            s.write(&batch).unwrap();
+        }
+        drop(s);
+        // the next start, signed with file_max_bytes = 1 MiB
+        let small = nn_export::config::FileConfig {
+            max_bytes: 1 << 20,
+            max_files: 3,
+        };
+        let bound = nn_export::config::dir_bound(&small);
+        let per_file = nn_export::config::file_bound(&small);
+        let mut s =
+            nn_export::jsonl::JsonlSink::open(d.path(), small.max_bytes, small.max_files).unwrap();
+        assert_eq!(s.size(), 0, "the active file rotated at the open");
+        assert!(
+            over_bound(d.path(), 3, bound).is_some(),
+            "the earlier files pass the new total"
+        );
+        assert_eq!(
+            dir_verdict(d.path(), 3, bound, None),
+            None,
+            "before a setup"
+        );
+        let allowance = allowance_after_setup(None, d.path(), per_file);
+        assert!(allowance.unwrap() > 6 << 20, "{allowance:?}");
+        // the honest sink writes on: never judged, until the earlier files
+        // have left
+        for _ in 0..24 {
+            s.write(&vec![line.clone(); 2048]).unwrap();
+            assert_eq!(dir_verdict(d.path(), 3, bound, allowance), None);
+        }
+        assert!(
+            over_bound(d.path(), 3, bound).is_none(),
+            "the earlier files gone"
+        );
+        // the allowance is the first setup's: a later setup keeps it
+        assert_eq!(allowance_after_setup(Some(7), d.path(), per_file), Some(7));
+        // a worker that writes past the bound and the allowance is judged
+        std::fs::write(
+            d.path().join("export.jsonl"),
+            vec![b'y'; (bound + allowance.unwrap()) as usize],
+        )
+        .unwrap();
+        assert!(dir_verdict(d.path(), 3, bound, allowance)
+            .unwrap()
+            .contains("past its bound"));
+        // and a name the sink does not write, whatever the allowance
+        std::fs::write(d.path().join("export.jsonl"), b"").unwrap();
+        std::fs::write(d.path().join("filler"), b"x").unwrap();
+        assert!(dir_verdict(d.path(), 3, bound, Some(u64::MAX / 2))
+            .unwrap()
+            .contains("does not write"));
+    }
+
+    /// The same configuration again (no larger file): no allowance, the
+    /// bound alone.
+    #[test]
+    fn the_same_configuration_again_has_the_bound_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = nn_export::jsonl::JsonlSink::open(d.path(), 1 << 20, 3).unwrap();
+        s.write(&vec![vec![b'x'; 63]; 40_000]).unwrap();
+        drop(s);
+        let f = nn_export::config::FileConfig {
+            max_bytes: 1 << 20,
+            max_files: 3,
+        };
+        let _s = nn_export::jsonl::JsonlSink::open(d.path(), f.max_bytes, f.max_files).unwrap();
+        let allowance = allowance_after_setup(None, d.path(), nn_export::config::file_bound(&f));
+        assert_eq!(allowance, Some(0));
+        let bound = nn_export::config::dir_bound(&f);
+        assert_eq!(dir_verdict(d.path(), 3, bound, allowance), None);
+        std::fs::write(d.path().join("export.jsonl.2"), vec![b'z'; bound as usize]).unwrap();
+        assert!(dir_verdict(d.path(), 3, bound, allowance).is_some());
+    }
+
+    fn row(line: u64, raw: &[u8]) -> ExportRow {
+        ExportRow {
+            file: 1,
+            line,
+            end: line * 10,
+            raw: raw.to_vec(),
+            rotate: None,
+        }
+    }
+
+    fn batch(rows: Vec<ExportRow>, next: Option<Cursor>) -> wal::Batch {
+        wal::Batch {
+            hashes: rows.iter().map(|r| format!("{:064}", r.line)).collect(),
+            rows,
+            next,
+            ..wal::Batch::default()
+        }
+    }
+
+    fn at(line: u64) -> Cursor {
+        Cursor {
+            file: 1,
+            line,
+            end: line * 10,
+            hash: format!("{line:064}"),
+        }
+    }
+
+    /// Lot 276's fifth lab: rows in flight with none to send are polled —
+    /// a request with no row, the one that gathers their acknowledgements
+    /// (without it a syslog sink's rows stayed in flight). Decided by
+    /// `plan`, which `round` follows (the second review of #499, R4: the
+    /// test of `polls` alone let the round's poll go unseen).
+    #[test]
+    fn rows_in_flight_are_polled_for_their_acknowledgements() {
+        assert!(polls(false), "rows in flight: a poll");
+        assert!(!polls(true), "nothing in flight: no request");
+        // rows in flight (sent, committed, not acked), nothing new to read
+        let mut c = chain();
+        apply(&mut c, (1..=3).map(sent).collect(), &out(None, Some(3), 0)).unwrap();
+        assert_eq!(c.window.len(), 3);
+        let p = plan(&mut c, ExportSink::Syslog, batch(vec![], Some(at(3))));
+        let (req, hashes) = p.send.expect("rows in flight: the poll");
+        assert!(req.rows.is_empty() && hashes.is_empty());
+        assert_eq!(
+            (req.sink, req.chain),
+            (ExportSink::Syslog, ExportChain::Detections)
+        );
+        assert_eq!(req.check(), Ok(()));
+        assert_eq!(
+            c.cursor,
+            Cursor::start_of(1),
+            "nothing acked: the cursor stays"
+        );
+        // nothing in flight, nothing read: nothing asked
+        let mut c = chain();
+        let p = plan(
+            &mut c,
+            ExportSink::Syslog,
+            batch(vec![], Some(Cursor::start_of(1))),
+        );
+        assert!(p.send.is_none() && p.dropped.is_empty());
+    }
+
+    /// The round's other decisions: rows read are sent (the next read past
+    /// them); nothing in flight and rows skipped by the read (lost, a
+    /// cursor gone) move the cursor with nothing asked; a row no request
+    /// carries is dropped, never sent, the cursor past it when nothing is
+    /// in flight — the window left as it is when rows are.
+    #[test]
+    fn a_round_sends_what_it_read_and_moves_past_what_it_skipped() {
+        let mut c = chain();
+        let p = plan(
+            &mut c,
+            ExportSink::File,
+            batch(vec![row(1, b"{}"), row(2, b"{}")], Some(at(2))),
+        );
+        let (req, hashes) = p.send.expect("rows to send");
+        assert_eq!(
+            req.rows.iter().map(|r| r.line).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(p.next_after, Some(at(2)));
+        assert_eq!(c.cursor, Cursor::start_of(1), "moved by the answer only");
+        // skipped rows: nothing read, the read's end past them
+        let mut c = chain();
+        let p = plan(&mut c, ExportSink::File, batch(vec![], Some(at(4))));
+        assert!(p.send.is_none());
+        assert_eq!((c.cursor.clone(), c.next.clone()), (at(4), at(4)));
+        assert!(c.dirty);
+        // a row no request carries (empty), nothing in flight: dropped,
+        // nothing asked, the cursor past it
+        let mut c = chain();
+        let p = plan(
+            &mut c,
+            ExportSink::File,
+            batch(vec![row(1, b"")], Some(at(1))),
+        );
+        assert!(p.send.is_none());
+        assert_eq!(p.dropped, vec![(1, 1)]);
+        assert_eq!(c.cursor, at(1));
+        // the same with rows in flight: dropped, the poll sent, the cursor
+        // left to the answer
+        let mut c = chain();
+        apply(&mut c, (1..=2).map(sent).collect(), &out(None, Some(2), 0)).unwrap();
+        let p = plan(
+            &mut c,
+            ExportSink::File,
+            batch(vec![row(3, b"")], Some(at(3))),
+        );
+        assert_eq!(p.dropped, vec![(1, 3)]);
+        assert!(p.send.expect("the poll").0.rows.is_empty());
+        assert_eq!(c.cursor, Cursor::start_of(1));
+        assert_eq!(c.next, at(3));
+    }
+
+    /// The second review of #499, R1: a chain's active file missing after
+    /// its rotation is said once, signed, when the wait has lasted —
+    /// never at once (the writer makes it microseconds after the rename),
+    /// never again for that wait, and again for a later one.
+    #[test]
+    fn an_active_file_missing_past_its_wait_is_noted_once() {
+        let mut c = chain();
+        let t0 = Instant::now();
+        assert_eq!(missing_note(&mut c, Some(5), t0), None, "the wait starts");
+        assert_eq!(
+            missing_note(&mut c, Some(5), t0 + Duration::from_secs(29)),
+            None
+        );
+        assert_eq!(
+            missing_note(&mut c, Some(5), t0 + ACTIVE_MISSING_NOTE),
+            Some(5),
+            "past its wait: said"
+        );
+        assert_eq!(
+            missing_note(&mut c, Some(5), t0 + Duration::from_secs(90)),
+            None,
+            "once"
+        );
+        // the file made: the wait ends; a later one is a new wait
+        assert_eq!(
+            missing_note(&mut c, None, t0 + Duration::from_secs(91)),
+            None
+        );
+        assert_eq!(c.missing, None);
+        let t1 = t0 + Duration::from_secs(100);
+        assert_eq!(missing_note(&mut c, Some(6), t1), None);
+        assert_eq!(
+            missing_note(&mut c, Some(6), t1 + ACTIVE_MISSING_NOTE),
+            Some(6)
+        );
+        // a wait for another file starts again: its own 30 s, from when the
+        // read first waited for it (mutation MC3 of lot 276's run 6: the
+        // file not compared, the first wait's start kept)
+        let t2 = t1 + Duration::from_secs(200);
+        assert_eq!(missing_note(&mut c, Some(8), t2), None);
+        assert_eq!(
+            missing_note(&mut c, Some(9), t2 + Duration::from_secs(29)),
+            None
+        );
+        assert_eq!(
+            missing_note(&mut c, Some(9), t2 + Duration::from_secs(31)),
+            None,
+            "9's wait is 2 s old"
+        );
+        assert_eq!(
+            missing_note(
+                &mut c,
+                Some(9),
+                t2 + Duration::from_secs(29) + ACTIVE_MISSING_NOTE
+            ),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn a_sink_down_or_failed_waits_at_least_its_minimum() {
+        assert_eq!(sink_wait(0), Duration::from_millis(200));
+        assert_eq!(sink_wait(150), Duration::from_millis(200));
+        assert_eq!(sink_wait(1001), Duration::from_millis(1001));
+    }
+
+    #[test]
+    fn a_refused_request_or_a_busy_slot_is_no_setup_again() {
+        assert!(!sets_up_again(&WorkerError::Busy));
+        assert!(!sets_up_again(&WorkerError::Refused(
+            "export_rows: the request's bytes".into()
+        )));
+        assert!(sets_up_again(&WorkerError::Timeout));
+        assert!(sets_up_again(&WorkerError::Died(
+            "closed its channel".into()
+        )));
+        assert!(sets_up_again(&WorkerError::Violation("bounds".into())));
+    }
+
+    #[test]
+    fn states_rank_and_faults_read() {
+        assert!(state_rank(Some(SinkState::Failed)) > state_rank(Some(SinkState::Down)));
+        assert!(state_rank(Some(SinkState::Down)) > state_rank(Some(SinkState::Up)));
+        assert!(fault_text(&SinkFault::Connect(libc::ECONNREFUSED)).contains("refused"));
+        assert_eq!(
+            fault_text(&SinkFault::Pin),
+            "the connects could not be pinned to the receiver's port"
+        );
+    }
+}

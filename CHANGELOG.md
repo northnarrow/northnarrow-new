@@ -6,6 +6,83 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- The minimal signed export (lot 276, capability C21, R15's first step;
+  `docs/operator/EXPORT.md`). Off by default; a signed
+  `/etc/northnarrow/export.local` (overlay `export`, `config-manage`) turns
+  it on, at the next start. The signed chains are the write-ahead log: the
+  core's `nn-export` thread (no capability, never the decision thread)
+  reads the rows of the detections, actions, FIM drift, netflow and canary
+  access chains after a cursor per sink and chain, and hands them to a new
+  unprivileged **export worker** (the agent's binary as
+  `northnarrow-export`, `nn-worker-exp`), which verifies each with the
+  agent's public key, maps it to **OCSF 1.9.0** (Detection Finding, Process,
+  File System and Network Activity, Remediation, Base Event; the schema
+  pinned in `crates/nn-export/ocsf/`, every record validated by the tests)
+  and writes it to a rotating, bounded **JSONL file**
+  (`/var/log/northnarrow/export`) and to **syslog over TLS** (RFC 5424
+  messages in RFC 5425 frames; rustls with the RustCrypto provider, TLS 1.3,
+  X25519, the CA pinned by the signed text). Every record carries its
+  signed row (`raw_data`) and its place and links
+  (`unmapped.northnarrow.row`). At least once: a cursor moves past rows the
+  sink delivered only (file: synced; syslog: acknowledged by the receiver's
+  TCP and settled for a second), and is written atomically
+  (`detections/export-cursors.json`). The worker's sandbox: Landlock with
+  its directory alone and a second layer pinning TCP connect to the
+  receiver's port (ABI ≥ 4, measured, required), seccomp with TCP sockets
+  and its files' calls only. Stage 8 of the loss counters (rows the export
+  can no longer deliver) is counted and signed (`telemetry_loss`, every
+  beat's `loss`); `export_state` rows are signed at the start, at a sink's
+  change and at the stop; the manifest carries `export` (and the worker's
+  `fs_rules`), each beat `export`. New verbs: `nn-admin export status`
+  (signed telemetry) and `nn-admin export verify` (a receiver's check of
+  every record against the agent's key and each chain's continuity). New
+  dependencies (rustls 0.23.46, rustls-rustcrypto 0.0.2-alpha, pinned
+  exactly) with eight RustSEC advisories recorded as not reached
+  (`.cargo/audit.toml`): the receiver's chain is verified by rustls' own
+  rustls-webpki 0.103.16, the provider's key provider loads no private
+  key; the CI charter gate refuses ring and aws-lc in the agent's graph.
+  The supervisor's pass no longer waits on a worker's long request; the
+  IPC's version is 4 (after lot 275's 3); the fuzz target `ipc_check`
+  covers the export's answers. After its independent review (#499): a
+  read inside a chain's rotation window waits for the rename (it went
+  "ahead" and back to the chain's oldest file); `nn-admin export verify`
+  maps each row again and refuses a record whose OCSF fields were
+  rewritten, and a rotation
+  without its terminator (`BROKEN`); the export worker runs as an account
+  of its own, `northnarrow-export`, the only one that writes the export's
+  directory; a blank line, or any row a request cannot carry, is lost,
+  counted and signed, never retried forever; the export says `failed` or
+  `degraded`, never `on`, when its controller does not run or its worker
+  is away; the worker's files are bounded (`RLIMIT_FSIZE`, 4 GiB in all,
+  the directory measured by the core); by default only the detections and
+  the actions are exported, the flows, file drift and canary reads each
+  opt-in (`EXPORT.md` §1a lists every field that leaves); X25519 refuses
+  a shared secret of all zeros; the sink's files are 0600. Lot 275's
+  inbound connections in the netflow chain are exported as Inbound flows
+  (the peer as the source, OCSF's bytes out the bytes the host received),
+  every other flow as Outbound. After its second review: a read in the
+  rotation's second window (the archive renamed, the new active file not
+  made yet) waits there — no eviction, no "ahead" — and a file still
+  missing 30 s later is a signed `active_missing` note; an action
+  outcome's record carries its intent's signed row
+  (`unmapped.northnarrow.intent_raw`), so that `nn-admin export verify`
+  checks every record on its own, whatever its input holds around it — the
+  intent's row verified with the key and mapped first, a missing, bent or
+  foreign one with the intent's facts TAMPERED (after its third check: a
+  PARTIAL verdict of the second review depended on the intent being before
+  the outcome in the input); `verify` says each outcome without its intent
+  attached (a NOTICE, exit 0) and checks the place words no hash covers
+  (`verified` true, `rotate` only as the signed terminator before a later
+  file's first row); the TAMPERED verdict says which (a row not signed, or
+  a record rewritten); a
+  signed configuration with fewer or smaller JSONL files holds from the
+  sink's open (the files past the new count removed, regular files only —
+  the worker's seccomp gains `newfstatat` without following a link —, an
+  active file past the new size rotated), and the core judges the export's
+  directory from the first setup against its bound and the bytes of the
+  files an earlier configuration wrote larger than this one's: the honest
+  worker is no longer killed for them (lot 276's tenth lab found the first
+  form of this fix killing it).
 - The maintainer's release-tag signing key in `.github/allowed_signers`
   (SUP-024; ED25519, `SHA256:uTnR1UsJWH1wlE2muj5W21Y7L1rxysvcR2jZcO1B5d8`,
   `namespaces="git"`): a `v*` tag signed with it now passes `verify-tag`

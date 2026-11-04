@@ -70,18 +70,21 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
     })
 }
 
-/// Name the process's thread (`comm`, 15 bytes): `nn-worker-parse`.
+/// Name the process's thread (`comm`, 15 bytes): `nn-worker-parse`,
+/// `nn-worker-exp`.
 fn set_name(kind: WorkerKind) {
     let mut name = [0u8; 16];
-    let s = format!("nn-worker-{}", kind.name());
+    let s = kind.comm();
     let n = s.len().min(15);
     name[..n].copy_from_slice(&s.as_bytes()[..n]);
     // SAFETY: PR_SET_NAME with a NUL-terminated 16-byte buffer.
     unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr(), 0, 0, 0) };
 }
 
-/// The worker's whole life; its exit status.
-pub fn main(args: &[String]) -> i32 {
+/// The worker's whole life; its exit status. The parse worker is served
+/// here; `export` — the agent's composition of nn-export and this sandbox
+/// — by `export` (lot 276: nn-linux does not depend on nn-export).
+pub fn main(args: &[String], export: fn(&Args) -> i32) -> i32 {
     let a = match parse_args(args) {
         Ok(a) => a,
         Err(e) => {
@@ -99,7 +102,17 @@ pub fn main(args: &[String]) -> i32 {
         eprintln!("northnarrow worker: --hostile exists only in lab builds (debug-trigger)");
         return EXIT_USAGE;
     }
-    let level = match sandbox::enter(&sandbox::Profile::parse(a.ipc_fd)) {
+    match a.kind {
+        WorkerKind::Parse => run(&a, &sandbox::Profile::parse(a.ipc_fd), &mut answer),
+        WorkerKind::Export => export(&a),
+    }
+}
+
+/// A worker's life once its arguments are read: its sandbox entered (exit
+/// [`EXIT_SANDBOX`] if not), its hello, then each request answered by
+/// `serve`, until the core closes the channel.
+pub fn run(a: &Args, profile: &sandbox::Profile, serve: &mut dyn FnMut(&Request) -> Answer) -> i32 {
+    let level = match sandbox::enter(profile) {
         Ok(l) => l,
         Err(e) => {
             eprintln!(
@@ -119,7 +132,7 @@ pub fn main(args: &[String]) -> i32 {
     if let Err(code) = send(a.ipc_fd, &hello) {
         return code;
     }
-    serve_loop(a.ipc_fd)
+    serve_loop(a.ipc_fd, serve)
 }
 
 fn send(fd: RawFd, msg: &FromWorker) -> Result<(), i32> {
@@ -132,7 +145,7 @@ fn send(fd: RawFd, msg: &FromWorker) -> Result<(), i32> {
 }
 
 /// Answer requests until the channel closes.
-pub fn serve_loop(fd: RawFd) -> i32 {
+pub fn serve_loop(fd: RawFd, serve: &mut dyn FnMut(&Request) -> Answer) -> i32 {
     let mut buf = vec![0u8; MAX_FRAME];
     loop {
         let n = match transport::recv_from(fd, &mut buf) {
@@ -151,7 +164,7 @@ pub fn serve_loop(fd: RawFd) -> i32 {
                 return EXIT_PROTOCOL;
             }
         };
-        let answer = answer(&msg.req);
+        let answer = serve(&msg.req);
         if let Err(code) = send(fd, &FromWorker::Response(Response { id: msg.id, answer })) {
             return code;
         }
@@ -168,6 +181,8 @@ pub(crate) fn answer(req: &Request) -> Answer {
         Request::DnsNames(names) => Answer::DnsNames(names.iter().map(qname).collect()),
         Request::TlsClientHello(bytes) => Answer::Tls(tls(bytes)),
         Request::DnsAnswers(bytes) => Answer::DnsAnswers(dns_answers(bytes)),
+        // the export worker's requests: never the parse worker's
+        Request::ExportSetup(_) | Request::ExportRows(_) => Answer::Refused(Refusal::OutOfBounds),
         Request::DebugCrash => debug_crash(),
         Request::DebugHang => debug_hang(),
     }
@@ -309,8 +324,15 @@ mod tests {
                 .as_deref(),
             Some("read-keys")
         );
+        // lot 276: the export worker's
+        assert_eq!(
+            parse_args(&argv("x --worker export --ipc-fd 3"))
+                .unwrap()
+                .kind,
+            WorkerKind::Export
+        );
         for bad in [
-            "x --worker export --ipc-fd 3",
+            "x --worker exp --ipc-fd 3",
             "x --worker parse --ipc-fd 2",
             "x --worker parse --ipc-fd 99",
             "x --worker parse --ipc-fd three",
