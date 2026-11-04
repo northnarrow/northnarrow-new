@@ -257,6 +257,9 @@ for i in range(n):
         os.unlink(p)
     elif mode == "trunc-unlink":          # emptied, then unlinked
         os.truncate(p, 0); os.unlink(p)
+    elif mode == "presized":              # mknod, truncate to 1 byte, written
+        os.mknod(p, 0o600 | stat.S_IFREG); os.truncate(p, 1)
+        fd = os.open(p, os.O_WRONLY | os.O_TRUNC); os.write(fd, b"x" * 2048); os.close(fd)
 '
 ops() { python3 -I -c "$OPS" "$@"; }
 for how in mknod tmpfile rdcreat; do
@@ -286,6 +289,32 @@ sleep 3
 n=$(journal "$mark" | grep "file burst: rename or destroyed-originals threshold crossed" | grep -c 'kind="\?unlink')
 [[ $n -eq 1 ]] && pass "25 originals truncated to 0, then unlinked: one burst of originals destroyed" \
               || bad "25 originals truncated then unlinked: $n bursts of originals destroyed (expected 1)"
+# the re-review of #500: copies made by mknod and truncated to one byte
+# before their first write-open are small rewrites to the kernel (the
+# ransomware tracker reads them as files written)
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+ops presized "$d" 25 z
+sleep 3
+n=$(journal "$mark" | grep "mass write: distinct existing files rewritten crossed" | grep -c "small_files=true")
+[[ $n -eq 1 ]] && pass "25 copies made by mknod, truncated to 1 byte, then written: one small-file overwrite event" \
+              || bad "25 presized copies: $n small-file overwrite events (expected 1)"
+# what the writes' count leaves out, the destructions' does too: 25 files of
+# 1,000 bytes another process made in the user's own runtime directory,
+# unlinked — no burst
+rd=/run/user/$(id -u)
+if [[ -d $rd && -w $rd ]]; then
+    rt=$(mktemp -d "$rd/nn-open-282r.XXXXXX")
+    ops prepare "$rt" 25 r 1000; sleep 3
+    mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+    ops unlink "$rt" 25 r
+    sleep 3
+    n=$(journal "$mark" | grep "file burst: rename or destroyed-originals threshold crossed" | grep -c 'kind="\?unlink')
+    [[ $n -eq 0 ]] && pass "25 files unlinked in the user's own runtime directory: no burst (the writes' carve-out)" \
+                  || bad "25 files unlinked in the user's own runtime directory: $n bursts (expected 0)"
+    rm -rf "$rt"
+else
+    printf 'SKIP  no runtime directory %s\n' "$rd"
+fi
 # an encryptor and a separate deleter, two processes of one unit (outside
 # any session): their crossings carry one cgroup, and the posture pairs them
 sudo "$NNADMIN" debug force-posture observing >/dev/null 2>&1

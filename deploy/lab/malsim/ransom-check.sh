@@ -18,7 +18,10 @@
 #          without a rename, small documents copied then deleted, and an
 #          encryptor whose originals a separate process of the same unit
 #          deletes each reach ENGAGED, as on main (the posture's mass-write
-#          arm; NN-L-IMP-001 where its shapes hold, recorded as data).
+#          arm; NN-L-IMP-001 where its shapes hold, recorded as data); the
+#          re-review of #500: copies made by mknod and truncated to one
+#          byte before they are written, then the originals deleted, reach
+#          ENGAGED and NN-L-IMP-001, as on main.
 #   MS-25  security tools: `systemctl stop auditd`, `auditctl -e 0`,
 #          `ufw disable`, a builtin `kill -STOP` of auditd and a rule file
 #          written into /etc/audit/rules.d each leave their NN-L-EVA record.
@@ -112,6 +115,24 @@ if want MS23; then
     variant "small files in place, no rename" 2048 python3 -I "$SIM" inplace --no-rename
     variant "small files copy-delete" 2048 python3 -I "$SIM" copy-delete
     variant "split encryptor and deleter" 8192 bash -c "python3 -I '$SIM' copy-only && python3 -I '$SIM' delete-only"
+    # the re-review of #500: copies made by mknod and sized to one byte by
+    # truncate(2) before their first write-open — small rewrites to the
+    # kernel — then the originals deleted: ENGAGED and NN-L-IMP-001 (the
+    # copies, their originals gone, their content), as on main
+    reset_posture
+    sudo python3 -I "$SIM" clean
+    sudo python3 -I "$SIM" prepare --files 300 >/dev/null
+    b=$(det_count)
+    unit_run python3 -I "$SIM" presized-copy-delete >/dev/null; rc=$?
+    sleep 3
+    n=$(rule_records "$b" NN-L-IMP-001_RansomwareEncryption)
+    k=$(rule_kills "$b" NN-L-IMP-001_RansomwareEncryption)
+    p=$(posture)
+    if engaged "$p" && [[ $n -ge 1 && $k -eq 0 && $rc -eq 0 ]]; then
+        pass "MS-23 presized copies (mknod, truncate to 1 byte) then delete: NN-L-IMP-001 recorded ($n), kill held, posture ENGAGED"
+    else
+        bad "MS-23 presized copies then delete: NN-L-IMP-001 records=$n kills=$k sim rc=$rc posture=$p (want ENGAGED and a record)"
+    fi
     # --- MS-23 negatives by the same unpackaged script (so no trust saves
     # them): the legitimate copy-then-delete shapes stay one shape, the
     # deletions — a log rotation with compression (the copies beside are

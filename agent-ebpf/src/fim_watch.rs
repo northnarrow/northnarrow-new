@@ -528,8 +528,10 @@ unsafe fn try_fim_setattr_observe(ctx: &LsmContext) -> i32 {
         }
     }
     // Lot 282 (the review of #500, C1): a file that holds data before a
-    // truncate empties it — its unlink then destroys an original.
-    let _ = crate::open_sensor::nn_setattr_mark(dentry as u64);
+    // truncate empties it — its unlink then destroys an original (the
+    // re-review: a size change only, read from the `iattr`).
+    let iattr = crate::inode_protect::setattr_iattr(ctx).map_or(0, |p| p as u64);
+    let _ = crate::open_sensor::nn_setattr_mark(dentry as u64, iattr);
     0 // observe-only — NEVER return -EPERM
 }
 

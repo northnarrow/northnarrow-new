@@ -13,6 +13,10 @@ can be recovered — and renames or replaces them, as an encryptor does.
   ransom-sim.py delete-only              lot 282: the deleter of a split pair (a
                                          process of its own) — delete each
                                          <name> whose <name>.locked is there
+  ransom-sim.py presized-copy-delete     lot 282 (the re-review of #500): make
+                                         <name>.locked with mknod, truncate it
+                                         to one byte (no open), write it, delete
+                                         <name>
   ransom-sim.py gzip-delete              negative: write <name>.gz, delete <name>
                                          (log rotation with compression)
   ransom-sim.py move-away                negative: copy to /srv/nn-malsim/moved
@@ -118,6 +122,26 @@ def delete_only(pause):
     print(f"ransom-sim: {done} originals deleted")
 
 
+def presized_copy_delete(pause):
+    """Lot 282 (the re-review of #500): each copy exists, one byte long,
+    before its first write-open — made by mknod, sized by truncate(2),
+    neither an open — so the kernel sees a small rewrite, not a new file."""
+    import stat
+
+    done = 0
+    for p in files():
+        size = os.path.getsize(p)
+        c = guard(p + ".locked")
+        os.mknod(c, 0o600 | stat.S_IFREG)
+        os.truncate(c, 1)
+        with open(c, "r+b") as f:  # an existing file of one byte
+            f.write(os.urandom(size))
+        os.unlink(p)
+        done += 1
+        time.sleep(pause)
+    print(f"ransom-sim: {done} presized copies written, originals deleted")
+
+
 def gzip_delete(pause):
     """The legitimate copy-then-delete of a log rotation with compression:
     the copy is a gzip member (stored, so it keeps the original's size),
@@ -177,6 +201,8 @@ def main(argv):
         copy_only(pause)
     elif cmd == "delete-only":
         delete_only(pause)
+    elif cmd == "presized-copy-delete":
+        presized_copy_delete(pause)
     elif cmd == "gzip-delete":
         gzip_delete(pause)
     elif cmd == "move-away":

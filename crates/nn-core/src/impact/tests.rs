@@ -221,6 +221,57 @@ fn rewrites_with_ciphertext_left_behind_are_decisive() {
     assert_eq!(t.counts().decisive, 1);
 }
 
+/// The re-review of #500 (B1's residual, its probe
+/// `review500_rr_presized_copies_then_deleted_originals`): the copies made
+/// first (`mknod`, or `O_RDONLY | O_CREAT`), brought to one byte by
+/// `truncate(2)` — no open — then written: the kernel counts them as small
+/// rewrites (`MassWrite { overwrites: true, small_files: true }`), not as
+/// files written new. They are files the actor wrote all the same: with
+/// the originals deleted beside them, the copies of their shape and their
+/// content, decisive as `new_copies_then_deleted_originals_are_decisive` —
+/// as on `main`, where every write-open counted.
+#[test]
+fn presized_copies_then_deleted_originals_are_decisive() {
+    let h = Host::new();
+    h.exec(300, 200, "/usr/bin/python3", &["python3", SIM]);
+    let (_dir, dir) = sandbox();
+    let d = dir.to_str().unwrap().to_string();
+    std::fs::write(dir.join("f017.locked"), b"ciphertext").unwrap();
+    let t = h.tracker(Fixed::high(&d));
+    let mut presized = rewrites(300, T0, &format!("{d}/f003.locked"));
+    if let Event::MassWrite { small_files, .. } = &mut presized {
+        *small_files = true;
+    }
+    let a = t.assess(&presized).unwrap();
+    assert!(!a.decisive && a.added.is_empty(), "{a:?}");
+    let b = t
+        .assess(&unlinks(300, T0 + 2 * S, &format!("{d}/f017")))
+        .unwrap();
+    assert!(b.decisive, "{b:?}");
+    let shapes: Vec<Signal> = b.signals.iter().map(|(s, _)| *s).collect();
+    assert_eq!(
+        shapes,
+        vec![
+            Signal::Entropy,
+            Signal::RenameExtension,
+            Signal::DeleteOriginals
+        ]
+    );
+    // the files of 4 KiB or more rewritten are shape (a), never files
+    // written for (d)
+    let h = Host::new();
+    h.exec(301, 200, "/usr/bin/python3", &["python3", SIM]);
+    let t = h.tracker(Fixed::low());
+    let _ = t.assess(&rewrites(301, T0, &format!("{d}/g003"))).unwrap();
+    let c = t
+        .assess(&unlinks(301, T0 + 2 * S, &format!("{d}/f017")))
+        .unwrap();
+    assert!(
+        !c.signals.iter().any(|(s, _)| *s == Signal::DeleteOriginals),
+        "{c:?}"
+    );
+}
+
 /// Lot 282, the review of #500 (C1): a crossing that needed files under
 /// 4 KiB (`small_files`) is no shape (a) — a build rewrites its own small
 /// outputs, and the tracker's verdict is decisive. The posture's arm reads

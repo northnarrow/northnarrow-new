@@ -46,8 +46,8 @@ use northnarrow_common::wire::open_sensor::{
         FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE, LEAF_CRED, LEAVES_CRED, SUBTREE,
         TREE_CARVEOUT, TREE_CRED, TREE_CRITICAL, TREE_HOME, TREE_PERSIST, TREE_RUNTIME,
     },
-    cgroup_step, created_in_window, destroys_an_original, first_in_window, kdbx_suffix, name_ext,
-    open_reason, rename_shape_with, rename_step, unlink_step, write_kind, write_step, ChildRuleKey,
+    carved_class, cgroup_step, created_in_window, destroys_an_original, first_in_window,
+    first_write, kdbx_suffix, marks_had_data, name_ext, open_reason, rename_shape_with, rename_step, unlink_step, write_kind, write_step, ChildRuleKey,
     DestroySeenKey, DirClass, NameParts, OpenCgKey, OpenCgWindow, OpenRecordRaw, OpenWriteWindow,
     OverwriteSeenKey, RenameNames, RenameWindow, UnlinkWindow, CHILD_RULES_MAX, NAME_HEAD_LEN,
     NAME_TAIL_LEN, OPEN_CLASSIFY_DEPTH, OPEN_NAME_LEN, OPEN_NAME_RULES_MAX, OPEN_PATH_SLOTS,
@@ -340,6 +340,28 @@ unsafe fn dir_class(dkey: &InodeKey, dir: *const u8, dir_inode: *const u8) -> Di
     c
 }
 
+/// Lot 282 (the re-review of #500): the directory of `parent` (a dentry;
+/// on `key`'s filesystem) is one whose writes the mass-write count leaves
+/// out — `TREE_CARVEOUT`, or `TREE_RUNTIME` owned by the caller's login
+/// uid, as [`count_write`] judges an open there — its class from the cache,
+/// computed and cached on a miss ([`dir_class`]).
+#[inline(always)]
+unsafe fn carved_dir(key: &InodeKey, parent: *const u8) -> bool {
+    let parent_inode = read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET)));
+    if parent_inode.is_null() {
+        return false;
+    }
+    let pkey = InodeKey {
+        dev: key.dev,
+        ino: match bpf_probe_read_kernel::<u64>(parent_inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
+            Ok(i) => i,
+            Err(_) => return false,
+        },
+    };
+    let cls = dir_class(&pkey, parent, parent_inode);
+    carved_class(cls.bits, cls.uid, || loginuid())
+}
+
 /// The ancestor walk of [`dir_class`]: class bits in the low half, the
 /// runtime directory's owner (or `u32::MAX`) in the high half.
 /// `DEPTH_CAPPED` when [`OPEN_CLASSIFY_DEPTH`] levels did not reach the
@@ -525,10 +547,7 @@ unsafe fn count_write(
     big: bool,
     key: &InodeKey,
 ) -> u64 {
-    if cls_bits & TREE_CARVEOUT != 0 {
-        return 0;
-    }
-    if cls_bits & TREE_RUNTIME != 0 && loginuid() == cls_uid {
+    if carved_class(cls_bits, cls_uid, || loginuid()) {
         return 0;
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
@@ -553,7 +572,10 @@ unsafe fn count_write(
         dev: key.dev,
         ino: key.ino,
     };
-    let first = first_in_window(OPEN_OVERWRITE_SEEN.get(&seen).copied(), start);
+    // The re-review of #500 (cost): a file the open created is new — its
+    // first write-open of the window, whatever an entry of a freed inode
+    // number says — so it is remembered without a lookup.
+    let first = first_write(created, || OPEN_OVERWRITE_SEEN.get(&seen).copied(), start);
     if first {
         let _ = OPEN_OVERWRITE_SEEN.insert(&seen, &start, 0);
     }
@@ -1214,9 +1236,18 @@ unsafe fn unlink_burst(dentry: *const u8) {
     if crate::fim_watch::caller_is_in_family() {
         return;
     }
+    let key = key_of(inode);
+    let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
+    // Lot 282, the re-review of #500: what the writes' count leaves out,
+    // the destructions' does too — a pseudo-filesystem, `/run/systemd`,
+    // the journal, the operator's extras, the destroyer's own runtime
+    // directory ([`carved_dir`]): a daemon's atomic replacements there are
+    // no originals, and cost no map work.
+    if !parent.is_null() && carved_dir(&key, parent) {
+        return;
+    }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let now = bpf_ktime_get_ns();
-    let key = key_of(inode);
     // Lot 282, the review of #500 (C1): an empty file is an original only
     // if it held data within the window (emptied by a truncate first).
     if size == 0 && !destroys_an_original(0, OPEN_HAD_DATA.get(&key).copied(), now) {
@@ -1233,7 +1264,6 @@ unsafe fn unlink_burst(dentry: *const u8) {
     if created_in_window(OPEN_CREATED.get(&made).copied(), now) {
         return;
     }
-    let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
     let hash_len =
         bpf_probe_read_kernel::<u64>(dentry.add(off!(DENTRY_D_NAME_OFFSET)) as *const u64).unwrap_or(0);
     if !parent.is_null() && hash_len != 0 {
@@ -1272,21 +1302,31 @@ unsafe fn unlink_burst(dentry: *const u8) {
 
 /// Lot 282, the review of #500 (C1), from `inode_setattr`
 /// (`fim_watch::fim_setattr_observe`): a regular file that holds data now,
-/// before the setattr applies (a truncate's own setattr runs before it
-/// empties the file), is remembered in [`OPEN_HAD_DATA`] — its unlink once
-/// emptied still destroys an original. A global BPF function, as
+/// before a truncate applies (its own setattr runs before it empties the
+/// file), is remembered in [`OPEN_HAD_DATA`] — its unlink once emptied
+/// still destroys an original. The re-review of #500 (cost): only a size
+/// change (`ATTR_SIZE` in the `iattr`'s `ia_valid`: `truncate`,
+/// `ftruncate`, an `O_TRUNC` open) — a chmod, a chown, a `touch` (a `tar
+/// x` sets the times of every file) no longer pays a map insert, nor
+/// evicts a truncated file's entry. A global BPF function, as
 /// [`nn_unlink_burst`].
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn nn_setattr_mark(dentry: u64) -> u64 {
-    unsafe { setattr_mark(dentry as *const u8) };
+pub extern "C" fn nn_setattr_mark(dentry: u64, iattr: u64) -> u64 {
+    unsafe { setattr_mark(dentry as *const u8, iattr as *const u8) };
     0
 }
 
 #[inline(always)]
-unsafe fn setattr_mark(dentry: *const u8) {
-    if !armed() || dentry.is_null() {
+unsafe fn setattr_mark(dentry: *const u8, iattr: *const u8) {
+    if !armed() || dentry.is_null() || iattr.is_null() {
         return;
+    }
+    // `ia_valid` is `struct iattr`'s first member (an `unsigned int`) in
+    // every kernel the agent supports, as it has been since 2.6.
+    match bpf_probe_read_kernel::<u32>(iattr as *const u32) {
+        Ok(v) if marks_had_data(v) => {}
+        _ => return,
     }
     let inode = read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET)));
     if inode.is_null() {

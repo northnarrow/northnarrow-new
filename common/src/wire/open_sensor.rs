@@ -432,6 +432,41 @@ pub fn first_in_window(seen: Option<u64>, start: u64) -> bool {
     seen != Some(start)
 }
 
+/// Lot 282, the re-review of #500 (cost): whether a write-open is its
+/// file's first of the window — always when the open `created` the file
+/// (a new inode: the eBPF counter skips the seen map's lookup, and an
+/// entry left by a freed inode number cannot make it a repeat), else
+/// [`first_in_window`] on what `seen` (the lookup) returned.
+#[inline(always)]
+pub fn first_write(created: bool, seen: impl FnOnce() -> Option<u64>, start: u64) -> bool {
+    created || first_in_window(seen(), start)
+}
+
+/// Lot 282, the re-review of #500: whether a directory of class `bits`
+/// (its runtime owner `owner`) is one whose writes — and, since then,
+/// destructions — the mass-write counts leave out: a carve-out
+/// (`TREE_CARVEOUT`: a pseudo-filesystem, `/run/systemd`, the journal, the
+/// operator's extras) or the caller's own runtime directory (`TREE_RUNTIME`
+/// owned by its login uid, `loginuid`, read only for such a directory).
+#[inline(always)]
+pub fn carved_class(bits: u32, owner: u32, loginuid: impl FnOnce() -> u32) -> bool {
+    bits & open_class::TREE_CARVEOUT != 0
+        || (bits & open_class::TREE_RUNTIME != 0 && loginuid() == owner)
+}
+
+/// `ATTR_SIZE` (include/linux/fs.h, `1 << 3` in every kernel): an
+/// `inode_setattr` that changes the file's size.
+pub const ATTR_SIZE: u32 = 1 << 3;
+
+/// Lot 282, the re-review of #500 (cost): whether an `inode_setattr` whose
+/// `iattr.ia_valid` is `ia_valid` marks its file in `OPEN_HAD_DATA` — a
+/// size change only (`truncate`, `ftruncate`, an `O_TRUNC` open), not a
+/// chmod, a chown or a `touch`.
+#[inline(always)]
+pub fn marks_had_data(ia_valid: u32) -> bool {
+    ia_valid & ATTR_SIZE != 0
+}
+
 /// Lot 282 (the lab's first run of the lot: `pip install` and `npm install`
 /// unpack into temporary files and delete them): a file a process destroys
 /// is no original of the user's when that same process created it within a
@@ -1186,6 +1221,58 @@ mod tests {
             (w.created, w.overwrites, w.small, w.count),
             (500, 0, 0, 1000)
         );
+    }
+
+    /// The re-review of #500 (cost): an open that created its file is its
+    /// file's first write-open of the window without a lookup — even when
+    /// the seen map holds the window's start for that inode number (a file
+    /// freed and its number reused within the window: a repeat would count
+    /// it less) — and the lookup is not made; any other open asks the map.
+    #[test]
+    fn a_created_file_is_first_without_a_lookup() {
+        let asked = core::cell::Cell::new(false);
+        let seen = || {
+            asked.set(true);
+            Some(7)
+        };
+        assert!(first_write(true, seen, 7));
+        assert!(!asked.get(), "no lookup for a created file");
+        assert!(!first_write(false, seen, 7));
+        assert!(asked.get());
+        assert!(first_write(false, || Some(3), 7));
+        assert!(first_write(false, || None, 7));
+    }
+
+    /// The re-review of #500: what the writes' count leaves out — and the
+    /// destructions' since — a carve-out, or the caller's own runtime
+    /// directory; a runtime directory of another login uid counts, and the
+    /// login uid is read only for a runtime directory.
+    #[test]
+    fn carved_directories_are_the_carve_outs_and_the_own_runtime_dir() {
+        use open_class::*;
+        let never = || -> u32 { panic!("login uid read for a directory that is no runtime one") };
+        assert!(carved_class(TREE_CARVEOUT, 0, never));
+        assert!(carved_class(TREE_CARVEOUT | TREE_HOME, 0, never));
+        assert!(!carved_class(TREE_HOME, 0, never));
+        assert!(!carved_class(0, 0, never));
+        assert!(carved_class(TREE_RUNTIME, 1000, || 1000));
+        assert!(!carved_class(TREE_RUNTIME, 1000, || 1001));
+        assert!(!carved_class(TREE_RUNTIME, 1000, || u32::MAX));
+    }
+
+    /// The re-review of #500 (cost): only a size change marks a file as
+    /// having held data — a truncate, an `O_TRUNC` open — never a chmod, a
+    /// chown or a `touch` (`ATTR_MODE` 1, `ATTR_UID` 2, `ATTR_GID` 4,
+    /// `ATTR_ATIME` 16, `ATTR_MTIME` 32, `ATTR_CTIME` 64; an `O_TRUNC`
+    /// open's `ATTR_OPEN` 0x8000 with the size).
+    #[test]
+    fn only_a_size_change_marks_had_data() {
+        assert!(marks_had_data(ATTR_SIZE));
+        assert!(marks_had_data(ATTR_SIZE | 32 | 64 | 0x8000));
+        for v in [0u32, 1, 2, 4, 1 | 64, 16 | 32 | 64, 2 | 4 | 64] {
+            assert!(!marks_had_data(v), "{v:#x}");
+        }
+        assert_eq!(ATTR_SIZE, 8);
     }
 
     /// Lot 282: what one write-open counts as.

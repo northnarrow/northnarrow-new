@@ -22,7 +22,9 @@
 //!   burst (`Event::FileBurst { kind: Unlink }`: 20 files that held data in
 //!   60 s — lot 282, the review of #500: any size, it was 4 KiB or more) of
 //!   an actor that crossed the new-file mass-write threshold in the window
-//!   (lot 282: files written new, the open's own creation or not).
+//!   (lot 282: files written new, the open's own creation or not; the
+//!   re-review of #500: or the small-file rewrite threshold, files written
+//!   all the same).
 //!
 //! Any **two** of them within [`RANSOM_WINDOW_NS`] for one actor make the
 //! assessment **decisive**: NN-L-IMP-001 (Critical, `KillProcessTree` of the
@@ -393,8 +395,22 @@ impl<H: DecisionHost> RansomTracker<H> {
                 ));
                 sample = Some(filename.clone());
             }
+            // Lot 282: the files an actor wrote new. The re-review of #500
+            // (B1, its residual): and a crossing that needed files under
+            // 4 KiB — a copy truncated to one byte before it is written
+            // (`truncate(2)` is no open) is a small rewrite to the kernel,
+            // and the copies-then-deleted shape (d) went dark for it. Here
+            // it is files written, as every write-open was on `main`: the
+            // copies beside the deleted originals and their content (c′, b)
+            // tell an encryptor from a build.
             Event::MassWrite {
                 overwrites: false,
+                filename,
+                ..
+            }
+            | Event::MassWrite {
+                overwrites: true,
+                small_files: true,
                 filename,
                 ..
             } => {
