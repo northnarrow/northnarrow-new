@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# Lot 277 (the re-review of #494, R2 and D6) — the start-in-cgroup tracker's
+# marks outlive a stop of the agent and an `install.sh --upgrade`, and its
+# pins are protected, on a lab guest (`nn-lab.sh tracker-persist-check`; run
+# by the lab user from the synced tree, sudo inside, the lab key with the
+# trusted-installer role). Benign: sleeping processes in throwaway cgroups.
+#
+#  1) a root process moves itself into a throwaway cgroup → marked;
+#  2) the agent and the watchdog stopped (trusted-installer window): the
+#     tracker's links stay pinned beside the pin root; a second process
+#     moved now is marked too (the programs run with no agent), the first
+#     keeps its mark;
+#  3) the agent started again: both marks kept, no "marks reset";
+#  4) `install.sh --upgrade` with the same build: both marks kept, the same
+#     tracker directory, no "marks reset" in the new start's journal;
+#  5) the tracker's pins refuse root: unlink of a link, a new entry in its
+#     directory (no window open);
+#  6) the third review of #494, R2-a: kernel.threads-max raised, the agent
+#     restarted → the same directory adopted, the marks kept, a signed
+#     note that the capacity is below the host's — no reset;
+#  7) R2-b: in a trusted-installer window, the registered directory
+#     replaced by one of the same name holding an LRU map as the marks,
+#     the agent restarted → not adopted: a new directory, the planted one
+#     removed, a signed "marks reset", the earlier marked process now
+#     "pre-epoch" (not known);
+#  8) point 3: the registered directory deleted between two agents (the
+#     window again) → a signed "marks lost between agents", the earlier
+#     processes not known;
+#  9) put back: the sleepers killed, the cgroups removed, threads-max as
+#     it was.
+set -u
+PATH=$PATH:/usr/sbin:/sbin
+HERE=$(cd "$(dirname "$0")" && pwd)
+TREE=$(cd "$HERE/../../.." && pwd)
+MARKS="$HERE/cgroup-marks.py"
+KEY=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r "$k" && { echo "$k"; break; }; done)
+NNADMIN=$(dirname "$(systemctl show -p ExecStart --value northnarrow-agent | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)")/nn-admin
+fail=0
+pass() { printf 'PASS  %s\n' "$*"; }
+bad() { printf 'FAIL  %s\n' "$*"; fail=1; }
+mover() {   # <cgroup name> <pid file>: a root sleeper that moved itself
+    sudo mkdir -p "/sys/fs/cgroup/$1"
+    sudo bash -c "echo \$BASHPID > /sys/fs/cgroup/$1/cgroup.procs && echo \$BASHPID > $2 && exec sleep 900" >/dev/null 2>&1 &
+    for _ in $(seq 1 20); do sudo test -s "$2" && break; sleep 0.2; done
+    sudo cat "$2"
+}
+mark_of() { sudo python3 -I "$MARKS" mark "$1"; }
+# The units refuse a manual stop (RefuseManualStop); inside the window
+# systemd's signals reach them — as lab_purge_pins stops them.
+units_stop() {
+    local u i
+    for u in northnarrow-watchdog northnarrow-agent; do
+        sudo systemctl kill --signal=SIGTERM "$u" 2>/dev/null
+        for i in $(seq 1 30); do
+            [ -z "$(sudo cat /sys/fs/cgroup/system.slice/$u.service/cgroup.procs 2>/dev/null)" ] && break
+            sleep 0.5
+        done
+        sudo systemctl kill --signal=SIGKILL "$u" 2>/dev/null
+        sudo systemctl reset-failed "$u" 2>/dev/null
+    done
+    sleep 1
+}
+units_start() {
+    sudo systemctl start northnarrow-agent; sleep 6; sudo systemctl start northnarrow-watchdog
+}
+# The agent logs to its own journal namespace (journald@northnarrow).
+since_start() { sudo journalctl --namespace=northnarrow -b --since "$1" --no-pager -o cat 2>/dev/null; }
+
+sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 5; }
+dir0=$(sudo python3 -I "$MARKS" dir)
+echo "tracker pin directory: $dir0"
+
+echo "== 1. a move marks"
+p1=$(mover nn277-persist-a /tmp/nn277-p1.pid)
+m=$(mark_of "$p1"); echo "    $m"
+grep -q "^$p1 moved $p1" <<<"$m" && pass "a root process that moved itself: marked" || bad "move: [$m]"
+
+echo "== 2. the agent stopped: the tracker goes on"
+sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 300 >/dev/null 2>&1 || bad "window refused"
+units_stop
+systemctl is-active --quiet northnarrow-agent && bad "the agent still runs"
+links=$(sudo sh -c "ls $dir0" | grep -c '^link_cgroup_join_')
+[[ $links -eq 5 ]] && pass "agent stopped: the tracker's 5 links still pinned in $dir0" || bad "links pinned: $links"
+p2=$(mover nn277-persist-b /tmp/nn277-p2.pid)
+m2=$(mark_of "$p2"); m1=$(mark_of "$p1"); echo "    $m2"; echo "    $m1"
+grep -q "^$p2 moved $p2" <<<"$m2" && pass "a move with no agent running: marked" || bad "move while stopped: [$m2]"
+grep -q "^$p1 moved" <<<"$m1" && pass "the earlier mark kept while stopped" || bad "earlier mark: [$m1]"
+
+echo "== 3. the agent started again"
+t3=$(date '+%F %T')
+units_start
+m1=$(mark_of "$p1"); m2=$(mark_of "$p2"); echo "    $m1"; echo "    $m2"
+grep -q "^$p1 moved" <<<"$m1" && grep -q "^$p2 moved" <<<"$m2" && pass "restart: both marks kept" || bad "restart: [$m1] [$m2]"
+j=$(since_start "$t3")
+grep -q "start-in-cgroup tracker is attached" <<<"$j" && pass "restart: the tracker attached" || bad "restart: no attach line"
+grep -q "marks reset" <<<"$j" && bad "restart: marks reset [$(grep 'marks reset' <<<"$j" | head -1)]" || pass "restart: no marks reset"
+
+echo "== 4. install.sh --upgrade (the same build)"
+t4=$(date '+%F %T')
+# From a root-owned copy of the tree (/root): R009 kills a root exec from
+# a home directory outside an administrator's terminal session, which a
+# script driven over ssh is not (the first run's upgrade was killed).
+U=/root/nn277-tree
+sudo rm -rf "$U"
+sudo mkdir -p "$U/target/release" "$U/agent-ebpf/target/bpfel-unknown-none/release"
+sudo rsync -a --exclude /target --exclude /agent-ebpf/target --exclude /.git "$TREE"/ "$U"/
+for b in northnarrow-agent northnarrow-watchdog nn-admin northnarrow-scan; do
+    sudo cp -a "$TREE/target/release/$b" "$U/target/release/" 2>/dev/null
+done
+sudo cp -a "$TREE"/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf "$TREE"/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf.buildhash "$U/agent-ebpf/target/bpfel-unknown-none/release/"
+sudo "$U/deploy/install.sh" --source-tree --upgrade --grant-key "$KEY" > /tmp/nn277-upgrade.log 2>&1; echo "    install.sh --upgrade: rc $?"
+sudo rm -rf "$U"
+grep -q "UPGRADE complete — health check passed" /tmp/nn277-upgrade.log && pass "upgrade completed" || bad "upgrade: $(grep -E 'UPGRADE|ROLLBACK|FAIL|still loaded' /tmp/nn277-upgrade.log | tail -3 | tr '\n' ' ')"
+grep -E "waiting for NorthNarrow's BPF programs|still loaded|dropping" /tmp/nn277-upgrade.log | cut -c1-160 | sed 's/^/    /'
+sleep 4
+dir1=$(sudo python3 -I "$MARKS" dir)
+m1=$(mark_of "$p1"); m2=$(mark_of "$p2"); echo "    $m1"; echo "    $m2"
+[[ $dir1 == "$dir0" ]] && pass "upgrade: the same tracker directory ($dir1)" || bad "upgrade: directory $dir0 → $dir1"
+grep -q "^$p1 moved" <<<"$m1" && grep -q "^$p2 moved" <<<"$m2" && pass "upgrade: both marks kept" || bad "upgrade: [$m1] [$m2]"
+j=$(since_start "$t4")
+grep -q "start-in-cgroup tracker is attached" <<<"$j" && pass "upgrade: the new agent's tracker attached" || bad "upgrade: no attach line"
+grep -q "marks reset" <<<"$j" && bad "upgrade: marks reset [$(grep 'marks reset' <<<"$j" | head -1)]" || pass "upgrade: no marks reset"
+
+echo "== 5. the tracker's pins refuse root (no window)"
+sleep 1
+if sudo rm -f "$dir1/link_cgroup_join_mark" 2>/tmp/nn277-rm.err; then
+    sudo test -e "$dir1/link_cgroup_join_mark" && pass "unlink of a tracker link refused" || bad "a tracker link was unlinked by root"
+else
+    pass "unlink of a tracker link refused ($(tail -1 /tmp/nn277-rm.err))"
+fi
+if sudo touch "$dir1/planted" 2>/dev/null; then bad "a new entry in the tracker's directory"; sudo rm -f "$dir1/planted"; else pass "a new entry in the tracker's directory refused"; fi
+
+restart_in_window() {   # <what to do with the agent stopped>
+    sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 300 >/dev/null 2>&1 || bad "window refused"
+    units_stop
+    eval "$1"
+    T=$(date '+%F %T')
+    units_start
+}
+
+echo "== 6. kernel.threads-max raised, the agent restarted: no reset (R2-a)"
+tm0=$(cat /proc/sys/kernel/threads-max)
+sudo sysctl -q kernel.threads-max=$((tm0 * 2))
+t6=$(date '+%F %T')
+sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 300 >/dev/null 2>&1
+units_stop; units_start
+dir6=$(sudo python3 -I "$MARKS" dir); m1=$(mark_of "$p1"); echo "    $m1 (dir $dir6)"
+j=$(since_start "$t6")
+[[ $dir6 == "$dir1" ]] && pass "threads-max raised: the same tracker directory" || bad "threads-max: $dir1 → $dir6"
+grep -q "^$p1 moved" <<<"$m1" && pass "threads-max raised: the mark kept" || bad "threads-max: [$m1]"
+grep -q "marks reset" <<<"$j" && bad "threads-max: a reset [$(grep 'marks reset' <<<"$j" | head -1 | cut -c1-160)]" || pass "threads-max raised: no reset"
+grep -q "capacity is below the host's" <<<"$j" && pass "threads-max raised: the capacity note signed" || bad "threads-max: no capacity note"
+sudo sysctl -q kernel.threads-max="$tm0"
+
+echo "== 7. the registered directory replaced by a planted one, an LRU map in it (R2-b)"
+restart_in_window "sudo rm -rf '$dir6' && sudo python3 -I '$MARKS' plant '$dir6'"
+dir7=$(sudo python3 -I "$MARKS" dir); m1=$(mark_of "$p1"); echo "    $m1 (dir $dir7)"
+j=$(since_start "$T")
+[[ $dir7 != "$dir6" ]] && pass "planted: not adopted, a new directory ($dir7)" || bad "planted: adopted $dir7"
+sudo test -e "$dir6" && bad "planted: $dir6 left" || pass "planted: the planted directory removed"
+grep -q "does not hold the maps registered" <<<"$j" && pass "planted: the reset signed ($(grep -o 'CGROUP_JOINED: [^)]*' <<<"$j" | head -1 | cut -c1-80))" || bad "planted: no signed reset"
+grep -q "^$p1 pre-epoch" <<<"$m1" && pass "planted: the earlier marked process is not known" || bad "planted: [$m1]"
+
+echo "== 8. the registered directory deleted between two agents (point 3)"
+restart_in_window "sudo rm -rf '$dir7'"
+dir8=$(sudo python3 -I "$MARKS" dir); m2=$(mark_of "$p2"); echo "    $m2 (dir $dir8)"
+j=$(since_start "$T")
+grep -q "marks lost between agents" <<<"$j" && pass "deleted: \"marks lost between agents\" signed" || bad "deleted: no signed reset"
+grep -q "^$p2 pre-epoch" <<<"$m2" && pass "deleted: the earlier marked process is not known" || bad "deleted: [$m2]"
+
+echo "== 9. put back"
+sudo kill "$p1" "$p2" 2>/dev/null; wait 2>/dev/null
+for c in nn277-persist-a nn277-persist-b; do for _ in $(seq 1 20); do sudo rmdir "/sys/fs/cgroup/$c" 2>/dev/null && break; sleep 0.5; done; done
+sudo rm -f /tmp/nn277-p1.pid /tmp/nn277-p2.pid /tmp/nn277-rm.err
+echo "tracker persist check: $( ((fail)) && echo FAIL || echo PASS)"
+exit $fail

@@ -115,8 +115,8 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CAT
 | `off <rule>` | not recorded, no response (the rule still runs, so chains and windows keep their state) |
 | `exempt <rule> uid <uid>` | that uid's matches of the rule are recorded only (not uid 0) |
 | `exempt <rule> exe <path> sha256 <hex>` | that executable — root-owned, in `/usr`, `/opt`, `/bin`, `/sbin`, `/lib*`, `/snap` or `/nix/store`, every directory up to `/` root-owned, no one else may write it, and its content exactly that digest |
-| `exempt <rule> cgroup <path>` | processes of that cgroup v2 path (it must end in a `.service` or `.scope`) |
-| `exempt <rule> unit <name>` | processes of that systemd unit (`backup.service`) |
+| `exempt <rule> cgroup <path>` | processes of that cgroup v2 path (it must end in a `.service` or `.scope`) **started there** (§2.1) |
+| `exempt <rule> unit <name>` | processes of that systemd unit (`backup.service`) **started there** (§2.1) |
 | `combat-without-corroboration NN-L-IMP-001` | the ransomware trigger reaches COMBAT without a second signal (it never locks COMBAT) |
 
 `enforce` is **refused** for a rule whose kill would not be fail-safe:
@@ -156,6 +156,143 @@ enforce NN-L-IMP-001
 exempt  NN-L-IMP-001 unit backup.service
 exempt  NN-L-IMP-001 exe /usr/bin/restic sha256 3f1c…(64 hex digits)
 ```
+
+### 2.1 Exemptions by cgroup or unit: started there, not moved there (lot 277)
+
+A cgroup's members are not all what the unit started: root can write its
+own pid into `/sys/fs/cgroup/system.slice/backup.service/cgroup.procs`, or
+start a child there with `clone3(CLONE_INTO_CGROUP)`, and is then "in"
+`backup.service`. Since lot 277 an exemption by `cgroup` or `unit` holds
+only for a process **started in that cgroup**: spawned into it by systemd
+(PID 1), or forked from a process that was.
+
+The kernel tells them apart (`agent-ebpf/src/cgroup_join.rs`, the
+start-in-cgroup tracker). It marks a process that was moved into a cgroup
+by anyone but systemd's placement, or started by `CLONE_INTO_CGROUP` by
+anyone but PID 1. A process it forks after that is marked too, before it
+runs, and the mark goes when its last thread exits. A new process starts
+with nothing at its pid, whatever a dead process left there (a move of a
+process already exiting marks after its exit: the review of #494, N5).
+The rule's match of a marked process is not exempt by `cgroup` or `unit`. An exemption by `uid` or
+`exe` still covers it: those name the actor, not where it runs. systemd's
+placement is a move PID 1 makes (a unit's process at its start, a scope's
+process, a process systemd was asked to attach), or the move a child of
+PID 1 makes of itself before it ran any program (systemd up to 254 forks,
+the child moves itself, then executes the unit's command). A move that
+changes nothing is no move — only a thread that moves **itself** into the
+cgroup it is already in: systemd 255's executor (`posix_spawn`ed by PID 1,
+moved by PID 1, then moving itself) and 256's and later (started by
+`CLONE_INTO_CGROUP`, then moving itself). A thread that writes another
+thread of its own process into `cgroup.threads` moves it, and the process is
+marked (the review of #494, B1).
+
+A move into a cgroup an exemption names, by anyone but systemd's placement,
+is a **signed detection**: NN-L-AT-001 with `operation` `cgroup_join`
+(Log, High). It is not refused, and it raises no posture trigger. The record
+names the mover (`principal`, `exe`) and, in `response`, the exemption the
+moved tree lost. The move goes through; what the moved process does is
+judged by the rules without the exemption. The kernel matches the
+destination's whole path against the `cgroup` exemptions and each of its
+components against the `unit` names: a move into a cgroup below an exempt
+unit (`backup.service/sub`) is signed too. A destination path of 255 bytes
+or more (the kernel's read fills its 256-byte buffer: the path may go on) is
+signed without a name while any such exemption is in force.
+
+The tracker's programs and maps are pinned like the other anti-tamper
+programs (the review of #494, D6), in a directory of their own beside the
+pin root: `/sys/fs/bpf/northnarrow-cgroup-join-v<schema>_<generation>`
+(the re-review of #494, R2), recorded in
+`/run/northnarrow/cgroup-join-pins`. Stopping the agent leaves them
+attached, and the marks go on being made and passed on; `install.sh
+--upgrade` purges the pin root and leaves this directory, so the marks
+outlive an upgrade too; a new start attaches its programs before it
+removes the old links. A start adopts only the directory its predecessor
+of this boot recorded, each map the one recorded (the third review of
+#494, R2-b). Anything else — the directory gone between two agents, maps
+that are not the recorded ones, a directory nobody recorded, an older
+schema's — is a **reset**: new maps, a signed degradation "cgroup
+exemptions: marks reset …" (or "marks lost between agents"), and every
+process started before that start, with what it forks, is not known —
+refused an exemption by cgroup or unit until it exits. **Restart the
+exempt services** after one. `kernel.pid_max` or `kernel.threads-max`
+raised later is no reset (R2-a): the marks keep their capacity, signed
+as below the host's. `uninstall.sh` removes the directory with the pin
+root.
+
+Where the exemption is refused:
+
+- on a kernel without the tracker (its targets not in the shape its
+  programs read: `northnarrow-agent --btf-check` prints `tracker
+  cgroup_join`; a signed `subsystem_degraded` "cgroup exemptions" at
+  every start) — every exemption by cgroup or unit;
+- for a process whose mark the kernel could not keep — the insert into the
+  marks failed, or the leader's start time could not be read: that process
+  and what it forks after, until its thread group ends (its byte in the
+  pinned `CGROUP_JOIN_LOST`, 4 MiB, written with plain stores: the
+  re-review of #494, R1); every other process's exemption stands. The
+  marks are sized when they are made (the first start of the boot) to
+  hold every thread group the host can run at once (`kernel.pid_max`,
+  capped by `kernel.threads-max`; 32,768 to 4,194,304; allocated as they
+  are taken), so a failed insert is a kernel out of memory or a limit
+  raised since, not a full map of live processes;
+- after a reset of the marks (above): every process started before it, and
+  what it forks, until it exits; It is never silent: counted in the start's
+  journal line (`marks lost`). Why per process (the review of #494, D2):
+  a state for the whole host, which any user's fork storm might reach,
+  would switch off every exemption by cgroup or unit until a reboot;
+- under the agent's containment slice (`/northnarrow.slice`, where it moves
+  the processes it blocks or throttles, unmarked): no exemption by cgroup or
+  unit applies there, and a policy that names `cgroup /northnarrow.slice…`,
+  `unit blocked.scope` or `unit throttled.scope` is refused (the review of
+  #494, N1).
+
+Refusals that are not an attack (fail-closed, as designed):
+
+- **`Delegate=yes` and container runtimes.** A service that moves its own
+  processes into its sub-cgroups is not systemd: those processes are
+  marked and lose the service's `unit` exemption. The same for a container
+  runtime — runc writes the pid itself, with the systemd cgroup driver too.
+  Exempt such a workload by `exe <path> sha256 <hex>` or `uid`.
+- **A cgroup v1 hierarchy** (a hybrid host): a move in it by anyone but
+  systemd's placement marks the process; the policy reads only the v2
+  (`0::`) cgroup.
+- **systemd 255's order inverted.** If the executor moved itself before PID
+  1 moved it (PID 1 kept off the CPU for milliseconds in that window), the
+  move is the executor's own and the unit's process is marked.
+- **A thread that is not the leader writing its own process into its
+  cgroup** (`cgroup.procs`, its tgid or `0`): the leader moves, not the
+  writer — marked (the re-review of #494, N-d).
+
+What it does not cover, as measured:
+
+- **A root that changes the unit itself** — a drop-in that rewrites
+  `ExecStart=`, a transient unit given the exempt unit's name where none is
+  loaded, systemd asked over D-Bus to attach a process
+  (`AttachProcessesToUnit`). Those are systemd's placements: the unit
+  exemption trusts the unit's definition. To bind an exemption to a
+  program, use `exe <path> sha256 <hex>` (a rewritten unit runs another
+  digest).
+- **A root that writes PID 1's memory**, or its pre-exec child's (systemd up
+  to 254): `ptrace`, `/proc/1/mem`. What PID 1 does is systemd's placement.
+- **Code injected into an exempt process that is already running**
+  (`ptrace`, `process_vm_writev`, `/proc/<pid>/mem`): nothing moves, and
+  every kind of exemption covers what the process then does — `exe <path>
+  sha256 <hex>` too, which is the file's digest, not the memory's.
+- A move made before the agent's first start since the host booted (no
+  program ran). Inside the trusted-installer window (a signed, audited
+  grant; an upgrade's), root can replace both the tracker's pins and
+  their record: the window trusts its holder. On a 6.18+ kernel with cgroup2 mounted `favordynmods`
+  (not systemd's default), a move of a dead group can mark its pid after
+  a new process took it: a false refusal. While no agent runs, the last agent's and watchdog's pids
+  stay the agent's family until the next start evicts them (pinned
+  `PROTECTED_PIDS`): a process given one of those pids moves unmarked; and
+  the `cgroup_join` record of a move made then reaches no journal (the mark
+  is made).
+- A start by `CLONE_INTO_CGROUP` is marked, not signed: the kernel's fork
+  path gives no destination path to match cheaply.
+- The same principle holds for any future exemption by container or
+  workload: a process counts as the workload's when the workload's runtime
+  started it there, never because its cgroup says so.
 
 ## 3. Testing it before it is signed
 

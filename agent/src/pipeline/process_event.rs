@@ -445,13 +445,33 @@ pub(crate) fn process_event(
                     suppressed_before: 0,
                 },
             };
+            // Lot 277: a move into a cgroup an exemption names is not a
+            // refusal: the move went through, the moved tree lost its
+            // exemptions by cgroup or unit (the kernel's mark).
+            let joined = *operation == nn_model::FsProtectOperation::CgroupJoin;
+            let exemption = joined
+                .then(|| {
+                    nn_linux::cgroup_join::exemption_named(&engine.policy().current(), *target_dev)
+                })
+                .flatten();
             if admit.record() {
-                warn!(
-                    pid, uid, comm = %Escaped(comm),
-                    op = %operation,
-                    target_dev, target_ino,
-                    "ANTI-TAMPER DENIAL"
-                );
+                if joined {
+                    warn!(
+                        pid, uid, comm = %Escaped(comm),
+                        moved = target_ino,
+                        exemption = exemption.as_deref().unwrap_or("(a path too long to match)"),
+                        "CGROUP EXEMPTION SPOOF: a process moved into an exempt cgroup by someone \
+                         other than systemd — not refused; it and what it starts are never exempt \
+                         by that cgroup or unit"
+                    );
+                } else {
+                    warn!(
+                        pid, uid, comm = %Escaped(comm),
+                        op = %operation,
+                        target_dev, target_ino,
+                        "ANTI-TAMPER DENIAL"
+                    );
+                }
             }
             if let Some(verdict) = verdict {
                 if let Admit::Record { suppressed_before } = admit {
@@ -463,12 +483,21 @@ pub(crate) fn process_event(
                     );
                     if let Some(sink) = detection_sink {
                         // Lot 273: who, by executable too.
+                        let outcome = if joined {
+                            format!(
+                                "not refused: the moved process and every process it starts are \
+                                 never exempt by {} (start-in-cgroup tracker)",
+                                exemption.as_deref().unwrap_or("the cgroup or the unit")
+                            )
+                        } else {
+                            "denied in kernel (anti-tamper LSM hook)".to_string()
+                        };
                         sink.record_denial(
                             &event,
                             &verdict,
                             at001.attack(),
                             posture.current_kind(),
-                            "denied in kernel (anti-tamper LSM hook)".to_string(),
+                            outcome,
                             suppressed_before,
                         );
                     }

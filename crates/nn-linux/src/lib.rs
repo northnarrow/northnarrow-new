@@ -131,6 +131,10 @@ pub mod canary {
 // the agent's `canary_host_linux`).
 pub mod canary_host_linux;
 
+// Lot 277: the start-in-cgroup tracker's agent half — the exemptions by
+// cgroup or unit hold for processes started in their cgroup only.
+pub mod cgroup_join;
+
 // The Linux host of the signed chains, the agent's host type (R09a; was the
 // agent's `chain_host_linux`).
 pub mod chain_host_linux;

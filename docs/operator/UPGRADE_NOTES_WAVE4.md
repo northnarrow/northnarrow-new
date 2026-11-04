@@ -56,6 +56,15 @@ has the details of each change below.
    degradation naming it (§7). Re-sign the policy without it (`alert …`)
    when convenient: `nn-admin config overlay set` refuses a file that
    keeps it.
+10. An exemption by `cgroup` or `unit` of the per-rule policy holds only
+    for a process started in its cgroup since lot 277 (§8): a process
+    moved into an exempt service, and a `Delegate=yes` service's or a
+    container runtime's own processes, lose it. After a **"cgroup
+    exemptions: marks reset"** degradation — the tracker's pins gone
+    between two agents, not the registered ones, or of another schema —
+    every process started before that start is "not known": **restart the
+    exempt services** (`systemctl restart <unit>`) so that their processes
+    are exempt again.
 
 ## 1. The on-host LLM advisor is removed (lab PR 214)
 
@@ -353,4 +362,32 @@ What an operator sees change:
   file as before (the line was valid there) and the list's JA3 entries; it
   skips the JA4 entries at its start (a line it cannot parse, a WARN each)
   and its `config overlay set` refuses an overlay that has one.
+
+## 8. Exemptions by cgroup or unit and the start-in-cgroup tracker (lot 277)
+
+An exemption by `cgroup` or `unit` (`RULE_POLICY.md` §2.1) holds only
+for a process started in that cgroup — spawned there by systemd, or
+forked from one that was; the kernel's start-in-cgroup tracker marks the
+others. What an operator sees change:
+
+- **The tracker's pins are beside the pin root**:
+  `/sys/fs/bpf/northnarrow-cgroup-join-v<schema>_<generation>`, recorded
+  in `/run/northnarrow/cgroup-join-pins` (both protected like the agent's
+  other files). `install.sh --upgrade` leaves them — the marks outlive
+  the upgrade — and `uninstall.sh` removes them.
+- **A reset is signed and fails closed.** A start adopts only the
+  directory its predecessor of this boot registered, each map the one
+  registered, in this schema's layout. Anything else — the directory gone
+  between two agents ("marks lost between agents"), maps that are not the
+  registered ones, a directory nobody registered, an older schema's —
+  builds new maps and signs "cgroup exemptions: marks reset …"; from that
+  start every process started before it, and what it forks, is "not
+  known" (refused an exemption by cgroup or unit) until it exits. **Restart
+  the exempt services** after such a degradation. A schema change of a
+  future release says in its notes whether it migrates the marks; this
+  release's schema is the first.
+- **`kernel.pid_max` or `kernel.threads-max` raised** after the marks were
+  made is no reset: the marks keep the capacity they were made with, a
+  signed note says it is below the host's, and a process past it is "not
+  known" (refused), never exempt. A reboot makes them at the new size.
 

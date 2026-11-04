@@ -1447,6 +1447,27 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         alt_paths: &[],
         optional: true,
     },
+    // Lot 277: appended (slots 118–119), no earlier slot moves (the enum,
+    // tracepoint and hook-argument slots after them do). The start-in-
+    // cgroup tracker (`agent-ebpf/src/cgroup_join.rs`) needs both; without
+    // either it is not attached and the exemptions by cgroup or unit are
+    // refused.
+    OffsetSpec {
+        name: "SIGNAL_STRUCT_LIVE_OFFSET",
+        struct_name: "signal_struct",
+        field_path: &["live"],
+        expected: SIGNAL_STRUCT_LIVE_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "KERNEL_CLONE_ARGS_FLAGS_OFFSET",
+        struct_name: "kernel_clone_args",
+        field_path: &["flags"],
+        expected: KERNEL_CLONE_ARGS_FLAGS_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
 ];
 
 /// Structs defined by a kernel module rather than vmlinux, and the module
@@ -1591,18 +1612,21 @@ pub mod slot {
     pub const KERNFS_NODE_PRIV_OFFSET: u32 = 115;
     pub const CGROUP_ROOT_OFFSET: u32 = 116;
     pub const CGROUP_ROOT_SUBSYS_MASK_OFFSET: u32 = 117;
-    // enum slots 118–119 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
-    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 120;
-    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 121;
-    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 122;
-    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 123;
-    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 124;
-    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 125;
-    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 126;
-    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 127;
-    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 128;
-    pub const TP_SYS_ENTER_EXECVE_ENVP_OFFSET: u32 = 129;
-    pub const TP_SYS_ENTER_EXECVEAT_ENVP_OFFSET: u32 = 130;
+    // Lot 277: appended (slots 118–119).
+    pub const SIGNAL_STRUCT_LIVE_OFFSET: u32 = 118;
+    pub const KERNEL_CLONE_ARGS_FLAGS_OFFSET: u32 = 119;
+    // enum slots 120–121 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
+    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 122;
+    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 123;
+    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 124;
+    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 125;
+    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 126;
+    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 127;
+    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 128;
+    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 129;
+    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 130;
+    pub const TP_SYS_ENTER_EXECVE_ENVP_OFFSET: u32 = 131;
+    pub const TP_SYS_ENTER_EXECVEAT_ENVP_OFFSET: u32 = 132;
 }
 
 /// `(const name, slot)` in [`REVALIDATE`] order — the agent writes resolved
@@ -1725,6 +1749,8 @@ pub const SLOT_TABLE: &[(&str, u32)] = &[
     ("KERNFS_NODE_PRIV_OFFSET", 115),
     ("CGROUP_ROOT_OFFSET", 116),
     ("CGROUP_ROOT_SUBSYS_MASK_OFFSET", 117),
+    ("SIGNAL_STRUCT_LIVE_OFFSET", 118),
+    ("KERNEL_CLONE_ARGS_FLAGS_OFFSET", 119),
 ];
 
 /// BPF self-defence (Tappa 10.8): `struct bpf_map`, `struct bpf_prog` and
@@ -1784,6 +1810,13 @@ pub const INODE_I_CTIME_NSEC_OFFSET: usize = 144;
 /// `nsproxy`), `tty` 408 as on 6.18 (both resolved at boot).
 pub const TASK_STRUCT_SIGNAL_OFFSET: usize = 3128;
 pub const SIGNAL_STRUCT_TTY_OFFSET: usize = 408;
+/// Lot 277: `signal_struct.live` (an `atomic_t`), the thread group's live
+/// threads: 0 at the `sched_process_exit` of its last thread (`do_exit`
+/// decrements it before the tracepoint). Byte 4 on 5.15, 6.8 and 6.18.
+pub const SIGNAL_STRUCT_LIVE_OFFSET: usize = 4;
+/// Lot 277: `kernel_clone_args.flags` (`u64`), its first member since the
+/// struct exists (5.3): `CLONE_INTO_CGROUP` is read there.
+pub const KERNEL_CLONE_ARGS_FLAGS_OFFSET: usize = 0;
 
 // ── Lab PR 219 — exploit post-condition guard (`agent-ebpf/src/epg.rs`) ──
 //
@@ -2069,26 +2102,26 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
 
 /// Tracepoint-field slots follow the enum slots.
 pub const TRACEPOINT_SLOT_TABLE: &[(&str, u32)] = &[
-    ("TP_SCHED_EXEC_FILENAME_OFFSET", 120),
-    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 121),
-    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 122),
-    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 123),
-    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 124),
-    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 125),
-    ("TP_IOURING_CREATE_FD_OFFSET", 126),
-    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 127),
-    ("TP_IOURING_CREATE_FLAGS_OFFSET", 128),
-    ("TP_SYS_ENTER_EXECVE_ENVP_OFFSET", 129),
-    ("TP_SYS_ENTER_EXECVEAT_ENVP_OFFSET", 130),
+    ("TP_SCHED_EXEC_FILENAME_OFFSET", 122),
+    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 123),
+    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 124),
+    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 125),
+    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 126),
+    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 127),
+    ("TP_IOURING_CREATE_FD_OFFSET", 128),
+    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 129),
+    ("TP_IOURING_CREATE_FLAGS_OFFSET", 130),
+    ("TP_SYS_ENTER_EXECVE_ENVP_OFFSET", 131),
+    ("TP_SYS_ENTER_EXECVEAT_ENVP_OFFSET", 132),
 ];
 
 /// Enum-value slots follow the offset slots.
-pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 118), ("ITER_IOVEC_VALUE", 119)];
+pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 120), ("ITER_IOVEC_VALUE", 121)];
 
 /// Slot of [`ITER_UBUF_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_UBUF_VALUE_SLOT: u32 = 118;
+pub const ITER_UBUF_VALUE_SLOT: u32 = 120;
 /// Slot of [`ITER_IOVEC_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_IOVEC_VALUE_SLOT: u32 = 119;
+pub const ITER_IOVEC_VALUE_SLOT: u32 = 121;
 
 // ───────────────────────────────────────
 //  LSM hook prototypes (lab PR 164).
@@ -2158,20 +2191,20 @@ pub const HOOK_ARGS: &[HookArgSpec] = &[
 
 /// Hook-argument slots follow the tracepoint slots.
 pub const HOOK_ARG_SLOT_TABLE: &[(&str, u32)] = &[
-    ("INODE_SETATTR_DENTRY_ARG", 131),
-    ("INODE_SETXATTR_DENTRY_ARG", 132),
-    ("INODE_REMOVEXATTR_DENTRY_ARG", 133),
+    ("INODE_SETATTR_DENTRY_ARG", 133),
+    ("INODE_SETXATTR_DENTRY_ARG", 134),
+    ("INODE_REMOVEXATTR_DENTRY_ARG", 135),
 ];
 
 /// Slot of the position of `inode_setattr`'s dentry: 0 up to 6.8, 1 from
 /// 6.9.
-pub const INODE_SETATTR_DENTRY_ARG_SLOT: u32 = 131;
+pub const INODE_SETATTR_DENTRY_ARG_SLOT: u32 = 133;
 /// Slot of the position of `inode_setxattr`'s dentry: 0 on 5.7 to 5.11,
 /// 1 from 5.12. The attribute name follows it.
-pub const INODE_SETXATTR_DENTRY_ARG_SLOT: u32 = 132;
+pub const INODE_SETXATTR_DENTRY_ARG_SLOT: u32 = 134;
 /// Slot of the position of `inode_removexattr`'s dentry (as
 /// `inode_setxattr`).
-pub const INODE_REMOVEXATTR_DENTRY_ARG_SLOT: u32 = 133;
+pub const INODE_REMOVEXATTR_DENTRY_ARG_SLOT: u32 = 135;
 
 /// Upper bound on a resolved position: every hook the agent attaches has
 /// at most six arguments. The eBPF reader bounds the slot value by it.
@@ -2307,6 +2340,61 @@ pub const FENTRY_TARGETS: &[&str] = &[CGROUP_MOVE_FINISH];
 /// `udp_recvmsg` and `udpv6_recvmsg` 6 up to 5.18 and 5 from 5.19.
 pub const PARAM_COUNT_FUNCS: &[&str] = &["inet_csk_accept", "udp_recvmsg", "udpv6_recvmsg"];
 
+/// Lot 277: a kernel function (fentry) or tracepoint (BTF tracepoint) a
+/// program of the start-in-cgroup tracker reads arguments of, and the
+/// struct each argument it reads points to, by the program's argument
+/// position. A tracepoint's prototype is its `btf_trace_<name>` typedef,
+/// whose first parameter is the tracepoint's own data pointer: the
+/// program's argument `n` is the typedef's parameter `n + 1`. The agent
+/// attaches the tracker only where every one has that shape (and
+/// [`CGROUP_MOVE_TARGET`] the move guard's): a prototype of another shape
+/// is not guessed at, and the exemptions by cgroup or unit are refused.
+#[derive(Debug, Clone, Copy)]
+pub struct JoinTarget {
+    pub name: &'static str,
+    pub tracepoint: bool,
+    pub args: &'static [(u32, &'static str)],
+}
+
+/// Lot 277: the tracker's targets (`agent-ebpf/src/cgroup_join.rs`), as
+/// 5.15, 6.8 and 6.18 have them.
+pub const CGROUP_JOIN_TARGETS: &[JoinTarget] = &[
+    // (struct cgroup *dst_cgrp, const char *path, struct task_struct *task,
+    // bool threadgroup); the path is read as a string
+    JoinTarget {
+        name: "cgroup_attach_task",
+        tracepoint: true,
+        args: &[(0, "cgroup"), (2, "task_struct")],
+    },
+    // (struct task_struct *parent, struct task_struct *child)
+    JoinTarget {
+        name: "sched_process_fork",
+        tracepoint: true,
+        args: &[(0, "task_struct"), (1, "task_struct")],
+    },
+    // (struct task_struct *p[, bool group_dead (6.16+)])
+    JoinTarget {
+        name: "sched_process_exit",
+        tracepoint: true,
+        args: &[(0, "task_struct")],
+    },
+    // void cgroup_post_fork(struct task_struct *child, struct
+    // kernel_clone_args *kargs)
+    JoinTarget {
+        name: "cgroup_post_fork",
+        tracepoint: false,
+        args: &[(0, "task_struct"), (1, "kernel_clone_args")],
+    },
+];
+
+/// Lot 277: the optional offsets the tracker reads; without one of them it
+/// is not attached.
+pub const CGROUP_JOIN_OFFSETS: &[&str] = &[
+    "SIGNAL_STRUCT_LIVE_OFFSET",
+    "KERNEL_CLONE_ARGS_FLAGS_OFFSET",
+    "TASK_STRUCT_SIGNAL_OFFSET",
+];
+
 /// Slot 0 value once the agent has written every resolved offset.
 pub const BTF_OFFSETS_MAGIC: u32 = 0xB7F0_0FF5;
 /// Map size: the magic slot, one slot per revalidated offset, one per enum
@@ -2339,6 +2427,9 @@ mod tests {
         );
         assert_eq!(slot::KERNFS_NODE_PARENT_OFFSET, 110);
         assert_eq!(slot::KERNFS_NODE_ID_OFFSET, 111);
+        // lot 277
+        assert_eq!(slot::SIGNAL_STRUCT_LIVE_OFFSET, 118);
+        assert_eq!(slot::KERNEL_CLONE_ARGS_FLAGS_OFFSET, 119);
     }
 
     /// Lockstep guard: if a const is added/removed without updating
@@ -2348,8 +2439,8 @@ mod tests {
     fn revalidate_table_is_complete() {
         assert_eq!(
             REVALIDATE.len(),
-            117,
-            "REVALIDATE must cover all 117 offsets"
+            119,
+            "REVALIDATE must cover all 119 offsets"
         );
     }
 
@@ -2370,7 +2461,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 134);
+        assert_eq!(BTF_OFFSETS_SLOTS, 136);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
@@ -2405,9 +2496,9 @@ mod tests {
             assert_eq!(*slot, first + i as u32);
             assert!(*slot < BTF_OFFSETS_SLOTS);
         }
-        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 120);
-        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 123);
-        assert_eq!(slot::TP_SYS_ENTER_EXECVEAT_ENVP_OFFSET, 130);
+        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 122);
+        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 125);
+        assert_eq!(slot::TP_SYS_ENTER_EXECVEAT_ENVP_OFFSET, 132);
         assert_eq!(TP_SCHED_EXEC_FILENAME_OFFSET, 8);
     }
 
@@ -2428,14 +2519,14 @@ mod tests {
             assert!(spec.compiled < HOOK_ARG_MAX);
             assert!(spec.func.starts_with("bpf_lsm_"));
         }
-        assert_eq!(INODE_SETATTR_DENTRY_ARG_SLOT, 131);
-        assert_eq!(INODE_SETXATTR_DENTRY_ARG_SLOT, 132);
-        assert_eq!(INODE_REMOVEXATTR_DENTRY_ARG_SLOT, 133);
-        assert_eq!(HOOK_ARG_SLOT_TABLE[0], ("INODE_SETATTR_DENTRY_ARG", 131));
-        assert_eq!(HOOK_ARG_SLOT_TABLE[1], ("INODE_SETXATTR_DENTRY_ARG", 132));
+        assert_eq!(INODE_SETATTR_DENTRY_ARG_SLOT, 133);
+        assert_eq!(INODE_SETXATTR_DENTRY_ARG_SLOT, 134);
+        assert_eq!(INODE_REMOVEXATTR_DENTRY_ARG_SLOT, 135);
+        assert_eq!(HOOK_ARG_SLOT_TABLE[0], ("INODE_SETATTR_DENTRY_ARG", 133));
+        assert_eq!(HOOK_ARG_SLOT_TABLE[1], ("INODE_SETXATTR_DENTRY_ARG", 134));
         assert_eq!(
             HOOK_ARG_SLOT_TABLE[2],
-            ("INODE_REMOVEXATTR_DENTRY_ARG", 133)
+            ("INODE_REMOVEXATTR_DENTRY_ARG", 135)
         );
         // a position and the argument after it stay below the bound
         assert!(HOOK_ARGS.iter().all(|h| h.compiled + 1 < HOOK_ARG_MAX));

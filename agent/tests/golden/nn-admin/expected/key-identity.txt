@@ -256,7 +256,7 @@ exit: 0
 |   not protected   : budget 1
 |   open latency    : fast path avg - max 0 µs (0), copy path avg - max 0 µs (0)
 |   restores        : 0 run, 0 files restored, 0 kept both, 0 refused
-| host hardening : 12 check(s), <the host's warnings: checked>
+| host hardening : 13 check(s), <the host's warnings: checked>
 --- stderr
 (empty)
 --- agent

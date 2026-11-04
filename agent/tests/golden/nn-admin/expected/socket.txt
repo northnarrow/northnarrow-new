@@ -312,7 +312,7 @@ exit: 0
 | combat stage      : (agent predates the field)
 | last admin action : (none since agent start)
 | telemetry         : withheld from the unsigned status (response mode, COMBAT evidence, ring drops and rejected records, deny fail-opens, trust level, degradations) — `nn-admin status --key <key>` with `audit-read` or `telemetry-read` reads them, signed
-| host hardening : 12 check(s), <the host's warnings: checked>
+| host hardening : 13 check(s), <the host's warnings: checked>
 --- stderr
 (empty)
 --- agent
@@ -330,7 +330,7 @@ exit: 0
 | combat stage      : contain (locked: `nn-admin unlock` to release)
 | last admin action : 7s ago
 | telemetry         : withheld from the unsigned status (response mode, COMBAT evidence, ring drops and rejected records, deny fail-opens, trust level, degradations) — `nn-admin status --key <key>` with `audit-read` or `telemetry-read` reads them, signed
-| host hardening : 12 check(s), <the host's warnings: checked>
+| host hardening : 13 check(s), <the host's warnings: checked>
 --- stderr
 (empty)
 --- agent
@@ -388,7 +388,7 @@ exit: 0
 |   not protected   : budget 1
 |   open latency    : fast path avg - max 0 µs (0), copy path avg - max 0 µs (0)
 |   restores        : 0 run, 0 files restored, 0 kept both, 0 refused
-| host hardening : 12 check(s), <the host's warnings: checked>
+| host hardening : 13 check(s), <the host's warnings: checked>
 --- stderr
 (empty)
 --- agent
@@ -893,7 +893,7 @@ exit: 0
 |   not protected   : budget 1
 |   open latency    : fast path avg - max 0 µs (0), copy path avg - max 0 µs (0)
 |   restores        : 0 run, 0 files restored, 0 kept both, 0 refused
-| host hardening : 12 check(s), <the host's warnings: checked>
+| host hardening : 13 check(s), <the host's warnings: checked>
 --- stderr
 (empty)
 --- agent
@@ -927,7 +927,7 @@ exit: 0
 | event bus         : (agent predates the bus)
 | deny fail-open    : (not counted: the agent reads no DENY_FAIL_OPEN counters)
 | copy on write     : (agent predates the guard)
-| host hardening : 12 check(s), <the host's warnings: checked>
+| host hardening : 13 check(s), <the host's warnings: checked>
 --- stderr
 (empty)
 --- agent
@@ -1008,7 +1008,7 @@ exit: 0
 |   not protected   : budget 1
 |   open latency    : fast path avg - max 0 µs (0), copy path avg - max 0 µs (0)
 |   restores        : 0 run, 0 files restored, 0 kept both, 0 refused
-| host hardening : 12 check(s), <the host's warnings: checked>
+| host hardening : 13 check(s), <the host's warnings: checked>
 --- stderr
 (empty)
 --- agent

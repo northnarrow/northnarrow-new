@@ -1445,10 +1445,14 @@ nn_unit_has_procs() {
 # foreign handle on a pinned link is refused.
 OWN_IDS_FILE=${OWN_IDS_FILE:-/run/northnarrow/bpf-own-ids}
 LSM_DRAIN_TIMEOUT=${LSM_DRAIN_TIMEOUT:-30}
-# Numeric first fields only: the list goes to bpftool as arguments.
+# Numeric first fields only: the list goes to bpftool as arguments. Lot 277
+# (the re-review of #494, R2): the start-in-cgroup tracker's programs are
+# marked `kept` — pinned beside the pin root ($BPFFS_ROOT-cgroup-join-v*),
+# they outlive purge_pin_root on purpose, so that the marks survive the
+# upgrade; the new agent swaps them for its own. uninstall.sh removes them.
 read_own_prog_ids() {
     [[ -r "$OWN_IDS_FILE" ]] || return 0
-    awk '$1 ~ /^[0-9]+$/ {print $1}' "$OWN_IDS_FILE" | sort -un | tr '\n' ' '
+    awk '$1 ~ /^[0-9]+$/ && $3 != "kept" {print $1}' "$OWN_IDS_FILE" | sort -un | tr '\n' ' '
 }
 # The ids among $1 still loaded. Only "No such file or directory" counts as
 # unloaded; any other bpftool error keeps the id on the list.

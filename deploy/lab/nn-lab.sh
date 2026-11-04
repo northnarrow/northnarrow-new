@@ -60,6 +60,10 @@
 #   deploy/lab/nn-lab.sh execq-check     # lab PR 223 (EXPERIMENTAL): exec quarantine at first sight, six cases, guest put back
 #   deploy/lab/nn-lab.sh malsim-exec-check # lab PR 226 (EXPERIMENTAL): exec policy and exec environment, MS-01/02/03/32 before and after, negatives, guest put back
 #   deploy/lab/nn-lab.sh policy-check    # lab PR 236: the signed per-rule policy — MS-23 held built in, killed under `enforce NN-L-IMP-001` (set live, then at boot), a bad policy refused, back to built in
+#   deploy/lab/nn-lab.sh test-one <target> # lot 277: one privileged test target of the agent on a purged pin root
+#   deploy/lab/nn-lab.sh tracker-persist-check  # lot 277: the tracker's marks outlive an agent stop and install.sh --upgrade; its pins refuse root
+#   deploy/lab/nn-lab.sh fork-cost       # lot 277: the tracker's cost a fork + exit (BPF stats per call; wall clock attached / detached)
+#   deploy/lab/nn-lab.sh exempt-check    # lot 277: an exemption by unit holds for MS-23 started by systemd in the unit, not for a root shell moved into its cgroup (nor its orphan): killed, the move signed
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh net-check         # lab PR 224: connect-time network verdicts, reverse shells, outbound fan-out (CM-02/03/14)
 #   deploy/lab/nn-lab.sh ransom-check [--only MS23|MS25] # lab PR 225: MS-23 ransomware recorded (kill held, ENGAGED), negatives; MS-25 security tools
@@ -929,7 +933,7 @@ lab_purge_pins() {
 agent_exe=$(systemctl show -p ExecStart --value northnarrow-agent 2>/dev/null | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)
 agent_exe=${agent_exe:-/usr/local/bin/northnarrow-agent}
 nn_admin=$(dirname "$agent_exe")/nn-admin
-if sudo test -d /sys/fs/bpf/northnarrow; then
+if sudo test -d /sys/fs/bpf/northnarrow || sudo sh -c 'ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* >/dev/null 2>&1'; then
     # The window can only be opened through a running agent. After an e2e
     # run the fixtures' pins are still there (protected) and the installed
     # agent is stopped: start it — as a protected pid it purges the stale
@@ -970,6 +974,15 @@ if sudo test -d /sys/fs/bpf/northnarrow; then
     sudo bash -c 'for d in /proc/[0-9]*; do e=$(readlink "$d/exe" 2>/dev/null) || continue; case "$e" in */northnarrow-agent-e2etest-*|*/northnarrow-watchdog-e2etest-*) kill -9 "${d#/proc/}" 2>/dev/null ;; esac; done'
     sudo rm -rf /sys/fs/bpf/northnarrow 2>/dev/null
     sudo test -d /sys/fs/bpf/northnarrow && echo PINS_PROTECTED
+    # Lot 277 (the re-review of #494, R2): the tracker's pins, beside the root.
+    for d in $(sudo sh -c 'ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* 2>/dev/null'); do
+        sudo test -d "$d" || continue
+        sudo rm -rf "$d" 2>/dev/null
+        sudo test -d "$d" && echo PINS_PROTECTED
+    done
+    # ... and their registration (the third review of #494, R2-b): a purge
+    # is a fresh start, not "marks lost between agents".
+    sudo rm -f /run/northnarrow/cgroup-join-pins 2>/dev/null
     # tamper-check leftovers (protected while an agent ran; the window is open now)
     sudo rm -f /etc/northnarrow/zz-tamper-*.local 2>/dev/null
     sudo rm -rf /run/systemd/system.control/northnarrow-agent.service.d 2>/dev/null
@@ -1560,6 +1573,46 @@ cmd_policy_check() {
     # + install.
     vm_running || die "guest is not running"
     vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/policy-check.sh'
+}
+
+cmd_test_one() {
+    # Lot 277 (the review of #494, D5): one privileged test target of the
+    # agent (`nn-lab.sh test-one cgroup_join_privileged_e2e`), on a purged
+    # pin root as test-ignored runs it: the tracker's behaviour test, and
+    # its mutations, without the whole suite.
+    vm_running || die "guest is not running"
+    local t=${1:?test target}
+    lab_purge_pins >/dev/null
+    lab_ignored_run 1/1 "$t" "sudo -E env \"PATH=\$PATH\" cargo test --release $LAB_CARGO_LOCKED -p northnarrow-agent --features test-privileged,debug-trigger --test $t -- --ignored --test-threads=1"
+}
+
+cmd_exempt_check() {
+    # Lot 277 (deploy/lab/malsim/exempt-check.sh): the per-rule policy's
+    # exemption by unit on MS-23 — exempt when systemd starts it as the
+    # unit, not when a root shell writes its pid into the unit's
+    # cgroup.procs (or forks it and exits): killed under `enforce
+    # NN-L-IMP-001`, the move a signed NN-L-AT-001 `cgroup_join`. Needs a
+    # sync + install.
+    vm_running || die "guest is not running"
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/exempt-check.sh'
+}
+
+cmd_tracker_persist_check() {
+    # Lot 277 (the re-review of #494, R2/D6; deploy/lab/malsim/
+    # tracker-persist-check.sh): the tracker's marks outlive a stop of the
+    # agent and an install.sh --upgrade (the same build), and its pins
+    # refuse root. Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh 'cd ~/northnarrow && bash deploy/lab/malsim/tracker-persist-check.sh'
+}
+
+cmd_fork_cost() {
+    # Lot 277 (the re-review of #494, lab point 4; deploy/lab/malsim/
+    # fork-cost.sh): the tracker's cost a fork and an exit — per call from
+    # the BPF statistics, and wall clock with its links attached and
+    # detached. Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh "cd ~/northnarrow && N=${N:-20000} ROUNDS=${ROUNDS:-5} bash deploy/lab/malsim/fork-cost.sh"
 }
 
 cmd_dns_sensor_check() {
@@ -2273,6 +2326,10 @@ case "${1:-help}" in
     net-check)     cmd_net_check ;;
     malsim-exec-check) cmd_malsim_exec_check ;;
     policy-check)  cmd_policy_check ;;
+    exempt-check)  cmd_exempt_check ;;
+    tracker-persist-check) cmd_tracker_persist_check ;;
+    fork-cost)     cmd_fork_cost ;;
+    test-one)      shift; cmd_test_one "$@" ;;
     dns-sensor-check) cmd_dns_sensor_check ;;
     ransom-check)  shift; cmd_ransom_check "$@" ;;
     fim-reuse-check) cmd_fim_reuse_check ;;

@@ -1110,6 +1110,15 @@ pub const FS_OP_NICE: u8 = 27;
 /// Lot 273c: the I/O priority of a protected process changed by another
 /// (`ioprio_set`: `task_setioprio`; `target_dev` = the ioprio value).
 pub const FS_OP_IOPRIO: u8 = 28;
+/// Lot 277: NOT a refusal — a process moved by `cgroup.procs` /
+/// `cgroup.threads` into a cgroup the per-rule policy's exemptions name (a
+/// cgroup path, or a unit's name, matched by hash:
+/// [`crate::cgroup_join`]), by anyone but systemd's placement. The move
+/// goes through; the moved process and every process it starts are never
+/// exempt by cgroup or unit (`target_ino` = the moved tgid, `target_dev` =
+/// the hash of the name matched, 0 for a destination path too long to
+/// hash).
+pub const FS_OP_CGROUP_JOIN: u8 = 29;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
@@ -2030,7 +2039,7 @@ mod tests {
         }
         // Lot 273: the new bits mark, they never require (no operation is
         // refused for carrying one).
-        for op in 1..=FS_OP_IOPRIO {
+        for op in 1..=FS_OP_CGROUP_JOIN {
             let r = fs_protect_required(op);
             assert_eq!(
                 r & (FS_PROTECT_INIT_RMDIR
@@ -2053,7 +2062,7 @@ mod tests {
         for caller in [0, 2, 1000, u32::MAX] {
             assert!(!fs_protect_init_may(FS_OP_RMDIR, dir, caller), "{caller}");
         }
-        for op in 1..=FS_OP_IOPRIO {
+        for op in 1..=FS_OP_CGROUP_JOIN {
             if op != FS_OP_RMDIR && op != FS_OP_XATTR {
                 assert!(!fs_protect_init_may(op, dir, 1), "op {op}");
             }
@@ -2139,6 +2148,7 @@ mod tests {
             FS_OP_SCHED,
             FS_OP_NICE,
             FS_OP_IOPRIO,
+            FS_OP_CGROUP_JOIN,
         ];
         for (i, a) in ops.iter().enumerate() {
             assert_ne!(*a, 0);

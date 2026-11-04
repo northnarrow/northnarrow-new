@@ -316,6 +316,10 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         // Lot 269: the denials' ring four times the object's (see
         // `FS_PROTECT_RING_BYTES`: a pump thread's wake-up on a busy CPU).
         loader.map_max_entries(FS_PROTECT_RING, FS_PROTECT_RING_BYTES);
+        // Lot 277 (the review of #494, D2): the tracker's marks sized from
+        // the host, so they cannot fill by the number of processes.
+        let joined_entries = crate::cgroup_join::joined_entries_now();
+        loader.map_max_entries(crate::cgroup_join::JOINED_MAP, joined_entries);
         if let Some(root) = pin_root {
             loader.default_map_pin_directory(root);
             debug!(
@@ -323,6 +327,10 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 "anti-tamper: anti-tamper maps will be by-name pinned to bpffs"
             );
         }
+        // The re-review of #494, R2: the tracker's maps in its own pin
+        // directory, beside the pin root — an upgrade's purge of the root
+        // leaves the marks.
+        crate::cgroup_join::prepare_pins(&mut loader, pin_root, joined_entries);
         let mut ebpf = loader
             .load(EBPF_BYTES)
             .with_context(|| "loading eBPF object (BTF, maps, programs)")?;

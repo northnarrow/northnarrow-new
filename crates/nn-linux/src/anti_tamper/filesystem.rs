@@ -2028,6 +2028,23 @@ fn register_inode(ebpf: &mut Ebpf, key: &InodeKey, flags: u8) -> Result<()> {
     Ok(())
 }
 
+/// Lot 277 (the third review of #494, R2-b): `path`, a file the agent
+/// keeps its state in, protected like its other files — no write, unlink,
+/// rename or setattr by a foreign caller outside the trusted-installer
+/// window (the start-in-cgroup tracker's registered pins).
+pub(crate) fn register_agent_file(ebpf: &mut Ebpf, path: &Path) -> Result<()> {
+    let meta =
+        std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(anyhow!("{} is not a regular file", path.display()));
+    }
+    let key = InodeKey {
+        dev: stat_dev_to_kernel_dev(meta.dev()),
+        ino: meta.ino(),
+    };
+    register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE)
+}
+
 /// Lot 273: register an inode of a protected unit's cgroup
 /// ([`super::cgroup_guard`]) like the boot's other entries (kept by the
 /// stale-key prune).
