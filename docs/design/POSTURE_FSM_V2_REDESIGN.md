@@ -712,7 +712,7 @@ minute → the mass-write arm's overwrite crossing → `ConfirmedIntrusion`
 → NEUTRALIZE killed podman's tree. On the same `main`, `apt purge podman`
 reached locked COMBAT from an anti-tamper refusal of `deb-systemd-helper`
 (its `rmdir` of a protected directory), and the ladder killed it. Three
-changes, and one false positive of NN-L-EVA-002 fixed on the way.
+changes, and one false positive of NN-L-EVA-002 fixed on the way (§10.4).
 
 ### 10.1 The mass-write arm measures what ransomware does to existing files
 
@@ -804,17 +804,47 @@ COMBAT on a heuristic only with a signal of another class in the actor's
 scope (BUG-032, POS-001), so the hold is the ladder's own check of that rule:
 the mass-write arm alone, however often and in whatever shape, stops at
 ENGAGED and never reaches the ladder (golden case
-`mass-write-arm-alone-engaged`). Open: corroboration is per actor scope (a
-login session, a workload), not per process tree — a signal of one process
-of a session vouches for another process of the same session, as the lab's
-`iptables` vouched for podman.
+`mass-write-arm-alone-engaged`). Corroboration stays per actor scope (§10.5).
 
-### 10.4 NN-L-EVA-002: a flush of one chain switches nothing off
+### 10.4 NN-L-EVA-002: a container runtime flushing its own chain
 
-`iptables -F <user-defined chain>` (and `--flush`) flushes that chain only:
-it is no longer "`iptables -F`" (the corroborator of the lab's COMBAT).
-`iptables -F` alone, followed by another option, or of a built-in chain
-(`INPUT`, `OUTPUT`, `FORWARD`, `PREROUTING`, `POSTROUTING`) still is.
+What a flush of one named chain (`iptables -F <chain>`, `--flush`) is depends
+on the chain's function and on who flushes it (the coordinator's review of the
+design):
+
+- the chains of the container runtimes and orchestrators — `CNI-…`,
+  `DOCKER…` (not `DOCKER-USER`, which holds the administrator's rules for the
+  containers' traffic), `KUBE-…`, `cali-…`, `cilium_…`, `NETAVARK…` —
+  flushed by the runtime itself are its own networking at work, not a
+  firewall switched off: the `iptables`'s parent is a runtime program (a CNI
+  plugin of `/usr/lib/cni` or `/usr/libexec/cni`, `dockerd`, `podman`,
+  `netavark`, `containerd`, `crio`, `kubelet`, `kube-proxy`), judged on what
+  the kernel executed, in a system tree and installed by a package — never a
+  name or a path alone;
+- the same chains flushed by any other process (a shell, an unpackaged
+  plugin in `/opt/cni/bin`, k3s's bundled tools), and every other chain —
+  the host firewall's (ufw's `ufw-…`, fail2ban's `f2b-…`, firewalld's
+  zones), a built-in one, every chain of a table — stay the firewall
+  switched off.
+
+Residual: kube-proxy, Calico and Cilium run in containers on most clusters;
+their executables are no package of the host, so their flushes stay records.
+
+### 10.5 What stays as it was, said explicitly
+
+- **Copy then delete from a login session.** The replacement shape (§10.1,
+  rule 2) counts outside an authenticated session only, as new files never
+  counted inside one (POS-002). Ransomware run from an SSH shell that writes
+  encrypted copies and deletes the originals does not pass through the
+  mass-write arm: the ransomware tracker (lot 225, NN-L-IMP-001 and the
+  posture's `RansomwareEncryption`) judges it, by the copies' content and
+  names. Encryption in place from a session still raises the arm (rule 1).
+- **Corroboration is per actor scope, not per process tree** (future work).
+  A signal of one process of a login session or a workload vouches for
+  another process of the same scope, as the lab's `iptables` (podman's CNI
+  plugin, under `sudo`) vouched for rootless podman's mass write. The
+  NEUTRALIZE hold of §10.3 judges the cause's evidence classes, not which
+  process raised them.
 
 ---
 

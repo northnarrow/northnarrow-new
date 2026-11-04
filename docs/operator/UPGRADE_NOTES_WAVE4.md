@@ -240,8 +240,11 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
     kind vouching for it signs a `combat_stage` row "NEUTRALIZE held" and
     kills nothing; the journal line of a COMBAT entry now names the signals
     that corroborated it;
-  - NN-L-EVA-002 is no longer recorded for `iptables -F <chain>` of a
-    user-defined chain.
+  - NN-L-EVA-002 is no longer recorded when a container runtime flushes
+    its own chain (`CNI-…`, `DOCKER…` but `DOCKER-USER`, `KUBE-…`,
+    `cali-…`, `cilium_…`, `NETAVARK…`, the `iptables`'s parent the
+    runtime's packaged program); it still is for the same chain flushed by
+    another process and for the host firewall's chains.
   The signed rows written before the upgrade keep their bytes and verify.
 
 ## 4. Build and development (source builds only)

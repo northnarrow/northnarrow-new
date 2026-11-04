@@ -1073,12 +1073,16 @@ impl Replay {
         .unwrap_or_default();
         let (tools, _) =
             SecurityTools::load::<LinuxHost>(&Path::new(CONFIGS).join("security-tools.v1"));
-        let defense = Arc::new(DefenseDetector::with_proc_root(
-            Arc::new(tools),
-            lineage.clone(),
-            Some(Arc::new(process_allowlist.with_identity(lineage.clone()))),
-            &proc_root,
-        ));
+        let defense = Arc::new(
+            DefenseDetector::with_proc_root(
+                Arc::new(tools),
+                lineage.clone(),
+                Some(Arc::new(process_allowlist.with_identity(lineage.clone()))),
+                &proc_root,
+            )
+            // Lot 282: the fixture's package database, never the machine's.
+            .with_program_owners(ProgramOwners::new(&fixture)),
+        );
         let window = Arc::new(
             TrustedInstallerOverride::new(
                 None,

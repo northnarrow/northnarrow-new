@@ -247,15 +247,21 @@ fn switch_off_commands_need_their_arguments() {
         .run(345, 200, "/usr/sbin/xtables-nft-multi", &["iptables", "-F"])
         .unwrap();
     assert_eq!(f.tool, "iptables");
-    // Lot 282 (lab 04/11): a flush of ONE chain — podman's CNI firewall
-    // plugin setting up its own chains at a host's first run — switches
-    // nothing off; a flush of every chain of a table still does.
+    // Lot 282: what a flush of one named chain is depends on the chain's
+    // function and on who flushes it (the runtime cases are
+    // `a_runtime_flushing_its_own_chain_is_no_switch_off`): from a shell,
+    // every chain — a runtime's included — and every table is a switch-off.
     // (each its own pid: the detector memoises a spawn by pid and time)
-    for (k, one_chain) in [
+    for (k, from_a_shell) in [
         &["iptables", "--wait", "-t", "nat", "-F", "CNI-HOSTPORT-DNAT"][..],
-        &["iptables", "-F", "CNI-FORWARD"][..],
         &["ip6tables", "-t", "filter", "--flush", "CNI-ADMIN"][..],
         &["iptables", "-w", "-F", "DOCKER-USER", "-t", "filter"][..],
+        &["iptables", "-F", "ufw-user-input"][..],
+        &["iptables", "-t", "nat", "-F"][..],
+        &["iptables", "-F", "-t", "filter"][..],
+        &["ip6tables", "--flush"][..],
+        &["iptables", "-w", "-F", "-X"][..],
+        &["iptables", "-F", "INPUT"][..],
     ]
     .into_iter()
     .enumerate()
@@ -265,32 +271,10 @@ fn switch_off_commands_need_their_arguments() {
                 3480 + k as u32,
                 200,
                 "/usr/sbin/xtables-nft-multi",
-                one_chain
-            )
-            .is_none(),
-            "{one_chain:?}"
-        );
-    }
-    for (k, every_chain) in [
-        &["iptables", "-t", "nat", "-F"][..],
-        &["iptables", "-F", "-t", "filter"][..],
-        &["ip6tables", "--flush"][..],
-        &["iptables", "-w", "-F", "-X"][..],
-        &["iptables", "-F", "INPUT"][..],
-        &["ip6tables", "-t", "nat", "--flush", "POSTROUTING"][..],
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        assert!(
-            h.run(
-                3490 + k as u32,
-                200,
-                "/usr/sbin/xtables-nft-multi",
-                every_chain
+                from_a_shell
             )
             .is_some(),
-            "{every_chain:?}"
+            "{from_a_shell:?}"
         );
     }
     // the other listed commands are unchanged: an operand after a run that
@@ -318,6 +302,164 @@ fn switch_off_commands_need_their_arguments() {
     assert!(h
         .run(347, 200, "/usr/sbin/aa-teardown", &["aa-teardown"])
         .is_some());
+}
+
+/// Lot 282 (Tappa Prove P0; lab 04/11 on main: podman's CNI plugin's
+/// `iptables -t nat -F CNI-…` was NN-L-EVA-002, and the DefenseImpairment it
+/// raised corroborated podman's own mass write into a locked COMBAT that
+/// killed podman). A container runtime flushing its own chain — the
+/// parent of the `iptables` a runtime program (a CNI plugin, dockerd,
+/// podman, netavark, …) in a system tree, installed by a package — switches
+/// nothing off. The host firewall's chains (ufw, fail2ban), `DOCKER-USER`
+/// (the administrator's rules), a built-in chain or a whole table stay a
+/// switch-off whoever flushes them; a runtime's chain flushed by a shell, an
+/// unpackaged plugin (`/opt/cni/bin`) or an unlisted program in the plugins'
+/// directory stays one too.
+#[test]
+fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
+    let h = host();
+    let root = TempDir::new().unwrap();
+    let info = root.path().join("var/lib/dpkg/info");
+    std::fs::create_dir_all(&info).unwrap();
+    std::fs::write(root.path().join("var/lib/dpkg/status"), "Package: x\n").unwrap();
+    std::fs::write(
+        info.join("containernetworking-plugins.list"),
+        "/usr/lib/cni\n/usr/lib/cni/bridge\n/usr/lib/cni/portmap\n",
+    )
+    .unwrap();
+    std::fs::write(info.join("docker.io.list"), "/usr/sbin/dockerd\n").unwrap();
+    std::fs::write(info.join("podman.list"), "/usr/bin/podman\n").unwrap();
+    let det = DefenseDetector::with_proc_root(
+        Arc::new(SecurityTools::builtin()),
+        h.lineage.clone(),
+        None,
+        h._proc.path(),
+    )
+    .with_program_owners(crate::impact::trust::ProgramOwners::new(root.path()));
+    let l = &h.lineage;
+    // the runtimes: podman (310) and its CNI plugin (311), dockerd (300);
+    // an unpackaged plugin (320), an unlisted program in the plugins'
+    // directory (330), a script in it run by a shell (340)
+    l.ingest_exec(
+        300,
+        1,
+        "/usr/sbin/dockerd",
+        &["dockerd".into()],
+        3 * S,
+        3 * S,
+        0,
+    );
+    l.ingest_exec(
+        310,
+        200,
+        "/usr/bin/podman",
+        &["podman".into()],
+        4 * S,
+        4 * S,
+        0,
+    );
+    l.ingest_exec(
+        311,
+        310,
+        "/usr/lib/cni/bridge",
+        &["bridge".into()],
+        5 * S,
+        5 * S,
+        0,
+    );
+    l.ingest_exec(
+        320,
+        310,
+        "/opt/cni/bin/bridge",
+        &["bridge".into()],
+        5 * S,
+        5 * S,
+        0,
+    );
+    l.ingest_exec(
+        330,
+        310,
+        "/usr/lib/cni/fake",
+        &["fake".into()],
+        5 * S,
+        5 * S,
+        0,
+    );
+    l.ingest_exec(
+        340,
+        200,
+        "/usr/bin/bash",
+        &["bash".into(), "/usr/lib/cni/bridge".into()],
+        5 * S,
+        5 * S,
+        0,
+    );
+    let run = |pid: u32, ppid: u32, argv: &[&str]| {
+        let argv_s: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+        let at = 100 * S + pid as u64;
+        let ipt = "/usr/sbin/xtables-nft-multi";
+        l.ingest_exec(pid, ppid, ipt, &argv_s, at, at, 0);
+        let mut e = spawn(pid, ppid, ipt, argv);
+        if let Event::ProcessSpawn { timestamp_ns, .. } = &mut e {
+            *timestamp_ns = at;
+        }
+        det.assess(&e)
+    };
+    let cni = ["iptables", "--wait", "-t", "nat", "-F", "CNI-0a1b2c3d4e5f"];
+    // the runtime's own chain, by the runtime: no switch-off
+    assert!(
+        run(4001, 311, &cni).is_none(),
+        "CNI chain by the CNI plugin"
+    );
+    assert!(run(
+        4002,
+        311,
+        &["ip6tables", "-t", "nat", "--flush", "CNI-DN-0a1b2c"]
+    )
+    .is_none());
+    assert!(
+        run(
+            4003,
+            300,
+            &[
+                "iptables",
+                "--wait",
+                "-t",
+                "filter",
+                "-F",
+                "DOCKER-ISOLATION-STAGE-1"
+            ]
+        )
+        .is_none(),
+        "dockerd's own chain"
+    );
+    assert!(run(4004, 300, &["iptables", "-t", "nat", "-F", "DOCKER"]).is_none());
+    assert!(run(4005, 310, &["iptables", "-F", "NETAVARK-FORWARD"]).is_none());
+    // the same chain by anyone else: a switch-off
+    assert!(run(4011, 200, &cni).is_some(), "CNI chain by a shell");
+    assert!(run(4012, 320, &cni).is_some(), "an unpackaged plugin");
+    assert!(
+        run(4013, 330, &cni).is_some(),
+        "an unlisted program in the plugins' directory"
+    );
+    assert!(run(4014, 340, &cni).is_some(), "a script run as the plugin");
+    // the firewall's chains, whoever flushes them
+    for (k, (ppid, argv)) in [
+        (200, &["iptables", "-F", "ufw-user-input"][..]),
+        (311, &["iptables", "-F", "ufw-before-input"][..]),
+        (300, &["iptables", "-F", "f2b-sshd"][..]),
+        (300, &["iptables", "-F", "DOCKER-USER"][..]),
+        (300, &["iptables", "-F", "INPUT"][..]),
+        (311, &["iptables", "-t", "nat", "-F"][..]),
+        (300, &["iptables", "-F"][..]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let f = run(4020 + k as u32, ppid, argv);
+        assert!(f.is_some(), "{argv:?} by {ppid}");
+        assert_eq!(f.unwrap().rule, EvaRule::SwitchedOff);
+    }
 }
 
 #[test]

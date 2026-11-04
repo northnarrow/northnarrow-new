@@ -110,8 +110,15 @@ pull` and an `apt purge` reached it. Since lot 282
   heuristic with no signal of another kind vouching for it holds its
   NEUTRALIZE (a signed `combat_stage` row, "NEUTRALIZE held"), and does not
   isolate for it;
-- NN-L-EVA-002 no longer reads `iptables -F <chain>` of a user-defined chain
-  (podman's network setup) as the firewall switched off.
+- NN-L-EVA-002 no longer reads a container runtime flushing its own chain
+  (`CNI-…`, `DOCKER…` but `DOCKER-USER`, `KUBE-…`, `cali-…`, `cilium_…`,
+  `NETAVARK…`, flushed by the runtime's packaged program: podman's CNI
+  plugin, dockerd) as the firewall switched off; the same chain flushed by
+  another process, and the host firewall's chains (ufw, fail2ban, firewalld,
+  the built-in ones), still are;
+- the replacement shape (copy then delete) counts outside an authenticated
+  session only: ransomware run from an SSH shell that way is judged by the
+  ransomware tracker (NN-L-IMP-001), not by the mass-write signal.
 
 None of this is a policy directive: the per-rule policy does not change it,
 and no `enforce` brings the old behaviour back.

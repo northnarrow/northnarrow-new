@@ -219,6 +219,12 @@ impl<H: DecisionHost> RansomTracker<H> {
         }
     }
 
+    /// The package database it judges programs on (lot 282: a replay
+    /// gives the security-tool detector the same one).
+    pub fn program_owners(&self) -> &ProgramOwners<H> {
+        &self.owners
+    }
+
     pub fn counts(&self) -> RansomCounts {
         RansomCounts {
             decisive: self.counters.decisive.load(Ordering::Relaxed),

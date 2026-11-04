@@ -688,8 +688,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - the ladder holds its NEUTRALIZE (signed, no kill, no ISOLATE) when
     COMBAT's cause is a heuristic that no signal of another kind vouches
     for (`CombatCause::single_heuristic_arm`);
-  - NN-L-EVA-002 no longer records `iptables -F` of one user-defined chain
-    as the firewall switched off.
+  - NN-L-EVA-002 no longer records a container runtime flushing its own
+    chain (`CNI-…`, `DOCKER…` but `DOCKER-USER`, `KUBE-…`, `cali-…`,
+    `cilium_…`, `NETAVARK…`; the `iptables`'s parent a runtime program —
+    a CNI plugin, dockerd, podman, netavark — in a system tree, installed
+    by a package); the same chain flushed by another process and the host
+    firewall's chains (ufw, fail2ban, firewalld, the built-in ones) still
+    are.
+  What stays: copy-then-delete ransomware run from an SSH shell is the
+  ransomware tracker's (NN-L-IMP-001), not the mass-write arm's (as
+  before); corroboration stays per actor scope, not per process tree.
   Tests: `common` (the counters' glue: 259 opens of one database, distinct
   rewrites, files created, a name deleted at every commit), the posture's
   triggers (the shapes, either order, sessions, exemptions, the

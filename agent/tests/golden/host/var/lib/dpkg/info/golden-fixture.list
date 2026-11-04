@@ -16,3 +16,6 @@
 /usr/bin/su
 /usr/bin/id
 /usr/sbin/auditctl
+/usr/lib/cni/bridge
+/usr/sbin/dockerd
+/usr/bin/podman
