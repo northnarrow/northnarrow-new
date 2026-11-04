@@ -5231,8 +5231,9 @@ number in parentheses is a lab PR.
     a start before it in `/proc`, and the judged lineage walk (lab PR 269)
     lost the session.
   - What changed: a fork's parent read at the fork's earliest time, and at
-    its tick only when that is "only later" and the parent took one identity
-    in the tick (review of #493, B1); the engine judges in the agent's
+    its tick only when that is "only later", the parent took one identity
+    in the tick and it is an authentication binary's (sudo's monitor; the
+    reviews of #493); the engine judges in the agent's
     posture (`decide_in`): R009's kill, and R001's and R003's of an exec by
     root, run in COMBAT only, the record kept, `enforce R009` restores them;
     the hold counts as a switch's for the legacy first match, so it never

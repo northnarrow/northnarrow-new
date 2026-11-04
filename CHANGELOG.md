@@ -691,7 +691,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     /usr/bin/borg`) passed for borg through the one-identity rule. The
     later exec now answers only for an identity its executable alone decides
     (no script, no npm entrypoint, no interpreter), the child's live exe
-    being that executable; sudo's monitor is one.
+    being that executable — and, after the third review, only for an
+    authentication binary's monitor (sudo, su, doas, pkexec, …: a child
+    forked before its parent's exec that executed the same canary reader
+    itself, restic or clamscan, before its exec reached the cache, would
+    have taken the reader's identity).
   - The installer is the process with the exact start `/proc` shows for it
     now: no allowance for the time suspended.
   - The posture is read once per decision. The static scan of `install.sh`

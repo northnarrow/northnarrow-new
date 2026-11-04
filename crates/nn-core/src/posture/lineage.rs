@@ -1553,6 +1553,13 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// event's time — a process that started after it is not the one the
     /// pid named then. Never the image `/proc` shows instead of the
     /// parent's: an exec the cache has not read leaves the pid not known.
+    ///
+    /// Lot 278: the parent's image is read at the fork's earliest time; the
+    /// exec the parent made up to the fork's tick answers only for the
+    /// monitor of an authentication binary (sudo, su, doas, pkexec, …:
+    /// [`AUTH_BINARY_EXES`]) forked in the tick of that binary's exec — the
+    /// one case the upper bound exists for (the lab's R009 flake). Any other
+    /// identity found only later is not known (the reviews of #493).
     fn fork_entry(&self, pid: u32, at: Option<u64>, depth: usize) -> Option<Entry> {
         if pid <= 1 || depth > LINEAGE_DEPTH_CAP {
             return None;
@@ -1595,7 +1602,16 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             CachedAt::Current(e) | CachedAt::Past(e) => e,
             CachedAt::LaterOnly => {
                 let e = self.only_identity_between(ppid, start_ns, forked_by)?;
-                if e.script.is_some() || e.argv_npm_cli || is_interpreter(&e.exe) {
+                // third review of #493: only an authentication binary's
+                // monitor — a child forked before its parent's exec that
+                // executed the same file itself (restic, clamscan: canary
+                // readers) before that exec reached the cache would take
+                // the identity, and nothing tells the two apart
+                if e.script.is_some()
+                    || e.argv_npm_cli
+                    || is_interpreter(&e.exe)
+                    || !is_auth_binary(&e.exe)
+                {
                     return None;
                 }
                 e
@@ -5347,6 +5363,52 @@ mod tests {
         // a child forked before the exec runs the earlier image: not sudo's
         write_exe(tmp.path(), 801, "/usr/bin/bash");
         assert_eq!(t.exec_identity(801, judged), None);
+    }
+
+    /// Third review of #493: the upper bound is for an authentication
+    /// binary's monitor only. A child forked before its parent's exec that
+    /// executed the same binary itself (restic, a canary reader) before its
+    /// own exec reached the cache cannot be told from a fork made after the
+    /// exec: not known, no reader. The monitor of each authentication
+    /// binary in use (sudo, su, doas, pkexec), forked in the tick of its
+    /// exec, keeps that binary's identity.
+    #[test]
+    fn only_an_authentication_binary_s_monitor_takes_the_later_exec() {
+        const MS: u64 = 1_000_000;
+        let monitor = |exe: &str| {
+            let tmp = TempDir::new().unwrap();
+            let t = AuthSessionTracker::new(tmp.path());
+            t.ingest_exec(700, 1, "/usr/bin/bash", &[], 5 * S, 5 * S, 1000);
+            // P (710): the shell's fork, executes `exe` at 10.003 s
+            t.ingest_exec(710, 700, exe, &[], 10_003 * MS, 10_001 * MS, 1000);
+            // C (711): forked at 10.008 s (`/proc`: tick 1000), runs `exe`
+            write_exe(tmp.path(), 711, exe);
+            write_status(tmp.path(), 711, 710);
+            write_started(tmp.path(), "711", 710, 1_000);
+            (tmp, t)
+        };
+        let judged = AsOf::Judged(10_030 * MS);
+        // a canary reader's binary: not known, no reader
+        let (_tmp, t) = monitor("/usr/bin/restic");
+        assert_eq!(t.exec_identity(711, judged), None);
+        assert_eq!(readers_of(&t, 711, judged), None);
+        // each authentication binary in use: its monitor keeps its identity
+        for exe in [
+            "/usr/bin/sudo",
+            "/bin/sudo",
+            "/usr/bin/su",
+            "/bin/su",
+            "/usr/bin/doas",
+            "/usr/bin/pkexec",
+        ] {
+            assert!(is_auth_binary(Path::new(exe)), "{exe}");
+            let (_tmp, t) = monitor(exe);
+            assert_eq!(
+                t.exec_identity(711, judged).map(|i| i.exe),
+                Some(PathBuf::from(exe)),
+                "{exe}"
+            );
+        }
     }
 
     /// Second review of #493 (mutation R3): the one-identity rule compares
