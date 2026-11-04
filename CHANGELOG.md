@@ -6,6 +6,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- The maintainer's release-tag signing key in `.github/allowed_signers`
+  (SUP-024; ED25519, `SHA256:uTnR1UsJWH1wlE2muj5W21Y7L1rxysvcR2jZcO1B5d8`,
+  `namespaces="git"`): a `v*` tag signed with it now passes `verify-tag`
+  and starts `release.yml`; a tag signed by any other key, unsigned or
+  lightweight is still refused before anything is built.
 - Network telemetry, level 2 of C07 (lot 275,
   `docs/operator/NETWORK_TELEMETRY.md`): three new sources of the bus,
   each with its sensor-contract entry, its attach state in the signed
