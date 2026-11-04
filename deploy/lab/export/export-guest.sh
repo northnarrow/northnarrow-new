@@ -532,6 +532,7 @@ PY
 # — the status, the manifest and the next beat say degraded, never on.
 phase_dead() {
     local i w st
+    bus_json > "$OUT/status-before-dead.json"
     "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 120 >/dev/null 2>&1
     for i in $(seq 1 12); do
         w=$(worker_pid)
@@ -541,6 +542,8 @@ phase_dead() {
         [ "$st" = degraded ] && break
     done
     status_json > "$OUT/status-dead.json"
+    bus_json > "$OUT/status-after-dead.json"
+    journalctl -u northnarrow-agent --since "-3min" --no-pager 2>/dev/null | grep -iE 'posture|combat|isolat|worker_export|export' | tail -60 > "$OUT/journal-dead.txt"
     check dead-status "the worker killed until disabled: export status degraded (worker $(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["export"]["worker"])' "$OUT/status-dead.json" 2>/dev/null))" bash -c "[ '$st' = degraded ]"
     "$NNADMIN" capabilities --json --key "$KEY" > "$OUT/capabilities-dead.json" 2>&1
     check dead-manifest "the manifest's export entry degraded" python3 -I -c '
