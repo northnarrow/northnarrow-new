@@ -96,8 +96,10 @@ posture: `insmod`; `modprobe` of a path or a `.ko*` name; `-C`, `-d`, `-S`,
 `--force*`, `-o`, `--remove-holders`, `--remove-dependencies`; any argument
 starting with `-` after the first name (`modprobe <name> -q` included); a
 copy of the tool or a program that is not the system's (by device and
-inode); `MODPROBE_OPTIONS`, or an environment the agent could not read at
-the exec; an argv not read whole. R011 resolves nothing: whether a name
+inode); `MODPROBE_OPTIONS`, or a running process whose environment the agent
+could not read at the exec or whose pid names another process; an argv not
+read whole. A tool that had exited before the agent could read its
+environment is recorded, noting it — a kill would reach no one. R011 resolves nothing: whether a name
 loads a module, and which, is the kernel's to judge. R018 records the load
 (`kernel_read_file`, the file's path) and kills the loader of a file outside
 the module directories, or of an unowned one by a loader it does not

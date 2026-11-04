@@ -165,9 +165,12 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
   `--remove-holders`, `--remove-dependencies`; an argument starting with
   `-` after the first name (`modprobe <name> -q`); a copy of the tool or a
   program whose device and inode are not the system's tool's;
-  `MODPROBE_OPTIONS`, or an environment the agent could not read at the exec
-  (a process that exited before the exec pump read it is killed — a kill
-  that reaches no one); a cut argv. R011 resolves no name and reads no
+  `MODPROBE_OPTIONS`; a running process whose environment the agent could
+  not read at the exec, or whose pid names another process; a cut argv. A
+  module tool that had exited before the agent could read its environment
+  is recorded, the reasoning saying so ("exited before its environment
+  could be read — a load it made is the kernel's to judge (R018)"): its
+  kill would reach no one. R011 resolves no name and reads no
   `modprobe.d`: the load itself is R018's record (after the fact) and the
   kernel's signature policy's refusal.
 

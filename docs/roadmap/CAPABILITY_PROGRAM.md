@@ -5638,9 +5638,11 @@ number in parentheses is a lab PR.
     `--remove-dependencies` and their abbreviations; any argument starting
     with `-` after the first name; an option the tool refuses; a `kmod`
     command but `help`/`list`/`static-nodes`/the version; a program not the
-    system's tool, of another mount namespace; `MODPROBE_OPTIONS` or an
-    environment not read; an argv not read whole. Recorded (High,
-    T1547.006) otherwise. `OBSERVING_KILLS` unchanged: R011's kill narrowed,
+    system's tool, of another mount namespace; `MODPROBE_OPTIONS`, a
+    running process's environment not read or its pid another's; an argv
+    not read whole. Recorded (High, T1547.006) otherwise — a tool that had
+    exited before its environment could be read noting it (the
+    coordinator's decision of 04/11: its kill would reach no one). `OBSERVING_KILLS` unchanged: R011's kill narrowed,
     no kill added. The NET-006 test waits for as many records as listeners
     it opened, then asserts exactly that many. No capability level moves.
   - Decisions (04/11/2026, the coordinator, after the independent review of
@@ -5742,9 +5744,9 @@ number in parentheses is a lab PR.
     `/var/lib/rancher` removed on both; on 24.04 podman and
     `/var/lib/containers` were there before these runs and stay.
   - Lab of this design: pending (round i, lease `k279`, both guests).
-  - Open: a module tool exec whose process exits before the exec pump reads
-    its environment is killed (a kill that reaches no one; how often is the
-    lab's to say); `modprobe -S` outside a package transaction (an initramfs
-    build by hand) and a quiet probe written `modprobe <name> -q` are killed,
-    as on `main`; the load itself is prevented only by the kernel's
-    signature policy and lot 285.
+  - Open: `modprobe -S` outside a package transaction (an initramfs build
+    by hand) and a quiet probe written `modprobe <name> -q` are killed, as
+    on `main`; a tool that exits before the exec pump reads its environment
+    is recorded on its command line alone (a load it made is R018's
+    record); the load itself is prevented only by the kernel's signature
+    policy and lot 285.

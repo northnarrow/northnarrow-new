@@ -253,8 +253,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    (and their abbreviations); any argument starting with `-` after the first \
                    module name; a `kmod` command that is not `help`/`list`/`static-nodes`/the \
                    version; a program that is not the system's tool (its path, its device and \
-                   inode), of another mount namespace; `MODPROBE_OPTIONS` in its environment or \
-                   an environment not read; an argv not read whole. Recorded otherwise: the \
+                   inode), of another mount namespace; `MODPROBE_OPTIONS` in its environment, \
+                   a running process's environment not read or its pid another's; an argv not \
+                   read whole. Recorded otherwise (a process that had exited before its \
+                   environment could be read: noted, its kill would reach no one): the \
                    system's tool by module name, nothing moved or forced — no `modprobe.d` or \
                    index is read, whether the names load anything is the kernel's to judge \
                    (R018 records the load). A copy run from a staging directory is killed with \
@@ -266,8 +268,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           `process-comm-allowlist` (DKMS under apt or dpkg). Killed still: an \
                           administrator's `insmod` of a built module, `modprobe -S` (an initramfs \
                           build outside a package transaction), a quiet probe written \
-                          `modprobe <name> -q`, a module tool exec whose process exited before \
-                          the exec pump read its environment.",
+                          `modprobe <name> -q`.",
         how_to_test: "`sudo modprobe dummy` (recorded; anti-tamper.sh case C16); \
                       `deploy/lab/malsim/kmod-check.sh` (the benign corpus recorded, the \
                       malicious shapes killed).",
@@ -280,9 +281,13 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::\
              what_the_exec_pump_read_is_judged",
             "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::\
+             an_exec_whose_process_exited_before_its_environment_was_read_is_recorded_noting_it",
+            "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::\
              kmod_tool_under_apt_is_recorded_not_killed",
             "crates/nn-linux/src/sensors/kmod_exec.rs::\
              the_environment_is_read_from_the_exec_s_process",
+            "crates/nn-linux/src/sensors/kmod_exec.rs::\
+             a_running_process_s_unreadable_environment_is_refused_an_exited_one_s_is_not",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::\
              process_kernel_module_tooling_trips_r011",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::\

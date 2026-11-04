@@ -8,12 +8,18 @@
 //!   A copy, a file of another filesystem, an exec the hook did not
 //!   describe (tracepoint mode) is not;
 //! - **the environment**: the process's `/proc/<pid>/environ`, tied to the
-//!   exec by its start time, holds no `MODPROBE_OPTIONS` — options kmod
-//!   puts in front of the command line (`-d`, `-C`, `--`…), which the
-//!   sensor does not see. Present: killed; unreadable (the process gone
-//!   or exiting before the pump read it, its pid another's): killed,
-//!   nothing told it apart. An empty environment read from the running
-//!   process is one (libxtables runs `modprobe` with none).
+//!   exec by a pidfd and its start time, holds no `MODPROBE_OPTIONS` —
+//!   options kmod puts in front of the command line (`-d`, `-C`, `--`…),
+//!   which the sensor does not see. Present: killed. A RUNNING process whose
+//!   environment could not be read, or whose pid names another process (its
+//!   start is not the exec's), or whose start is unknown: killed, nothing
+//!   told it apart. A process that had EXITED before its environment could
+//!   be read (reaped, a zombie, past its exit with its memory gone) is not
+//!   killed — a kill would reach no one and leave only a false High kill
+//!   (the coordinator's decision of 04/11): an invocation R011 would record
+//!   otherwise is recorded, noting it ([`Environment::Exited`]); a load it
+//!   made is the kernel's to judge (R018). An empty environment read from
+//!   the running process is one (libxtables runs `modprobe` with none).
 //!
 //! The core reads none of it (nn-linux's `sensors::kmod_exec` does, on the
 //! exec pump's thread, for the execs of a module tool only); the answer is
@@ -30,25 +36,39 @@ use parking_lot::Mutex;
 /// Kernel-module load/manage tool comms (design §7.1).
 pub const KMOD_TOOLS: &[&str] = &["insmod", "modprobe", "kmod"];
 
+/// What the exec pump read of a module tool's environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Environment {
+    /// Read from the running process: no `MODPROBE_OPTIONS`.
+    Clean,
+    /// The process had exited before its environment could be read (what
+    /// was read, if anything, held no `MODPROBE_OPTIONS`): how.
+    Exited(String),
+    /// Not vouched for (why): R011's kill.
+    Refused(String),
+}
+
 /// What the exec pump read of one exec of a module tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecFacts {
     /// `Ok` when the executed file is the system's module tool; else why
     /// not.
     pub program: Result<(), String>,
-    /// `Ok` when the environment was read and holds no `MODPROBE_OPTIONS`;
-    /// else why not.
-    pub environment: Result<(), String>,
+    pub environment: Environment,
 }
 
 impl ExecFacts {
     /// Why the exec is not vouched for by what the pump read, if it is not.
     pub fn refusal(&self) -> Option<&str> {
-        self.program
-            .as_ref()
-            .err()
-            .or(self.environment.as_ref().err())
-            .map(String::as_str)
+        match (&self.program, &self.environment) {
+            (Err(why), _) | (Ok(()), Environment::Refused(why)) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// The process had exited before its environment could be read.
+    pub fn exited(&self) -> bool {
+        matches!(self.environment, Environment::Exited(_))
     }
 }
 
@@ -129,7 +149,7 @@ mod tests {
     fn ok() -> ExecFacts {
         ExecFacts {
             program: Ok(()),
-            environment: Ok(()),
+            environment: Environment::Clean,
         }
     }
 
@@ -143,18 +163,32 @@ mod tests {
         assert_eq!(of(&e), Some(ok()));
         assert_eq!(of(&exec_at(u32::MAX - 1, 279_002)), None);
         let env = ExecFacts {
-            environment: Err("MODPROBE_OPTIONS".into()),
+            environment: Environment::Refused("MODPROBE_OPTIONS".into()),
             ..ok()
         };
         keep(&e, env.clone());
         assert_eq!(of(&e), Some(env.clone()));
         assert_eq!(env.refusal(), Some("MODPROBE_OPTIONS"));
+        assert!(!env.exited());
         let prog = ExecFacts {
             program: Err("a copy".into()),
             ..env
         };
         assert_eq!(prog.refusal(), Some("a copy"), "the program first");
         assert_eq!(ok().refusal(), None);
+        assert!(!ok().exited());
+        // exited before its environment could be read: no refusal, noted
+        let gone = ExecFacts {
+            environment: Environment::Exited("reaped".into()),
+            ..ok()
+        };
+        assert_eq!(gone.refusal(), None);
+        assert!(gone.exited());
+        let gone_copy = ExecFacts {
+            program: Err("a copy".into()),
+            ..gone
+        };
+        assert_eq!(gone_copy.refusal(), Some("a copy"));
         // not an exec: nothing kept, nothing read
         let other = Event::DefenderSignal {
             pid: u32::MAX - 1,

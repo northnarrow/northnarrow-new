@@ -55,7 +55,8 @@
 //! | any argument starting with `-` after the first module name; an option the tool refuses | kill |
 //! | a `kmod` command other than `help`, `list`, `static-nodes`, the version | kill |
 //! | not the system's tool: its path outside `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin` or another name, its device and inode not the system's tool's (as the exec pump stats them), a filesystem of another mount namespace | kill |
-//! | `MODPROBE_OPTIONS` in its environment, or an environment the exec pump could not read at the exec | kill |
+//! | `MODPROBE_OPTIONS` in its environment; a running process whose environment the exec pump could not read at the exec, or whose pid names another process | kill |
+//! | a process that had exited before the exec pump could read its environment, the rest of it recorded | record, noting it |
 //! | an argv the kernel did not read whole | kill |
 //! | otherwise — the system's tool, plain module names, before the first name only options that move and force nothing | record |
 //!
@@ -93,10 +94,17 @@ impl<H: PostureHost> R011KernelModuleTooling<H> {
     }
 }
 
-/// Lot 279: `Ok(what it asks for)` when R011 records the exec of a module
+/// Lot 279: the note of a record whose process had exited before the exec
+/// pump could read its environment (the coordinator's decision of 04/11: a
+/// kill would reach no one).
+pub const EXITED_NOTE: &str =
+    "exited before its environment could be read — a load it made is the kernel's to judge (R018)";
+
+/// Lot 279: `Ok((what it asks for, whether its process had exited before
+/// its environment could be read))` when R011 records the exec of a module
 /// tool, `Err(why)` when it kills it — its command line's syntax, then what
 /// the exec pump read at the exec ([`kmod_exec_facts`]).
-fn judge(event: &Event) -> Result<String, String> {
+fn judge(event: &Event) -> Result<(String, bool), String> {
     let Event::ProcessSpawn {
         filename,
         exe,
@@ -138,7 +146,7 @@ fn judge(event: &Event) -> Result<String, String> {
         ),
         Some(facts) => match facts.refusal() {
             Some(why) => Err(why.to_string()),
-            None => Ok(what),
+            None => Ok((what, facts.exited())),
         },
     }
 }
@@ -219,13 +227,21 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
         // pump read at the exec — recorded (High, no kill) by name, killed as
         // before otherwise.
         let (action, mut reasoning) = match judge(event) {
-            Ok(what) => (
+            Ok((what, false)) => (
                 ResponseAction::Log,
                 format!(
                     "Kernel-module tooling ({comm}) exec by module name — {what}: the system's \
                      tool, nothing moved or forced, no MODPROBE_OPTIONS — recorded, not killed \
                      (lot 279): the load itself is the kernel's to judge (R018 records it; the \
                      module signature policy) (T1547.006)"
+                ),
+            ),
+            Ok((what, true)) => (
+                ResponseAction::Log,
+                format!(
+                    "Kernel-module tooling ({comm}) exec by module name — {what}: the system's \
+                     tool, nothing moved or forced; {EXITED_NOTE} — recorded, not killed (lot \
+                     279) (T1547.006)"
                 ),
             ),
             Err(why) => (
@@ -261,7 +277,7 @@ mod tests {
     use crate::decision::rules::testutil::{spawn, spawn_full};
     use nn_model::ResponseAction;
 
-    use crate::decision::rules::kmod_exec_facts::{self, ExecFacts};
+    use crate::decision::rules::kmod_exec_facts::{self, Environment, ExecFacts};
 
     fn rule() -> R011KernelModuleTooling {
         R011KernelModuleTooling::new(Arc::new(CommAllowlist::default()))
@@ -313,7 +329,7 @@ mod tests {
             e,
             ExecFacts {
                 program: Ok(()),
-                environment: Ok(()),
+                environment: Environment::Clean,
             },
         )
     }
@@ -529,8 +545,9 @@ mod tests {
 
     /// Lot 279: what the exec pump read at the exec decides the rest — the
     /// program not the system's tool's file, `MODPROBE_OPTIONS` in the
-    /// environment or an environment not read, or no reading at all (a
-    /// replay): killed, the pump's reason said.
+    /// environment, a running process's environment not read, its pid
+    /// another process's, or no reading at all (a replay): killed, the pump's
+    /// reason said.
     #[test]
     fn what_the_exec_pump_read_is_judged() {
         let r = rule();
@@ -545,23 +562,36 @@ mod tests {
             (
                 ExecFacts {
                     program: Err("its device and inode are not the system's tool's".into()),
-                    environment: Ok(()),
+                    environment: Environment::Clean,
                 },
                 "not the system's tool's",
             ),
             (
                 ExecFacts {
                     program: Ok(()),
-                    environment: Err("MODPROBE_OPTIONS='-d /tmp/x' in its environment".into()),
+                    environment: Environment::Refused(
+                        "MODPROBE_OPTIONS='-d /tmp/x' in its environment".into(),
+                    ),
                 },
                 "MODPROBE_OPTIONS='-d /tmp/x'",
             ),
             (
                 ExecFacts {
                     program: Ok(()),
-                    environment: Err("it had exited before its environment was read".into()),
+                    environment: Environment::Refused(
+                        "its environment could not be read (Permission denied)".into(),
+                    ),
                 },
-                "before its environment was read",
+                "could not be read",
+            ),
+            (
+                ExecFacts {
+                    program: Ok(()),
+                    environment: Environment::Refused(
+                        "its pid names another process (its start is not the exec's)".into(),
+                    ),
+                },
+                "its pid names another process",
             ),
         ] {
             let v = r
@@ -569,7 +599,74 @@ mod tests {
                 .expect("fires");
             assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
             assert!(v.reasoning.contains(why), "{why}: {}", v.reasoning);
+            assert!(!v.reasoning.contains(EXITED_NOTE), "{}", v.reasoning);
         }
+    }
+
+    /// Lot 279, the coordinator's decision of 04/11: a process that had
+    /// exited before the exec pump could read its environment is not killed
+    /// (the kill would reach no one, a false High kill) — an invocation
+    /// recorded otherwise is recorded, noting it. Anything else R011 kills
+    /// stays a kill: the command line, a foreign program.
+    #[test]
+    fn an_exec_whose_process_exited_before_its_environment_was_read_is_recorded_noting_it() {
+        let r = rule();
+        let exited = || ExecFacts {
+            program: Ok(()),
+            environment: Environment::Exited("no process had its pid any more".into()),
+        };
+        for (e, what) in [
+            (modprobe(&["overlay"]), "modprobe of 'overlay'"),
+            (
+                exec("/usr/bin/kmod", "/usr/bin/kmod", &["kmod", "--version"]),
+                "kmod: the version printed",
+            ),
+        ] {
+            let v = r.evaluate(&read_as(e, exited())).expect("recorded");
+            assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
+            assert_eq!(v.severity, Severity::High);
+            for part in [what, EXITED_NOTE, "T1547.006", "parent=bash"] {
+                assert!(v.reasoning.contains(part), "{part}: {}", v.reasoning);
+            }
+            assert!(
+                !v.reasoning.contains("no MODPROBE_OPTIONS"),
+                "{}",
+                v.reasoning
+            );
+        }
+        for (e, facts, why) in [
+            (modprobe(&["/tmp/rk.ko"]), exited(), "names a file"),
+            (
+                modprobe(&["-d", "root", "dummy"]),
+                exited(),
+                "module tree's root",
+            ),
+            (
+                modprobe(&["dummy", "-q"]),
+                exited(),
+                "after the module name",
+            ),
+            (
+                modprobe(&["dummy"]),
+                ExecFacts {
+                    program: Err("its device and inode are not the system's tool's".into()),
+                    ..exited()
+                },
+                "not the system's tool's",
+            ),
+        ] {
+            let v = r.evaluate(&read_as(e, facts)).expect("fires");
+            assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
+            assert!(v.reasoning.contains(why), "{why}: {}", v.reasoning);
+        }
+        // a copy in a staging directory: its tree, exited or not
+        let v = r
+            .evaluate(&read_as(
+                exec("/tmp/modprobe", "/tmp/modprobe", &["modprobe", "dummy"]),
+                exited(),
+            ))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
 
     /// Lot 279: an argv the kernel did not read whole, or a program of a

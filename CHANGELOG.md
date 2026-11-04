@@ -756,11 +756,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   program that is not the system's tool (its path, or its device and inode
   against `/usr/bin/kmod`, `/usr/sbin/modprobe`… as the exec pump stats
   them), of another mount namespace; `MODPROBE_OPTIONS` in the process's
-  environment, or an environment the exec pump could not read at the exec
-  (`/proc/<pid>/environ` tied to the exec by a pidfd and the start time:
-  gone, exiting, another process's — an empty one read from the running
-  process is one: libxtables runs `modprobe` with none); an argv the kernel
-  did not read whole.
+  environment (`/proc/<pid>/environ` tied to the exec by a pidfd and the
+  start time; an empty one read from the running process is one: libxtables
+  runs `modprobe` with none), a running process whose environment could not
+  be read or whose pid names another process; an argv the kernel did not
+  read whole. A tool that had exited before its environment could be read
+  (reaped, a zombie, its memory gone) is recorded, noting it — its kill
+  would reach no one.
   Recorded otherwise (High, T1547.006, the names said): whether a name
   loads anything, and what, is the kernel's to judge at the load — R018
   records it, after the fact (its hook observes and denies nothing); the

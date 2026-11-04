@@ -1972,10 +1972,11 @@ mod tests {
         // read while it ran: the environment it had at the exec
         let facts = kmod_exec_facts::of(&out).expect("kept for R011");
         assert!(
-            facts
-                .environment
-                .as_ref()
-                .is_err_and(|w| w.contains("MODPROBE_OPTIONS='-d /tmp/nn-k279'")),
+            matches!(
+                &facts.environment,
+                kmod_exec_facts::Environment::Refused(w)
+                    if w.contains("MODPROBE_OPTIONS='-d /tmp/nn-k279'")
+            ),
             "{facts:?}"
         );
         // another program is none of the pump's business
