@@ -726,7 +726,7 @@ writes. In the kernel (the file-open sensor on LSM `file_open`,
 |---|---|---|
 | rewrites (`MASS_OVERWRITE`) | write-opens of an existing regular file of 4 KiB or more (no `FMODE_CREATED`) | file (`OPEN_OVERWRITE_SEEN`: tgid, device, inode) per 60-s window |
 | files created (`MASS_WRITE`) | write-opens that created their file (`FMODE_CREATED`) | open |
-| originals destroyed (`MASS_UNLINK`) | an unlink of a regular file of 4 KiB or more, or a rename onto the name of one (the target is destroyed) | name (`OPEN_DESTROY_SEEN`: tgid, parent dentry, the name's `hash_len`) per window |
+| originals destroyed (`MASS_UNLINK`) | an unlink of a regular file of 4 KiB or more, or a rename onto the name of one (the target is destroyed) — not a file the same process created within the window (`OPEN_CREATED`: its own temporary file, as `pip` and `npm` unpack) | name (`OPEN_DESTROY_SEEN`: tgid, parent dentry, the name's `hash_len`) per window |
 
 A repeat (the same file reopened, the same name destroyed again) is not
 counted; an entry the LRU maps evicted counts again (more, never fewer). The

@@ -673,7 +673,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     (`OPEN_OVERWRITE_SEEN`), files created apart (`MASS_WRITE` is now the
     files created), and the originals destroyed — an unlink, or a rename
     onto an existing file of 4 KiB or more — once per name
-    (`OPEN_DESTROY_SEEN`). The mass-write arm of `ConfirmedIntrusion`
+    (`OPEN_DESTROY_SEEN`), never a file the process itself created in the
+    window (`OPEN_CREATED`: `pip`'s and `npm`'s temporary files). The mass-write arm of `ConfirmedIntrusion`
     fires on 20 distinct existing files rewritten in place (40 for a
     cgroup), or on 20 originals destroyed by a process that created 20
     files within a window (outside an authenticated session); never on

@@ -225,7 +225,8 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
     rewritten (it carried every write-open); with `overwrites: false` it is
     the files created (it was every write-open, the same file's included);
     a `FileBurst` of kind `unlink` counts each original once per name and
-    window, a rename onto an existing file of 4 KiB or more included. The
+    window, a rename onto an existing file of 4 KiB or more included, a
+    file the process itself created in the window excluded. The
     agent's journal lines say so: `mass write: distinct existing files
     rewritten crossed the threshold`, `mass write: files created crossed the
     threshold`, `file burst: rename or destroyed-originals threshold
@@ -244,7 +245,9 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
     its own chain (`CNI-…`, `DOCKER…` but `DOCKER-USER`, `KUBE-…`,
     `cali-…`, `cilium_…`, `NETAVARK…`, the `iptables`'s parent the
     runtime's packaged program); it still is for the same chain flushed by
-    another process and for the host firewall's chains.
+    another process and for the host firewall's chains (an INFO line,
+    `NN-L-EVA-002: a container runtime's chain flushed by a process its
+    runtime does not vouch for`, names the parent).
   The signed rows written before the upgrade keep their bytes and verify.
 
 ## 4. Build and development (source builds only)

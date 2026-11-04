@@ -188,6 +188,22 @@ sleep 3
 n=$(crossed "$mark" "file burst: rename or destroyed-originals threshold crossed")
 [[ $n -eq 0 ]] && pass "one name deleted 30 times: no burst of originals destroyed (each name once per window)" \
               || bad "one name deleted 30 times: $n bursts (expected 0)"
+#   25 temporary files one process creates and deletes (pip, npm): its own
+#   files, no originals
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+python3 -I -c '
+import os, sys
+d = sys.argv[1]
+for i in range(25):
+    p = os.path.join(d, "tmp-%d" % i)
+    with open(p, "wb") as f:
+        f.write(b"t" * 8192)
+    os.unlink(p)
+' "$d"
+sleep 3
+n=$(journal "$mark" | grep "file burst: rename or destroyed-originals threshold crossed" | grep -c 'kind="\?unlink')
+[[ $n -eq 0 ]] && pass "25 temporary files a process created and deleted: no burst of originals destroyed" \
+              || bad "25 temporary files created and deleted: $n bursts of originals destroyed (expected 0)"
 sleep 58
 mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
 python3 -I -c '

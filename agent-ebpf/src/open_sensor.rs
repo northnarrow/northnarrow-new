@@ -46,7 +46,8 @@ use northnarrow_common::wire::open_sensor::{
         FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE, LEAF_CRED, LEAVES_CRED, SUBTREE,
         TREE_CARVEOUT, TREE_CRED, TREE_CRITICAL, TREE_HOME, TREE_PERSIST, TREE_RUNTIME,
     },
-    cgroup_step, first_in_window, kdbx_suffix, name_ext, open_reason, rename_shape_with,
+    cgroup_step, created_in_window, first_in_window, kdbx_suffix, name_ext, open_reason,
+    rename_shape_with,
     rename_step, unlink_step, write_step, ChildRuleKey, DestroySeenKey, DirClass, NameParts,
     OpenCgKey, OpenCgWindow, OpenRecordRaw, OpenWriteWindow, OverwriteSeenKey, RenameNames,
     RenameWindow, UnlinkWindow, CHILD_RULES_MAX, NAME_HEAD_LEN,
@@ -148,6 +149,12 @@ static OPEN_OVERWRITE_SEEN: LruHashMap<OverwriteSeenKey, u64> = LruHashMap::with
 /// journal at every commit, a lock file) is one original.
 #[map]
 static OPEN_DESTROY_SEEN: LruHashMap<DestroySeenKey, u64> = LruHashMap::with_max_entries(16384, 0);
+/// Lot 282: the files each tgid created (the value: when), so that its own
+/// temporary files, unlinked or renamed over, are no originals destroyed
+/// (`pip` and `npm` unpack into files they delete). An evicted entry makes
+/// such a file count as an original — more, never fewer.
+#[map]
+static OPEN_CREATED: LruHashMap<OverwriteSeenKey, u64> = LruHashMap::with_max_entries(16384, 0);
 /// Review 75: the last read-only report per (task, inode)
 /// ([`crate::read_repeat`]).
 #[map]
@@ -514,6 +521,15 @@ unsafe fn count_write(cls_bits: u32, cls_uid: u32, overwrite: bool, created: boo
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let now = bpf_ktime_get_ns();
+    if created {
+        let made = OverwriteSeenKey {
+            tgid,
+            _pad: 0,
+            dev: key.dev,
+            ino: key.ino,
+        };
+        let _ = OPEN_CREATED.insert(&made, &now, 0);
+    }
     let mut overwrite = overwrite;
     if overwrite {
         let start = match OPEN_WRITES.get(&tgid) {
@@ -1183,6 +1199,18 @@ unsafe fn unlink_burst(dentry: *const u8) {
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let now = bpf_ktime_get_ns();
+    // Lot 282: a file this process created within the window is its own
+    // temporary file, no original.
+    let key = key_of(inode);
+    let made = OverwriteSeenKey {
+        tgid,
+        _pad: 0,
+        dev: key.dev,
+        ino: key.ino,
+    };
+    if created_in_window(OPEN_CREATED.get(&made).copied(), now) {
+        return;
+    }
     let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
     let hash_len =
         bpf_probe_read_kernel::<u64>(dentry.add(off!(DENTRY_D_NAME_OFFSET)) as *const u64).unwrap_or(0);
@@ -1217,7 +1245,6 @@ unsafe fn unlink_burst(dentry: *const u8) {
     if count == 0 {
         return;
     }
-    let key = key_of(inode);
     emit(open_reason::MASS_UNLINK, &key, dentry, 0, 0, count);
 }
 

@@ -118,7 +118,9 @@ pub mod open_reason {
     /// Lot 282: originals destroyed — an unlink, or a rename onto the name
     /// of an existing regular file of that size (seen on `inode_rename`),
     /// which destroys it as surely — each name once per window
-    /// ([`super::DestroySeenKey`]); the path is the destroyed file's.
+    /// ([`super::DestroySeenKey`]), never a file the process itself created
+    /// within the window ([`super::created_in_window`]: its own temporary
+    /// file); the path is the destroyed file's.
     pub const MASS_UNLINK: u32 = 1 << 10;
     /// Lab PR 225 (CM-18): a signal that stops or ends a process, sent to
     /// the main process of another security tool (`DEFENDER_PIDS`, filled
@@ -346,6 +348,17 @@ pub struct DestroySeenKey {
 #[inline(always)]
 pub fn first_in_window(seen: Option<u64>, start: u64) -> bool {
     seen != Some(start)
+}
+
+/// Lot 282 (the lab's first run of the lot: `pip install` and `npm install`
+/// unpack into temporary files and delete them): a file a process destroys
+/// is no original of the user's when that same process created it within a
+/// burst window — `created` is when the eBPF counter's `OPEN_CREATED` map
+/// (keyed by [`OverwriteSeenKey`]: tgid, device, inode) saw it created,
+/// `None` when it did not.
+#[inline(always)]
+pub fn created_in_window(created: Option<u64>, now: u64) -> bool {
+    created.is_some_and(|t| now.saturating_sub(t) <= OPEN_BURST_WINDOW_NS)
 }
 
 /// `OPEN_CG_WRITES` key: a cgroup (v2 id), or, where the writer sits in
@@ -1066,6 +1079,64 @@ mod tests {
             many[18], OPEN_UNLINK_MIN,
             "19 new names + the journal: the 20th original"
         );
+    }
+
+    /// Lot 282: the destruction counter's glue with the files the process
+    /// created (`OPEN_CREATED`): `pip` unpacking 300 wheels into temporary
+    /// files and deleting them destroys no original; deleting 20 files it
+    /// did not create — or created more than a window ago — is 20
+    /// originals.
+    #[test]
+    fn a_process_s_own_temporary_files_are_no_originals() {
+        let mut created: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        let mut w: Option<UnlinkWindow> = None;
+        let mut destroy =
+            |ino: u64, now: u64, created: &std::collections::HashMap<u64, u64>| -> u32 {
+                if created_in_window(created.get(&ino).copied(), now) {
+                    return 0;
+                }
+                match w.as_mut() {
+                    Some(w) => unlink_step(w, now),
+                    None => {
+                        w = Some(UnlinkWindow {
+                            start_ns: now,
+                            count: 1,
+                            fired: 0,
+                        });
+                        0
+                    }
+                }
+            };
+        for i in 0..300u64 {
+            created.insert(1000 + i, i * 10_000_000);
+            assert_eq!(destroy(1000 + i, i * 10_000_000 + 5_000_000, &created), 0);
+        }
+        // its own files of two minutes ago, and files it never created
+        let mut crossed: Vec<u32> = Vec::new();
+        for i in 0..10u64 {
+            crossed.push(destroy(1000 + i, 125 * S + i, &created));
+        }
+        for i in 0..10u64 {
+            crossed.push(destroy(5000 + i, 125 * S + 10 + i, &created));
+        }
+        assert_eq!(crossed.iter().filter(|c| **c != 0).count(), 1);
+        assert_eq!(crossed[19], OPEN_UNLINK_MIN);
+    }
+
+    /// Lot 282: a file the destroying process created within a window is
+    /// its own temporary file, not an original; one it created longer ago,
+    /// or never, is an original.
+    #[test]
+    fn a_file_the_process_created_in_the_window_is_no_original() {
+        assert!(created_in_window(Some(10 * S), 10 * S));
+        assert!(
+            created_in_window(Some(10 * S), 70 * S),
+            "60 s is still the window"
+        );
+        assert!(!created_in_window(Some(10 * S), 70 * S + 1));
+        assert!(!created_in_window(None, 10 * S));
+        // a clock read before the creation's (CPUs apart): still its own
+        assert!(created_in_window(Some(10 * S), 9 * S));
     }
 
     #[test]
