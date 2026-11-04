@@ -776,6 +776,95 @@ Lab notes for 22.04-era userland:
   of the lab's privileged suites resolves root's own rustup and downloads a
   second toolchain on first use; harmless, just slow once.
 
+## Kernel fix level (lot 277)
+
+`nn-admin host-check` (and the capability manifest's `host_hardening`,
+signed at every boot) compares the kernel's version with the fixes the
+workers' sandbox and the anti-tamper rely on — check `kernel_fixes`. The
+versions are the first release of each stable branch that carries the
+fix, as the kernel's CVE records or the stable changelogs publish them
+(read on 2026-11-03; `crates/nn-linux/src/host_hardening.rs`,
+`KERNEL_FIXES`):
+
+| CVE | What it gives against the agent | Affected from | Fixed in (stable) | Fixed in (mainline) | Source |
+|---|---|---|---|---|---|
+| CVE-2022-0847 (Dirty Pipe) | a write into the page cache of any readable file — the agent's binaries, its configuration | 5.8 (commit f6dd975583bd) | 5.10.102, 5.15.25, 5.16.11 | 5.17 (commit 9d2231c5d74e) | https://dirtypipe.cm4all.com/; cdn.kernel.org `ChangeLog-5.10.102`, `-5.15.25`, `-5.16.11`, `-5.17` |
+| CVE-2022-30594 | `PTRACE_SEIZE` sets `PTRACE_O_SUSPEND_SECCOMP` without the capability: a tracer suspends a seccomp filter (the workers' last layer) | 4.3 (commit 13c4a90119d2) | 4.19.238, 5.4.189, 5.10.110, 5.15.33, 5.16.19, 5.17.2 | 5.18 (commit ee1fee900537) | the CVE record, https://www.cve.org/CVERecord?id=CVE-2022-30594 ("before 5.17.2"); cdn.kernel.org `ChangeLog-4.19.238`, `-5.4.189`, `-5.10.110`, `-5.15.33`, `-5.16.19`, `-5.17.2`, `-5.18` |
+| CVE-2024-42318 | `keyctl(KEYCTL_SESSION_TO_PARENT)` drops a Landlock domain (`cred_transfer`); the workers' seccomp filter refuses `keyctl` | 5.13 | 5.15.165, 6.1.103, 6.6.44, 6.10.3 | 6.11 | the kernel CNA's record, https://git.kernel.org/pub/scm/linux/security/vulns.git/plain/cve/published/2024/CVE-2024-42318.json |
+| CVE-2025-68736 | Landlock rights reached through a disconnected directory of a bind mount; the workers hold no filesystem right at all | 5.13 | 6.1.189, 6.6.143, 6.12.80, 6.18.2 (no 5.15 fix listed) | 6.19 | the kernel CNA's record, https://git.kernel.org/pub/scm/linux/security/vulns.git/plain/cve/published/2025/CVE-2025-68736.json |
+
+The upstream version is read from Ubuntu's `/proc/version_signature`
+(its last field: the stable version the kernel is based on), from Debian's
+`Debian <version>` in `/proc/version`, else from `osrelease`. A
+distribution **backports fixes without changing the version**, so the
+check says:
+
+- `ok` — every fix is in the version (its branch's, or mainline's), or the
+  kernel predates the bug — assuming a distribution did not backport the
+  buggy feature itself into an older kernel (the check cannot see that);
+- `warn` — a kernel taken for upstream whose version lacks a fix: the CVE
+  is named `MISSING`. "Upstream" is what the check cannot tell from a
+  distribution's: no Ubuntu signature, no Debian banner, no `.el`, SUSE or
+  `-generic` release, and a real sublevel. Fedora, Arch and Amazon Linux
+  (`6.1.112-122.…amzn2023`) are among them: a missing fix there is `warn`,
+  not `unknown`, though such a kernel may carry it backported — the
+  conservative side, never a false `ok` (the review of #494, N7);
+- `unknown` — a distribution's kernel whose version is below a fix
+  (Ubuntu, Debian, the Red Hat family's frozen `5.14.0-…el9`, SUSE): it may
+  carry the fix backported. The version cannot say; the distribution's
+  security tracker does. The check never says `ok` for it.
+
+As measured in the lab (lot 277, the note in
+https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md):
+the Ubuntu 22.04 guest (`5.15.0-202-generic`, its signature based on
+5.15.222) is `unknown` — CVE-2022-0847, CVE-2022-30594 and CVE-2024-42318
+fixed in the version, CVE-2025-68736 not (no 5.15 fix is listed upstream;
+Ubuntu's tracker says whether it carries one). The Debian 13 guest
+(`6.12.113+deb13-cloud-amd64`, Debian 6.12.113-1) is `ok`: the four fixes
+are in the version (6.12.80 carries CVE-2025-68736's).
+
+**`lockdown=integrity` is recommended on every host** (`host-check`'s
+`lockdown`): without it root can rewrite the running kernel (an unsigned
+module, `/dev/mem`, `kexec` of an unsigned kernel, a kprobe's write) and
+remove the agent's hooks with it, which no hook of the agent can refuse.
+`kexec_load_disabled` counts its load limits (6.6+: both
+`kexec_load_limit_reboot` and `_panic` at 0 refuse every load); under
+lockdown alone a signed kernel still boots with another command line, so
+the check still warns. `module_sig_enforce` counts `lockdown=integrity`
+and `kernel.modules_disabled=1`.
+
+## The start-in-cgroup tracker (lot 277)
+
+The per-rule policy's exemptions by cgroup or unit hold for processes
+started in their cgroup only (`RULE_POLICY.md` §2.1). The kernel's half is
+five programs, attached together where the kernel's BTF has their
+targets in the shapes they read (`northnarrow-agent --btf-check` prints
+`tracker cgroup_join`): the BTF tracepoints `cgroup_attach_task` (with
+its `path` argument), `sched_process_fork` and `sched_process_exit`,
+`fentry` on `cgroup_post_fork(task_struct *, kernel_clone_args *)`, and
+`fexit` on `cgroup_procs_write_start` in the move guard's shape — plus
+the optional offsets `signal_struct.live`, `kernel_clone_args.flags` and
+`task_struct.signal`. Checked on the BTF of 6.8 (Ubuntu 24.04) and 6.18
+(WSL2), and in the lab on 5.15 and 6.12 (`verifier-check`: the five
+programs load, `cgroup_join_mark` 876 and 908 instructions; lot 277's
+note); the review of #494's code on 6.8: lot 277's note in
+https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md. A kernel without them
+starts with a signed `subsystem_degraded` "cgroup exemptions", and every
+exemption by cgroup or unit is refused there. An optional offset absent
+makes the tracker absent (`btf_revalidate`), never a tracker reading a
+sentinel. The programs' links and the four maps are pinned beside the pin root, in
+`/sys/fs/bpf/northnarrow-cgroup-join-v<schema>_<generation>` (recorded in
+`/run/northnarrow/cgroup-join-pins`): they go on marking while the agent
+is stopped and through `install.sh --upgrade`, which purges the pin root
+only. The marks' map is sized when it is made to `kernel.pid_max` capped
+by `kernel.threads-max` and allocated as it fills; the "not known" map is
+a byte for each possible tgid, 4 MiB, preallocated; `CGROUP_JOIN_EPOCH`
+holds the last reset's instant. A start checks each map it adopts with
+`BPF_OBJ_GET_INFO_BY_FD` (4.13+).
+On 6.18+ with cgroup2's `favordynmods` (a remount by root; not systemd's
+default) a move no longer waits for a fork: see the trust model's
+residuals.
+
 ## Adding a distro to the lab
 
 `NN_LAB_DISTRO=<name> deploy/lab/nn-lab.sh up` boots a separate guest

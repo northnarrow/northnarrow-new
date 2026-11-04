@@ -366,6 +366,9 @@ pub(crate) fn load(
         } else {
             info!("per-rule response policy: built-in defaults (every held kill held)");
         }
+        // Lot 277: its cgroup paths and unit names to the kernel, which
+        // signs a move into a cgroup they name.
+        nn_linux::cgroup_join::sync_names(&policy);
         rp::PolicyHandle::new(policy)
     };
     let engine = RuleEngine::with_default_rules_and_net(

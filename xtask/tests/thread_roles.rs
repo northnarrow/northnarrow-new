@@ -165,6 +165,12 @@ const THREADS_WITHOUT_A_CALL: &[(&str, &str, &str)] = &[
         "libc::SYS_renameat2,",
         "the feasibility command's own file flipper (a tool's run, no role exists)",
     ),
+    (
+        "crates/nn-linux/src/worker/hostile.rs",
+        "std::thread::park();",
+        "lot 277: the hostile worker's parked thread (debug-trigger builds), there to be found at \
+         the sandbox's door — the worker has no capability to keep",
+    ),
 ];
 
 /// The files declared as `#[cfg(test)] mod x;` by their parent: test code.
@@ -274,8 +280,9 @@ fn a_planted_thread_without_its_sets_is_found() {
 }
 
 /// Review of #482 (R14c-5, the reviewer's planting P6): the errands thread
-/// runs exactly the decision's three errands — the rpm query, the
-/// `DEFENDER_PIDS` insert and removal — and no other caller hands it work.
+/// runs exactly the decision's errands — the rpm query, the
+/// `DEFENDER_PIDS` insert and removal, and (lot 277) the question about the
+/// start-in-cgroup tracker's marks — and no other caller hands it work.
 #[test]
 fn only_the_decision_s_errands_go_to_the_errands_thread() {
     let mut calls = Vec::new();
@@ -288,6 +295,9 @@ fn only_the_decision_s_errands_go_to_the_errands_thread() {
     assert_eq!(
         calls,
         vec![
+            // lot 277: the exemption check's question about the kernel's
+            // marks (`Marks::started`, one errand)
+            ("crates/nn-linux/src/cgroup_join.rs".to_string(), 1),
             ("crates/nn-linux/src/decision_host_linux.rs".to_string(), 1),
             ("crates/nn-linux/src/lib.rs".to_string(), 2),
         ],

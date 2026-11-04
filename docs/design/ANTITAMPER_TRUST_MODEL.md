@@ -1245,3 +1245,260 @@ Not done, and why:
 - **A soft-reboot** behaves as lot 273b measured it (outside this lot).
 - **Fail-open.** A task hook that cannot read its target's tgid lets the
   change through, counted in its `DENY_FAIL_OPEN` slot and signed.
+
+## Lot 277 — an exemption by cgroup is the cgroup's start, not its membership
+
+The per-rule policy may exempt an actor from a rule by its cgroup v2 path
+or its systemd unit (`docs/operator/RULE_POLICY.md` §2.1). Membership of a
+cgroup is not identity: root writes its own pid into an exempt service's
+`cgroup.procs` (or starts a child there with `clone3(CLONE_INTO_CGROUP)`)
+and is then "in" the service — exempt from the rule, killed by nothing.
+Since lot 277 such an exemption holds only for a process **started** in
+the cgroup: spawned into it by systemd, or forked from a process that
+was.
+
+### Mechanism
+
+The kernel decides, not a walk of the lineage afterwards. A walk cannot
+tell a process that a moved process forked and left (reparented to PID 1:
+the orphan of the review of 03/11) from a forking daemon's own child. The
+eBPF programs of `agent-ebpf/src/cgroup_join.rs` keep the pinned map
+`CGROUP_JOINED` (thread-group id → its leader's start time, how, by whom):
+
+- `cgroup_join_mark` (BTF tracepoint `cgroup_attach_task`, which fires
+  after a move through `cgroup.procs` / `cgroup.threads` went through)
+  marks the moved process, unless the move is systemd's placement. That
+  is a move PID 1 makes, or the move a child of PID 1 makes of itself
+  while it still runs PID 1's image (the same `mm->exe_file` as its parent:
+  it executed nothing since the fork; a reparented orphan of another
+  process does not share it). It does not mark a move that changes
+  nothing: `cgroup_join_src` (fexit `cgroup_procs_write_start`) records,
+  when the task to move is the writing thread itself, its cgroup before
+  the move, and the move is a no-op only for that thread and that cgroup
+  (the review of #494, B1: a thread writing its process's leader into
+  `cgroup.threads` stays where it is, the leader moves — the first version
+  compared the writer's cgroup and took that for no move). The agent's
+  family is not marked: it moves processes into its containment slice
+  (`/northnarrow.slice`), and no exemption by cgroup or unit applies
+  there — the policy's parser refuses a `cgroup` under it and a `unit`
+  `blocked.scope` or `throttled.scope`, and the check skips a process in
+  it whatever the policy says (the review of #494, N1).
+- `cgroup_join_born` (fentry `cgroup_post_fork`), for every fork of a new
+  thread group: what the maps hold at its tgid goes first — a dead group's,
+  since the pid was free (a move of a group already exiting marks it after
+  its exit, and any user can make one on its own pids: the review of #494,
+  N5). Then it marks a child started by `CLONE_INTO_CGROUP` by anyone but
+  PID 1, before it runs. No move can come between the pid's allocation and
+  this: the fork holds `cgroup_threadgroup_rwsem` for reading from
+  `cgroup_can_fork` to the end of `cgroup_post_fork`.
+- `cgroup_join_fork` (BTF tracepoint `sched_process_fork`) marks a new
+  process forked by a marked one, before its first wake-up. The parent's
+  mark counts only with its leader's start time: a dead process's mark at
+  a reused id passes on nothing.
+- `cgroup_join_exit` (BTF tracepoint `sched_process_exit`) removes the mark
+  when the group's last thread exits (`signal->live` 0), not with its
+  leader, which may exit first. Two threads exiting together may both read
+  0; a second remove finds nothing.
+
+The exemption check (`nn_core::decision::rule_policy::exempt`) asks
+`ActorFacts::started_in_cgroup` once a cgroup or a unit matched. The
+agent's answer (`nn_linux::cgroup_join`, on the errands thread) is the
+map's: not marked, marked, or not known. Not known means no tracker on
+this kernel, a mark the kernel could not keep for **this** group, or a
+failed lookup. Marked and not known refuse the exemption.
+
+A mark the kernel could not keep (the insert failed, the leader's start
+time unread, a clone's flags unread, the writing thread's own tgid
+unread) sets the group's byte in the pinned `CGROUP_JOIN_LOST`
+(preallocated: one byte for each of the 4,194,304 possible tgids, 4 MiB)
+to 1; a fork of a group whose byte is set sets the child's. The byte is
+set to 0 at the tgid's next fork (`cgroup_join_born`), before the new
+group runs and before any move can reach it — the only clear (a clear at
+the exit could run for two threads that both read `signal->live` 0).
+Both writes are plain stores, never a read-modify-write (the re-review of
+#494, R1). The review's version kept a bit a tgid, set with a test and an
+atomic add, on the claim that one event at a time touched a group's bit;
+that was false: `sched_process_fork` comes after `cgroup_post_fork` lets
+go of `cgroup_threadgroup_rwsem` (v5.15 `fork.c:2594` after
+`cgroup.c:6145`, v6.8 `fork.c:2912` after `cgroup.c:6498`), so a move of
+the new child by another process can mark it on another CPU at the same
+time. Two adds of the same bit left it clear — the child neither marked
+nor not known, exempt — and carried into the next tgid's. A store of 1
+by any number of CPUs leaves the byte 1, and no store reaches another
+tgid's byte. The first version (the review of #494, D2) counted a lost
+mark in a host-wide counter that refused every exemption by cgroup or
+unit until a reboot, and a preallocated map of 32,768 marks any user's
+fork storm under a marked parent could fill. The marks are now a hash map
+allocated as it is filled (`BPF_F_NO_PREALLOC`), its size set when it
+is made — the first start of the boot, or a reset — to `kernel.pid_max`
+capped by `kernel.threads-max` (32,768 to 4,194,304): the live thread groups, one mark each at most, are at most
+`threads-max` (a fork past it fails) and at most `pid_max`. Not
+`pid_max` alone: the hash's bucket array is allocated whole, 16 bytes a
+bucket — 64 MiB at the 4,194,304 systemd sets — where `threads-max`
+(about 250,000 on a 32 GiB host) needs 4 MiB. What fills it past that is
+dead groups' marks (the move of a group already exiting); those go at
+the pid's next fork, and a mark the full map refuses only makes that
+group not known, refused as a mark is. A move into a cgroup an exemption names
+(the policy's cgroup paths and unit names, hashed into
+`CGROUP_EXEMPT_NAMES`) is signed as NN-L-AT-001 `cgroup_join`. It is not
+refused, and the posture is not raised: the move is no tamper with the
+agent, and what the moved process does is judged without the exemption.
+
+Every move runs under `cgroup_mutex`, from the lookup to the tracepoint,
+and every move of another task under `cgroup_threadgroup_rwsem` held for
+writing too; a fork holds the rwsem for reading from `cgroup_can_fork` to
+the end of `cgroup_post_fork`: a fork after a move sees the mark. A write
+of `0` into `cgroup.threads` (the writing thread moves itself) does not
+take the rwsem (`*threadgroup_locked = pid || threadgroup`, v6.8
+`kernel/cgroup/cgroup.c:2916`; the review of #494, N6): the moved thread is
+the writer, and a fork by another thread of its process starts its child
+in that thread's cgroup.
+
+The programs' links are pinned (`prog_cgroup_join_*`,
+`link_cgroup_join_*`, the review of #494, D6), as the other anti-tamper
+programs are: a stopped agent leaves the tracker marking. Their pins and
+the four maps' (`CGROUP_JOINED`, `CGROUP_JOIN_LOST`, `CGROUP_JOIN_STATS`,
+`CGROUP_JOIN_EPOCH`) are in a directory of the tracker's own **beside**
+the pin root, not in it (the re-review of #494, R2):
+`/sys/fs/bpf/northnarrow-cgroup-join-v<schema>_<generation>` (no dot: bpffs refuses one in a name, `bpf_lookup`; the third review's first lab run found it, the directory refused with EPERM and the tracker absent).
+`install.sh --upgrade` purges the pin root so that every LSM program
+detaches (`purge_pin_root`); the review's version had the tracker's pins
+there, so an upgrade dropped every mark. Now the purge leaves the
+tracker's directory: its programs go on marking through the upgrade, and
+the new agent swaps them for its own, one by one, attach before purge
+(`cgroup_join_mark` before `cgroup_join_src`: the new `mark` reads the new,
+empty source slot until the new `src` runs, so it marks more meanwhile,
+never less — the re-review's N-f). The agent lists the tracker's programs
+as `kept` in `/run/northnarrow/bpf-own-ids`: the upgrade does not wait for
+them to unload; `uninstall.sh` removes the directory with the pin root and
+waits for every program.
+
+**What a start adopts** (the third review of #494, R2-a and R2-b). A start
+registers its pins in `/run/northnarrow/cgroup-join-pins` — the boot's
+id, the directory, each map's id and entries — and the agent protects
+that file like its other files (`register_agent_file`: no write, unlink or
+rename by a foreign caller outside the trusted-installer window), and the
+directory like the pin root (`register_bpffs_pins`). The next start
+adopts only that directory, and only when each of its maps is the one
+registered — `BPF_OBJ_GET_INFO_BY_FD` on a read-only handle: the id, and
+this schema's kind, key and value sizes and flags (a hash with
+`BPF_F_NO_PREALLOC` and nothing else for the marks; never an LRU hash, a
+preallocated one, or one read-only to programs) — with no other file in
+the directory. Anything else is a **reset**: new maps in the next
+generation's directory, the old directory removed once the new programs
+run, a signed degradation "cgroup exemptions: marks reset …" — the
+registered directory gone between two agents ("marks lost between
+agents": the third review's point 3, the window between an upgrade's purge
+of the pin root, with which the deny hooks detach, and the new agent's
+start), maps not the registered ones (a directory planted, before the
+first start or inside the window, with a map whose writer keeps an fd), a
+directory no start of this boot registered, an older schema's (not
+migrated: this is the first schema). A directory that is a symbolic link
+is refused, and removed without being followed (R2-d). A tracker
+directory beside adopted pins that nobody registered (planted under the
+name of a later generation) is removed, signed.
+
+**A reset fails closed** (R2-a). The review's version named the
+directory by the marks' size too, so a `sysctl kernel.threads-max` before
+a restart was a reset, and a reset gave every marked process its
+exemption back. The size is now a capacity fixed when the marks are made:
+a host that asks for more later keeps the map — a signed note, and a
+process past it is not known. A reset writes its instant into
+`CGROUP_JOIN_EPOCH` (`[monotonic, boot time]` ns) once the new programs
+run: a process started before it is not known to the agent (its leader's
+start, `/proc/<pid>/stat`, against the boot-time instant), and a fork of
+one — by anyone but PID 1, whose forks are systemd's placement, and the
+family — makes a child that is not known (`before_epoch`, the leader's
+monotonic start against the monotonic instant). Written after the
+attach, it leaves nothing unseen: a process forked before it started
+before it. The exempt services are then refused until they are restarted
+(`UPGRADE_NOTES_WAVE4.md` §7).
+A kernel that refuses the tracker removes its pins; a host without bpffs
+attaches the programs for the agent's life and warns.
+
+### Residual
+
+- **Root changes the unit itself.** A drop-in that rewrites `ExecStart=`,
+  a transient unit given the exempt unit's name where none is loaded,
+  systemd asked over D-Bus to attach a process (`AttachProcessesToUnit`):
+  these are systemd's placements, and the unit exemption trusts the
+  unit's definition. An exemption by `exe … sha256` binds to the program.
+- **A root that writes PID 1's memory** — or its pre-exec child's
+  (systemd up to 254) — with `ptrace` or `/proc/1/mem`: what PID 1 does is
+  systemd's placement (the review of #494, N3).
+- **Code injected into a running exempt process** (`ptrace`,
+  `process_vm_writev`, `/proc/<pid>/mem`): nothing moves; every kind of
+  exemption covers what the process then does, `exe … sha256` too (the
+  file's digest, not the memory's).
+- **A move before the agent's first start** since the host booted: no
+  program ran. While no agent runs, the last agent's and watchdog's pids
+  stay the family in the pinned `PROTECTED_PIDS` until the next start's
+  stale scan: a process given one of them moves unmarked (the re-review's
+  N-e; it needs that pid reused while no agent runs). A `cgroup_join`
+  record of a move made then reaches no journal; the mark is made.
+- **Inside the trusted-installer window** (a signed, audited grant), or
+  between an upgrade's purge of the pin root and the new agent's start
+  (the deny hooks detach with the purge), root can replace both the
+  tracker's pins and their record in `/run/northnarrow`: a planted map
+  registered by a forged record is adopted. The window trusts its holder.
+  The pins removed then are signed ("marks lost between agents"), and a
+  reboot removes them with every process.
+- **A downgrade to a version before lot 277** leaves the tracker's
+  programs attached and marking — harmless, nothing reads the marks —
+  until `uninstall.sh` or a reboot. (No release pinned them in the pin
+  root itself.)
+- **cgroup's `favordynmods`** (kernel 6.18+, `cgroup_enable_per_threadgroup_rwsem`,
+  v6.18 `kernel/cgroup/cgroup.c:1344-1356`, `:3096-3103`): a move takes
+  only the target group's rwsem and looks the pid up before it; the
+  fork-time clear of a dead group's mark (N5) no longer excludes a move of
+  that dead group, which can mark the tgid after the new owner's fork — a
+  false refusal for that process. Neither systemd 255 nor 257 mounts
+  cgroup2 with `favordynmods`; it takes a remount by root or
+  `CONFIG_CGROUP_FAVOR_DYNMODS` (the re-review's N-a).
+- **A probe that cannot read a task's tgid** (`tgid_of`, a live task's own
+  field: not seen to fail): the writer's own is set not known, another
+  task's — a moved one, a forked child — is only counted, with no group
+  to set (the re-review's N-b).
+- **The marks' size is the first start's of the boot**: `kernel.pid_max`
+  or `kernel.threads-max` raised later leave the map as it was, a signed
+  note at each start (the third review's R2-a: never a reset); a fork
+  storm past `threads-max` by the number of CPUs (the check comes before
+  the fork completes) and dead groups' marks take entries too. In every
+  case only the groups that ask for a mark become not known — a service
+  systemd starts asks for none (the re-review's N-g).
+- **After a reset**, every process started before it — the exempt
+  services among them, and what they fork — is refused an exemption by
+  cgroup or unit until it exits: restart the exempt services. That is the
+  price of failing closed; a reset is signed.
+- **A non-leader thread rewriting its own process into its cgroup**
+  (`cgroup.procs` with its tgid, or `0`): the leader moves, not the
+  writing thread, so it is marked — a false refusal for a multi-threaded
+  service that does so (the re-review's N-d).
+- **The `cgroup_join` records share the task denials' budget** (one a
+  caller and operation a second, 50 a second per CPU): any user moving its
+  own processes into a cgroup of its session named like an exempt unit
+  (`…/app.slice/backup.service`) makes High records — noise in the
+  denials' budget, not a way around the tracker (the re-review's N-h).
+- **A start by `CLONE_INTO_CGROUP` is marked, not signed**: the fork path
+  gives no destination path to match.
+- **False refusals, fail-closed**: a `Delegate=yes` service that moves its
+  own processes into its sub-cgroups, a container runtime (runc writes the
+  pid, with the systemd cgroup driver too), a move in a cgroup v1
+  hierarchy of a hybrid host (the policy reads the `0::` cgroup only):
+  those processes are marked and lose a `unit` exemption (the review of
+  #494, N2, N4).
+- **systemd 255** does not use `CLONE_INTO_CGROUP` (256 does): PID 1
+  `posix_spawn`s `systemd-executor`, `posix_spawn` returns after its
+  exec, and PID 1 moves it at once (`cg_attach`, v255 `execute.c`): a
+  placement. The executor moves itself much later (v255
+  `exec-invoke.c`), into the cgroup it is in: a no-op. If PID 1 stayed
+  off the CPU long enough for the executor's move to come first, that
+  move would be the executor's — it executed — and mark the unit's
+  process (a false refusal). The first version of this section said 255
+  used `CLONE_INTO_CGROUP` with a recent glibc (the review of #494, D4):
+  wrong. Measured on Ubuntu 24.04 (systemd 255) in the review's lab:
+  `docs/roadmap/CAPABILITY_PROGRAM.md`, lot 277.
+- **A container or workload context**: any future exemption by container
+  or workload follows the same rule. A process counts as the workload's
+  when the workload's runtime started it there, never because its cgroup
+  says so.

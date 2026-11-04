@@ -551,6 +551,35 @@ fn attach_reporting(
         ));
     }
 
+    // Lot 277: the start-in-cgroup tracker (the per-rule policy's
+    // exemptions by cgroup or unit hold for processes started in their
+    // cgroup only). Not a deny hook: without it those exemptions are
+    // refused, a signed degradation.
+    let (tracker, signed) = crate::cgroup_join::attach(ebpf, &btf, pin_root);
+    // The re-review of #494, R2, and its third review: marks of before this
+    // start dropped (a reset: their pins gone between two agents, not the
+    // ones registered, another schema's) or the marks' capacity below the
+    // host's — never in silence.
+    for why in signed {
+        report.degraded.push(format!("cgroup exemptions: {why}"));
+    }
+    match &tracker {
+        crate::cgroup_join::Tracker::Absent(why) => report.degraded.push(format!(
+            "cgroup exemptions: {} ({why})",
+            crate::cgroup_join::ABSENT_EFFECT
+        )),
+        crate::cgroup_join::Tracker::Attached(marks) => {
+            let gone = marks.sweep(std::path::Path::new("/proc"));
+            if gone > 0 {
+                info!(
+                    removed = gone,
+                    "cgroup exemptions: marks of processes gone while no agent ran removed"
+                );
+            }
+        }
+    }
+    crate::cgroup_join::install(tracker);
+
     // BPF self-defence (Tappa 10.8): map guard (deny) + bpf() observer.
     let bd = bpf_defense::attach(bpf_guard, ebpf, &btf, pin_root);
     for (program, why) in bd.deny_failures {
@@ -601,6 +630,38 @@ fn attach_reporting(
                 "anti-tamper FS: bpffs pins NOT registered — the pin root stays removable by root"
             );
             deny.infra_failure("filesystem::register_bpffs_pins", format!("{e:#}"));
+        }
+    }
+    // The re-review of #494, R2: the tracker's pin directory (beside the
+    // root) and its pins alike — no new entry, no unlink or rename by a
+    // foreign caller outside the trusted-installer window.
+    if let Some(dir) = crate::cgroup_join::pin_dir_now() {
+        if let Err(e) = filesystem::register_bpffs_pins(ebpf, dir) {
+            warn!(
+                error = format!("{e:#}"),
+                "anti-tamper FS: the tracker's pins NOT registered — removable by root"
+            );
+            deny.infra_failure(
+                "filesystem::register_bpffs_pins (tracker)",
+                format!("{e:#}"),
+            );
+        }
+        // The third review of #494 (R2-b): the record of which pins are the
+        // tracker's — the next start adopts nothing else.
+        // Absent when the tracker did not attach or could not register (the
+        // next start then resets: fail closed).
+        let state = std::path::Path::new(crate::cgroup_join::STATE_PATH);
+        if !state.exists() {
+            warn!("anti-tamper FS: no tracker pin state to protect");
+        } else if let Err(e) = filesystem::register_agent_file(ebpf, state) {
+            warn!(
+                error = format!("{e:#}"),
+                "anti-tamper FS: the tracker's pin state NOT protected — rewritable by root"
+            );
+            deny.infra_failure(
+                "filesystem::register_agent_file (tracker state)",
+                format!("{e:#}"),
+            );
         }
     }
     // Review 63: every inode this boot protects is registered now; the

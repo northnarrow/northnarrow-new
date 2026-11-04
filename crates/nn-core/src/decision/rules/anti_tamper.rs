@@ -166,6 +166,25 @@ impl Rule for NnLAt001AntiTamperDenial {
             FsProtectOperation::Ioprio => format!(
                 "to set the I/O priority of protected pid {target_ino} to {target_dev:#x} (ionice)"
             ),
+            // Lot 277: not refused — a process put in a cgroup the per-rule
+            // policy exempts, by someone other than systemd: it and every
+            // process it starts are never exempt by that cgroup or unit.
+            FsProtectOperation::CgroupJoin => {
+                let reasoning = format!(
+                    "`{comm}` moved pid {target_ino} into a cgroup an exemption of the per-rule \
+                     policy names (name hash {target_dev:#018x}) — not systemd starting it there. \
+                     The move went through; that process and every process it starts are never \
+                     exempt by the cgroup or the unit: posing as an exempt service is an attempt \
+                     on the policy."
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::High,
+                    &reasoning,
+                ));
+            }
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -239,6 +258,7 @@ mod tests {
             FsProtectOperation::Sched,
             FsProtectOperation::Nice,
             FsProtectOperation::Ioprio,
+            FsProtectOperation::CgroupJoin,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))
@@ -250,6 +270,21 @@ mod tests {
             .evaluate(&denial(FsProtectOperation::Signal))
             .unwrap();
         assert!(v.reasoning.contains("signal 9 to protected pid 709"));
+    }
+
+    /// Lot 277: a move into an exempt cgroup is signed as what it is — not
+    /// refused, the exemptions lost — with the moved pid and the name's
+    /// hash, never as a refusal.
+    #[test]
+    fn a_move_into_an_exempt_cgroup_is_signed_not_refused() {
+        let r = NnLAt001AntiTamperDenial
+            .evaluate(&denial(FsProtectOperation::CgroupJoin))
+            .expect("verdict")
+            .reasoning;
+        assert!(r.contains("moved pid 709 into a cgroup"), "{r}");
+        assert!(r.contains("0x0000000000000009"), "{r}");
+        assert!(r.contains("never exempt"), "{r}");
+        assert!(!r.contains("the kernel refused it"), "{r}");
     }
 
     /// External audit EBPF-015: a refused new entry names the directory as
