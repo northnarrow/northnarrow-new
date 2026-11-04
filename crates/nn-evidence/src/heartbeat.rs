@@ -162,6 +162,47 @@ pub struct HeartbeatRecord {
     /// records, reserved by the chain log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<BeatManifest>,
+    /// Lot 275 (the second review of #495, R2): NN-L-NET-028's judgements
+    /// this run, by outcome and, the unknown ones, by reason (`None`: an
+    /// agent older than lot 275, or one with no DNS response table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nodns: Option<BeatNoDns>,
+}
+
+/// NN-L-NET-028's judgements since the run started: a rule blinded for
+/// every process (`unknown.degraded`, `unknown.barrier`) shows in the beat,
+/// as do its `nodns_coverage_lost` rows queued to be signed
+/// (`coverage_lost`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BeatNoDns {
+    pub lineage: u64,
+    pub other_lineage: u64,
+    pub unresolved: u64,
+    pub unknown: BeatNoDnsUnknown,
+    /// `nodns_coverage_lost` rows queued to be signed (at most one a cause
+    /// a window; the final check of #495, N4: queued, not appended — an
+    /// `append` that fails is the agent's warning).
+    pub coverage_lost: u64,
+}
+
+/// The unknown judgements by reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BeatNoDnsUnknown {
+    /// The evidence lost for every process (undecoded, a user's held
+    /// records, DNS losses).
+    pub degraded: u64,
+    /// The lineage's own records held back.
+    pub held: u64,
+    /// A name asked whose response was never seen whole.
+    pub unseen: u64,
+    /// A binding of a process whose start is not known.
+    pub start: u64,
+    /// The DNS pumps had not caught up.
+    pub barrier: u64,
+    /// The DNS response sensor does not run.
+    pub sensor: u64,
+    /// The process predates the sensor.
+    pub older: u64,
 }
 
 /// R13 (lab PR 271): what a beat carries of the capability manifest — the

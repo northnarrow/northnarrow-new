@@ -430,9 +430,12 @@ fn recorded_versions_and_hashes_match_the_frozen_files() {
 
 /// Rules that can issue a Critical verdict but are out of the sub-gate,
 /// each with what brings it back: the reason `matrix.md` must give.
-/// Lab PR 163 (registry version 2): NN-L-NET-003 cannot fire until BUG-025
-/// gives it a TLS fingerprint producer.
-const OUT_OF_THE_SUB_GATE: &[(&str, &str)] = &[("NN-L-NET-003_BadJa3", "BUG-025")];
+/// Lab PR 163 (registry version 2): NN-L-NET-003 could not fire until
+/// BUG-025 gave it a TLS fingerprint producer; lot 275 (version 4) closed
+/// BUG-025 and made it Medium (R6: a fingerprint is not an identity), so it
+/// is out of the sub-gate as a rule that cannot issue a Critical verdict.
+/// None since.
+const OUT_OF_THE_SUB_GATE: &[(&str, &str)] = &[];
 
 /// A rule out of the sub-gate is a decision recorded with its reason, not a
 /// way out of the campaign: it stays in the denominator (a miss of it

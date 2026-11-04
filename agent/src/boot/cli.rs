@@ -839,6 +839,16 @@ pub(crate) struct Cli {
     )]
     pub(crate) rule_policy_local: PathBuf,
 
+    /// Lot 275: the signed allowlist of NN-L-NET-028 ("no DNS, no
+    /// connect"): the addresses and CIDR blocks it does not judge, one a
+    /// line, stored with `nn-admin config overlay set nodns-allow`.
+    #[arg(
+        long = "nodns-allow-local",
+        value_name = "PATH",
+        default_value = northnarrow_agent::decision::rules::net_nodns::DEFAULT_ALLOW_LOCAL
+    )]
+    pub(crate) nodns_allow_local: PathBuf,
+
     /// Do not read the new environment at exec (no LD_PRELOAD / LD_AUDIT /
     /// GLIBC_TUNABLES / history checks). Also `NN_EXEC_POLICY_NO_ENV=1`
     /// (1/0, true/false, yes/no, on/off).

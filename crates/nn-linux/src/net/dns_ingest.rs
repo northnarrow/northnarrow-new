@@ -72,6 +72,17 @@ impl DnsIngest {
         self.wanted.notified().await
     }
 
+    /// Lot 275: a pump other than the DNS query pump starts (`true`) or ends
+    /// (`false`) — what [`IngestClaim`] does for that one, for the DNS
+    /// response and TLS ClientHello pumps whose rings a record's
+    /// attribution waits on too. Ending releases the waiters at once.
+    pub fn set_pump(&self, running: bool) {
+        self.pump.store(running, Ordering::Release);
+        if !running {
+            self.passed.notify_waiters();
+        }
+    }
+
     /// Wait until the cache holds the queries made before a record timed
     /// `ts_ns` (`CLOCK_MONOTONIC`, the kernel's): `true` then, `false` when
     /// the wait ended first (no pump, or [`INGEST_WAIT`] since the record)

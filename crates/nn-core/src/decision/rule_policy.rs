@@ -107,6 +107,40 @@ const OUTSIDE_ENGINE: &[&str] = &[
 /// The one rule `combat-without-corroboration` takes.
 pub const RANSOMWARE_RULE: &str = "NN-L-IMP-001_RansomwareEncryption";
 
+/// Lot 275, R6 of the external review of 04/11: the rules `enforce` is
+/// refused for, each with why — a match on one attribute that many benign
+/// programs share, with no second predicate (a destination, an executable)
+/// to act on. In a policy to be signed ([`parse`]: `nn-admin config
+/// overlay set`, `policy-test`) the line refuses the file, as any bad line
+/// does. In a policy signed before ([`boot_policy`], at the agent's start)
+/// only that line is taken as `alert`, the rest in force, and the start
+/// signs a degradation naming the line: refusing the whole file would drop
+/// its exemptions, its other modes and its switches for one line.
+pub const ENFORCE_REFUSED: &[(&str, &str)] = &[
+    (
+        "NN-L-NET-003_BadJa3",
+        "it matches a TLS fingerprint alone, an attribute of the TLS stack that every program on \
+         the same library and settings shares, not a program's identity (the fingerprint alone \
+         finds 6.82 % of malware, 88.68 % with the destination: Anderson & McGrew); it has no \
+         second predicate, a destination or an executable, to act on — `alert` or `audit` it",
+    ),
+    (
+        "NN-L-NET-028_ConnectWithoutDns",
+        "it judges the absence of a DNS answer the agent saw, and an answer can be missing for \
+         benign reasons it cannot see (a container's resolvers of its own, a client's DNS over \
+         TCP, DoT or DoH, an address configured by hand): a kill on it is not fail-safe until it \
+         is measured on a wider corpus (review of #495) — `alert` or `audit` it",
+    ),
+];
+
+/// Why `enforce <id>` is refused, if it is.
+pub fn enforce_refused(id: &str) -> Option<&'static str> {
+    ENFORCE_REFUSED
+        .iter()
+        .find(|(r, _)| *r == id)
+        .map(|(_, why)| *why)
+}
+
 /// A parsed policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RulePolicy {
@@ -355,6 +389,31 @@ fn valid_cgroup(p: &str) -> Result<(), String> {
 
 /// Parse a policy file. Any bad line refuses the whole file.
 pub fn parse(text: &str) -> Result<RulePolicy, PolicyError> {
+    parse_as(text, RefusedEnforce::Refuse).map(|(p, _)| p)
+}
+
+/// What [`parse_as`] makes of an `enforce` [`ENFORCE_REFUSED`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusedEnforce {
+    /// The line refuses the file (a policy to be signed).
+    Refuse,
+    /// The line is taken as `alert` and returned (a policy signed before).
+    AsAlert,
+}
+
+/// An `enforce` line taken as `alert` ([`RefusedEnforce::AsAlert`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DemotedEnforce {
+    pub line: usize,
+    pub rule: &'static str,
+    pub why: &'static str,
+}
+
+fn parse_as(
+    text: &str,
+    refused: RefusedEnforce,
+) -> Result<(RulePolicy, Vec<DemotedEnforce>), PolicyError> {
+    let mut demoted = Vec::new();
     let mut p = RulePolicy::default();
     let mut lines = 0usize;
     for (i, raw) in text.lines().enumerate() {
@@ -377,8 +436,21 @@ pub fn parse(text: &str) -> Result<RulePolicy, PolicyError> {
         let words: Vec<&str> = content.split_whitespace().collect();
         match words.as_slice() {
             [kw, rule] if Mode::from_keyword(kw).is_some() => {
-                let mode = Mode::from_keyword(kw).expect("checked");
+                let mut mode = Mode::from_keyword(kw).expect("checked");
                 let id = resolve_rule(rule).map_err(err)?;
+                if mode == Mode::Enforce {
+                    if let Some(why) = enforce_refused(id) {
+                        if refused == RefusedEnforce::Refuse {
+                            return Err(err(format!("enforce {id} is refused: {why}")));
+                        }
+                        demoted.push(DemotedEnforce {
+                            line,
+                            rule: id,
+                            why,
+                        });
+                        mode = Mode::Alert;
+                    }
+                }
                 if let Some(prev) = p.modes.insert(id, mode) {
                     return Err(err(format!(
                         "{id} already has a mode ({}): one mode per rule",
@@ -490,7 +562,7 @@ pub fn parse(text: &str) -> Result<RulePolicy, PolicyError> {
             [] => unreachable!("empty content skipped"),
         }
     }
-    Ok(p)
+    Ok((p, demoted))
 }
 
 /// The active policy, shared by the engine, the posture and the admin
@@ -530,6 +602,10 @@ pub struct BootPolicy {
     pub policy: RulePolicy,
     /// A signed file that did not parse: the built-in defaults are in force.
     pub degraded: Option<String>,
+    /// R6 (lot 275): a signed file in force whose `enforce` lines of a rule
+    /// [`ENFORCE_REFUSED`] names were taken as `alert`, each named (the
+    /// detail of the signed degradation).
+    pub demoted: Option<String>,
 }
 
 /// The boot policy from the overlay gate's verified text (`None`: absent or
@@ -539,17 +615,49 @@ pub fn boot_policy(verified: Option<(&Path, &str)>) -> BootPolicy {
         None => BootPolicy {
             policy: RulePolicy::builtin(),
             degraded: None,
+            demoted: None,
         },
-        Some((path, text)) => match parse(text) {
-            Ok(mut p) => {
+        Some((path, text)) => match parse_as(text, RefusedEnforce::AsAlert) {
+            Ok((mut p, demoted)) => {
+                let lines: Vec<String> = demoted
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "line {}: enforce {} refused, applied as alert",
+                            d.line, d.rule
+                        )
+                    })
+                    .collect();
                 p.source = format!(
-                    "{} (signed, sha256 {})",
+                    "{} (signed, sha256 {}{})",
                     path.display(),
-                    hex(&Sha256::digest(text.as_bytes()))
+                    hex(&Sha256::digest(text.as_bytes())),
+                    if lines.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; {}", lines.join("; "))
+                    }
                 );
+                let demoted = (!demoted.is_empty()).then(|| {
+                    let each: Vec<String> = demoted
+                        .iter()
+                        .map(|d| {
+                            format!(
+                                "line {}: enforce {} refused, applied as alert ({})",
+                                d.line, d.rule, d.why
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "{}: {} — the rest of the policy is in force",
+                        path.display(),
+                        each.join("; ")
+                    )
+                });
                 BootPolicy {
                     policy: p,
                     degraded: None,
+                    demoted,
                 }
             }
             Err(e) => BootPolicy {
@@ -558,6 +666,7 @@ pub fn boot_policy(verified: Option<(&Path, &str)>) -> BootPolicy {
                     "{}: {e} — the built-in defaults are in force",
                     path.display()
                 )),
+                demoted: None,
             },
         },
     }
@@ -740,6 +849,13 @@ mod tests {
                 "twice",
             ),
             ("enforce R020\x07\n", 1, "control character"),
+            // R6 (lot 275): a fingerprint alone is not an identity
+            ("enforce NN-L-NET-003\n", 1, "enforce NN-L-NET-003_BadJa3 is refused"),
+            (
+                "alert R020\nenforce NN-L-NET-003_BadJa3\n",
+                2,
+                "no second predicate",
+            ),
         ] {
             let e = refused(text);
             assert_eq!(e.line, line, "{text:?}: {e}");
@@ -1031,6 +1147,99 @@ mod tests {
         let b = boot_policy(None);
         assert!(b.policy.is_builtin());
         assert_eq!(b.policy.source, "built-in defaults");
+    }
+
+    /// R6 (lot 275): a policy to be signed that enforces NN-L-NET-003 is
+    /// refused whole (above, `every_bad_line_refuses_the_file_with_its_number`);
+    /// one signed before keeps every other line at the start — its
+    /// exemptions, its other modes, its switch — and that line is taken as
+    /// `alert`, named in the degradation the start signs. Every other mode
+    /// of the rule is accepted, and `enforce` of another rule still is.
+    #[test]
+    fn a_signed_enforce_of_a_fingerprint_rule_is_applied_as_alert_at_the_start() {
+        const NET_003: &str = "NN-L-NET-003_BadJa3";
+        let text = "off R008\nexempt R020 uid 998\nenforce NN-L-NET-003\nenforce NN-L-IMP-001\n\
+                    combat-without-corroboration NN-L-IMP-001\n";
+        assert!(parse(text).is_err(), "to be signed: refused whole");
+        let b = boot_policy(Some((
+            Path::new("/etc/northnarrow/rule-policy.local"),
+            text,
+        )));
+        assert_eq!(b.degraded, None, "not the defaults");
+        assert!(!b.policy.is_builtin());
+        // the other lines in force
+        assert_eq!(
+            b.policy.mode(resolve_rule("R008").unwrap()),
+            Some(Mode::Off)
+        );
+        assert_eq!(b.policy.mode(IMP), Some(Mode::Enforce));
+        assert_eq!(
+            b.policy.exemptions(resolve_rule("R020").unwrap()),
+            &[Exemption::Uid(998)][..]
+        );
+        assert!(b.policy.ransomware_combat_without_corroboration);
+        // that line as alert, named
+        assert_eq!(b.policy.mode(NET_003), Some(Mode::Alert));
+        let d = b.demoted.expect("a signed degradation");
+        assert!(
+            d.contains("line 3: enforce NN-L-NET-003_BadJa3 refused, applied as alert")
+                && d.contains("no second predicate")
+                && d.contains("the rest of the policy is in force"),
+            "{d}"
+        );
+        assert!(
+            b.policy
+                .source
+                .contains("line 3: enforce NN-L-NET-003_BadJa3 refused, applied as alert"),
+            "{}",
+            b.policy.source
+        );
+        // a policy without such a line: nothing demoted
+        let b = boot_policy(Some((
+            Path::new("/etc/northnarrow/rule-policy.local"),
+            "enforce NN-L-IMP-001\n",
+        )));
+        assert_eq!((b.degraded, b.demoted), (None, None));
+        // a line the start cannot read still refuses the file to the defaults
+        let b = boot_policy(Some((
+            Path::new("/etc/northnarrow/rule-policy.local"),
+            "enforce NN-L-NET-003\nbogus x\n",
+        )));
+        assert!(b.policy.is_builtin() && b.demoted.is_none());
+        assert!(b.degraded.unwrap().contains("line 2"));
+        for mode in ["alert", "audit", "off"] {
+            let p = parse(&format!("{mode} NN-L-NET-003\n")).unwrap();
+            assert_eq!(p.mode(NET_003).map(Mode::keyword), Some(mode), "{mode}");
+        }
+        assert!(parse("exempt NN-L-NET-003 uid 1000\n").is_ok());
+        assert!(parse("enforce NN-L-IMP-001\n").is_ok());
+        // review of #495: NN-L-NET-028's kill is not fail-safe either
+        assert!(parse("enforce NN-L-NET-028\n").is_err());
+        let b = boot_policy(Some((
+            Path::new("/etc/northnarrow/rule-policy.local"),
+            "enforce NN-L-NET-028\noff R008\n",
+        )));
+        assert_eq!(
+            b.policy.mode("NN-L-NET-028_ConnectWithoutDns"),
+            Some(Mode::Alert)
+        );
+        assert_eq!(
+            b.policy.mode(resolve_rule("R008").unwrap()),
+            Some(Mode::Off)
+        );
+        assert!(b
+            .demoted
+            .unwrap()
+            .contains("line 1: enforce NN-L-NET-028_ConnectWithoutDns refused, applied as alert"));
+        assert_eq!(
+            ENFORCE_REFUSED.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            vec![NET_003, "NN-L-NET-028_ConnectWithoutDns"]
+        );
+        // every refused id is a rule the policy knows
+        for (id, why) in ENFORCE_REFUSED {
+            assert_eq!(resolve_rule(id), Ok(*id));
+            assert!(!why.is_empty());
+        }
     }
 
     #[test]

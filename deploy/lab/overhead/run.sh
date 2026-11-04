@@ -26,7 +26,7 @@ agent_ticks() {
     echo $(( own + w ))
 }
 hz=$(getconf CLK_TCK)
-for w in "open 200000" "wopen 50000" "exec 2000" "connect 5000" "udp 200000" "dns 20000" "getppid 5000000" "rdzero 2000000"; do
+for w in "open 200000" "wopen 50000" "exec 2000" "connect 5000" "udp 200000" "dns 20000" "tcpsend 200000" "udprecv 200000" "getppid 5000000" "rdzero 2000000"; do
     t0=$(agent_ticks)
     r=$("$BIN" $w "$WORK")
     t1=$(agent_ticks)

@@ -191,6 +191,70 @@ static int bench_udp(long n, int dns)
     return 0;
 }
 
+/* Lot 275: one 64-byte send per iteration on one established loopback TCP
+ * connection, the receiver drained (the ClientHello sensor's fentry on
+ * `tcp_sendmsg` runs on every send; past a flow's first it is one lookup
+ * that misses). */
+static int bench_tcpsend(long n)
+{
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (l < 0 || bind(l, (struct sockaddr *)&sa, sizeof sa) < 0 || listen(l, 1) < 0)
+        return -1;
+    socklen_t sl = sizeof sa;
+    getsockname(l, (struct sockaddr *)&sa, &sl);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    if (c < 0 || connect(c, (struct sockaddr *)&sa, sizeof sa) < 0)
+        return -1;
+    int a = accept(l, NULL, NULL);
+    if (a < 0)
+        return -1;
+    unsigned char buf[64];
+    memset(buf, 't', sizeof buf);
+    for (long i = 0; i < n; i++) {
+        if (send(c, buf, sizeof buf, 0) != (ssize_t)sizeof buf)
+            return -1;
+        if (recv(a, buf, sizeof buf, MSG_WAITALL) != (ssize_t)sizeof buf)
+            return -1;
+    }
+    close(a);
+    close(c);
+    close(l);
+    return 0;
+}
+
+/* Lot 275: one datagram received per iteration (the DNS response sensor's
+ * fexit on `udp_recvmsg` runs on every receive; a datagram from a port
+ * other than 53 costs its source port's test). */
+static int bench_udprecv(long n)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    int r = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in sa, from;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (s < 0 || r < 0 || bind(r, (struct sockaddr *)&sa, sizeof sa) < 0)
+        return -1;
+    socklen_t sl = sizeof sa;
+    getsockname(r, (struct sockaddr *)&sa, &sl);
+    unsigned char buf[64];
+    memset(buf, 'r', sizeof buf);
+    for (long i = 0; i < n; i++) {
+        if (sendto(s, buf, sizeof buf, 0, (struct sockaddr *)&sa, sizeof sa) < 0)
+            return -1;
+        socklen_t fl = sizeof from;
+        if (recvfrom(r, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl) < 0)
+            return -1;
+    }
+    close(r);
+    close(s);
+    return 0;
+}
+
 static int bench_getppid(long n)
 {
     for (long i = 0; i < n; i++)
@@ -217,7 +281,7 @@ static int bench_rdzero(long n)
 int main(int argc, char **argv)
 {
     if (argc != 4) {
-        fprintf(stderr, "usage: %s open|wopen|exec|connect|udp|dns|getppid|rdzero <iterations> <workdir>\n", argv[0]);
+        fprintf(stderr, "usage: %s open|wopen|exec|connect|udp|dns|tcpsend|udprecv|getppid|rdzero <iterations> <workdir>\n", argv[0]);
         return 2;
     }
     const char *mode = argv[1];
@@ -238,6 +302,10 @@ int main(int argc, char **argv)
         rc = bench_udp(n, 0);
     else if (!strcmp(mode, "dns"))
         rc = bench_udp(n, 1);
+    else if (!strcmp(mode, "tcpsend"))
+        rc = bench_tcpsend(n);
+    else if (!strcmp(mode, "udprecv"))
+        rc = bench_udprecv(n);
     else if (!strcmp(mode, "getppid"))
         rc = bench_getppid(n);
     else if (!strcmp(mode, "rdzero"))

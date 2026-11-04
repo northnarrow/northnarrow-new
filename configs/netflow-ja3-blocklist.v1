@@ -2,17 +2,21 @@
 #
 # Loaded at agent boot from /etc/northnarrow/netflow-ja3-blocklist.v1 (the
 # install.sh helper drops this file under /etc/northnarrow/ if missing).
-# Consumed by NN-L-NET-003 (JA3 match against operator-curated threat-actor
-# list — Critical, KillProcessTree + posture → COMBAT). Operators extend /
-# narrow via the /etc/northnarrow/netflow-ja3-blocklist.local overlay — same
-# `+entry` add / `-entry` disable schema as fim-paths.local (Tappa 9 C7).
+# Consumed by NN-L-NET-003 (a TLS ClientHello whose JA3 or JA4 is in the
+# list — Medium, recorded, never acted on: a fingerprint names a TLS stack,
+# not a program; lot 275, R6 of the external review of 04/11). Operators
+# extend / narrow via the /etc/northnarrow/netflow-ja3-blocklist.local
+# overlay — same `+entry` add / `-entry` disable schema as fim-paths.local
+# (Tappa 9 C7).
 #
-# Format: one entry per non-empty / non-comment line. Each entry is a
-# 32-character lowercase hex JA3 MD5 hash (Salesforce 2017 spec). The parser
-# normalises uppercase input to lowercase, so operators can paste vendor-
-# exported fingerprints in either case. `#` starts a comment; blank lines
-# ignored. NO `+` / `-` directives in v1 — those belong in the `.local`
-# overlay only.
+# Format: one entry per non-empty / non-comment line. Each entry is a JA3
+# (the 32-character hex MD5 hash, Salesforce 2017 spec) or a JA4 (the
+# 36-character `t13d1516h2_8daaf6152771_02713d6af862` form, FoxIO 2023; JA3
+# alone is unstable for clients that permute their extensions, Chrome from
+# 108). The parser normalises uppercase input to lowercase, so operators can
+# paste vendor-exported fingerprints in either case. `#` starts a comment;
+# blank lines ignored. NO `+` / `-` directives in v1 — those belong in the
+# `.local` overlay only.
 #
 # Curation policy (Tappa 10 §10):
 # - V1.0 ships EMPTY. Populating this file requires threat-intel curation
@@ -26,13 +30,10 @@
 #   know which fingerprints are load-bearing for their environment.
 # - The agent boots cleanly with an empty default.
 #
-# NOT ACTIVE IN THIS RELEASE (BUG-025, external audit NET-009): no sensor
-# captures the TLS ClientHello yet, so no flow carries a JA3 fingerprint and
-# NN-L-NET-003 cannot fire, whatever this list or the `.local` overlay holds.
-# A list with entries is reported at boot as an ERROR and a signed
-# `subsystem_degraded` audit entry, and `nn-admin net status` lists
-# NN-L-NET-003 as inactive. Entries are still parsed and kept, for the
-# release that adds the capture.
+# Lot 275 closed BUG-025 (external audit NET-009): the `tls_hello` sensor
+# captures an outbound flow's ClientHello and the parse worker fingerprints
+# it. Where the sensor does not attach, the boot says so (the `tls_hello`
+# degradation) and NN-L-NET-003 cannot match there.
 #
 # See docs/design/TAPPA10_NETWORK_OBSERVABILITY_DESIGN.md §13 Q5 + §10 for
 # the rationale.

@@ -59,16 +59,18 @@ fn default_rules() -> Vec<Box<dyn Rule>> {
 /// in `default_rules()` too: 77 rules under 76 ids. Lab PR 224: R020
 /// (shell with socket stdio) and NN-L-NET-026/027 (fan-out): 80 under 79.
 /// Lab PR 225 adds the ransomware rules (NN-L-IMP-001/002) and the
-/// security-tool rules (NN-L-EVA-001..004): 86 rules under 85 ids.
+/// security-tool rules (NN-L-EVA-001..004): 86 rules under 85 ids. Lot
+/// 275: NN-L-NET-028 ("no DNS, no connect"): 87 under 86.
 #[test]
 fn default_engine_has_seventy_nine_rules_across_all_families() {
     let engine = RuleEngine::with_default_rules();
     // chain 8 + tappa2 10 (+ R007's second pass) + process 7 + R020
     //   + module-load 1 (R018, BUG-034) + io_uring 2 + BPF 2 (PROC-014)
-    //   + FIM 25 + impact 2 + evasion 4 (lab PR 225) + canary 4 + net 19
+    //   + FIM 25 + impact 2 + evasion 4 (lab PR 225) + canary 4 + net 20
+    //   (NN-L-NET-028, lot 275)
     assert_eq!(
         engine.rule_count(),
-        8 + 10 + 1 + 7 + 1 + 1 + 2 + 2 + 25 + 2 + 4 + 4 + 19
+        8 + 10 + 1 + 7 + 1 + 1 + 2 + 2 + 25 + 2 + 4 + 4 + 20
     );
 }
 
@@ -311,9 +313,9 @@ fn default_engine_pins_all_seventy_nine_rule_ids() {
     let mut ids: Vec<&str> = rules.iter().map(|r| r.id()).collect();
     assert_eq!(
         ids.len(),
-        86,
-        "engine ships 85 rules after the impact and evasion rules (lab PR 225), \
-         R007 in two passes (external audit PROC-010)"
+        87,
+        "engine ships 86 rules after the impact and evasion rules (lab PR 225) and \
+         NN-L-NET-028 (lot 275), R007 in two passes (external audit PROC-010)"
     );
     // External audit PROC-010: R007's two passes share its id; no other
     // id appears twice.
@@ -323,7 +325,7 @@ fn default_engine_pins_all_seventy_nine_rule_ids() {
     ids.dedup();
 
     let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
-    assert_eq!(unique.len(), 85, "all rule IDs must be unique");
+    assert_eq!(unique.len(), 86, "all rule IDs must be unique");
 
     assert_eq!(
         ids,
@@ -394,6 +396,7 @@ fn default_engine_pins_all_seventy_nine_rule_ids() {
             "NN-L-NET-021_SensorRecordFlood",
             "NN-L-NET-026_ScanFanOut",
             "NN-L-NET-027_OutboundAuthBruteforce",
+            "NN-L-NET-028_ConnectWithoutDns",
             "R001_ExecFromTmp",
             "R002_ExecFromDevShm",
             "R003_ExecFromVarTmp",
@@ -480,7 +483,7 @@ fn production_engine_pins_all_rule_ids() {
     let (_tmp, lineage) = lineage_of(&[]);
     let production = production_engine(lineage);
     let default = RuleEngine::with_default_rules();
-    assert_eq!(production.rule_count(), 86);
+    assert_eq!(production.rule_count(), 87);
     assert_eq!(production.rule_ids(), default.rule_ids());
 }
 
@@ -526,7 +529,7 @@ fn both_builders_keep_the_family_order() {
                 ("NN-L-IMP", 2),
                 ("NN-L-EVA", 4),
                 ("NN-L-CANARY", 4),
-                ("NN-L-NET", 19),
+                ("NN-L-NET", 20),
                 ("NN-L-CHAIN", 1),
             ],
             "{name}"
@@ -1132,6 +1135,7 @@ fn tcp_row(
             FlowPhase::Closed => 0,
             _ => start_ns,
         },
+        dns_resolution: Default::default(),
     })
 }
 
@@ -1495,6 +1499,7 @@ fn net_flow(pid: u32, dst: [u8; 4], port: u16, proto: u8, ts: u64, sent: u64) ->
         close_reason: 0,
         phase: Default::default(),
         observed_ns: 0,
+        dns_resolution: Default::default(),
     })
 }
 

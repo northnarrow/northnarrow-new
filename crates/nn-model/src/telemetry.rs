@@ -340,6 +340,144 @@ pub struct TlsFingerprint {
     pub alpn: alloc::vec::Vec<alloc::string::String>,
 }
 
+/// Lot 275 (C07): what the DNS evidence says of a connect's destination,
+/// for NN-L-NET-028 ("no DNS, no connect"). Computed by the connect pump
+/// (TCP) and the net drain (UDP) once the DNS pumps have read the records
+/// made before the connect; a row of any other origin is
+/// [`DnsResolution::NotJudged`].
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsResolution {
+    /// Not judged: a destination that is not public, a row the pumps did
+    /// not make (read back, replayed), the judgement off.
+    #[default]
+    NotJudged,
+    /// The process, or an ancestor, resolved the destination through the
+    /// system resolver: a response it received named the address, or a
+    /// name it asked for resolved to it.
+    Lineage,
+    /// Another process on the host resolved it — not this one's lineage.
+    OtherLineage,
+    /// No process on the host resolved it within the window.
+    Unresolved,
+    /// The agent cannot tell: the process started before the DNS response
+    /// sensor, the sensor is not running, the lineage asked a name whose
+    /// response was not seen (a resolver's cache from before the sensor, a
+    /// resolver speaking DNS over TLS upstream), or DNS records of the
+    /// window were lost.
+    Unknown,
+}
+
+impl DnsResolution {
+    pub fn is_not_judged(&self) -> bool {
+        matches!(self, Self::NotJudged)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotJudged => "not_judged",
+            Self::Lineage => "lineage",
+            Self::OtherLineage => "other_lineage",
+            Self::Unresolved => "unresolved",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// A destination the lineage did not resolve (NN-L-NET-028's match).
+    pub fn not_resolved_by_lineage(&self) -> bool {
+        matches!(self, Self::OtherLineage | Self::Unresolved)
+    }
+}
+
+/// Lot 275 (C07) — a DNS response a process received, decoded by the parse
+/// worker ([`crate::Event::DnsAnswer`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DnsAnswerEvent {
+    /// Monotonic-clock ns since boot — the receive.
+    pub timestamp_ns: u64,
+    pub pid: u32,
+    pub uid: u32,
+    pub comm: alloc::string::String,
+    /// The receiver's image (its spawn record or `/proc`, never `comm`).
+    #[serde(default)]
+    pub exe: Option<alloc::string::String>,
+    /// Where the response came from (canonical), and its port (53).
+    pub server: std::net::IpAddr,
+    pub server_port: u16,
+    /// The question's name; `None` when the message was not decoded (the
+    /// parse worker did not answer, or the bytes are no DNS response).
+    pub query_name: Option<alloc::string::String>,
+    pub query_type: u16,
+    /// The response code (0 = no error, 3 = the name does not exist).
+    pub rcode: u8,
+    /// The A and AAAA answers, in the message's order.
+    pub addrs: alloc::vec::Vec<std::net::IpAddr>,
+    /// The names the answers' CNAME records lead to, in order.
+    pub cnames: alloc::vec::Vec<alloc::string::String>,
+    /// The smallest TTL of the answers (seconds; 0 without one).
+    pub ttl_secs: u32,
+    /// The bytes the receive returned.
+    pub datagram_len: u32,
+    /// The record holds only the message's first bytes (512): the answers
+    /// past them are not in `addrs`.
+    pub truncated: bool,
+}
+
+/// Lot 275 (C07): what the parse worker made of a captured ClientHello.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsHelloOutcome {
+    /// Fingerprinted.
+    Complete,
+    /// The message goes on past the bytes captured (a hello over 4,096
+    /// bytes, or split over several sends): no fingerprint.
+    Incomplete,
+    /// Not a ClientHello after all.
+    Invalid,
+    /// The parse worker did not answer.
+    Undecoded,
+}
+
+impl TlsHelloOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+            Self::Invalid => "invalid",
+            Self::Undecoded => "undecoded",
+        }
+    }
+}
+
+/// Lot 275 (C07) — the ClientHello an outbound TCP flow began with
+/// ([`crate::Event::TlsClientHello`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TlsHelloEvent {
+    /// Monotonic-clock ns since boot — the send.
+    pub timestamp_ns: u64,
+    pub pid: u32,
+    pub uid: u32,
+    pub comm: alloc::string::String,
+    /// The sender's image at the send (never `comm`).
+    #[serde(default)]
+    pub exe: Option<alloc::string::String>,
+    pub family: u8,
+    pub dst_addr: std::net::IpAddr,
+    pub dst_port: u16,
+    /// The flow's connect time (its correlator's), 0 when the socket's
+    /// connect was not recorded.
+    pub flow_start_ns: u64,
+    pub outcome: TlsHelloOutcome,
+    /// JA3, JA4, SNI and ALPN when [`TlsHelloOutcome::Complete`]
+    /// (`ja3_raw` is not carried by the worker's answer: empty).
+    pub fingerprint: Option<TlsFingerprint>,
+    /// The bytes the send carried, and whether more than were captured.
+    pub send_len: u32,
+    pub truncated: bool,
+}
+
 /// Tappa 10 (N1) — userland-decoded TCP / UDP flow record. Design
 /// §4.1.
 ///
@@ -435,6 +573,12 @@ pub struct NetFlowEvent {
     /// [`FlowPhase::Snapshot`]; 0 for a closed row.
     #[serde(default)]
     pub observed_ns: u64,
+    /// Lot 275: what the DNS evidence says of `dst_addr` (NN-L-NET-028),
+    /// on the connect-time row of a TCP flow and on a UDP row; left out of
+    /// the serialised row when not judged, so the rows written before it
+    /// read and write the same.
+    #[serde(default, skip_serializing_if = "DnsResolution::is_not_judged")]
+    pub dns_resolution: DnsResolution,
 }
 
 /// Lab PR 224 (CM-02): the phase of a [`NetFlowEvent`].
@@ -770,6 +914,7 @@ mod tests {
             close_reason: 0,
             phase: FlowPhase::Snapshot,
             observed_ns: 1_700_000_000_400_000_000,
+            dns_resolution: Default::default(),
         };
         let json = serde_json::to_string(&original).expect("serialize");
         assert!(json.contains(r#""phase":"snapshot""#), "{json}");

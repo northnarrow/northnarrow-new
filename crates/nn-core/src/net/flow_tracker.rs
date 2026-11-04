@@ -295,6 +295,10 @@ struct PendingFlow {
     comm: String,
     exe: Option<String>,
     proc_start_ns: u64,
+    /// Lot 275: the flow's ClientHello fingerprint, once the TLS sensor's
+    /// pump read it ([`FlowTracker::attach_tls_pending`]): its snapshots
+    /// and its closed row carry it.
+    tls: Option<TlsFingerprint>,
 }
 
 /// One process's pending connects, oldest first (lazy deletion).
@@ -466,6 +470,7 @@ impl<H: DecisionHost> FlowTracker<H> {
         self.pending.insert(
             key,
             PendingFlow {
+                tls: None,
                 announced: false,
                 last_snapshot_ns: 0,
                 start_ns: info.start_ns,
@@ -519,6 +524,7 @@ impl<H: DecisionHost> FlowTracker<H> {
             close_reason: 0,
             phase,
             observed_ns,
+            dns_resolution: Default::default(),
         }
     }
 
@@ -570,11 +576,12 @@ impl<H: DecisionHost> FlowTracker<H> {
                 bytes_sent: 0,
                 bytes_recv: 0,
                 resolved_hostname: None,
-                tls_fingerprint: None,
+                tls_fingerprint: p.tls.clone(),
                 flow_id: String::new(),
                 close_reason: 0,
                 phase: FlowPhase::Snapshot,
                 observed_ns: now_ns,
+                dns_resolution: Default::default(),
             });
         }
         SnapshotBatch { flows, deferred }
@@ -634,12 +641,26 @@ impl<H: DecisionHost> FlowTracker<H> {
             bytes_sent: info.bytes_sent,
             bytes_recv: info.bytes_recv,
             resolved_hostname: None,
-            tls_fingerprint: None,
+            tls_fingerprint: pending.tls,
             flow_id,
             close_reason: info.close_reason,
             phase: FlowPhase::Closed,
             observed_ns: 0,
+            dns_resolution: Default::default(),
         })
+    }
+
+    /// Lot 275: the ClientHello fingerprint of the pending flow `corr`; its
+    /// snapshots and closed row carry it. `false` when no such flow is
+    /// pending (its close came first, or its connect predates the agent).
+    pub fn attach_tls_pending(&mut self, corr: &CorrId, fp: TlsFingerprint) -> bool {
+        match self.pending.get_mut(corr) {
+            Some(p) => {
+                p.tls = Some(fp);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Close arrived with a kernel-side flow id but no pending connect:
@@ -708,6 +729,7 @@ impl<H: DecisionHost> FlowTracker<H> {
             close_reason: info.close_reason,
             phase: FlowPhase::Closed,
             observed_ns: 0,
+            dns_resolution: Default::default(),
         })
     }
 
@@ -751,6 +773,7 @@ impl<H: DecisionHost> FlowTracker<H> {
             close_reason: 0,
             phase: FlowPhase::Closed,
             observed_ns: 0,
+            dns_resolution: Default::default(),
         }
     }
 
@@ -943,6 +966,41 @@ mod tests {
             bytes_recv: recv,
             close_reason: reason,
         }
+    }
+
+    /// Lot 275: the ClientHello fingerprint the TLS pump attaches to a
+    /// pending flow is on its snapshots and its closed row; a flow no longer
+    /// pending takes none.
+    #[test]
+    fn a_pending_flow_carries_its_tls_fingerprint_to_its_rows() {
+        let mut t = FlowTracker::default();
+        const S: u64 = 1_000_000_000;
+        let info = connect_fixture(10 * S, 0xabc, 42, v4(198, 51, 100, 7), 443);
+        t.on_tcp_connect(&info);
+        let corr = FlowTracker::corr_id(10 * S, 0xabc);
+        let fp = TlsFingerprint {
+            ja3: "a".repeat(32),
+            ja3_raw: String::new(),
+            ja4: "t13d1516h2_8daaf6152771_02713d6af862".into(),
+            sni: Some("example.com".into()),
+            alpn: vec!["h2".into()],
+        };
+        assert!(t.attach_tls_pending(&corr, fp.clone()));
+        let snap = t.due_snapshots(
+            100 * S,
+            &SnapshotPolicy {
+                interval_ns: S,
+                min_age_ns: S,
+                max_per_tick: 8,
+            },
+        );
+        assert_eq!(snap.flows[0].tls_fingerprint.as_ref(), Some(&fp));
+        let row = t
+            .on_tcp_close(&close_fixture(200 * S, corr, 10, 20, 0))
+            .expect("closed");
+        assert_eq!(row.tls_fingerprint, Some(fp.clone()));
+        // gone: nothing to attach to
+        assert!(!t.attach_tls_pending(&corr, fp));
     }
 
     /// N3 test #1 — same connect inputs MUST hash to the same

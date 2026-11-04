@@ -143,6 +143,9 @@ pub mod net {
     // The netflow rows handed to the rules, paced per uid (external audit
     // NET-019).
     pub mod limiter;
+    // Lot 275: which process resolved which address — NN-L-NET-028's state
+    // (the DNS responses, the names asked, per process and host-wide).
+    pub mod resolved;
     // The `nameserver`s of the host's `resolv.conf`, re-read when they
     // change (lab PR 224).
     pub mod resolvers;
