@@ -235,6 +235,20 @@ northnarrow-agent northnarrow-watchdog` — and "Nothing was changed". A
 rollback (below) enables again the units that were enabled before the
 upgrade: the enablement links are not among the files it restores.
 
+**Drop-ins of the agent's own units that the new agent would quarantine
+are listed first** (lot 273d, the re-review of #497). Once the window is
+open (or, with no agent running, before anything is copied), the script
+asks the new agent which drop-ins of `northnarrow-agent.service.d`,
+`northnarrow-watchdog.service.d`, `northnarrow-.service.d` and
+`northnarrow.slice.d` it judges harmful (`northnarrow-agent --own-dropins
+check`, read-only), prints each with the reason and ends with `REFUSED`
+and "Nothing was changed" (the window it opened ends at its deadline).
+Remove them, or re-run with `--accept-dropin-quarantine`: the new agent
+moves them to `/var/lib/northnarrow/quarantine/dropins/` (each move
+printed) and the upgrade goes on. After the install the agent's integrity
+round never moves a drop-in that was there before it
+(`UPGRADE_NOTES_WAVE4.md` §7).
+
 **Any failure after step 3 rolls back** (an EXIT trap; Ctrl-C included).
 The new units, if they ran, are stopped through the new agent's own window
 (the same key) and its pin root dropped; every backed-up file is copied

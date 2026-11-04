@@ -1316,12 +1316,50 @@ precision its first judge of the host's drop-ins lacked.
   moves it), never by its mtime; a symlink (systemd follows it to a target
   outside our directories), a hard link and an `EnvironmentFile=` outside
   `/etc/northnarrow/` are quarantined whatever they set (a symlink kept as
-  its target's name, the target never touched); and since a drop-in kept
-  at a close stays writable by root, the integrity round judges every
-  drop-in of our directories again outside a window, the same way, each
-  move a signed `own_dropin_moved` and a reload asked. The unit now makes
+  its target's name, the target never touched); and the integrity round
+  judges our directories again outside a window, the same way, each move
+  a signed `own_dropin_moved` and a reload asked. The unit now makes
   `/etc/systemd/system/northnarrow-agent.service.d` too (NOCREATE on every
-  host; it was install.sh's on Debian or with `--cow-guard` only).
+  host; it was install.sh's on Debian or with `--cow-guard` only). The
+  re-review of #497:
+  - **RR1, a kept drop-in is write-protected.** The directories are
+    NOCREATE, which refuses a new entry but not a rewrite of one already
+    there: a harmless `50-CPUQuota.conf` kept at a close could become
+    `ExecStartPre=…` outside a window and be applied at the next boot,
+    before the agent runs. Every entry a close or a round keeps (a
+    regular file with one name), and the file an `EnvironmentFile=` of it
+    names under `/etc/northnarrow/`, get `FS_PROTECT_WRITE |
+    FS_PROTECT_MUTATE` in the pinned protected-inode map, added to what
+    the key had (`own_dropins::Protector`); a window lifts it as it lifts
+    every protected file's. A key a pass registered whose path no longer
+    names it is taken out at the pass's end, so a freed inode number never
+    protects another file (keys the boot registered are never taken out
+    by a pass). An `EnvironmentFile=` under `/etc/northnarrow/` counts
+    only when its file is a regular file with one name, there, and its
+    protection registered (`..` never leads out of the directory);
+    otherwise the drop-in is quarantined like one outside it.
+  - **RR2, an operator's drop-in is never moved silently.** The round
+    judges only what changed (ctime) since the agent was installed — its
+    binary's ctime (`own_dropins::install_time`; the binary is a
+    protected file) — so a drop-in the operator had before the install
+    is never moved by it. `install.sh` (full mode) asks the new agent
+    which existing drop-ins it would quarantine (`northnarrow-agent
+    --own-dropins check`, read-only, run where the tree's `--version` is:
+    inside the window, or with no agent to judge the exec), lists them
+    and refuses before anything changes, unless the operator passes
+    `--accept-dropin-quarantine` (the agent's `--own-dropins quarantine`
+    moves them, each move printed). A package upgrade runs no check: the
+    round leaves those drop-ins, the integrity round reports them.
+  - **A drop-in of ours written inside a window no longer costs its
+    writer's life** (round 17's C111). NN-L-FIM-009 killed whoever wrote
+    under `/etc/systemd/system/` except our unit files themselves, even
+    inside a signed window — an operator's `systemctl edit
+    northnarrow-agent` or a `cp` back from the quarantine was killed. Its
+    §15.1 exemption now covers our units' drop-ins too
+    (`is_own_unit_dropin`: `<unit dir>/<one of our four .d
+    directories>/<name>.conf`, one level, no `.`): inside an open window a
+    Log/Low, judged at the close; outside one, or another unit's drop-in,
+    still a kill.
 - **The judge, precise** (the re-check of #492). A slice's floors follow
   the host: memory a quarter of it, between 544 MiB (the agent's and the
   watchdog's together) and 1 GiB; a CPU share an eighth of the online
@@ -1496,5 +1534,22 @@ kept running); on 5.15 the write was `EBUSY`. It is the eighth guarded
 - The window closed by an agent's restart is not judged for our own
   drop-ins (no close ran): the next window's close does it, and the
   floors hold meanwhile.
+- **Our drop-ins' round and a window opened during it** (the re-review of
+  #497, NR4). The round reads whether a window is open, then judges and
+  moves: a window opened in between can see a file the operator is
+  writing in it moved by that pass (the operator copies it back inside
+  the window; the close judges it).
+- **A generator's drop-in for our units** (NR4): the round looks in every
+  unit directory, the generators' (`/run/systemd/generator*`) among them.
+  A generator that wrote a harmful drop-in for our units would have it
+  moved at every round and written again at every reload — a loop held to
+  one reload every 30 s. None is known.
+- **The RT runtime between the hook and the round** (NR3): the write deny
+  judges a runtime against the default 1 s period (990000 µs), since it
+  refuses every write of the period and cannot read it; the round judges
+  it against the host's period. With a shorter period set inside a
+  window, a runtime at 99 % of it passes the hook and is put back at the
+  next round — to 95 % of the period, never 0 (for a 1 µs period, the
+  kernel's defaults: the period to 1 s, then the runtime to 950 ms).
 - `cpu.uclamp.max`, `memory.swap.max`, a sibling's `memory.low` /
   `memory.min` are still not refused.

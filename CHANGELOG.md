@@ -808,6 +808,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     quarantined whatever it sets, and every drop-in of our directories is
     judged again at each round outside a window; the unit makes
     `/etc/systemd/system/northnarrow-agent.service.d` on every host.
+  - the re-review of #497: a drop-in of our units kept at a window's
+    close or by a round, and the file under `/etc/northnarrow/` an
+    `EnvironmentFile=` of it names, are write-protected outside a window
+    (such a file must be a regular file with one name, there, else the
+    drop-in is quarantined); the round judges only what changed since the
+    agent was installed, so an operator's drop-in from before is never
+    moved by it — `install.sh` lists the existing ones this release's
+    agent would quarantine (`northnarrow-agent --own-dropins check`) and
+    refuses, nothing changed, unless `--accept-dropin-quarantine`; the
+    RT runtime put back is never 0; the eBPF CI job fails unless both
+    `check_cfg` tests ran; NN-L-FIM-009 no longer kills the writer of a
+    drop-in of our units inside a trusted-installer window (a Low record,
+    the close judges it).
   Still open (`docs/design/ANTITAMPER_TRUST_MODEL.md`, "Lot 273d",
   Residual): the seven sysctls judged by value are judged on the bytes the
   hook reads before the kernel copies them — a root writer's second thread

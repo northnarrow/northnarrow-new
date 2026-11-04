@@ -10,10 +10,13 @@ has the details of each change below.
 
 ## Before you upgrade
 
-1. Nothing in the unit, its drop-ins or your wrappers has to change for
-   the agent to start: the settings of the removed LLM advisor are
-   accepted and ignored, each named in a WARN (§1). Drop them when
-   convenient.
+1. Nothing in the unit or your wrappers has to change for the agent to
+   start: the settings of the removed LLM advisor are accepted and
+   ignored, each named in a WARN (§1). Drop them when convenient. A
+   drop-in in the agent's own unit directories that this release's agent
+   judges harmful does have to change (lot 273d, §7): `install.sh
+   --upgrade` lists each one and refuses, nothing changed, until you
+   remove it or pass `--accept-dropin-quarantine`.
 2. A host that had the advisor's model installed keeps it on disk until
    you delete it (§2).
 3. A dashboard, report or SIEM rule that counted `VERDICT (ADE)` lines,
@@ -63,6 +66,11 @@ has the details of each change below.
 10. **Upgrades refuse units the next boot would not start** (lot 273d,
    §7): enable them first — `systemctl enable northnarrow-agent
    northnarrow-watchdog` — then run `install.sh --upgrade` again.
+11. **Drop-ins of the agent's own units** (lot 273d, §7): the ones this
+   release's agent would quarantine are listed by `install.sh --upgrade`,
+   which refuses until they are gone or you accept their move
+   (`--accept-dropin-quarantine`); the ones kept are write-protected
+   outside a window from then on.
 
 ## 1. The on-host LLM advisor is removed (lab PR 214)
 
@@ -341,8 +349,52 @@ What an operator sees change:
   even the value they hold, needs a window.
 - **A value written in another base than 10** (`040000`, `0x10000`) is
   refused outside a window: write the decimal value.
+- **The hook and the round judge the RT runtime differently.** Outside a
+  window the write deny refuses a runtime of -1 or of at least 990000 µs —
+  99 % of the default 1 s period: it cannot read the period, whose every
+  write it refuses. The integrity round judges the runtime against the
+  period the host has (one set inside a window): with a period of 500000,
+  a runtime of 495000 passes the hook and is put back by the next round,
+  to 95 % of the period (never 0; for a 1 µs period, to the kernel's
+  defaults, 1 s and 950 ms).
 - **`install.sh --upgrade`** refuses, before it changes anything, to
   upgrade running units that are not enabled or not pulled in by the
   default target ("the next boot would start no agent"); its health check
   reads the same after the switch, and a failed upgrade's rollback enables
   again the units that were enabled before it.
+- **Drop-ins of the agent's own units.** The directories
+  `northnarrow-agent.service.d`, `northnarrow-watchdog.service.d`,
+  `northnarrow-.service.d` and `northnarrow.slice.d` (under
+  `/etc/systemd/system`, `/run/systemd/system` and both `system.control`)
+  are the agent's: a drop-in there that this release's agent judges
+  harmful to its units — a value below a floor, a setting that breaks the
+  agent, an `NN_` or loader variable, an `EnvironmentFile=` outside
+  `/etc/northnarrow/` (such as `EnvironmentFile=-/etc/default/…`), a
+  `CPUAffinity=` that leaves out online CPUs, a symlink, a hard link —
+  is moved to `/var/lib/northnarrow/quarantine/dropins/`.
+  - **At the upgrade, nothing of yours moves silently.** `install.sh`
+    (full mode, `--upgrade` or a new install) asks the new agent
+    (`northnarrow-agent --own-dropins check`, read-only) which existing
+    drop-ins it would quarantine, lists them, and refuses — nothing
+    changed — until you remove them or re-run with
+    `--accept-dropin-quarantine`, which moves them first (each move
+    printed). A refused `--upgrade` has already opened its
+    trusted-installer window: it ends at its deadline.
+  - **After the install,** the integrity round moves only a drop-in
+    changed outside a window since the agent was installed (its binary's
+    ctime): one made inside a window is judged at the window's close, one
+    from before the install is never moved by the round.
+  - **A drop-in kept** at a close or by a round — and the file an
+    `EnvironmentFile=` of it names under `/etc/northnarrow/` — is
+    write-protected outside a window: edit it inside one. Such an
+    environment file must be a regular file with one name, there when the
+    drop-in is judged; otherwise the drop-in is quarantined.
+  - **To put one back,** open a window (`nn-admin trusted-installer-grant`),
+    copy the file from the quarantine into place, `systemctl
+    daemon-reload`; it is judged again at the window's close. Writing a
+    drop-in of the agent's units inside a window (a copy, `systemctl
+    edit`) is a Low record of NN-L-FIM-009; before this release the rule
+    killed the writer even inside a window.
+  - A package upgrade (`.deb`, `.rpm`) does not run the check: an existing
+    drop-in is left in place (the round does not move it) and reported by
+    the integrity round as a drop-in of our units.

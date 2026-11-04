@@ -5283,7 +5283,34 @@ number in parentheses is a lab PR.
     the missing tests (a failed restore, the thresholds' edges, a runtime
     enablement, an operator's disable kept by a rollback), the `check_cfg`
     test in the eBPF CI job, the persistent agent drop-in directory made by
-    the unit.
+    the unit. Measured in round 16 (22.04 on 5.15 and Debian 12 on 6.1, the
+    verifier 0 failing on both): C107, `kernel.pid_max=040000` refused
+    (EPERM, the value kept); C108 as first written, the write through
+    the ring refused (EPERM) — its worker was born inside `io_uring_enter`,
+    which the code before D2 refused too: no proof (NR1, below); C109, the period refused even at its own value, and a period
+    cut to the runtime inside a window (950000/950000) put the runtime
+    back to 902500, 95 % of it, after 9 and 10 s; C110, a symlink and a
+    hard link made inside a window moved at its close (in the signed
+    record), the link's target untouched. The re-review of #497 (no
+    blocker; D1–D3 closed, 0 bypasses in 4.7 million writes): a kept
+    drop-in and its environment file write-protected (RR1, C111); the
+    round judges only what changed since the install, `install.sh` lists
+    an operator's drop-ins the agent would quarantine and refuses unless
+    `--accept-dropin-quarantine` (RR2); C108 made a proof (a worker born
+    at a write(2)'s return, NR1); the RT restore never 0 (NR3); the CI
+    step pinned and counting its tests (NR5, NR6). Measured in round 17
+    (24.04 on 6.8, 22.04 on 5.15; the verifier 0 failing on both): the
+    new C108 discriminates — on 5ddb2877, before D2's flags check, the
+    worker born at a write(2)'s return wrote `kernel.pid_max`; on the lot
+    it is refused (EPERM) on 6.8 and 5.15; C107, C109 (902500 after 11 s)
+    and C110 as in round 16; RR2 (round 17b, an upgrade from main with the
+    reviewer's drop-ins): refused with both listed and nothing changed,
+    then with `--accept-dropin-quarantine` both moved and the upgrade
+    complete, the harmless one kept by the round and its rewrite outside a
+    window refused (EPERM); C111 (round 17c): a kept drop-in and its
+    environment file rewritten outside a window, both refused. Round 17
+    found NN-L-FIM-009 killing a drop-in's writer inside a window (C111's
+    shell): its §15.1 exemption now covers our units' drop-ins.
   - Lab: on our own QEMU guests — 22.04 (5.15), Debian 12 (6.1), 24.04 (6.8),
     Debian 13 (6.12, systemd 257), 26.04 (7.0) — each under its lease,
     rounds 12 to 15.
