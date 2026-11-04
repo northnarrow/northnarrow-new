@@ -114,10 +114,11 @@ pub struct KernelFix {
 ///   cdn.kernel.org.
 /// - CVE-2022-30594: `PTRACE_SEIZE` sets `PTRACE_O_SUSPEND_SECCOMP`
 ///   without the capability — a tracer suspends a seccomp filter. Since
-///   4.3 (commit 13c4a90119d2); fixed in 5.10.110, 5.15.33, 5.16.19,
-///   5.17.2 and mainline 5.18 (commit ee1fee900537): the CVE record
-///   ("before 5.17.2"), `ChangeLog-5.10.110`, `-5.15.33`, `-5.16.19`,
-///   `-5.17.2`, `-5.18`.
+///   4.3 (commit 13c4a90119d2); fixed in 4.19.238, 5.4.189, 5.10.110,
+///   5.15.33, 5.16.19, 5.17.2 and mainline 5.18 (commit ee1fee900537): the
+///   CVE record ("before 5.17.2"), `ChangeLog-4.19.238`, `-5.4.189`,
+///   `-5.10.110`, `-5.15.33`, `-5.16.19`, `-5.17.2`, `-5.18` (the review of
+///   #494, D3: the 4.19 and 5.4 branches).
 /// - CVE-2024-42318: `keyctl(KEYCTL_SESSION_TO_PARENT)` drops the caller's
 ///   Landlock domain (`cred_transfer`). Since 5.13; fixed in 5.15.165,
 ///   6.1.103, 6.6.44, 6.10.3 and mainline 6.11: the kernel CNA's record,
@@ -139,9 +140,16 @@ pub const KERNEL_FIXES: &[KernelFix] = &[
         cve: "CVE-2022-30594",
         what: "PTRACE_SEIZE suspends a seccomp filter (the workers' last layer)",
         introduced: (4, 3, 0),
-        stable: &[(5, 10, 110), (5, 15, 33), (5, 16, 19), (5, 17, 2)],
+        stable: &[
+            (4, 19, 238),
+            (5, 4, 189),
+            (5, 10, 110),
+            (5, 15, 33),
+            (5, 16, 19),
+            (5, 17, 2),
+        ],
         mainline: (5, 18),
-        source: "https://www.cve.org/CVERecord?id=CVE-2022-30594 ; cdn.kernel.org ChangeLog-5.10.110, -5.15.33, -5.16.19, -5.17.2, -5.18",
+        source: "https://www.cve.org/CVERecord?id=CVE-2022-30594 ; cdn.kernel.org ChangeLog-4.19.238, -5.4.189, -5.10.110, -5.15.33, -5.16.19, -5.17.2, -5.18",
     },
     KernelFix {
         cve: "CVE-2024-42318",
@@ -720,7 +728,8 @@ fn kexec_load_disabled(root: &Path) -> Check {
         Some(v) if lockdown_on => (
             Status::Warn,
             format!(
-                "{v} (lockdown refuses an unsigned image; a signed kernel still boots with                  another command line)"
+                "{v} (lockdown refuses an unsigned image; a signed kernel still boots with \
+                 another command line)"
             ),
         ),
         Some(v) => (Status::Warn, v),
@@ -916,7 +925,13 @@ mod tests {
             "{}",
             c.value
         );
+        // the review of #494, D3: 5.4 carries the ptrace fix from 5.4.189
+        assert!(c.value.contains("CVE-2022-30594 fixed"), "{}", c.value);
+        assert_eq!(c.status, Status::Ok, "{}", c.value);
+        let c = kernel(&[("proc/sys/kernel/osrelease", "5.4.188\n")]);
         assert!(c.value.contains("CVE-2022-30594 MISSING"), "{}", c.value);
+        let c = kernel(&[("proc/sys/kernel/osrelease", "4.19.238\n")]);
+        assert!(c.value.contains("CVE-2022-30594 fixed"), "{}", c.value);
         // the mainline release of each fix and every later one
         let c = kernel(&[("proc/sys/kernel/osrelease", "6.19.0-rc3\n")]);
         assert_eq!(c.status, Status::Ok, "{}", c.value);
@@ -1053,7 +1068,14 @@ mod tests {
                 (
                     "CVE-2022-30594",
                     (4, 3, 0),
-                    vec![(5, 10, 110), (5, 15, 33), (5, 16, 19), (5, 17, 2)],
+                    vec![
+                        (4, 19, 238),
+                        (5, 4, 189),
+                        (5, 10, 110),
+                        (5, 15, 33),
+                        (5, 16, 19),
+                        (5, 17, 2)
+                    ],
                     (5, 18)
                 ),
                 (
@@ -1160,8 +1182,10 @@ mod tests {
         );
         let c = kexec_load_disabled(r);
         assert_eq!(c.status, Status::Warn);
+        // the review of #494, D7: one sentence, no run of spaces
         assert!(
-            c.value.contains("a signed kernel still boots"),
+            c.value
+                .contains("a signed kernel still boots with another command line"),
             "{}",
             c.value
         );

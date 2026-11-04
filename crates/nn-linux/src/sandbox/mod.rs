@@ -142,7 +142,14 @@ pub fn enter_without_seccomp(profile: &Profile) -> Result<SandboxLevel, SandboxE
 
 /// Step 0 (lot 277): the process's only thread, or no sandbox.
 fn refuse_threaded() -> Result<(), SandboxError> {
-    match thread_count() {
+    one_thread(thread_count())
+}
+
+/// Step 0's verdict on a count: one thread enters; more, or a count that
+/// could not be made (`/proc/self/task` unreadable), refuses (the review
+/// of #494, D5: fail closed).
+fn one_thread(count: io::Result<usize>) -> Result<(), SandboxError> {
+    match count {
         Ok(1) => Ok(()),
         Ok(n) => Err(SandboxError::Threaded(n)),
         Err(e) => Err(step("/proc/self/task")(e)),

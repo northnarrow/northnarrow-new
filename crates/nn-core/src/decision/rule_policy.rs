@@ -320,6 +320,18 @@ fn valid_exe_path(p: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The review of #494, N1: the scopes the agent contains processes in
+/// (`/northnarrow.slice/blocked.scope`, `throttled.scope`): no exemption
+/// names them, by unit either.
+const AGENT_CONTAINMENT_UNITS: &[&str] = &["blocked.scope", "throttled.scope"];
+
+/// The review of #494, N1: a cgroup of the agent's containment slice,
+/// whose processes the agent moved there; no exemption by cgroup or unit
+/// covers them, whatever the policy names.
+fn in_containment(cgroup: &str) -> bool {
+    cgroup == "/northnarrow.slice" || cgroup.starts_with("/northnarrow.slice/")
+}
+
 /// `cgroup <path>`: absolute, canonical, its last component a unit, not the
 /// agent's own containment slice.
 fn valid_cgroup(p: &str) -> Result<(), String> {
@@ -418,6 +430,13 @@ pub fn parse(text: &str) -> Result<RulePolicy, PolicyError> {
                     ("unit", [u]) => {
                         if !valid_unit(u) {
                             return Err(err(format!("unit {u}: not a .service or .scope name")));
+                        }
+                        // The review of #494, N1: the agent's containment
+                        // scopes hold the processes it contained.
+                        if AGENT_CONTAINMENT_UNITS.contains(u) {
+                            return Err(err(format!(
+                                "unit {u}: the agent's containment scope holds contained processes"
+                            )));
                         }
                         Exemption::Unit(u.to_string())
                     }
@@ -605,13 +624,14 @@ pub fn exempt(
                 cgroup
                     .get_or_insert_with(|| facts.cgroup(pid))
                     .as_deref()
-                    .is_some_and(|g| g == c)
+                    .is_some_and(|g| g == c && !in_containment(g))
                     && started_here()
             }
             Exemption::Unit(u) => {
                 cgroup
                     .get_or_insert_with(|| facts.cgroup(pid))
                     .as_deref()
+                    .filter(|g| !in_containment(g))
                     .and_then(unit_of)
                     .is_some_and(|g| g == u)
                     && started_here()
@@ -708,6 +728,8 @@ mod tests {
                 "containment",
             ),
             ("exempt R020 unit sshd\n", 1, "not a .service"),
+            ("exempt R020 unit blocked.scope\n", 1, "containment scope"),
+            ("exempt R020 unit throttled.scope\n", 1, "containment scope"),
             ("exempt R020 unit a/b.service\n", 1, "not a .service"),
             ("exempt R020 bogus 1\n", 1, "exemption `bogus`"),
             ("exempt R020 uid 1000\nexempt R020 uid 1000\n", 2, "twice"),
@@ -812,6 +834,40 @@ mod tests {
             started: Some(true),
             reads: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The review of #494, N1: a process of the agent's containment slice is
+    /// never exempt by cgroup or unit — a unit name below it (a NEUTRALIZE
+    /// cgroup's `x.scope`) included; its uid exemption still holds.
+    #[test]
+    fn a_contained_process_is_never_exempt_by_cgroup_or_unit() {
+        let contained = Facts {
+            cgroup: Some("/northnarrow.slice/blocked.scope/backup.service"),
+            ..facts()
+        };
+        assert_eq!(
+            exempt(
+                &[Exemption::Unit("backup.service".into())],
+                42,
+                None,
+                &contained
+            ),
+            None
+        );
+        assert_eq!(
+            exempt(
+                &[Exemption::Cgroup(
+                    "/northnarrow.slice/blocked.scope/backup.service".into()
+                )],
+                42,
+                None,
+                &contained
+            ),
+            None
+        );
+        assert!(exempt(&[Exemption::Uid(998)], 42, None, &contained).is_some());
+        assert!(in_containment("/northnarrow.slice"));
+        assert!(!in_containment("/northnarrow.slicex/a.service"));
     }
 
     /// Lot 277: an exemption by cgroup or unit holds for a process started

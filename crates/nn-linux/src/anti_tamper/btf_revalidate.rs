@@ -3217,6 +3217,28 @@ mod tests {
             }
             Btf::parse(&b.build()).expect("tracker fixture parses")
         }
+        // the review of #494, D5: the tracker's offsets absent from a BTF
+        // that has every target leave it out, and say which
+        let specs: Vec<OffsetSpec> = REVALIDATE
+            .iter()
+            .copied()
+            .filter(|o| CGROUP_JOIN_OFFSETS.contains(&o.name))
+            .collect();
+        assert_eq!(specs.len(), CGROUP_JOIN_OFFSETS.len());
+        match resolve_with(
+            &btf_with(Drop::Nothing),
+            &specs,
+            &[],
+            HOOK_ARGS,
+            &[],
+            &|_| None,
+        ) {
+            ResolveOutcome::Resolved(r) => {
+                let why = r.cgroup_join_unavailable().expect("offsets absent");
+                assert!(why.contains("_OFFSET absent"), "{why}");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
         for (drop, why) in [
             (Drop::Nothing, None),
             (Drop::Write, Some("cgroup_procs_write_start")),

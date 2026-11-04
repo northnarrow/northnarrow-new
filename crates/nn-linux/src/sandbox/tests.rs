@@ -774,3 +774,19 @@ fn a_worker_with_a_second_thread_is_refused_before_anything_changes() {
     drop(stop);
     other.join().unwrap();
 }
+
+/// The review of #494, D5: a count that cannot be made refuses the sandbox
+/// (fail closed), as more than one thread does; one thread enters.
+#[test]
+fn an_unreadable_task_list_refuses_the_sandbox() {
+    assert!(one_thread(Ok(1)).is_ok());
+    assert!(matches!(one_thread(Ok(2)), Err(SandboxError::Threaded(2))));
+    assert!(matches!(one_thread(Ok(0)), Err(SandboxError::Threaded(0))));
+    match one_thread(Err(io::Error::from_raw_os_error(libc::EACCES))) {
+        Err(SandboxError::Step(what, why)) => {
+            assert_eq!(what, "/proc/self/task");
+            assert!(!why.is_empty());
+        }
+        other => panic!("expected a refused step, got {other:?}"),
+    }
+}

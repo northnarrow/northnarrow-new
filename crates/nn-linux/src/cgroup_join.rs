@@ -429,6 +429,31 @@ impl Marks {
     }
 }
 
+/// Lot 277 (the review of #494, D5): the mark of `tgid` in the pinned map
+/// under bpffs `root` — a privileged test's, a tool's read (the agent's own
+/// goes through [`Marks`]).
+pub fn pinned_mark(root: &Path, tgid: u32) -> Result<Option<Mark>, String> {
+    let md = MapData::from_pin(root.join(JOINED_MAP)).map_err(|e| e.to_string())?;
+    let map = Joined::try_from(aya::maps::Map::HashMap(md)).map_err(|e| e.to_string())?;
+    match map.get(&tgid, 0) {
+        Ok([_, info]) => {
+            let (how, by) = unpack(info);
+            Ok(Some(Mark { how, by }))
+        }
+        Err(aya::maps::MapError::KeyNotFound) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Lot 277 (the review of #494, D5): whether `tgid` is "not known" (its
+/// bit in the pinned bitmap under bpffs `root`).
+pub fn pinned_lost(root: &Path, tgid: u32) -> Result<bool, String> {
+    let (word, bit) = lost_slot(tgid).ok_or("no tgid that large")?;
+    let md = MapData::from_pin(root.join(LOST_MAP)).map_err(|e| e.to_string())?;
+    let map = Lost::try_from(aya::maps::Map::Array(md)).map_err(|e| e.to_string())?;
+    Ok(map.get(&word, 0).map_err(|e| e.to_string())? & bit != 0)
+}
+
 /// The thread groups among `tgids` that `proc_root` holds no more.
 fn gone(tgids: &[u32], proc_root: &Path) -> Vec<u32> {
     tgids

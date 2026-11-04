@@ -54,22 +54,41 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     ] {
         assert!(j.contains(a), "{a}");
     }
-    // marks that never evict and outlive a restart; the counters with them
+    // marks that outlive a restart, an entry allocated per mark (the agent
+    // sizes the map to the host: the review of #494, D2); the bitmap of the
+    // groups not known, preallocated; the counters with them
     assert!(j.contains(
-        "pub static CGROUP_JOINED: HashMap<u32, [u64; 2]> = HashMap::pinned(JOINED_ENTRIES, 0);"
+        "pub static CGROUP_JOINED: HashMap<u32, [u64; 2]> =\n    HashMap::pinned(JOINED_ENTRIES, BPF_F_NO_PREALLOC);"
     ));
+    assert!(j.contains("const BPF_F_NO_PREALLOC: u32 = 1;"));
+    assert!(j.contains("pub static CGROUP_JOIN_LOST: Array<u64> = Array::pinned(LOST_WORDS, 0);"));
     assert!(j.contains("pub static CGROUP_JOIN_STATS: Array<u64> = Array::pinned(STAT_SLOTS, 0);"));
     assert!(!j.contains("LruHashMap"));
-    // a mark refused is counted (every exemption by cgroup or unit is then
-    // refused by the agent)
+    // a mark refused puts the group in the bitmap (that group not known,
+    // never the host: the review of #494, D2), counted; set and cleared by
+    // an atomic add, only when the bit is not already as wanted
     in_order(
         body(&j, "mark"),
         &[
             "if CGROUP_JOINED.insert(&tgid, &rec, 0).is_err() {",
-            "count(STAT_LOST);\n        return false;",
+            "lose(tgid);\n        return false;",
         ],
     )
     .unwrap();
+    in_order(
+        body(&j, "lose"),
+        &[
+            "count(STAT_LOST);",
+            "if !has(w, bit) {\n                xadd(w, bit);",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&j, "found"),
+        &["if has(w, bit) {\n                xadd(w, bit.wrapping_neg());"],
+    )
+    .unwrap();
+    assert!(body(&j, "xadd").contains("atomic_xadd::<u64, u64, { AtomicOrdering::Relaxed }>(w, v)"));
     // the source of a self-move, cleared for every write
     in_order(
         body(&j, "try_src"),
@@ -77,7 +96,8 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
             "*slot = [0, 0];",
             "args.add(CGROUP_MOVE_RET_ARG)",
             "task >= 0u64.wrapping_sub(MAX_ERRNO)",
-            "if tgid_of(task) == Some((pid_tgid >> 32) as u32) {\n        *slot = [pid_tgid, generated::bpf_get_current_cgroup_id()];",
+            // the review of #494, B1: the writing thread itself
+            "if task == bpf_get_current_task() {\n        *slot = [bpf_get_current_pid_tgid(), generated::bpf_get_current_cgroup_id()];",
         ],
     )
     .unwrap();
@@ -91,8 +111,13 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
             "let task: u64 = ctx.arg(2);",
             "if family(writer) {\n        return;\n    }",
             "let Some(moved) = tgid_of(task) else {\n        count(STAT_LOST);",
-            "let Some(start) = leader_start(task) else {\n        count(STAT_LOST);",
-            "let unchanged = writer == moved\n        && match CGROUP_JOIN_SRC.get(0) {\n            Some(src) => src[0] == pid_tgid && src[1] == generated::bpf_get_current_cgroup_id(),\n            None => false,\n        };",
+            "let Some(start) = leader_start(task) else {\n        lose(moved);",
+            // the review of #494, B1: the shared `noop`, the moved task the
+            // writing thread itself (its behaviour: common's
+            // `a_noop_is_the_writing_thread_staying_where_it_is`, the
+            // privileged `a_threaded_move_of_the_leader_is_marked`)
+            "Some(src) => (src[0] == pid_tgid, src[1]),",
+            "let unchanged = noop(\n        task == bpf_get_current_task(),\n        src_this_write,\n        src_id,\n        generated::bpf_get_current_cgroup_id(),\n    );",
             "off!(TASK_STRUCT_REAL_PARENT_OFFSET)",
             "let pre_exec = parent_tgid == 1\n        && match (exe_file(task), exe_file(parent)) {\n            (Some(a), Some(b)) => a == b,\n            _ => false,\n        };",
             "match placement(writer, moved, parent_tgid, pre_exec, unchanged) {\n        Move::Placement | Move::NoOp => return,\n        Move::Mark => {}\n    }",
@@ -105,18 +130,18 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     .unwrap();
     // the destination's names: the whole path and each component, as
     // `common::cgroup_join::match_destination` walks them (unit-tested
-    // there); a path not ended inside the read is "any"; no counter
+    // there); a path unread or cut (a full buffer: the review of #494, D1)
+    // is "any"; no counter
     in_order(
         body(&j, "exempt_destination"),
         &[
             "CGROUP_EXEMPT_NAMES.get(&0).is_some()",
             "bpf_probe_read_kernel_str(",
-            "if n <= 0 {\n        return Some(0);\n    }",
+            "match path_read(n) {\n        PathRead::Unread | PathRead::Cut => return Some(0),\n        PathRead::Whole => {}\n    }",
             "for i in 0..PATH_READ {",
-            "if b == 0 {\n            ended = true;\n            break;\n        }",
+            "if b == 0 {\n            break;\n        }",
             "full = fnv_step(full, b);",
             "if b == b'/' {\n            if is_name(comp, NAME_UNIT) {\n                hit = comp;\n            }\n            comp = FNV_OFFSET;\n        } else {\n            comp = fnv_step(comp, b);\n        }",
-            "if !ended {\n        return Some(0);\n    }",
             "if is_name(comp, NAME_UNIT) {\n        hit = comp;\n    }",
             "if is_name(full, NAME_CGROUP) {\n        return Some(full);\n    }",
             "(hit != 0).then_some(hit)",
@@ -155,9 +180,11 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
         &[
             "let parent: u64 = ctx.arg(0);",
             "let child: u64 = ctx.arg(1);",
-            "let Some(rec) = CGROUP_JOINED.get(&ptgid) else {\n        return;\n    };",
-            "if leader_start(parent) != Some(rec[0]) {\n        return;\n    }",
+            "let marked = match CGROUP_JOINED.get(&ptgid) {\n        Some(rec) => leader_start(parent) == Some(rec[0]),\n        None => false,\n    };",
+            "let lost = is_lost(ptgid);",
+            "if !marked && !lost {\n        return;\n    }",
             "if ctgid == ptgid {\n        return;\n    }",
+            "if lost {\n        lose(ctgid);\n        return;\n    }",
             "if mark(ctgid, start, HOW_INHERITED, ptgid) {",
         ],
     )
@@ -166,8 +193,9 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     in_order(
         body(&j, "try_exit"),
         &[
+            "if !marked && !is_lost(tgid) {\n        return;\n    }",
             "off!(TASK_STRUCT_SIGNAL_OFFSET)",
-            "if rd_u32(signal + off!(SIGNAL_STRUCT_LIVE_OFFSET) as u64) == Some(0) {\n        let _ = CGROUP_JOINED.remove(&tgid);",
+            "if rd_u32(signal + off!(SIGNAL_STRUCT_LIVE_OFFSET) as u64) == Some(0) {\n        if marked {\n            let _ = CGROUP_JOINED.remove(&tgid);\n        }\n        found(tgid);",
         ],
     )
     .unwrap();
@@ -198,8 +226,9 @@ fn the_agent_asks_the_marks_where_it_decides() {
         &[
             "*started.get_or_insert_with(|| facts.started_in_cgroup(pid)) == Some(true)",
             "Exemption::Cgroup(c) => {",
-            ".is_some_and(|g| g == c)\n                    && started_here()",
+            ".is_some_and(|g| g == c && !in_containment(g))\n                    && started_here()",
             "Exemption::Unit(u) => {",
+            ".filter(|g| !in_containment(g))",
             ".is_some_and(|g| g == u)\n                    && started_here()",
         ],
     )
@@ -216,27 +245,45 @@ fn the_agent_asks_the_marks_where_it_decides() {
         ],
     )
     .unwrap();
-    // one errand: a lost mark refuses every answer, a mark is "not started
-    // here", only a missing key is "started here"
+    // one errand: the group's bit in the bitmap refuses its answer (that
+    // group's only, the review of #494, D2), a mark is "not started here",
+    // only a missing key is "started here"
+    assert!(!body(&cj, "started").contains("STAT_LOST"));
     in_order(
         body(&cj, "started"),
         &[
             "crate::caps::errands::run(move || {",
-            "if stats.lock().get(&STAT_LOST, 0).ok()? != 0 {\n                return None;\n            }",
+            "let (word, bit) = lost_slot(tgid)?;",
+            "if lost.lock().get(&word, 0).ok()? & bit != 0 {\n                return None;\n            }",
             "Ok(_) => Some(false),",
             "Err(aya::maps::MapError::KeyNotFound) => Some(true),",
             "Err(_) => None,",
         ],
     )
     .unwrap();
-    // all or none: a program that fails unloads those before it
+    // all or none: a program that fails unloads those before it; with a
+    // bpffs every link pinned (the review of #494, D6), the prior boot's
+    // removed only once the new one is attached
+    let att = body(&cj, "attach");
     in_order(
-        body(&cj, "attach"),
+        att,
         &[
             "if let Some(why) = unavailable() {",
+            "antitamper_bpf::purge_stale_pin(&link);",
             "return Tracker::Absent(why);",
-            "if let Err(e) = load_attach(ebpf, btf, name, *kind, target) {\n            for (n, k, _) in &PROGRAMS[..=i] {\n                unload(ebpf, n, *k);\n            }",
-            "return Tracker::Absent(e);",
+            "if let Err(e) = load_attach(ebpf, btf, name, *kind, target) {\n                    for (n, k, _) in &PROGRAMS[..=i] {\n                        unload(ebpf, n, *k);\n                    }",
+            "if let Err(e) = load_only(ebpf, btf, name, *kind, target) {\n                    for (n, k, _) in &PROGRAMS[..=i] {\n                        unload(ebpf, n, *k);\n                    }",
+            "if let Err(e) = pin_fresh(ebpf, root, name, *kind) {",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&cj, "pin_fresh"),
+        &[
+            "let id = p.attach()",
+            "antitamper_bpf::purge_stale_pin(&link_path);",
+            "prog.pin(&prog_path)",
+            "fd_link\n        .pin(&link_path)",
         ],
     )
     .unwrap();
@@ -244,7 +291,7 @@ fn the_agent_asks_the_marks_where_it_decides() {
     in_order(
         &at,
         &[
-            "let tracker = crate::cgroup_join::attach(ebpf, &btf);",
+            "let tracker = crate::cgroup_join::attach(ebpf, &btf, pin_root);",
             "crate::cgroup_join::Tracker::Absent(why) => report.degraded.push(format!(",
             "crate::cgroup_join::install(tracker);",
         ],
@@ -282,8 +329,9 @@ fn the_sandbox_counts_its_threads_first() {
         &["refuse_threaded()?;", "refuse_privileged()?;"],
     )
     .unwrap();
+    assert!(body(&s, "refuse_threaded").contains("one_thread(thread_count())"));
     in_order(
-        body(&s, "refuse_threaded"),
+        body(&s, "one_thread"),
         &[
             "Ok(1) => Ok(()),",
             "Ok(n) => Err(SandboxError::Threaded(n)),",
