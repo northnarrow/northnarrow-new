@@ -813,7 +813,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     process itself created in the window (`OPEN_CREATED`: `pip`'s and
     `npm`'s temporary files) nor one in a directory whose writes do not
     count (a carve-out, the destroyer's own runtime directory: the re-check
-    of #500 — a daemon's atomic replacements under `/run/systemd`). The
+    of #500 — a daemon's atomic replacements under `/run/systemd`;
+    `/run/udev/` is a carve-out now, measured: the boot's coldplug made
+    each udevd worker replace 20 device database files). The
     mass-write arm of `ConfirmedIntrusion` fires on 20 distinct existing
     files of 4 KiB or more rewritten in place (40 for a cgroup), on 20
     of any size outside an authenticated session (`MASS_OVERWRITE_SMALL`;

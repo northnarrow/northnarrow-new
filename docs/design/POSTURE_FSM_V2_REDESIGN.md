@@ -727,7 +727,16 @@ writes. In the kernel (the file-open sensor on LSM `file_open`,
 | rewrites (`MASS_OVERWRITE`) | write-opens of an existing regular file of 4 KiB or more (no `FMODE_CREATED`; the size read before `O_TRUNC` empties it) | file (`OPEN_OVERWRITE_SEEN`: tgid, device, inode) per 60-s window |
 | small rewrites (`MASS_OVERWRITE_SMALL`; the review of #500, C1) | the same, of any existing file that holds data: crosses when the distinct non-empty files rewritten reach the threshold before the files of 4 KiB or more alone do (a crossing of both is `MASS_OVERWRITE` alone) | file, per window |
 | files written new (`MASS_WRITE`) | the first write-open of the window of a file that held no data: created by the open (`FMODE_CREATED`), or empty when opened — made by `mknod(S_IFREG)`, an `O_TMPFILE` linked in with `linkat`, an `O_RDONLY \| O_CREAT` open reopened to write (the review of #500, B1: `FMODE_CREATED` alone was evaded by all three) | file (`OPEN_OVERWRITE_SEEN`, the same map: a file counts once, as what its first write-open of the window found) |
-| originals destroyed (`MASS_UNLINK`) | an unlink of a regular file that holds data (C1: it was 4 KiB or more), or held data within the window — seen non-empty at an `inode_setattr` that changes its size (`OPEN_HAD_DATA`, by inode: a `truncate` then an `unlink` is one original; the re-check of #500: a size change only, not a chmod or a `touch`) — or a rename onto the name of one (the target is destroyed); not a file the same process created within the window (`OPEN_CREATED`: its own temporary file, as `pip` and `npm` unpack), nor one in a directory whose writes do not count (the re-check of #500: a carve-out — a pseudo-filesystem, `/run/systemd`, the journal, the operator's extras — or the destroyer's own runtime directory, read from the parent's `DIR_CLASS`: a daemon's atomic replacements there) | name (`OPEN_DESTROY_SEEN`: tgid, parent dentry, the name's `hash_len`) per window |
+| originals destroyed (`MASS_UNLINK`) | an unlink of a regular file that holds data (C1: it was 4 KiB or more), or held data within the window — seen non-empty at an `inode_setattr` that changes its size (`OPEN_HAD_DATA`, by inode: a `truncate` then an `unlink` is one original; the re-check of #500: a size change only, not a chmod or a `touch`) — or a rename onto the name of one (the target is destroyed); not a file the same process created within the window (`OPEN_CREATED`: its own temporary file, as `pip` and `npm` unpack), nor one in a directory whose writes do not count (the re-check of #500: a carve-out — a pseudo-filesystem, `/run/systemd`, the journal, `/run/udev` (see below), the operator's extras — or the destroyer's own runtime directory, read from the parent's `DIR_CLASS`: a daemon's atomic replacements there) | name (`OPEN_DESTROY_SEEN`: tgid, parent dentry, the name's `hash_len`) per window |
+
+The re-check of #500 added `/run/udev/` to the carve-outs
+(`triggers::MASS_WRITE_CARVEOUT_PREFIXES`), as measured: on Ubuntu 22.04
+the boot's coldplug (`udevadm trigger --action=add` of every device) made
+each systemd-udevd worker write 20 device database files new under
+`/run/udev/data` and replace 20 old ones by a rename — the replacement
+shape, ENGAGED on `systemd-udevd.service`. It is device state, not a
+user's data; the udev rules that persist live in `/etc/udev` and
+`/lib/udev`, which the FIM and persistence rules watch.
 
 A repeat (the same file reopened, the same name destroyed again) is not
 counted; an entry the LRU maps evicted counts again (more, never fewer). The
