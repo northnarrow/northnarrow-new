@@ -321,7 +321,7 @@ fn the_agent_asks_the_marks_where_it_decides() {
             // the re-review of #494, R2: the tracker's own directory, a
             // refused one is no tracker
             "(Some(_), Some(Err(why))) => {",
-            "return (Tracker::Absent(format!(\"the tracker's pin directory: {why}\")), None);",
+            "Tracker::Absent(format!(\"the tracker's pin directory: {why}\")),",
             "if let Err(e) = load_only(ebpf, btf, name, *kind, target) {\n                    for (n, k, _) in &PROGRAMS[..=i] {\n                        unload(ebpf, n, *k);\n                    }",
             "if let Err(e) = pin_fresh(ebpf, dir, name, *kind) {",
             // the old layout's directory goes after the new programs run,
