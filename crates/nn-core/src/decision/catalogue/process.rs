@@ -253,10 +253,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    package installed or DKMS built, unchanged since (`max(mtime, ctime)` \
                    against the package database's last change), signed when the kernel \
                    enforces signatures — or an invocation that inserts nothing (`-r`, `-n`, \
-                   `-D`, `-c`, `kmod list`, `kmod static-nodes`) — is recorded. `insmod` of a \
-                   file, `modprobe` of a path, `-C`/`-d`/`-S`/`--force`, a name nothing \
-                   resolves, a module file no package installed or changed since, an argv not \
-                   read whole: killed. A copy run from a staging directory is killed with its \
+                   `-D`, `-c`, `kmod list`, `kmod static-nodes`, built-in modules, plain names \
+                   of no module of this kernel: \"nothing to load\") — is recorded. `insmod` of \
+                   a file, `modprobe` of a path, `-C`/`-d`/`-S`/`--force`, a module file no \
+                   package installed or changed since, an argv not read whole: killed. A copy run from a staging directory is killed with its \
                    tree, the tool elsewhere alone.",
         false_positives: "Kernel-driven loads (a kworker's modprobe at boot or hot-plug) are \
                           exempt. The container runtimes' and iptables' `modprobe` of the \

@@ -10,10 +10,11 @@
 //! | The exec | R011 |
 //! |---|---|
 //! | the system's tool (a file of `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`) asked for module NAMES, each resolved as kmod does to files of `/lib/modules/$(uname -r)/` that a package installed, DKMS built, or (no package database) the running kernel's `modules.order` lists — none changed since the package database's last change (DKMS: since its registry's; the kernel's tree: since the boot), each uncompressed one signed while the kernel enforces signatures | record |
-//! | a query that inserts nothing: `-r`, `-n`, `-D`, `-c`, `-R`, `--show-*`, `-V`, `-h`; `kmod list` / `static-nodes`; kmod run as `lsmod`, `rmmod`, `modinfo`, `depmod`; a usage error | record |
+//! | a query that inserts nothing: `-r`, `-n`, `-D`, `-c`, `-R`, `--show-*`, `-V`, `-h`; `kmod list` / `static-nodes`; kmod run as `lsmod`, `rmmod`, `modinfo`, `depmod`; a usage error; built-in modules only | record |
+//! | the system's tool, a complete argv, no option that moves the tree or forces the load, plain module names of which some or all resolve to nothing in the tree or among the built-ins (kmod: "not found") — the rest vouched for | record ("nothing to load: the name resolves to no module of this kernel") |
 //! | `insmod` of any file; `modprobe` of a path or a `.ko*` name | kill |
 //! | `-C`, `-d`, `-S` (the caller's configuration, tree root or kernel version), `-f` / `--force-*` | kill |
-//! | a name no index of the running kernel's tree resolves; a file outside it, a link (or behind a directory linked out of it), unowned, changed after its owner's last change, unsigned under enforcement | kill |
+//! | an unreadable tree; a name kmod refuses, or an alias naming a module the tree does not hold; a file outside the tree, a link (or behind a directory linked out of it), unowned, changed after its owner's last change, unsigned under enforcement | kill |
 //! | a copy of the tool elsewhere, another program named like it, a program of a filesystem the host's mount table does not show, an argv the kernel did not read whole, an option the tool would refuse | kill |
 //!
 //! **Resolution** follows libkmod's lookup order (`kmod_module_new_from_lookup`):
@@ -58,7 +59,23 @@
 //! (after `depmod`): resolved, but no package lists the file and DKMS did
 //! not build it — killed, as before (and its load, if it lands first, is
 //! R018's kill of an unowned module by an unexpected loader). Without
-//! `depmod` the name resolves to nothing: killed.
+//! `depmod` the name resolves to nothing: kmod loads nothing ("not
+//! found") — recorded, as below.
+//!
+//! **A plain name that resolves to nothing** (the coordinator's decision of
+//! 04/11, after 24.04's lab: k3s and kube-proxy probe modules a given
+//! kernel lacks — `nft-expr-counter` on Ubuntu's 6.8, where kmod itself
+//! answers "Module nft-expr-counter not found"): when the invocation has
+//! nothing else to judge — the system's tool, its argv read whole, no path,
+//! no `-C`/`-d`/`-S`/`--force`, a filesystem the host shows, the tree read
+//! — the name loads nothing and is recorded, "nothing to load: the name
+//! resolves to no module of this kernel". Killing it bought only a High
+//! alert on a probe that fails anyway. If a load came about all the same —
+//! `modprobe.d` or `depmod` raced between the exec and the tool's lookup,
+//! an index this does not read — it is R018's, judged on the file the
+//! kernel reads (`kernel_read_file`): a file outside the module tree or
+//! one no package installed is killed there. Anything suspicious beside the
+//! name keeps the kill.
 //!
 //! **Where it runs.** The exec pump asks ([`ModuleRequests::refresh`]: the
 //! module tree's indexes, the configuration, a few `stat`s and the package
@@ -115,6 +132,11 @@ static REQUESTS: LazyLock<Mutex<HashMap<ExecKey, Assessment>>> = LazyLock::new(D
 type ExecKey = (PathBuf, u32, u64);
 /// The execs [`REQUESTS`] keeps answers for at most.
 pub const REQUEST_KEYS: usize = 1024;
+
+/// Why a plain module name that resolves to nothing is recorded, not
+/// killed (the coordinator's decision of 04/11, after 24.04's lab: k3s's
+/// probe of `nft-expr-counter`, which kmod itself answers "not found").
+pub const NOTHING_TO_LOAD: &str = "nothing to load: the name resolves to no module of this kernel";
 
 /// The appended-signature marker of a module image (`MODULE_SIG_STRING`).
 const SIG_MARKER: &[u8] = b"~Module signature appended~\n";
@@ -259,11 +281,12 @@ impl<H: DecisionHost> ModuleRequests<H> {
             Invocation::LoadsNothing(what) => Assessment::LoadsNothing(what),
             Invocation::Refused(why) => Assessment::NotVouched(why),
             Invocation::Modules(names) => match self.judge(&names, fresh) {
-                // every name built into the running kernel: modprobe
-                // inserts nothing (kmod: success, no load)
-                Ok((what, true)) => Assessment::LoadsNothing(format!(
-                    "modprobe of built-in modules, nothing to insert: {what}"
-                )),
+                // every name built into the running kernel or of no module
+                // of it: modprobe inserts nothing (kmod: success, or "not
+                // found")
+                Ok((what, true)) => {
+                    Assessment::LoadsNothing(format!("modprobe inserts nothing: {what}"))
+                }
                 Ok((what, false)) => Assessment::Vouched(what),
                 Err(why) => Assessment::NotVouched(why),
             },
@@ -278,10 +301,14 @@ impl<H: DecisionHost> ModuleRequests<H> {
         let config = Config::read(&self.root);
         let mut parts = Vec::new();
         let mut judged = HashSet::new();
-        let mut all_builtin = true;
+        let mut inserts_nothing = true;
         for name in names {
             let targets = resolve_all(tree, &config, name)?;
-            all_builtin &= targets.iter().all(|t| matches!(t, Target::Builtin(_)));
+            if targets.is_empty() {
+                parts.push(format!("{name} → {NOTHING_TO_LOAD}"));
+                continue;
+            }
+            inserts_nothing &= targets.iter().all(|t| matches!(t, Target::Builtin(_)));
             let mut what = Vec::new();
             for t in &targets {
                 match t {
@@ -327,7 +354,7 @@ impl<H: DecisionHost> ModuleRequests<H> {
                 parts.join(" | "),
                 facts.release
             ),
-            all_builtin,
+            inserts_nothing,
         ))
     }
 
@@ -692,7 +719,11 @@ fn resolve_all(tree: &ModuleTree, config: &Config, name: &str) -> Result<Vec<Tar
     Ok(out)
 }
 
-/// What libkmod's lookup finds for `name` (`kmod_module_new_from_lookup`).
+/// What libkmod's lookup finds for `name` (`kmod_module_new_from_lookup`):
+/// no target when nothing of the tree or the built-ins is named or aliased
+/// so (kmod: "Module … not found", nothing loaded); `Err` for what is not
+/// a plain miss — a name kmod refuses, an alias naming a module the tree
+/// does not hold.
 fn resolve(tree: &ModuleTree, config: &Config, name: &str) -> Result<Vec<Target>, String> {
     let n = normalize(name).ok_or_else(|| format!("'{name}' is no valid module name"))?;
     let by_name = |m: &str| -> Option<Target> {
@@ -750,7 +781,8 @@ fn resolve(tree: &ModuleTree, config: &Config, name: &str) -> Result<Vec<Target>
     if !builtin.is_empty() {
         return Ok(builtin);
     }
-    Err("no module of the running kernel's tree is named or aliased so".to_string())
+    // kmod: "Module … not found" — nothing to load (no target)
+    Ok(Vec::new())
 }
 
 /// `alias <pattern> <module>` lines, normalised.
@@ -1210,13 +1242,15 @@ mod tests {
 
     /// The decision for "a module copied into /lib/modules then modprobed":
     /// resolved after depmod, but no package lists it — not vouched for;
-    /// without depmod nothing resolves it — not vouched for.
+    /// without depmod the name resolves to nothing — kmod loads nothing
+    /// ("not found"): recorded (the decision of 04/11), the file's load
+    /// being R018's if one came about anyway.
     #[test]
     fn a_module_copied_into_the_tree_then_modprobed_is_not_vouched_for() {
         let t = netfilter_host();
         let a = assess(&t, &modprobe(&["rk"]));
         assert!(
-            not_vouched(&a).contains("no module of the running kernel's tree"),
+            matches!(&a, Assessment::LoadsNothing(w) if w.contains(NOTHING_TO_LOAD)),
             "{a:?}"
         );
         t.module("kernel/drivers/misc/rk.ko", &[], true);
@@ -1371,19 +1405,15 @@ mod tests {
                 "{name}: {a:?}"
             );
         }
-        // the alias keys only: another key's value is no alias
-        for other in ["GPL", "license=GPL"] {
+        // the alias keys only: another key's value is no alias — a name of
+        // no module, nothing to load
+        for other in ["GPL", "license=GPL", "nft-expr-nothing"] {
             let a = assess(&t, &modprobe(&[other]));
             assert!(
-                not_vouched(&a).contains("no module of the running kernel's tree"),
+                matches!(&a, Assessment::LoadsNothing(w) if w.contains(NOTHING_TO_LOAD)),
                 "{other}: {a:?}"
             );
         }
-        let a = assess(&t, &modprobe(&["nft-expr-nothing"]));
-        assert!(
-            not_vouched(&a).contains("no module of the running kernel's tree"),
-            "{a:?}"
-        );
         // a built-in by alias beside a module file: the file judged
         assert!(matches!(
             assess(&t, &modprobe(&["-a", "nft-expr-counter", "nft_compat"])),
@@ -1400,6 +1430,64 @@ mod tests {
             matches!(&a, Assessment::Vouched(w) if w.contains("nft_compat")),
             "{a:?}"
         );
+    }
+
+    /// The decision of 04/11 (24.04's lab: k3s's `modprobe
+    /// nft-expr-counter`, which kmod answers "not found"): a plain name that
+    /// neither the tree nor the built-ins resolve loads nothing — recorded.
+    /// The same name with anything suspicious beside it is killed as
+    /// before: an option that moves the tree, a file, an argv cut, a copy
+    /// of the tool, an unreadable tree; and a name that is not a plain miss
+    /// (one kmod refuses, an alias naming a module the tree does not hold).
+    #[test]
+    fn a_plain_name_of_no_module_loads_nothing_anything_suspicious_is_killed() {
+        let t = netfilter_host();
+        let a = assess(&t, &modprobe(&["nft-expr-counter"]));
+        assert!(
+            matches!(&a, Assessment::LoadsNothing(w) if w.contains(NOTHING_TO_LOAD) && w.contains("nft-expr-counter")),
+            "{a:?}"
+        );
+        for e in [
+            modprobe(&["-d", "/tmp/root", "nft-expr-counter"]),
+            modprobe(&["-C", "/tmp/m.conf", "nft-expr-counter"]),
+            modprobe(&["-S", "9.9.9", "nft-expr-counter"]),
+            modprobe(&["--force", "nft-expr-counter"]),
+            modprobe(&["/tmp/nft-expr-counter"]),
+            exec(
+                "/tmp/modprobe",
+                "/tmp/modprobe",
+                &["modprobe", "nft-expr-counter"],
+            ),
+            exec(
+                "/usr/sbin/insmod",
+                "/usr/bin/kmod",
+                &["insmod", "nft-expr-counter"],
+            ),
+            modprobe(&["no[such"]),
+        ] {
+            assert!(!assess(&t, &e).records(), "{e:?}");
+        }
+        let mut cut = modprobe(&["nft-expr-counter"]);
+        if let Event::ProcessSpawn { argv_truncated, .. } = &mut cut {
+            *argv_truncated = true;
+        }
+        assert!(!assess(&t, &cut).records());
+        let mut foreign = modprobe(&["nft-expr-counter"]);
+        if let Event::ProcessSpawn { exe, .. } = &mut foreign {
+            exe.root = (0x801, 2);
+        }
+        assert!(!assess(&t, &foreign).records());
+        // an alias of the configuration naming a module the tree lacks
+        t.write(
+            "etc/modprobe.d/x.conf",
+            "alias nft-expr-counter missing_mod\n",
+        );
+        let a = assess(&t, &modprobe(&["nft-expr-counter"]));
+        assert!(not_vouched(&a).contains("does not hold"), "{a:?}");
+        // no tree to resolve against: killed (the name is not known to miss)
+        let none = HostTree::new();
+        std::fs::remove_file(none.path(&format!("lib/modules/{RELEASE}/modules.dep"))).unwrap();
+        assert!(!assess(&none, &modprobe(&["nft-expr-counter"])).records());
     }
 
     #[test]
@@ -1423,8 +1511,16 @@ mod tests {
     fn every_name_of_an_all_must_be_vouched_for() {
         let t = netfilter_host();
         assert!(assess(&t, &modprobe(&["-va", "nf_tables", "nfnetlink"])).records());
+        t.module("kernel/drivers/misc/rk.ko", &[], true);
         let a = assess(&t, &modprobe(&["-va", "nf_tables", "rk"]));
         assert!(not_vouched(&a).contains("modprobe rk"), "{a:?}");
+        // a name of no module beside a vouched one: the one vouched, the
+        // other nothing to load
+        let a = assess(&t, &modprobe(&["-va", "nf_tables", "no_such_mod"]));
+        assert!(
+            matches!(&a, Assessment::Vouched(w) if w.contains("nf_tables.ko") && w.contains(NOTHING_TO_LOAD)),
+            "{a:?}"
+        );
         // without -a the second operand is a parameter
         assert!(assess(&t, &modprobe(&["nf_tables", "rk"])).records());
     }

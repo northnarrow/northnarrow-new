@@ -22,13 +22,15 @@
 #   B6 zfs              zfsutils-linux installed (zfs-load-module: modprobe zfs)
 #   B7 admin            `sudo modprobe dummy`, `sudo modprobe -r dummy`
 #   B8 queries          modprobe -n / -D / -c / -R, kmod list, kmod static-nodes
+#   B9 no such module   modprobe of a plain name no module of this kernel has (as k3s
+#                       and kube-proxy probe): nothing to load, recorded (04/11)
 # Malicious (R011 kills each; no file exists to load, so nothing reaches the
 # kernel — the shapes that load are the privileged tests'
 # `r011_records_a_packaged_modprobe_and_kills_an_insmod_from_tmp` and
 # `r011_kills_a_module_copied_into_the_tree_and_r018_catches_what_argv_hides`,
 # under a detect-only agent):
 #   M1 insmod of a /tmp .ko          M2 modprobe of a /tmp .ko path
-#   M3 modprobe of a name no tree resolves
+#   M3 modprobe -S <a version of the caller's> of a name no tree resolves
 #   M4 modprobe -d <a /tmp tree>      M5 modprobe -C <a /tmp configuration>
 #   M6 a copy of the system's modprobe run from /tmp (a dry run)
 #
@@ -48,7 +50,7 @@ while [[ $# -gt 0 ]]; do
         --only) ONLY=${2:-}; shift 2 ;;
         --out) OUT=${2:-}; shift 2 ;;
         --with-podman|--with-docker|--with-k3s|--with-zfs|--with-wg) WITH+="${1#--with-} "; shift ;;
-        -h|--help) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "kmod-check: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -262,11 +264,16 @@ if want B8; then
         sudo kmod static-nodes --format=tmpfiles --output=/dev/null'
 fi
 
+if want B9; then
+    measure B9 benign "modprobe nn_k279_no_such_module (no such module)" -- \
+        bash -c 'sudo modprobe nn_k279_no_such_module; [ $? -eq 1 ]'
+fi
+
 # The malicious shapes: nothing exists to load.
 M=$WORK/missing
 if want M1; then measure M1 kill "insmod /tmp/…/rk.ko" -- sudo insmod "$M/rk.ko"; fi
 if want M2; then measure M2 kill "modprobe /tmp/…/rk.ko" -- sudo modprobe "$M/rk.ko"; fi
-if want M3; then measure M3 kill "modprobe nn_k279_no_such_module" -- sudo modprobe nn_k279_no_such_module; fi
+if want M3; then measure M3 kill "modprobe -S 9.9.9 nn_k279_no_such_module" -- sudo modprobe -S 9.9.9 nn_k279_no_such_module; fi
 if want M4; then measure M4 kill "modprobe -d /tmp/… dummy" -- sudo modprobe -d "$M/root" dummy; fi
 if want M5; then measure M5 kill "modprobe -C /tmp/….conf dummy" -- sudo modprobe -C "$M/m.conf" dummy; fi
 if want M6; then

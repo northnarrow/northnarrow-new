@@ -96,8 +96,10 @@ enforces signatures — or that inserts no module, is a High record
 (T1547.006), not killed, in every posture. Everything else R011 matched is
 killed as before, in every posture: `insmod` of a file, `modprobe` of a path,
 a tree, configuration or kernel version of the caller's (`-d`, `-C`, `-S`),
-a forced load, a name nothing resolves, a module file no package installed
-or changed since. Why: the container runtimes, iptables and kube-proxy run
+a forced load, a module file no package installed or changed since. A plain
+name that resolves to no module of the running kernel (kmod: "not found")
+loads nothing and is recorded ("nothing to load"); with a path, an option or
+a cut argv beside it, killed. Why: the container runtimes, iptables and kube-proxy run
 `modprobe` of the distribution's netfilter, bridge and overlay modules (lot
 275's lab: rootful podman's network killed on Ubuntu 22.04). What is left:
 a load the exec does not show (the environment's `MODPROBE_OPTIONS`, the

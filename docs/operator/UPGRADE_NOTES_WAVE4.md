@@ -151,7 +151,9 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
   unchanged since the package database's last change, is recorded (High,
   T1547.006, `response: none`), its reasoning naming each module, its file
   and who installed it; a query that inserts nothing (`modprobe -r`, `-n`,
-  `kmod static-nodes`) too. Everything else is killed as before, the
+  `kmod static-nodes`), a built-in module and a plain name of no module of
+  the running kernel ("nothing to load", the probes of k3s and kube-proxy)
+  too. Everything else is killed as before, the
   reasoning saying why ("not vouched for: …"). On a host whose module files
   changed after its last package transaction (an SELinux relabel, a restore
   from a backup: their ctime is new) every `modprobe` is still killed until

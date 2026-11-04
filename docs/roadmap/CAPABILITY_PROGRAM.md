@@ -5455,12 +5455,20 @@ number in parentheses is a lab PR.
     indexes). `OBSERVING_KILLS` unchanged: R011's match narrowed, no kill
     added. The NET-006 test waits for as many records as listeners it
     opened, then asserts exactly that many. No capability level moves.
-  - Decision (04/11/2026, the brief of lot 279): a module copied into
-    `/lib/modules/$(uname -r)/` and `modprobe`d, with or without `depmod`,
-    is killed (no package installed it; without `depmod` nothing resolves
-    it), and its load, if it lands first, is R018's kill of an unowned
-    module by an unexpected loader. No directive restores the kill of a
-    vouched-for load (`RULE_POLICY.md` §1).
+  - Decisions (04/11/2026): a module copied into
+    `/lib/modules/$(uname -r)/` and `modprobe`d after `depmod` is killed (no
+    package installed it), and its load, if it lands first, is R018's kill
+    of an unowned module by an unexpected loader (the brief). A plain name
+    that resolves to no module of the running kernel, in the tree or among
+    the built-ins (kmod: "not found") — with nothing suspicious beside it:
+    the system's tool, the argv whole, no path, no `-C`/`-d`/`-S`/`--force`,
+    a filesystem the host shows — is recorded, "nothing to load: the name
+    resolves to no module of this kernel"; a load that came about anyway
+    (a race on `modprobe.d` or `depmod`) is R018's on the file the kernel
+    reads (the coordinator, after 24.04's lab: k3s's `nft-expr-counter`).
+    So a copied module `modprobe`d without `depmod` is recorded: kmod finds
+    nothing to load. No directive restores the kill of a vouched-for load
+    (`RULE_POLICY.md` §1).
   - Lab (as measured; our own guests, lease `k279`; Ubuntu 22.04 5.15.0-202
     and 24.04 6.8.0-147; on each, `main` 80c8da36 then the lot on the same
     guest after a power cycle; `deploy/lab/malsim/kmod-check.sh` with
@@ -5537,7 +5545,4 @@ number in parentheses is a lab PR.
     ctimes are newer than its last package transaction (an SELinux relabel,
     a restore) keeps the kill until its next transaction; on an RPM host an
     out-of-tree module is killed until its first load was seen; the binary
-    indexes and `MODPROBE_OPTIONS` are not read (R018's); a name nothing
-    resolves, in the tree or among the built-ins, is killed though kmod
-    would load nothing for it (fail-closed, the coordinator's decision of
-    04/11).
+    indexes and `MODPROBE_OPTIONS` are not read (R018's).

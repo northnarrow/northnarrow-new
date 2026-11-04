@@ -42,13 +42,14 @@
 //! them, to files of the running kernel's tree that a package installed
 //! (DKMS built, or the kernel's `modules.order` lists on a host without a
 //! package database), unchanged since, signed when the kernel enforces
-//! signatures — or an invocation that inserts nothing — is RECORDED, High,
-//! T1547.006, no kill: rootful podman's `modprobe` of its netfilter
-//! modules was killed (lot 275's lab). Anything else is killed as before:
-//! `insmod` of a file, `modprobe` of a path, a tree, configuration or
-//! version of the caller's, a name nothing resolves, a module file no
-//! package installed or changed since, a copy of the tool, an argv not
-//! read whole. The load itself stays R018's, on the file the kernel reads.
+//! signatures — or an invocation that inserts nothing (a query, built-in
+//! modules, plain names of no module of this kernel: "nothing to load") —
+//! is RECORDED, High, T1547.006, no kill: rootful podman's `modprobe` of
+//! its netfilter modules was killed (lot 275's lab). Anything else is
+//! killed as before: `insmod` of a file, `modprobe` of a path, a tree,
+//! configuration or version of the caller's, a module file no package
+//! installed or changed since, a copy of the tool, an argv not read whole.
+//! The load itself stays R018's, on the file the kernel reads.
 
 use std::sync::Arc;
 
@@ -397,11 +398,13 @@ mod tests {
     }
 
     /// Lot 279: `modprobe nft-expr-counter` (k3s's probe) on a kernel whose
-    /// nf_tables is built in is a built-in's alias — recorded; a name
-    /// nothing resolves is killed (as on Ubuntu's 6.8.0-147, where no index
-    /// holds that alias).
+    /// nf_tables is built in is a built-in's alias — recorded. On a kernel
+    /// where no index holds it (Ubuntu's 6.8.0-147) kmod answers "not
+    /// found": a plain name of no module loads nothing — recorded too, the
+    /// record saying so (the decision of 04/11); with `-d` beside it,
+    /// killed.
     #[test]
-    fn a_built_in_module_s_alias_is_recorded_an_unknown_name_killed() {
+    fn a_built_in_s_alias_or_a_plain_name_of_no_module_is_recorded() {
         let t = distro_host();
         t.index(
             "modules.builtin",
@@ -412,22 +415,25 @@ mod tests {
             "nf_tables_core.alias=nft-expr-counter\0",
         );
         let r = rule_on(&t);
-        let v = r
-            .evaluate(&exec(
-                "/usr/sbin/modprobe",
-                "/usr/bin/kmod",
-                &["modprobe", "nft-expr-counter"],
-            ))
-            .expect("recorded");
+        let probe = |args: &[&str]| {
+            let mut argv = vec!["modprobe"];
+            argv.extend_from_slice(args);
+            r.evaluate(&exec("/usr/sbin/modprobe", "/usr/bin/kmod", &argv))
+                .expect("a verdict")
+        };
+        let v = probe(&["nft-expr-counter"]);
         assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
         assert!(v.reasoning.contains("inserts no module"), "{}", v.reasoning);
-        let v = r
-            .evaluate(&exec(
-                "/usr/sbin/modprobe",
-                "/usr/bin/kmod",
-                &["modprobe", "nft-expr-nothing"],
-            ))
-            .expect("fires");
+        let v = probe(&["nft-expr-nothing"]);
+        assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
+        assert_eq!(v.severity, Severity::High);
+        assert!(
+            v.reasoning
+                .contains("nothing to load: the name resolves to no module of this kernel"),
+            "{}",
+            v.reasoning
+        );
+        let v = probe(&["-d", "/tmp/root", "nft-expr-nothing"]);
         assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
     }
 
@@ -449,8 +455,8 @@ mod tests {
             (modprobe(&["/tmp/rk.ko"]), "the file"),
             (modprobe(&["rk"]), "no package installed it"),
             (
-                modprobe(&["not_a_module"]),
-                "no module of the running kernel's tree",
+                modprobe(&["-S", "9.9.9", "not_a_module"]),
+                "from the caller",
             ),
             (modprobe(&["-d", "/tmp/root", "dummy"]), "from the caller"),
             (modprobe(&["-C", "/tmp/m.conf", "dummy"]), "from the caller"),
