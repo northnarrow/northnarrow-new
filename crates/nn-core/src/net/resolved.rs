@@ -4,18 +4,28 @@
 //! Merged design of `research/ideas-2026-10-30/ideas-verdict.md`, item 1:
 //! the binding is per lineage, the host-wide table its complement.
 //!
-//! - **Names** (host-wide): every DNS response the response sensor reads
-//!   gives its question's name, its CNAME chain and its addresses, each
-//!   held for its TTL, at least [`NAME_FLOOR_SECS`] (the 300 s Palo Alto
-//!   uses for its "direct to IP" detection) and at most [`NAME_CAP_SECS`].
-//!   A response with no address (NXDOMAIN, an empty answer) is remembered
-//!   as answered.
+//! - **The question's chain only** (review of #495, D4): of a response's
+//!   records, those whose owner is the question's name or a target of the
+//!   chain's CNAMEs (bailiwick); any other record is ignored, counted
+//!   ([`Counters::out_of_chain`]).
+//! - **Names** (host-wide): a response a system resolver received
+//!   ([`is_system_resolver`]: its executable, of a fixed list in the
+//!   system tree, and a system uid — never a process name) gives its
+//!   question's name, its CNAME chain and its addresses, each held for its
+//!   TTL, at least [`NAME_FLOOR_SECS`] (the 300 s Palo Alto uses for its
+//!   "direct to IP" detection) and at most [`NAME_CAP_SECS`]. A response
+//!   with no address (NXDOMAIN, an empty answer) is remembered as
+//!   answered; an incomplete one (D1: cut by the sensor, the server's TC
+//!   bit, a malformed record) is not — its question stays asked and not
+//!   answered, its records bind. A response any other process received
+//!   (a datagram from port 53 to it) binds that process only.
 //! - **Bindings** (per process): `(pid, address)` — the process received a
 //!   response naming the address ([`ResolvedTable::on_answer`]: the stub
 //!   resolver's answer reaches the application), or asked for a name whose
-//!   response named it ([`ResolvedTable::on_query`] and the askers of
-//!   [`ResolvedTable::on_answer`]: a query through systemd-resolved's NSS
-//!   module, whose upstream answer the resolver receives). A binding lasts
+//!   response a system resolver received ([`ResolvedTable::on_query`] and
+//!   the askers of [`ResolvedTable::on_answer`]: a query through
+//!   systemd-resolved's NSS module, whose upstream answer the resolver
+//!   receives). A binding lasts
 //!   for the name's TTL (the floor at least) and then for
 //!   [`BIND_IDLE_SECS`] past each use, so a daemon that resolved its peers
 //!   once (an NTP client, a database client) keeps them while it uses them.
@@ -25,12 +35,16 @@
 //!
 //! [`ResolvedTable::check`] answers for a connect: a binding of the process
 //! or of an ancestor ([`DnsResolution::Lineage`]); else a name the lineage
-//! asked for recently whose response was never seen, or DNS records of the
-//! lineage held back by the kernel's budgets ([`DnsResolution::Unknown`]);
-//! else an address another process resolved ([`DnsResolution::OtherLineage`]);
-//! else [`DnsResolution::Unresolved`]. A binding counts for a process only
-//! when it was made after the process started (a pid outlives its process,
-//! external audit NET-016).
+//! asked for recently whose response was never seen whole, DNS records of
+//! the lineage held back by the kernel's budgets, a host-wide degradation
+//! ([`ResolvedTable::note_undecoded`]: an undecoded record, a user's held
+//! records, a ring's or a budget's loss), or a binding of a process whose
+//! start is not known ([`DnsResolution::Unknown`]); else an address a
+//! system resolver resolved for another lineage
+//! ([`DnsResolution::OtherLineage`]); else [`DnsResolution::Unresolved`]. A
+//! binding counts for a process only when it was made after the process
+//! started (a pid outlives its process, external audit NET-016), and only
+//! when that start is known (review of #495, N2).
 //!
 //! Every map is bounded ([`MAX_NAMES`], [`MAX_ADDRS`], [`MAX_BINDINGS`],
 //! [`MAX_ASKS`]); past a bound the oldest goes, counted
@@ -92,6 +106,35 @@ pub struct Answer<'a> {
     pub ts_ns: u64,
     pub qname: &'a str,
     pub records: &'a [Record],
+    /// Every record of the response read (review of #495, D1): not cut by
+    /// the sensor, no TC bit, no malformed record.
+    pub complete: bool,
+    /// A system resolver received it ([`is_system_resolver`], D4): its
+    /// names go host-wide and bind the processes that asked for them.
+    pub resolver: bool,
+}
+
+/// The system resolvers' executables (review of #495, D4): a response one of
+/// them receives counts host-wide.
+pub const SYSTEM_RESOLVER_EXES: &[&str] = &[
+    "/usr/lib/systemd/systemd-resolved",
+    "/lib/systemd/systemd-resolved",
+    "/usr/sbin/dnsmasq",
+    "/usr/bin/dnsmasq",
+    "/usr/sbin/nscd",
+    "/usr/sbin/unbound",
+];
+
+/// The highest uid of a system account: a resolver runs as one.
+pub const SYSTEM_UID_MAX: u32 = 999;
+
+/// The receiver of a response is a system resolver: its executable (the
+/// image the kernel executed, as the spawn cache knows it) is one of
+/// [`SYSTEM_RESOLVER_EXES`], and it runs as a system uid — so a user's copy
+/// of the program (in a namespace of its own, under another path) is not.
+/// Never by process name.
+pub fn is_system_resolver(exe: Option<&str>, uid: u32) -> bool {
+    uid <= SYSTEM_UID_MAX && exe.is_some_and(|e| SYSTEM_RESOLVER_EXES.contains(&e))
 }
 
 /// What the table did, for `nn-admin` and the tests.
@@ -99,6 +142,8 @@ pub struct Answer<'a> {
 pub struct Counters {
     pub answers: u64,
     pub bindings: u64,
+    /// Records outside the question's chain, ignored (D4).
+    pub out_of_chain: u64,
     /// Addresses a name spelled, not bound ("IP in the name").
     pub ip_in_name: u64,
     pub evicted: u64,
@@ -113,6 +158,15 @@ struct NameEntry {
     cnames: HashMap<String, u64>,
     /// When the name stops counting as answered.
     answered_until: u64,
+}
+
+/// What a member's binding of an address says ([`ResolvedTable::check`]).
+enum Bind {
+    /// Made after the process started, still held: used.
+    Used,
+    /// It exists, but the process's start is not known (N2).
+    StartUnknown,
+    None,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,8 +185,10 @@ struct Inner {
     binding_order: LazyLru<(u32, IpAddr)>,
     /// `(name, pid, ts)`, oldest first: the askers a response binds.
     askers: VecDeque<(String, u32, u64)>,
-    /// pid → its recent names `(name, ts)`, for the unseen-response test.
-    asks: HashMap<u32, VecDeque<(String, u64)>>,
+    /// pid → its recent names `(name, ts, answered)`, for the
+    /// unseen-response test: `answered` when a whole response the process
+    /// received itself answered it (a resolver's answers a name host-wide).
+    asks: HashMap<u32, VecDeque<(String, u64, bool)>>,
     asking_order: LazyLru<u32>,
     /// pid → the last time the kernel held one of its DNS records back.
     held: HashMap<u32, u64>,
@@ -243,74 +299,110 @@ impl<I: Default> ResolvedTable<I> {
         self.inner.lock().counters
     }
 
-    /// A response `a.pid` received: its names and addresses held
-    /// host-wide, its addresses bound to the receiver and to the processes
-    /// that asked for one of its names in the last [`ASK_WINDOW_SECS`].
+    /// A response `a.pid` received. Of its records, those of the question's
+    /// chain (D4). A system resolver's ([`Answer::resolver`]): its names and
+    /// addresses held host-wide, its addresses bound to the receiver and to
+    /// the processes that asked for one of the chain's names in the last
+    /// [`ASK_WINDOW_SECS`]. Any other process's: its addresses bound to it
+    /// only. A whole response answers its question (host-wide for a
+    /// resolver's, for the receiver's own asks otherwise); an incomplete one
+    /// (D1) does not: the question stays asked and unanswered, for the
+    /// receiver too, so a connect its records do not cover is unknown.
     pub fn on_answer(&self, a: &Answer<'_>) {
         let mut g = self.inner.lock();
         g.counters.answers += 1;
         let qname = key(a.qname);
-        // the chain's names, the question's first
+        // the chain's names, the question's first, through its CNAMEs in
+        // any order of the records
         let mut chain: Vec<String> = vec![qname.clone()];
+        let mut kept = vec![false; a.records.len()];
+        loop {
+            let mut grew = false;
+            for (i, r) in a.records.iter().enumerate() {
+                if kept[i] {
+                    continue;
+                }
+                match r {
+                    Record::Addr { name, .. } if chain.contains(&key(name)) => {
+                        kept[i] = true;
+                    }
+                    Record::Cname { name, target, .. } if chain.contains(&key(name)) => {
+                        kept[i] = true;
+                        let t = key(target);
+                        if !chain.contains(&t) && chain.len() <= MAX_CHAIN {
+                            chain.push(t);
+                            grew = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        g.counters.out_of_chain += kept.iter().filter(|k| !**k).count() as u64;
         let mut addrs: Vec<(IpAddr, u64)> = Vec::new();
-        for r in a.records {
+        for (r, _) in a.records.iter().zip(&kept).filter(|(_, k)| **k) {
             match r {
                 Record::Addr { name, ttl, addr } => {
                     let until = a.ts_ns.saturating_add(hold_ns(*ttl));
-                    let n = key(name);
-                    let e = g.names.entry(n.clone()).or_default();
-                    let slot = e
-                        .addrs
-                        .entry(nn_model::netaddr::canonical(*addr))
-                        .or_insert(0);
-                    *slot = (*slot).max(until);
-                    e.answered_until = e.answered_until.max(until);
-                    if !chain.contains(&n) {
-                        chain.push(n);
+                    let addr = nn_model::netaddr::canonical(*addr);
+                    if a.resolver {
+                        let e = g.names.entry(key(name)).or_default();
+                        let slot = e.addrs.entry(addr).or_insert(0);
+                        *slot = (*slot).max(until);
+                        if a.complete {
+                            e.answered_until = e.answered_until.max(until);
+                        }
                     }
-                    addrs.push((nn_model::netaddr::canonical(*addr), until));
+                    addrs.push((addr, until));
                 }
                 Record::Cname { name, ttl, target } => {
-                    let until = a.ts_ns.saturating_add(hold_ns(*ttl));
-                    let (n, t) = (key(name), key(target));
-                    let e = g.names.entry(n.clone()).or_default();
-                    let slot = e.cnames.entry(t.clone()).or_insert(0);
-                    *slot = (*slot).max(until);
-                    e.answered_until = e.answered_until.max(until);
-                    for x in [n, t] {
-                        if !chain.contains(&x) {
-                            chain.push(x);
+                    if a.resolver {
+                        let until = a.ts_ns.saturating_add(hold_ns(*ttl));
+                        let e = g.names.entry(key(name)).or_default();
+                        let slot = e.cnames.entry(key(target)).or_insert(0);
+                        *slot = (*slot).max(until);
+                        if a.complete {
+                            e.answered_until = e.answered_until.max(until);
                         }
                     }
                 }
             }
         }
-        // the question was answered, an address or not
-        let floor = a.ts_ns.saturating_add(NAME_FLOOR_SECS * SEC);
-        let q = g.names.entry(qname).or_default();
-        q.answered_until = q.answered_until.max(floor);
+        // the question was answered, an address or not — when it was whole
+        if a.resolver && a.complete {
+            let floor = a.ts_ns.saturating_add(NAME_FLOOR_SECS * SEC);
+            let q = g.names.entry(qname.clone()).or_default();
+            q.answered_until = q.answered_until.max(floor);
+        }
         // an address one of the chain's names spells binds nothing
         let before = addrs.len();
         addrs.retain(|(addr, _)| !chain.iter().any(|n| name_spells(n, *addr)));
         g.counters.ip_in_name += (before - addrs.len()) as u64;
-        for (addr, until) in &addrs {
-            let slot = g.addrs.entry(*addr).or_insert(0);
-            *slot = (*slot).max(*until);
-            g.addr_order.touch(*addr);
-        }
-        // the receiver, and the askers of one of the chain's names within
-        // the window either side: an asker before the response waits for
-        // it; one after it (its pump read first) was answered from the
-        // resolver's cache, with these addresses
-        let since = a.ts_ns.saturating_sub(ASK_WINDOW_SECS * SEC);
-        let until = a.ts_ns.saturating_add(ASK_WINDOW_SECS * SEC);
-        let mut pids: Vec<u32> = vec![a.pid];
-        for (n, pid, t) in g.askers.iter().rev() {
-            if *t < since {
-                break;
+        if a.resolver {
+            for (addr, until) in &addrs {
+                let slot = g.addrs.entry(*addr).or_insert(0);
+                *slot = (*slot).max(*until);
+                g.addr_order.touch(*addr);
             }
-            if *t <= until && chain.contains(n) && !pids.contains(pid) {
-                pids.push(*pid);
+        }
+        // the receiver, and — a resolver's response — the askers of one of
+        // the chain's names within the window either side: an asker before
+        // the response waits for it; one after it (its pump read first) was
+        // answered from the resolver's cache, with these addresses
+        let mut pids: Vec<u32> = vec![a.pid];
+        if a.resolver {
+            let since = a.ts_ns.saturating_sub(ASK_WINDOW_SECS * SEC);
+            let until = a.ts_ns.saturating_add(ASK_WINDOW_SECS * SEC);
+            for (n, pid, t) in g.askers.iter().rev() {
+                if *t < since {
+                    break;
+                }
+                if *t <= until && chain.contains(n) && !pids.contains(pid) {
+                    pids.push(*pid);
+                }
             }
         }
         for pid in pids {
@@ -318,7 +410,38 @@ impl<I: Default> ResolvedTable<I> {
                 Self::bind(&mut g, pid, *addr, a.ts_ns, *until);
             }
         }
+        // the receiver's own asks: answered by a whole response; an
+        // incomplete one leaves its question asked and unanswered
+        if a.complete {
+            if let Some(q) = g.asks.get_mut(&a.pid) {
+                for (n, t, answered) in q.iter_mut() {
+                    if *t <= a.ts_ns && chain.contains(n) {
+                        *answered = true;
+                    }
+                }
+            }
+        } else {
+            Self::ask(&mut g, a.pid, &qname, a.ts_ns);
+        }
         Self::bound(&mut g);
+    }
+
+    /// `pid`'s ask of `n` at `ts_ns`, unanswered, in its recent names.
+    fn ask(g: &mut Inner, pid: u32, n: &str, ts_ns: u64) {
+        {
+            let q = g.asks.entry(pid).or_default();
+            q.push_back((n.to_string(), ts_ns, false));
+            while q.len() > ASKS_PER_PID {
+                q.pop_front();
+            }
+        }
+        g.asking_order.touch(pid);
+        while g.asking_order.len() > MAX_ASKING_PIDS {
+            if let Some(old) = g.asking_order.pop_oldest() {
+                g.asks.remove(&old);
+                g.counters.evicted += 1;
+            }
+        }
     }
 
     /// `pid` asked for `name` at `ts_ns` (a datagram to port 53, or a
@@ -340,20 +463,7 @@ impl<I: Default> ResolvedTable<I> {
         while g.askers.front().is_some_and(|(_, _, t)| *t < retain) {
             g.askers.pop_front();
         }
-        {
-            let q = g.asks.entry(pid).or_default();
-            q.push_back((n.clone(), ts_ns));
-            while q.len() > ASKS_PER_PID {
-                q.pop_front();
-            }
-        }
-        g.asking_order.touch(pid);
-        while g.asking_order.len() > MAX_ASKING_PIDS {
-            if let Some(old) = g.asking_order.pop_oldest() {
-                g.asks.remove(&old);
-                g.counters.evicted += 1;
-            }
-        }
+        Self::ask(&mut g, pid, &n, ts_ns);
         for (addr, until) in Self::addresses_of(&g, &n, ts_ns) {
             Self::bind(&mut g, pid, addr, ts_ns, until);
         }
@@ -374,9 +484,11 @@ impl<I: Default> ResolvedTable<I> {
         }
     }
 
-    /// A DNS record received at `ts_ns` could not be decoded (the parse
-    /// worker did not answer): for [`UNSEEN_WINDOW_SECS`] a connect no
-    /// binding covers is unknown, for every process — the response may
+    /// The DNS evidence is incomplete for every process from about `ts_ns`
+    /// for [`UNSEEN_WINDOW_SECS`]: a record the parse worker did not
+    /// decode, a user's records the kernel's budgets held back, a DNS ring
+    /// or budget that lost records (review of #495, D3) — a connect no
+    /// binding covers is unknown, for every process: a lost response may
     /// have named it.
     pub fn note_undecoded(&self, ts_ns: u64) {
         let mut g = self.inner.lock();
@@ -487,19 +599,26 @@ impl<I: Default> ResolvedTable<I> {
         let addr = nn_model::netaddr::canonical(addr);
         let mut g = self.inner.lock();
         g.counters.checks += 1;
-        if Self::use_binding(&mut g, pid, start_ns, addr, now_ns) {
-            return DnsResolution::Lineage;
+        let mut start_unknown = false;
+        match Self::use_binding(&mut g, pid, start_ns, addr, now_ns) {
+            Bind::Used => return DnsResolution::Lineage,
+            Bind::StartUnknown => start_unknown = true,
+            Bind::None => {}
         }
         drop(g);
         let mut members = vec![(pid, start_ns)];
         members.extend(ancestors());
         let mut g = self.inner.lock();
         for (p, s) in members.iter().skip(1) {
-            if Self::use_binding(&mut g, *p, *s, addr, now_ns) {
-                return DnsResolution::Lineage;
+            match Self::use_binding(&mut g, *p, *s, addr, now_ns) {
+                Bind::Used => return DnsResolution::Lineage,
+                Bind::StartUnknown => start_unknown = true,
+                Bind::None => {}
             }
         }
-        if now_ns <= g.degraded_until {
+        // N2: a binding of a member whose start is not known may be an
+        // earlier holder's of its pid: neither used nor ignored
+        if start_unknown || now_ns <= g.degraded_until {
             return DnsResolution::Unknown;
         }
         let since = now_ns.saturating_sub(UNSEEN_WINDOW_SECS * SEC);
@@ -509,9 +628,10 @@ impl<I: Default> ResolvedTable<I> {
                 return DnsResolution::Unknown;
             }
             let unseen = g.asks.get(p).is_some_and(|q| {
-                q.iter().any(|(n, t)| {
+                q.iter().any(|(n, t, answered)| {
                     *t >= from
                         && *t <= now_ns
+                        && !*answered
                         && !g.names.get(n).is_some_and(|e| e.answered_until >= *t)
                 })
             });
@@ -526,16 +646,19 @@ impl<I: Default> ResolvedTable<I> {
         }
     }
 
-    fn use_binding(g: &mut Inner, pid: u32, start_ns: u64, addr: IpAddr, now_ns: u64) -> bool {
+    fn use_binding(g: &mut Inner, pid: u32, start_ns: u64, addr: IpAddr, now_ns: u64) -> Bind {
         let Some(b) = g.bindings.get_mut(&(pid, addr)) else {
-            return false;
+            return Bind::None;
         };
         if b.made_ns < start_ns || b.until_ns < now_ns || b.made_ns > now_ns {
-            return false;
+            return Bind::None;
+        }
+        if start_ns == 0 {
+            return Bind::StartUnknown;
         }
         b.until_ns = b.until_ns.max(now_ns.saturating_add(BIND_IDLE_SECS * SEC));
         g.binding_order.touch((pid, addr));
-        true
+        Bind::Used
     }
 
     /// Test/diagnostic: bindings, names and addresses held.
@@ -564,12 +687,28 @@ mod tests {
         }
     }
 
+    /// A whole response a system resolver received (the tests' default:
+    /// its names host-wide).
     fn answer(t: &Table, pid: u32, ts: u64, qname: &str, records: &[Record]) {
+        answer_as(t, pid, ts, qname, records, true, true);
+    }
+
+    fn answer_as(
+        t: &Table,
+        pid: u32,
+        ts: u64,
+        qname: &str,
+        records: &[Record],
+        complete: bool,
+        resolver: bool,
+    ) {
         t.on_answer(&Answer {
             pid,
             ts_ns: ts,
             qname,
             records,
+            complete,
+            resolver,
         });
     }
 
@@ -628,7 +767,9 @@ mod tests {
             t.check(42, T0 + 5, WEB, T0 + 10, none),
             DnsResolution::OtherLineage
         );
-        assert_eq!(t.check(42, 0, WEB, T0 + 10, none), DnsResolution::Lineage);
+        // N2 (review of #495): a start not known may be another holder's:
+        // the binding is neither used nor ignored
+        assert_eq!(t.check(42, 0, WEB, T0 + 10, none), DnsResolution::Unknown);
     }
 
     /// nss-resolve: the application asks through varlink (its query is the
@@ -903,10 +1044,11 @@ mod tests {
     fn the_tables_are_bounded() {
         let t = Table::new();
         for i in 0..(MAX_BINDINGS as u32 / 64 + 10) {
+            let owner = format!("n{i}.example");
             let recs: Vec<Record> = (0..64u32)
                 .map(|j| {
                     a(
-                        "n.example",
+                        &owner,
                         60,
                         IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i * 64 + j)),
                     )
@@ -939,5 +1081,257 @@ mod tests {
         assert_eq!(t.sensor_since(), Some(T0));
         t.set_sensor_since(0);
         assert_eq!(t.sensor_since(), None);
+    }
+
+    // ── review of #495 ───────────────────────────────────────────────
+
+    const A1: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+    const A2: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2));
+
+    /// D1 (the reviewer's probe P1, which passed on the PR's first head): a
+    /// response cut after A1 (the sensor's 512-byte cap, the server's TC
+    /// bit, a malformed record) binds A1, but its question stays asked and
+    /// unanswered — A2, past the cut, is unknown, never unresolved; for the
+    /// receiver as for a resolver's askers.
+    #[test]
+    fn an_incomplete_response_binds_what_it_read_and_answers_nothing() {
+        let t = Table::new();
+        t.on_query(42, "big.example", T0);
+        assert_eq!(t.check(42, 1, A2, T0 + SEC, none), DnsResolution::Unknown);
+        answer_as(
+            &t,
+            42,
+            T0 + 1,
+            "big.example",
+            &[a("big.example", 60, A1)],
+            false,
+            false,
+        );
+        assert_eq!(t.check(42, 1, A1, T0 + SEC, none), DnsResolution::Lineage);
+        assert_eq!(t.check(42, 1, A2, T0 + SEC, none), DnsResolution::Unknown);
+        // the receiver's query unseen: its incomplete response is an ask
+        let t = Table::new();
+        answer_as(
+            &t,
+            43,
+            T0,
+            "big.example",
+            &[a("big.example", 60, A1)],
+            false,
+            false,
+        );
+        assert_eq!(t.check(43, 1, A2, T0 + SEC, none), DnsResolution::Unknown);
+        // a resolver's incomplete response: its asker bound to A1, A2 unknown
+        let t = Table::new();
+        t.on_query(44, "big.example", T0);
+        answer_as(
+            &t,
+            500,
+            T0 + 1,
+            "big.example",
+            &[a("big.example", 60, A1)],
+            false,
+            true,
+        );
+        assert_eq!(t.check(44, 1, A1, T0 + SEC, none), DnsResolution::Lineage);
+        assert_eq!(t.check(44, 1, A2, T0 + SEC, none), DnsResolution::Unknown);
+        // the same, whole: A2 nobody resolved
+        let t = Table::new();
+        t.on_query(44, "big.example", T0);
+        answer_as(
+            &t,
+            500,
+            T0 + 1,
+            "big.example",
+            &[a("big.example", 60, A1)],
+            true,
+            true,
+        );
+        assert_eq!(
+            t.check(44, 1, A2, T0 + SEC, none),
+            DnsResolution::Unresolved
+        );
+    }
+
+    /// D4 (probe P3): a record outside the question's chain is ignored — not
+    /// held host-wide, bound to no one — even in a resolver's response.
+    #[test]
+    fn a_record_outside_the_question_chain_binds_nothing() {
+        for resolver in [false, true] {
+            let t = Table::new();
+            answer_as(
+                &t,
+                666,
+                T0,
+                "x.attacker.example",
+                &[a("www.victim.example", 60, C2)],
+                true,
+                resolver,
+            );
+            assert_eq!(t.counters().out_of_chain, 1);
+            assert_eq!(
+                t.check(666, 1, C2, T0 + SEC, none),
+                DnsResolution::Unresolved
+            );
+            // another lineage asks the name later: its answer was never seen
+            t.on_query(777, "www.victim.example", T0 + 60 * SEC);
+            assert_eq!(
+                t.check(777, 1, C2, T0 + 61 * SEC, none),
+                DnsResolution::Unknown,
+                "resolver {resolver}"
+            );
+            // and nobody resolved C2
+            assert_eq!(
+                t.check(888, 1, C2, T0 + 61 * SEC, none),
+                DnsResolution::Unresolved,
+                "resolver {resolver}"
+            );
+        }
+        // the chain in any order of the records: a CNAME after its A
+        let t = Table::new();
+        answer_as(
+            &t,
+            42,
+            T0,
+            "www.shop.example",
+            &[
+                a("edge.cdn.example", 60, WEB),
+                Record::Cname {
+                    name: "www.shop.example".into(),
+                    ttl: 60,
+                    target: "edge.cdn.example".into(),
+                },
+                a("other.example", 60, C2),
+            ],
+            true,
+            false,
+        );
+        assert_eq!(t.check(42, 1, WEB, T0 + SEC, none), DnsResolution::Lineage);
+        assert_eq!(
+            t.check(42, 1, C2, T0 + SEC, none),
+            DnsResolution::Unresolved
+        );
+        assert_eq!(t.counters().out_of_chain, 1);
+    }
+
+    /// D4 (probe P3b): a response any process received binds that process
+    /// only — not the askers of its name, not host-wide; a system
+    /// resolver's binds its askers and holds its names.
+    #[test]
+    fn only_a_resolver_s_response_binds_others() {
+        let t = Table::new();
+        t.on_query(777, "www.victim.example", T0);
+        answer_as(
+            &t,
+            666,
+            T0 + 2 * SEC,
+            "www.victim.example",
+            &[a("www.victim.example", 60, C2)],
+            true,
+            false,
+        );
+        assert_eq!(
+            t.check(666, 1, C2, T0 + 3 * SEC, none),
+            DnsResolution::Lineage
+        );
+        assert_eq!(
+            t.check(777, 1, C2, T0 + 3 * SEC, none),
+            DnsResolution::Unknown
+        );
+        assert_eq!(
+            t.check(888, 1, C2, T0 + 3 * SEC, none),
+            DnsResolution::Unresolved
+        );
+        // a later asker gets nothing from it either
+        t.on_query(999, "www.victim.example", T0 + 20 * SEC);
+        assert_eq!(
+            t.check(999, 1, C2, T0 + 21 * SEC, none),
+            DnsResolution::Unknown
+        );
+        // the receiver's own whole response answered its own ask
+        t.on_query(321, "self.example", T0);
+        answer_as(
+            &t,
+            321,
+            T0 + 1,
+            "self.example",
+            &[a("self.example", 60, WEB)],
+            true,
+            false,
+        );
+        assert_eq!(
+            t.check(321, 1, C2, T0 + SEC, none),
+            DnsResolution::Unresolved
+        );
+        // the resolver's: the asker bound, the name held, others see it
+        let t = Table::new();
+        t.on_query(777, "www.victim.example", T0);
+        answer_as(
+            &t,
+            500,
+            T0 + 2 * SEC,
+            "www.victim.example",
+            &[a("www.victim.example", 60, C2)],
+            true,
+            true,
+        );
+        assert_eq!(
+            t.check(777, 1, C2, T0 + 3 * SEC, none),
+            DnsResolution::Lineage
+        );
+        assert_eq!(
+            t.check(888, 1, C2, T0 + 3 * SEC, none),
+            DnsResolution::OtherLineage
+        );
+    }
+
+    /// D4: a system resolver is its executable, of the fixed list, run by a
+    /// system uid — never a name, never a user's copy.
+    #[test]
+    fn a_system_resolver_is_its_executable_and_a_system_uid() {
+        assert!(is_system_resolver(
+            Some("/usr/lib/systemd/systemd-resolved"),
+            101
+        ));
+        assert!(is_system_resolver(Some("/usr/sbin/dnsmasq"), 0));
+        assert!(is_system_resolver(
+            Some("/usr/sbin/unbound"),
+            SYSTEM_UID_MAX
+        ));
+        assert!(!is_system_resolver(
+            Some("/usr/sbin/unbound"),
+            SYSTEM_UID_MAX + 1
+        ));
+        assert!(!is_system_resolver(Some("/home/u/systemd-resolved"), 101));
+        assert!(!is_system_resolver(Some("systemd-resolved"), 101));
+        assert!(!is_system_resolver(None, 0));
+    }
+
+    /// N2: a binding of an ancestor whose start is not known is neither used
+    /// nor ignored: unknown.
+    #[test]
+    fn a_binding_of_a_member_of_unknown_start_is_unknown() {
+        let t = Table::new();
+        answer(&t, 10, T0, "repo.example", &[a("repo.example", 60, WEB)]);
+        assert_eq!(
+            t.check(11, T0 + 1, WEB, T0 + 2, || vec![(10, 0)]),
+            DnsResolution::Unknown
+        );
+        assert_eq!(
+            t.check(11, T0 + 1, WEB, T0 + 2, || vec![(10, 1)]),
+            DnsResolution::Lineage
+        );
+    }
+
+    /// RC6 (the review's mutation): the host-wide degradation lasts
+    /// exactly [`UNSEEN_WINDOW_SECS`] past the record.
+    #[test]
+    fn the_degradation_ends_at_its_window() {
+        let t = Table::new();
+        t.note_undecoded(T0);
+        let end = T0 + UNSEEN_WINDOW_SECS * SEC;
+        assert_eq!(t.check(42, 1, C2, end, none), DnsResolution::Unknown);
+        assert_eq!(t.check(42, 1, C2, end + 1, none), DnsResolution::Unresolved);
+        assert_eq!(t.check(42, 1, C2, T0 - SEC, none), DnsResolution::Unknown);
     }
 }

@@ -483,21 +483,25 @@ pub(super) const DOCS: &[RuleDoc] = &[
         actions: &[ResponseAction::KillProcess, ResponseAction::Log],
         sensors: &[Sensor::Network],
         data_components: &["DC0082"],
-        observes: "A TCP connect or a UDP send to a public address that neither the process \
-                   nor an ancestor resolved through the system resolver: no DNS response it \
-                   received, and no name it asked for, named the address (Medium; Low when \
-                   only another process on the host resolved it). Judged by the connect pump \
-                   and the net drain from the DNS response sensor's table, once per process and \
-                   destination per 10 minutes. Its kill (`KillProcess`) is held behind the \
-                   per-rule response policy, off by default.",
+        observes: "A TCP connect or a UDP send to a public address the DNS evidence does not \
+                   bind to the process or an ancestor: no DNS response it received (from port \
+                   53, the question's chain only) named the address, nor a system resolver's \
+                   response (its executable and a system uid) for a name it asked (Medium; \
+                   Low when only a system resolver's response for another lineage named it). \
+                   Judged by the connect pump and the net drain from the DNS response \
+                   sensor's table, once per process and destination per 10 minutes. Its kill \
+                   (`KillProcess`) is held behind the per-rule response policy, which refuses \
+                   `enforce` for it (review of #495).",
         false_positives: "Clients that resolve outside the system resolver — DNS over HTTPS \
                           in a browser, a resolver of their own, an address from a \
                           configuration file or handed over by another process; peers \
                           configured by address (NTP servers, database replicas, package \
-                          mirrors by IP). Not judged: LAN and the other non-public ranges, the \
-                          configured resolvers, the signed `nodns-allow.local`, and every \
-                          process older than the DNS response sensor or whose DNS records \
-                          were lost (unknown).",
+                          mirrors by IP); a container whose own resolvers are public ones (a \
+                          Docker default bridge falling back to 8.8.8.8). Not judged: LAN and \
+                          the other non-public ranges, the configured resolvers, the signed \
+                          `nodns-allow.local`, and the unknown — a process older than the DNS \
+                          response sensor, a response cut or never seen, DNS records lost or \
+                          held back (host-wide for 5 minutes), the DNS pumps not caught up.",
         how_to_test: "On a lab guest, `curl -m 3 http://203.0.113.5/` (a documentation \
                       address, a literal-IP connect) draws it; `curl -m 3 http://example.com/` \
                       (resolved) does not (`net-check.sh --only MS28`).",

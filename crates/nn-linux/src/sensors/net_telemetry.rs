@@ -319,15 +319,23 @@ fn floods(
 
 /// One pass over the DNS response ring: each record decoded, the table
 /// fed, its events into `outbox`. Returns the records read.
+#[allow(clippy::too_many_arguments)]
 fn answer_pass(
     ring: &mut RingBuf<MapData>,
     table: &ResolvedTable,
     lineage: &AuthSessionTracker,
     parse: &ParseClient,
+    losses: &mut crate::sensors::ring_drops::LossWatch,
     reject: &mut RejectThrottle,
     outbox: &mut VecDeque<Event>,
     stats: &mut PassStats,
 ) -> u32 {
+    // review of #495, D3: a response lost before this pass (the ring full,
+    // a process's or a user's budget) leaves every process's evidence
+    // incomplete, whoever lost it
+    if losses.grew() {
+        table.note_undecoded(crate::net::dns_ingest::monotonic_ns());
+    }
     let size = std::mem::size_of::<DnsAnswerRaw>();
     let mut raws: Vec<DnsAnswerRaw> = Vec::new();
     let mut drained = 0u32;
@@ -340,17 +348,24 @@ fn answer_pass(
         }
     }
     for raw in &raws {
-        let n = usize::from(raw.captured).min(raw.payload.len());
+        let bytes = captured_payload(raw);
         // `None`: the worker did not answer; `Some(None)`: no DNS response
-        let decoded = if n == 0 {
+        let decoded = if bytes.is_empty() {
             Some(None)
         } else {
-            parse.dns_answers(&raw.payload[..n])
+            parse.dns_answers(bytes)
         };
         let exe = lineage.image_at(raw.pid, raw.timestamp_ns);
         outbox.extend(ingest_answer(raw, decoded, exe, table, stats));
     }
     drained
+}
+
+/// The bytes of a response record the sensor copied: its payload up to
+/// `captured` (review of #495, RA5: never past it).
+fn captured_payload(raw: &DnsAnswerRaw) -> &[u8] {
+    let n = usize::from(raw.captured).min(raw.payload.len());
+    &raw.payload[..n]
 }
 
 /// One response record: the table fed (its records bound; an undecoded
@@ -376,19 +391,33 @@ fn ingest_answer(
                 ev.addrs.len(),
                 ev.rcode
             ));
+            // review of #495: a response cut (the sensor's cap, the
+            // server's TC bit, a malformed record) answers nothing (D1); a
+            // system resolver's counts host-wide, any other process's for
+            // itself only (D4)
             table.on_answer(&Answer {
                 pid: raw.pid,
                 ts_ns: raw.timestamp_ns,
                 qname: q,
                 records: &records,
+                complete: !ev.truncated,
+                resolver: crate::net::resolved::is_system_resolver(ev.exe.as_deref(), raw.uid),
             });
         }
         // the worker did not answer: what the response named is not known
         None if !worker_answered => table.note_undecoded(raw.timestamp_ns),
+        // a datagram from port 53 whose bytes were not read: its
+        // receiver's evidence is incomplete
+        None if raw.flags & answer_flags::UNREAD != 0 => table.note_held(raw.pid, raw.timestamp_ns),
         // no DNS response: no evidence either way
         None => {}
     }
-    if raw.flags & (held_flags::TASK | held_flags::UID) != 0 {
+    // review of #495, D3: a user's held records leave every process's
+    // evidence incomplete (the count rides on whichever record of the user
+    // comes next); a process's, its own lineage's
+    if raw.flags & held_flags::UID != 0 {
+        table.note_undecoded(raw.timestamp_ns);
+    } else if raw.flags & held_flags::TASK != 0 {
         table.note_held(raw.pid, raw.timestamp_ns);
     }
     let comm = ev.comm.clone();
@@ -409,12 +438,14 @@ fn ingest_answer(
 /// `attached`: the sensor's programs attached. Only then does the table say
 /// since when the sensor runs (NN-L-NET-028 judges the connects; without
 /// it every one is unknown) and do the connects wait for its passes.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_dns_answer_pump(
     rb: RingBuf<MapData>,
     table: Arc<ResolvedTable>,
     attached: bool,
     lineage: AuthSessionTracker,
     parse: ParseClient,
+    mut losses: crate::sensors::ring_drops::LossWatch,
     tx: &BusSender,
     rt: &tokio::runtime::Handle,
 ) -> Result<PumpThread> {
@@ -436,7 +467,16 @@ pub fn spawn_dns_answer_pump(
             DNS_ANSWER_LABEL,
             std::mem::size_of::<DnsAnswerRaw>(),
             |ring, reject, outbox, stats| {
-                answer_pass(ring, &table, &lineage, &parse, reject, outbox, stats)
+                answer_pass(
+                    ring,
+                    &table,
+                    &lineage,
+                    &parse,
+                    &mut losses,
+                    reject,
+                    outbox,
+                    stats,
+                )
             },
         ))
     })
@@ -881,6 +921,230 @@ mod tests {
             t.check(43, 1, c2, 11 * S, Vec::new),
             DnsResolution::Unresolved
         );
+    }
+
+    fn one_a(name: &str, addr: [u8; 4], complete: bool) -> DnsAnswersOut {
+        DnsAnswersOut {
+            qname: name.into(),
+            qtype: 1,
+            rcode: 0,
+            records: vec![DnsRecordOut::A {
+                name: name.into(),
+                ttl: 60,
+                addr,
+            }],
+            complete,
+        }
+    }
+
+    /// Review of #495, D1 (the reviewer's probe P1b, which passed on the
+    /// PR's first head): a response the sensor cut (TRUNCATED) or the worker
+    /// read incomplete binds what it read and answers nothing — the address
+    /// past the cut is unknown, never unresolved.
+    #[test]
+    fn a_cut_response_answers_nothing() {
+        use nn_model::telemetry::DnsResolution;
+        const S: u64 = 1_000_000_000;
+        let a1: std::net::IpAddr = "198.51.100.1".parse().unwrap();
+        let a2: std::net::IpAddr = "198.51.100.2".parse().unwrap();
+        for (flags, complete) in [(answer_flags::TRUNCATED, true), (0, false)] {
+            let t = ResolvedTable::default();
+            t.on_query(42, "big.example", 10 * S - 1);
+            assert_eq!(t.check(42, 1, a2, 11 * S, Vec::new), DnsResolution::Unknown);
+            let mut stats = PassStats::default();
+            let mut raw = answer_raw();
+            raw.timestamp_ns = 10 * S;
+            raw.flags = flags;
+            let evs = ingest_answer(
+                &raw,
+                Some(Some(one_a("big.example", [198, 51, 100, 1], complete))),
+                None,
+                &t,
+                &mut stats,
+            );
+            match &evs[0] {
+                Event::DnsAnswer(e) => assert!(e.truncated),
+                _ => panic!(),
+            }
+            assert_eq!(t.check(42, 1, a1, 11 * S, Vec::new), DnsResolution::Lineage);
+            assert_eq!(
+                t.check(42, 1, a2, 11 * S, Vec::new),
+                DnsResolution::Unknown,
+                "flags {flags} complete {complete}"
+            );
+        }
+        // a datagram from port 53 whose bytes were not read: its receiver's
+        // evidence incomplete
+        let t = ResolvedTable::default();
+        let mut raw = answer_raw();
+        raw.timestamp_ns = 10 * S;
+        raw.flags = answer_flags::UNREAD;
+        ingest_answer(&raw, Some(None), None, &t, &mut PassStats::default());
+        assert_eq!(t.check(42, 1, a2, 11 * S, Vec::new), DnsResolution::Unknown);
+        assert_eq!(
+            t.check(43, 1, a2, 11 * S, Vec::new),
+            DnsResolution::Unresolved
+        );
+    }
+
+    /// Review of #495, D3: a user's held responses (the count rides on the
+    /// user's next record, whichever process it is) leave every process's
+    /// evidence incomplete — not the reporter's alone.
+    #[test]
+    fn a_user_s_held_responses_degrade_every_process() {
+        use nn_model::telemetry::DnsResolution;
+        const S: u64 = 1_000_000_000;
+        let c2: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let t = ResolvedTable::default();
+        let mut raw = answer_raw();
+        raw.timestamp_ns = 10 * S;
+        raw.flags = held_flags::UID;
+        raw.held_uid = 9;
+        ingest_answer(&raw, Some(None), None, &t, &mut PassStats::default());
+        for pid in [42, 43, 4242] {
+            assert_eq!(
+                t.check(pid, 1, c2, 11 * S, Vec::new),
+                DnsResolution::Unknown
+            );
+        }
+    }
+
+    /// Review of #495, D4: a response any process received binds that
+    /// process only; one a system resolver received (its executable and a
+    /// system uid) binds the processes that asked its name, and the name
+    /// counts host-wide.
+    #[test]
+    fn only_a_system_resolver_s_response_binds_others() {
+        use nn_model::telemetry::DnsResolution;
+        const S: u64 = 1_000_000_000;
+        let c2: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let resolved_exe = Some("/usr/lib/systemd/systemd-resolved".to_string());
+        for (exe, uid, bound) in [
+            (None, 1000, false),
+            (Some("/usr/bin/python3".to_string()), 1000, false),
+            // a user's copy of the resolver's program
+            (resolved_exe.clone(), 1000, false),
+            (resolved_exe.clone(), 101, true),
+        ] {
+            let t = ResolvedTable::default();
+            t.on_query(777, "c2.example", 10 * S - 1);
+            let mut raw = answer_raw();
+            raw.timestamp_ns = 10 * S;
+            raw.uid = uid;
+            raw.pid = 500;
+            ingest_answer(
+                &raw,
+                Some(Some(one_a("c2.example", [203, 0, 113, 5], true))),
+                exe.clone(),
+                &t,
+                &mut PassStats::default(),
+            );
+            assert_eq!(
+                t.check(500, 1, c2, 11 * S, Vec::new),
+                DnsResolution::Lineage
+            );
+            let want = if bound {
+                DnsResolution::Lineage
+            } else {
+                DnsResolution::Unknown
+            };
+            assert_eq!(t.check(777, 1, c2, 11 * S, Vec::new), want, "{exe:?} {uid}");
+            let other = if bound {
+                DnsResolution::OtherLineage
+            } else {
+                DnsResolution::Unresolved
+            };
+            assert_eq!(
+                t.check(888, 1, c2, 11 * S, Vec::new),
+                other,
+                "{exe:?} {uid}"
+            );
+        }
+    }
+
+    /// Review of #495, D2: 1,024 responses a second for one user (its
+    /// sustained budget) outrun a pump that decodes about one a millisecond.
+    /// A connect whose barrier the pump had not reached is judged unknown,
+    /// never unresolved for want of the responses still in the ring; once
+    /// the pump has read them, it is bound.
+    #[test]
+    fn a_connect_ahead_of_the_response_pump_is_unknown() {
+        use nn_model::telemetry::DnsResolution;
+        const MS: u64 = 1_000_000;
+        let now = crate::net::dns_ingest::monotonic_ns();
+        let t = Arc::new(ResolvedTable::default());
+        let _claim = crate::net::resolved::ResolvedClaim::new(Arc::clone(&t), 1);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        // the second's responses, 1,024 of them; the process that connects
+        // asked the last name; the pump has read the first 1,000 only
+        let base = now - 1_300 * MS;
+        let ts = |i: u64| base + i * 1_000 * MS / 1024;
+        t.on_query(777, "n1023.example", ts(1023) - 1);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut stats = PassStats::default();
+        for i in 0..1024u64 {
+            if i == 1000 {
+                t.ingest().pass_ended(ts(999));
+            }
+            if i >= 1000 {
+                continue;
+            }
+            let mut raw = answer_raw();
+            raw.timestamp_ns = ts(i);
+            raw.pid = 4000 + (i % 7) as u32;
+            let name = format!("n{i}.example");
+            ingest_answer(
+                &raw,
+                Some(Some(one_a(&name, [203, 0, 113, (i % 250) as u8], true))),
+                None,
+                &t,
+                &mut stats,
+            );
+        }
+        let c2: std::net::IpAddr = "203.0.113.23".parse().unwrap();
+        // the connect, 1 ms after the last response, now over 250 ms ago
+        let connect = ts(1023) + MS;
+        let caught = rt.block_on(t.ingest().caught_up(connect));
+        assert!(!caught, "the pump is behind");
+        let got = crate::net::resolved::judge(&t, &lineage, 777, 1, c2, connect, caught);
+        assert_eq!(got, DnsResolution::Unknown);
+        // the pump reads the rest — its answer bound to the asker? not a
+        // resolver's: the asker's own response binds it
+        let mut raw = answer_raw();
+        raw.timestamp_ns = ts(1023);
+        raw.pid = 777;
+        ingest_answer(
+            &raw,
+            Some(Some(one_a("n1023.example", [203, 0, 113, 23], true))),
+            None,
+            &t,
+            &mut stats,
+        );
+        t.ingest().pass_ended(connect + MS);
+        let caught = rt.block_on(t.ingest().caught_up(connect));
+        assert!(caught);
+        assert_eq!(
+            crate::net::resolved::judge(&t, &lineage, 777, 1, c2, connect, caught),
+            DnsResolution::Lineage
+        );
+    }
+
+    /// Review of #495, RA5: only the bytes the sensor copied are decoded.
+    #[test]
+    fn only_the_captured_bytes_are_decoded() {
+        let mut raw = answer_raw();
+        raw.payload[..4].copy_from_slice(&[1, 2, 3, 4]);
+        raw.payload[4] = 9;
+        raw.captured = 4;
+        assert_eq!(captured_payload(&raw), &[1, 2, 3, 4]);
+        raw.captured = 0;
+        assert!(captured_payload(&raw).is_empty());
+        raw.captured = u16::MAX;
+        assert_eq!(captured_payload(&raw).len(), raw.payload.len());
     }
 
     /// A hello's fingerprint goes to its pending flow (a flow with no

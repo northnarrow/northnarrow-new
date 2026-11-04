@@ -35,8 +35,15 @@ use super::{WorkerError, Workers};
 /// never a pass slowed to the connects' wait in silence. The honest round
 /// trip is about a millisecond.
 pub const NAMES_TIMEOUT: Duration = Duration::from_millis(50);
-/// A ClientHello's or a DNS answer's deadline.
+/// A ClientHello's deadline.
 pub const ONE_TIMEOUT: Duration = Duration::from_millis(250);
+/// A DNS response's deadline. Review of #495 (D2): the DNS response pump's
+/// passes are a connect's barrier for NN-L-NET-028, as the names' are for
+/// the attribution — the same rule as [`NAMES_TIMEOUT`], a quarter of the
+/// connects' wait at most (pinned by a test): a worker slower than this
+/// is a hang, signed, and the response has no decode (the evidence then
+/// degrades host-wide), never a pass slowed past the connects' wait.
+pub const ANSWER_TIMEOUT: Duration = NAMES_TIMEOUT;
 /// The names left without a decode are said at most this often.
 pub const UNPARSED_LOG_EVERY: Duration = Duration::from_secs(10);
 
@@ -161,7 +168,7 @@ impl ParseClient {
         match w.request(
             WorkerKind::Parse,
             &Request::DnsAnswers(bytes.to_vec()),
-            ONE_TIMEOUT,
+            ANSWER_TIMEOUT,
         ) {
             Ok(Answer::DnsAnswers(out)) => Some(out),
             _ => None,

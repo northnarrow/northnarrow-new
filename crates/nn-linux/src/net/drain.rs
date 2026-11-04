@@ -489,6 +489,7 @@ pub async fn drain_loop(
                                 &flow_tracker,
                                 &dns_cache,
                                 &resolved,
+                                true,
                                 netflow_db.as_ref(),
                                 &lineage,
                                 &mut gate,
@@ -499,13 +500,14 @@ pub async fn drain_loop(
                     }
                 }
                 guard.clear_ready();
-                attribution_barrier(&batch, &dns_cache, &resolved, None).await;
+                let caught_up = attribution_barrier(&batch, &dns_cache, &resolved, None).await;
                 for raw in batch.drain(..) {
                     process_close_record(
                         bytemuck::bytes_of(&raw),
                         &flow_tracker,
                         &dns_cache,
                         &resolved,
+                        caught_up,
                         netflow_db.as_ref(),
                         &lineage,
                         &mut gate,
@@ -533,6 +535,7 @@ pub async fn drain_loop(
                                 &flow_tracker,
                                 &dns_cache,
                                 &resolved,
+                                true,
                                 netflow_db.as_ref(),
                                 &lineage,
                                 &mut gate,
@@ -543,7 +546,8 @@ pub async fn drain_loop(
                     }
                 }
                 guard.clear_ready();
-                attribution_barrier(&batch, &dns_cache, &resolved, Some(&tls_ingest)).await;
+                let caught_up =
+                    attribution_barrier(&batch, &dns_cache, &resolved, Some(&tls_ingest)).await;
                 // Lab PR 246: each close after its connect, on the bus too.
                 connect_barrier(&batch, &flow_tracker).await;
                 for raw in batch.drain(..) {
@@ -552,6 +556,7 @@ pub async fn drain_loop(
                         &flow_tracker,
                         &dns_cache,
                         &resolved,
+                        caught_up,
                         netflow_db.as_ref(),
                         &lineage,
                         &mut gate,
@@ -596,19 +601,22 @@ async fn attribution_barrier(
     dns_cache: &DnsCache,
     resolved: &crate::net::resolved::ResolvedTable,
     tls: Option<&crate::net::dns_ingest::DnsIngest>,
-) {
-    if let Some(ts) = batch.iter().map(|r| r.timestamp_ns).max() {
-        let tls_wait = async {
-            if let Some(t) = tls {
-                t.caught_up(ts).await;
-            }
-        };
-        tokio::join!(
-            dns_cache.ingest().caught_up(ts),
-            resolved.ingest().caught_up(ts),
-            tls_wait
-        );
-    }
+) -> bool {
+    let Some(ts) = batch.iter().map(|r| r.timestamp_ns).max() else {
+        return true;
+    };
+    let tls_wait = async {
+        if let Some(t) = tls {
+            t.caught_up(ts).await;
+        }
+    };
+    let (names, answers, ()) = tokio::join!(
+        dns_cache.ingest().caught_up(ts),
+        resolved.ingest().caught_up(ts),
+        tls_wait
+    );
+    // review of #495, D2: NN-L-NET-028's judgement needs both DNS pumps
+    names && answers
 }
 
 /// Lab PR 224: how often the drain looks for due snapshots — every 10 s, or
@@ -751,6 +759,8 @@ async fn process_close_record(
     flow_tracker: &Arc<Mutex<FlowTracker>>,
     dns_cache: &Arc<DnsCache>,
     resolved: &crate::net::resolved::ResolvedTable,
+    // NN-L-NET-028's barrier reached (review of #495, D2)
+    caught_up: bool,
     netflow_db: Option<&Arc<Mutex<NetFlowDb>>>,
     lineage: &crate::posture::lineage::AuthSessionTracker,
     gate: &mut RuleGate,
@@ -881,6 +891,7 @@ async fn process_close_record(
                 row.proc_start_ns,
                 row.dst_addr,
                 raw.timestamp_ns,
+                caught_up,
             );
             row
         }
@@ -1788,6 +1799,7 @@ mod tests {
                 &tracker,
                 &dns,
                 &Default::default(),
+                true,
                 Some(&db),
                 &lineage,
                 &mut gate,
@@ -1801,6 +1813,7 @@ mod tests {
             &tracker,
             &dns,
             &Default::default(),
+            true,
             Some(&db),
             &lineage,
             &mut gate,
@@ -1911,6 +1924,7 @@ mod tests {
                 &tracker,
                 &dns,
                 &Default::default(),
+                true,
                 Some(&db),
                 &lineage,
                 &mut gate,
@@ -2083,6 +2097,7 @@ mod tests {
                 &self.tracker,
                 &self.dns,
                 &Default::default(),
+                true,
                 self.db.as_ref(),
                 &self.lineage,
                 &mut self.gate,

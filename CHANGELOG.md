@@ -30,12 +30,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   the flow's snapshots and closed row (`ja3`, `ja4`, `sni` in
   `netflow.jsonl`). NN-L-NET-003 judges the hello (BUG-025 closed).
 - NN-L-NET-028, "no DNS, no connect", per lineage (lot 275): a TCP connect
-  or a UDP send to a public address that neither the process nor an
-  ancestor resolved through the system resolver — no response it received
-  named the address, no name it asked for resolved to it — is recorded:
-  Medium, Low when only another process on the host resolved it; once per
+  or a UDP send to a public address the DNS evidence does not bind to the
+  process or an ancestor — no response it received named the address (the
+  question's chain only), nor a system resolver's response (its executable
+  and a system uid) for a name it asked — is recorded: Medium, Low when
+  only a resolver's response for another lineage named it; once per
   process and destination every 10 minutes; its kill (`KillProcess`) held
-  behind the per-rule policy, off by default (`NODNS_KILL`). The state is
+  behind the per-rule policy (`NODNS_KILL`), whose `enforce` the policy
+  refuses for now (review of #495). The state is
   nn-core's `net::resolved` (the host's names held for their TTL, 300 s at
   least, a day at most; per-process bindings that last 2 h past each use;
   an address its own name spells binds nothing); the connect pump and the
@@ -44,8 +46,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   non-public ranges, the configured resolvers, the addresses of the signed
   `nodns-allow.local` (a new overlay kind, `nn-admin config overlay set
   nodns-allow`), and what the agent cannot judge (a process older than the
-  DNS response sensor, a name asked whose response was not seen, DNS
-  records held back, the parse worker not answering).
+  DNS response sensor, a name asked whose response was not seen whole, DNS
+  records held back or lost — host-wide for 5 minutes for a user's or a
+  ring's —, the DNS pumps not caught up, the parse worker not answering).
 - The agent's threads each keep only their capabilities, its keys in one
   place, its unit hardened (lot 272, Wave 4 phase 2, R14c of the
   restructure plan, §3.1–§3.3; `docs/architecture/PROCESS_MODEL.md` §8–§10).

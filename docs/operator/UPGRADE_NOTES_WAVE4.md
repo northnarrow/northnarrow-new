@@ -34,11 +34,12 @@ has the details of each change below.
    directory exited 1), and every refusal is a signed `agent_boot` row: a
    monitor that matched exit status 1 sees 78 (§6). A broken audit chain
    now refuses the start before anything is loaded.
-7. A signed `rule-policy.local` with `enforce NN-L-NET-003`: from lot 275
-   that line is taken as `alert` at the start, the rest of your policy in
-   force, and the start signs a `rule_policy` degradation naming it (§7).
-   Re-sign the policy without it (`alert NN-L-NET-003`) when convenient:
-   `nn-admin config overlay set` refuses a file that keeps it.
+7. A signed `rule-policy.local` with `enforce NN-L-NET-003` or `enforce
+   NN-L-NET-028`: from lot 275 that line is taken as `alert` at the start,
+   the rest of your policy in force, and the start signs a `rule_policy`
+   degradation naming it (§7). Re-sign the policy without it (`alert …`)
+   when convenient: `nn-admin config overlay set` refuses a file that
+   keeps it.
 
 ## 1. The on-host LLM advisor is removed (lab PR 214)
 
@@ -299,6 +300,13 @@ What an operator sees change:
   names in the policy's source. `nn-admin config overlay set` refuses a
   file with the line: replace it with `alert NN-L-NET-003` (or `audit`)
   and re-sign.
+- **NN-L-NET-028 too** (the review of #495): its `enforce` is refused the
+  same way — refused by `config overlay set`, applied as `alert` at the
+  start, a signed degradation — until the rule is measured on a wider
+  corpus: its kill judges the absence of a DNS answer, which benign
+  software can produce out of the agent's sight (a container's resolvers
+  of its own, DNS over TCP, DoT or DoH). Its records stay Medium or Low,
+  `Log`.
 - **Monitoring.** A rule that matched NN-L-NET-003 as Critical, or its
   `net_critical` category, sees `Medium` and `net_medium`; it is out of the
   V2 Critical sub-gate.

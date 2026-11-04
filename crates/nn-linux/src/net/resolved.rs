@@ -71,7 +71,9 @@ impl Drop for PumpClaim {
 /// What the DNS evidence says of a connect to `dst` at `ts_ns` by `pid`
 /// (which started at `proc_start_ns`, 0 when `/proc` no longer shows it):
 /// - `NotJudged` for a destination that is not public;
-/// - `Unknown` while the DNS response sensor does not run, and for a
+/// - `Unknown` when the DNS pumps had not read the records made before the
+///   connect (`caught_up` false: the barrier's wait ended first — review of
+///   #495, D2), while the DNS response sensor does not run, and for a
 ///   process older than the sensor that the evidence does not bind (it may
 ///   have resolved the address before the sensor watched);
 /// - otherwise [`ResolvedTable::check`] over the process and its lineage as
@@ -83,9 +85,13 @@ pub fn judge(
     proc_start_ns: u64,
     dst: IpAddr,
     ts_ns: u64,
+    caught_up: bool,
 ) -> DnsResolution {
     if !nn_model::netaddr::is_public(dst) {
         return DnsResolution::NotJudged;
+    }
+    if !caught_up {
+        return DnsResolution::Unknown;
     }
     let Some(since) = table.sensor_since() else {
         return DnsResolution::Unknown;
@@ -131,39 +137,39 @@ mod tests {
         let lineage = AuthSessionTracker::new(proc.path());
         let lan = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(
-            judge(&t, &lineage, 42, 5 * S, lan, 10 * S),
+            judge(&t, &lineage, 42, 5 * S, lan, 10 * S, true),
             DnsResolution::NotJudged
         );
         // no sensor: unknown
         assert_eq!(
-            judge(&t, &lineage, 42, 5 * S, C2, 10 * S),
+            judge(&t, &lineage, 42, 5 * S, C2, 10 * S, true),
             DnsResolution::Unknown
         );
         let claim = ResolvedClaim::new(Arc::clone(&t), 2 * S);
         assert!(t.ingest().covers(0));
         // started after the sensor, nothing resolved: unresolved
         assert_eq!(
-            judge(&t, &lineage, 42, 5 * S, C2, 10 * S),
+            judge(&t, &lineage, 42, 5 * S, C2, 10 * S, true),
             DnsResolution::Unresolved
         );
         // at the same instant as the sensor: judged
         assert_eq!(
-            judge(&t, &lineage, 42, 2 * S, C2, 10 * S),
+            judge(&t, &lineage, 42, 2 * S, C2, 10 * S, true),
             DnsResolution::Unresolved
         );
         // started before it: unknown
         assert_eq!(
-            judge(&t, &lineage, 42, S, C2, 10 * S),
+            judge(&t, &lineage, 42, S, C2, 10 * S, true),
             DnsResolution::Unknown
         );
         // start unknown, not in the spawn cache: unknown
         assert_eq!(
-            judge(&t, &lineage, 42, 0, C2, 10 * S),
+            judge(&t, &lineage, 42, 0, C2, 10 * S, true),
             DnsResolution::Unknown
         );
         // gone from /proc, its start from the spawn cache
         lineage.ingest_exec(43, 1, "/usr/bin/curl", &[], 4 * S, 3 * S, 0);
-        let got = judge(&t, &lineage, 43, 0, C2, 10 * S);
+        let got = judge(&t, &lineage, 43, 0, C2, 10 * S, true);
         assert!(
             matches!(got, DnsResolution::Unresolved | DnsResolution::Unknown),
             "{got:?}"
@@ -178,11 +184,21 @@ mod tests {
                 ttl: 60,
                 addr: C2,
             }],
+            complete: true,
+            resolver: false,
         });
         assert_eq!(
-            judge(&t, &lineage, 42, 5 * S, C2, 10 * S),
+            judge(&t, &lineage, 42, 5 * S, C2, 10 * S, true),
             DnsResolution::Lineage
         );
+        // D2 (review of #495): the DNS pumps had not read the records made
+        // before the connect — unknown, whatever the table holds
+        for dst in [C2, IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 9))] {
+            assert_eq!(
+                judge(&t, &lineage, 42, 5 * S, dst, 10 * S, false),
+                DnsResolution::Unknown
+            );
+        }
         drop(claim);
         assert_eq!(t.sensor_since(), None);
         // a sensor that did not attach claims nothing: unknown, and a
@@ -197,7 +213,7 @@ mod tests {
         let p = PumpClaim::if_attached(&ingest, true).expect("attached");
         drop(p);
         assert_eq!(
-            judge(&t, &lineage, 44, 5 * S, C2, 10 * S),
+            judge(&t, &lineage, 44, 5 * S, C2, 10 * S, true),
             DnsResolution::Unknown
         );
     }

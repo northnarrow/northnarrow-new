@@ -37,6 +37,83 @@ pub struct RingDrops {
     audit: LateAudit,
     posture: Arc<OnceLock<PostureSink>>,
     install_failure: Option<String>,
+    /// The map, shared with the pumps that watch their own slots
+    /// ([`LossWatch`]).
+    map: Option<Arc<PerCpuArray<MapData, u64>>>,
+}
+
+/// Review of #495, D3: a DNS sensor's losses, read by its pump at the start
+/// of each pass — its ring full, its records held back by a process's or a
+/// user's budget. They grew since the last pass: the DNS evidence is
+/// incomplete host-wide (the pump degrades the resolved table), whoever
+/// lost the record. A pass that serves a connect began after the connect,
+/// so it sees every loss before it.
+pub struct LossWatch {
+    map: Option<Arc<PerCpuArray<MapData, u64>>>,
+    slots: &'static [u32],
+    last: Option<u64>,
+}
+
+impl LossWatch {
+    /// A watch of nothing (no map: a test, a run without the counters).
+    pub fn none() -> Self {
+        Self {
+            map: None,
+            slots: &[],
+            last: None,
+        }
+    }
+
+    /// The slots' sum now; `None` when it cannot be read.
+    fn read(&self) -> Option<u64> {
+        let map = self.map.as_ref()?;
+        let mut sum = 0u64;
+        for slot in self.slots {
+            let per_cpu = map.get(slot, 0).ok()?;
+            sum = sum.saturating_add(per_cpu.iter().sum::<u64>());
+        }
+        Some(sum)
+    }
+
+    /// The losses grew since the last call: a loss, or counters that
+    /// cannot be read (no evidence of none). The first read sets the base.
+    pub fn grew(&mut self) -> bool {
+        if self.map.is_none() {
+            return false;
+        }
+        let now = self.read();
+        self.grew_to(now)
+    }
+
+    fn grew_to(&mut self, now: Option<u64>) -> bool {
+        match (self.last, now) {
+            (_, None) => true,
+            (None, Some(n)) => {
+                self.last = Some(n);
+                false
+            }
+            (Some(p), Some(n)) => {
+                self.last = Some(n);
+                n > p
+            }
+        }
+    }
+}
+
+impl RingDrops {
+    /// A watch of `slots`, its base read now.
+    pub fn loss_watch(&self, slots: &'static [u32]) -> LossWatch {
+        let mut w = LossWatch {
+            map: self.map.clone(),
+            slots,
+            last: None,
+        };
+        if w.map.is_some() {
+            let now = w.read();
+            w.last = now;
+        }
+        w
+    }
 }
 
 impl RingDrops {
@@ -370,7 +447,11 @@ pub fn install(ebpf: &mut Ebpf) -> RingDrops {
             ));
         }
     };
-    let bindings = RingDrops::default();
+    let map = Arc::new(map);
+    let bindings = RingDrops {
+        map: Some(Arc::clone(&map)),
+        ..RingDrops::default()
+    };
     let (audit, posture) = (bindings.audit.clone(), Arc::clone(&bindings.posture));
     info!(
         rings = RING_DROP_SLOTS,
@@ -416,6 +497,24 @@ pub fn install(ebpf: &mut Ebpf) -> RingDrops {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review of #495, D3: a DNS pump's loss watch — the first read is the
+    /// base, a growth or an unreadable counter is a loss, a steady one none;
+    /// no map, no watch.
+    #[test]
+    fn a_loss_watch_sees_growth_and_unreadable_counters() {
+        let mut w = LossWatch::none();
+        assert!(!w.grew(), "no map: nothing watched");
+        assert!(!w.grew_to(Some(5)), "the base");
+        assert!(!w.grew_to(Some(5)));
+        assert!(w.grew_to(Some(6)));
+        assert!(!w.grew_to(Some(6)));
+        assert!(w.grew_to(None), "unreadable: no evidence of none");
+        assert!(!w.grew_to(Some(6)));
+        // a watch from the counters with no map
+        let mut w = RingDrops::default().loss_watch(&[1, 2]);
+        assert!(!w.grew());
+    }
 
     #[test]
     fn snapshot_names_match_slots_and_nonzero_filters() {

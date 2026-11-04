@@ -30,6 +30,10 @@ and how an operator tunes it. The sources' terms are in
   process; 2,048, then 1,024 a second, per user. An accept over it is not
   recorded (nor its close), counted in `inbound_rate`, and the process's
   next record carries the count (`SensorFlood`, NN-L-NET-021).
+- **Limits:** the accepted sockets are kept in an LRU map of 65,536; past
+  it (more connections accepted and open at once) the oldest entry goes,
+  not counted, and that connection's close is not recorded (review of
+  #495, N4).
 
 ## 2. DNS responses (`dns_answer`)
 
@@ -48,11 +52,16 @@ and how an operator tunes it. The sources' terms are in
 - **Budget:** 64 responses at once, then 128 a second, per process; 2,048,
   then 1,024 a second, per user; the local resolvers' users exempt (as for
   the queries). Held responses are counted (`dns_answer_rate`) and carried
-  by the next record.
+  by the next record. One user's burst (2,048 records of 576 bytes) is more
+  than the ring holds (512 KiB, about 910): the ring's losses are counted
+  (`dns_answer`), as the DNS query ring's are. Either loss makes
+  NN-L-NET-028's evidence unknown for every process for 5 minutes (review
+  of #495, N3 and D3).
 - **Not seen:** DNS over TCP, DNS over TLS or HTTPS (a browser's own DoH, a
   resolver configured `DNSOverTLS=yes` upstream), a response longer than
-  512 bytes past the cut (its first records are read; it says
-  `truncated`).
+  512 bytes past the cut, or than the receiver's buffer (its first records
+  are read; it says `truncated`, as for a response with the server's TC
+  bit or a malformed record).
 - **Kernels:** `udp_recvmsg` lost its `noblock` parameter in 5.19: six
   parameters before, five after, read from the BTF as for the accept.
 
@@ -82,27 +91,40 @@ and how an operator tunes it. The sources' terms are in
   sender can rewrite them meanwhile, as it can shape its hello like another
   client's); a hello sent with the connect (TCP Fast Open) is not seen; a
   hello over 4,096 bytes, or split over several sends, is `incomplete`, no
-  fingerprint.
+  fingerprint. The connected sockets awaiting their first send are kept in
+  an LRU map of 65,536: a flood of connects that never send evicts the
+  oldest marks, not counted, and those flows' hellos are not seen (review
+  of #495, N4; NN-L-NET-003 only records). One user's burst (512 hellos of
+  4,176 bytes) is more than the 1 MiB ring holds (about 250): losses
+  counted (`tls`). NN-L-NET-003 records each listed hello, with no
+  deduplication (N8).
 
 ## 4. NN-L-NET-028 — "no DNS, no connect"
 
 Legitimate software nearly always looks a name up before it connects; an
 implant often carries an address in its code. NN-L-NET-028 records a TCP
-connect, or a UDP send, to a **public** address that the process and its
-ancestors did not resolve through the system resolver: no DNS response the
-lineage received named the address, and no name it asked for resolved to
-it.
+connect, or a UDP send, to a **public** address the DNS evidence does not
+bind to the process or an ancestor: no DNS response the lineage received
+(a datagram from port 53, of the question's chain only) named the address,
+and no response a **system resolver** received for a name the lineage asked
+did. A system resolver is its executable — `systemd-resolved`, `dnsmasq`,
+`nscd` or `unbound`, at its path in the system tree — run by a system uid,
+never a process name: any other process's response binds that process
+only.
 
-- **Verdict:** Medium when no process on the host resolved the address,
-  Low when only another process did (a shared CDN address, an address
-  handed over between processes). Once per process and destination every
-  10 minutes. Its response, `KillProcess`, is **held** behind the per-rule
-  policy, off by default: the verdict is `Log`. `enforce NN-L-NET-028` in
-  the signed `rule-policy.local` gives the kill back.
+- **Verdict:** Medium when nothing bound the address, Low when only a
+  system resolver's response for another lineage named it (a shared CDN
+  address). Once per process and destination every 10 minutes. Its
+  response, `KillProcess`, is **held** behind the per-rule policy: the
+  verdict is `Log`, and the policy refuses `enforce NN-L-NET-028` for now
+  (review of #495: an answer can be missing for benign reasons the agent
+  cannot see — [RULE_POLICY.md](RULE_POLICY.md) §2).
 - **Per lineage:** a binding is `(process, address)`, made when a response
-  names the address to a process that received it or asked for its name
-  (within 10 s, or later from the host's table of names, CNAME chains
-  followed). It lasts for the name's TTL (at least 300 s, at most a day),
+  names the address to the process that received it, or — a system
+  resolver's response — to a process that asked for its name (within 10 s,
+  or later from the host's table of names, CNAME chains followed). Only the
+  records of the question's chain count (its name, its CNAMEs' targets);
+  any other record of a response is ignored. It lasts for the name's TTL (at least 300 s, at most a day),
   then 2 hours past each use: a daemon that resolved its peers once keeps
   them while it uses them. A process's ancestors count; a sibling does not.
 - **Not judged (no record):**
@@ -114,11 +136,17 @@ it.
   - an address of the signed allowlist `nodns-allow.local` (§5);
   - what the agent cannot judge (`unknown`): a process older than the DNS
     response sensor (it may have resolved before the sensor watched); a
-    name the lineage asked whose response was never seen (systemd-resolved
+    process whose start is not known, for a binding it holds; a name the
+    lineage asked whose response was never seen whole (systemd-resolved
     answering from a cache older than the agent, or speaking DNS over TLS
-    upstream); DNS records of the lineage held back by the kernel's
-    budgets; for 5 minutes after a DNS record the parse worker could not
-    decode; the DNS response sensor not running.
+    upstream; a response cut at 512 bytes, with the server's TC bit or a
+    malformed record); DNS records of the lineage held back by its budget;
+    **for every process, for 5 minutes** after a DNS record the parse
+    worker could not decode, a user's DNS records held back, or a DNS ring
+    or budget that lost records; a connect judged before the DNS pumps had
+    read the records made before it; the DNS response sensor not running.
+    A DNS flood therefore blinds the rule for a while (the floods
+    themselves are NN-L-NET-020's records); it never alerts.
 - **"IP in the name":** an address its own name spells (`1-2-3-4.nip.io`,
   `1.2.3.4.sslip.io`, its hexadecimal form) binds nothing: such a name is a
   connect to that address.
@@ -144,8 +172,11 @@ it.
 - **The per-rule policy** (`rule-policy.local`, [RULE_POLICY.md](RULE_POLICY.md)):
   `off NN-L-NET-028` drops it, `audit NN-L-NET-028` records without
   counting, `exempt NN-L-NET-028 exe <path> sha256 <hex>` (or `uid`,
-  `unit`) spares one program; `enforce NN-L-NET-028` arms the held kill.
-- **False positives measured** (lot 275's lab, `deploy/lab/malsim/nodns-fp.sh`,
+  `unit`) spares one program. `enforce NN-L-NET-028` is refused (a policy
+  you sign with it is refused; one signed before is applied with the line
+  as `alert`, a signed degradation): its kill stays held.
+- **False positives measured** (lot 275's lab before the review of #495,
+  `deploy/lab/malsim/nodns-fp.sh`,
   every NN-L-NET-028 record of a workload's window counted, also under
   another rule's record of the same event): **none** on Ubuntu 24.04 (6.8)
   and 22.04 (5.15) over `apt-get update` and a download-only install, 40
@@ -163,10 +194,15 @@ it.
   resolve outside the system resolver (DoH, a resolver of their own);
   peers configured by address (NTP servers, database replicas, mirrors by
   IP); rootless container networking whose helper (`slirp4netns`, `pasta`)
-  connects for a container that resolved inside its own namespace; a ring
-  overflow of the DNS sensors (counted in `dns`, `dns_answer`) that lost a
-  response. Load tools that connect to literal addresses draw it too: the
-  lab's EXP-13 probe does, by design.
+  connects for a container that resolved inside its own namespace; a
+  container on Docker's default bridge whose resolvers fall back to public
+  ones (8.8.8.8: its processes' UDP sends to port 53 are judged, and the
+  answers they receive bind only themselves — review of #495, N5); a
+  response a process received from a resolver it runs itself that is no
+  system resolver. Load tools that connect to literal addresses draw it
+  too: the lab's EXP-13 probe does, by design. A DNS ring's overflow, or
+  records held back by a budget, no longer draws it: the evidence is then
+  unknown for every process for 5 minutes.
 
 ## 6. What it costs
 
@@ -186,7 +222,11 @@ running, every source on; Ubuntu 24.04 / 22.04 guests):
 | `dns` (queries sent) | +16.5 % | +10.5 % | +2.3 % | +16.1 % |
 
 The UDP receive path is where the cost is: every receive runs the DNS
-response program (most of them stop at the source port). The workloads
+response program. Before the review of #495 it read the source's pointer,
+family, port and address before the port's test; from then the family and
+the port in one read and the address only for port 53 (the figures above
+are from before; the sensor contract's overhead entries, in the signed
+manifest, are from after). The workloads
 `udprecv` and `tcpsend` are new with this lot (no `main` figure). The
 rounds are noisy (`connect` on 22.04's `main` run reads −8.4 %); the
 per-run reports are in the capability program's lot 275 note.

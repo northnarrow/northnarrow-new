@@ -652,8 +652,10 @@ pub struct DnsAnswerRaw {
     pub uid: u32,
     pub comm: [u8; TASK_COMM_LEN],
     pub server: [u8; ADDR_LEN],
-    /// The bytes the receive returned (the datagram's length, or less when
-    /// the buffer was shorter).
+    /// The receive's return value: the bytes copied, or — `MSG_TRUNC` —
+    /// the datagram's length, longer than the buffer (review of #495, N1:
+    /// what is read is at most the buffer's length, and a datagram longer
+    /// than what was read is `TRUNCATED`).
     pub datagram_len: u32,
     /// The bytes of `payload` read (at most [`DNS_ANSWER_CAP`]).
     pub captured: u16,

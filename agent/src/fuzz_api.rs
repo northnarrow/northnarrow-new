@@ -629,6 +629,20 @@ mod tests {
             }
         }
         assert!(ok >= 1 && refused >= 2, "ok {ok}, refused {refused}");
+        // review of #495, N6: a seed whose refused enforce the start applies
+        // as alert, the rest in force
+        let mut demoted = 0;
+        for (name, bytes) in inputs("seeds", "rule_policy") {
+            let b = crate::decision::rule_policy::boot_policy(Some((
+                std::path::Path::new("/etc/northnarrow/rule-policy.local"),
+                text(&bytes),
+            )));
+            if b.demoted.is_some() {
+                assert!(!b.policy.is_builtin(), "{name}");
+                demoted += 1;
+            }
+        }
+        assert!(demoted >= 1, "no seed reaches the start's demotion");
     }
 
     #[test]

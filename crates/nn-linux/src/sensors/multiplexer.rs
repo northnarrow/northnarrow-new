@@ -638,6 +638,11 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     resolved_for_dns,
                     lineage_for_dns.clone(),
                     ParseClient::new(plan.parse.clone()),
+                    // review of #495, D3: its ring's and its budget's losses
+                    ring_drops.loss_watch(&[
+                        common::ring_drops::ring_slot::DNS,
+                        common::ring_drops::ring_slot::DNS_RATE,
+                    ]),
                     &tx,
                     &rt,
                 )?),
@@ -690,6 +695,11 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     net_attached.dns_answer,
                     w.lineage.clone(),
                     ParseClient::new(plan.parse.clone()),
+                    // review of #495, D3: its ring's and its budget's losses
+                    ring_drops.loss_watch(&[
+                        common::ring_drops::ring_slot::DNS_ANSWER,
+                        common::ring_drops::ring_slot::DNS_ANSWER_RATE,
+                    ]),
                     &tx,
                     &rt,
                 )?),
@@ -1407,13 +1417,14 @@ impl Drop for ConnectPumpClaim {
 fn send_connects(
     raws: &[TcpConnectRaw],
     wiring: Option<&ConnectWiring>,
+    caught_up: bool,
     tx: &BusSender,
     rt: &tokio::runtime::Handle,
 ) -> bool {
     for chunk in raws.chunks(crate::sensors::bus::BATCH_MAX / 2) {
         let events: Vec<Event> = chunk
             .iter()
-            .flat_map(|raw| connect_events(raw, wiring))
+            .flat_map(|raw| connect_events(raw, wiring, caught_up))
             .collect();
         if tx.send_batch_blocking(rt, events).is_err() {
             return false;
@@ -1461,20 +1472,23 @@ fn pump_tcp_connect(
         // Lab PR 229: the connect-time rows name the destination's DNS name
         // once the DNS pump has read the queries made before these
         // connects (`DnsIngest`); read later, a query was not there yet.
+        let mut caught_up = true;
         if let (Some(w), Some(newest)) = (
             flow_tracker.as_ref(),
             batch.iter().map(|r| r.timestamp_ns).max(),
         ) {
             // Lot 275: and once the DNS response pump has read the responses
-            // received before them (NN-L-NET-028's judgement)
-            rt.block_on(async {
+            // received before them (NN-L-NET-028's judgement). Review of
+            // #495, D2: a wait that ended first leaves the judgement unknown.
+            let (names, answers) = rt.block_on(async {
                 tokio::join!(
                     w.dns_cache.ingest().caught_up(newest),
                     w.resolved.ingest().caught_up(newest)
                 )
             });
+            caught_up = names && answers;
         }
-        if !send_connects(&batch, flow_tracker.as_ref(), tx, rt) {
+        if !send_connects(&batch, flow_tracker.as_ref(), caught_up, tx, rt) {
             return Ok(());
         }
         batch.clear();
@@ -1500,7 +1514,14 @@ fn pump_tcp_connect(
 ///   [`send_connects`]): the net drain holds its close until then.
 ///   Without net wiring (the exec sensor's live test) only the
 ///   `TcpConnect`.
-fn connect_events(raw: &TcpConnectRaw, wiring: Option<&ConnectWiring>) -> Vec<Event> {
+///
+/// `caught_up`: the DNS pumps read the records made before the batch's
+/// connects (NN-L-NET-028's barrier; `false`: unknown, review of #495 D2).
+fn connect_events(
+    raw: &TcpConnectRaw,
+    wiring: Option<&ConnectWiring>,
+    caught_up: bool,
+) -> Vec<Event> {
     let Some(w) = wiring else {
         return vec![Event::from(raw)];
     };
@@ -1528,6 +1549,7 @@ fn connect_events(raw: &TcpConnectRaw, wiring: Option<&ConnectWiring>) -> Vec<Ev
             row.proc_start_ns,
             row.dst_addr,
             row.start_ns,
+            caught_up,
         );
         out.push(Event::NetFlow(row));
     }
@@ -1642,7 +1664,11 @@ fn dns_events(
                 // the parse worker did not answer: the name is not known
                 t.note_undecoded(*timestamp_ns);
             }
-            if raw.held != 0 {
+            // review of #495, D3: a user's held queries leave every
+            // process's evidence incomplete; a process's, its lineage's
+            if raw.held != 0 && raw.flags & dns_flags::RATE_HELD_UID != 0 {
+                t.note_undecoded(*timestamp_ns);
+            } else if raw.held != 0 {
                 t.note_held(*pid, *timestamp_ns);
             }
         }
@@ -1688,7 +1714,11 @@ fn nss_events(
         _ => {}
     }
     if let (Some(t), true) = (resolved, raw.held != 0) {
-        t.note_held(raw.pid, raw.timestamp_ns);
+        if raw.flags & dns_flags::RATE_HELD_UID != 0 {
+            t.note_undecoded(raw.timestamp_ns);
+        } else {
+            t.note_held(raw.pid, raw.timestamp_ns);
+        }
     }
     if let (Some(cache), Some(name)) = (dns_cache, name) {
         cache.on_dns_query(
@@ -1715,12 +1745,14 @@ fn nss_events(
 /// as its ring's records, so the thread runs the pump's own loop on the
 /// runtime's reactor (`Handle::block_on`): woken by either, it sends a
 /// pass's events in batches.
+#[allow(clippy::too_many_arguments)]
 fn spawn_dns_query_pump(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
     resolved: Option<Arc<crate::net::resolved::ResolvedTable>>,
     lineage: AuthSessionTracker,
     parse: ParseClient,
+    losses: crate::sensors::ring_drops::LossWatch,
     tx: &BusSender,
     rt: &tokio::runtime::Handle,
 ) -> Result<PumpThread> {
@@ -1736,18 +1768,20 @@ fn spawn_dns_query_pump(
     PumpThread::spawn("dns_query", move |stop| {
         let _claim = claim;
         rt.block_on(pump_dns_query(
-            rb, dns_cache, resolved, lineage, parse, tx, stop,
+            rb, dns_cache, resolved, lineage, parse, losses, tx, stop,
         ))
     })
     .context("starting the dns_query pump's thread")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pump_dns_query(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
     resolved: Option<Arc<crate::net::resolved::ResolvedTable>>,
     lineage: AuthSessionTracker,
     mut parse: ParseClient,
+    mut losses: crate::sensors::ring_drops::LossWatch,
     tx: BusSender,
     stop: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()> {
@@ -1775,6 +1809,7 @@ async fn pump_dns_query(
                     dns_cache.as_deref(),
                     resolved.as_deref(),
                     &mut parse,
+                    &mut losses,
                     &mut reject,
                     &mut outbox,
                 );
@@ -1798,6 +1833,7 @@ async fn pump_dns_query(
                     dns_cache.as_deref(),
                     resolved.as_deref(),
                     &mut parse,
+                    &mut losses,
                     &mut reject,
                     &mut outbox,
                 );
@@ -1834,16 +1870,24 @@ enum DnsStep {
 /// `outbox`, the cache fed. Returns the records read. Lab PR 229: the pass
 /// is marked in the cache's [`crate::net::dns_cache::DnsIngest`] with the
 /// time it began — every record submitted before it has been read.
+#[allow(clippy::too_many_arguments)]
 fn dns_pass(
     ring: &mut RingBuf<MapData>,
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
     resolved: Option<&crate::net::resolved::ResolvedTable>,
     parse: &mut ParseClient,
+    losses: &mut crate::sensors::ring_drops::LossWatch,
     reject: &mut RejectThrottle,
     outbox: &mut VecDeque<Event>,
 ) -> u32 {
     let began_ns = crate::net::dns_cache::monotonic_ns();
+    // review of #495, D3: a query lost before this pass (the ring full, a
+    // process's or a user's budget) leaves every process's evidence
+    // incomplete, whoever lost it
+    if let (Some(t), true) = (resolved, losses.grew()) {
+        t.note_undecoded(began_ns);
+    }
     let mut drained = 0u32;
     // R14b: the pass's records first (copied off the ring), then their
     // names decoded by the parse worker in batches, then the events
@@ -2049,7 +2093,7 @@ mod tests {
         raw.dst_addr[..4].copy_from_slice(&[127, 0, 0, 1]);
         raw.timestamp_ns = 10_000;
         raw.sk_ptr = 0xdead;
-        let events = connect_events(&raw, Some(&w));
+        let events = connect_events(&raw, Some(&w), true);
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], Event::TcpConnect { pid: 4500, .. }));
         let Event::NetFlow(row) = &events[1] else {
@@ -2060,7 +2104,7 @@ mod tests {
         assert_eq!(row.resolved_hostname.as_deref(), Some("c2.example"));
         assert_eq!(w.flow_tracker.lock().pending_len(), 1);
         // Without net wiring: the `TcpConnect` alone, as before.
-        assert_eq!(connect_events(&raw, None).len(), 1);
+        assert_eq!(connect_events(&raw, None, true).len(), 1);
         // Review #471 A1: a later exec of the pid, ingested before the
         // connect is read, does not name it — the image as of the connect.
         w.lineage.ingest_spawn(4500, 1, "/usr/sbin/nginx", 20_000);
@@ -2068,7 +2112,7 @@ mod tests {
             let mut r = raw;
             r.timestamp_ns = ts;
             r.sk_ptr = sk;
-            match &connect_events(&r, Some(&w))[1] {
+            match &connect_events(&r, Some(&w), true)[1] {
                 Event::NetFlow(row) => row.exe.clone(),
                 e => panic!("{e:?}"),
             }
@@ -2104,7 +2148,7 @@ mod tests {
         let corr = FlowTracker::corr_id(raw.timestamp_ns, raw.sk_ptr);
         assert!(!w.flow_tracker.lock().close_may_proceed(&corr));
         let (tx, mut rx) = crate::sensors::bus::channel();
-        assert!(send_connects(&[raw], Some(&w), &tx, rt.handle()));
+        assert!(send_connects(&[raw], Some(&w), true, &tx, rt.handle()));
         assert!(matches!(
             rx.try_recv().map(|r| r.envelope.event),
             Some(Event::TcpConnect { pid: 4700, .. })
@@ -2122,7 +2166,7 @@ mod tests {
         // A closed bus: not announced.
         drop(rx);
         raw.timestamp_ns = 40_000;
-        assert!(!send_connects(&[raw], Some(&w), &tx, rt.handle()));
+        assert!(!send_connects(&[raw], Some(&w), true, &tx, rt.handle()));
     }
 
     /// Lab PR 224 (CM-02 c): a record of the `socket_connect` deny is its
@@ -2139,7 +2183,7 @@ mod tests {
         raw.proto = 17;
         raw.dst_port = 53;
         raw.dst_addr[..4].copy_from_slice(&[192, 0, 2, 7]);
-        let events = connect_events(&raw, Some(&w));
+        let events = connect_events(&raw, Some(&w), true);
         assert_eq!(events.len(), 1);
         let Event::NetFlow(row) = &events[0] else {
             panic!("{:?}", events[0]);
@@ -2319,6 +2363,9 @@ mod tests {
                     ttl: 60,
                     addr: c2,
                 }],
+                // a system resolver's, whose names bind their askers
+                complete: true,
+                resolver: true,
             })
         };
         let decode = |raw: &DnsQueryRaw| -> nn_proto::ipc::QnameOut {
@@ -2392,6 +2439,8 @@ mod tests {
                     ttl: 60,
                     addr: web,
                 }],
+                complete: true,
+                resolver: true,
             });
             t
         };
@@ -2415,6 +2464,25 @@ mod tests {
             t.check(4801, 1, c2, 3 * S, Vec::new),
             DnsResolution::OtherLineage
         );
+        // review of #495, D3: a user's held queries degrade every process
+        for (q, pid) in [(&raw, 4801u32), (&nss, 4701)] {
+            let t = held_table();
+            let mut uheld = *q;
+            uheld.held = 4;
+            uheld.flags |= dns_flags::RATE_HELD | dns_flags::RATE_HELD_UID;
+            if q.flags & dns_flags::NSS != 0 {
+                let d = decode(&uheld);
+                let _ = nss_events(&uheld, Some(&d), &lineage, None, Some(&t));
+            } else {
+                let d = decode(&uheld);
+                let _ = dns_events(&uheld, Some(&d), &lineage, None, Some(&t));
+            }
+            assert_eq!(
+                t.check(pid, 1, c2, 3 * S, Vec::new),
+                DnsResolution::Unknown,
+                "another process than the reporter"
+            );
+        }
         let d = decode(&nss);
         let t = held_table();
         let _ = nss_events(&nss, Some(&d), &lineage, None, Some(&t));

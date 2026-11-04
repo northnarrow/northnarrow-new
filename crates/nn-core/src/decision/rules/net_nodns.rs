@@ -4,9 +4,14 @@
 //! with idea 8). Legitimate software nearly always looks a name up before
 //! it connects; an implant often does not (an address in its code: Unit 42
 //! found a direct-to-IP connection in 45% of the C2 samples it measured).
-//! A TCP connect or a UDP send to a **public** address that the process
-//! and its ancestors did not resolve recently through the system resolver
-//! is a detection: the connect pump and the net drain compute what the DNS
+//! A TCP connect or a UDP send to a **public** address that the DNS
+//! evidence does not bind to the process or an ancestor is a detection.
+//! Bound (`crate::net::resolved`, review of #495): an address of a DNS
+//! response the process or an ancestor received itself (a datagram from
+//! port 53, its question's chain only), or of a response a system resolver
+//! received (its executable and a system uid) for a name the process or an
+//! ancestor asked within [`crate::net::resolved::ASK_WINDOW_SECS`]. The
+//! connect pump and the net drain compute what the DNS
 //! evidence says of the destination (`nn_model::telemetry::DnsResolution`,
 //! from `crate::net::resolved`), and this rule judges it.
 //!
@@ -15,16 +20,18 @@
 //!   shared CDN address, or an address handed over from another process).
 //!   The kill of the process (`KillProcess`) is held behind the per-rule
 //!   response policy ([`super::super::response_policy::NODNS_KILL`]), off by
-//!   default: `enforce NN-L-NET-028` in the signed `rule-policy.local` gives
-//!   it back.
+//!   default; the policy refuses `enforce NN-L-NET-028` for now
+//!   ([`crate::decision::rule_policy::ENFORCE_REFUSED`], review of #495: an
+//!   answer can be missing for benign reasons the agent cannot see).
 //! - Not judged: a destination that is not public
 //!   ([`nn_model::netaddr::is_public`]: loopback, RFC 1918, ULA, link-local,
 //!   CGNAT, multicast…), a configured resolver (`resolv.conf`'s
 //!   `nameserver`s, systemd-resolved's upstream servers), an address of the
 //!   signed allowlist `nodns-allow.local` ([`NoDnsAllowlist`]), a
 //!   destination whose evidence is `Unknown` (the process predates the DNS
-//!   response sensor, a name it asked was answered unseen, its DNS records
-//!   were held back) or `Lineage`.
+//!   response sensor, a name it asked was answered unseen or incompletely,
+//!   DNS records were held back or lost, the DNS pumps had not caught up)
+//!   or `Lineage`.
 //! - Once per process and destination per [`DEDUP_SECS`]: a UDP flow's rows
 //!   come once a second.
 //! - The per-rule policy's exemptions (an executable with its digest, a
@@ -251,11 +258,13 @@ impl Rule for NnLNet028ConnectWithoutDns {
         let (severity, why) = match nf.dns_resolution {
             DnsResolution::OtherLineage => (
                 Severity::Low,
-                "only another process on the host resolved it, not this one nor an ancestor",
+                "only a system resolver's response for another lineage named it, not one for \
+                 this process nor an ancestor",
             ),
             _ => (
                 Severity::Medium,
-                "no process on the host resolved it through the system resolver",
+                "no DNS response the process or an ancestor received, nor a system resolver's \
+                 for a name they asked, named it",
             ),
         };
         let image = nf.exe.as_deref().unwrap_or(nf.comm.as_str());
@@ -345,7 +354,11 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(v.severity, Severity::Low);
-        assert!(v.reasoning.contains("another process"));
+        assert!(
+            v.reasoning.contains("for another lineage"),
+            "{}",
+            v.reasoning
+        );
     }
 
     /// The lineage's own resolution, an unknown one, an unjudged row: no.

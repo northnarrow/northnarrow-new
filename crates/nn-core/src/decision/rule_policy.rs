@@ -114,13 +114,22 @@ pub const RANSOMWARE_RULE: &str = "NN-L-IMP-001_RansomwareEncryption";
 /// only that line is taken as `alert`, the rest in force, and the start
 /// signs a degradation naming the line: refusing the whole file would drop
 /// its exemptions, its other modes and its switches for one line.
-pub const ENFORCE_REFUSED: &[(&str, &str)] = &[(
-    "NN-L-NET-003_BadJa3",
-    "it matches a TLS fingerprint alone, an attribute of the TLS stack that every program on \
-     the same library and settings shares, not a program's identity (the fingerprint alone \
-     finds 6.82 % of malware, 88.68 % with the destination: Anderson & McGrew); it has no \
-     second predicate, a destination or an executable, to act on — `alert` or `audit` it",
-)];
+pub const ENFORCE_REFUSED: &[(&str, &str)] = &[
+    (
+        "NN-L-NET-003_BadJa3",
+        "it matches a TLS fingerprint alone, an attribute of the TLS stack that every program on \
+         the same library and settings shares, not a program's identity (the fingerprint alone \
+         finds 6.82 % of malware, 88.68 % with the destination: Anderson & McGrew); it has no \
+         second predicate, a destination or an executable, to act on — `alert` or `audit` it",
+    ),
+    (
+        "NN-L-NET-028_ConnectWithoutDns",
+        "it judges the absence of a DNS answer the agent saw, and an answer can be missing for \
+         benign reasons it cannot see (a container's resolvers of its own, a client's DNS over \
+         TCP, DoT or DoH, an address configured by hand): a kill on it is not fail-safe until it \
+         is measured on a wider corpus (review of #495) — `alert` or `audit` it",
+    ),
+];
 
 /// Why `enforce <id>` is refused, if it is.
 pub fn enforce_refused(id: &str) -> Option<&'static str> {
@@ -1040,10 +1049,28 @@ mod tests {
             assert_eq!(p.mode(NET_003).map(Mode::keyword), Some(mode), "{mode}");
         }
         assert!(parse("exempt NN-L-NET-003 uid 1000\n").is_ok());
-        assert!(parse("enforce NN-L-NET-028\n").is_ok());
+        assert!(parse("enforce NN-L-IMP-001\n").is_ok());
+        // review of #495: NN-L-NET-028's kill is not fail-safe either
+        assert!(parse("enforce NN-L-NET-028\n").is_err());
+        let b = boot_policy(Some((
+            Path::new("/etc/northnarrow/rule-policy.local"),
+            "enforce NN-L-NET-028\noff R008\n",
+        )));
+        assert_eq!(
+            b.policy.mode("NN-L-NET-028_ConnectWithoutDns"),
+            Some(Mode::Alert)
+        );
+        assert_eq!(
+            b.policy.mode(resolve_rule("R008").unwrap()),
+            Some(Mode::Off)
+        );
+        assert!(b
+            .demoted
+            .unwrap()
+            .contains("line 1: enforce NN-L-NET-028_ConnectWithoutDns refused, applied as alert"));
         assert_eq!(
             ENFORCE_REFUSED.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
-            vec![NET_003]
+            vec![NET_003, "NN-L-NET-028_ConnectWithoutDns"]
         );
         // every refused id is a rule the policy knows
         for (id, why) in ENFORCE_REFUSED {

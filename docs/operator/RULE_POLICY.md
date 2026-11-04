@@ -55,11 +55,17 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CAT
 | `exempt <rule> unit <name>` | processes of that systemd unit (`backup.service`) |
 | `combat-without-corroboration NN-L-IMP-001` | the ransomware trigger reaches COMBAT without a second signal (it never locks COMBAT) |
 
-`enforce` is **refused** for a rule that matches one attribute many benign
-programs share, until the rule has a second predicate (a destination, an
-executable) to act on: today NN-L-NET-003, a TLS fingerprint (JA3 or JA4)
-in the operator's list (lot 275, R6 of the external review of 04/11; a
-fingerprint names a TLS stack, not a program — `NETWORK_TELEMETRY.md` §3).
+`enforce` is **refused** for a rule whose kill would not be fail-safe:
+- NN-L-NET-003, a TLS fingerprint (JA3 or JA4) in the operator's list — one
+  attribute many benign programs share, until the rule has a second
+  predicate (a destination, an executable) to act on (lot 275, R6 of the
+  external review of 04/11; a fingerprint names a TLS stack, not a program
+  — `NETWORK_TELEMETRY.md` §3);
+- NN-L-NET-028, "no DNS, no connect" — it judges the absence of a DNS
+  answer the agent saw, which benign software can produce out of its sight
+  (a container's resolvers of its own, DNS over TCP, DoT or DoH, an address
+  configured by hand): refused until it is measured on a wider corpus
+  (review of #495; `NETWORK_TELEMETRY.md` §4). Its kill stays held.
 In a policy you sign, the line refuses the file like any bad line
 (`nn-admin config overlay set` and `policy-test` say so). In a policy
 signed before the upgrade, the agent's start takes only that line as

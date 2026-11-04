@@ -22,6 +22,8 @@ const TYPE_A: u16 = 1;
 const TYPE_CNAME: u16 = 5;
 const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
+/// The header's TC bit: the server truncated the response.
+const FLAG_TC: u16 = 0x0200;
 /// RFC 1035 §2.3.4: a name's wire form, its root label included.
 const MAX_NAME_WIRE: usize = 255;
 /// Pointers one name may follow: more than a legal name needs (each pointer
@@ -75,9 +77,10 @@ pub struct DnsResponse {
     /// The A, AAAA and CNAME records of class IN, in the message's order;
     /// other records are stepped over.
     pub answers: Vec<AnswerRecord>,
-    /// Every answer was read: the message did not end inside the answer
-    /// section, held no malformed record before its end, and had no more
-    /// than [`MAX_RECORDS`] kept records.
+    /// Every answer was read: the server did not truncate it (TC), the
+    /// message did not end inside the answer section, held no malformed
+    /// record (an A or AAAA of another length included) before its end, and
+    /// had no more than [`MAX_RECORDS`] kept records.
     pub complete: bool,
 }
 
@@ -108,7 +111,9 @@ pub fn parse_response(bytes: &[u8]) -> Option<DnsResponse> {
         qtype,
         rcode: (flags & 0x000f) as u8,
         answers: Vec::new(),
-        complete: true,
+        // review of #495, D1: the TC bit — the server cut the response
+        // itself (the client asks again over TCP, which is not read)
+        complete: flags & FLAG_TC == 0,
     };
     for _ in 0..ancount {
         let Some((name, after)) = read_name(bytes, pos) else {
@@ -160,7 +165,12 @@ pub fn parse_response(bytes: &[u8]) -> Option<DnsResponse> {
                     }
                 }
             }
-            // a malformed A or AAAA, or another type: stepped over
+            // a malformed A or AAAA (D1): stepped over, the response not whole
+            (TYPE_A | TYPE_AAAA, _) => {
+                out.complete = false;
+                continue;
+            }
+            // another type: stepped over
             _ => continue,
         };
         if out.answers.len() == MAX_RECORDS {
@@ -369,6 +379,7 @@ mod tests {
         rr(&mut p, &[0xC0, 12], TYPE_A, 9, &[1, 2, 3]); // a 3-byte A: stepped over
         let r = parse_response(&p).unwrap();
         assert!(r.answers.is_empty());
+        assert!(!r.complete, "the 3-byte A: not whole (D1)");
         // AAAA data of 15 and of 17 bytes: stepped over
         let mut p = Vec::new();
         header(&mut p, 0x8180, 1, 2);
@@ -377,7 +388,8 @@ mod tests {
         rr(&mut p, &[0xC0, 12], TYPE_AAAA, 9, &[7; 15]);
         rr(&mut p, &[0xC0, 12], TYPE_AAAA, 9, &[7; 17]);
         let odd = parse_response(&p).unwrap();
-        assert!(odd.answers.is_empty() && odd.complete);
+        // review of #495, D1: stepped over, the response not whole
+        assert!(odd.answers.is_empty() && !odd.complete);
         let mut p = Vec::new();
         header(&mut p, 0x8183, 1, 3);
         name(&mut p, "nope.example");
@@ -391,7 +403,17 @@ mod tests {
             ("nope.example", 28, 3)
         );
         assert!(r.answers.is_empty());
-        assert!(r.complete);
+        // the 3-byte A: not whole (review of #495, D1)
+        assert!(!r.complete);
+        // NXDOMAIN with a TXT and a CH-class record only: whole
+        let mut p = Vec::new();
+        header(&mut p, 0x8183, 1, 2);
+        name(&mut p, "nope.example");
+        p.extend_from_slice(&[0, 28, 0, 1]);
+        rr(&mut p, &[0xC0, 12], 16, 5, b"\x03txt");
+        p.extend_from_slice(&[0xC0, 12, 0, 1, 0, 3, 0, 0, 0, 5, 0, 4, 1, 2, 3, 4]);
+        let r = parse_response(&p).unwrap();
+        assert!(r.answers.is_empty() && r.complete);
     }
 
     /// A pointer must point back: to itself, forward, or into a loop it is
@@ -484,5 +506,55 @@ mod tests {
         let r = parse_response(&p).unwrap();
         assert_eq!(r.answers.len(), MAX_RECORDS);
         assert!(!r.complete);
+    }
+
+    /// Review of #495, D1 (probe P2, which passed on the PR's first head:
+    /// the TC bit was not read): a response the server truncated is not
+    /// complete; nor is one with a malformed A record, which is stepped
+    /// over.
+    #[test]
+    fn a_truncated_or_malformed_response_is_not_complete() {
+        let mut m = alloc::vec![0x12, 0x34, 0x83, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]; // QR|TC|RD|RA
+        m.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        m.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 7]);
+        let r = parse_response(&m).unwrap();
+        assert_eq!(r.answers.len(), 1);
+        assert!(!r.complete, "TC=1");
+        // the same without TC: whole
+        m[2] = 0x81;
+        assert!(parse_response(&m).unwrap().complete);
+        // an A of 3 bytes, then a good one: stepped over, not whole
+        let mut m = alloc::vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0];
+        m.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        m.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 3, 192, 0, 2]);
+        m.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 8]);
+        let r = parse_response(&m).unwrap();
+        assert_eq!(r.answers.len(), 1);
+        assert!(!r.complete, "a malformed A");
+        // an AAAA of 15 bytes
+        let mut m = alloc::vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        m.extend_from_slice(b"\x07example\x03com\x00\x00\x1c\x00\x01");
+        m.extend_from_slice(&[0xC0, 12, 0, 28, 0, 1, 0, 0, 0, 60, 0, 15]);
+        m.extend_from_slice(&[0u8; 15]);
+        let r = parse_response(&m).unwrap();
+        assert!(r.answers.is_empty() && !r.complete, "a malformed AAAA");
+    }
+
+    /// Review of #495, RA1: each pointer must point before the previous
+    /// one's target, not only before the name's start — a second pointer
+    /// forward of the first target (still before the start) is refused.
+    #[test]
+    fn a_pointer_forward_of_the_previous_target_is_refused() {
+        let mut b = alloc::vec![0u8; 42];
+        // at 30: the label "c", then a pointer to 35 (forward of 30)
+        b[30..34].copy_from_slice(&[1, b'c', 0xC0, 35]);
+        b[35] = 0;
+        // at 40: a pointer to 30
+        b[40..42].copy_from_slice(&[0xC0, 30]);
+        assert_eq!(read_name(&b, 40), None);
+        // the same chain pointing back each time reads
+        b[32..34].copy_from_slice(&[0xC0, 20]);
+        b[20] = 0;
+        assert_eq!(read_name(&b, 40).map(|(n, _)| n), Some("c".into()));
     }
 }
