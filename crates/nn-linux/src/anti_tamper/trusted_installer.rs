@@ -126,6 +126,9 @@ pub struct TrustedInstallerOverride {
     /// (systemd's copy of the units back to their files before the
     /// maintenance restarts one). Late-bound by the start.
     reloader: Mutex<Option<crate::systemd_reload::Reloader>>,
+    /// Lot 273d: when the open window was armed (its close judges our
+    /// units' drop-ins made since, `crate::own_dropins`).
+    armed_at: Mutex<Option<std::time::SystemTime>>,
 }
 
 #[derive(Default)]
@@ -155,6 +158,7 @@ impl TrustedInstallerOverride {
             max_window,
             clock: Arc::new(SystemClock),
             reloader: Mutex::new(None),
+            armed_at: Mutex::new(None),
         }
     }
 
@@ -354,6 +358,20 @@ impl TrustedInstallerOverride {
             });
         }
         self.armed.store(true, Ordering::SeqCst);
+        {
+            let mut at = self.armed_at.lock();
+            if at.is_none() {
+                *at = Some(std::time::SystemTime::now());
+            }
+        }
+        // Lot 273d (the review of #492): the host's harmful drop-ins, read
+        // now — the status the grant's `nn-admin` reads next warns the
+        // operator before a `daemon-reload` inside this window applies one.
+        let harms = crate::host_dropins::harmful_here();
+        if let Some(h) = crate::host_dropins::withholding(&harms) {
+            warn!(drop_in = %h.detail(), "trusted-installer window opened with a harmful host drop-in on disk: {}", crate::host_dropins::WINDOW_WARNING);
+        }
+        crate::host_dropins::note_degradation(&harms);
         // Lot 273c (the review of #490): systemd's copy of the units back to
         // their files before the maintenance this window is for restarts
         // one — a refused `set-property` left its value there.
@@ -478,22 +496,58 @@ impl TrustedInstallerOverride {
             // Lot 273b: a resource limit changed inside the window stays —
             // its value is the one PID 1 may write back from now on.
             super::cgroup_guard::refresh_values(self.bpffs_root.as_deref());
+            // Lot 273d (the review of #492): our units' drop-ins made
+            // inside the window, judged; a harmful one quarantined, systemd
+            // reloaded (rate-limited).
+            let since = self
+                .armed_at
+                .lock()
+                .take()
+                .map(|t| t - std::time::Duration::from_secs(2))
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let moved = own_dropins_at_close(since);
+            if moved.iter().any(|m| m.to.is_some()) {
+                if let Some(r) = self.reloader.lock().as_ref() {
+                    r.request(crate::systemd_reload::Reason::OwnDropinQuarantined);
+                }
+            }
+            for m in &moved {
+                warn!(target: "anti_tamper.trusted_installer", detail = %m.detail(), "a drop-in of our units made inside the window, harmful to them");
+            }
+            // Lot 273d (R1 of the external review of 04/11): a guarded
+            // sysctl set harmful inside the window — `ftrace_enabled=0`
+            // above all, whose NOPs outlive the window — is put back at
+            // its close, not at the round's next pass.
+            let sysctls = sysctls_at_close();
+            for l in &sysctls {
+                warn!(target: "anti_tamper.trusted_installer", detail = %l, "a guarded sysctl set inside the window");
+            }
             info!(
                 target: "anti_tamper.trusted_installer",
                 reason,
                 close_failed = close_failed.is_some(),
                 "trusted-installer override CLOSED (FIM-009 §15.1)"
             );
-            self.audit_close(reason, close_failed.as_deref());
+            let lines: Vec<String> = moved
+                .iter()
+                .map(crate::own_dropins::Moved::detail)
+                .collect();
+            self.audit_close(reason, close_failed.as_deref(), &lines, &sysctls);
         }
     }
 
-    fn audit_close(&self, reason: &str, close_failed: Option<&str>) {
+    fn audit_close(
+        &self,
+        reason: &str,
+        close_failed: Option<&str>,
+        quarantined: &[String],
+        sysctls: &[String],
+    ) {
         let audit = self.audit.lock().clone();
         let Some(audit) = audit else {
             return;
         };
-        let (extra, result) = match close_failed {
+        let (mut extra, result) = match close_failed {
             None => (
                 serde_json::json!({ "reason": reason }),
                 format!("closed: {reason}"),
@@ -503,6 +557,12 @@ impl TrustedInstallerOverride {
                 format!("close_failed: {reason} (the kernel grant ends at its own deadline)"),
             ),
         };
+        if !quarantined.is_empty() {
+            extra["dropins_quarantined"] = serde_json::json!(quarantined);
+        }
+        if !sysctls.is_empty() {
+            extra["sysctls"] = serde_json::json!(sysctls);
+        }
         let mut log = audit.lock();
         let draft = AuditEntryDraft {
             op: "trusted_installer_window_close".to_string(),
@@ -528,6 +588,39 @@ impl TrustedInstallerOverride {
             );
         }
     }
+}
+
+/// Lot 273d (R1): the guarded sysctls judged at a window's close, the
+/// harmful ones put back (`sysctl_guard::check`); each one put back, or
+/// not, a line `<kind>: <detail>` of the signed close record (strict
+/// overcommit, the operator's, is the round's finding only).
+fn sysctls_at_close() -> Vec<String> {
+    crate::sysctl_guard::check(
+        std::path::Path::new("/"),
+        antitamper_bpf::cgroup_floors::Host::read().mem_total,
+        true,
+    )
+    .into_iter()
+    .filter(|s| s.kind != "sysctl_strict")
+    .map(|s| format!("{}: {}", s.kind, s.detail))
+    .collect()
+}
+
+/// Lot 273d: our units' drop-ins made since `since`, judged on this host.
+fn own_dropins_at_close(since: std::time::SystemTime) -> Vec<crate::own_dropins::Moved> {
+    let roots = crate::self_integrity::unit_roots(std::path::Path::new("/"));
+    let search: Vec<&std::path::Path> = roots.iter().map(|p| p.as_path()).collect();
+    crate::own_dropins::quarantine(
+        &search,
+        &crate::host_dropins::HostLimits::read(),
+        since,
+        std::path::Path::new(crate::own_dropins::QUARANTINE_DIR),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        crate::self_integrity::is_known_dropin,
+    )
 }
 
 /// Lot 278: the installer a grant asked for an installer acts for (review

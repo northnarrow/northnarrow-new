@@ -33,6 +33,10 @@ pub const OWN_SYSTEMD_UNITS: &[&str] = &[
     "/etc/systemd/system/northnarrow-watchdog-failed.service",
     "/usr/lib/systemd/system/northnarrow-watchdog-failed.service",
     "/lib/systemd/system/northnarrow-watchdog-failed.service",
+    // Lot 273d: the units' slice.
+    "/etc/systemd/system/northnarrow.slice",
+    "/usr/lib/systemd/system/northnarrow.slice",
+    "/lib/systemd/system/northnarrow.slice",
 ];
 
 /// Lab PR 225: who opened the current window and when it ends — named in

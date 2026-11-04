@@ -166,6 +166,12 @@ impl Rule for NnLAt001AntiTamperDenial {
             FsProtectOperation::Ioprio => format!(
                 "to set the I/O priority of protected pid {target_ino} to {target_dev:#x} (ionice)"
             ),
+            FsProtectOperation::Sysctl => format!(
+                "to write a global sysctl (inode {target_dev}:{target_ino}) with a value that aborts \
+                 or starves the agent with the host (overcommit, pid_max, threads-max, \
+                 max_map_count or real-time throttling), or kernel.ftrace_enabled, refused whatever \
+                 it carries (0 stops the BPF trampolines, the agent's hooks among them)"
+            ),
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -239,6 +245,7 @@ mod tests {
             FsProtectOperation::Sched,
             FsProtectOperation::Nice,
             FsProtectOperation::Ioprio,
+            FsProtectOperation::Sysctl,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))
@@ -327,6 +334,12 @@ mod tests {
         let r = direct(FsProtectOperation::Ioprio);
         assert!(
             r.contains("I/O priority of protected pid 709 to 0x9 (ionice)"),
+            "{r}"
+        );
+        let r = direct(FsProtectOperation::Sysctl);
+        assert!(r.contains("global sysctl (inode 9:709)"), "{r}");
+        assert!(
+            r.contains("kernel.ftrace_enabled, refused whatever it carries"),
             "{r}"
         );
         let r = relayed(FsProtectOperation::CgroupKill);

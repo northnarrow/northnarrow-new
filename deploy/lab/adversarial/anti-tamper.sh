@@ -826,9 +826,210 @@ def selftest():
     rc, out = quiet(cmd_finit, "/nonexistent/nn.ko")
     check(rc == 2 and out.startswith("setup:") and "errno=" not in out and "denied" not in out,
           "a missing input is a setup failure, not a refusal: %r" % out)
+    # lot 273d: timedwrite — the write's outcome, and the seconds to the
+    # first refusal of its kind appended to the detections after it
+    import threading
+    with tempfile.TemporaryDirectory() as td:
+        tgt, dets = os.path.join(td, "ftrace_enabled"), os.path.join(td, "dets.jsonl")
+        open(tgt, "w").close()
+        with open(dets, "w") as f:
+            f.write('{"rule_id":"NN-L-AT-001_AntiTamperDenial","operation":"sysctl"}\n')
+        def later():
+            time.sleep(0.05)
+            with open(dets, "a") as f:
+                f.write('{"rule_id":"NN-L-AT-001_AntiTamperDenial","operation":"signal"}\n')
+                f.write('{"rule_id":"NN-L-AT-001_AntiTamperDenial","operation":"sysctl"}\n')
+        th = threading.Thread(target=later)
+        th.start()
+        rc, out = quiet(cmd_timedwrite, tgt, "0", dets, "sysctl")
+        th.join()
+        parts = out.split()
+        check(rc == 0 and parts[0] == "wrote" and parts[1] != "none" and 0.04 <= float(parts[1]) < 2,
+              "timedwrite: the appended refusal, not the one before: %r" % out)
+        check(open(tgt).read() == "0", "timedwrite wrote the value")
+        rc, out = quiet(cmd_timedwrite, os.path.join(td, "nodir", "x"), "0", dets, "sysctl")
+        check(rc == 0 and out.startswith("errno=ENOENT none"), "timedwrite: a refused write: %r" % out)
     print("python helper selftest: %d checks, %d failed%s" % (
         checks, len(fails), "".join("\n  FAIL: " + x for x in fails)))
     return 1 if fails else 0
+
+# R1 of the external review of 04/11 (lot 273d): kernel.ftrace_enabled.
+def write_value(path, value):
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            os.write(fd, value.encode())
+        finally:
+            os.close(fd)
+        return "wrote"
+    except OSError as e:
+        return "errno=%s" % ename(e.errno)
+
+def cmd_timedwrite(path, value, dets, op):
+    # the write, then the seconds to the first NN-L-AT-001 record of `op`
+    # appended to the signed detections after it (`none` within 5 s)
+    try:
+        start = os.path.getsize(dets)
+    except OSError:
+        start = 0
+    t = time.monotonic()
+    res = write_value(path, value)
+    lat = "none"
+    while time.monotonic() - t < 5:
+        try:
+            with open(dets, "rb") as f:
+                if os.fstat(f.fileno()).st_size < start:
+                    start = 0
+                f.seek(start)
+                tail = f.read()
+        except OSError:
+            tail = b""
+        hit = False
+        for line in tail.splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and str(r.get("rule_id", "")).startswith(AT_RULE) and r.get("operation") == op:
+                hit = True
+                break
+        if hit:
+            lat = "%.3f" % (time.monotonic() - t)
+            break
+        time.sleep(0.01)
+    print(res, lat)
+    return 0
+
+def bpf_runs():
+    # the run counts (kernel.bpf_stats_enabled=1) of the loaded BPF-LSM,
+    # tracing (fentry/fexit, and tp_btf: a tracepoint, not ftrace) and
+    # kprobe programs: {type: [programs, runs]}, and each tracing
+    # program's {name: runs} under "per"
+    out = subprocess.run(["bpftool", "-j", "prog", "show"], capture_output=True, text=True, timeout=60)
+    s = {"lsm": [0, 0], "tracing": [0, 0], "kprobe": [0, 0], "per": {}}
+    for p in json.loads(out.stdout or "[]"):
+        t = p.get("type")
+        if t in ("lsm", "tracing", "kprobe"):
+            s[t][0] += 1
+            s[t][1] += int(p.get("run_cnt", 0) or 0)
+        if t == "tracing":
+            k = "%s#%s" % (p.get("name", "?"), p.get("id", "?"))
+            s["per"][k] = int(p.get("run_cnt", 0) or 0)
+    return s
+
+def ft_load():
+    # what fires each kind: execs (bprm_check, file_open, commit_creds),
+    # loopback connections (tcp_connect, tcp_close), signals (task_kill)
+    for _ in range(40):
+        subprocess.run(["/bin/true"])
+    import socket
+    for _ in range(5):
+        try:
+            socket.create_connection(("127.0.0.1", 22), timeout=1).close()
+        except OSError:
+            pass
+    for _ in range(20):
+        os.kill(os.getpid(), 0)
+
+def cmd_ftmeasure(path):
+    phases = []
+    def phase():
+        a = bpf_runs()
+        ft_load()
+        b = bpf_runs()
+        phases.append({k: b["per"].get(k, 0) - a["per"].get(k, 0) for k in b["per"]})
+        return " ".join("%s +%d" % (k, b[k][1] - a[k][1]) for k in ("lsm", "tracing", "kprobe"))
+    try:
+        first = bpf_runs()
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        print("setup: bpftool: %s" % e)
+        return 2
+    on = phase()
+    w0 = write_value(path, "0\n")
+    v0 = open(path).read().strip()
+    off = phase()
+    w1 = write_value(path, "1\n")
+    v1 = open(path).read().strip()
+    again = phase()
+    # each tracing program that ran with ftrace on: its runs on / at 0 / on again
+    per = ", ".join("%s %d/%d/%d" % (k.split("#")[0], phases[0].get(k, 0), phases[1].get(k, 0), phases[2].get(k, 0))
+                    for k in sorted(phases[0]) if phases[0].get(k, 0) or phases[1].get(k, 0))
+    print("programs lsm %d, tracing %d, kprobe %d; ftrace on: %s; write 0: %s, reads %s; then: %s; write 1: %s, reads %s; on again: %s; tracing on/0/on: %s" % (
+        first["lsm"][0], first["tracing"][0], first["kprobe"][0], on, w0, v0, off, w1, v1, again, per or "none ran"))
+    return 0
+
+def cmd_sysctl_race(path, good, bad, tries):
+    # a MEASURE (lot 273d; the coordinator's decision of 04/11): the write
+    # deny judges a value-judged sysctl's bytes in the LSM hook, before the
+    # kernel copies them; a second thread flips the one byte where `good`
+    # and `bad` differ meanwhile. Part 1: of `tries` writes, how many put
+    # `bad` in (each written back to `good` at once: the probe's write of a
+    # harmless value goes through). Part 2: one more `bad` let in and left,
+    # the seconds until the agent puts it back (its round), 90 s at most.
+    import threading
+    g, b = good.encode() + b"\n", bad.encode() + b"\n"
+    diff = [i for i in range(len(g)) if g[i] != b[i]]
+    if len(g) != len(b) or len(diff) != 1:
+        print("setup: good and bad must differ in one byte"); return 2
+    i, gv, bv = diff[0], g[diff[0]], b[diff[0]]
+    sys.setswitchinterval(0.00005)
+    buf = bytearray(g)
+    stop = []
+    def flip():
+        while not stop:
+            buf[i] = bv
+            buf[i] = gv
+    def now():
+        return os.pread(fd, 32, 0).strip()
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    refused = wins = n = 0
+    th = threading.Thread(target=flip, daemon=True)
+    t = time.monotonic()
+    th.start()
+    try:
+        for n in range(1, int(tries) + 1):
+            try:
+                os.pwrite(fd, buf, 0)
+            except OSError as e:
+                if e.errno in (errno.EPERM, errno.EACCES):
+                    refused += 1
+                else:
+                    print("errno=%s after %d writes" % (ename(e.errno), n)); break
+            if now() == b.strip():
+                wins += 1
+                os.pwrite(fd, g, 0)
+        part1 = "%d of %d writes put %s in (%d refused, %.1f s)" % (wins, n, bad, refused, time.monotonic() - t)
+        print(part1, flush=True)
+        # part 2: one let in, left for the agent
+        left = None
+        t2 = time.monotonic()
+        while time.monotonic() - t2 < 30:
+            try:
+                os.pwrite(fd, buf, 0)
+            except OSError:
+                pass
+            if now() == b.strip():
+                left = time.time()
+                break
+    finally:
+        stop.append(1)
+        th.join()
+    if left is None:
+        os.close(fd)
+        print("%s; part 2: no %s let in within 30 s" % (part1, bad))
+        return 0
+    back = None
+    while time.time() - left < 90:
+        if now() == g.strip():
+            back = time.time() - left
+            break
+        time.sleep(0.1)
+    if back is None:
+        os.pwrite(fd, g, 0)
+    os.close(fd)
+    print("%s; part 2: one let in at %.3f, put back to %s by the agent %s" % (
+        part1, left, good, "after %.1f s" % back if back is not None else "NOT within 90 s (written back by the probe)"))
+    return 0
 
 def main(argv):
     cmds = {
@@ -840,6 +1041,8 @@ def main(argv):
         "kexec-unload": (cmd_kexec_unload, 0), "strip-sig": (cmd_strip_sig, 2),
         "cgmove": (cmd_cgmove, 4), "v1move": (cmd_v1move, 4),
         "fdlater": (cmd_fdlater, 3), "handlewrite": (cmd_handlewrite, 3),
+        "timedwrite": (cmd_timedwrite, 4), "ftmeasure": (cmd_ftmeasure, 1),
+        "sysctl-race": (cmd_sysctl_race, 4),
     }
     if argv and argv[0] == "file" and len(argv) in (3, 4):
         return cmd_file(*argv[1:])
@@ -966,6 +1169,10 @@ post_proc() {   # <pid> <start> <comm>
 post_same() {   # <path> <ino|size|hash> <id before>
     local now; now=$(nnpy fileid "$1" "$2")
     [[ "$now" == "$3" ]] || { echo "${1##*/} changed (${3:0:30} -> ${now:0:30})"; return 1; }
+}
+post_same_text() {   # <path> <text before> (lot 273d: a sysctl's value)
+    local now; now=$(cat "$1" 2>/dev/null)
+    [[ "$now" == "$2" ]] || { echo "${1##*/} changed ($2 -> $now)"; return 1; }
 }
 post_not_shrunk() {   # <path> <dev:ino:size before>
     local now; now=$(nnpy fileid "$1" size)
@@ -1312,7 +1519,18 @@ ADMIN_KEY=${NN_ADMIN_KEY:-}
 for k in /root/northnarrow-admin.key "$ETC/admin.key"; do
     [[ -z "$ADMIN_KEY" && -r "$k" ]] && ADMIN_KEY=$k
 done
-grant_window() { "$NNADMIN" trusted-installer-grant --key "$ADMIN_KEY" --window-secs "${1:-120}" >/dev/null 2>&1; }
+# Lot 273d (C97/C98 seen timing-dependent by lots 275 and 277): each grant
+# notes when its window ends and the audit row before it, for
+# wait_no_window.
+WIN_UNTIL=0; WIN_A0=0
+grant_window() {
+    local a rc
+    a=$(audit_count)
+    "$NNADMIN" trusted-installer-grant --key "$ADMIN_KEY" --window-secs "${1:-120}" >/dev/null 2>&1
+    rc=$?
+    (( rc == 0 )) && { WIN_UNTIL=$(( $(date +%s) + ${1:-120} )); WIN_A0=$a; }
+    return $rc
+}
 restart_agent() {
     local old new i
     old=$(cat /run/northnarrow/agent.pid 2>/dev/null)
@@ -1384,6 +1602,20 @@ window_open() {
     jentry northnarrow-agent "$(agent_pid 0)" INFO "trusted-installer override " "-30min" \
         | tail -1 | grep -q '^trusted-installer override ARMED'
 }
+audit_since() { tail -n +"$(( ${1:-0} + 1 ))" "$AUDIT" 2>/dev/null; }
+# Lot 273d: the last window granted here has ended — past its time, its
+# signed close row in the audit chain (or a new agent's boot: a restart
+# ends a window), and the journal's state line no longer ARMED. A case
+# that must start outside a window waits for it (bounded): C95b's window
+# still open at C97's reload let PID 1 apply the 4K to system.slice on
+# 5.15 (lot 275's main run), where window_open alone had said "closed".
+window_ended() {
+    (( WIN_UNTIL == 0 )) && { ! window_open; return; }
+    (( $(date +%s) > WIN_UNTIL )) || return 1
+    audit_since "$WIN_A0" | grep -qE '"op":"(trusted_installer_window_close|agent_boot)"' || return 1
+    ! window_open
+}
+wait_no_window() { local i; for i in $(seq 1 "${1:-90}"); do window_ended && return 0; sleep 1; done; return 1; }
 for i in $(seq 1 130); do
     window_open || break
     (( i == 1 )) && echo "a trusted-installer window is open: waiting for it to close" >&2
@@ -1880,7 +2112,7 @@ fi
 # files are written "0" (a no-op if the open went through: ERANGE for
 # cgroup.kill). Inside a window it is all allowed (C76, at the end).
 if [[ ! -e $CGROOT/cgroup.controllers || -z "$AG_CG" || -z "$WD_CG" ]]; then
-    skipped_case C65,C66,C67,C68,C69,C70,C71,C72,C73,C74,C75,C77a,C77b,C78a,C78b,C78c,C79,C80,C81,C81b,C82,C83,C83b,C84,C85,C86,C87,C88,C89,C90,C91,C92,C93,C94,C95,C95b,C96,C97,C98,C99,C100,C101 "no cgroup v2 hierarchy, or a unit without a ControlGroup" 0
+    skipped_case C65,C66,C67,C68,C69,C70,C71,C72,C73,C74,C75,C77a,C77b,C78a,C78b,C78c,C79,C80,C81,C81b,C82,C83,C83b,C84,C85,C86,C87,C88,C89,C90,C91,C92,C93,C94,C95,C95b,C96,C97,C98,C99,C100,C101,C103,C105 "no cgroup v2 hierarchy, or a unit without a ControlGroup" 0
 else
     PID=$(agent_pid); START=$(proc_start "$PID")
     WDPID=$(wd_pid); WDSTART=$(proc_start "$WDPID")
@@ -2044,9 +2276,16 @@ else
         rm -f "$T"; systemctl daemon-reload
         unit_back C78b
     fi
-    # stopping the agent's slice (system.slice) is a propagated stop as
-    # C78a's, and it stops the lab's sshd with it: not run here
-    skipped_case C78c "systemctl stop system.slice: the stop job of C78a's kind, and the guest's sshd is in that slice" 1
+    # C78c: a stop of the agent's slice — lot 273d's northnarrow.slice, the
+    # units' own (RefuseManualStop=yes) — is refused; before lot 273d the
+    # units ran in system.slice, whose stop takes the lab's sshd with it:
+    # not run there
+    if [[ "$AG_SLICE" == /northnarrow.slice ]]; then
+        run_case C78c "systemctl stop northnarrow.slice (the units' own slice)" denied "" 0 -- \
+            bash -c 'systemctl stop northnarrow.slice 2>&1 | sed "s/refused/Operation not permitted (refused)/"; systemctl is-active northnarrow-agent'
+    else
+        skipped_case C78c "systemctl stop ${AG_SLICE:-system.slice}: the stop job of C78a's kind, and the guest's sshd is in that slice" 1
+    fi
     # C86 (lot 273b): a unit of the agent's slice started and stopped —
     # systemd 254 and 255 thaw the slices up the tree at every start and
     # stop (a write of 0 to system.slice/cgroup.freeze) and rewrite their
@@ -2058,7 +2297,7 @@ else
         # slice's other units on 257+)
         EV_FORBID="deny=cgroup_freeze|deny=xattr|deny=cgroup_limit" \
         run_case C86 "a unit of the agent's slice started and stopped (systemd's own thaw and xattrs)" allowed "" 0 -- \
-            bash -c 'systemd-run --quiet --unit=nn-lab-c86 /bin/sleep 60 && sleep 2 && systemctl stop nn-lab-c86 && systemctl restart cron 2>/dev/null; true'
+            bash -c "systemd-run --quiet --unit=nn-lab-c86 --slice=${AG_SLICE#/} /bin/sleep 60 && sleep 2 && systemctl stop nn-lab-c86 && systemctl restart cron 2>/dev/null; true"
         EV_FORBID=
         systemctl stop nn-lab-c86 >/dev/null 2>&1; systemctl reset-failed nn-lab-c86 >/dev/null 2>&1
     fi
@@ -2314,42 +2553,89 @@ print("seized pid 1" if r==0 else "errno=%s" % errno.errorcode.get(ctypes.get_er
 libc=ctypes.CDLL(None,use_errno=True)
 r=libc.ptrace(0x4206,1,None,None)
 print("seized pid 1" if r==0 else "errno=%s" % errno.errorcode.get(ctypes.get_errno(),"?"))'
-        for i in $(seq 1 40); do window_open || break; sleep 1; done
+        # lot 273d: ended by its time, its signed close and the journal,
+        # not the journal alone (C97 next reloads systemd)
+        wait_no_window 90 || echo "C95b: its window not seen ended within 90 s" >&2
     fi
     # C97 (the review of #492, C1): the host's type- and slice-wide
     # drop-ins are the host's configuration for every service — a global
     # LimitNOFILE and a hardening SystemCallFilter stay untouched (alerts at
-    # most); a MemoryMax=4K on system.slice.d, applied by the host's own
-    # `daemon-reload`, is neutralised for our units (PID 1's write of the
-    # slice refused) and signed `unit_dropin_harmful`; nothing is moved.
-    if selected C97; then
-        DS=/etc/systemd/system/service.d; DL=/etc/systemd/system/system.slice.d
+    # most); a MemoryMax below the agent's slice's floor, applied by the
+    # host's own `daemon-reload`, is neutralised for our units (PID 1's
+    # write of their slice refused) and signed `unit_dropin_harmful`;
+    # nothing is moved. Lot 273d: the units' slice is their own
+    # (northnarrow.slice), which system.slice.d no longer reaches: the
+    # value goes in slice.d (every slice), 600M — below the agent's slice's
+    # floor, survivable for the guest's other slices. Before lot 273d (the
+    # units in system.slice): a 4K in system.slice.d, as #492 measured it.
+    # Lot 273d (C97 seen timing-dependent by lots 275 and 277): the case
+    # starts only once every window granted before it has ended (C95b's
+    # still open at the reload let PID 1 apply the 4K on 5.15); and PID 1
+    # may load a slice's drop-in at the reload without writing it (systemd
+    # 257, Debian 13: no write, so no refusal to see) — then a start in the
+    # slice realises it (C86's path on 257+), which must be refused the
+    # same. Which path it took is in the row.
+    if selected C97 && ! wait_no_window 90; then
+        rows+=("| C97 | the host's drop-ins | not run | — | DEVIATION (not run: a trusted-installer window still open after 90 s) |")
+        echo "C97 not run: a window still open" >&2; fail=1
+    elif selected C97; then
+        DS=/etc/systemd/system/service.d
+        if [[ "$AG_SLICE" == /northnarrow.slice ]]; then
+            DL=/etc/systemd/system/slice.d; MEMV=600M
+        else
+            DL=/etc/systemd/system/system.slice.d; MEMV=4K
+        fi
+        SLU=${AG_SLICE#/}; SLU=${SLU:-system.slice}
         F1=$DS/99-nn-lab-c97-nofile.conf; F2=$DS/99-nn-lab-c97-scf.conf; F3=$DL/99-nn-lab-c97-mem.conf
-        SMX=$CGROOT/system.slice/memory.max; SMX0=$(cat "$SMX" 2>/dev/null)
+        SMX=$CGROOT${AG_SLICE:-/system.slice}/memory.max; SMX0=$(cat "$SMX" 2>/dev/null)
         DS_WAS=$([[ -d $DS ]] && echo present || echo absent); DL_WAS=$([[ -d $DL ]] && echo present || echo absent)
         mkdir -p "$DS" "$DL"
         t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
         printf '[Service]\nLimitNOFILE=1048576\n' > "$F1"
         printf '[Service]\nSystemCallFilter=~@obsolete\n' > "$F2"
-        printf '[Slice]\nMemoryMax=4K\n' > "$F3"
+        printf '[Slice]\nMemoryMax=%s\n' "$MEMV" > "$F3"
+        # PID 1's own word on its writes: a refused cgroup write is a debug
+        # line of systemd's ("Failed to set 'memory.max' attribute on …"),
+        # so the reload runs at its debug level (back after 5 s)
+        LL0=$(systemctl log-level 2>/dev/null); tr0=$(date '+%Y-%m-%d %H:%M:%S')
+        [[ -n $LL0 ]] && systemctl log-level debug 2>/dev/null
         systemctl daemon-reload
-        sleep 45; ev=$(evidence "$t0" "$a0" "$d0")
+        sleep 5; [[ -n $LL0 ]] && systemctl log-level "$LL0" 2>/dev/null
+        sleep 40; ev=$(evidence "$t0" "$a0" "$d0")
         smx=$(cat "$SMX" 2>/dev/null)
-        harm=$(tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep 'unit_dropin_harmful')
+        loaded=$(systemctl show -p MemoryMax --value "$SLU" 2>/dev/null)
+        p1() { journalctl -q --no-pager _PID=1 --since "$1" 2>/dev/null | grep -c "Failed to set 'memory.max' attribute on '/$SLU'"; }
+        how="written by PID 1 at the reload (PID 1's refused writes: $(p1 "$tr0"))"
+        if ! grep -q "deny=cgroup_limit" <<<"$ev" && [[ "$smx" == "$SMX0" ]]; then
+            how="loaded by systemd at the reload (its MemoryMax of $SLU: ${loaded:-?}, PID 1's refused writes: $(p1 "$tr0")) but not written; written at a start in the slice"
+            tr1=$(date '+%Y-%m-%d %H:%M:%S'); [[ -n $LL0 ]] && systemctl log-level debug 2>/dev/null
+            systemd-run --quiet --unit=nn-lab-c97 --slice="$SLU" /bin/sleep 30 >/dev/null 2>&1
+            sleep 5; [[ -n $LL0 ]] && systemctl log-level "$LL0" 2>/dev/null
+            systemctl stop nn-lab-c97 >/dev/null 2>&1; systemctl reset-failed nn-lab-c97 >/dev/null 2>&1
+            sleep 5; ev=$(evidence "$t0" "$a0" "$d0"); smx=$(cat "$SMX" 2>/dev/null)
+            how="$how (PID 1's refused writes there: $(p1 "$tr1"))"
+            grep -q "deny=cgroup_limit" <<<"$ev" || how="loaded by systemd at the reload (its MemoryMax of $SLU: ${loaded:-?}), written neither at the reload nor at a start in the slice (PID 1's refused writes: $(p1 "$tr0"))"
+        fi
+        harm=$(audit_since "$a0" | grep 'unit_dropin_harmful')
         h3=$(grep -c '99-nn-lab-c97-mem.conf' <<<"$harm"); h12=$(grep -cE '99-nn-lab-c97-(nofile|scf).conf' <<<"$harm")
         present=0; for f in "$F1" "$F2" "$F3"; do [[ -e $f ]] && present=$((present + 1)); done
         # round 7: a window opened while the 4K is on disk — the agent's own
         # reload at the window's opening must not apply it (PID 1's writes
         # are let through inside a window)
-        grant_window 20; sleep 10; smxw=$(cat "$SMX" 2>/dev/null)
-        for i in $(seq 1 40); do window_open || break; sleep 1; done
-        wh=$(tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep '"systemd_reload"' | grep -c '"withheld"')
-        if (( present == 3 && h3 > 0 && h12 == 0 && wh > 0 )) && [[ "$smx" == "$SMX0" && "$smxw" == "$SMX0" ]] && echo "$ev" | grep -q "deny=cgroup_limit"; then
-            v=OK; st="the three left in place; the slice's 4K refused (memory.max $smx, $smxw inside a window), signed harmful; LimitNOFILE and SystemCallFilter not harmful; the agent's reloads withheld: $wh"
+        # lot 273d: the grant itself warns the operator (round 7's case)
+        ga=$(audit_count)
+        gw=$("$NNADMIN" trusted-installer-grant --key "$ADMIN_KEY" --window-secs 20 2>&1 >/dev/null) \
+            && { WIN_UNTIL=$(( $(date +%s) + 20 )); WIN_A0=$ga; }
+        warned=$(grep -c 'WARNING — a host drop-in harmful' <<<"$gw")
+        sleep 10; smxw=$(cat "$SMX" 2>/dev/null)
+        wait_no_window 90 || echo "C97: the grant's window not seen ended within 90 s" >&2
+        wh=$(audit_since "$a0" | grep '"systemd_reload"' | grep -c '"withheld"')
+        if (( present == 3 && h3 > 0 && h12 == 0 && wh > 0 && warned > 0 )) && [[ "$smx" == "$SMX0" && "$smxw" == "$SMX0" ]] && echo "$ev" | grep -q "deny=cgroup_limit"; then
+            v=OK; st="the three left in place; ${AG_SLICE}'s MemoryMax=$MEMV $how, refused (memory.max $smx, $smxw inside a window), signed harmful; LimitNOFILE and SystemCallFilter not harmful; the agent's reloads withheld: $wh; the grant warned"
         else
-            v="DEVIATION (files left $present of 3, system.slice memory.max ${smx:-?} / ${smxw:-?} inside a window (was $SMX0), harmful signed for the 4K $h3, for the other two $h12, reloads withheld $wh)"; fail=1; st="not as expected"
+            v="DEVIATION (files left $present of 3, ${AG_SLICE} memory.max ${smx:-?} / ${smxw:-?} inside a window (was $SMX0), the value $how, harmful signed for the $MEMV $h3, for the other two $h12, reloads withheld $wh, the grant's warning $warned)"; fail=1; st="not as expected"
         fi
-        rows+=("| C97 | the host's drop-ins: LimitNOFILE and SystemCallFilter in service.d, MemoryMax=4K in system.slice.d | $st | $ev | $v |")
+        rows+=("| C97 | the host's drop-ins: LimitNOFILE and SystemCallFilter in service.d, MemoryMax=$MEMV in ${DL##*/} | $st | $ev | $v |")
         echo "C97 the host's drop-ins → $st; $ev; $v" >&2
         # removed BEFORE any window: inside one a reload applies the 4K to
         # the slice (PID 1's writes are let through there — round 7 lost
@@ -2359,26 +2645,43 @@ print("seized pid 1" if r==0 else "errno=%s" % errno.errorcode.get(ctypes.get_er
         [[ $DS_WAS == absent ]] && rmdir "$DS" 2>/dev/null; [[ $DL_WAS == absent ]] && rmdir "$DL" 2>/dev/null
         systemctl daemon-reload; sleep 5
         restored C97 "the lab's drop-ins" absent "$([[ -e $F1 || -e $F2 || -e $F3 ]] && echo present || echo absent)"
-        restored C97 "system.slice's memory.max" "$SMX0" "$(cat "$SMX" 2>/dev/null)"
+        restored C97 "${AG_SLICE}'s memory.max" "$SMX0" "$(cat "$SMX" 2>/dev/null)"
     fi
     # C98: a floor — the agent's memory.high set below 512 MiB inside a
     # window, the window closed: registered again at the floor, written
     # back, signed.
+    # Lot 273d (C98 seen timing-dependent by lot 275): the value set inside
+    # the window is below the floor but above what the agent's cgroup holds
+    # (its memory.current and 128 MiB) — lot 275's 2404 run set 100 MiB
+    # under a larger agent, whose reclaim stalled it: it was respawned
+    # inside the window (prev_run_abrupt), no close ran, and the fresh
+    # cgroup had systemd's value. An agent restarted during the case is
+    # said so, never read as the close's result.
     if selected C98 && [[ -e $CGROOT$AG_CG/memory.high ]]; then
         MH=$CGROOT$AG_CG/memory.high; MH0=$(cat "$MH")
-        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
-        grant_window 10; sleep 1; echo 104857600 > "$MH"
-        for i in $(seq 1 40); do window_open || break; sleep 1; done
-        sleep 40; ev=$(evidence "$t0" "$a0" "$d0"); now=$(cat "$MH")
-        if [[ "$now" == 536870912 ]] && echo "$ev" | grep -q "integrity_drift"; then
-            v=OK; st="restored to the floor"
+        CUR=$(cat "$CGROOT$AG_CG/memory.current" 2>/dev/null || echo 0)
+        LOW=$(( (CUR + (128 << 20)) / 4096 * 4096 )); (( LOW < 104857600 )) && LOW=104857600
+        if (( LOW > 536870912 - (32 << 20) )); then
+            skipped_case C98 "the agent's cgroup holds $CUR bytes: no value below the 512 MiB floor leaves it room" 1
         else
-            v="DEVIATION (memory.high $now after the window, expected the floor 536870912)"; fail=1; st="left"
+            wait_no_window 90 || echo "C98: an earlier window not seen ended within 90 s" >&2
+            P0=$(agent_pid 0)
+            t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+            grant_window 10; sleep 1; echo "$LOW" > "$MH"
+            wait_no_window 60 || echo "C98: its window not seen ended within 60 s" >&2
+            sleep 40; ev=$(evidence "$t0" "$a0" "$d0"); now=$(cat "$MH"); P1=$(agent_pid 0)
+            if [[ "$P1" != "$P0" ]]; then
+                v="DEVIATION (the agent restarted during the case, pid $P0 → ${P1:-none}: no close ran; memory.high $now)"; fail=1; st="not exercised"
+            elif [[ "$now" == 536870912 ]] && echo "$ev" | grep -q "integrity_drift"; then
+                v=OK; st="$LOW (the agent's cgroup at $CUR) restored to the floor"
+            else
+                v="DEVIATION (memory.high $now after the window, expected the floor 536870912; set $LOW, the agent's cgroup at $CUR)"; fail=1; st="left"
+            fi
+            rows+=("| C98 | the agent's memory.high below its floor at a window's close | $st | $ev | $v |")
+            echo "C98 floor at a window's close → $st; $ev; $v" >&2
+            grant_window 15; sleep 1; echo "$MH0" > "$MH"; wait_no_window 60
+            restored C98 "the agent's memory.high" "$MH0" "$(cat "$MH")"
         fi
-        rows+=("| C98 | the agent's memory.high below its floor at a window's close | $st | $ev | $v |")
-        echo "C98 floor at a window's close → $st; $ev; $v" >&2
-        grant_window 15; sleep 1; echo "$MH0" > "$MH"; for i in $(seq 1 40); do window_open || break; sleep 1; done
-        restored C98 "the agent's memory.high" "$MH0" "$(cat "$MH")"
     fi
     # C99: a named cgroup v1 hierarchy (no controller: an old container's
     # name=systemd) — a write to its cgroup.procs is let through (lot 273b
@@ -2415,6 +2718,57 @@ print("seized pid 1" if r==0 else "errno=%s" % errno.errorcode.get(ctypes.get_er
         systemctl daemon-reload
         restored C100 "systemd's MemoryHigh of the agent" "$MHP0" "$(systemctl show -p MemoryHigh --value northnarrow-agent.service)"
     fi
+    # C103 (lot 273d): io.prio.class idle on the agent's unit (its audit
+    # log's writes starved under contention): refused.
+    if selected C103; then
+        if [[ -e $CGROOT$AG_CG/io.prio.class ]]; then
+            run_case C103 "io.prio.class idle of the agent's unit (no window)" denied "deny=cgroup_limit" 0 -- nnpy file write "$CGROOT$AG_CG/io.prio.class" idle
+        else
+            skipped_case C103 "no io.prio.class (CONFIG_BLK_CGROUP_IOPRIO off, or a kernel before 5.14)" 1
+        fi
+    fi
+    # C104 (lot 273d): the global sysctls that abort or starve the agent —
+    # vm.max_map_count cut, real-time throttling off — refused outside a
+    # window; a harmless write (the value it holds) goes through.
+    if selected C104; then
+        MMC0=$(cat /proc/sys/vm/max_map_count); RT0=$(cat /proc/sys/kernel/sched_rt_runtime_us)
+        POST=$(post post_same_text /proc/sys/vm/max_map_count "$MMC0") \
+        run_case C104 "vm.max_map_count=100 (no window)" denied "deny=sysctl" 0 -- nnpy file write /proc/sys/vm/max_map_count 100
+        POST=$(post post_same_text /proc/sys/kernel/sched_rt_runtime_us "$RT0") \
+        run_case C104b "kernel.sched_rt_runtime_us=-1 (no window)" denied "deny=sysctl" 0 -- nnpy file write /proc/sys/kernel/sched_rt_runtime_us -1
+        EV_FORBID="deny=sysctl" run_case C104c "vm.max_map_count written with its own value (no window)" allowed "" 0 -- nnpy file write /proc/sys/vm/max_map_count "$MMC0"
+        # before lot 273d the writes went through: put back what they set
+        [[ "$(cat /proc/sys/vm/max_map_count)" == "$MMC0" ]] || echo "$MMC0" > /proc/sys/vm/max_map_count
+        [[ "$(cat /proc/sys/kernel/sched_rt_runtime_us)" == "$RT0" ]] || echo "$RT0" > /proc/sys/kernel/sched_rt_runtime_us
+        restored C104 "vm.max_map_count" "$MMC0" "$(cat /proc/sys/vm/max_map_count)"
+        restored C104 "kernel.sched_rt_runtime_us" "$RT0" "$(cat /proc/sys/kernel/sched_rt_runtime_us)"
+    fi
+    # C105 (lot 273d): a set-property inside a window below the agent's
+    # floor (MemoryHigh=300M, survivable): at the window's close its drop-in
+    # (made inside the window) is quarantined, systemd reloads (confirmed)
+    # and the file at its floor goes back to the configured value.
+    if selected C105 && [[ -e $CGROOT$AG_CG/memory.high ]]; then
+        MH=$CGROOT$AG_CG/memory.high; MHC=$(systemctl show -p MemoryHigh --value northnarrow-agent.service)
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        grant_window 15; sleep 2
+        timeout 60 systemctl set-property --runtime northnarrow-agent.service MemoryHigh=300M >/dev/null 2>&1
+        CTL=/run/systemd/system.control/northnarrow-agent.service.d/50-MemoryHigh.conf
+        made=$([[ -e $CTL ]] && echo yes || echo no)
+        for i in $(seq 1 40); do window_open || break; sleep 1; done
+        sleep 45; ev=$(evidence "$t0" "$a0" "$d0")
+        q=$(tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep '"trusted_installer_window_close"' | grep -c '50-MemoryHigh.conf')
+        rl=$(tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep '"systemd_reload"' | grep -c '"reloaded"')
+        now=$(cat "$MH"); copy=$(systemctl show -p MemoryHigh --value northnarrow-agent.service)
+        if [[ $made == yes && ! -e $CTL && "$now" == "$MHC" && "$copy" == "$MHC" ]] && (( q > 0 && rl > 0 )); then
+            v=OK; st="the drop-in quarantined at the close, systemd reloaded (confirmed), memory.high back to $now"
+        else
+            v="DEVIATION (drop-in made $made, now $([[ -e $CTL ]] && echo present || echo gone), quarantined in the close record $q, confirmed reloads $rl, memory.high $now, systemd's copy $copy, expected $MHC)"; fail=1; st="not as expected"
+        fi
+        rows+=("| C105 | set-property MemoryHigh=300M inside a window: its drop-in at the close | $st | $ev | $v |")
+        echo "C105 a below-floor drop-in made inside a window → $st; $ev; $v" >&2
+        if [[ -e $CTL ]]; then grant_window 20; sleep 2; rm -f "$CTL"; systemctl daemon-reload; for i in $(seq 1 40); do window_open || break; sleep 1; done; fi
+        restored C105 "systemd's MemoryHigh of the agent" "$MHC" "$(systemctl show -p MemoryHigh --value northnarrow-agent.service)"
+    fi
     # C101: memory.reclaim of the agent's unit (a forced reclaim, repeated:
     # a thrash): refused to everyone.
     if selected C101; then
@@ -2422,6 +2776,133 @@ print("seized pid 1" if r==0 else "errno=%s" % errno.errorcode.get(ctypes.get_er
             run_case C101 "memory.reclaim of the agent's unit (no window)" denied "deny=cgroup_limit" 0 -- nnpy file write "$CGROOT$AG_CG/memory.reclaim" 1M
         else
             skipped_case C101 "no memory.reclaim (a kernel before 5.19)" 1
+        fi
+    fi
+fi
+
+# ── R1 of the external review of 04/11 (lot 273d): kernel.ftrace_enabled ──
+# 0 turns every call site ftrace manages back into a NOP on 6.0 to 7.2 —
+# the BPF trampolines on them stop: fentry/fexit, the kprobes on ftrace
+# and, by the kernel's code, the BPF-LSM programs (every deny hook); EBUSY
+# on 5.15 to 5.19 while a trampoline is attached; refused from 7.3.
+#   C106  0 outside a window: refused, the value kept, the signed detection
+#         within 1 s;
+#   C106a 1 outside a window: refused too (the coordinator's decision of
+#         04/11: every write of ftrace_enabled outside a window, unread —
+#         nothing for a second thread to race; the agent's own restore
+#         passes by its identity, C106b);
+#   C106b 0 inside a window: let through (or the kernel's own EBUSY /
+#         EOPNOTSUPP), the manifest's degradation signed within 10 s, put
+#         back to 1 by the window's close or the round, signed;
+#   C106r a MEASURE of the declared residual of the seven sysctls judged
+#         by value (lot 280 closes it with cgroup/sysctl): the hook reads
+#         the bytes before the kernel copies them, and a second thread flips
+#         one — kernel.sched_rt_runtime_us 950000 / 990000 (harmful at 99 %,
+#         harmless on a guest without real-time load): how many of N writes
+#         put 990000 in, and how long until the agent puts one back;
+#   C106c a MEASURE (the lab build's BPF guard observes, so bpftool reads
+#         our programs; kernel.bpf_stats_enabled on for it): the run counts
+#         of the BPF-LSM, fentry/fexit and kprobe programs under the same
+#         load with ftrace on, written 0 inside a window, and on again —
+#         whether 0 stops them on this kernel (SENSOR_CONTRACT.md §5a).
+FT=/proc/sys/kernel/ftrace_enabled
+if ! selected C106 && ! selected C106a && ! selected C106b && ! selected C106c && ! selected C106r; then
+    :
+elif [[ ! -e $FT ]]; then
+    skipped_case C106,C106a,C106b,C106c,C106r "no kernel.ftrace_enabled (a kernel without ftrace)" 1
+elif [[ "$(cat "$FT")" != 1 ]]; then
+    skipped_case C106,C106a,C106b,C106c,C106r "kernel.ftrace_enabled is $(cat "$FT") before the cases" 0
+else
+    if selected C106; then
+        wait_no_window 90 || echo "C106: an earlier window not seen ended within 90 s" >&2
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        w=$(nnpy timedwrite "$FT" 0 "$DETS" sysctl); rc=${w%% *}; lat=${w##* }
+        sleep 3; ev=$(evidence "$t0" "$a0" "$d0"); now=$(cat "$FT")
+        if [[ $rc == errno=EPERM && $now == 1 && $lat != none ]] \
+            && python3 -I -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= 1.0 else 1)' "$lat" \
+            && grep -q "deny=sysctl" <<<"$ev"; then
+            v=OK; st="refused (EPERM), the value 1, the signed detection after $lat s"
+        else
+            v="DEVIATION (the write: $rc, the value $now, the signed detection after $lat s, expected EPERM, 1, within 1 s)"; fail=1; st="not as expected"
+        fi
+        rows+=("| C106 | kernel.ftrace_enabled=0 (no window) | $st | $ev | $v |")
+        echo "C106 kernel.ftrace_enabled=0 outside a window → $st; $ev; $v" >&2
+        [[ "$(cat "$FT")" == 1 ]] || echo 1 > "$FT"
+        restored C106 "kernel.ftrace_enabled" 1 "$(cat "$FT")"
+    fi
+    if selected C106a; then
+        POST=$(post post_same_text "$FT" 1) \
+        run_case C106a "kernel.ftrace_enabled=1 (no window)" denied "deny=sysctl" 0 -- nnpy file write "$FT" 1
+    fi
+    if selected C106b; then
+        wait_no_window 90 || echo "C106b: an earlier window not seen ended within 90 s" >&2
+        t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+        grant_window 12; sleep 2
+        w=$(nnpy file write "$FT" 0); vin=$(cat "$FT"); tw=$(date +%s)
+        # the manifest's degradation, signed at its next build (every 5 s)
+        deg=none
+        for i in $(seq 1 15); do
+            if audit_since "$a0" | grep '"subsystem_degraded"' | grep -q '"source":"ftrace_enabled"'; then deg=$(( $(date +%s) - tw )); break; fi
+            sleep 1
+        done
+        # back to 1: the window's close (12 s) or the round, whichever first
+        back=none
+        for i in $(seq 1 60); do [[ "$(cat "$FT")" == 1 ]] && { back=$(( $(date +%s) - tw )); break; }; sleep 1; done
+        wait_no_window 60 || echo "C106b: its window not seen ended within 60 s" >&2
+        sleep 2; ev=$(evidence "$t0" "$a0" "$d0")
+        by_close=$(audit_since "$a0" | grep '"trusted_installer_window_close"' | grep -c 'ftrace_enabled')
+        by_round=$(audit_since "$a0" | grep '"sysctl_restored"' | grep -c 'ftrace_enabled')
+        if [[ $w == *"wrote '0'"* ]]; then
+            if [[ $vin == 0 && $deg != none && $back != none ]] && (( deg <= 10 && by_close + by_round > 0 )) && ! grep -q "deny=sysctl" <<<"$ev"; then
+                v=OK; st="let through (the value 0), the manifest's degradation signed after ${deg} s, back to 1 after ${back} s (by the close: $by_close, by the round: $by_round)"
+            else
+                v="DEVIATION (let through, the value $vin, the degradation signed after $deg s, back to 1 after $back s, by the close $by_close, by the round $by_round)"; fail=1; st="not as expected"
+            fi
+        elif [[ $w == *"errno=EBUSY"* || $w == *"errno=EOPNOTSUPP"* ]] && [[ $vin == 1 ]]; then
+            v=OK; st="the kernel's own refusal (${w##*errno=}: on 5.15-5.19 a trampoline is attached, from 7.3 the switch is gone), the value 1"
+        else
+            v="DEVIATION (the write: $w, the value $vin)"; fail=1; st="not as expected"
+        fi
+        rows+=("| C106b | kernel.ftrace_enabled=0 inside a window | $st | $ev | $v |")
+        echo "C106b kernel.ftrace_enabled=0 inside a window → $st; $ev; $v" >&2
+        [[ "$(cat "$FT")" == 1 ]] || { grant_window 10; sleep 1; echo 1 > "$FT"; wait_no_window 60; }
+        restored C106b "kernel.ftrace_enabled" 1 "$(cat "$FT")"
+    fi
+    if selected C106r; then
+        RT=/proc/sys/kernel/sched_rt_runtime_us
+        if [[ "$(cat "$RT" 2>/dev/null)" != 950000 ]]; then
+            skipped_case C106r "kernel.sched_rt_runtime_us is not the default 950000 here" 1
+        else
+            wait_no_window 90 || echo "C106r: an earlier window not seen ended within 90 s" >&2
+            t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+            m=$(nnpy sysctl-race "$RT" 950000 990000 2000 | tail -1)
+            sleep 3; ev=$(evidence "$t0" "$a0" "$d0")
+            rs=$(audit_since "$a0" | grep '"sysctl_restored"' | grep -c 'sched_rt_runtime_us')
+            rows+=("| C106r | kernel.sched_rt_runtime_us=990000 by a thread flipping the written byte (no window; a declared residual, lot 280) | $(tr -d '|' <<<"$m"); signed sysctl_restored: $rs | $ev | MEASURED |")
+            echo "C106r the flip race on a value-judged sysctl → $m; restored rows $rs; $ev" >&2
+            [[ "$(cat "$RT")" == 950000 ]] || echo 950000 > "$RT"
+            restored C106r "kernel.sched_rt_runtime_us" 950000 "$(cat "$RT")"
+        fi
+    fi
+    if selected C106c; then
+        ST=/proc/sys/kernel/bpf_stats_enabled
+        if ! command -v bpftool >/dev/null 2>&1 || [[ ! -e $ST ]]; then
+            skipped_case C106c "no bpftool, or no kernel.bpf_stats_enabled" 1
+        elif [[ "$BPF_MODE" != observe ]]; then
+            skipped_case C106c "the BPF guard enforces (not a lab build): bpftool cannot read our programs" 1
+        else
+            wait_no_window 90 || echo "C106c: an earlier window not seen ended within 90 s" >&2
+            ST0=$(cat "$ST")
+            grant_window 30; sleep 2
+            echo 1 > "$ST"
+            m=$(nnpy ftmeasure "$FT")
+            echo "$ST0" > "$ST"
+            [[ "$(cat "$FT")" == 1 ]] || echo 1 > "$FT"
+            wait_no_window 90 || echo "C106c: its window not seen ended within 90 s" >&2
+            rows+=("| C106c | the BPF programs' runs with ftrace on, 0 (inside a window) and on again | $(tr -d '|' <<<"$m") | — | MEASURED |")
+            echo "C106c ftrace_enabled measure → $m" >&2
+            restored C106c "kernel.ftrace_enabled" 1 "$(cat "$FT")"
+            restored C106c "kernel.bpf_stats_enabled" "$ST0" "$(cat "$ST")"
         fi
     fi
 fi

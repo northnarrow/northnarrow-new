@@ -103,6 +103,8 @@ for u in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do
     sed 's#/usr/local/bin/#/usr/bin/#g' "deploy/systemd/$u.service" > "$root/usr/lib/systemd/system/$u.service"
     chmod 0644 "$root/usr/lib/systemd/system/$u.service"
 done
+# lot 273d: the units' slice
+install -m 0644 deploy/systemd/northnarrow.slice "$root/usr/lib/systemd/system/northnarrow.slice"
 install -m 0755 deploy/install.sh deploy/uninstall.sh "$root/usr/share/northnarrow/deploy/"
 install -m 0644 deploy/systemd/* "$root/usr/share/northnarrow/deploy/systemd/"
 cp -r configs "$root/usr/share/northnarrow/configs"
@@ -214,6 +216,7 @@ $(body posttrans)
 /usr/lib/systemd/system/northnarrow-agent.service
 /usr/lib/systemd/system/northnarrow-watchdog.service
 /usr/lib/systemd/system/northnarrow-watchdog-failed.service
+/usr/lib/systemd/system/northnarrow.slice
 /usr/share/northnarrow
 %doc /usr/share/doc/northnarrow
 EOT

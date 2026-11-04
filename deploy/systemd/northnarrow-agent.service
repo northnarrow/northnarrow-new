@@ -41,6 +41,9 @@ RefuseManualStop=yes
 IgnoreOnIsolate=yes
 
 [Service]
+# Lot 273d (the review of #492): a slice of their own — `system.slice.d`
+# (the host's settings for its system services) does not reach them.
+Slice=northnarrow.slice
 Type=notify
 # Logging footprint (product guardrail). Route this unit's stdout/stderr
 # into NorthNarrow's dedicated, hard-capped journal namespace instead of
@@ -100,6 +103,9 @@ ExecStartPre=+/bin/mkdir -p /etc/systemd/system.control/northnarrow-agent.servic
 # NOCREATE like its own. A drop-in there would reach the next start's
 # fresh cgroup before the agent is there to refuse it.
 ExecStartPre=+/bin/mkdir -p /etc/systemd/system/northnarrow-watchdog.service.d /run/systemd/system/northnarrow-watchdog.service.d /etc/systemd/system/northnarrow-.service.d /run/systemd/system/northnarrow-.service.d
+# Lot 273d: the slice's drop-in directories, made empty the same way and
+# registered NOCREATE (a drop-in there would reach both units' slice).
+ExecStartPre=+/bin/mkdir -p /etc/systemd/system/northnarrow.slice.d /run/systemd/system/northnarrow.slice.d /etc/systemd/system.control/northnarrow.slice.d /run/systemd/system.control/northnarrow.slice.d
 # External audit ATP-014 (NN-AUD-262): an explicit search path, without
 # /usr/local. systemd's default for a service starts with
 # /usr/local/sbin:/usr/local/bin, which the FIM list does not watch, and
@@ -263,6 +269,15 @@ ProtectHome=read-only
 # pid (at-authz-1/2), so widening the mount does not widen the attack
 # surface.
 ReadWritePaths=/run/northnarrow /var/lib/northnarrow /etc/northnarrow
+# Lot 273d: our units' and slice's own drop-in directories (the ones the
+# ExecStartPre=+ lines above make), so that a harmful drop-in made inside a
+# trusted-installer window is moved to /var/lib/northnarrow/quarantine at the
+# window's close (crates/nn-linux/src/own_dropins.rs). Read-only here, the
+# move failed with EROFS (the lab's round 11 on Debian 13: "NOT moved
+# (Read-only file system)") and the drop-in applied at the next reload.
+# Writes there stay this process's: the directories are NOCREATE to every
+# other pid. `-`: one not made yet (the first ExecStartPre=) is skipped.
+ReadWritePaths=-/etc/systemd/system/northnarrow-agent.service.d -/run/systemd/system/northnarrow-agent.service.d -/etc/systemd/system.control/northnarrow-agent.service.d -/run/systemd/system.control/northnarrow-agent.service.d -/etc/systemd/system/northnarrow-watchdog.service.d -/run/systemd/system/northnarrow-watchdog.service.d -/etc/systemd/system.control/northnarrow-watchdog.service.d -/run/systemd/system.control/northnarrow-watchdog.service.d -/etc/systemd/system/northnarrow-.service.d -/run/systemd/system/northnarrow-.service.d -/etc/systemd/system/northnarrow.slice.d -/run/systemd/system/northnarrow.slice.d -/etc/systemd/system.control/northnarrow.slice.d -/run/systemd/system.control/northnarrow.slice.d
 # CapabilityBoundingSet — the agent runs as root (no User=), so this set is
 # the HARD CEILING on its effective caps: a cap not listed is dropped even
 # from root. It is the blast radius if the agent is ever compromised, so it

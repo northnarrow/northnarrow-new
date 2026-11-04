@@ -263,6 +263,8 @@ WATCHDOG_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-watchdog.service"
 # Lab PR 216: the watchdog unit's OnFailure= handler (records that systemd
 # gave up on the watchdog; not enabled, started only by OnFailure=).
 WATCHDOG_FAILED_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-watchdog-failed.service"
+# Lot 273d: the units' slice of their own.
+SLICE_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow.slice"
 # Dedicated journal-namespace config (activated by LogNamespace=northnarrow
 # in both units). Capped, isolated journald instance → no /var/log/syslog
 # amplification, hard SystemMaxUse ceiling, zero customer config.
@@ -907,6 +909,7 @@ txn_targets() {
     local f
     for f in northnarrow-agent northnarrow-watchdog nn-admin northnarrow-scan; do echo "$BIN_DIR/$f"; done
     for f in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do echo "$UNIT_DIR/$f.service"; done
+    echo "$UNIT_DIR/northnarrow.slice"
     echo "$DROPIN_ROOT/northnarrow-agent.service.d/10-debian-perf-paranoid.conf"
     # lab PR 222: the copy-on-first-write drop-in (--cow-guard)
     echo "$DROPIN_ROOT/northnarrow-agent.service.d/20-cow-guard.conf"
@@ -1185,6 +1188,11 @@ txn_rollback() {   # <exit status of the failure>
     n_restored=$(find "$TXN_DIR/backup" \( -type f -o -type l \) 2>/dev/null | wc -l)
     n_removed=$(grep -c . "$TXN_DIR/absent")
     systemctl daemon-reload
+    # Lot 273d: the enablement is not one of the files restored above — the
+    # units enabled before the upgrade are enabled again, as rollback.sh does
+    while IFS= read -r u; do
+        if [[ -n "$u" ]]; then systemctl enable "$u" 2>/dev/null || echo "install.sh: WARNING: $u could not be enabled again" >&2; fi
+    done < "$TXN_DIR/enabled"
     systemctl restart systemd-journald@northnarrow.service 2>/dev/null
     echo "install.sh: restored $n_restored file(s) byte for byte; the $n_removed the upgrade would have created are gone"
     record="none: nothing was running before the upgrade, nothing was started"
@@ -1283,6 +1291,7 @@ if [[ $MODE != stop ]]; then
 require_file "$AGENT_UNIT_SRC"    "expected at $AGENT_UNIT_SRC (this script's sibling deploy/systemd/)"
 require_file "$WATCHDOG_UNIT_SRC" "expected at $WATCHDOG_UNIT_SRC"
 require_file "$WATCHDOG_FAILED_UNIT_SRC" "expected at $WATCHDOG_FAILED_UNIT_SRC (lab PR 216: the watchdog's OnFailure= handler)"
+require_file "$SLICE_UNIT_SRC" "expected at $SLICE_UNIT_SRC (lot 273d: the units' slice)"
 require_file "$JOURNALD_NS_CONF_SRC" "expected at $JOURNALD_NS_CONF_SRC (NN journal-namespace cap; the LogNamespace=northnarrow journald config)"
 require_file "$FIM_PATHS_V1_SRC"  "expected at $FIM_PATHS_V1_SRC (Tappa 9 C7 default FIM watched-paths list)"
 require_file "$NETFLOW_BLOCKLIST_V1_SRC"     "expected at $NETFLOW_BLOCKLIST_V1_SRC (Tappa 10 N8 default NetFlow IP/CIDR blocklist)"
@@ -1429,10 +1438,37 @@ stop_nn_unit() {
     systemctl reset-failed "$u.service" 2>/dev/null || true
 }
 nn_unit_has_procs() {
-    local cg
+    local cg c
     cg=$(systemctl show -p ControlGroup --value "$1.service" 2>/dev/null)
-    cg=${cg:-/system.slice/$1.service}
-    [[ -n "$(cat "/sys/fs/cgroup$cg/cgroup.procs" 2>/dev/null)" ]]
+    # lot 273d: the units' slice of their own; an older install's units ran
+    # in system.slice
+    for c in "$cg" "/northnarrow.slice/$1.service" "/system.slice/$1.service"; do
+        [[ -n "$c" && -n "$(cat "/sys/fs/cgroup$c/cgroup.procs" 2>/dev/null)" ]] && return 0
+    done
+    return 1
+}
+# Lot 273d (the lab's round 13, Debian 13): an upgrade that passed every
+# health check left a host whose units were not enabled — they ran, and the
+# next boot started no agent. Each unit must be enabled ("enabled": its
+# [Install] links in place; a runtime-only enablement does not survive a
+# reboot) and pulled in by the boot's default target. ENABLE_FAILURE names
+# what is missing.
+boot_enablement() {   # <unit>...
+    local u state def deps
+    ENABLE_FAILURE=""
+    def=$(systemctl get-default 2>/dev/null) || def=""
+    # read whole, then matched: `grep -q` on the pipe would close it early
+    # and, under pipefail, fail the check on systemctl's SIGPIPE
+    deps=$( [[ -n "$def" ]] && systemctl list-dependencies --plain --no-pager "$def" 2>/dev/null ) || true
+    for u in "$@"; do
+        state=$(systemctl is-enabled "$u.service" 2>/dev/null) || true
+        if [[ "$state" != enabled ]]; then
+            ENABLE_FAILURE="${ENABLE_FAILURE:+$ENABLE_FAILURE; }$u.service is ${state:-not known to systemd} (systemctl is-enabled)"
+        elif [[ -z "$def" ]] || ! grep -qE "(^|[[:space:]])$u\.service$" <<<"$deps"; then
+            ENABLE_FAILURE="${ENABLE_FAILURE:+$ENABLE_FAILURE; }$u.service is enabled but not pulled in by the default target ${def:-(unknown: systemctl get-default)}"
+        fi
+    done
+    [[ -z "$ENABLE_FAILURE" ]]
 }
 
 # External audit DEP-006: the drain gate used to wait for "no LSM program on
@@ -1655,6 +1691,17 @@ if (( ${#UNITS_TO_RESTART[@]} || STARTED_FOR_WINDOW )); then
     # agent runs only its own window (opened with the key) lets the rollback
     # stop it and put the previous files back. A window opened by hand before
     # the run covers the stop, not that.
+    # Lot 273d: the running units must be the ones the next boot starts —
+    # an upgrade of units that run but are not enabled (started by hand, or
+    # after `systemctl disable`) would leave the host without its agent at
+    # the next reboot, and the health check below would pass.
+    if [[ $MODE == full ]] && (( ${#UNITS_TO_RESTART[@]} )) && ! boot_enablement northnarrow-agent northnarrow-watchdog; then
+        echo "install.sh: REFUSED — $ENABLE_FAILURE: the next boot would start no agent." >&2
+        echo "install.sh: Enable them first, then re-run --upgrade:" >&2
+        echo "install.sh:   systemctl enable northnarrow-agent northnarrow-watchdog" >&2
+        echo "install.sh: Nothing was changed." >&2
+        exit 1
+    fi
     if [[ $MODE == full ]] && (( ${#UNITS_TO_RESTART[@]} )) && [[ -z "$GRANT_KEY" ]]; then
         echo "install.sh: REFUSED — --upgrade needs --grant-key <admin key with the trusted-installer role>: its" >&2
         echo "install.sh: window stops the running units, and a rollback needs the new agent's window too." >&2
@@ -1734,7 +1781,7 @@ if [[ $MODE == configure ]]; then
         for f in /usr/local/bin/northnarrow-agent /usr/local/bin/northnarrow-watchdog /usr/local/bin/nn-admin \
                  /usr/local/bin/northnarrow-scan \
                  /etc/systemd/system/northnarrow-agent.service /etc/systemd/system/northnarrow-watchdog.service \
-                 /etc/systemd/system/northnarrow-watchdog-failed.service; do
+                 /etc/systemd/system/northnarrow-watchdog-failed.service /etc/systemd/system/northnarrow.slice; do
             [[ -e "$f" ]] && { echo "install.sh: removing $f (install.sh layout, replaced by the package)"; rm -f "$f"; }
         done
         if (( ${#was_enabled[@]} )); then
@@ -1772,6 +1819,7 @@ install_unit() {
 install_unit "$AGENT_UNIT_SRC"    "$UNIT_DIR/northnarrow-agent.service.nn-new"
 install_unit "$WATCHDOG_UNIT_SRC" "$UNIT_DIR/northnarrow-watchdog.service.nn-new"
 install_unit "$WATCHDOG_FAILED_UNIT_SRC" "$UNIT_DIR/northnarrow-watchdog-failed.service.nn-new"
+install_unit "$SLICE_UNIT_SRC" "$UNIT_DIR/northnarrow.slice.nn-new"
 for staged in "$AGENT_BIN:northnarrow-agent" "$WATCHDOG_BIN:northnarrow-watchdog" "$NN_ADMIN_BIN:nn-admin" \
               "$SCAN_BIN:northnarrow-scan"; do
     if ! cmp -s "${staged%%:*}" "$BIN_DIR/${staged#*:}.nn-new"; then
@@ -1783,7 +1831,7 @@ done
 echo "install.sh: switching binaries and units (rename)"
 for f in "$BIN_DIR/northnarrow-agent" "$BIN_DIR/northnarrow-watchdog" "$BIN_DIR/nn-admin" \
          "$BIN_DIR/northnarrow-scan" "$UNIT_DIR/northnarrow-agent.service" "$UNIT_DIR/northnarrow-watchdog.service" \
-         "$UNIT_DIR/northnarrow-watchdog-failed.service"; do
+         "$UNIT_DIR/northnarrow-watchdog-failed.service" "$UNIT_DIR/northnarrow.slice"; do
     mv -fT "$f.nn-new" "$f"
 done
 fi
@@ -2338,6 +2386,15 @@ if (( UPGRADE )) && (( ${#UNITS_TO_RESTART[@]} )); then
         echo "install.sh: health check FAILED: $HEALTH_FAILURE" >&2
         exit 1
     fi
+    # Lot 273d: running is not enough — the next boot must start them too
+    # (the preflight checked it before; a unit file or link the switch
+    # changed is caught here, and rolled back like any failed check).
+    if ! boot_enablement northnarrow-agent northnarrow-watchdog; then
+        TXN_REASON="boot enablement: $ENABLE_FAILURE"
+        echo "install.sh: health check FAILED: $ENABLE_FAILURE — the next boot would start no agent" >&2
+        exit 1
+    fi
+    echo "install.sh: both units enabled and pulled in by $(systemctl get-default 2>/dev/null || echo 'the default target')"
     if [[ -n "$HEALTH_NOTE" ]]; then echo "install.sh: WARNING: $HEALTH_NOTE" >&2; fi
     for u in "${UNITS_TO_RESTART[@]}"; do
         echo "install.sh: $u is $(systemctl is-active "$u.service" || true)"

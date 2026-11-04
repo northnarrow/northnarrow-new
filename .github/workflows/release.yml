@@ -184,6 +184,7 @@ jobs:
                    usr/bin/northnarrow-scan \
                    usr/lib/systemd/system/northnarrow-agent.service \
                    usr/lib/systemd/system/northnarrow-watchdog-failed.service \
+                   usr/lib/systemd/system/northnarrow.slice \
                    usr/share/northnarrow/deploy/install.sh; do
             test -e "$tmp/$f" || { echo "missing in the .deb: $f"; exit 1; }
           done

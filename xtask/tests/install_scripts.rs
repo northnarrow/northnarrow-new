@@ -303,6 +303,18 @@ case "$cmd" in
         echo inactive > "$T/state.$u"; : > "$T/cg/$u/cgroup.procs" ;;
     show)
         u=${4%.service}; echo "/../../..$T/cg/$u" ;;
+    is-enabled)
+        u=${1%.service}; st=$(cat "$T/enabled.$u" 2>/dev/null || echo enabled)
+        [ -n "$q" ] || echo "$st"
+        [ "$st" = enabled ] ;;
+    get-default) echo multi-user.target ;;
+    list-dependencies)
+        echo multi-user.target
+        for u in northnarrow-agent northnarrow-watchdog; do
+            st=$(cat "$T/enabled.$u" 2>/dev/null || echo enabled)
+            [ "$st" = enabled ] && [ ! -e "$T/unwanted.$u" ] && echo "  $u.service"
+        done
+        exit 0 ;;
     *) exit 0 ;;
 esac"#,
         );
@@ -530,6 +542,50 @@ fn install_on_stale_pins_reports_a_refused_grant_or_a_failed_start() {
     assert_eq!(r.status, 1, "{r:#?}");
     assert!(r.stderr.contains("did not appear"), "{r:#?}");
     assert_eq!(r.called(GRANT), 0, "{r:#?}");
+}
+
+/// Lot 273d (the lab's round 13): an upgrade of units that run but are not
+/// enabled — or enabled and pulled in by no boot target — would leave a host
+/// whose next boot starts no agent; it is refused before anything changes:
+/// no window asked for, nothing stopped.
+#[test]
+fn an_upgrade_of_units_the_boot_would_not_start_is_refused() {
+    let both = ["northnarrow-agent", "northnarrow-watchdog"];
+    for (case, file, want) in [
+        (
+            "disabled",
+            "enabled.northnarrow-agent",
+            "northnarrow-agent.service is disabled (systemctl is-enabled)",
+        ),
+        (
+            "unwanted",
+            "unwanted.northnarrow-watchdog",
+            "northnarrow-watchdog.service is enabled but not pulled in by the default target multi-user.target",
+        ),
+    ] {
+        let host = Host::new(&format!("install-boot-{case}"), &both, true, true);
+        let marker = host.dir.join(file);
+        fs::write(&marker, if case == "disabled" { "disabled\n" } else { "" }).unwrap();
+        let r = host.install("full", true, Some("key-role"));
+        assert_eq!(r.status, 1, "{case}: {r:#?}");
+        assert!(r.stderr.contains(&format!("REFUSED — {want}")), "{case}: {r:#?}");
+        assert!(r.stderr.contains("Nothing was changed."), "{case}: {r:#?}");
+        assert!(
+            r.stderr
+                .contains("install.sh:   systemctl enable northnarrow-agent northnarrow-watchdog\n"),
+            "{case}: the exact command to run: {r:#?}"
+        );
+        assert_eq!(r.called(GRANT), 0, "{case}: {r:#?}");
+        assert!(
+            !r.calls.iter().any(|c| c.starts_with("systemctl kill")),
+            "{case}: {r:#?}"
+        );
+        assert_eq!(
+            fs::read_to_string(host.dir.join("state.northnarrow-agent")).unwrap(),
+            "active\n",
+            "{case}: still running"
+        );
+    }
 }
 
 /// A running install still takes the upgrade path: nothing extra started,
@@ -1104,7 +1160,9 @@ fn the_watchdog_failure_handler_ships_with_the_units() {
     assert!(install.contains(&format!(
         "install_unit \"$WATCHDOG_FAILED_UNIT_SRC\" \"$UNIT_DIR/{UNIT}.nn-new\""
     )));
-    assert!(install.contains("\"$UNIT_DIR/northnarrow-watchdog-failed.service\"; do"));
+    assert!(install.contains(
+        "\"$UNIT_DIR/northnarrow-watchdog-failed.service\" \"$UNIT_DIR/northnarrow.slice\"; do"
+    ));
     assert!(install.contains(
         "for f in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do echo \"$UNIT_DIR/$f.service\"; done"
     ));
@@ -1128,6 +1186,54 @@ fn the_watchdog_failure_handler_ships_with_the_units() {
         "rpm %files"
     );
     assert!(read("deploy/release/mk-tarball.sh").contains("deploy/systemd"));
+}
+
+/// Lot 273d (the review of #492): the units' slice of their own ships,
+/// switches and leaves with them — `system.slice.d` no longer reaches the
+/// agent and the watchdog — and both units name it.
+#[test]
+fn the_units_slice_ships_with_the_units() {
+    const SLICE: &str = "northnarrow.slice";
+    let unit = read(&format!("deploy/systemd/{SLICE}"));
+    for want in ["[Slice]", "RefuseManualStop=yes", "IgnoreOnIsolate=yes"] {
+        assert!(unit.contains(want), "{want}");
+    }
+    for u in ["northnarrow-agent.service", "northnarrow-watchdog.service"] {
+        assert!(
+            read(&format!("deploy/systemd/{u}")).contains("\nSlice=northnarrow.slice\n"),
+            "{u}"
+        );
+    }
+    let install = read("deploy/install.sh");
+    for want in [
+        "SLICE_UNIT_SRC=\"$REPO_ROOT/deploy/systemd/northnarrow.slice\"",
+        "require_file \"$SLICE_UNIT_SRC\"",
+        "install_unit \"$SLICE_UNIT_SRC\" \"$UNIT_DIR/northnarrow.slice.nn-new\"",
+        "\"$UNIT_DIR/northnarrow.slice\"; do",
+        "    echo \"$UNIT_DIR/northnarrow.slice\"",
+        "/etc/systemd/system/northnarrow.slice; do",
+    ] {
+        assert!(install.contains(want), "{want}");
+    }
+    let uninstall = read("deploy/uninstall.sh");
+    assert!(uninstall.contains("rm -f \"$UNIT_DIR/northnarrow.slice\""));
+    assert!(uninstall.contains("\"$DROPIN_ROOT/northnarrow.slice.d\""));
+    let packages = read("deploy/release/mk-packages.sh");
+    assert!(packages.contains(
+        "install -m 0644 deploy/systemd/northnarrow.slice \"$root/usr/lib/systemd/system/northnarrow.slice\""
+    ));
+    assert!(
+        packages.contains("/usr/lib/systemd/system/northnarrow.slice\n"),
+        "rpm %files"
+    );
+    assert!(
+        read(".github/workflows/release.yml").contains("usr/lib/systemd/system/northnarrow.slice")
+    );
+    // the slice's drop-in directories, made empty for the agent to register
+    // NOCREATE
+    assert!(read("deploy/systemd/northnarrow-agent.service").contains(
+        "/etc/systemd/system/northnarrow.slice.d /run/systemd/system/northnarrow.slice.d"
+    ));
 }
 
 // ── Lab PR 220: the transactional upgrade and the blocking provenance ────
@@ -1257,7 +1363,16 @@ case "$cmd" in
         u=${{1%.service}}; st=$(cat "$T/state.$u" 2>/dev/null || echo inactive)
         [ -n "$q" ] || echo "$st"
         [ "$st" = active ] ;;
-    is-enabled) [ -e "$T/enabled.${{1%.service}}" ] ;;
+    is-enabled)
+        if [ -e "$T/enabled.${{1%.service}}" ]; then [ -n "$q" ] || echo enabled
+        else [ -n "$q" ] || echo disabled; exit 1; fi ;;
+    get-default) echo multi-user.target ;;
+    list-dependencies)
+        echo multi-user.target
+        for u in northnarrow-agent northnarrow-watchdog; do
+            [ -e "$T/enabled.$u" ] && [ ! -e "$T/unwanted.$u" ] && echo "  $u.service"
+        done
+        exit 0 ;;
     enable) for a; do : > "$T/enabled.${{a%.service}}"; done ;;
     disable) for a; do /bin/rm -f "$T/enabled.${{a%.service}}"; done ;;
     start)
@@ -1286,7 +1401,9 @@ case "$cmd" in
             MainPID) cat "$T/mainpid.$u" 2>/dev/null || echo 0 ;;
         esac ;;
     daemon-reload)
-        if [ -e "$T/fail-daemon-reload" ]; then /bin/rm -f "$T/fail-daemon-reload"; exit 1; fi ;;
+        if [ -e "$T/fail-daemon-reload" ]; then /bin/rm -f "$T/fail-daemon-reload"; exit 1; fi
+        # lot 273d: a switch that loses the watchdog's enablement link
+        if [ -e "$T/lose-enable" ]; then /bin/rm -f "$T/lose-enable" "$T/enabled.northnarrow-watchdog"; fi ;;
     *) exit 0 ;;
 esac"#
             ),
@@ -1733,6 +1850,40 @@ fn started(r: &Run, unit: &str) -> Vec<String> {
         .iter()
         .filter_map(|c| c.strip_prefix(&prefix).map(str::to_string))
         .collect()
+}
+
+/// Lot 273d: running is not enough — an upgrade whose switch lost a unit's
+/// enablement fails its health check (the next boot would start no agent)
+/// and is rolled back: the old release back, both units enabled again.
+#[test]
+fn an_upgrade_that_leaves_a_unit_not_enabled_is_rolled_back() {
+    let lab = Lab::new("enable-rollback");
+    lab.install_old();
+    lab.binaries("new", NEW);
+    fs::write(lab.root.join("lose-enable"), "").unwrap();
+    let r = lab.upgrade();
+    assert_ne!(r.status, 0, "{r:#?}");
+    assert!(
+        r.stderr.contains(
+            "health check FAILED: northnarrow-watchdog.service is disabled (systemctl is-enabled) — the next boot would start no agent"
+        ),
+        "{r:#?}"
+    );
+    assert!(!r.stdout.contains("UPGRADE complete"), "{r:#?}");
+    assert_eq!(
+        fs::read(lab.root.join("bin/northnarrow-agent")).unwrap(),
+        fs::read(lab.case.join("old/target/release/northnarrow-agent")).unwrap(),
+        "the old release restored"
+    );
+    for u in ["northnarrow-agent", "northnarrow-watchdog"] {
+        assert!(
+            lab.root.join(format!("enabled.{u}")).exists(),
+            "{u} enabled again: {r:#?}"
+        );
+    }
+    let rows = lab.audit_rows("upgrade_rolled_back");
+    assert_eq!(rows.len(), 1, "{r:#?}");
+    assert_eq!(rows[0]["extra"]["stage"], "health_check");
 }
 
 /// Lab PR 220 (P0 C-45 / G-07 / TD-09): the new agent starts but never logs

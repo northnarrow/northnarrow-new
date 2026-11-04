@@ -8250,7 +8250,7 @@ exit: 0
 --- stdout
 | trusted-installer-grant: override armed for 300s — FS pin suspended; the agent's own systemd-unit writes are downgraded to an audit Log. Run install.sh + `systemctl restart` now; the window closes at the deadline or on restart, whichever comes first.
 --- stderr
-(empty)
+| trusted-installer-grant: the host's drop-ins were not checked (this key reads no status): run `nn-admin status --key …` and look for `host_dropins` before a `daemon-reload` inside the window
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -8258,6 +8258,9 @@ connection 1
 > {"TrustedInstallerGrantRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"TrustedInstallerGrant":{"window_secs":300}},"nonce":"<challenge>","op":18,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
 < TrustedInstallerGrantResult (granted)
 > (closed)
+connection 2
+> {"ChallengeRequest":{}}
+< (closed: no reply scripted)
 
 ### sock.trusted-installer-grant.refused.invalid-signature
 $ nn-admin trusted-installer-grant --window-secs 300 --key key-a --agent-id-file agent_id --socket admin.sock
@@ -10703,7 +10706,7 @@ exit: 0
 --- stdout
 | trusted-installer-grant: override armed for 120s — FS pin suspended; the agent's own systemd-unit writes are downgraded to an audit Log. Run install.sh + `systemctl restart` now; the window closes at the deadline or on restart, whichever comes first.
 --- stderr
-(empty)
+| trusted-installer-grant: the host's drop-ins were not checked (this key reads no status): run `nn-admin status --key …` and look for `host_dropins` before a `daemon-reload` inside the window
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -10711,6 +10714,9 @@ connection 1
 > {"TrustedInstallerGrantRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"TrustedInstallerGrant":{"window_secs":120}},"nonce":"<challenge>","op":18,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
 < TrustedInstallerGrantResult
 > (closed)
+connection 2
+> {"ChallengeRequest":{}}
+< (closed: no reply scripted)
 
 ### sock.trusted-installer-grant.clamped-up
 $ nn-admin trusted-installer-grant --window-secs 0 --key key-a --agent-id-file agent_id --socket admin.sock
@@ -10719,6 +10725,7 @@ exit: 0
 | trusted-installer-grant: override armed for 1s — FS pin suspended; the agent's own systemd-unit writes are downgraded to an audit Log. Run install.sh + `systemctl restart` now; the window closes at the deadline or on restart, whichever comes first.
 --- stderr
 | trusted-installer-grant: --window-secs 0 clamped to 1 (agent ceiling)
+| trusted-installer-grant: the host's drop-ins were not checked (this key reads no status): run `nn-admin status --key …` and look for `host_dropins` before a `daemon-reload` inside the window
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -10726,6 +10733,9 @@ connection 1
 > {"TrustedInstallerGrantRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"TrustedInstallerGrant":{"window_secs":1}},"nonce":"<challenge>","op":18,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
 < TrustedInstallerGrantResult
 > (closed)
+connection 2
+> {"ChallengeRequest":{}}
+< (closed: no reply scripted)
 
 ### sock.trusted-installer-grant.clamped-down
 $ nn-admin trusted-installer-grant --window-secs 3600 --key key-a --agent-id-file agent_id --socket admin.sock
@@ -10734,6 +10744,7 @@ exit: 0
 | trusted-installer-grant: override armed for 600s — FS pin suspended; the agent's own systemd-unit writes are downgraded to an audit Log. Run install.sh + `systemctl restart` now; the window closes at the deadline or on restart, whichever comes first.
 --- stderr
 | trusted-installer-grant: --window-secs 3600 clamped to 600 (agent ceiling)
+| trusted-installer-grant: the host's drop-ins were not checked (this key reads no status): run `nn-admin status --key …` and look for `host_dropins` before a `daemon-reload` inside the window
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -10741,6 +10752,9 @@ connection 1
 > {"TrustedInstallerGrantRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"TrustedInstallerGrant":{"window_secs":600}},"nonce":"<challenge>","op":18,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
 < TrustedInstallerGrantResult
 > (closed)
+connection 2
+> {"ChallengeRequest":{}}
+< (closed: no reply scripted)
 
 ### sock.shutdown.default-grace
 $ nn-admin shutdown --cosign-key key-b --key key-a --agent-id-file agent_id --socket admin.sock

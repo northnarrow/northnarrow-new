@@ -1029,6 +1029,10 @@ pub enum FsProtectOperation {
     /// Lot 273c: a protected process's I/O priority changed by another
     /// (`ionice`); `target_dev` is the value.
     Ioprio,
+    /// Lot 273d: a global sysctl's write that aborts or starves the agent
+    /// (overcommit, `pid_max`, `threads-max`, `max_map_count`, real-time
+    /// throttling).
+    Sysctl,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1065,6 +1069,7 @@ impl FsProtectOperation {
             crate::wire::FS_OP_SCHED => Self::Sched,
             crate::wire::FS_OP_NICE => Self::Nice,
             crate::wire::FS_OP_IOPRIO => Self::Ioprio,
+            crate::wire::FS_OP_SYSCTL => Self::Sysctl,
             other => Self::Unknown(other),
         }
     }
@@ -1099,6 +1104,7 @@ impl FsProtectOperation {
             Self::Sched => "sched",
             Self::Nice => "nice",
             Self::Ioprio => "ioprio",
+            Self::Sysctl => "sysctl",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -1655,6 +1661,11 @@ mod tests {
                 FsProtectOperation::Ioprio,
                 "ioprio",
             ),
+            (
+                crate::wire::FS_OP_SYSCTL,
+                FsProtectOperation::Sysctl,
+                "sysctl",
+            ),
         ];
         for (byte, op, name) in cases {
             assert_eq!(FsProtectOperation::from_wire(byte), op);
@@ -1662,8 +1673,8 @@ mod tests {
             assert_eq!(op.to_string(), name);
         }
         assert_eq!(
-            FsProtectOperation::from_wire(29),
-            FsProtectOperation::Unknown(29)
+            FsProtectOperation::from_wire(30),
+            FsProtectOperation::Unknown(30)
         );
     }
     use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};

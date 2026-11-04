@@ -869,6 +869,14 @@ pub const FS_OP_NICE: u8 = 27;
 /// Lot 273c: the I/O priority of a protected process changed by another
 /// (`ioprio_set`: `task_setioprio`; `target_dev` = the ioprio value).
 pub const FS_OP_IOPRIO: u8 = 28;
+/// Lot 273d (the review of #492): a write of a global sysctl that aborts
+/// or starves the agent with the host (`vm.overcommit_memory=2`, a cut
+/// `pid_max` / `threads-max` / `max_map_count`, real-time throttling off)
+/// (`common::cgroup_limits::sysctl_write_harmful`), and any write of
+/// `kernel.ftrace_enabled` (0 blinds it: R1 of the external review of
+/// 04/11), refused outside a window (`target_dev`/`target_ino` = the
+/// file's inode).
+pub const FS_OP_SYSCTL: u8 = 29;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
@@ -1789,7 +1797,7 @@ mod tests {
         }
         // Lot 273: the new bits mark, they never require (no operation is
         // refused for carrying one).
-        for op in 1..=FS_OP_IOPRIO {
+        for op in 1..=FS_OP_SYSCTL {
             let r = fs_protect_required(op);
             assert_eq!(
                 r & (FS_PROTECT_INIT_RMDIR
@@ -1812,7 +1820,7 @@ mod tests {
         for caller in [0, 2, 1000, u32::MAX] {
             assert!(!fs_protect_init_may(FS_OP_RMDIR, dir, caller), "{caller}");
         }
-        for op in 1..=FS_OP_IOPRIO {
+        for op in 1..=FS_OP_SYSCTL {
             if op != FS_OP_RMDIR && op != FS_OP_XATTR {
                 assert!(!fs_protect_init_may(op, dir, 1), "op {op}");
             }
@@ -1898,6 +1906,7 @@ mod tests {
             FS_OP_SCHED,
             FS_OP_NICE,
             FS_OP_IOPRIO,
+            FS_OP_SYSCTL,
         ];
         for (i, a) in ops.iter().enumerate() {
             assert_ne!(*a, 0);

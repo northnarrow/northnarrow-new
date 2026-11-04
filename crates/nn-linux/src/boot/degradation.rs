@@ -247,6 +247,20 @@ pub fn spawn_flusher() {
     });
 }
 
+/// Lot 273d (the review of #492): the degradations of `source` whose
+/// condition ended — every one but `keep` — leave the status, the manifest
+/// and the trust level; their signed records stay in the chain, and the
+/// condition's own end is signed by its finder (a drift cleared, a reload
+/// confirmed). A degradation that holds stays visible as long as it holds.
+/// Returns how many left.
+pub fn withdraw(source: &str, keep: &[String]) -> usize {
+    let mut r = REGISTRY.lock();
+    let before = r.entries.len();
+    r.entries
+        .retain(|d| d.source != source || keep.contains(&d.detail));
+    before - r.entries.len()
+}
+
 /// The event loop starts: later reports are not boot ones.
 pub fn mark_boot_over() {
     REGISTRY.lock().boot_over = true;
@@ -394,6 +408,22 @@ mod tests {
         let s = snapshot();
         assert_eq!(s.len(), MAX_KEPT + 1);
         assert!(s.last().unwrap().contains("3 more"), "{s:?}");
+        reset_for_tests();
+    }
+
+    /// Lot 273d: a degradation whose condition ended leaves the status; the
+    /// others of its source, and the other sources, stay.
+    #[test]
+    fn a_degradation_that_ended_is_withdrawn() {
+        let _g = TEST_LOCK.lock();
+        reset_for_tests();
+        report("host_dropins", "a");
+        report("host_dropins", "b");
+        report("systemd_reload", "c");
+        assert_eq!(withdraw("host_dropins", &["b".to_string()]), 1);
+        assert_eq!(snapshot(), vec!["host_dropins: b", "systemd_reload: c"]);
+        assert_eq!(withdraw("systemd_reload", &[]), 1);
+        assert_eq!(count(), 1);
         reset_for_tests();
     }
 }

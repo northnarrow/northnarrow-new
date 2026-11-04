@@ -78,6 +78,22 @@ fn rows(dir: &std::path::Path) -> Vec<crate::audit::AuditEntry> {
         .collect()
 }
 
+/// R1: a kernel whose `ftrace_enabled` is `value`, for the manifest's
+/// per-build read (`Inputs::proc_root`).
+fn proc_root(value: &str) -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("proc/sys/kernel/ftrace_enabled");
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(f, value).unwrap();
+    d
+}
+
+/// A healthy kernel's switches (ftrace on), shared by the tests.
+fn healthy_proc() -> std::path::PathBuf {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| proc_root("1\n")).path().to_path_buf()
+}
+
 /// Every source noted whole on its contract's attach point, as a healthy
 /// boot's attach code notes them.
 fn inputs(bpf_lsm: BpfLsm, self_test: SelfTestOutcome) -> Inputs {
@@ -113,6 +129,7 @@ fn inputs(bpf_lsm: BpfLsm, self_test: SelfTestOutcome) -> Inputs {
         ),
         opt_ins: Vec::new(),
         workers: None,
+        proc_root: healthy_proc(),
     }
 }
 
@@ -385,6 +402,90 @@ fn a_worse_state_is_signed_at_once_a_better_one_waits() {
     pumps(&without);
     assert_eq!(m.refresh_at(t0 + Duration::from_secs(90), false), None);
     assert_eq!(m.current().unwrap().unsigned_changes, 2);
+}
+
+/// R1 of the external review of 04/11: `kernel.ftrace_enabled` is read at
+/// every build — 0 at the boot is in revision 0; set to 0 while the agent
+/// runs, a worse state signed at once (its degradation signed too, so the
+/// heartbeat's hash changes and the verifier says DEGRADED); on again,
+/// withdrawn. A value that cannot be read is a degradation as well.
+#[test]
+fn every_build_reads_ftrace_enabled() {
+    let _serial = SERIAL.lock();
+    let dir = tempfile::tempdir().unwrap();
+    let (log, _) = open_log(dir.path());
+    let off = |m: &CapabilityManifest| {
+        m.degradations
+            .iter()
+            .filter(|d| d.starts_with("ftrace_enabled: kernel.ftrace_enabled"))
+            .count()
+    };
+    // 0 at the boot: in revision 0
+    let at_boot = proc_root("0\n");
+    let mut i = inputs(active(), SelfTestOutcome::Denied);
+    i.proc_root = at_boot.path().to_path_buf();
+    let b = SignedManifest::default();
+    b.arm(Some(&log), i);
+    assert_eq!(off(&b.current().unwrap()), 1);
+    assert!(
+        rows(dir.path()).iter().any(|e| e.op == AUDIT_OP
+            && e.extra["degradations"]
+                .as_array()
+                .is_some_and(|d| d.iter().any(|l| {
+                    l.as_str().is_some_and(|l| {
+                        l.starts_with("ftrace_enabled: kernel.ftrace_enabled is 0")
+                    })
+                }))),
+        "revision 0 names it"
+    );
+    std::fs::write(at_boot.path().join("proc/sys/kernel/ftrace_enabled"), "1\n").unwrap();
+    b.flush();
+    assert_eq!(off(&b.current().unwrap()), 0, "on again: withdrawn");
+    // a healthy boot, then 0 while running: the next build has it, its
+    // row at once
+    let root = proc_root("1\n");
+    let mut i = inputs(active(), SelfTestOutcome::Denied);
+    i.proc_root = root.path().to_path_buf();
+    let m = SignedManifest::default();
+    m.arm(Some(&log), i);
+    settle(&m);
+    let before = m.current().unwrap();
+    assert_eq!(off(&before), 0);
+    let file = root.path().join("proc/sys/kernel/ftrace_enabled");
+    std::fs::write(&file, "0\n").unwrap();
+    let t0 = std::time::Instant::now();
+    let rev = m.refresh_at(t0, false);
+    assert_eq!(rev, Some(before.revision + 1), "worse: signed at once");
+    let now = m.current().unwrap();
+    assert_eq!(off(&now), 1);
+    assert_ne!(now.hash, before.hash, "the heartbeat's hash changes");
+    assert!(
+        rows(dir.path()).iter().any(|e| e.op == CHANGE_OP
+            && e.extra["degradations"]
+                .as_array()
+                .is_some_and(|d| d.iter().any(|l| {
+                    l.as_str().is_some_and(|l| {
+                        l.starts_with("ftrace_enabled: kernel.ftrace_enabled is 0")
+                    })
+                }))),
+        "the signed revision names it"
+    );
+    // unreadable: a degradation too, the 0's line withdrawn
+    std::fs::remove_file(&file).unwrap();
+    m.refresh_at(t0 + Duration::from_secs(5), false);
+    let unread = m.current().unwrap();
+    assert_eq!(off(&unread), 1, "{:?}", unread.degradations);
+    assert!(
+        unread
+            .degradations
+            .iter()
+            .any(|d| d.contains("could not be read")),
+        "{:?}",
+        unread.degradations
+    );
+    std::fs::write(&file, "1\n").unwrap();
+    m.flush();
+    assert_eq!(off(&m.current().unwrap()), 0);
 }
 
 /// The review of #479 and its re-check: a worse state is signed at once;

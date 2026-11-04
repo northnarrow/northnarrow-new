@@ -73,6 +73,21 @@ pub mod sd_notify;
 pub mod cgroup_floors;
 pub mod cgroup_guard;
 
+/// Lot 273c/273d: the host's drop-ins judged by their value for our units
+/// (the agent's integrity round, its reloads, the watchdog's).
+pub mod host_dropins;
+/// systemd over its private socket, served by PID 1: what it reports the
+/// host and our units as, and its reload (external audit EBPF-001; lot
+/// 273c; lot 273d: here, so that the watchdog reads our units' properties
+/// before a respawn).
+#[cfg(target_os = "linux")]
+pub mod systemd_bus;
+
+/// Lot 273d: our units' resource properties in systemd's copy, against
+/// their floors.
+#[cfg(target_os = "linux")]
+pub mod unit_props;
+
 use std::borrow::{Borrow, BorrowMut};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};

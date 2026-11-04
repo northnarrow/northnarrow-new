@@ -151,7 +151,7 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         &[
             "off!(SUPER_BLOCK_S_MAGIC_OFFSET)",
             "Ok(m) => m,",
-            "match special_fs(magic) {\n        Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),\n        Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),\n        Some(SpecialFs::Proc) => refuse_oom_adj(file, inode, phase),\n        None => false,\n    }",
+            "match special_fs(magic) {\n        Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),\n        Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),\n        Some(SpecialFs::Proc) => {\n            refuse_sysctl(file, inode, hook, phase) || refuse_oom_adj(file, inode, phase)\n        }\n        None => false,\n    }",
         ],
     )
     .unwrap();
@@ -160,6 +160,27 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         2,
         "the magic is read and classified, nothing else:\n{w}"
     );
+    // Lot 273d (the review of #492): a guarded sysctl's harmful write
+    // refused outside a window, judged at the write by the shared verdict
+    // (R1: written_value() appears nowhere else in it)
+    assert_eq!(
+        body(&c, "refuse_sysctl").matches("written_value()").count(),
+        1
+    );
+    in_order(
+        body(&c, "refuse_sysctl"),
+        &[
+            "if phase == Phase::Open {\n        return false;\n    }",
+            "let kind = sysctl_kind(len, words);",
+            "if kind == SYSCTL_NONE {\n        return false;\n    }",
+            // R1: the shared verdict, the caller's identity passed in (the
+            // agent's own restore), the bytes read only through it
+            "if !sysctl_write_refused(kind, caller_may(caller), || written_value()) {\n        return false;\n    }",
+            "sign(phase, FS_OP_SYSCTL, key);",
+            "true",
+        ],
+    )
+    .unwrap();
     // The review of #490 (B): the file is recognised by its registered
     // value or by its kernfs node (name, parent's id), the dentry only
     // without the node's offsets — a handle-opened file's dentry is
@@ -611,18 +632,27 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     // The reload is a SIGHUP to PID 1 once PID 1 is found serving
     // systemd's private socket (lab, round 4: `Manager.Reload()` waits for
     // polkit without CAP_SYS_ADMIN, its reload came only at the close).
-    let sd = code("crates/nn-linux/src/systemd_state.rs");
-    let r = body(&sd, "reload");
+    // Lot 273d: the client is shared with the watchdog, and the reload is
+    // confirmed (Reloading(false) on a connection opened before the signal).
+    let sd = code("antitamper-bpf/src/systemd_bus.rs");
+    let r = body(&sd, "reload_verified");
     in_order(
         r,
         &[
-            "let state = system_state(socket, Duration::from_secs(5))?;",
+            "let mut s = connect(socket, timeout)?;",
+            "let state = state_on(&mut s)?;",
             "if state == \"stopping\" {",
             "libc::kill(1, libc::SIGHUP)",
+            "match reloading_signal(&msg)? {",
+            "Some(false) => return Ok(\"reloaded (Reloading(false) received)\"),",
         ],
     )
     .unwrap();
-    assert!(!r.contains("Reload"), "no Manager.Reload() call:\n{r}");
+    assert!(
+        !r.contains("Manager.Reload") && !r.contains("\"Reload\""),
+        "no Manager.Reload() call:\n{r}"
+    );
+    assert!(body(&sd, "reload").contains("reload_verified(socket, Duration::from_secs(30))"));
     // PID 1 serves the socket: the peer check of every exchange
     in_order(
         body(&sd, "connect"),
@@ -639,15 +669,25 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         body(&rl, "worker"),
         &[
             "crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read());",
-            "match outcome(&harms, || crate::systemd_state::reload(socket)) {",
+            "match outcome(&harms, || {\n            crate::systemd_state::reload_verified(socket, RELOAD_TIMEOUT)\n        }) {",
             "Outcome::Withheld(what) => {",
+            "crate::boot::degradation::report(",
+            "Outcome::Confirmed(note) => {",
+            "antitamper_bpf::unit_props::below_floors(socket, PROPS_TIMEOUT)",
+            "after();",
+            "Outcome::Failed(e) => {",
+            "crate::boot::degradation::report(",
         ],
     )
     .unwrap();
+    // Lot 273d: a refusal within the target's quiet is verified, not skipped
+    assert!(
+        body(&rl, "worker").contains("Decision::Skip => match hostile_copy(socket, &on_disk) {")
+    );
     in_order(
         body(&rl, "outcome"),
         &[
-            "if let Some(h) = harms.first() {",
+            "if let Some(h) = crate::host_dropins::withholding(harms) {",
             "return Outcome::Withheld(",
             "match reload() {",
         ],
@@ -663,6 +703,8 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         body(&ti, "arm_for"),
         &[
             "self.armed.store(true, Ordering::SeqCst);",
+            "let harms = crate::host_dropins::harmful_here();",
+            "crate::host_dropins::note_degradation(&harms);",
             "r.request(crate::systemd_reload::Reason::WindowOpened);",
         ],
     )
@@ -683,15 +725,18 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         body(&si, "collect_round"),
         &[
             "c.extend(unit_dropins(&search));",
-            "c.extend(\n            crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read())",
-            "kind: \"unit_dropin_harmful\",",
+            "crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read());",
+            "crate::host_dropins::note_degradation(&harms);",
+            "c.extend(harms.into_iter().map(|h| Finding {",
+            "crate::host_dropins::Kind::Harmful => \"unit_dropin_harmful\",",
+            "crate::host_dropins::Kind::BreaksAgent => \"unit_dropin_breaks_agent\",",
         ],
     )
     .unwrap();
     assert!(
         body(&si, "unit_dropins_with").contains("for (d, _) in crate::host_dropins::TYPE_DIRS {")
     );
-    let hd = code("crates/nn-linux/src/host_dropins.rs");
+    let hd = code("antitamper-bpf/src/host_dropins.rs");
     let hd = &hd[..hd.find("#[cfg(test)]").expect("its tests")];
     for call in [
         "fs::rename",
@@ -706,6 +751,106 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         assert!(!hd.contains(call), "host_dropins.rs only reads: {call}");
     }
     assert!(!si.contains("Reason::Quarantined") && !si.contains("dropin_quarantine"));
+    // Lot 273d: the watchdog reads systemd's copy before each respawn (a
+    // reload unless a harmful host drop-in withholds it), and the agent
+    // takes the files at their floors back to their configured values after
+    // a confirmed reload
+    let wm = code("watchdog/src/main.rs");
+    in_order(
+        &wm,
+        &[
+            "northnarrow_watchdog::check_systemds_copy(&hold, pid)",
+            "let _ = std::fs::remove_file(&cli.agent_pidfile);",
+            "r = respawn_cycle(",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&code("watchdog/src/lib.rs"), "check_systemds_copy"),
+        &[
+            "below_floors(socket, timeout)",
+            "if let Some(h) = antitamper_bpf::host_dropins::withholding(&harms) {",
+            "antitamper_bpf::systemd_bus::reload_verified(",
+            "record_hold(hold_path, &rec)",
+        ],
+    )
+    .unwrap();
+    assert!(code("agent/src/boot/mod.rs")
+        .contains("northnarrow_agent::anti_tamper::cgroup_guard::back_to_configured("));
+    in_order(
+        body(
+            &code("crates/nn-linux/src/anti_tamper/cgroup_guard.rs"),
+            "back_to_configured",
+        ),
+        &[
+            "antitamper_bpf::unit_props::configured_text(",
+            "if below_floor(\n            common::cgroup_limits::limit_kind_of(name),\n            &configured,\n            &floor,\n        ) {",
+            "continue;",
+            "std::fs::write(&path, format!(\"{configured}\\n\"))",
+            "refresh_values(bpffs_root);",
+        ],
+    )
+    .unwrap();
+    // Lot 273d: at a window's close our units' own drop-ins made inside it
+    // are judged (a harmful one quarantined, a reload asked); only our
+    // directories — the host's are never moved
+    let ti = code("crates/nn-linux/src/anti_tamper/trusted_installer.rs");
+    in_order(
+        &ti,
+        &[
+            "super::cgroup_guard::refresh_values(self.bpffs_root.as_deref());",
+            "let moved = own_dropins_at_close(since);",
+            "r.request(crate::systemd_reload::Reason::OwnDropinQuarantined);",
+            // R1: the guarded sysctls put back at the close, in its record
+            "let sysctls = sysctls_at_close();",
+            "self.audit_close(reason, close_failed.as_deref(), &lines, &sysctls);",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&ti, "sysctls_at_close"),
+        &[
+            "crate::sysctl_guard::check(",
+            "true,",
+            ".filter(|s| s.kind != \"sysctl_strict\")",
+        ],
+    )
+    .unwrap();
+    assert!(body(&ti, "audit_close").contains("extra[\"sysctls\"] = serde_json::json!(sysctls);"));
+    let od = code("crates/nn-linux/src/own_dropins.rs");
+    in_order(
+        body(&od, "own_dirs"),
+        &[
+            "root.join(\"northnarrow-agent.service.d\")",
+            "root.join(\"northnarrow-watchdog.service.d\")",
+            "root.join(\"northnarrow-.service.d\")",
+        ],
+    )
+    .unwrap();
+    assert!(
+        !od.contains("TYPE_DIRS")
+            && !od.contains("\"service.d\"")
+            && !od.contains("\"slice.d\"")
+            && !od.contains("system.slice.d"),
+        "own_dropins moves from our directories only"
+    );
+    assert!(body(&od, "quarantine").contains("meta.modified().is_ok_and(|m| m < since)"));
+    // Lot 273d: the guarded sysctls checked by the round (put back when harmful)
+    in_order(
+        body(&si, "collect_round"),
+        &["crate::sysctl_guard::check(", "true,"],
+    )
+    .unwrap();
+    // R1: ftrace_enabled read at every build of the capability manifest
+    in_order(
+        body(&code("agent/src/boot/manifest.rs"), "build"),
+        &[
+            "nn_linux::sysctl_guard::note_ftrace(&inputs.proc_root);",
+            "m.degradations = degradation::snapshot();",
+        ],
+    )
+    .unwrap();
+    assert!(code("agent/src/boot/ready.rs").contains("proc_root: std::path::PathBuf::from(\"/\"),"));
     let ab = code("antitamper-bpf/src/cgroup_guard.rs");
     in_order(
         body(&ab, "protect_unit_cgroup"),

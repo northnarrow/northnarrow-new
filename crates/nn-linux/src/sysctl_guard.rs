@@ -1,0 +1,384 @@
+//! Lot 273d (the review of #492): the global sysctls that abort or starve
+//! the agent with the rest of the host — `vm.overcommit_memory=2` with a
+//! low ratio (its next allocation fails and it aborts), `kernel.pid_max`,
+//! `kernel.threads-max` or `vm.max_map_count` cut below what it runs,
+//! `kernel.sched_rt_runtime_us=-1` (a real-time hog owns the CPUs).
+//!
+//! The choice: refused in the kernel AND checked by the integrity round.
+//! The write deny refuses a write of one of them outside a trusted-installer
+//! window when its value is harmful (`common::cgroup_limits::
+//! sysctl_write_harmful`, judged on the bytes written: a raised limit, an
+//! overcommit mode 0 or 1 go through — the operator's tuning stays
+//! possible, and any tuning inside a window). What the kernel cannot see —
+//! a value set before the agent's start (`sysctl.d` at boot) or inside a
+//! window — is the round's: a harmful value is put back to a safe one and
+//! signed (`sysctl_restored`); `vm.overcommit_memory=2` with a ratio of 50
+//! or more is an operator's strict accounting, signed (`sysctl_strict`)
+//! and left.
+//!
+//! R1 of the external review of 04/11: `kernel.ftrace_enabled=0` blinds
+//! the agent instead — on 6.0 to 7.2 the kernel turns every call site
+//! ftrace manages back into a NOP, with no error, and the BPF trampolines
+//! on them stop: the fentry/fexit sensors, the kprobes on ftrace and, by
+//! the kernel's code (the lab measures it, `SENSOR_CONTRACT.md` §5a), the
+//! BPF-LSM deny hooks. On 5.15 to 5.19 the write is EBUSY while a
+//! trampoline is attached; from 7.3 it is refused. Every write of it is
+//! refused outside a window, whatever it carries (the coordinator's
+//! decision of 04/11: nothing to judge, so nothing for a second thread to
+//! race; `common::cgroup_limits::sysctl_write_refused`), the agent's own
+//! restore passing by its identity as every guarded write does; a 0 is put
+//! back to 1 by the round and at a window's close; and it is
+//! read at every build of the capability manifest as well ([`note_ftrace`]):
+//! 0, or a value that cannot be read, is a signed degradation while it
+//! holds — the manifest changes, and the verifier off the host says
+//! DEGRADED.
+
+use std::path::Path;
+
+use common::cgroup_limits::{
+    limit_value, sysctl_write_harmful, SYSCTL_FTRACE_ENABLED, SYSCTL_MAX_MAP_COUNT,
+    SYSCTL_OVERCOMMIT_KBYTES, SYSCTL_OVERCOMMIT_MEMORY, SYSCTL_OVERCOMMIT_RATIO, SYSCTL_PID_MAX,
+    SYSCTL_SCHED_RT_RUNTIME, SYSCTL_THREADS_MAX,
+};
+
+/// The guarded files, their kinds and the safe value put back (`None`:
+/// computed, `threads-max`'s kernel default).
+pub const GUARDED: &[(&str, u8, Option<&str>)] = &[
+    (
+        "/proc/sys/vm/overcommit_ratio",
+        SYSCTL_OVERCOMMIT_RATIO,
+        Some("50"),
+    ),
+    (
+        "/proc/sys/vm/overcommit_kbytes",
+        SYSCTL_OVERCOMMIT_KBYTES,
+        Some("0"),
+    ),
+    (
+        "/proc/sys/vm/overcommit_memory",
+        SYSCTL_OVERCOMMIT_MEMORY,
+        Some("0"),
+    ),
+    (
+        "/proc/sys/vm/max_map_count",
+        SYSCTL_MAX_MAP_COUNT,
+        Some("65530"),
+    ),
+    ("/proc/sys/kernel/pid_max", SYSCTL_PID_MAX, Some("32768")),
+    ("/proc/sys/kernel/threads-max", SYSCTL_THREADS_MAX, None),
+    (
+        "/proc/sys/kernel/sched_rt_runtime_us",
+        SYSCTL_SCHED_RT_RUNTIME,
+        Some("950000"),
+    ),
+    (FTRACE_ENABLED, SYSCTL_FTRACE_ENABLED, Some("1")),
+];
+
+/// R1: the switch of ftrace, read at every build of the manifest.
+pub const FTRACE_ENABLED: &str = "/proc/sys/kernel/ftrace_enabled";
+
+/// R1: the degradation's source (`nn-admin status --key`, the manifest,
+/// the heartbeat).
+pub const FTRACE_DEGRADATION: &str = "ftrace_enabled";
+
+/// R1: what [`FTRACE_ENABLED`] says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ftrace {
+    /// Any integer but 0: the kernel's "on".
+    On,
+    /// 0: the call sites ftrace manages are NOPs (6.0 to 7.2).
+    Off,
+    /// Not read, or not an integer: whether the trampolines run is not
+    /// known — a degradation too.
+    Unknown(String),
+}
+
+impl Ftrace {
+    /// The degradation's line, `None` when on.
+    pub fn degradation(&self) -> Option<String> {
+        const WHAT: &str = "on 6.0 to 7.2 every call site ftrace manages is a NOP, with no \
+             error: the fentry/fexit sensors and, by the kernel's code, the BPF-LSM deny hooks \
+             do not run; the integrity round puts it back to 1";
+        match self {
+            Ftrace::On => None,
+            Ftrace::Off => Some(format!("kernel.ftrace_enabled is 0 — {WHAT}")),
+            Ftrace::Unknown(why) => Some(format!(
+                "kernel.ftrace_enabled {why}: whether the fentry/fexit sensors and the BPF-LSM \
+                 deny hooks run is not known"
+            )),
+        }
+    }
+}
+
+/// R1: [`FTRACE_ENABLED`] under `root` (`/` on the host, a directory in the
+/// tests).
+pub fn ftrace(root: &Path) -> Ftrace {
+    let path = root.join(FTRACE_ENABLED.trim_start_matches('/'));
+    match std::fs::read_to_string(&path) {
+        Ok(t) => match t.trim().parse::<i64>() {
+            Ok(0) => Ftrace::Off,
+            Ok(_) => Ftrace::On,
+            Err(_) => Ftrace::Unknown(format!("reads {:?}, not an integer", t.trim())),
+        },
+        Err(e) => Ftrace::Unknown(format!("could not be read ({e})")),
+    }
+}
+
+/// R1: [`ftrace`] read and noted — 0 or unknown a degradation (signed at
+/// once when the audit log is open), withdrawn once it is on again (its
+/// signed record stays; the round's `sysctl_restored` signs the restore).
+/// Called at every build of the capability manifest (5 s).
+pub fn note_ftrace(root: &Path) -> Ftrace {
+    let now = ftrace(root);
+    let line = now.degradation();
+    let keep: Vec<String> = line.iter().cloned().collect();
+    crate::boot::degradation::withdraw(FTRACE_DEGRADATION, &keep);
+    if let Some(l) = line {
+        if crate::boot::degradation::report(FTRACE_DEGRADATION, &l) {
+            crate::boot::degradation::flush();
+        }
+    }
+    now
+}
+
+/// One finding of the round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seen {
+    /// `sysctl_restored`, `sysctl_not_restored`, `sysctl_strict`.
+    pub kind: &'static str,
+    pub detail: String,
+}
+
+/// `threads-max`'s kernel default: a thread per 128 KiB of memory (an
+/// eighth of the memory in 16 KiB stacks), at least 8192.
+fn threads_default(mem_total: u64) -> String {
+    (mem_total / (128 << 10)).clamp(8192, 4_194_304).to_string()
+}
+
+/// The guarded sysctls under `root` (`/` on the host, a directory in the
+/// tests) judged, the harmful ones put back (`write`: false in a dry run).
+pub fn check(root: &Path, mem_total: u64, write: bool) -> Vec<Seen> {
+    let read = |p: &str| {
+        std::fs::read_to_string(root.join(p.trim_start_matches('/')))
+            .ok()
+            .map(|t| t.trim().to_string())
+    };
+    let ratio_ok = read("/proc/sys/vm/overcommit_ratio")
+        .and_then(|r| r.parse::<i64>().ok())
+        .is_some_and(|r| r >= 50);
+    let kbytes = read("/proc/sys/vm/overcommit_kbytes")
+        .and_then(|r| r.parse::<i64>().ok())
+        .unwrap_or(0);
+    let strict = read("/proc/sys/vm/overcommit_memory").as_deref() == Some("2");
+    let mut out = Vec::new();
+    for (path, kind, safe) in GUARDED {
+        // the ratio and the kbytes only count in strict mode
+        if matches!(*kind, SYSCTL_OVERCOMMIT_RATIO | SYSCTL_OVERCOMMIT_KBYTES) && !strict {
+            continue;
+        }
+        let Some(now) = read(path) else {
+            continue;
+        };
+        let Some(v) = limit_value(now.as_bytes()) else {
+            continue;
+        };
+        if !sysctl_write_harmful(*kind, Some(v)) {
+            continue;
+        }
+        // strict accounting with room: the operator's
+        if *kind == SYSCTL_OVERCOMMIT_MEMORY && ratio_ok && (kbytes == 0 || kbytes >= 1 << 20) {
+            out.push(Seen {
+                kind: "sysctl_strict",
+                detail: format!(
+                    "{path} is 2 (strict overcommit) with a ratio of 50 or more: left; the agent's \
+                     allocations fail when the host's commit limit is reached"
+                ),
+            });
+            continue;
+        }
+        let safe = safe
+            .map(str::to_string)
+            .unwrap_or_else(|| threads_default(mem_total));
+        let r = if write {
+            std::fs::write(root.join(path.trim_start_matches('/')), format!("{safe}\n"))
+        } else {
+            Ok(())
+        };
+        out.push(match r {
+            Ok(()) => Seen {
+                kind: "sysctl_restored",
+                detail: format!(
+                    "{path} was {now:?}, which aborts or starves the agent: put back to {safe}"
+                ),
+            },
+            Err(e) => Seen {
+                kind: "sysctl_not_restored",
+                detail: format!(
+                    "{path} is {now:?}, which aborts or starves the agent: NOT put back ({e})"
+                ),
+            },
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        for (p, v) in files {
+            let f = d.path().join(p.trim_start_matches('/'));
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, v).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn a_harmful_value_is_put_back_and_the_hosts_tuning_left() {
+        let d = host(&[
+            ("/proc/sys/vm/overcommit_memory", "2\n"),
+            ("/proc/sys/vm/overcommit_ratio", "0\n"),
+            ("/proc/sys/vm/max_map_count", "262144\n"),
+            ("/proc/sys/kernel/pid_max", "300\n"),
+            ("/proc/sys/kernel/threads-max", "126602\n"),
+            ("/proc/sys/kernel/sched_rt_runtime_us", "-1\n"),
+        ]);
+        let r = check(d.path(), 16 << 30, true);
+        let kinds: Vec<_> = r
+            .iter()
+            .map(|s| (s.kind, s.detail.split(' ').next().unwrap()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("sysctl_restored", "/proc/sys/vm/overcommit_ratio"),
+                ("sysctl_restored", "/proc/sys/vm/overcommit_memory"),
+                ("sysctl_restored", "/proc/sys/kernel/pid_max"),
+                ("sysctl_restored", "/proc/sys/kernel/sched_rt_runtime_us"),
+            ],
+            "{r:?}"
+        );
+        let read = |p: &str| std::fs::read_to_string(d.path().join(p)).unwrap();
+        assert_eq!(read("proc/sys/vm/overcommit_memory"), "0\n");
+        assert_eq!(read("proc/sys/kernel/pid_max"), "32768\n");
+        assert_eq!(read("proc/sys/vm/max_map_count"), "262144\n");
+        assert!(check(d.path(), 16 << 30, true).is_empty());
+    }
+
+    #[test]
+    fn a_low_ratio_outside_strict_mode_is_left() {
+        let d = host(&[
+            ("/proc/sys/vm/overcommit_memory", "0\n"),
+            ("/proc/sys/vm/overcommit_ratio", "0\n"),
+        ]);
+        assert!(check(d.path(), 16 << 30, true).is_empty());
+    }
+
+    #[test]
+    fn strict_accounting_with_room_is_the_operators() {
+        let d = host(&[
+            ("/proc/sys/vm/overcommit_memory", "2\n"),
+            ("/proc/sys/vm/overcommit_ratio", "80\n"),
+        ]);
+        let r = check(d.path(), 16 << 30, true);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].kind, "sysctl_strict");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("proc/sys/vm/overcommit_memory")).unwrap(),
+            "2\n"
+        );
+        assert_eq!(threads_default(1 << 30), "8192");
+        assert_eq!(threads_default(16 << 30), "131072");
+    }
+
+    /// R1: `ftrace_enabled=0` (set at boot, inside a window) is put back to
+    /// 1 by the round and signed; 1 is left.
+    #[test]
+    fn ftrace_off_is_put_back_on() {
+        let d = host(&[("/proc/sys/kernel/ftrace_enabled", "0\n")]);
+        let r = check(d.path(), 16 << 30, true);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].kind, "sysctl_restored");
+        assert!(
+            r[0].detail
+                .starts_with("/proc/sys/kernel/ftrace_enabled was \"0\""),
+            "{r:?}"
+        );
+        assert!(r[0].detail.ends_with("put back to 1"), "{r:?}");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("proc/sys/kernel/ftrace_enabled")).unwrap(),
+            "1\n"
+        );
+        assert!(check(d.path(), 16 << 30, true).is_empty());
+        let on = host(&[("/proc/sys/kernel/ftrace_enabled", "1\n")]);
+        assert!(check(on.path(), 16 << 30, true).is_empty());
+    }
+
+    /// R1: what the manifest's read finds — 0, and a value it cannot read
+    /// or parse, are degradations; any other integer is on.
+    #[test]
+    fn ftrace_is_read_as_the_kernel_reads_it() {
+        let at = |v: &str| ftrace(host(&[("/proc/sys/kernel/ftrace_enabled", v)]).path());
+        assert_eq!(at("1\n"), Ftrace::On);
+        assert_eq!(at("-1\n"), Ftrace::On);
+        assert_eq!(at("0\n"), Ftrace::Off);
+        assert!(matches!(at("x\n"), Ftrace::Unknown(w) if w.contains("not an integer")));
+        let none = tempfile::tempdir().unwrap();
+        assert!(
+            matches!(ftrace(none.path()), Ftrace::Unknown(w) if w.contains("could not be read"))
+        );
+        assert_eq!(Ftrace::On.degradation(), None);
+        let off = Ftrace::Off.degradation().unwrap();
+        assert!(off.starts_with("kernel.ftrace_enabled is 0"), "{off}");
+        assert!(off.contains("BPF-LSM deny hooks"), "{off}");
+    }
+
+    /// R1: a degradation while it holds (signed at once with the audit log
+    /// open), withdrawn once on again.
+    #[test]
+    fn ftrace_off_is_a_degradation_while_it_holds() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        crate::boot::degradation::reset_for_tests();
+        let d = host(&[("/proc/sys/kernel/ftrace_enabled", "0\n")]);
+        let key =
+            crate::audit::AgentSigningKey::load_or_bootstrap(&d.path().join("agent.sig")).unwrap();
+        let log = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::audit::AuditLog::open(&d.path().join("audit.log"), key, [7u8; 16]).unwrap(),
+        ));
+        crate::boot::degradation::attach_audit_log(Some(log));
+        let signed = || {
+            std::fs::read_to_string(d.path().join("audit.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .filter(|v| {
+                    v["extra"]["kind"] == "subsystem_degraded"
+                        && v["extra"]["source"] == FTRACE_DEGRADATION
+                })
+                .count()
+        };
+        assert_eq!(note_ftrace(d.path()), Ftrace::Off);
+        // signed by the read itself, not at the registry's next flush
+        assert_eq!(signed(), 1);
+        assert_eq!(note_ftrace(d.path()), Ftrace::Off);
+        assert_eq!(signed(), 1, "the same state is one record");
+        let s = crate::boot::degradation::snapshot();
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(
+            s[0].starts_with("ftrace_enabled: kernel.ftrace_enabled is 0"),
+            "{s:?}"
+        );
+        std::fs::write(d.path().join("proc/sys/kernel/ftrace_enabled"), "garbage\n").unwrap();
+        assert!(matches!(note_ftrace(d.path()), Ftrace::Unknown(_)));
+        let s = crate::boot::degradation::snapshot();
+        assert_eq!(s.len(), 1, "the 0 withdrawn, the unknown kept: {s:?}");
+        assert!(s[0].contains("not an integer"), "{s:?}");
+        std::fs::write(d.path().join("proc/sys/kernel/ftrace_enabled"), "1\n").unwrap();
+        assert_eq!(note_ftrace(d.path()), Ftrace::On);
+        assert!(crate::boot::degradation::snapshot().is_empty());
+        crate::boot::degradation::reset_for_tests();
+    }
+}

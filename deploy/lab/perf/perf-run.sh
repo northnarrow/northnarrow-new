@@ -223,7 +223,7 @@ agent_off() {
         for u in northnarrow-watchdog northnarrow-agent; do
             systemctl kill --signal=SIGTERM "$u" 2>/dev/null
             for i in $(seq 1 20); do
-                [[ -z $(cat "/sys/fs/cgroup/system.slice/$u.service/cgroup.procs" 2>/dev/null) ]] && break
+                [[ -z $(cat "/sys/fs/cgroup/northnarrow.slice/$u.service/cgroup.procs" "/sys/fs/cgroup/system.slice/$u.service/cgroup.procs" 2>/dev/null) ]] && break
                 sleep 0.5
             done
             systemctl kill --signal=SIGKILL "$u" 2>/dev/null

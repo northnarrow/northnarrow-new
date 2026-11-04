@@ -53,9 +53,13 @@ pub const LIMIT_RECLAIM: u8 = 9;
 /// Lot 273c: `io.weight` / `io.bfq.weight` (`default 100`, then per
 /// device): a weight of 1 starves the agent's I/O under contention.
 pub const LIMIT_IO_WEIGHT: u8 = 10;
+/// Lot 273d (the review of #492): `io.prio.class` (5.14 and later,
+/// `no-change` by default): `idle` starves the agent's writes — its audit
+/// log, its chains — under contention.
+pub const LIMIT_IO_PRIO_CLASS: u8 = 11;
 
 /// The protected resource files and their kinds.
-pub const LIMIT_FILES: [(&str, u8); 17] = [
+pub const LIMIT_FILES: [(&str, u8); 18] = [
     ("memory.max", LIMIT_UNSIGNED_MAX),
     ("memory.high", LIMIT_UNSIGNED_MAX),
     ("pids.max", LIMIT_UNSIGNED_MAX),
@@ -74,6 +78,8 @@ pub const LIMIT_FILES: [(&str, u8); 17] = [
     ("memory.reclaim", LIMIT_RECLAIM),
     ("io.weight", LIMIT_IO_WEIGHT),
     ("io.bfq.weight", LIMIT_IO_WEIGHT),
+    // Lot 273d (the review of #492)
+    ("io.prio.class", LIMIT_IO_PRIO_CLASS),
 ];
 
 /// The longest name the eBPF programs read (`cgroup.max.descendants`, 22
@@ -188,6 +194,7 @@ pub const fn default_value(kind: u8) -> Option<LimitValue> {
         LIMIT_CPU_LIST => limit_value(b""),
         LIMIT_PARTITION => limit_value(b"member"),
         LIMIT_IO_WEIGHT => limit_value(b"default 100"),
+        LIMIT_IO_PRIO_CLASS => limit_value(b"no-change"),
         _ => None,
     }
 }
@@ -285,6 +292,191 @@ pub const fn special_fs(s_magic: u64) -> Option<SpecialFs> {
     }
 }
 
+/// Lot 273d (the review of #492): the global sysctls whose value aborts or
+/// starves the agent with the rest of the host — `vm.overcommit_memory=2`
+/// with a low ratio (its next allocation fails), a `pid_max`, `threads-max`
+/// or `max_map_count` cut below what it runs, real-time throttling off
+/// (`sched_rt_runtime_us=-1`: a real-time hog owns the CPUs) — or blinds
+/// it: `kernel.ftrace_enabled=0` (R1 of the external review of 04/11)
+/// turns every call site ftrace manages back into a NOP on 6.0 to 7.2,
+/// with no error, and the BPF trampolines on them with it (fentry/fexit,
+/// the kprobes on ftrace and, by the kernel's code, the BPF-LSM programs:
+/// every deny hook). Not a sysctl of these.
+pub const SYSCTL_NONE: u8 = 0;
+pub const SYSCTL_OVERCOMMIT_MEMORY: u8 = 1;
+pub const SYSCTL_OVERCOMMIT_RATIO: u8 = 2;
+pub const SYSCTL_OVERCOMMIT_KBYTES: u8 = 3;
+pub const SYSCTL_MAX_MAP_COUNT: u8 = 4;
+pub const SYSCTL_PID_MAX: u8 = 5;
+pub const SYSCTL_THREADS_MAX: u8 = 6;
+pub const SYSCTL_SCHED_RT_RUNTIME: u8 = 7;
+pub const SYSCTL_FTRACE_ENABLED: u8 = 8;
+
+/// The guarded sysctls by their `/proc/sys` file name (unique in procfs:
+/// no `/proc/<pid>` file is named so), and their kinds.
+pub const SYSCTL_FILES: [(&str, u8); 8] = [
+    ("overcommit_memory", SYSCTL_OVERCOMMIT_MEMORY),
+    ("overcommit_ratio", SYSCTL_OVERCOMMIT_RATIO),
+    ("overcommit_kbytes", SYSCTL_OVERCOMMIT_KBYTES),
+    ("max_map_count", SYSCTL_MAX_MAP_COUNT),
+    ("pid_max", SYSCTL_PID_MAX),
+    ("threads-max", SYSCTL_THREADS_MAX),
+    ("sched_rt_runtime_us", SYSCTL_SCHED_RT_RUNTIME),
+    ("ftrace_enabled", SYSCTL_FTRACE_ENABLED),
+];
+
+const fn sysctl_words() -> [(usize, [u64; 3], u8); SYSCTL_FILES.len()] {
+    let mut out = [(0usize, [0u64; 3], SYSCTL_NONE); SYSCTL_FILES.len()];
+    let mut i = 0;
+    while i < SYSCTL_FILES.len() {
+        let (name, kind) = SYSCTL_FILES[i];
+        out[i] = (name.len(), name_words(name.as_bytes()), kind);
+        i += 1;
+    }
+    out
+}
+
+/// [`SYSCTL_FILES`]' names as the eBPF programs compare them.
+pub const SYSCTL_WORDS: [(usize, [u64; 3], u8); SYSCTL_FILES.len()] = sysctl_words();
+
+/// The kind of the procfs file of `len` bytes and name words `w`.
+#[inline(always)]
+pub fn sysctl_kind(len: usize, w: [u64; 3]) -> u8 {
+    let mut i = 0;
+    while i < SYSCTL_WORDS.len() {
+        let (l, n, kind) = SYSCTL_WORDS[i];
+        if l == len && n[0] == w[0] && n[1] == w[1] && n[2] == w[2] {
+            return kind;
+        }
+        i += 1;
+    }
+    SYSCTL_NONE
+}
+
+/// [`parse_i64`]'s state after a byte.
+#[derive(Clone, Copy)]
+struct Parsed {
+    n: i64,
+    digits: u32,
+    neg: bool,
+    /// a terminator seen: the bytes after it are not the value's
+    end: bool,
+    /// not an integer (or longer than 18 digits)
+    bad: bool,
+}
+
+/// [`parse_i64`]'s step: byte `i` of `v`.
+#[inline(always)]
+const fn parse_step(p: Parsed, v: &LimitValue, i: usize) -> Parsed {
+    if p.end || p.bad {
+        return p;
+    }
+    let b = ((v[i / 8] >> ((i % 8) * 8)) & 0xff) as u8;
+    if b == 0 || b == b'\n' || b == b' ' || b == b'\t' {
+        return Parsed { end: true, ..p };
+    }
+    if i == 0 && b == b'-' {
+        return Parsed { neg: true, ..p };
+    }
+    if b.is_ascii_digit() && p.digits < 18 {
+        return Parsed {
+            n: p.n * 10 + (b - b'0') as i64,
+            digits: p.digits + 1,
+            ..p
+        };
+    }
+    Parsed { bad: true, ..p }
+}
+
+/// A written decimal integer (an optional `-`, digits, then the end or a
+/// blank), `None` when it is not one; 24 bytes at most. Lot 273d's lab
+/// (round 12): written as a loop, LLVM laid it out with a fall-through
+/// back-edge that the 5.15 and 6.1 verifiers reject (`back-edge from insn
+/// … to …`: `loop_ok` is false for a non-jump instruction's edge there),
+/// and the write deny did not load on those kernels — so it is unrolled,
+/// one step per byte, no loop at all.
+#[inline(always)]
+pub const fn parse_i64(v: &LimitValue) -> Option<i64> {
+    macro_rules! steps {
+        ($p:ident; $($i:literal)*) => { $( let $p = parse_step($p, v, $i); )* };
+    }
+    let p = Parsed {
+        n: 0,
+        digits: 0,
+        neg: false,
+        end: false,
+        bad: false,
+    };
+    steps!(p; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23);
+    if p.bad || p.digits == 0 {
+        return None;
+    }
+    Some(if p.neg { -p.n } else { p.n })
+}
+
+/// Whether a write of `written` (its bytes, `None`: unread) to the sysctl
+/// of `kind` aborts or starves the agent: refused outside a window. An
+/// unread or unparsable write is refused like PID 1's unread write.
+#[inline(always)]
+pub const fn sysctl_write_harmful(kind: u8, written: Option<LimitValue>) -> bool {
+    let v = match written {
+        Some(w) => match parse_i64(&w) {
+            Some(v) => v,
+            None => return true,
+        },
+        None => return true,
+    };
+    match kind {
+        SYSCTL_OVERCOMMIT_MEMORY => v == 2,
+        SYSCTL_OVERCOMMIT_RATIO => v < 50,
+        // 0: the ratio decides; else a cap below 1 GiB
+        SYSCTL_OVERCOMMIT_KBYTES => v != 0 && v < 1 << 20,
+        SYSCTL_MAX_MAP_COUNT => v < 65530,
+        SYSCTL_PID_MAX => v < 32768,
+        SYSCTL_THREADS_MAX => v < 8192,
+        // -1: no throttling; at or past 99 % of the default period, almost none
+        SYSCTL_SCHED_RT_RUNTIME => v < 0 || v >= 990_000,
+        // 0 stops ftrace (the kernel reads any other integer as on): the
+        // value the round puts back. A write of it is refused whatever it
+        // carries ([`sysctl_refuses_every_write`]).
+        SYSCTL_FTRACE_ENABLED => v == 0,
+        _ => false,
+    }
+}
+
+/// R1 (the coordinator's decision of 04/11): the sysctls of which every
+/// write is refused outside a window, whatever its value — `ftrace_enabled`:
+/// no legitimate use of writing it is known (upstream deprecates it and
+/// refuses it from 7.3; a 1 over a 1 changes nothing), and with no value
+/// to judge there is no byte to read before the kernel copies it, so a
+/// second thread of the writer has nothing to race (the other seven are
+/// judged by value: lot 280 closes their race with `cgroup/sysctl`).
+#[inline(always)]
+pub const fn sysctl_refuses_every_write(kind: u8) -> bool {
+    kind == SYSCTL_FTRACE_ENABLED
+}
+
+/// The write deny's verdict on a write of the guarded sysctl of `kind`:
+/// the agent's family and a trusted-installer window (`caller_may`: the
+/// identity every guarded write is let through by — the round's own
+/// restore among them, never an exception by name) pass; outside them a
+/// sysctl of [`sysctl_refuses_every_write`] is refused without reading
+/// the write, the others by the value `written` returns (read only then).
+#[inline(always)]
+pub fn sysctl_write_refused(
+    kind: u8,
+    caller_may: bool,
+    written: impl FnOnce() -> Option<LimitValue>,
+) -> bool {
+    if kind == SYSCTL_NONE || caller_may {
+        return false;
+    }
+    if sysctl_refuses_every_write(kind) {
+        return true;
+    }
+    sysctl_write_harmful(kind, written())
+}
+
 #[inline(always)]
 const fn is_blank(b: u8) -> bool {
     matches!(b, b' ' | b'\n' | b'\t' | b'\r')
@@ -316,14 +508,19 @@ mod tests {
             ("memory.reclaim", LIMIT_RECLAIM),
             ("io.weight", LIMIT_IO_WEIGHT),
             ("io.bfq.weight", LIMIT_IO_WEIGHT),
+            ("io.prio.class", LIMIT_IO_PRIO_CLASS),
         ] {
             assert_eq!(limit_kind_of(name), kind, "{name}");
         }
-        assert_eq!(LIMIT_FILES.len(), 17);
+        assert_eq!(LIMIT_FILES.len(), 18);
         // Lot 273c: the defaults systemd writes for a unit that sets none,
         // and none for memory.reclaim (no value to put back)
         assert_eq!(default_value(LIMIT_CPU_LIST), limit_value(b""));
         assert_eq!(default_value(LIMIT_PARTITION), limit_value(b"member"));
+        assert_eq!(
+            default_value(LIMIT_IO_PRIO_CLASS),
+            limit_value(b"no-change")
+        );
         assert_eq!(default_value(LIMIT_IO_WEIGHT), limit_value(b"default 100"));
         assert_eq!(default_value(LIMIT_RECLAIM), None);
     }
@@ -486,5 +683,136 @@ mod tests {
         assert_eq!(special_fs(0x0102_1994), None);
         assert_eq!(special_fs(0xef53), None);
         assert_eq!(special_fs(0x6265_6572), None);
+    }
+
+    /// Lot 273d: the guarded sysctls, judged by the value written.
+    #[test]
+    fn a_sysctl_write_is_harmful_by_its_value() {
+        let w = |t: &[u8]| Some(limit_value(t).unwrap());
+        let k = |n: &str| sysctl_kind(n.len(), name_words(n.as_bytes()));
+        assert_eq!(k("overcommit_memory"), SYSCTL_OVERCOMMIT_MEMORY);
+        assert_eq!(k("sched_rt_runtime_us"), SYSCTL_SCHED_RT_RUNTIME);
+        assert_eq!(k("threads-max"), SYSCTL_THREADS_MAX);
+        assert_eq!(k("ftrace_enabled"), SYSCTL_FTRACE_ENABLED);
+        assert_eq!(k("ftrace_enable"), SYSCTL_NONE);
+        assert_eq!(k("stack_tracer_enabled"), SYSCTL_NONE);
+        assert_eq!(k("oom_score_adj"), SYSCTL_NONE);
+        assert_eq!(k("pid_max2"), SYSCTL_NONE);
+        assert_eq!(parse_i64(&limit_value(b"-1").unwrap()), Some(-1));
+        assert_eq!(parse_i64(&limit_value(b"65530").unwrap()), Some(65530));
+        assert_eq!(parse_i64(&limit_value(b"").unwrap()), None);
+        assert_eq!(parse_i64(&limit_value(b"1x").unwrap()), None);
+        // the unrolled steps: 18 digits, 19, a minus inside, after the end
+        assert_eq!(
+            parse_i64(&limit_value(b"123456789012345678").unwrap()),
+            Some(123_456_789_012_345_678)
+        );
+        assert_eq!(
+            parse_i64(&limit_value(b"1234567890123456789").unwrap()),
+            None
+        );
+        assert_eq!(parse_i64(&limit_value(b"1-2").unwrap()), None);
+        assert_eq!(parse_i64(&limit_value(b"-").unwrap()), None);
+        assert_eq!(parse_i64(&limit_value(b"42 x").unwrap()), Some(42));
+        assert_eq!(
+            parse_i64(&limit_value(b"-950000\n").unwrap()),
+            Some(-950_000)
+        );
+        assert_eq!(
+            parse_i64(&limit_value(b"000000000000000007").unwrap()),
+            Some(7)
+        );
+        assert_eq!(
+            parse_i64(&limit_value(b"000000000000000000000007").unwrap()),
+            None
+        );
+        for (kind, bad, good) in [
+            (SYSCTL_OVERCOMMIT_MEMORY, &b"2"[..], &b"0"[..]),
+            (SYSCTL_OVERCOMMIT_MEMORY, b"2", b"1"),
+            (SYSCTL_OVERCOMMIT_RATIO, b"0", b"50"),
+            (SYSCTL_OVERCOMMIT_KBYTES, b"1024", b"0"),
+            (SYSCTL_MAX_MAP_COUNT, b"100", b"262144"),
+            (SYSCTL_PID_MAX, b"300", b"4194304"),
+            (SYSCTL_THREADS_MAX, b"64", b"126602"),
+            (SYSCTL_SCHED_RT_RUNTIME, b"-1", b"950000"),
+            (SYSCTL_SCHED_RT_RUNTIME, b"1000000", b"500000"),
+            // R1: 0 in any spelling the kernel reads as 0 is refused, any
+            // other integer (the kernel's "on") let through
+            (SYSCTL_FTRACE_ENABLED, b"0", b"1"),
+            (SYSCTL_FTRACE_ENABLED, b"0\n", b"1\n"),
+            (SYSCTL_FTRACE_ENABLED, b"00", b"-1"),
+            (SYSCTL_FTRACE_ENABLED, b"-0", b"2"),
+            (SYSCTL_FTRACE_ENABLED, b"0x0", b"10"),
+            (SYSCTL_FTRACE_ENABLED, b" 0", b"1 0"),
+        ] {
+            assert!(sysctl_write_harmful(kind, w(bad)), "{kind} {bad:?}");
+            assert!(!sysctl_write_harmful(kind, w(good)), "{kind} {good:?}");
+        }
+        // a write whose bytes could not be read is refused
+        assert!(sysctl_write_harmful(SYSCTL_PID_MAX, None));
+        assert!(sysctl_write_harmful(SYSCTL_FTRACE_ENABLED, None));
+    }
+
+    /// R1 (the coordinator's decision of 04/11): every write of
+    /// `ftrace_enabled` outside a window is refused, 1 too, and its bytes
+    /// are never read (nothing for a second thread to race); the agent's
+    /// own restore and a window's write pass by the caller's identity, as
+    /// every guarded sysctl's do; the other seven stay judged by value.
+    #[test]
+    fn ftrace_enabled_is_refused_whatever_it_carries() {
+        let w = |t: &'static [u8]| move || Some(limit_value(t).unwrap());
+        let unread = || -> Option<LimitValue> { panic!("ftrace_enabled's write was read") };
+        assert!(sysctl_refuses_every_write(SYSCTL_FTRACE_ENABLED));
+        assert!(sysctl_write_refused(SYSCTL_FTRACE_ENABLED, false, unread));
+        assert!(sysctl_write_refused(SYSCTL_FTRACE_ENABLED, false, w(b"1")));
+        // the round's restore (the agent's family) and a window
+        assert!(!sysctl_write_refused(SYSCTL_FTRACE_ENABLED, true, unread));
+        assert!(!sysctl_write_refused(SYSCTL_FTRACE_ENABLED, true, w(b"1")));
+        // the round puts back only a 0
+        assert!(sysctl_write_harmful(SYSCTL_FTRACE_ENABLED, w(b"0")()));
+        assert!(!sysctl_write_harmful(SYSCTL_FTRACE_ENABLED, w(b"1")()));
+        // the other seven by value, only outside the caller's identity
+        for kind in [
+            SYSCTL_OVERCOMMIT_MEMORY,
+            SYSCTL_OVERCOMMIT_RATIO,
+            SYSCTL_OVERCOMMIT_KBYTES,
+            SYSCTL_MAX_MAP_COUNT,
+            SYSCTL_PID_MAX,
+            SYSCTL_THREADS_MAX,
+            SYSCTL_SCHED_RT_RUNTIME,
+        ] {
+            assert!(!sysctl_refuses_every_write(kind), "{kind}");
+            assert!(!sysctl_write_refused(kind, true, unread), "{kind}");
+        }
+        assert!(sysctl_write_refused(SYSCTL_MAX_MAP_COUNT, false, w(b"100")));
+        assert!(!sysctl_write_refused(
+            SYSCTL_MAX_MAP_COUNT,
+            false,
+            w(b"262144")
+        ));
+        assert!(!sysctl_write_refused(SYSCTL_NONE, false, unread));
+    }
+
+    /// The guarded sysctls, pinned: a file dropped from the table is a
+    /// file no write of is refused (R1: `ftrace_enabled` among them).
+    #[test]
+    fn the_guarded_sysctls_are_these() {
+        assert_eq!(
+            SYSCTL_FILES.as_slice(),
+            &[
+                ("overcommit_memory", SYSCTL_OVERCOMMIT_MEMORY),
+                ("overcommit_ratio", SYSCTL_OVERCOMMIT_RATIO),
+                ("overcommit_kbytes", SYSCTL_OVERCOMMIT_KBYTES),
+                ("max_map_count", SYSCTL_MAX_MAP_COUNT),
+                ("pid_max", SYSCTL_PID_MAX),
+                ("threads-max", SYSCTL_THREADS_MAX),
+                ("sched_rt_runtime_us", SYSCTL_SCHED_RT_RUNTIME),
+                ("ftrace_enabled", SYSCTL_FTRACE_ENABLED),
+            ][..]
+        );
+        for (name, kind) in SYSCTL_FILES {
+            assert!(name.len() <= 24, "{name}: longer than the three name words");
+            assert_eq!(sysctl_kind(name.len(), name_words(name.as_bytes())), kind);
+        }
     }
 }
