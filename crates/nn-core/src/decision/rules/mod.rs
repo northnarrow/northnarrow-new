@@ -23,6 +23,10 @@ pub mod epg;
 pub mod evasion;
 pub mod impact;
 pub mod iouring;
+/// Lot 279: what the exec pump read of a module tool's exec (R011).
+pub mod kmod_exec_facts;
+/// Lot 279: what a module tool's exec asks for, by its syntax (R011).
+pub mod kmod_invocation;
 pub mod module_provenance;
 pub mod net;
 pub mod net_fanout;

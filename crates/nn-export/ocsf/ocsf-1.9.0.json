@@ -1,0 +1,11007 @@
+{
+ "ocsf_version": "1.9.0",
+ "profiles": [
+  "host"
+ ],
+ "source": {
+  "schema": "https://schema.ocsf.io/schema/1.9.0/classes/<class>?profiles=host",
+  "captions": "https://schema.ocsf.io/api/1.9.0/(classes|objects)/<name>?profiles=host",
+  "fetched": "2026-11-03",
+  "sha256": {
+   "api/categories.json": "ebde6a7220f5def58d9e7edc71dd9ffa7bc015b0e30f41dee190642b412fd7dc",
+   "api/class-base_event.json": "00aaac3acc52acd936c3f471bc2639755049ee5a982358258f15d851c85deb59",
+   "api/class-detection_finding.json": "fd11cc078713eab445e36e7434ba103d87eb96058f89e69bbdcd1280adee8d18",
+   "api/class-file_activity.json": "684544aa4892bc1c2065d85955c5aa7c1d8f78dbee8ecfcbc1a64a7375e1ec50",
+   "api/class-file_remediation_activity.json": "1681537f7d8a85eb0dd245acdbcef5fe47996ad68812529c066e443e88e43037",
+   "api/class-network_activity.json": "866d0d71c5f7bbf9072d5b73c93f4893288f82ec808f744546dcc5624f6df430",
+   "api/class-network_remediation_activity.json": "1910a32933ed935ee3a226b06c4972e499fac3665912dd1943c785c2575017b0",
+   "api/class-process_activity.json": "5b781f8f0f983bf5740dd1e9d0d7257c17500defc675b88267661a9c2aff6c48",
+   "api/class-process_remediation_activity.json": "144b4a0fcfca2246f18485d341dec72c083cf64dcde271913582ac713df52a06",
+   "api/class-remediation_activity.json": "7d8f56bd22b0da6b66f56bf69433ee16cd1ff2f5849908888996de44e9ba7524",
+   "api/object-analytic.json": "bbe17792ecd25859b2e8a0c9b06e5dd5f9bb911cdedd7dd8dc3fcaf7db6dc27c",
+   "api/object-device.json": "4fc84cea665f01b143b8a621aa8ebe178097248fea52af5949f7b39151d27800",
+   "api/object-file.json": "a9c5d76d8b644cb5bccab5056d55c48cc82daa2dd77c4eeff1e7d80b347575fa",
+   "api/object-fingerprint.json": "09e5c3fbec65f4443b1d7b102bbf620ec7d22b742baab5adf9e57bcd81458e98",
+   "api/object-network_connection_info.json": "839975223b6d013fd35c1d34cbfc83b1041e55a0efb1ca4dceb550adac656cd7",
+   "base_event.host.schema.json": "b3ecde1969c7859a6535bf2ca0396d7ee9a5e8f46853fe2f23c9ff05f18e04cb",
+   "detection_finding.host.schema.json": "ff2d866acf3b83958d4e1966fe833ba072d48e8c216b2a69c2dea975932c9040",
+   "file_activity.host.schema.json": "0bfb465d7041f9c0c5a64fa49f198b3a829783c607a127714d3319194bbf5045",
+   "file_remediation_activity.host.schema.json": "f0f2862a6baac504ca3d3adf049834fd029a45905386231630a0599bb776a1c8",
+   "network_activity.host.schema.json": "478d0dfa9d8aa78fb3d237eb6ed56c186779cf12ad113ce5669b96e66998dc55",
+   "network_remediation_activity.host.schema.json": "fe102ca683bafdfdd2deae2ac6fdcce794225bb2560a0c972ab5a2dea4fe1d7c",
+   "process_activity.host.schema.json": "0a74bcf1b45e22633f989bd6c9d190b25d0d4257f922d741de555bd822652ee7",
+   "process_remediation_activity.host.schema.json": "c4c85f584b87a9d355d3aef905493b397c10e34a068b864a383937240c559a95",
+   "remediation_activity.host.schema.json": "f87758762622bb8a72f08da74072a79f04d937f3602db4cdb4ffc6de7b87f0a7"
+  }
+ },
+ "categories": {
+  "1": "System Activity",
+  "2": "Findings",
+  "3": "Identity & Access Management",
+  "4": "Network Activity",
+  "5": "Discovery",
+  "6": "Application Activity",
+  "7": "Remediation",
+  "8": "Unmanned Systems",
+  "0": "Uncategorized"
+ },
+ "classes": {
+  "base_event": {
+   "uid": 0,
+   "caption": "Base Event",
+   "category_uid": 0,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "activity_id": {
+      "enum": [
+       0,
+       99
+      ],
+      "type": "integer"
+     },
+     "activity_name": {
+      "type": "string"
+     },
+     "actor": {
+      "$ref": "#/$defs/actor"
+     },
+     "category_name": {
+      "type": "string"
+     },
+     "category_uid": {
+      "const": 0,
+      "type": "integer"
+     },
+     "class_name": {
+      "type": "string"
+     },
+     "class_uid": {
+      "const": 0,
+      "type": "integer"
+     },
+     "count": {
+      "type": "integer"
+     },
+     "device": {
+      "$ref": "#/$defs/device"
+     },
+     "duration": {
+      "type": "integer"
+     },
+     "end_time": {
+      "type": "integer"
+     },
+     "enrichments": {
+      "items": {
+       "$ref": "#/$defs/enrichment"
+      },
+      "type": "array"
+     },
+     "message": {
+      "type": "string"
+     },
+     "metadata": {
+      "$ref": "#/$defs/metadata"
+     },
+     "observables": {
+      "items": {
+       "$ref": "#/$defs/observable"
+      },
+      "type": "array"
+     },
+     "raw_data": {
+      "type": "string"
+     },
+     "raw_data_hash": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "raw_data_size": {
+      "type": "integer"
+     },
+     "severity": {
+      "type": "string"
+     },
+     "severity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "start_time": {
+      "type": "integer"
+     },
+     "status": {
+      "type": "string"
+     },
+     "status_code": {
+      "type": "string"
+     },
+     "status_detail": {
+      "type": "string"
+     },
+     "status_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       99
+      ],
+      "type": "integer"
+     },
+     "time": {
+      "type": "integer"
+     },
+     "timezone_offset": {
+      "type": "integer"
+     },
+     "type_name": {
+      "type": "string"
+     },
+     "type_uid": {
+      "type": "integer"
+     },
+     "unmapped": {
+      "$ref": "#/$defs/object"
+     }
+    },
+    "required": [
+     "activity_id",
+     "category_uid",
+     "class_uid",
+     "metadata",
+     "severity_id",
+     "time",
+     "type_uid"
+    ],
+    "type": "object"
+   },
+   "enums": {
+    "activity_id": {
+     "0": "Unknown",
+     "99": "Other"
+    },
+    "status_id": {
+     "0": "Unknown",
+     "1": "Success",
+     "2": "Failure",
+     "99": "Other"
+    },
+    "severity_id": {
+     "0": "Unknown",
+     "1": "Informational",
+     "2": "Low",
+     "3": "Medium",
+     "4": "High",
+     "5": "Critical",
+     "6": "Fatal",
+     "99": "Other"
+    }
+   }
+  },
+  "detection_finding": {
+   "uid": 2004,
+   "caption": "Detection Finding",
+   "category_uid": 2,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "activity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       99
+      ],
+      "type": "integer"
+     },
+     "activity_name": {
+      "type": "string"
+     },
+     "actor": {
+      "$ref": "#/$defs/actor"
+     },
+     "anomaly_analyses": {
+      "items": {
+       "$ref": "#/$defs/anomaly_analysis"
+      },
+      "type": "array"
+     },
+     "category_name": {
+      "type": "string"
+     },
+     "category_uid": {
+      "const": 2,
+      "type": "integer"
+     },
+     "class_name": {
+      "type": "string"
+     },
+     "class_uid": {
+      "const": 2004,
+      "type": "integer"
+     },
+     "comment": {
+      "type": "string"
+     },
+     "confidence": {
+      "type": "string"
+     },
+     "confidence_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       99
+      ],
+      "type": "integer"
+     },
+     "confidence_score": {
+      "type": "integer"
+     },
+     "count": {
+      "type": "integer"
+     },
+     "device": {
+      "$ref": "#/$defs/device"
+     },
+     "duration": {
+      "type": "integer"
+     },
+     "end_time": {
+      "type": "integer"
+     },
+     "enrichments": {
+      "items": {
+       "$ref": "#/$defs/enrichment"
+      },
+      "type": "array"
+     },
+     "evidences": {
+      "items": {
+       "$ref": "#/$defs/evidences"
+      },
+      "type": "array"
+     },
+     "finding_info": {
+      "$ref": "#/$defs/finding_info"
+     },
+     "impact": {
+      "type": "string"
+     },
+     "impact_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       99
+      ],
+      "type": "integer"
+     },
+     "impact_score": {
+      "type": "integer"
+     },
+     "is_alert": {
+      "type": "boolean"
+     },
+     "malware": {
+      "items": {
+       "$ref": "#/$defs/malware"
+      },
+      "type": "array"
+     },
+     "malware_scan_info": {
+      "$ref": "#/$defs/malware_scan_info"
+     },
+     "message": {
+      "type": "string"
+     },
+     "metadata": {
+      "$ref": "#/$defs/metadata"
+     },
+     "notes": {
+      "items": {
+       "$ref": "#/$defs/note"
+      },
+      "type": "array"
+     },
+     "observables": {
+      "items": {
+       "$ref": "#/$defs/observable"
+      },
+      "type": "array"
+     },
+     "raw_data": {
+      "type": "string"
+     },
+     "raw_data_hash": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "raw_data_size": {
+      "type": "integer"
+     },
+     "remediation": {
+      "$ref": "#/$defs/remediation"
+     },
+     "resources": {
+      "items": {
+       "$ref": "#/$defs/resource_details"
+      },
+      "type": "array"
+     },
+     "risk_details": {
+      "type": "string"
+     },
+     "risk_level": {
+      "type": "string"
+     },
+     "risk_level_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       99
+      ],
+      "type": "integer"
+     },
+     "risk_score": {
+      "type": "integer"
+     },
+     "severity": {
+      "type": "string"
+     },
+     "severity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "start_time": {
+      "type": "integer"
+     },
+     "status": {
+      "type": "string"
+     },
+     "status_code": {
+      "type": "string"
+     },
+     "status_detail": {
+      "type": "string"
+     },
+     "status_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "time": {
+      "type": "integer"
+     },
+     "timezone_offset": {
+      "type": "integer"
+     },
+     "type_name": {
+      "type": "string"
+     },
+     "type_uid": {
+      "type": "integer"
+     },
+     "unmapped": {
+      "$ref": "#/$defs/object"
+     },
+     "vendor_attributes": {
+      "$ref": "#/$defs/vendor_attributes"
+     },
+     "vulnerabilities": {
+      "items": {
+       "$ref": "#/$defs/vulnerability"
+      },
+      "type": "array"
+     }
+    },
+    "required": [
+     "activity_id",
+     "category_uid",
+     "class_uid",
+     "finding_info",
+     "metadata",
+     "severity_id",
+     "time",
+     "type_uid"
+    ],
+    "type": "object"
+   },
+   "enums": {
+    "activity_id": {
+     "0": "Unknown",
+     "1": "Create",
+     "2": "Update",
+     "3": "Close",
+     "99": "Other"
+    },
+    "status_id": {
+     "0": "Unknown",
+     "1": "New",
+     "2": "In Progress",
+     "3": "Suppressed",
+     "4": "Resolved",
+     "5": "Archived",
+     "6": "Deleted",
+     "99": "Other"
+    },
+    "severity_id": {
+     "0": "Unknown",
+     "1": "Informational",
+     "2": "Low",
+     "3": "Medium",
+     "4": "High",
+     "5": "Critical",
+     "6": "Fatal",
+     "99": "Other"
+    },
+    "confidence_id": {
+     "0": "Unknown",
+     "1": "Low",
+     "2": "Medium",
+     "3": "High",
+     "99": "Other"
+    }
+   }
+  },
+  "process_activity": {
+   "uid": 1007,
+   "caption": "Process Activity",
+   "category_uid": 1,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "activity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       99
+      ],
+      "type": "integer"
+     },
+     "activity_name": {
+      "type": "string"
+     },
+     "actor": {
+      "$ref": "#/$defs/actor"
+     },
+     "actual_permissions": {
+      "type": "integer"
+     },
+     "category_name": {
+      "type": "string"
+     },
+     "category_uid": {
+      "const": 1,
+      "type": "integer"
+     },
+     "class_name": {
+      "type": "string"
+     },
+     "class_uid": {
+      "const": 1007,
+      "type": "integer"
+     },
+     "count": {
+      "type": "integer"
+     },
+     "device": {
+      "$ref": "#/$defs/device"
+     },
+     "duration": {
+      "type": "integer"
+     },
+     "end_time": {
+      "type": "integer"
+     },
+     "enrichments": {
+      "items": {
+       "$ref": "#/$defs/enrichment"
+      },
+      "type": "array"
+     },
+     "exit_code": {
+      "type": "integer"
+     },
+     "injection_type": {
+      "type": "string"
+     },
+     "injection_type_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       99
+      ],
+      "type": "integer"
+     },
+     "launch_type": {
+      "type": "string"
+     },
+     "launch_type_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       99
+      ],
+      "type": "integer"
+     },
+     "message": {
+      "type": "string"
+     },
+     "metadata": {
+      "$ref": "#/$defs/metadata"
+     },
+     "module": {
+      "$ref": "#/$defs/module"
+     },
+     "observables": {
+      "items": {
+       "$ref": "#/$defs/observable"
+      },
+      "type": "array"
+     },
+     "process": {
+      "$ref": "#/$defs/process"
+     },
+     "raw_data": {
+      "type": "string"
+     },
+     "raw_data_hash": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "raw_data_size": {
+      "type": "integer"
+     },
+     "requested_permissions": {
+      "type": "integer"
+     },
+     "severity": {
+      "type": "string"
+     },
+     "severity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "start_time": {
+      "type": "integer"
+     },
+     "status": {
+      "type": "string"
+     },
+     "status_code": {
+      "type": "string"
+     },
+     "status_detail": {
+      "type": "string"
+     },
+     "status_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       99
+      ],
+      "type": "integer"
+     },
+     "time": {
+      "type": "integer"
+     },
+     "timezone_offset": {
+      "type": "integer"
+     },
+     "type_name": {
+      "type": "string"
+     },
+     "type_uid": {
+      "type": "integer"
+     },
+     "unmapped": {
+      "$ref": "#/$defs/object"
+     }
+    },
+    "required": [
+     "activity_id",
+     "actor",
+     "category_uid",
+     "class_uid",
+     "device",
+     "metadata",
+     "process",
+     "severity_id",
+     "time",
+     "type_uid"
+    ],
+    "type": "object"
+   },
+   "enums": {
+    "activity_id": {
+     "0": "Unknown",
+     "1": "Launch",
+     "2": "Terminate",
+     "3": "Open",
+     "4": "Inject",
+     "5": "Set User ID",
+     "99": "Other"
+    },
+    "status_id": {
+     "0": "Unknown",
+     "1": "Success",
+     "2": "Failure",
+     "99": "Other"
+    },
+    "severity_id": {
+     "0": "Unknown",
+     "1": "Informational",
+     "2": "Low",
+     "3": "Medium",
+     "4": "High",
+     "5": "Critical",
+     "6": "Fatal",
+     "99": "Other"
+    }
+   }
+  },
+  "file_activity": {
+   "uid": 1001,
+   "caption": "File System Activity",
+   "category_uid": 1,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "access_mask": {
+      "type": "integer"
+     },
+     "activity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       7,
+       8,
+       9,
+       10,
+       11,
+       12,
+       13,
+       14,
+       99
+      ],
+      "type": "integer"
+     },
+     "activity_name": {
+      "type": "string"
+     },
+     "actor": {
+      "$ref": "#/$defs/actor"
+     },
+     "category_name": {
+      "type": "string"
+     },
+     "category_uid": {
+      "const": 1,
+      "type": "integer"
+     },
+     "class_name": {
+      "type": "string"
+     },
+     "class_uid": {
+      "const": 1001,
+      "type": "integer"
+     },
+     "component": {
+      "type": "string"
+     },
+     "connection_uid": {
+      "type": "string"
+     },
+     "count": {
+      "type": "integer"
+     },
+     "create_mask": {
+      "type": "string"
+     },
+     "device": {
+      "$ref": "#/$defs/device"
+     },
+     "duration": {
+      "type": "integer"
+     },
+     "end_time": {
+      "type": "integer"
+     },
+     "enrichments": {
+      "items": {
+       "$ref": "#/$defs/enrichment"
+      },
+      "type": "array"
+     },
+     "file": {
+      "$ref": "#/$defs/file"
+     },
+     "file_diff": {
+      "type": "string"
+     },
+     "file_result": {
+      "$ref": "#/$defs/file"
+     },
+     "message": {
+      "type": "string"
+     },
+     "metadata": {
+      "$ref": "#/$defs/metadata"
+     },
+     "observables": {
+      "items": {
+       "$ref": "#/$defs/observable"
+      },
+      "type": "array"
+     },
+     "raw_data": {
+      "type": "string"
+     },
+     "raw_data_hash": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "raw_data_size": {
+      "type": "integer"
+     },
+     "severity": {
+      "type": "string"
+     },
+     "severity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "start_time": {
+      "type": "integer"
+     },
+     "status": {
+      "type": "string"
+     },
+     "status_code": {
+      "type": "string"
+     },
+     "status_detail": {
+      "type": "string"
+     },
+     "status_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       99
+      ],
+      "type": "integer"
+     },
+     "time": {
+      "type": "integer"
+     },
+     "timezone_offset": {
+      "type": "integer"
+     },
+     "type_name": {
+      "type": "string"
+     },
+     "type_uid": {
+      "type": "integer"
+     },
+     "unmapped": {
+      "$ref": "#/$defs/object"
+     }
+    },
+    "required": [
+     "activity_id",
+     "actor",
+     "category_uid",
+     "class_uid",
+     "device",
+     "file",
+     "metadata",
+     "severity_id",
+     "time",
+     "type_uid"
+    ],
+    "type": "object"
+   },
+   "enums": {
+    "activity_id": {
+     "0": "Unknown",
+     "1": "Create",
+     "2": "Read",
+     "3": "Update",
+     "4": "Delete",
+     "5": "Rename",
+     "6": "Set Attributes",
+     "7": "Set Security",
+     "8": "Get Attributes",
+     "9": "Get Security",
+     "10": "Encrypt",
+     "11": "Decrypt",
+     "12": "Mount",
+     "13": "Unmount",
+     "14": "Open",
+     "99": "Other"
+    },
+    "status_id": {
+     "0": "Unknown",
+     "1": "Success",
+     "2": "Failure",
+     "99": "Other"
+    },
+    "severity_id": {
+     "0": "Unknown",
+     "1": "Informational",
+     "2": "Low",
+     "3": "Medium",
+     "4": "High",
+     "5": "Critical",
+     "6": "Fatal",
+     "99": "Other"
+    }
+   }
+  },
+  "network_activity": {
+   "uid": 4001,
+   "caption": "Network Activity",
+   "category_uid": 4,
+   "schema": {
+    "additionalProperties": false,
+    "anyOf": [
+     {
+      "required": [
+       "dst_endpoint"
+      ]
+     },
+     {
+      "required": [
+       "src_endpoint"
+      ]
+     }
+    ],
+    "properties": {
+     "activity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       7,
+       99
+      ],
+      "type": "integer"
+     },
+     "activity_name": {
+      "type": "string"
+     },
+     "actor": {
+      "$ref": "#/$defs/actor"
+     },
+     "app_name": {
+      "type": "string"
+     },
+     "app_protocol_name": {
+      "type": "string"
+     },
+     "category_name": {
+      "type": "string"
+     },
+     "category_uid": {
+      "const": 4,
+      "type": "integer"
+     },
+     "class_name": {
+      "type": "string"
+     },
+     "class_uid": {
+      "const": 4001,
+      "type": "integer"
+     },
+     "connection_info": {
+      "$ref": "#/$defs/network_connection_info"
+     },
+     "count": {
+      "type": "integer"
+     },
+     "cumulative_traffic": {
+      "$ref": "#/$defs/network_traffic"
+     },
+     "device": {
+      "$ref": "#/$defs/device"
+     },
+     "dst_endpoint": {
+      "$ref": "#/$defs/network_endpoint"
+     },
+     "duration": {
+      "type": "integer"
+     },
+     "end_time": {
+      "type": "integer"
+     },
+     "enrichments": {
+      "items": {
+       "$ref": "#/$defs/enrichment"
+      },
+      "type": "array"
+     },
+     "initiator": {
+      "type": "string"
+     },
+     "initiator_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       99
+      ],
+      "type": "integer"
+     },
+     "is_src_dst_assignment_known": {
+      "type": "boolean"
+     },
+     "ja4_fingerprint_list": {
+      "items": {
+       "$ref": "#/$defs/ja4_fingerprint"
+      },
+      "type": "array"
+     },
+     "message": {
+      "type": "string"
+     },
+     "metadata": {
+      "$ref": "#/$defs/metadata"
+     },
+     "network_observation_point": {
+      "$ref": "#/$defs/network_endpoint"
+     },
+     "observables": {
+      "items": {
+       "$ref": "#/$defs/observable"
+      },
+      "type": "array"
+     },
+     "observation_point": {
+      "type": "string"
+     },
+     "observation_point_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       99
+      ],
+      "type": "integer"
+     },
+     "packet_list": {
+      "items": {
+       "$ref": "#/$defs/packet"
+      },
+      "type": "array"
+     },
+     "proxy": {
+      "$ref": "#/$defs/network_proxy"
+     },
+     "raw_data": {
+      "type": "string"
+     },
+     "raw_data_hash": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "raw_data_size": {
+      "type": "integer"
+     },
+     "severity": {
+      "type": "string"
+     },
+     "severity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "src_endpoint": {
+      "$ref": "#/$defs/network_endpoint"
+     },
+     "start_time": {
+      "type": "integer"
+     },
+     "status": {
+      "type": "string"
+     },
+     "status_code": {
+      "type": "string"
+     },
+     "status_detail": {
+      "type": "string"
+     },
+     "status_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       99
+      ],
+      "type": "integer"
+     },
+     "time": {
+      "type": "integer"
+     },
+     "timezone_offset": {
+      "type": "integer"
+     },
+     "tls": {
+      "$ref": "#/$defs/tls"
+     },
+     "traffic": {
+      "$ref": "#/$defs/network_traffic"
+     },
+     "type_name": {
+      "type": "string"
+     },
+     "type_uid": {
+      "type": "integer"
+     },
+     "unmapped": {
+      "$ref": "#/$defs/object"
+     },
+     "url": {
+      "$ref": "#/$defs/url"
+     }
+    },
+    "required": [
+     "activity_id",
+     "category_uid",
+     "class_uid",
+     "metadata",
+     "severity_id",
+     "time",
+     "type_uid"
+    ],
+    "type": "object"
+   },
+   "enums": {
+    "activity_id": {
+     "0": "Unknown",
+     "1": "Open",
+     "2": "Close",
+     "3": "Reset",
+     "4": "Fail",
+     "5": "Refuse",
+     "6": "Traffic",
+     "7": "Listen",
+     "99": "Other"
+    },
+    "status_id": {
+     "0": "Unknown",
+     "1": "Success",
+     "2": "Failure",
+     "99": "Other"
+    },
+    "severity_id": {
+     "0": "Unknown",
+     "1": "Informational",
+     "2": "Low",
+     "3": "Medium",
+     "4": "High",
+     "5": "Critical",
+     "6": "Fatal",
+     "99": "Other"
+    }
+   }
+  },
+  "remediation_activity": {
+   "uid": 7001,
+   "caption": "Remediation Activity",
+   "category_uid": 7,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "activity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "activity_name": {
+      "type": "string"
+     },
+     "actor": {
+      "$ref": "#/$defs/actor"
+     },
+     "category_name": {
+      "type": "string"
+     },
+     "category_uid": {
+      "const": 7,
+      "type": "integer"
+     },
+     "class_name": {
+      "type": "string"
+     },
+     "class_uid": {
+      "const": 7001,
+      "type": "integer"
+     },
+     "command_uid": {
+      "type": "string"
+     },
+     "count": {
+      "type": "integer"
+     },
+     "countermeasures": {
+      "items": {
+       "$ref": "#/$defs/d3fend"
+      },
+      "type": "array"
+     },
+     "device": {
+      "$ref": "#/$defs/device"
+     },
+     "duration": {
+      "type": "integer"
+     },
+     "end_time": {
+      "type": "integer"
+     },
+     "enrichments": {
+      "items": {
+       "$ref": "#/$defs/enrichment"
+      },
+      "type": "array"
+     },
+     "message": {
+      "type": "string"
+     },
+     "metadata": {
+      "$ref": "#/$defs/metadata"
+     },
+     "observables": {
+      "items": {
+       "$ref": "#/$defs/observable"
+      },
+      "type": "array"
+     },
+     "raw_data": {
+      "type": "string"
+     },
+     "raw_data_hash": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "raw_data_size": {
+      "type": "integer"
+     },
+     "remediation": {
+      "$ref": "#/$defs/remediation"
+     },
+     "scan": {
+      "$ref": "#/$defs/scan"
+     },
+     "severity": {
+      "type": "string"
+     },
+     "severity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "start_time": {
+      "type": "integer"
+     },
+     "status": {
+      "type": "string"
+     },
+     "status_code": {
+      "type": "string"
+     },
+     "status_detail": {
+      "type": "string"
+     },
+     "status_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "time": {
+      "type": "integer"
+     },
+     "timezone_offset": {
+      "type": "integer"
+     },
+     "type_name": {
+      "type": "string"
+     },
+     "type_uid": {
+      "type": "integer"
+     },
+     "unmapped": {
+      "$ref": "#/$defs/object"
+     }
+    },
+    "required": [
+     "activity_id",
+     "category_uid",
+     "class_uid",
+     "command_uid",
+     "metadata",
+     "severity_id",
+     "time",
+     "type_uid"
+    ],
+    "type": "object"
+   },
+   "enums": {
+    "activity_id": {
+     "0": "Unknown",
+     "1": "Isolate",
+     "2": "Evict",
+     "3": "Restore",
+     "4": "Harden",
+     "5": "Detect",
+     "6": "Deceive",
+     "99": "Other"
+    },
+    "status_id": {
+     "0": "Unknown",
+     "1": "Success",
+     "2": "Failure",
+     "3": "Does Not Exist",
+     "4": "Partial",
+     "5": "Unsupported",
+     "6": "Error",
+     "99": "Other"
+    },
+    "severity_id": {
+     "0": "Unknown",
+     "1": "Informational",
+     "2": "Low",
+     "3": "Medium",
+     "4": "High",
+     "5": "Critical",
+     "6": "Fatal",
+     "99": "Other"
+    }
+   }
+  },
+  "file_remediation_activity": {
+   "uid": 7002,
+   "caption": "File Remediation Activity",
+   "category_uid": 7,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "activity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "activity_name": {
+      "type": "string"
+     },
+     "actor": {
+      "$ref": "#/$defs/actor"
+     },
+     "category_name": {
+      "type": "string"
+     },
+     "category_uid": {
+      "const": 7,
+      "type": "integer"
+     },
+     "class_name": {
+      "type": "string"
+     },
+     "class_uid": {
+      "const": 7002,
+      "type": "integer"
+     },
+     "command_uid": {
+      "type": "string"
+     },
+     "count": {
+      "type": "integer"
+     },
+     "countermeasures": {
+      "items": {
+       "$ref": "#/$defs/d3fend"
+      },
+      "type": "array"
+     },
+     "device": {
+      "$ref": "#/$defs/device"
+     },
+     "duration": {
+      "type": "integer"
+     },
+     "end_time": {
+      "type": "integer"
+     },
+     "enrichments": {
+      "items": {
+       "$ref": "#/$defs/enrichment"
+      },
+      "type": "array"
+     },
+     "file": {
+      "$ref": "#/$defs/file"
+     },
+     "message": {
+      "type": "string"
+     },
+     "metadata": {
+      "$ref": "#/$defs/metadata"
+     },
+     "observables": {
+      "items": {
+       "$ref": "#/$defs/observable"
+      },
+      "type": "array"
+     },
+     "raw_data": {
+      "type": "string"
+     },
+     "raw_data_hash": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "raw_data_size": {
+      "type": "integer"
+     },
+     "remediation": {
+      "$ref": "#/$defs/remediation"
+     },
+     "scan": {
+      "$ref": "#/$defs/scan"
+     },
+     "severity": {
+      "type": "string"
+     },
+     "severity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "start_time": {
+      "type": "integer"
+     },
+     "status": {
+      "type": "string"
+     },
+     "status_code": {
+      "type": "string"
+     },
+     "status_detail": {
+      "type": "string"
+     },
+     "status_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "time": {
+      "type": "integer"
+     },
+     "timezone_offset": {
+      "type": "integer"
+     },
+     "type_name": {
+      "type": "string"
+     },
+     "type_uid": {
+      "type": "integer"
+     },
+     "unmapped": {
+      "$ref": "#/$defs/object"
+     }
+    },
+    "required": [
+     "activity_id",
+     "category_uid",
+     "class_uid",
+     "command_uid",
+     "file",
+     "metadata",
+     "severity_id",
+     "time",
+     "type_uid"
+    ],
+    "type": "object"
+   },
+   "enums": {
+    "activity_id": {
+     "0": "Unknown",
+     "1": "Isolate",
+     "2": "Evict",
+     "3": "Restore",
+     "4": "Harden",
+     "5": "Detect",
+     "6": "Deceive",
+     "99": "Other"
+    },
+    "status_id": {
+     "0": "Unknown",
+     "1": "Success",
+     "2": "Failure",
+     "3": "Does Not Exist",
+     "4": "Partial",
+     "5": "Unsupported",
+     "6": "Error",
+     "99": "Other"
+    },
+    "severity_id": {
+     "0": "Unknown",
+     "1": "Informational",
+     "2": "Low",
+     "3": "Medium",
+     "4": "High",
+     "5": "Critical",
+     "6": "Fatal",
+     "99": "Other"
+    }
+   }
+  },
+  "process_remediation_activity": {
+   "uid": 7003,
+   "caption": "Process Remediation Activity",
+   "category_uid": 7,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "activity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "activity_name": {
+      "type": "string"
+     },
+     "actor": {
+      "$ref": "#/$defs/actor"
+     },
+     "category_name": {
+      "type": "string"
+     },
+     "category_uid": {
+      "const": 7,
+      "type": "integer"
+     },
+     "class_name": {
+      "type": "string"
+     },
+     "class_uid": {
+      "const": 7003,
+      "type": "integer"
+     },
+     "command_uid": {
+      "type": "string"
+     },
+     "count": {
+      "type": "integer"
+     },
+     "countermeasures": {
+      "items": {
+       "$ref": "#/$defs/d3fend"
+      },
+      "type": "array"
+     },
+     "device": {
+      "$ref": "#/$defs/device"
+     },
+     "duration": {
+      "type": "integer"
+     },
+     "end_time": {
+      "type": "integer"
+     },
+     "enrichments": {
+      "items": {
+       "$ref": "#/$defs/enrichment"
+      },
+      "type": "array"
+     },
+     "message": {
+      "type": "string"
+     },
+     "metadata": {
+      "$ref": "#/$defs/metadata"
+     },
+     "observables": {
+      "items": {
+       "$ref": "#/$defs/observable"
+      },
+      "type": "array"
+     },
+     "process": {
+      "$ref": "#/$defs/process"
+     },
+     "raw_data": {
+      "type": "string"
+     },
+     "raw_data_hash": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "raw_data_size": {
+      "type": "integer"
+     },
+     "remediation": {
+      "$ref": "#/$defs/remediation"
+     },
+     "scan": {
+      "$ref": "#/$defs/scan"
+     },
+     "severity": {
+      "type": "string"
+     },
+     "severity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "start_time": {
+      "type": "integer"
+     },
+     "status": {
+      "type": "string"
+     },
+     "status_code": {
+      "type": "string"
+     },
+     "status_detail": {
+      "type": "string"
+     },
+     "status_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "time": {
+      "type": "integer"
+     },
+     "timezone_offset": {
+      "type": "integer"
+     },
+     "type_name": {
+      "type": "string"
+     },
+     "type_uid": {
+      "type": "integer"
+     },
+     "unmapped": {
+      "$ref": "#/$defs/object"
+     }
+    },
+    "required": [
+     "activity_id",
+     "category_uid",
+     "class_uid",
+     "command_uid",
+     "metadata",
+     "process",
+     "severity_id",
+     "time",
+     "type_uid"
+    ],
+    "type": "object"
+   },
+   "enums": {
+    "activity_id": {
+     "0": "Unknown",
+     "1": "Isolate",
+     "2": "Evict",
+     "3": "Restore",
+     "4": "Harden",
+     "5": "Detect",
+     "6": "Deceive",
+     "99": "Other"
+    },
+    "status_id": {
+     "0": "Unknown",
+     "1": "Success",
+     "2": "Failure",
+     "3": "Does Not Exist",
+     "4": "Partial",
+     "5": "Unsupported",
+     "6": "Error",
+     "99": "Other"
+    },
+    "severity_id": {
+     "0": "Unknown",
+     "1": "Informational",
+     "2": "Low",
+     "3": "Medium",
+     "4": "High",
+     "5": "Critical",
+     "6": "Fatal",
+     "99": "Other"
+    }
+   }
+  },
+  "network_remediation_activity": {
+   "uid": 7004,
+   "caption": "Network Remediation Activity",
+   "category_uid": 7,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "activity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "activity_name": {
+      "type": "string"
+     },
+     "actor": {
+      "$ref": "#/$defs/actor"
+     },
+     "category_name": {
+      "type": "string"
+     },
+     "category_uid": {
+      "const": 7,
+      "type": "integer"
+     },
+     "class_name": {
+      "type": "string"
+     },
+     "class_uid": {
+      "const": 7004,
+      "type": "integer"
+     },
+     "command_uid": {
+      "type": "string"
+     },
+     "connection_info": {
+      "$ref": "#/$defs/network_connection_info"
+     },
+     "count": {
+      "type": "integer"
+     },
+     "countermeasures": {
+      "items": {
+       "$ref": "#/$defs/d3fend"
+      },
+      "type": "array"
+     },
+     "device": {
+      "$ref": "#/$defs/device"
+     },
+     "duration": {
+      "type": "integer"
+     },
+     "end_time": {
+      "type": "integer"
+     },
+     "enrichments": {
+      "items": {
+       "$ref": "#/$defs/enrichment"
+      },
+      "type": "array"
+     },
+     "message": {
+      "type": "string"
+     },
+     "metadata": {
+      "$ref": "#/$defs/metadata"
+     },
+     "observables": {
+      "items": {
+       "$ref": "#/$defs/observable"
+      },
+      "type": "array"
+     },
+     "raw_data": {
+      "type": "string"
+     },
+     "raw_data_hash": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "raw_data_size": {
+      "type": "integer"
+     },
+     "remediation": {
+      "$ref": "#/$defs/remediation"
+     },
+     "scan": {
+      "$ref": "#/$defs/scan"
+     },
+     "severity": {
+      "type": "string"
+     },
+     "severity_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "start_time": {
+      "type": "integer"
+     },
+     "status": {
+      "type": "string"
+     },
+     "status_code": {
+      "type": "string"
+     },
+     "status_detail": {
+      "type": "string"
+     },
+     "status_id": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "time": {
+      "type": "integer"
+     },
+     "timezone_offset": {
+      "type": "integer"
+     },
+     "type_name": {
+      "type": "string"
+     },
+     "type_uid": {
+      "type": "integer"
+     },
+     "unmapped": {
+      "$ref": "#/$defs/object"
+     }
+    },
+    "required": [
+     "activity_id",
+     "category_uid",
+     "class_uid",
+     "command_uid",
+     "connection_info",
+     "metadata",
+     "severity_id",
+     "time",
+     "type_uid"
+    ],
+    "type": "object"
+   },
+   "enums": {
+    "activity_id": {
+     "0": "Unknown",
+     "1": "Isolate",
+     "2": "Evict",
+     "3": "Restore",
+     "4": "Harden",
+     "5": "Detect",
+     "6": "Deceive",
+     "99": "Other"
+    },
+    "status_id": {
+     "0": "Unknown",
+     "1": "Success",
+     "2": "Failure",
+     "3": "Does Not Exist",
+     "4": "Partial",
+     "5": "Unsupported",
+     "6": "Error",
+     "99": "Other"
+    },
+    "severity_id": {
+     "0": "Unknown",
+     "1": "Informational",
+     "2": "Low",
+     "3": "Medium",
+     "4": "High",
+     "5": "Critical",
+     "6": "Fatal",
+     "99": "Other"
+    }
+   }
+  }
+ },
+ "object_enums": {
+  "device.type_id": {
+   "0": "Unknown",
+   "1": "Server",
+   "2": "Desktop",
+   "3": "Laptop",
+   "4": "Tablet",
+   "5": "Mobile",
+   "6": "Virtual",
+   "7": "IOT",
+   "8": "Browser",
+   "9": "Firewall",
+   "10": "Switch",
+   "11": "Hub",
+   "12": "Router",
+   "13": "IDS",
+   "14": "IPS",
+   "15": "Load Balancer",
+   "99": "Other"
+  },
+  "file.type_id": {
+   "0": "Unknown",
+   "1": "Regular File",
+   "2": "Folder",
+   "3": "Character Device",
+   "4": "Block Device",
+   "5": "Local Socket",
+   "6": "Named Pipe",
+   "7": "Symbolic Link",
+   "8": "Executable File",
+   "99": "Other"
+  },
+  "analytic.type_id": {
+   "0": "Unknown",
+   "1": "Rule",
+   "2": "Behavioral",
+   "3": "Statistical",
+   "4": "Learning (ML/DL)",
+   "5": "Fingerprinting",
+   "6": "Tagging",
+   "7": "Keyword Match",
+   "8": "Regular Expressions",
+   "9": "Exact Data Match",
+   "10": "Partial Data Match",
+   "11": "Indexed Data Match",
+   "99": "Other"
+  },
+  "fingerprint.algorithm_id": {
+   "0": "Unknown",
+   "1": "MD5",
+   "2": "SHA-1",
+   "3": "SHA-256",
+   "4": "SHA-512",
+   "5": "CTPH",
+   "6": "TLSH",
+   "7": "quickXorHash",
+   "8": "SHA-224",
+   "9": "SHA-384",
+   "10": "SHA-512/224",
+   "11": "SHA-512/256",
+   "12": "SHA3-224",
+   "13": "SHA3-256",
+   "14": "SHA3-384",
+   "15": "SHA3-512",
+   "16": "xxHash H3 64-bit",
+   "17": "xxHash H3 128-bit",
+   "18": "Imphash",
+   "19": "NPF",
+   "20": "HASSH",
+   "99": "Other"
+  },
+  "network_connection_info.direction_id": {
+   "0": "Unknown",
+   "1": "Inbound",
+   "2": "Outbound",
+   "3": "Lateral",
+   "4": "Local",
+   "99": "Other"
+  },
+  "network_connection_info.protocol_ver_id": {
+   "0": "Unknown",
+   "4": "Internet Protocol version 4 (IPv4)",
+   "6": "Internet Protocol version 6 (IPv6)",
+   "99": "Other"
+  }
+ },
+ "$defs": {
+  "account": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "is_disabled": {
+     "type": "boolean"
+    },
+    "is_locked": {
+     "type": "boolean"
+    },
+    "is_on_premises_sync_enabled": {
+     "type": "boolean"
+    },
+    "labels": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "name": {
+     "type": "string"
+    },
+    "tags": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "actor": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "app_name"
+     ]
+    },
+    {
+     "required": [
+      "app_uid"
+     ]
+    },
+    {
+     "required": [
+      "application"
+     ]
+    },
+    {
+     "required": [
+      "iam_role"
+     ]
+    },
+    {
+     "required": [
+      "invoked_by"
+     ]
+    },
+    {
+     "required": [
+      "process"
+     ]
+    },
+    {
+     "required": [
+      "session"
+     ]
+    },
+    {
+     "required": [
+      "user"
+     ]
+    }
+   ],
+   "properties": {
+    "app_name": {
+     "type": "string"
+    },
+    "app_uid": {
+     "type": "string"
+    },
+    "application": {
+     "$ref": "#/$defs/application"
+    },
+    "authorizations": {
+     "items": {
+      "$ref": "#/$defs/authorization"
+     },
+     "type": "array"
+    },
+    "iam_role": {
+     "$ref": "#/$defs/iam_role"
+    },
+    "idp": {
+     "$ref": "#/$defs/idp"
+    },
+    "invoked_by": {
+     "type": "string"
+    },
+    "process": {
+     "$ref": "#/$defs/process"
+    },
+    "session": {
+     "$ref": "#/$defs/session"
+    },
+    "user": {
+     "$ref": "#/$defs/user"
+    }
+   },
+   "type": "object"
+  },
+  "advisory": {
+   "additionalProperties": false,
+   "properties": {
+    "avg_timespan": {
+     "$ref": "#/$defs/timespan"
+    },
+    "bulletin": {
+     "type": "string"
+    },
+    "classification": {
+     "type": "string"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "install_state": {
+     "type": "string"
+    },
+    "install_state_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "is_superseded": {
+     "type": "boolean"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "os": {
+     "$ref": "#/$defs/os"
+    },
+    "product": {
+     "$ref": "#/$defs/product"
+    },
+    "references": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "related_cves": {
+     "items": {
+      "$ref": "#/$defs/cve"
+     },
+     "type": "array"
+    },
+    "related_cwes": {
+     "items": {
+      "$ref": "#/$defs/cwe"
+     },
+     "type": "array"
+    },
+    "size": {
+     "type": "integer"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "title": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "uid"
+   ],
+   "type": "object"
+  },
+  "affected_code": {
+   "additionalProperties": false,
+   "properties": {
+    "end_column": {
+     "type": "integer"
+    },
+    "end_line": {
+     "type": "integer"
+    },
+    "file": {
+     "$ref": "#/$defs/file"
+    },
+    "owner": {
+     "$ref": "#/$defs/user"
+    },
+    "remediation": {
+     "$ref": "#/$defs/remediation"
+    },
+    "rule": {
+     "$ref": "#/$defs/rule"
+    },
+    "start_column": {
+     "type": "integer"
+    },
+    "start_line": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "file"
+   ],
+   "type": "object"
+  },
+  "affected_package": {
+   "additionalProperties": false,
+   "properties": {
+    "architecture": {
+     "type": "string"
+    },
+    "cpe_name": {
+     "type": "string"
+    },
+    "epoch": {
+     "type": "integer"
+    },
+    "fixed_in_version": {
+     "type": "string"
+    },
+    "hash": {
+     "$ref": "#/$defs/fingerprint"
+    },
+    "license": {
+     "type": "string"
+    },
+    "license_url": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "package_manager": {
+     "type": "string"
+    },
+    "package_manager_url": {
+     "type": "string"
+    },
+    "path": {
+     "type": "string"
+    },
+    "purl": {
+     "type": "string"
+    },
+    "release": {
+     "type": "string"
+    },
+    "remediation": {
+     "$ref": "#/$defs/remediation"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "vendor_name": {
+     "type": "string"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "version"
+   ],
+   "type": "object"
+  },
+  "agent": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "policies": {
+     "items": {
+      "$ref": "#/$defs/policy"
+     },
+     "type": "array"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_alt": {
+     "type": "string"
+    },
+    "vendor_name": {
+     "type": "string"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "ai_agent": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "ai_model": {
+     "$ref": "#/$defs/ai_model"
+    },
+    "charter": {
+     "$ref": "#/$defs/file"
+    },
+    "instance_uid": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "ai_model": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "ai_provider": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "ai_provider"
+   ],
+   "type": "object"
+  },
+  "analysis_target": {
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "type": "object"
+  },
+  "analytic": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "algorithm": {
+     "type": "string"
+    },
+    "category": {
+     "type": "string"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "related_analytics": {
+     "items": {
+      "$ref": "#/$defs/analytic"
+     },
+     "type": "array"
+    },
+    "sensor_info_list": {
+     "items": {
+      "$ref": "#/$defs/sensor_info"
+     },
+     "type": "array"
+    },
+    "state": {
+     "type": "string"
+    },
+    "state_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "anomaly": {
+   "additionalProperties": false,
+   "properties": {
+    "observation_parameter": {
+     "type": "string"
+    },
+    "observation_type": {
+     "type": "string"
+    },
+    "observations": {
+     "items": {
+      "$ref": "#/$defs/observation"
+     },
+     "type": "array"
+    },
+    "observed_pattern": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "observation_parameter",
+    "observations"
+   ],
+   "type": "object"
+  },
+  "anomaly_analysis": {
+   "additionalProperties": false,
+   "properties": {
+    "analysis_targets": {
+     "items": {
+      "$ref": "#/$defs/analysis_target"
+     },
+     "type": "array"
+    },
+    "anomalies": {
+     "items": {
+      "$ref": "#/$defs/anomaly"
+     },
+     "type": "array"
+    },
+    "baselines": {
+     "items": {
+      "$ref": "#/$defs/baseline"
+     },
+     "type": "array"
+    }
+   },
+   "required": [
+    "analysis_targets",
+    "anomalies"
+   ],
+   "type": "object"
+  },
+  "api": {
+   "additionalProperties": false,
+   "properties": {
+    "group": {
+     "$ref": "#/$defs/group"
+    },
+    "operation": {
+     "type": "string"
+    },
+    "request": {
+     "$ref": "#/$defs/request"
+    },
+    "response": {
+     "$ref": "#/$defs/response"
+    },
+    "service": {
+     "$ref": "#/$defs/service"
+    },
+    "token": {
+     "$ref": "#/$defs/token"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "operation"
+   ],
+   "type": "object"
+  },
+  "application": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "criticality": {
+     "type": "string"
+    },
+    "data": {},
+    "desc": {
+     "type": "string"
+    },
+    "group": {
+     "$ref": "#/$defs/group"
+    },
+    "hostname": {
+     "type": "string"
+    },
+    "labels": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "name": {
+     "type": "string"
+    },
+    "owner": {
+     "$ref": "#/$defs/user"
+    },
+    "product": {
+     "$ref": "#/$defs/product"
+    },
+    "resource_relationship": {
+     "$ref": "#/$defs/graph"
+    },
+    "risk_level": {
+     "type": "string"
+    },
+    "risk_level_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "risk_score": {
+     "type": "integer"
+    },
+    "sbom": {
+     "$ref": "#/$defs/sbom"
+    },
+    "tags": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "type": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_alt": {
+     "type": "string"
+    },
+    "url": {
+     "$ref": "#/$defs/url"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "attack": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "sub_technique"
+     ]
+    },
+    {
+     "required": [
+      "tactic"
+     ]
+    },
+    {
+     "required": [
+      "technique"
+     ]
+    }
+   ],
+   "properties": {
+    "mitigation": {
+     "$ref": "#/$defs/mitigation"
+    },
+    "sub_technique": {
+     "$ref": "#/$defs/sub_technique"
+    },
+    "tactic": {
+     "$ref": "#/$defs/tactic"
+    },
+    "tactics": {
+     "items": {
+      "$ref": "#/$defs/tactic"
+     },
+     "type": "array"
+    },
+    "technique": {
+     "$ref": "#/$defs/technique"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "attestation": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "fingerprint"
+     ]
+    },
+    {
+     "required": [
+      "signatures"
+     ]
+    }
+   ],
+   "properties": {
+    "authority_uid": {
+     "type": "string"
+    },
+    "chain_uid": {
+     "type": "string"
+    },
+    "fingerprint": {
+     "$ref": "#/$defs/fingerprint"
+    },
+    "prev_event": {
+     "$ref": "#/$defs/prev_event"
+    },
+    "signatures": {
+     "items": {
+      "$ref": "#/$defs/digital_signature"
+     },
+     "type": "array"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "auth_factor": {
+   "additionalProperties": false,
+   "properties": {
+    "device": {
+     "$ref": "#/$defs/device"
+    },
+    "email_addr": {
+     "type": "string"
+    },
+    "factor_type": {
+     "type": "string"
+    },
+    "factor_type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      99
+     ],
+     "type": "integer"
+    },
+    "is_hotp": {
+     "type": "boolean"
+    },
+    "is_totp": {
+     "type": "boolean"
+    },
+    "phone_number": {
+     "type": "string"
+    },
+    "provider": {
+     "type": "string"
+    },
+    "security_questions": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    }
+   },
+   "required": [
+    "factor_type_id"
+   ],
+   "type": "object"
+  },
+  "authorization": {
+   "additionalProperties": false,
+   "properties": {
+    "decision": {
+     "type": "string"
+    },
+    "policy": {
+     "$ref": "#/$defs/policy"
+    }
+   },
+   "type": "object"
+  },
+  "autonomous_system": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "number"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "number": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "baseline": {
+   "additionalProperties": false,
+   "properties": {
+    "observation_parameter": {
+     "type": "string"
+    },
+    "observation_type": {
+     "type": "string"
+    },
+    "observations": {
+     "items": {
+      "$ref": "#/$defs/observation"
+     },
+     "type": "array"
+    },
+    "observed_pattern": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "observation_parameter",
+    "observations"
+   ],
+   "type": "object"
+  },
+  "campaign": {
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "type": "object"
+  },
+  "certificate": {
+   "additionalProperties": false,
+   "properties": {
+    "created_time": {
+     "type": "integer"
+    },
+    "expiration_time": {
+     "type": "integer"
+    },
+    "fingerprints": {
+     "items": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "type": "array"
+    },
+    "is_self_signed": {
+     "type": "boolean"
+    },
+    "issuer": {
+     "type": "string"
+    },
+    "sans": {
+     "items": {
+      "$ref": "#/$defs/san"
+     },
+     "type": "array"
+    },
+    "serial_number": {
+     "type": "string"
+    },
+    "subject": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "issuer",
+    "serial_number"
+   ],
+   "type": "object"
+  },
+  "cis_control": {
+   "additionalProperties": false,
+   "properties": {
+    "desc": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "type": "object"
+  },
+  "classifier_details": {
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "type"
+   ],
+   "type": "object"
+  },
+  "cloud": {
+   "additionalProperties": false,
+   "properties": {
+    "account": {
+     "$ref": "#/$defs/account"
+    },
+    "cloud_partition": {
+     "type": "string"
+    },
+    "org": {
+     "$ref": "#/$defs/organization"
+    },
+    "project_uid": {
+     "type": "string"
+    },
+    "provider": {
+     "type": "string"
+    },
+    "region": {
+     "type": "string"
+    },
+    "zone": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "provider"
+   ],
+   "type": "object"
+  },
+  "container": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "hash": {
+     "$ref": "#/$defs/fingerprint"
+    },
+    "image": {
+     "$ref": "#/$defs/image"
+    },
+    "labels": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "name": {
+     "type": "string"
+    },
+    "network_driver": {
+     "type": "string"
+    },
+    "orchestrator": {
+     "type": "string"
+    },
+    "pod_uuid": {
+     "type": "string"
+    },
+    "runtime": {
+     "type": "string"
+    },
+    "size": {
+     "type": "integer"
+    },
+    "tag": {
+     "type": "string"
+    },
+    "tags": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "cpu_info": {
+   "additionalProperties": false,
+   "properties": {
+    "cores": {
+     "type": "integer"
+    },
+    "cpu_architecture": {
+     "type": "string"
+    },
+    "cpu_architecture_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "cpu_bits": {
+     "type": "integer"
+    },
+    "model": {
+     "type": "string"
+    },
+    "speed_mhz": {
+     "type": "integer"
+    },
+    "vendor_name": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "cve": {
+   "additionalProperties": false,
+   "properties": {
+    "created_time": {
+     "type": "integer"
+    },
+    "cvss": {
+     "items": {
+      "$ref": "#/$defs/cvss"
+     },
+     "type": "array"
+    },
+    "cwe": {
+     "$ref": "#/$defs/cwe"
+    },
+    "cwe_uid": {
+     "type": "string"
+    },
+    "cwe_url": {
+     "type": "string"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "epss": {
+     "$ref": "#/$defs/epss"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "product": {
+     "$ref": "#/$defs/product"
+    },
+    "references": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "related_cwes": {
+     "items": {
+      "$ref": "#/$defs/cwe"
+     },
+     "type": "array"
+    },
+    "title": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "uid"
+   ],
+   "type": "object"
+  },
+  "cvss": {
+   "additionalProperties": false,
+   "properties": {
+    "base_score": {
+     "type": "number"
+    },
+    "depth": {
+     "enum": [
+      "Base",
+      "Environmental",
+      "Temporal"
+     ],
+     "type": "string"
+    },
+    "metrics": {
+     "items": {
+      "$ref": "#/$defs/metric"
+     },
+     "type": "array"
+    },
+    "overall_score": {
+     "type": "number"
+    },
+    "severity": {
+     "type": "string"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "vector_string": {
+     "type": "string"
+    },
+    "vendor_name": {
+     "type": "string"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "base_score",
+    "version"
+   ],
+   "type": "object"
+  },
+  "cwe": {
+   "additionalProperties": false,
+   "properties": {
+    "caption": {
+     "type": "string"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "uid"
+   ],
+   "type": "object"
+  },
+  "d3f_tactic": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "d3f_technique": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "d3fend": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "d3f_tactic"
+     ]
+    },
+    {
+     "required": [
+      "d3f_technique"
+     ]
+    }
+   ],
+   "properties": {
+    "d3f_tactic": {
+     "$ref": "#/$defs/d3f_tactic"
+    },
+    "d3f_technique": {
+     "$ref": "#/$defs/d3f_technique"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "data_classification": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "category_id"
+     ]
+    },
+    {
+     "required": [
+      "confidentiality_id"
+     ]
+    }
+   ],
+   "properties": {
+    "category": {
+     "type": "string"
+    },
+    "category_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "classifier_details": {
+     "$ref": "#/$defs/classifier_details"
+    },
+    "confidentiality": {
+     "type": "string"
+    },
+    "confidentiality_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "discovery_details": {
+     "items": {
+      "$ref": "#/$defs/discovery_details"
+     },
+     "type": "array"
+    },
+    "policy": {
+     "$ref": "#/$defs/policy"
+    },
+    "size": {
+     "type": "integer"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "status": {
+     "type": "string"
+    },
+    "status_details": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "status_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "total": {
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "database": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "created_time": {
+     "type": "integer"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "embedding_model": {
+     "type": "string"
+    },
+    "groups": {
+     "items": {
+      "$ref": "#/$defs/group"
+     },
+     "type": "array"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "size": {
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "databucket": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "agent_list": {
+     "items": {
+      "$ref": "#/$defs/agent"
+     },
+     "type": "array"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "criticality": {
+     "type": "string"
+    },
+    "data": {},
+    "desc": {
+     "type": "string"
+    },
+    "encryption_details": {
+     "$ref": "#/$defs/encryption_details"
+    },
+    "file": {
+     "$ref": "#/$defs/file"
+    },
+    "group": {
+     "$ref": "#/$defs/group"
+    },
+    "groups": {
+     "items": {
+      "$ref": "#/$defs/group"
+     },
+     "type": "array"
+    },
+    "hostname": {
+     "type": "string"
+    },
+    "ip": {
+     "type": "string"
+    },
+    "is_backed_up": {
+     "type": "boolean"
+    },
+    "is_encrypted": {
+     "type": "boolean"
+    },
+    "is_public": {
+     "type": "boolean"
+    },
+    "labels": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "namespace": {
+     "type": "string"
+    },
+    "owner": {
+     "$ref": "#/$defs/user"
+    },
+    "resource_relationship": {
+     "$ref": "#/$defs/graph"
+    },
+    "size": {
+     "type": "integer"
+    },
+    "tags": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_alt": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "delegation": {
+   "additionalProperties": false,
+   "properties": {
+    "created_time": {
+     "type": "integer"
+    },
+    "issuer_uid": {
+     "type": "string"
+    },
+    "parent_uid": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "uid"
+   ],
+   "type": "object"
+  },
+  "device": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "hostname"
+     ]
+    },
+    {
+     "required": [
+      "instance_uid"
+     ]
+    },
+    {
+     "required": [
+      "interface_name"
+     ]
+    },
+    {
+     "required": [
+      "interface_uid"
+     ]
+    },
+    {
+     "required": [
+      "ip"
+     ]
+    },
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "agent_list": {
+     "items": {
+      "$ref": "#/$defs/agent"
+     },
+     "type": "array"
+    },
+    "autoscale_uid": {
+     "type": "string"
+    },
+    "boot_time": {
+     "type": "integer"
+    },
+    "boot_uid": {
+     "type": "string"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "string"
+    },
+    "eid": {
+     "type": "string"
+    },
+    "first_seen_time": {
+     "type": "integer"
+    },
+    "groups": {
+     "items": {
+      "$ref": "#/$defs/group"
+     },
+     "type": "array"
+    },
+    "hostname": {
+     "type": "string"
+    },
+    "hw_info": {
+     "$ref": "#/$defs/device_hw_info"
+    },
+    "hypervisor": {
+     "type": "string"
+    },
+    "iccid": {
+     "type": "string"
+    },
+    "image": {
+     "$ref": "#/$defs/image"
+    },
+    "imei": {
+     "type": "string"
+    },
+    "imei_list": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "instance_uid": {
+     "type": "string"
+    },
+    "interface_name": {
+     "type": "string"
+    },
+    "interface_uid": {
+     "type": "string"
+    },
+    "ip": {
+     "type": "string"
+    },
+    "is_backed_up": {
+     "type": "boolean"
+    },
+    "is_compliant": {
+     "type": "boolean"
+    },
+    "is_managed": {
+     "type": "boolean"
+    },
+    "is_mobile_account_active": {
+     "type": "boolean"
+    },
+    "is_personal": {
+     "type": "boolean"
+    },
+    "is_shared": {
+     "type": "boolean"
+    },
+    "is_supervised": {
+     "type": "boolean"
+    },
+    "is_trusted": {
+     "type": "boolean"
+    },
+    "last_seen_time": {
+     "type": "integer"
+    },
+    "location": {
+     "$ref": "#/$defs/location"
+    },
+    "mac": {
+     "type": "string"
+    },
+    "mac_vendor": {
+     "type": "string"
+    },
+    "meid": {
+     "type": "string"
+    },
+    "model": {
+     "type": "string"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "network_interfaces": {
+     "items": {
+      "$ref": "#/$defs/network_interface"
+     },
+     "type": "array"
+    },
+    "org": {
+     "$ref": "#/$defs/organization"
+    },
+    "os": {
+     "$ref": "#/$defs/os"
+    },
+    "os_machine_uuid": {
+     "type": "string"
+    },
+    "owner": {
+     "$ref": "#/$defs/user"
+    },
+    "peripheral_devices": {
+     "items": {
+      "$ref": "#/$defs/peripheral_device"
+     },
+     "type": "array"
+    },
+    "pool": {
+     "$ref": "#/$defs/group"
+    },
+    "region": {
+     "type": "string"
+    },
+    "risk_level": {
+     "type": "string"
+    },
+    "risk_level_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "risk_score": {
+     "type": "integer"
+    },
+    "subnet": {
+     "type": "string"
+    },
+    "subnet_uid": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      99
+     ],
+     "type": "integer"
+    },
+    "udid": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_alt": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "vendor_name": {
+     "type": "string"
+    },
+    "vlan_uid": {
+     "type": "string"
+    },
+    "vpc_uid": {
+     "type": "string"
+    },
+    "zone": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "device_hw_info": {
+   "additionalProperties": false,
+   "properties": {
+    "bios_date": {
+     "type": "string"
+    },
+    "bios_manufacturer": {
+     "type": "string"
+    },
+    "bios_ver": {
+     "type": "string"
+    },
+    "chassis": {
+     "type": "string"
+    },
+    "cores": {
+     "type": "integer"
+    },
+    "cpu_architecture": {
+     "type": "string"
+    },
+    "cpu_architecture_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "cpu_bits": {
+     "type": "integer"
+    },
+    "cpu_cores": {
+     "type": "integer"
+    },
+    "cpu_count": {
+     "type": "integer"
+    },
+    "cpu_info_list": {
+     "items": {
+      "$ref": "#/$defs/cpu_info"
+     },
+     "type": "array"
+    },
+    "cpu_speed": {
+     "type": "integer"
+    },
+    "cpu_type": {
+     "type": "string"
+    },
+    "desktop_display": {
+     "$ref": "#/$defs/display"
+    },
+    "gpu_count": {
+     "type": "integer"
+    },
+    "gpu_info_list": {
+     "items": {
+      "$ref": "#/$defs/gpu_info"
+     },
+     "type": "array"
+    },
+    "keyboard_info": {
+     "$ref": "#/$defs/keyboard_info"
+    },
+    "ram_size": {
+     "type": "integer"
+    },
+    "serial_number": {
+     "type": "string"
+    },
+    "uuid": {
+     "type": "string"
+    },
+    "vendor_name": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "digital_signature": {
+   "additionalProperties": false,
+   "properties": {
+    "algorithm": {
+     "type": "string"
+    },
+    "algorithm_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "certificate": {
+     "$ref": "#/$defs/certificate"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "developer_uid": {
+     "type": "string"
+    },
+    "digest": {
+     "$ref": "#/$defs/fingerprint"
+    },
+    "serialization": {
+     "type": "string"
+    },
+    "serialization_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      99
+     ],
+     "type": "integer"
+    },
+    "state": {
+     "type": "string"
+    },
+    "state_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      99
+     ],
+     "type": "integer"
+    }
+   },
+   "required": [
+    "algorithm_id"
+   ],
+   "type": "object"
+  },
+  "discovery_details": {
+   "additionalProperties": false,
+   "properties": {
+    "count": {
+     "type": "integer"
+    },
+    "occurrence_details": {
+     "$ref": "#/$defs/occurrence_details"
+    },
+    "occurrences": {
+     "items": {
+      "$ref": "#/$defs/occurrence_details"
+     },
+     "type": "array"
+    },
+    "rule": {
+     "$ref": "#/$defs/rule"
+    },
+    "type": {
+     "type": "string"
+    },
+    "value": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "display": {
+   "additionalProperties": false,
+   "properties": {
+    "color_depth": {
+     "type": "integer"
+    },
+    "physical_height": {
+     "type": "integer"
+    },
+    "physical_orientation": {
+     "type": "integer"
+    },
+    "physical_width": {
+     "type": "integer"
+    },
+    "scale_factor": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "dns_answer": {
+   "additionalProperties": false,
+   "properties": {
+    "class": {
+     "type": "string"
+    },
+    "flag_ids": {
+     "items": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       99
+      ],
+      "type": "integer"
+     },
+     "type": "array"
+    },
+    "flags": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "hostname": {
+     "type": "string"
+    },
+    "packet_uid": {
+     "type": "integer"
+    },
+    "rdata": {
+     "type": "string"
+    },
+    "ttl": {
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "rdata"
+   ],
+   "type": "object"
+  },
+  "dns_query": {
+   "additionalProperties": false,
+   "properties": {
+    "class": {
+     "type": "string"
+    },
+    "hostname": {
+     "type": "string"
+    },
+    "opcode": {
+     "type": "string"
+    },
+    "opcode_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "packet_uid": {
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "hostname"
+   ],
+   "type": "object"
+  },
+  "domain_contact": {
+   "additionalProperties": false,
+   "properties": {
+    "email_addr": {
+     "type": "string"
+    },
+    "location": {
+     "$ref": "#/$defs/location"
+    },
+    "name": {
+     "type": "string"
+    },
+    "phone_number": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "download_info": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "src_endpoint"
+     ]
+    },
+    {
+     "required": [
+      "src_url"
+     ]
+    },
+    {
+     "required": [
+      "type_id"
+     ]
+    }
+   ],
+   "properties": {
+    "referrer": {
+     "type": "string"
+    },
+    "src_endpoint": {
+     "$ref": "#/$defs/network_endpoint"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      99
+     ],
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "edge": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "data": {},
+    "is_directed": {
+     "type": "boolean"
+    },
+    "name": {
+     "type": "string"
+    },
+    "relation": {
+     "type": "string"
+    },
+    "source": {
+     "type": "string"
+    },
+    "target": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "source",
+    "target"
+   ],
+   "type": "object"
+  },
+  "email": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "from"
+     ]
+    },
+    {
+     "required": [
+      "to"
+     ]
+    }
+   ],
+   "properties": {
+    "bcc": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "bcc_mailboxes": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "cc": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "cc_mailboxes": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "delivered_to": {
+     "type": "string"
+    },
+    "delivered_to_list": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "files": {
+     "items": {
+      "$ref": "#/$defs/file"
+     },
+     "type": "array"
+    },
+    "from": {
+     "type": "string"
+    },
+    "from_list": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "from_mailbox": {
+     "type": "string"
+    },
+    "from_mailboxes": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "http_headers": {
+     "items": {
+      "$ref": "#/$defs/http_header"
+     },
+     "type": "array"
+    },
+    "is_read": {
+     "type": "boolean"
+    },
+    "message_uid": {
+     "type": "string"
+    },
+    "raw_header": {
+     "type": "string"
+    },
+    "reply_to": {
+     "type": "string"
+    },
+    "reply_to_list": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "reply_to_mailboxes": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "return_path": {
+     "type": "string"
+    },
+    "sender": {
+     "type": "string"
+    },
+    "sender_mailbox": {
+     "type": "string"
+    },
+    "size": {
+     "type": "integer"
+    },
+    "smtp_from": {
+     "type": "string"
+    },
+    "smtp_to": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "subject": {
+     "type": "string"
+    },
+    "to": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "to_mailboxes": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "urls": {
+     "items": {
+      "$ref": "#/$defs/url"
+     },
+     "type": "array"
+    },
+    "x_originating_ip": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    }
+   },
+   "type": "object"
+  },
+  "email_auth": {
+   "additionalProperties": false,
+   "properties": {
+    "dkim": {
+     "type": "string"
+    },
+    "dkim_domain": {
+     "type": "string"
+    },
+    "dkim_signature": {
+     "type": "string"
+    },
+    "dmarc": {
+     "type": "string"
+    },
+    "dmarc_override": {
+     "type": "string"
+    },
+    "dmarc_policy": {
+     "type": "string"
+    },
+    "spf": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "encryption_details": {
+   "additionalProperties": false,
+   "properties": {
+    "algorithm": {
+     "type": "string"
+    },
+    "algorithm_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "key_length": {
+     "type": "integer"
+    },
+    "key_uid": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "endpoint_connection": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "code"
+     ]
+    },
+    {
+     "required": [
+      "network_endpoint"
+     ]
+    }
+   ],
+   "properties": {
+    "code": {
+     "type": "integer"
+    },
+    "network_endpoint": {
+     "$ref": "#/$defs/network_endpoint"
+    }
+   },
+   "type": "object"
+  },
+  "enrichment": {
+   "additionalProperties": false,
+   "properties": {
+    "created_time": {
+     "type": "integer"
+    },
+    "data": {},
+    "desc": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "provider": {
+     "type": "string"
+    },
+    "reputation": {
+     "$ref": "#/$defs/reputation"
+    },
+    "short_desc": {
+     "type": "string"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "value": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "data",
+    "name",
+    "value"
+   ],
+   "type": "object"
+  },
+  "environment_variable": {
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "value": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "value"
+   ],
+   "type": "object"
+  },
+  "epss": {
+   "additionalProperties": false,
+   "properties": {
+    "created_time": {
+     "type": "integer"
+    },
+    "percentile": {
+     "type": "number"
+    },
+    "score": {
+     "type": "string"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "score"
+   ],
+   "type": "object"
+  },
+  "evidences": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "actor"
+     ]
+    },
+    {
+     "required": [
+      "api"
+     ]
+    },
+    {
+     "required": [
+      "connection_info"
+     ]
+    },
+    {
+     "required": [
+      "data"
+     ]
+    },
+    {
+     "required": [
+      "database"
+     ]
+    },
+    {
+     "required": [
+      "databucket"
+     ]
+    },
+    {
+     "required": [
+      "device"
+     ]
+    },
+    {
+     "required": [
+      "dst_endpoint"
+     ]
+    },
+    {
+     "required": [
+      "email"
+     ]
+    },
+    {
+     "required": [
+      "file"
+     ]
+    },
+    {
+     "required": [
+      "job"
+     ]
+    },
+    {
+     "required": [
+      "process"
+     ]
+    },
+    {
+     "required": [
+      "query"
+     ]
+    },
+    {
+     "required": [
+      "reg_key"
+     ]
+    },
+    {
+     "required": [
+      "reg_value"
+     ]
+    },
+    {
+     "required": [
+      "script"
+     ]
+    },
+    {
+     "required": [
+      "src_endpoint"
+     ]
+    },
+    {
+     "required": [
+      "url"
+     ]
+    },
+    {
+     "required": [
+      "user"
+     ]
+    },
+    {
+     "required": [
+      "win_service"
+     ]
+    }
+   ],
+   "properties": {
+    "actor": {
+     "$ref": "#/$defs/actor"
+    },
+    "ai_agent": {
+     "$ref": "#/$defs/ai_agent"
+    },
+    "api": {
+     "$ref": "#/$defs/api"
+    },
+    "connection_info": {
+     "$ref": "#/$defs/network_connection_info"
+    },
+    "container": {
+     "$ref": "#/$defs/container"
+    },
+    "data": {},
+    "database": {
+     "$ref": "#/$defs/database"
+    },
+    "databucket": {
+     "$ref": "#/$defs/databucket"
+    },
+    "device": {
+     "$ref": "#/$defs/device"
+    },
+    "dst_endpoint": {
+     "$ref": "#/$defs/network_endpoint"
+    },
+    "email": {
+     "$ref": "#/$defs/email"
+    },
+    "file": {
+     "$ref": "#/$defs/file"
+    },
+    "http_request": {
+     "$ref": "#/$defs/http_request"
+    },
+    "http_response": {
+     "$ref": "#/$defs/http_response"
+    },
+    "ja4_fingerprint_list": {
+     "items": {
+      "$ref": "#/$defs/ja4_fingerprint"
+     },
+     "type": "array"
+    },
+    "job": {
+     "$ref": "#/$defs/job"
+    },
+    "name": {
+     "type": "string"
+    },
+    "process": {
+     "$ref": "#/$defs/process"
+    },
+    "query": {
+     "$ref": "#/$defs/dns_query"
+    },
+    "reg_key": {
+     "$ref": "#/$defs/win_reg_key"
+    },
+    "reg_value": {
+     "$ref": "#/$defs/win_reg_value"
+    },
+    "resources": {
+     "items": {
+      "$ref": "#/$defs/resource_details"
+     },
+     "type": "array"
+    },
+    "script": {
+     "$ref": "#/$defs/script"
+    },
+    "src_endpoint": {
+     "$ref": "#/$defs/network_endpoint"
+    },
+    "tls": {
+     "$ref": "#/$defs/tls"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "url": {
+     "$ref": "#/$defs/url"
+    },
+    "user": {
+     "$ref": "#/$defs/user"
+    },
+    "verdict": {
+     "type": "string"
+    },
+    "verdict_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      99
+     ],
+     "type": "integer"
+    },
+    "win_service": {
+     "$ref": "#/$defs/win_win_service"
+    }
+   },
+   "type": "object"
+  },
+  "extension": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "version"
+   ],
+   "type": "object"
+  },
+  "feature": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "file": {
+   "additionalProperties": false,
+   "properties": {
+    "accessed_time": {
+     "type": "integer"
+    },
+    "accessor": {
+     "$ref": "#/$defs/user"
+    },
+    "attributes": {
+     "type": "integer"
+    },
+    "company_name": {
+     "type": "string"
+    },
+    "confidentiality": {
+     "type": "string"
+    },
+    "confidentiality_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "creator": {
+     "$ref": "#/$defs/user"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "download_info": {
+     "$ref": "#/$defs/download_info"
+    },
+    "drive_type": {
+     "type": "string"
+    },
+    "drive_type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      99
+     ],
+     "type": "integer"
+    },
+    "encryption_details": {
+     "$ref": "#/$defs/encryption_details"
+    },
+    "ext": {
+     "type": "string"
+    },
+    "hashes": {
+     "items": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "type": "array"
+    },
+    "imported_symbols": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "internal_name": {
+     "type": "string"
+    },
+    "is_deleted": {
+     "type": "boolean"
+    },
+    "is_encrypted": {
+     "type": "boolean"
+    },
+    "is_readonly": {
+     "type": "boolean"
+    },
+    "is_system": {
+     "type": "boolean"
+    },
+    "mime_type": {
+     "type": "string"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "modifier": {
+     "$ref": "#/$defs/user"
+    },
+    "name": {
+     "type": "string"
+    },
+    "owner": {
+     "$ref": "#/$defs/user"
+    },
+    "parent_folder": {
+     "type": "string"
+    },
+    "path": {
+     "type": "string"
+    },
+    "product": {
+     "$ref": "#/$defs/product"
+    },
+    "security_descriptor": {
+     "type": "string"
+    },
+    "signature": {
+     "$ref": "#/$defs/digital_signature"
+    },
+    "signatures": {
+     "items": {
+      "$ref": "#/$defs/digital_signature"
+     },
+     "type": "array"
+    },
+    "size": {
+     "type": "integer"
+    },
+    "tags": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "uri": {
+     "type": "string"
+    },
+    "url": {
+     "$ref": "#/$defs/url"
+    },
+    "version": {
+     "type": "string"
+    },
+    "volume": {
+     "type": "string"
+    },
+    "xattributes": {
+     "$ref": "#/$defs/object"
+    }
+   },
+   "required": [
+    "name",
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "finding_info": {
+   "additionalProperties": false,
+   "properties": {
+    "analytic": {
+     "$ref": "#/$defs/analytic"
+    },
+    "attack_graph": {
+     "$ref": "#/$defs/graph"
+    },
+    "attacks": {
+     "items": {
+      "$ref": "#/$defs/attack"
+     },
+     "type": "array"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "data_sources": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "first_seen_time": {
+     "type": "integer"
+    },
+    "kill_chain": {
+     "items": {
+      "$ref": "#/$defs/kill_chain_phase"
+     },
+     "type": "array"
+    },
+    "last_seen_time": {
+     "type": "integer"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "product": {
+     "$ref": "#/$defs/product"
+    },
+    "product_uid": {
+     "type": "string"
+    },
+    "related_analytics": {
+     "items": {
+      "$ref": "#/$defs/analytic"
+     },
+     "type": "array"
+    },
+    "related_events": {
+     "items": {
+      "$ref": "#/$defs/related_event"
+     },
+     "type": "array"
+    },
+    "related_events_count": {
+     "type": "integer"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "tags": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "title": {
+     "type": "string"
+    },
+    "traits": {
+     "items": {
+      "$ref": "#/$defs/trait"
+     },
+     "type": "array"
+    },
+    "types": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_alt": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "uid"
+   ],
+   "type": "object"
+  },
+  "fingerprint": {
+   "additionalProperties": false,
+   "properties": {
+    "algorithm": {
+     "type": "string"
+    },
+    "algorithm_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      99
+     ],
+     "type": "integer"
+    },
+    "encoding": {
+     "type": "string"
+    },
+    "encoding_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "serialization": {
+     "type": "string"
+    },
+    "serialization_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      99
+     ],
+     "type": "integer"
+    },
+    "value": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "algorithm_id",
+    "value"
+   ],
+   "type": "object"
+  },
+  "firewall_rule": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "category": {
+     "type": "string"
+    },
+    "condition": {
+     "type": "string"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "duration": {
+     "type": "integer"
+    },
+    "match_details": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "match_location": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "rate_limit": {
+     "type": "integer"
+    },
+    "sensitivity": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "function_invocation": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "error"
+     ]
+    },
+    {
+     "required": [
+      "parameters"
+     ]
+    },
+    {
+     "required": [
+      "return_value"
+     ]
+    }
+   ],
+   "properties": {
+    "error": {
+     "type": "string"
+    },
+    "parameters": {
+     "items": {
+      "$ref": "#/$defs/parameter"
+     },
+     "type": "array"
+    },
+    "return_value": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "gpu_info": {
+   "additionalProperties": false,
+   "properties": {
+    "bus_type": {
+     "type": "string"
+    },
+    "bus_type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      99
+     ],
+     "type": "integer"
+    },
+    "cores": {
+     "type": "integer"
+    },
+    "model": {
+     "type": "string"
+    },
+    "vendor_name": {
+     "type": "string"
+    },
+    "vram_mode": {
+     "type": "string"
+    },
+    "vram_mode_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      99
+     ],
+     "type": "integer"
+    },
+    "vram_size": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "graph": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "desc": {
+     "type": "string"
+    },
+    "edges": {
+     "items": {
+      "$ref": "#/$defs/edge"
+     },
+     "type": "array"
+    },
+    "is_directed": {
+     "type": "boolean"
+    },
+    "name": {
+     "type": "string"
+    },
+    "nodes": {
+     "items": {
+      "$ref": "#/$defs/node"
+     },
+     "type": "array"
+    },
+    "query_language": {
+     "type": "string"
+    },
+    "query_language_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      99
+     ],
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "nodes"
+   ],
+   "type": "object"
+  },
+  "group": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "desc": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "privileges": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "type": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_alt": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "http_header": {
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "value": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "value"
+   ],
+   "type": "object"
+  },
+  "http_request": {
+   "additionalProperties": false,
+   "properties": {
+    "args": {
+     "type": "string"
+    },
+    "body_length": {
+     "type": "integer"
+    },
+    "http_headers": {
+     "items": {
+      "$ref": "#/$defs/http_header"
+     },
+     "type": "array"
+    },
+    "http_method": {
+     "enum": [
+      "ACL",
+      "BASELINE-CONTROL",
+      "BIND",
+      "CHECKIN",
+      "CHECKOUT",
+      "CONNECT",
+      "COPY",
+      "DELETE",
+      "GET",
+      "HEAD",
+      "LABEL",
+      "LINK",
+      "LOCK",
+      "MERGE",
+      "MKACTIVITY",
+      "MKCALENDAR",
+      "MKCOL",
+      "MKREDIRECTREF",
+      "MKWORKSPACE",
+      "MOVE",
+      "OPTIONS",
+      "ORDERPATCH",
+      "PATCH",
+      "POST",
+      "PRI",
+      "PROPFIND",
+      "PROPPATCH",
+      "PUT",
+      "QUERY",
+      "REBIND",
+      "REPORT",
+      "SEARCH",
+      "TRACE",
+      "UNBIND",
+      "UNCHECKOUT",
+      "UNLINK",
+      "UNLOCK",
+      "UPDATE",
+      "UPDATEREDIRECTREF",
+      "VERSION-CONTROL"
+     ],
+     "type": "string"
+    },
+    "length": {
+     "type": "integer"
+    },
+    "referrer": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "url": {
+     "$ref": "#/$defs/url"
+    },
+    "user_agent": {
+     "type": "string"
+    },
+    "version": {
+     "type": "string"
+    },
+    "x_forwarded_for": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    }
+   },
+   "type": "object"
+  },
+  "http_response": {
+   "additionalProperties": false,
+   "properties": {
+    "body_length": {
+     "type": "integer"
+    },
+    "code": {
+     "type": "integer"
+    },
+    "content_type": {
+     "type": "string"
+    },
+    "http_headers": {
+     "items": {
+      "$ref": "#/$defs/http_header"
+     },
+     "type": "array"
+    },
+    "latency": {
+     "type": "integer"
+    },
+    "length": {
+     "type": "integer"
+    },
+    "message": {
+     "type": "string"
+    },
+    "status": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "code"
+   ],
+   "type": "object"
+  },
+  "iam_role": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "account": {
+     "$ref": "#/$defs/account"
+    },
+    "name": {
+     "type": "string"
+    },
+    "policies": {
+     "items": {
+      "$ref": "#/$defs/policy"
+     },
+     "type": "array"
+    },
+    "privileges": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "programmatic_credentials": {
+     "items": {
+      "$ref": "#/$defs/programmatic_credential"
+     },
+     "type": "array"
+    },
+    "resources": {
+     "items": {
+      "$ref": "#/$defs/resource_details"
+     },
+     "type": "array"
+    },
+    "session": {
+     "$ref": "#/$defs/session"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_alt": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "idp": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "auth_factors": {
+     "items": {
+      "$ref": "#/$defs/auth_factor"
+     },
+     "type": "array"
+    },
+    "domain": {
+     "type": "string"
+    },
+    "fingerprint": {
+     "$ref": "#/$defs/fingerprint"
+    },
+    "has_mfa": {
+     "type": "boolean"
+    },
+    "issuer": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "protocol_name": {
+     "type": "string"
+    },
+    "scim": {
+     "$ref": "#/$defs/scim"
+    },
+    "sso": {
+     "$ref": "#/$defs/sso"
+    },
+    "state": {
+     "type": "string"
+    },
+    "state_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "tenant_uid": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "url_string": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "image": {
+   "additionalProperties": false,
+   "properties": {
+    "labels": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "name": {
+     "type": "string"
+    },
+    "path": {
+     "type": "string"
+    },
+    "tag": {
+     "type": "string"
+    },
+    "tags": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "uid"
+   ],
+   "type": "object"
+  },
+  "ja4_fingerprint": {
+   "additionalProperties": false,
+   "properties": {
+    "section_a": {
+     "type": "string"
+    },
+    "section_b": {
+     "type": "string"
+    },
+    "section_c": {
+     "type": "string"
+    },
+    "section_d": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      99
+     ],
+     "type": "integer"
+    },
+    "value": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "type_id",
+    "value"
+   ],
+   "type": "object"
+  },
+  "job": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "type_id"
+     ]
+    }
+   ],
+   "properties": {
+    "cmd_line": {
+     "type": "string"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "file": {
+     "$ref": "#/$defs/file"
+    },
+    "job_actions": {
+     "items": {
+      "$ref": "#/$defs/job_action"
+     },
+     "type": "array"
+    },
+    "job_triggers": {
+     "items": {
+      "$ref": "#/$defs/job_trigger"
+     },
+     "type": "array"
+    },
+    "last_run_time": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "next_run_time": {
+     "type": "integer"
+    },
+    "run_state": {
+     "type": "string"
+    },
+    "run_state_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      99
+     ],
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "user": {
+     "$ref": "#/$defs/user"
+    }
+   },
+   "type": "object"
+  },
+  "job_action": {
+   "additionalProperties": false,
+   "properties": {
+    "cmd_line": {
+     "type": "string"
+    },
+    "com_class_uuid": {
+     "type": "string"
+    },
+    "file": {
+     "$ref": "#/$defs/file"
+    },
+    "properties": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "working_directory": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "job_trigger": {
+   "additionalProperties": false,
+   "properties": {
+    "event_codes": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "last_run_time": {
+     "type": "integer"
+    },
+    "log_sources": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "next_run_time": {
+     "type": "integer"
+    },
+    "properties": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "user": {
+     "$ref": "#/$defs/user"
+    }
+   },
+   "required": [
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "kb_article": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "src_url"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "avg_timespan": {
+     "$ref": "#/$defs/timespan"
+    },
+    "bulletin": {
+     "type": "string"
+    },
+    "classification": {
+     "type": "string"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "install_state": {
+     "type": "string"
+    },
+    "install_state_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "is_superseded": {
+     "type": "boolean"
+    },
+    "os": {
+     "$ref": "#/$defs/os"
+    },
+    "product": {
+     "$ref": "#/$defs/product"
+    },
+    "severity": {
+     "type": "string"
+    },
+    "size": {
+     "type": "integer"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "title": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "key_value_object": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "value"
+     ]
+    },
+    {
+     "required": [
+      "values"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "value": {
+     "type": "string"
+    },
+    "values": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "type": "object"
+  },
+  "keyboard_info": {
+   "additionalProperties": false,
+   "properties": {
+    "function_keys": {
+     "type": "integer"
+    },
+    "ime": {
+     "type": "string"
+    },
+    "keyboard_layout": {
+     "type": "string"
+    },
+    "keyboard_subtype": {
+     "type": "integer"
+    },
+    "keyboard_type": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "kill_chain_phase": {
+   "additionalProperties": false,
+   "properties": {
+    "phase": {
+     "type": "string"
+    },
+    "phase_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      99
+     ],
+     "type": "integer"
+    }
+   },
+   "required": [
+    "phase_id"
+   ],
+   "type": "object"
+  },
+  "ldap_person": {
+   "additionalProperties": false,
+   "properties": {
+    "cost_center": {
+     "type": "string"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "deleted_time": {
+     "type": "integer"
+    },
+    "department": {
+     "type": "string"
+    },
+    "display_name": {
+     "type": "string"
+    },
+    "email_addrs": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "employee_uid": {
+     "type": "string"
+    },
+    "given_name": {
+     "type": "string"
+    },
+    "hire_time": {
+     "type": "integer"
+    },
+    "job_title": {
+     "type": "string"
+    },
+    "labels": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "last_login_time": {
+     "type": "integer"
+    },
+    "ldap_cn": {
+     "type": "string"
+    },
+    "ldap_dn": {
+     "type": "string"
+    },
+    "leave_time": {
+     "type": "integer"
+    },
+    "location": {
+     "$ref": "#/$defs/location"
+    },
+    "manager": {
+     "$ref": "#/$defs/user"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "office_location": {
+     "type": "string"
+    },
+    "phone_number": {
+     "type": "string"
+    },
+    "surname": {
+     "type": "string"
+    },
+    "tags": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    }
+   },
+   "type": "object"
+  },
+  "load_balancer": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "classification": {
+     "type": "string"
+    },
+    "code": {
+     "type": "integer"
+    },
+    "dst_endpoint": {
+     "$ref": "#/$defs/network_endpoint"
+    },
+    "endpoint_connections": {
+     "items": {
+      "$ref": "#/$defs/endpoint_connection"
+     },
+     "type": "array"
+    },
+    "error_message": {
+     "type": "string"
+    },
+    "ip": {
+     "type": "string"
+    },
+    "message": {
+     "type": "string"
+    },
+    "metrics": {
+     "items": {
+      "$ref": "#/$defs/metric"
+     },
+     "type": "array"
+    },
+    "name": {
+     "type": "string"
+    },
+    "status_detail": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "location": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "city"
+     ]
+    },
+    {
+     "required": [
+      "country"
+     ]
+    },
+    {
+     "required": [
+      "postal_code"
+     ]
+    },
+    {
+     "required": [
+      "region"
+     ]
+    }
+   ],
+   "properties": {
+    "aerial_height": {
+     "type": "string"
+    },
+    "city": {
+     "type": "string"
+    },
+    "continent": {
+     "type": "string"
+    },
+    "coordinates": {
+     "items": {
+      "type": "number"
+     },
+     "type": "array"
+    },
+    "country": {
+     "type": "string"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "geodetic_altitude": {
+     "type": "string"
+    },
+    "geodetic_vertical_accuracy": {
+     "type": "string"
+    },
+    "geohash": {
+     "type": "string"
+    },
+    "horizontal_accuracy": {
+     "type": "string"
+    },
+    "is_on_premises": {
+     "type": "boolean"
+    },
+    "isp": {
+     "type": "string"
+    },
+    "lat": {
+     "type": "number"
+    },
+    "long": {
+     "type": "number"
+    },
+    "postal_code": {
+     "type": "string"
+    },
+    "pressure_altitude": {
+     "type": "string"
+    },
+    "provider": {
+     "type": "string"
+    },
+    "region": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "logger": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "device": {
+     "$ref": "#/$defs/device"
+    },
+    "event_uid": {
+     "type": "string"
+    },
+    "is_truncated": {
+     "type": "boolean"
+    },
+    "log_format": {
+     "type": "string"
+    },
+    "log_level": {
+     "type": "string"
+    },
+    "log_name": {
+     "type": "string"
+    },
+    "log_provider": {
+     "type": "string"
+    },
+    "log_version": {
+     "type": "string"
+    },
+    "logged_time": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "product": {
+     "$ref": "#/$defs/product"
+    },
+    "transmit_time": {
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "untruncated_size": {
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "long_string": {
+   "additionalProperties": false,
+   "properties": {
+    "is_truncated": {
+     "type": "boolean"
+    },
+    "untruncated_size": {
+     "type": "integer"
+    },
+    "value": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "value"
+   ],
+   "type": "object"
+  },
+  "malware": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "classification_ids": {
+     "items": {
+      "enum": [
+       0,
+       1,
+       2,
+       3,
+       4,
+       5,
+       6,
+       7,
+       8,
+       9,
+       10,
+       11,
+       13,
+       14,
+       15,
+       16,
+       17,
+       18,
+       19,
+       20,
+       21,
+       22,
+       99
+      ],
+      "type": "integer"
+     },
+     "type": "array"
+    },
+    "classifications": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "cves": {
+     "items": {
+      "$ref": "#/$defs/cve"
+     },
+     "type": "array"
+    },
+    "files": {
+     "items": {
+      "$ref": "#/$defs/file"
+     },
+     "type": "array"
+    },
+    "name": {
+     "type": "string"
+    },
+    "num_infected": {
+     "type": "integer"
+    },
+    "path": {
+     "type": "string"
+    },
+    "provider": {
+     "type": "string"
+    },
+    "severity": {
+     "type": "string"
+    },
+    "severity_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "classification_ids"
+   ],
+   "type": "object"
+  },
+  "malware_scan_info": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "end_time": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "num_files": {
+     "type": "integer"
+    },
+    "num_infected": {
+     "type": "integer"
+    },
+    "num_volumes": {
+     "type": "integer"
+    },
+    "size": {
+     "type": "integer"
+    },
+    "start_time": {
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "unique_malware_count": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "message_context": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "application"
+     ]
+    },
+    {
+     "required": [
+      "service"
+     ]
+    }
+   ],
+   "properties": {
+    "ai_role": {
+     "type": "string"
+    },
+    "ai_role_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "application": {
+     "$ref": "#/$defs/application"
+    },
+    "completion_tokens": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "prompt_text": {
+     "type": "string"
+    },
+    "prompt_tokens": {
+     "type": "integer"
+    },
+    "response_text": {
+     "type": "string"
+    },
+    "service": {
+     "$ref": "#/$defs/service"
+    },
+    "total_tokens": {
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "metadata": {
+   "additionalProperties": false,
+   "properties": {
+    "correlation_uid": {
+     "type": "string"
+    },
+    "debug": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "event_code": {
+     "type": "string"
+    },
+    "extension": {
+     "$ref": "#/$defs/extension"
+    },
+    "extensions": {
+     "items": {
+      "$ref": "#/$defs/extension"
+     },
+     "type": "array"
+    },
+    "is_truncated": {
+     "type": "boolean"
+    },
+    "labels": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "log_format": {
+     "type": "string"
+    },
+    "log_level": {
+     "type": "string"
+    },
+    "log_name": {
+     "type": "string"
+    },
+    "log_provider": {
+     "type": "string"
+    },
+    "log_source": {
+     "type": "string"
+    },
+    "log_version": {
+     "type": "string"
+    },
+    "logged_time": {
+     "type": "integer"
+    },
+    "loggers": {
+     "items": {
+      "$ref": "#/$defs/logger"
+     },
+     "type": "array"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "original_event_uid": {
+     "type": "string"
+    },
+    "original_time": {
+     "type": "string"
+    },
+    "processed_time": {
+     "type": "integer"
+    },
+    "product": {
+     "$ref": "#/$defs/product"
+    },
+    "profiles": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "reporter": {
+     "$ref": "#/$defs/reporter"
+    },
+    "sequence": {
+     "type": "integer"
+    },
+    "source": {
+     "type": "string"
+    },
+    "tags": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "tenant_uid": {
+     "type": "string"
+    },
+    "total_queued_duration": {
+     "$ref": "#/$defs/timespan"
+    },
+    "transformation_info_list": {
+     "items": {
+      "$ref": "#/$defs/transformation_info"
+     },
+     "type": "array"
+    },
+    "transmit_time": {
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "untruncated_size": {
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "product",
+    "version"
+   ],
+   "type": "object"
+  },
+  "metric": {
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "value": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "value"
+   ],
+   "type": "object"
+  },
+  "mitigation": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "countermeasures": {
+     "items": {
+      "$ref": "#/$defs/d3fend"
+     },
+     "type": "array"
+    },
+    "name": {
+     "type": "string"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "module": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "function_name"
+     ]
+    },
+    {
+     "required": [
+      "load_type_id"
+     ]
+    }
+   ],
+   "properties": {
+    "base_address": {
+     "type": "string"
+    },
+    "file": {
+     "$ref": "#/$defs/file"
+    },
+    "function_invocation": {
+     "$ref": "#/$defs/function_invocation"
+    },
+    "function_name": {
+     "type": "string"
+    },
+    "load_type": {
+     "type": "string"
+    },
+    "load_type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      99
+     ],
+     "type": "integer"
+    },
+    "start_address": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "network_connection_info": {
+   "additionalProperties": false,
+   "properties": {
+    "boundary": {
+     "type": "string"
+    },
+    "boundary_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      99
+     ],
+     "type": "integer"
+    },
+    "community_uid": {
+     "type": "string"
+    },
+    "direction": {
+     "type": "string"
+    },
+    "direction_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "flag_history": {
+     "type": "string"
+    },
+    "protocol_name": {
+     "type": "string"
+    },
+    "protocol_num": {
+     "type": "integer"
+    },
+    "protocol_ver": {
+     "type": "string"
+    },
+    "protocol_ver_id": {
+     "enum": [
+      0,
+      4,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "session": {
+     "$ref": "#/$defs/session"
+    },
+    "tcp_flags": {
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "direction_id"
+   ],
+   "type": "object"
+  },
+  "network_endpoint": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "domain"
+     ]
+    },
+    {
+     "required": [
+      "hostname"
+     ]
+    },
+    {
+     "required": [
+      "instance_uid"
+     ]
+    },
+    {
+     "required": [
+      "interface_name"
+     ]
+    },
+    {
+     "required": [
+      "interface_uid"
+     ]
+    },
+    {
+     "required": [
+      "ip"
+     ]
+    },
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "svc_name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "agent_list": {
+     "items": {
+      "$ref": "#/$defs/agent"
+     },
+     "type": "array"
+    },
+    "autonomous_system": {
+     "$ref": "#/$defs/autonomous_system"
+    },
+    "domain": {
+     "type": "string"
+    },
+    "fingerprints": {
+     "items": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "type": "array"
+    },
+    "hostname": {
+     "type": "string"
+    },
+    "hw_info": {
+     "$ref": "#/$defs/device_hw_info"
+    },
+    "instance_uid": {
+     "type": "string"
+    },
+    "interface_name": {
+     "type": "string"
+    },
+    "interface_uid": {
+     "type": "string"
+    },
+    "intermediate_ips": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "ip": {
+     "type": "string"
+    },
+    "isp": {
+     "type": "string"
+    },
+    "isp_org": {
+     "type": "string"
+    },
+    "location": {
+     "$ref": "#/$defs/location"
+    },
+    "mac": {
+     "type": "string"
+    },
+    "mac_vendor": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "network_scope": {
+     "type": "string"
+    },
+    "network_scope_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      99
+     ],
+     "type": "integer"
+    },
+    "os": {
+     "$ref": "#/$defs/os"
+    },
+    "owner": {
+     "$ref": "#/$defs/user"
+    },
+    "pool": {
+     "$ref": "#/$defs/group"
+    },
+    "port": {
+     "type": "integer"
+    },
+    "proxy_endpoint": {
+     "$ref": "#/$defs/network_proxy"
+    },
+    "subnet_uid": {
+     "type": "string"
+    },
+    "svc_name": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "vlan_uid": {
+     "type": "string"
+    },
+    "vpc_uid": {
+     "type": "string"
+    },
+    "zone": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "network_interface": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "hostname"
+     ]
+    },
+    {
+     "required": [
+      "ip"
+     ]
+    },
+    {
+     "required": [
+      "mac"
+     ]
+    },
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "hostname": {
+     "type": "string"
+    },
+    "ip": {
+     "type": "string"
+    },
+    "mac": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "namespace": {
+     "type": "string"
+    },
+    "open_ports": {
+     "items": {
+      "$ref": "#/$defs/port_info"
+     },
+     "type": "array"
+    },
+    "subnet_prefix": {
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "network_proxy": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "domain"
+     ]
+    },
+    {
+     "required": [
+      "hostname"
+     ]
+    },
+    {
+     "required": [
+      "instance_uid"
+     ]
+    },
+    {
+     "required": [
+      "interface_name"
+     ]
+    },
+    {
+     "required": [
+      "interface_uid"
+     ]
+    },
+    {
+     "required": [
+      "ip"
+     ]
+    },
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "svc_name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "agent_list": {
+     "items": {
+      "$ref": "#/$defs/agent"
+     },
+     "type": "array"
+    },
+    "autonomous_system": {
+     "$ref": "#/$defs/autonomous_system"
+    },
+    "domain": {
+     "type": "string"
+    },
+    "fingerprints": {
+     "items": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "type": "array"
+    },
+    "hostname": {
+     "type": "string"
+    },
+    "hw_info": {
+     "$ref": "#/$defs/device_hw_info"
+    },
+    "instance_uid": {
+     "type": "string"
+    },
+    "interface_name": {
+     "type": "string"
+    },
+    "interface_uid": {
+     "type": "string"
+    },
+    "intermediate_ips": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "ip": {
+     "type": "string"
+    },
+    "isp": {
+     "type": "string"
+    },
+    "isp_org": {
+     "type": "string"
+    },
+    "location": {
+     "$ref": "#/$defs/location"
+    },
+    "mac": {
+     "type": "string"
+    },
+    "mac_vendor": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "network_scope": {
+     "type": "string"
+    },
+    "network_scope_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      99
+     ],
+     "type": "integer"
+    },
+    "os": {
+     "$ref": "#/$defs/os"
+    },
+    "owner": {
+     "$ref": "#/$defs/user"
+    },
+    "pool": {
+     "$ref": "#/$defs/group"
+    },
+    "port": {
+     "type": "integer"
+    },
+    "proxy_endpoint": {
+     "$ref": "#/$defs/network_proxy"
+    },
+    "subnet_uid": {
+     "type": "string"
+    },
+    "svc_name": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "vlan_uid": {
+     "type": "string"
+    },
+    "vpc_uid": {
+     "type": "string"
+    },
+    "zone": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "network_traffic": {
+   "additionalProperties": false,
+   "properties": {
+    "bytes": {
+     "type": "integer"
+    },
+    "bytes_in": {
+     "type": "integer"
+    },
+    "bytes_missed": {
+     "type": "integer"
+    },
+    "bytes_out": {
+     "type": "integer"
+    },
+    "chunks": {
+     "type": "integer"
+    },
+    "chunks_in": {
+     "type": "integer"
+    },
+    "chunks_out": {
+     "type": "integer"
+    },
+    "end_time": {
+     "type": "integer"
+    },
+    "packets": {
+     "type": "integer"
+    },
+    "packets_in": {
+     "type": "integer"
+    },
+    "packets_out": {
+     "type": "integer"
+    },
+    "start_time": {
+     "type": "integer"
+    },
+    "timespan": {
+     "$ref": "#/$defs/timespan"
+    }
+   },
+   "type": "object"
+  },
+  "node": {
+   "additionalProperties": false,
+   "properties": {
+    "data": {},
+    "desc": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "uid"
+   ],
+   "type": "object"
+  },
+  "note": {
+   "additionalProperties": false,
+   "properties": {
+    "comment": {
+     "type": "string"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "owner": {
+     "$ref": "#/$defs/user"
+    },
+    "title": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "comment"
+   ],
+   "type": "object"
+  },
+  "object": {
+   "additionalProperties": true,
+   "properties": {},
+   "type": "object"
+  },
+  "observable": {
+   "additionalProperties": false,
+   "properties": {
+    "event_uid": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "reputation": {
+     "$ref": "#/$defs/reputation"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      99
+     ],
+     "type": "integer"
+    },
+    "type_uid": {
+     "type": "integer"
+    },
+    "value": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "observation": {
+   "additionalProperties": false,
+   "properties": {
+    "count": {
+     "type": "integer"
+    },
+    "timespan": {
+     "$ref": "#/$defs/timespan"
+    },
+    "value": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "value"
+   ],
+   "type": "object"
+  },
+  "occurrence_details": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "cell_name"
+     ]
+    },
+    {
+     "required": [
+      "column_name"
+     ]
+    },
+    {
+     "required": [
+      "column_number"
+     ]
+    },
+    {
+     "required": [
+      "end_line"
+     ]
+    },
+    {
+     "required": [
+      "json_path"
+     ]
+    },
+    {
+     "required": [
+      "page_number"
+     ]
+    },
+    {
+     "required": [
+      "record_index_in_array"
+     ]
+    },
+    {
+     "required": [
+      "row_number"
+     ]
+    },
+    {
+     "required": [
+      "start_line"
+     ]
+    }
+   ],
+   "properties": {
+    "cell_name": {
+     "type": "string"
+    },
+    "column_name": {
+     "type": "string"
+    },
+    "column_number": {
+     "type": "integer"
+    },
+    "end_line": {
+     "type": "integer"
+    },
+    "json_path": {
+     "type": "string"
+    },
+    "page_number": {
+     "type": "integer"
+    },
+    "record_index_in_array": {
+     "type": "integer"
+    },
+    "row_number": {
+     "type": "integer"
+    },
+    "start_line": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "organization": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "ou_name": {
+     "type": "string"
+    },
+    "ou_uid": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "os": {
+   "additionalProperties": false,
+   "properties": {
+    "build": {
+     "type": "string"
+    },
+    "country": {
+     "type": "string"
+    },
+    "cpe_name": {
+     "type": "string"
+    },
+    "cpu_bits": {
+     "type": "integer"
+    },
+    "edition": {
+     "type": "string"
+    },
+    "kernel_release": {
+     "type": "string"
+    },
+    "lang": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "sp_name": {
+     "type": "string"
+    },
+    "sp_ver": {
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      99,
+      100,
+      101,
+      200,
+      201,
+      300,
+      301,
+      302,
+      400,
+      401,
+      402
+     ],
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "osint": {
+   "additionalProperties": false,
+   "properties": {
+    "answers": {
+     "items": {
+      "$ref": "#/$defs/dns_answer"
+     },
+     "type": "array"
+    },
+    "attacks": {
+     "items": {
+      "$ref": "#/$defs/attack"
+     },
+     "type": "array"
+    },
+    "autonomous_system": {
+     "$ref": "#/$defs/autonomous_system"
+    },
+    "campaign": {
+     "$ref": "#/$defs/campaign"
+    },
+    "category": {
+     "type": "string"
+    },
+    "comment": {
+     "type": "string"
+    },
+    "confidence": {
+     "type": "string"
+    },
+    "confidence_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "creator": {
+     "$ref": "#/$defs/user"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "detection_pattern": {
+     "type": "string"
+    },
+    "detection_pattern_type": {
+     "type": "string"
+    },
+    "detection_pattern_type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "email": {
+     "$ref": "#/$defs/email"
+    },
+    "email_auth": {
+     "$ref": "#/$defs/email_auth"
+    },
+    "expiration_time": {
+     "type": "integer"
+    },
+    "external_uid": {
+     "type": "string"
+    },
+    "file": {
+     "$ref": "#/$defs/file"
+    },
+    "intrusion_sets": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "kill_chain": {
+     "items": {
+      "$ref": "#/$defs/kill_chain_phase"
+     },
+     "type": "array"
+    },
+    "labels": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "location": {
+     "$ref": "#/$defs/location"
+    },
+    "malware": {
+     "items": {
+      "$ref": "#/$defs/malware"
+     },
+     "type": "array"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "references": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "related_analytics": {
+     "items": {
+      "$ref": "#/$defs/analytic"
+     },
+     "type": "array"
+    },
+    "reputation": {
+     "$ref": "#/$defs/reputation"
+    },
+    "risk_score": {
+     "type": "integer"
+    },
+    "script": {
+     "$ref": "#/$defs/script"
+    },
+    "severity": {
+     "type": "string"
+    },
+    "severity_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "signatures": {
+     "items": {
+      "$ref": "#/$defs/digital_signature"
+     },
+     "type": "array"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "subdomains": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "subnet": {
+     "type": "string"
+    },
+    "threat_actor": {
+     "$ref": "#/$defs/threat_actor"
+    },
+    "tlp": {
+     "enum": [
+      "AMBER",
+      "AMBER STRICT",
+      "CLEAR",
+      "GREEN",
+      "RED",
+      "WHITE"
+     ],
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uploaded_time": {
+     "type": "integer"
+    },
+    "value": {
+     "type": "string"
+    },
+    "vendor_name": {
+     "type": "string"
+    },
+    "vulnerabilities": {
+     "items": {
+      "$ref": "#/$defs/vulnerability"
+     },
+     "type": "array"
+    },
+    "whois": {
+     "$ref": "#/$defs/whois"
+    }
+   },
+   "required": [
+    "type_id",
+    "value"
+   ],
+   "type": "object"
+  },
+  "package": {
+   "additionalProperties": false,
+   "properties": {
+    "architecture": {
+     "type": "string"
+    },
+    "cpe_name": {
+     "type": "string"
+    },
+    "epoch": {
+     "type": "integer"
+    },
+    "hash": {
+     "$ref": "#/$defs/fingerprint"
+    },
+    "license": {
+     "type": "string"
+    },
+    "license_url": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "package_manager": {
+     "type": "string"
+    },
+    "package_manager_url": {
+     "type": "string"
+    },
+    "purl": {
+     "type": "string"
+    },
+    "release": {
+     "type": "string"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "vendor_name": {
+     "type": "string"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "version"
+   ],
+   "type": "object"
+  },
+  "packet": {
+   "additionalProperties": false,
+   "properties": {
+    "encoding": {
+     "type": "string"
+    },
+    "encoding_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "end_offset": {
+     "type": "integer"
+    },
+    "format": {
+     "type": "string"
+    },
+    "format_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "sequence_number": {
+     "type": "integer"
+    },
+    "source": {
+     "type": "string"
+    },
+    "source_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      99
+     ],
+     "type": "integer"
+    },
+    "start_offset": {
+     "type": "integer"
+    },
+    "value": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "value"
+   ],
+   "type": "object"
+  },
+  "parameter": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "post_value"
+     ]
+    },
+    {
+     "required": [
+      "pre_value"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "post_value": {
+     "type": "string"
+    },
+    "pre_value": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "peripheral_device": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "class": {
+     "type": "string"
+    },
+    "model": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "serial_number": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "vendor_id_list": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "vendor_name": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "policy": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "type"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "data": {},
+    "desc": {
+     "type": "string"
+    },
+    "group": {
+     "$ref": "#/$defs/group"
+    },
+    "is_applied": {
+     "type": "boolean"
+    },
+    "name": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "port_info": {
+   "additionalProperties": false,
+   "properties": {
+    "port": {
+     "type": "integer"
+    },
+    "protocol_name": {
+     "type": "string"
+    },
+    "protocol_num": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "port"
+   ],
+   "type": "object"
+  },
+  "prev_event": {
+   "additionalProperties": false,
+   "properties": {
+    "fingerprint": {
+     "$ref": "#/$defs/fingerprint"
+    },
+    "type_uid": {
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "uid"
+   ],
+   "type": "object"
+  },
+  "process": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "cpid"
+     ]
+    },
+    {
+     "required": [
+      "pid"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "ancestry": {
+     "items": {
+      "$ref": "#/$defs/process_entity"
+     },
+     "type": "array"
+    },
+    "cmd_line": {
+     "type": "string"
+    },
+    "cpid": {
+     "type": "string"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "environment_variables": {
+     "items": {
+      "$ref": "#/$defs/environment_variable"
+     },
+     "type": "array"
+    },
+    "file": {
+     "$ref": "#/$defs/file"
+    },
+    "hosted_services": {
+     "items": {
+      "$ref": "#/$defs/win_win_service"
+     },
+     "type": "array"
+    },
+    "integrity": {
+     "type": "string"
+    },
+    "integrity_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "lineage": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "loaded_modules": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "name": {
+     "type": "string"
+    },
+    "parent_process": {
+     "$ref": "#/$defs/process"
+    },
+    "path": {
+     "type": "string"
+    },
+    "pid": {
+     "type": "integer"
+    },
+    "ptid": {
+     "type": "integer"
+    },
+    "sandbox": {
+     "type": "string"
+    },
+    "session": {
+     "$ref": "#/$defs/session"
+    },
+    "terminated_time": {
+     "type": "integer"
+    },
+    "tid": {
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "user": {
+     "$ref": "#/$defs/user"
+    },
+    "working_directory": {
+     "type": "string"
+    },
+    "xattributes": {
+     "$ref": "#/$defs/object"
+    }
+   },
+   "type": "object"
+  },
+  "process_entity": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "cmd_line"
+     ]
+    },
+    {
+     "required": [
+      "cpid"
+     ]
+    },
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "path"
+     ]
+    },
+    {
+     "required": [
+      "pid"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "cmd_line": {
+     "type": "string"
+    },
+    "cpid": {
+     "type": "string"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "path": {
+     "type": "string"
+    },
+    "pid": {
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "product": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "cpe_name": {
+     "type": "string"
+    },
+    "feature": {
+     "$ref": "#/$defs/feature"
+    },
+    "lang": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "path": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "url_string": {
+     "type": "string"
+    },
+    "vendor_name": {
+     "type": "string"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "programmatic_credential": {
+   "additionalProperties": false,
+   "properties": {
+    "last_used_time": {
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "uid"
+   ],
+   "type": "object"
+  },
+  "related_event": {
+   "additionalProperties": false,
+   "properties": {
+    "attacks": {
+     "items": {
+      "$ref": "#/$defs/attack"
+     },
+     "type": "array"
+    },
+    "count": {
+     "type": "integer"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "first_seen_time": {
+     "type": "integer"
+    },
+    "kill_chain": {
+     "items": {
+      "$ref": "#/$defs/kill_chain_phase"
+     },
+     "type": "array"
+    },
+    "last_seen_time": {
+     "type": "integer"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "observables": {
+     "items": {
+      "$ref": "#/$defs/observable"
+     },
+     "type": "array"
+    },
+    "product": {
+     "$ref": "#/$defs/product"
+    },
+    "product_uid": {
+     "type": "string"
+    },
+    "severity": {
+     "type": "string"
+    },
+    "severity_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    },
+    "status": {
+     "type": "string"
+    },
+    "tags": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "title": {
+     "type": "string"
+    },
+    "traits": {
+     "items": {
+      "$ref": "#/$defs/trait"
+     },
+     "type": "array"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_name": {
+     "type": "string"
+    },
+    "type_uid": {
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "uid"
+   ],
+   "type": "object"
+  },
+  "remediation": {
+   "additionalProperties": false,
+   "properties": {
+    "cis_controls": {
+     "items": {
+      "$ref": "#/$defs/cis_control"
+     },
+     "type": "array"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "kb_article_list": {
+     "items": {
+      "$ref": "#/$defs/kb_article"
+     },
+     "type": "array"
+    },
+    "kb_articles": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "references": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    }
+   },
+   "required": [
+    "desc"
+   ],
+   "type": "object"
+  },
+  "reporter": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "hostname"
+     ]
+    },
+    {
+     "required": [
+      "ip"
+     ]
+    },
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "hostname": {
+     "type": "string"
+    },
+    "ip": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "org": {
+     "$ref": "#/$defs/organization"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "reputation": {
+   "additionalProperties": false,
+   "properties": {
+    "base_score": {
+     "type": "number"
+    },
+    "provider": {
+     "type": "string"
+    },
+    "score": {
+     "type": "string"
+    },
+    "score_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      99
+     ],
+     "type": "integer"
+    }
+   },
+   "required": [
+    "base_score",
+    "score_id"
+   ],
+   "type": "object"
+  },
+  "request": {
+   "additionalProperties": false,
+   "properties": {
+    "containers": {
+     "items": {
+      "$ref": "#/$defs/container"
+     },
+     "type": "array"
+    },
+    "data": {},
+    "flags": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "uid"
+   ],
+   "type": "object"
+  },
+  "resource_details": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "agent_list": {
+     "items": {
+      "$ref": "#/$defs/agent"
+     },
+     "type": "array"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "criticality": {
+     "type": "string"
+    },
+    "criticality_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "data": {},
+    "device": {
+     "$ref": "#/$defs/device"
+    },
+    "group": {
+     "$ref": "#/$defs/group"
+    },
+    "hostname": {
+     "type": "string"
+    },
+    "ip": {
+     "type": "string"
+    },
+    "is_backed_up": {
+     "type": "boolean"
+    },
+    "labels": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "namespace": {
+     "type": "string"
+    },
+    "owner": {
+     "$ref": "#/$defs/user"
+    },
+    "resource_relationship": {
+     "$ref": "#/$defs/graph"
+    },
+    "role": {
+     "type": "string"
+    },
+    "role_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "tags": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "type": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_alt": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "user": {
+     "$ref": "#/$defs/user"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "response": {
+   "additionalProperties": false,
+   "properties": {
+    "code": {
+     "type": "integer"
+    },
+    "containers": {
+     "items": {
+      "$ref": "#/$defs/container"
+     },
+     "type": "array"
+    },
+    "data": {},
+    "error": {
+     "type": "string"
+    },
+    "error_message": {
+     "type": "string"
+    },
+    "flags": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "message": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "rule": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "category": {
+     "type": "string"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "san": {
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "type"
+   ],
+   "type": "object"
+  },
+  "sbom": {
+   "additionalProperties": false,
+   "properties": {
+    "created_time": {
+     "type": "integer"
+    },
+    "package": {
+     "$ref": "#/$defs/package"
+    },
+    "product": {
+     "$ref": "#/$defs/product"
+    },
+    "software_components": {
+     "items": {
+      "$ref": "#/$defs/software_component"
+     },
+     "type": "array"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "package",
+    "software_components"
+   ],
+   "type": "object"
+  },
+  "scan": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "scim": {
+   "additionalProperties": false,
+   "properties": {
+    "auth_protocol": {
+     "type": "string"
+    },
+    "auth_protocol_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      99
+     ],
+     "type": "integer"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "error_message": {
+     "type": "string"
+    },
+    "is_group_provisioning_enabled": {
+     "type": "boolean"
+    },
+    "is_user_provisioning_enabled": {
+     "type": "boolean"
+    },
+    "last_run_time": {
+     "type": "integer"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "protocol_name": {
+     "type": "string"
+    },
+    "rate_limit": {
+     "type": "integer"
+    },
+    "scim_group_schema": {},
+    "scim_user_schema": {},
+    "state": {
+     "type": "string"
+    },
+    "state_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_alt": {
+     "type": "string"
+    },
+    "url_string": {
+     "type": "string"
+    },
+    "vendor_name": {
+     "type": "string"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "script": {
+   "additionalProperties": false,
+   "properties": {
+    "file": {
+     "$ref": "#/$defs/file"
+    },
+    "hashes": {
+     "items": {
+      "$ref": "#/$defs/fingerprint"
+     },
+     "type": "array"
+    },
+    "name": {
+     "type": "string"
+    },
+    "parent_uid": {
+     "type": "string"
+    },
+    "script_content": {
+     "$ref": "#/$defs/long_string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "script_content",
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "sensor_info": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "sensor_layer": {
+     "type": "string"
+    },
+    "sensor_layer_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "sensor_layer_id"
+   ],
+   "type": "object"
+  },
+  "service": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "labels": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "name": {
+     "type": "string"
+    },
+    "tags": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "session": {
+   "additionalProperties": false,
+   "properties": {
+    "count": {
+     "type": "integer"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "credential_uid": {
+     "type": "string"
+    },
+    "expiration_reason": {
+     "type": "string"
+    },
+    "expiration_time": {
+     "type": "integer"
+    },
+    "is_mfa": {
+     "type": "boolean"
+    },
+    "is_remote": {
+     "type": "boolean"
+    },
+    "is_vpn": {
+     "type": "boolean"
+    },
+    "issuer": {
+     "type": "string"
+    },
+    "terminal": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_alt": {
+     "type": "string"
+    },
+    "uuid": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "software_component": {
+   "additionalProperties": false,
+   "properties": {
+    "author": {
+     "type": "string"
+    },
+    "hash": {
+     "$ref": "#/$defs/fingerprint"
+    },
+    "license": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "purl": {
+     "type": "string"
+    },
+    "related_component": {
+     "type": "string"
+    },
+    "relationship": {
+     "type": "string"
+    },
+    "relationship_id": {
+     "enum": [
+      0,
+      1,
+      99
+     ],
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "version"
+   ],
+   "type": "object"
+  },
+  "sso": {
+   "additionalProperties": false,
+   "properties": {
+    "auth_protocol": {
+     "type": "string"
+    },
+    "auth_protocol_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      99
+     ],
+     "type": "integer"
+    },
+    "certificate": {
+     "$ref": "#/$defs/certificate"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "duration_mins": {
+     "type": "integer"
+    },
+    "idle_timeout": {
+     "type": "integer"
+    },
+    "login_endpoint": {
+     "type": "string"
+    },
+    "logout_endpoint": {
+     "type": "string"
+    },
+    "metadata_endpoint": {
+     "type": "string"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "protocol_name": {
+     "type": "string"
+    },
+    "scopes": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "vendor_name": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "sub_technique": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "tactic": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "technique": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "src_url": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "threat_actor": {
+   "additionalProperties": false,
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "type": "object"
+  },
+  "ticket": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "src_url"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "src_url": {
+     "type": "string"
+    },
+    "status": {
+     "type": "string"
+    },
+    "status_details": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "status_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      99
+     ],
+     "type": "integer"
+    },
+    "title": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "timespan": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "duration"
+     ]
+    },
+    {
+     "required": [
+      "duration_days"
+     ]
+    },
+    {
+     "required": [
+      "duration_hours"
+     ]
+    },
+    {
+     "required": [
+      "duration_mins"
+     ]
+    },
+    {
+     "required": [
+      "duration_months"
+     ]
+    },
+    {
+     "required": [
+      "duration_secs"
+     ]
+    },
+    {
+     "required": [
+      "duration_weeks"
+     ]
+    },
+    {
+     "required": [
+      "duration_years"
+     ]
+    },
+    {
+     "required": [
+      "end_time"
+     ]
+    },
+    {
+     "required": [
+      "start_time"
+     ]
+    }
+   ],
+   "properties": {
+    "duration": {
+     "type": "integer"
+    },
+    "duration_days": {
+     "type": "integer"
+    },
+    "duration_hours": {
+     "type": "integer"
+    },
+    "duration_mins": {
+     "type": "integer"
+    },
+    "duration_months": {
+     "type": "integer"
+    },
+    "duration_secs": {
+     "type": "integer"
+    },
+    "duration_weeks": {
+     "type": "integer"
+    },
+    "duration_years": {
+     "type": "integer"
+    },
+    "end_time": {
+     "type": "integer"
+    },
+    "start_time": {
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      99
+     ],
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "tls": {
+   "additionalProperties": false,
+   "properties": {
+    "alert": {
+     "type": "integer"
+    },
+    "certificate": {
+     "$ref": "#/$defs/certificate"
+    },
+    "certificate_chain": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "cipher": {
+     "type": "string"
+    },
+    "client_ciphers": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "extension_list": {
+     "items": {
+      "$ref": "#/$defs/tls_extension"
+     },
+     "type": "array"
+    },
+    "handshake_dur": {
+     "type": "integer"
+    },
+    "ja3_hash": {
+     "$ref": "#/$defs/fingerprint"
+    },
+    "ja3s_hash": {
+     "$ref": "#/$defs/fingerprint"
+    },
+    "key_length": {
+     "type": "integer"
+    },
+    "sans": {
+     "items": {
+      "$ref": "#/$defs/san"
+     },
+     "type": "array"
+    },
+    "server_ciphers": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "sni": {
+     "type": "string"
+    },
+    "tls_extension_list": {
+     "items": {
+      "$ref": "#/$defs/tls_extension"
+     },
+     "type": "array"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "version"
+   ],
+   "type": "object"
+  },
+  "tls_extension": {
+   "additionalProperties": false,
+   "properties": {
+    "data": {},
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      5,
+      10,
+      13,
+      14,
+      15,
+      16,
+      18,
+      19,
+      20,
+      21,
+      41,
+      42,
+      43,
+      44,
+      45,
+      47,
+      48,
+      49,
+      50,
+      51,
+      99
+     ],
+     "type": "integer"
+    }
+   },
+   "required": [
+    "type_id"
+   ],
+   "type": "object"
+  },
+  "token": {
+   "additionalProperties": false,
+   "properties": {
+    "created_time": {
+     "type": "integer"
+    },
+    "expiration_time": {
+     "type": "integer"
+    },
+    "is_renewable": {
+     "type": "boolean"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "tenant_uid": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "zone": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "trait": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "category": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "values": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    }
+   },
+   "type": "object"
+  },
+  "transformation_info": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "lang": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "product": {
+     "$ref": "#/$defs/product"
+    },
+    "time": {
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "url_string": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "url": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "path"
+     ]
+    },
+    {
+     "required": [
+      "url_string"
+     ]
+    }
+   ],
+   "properties": {
+    "categories": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "category_ids": {
+     "items": {
+      "enum": [
+       0,
+       1,
+       3,
+       4,
+       5,
+       6,
+       7,
+       9,
+       11,
+       14,
+       15,
+       16,
+       17,
+       18,
+       20,
+       21,
+       22,
+       23,
+       24,
+       25,
+       26,
+       27,
+       29,
+       30,
+       31,
+       32,
+       33,
+       34,
+       35,
+       36,
+       37,
+       38,
+       40,
+       43,
+       44,
+       45,
+       46,
+       47,
+       49,
+       50,
+       51,
+       52,
+       53,
+       54,
+       55,
+       56,
+       57,
+       58,
+       59,
+       60,
+       61,
+       63,
+       64,
+       65,
+       66,
+       67,
+       68,
+       71,
+       83,
+       84,
+       85,
+       86,
+       87,
+       88,
+       89,
+       90,
+       92,
+       93,
+       95,
+       96,
+       97,
+       98,
+       99,
+       101,
+       102,
+       103,
+       106,
+       107,
+       108,
+       109,
+       110,
+       111,
+       112,
+       113,
+       114,
+       118,
+       121
+      ],
+      "type": "integer"
+     },
+     "type": "array"
+    },
+    "domain": {
+     "type": "string"
+    },
+    "hostname": {
+     "type": "string"
+    },
+    "path": {
+     "type": "string"
+    },
+    "port": {
+     "type": "integer"
+    },
+    "query_string": {
+     "type": "string"
+    },
+    "resource_type": {
+     "type": "string"
+    },
+    "scheme": {
+     "type": "string"
+    },
+    "subdomain": {
+     "type": "string"
+    },
+    "url_string": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "user": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "account"
+     ]
+    },
+    {
+     "required": [
+      "name"
+     ]
+    },
+    {
+     "required": [
+      "uid"
+     ]
+    }
+   ],
+   "properties": {
+    "account": {
+     "$ref": "#/$defs/account"
+    },
+    "credential_uid": {
+     "type": "string"
+    },
+    "display_name": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "string"
+    },
+    "email_addr": {
+     "type": "string"
+    },
+    "forward_addr": {
+     "type": "string"
+    },
+    "full_name": {
+     "type": "string"
+    },
+    "groups": {
+     "items": {
+      "$ref": "#/$defs/group"
+     },
+     "type": "array"
+    },
+    "has_mfa": {
+     "type": "boolean"
+    },
+    "ldap_person": {
+     "$ref": "#/$defs/ldap_person"
+    },
+    "name": {
+     "type": "string"
+    },
+    "org": {
+     "$ref": "#/$defs/organization"
+    },
+    "phone_number": {
+     "type": "string"
+    },
+    "programmatic_credentials": {
+     "items": {
+      "$ref": "#/$defs/programmatic_credential"
+     },
+     "type": "array"
+    },
+    "risk_level": {
+     "type": "string"
+    },
+    "risk_level_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "risk_score": {
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_alt": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "vendor_attributes": {
+   "additionalProperties": false,
+   "properties": {
+    "severity": {
+     "type": "string"
+    },
+    "severity_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      99
+     ],
+     "type": "integer"
+    }
+   },
+   "type": "object"
+  },
+  "vulnerability": {
+   "additionalProperties": false,
+   "oneOf": [
+    {
+     "not": {
+      "required": [
+       "cve",
+       "cwe"
+      ]
+     },
+     "required": [
+      "advisory"
+     ]
+    },
+    {
+     "not": {
+      "required": [
+       "advisory",
+       "cwe"
+      ]
+     },
+     "required": [
+      "cve"
+     ]
+    },
+    {
+     "not": {
+      "required": [
+       "advisory",
+       "cve"
+      ]
+     },
+     "required": [
+      "cwe"
+     ]
+    }
+   ],
+   "properties": {
+    "advisory": {
+     "$ref": "#/$defs/advisory"
+    },
+    "affected_code": {
+     "items": {
+      "$ref": "#/$defs/affected_code"
+     },
+     "type": "array"
+    },
+    "affected_packages": {
+     "items": {
+      "$ref": "#/$defs/affected_package"
+     },
+     "type": "array"
+    },
+    "category": {
+     "type": "string"
+    },
+    "cve": {
+     "$ref": "#/$defs/cve"
+    },
+    "cwe": {
+     "$ref": "#/$defs/cwe"
+    },
+    "dependency_chain": {
+     "type": "string"
+    },
+    "desc": {
+     "type": "string"
+    },
+    "exploit_last_seen_time": {
+     "type": "integer"
+    },
+    "exploit_ref_url": {
+     "type": "string"
+    },
+    "exploit_requirement": {
+     "type": "string"
+    },
+    "exploit_type": {
+     "type": "string"
+    },
+    "first_seen_time": {
+     "type": "integer"
+    },
+    "fix_available": {
+     "type": "boolean"
+    },
+    "fix_coverage": {
+     "type": "string"
+    },
+    "fix_coverage_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      99
+     ],
+     "type": "integer"
+    },
+    "is_exploit_available": {
+     "type": "boolean"
+    },
+    "is_fix_available": {
+     "type": "boolean"
+    },
+    "kb_article_list": {
+     "items": {
+      "$ref": "#/$defs/kb_article"
+     },
+     "type": "array"
+    },
+    "kb_articles": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "last_seen_time": {
+     "type": "integer"
+    },
+    "packages": {
+     "items": {
+      "$ref": "#/$defs/package"
+     },
+     "type": "array"
+    },
+    "references": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "related_vulnerabilities": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "remediation": {
+     "$ref": "#/$defs/remediation"
+    },
+    "severity": {
+     "type": "string"
+    },
+    "title": {
+     "type": "string"
+    },
+    "vendor_name": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "whois": {
+   "additionalProperties": false,
+   "properties": {
+    "autonomous_system": {
+     "$ref": "#/$defs/autonomous_system"
+    },
+    "created_time": {
+     "type": "integer"
+    },
+    "dnssec_status": {
+     "type": "string"
+    },
+    "dnssec_status_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      99
+     ],
+     "type": "integer"
+    },
+    "domain": {
+     "type": "string"
+    },
+    "domain_contacts": {
+     "items": {
+      "$ref": "#/$defs/domain_contact"
+     },
+     "type": "array"
+    },
+    "email_addr": {
+     "type": "string"
+    },
+    "isp": {
+     "type": "string"
+    },
+    "isp_org": {
+     "type": "string"
+    },
+    "last_seen_time": {
+     "type": "integer"
+    },
+    "name_servers": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "phone_number": {
+     "type": "string"
+    },
+    "registrar": {
+     "type": "string"
+    },
+    "status": {
+     "type": "string"
+    },
+    "subdomains": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "subnet": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "win_reg_key": {
+   "additionalProperties": false,
+   "properties": {
+    "is_system": {
+     "type": "boolean"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "path": {
+     "type": "string"
+    },
+    "security_descriptor": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "path"
+   ],
+   "type": "object"
+  },
+  "win_reg_value": {
+   "additionalProperties": false,
+   "properties": {
+    "data": {},
+    "is_default": {
+     "type": "boolean"
+    },
+    "is_system": {
+     "type": "boolean"
+    },
+    "modified_time": {
+     "type": "integer"
+    },
+    "name": {
+     "type": "string"
+    },
+    "path": {
+     "type": "string"
+    },
+    "reg_binary_data": {
+     "type": "string"
+    },
+    "reg_integer_data": {
+     "type": "integer"
+    },
+    "reg_string_data": {
+     "type": "string"
+    },
+    "reg_string_list_data": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "type": {
+     "type": "string"
+    },
+    "type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      99
+     ],
+     "type": "integer"
+    }
+   },
+   "required": [
+    "name",
+    "path"
+   ],
+   "type": "object"
+  },
+  "win_win_service": {
+   "additionalProperties": false,
+   "anyOf": [
+    {
+     "required": [
+      "cmd_line"
+     ]
+    },
+    {
+     "required": [
+      "service_category_id"
+     ]
+    },
+    {
+     "required": [
+      "service_dependencies"
+     ]
+    },
+    {
+     "required": [
+      "service_error_control_id"
+     ]
+    },
+    {
+     "required": [
+      "service_start_name"
+     ]
+    },
+    {
+     "required": [
+      "service_start_type_id"
+     ]
+    },
+    {
+     "required": [
+      "service_type_id"
+     ]
+    }
+   ],
+   "properties": {
+    "cmd_line": {
+     "type": "string"
+    },
+    "hosting_process": {
+     "$ref": "#/$defs/process_entity"
+    },
+    "labels": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "load_order_group": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "service_category": {
+     "type": "string"
+    },
+    "service_category_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      99
+     ],
+     "type": "integer"
+    },
+    "service_dependencies": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "service_dll_file": {
+     "$ref": "#/$defs/file"
+    },
+    "service_error_control": {
+     "type": "string"
+    },
+    "service_error_control_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "service_file": {
+     "$ref": "#/$defs/file"
+    },
+    "service_start_name": {
+     "type": "string"
+    },
+    "service_start_type": {
+     "type": "string"
+    },
+    "service_start_type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      99
+     ],
+     "type": "integer"
+    },
+    "service_type": {
+     "type": "string"
+    },
+    "service_type_id": {
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      99
+     ],
+     "type": "integer"
+    },
+    "tags": {
+     "items": {
+      "$ref": "#/$defs/key_value_object"
+     },
+     "type": "array"
+    },
+    "uid": {
+     "type": "string"
+    },
+    "uid_numeric": {
+     "type": "integer"
+    },
+    "version": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "type": "object"
+  }
+ }
+}

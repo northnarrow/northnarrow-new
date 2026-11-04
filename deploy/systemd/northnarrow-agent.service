@@ -262,7 +262,10 @@ ProtectHome=read-only
 # THIS process: the inode_protect write-deny hooks refuse every other
 # pid (at-authz-1/2), so widening the mount does not widen the attack
 # surface.
-ReadWritePaths=/run/northnarrow /var/lib/northnarrow /etc/northnarrow
+# Lot 276: the export worker's JSONL files (docs/operator/EXPORT.md). The
+# `-` keeps the unit starting where install.sh did not make it; the worker's
+# Landlock rule is this directory alone, and only it writes there.
+ReadWritePaths=/run/northnarrow /var/lib/northnarrow /etc/northnarrow -/var/log/northnarrow/export
 # CapabilityBoundingSet — the agent runs as root (no User=), so this set is
 # the HARD CEILING on its effective caps: a cap not listed is dropped even
 # from root. It is the blast radius if the agent is ever compromised, so it

@@ -87,6 +87,9 @@ pub const STDERR_LINES_PER_MINUTE: u32 = 20;
 pub const STDERR_LINE_MAX: usize = 200;
 /// How long [`Workers::stop`] waits for a slot before it kills by pid.
 pub const STOP_WAIT: Duration = Duration::from_secs(2);
+/// Lot 276: the longest a supervisor pass waits for a slot a request
+/// holds before it passes over it.
+pub const TICK_LOCK_WAIT: Duration = Duration::from_millis(10);
 
 /// The wait before the next start after `failures` in a row: at once
 /// after the first, then 1, 2, 4… seconds, at most [`MAX_BACKOFF`].
@@ -226,8 +229,8 @@ pub struct WorkerStatus {
 pub trait Launcher: Send + Sync {
     /// Why no worker can be started at all (`None`: they can).
     fn unavailable(&self) -> Option<String>;
-    /// The account a worker must declare in its hello.
-    fn account(&self) -> Option<(u32, u32)>;
+    /// The account a worker of `kind` must declare in its hello.
+    fn account(&self, kind: WorkerKind) -> Option<(u32, u32)>;
     /// Start a `kind` worker: the child and the core's end of its channel.
     fn launch(&self, kind: WorkerKind) -> std::io::Result<Spawned>;
     /// The kernel's Landlock ABI a worker's hello is checked against
@@ -249,9 +252,23 @@ pub trait Launcher: Send + Sync {
 pub struct ImageLauncher {
     /// `None`: the image could not be opened at boot.
     pub image: Option<SelfImage>,
+    /// The parse worker's account (`northnarrow-worker`).
     pub account: Result<WorkerAccount, String>,
+    /// The export worker's (`northnarrow-export`, lot 276): another account,
+    /// the one that owns the export's directory.
+    pub export_account: Result<WorkerAccount, String>,
     /// Arguments after the worker's own (the lab harness's).
     pub extra_args: Vec<String>,
+}
+
+impl ImageLauncher {
+    /// The account a worker of `kind` runs as.
+    fn account_of(&self, kind: WorkerKind) -> Result<&WorkerAccount, &String> {
+        match kind {
+            WorkerKind::Parse => self.account.as_ref(),
+            WorkerKind::Export => self.export_account.as_ref(),
+        }
+    }
 }
 
 impl Launcher for ImageLauncher {
@@ -265,8 +282,8 @@ impl Launcher for ImageLauncher {
             _ => None,
         }
     }
-    fn account(&self) -> Option<(u32, u32)> {
-        self.account.as_ref().ok().map(|a| (a.uid, a.gid))
+    fn account(&self, kind: WorkerKind) -> Option<(u32, u32)> {
+        self.account_of(kind).ok().map(|a| (a.uid, a.gid))
     }
     fn launch(&self, kind: WorkerKind) -> std::io::Result<Spawned> {
         // PR_SET_PDEATHSIG fires when the thread that forked exits: only
@@ -282,11 +299,18 @@ impl Launcher for ImageLauncher {
                 ),
             ));
         }
-        match (&self.image, &self.account) {
+        match (&self.image, self.account_of(kind)) {
             (Some(image), Ok(account)) => spawn(image, kind, account, &self.extra_args),
-            _ => Err(std::io::Error::new(
+            (None, _) => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "no image or no account",
+                "no image",
+            )),
+            (_, Err(e)) => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "no {} account ({e}): reinstall the agent, which creates it",
+                    super::account_name(kind)
+                ),
             )),
         }
     }
@@ -586,7 +610,13 @@ impl Workers {
     pub fn tick(&self, now: Instant) -> Duration {
         let mut pace = Duration::from_millis(250);
         for slot in &self.0.slots {
-            let mut s = slot.s.lock();
+            // lot 276: a slot held by a request in flight (the export's
+            // last up to its budget) is passed over this round — its
+            // requester judges the worker meanwhile — never waited on, so
+            // one worker's long request does not hold up another's watch
+            let Some(mut s) = slot.s.try_lock_for(TICK_LOCK_WAIT) else {
+                continue;
+            };
             if !s.stopped {
                 self.watch(slot.kind, &mut s, now);
                 self.drain_stderr(slot.kind, &mut s);
@@ -679,7 +709,7 @@ impl Workers {
                     }
                     Err(v) => return self.violation(kind, s, v),
                 };
-                let Some((uid, gid)) = self.0.launcher.account() else {
+                let Some((uid, gid)) = self.0.launcher.account(kind) else {
                     return;
                 };
                 let want = Expected {
@@ -948,6 +978,21 @@ impl Workers {
             s.served += 1;
         }
         Ok(resp.answer)
+    }
+
+    /// Lot 276: an answer that passed the protocol's check against its
+    /// request and failed the requester's against what it had sent before
+    /// (the export's window of rows in flight): the worker is killed and
+    /// reported as for any violation.
+    pub fn condemn(&self, kind: WorkerKind, why: &'static str) {
+        let Some(slot) = self.slot(kind) else {
+            return;
+        };
+        let mut s = slot.s.lock();
+        if s.child.is_some() {
+            self.violation(kind, &mut s, Violation::Bounds(why));
+        }
+        self.publish(slot, &s);
     }
 
     fn violation(&self, kind: WorkerKind, s: &mut SlotState, v: Violation) {

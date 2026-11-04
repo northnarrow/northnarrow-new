@@ -517,6 +517,17 @@ enum Cmd {
         sub: NetCmd,
     },
 
+    /// Lot 276 — the export of the signed chains as OCSF 1.9.0 records (a
+    /// JSONL file, syslog over TLS), turned on by a signed `export.local`
+    /// (docs/operator/EXPORT.md). `export status` shows it (signed: give
+    /// --key); `export verify`, run where the records arrive, checks each
+    /// one's row against the agent's public key and each chain's
+    /// continuity.
+    Export {
+        #[command(subcommand)]
+        sub: ExportCmd,
+    },
+
     /// FIM-009 self-upgrade (§15.1) — arm the trusted-installer
     /// override for an in-place agent upgrade. Submits a 1-of-N (M=1)
     /// quorum-signed grant; the admin.pub line for `--key` MUST carry
@@ -701,7 +712,7 @@ enum OverlayCmd {
         /// fim-paths, process-comm-allowlist, netflow-comm-allowlist,
         /// netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout,
         /// escalation-allow, canary-readers, cow-guard,
-        /// execq-hashes, exec-policy, rule-policy.
+        /// execq-hashes, exec-policy, rule-policy, export.
         kind: String,
         /// The overlay content to store.
         #[arg(long)]
@@ -1233,6 +1244,45 @@ impl From<CanaryDeployKindCmd> for CanaryDeploySpec {
             }
         }
     }
+}
+
+/// Lot 276 — the export's subcommands.
+#[derive(Subcommand, Debug)]
+enum ExportCmd {
+    /// The export's configuration, its worker, each sink's state and each
+    /// chain's cursor, and stage 8 (rows it can no longer deliver). Signed
+    /// telemetry: give --key (without it the agent withholds it).
+    Status {
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+        #[arg(long)]
+        json: bool,
+        /// A key with `audit-read` or `telemetry-read` (one audit row per
+        /// request).
+        #[arg(long)]
+        key: Option<PathBuf>,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+    },
+    /// Check exported records (the JSONL file's lines, or a syslog
+    /// receiver's messages, one a line) against the agent's public key:
+    /// each record's row signed and named, each record its row's mapping
+    /// (an action's outcome with its intent's signed row), each chain's
+    /// rows linked. Exit 0, 13 a record that does not verify, 11 a chain
+    /// that does not follow, 2 lines that are no record.
+    Verify {
+        /// The agent's public key, 64 hex characters (its `agent.sig.pub`).
+        #[arg(long = "agent-pubkey", conflicts_with = "agent_pubkey_file")]
+        agent_pubkey: Option<String>,
+        /// A file holding it.
+        #[arg(long = "agent-pubkey-file")]
+        agent_pubkey_file: Option<PathBuf>,
+        /// The records (default: standard input).
+        #[arg(long = "file")]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Tappa 10 N7 — net subcommand surface (mirrors FimCmd shape).
@@ -1983,6 +2033,77 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
             }
         },
 
+        // ── Lot 276 — the export ───────────────────────────────────
+        Cmd::Export {
+            sub:
+                ExportCmd::Status {
+                    socket,
+                    json,
+                    key,
+                    agent_id_file,
+                },
+        } => match read_status(&socket, key.as_deref(), &agent_id_file, "export status") {
+            Ok(out) => {
+                print_export_status(&out, json);
+                ExitCode::SUCCESS
+            }
+            Err(code) => code,
+        },
+        Cmd::Export {
+            sub:
+                ExportCmd::Verify {
+                    agent_pubkey,
+                    agent_pubkey_file,
+                    file,
+                    json,
+                },
+        } => {
+            let hex = match (agent_pubkey, agent_pubkey_file) {
+                (Some(h), _) => Ok(h),
+                (None, Some(f)) => std::fs::read_to_string(&f)
+                    .map(|t| t.trim().to_string())
+                    .map_err(|e| format!("{}: {e}", f.display())),
+                (None, None) => Err("--agent-pubkey or --agent-pubkey-file is required".into()),
+            };
+            let pubkey = hex.and_then(|h| {
+                crate::admin_cli::load_audit_pubkey(host, Some(&h), std::path::Path::new(""))
+                    .map_err(|e| format!("{e:#}"))
+            });
+            let pubkey = match pubkey {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("export verify: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            let report = match &file {
+                Some(f) => std::fs::File::open(f)
+                    .and_then(|r| crate::export::verify(std::io::BufReader::new(r), &pubkey))
+                    .map_err(|e| format!("{}: {e}", f.display())),
+                None => crate::export::verify(std::io::stdin().lock(), &pubkey)
+                    .map_err(|e| format!("standard input: {e}")),
+            };
+            match report {
+                Ok(r) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&r).unwrap_or_else(|_| "null".into())
+                        );
+                    } else {
+                        for l in crate::export::report_lines(&r) {
+                            println!("{}", clean(&l));
+                        }
+                    }
+                    ExitCode::from(r.exit_code())
+                }
+                Err(e) => {
+                    eprintln!("export verify: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+
         // ── Tappa 10 N7 — net subcommands ─────────────────────────
         Cmd::Net {
             sub:
@@ -2624,6 +2745,28 @@ fn withheld_line(label: &str, what: &str, cmd: &str) -> String {
 }
 
 /// External audit NET-019 / NET-012 / NET-009: `nn-admin net status`.
+/// Lot 276: `export status`.
+fn print_export_status(out: &StatusOutcome, json: bool) {
+    if json {
+        println!(
+            "{{\"export\":{},\"telemetry_signed\":{}}}",
+            serde_json::to_string(&out.export).unwrap_or_else(|_| "null".to_string()),
+            out.telemetry_signed
+        );
+        return;
+    }
+    if telemetry_withheld(out) {
+        println!(
+            "{}",
+            withheld_line("export", "the export's state", "export status")
+        );
+        return;
+    }
+    for l in crate::export::status_lines(out.export.as_ref()) {
+        println!("{}", clean(&l));
+    }
+}
+
 fn print_net_status(out: &StatusOutcome, json: bool) {
     let net_ring = |name: &str| {
         matches!(
@@ -5745,6 +5888,7 @@ mod flow_sock_line_tests {
             event_bus: None,
             event_bus_decision: None,
             response_dispatch: None,
+            export: None,
             telemetry_signed: true,
         }
     }

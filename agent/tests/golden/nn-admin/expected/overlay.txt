@@ -20,6 +20,7 @@ exit: 0
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -43,6 +44,7 @@ exit: 0
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -66,6 +68,7 @@ exit: 0
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -89,6 +92,7 @@ exit: 1
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -112,6 +116,7 @@ exit: 1
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -135,6 +140,7 @@ exit: 1
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -158,6 +164,7 @@ exit: 0
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -181,6 +188,7 @@ exit: 1
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -204,6 +212,7 @@ exit: 1
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -227,6 +236,7 @@ exit: 1
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -250,6 +260,7 @@ exit: 1
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -273,6 +284,7 @@ exit: 1
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -296,6 +308,7 @@ exit: 0
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -319,6 +332,7 @@ exit: 1
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -342,6 +356,7 @@ exit: 0
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -365,6 +380,7 @@ exit: 0
 | exec-policy              signed (ts 1750000000, keys 730a5edc)
 | rule-policy              signed (ts 1750000000, keys 730a5edc)
 | nodns-allow              signed (ts 1750000000, keys 730a5edc)
+| export                   signed (ts 1750000000, keys 730a5edc)
 --- stderr
 (empty)
 
@@ -389,6 +405,7 @@ exit: 1
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -413,6 +430,7 @@ exit: 1
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -437,6 +455,7 @@ exit: 1
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -460,6 +479,7 @@ exit: 1
 | exec-policy              absent
 | rule-policy              absent
 | nodns-allow              absent
+| export                   absent
 --- stderr
 (empty)
 
@@ -915,6 +935,36 @@ exit: 0
 |   "v": 1
 | }
 
+### overlay-sign.kind.export
+$ nn-admin config overlay sign export --file overlay.local --key key-a --agent-id-file agent_id
+exit: 0
+--- stdout
+| config overlay sign: overlay.local.sig written (the agent verifies it at its next start)
+--- stderr
+(empty)
+--- files
++ overlay.local.sig (file 0644)
+| {
+|   "kind": "export",
+|   "payload": {
+|     "agent_id": "hex:11111111111111111111111111111111",
+|     "extra": {
+|       "ConfigOverlaySet": {
+|         "kind": 17,
+|         "len": 24,
+|         "sha256": "hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"
+|       }
+|     },
+|     "nonce": "<random nonce>",
+|     "op": 21,
+|     "ts": <now>
+|   },
+|   "signatures": [
+|     "<sig of key-a>"
+|   ],
+|   "v": 1
+| }
+
 ### overlay-sign.to-out
 $ nn-admin config overlay sign fim-paths --file overlay.local --key key-a --agent-id-file agent_id --out elsewhere.sig
 exit: 0
@@ -998,7 +1048,7 @@ exit: 2
 --- stdout
 (empty)
 --- stderr
-| config overlay: unknown overlay `no-such-list` — one of: fim-paths, process-comm-allowlist, netflow-comm-allowlist, netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout, escalation-allow, combat-rules-v4, combat-rules-v6, combat-allow, canary-readers, cow-guard, execq-hashes, exec-policy, rule-policy, nodns-allow
+| config overlay: unknown overlay `no-such-list` — one of: fim-paths, process-comm-allowlist, netflow-comm-allowlist, netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout, escalation-allow, combat-rules-v4, combat-rules-v6, combat-allow, canary-readers, cow-guard, execq-hashes, exec-policy, rule-policy, nodns-allow, export
 
 ### overlay-sign.kind-by-file-name
 $ nn-admin config overlay sign process-comm-allowlist.local --file overlay.local --key key-a --agent-id-file agent_id

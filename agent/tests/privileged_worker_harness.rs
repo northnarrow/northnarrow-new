@@ -517,6 +517,7 @@ fn workers_reporting(h: &Harness, extra: &[&str], reports: Reports) -> Workers {
         launcher: Arc::new(ImageLauncher {
             image: Some(h.image()),
             account: Ok(h.account.clone()),
+            export_account: Err("no export account".into()),
             extra_args: extra.iter().map(|s| s.to_string()).collect(),
         }),
         roles: Arc::new(NoPidRoles),

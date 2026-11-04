@@ -9,6 +9,14 @@ sandbox, for the work that reads bytes an attacker writes. The design is
 | Worker | What it does | Since |
 |---|---|---|
 | `parse` | nn-parse's parsers: the DNS query names (every DNS event's name), DNS answers, the TLS ClientHello | R14a (started), R14b (the parsing moved in) |
+| `export` | the export's OCSF mapping and sinks (rotating JSONL files, syslog over TLS): the signed rows the core hands it ([`EXPORT.md`](EXPORT.md)); started only when a signed `export.local` turns the export on | lot 276 |
+
+The export worker's sandbox is the parse worker's with what its sinks need:
+one Landlock rule (its directory, `/var/log/northnarrow/export`), a second
+Landlock layer that pins its TCP connects to the receiver's port (measured;
+required where the kernel's Landlock handles TCP, ABI ≥ 4), TCP sockets and
+its files' calls in its seccomp filter, 16 descriptors — `EXPORT.md` §5.
+Its `comm` is `nn-worker-exp`.
 
 ## 1. The `northnarrow-worker` account
 
@@ -20,6 +28,11 @@ group, no home (`/nonexistent`), no shell (`nologin`), never root:
 useradd --system --user-group --no-create-home --home-dir /nonexistent \
         --shell /usr/sbin/nologin --comment "NorthNarrow agent workers" northnarrow-worker
 ```
+
+Lot 276: the export worker runs as an account of its own,
+`northnarrow-export`, created and checked the same way, which owns the
+export's directory (`/var/log/northnarrow/export`, 0755, its files 0600):
+the parse worker's account cannot write there.
 
 It owns no file. `uninstall.sh` (and the packages' removal) deletes it with
 its group, as it deletes `northnarrow-scan`.

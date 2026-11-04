@@ -34,19 +34,74 @@
 //! Lab PR 166: a copy run from a staging directory is killed with its
 //! tree, as R001..R003 would ([`super::tool_kill`]); the tool anywhere
 //! else keeps the single-process kill.
+//!
+//! ## By name, the system's tool, nothing moved (lot 279)
+//!
+//! R011 killed every exec of a module tool that no package-manager actor
+//! ran and no kernel thread asked for: the `modprobe` of rootful podman's
+//! netfilter modules among them (lot 275's lab: W5 rc 137 on Ubuntu
+//! 22.04). An exec is now RECORDED (High, T1547.006, no kill) when its
+//! command line asks for modules BY NAME and nothing else could make it
+//! load something the system's tree does not name; killed as before
+//! otherwise. It is judged on the syntax alone — kmod's lookup is not
+//! emulated, no `modprobe.d` or index is read (the coordinator's decision
+//! of 04/11, after the independent review of #498):
+//!
+//! | The exec | R011 |
+//! |---|---|
+//! | `insmod`, whatever its arguments | kill |
+//! | a `modprobe` argument with a `/`, or ending in `.ko`, `.ko.xz`, `.ko.zst`, `.ko.gz` | kill |
+//! | `-C`/`--config`, `-d`/`--dirname`, `-S`/`--set-version`, `-f`/`--force*`, `-o`, `--remove-holders`, `--remove-dependencies` (and the abbreviations `getopt_long` takes) | kill |
+//! | any argument starting with `-` after the first module name; an option the tool refuses | kill |
+//! | a `kmod` command other than `help`, `list`, `static-nodes`, the version | kill |
+//! | not the system's tool: its path outside `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin` or another name, its device and inode not those of the file `/usr/bin/kmod` resolves to (as the exec pump stats it), `/usr/bin/kmod` and `/bin/kmod` two different files, a filesystem of another mount namespace | kill |
+//! | `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` in its environment (read, it is evidence: killed even if the process has since exited); a running process whose environment the exec pump could not read at the exec; an environment over 1 MiB; an unknown start | kill |
+//! | a process that had exited before the exec pump could read its environment (no process with its pid, its pid another's, a zombie, its memory gone), the rest of it recorded — not a leader that exited while another thread runs on: that thread's environment is read and judged, refused when not read whole or when no thread is seen while the kernel counts more than one | record, its environment not verified |
+//! | an argv the kernel did not read whole | kill |
+//! | otherwise — the system's tool, plain module names, before the first name only options that move and force nothing | record |
+//!
+//! Whether the names load anything, and what, is the kernel's to judge at
+//! the load: its signature policy (module signing, lockdown: the host check
+//! reports both) refuses what it does not trust, and lot 285 adds the
+//! kernel's deny of an untrusted file. R018 judges the loads the kernel
+//! reports (`kernel_read_file` / `kernel_load_data`, the file's path from
+//! its dentry) AFTER them — its hook observes and denies nothing: a load
+//! whose loader's parent is a kernel thread has no verdict; a file outside
+//! the module directories (or deeper than any) is a Critical kill of the
+//! loader's tree, whatever the loader; a file in them that no package
+//! installed is a Critical kill, or only a Log when the loader or its
+//! parent is in R018's loader allowlist (`systemd-udevd`, `systemd-modules`,
+//! `kmod` — comms, which a process chooses); a packaged file loaded by those
+//! has NO verdict, by another loader a Log. Every load is a line of the
+//! agent's journal, not a signed record. So `execve("/usr/bin/kmod",
+//! ["modprobe", "rk"])` of a module copied into the tree and indexed by
+//! `depmod` is R011's record and R018's Log, no kill (taking `kmod` out of
+//! R018's allowlist goes with lot 285's redesign of R018).
+//!
+//! What R011 does not see: a root process that loads a module without any
+//! tool (its own `finit_module(2)`) — as on `main`, with comm `kmod` maybe
+//! no verdict at all (above); a root parent that traces the tool and
+//! rewrites its argv or environment after the exec pump read them; code
+//! injected into the tool (an `LD_PRELOAD` read too late,
+//! `/etc/ld.so.preload`) that forks and lets the tool exit — the pump reads
+//! an exited tool (recorded), and a kill of the tool would not reach the
+//! child, which runs on out of its tree; a
+//! `modprobe.d` `install`/`remove` command — root's configuration, run by
+//! `modprobe` through `/bin/sh -c` as programs the exec rules judge (on
+//! `main` a user-space `modprobe` was killed, its command then usually not
+//! run; the coverage of `modprobe.d` is in `TAPPA9_FIM_TRUST_MODEL.md`).
 
 use std::sync::Arc;
 
-use nn_model::{Event, Severity, Verdict};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
 use crate::decision::attack::{AttackRef, Tactic};
+use crate::decision::rules::kmod_exec_facts::{self, KMOD_TOOLS};
+use crate::decision::rules::kmod_invocation::{self, Syntax};
 use crate::decision::{rules::build_verdict, Rule};
 use crate::posture::host::PostureHost;
-
-/// Kernel-module load/manage tool comms (design §7.1).
-const KMOD_TOOLS: &[&str] = &["insmod", "modprobe", "kmod"];
 
 pub struct R011KernelModuleTooling<H: PostureHost> {
     allowlist: Arc<CommAllowlist<H>>,
@@ -55,6 +110,63 @@ pub struct R011KernelModuleTooling<H: PostureHost> {
 impl<H: PostureHost> R011KernelModuleTooling<H> {
     pub fn new(allowlist: Arc<CommAllowlist<H>>) -> Self {
         Self { allowlist }
+    }
+}
+
+/// Lot 279: the note of a record whose process had exited before the exec
+/// pump could read its environment (the coordinator's decision of 04/11: a
+/// kill would reach no one).
+pub const EXITED_NOTE: &str = "exited before its environment could be read — a load it made is \
+                                the kernel's to judge (R018); its environment not verified";
+
+/// Lot 279: `Ok((what it asks for, whether its process had exited before
+/// its environment could be read))` when R011 records the exec of a module
+/// tool, `Err(why)` when it kills it — its command line's syntax, then what
+/// the exec pump read at the exec ([`kmod_exec_facts`]).
+fn judge(event: &Event) -> Result<(String, bool), String> {
+    let Event::ProcessSpawn {
+        filename,
+        exe,
+        argv,
+        argv_truncated,
+        ..
+    } = event
+    else {
+        return Err("not an exec".to_string());
+    };
+    if argv.is_empty() {
+        return Err("its argv was not read by the kernel: no argument was checked".to_string());
+    }
+    if *argv_truncated {
+        return Err(format!(
+            "its argv was cut at {} bytes: arguments past the cut were not seen",
+            common::wire::ARGV_LEN - 1
+        ));
+    }
+    // the kernel named a file of a filesystem this mount namespace does not
+    // show (another namespace's root): not the host's tool
+    if !exe.path.is_empty() && exe.root != (0, 0) {
+        return Err(format!(
+            "the program ({}) is in a filesystem the host's mount table does not show (another \
+             mount namespace)",
+            exe.path
+        ));
+    }
+    let tool = kmod_invocation::tool_of(exe.path_or(filename), argv)?;
+    let what = match kmod_invocation::judge(tool, argv) {
+        Syntax::Record(what) => what,
+        Syntax::Kill(why) => return Err(why),
+    };
+    match kmod_exec_facts::of(event) {
+        None => Err(
+            "the exec pump did not read its program and environment at the exec (a replay, or \
+             more execs of module tools in flight than it keeps): neither was checked"
+                .to_string(),
+        ),
+        Some(facts) => match facts.refusal() {
+            Some(why) => Err(why.to_string()),
+            None => Ok((what, facts.exited())),
+        },
     }
 }
 
@@ -79,7 +191,6 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
             comm,
             filename,
             exe,
-            argv,
             parent_comm,
             parent_is_kthread,
             ..
@@ -131,19 +242,35 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
         if *parent_is_kthread {
             return None;
         }
-        // Base detection fires on comm alone (graceful-degrade when the
-        // T10.6 argv refit isn't deployed). argv/parent_comm add
-        // confidence to the verdict reasoning (Q7 — additive, not a gate).
-        let mut reasoning = String::from(
-            "Kernel-module tooling (insmod/modprobe/kmod) exec — kernel \
-             rootkit / persistence indicator (T1547.006); posture → ENGAGED",
-        );
-        if let Some(m) = argv
-            .iter()
-            .find(|a| a.contains("/lib/modules/") || a.ends_with(".ko"))
-        {
-            reasoning = format!("{reasoning} — argv confirms a real module load ({m})");
-        }
+        // Lot 279: judged on the command line's syntax and on what the exec
+        // pump read at the exec — recorded (High, no kill) by name, killed as
+        // before otherwise.
+        let (action, mut reasoning) = match judge(event) {
+            Ok((what, false)) => (
+                ResponseAction::Log,
+                format!(
+                    "Kernel-module tooling ({comm}) exec by module name — {what}: the system's \
+                     tool, nothing moved or forced, no MODPROBE_OPTIONS or LD_* — recorded, not \
+                     killed (lot 279): what the names load is the kernel's to judge (its \
+                     signature policy; R018 judges the load it reports, after it) (T1547.006)"
+                ),
+            ),
+            Ok((what, true)) => (
+                ResponseAction::Log,
+                format!(
+                    "Kernel-module tooling ({comm}) exec by module name — {what}: the system's \
+                     tool, nothing moved or forced; {EXITED_NOTE} — recorded, not killed (lot \
+                     279) (T1547.006)"
+                ),
+            ),
+            Err(why) => (
+                super::tool_kill(exe.path_or(filename)),
+                format!(
+                    "Kernel-module tooling (insmod/modprobe/kmod) exec — kernel rootkit / \
+                     persistence indicator (T1547.006); posture → ENGAGED — killed: {why}"
+                ),
+            ),
+        };
         if !parent_comm.is_empty() {
             reasoning = format!("{reasoning}; parent={parent_comm}");
         }
@@ -152,13 +279,7 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
             &self.allowlist,
             event,
             judgement.apply(
-                build_verdict(
-                    self,
-                    event,
-                    super::tool_kill(exe.path_or(filename)),
-                    Severity::High,
-                    &reasoning,
-                ),
+                build_verdict(self, event, action, Severity::High, &reasoning),
                 comm,
             ),
         ))
@@ -175,8 +296,61 @@ mod tests {
     use crate::decision::rules::testutil::{spawn, spawn_full};
     use nn_model::ResponseAction;
 
+    use crate::decision::rules::kmod_exec_facts::{self, Environment, ExecFacts};
+
     fn rule() -> R011KernelModuleTooling {
         R011KernelModuleTooling::new(Arc::new(CommAllowlist::default()))
+    }
+
+    /// Lot 279: a root exec of `exe` as the caller ran it (`filename`),
+    /// with `argv` — each its own (pid, exec time), which the facts of the
+    /// exec pump are kept by.
+    fn exec(filename: &str, exe: &str, argv: &[&str]) -> Event {
+        let comm = filename.rsplit('/').next().unwrap();
+        let mut e = crate::decision::rules::testutil::spawn_exe(comm, filename, exe, 0);
+        if let Event::ProcessSpawn {
+            uid,
+            gid,
+            argv: a,
+            pid,
+            timestamp_ns,
+            parent_comm,
+            ..
+        } = &mut e
+        {
+            (*uid, *gid) = (0, 0);
+            *a = argv.iter().map(|s| s.to_string()).collect();
+            *parent_comm = "bash".to_string();
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (*pid, *timestamp_ns) = (2_790_000 + n, 279_000_000 + u64::from(n));
+        }
+        e
+    }
+
+    /// `modprobe <args…>` as xtables and the container runtimes run it.
+    fn modprobe(args: &[&str]) -> Event {
+        let mut argv = vec!["/sbin/modprobe"];
+        argv.extend_from_slice(args);
+        exec("/sbin/modprobe", "/usr/bin/kmod", &argv)
+    }
+
+    /// `e` as the exec pump read it: `facts`.
+    fn read_as(e: Event, facts: ExecFacts) -> Event {
+        kmod_exec_facts::keep(&e, facts);
+        e
+    }
+
+    /// `e` as the exec pump read it: the system's tool, no
+    /// `MODPROBE_OPTIONS`.
+    fn read_ok(e: Event) -> Event {
+        read_as(
+            e,
+            ExecFacts {
+                program: Ok(()),
+                environment: Environment::Clean,
+            },
+        )
     }
 
     /// Build a ProcessSpawn with explicit `parent_is_kthread`. The
@@ -231,8 +405,9 @@ mod tests {
         }
     }
 
+    /// Lot 279: an insmod of a file is killed, the file named.
     #[test]
-    fn argv_module_image_enriches_reasoning() {
+    fn insmod_of_a_file_is_killed_naming_it() {
         let ev = spawn_full(
             "insmod",
             "/usr/sbin/insmod",
@@ -242,20 +417,341 @@ mod tests {
         );
         let v = rule().evaluate(&ev).expect("fires");
         assert_eq!(v.severity, Severity::High); // base severity preserved
-        assert!(v.reasoning.contains("argv confirms a real module load"));
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert!(
+            v.reasoning.contains("insmod loads the file"),
+            "{}",
+            v.reasoning
+        );
         assert!(v.reasoning.contains("evil.ko"));
         assert!(v.reasoning.contains("parent=bash"));
     }
 
     #[test]
     fn fires_without_argv_graceful_degrade() {
-        // Empty argv (D2 not deployed) — base predicate still fires, no
-        // enrichment clause.
+        // Empty argv (not read by the kernel): nothing was checked — the
+        // kill, as before.
         let v = rule()
             .evaluate(&spawn("insmod", "/usr/sbin/insmod"))
             .expect("fires");
         assert_eq!(v.severity, Severity::High);
-        assert!(!v.reasoning.contains("argv confirms"));
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert!(v.reasoning.contains("argv was not read"), "{}", v.reasoning);
+        // the reason is the argv's wherever the program lives (lot 279)
+        let e = read_ok(spawn("modprobe", "/tmp/modprobe"));
+        let v = rule().evaluate(&e).expect("fires");
+        assert!(
+            v.reasoning
+                .contains("its argv was not read by the kernel: no argument was checked"),
+            "{}",
+            v.reasoning
+        );
+    }
+
+    // ─── Lot 279 — by name, the system's tool, nothing moved ────────
+
+    /// Lot 275's lab (W5, Ubuntu 22.04): rootful podman's netfilter
+    /// modprobe was killed. The container runtimes', xtables', kube-proxy's
+    /// and an administrator's shapes — module names, the system's tool, a
+    /// clean environment — are recorded, High, T1547.006, no kill; so is a
+    /// query, and a name of no module (nothing is resolved: whatever it
+    /// loads is the kernel's to judge).
+    #[test]
+    fn modprobe_by_name_is_recorded_not_killed() {
+        let r = rule();
+        for (e, what) in [
+            (modprobe(&["ip_tables"]), "modprobe of 'ip_tables'"),
+            (
+                modprobe(&["-va", "bridge", "br_netfilter"]),
+                "modprobe of 'bridge', 'br_netfilter'",
+            ),
+            (
+                exec(
+                    "/usr/sbin/modprobe",
+                    "/usr/bin/kmod",
+                    &["modprobe", "overlay"],
+                ),
+                "modprobe of 'overlay'",
+            ),
+            (modprobe(&["--", "ip_vs"]), "modprobe of 'ip_vs'"),
+            (
+                modprobe(&["-q", "--", "nft-expr-counter"]),
+                "modprobe of 'nft-expr-counter'",
+            ),
+            (modprobe(&["dummy"]), "modprobe of 'dummy'"),
+            (modprobe(&["-r", "dummy"]), "modprobe of 'dummy'"),
+            (
+                modprobe(&["nf_conntrack", "hashsize=1024"]),
+                "with 1 parameter",
+            ),
+            (
+                exec("/usr/bin/kmod", "/usr/bin/kmod", &["kmod", "list"]),
+                "kmod list",
+            ),
+            (
+                exec("/usr/bin/kmod", "/usr/bin/kmod", &["lsmod"]),
+                "kmod run as lsmod",
+            ),
+        ] {
+            let e = read_ok(e);
+            let v = r.evaluate(&e).expect("recorded");
+            assert_eq!(v.action, ResponseAction::Log, "{e:?}: {}", v.reasoning);
+            assert_eq!(v.severity, Severity::High);
+            assert_eq!(v.rule_id, "R011_KernelModuleTooling");
+            for part in [what, "by module name", "T1547.006", "R018", "parent=bash"] {
+                assert!(v.reasoning.contains(part), "{part}: {}", v.reasoning);
+            }
+        }
+    }
+
+    /// Lot 279: what the command line names is killed whatever the pump
+    /// read — every malicious shape of deploy/lab/malsim/kmod-check.sh and
+    /// the review of #498's (B-1, B-4).
+    #[test]
+    fn what_the_command_line_names_is_killed() {
+        let r = rule();
+        for (e, why) in [
+            (
+                exec(
+                    "/usr/sbin/insmod",
+                    "/usr/bin/kmod",
+                    &["insmod", "/tmp/rk.ko"],
+                ),
+                "insmod loads the file '/tmp/rk.ko'",
+            ),
+            (
+                exec("/usr/bin/kmod", "/usr/bin/kmod", &["insmod", "/tmp/rk.ko"]),
+                "insmod loads the file",
+            ),
+            (modprobe(&["/tmp/rk.ko"]), "names a file"),
+            (modprobe(&["rk.ko"]), "names a file"),
+            (modprobe(&["-S", "9.9.9", "dummy"]), "the kernel version"),
+            (modprobe(&["-d", "/tmp/root", "dummy"]), "names a file"),
+            (modprobe(&["-d", "root", "dummy"]), "the module tree's root"),
+            (modprobe(&["-C", "m.conf", "dummy"]), "its configuration"),
+            (modprobe(&["--force", "dummy"]), "force"),
+            (modprobe(&["--remove-holders", "dummy"]), "as an insertion"),
+            (modprobe(&["dummy", "-r"]), "after the module name"),
+            (modprobe(&["dummy", "-q"]), "after the module name"),
+            (
+                exec("/usr/bin/kmod", "/usr/bin/kmod", &["kmod", "insert", "x"]),
+                "not one that loads nothing",
+            ),
+        ] {
+            let e = read_ok(e);
+            let v = r.evaluate(&e).expect("fires");
+            assert_eq!(
+                v.action,
+                ResponseAction::KillProcess,
+                "{e:?}: {}",
+                v.reasoning
+            );
+            assert_eq!(v.severity, Severity::High);
+            assert!(v.reasoning.contains(why), "{why}: {}", v.reasoning);
+            assert!(v.reasoning.contains("killed: "), "{}", v.reasoning);
+        }
+        // a copy of the tool in a staging directory: its tree
+        let v = r
+            .evaluate(&read_ok(exec(
+                "/tmp/modprobe",
+                "/tmp/modprobe",
+                &["modprobe", "dummy"],
+            )))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        assert!(v.reasoning.contains("not the system's module tool"));
+    }
+
+    /// Lot 279: what the exec pump read at the exec decides the rest — the
+    /// program not the system's tool's file, `MODPROBE_OPTIONS` in the
+    /// or a dynamic linker's variable in the environment, a running
+    /// process's environment not read, an unknown start, or no reading at
+    /// all (a replay): killed, the pump's reason said.
+    #[test]
+    fn what_the_exec_pump_read_is_judged() {
+        let r = rule();
+        let v = r.evaluate(&modprobe(&["dummy"])).expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert!(
+            v.reasoning.contains("the exec pump did not read"),
+            "{}",
+            v.reasoning
+        );
+        for (facts, why) in [
+            (
+                ExecFacts {
+                    program: Err("its device and inode are not the system's tool's".into()),
+                    environment: Environment::Clean,
+                },
+                "not the system's tool's",
+            ),
+            (
+                ExecFacts {
+                    program: Ok(()),
+                    environment: Environment::Refused(
+                        "MODPROBE_OPTIONS='-d /tmp/x' in its environment".into(),
+                    ),
+                },
+                "MODPROBE_OPTIONS='-d /tmp/x'",
+            ),
+            (
+                ExecFacts {
+                    program: Ok(()),
+                    environment: Environment::Refused(
+                        "its environment could not be read (Permission denied)".into(),
+                    ),
+                },
+                "could not be read",
+            ),
+            (
+                ExecFacts {
+                    program: Ok(()),
+                    environment: Environment::Refused(
+                        "LD_PRELOAD='/tmp/x.so' in its environment".into(),
+                    ),
+                },
+                "LD_PRELOAD='/tmp/x.so'",
+            ),
+            (
+                ExecFacts {
+                    program: Ok(()),
+                    environment: Environment::Refused(
+                        "its start is unknown: its environment cannot be tied to the exec".into(),
+                    ),
+                },
+                "its start is unknown",
+            ),
+        ] {
+            let v = r
+                .evaluate(&read_as(modprobe(&["dummy"]), facts))
+                .expect("fires");
+            assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
+            assert!(v.reasoning.contains(why), "{why}: {}", v.reasoning);
+            assert!(!v.reasoning.contains(EXITED_NOTE), "{}", v.reasoning);
+        }
+    }
+
+    /// Lot 279, the coordinator's decision of 04/11: a process that had
+    /// exited before the exec pump could read its environment is not killed
+    /// (the kill would reach no one, a false High kill) — an invocation
+    /// recorded otherwise is recorded, noting it. Anything else R011 kills
+    /// stays a kill: the command line, a foreign program.
+    #[test]
+    fn an_exec_whose_process_exited_before_its_environment_was_read_is_recorded_noting_it() {
+        let r = rule();
+        let exited = || ExecFacts {
+            program: Ok(()),
+            environment: Environment::Exited("no process had its pid any more".into()),
+        };
+        for (e, what) in [
+            (modprobe(&["overlay"]), "modprobe of 'overlay'"),
+            (
+                exec("/usr/bin/kmod", "/usr/bin/kmod", &["kmod", "--version"]),
+                "kmod: the version printed",
+            ),
+        ] {
+            let v = r.evaluate(&read_as(e, exited())).expect("recorded");
+            assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
+            assert_eq!(v.severity, Severity::High);
+            for part in [what, EXITED_NOTE, "T1547.006", "parent=bash"] {
+                assert!(v.reasoning.contains(part), "{part}: {}", v.reasoning);
+            }
+            assert!(
+                !v.reasoning.contains("no MODPROBE_OPTIONS"),
+                "{}",
+                v.reasoning
+            );
+        }
+        for (e, facts, why) in [
+            (modprobe(&["/tmp/rk.ko"]), exited(), "names a file"),
+            (
+                modprobe(&["-d", "root", "dummy"]),
+                exited(),
+                "module tree's root",
+            ),
+            (
+                modprobe(&["dummy", "-q"]),
+                exited(),
+                "after the module name",
+            ),
+            (
+                modprobe(&["dummy"]),
+                ExecFacts {
+                    program: Err("its device and inode are not the system's tool's".into()),
+                    ..exited()
+                },
+                "not the system's tool's",
+            ),
+        ] {
+            let v = r.evaluate(&read_as(e, facts)).expect("fires");
+            assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
+            assert!(v.reasoning.contains(why), "{why}: {}", v.reasoning);
+        }
+        // a copy in a staging directory: its tree, exited or not
+        let v = r
+            .evaluate(&read_as(
+                exec("/tmp/modprobe", "/tmp/modprobe", &["modprobe", "dummy"]),
+                exited(),
+            ))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+    }
+
+    /// Lot 279: an argv the kernel did not read whole, or a program of a
+    /// filesystem the host's mount table does not show, is killed whatever
+    /// the pump read.
+    #[test]
+    fn a_cut_argv_or_another_namespace_s_program_is_killed() {
+        let mut cut = modprobe(&["dummy"]);
+        if let Event::ProcessSpawn { argv_truncated, .. } = &mut cut {
+            *argv_truncated = true;
+        }
+        let mut other_ns = modprobe(&["dummy"]);
+        if let Event::ProcessSpawn { exe, .. } = &mut other_ns {
+            exe.root = (8, 2);
+        }
+        for (e, why) in [
+            (cut, "its argv was cut at 511 bytes"),
+            (other_ns, "another mount namespace"),
+        ] {
+            let v = rule().evaluate(&read_ok(e)).expect("fires");
+            assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
+            assert!(v.reasoning.contains(why), "{why}: {}", v.reasoning);
+        }
+        // a path the kernel did not give (it names no root then): the
+        // caller's path, and the pump's device and inode, are judged
+        let mut unnamed = modprobe(&["dummy"]);
+        if let Event::ProcessSpawn { exe, .. } = &mut unnamed {
+            exe.path.clear();
+            exe.root = (8, 2);
+        }
+        let v = rule().evaluate(&read_ok(unnamed)).expect("recorded");
+        assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
+    }
+
+    /// Lot 279: the kernel-thread exemption and the allowlist come first,
+    /// as before; a forged kworker parent is killed.
+    #[test]
+    fn the_exemptions_come_before_the_judgement() {
+        let mut e = modprobe(&["/tmp/rk.ko"]);
+        if let Event::ProcessSpawn {
+            parent_comm,
+            parent_is_kthread,
+            ..
+        } = &mut e
+        {
+            *parent_comm = "kworker/u8:3".to_string();
+            *parent_is_kthread = true;
+        }
+        assert!(rule().evaluate(&e).is_none());
+        if let Event::ProcessSpawn {
+            parent_is_kthread, ..
+        } = &mut e
+        {
+            *parent_is_kthread = false;
+        }
+        let v = rule().evaluate(&e).expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
     }
 
     #[test]

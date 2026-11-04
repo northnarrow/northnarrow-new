@@ -116,6 +116,8 @@ pub struct Inputs {
     pub opt_ins: Vec<String>,
     /// R14a: the workers' supervisor (`None`: no worker in this run).
     pub workers: Option<nn_linux::worker::Workers>,
+    /// Lot 276: the export (`None`: no configuration of it).
+    pub export: Option<crate::export::ExportHandle>,
 }
 
 /// R14a (plan §3.1, §3.5): each worker kind's entry — its state, and the
@@ -216,6 +218,7 @@ fn build(inputs: &Inputs, terminated: &[String]) -> CapabilityManifest {
         .as_ref()
         .map(worker_entries)
         .unwrap_or_default();
+    m.export = inputs.export.as_ref().map(|e| e.manifest_entry());
     m.settled = m.probe_settled();
     m.contract_hash = m.contract_hash_now();
     m.revision = 0;

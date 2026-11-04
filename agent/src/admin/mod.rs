@@ -326,6 +326,8 @@ pub struct AdminHandles {
     /// R12c (lab PR 270): stages 6 and 7 — the response dispatcher, the
     /// actions chain, the evidence writer's queue (`None`: none — tests).
     pub response_dispatch: Option<ResponseDispatchSource>,
+    /// Lot 276: the export and its stage 8 (`None`: no configuration).
+    pub export: Option<crate::export::ExportHandle>,
 }
 
 /// R12c (lab PR 270): where the status reads stages 6 and 7.

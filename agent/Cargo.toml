@@ -88,6 +88,10 @@ nn-linux = { workspace = true }
 # of this package is its shim, which passes it the agent's host
 # (`admin_host`); `admin_cli` keeps its path here.
 nn-admin = { workspace = true }
+# Lot 276: the export — the chains as the WAL (the core's thread reads them
+# and keeps the cursors) and the export worker (OCSF, the JSONL file,
+# syslog over TLS) composed with nn-linux's sandbox (`export`).
+nn-export = { workspace = true, features = ["sinks"] }
 # ISSUE_002: shared aya-handling primitives (bpffs pin paths, LSM
 # hook attach/reuse, /proc helpers). Watchdog binary consumes this
 # crate directly without pulling the rest of `agent` —
@@ -178,6 +182,10 @@ nn-core = { workspace = true, features = ["test-util"] }
 # given binaries; R09b, lab PR 254: the FIM's stand-in for the kernel's
 # watched inodes). A dev-dependency only: no build of the binaries has them.
 nn-linux = { workspace = true, features = ["test-util"] }
+# Lot 276: the export's tests validate each record against the pinned OCSF
+# schema (`schema-check`). A dev-dependency only: no build of the binaries
+# has it.
+nn-export = { workspace = true, features = ["sinks", "schema-check"] }
 
 # Kani proofs live behind cfg(kani) (Tappa 10.8); declare it so normal
 # builds with -D warnings do not flag it as an unexpected cfg.

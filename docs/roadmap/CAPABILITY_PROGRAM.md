@@ -49,11 +49,11 @@ number in parentheses is a lab PR.
 | C18 | Host network isolation | 1 | ISOLATE per family, IPv4 and IPv6, with read-back, retry and a signed outcome, in the lab on 24.04 only (217); the signed management carve-out (`configs/combat-allow.cidrs`) and unlock; only inside an engaged COMBAT (`docs/operator/COMBAT_RECOVERY.md`) | 3 |
 | C19 | Rollback and remediation | 1 | copy on first write (222; EXPERIMENTAL, off by default): a signed restore of 51 of 51 files on XFS, 50 of 51 on ext4 (over the 16 MiB cap); in-place rewrites only: `x.enc` then an unlink or rename over `x`, and `truncate` by path, are not covered (`docs/design/COPY_ON_FIRST_WRITE.md`); no remediation of persistences | 3 |
 | C20 | Automation, playbooks, SOAR | 1 | the automatic COMBAT ladder and the per-rule policy; no playbook, webhook or OpenC2 | 3 |
-| C21 | SIEM integration and export | 0 | no export of the detections ("until R15 exports the chains off the host", `docs/operator/HEARTBEAT.md`); local JSON reads and the heartbeat pull (270) only; no OCSF, syslog or OTLP | 3 |
+| C21 | SIEM integration and export | 1 (lot 276) | the signed chains exported as OCSF 1.9.0 to rotating JSONL files and to syslog over TLS (RFC 5425), off by default, each record carrying its signed row, checked by `nn-admin export verify` against the agent's key alone; a cursor per chain, at least once, an unprivileged export worker (`docs/operator/EXPORT.md`); measured on Ubuntu 26.04 and Debian 12 (lot 276's note); no application acknowledgement (RELP, OTLP), no reload | 3 |
 | C22 | Backend and multi-host correlation | 0 | the heartbeat's external verifier (270) is not a backend | 3 |
 | C23 | Anti-tamper and self-defence | 2 (provisional) | 21 LSM deny hooks and 6 optional (lot 273: the cgroup move guard; lot 273b: the write deny `file_permission`, the guard's third program; lot 273c: `task_setrlimit`, `task_setscheduler`, `task_setnice`, `task_setioprio`), the fail-opens counted and signed (215); start refused without BPF LSM, a hook's self-test (218); a fail-visible watchdog (216); the signing key decided once at boot (265, 268); unprivileged workers under Landlock and seccomp (272); the signed heartbeat's external verifier sees a stop in 6.5 s (270). Provisional: on systemd 257 and later `systemctl kill -s SIGKILL` stopped the agent through `cgroup.kill` outside a maintenance window, and any root shell could kill, freeze or move the units' cgroups on every kernel (tamper case C31; C33's `systemctl stop` was refused all along — it read C31's kill); closed by lot 273 (#489: the units' cgroups protected, the move guard; C15, C20, C31, C65–C75 refused and signed and C76 allowed inside a window on the five guests); lot 273b (the review of #489): the units' and their slices' resource limits (an OOM kill inside the write, a starvation), a cgroup v1 hierarchy where systemd runs the unified one, a write through a descriptor opened earlier and the protected pids' `oom_score_adj` refused outside a window, the move guard self-tested at every boot (C12, C18, C77–C86); lot 273c (the review of #490): another process's `prlimit`, `renice`, `chrt`, `taskset`, `ionice` of a protected process refused (four deny hooks, 21 in all), PID 1 closed to attach-mode access, no resource value below a floor registered (the agent's start, the watchdog's check of a respawn, a window's close), systemd's copy of a refused `set-property` taken back by a reload, the host's drop-ins judged by their value for our units (never moved), cgroup v1 refused only where it moves or freezes (C89–C102), provisional until its review | 3 |
 | C24 | Offline and air-gapped operation | 2 | the agent's only traffic of its own is the DNS probe to 127.0.0.1:53 (`crates/nn-linux/src/telemetry_probe.rs`); updates are an operator's action; the attestation is verified offline with a bundle (`docs/operator/INSTALL_UPGRADE_UNINSTALL.md`) | 3 |
-| C25 | Data sovereignty | 2 | the telemetry stays on the host; no model in the root process (214); the README's compliance table states design properties, not certifications (its NIS2, GDPR, DORA and CRA badges were removed on 2026-11-03) | 3 |
+| C25 | Data sovereignty | 2 | the telemetry stays on the host unless the operator signs an export overlay (lot 276: off by default; the detections and the responses by default, the flows, file drift and canary reads only each named; the exact fields that leave, `docs/operator/EXPORT.md` §1a); no model in the root process (214); the README's compliance table states design properties, not certifications (its NIS2, GDPR, DORA and CRA badges were removed on 2026-11-03) | 3 |
 | C26 | Open code, licence, inspectability | 2 | Apache-2.0 (`Cargo.toml`), the eBPF object Dual MIT/GPL, a public repository, the module map | 3 |
 | C27 | Product supply-chain security | 1 | SLSA provenance, a CycloneDX SBOM and a signed RPM in `release.yml`; install takes attested trees only (220); dependency audit, Dependabot. No release with assets since 09/10, `release-check` not run in Wave 4, SHA256SUMS and the RPM key not attested | 3 |
 | C28 | Safe content release | 1 | a transactional upgrade with a byte-for-byte rollback (220); signed overlays with an anti-rollback floor; the content is in the binary: no channel, canary or ring | 3 |
@@ -6040,3 +6040,645 @@ number in parentheses is a lab PR.
     kube-proxy, Calico and Cilium flush their chains from containers (no
     host package vouches for them): their flushes stay records.
   - No capability level moves.
+- **Lot 276 — C21: the minimal signed export (OCSF 1.9.0 to JSONL files
+  and to syslog over TLS, each record carrying its signed row; off by
+  default).**
+  - What was open: nothing left the host but the local JSON reads and the
+    heartbeat's pull (lot 270); a SIEM had no record of the agent's, and
+    no way to check one against the chains.
+  - What changed: a signed `export.local` (overlay kind 17,
+    `config-manage`, next start) turns on the export of the chains it
+    names — the detections and the actions by default, fim_drift, netflow
+    and canary_access each opt-in (the review of #499, D6) — as OCSF 1.9.0
+    records — Detection Finding (2004, with Process Activity 1007 for an
+    exec detection), Remediation 7001–7004 from the actions chain's intent
+    and outcome rows (one `correlation_uid`), File System Activity (1001),
+    Network Activity (4001), a Base Event (0) for any other row — to
+    rotating, bounded JSONL files and to a syslog receiver over TLS
+    (RFC 5424 in RFC 5425 framing; rustls 0.23.46 with rustls-rustcrypto
+    0.0.2-alpha, pinned exactly, TLS 1.3 and X25519 only). Each record's
+    `raw_data` is its signed row verbatim and `unmapped.northnarrow.row`
+    its place and links; `nn-admin export verify` checks a receiver's
+    records against the agent's public key alone (each row's seal, each
+    chain's links, across a rotation through its terminator). The chains
+    are the write-ahead log: the core reads them on its `nn-export`
+    thread and keeps one cursor per sink and chain (file, line, end,
+    `entry_hash`), moved only by the worker's acknowledgement of a row's
+    place — at least once. The worker `export` (R14) holds neither the
+    chains nor the cursors: it receives the rows' bytes, verifies each
+    with the agent's key, maps and sends; its seccomp allowlist and two
+    Landlock layers (its directory at entry; TCP connect pinned to the
+    receiver's port after its setup, ABI ≥ 4, measured) are its own; the
+    core checks every answer against what it sent and kills a worker
+    that lies. A request has a budget of 1 s, the in-flight bytes 1 MiB,
+    a receiver 30 s of stall: no receiver can hold the decision thread
+    or the supervisor (whose tick no longer waits on a slot a request
+    holds). Rows the export can no longer deliver are stage 8 of the
+    loss counters; `nn-admin export status`, the manifest's `export`, the
+    beat's `export` and the signed `export_state` rows say its state.
+    The design's one departure from the plan: the brief's worker held
+    the chains read-only and its cursors; here it holds neither (the
+    chains are root's 0600; a worker that parses a receiver's bytes reads
+    no chain).
+  - Found by the lot's own tests and mutations, fixed in the lot: a TCP
+    acknowledgement alone lost rows when a receiver closed with bytes it
+    had not read (its kernel resets the connection): a row is delivered
+    once acknowledged and the connection still up a second later (the
+    settle); rustls' default 64 KiB send buffer made every record over it
+    fail its write (`Closed`, again and again) — lifted, the sink's own
+    in-flight bound holds what rustls buffers; the CA bundle was read
+    without a bound and through a link; nn-export's test PKI was ignored
+    by `.gitignore` (`*.pem`, `*.key`) and would have failed CI; a row's
+    format is now read as the chain log reads it (no `fmt_ver` or up to 2
+    untagged, 3 under the chain's domain, a later one refused); the
+    narrowed provider's key provider loads no private key (rsa's and
+    ECDSA's private-key code unreachable by construction). The count of an
+    evicted file's rows is the manifest's, a lower bound across a restart
+    (documented). `nn-admin export verify` said OK of an empty capture:
+    `EMPTY`, exit 2.
+  - Found by the lab, fixed in the lot (round 2, Ubuntu 26.04 and Debian
+    12): a chain's backlog made a batch of the WAL one row past
+    `MAX_EXPORT_BYTES`, the core's request was refused by its own check,
+    and the controller set the worker up again on each refusal — on 26.04
+    37,213 faults in 5 s, each setup a new connection and another Landlock
+    layer, until Landlock's 16 and the pin failed (the syslog sink
+    `failed`); on Debian 12 the same rows written again and again
+    (244,942 duplicate records) and the netflow backlog never delivered.
+    Now a batch never passes its bytes, the pin is laid once per worker
+    (a setup again reuses it), and a request the core refused itself sets
+    nothing up again. Round 1 had measured nothing: the lab script put the
+    CA in `/etc/northnarrow` outside a window (the agent refused it) and
+    ran its receiver as root from the lab user's tree; both fixed in the
+    script, and `EXPORT.md` says the CA goes in inside a window.
+  - An expected gap, measured: a receiver that keeps its session, never
+    reads, then dies, loses what its kernel acknowledged (round 2: 5
+    detection rows) — RFC 5425 has no application acknowledgement
+    (`EXPORT.md` §8); the lab's `stall` phase checks the loss is only
+    rows written while it held the connection.
+  - Lab: our own QEMU guests under lease k276, the agent installed as an
+    operator does (`enable --now`) and uninstalled at the end (`--purge`,
+    inside its window), a local receiver of syslog over TLS (the lab's
+    `syslog_receiver`), `deploy/lab/export/export-guest.sh`, start =
+    oldest, both sinks. Round 1 measured nothing (the script: above);
+    round 2 found the defect above; round 3 (c796a0c3) and round 4
+    (510e1100, the slow receiver among the bounded-loss phases):
+    - Ubuntu 26.04 (kernel 7.0, Landlock ABI 8): the worker as
+      `northnarrow-worker`, no capability, `no_new_privs`, its seccomp
+      filter, its directory's rule declared, the receiver's port pinned
+      (`port_pinned` true in the manifest). Round 3: 11,003 chain rows
+      (its whole history) in the capture and in the JSONL files, none
+      missing, none other, every record verified by `nn-admin export
+      verify` (the agent's key, each chain's links); the receiver killed
+      while rows flowed: 11,097 rows, none lost, 10 duplicate records;
+      silent, garbage and chatty receivers: each burst detected, stage 5
+      unchanged (16 → 16), the worker ready, no row lost. Round 4: 50
+      checks, 50 passed (67 rows; 161 through the outage, none lost;
+      stage 5 24 → 24 in every phase).
+    - Debian 12 (kernel 6.1, Landlock ABI 2, no pin: `port_pinned` false):
+      round 4 50 of 50 (56 rows; 150 through the outage, none lost; stage
+      5 20 → 20 in every phase). Round 3's one FAIL, stage 5 20 → 59 in
+      the slow receiver's phase, is not the export's: its syslog sink was
+      idle then (in its backoff since the garbage receiver: 149 rows
+      before and after); round 4's same phase with the sink up against
+      the same receiver: 20 → 20.
+    - The bounded loss (`EXPORT.md` §8), round 4: of the rows written
+      while it held the connection, 42 of 47 (26.04) and 28 of 47
+      (Debian 12) lost behind a receiver reading 512 bytes a second that
+      then died, 43 of 46 and 31 of 46 behind one that never read; none
+      outside those windows.
+    - The cost (a flow-heavy minute, both sinks, round 4): 81,912 rows
+      in 61 s, the worker 12.3 % of a CPU, the core's `nn-export` thread
+      1.85 %, the worker's RSS 11.7 MB (26.04); 44,400 rows in 62 s,
+      6.5 % and 1.05 %, 8.0 MB (Debian 12). The agent's overhead on the
+      hooked operations (`nn-lab.sh overhead 3`, 26.04, round 3) the same
+      with the export off and on, within the noise of a loaded host.
+  - Mutations: 205 in four runs on the lot's code (IPC checks, row
+    verification, the OCSF mapping, the JSONL and syslog sinks, TLS, the
+    WAL reader, the configuration, the core's controller, `nn-admin export
+    verify`, the export's seccomp and Landlock, the supervisor, stage 8,
+    the beat): run 1 100 (87 caught; the nn-export set did not compile —
+    the ignored PKI), run 2 67 (51 caught), run 3 26 (the survivors with
+    their new tests and the sink and configuration sets again: 23
+    caught), run 4 12 (the second lab's fixes and the sites around them:
+    12 caught); each catch a named test failing. Three are argued
+    equivalent: no `fdatasync` (durability
+    across a power loss, which no test without a host crash observes),
+    the TLS 1.2 suites' retain (the provider has none: a test pins it),
+    the pin's measurement replaced by `true` (it differs only on a kernel
+    that does not enforce the Landlock rule it reports). The fuzz target
+    `ipc_check` covers the export's answers and its worker's hello.
+  - Dependencies: 76 entries more in `Cargo.lock` and in
+    `fuzz/Cargo.lock` — nn-export and 75 crates (none removed; ring is in the lockfiles as an optional dependency of
+    rustls-webpki 0.102 and is never built — CI's charter gate now refuses
+    ring, aws-lc-rs and aws-lc-sys in the build): rustls 0.23.46,
+    rustls-webpki 0.103.16 and 0.102.8, rustls-pki-types, untrusted,
+    rustls-rustcrypto 0.0.2-alpha and the RustCrypto generation it is built
+    on (aead, aes, aes-gcm, chacha20, chacha20poly1305, cipher, ctr,
+    ghash, polyval, poly1305, universal-hash, inout, hkdf, hmac, sha2 0.10,
+    digest 0.10, block-buffer, crypto-common, generic-array, signature 2,
+    ecdsa, elliptic-curve, p256, p384, primeorder, sec1, ff, group,
+    rfc6979, crypto-bigint 0.5, base16ct, der, spki, pkcs1, pkcs5, pkcs8,
+    pem-rfc7468, const-oid, rsa 0.9, num-bigint-dig, num-integer,
+    num-iter, libm, ed25519 2, ed25519-dalek 2, curve25519-dalek 4,
+    x25519-dalek 2, fiat-crypto, rand 0.8, rand_chacha, rand_core 0.6,
+    ppv-lite86, getrandom 0.2, cpufeatures, opaque-debug, paste, spin,
+    version_check, the windows-sys/windows-targets family — targets the
+    agent is not built for). Eight advisories in the provider's copies,
+    each an exception in `.cargo/audit.toml` with why it is not reached
+    and the test that holds it (EXPORT.md §7); licences all permissive
+    (Apache-2.0, MIT, ISC).
+  - Review of #499 (independent, at 096483b8: one blocker, eight points
+    to fix), each closed in the code with its test:
+    - X1, the blocker: a read inside a chain's rotation window (the
+      terminator appended to the active file, the archive not yet renamed)
+      took the cursor for one "ahead" and went back to the chain's oldest
+      file — the honest worker's answer then a violation (killed), or the
+      whole chain exported again, and `cursor_ahead` notes signed for
+      nothing. The read now waits for the rename.
+    - D1: `nn-admin export verify` maps each row again and compares the
+      record (a record with its OCSF fields rewritten is `TAMPERED`, exit
+      13); the export worker runs as an account of its own,
+      `northnarrow-export`, the only one that writes the export's
+      directory (the parse worker's account cannot). D2: the core carries
+      the terminator a read saw to the next row; a rotation without it is
+      `BROKEN` (exit 11). D3: a blank line, or a row no request can carry,
+      is lost, counted in stage 8 and signed, never retried forever; a
+      request the core refused itself leaves the worker's window as it
+      was. D4: the export says `failed` when its controller does not run
+      and `degraded` when its worker is disabled, unavailable or away past
+      30 s — never `on` — in the status, the beat (with the worker's
+      health; DEGRADED) and the manifest. D5: the worker's files are
+      bounded (`RLIMIT_FSIZE`, `SIGXFSZ` ignored; 4 GiB in all in the
+      signed text; the core measures the directory every second and kills
+      a worker past it or writing a name the sink does not write). D6: by
+      default the detections and the actions only, the flows, the file
+      drift and the canary reads each opt-in; `EXPORT.md` §1a lists every
+      field that leaves, chain by chain; README and C25 say nothing leaves
+      unless the operator signs the export. D7: an X25519 of our own
+      refuses an all-zero shared secret (RFC 8446 §7.4.2; the provider's
+      does not); `EXPORT.md` §7 quotes the provider's upstream warning
+      ("DO NOT USE IN PRODUCTION") and what the export holds against it.
+      D8: the sink's files 0600 whatever the umask, and the wait of a sink
+      down or failed (200 ms at least), each with a test. N3 (a comment
+      citing a TLS 1.2 test that did not exist), N13 (the receiver's
+      requirement, TLS 1.3 with X25519, documented); the provider's
+      webpki test reads the lockfile and the registry (CI's test job has
+      no offline `cargo metadata`). The xtask guards of the gates found
+      three forms to fix: the sink's file name in nn-proto (the core
+      names no worker-side module), nn-export's sinks opt-in, nn-admin →
+      nn-export in the module map.
+    - Found by the lab's round 5, fixed: with no row to send, the
+      controller no longer polled the worker (the D3 change), so a syslog
+      sink's rows stayed in flight, unacknowledged, though every one had
+      arrived (`caught-up` FAIL on both guests); the poll is back, a
+      tested function (bd1639ac).
+    - Mutations, run 5 (30 on the review's fixes, 196bbd35): 29 caught,
+      each by a named test; MC8 (netflow in the default chains) survived —
+      its test compared with the constant itself —, now a test names the
+      detections and the actions literally.
+    - Lab, rounds 5 to 9 (the review's phases: a chain rotated under the
+      export; `nn-admin export verify` on a rewritten record, a cut tail
+      and an empty capture; the worker killed until disabled), our guests
+      under lease k276, the agent installed as an operator does and
+      uninstalled at the end:
+      - Round 5 (196bbd35), Ubuntu 26.04 and Debian 12: the worker as
+        `northnarrow-export`, its directory its account's alone; every
+        chain row in the capture and in the files (120 and 57 rows), none
+        missing, none other, every record verified; the netflow chain
+        rotated under the export (0 → 1 archive, in 18 s and 51 s): 23,144
+        and 23,258 rows, none missing, none other, the capture verified
+        across the rotation, every row once (0 duplicate records: a read
+        "ahead" sends the chain again); `TAMPERED` (exit 13)
+        for a rewritten record, `BROKEN` (11) for a cut tail without its
+        terminator, `EMPTY` (2) for an empty capture. `caught-up` failed
+        on both: the poll above.
+      - Round 6 (ceae04f0, the poll back), Ubuntu 26.04: all of the above
+        passed, both sinks caught up (67 rows; 23,272 across the rotation
+        of 21 s). Its Debian 12 did not boot (the host's WSL,
+        `UtilAcceptVsock` at the guest's start; nothing ran).
+      - Round 7 (abd82e59, the merge with lot 275), Debian 12: setup,
+        arrive (111 rows), the rotation (0 → 1 archive in 29 s; 23,769
+        rows) and verify's `TAMPERED`, `BROKEN` and `EMPTY` all passed,
+        both sinks caught up, every row once.
+      - The phase that killed the worker from the guest script until the
+        supervisor disabled it (D4) measured nothing in rounds 5 to 7: the
+        script ended at its first kill. Round 7's probe found why: that
+        root `kill -9` of the protected worker was refused in the kernel
+        (`task_kill`), signed (NN-L-AT-001, High, posture Combat) and
+        answered by the COMBAT ladder — `BlockOutbound`, then
+        `KillProcessTree` of the sender, the script itself (systemd:
+        killed, signal 9). The product's protection, the lab's method:
+        replaced by the phase `protected`, one root kill from a transient
+        unit of its own, which the ladder ends instead of the script.
+        Round 8 (Debian 12) ran it: the kill refused, the worker untouched,
+        the export on with its worker ready, the attempt signed for the
+        sender and the sender killed by the ladder (its two checks of
+        those last facts failed on the script's reading of the sender's
+        pid — systemd expands `$` itself —, the probe's rows showed both);
+        round 9 (11950df9, the pid read through systemd's `$$`): 17 of 17
+        (the setup's 12 and the 5 of `protected`: the worker's pid
+        unchanged, NN-L-AT-001 signed for the sender, `KillProcessTree`
+        of it, success). The degraded state is the unit tests' (the
+        controller's, the beat's; mutations ME1–ME4 caught).
+    - The merge with `main` a97d5ff2 (#495, lot 275): the export's
+      overlay is kind 17 (lot 275's `nodns-allow` is 16), the IPC's
+      version 4 (lot 275's 3, then the export's requests and the hello's
+      filesystem rules), each beat carries `nodns` and `export`. Lot 275
+      writes inbound connections to the netflow chain (`"inbound": true`,
+      the peer as the source): their OCSF records are Inbound, with
+      OCSF's `bytes_out` the bytes the host received (`EXPORT.md` §3, the
+      mapping's test and the end-to-end test's writer with one inbound row
+      in ten; 4 mutations, each caught by the mapping's test). NN-L-NET-028
+      judges the worker's connect to a receiver at a public address (by
+      address, never a name): `EXPORT.md` says to list it in
+      `nodns-allow.local`.
+  - Second review of #499 (at e74d77af, after the merge with lot 275): no
+    blocker; three points to fix that the first review's fixes had opened,
+    one test missing, five notes — each closed with its test:
+    - R1: the rotation's second window (the archive renamed, the new
+      active file not made yet) — the read took the current file for
+      "evicted", went on to the next, "ahead", and back to the chain's
+      oldest file. The current file not there is now "nothing for now":
+      the read waits (the reviewer's test); after a rotation the core
+      signs `active_missing` once when the wait passes 30 s — a creation
+      that keeps failing is said, never silent.
+    - R2: `nn-admin export verify` called TAMPERED a genuine action
+      outcome whose intent its input did not hold (a file rotated between
+      them, a capture started after the intent): it now says PARTIAL
+      (exit 3) — the outcome's own fields compared, its intent's (class,
+      target, reasons, severity, message) said not verifiable there; an
+      own field rewritten stays TAMPERED (13), whose verdict now says
+      which (a row not signed, or a record rewritten: it said "not
+      signed" of a signed row).
+    - R3: a signed configuration with fewer JSONL files left the earlier
+      ones, which the core took for a stranger's and killed the honest
+      worker. The sink's open now removes the `export.jsonl.N` at or past
+      the new count (regular files only, read with `newfstatat` without
+      following a link — the export worker's seccomp keeps that one call,
+      its arguments pinned by a test) and rotates an active file past the
+      new size; the core judges the directory from the first setup of the
+      run, against the bound and the bytes of the files an earlier
+      configuration wrote larger than this one's.
+    - R4: the round's poll (lot 276's fifth lab) was decided in `round`
+      itself, its test a tautology (the reviewer's R6 survived): the
+      decision is `plan`, tested; R6, R7 (`MakeSym` in the directory's
+      rule) and R8 (an unreadable file taken as holding the cursor) are
+      caught by named tests.
+    - Notes closed: the netflow rows without `inbound` are Outbound (2);
+      EXPORT.md and RULE_POLICY.md on NN-L-NET-028 and the export worker
+      (a public receiver reached by address, the `enforce` case); the
+      umask test writes in a process of its own; the README's box; the
+      fields no signature covers (`device.hostname`, `device.uid`,
+      `metadata.product.version`) named in EXPORT.md §6. The rest is in
+      the backlog.
+    - Found by the lab's round 10, fixed: the first form of R3 raised the
+      core's bound only to the directory's bytes at the setup — at 64 MiB
+      to 1 MiB files the honest worker was killed at its first write (the
+      directory 52,959,031 bytes for a bound of 52,957,727) and the file
+      sink stopped; the bound now adds those larger files' bytes. And the
+      lab script's counts of `cursor_ahead` and eviction notes read
+      `journalctl -u northnarrow-agent`, which holds systemd's lines only
+      (the agent logs in its journal namespace): rounds 5 to 10 could see
+      no note there. Their rotation results stand on the captures (every
+      row once, 0 duplicate records: a read "ahead" sends the chain
+      again); round 11 counts the notes in the agent's journal.
+    - Mutations, runs 6 and 7 (31 on the second review's fixes and the
+      allowance): 29 caught by named tests at first; MC3 (another file's
+      wait taken as the same) and MF1 (a file's bound without its line's
+      1 MiB) survived, got their tests, and are caught.
+    - Lab: round 11 (ddf3ff45), Debian 12, under lease k276: 10 steps,
+      the export's 39 checks all passed — the rotation under load (0 → 1
+      archive in 32 s; 23,763 rows, none missing, none twice; 0
+      `cursor_ahead`, 0 eviction or `active_missing` notes, counted in the
+      agent's journal), the protection (5 of 5), `verify` on the COMBAT
+      ladder's own intent and outcome (with its intent OK; the outcome
+      alone PARTIAL, 3; its status rewritten TAMPERED, 13), and the file
+      configuration made smaller with a restart each time: from 64 MiB to
+      1 MiB files the 53 MB file kept while eight new ones filled (the
+      allowance) and the worker never killed, then from 8 files to 2 the
+      `.2` to `.4` removed at the sink's open, the worker's pid unchanged,
+      the file sink up with no fault, no directory note since the phase's
+      start; then off, `uninstall --purge`, the guest powered off clean.
+  - Third check of #499 (at 03edb5b1): one blocker, P1 — the PARTIAL of
+    the second review depended on the order of the input: in a whole
+    capture, the outcome's line moved before its intent's with the intent's
+    facts rewritten gave PARTIAL (3), not TAMPERED; P2 — a capture's head
+    cut before the intent made those facts arbitrary. The coordinator's
+    decision, done: an action outcome's record carries its intent's signed
+    row (`unmapped.northnarrow.intent_raw`, beside `intent_row`, its
+    place); `nn-admin export verify` maps each record on its own — that row
+    verified with the agent's key, checked to be this action's intent and
+    the row its place's hashes name, mapped first, then the outcome —, and
+    a row missing, bent, foreign or unsigned with the intent's facts in the
+    record is TAMPERED. PARTIAL and exit 3 are gone; an outcome the worker
+    mapped without its intent (restarted between them, the export started
+    after it) carries neither and is its row's mapping without one. The
+    intent's place (`file`, `line`, `end`) stays the record's word, as
+    every record's own place. Tests: the reviewer's (reordered and
+    rewritten 13; the head cut and rewritten 13), an outcome on its own in
+    every order (0), the attached row bent, another action's or run's,
+    misplaced, not a row, or gone (13), an outcome mapped without its
+    intent (0; given the intent's facts, 13). README's "No telemetry" line
+    is qualified by the signed export; EXPORT.md documents the allowance's
+    residual (N2). Mutations, run 8: 7 on the intent row and the
+    per-record check (the row never used, an unsigned one taken, another
+    run's or action's taken, the place's hash not checked, the verdict
+    never saying "rewritten", the worker carrying no row), 7 caught by
+    named tests.
+    - Lab, round 12 (2993bf5f), Debian 12, under lease k276: 10 steps,
+      the export's 27 checks all passed — on the COMBAT ladder's own
+      actions (the `protected` phase): the actions chain's records whole
+      OK (0); an outcome moved before its intent with its intent's facts
+      rewritten TAMPERED (13); the capture's head cut after the intent,
+      the records left OK on their own (0), the outcome rewritten among
+      them TAMPERED (13). An outcome's record: 2,117 bytes without its
+      intent's row, 2,687 with it (+570; the five of the run 2,589 to
+      2,687). Then off, `uninstall --purge`, the guest powered off clean.
+  - Fourth check of #499 (at 408505e9): P1 and P2 closed, no blocker; two
+    small points, `verify` and the documentation only (no lab):
+    - Q1: an outcome without `intent_raw` is its row's mapping — true, but
+      emptied (class 7001, severity 0, `action ?`) — and a relay can reduce
+      any outcome to it, a critical `KillProcessTree` too, which the record
+      cannot tell from a worker that had not seen the intent. `verify` now
+      says each one (`NOTICE line N: … intent not attached: action A of run
+      R`, with the correlation id) and their count in the `OK` verdict, the
+      exit 0; EXPORT.md §6 says the reduction is possible and how to get the
+      intent back from the actions chain with the public key alone.
+    - Q2: the place words no hash covers passed with any value: `verified`
+      must be `true`, `rotate` is allowed only on a later file's first row
+      and there must be the signed terminator its row's `prev_hash` names —
+      the record's own place and the intent's alike; a bent terminator is
+      now TAMPERED on the record itself.
+    - Tests: the reviewer's (`review499c_own_row_words`, `review499c_intent_raw`
+      cases a to j) and a data row as a first row's terminator. Mutations,
+      run 9: 9 on the notice and the place
+      words, 8 caught by named tests at first; MQ2 (`rotate` taken on any
+      row) survived, got its test, and is caught. CHANGELOG's first paragraph names the worker's account
+      `northnarrow-export`.
+  - Level: C21 0 → 1. A signed, verifiable export of the detections and
+    the other chains to a file and a SIEM's syslog, off by default,
+    measured on two kernels (one with the pin, one without); not 2: no
+    application acknowledgement (RELP, OTLP), no backend (C22), the
+    export's configuration at the next start only.
+  - Open: the configuration at the next start only (no reload); syslog's
+    delivery is the receiver's TCP and the settle, no application
+    acknowledgement (RELP, OTLP: R15's rest); no client certificate;
+    Landlock pins the receiver's port, not its address, and nothing below
+    ABI 4 (a per-role `socket_connect` pin in the BPF LSM would); the
+    worker's flows to its receiver are judged by the network rules like
+    any process's (NN-L-NET-028 on a receiver at a public address: list it
+    in `nodns-allow.local`); the degraded state has no lab phase (a root
+    kill of the worker is a tamper attempt: a debug trigger for the export
+    worker's faults would give one); the audit log, the status events and
+    the heartbeat are not exported.
+- **Lot 279 — R011 judges a module tool's command line, and what the exec
+  pump reads at the exec; the NET-006 listener test waits for both of its
+  records (C14, C11; lot 275's lab, the CI of #493, the review of #498).**
+  - What was open: R011 killed every exec of `insmod`, `modprobe` or `kmod`
+    that no package-manager actor ran and no kernel thread asked for, in
+    every posture (a kill from before Wave 4): the `modprobe` rootful
+    podman runs for its netfilter modules (lot 275's lab, Ubuntu 22.04: W5
+    rc 137, rootless rc 0), an administrator's `sudo modprobe dummy`, and
+    by the same rule the container runtimes', iptables' and kube-proxy's.
+    The privileged NET-006 listener test raced its own second record (the
+    CI of #493 on Ubuntu 22.04).
+  - What changed: R011 judges the exec on its command line's SYNTAX
+    (`crates/nn-core/src/decision/rules/kmod_invocation.rs`: the multi-call
+    binary's mode from `argv[0]`, getopt's options and long abbreviations)
+    and on what the exec pump read at the exec
+    (`crates/nn-linux/src/sensors/kmod_exec.rs`, kept per exec in
+    `kmod_exec_facts.rs`: the executed file's device and inode against the
+    file `/usr/bin/kmod` resolves to, `/proc/<pid>/environ` tied to the exec
+    by a pidfd and the start time). Killed: `insmod`; a `modprobe` argument with a `/` or a
+    `.ko*` suffix; `-C`, `-d`, `-S`, `--force*`, `-o`, `--remove-holders`,
+    `--remove-dependencies` and their abbreviations; any argument starting
+    with `-` after the first name; an option the tool refuses; a `kmod`
+    command but `help`/`list`/`static-nodes`/the version; a program not the
+    system's tool, of another mount namespace; `MODPROBE_OPTIONS`,
+    `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH` (read: a kill even if the
+    process has since exited — evidence, not a false positive; the
+    coordinator, 04/11), a running process's
+    environment not read, over 1 MiB, an unknown start; an argv not read
+    whole. Recorded (High, T1547.006) otherwise — a tool that had exited
+    before its environment could be read (no process with its pid, its pid
+    another's, a zombie, its memory gone whatever was read) noting it, its
+    environment not verified (the coordinator's decision of 04/11: its kill
+    would reach no one; best effort for a short-lived `modprobe`).
+    `OBSERVING_KILLS` unchanged: R011's kill narrowed, no kill added. The NET-006 test waits for as many records as listeners
+    it opened, then asserts exactly that many. No capability level moves.
+  - Decisions (04/11/2026, the coordinator, after the independent review of
+    #498): the first design — kmod's lookup emulated (configuration aliases,
+    `modules.dep`, `.symbols`, `.alias`, built-ins, soft dependencies, each
+    file's owner, `max(mtime, ctime)` and signature) — is RETIRED: the
+    review found `--remove-holders`/`--remove-dependencies` read as a
+    removal (kmod 29..34 insert), `modprobe.d`'s `install`/`remove` commands
+    not modelled (a "vouched" or "nothing to load" name running a command
+    as root), an option after the name that `POSIXLY_CORRECT` or
+    `MODPROBE_OPTIONS='--'` turns into a parameter, the exec pump blockable
+    by a FIFO in `/run/modprobe.d`, limits that fell back on the record, an
+    owner's time that root dates forward, a DKMS provenance a `mkdir` fakes.
+    R011 now reads no `modprobe.d`, index or module file. R018 OBSERVES, it
+    is not a backstop that prevents: after the load (its hook denies
+    nothing) it kills the loader's tree for a file outside the module
+    directories, and for an unowned file in them unless the loader or its
+    parent is in its loader allowlist (`systemd-udevd`, `systemd-modules`,
+    `kmod`: comms), where it is a Log; a packaged file loaded by those, or a
+    load by a kernel thread's child, has no verdict; every load is a journal
+    line. Prevention is module signing and lockdown (the host check) and lot
+    285 (the kernel's deny of an untrusted file; `kmod` out of R018's
+    allowlist goes with its redesign of R018). What R011 never covered, as
+    on `main`: a root process that loads a module without any tool (its own
+    `finit_module(2)`; with comm `kmod` maybe no verdict at all), a root
+    parent tracing the tool and rewriting its argv or environment. The
+    `install`/`remove` commands of root's `modprobe.d` run as programs the
+    exec rules judge — on `main` a user-space `modprobe` was killed first,
+    so this residual is new for it; written with `modprobe.d`'s coverage in
+    `TAPPA9_FIM_TRUST_MODEL.md` (follow-ups: a FIM rule on every
+    `modprobe.d`, a record for a `modprobe`'s children).
+  - The re-review of #498 (52e0467c): no BLOCKING finding; kmod 31 as an
+    oracle on 40,495 argv in two environments — no argv kmod reads as a
+    file, a moved tree or a caller's configuration is recorded. Its five
+    to-fix points, done: a read the exit cut short is no whole environment
+    (exited); `LD_PRELOAD`/`LD_AUDIT`/`LD_LIBRARY_PATH` killed; R018 said as
+    it is (above); the `install`/`remove` residual in the trust model; the
+    system's tool only the file `/usr/bin/kmod` resolves to.
+  - The re-check of #498 (18afcc73): no BLOCKING finding; DC-1–DC-5 closed
+    with named tests, its five mutations caught. Done in cf8c3507: DC-A — a
+    leader that exited by `pthread_exit` while another thread runs on (a
+    zombie without memory, its `environ` empty or unreadable, its pidfd not
+    exited) was read as an exit, R011's record, its `LD_*` or
+    `MODPROBE_OPTIONS` lost; the pump now reads the environment through a
+    thread with the process's memory (`/proc/<pid>/task/<tid>/environ`) and
+    judges it, refused when the threads cannot be listed while the process
+    runs or that read is not whole; a single-threaded process mid-exit
+    (DC-1) stays an exit. N-3 — `/usr/bin/kmod` and `/bin/kmod` two
+    different files: no file is the system's tool, every tool killed as an
+    unknown program (one file under both names, a merged `/usr` or a hard
+    link, is the tool). N-1 — code injected into the tool that forks and
+    lets it exit survives in the child, which a kill of the tool would not
+    reach: written as a residual. Tests: the re-check's case on a real
+    process (the test binary run again forks a process whose leader exits
+    while a thread sleeps on: `MODPROBE_OPTIONS`, `LD_PRELOAD` refused, a
+    clean environment clean), the thread path on a copy of `/proc` beside a
+    real pidfd, a read cut by the thread's or the process's exit (a FIFO
+    `environ`), the two `kmod` files. No guest round for these two: their
+    tests are the unit tests above; the R011 e2e runs in CI's KVM jobs
+    (22.04, 24.04).
+  - The check of 39fcda1c: DC-A and N-3 closed, J19 equivalent. DC-B, done
+    in d56722e1: with a relay of threads (the leader exited, each thread
+    makes the next and exits) the listing could see no thread with the
+    process's memory and the read fell back on an exit — 3,158 of 64,616
+    reads (4.9%) of a process alive throughout. With no thread seen and the
+    pidfd not exited, the pump reads `Threads:` of `/proc/<pid>/status`:
+    more than one, refused, never an exit; not readable, refused; one (a
+    single-threaded process mid-exit, DC-1), its exit. Test: the reviewer's
+    case on a real process (`a_relay_of_threads_after_its_leader_exited_is_never_an_exit`,
+    3 s of reads: never an exit, never clean; it fails without the fix).
+  - Lab of the EARLIER design (retired: the decisions above; as measured;
+    our own guests, lease `k279`; Ubuntu 22.04 5.15.0-202 and 24.04
+    6.8.0-147; on each, `main` 80c8da36 then the lot on the same
+    guest after a power cycle; `deploy/lab/malsim/kmod-check.sh` with
+    podman, docker.io, k3s with kube-proxy in ipvs mode, zfsutils-linux and
+    wireguard-tools installed for the run and removed after; no
+    `/etc/northnarrow/*.local` before or after). R011's kills over the
+    benign corpus: 22.04 `main` 43 (k3s 38 — 28 run by k3s-server, 10 by
+    systemd —, podman rootless, containerd's `ExecStartPre=-/sbin/modprobe
+    overlay` at docker.io's start, zfs-load-module, `sudo modprobe dummy`,
+    `modprobe -n`), the lot (f6650f8b) 0: iptables-legacy's `ip_tables`,
+    podman rootless's and containerd's `overlay`, k3s's eight (`br_netfilter`,
+    `ip_vs`, `iptable_filter`, `iptable_nat`, `nfnetlink-subsys-11` →
+    `nft_compat`, `nft-chain-2-nat` → `nft_chain_nat`, `overlay`…),
+    zfs-load-module's `zfs`, `modprobe dummy`/`-r dummy` and the queries
+    recorded, each with its module, file and owner; 24.04 `main` 15, the lot
+    (19050626) 1 — k3s-server's `modprobe nft-expr-counter`, a name no index
+    of 6.8.0-147's tree resolves (the counter is part of `nf_tables` there):
+    killed, the brief's fail-closed for an unresolved name. The malicious
+    shapes (insmod of a `/tmp` `.ko`, modprobe of a path, of a name nothing
+    resolves, `-d`, `-C`, a copy of modprobe in `/tmp`): killed, 6 of 6, on
+    `main` and the lot, both guests. Tamper-check, 119 rows: (case, verdict)
+    of the lot = `main`'s on each guest (22.04: 114 OK, C64 DEVIATION, C27
+    C57c KNOWN GAP, C78c C101 N/A; 24.04: 115 OK, the same but C101 run).
+    Test-ignored of the lot on each guest: 109 passed, 1 failed —
+    `r011_records_a_packaged_modprobe_and_kills_an_insmod_from_tmp`, whose
+    verdict was the expected Log but which asserted the response "none" (a
+    detect-only agent renders a Log "suppressed (detect-only)"; the test
+    fixed); `r011_kills_a_module_copied_into_the_tree_and_r018_catches_what_argv_hides`
+    (copied + `depmod` → R011 kill and R018 KillProcessTree;
+    `MODPROBE_OPTIONS="-d /tmp/…"` → R011 record, R018 Critical kill),
+    `process_kernel_module_tooling_trips_r011` and the NET-006 listener test
+    passed on both. The final tree (b79f16a8: the test fixed, built-ins'
+    aliases read, origin/main 0131394c merged), on both guests again:
+    test-ignored 89 suites, 110 passed, 0 failed on each, the four tests
+    above ok, none skipped; 24.04's kmod-check: R011's benign kills 1, the
+    same k3s-server `modprobe nft-expr-counter` — on 6.8.0-147 `nf_tables`
+    is a module (in `modules.dep`, not in `modules.builtin`), no index holds
+    the alias (`modules.alias` 0, `modules.builtin.modinfo` 0) and kmod
+    itself answers "Module nft-expr-counter not found" (`modprobe -n -v`):
+    an unresolved name, killed (then fail-closed); the built-ins' aliases
+    changed nothing there. The malicious shapes 6 of 6 killed; every other
+    benign module tool exec recorded. After the coordinator's decision of
+    04/11 (a plain name of no module: recorded, "nothing to load"),
+    4977f3ed on 24.04, a short round (k3s, the plain miss, the malicious
+    shapes): k3s's 9 module tool execs recorded, 0 killed; `modprobe
+    nn_k279_no_such_module` recorded, "nothing to load: the name resolves to
+    no module of this kernel" (modprobe's own exit 1, "not found"); the
+    malicious shapes 6 of 6 killed, among them `modprobe -S 9.9.9` of that
+    same missing name.
+  - Measured beside R011, for the Tappa Prove (the kills on a benign corpus;
+    not this lot's to change). Every run, on both guests, `main` and the lot
+    alike, went to a locked COMBAT and judged most of the corpus there. The
+    escalations: the posture's mass-write count on the container runtimes'
+    own storage (podman's `/run/libpod/alive.lck` and layer locks: ENGAGED;
+    rootless podman's first image pull, 259 writes to
+    `~/.local/share/containers/storage/libpod/bolt_state.db`: COMBAT),
+    corroborated by NN-L-EVA-002's false positive on the runtime's
+    `iptables -F` of its own chain (found, and corrected, by lot 282); on
+    22.04 `main` also an anti-tamper denial (`deb-systemd-helper`'s `rmdir`
+    at podman's purge). Then NEUTRALIZE killed, with intent and outcome
+    signed in the actions chain and the stage transitions in the audit
+    chain: rootless podman's tree (rc 137; no OOM, no systemd-oomd kill, not
+    the script's timeout, the container itself exited 0 — 22.04 the lot 1
+    of 1, `main` 1 of 1, the lot's agent again 1 of 3 rounds, the one with
+    the first image pull, the two with the image cached rc 0 with the
+    posture ENGAGED only; without an agent 3 of 3 rc 0); on 24.04 the
+    daemon's tree at docker.io's start (13 trees killed or already gone, in
+    `main`'s run and the lot's: `docker run` rc 125, the daemon's API
+    closed: EOF). In those COMBAT windows NN-L-FIM-009 killed the k3s
+    installer's `touch`, `chmod` and `tee` writing
+    `/etc/systemd/system/k3s.service.env` and `/etc/systemd/system/k3s.service`
+    (each "already gone"; 22.04 `main` 5, the lot 3; 24.04 `main` 3, the lot
+    4) and R013 k3s's bundled `runc`
+    (`/var/lib/rancher/k3s/data/<hash>/bin/runc`; 22.04 `main` 4, the lot 21;
+    24.04 `main` 11, the lot 21). The guests left as found: k3s's
+    `/var/lib/rancher` removed on both; on 24.04 podman and
+    `/var/lib/containers` were there before these runs and stay.
+  - Lab of this design (as measured; our own guests, lease `k279`; before
+    each round no agent, no pin, no `/etc/northnarrow/*.local`; install,
+    `enable --now`, settle; after it `uninstall.sh --purge`, k3s's
+    `/var/lib/rancher` removed, the guest powered off). R011's kills over
+    `kmod-check.sh`'s measured windows:
+    - Ubuntu 24.04 (6.8.0-147, kmod 31), round i, 7f55af1c, with podman
+      (there before), docker.io, k3s (kube-proxy ipvs), zfsutils-linux:
+      malicious 9 of 9 killed (M1–M6 and the new M7 `--remove-holders`,
+      M8 `MODPROBE_OPTIONS='-d /tmp/…'`, M9 `modprobe <name> -q`); benign
+      recorded — podman rootless's `overlay`, docker.io's start
+      (containerd's `overlay`, fan-net's `vxlan`), k3s's 8 (`br_netfilter`,
+      `ip_vs`, `iptable_filter`, `iptable_nat`, `nfnetlink-subsys-11`,
+      `nft-chain-2-nat`, `nft-expr-counter`, `overlay`), zfs-load-module's
+      `zfs`, `modprobe dummy`/`-r`, the queries, `modprobe
+      nn_k279_no_such_module` — but 1 killed: iptables-legacy's `modprobe`,
+      "its environment read empty". libxtables runs it with
+      `posix_spawn(…, argv, NULL)`: no environment at all, the process
+      alive (the kill landed; `iptables-legacy -L` rc 3). Fixed in
+      16df634f (an empty read from a process that still has its memory is
+      an empty environment). Outside the windows the script's own `kmod
+      --version` was killed "already gone", having exited before the pump
+      read it — the kill that reaches no one the coordinator then ruled a
+      record (52c00fe3). Test-ignored: 91 suites, 120 passed, 0 failed, the
+      lot's four tests ok.
+    - 24.04 round j, 52e0467c (k3s, B1, B7–B9, M1–M9): iptables-legacy's
+      `modprobe ip_tables` recorded (rc 0), k3s's 9 recorded, malicious 9 of
+      9 killed, benign kills 0.
+    - Ubuntu 22.04 (5.15.0-202, kmod 29), round i, 52c00fe3, the full
+      corpus (podman, docker.io, k3s, zfsutils-linux): benign kills 0 —
+      iptables-legacy, podman rootless (its rc 137 is the COMBAT ladder
+      below, not R011), docker.io's start, k3s's 8, zfs ×2, `dummy`/`-r`,
+      the queries, B9 recorded; malicious 9 of 9 killed; no record "exited
+      before its environment could be read" in the windows. Test-ignored:
+      91 suites, 120 passed, 0 failed, the lot's four tests ok (copied +
+      `depmod` by name: R011 record, R018 KillProcessTree after the load;
+      `-d`, `MODPROBE_OPTIONS`, `-q` after the name: R011 kills).
+    - 24.04 round k, d0f2284f (the re-review's fixes; k3s, B1, B7–B9,
+      M1–M10): benign kills 0 (k3s's 9 recorded), malicious 10 of 10
+      killed — M10 `LD_PRELOAD=/nonexistent.so modprobe …` killed, "the
+      dynamic linker runs code of the caller's choosing in the tool".
+    - 22.04 round k, d0f2284f (k3s, B1, B7–B9, M1–M10): benign kills 0
+      (k3s's 9 recorded), malicious 10 of 10 killed. Test-ignored: 91
+      suites, 118 passed, 2 FAILED — both R011 e2e (and the CI's KVM jobs on
+      cd355238, 22.04 and 24.04, the same two): the test's by-name
+      `modprobe dummy` killed, because `cargo test` runs test binaries with
+      `LD_LIBRARY_PATH` set (its target directories and the toolchain's
+      lib, even for a caller with none) and the tool inherited it — DC-2 as
+      written. 77822f1c spawns the tool in the e2e without
+      `MODPROBE_OPTIONS`/`LD_*` (a case sets the one it tests).
+    - Round l, 77822f1c: `test-one` of the e2e target without an install
+      step — every fixture agent but the first failed to start ("never
+      opened admin socket"), 1 passed 17 failed on both guests: the step
+      list's fault.
+    - Round m, 77822f1c (install, `enable --now`, settle, `test-one
+      detection_rules_at_scale_privileged_e2e`, uninstall): 22.04 and 24.04
+      each 18 passed, 0 failed — the three R011 e2e ok (by name recorded,
+      R018 after the load; `-d`, `MODPROBE_OPTIONS`, `-q` after the name,
+      `LD_PRELOAD` killed); the guests left clean.
+  - Open: `modprobe -S` outside a package transaction (an initramfs build
+    by hand), a quiet probe written `modprobe <name> -q` and a `modprobe`
+    run with `LD_LIBRARY_PATH` set are killed; a tool that exits before the
+    exec pump reads its environment is recorded on its command line alone
+    (a burst of execs can make that likelier: `-d` or a path then R018's
+    after the load, `-C` with an `install` nobody's); code injected into the
+    tool can outlive it in a forked child (N-1); the load itself is
+    prevented only by the kernel's signature policy and lot 285. Follow-ups
+    (the re-check's N-2, N-4): the refused variables searched before an
+    error of a read cut by the exit; the e2e's and the lab's
+    `MODPROBE_OPTIONS`/`LD_PRELOAD` kills made deterministic (a preload that
+    sleeps in its constructor).

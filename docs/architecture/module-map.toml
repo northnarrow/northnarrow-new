@@ -91,13 +91,13 @@ allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidenc
 planned = false
 
 [crates.nn-export]
-about = "the export worker: WAL, OCSF, OTLP/syslog with an at-least-once cursor (R15)"
+about = "the export (lot 276, R15's first step): the chains as the WAL with an at-least-once cursor per sink and chain, OCSF 1.9.0, a JSONL file and syslog over TLS (rustls with the RustCrypto provider) run in the export worker; OTLP later"
 allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence", "nn-core"]
-planned = true
+planned = false
 
 [crates.nn-admin]
 about = "the operator client (R10, lab PR 259: admin_cli and the command line, from the agent): what it reads of the Linux host and of the agent goes through its `host::AdminHost`, which the agent implements — no arc to nn-linux, the plan's §2.1 and the decision lab PR 239 left to R10; the nn-admin binary stays a shim of the agent package"
-allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence", "nn-core"]
+allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence", "nn-core", "nn-export"]
 forbid_unsafe = true
 planned = false
 
@@ -166,6 +166,11 @@ planned = false
 # 261): `main.rs`'s start is here, in its typed phases — the command line,
 # the checks, the attach, the evidence, the subsystems, READY
 "boot" = "northnarrow-agent"
+# post-plan (lot 276): the export's composition — the core's thread (the
+# chains read as the WAL, the cursors), the export worker's entry in
+# nn-linux's sandbox, the overlay's load; nn-export holds the logic, which
+# may not name nn-linux
+"export" = "northnarrow-agent"
 # post-plan (lab PR 241, R04a): the binary's version, cargo features and BPF
 # guard mode, from `audit` (a `cfg!(feature)` is read in the agent, §4.1
 # rule 4)

@@ -29,6 +29,9 @@ pub mod agent_id;
 /// The command line: clap's dispatcher, the rendering, the exit codes (was
 /// the agent's `bin/nn_admin.rs`).
 pub mod cli;
+/// Lot 276: `export status` and `export verify` (the receiver's check of
+/// the records it got against the agent's key).
+pub mod export;
 /// R12c-2 (lab PR 270): the heartbeat's export and its external verifier.
 pub mod heartbeat;
 /// What nn-admin needs of the host it runs on and of the agent it

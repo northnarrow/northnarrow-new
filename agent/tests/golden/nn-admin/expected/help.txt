@@ -28,6 +28,7 @@ exit: 2
 |   fim                      Tappa 9 C6 — FIM operator surface. `fim baseline` queues a re-compute of the watched-paths SHA-256 baseline (signed payload, single-sig `fim-manage` role per §13 Q6). `fim report [--since <unix-ts>]` reads the chained drift log (signed payload, single-sig `fim-read` role)
 |   canary                   Tappa 9.5 K6 — deception canary operator surface. `canary deploy` installs a new canary (File / Process / Network / Credential variants), `canary list` streams the chained registry log, `canary burn` permanently retires a canary, `canary refresh` re-renders the on-disk artefact. Authorisation: `canary-read` for `list`; `canary-manage` for `deploy` / `burn` / `refresh` (§12 Q7 SPLIT lock-in)
 |   net                      Tappa 10 N7 — network observability operator surface. `net flows` reads the chained netflow log, `net listeners` snapshots active listeners, `net resolve <ip>` looks up DNS attribution, `net fingerprint --flow-id <hex>` dumps JA3/JA4. All four are `Role::NetRead` (1-of-N quorum per §13 Q6)
+|   export                   Lot 276 — the export of the signed chains as OCSF 1.9.0 records (a JSONL file, syslog over TLS), turned on by a signed `export.local` (docs/operator/EXPORT.md). `export status` shows it (signed: give --key); `export verify`, run where the records arrive, checks each one's row against the agent's public key and each chain's continuity
 |   trusted-installer-grant  FIM-009 self-upgrade (§15.1) — arm the trusted-installer override for an in-place agent upgrade. Submits a 1-of-N (M=1) quorum-signed grant; the admin.pub line for `--key` MUST carry the `trusted-installer` role. While the window is open the agent's FS pin is suspended (so install.sh can replace the protected binary) AND a write to the agent's OWN systemd units is downgraded from kill to an audit Log. The window is bounded by --window-secs (clamped to the agent's 600 s ceiling) and by the next agent restart. Operator flow: grant → install.sh → `systemctl restart` → signed `fim baseline`
 |   response                 External audit CMB-016 — undo what the response layer did: `response status` lists the processes the agent holds in its containment scopes, the quarantine vault and the COMBAT stage (`audit-read`); `response release` returns a contained process to the cgroup it came from and `response restore` writes a quarantined file back out of the vault (`response-manage`). The agent does the work and records it in the signed audit log
 |   remediate                Lab PR 222 — undo what ransomware rewrote, from the copy-on-first- write journal (`remediate ransomware`, `response-manage`). The agent restores and signs one `cow_restore` row per file
@@ -81,6 +82,7 @@ exit: 0
 |   fim                      Tappa 9 C6 — FIM operator surface. `fim baseline` queues a re-compute of the watched-paths SHA-256 baseline (signed payload, single-sig `fim-manage` role per §13 Q6). `fim report [--since <unix-ts>]` reads the chained drift log (signed payload, single-sig `fim-read` role)
 |   canary                   Tappa 9.5 K6 — deception canary operator surface. `canary deploy` installs a new canary (File / Process / Network / Credential variants), `canary list` streams the chained registry log, `canary burn` permanently retires a canary, `canary refresh` re-renders the on-disk artefact. Authorisation: `canary-read` for `list`; `canary-manage` for `deploy` / `burn` / `refresh` (§12 Q7 SPLIT lock-in)
 |   net                      Tappa 10 N7 — network observability operator surface. `net flows` reads the chained netflow log, `net listeners` snapshots active listeners, `net resolve <ip>` looks up DNS attribution, `net fingerprint --flow-id <hex>` dumps JA3/JA4. All four are `Role::NetRead` (1-of-N quorum per §13 Q6)
+|   export                   Lot 276 — the export of the signed chains as OCSF 1.9.0 records (a JSONL file, syslog over TLS), turned on by a signed `export.local` (docs/operator/EXPORT.md). `export status` shows it (signed: give --key); `export verify`, run where the records arrive, checks each one's row against the agent's public key and each chain's continuity
 |   trusted-installer-grant  FIM-009 self-upgrade (§15.1) — arm the trusted-installer override for an in-place agent upgrade. Submits a 1-of-N (M=1) quorum-signed grant; the admin.pub line for `--key` MUST carry the `trusted-installer` role. While the window is open the agent's FS pin is suspended (so install.sh can replace the protected binary) AND a write to the agent's OWN systemd units is downgraded from kill to an audit Log. The window is bounded by --window-secs (clamped to the agent's 600 s ceiling) and by the next agent restart. Operator flow: grant → install.sh → `systemctl restart` → signed `fim baseline`
 |   response                 External audit CMB-016 — undo what the response layer did: `response status` lists the processes the agent holds in its containment scopes, the quarantine vault and the COMBAT stage (`audit-read`); `response release` returns a contained process to the cgroup it came from and `response restore` writes a quarantined file back out of the vault (`response-manage`). The agent does the work and records it in the signed audit log
 |   remediate                Lab PR 222 — undo what ransomware rewrote, from the copy-on-first- write journal (`remediate ransomware`, `response-manage`). The agent restores and signs one `cow_restore` row per file
@@ -1816,6 +1818,129 @@ exit: 0
 --- stderr
 (empty)
 
+### help.export.long
+$ nn-admin export --help
+exit: 0
+--- stdout
+| Lot 276 — the export of the signed chains as OCSF 1.9.0 records (a JSONL file, syslog over TLS), turned on by a signed `export.local` (docs/operator/EXPORT.md). `export status` shows it (signed: give --key); `export verify`, run where the records arrive, checks each one's row against the agent's public key and each chain's continuity
+|
+| Usage: nn-admin export <COMMAND>
+|
+| Commands:
+|   status  The export's configuration, its worker, each sink's state and each chain's cursor, and stage 8 (rows it can no longer deliver). Signed telemetry: give --key (without it the agent withholds it)
+|   verify  Check exported records (the JSONL file's lines, or a syslog receiver's messages, one a line) against the agent's public key: each record's row signed and named, each record its row's mapping (an action's outcome with its intent's signed row), each chain's rows linked. Exit 0, 13 a record that does not verify, 11 a chain that does not follow, 2 lines that are no record
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+--- stderr
+(empty)
+
+### help.export.short
+$ nn-admin export -h
+exit: 0
+--- stdout
+(the same bytes as in help.export.long)
+--- stderr
+(empty)
+
+### help.export.subcommand
+$ nn-admin help export
+exit: 0
+--- stdout
+(the same bytes as in help.export.long)
+--- stderr
+(empty)
+
+### help.export.without-subcommand
+$ nn-admin export
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| Lot 276 — the export of the signed chains as OCSF 1.9.0 records (a JSONL file, syslog over TLS), turned on by a signed `export.local` (docs/operator/EXPORT.md). `export status` shows it (signed: give --key); `export verify`, run where the records arrive, checks each one's row against the agent's public key and each chain's continuity
+|
+| Usage: nn-admin export <COMMAND>
+|
+| Commands:
+|   status  The export's configuration, its worker, each sink's state and each chain's cursor, and stage 8 (rows it can no longer deliver). Signed telemetry: give --key (without it the agent withholds it)
+|   verify  Check exported records (the JSONL file's lines, or a syslog receiver's messages, one a line) against the agent's public key: each record's row signed and named, each record its row's mapping (an action's outcome with its intent's signed row), each chain's rows linked. Exit 0, 13 a record that does not verify, 11 a chain that does not follow, 2 lines that are no record
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+
+### help.export.status.long
+$ nn-admin export status --help
+exit: 0
+--- stdout
+| The export's configuration, its worker, each sink's state and each chain's cursor, and stage 8 (rows it can no longer deliver). Signed telemetry: give --key (without it the agent withholds it)
+|
+| Usage: nn-admin export status [OPTIONS]
+|
+| Options:
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|       --json                           
+|       --key <KEY>                      A key with `audit-read` or `telemetry-read` (one audit row per request)
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.export.status.short
+$ nn-admin export status -h
+exit: 0
+--- stdout
+(the same bytes as in help.export.status.long)
+--- stderr
+(empty)
+
+### help.export.status.subcommand
+$ nn-admin help export status
+exit: 0
+--- stdout
+(the same bytes as in help.export.status.long)
+--- stderr
+(empty)
+
+### help.export.verify.long
+$ nn-admin export verify --help
+exit: 0
+--- stdout
+| Check exported records (the JSONL file's lines, or a syslog receiver's messages, one a line) against the agent's public key: each record's row signed and named, each record its row's mapping (an action's outcome with its intent's signed row), each chain's rows linked. Exit 0, 13 a record that does not verify, 11 a chain that does not follow, 2 lines that are no record
+|
+| Usage: nn-admin export verify [OPTIONS]
+|
+| Options:
+|       --agent-pubkey <AGENT_PUBKEY>
+|           The agent's public key, 64 hex characters (its `agent.sig.pub`)
+|       --agent-pubkey-file <AGENT_PUBKEY_FILE>
+|           A file holding it
+|       --file <FILE>
+|           The records (default: standard input)
+|       --json
+|           
+|   -h, --help
+|           Print help
+--- stderr
+(empty)
+
+### help.export.verify.short
+$ nn-admin export verify -h
+exit: 0
+--- stdout
+(the same bytes as in help.export.verify.long)
+--- stderr
+(empty)
+
+### help.export.verify.subcommand
+$ nn-admin help export verify
+exit: 0
+--- stdout
+(the same bytes as in help.export.verify.long)
+--- stderr
+(empty)
+
 ### help.trusted-installer-grant.long
 $ nn-admin trusted-installer-grant --help
 exit: 0
@@ -2202,7 +2327,7 @@ exit: 0
 | Usage: nn-admin config overlay set [OPTIONS] --file <FILE> --key <KEY> <KIND>
 |
 | Arguments:
-|   <KIND>  fim-paths, process-comm-allowlist, netflow-comm-allowlist, netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout, escalation-allow, canary-readers, cow-guard, execq-hashes, exec-policy, rule-policy
+|   <KIND>  fim-paths, process-comm-allowlist, netflow-comm-allowlist, netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout, escalation-allow, canary-readers, cow-guard, execq-hashes, exec-policy, rule-policy, export
 |
 | Options:
 |       --file <FILE>                    The overlay content to store

@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use nn_linux::worker::supervisor::{Config, ImageLauncher, NoPidRoles, PidRoles, PinnedPidRoles};
-use nn_linux::worker::{SelfImage, WorkerAccount, Workers, WORKER_USER};
+use nn_linux::worker::{SelfImage, WorkerAccount, Workers, EXPORT_USER, WORKER_USER};
 use nn_proto::ipc::WorkerKind;
 use tracing::{info, warn};
 
@@ -34,11 +34,14 @@ pub(crate) fn own_launch(
         exec_path: image.exec_path(),
         image: image.identity(),
         uid: account.uid,
+        export_uid: WorkerAccount::lookup(EXPORT_USER).ok().map(|a| a.uid),
     })
 }
 
-/// Start the supervisor. `image`: what `main` opened at boot.
-pub(crate) fn start(cli: &Cli, image: std::io::Result<SelfImage>) -> Workers {
+/// Start the supervisor. `image`: what `main` opened at boot; `export_on`:
+/// the export's signed configuration turns it on (lot 276), its worker
+/// starts beside the parse worker.
+pub(crate) fn start(cli: &Cli, image: std::io::Result<SelfImage>, export_on: bool) -> Workers {
     let image = match image {
         Ok(i) => Some(i),
         Err(e) => {
@@ -47,6 +50,7 @@ pub(crate) fn start(cli: &Cli, image: std::io::Result<SelfImage>) -> Workers {
         }
     };
     let account = WorkerAccount::lookup(WORKER_USER);
+    let export_account = WorkerAccount::lookup(EXPORT_USER);
     // R14b: no role until this boot's deny hooks are attached ([`arm`]):
     // an earlier boot's pinned hooks read any entry as both roles
     let roles: Arc<dyn PidRoles> = Arc::new(NoPidRoles);
@@ -54,13 +58,18 @@ pub(crate) fn start(cli: &Cli, image: std::io::Result<SelfImage>) -> Workers {
         launcher: Arc::new(ImageLauncher {
             image,
             account,
+            export_account,
             extra_args: Vec::new(),
         }),
         roles,
         report: Arc::new(|source: &str, detail: &str| {
             northnarrow_agent::boot::degradation::report(source, detail);
         }),
-        kinds: vec![WorkerKind::Parse],
+        kinds: if export_on {
+            vec![WorkerKind::Parse, WorkerKind::Export]
+        } else {
+            vec![WorkerKind::Parse]
+        },
         debug_dir: cli.admin_socket.parent().map(std::path::Path::to_path_buf),
     });
     if let Err(e) = workers.start() {

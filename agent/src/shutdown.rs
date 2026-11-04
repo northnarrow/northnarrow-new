@@ -17,6 +17,7 @@ use crate::run_loop::Stopped;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stop(
     cli: &Cli,
+    export: Option<northnarrow_agent::export::controller::Running>,
     workers: &nn_linux::worker::Workers,
     heartbeat: &Option<northnarrow_agent::heartbeat::Heartbeat>,
     execq_handle: Option<northnarrow_agent::execq::Handle>,
@@ -35,6 +36,11 @@ pub(crate) fn stop(
     // reason — a verifier off the host tells a stop from a silence.
     if let Some(hb) = heartbeat {
         hb.stop(stop_reason);
+    }
+    // Lot 276: the export's thread first — its cursors written, its stop
+    // row signed — while its worker still answers.
+    if let Some(e) = export {
+        e.stop();
     }
     // R14a: the workers end with their core (they would anyway: their
     // parent-death signal), their pids out of PROTECTED_PIDS first.
