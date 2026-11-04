@@ -239,6 +239,51 @@ mod tests {
         let why = environment(empty.id(), started(&empty)).unwrap_err();
         assert!(why.contains("read empty"), "{why}");
         stop(empty);
+
+        // exited, not yet reaped (a zombie still holds its pid and start)
+        let mut zombie = sleeper(&[("PATH", "/usr/bin")]);
+        let start = started(&zombie);
+        zombie.kill().unwrap();
+        let pid = zombie.id();
+        for _ in 0..200 {
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            if state
+                .rsplit_once(')')
+                .is_some_and(|(_, r)| r.trim_start().starts_with('Z'))
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let why = environment(pid, start).unwrap_err();
+        assert!(why.contains("exited while"), "{why}");
+        zombie.wait().unwrap();
+
+        // larger than the bound: not read whole
+        let big = "x".repeat(120_000);
+        let vars: Vec<(String, &str)> = (0..9)
+            .map(|i| (format!("NN_K279_BIG{i}"), big.as_str()))
+            .collect();
+        let env: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let large = sleeper(&env);
+        let why = environment(large.id(), started(&large)).unwrap_err();
+        assert!(why.contains("larger than 1048576 bytes"), "{why}");
+        stop(large);
+    }
+
+    /// Another user's process, which an unprivileged reader may not read
+    /// (`/proc/1/environ`): said so (the agent, root with
+    /// `CAP_SYS_PTRACE`, reads every one).
+    #[test]
+    fn an_environment_not_readable_is_said_so() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("run as root: /proc/1/environ is readable, nothing to show");
+            return;
+        }
+        let start = proc_start_ns(1).expect("init's start");
+        let why = environment(1, start).unwrap_err();
+        assert!(why.contains("could not be read"), "{why}");
     }
 
     /// The program is the system's tool by device and inode: the file a

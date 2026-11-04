@@ -402,6 +402,15 @@ mod tests {
         assert_eq!(v.severity, Severity::High);
         assert_eq!(v.action, ResponseAction::KillProcess);
         assert!(v.reasoning.contains("argv was not read"), "{}", v.reasoning);
+        // the reason is the argv's wherever the program lives (lot 279)
+        let e = read_ok(spawn("modprobe", "/tmp/modprobe"));
+        let v = rule().evaluate(&e).expect("fires");
+        assert!(
+            v.reasoning
+                .contains("its argv was not read by the kernel: no argument was checked"),
+            "{}",
+            v.reasoning
+        );
     }
 
     // ─── Lot 279 — by name, the system's tool, nothing moved ────────
@@ -584,6 +593,15 @@ mod tests {
             assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
             assert!(v.reasoning.contains(why), "{why}: {}", v.reasoning);
         }
+        // a path the kernel did not give (it names no root then): the
+        // caller's path, and the pump's device and inode, are judged
+        let mut unnamed = modprobe(&["dummy"]);
+        if let Event::ProcessSpawn { exe, .. } = &mut unnamed {
+            exe.path.clear();
+            exe.root = (8, 2);
+        }
+        let v = rule().evaluate(&read_ok(unnamed)).expect("recorded");
+        assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
     }
 
     /// Lot 279: the kernel-thread exemption and the allowlist come first,

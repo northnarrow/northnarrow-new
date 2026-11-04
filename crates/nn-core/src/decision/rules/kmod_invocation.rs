@@ -564,7 +564,11 @@ mod tests {
                 "{a:?}: {s:?}"
             );
         }
-        for a in [&["modprobe", "--", "-r"][..], &["modprobe", "-"]] {
+        for a in [
+            &["modprobe", "--", "-r"][..],
+            &["modprobe", "-"],
+            &["modprobe", "--", "--", "x"],
+        ] {
             let s = modprobe_of(a);
             assert!(
                 killed(&s).is_some_and(|w| w.contains("starts with '-'")),
