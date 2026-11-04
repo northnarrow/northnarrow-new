@@ -112,6 +112,13 @@ struct Fixture {
 
 impl Fixture {
     fn setup() -> Self {
+        Self::setup_with(None)
+    }
+
+    /// Lot 278: with `policy`, a signed per-rule policy set through the
+    /// admin socket once the agent runs (`nn-admin policy set`, a key with
+    /// `config-manage`, nn-admin from a root-owned copy).
+    fn setup_with(policy: Option<&str>) -> Self {
         wipe_pin_tree();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let dir = tempdir.path().to_path_buf();
@@ -130,6 +137,32 @@ impl Fixture {
             .status()
             .expect("spawn nn-admin init");
         assert!(status.success(), "nn-admin init failed");
+        // lot 278: a second key holding `config-manage`, for the policy
+        let policy_key = dir.join("policy.priv");
+        if policy.is_some() {
+            let pub_tmp = dir.join("policy.pub");
+            let status = Command::new(nn_admin_bin())
+                .arg("init")
+                .arg("--priv-out")
+                .arg(&policy_key)
+                .arg("--pub-append")
+                .arg(&pub_tmp)
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .status()
+                .expect("spawn nn-admin init (policy key)");
+            assert!(status.success(), "nn-admin init (policy key) failed");
+            let hex = std::fs::read_to_string(&pub_tmp)
+                .expect("read the policy key's pub")
+                .lines()
+                .find(|l| !l.starts_with('#') && !l.trim().is_empty())
+                .expect("a pub line")
+                .trim()
+                .to_string();
+            let mut admin_pub = std::fs::read_to_string(state.admin_pub()).expect("admin.pub");
+            admin_pub.push_str(&format!("{hex} config-manage\n"));
+            std::fs::write(state.admin_pub(), admin_pub).expect("write admin.pub");
+        }
 
         let combat = dir.join("combat-rules.v4");
         std::fs::copy(configs().join("combat-rules.v4"), &combat).expect("copy combat rules");
@@ -202,6 +235,32 @@ impl Fixture {
             std::thread::sleep(POLL_INTERVAL);
         }
 
+        if let Some(policy) = policy {
+            let file = dir.join("rule-policy.candidate");
+            std::fs::write(&file, policy).expect("write the policy");
+            // a root-owned copy: no root exec from the build tree
+            let admin = common::install_to_priv_bin(Path::new(nn_admin_bin()));
+            let out = Command::new(&admin.path)
+                .args(["policy", "set", "--file"])
+                .arg(&file)
+                .arg("--key")
+                .arg(&policy_key)
+                .arg("--agent-id-file")
+                .arg(state.agent_id_file())
+                .arg("--socket")
+                .arg(&socket)
+                .stdin(Stdio::null())
+                .output()
+                .expect("spawn nn-admin policy set");
+            assert!(
+                out.status.success(),
+                "nn-admin policy set failed: {}{}\nagent.log tail:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+                tail(&agent_log)
+            );
+        }
+
         Self {
             _tempdir: tempdir,
             agent_log,
@@ -263,6 +322,9 @@ fn tmp_sleep() -> (tempfile::TempDir, PathBuf) {
         .prefix("nnresp")
         .tempdir_in("/tmp")
         .expect("tempdir under /tmp");
+    // lot 278: run as `nobody` (R001's tree kill, in every posture)
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod the offender's directory");
     let bin = dir.path().join("sleep");
     std::fs::copy("/bin/sleep", &bin).expect("copy /bin/sleep");
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -270,7 +332,9 @@ fn tmp_sleep() -> (tempfile::TempDir, PathBuf) {
 }
 
 /// (a) An exec from `/tmp` (R001, or the exec rule that matches it first;
-/// since lab PR 166 a tree kill either way) by a child of the harness. A
+/// since lab PR 166 a tree kill either way) by a child of the harness, run
+/// as `nobody` (lot 278: root's exec from `/tmp` is R009's, killed in
+/// COMBAT or under `enforce R009` — below). A
 /// decoy with the same name and the same parent runs beside it. The
 /// record names the offender and the bare action name (carried out); the
 /// offender died by SIGKILL; the decoy and the harness run on.
@@ -294,17 +358,25 @@ fn tmp_exec_kill_hits_the_offender_only() {
             .expect("spawn the decoy"),
     );
     let (_dir, bin) = tmp_sleep();
-    let mut offender = Spawned(
+    let mut offender = Spawned({
+        use std::os::unix::process::CommandExt;
         Command::new(&bin)
             .arg("120")
+            .uid(NOBODY)
+            .gid(NOBODY)
             .stdout(Stdio::null())
             .spawn()
-            .expect("exec the /tmp offender"),
-    );
+            .expect("exec the /tmp offender")
+    });
     let pid = offender.0.id();
 
     let rec = fx.wait_record_of(pid);
     assert_eq!(rec["exe"].as_str(), bin.to_str(), "record: {rec}");
+    assert_eq!(
+        rec["rule_id"].as_str(),
+        Some("R001_ExecFromTmp"),
+        "record: {rec}"
+    );
     let action = rec["verdict"]["Rule"].as_str();
     assert_eq!(
         action,
@@ -338,7 +410,6 @@ fn tmp_exec_kill_hits_the_offender_only() {
 }
 
 /// `nobody` on Debian and Ubuntu.
-#[cfg(feature = "debug-trigger")]
 const NOBODY: u32 = 65534;
 
 /// The lab's root dropper (lab PR 166), built with `cc` in a fresh
@@ -401,112 +472,136 @@ int main(void) {
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 #[cfg(feature = "debug-trigger")]
 fn tmp_dropper_forked_child_dies_with_it() {
-    use std::io::{BufRead, BufReader};
-    use std::os::unix::process::CommandExt;
     let _eni = EniIptablesGuard::install();
     // Built before the agent runs: nothing here should draw a verdict.
     let (_dir, bin) = tmp_fork_dropper();
     let fx = Fixture::setup();
 
-    for (uid, rule) in [
-        (None, "R009_RootExecFromUserPath"),
-        (Some(NOBODY), "R001_ExecFromTmp"),
+    for (uid, rule, killed) in [
+        (None, "R009_RootExecFromUserPath", false),
+        (Some(NOBODY), "R001_ExecFromTmp", true),
     ] {
-        let held = uid.is_none();
-        // Lab PR 269 (review of #475): the decision thread stands still
-        // while the dropper starts, so its child exists — it has written its
-        // pid — before the verdict, every run (with the decision on a thread
-        // of its own the kill could land before the fork on ubuntu2204).
-        fx.stall_decision(4);
-        let mut cmd = Command::new(&bin);
-        cmd.stdout(Stdio::piped());
-        if let Some(id) = uid {
-            cmd.uid(id).gid(id);
-        }
-        let mut dropper = Spawned(cmd.spawn().expect("exec the /tmp dropper"));
-        let pid = dropper.0.id();
-        let mut line = String::new();
-        BufReader::new(dropper.0.stdout.take().expect("dropper stdout"))
-            .read_line(&mut line)
-            .expect("read the child's pid");
-        let child: u32 = line.trim().parse().unwrap_or_else(|_| {
-            panic!("uid {uid:?}: no child pid ({line:?}) though the verdict was held back")
-        });
-        assert!(
-            !common::pid_gone(child) && runs_image(child, &bin),
-            "uid {uid:?}: the child {child} runs the dropper's image before the verdict"
-        );
+        dropper_case(&fx, &bin, uid, rule, killed);
+    }
+}
 
-        let rec = fx.wait_record_of(pid);
-        assert_eq!(
-            rec["rule_id"].as_str(),
-            Some(rule),
-            "uid {uid:?}; record: {rec}"
-        );
-        assert_eq!(rec["exe"].as_str(), bin.to_str(), "record: {rec}");
-        if held {
-            // lot 278: detected, High, the kill held in OBSERVING
-            assert_eq!(
-                rec["verdict"],
-                serde_json::json!({"Rule": "Log"}),
-                "record: {rec}"
-            );
-            assert_eq!(rec["severity"], "High", "record: {rec}");
-            assert_eq!(rec["posture_at"], "Observing", "record: {rec}");
-            std::thread::sleep(Duration::from_secs(2));
-            assert!(
-                !common::pid_gone(pid) && !common::pid_gone(child),
-                "the root dropper or its child was killed in OBSERVING; record: {rec}"
-            );
-            // SAFETY: plain kill(2) of the child this test's dropper forked.
-            unsafe { libc::kill(child as i32, libc::SIGKILL) };
-            drop(dropper);
-            let gone = common::wait_until(Duration::from_secs(5), || {
-                processes_of(&bin).is_empty().then_some(())
-            });
-            assert!(
-                gone.is_some(),
-                "the root dropper's processes: {:?}",
-                processes_of(&bin)
-            );
-            continue;
-        }
+/// Lot 278: under a signed `enforce R009` (the operator's choice) a root
+/// dropper from `/tmp` dies with its forked child in every posture — the
+/// kill of the tree, R009's, as before the decision of 03/11/2026.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+#[cfg(feature = "debug-trigger")]
+fn root_tmp_dropper_under_enforce_r009_dies_with_its_child() {
+    let _eni = EniIptablesGuard::install();
+    let (_dir, bin) = tmp_fork_dropper();
+    let fx = Fixture::setup_with(Some("enforce R009\n"));
+    dropper_case(&fx, &bin, None, "R009_RootExecFromUserPath", true);
+}
+
+/// One run of the dropper (`uid`: `None` for root) under `fx`: its record
+/// is `rule`'s, and its tree is killed (`killed`) or recorded with the kill
+/// held and left running (then the test ends it).
+#[cfg(feature = "debug-trigger")]
+fn dropper_case(fx: &Fixture, bin: &Path, uid: Option<u32>, rule: &str, killed: bool) {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::CommandExt;
+    let bin = bin.to_path_buf();
+    let held = !killed;
+    // Lab PR 269 (review of #475): the decision thread stands still
+    // while the dropper starts, so its child exists — it has written its
+    // pid — before the verdict, every run (with the decision on a thread
+    // of its own the kill could land before the fork on ubuntu2204).
+    fx.stall_decision(4);
+    let mut cmd = Command::new(&bin);
+    cmd.stdout(Stdio::piped());
+    if let Some(id) = uid {
+        cmd.uid(id).gid(id);
+    }
+    let mut dropper = Spawned(cmd.spawn().expect("exec the /tmp dropper"));
+    let pid = dropper.0.id();
+    let mut line = String::new();
+    BufReader::new(dropper.0.stdout.take().expect("dropper stdout"))
+        .read_line(&mut line)
+        .expect("read the child's pid");
+    let child: u32 = line.trim().parse().unwrap_or_else(|_| {
+        panic!("uid {uid:?}: no child pid ({line:?}) though the verdict was held back")
+    });
+    assert!(
+        !common::pid_gone(child) && runs_image(child, &bin),
+        "uid {uid:?}: the child {child} runs the dropper's image before the verdict"
+    );
+
+    let rec = fx.wait_record_of(pid);
+    assert_eq!(
+        rec["rule_id"].as_str(),
+        Some(rule),
+        "uid {uid:?}; record: {rec}"
+    );
+    assert_eq!(rec["exe"].as_str(), bin.to_str(), "record: {rec}");
+    if held {
+        // lot 278: detected, High, the kill held in OBSERVING
         assert_eq!(
             rec["verdict"],
-            serde_json::json!({"Rule": "KillProcessTree"}),
-            "uid {uid:?}; record: {rec}"
+            serde_json::json!({"Rule": "Log"}),
+            "record: {rec}"
         );
-        assert_eq!(
-            rec["response"], "KillProcessTree",
-            "the bare action name: the whole tree was killed; uid {uid:?}; record: {rec}"
-        );
-        let status = common::wait_exit(&mut dropper.0, RECORD_POLL_TIMEOUT).unwrap_or_else(|| {
-            panic!("uid {uid:?}: the dropper still runs: the kill did not land; record: {rec}")
-        });
-        assert_eq!(
-            status.signal(),
-            Some(libc::SIGKILL),
-            "uid {uid:?}: the dropper ended otherwise: {status:?}; record: {rec}"
-        );
-        let child_gone = common::wait_until(Duration::from_secs(5), || {
-            common::pid_gone(child).then_some(())
-        });
+        assert_eq!(rec["severity"], "High", "record: {rec}");
+        // judged below COMBAT (the exec from /tmp raised ENGAGED)
+        assert_ne!(rec["posture_at"], "Combat", "record: {rec}");
+        assert_eq!(rec["response"], "none", "record: {rec}");
+        std::thread::sleep(Duration::from_secs(2));
         assert!(
-            child_gone.is_some(),
-            "uid {uid:?}: the dropper's child {child} survived the kill; record: {rec}"
+            !common::pid_gone(pid) && !common::pid_gone(child),
+            "the root dropper or its child was killed below COMBAT; record: {rec}"
         );
-        // No process runs the image from /tmp any more, deleted or not: the
-        // child and any other descendant.
-        let none_left = common::wait_until(Duration::from_secs(5), || {
+        // SAFETY: plain kill(2) of the child this test's dropper forked.
+        unsafe { libc::kill(child as i32, libc::SIGKILL) };
+        drop(dropper);
+        let gone = common::wait_until(Duration::from_secs(5), || {
             processes_of(&bin).is_empty().then_some(())
         });
         assert!(
-            none_left.is_some(),
-            "uid {uid:?}: processes of the dropper's image survived the kill: {:?} (child \
-             {child}); record: {rec}",
+            gone.is_some(),
+            "the root dropper's processes: {:?}",
             processes_of(&bin)
         );
+        return;
     }
+    assert_eq!(
+        rec["verdict"],
+        serde_json::json!({"Rule": "KillProcessTree"}),
+        "uid {uid:?}; record: {rec}"
+    );
+    assert_eq!(
+        rec["response"], "KillProcessTree",
+        "the bare action name: the whole tree was killed; uid {uid:?}; record: {rec}"
+    );
+    let status = common::wait_exit(&mut dropper.0, RECORD_POLL_TIMEOUT).unwrap_or_else(|| {
+        panic!("uid {uid:?}: the dropper still runs: the kill did not land; record: {rec}")
+    });
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "uid {uid:?}: the dropper ended otherwise: {status:?}; record: {rec}"
+    );
+    let child_gone = common::wait_until(Duration::from_secs(5), || {
+        common::pid_gone(child).then_some(())
+    });
+    assert!(
+        child_gone.is_some(),
+        "uid {uid:?}: the dropper's child {child} survived the kill; record: {rec}"
+    );
+    // No process runs the image from /tmp any more, deleted or not: the
+    // child and any other descendant.
+    let none_left = common::wait_until(Duration::from_secs(5), || {
+        processes_of(&bin).is_empty().then_some(())
+    });
+    assert!(
+        none_left.is_some(),
+        "uid {uid:?}: processes of the dropper's image survived the kill: {:?} (child \
+         {child}); record: {rec}",
+        processes_of(&bin)
+    );
 }
 
 /// `/proc/<pid>/exe` is `image`, or `image` deleted since (` (deleted)`).
