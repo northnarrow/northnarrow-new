@@ -25,6 +25,9 @@ pub mod exe_identity;
 pub mod exec;
 pub mod flow_sock;
 pub mod multiplexer;
+/// Lot 275 (C07): the inbound, DNS response and TLS ClientHello sensors'
+/// attach, and the pumps of the last two.
+pub mod net_telemetry;
 pub mod open_sensor;
 /// R12b (lab PR 269): the ring pumps on threads of their own.
 pub mod pump;

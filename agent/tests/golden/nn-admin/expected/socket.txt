@@ -312,7 +312,7 @@ exit: 0
 | combat stage      : (agent predates the field)
 | last admin action : (none since agent start)
 | telemetry         : withheld from the unsigned status (response mode, COMBAT evidence, ring drops and rejected records, deny fail-opens, trust level, degradations) — `nn-admin status --key <key>` with `audit-read` or `telemetry-read` reads them, signed
-| host hardening : 12 check(s), <the host's warnings: checked>
+| host hardening : 13 check(s), <the host's warnings: checked>
 --- stderr
 (empty)
 --- agent
@@ -330,7 +330,7 @@ exit: 0
 | combat stage      : contain (locked: `nn-admin unlock` to release)
 | last admin action : 7s ago
 | telemetry         : withheld from the unsigned status (response mode, COMBAT evidence, ring drops and rejected records, deny fail-opens, trust level, degradations) — `nn-admin status --key <key>` with `audit-read` or `telemetry-read` reads them, signed
-| host hardening : 12 check(s), <the host's warnings: checked>
+| host hardening : 13 check(s), <the host's warnings: checked>
 --- stderr
 (empty)
 --- agent
@@ -388,7 +388,7 @@ exit: 0
 |   not protected   : budget 1
 |   open latency    : fast path avg - max 0 µs (0), copy path avg - max 0 µs (0)
 |   restores        : 0 run, 0 files restored, 0 kept both, 0 refused
-| host hardening : 12 check(s), <the host's warnings: checked>
+| host hardening : 13 check(s), <the host's warnings: checked>
 --- stderr
 (empty)
 --- agent
@@ -893,7 +893,7 @@ exit: 0
 |   not protected   : budget 1
 |   open latency    : fast path avg - max 0 µs (0), copy path avg - max 0 µs (0)
 |   restores        : 0 run, 0 files restored, 0 kept both, 0 refused
-| host hardening : 12 check(s), <the host's warnings: checked>
+| host hardening : 13 check(s), <the host's warnings: checked>
 --- stderr
 (empty)
 --- agent
@@ -927,7 +927,7 @@ exit: 0
 | event bus         : (agent predates the bus)
 | deny fail-open    : (not counted: the agent reads no DENY_FAIL_OPEN counters)
 | copy on write     : (agent predates the guard)
-| host hardening : 12 check(s), <the host's warnings: checked>
+| host hardening : 13 check(s), <the host's warnings: checked>
 --- stderr
 (empty)
 --- agent
@@ -1008,7 +1008,7 @@ exit: 0
 |   not protected   : budget 1
 |   open latency    : fast path avg - max 0 µs (0), copy path avg - max 0 µs (0)
 |   restores        : 0 run, 0 files restored, 0 kept both, 0 refused
-| host hardening : 12 check(s), <the host's warnings: checked>
+| host hardening : 13 check(s), <the host's warnings: checked>
 --- stderr
 (empty)
 --- agent
@@ -11197,13 +11197,28 @@ connection 1
 < ConfigOverlaySetResponse
 > (closed)
 
+### sock.config-overlay-set.kind.nodns-allow
+$ nn-admin config overlay set nodns-allow --file overlay.local --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 0
+--- stdout
+| config overlay set: stored
+--- stderr
+(empty)
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"ConfigOverlaySetRequest":{"content":"# matrix: comments only\n","payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"ConfigOverlaySet":{"kind":16,"len":24,"sha256":"hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"}},"nonce":"<challenge>","op":21,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< ConfigOverlaySetResponse
+> (closed)
+
 ### sock.config-overlay-set.unknown-kind
 $ nn-admin config overlay set no-such-list --file overlay.local --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 2
 --- stdout
 (empty)
 --- stderr
-| config overlay: unknown overlay `no-such-list` — one of: fim-paths, process-comm-allowlist, netflow-comm-allowlist, netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout, escalation-allow, combat-rules-v4, combat-rules-v6, combat-allow, canary-readers, cow-guard, execq-hashes, exec-policy, rule-policy
+| config overlay: unknown overlay `no-such-list` — one of: fim-paths, process-comm-allowlist, netflow-comm-allowlist, netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout, escalation-allow, combat-rules-v4, combat-rules-v6, combat-allow, canary-readers, cow-guard, execq-hashes, exec-policy, rule-policy, nodns-allow
 --- agent
 (no connection)
 

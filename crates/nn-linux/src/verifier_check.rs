@@ -379,6 +379,11 @@ fn load_object(bytes: &[u8], level: VerifierLogLevel) -> Result<Ebpf> {
         crate::sensors::multiplexer::FS_PROTECT_RING,
         crate::sensors::multiplexer::FS_PROTECT_RING_BYTES,
     );
+    // Lot 277: the tracker's marks at the size the agent loads them.
+    loader.map_max_entries(
+        crate::cgroup_join::JOINED_MAP,
+        crate::cgroup_join::joined_entries_now(),
+    );
     loader.default_map_pin_directory(PIN_DIR);
     loader.verifier_log_level(level);
     let mut ebpf = loader
@@ -443,6 +448,18 @@ fn load_one(prog: &mut Program, section: &str, btf: &Btf) -> Outcome {
 fn optional_reason(name: &str, section: &str, outcome: &Outcome) -> Option<String> {
     if name.starts_with(LAB_PROBE_PREFIX) {
         return Some("sensor-feasibility probe, never loaded by the agent".into());
+    }
+    // Lot 275: a fexit built for another kernel's parameter count of its
+    // function (the verifier refuses the slot past the last parameter; the
+    // agent loads the variant built for this kernel's count)
+    if let Some((_, func, _)) = crate::sensors::net_telemetry::ARITY_VARIANTS
+        .iter()
+        .find(|(p, _, _)| *p == name)
+    {
+        let params = btf_revalidate::resolved().and_then(|r| r.param_count(func));
+        if let Some(why) = crate::sensors::net_telemetry::other_arity(name, params) {
+            return Some(why);
+        }
     }
     if let Outcome::Absent(_) = outcome {
         let hook = section.strip_prefix("lsm/").unwrap_or("");

@@ -66,9 +66,11 @@ pub enum Exemption {
     Uid(u32),
     /// An executable of a root-owned system tree, by path and content.
     Exe { path: String, sha256: [u8; 32] },
-    /// The process's cgroup v2 path (a `.service` or `.scope`).
+    /// The process's cgroup v2 path (a `.service` or `.scope`). Lot 277:
+    /// for a process started in it only ([`ActorFacts::started_in_cgroup`]).
     Cgroup(String),
-    /// The systemd unit of the process's cgroup (`foo.service`).
+    /// The systemd unit of the process's cgroup (`foo.service`). Lot 277:
+    /// for a process started in that cgroup only.
     Unit(String),
 }
 
@@ -104,6 +106,40 @@ const OUTSIDE_ENGINE: &[&str] = &[
 
 /// The one rule `combat-without-corroboration` takes.
 pub const RANSOMWARE_RULE: &str = "NN-L-IMP-001_RansomwareEncryption";
+
+/// Lot 275, R6 of the external review of 04/11: the rules `enforce` is
+/// refused for, each with why — a match on one attribute that many benign
+/// programs share, with no second predicate (a destination, an executable)
+/// to act on. In a policy to be signed ([`parse`]: `nn-admin config
+/// overlay set`, `policy-test`) the line refuses the file, as any bad line
+/// does. In a policy signed before ([`boot_policy`], at the agent's start)
+/// only that line is taken as `alert`, the rest in force, and the start
+/// signs a degradation naming the line: refusing the whole file would drop
+/// its exemptions, its other modes and its switches for one line.
+pub const ENFORCE_REFUSED: &[(&str, &str)] = &[
+    (
+        "NN-L-NET-003_BadJa3",
+        "it matches a TLS fingerprint alone, an attribute of the TLS stack that every program on \
+         the same library and settings shares, not a program's identity (the fingerprint alone \
+         finds 6.82 % of malware, 88.68 % with the destination: Anderson & McGrew); it has no \
+         second predicate, a destination or an executable, to act on — `alert` or `audit` it",
+    ),
+    (
+        "NN-L-NET-028_ConnectWithoutDns",
+        "it judges the absence of a DNS answer the agent saw, and an answer can be missing for \
+         benign reasons it cannot see (a container's resolvers of its own, a client's DNS over \
+         TCP, DoT or DoH, an address configured by hand): a kill on it is not fail-safe until it \
+         is measured on a wider corpus (review of #495) — `alert` or `audit` it",
+    ),
+];
+
+/// Why `enforce <id>` is refused, if it is.
+pub fn enforce_refused(id: &str) -> Option<&'static str> {
+    ENFORCE_REFUSED
+        .iter()
+        .find(|(r, _)| *r == id)
+        .map(|(_, why)| *why)
+}
 
 /// A parsed policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -318,6 +354,18 @@ fn valid_exe_path(p: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The review of #494, N1: the scopes the agent contains processes in
+/// (`/northnarrow.slice/blocked.scope`, `throttled.scope`): no exemption
+/// names them, by unit either.
+const AGENT_CONTAINMENT_UNITS: &[&str] = &["blocked.scope", "throttled.scope"];
+
+/// The review of #494, N1: a cgroup of the agent's containment slice,
+/// whose processes the agent moved there; no exemption by cgroup or unit
+/// covers them, whatever the policy names.
+fn in_containment(cgroup: &str) -> bool {
+    cgroup == "/northnarrow.slice" || cgroup.starts_with("/northnarrow.slice/")
+}
+
 /// `cgroup <path>`: absolute, canonical, its last component a unit, not the
 /// agent's own containment slice.
 fn valid_cgroup(p: &str) -> Result<(), String> {
@@ -341,6 +389,31 @@ fn valid_cgroup(p: &str) -> Result<(), String> {
 
 /// Parse a policy file. Any bad line refuses the whole file.
 pub fn parse(text: &str) -> Result<RulePolicy, PolicyError> {
+    parse_as(text, RefusedEnforce::Refuse).map(|(p, _)| p)
+}
+
+/// What [`parse_as`] makes of an `enforce` [`ENFORCE_REFUSED`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusedEnforce {
+    /// The line refuses the file (a policy to be signed).
+    Refuse,
+    /// The line is taken as `alert` and returned (a policy signed before).
+    AsAlert,
+}
+
+/// An `enforce` line taken as `alert` ([`RefusedEnforce::AsAlert`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DemotedEnforce {
+    pub line: usize,
+    pub rule: &'static str,
+    pub why: &'static str,
+}
+
+fn parse_as(
+    text: &str,
+    refused: RefusedEnforce,
+) -> Result<(RulePolicy, Vec<DemotedEnforce>), PolicyError> {
+    let mut demoted = Vec::new();
     let mut p = RulePolicy::default();
     let mut lines = 0usize;
     for (i, raw) in text.lines().enumerate() {
@@ -363,8 +436,21 @@ pub fn parse(text: &str) -> Result<RulePolicy, PolicyError> {
         let words: Vec<&str> = content.split_whitespace().collect();
         match words.as_slice() {
             [kw, rule] if Mode::from_keyword(kw).is_some() => {
-                let mode = Mode::from_keyword(kw).expect("checked");
+                let mut mode = Mode::from_keyword(kw).expect("checked");
                 let id = resolve_rule(rule).map_err(err)?;
+                if mode == Mode::Enforce {
+                    if let Some(why) = enforce_refused(id) {
+                        if refused == RefusedEnforce::Refuse {
+                            return Err(err(format!("enforce {id} is refused: {why}")));
+                        }
+                        demoted.push(DemotedEnforce {
+                            line,
+                            rule: id,
+                            why,
+                        });
+                        mode = Mode::Alert;
+                    }
+                }
                 if let Some(prev) = p.modes.insert(id, mode) {
                     return Err(err(format!(
                         "{id} already has a mode ({}): one mode per rule",
@@ -416,6 +502,13 @@ pub fn parse(text: &str) -> Result<RulePolicy, PolicyError> {
                     ("unit", [u]) => {
                         if !valid_unit(u) {
                             return Err(err(format!("unit {u}: not a .service or .scope name")));
+                        }
+                        // The review of #494, N1: the agent's containment
+                        // scopes hold the processes it contained.
+                        if AGENT_CONTAINMENT_UNITS.contains(u) {
+                            return Err(err(format!(
+                                "unit {u}: the agent's containment scope holds contained processes"
+                            )));
                         }
                         Exemption::Unit(u.to_string())
                     }
@@ -469,7 +562,7 @@ pub fn parse(text: &str) -> Result<RulePolicy, PolicyError> {
             [] => unreachable!("empty content skipped"),
         }
     }
-    Ok(p)
+    Ok((p, demoted))
 }
 
 /// The active policy, shared by the engine, the posture and the admin
@@ -509,6 +602,10 @@ pub struct BootPolicy {
     pub policy: RulePolicy,
     /// A signed file that did not parse: the built-in defaults are in force.
     pub degraded: Option<String>,
+    /// R6 (lot 275): a signed file in force whose `enforce` lines of a rule
+    /// [`ENFORCE_REFUSED`] names were taken as `alert`, each named (the
+    /// detail of the signed degradation).
+    pub demoted: Option<String>,
 }
 
 /// The boot policy from the overlay gate's verified text (`None`: absent or
@@ -518,17 +615,49 @@ pub fn boot_policy(verified: Option<(&Path, &str)>) -> BootPolicy {
         None => BootPolicy {
             policy: RulePolicy::builtin(),
             degraded: None,
+            demoted: None,
         },
-        Some((path, text)) => match parse(text) {
-            Ok(mut p) => {
+        Some((path, text)) => match parse_as(text, RefusedEnforce::AsAlert) {
+            Ok((mut p, demoted)) => {
+                let lines: Vec<String> = demoted
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "line {}: enforce {} refused, applied as alert",
+                            d.line, d.rule
+                        )
+                    })
+                    .collect();
                 p.source = format!(
-                    "{} (signed, sha256 {})",
+                    "{} (signed, sha256 {}{})",
                     path.display(),
-                    hex(&Sha256::digest(text.as_bytes()))
+                    hex(&Sha256::digest(text.as_bytes())),
+                    if lines.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; {}", lines.join("; "))
+                    }
                 );
+                let demoted = (!demoted.is_empty()).then(|| {
+                    let each: Vec<String> = demoted
+                        .iter()
+                        .map(|d| {
+                            format!(
+                                "line {}: enforce {} refused, applied as alert ({})",
+                                d.line, d.rule, d.why
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "{}: {} — the rest of the policy is in force",
+                        path.display(),
+                        each.join("; ")
+                    )
+                });
                 BootPolicy {
                     policy: p,
                     degraded: None,
+                    demoted,
                 }
             }
             Err(e) => BootPolicy {
@@ -537,6 +666,7 @@ pub fn boot_policy(verified: Option<(&Path, &str)>) -> BootPolicy {
                     "{}: {e} — the built-in defaults are in force",
                     path.display()
                 )),
+                demoted: None,
             },
         },
     }
@@ -554,6 +684,15 @@ pub trait ActorFacts: Send + Sync {
     /// `/proc/<pid>/exe` opened: its path, when it is a root-owned file of
     /// a root-owned tree no one else can write, and its SHA-256.
     fn trusted_exe(&self, pid: u32) -> Option<(String, [u8; 32])>;
+    /// Lot 277: whether `pid` started in the cgroup it runs in — spawned
+    /// into it by systemd, or forked from a process that was — and so may
+    /// be exempt by its cgroup or unit. `Some(false)`: it, or a process it
+    /// was forked from, was moved into a cgroup (`cgroup.procs`) by anyone
+    /// but systemd's placement, or started by `clone3(CLONE_INTO_CGROUP)`
+    /// by anyone but PID 1 (the kernel's marks, `nn_linux::cgroup_join`).
+    /// `None`: not known (no tracker on this kernel, a mark the kernel
+    /// could not take) — not exempt either.
+    fn started_in_cgroup(&self, pid: u32) -> Option<bool>;
 }
 
 /// The unit a cgroup path names: its last `.service` / `.scope` component.
@@ -565,7 +704,10 @@ fn unit_of(cgroup: &str) -> Option<&str> {
 
 /// The exemption among `ex` that covers process `pid` (acting as `uid`
 /// when the event says so), if any. Facts are read only for the kinds
-/// present, at most once each.
+/// present, at most once each. Lot 277: an exemption by cgroup or unit
+/// covers a process of that cgroup only if it started there
+/// ([`ActorFacts::started_in_cgroup`], read once, and only when a cgroup
+/// or a unit matched).
 pub fn exempt(
     ex: &[Exemption],
     pid: u32,
@@ -577,22 +719,32 @@ pub fn exempt(
     }
     let mut uid: Option<Option<u32>> = None;
     let mut cgroup: Option<Option<String>> = None;
+    let mut started: Option<Option<bool>> = None;
     let mut exe: Option<Option<(String, [u8; 32])>> = None;
+    let mut started_here =
+        || *started.get_or_insert_with(|| facts.started_in_cgroup(pid)) == Some(true);
     for e in ex {
         let hit = match e {
             Exemption::Uid(u) => {
                 let got = *uid.get_or_insert_with(|| event_uid.or_else(|| facts.uid(pid)));
                 got == Some(*u)
             }
-            Exemption::Cgroup(c) => cgroup
-                .get_or_insert_with(|| facts.cgroup(pid))
-                .as_deref()
-                .is_some_and(|g| g == c),
-            Exemption::Unit(u) => cgroup
-                .get_or_insert_with(|| facts.cgroup(pid))
-                .as_deref()
-                .and_then(unit_of)
-                .is_some_and(|g| g == u),
+            Exemption::Cgroup(c) => {
+                cgroup
+                    .get_or_insert_with(|| facts.cgroup(pid))
+                    .as_deref()
+                    .is_some_and(|g| g == c && !in_containment(g))
+                    && started_here()
+            }
+            Exemption::Unit(u) => {
+                cgroup
+                    .get_or_insert_with(|| facts.cgroup(pid))
+                    .as_deref()
+                    .filter(|g| !in_containment(g))
+                    .and_then(unit_of)
+                    .is_some_and(|g| g == u)
+                    && started_here()
+            }
             Exemption::Exe { path, sha256 } => exe
                 .get_or_insert_with(|| facts.trusted_exe(pid))
                 .as_ref()
@@ -685,6 +837,8 @@ mod tests {
                 "containment",
             ),
             ("exempt R020 unit sshd\n", 1, "not a .service"),
+            ("exempt R020 unit blocked.scope\n", 1, "containment scope"),
+            ("exempt R020 unit throttled.scope\n", 1, "containment scope"),
             ("exempt R020 unit a/b.service\n", 1, "not a .service"),
             ("exempt R020 bogus 1\n", 1, "exemption `bogus`"),
             ("exempt R020 uid 1000\nexempt R020 uid 1000\n", 2, "twice"),
@@ -695,6 +849,13 @@ mod tests {
                 "twice",
             ),
             ("enforce R020\x07\n", 1, "control character"),
+            // R6 (lot 275): a fingerprint alone is not an identity
+            ("enforce NN-L-NET-003\n", 1, "enforce NN-L-NET-003_BadJa3 is refused"),
+            (
+                "alert R020\nenforce NN-L-NET-003_BadJa3\n",
+                2,
+                "no second predicate",
+            ),
         ] {
             let e = refused(text);
             assert_eq!(e.line, line, "{text:?}: {e}");
@@ -757,6 +918,8 @@ mod tests {
         uid: Option<u32>,
         cgroup: Option<&'static str>,
         exe: Option<(&'static str, [u8; 32])>,
+        /// Lot 277.
+        started: Option<bool>,
         reads: Mutex<Vec<&'static str>>,
     }
 
@@ -773,6 +936,10 @@ mod tests {
             self.reads.lock().push("exe");
             self.exe.map(|(p, h)| (p.to_string(), h))
         }
+        fn started_in_cgroup(&self, _: u32) -> Option<bool> {
+            self.reads.lock().push("started");
+            self.started
+        }
     }
 
     fn facts() -> Facts {
@@ -780,8 +947,119 @@ mod tests {
             uid: Some(998),
             cgroup: Some("/system.slice/backup.service"),
             exe: Some(("/usr/bin/backup", [7u8; 32])),
+            started: Some(true),
             reads: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The review of #494, N1: a process of the agent's containment slice is
+    /// never exempt by cgroup or unit — a unit name below it (a NEUTRALIZE
+    /// cgroup's `x.scope`) included; its uid exemption still holds.
+    #[test]
+    fn a_contained_process_is_never_exempt_by_cgroup_or_unit() {
+        let contained = Facts {
+            cgroup: Some("/northnarrow.slice/blocked.scope/backup.service"),
+            ..facts()
+        };
+        assert_eq!(
+            exempt(
+                &[Exemption::Unit("backup.service".into())],
+                42,
+                None,
+                &contained
+            ),
+            None
+        );
+        assert_eq!(
+            exempt(
+                &[Exemption::Cgroup(
+                    "/northnarrow.slice/blocked.scope/backup.service".into()
+                )],
+                42,
+                None,
+                &contained
+            ),
+            None
+        );
+        assert!(exempt(&[Exemption::Uid(998)], 42, None, &contained).is_some());
+        assert!(in_containment("/northnarrow.slice"));
+        assert!(!in_containment("/northnarrow.slicex/a.service"));
+    }
+
+    /// Lot 277: an exemption by cgroup or unit holds for a process started
+    /// in the cgroup only — not for one moved into it (or forked from one
+    /// that was), nor where that is not known; the other kinds do not ask.
+    #[test]
+    fn a_cgroup_or_unit_exemption_needs_a_start_in_the_cgroup() {
+        for (started, holds) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let f = Facts { started, ..facts() };
+            for e in [
+                Exemption::Unit("backup.service".into()),
+                Exemption::Cgroup("/system.slice/backup.service".into()),
+            ] {
+                assert_eq!(
+                    exempt(std::slice::from_ref(&e), 42, None, &f).is_some(),
+                    holds,
+                    "{e} with started {started:?}"
+                );
+            }
+            // a uid or exe exemption is the actor's, wherever it started
+            assert!(exempt(&[Exemption::Uid(998)], 42, None, &f).is_some());
+            assert!(exempt(
+                &[Exemption::Exe {
+                    path: "/usr/bin/backup".into(),
+                    sha256: [7; 32],
+                }],
+                42,
+                None,
+                &f
+            )
+            .is_some());
+        }
+        // a moved process exempt by its uid still is, and says so
+        let moved = Facts {
+            started: Some(false),
+            ..facts()
+        };
+        assert_eq!(
+            exempt(
+                &[
+                    Exemption::Unit("backup.service".into()),
+                    Exemption::Uid(998)
+                ],
+                42,
+                None,
+                &moved
+            )
+            .as_deref(),
+            Some("uid 998")
+        );
+        // the start is read once, after a cgroup matched, never before
+        let f = facts();
+        exempt(
+            &[
+                Exemption::Unit("other.service".into()),
+                Exemption::Cgroup("/x/b.service".into()),
+            ],
+            42,
+            None,
+            &f,
+        );
+        assert_eq!(*f.reads.lock(), vec!["cgroup"]);
+        let f = Facts {
+            started: Some(false),
+            ..facts()
+        };
+        exempt(
+            &[
+                Exemption::Unit("backup.service".into()),
+                Exemption::Cgroup("/system.slice/backup.service".into()),
+            ],
+            42,
+            None,
+            &f,
+        );
+        assert_eq!(*f.reads.lock(), vec!["cgroup", "started"]);
     }
 
     #[test]
@@ -816,6 +1094,7 @@ mod tests {
             uid: None,
             cgroup: None,
             exe: None,
+            started: None,
             reads: Mutex::new(Vec::new()),
         };
         for e in [
@@ -868,6 +1147,99 @@ mod tests {
         let b = boot_policy(None);
         assert!(b.policy.is_builtin());
         assert_eq!(b.policy.source, "built-in defaults");
+    }
+
+    /// R6 (lot 275): a policy to be signed that enforces NN-L-NET-003 is
+    /// refused whole (above, `every_bad_line_refuses_the_file_with_its_number`);
+    /// one signed before keeps every other line at the start — its
+    /// exemptions, its other modes, its switch — and that line is taken as
+    /// `alert`, named in the degradation the start signs. Every other mode
+    /// of the rule is accepted, and `enforce` of another rule still is.
+    #[test]
+    fn a_signed_enforce_of_a_fingerprint_rule_is_applied_as_alert_at_the_start() {
+        const NET_003: &str = "NN-L-NET-003_BadJa3";
+        let text = "off R008\nexempt R020 uid 998\nenforce NN-L-NET-003\nenforce NN-L-IMP-001\n\
+                    combat-without-corroboration NN-L-IMP-001\n";
+        assert!(parse(text).is_err(), "to be signed: refused whole");
+        let b = boot_policy(Some((
+            Path::new("/etc/northnarrow/rule-policy.local"),
+            text,
+        )));
+        assert_eq!(b.degraded, None, "not the defaults");
+        assert!(!b.policy.is_builtin());
+        // the other lines in force
+        assert_eq!(
+            b.policy.mode(resolve_rule("R008").unwrap()),
+            Some(Mode::Off)
+        );
+        assert_eq!(b.policy.mode(IMP), Some(Mode::Enforce));
+        assert_eq!(
+            b.policy.exemptions(resolve_rule("R020").unwrap()),
+            &[Exemption::Uid(998)][..]
+        );
+        assert!(b.policy.ransomware_combat_without_corroboration);
+        // that line as alert, named
+        assert_eq!(b.policy.mode(NET_003), Some(Mode::Alert));
+        let d = b.demoted.expect("a signed degradation");
+        assert!(
+            d.contains("line 3: enforce NN-L-NET-003_BadJa3 refused, applied as alert")
+                && d.contains("no second predicate")
+                && d.contains("the rest of the policy is in force"),
+            "{d}"
+        );
+        assert!(
+            b.policy
+                .source
+                .contains("line 3: enforce NN-L-NET-003_BadJa3 refused, applied as alert"),
+            "{}",
+            b.policy.source
+        );
+        // a policy without such a line: nothing demoted
+        let b = boot_policy(Some((
+            Path::new("/etc/northnarrow/rule-policy.local"),
+            "enforce NN-L-IMP-001\n",
+        )));
+        assert_eq!((b.degraded, b.demoted), (None, None));
+        // a line the start cannot read still refuses the file to the defaults
+        let b = boot_policy(Some((
+            Path::new("/etc/northnarrow/rule-policy.local"),
+            "enforce NN-L-NET-003\nbogus x\n",
+        )));
+        assert!(b.policy.is_builtin() && b.demoted.is_none());
+        assert!(b.degraded.unwrap().contains("line 2"));
+        for mode in ["alert", "audit", "off"] {
+            let p = parse(&format!("{mode} NN-L-NET-003\n")).unwrap();
+            assert_eq!(p.mode(NET_003).map(Mode::keyword), Some(mode), "{mode}");
+        }
+        assert!(parse("exempt NN-L-NET-003 uid 1000\n").is_ok());
+        assert!(parse("enforce NN-L-IMP-001\n").is_ok());
+        // review of #495: NN-L-NET-028's kill is not fail-safe either
+        assert!(parse("enforce NN-L-NET-028\n").is_err());
+        let b = boot_policy(Some((
+            Path::new("/etc/northnarrow/rule-policy.local"),
+            "enforce NN-L-NET-028\noff R008\n",
+        )));
+        assert_eq!(
+            b.policy.mode("NN-L-NET-028_ConnectWithoutDns"),
+            Some(Mode::Alert)
+        );
+        assert_eq!(
+            b.policy.mode(resolve_rule("R008").unwrap()),
+            Some(Mode::Off)
+        );
+        assert!(b
+            .demoted
+            .unwrap()
+            .contains("line 1: enforce NN-L-NET-028_ConnectWithoutDns refused, applied as alert"));
+        assert_eq!(
+            ENFORCE_REFUSED.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            vec![NET_003, "NN-L-NET-028_ConnectWithoutDns"]
+        );
+        // every refused id is a rule the policy knows
+        for (id, why) in ENFORCE_REFUSED {
+            assert_eq!(resolve_rule(id), Ok(*id));
+            assert!(!why.is_empty());
+        }
     }
 
     #[test]

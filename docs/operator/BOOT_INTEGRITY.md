@@ -473,7 +473,12 @@ refused (a hybrid or legacy host, whose systemd writes its own v1
 hierarchy), a protected process's `oom_score_adj` not refused (the
 kernel's BTF lacks one of the four proc offsets), and every PID 1 write
 of a protected resource file refused (no syscall argument offsets: an
-architecture other than x86-64).
+architecture other than x86-64). Lot 277 added one: `cgroup exemptions`,
+the start-in-cgroup tracker not attached (a target of its five programs
+absent or of another shape, one of its offsets absent, or a failed load).
+Every exemption by cgroup or unit of the per-rule policy is then refused
+(`RULE_POLICY.md` §2.1); `host-check`'s `kernel_fixes` row joins the
+manifest's `host_hardening`, like every other check.
 
 An operator's choice of a weaker sensor (`--exec-sensor tracepoint`,
 `--file-open-sensor tracepoint`, `--dns-sensor sendmsg`) is recorded too:

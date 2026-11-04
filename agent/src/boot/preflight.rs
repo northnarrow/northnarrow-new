@@ -468,6 +468,17 @@ pub(crate) fn btf_check(path: &std::path::Path) -> i32 {
                 };
                 println!("  optional {hook:<33} {verdict}");
             }
+            // Lot 277: the start-in-cgroup tracker.
+            match r.cgroup_join_unavailable() {
+                None => println!(
+                    "  tracker  {:<33} present — the exemptions by cgroup or unit hold for processes started in their cgroup",
+                    "cgroup_join"
+                ),
+                Some(why) => println!(
+                    "  tracker  {:<33} absent  — {why}: every exemption by cgroup or unit is refused (signed subsystem_degraded)",
+                    "cgroup_join"
+                ),
+            }
             for module in &r.modules_not_loaded {
                 println!(
                     "  module  {module:<34} no BTF next to the vmlinux file — its types' offsets stay unset (not a degradation)"

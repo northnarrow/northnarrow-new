@@ -6,6 +6,137 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Network telemetry, level 2 of C07 (lot 275,
+  `docs/operator/NETWORK_TELEMETRY.md`): three new sources of the bus,
+  each with its sensor-contract entry, its attach state in the signed
+  manifest, its kernel budget, its ring's loss counters (`inbound` /
+  `inbound_rate`, `dns_answer` / `dns_answer_rate`, `tls` / `tls_rate`)
+  and the network class. **Inbound connections** (`net_inbound`): an
+  fexit on `inet_csk_accept` (the program built for this kernel's
+  parameter count — 4 up to 6.9, 2 from 6.10 — read from its BTF) records
+  every accepted connection in the accepting process's context, and
+  `tcp_close` its close, on a ring and a socket map of their own (an
+  inbound flood no longer reaches the outbound flows' ring or evicts their
+  sockets); `Event::NetInbound` rows with the attribution of an outbound
+  flow, the closed ones in `netflow.jsonl` with `"inbound": true`. **DNS
+  responses** (`dns_answer`): an fexit on `udp_recvmsg` / `udpv6_recvmsg`
+  reads every datagram from port 53 from the receiver's buffer (512 bytes);
+  the parse worker decodes the question, the response code and the A,
+  AAAA and CNAME records with their TTLs (IPC version 3; nn-parse's
+  `dns_response`, fuzzed); `Event::DnsAnswer`. **TLS ClientHellos**
+  (`tls_hello`): an fentry on `tcp_sendmsg` copies an outbound flow's first
+  send when it is a ClientHello (4,096 bytes); the parse worker computes
+  JA3, JA4, SNI and ALPN; `Event::TlsClientHello`, and the fingerprint on
+  the flow's snapshots and closed row (`ja3`, `ja4`, `sni` in
+  `netflow.jsonl`). NN-L-NET-003 judges the hello (BUG-025 closed).
+- NN-L-NET-028, "no DNS, no connect", per lineage (lot 275): a TCP connect
+  or a UDP send to a public address the DNS evidence does not bind to the
+  process or an ancestor — no response it received named the address (the
+  question's chain only), nor a system resolver's response (its executable
+  and a system uid) for a name it asked — is recorded: Medium, Low when
+  only a resolver's response for another lineage named it; once per
+  process and destination every 10 minutes; its kill (`KillProcess`) held
+  behind the per-rule policy (`NODNS_KILL`), whose `enforce` the policy
+  refuses for now (review of #495). The state is
+  nn-core's `net::resolved` (the host's names held for their TTL, 300 s at
+  least, a day at most; per-process bindings that last 2 h past each use;
+  an address its own name spells binds nothing); the connect pump and the
+  net drain judge each connect-time and UDP row once the DNS pumps have
+  read the records made before it. Not judged: LAN and the other
+  non-public ranges, the configured resolvers, the addresses of the signed
+  `nodns-allow.local` (a new overlay kind, `nn-admin config overlay set
+  nodns-allow`), and what the agent cannot judge (a process older than the
+  DNS response sensor, a name asked whose response was not seen whole, DNS
+  records held back or lost — host-wide for 5 minutes for a user's or a
+  ring's —, the DNS pumps not caught up, the parse worker not answering).
+  A blinding shows: a signed `nodns_coverage_lost` audit row (its cause and
+  the pid or uid that caused it, one a cause every 5 minutes) and the
+  heartbeat's `nodns` counters of the rule's judgements by outcome and
+  unknown reason. A system resolver whose response binds other processes
+  is its executable at its system path, one of the resolver users (never
+  root) and the host's file there: its image's device and inode, in
+  whatever mount namespace it runs (a sandboxed systemd-resolved is one; a
+  container's dnsmasq, or an image replaced at the path, is not) — never a
+  path alone. A blinding's record is limited by the agent's monotonic
+  clock, one a cause every 5 minutes; the beat's `coverage_lost` counts the
+  rows queued to be signed.
+- Exemptions by cgroup or unit hold only for processes started in their
+  cgroup, the kernel's host checks name the fixes the sandbox relies on,
+  and a worker enters its sandbox single-threaded (lot 277, Wave 4 phase 3,
+  wave 1).
+  - The per-rule policy's `exempt <rule> cgroup|unit` held for any member
+    of the cgroup: root wrote its own pid into an exempt service's
+    `cgroup.procs` and was exempt. Five eBPF programs (the start-in-cgroup
+    tracker) now mark a process moved into a cgroup by anyone but systemd's
+    placement (a move by PID 1, or a fresh child of PID 1 moving itself
+    before its exec), a child started by `clone3(CLONE_INTO_CGROUP)` by
+    anyone but PID 1, and every process either one forks after it. The mark
+    goes with the group's last thread. A marked process is not exempt by
+    cgroup or unit; uid and exe exemptions are unchanged. A move into a
+    cgroup an exemption names is a signed NN-L-AT-001 `cgroup_join` (Log,
+    High; not refused, no posture trigger). A kernel without the tracker's
+    targets refuses every such exemption, a signed `subsystem_degraded`;
+    `--btf-check` prints `tracker cgroup_join`. Two optional offsets
+    (`signal_struct.live`, `kernel_clone_args.flags`) take slots 118–119;
+    the enum, tracepoint and hook-argument slots after them move by two.
+    Residuals as `ANTITAMPER_TRUST_MODEL.md` lists them (a root that
+    rewrites the unit itself is still the unit).
+  - The review of #494 before the merge: a move is a no-op only when the
+    writing thread moves itself and its cgroup does not change (a thread
+    writing its leader into `cgroup.threads` was taken for no move); a
+    destination path that fills the 256-byte read is signed without a
+    name; a mark the kernel cannot keep makes that process tree not known
+    (a per-group bit in the pinned 512 KiB `CGROUP_JOIN_LOST`), never every
+    exemption on the host until a reboot; the marks' map is sized to
+    `kernel.pid_max` capped by `kernel.threads-max`, allocated as it fills;
+    a new process's pid starts with no mark a dead group left there; the
+    tracker's links are pinned like the other anti-tamper programs, so it
+    keeps marking while the agent is stopped; the policy refuses a `unit`
+    exemption naming the agent's containment scopes and applies none under
+    `/northnarrow.slice`; CVE-2022-30594's 5.4.189 and 4.19.238 are in the
+    table; a privileged behaviour test of the tracker
+    (`agent/tests/cgroup_join_privileged_e2e.rs`) and `exempt-check`'s
+    threaded case and 200 starts under load. The sensor contract lists the
+    tracker and the `cgroup_join` record.
+  - The re-review of #494: the "not known" state is a byte a tgid in a 4
+    MiB preallocated map, written with plain stores (the bit set with a
+    test and an atomic add could be added twice by a fork and a move on
+    two CPUs: the child exempt, the carry into the next tgid); the
+    tracker's maps and links are pinned in a directory of their own beside
+    the pin root (`/sys/fs/bpf/northnarrow-cgroup-join-v<schema>-<entries>`),
+    which `install.sh --upgrade` leaves — the marks outlive an upgrade —
+    and `uninstall.sh` removes; a start whose maps' layout differs builds
+    new ones and signs "marks reset"; the directory is protected like the
+    pin root; `bpf-own-ids` marks the tracker's programs `kept`; the swap
+    attaches `mark` before `src`; a `debug-trigger` build's
+    `NN_DEBUG_CGROUP_JOINED_ENTRIES` sizes the marks for the privileged
+    test of a full map; the lab's `tracker-persist-check` (an agent stop,
+    an upgrade, the pins' protection) and `fork-cost`.
+  - The third review of #494: the tracker's directory is named by schema
+    and generation (`…-cgroup-join-v1_<n>`), not by the marks' size — a
+    larger size asked later keeps the map, a signed note; a start adopts
+    only the directory its predecessor of this boot recorded in
+    `/run/northnarrow/cgroup-join-pins` (protected), each map checked
+    with `BPF_OBJ_GET_INFO_BY_FD` (its id, kind, sizes, flags); anything
+    else — the directory gone between two agents, other maps, a directory
+    nobody recorded, an older schema — is a signed reset after which every
+    process started before it, and its forks, are not known
+    (`CGROUP_JOIN_EPOCH`): restart the exempt services; a symbolic link is
+    never a tracker directory, and a purge does not follow one; a planted
+    directory beside the recorded one is removed, signed.
+  - `nn-admin host-check` (and the signed manifest's `host_hardening`):
+    `kernel_fixes` compares the kernel's upstream version (Ubuntu's
+    `version_signature`, Debian's banner, else `osrelease`) with the fixes
+    of CVE-2022-0847, CVE-2022-30594, CVE-2024-42318 and CVE-2025-68736,
+    each branch's version from the kernel CNA's records or the stable
+    changelogs (`KERNEL_COMPATIBILITY.md`, "Kernel fix level"). A
+    distribution's kernel below a fix is `unknown`, never `ok`. `lockdown`
+    recommends `integrity` on every host; `kexec_load_disabled` counts the
+    6.6+ load limits; `module_sig_enforce` counts `modules_disabled=1`.
+  - The worker counts the entries of `/proc/self/task` before its sandbox
+    and refuses to enter with more than one thread (Landlock and
+    `no_new_privs` bind the calling thread only): exit 78. The hostile
+    worker's `threaded` attack checks it in the privileged harness.
 - CodeQL code scanning (lot codeql; C27, CI only, no product change):
   `.github/workflows/codeql.yml`, an advanced setup (the repository's
   default setup stays off). Every language of what ships — `rust` (the
@@ -1996,6 +2127,23 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- NN-L-NET-003: a TLS fingerprint is an attribute, not an identity (lot
+  275, R6 of the external review of 04/11). A ClientHello whose JA3 — or,
+  new, JA4 — is in the operator's fingerprint list
+  (`netflow-ja3-blocklist.{v1,local}`, which accepts both forms) is
+  **Medium** and `Log`, no longer Critical with `KillProcessTree` and
+  COMBAT; its record says the fingerprint names a TLS stack every program
+  on it shares (the fingerprint alone finds 6.82 % of malware, 88.68 % with
+  the destination: Anderson & McGrew). The signed per-rule policy refuses
+  `enforce NN-L-NET-003` until the rule has a second predicate (a
+  destination or an executable): the line refuses a file to be signed
+  (`config overlay set`); in a policy signed before, the start takes only
+  that line as `alert`, the rest of the policy in force, and signs a
+  `rule_policy` degradation naming it ("enforce refused, applied as
+  alert"). Out of the V2 Critical
+  sub-gate (registry version 4, 29 rows). The shipped
+  `netflow-ja3-blocklist.v1` says so (its earlier text is replaced at
+  install, as every earlier shipped list).
 - The responses run by a pool of workers keyed by process (lab PR 270,
   R12c-3; `docs/architecture/EVENT_BUS.md` §2e): eight workers
   (`nn-response-<n>`, `NN_RESPONSE_WORKERS`, 1 to 32) take one response

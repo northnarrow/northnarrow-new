@@ -6,6 +6,13 @@
 //! before it reads anything, and exits if it fails. What it does, in
 //! order:
 //!
+//! 0. lot 277: refuses to enter unless it is the process's only thread
+//!    ([`thread_count`]: the entries of `/proc/self/task`). Landlock's
+//!    `landlock_restrict_self` and `PR_SET_NO_NEW_PRIVS` bind the calling
+//!    thread only: a thread started before them would keep every right
+//!    the worker gives up (the seccomp filter alone is synchronised to
+//!    every thread). The worker starts none; a library that did would be
+//!    found here, not trusted;
 //! 1. refuses to run as root, with a group 0, or with any supplementary
 //!    group (the core's `pre_exec` set them; a worker never finds itself
 //!    privileged);
@@ -78,6 +85,9 @@ impl Profile {
 /// the degradation.
 #[derive(Debug)]
 pub enum SandboxError {
+    /// Lot 277: more than one thread when the sandbox was to be entered
+    /// (the count found).
+    Threaded(usize),
     /// Run as root, a group 0, or with supplementary groups.
     Privileged(String),
     /// A step failed (`prctl`, `setrlimit`, Landlock, seccomp).
@@ -87,6 +97,10 @@ pub enum SandboxError {
 impl std::fmt::Display for SandboxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SandboxError::Threaded(n) => write!(
+                f,
+                "refusing to enter with {n} threads: Landlock and no_new_privs would bind one"
+            ),
             SandboxError::Privileged(why) => write!(f, "refusing to run privileged: {why}"),
             SandboxError::Step(step, why) => write!(f, "{step}: {why}"),
         }
@@ -102,6 +116,7 @@ fn step(name: &'static str) -> impl Fn(io::Error) -> SandboxError {
 /// Enter `profile` (see the module's documentation): the level entered,
 /// or why not. On an error the caller exits at once.
 pub fn enter(profile: &Profile) -> Result<SandboxLevel, SandboxError> {
+    refuse_threaded()?;
     refuse_privileged()?;
     harden(profile)?;
     let mut level = measure()?;
@@ -117,11 +132,94 @@ pub fn enter(profile: &Profile) -> Result<SandboxLevel, SandboxError> {
 /// production path calls it: a worker always enters [`enter`].
 #[cfg(feature = "debug-trigger")]
 pub fn enter_without_seccomp(profile: &Profile) -> Result<SandboxLevel, SandboxError> {
+    refuse_threaded()?;
     refuse_privileged()?;
     harden(profile)?;
     let mut level = measure()?;
     landlock_restrict(&mut level)?;
     Ok(level)
+}
+
+/// Step 0 (lot 277): the process's only thread, or no sandbox.
+fn refuse_threaded() -> Result<(), SandboxError> {
+    one_thread(thread_count())
+}
+
+/// Step 0's verdict on a count: one thread enters; more, or a count that
+/// could not be made (`/proc/self/task` unreadable), refuses (the review
+/// of #494, D5: fail closed).
+fn one_thread(count: io::Result<usize>) -> Result<(), SandboxError> {
+    match count {
+        Ok(1) => Ok(()),
+        Ok(n) => Err(SandboxError::Threaded(n)),
+        Err(e) => Err(step("/proc/self/task")(e)),
+    }
+}
+
+/// Lot 277: the threads of the calling process — the entries of
+/// `/proc/self/task` other than `.` and `..`, one per thread. Read with
+/// `open` and `getdents64` into a buffer on the stack: no allocation, so
+/// a forked child of a multi-threaded process may count too.
+pub fn thread_count() -> io::Result<usize> {
+    // SAFETY: open of a constant NUL-terminated path.
+    let fd = unsafe {
+        libc::open(
+            c"/proc/self/task".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // `struct linux_dirent64` records, 8-byte aligned.
+    let mut buf = [0u64; 512];
+    let mut threads = 0usize;
+    let result = loop {
+        // SAFETY: getdents64 into our own buffer, its size in bytes.
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                fd,
+                buf.as_mut_ptr(),
+                std::mem::size_of_val(&buf),
+            )
+        };
+        if n < 0 {
+            break Err(io::Error::last_os_error());
+        }
+        if n == 0 {
+            break Ok(threads);
+        }
+        threads += count_dirents(&buf, n as usize);
+    };
+    // SAFETY: our own descriptor.
+    unsafe { libc::close(fd) };
+    result
+}
+
+/// The entries among the first `len` bytes of `getdents64` records in
+/// `buf` that are not `.` or `..`: `d_reclen` (a `u16` at byte 16), the
+/// name from byte 19.
+fn count_dirents(buf: &[u64], len: usize) -> usize {
+    // SAFETY: a `u64` buffer viewed as its bytes.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), std::mem::size_of_val(buf))
+    };
+    let len = len.min(bytes.len());
+    let mut n = 0;
+    let mut off = 0;
+    while off + 19 < len {
+        let reclen = usize::from(u16::from_ne_bytes([bytes[off + 16], bytes[off + 17]]));
+        if reclen == 0 {
+            break;
+        }
+        let name = &bytes[off + 19..(off + reclen).min(len)];
+        if !matches!(name, [b'.', 0, ..] | [b'.', b'.', 0, ..]) {
+            n += 1;
+        }
+        off += reclen;
+    }
+    n
 }
 
 /// Step 1.

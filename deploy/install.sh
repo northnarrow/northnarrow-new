@@ -1490,10 +1490,14 @@ boot_enablement() {   # <unit>...
 # foreign handle on a pinned link is refused.
 OWN_IDS_FILE=${OWN_IDS_FILE:-/run/northnarrow/bpf-own-ids}
 LSM_DRAIN_TIMEOUT=${LSM_DRAIN_TIMEOUT:-30}
-# Numeric first fields only: the list goes to bpftool as arguments.
+# Numeric first fields only: the list goes to bpftool as arguments. Lot 277
+# (the re-review of #494, R2): the start-in-cgroup tracker's programs are
+# marked `kept` — pinned beside the pin root ($BPFFS_ROOT-cgroup-join-v*),
+# they outlive purge_pin_root on purpose, so that the marks survive the
+# upgrade; the new agent swaps them for its own. uninstall.sh removes them.
 read_own_prog_ids() {
     [[ -r "$OWN_IDS_FILE" ]] || return 0
-    awk '$1 ~ /^[0-9]+$/ {print $1}' "$OWN_IDS_FILE" | sort -un | tr '\n' ' '
+    awk '$1 ~ /^[0-9]+$/ && $3 != "kept" {print $1}' "$OWN_IDS_FILE" | sort -un | tr '\n' ' '
 }
 # The ids among $1 still loaded. Only "No such file or directory" counts as
 # unloaded; any other bpftool error keeps the id on the list.
@@ -1607,7 +1611,7 @@ own_dropins_preflight() {
     if (( ! ${ACCEPT_DROPIN_QUARANTINE:-0} )); then
         echo "install.sh: REFUSED — remove them (or move them out of those directories), or re-run with" >&2
         echo "install.sh: --accept-dropin-quarantine to have them moved to /var/lib/northnarrow/quarantine/dropins" >&2
-        echo "install.sh: (docs/operator/UPGRADE_NOTES_WAVE4.md section 7)." >&2
+        echo "install.sh: (docs/operator/UPGRADE_NOTES_WAVE4.md section 9)." >&2
         if (( ${WINDOW_OPENED:-0} )); then
             echo "install.sh: Nothing was changed (the trusted-installer window this run opened ends at its deadline)." >&2
         else
@@ -2052,7 +2056,7 @@ done
 declare -A SHIPPED_V1_EARLIER=(
     [fim-paths.v1]="6baec5b5f0dfc92bdf91a0426b8d3693bd4b4a7b25df79e6ff9aa2298b906659 99e3364b81cf77ccd51cda88e80bc71a45b13e7b75c7ff480b195e157ab3011a 3fc62222695e595a26069123393850cfe917c614d863947248240a3b41810c9b"
     [netflow-blocklist.v1]="b50d821782e5ab9d8ab3e27aa7c3dfb3ea0aec87001c16b2eea758d94e8a7866"
-    [netflow-ja3-blocklist.v1]="0340417224f37515e1c2a1ed24bc3f530c4bdb910f6bf65dee9793152efc6a24"
+    [netflow-ja3-blocklist.v1]="0340417224f37515e1c2a1ed24bc3f530c4bdb910f6bf65dee9793152efc6a24 3549750f6c1530fc139f9853d173bccb72612b58086392517fa9fe1f3a815870"
     [process-comm-allowlist.v1]="4a3a973fff7875d6050b458778031c1e69f2ed0181bbde9da52854a1f16fe730 e99ae04a743682c471899cc997e7d5da6c055c043706d398e55aa976f0669b94"
     [netflow-comm-allowlist.v1]="4fca39d4d5a35da6fb5409bf25f76ce9020f444f4ac553b3c3ecda3ad9277f10"
     [security-tools.v1]=""

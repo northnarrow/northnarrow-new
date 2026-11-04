@@ -13,7 +13,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted ring buffers (map size).
-pub const RING_DROP_SLOTS: u32 = 22;
+pub const RING_DROP_SLOTS: u32 = 28;
 
 /// Slot of each ring buffer in `RING_DROPS`.
 pub mod ring_slot {
@@ -62,6 +62,22 @@ pub mod ring_slot {
     /// `EXECPOL_EVENTS` ring could not hold. The decision still applied;
     /// its record is lost.
     pub const EXECPOL: u32 = 21;
+    /// Lot 275 (C07): an accepted connection, or its close, the
+    /// `INBOUND_EVENTS` ring could not hold.
+    pub const INBOUND: u32 = 22;
+    /// Lot 275: accepts over a process's or a user's record budget, not
+    /// recorded (held back before the ring; their closes are not either).
+    pub const INBOUND_RATE: u32 = 23;
+    /// Lot 275: a DNS response the `DNS_ANSWER_EVENTS` ring could not hold.
+    pub const DNS_ANSWER: u32 = 24;
+    /// Lot 275: DNS responses over a process's or a user's record budget,
+    /// not recorded (held back before the ring).
+    pub const DNS_ANSWER_RATE: u32 = 25;
+    /// Lot 275: a ClientHello the `TLS_HELLO_EVENTS` ring could not hold.
+    pub const TLS: u32 = 26;
+    /// Lot 275: ClientHellos over a process's or a user's record budget,
+    /// not recorded (held back before the ring).
+    pub const TLS_RATE: u32 = 27;
 }
 
 /// Human names, indexed by slot.
@@ -88,6 +104,12 @@ pub const RING_DROP_NAMES: [&str; RING_DROP_SLOTS as usize] = [
     "exploit_guard",
     "execq",
     "execpol",
+    "inbound",
+    "inbound_rate",
+    "dns_answer",
+    "dns_answer_rate",
+    "tls",
+    "tls_rate",
 ];
 
 #[cfg(test)]
@@ -128,7 +150,9 @@ mod tests {
         );
         assert_eq!(RING_DROP_NAMES[ring_slot::EXECQ as usize], "execq");
         assert_eq!(RING_DROP_NAMES[ring_slot::EXECPOL as usize], "execpol");
-        assert_eq!(ring_slot::EXECPOL + 1, RING_DROP_SLOTS);
+        assert_eq!(RING_DROP_NAMES[ring_slot::INBOUND as usize], "inbound");
+        assert_eq!(RING_DROP_NAMES[ring_slot::TLS_RATE as usize], "tls_rate");
+        assert_eq!(ring_slot::TLS_RATE + 1, RING_DROP_SLOTS);
     }
 
     /// Slot order is wire-stable: the lab soak and older status readers
@@ -159,6 +183,12 @@ mod tests {
             (ring_slot::EXPLOIT_GUARD, "exploit_guard"),
             (ring_slot::EXECQ, "execq"),
             (ring_slot::EXECPOL, "execpol"),
+            (ring_slot::INBOUND, "inbound"),
+            (ring_slot::INBOUND_RATE, "inbound_rate"),
+            (ring_slot::DNS_ANSWER, "dns_answer"),
+            (ring_slot::DNS_ANSWER_RATE, "dns_answer_rate"),
+            (ring_slot::TLS, "tls"),
+            (ring_slot::TLS_RATE, "tls_rate"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");

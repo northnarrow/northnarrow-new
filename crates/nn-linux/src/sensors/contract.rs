@@ -15,7 +15,8 @@
 
 use common::wire::{exe, open_sensor as wos};
 use common::wire::{
-    ARGV_LEN, FILENAME_LEN, FIM_CHILD_NAME_LEN, QNAME_LEN, QNAME_WIRE_LEN, TASK_COMM_LEN,
+    ARGV_LEN, DNS_ANSWER_CAP, FILENAME_LEN, FIM_CHILD_NAME_LEN, QNAME_LEN, QNAME_WIRE_LEN,
+    TASK_COMM_LEN, TLS_HELLO_CAP,
 };
 use nn_core::contract::{
     EventKind as K, FailureMode, Fallback, KernelBudget, OptIn, Overhead, SourceContract,
@@ -63,6 +64,15 @@ pub mod attach {
     pub const NET_FLOWS_V4: &str =
         "kprobe:inet_csk_listen_start, fexit:tcp_close, kprobe:udp_sendmsg";
     pub const OPEN_LSM: &str = "lsm:file_open (FIM observer)";
+    /// Lot 275: the inbound connections (the accept's return, the close of
+    /// a recorded accept).
+    pub const NET_INBOUND: &str = "fexit:inet_csk_accept, fexit:tcp_close (accepted sockets)";
+    /// Lot 275: the DNS responses, read from the receiver's buffer.
+    pub const DNS_ANSWER: &str = "fexit:udp_recvmsg+udpv6_recvmsg (the receiver's buffer)";
+    /// Part of [`DNS_ANSWER`]: `udpv6_recvmsg` not attached.
+    pub const DNS_ANSWER_V4: &str = "fexit:udp_recvmsg (the receiver's buffer)";
+    /// Lot 275: an outbound flow's first send when it is a ClientHello.
+    pub const TLS_HELLO: &str = "fentry:tcp_sendmsg (the sender's buffer, a flow's first send)";
     pub const OPEN_TRACEPOINT: &str = "tracepoint:syscalls/sys_enter_openat (user memory)";
 }
 
@@ -94,7 +104,9 @@ const DENY_HOOK_LIST: &str = "LSM task_kill, ptrace_access_check, inode_unlink, 
 /// `docs/roadmap/CAPABILITY_PROGRAM.md`, lots 273b and 273c). Lot 273c
 /// (the review of #490): measured again with `kernel.bpf_stats_enabled=0`
 /// (the stats add two clock reads to every call; lot 273b's rounds ran
-/// with them), the per-call cost from one round with them on.
+/// with them), the per-call cost from one round with them on. Lot 277: the
+/// start-in-cgroup tracker's work, where it runs, and (the third review of
+/// #494) its cost as the lab measured it.
 const FS_PROTECT_OVERHEAD: &[Overhead] = &[
     Overhead {
         what: "the cgroup move guard (LSM inode_permission): every permission check of a \
@@ -112,11 +124,60 @@ const FS_PROTECT_OVERHEAD: &[Overhead] = &[
                stats off, the 2,000-file package installed and removed +4 % (1,076 -> 1,123 \
                ms), find /usr within the noise (medians of three A/B rounds)",
     },
+    Overhead {
+        what: "(lot 277) the start-in-cgroup tracker (tp_btf cgroup_attach_task, \
+               sched_process_fork, sched_process_exit; fentry cgroup_post_fork; fexit \
+               cgroup_procs_write_start; their links pinned): every fork — a new group's \
+               state cleared, one CGROUP_JOINED lookup, one byte of CGROUP_JOIN_LOST, the \
+               reset's epoch and an insert when the parent is marked — and every exit of a \
+               marked group; every cgroup migration — the systemd-placement test and a path walk \
+               of at most 255 bytes while an exemption by cgroup or unit is in force",
+        cost: "about 0.93 us a fork and its exit on Ubuntu 24.04 (6.8: cgroup_post_fork 469 \
+               ns, sched_process_fork 192 ns, sched_process_exit 272 ns a call) and 0.6 us on \
+               22.04 (5.15: 269, 139 and 187 ns) — run_time_ns / run_cnt over 100,024 calls, \
+               the BPF stats' own clock reads included; a fork + exit + wait of about 140 us \
+               (24.04) and 55 us (22.04) on the lab's guests, the same with the tracker's links \
+               detached within the rounds' spread (medians of five rounds of 20,000)",
+    },
 ];
+
+/// Lot 275 (the reviews of #495, D5 and R0): the cost of the three network
+/// sources on their hot paths, as the lab measured it after the response
+/// program's early port test — per call, `run_time_ns / run_cnt` with
+/// `kernel.bpf_stats_enabled=1` for that measurement only
+/// (`deploy/lab/overhead/prog-cost.sh`, its nn-bench workloads; the stats'
+/// two clock reads a call included); and the throughput lost with the
+/// agent on, every source attached, the stats off (`nn-lab.sh overhead 3`,
+/// medians of three rounds). Ubuntu 24.04 (6.8.0-147), lab round 5 of lot
+/// 275; Ubuntu 22.04 (5.15.0-202), round 4, where the workload ran a moment
+/// only (R001 killed it from /tmp: the script was fixed after).
+const DNS_ANSWER_OVERHEAD: &[Overhead] = &[Overhead {
+    what: "the DNS response program (fexit udp_recvmsg / udpv6_recvmsg): every UDP receive of \
+           more than 12 bytes — the source's family and port in one read, the address and the \
+           budgets only for port 53",
+    cost: "about 128 ns a receive of a loopback datagram from another port (6.8; 5.15: about \
+           44 ns over 1,597 calls), 88 ns a call with an empty receive between each (`udp`); \
+           with the stats off, a 64-byte receive loop +20.6 % and a send-and-drain loop +19.7 % \
+           against the agent off (all sources on)",
+}];
+
+const TLS_HELLO_OVERHEAD: &[Overhead] = &[Overhead {
+    what: "the TLS ClientHello program (fentry tcp_sendmsg): every TCP send — one lookup of the \
+           socket's mark, which misses past a flow's first send",
+    cost: "about 121 ns a send (6.8, 200,000 64-byte sends on one connection); with the stats \
+           off, that send loop +9.9 % against the agent off (all sources on)",
+}];
+
+const NET_INBOUND_OVERHEAD: &[Overhead] = &[Overhead {
+    what: "the inbound connection program (fexit inet_csk_accept): every accept — its budgets, \
+           the socket's correlator in its map, a ring record",
+    cost: "about 666 ns an accept (6.8, 20,000 loopback connect/accept/close); with the stats \
+           off, that loop +5.9 % against the agent off (all sources on)",
+}];
 
 /// Every source of the bus on Linux (a table of the build: a `const`, no
 /// process state).
-pub const SOURCES: [SourceContract; 13] = [
+pub const SOURCES: [SourceContract; 16] = [
     SourceContract {
         source: "process_spawn",
         sensors: &["process_spawn"],
@@ -354,12 +415,17 @@ pub const SOURCES: [SourceContract; 13] = [
              counted per hook and signed (deny_fail_open); a missing deny hook, bpf not in the \
              active LSM list or a deny self-test whose signal is delivered refuses the start \
              (signed) unless NN_ANTI_TAMPER_ALLOW_DEGRADED=1: then L1 or L0, signed; the deny \
-             never depends on the record",
+             never depends on the record; (lot 277) the start-in-cgroup tracker not attached is \
+             signed degraded and no exemption by cgroup or unit applies (fail-closed for the \
+             exemption), a process whose mark could not be kept is not known: no such exemption \
+             for it and what it forks until its thread group ends",
         kernel_budgets: &[KernelBudget {
             allows: "a refused signal, ptrace, kexec, cgroup move, oom_score_adj write or (lot \
                      273b) refused write through a descriptor: one record per caller and \
-                     operation a second, 50 a second per CPU (every one is refused); a refused \
-                     open or other inode operation has no kernel budget",
+                     operation a second, 50 a second per CPU (every one is refused); (lot 277) \
+                     a move into a cgroup an exemption names (cgroup_join, recorded, not \
+                     refused) shares that budget; a refused open or other inode operation has \
+                     no kernel budget",
             counter: "task_denial_rate",
         }],
         overhead: FS_PROTECT_OVERHEAD,
@@ -623,6 +689,112 @@ pub const SOURCES: [SourceContract; 13] = [
         degradation_sources: &["net_sensor", "net_drain"],
         standby_for: None,
     },
+    // Lot 275 (C07 1→2): the inbound connections, the DNS responses, the TLS
+    // ClientHellos.
+    SourceContract {
+        source: "net_inbound",
+        sensors: &["net_inbound"],
+        events: &[K::NetInbound, K::SensorFlood],
+        attach: attach::NET_INBOUND,
+        also: &[],
+        needs_bpf_lsm: false,
+        lsm_part: None,
+        fallbacks: &[],
+        sync_verdict: SyncVerdict::None,
+        opt_in: None,
+        on_failure: FailureMode::Blind,
+        on_failure_detail: "its attach failing (no inet_csk_accept of a known parameter count, \
+             or refused) is signed (net_inbound) and the agent runs without it; its drain ending \
+             is signed (drain_ended) and stops the agent within 5 s; the closed rows share the \
+             netflow log, whose failure to open is the net drain's",
+        kernel_budgets: &[KernelBudget {
+            allows: "accepts: 256 at once, then 512 a second, per accepting process; 2,048 at \
+                     once, then 1,024 a second, per user (SensorFlood says so); a held accept's \
+                     close is not recorded either",
+            counter: "inbound_rate",
+        }],
+        overhead: NET_INBOUND_OVERHEAD,
+        truncations: &[COMM],
+        rings: &["inbound"],
+        probe: None,
+        self_tested: false,
+        degradation_sources: &["net_inbound"],
+        standby_for: None,
+    },
+    SourceContract {
+        source: "dns_answer",
+        sensors: &["dns_answer"],
+        events: &[K::DnsAnswer, K::SensorFlood],
+        attach: attach::DNS_ANSWER,
+        also: &[],
+        needs_bpf_lsm: false,
+        lsm_part: None,
+        fallbacks: &[],
+        sync_verdict: SyncVerdict::None,
+        opt_in: None,
+        on_failure: FailureMode::Blind,
+        on_failure_detail: "its attach failing is signed (dns_answer; udpv6_recvmsg alone: \
+             partial) and the agent runs without it — NN-L-NET-028 then judges every connect \
+             unknown; its pump ending stops the agent within 5 s (signed); R14b: the responses \
+             are decoded by the parse worker — while it is down the events carry no name and no \
+             address, and nothing is bound",
+        kernel_budgets: &[KernelBudget {
+            allows: "64 responses at once, then 128 a second, per process; 2,048 at once, then \
+                     1,024 a second, per user (the resolvers' users exempt); each record says \
+                     how many were held (SensorFlood)",
+            counter: "dns_answer_rate",
+        }],
+        overhead: DNS_ANSWER_OVERHEAD,
+        truncations: &[
+            Truncation {
+                field: "response (the receiver's buffer)",
+                max_bytes: DNS_ANSWER_CAP as u32,
+                marked: "truncated; the records past the cut are not read",
+            },
+            COMM,
+        ],
+        rings: &["dns_answer"],
+        probe: None,
+        self_tested: false,
+        degradation_sources: &["dns_answer"],
+        standby_for: None,
+    },
+    SourceContract {
+        source: "tls_hello",
+        sensors: &["tls_hello"],
+        events: &[K::TlsClientHello, K::SensorFlood],
+        attach: attach::TLS_HELLO,
+        also: &[],
+        needs_bpf_lsm: false,
+        lsm_part: None,
+        fallbacks: &[],
+        sync_verdict: SyncVerdict::None,
+        opt_in: None,
+        on_failure: FailureMode::Blind,
+        on_failure_detail: "its attach failing is signed (tls_hello) and the agent runs \
+             without it (NN-L-NET-003 cannot match); its pump ending stops the agent within 5 s \
+             (signed); R14b: the hellos are fingerprinted by the parse worker — while it is down \
+             the events say undecoded",
+        kernel_budgets: &[KernelBudget {
+            allows: "64 hellos at once, then 32 a second, per process; 512 at once, then 256 a \
+                     second, per user (SensorFlood says so)",
+            counter: "tls_rate",
+        }],
+        overhead: TLS_HELLO_OVERHEAD,
+        truncations: &[
+            Truncation {
+                field: "ClientHello (the sender's buffer)",
+                max_bytes: TLS_HELLO_CAP as u32,
+                marked: "truncated; a hello past the cut is incomplete, no fingerprint",
+            },
+            COMM,
+        ],
+        rings: &["tls"],
+        probe: None,
+        self_tested: false,
+        degradation_sources: &["tls_hello"],
+        standby_for: None,
+    },
 ];
 
 /// The sources that do not travel the bus as a source of their own and are
@@ -743,6 +915,29 @@ mod tests {
             "udp_sendmsg_outbound.rs",
             "const UDP_EMIT_MIN_INTERVAL_NS: u64 = 1_000_000_000;",
         );
+        // lot 275
+        has("inbound.rs", "const TASK_BURST: u64 = 256;");
+        has("inbound.rs", "task_refill_ns: 1_000_000_000 / 512,");
+        has("inbound.rs", "const UID_BURST: u64 = 2048;");
+        has("inbound.rs", "uid_refill_ns: 1_000_000_000 / 1024,");
+        has("dns_answer.rs", "const TASK_BURST: u64 = 64;");
+        has("dns_answer.rs", "task_refill_ns: 1_000_000_000 / 128,");
+        has("dns_answer.rs", "const UID_BURST: u64 = 2048;");
+        has("dns_answer.rs", "uid_refill_ns: 1_000_000_000 / 1024,");
+        has("tls_hello.rs", "const TASK_BURST: u64 = 64;");
+        has("tls_hello.rs", "task_refill_ns: 1_000_000_000 / 32,");
+        has("tls_hello.rs", "const UID_BURST: u64 = 512;");
+        has("tls_hello.rs", "uid_refill_ns: 1_000_000_000 / 256,");
+        let inb = source("net_inbound").unwrap().kernel_budgets[0].allows;
+        assert!(inb.contains("256 at once, then 512") && inb.contains("2,048 at"));
+        let ans = source("dns_answer").unwrap().kernel_budgets[0].allows;
+        assert!(
+            ans.contains("64 responses at once, then 128") && ans.contains("2,048 at once, then")
+        );
+        let tls = source("tls_hello").unwrap().kernel_budgets[0].allows;
+        assert!(
+            tls.contains("64 hellos at once, then 32") && tls.contains("512 at once, then 256")
+        );
         let dns = source("dns_query").unwrap().kernel_budgets[0].allows;
         assert!(
             dns.contains("64 queries at once, then 128")
@@ -832,5 +1027,7 @@ mod tests {
         assert_eq!(t("fim_drain", "child name"), 63);
         assert_eq!(t("module_load", "module path"), 31);
         assert_eq!(t("exec_check", "comm"), 15);
+        assert_eq!(t("dns_answer", "response"), 512);
+        assert_eq!(t("tls_hello", "ClientHello"), 4096);
     }
 }

@@ -32,6 +32,11 @@ pub mod bpf_cmd;
 /// revalidates against. NOT `std`-gated — the eBPF half needs it with
 /// `default-features = false`.
 pub mod btf_offsets;
+/// Lot 277: the processes not started in the cgroup they run in (the
+/// exemptions by cgroup or unit hold for none of them): the eBPF
+/// programs' decision and the names they match, shared with the agent.
+/// NOT `std`-gated.
+pub mod cgroup_join;
 /// Lot 273b: the resource files of the protected cgroups, their values as
 /// stored and compared, shared by the eBPF programs and the agent. NOT
 /// `std`-gated.

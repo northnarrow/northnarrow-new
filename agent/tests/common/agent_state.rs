@@ -210,6 +210,10 @@ pub const INPUT_FLAGS: &[(&str, &str)] = &[
     ("--execq-hashes-local", "the exec quarantine's hash list"),
     ("--exec-policy-local", "the exec policy"),
     ("--rule-policy-local", "the per-rule response policy"),
+    (
+        "--nodns-allow-local",
+        "NN-L-NET-028's signed allowlist (lot 275)",
+    ),
 ];
 
 /// The paths an agent uses with no flag to move them. Every agent a test

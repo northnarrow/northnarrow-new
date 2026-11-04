@@ -131,6 +131,10 @@ pub mod canary {
 // the agent's `canary_host_linux`).
 pub mod canary_host_linux;
 
+// Lot 277: the start-in-cgroup tracker's agent half — the exemptions by
+// cgroup or unit hold for processes started in their cgroup only.
+pub mod cgroup_join;
+
 // The Linux host of the signed chains, the agent's host type (R09a; was the
 // agent's `chain_host_linux`).
 pub mod chain_host_linux;
@@ -287,6 +291,15 @@ pub mod net {
     // The drain of the closed flows, listeners and UDP flows, and the
     // netflow and listener logs (Tappa 10 N9).
     pub mod drain;
+
+    // Lot 275 (C07): the drain of the inbound connections (accepted,
+    // closed), into the same netflow log.
+    pub mod inbound;
+
+    // Lot 275 (NN-L-NET-028): which process resolved which address — the
+    // table on the Linux host (the DNS response pump's ingest with it) and
+    // the judgement of a connect the pumps make.
+    pub mod resolved;
 
     // R09b shims (lab PR 254; plan §4.1 rule 2, removed in R17): the paths
     // the moved sensors and drain name for nn-core's network state, as the

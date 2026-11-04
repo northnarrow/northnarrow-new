@@ -204,10 +204,30 @@ units_inactive() {
     done
     return 0
 }
-if (( ! PACKAGE )) && [[ -d "$BPFFS_ROOT" ]] && units_inactive; then
-    log "units inactive but $BPFFS_ROOT exists — removing the stale pins first"
+# Lot 277 (the re-review of #494, R2): the start-in-cgroup tracker's pin
+# directories, beside the pin root (an upgrade leaves them; the uninstall
+# removes them with it).
+tracker_pin_dirs() {
+    local d
+    for d in "$BPFFS_ROOT"-cgroup-join-v*; do
+        [[ -d "$d" ]] && echo "$d"
+    done
+    return 0
+}
+pins_present() {
+    [[ -d "$BPFFS_ROOT" || -n "$(tracker_pin_dirs)" ]]
+}
+remove_pins() {
+    local d
     rm -rf "$BPFFS_ROOT" 2>/dev/null || true
-    if [[ -d "$BPFFS_ROOT" ]]; then
+    for d in $(tracker_pin_dirs); do
+        rm -rf "$d" 2>/dev/null || true
+    done
+}
+if (( ! PACKAGE )) && pins_present && units_inactive; then
+    log "units inactive but $BPFFS_ROOT (or the tracker's pins beside it) exists — removing the stale pins first"
+    remove_pins
+    if pins_present; then
         if [[ -z "$GRANT_KEY" ]]; then
             stale_pin_root_help >&2
             exit 1
@@ -278,11 +298,11 @@ for u in northnarrow-watchdog northnarrow-agent; do
 done
 
 # ── 2. LSM programs ───────────────────────────────────────────────────
-if [[ -d "$BPFFS_ROOT" ]]; then
-    log "removing pinned maps/programs/links under $BPFFS_ROOT"
-    rm -rf "$BPFFS_ROOT" 2>/dev/null || true
-    if [[ -d "$BPFFS_ROOT" ]]; then
-        echo "uninstall.sh: $BPFFS_ROOT is PROTECTED by the anti-tamper and no trusted-installer window is open" >&2
+if pins_present; then
+    log "removing pinned maps/programs/links under $BPFFS_ROOT and the tracker's beside it"
+    remove_pins
+    if pins_present; then
+        echo "uninstall.sh: $BPFFS_ROOT (or $BPFFS_ROOT-cgroup-join-v*) is PROTECTED by the anti-tamper and no trusted-installer window is open" >&2
         echo "uninstall.sh: (review entry 39). Start the agent again (systemctl start northnarrow-agent) and re-run" >&2
         echo "uninstall.sh: with --grant-key <admin.key carrying the trusted-installer role>; or, if the agent" >&2
         echo "uninstall.sh: refuses to start (exit 78: its key lost or hidden), follow INSTALL_UPGRADE_UNINSTALL.md" >&2

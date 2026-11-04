@@ -708,6 +708,9 @@ fn every_source_and_attach_point_the_code_starts_has_a_contract_entry() {
         "crates/nn-linux/src/sensors/exe_identity.rs",
         "agent/src/boot/fim.rs",
         "agent/src/boot/net.rs",
+        // lot 275
+        "crates/nn-linux/src/sensors/net_telemetry.rs",
+        "crates/nn-linux/src/net/inbound.rs",
     ]);
     let mut labels: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -829,6 +832,7 @@ fn the_stop_beat_signs_what_is_pending() {
             journal: crate::response::journal::ActionJournal::memory(),
             audit: None,
             probe_on: false,
+            nodns: None,
         },
     );
     let view = m.current().unwrap();

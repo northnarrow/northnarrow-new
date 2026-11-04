@@ -38,10 +38,11 @@ use std::fs;
 use std::sync::OnceLock;
 
 use common::btf_offsets::{
-    EnumSpec, FexitTarget, HookArgCheck, HookArgSpec, OffsetSpec, BTF_MODULE_STRUCTS,
-    BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC, CGROUP_MOVE_FINISH, CGROUP_MOVE_TARGET, ENUM_SLOT_TABLE,
-    ENUM_VALUES, FENTRY_TARGETS, FEXIT_TARGETS, HOOK_ARGS, HOOK_ARG_CHECKS, HOOK_ARG_MAX,
-    HOOK_ARG_SLOT_TABLE, REVALIDATE, SLOT_TABLE,
+    EnumSpec, FexitTarget, HookArgCheck, HookArgSpec, JoinTarget, OffsetSpec, BTF_MODULE_STRUCTS,
+    BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC, CGROUP_JOIN_OFFSETS, CGROUP_JOIN_TARGETS,
+    CGROUP_MOVE_FINISH, CGROUP_MOVE_TARGET, ENUM_SLOT_TABLE, ENUM_VALUES, FENTRY_TARGETS,
+    FEXIT_TARGETS, HOOK_ARGS, HOOK_ARG_CHECKS, HOOK_ARG_MAX, HOOK_ARG_SLOT_TABLE, REVALIDATE,
+    SLOT_TABLE,
 };
 
 /// The running kernel's BTF, exported by the kernel when built with
@@ -170,9 +171,26 @@ pub struct ResolvedOffsets {
     /// its program is attached and counted as an expected deny hook;
     /// absent: neither.
     pub optional_deny_hooks: Vec<(&'static str, bool)>,
+    /// Lot 275: the parameter count of each function of
+    /// [`common::btf_offsets::PARAM_COUNT_FUNCS`] this kernel's BTF has;
+    /// the network sensors attach the fexit program built for it.
+    pub func_params: Vec<(&'static str, usize)>,
+    /// Lot 277: why the start-in-cgroup tracker cannot be attached on this
+    /// kernel (a target of another shape or absent, an offset absent);
+    /// `None` when it can.
+    pub cgroup_join_unavailable: Option<String>,
 }
 
 impl ResolvedOffsets {
+    /// Lot 275: the parameter count of `func` on this kernel, when its BTF
+    /// has the function ([`common::btf_offsets::PARAM_COUNT_FUNCS`] only).
+    pub fn param_count(&self, func: &str) -> Option<usize> {
+        self.func_params
+            .iter()
+            .find(|(f, _)| *f == func)
+            .map(|(_, n)| *n)
+    }
+
     /// Lab PR 164: position of the [`HOOK_ARGS`] entry `name` on this
     /// kernel, or `None` when it was not resolved.
     pub fn hook_arg_position(&self, name: &str) -> Option<u32> {
@@ -203,6 +221,12 @@ impl ResolvedOffsets {
             .iter()
             .find(|m| m.name == CGROUP_MOVE_TARGET.func)
             .map(|m| m.detail.as_str())
+    }
+
+    /// Lot 277: why the start-in-cgroup tracker cannot be attached here,
+    /// `None` when it can.
+    pub fn cgroup_join_unavailable(&self) -> Option<&str> {
+        self.cgroup_join_unavailable.as_deref()
     }
 
     /// Lab PR 174: whether this kernel's BTF has the optional deny hook
@@ -618,6 +642,29 @@ fn resolve_with(
         }
         present
     };
+    // Lot 277: the start-in-cgroup tracker — the move guard's fexit target
+    // in its shape (its source stash reads the same return value), every
+    // one of its own targets in theirs, its offsets present.
+    let cgroup_join_unavailable = if !cgroup_move {
+        Some(format!(
+            "{} is not in the shape the programs read (or absent)",
+            CGROUP_MOVE_TARGET.func
+        ))
+    } else {
+        CGROUP_JOIN_TARGETS
+            .iter()
+            .find_map(|t| match btf.join_target_shape(t) {
+                Ok(true) => None,
+                Ok(false) => Some(format!("the kernel's BTF has no {}", t.name)),
+                Err(e) => Some(e.to_string()),
+            })
+            .or_else(|| {
+                absent
+                    .iter()
+                    .find(|m| CGROUP_JOIN_OFFSETS.contains(&m.name))
+                    .map(|m| format!("{} absent: {}", m.name, m.detail))
+            })
+    };
     let optional_deny_hooks = super::OPTIONAL_DENY_HOOKS
         .iter()
         .map(|h| {
@@ -628,6 +675,10 @@ fn resolve_with(
             }
         })
         .collect();
+    let func_params = common::btf_offsets::PARAM_COUNT_FUNCS
+        .iter()
+        .filter_map(|f| btf.param_count(f).map(|n| (*f, n)))
+        .collect();
     if missing.is_empty() {
         ResolveOutcome::Resolved(ResolvedOffsets {
             values,
@@ -636,6 +687,8 @@ fn resolve_with(
             modules_not_loaded,
             hook_args_checked,
             optional_deny_hooks,
+            func_params,
+            cgroup_join_unavailable,
         })
     } else {
         ResolveOutcome::Refuse(RefuseReason::Drift(missing))
@@ -1166,7 +1219,14 @@ struct Btf {
     /// LSM hook functions are kept (a vmlinux has tens of thousands), and
     /// (lot 273) the [`FEXIT_TARGETS`] functions.
     lsm_funcs: HashMap<String, u32>,
+    /// Lot 277: the tracepoints of [`CGROUP_JOIN_TARGETS`] → their
+    /// `btf_trace_<name>` typedef's type id.
+    tracepoints: HashMap<String, u32>,
 }
+
+/// Prefix of the typedefs the kernel's BTF names its tracepoints'
+/// prototypes by.
+const TRACE_TYPEDEF_PREFIX: &str = "btf_trace_";
 
 /// Prefix of the BTF functions the kernel generates for its LSM hooks.
 const LSM_FUNC_PREFIX: &str = "bpf_lsm_";
@@ -1235,6 +1295,7 @@ impl Btf {
         };
         let mut name_to_id: HashMap<String, u32> = HashMap::new();
         let mut lsm_funcs: HashMap<String, u32> = HashMap::new();
+        let mut tracepoints: HashMap<String, u32> = HashMap::new();
 
         let mut p = tstart;
         while p + 12 <= tend {
@@ -1285,6 +1346,21 @@ impl Btf {
                 // A type tag (`__user`, `__rcu`, …) qualifies the type it
                 // refers to, like a cv-qualifier.
                 KIND_TYPEDEF | KIND_CONST | KIND_VOLATILE | KIND_RESTRICT | KIND_TYPE_TAG => {
+                    // Lot 277: a tracepoint the tracker reads, by its
+                    // `btf_trace_<name>` typedef (this type's id).
+                    if kind == KIND_TYPEDEF {
+                        if let Some(tp) = name_of(name_off)
+                            .as_deref()
+                            .and_then(|n| n.strip_prefix(TRACE_TYPEDEF_PREFIX))
+                        {
+                            if CGROUP_JOIN_TARGETS
+                                .iter()
+                                .any(|t| t.tracepoint && t.name == tp)
+                            {
+                                tracepoints.entry(tp.to_string()).or_insert(id);
+                            }
+                        }
+                    }
                     types.push(Ty::Forward {
                         type_id: size_or_type,
                     });
@@ -1299,6 +1375,10 @@ impl Btf {
                         if nm.starts_with(LSM_FUNC_PREFIX)
                             || FEXIT_TARGETS.iter().any(|t| t.func == nm)
                             || FENTRY_TARGETS.iter().any(|f| *f == nm)
+                            || common::btf_offsets::PARAM_COUNT_FUNCS.contains(&nm.as_str())
+                            || CGROUP_JOIN_TARGETS
+                                .iter()
+                                .any(|t| !t.tracepoint && t.name == nm)
                         {
                             lsm_funcs.entry(nm).or_insert(size_or_type);
                         }
@@ -1382,7 +1462,72 @@ impl Btf {
             strings,
             name_to_id,
             lsm_funcs,
+            tracepoints,
         })
+    }
+
+    /// Lot 275: the parameter count of function `func`
+    /// ([`common::btf_offsets::PARAM_COUNT_FUNCS`]); `None` when the kernel's
+    /// BTF has no such function, or no prototype for it.
+    fn param_count(&self, func: &str) -> Option<usize> {
+        let proto = *self.lsm_funcs.get(func)?;
+        match self.types.get(proto as usize) {
+            Some(Ty::FuncProto { params, .. }) => Some(params.len()),
+            _ => None,
+        }
+    }
+
+    /// Lot 277: the parameters of target `t` as its program numbers them —
+    /// a function's own, a tracepoint's typedef's after its data pointer.
+    /// `Ok(None)`: the kernel has no such function or tracepoint.
+    fn join_params(&self, t: &JoinTarget) -> Result<Option<Vec<u32>>, ResolveError> {
+        let proto_of = |mut id: u32| -> Option<&Vec<u32>> {
+            for _ in 0..16 {
+                match self.types.get(id as usize)? {
+                    Ty::Forward { type_id } | Ty::Ptr { type_id } => id = *type_id,
+                    Ty::FuncProto { params, .. } => return Some(params),
+                    _ => return None,
+                }
+            }
+            None
+        };
+        let id = if t.tracepoint {
+            self.tracepoints.get(t.name)
+        } else {
+            self.lsm_funcs.get(t.name)
+        };
+        let Some(id) = id.copied() else {
+            return Ok(None);
+        };
+        let params = proto_of(id)
+            .ok_or_else(|| ResolveError::Prototype(format!("{}: no function prototype", t.name)))?;
+        Ok(Some(if t.tracepoint {
+            params.iter().skip(1).copied().collect()
+        } else {
+            params.clone()
+        }))
+    }
+
+    /// Lot 277: `Ok(true)` when the kernel has target `t` with a pointer to
+    /// each struct its program reads where it reads it, `Ok(false)` when it
+    /// has no such target, an error for another shape.
+    fn join_target_shape(&self, t: &JoinTarget) -> Result<bool, ResolveError> {
+        let Some(params) = self.join_params(t)? else {
+            return Ok(false);
+        };
+        for (pos, pointee) in t.args {
+            if params
+                .get(*pos as usize)
+                .and_then(|p| self.pointee_name(*p))
+                != Some(*pointee)
+            {
+                return Err(ResolveError::Prototype(format!(
+                    "{}: argument {pos} is not a struct {pointee} *, where the program reads it",
+                    self.describe_prototype(t.name, &params)
+                )));
+            }
+        }
+        Ok(true)
     }
 
     /// Lab PR 174: whether the kernel has LSM hook `hook` (its
@@ -2744,6 +2889,29 @@ mod tests {
             .1
     }
 
+    /// Lot 275: the network sensors' fexit targets' parameter counts are
+    /// read from the BTF — the program built for that count is attached; a
+    /// function the kernel lacks has no count (its sensor is not attached).
+    #[test]
+    fn the_net_fexit_targets_parameter_counts_are_read() {
+        let mut b = BtfBuilder::new();
+        let int = b.int("int");
+        let sock = b.composite(Some("sock"), false, false, &[]);
+        let p_sock = b.ptr(sock);
+        // 6.10+: inet_csk_accept(sk, arg); 5.15: udp_recvmsg with 6
+        b.func("inet_csk_accept", p_sock, &[p_sock, p_sock]);
+        b.func("udp_recvmsg", int, &[p_sock, p_sock, int, int, int, p_sock]);
+        // a function outside the list is not recorded
+        b.func("tcp_sendmsg", int, &[p_sock, p_sock, int]);
+        let btf = Btf::parse(&b.build()).expect("fixture parses");
+        let r = hooks_only(&btf);
+        assert_eq!(r.param_count("inet_csk_accept"), Some(2));
+        assert_eq!(r.param_count("udp_recvmsg"), Some(6));
+        assert_eq!(r.param_count("udpv6_recvmsg"), None, "absent");
+        assert_eq!(r.param_count("tcp_sendmsg"), None, "not a listed target");
+        assert_eq!(r.func_params.len(), 2);
+    }
+
     #[test]
     fn setattr_dentry_is_argument_0_up_to_6_8() {
         let r = hooks_only(&hook_btf(Setattr::UpTo68, Xattr::From512, 1));
@@ -3044,6 +3212,106 @@ mod tests {
                 optional_hook_gate(Some(&r), "file_ioctl_compat"),
                 Some(false)
             );
+        }
+    }
+
+    /// Lot 277: the start-in-cgroup tracker is attachable where the move
+    /// guard's fexit target is in its shape and every one of its own
+    /// targets reads a pointer to the struct its program reads — the
+    /// tracepoints by their `btf_trace_<name>` typedef, past its data
+    /// pointer — and nowhere else: a missing target, a prototype of
+    /// another shape (a `cgroup_attach_task` without its path) or the move
+    /// guard's target missing leave it out, and say why.
+    #[test]
+    fn the_start_in_cgroup_tracker_is_selected_from_the_kernels_btf() {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Drop {
+            Nothing,
+            Write,
+            PostFork,
+            ExitTp,
+            AttachWithoutPath,
+            KargsInt,
+        }
+        fn btf_with(drop: Drop) -> Btf {
+            let mut b = BtfBuilder::new();
+            let int = b.int("int");
+            let ch = b.int("char");
+            let p_char = b.ptr(ch);
+            let task = b.composite(Some("task_struct"), false, false, &[]);
+            let cgroup = b.composite(Some("cgroup"), false, false, &[]);
+            let kargs = b.composite(Some("kernel_clone_args"), false, false, &[]);
+            let p_task = b.ptr(task);
+            let p_cgroup = b.ptr(cgroup);
+            let p_kargs = b.ptr(kargs);
+            let p_int = b.ptr(int);
+            if drop != Drop::Write {
+                b.func("cgroup_procs_write_start", p_task, &[p_char, int, p_int]);
+                b.func("cgroup_procs_write_finish", int, &[p_task, int]);
+            }
+            if drop != Drop::PostFork {
+                let second = if drop == Drop::KargsInt { int } else { p_kargs };
+                b.func("cgroup_post_fork", int, &[p_task, second]);
+            }
+            let tp = |b: &mut BtfBuilder, name: &str, params: &[u32]| {
+                let f = b.func(&format!("__fixture_proto_{name}"), int, params);
+                let p = b.ptr(f - 1);
+                b.typedef(&format!("btf_trace_{name}"), p);
+            };
+            let attach: Vec<u32> = if drop == Drop::AttachWithoutPath {
+                vec![p_int, p_cgroup, p_task, int]
+            } else {
+                vec![p_int, p_cgroup, p_char, p_task, int]
+            };
+            tp(&mut b, "cgroup_attach_task", &attach);
+            tp(&mut b, "sched_process_fork", &[p_int, p_task, p_task]);
+            if drop != Drop::ExitTp {
+                tp(&mut b, "sched_process_exit", &[p_int, p_task, int]);
+            }
+            Btf::parse(&b.build()).expect("tracker fixture parses")
+        }
+        // the review of #494, D5: the tracker's offsets absent from a BTF
+        // that has every target leave it out, and say which
+        let specs: Vec<OffsetSpec> = REVALIDATE
+            .iter()
+            .copied()
+            .filter(|o| CGROUP_JOIN_OFFSETS.contains(&o.name))
+            .collect();
+        assert_eq!(specs.len(), CGROUP_JOIN_OFFSETS.len());
+        match resolve_with(
+            &btf_with(Drop::Nothing),
+            &specs,
+            &[],
+            HOOK_ARGS,
+            &[],
+            &|_| None,
+        ) {
+            ResolveOutcome::Resolved(r) => {
+                let why = r.cgroup_join_unavailable().expect("offsets absent");
+                assert!(why.contains("_OFFSET absent"), "{why}");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+        for (drop, why) in [
+            (Drop::Nothing, None),
+            (Drop::Write, Some("cgroup_procs_write_start")),
+            (Drop::PostFork, Some("no cgroup_post_fork")),
+            (Drop::ExitTp, Some("no sched_process_exit")),
+            (
+                Drop::AttachWithoutPath,
+                Some("argument 2 is not a struct task_struct"),
+            ),
+            (
+                Drop::KargsInt,
+                Some("argument 1 is not a struct kernel_clone_args"),
+            ),
+        ] {
+            let r = hooks_only(&btf_with(drop));
+            match (why, r.cgroup_join_unavailable()) {
+                (None, None) => {}
+                (Some(want), Some(got)) => assert!(got.contains(want), "{got}"),
+                (want, got) => panic!("{want:?} vs {got:?}"),
+            }
         }
     }
 

@@ -503,6 +503,247 @@ impl NetListenRaw {
     }
 }
 
+// ── Lot 275 (C07 1→2): inbound connections, DNS answers, TLS hellos ─────
+
+/// Lot 275 — capacity of the `INBOUND_EVENTS` ring (accepted connections
+/// and their closes; 112-byte records, about 2,300).
+pub const INBOUND_EVENTS_BYTES: u32 = 256 * 1024;
+/// Lot 275 — capacity of the `DNS_ANSWER_EVENTS` ring (576-byte records,
+/// about 900).
+pub const DNS_ANSWER_EVENTS_BYTES: u32 = 512 * 1024;
+/// Lot 275 — capacity of the `TLS_HELLO_EVENTS` ring (4,176-byte records,
+/// about 250).
+pub const TLS_HELLO_EVENTS_BYTES: u32 = 1024 * 1024;
+/// Lot 275 — `INBOUND_SOCK_MAP` entry cap: the accepted sockets the kernel
+/// remembers between their accept and their close, apart from the outbound
+/// ones (`FLOW_SOCK_MAP`), so an inbound flood never evicts an outbound
+/// flow's close.
+pub const INBOUND_SOCK_MAP_MAX_ENTRIES: u32 = 65_536;
+/// Lot 275 — `TLS_PENDING` entry cap: the outbound sockets whose first send
+/// has not been seen yet (the ClientHello candidate).
+pub const TLS_PENDING_MAX_ENTRIES: u32 = 65_536;
+/// Lot 275 — the most of a DNS response a record carries: the classic
+/// 512-byte UDP message (RFC 1035 §4.2.1). A longer one is cut there
+/// ([`answer_flags::TRUNCATED`]); its answers come first in the message, so
+/// the records the cut leaves whole are still read.
+pub const DNS_ANSWER_CAP: usize = 512;
+/// Lot 275 — the most of a ClientHello a record carries (design §6.3 of
+/// Tappa 10: the first 4,096 bytes of the flow). A post-quantum key share
+/// makes a browser's hello about 1,800 bytes; a longer one is cut
+/// ([`tls_flags::TRUNCATED`]) and its fingerprint is `incomplete`.
+pub const TLS_HELLO_CAP: usize = 4096;
+
+/// Lot 275 — what an [`NetInboundRaw`] is.
+pub mod inbound_kind {
+    /// `inet_csk_accept` returned the socket to the accepting process.
+    pub const ACCEPT: u8 = 1;
+    /// `tcp_close` of an accepted socket the accept recorded.
+    pub const CLOSE: u8 = 2;
+}
+
+/// Lot 275 — the budget flags of the new records (as `dns_flags`).
+pub mod held_flags {
+    /// `held` counts records of this process the kernel held back since
+    /// its previous record (its own budget ran out).
+    pub const TASK: u8 = 1 << 0;
+    /// `held_uid` counts records of this process's user held back (the
+    /// user's budget, across its processes).
+    pub const UID: u8 = 1 << 1;
+}
+
+/// Lot 275 — flags of a [`DnsAnswerRaw`] (bits 0 and 1 are
+/// [`held_flags`]).
+pub mod answer_flags {
+    /// The datagram was longer than [`super::DNS_ANSWER_CAP`]: the record
+    /// holds its first bytes.
+    pub const TRUNCATED: u8 = 1 << 2;
+    /// The receiver's buffer could not be read (`captured` is 0).
+    pub const UNREAD: u8 = 1 << 3;
+}
+
+/// Lot 275 — flags of a [`TlsHelloRaw`] (bits 0 and 1 are [`held_flags`]).
+pub mod tls_flags {
+    /// The send was longer than [`super::TLS_HELLO_CAP`]: the record holds
+    /// its first bytes.
+    pub const TRUNCATED: u8 = 1 << 2;
+}
+
+/// Lot 275 (C07) — an accepted TCP connection (`inet_csk_accept`, fexit:
+/// the accepting process's context) or its close (`tcp_close`, fexit), one
+/// ring for both so a close always follows its accept. `remote_*` is the
+/// peer that connected, `local_*` the listener's end. `flow_id` is the
+/// correlator the accept wrote in `INBOUND_SOCK_MAP` (its time, then the
+/// socket's address), read back by the close; the close carries the byte
+/// counters and `sk_err`. Only an accept within the accepting process's
+/// and user's budgets is recorded, and only a recorded accept has a close.
+///
+/// Layout: 8 + 8 + 8 + 16 + 4 + 4 + 16 + 16 + 16 + 4 + 4 + 4 + 4 = 112
+/// bytes, 8-aligned.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct NetInboundRaw {
+    pub timestamp_ns: u64,
+    pub bytes_sent: u64,
+    pub bytes_recv: u64,
+    pub flow_id: [u8; ADDR_LEN],
+    pub pid: u32,
+    pub uid: u32,
+    pub remote_addr: [u8; ADDR_LEN],
+    pub local_addr: [u8; ADDR_LEN],
+    pub comm: [u8; TASK_COMM_LEN],
+    pub family: u8,
+    /// [`inbound_kind`].
+    pub kind: u8,
+    /// Low 8 bits of `sk->sk_err` at the close; 0 at the accept.
+    pub close_reason: u8,
+    /// [`held_flags`].
+    pub flags: u8,
+    pub remote_port: u16,
+    pub local_port: u16,
+    /// Accepts of this process held back by its budget since its previous
+    /// record (saturating).
+    pub held: u16,
+    /// As `held`, by its user's budget.
+    pub held_uid: u16,
+    pub _pad: [u8; 4],
+}
+
+impl NetInboundRaw {
+    pub const fn zeroed() -> Self {
+        Self {
+            timestamp_ns: 0,
+            bytes_sent: 0,
+            bytes_recv: 0,
+            flow_id: [0; ADDR_LEN],
+            pid: 0,
+            uid: 0,
+            remote_addr: [0; ADDR_LEN],
+            local_addr: [0; ADDR_LEN],
+            comm: [0; TASK_COMM_LEN],
+            family: 0,
+            kind: 0,
+            close_reason: 0,
+            flags: 0,
+            remote_port: 0,
+            local_port: 0,
+            held: 0,
+            held_uid: 0,
+            _pad: [0; 4],
+        }
+    }
+}
+
+/// Lot 275 (C07) — a DNS response a process received: `udp_recvmsg` /
+/// `udpv6_recvmsg` (fexit, the receiver's context) of a datagram from port
+/// 53, read from the receiver's own buffer after the kernel copied it
+/// there (so a response in page fragments reads as well as a linear one).
+/// `server` is the datagram's source (the `msg_name` the kernel filled, or
+/// the connected socket's peer). The parse worker decodes `payload`.
+///
+/// Layout: 8 + 4 + 4 + 16 + 16 + 4 + 2 + 2 + 2 + 1 + 1 + 2 + 2 + 512 = 576
+/// bytes, 8-aligned.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct DnsAnswerRaw {
+    pub timestamp_ns: u64,
+    pub pid: u32,
+    pub uid: u32,
+    pub comm: [u8; TASK_COMM_LEN],
+    pub server: [u8; ADDR_LEN],
+    /// The receive's return value: the bytes copied, or — `MSG_TRUNC` —
+    /// the datagram's length, longer than the buffer (review of #495, N1:
+    /// what is read is at most the buffer's length, and a datagram longer
+    /// than what was read is `TRUNCATED`).
+    pub datagram_len: u32,
+    /// The bytes of `payload` read (at most [`DNS_ANSWER_CAP`]).
+    pub captured: u16,
+    pub server_port: u16,
+    pub held: u16,
+    pub family: u8,
+    /// [`held_flags`] and [`answer_flags`].
+    pub flags: u8,
+    pub held_uid: u16,
+    pub _pad: [u8; 2],
+    pub payload: [u8; DNS_ANSWER_CAP],
+}
+
+impl DnsAnswerRaw {
+    pub const fn zeroed() -> Self {
+        Self {
+            timestamp_ns: 0,
+            pid: 0,
+            uid: 0,
+            comm: [0; TASK_COMM_LEN],
+            server: [0; ADDR_LEN],
+            datagram_len: 0,
+            captured: 0,
+            server_port: 0,
+            held: 0,
+            family: 0,
+            flags: 0,
+            held_uid: 0,
+            _pad: [0; 2],
+            payload: [0; DNS_ANSWER_CAP],
+        }
+    }
+}
+
+/// Lot 275 (C07) — the first send of an outbound TCP flow when it is shaped
+/// as a TLS ClientHello (`tcp_sendmsg`, fentry: a handshake record, version
+/// 3.x, a ClientHello message), copied from the sender's buffer. `flow_id`
+/// is the flow's correlator (`FLOW_SOCK_MAP`), so the fingerprint joins the
+/// flow's record; the destination is the socket's peer.
+///
+/// Layout: 8 + 16 + 4 + 4 + 16 + 16 + 4 + 2 + 2 + 2 + 1 + 1 + 2 + 2 + 4096
+/// = 4,176 bytes, 8-aligned.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct TlsHelloRaw {
+    pub timestamp_ns: u64,
+    pub flow_id: [u8; ADDR_LEN],
+    pub pid: u32,
+    pub uid: u32,
+    pub comm: [u8; TASK_COMM_LEN],
+    pub dst_addr: [u8; ADDR_LEN],
+    /// The bytes the send carried.
+    pub send_len: u32,
+    /// The bytes of `data` read (at most [`TLS_HELLO_CAP`]).
+    pub captured: u16,
+    pub dst_port: u16,
+    pub held: u16,
+    pub family: u8,
+    /// [`held_flags`] and [`tls_flags`].
+    pub flags: u8,
+    pub held_uid: u16,
+    pub _pad: [u8; 2],
+    pub data: [u8; TLS_HELLO_CAP],
+}
+
+impl TlsHelloRaw {
+    pub const fn zeroed() -> Self {
+        Self {
+            timestamp_ns: 0,
+            flow_id: [0; ADDR_LEN],
+            pid: 0,
+            uid: 0,
+            comm: [0; TASK_COMM_LEN],
+            dst_addr: [0; ADDR_LEN],
+            send_len: 0,
+            captured: 0,
+            dst_port: 0,
+            held: 0,
+            family: 0,
+            flags: 0,
+            held_uid: 0,
+            _pad: [0; 2],
+            data: [0; TLS_HELLO_CAP],
+        }
+    }
+}
+
 /// Tappa 10 (N2) — flow close / outbound emission. UNIFIED record
 /// across `tcp_close` (fexit, accurate byte counters via
 /// `tcp_sock` reads) AND `udp_sendmsg_outbound` (kprobe, per-send
@@ -869,14 +1110,24 @@ pub const FS_OP_NICE: u8 = 27;
 /// Lot 273c: the I/O priority of a protected process changed by another
 /// (`ioprio_set`: `task_setioprio`; `target_dev` = the ioprio value).
 pub const FS_OP_IOPRIO: u8 = 28;
-/// Lot 273d (the review of #492): a write of a global sysctl that aborts
+/// Lot 277: NOT a refusal — a process moved by `cgroup.procs` /
+/// `cgroup.threads` into a cgroup the per-rule policy's exemptions name (a
+/// cgroup path, or a unit's name, matched by hash:
+/// [`crate::cgroup_join`]), by anyone but systemd's placement. The move
+/// goes through; the moved process and every process it starts are never
+/// exempt by cgroup or unit (`target_ino` = the moved tgid, `target_dev` =
+/// the hash of the name matched, 0 for a destination path too long to
+/// hash).
+pub const FS_OP_CGROUP_JOIN: u8 = 29;
+
+/// Lot 273d (the review of #492; 30 since lot 277 took 29): a write of a global sysctl that aborts
 /// or starves the agent with the host (`vm.overcommit_memory=2`, a cut
 /// `pid_max` / `threads-max` / `max_map_count`, real-time throttling off)
 /// (`common::cgroup_limits::sysctl_write_harmful`), and any write of
 /// `kernel.ftrace_enabled` (0 blinds it: R1 of the external review of
 /// 04/11), refused outside a window (`target_dev`/`target_ino` = the
 /// file's inode).
-pub const FS_OP_SYSCTL: u8 = 29;
+pub const FS_OP_SYSCTL: u8 = 30;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
@@ -1906,6 +2157,7 @@ mod tests {
             FS_OP_SCHED,
             FS_OP_NICE,
             FS_OP_IOPRIO,
+            FS_OP_CGROUP_JOIN,
             FS_OP_SYSCTL,
         ];
         for (i, a) in ops.iter().enumerate() {
@@ -2102,6 +2354,27 @@ mod tests {
         assert_eq!(restored.close_reason, original.close_reason);
         assert_eq!(restored.proto, original.proto);
         assert_eq!(restored.dst_port, original.dst_port);
+    }
+
+    /// Lot 275: the new records' sizes and capacities (the eBPF programs
+    /// reserve them; the drains decode them by size).
+    #[test]
+    fn lot_275_records_and_capacities_lock_in() {
+        assert_eq!(size_of::<NetInboundRaw>(), 112);
+        assert_eq!(size_of::<DnsAnswerRaw>(), 576);
+        assert_eq!(size_of::<TlsHelloRaw>(), 4176);
+        assert_eq!(core::mem::align_of::<TlsHelloRaw>(), 8);
+        assert_eq!(INBOUND_EVENTS_BYTES, 256 * 1024);
+        assert_eq!(DNS_ANSWER_EVENTS_BYTES, 512 * 1024);
+        assert_eq!(TLS_HELLO_EVENTS_BYTES, 1024 * 1024);
+        assert_eq!(DNS_ANSWER_CAP, 512);
+        assert_eq!(TLS_HELLO_CAP, 4096);
+        // the flags of a record do not overlap
+        assert_eq!(held_flags::TASK | held_flags::UID, 0b11);
+        assert_eq!(answer_flags::TRUNCATED & 0b11, 0);
+        assert_eq!(answer_flags::UNREAD & (0b11 | answer_flags::TRUNCATED), 0);
+        assert_eq!(tls_flags::TRUNCATED & 0b11, 0);
+        assert_ne!(inbound_kind::ACCEPT, inbound_kind::CLOSE);
     }
 
     /// N2 test #7: capacity-constant lock-in. The byte sizes

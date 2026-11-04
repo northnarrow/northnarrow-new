@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{
     ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw, ADDR_LEN,
-    FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_CGROUP_FREEZE, FS_OP_CGROUP_KILL, FS_OP_CGROUP_LIMIT,
-    FS_OP_CGROUP_MOVE, FS_OP_CGROUP_V1, FS_OP_CREATE, FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_LINK,
-    FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_OOM_ADJ, FS_OP_PTRACE, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR,
-    FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR,
+    FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_CGROUP_FREEZE, FS_OP_CGROUP_JOIN, FS_OP_CGROUP_KILL,
+    FS_OP_CGROUP_LIMIT, FS_OP_CGROUP_MOVE, FS_OP_CGROUP_V1, FS_OP_CREATE, FS_OP_IOCTL, FS_OP_KEXEC,
+    FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_OOM_ADJ, FS_OP_PTRACE, FS_OP_READ, FS_OP_RENAME,
+    FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE,
+    FS_OP_XATTR,
 };
 
 /// Serde default of `Event::CanaryTripped::first_trip`.
@@ -481,6 +482,22 @@ pub enum Event {
         #[serde(default)]
         rebaselined: bool,
     },
+    /// Lot 275 (C07), appended (the variants before keep their place in
+    /// every encoding) — an inbound TCP connection, with the same flow
+    /// attribution as an outbound one: its row at the accept
+    /// ([`crate::telemetry::FlowPhase::Connect`], the accepting process)
+    /// and at the close ([`crate::telemetry::FlowPhase::Closed`], the byte
+    /// counters). `src_*` is the peer that connected, `dst_*` the local
+    /// listener's end (the initiator first, as the outbound rows have it).
+    /// A variant of its own: the rules of outbound flows never read it.
+    NetInbound(crate::wire::NetFlowEvent),
+    /// Lot 275 (C07) — a DNS response a process received (the receiver's
+    /// context: the application on a stub-resolver host, the local
+    /// resolver for its upstream leg), decoded by the parse worker.
+    DnsAnswer(crate::telemetry::DnsAnswerEvent),
+    /// Lot 275 (C07) — the TLS ClientHello an outbound flow began with, its
+    /// JA3 and JA4 computed by the parse worker (NN-L-NET-003 judges it).
+    TlsClientHello(crate::telemetry::TlsHelloEvent),
 }
 
 /// Lab PR 219: what the exploit post-condition guard found (`epg::kind`).
@@ -860,6 +877,12 @@ pub enum FloodSource {
     Listen,
     /// `io_uring_create` (`io_uring_setup()`).
     IoUringCreate,
+    /// Lot 275: `inet_csk_accept` (an inbound connection accepted).
+    Accept,
+    /// Lot 275: a DNS response received.
+    DnsAnswer,
+    /// Lot 275: a TLS ClientHello sent.
+    TlsHello,
 }
 
 impl FloodSource {
@@ -867,6 +890,9 @@ impl FloodSource {
         match self {
             Self::Listen => "listen",
             Self::IoUringCreate => "io_uring_create",
+            Self::Accept => "accept",
+            Self::DnsAnswer => "dns_answer",
+            Self::TlsHello => "tls_hello",
         }
     }
 }
@@ -1029,6 +1055,13 @@ pub enum FsProtectOperation {
     /// Lot 273c: a protected process's I/O priority changed by another
     /// (`ionice`); `target_dev` is the value.
     Ioprio,
+    /// Lot 277: NOT a refusal — a process moved into a cgroup the per-rule
+    /// policy's exemptions name, by anyone but systemd's placement; the
+    /// target is the moved tgid, `target_dev` the hash of the exemption's
+    /// name (0: a destination too long to hash). The move went through;
+    /// the moved process and what it starts are never exempt by cgroup or
+    /// unit.
+    CgroupJoin,
     /// Lot 273d: a global sysctl's write that aborts or starves the agent
     /// (overcommit, `pid_max`, `threads-max`, `max_map_count`, real-time
     /// throttling).
@@ -1069,6 +1102,7 @@ impl FsProtectOperation {
             crate::wire::FS_OP_SCHED => Self::Sched,
             crate::wire::FS_OP_NICE => Self::Nice,
             crate::wire::FS_OP_IOPRIO => Self::Ioprio,
+            FS_OP_CGROUP_JOIN => Self::CgroupJoin,
             crate::wire::FS_OP_SYSCTL => Self::Sysctl,
             other => Self::Unknown(other),
         }
@@ -1104,6 +1138,7 @@ impl FsProtectOperation {
             Self::Sched => "sched",
             Self::Nice => "nice",
             Self::Ioprio => "ioprio",
+            Self::CgroupJoin => "cgroup_join",
             Self::Sysctl => "sysctl",
             Self::Unknown(_) => "unknown",
         }
@@ -1661,6 +1696,12 @@ mod tests {
                 FsProtectOperation::Ioprio,
                 "ioprio",
             ),
+            // Lot 277
+            (
+                crate::wire::FS_OP_CGROUP_JOIN,
+                FsProtectOperation::CgroupJoin,
+                "cgroup_join",
+            ),
             (
                 crate::wire::FS_OP_SYSCTL,
                 FsProtectOperation::Sysctl,
@@ -1673,8 +1714,8 @@ mod tests {
             assert_eq!(op.to_string(), name);
         }
         assert_eq!(
-            FsProtectOperation::from_wire(30),
-            FsProtectOperation::Unknown(30)
+            FsProtectOperation::from_wire(31),
+            FsProtectOperation::Unknown(31)
         );
     }
     use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};
