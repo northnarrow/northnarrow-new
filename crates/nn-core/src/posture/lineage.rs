@@ -2457,6 +2457,19 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         Some(hops.into_inner())
     }
 
+    /// Lot 282: what the kernel executed for `pid`'s parent, when it forked
+    /// `pid` (the ordered walk of one hop: external audit POS-003). `None`
+    /// when either cannot be placed. Unlike [`Self::lineage_identities`],
+    /// an ancestor further up that cannot be read (a daemon's double fork,
+    /// a process gone before its exec was read) does not hide the parent:
+    /// NN-L-EVA-002 asks who ran an `iptables`, nothing more.
+    pub fn parent_identity(&self, pid: u32, as_of: AsOf) -> Option<ExecIdentity> {
+        match self.lineage_walk(pid, as_of, |hop| hop.pid != pid, 1) {
+            Some(Some(hop)) => Some(self.hop_identity(&hop)),
+            _ => None,
+        }
+    }
+
     /// Lot 275 (NN-L-NET-028): `pid` and its ancestors on the walk of
     /// [`Self::actor_in_lineage`] (ordered, POS-003), `pid` first, each
     /// with its start as the spawn cache holds it (`CLOCK_MONOTONIC` ns; 0

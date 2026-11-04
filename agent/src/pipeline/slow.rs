@@ -228,6 +228,7 @@ mod tests {
             sources: 0,
             filename: "/srv/data/a.pdf".to_string(),
             timestamp_ns: ts,
+            cgroup_id: 0,
         }
     }
 

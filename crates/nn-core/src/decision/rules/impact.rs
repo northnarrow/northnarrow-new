@@ -243,6 +243,7 @@ mod tests {
             sources: 0,
             filename: "/srv/nn-malsim/f020.locked".into(),
             timestamp_ns: ts,
+            cgroup_id: 0,
         }
     }
 
@@ -322,6 +323,8 @@ mod tests {
             timestamp_ns: 500 * S,
             overwrites: true,
             cgroup_window: false,
+            small_files: false,
+            cgroup_id: 0,
         };
         let rules = impact_rules(tr);
         assert!(rules.iter().all(|r| r.evaluate(&rewrites).is_none()));

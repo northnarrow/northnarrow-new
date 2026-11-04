@@ -27,13 +27,26 @@ use crate::posture::{CombatCause, CombatEntry, EntryProcess, TriggerEvidence};
 /// Lab PR 245: the evidence the posture cites for `trigger`, raised on an
 /// event of `pid`.
 fn evidence_of(trigger: TriggerType, pid: Option<u32>) -> TriggerEvidence {
+    // Lot 282: a heuristic's, as the posture builds it — it enters COMBAT
+    // on a heuristic only with a signal of another kind of evidence in the
+    // actor's scope, and the ladder never kills on one heuristic arm
+    // (`CombatCause::single_heuristic_arm`); a decisive trigger cites none.
+    use nn_model::posture_types::{Confidence, EvidenceClass};
+    let confidence =
+        trigger.confidence(nn_model::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION);
+    let corroborated_by = match (confidence, trigger.evidence_class()) {
+        (Confidence::Decisive, _) => Vec::new(),
+        (_, EvidenceClass::Execution) => {
+            vec![(TriggerType::ExfiltrationPattern, EvidenceClass::Network)]
+        }
+        _ => vec![(TriggerType::ExploitAttempt, EvidenceClass::Execution)],
+    };
     TriggerEvidence {
         trigger,
         raised: vec![trigger],
         class: trigger.evidence_class(),
-        confidence: trigger
-            .confidence(nn_model::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION),
-        corroborated_by: Vec::new(),
+        confidence,
+        corroborated_by,
         locked: trigger.locks_combat(),
         scope: "login uid 1000".to_string(),
         event_kind: "ProcessSpawn",

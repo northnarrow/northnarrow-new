@@ -141,14 +141,204 @@ else
 fi
 aws_fixture_restore || bad "~/.aws not put back as found (see above)"
 
-# 3. mass write: 25 write-opens counted in the kernel, one event
+# 3. mass write: 25 files created by one process, counted in the kernel,
+# one event (lot 282: the files created, apart from the rewrites)
 mark=$(date '+%Y-%m-%d %H:%M:%S')
 d=$(mktemp -d /var/tmp/nn-open-mw.XXXXXX)
 for i in $(seq 1 25); do : > "$d/f$i"; done
 sleep 3; rm -rf "$d"
-mw=$(journal "$mark" | grep -c "mass write: write-open threshold crossed")
-[[ $mw -eq 1 ]] && pass "one MassWrite event for 25 write-opens (kernel count)" \
-               || bad "$mw MassWrite events for 25 write-opens (expected 1)"
+mw=$(journal "$mark" | grep -c "mass write: files created crossed the threshold")
+[[ $mw -eq 1 ]] && pass "one MassWrite event for 25 files created (kernel count)" \
+               || bad "$mw MassWrite events for 25 files created (expected 1)"
+# 3b. lot 282 (Tappa Prove P0): what the kernel counts is what ransomware
+# does to existing files. One process (this shell: its own redirections, or
+# one python3) each time; files of 8 KiB, over the 4 KiB floor.
+d=$(mktemp -d /var/tmp/nn-open-282.XXXXXX)
+for i in $(seq 1 25); do head -c 8192 /dev/zero > "$d/e$i"; done
+sleep 61   # the creations above in a window of their own
+crossed() { journal "$1" | grep -c "$2"; }
+#   one existing file rewritten 40 times (a database): no crossing at all
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+for i in $(seq 1 40); do : 1<> "$d/e1"; done
+sleep 3
+n=$(crossed "$mark" "mass write: ")
+[[ $n -eq 0 ]] && pass "one existing file rewritten 40 times: no mass-write event (each file once per window)" \
+              || bad "one existing file rewritten 40 times: $n mass-write events (expected 0)"
+sleep 58
+#   25 distinct existing files rewritten in place: one overwrite crossing
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+for i in $(seq 1 25); do : 1<> "$d/e$i"; done
+sleep 3
+n=$(crossed "$mark" "mass write: distinct existing files rewritten crossed")
+[[ $n -eq 1 ]] && pass "25 distinct existing files rewritten: one overwrite event" \
+              || bad "25 distinct existing files rewritten: $n overwrite events (expected 1)"
+#   one name created and deleted 30 times (a journal): no burst; 25
+#   originals replaced by a rename onto their names: one burst of originals
+#   destroyed (and one of files created)
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+python3 -I -c '
+import os, sys
+d = sys.argv[1]
+for i in range(30):
+    with open(os.path.join(d, "db-journal"), "wb") as f:
+        f.write(b"j" * 8192)
+    os.unlink(os.path.join(d, "db-journal"))
+' "$d"
+sleep 3
+n=$(crossed "$mark" "file burst: rename or destroyed-originals threshold crossed")
+[[ $n -eq 0 ]] && pass "one name deleted 30 times: no burst of originals destroyed (each name once per window)" \
+              || bad "one name deleted 30 times: $n bursts (expected 0)"
+#   25 temporary files one process creates and deletes (pip, npm): its own
+#   files, no originals
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+python3 -I -c '
+import os, sys
+d = sys.argv[1]
+for i in range(25):
+    p = os.path.join(d, "tmp-%d" % i)
+    with open(p, "wb") as f:
+        f.write(b"t" * 8192)
+    os.unlink(p)
+' "$d"
+sleep 3
+n=$(journal "$mark" | grep "file burst: rename or destroyed-originals threshold crossed" | grep -c 'kind="\?unlink')
+[[ $n -eq 0 ]] && pass "25 temporary files a process created and deleted: no burst of originals destroyed" \
+              || bad "25 temporary files created and deleted: $n bursts of originals destroyed (expected 0)"
+sleep 58
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+python3 -I -c '
+import os, sys
+d = sys.argv[1]
+for i in range(1, 26):
+    t = os.path.join(d, ".e%d.tmp" % i)
+    with open(t, "wb") as f:
+        f.write(b"r" * 8192)
+    os.rename(t, os.path.join(d, "e%d" % i))
+' "$d"
+sleep 3
+n=$(journal "$mark" | grep "file burst: rename or destroyed-originals threshold crossed" | grep -c 'kind="\?unlink')
+[[ $n -eq 1 ]] && pass "25 originals replaced by a rename onto their names: one burst of originals destroyed" \
+              || bad "25 originals replaced by a rename: $n bursts of originals destroyed (expected 1)"
+rm -rf "$d"
+# 3c. lot 282, the review of #500 (B1, C1): files written new whatever made
+# them, originals of any size, an original truncated before its unlink, and
+# an encryptor and a separate deleter of one cgroup. Each case is a process
+# of its own (its own window); the files it works on are made by another.
+d=$(mktemp -d /var/tmp/nn-open-282c.XXXXXX)
+OPS='
+import os, stat, sys
+mode, d, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+pre = sys.argv[4] if len(sys.argv) > 4 else "f"
+path = lambda i: os.path.join(d, "%s%d" % (pre, i))
+# linkat(/proc/self/fd/N, AT_SYMLINK_FOLLOW): os.link() without a
+# directory descriptor calls link(2), which links the /proc symlink itself
+# (EXDEV) instead of the file it names
+proc = os.open("/proc/self", os.O_RDONLY | os.O_DIRECTORY)
+for i in range(n):
+    p = path(i)
+    if mode == "mknod":                   # made by mknod, then written
+        os.mknod(p, 0o600 | stat.S_IFREG)
+        fd = os.open(p, os.O_WRONLY); os.write(fd, b"x" * 1024); os.close(fd)
+    elif mode == "tmpfile":               # an O_TMPFILE linked in
+        fd = os.open(d, os.O_TMPFILE | os.O_WRONLY, 0o600)
+        os.write(fd, b"x" * 1024)
+        os.link("fd/%d" % fd, p, src_dir_fd=proc, follow_symlinks=True)
+        os.close(fd)
+    elif mode == "rdcreat":               # created read-only, reopened to write
+        os.close(os.open(p, os.O_RDONLY | os.O_CREAT, 0o600))
+        fd = os.open(p, os.O_WRONLY); os.write(fd, b"x" * 1024); os.close(fd)
+    elif mode == "prepare":               # plain files of argv[5] bytes
+        with open(p, "wb") as f: f.write(b"p" * int(sys.argv[5]))
+    elif mode == "inplace":               # rewritten in place
+        fd = os.open(p, os.O_RDWR); os.write(fd, b"z" * 100); os.close(fd)
+    elif mode == "copies":                # a copy beside each, a new file
+        with open(p + ".locked", "wb") as f: f.write(b"c" * 2048)
+    elif mode == "unlink":
+        os.unlink(p)
+    elif mode == "trunc-unlink":          # emptied, then unlinked
+        os.truncate(p, 0); os.unlink(p)
+    elif mode == "presized":              # mknod, truncate to 1 byte, written
+        os.mknod(p, 0o600 | stat.S_IFREG); os.truncate(p, 1)
+        fd = os.open(p, os.O_WRONLY | os.O_TRUNC); os.write(fd, b"x" * 2048); os.close(fd)
+'
+ops() { python3 -I -c "$OPS" "$@"; }
+for how in mknod tmpfile rdcreat; do
+    mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+    ops "$how" "$d" 25 "$how"
+    sleep 3
+    n=$(crossed "$mark" "mass write: files created crossed the threshold")
+    [[ $n -eq 1 ]] && pass "25 files written new by $how (no FMODE_CREATED on the write-open): one files-created event" \
+                  || bad "25 files written new by $how: $n files-created events (expected 1)"
+done
+ops prepare "$d" 25 s 1000; ops prepare "$d" 25 t 8192; sleep 3
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+ops inplace "$d" 25 s
+sleep 3
+n=$(journal "$mark" | grep "mass write: distinct existing files rewritten crossed" | grep -c "small_files=true")
+[[ $n -eq 1 ]] && pass "25 existing files of 1,000 bytes rewritten in place: one overwrite event, small_files=true" \
+              || bad "25 existing 1,000-byte files rewritten in place: $n small-file overwrite events (expected 1)"
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+ops unlink "$d" 25 s
+sleep 3
+n=$(journal "$mark" | grep "file burst: rename or destroyed-originals threshold crossed" | grep -c 'kind="\?unlink')
+[[ $n -eq 1 ]] && pass "25 originals of 1,000 bytes unlinked: one burst of originals destroyed" \
+              || bad "25 originals of 1,000 bytes unlinked: $n bursts of originals destroyed (expected 1)"
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+ops trunc-unlink "$d" 25 t
+sleep 3
+n=$(journal "$mark" | grep "file burst: rename or destroyed-originals threshold crossed" | grep -c 'kind="\?unlink')
+[[ $n -eq 1 ]] && pass "25 originals truncated to 0, then unlinked: one burst of originals destroyed" \
+              || bad "25 originals truncated then unlinked: $n bursts of originals destroyed (expected 1)"
+# the re-review of #500: copies made by mknod and truncated to one byte
+# before their first write-open are small rewrites to the kernel (the
+# ransomware tracker reads them as files written)
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+ops presized "$d" 25 z
+sleep 3
+n=$(journal "$mark" | grep "mass write: distinct existing files rewritten crossed" | grep -c "small_files=true")
+[[ $n -eq 1 ]] && pass "25 copies made by mknod, truncated to 1 byte, then written: one small-file overwrite event" \
+              || bad "25 presized copies: $n small-file overwrite events (expected 1)"
+# what the writes' count leaves out, the destructions' does too: 25 files of
+# 1,000 bytes another process made in the user's own runtime directory,
+# unlinked — no burst
+rd=/run/user/$(id -u)
+if [[ -d $rd && -w $rd ]]; then
+    rt=$(mktemp -d "$rd/nn-open-282r.XXXXXX")
+    ops prepare "$rt" 25 r 1000; sleep 3
+    mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+    ops unlink "$rt" 25 r
+    sleep 3
+    n=$(journal "$mark" | grep "file burst: rename or destroyed-originals threshold crossed" | grep -c 'kind="\?unlink')
+    [[ $n -eq 0 ]] && pass "25 files unlinked in the user's own runtime directory: no burst (the writes' carve-out)" \
+                  || bad "25 files unlinked in the user's own runtime directory: $n bursts (expected 0)"
+    rm -rf "$rt"
+else
+    printf 'SKIP  no runtime directory %s\n' "$rd"
+fi
+# an encryptor and a separate deleter, two processes of one unit (outside
+# any session): their crossings carry one cgroup, and the posture pairs them
+sudo "$NNADMIN" debug force-posture observing >/dev/null 2>&1
+r=$(sudo mktemp -d /var/tmp/nn-open-282s.XXXXXX)
+printf '%s' "$OPS" | sudo tee "$r/ops.py" >/dev/null
+sudo python3 -I "$r/ops.py" prepare "$r" 25 o 8192; sleep 3
+mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
+sudo systemd-run --quiet --wait --pipe --collect -- bash -c "python3 -I '$r/ops.py' copies '$r' 25 o && python3 -I '$r/ops.py' unlink '$r' 25 o"
+sleep 4
+cw=$(journal "$mark" | grep "mass write: files created crossed the threshold" | grep -oE 'cgroup=[0-9]+' | sort -u)
+cd_=$(journal "$mark" | grep "file burst: rename or destroyed-originals threshold crossed" | grep 'kind="\?unlink' | grep -oE 'cgroup=[0-9]+' | sort -u)
+if [[ -n $cw && $cw == "$cd_" && $cw != cgroup=0 && $cw != cgroup=1 ]]; then
+    pass "an encryptor and a separate deleter of one unit: both crossings carry $cw"
+else
+    bad "encryptor/deleter crossings' cgroups: created [${cw//$'\n'/ }] destroyed [${cd_//$'\n'/ }]"
+fi
+if journal "$mark" | grep "raising ConfirmedIntrusion" | grep -q "originals destroyed and replaced by new files"; then
+    pass "an encryptor and a separate deleter of one cgroup: ConfirmedIntrusion (the replacement shape, paired in the cgroup)"
+else
+    bad "no replacement-shape ConfirmedIntrusion for an encryptor and a separate deleter of one unit ($(journal "$mark" | grep -m1 'mass-write arm\|ConfirmedIntrusion' | cut -c1-160))"
+fi
+sudo rm -rf "$r"
+sudo "$NNADMIN" debug force-posture observing >/dev/null 2>&1
+rm -rf "$d"
 
 # 4. persistence: a root write under /etc/cron.d from a shell (not a package
 # manager) raises PersistenceMechanism from the OBSERVING posture

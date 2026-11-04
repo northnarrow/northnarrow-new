@@ -864,7 +864,7 @@ fn sudo_cascade_e2e_stays_at_observing() {
 
     // 4. apt mass-writes /var/cache/apt/* — 25 writes in window.
     let recent: Vec<Event> = (0..25u64)
-        .map(|i| file_open(200, 0, "/var/cache/apt/x", 1, i + 100))
+        .map(|i| file_open(200, 0, &format!("/var/cache/apt/x.{i}"), 1, i + 100))
         .collect();
     let focal = file_open(200, 0, "/var/cache/apt/x", 1, 200);
     let r = m.observe(&focal, &recent);
@@ -909,7 +909,7 @@ fn mass_write_alone_from_non_auth_pid_reaches_engaged() {
     let _ = m.observe(&spawn(900, 1, "zsh", "/usr/bin/zsh", 1), &[]);
 
     let recent: Vec<Event> = (0..25u64)
-        .map(|i| file_open(900, 1000, "/home/u/x", 1, i + 100))
+        .map(|i| file_open(900, 1000, &format!("/home/u/x.{i}"), 1, i + 100))
         .collect();
     let focal = file_open(900, 1000, "/home/u/x", 1, 200);
     let r = m.observe(&focal, &recent);
@@ -1237,7 +1237,15 @@ fn snapd_refresh_e2e_stays_at_observing() {
 
     // 1. 25 atomic state.json rewrites in-window (mass-write arm).
     let recent: Vec<Event> = (0..25u64)
-        .map(|i| file_open(1096, 0, "/var/lib/snapd/state.json.tmp", 1, i + 100))
+        .map(|i| {
+            file_open(
+                1096,
+                0,
+                &format!("/var/lib/snapd/state.json.tmp.{i}"),
+                1,
+                i + 100,
+            )
+        })
         .collect();
     let focal = file_open(1096, 0, "/var/lib/snapd/state.json.tmp", 1, 200);
     let r = m.observe(&focal, &recent);
@@ -1279,7 +1287,7 @@ fn non_daemon_masswrite_plus_persistence_reaches_combat() {
 
     // 1. mass-write → ConfirmedIntrusion → ENGAGED (seeds the ledger).
     let recent: Vec<Event> = (0..25u64)
-        .map(|i| file_open(900, 1000, "/home/u/docs/f", 1, i + 100))
+        .map(|i| file_open(900, 1000, &format!("/home/u/docs/f.{i}"), 1, i + 100))
         .collect();
     let focal = file_open(900, 1000, "/home/u/docs/f", 1, 200);
     let r = m.observe(&focal, &recent);
@@ -2153,6 +2161,8 @@ fn overwrites(pid: u32, uid: u32) -> Event {
         timestamp_ns: 50_000_000_000,
         overwrites: true,
         cgroup_window: false,
+        small_files: false,
+        cgroup_id: 0,
     }
 }
 

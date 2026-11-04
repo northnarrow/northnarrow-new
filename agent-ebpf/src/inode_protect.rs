@@ -567,6 +567,22 @@ pub(crate) unsafe fn setattr_dentry(ctx: &LsmContext) -> Option<*const c_void> {
     }
 }
 
+/// Lot 282 (the re-review of #500): `inode_setattr`'s `struct iattr *`,
+/// the argument after the dentry ([`setattr_dentry`]'s position, resolved
+/// from the running kernel's prototype; below `HOOK_ARG_MAX`, so the
+/// next one is a read of the context at most one slot further, through
+/// `bpf_probe_read_kernel`). `None` when the position is not known.
+#[inline(always)]
+pub(crate) unsafe fn setattr_iattr(ctx: &LsmContext) -> Option<*const u8> {
+    let i = crate::btf_offsets::hook_arg(INODE_SETATTR_DENTRY_ARG_SLOT)?;
+    let iattr = raw_arg(ctx, i + 1) as *const u8;
+    if iattr.is_null() {
+        None
+    } else {
+        Some(iattr)
+    }
+}
+
 #[lsm(hook = "file_ioctl")]
 pub fn file_ioctl(ctx: LsmContext) -> i32 {
     unsafe { try_file_ioctl(&ctx, hook::FILE_IOCTL) }

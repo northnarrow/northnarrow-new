@@ -514,11 +514,19 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           children of one parent) within 10 s: `ufw disable` runs dozens of \
                           `iptables -F` through `ufw-init`; the repeats are counted \
                           (`detections_held`, the next record's `suppressed_before`), never on \
-                          the kill path.",
+                          the kill path. Lot 282: a container runtime flushing its own chain \
+                          (`CNI-…`, `DOCKER…` but `DOCKER-USER`, `KUBE-…`, `cali-…`, \
+                          `cilium_…`, `NETAVARK…`) — the `iptables`'s parent a runtime program \
+                          installed by a package (a CNI plugin, dockerd, podman, netavark) — \
+                          switches nothing off and is not recorded; the same chain flushed by \
+                          another process, and the host firewall's chains (ufw, fail2ban, \
+                          firewalld), are.",
         how_to_test: "`ransom-check.sh` MS-25: `auditctl -e 0`, `ufw disable`.",
         tests: &[
             "crates/nn-core/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands",
             "crates/nn-core/src/decision/rules/evasion.rs::eva_002_coalesces_the_iptables_calls_of_one_ufw_disable",
+            "crates/nn-core/src/impair/tests.rs::switch_off_commands_need_their_arguments",
+            "crates/nn-core/src/impair/tests.rs::a_runtime_flushing_its_own_chain_is_no_switch_off",
             "crates/nn-core/src/detection_budget.rs::coalesced_repeats_are_counted_without_spending_the_budget",
             "deploy/lab/malsim/ransom-check.sh::MS-25",
         ],

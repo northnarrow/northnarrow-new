@@ -872,6 +872,84 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- The posture no longer reaches COMBAT, and the ladder no longer kills, on
+  benign workloads (lot 282, Tappa Prove P0; `docs/design/
+  POSTURE_FSM_V2_REDESIGN.md` §10). Measured on `main` (Ubuntu 22.04): a
+  host's first `sudo podman run` reached locked COMBAT and NEUTRALIZE killed
+  podman — its CNI plugin's `iptables -F <chain>` was NN-L-EVA-002
+  (`DefenseImpairment`, the administrator's scope), podman's 261 opens of
+  `bolt_state.db` in a minute were the mass-write arm's overwrite crossing;
+  `apt purge podman` reached it from an anti-tamper refusal of
+  `deb-systemd-helper`, which the ladder killed. Now:
+  - the kernel counts what ransomware does to existing files: a file
+    counted once per 60-s window however often it is opened
+    (`OPEN_OVERWRITE_SEEN`), as what its first write-open found — a
+    rewrite when it held data, else a file written new (created by the
+    open, or empty when opened: `mknod`, an `O_TMPFILE` linked in, an
+    `O_RDONLY|O_CREAT` open reopened; `FMODE_CREATED` alone, the first
+    version of the lot, was evaded by all three: the review of #500, B1) —
+    and the originals destroyed — an unlink, or a rename onto an existing
+    file, of any regular file that holds data, or held it within the
+    window (`OPEN_HAD_DATA`, marked at a size change: a truncate then an
+    unlink) — once per name (`OPEN_DESTROY_SEEN`), never a file the
+    process itself created in the window (`OPEN_CREATED`: `pip`'s and
+    `npm`'s temporary files) nor one in a directory whose writes do not
+    count (a carve-out, the destroyer's own runtime directory: the re-check
+    of #500 — a daemon's atomic replacements under `/run/systemd`;
+    `/run/udev/` is a carve-out now, measured: the boot's coldplug made
+    each udevd worker replace 20 device database files). The
+    mass-write arm of `ConfirmedIntrusion` fires on 20 distinct existing
+    files of 4 KiB or more rewritten in place (40 for a cgroup), on 20
+    of any size outside an authenticated session (`MASS_OVERWRITE_SMALL`;
+    inside one a build's small outputs never counted: lab PR 127), or on
+    20 originals destroyed beside 20 files written new by one process, or
+    by one cgroup (an encryptor and a separate deleter: the record now
+    carries the cgroup id), within a window (outside an authenticated
+    session); never on files written new alone, one file rewritten again
+    and again, or deletions alone. Tracepoint mode counts distinct files,
+    `O_CREAT|O_EXCL` opens included (an encryptor's copies). Every shape is
+    file-system evidence: none corroborates another. The exempt writers
+    are kept, and an exempt crossing is logged with its exemption;
+  - an anti-tamper refusal of a file operation (unlink, rmdir, rename,
+    setattr, create, link, symlink, mkdir, mknod, xattr) of a package
+    transaction's process (judged as R009 judges it) raises
+    `PackageTamperRefusal` (ALERTED, never corroboration) instead of the
+    decisive `AntiTamperDenial`; a refused signal, ptrace, BPF handle,
+    kexec, cgroup write, limit, read or scheduling change keeps its weight
+    (the review of #500, B2: an apt `Pre-Invoke` hook makes any root
+    process a transaction's);
+  - the ladder holds its NEUTRALIZE (signed, no kill, no ISOLATE) when
+    COMBAT's cause is a heuristic that no signal of another kind vouches
+    for (`CombatCause::single_heuristic_arm`);
+  - NN-L-EVA-002 no longer records a container runtime flushing its own
+    chain (`CNI-…`, `DOCKER…`, `KUBE-…`, `cali-…`, `cilium_…`,
+    `NETAVARK…`, not the filter chains `DOCKER-USER`, `CNI-ADMIN` and
+    `KUBE-FIREWALL`; the `iptables`'s parent a runtime program —
+    a CNI plugin, dockerd, podman, netavark — in a system tree, installed
+    by a package); the same chain flushed by another process and the host
+    firewall's chains (ufw, fail2ban, firewalld, the built-in ones) still
+    are.
+  NN-L-IMP-001's (d) reads the small-file rewrite crossing as files
+  written too (the re-check of #500: a copy sized to one byte by
+  `truncate(2)` before it is written was no file written new, and the
+  copy-then-delete `main` saw went dark). What stays: copy-then-delete
+  ransomware run from an SSH shell is the ransomware tracker's
+  (NN-L-IMP-001), not the mass-write arm's (as before); corroboration stays per actor scope, not per process tree;
+  what neither sees (originals deleted more than a minute after the
+  copies, a deleter in another cgroup or forked per file, tracepoint mode)
+  is listed in the design's §10.5.
+  Tests: `common` (the counters' glue: 259 opens of one database, distinct
+  rewrites, files created, a name deleted at every commit), the posture's
+  triggers (the shapes, either order, sessions, exemptions, the
+  transaction's refusal), the ladder (`a_single_heuristic_arm_is_never_killed`),
+  NN-L-EVA-002's chains, and two golden posture cases
+  (`mass-write-arm-alone-engaged`, `package-refusal-alerted`); the lab check
+  `open-sensor-check` gains the kernel's cases (the review of #500: files
+  written new by `mknod`, `O_TMPFILE`, a reopened read-only creation; small
+  files rewritten and unlinked; a truncate then an unlink; an encryptor and
+  a deleter of one unit), and `ransom-check`'s MS-23 three variants (small
+  files in place, small files copied then deleted, a split encryptor and
+  deleter).
 - R011 no longer kills an exec of the system's kernel-module tool by module
   name (lot 279): it killed the `modprobe` rootful podman runs for its
   netfilter modules (lot 275's lab, Ubuntu 22.04), and every `modprobe` of

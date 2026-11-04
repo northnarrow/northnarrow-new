@@ -95,6 +95,8 @@ fn new_files(pid: u32, ts: u64, file: &str) -> Event {
         timestamp_ns: ts,
         overwrites: false,
         cgroup_window: false,
+        small_files: false,
+        cgroup_id: 0,
     }
 }
 
@@ -109,6 +111,7 @@ fn unlinks(pid: u32, ts: u64, file: &str) -> Event {
         sources: 0,
         filename: file.into(),
         timestamp_ns: ts,
+        cgroup_id: 0,
     }
 }
 
@@ -500,6 +503,7 @@ fn unlinks_by(uid: u32, pid: u32, ts: u64, file: &str) -> Event {
             sources,
             filename,
             timestamp_ns,
+            cgroup_id: 0,
         },
         e => e,
     }

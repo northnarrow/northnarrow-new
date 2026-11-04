@@ -527,6 +527,11 @@ unsafe fn try_fim_setattr_observe(ctx: &LsmContext) -> i32 {
             emit_drift(FIM_OP_MODIFIED, key);
         }
     }
+    // Lot 282 (the review of #500, C1): a file that holds data before a
+    // truncate empties it — its unlink then destroys an original (the
+    // re-review: a size change only, read from the `iattr`).
+    let iattr = crate::inode_protect::setattr_iattr(ctx).map_or(0, |p| p as u64);
+    let _ = crate::open_sensor::nn_setattr_mark(dentry as u64, iattr);
     0 // observe-only — NEVER return -EPERM
 }
 
@@ -651,6 +656,10 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
             emit_drift_with_dest(FIM_OP_RENAMED, key, NO_DEST, FIM_RENAME_REPLACED);
         }
     }
+    // Lot 282: a rename onto the name of an existing regular file destroys
+    // that file — an original replaced, counted as its unlink is (a name
+    // that did not exist has a negative dentry, and counts nothing).
+    let _ = crate::open_sensor::nn_unlink_burst(crate::open_sensor::raw_arg(ctx, 3));
     // Lab PR 225: every rename counts toward its process's burst of
     // renames to a new extension, wherever the file is.
     let _ = crate::open_sensor::nn_rename_burst(
