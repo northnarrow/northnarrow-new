@@ -847,8 +847,8 @@ the optional offsets `signal_struct.live`, `kernel_clone_args.flags` and
 `task_struct.signal`. Checked on the BTF of 6.8 (Ubuntu 24.04) and 6.18
 (WSL2), and in the lab on 5.15 and 6.12 (`verifier-check`: the five
 programs load, `cgroup_join_mark` 876 and 908 instructions; lot 277's
-note); the review of #494's code on 6.8: `docs/roadmap/CAPABILITY_PROGRAM.md`,
-lot 277. A kernel without them
+note); the review of #494's code on 6.8: lot 277's note in
+https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md. A kernel without them
 starts with a signed `subsystem_degraded` "cgroup exemptions", and every
 exemption by cgroup or unit is refused there. An optional offset absent
 makes the tracker absent (`btf_revalidate`), never a tracker reading a
