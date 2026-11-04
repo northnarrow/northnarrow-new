@@ -3,8 +3,14 @@
 //! once it would pass its size, the oldest removed — at most
 //! `max_files × max_bytes` on disk. A batch is acknowledged once it is
 //! written and `fdatasync`ed. Raw system calls only (`openat`, `write`,
-//! `fdatasync`, `lseek`, `renameat2`, `unlinkat`, `close`): the export
-//! worker's seccomp allowlist names exactly these.
+//! `fdatasync`, `lseek`, `renameat2`, `unlinkat`, `newfstatat`, `close`):
+//! the export worker's seccomp allowlist names exactly these.
+//!
+//! A configuration's bound holds from the sink's open (the second review of
+//! #499, R3): the files an earlier, larger configuration left past it
+//! (`export.jsonl.N`, N ≥ `max_files`; regular files only, a link never
+//! followed nor removed) are removed, and an active file past `max_bytes`
+//! is rotated.
 //!
 //! A log shipper reading these files is behind the sink: what rotates out
 //! before it reads it, it misses (the files are the bound, the chains the
@@ -47,7 +53,14 @@ pub struct JsonlSink {
     size: u64,
     /// Files rotated out (removed) since the sink opened.
     pub dropped_files: u64,
+    /// Files an earlier configuration left past this one's count, removed
+    /// at the open.
+    pub cleared_files: u64,
 }
+
+/// The highest rotated file's number a configuration can have
+/// (`file_max_files` is at most 255: `.1` … `.254`).
+const MAX_ROTATED: u8 = u8::MAX - 1;
 
 impl JsonlSink {
     /// The sink in `dir` (which must exist), its active file opened.
@@ -59,9 +72,58 @@ impl JsonlSink {
             fd: None,
             size: 0,
             dropped_files: 0,
+            cleared_files: 0,
         };
+        s.clear_past_bound()?;
         s.reopen()?;
+        if s.size > s.max_bytes {
+            // written under a larger `max_bytes`: rotated now, not at the
+            // next line
+            s.rotate()?;
+        }
         Ok(s)
+    }
+
+    /// Remove each `export.jsonl.N` with N ≥ `max_files` that is a regular
+    /// file: what an earlier configuration with more files left (the core
+    /// took them for a stranger's files and killed the worker). Its type
+    /// is read without following a link (`newfstatat`,
+    /// `AT_SYMLINK_NOFOLLOW`); a link, a FIFO or anything else is left as
+    /// it is — the core's check of the directory names it.
+    fn clear_past_bound(&mut self) -> Result<(), i32> {
+        for n in self.max_files..=MAX_ROTATED {
+            let p = cpath(&self.path(n))?;
+            // SAFETY: an all-zero `stat` is a valid value to be written over.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: newfstatat with a NUL-terminated path into a local
+            // `stat`, never following a final link.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_newfstatat,
+                    libc::AT_FDCWD,
+                    p.as_ptr(),
+                    &mut st as *mut libc::stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                match errno() {
+                    libc::ENOENT => continue,
+                    e => return Err(e),
+                }
+            }
+            if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+                continue;
+            }
+            // SAFETY: unlinkat with a NUL-terminated path (a name removed,
+            // never a link followed).
+            if unsafe { libc::unlinkat(libc::AT_FDCWD, p.as_ptr(), 0) } == 0 {
+                self.cleared_files += 1;
+            } else if errno() != libc::ENOENT {
+                return Err(errno());
+            }
+        }
+        Ok(())
     }
 
     fn path(&self, n: u8) -> PathBuf {
@@ -288,21 +350,44 @@ mod tests {
         assert_eq!(s.dropped_files, 0);
     }
 
-    /// Every file of the sink, the active one and each rotated, is the
-    /// worker's account's alone (0600), whatever the umask.
+    /// The writer of [`the_files_are_the_worker_s_alone`], in a process of
+    /// its own (the umask is the process's: the test's threads must not
+    /// see it — the second review of #499, N5). A no-op without its
+    /// variable.
     #[test]
-    fn the_files_are_the_worker_s_alone() {
-        use std::os::unix::fs::PermissionsExt;
-        let d = tempfile::tempdir().unwrap();
-        // SAFETY: umask of this test process, restored below.
-        let before = unsafe { libc::umask(0o000) };
-        let mut s = JsonlSink::open(d.path(), 15, 3).unwrap();
+    #[ignore = "a helper: run by the_files_are_the_worker_s_alone"]
+    fn umask_zero_writer() {
+        let Some(dir) = std::env::var_os("NN_EXPORT_UMASK_ZERO_DIR") else {
+            return;
+        };
+        // SAFETY: umask of this helper process alone.
+        unsafe { libc::umask(0o000) };
+        let mut s = JsonlSink::open(Path::new(&dir), 15, 3).unwrap();
         for n in 0..5u32 {
             s.write(&[format!("{{\"n\":{n:03}}}").into_bytes()])
                 .unwrap();
         }
-        // SAFETY: restoring the umask.
-        unsafe { libc::umask(before) };
+    }
+
+    /// Every file of the sink, the active one and each rotated, is the
+    /// worker's account's alone (0600), whatever the umask: written by a
+    /// process of its own with umask 0.
+    #[test]
+    fn the_files_are_the_worker_s_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let st = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "jsonl::tests::umask_zero_writer",
+                "--test-threads=1",
+            ])
+            .env("NN_EXPORT_UMASK_ZERO_DIR", d.path())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "the writer: {st}");
         let mut seen = 0;
         for e in std::fs::read_dir(d.path()).unwrap() {
             let e = e.unwrap();
@@ -311,6 +396,78 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, 3, "the active file and two rotated");
+    }
+
+    /// The second review of #499, R3: a signed configuration with fewer
+    /// files — the sink's open removes what the earlier one left past the
+    /// new count (regular files), never a link nor what it names.
+    #[test]
+    fn fewer_files_after_a_new_configuration_are_cleared_at_the_open() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = JsonlSink::open(d.path(), 15, 4).unwrap();
+        for n in 0..6u32 {
+            s.write(&[format!("{{\"n\":{n:03}}}").into_bytes()])
+                .unwrap();
+        }
+        drop(s);
+        let names = |d: &Path| files(d).into_iter().map(|f| f.0).collect::<Vec<_>>();
+        assert_eq!(
+            names(d.path()),
+            [
+                "export.jsonl",
+                "export.jsonl.1",
+                "export.jsonl.2",
+                "export.jsonl.3"
+            ]
+        );
+        // a link where a rotated file would be, naming a file outside
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("kept");
+        std::fs::write(&target, b"kept\n").unwrap();
+        std::os::unix::fs::symlink(&target, d.path().join("export.jsonl.9")).unwrap();
+        // the next start, signed with file_max_files = 2
+        let mut s = JsonlSink::open(d.path(), 15, 2).unwrap();
+        assert_eq!(s.cleared_files, 2, "export.jsonl.2 and .3");
+        s.write(&[b"{\"n\":999}".to_vec()]).unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["export.jsonl", "export.jsonl.1", "export.jsonl.9"]);
+        assert!(std::fs::symlink_metadata(d.path().join("export.jsonl.9"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"kept\n");
+        // the same count again: nothing to clear
+        drop(s);
+        let s = JsonlSink::open(d.path(), 15, 2).unwrap();
+        assert_eq!(s.cleared_files, 0);
+    }
+
+    /// A smaller `max_bytes`: an active file written past it under the
+    /// earlier configuration is rotated at the open, not at the next line.
+    #[test]
+    fn an_active_file_past_a_smaller_size_is_rotated_at_the_open() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = JsonlSink::open(d.path(), 1000, 3).unwrap();
+        for n in 0..20u32 {
+            s.write(&[format!("{{\"n\":{n:03}}}").into_bytes()])
+                .unwrap();
+        }
+        assert_eq!(s.size(), 200);
+        drop(s);
+        let s = JsonlSink::open(d.path(), 100, 3).unwrap();
+        assert_eq!(s.size(), 0, "rotated at the open");
+        let f = files(d.path());
+        assert_eq!(f[0].0, "export.jsonl");
+        assert!(f[0].1.is_empty());
+        assert_eq!((f[1].0.as_str(), f[1].1.len()), ("export.jsonl.1", 20));
+        // within its size: kept as it is
+        drop(s);
+        let s = JsonlSink::open(d.path(), 100, 3).unwrap();
+        assert_eq!((s.size(), s.dropped_files), (0, 0));
     }
 
     #[test]

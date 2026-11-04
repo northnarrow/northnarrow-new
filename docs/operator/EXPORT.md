@@ -30,7 +30,7 @@ The mapping, row by row:
 | action `interrupted` | its intent's class | status Error: the agent stopped between the intent and its outcome |
 | action `overflow`, `stalled`, `run_started`, `run_ended` | 0 Base Event / Other | the row as `raw_data` |
 | FIM drift | 1001 / by its op: Modified Update, Created/Linked Create, Deleted Delete, Renamed Rename, Opened Open, CapabilitySet Set Security, AttrChanged Set Attributes | the file (path, SHA-256 of its new content), the modifier as `actor.process` |
-| netflow | 4001 / Traffic | `src_endpoint`, `dst_endpoint` (its resolved name), `connection_info` (protocol, IP version; direction Inbound for an inbound connection's row, lot 275's `"inbound": true` — the peer that connected is the source, the local listener the destination —, Unknown otherwise), `traffic` (bytes in, out: OCSF's `bytes_out` from the source to the destination), `duration`, status by its close; JA3, JA4, SNI and `inbound` in `unmapped.northnarrow` |
+| netflow | 4001 / Traffic | `src_endpoint`, `dst_endpoint` (its resolved name), `connection_info` (protocol, IP version; direction Inbound for an inbound connection's row, lot 275's `"inbound": true` — the peer that connected is the source, the local listener the destination —, Outbound for every other row: a connection the host made), `traffic` (bytes in, out: OCSF's `bytes_out` from the source to the destination), `duration`, status by its close; JA3, JA4, SNI and `inbound` in `unmapped.northnarrow` |
 | a row that does not parse, or of a kind not known | 0 Base Event / Other | its bytes as `raw_data` (nothing a chain holds is dropped by the mapping) |
 
 Every record has `metadata` (`version` 1.9.0, `profiles` `["host"]`, the
@@ -151,9 +151,18 @@ connection carries at most 64 MiB, then a fresh one takes over.
 The JSONL files: `/var/log/northnarrow/export/export.jsonl`, rotated to
 `export.jsonl.1` … once it would pass `file_max_bytes`, the oldest removed:
 at most `file_max_files × file_max_bytes` on disk. The directory is the
-worker account's (0750; a shipper reads it as root, or is given the group).
+export account's (0755; its files 0600: a shipper reads them as root).
 A shipper behind the rotation misses what rotated out: the chains are the
 record, the files the bound.
+
+A signed configuration with **fewer or smaller files** holds from the
+sink's open, at the next start: the `export.jsonl.N` an earlier
+configuration left at or past the new `file_max_files` are removed —
+regular files only, read without following a link (a link, or anything
+else, is left as it is, and the core's check names it) —, and an active
+file past the new `file_max_bytes` is rotated at once. The rotated files
+the earlier configuration wrote larger leave by the sink's rotations; the
+core does not take them for the worker's (§5).
 
 ## 4. What you see
 
@@ -187,8 +196,12 @@ export: on
   configuration's hash, the chains, the sinks, the cursors), at a sink's
   change of state (a worse one at once, a better one at most once a minute),
   at a chain moved under a cursor (`note`: evicted, `cursor_gone`,
-  `cursor_ahead`, `oversize`), at the stop (each sink's counts, the
-  cursors).
+  `cursor_ahead`, `oversize`, `blank`, `unsendable`), at a chain's active
+  file still missing 30 s after its rotation renamed the one before it
+  (`active_missing`: the writer makes it microseconds after the rename —
+  missing this long, its creation failed, and the export waits there,
+  never skipping ahead), at the directory past its bound
+  (`directory_over`, §5), at the stop (each sink's counts, the cursors).
 - the **capability manifest**'s `export` (state, chains, sinks, the
   configuration's hash, the port pin as measured); its changes signed as
   `capability_manifest_change`.
@@ -218,8 +231,10 @@ The parse worker's (`WORKERS.md` §3) with what its sinks need, no more:
   `getsockopt(SO_ERROR)`, `ioctl(SIOCOUTQ)`, `sendto`/`recvfrom` with no
   address on a descriptor above its channel; `openat` with exactly the
   sink's flags (append, create, no link followed), `write` above the
-  channel, `lseek`, `fdatasync`, `renameat2`, `unlinkat`; the three Landlock
-  calls (for layer 2: a layer only takes rights away). No `exec`, no
+  channel, `lseek`, `fdatasync`, `renameat2`, `unlinkat`,
+  `newfstatat(AT_FDCWD, …, AT_SYMLINK_NOFOLLOW)` (the sink's open: a file
+  an earlier configuration left is removed only if it is a regular one);
+  the three Landlock calls (for layer 2: a layer only takes rights away). No `exec`, no
   process, no UDP, no UNIX socket by path, no `ptrace`, no `bpf`.
 - 16 descriptors, 512 MiB of address space, no process, no core; no
   file larger than 1 GiB and 1 MiB (`RLIMIT_FSIZE`, `SIGXFSZ` ignored: a
@@ -228,8 +243,18 @@ The parse worker's (`WORKERS.md` §3) with what its sinks need, no more:
   files' bound (`file_max_bytes × file_max_files`, at most 4 GiB, and 1 MiB
   a file), and the worker is killed, the file sink stopped, a signed
   `directory_over` note — the export never fills the disk the chains are
-  on. A dedicated mount or a quota for `/var/log/northnarrow/export` holds
-  it too.
+  on. The directory is judged from the first worker's setup of the run (the
+  sink's open has cleared what an earlier configuration left, §3), against
+  its bound or, when the files an earlier, larger configuration wrote pass
+  it, against the bytes the directory held at that setup: the honest worker
+  is never killed for them, and a worker killed for its directory does not
+  raise that floor for the next one. What remains: a worker taken over can
+  write up to its file size limit in each of its descriptors for about a
+  second, until the core's next measurement kills it — and again at each
+  restart, until the supervisor disables it; the core cannot remove what it
+  wrote (its thread holds no capability, the directory is the export
+  account's), the sink's rotations or the operator do. A dedicated mount or
+  a quota for `/var/log/northnarrow/export` holds it too.
 
 It holds no key of the agent's: it verifies rows with the public key the
 core hands it. It reads no chain (root's, 0600 in 0700 directories) and
@@ -254,19 +279,33 @@ kept the frames) — and checks:
 - each record's OCSF fields are the agent's mapping of its row: the row is
   mapped again (the mapping of the same `nn-admin` version as the agent)
   and compared, field for field — a record whose fields were rewritten,
-  its row genuine, is `TAMPERED`. The fields no row carries — the host's
-  name, the agent's id and version (`device`, `metadata.product`) — are
-  the record's own context, not checked;
+  its row genuine, is `TAMPERED`. An action's outcome carries its intent's
+  facts (its class by the intent's response, the target, the reasons, the
+  severity, the message): when its intent is not before it in the input (a
+  JSONL file rotated between them, a capture started after the intent),
+  those cannot be mapped here — the outcome's own fields (its time, status,
+  detail, duration, ids, place, row) are compared, the rest is said not
+  verifiable (`PARTIAL`): verify the files or captures together;
+- **not covered by the signature**: `device.hostname` (the host's name),
+  `device.uid` (the agent's id) and `metadata.product.version` (the agent's
+  version) — no row carries them; `verify` maps the row again with them as
+  the record says, so a record says them as it was written, true or not.
+  Every other field is the row's (signed, in `raw_data`) or its mapping;
 - each chain's rows, in their order, link: a row's `prev_hash` is the row
   before it's `entry_hash`; across a rotation through the terminator the
   first row of the next file carries — a first row without it is `BROKEN`
   (the file before's tail is not shown complete);
 - a record delivered twice is counted (`duplicates`), not refused.
 
-Exit 0 (`OK`), 13 a row that does not verify (`TAMPERED`), 11 a chain that
-does not follow (`BROKEN`: rows missing — an export that was off, a gap the
-agent's stage 8 counted, or rows taken out on the way), 2 lines that are no
-record, or no record at all (`EMPTY`: an empty capture proves nothing). The agent's public key: `/etc/northnarrow/agent.sig.pub` on the host,
+Exit 0 (`OK`), 13 a record that does not verify (`TAMPERED`: a row not
+signed by the agent's key, or not the one it names; or fields that are not
+its row's mapping — the verdict says which), 11 a chain that does not
+follow (`BROKEN`: rows missing — an export that was off, a gap the agent's
+stage 8 counted, or rows taken out on the way), 2 lines that are no record,
+or no record at all (`EMPTY`: an empty capture proves nothing), 3 every
+record verified as far as the input lets it — outcomes whose intent it
+does not hold (`PARTIAL`; an outcome's own fields rewritten are still 13).
+The agent's public key: `/etc/northnarrow/agent.sig.pub` on the host,
 copied off it once.
 
 ## 7. The TLS stack and its dependencies
@@ -343,8 +382,13 @@ fuzz/Cargo.lock): the lot's note lists them.
   rules like any process's (NN-L-NET-007 alerts on an internal receiver;
   NN-L-NET-028, lot 275, on a receiver at a public address, which the
   worker connects to by address, never by a name: list that address in the
-  signed `nodns-allow.local`, `NETWORK_TELEMETRY.md`): exempting the export
-  worker's pid to its configured receiver is a follow-up.
+  signed `nodns-allow.local`, `NETWORK_TELEMETRY.md`; a Medium record each
+  worker pid and destination, at most every 10 minutes, exported too).
+  `enforce NN-L-NET-028` is refused today (`RULE_POLICY.md`); were it ever
+  signed and accepted, its kill would be aimed at the export worker itself
+  at each such connect — list the receiver in `nodns-allow.local` first.
+  Exempting the export worker's connects to its configured receiver is a
+  follow-up.
 - Not exported: the audit log, the status events, the heartbeat (which has
   its own verifier, `HEARTBEAT.md`), the netflow listeners, the FIM
   baseline.

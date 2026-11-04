@@ -104,6 +104,11 @@ pub struct Batch {
     /// Rows lost to the export by this read (stage 8).
     pub lost: u64,
     pub notes: Vec<Note>,
+    /// The file the read waits for: a rotating chain's active file not
+    /// there after a rotation renamed the one before it to its archive
+    /// (the writer makes it right after; the second review of #499, R1).
+    /// The core says so, signed, when the wait lasts.
+    pub waiting: Option<u64>,
 }
 
 /// Why a chain could not be read now (retried at the next round).
@@ -126,6 +131,12 @@ enum Located {
     Gone,
     /// After the chain's current file.
     Ahead,
+    /// The chain's current file, not created yet: right after a rotation
+    /// renamed the active file to its archive, before the writer makes the
+    /// fresh one (the second review of #499, R1: taken for "evicted", the
+    /// read went on to the next file, "ahead", and back to the chain's
+    /// oldest), or a chain no writer opened yet. Nothing to read now.
+    NotYet,
 }
 
 /// The current generation of a chain: the active file's number (0 for a
@@ -159,7 +170,8 @@ fn locate<H: ChainHost>(src: &Source, file: u64) -> Result<Located, WalError> {
     }
     let f = match H::open_read_nofollow(&src.active) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Located::Gone),
+        // the current generation is never evicted: not created yet
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Located::NotYet),
         Err(e) => return Err(io(&src.active)(e)),
     };
     // a rotation between the generation's read and the open: the file
@@ -195,6 +207,19 @@ fn ends_a_line(path: &Path, end: u64) -> bool {
         && f.seek(SeekFrom::Start(end - 1)).is_ok()
         && f.read_exact(&mut b).is_ok()
         && b[0] == b'\n'
+}
+
+/// Whether the cursor's row is where the cursor says in `path`: the line
+/// ending at its `end` has its `entry_hash` (a line skipped — blank,
+/// oversize — has none: its end is a line's end). A file that cannot be
+/// read is not taken for one that holds it: the file is read again from
+/// its start, rows given twice, never skipped.
+fn cursor_holds(path: &Path, cur: &Cursor) -> bool {
+    if cur.hash.is_empty() {
+        ends_a_line(path, cur.end)
+    } else {
+        chainlog::holds_line_ending_at(path, cur.end, &cur.hash).unwrap_or(false)
+    }
 }
 
 /// The terminator that sealed archive `file` (its last line), verbatim.
@@ -313,6 +338,15 @@ pub fn read_after<H: ChainHost>(
                 check = false;
                 continue;
             }
+            Located::NotYet => {
+                // the read waits here, at the next round: never an
+                // eviction, never "ahead"; after a rotation (the file
+                // before it archived) the core watches how long
+                if cur.file > 1 && archived::<H>(src, cur.file - 1) {
+                    out.waiting = Some(cur.file);
+                }
+                break;
+            }
         };
         if check {
             check = false;
@@ -323,13 +357,7 @@ pub fn read_after<H: ChainHost>(
             } else {
                 src.active.clone()
             };
-            let holds = if cur.hash.is_empty() {
-                // a line skipped (blank, oversize): its end, a line's end
-                ends_a_line(&path, cur.end)
-            } else {
-                chainlog::holds_line_ending_at(&path, cur.end, &cur.hash).unwrap_or(false)
-            };
-            if !holds {
+            if !cursor_holds(&path, &cur) {
                 out.notes.push(Note::CursorGone {
                     file: cur.file,
                     line: cur.line,

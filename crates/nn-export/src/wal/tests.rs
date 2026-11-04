@@ -577,3 +577,120 @@ fn a_blank_line_is_lost_counted_and_never_sent() {
         again.notes
     );
 }
+
+/// The second review of #499 (R1): the rotation's second window — the
+/// archive renamed, the fresh active file not created yet. The read stops
+/// at the archive's end: no eviction, no "ahead", no row, and it says the
+/// file it waits for; once the writer makes the file, it reads on with the
+/// terminator carried.
+#[test]
+fn review499r_window_2_renamed_active_not_created() {
+    let d = tempfile::tempdir().unwrap();
+    let active = d.path().join("detections.jsonl");
+    write(&active, 0, 30, 1000, 64);
+    let s = src(&active);
+    let all = read_after::<TestHost>(&s, &Cursor::start_of(1), false, ALL, &pk()).unwrap();
+    let last_file = all.rows.iter().map(|r| r.file).max().unwrap();
+    let archived = last_file - 1;
+    let i = all.rows.iter().rposition(|r| r.file == archived).unwrap();
+    let last = &all.rows[i];
+    let cur = Cursor {
+        file: last.file,
+        line: last.line,
+        end: last.end,
+        hash: all.hashes[i].clone(),
+    };
+    let arch = chainlog::archive_path_for(&active, archived);
+    let next_arch = chainlog::archive_path_for(&active, archived + 1);
+    // the state right after the rename: archive `archived` there, the
+    // active file of `archived + 1` not created yet
+    let newest = d.path().join("newest");
+    std::fs::rename(&active, &newest).unwrap();
+    assert!(arch.exists() && !next_arch.exists() && !active.exists());
+    let lim = Limits {
+        rows: MAX_EXPORT_ROWS,
+        bytes: MAX_EXPORT_BYTES,
+    };
+    for check in [false, true] {
+        let b = read_after::<TestHost>(&s, &cur, check, lim, &pk()).unwrap();
+        assert!(
+            b.notes.is_empty() && b.rows.is_empty(),
+            "notes {:?}, {} rows",
+            b.notes,
+            b.rows.len()
+        );
+        assert_eq!(b.lost, 0);
+        assert_eq!(b.waiting, Some(archived + 1));
+        assert_eq!(
+            b.next.as_ref().map(Cursor::pos),
+            Some(RowPos {
+                file: archived + 1,
+                line: 0
+            })
+        );
+    }
+    // a sink behind reads up to the archive's end, and waits there too
+    let b = read_after::<TestHost>(&s, &Cursor::start_of(archived), false, lim, &pk()).unwrap();
+    assert!(b.notes.is_empty(), "{:?}", b.notes);
+    assert!(b.rows.iter().all(|r| r.file == archived));
+    assert_eq!(b.rows.last().map(|r| r.pos()), Some(last.pos()));
+    assert_eq!(b.waiting, Some(archived + 1));
+    // the writer made it: read on, the terminator carried from the archive
+    std::fs::rename(&newest, &active).unwrap();
+    let b = read_after::<TestHost>(&s, b.next.as_ref().unwrap(), false, lim, &pk()).unwrap();
+    assert!(b.notes.is_empty(), "{:?}", b.notes);
+    assert_eq!(b.waiting, None);
+    assert_eq!(
+        (b.rows[0].file, b.rows[0].line),
+        (archived + 1, 1),
+        "the new file's first row"
+    );
+    assert!(b.rows[0].rotate.is_some(), "the terminator carried");
+}
+
+/// A rotating chain no writer opened yet (no file at all): nothing to read,
+/// no note, and no wait to watch (no rotation before it).
+#[test]
+fn a_chain_not_created_yet_reads_nothing_and_notes_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let active = d.path().join("detections.jsonl");
+    let s = src(&active);
+    for from in [Cursor::start_of(1), initial::<TestHost>(&s, true).unwrap()] {
+        let b = read_after::<TestHost>(&s, &from, false, ALL, &pk()).unwrap();
+        assert!(b.rows.is_empty() && b.notes.is_empty() && b.lost == 0);
+        assert_eq!(b.waiting, None);
+        assert_eq!(b.next.as_ref().map(Cursor::pos), Some(from.pos()));
+    }
+}
+
+/// A cursor checked against a file that cannot be read is not taken for
+/// one that holds (mutation R8 of the second review: an I/O error taken
+/// as "holds" skipped the check).
+#[test]
+fn a_cursor_on_a_file_that_cannot_be_read_does_not_hold() {
+    let d = tempfile::tempdir().unwrap();
+    let cur = Cursor {
+        file: 1,
+        line: 3,
+        end: 300,
+        hash: "ab".repeat(32),
+    };
+    assert!(!cursor_holds(&d.path().join("missing.jsonl"), &cur));
+    let skipped = Cursor {
+        hash: String::new(),
+        ..cur.clone()
+    };
+    assert!(!cursor_holds(&d.path().join("missing.jsonl"), &skipped));
+    // and one that holds, for contrast
+    let active = d.path().join("detections.jsonl");
+    write(&active, 0, 3, 1 << 20, 4);
+    let s = src(&active);
+    let all = read_after::<TestHost>(&s, &Cursor::start_of(1), false, ALL, &pk()).unwrap();
+    let held = Cursor {
+        file: 1,
+        line: all.rows[1].line,
+        end: all.rows[1].end,
+        hash: all.hashes[1].clone(),
+    };
+    assert!(cursor_holds(&active, &held));
+}

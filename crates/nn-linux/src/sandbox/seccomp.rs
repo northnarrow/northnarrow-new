@@ -136,7 +136,10 @@ impl Allowlist {
     ///   `openat(AT_FDCWD, …)` with exactly `nn_export::jsonl::OPEN_FLAGS`
     ///   (append-only, never through a link), `write` above the channel,
     ///   `lseek`, `fdatasync`, `renameat2(AT_FDCWD, …, AT_FDCWD, …, 0)`,
-    ///   `unlinkat(AT_FDCWD, …, 0)`;
+    ///   `unlinkat(AT_FDCWD, …, 0)`, `newfstatat(AT_FDCWD, …,
+    ///   AT_SYMLINK_NOFOLLOW)` (the sink's open: a file an earlier
+    ///   configuration left is removed only if it is a regular one — the
+    ///   second review of #499, R3);
     /// - the Landlock calls (`landlock_create_ruleset`, `_add_rule`,
     ///   `_restrict_self`): its second layer, the port's pin, made after its
     ///   setup; a layer only ever takes rights away.
@@ -239,6 +242,14 @@ impl Allowlist {
             libc::SYS_unlinkat,
             "unlinkat",
             vec![Arg::Eq(0, at_fdcwd), Arg::Eq(2, 0)],
+        );
+        a.keep(
+            libc::SYS_newfstatat,
+            "newfstatat",
+            vec![
+                Arg::Eq(0, at_fdcwd),
+                Arg::Eq(3, libc::AT_SYMLINK_NOFOLLOW as u64),
+            ],
         );
         for (nr, name) in [
             (libc::SYS_connect, "connect"),

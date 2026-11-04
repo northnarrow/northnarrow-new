@@ -305,7 +305,7 @@ fn every_chain_exported_verifies_where_it_arrives() {
         "file, process, finding, network, process remediation"
     );
     // lot 275's inbound connections (the netflow writer's `"inbound": true`)
-    // are Inbound flows, the others as before
+    // are Inbound flows, the others Outbound
     let directions: Vec<u64> = file
         .lines()
         .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
@@ -314,7 +314,7 @@ fn every_chain_exported_verifies_where_it_arrives() {
         .collect();
     assert_eq!(directions.len(), 40);
     assert_eq!(directions.iter().filter(|d| **d == 1).count(), 4);
-    assert_eq!(directions.iter().filter(|d| **d == 0).count(), 36);
+    assert_eq!(directions.iter().filter(|d| **d == 2).count(), 36);
     // at least once: the same rows again are counted, not refused
     let again = format!("{file}{file}");
     let r = nn_admin::export::verify(again.as_bytes(), &pk).unwrap();

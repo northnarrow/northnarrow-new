@@ -4,7 +4,7 @@
 # crates/nn-export/examples/syslog_receiver.rs, built in the guest's tree).
 # Our own lab guests only.
 #
-# usage: export-guest.sh <out-dir> <phase>...  (setup arrive outage hostile slow stall rotate rewritten protected cost off)
+# usage: export-guest.sh <out-dir> <phase>...  (setup arrive outage hostile slow stall rotate rewritten protected partial shrink cost off)
 #
 #   setup   — a lab CA and a receiver certificate (receiver.lab, 127.0.0.1),
 #             the receiver up (honest), the signed export.local (both sinks,
@@ -465,6 +465,10 @@ phase_rotate() {
     check verify-capture-rotate "the capture verifies across the rotation" verify capture-rotate "$CAP"
     journalctl -u northnarrow-agent --since "-10min" --no-pager 2>/dev/null | grep -ciE 'cursorahead|cursor_ahead' > "$OUT/cursor-ahead.txt"
     check rotate-no-cursor-ahead "no read went ahead of the chain (cursor_ahead notes: $(cat "$OUT/cursor-ahead.txt"))" bash -c "[ \"\$(cat '$OUT/cursor-ahead.txt')\" = 0 ]"
+    # the second review of #499 (R1): the rotation's second window (the
+    # archive renamed, the new file not made yet) is no eviction either
+    journalctl -u northnarrow-agent --since "-10min" --no-pager 2>/dev/null | grep -ciE 'Evicted [{]|active file is missing' > "$OUT/evicted.txt"
+    check rotate-no-eviction "no file taken for evicted or missing across the rotation (notes: $(cat "$OUT/evicted.txt"))" bash -c "[ \"\$(cat '$OUT/evicted.txt')\" = 0 ]"
 }
 
 # The review of #499 (D1, D2): what verify refuses — a record whose OCSF
@@ -572,6 +576,116 @@ sys.exit(1)' "$STATE/detections/detections.jsonl" "$sender"
     check protected-answered "the sender ended by the response ladder, not by itself" bash -c "
         ! grep -q sender-alive '$OUT/tamper.txt' &&
         grep -q 'Killed { pid: $sender }' '$STATE/detections/actions.jsonl'"
+}
+
+# The second review of #499 (R2): `export verify` on a capture that holds an
+# action's outcome but not its intent (a file rotated between them, a
+# capture started after the intent) — PARTIAL (exit 3), never TAMPERED; the
+# outcome with its intent OK; the partial outcome with one of its own
+# fields rewritten TAMPERED (13). The actions come from the `protected`
+# phase (the COMBAT ladder's intents and outcomes): run it first.
+phase_partial() {
+    local rc
+    check partial-caught-up "both sinks caught up with the actions" caught_up 300
+    python3 -I - "$CAP" "$OUT" <<'PY'
+import json, re, sys
+cap, out = sys.argv[1], sys.argv[2]
+recs = []
+for l in open(cap, errors="replace"):
+    m = re.search(r"(\{.*\})\s*$", l)
+    if not m:
+        continue
+    try:
+        recs.append(json.loads(m.group(1)))
+    except ValueError:
+        pass
+def nn(v):
+    return (v.get("unmapped") or {}).get("northnarrow") or {}
+outcomes = [v for v in recs if nn(v).get("kind") == "outcome" and nn(v).get("intent_row")]
+if not outcomes:
+    print("no outcome with its intent in the capture")
+    sys.exit(0)
+o = outcomes[-1]
+ir = nn(o)["intent_row"]
+intent = [v for v in recs if nn(v).get("kind") == "intent"
+          and nn(v)["row"]["file"] == ir["file"] and nn(v)["row"]["line"] == ir["line"]][:1]
+with open(out + "/partial-whole.jsonl", "w") as f:
+    for v in intent + [o]:
+        f.write(json.dumps(v, separators=(",", ":")) + "\n")
+with open(out + "/partial.jsonl", "w") as f:
+    f.write(json.dumps(o, separators=(",", ":")) + "\n")
+bent = dict(o)
+bent["status_detail"] = "not run: rewritten"
+with open(out + "/partial-bent.jsonl", "w") as f:
+    f.write(json.dumps(bent, separators=(",", ":")) + "\n")
+r = nn(o)["row"]
+print(f"outcome {r['file']}/{r['line']} class {o['class_uid']}, its intent {ir['file']}/{ir['line']} ({len(intent)} record)")
+PY
+    if [ -s "$OUT/partial.jsonl" ]; then
+        "$NNADMIN" export verify --agent-pubkey-file /etc/northnarrow/agent.sig.pub --file "$OUT/partial-whole.jsonl" > "$OUT/verify-partial-whole.txt" 2>&1
+        rc=$?
+        check partial-whole-ok "the outcome with its intent: OK, exit 0 (got $rc)" test "$rc" -eq 0
+        "$NNADMIN" export verify --agent-pubkey-file /etc/northnarrow/agent.sig.pub --file "$OUT/partial.jsonl" > "$OUT/verify-partial.txt" 2>&1
+        rc=$?
+        check partial-partial "the outcome without its intent: PARTIAL, exit 3 (got $rc)" bash -c "[ $rc -eq 3 ] && grep -q '^PARTIAL:' '$OUT/verify-partial.txt'"
+        "$NNADMIN" export verify --agent-pubkey-file /etc/northnarrow/agent.sig.pub --file "$OUT/partial-bent.jsonl" > "$OUT/verify-partial-bent.txt" 2>&1
+        rc=$?
+        check partial-bent "the partial outcome with its own field rewritten: TAMPERED, exit 13 (got $rc)" test "$rc" -eq 13
+    else
+        fail partial-outcome "no action outcome with its intent in the capture (run the protected phase first)"
+    fi
+}
+
+# The signed text of the `shrink` phase: the JSONL files' count $1, 1 MiB
+# each; set, and the agent started again.
+shrink_overlay() {   # <files>
+    local sha
+    sha=$(sha256sum /etc/northnarrow/export-ca.pem | cut -d' ' -f1)
+    printf '%s\n' "# lot 276 lab: the JSONL files' count" "enabled = true" \
+        "chain = detections" "chain = actions" "chain = netflow" "start = end" \
+        "file = on" "file_max_bytes = 1MiB" "file_max_files = $1" \
+        "syslog = 127.0.0.1:$PORT" "syslog_server_name = receiver.lab" \
+        "syslog_ca = /etc/northnarrow/export-ca.pem" "syslog_ca_sha256 = $sha" \
+        > "$LAB/export-shrink.local"
+    "$NNADMIN" config overlay set export --file "$LAB/export-shrink.local" --key "$KEY" >> "$OUT/overlay-shrink.txt" 2>&1
+    restart_agent >> "$OUT/restart-shrink.txt" 2>&1
+    sleep 5
+}
+
+# The second review of #499 (R3): a signed configuration with fewer JSONL
+# files, the agent started again — the sink's open removes what the earlier
+# one left past the new count, and the core does not take it for the
+# worker's: the worker not killed, the file sink up, no `directory_over`.
+phase_shrink() {
+    local w0 w1 s
+    # 8 files of 1 MiB, filled past four
+    shrink_overlay 8
+    s=$(date +%s)
+    while [ ! -e "$EXPORT_DIR/export.jsonl.4" ] && [ $(( $(date +%s) - s )) -lt 300 ]; do
+        events 0 200 0
+    done
+    ls -l "$EXPORT_DIR" > "$OUT/shrink-before.txt"
+    check shrink-filled "the JSONL files past four (export.jsonl.4 there, $(( $(date +%s) - s )) s)" test -e "$EXPORT_DIR/export.jsonl.4"
+    check shrink-caught-up "both sinks caught up" caught_up 300
+    # the next start, signed with 2
+    shrink_overlay 2
+    w0=$(worker_pid)
+    sleep 10
+    w1=$(worker_pid)
+    ls -l "$EXPORT_DIR" > "$OUT/shrink-after.txt"
+    status_json > "$OUT/status-shrink.json"
+    check shrink-cleared "the files past the new count removed at the sink's open (left: $(ls "$EXPORT_DIR" | tr '\n' ' '))" bash -c "[ -z \"\$(ls '$EXPORT_DIR' | grep -vxE 'export\.jsonl(\.1)?')\" ]"
+    check shrink-worker "the worker not killed (pid ${w0:-none}, 10 s later ${w1:-none})" bash -c "[ -n '$w0' ] && [ '$w0' = '$w1' ]"
+    check shrink-file-up "the export on, its worker ready, the file sink up, no fault" python3 -I -c '
+import json,sys
+e = json.load(open(sys.argv[1]))["export"]
+f = [k for k in e["sinks"] if k["sink"] == "file"][0]
+print(e["state"], e["worker"], f["state"], f["faults"], f.get("fault"))
+sys.exit(0 if e["state"] == "on" and e["worker"] == "ready" and f["state"] == "up" and f["faults"] == 0 else 1)' "$OUT/status-shrink.json"
+    journalctl -u northnarrow-agent --since "-1min" --no-pager 2>/dev/null | grep -ciE 'past its bound|directory_over' > "$OUT/shrink-over.txt"
+    check shrink-not-over "no directory past its bound since the start (notes: $(cat "$OUT/shrink-over.txt"))" bash -c "[ \"\$(cat '$OUT/shrink-over.txt')\" = 0 ]"
+    events 0 50 0
+    check shrink-writes "the sinks catch up after the start" caught_up 120
 }
 
 ticks() { awk '{print $14 + $15}' "$1" 2>/dev/null; }

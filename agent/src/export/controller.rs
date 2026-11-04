@@ -183,6 +183,9 @@ struct ChainRun {
     next: Cursor,
     lost: u64,
     dirty: bool,
+    /// The file a read waits for (its active file not there after a
+    /// rotation), since when, and whether that was signed.
+    missing: Option<(u64, Instant, bool)>,
 }
 
 struct SinkRun {
@@ -385,6 +388,7 @@ fn run(p: Params, stop: &AtomicBool) {
                         window: VecDeque::new(),
                         lost: 0,
                         dirty: true,
+                        missing: None,
                     }
                 })
                 .collect(),
@@ -428,16 +432,21 @@ fn run(p: Params, stop: &AtomicBool) {
         .map(|f| (f.max_files, nn_export::config::dir_bound(f)));
     let mut dir_checked = Instant::now() - DIR_CHECK_EVERY;
     let mut dir_over: Option<String> = None;
+    // the directory's bytes once the first worker of this run set its sink
+    // up (what an earlier configuration left, past this one's names
+    // cleared by the sink's open): judged from then on
+    let mut dir_floor: Option<u64> = None;
     while !stop.load(Ordering::SeqCst) {
         // the file sink's directory within its bound, or the file sink
         // stops and the worker that wrote past it is killed
         if let Some((max_files, bound)) = dir_limits {
             if dir_checked.elapsed() >= DIR_CHECK_EVERY {
                 dir_checked = Instant::now();
-                let now_over = over_bound(
+                let now_over = dir_verdict(
                     std::path::Path::new(nn_proto::ipc::EXPORT_DIR),
                     max_files,
                     bound,
+                    dir_floor,
                 );
                 if let (Some(why), None) = (&now_over, &dir_over) {
                     warn!(%why, "export: the export's directory past its bound: the worker killed, the file sink stopped");
@@ -478,6 +487,10 @@ fn run(p: Params, stop: &AtomicBool) {
                     );
                     if let Ok(Answer::ExportSetup(out)) = answer {
                         set_up_for = Some(w.starts);
+                        if dir_limits.is_some() && dir_floor.is_none() {
+                            dir_floor =
+                                Some(dir_bytes(std::path::Path::new(nn_proto::ipc::EXPORT_DIR)));
+                        }
                         port_pinned = setup.syslog.as_ref().map(|_| out.port_pinned);
                         for k in &mut sinks {
                             k.until = None;
@@ -783,10 +796,142 @@ fn over_bound(dir: &std::path::Path, max_files: u8, bound: u64) -> Option<String
     (total > bound).then(|| format!("{total} bytes, past its bound of {bound}"))
 }
 
+/// The bytes of every entry in `dir` (0 when it cannot be read).
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|es| {
+            es.flatten()
+                .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// The core's verdict on the export's directory: `None` until the first
+/// worker of the run set its sink up (`floor`: the directory's bytes then
+/// — the sink's open has removed what an earlier configuration left past
+/// this one's file count, and rotated an active file past its size), then
+/// [`over_bound`] with the bound never below that floor: files an earlier,
+/// larger configuration wrote leave by the sink's rotations, and the
+/// honest worker is never killed for them (the second review of #499, R3).
+/// The floor is the first setup's alone: a worker killed for its directory
+/// does not raise it for the next one.
+fn dir_verdict(
+    dir: &std::path::Path,
+    max_files: u8,
+    bound: u64,
+    floor: Option<u64>,
+) -> Option<String> {
+    floor.and_then(|f| over_bound(dir, max_files, bound.max(f)))
+}
+
 /// Whether a round with no row to send asks the worker anyway: when rows
 /// are in flight — the poll that gathers their acknowledgements.
 fn polls(window_empty: bool) -> bool {
     !window_empty
+}
+
+/// What a round sends after its read.
+#[derive(Debug)]
+struct Planned {
+    /// The request and its rows' hashes: rows, or none — the poll that
+    /// gathers the acknowledgements of rows in flight. `None`: nothing to
+    /// ask (no row to send, none in flight).
+    send: Option<(ExportRows, Vec<String>)>,
+    /// Rows no request carries (`(file, line)`): lost, to count and sign.
+    dropped: Vec<(u64, u64)>,
+    /// Where the read after this one starts (past the rows read).
+    next_after: Option<Cursor>,
+}
+
+/// The round's decision on what it read (the second review of #499, R4:
+/// the poll lot 276's fifth lab found missing is decided here, tested):
+/// nothing read and nothing in flight moves the cursor past rows skipped
+/// (lost, a cursor gone) and asks nothing; what the protocol's check would
+/// refuse is dropped, never sent (the review of #499, D3); rows in flight
+/// with none to send are polled.
+fn plan(c: &mut ChainRun, sink: ExportSink, batch: wal::Batch) -> Planned {
+    if batch.rows.is_empty() && c.window.is_empty() {
+        if let Some(n) = batch.next {
+            if n != c.cursor {
+                c.cursor = n.clone();
+                c.dirty = true;
+            }
+            c.next = n;
+        }
+        return Planned {
+            send: None,
+            dropped: Vec::new(),
+            next_after: None,
+        };
+    }
+    let next_after = batch.next.clone();
+    let (rows, hashes, dropped) = sendable(sink, c.src.chain, batch.rows, batch.hashes);
+    if rows.is_empty() {
+        // rows dropped: the next read starts past them
+        if !dropped.is_empty() {
+            if let Some(n) = &next_after {
+                if c.window.is_empty() && *n != c.cursor {
+                    c.cursor = n.clone();
+                    c.dirty = true;
+                }
+                c.next = n.clone();
+            }
+        }
+        // nothing in flight: nothing to ask; rows in flight: a request with
+        // no row, the poll that gathers their acknowledgements (lot 276's
+        // fifth lab: without it the syslog sink's rows stayed in flight)
+        if !polls(c.window.is_empty()) {
+            return Planned {
+                send: None,
+                dropped,
+                next_after,
+            };
+        }
+    }
+    Planned {
+        send: Some((
+            ExportRows {
+                sink,
+                chain: c.src.chain,
+                rows,
+                budget_ms: BUDGET.as_millis() as u32,
+            },
+            hashes,
+        )),
+        dropped,
+        next_after,
+    }
+}
+
+/// How long a read may wait for a chain's active file after a rotation
+/// before the export says so, signed: the writer makes it right after the
+/// rename (microseconds); missing this long, its creation failed — never a
+/// silent state (the second review of #499, R1).
+const ACTIVE_MISSING_NOTE: Duration = Duration::from_secs(30);
+
+/// The chain's wait for its active file (`waiting`: the file a read waits
+/// for, `None` when it read on): the file to sign as missing, once per
+/// wait, when the wait has lasted [`ACTIVE_MISSING_NOTE`].
+fn missing_note(c: &mut ChainRun, waiting: Option<u64>, now: Instant) -> Option<u64> {
+    match (waiting, c.missing) {
+        (None, _) => {
+            c.missing = None;
+            None
+        }
+        (Some(f), Some((g, since, noted))) if f == g => {
+            if !noted && now.saturating_duration_since(since) >= ACTIVE_MISSING_NOTE {
+                c.missing = Some((g, since, true));
+                Some(f)
+            } else {
+                None
+            }
+        }
+        (Some(f), _) => {
+            c.missing = Some((f, now, false));
+            None
+        }
+    }
 }
 
 /// The least a sink down or failed waits before its next request.
@@ -814,7 +959,8 @@ fn sets_up_again(e: &WorkerError) -> bool {
 fn round(p: &Params, k: &mut SinkRun, i: usize, set_up_for: &mut Option<u64>) -> bool {
     let sink = k.sink;
     let c = &mut k.chains[i];
-    let batch = if c.window.len() < MAX_WINDOW {
+    let read = c.window.len() < MAX_WINDOW;
+    let batch = if read {
         match wal::read_after::<LinuxHost>(
             &c.src,
             &c.next,
@@ -835,6 +981,25 @@ fn round(p: &Params, k: &mut SinkRun, i: usize, set_up_for: &mut Option<u64>) ->
         wal::Batch::default()
     };
     c.unchecked = false;
+    if read {
+        if let Some(file) = missing_note(c, batch.waiting, Instant::now()) {
+            warn!(
+                sink = sink.name(),
+                chain = c.src.chain.name(),
+                file,
+                "export: the chain's active file is missing after its rotation"
+            );
+            sign(
+                &p.audit,
+                "detected",
+                serde_json::json!({
+                    "at": "note", "note": "active_missing", "sink": sink.name(),
+                    "chain": c.src.chain.name(), "file": file,
+                    "secs": ACTIVE_MISSING_NOTE.as_secs(),
+                }),
+            );
+        }
+    }
     if batch.lost > 0 || !batch.notes.is_empty() {
         c.lost += batch.lost;
         for n in &batch.notes {
@@ -848,25 +1013,11 @@ fn round(p: &Params, k: &mut SinkRun, i: usize, set_up_for: &mut Option<u64>) ->
             sign(&p.audit, "detected", x);
         }
     }
-    if batch.rows.is_empty() && c.window.is_empty() {
-        // nothing in flight: skipped rows (lost, a cursor gone) move the
-        // cursor too
-        if let Some(n) = batch.next {
-            if n != c.cursor {
-                c.cursor = n.clone();
-                c.dirty = true;
-            }
-            c.next = n;
-        }
-        return false;
-    }
-    // what the protocol's check would refuse is never sent: a row no
-    // request carries is lost here, counted (stage 8) and signed, and the
-    // rest goes — the window holds only what was sent (the review of #499,
-    // D3: a refused request read again every round, the window cleared
-    // under rows the worker still held)
-    let next_after = batch.next.clone();
-    let (rows, hashes, dropped) = sendable(sink, c.src.chain, batch.rows, batch.hashes);
+    let Planned {
+        send,
+        dropped,
+        next_after,
+    } = plan(c, sink, batch);
     if !dropped.is_empty() {
         c.lost += dropped.len() as u64;
         for (file, line) in &dropped {
@@ -887,30 +1038,8 @@ fn round(p: &Params, k: &mut SinkRun, i: usize, set_up_for: &mut Option<u64>) ->
             );
         }
     }
-    if rows.is_empty() {
-        // rows dropped: the next read starts past them
-        if !dropped.is_empty() {
-            if let Some(n) = &next_after {
-                if c.window.is_empty() && *n != c.cursor {
-                    c.cursor = n.clone();
-                    c.dirty = true;
-                }
-                c.next = n.clone();
-            }
-        }
-        // nothing in flight: nothing to ask; rows in flight: a request with
-        // no row, the poll that gathers their acknowledgements (lot 276's
-        // fifth lab: without it the syslog sink's rows stayed in flight)
-        if !polls(c.window.is_empty()) {
-            return false;
-        }
-    }
-    let batch_hashes = hashes;
-    let req = ExportRows {
-        sink,
-        chain: c.src.chain,
-        rows,
-        budget_ms: BUDGET.as_millis() as u32,
+    let Some((req, batch_hashes)) = send else {
+        return false;
     };
     let answer = p.workers.request(
         WorkerKind::Export,
@@ -1016,6 +1145,7 @@ mod tests {
             next: Cursor::start_of(1),
             lost: 0,
             dirty: false,
+            missing: None,
         }
     }
 
@@ -1172,10 +1302,237 @@ mod tests {
         assert_eq!(over_bound(d.path(), 3, 100), None);
     }
 
+    /// The second review of #499 (R3): a signed configuration that lowers
+    /// `file_max_files` — the sink's open clears what the earlier one left,
+    /// and the honest sink's directory is within its bound.
+    #[test]
+    fn review499r_fewer_files_after_a_new_configuration() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = nn_export::jsonl::JsonlSink::open(d.path(), 15, 4).unwrap();
+        for n in 0..6u32 {
+            s.write(&[format!("{{\"n\":{n:03}}}").into_bytes()])
+                .unwrap();
+        }
+        drop(s);
+        // the next start, signed with file_max_files = 2
+        let mut s = nn_export::jsonl::JsonlSink::open(d.path(), 15, 2).unwrap();
+        s.write(&[b"{\"n\":999}".to_vec()]).unwrap();
+        let why = over_bound(d.path(), 2, 1 << 20);
+        assert_eq!(
+            why, None,
+            "an honest sink's directory judged past its bound"
+        );
+        let floor = dir_bytes(d.path());
+        assert_eq!(dir_verdict(d.path(), 2, 1 << 20, Some(floor)), None);
+    }
+
+    /// A signed configuration that lowers `file_max_bytes`: the files the
+    /// earlier one wrote pass the new total, and leave by the sink's
+    /// rotations — the directory is judged against the bytes it held at the
+    /// first setup, never below the configured bound; what grows past that
+    /// floor is still judged, and nothing is judged before a setup.
+    #[test]
+    fn a_smaller_file_size_does_not_condemn_the_honest_worker() {
+        let d = tempfile::tempdir().unwrap();
+        let line = vec![b'x'; 63];
+        let mut s = nn_export::jsonl::JsonlSink::open(d.path(), 4 << 20, 3).unwrap();
+        // 46 × 4096 lines of 64 bytes: about 11.5 MiB in the 3 files
+        let batch = vec![line; 4096];
+        for _ in 0..46 {
+            s.write(&batch).unwrap();
+        }
+        drop(s);
+        // the next start, signed with file_max_bytes = 1 MiB: the bound
+        let small = nn_export::config::FileConfig {
+            max_bytes: 1 << 20,
+            max_files: 3,
+        };
+        let bound = nn_export::config::dir_bound(&small);
+        let s =
+            nn_export::jsonl::JsonlSink::open(d.path(), small.max_bytes, small.max_files).unwrap();
+        assert_eq!(s.size(), 0, "the active file rotated at the open");
+        assert!(
+            over_bound(d.path(), 3, bound).is_some(),
+            "the earlier files pass the new total"
+        );
+        assert_eq!(
+            dir_verdict(d.path(), 3, bound, None),
+            None,
+            "before a setup"
+        );
+        let floor = dir_bytes(d.path());
+        assert!(floor > bound);
+        assert_eq!(dir_verdict(d.path(), 3, bound, Some(floor)), None);
+        // a worker that writes past the floor is still judged
+        std::fs::write(d.path().join("export.jsonl"), vec![b'y'; 4096]).unwrap();
+        assert!(dir_verdict(d.path(), 3, bound, Some(floor))
+            .unwrap()
+            .contains("past its bound"));
+        // and a name the sink does not write, whatever the floor
+        std::fs::write(d.path().join("export.jsonl"), b"").unwrap();
+        std::fs::write(d.path().join("filler"), b"x").unwrap();
+        assert!(dir_verdict(d.path(), 3, bound, Some(u64::MAX))
+            .unwrap()
+            .contains("does not write"));
+    }
+
+    fn row(line: u64, raw: &[u8]) -> ExportRow {
+        ExportRow {
+            file: 1,
+            line,
+            end: line * 10,
+            raw: raw.to_vec(),
+            rotate: None,
+        }
+    }
+
+    fn batch(rows: Vec<ExportRow>, next: Option<Cursor>) -> wal::Batch {
+        wal::Batch {
+            hashes: rows.iter().map(|r| format!("{:064}", r.line)).collect(),
+            rows,
+            next,
+            ..wal::Batch::default()
+        }
+    }
+
+    fn at(line: u64) -> Cursor {
+        Cursor {
+            file: 1,
+            line,
+            end: line * 10,
+            hash: format!("{line:064}"),
+        }
+    }
+
+    /// Lot 276's fifth lab: rows in flight with none to send are polled —
+    /// a request with no row, the one that gathers their acknowledgements
+    /// (without it a syslog sink's rows stayed in flight). Decided by
+    /// `plan`, which `round` follows (the second review of #499, R4: the
+    /// test of `polls` alone let the round's poll go unseen).
     #[test]
     fn rows_in_flight_are_polled_for_their_acknowledgements() {
         assert!(polls(false), "rows in flight: a poll");
         assert!(!polls(true), "nothing in flight: no request");
+        // rows in flight (sent, committed, not acked), nothing new to read
+        let mut c = chain();
+        apply(&mut c, (1..=3).map(sent).collect(), &out(None, Some(3), 0)).unwrap();
+        assert_eq!(c.window.len(), 3);
+        let p = plan(&mut c, ExportSink::Syslog, batch(vec![], Some(at(3))));
+        let (req, hashes) = p.send.expect("rows in flight: the poll");
+        assert!(req.rows.is_empty() && hashes.is_empty());
+        assert_eq!(
+            (req.sink, req.chain),
+            (ExportSink::Syslog, ExportChain::Detections)
+        );
+        assert_eq!(req.check(), Ok(()));
+        assert_eq!(
+            c.cursor,
+            Cursor::start_of(1),
+            "nothing acked: the cursor stays"
+        );
+        // nothing in flight, nothing read: nothing asked
+        let mut c = chain();
+        let p = plan(
+            &mut c,
+            ExportSink::Syslog,
+            batch(vec![], Some(Cursor::start_of(1))),
+        );
+        assert!(p.send.is_none() && p.dropped.is_empty());
+    }
+
+    /// The round's other decisions: rows read are sent (the next read past
+    /// them); nothing in flight and rows skipped by the read (lost, a
+    /// cursor gone) move the cursor with nothing asked; a row no request
+    /// carries is dropped, never sent, the cursor past it when nothing is
+    /// in flight — the window left as it is when rows are.
+    #[test]
+    fn a_round_sends_what_it_read_and_moves_past_what_it_skipped() {
+        let mut c = chain();
+        let p = plan(
+            &mut c,
+            ExportSink::File,
+            batch(vec![row(1, b"{}"), row(2, b"{}")], Some(at(2))),
+        );
+        let (req, hashes) = p.send.expect("rows to send");
+        assert_eq!(
+            req.rows.iter().map(|r| r.line).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(p.next_after, Some(at(2)));
+        assert_eq!(c.cursor, Cursor::start_of(1), "moved by the answer only");
+        // skipped rows: nothing read, the read's end past them
+        let mut c = chain();
+        let p = plan(&mut c, ExportSink::File, batch(vec![], Some(at(4))));
+        assert!(p.send.is_none());
+        assert_eq!((c.cursor.clone(), c.next.clone()), (at(4), at(4)));
+        assert!(c.dirty);
+        // a row no request carries (empty), nothing in flight: dropped,
+        // nothing asked, the cursor past it
+        let mut c = chain();
+        let p = plan(
+            &mut c,
+            ExportSink::File,
+            batch(vec![row(1, b"")], Some(at(1))),
+        );
+        assert!(p.send.is_none());
+        assert_eq!(p.dropped, vec![(1, 1)]);
+        assert_eq!(c.cursor, at(1));
+        // the same with rows in flight: dropped, the poll sent, the cursor
+        // left to the answer
+        let mut c = chain();
+        apply(&mut c, (1..=2).map(sent).collect(), &out(None, Some(2), 0)).unwrap();
+        let p = plan(
+            &mut c,
+            ExportSink::File,
+            batch(vec![row(3, b"")], Some(at(3))),
+        );
+        assert_eq!(p.dropped, vec![(1, 3)]);
+        assert!(p.send.expect("the poll").0.rows.is_empty());
+        assert_eq!(c.cursor, Cursor::start_of(1));
+        assert_eq!(c.next, at(3));
+    }
+
+    /// The second review of #499, R1: a chain's active file missing after
+    /// its rotation is said once, signed, when the wait has lasted —
+    /// never at once (the writer makes it microseconds after the rename),
+    /// never again for that wait, and again for a later one.
+    #[test]
+    fn an_active_file_missing_past_its_wait_is_noted_once() {
+        let mut c = chain();
+        let t0 = Instant::now();
+        assert_eq!(missing_note(&mut c, Some(5), t0), None, "the wait starts");
+        assert_eq!(
+            missing_note(&mut c, Some(5), t0 + Duration::from_secs(29)),
+            None
+        );
+        assert_eq!(
+            missing_note(&mut c, Some(5), t0 + ACTIVE_MISSING_NOTE),
+            Some(5),
+            "past its wait: said"
+        );
+        assert_eq!(
+            missing_note(&mut c, Some(5), t0 + Duration::from_secs(90)),
+            None,
+            "once"
+        );
+        // the file made: the wait ends; a later one is a new wait
+        assert_eq!(
+            missing_note(&mut c, None, t0 + Duration::from_secs(91)),
+            None
+        );
+        assert_eq!(c.missing, None);
+        let t1 = t0 + Duration::from_secs(100);
+        assert_eq!(missing_note(&mut c, Some(6), t1), None);
+        assert_eq!(
+            missing_note(&mut c, Some(6), t1 + ACTIVE_MISSING_NOTE),
+            Some(6)
+        );
+        // a wait for another file starts again
+        assert_eq!(
+            missing_note(&mut c, Some(7), t1 + ACTIVE_MISSING_NOTE),
+            None
+        );
     }
 
     #[test]

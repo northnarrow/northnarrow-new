@@ -555,8 +555,8 @@ fn lines_are_ascii_with_escapes() {
 /// Lot 275's inbound connections in the netflow chain (`"inbound": true`:
 /// the peer that connected as `src_*`, the local listener as `dst_*`, the
 /// byte counters the local socket's): direction Inbound, OCSF's `bytes_out`
-/// (source to destination) the bytes the host received; an outbound row
-/// (no such field) as before.
+/// (source to destination) the bytes the host received; every other row
+/// (no such field: a connection the host made) Outbound.
 #[test]
 fn an_inbound_flow_is_inbound_with_its_traffic_from_the_peer() {
     let body = |extra: &str| {
@@ -595,8 +595,8 @@ fn an_inbound_flow_is_inbound_with_its_traffic_from_the_peer() {
     assert_eq!(inbound["unmapped"]["northnarrow"]["inbound"], true);
     assert_eq!(inbound["actor"]["process"]["name"], "sshd");
     for outbound in [map(&body("")), map(&body(r#","inbound":false"#))] {
-        assert_eq!(outbound["connection_info"]["direction_id"], 0);
-        assert_eq!(outbound["connection_info"]["direction"], "Unknown");
+        assert_eq!(outbound["connection_info"]["direction_id"], 2);
+        assert_eq!(outbound["connection_info"]["direction"], "Outbound");
         assert_eq!(
             outbound["traffic"],
             json!({"bytes_in": 300, "bytes_out": 4000, "bytes": 4300})

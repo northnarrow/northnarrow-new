@@ -384,7 +384,7 @@ on-host LLM advisor removed, which also took about 150 crates out of `Cargo.lock
   - [ ] `isolate --ttl`: a signed isolation outside the COMBAT ladder, with an expiry
   - [ ] Kernel lockdown checks
   - [ ] A tag release, verified end to end
-- [ ] A minimal signed export of detections in OCSF
+- [x] A minimal signed export of detections in OCSF (lot 276: off by default, `docs/operator/EXPORT.md`)
 - [ ] A free, public self-assessment against MITRE's open emulation plans
 - [ ] **Waves 2 and 3**: the remaining Linux capabilities, in the program's order (telemetry, prevention, detection, integration)
 

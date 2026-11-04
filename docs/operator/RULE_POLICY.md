@@ -129,7 +129,12 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CAT
   answer the agent saw, which benign software can produce out of its sight
   (a container's resolvers of its own, DNS over TCP, DoT or DoH, an address
   configured by hand): refused until it is measured on a wider corpus
-  (review of #495; `NETWORK_TELEMETRY.md` §4). Its kill stays held.
+  (review of #495; `NETWORK_TELEMETRY.md` §4). Its kill stays held. The
+  agent's own export worker (lot 276) connects to its syslog receiver by
+  address, never by a name: a receiver at a public address is recorded
+  (Medium) unless it is in `nodns-allow.local`; were this `enforce` ever
+  accepted, its kill would be aimed at that worker — the allowlist first
+  (`EXPORT.md` §8).
 In a policy you sign, the line refuses the file like any bad line
 (`nn-admin config overlay set` and `policy-test` say so). In a policy
 signed before the upgrade, the agent's start takes only that line as

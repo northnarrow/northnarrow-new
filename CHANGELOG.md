@@ -59,7 +59,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   opt-in (`EXPORT.md` §1a lists every field that leaves); X25519 refuses
   a shared secret of all zeros; the sink's files are 0600. Lot 275's
   inbound connections in the netflow chain are exported as Inbound flows
-  (the peer as the source, OCSF's bytes out the bytes the host received).
+  (the peer as the source, OCSF's bytes out the bytes the host received),
+  every other flow as Outbound. After its second review: a read in the
+  rotation's second window (the archive renamed, the new active file not
+  made yet) waits there — no eviction, no "ahead" — and a file still
+  missing 30 s later is a signed `active_missing` note; `nn-admin export
+  verify` says PARTIAL (exit 3) for an outcome whose intent its input does
+  not hold (its own fields checked; a rewritten one stays TAMPERED, whose
+  verdict now says which: a row not signed, or a record rewritten); a
+  signed configuration with fewer or smaller JSONL files holds from the
+  sink's open (the files past the new count removed, regular files only —
+  the worker's seccomp gains `newfstatat` without following a link —, an
+  active file past the new size rotated), and the core judges the export's
+  directory from the first setup, never below the bytes it held then: the
+  honest worker is no longer killed for an earlier configuration's files.
 - Network telemetry, level 2 of C07 (lot 275,
   `docs/operator/NETWORK_TELEMETRY.md`): three new sources of the bus,
   each with its sensor-contract entry, its attach state in the signed

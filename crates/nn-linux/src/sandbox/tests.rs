@@ -710,6 +710,7 @@ fn the_export_allowlist_keeps_its_sinks_and_nothing_to_escape_with() {
         "openat",
         "renameat2",
         "unlinkat",
+        "newfstatat",
         "lseek",
         "fdatasync",
         "landlock_create_ruleset",
@@ -1115,4 +1116,32 @@ fn the_export_worker_s_files_are_bounded() {
         },
     );
     assert!(exited(st, 0), "status {st:#x}");
+}
+
+/// The export directory's Landlock rule grants regular files only: read,
+/// list, write, create, remove, truncate — never a symbolic link, a device,
+/// a FIFO, a socket, a directory, execution or a move across directories
+/// (the second review of #499, mutation R7: `MakeSym` added went unseen;
+/// seccomp has no `symlink` either, but each layer holds alone).
+#[test]
+fn the_export_directory_s_rule_grants_regular_files_only() {
+    use landlock::AccessFs as A;
+    let r = export_dir_rights();
+    assert_eq!(
+        r,
+        A::ReadFile | A::ReadDir | A::WriteFile | A::RemoveFile | A::MakeReg | A::Truncate
+    );
+    for never in [
+        A::MakeSym,
+        A::MakeChar,
+        A::MakeBlock,
+        A::MakeFifo,
+        A::MakeSock,
+        A::MakeDir,
+        A::RemoveDir,
+        A::Execute,
+        A::Refer,
+    ] {
+        assert!(!r.contains(never), "{never:?}");
+    }
 }

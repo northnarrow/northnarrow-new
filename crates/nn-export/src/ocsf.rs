@@ -257,9 +257,66 @@ pub struct Mapper {
 /// Intents kept for their outcomes.
 pub const MAX_INTENTS: usize = 4096;
 
+/// An action outcome's record fields that its intent gives (the class by
+/// the intent's response and its activity, the target — process, file,
+/// connection —, the reasons, the severity, the message) besides
+/// `unmapped.northnarrow.intent_row`: a receiver whose capture does not
+/// hold the intent cannot map them again (`nn-admin export verify`'s
+/// PARTIAL; the second review of #499, R2). The rest of the record — its
+/// time, status, detail, duration, command and correlation ids, place,
+/// row — is the outcome's own.
+pub const INTENT_FIELDS: &[&str] = &[
+    "class_uid",
+    "class_name",
+    "category_uid",
+    "category_name",
+    "activity_id",
+    "activity_name",
+    "type_uid",
+    "type_name",
+    "severity_id",
+    "severity",
+    "process",
+    "file",
+    "connection_info",
+    "remediation",
+    "message",
+];
+
+/// `record` without the fields its intent gives ([`INTENT_FIELDS`] and
+/// `unmapped.northnarrow.intent_row`): an outcome's own fields.
+pub fn without_intent_fields(record: &Value) -> Value {
+    let mut v = record.clone();
+    if let Value::Object(m) = &mut v {
+        for k in INTENT_FIELDS {
+            m.remove(*k);
+        }
+        if let Some(Value::Object(nn)) =
+            m.get_mut("unmapped").and_then(|u| u.get_mut("northnarrow"))
+        {
+            nn.remove("intent_row");
+        }
+    }
+    v
+}
+
+/// An actions chain row's `(run, action)` when it is an outcome.
+pub fn outcome_key(raw: &[u8]) -> Option<(String, u64)> {
+    let v: Value = serde_json::from_slice(raw).ok()?;
+    (text(&v, "row").as_deref() == Some("outcome"))
+        .then(|| Some((text(&v, "run")?, uint(&v, "action")?)))
+        .flatten()
+}
+
 impl Mapper {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the intent of action `(run, action)` was mapped (and is
+    /// kept).
+    pub fn has_intent(&self, run: &str, action: u64) -> bool {
+        self.intents.contains_key(&(run.to_string(), action))
     }
 
     /// The records of one row (one or two; never none).
@@ -690,15 +747,17 @@ fn flow(ctx: &Context, row: &Row<'_>, v: &Value) -> Value {
     let proto = uint(v, "proto").unwrap_or(0);
     // lot 275: an inbound connection's row (`"inbound": true`) has the peer
     // that connected as `src_*`, the local listener as `dst_*`; the byte
-    // counters stay the local socket's
+    // counters stay the local socket's. Every other row of the chain is a
+    // connection the host made (the connect sensor's; rows written before
+    // lot 275 too): Outbound (the second review of #499, N2)
     let inbound = v.get("inbound").and_then(Value::as_bool) == Some(true);
     let mut ci = Map::new();
     if inbound {
         ci.insert("direction_id".into(), json!(1));
         ci.insert("direction".into(), json!("Inbound"));
     } else {
-        ci.insert("direction_id".into(), json!(0));
-        ci.insert("direction".into(), json!("Unknown"));
+        ci.insert("direction_id".into(), json!(2));
+        ci.insert("direction".into(), json!("Outbound"));
     }
     ci.insert("protocol_num".into(), json!(proto));
     if let Some(n) = match proto {
