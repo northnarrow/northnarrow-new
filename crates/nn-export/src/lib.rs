@@ -20,7 +20,7 @@ pub mod config;
 pub use ocsf::OCSF_VERSION;
 
 pub mod jsonl;
-#[cfg(feature = "sinks")]
+#[cfg(any(feature = "sinks", test))]
 pub mod net;
 pub mod ocsf;
 /// The tests' OCSF validator against the pinned schema (the
@@ -28,10 +28,10 @@ pub mod ocsf;
 #[cfg(any(test, feature = "schema-check"))]
 pub mod schema;
 pub mod syslog;
-#[cfg(feature = "sinks")]
+#[cfg(any(feature = "sinks", test))]
 pub mod tls;
 pub mod wal;
-#[cfg(feature = "sinks")]
+#[cfg(any(feature = "sinks", test))]
 pub mod worker;
 
 #[cfg(test)]

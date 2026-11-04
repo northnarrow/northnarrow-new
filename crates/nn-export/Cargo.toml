@@ -48,11 +48,11 @@ x25519-dalek = { version = "=2.0.1", default-features = false, optional = true }
 rand_core = { version = "=0.6.4", default-features = false, features = ["getrandom"], optional = true }
 
 [features]
-default = ["sinks"]
 # The worker's half: the syslog sink, its TLS client, the worker's state
-# (`net`, `tls`, `worker`) and the TLS crates. Without it (nn-admin's
-# `export verify`), the mapping, the WAL reader and the configuration only
-# — no TLS crate in the build (the review of #499, D1).
+# (`net`, `tls`, `worker`) and the TLS crates — the agent's (it runs the
+# worker). Without it (nn-admin's `export verify`): the mapping, the WAL
+# reader and the configuration only, no TLS crate (the review of #499, D1).
+# This crate's own tests build the worker's half too (its dev-dependencies).
 sinks = ["dep:rustls", "dep:rustls-rustcrypto", "dep:x25519-dalek", "dep:rand_core"]
 # The OCSF validator against the pinned schema, for the agent's tests (its
 # dev-dependency turns it on); never in a production build.
@@ -60,6 +60,11 @@ schema-check = []
 
 [dev-dependencies]
 tempfile = "3"
+# the worker's half in this crate's tests (the `sinks` feature's crates)
+rustls = { version = "=0.23.46", default-features = false, features = ["std"] }
+rustls-rustcrypto = { version = "=0.0.2-alpha", default-features = false, features = ["std", "zeroize"] }
+x25519-dalek = { version = "=2.0.1", default-features = false }
+rand_core = { version = "=0.6.4", default-features = false, features = ["getrandom"] }
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize", "rand_core"] }
 base64 = "0.23"
 

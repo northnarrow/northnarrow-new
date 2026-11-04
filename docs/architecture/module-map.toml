@@ -97,7 +97,7 @@ planned = false
 
 [crates.nn-admin]
 about = "the operator client (R10, lab PR 259: admin_cli and the command line, from the agent): what it reads of the Linux host and of the agent goes through its `host::AdminHost`, which the agent implements — no arc to nn-linux, the plan's §2.1 and the decision lab PR 239 left to R10; the nn-admin binary stays a shim of the agent package"
-allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence", "nn-core"]
+allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence", "nn-core", "nn-export"]
 forbid_unsafe = true
 planned = false
 

@@ -15,7 +15,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 /// The active file's name.
-pub const ACTIVE: &str = "export.jsonl";
+pub const ACTIVE: &str = nn_proto::ipc::EXPORT_FILE;
 
 /// `openat`'s flags for the active file: append-only, never through a
 /// link (the worker's allowlist keeps `openat` with exactly these).

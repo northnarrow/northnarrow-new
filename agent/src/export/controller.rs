@@ -769,9 +769,9 @@ fn over_bound(dir: &std::path::Path, max_files: u8, bound: u64) -> Option<String
     for e in entries.flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        let ours = name == nn_export::jsonl::ACTIVE
+        let ours = name == nn_proto::ipc::EXPORT_FILE
             || name
-                .strip_prefix(nn_export::jsonl::ACTIVE)
+                .strip_prefix(nn_proto::ipc::EXPORT_FILE)
                 .and_then(|n| n.strip_prefix('.'))
                 .and_then(|n| n.parse::<u8>().ok())
                 .is_some_and(|n| n >= 1 && n < max_files);

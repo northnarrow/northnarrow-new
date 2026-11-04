@@ -206,6 +206,10 @@ impl WorkerKind {
 pub const EXPORT_DIR: &str = "/var/log/northnarrow/export";
 
 /// [`EXPORT_DIR`]'s rule as the sandbox declares it.
+/// Lot 276: the JSONL sink's active file in [`EXPORT_DIR`] (rotated ones
+/// `<it>.N`): named here, where the core and the worker both read it.
+pub const EXPORT_FILE: &str = "export.jsonl";
+
 pub const EXPORT_DIR_RULE: &str =
     "/var/log/northnarrow/export: read, write, create, remove, truncate";
 

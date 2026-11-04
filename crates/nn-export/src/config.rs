@@ -411,6 +411,12 @@ mod tests {
         let c = ExportConfig::parse("").unwrap();
         assert!(!c.enabled);
         assert_eq!(c.chains, DEFAULT_CHAINS.to_vec());
+        // the default, by name (the review of #499, D6): the detections and
+        // the actions — never the flows, the file drift, the canary reads
+        assert_eq!(
+            c.chains,
+            vec![ExportChain::Detections, ExportChain::Actions]
+        );
         assert_eq!(c.start, Start::End);
         assert!(c.file.is_none() && c.syslog.is_none());
         // a sink configured but not enabled: off
