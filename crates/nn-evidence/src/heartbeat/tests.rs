@@ -422,6 +422,7 @@ fn the_export_s_loss_and_state_alert() {
     b.loss[7] = Some(4);
     b.export = Some(BeatExport {
         state: "on".into(),
+        worker: "ready".into(),
         sinks: vec![sink("down")],
     });
     c.push(b);
@@ -437,6 +438,7 @@ fn the_export_s_loss_and_state_alert() {
     b.loss[7] = Some(4);
     b.export = Some(BeatExport {
         state: "on".into(),
+        worker: "ready".into(),
         sinks: vec![sink("failed")],
     });
     c.push(b);
@@ -449,12 +451,31 @@ fn the_export_s_loss_and_state_alert() {
     b.loss[7] = Some(4);
     b.export = Some(BeatExport {
         state: "refused".into(),
+        worker: String::new(),
         sinks: vec![],
     });
     c.push(b);
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(91), &cfg());
     assert!(
         r.alerts[0].detail().contains("the export is refused"),
+        "{r:?}"
+    );
+    // the review of #499, D4: an export on whose worker is away says so —
+    // the beat's state `degraded`, never "on"
+    let s = r.state.unwrap();
+    let mut b = beat(5, 120);
+    b.loss = vec![Some(0); STAGE_NAMES.len()];
+    b.loss[7] = Some(4);
+    b.export = Some(BeatExport {
+        state: "degraded".into(),
+        worker: "disabled".into(),
+        sinks: vec![sink("up")],
+    });
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(121), &cfg());
+    assert_eq!(kinds(&r), ["DEGRADED"], "{r:?}");
+    assert!(
+        r.alerts[0].detail().contains("the export is degraded"),
         "{r:?}"
     );
     // an earlier agent's beat of seven stages next to a new one's eight

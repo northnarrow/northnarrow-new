@@ -121,6 +121,15 @@ pub fn start(p: Params) -> std::io::Result<Running> {
         .spawn(move || {
             // R14c: the export's thread holds no capability
             nn_linux::caps::enter_or_report(nn_linux::caps::Role::Export);
+            // however it ends (a stop, a panic), the export says it no
+            // longer runs (the review of #499, D4)
+            struct Ended(super::ExportHandle);
+            impl Drop for Ended {
+                fn drop(&mut self) {
+                    self.0.set_running(false);
+                }
+            }
+            let _ended = Ended(p.handle.clone());
             run(p, &s)
         })?;
     Ok(Running {

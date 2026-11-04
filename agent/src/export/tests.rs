@@ -350,7 +350,39 @@ fn the_configuration_is_off_without_a_signed_text_on_with_one() {
     // the handle says what was loaded
     assert!(ExportHandle::new(&Loaded::Absent).is_none());
     let h = ExportHandle::new(&c).unwrap();
+    // the review of #499, D4: on, its controller not started — failed,
+    // in the status, the beat and the manifest alike, never "on"
+    assert_eq!(h.status().state, "failed");
+    assert_eq!(h.beat().state, "failed");
+    assert_eq!(h.manifest_entry().state, "failed");
+    h.set_running(true);
+    h.publish("ready".into(), None, Vec::new(), None, 0);
     assert_eq!(h.status().state, "on");
+    assert_eq!(
+        (h.beat().state.as_str(), h.beat().worker.as_str()),
+        ("on", "ready")
+    );
+    // its worker disabled, or unavailable: degraded at once
+    for w in ["disabled", "unavailable"] {
+        h.publish(w.into(), None, Vec::new(), None, 0);
+        assert_eq!(h.status().state, "degraded", "{w}");
+        assert_eq!(h.manifest_entry().state, "degraded", "{w}");
+        assert_eq!(h.beat().state, "degraded", "{w}");
+    }
+    // a restart: on within the grace, degraded past it
+    h.publish("ready".into(), None, Vec::new(), None, 0);
+    h.publish("backoff".into(), None, Vec::new(), None, 0);
+    assert_eq!(h.status().state, "on");
+    h.0.live.lock().not_ready_since =
+        Some(std::time::Instant::now() - NOT_READY_GRACE - std::time::Duration::from_secs(1));
+    h.publish("starting".into(), None, Vec::new(), None, 0);
+    assert_eq!(h.status().state, "degraded");
+    assert!(h.status().why.unwrap().contains("starting"));
+    h.publish("ready".into(), None, Vec::new(), None, 0);
+    assert_eq!(h.status().state, "on");
+    h.set_running(false);
+    assert_eq!(h.beat().state, "failed");
+    h.set_running(true);
     assert_eq!(h.lost(), Some(0));
     assert_eq!(
         h.manifest_entry().sinks,

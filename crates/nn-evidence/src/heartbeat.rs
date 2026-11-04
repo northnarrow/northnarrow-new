@@ -172,8 +172,14 @@ pub struct HeartbeatRecord {
 /// Lot 276: what a beat carries of the export.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeatExport {
-    /// `on`, `off`, `refused`, `failed`.
+    /// `on`, `off`, `refused`, `failed`, `degraded` (on, its worker away or
+    /// disabled: the review of #499, D4).
     pub state: String,
+    /// The export worker's health (`ready`, `starting`, `backoff`,
+    /// `disabled`, `unavailable`, `stopped`; empty in a beat of an agent
+    /// before the review of #499).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub worker: String,
     pub sinks: Vec<BeatExportSink>,
 }
 

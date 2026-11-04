@@ -166,7 +166,10 @@ pub fn start_if_on(
         cursors: cursors_path(detections_file),
         handle: handle.clone(),
     }) {
-        Ok(r) => Some(r),
+        Ok(r) => {
+            handle.set_running(true);
+            Some(r)
+        }
         Err(e) => {
             crate::boot::degradation::report(
                 "export",
@@ -204,7 +207,13 @@ struct Live {
     sinks: Vec<ExportSinkStatus>,
     cursors_saved: Option<String>,
     cursor_saves: u64,
+    /// Since when the worker has not been ready (`None`: it is).
+    not_ready_since: Option<std::time::Instant>,
 }
+
+/// How long the export's worker may be away (a restart, a backoff) before
+/// the export says `degraded` (the review of #499, D4).
+pub const NOT_READY_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug)]
 struct Shared {
@@ -216,6 +225,9 @@ struct Shared {
     sinks: Vec<String>,
     live: Mutex<Live>,
     lost: AtomicU64,
+    /// Its controller runs (set by `start_if_on`; an export on whose
+    /// controller never started is `failed`, never "on").
+    running: std::sync::atomic::AtomicBool,
 }
 
 /// What the status, the manifest and the beats read of the export. Cheap
@@ -283,6 +295,7 @@ impl ExportHandle {
                 ..Live::default()
             }),
             lost: AtomicU64::new(0),
+            running: std::sync::atomic::AtomicBool::new(false),
         })))
     }
 
@@ -303,21 +316,63 @@ impl ExportHandle {
         cursors_saved: Option<String>,
         cursor_saves: u64,
     ) {
-        *self.0.live.lock() = Live {
+        let mut live = self.0.live.lock();
+        let not_ready_since = if worker == "ready" {
+            None
+        } else {
+            live.not_ready_since
+                .or_else(|| Some(std::time::Instant::now()))
+        };
+        *live = Live {
             worker,
             port_pinned,
             sinks,
             cursors_saved,
             cursor_saves,
+            not_ready_since,
         };
+    }
+
+    /// Its controller runs, or stopped.
+    pub(crate) fn set_running(&self, running: bool) {
+        self.0.running.store(running, Ordering::Relaxed);
+    }
+
+    /// The export's state as the status, the beat and the manifest say it:
+    /// the configuration's (`on`, `off`, `refused`, `failed`, `none`), and
+    /// for one `on`, what runs — `failed` when its controller is not
+    /// running, `degraded` when its worker is disabled or unavailable, or
+    /// away past [`NOT_READY_GRACE`]: never "on" for an export that does
+    /// nothing (the review of #499, D4). With why.
+    fn effective(&self, live: &Live) -> (String, Option<String>) {
+        if self.0.state != "on" {
+            return (self.0.state.to_string(), self.0.why.clone());
+        }
+        if !self.0.running.load(Ordering::Relaxed) {
+            return (
+                "failed".into(),
+                Some("its controller is not running".into()),
+            );
+        }
+        let away = live
+            .not_ready_since
+            .is_some_and(|t| t.elapsed() >= NOT_READY_GRACE);
+        if matches!(live.worker.as_str(), "disabled" | "unavailable") || away {
+            return (
+                "degraded".into(),
+                Some(format!("its worker is {}", live.worker)),
+            );
+        }
+        ("on".into(), None)
     }
 
     /// `nn-admin export status --key`.
     pub fn status(&self) -> ExportStatus {
         let live = self.0.live.lock();
+        let (state, why) = self.effective(&live);
         ExportStatus {
-            state: self.0.state.to_string(),
-            why: self.0.why.clone(),
+            state,
+            why,
             config: self.0.config.clone(),
             config_sha256: self.0.sha256.clone(),
             ocsf_version: nn_export::OCSF_VERSION.to_string(),
@@ -334,7 +389,8 @@ impl ExportHandle {
     pub fn beat(&self) -> nn_evidence::heartbeat::BeatExport {
         let live = self.0.live.lock();
         nn_evidence::heartbeat::BeatExport {
-            state: self.0.state.to_string(),
+            state: self.effective(&live).0,
+            worker: live.worker.clone(),
             sinks: live
                 .sinks
                 .iter()
@@ -350,14 +406,16 @@ impl ExportHandle {
 
     /// The manifest's entry: the configuration, and the pin measured.
     pub fn manifest_entry(&self) -> nn_core::contract::manifest::ExportEntry {
+        let live = self.0.live.lock();
+        let (state, why) = self.effective(&live);
         nn_core::contract::manifest::ExportEntry {
-            state: self.0.state.to_string(),
-            why: self.0.why.clone().unwrap_or_default(),
+            state,
+            why: why.unwrap_or_default(),
             ocsf_version: nn_export::OCSF_VERSION.to_string(),
             chains: self.0.chains.clone(),
             sinks: self.0.sinks.clone(),
             config_sha256: self.0.sha256.clone(),
-            port_pinned: self.0.live.lock().port_pinned,
+            port_pinned: live.port_pinned,
         }
     }
 }
