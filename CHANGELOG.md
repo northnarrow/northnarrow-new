@@ -27,6 +27,23 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     the enum, tracepoint and hook-argument slots after them move by two.
     Residuals as `ANTITAMPER_TRUST_MODEL.md` lists them (a root that
     rewrites the unit itself is still the unit).
+  - The review of #494 before the merge: a move is a no-op only when the
+    writing thread moves itself and its cgroup does not change (a thread
+    writing its leader into `cgroup.threads` was taken for no move); a
+    destination path that fills the 256-byte read is signed without a
+    name; a mark the kernel cannot keep makes that process tree not known
+    (a per-group bit in the pinned 512 KiB `CGROUP_JOIN_LOST`), never every
+    exemption on the host until a reboot; the marks' map is sized to
+    `kernel.pid_max` capped by `kernel.threads-max`, allocated as it fills;
+    a new process's pid starts with no mark a dead group left there; the
+    tracker's links are pinned like the other anti-tamper programs, so it
+    keeps marking while the agent is stopped; the policy refuses a `unit`
+    exemption naming the agent's containment scopes and applies none under
+    `/northnarrow.slice`; CVE-2022-30594's 5.4.189 and 4.19.238 are in the
+    table; a privileged behaviour test of the tracker
+    (`agent/tests/cgroup_join_privileged_e2e.rs`) and `exempt-check`'s
+    threaded case and 200 starts under load. The sensor contract lists the
+    tracker and the `cgroup_join` record.
   - `nn-admin host-check` (and the signed manifest's `host_hardening`):
     `kernel_fixes` compares the kernel's upstream version (Ubuntu's
     `version_signature`, Debian's banner, else `osrelease`) with the fixes

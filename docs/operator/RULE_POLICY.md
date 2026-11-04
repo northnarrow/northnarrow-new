@@ -85,7 +85,9 @@ The kernel tells them apart (`agent-ebpf/src/cgroup_join.rs`, the
 start-in-cgroup tracker). It marks a process that was moved into a cgroup
 by anyone but systemd's placement, or started by `CLONE_INTO_CGROUP` by
 anyone but PID 1. A process it forks after that is marked too, before it
-runs, and the mark goes when its last thread exits. The rule's match of a
+runs, and the mark goes when its last thread exits. A new process starts
+with nothing at its pid, whatever a dead process left there (a move of a
+process already exiting marks after its exit: the review of #494, N5). The rule's match of a
 marked process is not exempt by `cgroup` or `unit`. An exemption by `uid` or
 `exe` still covers it: those name the actor, not where it runs. systemd's
 placement is a move PID 1 makes (a unit's process at its start, a scope's
@@ -149,10 +151,6 @@ Refusals that are not an attack (fail-closed, as designed):
 - **A cgroup v1 hierarchy** (a hybrid host): a move in it by anyone but
   systemd's placement marks the process; the policy reads only the v2
   (`0::`) cgroup.
-- **A reused pid.** A mark made on a thread group that was already exiting
-  is not removed by its exit (that came first): the next process given the
-  pid is refused its exemption until its own thread group ends, which
-  removes the mark.
 - **systemd 255's order inverted.** If the executor moved itself before PID
   1 moved it (PID 1 kept off the CPU for milliseconds in that window), the
   move is the executor's own and the unit's process is marked.

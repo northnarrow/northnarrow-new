@@ -5308,7 +5308,9 @@ number in parentheses is a lab PR.
     and the unit exemption trusts it; `exe … sha256` binds a program. Also
     open: a move while no agent runs; a `CLONE_INTO_CGROUP` start is marked
     but not signed; a full map refuses every such exemption until the host
-    reboots; on systemd 255 without `CLONE_INTO_CGROUP`, the executor's
-    own move could beat PID 1's and mark it (a false refusal, not measured
+    reboots (changed by the review of #494, below); on systemd 255 — which
+    does not use `CLONE_INTO_CGROUP` at all: that came in 256, and this
+    note first said otherwise (the review of #494, D4) — the executor's own
+    move could beat PID 1's and mark it (a false refusal, not measured
     here); `kernel_fixes` is `unknown` on a distribution's kernel below a
     fix, because the version cannot say.

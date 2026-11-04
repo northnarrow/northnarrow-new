@@ -800,9 +800,15 @@ distribution **backports fixes without changing the version**, so the
 check says:
 
 - `ok` — every fix is in the version (its branch's, or mainline's), or the
-  kernel predates the bug;
-- `warn` — an upstream kernel (no distribution's files, a real sublevel)
-  whose version lacks a fix: the CVE is named `MISSING`;
+  kernel predates the bug — assuming a distribution did not backport the
+  buggy feature itself into an older kernel (the check cannot see that);
+- `warn` — a kernel taken for upstream whose version lacks a fix: the CVE
+  is named `MISSING`. "Upstream" is what the check cannot tell from a
+  distribution's: no Ubuntu signature, no Debian banner, no `.el`, SUSE or
+  `-generic` release, and a real sublevel. Fedora, Arch and Amazon Linux
+  (`6.1.112-122.…amzn2023`) are among them: a missing fix there is `warn`,
+  not `unknown`, though such a kernel may carry it backported — the
+  conservative side, never a false `ok` (the review of #494, N7);
 - `unknown` — a distribution's kernel whose version is below a fix
   (Ubuntu, Debian, the Red Hat family's frozen `5.14.0-…el9`, SUSE): it may
   carry the fix backported. The version cannot say; the distribution's
@@ -841,9 +847,16 @@ the optional offsets `signal_struct.live`, `kernel_clone_args.flags` and
 `task_struct.signal`. Checked on the BTF of 6.8 (Ubuntu 24.04) and 6.18
 (WSL2), and in the lab on 5.15 and 6.12 (`verifier-check`: the five
 programs load, `cgroup_join_mark` 876 and 908 instructions; lot 277's
-note). A kernel without them
+note); the review of #494's code on 6.8: `docs/roadmap/CAPABILITY_PROGRAM.md`,
+lot 277. A kernel without them
 starts with a signed `subsystem_degraded` "cgroup exemptions", and every
-exemption by cgroup or unit is refused there.
+exemption by cgroup or unit is refused there. An optional offset absent
+makes the tracker absent (`btf_revalidate`), never a tracker reading a
+sentinel. The programs' links are pinned in `/sys/fs/bpf/northnarrow`
+(`prog_cgroup_join_*`, `link_cgroup_join_*`): they go on marking while
+the agent is stopped. The marks' map is sized at the start to
+`kernel.pid_max` capped by `kernel.threads-max` and allocated as it fills;
+the per-group "not known" bitmap is 512 KiB, preallocated.
 
 ## Adding a distro to the lab
 
