@@ -29,7 +29,7 @@ bad() { printf 'FAIL  %s\n' "$*"; fail=1; }
 at_tty() { script -qec "$*" /dev/null < /dev/null; }
 mover() {   # <cgroup name> <pid file>: a root sleeper that moved itself
     sudo mkdir -p "/sys/fs/cgroup/$1"
-    sudo bash -c "echo \$BASHPID > /sys/fs/cgroup/$1/cgroup.procs && echo \$BASHPID > $2 && exec sleep 900" &
+    sudo bash -c "echo \$BASHPID > /sys/fs/cgroup/$1/cgroup.procs && echo \$BASHPID > $2 && exec sleep 900" >/dev/null 2>&1 &
     for _ in $(seq 1 20); do sudo test -s "$2" && break; sleep 0.2; done
     sudo cat "$2"
 }

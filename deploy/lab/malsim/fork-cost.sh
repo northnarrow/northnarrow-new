@@ -46,7 +46,21 @@ int main(int argc, char **argv) {
 C
 cc -O2 -o $B $B.c || { echo "FAIL  no C compiler"; exit 1; }
 median() { sort -n | awk '{a[NR]=$1} END {print (NR%2 ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2)}'; }
-bench() { for _ in $(seq 1 "$ROUNDS"); do taskset -c 1 $B "$N"; done; }
+CPU=$(( $(nproc) > 1 ? 1 : 0 ))
+bench() { for _ in $(seq 1 "$ROUNDS"); do taskset -c "$CPU" $B "$N"; done; }
+moved_marked() {   # a root sleeper that moved itself into a throwaway cgroup: its mark
+    local p m
+    sudo rm -f /tmp/nn277-cost.pid
+    sudo mkdir -p /sys/fs/cgroup/nn277-cost
+    sudo bash -c 'echo $BASHPID > /sys/fs/cgroup/nn277-cost/cgroup.procs && echo $BASHPID > /tmp/nn277-cost.pid && exec sleep 30' >/dev/null 2>&1 &
+    for _ in $(seq 1 20); do sudo test -s /tmp/nn277-cost.pid && break; sleep 0.2; done
+    p=$(sudo cat /tmp/nn277-cost.pid)
+    m=$(sudo python3 -I "$MARKS" mark "$p" 2>&1)
+    sudo kill "$p" 2>/dev/null
+    for _ in $(seq 1 20); do sudo rmdir /sys/fs/cgroup/nn277-cost 2>/dev/null && break; sleep 0.2; done
+    sudo rm -f /tmp/nn277-cost.pid
+    echo "$m"
+}
 prog_stat() {   # <name prefix (15 chars)>: "run_cnt run_time_ns"
     sudo bpftool prog show 2>/dev/null | awk -v n="$1" '
         $0 ~ " name "n" " { for (i=1;i<=NF;i++) { if ($i=="run_time_ns") t=$(i+1); if ($i=="run_cnt") c=$(i+1) } found=1 }
@@ -71,18 +85,23 @@ done
 sudo sysctl -q kernel.bpf_stats_enabled=0
 echo "RESULT per-call: born + fork + exit = $total ns a fork and its exit (BPF statistics; the stats' own clock reads included)"
 
-echo "== 2. wall clock (statistics off), ns per fork + exit + wait on CPU 1"
+echo "== 2. wall clock (statistics off), ns per fork + exit + wait on CPU $CPU"
 on1=$(bench | tr '\n' ' '); m_on1=$(tr ' ' '\n' <<<"$on1" | grep . | median)
 echo "    tracker attached:   $on1 (median $m_on1)"
 sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 300 >/dev/null 2>&1 || { echo "FAIL  window refused"; fail=1; }
 for l in $(sudo sh -c "ls $dir" | grep '^link_cgroup_join_'); do sudo rm -f "$dir/$l"; done
 sleep 1
-left=$(sudo bpftool link show 2>/dev/null | grep -c "cgroup_join" || true)
-echo "    links unpinned (tracker links left: $left)"
+probe=$(moved_marked)
+echo "    links unpinned; a move now: [$probe] (detached: no mark)"
+grep -q " -$" <<<"$probe" || { echo "FAIL  the tracker still marks with its links unpinned"; fail=1; }
 off=$(bench | tr '\n' ' '); m_off=$(tr ' ' '\n' <<<"$off" | grep . | median)
 echo "    tracker detached:   $off (median $m_off)"
+t2=$(date '+%F %T')
 sudo systemctl restart northnarrow-agent; sleep 6
-sudo journalctl -u northnarrow-agent -b -n 300 --no-pager -o cat | grep -q "start-in-cgroup tracker is attached" || { echo "FAIL  the tracker did not attach again"; fail=1; }
+sudo journalctl -u northnarrow-agent -b --since "$t2" --no-pager -o cat | grep -q "start-in-cgroup tracker is attached" || { echo "FAIL  the tracker did not attach again"; fail=1; }
+probe=$(moved_marked)
+echo "    agent restarted; a move now: [$probe] (attached: marked)"
+grep -q " moved " <<<"$probe" || { echo "FAIL  the tracker does not mark after the restart"; fail=1; }
 on2=$(bench | tr '\n' ' '); m_on2=$(tr ' ' '\n' <<<"$on2" | grep . | median)
 echo "    tracker attached:   $on2 (median $m_on2)"
 echo "RESULT wall: attached $m_on1 / $m_on2 ns, detached $m_off ns a fork + exit + wait (medians of $ROUNDS rounds of $N)"
