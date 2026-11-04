@@ -238,27 +238,39 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
   - the kernel's mass-write events count differently. `MassWrite` with
     `overwrites: true` carries in `count` the distinct existing files
     rewritten (it carried every write-open); with `overwrites: false` it is
-    the files created (it was every write-open, the same file's included);
-    a `FileBurst` of kind `unlink` counts each original once per name and
-    window, a rename onto an existing file of 4 KiB or more included, a
-    file the process itself created in the window excluded. The
+    the files written new — created by the open, or empty when opened
+    (`mknod`, `O_TMPFILE`), each once (it was every write-open, the same
+    file's included); a new field `small_files: true` marks an overwrite
+    crossing that needed files under 4 KiB (counted by the posture outside
+    an authenticated session only, never by NN-L-IMP-001's shape (a)); a
+    `FileBurst` of kind `unlink` counts each original once per name and
+    window — any regular file that holds data (it was 4 KiB or more), or
+    held it within the window (a truncate then an unlink), a rename onto
+    one included, a file the process itself created in the window excluded;
+    both events carry a new `cgroup_id` (the writer's cgroup v2 id, the
+    posture's pairing of a copy and a deletion). The
     agent's journal lines say so: `mass write: distinct existing files
-    rewritten crossed the threshold`, `mass write: files created crossed the
-    threshold`, `file burst: rename or destroyed-originals threshold
-    crossed` (were `mass write: write-open threshold crossed` and `file
+    rewritten crossed the threshold` (with `small_files=` and `cgroup=`),
+    `mass write: files created crossed the threshold (files written new …)`,
+    `file burst: rename or destroyed-originals threshold crossed` (with
+    `cgroup=`) (were `mass write: write-open threshold crossed` and `file
     burst: rename or unlink threshold crossed`); an exempt writer's crossing
     is an INFO line naming the exemption;
   - a new posture trigger, `PackageTamperRefusal` (ALERTED), in the
     journal's `POSTURE TRANSITION` lines, for an anti-tamper refusal of a
-    package transaction's process (it was `AntiTamperDenial`, COMBAT);
-    the refusal's NN-L-AT-001 record is unchanged;
+    file operation (unlink, rmdir, rename, setattr, create, link, symlink,
+    mkdir, mknod, an extended attribute) of a package transaction's process
+    (it was `AntiTamperDenial`, COMBAT); its other refused operations — a
+    signal, a ptrace, a BPF handle, a kexec, a cgroup write, a limit — keep
+    their weight; the refusal's NN-L-AT-001 record is unchanged;
   - a COMBAT whose cause is one heuristic signal with nothing of another
     kind vouching for it signs a `combat_stage` row "NEUTRALIZE held" and
     kills nothing; the journal line of a COMBAT entry now names the signals
     that corroborated it;
   - NN-L-EVA-002 is no longer recorded when a container runtime flushes
-    its own chain (`CNI-…`, `DOCKER…` but `DOCKER-USER`, `KUBE-…`,
-    `cali-…`, `cilium_…`, `NETAVARK…`, the `iptables`'s parent the
+    its own chain (`CNI-…`, `DOCKER…`, `KUBE-…`, `cali-…`, `cilium_…`,
+    `NETAVARK…` — not the filter chains `DOCKER-USER`, `CNI-ADMIN`,
+    `KUBE-FIREWALL`, which stay a switch-off — the `iptables`'s parent the
     runtime's packaged program); it still is for the same chain flushed by
     another process and for the host firewall's chains (an INFO line,
     `NN-L-EVA-002: a container runtime's chain flushed by a process its
