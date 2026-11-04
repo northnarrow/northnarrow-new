@@ -5762,7 +5762,48 @@ number in parentheses is a lab PR.
     24.04 `main` 11, the lot 21). The guests left as found: k3s's
     `/var/lib/rancher` removed on both; on 24.04 podman and
     `/var/lib/containers` were there before these runs and stay.
-  - Lab of this design: pending (round i, lease `k279`, both guests).
+  - Lab of this design (as measured; our own guests, lease `k279`; before
+    each round no agent, no pin, no `/etc/northnarrow/*.local`; install,
+    `enable --now`, settle; after it `uninstall.sh --purge`, k3s's
+    `/var/lib/rancher` removed, the guest powered off). R011's kills over
+    `kmod-check.sh`'s measured windows:
+    - Ubuntu 24.04 (6.8.0-147, kmod 31), round i, 7f55af1c, with podman
+      (there before), docker.io, k3s (kube-proxy ipvs), zfsutils-linux:
+      malicious 9 of 9 killed (M1–M6 and the new M7 `--remove-holders`,
+      M8 `MODPROBE_OPTIONS='-d /tmp/…'`, M9 `modprobe <name> -q`); benign
+      recorded — podman rootless's `overlay`, docker.io's start
+      (containerd's `overlay`, fan-net's `vxlan`), k3s's 8 (`br_netfilter`,
+      `ip_vs`, `iptable_filter`, `iptable_nat`, `nfnetlink-subsys-11`,
+      `nft-chain-2-nat`, `nft-expr-counter`, `overlay`), zfs-load-module's
+      `zfs`, `modprobe dummy`/`-r`, the queries, `modprobe
+      nn_k279_no_such_module` — but 1 killed: iptables-legacy's `modprobe`,
+      "its environment read empty". libxtables runs it with
+      `posix_spawn(…, argv, NULL)`: no environment at all, the process
+      alive (the kill landed; `iptables-legacy -L` rc 3). Fixed in
+      16df634f (an empty read from a process that still has its memory is
+      an empty environment). Outside the windows the script's own `kmod
+      --version` was killed "already gone", having exited before the pump
+      read it — the kill that reaches no one the coordinator then ruled a
+      record (52c00fe3). Test-ignored: 91 suites, 120 passed, 0 failed, the
+      lot's four tests ok.
+    - 24.04 round j, 52e0467c (k3s, B1, B7–B9, M1–M9): iptables-legacy's
+      `modprobe ip_tables` recorded (rc 0), k3s's 9 recorded, malicious 9 of
+      9 killed, benign kills 0.
+    - Ubuntu 22.04 (5.15.0-202, kmod 29), round i, 52c00fe3, the full
+      corpus (podman, docker.io, k3s, zfsutils-linux): benign kills 0 —
+      iptables-legacy, podman rootless (its rc 137 is the COMBAT ladder
+      below, not R011), docker.io's start, k3s's 8, zfs ×2, `dummy`/`-r`,
+      the queries, B9 recorded; malicious 9 of 9 killed; no record "exited
+      before its environment could be read" in the windows. Test-ignored:
+      91 suites, 120 passed, 0 failed, the lot's four tests ok (copied +
+      `depmod` by name: R011 record, R018 KillProcessTree after the load;
+      `-d`, `MODPROBE_OPTIONS`, `-q` after the name: R011 kills).
+    - 24.04 round k, d0f2284f (the re-review's fixes; k3s, B1, B7–B9,
+      M1–M10): benign kills 0 (k3s's 9 recorded), malicious 10 of 10
+      killed — M10 `LD_PRELOAD=/nonexistent.so modprobe …` killed, "the
+      dynamic linker runs code of the caller's choosing in the tool".
+    - 22.04 round k (d0f2284f, M10 and test-ignored with the e2e's
+      `LD_PRELOAD` case): queued for the guest's lease.
   - Open: `modprobe -S` outside a package transaction (an initramfs build
     by hand), a quiet probe written `modprobe <name> -q` and a `modprobe`
     run with `LD_LIBRARY_PATH` set are killed; a tool that exits before the
