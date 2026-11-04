@@ -2877,8 +2877,8 @@ fn string_pairs(v: Option<&serde_yaml_ng::Value>) -> Vec<(String, String)> {
 /// token reads the repository; the analyze job alone may also write the
 /// code-scanning results. The Rust job installs every toolchain the tree
 /// pins (each `rust-toolchain.toml`), fetches every cargo project from its
-/// lockfile and fails if the extraction changed one; the CodeQL bundle the runner caches is not
-/// deleted, and no step is handed a secret.
+/// lockfile and fails if the extraction changed one; the CodeQL bundle the
+/// runner caches is not deleted, and no step is handed a secret.
 #[test]
 fn codeql_scans_every_language_of_the_tree() {
     const FILE: &str = ".github/workflows/codeql.yml";
