@@ -42,8 +42,9 @@
 //!   `--first-time`, `--show-*`, `-V`, `-h`, `--`); `kmod help`, `list`,
 //!   `static-nodes` and the version; kmod run as `lsmod`, `rmmod`, `modinfo`
 //!   or `depmod` (they insert nothing). Whether the names load anything,
-//!   and what, is the kernel's to judge at the load (R018 records it; the
-//!   module signature policy refuses what it does not trust).
+//!   and what, is the kernel's to judge at the load (its module signature
+//!   policy refuses what it does not trust; R018 judges, after it, the load
+//!   it reports — see R011's module doc for what it gives no verdict on).
 
 /// The tool an exec runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -37,6 +37,7 @@
 #   M7 modprobe --remove-holders (kmod 29..34 run it as an insertion)
 #   M8 MODPROBE_OPTIONS="-d <a /tmp tree>" in the environment, modprobe dummy
 #   M9 an option after the module name (modprobe <name> -q)
+#   M10 LD_PRELOAD in the environment (the dynamic linker's code in the tool)
 #
 #   bash deploy/lab/malsim/kmod-check.sh [--only B1,M3] [--out FILE]
 #        [--with-podman] [--with-docker] [--with-k3s] [--with-zfs] [--with-wg]
@@ -54,7 +55,7 @@ while [[ $# -gt 0 ]]; do
         --only) ONLY=${2:-}; shift 2 ;;
         --out) OUT=${2:-}; shift 2 ;;
         --with-podman|--with-docker|--with-k3s|--with-zfs|--with-wg) WITH+="${1#--with-} "; shift ;;
-        -h|--help) sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "kmod-check: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -287,6 +288,7 @@ fi
 if want M7; then measure M7 kill "modprobe --remove-holders nn_k279_no_such_module" -- sudo modprobe --remove-holders nn_k279_no_such_module; fi
 if want M8; then measure M8 kill "MODPROBE_OPTIONS='-d /tmp/…' modprobe dummy" -- sudo env MODPROBE_OPTIONS="-d $M/root" modprobe dummy; fi
 if want M9; then measure M9 kill "modprobe nn_k279_no_such_module -q (option after the name)" -- sudo modprobe nn_k279_no_such_module -q; fi
+if want M10; then measure M10 kill "LD_PRELOAD=/nonexistent.so modprobe nn_k279_no_such_module" -- sudo env LD_PRELOAD=/nonexistent-nn-k279.so modprobe nn_k279_no_such_module; fi
 
 echo "== R011 kills over the run: $r011_kills"
 if [[ -n $OUT ]]; then

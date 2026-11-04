@@ -5632,18 +5632,21 @@ number in parentheses is a lab PR.
     and on what the exec pump read at the exec
     (`crates/nn-linux/src/sensors/kmod_exec.rs`, kept per exec in
     `kmod_exec_facts.rs`: the executed file's device and inode against the
-    system's tools', `/proc/<pid>/environ` tied to the exec by a pidfd and
-    the start time). Killed: `insmod`; a `modprobe` argument with a `/` or a
+    file `/usr/bin/kmod` resolves to, `/proc/<pid>/environ` tied to the exec
+    by a pidfd and the start time). Killed: `insmod`; a `modprobe` argument with a `/` or a
     `.ko*` suffix; `-C`, `-d`, `-S`, `--force*`, `-o`, `--remove-holders`,
     `--remove-dependencies` and their abbreviations; any argument starting
     with `-` after the first name; an option the tool refuses; a `kmod`
     command but `help`/`list`/`static-nodes`/the version; a program not the
-    system's tool, of another mount namespace; `MODPROBE_OPTIONS`, a
-    running process's environment not read or its pid another's; an argv
-    not read whole. Recorded (High, T1547.006) otherwise — a tool that had
-    exited before its environment could be read noting it (the
-    coordinator's decision of 04/11: its kill would reach no one). `OBSERVING_KILLS` unchanged: R011's kill narrowed,
-    no kill added. The NET-006 test waits for as many records as listeners
+    system's tool, of another mount namespace; `MODPROBE_OPTIONS`,
+    `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, a running process's
+    environment not read, over 1 MiB, an unknown start; an argv not read
+    whole. Recorded (High, T1547.006) otherwise — a tool that had exited
+    before its environment could be read (no process with its pid, its pid
+    another's, a zombie, its memory gone whatever was read) noting it, its
+    environment not verified (the coordinator's decision of 04/11: its kill
+    would reach no one; best effort for a short-lived `modprobe`).
+    `OBSERVING_KILLS` unchanged: R011's kill narrowed, no kill added. The NET-006 test waits for as many records as listeners
     it opened, then asserts exactly that many. No capability level moves.
   - Decisions (04/11/2026, the coordinator, after the independent review of
     #498): the first design — kmod's lookup emulated (configuration aliases,
@@ -5656,15 +5659,31 @@ number in parentheses is a lab PR.
     `MODPROBE_OPTIONS='--'` turns into a parameter, the exec pump blockable
     by a FIFO in `/run/modprobe.d`, limits that fell back on the record, an
     owner's time that root dates forward, a DKMS provenance a `mkdir` fakes.
-    R011 now reads no `modprobe.d`, index or module file. R018 OBSERVES: it
-    records each load the kernel reports and kills the loader of a file
-    outside the module directories or of an unowned module by a loader it
-    does not expect — after the load (its hook denies nothing; `kmod` is in
-    its loader allowlist); it is not a backstop that prevents. Prevention is
-    module signing and lockdown (the host check) and lot 285 (the kernel's
-    deny of an untrusted file). What R011 never saw, as on `main`: a root
-    process that loads a module without any tool (its own
-    `finit_module(2)`), and the commands of root's `modprobe.d`.
+    R011 now reads no `modprobe.d`, index or module file. R018 OBSERVES, it
+    is not a backstop that prevents: after the load (its hook denies
+    nothing) it kills the loader's tree for a file outside the module
+    directories, and for an unowned file in them unless the loader or its
+    parent is in its loader allowlist (`systemd-udevd`, `systemd-modules`,
+    `kmod`: comms), where it is a Log; a packaged file loaded by those, or a
+    load by a kernel thread's child, has no verdict; every load is a journal
+    line. Prevention is module signing and lockdown (the host check) and lot
+    285 (the kernel's deny of an untrusted file; `kmod` out of R018's
+    allowlist goes with its redesign of R018). What R011 never covered, as
+    on `main`: a root process that loads a module without any tool (its own
+    `finit_module(2)`; with comm `kmod` maybe no verdict at all), a root
+    parent tracing the tool and rewriting its argv or environment. The
+    `install`/`remove` commands of root's `modprobe.d` run as programs the
+    exec rules judge — on `main` a user-space `modprobe` was killed first,
+    so this residual is new for it; written with `modprobe.d`'s coverage in
+    `TAPPA9_FIM_TRUST_MODEL.md` (follow-ups: a FIM rule on every
+    `modprobe.d`, a record for a `modprobe`'s children).
+  - The re-review of #498 (52e0467c): no BLOCKING finding; kmod 31 as an
+    oracle on 40,495 argv in two environments — no argv kmod reads as a
+    file, a moved tree or a caller's configuration is recorded. Its five
+    to-fix points, done: a read the exit cut short is no whole environment
+    (exited); `LD_PRELOAD`/`LD_AUDIT`/`LD_LIBRARY_PATH` killed; R018 said as
+    it is (above); the `install`/`remove` residual in the trust model; the
+    system's tool only the file `/usr/bin/kmod` resolves to.
   - Lab of the EARLIER design (retired: the decisions above; as measured;
     our own guests, lease `k279`; Ubuntu 22.04 5.15.0-202 and 24.04
     6.8.0-147; on each, `main` 80c8da36 then the lot on the same
@@ -5745,8 +5764,9 @@ number in parentheses is a lab PR.
     `/var/lib/containers` were there before these runs and stay.
   - Lab of this design: pending (round i, lease `k279`, both guests).
   - Open: `modprobe -S` outside a package transaction (an initramfs build
-    by hand) and a quiet probe written `modprobe <name> -q` are killed, as
-    on `main`; a tool that exits before the exec pump reads its environment
-    is recorded on its command line alone (a load it made is R018's
-    record); the load itself is prevented only by the kernel's signature
-    policy and lot 285.
+    by hand), a quiet probe written `modprobe <name> -q` and a `modprobe`
+    run with `LD_LIBRARY_PATH` set are killed; a tool that exits before the
+    exec pump reads its environment is recorded on its command line alone
+    (a burst of execs can make that likelier: `-d` or a path then R018's
+    after the load, `-C` with an `install` nobody's); the load itself is
+    prevented only by the kernel's signature policy and lot 285.

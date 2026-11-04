@@ -955,7 +955,10 @@ fn assert_r011(fx: &Fixture, pid: u32, verdict: &str, why: &str) {
 ///   see: R011 kills on the environment the exec pump read at the exec (and
 ///   R018 records the load from /tmp, Critical);
 /// - an option after the module name (`modprobe dummy -q`): R011 kills —
-///   whether it is an option is the environment's to say.
+///   whether it is an option is the environment's to say;
+/// - `LD_PRELOAD` in the environment (the re-review of #498, DC-2): R011
+///   kills — the dynamic linker would run code of the caller's choosing in
+///   the system's tool.
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn r011_records_a_name_and_kills_a_moved_tree_or_modprobe_options() {
@@ -1056,6 +1059,21 @@ fn r011_records_a_name_and_kills_a_moved_tree_or_modprobe_options() {
     // An option after the module name.
     let (pid, _) = run_tool("/sbin/modprobe", &["dummy", "-q"], &[]);
     assert_r011(&fx, pid, "KillProcess", "after the module name");
+    unload("dummy");
+
+    // The dynamic linker's code (a library that does not exist: ld.so says
+    // so and runs the tool).
+    let (pid, _) = run_tool(
+        "/sbin/modprobe",
+        &["dummy"],
+        &[("LD_PRELOAD", "/nonexistent-nn-k279.so")],
+    );
+    assert_r011(
+        &fx,
+        pid,
+        "KillProcess",
+        "LD_PRELOAD='/nonexistent-nn-k279.so' in its environment",
+    );
     unload("dummy");
 }
 

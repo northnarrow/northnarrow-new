@@ -754,21 +754,24 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   parameter as the environment decides); an option the tool refuses; a
   `kmod` command other than `help`, `list`, `static-nodes`, the version; a
   program that is not the system's tool (its path, or its device and inode
-  against `/usr/bin/kmod`, `/usr/sbin/modprobe`… as the exec pump stats
-  them), of another mount namespace; `MODPROBE_OPTIONS` in the process's
-  environment (`/proc/<pid>/environ` tied to the exec by a pidfd and the
-  start time; an empty one read from the running process is one: libxtables
-  runs `modprobe` with none), a running process whose environment could not
-  be read or whose pid names another process; an argv the kernel did not
-  read whole. A tool that had exited before its environment could be read
-  (reaped, a zombie, its memory gone) is recorded, noting it — its kill
-  would reach no one.
-  Recorded otherwise (High, T1547.006, the names said): whether a name
-  loads anything, and what, is the kernel's to judge at the load — R018
-  records it, after the fact (its hook observes and denies nothing); the
-  prevention of a load is module signing, lockdown and lot 285.
-  `OBSERVING_KILLS` keeps R011 as a kill from before Wave 4: its kill
-  narrowed, no kill was added.
+  against the file `/usr/bin/kmod` resolves to, stat'ed by the exec pump),
+  of another mount namespace; `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT`
+  or `LD_LIBRARY_PATH` in the process's environment (`/proc/<pid>/environ`
+  tied to the exec by a pidfd and the start time; an empty one read from
+  the running process is one: libxtables runs `modprobe` with none), a
+  running process whose environment could not be read, an environment over
+  1 MiB, an unknown start; an argv the kernel did not read whole. A tool
+  that had exited before its environment could be read (no process with its
+  pid, its pid another's, a zombie, its memory gone whatever was read) is
+  recorded, its environment not verified — its kill would reach no one; the
+  environment's check is best effort for a short-lived `modprobe`.
+  Recorded otherwise (High, T1547.006, the names said): what a name loads
+  is the kernel's to judge — its signature policy, lockdown and lot 285
+  prevent a load; R018 judges a load it reports after the fact, with no
+  verdict for a packaged file loaded by a comm of its loader allowlist
+  (`systemd-udevd`, `systemd-modules`, `kmod`) or a kernel thread's child
+  (taking `kmod` out of it goes with lot 285). `OBSERVING_KILLS` keeps R011
+  as a kill from before Wave 4: its kill narrowed, no kill was added.
 - The privileged test `net_listener_on_uncommon_port_records_event` waits
   for both NN-L-NET-006 records of its pid (lot 279): it found the 8443
   twin's and counted before the 41999 one was appended (the CI of #493 on

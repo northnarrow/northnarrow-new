@@ -3,23 +3,29 @@
 //! command line's syntax ([`super::kmod_invocation`]):
 //!
 //! - **the program**: the file the kernel executed (`exe`'s device and
-//!   inode, from the LSM hook) is the system's module tool — the inode of
-//!   `/usr/bin/kmod`, `/usr/sbin/modprobe`, … as the pump stats them then.
-//!   A copy, a file of another filesystem, an exec the hook did not
-//!   describe (tracepoint mode) is not;
+//!   inode, from the LSM hook) is the system's module tool — the one file
+//!   `/usr/bin/kmod` resolves to, as the pump stats it then (the links the
+//!   distribution installs execute that file). A copy, a file of its own
+//!   under a tool's name, a file of another filesystem, an exec the hook
+//!   did not describe (tracepoint mode) is not;
 //! - **the environment**: the process's `/proc/<pid>/environ`, tied to the
-//!   exec by a pidfd and its start time, holds no `MODPROBE_OPTIONS` —
-//!   options kmod puts in front of the command line (`-d`, `-C`, `--`…),
-//!   which the sensor does not see. Present: killed. A RUNNING process whose
-//!   environment could not be read, or whose pid names another process (its
-//!   start is not the exec's), or whose start is unknown: killed, nothing
-//!   told it apart. A process that had EXITED before its environment could
-//!   be read (reaped, a zombie, past its exit with its memory gone) is not
-//!   killed — a kill would reach no one and leave only a false High kill
-//!   (the coordinator's decision of 04/11): an invocation R011 would record
-//!   otherwise is recorded, noting it ([`Environment::Exited`]); a load it
-//!   made is the kernel's to judge (R018). An empty environment read from
+//!   exec by a pidfd and its start time, holds neither `MODPROBE_OPTIONS`
+//!   (options kmod puts in front of the command line: `-d`, `-C`, `--`…,
+//!   which the sensor does not see) nor the dynamic linker's `LD_PRELOAD`,
+//!   `LD_AUDIT`, `LD_LIBRARY_PATH` (code of the caller's choosing in the
+//!   tool). One read: killed, whatever became of the process. A RUNNING
+//!   process whose environment could not be read, an environment over
+//!   1 MiB, an unknown start: killed, nothing told it apart. A process that
+//!   had EXITED before its environment could be read — no process with its
+//!   pid, its pid another process's (its start not the exec's), a zombie,
+//!   past its exit with its memory gone whatever was read then — is not
+//!   killed: a kill would reach no one and leave only a false High kill
+//!   (the coordinator's decision of 04/11, the re-review's conditions); an
+//!   invocation R011 would record otherwise is recorded, its environment
+//!   not verified ([`Environment::Exited`]). An empty environment read from
 //!   the running process is one (libxtables runs `modprobe` with none).
+//!   Best effort: a short-lived `modprobe` may exit before the pump reads
+//!   it, the likelier as a burst of execs slows the pump.
 //!
 //! The core reads none of it (nn-linux's `sensors::kmod_exec` does, on the
 //! exec pump's thread, for the execs of a module tool only); the answer is

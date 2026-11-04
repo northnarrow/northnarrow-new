@@ -54,23 +54,38 @@
 //! | `-C`/`--config`, `-d`/`--dirname`, `-S`/`--set-version`, `-f`/`--force*`, `-o`, `--remove-holders`, `--remove-dependencies` (and the abbreviations `getopt_long` takes) | kill |
 //! | any argument starting with `-` after the first module name; an option the tool refuses | kill |
 //! | a `kmod` command other than `help`, `list`, `static-nodes`, the version | kill |
-//! | not the system's tool: its path outside `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin` or another name, its device and inode not the system's tool's (as the exec pump stats them), a filesystem of another mount namespace | kill |
-//! | `MODPROBE_OPTIONS` in its environment; a running process whose environment the exec pump could not read at the exec, or whose pid names another process | kill |
-//! | a process that had exited before the exec pump could read its environment, the rest of it recorded | record, noting it |
+//! | not the system's tool: its path outside `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin` or another name, its device and inode not those of the file `/usr/bin/kmod` resolves to (as the exec pump stats it), a filesystem of another mount namespace | kill |
+//! | `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` in its environment; a running process whose environment the exec pump could not read at the exec; an environment over 1 MiB; an unknown start | kill |
+//! | a process that had exited before the exec pump could read its environment (no process with its pid, its pid another's, a zombie, its memory gone), the rest of it recorded | record, its environment not verified |
 //! | an argv the kernel did not read whole | kill |
 //! | otherwise — the system's tool, plain module names, before the first name only options that move and force nothing | record |
 //!
 //! Whether the names load anything, and what, is the kernel's to judge at
-//! the load: R018 records every load (`kernel_read_file`, the file's path
-//! from its dentry) and kills the loader of a file outside the module
-//! directories or of an unowned module by a loader it does not expect —
-//! AFTER the load: its hook observes and denies nothing. The prevention of
-//! a load is module signing and lockdown (the host check) and lot 285 (the
-//! kernel's deny of an untrusted file). What R011 does not see, as before:
-//! a root process that loads a module without any tool (its own
-//! `finit_module(2)`), and a `modprobe.d` `install`/`remove` command, which
-//! runs as the configuration's (root's) command and is judged by the exec
-//! rules as the program it runs.
+//! the load: its signature policy (module signing, lockdown: the host check
+//! reports both) refuses what it does not trust, and lot 285 adds the
+//! kernel's deny of an untrusted file. R018 judges the loads the kernel
+//! reports (`kernel_read_file` / `kernel_load_data`, the file's path from
+//! its dentry) AFTER them — its hook observes and denies nothing: a load
+//! whose loader's parent is a kernel thread has no verdict; a file outside
+//! the module directories (or deeper than any) is a Critical kill of the
+//! loader's tree, whatever the loader; a file in them that no package
+//! installed is a Critical kill, or only a Log when the loader or its
+//! parent is in R018's loader allowlist (`systemd-udevd`, `systemd-modules`,
+//! `kmod` — comms, which a process chooses); a packaged file loaded by those
+//! has NO verdict, by another loader a Log. Every load is a line of the
+//! agent's journal, not a signed record. So `execve("/usr/bin/kmod",
+//! ["modprobe", "rk"])` of a module copied into the tree and indexed by
+//! `depmod` is R011's record and R018's Log, no kill (taking `kmod` out of
+//! R018's allowlist goes with lot 285's redesign of R018).
+//!
+//! What R011 does not see: a root process that loads a module without any
+//! tool (its own `finit_module(2)`) — as on `main`, with comm `kmod` maybe
+//! no verdict at all (above); a root parent that traces the tool and
+//! rewrites its argv or environment after the exec pump read them; a
+//! `modprobe.d` `install`/`remove` command — root's configuration, run by
+//! `modprobe` through `/bin/sh -c` as programs the exec rules judge (on
+//! `main` a user-space `modprobe` was killed, its command then usually not
+//! run; the coverage of `modprobe.d` is in `TAPPA9_FIM_TRUST_MODEL.md`).
 
 use std::sync::Arc;
 
@@ -97,8 +112,8 @@ impl<H: PostureHost> R011KernelModuleTooling<H> {
 /// Lot 279: the note of a record whose process had exited before the exec
 /// pump could read its environment (the coordinator's decision of 04/11: a
 /// kill would reach no one).
-pub const EXITED_NOTE: &str =
-    "exited before its environment could be read — a load it made is the kernel's to judge (R018)";
+pub const EXITED_NOTE: &str = "exited before its environment could be read — a load it made is \
+                                the kernel's to judge (R018); its environment not verified";
 
 /// Lot 279: `Ok((what it asks for, whether its process had exited before
 /// its environment could be read))` when R011 records the exec of a module
@@ -231,9 +246,9 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
                 ResponseAction::Log,
                 format!(
                     "Kernel-module tooling ({comm}) exec by module name — {what}: the system's \
-                     tool, nothing moved or forced, no MODPROBE_OPTIONS — recorded, not killed \
-                     (lot 279): the load itself is the kernel's to judge (R018 records it; the \
-                     module signature policy) (T1547.006)"
+                     tool, nothing moved or forced, no MODPROBE_OPTIONS or LD_* — recorded, not \
+                     killed (lot 279): what the names load is the kernel's to judge (its \
+                     signature policy; R018 judges the load it reports, after it) (T1547.006)"
                 ),
             ),
             Ok((what, true)) => (
@@ -545,9 +560,9 @@ mod tests {
 
     /// Lot 279: what the exec pump read at the exec decides the rest — the
     /// program not the system's tool's file, `MODPROBE_OPTIONS` in the
-    /// environment, a running process's environment not read, its pid
-    /// another process's, or no reading at all (a replay): killed, the pump's
-    /// reason said.
+    /// or a dynamic linker's variable in the environment, a running
+    /// process's environment not read, an unknown start, or no reading at
+    /// all (a replay): killed, the pump's reason said.
     #[test]
     fn what_the_exec_pump_read_is_judged() {
         let r = rule();
@@ -588,10 +603,19 @@ mod tests {
                 ExecFacts {
                     program: Ok(()),
                     environment: Environment::Refused(
-                        "its pid names another process (its start is not the exec's)".into(),
+                        "LD_PRELOAD='/tmp/x.so' in its environment".into(),
                     ),
                 },
-                "its pid names another process",
+                "LD_PRELOAD='/tmp/x.so'",
+            ),
+            (
+                ExecFacts {
+                    program: Ok(()),
+                    environment: Environment::Refused(
+                        "its start is unknown: its environment cannot be tied to the exec".into(),
+                    ),
+                },
+                "its start is unknown",
             ),
         ] {
             let v = r

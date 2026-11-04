@@ -2,21 +2,39 @@
 //! the exec — R011's facts ([`nn_core::decision::rules::kmod_exec_facts`]):
 //!
 //! - whether the file the kernel executed is the system's module tool: its
-//!   device and inode (`exe`, from the LSM hook) against those of the
-//!   tools' paths (`/usr/bin/kmod`, `/usr/sbin/modprobe`, … followed to
-//!   their file), stat'ed now;
-//! - whether the process's environment holds `MODPROBE_OPTIONS`, which kmod
-//!   puts in front of its command line and the sensor does not see:
+//!   device and inode (`exe`, from the LSM hook) against those of the one
+//!   file `/usr/bin/kmod` resolves to (`/bin/kmod` where there is no
+//!   `/usr/bin/kmod`), stat'ed now — the links the distribution installs
+//!   (`/usr/sbin/modprobe` → `../bin/kmod`) execute that same file; a file
+//!   of its own under a tool's name (`/usr/bin/modprobe`, where the
+//!   distribution installs none) is not it (the re-review of #498, DC-5);
+//! - whether the process's environment holds `MODPROBE_OPTIONS` (which kmod
+//!   puts in front of its command line, and the sensor does not see) or one
+//!   of the dynamic linker's `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`
+//!   (code of the caller's choosing run in the tool: the re-review, DC-2):
 //!   `/proc/<pid>/environ`, tied to the exec by a pidfd and the process's
-//!   start. A RUNNING process whose environment could not be read, whose pid
-//!   names another process or whose start is unknown: refused (R011 kills).
-//!   A process that had EXITED before its environment could be read — no
-//!   process with its pid any more, a zombie, past its exit with its memory
-//!   gone — is said so ([`Environment::Exited`]): its kill would reach no
-//!   one (the coordinator's decision of 04/11; R011 records it, noting it).
-//!   An empty environment read from the running process is one: libxtables
-//!   runs `modprobe` with none (`posix_spawn(…, argv, NULL)`; lot 279's lab,
-//!   iptables-legacy on Ubuntu 24.04).
+//!   start. Read: refused (R011 kills) — whatever became of the process: it
+//!   is what the exec asked for. A RUNNING process whose environment could
+//!   not be read, an environment over 1 MiB, an unknown start: refused. A
+//!   process that had EXITED before its environment could be read — no
+//!   process with its pid (`ESRCH`), its pid another process's (its start
+//!   not the exec's: reaped, the pid reused), a zombie, past its exit with
+//!   its memory gone, whatever was read then (a read cut by the exit is no
+//!   whole environment: DC-1) — is said so ([`Environment::Exited`]): its
+//!   kill would reach no one (the coordinator's decision of 04/11; R011
+//!   records it, its environment not verified). An empty environment read
+//!   from the running process is one: libxtables runs `modprobe` with none
+//!   (`posix_spawn(…, argv, NULL)`; lot 279's lab, iptables-legacy on
+//!   Ubuntu 24.04).
+//!
+//! **Best effort.** A `modprobe` that does its work and exits before the
+//! exec pump reads its environment is judged on its command line alone,
+//! and a burst of execs that slows the pump makes that likelier: a `-d` or
+//! a path put in `MODPROBE_OPTIONS` is then R018's after the load, a `-C`
+//! naming a configuration with an `install` command nobody's. A root parent
+//! that traces the tool (`PTRACE_O_TRACEEXEC`) can rewrite its argv and
+//! environment after this reading — root running code of its own, the
+//! residual R011 never covered.
 //!
 //! On the exec pump's thread, first, before the event goes on the bus, for
 //! the execs whose `comm` is a module tool's only: a dozen `stat`s, one
@@ -35,21 +53,17 @@ use nn_model::{Event, ExeIdentity};
 use crate::anti_tamper::filesystem::stat_dev_to_kernel_dev;
 use crate::response::proc_ref::{pidfd_exited, pidfd_open, started_at, stat_start_ticks};
 
-/// The system's module tools' paths under the host's root: kmod and the
-/// links the distributions install to it (or tools of those names).
-const TOOL_PATHS: &[&str] = &[
-    "usr/bin/kmod",
-    "bin/kmod",
-    "usr/sbin/kmod",
-    "sbin/kmod",
-    "usr/sbin/modprobe",
-    "sbin/modprobe",
-    "usr/bin/modprobe",
-    "bin/modprobe",
-    "usr/sbin/insmod",
-    "sbin/insmod",
-    "usr/bin/insmod",
-    "bin/insmod",
+/// The system's module tool under the host's root: the file `/usr/bin/kmod`
+/// resolves to, or `/bin/kmod`'s where there is no `/usr/bin/kmod`.
+const KMOD_PATHS: &[&str] = &["usr/bin/kmod", "bin/kmod"];
+
+/// The environment variables that refuse an exec of a module tool: kmod's
+/// options in front of its command line, and the dynamic linker's code.
+const REFUSED_VARS: &[&str] = &[
+    "MODPROBE_OPTIONS",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
 ];
 
 /// The most of an environment read (a larger one is not read: killed).
@@ -88,8 +102,8 @@ pub fn facts(root: &Path, event: &Event) -> Option<ExecFacts> {
     })
 }
 
-/// `Ok` when the file the kernel executed is one of the system's module
-/// tools' (device and inode).
+/// `Ok` when the file the kernel executed is the system's module tool
+/// (device and inode).
 fn program(root: &Path, exe: &ExeIdentity) -> Result<(), String> {
     if !exe.has(exe_flags::KNOWN) {
         return Err(
@@ -98,16 +112,16 @@ fn program(root: &Path, exe: &ExeIdentity) -> Result<(), String> {
                 .to_string(),
         );
     }
-    let ours = TOOL_PATHS
+    let kmod = KMOD_PATHS
         .iter()
-        .filter_map(|p| std::fs::metadata(root.join(p)).ok())
-        .any(|m| (stat_dev_to_kernel_dev(m.dev()), m.ino()) == (exe.dev, exe.ino));
-    if ours {
+        .find_map(|p| std::fs::metadata(root.join(p)).ok())
+        .map(|m| (stat_dev_to_kernel_dev(m.dev()), m.ino()));
+    if kmod == Some((exe.dev, exe.ino)) {
         Ok(())
     } else {
         Err(format!(
             "the file it executed (device {:#x}, inode {}) is not the system's module tool \
-             (/usr/bin/kmod, /usr/sbin/modprobe, /usr/sbin/insmod… as stat'ed at the exec)",
+             (the file /usr/bin/kmod resolves to, stat'ed at the exec)",
             exe.dev, exe.ino
         ))
     }
@@ -140,9 +154,10 @@ fn environment(proc: &Path, pid: u32, start_ns: u64) -> Environment {
     let stat = || std::fs::read_to_string(proc.join(format!("{pid}/stat"))).ok();
     match stat().as_deref().and_then(stat_start_ticks) {
         Some(ticks) if started_at(ticks, start_ns) => {}
+        // the exec's process was reaped and its pid reused
         Some(_) => {
-            return Environment::Refused(
-                "its pid names another process (its start is not the exec's)".to_string(),
+            return Environment::Exited(
+                "its pid names another process now (its start is not the exec's)".to_string(),
             )
         }
         None if pidfd_exited(&fd) => {
@@ -162,8 +177,10 @@ fn environment(proc: &Path, pid: u32, start_ns: u64) -> Environment {
 
 /// What an environment read (`read`'s outcome; `env`, at most
 /// [`MAX_ENVIRON`] + 1 bytes) says, its process `gone` by the end of the
-/// read (exited, or its memory gone) or not. `MODPROBE_OPTIONS` read is a
-/// refusal whatever became of the process.
+/// read (exited, or its memory gone) or not. A variable of [`REFUSED_VARS`]
+/// read, or more than [`MAX_ENVIRON`] bytes, is a refusal whatever became
+/// of the process; anything else read from a process gone is no whole
+/// environment (a read the exit cut short ends without an error).
 fn judged(read: std::io::Result<()>, env: &[u8], gone: bool) -> Environment {
     if let Err(e) = read {
         return if gone {
@@ -177,21 +194,29 @@ fn judged(read: std::io::Result<()>, env: &[u8], gone: bool) -> Environment {
             "its environment is larger than {MAX_ENVIRON} bytes: not read whole"
         ));
     }
-    if let Some(value) = env
-        .split(|b| *b == 0)
-        .find_map(|kv| kv.strip_prefix(b"MODPROBE_OPTIONS="))
-    {
-        return Environment::Refused(format!(
-            "MODPROBE_OPTIONS='{}' in its environment: kmod puts it in front of the command line, \
-             which the sensor does not see",
-            String::from_utf8_lossy(value)
-        ));
+    for kv in env.split(|b| *b == 0) {
+        let Some(eq) = kv.iter().position(|b| *b == b'=') else {
+            continue;
+        };
+        let (name, value) = (&kv[..eq], &kv[eq + 1..]);
+        if let Some(var) = REFUSED_VARS.iter().find(|v| v.as_bytes() == name) {
+            return Environment::Refused(format!(
+                "{var}='{}' in its environment: {}",
+                String::from_utf8_lossy(value),
+                if *var == "MODPROBE_OPTIONS" {
+                    "kmod puts it in front of the command line, which the sensor does not see"
+                } else {
+                    "the dynamic linker runs code of the caller's choosing in the tool"
+                }
+            ));
+        }
     }
     if gone {
         return Environment::Exited(if env.is_empty() {
             "it had exited (its memory gone) when its environment was read".to_string()
         } else {
-            "it exited while its environment was read (what was read holds no MODPROBE_OPTIONS)"
+            "it exited while its environment was read (what was read holds no refused \
+             variable, and may be cut short)"
                 .to_string()
         });
     }
@@ -311,10 +336,10 @@ mod tests {
         fake
     }
 
-    /// The environment is read at the exec: `MODPROBE_OPTIONS` named with
-    /// its value; a clean one and an empty one (libxtables' modprobe) are
-    /// clean; a start that is not the exec's or unknown, refused; a process
-    /// reaped or a zombie, exited.
+    /// The environment is read at the exec: `MODPROBE_OPTIONS` or a dynamic
+    /// linker's variable named with its value; a clean one and an empty one
+    /// (libxtables' modprobe) are clean; an unknown start refused; a process
+    /// reaped, a pid now another process's, a zombie: exited.
     #[test]
     fn the_environment_is_read_from_the_exec_s_process() {
         let p = Path::new("/proc");
@@ -322,7 +347,8 @@ mod tests {
         let start = started(&clean);
         assert_eq!(environment(p, clean.id(), start), Environment::Clean);
         let later = start + 3_600_000_000_000;
-        assert!(refused(environment(p, clean.id(), later)).contains("another process"));
+        // its pid another process's: the exec's had been reaped
+        assert!(exited(environment(p, clean.id(), later)).contains("another process now"));
         assert!(refused(environment(p, clean.id(), 0)).contains("start is unknown"));
         let pid = clean.id();
         stop(clean);
@@ -336,8 +362,19 @@ mod tests {
         let why = refused(environment(p, empty_value.id(), started(&empty_value)));
         assert!(why.contains("MODPROBE_OPTIONS=''"), "{why}");
         stop(empty_value);
+        // the dynamic linker's code (DC-2)
+        let ld = sleeper(&[
+            ("PATH", "/usr/bin"),
+            ("LD_LIBRARY_PATH", "/nonexistent-nn-k279"),
+        ]);
+        let why = refused(environment(p, ld.id(), started(&ld)));
+        assert!(
+            why.contains("LD_LIBRARY_PATH='/nonexistent-nn-k279'"),
+            "{why}"
+        );
+        stop(ld);
         // a name that only starts like it is another variable
-        let other = sleeper(&[("MODPROBE_OPTIONS_X", "-d /tmp/x")]);
+        let other = sleeper(&[("MODPROBE_OPTIONS_X", "-d /tmp/x"), ("XLD_PRELOAD", "x")]);
         assert_eq!(
             environment(p, other.id(), started(&other)),
             Environment::Clean
@@ -462,22 +499,47 @@ mod tests {
         thread.join().unwrap();
     }
 
-    /// What was read is judged whole: `MODPROBE_OPTIONS` refused whatever
-    /// became of the process; an unread environment refused while the
-    /// process runs, exited once it is gone; an empty one clean while it
-    /// runs.
+    /// What was read is judged whole: a refused variable or more than
+    /// 1 MiB refused whatever became of the process; anything else read
+    /// from a process gone is no whole environment (exited, DC-1); an
+    /// unread environment refused while the process runs, exited once it is
+    /// gone; an empty one clean while it runs.
     #[test]
     fn what_was_read_is_judged() {
         let denied = || Err(std::io::Error::from_raw_os_error(libc::EACCES));
         assert_eq!(judged(Ok(()), b"", false), Environment::Clean);
         assert_eq!(judged(Ok(()), b"PATH=/bin\0", false), Environment::Clean);
         assert!(exited(judged(Ok(()), b"", true)).contains("memory gone"));
-        assert!(exited(judged(Ok(()), b"PATH=/bin\0", true)).contains("holds no MODPROBE_OPTIONS"));
+        // a read the exit cut short: no whole environment
+        assert!(exited(judged(Ok(()), b"PATH=/bin\0FILLER=xxxx", true)).contains("cut short"));
         for gone in [false, true] {
-            let why = refused(judged(Ok(()), b"PATH=/bin\0MODPROBE_OPTIONS=-C x\0", gone));
-            assert!(why.contains("MODPROBE_OPTIONS='-C x'"), "{why}");
+            for (env, named) in [
+                (
+                    &b"PATH=/bin\0MODPROBE_OPTIONS=-C x\0"[..],
+                    "MODPROBE_OPTIONS='-C x'",
+                ),
+                (b"LD_PRELOAD=/tmp/x.so\0", "LD_PRELOAD='/tmp/x.so'"),
+                (b"A=1\0LD_AUDIT=/tmp/a.so", "LD_AUDIT='/tmp/a.so'"),
+                (b"LD_LIBRARY_PATH=\0", "LD_LIBRARY_PATH=''"),
+                // after an entry without '=', a value with one
+                (
+                    b"JUNK\0LD_PRELOAD=/tmp/a=b.so\0",
+                    "LD_PRELOAD='/tmp/a=b.so'",
+                ),
+            ] {
+                let why = refused(judged(Ok(()), env, gone));
+                assert!(why.contains(named), "{named}: {why}");
+            }
             let big = vec![b'x'; MAX_ENVIRON as usize + 1];
             assert!(refused(judged(Ok(()), &big, gone)).contains("larger than"));
+        }
+        // names that only look like them, a value that names one
+        for env in [
+            &b"LD_PRELOADX=1\0XLD_PRELOAD=1\0LD_LIBRARY=1\0"[..],
+            b"A=LD_PRELOAD=/tmp/x.so\0",
+            b"LD_PRELOAD\0",
+        ] {
+            assert_eq!(judged(Ok(()), env, false), Environment::Clean, "{env:?}");
         }
         let big = vec![b'x'; MAX_ENVIRON as usize];
         assert_eq!(judged(Ok(()), &big, false), Environment::Clean);
@@ -500,18 +562,24 @@ mod tests {
         assert!(why.contains("could not be read"), "{why}");
     }
 
-    /// The program is the system's tool by device and inode: the file a
-    /// tool's path leads to (through its link), not another file — and not
-    /// an exec the kernel did not describe.
+    /// The program is the system's tool by device and inode: the file
+    /// `/usr/bin/kmod` resolves to (a link to it executes that file), not
+    /// another file — a file of its own under a tool's name included (DC-5)
+    /// — and not an exec the kernel did not describe; `/bin/kmod` where
+    /// there is no `/usr/bin/kmod`.
     #[test]
     fn the_program_is_the_system_s_tool_by_device_and_inode() {
         let root = tempfile::tempdir().unwrap();
         let p = |rel: &str| root.path().join(rel);
         std::fs::create_dir_all(p("usr/bin")).unwrap();
         std::fs::create_dir_all(p("usr/sbin")).unwrap();
+        std::fs::create_dir_all(p("bin")).unwrap();
         std::fs::write(p("usr/bin/kmod"), b"\x7fELF kmod").unwrap();
         std::os::unix::fs::symlink("../bin/kmod", p("usr/sbin/modprobe")).unwrap();
         std::fs::write(p("usr/bin/copy"), b"\x7fELF kmod").unwrap();
+        // where the distribution installs nothing: a file of its own
+        std::fs::write(p("usr/bin/modprobe"), b"\x7fELF kmod").unwrap();
+        std::fs::write(p("bin/kmod"), b"\x7fELF another kmod").unwrap();
         let id = |rel: &str, known: bool| {
             let m = std::fs::metadata(p(rel)).unwrap();
             ExeIdentity {
@@ -524,8 +592,13 @@ mod tests {
         };
         assert_eq!(program(root.path(), &id("usr/bin/kmod", true)), Ok(()));
         assert_eq!(program(root.path(), &id("usr/sbin/modprobe", true)), Ok(()));
-        let why = program(root.path(), &id("usr/bin/copy", true)).unwrap_err();
-        assert!(why.contains("is not the system's module tool"), "{why}");
+        for other in ["usr/bin/copy", "usr/bin/modprobe", "bin/kmod"] {
+            let why = program(root.path(), &id(other, true)).unwrap_err();
+            assert!(
+                why.contains("is not the system's module tool"),
+                "{other}: {why}"
+            );
+        }
         let why = program(root.path(), &id("usr/bin/kmod", false)).unwrap_err();
         assert!(why.contains("did not describe the file"), "{why}");
         // the stat's device in the kernel's encoding, not stat()'s
@@ -534,6 +607,13 @@ mod tests {
         if raw.dev != stat_dev_to_kernel_dev(raw.dev) {
             assert!(program(root.path(), &raw).is_err());
         }
+        // no /usr/bin/kmod: /bin/kmod's file
+        let bin_kmod = id("bin/kmod", true);
+        std::fs::remove_file(p("usr/bin/kmod")).unwrap();
+        assert_eq!(program(root.path(), &bin_kmod), Ok(()));
+        // neither: nothing is the system's tool
+        std::fs::remove_file(p("bin/kmod")).unwrap();
+        assert!(program(root.path(), &bin_kmod).is_err());
     }
 
     /// Only an exec whose `comm` is a module tool's is read; its facts are

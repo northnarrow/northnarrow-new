@@ -90,27 +90,38 @@ posture, as before.
 R011's kill existed before Wave 4 and stays in `OBSERVING_KILLS` below; lot
 279 narrows it and adds no kill. An exec of the system's module tool by
 module name — plain names, before the first name only options that move and
-force nothing, no `MODPROBE_OPTIONS` in its environment — is a High record
-(T1547.006), not killed, in every posture. Killed as before, in every
-posture: `insmod`; `modprobe` of a path or a `.ko*` name; `-C`, `-d`, `-S`,
-`--force*`, `-o`, `--remove-holders`, `--remove-dependencies`; any argument
-starting with `-` after the first name (`modprobe <name> -q` included); a
-copy of the tool or a program that is not the system's (by device and
-inode); `MODPROBE_OPTIONS`, or a running process whose environment the agent
-could not read at the exec or whose pid names another process; an argv not
-read whole. A tool that had exited before the agent could read its
-environment is recorded, noting it — a kill would reach no one. R011 resolves nothing: whether a name
-loads a module, and which, is the kernel's to judge. R018 records the load
-(`kernel_read_file`, the file's path) and kills the loader of a file outside
-the module directories, or of an unowned one by a loader it does not
-expect — after the load: it observes, it does not deny. What prevents a load
-is the kernel's module signature enforcement and lockdown (the host check
-reports both) and lot 285's deny of an untrusted file. What R011 never saw,
-as before: a root process loading a module with its own `finit_module(2)`,
-and the `install`/`remove` commands of root's `modprobe.d`, which run as
-programs the exec rules judge. Why: the container runtimes, kube-proxy and
-k3s run `modprobe` of the distribution's netfilter, bridge and overlay
-modules (lot 275's lab: rootful podman's network killed on Ubuntu 22.04). No
+force nothing, no `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or
+`LD_LIBRARY_PATH` in its environment — is a High record (T1547.006), not
+killed, in every posture. Killed as before, in every posture: `insmod`;
+`modprobe` of a path or a `.ko*` name; `-C`, `-d`, `-S`, `--force*`, `-o`,
+`--remove-holders`, `--remove-dependencies`; any argument starting with `-`
+after the first name (`modprobe <name> -q` included); a copy of the tool or
+a program that is not the system's (its device and inode against the file
+`/usr/bin/kmod` resolves to); one of those variables, a running process
+whose environment the agent could not read at the exec, an environment over
+1 MiB, an unknown start; an argv not read whole. A tool that had exited
+before the agent could read its environment is recorded, its environment
+not verified — a kill would reach no one; for a short-lived `modprobe` the
+environment's check is best effort. R011 resolves nothing: whether a name
+loads a module, and which, is the kernel's to judge — its module signature
+enforcement and lockdown (the host check reports both) and lot 285's deny of
+an untrusted file are what prevent a load. R018 judges the loads the kernel
+reports, after them (it observes, it denies nothing): no verdict for a
+kernel thread's child; the loader's tree killed for a file outside the
+module directories; for an unowned file in them a kill, or a Log when the
+loader or its parent is in R018's loader allowlist (`systemd-udevd`,
+`systemd-modules`, `kmod`: comms); no verdict for a packaged file loaded by
+those, a Log by another loader; every load a journal line. Taking `kmod` out
+of that allowlist goes with lot 285's redesign of R018. What R011 never
+covered: a root process loading a module with its own `finit_module(2)` (with
+comm `kmod`, maybe no verdict at all), a root parent tracing the tool and
+rewriting its argv or environment after the agent read them. The
+`install`/`remove` commands of root's `modprobe.d` run as programs the exec
+rules judge; before lot 279 a user-space `modprobe` was killed, its command
+then usually not run — the residual and `modprobe.d`'s coverage are in
+`TAPPA9_FIM_TRUST_MODEL.md`. Why: the container runtimes, kube-proxy and k3s
+run `modprobe` of the distribution's netfilter, bridge and overlay modules
+(lot 275's lab: rootful podman's network killed on Ubuntu 22.04). No
 directive restores the kill of a recorded exec: `enforce R011` runs R011's
 own response, which for it is the record.
 
