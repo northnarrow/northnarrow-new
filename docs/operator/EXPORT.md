@@ -119,8 +119,9 @@ nothing is exported. A file whose signature does not verify: **refused**
   no capability, `nice` 10 — never the decision thread, never a lock of the
   evidence writers'), row after row after each sink's cursor, verbatim. It
   parses nothing of a row but its seal's hashes.
-- The **export worker** — the agent's binary as `northnarrow-worker`,
-  sandboxed (§5) — verifies each row with the agent's public key, maps it to
+- The **export worker** — the agent's binary as `northnarrow-export`, an
+  account of its own (not the parse worker's: it alone writes the export's
+  directory), sandboxed (§5) — verifies each row with the agent's public key, maps it to
   OCSF, writes it to its sink and says which rows are delivered.
 - The core moves each sink's **cursor** past the delivered rows only, and
   writes the cursors (`/var/lib/northnarrow/detections/export-cursors.json`,

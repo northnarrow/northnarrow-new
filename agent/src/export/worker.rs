@@ -1,5 +1,5 @@
 //! The `export` worker's life (lot 276): `northnarrow-agent --worker export
-//! --ipc-fd 3`, started by the core as `northnarrow-worker`. Its sandbox
+//! --ipc-fd 3`, started by the core as `northnarrow-export` (its own account). Its sandbox
 //! first (`nn_linux::sandbox::Profile::export`: Landlock with its one
 //! directory, the seccomp allowlist of its sinks), then each request
 //! answered by nn-export's worker state — the only process where rows are

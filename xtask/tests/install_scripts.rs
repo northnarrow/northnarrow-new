@@ -2703,11 +2703,15 @@ esac"#,
         .lines()
         .map(str::to_string)
         .collect();
-    let left = ["northnarrow-scan", "northnarrow-worker"]
-        .iter()
-        .filter(|u| dir.join(format!("user.{u}")).exists())
-        .map(|u| u.to_string())
-        .collect();
+    let left = [
+        "northnarrow-scan",
+        "northnarrow-worker",
+        "northnarrow-export",
+    ]
+    .iter()
+    .filter(|u| dir.join(format!("user.{u}")).exists())
+    .map(|u| u.to_string())
+    .collect();
     (
         Run {
             status: out.status.code().unwrap_or(-1),
@@ -2748,10 +2752,12 @@ fn check_accounts_body() -> String {
         .join("\n");
     assert_eq!(
         calls,
-        "check_system_user \"$SCAN_USER\"\ncheck_system_user \"$WORKER_USER\""
+        "check_system_user \"$SCAN_USER\"\ncheck_system_user \"$WORKER_USER\"\n\
+         check_system_user \"$EXPORT_USER\""
     );
     format!(
         "SCAN_USER=northnarrow-scan\nWORKER_USER=northnarrow-worker\n\
+         EXPORT_USER=northnarrow-export\n\
          LOGIN_DEFS=$NN_TEST_DIR/login.defs\nPROC_ROOT=$NN_TEST_DIR/proc\n{block}\n{calls}"
     )
 }
@@ -2955,8 +2961,19 @@ fn install_creates_the_worker_and_scanner_accounts() {
     let body = install_accounts_body();
     let (r, left) = accounts_run("accounts-new", &body, &[], true);
     assert!(r.stdout.contains("RESULT ok"), "{r:#?}");
-    assert_eq!(left, ["northnarrow-scan", "northnarrow-worker"]);
-    for u in ["northnarrow-scan", "northnarrow-worker"] {
+    assert_eq!(
+        left,
+        [
+            "northnarrow-scan",
+            "northnarrow-worker",
+            "northnarrow-export"
+        ]
+    );
+    for u in [
+        "northnarrow-scan",
+        "northnarrow-worker",
+        "northnarrow-export",
+    ] {
         let call = r
             .calls
             .iter()
@@ -2975,8 +2992,9 @@ fn install_creates_the_worker_and_scanner_accounts() {
     }
     let (r, _) = accounts_run("accounts-kept", &body, &["northnarrow-worker"], true);
     assert!(r.stdout.contains("RESULT ok"), "{r:#?}");
-    assert_eq!(r.calls.len(), 1, "only the missing one: {r:#?}");
+    assert_eq!(r.calls.len(), 2, "only the missing ones: {r:#?}");
     assert!(r.calls[0].ends_with(" northnarrow-scan"));
+    assert!(r.calls[1].ends_with(" northnarrow-export"));
     let (r, left) = accounts_run("accounts-no-useradd", &body, &[], false);
     assert!(r.stdout.contains("RESULT ok"), "{r:#?}");
     assert!(left.is_empty());
@@ -3005,14 +3023,22 @@ fn uninstall_removes_the_worker_and_scanner_accounts() {
     let (r, left) = accounts_run(
         "accounts-removed",
         &body,
-        &["northnarrow-scan", "northnarrow-worker"],
+        &[
+            "northnarrow-scan",
+            "northnarrow-worker",
+            "northnarrow-export",
+        ],
         true,
     );
     assert!(r.stdout.contains("RESULT ok"), "{r:#?}");
     assert!(left.is_empty(), "{left:?}");
     assert_eq!(
         r.calls,
-        ["userdel northnarrow-scan", "userdel northnarrow-worker"]
+        [
+            "userdel northnarrow-scan",
+            "userdel northnarrow-worker",
+            "userdel northnarrow-export"
+        ]
     );
     let (r, _) = accounts_run("accounts-one-left", &body, &["northnarrow-worker"], true);
     assert_eq!(r.calls, ["userdel northnarrow-worker"]);

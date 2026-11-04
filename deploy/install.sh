@@ -254,6 +254,9 @@ SCAN_BIN="$TARGET_DIR/northnarrow-scan"
 SCAN_USER=northnarrow-scan
 # R14a: the account of the agent's workers (created below).
 WORKER_USER=northnarrow-worker
+# Lot 276 (review of #499, D1): the export worker's own account, the one
+# that owns the export's directory (created below).
+EXPORT_USER=northnarrow-export
 # Review of #480 (F11): where the system accounts' uid and gid ranges are,
 # and the processes.
 LOGIN_DEFS=${LOGIN_DEFS:-/etc/login.defs}
@@ -1386,6 +1389,7 @@ check_system_user() {   # <name>
 # <<< system_user_check
 check_system_user "$SCAN_USER"
 check_system_user "$WORKER_USER"
+check_system_user "$EXPORT_USER"
 fi
 
 # Lab PR 220: replacing an install is a transaction ("upgrade transaction" above):
@@ -1828,18 +1832,32 @@ ensure_system_user "$SCAN_USER" "NorthNarrow exec quarantine scanner" \
     "the exec quarantine cannot start its scanner"
 ensure_system_user "$WORKER_USER" "NorthNarrow agent workers" \
     "the agent cannot start its workers (a signed degradation: their enrichment is off)"
+ensure_system_user "$EXPORT_USER" "NorthNarrow export worker" \
+    "the agent cannot start its export worker (a signed degradation when an export is configured)"
 
 # Lot 276: the export's JSONL files (docs/operator/EXPORT.md) — the one
-# directory the export worker's Landlock rule lets it write, its account's
-# (0750; a log shipper reads it as root, or is given the group). Created
-# whether or not an export is configured: off without a signed
+# directory the export worker's Landlock rule lets it write, its own
+# account's: only that account writes it (the parse worker's cannot, review
+# of #499 D1); 0755 so that the core's export thread, which holds no
+# capability, sees each file's name and size (its bound on the directory,
+# D5) — the files themselves are 0600 (a log shipper reads them as root).
+# Created whether or not an export is configured: off without a signed
 # export.local, and empty. The agent's unit makes it writable
-# (`ReadWritePaths=-/var/log/northnarrow/export`).
+# (`ReadWritePaths=-/var/log/northnarrow/export`). Never through a link
+# planted where it goes.
 EXPORT_DIR=${EXPORT_DIR:-/var/log/northnarrow/export}
+for d in "$(dirname "$EXPORT_DIR")" "$EXPORT_DIR"; do
+    if [[ -L $d ]]; then
+        echo "install.sh: $d is a symbolic link: refused (remove it, then install again)" >&2
+        exit 1
+    fi
+done
 install -d -m 0755 -o root -g root "$(dirname "$EXPORT_DIR")"
 # (no account: no directory — an export's file sink then says why, signed)
-if getent passwd "$WORKER_USER" >/dev/null; then
-    install -d -m 0750 -o "$WORKER_USER" -g "$WORKER_USER" "$EXPORT_DIR"
+if getent passwd "$EXPORT_USER" >/dev/null; then
+    install -d -m 0755 -o "$EXPORT_USER" -g "$EXPORT_USER" "$EXPORT_DIR"
+    chown "$EXPORT_USER:$EXPORT_USER" "$EXPORT_DIR"
+    chmod 0755 "$EXPORT_DIR"
 fi
 
 # Debian-family kernels carry a distro patch that makes

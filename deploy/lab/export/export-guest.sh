@@ -279,7 +279,8 @@ sys.exit(0 if e["state"] == "on" and e["worker"] == "ready" else 1)' "$OUT/statu
     check worker-process "an nn-worker-exp process, child of the agent" test -n "$w"
     if [ -n "$w" ]; then
         grep -E '^(Uid|Gid|Groups|NoNewPrivs|Seccomp|CapInh|CapPrm|CapEff|CapAmb):' "/proc/$w/status" > "$OUT/worker-status.txt"
-        check worker-account "the worker runs as northnarrow-worker" bash -c "[ \"\$(stat -c %U /proc/$w)\" = northnarrow-worker ]"
+        check worker-account "the worker runs as northnarrow-export (its own account)" bash -c "[ \"\$(stat -c %U /proc/$w)\" = northnarrow-export ]"
+        check export-dir "the export directory is the export account's alone to write" bash -c "[ \"\$(stat -c %U:%a $EXPORT_DIR)\" = northnarrow-export:755 ]"
         check worker-nnp "no_new_privs, seccomp filter, no capability" bash -c "grep -q 'NoNewPrivs:.1' '$OUT/worker-status.txt' && grep -q 'Seccomp:.2' '$OUT/worker-status.txt' && grep -q 'CapEff:.0000000000000000' '$OUT/worker-status.txt'"
         check worker-parent "its parent is the agent" bash -c "[ \"\$(ps -o ppid= -p $w | tr -d ' ')\" = \"$(agent_pid)\" ]"
         ls -l "/proc/$w/fd" > "$OUT/worker-fds.txt" 2>&1

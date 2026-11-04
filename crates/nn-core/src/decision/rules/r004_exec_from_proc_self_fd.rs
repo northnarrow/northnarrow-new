@@ -60,6 +60,9 @@ pub struct OwnWorkerLaunch {
     pub image: (u64, u64),
     /// The `northnarrow-worker` account's uid.
     pub uid: u32,
+    /// Lot 276: the export worker's account's (`northnarrow-export`;
+    /// `None`: no such account, no export worker).
+    pub export_uid: Option<u32>,
 }
 
 impl OwnWorkerLaunch {
@@ -72,18 +75,27 @@ impl OwnWorkerLaunch {
         exe: &nn_model::ExeIdentity,
     ) -> bool {
         use common::wire::exe::exe_flags::KNOWN;
-        let argv_ok = matches!(
-            argv,
+        let kind = match argv {
             [a0, w, kind, f, three]
                 if a0 == "northnarrow-agent"
                     && w == "--worker"
-                    && nn_proto::ipc::WorkerKind::from_name(kind).is_some()
                     && f == "--ipc-fd"
-                    && three == "3"
-        );
+                    && three == "3" =>
+            {
+                nn_proto::ipc::WorkerKind::from_name(kind)
+            }
+            _ => None,
+        };
+        // each kind its account: the export worker's is its own (lot 276)
+        let account = match kind {
+            Some(nn_proto::ipc::WorkerKind::Parse) => Some(self.uid),
+            Some(nn_proto::ipc::WorkerKind::Export) => self.export_uid,
+            None => None,
+        };
+        let argv_ok = kind.is_some();
         ppid == self.agent_pid
             && self.agent_pid != 0
-            && uid == self.uid
+            && account == Some(uid)
             && uid != 0
             && filename == self.exec_path
             && argv_ok
@@ -339,6 +351,7 @@ mod tests {
             exec_path: "/proc/self/fd/64".into(),
             image: (2049, 77),
             uid: 990,
+            export_uid: Some(989),
         };
         let rule = R004ExecFromProcSelfFd::default().with_own_launch(Some(own.clone()));
         let launch =
@@ -382,6 +395,50 @@ mod tests {
                 Default::default()
             ))
             .is_none());
+        // lot 276: the export worker, as its own account — and only so: as
+        // the parse worker's account, or the parse worker as the export's,
+        // fileless as ever
+        let export = ["northnarrow-agent", "--worker", "export", "--ipc-fd", "3"];
+        assert!(rule
+            .evaluate(&launch(
+                900,
+                989,
+                "/proc/self/fd/64",
+                &export,
+                Default::default()
+            ))
+            .is_none());
+        assert!(rule
+            .evaluate(&launch(
+                900,
+                990,
+                "/proc/self/fd/64",
+                &export,
+                Default::default()
+            ))
+            .is_some());
+        assert!(rule
+            .evaluate(&launch(
+                900,
+                989,
+                "/proc/self/fd/64",
+                &argv,
+                Default::default()
+            ))
+            .is_some());
+        let no_export = R004ExecFromProcSelfFd::default().with_own_launch(Some(OwnWorkerLaunch {
+            export_uid: None,
+            ..own.clone()
+        }));
+        assert!(no_export
+            .evaluate(&launch(
+                900,
+                989,
+                "/proc/self/fd/64",
+                &export,
+                Default::default()
+            ))
+            .is_some());
         // any fact off: fileless as ever
         for (what, e) in [
             (

@@ -258,7 +258,7 @@ impl Launcher for Scripted {
     fn unavailable(&self) -> Option<String> {
         None
     }
-    fn account(&self) -> Option<(u32, u32)> {
+    fn account(&self, _kind: WorkerKind) -> Option<(u32, u32)> {
         Some((UID, GID))
     }
     fn kernel_landlock_abi(&self) -> u8 {
@@ -763,6 +763,7 @@ fn an_unavailable_launcher_is_reported_once_and_never_started() {
         launcher: Arc::new(ImageLauncher {
             image: None,
             account: Err("no user".into()),
+            export_account: Err("no export account".into()),
             extra_args: vec![],
         }),
         roles,
@@ -877,7 +878,7 @@ impl Launcher for ShortLived {
     fn unavailable(&self) -> Option<String> {
         None
     }
-    fn account(&self) -> Option<(u32, u32)> {
+    fn account(&self, _kind: WorkerKind) -> Option<(u32, u32)> {
         Some((UID, GID))
     }
     fn kernel_landlock_abi(&self) -> u8 {
@@ -984,7 +985,7 @@ impl Launcher for Spinner {
     fn unavailable(&self) -> Option<String> {
         None
     }
-    fn account(&self) -> Option<(u32, u32)> {
+    fn account(&self, _kind: WorkerKind) -> Option<(u32, u32)> {
         Some((UID, GID))
     }
     fn kernel_landlock_abi(&self) -> u8 {
@@ -1100,6 +1101,7 @@ fn a_worker_is_started_from_the_supervisor_s_thread_only() {
     let launcher = ImageLauncher {
         image: None,
         account: Err("none".into()),
+        export_account: Err("no export account".into()),
         extra_args: vec![],
     };
     let err = launcher.launch(WorkerKind::Parse).unwrap_err();
@@ -1166,7 +1168,7 @@ impl Launcher for Contradicted {
     fn unavailable(&self) -> Option<String> {
         None
     }
-    fn account(&self) -> Option<(u32, u32)> {
+    fn account(&self, _kind: WorkerKind) -> Option<(u32, u32)> {
         Some((UID, GID))
     }
     fn kernel_landlock_abi(&self) -> u8 {
@@ -1239,6 +1241,7 @@ fn the_image_launcher_reads_the_process_s_own_status() {
     let launcher = ImageLauncher {
         image: None,
         account: Err("none".into()),
+        export_account: Err("no export account".into()),
         extra_args: Vec::new(),
     };
     // SAFETY: getuid and getgid have no preconditions.

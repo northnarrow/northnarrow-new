@@ -229,8 +229,8 @@ pub struct WorkerStatus {
 pub trait Launcher: Send + Sync {
     /// Why no worker can be started at all (`None`: they can).
     fn unavailable(&self) -> Option<String>;
-    /// The account a worker must declare in its hello.
-    fn account(&self) -> Option<(u32, u32)>;
+    /// The account a worker of `kind` must declare in its hello.
+    fn account(&self, kind: WorkerKind) -> Option<(u32, u32)>;
     /// Start a `kind` worker: the child and the core's end of its channel.
     fn launch(&self, kind: WorkerKind) -> std::io::Result<Spawned>;
     /// The kernel's Landlock ABI a worker's hello is checked against
@@ -252,9 +252,23 @@ pub trait Launcher: Send + Sync {
 pub struct ImageLauncher {
     /// `None`: the image could not be opened at boot.
     pub image: Option<SelfImage>,
+    /// The parse worker's account (`northnarrow-worker`).
     pub account: Result<WorkerAccount, String>,
+    /// The export worker's (`northnarrow-export`, lot 276): another account,
+    /// the one that owns the export's directory.
+    pub export_account: Result<WorkerAccount, String>,
     /// Arguments after the worker's own (the lab harness's).
     pub extra_args: Vec<String>,
+}
+
+impl ImageLauncher {
+    /// The account a worker of `kind` runs as.
+    fn account_of(&self, kind: WorkerKind) -> Result<&WorkerAccount, &String> {
+        match kind {
+            WorkerKind::Parse => self.account.as_ref(),
+            WorkerKind::Export => self.export_account.as_ref(),
+        }
+    }
 }
 
 impl Launcher for ImageLauncher {
@@ -268,8 +282,8 @@ impl Launcher for ImageLauncher {
             _ => None,
         }
     }
-    fn account(&self) -> Option<(u32, u32)> {
-        self.account.as_ref().ok().map(|a| (a.uid, a.gid))
+    fn account(&self, kind: WorkerKind) -> Option<(u32, u32)> {
+        self.account_of(kind).ok().map(|a| (a.uid, a.gid))
     }
     fn launch(&self, kind: WorkerKind) -> std::io::Result<Spawned> {
         // PR_SET_PDEATHSIG fires when the thread that forked exits: only
@@ -285,11 +299,18 @@ impl Launcher for ImageLauncher {
                 ),
             ));
         }
-        match (&self.image, &self.account) {
+        match (&self.image, self.account_of(kind)) {
             (Some(image), Ok(account)) => spawn(image, kind, account, &self.extra_args),
-            _ => Err(std::io::Error::new(
+            (None, _) => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "no image or no account",
+                "no image",
+            )),
+            (_, Err(e)) => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "no {} account ({e}): reinstall the agent, which creates it",
+                    super::account_name(kind)
+                ),
             )),
         }
     }
@@ -688,7 +709,7 @@ impl Workers {
                     }
                     Err(v) => return self.violation(kind, s, v),
                 };
-                let Some((uid, gid)) = self.0.launcher.account() else {
+                let Some((uid, gid)) = self.0.launcher.account(kind) else {
                     return;
                 };
                 let want = Expected {

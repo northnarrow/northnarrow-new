@@ -756,6 +756,7 @@ fn the_workers_entries_say_their_state_and_why() {
         launcher: Arc::new(ImageLauncher {
             image: None,
             account: Err("no user".into()),
+            export_account: Err("no export account".into()),
             extra_args: Vec::new(),
         }),
         roles: Arc::new(NoPidRoles),

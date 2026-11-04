@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use nn_linux::worker::supervisor::{Config, ImageLauncher, NoPidRoles, PidRoles, PinnedPidRoles};
-use nn_linux::worker::{SelfImage, WorkerAccount, Workers, WORKER_USER};
+use nn_linux::worker::{SelfImage, WorkerAccount, Workers, EXPORT_USER, WORKER_USER};
 use nn_proto::ipc::WorkerKind;
 use tracing::{info, warn};
 
@@ -34,6 +34,7 @@ pub(crate) fn own_launch(
         exec_path: image.exec_path(),
         image: image.identity(),
         uid: account.uid,
+        export_uid: WorkerAccount::lookup(EXPORT_USER).ok().map(|a| a.uid),
     })
 }
 
@@ -49,6 +50,7 @@ pub(crate) fn start(cli: &Cli, image: std::io::Result<SelfImage>, export_on: boo
         }
     };
     let account = WorkerAccount::lookup(WORKER_USER);
+    let export_account = WorkerAccount::lookup(EXPORT_USER);
     // R14b: no role until this boot's deny hooks are attached ([`arm`]):
     // an earlier boot's pinned hooks read any entry as both roles
     let roles: Arc<dyn PidRoles> = Arc::new(NoPidRoles);
@@ -56,6 +58,7 @@ pub(crate) fn start(cli: &Cli, image: std::io::Result<SelfImage>, export_on: boo
         launcher: Arc::new(ImageLauncher {
             image,
             account,
+            export_account,
             extra_args: Vec::new(),
         }),
         roles,

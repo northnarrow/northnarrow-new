@@ -29,6 +29,11 @@ useradd --system --user-group --no-create-home --home-dir /nonexistent \
         --shell /usr/sbin/nologin --comment "NorthNarrow agent workers" northnarrow-worker
 ```
 
+Lot 276: the export worker runs as an account of its own,
+`northnarrow-export`, created and checked the same way, which owns the
+export's directory (`/var/log/northnarrow/export`, 0755, its files 0600):
+the parse worker's account cannot write there.
+
 It owns no file. `uninstall.sh` (and the packages' removal) deletes it with
 its group, as it deletes `northnarrow-scan`.
 

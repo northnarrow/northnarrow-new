@@ -149,7 +149,7 @@ start_agent_for_window() {
 echo "NorthNarrow uninstall"
 echo "  binaries : $BIN_DIR/{northnarrow-agent,northnarrow-watchdog,nn-admin,northnarrow-scan}"
 echo "  units    : $UNIT_DIR/northnarrow-{agent,watchdog,watchdog-failed}.service"
-echo "  accounts : northnarrow-scan, northnarrow-worker"
+echo "  accounts : northnarrow-scan, northnarrow-worker, northnarrow-export"
 echo "  bpffs    : $BPFFS_ROOT"
 if (( PURGE )); then
     echo "  PURGE    : $ETC_DIR (admin keys, audit chain, agent identity)"
@@ -369,7 +369,7 @@ done
 # scanner, R14a's workers. Their processes ended with the agent (a worker
 # dies with its core). userdel removes each one's own group too.
 # >>> remove_users
-for u in northnarrow-scan northnarrow-worker; do
+for u in northnarrow-scan northnarrow-worker northnarrow-export; do
     if getent passwd "$u" >/dev/null 2>&1 && command -v userdel >/dev/null 2>&1; then
         log "removing the system account $u"
         userdel "$u" 2>/dev/null || log "userdel $u failed — remove it by hand"
