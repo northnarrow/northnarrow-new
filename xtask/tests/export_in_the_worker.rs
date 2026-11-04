@@ -150,20 +150,34 @@ fn a_planted_call_in_the_core_fails() {
 /// fails the day it takes more.
 #[test]
 fn the_provider_takes_only_alg_ids_of_its_webpki() {
-    let meta = support::cargo_metadata(&[]);
-    let pkg = meta["packages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == "rustls-rustcrypto")
+    // the version locked (the lockfile, not `cargo metadata`: offline, that
+    // wants every target's packages downloaded — CI's test job has only
+    // its own, #499's first run)
+    let lock = fs::read_to_string(repo_root().join("Cargo.lock")).unwrap();
+    let at = lock
+        .find("name = \"rustls-rustcrypto\"\nversion = \"")
         .expect("rustls-rustcrypto is locked");
+    let version: String = lock[at..]
+        .lines()
+        .nth(1)
+        .unwrap()
+        .trim_start_matches("version = \"")
+        .trim_end_matches('"')
+        .to_string();
     assert_eq!(
-        pkg["version"], "0.0.2-alpha",
+        version, "0.0.2-alpha",
         "re-check the advisories' entries for a new release"
     );
-    let src = PathBuf::from(pkg["manifest_path"].as_str().unwrap())
-        .parent()
-        .unwrap()
+    // its sources, where cargo unpacked them (the build before the tests)
+    let home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cargo"));
+    let src = fs::read_dir(home.join("registry/src"))
+        .expect("cargo's registry")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().join(format!("rustls-rustcrypto-{version}")))
+        .find(|p| p.is_dir())
+        .expect("rustls-rustcrypto's sources unpacked (build the workspace once)")
         .join("src");
     let mut uses = Vec::new();
     for f in rs_files(&src) {
