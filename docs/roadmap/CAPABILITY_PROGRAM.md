@@ -5403,11 +5403,20 @@ number in parentheses is a lab PR.
     the mutation tree (no test ran): not counted until the start's
     reporting got its test (`boot::policy`), which catches MD7 and MD8.
     The reviews: set E (27, D1–D4 and N2) 27 caught, set F (16, R1–R3) 16
-    caught — MF10 and MF11 once their tests were added; the nn-linux ones
-    counted only from a mutation tree with a fresh eBPF stamp, and a catch
-    only with a failing test named. The eBPF is covered by the lab
-    (verifier, MS28–MS31, the privileged e2e tests), the lab helpers by
-    their selftests.
+    caught — MF10 and MF11 once their tests were added; the final check:
+    set G (13 — C1's host file: no check, an unreadable or any file the
+    host's, the file read in the process's view, the path taken for the
+    image, the device or the inode dropped, the link not followed; N1's
+    window: an earlier reading re-arming it, open-ended, not restarted, a
+    second long, the degradation from the agent's clock) 13 caught. The
+    nn-linux ones counted only from a mutation tree with a fresh eBPF
+    stamp, and a catch only with a failing test named. The eBPF is covered
+    by the lab (verifier, MS28–MS32, the privileged e2e tests), the lab
+    helpers by their selftests. The CI's fuzz smoke run found
+    crash-8a7b232e in `dns_records`: the property's least record size
+    assumed a two-byte owner name, and the root is one byte (a root-named
+    A record reads in 15) — the parser right, the property fixed, the
+    input kept as a regression with the parser's test.
   - Level: C07 1 → 2. Inbound connections, DNS answers and TLS
     fingerprints in the flow record are present and tested in the lab on
     both kernel classes: MS28–MS30 (and MS31) PASS on 5.15 (round 4) and

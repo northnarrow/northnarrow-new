@@ -451,7 +451,9 @@ fi
 # only it looked up (resolvectl, its cache flushed first: no process of
 # this lineage receives a response) binds every process to the address as
 # another lineage's: one datagram there (port 9, discard) is judged
-# other_lineage on its row, NN-L-NET-028 never Medium for it.
+# other_lineage — NN-L-NET-028's record for it is Low, never Medium
+# (unresolved). The netflow log's rows do not carry the judgement: the
+# records do.
 if want MS32; then
     rpid=$(systemctl show -p MainPID --value systemd-resolved 2>/dev/null)
     if [[ ${rpid:-0} -gt 0 ]] && command -v resolvectl >/dev/null; then
@@ -461,15 +463,13 @@ if want MS32; then
         addr=$(resolvectl query -4 --legend=no example.net 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
         if [[ -n $addr ]]; then
             b=$(det_count)
-            before=$(sudo cat "$NETFLOW" 2>/dev/null | wc -l)
             python3 -I -c 'import socket, sys; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b"nn-ms", (sys.argv[1], 9))' "$addr" &
             p=$!; wait $p
             sleep 3
-            res=$(sudo tail -n "+$(( before + 1 ))" "$NETFLOW" 2>/dev/null \
-                | jq -r --argjson p "$p" 'select(.pid == $p and .dst_port == 9) | .dns_resolution // "not_judged"' 2>/dev/null | tail -1)
+            low=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --in-matches --severity Low --pid "$p")
             med=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --in-matches --severity Medium --pid "$p")
-            ok=1; [[ $res == other_lineage && $med -eq 0 ]] && ok=0
-            outcome MS32 $ok "a datagram to $addr (example.net, looked up by systemd-resolved only, pid $rpid in $ns_own, init in $ns_init): dns_resolution=${res:-none}, NET-028 Medium=$med" \
+            ok=1; [[ $low -ge 1 && $med -eq 0 ]] && ok=0
+            outcome MS32 $ok "a datagram to $addr (example.net, looked up by systemd-resolved only, pid $rpid in $ns_own, init in $ns_init): NET-028 Low (other_lineage)=$low, Medium (unresolved)=$med" \
                 "systemd-resolved's response binds no other process (the resolver not recognized)"
         else
             skip MS32 "resolvectl does not resolve example.net on this guest: not run"
