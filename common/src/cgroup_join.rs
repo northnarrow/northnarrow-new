@@ -74,7 +74,9 @@ pub const LOST_SLOTS: u32 = PID_LIMIT / LOST_BYTES as u32;
 pub const PIN_SCHEMA: u32 = 1;
 
 /// The name's part before the schema of the tracker's pin directory:
-/// `<pin root><PIN_DIR_INFIX><schema>.<generation>`.
+/// `<pin root><PIN_DIR_INFIX><schema>_<generation>` — no dot: bpffs refuses
+/// a name with one (`bpf_lookup`, v5.15 and v6.8 `kernel/bpf/inode.c`:
+/// "dots in names … are reserved", EPERM; lot 277's lab).
 pub const PIN_DIR_INFIX: &str = "-cgroup-join-v";
 
 /// `CGROUP_JOIN_EPOCH`: `[CLOCK_MONOTONIC ns, CLOCK_BOOTTIME ns]` of the
@@ -87,11 +89,11 @@ pub const PIN_DIR_INFIX: &str = "-cgroup-join-v";
 pub const EPOCH_SLOTS: u32 = 2;
 
 /// The tracker's pin directory for pin root `root`, generation `gen`:
-/// `/sys/fs/bpf/northnarrow-cgroup-join-v1.0`. A sibling of the root, so a
+/// `/sys/fs/bpf/northnarrow-cgroup-join-v1_0`. A sibling of the root, so a
 /// purge of the root leaves it.
 #[cfg(feature = "std")]
 pub fn pin_dir(root: &str, gen: u32) -> String {
-    format!("{root}{PIN_DIR_INFIX}{PIN_SCHEMA}.{gen}")
+    format!("{root}{PIN_DIR_INFIX}{PIN_SCHEMA}_{gen}")
 }
 
 /// `name` (a file name in the root's parent) as a tracker pin directory of
@@ -105,7 +107,7 @@ pub fn parse_pin_dir(root_name: &str, name: &str) -> Option<(u32, Option<u32>)> 
             .then(|| v.parse::<u32>().ok())
             .flatten()
     };
-    if let Some((schema, gen)) = rest.split_once('.') {
+    if let Some((schema, gen)) = rest.split_once('_') {
         return Some((num(schema)?, Some(num(gen)?)));
     }
     let (schema, size) = rest.split_once('-')?;
@@ -452,12 +454,18 @@ mod tests {
     fn the_tracker_pins_are_named_by_schema_and_generation_beside_the_root() {
         assert_eq!(
             pin_dir("/sys/fs/bpf/northnarrow", 0),
-            format!("/sys/fs/bpf/northnarrow-cgroup-join-v{PIN_SCHEMA}.0")
+            format!("/sys/fs/bpf/northnarrow-cgroup-join-v{PIN_SCHEMA}_0")
         );
         assert!(!pin_dir("/sys/fs/bpf/northnarrow", 3).starts_with("/sys/fs/bpf/northnarrow/"));
+        // bpffs refuses a name with a dot (EPERM)
+        assert!(!pin_dir("/sys/fs/bpf/northnarrow", 7)
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .contains('.'));
         for (name, want) in [
-            ("northnarrow-cgroup-join-v1.0", (1, Some(0))),
-            ("northnarrow-cgroup-join-v2.17", (2, Some(17))),
+            ("northnarrow-cgroup-join-v1_0", (1, Some(0))),
+            ("northnarrow-cgroup-join-v2_17", (2, Some(17))),
             ("northnarrow-cgroup-join-v1-63222", (1, None)),
             ("northnarrow-cgroup-join-v0-4194304", (0, None)),
         ] {
@@ -467,15 +475,16 @@ mod tests {
         for no in [
             "northnarrow",
             "northnarrow-cgroup-join-v1",
-            "northnarrow-cgroup-join-v1.",
+            "northnarrow-cgroup-join-v1_",
+            "northnarrow-cgroup-join-v1.0",
             "northnarrow-cgroup-join-v1-",
-            "northnarrow-cgroup-join-v.1",
-            "northnarrow-cgroup-join-vx.0",
-            "northnarrow-cgroup-join-v1.0x",
+            "northnarrow-cgroup-join-v_1",
+            "northnarrow-cgroup-join-vx_0",
+            "northnarrow-cgroup-join-v1_0x",
             "northnarrow-cgroup-join-v1-64x",
-            "northnarrow-cgroup-join-v1.99999999999",
-            "other-cgroup-join-v1.0",
-            "northnarrowx-cgroup-join-v1.0",
+            "northnarrow-cgroup-join-v1_99999999999",
+            "other-cgroup-join-v1_0",
+            "northnarrowx-cgroup-join-v1_0",
         ] {
             assert!(!is_pin_dir_of("northnarrow", no), "{no}");
         }

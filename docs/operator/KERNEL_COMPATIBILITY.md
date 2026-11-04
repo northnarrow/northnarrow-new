@@ -853,7 +853,7 @@ starts with a signed `subsystem_degraded` "cgroup exemptions", and every
 exemption by cgroup or unit is refused there. An optional offset absent
 makes the tracker absent (`btf_revalidate`), never a tracker reading a
 sentinel. The programs' links and the four maps are pinned beside the pin root, in
-`/sys/fs/bpf/northnarrow-cgroup-join-v<schema>.<generation>` (recorded in
+`/sys/fs/bpf/northnarrow-cgroup-join-v<schema>_<generation>` (recorded in
 `/run/northnarrow/cgroup-join-pins`): they go on marking while the agent
 is stopped and through `install.sh --upgrade`, which purges the pin root
 only. The marks' map is sized when it is made to `kernel.pid_max` capped

@@ -1360,7 +1360,7 @@ programs are: a stopped agent leaves the tracker marking. Their pins and
 the four maps' (`CGROUP_JOINED`, `CGROUP_JOIN_LOST`, `CGROUP_JOIN_STATS`,
 `CGROUP_JOIN_EPOCH`) are in a directory of the tracker's own **beside**
 the pin root, not in it (the re-review of #494, R2):
-`/sys/fs/bpf/northnarrow-cgroup-join-v<schema>.<generation>`.
+`/sys/fs/bpf/northnarrow-cgroup-join-v<schema>_<generation>` (no dot: bpffs refuses one in a name, `bpf_lookup`; the third review's first lab run found it, the directory refused with EPERM and the tracker absent).
 `install.sh --upgrade` purges the pin root so that every LSM program
 detaches (`purge_pin_root`); the review's version had the tracker's pins
 there, so an upgrade dropped every mark. Now the purge leaves the

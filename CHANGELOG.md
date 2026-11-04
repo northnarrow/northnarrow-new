@@ -59,7 +59,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     test of a full map; the lab's `tracker-persist-check` (an agent stop,
     an upgrade, the pins' protection) and `fork-cost`.
   - The third review of #494: the tracker's directory is named by schema
-    and generation (`…-cgroup-join-v1.<n>`), not by the marks' size — a
+    and generation (`…-cgroup-join-v1_<n>`), not by the marks' size — a
     larger size asked later keeps the map, a signed note; a start adopts
     only the directory its predecessor of this boot recorded in
     `/run/northnarrow/cgroup-join-pins` (protected), each map checked

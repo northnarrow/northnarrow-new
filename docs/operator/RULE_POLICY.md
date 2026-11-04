@@ -115,7 +115,7 @@ signed without a name while any such exemption is in force.
 
 The tracker's programs and maps are pinned like the other anti-tamper
 programs (the review of #494, D6), in a directory of their own beside the
-pin root: `/sys/fs/bpf/northnarrow-cgroup-join-v<schema>.<generation>`
+pin root: `/sys/fs/bpf/northnarrow-cgroup-join-v<schema>_<generation>`
 (the re-review of #494, R2), recorded in
 `/run/northnarrow/cgroup-join-pins`. Stopping the agent leaves them
 attached, and the marks go on being made and passed on; `install.sh

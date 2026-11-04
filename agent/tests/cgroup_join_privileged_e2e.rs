@@ -772,11 +772,11 @@ fn a_planted_tracker_directory_is_never_adopted() {
     let gen = before
         .dir
         .to_string_lossy()
-        .rsplit_once('.')
+        .rsplit_once('_')
         .and_then(|(_, g)| g.parse::<u32>().ok())
         .expect("a generation");
     let planted = format!(
-        "{}{}{}.{}",
+        "{}{}{}_{}",
         root().display(),
         ::common::cgroup_join::PIN_DIR_INFIX,
         ::common::cgroup_join::PIN_SCHEMA,

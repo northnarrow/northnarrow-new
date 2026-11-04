@@ -291,7 +291,7 @@ forked from one that was; the kernel's start-in-cgroup tracker marks the
 others. What an operator sees change:
 
 - **The tracker's pins are beside the pin root**:
-  `/sys/fs/bpf/northnarrow-cgroup-join-v<schema>.<generation>`, recorded
+  `/sys/fs/bpf/northnarrow-cgroup-join-v<schema>_<generation>`, recorded
   in `/run/northnarrow/cgroup-join-pins` (both protected like the agent's
   other files). `install.sh --upgrade` leaves them — the marks outlive
   the upgrade — and `uninstall.sh` removes them.

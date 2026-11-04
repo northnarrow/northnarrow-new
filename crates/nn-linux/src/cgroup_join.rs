@@ -1384,7 +1384,7 @@ mod tests {
     fn the_pin_state_reads_back_what_it_wrote_and_nothing_partial() {
         let st = PinState {
             boot: "b0".to_string(),
-            dir: PathBuf::from("/sys/fs/bpf/northnarrow-cgroup-join-v1.3"),
+            dir: PathBuf::from("/sys/fs/bpf/northnarrow-cgroup-join-v1_3"),
             maps: vec![reg(JOINED_MAP, 40, 63_222), reg(LOST_MAP, 41, LOST_SLOTS)],
         };
         assert_eq!(PinState::parse(&st.render()), Some(st.clone()));
@@ -1407,7 +1407,7 @@ mod tests {
     #[test]
     fn a_start_adopts_only_the_registered_pins_and_signs_every_reset() {
         let root = Path::new("/b/northnarrow");
-        let d = |g: u32| PathBuf::from(format!("/b/northnarrow-cgroup-join-v1.{g}"));
+        let d = |g: u32| PathBuf::from(format!("/b/northnarrow-cgroup-join-v1_{g}"));
         let st = |dir: PathBuf| PinState {
             boot: "B".to_string(),
             dir,
@@ -1479,8 +1479,8 @@ mod tests {
         let p = plan(
             root,
             "B",
-            Some(&st(PathBuf::from("/b/northnarrow-cgroup-join-v0.4"))),
-            &[PathBuf::from("/b/northnarrow-cgroup-join-v0.4")],
+            Some(&st(PathBuf::from("/b/northnarrow-cgroup-join-v0_4"))),
+            &[PathBuf::from("/b/northnarrow-cgroup-join-v0_4")],
             &ok(1),
             1000,
             None,
@@ -1548,12 +1548,12 @@ mod tests {
         let target = t.path().join("elsewhere");
         std::fs::create_dir(&target).unwrap();
         std::fs::write(target.join("CGROUP_JOINED"), "").unwrap();
-        let link = t.path().join("northnarrow-cgroup-join-v1.0");
+        let link = t.path().join("northnarrow-cgroup-join-v1_0");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(usable_dir(&link).unwrap_err().contains("symbolic link"));
         purge_pin_dir(&link);
         assert!(!link.exists() && target.join("CGROUP_JOINED").exists());
-        let real = t.path().join("northnarrow-cgroup-join-v1.1");
+        let real = t.path().join("northnarrow-cgroup-join-v1_1");
         assert_eq!(usable_dir(&real), Ok(()));
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(

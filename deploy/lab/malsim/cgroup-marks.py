@@ -17,7 +17,7 @@ usage (root): cgroup-marks.py mark PID...   one line per pid:
 The re-review of #494 (R1, R2) and its third review: the maps are in the
 tracker's own pin directory beside the pin root, the one the agent
 registered in /run/northnarrow/cgroup-join-pins
-(/sys/fs/bpf/northnarrow-cgroup-join-v<schema>.<generation>);
+(/sys/fs/bpf/northnarrow-cgroup-join-v<schema>_<generation>);
 CGROUP_JOIN_LOST holds a byte per tgid (64 an entry); CGROUP_JOIN_EPOCH the
 last reset's instant.
 """
