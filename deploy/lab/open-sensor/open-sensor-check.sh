@@ -230,6 +230,10 @@ import os, stat, sys
 mode, d, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
 pre = sys.argv[4] if len(sys.argv) > 4 else "f"
 path = lambda i: os.path.join(d, "%s%d" % (pre, i))
+# linkat(/proc/self/fd/N, AT_SYMLINK_FOLLOW): os.link() without a
+# directory descriptor calls link(2), which links the /proc symlink itself
+# (EXDEV) instead of the file it names
+proc = os.open("/proc/self", os.O_RDONLY | os.O_DIRECTORY)
 for i in range(n):
     p = path(i)
     if mode == "mknod":                   # made by mknod, then written
@@ -238,7 +242,7 @@ for i in range(n):
     elif mode == "tmpfile":               # an O_TMPFILE linked in
         fd = os.open(d, os.O_TMPFILE | os.O_WRONLY, 0o600)
         os.write(fd, b"x" * 1024)
-        os.link("/proc/self/fd/%d" % fd, p)
+        os.link("fd/%d" % fd, p, src_dir_fd=proc, follow_symlinks=True)
         os.close(fd)
     elif mode == "rdcreat":               # created read-only, reopened to write
         os.close(os.open(p, os.O_RDONLY | os.O_CREAT, 0o600))
