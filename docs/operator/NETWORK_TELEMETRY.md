@@ -115,10 +115,16 @@ and no response a **system resolver** received for a name the lineage asked
 did. A system resolver is its executable — `systemd-resolved`, `dnsmasq`,
 `nscd`, `unbound`, `named`, `pdns_recursor` or `kresd`, at its path in the
 system tree — run by one of the host's resolver users (the dedicated
-accounts the DNS budgets exempt; never root), in the host's mount
-namespace, where that path names the host's file (the second review of
-#495, R1: a path alone is never an identity — a container's
-`/usr/sbin/dnsmasq` is not one). Never a process name: any other
+accounts the DNS budgets exempt; never root), the image it runs the
+host's file at that path: the device and inode of its `/proc/<pid>/exe`
+(the kernel's link to the image, opened as a file) are those of the file
+the agent finds at the path (the second review of #495, R1, and its final
+check, C1: a path alone is never an identity). Whatever mount namespace
+it runs in: systemd-resolved, which its unit sandboxes in one of its own
+(`ProtectSystem=strict`, `PrivateTmp`), is one; a container's
+`/usr/sbin/dnsmasq` (an overlay, another file) is not, nor a resolver
+whose image an upgrade replaced at the path until it restarts (another
+inode; its askers unknown meanwhile). Never a process name: any other
 process's response binds that process only. Where no resolver is
 recognized (nscd as root, dnsmasq as `nobody`), the askers stay unknown:
 fail-safe.
@@ -162,7 +168,9 @@ fail-safe.
     process, and each connect judged before the DNS pumps caught up, is a
     signed `nodns_coverage_lost` row of the audit log (its `cause` —
     `undecoded`, `user_held`, `dns_losses`, `barrier` — and the `pid` and
-    `uid` that caused it when known; at most one a cause every 5 minutes),
+    `uid` that caused it when known; at most one a cause every 5 minutes
+    of the agent's monotonic clock, whatever order the sources' timestamps
+    arrive in — the final check, N1),
     and every beat of the heartbeat carries the rule's judgements by
     outcome and unknown reason (`nodns`, [HEARTBEAT.md](HEARTBEAT.md)). A
     burst of queries then a literal-IP connect leaves at least the row
@@ -234,8 +242,9 @@ fail-safe.
 
 Each source's programs run on hot paths: `tcp_sendmsg` (every TCP send: one
 map lookup that misses after a flow's first send), `udp_recvmsg` (every UDP
-receive: the return value's test, the source address read and its port
-compared), `inet_csk_accept` (every accept). Measured in lot 275's lab
+receive of more than 12 bytes: the source's family and port in one read,
+its address and the budgets only for port 53), `inet_csk_accept` (every
+accept). Measured in lot 275's lab
 (`nn-lab.sh overhead 3`, medians of 3 rounds, throughput lost with the agent
 running, every source on; Ubuntu 24.04 / 22.04 guests):
 

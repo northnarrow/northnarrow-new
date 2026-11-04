@@ -2002,14 +2002,23 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         false
     }
 
-    /// The second review of #495 (R1): `pid` runs in init's mount namespace
-    /// — the paths it sees are the host's. `false` when either namespace
-    /// cannot be read (the process is gone, or not readable): no evidence
+    /// The final check of #495 (C1; its second review, R1): the image `pid`
+    /// runs is the host's file at `path` — the device and inode of
+    /// `/proc/<pid>/exe` (the kernel's link to the image it executed, opened
+    /// as a file: no path walked in the process's mount namespace) are those
+    /// of `path` under the host's root, as the agent reads it. A service
+    /// systemd runs in a mount namespace of its own (systemd-resolved:
+    /// `ProtectSystem=strict`, `PrivateTmp`) runs the host's file; a
+    /// container's copy at that path (an overlay, another file), an image
+    /// replaced at the path since the process started (another inode) and a
+    /// process gone do not. `false` when either cannot be read: no evidence
     /// it is the host's.
-    pub fn in_init_mount_ns(&self, pid: u32) -> bool {
-        let ns = |p: &str| H::read_link(self.inner.proc_root.join(p).join("ns").join("mnt")).ok();
-        match (ns(&pid.to_string()), ns("1")) {
-            (Some(own), Some(init)) => own == init,
+    pub fn runs_host_file(&self, pid: u32, path: &str) -> bool {
+        let id = |file: PathBuf| H::file_id(file);
+        let exe = self.inner.proc_root.join(pid.to_string()).join("exe");
+        let host = self.inner.host_root.join(path.trim_start_matches('/'));
+        match (id(exe), id(host)) {
+            (Some(own), Some(host)) => own == host,
             _ => false,
         }
     }

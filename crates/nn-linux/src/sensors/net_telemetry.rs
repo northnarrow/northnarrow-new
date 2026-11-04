@@ -415,10 +415,12 @@ fn sign_coverage_losses(table: &ResolvedTable, audit: &crate::late_audit::LateAu
 }
 
 /// The receiver of a response is a system resolver (the second review of
-/// #495, R1): its executable and its uid ([`is_system_resolver`]), and it
-/// runs in the host's mount namespace, where its executable's path names
-/// the host's file — never a path alone. The namespace is read last, for
-/// the few receivers the first two leave.
+/// #495, R1, and its final check, C1): its executable and its uid
+/// ([`is_system_resolver`]), and the image it runs is the host's file at
+/// that path, the same device and inode
+/// ([`AuthSessionTracker::runs_host_file`]), whatever mount namespace it
+/// runs in (systemd-resolved's is its own) — never a path alone. The files
+/// are read last, for the few receivers the first two leave.
 ///
 /// [`is_system_resolver`]: crate::net::resolved::is_system_resolver
 fn from_system_resolver(
@@ -429,7 +431,7 @@ fn from_system_resolver(
     resolver_uids: &[u32],
 ) -> bool {
     crate::net::resolved::is_system_resolver(exe, uid, resolver_uids)
-        && lineage.in_init_mount_ns(pid)
+        && exe.is_some_and(|path| lineage.runs_host_file(pid, path))
 }
 
 /// The bytes of a response record the sensor copied: its payload up to
@@ -1092,12 +1094,16 @@ mod tests {
         }
     }
 
-    /// Review of #495, D4, and its second review, R1: a response any process
-    /// received binds that process only; one a system resolver received —
-    /// its executable, one of the host's resolver users (never root), in the
-    /// host's mount namespace — binds the processes that asked its name, and
-    /// the name counts host-wide. A rootful container's `/usr/sbin/dnsmasq`
-    /// (its own mount namespace) is no system resolver; nor is root.
+    /// Review of #495, D4, its second review, R1, and its final check, C1:
+    /// a response any process received binds that process only; one a
+    /// system resolver received — its executable, one of the host's resolver
+    /// users (never root), the image the host's file at that path (its
+    /// device and inode) — binds the processes that asked its name, and the
+    /// name counts host-wide. systemd-resolved runs in a mount namespace of
+    /// its own (its unit's `ProtectSystem=strict`, `PrivateTmp`): it is one.
+    /// A rootful container's `/usr/sbin/dnsmasq` (another file), an image
+    /// replaced at the path since the process started (another inode), root
+    /// and a process gone are not.
     #[test]
     fn only_a_system_resolver_s_response_binds_others() {
         use nn_model::telemetry::DnsResolution;
@@ -1105,26 +1111,51 @@ mod tests {
         const S: u64 = 1_000_000_000;
         let c2: std::net::IpAddr = "203.0.113.5".parse().unwrap();
         let procs = tempfile::TempDir::new().unwrap();
-        for (pid, ns) in [
-            ("1", "mnt:[4026531841]"),
-            ("500", "mnt:[4026531841]"),
-            ("600", "mnt:[4026532900]"),
+        let host = tempfile::TempDir::new().unwrap();
+        let resolved_exe = "/usr/lib/systemd/systemd-resolved";
+        let on_host = |path: &str| host.path().join(path.trim_start_matches('/'));
+        for path in [resolved_exe, "/usr/sbin/dnsmasq"] {
+            std::fs::create_dir_all(on_host(path).parent().unwrap()).unwrap();
+            std::fs::write(on_host(path), b"\x7fELF the host's").unwrap();
+        }
+        // pid 700 started the image an upgrade then replaced at the path:
+        // its exe is the old inode, the path names the new one
+        let old = host.path().join("old-systemd-resolved");
+        std::fs::hard_link(on_host(resolved_exe), &old).unwrap();
+        let new = host.path().join("new-systemd-resolved");
+        std::fs::write(&new, b"\x7fELF the upgrade's").unwrap();
+        std::fs::rename(&new, on_host(resolved_exe)).unwrap();
+        // the container's copy of dnsmasq: the same bytes, another file
+        let copy = host.path().join("overlay/merged/usr/sbin/dnsmasq");
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::copy(on_host("/usr/sbin/dnsmasq"), &copy).unwrap();
+        for (pid, ns, exe) in [
+            ("1", "mnt:[4026531841]", None),
+            // systemd-resolved, sandboxed: a mount namespace of its own
+            ("500", "mnt:[4026532217]", Some(on_host(resolved_exe))),
+            ("600", "mnt:[4026532900]", Some(copy.clone())),
+            ("700", "mnt:[4026532217]", Some(old.clone())),
         ] {
             std::fs::create_dir_all(procs.path().join(pid).join("ns")).unwrap();
             symlink(ns, procs.path().join(pid).join("ns/mnt")).unwrap();
+            if let Some(exe) = exe {
+                symlink(exe, procs.path().join(pid).join("exe")).unwrap();
+            }
         }
-        let lineage = AuthSessionTracker::new(procs.path());
+        let lineage = AuthSessionTracker::new(procs.path()).with_host_root(host.path());
         let users = [101u32];
-        let resolved_exe = "/usr/lib/systemd/systemd-resolved";
         for (exe, pid, uid, bound) in [
             (None, 500, 101, false),
             (Some("/usr/bin/python3"), 500, 101, false),
             // root runs it: no resolver user
             (Some(resolved_exe), 500, 0, false),
-            // a resolver user's copy... in a container's own mount namespace
+            // a resolver user's dnsmasq in a container: another file
             (Some("/usr/sbin/dnsmasq"), 600, 101, false),
+            // the image replaced at the path since it started: another inode
+            (Some(resolved_exe), 700, 101, false),
             // a uid that is no resolver user
             (Some(resolved_exe), 500, 1000, false),
+            // systemd-resolved in its own mount namespace: the host's file
             (Some(resolved_exe), 500, 101, true),
         ] {
             let resolver = from_system_resolver(&lineage, exe, pid, uid, &users);

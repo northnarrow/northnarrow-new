@@ -52,6 +52,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
 use nn_model::telemetry::DnsResolution;
 use parking_lot::Mutex;
@@ -133,10 +134,12 @@ pub const SYSTEM_RESOLVER_EXES: &[&str] = &[
 /// [`SYSTEM_RESOLVER_EXES`], and its uid one of the host's resolver users
 /// (`resolver_uids`: the dedicated accounts of `RESOLVER_USERS` in the
 /// host's `/etc/passwd`), never root. A path alone is never an identity
-/// (the second review of #495, R1): the caller also requires the process to
-/// run in the host's mount namespace, where that path names the host's
-/// file — a container's `/usr/sbin/dnsmasq`, any program at that path in a
-/// namespace of its own, is not one. Never by process name.
+/// (the second review of #495, R1, and its final check, C1): the caller
+/// also requires the image the process runs to be the host's file at that
+/// path, the same device and inode, whatever mount namespace it runs in — a
+/// sandboxed systemd-resolved runs the host's file; a container's
+/// `/usr/sbin/dnsmasq` (an overlay, another file) or an image replaced at
+/// the path does not. Never by process name.
 pub fn is_system_resolver(exe: Option<&str>, uid: u32, resolver_uids: &[u32]) -> bool {
     uid != 0
         && resolver_uids.contains(&uid)
@@ -292,9 +295,11 @@ struct Inner {
     degraded_until: u64,
     counters: Counters,
     judgements: Judgements,
-    /// Coverage losses to be signed, and when each cause was last queued.
+    /// Coverage losses to be signed, and when each cause was last queued,
+    /// by the agent's monotonic clock (the final check of #495, N1: never
+    /// a source's timestamp, which the pumps do not order between them).
     coverage: Vec<CoverageLoss>,
-    coverage_last: HashMap<CoverageCause, u64>,
+    coverage_last: HashMap<CoverageCause, Instant>,
 }
 
 impl std::fmt::Debug for Inner {
@@ -422,13 +427,31 @@ impl<I: Default> ResolvedTable<I> {
     /// NN-L-NET-028's evidence is lost for every process from `ts_ns`
     /// (`window_secs` long; 0: no window, one connect's — the barrier's),
     /// for `cause`, by `pid` or `uid` when known: queued to be signed at
-    /// most once a cause per [`COVERAGE_RECORD_EVERY_SECS`].
+    /// most once a cause per [`COVERAGE_RECORD_EVERY_SECS`] of the agent's
+    /// monotonic clock ([`Self::note_coverage_lost_at`], now).
     pub fn note_coverage_lost(
         &self,
         cause: CoverageCause,
         pid: Option<u32>,
         uid: Option<u32>,
         ts_ns: u64,
+    ) {
+        self.note_coverage_lost_at(cause, pid, uid, ts_ns, Instant::now());
+    }
+
+    /// [`Self::note_coverage_lost`] with the agent's clock at `now`. The
+    /// degradation runs from the source's `ts_ns` (the clock of the
+    /// connects it covers); the record's limit by `now` (the final check of
+    /// #495, N1): a cause's record is due a full window after its last one,
+    /// never sooner — a `now` before it (another thread's earlier reading)
+    /// is not.
+    pub fn note_coverage_lost_at(
+        &self,
+        cause: CoverageCause,
+        pid: Option<u32>,
+        uid: Option<u32>,
+        ts_ns: u64,
+        now: Instant,
     ) {
         let window_secs = if cause == CoverageCause::Barrier {
             0
@@ -441,12 +464,11 @@ impl<I: Default> ResolvedTable<I> {
                 .degraded_until
                 .max(ts_ns.saturating_add(window_secs * SEC));
         }
-        let due = g
-            .coverage_last
-            .get(&cause)
-            .is_none_or(|last| ts_ns < *last || ts_ns - *last >= COVERAGE_RECORD_EVERY_SECS * SEC);
+        let due = g.coverage_last.get(&cause).is_none_or(|last| {
+            now.saturating_duration_since(*last) >= Duration::from_secs(COVERAGE_RECORD_EVERY_SECS)
+        });
         if due {
-            g.coverage_last.insert(cause, ts_ns);
+            g.coverage_last.insert(cause, now);
             g.coverage.push(CoverageLoss {
                 cause,
                 pid,
@@ -1459,7 +1481,7 @@ mod tests {
     /// D4 and R1: a system resolver is its executable, of the fixed list,
     /// run by one of the host's resolver users — never root, never another
     /// uid, never a name, never a user's copy (the caller adds the host's
-    /// mount namespace).
+    /// file: its device and inode).
     #[test]
     fn a_system_resolver_is_its_executable_and_a_resolver_user() {
         let users = [101, 120];
@@ -1517,16 +1539,37 @@ mod tests {
         assert_eq!(t.check(42, 1, C2, T0 - SEC, none), DnsResolution::Unknown);
     }
 
-    /// The second review of #495, R2: a loss of coverage for every process
-    /// is queued to be signed with its cause and who caused it, at most once
-    /// a cause per window; a barrier's degrades nothing beyond its connect.
+    /// The second review of #495, R2, and its final check, N1: a loss of
+    /// coverage for every process is queued to be signed with its cause and
+    /// who caused it, at most once a cause per window of the agent's clock —
+    /// a source's timestamp older than the last record's, or the clock read
+    /// before it by another thread, re-arms nothing; a barrier's degrades
+    /// nothing beyond its connect.
     #[test]
     fn a_coverage_loss_is_queued_once_a_cause_a_window() {
         let t = Table::new();
-        t.note_coverage_lost(CoverageCause::UserHeld, Some(42), Some(1000), T0);
-        t.note_coverage_lost(CoverageCause::UserHeld, Some(43), Some(1000), T0 + SEC);
-        t.note_coverage_lost(CoverageCause::Losses, None, None, T0 + SEC);
-        t.note_coverage_lost(CoverageCause::Barrier, Some(44), None, T0 + 2 * SEC);
+        let now = Instant::now();
+        let at = |secs: u64| now + Duration::from_secs(secs);
+        t.note_coverage_lost_at(CoverageCause::UserHeld, Some(42), Some(1000), T0, at(0));
+        t.note_coverage_lost_at(
+            CoverageCause::UserHeld,
+            Some(43),
+            Some(1000),
+            T0 + SEC,
+            at(1),
+        );
+        t.note_coverage_lost_at(CoverageCause::Losses, None, None, T0 + SEC, at(1));
+        t.note_coverage_lost_at(CoverageCause::Barrier, Some(44), None, T0 + 2 * SEC, at(2));
+        // N1: a source's timestamp before the last record's (another pump's
+        // ring), and an earlier reading of the clock: not due
+        t.note_coverage_lost_at(
+            CoverageCause::UserHeld,
+            Some(46),
+            Some(1000),
+            T0 - SEC,
+            at(3),
+        );
+        t.note_coverage_lost_at(CoverageCause::Losses, None, None, T0 + SEC, now);
         let q = t.take_coverage_losses();
         assert_eq!(
             q.iter()
@@ -1544,18 +1587,42 @@ mod tests {
             ]
         );
         assert!(t.take_coverage_losses().is_empty(), "taken once");
-        // a window later: the cause again
-        let next = T0 + COVERAGE_RECORD_EVERY_SECS * SEC;
-        t.note_coverage_lost(CoverageCause::UserHeld, Some(45), Some(1001), next - 1);
+        // a window of the agent's clock later: the cause again, whatever
+        // the source's timestamp
+        let next = at(COVERAGE_RECORD_EVERY_SECS);
+        t.note_coverage_lost_at(
+            CoverageCause::UserHeld,
+            Some(45),
+            Some(1001),
+            T0 + 1_000 * SEC,
+            next - Duration::from_nanos(1),
+        );
         assert!(
             t.take_coverage_losses().is_empty(),
             "still within the window"
         );
-        t.note_coverage_lost(CoverageCause::UserHeld, Some(45), Some(1001), next);
+        t.note_coverage_lost_at(CoverageCause::UserHeld, Some(45), Some(1001), T0, next);
         assert_eq!(t.take_coverage_losses().len(), 1);
+        // and the window runs again from that record
+        t.note_coverage_lost_at(
+            CoverageCause::UserHeld,
+            Some(47),
+            Some(1001),
+            T0,
+            next + Duration::from_secs(1),
+        );
+        assert!(t.take_coverage_losses().is_empty(), "the window restarted");
         assert_eq!(t.judgements().coverage_records, 4);
-        // the degradation: every process unknown until the window's end
-        assert_eq!(t.check(7, 1, C2, next + SEC, none), DnsResolution::Unknown);
+        // the degradation runs from the sources' timestamps: every process
+        // unknown until the latest one's window ends
+        let end = T0 + 1_000 * SEC + UNSEEN_WINDOW_SECS * SEC;
+        assert_eq!(t.check(7, 1, C2, end, none), DnsResolution::Unknown);
+        assert_eq!(t.check(7, 1, C2, end + 1, none), DnsResolution::Unresolved);
+        // the record of now: the agent's clock
+        let t = Table::new();
+        t.note_coverage_lost(CoverageCause::Undecoded, None, None, T0);
+        t.note_coverage_lost(CoverageCause::Undecoded, None, None, T0 + 400 * SEC);
+        assert_eq!(t.take_coverage_losses().len(), 1);
         // a barrier alone degrades nothing
         let t = Table::new();
         t.note_coverage_lost(CoverageCause::Barrier, Some(44), None, T0);

@@ -71,6 +71,7 @@ const MARKERS: &[&str] = &[
     "H::rpm_owns",
     "H::on_host_path",
     "H::accessor_exe",
+    "H::file_id",
     "TcpStream",
     "UnixStream",
     ".sync_all(",
@@ -266,9 +267,10 @@ const KNOWN: &[(&str, usize, &str)] = &[
          the cache does not hold, a fork's parent and start, exe and uid (`fork_entry`: the \
          parent's cached image accepted only when `/proc/<pid>/exe` is that file — the \
          re-review of #475); never a process's image read as its identity in a judgement; \
-         lot 275 (the second review of #495, R1): `in_init_mount_ns`, read by the DNS \
-         response pump only (a response's receiver in the host's mount namespace), not in a \
-         judgement",
+         lot 275 (the final check of #495, C1): `runs_host_file`, the device and inode of a \
+         response's receiver's `/proc/<pid>/exe` and of the host's file at its path (one \
+         `fstat` each), read by the DNS response pump only, for a receiver whose executable \
+         and uid are already a resolver's, not in a judgement",
     ),
     (
         "crates/nn-core/src/posture/triggers.rs",

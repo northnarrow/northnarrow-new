@@ -39,7 +39,11 @@
 # address, nip.io, counts as literal when the guest is online), MS29 (an
 # accepted connection's rows in the netflow log, `inbound`), MS30 (the DNS
 # response sensor's records, its summary line), MS31 (a TLS client's JA3,
-# JA4 and SNI on its flow's closed row).
+# JA4 and SNI on its flow's closed row), MS32 (the final check of #495,
+# C1: systemd-resolved, sandboxed in a mount namespace of its own, is the
+# system resolver — a name only it looked up binds every process to its
+# address as another lineage's, `other_lineage`; one datagram to that
+# address, port 9, skipped offline).
 # The kills lab PR 224 adds — R020's, the fan-out kill tier, port 53 of a
 # server that is no configured resolver — are held behind the per-rule
 # response policy, off by default (decision of 21/10/2026): those cases
@@ -438,6 +442,40 @@ if want MS31; then
             "no fingerprint on the flow's row"
     else
         skip MS31 "https://example.com is not reachable from this guest"
+    fi
+fi
+
+# ── MS32: systemd-resolved is the system resolver (lot 275, C1) ──────
+# Its unit runs it in a mount namespace of its own (ProtectSystem=strict,
+# PrivateTmp); the agent knows it by its image's device and inode. A name
+# only it looked up (resolvectl, its cache flushed first: no process of
+# this lineage receives a response) binds every process to the address as
+# another lineage's: one datagram there (port 9, discard) is judged
+# other_lineage on its row, NN-L-NET-028 never Medium for it.
+if want MS32; then
+    rpid=$(systemctl show -p MainPID --value systemd-resolved 2>/dev/null)
+    if [[ ${rpid:-0} -gt 0 ]] && command -v resolvectl >/dev/null; then
+        ns_own=$(sudo readlink "/proc/$rpid/ns/mnt")
+        ns_init=$(sudo readlink /proc/1/ns/mnt)
+        sudo resolvectl flush-caches
+        addr=$(resolvectl query -4 --legend=no example.net 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+        if [[ -n $addr ]]; then
+            b=$(det_count)
+            before=$(sudo cat "$NETFLOW" 2>/dev/null | wc -l)
+            python3 -I -c 'import socket, sys; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b"nn-ms", (sys.argv[1], 9))' "$addr" &
+            p=$!; wait $p
+            sleep 3
+            res=$(sudo tail -n "+$(( before + 1 ))" "$NETFLOW" 2>/dev/null \
+                | jq -r --argjson p "$p" 'select(.pid == $p and .dst_port == 9) | .dns_resolution // "not_judged"' 2>/dev/null | tail -1)
+            med=$(count_new "$b" --rule NN-L-NET-028_ConnectWithoutDns --in-matches --severity Medium --pid "$p")
+            ok=1; [[ $res == other_lineage && $med -eq 0 ]] && ok=0
+            outcome MS32 $ok "a datagram to $addr (example.net, looked up by systemd-resolved only, pid $rpid in $ns_own, init in $ns_init): dns_resolution=${res:-none}, NET-028 Medium=$med" \
+                "systemd-resolved's response binds no other process (the resolver not recognized)"
+        else
+            skip MS32 "resolvectl does not resolve example.net on this guest: not run"
+        fi
+    else
+        skip MS32 "systemd-resolved is not running on this guest: not run"
     fi
 fi
 

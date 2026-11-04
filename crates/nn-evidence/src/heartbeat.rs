@@ -171,14 +171,17 @@ pub struct HeartbeatRecord {
 
 /// NN-L-NET-028's judgements since the run started: a rule blinded for
 /// every process (`unknown.degraded`, `unknown.barrier`) shows in the beat,
-/// as do its signed `nodns_coverage_lost` rows (`coverage_lost`).
+/// as do its `nodns_coverage_lost` rows queued to be signed
+/// (`coverage_lost`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BeatNoDns {
     pub lineage: u64,
     pub other_lineage: u64,
     pub unresolved: u64,
     pub unknown: BeatNoDnsUnknown,
-    /// `nodns_coverage_lost` rows (at most one a cause a window).
+    /// `nodns_coverage_lost` rows queued to be signed (at most one a cause
+    /// a window; the final check of #495, N4: queued, not appended — an
+    /// `append` that fails is the agent's warning).
     pub coverage_lost: u64,
 }
 

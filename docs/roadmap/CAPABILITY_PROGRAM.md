@@ -5272,12 +5272,17 @@ number in parentheses is a lab PR.
     process for 5 minutes. D4: only the question's chain binds, and a
     response binds only its receiver unless a system resolver received it
     — its executable at its system path, one of the host's resolver users
-    (never root), in init's mount namespace (R1: never a path alone). D5:
+    (never root), its image the host's file at that path — the device and
+    inode of its `/proc/<pid>/exe`, in whatever mount namespace it runs
+    (R1, and the final check's C1: init's mount namespace, R1's first
+    form, left out systemd-resolved, which its unit sandboxes; never a
+    path alone). D5:
     the response program reads the source's family and port first and the
     address only for port 53, at most `min(ret, len)` (N1); the three
     sources declare their measured cost in the contract. R2: a blinding
     shows — a signed `nodns_coverage_lost` (its cause, the pid or uid that
-    caused it; one a cause every 5 minutes) and the rule's judgements by
+    caused it; one a cause every 5 minutes of the agent's clock, N1) and
+    the rule's judgements by
     outcome and unknown reason in every heartbeat (`nodns`). N2: a binding
     of a process of unknown start is unknown. The reviewers' probes are
     tests asserting the opposite of what they showed.

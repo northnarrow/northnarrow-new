@@ -62,6 +62,21 @@ impl PostureHost for LinuxHost {
             .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
     }
 
+    /// `open(2)` with `O_PATH | O_CLOEXEC` and `fstat(2)` of that file:
+    /// `/proc/<pid>/exe` opens the image the kernel executed (its magic
+    /// link, no path walked in the process's mount namespace), a host path
+    /// the file the agent sees there.
+    fn file_id<P: AsRef<Path>>(path: P) -> Option<(u64, u64)> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(path)
+            .ok()?;
+        let meta = file.metadata().ok()?;
+        Some((meta.dev(), meta.ino()))
+    }
+
     fn suspended_ns() -> u64 {
         let now = |clock| {
             let mut ts = libc::timespec {
@@ -169,6 +184,59 @@ mod tests {
             "{stat}"
         );
         assert!(LinuxHost::read(me.join("cmdline")).is_ok_and(|b| !b.is_empty()));
+    }
+
+    /// The final check of #495 (C1): a process's image is the file its
+    /// `exe` opens — the kernel's link, not a path: this test's own binary
+    /// is `current_exe`'s file, a copy of it another; a child running a
+    /// copied `sleep` keeps that file's identity after another file is
+    /// renamed over its path (an upgrade), which the path then no longer
+    /// names; a missing path has none.
+    #[test]
+    fn a_process_s_image_is_the_file_its_exe_opens() {
+        let me = Path::new(LinuxHost::PROC_ROOT).join(std::process::id().to_string());
+        let own = LinuxHost::file_id(me.join("exe"));
+        assert!(own.is_some());
+        assert_eq!(own, LinuxHost::file_id(std::env::current_exe().unwrap()));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sleep = tmp.path().join("sleep");
+        fs::copy("/bin/sleep", &sleep).unwrap();
+        assert_ne!(LinuxHost::file_id(&sleep), own);
+        assert_eq!(LinuxHost::file_id(tmp.path().join("absent")), None);
+        // the device counts: `/proc`'s and `/sys`'s roots are each inode 1
+        // of their own file system
+        let (proc_root, sys_root) = (LinuxHost::file_id("/proc"), LinuxHost::file_id("/sys"));
+        assert!(proc_root.is_some() && sys_root.is_some());
+        assert_ne!(proc_root, sys_root);
+        // another test's fork may hold the copy's write descriptor until
+        // its exec (the parallel harness): `ETXTBSY` for a moment
+        let mut child = (0..200)
+            .find_map(
+                |_| match std::process::Command::new(&sleep).arg("30").spawn() {
+                    Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        None
+                    }
+                    other => Some(other.unwrap()),
+                },
+            )
+            .expect("the copy of sleep runs");
+        let exe = Path::new(LinuxHost::PROC_ROOT)
+            .join(child.id().to_string())
+            .join("exe");
+        let started = LinuxHost::file_id(&sleep);
+        let running = LinuxHost::file_id(&exe);
+        let upgrade = tmp.path().join("sleep.new");
+        fs::copy("/bin/sleep", &upgrade).unwrap();
+        fs::rename(&upgrade, &sleep).unwrap();
+        let after = LinuxHost::file_id(&exe);
+        let path_now = LinuxHost::file_id(&sleep);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(started.is_some());
+        assert_eq!(running, started);
+        assert_eq!(after, started);
+        assert_ne!(path_now, started);
     }
 
     /// The clocks are the kernel's: the monotonic one between two readings
