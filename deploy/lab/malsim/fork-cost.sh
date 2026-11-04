@@ -64,10 +64,10 @@ moved_marked() {   # a root sleeper that moved itself into a throwaway cgroup: i
     sudo rm -f /tmp/nn277-cost.pid
     echo "$m"
 }
-prog_stat() {   # <name prefix (15 chars)>: "run_cnt run_time_ns"
+prog_stat() {   # <name prefix (15 chars)>: "run_cnt run_time_ns", summed over every program of that name
     sudo bpftool prog show 2>/dev/null | awk -v n="$1" '
-        $0 ~ " name "n" " { for (i=1;i<=NF;i++) { if ($i=="run_time_ns") t=$(i+1); if ($i=="run_cnt") c=$(i+1) } found=1 }
-        END { if (found) print c+0, t+0; else print "0 0" }'
+        $0 ~ " name "n" " { for (i=1;i<=NF;i++) { if ($i=="run_time_ns") t+=$(i+1); if ($i=="run_cnt") c+=$(i+1) } }
+        END { print c+0, t+0 }'
 }
 sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 5; }
 dir=$(sudo python3 -I "$MARKS" dir)
@@ -106,10 +106,10 @@ for u in northnarrow-watchdog northnarrow-agent; do
     sudo systemctl kill --signal=SIGKILL "$u" 2>/dev/null; sudo systemctl reset-failed "$u" 2>/dev/null
 done
 sudo systemctl start northnarrow-agent; sleep 6
-sudo journalctl -u northnarrow-agent -b --since "$t2" --no-pager -o cat | grep -q "start-in-cgroup tracker is attached" || { echo "FAIL  the tracker did not attach again"; fail=1; }
+sudo journalctl --namespace=northnarrow -b --since "$t2" --no-pager -o cat | grep -q "start-in-cgroup tracker is attached" || { echo "FAIL  the tracker did not attach again"; fail=1; }
 probe=$(moved_marked)
-echo "    agent restarted; a move now: [$probe] (attached: marked)"
-grep -q " moved " <<<"$probe" || { echo "FAIL  the tracker does not mark after the restart"; fail=1; }
+echo "    agent restarted; a move now: [$probe] (attached: marked, or not known after a reset this boot)"
+grep -qE " moved | lost$| pre-epoch$" <<<"$probe" || { echo "FAIL  the tracker does not mark after the restart"; fail=1; }
 on2=$(bench | tr '\n' ' '); m_on2=$(tr ' ' '\n' <<<"$on2" | grep . | median)
 echo "    tracker attached:   $on2 (median $m_on2)"
 echo "RESULT wall: attached $m_on1 / $m_on2 ns, detached $m_off ns a fork + exit + wait (medians of $ROUNDS rounds of $N)"

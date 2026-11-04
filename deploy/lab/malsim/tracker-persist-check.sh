@@ -63,7 +63,8 @@ units_stop() {
 units_start() {
     sudo systemctl start northnarrow-agent; sleep 6; sudo systemctl start northnarrow-watchdog
 }
-since_start() { sudo journalctl -u northnarrow-agent -b --since "$1" --no-pager -o cat 2>/dev/null; }
+# The agent logs to its own journal namespace (journald@northnarrow).
+since_start() { sudo journalctl --namespace=northnarrow -b --since "$1" --no-pager -o cat 2>/dev/null; }
 
 sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 5; }
 dir0=$(sudo python3 -I "$MARKS" dir)
@@ -96,9 +97,19 @@ grep -q "marks reset" <<<"$j" && bad "restart: marks reset [$(grep 'marks reset'
 
 echo "== 4. install.sh --upgrade (the same build)"
 t4=$(date '+%F %T')
-# script(1) gives sudo the terminal R009 asks of a root exec from a home
-# directory (as nn-lab.sh upgrade-check does); its typescript is the log.
-( cd "$TREE" && script -qec "sudo ./deploy/install.sh --source-tree --upgrade --grant-key $KEY" /tmp/nn277-upgrade.log < /dev/null > /dev/null 2>&1 ); echo "    install.sh --upgrade: rc $?"
+# From a root-owned copy of the tree (/root): R009 kills a root exec from
+# a home directory outside an administrator's terminal session, which a
+# script driven over ssh is not (the first run's upgrade was killed).
+U=/root/nn277-tree
+sudo rm -rf "$U"
+sudo mkdir -p "$U/target/release" "$U/agent-ebpf/target/bpfel-unknown-none/release"
+sudo rsync -a --exclude /target --exclude /agent-ebpf/target --exclude /.git "$TREE"/ "$U"/
+for b in northnarrow-agent northnarrow-watchdog nn-admin northnarrow-scan; do
+    sudo cp -a "$TREE/target/release/$b" "$U/target/release/" 2>/dev/null
+done
+sudo cp -a "$TREE"/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf "$TREE"/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf.buildhash "$U/agent-ebpf/target/bpfel-unknown-none/release/"
+sudo "$U/deploy/install.sh" --source-tree --upgrade --grant-key "$KEY" > /tmp/nn277-upgrade.log 2>&1; echo "    install.sh --upgrade: rc $?"
+sudo rm -rf "$U"
 grep -q "UPGRADE complete — health check passed" /tmp/nn277-upgrade.log && pass "upgrade completed" || bad "upgrade: $(grep -E 'UPGRADE|ROLLBACK|FAIL|still loaded' /tmp/nn277-upgrade.log | tail -3 | tr '\n' ' ')"
 grep -E "waiting for NorthNarrow's BPF programs|still loaded|dropping" /tmp/nn277-upgrade.log | cut -c1-160 | sed 's/^/    /'
 sleep 4

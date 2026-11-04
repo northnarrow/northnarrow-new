@@ -388,9 +388,15 @@ pub fn plan(
         }
     };
     if let Some(n) = debug_entries.filter(|n| *n != entries) {
-        return next(Some(format!(
-            "marks reset: a debug build asked for {n} marks, {entries} are pinned"
-        )));
+        // A `debug-trigger` build's test of a full map: new maps at its
+        // size, signed, but no epoch — the test harness that started
+        // before them must not see its own children not known.
+        let mut p = next(None);
+        p.note = Some(format!(
+            "a debug build asked for {n} marks, {entries} are pinned: new maps (debug-trigger \
+             builds only)"
+        ));
+        return p;
     }
     Plan {
         dir: st.dir.clone(),
@@ -1489,7 +1495,8 @@ mod tests {
         assert!(p.reset.unwrap().contains("schema v0"));
         // a debug build's size is a reset, never the host's
         let p = plan(root, "B", Some(&s0), &[d(0)], &ok(63_222), 63_222, Some(64));
-        assert!(!p.adopt && p.dir == d(1) && p.reset.unwrap().contains("debug build asked for 64"));
+        assert!(!p.adopt && p.dir == d(1) && p.reset.is_none());
+        assert!(p.note.unwrap().contains("debug build asked for 64"));
         let p = plan(root, "B", Some(&s0), &[d(0)], &ok(64), 63_222, Some(64));
         assert!(p.adopt);
         // a planted directory of a future generation beside the registered
