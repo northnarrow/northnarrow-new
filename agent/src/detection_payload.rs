@@ -124,7 +124,10 @@ pub(crate) fn exe_from_event(event: &Event) -> Option<String> {
         | Event::CanaryTripped { .. }
         | Event::Fim(_)
         | Event::NetFlow(_)
-        | Event::NetListener(_) => None,
+        | Event::NetListener(_)
+        | Event::NetInbound(_)
+        | Event::DnsAnswer(_)
+        | Event::TlsClientHello(_) => None,
     }
 }
 
@@ -150,7 +153,10 @@ pub(crate) fn file_from_event(event: &Event) -> Option<String> {
         | Event::FsProtectDenial { .. }
         | Event::CanaryTripped { .. }
         | Event::NetFlow(_)
-        | Event::NetListener(_) => None,
+        | Event::NetListener(_)
+        | Event::NetInbound(_)
+        | Event::DnsAnswer(_)
+        | Event::TlsClientHello(_) => None,
     }
 }
 

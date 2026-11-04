@@ -751,10 +751,14 @@ pub enum OverlayKind {
     /// …`, `combat-without-corroboration NN-L-IMP-001`). Without it every
     /// rule keeps its built-in response, the held kills held.
     RulePolicy = 15,
+    /// Lot 275: `nodns-allow.local` — the addresses and CIDR blocks
+    /// NN-L-NET-028 ("no DNS, no connect") does not judge (a mirror, an
+    /// NTP server, a peer configured by address), one a line.
+    NoDnsAllow = 16,
 }
 
 impl OverlayKind {
-    pub const ALL: [OverlayKind; 15] = [
+    pub const ALL: [OverlayKind; 16] = [
         OverlayKind::FimPaths,
         OverlayKind::ProcessCommAllowlist,
         OverlayKind::NetflowCommAllowlist,
@@ -770,6 +774,7 @@ impl OverlayKind {
         OverlayKind::ExecqHashes,
         OverlayKind::ExecPolicy,
         OverlayKind::RulePolicy,
+        OverlayKind::NoDnsAllow,
     ];
 
     /// CLI / log keyword (`nn-admin config overlay set <keyword>`).
@@ -790,6 +795,7 @@ impl OverlayKind {
             OverlayKind::ExecqHashes => "execq-hashes",
             OverlayKind::ExecPolicy => "exec-policy",
             OverlayKind::RulePolicy => "rule-policy",
+            OverlayKind::NoDnsAllow => "nodns-allow",
         }
     }
 
@@ -841,6 +847,7 @@ impl TryFrom<u8> for OverlayKind {
             13 => Ok(Self::ExecqHashes),
             14 => Ok(Self::ExecPolicy),
             15 => Ok(Self::RulePolicy),
+            16 => Ok(Self::NoDnsAllow),
             other => Err(SignedPayloadError::UnknownOverlayKind(other)),
         }
     }
@@ -2004,6 +2011,7 @@ mod tests {
             (OverlayKind::ExecqHashes, 13, "execq-hashes"),
             (OverlayKind::ExecPolicy, 14, "exec-policy"),
             (OverlayKind::RulePolicy, 15, "rule-policy"),
+            (OverlayKind::NoDnsAllow, 16, "nodns-allow"),
         ] {
             assert_eq!(u8::from(k), byte);
             assert_eq!(OverlayKind::try_from(byte).unwrap(), k);

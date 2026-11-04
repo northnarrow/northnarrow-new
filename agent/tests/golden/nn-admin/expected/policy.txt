@@ -18,6 +18,7 @@ exit: 0
 |   held: the kill of the ransomware actor's process tree (NN-L-IMP-001, lab PR 225)
 |   held: the kill of the staged program that asked a security tool off (NN-L-EVA, lab PR 225)
 |   held: the kill for a rename seen only as a watched directory's new entry (NN-L-FIM-010, a match added by lab PR 225)
+|   held: the kill of a process that connected to a public address its lineage did not resolve (NN-L-NET-028, lot 275)
 --- stderr
 (empty)
 
@@ -41,6 +42,7 @@ exit: 0
 |   held: the kill of the ransomware actor's process tree (NN-L-IMP-001, lab PR 225)
 |   held: the kill of the staged program that asked a security tool off (NN-L-EVA, lab PR 225)
 |   held: the kill for a rename seen only as a watched directory's new entry (NN-L-FIM-010, a match added by lab PR 225)
+|   held: the kill of a process that connected to a public address its lineage did not resolve (NN-L-NET-028, lot 275)
 --- stderr
 (empty)
 
@@ -67,6 +69,7 @@ exit: 0
 |   held: the kill of the ransomware actor's process tree (NN-L-IMP-001, lab PR 225)
 |   held: the kill of the staged program that asked a security tool off (NN-L-EVA, lab PR 225)
 |   held: the kill for a rename seen only as a watched directory's new entry (NN-L-FIM-010, a match added by lab PR 225)
+|   held: the kill of a process that connected to a public address its lineage did not resolve (NN-L-NET-028, lot 275)
 --- stderr
 (empty)
 
@@ -88,6 +91,7 @@ exit: 1
 |   held: the kill of the ransomware actor's process tree (NN-L-IMP-001, lab PR 225)
 |   held: the kill of the staged program that asked a security tool off (NN-L-EVA, lab PR 225)
 |   held: the kill for a rename seen only as a watched directory's new entry (NN-L-FIM-010, a match added by lab PR 225)
+|   held: the kill of a process that connected to a public address its lineage did not resolve (NN-L-NET-028, lot 275)
 --- stderr
 (empty)
 
@@ -109,6 +113,7 @@ exit: 1
 |   held: the kill of the ransomware actor's process tree (NN-L-IMP-001, lab PR 225)
 |   held: the kill of the staged program that asked a security tool off (NN-L-EVA, lab PR 225)
 |   held: the kill for a rename seen only as a watched directory's new entry (NN-L-FIM-010, a match added by lab PR 225)
+|   held: the kill of a process that connected to a public address its lineage did not resolve (NN-L-NET-028, lot 275)
 --- stderr
 (empty)
 
@@ -130,6 +135,7 @@ exit: 1
 |   held: the kill of the ransomware actor's process tree (NN-L-IMP-001, lab PR 225)
 |   held: the kill of the staged program that asked a security tool off (NN-L-EVA, lab PR 225)
 |   held: the kill for a rename seen only as a watched directory's new entry (NN-L-FIM-010, a match added by lab PR 225)
+|   held: the kill of a process that connected to a public address its lineage did not resolve (NN-L-NET-028, lot 275)
 --- stderr
 (empty)
 
@@ -151,6 +157,7 @@ exit: 1
 |   held: the kill of the ransomware actor's process tree (NN-L-IMP-001, lab PR 225)
 |   held: the kill of the staged program that asked a security tool off (NN-L-EVA, lab PR 225)
 |   held: the kill for a rename seen only as a watched directory's new entry (NN-L-FIM-010, a match added by lab PR 225)
+|   held: the kill of a process that connected to a public address its lineage did not resolve (NN-L-NET-028, lot 275)
 --- stderr
 (empty)
 
@@ -172,6 +179,7 @@ exit: 1
 |   held: the kill of the ransomware actor's process tree (NN-L-IMP-001, lab PR 225)
 |   held: the kill of the staged program that asked a security tool off (NN-L-EVA, lab PR 225)
 |   held: the kill for a rename seen only as a watched directory's new entry (NN-L-FIM-010, a match added by lab PR 225)
+|   held: the kill of a process that connected to a public address its lineage did not resolve (NN-L-NET-028, lot 275)
 --- stderr
 (empty)
 
@@ -201,6 +209,7 @@ exit: 1
 |   held: the kill of the ransomware actor's process tree (NN-L-IMP-001, lab PR 225)
 |   held: the kill of the staged program that asked a security tool off (NN-L-EVA, lab PR 225)
 |   held: the kill for a rename seen only as a watched directory's new entry (NN-L-FIM-010, a match added by lab PR 225)
+|   held: the kill of a process that connected to a public address its lineage did not resolve (NN-L-NET-028, lot 275)
 --- stderr
 (empty)
 
@@ -7848,7 +7857,7 @@ exit: 2
 --- stdout
 (empty)
 --- stderr
-| policy test: events.json: line 1: not an event: unknown variant `kind`, expected one of `ProcessSpawn`, `FileOpen`, `MassWrite`, `FileBurst`, `DefenderSignal`, `ExecCheck`, `ModuleLoad`, `BpfSyscall`, `IoUring`, `TcpConnect`, `DnsQuery`, `FsProtectDenial`, `Fim`, `CanaryTripped`, `NetFlow`, `NetListener`, `DnsFlood`, `SensorFlood`, `ExploitPostcondition`
+| policy test: events.json: line 1: not an event: unknown variant `kind`, expected one of `ProcessSpawn`, `FileOpen`, `MassWrite`, `FileBurst`, `DefenderSignal`, `ExecCheck`, `ModuleLoad`, `BpfSyscall`, `IoUring`, `TcpConnect`, `DnsQuery`, `FsProtectDenial`, `Fim`, `CanaryTripped`, `NetFlow`, `NetListener`, `DnsFlood`, `SensorFlood`, `ExploitPostcondition`, `NetInbound`, `DnsAnswer`, `TlsClientHello`
 
 ### policy-test.error.events-wrapped-not-an-event
 $ nn-admin policy test --events events.json --config-dir empty
@@ -7856,7 +7865,7 @@ exit: 2
 --- stdout
 (empty)
 --- stderr
-| policy test: events.json: line 1: not an event: unknown variant `x`, expected one of `ProcessSpawn`, `FileOpen`, `MassWrite`, `FileBurst`, `DefenderSignal`, `ExecCheck`, `ModuleLoad`, `BpfSyscall`, `IoUring`, `TcpConnect`, `DnsQuery`, `FsProtectDenial`, `Fim`, `CanaryTripped`, `NetFlow`, `NetListener`, `DnsFlood`, `SensorFlood`, `ExploitPostcondition`
+| policy test: events.json: line 1: not an event: unknown variant `x`, expected one of `ProcessSpawn`, `FileOpen`, `MassWrite`, `FileBurst`, `DefenderSignal`, `ExecCheck`, `ModuleLoad`, `BpfSyscall`, `IoUring`, `TcpConnect`, `DnsQuery`, `FsProtectDenial`, `Fim`, `CanaryTripped`, `NetFlow`, `NetListener`, `DnsFlood`, `SensorFlood`, `ExploitPostcondition`, `NetInbound`, `DnsAnswer`, `TlsClientHello`
 
 ### policy-test.error.events-blank-lines
 $ nn-admin policy test --events events.json --config-dir empty

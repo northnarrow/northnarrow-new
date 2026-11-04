@@ -99,7 +99,7 @@ fn remember_flow_sock(sk_ptr: u64, corr: &[u8; 16]) {
 /// corr_id (sk_ptr alone is unique while the sock is allocated;
 /// the ts prefix de-confuses across allocator reuse).
 #[inline(always)]
-fn build_corr_id(timestamp_ns: u64, sk_ptr: u64) -> [u8; 16] {
+pub(crate) fn build_corr_id(timestamp_ns: u64, sk_ptr: u64) -> [u8; 16] {
     let mut out = [0u8; 16];
     let ts = timestamp_ns.to_le_bytes();
     let sp = sk_ptr.to_le_bytes();
@@ -224,6 +224,8 @@ fn try_tcp_connect_v4(ctx: &ProbeContext) -> Result<(), i64> {
     if sk_ptr != 0 {
         let corr = build_corr_id(ts, sk_ptr);
         remember_flow_sock(sk_ptr, &corr);
+        // Lot 275: the socket's first send is a ClientHello candidate.
+        crate::tls_hello::remember(sk_ptr);
     }
     entry.submit(0);
     Ok(())
@@ -277,6 +279,8 @@ fn try_tcp_connect_v6(ctx: &ProbeContext) -> Result<(), i64> {
     if sk_ptr != 0 {
         let corr = build_corr_id(ts, sk_ptr);
         remember_flow_sock(sk_ptr, &corr);
+        // Lot 275: the socket's first send is a ClientHello candidate.
+        crate::tls_hello::remember(sk_ptr);
     }
     entry.submit(0);
     Ok(())

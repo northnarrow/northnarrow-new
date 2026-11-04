@@ -26,7 +26,7 @@
 use libfuzzer_sys::fuzz_target;
 use nn_proto::ipc::{
     alpn_display, check_hello, check_response, decode, encode, max_qname_out,
-    min_dns_answer_bytes, Answer, Expected, FromWorker, QnameForm, QnameIn, Request, SniOut, TlsOut,
+    min_dns_answer_bytes, Answer, DnsRecordOut, Expected, MAX_DNS_NAME_OUT, MAX_DNS_RECORDS, FromWorker, QnameForm, QnameIn, Request, SniOut, TlsOut,
     ToWorker, WorkerKind, LANDLOCK_ABI_KNOWN, MAX_ALPN, MAX_TLS_FIELD,
 };
 
@@ -133,8 +133,21 @@ fn accepted_answer(req: &Request, answer: &Answer) {
                 }
             }
         }
-        (Request::DnsAnswers(bytes), Answer::DnsAnswers { a, aaaa }) => {
-            assert!(min_dns_answer_bytes(a.len(), aaaa.len()) <= bytes.len());
+        (Request::DnsAnswers(_), Answer::DnsAnswers(None)) => {}
+        // lot 275: the records fit in the bytes, within the bound; every
+        // name printable ASCII and bounded
+        (Request::DnsAnswers(bytes), Answer::DnsAnswers(Some(out))) => {
+            assert!(out.records.len() <= MAX_DNS_RECORDS);
+            assert!(min_dns_answer_bytes(&out.records) <= bytes.len());
+            assert!(out.rcode <= 15);
+            let ok = |n: &str| n.len() <= MAX_DNS_NAME_OUT && n.bytes().all(|b| (0x20..=0x7e).contains(&b));
+            assert!(ok(&out.qname), "{out:?}");
+            for r in &out.records {
+                match r {
+                    DnsRecordOut::A { name, .. } | DnsRecordOut::Aaaa { name, .. } => assert!(ok(name)),
+                    DnsRecordOut::Cname { name, target, .. } => assert!(ok(name) && ok(target)),
+                }
+            }
         }
         (req, answer) => panic!("{} accepted {answer:?}", req.name()),
     }

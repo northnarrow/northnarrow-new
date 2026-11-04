@@ -95,6 +95,12 @@ const UDP6_MAPPED_PORT: u16 = 35998;
 /// the same helper connects to during the burst.
 const UDP_BURST_PORT: u16 = 35996;
 const TCP_DURING_BURST_PORT: u16 = 35995;
+/// Lot 275: the ports of the inbound, TLS ClientHello and "no DNS, no
+/// connect" tests.
+const INBOUND_PORT: u16 = 35994;
+const TLS_PORT: u16 = 35993;
+const TLS_SNI: &str = "nn-e2e.northnarrow-e2etest.invalid";
+const NET_028: &str = "NN-L-NET-028_ConnectWithoutDns";
 
 fn nn_admin_bin() -> &'static str {
     env!("CARGO_BIN_EXE_nn-admin")
@@ -518,9 +524,13 @@ s.close()
     // Wait for the netflow row with our destination port. Other
     // background TCP activity on the host may also append rows
     // — we filter by dst_port to anchor on ours.
+    // Lot 275: the listener's side of the same connection is an inbound
+    // row (`inbound`), with the same destination: the outbound one is
+    // asserted here.
     let rows = fx.wait_netflow_matching(1, |r| {
         r["dst_port"].as_u64() == Some(FLOW_DST_PORT as u64)
             && r["dst_addr"].as_str() == Some("127.0.0.1")
+            && r["inbound"].as_bool() != Some(true)
     });
     let row = &rows[0];
     assert_eq!(row["proto"].as_u64(), Some(6), "proto must be TCP (6)");
@@ -951,6 +961,7 @@ u.close()
     let tcp_row = |r: &serde_json::Value| {
         r["proto"].as_u64() == Some(6)
             && r["dst_port"].as_u64() == Some(TCP_DURING_BURST_PORT as u64)
+            && r["inbound"].as_bool() != Some(true)
     };
     fx.wait_netflow_matching(1, tcp_row);
 
@@ -981,5 +992,238 @@ u.close()
         bytes >= 5_000_000,
         "the aggregated rows must carry most of the ~10 MB sent; got {bytes} bytes in {} rows",
         rows.len()
+    );
+}
+
+// ── Lot 275 (C07): inbound connections, TLS ClientHellos, NN-L-NET-028 ──
+
+/// Lot 275 — an accepted connection is an inbound row of the netflow log
+/// (`"inbound": true`): the peer that connected as the source, the
+/// listener's end as the destination, the accepting process (this test
+/// binary) as its pid, the byte counters of the listener's side.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn net_inbound_connection_records_its_rows() {
+    let _eni = EniIptablesGuard::install();
+    let fx = NetFixture::setup();
+    let listener = TcpListener::bind(("127.0.0.1", INBOUND_PORT)).expect("bind the inbound port");
+    let accept_thread = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4];
+            let _ = stream.read_exact(&mut buf);
+            let _ = stream.write_all(b"pong");
+        }
+    });
+    let helper = format!(
+        r#"
+import socket
+s = socket.create_connection(("127.0.0.1", {port}), 3)
+s.sendall(b"ping")
+s.recv(4)
+s.close()
+"#,
+        port = INBOUND_PORT,
+    );
+    let status = Command::new("python3")
+        .arg("-c")
+        .arg(&helper)
+        .status()
+        .expect("spawn the inbound client");
+    assert!(status.success(), "client: {status:?}");
+    let _ = accept_thread.join();
+    let rows = fx.wait_netflow_matching(1, |r| {
+        r["inbound"].as_bool() == Some(true)
+            && r["dst_port"].as_u64() == Some(INBOUND_PORT as u64)
+            && r["dst_addr"].as_str() == Some("127.0.0.1")
+    });
+    let row = &rows[0];
+    assert_eq!(row["proto"].as_u64(), Some(6), "{row}");
+    assert_eq!(
+        row["pid"].as_u64(),
+        Some(u64::from(std::process::id())),
+        "the accepting process: {row}"
+    );
+    assert_eq!(row["src_addr"].as_str(), Some("127.0.0.1"), "{row}");
+    assert!(
+        row["src_port"]
+            .as_u64()
+            .is_some_and(|p| p > 0 && p != INBOUND_PORT as u64),
+        "{row}"
+    );
+    assert!(row["bytes_recv"].as_u64().is_some_and(|b| b >= 4), "{row}");
+    assert!(row["bytes_sent"].as_u64().is_some_and(|b| b >= 4), "{row}");
+    assert_eq!(row["flow_id"].as_str().map(str::len), Some(32), "{row}");
+    // the client's own row is outbound, on the same destination
+    fx.wait_netflow_matching(1, |r| {
+        r["inbound"].as_bool() != Some(true) && r["dst_port"].as_u64() == Some(INBOUND_PORT as u64)
+    });
+}
+
+/// Lot 275 — a TLS client's ClientHello is fingerprinted: its flow's
+/// closed row carries the JA3, the JA4 and the SNI it sent. The "server"
+/// reads the hello and closes (no handshake: nothing leaves the host).
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn net_tls_client_hello_fingerprint_on_the_flow_row() {
+    let _eni = EniIptablesGuard::install();
+    let fx = NetFixture::setup();
+    let listener = TcpListener::bind(("127.0.0.1", TLS_PORT)).expect("bind the TLS port");
+    let accept_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+        }
+    });
+    let helper = format!(
+        r#"
+import socket, ssl
+ctx = ssl.create_default_context()
+s = socket.create_connection(("127.0.0.1", {port}), 3)
+try:
+    ctx.wrap_socket(s, server_hostname="{sni}")
+except Exception:
+    pass
+s.close()
+"#,
+        port = TLS_PORT,
+        sni = TLS_SNI,
+    );
+    let status = Command::new("python3")
+        .arg("-c")
+        .arg(&helper)
+        .status()
+        .expect("spawn the TLS client");
+    assert!(status.success(), "client: {status:?}");
+    let _ = accept_thread.join();
+    let rows = fx.wait_netflow_matching(1, |r| {
+        r["inbound"].as_bool() != Some(true)
+            && r["dst_port"].as_u64() == Some(TLS_PORT as u64)
+            && r["ja3"].is_string()
+    });
+    let row = &rows[0];
+    let ja3 = row["ja3"].as_str().unwrap_or("");
+    assert!(
+        ja3.len() == 32 && ja3.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{row}"
+    );
+    let ja4 = row["ja4"].as_str().unwrap_or("");
+    assert!(ja4.len() == 36 && ja4.starts_with('t'), "{row}");
+    assert_eq!(row["sni"].as_str(), Some(TLS_SNI), "{row}");
+}
+
+/// A DNS response for `name` (one A record, `addr`, TTL 60) to `query`.
+fn dns_response(query: &[u8], addr: [u8; 4]) -> Vec<u8> {
+    let mut r = Vec::with_capacity(query.len() + 16);
+    r.extend_from_slice(&query[..2]); // id
+    r.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+    r.extend_from_slice(&query[12..]); // the question, as asked
+    r.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+    r.extend_from_slice(&addr);
+    r
+}
+
+/// Lot 275 — NN-L-NET-028: a process that asked a name (a DNS server of
+/// the test's own on 127.0.0.2:53 answers it with a documentation
+/// address) and connects to the address is not recorded; a process that
+/// connects to a documentation address with no lookup is (Medium, its kill
+/// held: `Log`). The addresses route nowhere: the connects fail, the
+/// connect hook has seen them.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn net_connect_without_dns_is_recorded_and_a_resolved_one_is_not() {
+    let _eni = EniIptablesGuard::install();
+    let fx = NetFixture::setup();
+    // the DNS server: one response for each query, then done
+    let server = std::net::UdpSocket::bind("127.0.0.2:53").expect("bind 127.0.0.2:53");
+    server
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let server_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        if let Ok((n, from)) = server.recv_from(&mut buf) {
+            if n > 12 {
+                let _ = server.send_to(&dns_response(&buf[..n], [198, 51, 100, 210]), from);
+            }
+        }
+    });
+    // the resolved client: asks, receives the answer, connects to it
+    let resolved = r#"
+import os, socket, struct, sys
+q = struct.pack(">HHHHHH", 0x4e42, 0x0100, 1, 0, 0, 0)
+q += b"\x08resolved\x0fnorthnarrow-e2e\x07invalid\x00" + struct.pack(">HH", 1, 1)
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+u.settimeout(5)
+u.sendto(q, ("127.0.0.2", 53))
+a, _ = u.recvfrom(512)
+ip = ".".join(str(b) for b in a[-4:])
+print(os.getpid(), ip, flush=True)
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect((ip, 9))
+except Exception:
+    pass
+"#;
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(resolved)
+        .output()
+        .expect("spawn the resolved client");
+    let _ = server_thread.join();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut parts = text.split_whitespace();
+    let resolved_pid: u64 = parts.next().and_then(|p| p.parse().ok()).expect("its pid");
+    assert_eq!(
+        parts.next(),
+        Some("198.51.100.210"),
+        "the answer read: {text}"
+    );
+    // the literal client
+    let literal = r#"
+import os, socket
+print(os.getpid(), flush=True)
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect(("198.51.100.211", 9))
+except Exception:
+    pass
+"#;
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(literal)
+        .output()
+        .expect("spawn the literal client");
+    let literal_pid: u64 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("its pid");
+    // the literal connect's record; the resolved one, judged before it by
+    // the same pump, has none
+    let deadline = Instant::now() + JSONL_POLL_TIMEOUT;
+    let mine = |pid: u64| -> Vec<serde_json::Value> {
+        common::records_of(&fx.detections_log, NET_028)
+            .into_iter()
+            .filter(|r| r["principal"]["pid"].as_u64() == Some(pid))
+            .collect()
+    };
+    while mine(literal_pid).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    let rec = mine(literal_pid);
+    assert_eq!(rec.len(), 1, "the literal connect's NN-L-NET-028 record");
+    assert_eq!(rec[0]["severity"], "Medium", "{}", rec[0]);
+    assert_eq!(
+        rec[0]["verdict"],
+        serde_json::json!({"Rule": "Log"}),
+        "held: {}",
+        rec[0]
+    );
+    assert!(
+        mine(resolved_pid).is_empty(),
+        "the resolved connect drew NN-L-NET-028: {:?}",
+        mine(resolved_pid)
     );
 }

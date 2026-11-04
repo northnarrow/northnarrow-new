@@ -30,6 +30,8 @@ pub mod kmod_invocation;
 pub mod module_provenance;
 pub mod net;
 pub mod net_fanout;
+/// Lot 275: NN-L-NET-028, "no DNS, no connect".
+pub mod net_nodns;
 mod r001_exec_from_tmp;
 mod r002_exec_from_dev_shm;
 mod r003_exec_from_var_tmp;

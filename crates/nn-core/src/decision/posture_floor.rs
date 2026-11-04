@@ -182,7 +182,6 @@ pub const OBSERVING_KILLS: &[(&str, ObservingKill)] = {
         // Network
         ("NN-L-NET-001_OutboundToBlockedIp", BeforeWave4),
         ("NN-L-NET-002_OutboundToBlockedTld", BeforeWave4),
-        ("NN-L-NET-003_BadJa3", BeforeWave4),
         ("NN-L-NET-008_OutboundFromTmpExec", BeforeWave4),
         ("NN-L-NET-010_OutboundToHighRiskC2Port", BeforeWave4),
         ("NN-L-NET-014_DnsTunnelEntropy", BeforeWave4),

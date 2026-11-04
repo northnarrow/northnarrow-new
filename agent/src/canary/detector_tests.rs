@@ -804,6 +804,7 @@ fn flow_row(
         close_reason: 111,
         phase,
         observed_ns: start_ns + 1_000,
+        dns_resolution: Default::default(),
     })
 }
 
@@ -1017,6 +1018,7 @@ fn the_trips_own_connection_draws_no_chain_verdict_in_any_order() {
         close_reason: 0,
         phase: FlowPhase::Closed,
         observed_ns: 0,
+        dns_resolution: Default::default(),
     });
     let trip = connect_to("127.0.0.1", 41147, PID, T0);
 

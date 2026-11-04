@@ -586,6 +586,33 @@ attribution only (the DNS rules judge the queries on the wire).
 - **Not seen:** a program that asks systemd-resolved itself (varlink or
   D-Bus, not through glibc), a statically linked resolver.
 
+## Inbound connections, DNS responses, TLS ClientHellos (lot 275)
+
+Three sources of network telemetry ([NETWORK_TELEMETRY.md](NETWORK_TELEMETRY.md)),
+each optional: one that does not attach is a signed degradation and the
+agent runs without it.
+
+- **`net_inbound`**: fexit on `inet_csk_accept` and the existing fexit on
+  `tcp_close`. `inet_csk_accept` takes four parameters up to 6.9 (`sk,
+  flags, err, kern`) and two from 6.10 (`sk, arg`); its return value is the
+  slot after the last parameter, so the object carries one program per
+  count (`inbound_accept_ret4`, `inbound_accept_ret2`) and the agent loads
+  the one this kernel's BTF names (`PARAM_COUNT_FUNCS` in
+  `common/src/btf_offsets.rs`; `verifier-check` lists the other as built
+  for another kernel's count, not a failure).
+- **`dns_answer`**: fexit on `udp_recvmsg` and `udpv6_recvmsg`, six
+  parameters up to 5.18 (`noblock` among them) and five from 5.19
+  (`dns_answer_v4_ret6`/`_ret5`, `dns_answer_v6_ret6`/`_ret5`), chosen the
+  same way. Without `udpv6_recvmsg` the source is `partial` (IPv6
+  responses not seen). The response is read from the receiver's buffer
+  through the iterator's base (`ITER_UBUF` from 6.0, a one-segment
+  `ITER_IOVEC` before), the offsets of the DNS query sensor.
+- **`tls_hello`**: fentry on `tcp_sendmsg` (`sk, msg, size` on every
+  supported kernel), the sender's buffer read the same way.
+
+The variable-size reads (`bpf_probe_read_user` of a length masked below its
+destination's size) are the constructs of "Older verifiers" below.
+
 ## Standard streams at exec and the connect deny (lab PR 224)
 
 `sched_process_exec` reads the new image's fds 0..2 and its parent's

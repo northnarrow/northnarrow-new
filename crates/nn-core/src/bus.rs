@@ -665,6 +665,13 @@ pub fn record_time_ns(event: &Event) -> u64 {
             FlowPhase::Closed if nf.proto == 6 => nf.end_ns,
             FlowPhase::Closed => 0,
         },
+        // Lot 275: the accept's time, or the close's
+        Event::NetInbound(nf) => match nf.phase {
+            FlowPhase::Closed => nf.end_ns,
+            _ => nf.observed_ns,
+        },
+        Event::DnsAnswer(a) => a.timestamp_ns,
+        Event::TlsClientHello(h) => h.timestamp_ns,
     }
 }
 
@@ -674,7 +681,9 @@ pub fn record_time_ns(event: &Event) -> u64 {
 pub fn actor_of(event: &Event) -> (u32, u64) {
     match event {
         Event::ProcessSpawn { pid, start_ns, .. } => (*pid, *start_ns),
-        Event::NetFlow(nf) => (nf.pid, nf.proc_start_ns),
+        Event::NetFlow(nf) | Event::NetInbound(nf) => (nf.pid, nf.proc_start_ns),
+        Event::DnsAnswer(a) => (a.pid, 0),
+        Event::TlsClientHello(h) => (h.pid, 0),
         Event::FileOpen { pid, .. }
         | Event::MassWrite { pid, .. }
         | Event::FileBurst { pid, .. }
@@ -2159,6 +2168,7 @@ mod tests {
                 close_reason: 0,
                 phase,
                 observed_ns,
+                dns_resolution: Default::default(),
             })
         };
         assert_eq!(

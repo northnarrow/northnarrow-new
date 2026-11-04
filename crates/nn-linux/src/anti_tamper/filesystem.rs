@@ -237,6 +237,9 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     // Lab PR 226 (EXPERIMENTAL): the exec policy and its signature.
     "exec-policy.local",
     "exec-policy.local.sig",
+    // Lot 275: NN-L-NET-028's allowlist and its signature.
+    "nodns-allow.local",
+    "nodns-allow.local.sig",
 ];
 
 /// External audit EVD-001: the subset of [`ETC_WRITE_DENY_FILES`] no
@@ -2666,6 +2669,9 @@ mod tests {
                 "security-tools.v1",
                 "exec-policy.local",
                 "exec-policy.local.sig",
+                // Lot 275 — APPENDED.
+                "nodns-allow.local",
+                "nodns-allow.local.sig",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"

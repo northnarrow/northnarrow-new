@@ -65,6 +65,12 @@ pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {
     /// followed; `None` when it is not a directory or cannot be read.
     fn dir_owner<P: AsRef<Path>>(path: P) -> Option<u32>;
 
+    /// The device and inode of the file `path` names, opened as a file
+    /// (`O_PATH`, `fstat(2)`): a process's `exe` (the kernel's link to the
+    /// image it executed) or a file of the host; `None` when it cannot be
+    /// opened (the final check of #495, C1).
+    fn file_id<P: AsRef<Path>>(path: P) -> Option<(u64, u64)>;
+
     /// The time the host has spent suspended so far, ns: the boot clock
     /// less the monotonic clock (`CLOCK_BOOTTIME` − `CLOCK_MONOTONIC`).
     fn suspended_ns() -> u64;
@@ -183,6 +189,14 @@ pub(crate) mod testing {
                 .ok()
                 .filter(|m| m.is_dir())
                 .map(|_| TEST_OWNER)
+        }
+
+        /// No file's identity on the portable host (a device and an inode
+        /// are an OS's): no image is the host's file. The Linux semantics are
+        /// tested with the agent's host (`posture_host_linux`, and the DNS
+        /// response pump's resolver test).
+        fn file_id<P: AsRef<Path>>(_path: P) -> Option<(u64, u64)> {
+            None
         }
 
         fn suspended_ns() -> u64 {

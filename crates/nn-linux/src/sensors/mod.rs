@@ -27,6 +27,9 @@ pub mod flow_sock;
 /// Lot 279: the exec pump's reading of a module tool's exec (R011).
 pub mod kmod_exec;
 pub mod multiplexer;
+/// Lot 275 (C07): the inbound, DNS response and TLS ClientHello sensors'
+/// attach, and the pumps of the last two.
+pub mod net_telemetry;
 pub mod open_sensor;
 /// R12b (lab PR 269): the ring pumps on threads of their own.
 pub mod pump;

@@ -2,8 +2,9 @@
 
 Every detection rule has a built-in response: a record (`Log`), a kill of the
 process or of its tree, a capability stripped from a file. Some kills added by
-lab PRs 219–226 are **held** by default (recorded as an alert, the process left
-running) until an operator turns them on. The per-rule response policy is
+lab PRs 219–226 and lot 275 (NN-L-NET-028's — `NETWORK_TELEMETRY.md`) are
+**held** by default (recorded as an alert, the process left running) until an operator
+turns them on. The per-rule response policy is
 where you do that, rule by rule, and where you tone a noisy rule down or
 exempt one known program from it. Design:
 https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/MULTI_MATCH_AND_RULE_POLICY.md
@@ -156,6 +157,26 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CAT
 | `exempt <rule> cgroup <path>` | processes of that cgroup v2 path (it must end in a `.service` or `.scope`) **started there** (§2.1) |
 | `exempt <rule> unit <name>` | processes of that systemd unit (`backup.service`) **started there** (§2.1) |
 | `combat-without-corroboration NN-L-IMP-001` | the ransomware trigger reaches COMBAT without a second signal (it never locks COMBAT) |
+
+`enforce` is **refused** for a rule whose kill would not be fail-safe:
+- NN-L-NET-003, a TLS fingerprint (JA3 or JA4) in the operator's list — one
+  attribute many benign programs share, until the rule has a second
+  predicate (a destination, an executable) to act on (lot 275, R6 of the
+  external review of 04/11; a fingerprint names a TLS stack, not a program
+  — `NETWORK_TELEMETRY.md` §3);
+- NN-L-NET-028, "no DNS, no connect" — it judges the absence of a DNS
+  answer the agent saw, which benign software can produce out of its sight
+  (a container's resolvers of its own, DNS over TCP, DoT or DoH, an address
+  configured by hand): refused until it is measured on a wider corpus
+  (review of #495; `NETWORK_TELEMETRY.md` §4). Its kill stays held.
+In a policy you sign, the line refuses the file like any bad line
+(`nn-admin config overlay set` and `policy-test` say so). In a policy
+signed before the upgrade, the agent's start takes only that line as
+`alert` and keeps the rest of the policy in force — its exemptions, its
+other modes, its switches — and signs a `rule_policy` degradation naming
+the line ("enforce refused, applied as alert"); `policy show` names it in
+the policy's source. `alert`, `audit`, `off` and `exempt` of the rule are
+accepted.
 
 An exemption is **never** by process name: `comm`, `name`, `process` and
 `argv` refuse the file (any user can name a process `sshd`). When the agent

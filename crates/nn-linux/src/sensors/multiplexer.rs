@@ -89,6 +89,14 @@ pub struct NetWiring {
     /// External audit NETR-008: names the connecting process's image on
     /// every TCP connect (the spawn cache, `/proc` as fallback).
     pub lineage: crate::posture::lineage::AuthSessionTracker,
+    /// Lot 275 (NN-L-NET-028): which process resolved which address, fed
+    /// by the DNS query and response pumps, read by the connect pump and
+    /// the net drain.
+    pub resolved: Arc<crate::net::resolved::ResolvedTable>,
+    /// Lot 275: how far the TLS ClientHello pump has read its ring (the net
+    /// drain's closes wait for it, so a closed row carries its
+    /// fingerprint).
+    pub tls_ingest: Arc<crate::net::dns_ingest::DnsIngest>,
 }
 
 /// Tappa 10 N9 — ringbufs the multiplexer surfaces back to the
@@ -102,6 +110,9 @@ pub struct NetRingBufs {
     pub listen_rb: RingBuf<MapData>,
     /// Review 73: the UDP flow records, apart from the TCP closes.
     pub udp_rb: RingBuf<MapData>,
+    /// Lot 275 (C07): the inbound connections (accepts and their closes),
+    /// for the inbound drain (`crate::net::inbound`).
+    pub inbound_rb: RingBuf<MapData>,
 }
 
 /// The exec guards' kernel configuration, which the load writes once the
@@ -479,6 +490,8 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         // the close + listen ringbufs would fill up + drop events,
         // and the kernel-side observation would waste cycles. Keep
         // start() lean for the existing exec_sensor_live test.
+        // Lot 275: which of the three network sensors attached.
+        let mut net_attached = crate::sensors::net_telemetry::Attached::default();
         let net_bufs = if net.is_some() {
             // Lab PR 229: names resolved through systemd-resolved's NSS
             // module, for the DNS attribution (optional).
@@ -528,10 +541,15 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             let listen_rb = take_ringbuf(&mut ebpf, "NET_LISTEN_EVENTS")?;
             let udp_rb = take_ringbuf(&mut ebpf, "NET_UDP_EVENTS")?;
             info!("net: N2 BPF programs attached (inet_csk_listen_start kprobe + tcp_close fexit + udp_sendmsg_outbound kprobes on udp_sendmsg and udpv6_sendmsg)");
+            // Lot 275 (C07): the inbound connections, the DNS responses and
+            // the TLS ClientHellos (soft: each one missing is signed).
+            net_attached = crate::sensors::net_telemetry::attach(&mut ebpf, &btf, &attach_points);
+            let inbound_rb = take_ringbuf(&mut ebpf, "INBOUND_EVENTS")?;
             Some(NetRingBufs {
                 close_rb,
                 listen_rb,
                 udp_rb,
+                inbound_rb,
             })
         } else {
             None
@@ -556,8 +574,19 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             flow_tracker: Arc::clone(&w.flow_tracker),
             lineage: w.lineage.clone(),
             dns_cache: Arc::clone(&w.dns_cache),
+            resolved: Arc::clone(&w.resolved),
         });
         let dns_cache_for_dns = net.as_ref().map(|w| Arc::clone(&w.dns_cache));
+        let resolved_for_dns = net.as_ref().map(|w| Arc::clone(&w.resolved));
+        // Lot 275: the DNS response and TLS ClientHello rings, pumped only
+        // with net wiring (their programs attach only then).
+        let net_telemetry_rbs = match net.as_ref() {
+            Some(_) => Some((
+                take_ringbuf(&mut ebpf, "DNS_ANSWER_EVENTS")?,
+                take_ringbuf(&mut ebpf, "TLS_HELLO_EVENTS")?,
+            )),
+            None => None,
+        };
         // External audit SNS-014: the DNS pump names a sender through the
         // lineage tracker (its spawn cache, `/proc` checked against the
         // query's time); without net wiring, a tracker of its own on `/proc`.
@@ -614,8 +643,14 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 Pump::Thread(spawn_dns_query_pump(
                     dns_query_rb,
                     dns_cache_for_dns,
-                    lineage_for_dns,
+                    resolved_for_dns,
+                    lineage_for_dns.clone(),
                     ParseClient::new(plan.parse.clone()),
+                    // review of #495, D3: its ring's and its budget's losses
+                    ring_drops.loss_watch(&[
+                        common::ring_drops::ring_slot::DNS,
+                        common::ring_drops::ring_slot::DNS_RATE,
+                    ]),
                     &tx,
                     &rt,
                 )?),
@@ -657,6 +692,44 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 )),
             ),
         ];
+        let mut pumps = pumps;
+        // Lot 275 (C07): the DNS response and TLS ClientHello pumps.
+        if let (Some(w), Some((answer_rb, tls_rb))) = (net.as_ref(), net_telemetry_rbs) {
+            pumps.push((
+                "dns_answer",
+                Pump::Thread(crate::sensors::net_telemetry::spawn_dns_answer_pump(
+                    answer_rb,
+                    Arc::clone(&w.resolved),
+                    net_attached.dns_answer,
+                    w.lineage.clone(),
+                    ParseClient::new(plan.parse.clone()),
+                    // review of #495, D3: its ring's and its budget's losses
+                    ring_drops.loss_watch(&[
+                        common::ring_drops::ring_slot::DNS_ANSWER,
+                        common::ring_drops::ring_slot::DNS_ANSWER_RATE,
+                    ]),
+                    // the second review of #495, R1: a resolver's uid
+                    crate::sensors::dns_sensor::host_resolver_uids(),
+                    // R2: the coverage losses, signed
+                    ring_drops.audit(),
+                    &tx,
+                    &rt,
+                )?),
+            ));
+            pumps.push((
+                "tls_hello",
+                Pump::Thread(crate::sensors::net_telemetry::spawn_tls_pump(
+                    tls_rb,
+                    Arc::clone(&w.tls_ingest),
+                    net_attached.tls_hello,
+                    Arc::clone(&w.flow_tracker),
+                    w.lineage.clone(),
+                    ParseClient::new(plan.parse.clone()),
+                    &tx,
+                    &rt,
+                )?),
+            ));
+        }
 
         Ok((
             Self {
@@ -1321,6 +1394,8 @@ struct ConnectWiring {
     flow_tracker: Arc<Mutex<FlowTracker>>,
     lineage: AuthSessionTracker,
     dns_cache: Arc<DnsCache>,
+    /// Lot 275: the connect-time row's DNS judgement (NN-L-NET-028).
+    resolved: Arc<crate::net::resolved::ResolvedTable>,
 }
 
 /// The connect pump (R12b: a thread of its own, a source of the bus).
@@ -1357,6 +1432,19 @@ impl Drop for ConnectPumpClaim {
     }
 }
 
+/// Wait until both DNS pumps have read the records made before `newest`
+/// (the queries for the attribution, the responses for NN-L-NET-028):
+/// `false` when either wait ended first (review of #495, D2).
+fn dns_barrier(w: &ConnectWiring, newest: u64, rt: &tokio::runtime::Handle) -> bool {
+    let (names, answers) = rt.block_on(async {
+        tokio::join!(
+            w.dns_cache.ingest().caught_up(newest),
+            w.resolved.ingest().caught_up(newest)
+        )
+    });
+    names && answers
+}
+
 /// Connect records on the bus ([`connect_events`], in order, in batches),
 /// then, lab PR 246, announced to the flow tracker: each one's close, held
 /// by the net drain until then, follows it on the bus. `false` when the
@@ -1364,13 +1452,14 @@ impl Drop for ConnectPumpClaim {
 fn send_connects(
     raws: &[TcpConnectRaw],
     wiring: Option<&ConnectWiring>,
+    caught_up: bool,
     tx: &BusSender,
     rt: &tokio::runtime::Handle,
 ) -> bool {
     for chunk in raws.chunks(crate::sensors::bus::BATCH_MAX / 2) {
         let events: Vec<Event> = chunk
             .iter()
-            .flat_map(|raw| connect_events(raw, wiring))
+            .flat_map(|raw| connect_events(raw, wiring, caught_up))
             .collect();
         if tx.send_batch_blocking(rt, events).is_err() {
             return false;
@@ -1418,13 +1507,17 @@ fn pump_tcp_connect(
         // Lab PR 229: the connect-time rows name the destination's DNS name
         // once the DNS pump has read the queries made before these
         // connects (`DnsIngest`); read later, a query was not there yet.
+        let mut caught_up = true;
         if let (Some(w), Some(newest)) = (
             flow_tracker.as_ref(),
             batch.iter().map(|r| r.timestamp_ns).max(),
         ) {
-            rt.block_on(w.dns_cache.ingest().caught_up(newest));
+            // Lot 275: and once the DNS response pump has read the responses
+            // received before them (NN-L-NET-028's judgement). Review of
+            // #495, D2: a wait that ended first leaves the judgement unknown.
+            caught_up = dns_barrier(w, newest, rt);
         }
-        if !send_connects(&batch, flow_tracker.as_ref(), tx, rt) {
+        if !send_connects(&batch, flow_tracker.as_ref(), caught_up, tx, rt) {
             return Ok(());
         }
         batch.clear();
@@ -1450,7 +1543,14 @@ fn pump_tcp_connect(
 ///   [`send_connects`]): the net drain holds its close until then.
 ///   Without net wiring (the exec sensor's live test) only the
 ///   `TcpConnect`.
-fn connect_events(raw: &TcpConnectRaw, wiring: Option<&ConnectWiring>) -> Vec<Event> {
+///
+/// `caught_up`: the DNS pumps read the records made before the batch's
+/// connects (NN-L-NET-028's barrier; `false`: unknown, review of #495 D2).
+fn connect_events(
+    raw: &TcpConnectRaw,
+    wiring: Option<&ConnectWiring>,
+    caught_up: bool,
+) -> Vec<Event> {
     let Some(w) = wiring else {
         return vec![Event::from(raw)];
     };
@@ -1470,6 +1570,16 @@ fn connect_events(raw: &TcpConnectRaw, wiring: Option<&ConnectWiring>) -> Vec<Ev
         row.resolved_hostname =
             w.dns_cache
                 .lookup_for_connect(row.pid, row.start_ns, row.proc_start_ns);
+        // Lot 275 (NN-L-NET-028): did the lineage resolve the destination
+        row.dns_resolution = crate::net::resolved::judge(
+            &w.resolved,
+            &w.lineage,
+            row.pid,
+            row.proc_start_ns,
+            row.dst_addr,
+            row.start_ns,
+            caught_up,
+        );
         out.push(Event::NetFlow(row));
     }
     out
@@ -1540,6 +1650,7 @@ fn dns_events(
     decoded: Option<&nn_proto::ipc::QnameOut>,
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
+    resolved: Option<&crate::net::resolved::ResolvedTable>,
 ) -> (Event, Option<Event>) {
     let mut event = query_event(raw, decoded);
     let mut flood = None;
@@ -1572,6 +1683,29 @@ fn dns_events(
                 *timestamp_ns,
             );
         }
+        // Lot 275 (NN-L-NET-028): the name the process asked, for the
+        // response to bind (or the response seen already); a lost record
+        // of it makes its connects' judgement unknown
+        if let Some(t) = resolved {
+            if decoded.is_some() {
+                t.on_query(*pid, query_name, *timestamp_ns);
+            } else {
+                // the parse worker did not answer: the name is not known
+                t.note_undecoded(*timestamp_ns);
+            }
+            // review of #495, D3: a user's held queries leave every
+            // process's evidence incomplete; a process's, its lineage's
+            if raw.held != 0 && raw.flags & dns_flags::RATE_HELD_UID != 0 {
+                t.note_coverage_lost(
+                    crate::net::resolved::CoverageCause::UserHeld,
+                    Some(*pid),
+                    Some(*uid),
+                    *timestamp_ns,
+                );
+            } else if raw.held != 0 {
+                t.note_held(*pid, *timestamp_ns);
+            }
+        }
         // Review 78: queries the kernel's DNS budgets held back since this
         // process's previous record.
         if raw.held != 0 {
@@ -1603,8 +1737,29 @@ fn nss_events(
     decoded: Option<&nn_proto::ipc::QnameOut>,
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
+    resolved: Option<&crate::net::resolved::ResolvedTable>,
 ) -> Option<Event> {
-    if let (Some(cache), Some(name)) = (dns_cache, nss_query_name(decoded)) {
+    let name = nss_query_name(decoded);
+    // Lot 275: the name asked through systemd-resolved, for the upstream
+    // response (received by the resolver) to bind to this process
+    match (resolved, name.as_deref()) {
+        (Some(t), Some(name)) => t.on_query(raw.pid, name, raw.timestamp_ns),
+        (Some(t), None) if decoded.is_none() => t.note_undecoded(raw.timestamp_ns),
+        _ => {}
+    }
+    if let (Some(t), true) = (resolved, raw.held != 0) {
+        if raw.flags & dns_flags::RATE_HELD_UID != 0 {
+            t.note_coverage_lost(
+                crate::net::resolved::CoverageCause::UserHeld,
+                Some(raw.pid),
+                Some(raw.uid),
+                raw.timestamp_ns,
+            );
+        } else {
+            t.note_held(raw.pid, raw.timestamp_ns);
+        }
+    }
+    if let (Some(cache), Some(name)) = (dns_cache, name) {
         cache.on_dns_query(
             raw.pid,
             name,
@@ -1629,11 +1784,14 @@ fn nss_events(
 /// as its ring's records, so the thread runs the pump's own loop on the
 /// runtime's reactor (`Handle::block_on`): woken by either, it sends a
 /// pass's events in batches.
+#[allow(clippy::too_many_arguments)]
 fn spawn_dns_query_pump(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
+    resolved: Option<Arc<crate::net::resolved::ResolvedTable>>,
     lineage: AuthSessionTracker,
     parse: ParseClient,
+    losses: crate::sensors::ring_drops::LossWatch,
     tx: &BusSender,
     rt: &tokio::runtime::Handle,
 ) -> Result<PumpThread> {
@@ -1648,16 +1806,21 @@ fn spawn_dns_query_pump(
     let rt = rt.clone();
     PumpThread::spawn("dns_query", move |stop| {
         let _claim = claim;
-        rt.block_on(pump_dns_query(rb, dns_cache, lineage, parse, tx, stop))
+        rt.block_on(pump_dns_query(
+            rb, dns_cache, resolved, lineage, parse, losses, tx, stop,
+        ))
     })
     .context("starting the dns_query pump's thread")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pump_dns_query(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
+    resolved: Option<Arc<crate::net::resolved::ResolvedTable>>,
     lineage: AuthSessionTracker,
     mut parse: ParseClient,
+    mut losses: crate::sensors::ring_drops::LossWatch,
     tx: BusSender,
     stop: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()> {
@@ -1683,7 +1846,9 @@ async fn pump_dns_query(
                     guard.get_inner_mut(),
                     &lineage,
                     dns_cache.as_deref(),
+                    resolved.as_deref(),
                     &mut parse,
+                    &mut losses,
                     &mut reject,
                     &mut outbox,
                 );
@@ -1705,7 +1870,9 @@ async fn pump_dns_query(
                     async_fd.get_mut(),
                     &lineage,
                     dns_cache.as_deref(),
+                    resolved.as_deref(),
                     &mut parse,
+                    &mut losses,
                     &mut reject,
                     &mut outbox,
                 );
@@ -1742,27 +1909,40 @@ enum DnsStep {
 /// `outbox`, the cache fed. Returns the records read. Lab PR 229: the pass
 /// is marked in the cache's [`crate::net::dns_cache::DnsIngest`] with the
 /// time it began — every record submitted before it has been read.
-fn dns_pass(
-    ring: &mut RingBuf<MapData>,
+#[allow(clippy::too_many_arguments)]
+fn dns_pass<R: crate::sensors::pump::RingSource>(
+    ring: &mut R,
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
+    resolved: Option<&crate::net::resolved::ResolvedTable>,
     parse: &mut ParseClient,
+    losses: &mut crate::sensors::ring_drops::LossWatch,
     reject: &mut RejectThrottle,
     outbox: &mut VecDeque<Event>,
 ) -> u32 {
     let began_ns = crate::net::dns_cache::monotonic_ns();
+    // review of #495, D3: a query lost before this pass (the ring full, a
+    // process's or a user's budget) leaves every process's evidence
+    // incomplete, whoever lost it
+    if let (Some(t), true) = (resolved, losses.grew()) {
+        t.note_coverage_lost(
+            crate::net::resolved::CoverageCause::Losses,
+            None,
+            None,
+            began_ns,
+        );
+    }
     let mut drained = 0u32;
     // R14b: the pass's records first (copied off the ring), then their
     // names decoded by the parse worker in batches, then the events
     let mut raws: Vec<DnsQueryRaw> = Vec::new();
-    while let Some(item) = ring.next() {
+    while ring.next_record(&mut |bytes: &[u8]| {
         drained += 1;
-        let bytes: &[u8] = item.as_ref();
         match bytemuck::try_from_bytes::<DnsQueryRaw>(bytes) {
             Ok(raw) => raws.push(*raw),
             Err(_e) => reject.record("dns_query", std::mem::size_of::<DnsQueryRaw>(), bytes.len()),
         }
-    }
+    }) {}
     let decoded = if raws.is_empty() {
         Vec::new()
     } else {
@@ -1782,9 +1962,9 @@ fn dns_pass(
     for (i, raw) in raws.iter().enumerate() {
         let d = decoded.get(i).and_then(Option::as_ref);
         if raw.flags & dns_flags::NSS != 0 {
-            outbox.extend(nss_events(raw, d, lineage, dns_cache));
+            outbox.extend(nss_events(raw, d, lineage, dns_cache, resolved));
         } else {
-            let (event, flood) = dns_events(raw, d, lineage, dns_cache);
+            let (event, flood) = dns_events(raw, d, lineage, dns_cache, resolved);
             outbox.push_back(event);
             outbox.extend(flood);
         }
@@ -1989,11 +2169,92 @@ mod tests {
             flow_tracker: Arc::new(Mutex::new(FlowTracker::default())),
             lineage,
             dns_cache: Arc::new(DnsCache::default()),
+            resolved: Arc::new(crate::net::resolved::ResolvedTable::default()),
         }
     }
 
     /// Lab PR 224 (CM-02 a): a connect becomes its `TcpConnect` and then
     /// its connect-time row (image and DNS name read now) for the rules,
+    /// A ring of the tests: its records, then empty.
+    struct FakeRing(std::collections::VecDeque<Vec<u8>>);
+
+    impl crate::sensors::pump::RingSource for FakeRing {
+        fn next_record(&mut self, f: &mut dyn FnMut(&[u8])) -> bool {
+            match self.0.pop_front() {
+                Some(r) => {
+                    f(&r);
+                    true
+                }
+                None => false,
+            }
+        }
+        fn wait(&mut self, _timeout_ms: i32) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Review of #495, D2: the connect pump's barrier is reached only when
+    /// both DNS pumps have read the records made before the connects — a
+    /// pump not running, or one behind, leaves it unreached.
+    #[test]
+    fn the_connect_barrier_needs_both_dns_pumps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let w = wiring(AuthSessionTracker::new(tmp.path()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // well past the wait: no waiting in the test
+        let old = crate::net::dns_ingest::monotonic_ns() - 2_000_000_000;
+        assert!(!dns_barrier(&w, old, rt.handle()), "no pump runs");
+        let _names = crate::net::dns_cache::IngestClaim::new(Arc::clone(&w.dns_cache));
+        let _answers = crate::net::resolved::ResolvedClaim::new(Arc::clone(&w.resolved), 1);
+        assert!(!dns_barrier(&w, old, rt.handle()), "both behind");
+        w.dns_cache.ingest().pass_ended(old + 1);
+        assert!(
+            !dns_barrier(&w, old, rt.handle()),
+            "the response pump behind"
+        );
+        w.resolved.ingest().pass_ended(old + 1);
+        assert!(dns_barrier(&w, old, rt.handle()));
+        // a connect the queries' pump had not passed
+        assert!(!dns_barrier(&w, old + 2, rt.handle()));
+    }
+
+    /// Review of #495, D3: a DNS query lost before the pass (its ring, a
+    /// budget) degrades the evidence host-wide at the pass's start.
+    #[test]
+    fn a_query_pass_after_a_loss_degrades_every_process() {
+        use nn_model::telemetry::DnsResolution;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        let c2: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        for (reads, unknown) in [
+            (&[Some(5), Some(6)][..], true),
+            (&[Some(5), Some(5)][..], false),
+            (&[Some(5), None][..], true),
+        ] {
+            let t = crate::net::resolved::ResolvedTable::default();
+            let mut losses = crate::sensors::ring_drops::LossWatch::scripted(reads);
+            let mut parse = ParseClient::new(None);
+            let mut reject = RejectThrottle::new();
+            let mut outbox = VecDeque::new();
+            dns_pass(
+                &mut FakeRing(Default::default()),
+                &lineage,
+                None,
+                Some(&t),
+                &mut parse,
+                &mut losses,
+                &mut reject,
+                &mut outbox,
+            );
+            let now = crate::net::dns_ingest::monotonic_ns();
+            let got = t.check(4242, 1, c2, now, Vec::new);
+            assert_eq!(got == DnsResolution::Unknown, unknown, "{reads:?}: {got:?}");
+        }
+    }
+
     /// with the flow pending for its close. The starting tree sent the
     /// `TcpConnect` alone: no rule judged an open flow.
     #[test]
@@ -2016,7 +2277,7 @@ mod tests {
         raw.dst_addr[..4].copy_from_slice(&[127, 0, 0, 1]);
         raw.timestamp_ns = 10_000;
         raw.sk_ptr = 0xdead;
-        let events = connect_events(&raw, Some(&w));
+        let events = connect_events(&raw, Some(&w), true);
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], Event::TcpConnect { pid: 4500, .. }));
         let Event::NetFlow(row) = &events[1] else {
@@ -2027,7 +2288,7 @@ mod tests {
         assert_eq!(row.resolved_hostname.as_deref(), Some("c2.example"));
         assert_eq!(w.flow_tracker.lock().pending_len(), 1);
         // Without net wiring: the `TcpConnect` alone, as before.
-        assert_eq!(connect_events(&raw, None).len(), 1);
+        assert_eq!(connect_events(&raw, None, true).len(), 1);
         // Review #471 A1: a later exec of the pid, ingested before the
         // connect is read, does not name it — the image as of the connect.
         w.lineage.ingest_spawn(4500, 1, "/usr/sbin/nginx", 20_000);
@@ -2035,7 +2296,7 @@ mod tests {
             let mut r = raw;
             r.timestamp_ns = ts;
             r.sk_ptr = sk;
-            match &connect_events(&r, Some(&w))[1] {
+            match &connect_events(&r, Some(&w), true)[1] {
                 Event::NetFlow(row) => row.exe.clone(),
                 e => panic!("{e:?}"),
             }
@@ -2071,7 +2332,7 @@ mod tests {
         let corr = FlowTracker::corr_id(raw.timestamp_ns, raw.sk_ptr);
         assert!(!w.flow_tracker.lock().close_may_proceed(&corr));
         let (tx, mut rx) = crate::sensors::bus::channel();
-        assert!(send_connects(&[raw], Some(&w), &tx, rt.handle()));
+        assert!(send_connects(&[raw], Some(&w), true, &tx, rt.handle()));
         assert!(matches!(
             rx.try_recv().map(|r| r.envelope.event),
             Some(Event::TcpConnect { pid: 4700, .. })
@@ -2089,7 +2350,7 @@ mod tests {
         // A closed bus: not announced.
         drop(rx);
         raw.timestamp_ns = 40_000;
-        assert!(!send_connects(&[raw], Some(&w), &tx, rt.handle()));
+        assert!(!send_connects(&[raw], Some(&w), true, &tx, rt.handle()));
     }
 
     /// Lab PR 224 (CM-02 c): a record of the `socket_connect` deny is its
@@ -2106,7 +2367,7 @@ mod tests {
         raw.proto = 17;
         raw.dst_port = 53;
         raw.dst_addr[..4].copy_from_slice(&[192, 0, 2, 7]);
-        let events = connect_events(&raw, Some(&w));
+        let events = connect_events(&raw, Some(&w), true);
         assert_eq!(events.len(), 1);
         let Event::NetFlow(row) = &events[0] else {
             panic!("{:?}", events[0]);
@@ -2201,7 +2462,7 @@ mod tests {
         raw.pid = 4242;
         raw.held = 3;
         raw.timestamp_ns = 5_000_000_000;
-        let (event, flood) = dns_events(&raw, None, &lineage, None);
+        let (event, flood) = dns_events(&raw, None, &lineage, None, None);
         assert!(
             matches!(event, Event::DnsQuery { exe: None, .. }),
             "{event:?}"
@@ -2216,14 +2477,14 @@ mod tests {
         ));
         // the process that holds the pid started before the query: its own
         stat(1);
-        let (event, _) = dns_events(&raw, None, &lineage, None);
+        let (event, _) = dns_events(&raw, None, &lineage, None, None);
         let Event::DnsQuery { exe, .. } = event else {
             panic!()
         };
         assert_eq!(exe.as_deref(), Some("/usr/sbin/dnsmasq"));
         // gone
         std::fs::remove_dir_all(&dir).unwrap();
-        let (event, _) = dns_events(&raw, None, &lineage, None);
+        let (event, _) = dns_events(&raw, None, &lineage, None, None);
         assert!(matches!(event, Event::DnsQuery { exe: None, .. }));
     }
 
@@ -2242,7 +2503,7 @@ mod tests {
         let name = b"\x03bar\x13northnarrow-e2etest\x07invalid\x00";
         raw.query_name[..name.len()].copy_from_slice(name);
         raw.qname_len = name.len() as u16;
-        let (event, _) = dns_events(&raw, None, &lineage, Some(&cache));
+        let (event, _) = dns_events(&raw, None, &lineage, Some(&cache), None);
         assert!(
             matches!(&event, Event::DnsQuery { query_name, qname_partial: true, .. } if query_name.is_empty()),
             "{event:?}"
@@ -2257,10 +2518,170 @@ mod tests {
         };
         let d = v.remove(0);
         assert_eq!(d.name, "bar.northnarrow-e2etest.invalid");
-        let _ = dns_events(&raw, Some(&d), &lineage, Some(&cache));
+        let _ = dns_events(&raw, Some(&d), &lineage, Some(&cache), None);
         assert_eq!(
             cache.lookup_for_connect(4800, 8_000, 0).as_deref(),
             Some("bar.northnarrow-e2etest.invalid")
+        );
+    }
+
+    /// Lot 275 (NN-L-NET-028): a query's name, decoded, is an ask the
+    /// resolved table binds the response to (a datagram's and an NSS
+    /// lookup's alike); an undecoded one degrades the evidence (unknown for
+    /// a while); a record carrying held queries makes its process's
+    /// connects unknown.
+    #[test]
+    fn the_queries_feed_the_resolved_table() {
+        use nn_model::telemetry::DnsResolution;
+        const S: u64 = 1_000_000_000;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        let c2: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let answer = |t: &crate::net::resolved::ResolvedTable, name: &str| {
+            t.on_answer(&crate::net::resolved::Answer {
+                pid: 1,
+                ts_ns: 2 * S,
+                qname: name,
+                records: &[crate::net::resolved::Record::Addr {
+                    name: name.into(),
+                    ttl: 60,
+                    addr: c2,
+                }],
+                // a system resolver's, whose names bind their askers
+                complete: true,
+                resolver: true,
+            })
+        };
+        let decode = |raw: &DnsQueryRaw| -> nn_proto::ipc::QnameOut {
+            use nn_proto::ipc::{Answer, Request};
+            match crate::worker::serve::answer(&Request::DnsNames(vec![name_request(raw)])) {
+                Answer::DnsNames(mut v) => v.remove(0),
+                other => panic!("{other:?}"),
+            }
+        };
+        // a datagram's query, decoded
+        let mut raw = DnsQueryRaw::zeroed();
+        raw.pid = 4800;
+        raw.timestamp_ns = S;
+        raw.family = 2;
+        raw.flags = dns_flags::SKB;
+        let name = b"\x02c2\x13northnarrow-e2etest\x07invalid\x00\x00\x01\x00\x01";
+        raw.query_name[..name.len()].copy_from_slice(name);
+        raw.qname_len = name.len() as u16;
+        let t = crate::net::resolved::ResolvedTable::default();
+        let d = decode(&raw);
+        let _ = dns_events(&raw, Some(&d), &lineage, None, Some(&t));
+        answer(&t, "c2.northnarrow-e2etest.invalid");
+        assert_eq!(
+            t.check(4800, 1, c2, 3 * S, Vec::new),
+            DnsResolution::Lineage
+        );
+        // the same, not decoded: nothing bound, the evidence degraded
+        let t = crate::net::resolved::ResolvedTable::default();
+        let _ = dns_events(&raw, None, &lineage, None, Some(&t));
+        answer(&t, "c2.northnarrow-e2etest.invalid");
+        assert_eq!(
+            t.check(4800, 1, c2, 3 * S, Vec::new),
+            DnsResolution::Unknown
+        );
+        // an NSS lookup, decoded
+        let mut nss = DnsQueryRaw::zeroed();
+        nss.pid = 4700;
+        nss.flags = dns_flags::NSS;
+        nss.timestamp_ns = S;
+        let text = b"c2.northnarrow-e2etest.invalid.";
+        nss.query_name[..text.len()].copy_from_slice(text);
+        nss.qname_len = text.len() as u16;
+        let t = crate::net::resolved::ResolvedTable::default();
+        let d = decode(&nss);
+        let _ = nss_events(&nss, Some(&d), &lineage, None, Some(&t));
+        answer(&t, "c2.northnarrow-e2etest.invalid");
+        assert_eq!(
+            t.check(4700, 1, c2, 3 * S, Vec::new),
+            DnsResolution::Lineage
+        );
+        // ... not decoded: degraded
+        let t = crate::net::resolved::ResolvedTable::default();
+        let _ = nss_events(&nss, None, &lineage, None, Some(&t));
+        assert_eq!(
+            t.check(4700, 1, c2, 3 * S, Vec::new),
+            DnsResolution::Unknown
+        );
+        // held queries carried by a decoded record (its name answered with
+        // another address): the process unknown; without them, another
+        // lineage's address
+        let web: std::net::IpAddr = "198.51.100.1".parse().unwrap();
+        let held_table = || {
+            let t = crate::net::resolved::ResolvedTable::default();
+            answer(&t, "other.example");
+            t.on_answer(&crate::net::resolved::Answer {
+                pid: 1,
+                ts_ns: 2 * S,
+                qname: "c2.northnarrow-e2etest.invalid",
+                records: &[crate::net::resolved::Record::Addr {
+                    name: "c2.northnarrow-e2etest.invalid".into(),
+                    ttl: 60,
+                    addr: web,
+                }],
+                complete: true,
+                resolver: true,
+            });
+            t
+        };
+        let d = decode(&raw);
+        let t = held_table();
+        let _ = dns_events(&raw, Some(&d), &lineage, None, Some(&t));
+        assert_eq!(
+            t.check(4800, 1, c2, 3 * S, Vec::new),
+            DnsResolution::OtherLineage
+        );
+        let t = held_table();
+        let mut held = raw;
+        held.held = 9;
+        held.flags |= dns_flags::RATE_HELD;
+        let _ = dns_events(&held, Some(&d), &lineage, None, Some(&t));
+        assert_eq!(
+            t.check(4800, 1, c2, 3 * S, Vec::new),
+            DnsResolution::Unknown
+        );
+        assert_eq!(
+            t.check(4801, 1, c2, 3 * S, Vec::new),
+            DnsResolution::OtherLineage
+        );
+        // review of #495, D3: a user's held queries degrade every process
+        for (q, pid) in [(&raw, 4801u32), (&nss, 4701)] {
+            let t = held_table();
+            let mut uheld = *q;
+            uheld.held = 4;
+            uheld.flags |= dns_flags::RATE_HELD | dns_flags::RATE_HELD_UID;
+            if q.flags & dns_flags::NSS != 0 {
+                let d = decode(&uheld);
+                let _ = nss_events(&uheld, Some(&d), &lineage, None, Some(&t));
+            } else {
+                let d = decode(&uheld);
+                let _ = dns_events(&uheld, Some(&d), &lineage, None, Some(&t));
+            }
+            assert_eq!(
+                t.check(pid, 1, c2, 3 * S, Vec::new),
+                DnsResolution::Unknown,
+                "another process than the reporter"
+            );
+        }
+        let d = decode(&nss);
+        let t = held_table();
+        let _ = nss_events(&nss, Some(&d), &lineage, None, Some(&t));
+        assert_eq!(
+            t.check(4700, 1, c2, 3 * S, Vec::new),
+            DnsResolution::OtherLineage
+        );
+        let t = held_table();
+        let mut nheld = nss;
+        nheld.held = 2;
+        nheld.flags |= dns_flags::RATE_HELD;
+        let _ = nss_events(&nheld, Some(&d), &lineage, None, Some(&t));
+        assert_eq!(
+            t.check(4700, 1, c2, 3 * S, Vec::new),
+            DnsResolution::Unknown
         );
     }
 
@@ -2289,9 +2710,9 @@ mod tests {
             }
         };
         // without a decode nothing feeds the cache
-        assert!(nss_events(&raw, None, &lineage, Some(&cache)).is_none());
+        assert!(nss_events(&raw, None, &lineage, Some(&cache), None).is_none());
         assert_eq!(cache.lookup_for_connect(4700, 8_000, 0), None);
-        assert!(nss_events(&raw, Some(&decoded(&raw)), &lineage, Some(&cache)).is_none());
+        assert!(nss_events(&raw, Some(&decoded(&raw)), &lineage, Some(&cache), None).is_none());
         assert_eq!(
             cache.lookup_for_connect(4700, 8_000, 0).as_deref(),
             Some("foo.northnarrow-e2etest.invalid")
@@ -2304,7 +2725,7 @@ mod tests {
         raw.held = 5;
         raw.flags |= dns_flags::RATE_HELD;
         assert!(matches!(
-            nss_events(&raw, None, &lineage, Some(&cache)),
+            nss_events(&raw, None, &lineage, Some(&cache), None),
             Some(Event::DnsFlood {
                 pid: 4700,
                 held: 5,
@@ -2315,7 +2736,7 @@ mod tests {
         let mut empty = DnsQueryRaw::zeroed();
         empty.pid = 4701;
         empty.flags = dns_flags::NSS;
-        assert!(nss_events(&empty, Some(&decoded(&empty)), &lineage, Some(&cache)).is_none());
+        assert!(nss_events(&empty, Some(&decoded(&empty)), &lineage, Some(&cache), None).is_none());
         assert_eq!(cache.lookup_for_connect(4701, 8_000, 0), None);
     }
 

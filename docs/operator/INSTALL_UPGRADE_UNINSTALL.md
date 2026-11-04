@@ -196,7 +196,7 @@ start — left the host without a working agent. What it does now, in order:
    or — when the recorded pins are gone or not as recorded, or of an older
    schema — builds new ones, a signed "marks reset", after which every
    process started before it is not known: restart the exempt services
-   (`UPGRADE_NOTES_WAVE4.md` §7);
+   (`UPGRADE_NOTES_WAVE4.md` §8);
 5. **switches** the binaries and units: each new file is staged next to
    the installed one (`<path>.nn-new`, same directory, same file system),
    compared with its source, then renamed over it (`rename(2)`): every path

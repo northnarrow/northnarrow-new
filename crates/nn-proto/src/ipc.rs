@@ -46,8 +46,10 @@ use serde::{Deserialize, Serialize};
 
 /// The protocol's version: a worker that says another one is refused. 2
 /// (R14b): a name's `form` (an NSS record's text), the parse worker's names
-/// in production.
-pub const IPC_VERSION: u16 = 2;
+/// in production. 3 (lot 275): a DNS response's answer is the question, the
+/// response code and the A, AAAA and CNAME records with their TTLs
+/// ([`DnsAnswersOut`]), for the DNS response sensor.
+pub const IPC_VERSION: u16 = 3;
 
 /// Largest packet either side sends or accepts (plan §3.5: 64 KiB).
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -90,6 +92,15 @@ pub const MAX_TLS_IN: usize = 32 * 1024;
 
 /// Longest DNS answer input.
 pub const MAX_DNS_ANSWER_IN: usize = 60 * 1024;
+
+/// Lot 275: most records a DNS answer carries (nn-parse's
+/// `dns_response::MAX_RECORDS`): two names each, every byte of a name
+/// possibly `\DDD`, within a frame.
+pub const MAX_DNS_RECORDS: usize = 24;
+
+/// Lot 275: longest decoded DNS name a worker may return (a 255-octet wire
+/// name, every byte as `\DDD`).
+pub const MAX_DNS_NAME_OUT: usize = 4 * 255;
 
 /// Longest string field of a TLS result (an ALPN name is at most 255 bytes
 /// on the wire; JA3/JA4 are fixed-size).
@@ -350,6 +361,58 @@ pub enum TlsOut {
     },
 }
 
+/// Lot 275: one record of a DNS response's answer section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DnsRecordOut {
+    A {
+        name: String,
+        ttl: u32,
+        addr: [u8; 4],
+    },
+    Aaaa {
+        name: String,
+        ttl: u32,
+        addr: [u8; 16],
+    },
+    Cname {
+        name: String,
+        ttl: u32,
+        target: String,
+    },
+}
+
+impl DnsRecordOut {
+    /// The bytes the record takes at least on the wire: a pointer as its
+    /// owner (2), type, class, TTL and length (10), its data (4, 16, or a
+    /// pointer as the target).
+    pub const fn min_wire_bytes(&self) -> usize {
+        match self {
+            DnsRecordOut::A { .. } => 12 + 4,
+            DnsRecordOut::Aaaa { .. } => 12 + 16,
+            DnsRecordOut::Cname { .. } => 12 + 2,
+        }
+    }
+
+    fn names(&self) -> [&str; 2] {
+        match self {
+            DnsRecordOut::A { name, .. } | DnsRecordOut::Aaaa { name, .. } => [name, ""],
+            DnsRecordOut::Cname { name, target, .. } => [name, target],
+        }
+    }
+}
+
+/// Lot 275: what a DNS response held (nn-parse's `DnsResponse`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsAnswersOut {
+    /// The question's name, decoded.
+    pub qname: String,
+    pub qtype: u16,
+    pub rcode: u8,
+    pub records: Vec<DnsRecordOut>,
+    /// Every answer was read (not cut, not malformed, not past the bound).
+    pub complete: bool,
+}
+
 /// What the core asks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
@@ -359,7 +422,8 @@ pub enum Request {
     DnsNames(Vec<QnameIn>),
     /// A TLS ClientHello (the record layer or the bare handshake message).
     TlsClientHello(Vec<u8>),
-    /// A DNS response: its A and AAAA answers.
+    /// A DNS response: its question and its A, AAAA and CNAME answers (lot
+    /// 275).
     DnsAnswers(Vec<u8>),
     /// `debug-trigger` builds' faults (the lab's worker crash and hang):
     /// the worker aborts, or stops answering. Last, so the production
@@ -427,10 +491,8 @@ pub enum Answer {
     Pong,
     DnsNames(Vec<QnameOut>),
     Tls(TlsOut),
-    DnsAnswers {
-        a: Vec<[u8; 4]>,
-        aaaa: Vec<[u8; 16]>,
-    },
+    /// `None`: the bytes are no DNS response.
+    DnsAnswers(Option<DnsAnswersOut>),
     /// The request was not served ([`Refusal`]: a closed set, review of
     /// #480 F9 — no free text from a worker). Review of #481 (R14b-1): the
     /// core checks every request before it sends it ([`Request::check`]),
@@ -739,15 +801,21 @@ fn ja4_ok(s: &str) -> bool {
         && lower_hex(span(b, 24..36), 12)
 }
 
-/// The fewest bytes a DNS message with `a` A answers and `aaaa` AAAA
-/// answers takes: its 12-byte header and each answer with a root name (one
-/// byte), type, class, TTL, length and data (15 and 27 bytes).
-pub const fn min_dns_answer_bytes(a: usize, aaaa: usize) -> usize {
-    if a == 0 && aaaa == 0 {
-        0
-    } else {
-        12 + 15 * a + 27 * aaaa
-    }
+/// The fewest bytes a DNS response with these records takes: its 12-byte
+/// header, a question (a root name, type and class: 5 bytes) and each
+/// record at its least ([`DnsRecordOut::min_wire_bytes`]).
+pub fn min_dns_answer_bytes(records: &[DnsRecordOut]) -> usize {
+    12 + 5
+        + records
+            .iter()
+            .map(DnsRecordOut::min_wire_bytes)
+            .sum::<usize>()
+}
+
+/// A decoded DNS name of a response: printable ASCII (`\DDD` escapes
+/// included), no pointer mark, at most [`MAX_DNS_NAME_OUT`] bytes.
+fn dns_name_ok(name: &str) -> bool {
+    name.len() <= MAX_DNS_NAME_OUT && name.bytes().all(|b| (0x20..=0x7e).contains(&b))
 }
 
 /// The core's check of a response against the request it answers: the
@@ -824,9 +892,25 @@ pub fn check_response(req: &Request, answer: &Answer) -> Result<(), Violation> {
                 Ok(())
             }
         },
-        (Request::DnsAnswers(bytes), Answer::DnsAnswers { a, aaaa }) => {
-            if min_dns_answer_bytes(a.len(), aaaa.len()) > bytes.len() {
+        (Request::DnsAnswers(_), Answer::DnsAnswers(None)) => Ok(()),
+        (Request::DnsAnswers(bytes), Answer::DnsAnswers(Some(out))) => {
+            if out.records.len() > MAX_DNS_RECORDS {
+                return Err(Violation::Bounds("dns_answers: too many records"));
+            }
+            if min_dns_answer_bytes(&out.records) > bytes.len() {
                 return Err(Violation::Bounds("dns_answers: more answers than bytes"));
+            }
+            if !dns_name_ok(&out.qname)
+                || out
+                    .records
+                    .iter()
+                    .flat_map(DnsRecordOut::names)
+                    .any(|n| !dns_name_ok(n))
+            {
+                return Err(Violation::Bounds("dns_answers: a name"));
+            }
+            if out.rcode > 15 {
+                return Err(Violation::Bounds("dns_answers: rcode"));
             }
             Ok(())
         }
@@ -1238,18 +1322,72 @@ mod tests {
 
     #[test]
     fn dns_answer_results_are_checked() {
-        let req = Request::DnsAnswers(vec![0; 69]);
-        let ok = Answer::DnsAnswers {
-            a: vec![[1, 2, 3, 4]; 2],
-            aaaa: vec![[0; 16]],
+        let a = |n: &str| DnsRecordOut::A {
+            name: n.into(),
+            ttl: 60,
+            addr: [1, 2, 3, 4],
         };
-        assert_eq!(min_dns_answer_bytes(2, 1), 69);
-        assert_eq!(check_response(&req, &ok), Ok(()));
-        let too_many = Answer::DnsAnswers {
-            a: vec![[1, 2, 3, 4]; 4],
-            aaaa: vec![],
+        let records = vec![
+            DnsRecordOut::Cname {
+                name: "www.example".into(),
+                ttl: 60,
+                target: "edge.example".into(),
+            },
+            a("edge.example"),
+            a("edge.example"),
+            DnsRecordOut::Aaaa {
+                name: "edge.example".into(),
+                ttl: 60,
+                addr: [0; 16],
+            },
+        ];
+        // 12 + 5, a CNAME 14, two A 16 each, an AAAA 28
+        assert_eq!(min_dns_answer_bytes(&records), 17 + 14 + 32 + 28);
+        let out = |records: Vec<DnsRecordOut>| {
+            Answer::DnsAnswers(Some(DnsAnswersOut {
+                qname: "www.example".into(),
+                qtype: 1,
+                rcode: 0,
+                records,
+                complete: true,
+            }))
         };
-        assert!(check_response(&req, &too_many).is_err());
+        let req = Request::DnsAnswers(vec![0; 91]);
+        assert_eq!(check_response(&req, &out(records.clone())), Ok(()));
+        assert_eq!(check_response(&req, &Answer::DnsAnswers(None)), Ok(()));
+        // more records than the bytes hold
+        let mut more = records.clone();
+        more.push(a("edge.example"));
+        assert!(check_response(&req, &out(more)).is_err());
+        // past the bound, whatever the bytes
+        let big = Request::DnsAnswers(vec![0; MAX_DNS_ANSWER_IN]);
+        assert!(check_response(&big, &out(vec![a("x"); MAX_DNS_RECORDS])).is_ok());
+        assert!(check_response(&big, &out(vec![a("x"); MAX_DNS_RECORDS + 1])).is_err());
+        // a name with a control character or a byte past ASCII, or too long
+        for bad in ["a\nb", "bad\u{7}", "del\u{7f}", "é.example"] {
+            assert!(check_response(&big, &out(vec![a(bad)])).is_err(), "{bad:?}");
+        }
+        assert!(check_response(&big, &out(vec![a("esc\\007aped")])).is_ok());
+        assert!(check_response(&big, &out(vec![a(&"a".repeat(MAX_DNS_NAME_OUT))])).is_ok());
+        assert!(check_response(&big, &out(vec![a(&"a".repeat(MAX_DNS_NAME_OUT + 1))])).is_err());
+        let cname_to = |t: &str| DnsRecordOut::Cname {
+            name: "ok".into(),
+            ttl: 1,
+            target: t.into(),
+        };
+        assert!(check_response(&big, &out(vec![cname_to("x\ty")])).is_err());
+        let q = |qname: &str, rcode: u8| {
+            Answer::DnsAnswers(Some(DnsAnswersOut {
+                qname: qname.into(),
+                qtype: 1,
+                rcode,
+                records: vec![],
+                complete: true,
+            }))
+        };
+        assert!(check_response(&big, &q("ok.example", 3)).is_ok());
+        assert!(check_response(&big, &q("ok.example", 16)).is_err());
+        assert!(check_response(&big, &q("ctl\u{0}", 0)).is_err());
         assert!(check_response(&req, &Answer::Pong).is_err());
         // review of #481 (R14b-1): a refusal of a checked request is a lie
         for r in [Refusal::OutOfBounds, Refusal::DebugOnly] {
