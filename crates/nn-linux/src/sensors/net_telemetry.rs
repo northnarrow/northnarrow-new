@@ -1265,28 +1265,46 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let lineage = AuthSessionTracker::new(tmp.path());
         let c2: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig"))
+            .unwrap();
+        let audit = crate::late_audit::LateAudit::new();
+        audit.bind(Some(std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::audit::AuditLog::open(&dir.path().join("audit.log"), key, [0x64; 16]).unwrap(),
+        ))));
         for (reads, unknown) in [
             (&[Some(0), Some(3)][..], true),
             (&[Some(3), Some(3)][..], false),
         ] {
             let t = ResolvedTable::default();
             let mut losses = crate::sensors::ring_drops::LossWatch::scripted(reads);
-            answer_pass(
-                &mut Empty,
-                &t,
-                &lineage,
-                &ParseClient::new(None),
-                &mut losses,
-                &[],
-                &crate::late_audit::LateAudit::new(),
-                &mut RejectThrottle::new(),
-                &mut VecDeque::new(),
-                &mut PassStats::default(),
-            );
+            for _ in 0..2 {
+                answer_pass(
+                    &mut Empty,
+                    &t,
+                    &lineage,
+                    &ParseClient::new(None),
+                    &mut losses,
+                    &[],
+                    &audit,
+                    &mut RejectThrottle::new(),
+                    &mut VecDeque::new(),
+                    &mut PassStats::default(),
+                );
+            }
             let now = crate::net::dns_ingest::monotonic_ns();
             let got = t.check(4242, 1, c2, now, Vec::new);
             assert_eq!(got == DnsResolution::Unknown, unknown, "{reads:?}: {got:?}");
         }
+        // the second review, R2: the pass signed the loss (its next pass:
+        // the loss is queued by the pass that saw it, signed by it)
+        let text = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains(COVERAGE_LOST_OP))
+            .collect();
+        assert_eq!(rows.len(), 1, "{text}");
+        assert!(rows[0].contains("\"cause\":\"dns_losses\""), "{}", rows[0]);
     }
 
     /// The second review of #495, R2: a burst of one user's queries (its

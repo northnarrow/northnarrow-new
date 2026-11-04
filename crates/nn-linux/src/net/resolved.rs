@@ -198,12 +198,20 @@ mod tests {
         );
         // D2 (review of #495): the DNS pumps had not read the records made
         // before the connect — unknown, whatever the table holds
+        let _ = t.take_coverage_losses();
         for dst in [C2, IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 9))] {
             assert_eq!(
                 judge(&t, &lineage, 42, 5 * S, dst, 10 * S, false),
                 DnsResolution::Unknown
             );
         }
+        // the second review, R2: signed (once a window), counted
+        let q = t.take_coverage_losses();
+        assert_eq!(
+            q.iter().map(|l| (l.cause, l.pid)).collect::<Vec<_>>(),
+            vec![(CoverageCause::Barrier, Some(42))]
+        );
+        assert_eq!(t.judgements().unknown_barrier, 2);
         drop(claim);
         assert_eq!(t.sensor_since(), None);
         // a sensor that did not attach claims nothing: unknown, and a
