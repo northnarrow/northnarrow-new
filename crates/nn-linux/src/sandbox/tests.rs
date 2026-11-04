@@ -1069,3 +1069,50 @@ fn an_unreadable_task_list_refuses_the_sandbox() {
         other => panic!("expected a refused step, got {other:?}"),
     }
 }
+
+/// The review of #499, D5: the export worker's files are bounded
+/// (`RLIMIT_FSIZE`), and a write past the bound fails with `EFBIG` — the
+/// process is not ended by `SIGXFSZ`.
+#[test]
+fn the_export_worker_s_files_are_bounded() {
+    assert_eq!(
+        Profile::export(3, SOCK, OPEN).max_file_bytes,
+        Some(EXPORT_MAX_FILE_BYTES)
+    );
+    assert_eq!(Profile::parse(3).max_file_bytes, None);
+    let st = in_child(
+        || {
+            harden(&Profile {
+                max_file_bytes: Some(4096),
+                ..Profile::export(2, SOCK, OPEN)
+            })
+            .is_ok()
+        },
+        || {
+            // SAFETY: plain syscalls on a file of our own.
+            unsafe {
+                let path = format!("/tmp/nn-fsize-{}\0", libc::getpid());
+                let fd = libc::open(
+                    path.as_ptr().cast(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC,
+                    0o600 as libc::c_uint,
+                );
+                if fd < 0 {
+                    return 2;
+                }
+                let buf = [b'a'; 8192];
+                let first = libc::write(fd, buf.as_ptr().cast(), buf.len());
+                let second = libc::write(fd, buf.as_ptr().cast(), buf.len());
+                let e = io::Error::last_os_error().raw_os_error();
+                libc::close(fd);
+                libc::unlink(path.as_ptr().cast());
+                if first == 4096 && second < 0 && e == Some(libc::EFBIG) {
+                    0
+                } else {
+                    3
+                }
+            }
+        },
+    );
+    assert!(exited(st, 0), "status {st:#x}");
+}

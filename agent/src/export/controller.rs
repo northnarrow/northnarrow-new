@@ -407,7 +407,45 @@ fn run(p: Params, stop: &AtomicBool) {
     let mut last_save = Instant::now() - SAVE_EVERY;
     let mut saved_at: Option<String> = None;
     let mut saves = 0u64;
+    let dir_limits = p
+        .configured
+        .config
+        .file
+        .as_ref()
+        .map(|f| (f.max_files, nn_export::config::dir_bound(f)));
+    let mut dir_checked = Instant::now() - DIR_CHECK_EVERY;
+    let mut dir_over: Option<String> = None;
     while !stop.load(Ordering::SeqCst) {
+        // the file sink's directory within its bound, or the file sink
+        // stops and the worker that wrote past it is killed
+        if let Some((max_files, bound)) = dir_limits {
+            if dir_checked.elapsed() >= DIR_CHECK_EVERY {
+                dir_checked = Instant::now();
+                let now_over = over_bound(
+                    std::path::Path::new(nn_proto::ipc::EXPORT_DIR),
+                    max_files,
+                    bound,
+                );
+                if let (Some(why), None) = (&now_over, &dir_over) {
+                    warn!(%why, "export: the export's directory past its bound: the worker killed, the file sink stopped");
+                    p.workers
+                        .condemn(WorkerKind::Export, "export: its directory past its bound");
+                    sign(
+                        &p.audit,
+                        "detected",
+                        serde_json::json!({"at": "note", "note": "directory_over", "sink": "file", "why": why}),
+                    );
+                }
+                dir_over = now_over;
+            }
+            if dir_over.is_some() {
+                for k in sinks.iter_mut().filter(|k| k.sink == ExportSink::File) {
+                    k.until = Some(Instant::now() + DIR_CHECK_EVERY);
+                    k.state = Some(SinkState::Failed);
+                    k.fault = Some(SinkFault::File(libc::EFBIG));
+                }
+            }
+        }
         let status = p
             .workers
             .status()
@@ -697,6 +735,39 @@ fn sendable(
         kept_hashes.pop();
     }
     (kept, kept_hashes, dropped)
+}
+
+/// How often the core measures the export's directory.
+const DIR_CHECK_EVERY: Duration = Duration::from_secs(1);
+
+/// Why the export's directory is past what the file sink may hold (the
+/// review of #499, D5: a worker taken over could fill the chains' disk),
+/// or `None`: its files are the sink's names alone (`export.jsonl`,
+/// `export.jsonl.N`, `N` < `max_files`) and their total within `bound`.
+/// Read as the core's export thread can — no capability: the directory is
+/// world-readable, its files are not.
+fn over_bound(dir: &std::path::Path, max_files: u8, bound: u64) -> Option<String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("{} not readable: {e}", dir.display())),
+    };
+    let mut total = 0u64;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let ours = name == nn_export::jsonl::ACTIVE
+            || name
+                .strip_prefix(nn_export::jsonl::ACTIVE)
+                .and_then(|n| n.strip_prefix('.'))
+                .and_then(|n| n.parse::<u8>().ok())
+                .is_some_and(|n| n >= 1 && n < max_files);
+        if !ours {
+            return Some(format!("a file the sink does not write: {name}"));
+        }
+        total += e.metadata().map(|m| m.len()).unwrap_or(0);
+    }
+    (total > bound).then(|| format!("{total} bytes, past its bound of {bound}"))
 }
 
 /// The least a sink down or failed waits before its next request.
@@ -1043,6 +1114,35 @@ mod tests {
             budget_ms: 1000,
         };
         assert_eq!(req.check(), Ok(()));
+    }
+
+    #[test]
+    fn the_export_s_directory_is_held_to_its_bound() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(over_bound(&d.path().join("none"), 3, 100), None);
+        std::fs::write(d.path().join("export.jsonl"), [b'a'; 40]).unwrap();
+        std::fs::write(d.path().join("export.jsonl.1"), [b'a'; 40]).unwrap();
+        std::fs::write(d.path().join("export.jsonl.2"), [b'a'; 20]).unwrap();
+        assert_eq!(over_bound(d.path(), 3, 100), None);
+        // one byte more
+        std::fs::write(d.path().join("export.jsonl.2"), [b'a'; 21]).unwrap();
+        assert!(over_bound(d.path(), 3, 100)
+            .unwrap()
+            .contains("past its bound"));
+        // a name the sink does not write, a number past its files
+        std::fs::write(d.path().join("export.jsonl.2"), [b'a'; 1]).unwrap();
+        for bad in [
+            "export.jsonl.3",
+            "filler",
+            "export.jsonl.0",
+            "export.jsonl.x",
+        ] {
+            std::fs::write(d.path().join(bad), b"x").unwrap();
+            let why = over_bound(d.path(), 3, 100).unwrap();
+            assert!(why.contains("does not write"), "{bad}: {why}");
+            std::fs::remove_file(d.path().join(bad)).unwrap();
+        }
+        assert_eq!(over_bound(d.path(), 3, 100), None);
     }
 
     #[test]

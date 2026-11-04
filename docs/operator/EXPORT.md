@@ -86,7 +86,7 @@ chain = actions
 start = end                 # end: the rows written from now | oldest: every row the chain holds
 file = on                   # the JSONL files
 file_max_bytes = 64MiB      # each file, 1MiB..1GiB
-file_max_files = 4          # 1..32, the active file with them
+file_max_files = 4          # 1..32, the active file with them; the two at most 4 GiB together
 syslog = 192.0.2.10:6514    # an IP and a port — the worker resolves no name
 syslog_server_name = siem.example.org   # its certificate's name (default: the IP)
 syslog_ca = /etc/northnarrow/export-ca.pem
@@ -216,7 +216,15 @@ The parse worker's (`WORKERS.md` §3) with what its sinks need, no more:
   channel, `lseek`, `fdatasync`, `renameat2`, `unlinkat`; the three Landlock
   calls (for layer 2: a layer only takes rights away). No `exec`, no
   process, no UDP, no UNIX socket by path, no `ptrace`, no `bpf`.
-- 16 descriptors, 512 MiB of address space, no process, no core.
+- 16 descriptors, 512 MiB of address space, no process, no core; no
+  file larger than 1 GiB and 1 MiB (`RLIMIT_FSIZE`, `SIGXFSZ` ignored: a
+  write past it fails). The core measures the directory every second: a
+  file the sink does not write (`export.jsonl[.N]`), or a total past the
+  files' bound (`file_max_bytes × file_max_files`, at most 4 GiB, and 1 MiB
+  a file), and the worker is killed, the file sink stopped, a signed
+  `directory_over` note — the export never fills the disk the chains are
+  on. A dedicated mount or a quota for `/var/log/northnarrow/export` holds
+  it too.
 
 It holds no key of the agent's: it verifies rows with the public key the
 core hands it. It reads no chain (root's, 0600 in 0700 directories) and

@@ -33,6 +33,16 @@ use nn_proto::ipc::{ExportChain, MAX_CA_PEM};
 /// the signed text names each (`docs/operator/EXPORT.md` §1a).
 pub const DEFAULT_CHAINS: [ExportChain; 2] = [ExportChain::Detections, ExportChain::Actions];
 
+/// The JSONL files' total at most (`file_max_bytes × file_max_files`).
+pub const MAX_DIR_BYTES: u64 = 4 << 30;
+
+/// The directory's bound the core holds the worker to: the files' total and
+/// one record past each (a line longer than a file goes whole into an
+/// empty one).
+pub fn dir_bound(f: &FileConfig) -> u64 {
+    f.max_bytes * u64::from(f.max_files) + u64::from(f.max_files) * (1 << 20)
+}
+
 /// Where the overlay lives.
 pub const EXPORT_LOCAL: &str = "/etc/northnarrow/export.local";
 
@@ -281,6 +291,14 @@ impl ExportConfig {
             c.chains = DEFAULT_CHAINS.to_vec();
         }
         if file {
+            // the directory's total, the rotation's bound (the review of
+            // #499, D5): the export never fills the chains' disk
+            if max_bytes.saturating_mul(u64::from(max_files)) > MAX_DIR_BYTES {
+                bail!(
+                    "export.local: file_max_bytes × file_max_files past {} GiB",
+                    MAX_DIR_BYTES >> 30
+                );
+            }
             c.file = Some(FileConfig {
                 max_bytes,
                 max_files,
@@ -459,6 +477,10 @@ mod tests {
             ("size large", "file_max_bytes = 2GiB".to_string()),
             ("size junk", "file_max_bytes = lots".to_string()),
             ("files", "file_max_files = 33".to_string()),
+            (
+                "the directory's total past 4 GiB",
+                "file = on\nfile_max_bytes = 1GiB\nfile_max_files = 5".to_string(),
+            ),
             (
                 "a name, not an IP",
                 format!("syslog = siem.example.org:6514\n{ca}"),

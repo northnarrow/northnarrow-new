@@ -88,7 +88,16 @@ pub struct Profile {
     /// parse worker's. The export's TCP is pinned to its receiver's port
     /// by a layer of its own after its setup ([`pin_tcp_connect`]).
     pub deny_tcp: bool,
+    /// Lot 276 (the review of #499, D5): the largest file the worker may
+    /// write (`RLIMIT_FSIZE`; `SIGXFSZ` ignored, so a write past it fails
+    /// with `EFBIG`). `None`: the limit inherited (the parse worker writes
+    /// no file).
+    pub max_file_bytes: Option<u64>,
 }
+
+/// The export worker's largest file: a sink's file is at most
+/// `file_max_bytes` (1 GiB at most) and one record over it.
+pub const EXPORT_MAX_FILE_BYTES: u64 = (1 << 30) + (1 << 20);
 
 impl Profile {
     /// The `parse` worker (plan §3.1): no file, no network, no process,
@@ -102,6 +111,7 @@ impl Profile {
             max_fds: MAX_FDS,
             fs_rules: Vec::new(),
             deny_tcp: true,
+            max_file_bytes: None,
         }
     }
 
@@ -126,6 +136,7 @@ impl Profile {
                 declared: nn_proto::ipc::EXPORT_DIR_RULE,
             }],
             deny_tcp: false,
+            max_file_bytes: Some(EXPORT_MAX_FILE_BYTES),
         }
     }
 }
@@ -320,6 +331,15 @@ fn harden(profile: &Profile) -> Result<(), SandboxError> {
         (libc::RLIMIT_AS, profile.memory, "RLIMIT_AS"),
     ] {
         setrlimit(res, v).map_err(step(name))?;
+    }
+    if let Some(max) = profile.max_file_bytes {
+        // a write past the limit fails (EFBIG) rather than ending the
+        // process by signal: the sink says why
+        // SAFETY: setting a signal's disposition to SIG_IGN.
+        if unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) } == libc::SIG_ERR {
+            return Err(step("SIGXFSZ")(io::Error::last_os_error()));
+        }
+        setrlimit(libc::RLIMIT_FSIZE, max).map_err(step("RLIMIT_FSIZE"))?;
     }
     Ok(())
 }
