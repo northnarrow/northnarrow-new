@@ -933,6 +933,17 @@ mod tests {
         // a data row in the terminator's place
         let r = verify(with(Some(&rows[1])).as_bytes(), &k.verifying_key()).unwrap();
         assert_eq!(r.exit_code(), 13, "{r:#?}");
+        // a data row in its place that the row does follow: no terminator
+        let after_data = row(&k, "detections", 3, &hash(&rows[1]));
+        let r = verify(
+            with_next(Some(&rows[1]), &after_data).as_bytes(),
+            &k.verifying_key(),
+        )
+        .unwrap();
+        assert_eq!(r.exit_code(), 13, "{r:#?}");
+        assert!(r.tampered[0]
+            .1
+            .contains("`rotate` is not the terminator its row follows"));
         // a terminator signed by another key
         let other = SigningKey::from_bytes(&[6; 32]);
         let forged = terminator(&other, "detections", &hash(&rows[1]));
