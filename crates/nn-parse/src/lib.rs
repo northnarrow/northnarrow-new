@@ -1,5 +1,5 @@
 //! `nn-parse` — parsers of attacker-written bytes: the TLS ClientHello (JA3),
-//! DNS records and QNAMEs.
+//! DNS records and responses, and QNAMEs.
 //!
 //! Why a crate of its own: the leaf of the layout: no crate of this repository
 //! below it, pure, fuzzed, the code the confined worker runs (R14b).
@@ -22,6 +22,10 @@ pub mod dns_qname;
 /// The A and AAAA answers of a DNS response (was the agent's
 /// `net::dns_cache` reply parser until R06, lab PR 242).
 pub mod dns_records;
+
+/// Lot 275: a DNS response's question, response code and A, AAAA and CNAME
+/// answers with their TTLs, for the DNS response sensor.
+pub mod dns_response;
 
 /// The TLS ClientHello: JA3, JA4, SNI, ALPN (its cursor Kani-proved; was the
 /// agent's `net::tls_parser` until R06, lab PR 242).

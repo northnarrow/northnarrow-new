@@ -841,8 +841,10 @@ pub fn event_time_ns(event: &Event) -> u64 {
         | Event::SensorFlood { timestamp_ns, .. }
         | Event::ExploitPostcondition { timestamp_ns, .. } => *timestamp_ns,
         Event::Fim(fe) => fe.timestamp_ns,
-        Event::NetFlow(nf) => nf.start_ns,
+        Event::NetFlow(nf) | Event::NetInbound(nf) => nf.start_ns,
         Event::NetListener(nl) => nl.timestamp_ns,
+        Event::DnsAnswer(a) => a.timestamp_ns,
+        Event::TlsClientHello(h) => h.timestamp_ns,
     }
 }
 
@@ -2000,6 +2002,27 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         false
     }
 
+    /// The final check of #495 (C1; its second review, R1): the image `pid`
+    /// runs is the host's file at `path` — the device and inode of
+    /// `/proc/<pid>/exe` (the kernel's link to the image it executed, opened
+    /// as a file: no path walked in the process's mount namespace) are those
+    /// of `path` under the host's root, as the agent reads it. A service
+    /// systemd runs in a mount namespace of its own (systemd-resolved:
+    /// `ProtectSystem=strict`, `PrivateTmp`) runs the host's file; a
+    /// container's copy at that path (an overlay, another file), an image
+    /// replaced at the path since the process started (another inode) and a
+    /// process gone do not. `false` when either cannot be read: no evidence
+    /// it is the host's.
+    pub fn runs_host_file(&self, pid: u32, path: &str) -> bool {
+        let id = |file: PathBuf| H::file_id(file);
+        let exe = self.inner.proc_root.join(pid.to_string()).join("exe");
+        let host = self.inner.host_root.join(path.trim_start_matches('/'));
+        match (id(exe), id(host)) {
+            (Some(own), Some(host)) => own == host,
+            _ => false,
+        }
+    }
+
     /// Lab PR 175: `pid` runs in a mount namespace other than init's whose
     /// root mount (the last `/` of its `mountinfo`) is an overlay with its
     /// `upperdir` and `workdir` in the container storage of `users`; that
@@ -2445,6 +2468,26 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             Some(Some(hop)) => Some(self.hop_identity(&hop)),
             _ => None,
         }
+    }
+
+    /// Lot 275 (NN-L-NET-028): `pid` and its ancestors on the walk of
+    /// [`Self::actor_in_lineage`] (ordered, POS-003), `pid` first, each
+    /// with its start as the spawn cache holds it (`CLOCK_MONOTONIC` ns; 0
+    /// for a hop read from `/proc`). The hops read before a hop that cannot
+    /// be read; empty when `pid`'s own cannot.
+    pub fn lineage_starts(&self, pid: u32, as_of: AsOf) -> Vec<(u32, u64)> {
+        let hops = std::cell::RefCell::new(Vec::new());
+        let _ = self.lineage_walk(
+            pid,
+            as_of,
+            |hop| {
+                let start = if hop.cached { hop.start_ns } else { 0 };
+                hops.borrow_mut().push((hop.pid, start));
+                false
+            },
+            LINEAGE_DEPTH_CAP,
+        );
+        hops.into_inner()
     }
 
     /// What the kernel executed for a hop: the spawn cache's record, else
@@ -3581,6 +3624,30 @@ mod tests {
         let t = AuthSessionTracker::new("/proc");
         t.ingest_spawn(100, 50, "/usr/bin/sudo", 1);
         assert!(t.is_auth_mediated(100, AsOf::Now));
+    }
+
+    #[test]
+    fn lineage_starts_are_the_process_then_its_ancestors() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        t.ingest_exec(100, 50, "/usr/bin/bash", &[], 10, 5, 1000);
+        t.ingest_exec(200, 100, "/usr/bin/python3", &[], 20, 15, 1000);
+        t.ingest_exec(300, 200, "/usr/bin/curl", &[], 30, 25, 1000);
+        let got = t.lineage_starts(300, AsOf::Now);
+        assert_eq!(
+            got,
+            vec![(300, 25), (200, 15), (100, 5)],
+            "the cached starts"
+        );
+        assert_eq!(
+            t.lineage_starts(100, AsOf::Now)
+                .iter()
+                .map(|(p, _)| *p)
+                .collect::<Vec<_>>(),
+            vec![100]
+        );
+        assert!(t.lineage_starts(999, AsOf::Now).is_empty(), "not known");
+        assert!(t.lineage_starts(1, AsOf::Now).is_empty(), "init");
     }
 
     #[test]

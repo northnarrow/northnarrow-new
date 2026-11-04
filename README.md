@@ -58,7 +58,7 @@ liability before it is a product. NorthNarrow inverts it:
 flowchart LR
     subgraph KERNEL["Linux kernel"]
         direction TB
-        SENS["eBPF sensors · 13 sources<br/>exec · file open · FIM · TCP/UDP flows · DNS<br/>listeners · modules · io_uring · bpf() · exploit guard"]
+        SENS["eBPF sensors · 16 sources<br/>exec · file open · FIM · TCP/UDP flows · inbound · DNS · TLS<br/>listeners · modules · io_uring · bpf() · exploit guard"]
         LSM["BPF-LSM deny hooks<br/>17 + up to 6 optional"]
     end
 
@@ -96,7 +96,7 @@ flowchart LR
 
 | | |
 |---|---|
-| **Sense** | Thirteen sources on tracepoints, kprobes, uprobes, fentry/fexit and BPF-LSM hooks. Each source's attach point, fallbacks, failure mode, budgets, truncations and loss counters are a contract in code, and the agent signs a capability manifest of what really attached, at boot and at every change ([sensor contract](docs/operator/SENSOR_CONTRACT.md)). |
+| **Sense** | Sixteen sources on tracepoints, kprobes, uprobes, fentry/fexit and BPF-LSM hooks. Each source's attach point, fallbacks, failure mode, budgets, truncations and loss counters are a contract in code, and the agent signs a capability manifest of what really attached, at boot and at every change ([sensor contract](docs/operator/SENSOR_CONTRACT.md)). |
 | **Prioritise** | Every event class has its own queue. Tamper (P0) is taken first, so a flood of file opens no longer pushes denials out. A full queue follows its class's policy, and every drop is counted and signed, never silent ([event bus](docs/architecture/EVENT_BUS.md)). |
 | **Decide** | One OS thread with no `await` judges every event against 93 rules, chain correlation and the posture; most of the blocking I/O it used to do now runs elsewhere. There is no AI model on the host: the on-host LLM advisor was removed in Wave 4 ([upgrade notes](docs/operator/UPGRADE_NOTES_WAVE4.md)). |
 | **Act** | Responses go to a dispatcher: eight workers by default, Critical first, one process's responses in order. Each action is a signed intent before it runs and a signed outcome after it. The posture rises from OBSERVING through ALERTED and ENGAGED to COMBAT only on corroborated evidence. COMBAT climbs from INVESTIGATE to NEUTRALIZE to ISOLATE, and only an Ed25519-signed command releases it. |
@@ -198,15 +198,15 @@ Thirty capabilities, each with a level that changes only together with its evide
 supported kernel. The table in
 [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md) was re-assessed on 2026-11-03
 against `main`, separately from the lab PRs. It is a self-assessment, not a third party's.
-**No capability is at level 3.** Ten are at 2, ten at 1 and ten at 0.
+**No capability is at level 3.** Eleven are at 2, nine at 1 and ten at 0.
 
 <details>
 <summary><b>All thirty levels</b></summary>
 
 | Level | Capabilities |
 |---|---|
-| **2** | C01 Linux sensor · C06 file telemetry and FIM · C12 synchronous inline blocking (experimental, off by default) · C14 behavioural detection and correlation · C16 structured ATT&CK mapping · C17 response on processes and files · C23 anti-tamper and self-defence (*provisional*) · C24 offline and air-gapped operation · C25 data sovereignty · C26 open code and inspectability |
-| **1** | C05 process telemetry (exec only) · C07 endpoint network telemetry · C11 containers · C13 malware prevention · C15 custom rules · C18 host network isolation · C19 rollback · C20 automation · C27 product supply chain · C28 safe content release |
+| **2** | C01 Linux sensor · C06 file telemetry and FIM · C07 endpoint network telemetry · C12 synchronous inline blocking (experimental, off by default) · C14 behavioural detection and correlation · C16 structured ATT&CK mapping · C17 response on processes and files · C23 anti-tamper and self-defence (*provisional*) · C24 offline and air-gapped operation · C25 data sovereignty · C26 open code and inspectability |
+| **1** | C05 process telemetry (exec only) · C11 containers · C13 malware prevention · C15 custom rules · C18 host network isolation · C19 rollback · C20 automation · C27 product supply chain · C28 safe content release |
 | **0** | C02 Windows · C03 macOS · C04 ARM64 · C08 identity / ITDR · C09 cloud · C10 NDR · C21 SIEM export · C22 backend · C29 independent public validation · C30 generative AI on the host (absent by design) |
 
 </details>
@@ -251,21 +251,22 @@ but a defence inside the kernel is only as strong as the kernel's integrity:
   Hardware attestation (a TPM quote of the measured boot) is future work
   ([`HEARTBEAT.md`](docs/operator/HEARTBEAT.md#what-it-does-not-prove)).
 - **The capability manifest is the agent's own word.** The telemetry probe exercises 3 of the
-  13 sources, and the boot's deny self-test exercises `task_kill` and the move guard.
+  16 sources, and the boot's deny self-test exercises `task_kill` and the move guard.
 
 **Not verified yet.**
 
 - **No adversarial campaign proof.** The V2 campaign has not run, so no rule has campaign
   evidence, and no coverage percentage is published until it has
-  ([`docs/validation/matrix.md`](docs/validation/matrix.md)). The JA3 rule cannot fire: no
-  sensor produces a TLS fingerprint yet.
+  ([`docs/validation/matrix.md`](docs/validation/matrix.md)).
 - **No independent validation.** The public CI runs are a step towards it, not a substitute (C29).
 - **No export, no backend.** Evidence stays on the host; only the heartbeat leaves it, by pull
   (C21, C22).
 - **Linux x86_64 only.** No ARM64, no Windows, no macOS (C02 to C04).
 - **No published release with assets.** The signed pipeline exists, but the one tag has no assets.
-- **Partial telemetry.** Exec only, with no fork, exit or credential events (C05). No inbound
-  connections, DNS answers or TLS fingerprints (C07).
+- **Partial telemetry.** Exec only, with no fork, exit or credential events (C05). DNS is read
+  over UDP only: no DNS over TCP, DoT or DoH, and no `recvmmsg` (C07).
+- **A TLS fingerprint is not an identity.** NN-L-NET-003 records a JA3 or JA4 in the operator's
+  list as Medium and never acts on it; `enforce` is refused until it has a second predicate.
 - **Narrow measurements.** Overhead is measured on Ubuntu 24.04 only. One 24-hour soak passed,
   on AlmaLinux 9, before Wave 4.
 - **Prevention is experimental and off by default:** the exec policy, exec quarantine and copy on
@@ -372,10 +373,10 @@ on-host LLM advisor removed, which also took about 150 crates out of `Cargo.lock
 
 - [ ] Lot 273c, in progress: `prlimit` / `RLIMIT_CPU` and scheduler starvation refused outside a window
 - [ ] **Wave 1**
-  - [ ] Network telemetry (inbound connections, DNS answers, TLS fingerprints) and "no DNS, no connect": a connection to an address no DNS answer gave
+  - [x] Network telemetry (inbound connections, DNS answers, TLS fingerprints) and "no DNS, no connect": a connection to an address no DNS answer gave (lot 275; the rule records, its kill refused until measured wider)
   - [ ] Process telemetry: fork, exit and credential changes
   - [ ] Deception that trips when a decoy is used
-  - [ ] A self-test of every sensor, not three of thirteen
+  - [ ] A self-test of every sensor, not three of sixteen
   - [ ] Foreign BPF loads and rootkit helpers refused
   - [ ] Per-rule exemptions by cgroup or unit that hold only for processes started there: a process moved into an exempt cgroup loses the exemption, and the move is signed
   - [ ] `isolate --ttl`: a signed isolation outside the COMBAT ladder, with an expiry

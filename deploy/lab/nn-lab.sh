@@ -1265,7 +1265,7 @@ for line in open(raw):
 print(f"# Agent overhead — {distro} ({kernel})\n")
 print("| workload | agent off (ops/s) | agent on (ops/s) | overhead | agent CPU during the run |")
 print("|---|---|---|---|---|")
-for wl in ("open", "wopen", "exec", "connect", "udp", "dns"):
+for wl in ("open", "wopen", "exec", "connect", "udp", "dns", "tcpsend", "udprecv"):
     if wl not in rows:
         continue
     off, on = statistics.median(rows[wl]["off"]), statistics.median(rows[wl]["on"])

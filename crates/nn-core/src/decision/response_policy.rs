@@ -213,6 +213,18 @@ pub const FIM_010_MOVED_IN_KILL: PolicySwitch = PolicySwitch::off(
      match added by lab PR 225)",
 );
 
+/// NN-L-NET-028 (lot 275, new rule): the kill of a process that connected
+/// to a public address its lineage did not resolve.
+pub const NODNS_KILL: PolicySwitch = PolicySwitch::off(
+    "the kill of a process that connected to a public address its lineage did not resolve \
+     (NN-L-NET-028, lot 275)",
+);
+
+// NN-L-NET-003 has no switch: from lot 275 (R6 of the external review of
+// 04/11) a fingerprint match is Medium and `Log`, with no response to hold,
+// and the per-rule policy refuses `enforce` for it
+// (`rule_policy::ENFORCE_REFUSED`).
+
 /// Every switch, for the tests and the documents.
 pub const ALL: &[PolicySwitch] = &[
     R020_KILL,
@@ -223,6 +235,7 @@ pub const ALL: &[PolicySwitch] = &[
     IMP_001_KILL,
     EVA_KILL,
     FIM_010_MOVED_IN_KILL,
+    NODNS_KILL,
 ];
 
 #[cfg(test)]

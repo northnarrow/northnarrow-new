@@ -899,6 +899,7 @@ mod tests {
                 close_reason: rng.random(),
                 agent_id: text(&mut rng),
                 decision_engine_skipped: rng.random(),
+                inbound: rng.random(),
             })
             .collect();
         check(flows);

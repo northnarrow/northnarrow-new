@@ -57,7 +57,10 @@ impl Sensor {
             | Event::DnsFlood { .. }
             | Event::SensorFlood { .. }
             | Event::NetFlow(_)
-            | Event::NetListener(_) => Sensor::Network,
+            | Event::NetListener(_)
+            | Event::NetInbound(_)
+            | Event::DnsAnswer(_)
+            | Event::TlsClientHello(_) => Sensor::Network,
             Event::FsProtectDenial { .. } | Event::DefenderSignal { .. } => Sensor::AntiTamper,
             Event::CanaryTripped { .. } => Sensor::Canary,
         }
@@ -184,10 +187,22 @@ impl Principal {
                 uid: fe.modifier_uid,
                 ppid: None,
             },
-            Event::NetFlow(nf) => Principal {
+            Event::NetFlow(nf) | Event::NetInbound(nf) => Principal {
                 pid: nf.pid,
                 comm: nf.comm.clone(),
                 uid: nf.uid,
+                ppid: None,
+            },
+            Event::DnsAnswer(a) => Principal {
+                pid: a.pid,
+                comm: a.comm.clone(),
+                uid: a.uid,
+                ppid: None,
+            },
+            Event::TlsClientHello(h) => Principal {
+                pid: h.pid,
+                comm: h.comm.clone(),
+                uid: h.uid,
                 ppid: None,
             },
             Event::NetListener(nl) => Principal {

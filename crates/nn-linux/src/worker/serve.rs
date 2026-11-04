@@ -167,19 +167,44 @@ pub(crate) fn answer(req: &Request) -> Answer {
         Request::Ping => Answer::Pong,
         Request::DnsNames(names) => Answer::DnsNames(names.iter().map(qname).collect()),
         Request::TlsClientHello(bytes) => Answer::Tls(tls(bytes)),
-        Request::DnsAnswers(bytes) => Answer::DnsAnswers {
-            a: nn_parse::dns_records::parse_a_records(bytes)
-                .into_iter()
-                .map(|ip| ip.octets())
-                .collect(),
-            aaaa: nn_parse::dns_records::parse_aaaa_records(bytes)
-                .into_iter()
-                .map(|ip| ip.octets())
-                .collect(),
-        },
+        Request::DnsAnswers(bytes) => Answer::DnsAnswers(dns_answers(bytes)),
         Request::DebugCrash => debug_crash(),
         Request::DebugHang => debug_hang(),
     }
+}
+
+/// Lot 275: a DNS response's question and records, as the protocol carries
+/// them (nn-parse keeps at most `MAX_DNS_RECORDS`, and its names are the
+/// protocol's alphabet).
+fn dns_answers(bytes: &[u8]) -> Option<nn_proto::ipc::DnsAnswersOut> {
+    use nn_parse::dns_response::AnswerRecord;
+    use nn_proto::ipc::{DnsAnswersOut, DnsRecordOut};
+    let r = nn_parse::dns_response::parse_response(bytes)?;
+    Some(DnsAnswersOut {
+        qname: r.qname,
+        qtype: r.qtype,
+        rcode: r.rcode,
+        records: r
+            .answers
+            .into_iter()
+            .map(|a| match a {
+                AnswerRecord::A { name, ttl, addr } => DnsRecordOut::A {
+                    name,
+                    ttl,
+                    addr: addr.octets(),
+                },
+                AnswerRecord::Aaaa { name, ttl, addr } => DnsRecordOut::Aaaa {
+                    name,
+                    ttl,
+                    addr: addr.octets(),
+                },
+                AnswerRecord::Cname { name, ttl, target } => {
+                    DnsRecordOut::Cname { name, ttl, target }
+                }
+            })
+            .collect(),
+        complete: r.complete,
+    })
 }
 
 fn qname(q: &QnameIn) -> QnameOut {
@@ -296,6 +321,42 @@ mod tests {
         ] {
             assert!(parse_args(&argv(bad)).is_err(), "{bad}");
         }
+    }
+
+    /// Lot 275: the worker's answer to a DNS response carries its question
+    /// and its records; to bytes that are no response, `None`.
+    #[test]
+    fn a_dns_response_is_answered_with_its_question_and_records() {
+        use nn_proto::ipc::{DnsRecordOut, Request};
+        let mut m = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        m.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        m.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 7]);
+        match answer(&Request::DnsAnswers(m.clone())) {
+            Answer::DnsAnswers(Some(out)) => {
+                assert_eq!(
+                    (out.qname.as_str(), out.qtype, out.rcode),
+                    ("example.com", 1, 0)
+                );
+                assert!(out.complete);
+                assert_eq!(
+                    out.records,
+                    vec![DnsRecordOut::A {
+                        name: "example.com".into(),
+                        ttl: 60,
+                        addr: [192, 0, 2, 7]
+                    }]
+                );
+                assert!(nn_proto::ipc::check_response(
+                    &Request::DnsAnswers(m.clone()),
+                    &Answer::DnsAnswers(Some(out))
+                )
+                .is_ok());
+            }
+            other => panic!("{other:?}"),
+        }
+        // a query (QR clear) is no response
+        m[2] = 0x01;
+        assert_eq!(answer(&Request::DnsAnswers(m)), Answer::DnsAnswers(None));
     }
 
     #[test]

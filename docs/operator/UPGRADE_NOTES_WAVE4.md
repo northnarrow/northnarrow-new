@@ -50,15 +50,21 @@ has the details of each change below.
    To upgrade a host in COMBAT, release COMBAT first or install from a
    tree root owns (`/opt`, `/usr/local/src`), whose execs R009 does not
    match.
-9. An exemption by `cgroup` or `unit` of the per-rule policy holds only
-   for a process started in its cgroup since lot 277 (§7): a process
-   moved into an exempt service, and a `Delegate=yes` service's or a
-   container runtime's own processes, lose it. After a **"cgroup
-   exemptions: marks reset"** degradation — the tracker's pins gone
-   between two agents, not the registered ones, or of another schema —
-   every process started before that start is "not known": **restart the
-   exempt services** (`systemctl restart <unit>`) so that their processes
-   are exempt again.
+9. A signed `rule-policy.local` with `enforce NN-L-NET-003` or `enforce
+   NN-L-NET-028`: from lot 275 that line is taken as `alert` at the start,
+   the rest of your policy in force, and the start signs a `rule_policy`
+   degradation naming it (§7). Re-sign the policy without it (`alert …`)
+   when convenient: `nn-admin config overlay set` refuses a file that
+   keeps it.
+10. An exemption by `cgroup` or `unit` of the per-rule policy holds only
+    for a process started in its cgroup since lot 277 (§8): a process
+    moved into an exempt service, and a `Delegate=yes` service's or a
+    container runtime's own processes, lose it. After a **"cgroup
+    exemptions: marks reset"** degradation — the tracker's pins gone
+    between two agents, not the registered ones, or of another schema —
+    every process started before that start is "not known": **restart the
+    exempt services** (`systemctl restart <unit>`) so that their processes
+    are exempt again.
 
 ## 1. The on-host LLM advisor is removed (lab PR 214)
 
@@ -359,7 +365,42 @@ What an operator sees change:
   release starts again and records it. An older agent starts unaudited on
   a key that cannot be loaded, as it did.
 
-## 7. Exemptions by cgroup or unit and the start-in-cgroup tracker (lot 277)
+## 7. NN-L-NET-003: a TLS fingerprint is not an identity (lot 275)
+
+- **What changes.** The TLS ClientHello sensor of lot 275 produces the
+  first real fingerprints, so NN-L-NET-003 matches for the first time. A
+  JA3 — or, new, a JA4 — in `netflow-ja3-blocklist.{v1,local}` is a
+  **Medium** record with no response (`Log`), no longer a Critical
+  `KillProcessTree` with COMBAT: a fingerprint names a TLS library and its
+  settings, which every program on it shares (R6 of the external review
+  of 04/11; `NETWORK_TELEMETRY.md` §3). The list file keeps its name and
+  accepts JA4 entries next to JA3.
+- **A policy that enforced it.** `enforce NN-L-NET-003` is refused until the
+  rule has a second predicate (a destination or an executable). A signed
+  `rule-policy.local` that holds the line is **not** dropped at the start:
+  only that line is taken as `alert`, every other line stays in force, and
+  the start signs a `rule_policy` degradation — "line N: enforce
+  NN-L-NET-003_BadJa3 refused, applied as alert … — the rest of the policy
+  is in force" — which `nn-admin status --key` lists and `policy show`
+  names in the policy's source. `nn-admin config overlay set` refuses a
+  file with the line: replace it with `alert NN-L-NET-003` (or `audit`)
+  and re-sign.
+- **NN-L-NET-028 too** (the review of #495): its `enforce` is refused the
+  same way — refused by `config overlay set`, applied as `alert` at the
+  start, a signed degradation — until the rule is measured on a wider
+  corpus: its kill judges the absence of a DNS answer, which benign
+  software can produce out of the agent's sight (a container's resolvers
+  of its own, DNS over TCP, DoT or DoH). Its records stay Medium or Low,
+  `Log`.
+- **Monitoring.** A rule that matched NN-L-NET-003 as Critical, or its
+  `net_critical` category, sees `Medium` and `net_medium`; it is out of the
+  V2 Critical sub-gate.
+- **Rollback.** An agent from before this release reads the same policy
+  file as before (the line was valid there) and the list's JA3 entries; it
+  skips the JA4 entries at its start (a line it cannot parse, a WARN each)
+  and its `config overlay set` refuses an overlay that has one.
+
+## 8. Exemptions by cgroup or unit and the start-in-cgroup tracker (lot 277)
 
 An exemption by `cgroup` or `unit` (`RULE_POLICY.md` §2.1) holds only
 for a process started in that cgroup — spawned there by systemd, or

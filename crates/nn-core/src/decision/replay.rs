@@ -103,6 +103,9 @@ pub fn engine<H: DecisionHost>(host: HostParts<'_, H>) -> RuleEngine<H> {
     let net_config = NetRuleConfig {
         resolvers: crate::net::resolvers::HostResolvers::fixed(resolvers),
         fanout: Arc::new(FanoutConfig::default()),
+        // lot 275: the replay's rows carry no DNS judgement (the pumps make
+        // it), so the rule does not fire in a replay
+        nodns_allow: Arc::new(super::rules::net_nodns::NoDnsAllowlist::empty()),
     };
     RuleEngine::with_default_rules_and_net(
         Arc::new(

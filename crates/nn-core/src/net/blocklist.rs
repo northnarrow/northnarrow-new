@@ -12,8 +12,9 @@
 //!    Tappa 9 C7 + Tappa 9.5 K7 already follow.
 //!
 //! V1.0 also ships `netflow-ja3-blocklist.v1` + matching `.local`
-//! for JA3 hash entries (used by NN-L-NET-003). Same shape, just
-//! a different entry parser (32-hex chars per line vs `IP[/cidr]`).
+//! for TLS fingerprint entries (used by NN-L-NET-003): a JA3 hash or,
+//! from lot 275 (R6 of the external review of 04/11), a JA4. Same shape,
+//! just a different entry parser (a fingerprint per line vs `IP[/cidr]`).
 //!
 //! No external dep — IP / CIDR parsing is `std::net::IpAddr` +
 //! a hand-rolled `cidr_contains` helper. ipnet would be smaller
@@ -65,6 +66,8 @@ pub const EARLIER_NETFLOW_BLOCKLIST_V1_SHA256: &[&str] = &[
 pub const EARLIER_JA3_BLOCKLIST_V1_SHA256: &[&str] = &[
     // Tappa 10 N8 (562a79d)
     "0340417224f37515e1c2a1ed24bc3f530c4bdb910f6bf65dee9793152efc6a24",
+    // lab PR 142 (2ec03e2), the rule inactive until BUG-025
+    "3549750f6c1530fc139f9853d173bccb72612b58086392517fa9fe1f3a815870",
 ];
 /// The shipped `netflow-blocklist.v1` (built-in copy, earlier ones).
 pub const NETFLOW_BLOCKLIST_SHIPPED: Shipped<'static> = Shipped::new(
@@ -385,11 +388,11 @@ pub fn parse_blocklist_overlay_text(
 
 // ── JA3 blocklist ────────────────────────────────────────────────────
 
-/// External audit NET-009 (BUG-025): no sensor captures a TLS ClientHello
-/// in this build — `tls_parser` has no caller and every flow row carries
-/// no fingerprint — so NN-L-NET-003 cannot match, whatever the JA3 list
-/// holds. Turned on by the change that adds the producer.
-pub const TLS_FINGERPRINT_PRODUCER: bool = false;
+/// External audit NET-009 (BUG-025): whether this build has a sensor that
+/// captures a TLS ClientHello. Lot 275 added it (`agent-ebpf/src/tls_hello.rs`,
+/// fingerprinted by the parse worker): NN-L-NET-003 can match. A kernel
+/// where it does not attach says so itself (the `tls_hello` degradation).
+pub const TLS_FINGERPRINT_PRODUCER: bool = true;
 
 pub fn ja3_entries_phrase(entries: usize) -> String {
     if entries == 1 {
@@ -413,9 +416,13 @@ pub fn ja3_coverage_gap(entries: usize, producer: bool) -> Option<String> {
     })
 }
 
-/// JA3 fingerprint blocklist. JA3 hashes are 32-char lowercase
-/// hex strings (MD5 of the JA3 raw tuple, per Salesforce 2017
-/// spec). Same file format as `NetBlocklist` minus CIDR support.
+/// TLS fingerprint blocklist: JA3 hashes (32-char lowercase hex, the MD5
+/// of the JA3 raw tuple, Salesforce 2017) and, from lot 275 (R6), JA4
+/// fingerprints (36 chars, `t13d1516h2_8daaf6152771_02713d6af862`, FoxIO
+/// 2023: JA3 alone is unstable for a client that permutes its extensions,
+/// Chrome from 108). Both forms in one set: they cannot collide (a JA4
+/// has its two underscores). Same file format as `NetBlocklist` minus CIDR
+/// support.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ja3Blocklist {
     hashes: BTreeSet<String>,
@@ -449,6 +456,19 @@ impl Ja3Blocklist {
 
     pub fn contains(&self, hash: &str) -> bool {
         self.hashes.contains(hash)
+    }
+
+    /// The entry a ClientHello's fingerprints match: its JA3, else its JA4
+    /// (compared in lowercase, as the parser keeps the entries).
+    pub fn matching(&self, ja3: &str, ja4: &str) -> Option<FingerprintMatch> {
+        if !ja3.is_empty() && self.hashes.contains(ja3) {
+            return Some(FingerprintMatch::Ja3);
+        }
+        if ja4.is_empty() {
+            return None;
+        }
+        let ja4 = ja4.to_ascii_lowercase();
+        self.hashes.contains(&ja4).then_some(FingerprintMatch::Ja4)
     }
 
     /// Where the defaults came from (see [`NetBlocklist::defaults`]).
@@ -485,11 +505,53 @@ impl Ja3Blocklist {
     }
 }
 
+/// Which of a ClientHello's fingerprints a blocklist entry matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintMatch {
+    Ja3,
+    Ja4,
+}
+
+impl FingerprintMatch {
+    pub fn label(self) -> &'static str {
+        match self {
+            FingerprintMatch::Ja3 => "JA3",
+            FingerprintMatch::Ja4 => "JA4",
+        }
+    }
+}
+
+/// A JA4 in its 36-character form `a_b_c`: `a` the protocol (`t` TCP, `q`
+/// QUIC, `d` DTLS), the version (two characters), `d` or `i` (an SNI or
+/// none), the cipher and extension counts (two digits each) and the ALPN's
+/// first and last characters; `b` and `c` 12 hexadecimal digits each.
+fn is_ja4(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 || b[10] != b'_' || b[23] != b'_' {
+        return false;
+    }
+    let alnum = |c: u8| c.is_ascii_digit() || c.is_ascii_lowercase();
+    matches!(b[0], b't' | b'q' | b'd')
+        && alnum(b[1])
+        && alnum(b[2])
+        && matches!(b[3], b'd' | b'i')
+        && b[4..8].iter().all(u8::is_ascii_digit)
+        && alnum(b[8])
+        && alnum(b[9])
+        && b[11..23]
+            .iter()
+            .chain(&b[24..36])
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+}
+
+/// One blocklist entry: a JA3 hash or a JA4, in lowercase.
 fn parse_ja3_hash(s: &str) -> Result<String> {
     let s = s.to_ascii_lowercase();
-    if s.len() != 32 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+    let ja3 = s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit());
+    if !ja3 && !is_ja4(&s) {
         return Err(anyhow!(
-            "expected 32 lowercase-hex chars for JA3 hash, got `{s}`"
+            "expected a JA3 (32 hexadecimal digits) or a JA4 (`t13d1516h2_8daaf6152771_02713d6af862`), \
+             got `{s}`"
         ));
     }
     Ok(s)
@@ -915,10 +977,64 @@ mod tests {
         let _ = bl;
     }
 
-    /// The shipped `.v1` no longer says NN-L-NET-003 "stays functional".
+    /// The shipped `.v1` no longer says NN-L-NET-003 "stays functional",
+    /// nor, since lot 275, that it is inactive or kills (R6).
     #[test]
-    fn the_shipped_ja3_list_states_the_rule_is_inactive() {
+    fn the_shipped_ja3_list_states_what_the_rule_does() {
         assert!(!BUILTIN_JA3_BLOCKLIST_V1.contains("stays functional"));
-        assert!(BUILTIN_JA3_BLOCKLIST_V1.contains("BUG-025"));
+        assert!(!BUILTIN_JA3_BLOCKLIST_V1.contains("NOT ACTIVE"));
+        assert!(!BUILTIN_JA3_BLOCKLIST_V1.contains("KillProcessTree"));
+        assert!(BUILTIN_JA3_BLOCKLIST_V1.contains("never acted on"));
+        assert!(BUILTIN_JA3_BLOCKLIST_V1.contains("JA4"));
+    }
+
+    /// R6 (lot 275): a JA4 entry is accepted, in either case, and matched
+    /// against a hello's JA4; malformed JA4s are refused.
+    #[test]
+    fn ja4_entries_are_parsed_and_matched() {
+        let ja4 = "t13d1516h2_8daaf6152771_02713d6af862";
+        assert_eq!(parse_ja3_hash(&ja4.to_ascii_uppercase()).unwrap(), ja4);
+        for good in [
+            ja4,
+            "q13i0310h3_55b375c5d22e_cd85d2d88918",
+            "t12d190800_d83cc789557e_7af1ed941c26",
+        ] {
+            assert!(parse_ja3_hash(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "t13d1516h2_8daaf6152771_02713d6af86",   // c one short
+            "t13d1516h2_8daaf6152771_02713d6af8622", // c one long
+            "t13d1516h2-8daaf6152771_02713d6af862",  // a dash
+            "x13d1516h2_8daaf6152771_02713d6af862",  // no such protocol
+            "t13x1516h2_8daaf6152771_02713d6af862",  // neither d nor i
+            "t13d15a6h2_8daaf6152771_02713d6af862",  // a count not a digit
+            "t13d1516h2_8daaf615277g_02713d6af862",  // b not hex
+            "t13d1516h2_8daaf6152771_02713d6af86z",  // c not hex
+            "t13d1516h-_8daaf6152771_02713d6af862",  // the ALPN not alphanumeric
+            "",
+        ] {
+            assert!(parse_ja3_hash(bad).is_err(), "{bad}");
+        }
+        let ja3 = "a0e9f5d64349fb13191bc781f81f42e1";
+        let bl = Ja3Blocklist::from_entries([ja3, ja4]);
+        assert_eq!(bl.matching(ja3, ""), Some(FingerprintMatch::Ja3));
+        assert_eq!(bl.matching("", ja4), Some(FingerprintMatch::Ja4));
+        // the hello's JA4 compared in lowercase
+        assert_eq!(
+            bl.matching(&"b".repeat(32), &ja4.to_ascii_uppercase()),
+            Some(FingerprintMatch::Ja4)
+        );
+        // the JA3 first when both match
+        assert_eq!(bl.matching(ja3, ja4), Some(FingerprintMatch::Ja3));
+        assert_eq!(
+            bl.matching(&"b".repeat(32), "t13d1516h2_000000000000_000000000000"),
+            None
+        );
+        // an empty fingerprint never matches (nor an empty entry)
+        let odd = Ja3Blocklist::from_entries([""]);
+        assert_eq!(odd.matching("", ""), None);
+        // the overlay accepts both forms
+        let (adds, _) = parse_ja3_overlay_text("x", &format!("+{ja3}\n+{ja4}\n")).unwrap();
+        assert_eq!(adds.len(), 2);
     }
 }

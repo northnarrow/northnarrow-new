@@ -402,10 +402,15 @@ fn a_request_out_of_bounds_is_refused_before_it_is_sent() {
 /// connects' wait.
 #[test]
 fn a_slow_worker_is_a_hang_well_before_the_connects_wait() {
-    use crate::worker::parse::{ParseClient, NAMES_TIMEOUT};
+    use crate::worker::parse::{ParseClient, ANSWER_TIMEOUT, NAMES_TIMEOUT};
     assert!(
         NAMES_TIMEOUT * 4 < crate::net::dns_ingest::INGEST_WAIT,
         "{NAMES_TIMEOUT:?}"
+    );
+    // review of #495, D2: and a DNS response's, NN-L-NET-028's barrier
+    assert!(
+        ANSWER_TIMEOUT * 4 <= crate::net::dns_ingest::INGEST_WAIT,
+        "{ANSWER_TIMEOUT:?}"
     );
     let f = fixture(Script::SlowNames);
     assert!(tick_until(&f.workers, Health::Ready));

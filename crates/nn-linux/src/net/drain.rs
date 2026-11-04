@@ -158,6 +158,12 @@ pub struct NetFlowPayload {
     /// to the rules.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub decision_engine_skipped: bool,
+    /// Lot 275 (C07): an inbound connection's row (`src_*` the peer that
+    /// connected, `dst_*` the local listener's end, `pid` the process that
+    /// accepted it). Written only when `true`: an outbound row, and every
+    /// row written before, carries no such field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inbound: bool,
 }
 
 /// External audit EVD-008 (lab PR 204): the netflow log's name in its v3
@@ -223,6 +229,16 @@ impl NetFlowDb {
     /// [`NETFLOW_SYNC_INTERVAL`] together. `skipped`: the row was held
     /// back from the rules (`decision_engine_skipped`).
     pub fn append(&mut self, ev: &NetFlowEvent, skipped: bool) -> Result<String> {
+        self.append_row(ev, skipped, false)
+    }
+
+    /// Lot 275: [`Self::append`] for an inbound connection's closed row
+    /// (`inbound` in the row).
+    pub fn append_inbound(&mut self, ev: &NetFlowEvent) -> Result<String> {
+        self.append_row(ev, false, true)
+    }
+
+    fn append_row(&mut self, ev: &NetFlowEvent, skipped: bool, inbound: bool) -> Result<String> {
         let payload = NetFlowPayload {
             ts: format_ts(Utc::now()),
             flow_id: ev.flow_id.clone(),
@@ -247,6 +263,7 @@ impl NetFlowDb {
             close_reason: ev.close_reason,
             agent_id: hex::encode(self.agent_id),
             decision_engine_skipped: skipped,
+            inbound,
         };
         self.inner.append_deferred(payload)
     }
@@ -402,6 +419,10 @@ pub async fn drain_loop(
     udp_rb: RingBuf<MapData>,
     flow_tracker: Arc<Mutex<FlowTracker>>,
     dns_cache: Arc<DnsCache>,
+    // Lot 275 (NN-L-NET-028): the UDP rows' DNS judgement; the TLS pump's
+    // ingest a TCP close waits on (its row carries the fingerprint).
+    resolved: Arc<crate::net::resolved::ResolvedTable>,
+    tls_ingest: Arc<crate::net::dns_ingest::DnsIngest>,
     // Lab PR 218 (external review P0 C-14): `None` when the netflow log
     // cannot be opened — the drain runs all the same, the flows reach the
     // rules unpersisted (the drain used to stay off for the whole boot:
@@ -467,6 +488,8 @@ pub async fn drain_loop(
                                 item.as_ref(),
                                 &flow_tracker,
                                 &dns_cache,
+                                &resolved,
+                                true,
                                 netflow_db.as_ref(),
                                 &lineage,
                                 &mut gate,
@@ -477,12 +500,14 @@ pub async fn drain_loop(
                     }
                 }
                 guard.clear_ready();
-                attribution_barrier(&batch, &dns_cache).await;
+                let caught_up = attribution_barrier(&batch, &dns_cache, &resolved, None).await;
                 for raw in batch.drain(..) {
                     process_close_record(
                         bytemuck::bytes_of(&raw),
                         &flow_tracker,
                         &dns_cache,
+                        &resolved,
+                        caught_up,
                         netflow_db.as_ref(),
                         &lineage,
                         &mut gate,
@@ -509,6 +534,8 @@ pub async fn drain_loop(
                                 item.as_ref(),
                                 &flow_tracker,
                                 &dns_cache,
+                                &resolved,
+                                true,
                                 netflow_db.as_ref(),
                                 &lineage,
                                 &mut gate,
@@ -519,7 +546,8 @@ pub async fn drain_loop(
                     }
                 }
                 guard.clear_ready();
-                attribution_barrier(&batch, &dns_cache).await;
+                let caught_up =
+                    attribution_barrier(&batch, &dns_cache, &resolved, Some(&tls_ingest)).await;
                 // Lab PR 246: each close after its connect, on the bus too.
                 connect_barrier(&batch, &flow_tracker).await;
                 for raw in batch.drain(..) {
@@ -527,6 +555,8 @@ pub async fn drain_loop(
                         bytemuck::bytes_of(&raw),
                         &flow_tracker,
                         &dns_cache,
+                        &resolved,
+                        caught_up,
                         netflow_db.as_ref(),
                         &lineage,
                         &mut gate,
@@ -562,10 +592,31 @@ pub async fn drain_loop(
 /// attribution finds its process's query. A close read before the pump had
 /// read the query of the same process attributed no name — the CI flake of
 /// `net_outbound_connect_records_flow_with_dns_attribution`.
-async fn attribution_barrier(batch: &[NetFlowCloseRaw], dns_cache: &DnsCache) {
-    if let Some(ts) = batch.iter().map(|r| r.timestamp_ns).max() {
-        dns_cache.ingest().caught_up(ts).await;
-    }
+///
+/// Lot 275: and the DNS response pump's responses received before it (a
+/// UDP row's NN-L-NET-028 judgement), and — for the TCP closes — the TLS
+/// pump's ClientHellos sent before it (the closed row's fingerprint).
+async fn attribution_barrier(
+    batch: &[NetFlowCloseRaw],
+    dns_cache: &DnsCache,
+    resolved: &crate::net::resolved::ResolvedTable,
+    tls: Option<&crate::net::dns_ingest::DnsIngest>,
+) -> bool {
+    let Some(ts) = batch.iter().map(|r| r.timestamp_ns).max() else {
+        return true;
+    };
+    let tls_wait = async {
+        if let Some(t) = tls {
+            t.caught_up(ts).await;
+        }
+    };
+    let (names, answers, ()) = tokio::join!(
+        dns_cache.ingest().caught_up(ts),
+        resolved.ingest().caught_up(ts),
+        tls_wait
+    );
+    // review of #495, D2: NN-L-NET-028's judgement needs both DNS pumps
+    names && answers
 }
 
 /// Lab PR 224: how often the drain looks for due snapshots — every 10 s, or
@@ -702,10 +753,14 @@ pub(crate) async fn connect_barrier(batch: &[NetFlowCloseRaw], flow_tracker: &Mu
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_close_record(
     bytes: &[u8],
     flow_tracker: &Arc<Mutex<FlowTracker>>,
     dns_cache: &Arc<DnsCache>,
+    resolved: &crate::net::resolved::ResolvedTable,
+    // NN-L-NET-028's barrier reached (review of #495, D2)
+    caught_up: bool,
     netflow_db: Option<&Arc<Mutex<NetFlowDb>>>,
     lineage: &crate::posture::lineage::AuthSessionTracker,
     gate: &mut RuleGate,
@@ -826,7 +881,19 @@ async fn process_close_record(
                 // attribution below.
                 proc_start_ns: lineage.start_floor_ns(raw.pid).unwrap_or(0),
             };
-            flow_tracker.lock().on_udp_send(&info)
+            let mut row = flow_tracker.lock().on_udp_send(&info);
+            // Lot 275 (NN-L-NET-028): a datagram to a public address its
+            // lineage did not resolve
+            row.dns_resolution = crate::net::resolved::judge(
+                resolved,
+                lineage,
+                row.pid,
+                row.proc_start_ns,
+                row.dst_addr,
+                raw.timestamp_ns,
+                caught_up,
+            );
+            row
         }
         other => {
             debug!(
@@ -1041,6 +1108,7 @@ mod tests {
             close_reason: 0,
             phase: Default::default(),
             observed_ns: 0,
+            dns_resolution: Default::default(),
         }
     }
 
@@ -1207,6 +1275,7 @@ mod tests {
                 close_reason: legacy.close_reason,
                 agent_id: legacy.agent_id.clone(),
                 decision_engine_skipped: false,
+                inbound: false,
             },
             fmt_ver: None,
             prev_hash: legacy.prev_hash.clone(),
@@ -1419,6 +1488,28 @@ mod tests {
         assert_eq!(line.payload.sni, Some("example.com".to_string()));
     }
 
+    /// Lot 275: an inbound row says so (`"inbound":true`); an outbound row
+    /// carries no such field, as every row written before.
+    #[test]
+    fn an_inbound_row_says_so_and_an_outbound_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("netflow.jsonl");
+        let mut db = open_db(&path);
+        let ev = test_event();
+        db.append(&ev, false).unwrap();
+        db.append_inbound(&ev).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(!lines[0].contains("\"inbound\""), "{}", lines[0]);
+        assert!(lines[1].contains("\"inbound\":true"), "{}", lines[1]);
+        let l1: crate::chainlog::ChainLine<NetFlowPayload> =
+            serde_json::from_str(lines[1]).unwrap();
+        assert!(l1.payload.inbound && !l1.payload.decision_engine_skipped);
+        let l0: crate::chainlog::ChainLine<NetFlowPayload> =
+            serde_json::from_str(lines[0]).unwrap();
+        assert!(!l0.payload.inbound);
+    }
+
     /// A netflow log signed with the key at `<dir>/k.sig`.
     fn open_db(path: &Path) -> NetFlowDb {
         NetFlowDb::open(
@@ -1554,6 +1645,34 @@ mod tests {
     /// connect's destination, not the port 0 the kernel left on a refused
     /// connect. No wait for a close whose connect is old, is announced,
     /// is a kernel lookup miss, for a UDP record, or with no connect pump.
+    /// Review of #495, D2: the net drain's barrier is reached only when both
+    /// DNS pumps read the records made before the batch's newest; the TLS
+    /// pump's wait does not count for it.
+    #[tokio::test]
+    async fn the_drain_barrier_needs_both_dns_pumps() {
+        let dns = Arc::new(DnsCache::default());
+        let resolved = Arc::new(crate::net::resolved::ResolvedTable::default());
+        let tls = crate::net::dns_ingest::DnsIngest::default();
+        let old = crate::net::dns_ingest::monotonic_ns() - 2_000_000_000;
+        let mut raw = NetFlowCloseRaw::zeroed();
+        raw.timestamp_ns = old;
+        let batch = [raw];
+        assert!(
+            attribution_barrier(&[], &dns, &resolved, None).await,
+            "an empty batch"
+        );
+        assert!(
+            !attribution_barrier(&batch, &dns, &resolved, None).await,
+            "no pump"
+        );
+        let _names = crate::net::dns_cache::IngestClaim::new(Arc::clone(&dns));
+        let _answers = crate::net::resolved::ResolvedClaim::new(Arc::clone(&resolved), 1);
+        dns.ingest().pass_ended(old + 1);
+        assert!(!attribution_barrier(&batch, &dns, &resolved, Some(&tls)).await);
+        resolved.ingest().pass_ended(old + 1);
+        assert!(attribution_barrier(&batch, &dns, &resolved, Some(&tls)).await);
+    }
+
     #[tokio::test]
     async fn a_close_is_held_until_its_connect_is_on_the_bus() {
         use std::time::Instant as StdInstant;
@@ -1703,10 +1822,32 @@ mod tests {
         let (tx, mut rx) = crate::sensors::bus::channel();
         for corr in 1..=5u8 {
             let raw = close_raw(1000, 4242, [100, 64, 0, 1], 8080, corr);
-            process_close_record(&raw, &tracker, &dns, Some(&db), &lineage, &mut gate, &tx).await;
+            process_close_record(
+                &raw,
+                &tracker,
+                &dns,
+                &Default::default(),
+                true,
+                Some(&db),
+                &lineage,
+                &mut gate,
+                &tx,
+            )
+            .await;
         }
         let raw = close_raw(1000, 4242, [192, 0, 2, 10], 8080, 6);
-        process_close_record(&raw, &tracker, &dns, Some(&db), &lineage, &mut gate, &tx).await;
+        process_close_record(
+            &raw,
+            &tracker,
+            &dns,
+            &Default::default(),
+            true,
+            Some(&db),
+            &lineage,
+            &mut gate,
+            &tx,
+        )
+        .await;
         drop(tx);
         let mut sent = Vec::new();
         while let Some(Event::NetFlow(nf)) = rx.recv().await.map(|r| r.envelope.event) {
@@ -1806,7 +1947,18 @@ mod tests {
             .finish();
         {
             let _guard = tracing::subscriber::set_default(sub);
-            process_close_record(&bytes, &tracker, &dns, Some(&db), &lineage, &mut gate, &tx).await;
+            process_close_record(
+                &bytes,
+                &tracker,
+                &dns,
+                &Default::default(),
+                true,
+                Some(&db),
+                &lineage,
+                &mut gate,
+                &tx,
+            )
+            .await;
         }
         let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
         let warn: Vec<&str> = text
@@ -1972,6 +2124,8 @@ mod tests {
                 bytemuck::bytes_of(raw),
                 &self.tracker,
                 &self.dns,
+                &Default::default(),
+                true,
                 self.db.as_ref(),
                 &self.lineage,
                 &mut self.gate,

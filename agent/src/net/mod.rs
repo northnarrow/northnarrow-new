@@ -37,7 +37,9 @@ pub use nn_core::net::resolvers;
 /// the netflow rows' gate to the rules (paced per uid; R08b: nn-core's,
 /// with the rules and the correlation store they read) on the Linux host,
 /// which the drain names.
-pub use nn_linux::net::{blind_spots, dns_cache, dns_ingest, drain, flow_tracker, limiter};
+pub use nn_linux::net::{
+    blind_spots, dns_cache, dns_ingest, drain, flow_tracker, inbound, limiter, resolved,
+};
 // R14b (plan §3.1): the ClientHello parser (JA3, JA4, SNI, ALPN; nn-parse's
 // `tls` since R06, lab PR 242) is no longer re-exported here as
 // `tls_parser`: the core reaches it only through the parse worker

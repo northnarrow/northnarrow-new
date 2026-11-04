@@ -35,7 +35,7 @@ number in parentheses is a lab PR.
 | C04 | ARM64 support | 0 | aarch64: the portable crates' check only (`ci.yml`); the agent and the eBPF object are built for x86_64 only | 3 |
 | C05 | Process telemetry | 1 | exec only, with argv, parent and `start_ns` (`crates/nn-model/src/event.rs`; the parent's key, 238); no fork, exit or credential-change event (`crates/nn-core/src/contract/mod.rs`): those hooks serve the exploit guard only (219) | 3 |
 | C06 | File telemetry and FIM | 2 | the LSM `file_open` observer and the FIM drain (`docs/operator/SENSOR_CONTRACT.md`); 25 FIM rules (`docs/detection/RULE_CATALOGUE.md`); rename and unlink bursts (225); setattr from 6.9; multi-match (236) | 3 |
-| C07 | Endpoint network telemetry | 1 | outbound TCP connect v4/v6, flows at close, listen, outbound UDP and DNS queries (`SENSOR_CONTRACT.md`; 229); no inbound connection (`agent-ebpf/src/tcp_close.rs` drops passive sockets), no DNS answer, no TLS fingerprint in a flow (the parsers in `crates/nn-linux/src/worker/parse.rs` have no sensor); 224 added verdicts (C12, C14), not telemetry | 3 |
+| C07 | Endpoint network telemetry | 2 | outbound TCP connect v4/v6, flows at close, listen, outbound UDP and DNS queries (`SENSOR_CONTRACT.md`; 229); inbound connections, DNS answers and TLS fingerprints in the flow record (lot 275, #495: `net_inbound`, `dns_answer`, `tls_hello`; MS28–MS31 PASS on 5.15 and 6.8); 224 added verdicts (C12, C14), not telemetry | 3 |
 | C08 | Identity and ITDR | 0 | no authentication event source (the FIM on `authorized_keys`, PAM and sudoers is C06) | 3 |
 | C09 | Cloud telemetry and posture | 0 | no IMDS code, no cloud context | 3 |
 | C10 | Network detection (NDR) | 0 | the beacon and fan-out rules judge the endpoint's own flows (C07, C14); no protocol log | 3 |
@@ -5218,6 +5218,236 @@ number in parentheses is a lab PR.
     outside this lot); a hybrid v1 host, another architecture than x86-64
     and a kernel without the proc offsets are signed degradations; the
     move guard's cost on path-heavy work.
+- **Lot 275 — C07 1 → 2: inbound connections, DNS responses and TLS
+  ClientHello fingerprints as telemetry; NN-L-NET-028, "no DNS, no
+  connect", per lineage (wave 1 of phase 3).**
+  - What was missing (the re-assessment of 03/11, C07 at 1): the passive
+    sockets dropped at `tcp_close` (review 79); the parse worker's DNS
+    answer and ClientHello parsers with no sensor (BUG-025: NN-L-NET-003
+    could not match).
+  - What changed: three sources of the bus, each with its contract entry,
+    its manifest state, a kernel budget, its rings' loss counters and the
+    network class. `net_inbound`: fexit `inet_csk_accept`, the program of
+    this kernel's parameter count read from its BTF (4 up to 6.9, 2 from
+    6.10); `tcp_close` of a recorded accept; a ring and a socket map of
+    their own. `dns_answer`: fexit `udp_recvmsg` / `udpv6_recvmsg` (6
+    parameters up to 5.18, 5 from 5.19), a datagram from port 53 read from
+    the receiver's buffer (512 bytes), decoded by the parse worker
+    (question, rcode, A/AAAA/CNAME with TTLs, IPC v3). `tls_hello`: fentry
+    `tcp_sendmsg` on an outbound flow's first send, 4,096 bytes, JA3/JA4/
+    SNI/ALPN by the worker, the fingerprint on the flow's rows;
+    NN-L-NET-003 judges the hello (R6 below). NN-L-NET-028 (nn-core
+    `net::resolved`; judged by the connect pump and the net drain after
+    the DNS pumps' barriers): Medium (Low: another lineage resolved it),
+    once per process and destination per 10 min, its kill held
+    (`NODNS_KILL`); not judged: LAN, configured resolvers, the signed
+    `nodns-allow.local`, unknown evidence (no response sensor, a process
+    older than it, a query whose response was not seen, held records).
+  - R6 of the external review of 04/11 (C07, C15), in this lot because it
+    makes the first fingerprints and so the first matches: NN-L-NET-003 is
+    Medium and `Log` (it was Critical, `KillProcessTree` and COMBAT), its
+    record saying the fingerprint is an attribute of the TLS stack, not
+    the program's identity (the fingerprint alone finds 6.82 % of malware,
+    88.68 % with the destination: Anderson & McGrew); the signed per-rule
+    policy refuses `enforce NN-L-NET-003` until the rule has a second
+    predicate (a destination or an executable) — the line refuses a file
+    to be signed (`config overlay set`); in a policy signed before, the
+    start takes only that line as `alert`, the rest in force, and signs a
+    `rule_policy` degradation naming it; the fingerprint
+    list takes JA4 entries next to JA3 (Chrome permutes its extensions
+    from 108: its JA3 varies). Registry version 4: out of the Critical
+    sub-gate (29). Host code only: the lab's sensors and verifier are not
+    concerned.
+  - The independent review of #495 (no blocker) and its second: NN-L-NET-028
+    was not fail-safe as claimed, and is now. Its `enforce` is refused (as
+    NET-003's: by `config overlay set`; at the start the line as `alert`,
+    signed) until it is measured on a wider corpus. D1: an incomplete
+    response (the 512-byte cut, a datagram longer than the buffer, the
+    server's TC bit, a malformed A/AAAA) binds what it read and answers
+    nothing. D2: a connect judged before both DNS pumps read the records
+    made before it is unknown (`judge`'s barrier; the response IPC's
+    deadline 50 ms, a quarter of the wait). D3: a user's held DNS records,
+    and any growth of the DNS rings' and budgets' `RING_DROPS` slots read
+    at each pass (no counters: a loss), degrade the evidence for every
+    process for 5 minutes. D4: only the question's chain binds, and a
+    response binds only its receiver unless a system resolver received it
+    — its executable at its system path, one of the host's resolver users
+    (never root), its image the host's file at that path — the device and
+    inode of its `/proc/<pid>/exe`, in whatever mount namespace it runs
+    (R1, and the final check's C1: init's mount namespace, R1's first
+    form, left out systemd-resolved, which its unit sandboxes; never a
+    path alone). D5:
+    the response program reads the source's family and port first and the
+    address only for port 53, at most `min(ret, len)` (N1); the three
+    sources declare their measured cost in the contract. R2: a blinding
+    shows — a signed `nodns_coverage_lost` (its cause, the pid or uid that
+    caused it; one a cause every 5 minutes of the agent's clock, N1) and
+    the rule's judgements by
+    outcome and unknown reason in every heartbeat (`nodns`). N2: a binding
+    of a process of unknown start is unknown. The reviewers' probes are
+    tests asserting the opposite of what they showed.
+  - What the lab found and changed: the first build (2d2b2831) had three
+    programs the verifier refused on both kernels — `inbound_accept_ret4`
+    (the fexit's return slot is a `PTR_TO_BTF_ID`; the correlator's byte
+    split shifted it) and the DNS response programs this kernel loads (the
+    read size: LLVM dropped the mask below the cap and passed the
+    sign-extended return value). The agent ran degraded, signed (the
+    manifest's `net_inbound` and `dns_answer` absent, NN-L-NET-028 judging
+    every connect unknown); fixed in 1f69f74c (the address copied into a
+    scalar by the probe helper; the length through a volatile stack read).
+    The lab's own checks then missed what the agent recorded: MS28 read
+    only a record's own rule (the lab's blocklist covers the documentation
+    ranges, so NN-L-NET-001 is the record's rule and NN-L-NET-028 one of
+    its `matches`) and the pid of a `timeout` wrapper; MS30's pattern had
+    the summary's fields before its message; the e2e test's DNS query held
+    a raw NUL. Fixed in f06830d3 (lab scripts and the test only).
+  - Lab (as measured; our own guests, at most two at a time, under the
+    leases; left off). Verifier on 1f69f74c: 6.8.0-147 92 programs, 90 OK,
+    2 not counted (the other parameter count), 0 failing; 5.15.0-202 87
+    OK, 5 not counted, 0 failing. net-check on the agent of 1f69f74c (the
+    checks of f06830d3): 6.8, round 2's smoke (the checks before f06830d3):
+    MS29 (3 accepted connections, 3 closed `inbound` rows) and MS31 (ja3
+    0149f47e…, ja4 t13d3112h2_…, sni example.com) PASS; MS28 and MS30 FAIL
+    as checks, while the guest's signed records hold one NN-L-NET-028 for
+    each of the four literal connects (Medium, Log) and the DNS response
+    pump's summary 30 responses read, 27 decoded in the first minute (read
+    from the host); 6.8 after both reviews (round 5, 17b30343; verifier
+    90 OK, 0 failing): MS28 5 of 5, MS29 (3 rows), MS30 (32 responses
+    read, 29 decoded in the first minute), MS31 (ja3 0149f47e…, ja4
+    t13d3112h2_…), NEG PASS — round 4 had run on another lot's agent (its
+    install refused over an agent running with no pin root, which the
+    lab's purge did not stop; the harness fixed); 5.15 after the reviews'
+    eBPF change (round 4, 95bac843; verifier 87 OK, 0 failing): MS28 5 of
+    5, MS29, MS30 PASS; 5.15 (round 3): MS28 5 of 5 (a TCP v4,
+    a UDP and an IPv6 connect to a documentation address with no lookup:
+    one NN-L-NET-028 each, Medium, Log, no kill; `curl http://example.com/`
+    none; `203-0-113-5.nip.io`, a name that spells its address, one), MS29
+    (3 accepted connections, 3 closed `inbound` rows), MS30 (38 responses
+    read, 33 decoded in the first minute), MS31 (`curl https://example.com/`:
+    ja3 4ea056e6…, ja4 t13d3113h2_…, sni on the closed row), NEG PASS.
+    6.8 after the final check (C1; round 6, 3060d947, and 6b, 79cb419f):
+    systemd-resolved runs in a mount namespace of its own
+    (`mnt:[4026532305]`, init's `mnt:[4026531841]`) and its image is the
+    host's file (`/proc/<pid>/exe` and `/usr/lib/systemd/systemd-resolved`
+    both 64769:3190); MS32 — a name only it looked up (`resolvectl`, its
+    cache flushed), then one datagram from another process to the address
+    — one NN-L-NET-028 record, Low (`other_lineage`), none Medium: the
+    resolver recognized. MS28 5 of 5, MS29, MS30, MS31, NEG PASS (round
+    6's MS32 had read the judgement from the netflow log, whose rows do
+    not carry it — the check fixed in 79cb419f, the agent unchanged).
+    False positives (`nodns-fp.sh`, NN-L-NET-028 records in each workload's
+    window, also as a match of another rule's record): 0 on 6.8 over W1–W6
+    (`apt-get update` and a download-only install, 40 parallel HTTPS
+    fetches over 12 hosts, `wget -p`, 30 s of `systemd-timesyncd`, `git
+    clone` over HTTPS, `apt-get download`, podman rootful and rootless
+    fetching over HTTPS, `getent`/`dig` through the stub resolver), every
+    workload rc 0; 0 on 5.15, where the `git clone`'s HTTPS helper died of
+    `SIGILL` in libgnutls on the guest's virtual CPU (after its connect)
+    and the rootful container did not start (R011 killed podman's
+    `modprobe`); again 0 on 6.8 after both reviews (round 5, W1–W6, every
+    workload rc 0) and after the final check (round 6, the resolver by its
+    image, W1–W6, every workload rc 0). The EXP-13 probe (literal 192.0.2.1) draws NN-L-NET-028,
+    by design. Cost after the early port test (round 5, 6.8, the
+    contract's overhead entries): per call (BPF stats on) about 128 ns a
+    UDP receive from another port than 53, 121 ns a TCP send, 666 ns an
+    accept; with the stats off `udprecv` +20.6 %, `udp` +19.7 %,
+    `tcpsend` +9.9 %, `connect` +5.9 %. `perf-compare` against the 6.8
+    baseline (40fd666, 21/10): FAIL, 11 regressions, with the agent-off
+    reference itself +4 to +33 % slower (the PC loaded by the other lots'
+    guests, gates and mutations); per workload the agent's share (on ÷
+    off) of this lot's paths is unchanged or lower — `udp_send` 1.274 →
+    1.278, `dns_send` 1.221 → 1.158, `tcp_connect_close` 1.405 → 1.264 —
+    while the file paths moved (`write_open` 1.444 → 1.813, `open` 1.389 →
+    1.696: the deny hooks lots 273b and 273c added on `file_permission`
+    and `inode_permission` since the baseline) and the agent's RSS (+9.5
+    MiB idle) and idle CPU (0.2 → 1.2 %) with them; no baseline of today's
+    `main` was taken. Overhead (`overhead 3`, medians, main → lot 275): 6.8 `udp`
+    +17.1 → +22.8 %, `connect` +11.7 → +15.0 %, `dns` +16.5 → +10.5 %, new
+    `udprecv` +20.9 %, `tcpsend` +1.9 %; 5.15 `udp` +5.4 → +23.1 %,
+    `connect` −8.4 → +15.2 %, `dns` +2.3 → +16.1 %, `udprecv` +22.6 %,
+    `tcpsend` +2.8 %; `open` / `wopen` / `exec` 6.8 +37.7 / +42.9 / +10.2
+    → +39.5 / +42.9 / +10.4 %, 5.15 +35.0 / +47.9 / +9.3 → +38.6 / +40.3 /
+    +14.6 % (the rounds are noisy: 5.15's main `connect` reads −8.4 %).
+    EXP-13c (net 50/s, DNS 200/s, 12 probes), main → lot 275:
+    every refused attempt refused and accounted for (6,000 on 5.15, 12,000
+    on 6.8), the NET-001 probes 12 of 12 judged and killed, the stage
+    probes 12 of 12 judged, 2,000 connects 0 failed, decisions over budget
+    0 and capped 0 on every class; P3 decided 14,075 → 18,099 (the new
+    sources' events); 6.8's P1 worst delay 0.74 → 2.43 s, before the
+    warm-up's end (its p99 255 µs, main 207 µs). test-ignored: 6.8
+    (1f69f74c) 109 passed, 1 failed (the e2e test's NUL); 5.15 round 3
+    (f06830d3) 89 suites, 110 passed, 0 failed — the no-DNS e2e test
+    passes; two teardown failures of 5.15's round 1 ("still alive 10 s
+    into teardown", tests of 273c) did not come back on 5.15 nor 6.8.
+    tamper-check, lot 275 against main on the same guest: 5.15 121 rows,
+    (case, verdict) the same but C97 (main a deviation, lot 275 OK); 6.8
+    119 rows, the same but C98 (main OK, lot 275 a deviation:
+    `memory.high` above the floor after the window) — C97 and C98 are lot
+    273c's memory-floor cases, whose reload is asked, not awaited; lot 275
+    touches no cgroup or anti-tamper code (C97's timing is lot 273d's to
+    explain).
+  - Gates on 3060d947 (the final check's code, the lot merged with
+    `main` 80c8da36, #493), and again on the final tip, the lot merged
+    with `main` 0131394c (#496, CodeQL) and 6881a0b1 (#494, lot 277: the
+    BTF offsets and their revalidation keep both lots' additions, the
+    notes in lot order) — the commits after 3060d947 change a lab check,
+    the notes and those merges:
+    `build-ebpf --release`; clippy ×4 `-D warnings`; fmt; the workspace's
+    tests, 86 suites, 3,777 passed, 0 failed, 17 ignored; the wire test
+    with `--features debug-trigger`; the map test with
+    `NN_REQUIRE_EBPF_OBJECT=1`; the privileged tests built (`--no-run`);
+    `attack-coverage --check`; `golden` ×5 (54 files, the same bytes);
+    MSRV 1.89; the fuzz replay (14 targets); the portable core (5
+    targets); the lockfiles unchanged. On the merge alone one test failed,
+    lot 278's `posture_floor` classification (NN-L-NET-003 kills no more;
+    NN-L-NET-028's kill held, its catalogue action `Log`), fixed in
+    bd3b1b0f. Mutations: 78 on the lot's userland code
+    in two sets (66 + 12: the resolved table, the rule and its allowlist,
+    the response parser, the IPC check, the pumps' ingest, the attach by
+    arity, the lineage walk, the worker), 77 caught, MP3 argued equivalent
+    (a self-pointer loop already ends at the 128-hop / 255-octet bounds);
+    the first round's three survivors got tests (MR14: askers on either
+    side of the response, MT1: the TTL bound, MS1: the worker's answer
+    content). R6: set C (20: the severity, the action, the category, the
+    record's sentence, the JA4 hit named, the JA4 match, its case, the JA3
+    first, empty fingerprints, the JA4 form's checks, the refusal, its
+    scope and its list) 20 caught; set D (8: the start's demotion — the
+    file refused whole, the line kept as enforce, the degradation dropped
+    or without its line, the source, the strict path demoting, the start's
+    two reports) 8 caught. MD7 was first "caught" by a stale eBPF stamp in
+    the mutation tree (no test ran): not counted until the start's
+    reporting got its test (`boot::policy`), which catches MD7 and MD8.
+    The reviews: set E (27, D1–D4 and N2) 27 caught, set F (16, R1–R3) 16
+    caught — MF10 and MF11 once their tests were added; the final check:
+    set G (13 — C1's host file: no check, an unreadable or any file the
+    host's, the file read in the process's view, the path taken for the
+    image, the device or the inode dropped, the link not followed; N1's
+    window: an earlier reading re-arming it, open-ended, not restarted, a
+    second long, the degradation from the agent's clock) 13 caught. The
+    nn-linux ones counted only from a mutation tree with a fresh eBPF
+    stamp, and a catch only with a failing test named. The eBPF is covered
+    by the lab (verifier, MS28–MS32, the privileged e2e tests), the lab
+    helpers by their selftests. The CI's fuzz smoke run found
+    crash-8a7b232e in `dns_records`: the property's least record size
+    assumed a two-byte owner name, and the root is one byte (a root-named
+    A record reads in 15) — the parser right, the property fixed, the
+    input kept as a regression with the parser's test.
+  - Level: C07 1 → 2. Inbound connections, DNS answers and TLS
+    fingerprints in the flow record are present and tested in the lab on
+    both kernel classes: MS28–MS30 (and MS31) PASS on 5.15 (round 4) and
+    6.8 (round 5) on the reviews' code, and on 6.8 again after the final
+    check (rounds 6 and 6b, with MS32: systemd-resolved recognized). Not 3: one architecture, two
+    distributions; `recvmmsg`, a multi-segment iovec, DNS over TCP, DoT
+    and DoH are not read; NN-L-NET-028's kill is refused until measured on
+    a wider corpus.
+  - Open: the UDP receive cost (about 128 ns a receive; batching the
+    response decodes per pass, as the names are, would also make D2's
+    barrier time out less); DNS over TCP and `recvmmsg`; the response
+    sensor on `nss-resolve` hosts measured only through the NSS query
+    records; Docker and browsers in the false-positive set; a third kernel
+    class (6.10+, the 2-parameter `inet_csk_accept`); a `perf` baseline of
+    today's `main` on an idle PC, against which the lot's figures can be
+    gated; NN-L-NET-003's second predicate.
 - **Lot 277 — C15/C23: an exemption by cgroup or unit holds for a process
   started in the cgroup; the host check names the kernel fixes the sandbox
   relies on; a worker enters its sandbox single-threaded (Wave 4 phase 3,

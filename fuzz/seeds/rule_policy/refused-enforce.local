@@ -1,0 +1,6 @@
+# review of #495: an enforce the start applies as alert
+enforce NN-L-NET-003
+off R008
+exempt R020 uid 998
+enforce NN-L-NET-028 # refused too
+enforce NN-L-IMP-001

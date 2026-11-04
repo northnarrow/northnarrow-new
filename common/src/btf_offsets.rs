@@ -2332,6 +2332,14 @@ pub const CGROUP_MOVE_FINISH: &str = "cgroup_procs_write_finish";
 /// to (presence checked, no argument read).
 pub const FENTRY_TARGETS: &[&str] = &[CGROUP_MOVE_FINISH];
 
+/// Lot 275 (C07): the functions the network sensors' fexit programs trace
+/// whose parameter count changed across the supported kernels — the return
+/// value is the slot after the last parameter. The agent reads each one's
+/// count from the kernel's BTF and attaches the program built for it:
+/// `inet_csk_accept` has 4 parameters up to 6.9 and 2 from 6.10;
+/// `udp_recvmsg` and `udpv6_recvmsg` 6 up to 5.18 and 5 from 5.19.
+pub const PARAM_COUNT_FUNCS: &[&str] = &["inet_csk_accept", "udp_recvmsg", "udpv6_recvmsg"];
+
 /// Lot 277: a kernel function (fentry) or tracepoint (BTF tracepoint) a
 /// program of the start-in-cgroup tracker reads arguments of, and the
 /// struct each argument it reads points to, by the program's argument
