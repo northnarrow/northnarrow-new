@@ -819,8 +819,10 @@ fn r011_records_a_packaged_modprobe_and_kills_an_insmod_from_tmp() {
         .stderr(Stdio::null())
         .status();
 
-    // The system's tool, by the path the container runtimes use.
-    let mut child = Command::new("/sbin/modprobe")
+    // The system's tool, by the path the container runtimes use — without
+    // the test runner's own environment R011 kills on (cargo puts its
+    // target directories in LD_LIBRARY_PATH: lot 279's lab, 22.04 round k).
+    let mut child = without_refused_env(Command::new("/sbin/modprobe"))
         .arg("dummy")
         .spawn()
         .expect("spawn modprobe dummy");
@@ -900,9 +902,26 @@ fn r018_records_of(fx: &Fixture, pid: u32) -> Vec<serde_json::Value> {
     .unwrap_or_else(|| panic!("no R018 record of loader {pid}: {:?}", of()))
 }
 
-/// `program args…` run with `env`, its pid and whether it succeeded.
+/// Lot 279: `c` without the environment variables R011 kills a module
+/// tool on (`MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT`,
+/// `LD_LIBRARY_PATH`) — the test runner's own: cargo runs the tests with its
+/// target directories in `LD_LIBRARY_PATH`. A case sets the one it tests.
+fn without_refused_env(mut c: Command) -> Command {
+    for v in [
+        "MODPROBE_OPTIONS",
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "LD_LIBRARY_PATH",
+    ] {
+        c.env_remove(v);
+    }
+    c
+}
+
+/// `program args…` run with `env` (over the runner's, less the variables
+/// R011 kills on), its pid and whether it succeeded.
 fn run_tool(program: &str, args: &[&str], env: &[(&str, &str)]) -> (u32, bool) {
-    let mut c = Command::new(program);
+    let mut c = without_refused_env(Command::new(program));
     c.args(args).stdout(Stdio::null()).stderr(Stdio::null());
     for (k, v) in env {
         c.env(k, v);
