@@ -249,6 +249,12 @@ impl<H: DecisionHost> ProgramOwners<H> {
         }
     }
 
+    /// The root whose package database it reads (lot 282: the replays
+    /// give the security-tool detector the same fixture).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// `Some(true)` when a package installed `path`, `Some(false)` when
     /// none did, `None` when the host has no package database to ask.
     pub fn owned(&self, path: &Path) -> Option<bool> {

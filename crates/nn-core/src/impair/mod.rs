@@ -472,6 +472,70 @@ pub struct DefenseDetector<H: DecisionHost> {
     coalesce: Mutex<HashMap<CoalesceKey, CoalesceWindow>>,
     /// The trusted-installer window ([`Self::set_installer_window`]).
     installer: std::sync::OnceLock<Arc<H::InstallerWindow>>,
+    /// Lot 282: which programs a package installed — a container runtime's
+    /// own chain flush is vouched for by its packaged program
+    /// ([`Self::flushed_by_its_runtime`]). The host's package database in
+    /// production; a fixture's in the replays and tests
+    /// ([`Self::with_program_owners`]).
+    owners: crate::impact::trust::ProgramOwners<H>,
+}
+
+/// Lot 282 (Tappa Prove P0; the coordinator's review of the design): the
+/// chains of the container runtimes and orchestrators — CNI's (`CNI-…`),
+/// Docker's (`DOCKER…`), kube-proxy's (`KUBE-…`), Calico's (`cali-…`),
+/// Cilium's (`cilium_…`), netavark's (`NETAVARK…`). Their flush by the
+/// runtime that owns them is its own networking at work (podman's CNI
+/// plugin at a container's removal, dockerd at its start), not a firewall
+/// switched off. The chains among them whose function is filtering
+/// ([`FILTER_CHAINS`]) are not. The host firewall's chains — ufw's
+/// (`ufw-…`), fail2ban's (`f2b-…`), firewalld's zones, the built-in ones —
+/// hold its filtering: emptied by anyone, the firewall is off.
+const RUNTIME_CHAIN_PREFIXES: &[&str] =
+    &["CNI-", "DOCKER", "KUBE-", "cali-", "cilium_", "NETAVARK"];
+
+/// Lot 282, the review of #500 (C2): the chains a runtime creates whose
+/// function is a firewall's, judged as the host firewall's whoever flushes
+/// them — `DOCKER-USER` (the administrator's own rules for the containers'
+/// traffic), `CNI-ADMIN` (the same for CNI's `firewall` plugin) and
+/// `KUBE-FIREWALL` (kube-proxy's and the kubelet's drop of marked packets,
+/// the guard of `route_localnet`). No runtime empties them at its start or
+/// at a container's removal.
+const FILTER_CHAINS: &[&str] = &["DOCKER-USER", "CNI-ADMIN", "KUBE-FIREWALL"];
+
+/// Lot 282: a chain of [`RUNTIME_CHAIN_PREFIXES`] that is no filter chain
+/// ([`FILTER_CHAINS`]).
+fn is_runtime_chain(chain: &str) -> bool {
+    !FILTER_CHAINS.contains(&chain) && RUNTIME_CHAIN_PREFIXES.iter().any(|p| chain.starts_with(p))
+}
+
+/// Lot 282: the programs that flush a runtime's chains when they are the
+/// runtime — the CNI plugins' directories (Debian and Ubuntu, Fedora and
+/// RHEL), and the runtimes that run `iptables` themselves. Judged on what
+/// the kernel executed for the flushing `iptables`'s parent, in a system
+/// tree and installed by a package ([`DefenseDetector::flushed_by_its_runtime`]):
+/// never a name or a path alone.
+const RUNTIME_PROGRAM_DIRS: &[&str] = &["/usr/lib/cni/", "/usr/libexec/cni/"];
+const RUNTIME_PROGRAMS: &[&str] = &[
+    "/usr/bin/containerd",
+    "/usr/bin/crio",
+    "/usr/bin/dockerd",
+    "/usr/bin/kube-proxy",
+    "/usr/bin/kubelet",
+    "/usr/bin/podman",
+    "/usr/lib/podman/netavark",
+    "/usr/libexec/podman/netavark",
+    "/usr/sbin/dockerd",
+];
+
+/// Lot 282: `exe` is one of [`RUNTIME_PROGRAMS`] or a plugin of
+/// [`RUNTIME_PROGRAM_DIRS`] (a file directly in it).
+fn is_runtime_program(exe: &Path) -> bool {
+    let e = exe.to_string_lossy();
+    RUNTIME_PROGRAMS.contains(&e.as_ref())
+        || RUNTIME_PROGRAM_DIRS.iter().any(|d| {
+            e.strip_prefix(d)
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+        })
 }
 
 /// After a tool's exec, when `/proc` is scanned again for its processes:
@@ -553,7 +617,48 @@ impl<H: DecisionHost> DefenseDetector<H> {
             rescans: Mutex::new((Vec::new(), None)),
             coalesce: Mutex::new(HashMap::new()),
             installer: std::sync::OnceLock::new(),
+            owners: crate::impact::trust::ProgramOwners::default(),
         }
+    }
+
+    /// Lot 282: judge package ownership on `owners` (a replay's fixture,
+    /// a test's) instead of the host's package database.
+    pub fn with_program_owners(mut self, owners: crate::impact::trust::ProgramOwners<H>) -> Self {
+        self.owners = owners;
+        self
+    }
+
+    /// Lot 282: the `iptables` process `pid` was executed by a container
+    /// runtime flushing its own chain — its parent (what the kernel
+    /// executed for it) is a runtime program ([`is_runtime_program`]: in a
+    /// system tree by construction) installed by a package. A parent that
+    /// cannot be read, a shell, an unpackaged copy (`/opt/cni/bin`, k3s's
+    /// bundled tools) or a host with no package database vouches for
+    /// nothing.
+    fn flushed_by_its_runtime(&self, pid: u32, as_of: AsOf) -> bool {
+        let parent = self.lineage.parent_identity(pid, as_of);
+        let runtime = parent.as_ref().is_some_and(|p| is_runtime_program(&p.exe));
+        let packaged = parent
+            .as_ref()
+            .filter(|_| runtime)
+            .and_then(|p| self.owners.owned(&p.exe));
+        let vouched = runtime && packaged == Some(true);
+        if !vouched {
+            // Recorded, not silent: why a runtime's chain flush is a
+            // switch-off (the lab reads it).
+            tracing::info!(
+                pid,
+                parent = %parent.as_ref().map_or_else(
+                    || "unknown".to_string(),
+                    |p| p.exe.to_string_lossy().into_owned()
+                ),
+                runtime_program = runtime,
+                packaged = ?packaged,
+                "NN-L-EVA-002: a container runtime's chain flushed by a process its runtime \
+                 does not vouch for — still the firewall switched off"
+            );
+        }
+        vouched
     }
 
     /// Wire the trusted-installer window (`main.rs`, once): inside a valid
@@ -729,7 +834,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
                     self.schedule_rescan(Instant::now());
                     return None;
                 }
-                let (rule, tool, what) = self.spawn_finding(&id, argv, as_of)?;
+                let (rule, tool, what) = self.spawn_finding(*pid, &id, argv, as_of)?;
                 (rule, tool, what, *pid, image, *timestamp_ns)
             }
             Event::DefenderSignal {
@@ -866,6 +971,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
 
     fn spawn_finding(
         &self,
+        pid: u32,
         id: &ExecIdentity,
         argv: &[String],
         as_of: AsOf,
@@ -881,7 +987,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
             } else {
                 prog.iter().any(|p| *p == c.program)
             };
-            named && contains_run(&args, &c.args)
+            named && switches_off(&args, &c.args, || self.flushed_by_its_runtime(pid, as_of))
         }) {
             let shown = if c.args.is_empty() {
                 format!("`{}`", c.program)
@@ -1042,13 +1148,31 @@ fn program_name<'a>(id: &'a ExecIdentity, argv: &'a [String]) -> Vec<&'a str> {
     out
 }
 
-/// `args` holds `run` as consecutive arguments (an empty run: always).
-fn contains_run(args: &[&str], run: &[String]) -> bool {
+/// `args` holds the switch-off command `run` as consecutive arguments (an
+/// empty run: always). Lot 282 (Tappa Prove P0): except a listed flush
+/// (`iptables -F`, `--flush`) of a container runtime's own chain
+/// ([`is_runtime_chain`]) that the runtime itself runs
+/// (`by_its_runtime`, asked only then). Podman's CNI plugin flushes its NAT
+/// chain (`iptables -t nat -F CNI-…`) at a container's removal: NN-L-EVA-002
+/// recorded "`iptables -F`", and the posture's DefenseImpairment, recorded in
+/// the administrator's scope, corroborated podman's own mass write — COMBAT,
+/// locked, and the ladder killed podman (lab 04/11, on main). The same chain
+/// flushed by any other process, and any other chain — the host firewall's
+/// (ufw, fail2ban, firewalld), a built-in one, every chain of a table (no
+/// chain named) — is still the firewall switched off.
+fn switches_off(args: &[&str], run: &[String], by_its_runtime: impl Fn() -> bool) -> bool {
     if run.is_empty() {
         return true;
     }
-    args.windows(run.len())
-        .any(|w| w.iter().zip(run).all(|(a, b)| *a == b.as_str()))
+    let flush = run.last().is_some_and(|a| a == "-F" || a == "--flush");
+    args.windows(run.len()).enumerate().any(|(i, w)| {
+        w.iter().zip(run).all(|(a, b)| *a == b.as_str())
+            && !(flush
+                && args
+                    .get(i + run.len())
+                    .is_some_and(|chain| is_runtime_chain(chain))
+                && by_its_runtime())
+    })
 }
 
 /// `kill -0 …` (an existence probe), `kill -l` (a listing).

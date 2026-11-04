@@ -2182,6 +2182,8 @@ fn a_signed_policy_set_applies_at_once_to_the_engine_the_posture_and_the_executo
             timestamp_ns: 50_000_000_000,
             overwrites: true,
             cgroup_window: false,
+            small_files: false,
+            cgroup_id: 0,
         }
     };
 

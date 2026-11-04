@@ -142,6 +142,49 @@ kills of the same exec are held by the legacy ceiling (R009's record is the
 first match), in COMBAT too. That was so for the session and the package
 transaction before lot 278.
 
+**What brings COMBAT, and what the ladder kills (lot 282).** COMBAT is
+where the kills above wait, and where the ladder's NEUTRALIZE kills the
+offender's process tree; on `main` before lot 282 a host's first `podman
+pull` and an `apt purge` reached it. Since lot 282
+([the posture design, §10](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/POSTURE_FSM_V2_REDESIGN.md)):
+- the posture's mass-write signal counts distinct existing files rewritten
+  in place, or destroyed (unlinked, emptied by a truncate then unlinked, or
+  replaced by a rename) by a process — or a cgroup — that also wrote files
+  new — never files written new alone (an image pulled, a clone, an archive
+  extracted, a build), one file rewritten again and again (a database) or
+  files deleted alone (`rm -rf`, a purge). Files of any size that hold data
+  count; rewrites of files under 4 KiB only outside an authenticated session
+  (a build's own small outputs inside one: lab PR 127);
+- an anti-tamper refusal of a package transaction's process (a package
+  manager root executed, whose run covers it, as R009 judges it) of a file
+  operation a maintainer script does — removing, renaming, changing the
+  attributes of, or making an entry beside, a file or directory the agent
+  protects — raises ALERTED (`PackageTamperRefusal`) and never vouches for
+  COMBAT; any other refused operation of that process (a signal, a ptrace, a
+  BPF handle, a kexec, a cgroup write, a limit, a read of the key) keeps its
+  weight, since any root command can run as an apt hook; a refusal of any
+  other process still brings COMBAT on its own;
+- the ladder never kills on one heuristic signal: a COMBAT whose cause is a
+  heuristic with no signal of another kind vouching for it holds its
+  NEUTRALIZE (a signed `combat_stage` row, "NEUTRALIZE held"), and does not
+  isolate for it;
+- NN-L-EVA-002 no longer reads a container runtime flushing its own chain
+  (`CNI-…`, `DOCKER…`, `KUBE-…`, `cali-…`, `cilium_…`, `NETAVARK…`,
+  flushed by the runtime's packaged program: podman's CNI plugin, dockerd)
+  as the firewall switched off; the same chain flushed by another process,
+  the filter chains a runtime creates (`DOCKER-USER`, `CNI-ADMIN`,
+  `KUBE-FIREWALL`) and the host firewall's chains (ufw, fail2ban,
+  firewalld, the built-in ones), still are;
+- the replacement shape (copy then delete) counts outside an authenticated
+  session only: ransomware run from an SSH shell that way is judged by the
+  ransomware tracker (NN-L-IMP-001), not by the mass-write signal. What
+  neither sees — originals deleted more than a minute after the copies, a
+  deleter in another cgroup or forked once per file, tracepoint mode — is
+  listed in the design's §10.5.
+
+None of this is a policy directive: the per-rule policy does not change it,
+and no `enforce` brings the old behaviour back.
+
 Every other rule whose response can be a kill, and why it may kill in
 OBSERVING, is listed in `crates/nn-core/src/decision/posture_floor.rs`
 (`OBSERVING_KILLS`): the kills that existed before Wave 4, kept as they were

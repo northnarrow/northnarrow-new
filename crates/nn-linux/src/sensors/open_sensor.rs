@@ -1286,8 +1286,12 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
     }
     // External audit POS-002: one event per crossing; an open crossing
     // both thresholds is one event, an overwrite one. EBPF-011: the cgroup
-    // window's crossing is an overwrite crossing too, and says so.
-    let overwrites = open_reason::MASS_OVERWRITE | open_reason::MASS_OVERWRITE_CGROUP;
+    // window's crossing is an overwrite crossing too, and says so. Lot 282
+    // (the review of #500, C1): so is the crossing that needed files under
+    // 4 KiB, which says so too — unless a crossing of files of 4 KiB or
+    // more (the process's, or its cgroup's) came with it.
+    let large = open_reason::MASS_OVERWRITE | open_reason::MASS_OVERWRITE_CGROUP;
+    let overwrites = large | open_reason::MASS_OVERWRITE_SMALL;
     if r.reason & (open_reason::MASS_WRITE | overwrites) != 0 {
         out.push(Event::MassWrite {
             pid: r.pid,
@@ -1298,6 +1302,8 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             timestamp_ns: r.timestamp_ns,
             overwrites: r.reason & overwrites != 0,
             cgroup_window: r.reason & open_reason::MASS_OVERWRITE_CGROUP != 0,
+            small_files: r.reason & open_reason::MASS_OVERWRITE_SMALL != 0 && r.reason & large == 0,
+            cgroup_id: r.cgroup,
         });
     }
     // Lab PR 225: the rename and unlink bursts (`inode_rename`,
@@ -1313,6 +1319,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             sources: r.mode,
             filename: filename.clone(),
             timestamp_ns: r.timestamp_ns,
+            cgroup_id: r.cgroup,
         });
     }
     if r.reason & open_reason::MASS_UNLINK != 0 {
@@ -1326,6 +1333,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             sources: 0,
             filename,
             timestamp_ns: r.timestamp_ns,
+            cgroup_id: r.cgroup,
         });
     }
     out
@@ -2184,6 +2192,8 @@ mod tests {
             timestamp_ns: 0,
             overwrites: true,
             cgroup_window: false,
+            small_files: false,
+            cgroup_id: 0,
         };
         rt.block_on(async {
             tx.send(mass(100)).await.unwrap();
@@ -2398,6 +2408,65 @@ mod tests {
         };
         assert_eq!(filename, "/etc/?/sshd_config");
         assert!(!path_is_exact(filename));
+    }
+
+    /// Lot 282, the review of #500 (C1): the crossing that needed files
+    /// under 4 KiB is an overwrite mass write that says so — unless a
+    /// crossing of files of 4 KiB or more (the process's, or its
+    /// cgroup's) came with it — and every mass record carries the writer's
+    /// cgroup, the unlink burst's included.
+    #[test]
+    fn small_file_crossing_and_cgroup_reach_the_events() {
+        let mut mounts = MountTable::default();
+        mounts.roots.insert((7, 2), "/".into());
+        mounts.loaded = Some(Instant::now());
+        let mut r = record(
+            open_reason::MASS_OVERWRITE_SMALL,
+            &["a.txt", "u", "home", "/"],
+            (7, 2),
+        );
+        r.cgroup = 4242;
+        let ev = events_of(&r, &mut mounts);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert!(matches!(
+            &ev[0],
+            Event::MassWrite {
+                overwrites: true,
+                small_files: true,
+                cgroup_window: false,
+                cgroup_id: 4242,
+                ..
+            }
+        ));
+        r.reason = open_reason::MASS_OVERWRITE_SMALL | open_reason::MASS_OVERWRITE_CGROUP;
+        assert!(matches!(
+            &events_of(&r, &mut mounts)[0],
+            Event::MassWrite {
+                overwrites: true,
+                small_files: false,
+                cgroup_window: true,
+                ..
+            }
+        ));
+        r.reason = open_reason::MASS_WRITE;
+        assert!(matches!(
+            &events_of(&r, &mut mounts)[0],
+            Event::MassWrite {
+                overwrites: false,
+                small_files: false,
+                cgroup_id: 4242,
+                ..
+            }
+        ));
+        r.reason = open_reason::MASS_UNLINK;
+        assert!(matches!(
+            &events_of(&r, &mut mounts)[0],
+            Event::FileBurst {
+                kind: nn_model::FileBurstKind::Unlink,
+                cgroup_id: 4242,
+                ..
+            }
+        ));
     }
 
     /// External audit EBPF-011: the cgroup window's crossing is an

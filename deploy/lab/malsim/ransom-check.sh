@@ -13,7 +13,15 @@
 #          Negatives — tar, rsync, git checkout, apt install of a package
 #          with 300 high-entropy files, and the simulator's own script
 #          compressing (log rotation) or moving (mv across filesystems)
-#          its files then deleting them — draw no NN-L-IMP-001.
+#          its files then deleting them — draw no NN-L-IMP-001. Lot 282 (the
+#          review of #500): small documents (about 2 KiB) rewritten in place
+#          without a rename, small documents copied then deleted, and an
+#          encryptor whose originals a separate process of the same unit
+#          deletes each reach ENGAGED, as on main (the posture's mass-write
+#          arm; NN-L-IMP-001 where its shapes hold, recorded as data); the
+#          re-review of #500: copies made by mknod and truncated to one
+#          byte before they are written, then the originals deleted, reach
+#          ENGAGED and NN-L-IMP-001, as on main.
 #   MS-25  security tools: `systemctl stop auditd`, `auditctl -e 0`,
 #          `ufw disable`, a builtin `kill -STOP` of auditd and a rule file
 #          written into /etc/audit/rules.d each leave their NN-L-EVA record.
@@ -84,6 +92,47 @@ if want MS23; then
         bad "MS-23 copy-delete: NN-L-IMP-001 records=$n kills=$k sim rc=$rc originals left=$left posture=$p"
     fi
     engaged "$p" && pass "MS-23 copy-delete: posture ENGAGED (COMBAT needs corroboration)" || bad "MS-23 copy-delete: posture $p, want ENGAGED"
+    # --- lot 282 (the review of #500): what the arm must still see, as on
+    # main — documents under 4 KiB rewritten in place (no rename: the
+    # rewrites alone), documents under 4 KiB copied then deleted, and an
+    # encryptor whose originals another process of its unit deletes
+    variant() {   # <label> <prepare size> <command…>
+        local label=$1 size=$2; shift 2
+        reset_posture
+        sudo python3 -I "$SIM" clean
+        sudo python3 -I "$SIM" prepare --files 300 --size "$size" >/dev/null
+        b=$(det_count)
+        unit_run "$@" >/dev/null; rc=$?
+        sleep 3
+        n=$(rule_records "$b" NN-L-IMP-001_RansomwareEncryption)
+        p=$(posture)
+        if engaged "$p" && [[ $rc -eq 0 ]]; then
+            pass "MS-23 $label: posture ENGAGED (NN-L-IMP-001 records: $n)"
+        else
+            bad "MS-23 $label: posture $p, want ENGAGED (sim rc=$rc, NN-L-IMP-001 records: $n)"
+        fi
+    }
+    variant "small files in place, no rename" 2048 python3 -I "$SIM" inplace --no-rename
+    variant "small files copy-delete" 2048 python3 -I "$SIM" copy-delete
+    variant "split encryptor and deleter" 8192 bash -c "python3 -I '$SIM' copy-only && python3 -I '$SIM' delete-only"
+    # the re-review of #500: copies made by mknod and sized to one byte by
+    # truncate(2) before their first write-open — small rewrites to the
+    # kernel — then the originals deleted: ENGAGED and NN-L-IMP-001 (the
+    # copies, their originals gone, their content), as on main
+    reset_posture
+    sudo python3 -I "$SIM" clean
+    sudo python3 -I "$SIM" prepare --files 300 >/dev/null
+    b=$(det_count)
+    unit_run python3 -I "$SIM" presized-copy-delete >/dev/null; rc=$?
+    sleep 3
+    n=$(rule_records "$b" NN-L-IMP-001_RansomwareEncryption)
+    k=$(rule_kills "$b" NN-L-IMP-001_RansomwareEncryption)
+    p=$(posture)
+    if engaged "$p" && [[ $n -ge 1 && $k -eq 0 && $rc -eq 0 ]]; then
+        pass "MS-23 presized copies (mknod, truncate to 1 byte) then delete: NN-L-IMP-001 recorded ($n), kill held, posture ENGAGED"
+    else
+        bad "MS-23 presized copies then delete: NN-L-IMP-001 records=$n kills=$k sim rc=$rc posture=$p (want ENGAGED and a record)"
+    fi
     # --- MS-23 negatives by the same unpackaged script (so no trust saves
     # them): the legitimate copy-then-delete shapes stay one shape, the
     # deletions — a log rotation with compression (the copies beside are

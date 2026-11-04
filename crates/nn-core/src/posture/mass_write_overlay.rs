@@ -13,7 +13,14 @@
 //! comments, blank lines ignored, optional `+` directive prefix.
 //!
 //! **Security note**: every prefix listed here suppresses
-//! ransomware-shape detection inside that path tree. Use sparingly.
+//! ransomware-shape detection inside that path tree — the writes there,
+//! and (lot 282, the re-check of #500) the destructions too: an
+//! original unlinked, or replaced by a rename, inside a listed tree is no
+//! original destroyed for the kernel's count (`carved_class`). An entry in
+//! a user's home is a tree on the same filesystem as the user's
+//! documents: originals moved there and deleted no longer count (writes
+//! there never did, so encrypting in place there and moving back was
+//! already unseen). Use sparingly.
 //! Typical entries are dev-tooling state directories (e.g. agent
 //! transcript stores in `/home/<user>/.claude/`) that legitimately
 //! burst many writes per second. There is no `.v1` curated default; the

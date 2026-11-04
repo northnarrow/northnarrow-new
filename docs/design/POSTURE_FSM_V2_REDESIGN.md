@@ -1,6 +1,9 @@
 # POSTURE_FSM_V2 — Gradient Multi-Signal Posture + Fleet-Level Architecture
 
-**Status:** Design document. NOT implemented. No code changes accompany this doc.
+**Status:** Design document. NOT implemented as a whole; lot 282 (Tappa Prove P0,
+04/11/2026) implemented the parts §10 describes — the mass-write arm's measure (§5.1),
+the anti-tamper refusals of package transactions, and no kill on one heuristic arm
+(Principle 2).
 **Owner:** Phase B redesign track. Implementation scoped across beta → V1.0 → V2.0.
 **Cross-refs:** `BUG-014`, `BUG-017`, `BUG-018` (see `docs/backlog/BUG_CATALOG_DESIGN.md` once
 written); `Tappa 14.3` cloud-broker design (separate doc, pending).
@@ -63,7 +66,8 @@ Detection (`agent/src/posture/triggers.rs`):
      starts with `/tmp/` or `/dev/shm/`.
   3. Mass-write: ≥ `MASS_WRITE_MIN = 20` FileOpen-with-write-flag events
      from the same PID inside a `MASS_WRITE_WINDOW_NS = 60 s` window
-     (lines 50-51).
+     (lines 50-51). (Lot 282: distinct existing files destroyed or
+     replaced, not writes — §10.1.)
 - The mass-write arm is gated by:
   - `ExemptPids::is_exempt` (the agent's own PID + verified watchdog PID)
   - `AuthSessionTracker::is_auth_mediated` (parent-chain walk hitting
@@ -691,6 +695,340 @@ compatible additive change.
 - §8.1 proposes one full release of V1-V2 dual-arbiter for empirical
   comparison. Could be shorter (one minor release) or longer (two
   releases) depending on confidence in the multi-signal calibration.
+
+---
+
+## 10. Implemented in lot 282 (Tappa Prove P0, 04/11/2026)
+
+The lab of lot 279 (Ubuntu 22.04) found the ladder killing podman at a host's
+first `podman pull`, and lot 282's measurement on `main` (same guest) gave the
+chain, signed: `sudo podman run` (first pull) → podman's CNI firewall plugin
+ran `iptables -t nat -F <its own chain>` → NN-L-EVA-002 recorded "`iptables
+-F`" → `DefenseImpairment` (ENGAGED, execution evidence) in the
+administrator's login scope → podman opened `bolt_state.db` 261 times in a
+minute → the mass-write arm's overwrite crossing → `ConfirmedIntrusion`
+(file-system evidence, root's write: privileged), corroborated by the
+`DefenseImpairment` → COMBAT, locked → INVESTIGATE → jump-ahead (podman forks)
+→ NEUTRALIZE killed podman's tree. On the same `main`, `apt purge podman`
+reached locked COMBAT from an anti-tamper refusal of `deb-systemd-helper`
+(its `rmdir` of a protected directory), and the ladder killed it. Three
+changes, and one false positive of NN-L-EVA-002 fixed on the way (§10.4).
+
+### 10.1 The mass-write arm measures what ransomware does to existing files
+
+Ransomware rewrites or replaces many EXISTING files of a user; image, package
+and build tools create many NEW files, and databases rewrite THE SAME file.
+The arm counts distinct pre-existing files destroyed or replaced, never
+writes. In the kernel (the file-open sensor on LSM `file_open`,
+`inode_unlink`, `inode_rename`; `common/src/wire/open_sensor.rs`):
+
+| counter | counts | once per |
+|---|---|---|
+| rewrites (`MASS_OVERWRITE`) | write-opens of an existing regular file of 4 KiB or more (no `FMODE_CREATED`; the size read before `O_TRUNC` empties it) | file (`OPEN_OVERWRITE_SEEN`: tgid, device, inode) per 60-s window |
+| small rewrites (`MASS_OVERWRITE_SMALL`; the review of #500, C1) | the same, of any existing file that holds data: crosses when the distinct non-empty files rewritten reach the threshold before the files of 4 KiB or more alone do (a crossing of both is `MASS_OVERWRITE` alone) | file, per window |
+| files written new (`MASS_WRITE`) | the first write-open of the window of a file that held no data: created by the open (`FMODE_CREATED`), or empty when opened — made by `mknod(S_IFREG)`, an `O_TMPFILE` linked in with `linkat`, an `O_RDONLY \| O_CREAT` open reopened to write (the review of #500, B1: `FMODE_CREATED` alone was evaded by all three) | file (`OPEN_OVERWRITE_SEEN`, the same map: a file counts once, as what its first write-open of the window found) |
+| originals destroyed (`MASS_UNLINK`) | an unlink of a regular file that holds data (C1: it was 4 KiB or more), or held data within the window — seen non-empty at an `inode_setattr` that changes its size (`OPEN_HAD_DATA`, by inode: a `truncate` then an `unlink` is one original; the re-check of #500: a size change only, not a chmod or a `touch`) — or a rename onto the name of one (the target is destroyed); not a file the same process created within the window (`OPEN_CREATED`: its own temporary file, as `pip` and `npm` unpack), nor one in a directory whose writes do not count (the re-check of #500: a carve-out — a pseudo-filesystem, `/run/systemd`, the journal, `/run/udev` (see below), the operator's extras — or the destroyer's own runtime directory, read from the parent's `DIR_CLASS`: a daemon's atomic replacements there) | name (`OPEN_DESTROY_SEEN`: tgid, parent dentry, the name's `hash_len`) per window |
+
+The re-check of #500 added `/run/udev/` to the carve-outs
+(`triggers::MASS_WRITE_CARVEOUT_PREFIXES`), as measured: on Ubuntu 22.04
+the boot's coldplug (`udevadm trigger --action=add` of every device) made
+each systemd-udevd worker write 20 device database files new under
+`/run/udev/data` and replace 20 old ones by a rename — the replacement
+shape, ENGAGED on `systemd-udevd.service`. The directory is root-only
+(udevd's, 0755), on the `/run` tmpfs as `/run/systemd` (a carve-out
+already), and holds no user's data — device databases, tags, links: a
+rename into it from a user's tree fails (`EXDEV`). Persistence through
+udev rules (ATT&CK T1546.017: `/etc/udev/rules.d`, `/lib/udev/rules.d`,
+and the volatile `/run/udev/rules.d` inside this carve-out) is watched
+by no rule today — no FIM path, no persistence prefix, absent from
+`ATTACK_COVERAGE` — and is a lot of its own: the mass-write arm is a
+ransomware heuristic, not a persistence detector, so the carve-out
+neither opens nor closes it.
+
+A repeat (the same file reopened, the same name destroyed again) is not
+counted; an entry the LRU maps evicted counts again (more, never fewer). The
+cgroup window (external audit EBPF-011) adds the processes' distinct rewrites.
+The arm (`crates/nn-core/src/posture/triggers.rs`, `confirmed_intrusion`)
+raises `ConfirmedIntrusion` on:
+
+1. **rewrites** — at least 20 distinct existing files of 4 KiB or more
+   rewritten in place by one process in 60 s, or 40 by one cgroup's
+   processes (each with three or more): `MassWrite { overwrites: true }`.
+   Inside an authenticated session too (external audit POS-002: encryption
+   in place run from a shell). The review of #500 (C1): 20 distinct existing
+   files that hold data, the smaller ones included (`MassWrite { overwrites:
+   true, small_files: true }`), outside an authenticated session only —
+   inside one, as before, only files of 4 KiB or more count: a build
+   rewrites its own small outputs (cargo's fingerprints, `.d` files), and
+   counted as ransomware in a session it reached COMBAT and the ladder
+   killed cargo (lab PR 127, the reason of the 4 KiB floor).
+2. **replacement** — at least 20 distinct originals destroyed and at least
+   20 files written new, the two crossings within a window of each other, in
+   either order (`FileBurst { kind: Unlink }` and `MassWrite { overwrites:
+   false }`): the encrypted copy written and the original deleted, or the
+   copy renamed onto it. The two halves pair within one process, or (the
+   review of #500, C1) within one cgroup — the kernel's cgroup v2 id of each
+   crossing (`OpenRecordRaw::cgroup`): an encryptor and a separate deleter (a
+   helper, an `rm` it runs, a second worker of the unit or the container). A
+   half of an exempt writer, or of a process of an authenticated session,
+   pairs only within its own process; the root cgroup (no hierarchy in use)
+   pairs nothing. Outside an authenticated session (a session's new files
+   never counted, and a checkout or an archive extracted over a tree from a
+   shell is this shape).
+
+and never on files created alone (an image pulled, a clone, an archive
+extracted, a build, a cache filled), one file rewritten again and again (a
+database, a state file), or originals deleted alone (`rm -rf`, a purge, a
+cache sweep). In tracepoint mode (no LSM sensor; every open reaches userland,
+whether its file existed is unknown, and no unlink is seen) the arm counts
+the distinct files a process opened to write — an open that must create its
+file (`O_CREAT | O_EXCL`) included (the review of #500, C1: a copy-and-delete
+encryptor's copies; tracepoint mode cannot tell them from an extraction, so
+an extraction outside a session raises the arm there, ENGAGED, as on
+`main`) — and inside a session no open that may create one does.
+Every shape is file-system evidence (`triggers::evidence_class`): no shape of
+the arm corroborates another, nor the ransomware tracker's
+`RansomwareEncryption` (file-system evidence too).
+
+The firing set stays within the old one: a rewrite crossing needs 20
+distinct files where it needed 20 opens (and a small-file crossing 20
+distinct files that `main` counted as 20 write-opens outside a session); a
+replacement needs the crossing of files written new that alone used to fire
+(each of them a write-open `main` counted). A replacement paired in a cgroup
+raises the arm on the later half's process — the deleter's burst, say —
+where `main` raised it on the encryptor's own crossing, within the same
+window. One corner goes further (the review of #500, N4): the exempt writers
+are judged on the path of the replacement's crossing, the destroyed file's
+for a deletion, where `main` judged the written file's — a writer exempt in
+its own storage and not outside it may raise the arm where `main` did not;
+the safe direction. The ransomware simulation's shapes still fire it (in
+place: 300 distinct files rewritten; copy-delete: 300 originals destroyed
+beside 300 new files), and so do its variants of the review of #500 (§10.6).
+
+The writers the arm exempts are kept, each for the shape that still counts
+it (and an exempt crossing is now recorded at INFO with the exemption that
+answered): a package transaction (it replaces the files it upgrades), the
+man-db cache rebuild as a system account (it replaces each locale's
+`index.db` by a rename), npm's CLI (`npm ci` deletes `node_modules` and
+extracts it again) and a user's package manager in that user's container
+storage. None is by name or path alone.
+
+The kernel counters feed the ransomware tracker too (`crates/nn-core/src/impact`):
+its (a) rewrites are distinct files of 4 KiB or more (a small-file crossing
+is no shape (a): the tracker's verdict is decisive, and a build rewrites its
+own small outputs), its (d) "deletion of originals after writing new files"
+reads files written new (not every write-open; whatever made them: B1) —
+and (the re-check of #500) the small-file rewrite crossing too: a copy
+made by `mknod` and brought to one byte by `truncate(2)` before it is
+written is a small rewrite to the kernel, a file written all the same;
+the copies beside the deleted originals and their content decide — and
+originals of any size that held data, and counts a rename onto an
+original as its deletion. What it does not see is said in §10.5.
+
+### 10.2 An anti-tamper refusal of a package transaction never corroborates
+
+A refusal is signed (NN-L-AT-001) and the kernel already blocked it. When the
+refused process belongs to a package transaction — a package manager proper
+(`PACKAGE_MANAGER_EXES`: dpkg, apt, rpm, dnf, …) executed by root whose run
+covers the refusal, judged as R009 and the FIM rules judge it
+(`AuthSessionTracker::in_package_transaction`) — it raises
+`PackageTamperRefusal`: ALERTED, kernel evidence, never written to the
+corroboration ledger (an ALERTED-tier trigger never is), never decisive,
+never locking — for the refused operations a maintainer script does on the
+file namespace only (the review of #500, B2: `unlink`, `rmdir`, `rename`,
+`setattr`, `create`, `link`, `symlink`, `mkdir`, `mknod`, an extended
+attribute; `triggers::is_package_file_operation`). Any root process makes
+itself a "transaction" without pretending anything — `apt-get -o
+APT::Update::Pre-Invoke::=<cmd> update`, `DPkg::Pre-Invoke`, `rpm --eval
+'%(cmd)'`, a dpkg run with `LD_PRELOAD`, and every child of `snapd` and
+`packagekitd`, which run for as long as the host does — so a refused signal,
+ptrace, BPF map or link handle, kexec, cgroup write, resource limit,
+scheduling change, read of the signing key, write-open, `ioctl` or
+`oom_score_adj` write keeps the weight it has outside one (`AntiTamperDenial`,
+decisive, COMBAT locked; `DefenseImpairment` for a scheduling change;
+`SensitiveFileAccess` for the read). A refusal of any other process keeps
+today's weight; PID 1's relayed signal stays `RelayedTamperAttempt`.
+Residual: a root process inside a package transaction — a malicious
+package's maintainer script, or any root command run as an apt hook — whose
+file operation on the agent's files is refused (the kernel blocks it, the
+record is signed) no longer brings COMBAT by itself.
+
+### 10.3 COMBAT never kills on one heuristic arm
+
+Principle 2 at the point of the kill: the ladder's NEUTRALIZE does not kill,
+quarantine or isolate when the episode's cause is a heuristic
+(`Confidence::NeedsCorroboration`) that no signal of another kind of evidence
+vouches for (`CombatCause::single_heuristic_arm`: nothing, or only repeats of
+its own kind — the sustained knob). It signs a `combat_stage` row "NEUTRALIZE
+held … one heuristic arm …" and does not escalate to ISOLATE (the offenders
+were spared by choice, not found uncontainable). The posture already reaches
+COMBAT on a heuristic only with a signal of another class in the actor's
+scope (BUG-032, POS-001), so the hold is the ladder's own check of that rule:
+the mass-write arm alone, however often and in whatever shape, stops at
+ENGAGED and never reaches the ladder (golden case
+`mass-write-arm-alone-engaged`). Corroboration stays per actor scope (§10.5).
+
+### 10.4 NN-L-EVA-002: a container runtime flushing its own chain
+
+What a flush of one named chain (`iptables -F <chain>`, `--flush`) is depends
+on the chain's function and on who flushes it (the coordinator's review of the
+design):
+
+- the chains of the container runtimes and orchestrators — `CNI-…`,
+  `DOCKER…`, `KUBE-…`, `cali-…`, `cilium_…`, `NETAVARK…` — but the filter
+  chains they create (`DOCKER-USER` and, the review of #500, `CNI-ADMIN`:
+  the administrator's rules for the containers' traffic; `KUBE-FIREWALL`:
+  the drop of marked packets, the guard of `route_localnet`), which no
+  runtime empties —
+  flushed by the runtime itself are its own networking at work, not a
+  firewall switched off: the `iptables`'s parent is a runtime program (a CNI
+  plugin of `/usr/lib/cni` or `/usr/libexec/cni`, `dockerd`, `podman`,
+  `netavark`, `containerd`, `crio`, `kubelet`, `kube-proxy`), judged on what
+  the kernel executed, in a system tree and installed by a package — never a
+  name or a path alone;
+- the same chains flushed by any other process (a shell, an unpackaged
+  plugin in `/opt/cni/bin`, k3s's bundled tools), the filter chains above
+  flushed by anyone, and every other chain — the host firewall's (ufw's
+  `ufw-…`, fail2ban's `f2b-…`, firewalld's zones), a built-in one, every
+  chain of a table — stay the firewall switched off.
+
+Residual: kube-proxy, Calico and Cilium run in containers on most clusters;
+their executables are no package of the host, so their flushes stay records.
+A root process can make a packaged runtime its parent (`LD_PRELOAD` into
+dockerd or podman, a ptrace) and flush a runtime's chain without a record:
+an accepted residual of a heuristic, the filter chains excluded.
+
+### 10.5 What stays as it was, said explicitly
+
+- **Copy then delete from a login session.** The replacement shape (§10.1,
+  rule 2) counts outside an authenticated session only, as new files never
+  counted inside one (POS-002). Ransomware run from an SSH shell that writes
+  encrypted copies and deletes the originals does not pass through the
+  mass-write arm: the ransomware tracker (lot 225, NN-L-IMP-001 and the
+  posture's `RansomwareEncryption`) judges it, by the copies' content and
+  names — copies written new, or (the re-check of #500) copies sized to
+  one byte before they are written. Encryption in place from a session
+  still raises the arm (rule 1), for files of 4 KiB or more: small
+  documents encrypted in place from a session do not (as on `main`; the
+  tracker sees them by their renames; a session threshold of its own for
+  small rewrites is to be measured on a development corpus first: lot
+  283).
+- **What the arm does not see (the review of #500, C1), and who does.**
+  - Originals deleted more than 60 s after the copies were written (the
+    halves pair within one window, either order). NN-L-IMP-001 pairs its
+    shapes within 120 s; past that, nothing.
+  - An encryptor and a deleter in different cgroups (the deletion handed to
+    another unit, a cron job, a `systemd-run`), or a deleter forked once per
+    file (each process under 20 originals): the copies' crossing alone is no
+    shape. `main` raised the arm on the encryptor's 20 write-opens; the
+    tracker's (d) needs the deleter to descend from the encryptor.
+  - Writers forked once per file (each under 20 files written new or
+    rewritten) and a slow encryptor (under 20 files a minute): as on `main`,
+    the counters are per process (the cgroup window adds rewrites of 4 KiB
+    or more only).
+  - A truncated original whose `OPEN_HAD_DATA` entry was evicted (more than
+    4,096 files truncated in the window — since the re-check of #500 a
+    chmod, a chown or a `touch` no longer marks a file): its unlink counts
+    nothing, as it did.
+  - Tracepoint mode: the arm counts files written, no replacement shape, and
+    the tracker is blind (no `MassWrite`, no `FileBurst`).
+  - NN-L-IMP-001 itself: (a) counts rewrites of files of 4 KiB or more only;
+    (b) measures entropy over the bytes it reads, and a file of a few
+    hundred bytes of random data measures under 7.5 bits per byte (the
+    signal needs about 1 KiB of ciphertext); (d) needs the deleter to be the
+    writer's actor (the nearest foreign program of its lineage). Small
+    documents encrypted in place are the tracker's by (c), their renames to
+    a new extension, with (b) where they hold a kilobyte or more.
+- **The kernel windows evict.** The per-process windows (`OPEN_WRITES`,
+  `OPEN_UNLINKS`: 4,096 processes, LRU, as before the lot) restart a
+  process's counts when another 4,096 processes write or delete within its
+  window: fewer, not more. The lot's maps evict the other way — a file or a
+  name seen again counts again (`OPEN_OVERWRITE_SEEN`, `OPEN_DESTROY_SEEN`),
+  a process's own temporary file forgotten counts as an original
+  (`OPEN_CREATED`) — save `OPEN_HAD_DATA`, above. Documented, not changed:
+  4,096 writers in a minute is a host under a fork storm, which other
+  signals see.
+- **Corroboration is per actor scope, not per process tree** (future work).
+  A signal of one process of a login session or a workload vouches for
+  another process of the same scope, as the lab's `iptables` (podman's CNI
+  plugin, under `sudo`) vouched for rootless podman's mass write. The
+  NEUTRALIZE hold of §10.3 judges the cause's evidence classes, not which
+  process raised them.
+
+### 10.6 The review of #500: the kernel's cost, and the variants measured
+
+The counters' maps, LRU hashes preallocated by the kernel:
+`OPEN_OVERWRITE_SEEN`, `OPEN_DESTROY_SEEN` and `OPEN_CREATED`, 16,384
+entries each (key 24 bytes, value 8), and `OPEN_HAD_DATA`, 4,096 (key 16,
+value 8). Per call, a write-open of a regular file now looks its file up in
+`OPEN_OVERWRITE_SEEN` (and inserts it, once per window) whatever it found
+— a file written new included — and a creation inserts into
+`OPEN_CREATED`; an unlink, or a rename onto an existing name, reads the
+inode's key and looks it up in `OPEN_CREATED` (and, for an empty file, in
+`OPEN_HAD_DATA`), then its name in `OPEN_DESTROY_SEEN`; a setattr of a
+regular file that holds data inserts into `OPEN_HAD_DATA`. The re-check of
+#500 made three of these cheaper (measured below): a creation inserts into
+`OPEN_OVERWRITE_SEEN` without looking it up (a new inode); an unlink or a
+rename reads its directory's class first (`DIR_CLASS`, a lookup; the walk
+on a miss) and stops in a carve-out; a setattr reads the `iattr`'s
+`ia_valid` and marks a size change only. Measured on our
+own lab guests (4 vCPU, QEMU; the kernel's BPF statistics on for the bench
+only, `run_time_ns / run_cnt` of each program over 20,000 operations on
+files of 1 KiB; `main` a97d5ff2 against the lot on the same Ubuntu 22.04
+guest, 5.15):
+
+| operation (program) | `main`, ns a call | the lot, ns a call | the bench's operation, `main` → the lot |
+|---|---:|---:|---|
+| a file created (`fim_file_open_sensor`) | 516 | 1,568 | 27.2 → 31.3 µs |
+| an existing file rewritten, again (`fim_file_open_sensor`) | 320 | 347 | 3.26 → 3.16 µs |
+| an unlink (`fim_unlink_observe`) | 270 | 1,147 | 8.9 → 10.1 µs |
+| a rename onto an existing file (`fim_rename_observe`) | 2,728 | 5,657 | 102 → 115 µs |
+| a chmod (`fim_setattr_observe`) | 115 | 351 | 2.13 → 2.35 µs |
+
+`main`'s unlink of a file under 4 KiB returned at the size check; the lot
+counts it. On Ubuntu 24.04 (6.8, the lot only): 1,859, 664, 1,990, 7,342
+and 916 ns. Memory, as 6.8 accounts it (`bpftool map show`, `memlock`):
+1,573,952 bytes for each map of 16,384 entries and 361,536 for
+`OPEN_HAD_DATA` — about 5.1 MB together (5.15 reports page estimates, 512
+KiB and 96 KiB). The LRU lists are the maps' common ones; a per-CPU list
+(`BPF_F_NO_COMMON_LRU`) would take the lock off a creation burst's path,
+not evaluated here. The verifier: on 5.15 `fim_file_open_sensor` 4,379
+instructions, `fim_unlink_observe` 2,360, `fim_rename_observe` 6,270,
+`fim_setattr_observe` 1,008; on 6.8 the same, with 104,758, 9,038, 129,370
+and 1,220 instructions verified; every program loads on both. The
+variants of the review — small documents encrypted in place, small
+documents copied then deleted, an encryptor whose originals another
+process of its unit deletes — reach ENGAGED on `main` and on the lot
+(`ransom-check`, MS-23): on the lot the arm raises each (the small-file
+crossing, the replacement, the replacement paired in the unit's cgroup).
+
+After the re-check of #500 (the same bench; one round per guest, each
+build installed in turn on the same guest — on 22.04 `main` b000a814, the
+head the re-check read, dd870a16, and the lot's 79ca9ab3; on 24.04 the
+latter two), ns a call:
+
+| operation (program) | 22.04 `main` | 22.04 before → after | 24.04 before → after |
+|---|---:|---:|---:|
+| a file created (`fim_file_open_sensor`) | 500 | 1,158 → 1,144 | 2,838 → 1,799 |
+| an existing file rewritten, again | 291 | 311 → 325 | 799 → 684 |
+| an unlink (`fim_unlink_observe`) | 270 | 1,052 → 1,194 | 2,283 → 1,908 |
+| a rename onto an existing file | 2,556 | 5,165 → 5,033 | 8,885 → 8,179 |
+| a chmod (`fim_setattr_observe`) | 117 | 351 → 134 | 930 → 353 |
+
+The chmod is back to `main`'s cost (a size change only marks a file). The
+creation's skipped lookup is within the rounds' spread; the unlink in a
+directory that is no carve-out pays the class lookup (about 140 ns on
+5.15), and in a carve-out stops before every map (daemons' atomic
+replacements under `/run/systemd`; not in the bench). 24.04's "before"
+ran while the 22.04 guest was busy on the same host (its operations took
+twice as long): its differences are no measure of the change. The
+verifier after the re-check: `fim_unlink_observe` 3,331 instructions
+(57,674 verified on 6.8: the directory's class, the walk on a miss),
+`fim_rename_observe` 7,241 (178,006), `fim_setattr_observe` 1,072 (1,278),
+`fim_file_open_sensor` 4,379 (104,801); every program loads on 5.15 and
+6.8. MS-23 with the presized copies (made by `mknod`, truncated to one
+byte, written, the originals deleted): ENGAGED and NN-L-IMP-001 on
+`main` and on the lot, both guests.
 
 ---
 

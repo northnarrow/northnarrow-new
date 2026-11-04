@@ -79,17 +79,24 @@ pub fn engine<H: DecisionHost>(host: HostParts<'_, H>) -> RuleEngine<H> {
         .unwrap_or_default(),
     );
     let (tools, _) = SecurityTools::load::<H>(&file("security-tools.v1"));
-    let defense = Arc::new(DefenseDetector::with_proc_root(
-        Arc::new(tools),
-        lineage.clone(),
-        Some(Arc::new(
-            process_allowlist
-                .as_ref()
-                .clone()
-                .with_identity(lineage.clone()),
+    let defense = Arc::new(
+        DefenseDetector::with_proc_root(
+            Arc::new(tools),
+            lineage.clone(),
+            Some(Arc::new(
+                process_allowlist
+                    .as_ref()
+                    .clone()
+                    .with_identity(lineage.clone()),
+            )),
+            proc_root,
+        )
+        // Lot 282: the fixture's package database, as the ransomware tracker's
+        // (a runtime's own chain flush is vouched for by its package).
+        .with_program_owners(crate::impact::trust::ProgramOwners::new(
+            ransom.program_owners().root(),
         )),
-        proc_root,
-    ));
+    );
     let correlation = Arc::new(Mutex::new(CorrelationStore::with_tree(
         AncestryTree::with_proc_root(proc_root, super::correlation::ancestry::MAX_TRACKED_EDGES),
     )));

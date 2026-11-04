@@ -19,9 +19,12 @@
 //!   extension appended to the names of the originals (d) deleted, found
 //!   beside them;
 //! - **(d) deletion of originals after writing new files** — the unlink
-//!   burst (`Event::FileBurst { kind: Unlink }`: 20 files of at least 4 KiB
-//!   in 60 s) of an actor that crossed the new-file mass-write threshold in
-//!   the window.
+//!   burst (`Event::FileBurst { kind: Unlink }`: 20 files that held data in
+//!   60 s — lot 282, the review of #500: any size, it was 4 KiB or more) of
+//!   an actor that crossed the new-file mass-write threshold in the window
+//!   (lot 282: files written new, the open's own creation or not; the
+//!   re-review of #500: or the small-file rewrite threshold, files written
+//!   all the same).
 //!
 //! Any **two** of them within [`RANSOM_WINDOW_NS`] for one actor make the
 //! assessment **decisive**: NN-L-IMP-001 (Critical, `KillProcessTree` of the
@@ -219,6 +222,12 @@ impl<H: DecisionHost> RansomTracker<H> {
         }
     }
 
+    /// The package database it judges programs on (lot 282: a replay
+    /// gives the security-tool detector the same one).
+    pub fn program_owners(&self) -> &ProgramOwners<H> {
+        &self.owners
+    }
+
     pub fn counts(&self) -> RansomCounts {
         RansomCounts {
             decisive: self.counters.decisive.load(Ordering::Relaxed),
@@ -362,8 +371,12 @@ impl<H: DecisionHost> RansomTracker<H> {
         let mut sample: Option<String> = None;
         let mut copies_of: Option<(String, Vec<String>, u32)> = None;
         match event {
+            // Lot 282 (the review of #500, C1): a crossing that needed files
+            // under 4 KiB is no shape (a) — a build rewrites its own small
+            // outputs; the posture's arm reads it outside a session.
             Event::MassWrite {
                 overwrites: true,
+                small_files: false,
                 count,
                 filename,
                 cgroup_window,
@@ -382,8 +395,22 @@ impl<H: DecisionHost> RansomTracker<H> {
                 ));
                 sample = Some(filename.clone());
             }
+            // Lot 282: the files an actor wrote new. The re-review of #500
+            // (B1, its residual): and a crossing that needed files under
+            // 4 KiB — a copy truncated to one byte before it is written
+            // (`truncate(2)` is no open) is a small rewrite to the kernel,
+            // and the copies-then-deleted shape (d) went dark for it. Here
+            // it is files written, as every write-open was on `main`: the
+            // copies beside the deleted originals and their content (c′, b)
+            // tell an encryptor from a build.
             Event::MassWrite {
                 overwrites: false,
+                filename,
+                ..
+            }
+            | Event::MassWrite {
+                overwrites: true,
+                small_files: true,
                 filename,
                 ..
             } => {
@@ -437,8 +464,8 @@ impl<H: DecisionHost> RansomTracker<H> {
                     shapes.push((
                         Signal::DeleteOriginals,
                         format!(
-                            "{count} files of 4 KiB or more deleted in 60 s after {} new files \
-                             were written, last {filename}",
+                            "{count} files holding data deleted in 60 s after {} new files were \
+                             written, last {filename}",
                             common::wire::open_sensor::OPEN_MASS_WRITE_MIN
                         ),
                     ));

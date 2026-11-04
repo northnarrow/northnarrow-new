@@ -39,15 +39,27 @@ use crate::anti_tamper::network_isolate::{FamilyOutcome, IsolationReport};
 use crate::posture::{CombatCause, CombatEntry, EntryProcess, TriggerEvidence};
 
 /// Lab PR 245: the evidence the posture cites for `trigger`, raised on an
-/// event of `pid`.
+/// event of `pid`. Lot 282: a heuristic's, as the posture builds it — the
+/// posture enters COMBAT on a heuristic only with a signal of another kind
+/// of evidence in the actor's scope, so the evidence cites one (a decisive
+/// trigger cites none). [`lone_arm`] is a heuristic citing nothing.
 fn evidence_of(trigger: TriggerType, pid: Option<u32>) -> TriggerEvidence {
+    use nn_model::posture_types::{Confidence, EvidenceClass};
+    let confidence =
+        trigger.confidence(nn_model::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION);
+    let corroborated_by = match (confidence, trigger.evidence_class()) {
+        (Confidence::Decisive, _) => Vec::new(),
+        (_, EvidenceClass::Execution) => {
+            vec![(TriggerType::ExfiltrationPattern, EvidenceClass::Network)]
+        }
+        _ => vec![(TriggerType::ExploitAttempt, EvidenceClass::Execution)],
+    };
     TriggerEvidence {
         trigger,
         raised: vec![trigger],
         class: trigger.evidence_class(),
-        confidence: trigger
-            .confidence(nn_model::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION),
-        corroborated_by: Vec::new(),
+        confidence,
+        corroborated_by,
         locked: trigger.locks_combat(),
         scope: "login uid 1000".to_string(),
         event_kind: "ProcessSpawn",
@@ -67,6 +79,27 @@ fn entry(pid: Option<u32>, trigger: Option<TriggerType>) -> CombatEntry {
             None => CombatCause::DebugForce,
         },
         offender: pid.map(|pid| EntryProcess {
+            pid,
+            start_ns: 0,
+            seen_ns: 0,
+        }),
+    }
+}
+
+/// Lot 282: the entry of a COMBAT that rests on one heuristic arm — the
+/// mass-write arm of `ConfirmedIntrusion` (file-system evidence) of `pid`,
+/// vouched for by `by` (nothing, or only signals of its own kind).
+fn lone_arm(
+    pid: u32,
+    by: Vec<(TriggerType, nn_model::posture_types::EvidenceClass)>,
+) -> CombatEntry {
+    let mut e = evidence_of(TriggerType::ConfirmedIntrusion, Some(pid));
+    e.class = nn_model::posture_types::EvidenceClass::FileSystem;
+    e.event_kind = "MassWrite";
+    e.corroborated_by = by;
+    CombatEntry {
+        cause: CombatCause::Trigger(e),
+        offender: Some(EntryProcess {
             pid,
             start_ns: 0,
             seen_ns: 0,
@@ -418,6 +451,116 @@ fn uncontainable_threat_escalates_to_isolate_last_resort() {
         audit_idx < isolate_idx,
         "evidence must be emitted BEFORE isolation: {log:?}"
     );
+}
+
+/// Lot 282 (Tappa Prove P0, lab 04/11: rootless podman killed by
+/// NEUTRALIZE after the first pull): the ladder never kills, quarantines or
+/// isolates on ONE heuristic arm. A COMBAT whose cause is the mass-write
+/// arm with nothing of another kind vouching for it — nothing at all, or
+/// repeats of its own file-system kind (the sustained knob) — holds its
+/// NEUTRALIZE at the deadline and on a jump-ahead alike, and signs why.
+#[test]
+fn a_single_heuristic_arm_is_never_killed() {
+    use nn_model::posture_types::EvidenceClass;
+    let win = Duration::from_secs(30);
+    for by in [
+        Vec::new(),
+        vec![(TriggerType::ConfirmedIntrusion, EvidenceClass::FileSystem)],
+        vec![(TriggerType::RansomwareEncryption, EvidenceClass::FileSystem)],
+    ] {
+        // the deadline
+        let (l, rec) = ladder(NeutralizeOutcome::Contained, win);
+        let t0 = Instant::now();
+        let e = lone_arm(4735, by.clone());
+        assert!(e.cause.single_heuristic_arm());
+        l.engage(&e, t0);
+        l.tick(t0 + win + Duration::from_secs(1));
+        l.tick(t0 + win + Duration::from_secs(60));
+        assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+        let log = rec.log();
+        assert!(
+            !log.iter()
+                .any(|x| x.starts_with("neutralize") || x == "isolate"),
+            "{by:?}: {log:?}"
+        );
+        assert!(
+            log.iter().any(|x| x == "audit:INVESTIGATE->NEUTRALIZE"),
+            "{log:?}"
+        );
+        // the jump-ahead (podman forking its children), with the reason signed
+        let (l, rec, reasons) = ladder_protected(
+            NeutralizeOutcome::Contained,
+            Duration::from_secs(300),
+            HashMap::new(),
+        );
+        l.engage(&lone_arm(4735, by.clone()), t0);
+        l.observe(&spawn(4858, 4735), t0 + Duration::from_secs(1));
+        assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+        assert!(
+            !rec.log()
+                .iter()
+                .any(|x| x.starts_with("neutralize") || x == "isolate"),
+            "{by:?}: {:?}",
+            rec.log()
+        );
+        let reasons = reasons.lock().clone();
+        let held = reasons
+            .iter()
+            .find(|(to, _)| to == "NEUTRALIZE")
+            .expect("the held NEUTRALIZE is signed");
+        assert!(held.1.contains("NEUTRALIZE held"), "{held:?}");
+        assert!(held.1.contains("one heuristic arm"), "{held:?}");
+        assert!(
+            held.1.contains("ConfirmedIntrusion (FileSystem"),
+            "{held:?}"
+        );
+        assert!(
+            !reasons.iter().any(|(to, _)| to == "ISOLATE"),
+            "{reasons:?}"
+        );
+    }
+}
+
+/// Lot 282: the same arm vouched for by another kind of evidence is no
+/// longer one arm — the NEUTRALIZE kills as before; and a decisive cause
+/// (a kernel denial) needs nobody's word.
+#[test]
+fn a_corroborated_or_decisive_cause_is_neutralized() {
+    use nn_model::posture_types::EvidenceClass;
+    let win = Duration::from_secs(30);
+    let (l, rec) = ladder(NeutralizeOutcome::Contained, win);
+    let t0 = Instant::now();
+    let e = lone_arm(
+        4735,
+        vec![
+            (TriggerType::RansomwareEncryption, EvidenceClass::FileSystem),
+            (TriggerType::DefenseImpairment, EvidenceClass::Execution),
+        ],
+    );
+    assert!(!e.cause.single_heuristic_arm());
+    l.engage(&e, t0);
+    l.tick(t0 + win + Duration::from_secs(1));
+    assert!(
+        rec.log().iter().any(|x| x == "neutralize:[4735]"),
+        "{:?}",
+        rec.log()
+    );
+    let (l, rec) = ladder(NeutralizeOutcome::Contained, win);
+    let e = entry(Some(77), Some(TriggerType::AntiTamperDenial));
+    assert!(!e.cause.single_heuristic_arm());
+    l.engage(&e, t0);
+    l.tick(t0 + win + Duration::from_secs(1));
+    assert!(
+        rec.log().iter().any(|x| x == "neutralize:[77]"),
+        "{:?}",
+        rec.log()
+    );
+    // a forced COMBAT is an administrator's word, not a heuristic
+    assert!(!CombatCause::DebugForce.single_heuristic_arm());
+    assert!(!CombatCause::AdminForce {
+        signers: Vec::new()
+    }
+    .single_heuristic_arm());
 }
 
 // ── Jump-ahead: active exfil pre-empts the INVESTIGATE deadline ──

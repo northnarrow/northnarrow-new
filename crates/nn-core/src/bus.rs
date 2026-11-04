@@ -1613,6 +1613,8 @@ mod tests {
             timestamp_ns: 0,
             overwrites: false,
             cgroup_window: false,
+            small_files: false,
+            cgroup_id: 0,
         };
         assert_eq!(when_full(&mass), WhenFull::Backpressure);
         let denial = Event::FsProtectDenial {

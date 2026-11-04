@@ -146,6 +146,18 @@ pub enum TriggerType {
     // heuristic of another kind from the same actor. Appended last to keep
     // variant ordering stable.
     DefenseImpairment,
+
+    // Lot 282 (Tappa Prove P0): an anti-tamper refusal of a package
+    // transaction's process — a package manager proper executed by root
+    // whose run covers it, as R009 and the FIM rules judge it
+    // (`deb-systemd-helper` removing a directory the agent protects while
+    // `apt purge` runs). The refusal is signed (NN-L-AT-001) and the kernel
+    // already blocked it: it raises ALERTED and never corroborates (an
+    // ALERTED-tier trigger is never written to the ledger). As
+    // `AntiTamperDenial` it locked COMBAT on its own and the ladder killed
+    // the maintainer script. A refusal of any other process keeps
+    // `AntiTamperDenial`. Appended last to keep variant ordering stable.
+    PackageTamperRefusal,
 }
 
 /// Lab PR 225, held by the decision of 21/10/2026 (no new destructive
@@ -218,7 +230,8 @@ impl TriggerType {
             TriggerType::AntiTamperDenial
             | TriggerType::RelayedTamperAttempt
             | TriggerType::ControlSurfaceTamper
-            | TriggerType::ExploitPostcondition => EvidenceClass::Kernel,
+            | TriggerType::ExploitPostcondition
+            | TriggerType::PackageTamperRefusal => EvidenceClass::Kernel,
             TriggerType::TelemetryLoss => EvidenceClass::Telemetry,
         }
     }
@@ -230,7 +243,8 @@ impl TriggerType {
             | TriggerType::SuspiciousDns
             | TriggerType::SensitiveFileAccess
             | TriggerType::Lolbas
-            | TriggerType::TelemetryLoss => PostureKind::Alerted,
+            | TriggerType::TelemetryLoss
+            | TriggerType::PackageTamperRefusal => PostureKind::Alerted,
 
             TriggerType::ExploitAttempt
             | TriggerType::AdjacentCompromise
@@ -319,6 +333,7 @@ impl TriggerType {
             TriggerType::ExploitPostcondition => "ExploitPostcondition",
             TriggerType::RansomwareEncryption => "RansomwareEncryption",
             TriggerType::DefenseImpairment => "DefenseImpairment",
+            TriggerType::PackageTamperRefusal => "PackageTamperRefusal",
         }
     }
 }
@@ -486,6 +501,24 @@ mod tests {
         assert_eq!(d.as_str(), "DefenseImpairment");
         assert!(TriggerType::AntiTamperDenial.locks_combat());
         assert!(TriggerType::ControlSurfaceTamper.locks_combat());
+    }
+
+    /// Lot 282: a package transaction's anti-tamper refusal raises
+    /// ALERTED, kernel evidence that never corroborates, is never decisive
+    /// and never locks — wherever the ransomware directive stands.
+    #[test]
+    fn a_package_transaction_refusal_never_corroborates() {
+        let t = TriggerType::PackageTamperRefusal;
+        assert_eq!(t.target_level(), PostureKind::Alerted);
+        assert_eq!(t.evidence_class(), EvidenceClass::Kernel);
+        assert!(!t.is_corroboration());
+        assert!(!t.locks_combat());
+        assert_eq!(t.confidence(false), Confidence::NeedsCorroboration);
+        assert_eq!(t.confidence(true), Confidence::NeedsCorroboration);
+        assert_eq!(t.as_str(), "PackageTamperRefusal");
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, "\"PackageTamperRefusal\"");
+        assert_eq!(serde_json::from_str::<TriggerType>(&json).unwrap(), t);
     }
 
     #[test]

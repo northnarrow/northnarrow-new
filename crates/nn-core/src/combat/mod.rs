@@ -1586,6 +1586,31 @@ impl<H: CombatHost> Inner<H> {
                 LadderStep::None => return,
                 LadderStep::Neutralize { from, named, refs } => {
                     let trigger = named.trigger();
+                    // Lot 282 (Tappa Prove P0): never a kill on ONE
+                    // heuristic arm. The posture reaches COMBAT on a
+                    // heuristic only with a signal of another kind of
+                    // evidence in the actor's scope; a cause without one
+                    // (the sustained knob, a future path) holds the
+                    // NEUTRALIZE: nothing killed or quarantined, and no
+                    // ISOLATE for it — the offenders were spared by choice,
+                    // not found uncontainable. Signed, as every stage.
+                    if let Some(cause) = named.cause.as_deref().filter(|c| c.single_heuristic_arm())
+                    {
+                        let why = format!(
+                            "NEUTRALIZE held ({reason}): COMBAT rests on one heuristic arm — {} — \
+                             with no signal of another kind of evidence vouching for it; the \
+                             offenders are not killed, quarantined or isolated",
+                            cause.summary()
+                        );
+                        warn!(
+                            target: "combat.ladder",
+                            offenders = ?named.offenders,
+                            cause = %cause.summary(),
+                            "COMBAT: NEUTRALIZE held — single heuristic arm, no kill"
+                        );
+                        self.record(named.transition(Some(from), CombatStage::Neutralize, why));
+                        return;
+                    }
                     // Pull host-critical processes out of the kill set: the
                     // ladder never SIGKILLs init / the agent / its watchdog
                     // / sshd. A spared offender is logged here and, because
