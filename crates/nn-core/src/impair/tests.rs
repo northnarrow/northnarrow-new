@@ -400,6 +400,18 @@ fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
         5 * S,
         0,
     );
+    // a plugin whose own parent cannot be placed (podman's cleanup, run by a
+    // conmon that double-forked: lab 04/11, the lot's first run) — its
+    // parent is all that is asked
+    l.ingest_exec(
+        360,
+        9999,
+        "/usr/lib/cni/portmap",
+        &["portmap".into()],
+        5 * S,
+        5 * S,
+        0,
+    );
     // a packaged program below the plugins' directory, not in it
     l.ingest_exec(
         350,
@@ -463,6 +475,10 @@ fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
     assert!(
         run(4006, 312, &cni).is_none(),
         "the plugin of /usr/libexec/cni"
+    );
+    assert!(
+        run(4007, 360, &cni).is_none(),
+        "a plugin whose own parent is unknown"
     );
     // the same chain by anyone else: a switch-off
     assert!(run(4011, 200, &cni).is_some(), "CNI chain by a shell");

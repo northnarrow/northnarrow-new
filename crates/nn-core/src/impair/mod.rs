@@ -627,13 +627,29 @@ impl<H: DecisionHost> DefenseDetector<H> {
     /// bundled tools) or a host with no package database vouches for
     /// nothing.
     fn flushed_by_its_runtime(&self, pid: u32, as_of: AsOf) -> bool {
-        let Some(hops) = self.lineage.lineage_identities(pid, as_of) else {
-            return false;
-        };
-        let Some((_, parent)) = hops.get(1) else {
-            return false;
-        };
-        is_runtime_program(&parent.exe) && self.owners.owned(&parent.exe) == Some(true)
+        let parent = self.lineage.parent_identity(pid, as_of);
+        let runtime = parent.as_ref().is_some_and(|p| is_runtime_program(&p.exe));
+        let packaged = parent
+            .as_ref()
+            .filter(|_| runtime)
+            .and_then(|p| self.owners.owned(&p.exe));
+        let vouched = runtime && packaged == Some(true);
+        if !vouched {
+            // Recorded, not silent: why a runtime's chain flush is a
+            // switch-off (the lab reads it).
+            tracing::info!(
+                pid,
+                parent = %parent.as_ref().map_or_else(
+                    || "unknown".to_string(),
+                    |p| p.exe.to_string_lossy().into_owned()
+                ),
+                runtime_program = runtime,
+                packaged = ?packaged,
+                "NN-L-EVA-002: a container runtime's chain flushed by a process its runtime \
+                 does not vouch for — still the firewall switched off"
+            );
+        }
+        vouched
     }
 
     /// Wire the trusted-installer window (`main.rs`, once): inside a valid
