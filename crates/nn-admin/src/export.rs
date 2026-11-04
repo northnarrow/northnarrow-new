@@ -1014,7 +1014,18 @@ mod tests {
                 .replace("\"action\":7", "\"action\":8"),
         );
         type Bend = Box<dyn Fn(&mut serde_json::Value)>;
-        let bent: [(&str, Bend); 8] = [
+        let other_run = sealed(
+            &k,
+            "actions",
+            "data",
+            &"0".repeat(64),
+            &rows[0]
+                .split(",\"entry_hash\"")
+                .next()
+                .unwrap()
+                .replace("\"run\":\"r1\"", "\"run\":\"r2\""),
+        );
+        let bent: [(&str, Bend); 9] = [
             (
                 "does not verify",
                 Box::new(|v| {
@@ -1029,6 +1040,12 @@ mod tests {
                 "not its action's intent",
                 Box::new(move |v| {
                     v["unmapped"]["northnarrow"]["intent_raw"] = other.clone().into()
+                }),
+            ),
+            (
+                "not its action's intent",
+                Box::new(move |v| {
+                    v["unmapped"]["northnarrow"]["intent_raw"] = other_run.clone().into()
                 }),
             ),
             (
