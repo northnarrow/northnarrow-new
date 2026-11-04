@@ -931,7 +931,7 @@ lab_purge_pins() {
 agent_exe=$(systemctl show -p ExecStart --value northnarrow-agent 2>/dev/null | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)
 agent_exe=${agent_exe:-/usr/local/bin/northnarrow-agent}
 nn_admin=$(dirname "$agent_exe")/nn-admin
-if sudo test -d /sys/fs/bpf/northnarrow; then
+if sudo test -d /sys/fs/bpf/northnarrow || sudo sh -c 'ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* >/dev/null 2>&1'; then
     # The window can only be opened through a running agent. After an e2e
     # run the fixtures' pins are still there (protected) and the installed
     # agent is stopped: start it — as a protected pid it purges the stale
@@ -972,6 +972,12 @@ if sudo test -d /sys/fs/bpf/northnarrow; then
     sudo bash -c 'for d in /proc/[0-9]*; do e=$(readlink "$d/exe" 2>/dev/null) || continue; case "$e" in */northnarrow-agent-e2etest-*|*/northnarrow-watchdog-e2etest-*) kill -9 "${d#/proc/}" 2>/dev/null ;; esac; done'
     sudo rm -rf /sys/fs/bpf/northnarrow 2>/dev/null
     sudo test -d /sys/fs/bpf/northnarrow && echo PINS_PROTECTED
+    # Lot 277 (the re-review of #494, R2): the tracker's pins, beside the root.
+    for d in $(sudo sh -c 'ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* 2>/dev/null'); do
+        sudo test -d "$d" || continue
+        sudo rm -rf "$d" 2>/dev/null
+        sudo test -d "$d" && echo PINS_PROTECTED
+    done
     # tamper-check leftovers (protected while an agent ran; the window is open now)
     sudo rm -f /etc/northnarrow/zz-tamper-*.local 2>/dev/null
     sudo rm -rf /run/systemd/system.control/northnarrow-agent.service.d 2>/dev/null

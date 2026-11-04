@@ -30,10 +30,21 @@
 //!
 //! A mark the kernel cannot take (an allocation failed) is never a silent
 //! loss and never a host-wide one (the review of #494, D2): the thread
-//! group is set in the preallocated bitmap `CGROUP_JOIN_LOST`
-//! ([`lost_slot`]), passed on at a fork like a mark and cleared with the
-//! group's last thread — that process tree, and only it, is "not known",
-//! and refused an exemption by cgroup or unit.
+//! group's byte is set in the preallocated `CGROUP_JOIN_LOST`
+//! ([`lost_slot`]), passed on at a fork like a mark and cleared at its
+//! tgid's next fork — that process tree, and only it, is "not known", and
+//! refused an exemption by cgroup or unit. One byte a tgid, written with a
+//! plain store of 1 or 0 (the re-review of #494, R1: a bit set by a test
+//! and an add could be added twice by two CPUs, which left the group's bit
+//! clear and carried into its neighbour's).
+//!
+//! The tracker's maps and links are pinned in a directory of their own,
+//! next to the agent's pin root and not in it ([`pin_dir`]): an upgrade's
+//! purge of the pin root leaves the marks and the programs (the re-review
+//! of #494, R2). Its name carries the maps' layout — [`PIN_SCHEMA`] and the
+//! marks' entries — so a start whose layout differs builds new maps in a
+//! new directory and removes the old one, a signed degradation ("marks
+//! reset"), never a silent one.
 
 /// The marks the object declares (the agent sizes the map at its load to
 /// the host's `kernel.pid_max` and `kernel.threads-max`, the lower:
@@ -44,8 +55,43 @@ pub const JOINED_ENTRIES: u32 = 32768;
 /// `PID_MAX_LIMIT` on 64-bit (include/linux/threads.h): no tgid reaches it.
 pub const PID_LIMIT: u32 = 4 * 1024 * 1024;
 
-/// The bitmap of "not known" thread groups: one bit per possible tgid.
-pub const LOST_WORDS: u32 = PID_LIMIT / 64;
+/// The bytes of one entry of `CGROUP_JOIN_LOST`.
+pub const LOST_BYTES: usize = 64;
+
+/// The entries of `CGROUP_JOIN_LOST`: one byte per possible tgid (4 MiB).
+pub const LOST_SLOTS: u32 = PID_LIMIT / LOST_BYTES as u32;
+
+/// The layout of the tracker's pinned maps (key, value and kind of
+/// `CGROUP_JOINED`, `CGROUP_JOIN_LOST`, `CGROUP_JOIN_STATS`): raised with
+/// any change to one of them, so that a start never reuses maps of another
+/// layout.
+pub const PIN_SCHEMA: u32 = 1;
+
+/// The name's part before the schema of the tracker's pin directory:
+/// `<pin root><PIN_DIR_INFIX><schema>-<entries>`.
+pub const PIN_DIR_INFIX: &str = "-cgroup-join-v";
+
+/// The tracker's pin directory for pin root `root` and marks of `entries`:
+/// `/sys/fs/bpf/northnarrow-cgroup-join-v1-262144`. A sibling of the root,
+/// so a purge of the root leaves it.
+#[cfg(feature = "std")]
+pub fn pin_dir(root: &str, entries: u32) -> String {
+    format!("{root}{PIN_DIR_INFIX}{PIN_SCHEMA}-{entries}")
+}
+
+/// `name` (a file name in the root's parent) is a tracker pin directory
+/// of pin root `root_name`, whatever its layout.
+pub fn is_pin_dir_of(root_name: &str, name: &str) -> bool {
+    name.strip_prefix(root_name)
+        .and_then(|rest| rest.strip_prefix(PIN_DIR_INFIX))
+        .is_some_and(|rest| {
+            let mut it = rest.splitn(2, '-');
+            let num = |p: Option<&str>| {
+                p.is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            };
+            num(it.next()) && num(it.next())
+        })
+}
 
 /// Lot 277 (the review of #494, D2): the entries the agent gives the marks
 /// at its load — the host's `pid_max` and `threads-max`, the lower (a fork
@@ -62,13 +108,16 @@ pub fn joined_entries(pid_max: Option<u64>, threads_max: Option<u64>) -> u32 {
     n.clamp(u64::from(JOINED_ENTRIES), u64::from(PID_LIMIT)) as u32
 }
 
-/// The word and the bit of `tgid` in the bitmap, `None` past it (no tgid
-/// is).
-pub const fn lost_slot(tgid: u32) -> Option<(u32, u64)> {
+/// The entry and the byte of `tgid` in `CGROUP_JOIN_LOST`, `None` past it
+/// (no tgid is).
+pub const fn lost_slot(tgid: u32) -> Option<(u32, usize)> {
     if tgid >= PID_LIMIT {
         return None;
     }
-    Some((tgid >> 6, 1u64 << (tgid & 63)))
+    Some((
+        tgid / LOST_BYTES as u32,
+        (tgid % LOST_BYTES as u32) as usize,
+    ))
 }
 
 /// Lot 277 (the review of #494, B1): a completed move changed nothing — the
@@ -357,10 +406,45 @@ mod tests {
         assert_eq!(joined_entries(Some(1_000), Some(500)), JOINED_ENTRIES);
         assert_eq!(joined_entries(None, None), PID_LIMIT);
         assert_eq!(joined_entries(Some(u64::MAX), None), PID_LIMIT);
-        assert_eq!(lost_slot(0), Some((0, 1)));
-        assert_eq!(lost_slot(65), Some((1, 2)));
-        assert_eq!(lost_slot(PID_LIMIT - 1), Some((LOST_WORDS - 1, 1 << 63)));
+        assert_eq!(lost_slot(0), Some((0, 0)));
+        assert_eq!(lost_slot(63), Some((0, 63)));
+        assert_eq!(lost_slot(65), Some((1, 1)));
+        assert_eq!(lost_slot(PID_LIMIT - 1), Some((LOST_SLOTS - 1, 63)));
         assert_eq!(lost_slot(PID_LIMIT), None);
+        assert_eq!(LOST_SLOTS as usize * LOST_BYTES, PID_LIMIT as usize);
+        // every tgid its own byte
+        let mut seen = std::collections::HashSet::new();
+        for t in (0..PID_LIMIT).step_by(4093).chain([1, 64, 4095, 4096]) {
+            assert!(seen.insert(lost_slot(t).unwrap()), "{t}");
+        }
+    }
+
+    /// The re-review of #494, R2: the tracker's pins beside the pin root,
+    /// named by their layout; an older layout's directory is the root's.
+    #[test]
+    fn the_tracker_pins_are_named_by_their_layout_beside_the_root() {
+        assert_eq!(
+            pin_dir("/sys/fs/bpf/northnarrow", 262_144),
+            format!("/sys/fs/bpf/northnarrow-cgroup-join-v{PIN_SCHEMA}-262144")
+        );
+        assert!(!pin_dir("/sys/fs/bpf/northnarrow", 64).starts_with("/sys/fs/bpf/northnarrow/"));
+        for yes in [
+            "northnarrow-cgroup-join-v1-64",
+            "northnarrow-cgroup-join-v0-4194304",
+        ] {
+            assert!(is_pin_dir_of("northnarrow", yes), "{yes}");
+        }
+        for no in [
+            "northnarrow",
+            "northnarrow-cgroup-join-v1",
+            "northnarrow-cgroup-join-v1-",
+            "northnarrow-cgroup-join-vx-64",
+            "northnarrow-cgroup-join-v1-64x",
+            "other-cgroup-join-v1-64",
+            "northnarrowx-cgroup-join-v1-64",
+        ] {
+            assert!(!is_pin_dir_of("northnarrow", no), "{no}");
+        }
     }
 
     #[test]

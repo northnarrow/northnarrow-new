@@ -37,8 +37,6 @@
 //! The agent's family (the agent, the watchdog) moves processes into its
 //! own containment cgroups, which no exemption may name: not marked.
 
-use core::intrinsics::{atomic_xadd, AtomicOrdering};
-
 use aya_ebpf::{
     helpers::{bpf_get_current_pid_tgid, bpf_get_current_task, bpf_probe_read_kernel, generated},
     macros::{btf_tracepoint, fentry, fexit, map},
@@ -50,7 +48,7 @@ use northnarrow_common::btf_offsets::CGROUP_MOVE_RET_ARG;
 use northnarrow_common::cgroup_join::{
     fnv_step, lost_slot, noop, pack, path_read, placement, Move, PathRead, CLONE_INTO_CGROUP,
     EXEMPT_NAMES_ENTRIES, FNV_OFFSET, HOW_BORN_INTO, HOW_INHERITED, HOW_MOVED, JOINED_ENTRIES,
-    LOST_WORDS, NAME_CGROUP, NAME_UNIT, PATH_READ, STAT_INHERITED, STAT_INTO_EXEMPT, STAT_LOST,
+    LOST_BYTES, LOST_SLOTS, NAME_CGROUP, NAME_UNIT, PATH_READ, STAT_INHERITED, STAT_INTO_EXEMPT, STAT_LOST,
     STAT_ROOTS, STAT_SLOTS,
 };
 use northnarrow_common::wire::{InodeKey, FS_OP_CGROUP_JOIN};
@@ -65,26 +63,32 @@ use crate::btf_offsets::{
 const BPF_F_NO_PREALLOC: u32 = 1;
 
 /// The marked thread groups: tgid → `[its leader's start time, pack(how,
-/// by whom)]`. Pinned with the programs' links: the marks outlive an agent
-/// restart, and are kept while no agent runs. Sized by the agent at its
+/// by whom)]`. Pinned with the programs' links in the tracker's own
+/// directory (the agent names it at the load: `common::cgroup_join::pin_dir`,
+/// the re-review of #494, R2): the marks outlive an agent restart and an
+/// upgrade, and are kept while no agent runs. Sized by the agent at its
 /// load to the host's `pid_max` / `threads-max` (the review of #494, D2),
 /// an entry allocated per mark; a mark it cannot take (an allocation that
-/// failed) puts the group in [`CGROUP_JOIN_LOST`].
+/// failed, the map full) puts the group in [`CGROUP_JOIN_LOST`].
 #[map]
 pub static CGROUP_JOINED: HashMap<u32, [u64; 2]> =
-    HashMap::pinned(JOINED_ENTRIES, BPF_F_NO_PREALLOC);
+    HashMap::with_max_entries(JOINED_ENTRIES, BPF_F_NO_PREALLOC);
 
 /// The review of #494, D2: the thread groups whose mark could not be taken
-/// — one bit per possible tgid, preallocated (512 KiB), so setting one
-/// never fails. Passed on at a fork like a mark, cleared with the group's
-/// last thread: that tree, and only it, is "not known" to the agent.
+/// — one byte per possible tgid, preallocated (4 MiB), so setting one never
+/// fails. Passed on at a fork like a mark, cleared at the tgid's next fork:
+/// that tree, and only it, is "not known" to the agent. The re-review of
+/// #494, R1: a byte written with a plain store, 1 or 0 — two CPUs setting
+/// it at once both leave it set, and no write touches another tgid's byte
+/// (a bit set with a test and an atomic add was added twice by two CPUs:
+/// the bit cleared, the carry into the next tgid's).
 #[map]
-pub static CGROUP_JOIN_LOST: Array<u64> = Array::pinned(LOST_WORDS, 0);
+pub static CGROUP_JOIN_LOST: Array<[u8; LOST_BYTES]> = Array::with_max_entries(LOST_SLOTS, 0);
 
 /// The tracker's counters ([`northnarrow_common::cgroup_join`]'s `STAT_*`).
 /// Pinned with the marks.
 #[map]
-pub static CGROUP_JOIN_STATS: Array<u64> = Array::pinned(STAT_SLOTS, 0);
+pub static CGROUP_JOIN_STATS: Array<u64> = Array::with_max_entries(STAT_SLOTS, 0);
 
 /// The names the per-rule policy's exemptions by cgroup or unit give
 /// (FNV-1a of a cgroup path, or of a unit's name) → `NAME_CGROUP` /
@@ -154,63 +158,44 @@ fn family(tgid: u32) -> bool {
     crate::task_kill::is_exempt_pid(tgid)
 }
 
-/// The group's word in [`CGROUP_JOIN_LOST`] and its bit.
+/// The group's byte in [`CGROUP_JOIN_LOST`].
 #[inline(always)]
-fn lost_word(tgid: u32) -> Option<(*mut u64, u64)> {
-    let (word, bit) = lost_slot(tgid)?;
-    Some((CGROUP_JOIN_LOST.get_ptr_mut(word)?, bit))
+fn lost_byte(tgid: u32) -> Option<*mut u8> {
+    let (slot, byte) = lost_slot(tgid)?;
+    let entry = CGROUP_JOIN_LOST.get_ptr_mut(slot)?;
+    // SAFETY: `byte` < LOST_BYTES, the entry's length.
+    Some(unsafe { (entry as *mut u8).add(byte & (LOST_BYTES - 1)) })
 }
 
-/// `*w & bit`, read once (an aligned 8-byte load is single-copy atomic;
-/// the BPF backend selects no atomic load on the default CPU).
-#[inline(always)]
-unsafe fn has(w: *mut u64, bit: u64) -> bool {
-    core::ptr::read_volatile(w) & bit != 0
-}
-
-/// `*w += v`, atomically (BPF_XADD on every kernel and CPU version; its
-/// result unused).
-#[inline(always)]
-unsafe fn xadd(w: *mut u64, v: u64) {
-    let _ = atomic_xadd::<u64, u64, { AtomicOrdering::Relaxed }>(w, v);
-}
-
-/// The group is "not known": its mark could not be taken. Counted; its bit
-/// set. One event sets or clears a group's bit at a time — the fork that
-/// makes its tgid (`cgroup_post_fork`, then `sched_process_fork`, on the
-/// forking thread, no move between them), then its moves under
-/// `cgroup_mutex` — so the test before the add holds; the add is atomic
-/// for the other groups' bits of the word.
+/// The group is "not known": its mark could not be taken. Counted; its
+/// byte set to 1 — a store, not a read-modify-write: any number of CPUs
+/// setting it leave it set (the re-review of #494, R1: a fork's
+/// `sched_process_fork` comes after `cgroup_post_fork` lets go of
+/// `cgroup_threadgroup_rwsem`, so a move of the new child can run beside
+/// it on another CPU).
 #[inline(always)]
 fn lose(tgid: u32) {
     count(STAT_LOST);
-    if let Some((w, bit)) = lost_word(tgid) {
-        // SAFETY: a word of a preallocated array map.
-        unsafe {
-            if !has(w, bit) {
-                xadd(w, bit);
-            }
-        }
+    if let Some(b) = lost_byte(tgid) {
+        // SAFETY: a byte of a preallocated array map.
+        unsafe { core::ptr::write_volatile(b, 1) };
     }
 }
 
 #[inline(always)]
 fn is_lost(tgid: u32) -> bool {
-    // SAFETY: a word of a preallocated array map.
-    lost_word(tgid).is_some_and(|(w, bit)| unsafe { has(w, bit) })
+    // SAFETY: a byte of a preallocated array map.
+    lost_byte(tgid).is_some_and(|b| unsafe { core::ptr::read_volatile(b) } != 0)
 }
 
-/// The group's bit cleared: its tgid is a new thread group's
-/// (`cgroup_join_born`), the only clear — exactly once per fork.
+/// The group's byte cleared: its tgid is a new thread group's
+/// (`cgroup_join_born`), before the group runs and before any move can
+/// reach it; the only clear.
 #[inline(always)]
 fn found(tgid: u32) {
-    if let Some((w, bit)) = lost_word(tgid) {
-        // SAFETY: a word of a preallocated array map.
-        unsafe {
-            if has(w, bit) {
-                xadd(w, bit.wrapping_neg());
-            }
-        }
+    if let Some(b) = lost_byte(tgid) {
+        // SAFETY: a byte of a preallocated array map.
+        unsafe { core::ptr::write_volatile(b, 0) };
     }
 }
 
@@ -278,7 +263,14 @@ unsafe fn try_mark(ctx: &BtfTracePointContext) {
         return;
     }
     let Some(moved) = tgid_of(task) else {
-        count(STAT_LOST);
+        // The re-review of #494, N-b: a tgid unread is known only for the
+        // writing thread itself, which is then not known; another task's
+        // is counted (a read of a live task's own field does not fail).
+        if task == bpf_get_current_task() {
+            lose(writer);
+        } else {
+            count(STAT_LOST);
+        }
         return;
     };
     let Some(start) = leader_start(task) else {
@@ -533,10 +525,9 @@ unsafe fn try_exit(ctx: &BtfTracePointContext) {
         return;
     }
     // Two threads exiting together may both read 0: a second remove finds
-    // nothing. The group's bit in `CGROUP_JOIN_LOST` stays — a dead tgid's,
-    // read by no one — until the pid's next thread group is forked
-    // (`cgroup_join_born`): a clear here could run twice and take the bit
-    // from the word twice.
+    // nothing. The group's byte in `CGROUP_JOIN_LOST` stays — a dead
+    // tgid's, read by no one — until the pid's next thread group is forked
+    // (`cgroup_join_born`), which clears it before anything can reach it.
     if rd_u32(signal + off!(SIGNAL_STRUCT_LIVE_OFFSET) as u64) == Some(0) {
         let _ = CGROUP_JOINED.remove(&tgid);
     }

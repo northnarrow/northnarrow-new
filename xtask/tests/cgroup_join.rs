@@ -57,16 +57,39 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     // marks that outlive a restart, an entry allocated per mark (the agent
     // sizes the map to the host: the review of #494, D2); the bitmap of the
     // groups not known, preallocated; the counters with them
+    // the tracker's maps are pinned where the agent says (its own
+    // directory beside the pin root, the re-review of #494, R2), not by
+    // name into the pin root, which an upgrade purges
     assert!(j.contains(
-        "pub static CGROUP_JOINED: HashMap<u32, [u64; 2]> =\n    HashMap::pinned(JOINED_ENTRIES, BPF_F_NO_PREALLOC);"
+        "pub static CGROUP_JOINED: HashMap<u32, [u64; 2]> =\n    HashMap::with_max_entries(JOINED_ENTRIES, BPF_F_NO_PREALLOC);"
     ));
     assert!(j.contains("const BPF_F_NO_PREALLOC: u32 = 1;"));
-    assert!(j.contains("pub static CGROUP_JOIN_LOST: Array<u64> = Array::pinned(LOST_WORDS, 0);"));
-    assert!(j.contains("pub static CGROUP_JOIN_STATS: Array<u64> = Array::pinned(STAT_SLOTS, 0);"));
+    assert!(j.contains(
+        "pub static CGROUP_JOIN_LOST: Array<[u8; LOST_BYTES]> = Array::with_max_entries(LOST_SLOTS, 0);"
+    ));
+    assert!(j.contains(
+        "pub static CGROUP_JOIN_STATS: Array<u64> = Array::with_max_entries(STAT_SLOTS, 0);"
+    ));
+    assert!(
+        !j.contains("::pinned("),
+        "no map of the tracker pinned into the pin root"
+    );
     assert!(!j.contains("LruHashMap"));
-    // a mark refused puts the group in the bitmap (that group not known,
-    // never the host: the review of #494, D2), counted; set and cleared by
-    // an atomic add, only when the bit is not already as wanted
+    // the re-review of #494, R1: no read-modify-write of the "not known"
+    // state — a byte a tgid, a plain store of 1 or 0
+    assert!(!j.contains("atomic_xadd") && !j.contains("xadd("));
+    assert!(!code("agent-ebpf/src/main.rs").contains("core_intrinsics"));
+    in_order(
+        body(&j, "lost_byte"),
+        &[
+            "let (slot, byte) = lost_slot(tgid)?;",
+            "CGROUP_JOIN_LOST.get_ptr_mut(slot)?",
+            "(entry as *mut u8).add(byte & (LOST_BYTES - 1))",
+        ],
+    )
+    .unwrap();
+    // a mark refused puts the group's byte to 1 (that group not known,
+    // never the host: the review of #494, D2), counted
     in_order(
         body(&j, "mark"),
         &[
@@ -79,16 +102,14 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
         body(&j, "lose"),
         &[
             "count(STAT_LOST);",
-            "if !has(w, bit) {\n                xadd(w, bit);",
+            "if let Some(b) = lost_byte(tgid) {",
+            "unsafe { core::ptr::write_volatile(b, 1) };",
         ],
     )
     .unwrap();
-    in_order(
-        body(&j, "found"),
-        &["if has(w, bit) {\n                xadd(w, bit.wrapping_neg());"],
-    )
-    .unwrap();
-    assert!(body(&j, "xadd").contains("atomic_xadd::<u64, u64, { AtomicOrdering::Relaxed }>(w, v)"));
+    assert!(body(&j, "found").contains("unsafe { core::ptr::write_volatile(b, 0) };"));
+    assert!(body(&j, "is_lost")
+        .contains("lost_byte(tgid).is_some_and(|b| unsafe { core::ptr::read_volatile(b) } != 0)"));
     // the source of a self-move, cleared for every write
     in_order(
         body(&j, "try_src"),
@@ -110,7 +131,10 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
         &[
             "let task: u64 = ctx.arg(2);",
             "if family(writer) {\n        return;\n    }",
-            "let Some(moved) = tgid_of(task) else {\n        count(STAT_LOST);",
+            // the re-review of #494, N-b: the writer's own tgid unread is
+            // not known; another task's is counted
+            "let Some(moved) = tgid_of(task) else {",
+            "if task == bpf_get_current_task() {\n            lose(writer);\n        } else {\n            count(STAT_LOST);\n        }",
             "let Some(start) = leader_start(task) else {\n        lose(moved);",
             // the review of #494, B1: the shared `noop`, the moved task the
             // writing thread itself (its behaviour: common's
@@ -257,22 +281,32 @@ fn the_agent_asks_the_marks_where_it_decides() {
         ],
     )
     .unwrap();
-    // one errand: the group's bit in the bitmap refuses its answer (that
-    // group's only, the review of #494, D2), a mark is "not started here",
-    // only a missing key is "started here"
+    // one errand: the group's byte refuses its answer (that group's only,
+    // the review of #494, D2), a mark is "not started here", only a missing
+    // key is "started here" — the same reads as the privileged test's
+    // (`lost_in`, `mark_in`: its behaviour is that test's)
     assert!(!body(&cj, "started").contains("STAT_LOST"));
     in_order(
         body(&cj, "started"),
         &[
             "crate::caps::errands::run(move || {",
-            "let (word, bit) = lost_slot(tgid)?;",
-            "if lost.lock().get(&word, 0).ok()? & bit != 0 {\n                return None;\n            }",
-            "Ok(_) => Some(false),",
-            "Err(aya::maps::MapError::KeyNotFound) => Some(true),",
-            "Err(_) => None,",
+            "if lost_in(&lost.lock(), tgid).ok()? {\n                return None;\n            }",
+            "mark_in(&joined.lock(), tgid).ok().map(|m| m.is_none())",
         ],
     )
     .unwrap();
+    in_order(
+        body(&cj, "mark_in"),
+        &[
+            "Ok([_, info]) => {",
+            "Err(aya::maps::MapError::KeyNotFound) => Ok(None),",
+            "Err(e) => Err(e.to_string()),",
+        ],
+    )
+    .unwrap();
+    assert!(body(&cj, "lost_in").contains("[byte] != 0)"));
+    assert!(body(&cj, "pinned_lost").contains("lost_in(&map, tgid)"));
+    assert!(body(&cj, "pinned_mark").contains("mark_in(&map, tgid)"));
     // all or none: a program that fails unloads those before it; with a
     // bpffs every link pinned (the review of #494, D6), the prior boot's
     // removed only once the new one is attached
@@ -281,11 +315,58 @@ fn the_agent_asks_the_marks_where_it_decides() {
         att,
         &[
             "if let Some(why) = unavailable() {",
-            "antitamper_bpf::purge_stale_pin(&link);",
-            "return Tracker::Absent(why);",
-            "if let Err(e) = load_attach(ebpf, btf, name, *kind, target) {\n                    for (n, k, _) in &PROGRAMS[..=i] {\n                        unload(ebpf, n, *k);\n                    }",
+            "purge_legacy_pins(root);",
+            "purge_pin_dir(&d);",
+            "return (Tracker::Absent(why), None);",
+            // the re-review of #494, R2: the tracker's own directory, a
+            // refused one is no tracker
+            "(Some(_), Some(Err(why))) => {",
+            "return (Tracker::Absent(format!(\"the tracker's pin directory: {why}\")), None);",
             "if let Err(e) = load_only(ebpf, btf, name, *kind, target) {\n                    for (n, k, _) in &PROGRAMS[..=i] {\n                        unload(ebpf, n, *k);\n                    }",
-            "if let Err(e) = pin_fresh(ebpf, root, name, *kind) {",
+            "if let Err(e) = pin_fresh(ebpf, dir, name, *kind) {",
+            // the old layout's directory goes after the new programs run,
+            // and says so
+            "let old = other_pin_dirs(root, Some(dir));",
+            "purge_pin_dir(d);",
+            "reset = Some(why);",
+            "if let Err(e) = load_attach(ebpf, btf, name, *kind, target) {\n                    for (n, k, _) in &PROGRAMS[..=i] {\n                        unload(ebpf, n, *k);\n                    }",
+        ],
+    )
+    .unwrap();
+    // the swap's order: mark before src (the re-review of #494, N-f)
+    let progs = &cj[cj.find("pub const PROGRAMS").unwrap()..];
+    assert!(
+        progs.find("\"cgroup_join_mark\"").unwrap() < progs.find("\"cgroup_join_src\"").unwrap()
+    );
+    // the loader pins the three maps in the tracker's directory, made
+    // before the load, never through a link
+    in_order(
+        body(&cj, "prepare_pins"),
+        &[
+            "common::cgroup_join::pin_dir(",
+            "antitamper_bpf::pin_root_refusal_at(&dir)",
+            "DirBuilder::new().mode(0o700).create(&dir)",
+            "for name in PINNED_MAPS {\n            loader.map_pin_path(name, dir.join(name));",
+        ],
+    )
+    .unwrap();
+    let mx = code("crates/nn-linux/src/sensors/multiplexer.rs");
+    in_order(
+        &mx,
+        &[
+            "let joined_entries = crate::cgroup_join::joined_entries_now();",
+            "loader.map_max_entries(crate::cgroup_join::JOINED_MAP, joined_entries);",
+            "crate::cgroup_join::prepare_pins(&mut loader, pin_root, joined_entries);",
+            ".load(EBPF_BYTES)",
+        ],
+    )
+    .unwrap();
+    // the test knob exists in debug-trigger builds only
+    in_order(
+        body(&cj, "joined_entries_now"),
+        &[
+            "#[cfg(feature = \"debug-trigger\")]",
+            "std::env::var(\"NN_DEBUG_CGROUP_JOINED_ENTRIES\")",
         ],
     )
     .unwrap();
@@ -303,9 +384,13 @@ fn the_agent_asks_the_marks_where_it_decides() {
     in_order(
         &at,
         &[
-            "let tracker = crate::cgroup_join::attach(ebpf, &btf, pin_root);",
+            "let (tracker, reset) = crate::cgroup_join::attach(ebpf, &btf, pin_root);",
+            "if let Some(why) = reset {\n        report.degraded.push(format!(\"cgroup exemptions: {why}\"));",
             "crate::cgroup_join::Tracker::Absent(why) => report.degraded.push(format!(",
             "crate::cgroup_join::install(tracker);",
+            // the tracker's pins protected like the root's
+            "if let Some(dir) = crate::cgroup_join::pin_dir_now() {\n        if let Err(e) = filesystem::register_bpffs_pins(ebpf, dir) {",
+            "filesystem::prune_stale_inodes(ebpf)",
         ],
     )
     .unwrap();

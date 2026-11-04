@@ -24,11 +24,15 @@
 //!   move into a cgroup an exemption names is signed (`cgroup_join`,
 //!   NN-L-AT-001, not refused).
 //!
-//! The marks outlive an agent restart (the map is pinned); the programs do
-//! not run while no agent runs, and the start removes the marks of the
-//! processes gone meanwhile ([`Marks::sweep`]). A move made while no agent
-//! ran is not seen: the residual is the trust model's
-//! (`docs/design/ANTITAMPER_TRUST_MODEL.md`).
+//! The maps and the programs' links are pinned in the tracker's own
+//! directory beside the agent's pin root ([`prepare_pins`],
+//! `common::cgroup_join::pin_dir`): they outlive an agent restart and an
+//! upgrade's purge of the pin root (the re-review of #494, R2), and the
+//! programs go on marking while no agent runs. A start whose maps' layout
+//! differs from the directory it finds builds new ones and removes the old
+//! directory: a signed degradation, "marks reset" ([`attach`]). A move made
+//! before the first start since the host booted is not seen: the residual
+//! is the trust model's (`docs/design/ANTITAMPER_TRUST_MODEL.md`).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -36,9 +40,10 @@ use std::sync::{Arc, OnceLock};
 use aya::maps::{Array, HashMap, MapData};
 use aya::programs::links::FdLink;
 use aya::programs::{BtfTracePoint, FEntry, FExit};
-use aya::{Btf, Ebpf};
+use aya::{Btf, Ebpf, EbpfLoader};
 use common::cgroup_join::{
-    fnv, lost_slot, unpack, NAME_CGROUP, NAME_UNIT, STAT_INTO_EXEMPT, STAT_LOST, STAT_ROOTS,
+    fnv, is_pin_dir_of, lost_slot, unpack, LOST_BYTES, NAME_CGROUP, NAME_UNIT, STAT_INTO_EXEMPT,
+    STAT_LOST, STAT_ROOTS,
 };
 use nn_core::decision::rule_policy::{Exemption, RulePolicy};
 use parking_lot::Mutex;
@@ -46,12 +51,14 @@ use tracing::{info, warn};
 
 use crate::anti_tamper::btf_revalidate;
 
-/// The marks (pinned).
+/// The marks (pinned in the tracker's directory).
 pub const JOINED_MAP: &str = "CGROUP_JOINED";
-/// The "not known" bitmap (pinned).
+/// The "not known" thread groups, a byte each (pinned there).
 pub const LOST_MAP: &str = "CGROUP_JOIN_LOST";
-/// The counters (pinned).
+/// The counters (pinned there).
 pub const STATS_MAP: &str = "CGROUP_JOIN_STATS";
+/// The re-review of #494, R2: the maps pinned in the tracker's directory.
+pub const PINNED_MAPS: [&str; 3] = [JOINED_MAP, LOST_MAP, STATS_MAP];
 /// The exemptions' names the kernel matches a destination against.
 pub const NAMES_MAP: &str = "CGROUP_EXEMPT_NAMES";
 
@@ -64,14 +71,25 @@ pub enum Kind {
     TpBtf,
 }
 
-/// The tracker's programs: `(program, how, target)`.
+/// The tracker's programs: `(program, how, target)`, in the order a start
+/// swaps them for the prior boot's: `cgroup_join_mark` before
+/// `cgroup_join_src` (the re-review of #494, N-f) — the new `mark` reads the
+/// new, empty source slot until the new `src` writes it, and marks every
+/// move meanwhile (more, never less).
 pub const PROGRAMS: [(&str, Kind, &str); 5] = [
     ("cgroup_join_exit", Kind::TpBtf, "sched_process_exit"),
     ("cgroup_join_fork", Kind::TpBtf, "sched_process_fork"),
     ("cgroup_join_born", Kind::FEntry, "cgroup_post_fork"),
-    ("cgroup_join_src", Kind::FExit, "cgroup_procs_write_start"),
     ("cgroup_join_mark", Kind::TpBtf, "cgroup_attach_task"),
+    ("cgroup_join_src", Kind::FExit, "cgroup_procs_write_start"),
 ];
+
+/// The re-review of #494, R2: the program names the agent lists as kept
+/// across an upgrade in its own-programs file (`bpf_defense`): pinned
+/// outside the pin root, they outlive its purge.
+pub fn is_kept_program(name: &str) -> bool {
+    PROGRAMS.iter().any(|(n, _, _)| *n == name)
+}
 
 /// What a kernel without the tracker loses.
 pub const ABSENT_EFFECT: &str =
@@ -80,7 +98,7 @@ pub const ABSENT_EFFECT: &str =
      told from the service)";
 
 type Joined = HashMap<MapData, u32, [u64; 2]>;
-type Lost = Array<MapData, u64>;
+type Lost = Array<MapData, [u8; LOST_BYTES]>;
 type Stats = Array<MapData, u64>;
 type Names = HashMap<MapData, u64, u8>;
 
@@ -102,11 +120,26 @@ pub enum Tracker {
 
 static TRACKER: OnceLock<Tracker> = OnceLock::new();
 
+/// The tracker's pin directory this boot: `Ok` the directory the loader
+/// pinned the maps in, `Err` why there is none on a bpffs host (the tracker
+/// is then absent); unset without a bpffs ([`prepare_pins`]).
+static PIN_DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+
 /// The review of #494, D2: the entries the marks get at the object's load
 /// — the host's `pid_max` and `threads-max`, the lower
 /// (`common::cgroup_join::joined_entries`): no more thread groups can be
-/// alive. A map pinned by an earlier boot keeps its own size.
+/// alive. The re-review of #494 (its point 3): a `debug-trigger` build
+/// (the lab's privileged tests, never a release) takes
+/// `NN_DEBUG_CGROUP_JOINED_ENTRIES` instead, so that a test can fill the
+/// map.
 pub fn joined_entries_now() -> u32 {
+    #[cfg(feature = "debug-trigger")]
+    if let Some(n) = std::env::var("NN_DEBUG_CGROUP_JOINED_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        return n.clamp(1, common::cgroup_join::PID_LIMIT);
+    }
     let read = |p: &str| {
         std::fs::read_to_string(p)
             .ok()
@@ -116,6 +149,108 @@ pub fn joined_entries_now() -> u32 {
         read("/proc/sys/kernel/pid_max"),
         read("/proc/sys/kernel/threads-max"),
     )
+}
+
+/// The re-review of #494, R2: before the object's load, the tracker's pin
+/// directory for `pin_root` and marks of `entries`
+/// (`common::cgroup_join::pin_dir`: beside the root, named by the maps'
+/// layout) — created `0700`, never through a symbolic link — and the
+/// loader told to pin the tracker's maps there ([`PINNED_MAPS`]): a map
+/// pinned there by an earlier start of this boot is reused, else created.
+/// Without a bpffs (`pin_root` `None`) the maps are this process's.
+pub fn prepare_pins(loader: &mut EbpfLoader<'_>, pin_root: Option<&Path>, entries: u32) {
+    let Some(root) = pin_root else {
+        return;
+    };
+    let dir = PIN_DIR.get_or_init(|| {
+        let dir = PathBuf::from(common::cgroup_join::pin_dir(
+            &root.to_string_lossy(),
+            entries,
+        ));
+        if let Some(why) = antitamper_bpf::pin_root_refusal_at(&dir) {
+            return Err(why);
+        }
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("creating {}: {e}", dir.display())),
+        }
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.is_dir() => {
+                if m.permissions().mode() & 0o7777 != 0o700 {
+                    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+                }
+                Ok(dir)
+            }
+            Ok(_) => Err(format!("{} is not a directory", dir.display())),
+            Err(e) => Err(format!("{}: {e}", dir.display())),
+        }
+    });
+    if let Ok(dir) = dir {
+        for name in PINNED_MAPS {
+            loader.map_pin_path(name, dir.join(name));
+        }
+    }
+}
+
+/// The tracker's pin directory this boot, once [`prepare_pins`] made it.
+pub fn pin_dir_now() -> Option<&'static Path> {
+    PIN_DIR
+        .get()
+        .and_then(|r| r.as_ref().ok())
+        .map(PathBuf::as_path)
+}
+
+/// The tracker pin directories beside `pin_root` other than `keep`: those
+/// of another layout, an earlier version's.
+fn other_pin_dirs(pin_root: &Path, keep: Option<&Path>) -> Vec<PathBuf> {
+    let (Some(parent), Some(root_name)) = (pin_root.parent(), pin_root.file_name()) else {
+        return Vec::new();
+    };
+    let root_name = root_name.to_string_lossy();
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| is_pin_dir_of(&root_name, &e.file_name().to_string_lossy()))
+        .map(|e| e.path())
+        .filter(|p| Some(p.as_path()) != keep)
+        .collect();
+    out.sort();
+    out
+}
+
+/// Remove tracker pin directory `dir`: its links first (their programs
+/// detach), then the rest, then the directory. The agent is a protected
+/// pid by then; a pin it cannot remove is logged.
+fn purge_pin_dir(dir: &Path) {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|r| r.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    files.sort_by_key(|p| {
+        !p.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("link_"))
+    });
+    for f in &files {
+        antitamper_bpf::purge_stale_pin(f);
+    }
+    if let Err(e) = std::fs::remove_dir(dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(error = %e, dir = %dir.display(), "cgroup exemptions: an old tracker pin directory NOT removed");
+        }
+    }
+}
+
+/// The pins this module made in the pin root itself before the re-review of
+/// #494 (R2): an upgrade's purge took them.
+fn purge_legacy_pins(pin_root: &Path) {
+    for (name, _, _) in &PROGRAMS {
+        let (prog, link) = pin_paths(pin_root, name);
+        antitamper_bpf::purge_stale_pin(&link);
+        antitamper_bpf::purge_stale_pin(&prog);
+    }
 }
 
 /// The boot's tracker (a second call keeps the first).
@@ -236,57 +371,84 @@ fn unload(ebpf: &mut Ebpf, name: &str, kind: Kind) {
 /// Attach the tracker's programs, all or none (a mark that no fork passes
 /// on, or that no exit removes, is worse than none: the agent would trust
 /// what it does not see), and take its maps. The tracker's state for the
-/// boot, which the caller [`install`]s.
+/// boot, which the caller [`install`]s, and — the re-review of #494, R2 —
+/// why the marks of before this start are gone, if they are: a signed
+/// degradation for the caller.
 ///
-/// The review of #494, D6: with a bpffs (`pin_root`), each program's link
-/// is pinned as the anti-tamper hooks' are — the tracker keeps marking
-/// while no agent runs (a restart, an upgrade). The five programs are
-/// loaded first and only then attached and pinned one by one, each after
-/// its predecessor of the prior boot is still running: a load refused
-/// leaves the prior boot's pinned tracker as it was.
-pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Tracker {
+/// The review of #494, D6: with a bpffs, each program's link is pinned in
+/// the tracker's directory ([`prepare_pins`]) — the tracker keeps marking
+/// while no agent runs (a restart, an upgrade: the directory is not the pin
+/// root, which an upgrade purges). The five programs are loaded first and
+/// only then attached and pinned one by one, each after its predecessor of
+/// the prior boot is still running: a load refused leaves the prior boot's
+/// pinned tracker as it was. A tracker directory of another layout (another
+/// schema, another size) goes once the new programs run: its marks with it.
+pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, Option<String>) {
     if let Some(why) = unavailable() {
         warn!(reason = %why, effect = ABSENT_EFFECT, "cgroup exemptions: tracker not attached");
         // A prior boot's pinned tracker goes too: no program of an older
         // agent stays attached where this one would not attach.
         if let Some(root) = pin_root {
-            for (name, _, _) in &PROGRAMS {
-                let (prog, link) = pin_paths(root, name);
-                antitamper_bpf::purge_stale_pin(&link);
-                antitamper_bpf::purge_stale_pin(&prog);
+            purge_legacy_pins(root);
+            for d in other_pin_dirs(root, None) {
+                purge_pin_dir(&d);
             }
         }
-        return Tracker::Absent(why);
+        return (Tracker::Absent(why), None);
     }
-    match pin_root {
-        None => {
-            for (i, (name, kind, target)) in PROGRAMS.iter().enumerate() {
-                if let Err(e) = load_attach(ebpf, btf, name, *kind, target) {
-                    for (n, k, _) in &PROGRAMS[..=i] {
-                        unload(ebpf, n, *k);
-                    }
-                    warn!(error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker attach FAILED");
-                    return Tracker::Absent(e);
-                }
-            }
-            warn!("cgroup exemptions: tracker attached WITHOUT pin (no bpffs): not kept while no agent runs");
+    let mut reset = None;
+    match (pin_root, PIN_DIR.get()) {
+        (Some(_), Some(Err(why))) => {
+            warn!(reason = %why, effect = ABSENT_EFFECT, "cgroup exemptions: tracker pin directory refused");
+            return (
+                Tracker::Absent(format!("the tracker's pin directory: {why}")),
+                None,
+            );
         }
-        Some(root) => {
+        (Some(root), Some(Ok(dir))) => {
             for (i, (name, kind, target)) in PROGRAMS.iter().enumerate() {
                 if let Err(e) = load_only(ebpf, btf, name, *kind, target) {
                     for (n, k, _) in &PROGRAMS[..=i] {
                         unload(ebpf, n, *k);
                     }
                     warn!(error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker load FAILED");
-                    return Tracker::Absent(e);
+                    return (Tracker::Absent(e), None);
                 }
             }
             for (name, kind, _) in &PROGRAMS {
-                if let Err(e) = pin_fresh(ebpf, root, name, *kind) {
+                if let Err(e) = pin_fresh(ebpf, dir, name, *kind) {
                     warn!(program = name, error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker attach or pin FAILED");
-                    return Tracker::Absent(e);
+                    return (Tracker::Absent(e), None);
                 }
             }
+            purge_legacy_pins(root);
+            let old = other_pin_dirs(root, Some(dir));
+            if !old.is_empty() {
+                let names: Vec<String> = old.iter().map(|d| d.display().to_string()).collect();
+                for d in &old {
+                    purge_pin_dir(d);
+                }
+                let why = format!(
+                    "marks reset: the tracker's maps of another layout ({}) replaced by {} — the \
+                     marks and the \"not known\" groups of before this start are gone",
+                    names.join(", "),
+                    dir.display()
+                );
+                warn!(reason = %why, "cgroup exemptions: marks reset by an upgrade or a new size");
+                reset = Some(why);
+            }
+        }
+        _ => {
+            for (i, (name, kind, target)) in PROGRAMS.iter().enumerate() {
+                if let Err(e) = load_attach(ebpf, btf, name, *kind, target) {
+                    for (n, k, _) in &PROGRAMS[..=i] {
+                        unload(ebpf, n, *k);
+                    }
+                    warn!(error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker attach FAILED");
+                    return (Tracker::Absent(e), None);
+                }
+            }
+            warn!("cgroup exemptions: tracker attached WITHOUT pin (no bpffs): not kept while no agent runs");
         }
     }
     let take = |ebpf: &mut Ebpf, name: &str| {
@@ -309,18 +471,18 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Tracker {
         Ok(m) => {
             info!(
                 programs = PROGRAMS.len(),
-                pinned = pin_root.is_some(),
+                pinned = pin_dir_now().map(|d| d.display().to_string()),
                 "cgroup exemptions: the start-in-cgroup tracker is attached (moves into a cgroup \
                  and CLONE_INTO_CGROUP starts outside systemd are marked, with what they fork)"
             );
-            Tracker::Attached(m)
+            (Tracker::Attached(m), reset)
         }
         Err(e) => {
             for (n, k, _) in &PROGRAMS {
                 unload(ebpf, n, *k);
             }
             warn!(error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker maps unavailable");
-            Tracker::Absent(e)
+            (Tracker::Absent(e), reset)
         }
     }
 }
@@ -368,15 +530,10 @@ impl Marks {
     pub fn started(&self, tgid: u32) -> Option<bool> {
         let (joined, lost) = (Arc::clone(&self.joined), Arc::clone(&self.lost));
         crate::caps::errands::run(move || {
-            let (word, bit) = lost_slot(tgid)?;
-            if lost.lock().get(&word, 0).ok()? & bit != 0 {
+            if lost_in(&lost.lock(), tgid).ok()? {
                 return None;
             }
-            match joined.lock().get(&tgid, 0) {
-                Ok(_) => Some(false),
-                Err(aya::maps::MapError::KeyNotFound) => Some(true),
-                Err(_) => None,
-            }
+            mark_in(&joined.lock(), tgid).ok().map(|m| m.is_none())
         })
         .flatten()
     }
@@ -384,14 +541,7 @@ impl Marks {
     /// The mark of thread group `tgid`, if any (a tool's, a test's read:
     /// on the caller's thread).
     pub fn lookup(&self, tgid: u32) -> Result<Option<Mark>, String> {
-        match self.joined.lock().get(&tgid, 0) {
-            Ok([_, info]) => {
-                let (how, by) = unpack(info);
-                Ok(Some(Mark { how, by }))
-            }
-            Err(aya::maps::MapError::KeyNotFound) => Ok(None),
-            Err(e) => Err(e.to_string()),
-        }
+        mark_in(&self.joined.lock(), tgid)
     }
 
     /// Counter `slot` (`common::cgroup_join::STAT_*`), on the caller's
@@ -426,6 +576,44 @@ impl Marks {
             .into_iter()
             .filter(|k| map.remove(k).is_ok())
             .count()
+    }
+}
+
+/// The mark of `tgid` in `joined`: one read, for the agent's answer and a
+/// tool's alike.
+fn mark_in(joined: &Joined, tgid: u32) -> Result<Option<Mark>, String> {
+    match joined.get(&tgid, 0) {
+        Ok([_, info]) => {
+            let (how, by) = unpack(info);
+            Ok(Some(Mark { how, by }))
+        }
+        Err(aya::maps::MapError::KeyNotFound) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Whether `tgid` is "not known" in `lost` (its byte): one read, for the
+/// agent's answer and a tool's alike.
+fn lost_in(lost: &Lost, tgid: u32) -> Result<bool, String> {
+    let (slot, byte) = lost_slot(tgid).ok_or("no tgid that large")?;
+    Ok(lost.get(&slot, 0).map_err(|e| e.to_string())?[byte] != 0)
+}
+
+/// The tracker's pin directory beside pin root `root` (one after a start:
+/// the start removes the others) — a test's, a tool's.
+pub fn pinned_dir(root: &Path) -> Result<PathBuf, String> {
+    let mut dirs = other_pin_dirs(root, None);
+    match dirs.len() {
+        1 => Ok(dirs.remove(0)),
+        0 => Err(format!(
+            "no tracker pin directory beside {}",
+            root.display()
+        )),
+        _ => Err(format!(
+            "{} tracker pin directories beside {}: {dirs:?}",
+            dirs.len(),
+            root.display()
+        )),
     }
 }
 
@@ -475,25 +663,17 @@ fn open_pinned_ro(path: &Path) -> Result<MapData, String> {
 /// under bpffs `root` — a privileged test's, a tool's read (the agent's own
 /// goes through [`Marks`]).
 pub fn pinned_mark(root: &Path, tgid: u32) -> Result<Option<Mark>, String> {
-    let md = open_pinned_ro(&root.join(JOINED_MAP))?;
+    let md = open_pinned_ro(&pinned_dir(root)?.join(JOINED_MAP))?;
     let map = Joined::try_from(aya::maps::Map::HashMap(md)).map_err(|e| e.to_string())?;
-    match map.get(&tgid, 0) {
-        Ok([_, info]) => {
-            let (how, by) = unpack(info);
-            Ok(Some(Mark { how, by }))
-        }
-        Err(aya::maps::MapError::KeyNotFound) => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
+    mark_in(&map, tgid)
 }
 
 /// Lot 277 (the review of #494, D5): whether `tgid` is "not known" (its
-/// bit in the pinned bitmap under bpffs `root`).
+/// byte in the pinned `CGROUP_JOIN_LOST` beside bpffs `root`).
 pub fn pinned_lost(root: &Path, tgid: u32) -> Result<bool, String> {
-    let (word, bit) = lost_slot(tgid).ok_or("no tgid that large")?;
-    let md = open_pinned_ro(&root.join(LOST_MAP))?;
+    let md = open_pinned_ro(&pinned_dir(root)?.join(LOST_MAP))?;
     let map = Lost::try_from(aya::maps::Map::Array(md)).map_err(|e| e.to_string())?;
-    Ok(map.get(&word, 0).map_err(|e| e.to_string())? & bit != 0)
+    lost_in(&map, tgid)
 }
 
 /// The thread groups among `tgids` that `proc_root` holds no more.
@@ -608,6 +788,53 @@ pub fn describe() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The re-review of #494, R2: the tracker's directories beside the pin
+    /// root are found by name (another layout's, an older version's), the
+    /// current one kept; a purge takes the links first, then the rest and
+    /// the directory; a reader finds the one directory a start leaves.
+    #[test]
+    fn the_tracker_s_old_pin_directories_are_found_and_purged() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("northnarrow");
+        std::fs::create_dir(&root).unwrap();
+        let cur = PathBuf::from(common::cgroup_join::pin_dir(&root.to_string_lossy(), 64));
+        let old = t.path().join("northnarrow-cgroup-join-v0-32768");
+        let other = t.path().join("northnarrow-cgroup-join-v1-262144");
+        for d in [&cur, &old, &other, &t.path().join("northnarrow-other")] {
+            std::fs::create_dir(d).unwrap();
+        }
+        assert_eq!(
+            other_pin_dirs(&root, Some(&cur)),
+            vec![old.clone(), other.clone()]
+        );
+        assert_eq!(other_pin_dirs(&root, None).len(), 3);
+        assert!(pinned_dir(&root)
+            .unwrap_err()
+            .contains("3 tracker pin directories"));
+        for f in [
+            "link_cgroup_join_mark",
+            "prog_cgroup_join_mark",
+            "CGROUP_JOINED",
+        ] {
+            std::fs::write(old.join(f), "").unwrap();
+        }
+        purge_pin_dir(&old);
+        purge_pin_dir(&other);
+        assert!(!old.exists() && !other.exists());
+        assert_eq!(other_pin_dirs(&root, Some(&cur)), Vec::<PathBuf>::new());
+        assert_eq!(pinned_dir(&root).unwrap(), cur);
+        std::fs::remove_dir(&cur).unwrap();
+        assert!(pinned_dir(&root)
+            .unwrap_err()
+            .contains("no tracker pin directory"));
+        // the legacy pins in the root itself (before R2) go
+        let (prog, link) = pin_paths(&root, "cgroup_join_exit");
+        std::fs::write(&prog, "").unwrap();
+        std::fs::write(&link, "").unwrap();
+        purge_legacy_pins(&root);
+        assert!(!prog.exists() && !link.exists());
+    }
 
     /// The policy's cgroup paths and unit names, hashed as the kernel
     /// hashes a destination path (`match_destination`), with key 0 for

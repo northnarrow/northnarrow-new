@@ -555,7 +555,13 @@ fn attach_reporting(
     // exemptions by cgroup or unit hold for processes started in their
     // cgroup only). Not a deny hook: without it those exemptions are
     // refused, a signed degradation.
-    let tracker = crate::cgroup_join::attach(ebpf, &btf, pin_root);
+    let (tracker, reset) = crate::cgroup_join::attach(ebpf, &btf, pin_root);
+    // The re-review of #494, R2: marks of before this start dropped (the
+    // maps' layout changed: an upgrade's schema, another size) — never in
+    // silence.
+    if let Some(why) = reset {
+        report.degraded.push(format!("cgroup exemptions: {why}"));
+    }
     match &tracker {
         crate::cgroup_join::Tracker::Absent(why) => report.degraded.push(format!(
             "cgroup exemptions: {} ({why})",
@@ -623,6 +629,21 @@ fn attach_reporting(
                 "anti-tamper FS: bpffs pins NOT registered — the pin root stays removable by root"
             );
             deny.infra_failure("filesystem::register_bpffs_pins", format!("{e:#}"));
+        }
+    }
+    // The re-review of #494, R2: the tracker's pin directory (beside the
+    // root) and its pins alike — no new entry, no unlink or rename by a
+    // foreign caller outside the trusted-installer window.
+    if let Some(dir) = crate::cgroup_join::pin_dir_now() {
+        if let Err(e) = filesystem::register_bpffs_pins(ebpf, dir) {
+            warn!(
+                error = format!("{e:#}"),
+                "anti-tamper FS: the tracker's pins NOT registered — removable by root"
+            );
+            deny.infra_failure(
+                "filesystem::register_bpffs_pins (tracker)",
+                format!("{e:#}"),
+            );
         }
     }
     // Review 63: every inode this boot protects is registered now; the

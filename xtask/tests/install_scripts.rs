@@ -2753,3 +2753,96 @@ fn uninstall_removes_the_worker_and_scanner_accounts() {
     let (r, _) = accounts_run("accounts-one-left", &body, &["northnarrow-worker"], true);
     assert_eq!(r.calls, ["userdel northnarrow-worker"]);
 }
+
+/// The text of shell function `name` in `rel`: from `name() {` to the first
+/// line that is `}`.
+fn shell_fn(rel: &str, name: &str) -> String {
+    let text = read(rel);
+    let start = text
+        .find(&format!("\n{name}() {{"))
+        .unwrap_or_else(|| panic!("{rel}: no {name}()"))
+        + 1;
+    let end = text[start..]
+        .find("\n}\n")
+        .map(|i| start + i + 3)
+        .unwrap_or_else(|| panic!("{rel}: {name}() not closed"));
+    text[start..end].to_string()
+}
+
+/// Lot 277 (the re-review of #494, R2): the start-in-cgroup tracker's
+/// programs, pinned beside the pin root, outlive an upgrade on purpose —
+/// `install.sh --upgrade` does not wait for the ids the agent lists as
+/// `kept`, and `uninstall.sh` waits for every id and removes the tracker's
+/// pin directories with the root.
+#[test]
+fn an_upgrade_keeps_the_tracker_and_an_uninstall_removes_it() {
+    let dir = case_dir("tracker-kept");
+    let ids = dir.join("own-ids");
+    fs::write(
+        &ids,
+        "# northnarrow-agent pid 7: loaded BPF programs (id name [kept])\n\
+         12 task_kill\n40 cgroup_join_mark kept\n41 cgroup_join_src kept\n9 file_open\n",
+    )
+    .unwrap();
+    let run = |rel: &str, body: &str| {
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(format!("set -euo pipefail\n{body}"))
+            .env("OWN_IDS_FILE", &ids)
+            .env("BPFFS_ROOT", dir.join("pins"))
+            .output()
+            .expect("bash runs");
+        assert!(
+            out.status.success(),
+            "{rel}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let install = shell_fn("deploy/install.sh", "read_own_prog_ids");
+    assert_eq!(
+        run("install.sh", &format!("{install}\nread_own_prog_ids")),
+        "9 12",
+        "the upgrade waits for the pin root's programs only"
+    );
+    let uninstall = shell_fn("deploy/uninstall.sh", "read_own_prog_ids");
+    assert_eq!(
+        run("uninstall.sh", &format!("{uninstall}\nread_own_prog_ids")),
+        "9 12 40 41",
+        "the uninstall waits for every program"
+    );
+    // the uninstall's removal: the root and every tracker directory beside it
+    for d in [
+        "pins",
+        "pins-cgroup-join-v1-64",
+        "pins-cgroup-join-v2-262144",
+    ] {
+        fs::create_dir_all(dir.join(d)).unwrap();
+        fs::write(dir.join(d).join("link_x"), "").unwrap();
+    }
+    fs::create_dir_all(dir.join("pins-other")).unwrap();
+    let fns = ["tracker_pin_dirs", "pins_present", "remove_pins"]
+        .map(|f| shell_fn("deploy/uninstall.sh", f))
+        .join("\n");
+    assert_eq!(
+        run(
+            "uninstall.sh",
+            &format!("{fns}\npins_present && echo present\nremove_pins\npins_present || echo gone")
+        ),
+        "present\ngone"
+    );
+    assert!(
+        dir.join("pins-other").exists(),
+        "only the tracker's directories"
+    );
+    // install.sh's purge of the root leaves the tracker's directory
+    fs::create_dir_all(dir.join("pins/x")).unwrap();
+    fs::create_dir_all(dir.join("pins-cgroup-join-v1-64")).unwrap();
+    let purge = shell_fn("deploy/install.sh", "purge_pin_root");
+    run("install.sh", &format!("{purge}\npurge_pin_root"));
+    assert!(!dir.join("pins").exists());
+    assert!(
+        dir.join("pins-cgroup-join-v1-64").exists(),
+        "the upgrade keeps the tracker's pins"
+    );
+}
