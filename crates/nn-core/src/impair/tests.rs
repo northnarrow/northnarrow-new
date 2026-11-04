@@ -250,29 +250,46 @@ fn switch_off_commands_need_their_arguments() {
     // Lot 282 (lab 04/11): a flush of ONE chain — podman's CNI firewall
     // plugin setting up its own chains at a host's first run — switches
     // nothing off; a flush of every chain of a table still does.
-    for one_chain in [
+    // (each its own pid: the detector memoises a spawn by pid and time)
+    for (k, one_chain) in [
         &["iptables", "--wait", "-t", "nat", "-F", "CNI-HOSTPORT-DNAT"][..],
         &["iptables", "-F", "CNI-FORWARD"][..],
         &["ip6tables", "-t", "filter", "--flush", "CNI-ADMIN"][..],
         &["iptables", "-w", "-F", "DOCKER-USER", "-t", "filter"][..],
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         assert!(
-            h.run(348, 200, "/usr/sbin/xtables-nft-multi", one_chain)
-                .is_none(),
+            h.run(
+                3480 + k as u32,
+                200,
+                "/usr/sbin/xtables-nft-multi",
+                one_chain
+            )
+            .is_none(),
             "{one_chain:?}"
         );
     }
-    for every_chain in [
+    for (k, every_chain) in [
         &["iptables", "-t", "nat", "-F"][..],
         &["iptables", "-F", "-t", "filter"][..],
         &["ip6tables", "--flush"][..],
         &["iptables", "-w", "-F", "-X"][..],
         &["iptables", "-F", "INPUT"][..],
         &["ip6tables", "-t", "nat", "--flush", "POSTROUTING"][..],
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         assert!(
-            h.run(349, 200, "/usr/sbin/xtables-nft-multi", every_chain)
-                .is_some(),
+            h.run(
+                3490 + k as u32,
+                200,
+                "/usr/sbin/xtables-nft-multi",
+                every_chain
+            )
+            .is_some(),
             "{every_chain:?}"
         );
     }

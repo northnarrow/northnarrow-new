@@ -952,6 +952,21 @@ mod tests {
         assert_eq!((w.created, w.overwrites), (500, 0));
     }
 
+    /// Lot 282: the creation crossing carries the files created, not the
+    /// window's write-opens — a database reopened ten times beside twenty
+    /// new files is twenty files created.
+    #[test]
+    fn the_creation_crossing_carries_the_files_created() {
+        let mut t = Tgid::default();
+        let mut steps: Vec<_> = (0..10u64).map(|i| t.open(7, true, i)).collect();
+        steps.extend((0..20u64).map(|i| t.open(100 + i, false, 10 + i)));
+        assert_eq!(
+            crossings(&steps),
+            vec![(29, open_reason::MASS_WRITE, OPEN_MASS_WRITE_MIN)]
+        );
+        assert_eq!(t.w.unwrap().count, 30);
+    }
+
     /// Lot 282: an open crossing both thresholds is one record, the
     /// overwrite's, with the files rewritten as its count.
     #[test]
