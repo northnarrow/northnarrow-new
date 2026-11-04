@@ -130,6 +130,21 @@ pub(crate) mod testing {
     /// When the tests began.
     static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+    /// The test host's trusted-installer window: open or not, and (lot
+    /// 278) the grant it names while open — `bool` converts to a window
+    /// with no grant.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub(crate) struct TestWindow {
+        pub(crate) open: bool,
+        pub(crate) grant: Option<crate::anti_tamper::trusted_installer::WindowGrant>,
+    }
+
+    impl From<bool> for TestWindow {
+        fn from(open: bool) -> Self {
+            Self { open, grant: None }
+        }
+    }
+
     /// Plain `std`, every directory [`TEST_OWNER`]'s, the clocks above.
     #[derive(Debug, Clone, Copy, Default)]
     pub(crate) struct TestHost;
@@ -189,10 +204,10 @@ pub(crate) mod testing {
     /// itself, nn-core's; R08c, lab PR 252: so are its judges, which no
     /// test of the posture wires — none fires.)
     impl PostureAgent for TestHost {
-        type InstallerWindow = bool;
+        type InstallerWindow = TestWindow;
 
-        fn installer_window_open(window: &bool) -> bool {
-            *window
+        fn installer_window_open(window: &TestWindow) -> bool {
+            window.open
         }
 
         type UnlockToken = ();

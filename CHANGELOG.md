@@ -621,6 +621,85 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- R009 no longer kills root automation run from a source tree outside
+  COMBAT; an installer's trusted-installer window covers its own process
+  tree (lot 278, the false positive of the review of #492, section f).
+  R009 (a file in a home, `/tmp` or `/var/tmp` executed by root) killed
+  `install.sh`, `install.sh --upgrade` and `uninstall.sh` run by automation
+  without a terminal (Ansible `become`, cloud-init, CI) from a checkout or an
+  unpacked tree, in OBSERVING too; and at a terminal under `sudo`, the lab's
+  "R009 flake": `sudo` with `use_pty` forks a monitor that `/proc` shows
+  started before sudo's exec when both fall in one clock tick (the start is
+  rounded down, less the time suspended), and the judged lineage walk
+  (lab PR 269) found sudo's exec "only later" and lost the administrator's
+  session. Now:
+  - the lineage reads a fork's parent at the latest time the fork can have
+    happened (`/proc/<pid>/exe` must still be the parent's image): the
+    session holds whatever the milliseconds between the exec and the fork;
+  - the engine judges an event in the posture the agent judged it in
+    (`RuleEngine::decide_in`); R009's kill runs in COMBAT only, and R001's
+    and R003's kill of an exec by root likewise (a root exec from those
+    directories is R009's to decide). Below COMBAT the record keeps its
+    severity, `held` names the kill and the reasoning the posture; a signed
+    `enforce R009` kills in every posture. Holding the kill in OBSERVING
+    only would not have been enough: any exec from `/tmp` raises ENGAGED for
+    24 hours, so the second run of an installer from an unpacked tree would
+    have been killed. Every other rule that can kill in OBSERVING is listed
+    with why (`posture_floor::OBSERVING_KILLS`: kills from before Wave 4,
+    kept by the decision of 21/10; the exploit guard's and the exec
+    quarantine's opt-ins), held to the rule catalogue by a test;
+  - a trusted-installer grant is made to the installer that asked for it:
+    the parent of the `nn-admin` at the other end of the socket, by its pid
+    and its start (`installer_of_requester`), with the time of the grant.
+    R009 records at Low, naming the key, the deadline and the installer's
+    pid, what that process's own tree executes after the grant while the
+    window is open — by lineage (`AuthSessionTracker::descends_from`), never
+    by a name or a path;
+  - `install.sh` executed the tree's agent (`--version`) before its window
+    opened, and in a refused run too: it now reads the version once the
+    window is open, or after the stop when no agent judges it.
+  Golden: the five root-from-`/tmp` exec records of the corpus are R009's
+  High record with the kill held (and R001's), judged in OBSERVING; the chain
+  kills of the same processes run as before; the nn-admin matrix shows the
+  same five records and nothing else. `docs/operator/RULE_POLICY.md` §1,
+  `INSTALL_UPGRADE_UNINSTALL.md` §2.1, `UPGRADE_NOTES_WAVE4.md`.
+  The review of #493:
+  - B1: the fork's upper bound lent an interpreter's fork the script its
+    parent executed after forking it (a user's `python3 evil.py` fork
+    passed for borg or dnf). The parent is read at the fork's earliest
+    time; at its tick only when that is "only later" and the parent took
+    one identity in the tick.
+  - A1: the posture hold, counted as R009's own record, held through the
+    legacy ceiling the kills R011, R012, R013 and R017 had on a root exec
+    from `/tmp` or a home. It now counts as a switch's: those kills run in
+    every posture, as before.
+  - The decision of 03/11/2026 is recorded (RULE_POLICY §1): R009 and
+    R001/R003 on root's exec in COMBAT only, a change of the decision of
+    21/10 and POS-015 for these three cases; the way back is `enforce
+    R009`; what is left is a root dropper from `/tmp` below COMBAT, recorded
+    High and not killed.
+  - The window names an installer only when asked for one: `nn-admin
+    trusted-installer-grant --for-installer` (the scripts pass it when the
+    installed nn-admin knows it — not at the first upgrade from an older
+    release) sends a new request (`TrustedInstallerGrantForInstallerRequest`,
+    production variant 58; the debug-only pair moves to 59/60), whose audit
+    row says `for_installer` and the installer's pid; a plain grant names
+    none. An older agent closes the connection and nn-admin asks for the
+    plain grant.
+  - The second review of #493: a fork of a fork that never executed (G runs
+    `python3 evil.py`, its fork forks the child, then executes `python3
+    /usr/bin/borg`) passed for borg through the one-identity rule. The
+    later exec now answers only for an identity its executable alone decides
+    (no script, no npm entrypoint, no interpreter), the child's live exe
+    being that executable — and, after the third review, only for an
+    authentication binary's monitor (sudo, su, doas, pkexec, …: a child
+    forked before its parent's exec that executed the same canary reader
+    itself, restic or clamscan, before its exec reached the cache, would
+    have taken the reader's identity).
+  - The installer is the process with the exact start `/proc` shows for it
+    now: no allowance for the time suspended.
+  - The posture is read once per decision. The static scan of `install.sh`
+    sees every spelling of the tree's binaries.
 - **Security (lot 273c, C23): another process's change of the agent's
   limits and priorities refused, PID 1's memory closed to attach-mode
   access, resource values below a floor never registered, systemd's copy

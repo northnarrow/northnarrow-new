@@ -108,11 +108,11 @@ exit: 0
 |    0  -
 |    1  NN-L-CANARY-001_FileAccess KillProcessTree Critical pid 6473001
 |    2  -
-|    3  R009_RootExecFromUserPath KillProcessTree High pid 6471001  [R009_RootExecFromUserPath builtin KillProcessTree; R001_ExecFromTmp builtin KillProcessTree]
+|    3  R009_RootExecFromUserPath Log High pid 6471001  [R009_RootExecFromUserPath builtin Log (held); R001_ExecFromTmp builtin Log (held)]
 |    4  NN-L-FIM-017_GpgKeyringAccessed KillProcess High pid 6471001
 |    5  NN-L-CHAIN-007_TmpCredExfilSequence KillProcessTree Critical pid 6471001  [NN-L-CHAIN-007_TmpCredExfilSequence builtin KillProcessTree; NN-L-CHAIN-001_CredReadThenEgress builtin KillProcessTree; NN-L-CHAIN-002_TmpExecThenEgress builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin KillProcess]
 |    6  -
-|    7  R009_RootExecFromUserPath KillProcessTree High pid 6472001  [R009_RootExecFromUserPath builtin KillProcessTree; R001_ExecFromTmp builtin KillProcessTree]
+|    7  R009_RootExecFromUserPath Log High pid 6472001  [R009_RootExecFromUserPath builtin Log (held); R001_ExecFromTmp builtin Log (held)]
 |    8  NN-L-CHAIN-002_TmpExecThenEgress KillProcessTree Critical pid 6472001  [NN-L-CHAIN-002_TmpExecThenEgress builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin KillProcess]
 |    9  -
 |   10  R001_ExecFromTmp KillProcessTree Medium pid 6474001
@@ -154,7 +154,7 @@ exit: 0
 |   46  -
 |   47  -
 |   48  NN-L-EVA-001_SecurityServiceStopped Log High pid 5400013
-|   49  R009_RootExecFromUserPath KillProcessTree High pid 5400021  [R009_RootExecFromUserPath builtin KillProcessTree; R001_ExecFromTmp builtin KillProcessTree]
+|   49  R009_RootExecFromUserPath Log High pid 5400021  [R009_RootExecFromUserPath builtin Log (held); R001_ExecFromTmp builtin Log (held)]
 |   50  NN-L-EVA-001_SecurityServiceStopped Log High pid 5400021  (held)
 |   51  NN-L-FIM-010_RansomwareExtensionRename KillProcessTree Critical pid 5100101
 |   52  -
@@ -214,12 +214,12 @@ exit: 0
 |  106  -
 |  107  NN-L-FIM-017_GpgKeyringAccessed KillProcess High pid 6400001
 |  108  NN-L-CHAIN-001_CredReadThenEgress KillProcessTree Critical pid 6400001  [NN-L-CHAIN-001_CredReadThenEgress builtin KillProcessTree; NN-L-NET-001_OutboundToBlockedIp builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin KillProcess]
-|  109  NN-L-CHAIN-007_TmpCredExfilSequence KillProcessTree Critical pid 6400001  [NN-L-CHAIN-007_TmpCredExfilSequence builtin KillProcessTree; NN-L-CHAIN-002_TmpExecThenEgress builtin KillProcessTree; R009_RootExecFromUserPath builtin KillProcessTree; R001_ExecFromTmp builtin KillProcessTree]
+|  109  NN-L-CHAIN-007_TmpCredExfilSequence KillProcessTree Critical pid 6400001  [NN-L-CHAIN-007_TmpCredExfilSequence builtin KillProcessTree; NN-L-CHAIN-002_TmpExecThenEgress builtin KillProcessTree; R009_RootExecFromUserPath builtin Log (held); R001_ExecFromTmp builtin Log (held)]
 |  110  -
 |  111  -
 |  112  -
 |  113  NN-L-FIM-004_AuthorizedKeysModified Log High pid 6200003  [NN-L-FIM-002_NewSuidBinary builtin Log; NN-L-FIM-004_AuthorizedKeysModified builtin Log (held)]
-|  114  R009_RootExecFromUserPath KillProcessTree High pid 6100001  [R009_RootExecFromUserPath builtin KillProcessTree; R001_ExecFromTmp builtin KillProcessTree]
+|  114  R009_RootExecFromUserPath Log High pid 6100001  [R009_RootExecFromUserPath builtin Log (held); R001_ExecFromTmp builtin Log (held)]
 |  115  NN-L-FIM-009_SystemdUnitDropped KillProcess High pid 6100001  [NN-L-FIM-009_SystemdUnitDropped builtin KillProcess; NN-L-FIM-023_SystemdTimerCreated builtin KillProcess]
 |  116  -
 |  117  -

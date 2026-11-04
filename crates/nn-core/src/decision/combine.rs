@@ -186,6 +186,11 @@ pub fn apply_policy(
 ) -> RuleMatch {
     let mode = policy.mode(rule_id);
     let builtin_action = v.action.clone();
+    // Review of #493 (A1): a hold by the posture counts as a switch's for
+    // the legacy first match — it never stands in for another rule's kill
+    // of the same exec that existed before (R011–R013, R017 on a root exec
+    // from a home or /tmp); R001/R003 on root's exec wait for COMBAT by
+    // their own floor.
     let switch_held = held.is_some();
     // Named only while the switch still holds the response (built in).
     let mut held_switch = held.as_ref().map(|h| h.switch);

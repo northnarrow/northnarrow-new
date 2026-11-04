@@ -66,6 +66,9 @@ pub(super) struct DispatchNotes {
     /// Lab PR 217: a force-posture out of COMBAT — what its release
     /// released, or why it did not (the posture then stayed COMBAT).
     pub(super) force_release: Option<std::result::Result<String, String>>,
+    /// Lot 278: the installer a for-installer grant named (its pid), when
+    /// the window was opened and the requester's parent could be told.
+    pub(super) installer_pid: Option<u32>,
 }
 
 /// Inspect the (request, reply) pair after `dispatch` returns
@@ -373,6 +376,28 @@ pub(super) fn emit_audit_for(
             (
                 "trusted_installer_grant",
                 serde_json::json!({ "window_secs": window }),
+                audit_result_str(*r),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
+        // Lot 278 (review of #493, note a): the grant asked for by an
+        // installer for its own tree — the row says so, and names the
+        // installer (the requester's parent) when the window was opened.
+        (
+            AdminMessage::TrustedInstallerGrantForInstallerRequest(req),
+            AdminMessage::TrustedInstallerGrantResult(r),
+        ) => {
+            let window = match &req.payload.extra {
+                OperationExtra::TrustedInstallerGrant(e) => e.window_secs,
+                _ => 0,
+            };
+            (
+                "trusted_installer_grant",
+                serde_json::json!({
+                    "window_secs": window,
+                    "for_installer": true,
+                    "installer_pid": notes.installer_pid,
+                }),
                 audit_result_str(*r),
                 req.signatures.len().saturating_sub(1),
             )

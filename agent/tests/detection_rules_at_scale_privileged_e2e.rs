@@ -1322,8 +1322,9 @@ fn chain_privesc_then_descendant_egress_trips_chain_008() {
 
 /// CHAIN-005 — `/tmp` exec by a parent, descendant egress to a non-DNS
 /// port (T1059 → T1571). The suite runs detect-only, so the forked child
-/// connects. Enforced, the /tmp exec's kill (R009 as root, R001 otherwise)
-/// takes the tree since lab PR 166, the child with it.
+/// connects. Enforced, the /tmp exec's kill (R009 as root, in COMBAT since
+/// lot 278; R001 otherwise) takes the tree since lab PR 166, the child with
+/// it.
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn chain_tmp_parent_then_descendant_egress_trips_chain_005() {

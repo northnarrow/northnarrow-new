@@ -3508,7 +3508,7 @@ fn dispatch_trusted_installer_grant_arms_on_valid_m1() {
     let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
     let ov = test_override();
     let mut fps = Vec::new();
-    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), &mut fps);
+    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), None, &mut fps);
     assert!(matches!(resp, AdminResult::Success));
     assert!(
         ov.is_window_open(),
@@ -3519,6 +3519,111 @@ fn dispatch_trusted_installer_grant_arms_on_valid_m1() {
         1,
         "signer fingerprint captured for the audit chain"
     );
+    // a plain grant (not asked for an installer): no installer named
+    assert_eq!(ov.current_grant().expect("open").grantee, None);
+}
+
+/// Lot 278: the window is granted to the requester's parent — the
+/// installer that ran `nn-admin trusted-installer-grant` — by its pid and
+/// its start, read from `/proc`.
+#[test]
+fn dispatch_trusted_installer_grant_names_the_requester_s_parent() {
+    use crate::os_rng::OsRng;
+    use ed25519_dalek::SigningKey;
+    let signing = SigningKey::generate(&mut OsRng);
+    let agent_id = [0x1b; 16];
+    let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+    let auth = ConnAuth::new(&auth);
+    let nonce = auth.issue_challenge().unwrap();
+    let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
+    let ov = test_override();
+    let mut fps = Vec::new();
+    // this test process stands for nn-admin: its parent is the installer
+    let me = std::process::id();
+    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), Some(me), &mut fps);
+    assert!(matches!(resp, AdminResult::Success));
+    let who = ov.current_grant().expect("open").grantee;
+    let parent = std::os::unix::process::parent_id();
+    if parent > 1 {
+        let who = who.expect("the parent named");
+        assert_eq!(who.pid, parent);
+        let stat = std::fs::read_to_string(format!("/proc/{parent}/stat")).unwrap();
+        let start: u64 = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(who.start_ticks, start);
+    } else {
+        assert_eq!(
+            who, None,
+            "a requester started by init acts for no installer"
+        );
+    }
+}
+
+/// Review of #493 (note a; mutation MA2): through the dispatcher, a plain
+/// grant names no installer, whoever asked; the grant asked for an
+/// installer names the requester's parent, and the notes carry its pid for
+/// the audit row.
+#[test]
+fn only_the_grant_for_an_installer_names_one() {
+    use crate::os_rng::OsRng;
+    use ed25519_dalek::SigningKey;
+    let signing = SigningKey::generate(&mut OsRng);
+    let agent_id = [0x1d; 16];
+    let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+    let dir = TempDir::new().unwrap();
+    let isolator = NetworkIsolator::new(rules_path()).unwrap();
+    let posture = PostureMachine::new();
+    let marker = dir.path().join("marker");
+    let me = std::process::id();
+    let parent = std::os::unix::process::parent_id();
+    let client = AuditClient {
+        pid: me,
+        ..fake_client()
+    };
+    for (for_installer, wants) in [(false, None), (true, (parent > 1).then_some(parent))] {
+        let conn = ConnAuth::new(&auth);
+        let nonce = conn.issue_challenge().unwrap();
+        let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
+        let msg = if for_installer {
+            AdminMessage::TrustedInstallerGrantForInstallerRequest(req)
+        } else {
+            AdminMessage::TrustedInstallerGrantRequest(req)
+        };
+        let ov = test_override();
+        let mut notes = DispatchNotes::default();
+        let reply = dispatch(
+            msg,
+            &conn,
+            Wired {
+                installer_override: Some(&ov),
+                ..bare_context(
+                    &posture,
+                    &isolator,
+                    &marker,
+                    &AdminReadPaths::default(),
+                    &AdminHandles::default(),
+                )
+            },
+            &client,
+            &mut Vec::new(),
+            &mut notes,
+        );
+        assert_eq!(
+            reply,
+            AdminMessage::TrustedInstallerGrantResult(AdminResult::Success),
+            "for_installer={for_installer}"
+        );
+        let named = ov.current_grant().expect("open").grantee.map(|g| g.pid);
+        assert_eq!(named, wants, "for_installer={for_installer}");
+        assert_eq!(notes.installer_pid, wants, "for_installer={for_installer}");
+    }
 }
 
 /// A signature from a key NOT in admin.pub is rejected; the override
@@ -3537,7 +3642,7 @@ fn dispatch_trusted_installer_grant_bad_signature_rejected() {
     let req = signed_grant_req(&other, nonce, agent_id, 120, now_unix_secs());
     let ov = test_override();
     let mut fps = Vec::new();
-    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), &mut fps);
+    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), None, &mut fps);
     assert!(matches!(resp, AdminResult::InvalidSignature));
     assert!(
         !ov.is_window_open(),
@@ -3560,7 +3665,7 @@ fn dispatch_trusted_installer_grant_wrong_agent_id_rejected() {
     let req = signed_grant_req(&signing, nonce, [0xff; 16], 120, now_unix_secs());
     let ov = test_override();
     let mut fps = Vec::new();
-    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), &mut fps);
+    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), None, &mut fps);
     assert!(matches!(resp, AdminResult::AgentIdMismatch));
     assert!(!ov.is_window_open());
 }
@@ -3583,12 +3688,12 @@ fn dispatch_trusted_installer_grant_replayed_nonce_rejected() {
     // First presentation succeeds.
     let first = signed_grant_req(&signing, nonce, agent_id, 120, now);
     assert!(matches!(
-        dispatch_trusted_installer_grant(first, &auth, Some(&ov), &mut fps),
+        dispatch_trusted_installer_grant(first, &auth, Some(&ov), None, &mut fps),
         AdminResult::Success
     ));
     // Exact-byte replay (deterministic Ed25519) — nonce already consumed.
     let replay = signed_grant_req(&signing, nonce, agent_id, 120, now);
-    let resp = dispatch_trusted_installer_grant(replay, &auth, Some(&ov), &mut fps);
+    let resp = dispatch_trusted_installer_grant(replay, &auth, Some(&ov), None, &mut fps);
     assert!(matches!(resp, AdminResult::NoPendingChallenge));
 }
 
@@ -3607,7 +3712,7 @@ fn dispatch_trusted_installer_grant_role_denied_without_role() {
     let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
     let ov = test_override();
     let mut fps = Vec::new();
-    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), &mut fps);
+    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), None, &mut fps);
     assert!(matches!(resp, AdminResult::RoleDenied));
     assert!(!ov.is_window_open());
 }
@@ -3628,7 +3733,7 @@ fn dispatch_trusted_installer_grant_skewed_ts_rejected() {
     let req = signed_grant_req(&signing, nonce, agent_id, 120, skewed_ts);
     let ov = test_override();
     let mut fps = Vec::new();
-    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), &mut fps);
+    let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), None, &mut fps);
     assert!(matches!(resp, AdminResult::TimestampSkew { .. }));
     assert!(!ov.is_window_open());
 }
@@ -3646,7 +3751,7 @@ fn dispatch_trusted_installer_grant_without_override_unknown_operation() {
     let nonce = auth.issue_challenge().unwrap();
     let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
     let mut fps = Vec::new();
-    let resp = dispatch_trusted_installer_grant(req, &auth, None, &mut fps);
+    let resp = dispatch_trusted_installer_grant(req, &auth, None, None, &mut fps);
     assert!(matches!(resp, AdminResult::UnknownOperation));
 }
 

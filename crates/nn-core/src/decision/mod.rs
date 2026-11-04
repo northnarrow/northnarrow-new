@@ -36,6 +36,7 @@ pub mod correlation;
 pub mod engine;
 pub mod flow_ledger;
 pub mod host;
+pub mod posture_floor;
 pub mod replay;
 pub mod response_policy;
 pub mod rule_policy;

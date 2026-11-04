@@ -231,8 +231,27 @@ pub(super) fn dispatch(
                 req,
                 auth,
                 installer_override,
+                None,
                 fps_out,
             ))
+        }
+        // Lot 278 (review of #493, note a): asked for by an installer for
+        // its own tree — the requester's parent named as the window's
+        AdminMessage::TrustedInstallerGrantForInstallerRequest(req) => {
+            let r = dispatch_trusted_installer_grant(
+                req,
+                auth,
+                installer_override,
+                Some(client.pid),
+                fps_out,
+            );
+            if matches!(r, nn_proto::admin_protocol::AdminResult::Success) {
+                notes.installer_pid = installer_override
+                    .and_then(|o| o.current_grant())
+                    .and_then(|g| g.grantee)
+                    .map(|w| w.pid);
+            }
+            AdminMessage::TrustedInstallerGrantResult(r)
         }
         AdminMessage::ConfigOverlaySetRequest(req) => {
             AdminMessage::ConfigOverlaySetResponse(dispatch_config_overlay_set(
