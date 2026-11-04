@@ -4,9 +4,15 @@ network, no persistence). It writes N plain files under /srv/nn-malsim, then
 "encrypts" them with os.urandom — the shape the agent judges, nothing that
 can be recovered — and renames or replaces them, as an encryptor does.
 
-  ransom-sim.py prepare --files N        N plain text files of 8 KiB
+  ransom-sim.py prepare --files N [--size B]
+                                         N plain text files of B bytes (8 KiB)
   ransom-sim.py inplace [--no-rename]    rewrite each in place, rename to .locked
   ransom-sim.py copy-delete              write <name>.locked, delete <name>
+  ransom-sim.py copy-only                lot 282: the encryptor of a split pair —
+                                         write <name>.locked, keep <name>
+  ransom-sim.py delete-only              lot 282: the deleter of a split pair (a
+                                         process of its own) — delete each
+                                         <name> whose <name>.locked is there
   ransom-sim.py gzip-delete              negative: write <name>.gz, delete <name>
                                          (log rotation with compression)
   ransom-sim.py move-away                negative: copy to /srv/nn-malsim/moved
@@ -50,10 +56,10 @@ def files():
     return out
 
 
-def prepare(n):
+def prepare(n, size):
     os.makedirs(guard(DATA), exist_ok=True)
     line = b"Quarterly figures, plain text that compresses well. " * 4 + b"\n"
-    body = MARK + line * (8192 // len(line))
+    body = MARK + line * (size // len(line))  # 8 KiB: 8,115 bytes
     kinds = ["docx", "pdf", "xlsx", "txt", "csv", "odt", "jpg"]
     for i in range(n):
         p = guard(os.path.join(DATA, f"report-{i:04d}.{kinds[i % len(kinds)]}"))
@@ -85,6 +91,31 @@ def copy_delete(pause):
         done += 1
         time.sleep(pause)
     print(f"ransom-sim: {done} copies written, originals deleted")
+
+
+def copy_only(pause):
+    """Lot 282 (the review of #500): the encryptor of a split pair writes
+    the encrypted copies and leaves the originals to another process."""
+    done = 0
+    for p in files():
+        size = os.path.getsize(p)
+        with open(guard(p + ".locked"), "wb") as f:  # a new file
+            f.write(os.urandom(size))
+        done += 1
+        time.sleep(pause)
+    print(f"ransom-sim: {done} copies written, originals kept")
+
+
+def delete_only(pause):
+    """Lot 282: the deleter of a split pair, a process of its own: each
+    original whose encrypted copy is there."""
+    done = 0
+    for p in files():
+        if os.path.isfile(guard(p + ".locked")):
+            os.unlink(p)
+            done += 1
+            time.sleep(pause)
+    print(f"ransom-sim: {done} originals deleted")
 
 
 def gzip_delete(pause):
@@ -136,11 +167,16 @@ def main(argv):
     cmd = argv[1]
     if cmd == "prepare":
         n = int(argv[argv.index("--files") + 1]) if "--files" in argv else 300
-        prepare(n)
+        size = int(argv[argv.index("--size") + 1]) if "--size" in argv else 8192
+        prepare(n, size)
     elif cmd == "inplace":
         inplace("--no-rename" not in argv, pause)
     elif cmd == "copy-delete":
         copy_delete(pause)
+    elif cmd == "copy-only":
+        copy_only(pause)
+    elif cmd == "delete-only":
+        delete_only(pause)
     elif cmd == "gzip-delete":
         gzip_delete(pause)
     elif cmd == "move-away":

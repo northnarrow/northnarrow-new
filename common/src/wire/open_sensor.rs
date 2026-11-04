@@ -80,10 +80,15 @@ pub mod open_reason {
     pub const PERSIST: u32 = 1 << 2;
     pub const PROBE: u32 = 1 << 3;
     pub const CRED: u32 = 1 << 4;
-    /// Lot 282: the tgid's write-opens that CREATED a file
-    /// (`FMODE_CREATED`) crossed the mass-write threshold in the window —
-    /// an extraction, a clone, a build, a cache filled. `count` carries the
-    /// files created. (It was every write-open, the same file's included.)
+    /// Lot 282: the tgid's distinct files written NEW crossed the
+    /// mass-write threshold in the window — an extraction, a clone, a
+    /// build, a cache filled, the copies of an encryptor. `count` carries
+    /// them. (It was every write-open, the same file's included.) The
+    /// review of #500 (B1): a file written new is any file whose first
+    /// write-open of the window is no rewrite ([`super::WriteKind::New`]):
+    /// created by the open (`FMODE_CREATED`), or empty when opened — made
+    /// by `mknod`, an `O_TMPFILE` linked in, an `O_RDONLY | O_CREAT` open
+    /// reopened to write. `FMODE_CREATED` alone was evaded by all three.
     pub const MASS_WRITE: u32 = 1 << 5;
     /// Review 86: a file capability was set (`security.capability`). The
     /// record's `count` carries the permitted set's low 32 bits, `flags`
@@ -92,10 +97,11 @@ pub mod open_reason {
     pub const FILE_CAP: u32 = 1 << 6;
     /// External audit POS-002: the tgid's write-opens of files that
     /// existed before the open (no `FMODE_CREATED`: rewritten, not
-    /// created) crossed the mass-write threshold in the window. Lot 282:
-    /// each file once per window ([`super::OverwriteSeenKey`]: a database
-    /// rewritten 259 times is one file), and `count` carries those
-    /// distinct files (it carried every write-open).
+    /// created), of at least [`super::OVERWRITE_MIN_BYTES`] (lab PR 127),
+    /// crossed the mass-write threshold in the window. Lot 282: each file
+    /// once per window ([`super::OverwriteSeenKey`]: a database rewritten
+    /// 259 times is one file), and `count` carries those distinct files (it
+    /// carried every write-open).
     pub const MASS_OVERWRITE: u32 = 1 << 7;
     /// External audit EBPF-011: the overwrites of one cgroup's processes,
     /// each below its own threshold, crossed [`super::OPEN_CG_OVERWRITE_MIN`]
@@ -111,16 +117,18 @@ pub mod open_reason {
     /// counted rename to the next (originals of different kinds). The path
     /// is the file's new name. Seen on `inode_rename` (regular files, LSM file-open sensor armed).
     pub const MASS_RENAME: u32 = 1 << 9;
-    /// Lab PR 225: a tgid's unlinks of regular files of at least
-    /// [`super::UNLINK_MIN_BYTES`] crossed [`super::OPEN_UNLINK_MIN`] in the
-    /// window ([`super::unlink_step`]). `count` carries them; the path is the
-    /// unlinked file's. Seen on `inode_unlink` (LSM file-open sensor armed).
-    /// Lot 282: originals destroyed — an unlink, or a rename onto the name
-    /// of an existing regular file of that size (seen on `inode_rename`),
-    /// which destroys it as surely — each name once per window
-    /// ([`super::DestroySeenKey`]), never a file the process itself created
-    /// within the window ([`super::created_in_window`]: its own temporary
-    /// file); the path is the destroyed file's.
+    /// Lab PR 225: a tgid's unlinks of regular files crossed
+    /// [`super::OPEN_UNLINK_MIN`] in the window ([`super::unlink_step`]).
+    /// `count` carries them; the path is the unlinked file's. Seen on
+    /// `inode_unlink` (LSM file-open sensor armed). Lot 282: originals
+    /// destroyed — an unlink, or a rename onto the name of an existing
+    /// regular file (seen on `inode_rename`), which destroys it as surely —
+    /// each name once per window ([`super::DestroySeenKey`]), never a file
+    /// the process itself created within the window
+    /// ([`super::created_in_window`]: its own temporary file); the path is
+    /// the destroyed file's. The review of #500 (C1): any file that held
+    /// data ([`super::destroys_an_original`]) — it was one of 4 KiB or more
+    /// — or one emptied within the window (a `truncate` then an `unlink`).
     pub const MASS_UNLINK: u32 = 1 << 10;
     /// Lab PR 225 (CM-18): a signal that stops or ends a process, sent to
     /// the main process of another security tool (`DEFENDER_PIDS`, filled
@@ -128,6 +136,16 @@ pub mod open_reason {
     /// itself or the agent. Seen on `task_kill`, never refused. `count`
     /// carries the signal, `flags` the target's tgid; no path.
     pub const DEFENDER_SIGNAL: u32 = 1 << 11;
+    /// Lot 282, the review of #500 (C1): the tgid's distinct existing
+    /// NON-EMPTY files rewritten — those under
+    /// [`super::OVERWRITE_MIN_BYTES`] included — crossed the mass-write
+    /// threshold in the window before the files of that size alone did
+    /// ([`MASS_OVERWRITE`], which a crossing of both reports alone).
+    /// `count` carries them. Encryption in place of small documents; the
+    /// posture counts it outside an authenticated session only — inside
+    /// one, as before, only files of 4 KiB or more count (a build rewrites
+    /// its own small outputs: lab PR 127, cargo killed).
+    pub const MASS_OVERWRITE_SMALL: u32 = 1 << 12;
 }
 
 /// Names in the rule maps: NUL-padded, at most 31 bytes kept.
@@ -165,10 +183,16 @@ pub const OPEN_UNLINK_MIN: u32 = 20;
 /// Lab PR 225: the window of the rename and unlink counts, the mass-write
 /// window.
 pub const OPEN_BURST_WINDOW_NS: u64 = OPEN_MASS_WRITE_WINDOW_NS;
-/// Lab PR 225: an unlink counts for a file of at least this size, the
-/// overwrite's minimum: originals are documents; a build's and a
-/// compiler's temporary files are mostly smaller.
-pub const UNLINK_MIN_BYTES: u64 = 4096;
+/// An overwrite of [`open_reason::MASS_OVERWRITE`] counts for an existing
+/// file of at least this size, read at open (before `O_TRUNC` empties it).
+/// A build rewrites its own small outputs — a full workspace rebuild in
+/// the lab (lab PR 127): up to 17 overwrites per cargo process in all, at
+/// most 4 of 4 KiB or more — and a cargo build, counted as ransomware, was
+/// killed and cargo and rustc quarantined. Lot 282 (the review of #500,
+/// C1): the smaller non-empty files count apart
+/// ([`open_reason::MASS_OVERWRITE_SMALL`]); an unlink counts for any file
+/// that held data (it counted from this size: lab PR 225).
+pub const OVERWRITE_MIN_BYTES: u64 = 4096;
 /// Lab PR 225: bytes of a name's end read for its extension. A longer
 /// extension is no extension to the counter.
 pub const NAME_TAIL_LEN: usize = 16;
@@ -219,25 +243,71 @@ pub struct OpenWriteWindow {
     /// [`open_reason::MASS_WRITE`] / [`open_reason::MASS_OVERWRITE`] once
     /// each was reported in this window.
     pub fired: u32,
-    /// External audit POS-002: the write-opens of files that existed. Lot
-    /// 282: each file once per window (the eBPF counter's
-    /// [`OverwriteSeenKey`] map tells a file's first rewrite of the window
-    /// from a repeat, which is a plain write-open).
+    /// External audit POS-002: the write-opens of files that existed, of
+    /// at least [`OVERWRITE_MIN_BYTES`]. Lot 282: each file once per window
+    /// (the eBPF counter's [`OverwriteSeenKey`] map tells a file's first
+    /// write-open of the window from a repeat, which is a plain
+    /// write-open).
     pub overwrites: u32,
-    /// Lot 282: the write-opens that created their file (`FMODE_CREATED`).
+    /// Lot 282: the files written new ([`WriteKind::New`]), each once per
+    /// window.
     pub created: u32,
+    /// Lot 282, the review of #500 (C1): the existing non-empty files
+    /// under [`OVERWRITE_MIN_BYTES`] rewritten ([`WriteKind::SmallRewrite`]),
+    /// each once per window.
+    pub small: u32,
+    pub _pad: u32,
+}
+
+/// Lot 282: what one write-open of a regular file adds to its tgid's
+/// window ([`write_kind`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WriteKind {
+    /// A file already counted in this window: a plain write-open.
+    Repeat,
+    /// An existing file of at least [`OVERWRITE_MIN_BYTES`] rewritten.
+    Rewrite,
+    /// An existing non-empty file under [`OVERWRITE_MIN_BYTES`] rewritten.
+    SmallRewrite,
+    /// A file written new: created by the open, or empty when opened.
+    New,
+}
+
+/// Lot 282 (the review of #500, B1 and C1): the kind of one write-open of
+/// a regular file — `created` by the open (`FMODE_CREATED`), `data`: it
+/// held data when opened (its size, read before `O_TRUNC` empties it, not
+/// zero), `big`: at least [`OVERWRITE_MIN_BYTES`] — whose `first`
+/// write-open of the window this is ([`first_in_window`] on the seen map).
+/// Each file counts once per window: a rewrite when the open found data in
+/// it, else a file written new — created by the open, or by `mknod`, an
+/// `O_TMPFILE` linked in, an `O_RDONLY | O_CREAT` open reopened to write:
+/// whatever made it, it held nothing of the user's. (`FMODE_CREATED` alone
+/// decided, and all three evaded it.)
+#[inline(always)]
+pub fn write_kind(created: bool, data: bool, big: bool, first: bool) -> WriteKind {
+    if !first {
+        WriteKind::Repeat
+    } else if created || !data {
+        WriteKind::New
+    } else if big {
+        WriteKind::Rewrite
+    } else {
+        WriteKind::SmallRewrite
+    }
 }
 
 impl OpenWriteWindow {
-    /// The window a tgid's first counted write-open starts.
+    /// The window a tgid's first counted write-open, of `kind`, starts.
     #[inline(always)]
-    pub fn fresh(now: u64, over: bool, created: bool) -> Self {
+    pub fn fresh(now: u64, kind: WriteKind) -> Self {
         OpenWriteWindow {
             start_ns: now,
             count: 1,
             fired: 0,
-            overwrites: over as u32,
-            created: created as u32,
+            overwrites: (kind == WriteKind::Rewrite) as u32,
+            created: (kind == WriteKind::New) as u32,
+            small: (kind == WriteKind::SmallRewrite) as u32,
+            _pad: 0,
         }
     }
 
@@ -259,30 +329,32 @@ impl OpenWriteWindow {
 /// `OpenWriteWindow::fired` bits: the threshold already reported.
 pub const FIRED_WRITES: u32 = 1;
 pub const FIRED_OVERWRITES: u32 = 2;
+/// Lot 282 (the review of #500, C1): [`open_reason::MASS_OVERWRITE_SMALL`].
+pub const FIRED_SMALL: u32 = 4;
 
-/// One more write-open in a tgid's window `w` at `now`; `over`: it rewrites
-/// an existing file (POS-002, at least 4 KiB since lab PR 127) for the
-/// first time in the window (lot 282: a repeat of the same file is a plain
-/// write-open, `over` false); `created`: the open created its file (lot
-/// 282). Returns the [`open_reason`] bits it adds (`MASS_OVERWRITE` when
-/// the distinct files rewritten reach the threshold, `MASS_WRITE` when the
-/// files created do, each once per window), the count the record carries
-/// when it adds any (the files rewritten for an overwrite crossing, else
-/// the files created), and the overwrites it adds to the cgroup window
-/// (external audit EBPF-011): 0 until the process has rewritten
-/// [`OPEN_CG_PROC_MIN`] distinct files in its window, then all of them at
-/// once and one per further file after, and 0 again once its own threshold
-/// reported it.
+/// One more write-open, of `kind` ([`write_kind`]), in a tgid's window `w`
+/// at `now`. Returns the [`open_reason`] bits it adds — `MASS_OVERWRITE`
+/// when the distinct files of at least [`OVERWRITE_MIN_BYTES`] rewritten
+/// reach the threshold, `MASS_OVERWRITE_SMALL` when the distinct non-empty
+/// files rewritten (the smaller included) reach it first, `MASS_WRITE`
+/// when the files written new do, each once per window (lot 282) — the
+/// count the record carries when it adds any (the files rewritten for an
+/// overwrite crossing, else the files written new), and the overwrites it
+/// adds to the cgroup window (external audit EBPF-011): 0 until the
+/// process has rewritten [`OPEN_CG_PROC_MIN`] distinct files of at least
+/// [`OVERWRITE_MIN_BYTES`] in its window, then all of them at once and one
+/// per further file after, and 0 again once its own threshold reported it.
 #[inline(always)]
-pub fn write_step(w: &mut OpenWriteWindow, over: bool, created: bool, now: u64) -> (u32, u32, u32) {
-    let over = over as u32;
+pub fn write_step(w: &mut OpenWriteWindow, kind: WriteKind, now: u64) -> (u32, u32, u32) {
     if now.saturating_sub(w.start_ns) > OPEN_MASS_WRITE_WINDOW_NS {
-        *w = OpenWriteWindow::fresh(now, over != 0, created);
+        *w = OpenWriteWindow::fresh(now, kind);
         return (0, 0, 0);
     }
+    let over = (kind == WriteKind::Rewrite) as u32;
     w.count += 1;
     w.overwrites += over;
-    w.created += created as u32;
+    w.created += (kind == WriteKind::New) as u32;
+    w.small += (kind == WriteKind::SmallRewrite) as u32;
     let mut bits = 0u32;
     if w.created >= OPEN_MASS_WRITE_MIN && w.fired & FIRED_WRITES == 0 {
         w.fired |= FIRED_WRITES;
@@ -291,6 +363,14 @@ pub fn write_step(w: &mut OpenWriteWindow, over: bool, created: bool, now: u64) 
     if w.overwrites >= OPEN_MASS_WRITE_MIN && w.fired & FIRED_OVERWRITES == 0 {
         w.fired |= FIRED_OVERWRITES;
         bits |= open_reason::MASS_OVERWRITE;
+    }
+    // Reached together with the files of 4 KiB or more, the crossing is
+    // theirs alone (it counts inside a session too).
+    if w.overwrites + w.small >= OPEN_MASS_WRITE_MIN && w.fired & FIRED_SMALL == 0 {
+        w.fired |= FIRED_SMALL;
+        if bits & open_reason::MASS_OVERWRITE == 0 {
+            bits |= open_reason::MASS_OVERWRITE_SMALL;
+        }
     }
     let cg = if over == 0 || w.fired & FIRED_OVERWRITES != 0 || w.overwrites < OPEN_CG_PROC_MIN {
         0
@@ -301,6 +381,8 @@ pub fn write_step(w: &mut OpenWriteWindow, over: bool, created: bool, now: u64) 
     };
     let count = if bits & open_reason::MASS_OVERWRITE != 0 {
         w.overwrites
+    } else if bits & open_reason::MASS_OVERWRITE_SMALL != 0 {
+        w.overwrites + w.small
     } else if bits != 0 {
         w.created
     } else {
@@ -361,6 +443,20 @@ pub fn created_in_window(created: Option<u64>, now: u64) -> bool {
     created.is_some_and(|t| now.saturating_sub(t) <= OPEN_BURST_WINDOW_NS)
 }
 
+/// Lot 282, the review of #500 (C1): whether an unlink (or a rename onto
+/// its name) of a regular file of `size` bytes destroys an original — the
+/// file holds data, or it held data within a burst window before (`had`:
+/// when the eBPF counter's `OPEN_HAD_DATA` map last saw it non-empty at an
+/// `inode_setattr`, `None` when it did not). A file emptied by a
+/// `truncate` — whose own `inode_setattr` runs before it empties the file
+/// — and then unlinked is one original destroyed; an empty file never
+/// written is none. (A file of 4 KiB or more counted; a smaller one, or one
+/// truncated first, did not.)
+#[inline(always)]
+pub fn destroys_an_original(size: u64, had: Option<u64>, now: u64) -> bool {
+    size != 0 || had.is_some_and(|t| now.saturating_sub(t) <= OPEN_BURST_WINDOW_NS)
+}
+
 /// `OPEN_CG_WRITES` key: a cgroup (v2 id), or, where the writer sits in
 /// the root cgroup (no cgroup v2 hierarchy in use), its uid and login uid.
 #[repr(C)]
@@ -402,7 +498,7 @@ pub fn cgroup_step(w: &mut OpenCgWindow, add: u32, now: u64) -> u32 {
 }
 
 /// One interesting open. 8-aligned, no implicit padding:
-/// 8·5 + 4·7 + 16 + 2 + 1 + 1 + 512 = 600.
+/// 8·6 + 4·7 + 16 + 2 + 1 + 1 + 512 = 608.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -415,6 +511,12 @@ pub struct OpenRecordRaw {
     /// a mount point to make the path absolute.
     pub root_dev: u64,
     pub root_ino: u64,
+    /// Lot 282 (the review of #500, C1): the writer's cgroup v2 id
+    /// (`bpf_get_current_cgroup_id`; 1, the root, where no hierarchy is in
+    /// use). The posture pairs the two halves of a replacement — files
+    /// written new, originals destroyed — within one cgroup as well as one
+    /// process: an encryptor and a separate deleter.
+    pub cgroup: u64,
     pub pid: u32,
     pub uid: u32,
     pub gid: u32,
@@ -751,11 +853,11 @@ mod tests {
 
     #[test]
     fn open_sensor_layouts() {
-        assert_eq!(core::mem::size_of::<OpenRecordRaw>(), 600);
+        assert_eq!(core::mem::size_of::<OpenRecordRaw>(), 608);
         assert_eq!(core::mem::align_of::<OpenRecordRaw>(), 8);
         assert_eq!(core::mem::size_of::<ChildRuleKey>(), 48);
         assert_eq!(core::mem::size_of::<DirClass>(), 16);
-        assert_eq!(core::mem::size_of::<OpenWriteWindow>(), 24);
+        assert_eq!(core::mem::size_of::<OpenWriteWindow>(), 32);
         assert_eq!(core::mem::size_of::<OpenCgKey>(), 16);
         assert_eq!(core::mem::size_of::<OpenCgWindow>(), 16);
         assert_eq!(core::mem::size_of::<NameParts>(), 56);
@@ -782,15 +884,15 @@ mod tests {
     /// `n` write-opens by one process, `over` each, from `t0` on (a few ms
     /// apart); the reasons and cgroup shares in order.
     fn process(n: u32, over: bool, t0: u64) -> Vec<(u32, u32, u32)> {
-        let mut w = OpenWriteWindow::fresh(t0, over, !over);
+        let kind = if over {
+            WriteKind::Rewrite
+        } else {
+            WriteKind::New
+        };
+        let mut w = OpenWriteWindow::fresh(t0, kind);
         let mut out = vec![(0, 0, 0)];
         for i in 1..n {
-            out.push(write_step(
-                &mut w,
-                over,
-                !over,
-                t0 + u64::from(i) * 1_000_000,
-            ));
+            out.push(write_step(&mut w, kind, t0 + u64::from(i) * 1_000_000));
         }
         out
     }
@@ -861,9 +963,9 @@ mod tests {
     /// up.
     #[test]
     fn windows_restart_after_sixty_seconds() {
-        let mut w = OpenWriteWindow::fresh(0, true, false);
+        let mut w = OpenWriteWindow::fresh(0, WriteKind::Rewrite);
         for i in 1..5u64 {
-            let (_, _, add) = write_step(&mut w, true, false, i * 61 * S);
+            let (_, _, add) = write_step(&mut w, WriteKind::Rewrite, i * 61 * S);
             assert_eq!(add, 0);
             assert_eq!(w.overwrites, 1);
         }
@@ -874,10 +976,9 @@ mod tests {
     }
 
     /// Lot 282: the eBPF counter's glue for one tgid
-    /// (`nn_open_count_write`): the seen map decides whether a rewrite is
-    /// the file's first of the window, `write_step` counts. `open` is one
-    /// write-open of file `ino` — `existing` (at least 4 KiB, no
-    /// `FMODE_CREATED`) or created — at `now`.
+    /// (`nn_open_count_write`): the seen map decides whether a write-open
+    /// is the file's first of the window, [`write_kind`] what it counts as,
+    /// `write_step` counts.
     #[derive(Default)]
     struct Tgid {
         w: Option<OpenWriteWindow>,
@@ -885,18 +986,31 @@ mod tests {
     }
 
     impl Tgid {
-        fn open(&mut self, ino: u64, existing: bool, now: u64) -> (u32, u32, u32) {
+        /// One write-open of file `ino`, `size` bytes when opened,
+        /// `created` by the open, at `now`.
+        fn write(&mut self, ino: u64, created: bool, size: u64, now: u64) -> (u32, u32, u32) {
             let start = self.w.as_ref().map_or(now, |w| w.start_for(now));
-            let over = existing && first_in_window(self.seen.get(&ino).copied(), start);
-            if over {
+            let first = first_in_window(self.seen.get(&ino).copied(), start);
+            if first {
                 self.seen.insert(ino, start);
             }
+            let kind = write_kind(created, size != 0, size >= OVERWRITE_MIN_BYTES, first);
             match self.w.as_mut() {
-                Some(w) => write_step(w, over, !existing, now),
+                Some(w) => write_step(w, kind, now),
                 None => {
-                    self.w = Some(OpenWriteWindow::fresh(now, over, !existing));
+                    self.w = Some(OpenWriteWindow::fresh(now, kind));
                     (0, 0, 0)
                 }
+            }
+        }
+
+        /// One write-open of file `ino` — `existing` (8 KiB, no
+        /// `FMODE_CREATED`) or created — at `now`.
+        fn open(&mut self, ino: u64, existing: bool, now: u64) -> (u32, u32, u32) {
+            if existing {
+                self.write(ino, false, 8192, now)
+            } else {
+                self.write(ino, true, 0, now)
             }
         }
     }
@@ -980,31 +1094,135 @@ mod tests {
         assert_eq!(t.w.unwrap().count, 30);
     }
 
-    /// Lot 282: an open crossing both thresholds is one record, the
-    /// overwrite's, with the files rewritten as its count.
+    /// Lot 282: one write-open is one kind, so a window crosses each
+    /// threshold on its own open, each with its own count — the files
+    /// written new for `MASS_WRITE`, the files rewritten for
+    /// `MASS_OVERWRITE` (whose crossing reports the small-file one's alone:
+    /// none of them was under 4 KiB).
     #[test]
-    fn a_crossing_of_both_carries_the_rewrites() {
-        let mut w = OpenWriteWindow::fresh(0, false, true);
+    fn each_crossing_carries_its_own_count() {
+        let mut w = OpenWriteWindow::fresh(0, WriteKind::New);
         for i in 1..19u64 {
-            assert_eq!(write_step(&mut w, true, true, i).0, 0);
+            assert_eq!(write_step(&mut w, WriteKind::New, i).0, 0);
         }
-        // the 19th created; the 20th open both rewrites (19th distinct) …
-        let (bits, count, _) = write_step(&mut w, true, true, 19);
-        assert_eq!(bits, open_reason::MASS_WRITE);
-        assert_eq!(count, 20);
-        let (bits, count, _) = write_step(&mut w, true, false, 20);
-        assert_eq!(bits, open_reason::MASS_OVERWRITE);
-        assert_eq!(count, 20);
-        let mut w = OpenWriteWindow::fresh(0, true, true);
-        for i in 1..19u64 {
-            write_step(&mut w, true, true, i);
+        for i in 0..19u64 {
+            assert_eq!(write_step(&mut w, WriteKind::Rewrite, 100 + i).0, 0);
         }
-        let (bits, count, _) = write_step(&mut w, true, true, 19);
-        assert_eq!(bits, open_reason::MASS_WRITE | open_reason::MASS_OVERWRITE);
         assert_eq!(
-            count, 20,
+            write_step(&mut w, WriteKind::New, 200),
+            (open_reason::MASS_WRITE, 20, 0)
+        );
+        let (bits, count, _) = write_step(&mut w, WriteKind::Rewrite, 201);
+        assert_eq!(
+            (bits, count),
+            (open_reason::MASS_OVERWRITE, 20),
             "the overwrite crossing's count: the files rewritten"
         );
+        assert_eq!(w.fired, FIRED_WRITES | FIRED_OVERWRITES | FIRED_SMALL);
+        assert_eq!(write_step(&mut w, WriteKind::Repeat, 202), (0, 0, 0));
+        assert_eq!((w.count, w.created, w.overwrites, w.small), (41, 20, 20, 0));
+    }
+
+    /// Lot 282, the review of #500 (C1): an encryptor of small documents
+    /// in place — twenty existing non-empty files under 4 KiB rewritten —
+    /// crosses `MASS_OVERWRITE_SMALL` (the files rewritten as its count),
+    /// never `MASS_OVERWRITE`, and feeds no cgroup window. Mixed with
+    /// larger files it crosses on the twentieth distinct file of any size,
+    /// and the larger files alone cross `MASS_OVERWRITE` later, on their
+    /// twentieth. An empty file is no rewrite: it is written new.
+    #[test]
+    fn small_files_rewritten_cross_on_their_own_threshold() {
+        let mut t = Tgid::default();
+        let steps: Vec<_> = (0..40u64)
+            .map(|i| t.write(100 + i, false, 1500, i * 1_000_000))
+            .collect();
+        assert_eq!(
+            crossings(&steps),
+            vec![(19, open_reason::MASS_OVERWRITE_SMALL, OPEN_MASS_WRITE_MIN)]
+        );
+        assert!(steps.iter().all(|s| s.2 == 0), "no cgroup share");
+        let w = t.w.unwrap();
+        assert_eq!((w.small, w.overwrites, w.created), (40, 0, 0));
+        // ten of 8 KiB and ten of 1 KiB, then ten more of 8 KiB
+        let mut t = Tgid::default();
+        let mut steps: Vec<_> = (0..10u64).map(|i| t.write(i, false, 8192, i)).collect();
+        steps.extend((10..20u64).map(|i| t.write(i, false, 1024, i)));
+        steps.extend((20..30u64).map(|i| t.write(i, false, 8192, i)));
+        assert_eq!(
+            crossings(&steps),
+            vec![
+                (19, open_reason::MASS_OVERWRITE_SMALL, 20),
+                (29, open_reason::MASS_OVERWRITE, 20)
+            ]
+        );
+        // an empty file, opened to write: a file written new
+        let mut t = Tgid::default();
+        t.write(1, false, 0, 0);
+        assert_eq!(t.w.unwrap().created, 1);
+    }
+
+    /// The review of #500 (B1, its probe
+    /// `review500_probe_neither_created_nor_overwrite_counts_nothing`):
+    /// files the open did not create and that held nothing — made by
+    /// `mknod(S_IFREG)`, by an `O_TMPFILE` open linked in with `linkat`, by
+    /// an `O_RDONLY | O_CREAT` open then reopened to write — were neither
+    /// created (`FMODE_CREATED`) nor rewritten, and 500 of them crossed
+    /// nothing. They are files written new: the creation crossing on the
+    /// twentieth, with the distinct files as its count; reopened, none
+    /// counts again.
+    #[test]
+    fn files_written_new_whatever_made_them_cross_mass_write() {
+        let mut t = Tgid::default();
+        let mut steps: Vec<_> = (0..500u64)
+            .map(|i| t.write(1000 + i, false, 0, i * 1_000_000))
+            .collect();
+        steps.extend((0..500u64).map(|i| t.write(1000 + i, false, 2048, S + i)));
+        assert_eq!(
+            crossings(&steps),
+            vec![(19, open_reason::MASS_WRITE, OPEN_MASS_WRITE_MIN)]
+        );
+        let w = t.w.unwrap();
+        assert_eq!(
+            (w.created, w.overwrites, w.small, w.count),
+            (500, 0, 0, 1000)
+        );
+    }
+
+    /// Lot 282: what one write-open counts as.
+    #[test]
+    fn write_kind_reads_the_open() {
+        use WriteKind::*;
+        // (created, data, big, first)
+        assert_eq!(write_kind(false, true, true, true), Rewrite);
+        assert_eq!(write_kind(false, true, false, true), SmallRewrite);
+        assert_eq!(write_kind(false, false, false, true), New);
+        assert_eq!(write_kind(true, false, false, true), New);
+        // created by the open whatever its size (another opener's data
+        // cannot be in a file the open made)
+        assert_eq!(write_kind(true, true, true, true), New);
+        for (c, d, b) in [
+            (false, true, true),
+            (true, false, false),
+            (false, false, false),
+        ] {
+            assert_eq!(write_kind(c, d, b, false), Repeat);
+        }
+    }
+
+    /// Lot 282, the review of #500 (C1): an unlink destroys an original
+    /// when the file holds data, or held it within a burst window (a
+    /// `truncate` then an `unlink`); an empty file never seen with data is
+    /// none.
+    #[test]
+    fn an_original_held_data_now_or_within_the_window() {
+        assert!(destroys_an_original(1, None, 10 * S));
+        assert!(destroys_an_original(4096, None, 10 * S));
+        assert!(!destroys_an_original(0, None, 10 * S));
+        assert!(destroys_an_original(0, Some(10 * S), 10 * S));
+        assert!(destroys_an_original(0, Some(10 * S), 70 * S));
+        assert!(!destroys_an_original(0, Some(10 * S), 70 * S + 1));
+        // a clock read before the setattr's (CPUs apart): still within
+        assert!(destroys_an_original(0, Some(10 * S), 9 * S));
     }
 
     /// Lot 282: a file counts once per window — in the next window its
@@ -1012,7 +1230,7 @@ mod tests {
     /// start, so a stale entry never hides a file.
     #[test]
     fn a_file_counts_again_in_the_next_window() {
-        let w = OpenWriteWindow::fresh(5 * S, true, false);
+        let w = OpenWriteWindow::fresh(5 * S, WriteKind::Rewrite);
         assert_eq!(w.start_for(5 * S), 5 * S);
         assert_eq!(w.start_for(65 * S), 5 * S, "60 s is still the window");
         assert_eq!(

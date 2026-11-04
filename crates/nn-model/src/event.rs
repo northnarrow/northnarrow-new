@@ -144,6 +144,18 @@ pub enum Event {
         /// — and `count` is the cgroup's overwrites in the window.
         #[serde(default)]
         cgroup_window: bool,
+        /// Lot 282 (the review of #500, C1): an overwrite crossing that
+        /// needed files under 4 KiB (`MASS_OVERWRITE_SMALL`) — encryption in
+        /// place of small documents, or a build rewriting its own small
+        /// outputs: the posture counts it outside an authenticated session
+        /// only, the ransomware tracker not at all.
+        #[serde(default)]
+        small_files: bool,
+        /// Lot 282 (the review of #500, C1): the writer's cgroup v2 id, as
+        /// the kernel read it (0 when unknown, 1 the root): the posture
+        /// pairs a replacement's halves within one cgroup.
+        #[serde(default)]
+        cgroup_id: u64,
     },
     /// Lab PR 225: one process crossed a rename or an unlink burst
     /// threshold, counted in the kernel on `inode_rename` / `inode_unlink`
@@ -169,6 +181,10 @@ pub enum Event {
         /// unlinked file (absolute path when resolved).
         filename: String,
         timestamp_ns: u64,
+        /// Lot 282 (the review of #500, C1): the process's cgroup v2 id, as
+        /// the kernel read it (0 when unknown, 1 the root).
+        #[serde(default)]
+        cgroup_id: u64,
     },
     /// Lab PR 225 (CM-18): a signal that stops or ends a process, sent to
     /// the main process of another security tool of the host (the list

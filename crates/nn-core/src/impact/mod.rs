@@ -19,9 +19,10 @@
 //!   extension appended to the names of the originals (d) deleted, found
 //!   beside them;
 //! - **(d) deletion of originals after writing new files** — the unlink
-//!   burst (`Event::FileBurst { kind: Unlink }`: 20 files of at least 4 KiB
-//!   in 60 s) of an actor that crossed the new-file mass-write threshold in
-//!   the window.
+//!   burst (`Event::FileBurst { kind: Unlink }`: 20 files that held data in
+//!   60 s — lot 282, the review of #500: any size, it was 4 KiB or more) of
+//!   an actor that crossed the new-file mass-write threshold in the window
+//!   (lot 282: files written new, the open's own creation or not).
 //!
 //! Any **two** of them within [`RANSOM_WINDOW_NS`] for one actor make the
 //! assessment **decisive**: NN-L-IMP-001 (Critical, `KillProcessTree` of the
@@ -368,8 +369,12 @@ impl<H: DecisionHost> RansomTracker<H> {
         let mut sample: Option<String> = None;
         let mut copies_of: Option<(String, Vec<String>, u32)> = None;
         match event {
+            // Lot 282 (the review of #500, C1): a crossing that needed files
+            // under 4 KiB is no shape (a) — a build rewrites its own small
+            // outputs; the posture's arm reads it outside a session.
             Event::MassWrite {
                 overwrites: true,
+                small_files: false,
                 count,
                 filename,
                 cgroup_window,
@@ -443,8 +448,8 @@ impl<H: DecisionHost> RansomTracker<H> {
                     shapes.push((
                         Signal::DeleteOriginals,
                         format!(
-                            "{count} files of 4 KiB or more deleted in 60 s after {} new files \
-                             were written, last {filename}",
+                            "{count} files holding data deleted in 60 s after {} new files were \
+                             written, last {filename}",
                             common::wire::open_sensor::OPEN_MASS_WRITE_MIN
                         ),
                     ));

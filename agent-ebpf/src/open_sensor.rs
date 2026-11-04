@@ -46,14 +46,13 @@ use northnarrow_common::wire::open_sensor::{
         FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE, LEAF_CRED, LEAVES_CRED, SUBTREE,
         TREE_CARVEOUT, TREE_CRED, TREE_CRITICAL, TREE_HOME, TREE_PERSIST, TREE_RUNTIME,
     },
-    cgroup_step, created_in_window, first_in_window, kdbx_suffix, name_ext, open_reason,
-    rename_shape_with,
-    rename_step, unlink_step, write_step, ChildRuleKey, DestroySeenKey, DirClass, NameParts,
-    OpenCgKey, OpenCgWindow, OpenRecordRaw, OpenWriteWindow, OverwriteSeenKey, RenameNames,
-    RenameWindow, UnlinkWindow, CHILD_RULES_MAX, NAME_HEAD_LEN,
+    cgroup_step, created_in_window, destroys_an_original, first_in_window, kdbx_suffix, name_ext,
+    open_reason, rename_shape_with, rename_step, unlink_step, write_kind, write_step, ChildRuleKey,
+    DestroySeenKey, DirClass, NameParts, OpenCgKey, OpenCgWindow, OpenRecordRaw, OpenWriteWindow,
+    OverwriteSeenKey, RenameNames, RenameWindow, UnlinkWindow, CHILD_RULES_MAX, NAME_HEAD_LEN,
     NAME_TAIL_LEN, OPEN_CLASSIFY_DEPTH, OPEN_NAME_LEN, OPEN_NAME_RULES_MAX, OPEN_PATH_SLOTS,
-    OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX, OPEN_SENSOR_ARMED, RENAME_APPENDED, RENAME_OTHER,
-    RUNTIME_UIDS_MAX, UNLINK_MIN_BYTES,
+    OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX, OPEN_SENSOR_ARMED, OVERWRITE_MIN_BYTES, RENAME_APPENDED,
+    RENAME_OTHER, RUNTIME_UIDS_MAX,
 };
 use northnarrow_common::wire::{InodeKey, FIM_OP_OPENED};
 
@@ -71,13 +70,6 @@ const FMODE_WRITE: u32 = 0x2;
 /// created the file. Set before `security_file_open` runs.
 const FMODE_CREATED: u32 = 0x10_0000;
 
-/// An overwrite counts only for an existing file of at least this size,
-/// read at open (before `O_TRUNC` empties it). Encryption in place is the
-/// shape of documents; a build rewrites its own small outputs — a full
-/// workspace rebuild in the lab (lab PR 127): up to 17 overwrites per
-/// cargo process in all, at most 4 of 4 KiB or more — and a cargo build,
-/// counted as ransomware, was killed and cargo and rustc quarantined.
-const OVERWRITE_MIN_BYTES: u64 = 4096;
 /// `BTRFS_SUPER_MAGIC`, include/uapi/linux/magic.h.
 const BTRFS_SUPER_MAGIC: u64 = 0x9123_683E;
 const S_IFMT: u16 = 0o170_000;
@@ -138,10 +130,12 @@ static OPEN_WRITES: LruHashMap<u32, OpenWriteWindow> = LruHashMap::with_max_entr
 /// forks a fresh worker every few files stays under the per-tgid one).
 #[map]
 static OPEN_CG_WRITES: LruHashMap<OpenCgKey, OpenCgWindow> = LruHashMap::with_max_entries(1024, 0);
-/// Lot 282: the files each tgid rewrote in its current write window (the
+/// Lot 282: the files each tgid wrote in its current write window (the
 /// value: that window's start). A file's later opens in the window are
 /// plain write-opens, not rewrites of another file: one database rewritten
-/// 259 times was a mass overwrite. An evicted entry counts its file again.
+/// 259 times was a mass overwrite. The review of #500 (B1): every file
+/// written, so a file written new counts once too, whatever made it. An
+/// evicted entry counts its file again.
 #[map]
 static OPEN_OVERWRITE_SEEN: LruHashMap<OverwriteSeenKey, u64> = LruHashMap::with_max_entries(16384, 0);
 /// Lot 282: the originals each tgid destroyed in its current unlink window,
@@ -155,6 +149,14 @@ static OPEN_DESTROY_SEEN: LruHashMap<DestroySeenKey, u64> = LruHashMap::with_max
 /// such a file count as an original — more, never fewer.
 #[map]
 static OPEN_CREATED: LruHashMap<OverwriteSeenKey, u64> = LruHashMap::with_max_entries(16384, 0);
+/// Lot 282, the review of #500 (C1): the regular files seen holding data
+/// at an `inode_setattr` (a chmod, a chown, a `touch`, a truncate — whose
+/// own setattr runs before it empties the file), by inode (the value:
+/// when), so that one emptied by a truncate and then unlinked is an
+/// original destroyed ([`destroys_an_original`]), whoever unlinks it. An
+/// evicted entry makes such an unlink count nothing — as it counted before.
+#[map]
+static OPEN_HAD_DATA: LruHashMap<InodeKey, u64> = LruHashMap::with_max_entries(4096, 0);
 /// Review 75: the last read-only report per (task, inode)
 /// ([`crate::read_repeat`]).
 #[map]
@@ -457,10 +459,11 @@ unsafe fn loginuid() -> u32 {
 /// The write-open counts of the sensor, and the record of a crossing:
 /// `cls` is the parent directory's [`DirClass`] (bits in the low half, the
 /// runtime directory's owner in the high half), `dentry` the opened file's
-/// dentry, `dev_over` its device with the overwrite flag in bit 63
-/// (`overwrite`: no `FMODE_CREATED`, at least [`OVERWRITE_MIN_BYTES`];
-/// external audit POS-002) and the creation flag in bit 62 (lot 282:
-/// `FMODE_CREATED`), `ino` its inode number, `flags_mode` its
+/// dentry, `dev_over` its device with, lot 282, three flags: bit 63 the
+/// file held data when opened (its size not zero, read before `O_TRUNC`
+/// empties it), bit 62 the open created it (`FMODE_CREATED`), bit 61 its
+/// size is at least [`OVERWRITE_MIN_BYTES`] (external audit POS-002, lab PR
+/// 127) — `ino` its inode number, `flags_mode` its
 /// `f_flags` and, in the high half, its `f_mode`. When a window crosses
 /// its threshold ([`count_write`]) the record is emitted here — `reason`
 /// the mass-write bits, `count` the window's — unless the writer is the
@@ -477,7 +480,7 @@ unsafe fn loginuid() -> u32 {
 pub extern "C" fn nn_open_count_write(cls: u64, dentry: u64, dev_over: u64, ino: u64, flags_mode: u64) -> u64 {
     unsafe {
         let key = InodeKey {
-            dev: dev_over & !(3u64 << 62),
+            dev: dev_over & !(7u64 << 61),
             ino,
         };
         let r = count_write(
@@ -485,6 +488,7 @@ pub extern "C" fn nn_open_count_write(cls: u64, dentry: u64, dev_over: u64, ino:
             (cls >> 32) as u32,
             dev_over >> 63 != 0,
             (dev_over >> 62) & 1 != 0,
+            (dev_over >> 61) & 1 != 0,
             &key,
         );
         let reason = r as u32;
@@ -504,15 +508,23 @@ pub extern "C" fn nn_open_count_write(cls: u64, dentry: u64, dev_over: u64, ino:
 
 /// Count a write-open per tgid and, for an overwrite, per cgroup (external
 /// audit EBPF-011). Returns the [`open_reason`] bits this open adds in the
-/// low half — `MASS_WRITE` / `MASS_OVERWRITE` when the tgid's window
-/// crosses the threshold, `MASS_OVERWRITE_CGROUP` when its cgroup's does,
-/// each once per window — and the count in the high half (the cgroup's
-/// overwrites when that window crossed, else the tgid's: the files it
-/// rewrote, or created). Lot 282: `overwrite` counts only for the file's
-/// first rewrite of the window ([`OPEN_OVERWRITE_SEEN`]); `created`: the
-/// open created its file.
+/// low half — `MASS_WRITE` / `MASS_OVERWRITE` / `MASS_OVERWRITE_SMALL`
+/// when the tgid's window crosses a threshold, `MASS_OVERWRITE_CGROUP`
+/// when its cgroup's does, each once per window — and the count in the
+/// high half (the cgroup's overwrites when that window crossed, else the
+/// tgid's: the files it rewrote, or wrote new). Lot 282: each file counts
+/// once per window ([`OPEN_OVERWRITE_SEEN`]), as [`write_kind`] reads its
+/// first write-open — `data`: it held data, `created`: the open created
+/// it, `big`: at least [`OVERWRITE_MIN_BYTES`].
 #[inline(always)]
-unsafe fn count_write(cls_bits: u32, cls_uid: u32, overwrite: bool, created: bool, key: &InodeKey) -> u64 {
+unsafe fn count_write(
+    cls_bits: u32,
+    cls_uid: u32,
+    data: bool,
+    created: bool,
+    big: bool,
+    key: &InodeKey,
+) -> u64 {
     if cls_bits & TREE_CARVEOUT != 0 {
         return 0;
     }
@@ -530,28 +542,26 @@ unsafe fn count_write(cls_bits: u32, cls_uid: u32, overwrite: bool, created: boo
         };
         let _ = OPEN_CREATED.insert(&made, &now, 0);
     }
-    let mut overwrite = overwrite;
-    if overwrite {
-        let start = match OPEN_WRITES.get(&tgid) {
-            Some(w) => w.start_for(now),
-            None => now,
-        };
-        let seen = OverwriteSeenKey {
-            tgid,
-            _pad: 0,
-            dev: key.dev,
-            ino: key.ino,
-        };
-        if first_in_window(OPEN_OVERWRITE_SEEN.get(&seen).copied(), start) {
-            let _ = OPEN_OVERWRITE_SEEN.insert(&seen, &start, 0);
-        } else {
-            overwrite = false;
-        }
+    let window = OPEN_WRITES.get_ptr_mut(&tgid);
+    let start = match window {
+        Some(w) => (*w).start_for(now),
+        None => now,
+    };
+    let seen = OverwriteSeenKey {
+        tgid,
+        _pad: 0,
+        dev: key.dev,
+        ino: key.ino,
+    };
+    let first = first_in_window(OPEN_OVERWRITE_SEEN.get(&seen).copied(), start);
+    if first {
+        let _ = OPEN_OVERWRITE_SEEN.insert(&seen, &start, 0);
     }
-    let (mut reason, mut count, cg_add) = match OPEN_WRITES.get_ptr_mut(&tgid) {
-        Some(w) => write_step(&mut *w, overwrite, created, now),
+    let kind = write_kind(created, data, big, first);
+    let (mut reason, mut count, cg_add) = match window {
+        Some(w) => write_step(&mut *w, kind, now),
         None => {
-            let _ = OPEN_WRITES.insert(&tgid, &OpenWriteWindow::fresh(now, overwrite, created), 0);
+            let _ = OPEN_WRITES.insert(&tgid, &OpenWriteWindow::fresh(now, kind), 0);
             (0, 0, 0)
         }
     };
@@ -810,11 +820,13 @@ unsafe fn observe(
     // the million instructions.
     if write && regular {
         let created = mode & FMODE_CREATED != 0;
-        let over = !created && size >= OVERWRITE_MIN_BYTES;
         let _ = nn_open_count_write(
             u64::from(cls.bits) | (u64::from(cls.uid) << 32),
             dentry as u64,
-            key.dev | (u64::from(over) << 63) | (u64::from(created) << 62),
+            key.dev
+                | (u64::from(size != 0) << 63)
+                | (u64::from(created) << 62)
+                | (u64::from(size >= OVERWRITE_MIN_BYTES) << 61),
             key.ino,
             u64::from(flags) | (u64::from(mode) << 32),
         );
@@ -893,6 +905,9 @@ unsafe fn emit_record(reason: u32, key: &InodeKey, dentry: *const u8, flags: u32
     (*raw).mode = mode;
     (*raw).reason = reason;
     (*raw).count = count;
+    // Lot 282 (the review of #500, C1): the replacement's halves are
+    // paired per cgroup too.
+    (*raw).cgroup = bpf_get_current_cgroup_id();
     let dst = (*raw).path.as_mut_ptr();
     let mut d = dentry;
     let mut n: usize = 0;
@@ -1162,8 +1177,10 @@ pub extern "C" fn nn_rename_shape() -> u64 {
 }
 
 /// Lab PR 225, from `inode_unlink` (`fim_watch::fim_unlink_observe`): an
-/// unlink of a regular file of at least [`UNLINK_MIN_BYTES`] counts in its
-/// tgid's window ([`unlink_step`]); the crossing reports
+/// unlink of a regular file that destroys an original
+/// ([`destroys_an_original`]: it holds data, or held it within the window
+/// — lot 282, the review of #500; it was a file of at least 4 KiB) counts
+/// in its tgid's window ([`unlink_step`]); the crossing reports
 /// [`open_reason::MASS_UNLINK`] once per window. Ransomware that writes an
 /// encrypted copy deletes the original. The agent's own unlinks do not
 /// count. A global BPF function, as [`nn_rename_burst`].
@@ -1191,7 +1208,7 @@ unsafe fn unlink_burst(dentry: *const u8) {
         return;
     }
     let (mode, size) = mode_size(inode);
-    if mode & S_IFMT != S_IFREG || size < UNLINK_MIN_BYTES {
+    if mode & S_IFMT != S_IFREG {
         return;
     }
     if crate::fim_watch::caller_is_in_family() {
@@ -1199,9 +1216,14 @@ unsafe fn unlink_burst(dentry: *const u8) {
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let now = bpf_ktime_get_ns();
+    let key = key_of(inode);
+    // Lot 282, the review of #500 (C1): an empty file is an original only
+    // if it held data within the window (emptied by a truncate first).
+    if size == 0 && !destroys_an_original(0, OPEN_HAD_DATA.get(&key).copied(), now) {
+        return;
+    }
     // Lot 282: a file this process created within the window is its own
     // temporary file, no original.
-    let key = key_of(inode);
     let made = OverwriteSeenKey {
         tgid,
         _pad: 0,
@@ -1246,6 +1268,37 @@ unsafe fn unlink_burst(dentry: *const u8) {
         return;
     }
     emit(open_reason::MASS_UNLINK, &key, dentry, 0, 0, count);
+}
+
+/// Lot 282, the review of #500 (C1), from `inode_setattr`
+/// (`fim_watch::fim_setattr_observe`): a regular file that holds data now,
+/// before the setattr applies (a truncate's own setattr runs before it
+/// empties the file), is remembered in [`OPEN_HAD_DATA`] — its unlink once
+/// emptied still destroys an original. A global BPF function, as
+/// [`nn_unlink_burst`].
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_setattr_mark(dentry: u64) -> u64 {
+    unsafe { setattr_mark(dentry as *const u8) };
+    0
+}
+
+#[inline(always)]
+unsafe fn setattr_mark(dentry: *const u8) {
+    if !armed() || dentry.is_null() {
+        return;
+    }
+    let inode = read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET)));
+    if inode.is_null() {
+        return;
+    }
+    let (mode, size) = mode_size(inode);
+    if mode & S_IFMT != S_IFREG || size == 0 {
+        return;
+    }
+    let key = key_of(inode);
+    let now = bpf_ktime_get_ns();
+    let _ = OPEN_HAD_DATA.insert(&key, &now, 0);
 }
 
 /// Review 86: a file capability set by any route — `setcap`, a direct

@@ -310,11 +310,12 @@ fn switch_off_commands_need_their_arguments() {
 /// killed podman). A container runtime flushing its own chain — the
 /// parent of the `iptables` a runtime program (a CNI plugin, dockerd,
 /// podman, netavark, …) in a system tree, installed by a package — switches
-/// nothing off. The host firewall's chains (ufw, fail2ban), `DOCKER-USER`
-/// (the administrator's rules), a built-in chain or a whole table stay a
-/// switch-off whoever flushes them; a runtime's chain flushed by a shell, an
-/// unpackaged plugin (`/opt/cni/bin`) or an unlisted program in the plugins'
-/// directory stays one too.
+/// nothing off. The host firewall's chains (ufw, fail2ban), the filter
+/// chains a runtime creates — `DOCKER-USER`, `CNI-ADMIN` (the
+/// administrators' rules), `KUBE-FIREWALL` — a built-in chain or a whole
+/// table stay a switch-off whoever flushes them; a runtime's chain flushed
+/// by a shell, an unpackaged plugin (`/opt/cni/bin`) or an unlisted program
+/// in the plugins' directory stays one too.
 #[test]
 fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
     let h = host();
@@ -517,6 +518,10 @@ fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
         (311, &["iptables", "-F", "ufw-before-input"][..]),
         (300, &["iptables", "-F", "f2b-sshd"][..]),
         (300, &["iptables", "-F", "DOCKER-USER"][..]),
+        // the review of #500 (C2): CNI's and kube-proxy's filter chains
+        (311, &["iptables", "-t", "filter", "-F", "CNI-ADMIN"][..]),
+        (300, &["iptables", "-F", "KUBE-FIREWALL"][..]),
+        (311, &["ip6tables", "--flush", "KUBE-FIREWALL"][..]),
         (300, &["iptables", "-F", "INPUT"][..]),
         (311, &["iptables", "-t", "nat", "-F"][..]),
         (300, &["iptables", "-F"][..]),

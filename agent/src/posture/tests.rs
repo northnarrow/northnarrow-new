@@ -2161,6 +2161,8 @@ fn overwrites(pid: u32, uid: u32) -> Event {
         timestamp_ns: 50_000_000_000,
         overwrites: true,
         cgroup_window: false,
+        small_files: false,
+        cgroup_id: 0,
     }
 }
 

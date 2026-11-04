@@ -527,6 +527,9 @@ unsafe fn try_fim_setattr_observe(ctx: &LsmContext) -> i32 {
             emit_drift(FIM_OP_MODIFIED, key);
         }
     }
+    // Lot 282 (the review of #500, C1): a file that holds data before a
+    // truncate empties it — its unlink then destroys an original.
+    let _ = crate::open_sensor::nn_setattr_mark(dentry as u64);
     0 // observe-only — NEVER return -EPERM
 }
 

@@ -301,28 +301,37 @@ pub(crate) fn process_event(
             count,
             filename,
             cgroup_window: true,
+            cgroup_id,
             ..
         } => info!(
             pid = *pid,
             comm = %Escaped(comm),
             overwrites = *count,
             last = %Escaped(filename),
+            cgroup = *cgroup_id,
             "mass write: overwrite threshold crossed by the processes of one cgroup (counted in the kernel)"
         ),
         // Lot 282: the kernel counts distinct existing files rewritten and
-        // files created apart (it counted write-opens).
+        // files written new apart (it counted write-opens); the review of
+        // #500: the rewrites of files under 4 KiB too (`small_files`), and
+        // every crossing names its cgroup (the replacement's halves pair
+        // there).
         Event::MassWrite {
             pid,
             comm,
             count,
             filename,
             overwrites: true,
+            small_files,
+            cgroup_id,
             ..
         } => info!(
             pid = *pid,
             comm = %Escaped(comm),
             rewritten = *count,
+            small_files = *small_files,
             last = %Escaped(filename),
+            cgroup = *cgroup_id,
             "mass write: distinct existing files rewritten crossed the threshold (counted in the kernel)"
         ),
         Event::MassWrite {
@@ -330,13 +339,15 @@ pub(crate) fn process_event(
             comm,
             count,
             filename,
+            cgroup_id,
             ..
         } => info!(
             pid = *pid,
             comm = %Escaped(comm),
             created = *count,
             last = %Escaped(filename),
-            "mass write: files created crossed the threshold (counted in the kernel)"
+            cgroup = *cgroup_id,
+            "mass write: files created crossed the threshold (files written new — created, or empty when opened; counted in the kernel)"
         ),
         // Lab PR 225: the rename and unlink bursts (NN-L-IMP-001/002 read them).
         Event::FileBurst {
@@ -345,6 +356,7 @@ pub(crate) fn process_event(
             kind,
             count,
             filename,
+            cgroup_id,
             ..
         } => info!(
             pid = *pid,
@@ -352,6 +364,7 @@ pub(crate) fn process_event(
             kind = kind.as_str(),
             count = *count,
             last = %Escaped(filename),
+            cgroup = *cgroup_id,
             "file burst: rename or destroyed-originals threshold crossed (counted in the kernel)"
         ),
         // Lab PR 225: NN-L-EVA-003 reports it.

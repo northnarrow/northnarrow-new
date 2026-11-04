@@ -486,17 +486,26 @@ pub struct DefenseDetector<H: DecisionHost> {
 /// Cilium's (`cilium_…`), netavark's (`NETAVARK…`). Their flush by the
 /// runtime that owns them is its own networking at work (podman's CNI
 /// plugin at a container's removal, dockerd at its start), not a firewall
-/// switched off. `DOCKER-USER` is not one of them: it holds the
-/// administrator's own rules for the containers' traffic. The host
-/// firewall's chains — ufw's (`ufw-…`), fail2ban's (`f2b-…`), firewalld's
-/// zones, the built-in ones — hold its filtering: emptied by anyone, the
-/// firewall is off.
+/// switched off. The chains among them whose function is filtering
+/// ([`FILTER_CHAINS`]) are not. The host firewall's chains — ufw's
+/// (`ufw-…`), fail2ban's (`f2b-…`), firewalld's zones, the built-in ones —
+/// hold its filtering: emptied by anyone, the firewall is off.
 const RUNTIME_CHAIN_PREFIXES: &[&str] =
     &["CNI-", "DOCKER", "KUBE-", "cali-", "cilium_", "NETAVARK"];
 
-/// Lot 282: a chain of [`RUNTIME_CHAIN_PREFIXES`].
+/// Lot 282, the review of #500 (C2): the chains a runtime creates whose
+/// function is a firewall's, judged as the host firewall's whoever flushes
+/// them — `DOCKER-USER` (the administrator's own rules for the containers'
+/// traffic), `CNI-ADMIN` (the same for CNI's `firewall` plugin) and
+/// `KUBE-FIREWALL` (kube-proxy's and the kubelet's drop of marked packets,
+/// the guard of `route_localnet`). No runtime empties them at its start or
+/// at a container's removal.
+const FILTER_CHAINS: &[&str] = &["DOCKER-USER", "CNI-ADMIN", "KUBE-FIREWALL"];
+
+/// Lot 282: a chain of [`RUNTIME_CHAIN_PREFIXES`] that is no filter chain
+/// ([`FILTER_CHAINS`]).
 fn is_runtime_chain(chain: &str) -> bool {
-    chain != "DOCKER-USER" && RUNTIME_CHAIN_PREFIXES.iter().any(|p| chain.starts_with(p))
+    !FILTER_CHAINS.contains(&chain) && RUNTIME_CHAIN_PREFIXES.iter().any(|p| chain.starts_with(p))
 }
 
 /// Lot 282: the programs that flush a runtime's chains when they are the

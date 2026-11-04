@@ -463,30 +463,72 @@ enum Half {
     Destroyed,
 }
 
-/// Lot 282: per pid, the last time each half of the replacement shape was
-/// reported (pruned of pids older than a window past 1,024, as
-/// [`MassWriters`]).
+/// Lot 282: who a half of the replacement shape belongs to — the process
+/// that crossed it, and (the review of #500, C1) its cgroup: an encryptor
+/// that writes the copies and a separate process that deletes the
+/// originals (a helper, an `rm` it runs, a second worker of the same
+/// unit or container) are one replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PairKey {
+    Pid(u32),
+    Cgroup(u64),
+}
+
+/// Lot 282: per process and per cgroup, the last time each half of the
+/// replacement shape was reported (pruned of keys older than a window past
+/// 1,024, as [`MassWriters`]).
 #[derive(Debug, Default, Clone)]
-struct Replacements(Arc<parking_lot::Mutex<HashMap<u32, [Option<u64>; 2]>>>);
+struct Replacements(Arc<parking_lot::Mutex<HashMap<PairKey, [Option<u64>; 2]>>>);
 
 impl Replacements {
-    /// Record `half` of `pid` at `ts_ns`; whether the other half lies
-    /// within a mass-write window of it, on either side (the rings are
-    /// drained apart, and a writer may delete before it writes).
-    fn record(&self, pid: u32, half: Half, ts_ns: u64) -> bool {
+    /// Record `half` of `pid` — and of `cgroup`, when given — at `ts_ns`;
+    /// whether the other half of either lies within a mass-write window of
+    /// it, on either side (the rings are drained apart, and a writer may
+    /// delete before it writes).
+    fn record(&self, pid: u32, cgroup: Option<u64>, half: Half, ts_ns: u64) -> bool {
         let mut g = self.0.lock();
         if g.len() > 1024 {
             let cutoff = ts_ns.saturating_sub(MASS_WRITE_WINDOW_NS);
             g.retain(|_, h| h.iter().flatten().any(|t| *t >= cutoff));
         }
-        let h = g.entry(pid).or_default();
         let (mine, other) = match half {
             Half::Created => (0, 1),
             Half::Destroyed => (1, 0),
         };
-        h[mine] = Some(ts_ns);
-        h[other].is_some_and(|t| t.abs_diff(ts_ns) <= MASS_WRITE_WINDOW_NS)
+        let mut paired = false;
+        for key in [Some(PairKey::Pid(pid)), cgroup.map(PairKey::Cgroup)]
+            .into_iter()
+            .flatten()
+        {
+            let h = g.entry(key).or_default();
+            h[mine] = Some(ts_ns);
+            paired |= h[other].is_some_and(|t| t.abs_diff(ts_ns) <= MASS_WRITE_WINDOW_NS);
+        }
+        paired
     }
+}
+
+/// Lot 282, the review of #500 (C1): the cgroup a replacement's half is
+/// paired in — the kernel's cgroup v2 id of the process that crossed it,
+/// unless that is unknown or the root (no hierarchy in use: every process
+/// would pair with every other), or the half would not count on its own
+/// account: an exempt writer's ([`mass_write_exempt`]) or a process of an
+/// authenticated session's (whose new files never counted) is paired with
+/// its own process's other half alone, as before.
+fn pairing_cgroup<H: PostureHost>(
+    auth: &AuthSessionTracker<H>,
+    pid: u32,
+    cgroup_id: u64,
+    ts_ns: u64,
+    filename: &str,
+) -> Option<u64> {
+    if cgroup_id <= 1
+        || mass_write_exempt(auth, pid, ts_ns, filename, false).is_some()
+        || auth.is_auth_mediated(pid, AsOf::judged(ts_ns))
+    {
+        return None;
+    }
+    Some(cgroup_id)
 }
 
 impl<H: DecisionHost> TriggerDetector<H> {
@@ -789,9 +831,10 @@ impl<H: DecisionHost> TriggerDetector<H> {
             if *operation != nn_model::FsProtectOperation::CgroupJoin {
                 hits.push(if *pid == 1 {
                     TriggerType::RelayedTamperAttempt
-                } else if self
-                    .auth
-                    .in_package_transaction(*pid, AsOf::judged(*timestamp_ns))
+                } else if is_package_file_operation(*operation)
+                    && self
+                        .auth
+                        .in_package_transaction(*pid, AsOf::judged(*timestamp_ns))
                 {
                     // Lot 282 (Tappa Prove): a refusal of a package
                     // transaction's process — `deb-systemd-helper` removing a
@@ -801,7 +844,13 @@ impl<H: DecisionHost> TriggerDetector<H> {
                     // own, and the ladder killed the maintainer script. The
                     // transaction is judged as R009 and the FIM rules judge it
                     // (a package manager proper executed by root whose run
-                    // covers the refusal).
+                    // covers the refusal). The review of #500 (B2): only the
+                    // file operations a maintainer script does
+                    // ([`is_package_file_operation`]); a refused signal,
+                    // ptrace, BPF handle, kexec, cgroup write, limit, read or
+                    // scheduling change keeps its weight below — any root
+                    // process becomes a "transaction" with an `apt-get -o
+                    // APT::Update::Pre-Invoke::=…` hook.
                     TriggerType::PackageTamperRefusal
                 } else if *operation == nn_model::FsProtectOperation::Read {
                     // External audit EVD-001: a refused read of the agent's
@@ -1463,25 +1512,35 @@ fn staging_exec<H: PostureAgent>(
 ///    or 40 by the processes of one cgroup, each with three or more
 ///    (external audit EBPF-011). Counted inside an authenticated session
 ///    too (external audit POS-002: encryption in place run from a shell).
-/// 2. **replacement** — at least [`MASS_WRITE_MIN`] distinct originals of
-///    4 KiB or more destroyed (unlinked, or replaced by a rename onto their
-///    name; each name once) by a process that also created at least
-///    [`MASS_WRITE_MIN`] files, the two crossings within a window of each
-///    other in either order (`FileBurst { kind: Unlink }` and
-///    `MassWrite { overwrites: false }`): an encrypted copy written, the
-///    original deleted or replaced. Outside an authenticated session: a
-///    session's new files never counted (POS-002), and a checkout or an
-///    archive extracted over a tree from a shell is this shape.
+///    The review of #500 (C1): files under 4 KiB count too, each once, but
+///    only outside an authenticated session (`MassWrite { small_files:
+///    true }`): inside one only files of 4 KiB or more ever counted — a
+///    build rewrites its own small outputs (lab PR 127: cargo killed).
+/// 2. **replacement** — at least [`MASS_WRITE_MIN`] distinct originals
+///    destroyed (unlinked, or replaced by a rename onto their name; each
+///    name once; a file that holds data, or held it within the window — a
+///    truncate then an unlink) by a process that also wrote at least
+///    [`MASS_WRITE_MIN`] files new (created by the open, or empty when
+///    opened: `mknod`, `O_TMPFILE` — the review of #500, B1), the two
+///    crossings within a window of each other in either order
+///    (`FileBurst { kind: Unlink }` and `MassWrite { overwrites: false }`):
+///    an encrypted copy written, the original deleted or replaced. The two
+///    halves pair within one process, or (the review of #500, C1) within
+///    one cgroup — an encryptor and a separate deleter. Outside an
+///    authenticated session: a session's new files never counted
+///    (POS-002), and a checkout or an archive extracted over a tree from a
+///    shell is this shape.
 /// 3. **never on their own** — files created (an image pulled, a clone,
 ///    an archive extracted, a build, a cache filled), one file rewritten
 ///    again and again (a database, a state file), originals deleted (`rm
 ///    -rf`, a purge, a cache sweep).
 ///
-/// Tracepoint mode (no LSM sensor: every open reaches userland, and
-/// whether its file existed is not known): the distinct files one process
-/// opened to write in the window; an open that must create its file
-/// (`O_CREAT | O_EXCL`) never counts, and inside a session no open that
-/// may create one does (POS-002).
+/// Tracepoint mode (no LSM sensor: every open reaches userland, whether its
+/// file existed is not known, and no unlink is seen): the distinct files
+/// one process opened to write in the window — an extraction counts as on
+/// main, since a copy-and-delete encryptor's copies (`O_CREAT | O_EXCL`
+/// among them: the review of #500, C1) cannot be told from it — and inside
+/// a session no open that may create one does (POS-002).
 ///
 /// The writers [`mass_write_exempt`] names are exempt from every shape.
 #[allow(clippy::too_many_arguments)]
@@ -1512,11 +1571,20 @@ fn confirmed_intrusion<H: PostureHost>(
             timestamp_ns,
             overwrites,
             cgroup_window,
+            small_files,
+            cgroup_id,
             ..
         } => {
-            let shape = if *overwrites {
+            let shape = if *overwrites && *small_files {
+                Shape::SmallRewrites
+            } else if *overwrites {
                 Shape::Rewrites
-            } else if replacements.record(*pid, Half::Created, *timestamp_ns) {
+            } else if replacements.record(
+                *pid,
+                pairing_cgroup(auth, *pid, *cgroup_id, *timestamp_ns, filename),
+                Half::Created,
+                *timestamp_ns,
+            ) {
                 Shape::Replacement
             } else {
                 tracing::debug!(
@@ -1545,9 +1613,15 @@ fn confirmed_intrusion<H: PostureHost>(
             count,
             filename,
             timestamp_ns,
+            cgroup_id,
             ..
         } => {
-            if !replacements.record(*pid, Half::Destroyed, *timestamp_ns) {
+            if !replacements.record(
+                *pid,
+                pairing_cgroup(auth, *pid, *cgroup_id, *timestamp_ns, filename),
+                Half::Destroyed,
+                *timestamp_ns,
+            ) {
                 tracing::debug!(
                     pid = *pid,
                     comm = %nn_model::log_escape::Escaped(comm),
@@ -1578,9 +1652,13 @@ fn confirmed_intrusion<H: PostureHost>(
 /// Lot 282: which rule of the arm a kernel crossing meets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
-    /// Distinct existing files rewritten in place.
+    /// Distinct existing files of 4 KiB or more rewritten in place.
     Rewrites,
-    /// Originals destroyed by a process that created files beside them.
+    /// The review of #500 (C1): distinct existing non-empty files rewritten
+    /// in place, some under 4 KiB.
+    SmallRewrites,
+    /// Originals destroyed by a process (or a cgroup) that wrote files new
+    /// beside them.
     Replacement,
 }
 
@@ -1588,8 +1666,15 @@ impl Shape {
     fn as_str(self) -> &'static str {
         match self {
             Shape::Rewrites => "existing files rewritten",
+            Shape::SmallRewrites => "existing files rewritten, some under 4 KiB",
             Shape::Replacement => "originals destroyed and replaced by new files",
         }
+    }
+
+    /// Counted inside an authenticated session too: only the rewrites of
+    /// files of 4 KiB or more (POS-002).
+    fn counts_in_a_session(self) -> bool {
+        self == Shape::Rewrites
     }
 }
 
@@ -1631,16 +1716,19 @@ fn kernel_arm<H: PostureHost>(
     // ransomware run from a session never raised it. Its rewrites of
     // existing files — the shape of encryption in place — count; its new
     // files never did, and lot 282: neither does a replacement of
-    // originals by new files (a checkout, an archive extracted over a tree).
-    if shape == Shape::Replacement && auth.is_auth_mediated(c.pid, AsOf::judged(c.timestamp_ns)) {
+    // originals by new files (a checkout, an archive extracted over a tree),
+    // nor (the review of #500, C1) a crossing that needed files under 4 KiB
+    // (a build rewriting its own small outputs: lab PR 127).
+    if !shape.counts_in_a_session() && auth.is_auth_mediated(c.pid, AsOf::judged(c.timestamp_ns)) {
         tracing::info!(
             pid = c.pid,
             comm = %Escaped(c.comm),
             filename = %Escaped(c.filename),
             count = c.count,
-            "originals replaced by new files inside an authenticated session — not counted (a \
-             checkout, an archive extracted over a tree); rewriting existing files in place would \
-             be"
+            shape = shape.as_str(),
+            "crossing inside an authenticated session — not counted (a checkout, an archive \
+             extracted over a tree, a build's own small outputs); rewriting existing files of 4 \
+             KiB or more in place would be"
         );
         return false;
     }
@@ -1726,11 +1814,12 @@ fn tracepoint_arm<H: PostureHost>(
     // External audit POS-002 (tracepoint mode sees the open flags but not
     // whether the file existed): a session's opens that may create
     // (`O_CREAT`) do not count, its opens of an existing file to write do.
-    // Lot 282: an open that must create its file (`O_CREAT | O_EXCL`: it
-    // fails on an existing one) never counts, for anyone.
+    // Lot 282, the review of #500 (C1): outside a session an open that
+    // must create its file (`O_CREAT | O_EXCL`) counts too — an encryptor's
+    // copies are such files, and tracepoint mode sees no unlink to pair
+    // them with (it did not count, and nothing saw them).
     let session = auth.is_auth_mediated(*focal_pid, AsOf::judged(*focal_ts));
-    let counted =
-        |f: u32| f & (O_CREAT | O_EXCL) != (O_CREAT | O_EXCL) && (!session || f & O_CREAT == 0);
+    let counted = |f: u32| !session || f & O_CREAT == 0;
     if !counted(*flags) {
         return false;
     }
@@ -2057,9 +2146,32 @@ fn is_write_open(flags: u32) -> bool {
 
 /// `O_CREAT` on Linux (0o100): the open may create the file.
 const O_CREAT: u32 = 0o100;
-/// `O_EXCL` on Linux (0o200): with `O_CREAT`, the open fails on an
-/// existing file — it creates its file (lot 282).
-const O_EXCL: u32 = 0o200;
+
+/// Lot 282, the review of #500 (B2): the refused operations a package
+/// transaction's maintainer script really does — on the file namespace:
+/// remove, rename, change the attributes of, or make an entry beside, a
+/// file or directory the agent protects (`deb-systemd-helper`'s `rmdir`
+/// during `apt purge`). Only these become [`TriggerType::PackageTamperRefusal`]
+/// inside a transaction; every other refusal (a signal, a ptrace, a BPF
+/// handle, a kexec, a cgroup write, a limit, a read of the key, a
+/// scheduling change, a write-open, an `ioctl`, an `oom_score_adj`) keeps
+/// the weight it has outside one.
+fn is_package_file_operation(op: nn_model::FsProtectOperation) -> bool {
+    use nn_model::FsProtectOperation as Op;
+    matches!(
+        op,
+        Op::Unlink
+            | Op::Rmdir
+            | Op::Rename
+            | Op::Setattr
+            | Op::Create
+            | Op::Link
+            | Op::Symlink
+            | Op::Mkdir
+            | Op::Mknod
+            | Op::Xattr
+    )
+}
 
 /// The posture's event builders for tests: its own, and the agent's tests
 /// of the posture (nn-core's `test-util`, R08a, lab PR 250).
@@ -2507,13 +2619,38 @@ mod tests {
                 timestamp_ns: ts,
             };
         use nn_model::FsProtectOperation as Op;
-        for op in [Op::Rmdir, Op::Unlink, Op::Signal, Op::Read, Op::Sched] {
+        for op in [
+            Op::Rmdir,
+            Op::Unlink,
+            Op::Rename,
+            Op::Setattr,
+            Op::Create,
+            Op::Link,
+            Op::Symlink,
+            Op::Mkdir,
+            Op::Mknod,
+            Op::Xattr,
+        ] {
             assert_eq!(
                 det.detect(&refusal(130, op, 8 * S), &[]),
                 vec![TriggerType::PackageTamperRefusal],
                 "{op:?}"
             );
         }
+        // The review of #500 (B2): what is no file operation of a
+        // maintainer script keeps its weight inside the transaction too.
+        assert_eq!(
+            det.detect(&refusal(130, Op::Signal, 8 * S), &[]),
+            vec![TriggerType::AntiTamperDenial]
+        );
+        assert_eq!(
+            det.detect(&refusal(130, Op::Read, 8 * S), &[]),
+            vec![TriggerType::SensitiveFileAccess]
+        );
+        assert_eq!(
+            det.detect(&refusal(130, Op::Sched, 8 * S), &[]),
+            vec![TriggerType::DefenseImpairment]
+        );
         assert_eq!(
             det.detect(&refusal(210, Op::Rmdir, 8 * S), &[]),
             vec![TriggerType::AntiTamperDenial]
@@ -2530,6 +2667,70 @@ mod tests {
         assert_eq!(
             det.detect(&refusal(1, Op::Signal, 8 * S), &[]),
             vec![TriggerType::RelayedTamperAttempt]
+        );
+    }
+
+    /// The review of #500 (B2, its probe): any root process makes itself a
+    /// package transaction's — `apt-get -o APT::Update::Pre-Invoke::=/tmp/x
+    /// update` runs `/tmp/x` under root's apt-get, through `sh -c`. Its
+    /// refused signal, ptrace, BPF handles, kexec, cgroup kill and write-open
+    /// of the agent stay decisive (`AntiTamperDenial`, COMBAT locked), its
+    /// limit change too; its refused scheduling change stays an impairment,
+    /// its refused read of the key a credential reach. Only a refused file
+    /// operation of the kind a maintainer script does is ALERTED.
+    #[test]
+    fn a_pre_invoke_hook_keeps_every_refusal_but_the_file_operations_decisive() {
+        const S: u64 = 1_000_000_000;
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe_by(0, 400, 1, "/usr/bin/apt-get", S), &[]);
+        let _ = det.detect(&spawn_with_exe_by(0, 410, 400, "/usr/bin/dash", 2 * S), &[]);
+        let _ = det.detect(&spawn_with_exe_by(0, 420, 410, "/tmp/x", 3 * S), &[]);
+        let refusal = |op: nn_model::FsProtectOperation| Event::FsProtectDenial {
+            pid: 420,
+            uid: 0,
+            comm: "x".into(),
+            target_dev: 64_770,
+            target_ino: 12345,
+            operation: op,
+            timestamp_ns: 4 * S,
+        };
+        use nn_model::FsProtectOperation as Op;
+        for op in [
+            Op::Signal,
+            Op::Ptrace,
+            Op::BpfLink,
+            Op::BpfMap,
+            Op::Kexec,
+            Op::CgroupKill,
+            Op::CgroupFreeze,
+            Op::CgroupMove,
+            Op::CgroupLimit,
+            Op::CgroupV1,
+            Op::OomAdj,
+            Op::Rlimit,
+            Op::Write,
+            Op::Ioctl,
+        ] {
+            assert_eq!(
+                det.detect(&refusal(op), &[]),
+                vec![TriggerType::AntiTamperDenial],
+                "{op:?}"
+            );
+        }
+        for op in [Op::Sched, Op::Nice, Op::Ioprio] {
+            assert_eq!(
+                det.detect(&refusal(op), &[]),
+                vec![TriggerType::DefenseImpairment],
+                "{op:?}"
+            );
+        }
+        assert_eq!(
+            det.detect(&refusal(Op::Read), &[]),
+            vec![TriggerType::SensitiveFileAccess]
+        );
+        assert_eq!(
+            det.detect(&refusal(Op::Rmdir), &[]),
+            vec![TriggerType::PackageTamperRefusal]
         );
     }
 
@@ -3205,12 +3406,36 @@ mod tests {
             timestamp_ns: ts,
             overwrites,
             cgroup_window: false,
+            small_files: false,
+            cgroup_id: 0,
         }
+    }
+
+    /// Lot 282, the review of #500 (C1): a crossing of `pid` in cgroup
+    /// `cgroup_id`; `small`: an overwrite crossing that needed files under
+    /// 4 KiB (`MASS_OVERWRITE_SMALL`).
+    fn mass_write_in(pid: u32, cgroup_id: u64, overwrites: bool, small: bool, ts: u64) -> Event {
+        let mut e = mass_write(pid, overwrites, ts);
+        if let Event::MassWrite {
+            cgroup_id: c,
+            small_files,
+            ..
+        } = &mut e
+        {
+            (*c, *small_files) = (cgroup_id, small);
+        }
+        e
     }
 
     /// Lot 282: the kernel's burst of originals destroyed (unlinked, or
     /// replaced by a rename onto their name), `MASS_UNLINK`.
     fn destroyed(pid: u32, ts: u64) -> Event {
+        destroyed_in(pid, 0, ts)
+    }
+
+    /// Lot 282, the review of #500 (C1): [`destroyed`] in cgroup
+    /// `cgroup_id`.
+    fn destroyed_in(pid: u32, cgroup_id: u64, ts: u64) -> Event {
         Event::FileBurst {
             pid,
             uid: 1000,
@@ -3221,6 +3446,7 @@ mod tests {
             sources: 0,
             filename: "/home/u/docs/report.docx".into(),
             timestamp_ns: ts,
+            cgroup_id,
         }
     }
 
@@ -3299,8 +3525,9 @@ mod tests {
     /// Lot 282: the replacement shape — files created and originals
     /// destroyed by ONE process within a window of each other, in either
     /// order (the rings are drained apart; a writer may delete first) —
-    /// fires on the second half; two processes' halves never add up, nor
-    /// two halves farther apart than a window.
+    /// fires on the second half; two processes' halves never add up unless
+    /// they share a cgroup (`the_replacement_shape_pairs_within_a_cgroup`),
+    /// nor two halves farther apart than a window.
     #[test]
     fn the_replacement_shape_is_one_processs_two_halves_within_a_window() {
         let det = detector_with_empty_proc();
@@ -3318,9 +3545,13 @@ mod tests {
         // farther apart than a window
         assert!(!det.detect(&mass_write(620, false, 10), &[]).contains(&ci));
         assert!(!det.detect(&destroyed(620, 11 + w), &[]).contains(&ci));
-        // two processes' halves
+        // two processes' halves, in no cgroup (or the root's)
         assert!(!det.detect(&mass_write(630, false, 10), &[]).contains(&ci));
         assert!(!det.detect(&destroyed(640, 11), &[]).contains(&ci));
+        assert!(!det
+            .detect(&mass_write_in(630, 1, false, false, 20), &[])
+            .contains(&ci));
+        assert!(!det.detect(&destroyed_in(640, 1, 21), &[]).contains(&ci));
         // a rename burst is the ransomware tracker's (NN-L-IMP-002), not a half
         let renames = Event::FileBurst {
             pid: 650,
@@ -3332,9 +3563,95 @@ mod tests {
             sources: 0,
             filename: "/home/u/a.pdf.locked".into(),
             timestamp_ns: 12,
+            cgroup_id: 0,
         };
         assert!(!det.detect(&renames, &[]).contains(&ci));
         assert!(!det.detect(&mass_write(650, false, 13), &[]).contains(&ci));
+    }
+
+    /// The review of #500 (C1, its probe
+    /// `review500_probe_replacement_split_or_late`): an encryptor that
+    /// writes the copies and a separate process that deletes the
+    /// originals — a helper, an `rm` it runs, a second worker of the same
+    /// unit or container — are one replacement when they share a cgroup
+    /// (the kernel's cgroup v2 id of each crossing), in either order. Not
+    /// across cgroups; not when either half is an exempt writer's (a
+    /// package transaction extracting beside an `rm`) or an authenticated
+    /// session's (whose new files never counted); not two halves farther
+    /// apart than a window — a deletion more than 60 s after the copies is
+    /// not seen (declared: §10.5 of the design).
+    #[test]
+    fn the_replacement_shape_pairs_within_a_cgroup() {
+        let det = detector_with_empty_proc();
+        for pid in [700, 701, 710, 711, 720, 721, 740, 741] {
+            let _ = det.detect(&spawn_with_exe(pid, 1, "/srv/app/worker", 1), &[]);
+        }
+        let ci = TriggerType::ConfirmedIntrusion;
+        let w = MASS_WRITE_WINDOW_NS;
+        // the encryptor's copies, then a separate deleter: same cgroup
+        assert!(!det
+            .detect(&mass_write_in(700, 9001, false, false, 10), &[])
+            .contains(&ci));
+        assert!(det.detect(&destroyed_in(701, 9001, 20), &[]).contains(&ci));
+        // the deleter first
+        assert!(!det.detect(&destroyed_in(711, 9002, 10), &[]).contains(&ci));
+        assert!(det
+            .detect(&mass_write_in(710, 9002, false, false, 30), &[])
+            .contains(&ci));
+        // other cgroups
+        assert!(!det
+            .detect(&mass_write_in(720, 9003, false, false, 10), &[])
+            .contains(&ci));
+        assert!(!det.detect(&destroyed_in(721, 9004, 20), &[]).contains(&ci));
+        // the deletion past the window
+        assert!(!det
+            .detect(&mass_write_in(740, 9005, false, false, 10), &[])
+            .contains(&ci));
+        assert!(!det
+            .detect(&destroyed_in(741, 9005, 11 + w), &[])
+            .contains(&ci));
+        // a package transaction's extraction beside an rm of its cgroup
+        let _ = det.detect(&spawn_with_exe_by(0, 750, 1, "/usr/bin/dpkg", 2), &[]);
+        let _ = det.detect(&spawn_with_exe_by(0, 751, 1, "/usr/bin/rm", 2), &[]);
+        assert!(!det
+            .detect(&mass_write_in(750, 9006, false, false, 10), &[])
+            .contains(&ci));
+        assert!(!det.detect(&destroyed_in(751, 9006, 20), &[]).contains(&ci));
+        // a session's new files beside a daemon's deletions of its cgroup
+        let _ = det.detect(&spawn_with_exe(760, 1, "/usr/sbin/sshd", 2), &[]);
+        let _ = det.detect(&spawn_with_exe(761, 760, "/usr/bin/bash", 3), &[]);
+        let _ = det.detect(&spawn_with_exe(762, 761, "/usr/bin/tar", 4), &[]);
+        let _ = det.detect(&spawn_with_exe(763, 1, "/srv/app/cleaner", 5), &[]);
+        assert!(!det
+            .detect(&mass_write_in(762, 9007, false, false, 10), &[])
+            .contains(&ci));
+        assert!(!det.detect(&destroyed_in(763, 9007, 20), &[]).contains(&ci));
+    }
+
+    /// The review of #500 (C1): a crossing that needed files under 4 KiB
+    /// (`MassWrite { small_files: true }`: small documents encrypted in
+    /// place) raises the arm outside an authenticated session — it did on
+    /// main, where every write-open counted there — and not inside one,
+    /// where only files of 4 KiB or more ever counted (a build rewrites its
+    /// own small outputs: lab PR 127, cargo killed).
+    #[test]
+    fn small_files_rewritten_count_outside_a_session_only() {
+        let det = detector_with_empty_proc();
+        let ci = TriggerType::ConfirmedIntrusion;
+        let _ = det.detect(&spawn_with_exe(800, 1, "/srv/app/worker", 1), &[]);
+        assert!(det
+            .detect(&mass_write_in(800, 0, true, true, 10), &[])
+            .contains(&ci));
+        let _ = det.detect(&spawn_with_exe(200, 1, "/usr/sbin/sshd", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(300, 200, "/usr/bin/bash", 2), &[]);
+        let _ = det.detect(&spawn_with_exe(400, 300, "/usr/bin/cargo", 3), &[]);
+        assert!(!det
+            .detect(&mass_write_in(400, 0, true, true, 10), &[])
+            .contains(&ci));
+        // the same process's files of 4 KiB or more, later in the window
+        assert!(det
+            .detect(&mass_write_in(400, 0, true, false, 11), &[])
+            .contains(&ci));
     }
 
     /// Lot 282: every shape of the arm is file-system evidence — the
@@ -3346,6 +3663,7 @@ mod tests {
         let ci = TriggerType::ConfirmedIntrusion;
         for e in [
             mass_write(1, true, 1),
+            mass_write_in(1, 0, true, true, 1),
             mass_write(1, false, 1),
             destroyed(1, 1),
             file_open(1, 1000, "/home/u/x", 2, 1),
@@ -3360,12 +3678,14 @@ mod tests {
     }
 
     /// Lot 282: in tracepoint mode the arm counts distinct files — a
-    /// database opened to write again and again is one file — and an open
-    /// that must create its file (`O_CREAT | O_EXCL`) never counts; an open
-    /// that may create one (`O_CREAT | O_TRUNC`) still does outside a
-    /// session (whether its file existed is not known there).
+    /// database opened to write again and again is one file. Outside a
+    /// session every write-open counts, whether its file existed is not
+    /// known there: one that may create it (`O_CREAT | O_TRUNC`), and (the
+    /// review of #500, C1) one that must (`O_CREAT | O_EXCL`) — a
+    /// copy-and-delete encryptor's copies, and tracepoint mode sees no
+    /// unlink to tell them from an extraction.
     #[test]
-    fn tracepoint_mass_write_counts_distinct_files_and_never_exclusive_creates() {
+    fn tracepoint_mass_write_counts_distinct_files_exclusive_creates_included() {
         let det = detector_with_empty_proc();
         let _ = det.detect(&spawn_with_exe(800, 1, "/srv/app/worker", 1), &[]);
         let ci = TriggerType::ConfirmedIntrusion;
@@ -3383,7 +3703,7 @@ mod tests {
             det.detect(&file_open(800, 0, "/srv/app/out/x", flags, 400), &recent)
         };
         // O_WRONLY | O_CREAT | O_EXCL
-        assert!(!burst(0o301).contains(&ci));
+        assert!(burst(0o301).contains(&ci));
         // O_WRONLY | O_CREAT | O_TRUNC
         assert!(burst(0o1101).contains(&ci));
         // O_RDWR
@@ -3415,20 +3735,21 @@ mod tests {
         let r = Replacements::default();
         let w = MASS_WRITE_WINDOW_NS;
         // pid 1: an old creation, then a recent destruction (no pair yet)
-        assert!(!r.record(1, Half::Created, 0));
-        assert!(!r.record(1, Half::Destroyed, 3 * w));
+        assert!(!r.record(1, None, Half::Created, 0));
+        assert!(!r.record(1, None, Half::Destroyed, 3 * w));
         // 1,100 other pids, a little later: the map is pruned on each record
         for pid in 1000..2100u32 {
-            assert!(!r.record(pid, Half::Created, 3 * w + 2));
+            assert!(!r.record(pid, None, Half::Created, 3 * w + 2));
         }
         // pid 1's recent destruction is still there to pair with
-        assert!(r.record(1, Half::Created, 3 * w + 1));
+        assert!(r.record(1, None, Half::Created, 3 * w + 1));
         // a pid with nothing recent is gone once the map is pruned
-        assert!(!r.record(7, Half::Created, 0));
+        assert!(!r.record(7, Some(77), Half::Created, 0));
         for pid in 2100..2200u32 {
-            r.record(pid, Half::Created, 10 * w);
+            r.record(pid, None, Half::Created, 10 * w);
         }
-        assert!(!r.0.lock().contains_key(&7));
+        assert!(!r.0.lock().contains_key(&PairKey::Pid(7)));
+        assert!(!r.0.lock().contains_key(&PairKey::Cgroup(77)));
         assert!(r.0.lock().len() < 1_200);
     }
 
