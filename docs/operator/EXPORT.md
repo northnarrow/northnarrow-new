@@ -300,19 +300,40 @@ kept the frames) — and checks:
   facts in the record, is `TAMPERED`. An outcome mapped without its intent
   (the worker had not seen it: restarted between them, the export started
   after it, the intent past the 4,096 the worker keeps) carries neither and
-  is its row's mapping without an intent (class 7001, activity Unknown, no
-  target). The intent's place (`file`, `line`, `end`) is the record's word,
-  as every record's own place: the chain's links check places. The cost:
+  is its row's mapping without an intent (class 7001, activity Unknown,
+  severity 0, `action ?`, no target). **Such a reduction is possible on the
+  way too**: a relay that takes `intent_raw` and the intent's facts out of
+  any outcome's record — a critical `KillProcessTree` among them — leaves a
+  record that is still its row's mapping, true but emptied, and that
+  cannot be told from the worker's own. `verify` says each one (`NOTICE
+  line N: … intent not attached: action A of run R …`, and their count in
+  the `OK` verdict; the exit stays 0: nothing in it is false). The intent is
+  not lost: it is a row of the actions chain — its own record in the export
+  (`unmapped.northnarrow.kind` `intent`, the outcome's
+  `metadata.correlation_uid`), which `verify` checks with the public key
+  alone, or on the host the line `"row":"intent"` with the outcome's `run`
+  and `action` in `/var/lib/northnarrow/detections/actions.jsonl` or its
+  archives (`sudo nn-admin chain verify --log actions`). The intent's place
+  (`file`, `line`, `end`) is the record's word, as every record's own
+  place: the chain's links check places. The cost:
   an outcome's record carries its intent's row once more — lot 276's lab
   (round 12, the COMBAT ladder's outcomes): 2,117 bytes without it, 2,687
   with it (+570, the intent's row of 502 bytes as a JSON string), five
   outcomes of 2,589 to 2,687 bytes; the intents' and every other record
   unchanged;
+- the words of a place no hash covers, the record's own and its intent's
+  (`unmapped.northnarrow.row`, `…intent_row`): `verified` is `true` (the
+  row was just proved), `rotate` is there only on the first row of a file
+  after the first (line 1, file > 1), and there it must be the signed
+  terminator whose `entry_hash` is the row's `prev_hash` — anything else is
+  `TAMPERED`; `file`, `line` and `end` are the record's word, the chain's
+  links checking files and lines;
 - **not covered by the signature**: `device.hostname` (the host's name),
   `device.uid` (the agent's id) and `metadata.product.version` (the agent's
   version) — no row carries them; `verify` maps the row again with them as
   the record says, so a record says them as it was written, true or not.
-  Every other field is the row's (signed, in `raw_data`) or its mapping;
+  Every other field is the row's (signed, in `raw_data`) or its mapping,
+  but the places' `file`, `line` and `end` (above);
 - each chain's rows, in their order, link: a row's `prev_hash` is the row
   before it's `entry_hash`; across a rotation through the terminator the
   first row of the next file carries — a first row without it is `BROKEN`

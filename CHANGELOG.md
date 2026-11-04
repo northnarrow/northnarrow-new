@@ -14,7 +14,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   reads the rows of the detections, actions, FIM drift, netflow and canary
   access chains after a cursor per sink and chain, and hands them to a new
   unprivileged **export worker** (the agent's binary as
-  `northnarrow-worker`, `nn-worker-exp`), which verifies each with the
+  `northnarrow-export`, `nn-worker-exp`), which verifies each with the
   agent's public key, maps it to **OCSF 1.9.0** (Detection Finding, Process,
   File System and Network Activity, Remediation, Base Event; the schema
   pinned in `crates/nn-export/ocsf/`, every record validated by the tests)
@@ -70,8 +70,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   intent's row verified with the key and mapped first, a missing, bent or
   foreign one with the intent's facts TAMPERED (after its third check: a
   PARTIAL verdict of the second review depended on the intent being before
-  the outcome in the input); the TAMPERED verdict says which (a row not
-  signed, or a record rewritten); a
+  the outcome in the input); `verify` says each outcome without its intent
+  attached (a NOTICE, exit 0) and checks the place words no hash covers
+  (`verified` true, `rotate` only as the signed terminator before a later
+  file's first row); the TAMPERED verdict says which (a row not signed, or
+  a record rewritten); a
   signed configuration with fewer or smaller JSONL files holds from the
   sink's open (the files past the new count removed, regular files only —
   the worker's seccomp gains `newfstatat` without following a link —, an

@@ -69,6 +69,11 @@ pub struct Report {
     pub malformed: Vec<(u64, String)>,
     /// Records whose row does not verify: `(line, why)`.
     pub tampered: Vec<(u64, String)>,
+    /// Action outcomes without their intent attached — genuine, but their
+    /// class, target, reasons and severity are not in the record (a worker
+    /// that had not seen the intent, or a relay that took it out): `(line,
+    /// which)`. Not a failure (the fourth check of #499, Q1).
+    pub notices: Vec<(u64, String)>,
     pub chains: Vec<ChainReport>,
 }
 
@@ -165,7 +170,7 @@ fn mapped_alike(
     rotate: Option<&str>,
     seal: &nn_evidence::row_verify::RowSeal,
     pk: &VerifyingKey,
-) -> Result<(), String> {
+) -> Result<Mapped, String> {
     use nn_export::ocsf::{Context, Mapper, Row};
     use nn_proto::ipc::ExportChain;
     let Some(c) = ExportChain::from_name(chain) else {
@@ -201,6 +206,10 @@ fn mapped_alike(
     let n = usize::from(text(&["metadata", "uid"]) == Some(format!("{base}/1")));
     let mut mapper = Mapper::new();
     let nn = &v["unmapped"]["northnarrow"];
+    // the words of the record's place no hash covers (the fourth check of
+    // #499, Q2)
+    place_words(r, file, line, &seal.prev_hash, chain, pk)
+        .map_err(|why| rewritten(&format!("its row's place: {why}")))?;
     if let Some(intent_raw) = nn.get("intent_raw") {
         let intent_raw = intent_raw
             .as_str()
@@ -234,6 +243,15 @@ fn mapped_alike(
             return Err(rewritten("the intent row's place names another row"));
         }
         let at = |k: &str| place.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        place_words(
+            place,
+            at("file"),
+            at("line"),
+            &iseal.prev_hash,
+            "actions",
+            pk,
+        )
+        .map_err(|why| rewritten(&format!("the intent row's place: {why}")))?;
         mapper.map(
             &ctx,
             &Row {
@@ -252,10 +270,70 @@ fn mapped_alike(
             },
         );
     }
-    if mapper.map(&ctx, &row).get(n) == Some(v) {
-        Ok(())
-    } else {
-        Err(REWRITTEN.to_string())
+    if mapper.map(&ctx, &row).get(n) != Some(v) {
+        return Err(REWRITTEN.to_string());
+    }
+    // an outcome without its intent: genuine, its intent's facts not in it
+    // (a worker that had not seen the intent — or a relay that took them
+    // out: the record cannot tell; the fourth check of #499, Q1)
+    if c == ExportChain::Actions && nn.get("intent_raw").is_none() {
+        let o = serde_json::from_str::<serde_json::Value>(raw).ok();
+        if let Some(o) = o.filter(|o| o.get("row").and_then(|x| x.as_str()) == Some("outcome")) {
+            return Ok(Mapped::NoIntent {
+                run: o
+                    .get("run")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                action: o.get("action").and_then(|x| x.as_u64()).unwrap_or(0),
+                correlation: text(&["metadata", "correlation_uid"]).unwrap_or_default(),
+            });
+        }
+    }
+    Ok(Mapped::Alike)
+}
+
+/// A record that is its row's mapping: whole, or an action's outcome
+/// without its intent attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mapped {
+    Alike,
+    NoIntent {
+        run: String,
+        action: u64,
+        correlation: String,
+    },
+}
+
+/// A place's words no hash covers: `verified` true (`verify` has just
+/// proved the row), `rotate` only on the first row of a file after the
+/// first (line 1, file > 1), and there the signed terminator whose
+/// `entry_hash` is the row's `prev_hash` (the fourth check of #499, Q2:
+/// both passed with any value).
+fn place_words(
+    place: &serde_json::Value,
+    file: u64,
+    line: u64,
+    prev_hash: &str,
+    chain: &str,
+    pk: &VerifyingKey,
+) -> Result<(), String> {
+    if place.get("verified") != Some(&serde_json::Value::Bool(true)) {
+        return Err("`verified` is not true".to_string());
+    }
+    match place.get("rotate") {
+        None => Ok(()),
+        Some(_) if line != 1 || file < 2 => {
+            Err("`rotate` on a row that is no later file's first".to_string())
+        }
+        Some(t) => {
+            let t = t.as_str().ok_or("`rotate` is not a row")?;
+            match verify_row(t.as_bytes(), chain, pk) {
+                Ok(ts) if ts.terminator && ts.entry_hash == prev_hash => Ok(()),
+                Ok(_) => Err("`rotate` is not the terminator its row follows".to_string()),
+                Err(e) => Err(format!("`rotate` does not verify: {e}")),
+            }
+        }
     }
 }
 
@@ -330,9 +408,25 @@ pub fn verify(input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report>
         }
         // the OCSF fields are the agent's mapping of the row, or the
         // record was rewritten (the review of #499, D1: they are not signed)
-        if let Err(why) = mapped_alike(&v, &chain, file, l, raw, rotate.as_deref(), &seal, pk) {
-            rep.tampered.push((n, format!("{chain} {file}/{l}: {why}")));
-            continue;
+        match mapped_alike(&v, &chain, file, l, raw, rotate.as_deref(), &seal, pk) {
+            Ok(Mapped::Alike) => {}
+            Ok(Mapped::NoIntent {
+                run,
+                action,
+                correlation,
+            }) => rep.notices.push((
+                n,
+                format!(
+                    "{chain} {file}/{l}: intent not attached: action {action} of run {run} — \
+                     its class, target, reasons and severity are not in the record; its intent \
+                     is the actions chain's `intent` row of that run and action (the records' \
+                     metadata.correlation_uid {correlation})"
+                ),
+            )),
+            Err(why) => {
+                rep.tampered.push((n, format!("{chain} {file}/{l}: {why}")));
+                continue;
+            }
         }
         let duplicate = v
             .get("metadata")
@@ -468,11 +562,23 @@ pub fn report_lines(r: &Report) -> Vec<String> {
     for (n, why) in r.malformed.iter().take(20) {
         out.push(format!("MALFORMED line {n}: {why}"));
     }
+    for (n, why) in r.notices.iter().take(20) {
+        out.push(format!("NOTICE line {n}: {why}"));
+    }
 
     out.push(match r.exit_code() {
-        0 => "OK: every record's row is signed by the agent's key, every chain follows from its \
-              first row seen"
-            .to_string(),
+        0 => format!(
+            "OK: every record's row is signed by the agent's key, every chain follows from its \
+             first row seen{}",
+            if r.notices.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; {} action outcome(s) without their intent attached (NOTICE lines)",
+                    r.notices.len()
+                )
+            }
+        ),
         13 => {
             // which it is: the second review of #499 (R2) found a rewritten
             // record said "not signed" when its row was
@@ -803,14 +909,15 @@ mod tests {
         .join("\n");
         let r = verify(cut.as_bytes(), &k.verifying_key()).unwrap();
         assert_ne!(r.exit_code(), 0, "{:?}", report_lines(&r));
-        // a genuine terminator of another place: it does not link the files
+        // a genuine terminator of another place: not the one its row
+        // follows — the record's own words checked on their own (the fourth
+        // check of #499, Q2): TAMPERED
         let elsewhere = terminator(&k, "detections", &hash(&rows[0]));
         let r = verify(with(Some(&elsewhere)).as_bytes(), &k.verifying_key()).unwrap();
-        assert_eq!(r.exit_code(), 11, "{r:#?}");
-        assert_eq!(
-            r.chains[0].breaks[0].why,
-            "the terminator does not link the two files"
-        );
+        assert_eq!(r.exit_code(), 13, "{r:#?}");
+        assert!(r.tampered[0]
+            .1
+            .contains("`rotate` is not the terminator its row follows"));
         // the next file's first row follows its terminator, the terminator
         // does not follow the last row before it
         let next2 = row(&k, "detections", 3, &hash(&elsewhere));
@@ -825,12 +932,13 @@ mod tests {
         );
         // a data row in the terminator's place
         let r = verify(with(Some(&rows[1])).as_bytes(), &k.verifying_key()).unwrap();
-        assert_eq!(r.exit_code(), 11, "{r:#?}");
+        assert_eq!(r.exit_code(), 13, "{r:#?}");
         // a terminator signed by another key
         let other = SigningKey::from_bytes(&[6; 32]);
         let forged = terminator(&other, "detections", &hash(&rows[1]));
         let r = verify(with(Some(&forged)).as_bytes(), &k.verifying_key()).unwrap();
-        assert_eq!(r.chains[0].breaks[0].why, "the terminator does not verify");
+        assert_eq!(r.exit_code(), 13, "{r:#?}");
+        assert!(r.tampered[0].1.contains("`rotate` does not verify"));
     }
 
     /// The review of #499, D1: a record whose OCSF fields are rewritten —
@@ -1115,6 +1223,161 @@ mod tests {
         forged["process"] = serde_json::json!({"pid": 4242});
         let r = verify(forged.to_string().as_bytes(), &k.verifying_key()).unwrap();
         assert_eq!(r.exit_code(), 13);
+    }
+
+    /// The fourth check of #499 (Q2): a record's own place words — `rotate`
+    /// on a row that is no later file's first, `verified` false — are
+    /// TAMPERED; its `end` stays the record's word (as its file and line,
+    /// which the chain's links check).
+    #[test]
+    fn review499c_own_row_words() {
+        let k = SigningKey::from_bytes(&[5; 32]);
+        let rows = chain_of(&k, 3);
+        let pk = k.verifying_key();
+        let base: serde_json::Value =
+            serde_json::from_str(&record("detections", 1, 2, &rows[1], "b")).unwrap();
+        let mut a = base.clone();
+        a["unmapped"]["northnarrow"]["row"]["rotate"] = "anything at all".into();
+        let mut b = base.clone();
+        b["unmapped"]["northnarrow"]["row"]["verified"] = false.into();
+        let mut c = base.clone();
+        c["unmapped"]["northnarrow"]["row"]["end"] = 1.into();
+        for (n, v, want) in [("rotate", a, 13), ("verified", b, 13), ("end", c, 0)] {
+            let input = [
+                record("detections", 1, 1, &rows[0], "a"),
+                v.to_string(),
+                record("detections", 1, 3, &rows[2], "c"),
+            ]
+            .join("\n");
+            let r = verify(input.as_bytes(), &pk).unwrap();
+            assert_eq!(r.exit_code(), want, "{n}: {:?}", report_lines(&r));
+            if want == 13 {
+                assert!(
+                    r.tampered[0].1.contains("its row's place"),
+                    "{n}: {:?}",
+                    r.tampered
+                );
+            }
+        }
+    }
+
+    /// The fourth check of #499: the reviewer's cases — rewritten,
+    /// reordered, the head cut, the carried row bent or foreign, its
+    /// place's hashes false, the row taken out with the facts kept: 13;
+    /// (f) the downgrade — a genuine outcome turned into its row's mapping
+    /// without the intent — OK, but said (NOTICE, and a count in the
+    /// verdict; Q1); (g, h) the intent place's `rotate` and `verified`
+    /// bent: 13 (Q2); its file and line stay the record's word.
+    #[test]
+    fn review499c_intent_raw() {
+        let k = SigningKey::from_bytes(&[5; 32]);
+        let (rows, recs) = intent_and_outcome(&k);
+        let pk = k.verifying_key();
+        let code = |s: String| verify(s.as_bytes(), &pk).unwrap().exit_code();
+        let rewrite = |v: &serde_json::Value| {
+            let mut f = v.clone();
+            f["severity_id"] = 1.into();
+            f["severity"] = "Informational".into();
+            f["process"] = serde_json::json!({"pid": 1});
+            f["message"] = "benign".into();
+            f["remediation"] = serde_json::json!({"desc": "nothing"});
+            f
+        };
+        let forged = rewrite(&recs[1]);
+        assert_eq!(
+            (
+                code(format!("{}\n{}", forged, recs[0])),
+                code(forged.to_string())
+            ),
+            (13, 13)
+        );
+        let mut c = recs[1].clone();
+        c["unmapped"]["northnarrow"]["intent_raw"] =
+            rows[0].replace("\"pid\":4242", "\"pid\":1").into();
+        let p0 = "0".repeat(64);
+        let intent_of = |run: &str, action: u64| {
+            sealed(
+                &k,
+                "actions",
+                "data",
+                &p0,
+                &format!(
+                    r#"{{"row":"intent","run":"{run}","action":{action},"ts":"2026-10-31T23:59:00.000000Z","intent":{{"source":"rule","response":"Log","pid":9,"start_ns":1,"severity":"low","why":[],"queued_us":1}},"fmt_ver":3,"prev_hash":"{p0}""#
+                ),
+            )
+        };
+        let mut d1 = recs[1].clone();
+        d1["unmapped"]["northnarrow"]["intent_raw"] = intent_of("r1", 8).into();
+        let mut d2 = recs[1].clone();
+        d2["unmapped"]["northnarrow"]["intent_raw"] = intent_of("r2", 7).into();
+        let mut e = recs[1].clone();
+        e["unmapped"]["northnarrow"]["intent_row"]["entry_hash"] = "ab".repeat(32).into();
+        let mut e2 = recs[1].clone();
+        e2["unmapped"]["northnarrow"]["intent_row"]["prev_hash"] = "cd".repeat(32).into();
+        let mut i = recs[1].clone();
+        i["unmapped"]["northnarrow"]
+            .as_object_mut()
+            .unwrap()
+            .remove("intent_raw");
+        // (g) the intent place's rotate, on a row that is no later file's
+        // first, and on a first row (line 1 of file 2) as a bent terminator;
+        // (h) its verified false
+        let mut g = recs[1].clone();
+        g["unmapped"]["northnarrow"]["intent_row"]["rotate"] =
+            "{\"rotate\":\"not a terminator\"}".into();
+        let mut g2 = g.clone();
+        g2["unmapped"]["northnarrow"]["intent_row"]["file"] = 2.into();
+        g2["unmapped"]["northnarrow"]["intent_row"]["line"] = 1.into();
+        let mut h = recs[1].clone();
+        h["unmapped"]["northnarrow"]["intent_row"]["verified"] = false.into();
+        for (n, v) in [
+            ("c", c),
+            ("d1", d1),
+            ("d2", d2),
+            ("e", e),
+            ("e2", e2),
+            ("i", i),
+            ("g", g),
+            ("g2", g2),
+            ("h", h),
+        ] {
+            assert_eq!(code(v.to_string()), 13, "case {n}");
+        }
+        // (f) the downgrade: OK — the record is its row's — and said
+        let alone = mapped("actions", 1, 2, &rows[1], None);
+        assert_eq!(
+            (alone["class_uid"].as_u64(), alone["severity_id"].as_u64()),
+            (Some(7001), Some(0))
+        );
+        let r = verify(alone.to_string().as_bytes(), &pk).unwrap();
+        let said = report_lines(&r);
+        assert_eq!(r.exit_code(), 0, "{said:?}");
+        assert_eq!(r.notices.len(), 1);
+        assert!(
+            said.iter().any(|l| l.starts_with(
+                "NOTICE line 1: actions 1/2: intent not attached: action 7 of run r1"
+            )),
+            "{said:?}"
+        );
+        assert!(
+            said.last()
+                .unwrap()
+                .ends_with("; 1 action outcome(s) without their intent attached (NOTICE lines)"),
+            "{said:?}"
+        );
+        // the outcome with its intent attached, and the intent: no notice
+        let both = recs
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = verify(both.as_bytes(), &pk).unwrap();
+        assert!(r.notices.is_empty() && r.exit_code() == 0);
+        // (j) the intent's file and line: the record's word
+        let mut j = recs[1].clone();
+        j["unmapped"]["northnarrow"]["intent_row"]["line"] = 99.into();
+        j["unmapped"]["northnarrow"]["intent_row"]["file"] = 42.into();
+        assert_eq!(code(j.to_string()), 0);
     }
 
     #[test]
