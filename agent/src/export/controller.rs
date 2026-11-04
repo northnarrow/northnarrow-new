@@ -1539,10 +1539,27 @@ mod tests {
             missing_note(&mut c, Some(6), t1 + ACTIVE_MISSING_NOTE),
             Some(6)
         );
-        // a wait for another file starts again
+        // a wait for another file starts again: its own 30 s, from when the
+        // read first waited for it (mutation MC3 of lot 276's run 6: the
+        // file not compared, the first wait's start kept)
+        let t2 = t1 + Duration::from_secs(200);
+        assert_eq!(missing_note(&mut c, Some(8), t2), None);
         assert_eq!(
-            missing_note(&mut c, Some(7), t1 + ACTIVE_MISSING_NOTE),
+            missing_note(&mut c, Some(9), t2 + Duration::from_secs(29)),
             None
+        );
+        assert_eq!(
+            missing_note(&mut c, Some(9), t2 + Duration::from_secs(31)),
+            None,
+            "9's wait is 2 s old"
+        );
+        assert_eq!(
+            missing_note(
+                &mut c,
+                Some(9),
+                t2 + Duration::from_secs(29) + ACTIVE_MISSING_NOTE
+            ),
+            Some(9)
         );
     }
 
