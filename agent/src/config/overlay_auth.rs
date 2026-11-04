@@ -1159,7 +1159,10 @@ mod tests {
         assert_eq!(b.policy.exemptions("R020_ShellWithSocketStdio").len(), 1);
         assert_eq!(b.policy.mode("NN-L-NET-003_BadJa3"), Some(Mode::Alert));
         let d = b.demoted.expect("the degradation");
-        assert!(d.contains("line 3: enforce NN-L-NET-003_BadJa3 refused, applied as alert"), "{d}");
+        assert!(
+            d.contains("line 3: enforce NN-L-NET-003_BadJa3 refused, applied as alert"),
+            "{d}"
+        );
     }
 
     /// Lab PR 230 (D0 of the dependency plan): an overlay signed before the
