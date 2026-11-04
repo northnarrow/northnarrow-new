@@ -77,7 +77,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
         tests: &[
             "crates/nn-core/src/decision/rules/net.rs::net_003_fires_on_ja3_blocklist_match",
             "crates/nn-core/src/decision/rules/net.rs::net_003_matches_a_ja4_entry",
-            "crates/nn-core/src/decision/rule_policy.rs::enforce_of_a_fingerprint_rule_is_refused_and_its_other_modes_are_not",
+            "crates/nn-core/src/decision/rule_policy.rs::a_signed_enforce_of_a_fingerprint_rule_is_applied_as_alert_at_the_start",
             "deploy/lab/malsim/net-check.sh::MS31",
         ],
         attack_note: "TLS C2 is T1573.002 (ATT&CK classes SSL/TLS as asymmetric cryptography). \
