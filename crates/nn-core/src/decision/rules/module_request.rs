@@ -1341,11 +1341,13 @@ mod tests {
         assert!(assess(&t, &modprobe(&["nf-y"])).records());
     }
 
-    /// The coordinator's case (24.04's lab, k3s): on a kernel whose
-    /// nf_tables is built in, `modprobe nft-expr-counter` names a built-in
-    /// module by an alias of `modules.builtin.modinfo` — kmod succeeds and
-    /// inserts nothing: recorded as a query. A name neither the tree nor the
-    /// built-ins resolve stays unresolved: not vouched for (fail-closed).
+    /// On a kernel whose nf_tables is built in, `modprobe nft-expr-counter`
+    /// names a built-in module by an alias of `modules.builtin.modinfo` —
+    /// kmod succeeds and inserts nothing: recorded as a query. (Ubuntu's
+    /// 6.8.0-147, lot 279's lab, builds nf_tables as a module and gives the
+    /// counter no alias at all: unresolved there, killed.) A name neither
+    /// the tree nor the built-ins resolve stays unresolved: not vouched for
+    /// (fail-closed).
     #[test]
     fn an_alias_of_a_built_in_module_inserts_nothing() {
         let t = HostTree::new();

@@ -5492,26 +5492,45 @@ number in parentheses is a lab PR.
     (copied + `depmod` → R011 kill and R018 KillProcessTree;
     `MODPROBE_OPTIONS="-d /tmp/…"` → R011 record, R018 Critical kill),
     `process_kernel_module_tooling_trips_r011` and the NET-006 listener test
-    passed on both. @ROUNDG@
+    passed on both. The final tree (b79f16a8: the test fixed, built-ins'
+    aliases read, origin/main 0131394c merged), on both guests again:
+    test-ignored 89 suites, 110 passed, 0 failed on each, the four tests
+    above ok, none skipped; 24.04's kmod-check: R011's benign kills 1, the
+    same k3s-server `modprobe nft-expr-counter` — on 6.8.0-147 `nf_tables`
+    is a module (in `modules.dep`, not in `modules.builtin`), no index holds
+    the alias (`modules.alias` 0, `modules.builtin.modinfo` 0) and kmod
+    itself answers "Module nft-expr-counter not found" (`modprobe -n -v`):
+    an unresolved name, killed (fail-closed, the decision of 04/11); the
+    built-ins' aliases changed nothing there. The malicious shapes 6 of 6
+    killed; every other benign module tool exec recorded.
   - Measured beside R011, for the Tappa Prove (the kills on a benign corpus;
-    not this lot's to change). On 22.04 both runs went to a locked COMBAT
-    and judged most of the corpus there: `main` at docker.io's purge
-    (`deb-systemd-helper`'s `rmdir` refused by the anti-tamper hooks,
-    decisive), the lot at rootless podman's image pull — the posture's
-    mass-write count on podman's own storage (`/run/libpod/alive.lck`, the
-    layer locks: ENGAGED; 259 writes to `~/.local/share/containers/storage/libpod/bolt_state.db`:
-    COMBAT, locked), then NEUTRALIZE killed rootless podman's tree (rc 137;
-    intent and outcome signed in the actions chain, the stage transitions in
-    the audit chain; no OOM, not the script's timeout, the container itself
-    exited 0). `main` with its agent installed again does the same (the
-    follow-up round: rc 137, the same ladder); without an agent, 3 rounds of
-    the same sequence rc 0. In those COMBAT windows: NN-L-FIM-009 killed the
-    k3s installer's `touch`, `chmod` and `tee` writing
+    not this lot's to change). Every run, on both guests, `main` and the lot
+    alike, went to a locked COMBAT and judged most of the corpus there. The
+    escalations: the posture's mass-write count on the container runtimes'
+    own storage (podman's `/run/libpod/alive.lck` and layer locks: ENGAGED;
+    rootless podman's first image pull, 259 writes to
+    `~/.local/share/containers/storage/libpod/bolt_state.db`: COMBAT),
+    corroborated by NN-L-EVA-002's false positive on the runtime's
+    `iptables -F` of its own chain (found, and corrected, by lot 282); on
+    22.04 `main` also an anti-tamper denial (`deb-systemd-helper`'s `rmdir`
+    at podman's purge). Then NEUTRALIZE killed, with intent and outcome
+    signed in the actions chain and the stage transitions in the audit
+    chain: rootless podman's tree (rc 137; no OOM, no systemd-oomd kill, not
+    the script's timeout, the container itself exited 0 — 22.04 the lot 1
+    of 1, `main` 1 of 1, the lot's agent again 1 of 3 rounds, the one with
+    the first image pull, the two with the image cached rc 0 with the
+    posture ENGAGED only; without an agent 3 of 3 rc 0); on 24.04 the
+    daemon's tree at docker.io's start (13 trees killed or already gone, in
+    `main`'s run and the lot's: `docker run` rc 125, the daemon's API
+    closed: EOF). In those COMBAT windows NN-L-FIM-009 killed the k3s
+    installer's `touch`, `chmod` and `tee` writing
     `/etc/systemd/system/k3s.service.env` and `/etc/systemd/system/k3s.service`
-    (`main` 5, the lot 3; each "already gone"); R013 killed k3s's bundled
-    `runc` (`/var/lib/rancher/k3s/data/<hash>/bin/runc`; `main` 4, the lot
-    21). On 24.04 `docker run` failed in both runs (rc 125, the daemon's API
-    closed: EOF). @DOCKER@
+    (each "already gone"; 22.04 `main` 5, the lot 3; 24.04 `main` 3, the lot
+    4) and R013 k3s's bundled `runc`
+    (`/var/lib/rancher/k3s/data/<hash>/bin/runc`; 22.04 `main` 4, the lot 21;
+    24.04 `main` 11, the lot 21). The guests left as found: k3s's
+    `/var/lib/rancher` removed on both; on 24.04 podman and
+    `/var/lib/containers` were there before these runs and stay.
   - Open: a packaged module file overwritten in place and followed by any
     package transaction passes the time check (FIM-008 sees the write; the
     kernel's signature check refuses it when enforced); a host whose files'

@@ -396,9 +396,10 @@ mod tests {
         assert!(v.reasoning.contains("inserts no module"), "{}", v.reasoning);
     }
 
-    /// Lot 279, 24.04's lab: k3s's `modprobe nft-expr-counter` on a kernel
-    /// whose nf_tables is built in is a built-in's alias — recorded; a name
-    /// nothing resolves is killed.
+    /// Lot 279: `modprobe nft-expr-counter` (k3s's probe) on a kernel whose
+    /// nf_tables is built in is a built-in's alias — recorded; a name
+    /// nothing resolves is killed (as on Ubuntu's 6.8.0-147, where no index
+    /// holds that alias).
     #[test]
     fn a_built_in_module_s_alias_is_recorded_an_unknown_name_killed() {
         let t = distro_host();

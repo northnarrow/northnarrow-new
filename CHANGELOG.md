@@ -674,9 +674,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   DKMS: its registry's, the kernel's tree: the boot), each uncompressed one
   signed while the kernel enforces signatures — or an invocation that
   inserts nothing (`-r`, `-n`, `-D`, `-c`, `-R`, `kmod list`, `kmod
-  static-nodes`, kmod run as `lsmod`, a module built into the kernel, as
-  k3s's `modprobe nft-expr-counter` where nf_tables is built in) — is a
-  High record, T1547.006, not
+  static-nodes`, kmod run as `lsmod`, a module built into the kernel) —
+  is a High record, T1547.006, not
   killed. Killed as before: `insmod` of a file, `modprobe` of a path or a
   `.ko*` name, `-C`, `-d`, `-S`, `--force*`, a name nothing resolves, a
   module file outside the tree, a link or behind a directory linked out of
