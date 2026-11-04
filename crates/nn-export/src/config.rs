@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! enabled = true
-//! chain = detections          # repeated; none named: all five
+//! chain = detections          # repeated; none named: detections and actions
 //! chain = actions
 //! start = end                 # end (rows written from now) | oldest
 //! file = on                   # the JSONL files in /var/log/northnarrow/export
@@ -26,6 +26,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
 use nn_proto::ipc::{ExportChain, MAX_CA_PEM};
+
+/// The chains exported when the configuration names none: the detections
+/// and the actions. `netflow`, `fim_drift`, `canary_access` (who connected
+/// where, which files changed, who read a canary) leave the host only when
+/// the signed text names each (`docs/operator/EXPORT.md` §1a).
+pub const DEFAULT_CHAINS: [ExportChain; 2] = [ExportChain::Detections, ExportChain::Actions];
 
 /// Where the overlay lives.
 pub const EXPORT_LOCAL: &str = "/etc/northnarrow/export.local";
@@ -269,7 +275,10 @@ impl ExportConfig {
         c.enabled = enabled.unwrap_or(false);
         c.start = start.unwrap_or(Start::End);
         if c.chains.is_empty() {
-            c.chains = ExportChain::ALL.to_vec();
+            // the default the least a host gives away (the review of #499,
+            // D6, a product decision): the detections and the responses;
+            // flows, file drift and canary reads only when named
+            c.chains = DEFAULT_CHAINS.to_vec();
         }
         if file {
             c.file = Some(FileConfig {
@@ -383,7 +392,7 @@ mod tests {
     fn off_without_a_file_and_by_default() {
         let c = ExportConfig::parse("").unwrap();
         assert!(!c.enabled);
-        assert_eq!(c.chains, ExportChain::ALL.to_vec());
+        assert_eq!(c.chains, DEFAULT_CHAINS.to_vec());
         assert_eq!(c.start, Start::End);
         assert!(c.file.is_none() && c.syslog.is_none());
         // a sink configured but not enabled: off

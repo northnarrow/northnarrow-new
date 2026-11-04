@@ -250,6 +250,12 @@ phase_setup() {
     cat > "$LAB/export.local" <<EOF
 # lot 276 lab
 enabled = true
+# the five, each named: flows, file drift and canary reads are opt-in
+chain = detections
+chain = actions
+chain = fim_drift
+chain = netflow
+chain = canary_access
 start = oldest
 file = on
 file_max_bytes = 64MiB

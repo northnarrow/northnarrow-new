@@ -51,6 +51,29 @@ for 1.9.0 with the `host` profile, each download's SHA-256 recorded;
 `crates/nn-export/tests/ocsf_vendor.py` rebuilds it). Every record the mapping writes is validated
 against it by the tests (`nn_export::schema`).
 
+## 1a. What leaves the host, field by field
+
+Nothing leaves the host unless the operator signs `export.local` (§2), and
+then only to the operator's own files and receiver. **By default the
+export carries the detections and the actions only**; the flows, the file
+drift and the canary reads leave only when the signed text names each
+(`chain = netflow`, `chain = fim_drift`, `chain = canary_access`). Every
+record carries its signed row whole (`raw_data`), so a chain's record
+carries every field of its row:
+
+| Chain | Fields of the row (all of them leave) | Personal data in them |
+|---|---|---|
+| every record | `metadata` (the chain, the row's place), `device` (the **host's name**, the agent's id), the product's version | the host's name |
+| `detections` (default) | `id`, `ts`, `sensor`, `path`, `rule_id`, `rule_name`, `severity`, `verdict`, `confidence`, `mitre`, `principal` (**`pid`, `comm`, `uid`, `ppid`**), **`exe`** (the executable's path), `posture_at`, `response`, `detection_type`, `status`, `suppressed_before`, **`file`** (the path a file sensor saw), **`network`** (the destination of a network detection) | a user id, process names, executable and file paths, a destination address |
+| `actions` (default) | `row`, `run`, `action`, `ts`; an intent's `source`, `response`, **`pid`**, `start_ns`, **`file`**, `severity`, `why`, **`detail`** (the detection's kind and actor), `queued_us`; an outcome's `result`, `outcome`, `reason`, `elapsed_us`; an overflow's counts and its first **`samples`** (`KillProcessTree pid 4242 (rule)`); `noted_by` | process ids, file paths |
+| `netflow` (only named) | `ts`, `flow_id`, `start_ns`, `end_ns`, `family`, **`src_addr`, `src_port`, `dst_addr`, `dst_port`**, `proto`, **`pid`, `uid`, `comm`, `exe`**, `bytes_sent`, `bytes_recv`, **`resolved_hostname`**, `ja3`, `ja4`, **`sni`**, `close_reason`, `agent_id`, `decision_engine_skipped` | **who connected where**: per user id, the addresses and the names of what they reached — a browsing history |
+| `fim_drift` (only named) | `ts`, **`path`**, `op`, `baseline_sha256`, `new_sha256`, **`modifier_pid`, `modifier_uid`, `modifier_comm`**, `severity`, `decision_engine_skipped`, `skip_reason`, `agent_id`, `attrs` (mode, owner and group before and after) | file paths (a home directory's among them), who changed them |
+| `canary_access` (only named) | `ts`, `canary_id`, `canary_name`, `canary_type`, `access_kind`, **`accessor_pid`, `accessor_uid`, `accessor_comm`, `accessor_exe`**, `first_trip`, `agent_id`, `seq` | who read a decoy file (its path in `canary_name`, a home directory's among them) |
+
+No command line and no user name is in any chain (user ids only). The
+signature fields (`prev_hash`, `entry_hash`, `agent_sig`) leave with
+every row: they are what the receiver checks.
+
 ## 2. Turning it on
 
 `/etc/northnarrow/export.local`, signed like every overlay (a key with
@@ -58,7 +81,7 @@ against it by the tests (`nn_export::schema`).
 
 ```text
 enabled = true
-chain = detections          # repeated; none named: all five
+chain = detections          # repeated; none named: detections and actions
 chain = actions
 start = end                 # end: the rows written from now | oldest: every row the chain holds
 file = on                   # the JSONL files

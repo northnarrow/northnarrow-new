@@ -43,7 +43,7 @@ liability before it is a product. NorthNarrow inverts it:
 
 | | Cloud-first EDR/XDR | **NorthNarrow** |
 |---|---|---|
-| Where telemetry goes | the vendor's cloud | **stays on the host**: the agent's only traffic of its own is a DNS probe to `127.0.0.1:53` |
+| Where telemetry goes | the vendor's cloud | **stays on the host**: the agent's only traffic of its own is a DNS probe to `127.0.0.1:53` — unless the operator signs an export overlay, which sends exactly the fields [`EXPORT.md`](docs/operator/EXPORT.md) lists to the operator's own SIEM |
 | Who decides | remote models and a SOC | **deterministic rules**, correlation and an adaptive posture, on the host; no AI model on the host |
 | Who responds | a human, later | **the host itself**, on a graduated ladder that only a signed human command releases |
 | Can root switch it off? | varies | **hardened against root**: BPF-LSM refuses signals, ptrace, file tampering, cgroup kills, freezes, moves and resource limits, root included, outside a signed maintenance window. Not absolute: see [the limits](#limits-said-plainly) |
@@ -260,8 +260,10 @@ but a defence inside the kernel is only as strong as the kernel's integrity:
   ([`docs/validation/matrix.md`](docs/validation/matrix.md)). The JA3 rule cannot fire: no
   sensor produces a TLS fingerprint yet.
 - **No independent validation.** The public CI runs are a step towards it, not a substitute (C29).
-- **No export, no backend.** Evidence stays on the host; only the heartbeat leaves it, by pull
-  (C21, C22).
+- **A minimal export, no backend.** Evidence stays on the host unless the operator signs an
+  export overlay: then the detections and the responses (and only the other chains the overlay
+  names) go as signed OCSF records to the operator's own files or syslog receiver; the heartbeat
+  leaves by pull (C21, C22; [`docs/operator/EXPORT.md`](docs/operator/EXPORT.md)).
 - **Linux x86_64 only.** No ARM64, no Windows, no macOS (C02 to C04).
 - **No published release with assets.** The signed pipeline exists, but the one tag has no assets.
 - **Partial telemetry.** Exec only, with no fork, exit or credential events (C05). No inbound
@@ -399,7 +401,8 @@ on-host LLM advisor removed, which also took about 150 crates out of `Cargo.lock
 - **Vulnerability disclosure:** [`SECURITY.md`](SECURITY.md). Please do not file
   security-sensitive reports as public issues.
 - **No telemetry, no phone-home, no update channel the agent reaches out to.** Updates are an
-  operator action with a signed artefact.
+  operator action with a signed artefact. The export sends nothing unless the operator signs its
+  overlay, and then only to the operator's own receiver.
 
 <details>
 <summary><b>Release pipeline, packages, CI and dependencies</b></summary>
@@ -454,7 +457,7 @@ no conformity assessment has been made.
 | Regulation | How the architecture answers it |
 |---|---|
 | **NIS2** | on-host detection and response; a structured, signed audit log for incident reporting |
-| **GDPR** | no telemetry leaves the controller's perimeter; no processor relationship to declare |
+| **GDPR** | no telemetry leaves the controller's perimeter; no processor relationship to declare; the export, off by default, sends to the controller's own receiver only the fields its signed overlay names ([`EXPORT.md`](docs/operator/EXPORT.md) §1a) |
 | **DORA** | fully operational with degraded or absent connectivity; no vendor dependency for continued protection |
 | **CRA** | a signed release pipeline, SBOMs, provenance attestation, a disclosure process |
 | **EU AI Act** | no AI system on the host: detection and response are deterministic rules, correlation and posture (the on-host LLM advisor was removed in Wave 4). A future AI assistant would sit off the enforcement path, on a backend |
