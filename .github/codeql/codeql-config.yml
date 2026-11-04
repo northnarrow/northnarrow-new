@@ -1,0 +1,17 @@
+# CodeQL configuration of .github/workflows/codeql.yml (lot codeql, review
+# of #496). paths-ignore lists only directories that no shipped build
+# contains: each workspace member's cargo integration tests (`<member>/tests`),
+# the fuzz harness (`fuzz`) and the lab's tooling (`deploy/lab`). Everything
+# that ships is scanned, `#[cfg(test)]` modules included. With these
+# ignored, the tree has no C/C++ or Python left to scan.
+# xtask/tests/supply_chain.rs keeps this list equal to those directories.
+name: NorthNarrow CodeQL
+
+paths-ignore:
+  - agent/tests
+  - cli/tests
+  - scan/tests
+  - watchdog/tests
+  - xtask/tests
+  - fuzz
+  - deploy/lab

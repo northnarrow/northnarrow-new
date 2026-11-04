@@ -25,6 +25,8 @@ Please **do not** open a public GitHub issue for security problems.
   reporting: **Security → Report a vulnerability** on
   https://github.com/northnarrow/northnarrow-new, or directly
   https://github.com/northnarrow/northnarrow-new/security/advisories/new.
+  Private vulnerability reporting is enabled on the repository (checked
+  on 2026-11-04).
 - This is the only channel for now, and it needs a GitHub account. An
   encrypted e-mail channel will be listed here and in
   `.well-known/security.txt`, with its key fingerprint, when the maintainer
@@ -64,6 +66,36 @@ through ENISA's single reporting platform:
 - The users of NorthNarrow are informed of the vulnerability or incident
   and of the mitigations through a GitHub Security Advisory (Article
   14(8)), without waiting for the final report.
+
+## Code scanning
+
+CodeQL (GitHub code scanning, `.github/workflows/codeql.yml`) analyses
+every language of what ships, with the `security-extended` queries: the
+Rust of the workspace and `agent-ebpf` (`#[cfg(test)]` modules included)
+and the GitHub Actions workflows. Directories that no shipped build
+contains are not scanned: the crates' integration tests (`*/tests/`), the
+fuzz harness (`fuzz/`) and the lab's tooling (`deploy/lab/`, which holds
+the tree's only C and Python). `.github/codeql/codeql-config.yml` lists
+them, and a repository test keeps that list to such directories. CodeQL
+runs on every pull request to `main`, on every push to `main` and weekly,
+so a query added by a new CodeQL release also runs on an unchanged `main`.
+Each language is analysed without a build (`build-mode: none`), the
+whole tree on a pull request too. In the pull request itself, GitHub
+flags only the alerts that it adds.
+
+The job that analyses the code holds a read-only token. The analysis
+runs the build scripts and proc-macros of the dependencies, and none of
+them can write code-scanning results or close an alert. A separate job,
+which builds and runs nothing of the tree, uploads the results.
+
+- An alert is fixed in the code, or triaged in a pull request (real,
+  false positive, not applicable) and its fix scheduled; it is not
+  dismissed to make a run pass.
+- A code-scanning alert is not a vulnerability report. If you find that
+  one is exploitable, report it privately as above.
+- Alongside it: the dependency audit (`cargo audit` on every pull request
+  and daily), Dependabot, secret scanning with push protection, the fuzz
+  smoke run and the Kani proofs.
 
 ## Scope notes
 
