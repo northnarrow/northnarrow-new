@@ -727,7 +727,7 @@ writes. In the kernel (the file-open sensor on LSM `file_open`,
 | rewrites (`MASS_OVERWRITE`) | write-opens of an existing regular file of 4 KiB or more (no `FMODE_CREATED`; the size read before `O_TRUNC` empties it) | file (`OPEN_OVERWRITE_SEEN`: tgid, device, inode) per 60-s window |
 | small rewrites (`MASS_OVERWRITE_SMALL`; the review of #500, C1) | the same, of any existing file that holds data: crosses when the distinct non-empty files rewritten reach the threshold before the files of 4 KiB or more alone do (a crossing of both is `MASS_OVERWRITE` alone) | file, per window |
 | files written new (`MASS_WRITE`) | the first write-open of the window of a file that held no data: created by the open (`FMODE_CREATED`), or empty when opened — made by `mknod(S_IFREG)`, an `O_TMPFILE` linked in with `linkat`, an `O_RDONLY \| O_CREAT` open reopened to write (the review of #500, B1: `FMODE_CREATED` alone was evaded by all three) | file (`OPEN_OVERWRITE_SEEN`, the same map: a file counts once, as what its first write-open of the window found) |
-| originals destroyed (`MASS_UNLINK`) | an unlink of a regular file that holds data (C1: it was 4 KiB or more), or held data within the window — seen non-empty at an `inode_setattr` (`OPEN_HAD_DATA`, by inode: a `truncate` then an `unlink` is one original) — or a rename onto the name of one (the target is destroyed); not a file the same process created within the window (`OPEN_CREATED`: its own temporary file, as `pip` and `npm` unpack) | name (`OPEN_DESTROY_SEEN`: tgid, parent dentry, the name's `hash_len`) per window |
+| originals destroyed (`MASS_UNLINK`) | an unlink of a regular file that holds data (C1: it was 4 KiB or more), or held data within the window — seen non-empty at an `inode_setattr` that changes its size (`OPEN_HAD_DATA`, by inode: a `truncate` then an `unlink` is one original; the re-check of #500: a size change only, not a chmod or a `touch`) — or a rename onto the name of one (the target is destroyed); not a file the same process created within the window (`OPEN_CREATED`: its own temporary file, as `pip` and `npm` unpack), nor one in a directory whose writes do not count (the re-check of #500: a carve-out — a pseudo-filesystem, `/run/systemd`, the journal, the operator's extras — or the destroyer's own runtime directory, read from the parent's `DIR_CLASS`: a daemon's atomic replacements there) | name (`OPEN_DESTROY_SEEN`: tgid, parent dentry, the name's `hash_len`) per window |
 
 A repeat (the same file reopened, the same name destroyed again) is not
 counted; an entry the LRU maps evicted counts again (more, never fewer). The
@@ -801,9 +801,13 @@ The kernel counters feed the ransomware tracker too (`crates/nn-core/src/impact`
 its (a) rewrites are distinct files of 4 KiB or more (a small-file crossing
 is no shape (a): the tracker's verdict is decisive, and a build rewrites its
 own small outputs), its (d) "deletion of originals after writing new files"
-reads files written new (not every write-open; whatever made them: B1) and
-originals of any size that held data, and counts a rename onto an original
-as its deletion. What it does not see is said in §10.5.
+reads files written new (not every write-open; whatever made them: B1) —
+and (the re-check of #500) the small-file rewrite crossing too: a copy
+made by `mknod` and brought to one byte by `truncate(2)` before it is
+written is a small rewrite to the kernel, a file written all the same;
+the copies beside the deleted originals and their content decide — and
+originals of any size that held data, and counts a rename onto an
+original as its deletion. What it does not see is said in §10.5.
 
 ### 10.2 An anti-tamper refusal of a package transaction never corroborates
 
@@ -886,9 +890,13 @@ an accepted residual of a heuristic, the filter chains excluded.
   encrypted copies and deletes the originals does not pass through the
   mass-write arm: the ransomware tracker (lot 225, NN-L-IMP-001 and the
   posture's `RansomwareEncryption`) judges it, by the copies' content and
-  names. Encryption in place from a session still raises the arm (rule 1),
-  for files of 4 KiB or more: small documents encrypted in place from a
-  session do not (as on `main`; the tracker sees them by their renames).
+  names — copies written new, or (the re-check of #500) copies sized to
+  one byte before they are written. Encryption in place from a session
+  still raises the arm (rule 1), for files of 4 KiB or more: small
+  documents encrypted in place from a session do not (as on `main`; the
+  tracker sees them by their renames; a session threshold of its own for
+  small rewrites is to be measured on a development corpus first: lot
+  283).
 - **What the arm does not see (the review of #500, C1), and who does.**
   - Originals deleted more than 60 s after the copies were written (the
     halves pair within one window, either order). NN-L-IMP-001 pairs its
@@ -903,8 +911,9 @@ an accepted residual of a heuristic, the filter chains excluded.
     the counters are per process (the cgroup window adds rewrites of 4 KiB
     or more only).
   - A truncated original whose `OPEN_HAD_DATA` entry was evicted (more than
-    4,096 files seen holding data at a setattr — chmod, chown, `touch`, a
-    truncate — in the window): its unlink counts nothing, as it did.
+    4,096 files truncated in the window — since the re-check of #500 a
+    chmod, a chown or a `touch` no longer marks a file): its unlink counts
+    nothing, as it did.
   - Tracepoint mode: the arm counts files written, no replacement shape, and
     the tracker is blind (no `MassWrite`, no `FileBurst`).
   - NN-L-IMP-001 itself: (a) counts rewrites of files of 4 KiB or more only;
@@ -941,7 +950,12 @@ value 8). Per call, a write-open of a regular file now looks its file up in
 `OPEN_CREATED`; an unlink, or a rename onto an existing name, reads the
 inode's key and looks it up in `OPEN_CREATED` (and, for an empty file, in
 `OPEN_HAD_DATA`), then its name in `OPEN_DESTROY_SEEN`; a setattr of a
-regular file that holds data inserts into `OPEN_HAD_DATA`. Measured on our
+regular file that holds data inserts into `OPEN_HAD_DATA`. The re-check of
+#500 made three of these cheaper (measured below): a creation inserts into
+`OPEN_OVERWRITE_SEEN` without looking it up (a new inode); an unlink or a
+rename reads its directory's class first (`DIR_CLASS`, a lookup; the walk
+on a miss) and stops in a carve-out; a setattr reads the `iattr`'s
+`ia_valid` and marks a size change only. Measured on our
 own lab guests (4 vCPU, QEMU; the kernel's BPF statistics on for the bench
 only, `run_time_ns / run_cnt` of each program over 20,000 operations on
 files of 1 KiB; `main` a97d5ff2 against the lot on the same Ubuntu 22.04

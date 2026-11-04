@@ -808,9 +808,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     version of the lot, was evaded by all three: the review of #500, B1) —
     and the originals destroyed — an unlink, or a rename onto an existing
     file, of any regular file that holds data, or held it within the
-    window (`OPEN_HAD_DATA`: a truncate then an unlink) — once per name
-    (`OPEN_DESTROY_SEEN`), never a file the process itself created in the
-    window (`OPEN_CREATED`: `pip`'s and `npm`'s temporary files). The
+    window (`OPEN_HAD_DATA`, marked at a size change: a truncate then an
+    unlink) — once per name (`OPEN_DESTROY_SEEN`), never a file the
+    process itself created in the window (`OPEN_CREATED`: `pip`'s and
+    `npm`'s temporary files) nor one in a directory whose writes do not
+    count (a carve-out, the destroyer's own runtime directory: the re-check
+    of #500 — a daemon's atomic replacements under `/run/systemd`). The
     mass-write arm of `ConfirmedIntrusion` fires on 20 distinct existing
     files of 4 KiB or more rewritten in place (40 for a cgroup), on 20
     of any size outside an authenticated session (`MASS_OVERWRITE_SMALL`;
@@ -842,9 +845,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     by a package); the same chain flushed by another process and the host
     firewall's chains (ufw, fail2ban, firewalld, the built-in ones) still
     are.
-  What stays: copy-then-delete ransomware run from an SSH shell is the
-  ransomware tracker's (NN-L-IMP-001), not the mass-write arm's (as
-  before); corroboration stays per actor scope, not per process tree;
+  NN-L-IMP-001's (d) reads the small-file rewrite crossing as files
+  written too (the re-check of #500: a copy sized to one byte by
+  `truncate(2)` before it is written was no file written new, and the
+  copy-then-delete `main` saw went dark). What stays: copy-then-delete
+  ransomware run from an SSH shell is the ransomware tracker's
+  (NN-L-IMP-001), not the mass-write arm's (as before); corroboration stays per actor scope, not per process tree;
   what neither sees (originals deleted more than a minute after the
   copies, a deleter in another cgroup or forked per file, tracepoint mode)
   is listed in the design's §10.5.

@@ -246,7 +246,10 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
     `FileBurst` of kind `unlink` counts each original once per name and
     window — any regular file that holds data (it was 4 KiB or more), or
     held it within the window (a truncate then an unlink), a rename onto
-    one included, a file the process itself created in the window excluded;
+    one included, a file the process itself created in the window and a
+    file in a directory whose writes do not count (`/run/systemd`, the
+    journal, a pseudo-filesystem, the operator's carve-outs, the process's
+    own runtime directory) excluded;
     both events carry a new `cgroup_id` (the writer's cgroup v2 id, the
     posture's pairing of a copy and a deletion). The
     agent's journal lines say so: `mass write: distinct existing files
