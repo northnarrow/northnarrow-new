@@ -5641,6 +5641,17 @@ number in parentheses is a lab PR.
     workspace's tests, the privileged tests built, attack-coverage, golden
     ×5, MSRV, fuzz replay, portable-core, lockfiles): as PR #494 records
     them for this commit.
+  - After the merge (PR #494 merged at b13ce8a4): CI's 22.04 privileged
+    suites failed once on `a_reset_makes_what_started_before_it_not_known`,
+    "quit_agent … SIGQUIT to pid 16177 refused (EPERM)". A fault of the
+    fixtures' teardown, not of the tracker. The teardown's new diagnostics
+    named the process left on 22.04 (6 of 8 runs of the old teardown
+    failed there): the agent's move guard self-test target, a child
+    registered as protected, alive after the agent and outside the
+    fixture's `sudo` tree, which the old rounds alone signalled. The
+    teardown now evicts and signals every pid it has seen each round, the
+    agent first: 8 of 8 runs passed on 22.04 with it (#501). Lot 275's two
+    "still alive 10 s" teardowns on 5.15 were the same.
 - **Lot 278 — R009 kills in COMBAT only; the installer's window covers its
   own process tree; the lab's "R009 flake" fixed at its cause (C14, C17;
   the false positive of the review of #492, section f).**
