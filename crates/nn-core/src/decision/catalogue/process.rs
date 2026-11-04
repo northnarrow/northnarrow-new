@@ -258,7 +258,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` in its \
                    environment (read: killed even if the process has since exited — \
                    evidence; a leader that exited while a thread runs on is read through that \
-                   thread), a running process's environment not read, over 1 MiB, an unknown \
+                   thread, refused when none is read whole), a running process's environment \
+                   not read, over 1 MiB, an unknown \
                    start; an argv not read whole. Recorded \
                    otherwise: the system's tool by module name, nothing moved or forced — no \
                    `modprobe.d` or index is read, what the names load is the kernel's to judge \
@@ -301,6 +302,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-linux/src/sensors/kmod_exec.rs::what_was_read_is_judged",
             "crates/nn-linux/src/sensors/kmod_exec.rs::\
              a_leader_that_exited_while_its_thread_runs_has_not_exited",
+            "crates/nn-linux/src/sensors/kmod_exec.rs::\
+             a_relay_of_threads_after_its_leader_exited_is_never_an_exit",
             "crates/nn-linux/src/sensors/kmod_exec.rs::\
              the_program_is_the_system_s_tool_by_device_and_inode",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::\

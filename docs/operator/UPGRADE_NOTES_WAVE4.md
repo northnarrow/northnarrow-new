@@ -183,7 +183,8 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
   could be read — a load it made is the kernel's to judge (R018); its
   environment not verified"): its kill would reach no one. A tool whose
   first thread exited while another runs on has not exited: its
-  environment is read through the running thread. R011 resolves no
+  environment is read through the running thread (killed when none is read
+  whole). R011 resolves no
   name and reads no `modprobe.d`: the load is the kernel's signature
   policy's to refuse, and R018's to judge after it (with no verdict for a
   packaged file loaded by a comm of its loader allowlist). The

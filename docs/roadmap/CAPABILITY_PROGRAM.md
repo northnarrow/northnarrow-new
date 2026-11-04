@@ -5949,6 +5949,16 @@ number in parentheses is a lab PR.
     `environ`), the two `kmod` files. No guest round for these two: their
     tests are the unit tests above; the R011 e2e runs in CI's KVM jobs
     (22.04, 24.04).
+  - The check of 39fcda1c: DC-A and N-3 closed, J19 equivalent. DC-B, done
+    in d56722e1: with a relay of threads (the leader exited, each thread
+    makes the next and exits) the listing could see no thread with the
+    process's memory and the read fell back on an exit — 3,158 of 64,616
+    reads (4.9%) of a process alive throughout. With no thread seen and the
+    pidfd not exited, the pump reads `Threads:` of `/proc/<pid>/status`:
+    more than one, refused, never an exit; not readable, refused; one (a
+    single-threaded process mid-exit, DC-1), its exit. Test: the reviewer's
+    case on a real process (`a_relay_of_threads_after_its_leader_exited_is_never_an_exit`,
+    3 s of reads: never an exit, never clean; it fails without the fix).
   - Lab of the EARLIER design (retired: the decisions above; as measured;
     our own guests, lease `k279`; Ubuntu 22.04 5.15.0-202 and 24.04
     6.8.0-147; on each, `main` 80c8da36 then the lot on the same

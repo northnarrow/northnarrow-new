@@ -828,7 +828,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   recorded, its environment not verified — its kill would reach no one; a
   tool whose leader exited while another thread runs on (`pthread_exit`)
   has not exited: its environment is read through the running thread
-  (`/proc/<pid>/task/<tid>/environ`), killed when not read whole. The
+  (`/proc/<pid>/task/<tid>/environ`), killed when not read whole or when
+  no thread is seen while the kernel counts more than one (`Threads:`). The
   environment's check is best effort for a short-lived `modprobe`; code
   injected into the tool may outlive it in a forked child, which R011's
   kill of the tool would not reach.

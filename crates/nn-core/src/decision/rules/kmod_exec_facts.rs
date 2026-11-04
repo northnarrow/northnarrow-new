@@ -29,7 +29,8 @@
 //!   not verified ([`Environment::Exited`]). A leader that exited while
 //!   another thread of its process runs on (`pthread_exit`) has not: the
 //!   environment is read through that thread, refused when it cannot be
-//!   read whole (the re-check of #498, DC-A). An empty environment read
+//!   read whole (the re-check of #498, DC-A) — or when no thread is seen
+//!   while the kernel counts more than one (DC-B). An empty environment read
 //!   from the running process is one (libxtables runs `modprobe` with
 //!   none). Best effort: a short-lived `modprobe` may exit before the pump
 //!   reads it, the likelier as a burst of execs slows the pump; code

@@ -108,7 +108,7 @@ before the agent could read its environment is recorded, its environment
 not verified — a kill would reach no one; a tool whose first thread (its
 leader) exited while another thread runs on has not exited: the agent reads
 the environment through the running thread, and kills when it cannot read
-it whole. For a short-lived `modprobe` the environment's check is best
+it whole — or sees no thread running while the kernel counts more than one. For a short-lived `modprobe` the environment's check is best
 effort. R011 resolves nothing: whether a name
 loads a module, and which, is the kernel's to judge — its module signature
 enforcement and lockdown (the host check reports both) and lot 285's deny of
