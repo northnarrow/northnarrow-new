@@ -52,6 +52,7 @@ fn beat(seq: u64, s: i64) -> HeartbeatRecord {
         }],
         stop_reason: None,
         capabilities: None,
+        nodns: None,
         export: None,
     }
 }

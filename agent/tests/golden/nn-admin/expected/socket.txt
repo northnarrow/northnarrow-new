@@ -12081,8 +12081,8 @@ connection 1
 < ConfigOverlaySetResponse
 > (closed)
 
-### sock.config-overlay-set.kind.export
-$ nn-admin config overlay set export --file overlay.local --key key-a --agent-id-file agent_id --socket admin.sock
+### sock.config-overlay-set.kind.nodns-allow
+$ nn-admin config overlay set nodns-allow --file overlay.local --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
 --- stdout
 | config overlay set: stored
@@ -12096,13 +12096,28 @@ connection 1
 < ConfigOverlaySetResponse
 > (closed)
 
+### sock.config-overlay-set.kind.export
+$ nn-admin config overlay set export --file overlay.local --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 0
+--- stdout
+| config overlay set: stored
+--- stderr
+(empty)
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"ConfigOverlaySetRequest":{"content":"# matrix: comments only\n","payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"ConfigOverlaySet":{"kind":17,"len":24,"sha256":"hex:9222fd1868bbf2a6f25005e5f84fcefdf2b60bed1a4850fde18cf83c18d790d1"}},"nonce":"<challenge>","op":21,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< ConfigOverlaySetResponse
+> (closed)
+
 ### sock.config-overlay-set.unknown-kind
 $ nn-admin config overlay set no-such-list --file overlay.local --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 2
 --- stdout
 (empty)
 --- stderr
-| config overlay: unknown overlay `no-such-list` — one of: fim-paths, process-comm-allowlist, netflow-comm-allowlist, netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout, escalation-allow, combat-rules-v4, combat-rules-v6, combat-allow, canary-readers, cow-guard, execq-hashes, exec-policy, rule-policy, export
+| config overlay: unknown overlay `no-such-list` — one of: fim-paths, process-comm-allowlist, netflow-comm-allowlist, netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout, escalation-allow, combat-rules-v4, combat-rules-v6, combat-allow, canary-readers, cow-guard, execq-hashes, exec-policy, rule-policy, nodns-allow, export
 --- agent
 (no connection)
 

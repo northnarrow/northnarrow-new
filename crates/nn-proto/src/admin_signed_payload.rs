@@ -751,14 +751,18 @@ pub enum OverlayKind {
     /// …`, `combat-without-corroboration NN-L-IMP-001`). Without it every
     /// rule keeps its built-in response, the held kills held.
     RulePolicy = 15,
+    /// Lot 275: `nodns-allow.local` — the addresses and CIDR blocks
+    /// NN-L-NET-028 ("no DNS, no connect") does not judge (a mirror, an
+    /// NTP server, a peer configured by address), one a line.
+    NoDnsAllow = 16,
     /// Lot 276: `export.local` — the export's configuration (its chains,
     /// its JSONL file sink, its syslog-over-TLS receiver and the CA it
     /// pins). Off without it: a signed file turns the export on.
-    Export = 16,
+    Export = 17,
 }
 
 impl OverlayKind {
-    pub const ALL: [OverlayKind; 16] = [
+    pub const ALL: [OverlayKind; 17] = [
         OverlayKind::FimPaths,
         OverlayKind::ProcessCommAllowlist,
         OverlayKind::NetflowCommAllowlist,
@@ -774,6 +778,7 @@ impl OverlayKind {
         OverlayKind::ExecqHashes,
         OverlayKind::ExecPolicy,
         OverlayKind::RulePolicy,
+        OverlayKind::NoDnsAllow,
         OverlayKind::Export,
     ];
 
@@ -795,6 +800,7 @@ impl OverlayKind {
             OverlayKind::ExecqHashes => "execq-hashes",
             OverlayKind::ExecPolicy => "exec-policy",
             OverlayKind::RulePolicy => "rule-policy",
+            OverlayKind::NoDnsAllow => "nodns-allow",
             OverlayKind::Export => "export",
         }
     }
@@ -847,7 +853,8 @@ impl TryFrom<u8> for OverlayKind {
             13 => Ok(Self::ExecqHashes),
             14 => Ok(Self::ExecPolicy),
             15 => Ok(Self::RulePolicy),
-            16 => Ok(Self::Export),
+            16 => Ok(Self::NoDnsAllow),
+            17 => Ok(Self::Export),
             other => Err(SignedPayloadError::UnknownOverlayKind(other)),
         }
     }
@@ -2011,7 +2018,8 @@ mod tests {
             (OverlayKind::ExecqHashes, 13, "execq-hashes"),
             (OverlayKind::ExecPolicy, 14, "exec-policy"),
             (OverlayKind::RulePolicy, 15, "rule-policy"),
-            (OverlayKind::Export, 16, "export"),
+            (OverlayKind::NoDnsAllow, 16, "nodns-allow"),
+            (OverlayKind::Export, 17, "export"),
         ] {
             assert_eq!(u8::from(k), byte);
             assert_eq!(OverlayKind::try_from(byte).unwrap(), k);
@@ -2020,7 +2028,7 @@ mod tests {
             assert_eq!(OverlayKind::from_keyword(&k.file_name()), Some(k));
         }
         assert!(OverlayKind::try_from(0u8).is_err());
-        assert!(OverlayKind::try_from(17u8).is_err());
+        assert!(OverlayKind::try_from(18u8).is_err());
         assert_eq!(OverlayKind::Export.file_name(), "export.local");
         assert_eq!(OverlayKind::from_keyword("nope"), None);
     }

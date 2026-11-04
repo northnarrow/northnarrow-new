@@ -123,6 +123,8 @@ fn flow(i: u64) -> crate::net::drain::NetFlowPayload {
         close_reason: 0,
         agent_id: hex::encode(AGENT_ID),
         decision_engine_skipped: false,
+        // lot 275: one row in ten an inbound connection's
+        inbound: i % 10 == 9,
     }
 }
 
@@ -302,6 +304,17 @@ fn every_chain_exported_verifies_where_it_arrives() {
         vec![1001, 1007, 2004, 4001, 7003],
         "file, process, finding, network, process remediation"
     );
+    // lot 275's inbound connections (the netflow writer's `"inbound": true`)
+    // are Inbound flows, the others as before
+    let directions: Vec<u64> = file
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v["class_uid"] == 4001)
+        .map(|v| v["connection_info"]["direction_id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(directions.len(), 40);
+    assert_eq!(directions.iter().filter(|d| **d == 1).count(), 4);
+    assert_eq!(directions.iter().filter(|d| **d == 0).count(), 36);
     // at least once: the same rows again are counted, not refused
     let again = format!("{file}{file}");
     let r = nn_admin::export::verify(again.as_bytes(), &pk).unwrap();

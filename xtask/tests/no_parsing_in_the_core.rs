@@ -115,7 +115,8 @@ fn the_dns_pump_asks_the_worker() {
     let mux =
         fs::read_to_string(repo_root().join("crates/nn-linux/src/sensors/multiplexer.rs")).unwrap();
     let code = strip_comments(&mux);
-    let pass = &code[code.find("fn dns_pass(").unwrap()..];
+    // lot 275: generic over its ring (`fn dns_pass<R: RingSource>(`)
+    let pass = &code[code.find("fn dns_pass").unwrap()..];
     let pass = &pass[..pass.find("\n}\n").unwrap()];
     assert!(pass.contains("parse.names(raws.iter().map(name_request).collect())"));
     let sensor = strip_comments(

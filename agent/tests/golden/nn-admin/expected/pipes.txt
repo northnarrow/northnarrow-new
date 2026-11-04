@@ -341,6 +341,7 @@ exit: 0
 | execq-hashes             absent
 | exec-policy              absent
 | rule-policy              absent
+| nodns-allow              absent
 | export                   absent
 
 ### pipe.stdout.policy-show
@@ -369,6 +370,7 @@ exit: 0
 |   held: the kill of the ransomware actor's process tree (NN-L-IMP-001, lab PR 225)
 |   held: the kill of the staged program that asked a security tool off (NN-L-EVA, lab PR 225)
 |   held: the kill for a rename seen only as a watched directory's new entry (NN-L-FIM-010, a match added by lab PR 225)
+|   held: the kill of a process that connected to a public address its lineage did not resolve (NN-L-NET-028, lot 275)
 
 ### pipe.stdout.policy-test
 $ nn-admin policy test --events events.json --config-dir empty

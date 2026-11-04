@@ -1,5 +1,5 @@
 # NorthNarrow — V2 validation campaign — frozen rule denominator.
-# version: 3
+# version: 4
 # frozen: 2026-10-15, before any V2 run (external audit NN-AUD-217, NN-AUD-235).
 # version 2 (2026-10-16, lab PR 163, before any V2 run): NN-L-NET-003 leaves
 # the Critical sub-gate (gate -), inactive until BUG-025 (no sensor produces
@@ -16,6 +16,13 @@
 # ransomware rules NN-L-IMP-001 (Critical, in the sub-gate) and NN-L-IMP-002,
 # and the security-tool rules NN-L-EVA-001..004 (lab PR 225: families impact
 # and evasion).
+# version 4 (2026-11-03/04, lot 275, before any V2 run): NN-L-NET-028 ("no
+# DNS, no connect": a connect to a public address its lineage did not
+# resolve; Medium, its kill held behind the per-rule policy), family net;
+# BUG-025 is closed (the TLS ClientHello sensor produces the fingerprints
+# NN-L-NET-003 judges), and NN-L-NET-003 is Medium and Log, a fingerprint
+# being an attribute, not an identity (R6 of the external review of 04/11):
+# it cannot issue a Critical verdict and stays out of the sub-gate (gate -).
 #
 # One row per rule the agent can record: the 85 rules the production engine
 # loads (decision::rules::default_rules_with_net) and NN-L-AT-001 and
@@ -33,8 +40,8 @@
 #            outside it
 #   gate     critical = in the 100 % Critical sub-gate: every rule design
 #            §13 Q1 names, and every other rule that can issue a Critical
-#            verdict on the agent as built (NN-L-NET-003 cannot until
-#            BUG-025); - otherwise
+#            verdict on the agent as built (NN-L-NET-003 out in versions 2
+#            and 3, until BUG-025; Medium from version 4); - otherwise
 #   q1       yes = named by Q1 itself (FIM-001/002/008/010/021/022 and every
 #            CHAIN rule); - otherwise
 #   status   in = in the denominator; n/a:<reason> = left out, decided in a
@@ -121,6 +128,7 @@ NN-L-NET-020_DnsQueryFlood	net	engine	-	-	in
 NN-L-NET-021_SensorRecordFlood	net	engine	-	-	in
 NN-L-NET-026_ScanFanOut	net	engine	-	-	in
 NN-L-NET-027_OutboundAuthBruteforce	net	engine	-	-	in
+NN-L-NET-028_ConnectWithoutDns	net	engine	-	-	in
 NN-L-IOU-001_IoUringRingCreated	io_uring	engine	-	-	in
 NN-L-IOU-002_IoUringFileAndNetwork	io_uring	engine	-	-	in
 NN-L-BPF-001_BpfProgramLoaded	bpf	engine	-	-	in

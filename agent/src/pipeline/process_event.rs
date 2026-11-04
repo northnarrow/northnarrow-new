@@ -673,6 +673,41 @@ pub(crate) fn process_event(
                 "net listener"
             );
         }
+        // Lot 275: one line per inbound flow row, DNS response and hello —
+        // DEBUG, as the outbound flows (review 71); their records are the
+        // netflow log and the rules'.
+        Event::NetInbound(nf) => {
+            debug!(
+                pid = %nf.pid,
+                comm = %Escaped(&nf.comm),
+                peer = %nf.src_addr,
+                peer_port = %nf.src_port,
+                local_port = %nf.dst_port,
+                phase = nf.phase.as_str(),
+                "inbound flow"
+            );
+        }
+        Event::DnsAnswer(a) => {
+            debug!(
+                pid = %a.pid,
+                comm = %Escaped(&a.comm),
+                query = %Escaped(a.query_name.as_deref().unwrap_or("")),
+                answers = a.addrs.len(),
+                rcode = a.rcode,
+                "dns answer"
+            );
+        }
+        Event::TlsClientHello(h) => {
+            debug!(
+                pid = %h.pid,
+                comm = %Escaped(&h.comm),
+                dst_addr = %h.dst_addr,
+                dst_port = %h.dst_port,
+                outcome = h.outcome.as_str(),
+                ja4 = %Escaped(h.fingerprint.as_ref().map_or("", |f| f.ja4.as_str())),
+                "tls client hello"
+            );
+        }
     }
 
     // Lab PR 236 (multi-match): every rule judged the event; the decision

@@ -388,6 +388,7 @@ mod tests {
             close_reason: 0,
             phase: Default::default(),
             observed_ns: 0,
+            dns_resolution: Default::default(),
         };
         note_flow(&ev);
         let after = encrypted_flows();

@@ -26,6 +26,10 @@ pub(crate) struct Attached {
     pub(crate) lineage: AuthSessionTracker,
     pub(crate) flow_tracker: Arc<parking_lot::Mutex<FlowTracker>>,
     pub(crate) dns_cache: Arc<DnsCache>,
+    /// Lot 275 (NN-L-NET-028): the resolved table, and the TLS pump's
+    /// ingest the net drain's closes wait on.
+    pub(crate) resolved: Arc<northnarrow_agent::net::resolved::ResolvedTable>,
+    pub(crate) tls_ingest: Arc<northnarrow_agent::net::dns_ingest::DnsIngest>,
     pub(crate) execq_mode: northnarrow_agent::execq::Mode,
     pub(crate) execpol_mode: northnarrow_agent::execpol::Mode,
     /// R11c (lab PR 264): the exec guards the load installed, with their
@@ -96,10 +100,16 @@ pub(crate) async fn load(
     // spawned further down.
     let flow_tracker = Arc::new(parking_lot::Mutex::new(FlowTracker::default()));
     let dns_cache = Arc::new(DnsCache::default());
+    // Lot 275 (C07, NN-L-NET-028): which process resolved which address,
+    // and how far the TLS ClientHello pump has read its ring.
+    let resolved = Arc::new(northnarrow_agent::net::resolved::ResolvedTable::default());
+    let tls_ingest = Arc::new(northnarrow_agent::net::dns_ingest::DnsIngest::default());
     let net_wiring = northnarrow_agent::sensors::multiplexer::NetWiring {
         flow_tracker: Arc::clone(&flow_tracker),
         dns_cache: Arc::clone(&dns_cache),
         lineage: lineage.clone(),
+        resolved: Arc::clone(&resolved),
+        tls_ingest: Arc::clone(&tls_ingest),
     };
     // R11c (lab PR 264): what the load is told — it was set in process-wide
     // switches before the multiplexer started.
@@ -322,6 +332,8 @@ pub(crate) async fn load(
         lineage,
         flow_tracker,
         dns_cache,
+        resolved,
+        tls_ingest,
         execq_mode,
         execpol_mode,
         exec_guards,

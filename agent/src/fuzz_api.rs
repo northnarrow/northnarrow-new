@@ -534,11 +534,19 @@ mod tests {
             (
                 "dns-answers.bin",
                 packet(
-                    3 | (2 << 2),
-                    &answer(Answer::DnsAnswers {
-                        a: vec![[192, 0, 2, 1]],
-                        aaaa: vec![],
-                    }),
+                    // lot 275: 64 bytes, room for the question and the record
+                    3 | (4 << 2),
+                    &answer(Answer::DnsAnswers(Some(nn_proto::ipc::DnsAnswersOut {
+                        qname: "example.com".into(),
+                        qtype: 1,
+                        rcode: 0,
+                        records: vec![nn_proto::ipc::DnsRecordOut::A {
+                            name: "example.com".into(),
+                            ttl: 60,
+                            addr: [192, 0, 2, 1],
+                        }],
+                        complete: true,
+                    }))),
                 ),
             ),
             // lot 276: the export worker's hello (the selector's low bit),
@@ -725,6 +733,20 @@ mod tests {
             }
         }
         assert!(ok >= 1 && refused >= 2, "ok {ok}, refused {refused}");
+        // review of #495, N6: a seed whose refused enforce the start applies
+        // as alert, the rest in force
+        let mut demoted = 0;
+        for (name, bytes) in inputs("seeds", "rule_policy") {
+            let b = crate::decision::rule_policy::boot_policy(Some((
+                std::path::Path::new("/etc/northnarrow/rule-policy.local"),
+                text(&bytes),
+            )));
+            if b.demoted.is_some() {
+                assert!(!b.policy.is_builtin(), "{name}");
+                demoted += 1;
+            }
+        }
+        assert!(demoted >= 1, "no seed reaches the start's demotion");
     }
 
     #[test]

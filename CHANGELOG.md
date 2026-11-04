@@ -42,8 +42,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   rustls-webpki 0.103.16, the provider's key provider loads no private
   key; the CI charter gate refuses ring and aws-lc in the agent's graph.
   The supervisor's pass no longer waits on a worker's long request; the
-  IPC's version is 3; the fuzz target `ipc_check` covers the export's
-  answers. After its independent review (#499): a read inside a chain's
+  IPC's version is 4 (after lot 275's 3); the fuzz target `ipc_check`
+  covers the export's answers. After its independent review (#499): a
+  read inside a chain's
   rotation window waits for the rename (it went "ahead" and back to the
   chain's oldest file); `nn-admin export verify` maps each row again and
   refuses a record whose OCSF fields were rewritten, and a rotation
@@ -57,6 +58,60 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   the actions are exported, the flows, file drift and canary reads each
   opt-in (`EXPORT.md` §1a lists every field that leaves); X25519 refuses
   a shared secret of all zeros; the sink's files are 0600.
+- Network telemetry, level 2 of C07 (lot 275,
+  `docs/operator/NETWORK_TELEMETRY.md`): three new sources of the bus,
+  each with its sensor-contract entry, its attach state in the signed
+  manifest, its kernel budget, its ring's loss counters (`inbound` /
+  `inbound_rate`, `dns_answer` / `dns_answer_rate`, `tls` / `tls_rate`)
+  and the network class. **Inbound connections** (`net_inbound`): an
+  fexit on `inet_csk_accept` (the program built for this kernel's
+  parameter count — 4 up to 6.9, 2 from 6.10 — read from its BTF) records
+  every accepted connection in the accepting process's context, and
+  `tcp_close` its close, on a ring and a socket map of their own (an
+  inbound flood no longer reaches the outbound flows' ring or evicts their
+  sockets); `Event::NetInbound` rows with the attribution of an outbound
+  flow, the closed ones in `netflow.jsonl` with `"inbound": true`. **DNS
+  responses** (`dns_answer`): an fexit on `udp_recvmsg` / `udpv6_recvmsg`
+  reads every datagram from port 53 from the receiver's buffer (512 bytes);
+  the parse worker decodes the question, the response code and the A,
+  AAAA and CNAME records with their TTLs (IPC version 3; nn-parse's
+  `dns_response`, fuzzed); `Event::DnsAnswer`. **TLS ClientHellos**
+  (`tls_hello`): an fentry on `tcp_sendmsg` copies an outbound flow's first
+  send when it is a ClientHello (4,096 bytes); the parse worker computes
+  JA3, JA4, SNI and ALPN; `Event::TlsClientHello`, and the fingerprint on
+  the flow's snapshots and closed row (`ja3`, `ja4`, `sni` in
+  `netflow.jsonl`). NN-L-NET-003 judges the hello (BUG-025 closed).
+- NN-L-NET-028, "no DNS, no connect", per lineage (lot 275): a TCP connect
+  or a UDP send to a public address the DNS evidence does not bind to the
+  process or an ancestor — no response it received named the address (the
+  question's chain only), nor a system resolver's response (its executable
+  and a system uid) for a name it asked — is recorded: Medium, Low when
+  only a resolver's response for another lineage named it; once per
+  process and destination every 10 minutes; its kill (`KillProcess`) held
+  behind the per-rule policy (`NODNS_KILL`), whose `enforce` the policy
+  refuses for now (review of #495). The state is
+  nn-core's `net::resolved` (the host's names held for their TTL, 300 s at
+  least, a day at most; per-process bindings that last 2 h past each use;
+  an address its own name spells binds nothing); the connect pump and the
+  net drain judge each connect-time and UDP row once the DNS pumps have
+  read the records made before it. Not judged: LAN and the other
+  non-public ranges, the configured resolvers, the addresses of the signed
+  `nodns-allow.local` (a new overlay kind, `nn-admin config overlay set
+  nodns-allow`), and what the agent cannot judge (a process older than the
+  DNS response sensor, a name asked whose response was not seen whole, DNS
+  records held back or lost — host-wide for 5 minutes for a user's or a
+  ring's —, the DNS pumps not caught up, the parse worker not answering).
+  A blinding shows: a signed `nodns_coverage_lost` audit row (its cause and
+  the pid or uid that caused it, one a cause every 5 minutes) and the
+  heartbeat's `nodns` counters of the rule's judgements by outcome and
+  unknown reason. A system resolver whose response binds other processes
+  is its executable at its system path, one of the resolver users (never
+  root) and the host's file there: its image's device and inode, in
+  whatever mount namespace it runs (a sandboxed systemd-resolved is one; a
+  container's dnsmasq, or an image replaced at the path, is not) — never a
+  path alone. A blinding's record is limited by the agent's monotonic
+  clock, one a cause every 5 minutes; the beat's `coverage_lost` counts the
+  rows queued to be signed.
 - Exemptions by cgroup or unit hold only for processes started in their
   cgroup, the kernel's host checks name the fixes the sandbox relies on,
   and a worker enters its sandbox single-threaded (lot 277, Wave 4 phase 3,
@@ -2034,6 +2089,23 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- NN-L-NET-003: a TLS fingerprint is an attribute, not an identity (lot
+  275, R6 of the external review of 04/11). A ClientHello whose JA3 — or,
+  new, JA4 — is in the operator's fingerprint list
+  (`netflow-ja3-blocklist.{v1,local}`, which accepts both forms) is
+  **Medium** and `Log`, no longer Critical with `KillProcessTree` and
+  COMBAT; its record says the fingerprint names a TLS stack every program
+  on it shares (the fingerprint alone finds 6.82 % of malware, 88.68 % with
+  the destination: Anderson & McGrew). The signed per-rule policy refuses
+  `enforce NN-L-NET-003` until the rule has a second predicate (a
+  destination or an executable): the line refuses a file to be signed
+  (`config overlay set`); in a policy signed before, the start takes only
+  that line as `alert`, the rest of the policy in force, and signs a
+  `rule_policy` degradation naming it ("enforce refused, applied as
+  alert"). Out of the V2 Critical
+  sub-gate (registry version 4, 29 rows). The shipped
+  `netflow-ja3-blocklist.v1` says so (its earlier text is replaced at
+  install, as every earlier shipped list).
 - The responses run by a pool of workers keyed by process (lab PR 270,
   R12c-3; `docs/architecture/EVENT_BUS.md` §2e): eight workers
   (`nn-response-<n>`, `NN_RESPONSE_WORKERS`, 1 to 32) take one response

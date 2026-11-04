@@ -19,7 +19,7 @@
 //! |---- |----------|-----------------------|--------------------|
 //! | 001 | Critical | KillProcessTree+COMBAT| NetFlow            |
 //! | 002 | High     | KillProcess + ENGAGED | NetFlow            |
-//! | 003 | Critical | KillProcessTree+COMBAT| NetFlow            |
+//! | 003 | Medium   | log (R6, lot 275)     | TlsClientHello     |
 //! | 004 | High     | KillProcess + ENGAGED | DnsQuery           |
 //! | 005 | High     | ENGAGED + log         | DnsQuery (window)  |
 //! | 006 | Medium   | ALERTED               | NetListener        |
@@ -29,8 +29,9 @@
 //!
 //! ## Critical-rate-limit lock-in (§13 Q4)
 //!
-//! NN-L-NET-001 + NN-L-NET-003 are tagged Critical with the
-//! "never throttled by the NetFlow rate limiter" invariant.
+//! NN-L-NET-001 is tagged Critical with the "never throttled by the
+//! NetFlow rate limiter" invariant (NN-L-NET-003 was too, until lot 275's
+//! R6 made a fingerprint match Medium).
 //! External audit NET-019: the §6.5 pacing sits in the net drain, per
 //! uid, before any rule runs, so it cannot read a verdict's tier; it
 //! instead never holds back a flow that meets the predicate of a rule
@@ -44,7 +45,7 @@
 //! - NN-L-NET-001 holds an `Arc<NetBlocklist>` (operator-loaded
 //!   IP/CIDR list).
 //! - NN-L-NET-003 holds an `Arc<Ja3Blocklist>` (operator-loaded
-//!   JA3 hashes).
+//!   JA3 hashes and JA4 fingerprints).
 //! - NN-L-NET-005 holds an `Arc<Mutex<DnsBurstWindow>>` (per-PID
 //!   rolling 60s counter of TXT/NULL queries).
 //!
@@ -690,11 +691,17 @@ impl Rule for NnLNet002OutboundToBlockedTld {
     }
 }
 
-// ── NN-L-NET-003 — JA3 threat-actor match ────────────────────────────
+// ── NN-L-NET-003 — a TLS fingerprint in the operator's list ──────────
 
-/// JA3 hash matches an operator-curated threat-actor blocklist.
-/// Critical + KillProcessTree + posture→COMBAT. NEVER throttled
-/// per Q4 (documented C2 indicator).
+/// A TLS ClientHello whose JA3 or JA4 is in the operator's fingerprint
+/// blocklist. Lot 275, R6 of the external review of 04/11: Medium,
+/// recorded, never acted on. A fingerprint names a TLS stack (a library and
+/// its settings), not a program: every program on the same stack shares
+/// it, and the fingerprint alone finds little malware (a recall of 6.82 %
+/// against 88.68 % with the destination, Anderson & McGrew). The signed
+/// per-rule policy refuses `enforce` for this rule until it has a second
+/// predicate, a destination or an executable
+/// ([`crate::decision::rule_policy::ENFORCE_REFUSED`]).
 pub struct NnLNet003BadJa3 {
     blocklist: Arc<Ja3Blocklist>,
 }
@@ -710,37 +717,44 @@ impl Rule for NnLNet003BadJa3 {
         "NN-L-NET-003_BadJa3"
     }
     fn name(&self) -> &'static str {
-        "JA3 fingerprint matches threat-actor blocklist"
+        "TLS fingerprint (JA3 or JA4) in the operator's blocklist"
     }
     fn category(&self) -> &'static str {
-        CATEGORY_CRITICAL
+        CATEGORY_MEDIUM
     }
     fn attack(&self) -> &'static [AttackRef] {
         const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CommandAndControl, "T1573.002")];
         ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::NetFlow(nf) = event else {
+        // Lot 275: judged on the ClientHello the TLS sensor fingerprinted,
+        // once per flow, as soon as it is sent (the flow's closed row
+        // carries the same fingerprint for the netflow log, not judged
+        // again).
+        let Event::TlsClientHello(h) = event else {
             return None;
         };
-        // Lab PR 224: judged on the closed flow only (byte counts, or a
-        // record the netflow pacing applies to), once.
-        if nf.phase != FlowPhase::Closed {
-            return None;
-        }
-        let fp = nf.tls_fingerprint.as_ref()?;
-        if !self.blocklist.contains(&fp.ja3) {
-            return None;
-        }
+        let fp = h.fingerprint.as_ref()?;
+        let hit = self.blocklist.matching(&fp.ja3, &fp.ja4)?;
+        let value = match hit {
+            crate::net::blocklist::FingerprintMatch::Ja3 => fp.ja3.as_str(),
+            crate::net::blocklist::FingerprintMatch::Ja4 => fp.ja4.as_str(),
+        };
         Some(net_verdict(
             self,
-            ResponseAction::KillProcessTree,
-            Severity::Critical,
-            "TLS JA3 fingerprint matches operator threat-actor \
-             blocklist — kill the process tree + posture → COMBAT",
-            nf.pid,
-            nf.comm.clone(),
-            nf.start_ns,
+            ResponseAction::Log,
+            Severity::Medium,
+            &format!(
+                "TLS ClientHello {} {} is in the operator's fingerprint blocklist: the \
+                 fingerprint is an attribute of the TLS stack (a library and its settings), not \
+                 the program's identity — every program on the same stack shares it; \
+                 recorded, never acted on by the fingerprint alone",
+                hit.label(),
+                nn_model::log_escape::Escaped(value)
+            ),
+            h.pid,
+            h.comm.clone(),
+            h.timestamp_ns,
         ))
     }
 }
@@ -2461,6 +2475,10 @@ impl Rule for NnLNet021SensorRecordFlood {
             nn_model::FloodSource::IoUringCreate => {
                 ("io_uring_setup() calls", "io_uring ring-creation records")
             }
+            // Lot 275
+            nn_model::FloodSource::Accept => ("accepted connections", "inbound connection records"),
+            nn_model::FloodSource::DnsAnswer => ("DNS responses", "DNS response records"),
+            nn_model::FloodSource::TlsHello => ("TLS ClientHellos", "ClientHello records"),
         };
         Some(net_verdict(
             self,
@@ -2687,7 +2705,8 @@ impl<H: DecisionHost> Rule for NnLNet014DnsTunnelEntropy<H> {
 
 /// External audit NET-019: whether a flow meets the predicate of a
 /// NetFlow rule that kills — NN-L-NET-001 (blocklisted destination),
-/// -002 (blocked TLD), -003 (any TLS fingerprint), -008 (image in a
+/// -002 (blocked TLD), a TLS fingerprint (NN-L-NET-003's predicate before
+/// lot 275's R6 made it Medium and Log; kept, a superset), -008 (image in a
 /// staging directory, a lookup at a configured resolver included), -010
 /// (high-risk C2 port), -018 (internal host on a lateral-movement port) —
 /// allowlists and carve-outs aside, so a superset. The netflow drain never holds such a row back from the
@@ -2731,6 +2750,8 @@ pub fn may_meet_a_kill_rule(
 pub struct NetRuleConfig {
     pub resolvers: Arc<crate::net::resolvers::HostResolvers>,
     pub fanout: Arc<super::net_fanout::FanoutConfig>,
+    /// Lot 275: NN-L-NET-028's signed allowlist (`nodns-allow.local`).
+    pub nodns_allow: Arc<super::net_nodns::NoDnsAllowlist>,
 }
 
 impl Default for NetRuleConfig {
@@ -2740,6 +2761,7 @@ impl Default for NetRuleConfig {
         Self {
             resolvers: crate::net::resolvers::HostResolvers::none(),
             fanout: Arc::new(super::net_fanout::FanoutConfig::default()),
+            nodns_allow: Arc::new(super::net_nodns::NoDnsAllowlist::empty()),
         }
     }
 }
@@ -2828,6 +2850,12 @@ pub fn net_rules<H: DecisionHost>(
     // tier, before the record-only rules; they read connect attempts and
     // UDP rows, which no rule above answers but for a kill.
     rules.extend(fanout);
+    // Lot 275: "no DNS, no connect" — its kill held behind the per-rule
+    // policy; judged on the connect-time and UDP rows the pumps annotate.
+    rules.push(Box::new(super::net_nodns::NnLNet028ConnectWithoutDns::new(
+        Arc::clone(&config.resolvers),
+        Arc::clone(&config.nodns_allow),
+    )));
     rules.extend::<Vec<Box<dyn Rule>>>(vec![
         Box::new(NnLNet011PlaintextCredService::new(Arc::clone(
             &comm_allowlist,
@@ -2945,6 +2973,7 @@ mod tests {
             close_reason: 0,
             phase: Default::default(),
             observed_ns: 0,
+            dns_resolution: Default::default(),
         })
     }
 
@@ -3051,41 +3080,115 @@ mod tests {
 
     // ── NN-L-NET-003 ─────────────────────────────────────────────
 
+    /// Lot 275: a ClientHello the TLS sensor fingerprinted with `ja3`.
+    fn hello(ja3: Option<&str>, comm: &str) -> Event {
+        Event::TlsClientHello(nn_model::telemetry::TlsHelloEvent {
+            timestamp_ns: 7,
+            pid: 4242,
+            uid: 1000,
+            comm: comm.into(),
+            exe: None,
+            family: 2,
+            dst_addr: v4(8, 8, 8, 8),
+            dst_port: 443,
+            flow_start_ns: 5,
+            outcome: if ja3.is_some() {
+                nn_model::telemetry::TlsHelloOutcome::Complete
+            } else {
+                nn_model::telemetry::TlsHelloOutcome::Incomplete
+            },
+            fingerprint: ja3.map(|j| TlsFingerprint {
+                ja3: j.to_string(),
+                ja3_raw: String::new(),
+                ja4: "t13d1516h2_8daaf6152771_02713d6af862".to_string(),
+                sni: None,
+                alpn: vec![],
+            }),
+            send_len: 512,
+            truncated: false,
+        })
+    }
+
+    /// Lot 275, R6: judged on the ClientHello, Medium, `Log` and nothing
+    /// held (a fingerprint is an attribute, not an identity: no response,
+    /// whatever the policy says — it refuses `enforce` for this rule).
     #[test]
     fn net_003_fires_on_ja3_blocklist_match() {
         let hash = "deadbeefcafe00112233445566778899";
         let bl = Arc::new(Ja3Blocklist::from_entries([hash]));
         let rule = NnLNet003BadJa3::new(bl);
+        crate::decision::response_policy::take_held();
+        let v = rule
+            .evaluate(&hello(Some(hash), "evilbin"))
+            .expect("JA3 hit");
+        assert_eq!(v.severity, Severity::Medium);
+        assert_eq!(v.category, CATEGORY_MEDIUM);
+        assert_eq!(v.action, ResponseAction::Log);
+        assert!(
+            crate::decision::response_policy::take_held().is_none(),
+            "no response held back: there is none to give"
+        );
+        assert_eq!((v.event_pid, v.timestamp_ns), (4242, 7));
+        assert!(
+            v.reasoning.contains(&format!("JA3 {hash}")),
+            "{}",
+            v.reasoning
+        );
+        assert!(
+            v.reasoning.contains("an attribute of the TLS stack")
+                && v.reasoning.contains("not the program's identity")
+                && v.reasoning.contains("never acted on"),
+            "{}",
+            v.reasoning
+        );
+        // the flow's rows carry the fingerprint for the netflow log: not
+        // judged again
         let mut e = flow(v4(8, 8, 8, 8), 443, "evilbin");
         if let Event::NetFlow(nf) = &mut e {
-            nf.tls_fingerprint = Some(TlsFingerprint {
-                ja3: hash.to_string(),
-                ja3_raw: "771,...".to_string(),
-                ja4: "t13d_xx".to_string(),
-                sni: None,
-                alpn: vec![],
-            });
+            nf.tls_fingerprint = match hello(Some(hash), "evilbin") {
+                Event::TlsClientHello(h) => h.fingerprint,
+                _ => unreachable!(),
+            };
         }
-        let v = rule.evaluate(&e).expect("JA3 hit");
-        assert_eq!(v.severity, Severity::Critical);
-        assert_eq!(v.category, CATEGORY_CRITICAL);
+        assert!(rule.evaluate(&e).is_none());
+    }
+
+    /// R6: a JA4 entry matches the hello's JA4 (the client may permute its
+    /// extensions: its JA3 then varies), the record names which one.
+    #[test]
+    fn net_003_matches_a_ja4_entry() {
+        let ja4 = "t13d1516h2_8daaf6152771_02713d6af862";
+        let rule = NnLNet003BadJa3::new(Arc::new(Ja3Blocklist::from_entries([ja4])));
+        let v = rule
+            .evaluate(&hello(Some(&"cc".repeat(16)), "chrome"))
+            .expect("JA4 hit");
+        assert_eq!(
+            (v.severity, v.action.clone()),
+            (Severity::Medium, ResponseAction::Log)
+        );
+        assert!(
+            v.reasoning.contains(&format!("JA4 {ja4}")),
+            "{}",
+            v.reasoning
+        );
+        // another JA4, the same JA3 absent: no match
+        let other = NnLNet003BadJa3::new(Arc::new(Ja3Blocklist::from_entries([
+            "t13d1516h2_8daaf6152771_000000000000",
+        ])));
+        assert!(other
+            .evaluate(&hello(Some(&"cc".repeat(16)), "chrome"))
+            .is_none());
     }
 
     #[test]
     fn net_003_does_not_fire_on_unknown_ja3() {
         let bl = Arc::new(Ja3Blocklist::from_entries(["aa".repeat(16)]));
         let rule = NnLNet003BadJa3::new(bl);
-        let mut e = flow(v4(8, 8, 8, 8), 443, "curl");
-        if let Event::NetFlow(nf) = &mut e {
-            nf.tls_fingerprint = Some(TlsFingerprint {
-                ja3: "bb".repeat(16),
-                ja3_raw: "".to_string(),
-                ja4: "".to_string(),
-                sni: None,
-                alpn: vec![],
-            });
-        }
-        assert!(rule.evaluate(&e).is_none());
+        assert!(rule
+            .evaluate(&hello(Some(&"bb".repeat(16)), "curl"))
+            .is_none());
+        // an incomplete hello has no fingerprint
+        assert!(rule.evaluate(&hello(None, "curl")).is_none());
     }
 
     // ── NN-L-NET-004 ─────────────────────────────────────────────
@@ -4217,13 +4320,13 @@ mod tests {
     /// external audit EBPF-013 adds NN-L-NET-021).
     /// Future rule additions must update this assertion.
     #[test]
-    fn net_rules_builder_returns_19_rules() {
+    fn net_rules_builder_returns_20_rules() {
         let rules = net_rules_empty();
         assert_eq!(
             rules.len(),
-            19,
+            20,
             "N6 9 + D4 5 + T4.1 DNS-tunnel-entropy 1 + DNS flood 1 + sensor flood 1 \
-             + lab PR 224 fan-out 2 = 19 net rules"
+             + lab PR 224 fan-out 2 + lot 275 no-DNS 1 = 20 net rules"
         );
     }
 
@@ -4239,20 +4342,13 @@ mod tests {
             .filter(|r| r.category() == CATEGORY_CRITICAL)
             .map(|r| r.id())
             .collect();
-        // Per design §7, NN-L-NET-001 + NN-L-NET-003 are the
-        // two Critical rules.
+        // Per design §7, NN-L-NET-001 is the Critical rule; NN-L-NET-003
+        // was the other one until lot 275's R6 (a fingerprint is not an
+        // identity: Medium).
         assert_eq!(
-            critical_ids.len(),
-            2,
-            "exactly 2 Critical rules: {critical_ids:?}"
-        );
-        assert!(
-            critical_ids.contains(&"NN-L-NET-001_OutboundToBlockedIp"),
-            "001 must be Critical"
-        );
-        assert!(
-            critical_ids.contains(&"NN-L-NET-003_BadJa3"),
-            "003 must be Critical"
+            critical_ids,
+            vec!["NN-L-NET-001_OutboundToBlockedIp"],
+            "exactly 1 Critical rule"
         );
     }
 
@@ -4272,7 +4368,8 @@ mod tests {
         let rules = net_rules_empty();
         // Construct a synthetic event per rule + verify any
         // Critical verdict carries CATEGORY_CRITICAL.
-        // We exercise the two known Criticals here:
+        // We exercise the known Critical here, and NN-L-NET-003, Critical
+        // until lot 275's R6:
         let bl = Arc::new(NetBlocklist::from_entries([
             crate::net::blocklist::NetBlocklistEntry::Ip(v4(1, 2, 3, 4)),
         ]));
@@ -4286,19 +4383,11 @@ mod tests {
         assert_eq!(v1.severity, Severity::Critical);
         assert_eq!(v1.category, CATEGORY_CRITICAL);
 
-        let mut e = flow(v4(8, 8, 8, 8), 443, "x");
-        if let Event::NetFlow(nf) = &mut e {
-            nf.tls_fingerprint = Some(TlsFingerprint {
-                ja3: "aa".repeat(16),
-                ja3_raw: "".to_string(),
-                ja4: "".to_string(),
-                sni: None,
-                alpn: vec![],
-            });
-        }
-        let v3 = net_003.evaluate(&e).expect("003 fires");
-        assert_eq!(v3.severity, Severity::Critical);
-        assert_eq!(v3.category, CATEGORY_CRITICAL);
+        let v3 = net_003
+            .evaluate(&hello(Some(&"aa".repeat(16)), "x"))
+            .expect("003 fires");
+        assert_eq!(v3.severity, Severity::Medium, "R6: not Critical");
+        assert_eq!(v3.category, CATEGORY_MEDIUM);
 
         let _ = rules; // keep the imports honest
     }
@@ -4333,6 +4422,7 @@ mod tests {
             close_reason: 0,
             phase: Default::default(),
             observed_ns: 0,
+            dns_resolution: Default::default(),
         })
     }
 

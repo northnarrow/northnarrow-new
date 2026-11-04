@@ -551,3 +551,58 @@ fn lines_are_ascii_with_escapes() {
     assert_eq!(l, b"{\"a\":\"\\u00e9\\ud83d\\ude00\\n\"}".to_vec());
     assert_eq!(serde_json::from_slice::<Value>(&l).unwrap(), v);
 }
+
+/// Lot 275's inbound connections in the netflow chain (`"inbound": true`:
+/// the peer that connected as `src_*`, the local listener as `dst_*`, the
+/// byte counters the local socket's): direction Inbound, OCSF's `bytes_out`
+/// (source to destination) the bytes the host received; an outbound row
+/// (no such field) as before.
+#[test]
+fn an_inbound_flow_is_inbound_with_its_traffic_from_the_peer() {
+    let body = |extra: &str| {
+        sealed(&format!(
+            r#"{{"ts":"2026-06-08T12:00:05.000000Z","flow_id":"f-9","start_ns":1000000,"end_ns":51000000,"family":2,"src_addr":"198.51.100.9","src_port":51000,"dst_addr":"10.0.0.2","dst_port":22,"proto":6,"pid":700,"uid":0,"comm":"sshd","exe":"/usr/sbin/sshd","bytes_sent":4000,"bytes_recv":300,"resolved_hostname":null,"ja3":null,"ja4":null,"sni":null,"close_reason":0,"agent_id":"0123456789abcdef0123456789abcdef"{extra}}}"#
+        ))
+    };
+    let map = |raw: &str| {
+        let row = Row {
+            chain: ExportChain::Netflow,
+            file: 1,
+            line: 1,
+            end: 100,
+            raw: raw.as_bytes(),
+            rotate: None,
+            verified: true,
+            prev_hash: Some("0".repeat(64)),
+            entry_hash: Some("1".repeat(64)),
+        };
+        let recs = Mapper::new().map(&ctx(), &row);
+        assert_eq!(recs.len(), 1);
+        let errs = check_record(&recs[0]);
+        assert!(errs.is_empty(), "{}", errs.join("\n"));
+        recs[0].clone()
+    };
+    let inbound = map(&body(r#","inbound":true"#));
+    assert_eq!(inbound["class_uid"], 4001);
+    assert_eq!(inbound["connection_info"]["direction_id"], 1);
+    assert_eq!(inbound["connection_info"]["direction"], "Inbound");
+    assert_eq!(inbound["src_endpoint"]["ip"], "198.51.100.9");
+    assert_eq!(inbound["dst_endpoint"]["port"], 22);
+    assert_eq!(
+        inbound["traffic"],
+        json!({"bytes_in": 4000, "bytes_out": 300, "bytes": 4300})
+    );
+    assert_eq!(inbound["unmapped"]["northnarrow"]["inbound"], true);
+    assert_eq!(inbound["actor"]["process"]["name"], "sshd");
+    for outbound in [map(&body("")), map(&body(r#","inbound":false"#))] {
+        assert_eq!(outbound["connection_info"]["direction_id"], 0);
+        assert_eq!(outbound["connection_info"]["direction"], "Unknown");
+        assert_eq!(
+            outbound["traffic"],
+            json!({"bytes_in": 300, "bytes_out": 4000, "bytes": 4300})
+        );
+    }
+    assert!(map(&body(""))["unmapped"]["northnarrow"]
+        .get("inbound")
+        .is_none());
+}

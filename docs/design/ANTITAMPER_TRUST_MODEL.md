@@ -1412,7 +1412,7 @@ family — makes a child that is not known (`before_epoch`, the leader's
 monotonic start against the monotonic instant). Written after the
 attach, it leaves nothing unseen: a process forked before it started
 before it. The exempt services are then refused until they are restarted
-(`UPGRADE_NOTES_WAVE4.md` §7).
+(`UPGRADE_NOTES_WAVE4.md` §8).
 A kernel that refuses the tracker removes its pins; a host without bpffs
 attaches the programs for the agent's life and warns.
 

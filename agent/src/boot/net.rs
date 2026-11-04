@@ -25,6 +25,8 @@ pub(crate) fn start(
     audit_log: &AuditHandle,
     flow_tracker: Arc<parking_lot::Mutex<FlowTracker>>,
     dns_cache: Arc<DnsCache>,
+    resolved: Arc<northnarrow_agent::net::resolved::ResolvedTable>,
+    tls_ingest: Arc<northnarrow_agent::net::dns_ingest::DnsIngest>,
     lineage: &AuthSessionTracker,
     sensor: &mut SensorMultiplexer,
     net_bufs: northnarrow_agent::sensors::multiplexer::NetRingBufs,
@@ -134,6 +136,36 @@ pub(crate) fn start(
                 None
             }
         };
+        // Lot 275 (C07): the inbound connections' drain, on a thread of its
+        // own (a source of the bus), its closed rows in the same netflow log.
+        {
+            let inbound_rb = net_bufs.inbound_rb;
+            let netflow_db = netflow_db_opt.clone();
+            let lineage_for_inbound = lineage.clone();
+            let event_tx = sensor.event_tx_for("net_inbound");
+            let audit_for_inbound = audit_log.clone();
+            let spawned = northnarrow_agent::sensors::pump::spawn_drain_thread(
+                "net_inbound",
+                move || async move {
+                    let outcome = northnarrow_agent::net::inbound::inbound_loop(
+                        inbound_rb,
+                        netflow_db,
+                        lineage_for_inbound,
+                        event_tx,
+                    )
+                    .await;
+                    drain_ended("inbound", outcome, audit_for_inbound.as_ref());
+                },
+            );
+            match spawned {
+                Ok(t) => sensor.register_pump_thread("net_inbound", t),
+                Err(e) => warn!(
+                    error = %e,
+                    "net: the inbound drain's thread could not start — accepted connections will \
+                     be dropped"
+                ),
+            }
+        }
         {
             let netflow_db = netflow_db_opt;
             let listener_db = listener_db_opt;
@@ -168,6 +200,8 @@ pub(crate) fn start(
                         udp_rb,
                         flow_tracker_for_drain,
                         dns_cache_for_drain,
+                        resolved,
+                        tls_ingest,
                         netflow_db,
                         listener_db,
                         lineage_for_net,

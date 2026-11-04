@@ -55,22 +55,33 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "NN-L-NET-003_BadJa3",
-        severities: &[Severity::Critical],
-        actions: &[ResponseAction::KillProcessTree],
+        severities: &[Severity::Medium],
+        actions: &[ResponseAction::Log],
         sensors: &[Sensor::Network],
         data_components: &["DC0085"],
-        observes: "An outbound flow whose TLS ClientHello fingerprint (JA3) is in the operator's \
-                   JA3 blocklist (`netflow-ja3-blocklist.{v1,local}`).",
-        false_positives: "A JA3 hash names a TLS library and its settings, not a program: an \
-                          entry shared by a common client (a language runtime's default TLS \
-                          stack) kills every program built on it.",
-        how_to_test: "Cannot be exercised on a guest: no sensor fills a flow's TLS fingerprint \
-                      until BUG-025 (`FlowTracker::attach_tls` has no caller), so the rule \
-                      cannot fire. The unit test gives the flow a fingerprint directly.",
-        tests: &["crates/nn-core/src/decision/rules/net.rs::net_003_fires_on_ja3_blocklist_match"],
+        observes: "An outbound TLS ClientHello whose JA3 or JA4 fingerprint is in the operator's \
+                   fingerprint blocklist (`netflow-ja3-blocklist.{v1,local}`, JA3 and JA4 \
+                   entries), judged as it is sent (the `tls_hello` sensor, lot 275). Recorded, \
+                   never acted on: the signed per-rule policy refuses `enforce` for it.",
+        false_positives: "A fingerprint names a TLS library and its settings, not a program: \
+                          every program on the same stack shares it (a language runtime's \
+                          default client, a common HTTP library), and the fingerprint alone \
+                          finds 6.82 % of malware against 88.68 % with the destination \
+                          (Anderson & McGrew). Hence Medium and no response (R6 of the \
+                          external review of 04/11). A client that permutes its extensions \
+                          (Chrome from 108) has a JA3 that varies: list its JA4.",
+        how_to_test: "`net-check.sh --only MS31`: a `curl https://example.com/` and its \
+                      ClientHello's JA3, JA4 and SNI on the flow's closed row — the fingerprint \
+                      the rule judges; the record of a listed fingerprint is the unit tests' \
+                      (not run in lot 275's lab).",
+        tests: &[
+            "crates/nn-core/src/decision/rules/net.rs::net_003_fires_on_ja3_blocklist_match",
+            "crates/nn-core/src/decision/rules/net.rs::net_003_matches_a_ja4_entry",
+            "crates/nn-core/src/decision/rule_policy.rs::a_signed_enforce_of_a_fingerprint_rule_is_applied_as_alert_at_the_start",
+            "deploy/lab/malsim/net-check.sh::MS31",
+        ],
         attack_note: "TLS C2 is T1573.002 (ATT&CK classes SSL/TLS as asymmetric cryptography). \
-                      Inactive until BUG-025: out of the V2 Critical sub-gate, still in its \
-                      denominator.",
+                      Medium from lot 275: not in the V2 Critical sub-gate, in its denominator.",
     },
     RuleDoc {
         id: "NN-L-NET-004_SuspiciousDnsQname",
@@ -464,5 +475,50 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "deploy/lab/malsim/net-check.sh::MS21",
         ],
         attack_note: "Outbound only: the connects are counted, not the credentials tried.",
+    },
+    // ── "no DNS, no connect" (lot 275) ─────────────────────────────────
+    RuleDoc {
+        id: "NN-L-NET-028_ConnectWithoutDns",
+        severities: &[Severity::Medium, Severity::Low],
+        // its kill held (`NODNS_KILL`) and its `enforce` refused: `Log`
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::Network],
+        data_components: &["DC0082"],
+        observes: "A TCP connect or a UDP send to a public address the DNS evidence does not \
+                   bind to the process or an ancestor: no DNS response it received (from port \
+                   53, the question's chain only) named the address, nor a system resolver's \
+                   response (its executable and a system uid) for a name it asked (Medium; \
+                   Low when only a system resolver's response for another lineage named it). \
+                   Judged by the connect pump and the net drain from the DNS response \
+                   sensor's table, once per process and destination per 10 minutes. Its kill \
+                   (`KillProcess`) is held behind the per-rule response policy, which refuses \
+                   `enforce` for it (review of #495).",
+        false_positives: "Clients that resolve outside the system resolver — DNS over HTTPS \
+                          in a browser, a resolver of their own, an address from a \
+                          configuration file or handed over by another process; peers \
+                          configured by address (NTP servers, database replicas, package \
+                          mirrors by IP); a container whose own resolvers are public ones (a \
+                          Docker default bridge falling back to 8.8.8.8). Not judged: LAN and \
+                          the other non-public ranges, the configured resolvers, the signed \
+                          `nodns-allow.local`, and the unknown — a process older than the DNS \
+                          response sensor, a response cut or never seen, DNS records lost or \
+                          held back (host-wide for 5 minutes), the DNS pumps not caught up. A \
+                          rule blinded so is signed (`nodns_coverage_lost`, its cause and who \
+                          caused it) and counted in every beat (`nodns`).",
+        how_to_test: "On a lab guest, `curl -m 3 http://203.0.113.5/` (a documentation \
+                      address, a literal-IP connect) draws it; `curl -m 3 http://example.com/` \
+                      (resolved) does not (`net-check.sh --only MS28`).",
+        tests: &[
+            "crates/nn-core/src/decision/rules/net_nodns.rs::\
+             a_connect_to_an_unresolved_public_address_is_recorded_its_kill_held",
+            "crates/nn-core/src/decision/rules/net_nodns.rs::lan_resolvers_and_the_allowlist_are_exempt",
+            "crates/nn-core/src/net/resolved.rs::a_process_that_received_the_response_resolved_the_address",
+            "deploy/lab/malsim/net-check.sh::MS28",
+        ],
+        attack_note: "ATT&CK has no technique for a connect without a name lookup; the rule's \
+                      catch is the command and control (T1071) or the second stage (T1105) an \
+                      address written in the implant reaches. A C2 behind a domain is not \
+                      caught: it is pushed into the DNS records, where the DNS rules and the \
+                      operator's blocklists see it.",
     },
 ];

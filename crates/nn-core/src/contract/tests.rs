@@ -251,7 +251,8 @@ fn every_kind_is_listed_once_with_its_class() {
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), n);
-    assert_eq!(n, 19);
+    // lot 275: NetInbound, DnsAnswer, TlsClientHello
+    assert_eq!(n, 22);
     for k in EventKind::ALL {
         assert_eq!(k.class().is_none(), DERIVED_KINDS.contains(k), "{k:?}");
     }

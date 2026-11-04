@@ -59,6 +59,34 @@ pub fn is_internal(addr: IpAddr) -> bool {
     }
 }
 
+/// Lot 275 (NN-L-NET-028): `true` when `addr` is a destination outside the
+/// host and its local networks — not loopback, unspecified, multicast or
+/// broadcast, not [`is_internal`] (RFC 1918, unique-local, IPv6
+/// link-local), not IPv4 link-local (`169.254/16`), CGNAT (`100.64/10`),
+/// `0/8`, the reserved `240/4`, the benchmark `198.18/15`, nor IPv6
+/// site-local (`fec0::/10`). The documentation ranges (`192.0.2/24`,
+/// `198.51.100/24`, `203.0.113/24`, `2001:db8::/32`) count as public: no LAN
+/// uses them, and the rule's benign lab test connects to one. An
+/// IPv4-mapped address is judged as the IPv4 address it maps.
+pub fn is_public(addr: IpAddr) -> bool {
+    let addr = canonical(addr);
+    if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() || is_internal(addr) {
+        return false;
+    }
+    match addr {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_broadcast()
+                || o[0] == 0
+                || (o[0] == 169 && o[1] == 254)
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || o[0] >= 240
+                || (o[0] == 198 && (o[1] & 0xfe) == 18))
+        }
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfec0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +112,61 @@ mod tests {
         assert_eq!(canonical(lo), lo);
         let v6: IpAddr = "2001:db8::1".parse().unwrap();
         assert_eq!(canonical(v6), v6);
+    }
+
+    /// Lot 275: the destinations NN-L-NET-028 judges.
+    #[test]
+    fn public_is_outside_the_host_and_its_networks() {
+        let p = |s: &str| s.parse::<IpAddr>().unwrap();
+        for a in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "203.0.113.5",
+            "198.51.100.1",
+            "192.0.2.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "169.253.1.1",
+            "198.17.0.1",
+            "198.20.0.1",
+            "223.255.255.254",
+            "::ffff:8.8.8.8",
+            "2001:db8::1",
+            "2606:4700::1111",
+            "fbff::1",
+            "fe7f::1",
+        ] {
+            assert!(is_public(p(a)), "{a} is public");
+        }
+        for a in [
+            "127.0.0.1",
+            "127.0.0.53",
+            "0.0.0.0",
+            "0.1.2.3",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "169.254.169.254",
+            "198.18.0.1",
+            "198.19.255.255",
+            "224.0.0.251",
+            "239.255.255.250",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:10.0.0.5",
+            "::ffff:127.0.0.1",
+            "fd00::1",
+            "fe80::1",
+            "fec0::1",
+            "feff::1",
+            "ff02::1",
+        ] {
+            assert!(!is_public(p(a)), "{a} is not public");
+        }
     }
 
     #[test]

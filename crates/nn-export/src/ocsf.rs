@@ -688,9 +688,18 @@ fn fim(ctx: &Context, row: &Row<'_>, v: &Value) -> Value {
 fn flow(ctx: &Context, row: &Row<'_>, v: &Value) -> Value {
     let time = text(v, "ts").and_then(|t| time_ms(&t));
     let proto = uint(v, "proto").unwrap_or(0);
+    // lot 275: an inbound connection's row (`"inbound": true`) has the peer
+    // that connected as `src_*`, the local listener as `dst_*`; the byte
+    // counters stay the local socket's
+    let inbound = v.get("inbound").and_then(Value::as_bool) == Some(true);
     let mut ci = Map::new();
-    ci.insert("direction_id".into(), json!(0));
-    ci.insert("direction".into(), json!("Unknown"));
+    if inbound {
+        ci.insert("direction_id".into(), json!(1));
+        ci.insert("direction".into(), json!("Inbound"));
+    } else {
+        ci.insert("direction_id".into(), json!(0));
+        ci.insert("direction".into(), json!("Unknown"));
+    }
     ci.insert("protocol_num".into(), json!(proto));
     if let Some(n) = match proto {
         6 => Some("tcp"),
@@ -718,6 +727,10 @@ fn flow(ctx: &Context, row: &Row<'_>, v: &Value) -> Value {
     }
     let sent = uint(v, "bytes_sent").unwrap_or(0);
     let recv = uint(v, "bytes_recv").unwrap_or(0);
+    // OCSF's `bytes_out` is the source's to the destination, `bytes_in` the
+    // destination's to the source: the local socket's sent bytes are `out`
+    // when the host connected, `in` when the peer did
+    let (bytes_out, bytes_in) = if inbound { (recv, sent) } else { (sent, recv) };
     let mut extra = Map::new();
     if let Some(e) = endpoint(
         &text(v, "src_addr").unwrap_or_default(),
@@ -737,7 +750,7 @@ fn flow(ctx: &Context, row: &Row<'_>, v: &Value) -> Value {
     extra.insert("connection_info".into(), Value::Object(ci));
     extra.insert(
         "traffic".into(),
-        json!({"bytes_in": recv, "bytes_out": sent, "bytes": sent.saturating_add(recv)}),
+        json!({"bytes_in": bytes_in, "bytes_out": bytes_out, "bytes": sent.saturating_add(recv)}),
     );
     extra.insert(
         "actor".into(),
@@ -760,7 +773,7 @@ fn flow(ctx: &Context, row: &Row<'_>, v: &Value) -> Value {
     }
     let mut nn = Map::new();
     nn.insert("row".into(), row_ref(row));
-    for k in ["flow_id", "ja3", "ja4", "sni"] {
+    for k in ["flow_id", "ja3", "ja4", "sni", "inbound"] {
         if let Some(x) = v.get(k).filter(|x| !x.is_null()) {
             nn.insert(k.into(), x.clone());
         }

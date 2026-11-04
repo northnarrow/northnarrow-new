@@ -30,7 +30,7 @@ The mapping, row by row:
 | action `interrupted` | its intent's class | status Error: the agent stopped between the intent and its outcome |
 | action `overflow`, `stalled`, `run_started`, `run_ended` | 0 Base Event / Other | the row as `raw_data` |
 | FIM drift | 1001 / by its op: Modified Update, Created/Linked Create, Deleted Delete, Renamed Rename, Opened Open, CapabilitySet Set Security, AttrChanged Set Attributes | the file (path, SHA-256 of its new content), the modifier as `actor.process` |
-| netflow | 4001 / Traffic | `src_endpoint`, `dst_endpoint` (its resolved name), `connection_info` (protocol, IP version), `traffic` (bytes in, out), `duration`, status by its close; JA3, JA4, SNI in `unmapped.northnarrow` |
+| netflow | 4001 / Traffic | `src_endpoint`, `dst_endpoint` (its resolved name), `connection_info` (protocol, IP version; direction Inbound for an inbound connection's row, lot 275's `"inbound": true` — the peer that connected is the source, the local listener the destination —, Unknown otherwise), `traffic` (bytes in, out: OCSF's `bytes_out` from the source to the destination), `duration`, status by its close; JA3, JA4, SNI and `inbound` in `unmapped.northnarrow` |
 | a row that does not parse, or of a kind not known | 0 Base Event / Other | its bytes as `raw_data` (nothing a chain holds is dropped by the mapping) |
 
 Every record has `metadata` (`version` 1.9.0, `profiles` `["host"]`, the
@@ -66,7 +66,7 @@ carries every field of its row:
 | every record | `metadata` (the chain, the row's place), `device` (the **host's name**, the agent's id), the product's version | the host's name |
 | `detections` (default) | `id`, `ts`, `sensor`, `path`, `rule_id`, `rule_name`, `severity`, `verdict`, `confidence`, `mitre`, `principal` (**`pid`, `comm`, `uid`, `ppid`**), **`exe`** (the executable's path), `posture_at`, `response`, `detection_type`, `status`, `suppressed_before`, **`file`** (the path a file sensor saw), **`network`** (the destination of a network detection) | a user id, process names, executable and file paths, a destination address |
 | `actions` (default) | `row`, `run`, `action`, `ts`; an intent's `source`, `response`, **`pid`**, `start_ns`, **`file`**, `severity`, `why`, **`detail`** (the detection's kind and actor), `queued_us`; an outcome's `result`, `outcome`, `reason`, `elapsed_us`; an overflow's counts and its first **`samples`** (`KillProcessTree pid 4242 (rule)`); `noted_by` | process ids, file paths |
-| `netflow` (only named) | `ts`, `flow_id`, `start_ns`, `end_ns`, `family`, **`src_addr`, `src_port`, `dst_addr`, `dst_port`**, `proto`, **`pid`, `uid`, `comm`, `exe`**, `bytes_sent`, `bytes_recv`, **`resolved_hostname`**, `ja3`, `ja4`, **`sni`**, `close_reason`, `agent_id`, `decision_engine_skipped` | **who connected where**: per user id, the addresses and the names of what they reached — a browsing history |
+| `netflow` (only named) | `ts`, `flow_id`, `start_ns`, `end_ns`, `family`, **`src_addr`, `src_port`, `dst_addr`, `dst_port`**, `proto`, **`pid`, `uid`, `comm`, `exe`**, `bytes_sent`, `bytes_recv`, **`resolved_hostname`**, `ja3`, `ja4`, **`sni`**, `close_reason`, `agent_id`, `decision_engine_skipped`, `inbound` (lot 275: a connection the host accepted) | **who connected where**: per user id, the addresses and the names of what they reached — a browsing history; and the addresses that connected to the host's services |
 | `fim_drift` (only named) | `ts`, **`path`**, `op`, `baseline_sha256`, `new_sha256`, **`modifier_pid`, `modifier_uid`, `modifier_comm`**, `severity`, `decision_engine_skipped`, `skip_reason`, `agent_id`, `attrs` (mode, owner and group before and after) | file paths (a home directory's among them), who changed them |
 | `canary_access` (only named) | `ts`, `canary_id`, `canary_name`, `canary_type`, `access_kind`, **`accessor_pid`, `accessor_uid`, `accessor_comm`, `accessor_exe`**, `first_trip`, `agent_id`, `seq` | who read a decoy (the operator's name for it in `canary_name`, which may be its path, a home directory's among them) |
 
@@ -340,9 +340,11 @@ fuzz/Cargo.lock): the lot's note lists them.
   kernel pins the worker's connects (a per-role address pin in the BPF LSM
   `socket_connect` hook would, on every kernel).
 - The worker's own flows to its receiver are judged by the agent's network
-  rules like any process's (NN-L-NET-007 alerts on an internal receiver):
-  exempting the export worker's pid to its configured receiver is a
-  follow-up.
+  rules like any process's (NN-L-NET-007 alerts on an internal receiver;
+  NN-L-NET-028, lot 275, on a receiver at a public address, which the
+  worker connects to by address, never by a name: list that address in the
+  signed `nodns-allow.local`, `NETWORK_TELEMETRY.md`): exempting the export
+  worker's pid to its configured receiver is a follow-up.
 - Not exported: the audit log, the status events, the heartbeat (which has
   its own verifier, `HEARTBEAT.md`), the netflow listeners, the FIM
   baseline.

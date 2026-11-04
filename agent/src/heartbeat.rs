@@ -68,8 +68,31 @@ pub struct Sources {
     pub journal: crate::response::journal::ActionJournal,
     pub audit: Option<Arc<Mutex<AuditLog>>>,
     pub probe_on: bool,
+    /// Lot 275 (the second review of #495, R2): NN-L-NET-028's table — its
+    /// judgements in each beat.
+    pub nodns: Option<Arc<crate::net::resolved::ResolvedTable>>,
     /// Lot 276: the export (`None`: none configured).
     pub export: Option<crate::export::ExportHandle>,
+}
+
+/// What a beat carries of NN-L-NET-028's judgements.
+fn nodns_of(t: &crate::net::resolved::ResolvedTable) -> nn_evidence::heartbeat::BeatNoDns {
+    let j = t.judgements();
+    nn_evidence::heartbeat::BeatNoDns {
+        lineage: j.lineage,
+        other_lineage: j.other_lineage,
+        unresolved: j.unresolved,
+        unknown: nn_evidence::heartbeat::BeatNoDnsUnknown {
+            degraded: j.unknown_degraded,
+            held: j.unknown_held,
+            unseen: j.unknown_unseen,
+            start: j.unknown_start,
+            barrier: j.unknown_barrier,
+            sensor: j.unknown_sensor,
+            older: j.unknown_older,
+        },
+        coverage_lost: j.coverage_records,
+    }
 }
 
 /// The loss of stages 1 to 8 now (`None`: a stage not counted here).
@@ -310,6 +333,7 @@ impl Heartbeat {
             heads,
             stop_reason: stop_reason.map(str::to_string),
             capabilities: s.manifest.as_ref().and_then(|m| m.beat()),
+            nodns: s.nodns.as_deref().map(nodns_of),
             export: s.export.as_ref().map(|e| e.beat()),
         };
         let written = match &mut w.log {
@@ -475,8 +499,62 @@ mod tests {
             journal: crate::response::journal::ActionJournal::memory(),
             audit: None,
             probe_on: false,
+            nodns: None,
             export: None,
         }
+    }
+
+    /// Lot 275 (the second review of #495, R2): each beat carries
+    /// NN-L-NET-028's judgements by outcome and unknown reason; a beat of an
+    /// agent without the table carries none (its line unchanged).
+    #[test]
+    fn a_beat_carries_the_nodns_judgements() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("heartbeat.jsonl");
+        let key = crate::keys::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
+        let table = Arc::new(crate::net::resolved::ResolvedTable::default());
+        table.count_unknown(crate::net::resolved::UnknownWhy::Barrier);
+        table.note_undecoded(5);
+        let c2: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let _ = table.check(9, 1, c2, 6, Vec::new);
+        let mut s = sources();
+        s.nodns = Some(Arc::clone(&table));
+        let hb = Heartbeat::open(
+            &path,
+            key,
+            Arc::new(crate::chainlog::NoProtection),
+            false,
+            s,
+        );
+        hb.beat(BeatKind::Beat, None);
+        let lines = export_lines(&path, 10).unwrap();
+        let last: HeartbeatRecord = serde_json::from_str::<
+            crate::chainlog::ChainLine<HeartbeatRecord>,
+        >(lines.last().unwrap())
+        .unwrap()
+        .payload;
+        let n = last.nodns.expect("the counters");
+        assert_eq!(
+            (n.unknown.barrier, n.unknown.degraded, n.coverage_lost),
+            (1, 1, 1)
+        );
+        assert!(lines.last().unwrap().contains("\"nodns\":{"));
+        // without the table: no field
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("heartbeat.jsonl");
+        let key = crate::keys::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
+        let _hb = Heartbeat::open(
+            &path,
+            key,
+            Arc::new(crate::chainlog::NoProtection),
+            false,
+            sources(),
+        );
+        assert!(!export_lines(&path, 10)
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("nodns"));
     }
 
     /// Lot 276: stage 8 is the export's loss — `None` without an export,

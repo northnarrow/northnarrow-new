@@ -108,6 +108,12 @@ event_kinds! {
     NetFlow => Some(EventClass::Network),
     /// A listening socket.
     NetListener => Some(EventClass::Network),
+    /// Lot 275: an inbound TCP connection's row (accepted, closed).
+    NetInbound => Some(EventClass::Network),
+    /// Lot 275: a DNS response a process received.
+    DnsAnswer => Some(EventClass::Network),
+    /// Lot 275: an outbound flow's TLS ClientHello.
+    TlsClientHello => Some(EventClass::Network),
     /// A canary token tripped (made by the canary detector, not a source).
     CanaryTripped => None,
 }
@@ -134,6 +140,9 @@ impl EventKind {
             Event::DnsFlood { .. } => EventKind::DnsFlood,
             Event::NetFlow(_) => EventKind::NetFlow,
             Event::NetListener(_) => EventKind::NetListener,
+            Event::NetInbound(_) => EventKind::NetInbound,
+            Event::DnsAnswer(_) => EventKind::DnsAnswer,
+            Event::TlsClientHello(_) => EventKind::TlsClientHello,
             Event::CanaryTripped { .. } => EventKind::CanaryTripped,
         }
     }

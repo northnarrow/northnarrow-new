@@ -269,6 +269,8 @@ async fn run(
         lineage,
         flow_tracker,
         dns_cache,
+        resolved,
+        tls_ingest,
         execq_mode,
         execpol_mode,
         exec_guards,
@@ -292,6 +294,8 @@ async fn run(
         export_loaded.on().is_some(),
     )
     .await?;
+    // the second review of #495 (R2): NN-L-NET-028's judgements in the beat
+    let resolved_for_beat = Arc::clone(&resolved);
     let attach::SelfTested {
         self_test,
         expected_denial,
@@ -492,6 +496,8 @@ async fn run(
         &audit_log,
         flow_tracker,
         dns_cache,
+        resolved,
+        tls_ingest,
         &lineage,
         &mut sensor,
         net_bufs,
@@ -629,6 +635,7 @@ async fn run(
             journal: journal.clone(),
             audit: audit_log.clone(),
             probe_on: telemetry_probe.is_some(),
+            nodns: Some(resolved_for_beat),
             export: export.clone(),
         },
     );

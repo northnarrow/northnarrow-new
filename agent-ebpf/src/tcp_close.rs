@@ -80,15 +80,23 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
         return Ok(());
     }
 
+    // Lot 275: an outbound socket whose first send never came is no longer
+    // a ClientHello candidate (the next socket at this address is not it).
+    crate::tls_hello::forget(sk_key);
     // Review 79: only a socket the connect kprobe recorded has a flow to
-    // close. Every passive socket (listeners, accepted peers) and every
-    // connect that predates the agent missed FLOW_SOCK_MAP, and userland
-    // dropped those records ("not recorded"): sending them only let an
-    // inbound connection flood fill this ring and push out the closes of
-    // outbound flows, the ones the flow rules judge.
+    // close on this ring. Every passive socket (listeners, accepted peers)
+    // and every connect that predates the agent missed FLOW_SOCK_MAP, and
+    // userland dropped those records ("not recorded"): sending them only let
+    // an inbound connection flood fill this ring and push out the closes of
+    // outbound flows, the ones the flow rules judge. Lot 275: an accepted
+    // socket the inbound sensor recorded has its close on its own ring
+    // (`crate::inbound`), never this one.
     let corr: [u8; 16] = match FLOW_SOCK_MAP.get(&sk_key) {
         Some(c) => *c,
-        None => return Ok(()),
+        None => {
+            crate::inbound::close(sk_ptr, family);
+            return Ok(());
+        }
     };
     // Forget the socket before anything can fail: an entry left behind by
     // a full ring would be found again by the next socket the slab puts at

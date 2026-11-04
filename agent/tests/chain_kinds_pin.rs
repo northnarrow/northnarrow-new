@@ -112,6 +112,7 @@ fn the_heartbeat_chain_s_line_is_pinned() {
         ],
         stop_reason: None,
         capabilities: None,
+        nodns: None,
         export: None,
     };
     assert_eq!(first_line(row), HEARTBEAT_LINE);
@@ -152,6 +153,7 @@ fn the_heartbeat_chain_s_line_with_capabilities_is_pinned() {
             contract_version: Some(1),
             kernel: Some("6.8.0-147-generic".into()),
         }),
+        nodns: None,
         export: None,
     };
     assert_eq!(first_line(row), HEARTBEAT_CAPABILITIES_LINE);
