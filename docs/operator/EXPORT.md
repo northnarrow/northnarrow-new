@@ -229,13 +229,24 @@ copied off it once.
 
 rustls with the RustCrypto provider (`rustls-rustcrypto`) — the founder's
 decision: TLS in Rust only (aws-lc-rs is C; ring has C and assembly),
-accepting a younger provider. Both pinned exactly (`=0.23.46`,
+accepting a younger provider, which its own README marks
+**"⚠️USE THIS AT YOUR OWN RISK! DO NOT USE THIS IN PRODUCTION⚠️"**
+(rustls-rustcrypto 0.0.2-alpha, the latest release on crates.io). What
+the export holds against that, below: TLS 1.3 only, X25519 only and our
+own group that refuses a shared secret of all zeros (the provider's does
+not: RFC 8446 §7.4.2), a key provider that loads no private key
+(`NoKeys`), the receiver's chain verified by rustls' own rustls-webpki
+0.103.16, the export off by default, the provider's advisories recorded
+with an expiry (2027-05-03). The provider is to be reviewed again in
+phase 4 of the plan. Both pinned exactly (`=0.23.46`,
 `=0.0.2-alpha` in `crates/nn-export/Cargo.toml`): they move only by a
 reviewed edit. rustls is built without its defaults (no aws-lc-rs, no TLS
 1.2, no logging), the provider without TLS 1.2.
 
 The worker narrows the provider (`nn_export::tls::provider`): TLS 1.3, its
-three suites, **X25519 only**, no client certificate and a key provider
+three suites, **X25519 only** (our group: a shared secret of all zeros,
+the peer's key of small order, ends the handshake), no client certificate
+and a key provider
 that loads no private key (`NoKeys`), the receiver's chain checked by
 rustls' own WebPKI verifier against the pinned CA bundle: rustls'
 `with_root_certificates` builds its `WebPkiServerVerifier`, on rustls'

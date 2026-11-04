@@ -40,6 +40,12 @@ libc = "0.2"
 # no aws-lc-rs, no TLS 1.2, no logging; the provider without TLS 1.2.
 rustls = { version = "=0.23.46", default-features = false, features = ["std"] }
 rustls-rustcrypto = { version = "=0.0.2-alpha", default-features = false, features = ["std", "zeroize"] }
+# X25519 of our own (`nn_export::tls`): the provider's does not refuse a
+# shared secret of all zeros (RFC 8446 §7.4.2, the review of #499, D7) —
+# the same crates the provider already uses, pinned to their locked
+# versions (no new package in the lockfiles).
+x25519-dalek = { version = "=2.0.1", default-features = false }
+rand_core = { version = "=0.6.4", default-features = false, features = ["getrandom"] }
 
 [features]
 # The OCSF validator against the pinned schema, for the agent's tests (its
