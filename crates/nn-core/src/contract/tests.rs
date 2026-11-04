@@ -857,6 +857,7 @@ fn manifest_of(f: &SourceFacts) -> CapabilityManifest {
         missing,
         content: Vec::new(),
         workers: Vec::new(),
+        export: None,
         telemetry_probe: "every 60 s".into(),
         settled: false,
         contract_hash: String::new(),

@@ -443,7 +443,8 @@ if (( PURGE )); then
     if [[ -f "$LEGACY_KEY" ]]; then
         log "PURGE: removing the admin private key $LEGACY_KEY (an install before external audit DEP-001)"
     fi
-    for d in "$ETC_DIR" "$STATE_DIR" "$UPGRADE_TXN_ROOT"; do
+    # lot 276: the export's JSONL files (copies of what the chains held)
+    for d in "$ETC_DIR" "$STATE_DIR" "$UPGRADE_TXN_ROOT" "${EXPORT_DIR:-/var/log/northnarrow/export}"; do
         [[ -e "$d" ]] && { log "PURGE: removing $d"; rm -rf "$d"; }
     done
     # Its admin.pub line went with $ETC_DIR: the key opens nothing here any

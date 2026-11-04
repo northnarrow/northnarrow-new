@@ -37,8 +37,10 @@ pub(crate) fn own_launch(
     })
 }
 
-/// Start the supervisor. `image`: what `main` opened at boot.
-pub(crate) fn start(cli: &Cli, image: std::io::Result<SelfImage>) -> Workers {
+/// Start the supervisor. `image`: what `main` opened at boot; `export_on`:
+/// the export's signed configuration turns it on (lot 276), its worker
+/// starts beside the parse worker.
+pub(crate) fn start(cli: &Cli, image: std::io::Result<SelfImage>, export_on: bool) -> Workers {
     let image = match image {
         Ok(i) => Some(i),
         Err(e) => {
@@ -60,7 +62,11 @@ pub(crate) fn start(cli: &Cli, image: std::io::Result<SelfImage>) -> Workers {
         report: Arc::new(|source: &str, detail: &str| {
             northnarrow_agent::boot::degradation::report(source, detail);
         }),
-        kinds: vec![WorkerKind::Parse],
+        kinds: if export_on {
+            vec![WorkerKind::Parse, WorkerKind::Export]
+        } else {
+            vec![WorkerKind::Parse]
+        },
         debug_dir: cli.admin_socket.parent().map(std::path::Path::to_path_buf),
     });
     if let Err(e) = workers.start() {

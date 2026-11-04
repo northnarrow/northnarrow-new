@@ -52,6 +52,7 @@ fn beat(seq: u64, s: i64) -> HeartbeatRecord {
         }],
         stop_reason: None,
         capabilities: None,
+        export: None,
     }
 }
 
@@ -395,6 +396,69 @@ fn degraded_health_alerts() {
     let s = r.state.unwrap();
     let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(61), &cfg());
     assert!(r.alerts[0].detail().contains("interrupted"), "{r:?}");
+}
+
+/// Lot 276: stage 8 (the export's loss) alerts as every stage; an export
+/// not on, or a sink of it failed, is DEGRADED; a sink down is not (its
+/// rows wait in the chains).
+#[test]
+fn the_export_s_loss_and_state_alert() {
+    use crate::heartbeat::{BeatExport, BeatExportSink};
+    let mut c = Chain::new();
+    let mut b = beat(1, 0);
+    b.loss = vec![Some(0); STAGE_NAMES.len()];
+    c.push(b);
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let sink = |state: &str| BeatExportSink {
+        sink: "syslog".into(),
+        state: state.into(),
+        rows: 10,
+        behind_bytes: 0,
+    };
+    let mut b = beat(2, 30);
+    b.loss = vec![Some(0); STAGE_NAMES.len()];
+    b.loss[7] = Some(4);
+    b.export = Some(BeatExport {
+        state: "on".into(),
+        sinks: vec![sink("down")],
+    });
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(31), &cfg());
+    assert_eq!(kinds(&r), ["LOSS"], "{r:?}");
+    assert!(
+        r.alerts[0].detail().contains("stage 8 (export) +4"),
+        "{r:?}"
+    );
+    let s = r.state.unwrap();
+    let mut b = beat(3, 60);
+    b.loss = vec![Some(0); STAGE_NAMES.len()];
+    b.loss[7] = Some(4);
+    b.export = Some(BeatExport {
+        state: "on".into(),
+        sinks: vec![sink("failed")],
+    });
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(61), &cfg());
+    assert_eq!(kinds(&r), ["DEGRADED"], "{r:?}");
+    assert!(r.alerts[0].detail().contains("syslog sink failed"), "{r:?}");
+    let s = r.state.unwrap();
+    let mut b = beat(4, 90);
+    b.loss = vec![Some(0); STAGE_NAMES.len()];
+    b.loss[7] = Some(4);
+    b.export = Some(BeatExport {
+        state: "refused".into(),
+        sinks: vec![],
+    });
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(91), &cfg());
+    assert!(
+        r.alerts[0].detail().contains("the export is refused"),
+        "{r:?}"
+    );
+    // an earlier agent's beat of seven stages next to a new one's eight
+    assert_eq!(STAGE_NAMES[7], "export");
 }
 
 /// A beat stamped in the future: the agent's clock ahead of the

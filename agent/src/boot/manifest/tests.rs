@@ -47,6 +47,7 @@ fn base() -> CapabilityManifest {
         missing: Vec::new(),
         content: Vec::new(),
         workers: Vec::new(),
+        export: None,
         telemetry_probe: String::new(),
         settled: false,
         contract_hash: String::new(),
@@ -113,6 +114,7 @@ fn inputs(bpf_lsm: BpfLsm, self_test: SelfTestOutcome) -> Inputs {
         ),
         opt_ins: Vec::new(),
         workers: None,
+        export: None,
     }
 }
 
@@ -728,6 +730,7 @@ fn the_stop_beat_signs_what_is_pending() {
             journal: crate::response::journal::ActionJournal::memory(),
             audit: None,
             probe_on: false,
+            export: None,
         },
     );
     let view = m.current().unwrap();

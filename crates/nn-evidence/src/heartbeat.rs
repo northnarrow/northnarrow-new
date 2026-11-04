@@ -145,7 +145,8 @@ pub struct HeartbeatRecord {
     pub decision_rounds: u64,
     pub decision_since_last_ms: u64,
     /// The events lost at each stage of their path since the run started,
-    /// stages 1 to 7 (`None`: not counted on this agent).
+    /// stages 1 to 8 (`None`: not counted on this agent; 7 entries from an
+    /// agent older than lot 276's export).
     pub loss: Vec<Option<u64>>,
     pub actions: BeatActions,
     /// The telemetry probe's gaps since the run started (`None`: off).
@@ -162,6 +163,30 @@ pub struct HeartbeatRecord {
     /// records, reserved by the chain log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<BeatManifest>,
+    /// Lot 276: the export's state — each sink's, how far behind — when
+    /// one is configured (`None`: no export, or an agent older than it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<BeatExport>,
+}
+
+/// Lot 276: what a beat carries of the export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeatExport {
+    /// `on`, `off`, `refused`, `failed`.
+    pub state: String,
+    pub sinks: Vec<BeatExportSink>,
+}
+
+/// One sink of the export, as a beat carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeatExportSink {
+    pub sink: String,
+    /// `up`, `connecting`, `down`, `failed`, `waiting`.
+    pub state: String,
+    /// Rows delivered since the run started.
+    pub rows: u64,
+    /// The chains' bytes after the sink's cursors, together.
+    pub behind_bytes: u64,
 }
 
 /// R13 (lab PR 271): what a beat carries of the capability manifest — the
@@ -268,8 +293,10 @@ impl crate::chainlog::ChainPayload for HeartbeatRecord {
     const KIND: &'static str = "heartbeat";
 }
 
-/// The names of the stages a beat's `loss` counts (index 0: stage 1).
-pub const STAGE_NAMES: [&str; 7] = [
+/// The names of the stages a beat's `loss` counts (index 0: stage 1); the
+/// eighth, the export's, since lot 276 (a beat of an earlier agent has
+/// seven).
+pub const STAGE_NAMES: [&str; 8] = [
     "kernel ring",
     "kernel budget",
     "decode",
@@ -277,6 +304,7 @@ pub const STAGE_NAMES: [&str; 7] = [
     "decision delay",
     "response queue",
     "evidence writer queue",
+    "export",
 ];
 
 /// What the verifier remembers of the last beat it verified.
@@ -740,7 +768,7 @@ pub fn check(
             l.degradations.clone(),
         ),
         Some(_) => (
-            vec![Some(0); 7],
+            vec![Some(0); STAGE_NAMES.len()],
             BeatActions::default(),
             Some(0),
             Vec::new(),
@@ -824,6 +852,17 @@ pub fn check(
             "{} action row(s) not in the signed actions chain",
             newest.actions.unwritten - prev_actions.unwritten
         ));
+    }
+    // lot 276: an export configured and not running, or a sink of it that
+    // cannot work as configured (a sink down is the receiver's: its rows
+    // wait in the chains, stage 8 counts what they lose)
+    if let Some(e) = &newest.export {
+        if e.state != "on" {
+            degraded.push(format!("the export is {}", e.state));
+        }
+        for k in e.sinks.iter().filter(|k| k.state == "failed") {
+            degraded.push(format!("the export's {} sink failed", k.sink));
+        }
     }
     if newest.actions.interrupted_at_boot > prev_actions.interrupted_at_boot {
         degraded.push(format!(

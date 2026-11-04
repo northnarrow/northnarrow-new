@@ -1829,6 +1829,19 @@ ensure_system_user "$SCAN_USER" "NorthNarrow exec quarantine scanner" \
 ensure_system_user "$WORKER_USER" "NorthNarrow agent workers" \
     "the agent cannot start its workers (a signed degradation: their enrichment is off)"
 
+# Lot 276: the export's JSONL files (docs/operator/EXPORT.md) — the one
+# directory the export worker's Landlock rule lets it write, its account's
+# (0750; a log shipper reads it as root, or is given the group). Created
+# whether or not an export is configured: off without a signed
+# export.local, and empty. The agent's unit makes it writable
+# (`ReadWritePaths=-/var/log/northnarrow/export`).
+EXPORT_DIR=${EXPORT_DIR:-/var/log/northnarrow/export}
+install -d -m 0755 -o root -g root "$(dirname "$EXPORT_DIR")"
+# (no account: no directory — an export's file sink then says why, signed)
+if getent passwd "$WORKER_USER" >/dev/null; then
+    install -d -m 0750 -o "$WORKER_USER" -g "$WORKER_USER" "$EXPORT_DIR"
+fi
+
 # Debian-family kernels carry a distro patch that makes
 # kernel.perf_event_paranoid=3 (their default) require CAP_SYS_ADMIN for
 # perf_event_open — CAP_PERFMON, which is all upstream (and Ubuntu's own

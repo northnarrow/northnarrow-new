@@ -8,6 +8,10 @@ Cargo.lock.bak
 .env.*
 *.pem
 *.key
+# lot 276: nn-export's test-only TLS material (a receiver on 127.0.0.1 for the
+# tests and the lab; its CA's key discarded, trusted by no build)
+!crates/nn-export/tests/pki/*.pem
+!crates/nn-export/tests/pki/srv.key
 
 # Editor / IDE
 *.swp

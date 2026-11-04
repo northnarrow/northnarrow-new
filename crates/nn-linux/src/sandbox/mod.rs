@@ -44,16 +44,28 @@ use std::io;
 use std::os::fd::RawFd;
 
 use landlock::{
-    Access, AccessFs, AccessNet, CompatLevel, Compatible, LandlockStatus, RulesetAttr,
-    RulesetStatus, Scope, ABI,
+    Access, AccessFs, AccessNet, CompatLevel, Compatible, LandlockStatus, NetPort, PathBeneath,
+    PathFd, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
 use nn_proto::ipc::{LandlockEnforced, SandboxLevel};
 
 pub mod seccomp;
 
-/// The descriptors a worker may hold at once: stdio, its channel and a
-/// margin.
+/// The descriptors the parse worker may hold at once: stdio, its channel
+/// and a margin.
 pub const MAX_FDS: u64 = 8;
+
+/// Lot 276: the export worker's: its socket, its file and a Landlock
+/// ruleset's, too.
+pub const EXPORT_MAX_FDS: u64 = 16;
+
+/// A directory a Landlock ruleset grants the export's file rights beneath.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsRule {
+    pub path: std::path::PathBuf,
+    /// The rule as the sandbox declares it (`WorkerKind::fs_rules`).
+    pub declared: &'static str,
+}
 
 /// A sandbox to enter.
 #[derive(Debug, Clone)]
@@ -66,6 +78,16 @@ pub struct Profile {
     pub memory: u64,
     /// The system calls the worker keeps.
     pub syscalls: seccomp::Allowlist,
+    /// `RLIMIT_NOFILE`.
+    pub max_fds: u64,
+    /// Lot 276: the directories the ruleset grants rights beneath (none for
+    /// the parse worker). A directory that is missing gets no rule (and the
+    /// level declares none).
+    pub fs_rules: Vec<FsRule>,
+    /// TCP bind and connect handled with no rule (ABI ≥ 4) at entry: the
+    /// parse worker's. The export's TCP is pinned to its receiver's port
+    /// by a layer of its own after its setup ([`pin_tcp_connect`]).
+    pub deny_tcp: bool,
 }
 
 impl Profile {
@@ -77,8 +99,47 @@ impl Profile {
             ipc_fd,
             memory: 512 << 20,
             syscalls: seccomp::Allowlist::parse_worker(ipc_fd, std::process::id()),
+            max_fds: MAX_FDS,
+            fs_rules: Vec::new(),
+            deny_tcp: true,
         }
     }
+
+    /// Lot 276: the `export` worker (the restructure plan's §3.1): read and
+    /// write files beneath its directory alone (`nn_proto::ipc::EXPORT_DIR`),
+    /// a TCP connection to its receiver (the port pinned after its setup),
+    /// no process; `sock_flags` and `open_flags` are nn-export's.
+    pub fn export(ipc_fd: RawFd, sock_flags: i32, open_flags: i32) -> Self {
+        Self {
+            name: "export",
+            ipc_fd,
+            memory: 512 << 20,
+            syscalls: seccomp::Allowlist::export_worker(
+                ipc_fd,
+                std::process::id(),
+                sock_flags,
+                open_flags,
+            ),
+            max_fds: EXPORT_MAX_FDS,
+            fs_rules: vec![FsRule {
+                path: std::path::PathBuf::from(nn_proto::ipc::EXPORT_DIR),
+                declared: nn_proto::ipc::EXPORT_DIR_RULE,
+            }],
+            deny_tcp: false,
+        }
+    }
+}
+
+/// The rights the export's directory rule grants: read, list, write,
+/// create and remove regular files, truncate (ABI 3); never execute, never
+/// a device, a link, a socket or a FIFO.
+fn export_dir_rights() -> landlock::BitFlags<AccessFs> {
+    AccessFs::ReadFile
+        | AccessFs::ReadDir
+        | AccessFs::WriteFile
+        | AccessFs::RemoveFile
+        | AccessFs::MakeReg
+        | AccessFs::Truncate
 }
 
 /// Why a worker did not enter its sandbox: it exits, and the core signs
@@ -120,7 +181,7 @@ pub fn enter(profile: &Profile) -> Result<SandboxLevel, SandboxError> {
     refuse_privileged()?;
     harden(profile)?;
     let mut level = measure()?;
-    landlock_restrict(&mut level)?;
+    landlock_restrict(profile, &mut level)?;
     seccomp::install(&profile.syscalls).map_err(step("seccomp"))?;
     level.seccomp = true;
     Ok(level)
@@ -136,7 +197,7 @@ pub fn enter_without_seccomp(profile: &Profile) -> Result<SandboxLevel, SandboxE
     refuse_privileged()?;
     harden(profile)?;
     let mut level = measure()?;
-    landlock_restrict(&mut level)?;
+    landlock_restrict(profile, &mut level)?;
     Ok(level)
 }
 
@@ -255,7 +316,7 @@ fn harden(profile: &Profile) -> Result<(), SandboxError> {
     for (res, v, name) in [
         (libc::RLIMIT_CORE, 0, "RLIMIT_CORE"),
         (libc::RLIMIT_NPROC, 0, "RLIMIT_NPROC"),
-        (libc::RLIMIT_NOFILE, MAX_FDS, "RLIMIT_NOFILE"),
+        (libc::RLIMIT_NOFILE, profile.max_fds, "RLIMIT_NOFILE"),
         (libc::RLIMIT_AS, profile.memory, "RLIMIT_AS"),
     ] {
         setrlimit(res, v).map_err(step(name))?;
@@ -549,21 +610,34 @@ fn measure_landlock(peer: Option<&ScopePeer>) -> Measured {
 }
 
 /// Step 4: Landlock, best effort; what it refuses measured, then declared.
-fn landlock_restrict(level: &mut SandboxLevel) -> Result<(), SandboxError> {
+fn landlock_restrict(profile: &Profile, level: &mut SandboxLevel) -> Result<(), SandboxError> {
     let fail = |e: landlock::RulesetError| SandboxError::Step("landlock", e.to_string());
     let peer = scope_peer();
-    let status = landlock::Ruleset::default()
+    let mut ruleset = landlock::Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(LANDLOCK_ASK))
-        .map_err(fail)?
-        .handle_access(AccessNet::from_all(LANDLOCK_ASK))
-        .map_err(fail)?
+        .map_err(fail)?;
+    if profile.deny_tcp {
+        ruleset = ruleset
+            .handle_access(AccessNet::from_all(LANDLOCK_ASK))
+            .map_err(fail)?;
+    }
+    let mut created = ruleset
         .scope(Scope::from_all(LANDLOCK_ASK))
         .map_err(fail)?
         .create()
-        .map_err(fail)?
-        .restrict_self()
         .map_err(fail)?;
+    // lot 276: the export's directory (a directory missing gets no rule)
+    let mut granted = Vec::new();
+    for r in &profile.fs_rules {
+        if let Ok(dir) = PathFd::new(&r.path) {
+            created = created
+                .add_rule(PathBeneath::new(dir, export_dir_rights()))
+                .map_err(fail)?;
+            granted.push(r.declared.to_string());
+        }
+    }
+    let status = created.restrict_self().map_err(fail)?;
     let abi = match status.landlock {
         LandlockStatus::Available { effective_abi, .. } => effective_abi as u8,
         _ => 0,
@@ -576,7 +650,61 @@ fn landlock_restrict(level: &mut SandboxLevel) -> Result<(), SandboxError> {
     let measured = measure_landlock(peer.as_ref());
     drop(peer);
     declare(level, abi, enforced, measured);
+    if level.landlock != LandlockEnforced::None {
+        level.fs_rules = granted;
+    }
     Ok(())
+}
+
+/// Lot 276: pin the calling worker's TCP connects to `port` — a Landlock
+/// layer of its own (layers only take rights away: the entry's ruleset
+/// stays), made after the worker's setup told it its receiver. Measured:
+/// a connect to another loopback port is refused with `EACCES`. `false`
+/// on a kernel whose Landlock does not handle TCP (ABI < 4): the core
+/// asks for the pin only where it does (`SyslogSetup::pin_port`).
+pub fn pin_tcp_connect(port: u16, sock_flags: i32) -> bool {
+    let layer = landlock::Ruleset::default()
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessNet::from_all(LANDLOCK_ASK))
+        .and_then(|r| r.create())
+        .and_then(|r| r.add_rule(NetPort::new(port, AccessNet::ConnectTcp)))
+        .map(|r| r.no_new_privs(false))
+        .and_then(|r| r.restrict_self());
+    match layer {
+        Ok(st) if st.ruleset != RulesetStatus::NotEnforced => {
+            tcp_refused(if port == 1 { 2 } else { 1 }, sock_flags)
+        }
+        _ => false,
+    }
+}
+
+/// A TCP connect to `127.0.0.1:port` is refused by Landlock (`EACCES`; a
+/// closed port says `ECONNREFUSED`).
+fn tcp_refused(port: u16, sock_flags: i32) -> bool {
+    // SAFETY: socket, connect and close on our own descriptor, a local
+    // address.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, sock_flags, 0);
+        if fd < 0 {
+            return false;
+        }
+        let sa = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from(std::net::Ipv4Addr::LOCALHOST).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        let rc = libc::connect(
+            fd,
+            (&sa as *const libc::sockaddr_in).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        let refused = rc != 0 && errno() == libc::EACCES;
+        libc::close(fd);
+        refused
+    }
 }
 
 /// The level declared: the kernel's `abi`, the crate's `enforced` state,

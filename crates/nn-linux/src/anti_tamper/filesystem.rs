@@ -237,6 +237,10 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     // Lab PR 226 (EXPERIMENTAL): the exec policy and its signature.
     "exec-policy.local",
     "exec-policy.local.sig",
+    // Lot 276: the export's configuration and its signature. MUTATE-only
+    // like the other overlays (its CA file is pinned by the signed text).
+    "export.local",
+    "export.local.sig",
 ];
 
 /// External audit EVD-001: the subset of [`ETC_WRITE_DENY_FILES`] no
@@ -2666,6 +2670,9 @@ mod tests {
                 "security-tools.v1",
                 "exec-policy.local",
                 "exec-policy.local.sig",
+                // Lot 276 — APPENDED.
+                "export.local",
+                "export.local.sig",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"

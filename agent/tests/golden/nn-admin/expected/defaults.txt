@@ -409,6 +409,38 @@ exit: 5
 --- stderr
 | net status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
 
+### default.export-status-key.agent-id
+$ nn-admin export status --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| export status: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.export-status-key.socket
+$ nn-admin export status --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| export status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
+### default.export-status-key-json.agent-id
+$ nn-admin export status --json --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| export status: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.export-status-key-json.socket
+$ nn-admin export status --json --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| export status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
 ### default.capabilities.agent-id
 $ nn-admin capabilities --key key-a
 exit: 5

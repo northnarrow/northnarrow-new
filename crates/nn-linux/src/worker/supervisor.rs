@@ -87,6 +87,9 @@ pub const STDERR_LINES_PER_MINUTE: u32 = 20;
 pub const STDERR_LINE_MAX: usize = 200;
 /// How long [`Workers::stop`] waits for a slot before it kills by pid.
 pub const STOP_WAIT: Duration = Duration::from_secs(2);
+/// Lot 276: the longest a supervisor pass waits for a slot a request
+/// holds before it passes over it.
+pub const TICK_LOCK_WAIT: Duration = Duration::from_millis(10);
 
 /// The wait before the next start after `failures` in a row: at once
 /// after the first, then 1, 2, 4… seconds, at most [`MAX_BACKOFF`].
@@ -586,7 +589,13 @@ impl Workers {
     pub fn tick(&self, now: Instant) -> Duration {
         let mut pace = Duration::from_millis(250);
         for slot in &self.0.slots {
-            let mut s = slot.s.lock();
+            // lot 276: a slot held by a request in flight (the export's
+            // last up to its budget) is passed over this round — its
+            // requester judges the worker meanwhile — never waited on, so
+            // one worker's long request does not hold up another's watch
+            let Some(mut s) = slot.s.try_lock_for(TICK_LOCK_WAIT) else {
+                continue;
+            };
             if !s.stopped {
                 self.watch(slot.kind, &mut s, now);
                 self.drain_stderr(slot.kind, &mut s);
@@ -948,6 +957,21 @@ impl Workers {
             s.served += 1;
         }
         Ok(resp.answer)
+    }
+
+    /// Lot 276: an answer that passed the protocol's check against its
+    /// request and failed the requester's against what it had sent before
+    /// (the export's window of rows in flight): the worker is killed and
+    /// reported as for any violation.
+    pub fn condemn(&self, kind: WorkerKind, why: &'static str) {
+        let Some(slot) = self.slot(kind) else {
+            return;
+        };
+        let mut s = slot.s.lock();
+        if s.child.is_some() {
+            self.violation(kind, &mut s, Violation::Bounds(why));
+        }
+        self.publish(slot, &s);
     }
 
     fn violation(&self, kind: WorkerKind, s: &mut SlotState, v: Violation) {

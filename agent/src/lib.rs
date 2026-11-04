@@ -157,6 +157,9 @@ mod epg_tests;
 pub mod exec_guards;
 pub mod execpol;
 pub mod execq;
+/// Lot 276: the export — its signed configuration, the core's thread that
+/// reads the chains as the write-ahead log, the export worker's entry.
+pub mod export;
 /// R09b shim (lab PR 254): file integrity monitoring — the observers'
 /// attach, the drain and its drift log, the baseline, the honeypot baits,
 /// the recompute, the watched paths' loader on the Linux host — is

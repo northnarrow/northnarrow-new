@@ -50,5 +50,9 @@ pub mod heartbeat;
 // nn-linux, so that nn-linux and nn-admin both draw from it; rand's
 // portable `SysRng`, no libc of its own.
 pub mod os_rng;
+
+/// Lot 276: one signed row verified from its bytes alone (the export's
+/// receivers hold rows, not their types).
+pub mod row_verify;
 /// The full verifiers' bounded line reader (was the agent's `verify_lines`).
 pub mod verify_lines;

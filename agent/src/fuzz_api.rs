@@ -457,9 +457,11 @@ mod tests {
     #[test]
     fn ipc_check_seeds_are_accepted_and_the_f1_input_refused() {
         use nn_proto::ipc::{
-            check_hello, check_response, decode, encode, Answer, Expected, FromWorker,
-            LandlockEnforced, QnameForm, QnameIn, QnameOut, Request, Response, SandboxLevel,
-            SniOut, TlsOut, WorkerHello, WorkerKind, IPC_VERSION,
+            check_hello, check_response, decode, encode, Answer, Expected, ExportAddr, ExportChain,
+            ExportRow, ExportRows, ExportRowsOut, ExportSetup, ExportSetupOut, ExportSink,
+            FileSetup, FromWorker, LandlockEnforced, QnameForm, QnameIn, QnameOut, Request,
+            Response, RowPos, SandboxLevel, SinkState, SniOut, SyslogSetup, TlsOut, WorkerHello,
+            WorkerKind, EXPORT_DIR_RULE, IPC_VERSION,
         };
         let packet = |sel: u8, m: &FromWorker| {
             let mut v = vec![sel];
@@ -481,6 +483,24 @@ mod tests {
                 uid: 990,
                 gid: 990,
                 nofile: 8,
+                ..SandboxLevel::default()
+            },
+        });
+        let export_hello = FromWorker::Hello(WorkerHello {
+            version: IPC_VERSION,
+            kind: WorkerKind::Export,
+            pid: 4243,
+            sandbox: SandboxLevel {
+                landlock_abi: 4,
+                landlock: LandlockEnforced::Partial,
+                fs_denied: true,
+                net_denied: false,
+                seccomp: true,
+                no_new_privs: true,
+                uid: 990,
+                gid: 990,
+                nofile: 16,
+                fs_rules: vec![EXPORT_DIR_RULE.to_string()],
                 ..SandboxLevel::default()
             },
         });
@@ -521,6 +541,37 @@ mod tests {
                     }),
                 ),
             ),
+            // lot 276: the export worker's hello (the selector's low bit),
+            // a rows answer (sink syslog: bit 2) and a setup's (both sinks,
+            // the pin asked for: bits 2, 3, 4)
+            ("hello-export-abi4.bin", packet(1 | (4 << 2), &export_hello)),
+            (
+                "export-rows.bin",
+                packet(
+                    4 | (1 << 4),
+                    &answer(Answer::ExportRows(ExportRowsOut {
+                        acked: Some(RowPos { file: 1, line: 1 }),
+                        committed: Some(RowPos { file: 1, line: 2 }),
+                        records: 1,
+                        unverified: 0,
+                        state: SinkState::Up,
+                        fault: None,
+                        retry_ms: 0,
+                    })),
+                ),
+            ),
+            (
+                "export-setup.bin",
+                packet(
+                    4 | 8 | 16,
+                    &answer(Answer::ExportSetup(ExportSetupOut {
+                        port_pinned: true,
+                        file: SinkState::Up,
+                        syslog: SinkState::Connecting,
+                        fault: None,
+                    })),
+                ),
+            ),
         ];
         for (name, bytes) in &seeds {
             generated("seeds", "ipc_check", name, bytes);
@@ -535,7 +586,56 @@ mod tests {
             &f1,
         );
         // each seed reaches acceptance; the regression is refused
+        // as the fuzz target's `export_request`
+        let export_req = |sel: u8, a: &Answer| match a {
+            Answer::ExportRows(_) => Some(Request::ExportRows(ExportRows {
+                sink: if sel & 4 == 0 {
+                    ExportSink::File
+                } else {
+                    ExportSink::Syslog
+                },
+                chain: if sel & 8 == 0 {
+                    ExportChain::Detections
+                } else {
+                    ExportChain::CanaryAccess
+                },
+                rows: (1..=u64::from(sel >> 4) + 1)
+                    .map(|l| ExportRow {
+                        file: if sel & 8 == 0 {
+                            1 + u64::from(l > 8)
+                        } else {
+                            0
+                        },
+                        line: l,
+                        end: 100 * l,
+                        raw: b"{}".to_vec(),
+                        rotate: None,
+                    })
+                    .collect(),
+                budget_ms: 1000,
+            })),
+            Answer::ExportSetup(_) => Some(Request::ExportSetup(ExportSetup {
+                agent_id: "0".repeat(32),
+                hostname: "host".into(),
+                version: "1".into(),
+                pubkey: [0; 32],
+                file: (sel & 4 != 0).then_some(FileSetup {
+                    max_bytes: 1 << 20,
+                    max_files: 2,
+                }),
+                syslog: (sel & 8 != 0 || sel & 4 == 0).then(|| SyslogSetup {
+                    addr: ExportAddr::V4([127, 0, 0, 1]),
+                    port: 6514,
+                    server_name: "receiver.lab".into(),
+                    ca_pem: b"-".to_vec(),
+                    facility: 13,
+                    pin_port: sel & 16 != 0,
+                }),
+            })),
+            _ => None,
+        };
         let req_for = |sel: u8, a: &Answer| match sel & 3 {
+            _ if export_req(sel, a).is_some() => export_req(sel, a).unwrap(),
             0 => Request::Ping,
             1 => Request::DnsNames(
                 (0..match a {
@@ -564,7 +664,11 @@ mod tests {
                 FromWorker::Hello(h) => check_hello(
                     &h,
                     &Expected {
-                        kind: WorkerKind::Parse,
+                        kind: if sel & 1 == 0 {
+                            WorkerKind::Parse
+                        } else {
+                            WorkerKind::Export
+                        },
                         pid: h.pid,
                         uid: h.sandbox.uid,
                         gid: h.sandbox.gid,

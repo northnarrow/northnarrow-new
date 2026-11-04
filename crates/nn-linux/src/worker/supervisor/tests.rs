@@ -1256,3 +1256,57 @@ fn the_image_launcher_reads_the_process_s_own_status() {
         "{gone:?}"
     );
 }
+
+/// Lot 276: a request in flight holds its slot; the supervisor's pass
+/// passes over it at once instead of waiting for it (the export's requests
+/// last their budget: the parse worker's watch is never held up by them).
+#[test]
+fn a_pass_does_not_wait_on_a_slot_a_request_holds() {
+    let f = fixture(Script::SlowNames);
+    assert!(tick_until(&f.workers, Health::Ready));
+    let w = f.workers.clone();
+    let req =
+        std::thread::spawn(move || w.request(WorkerKind::Parse, &names(), Duration::from_secs(2)));
+    // the request has the slot (the worker answers its names after 100 ms)
+    std::thread::sleep(Duration::from_millis(30));
+    let t = Instant::now();
+    f.workers.tick(Instant::now());
+    let took = t.elapsed();
+    assert!(
+        took < Duration::from_millis(60),
+        "the pass waited {took:?} on a slot held by a request"
+    );
+    assert!(matches!(req.join().unwrap(), Ok(Answer::DnsNames(_))));
+}
+
+/// Lot 276: the requester's own check of an answer (the export's window)
+/// condemns the worker as a violation: killed, counted, reported, another
+/// started.
+#[test]
+fn a_condemned_worker_is_killed_as_for_a_violation() {
+    let f = fixture(Script::Honest);
+    assert!(tick_until(&f.workers, Health::Ready));
+    let pid = f.workers.status()[0].pid.unwrap();
+    f.workers.condemn(
+        WorkerKind::Parse,
+        "export_rows: a row the core did not send",
+    );
+    let st = &f.workers.status()[0];
+    assert_eq!(st.violations, 1, "{st:?}");
+    assert_ne!(st.health, Health::Ready);
+    assert!(
+        f.reports
+            .lock()
+            .iter()
+            .any(|(_, d)| d.contains("a row the core did not send")),
+        "{:?}",
+        f.reports.lock()
+    );
+    assert!(tick_until(&f.workers, Health::Ready));
+    assert_ne!(f.workers.status()[0].pid, Some(pid), "another worker");
+    // a kind with no slot: nothing happens
+    f.workers.condemn(
+        WorkerKind::Export,
+        "export_rows: a row the core did not send",
+    );
+}

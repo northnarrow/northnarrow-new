@@ -1551,6 +1551,8 @@ exit 0"#
             .env("ETC_DIR", r.join("etc"))
             .env("STATE_DIR", r.join("state"))
             .env("RUN_DIR", r.join("run"))
+            // lot 276: the export's JSONL directory
+            .env("EXPORT_DIR", r.join("log/export"))
             .env("BPFFS_ROOT", r.join("pins"))
             .env(
                 "JOURNALD_NS_CONF",

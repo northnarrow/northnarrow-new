@@ -35,6 +35,9 @@ const TREES: &[&str] = &[
 const WORKER_SIDE: &[&str] = &[
     "crates/nn-linux/src/worker/serve.rs",
     "crates/nn-linux/src/worker/hostile.rs",
+    // lot 276: the export worker's entry (it names no parser; its own
+    // guard is xtask/tests/export_in_the_worker.rs)
+    "agent/src/export/worker.rs",
 ];
 
 fn rs_files(dir: &std::path::Path) -> Vec<PathBuf> {

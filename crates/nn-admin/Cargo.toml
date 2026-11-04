@@ -33,6 +33,8 @@ clap = { workspace = true }
 # serde_json with the agent's feature (`float_roundtrip`), so a build of
 # nn-admin alone parses as the agent does.
 serde_json = { version = "1", features = ["float_roundtrip"] }
+# Lot 276: `export verify --json`'s report.
+serde = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
 # Tappa 7 task 7 / Tappa 8: the operator's Ed25519 keys and signatures;
 # `rand_core` lets the OS CSPRNG (`os_rng`) feed `init`'s key generation.
@@ -59,6 +61,8 @@ debug-trigger = ["nn-proto/debug-trigger"]
 
 [dev-dependencies]
 tempfile = "3"
+# `export verify`'s tests sign their rows (the chains' base64).
+base64 = "0.23"
 
 [lints]
 workspace = true

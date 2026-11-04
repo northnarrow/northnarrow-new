@@ -68,9 +68,11 @@ pub struct Sources {
     pub journal: crate::response::journal::ActionJournal,
     pub audit: Option<Arc<Mutex<AuditLog>>>,
     pub probe_on: bool,
+    /// Lot 276: the export (`None`: none configured).
+    pub export: Option<crate::export::ExportHandle>,
 }
 
-/// The loss of stages 1 to 7 now (`None`: a stage not counted here).
+/// The loss of stages 1 to 8 now (`None`: a stage not counted here).
 fn loss_now(s: &Sources) -> Vec<Option<u64>> {
     let dispatch = s.dispatch.as_ref().map(|f| f());
     let queues = s.bus.as_ref().map(|b| b.snapshot()).unwrap_or_default();
@@ -79,10 +81,11 @@ fn loss_now(s: &Sources) -> Vec<Option<u64>> {
         crate::sensors::reject::total(),
         &queues,
         dispatch.as_ref().map(|d| (d.stage6(), d.stage7())),
+        s.export.as_ref().and_then(|e| e.lost()),
     );
     let mut out: Vec<Option<u64>> = stages
         .into_iter()
-        .filter(|st| (1..=7).contains(&st.stage))
+        .filter(|st| (1..=8).contains(&st.stage))
         .map(|st| st.total)
         .collect();
     if s.bus.is_none() {
@@ -93,7 +96,7 @@ fn loss_now(s: &Sources) -> Vec<Option<u64>> {
             }
         }
     }
-    out.resize(7, None);
+    out.resize(nn_evidence::heartbeat::STAGE_NAMES.len(), None);
     out
 }
 
@@ -307,6 +310,7 @@ impl Heartbeat {
             heads,
             stop_reason: stop_reason.map(str::to_string),
             capabilities: s.manifest.as_ref().and_then(|m| m.beat()),
+            export: s.export.as_ref().map(|e| e.beat()),
         };
         let written = match &mut w.log {
             Some(log) => match log.append(record) {
@@ -471,7 +475,28 @@ mod tests {
             journal: crate::response::journal::ActionJournal::memory(),
             audit: None,
             probe_on: false,
+            export: None,
         }
+    }
+
+    /// Lot 276: stage 8 is the export's loss — `None` without an export,
+    /// its count with one on.
+    #[test]
+    fn the_export_s_loss_is_stage_8() {
+        let none = loss_now(&sources());
+        assert_eq!(none.len(), 8);
+        assert_eq!(none[7], None);
+        let h =
+            crate::export::ExportHandle::new(&crate::export::parse("enabled = true\nfile = on\n"))
+                .unwrap();
+        h.add_lost(3);
+        let s = Sources {
+            export: Some(h),
+            ..sources()
+        };
+        let on = loss_now(&s);
+        assert_eq!(on.len(), 8);
+        assert_eq!(on[7], Some(3));
     }
 
     /// A start beat at the open, numbered beats after it continuing across
@@ -520,7 +545,8 @@ mod tests {
         use BeatKind::*;
         assert_eq!(kinds, [Start, Beat, Stop, Start, Beat]);
         assert_eq!(beats[2].stop_reason.as_deref(), Some("admin_shutdown"));
-        assert_eq!(beats[0].loss.len(), 7);
+        // stages 1 to 8 (lot 276: the export's)
+        assert_eq!(beats[0].loss.len(), 8);
         // the verifier's check accepts the whole tail
         let raw: Vec<Vec<u8>> = lines.iter().map(|l| l.as_bytes().to_vec()).collect();
         let r = nn_evidence::heartbeat::check(
@@ -570,7 +596,7 @@ mod tests {
             .map(|r| r["extra"]["at"].as_str().unwrap())
             .collect();
         assert_eq!(at, ["start", "stop"], "{rows:#?}");
-        assert_eq!(rows[0]["extra"]["stages"].as_array().unwrap().len(), 7);
+        assert_eq!(rows[0]["extra"]["stages"].as_array().unwrap().len(), 8);
         assert_eq!(rows[0]["extra"]["run"], "1234567890abcdef");
         // the beats name the audit chain's head
         let lines = export_lines(&dir.path().join("heartbeat.jsonl"), 10).unwrap();

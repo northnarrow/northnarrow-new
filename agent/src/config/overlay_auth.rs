@@ -95,6 +95,11 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
         OverlayKind::CowGuard => {
             crate::cow::config::CowConfig::validate(text)?;
         }
+        // Lot 276: the export's own strict parser (its CA file is checked
+        // against the digest it pins when the agent starts with it).
+        OverlayKind::Export => {
+            nn_export::config::ExportConfig::validate(text)?;
+        }
         OverlayKind::NetflowBlocklist => {
             crate::net::blocklist::parse_blocklist_overlay_text(&label, text)?;
         }
@@ -720,6 +725,41 @@ mod tests {
             gate.verified(OverlayKind::ProcessCommAllowlist, &dir.path().join("none")),
             Verified::Missing
         );
+    }
+
+    /// Lot 276: the export's configuration is the text the gate verified —
+    /// absent without a file, refused (never read as absent: a signed
+    /// degradation) once its bytes no longer match their signature; a
+    /// signed text the export cannot use failed (refused at `set` already).
+    #[test]
+    fn the_export_loads_only_a_verified_text() {
+        use crate::export::{load_from, Loaded};
+        let (dir, key, admin_pub) = setup("config-manage");
+        let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::default());
+        let none = dir.path().join(OverlayKind::Export.file_name());
+        assert!(matches!(load_from(&gate, &none), Loaded::Absent));
+        let p = write_signed(
+            dir.path(),
+            &key,
+            OverlayKind::Export,
+            "enabled = true\nfile = on\n",
+            100,
+        );
+        match load_from(&gate, &p) {
+            Loaded::Configured(c) => assert!(c.config.enabled && c.config.file.is_some()),
+            other => panic!("{other:?}"),
+        }
+        std::fs::write(&p, "enabled = true\nfile = on\nstart = oldest\n").unwrap();
+        assert!(matches!(load_from(&gate, &p), Loaded::Refused));
+        let bad = write_signed(
+            dir.path(),
+            &key,
+            OverlayKind::Export,
+            "enabled = true\n",
+            101,
+        );
+        assert!(matches!(load_from(&gate, &bad), Loaded::Failed { .. }));
+        assert!(validate_content(OverlayKind::Export, "enabled = true\n").is_err());
     }
 
     /// External audit LLMR-013: the loader applies the text the gate

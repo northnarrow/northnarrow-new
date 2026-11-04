@@ -1,0 +1,55 @@
+[package]
+name = "nn-export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "NorthNarrow nn-export: the minimal signed export (lot 276, R15's first step): the signed chains as the write-ahead log, OCSF 1.9.0, a rotating JSONL file and syslog over TLS, run in the unprivileged export worker."
+publish = false
+
+# Lot 276: the crate the module map planned for R15 (docs/architecture/
+# module-map.toml, `[crates.nn-export]`). Two halves: what the core runs —
+# the chain reader and its cursors (`wal`), the configuration (`config`) —
+# and what only the export worker runs, in its sandbox: the OCSF mapping
+# (`ocsf`), the sinks (`jsonl`, `syslog`, `net`, `tls`) and the worker's
+# state (`worker`). xtask/tests/export_in_the_worker.rs holds the line.
+[dependencies]
+# The IPC's export requests and answers, the chain and sink names.
+nn-proto = { workspace = true }
+# The chains' archives, cursors' checks (`holds_line_ending_at`), the
+# manifest's rotation rows, and `row_verify` (each row checked from its
+# bytes in the worker).
+nn-evidence = { workspace = true }
+serde = { workspace = true }
+# The agent's feature (`float_roundtrip`): the rows' numbers read as written.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.11"
+hex = "0.4"
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize"] }
+anyhow = { workspace = true }
+# The worker's sockets and files: raw system calls, so its seccomp
+# allowlist names exactly what runs (`net`, `jsonl`).
+libc = "0.2"
+# The founder's decision (plan of 03/11, INI-20): TLS in Rust only —
+# rustls with the RustCrypto provider, not aws-lc-rs (C) or ring (C and
+# assembly). Pinned exactly: a young dependency moves only by a reviewed
+# edit of this file (docs/operator/EXPORT.md §7, the dependency set and its
+# recorded advisories in .cargo/audit.toml). rustls without its defaults:
+# no aws-lc-rs, no TLS 1.2, no logging; the provider without TLS 1.2.
+rustls = { version = "=0.23.46", default-features = false, features = ["std"] }
+rustls-rustcrypto = { version = "=0.0.2-alpha", default-features = false, features = ["std", "zeroize"] }
+
+[features]
+# The OCSF validator against the pinned schema, for the agent's tests (its
+# dev-dependency turns it on); never in a production build.
+schema-check = []
+
+[dev-dependencies]
+tempfile = "3"
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize", "rand_core"] }
+base64 = "0.23"
+
+[lints]
+workspace = true

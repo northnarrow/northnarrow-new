@@ -16,7 +16,13 @@
 //!   zero byte; JA3 32 hex digits; JA4 36 ASCII bytes in its
 //!   shape; an SNI a host name; ALPN names printable ASCII, non-empty,
 //!   bounded; no more DNS answers than the bytes can hold;
-//! - a message decoded encodes back to the bytes that decode to itself.
+//! - a message decoded encodes back to the bytes that decode to itself;
+//! - lot 276, the export worker's answers: rows acknowledged never past
+//!   those committed, committed never past the last row sent, a file's
+//!   write never in flight, no more unverified rows than records, a sink
+//!   asked for never off, a retry bounded; a setup that asked for the pin
+//!   either pinned or failed for it; its hello without TCP denied but with
+//!   no filesystem rule other than its directory's.
 //!
 //! The first byte chooses the request an answer is checked against (its
 //! two low bits), its size (the next four), a name's form (the two high
@@ -26,8 +32,10 @@
 use libfuzzer_sys::fuzz_target;
 use nn_proto::ipc::{
     alpn_display, check_hello, check_response, decode, encode, max_qname_out,
-    min_dns_answer_bytes, Answer, Expected, FromWorker, QnameForm, QnameIn, Request, SniOut, TlsOut,
-    ToWorker, WorkerKind, LANDLOCK_ABI_KNOWN, MAX_ALPN, MAX_TLS_FIELD,
+    min_dns_answer_bytes, Answer, ExportAddr, ExportChain, ExportRow, ExportRows, ExportSetup,
+    ExportSink, Expected, FileSetup, FromWorker, QnameForm, QnameIn, Request, SinkFault, SinkState,
+    SniOut, SyslogSetup, TlsOut, ToWorker, WorkerKind, LANDLOCK_ABI_KNOWN, MAX_ALPN, MAX_RETRY_MS,
+    MAX_TLS_FIELD,
 };
 
 fn lower_hex(s: &str, len: usize) -> bool {
@@ -49,8 +57,63 @@ fn name_bytes(sel: u8, len: usize) -> Vec<u8> {
     (0..len).map(|i| (i as u8).wrapping_add(sel)).collect()
 }
 
+/// Lot 276: the export's request an export answer is checked against —
+/// 1 to 16 rows of one chain to the file or the syslog sink, a setup with
+/// either sink and the pin asked for or not (the selector's bits).
+fn export_request(sel: u8, answer: &Answer) -> Option<Request> {
+    match answer {
+        Answer::ExportRows(_) => {
+            let n = u64::from(sel >> 4) + 1;
+            Some(Request::ExportRows(ExportRows {
+                sink: if sel & 4 == 0 {
+                    ExportSink::File
+                } else {
+                    ExportSink::Syslog
+                },
+                chain: if sel & 8 == 0 {
+                    ExportChain::Detections
+                } else {
+                    ExportChain::CanaryAccess
+                },
+                rows: (1..=n)
+                    .map(|l| ExportRow {
+                        file: if sel & 8 == 0 { 1 + (l > 8) as u64 } else { 0 },
+                        line: l,
+                        end: 100 * l,
+                        raw: b"{}".to_vec(),
+                        rotate: None,
+                    })
+                    .collect(),
+                budget_ms: 1000,
+            }))
+        }
+        Answer::ExportSetup(_) => Some(Request::ExportSetup(ExportSetup {
+            agent_id: "0".repeat(32),
+            hostname: "host".into(),
+            version: "1".into(),
+            pubkey: [0; 32],
+            file: (sel & 4 != 0).then_some(FileSetup {
+                max_bytes: 1 << 20,
+                max_files: 2,
+            }),
+            syslog: (sel & 8 != 0 || sel & 4 == 0).then(|| SyslogSetup {
+                addr: ExportAddr::V4([127, 0, 0, 1]),
+                port: 6514,
+                server_name: "receiver.lab".into(),
+                ca_pem: b"-".to_vec(),
+                facility: 13,
+                pin_port: sel & 16 != 0,
+            }),
+        })),
+        _ => None,
+    }
+}
+
 /// The request an answer is checked against.
 fn request(sel: u8, answer: &Answer) -> Request {
+    if let Some(r) = export_request(sel, answer) {
+        return r;
+    }
     let size = usize::from(sel >> 2);
     match sel & 3 {
         0 => Request::Ping,
@@ -136,6 +199,29 @@ fn accepted_answer(req: &Request, answer: &Answer) {
         (Request::DnsAnswers(bytes), Answer::DnsAnswers { a, aaaa }) => {
             assert!(min_dns_answer_bytes(a.len(), aaaa.len()) <= bytes.len());
         }
+        (Request::ExportRows(r), Answer::ExportRows(o)) => {
+            let last = r.rows.last().map(|x| x.pos());
+            if let Some(a) = o.acked {
+                assert!(o.committed.is_some_and(|c| a <= c), "{o:?}");
+            }
+            if let Some(c) = o.committed {
+                assert!(last.is_some_and(|l| c <= l), "{o:?}");
+            }
+            assert!(r.sink != ExportSink::File || o.acked == o.committed, "{o:?}");
+            assert!(o.unverified <= o.records, "{o:?}");
+            assert!(o.state != SinkState::Off, "{o:?}");
+            assert!(o.retry_ms <= MAX_RETRY_MS, "{o:?}");
+        }
+        (Request::ExportSetup(s), Answer::ExportSetup(o)) => {
+            if s.syslog.as_ref().is_some_and(|y| y.pin_port) && !o.port_pinned {
+                assert!(
+                    o.fault == Some(SinkFault::Pin) && o.syslog == SinkState::Failed,
+                    "{o:?}"
+                );
+            }
+            assert_eq!(s.file.is_none(), o.file == SinkState::Off, "{o:?}");
+            assert_eq!(s.syslog.is_none(), o.syslog == SinkState::Off, "{o:?}");
+        }
         (req, answer) => panic!("{} accepted {answer:?}", req.name()),
     }
 }
@@ -160,8 +246,14 @@ fuzz_target!(|data: &[u8]| {
     }
     match msg {
         FromWorker::Hello(h) => {
+            // lot 276: the selector's low bit, the export worker's hello
+            let kind = if sel & 1 == 0 {
+                WorkerKind::Parse
+            } else {
+                WorkerKind::Export
+            };
             let want = Expected {
-                kind: WorkerKind::Parse,
+                kind,
                 pid: h.pid,
                 uid: h.sandbox.uid,
                 gid: h.sandbox.gid,
@@ -176,7 +268,12 @@ fuzz_target!(|data: &[u8]| {
                 let abi = want.kernel_landlock_abi.min(LANDLOCK_ABI_KNOWN);
                 assert_eq!(s.landlock_abi, abi);
                 assert!(abi < 1 || s.fs_denied, "{s:?}");
-                assert!(abi < 4 || s.net_denied, "{s:?}");
+                assert!(abi < 4 || kind == WorkerKind::Export || s.net_denied, "{s:?}");
+                assert!(
+                    s.fs_rules.iter().all(|r| kind.fs_rules().contains(&r.as_str())),
+                    "{s:?}"
+                );
+                assert!(abi > 0 || s.fs_rules.is_empty(), "{s:?}");
                 assert!(abi < 6 || s.scoped, "{s:?}");
             }
         }
