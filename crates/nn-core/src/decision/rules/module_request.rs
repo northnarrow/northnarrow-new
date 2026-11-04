@@ -590,12 +590,9 @@ impl Config {
             let text = read_bounded(&f).unwrap_or_default();
             // a trailing backslash continues the line
             let joined = text.replace("\\\n", " ");
+            // a comment (`#` first) is no `alias` or `softdep` line
             for line in joined.lines() {
-                // kmod: a line whose first word starts with `#` is a comment
                 let mut w = line.split_whitespace();
-                if w.clone().next().is_some_and(|t| t.starts_with('#')) {
-                    continue;
-                }
                 match w.next() {
                     Some("alias") => {
                         if let (Some(a), Some(m)) = (w.next(), w.next()) {
@@ -1441,6 +1438,39 @@ mod tests {
         ] {
             assert!(!assess(&t, &e).records(), "{e:?}");
         }
+    }
+
+    /// Bounded: an index larger than 32 MiB is not read, and one exec is
+    /// judged on 64 modules at most — past either, not vouched for.
+    #[test]
+    fn an_oversized_index_or_too_many_modules_is_not_vouched_for() {
+        let t = netfilter_host();
+        // a chain of 70 soft dependencies, each a packaged module
+        let mut rels = vec![NF, NFNL, CRC];
+        let names: Vec<String> = (0..70).map(|i| format!("kernel/s/s{i}.ko")).collect();
+        for (i, rel) in names.iter().enumerate() {
+            t.module(rel, &[], true);
+            if i + 1 < names.len() {
+                t.append(
+                    "etc/modprobe.d/chain.conf",
+                    &format!("softdep s{i} post: s{}\n", i + 1),
+                );
+            }
+        }
+        rels.extend(names.iter().map(String::as_str));
+        t.packaged("linux-modules-6.8.0-1-generic", &rels);
+        let a = assess(&t, &modprobe(&["s60"]));
+        assert!(a.records(), "10 modules: {a:?}");
+        let a = assess(&t, &modprobe(&["s0"]));
+        assert!(not_vouched(&a).contains("more than 64 modules"), "{a:?}");
+        // modules.dep past the bound (sparse: no 32 MiB written)
+        let dep = std::fs::File::options()
+            .write(true)
+            .open(t.path(&format!("lib/modules/{RELEASE}/modules.dep")))
+            .unwrap();
+        dep.set_len(MAX_INDEX_BYTES + 1).unwrap();
+        let a = assess(&t, &modprobe(&["nf_tables"]));
+        assert!(not_vouched(&a).contains("modules.dep"), "{a:?}");
     }
 
     /// R12b's shape, lot 279: the answer the exec pump made is the one R011

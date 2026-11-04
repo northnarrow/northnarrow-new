@@ -599,3 +599,33 @@ fn the_rules_fail_on_planted_violations() {
         .iter()
         .any(|m| m.contains("lineage.rs") && m.contains("lower the pin")));
 }
+
+/// Lot 279: the exec pump assesses what a module tool's exec loads (its
+/// module tree, configuration and package database read on the pump's
+/// thread), so R011 judges on that answer: the process_spawn pump's step
+/// is `spawn_assessed`, which calls `refresh` after the path's resolution.
+#[test]
+fn the_exec_pump_assesses_what_a_module_tool_loads() {
+    let mux = strip_comments(
+        &std::fs::read_to_string(repo_root().join("crates/nn-linux/src/sensors/multiplexer.rs"))
+            .unwrap(),
+    );
+    let pump = &mux[mux
+        .find("\"process_spawn\",\n")
+        .expect("the process_spawn pump")..];
+    let pump = &pump[..pump.find(")?),").expect("its end")];
+    assert!(
+        pump.contains("spawn_assessed(ModuleRequests::default())"),
+        "the process_spawn pump does not assess module tools' execs: {pump}"
+    );
+    let step = &mux[mux.find("fn spawn_assessed(").expect("spawn_assessed")..];
+    let step = &step[..step.find("\n}\n").expect("its end")];
+    let resolve = step
+        .find("resolved(raw, e)")
+        .expect("the path resolved first");
+    let refresh = step.find("requests.refresh(&e)").expect("then assessed");
+    assert!(
+        resolve < refresh,
+        "assessed before its path was resolved: {step}"
+    );
+}
