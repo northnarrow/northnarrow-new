@@ -5295,3 +5295,48 @@ number in parentheses is a lab PR.
     reached yet; the privileged test of a root dropper asserts the held
     record and was not run on a guest in this lot; EPG and EXECQ kill in
     OBSERVING only on their opt-ins.
+- **Lot 279 — R011 judges what a module tool's exec loads; the NET-006
+  listener test waits for both of its records (C14, C11; lot 275's lab and
+  the CI of #493).**
+  - What was open: R011 killed every exec of `insmod`, `modprobe` or `kmod`
+    that no package-manager actor ran and no kernel thread asked for, in
+    every posture (a kill from before Wave 4): the `modprobe` rootful
+    podman runs for its netfilter modules (lot 275's lab, Ubuntu 22.04: W5
+    rc 137, rootless rc 0), an administrator's `sudo modprobe dummy`, and
+    by the same rule the container runtimes', iptables' and kube-proxy's.
+    The privileged NET-006 listener test raced its own second record (the
+    CI of #493 on Ubuntu 22.04).
+  - What changed: the exec is judged on what it loads
+    (`crates/nn-core/src/decision/rules/module_request.rs`,
+    `kmod_invocation.rs`): the command line read as kmod reads it (the
+    multi-call binary's mode from `argv[0]`, getopt's permutation and long
+    prefixes), the names resolved as libkmod resolves them (configuration
+    aliases, `modules.dep`, `modules.symbols`, `modules.alias`, built-ins;
+    dependencies and soft dependencies), each file judged: in the running
+    kernel's tree, a regular file, installed by a package or built by DKMS
+    (no package database: listed in the kernel's `modules.order`),
+    `max(mtime, ctime)` not after its owner's last change (the package
+    database, DKMS's registry, the boot), signed while the kernel enforces
+    signatures (an uncompressed image's marker; a compressed one's is the
+    kernel's to check). Vouched for, or a query that inserts nothing: a High
+    record, no kill; anything else killed as before. The exec pump makes
+    the assessment on its thread (no process run there; R12b's shape) and
+    R011 reads it. R018, on the file the kernel reads, stays the backstop
+    for what the exec does not show (`MODPROBE_OPTIONS`, the binary
+    indexes). `OBSERVING_KILLS` unchanged: R011's match narrowed, no kill
+    added. The NET-006 test waits for as many records as listeners it
+    opened, then asserts exactly that many. No capability level moves.
+  - Decision (04/11/2026, the brief of lot 279): a module copied into
+    `/lib/modules/$(uname -r)/` and `modprobe`d, with or without `depmod`,
+    is killed (no package installed it; without `depmod` nothing resolves
+    it), and its load, if it lands first, is R018's kill of an unowned
+    module by an unexpected loader. No directive restores the kill of a
+    vouched-for load (`RULE_POLICY.md` §1).
+  - Lab: not run on a guest when this note was written.
+  - Open: a packaged module file overwritten in place and followed by any
+    package transaction passes the time check (FIM-008 sees the write; the
+    kernel's signature check refuses it when enforced); a host whose files'
+    ctimes are newer than its last package transaction (an SELinux relabel,
+    a restore) keeps the kill until its next transaction; on an RPM host an
+    out-of-tree module is killed until its first load was seen; the binary
+    indexes and `MODPROBE_OPTIONS` are not read (R018's).

@@ -219,6 +219,15 @@ const KNOWN: &[(&str, usize, &str)] = &[
          only for a file no pump asked about (the replay, the tests)",
     ),
     (
+        "crates/nn-core/src/decision/rules/module_request.rs",
+        15,
+        "lot 279: what a module tool's exec loads — the module tree's indexes, the \
+         configuration, the files' owners, times and signature marker — assessed by the exec \
+         pump on its thread (`ModuleRequests::refresh`); R011 reads its answer, and assesses \
+         itself, off the runtime's worker, only an exec no pump asked about (the replay, the \
+         tests)",
+    ),
+    (
         "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs",
         1,
         "R004 matches a `/proc/self/fd` path in the exec's string, no read",

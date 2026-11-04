@@ -148,6 +148,8 @@ pub const OBSERVING_KILLS: &[(&str, ObservingKill)] = {
         ("R006_ReverseShellTooling", BeforeWave4),
         ("R007_CryptoMiner", BeforeWave4),
         ("R010_BinaryInWebroot", BeforeWave4),
+        // Lot 279: the match narrowed to what no package vouches for (a
+        // vouched-for load is R011's own record); no kill added.
         ("R011_KernelModuleTooling", BeforeWave4),
         ("R012_SetcapTooling", BeforeWave4),
         ("R013_NamespaceEscapeTooling", BeforeWave4),

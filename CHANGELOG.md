@@ -621,6 +621,40 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- R011 judges what a kernel-module tool's exec loads, not the tool's name
+  (lot 279): it killed the `modprobe` rootful podman runs for its netfilter
+  modules (lot 275's lab, Ubuntu 22.04), and every `modprobe` of the
+  container runtimes, iptables and an administrator. An exec of the
+  system's tool (a file of `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`)
+  asking for module names that resolve, as kmod resolves them
+  (configuration aliases, `modules.dep`, `modules.symbols`,
+  `modules.alias`, built-ins; dependencies and soft dependencies), to files
+  of the running kernel's tree that a package installed or DKMS built (on a
+  host without a package database: the kernel's `modules.order`), none
+  changed since the package database's last change (`max(mtime, ctime)`;
+  DKMS: its registry's, the kernel's tree: the boot), each uncompressed one
+  signed while the kernel enforces signatures — or an invocation that
+  inserts nothing (`-r`, `-n`, `-D`, `-c`, `-R`, `kmod list`, `kmod
+  static-nodes`, kmod run as `lsmod`) — is a High record, T1547.006, not
+  killed. Killed as before: `insmod` of a file, `modprobe` of a path or a
+  `.ko*` name, `-C`, `-d`, `-S`, `--force*`, a name nothing resolves, a
+  module file outside the tree, a link, unowned (copied into the tree, even
+  after `depmod`), changed after its owner's last change or unsigned under
+  enforcement, a copy of the tool or another program of its name, an argv
+  the kernel did not read whole or the tool would refuse. The exec pump
+  assesses the exec on its own thread (`module_request`, no process run
+  there: an RPM host's ownership is the module-load pump's `rpm -qf`) and
+  R011 judges on its answer. What the exec does not show — the
+  environment's `MODPROBE_OPTIONS`, the binary indexes — can redirect a
+  vouched-for name to another file; that load is R018's, judged on the file
+  the kernel reads (shown by the privileged test: `MODPROBE_OPTIONS="-d
+  /tmp/…"` recorded by R011, killed by R018). `OBSERVING_KILLS` keeps R011
+  as a kill from before Wave 4: its match narrowed, no kill was added.
+- The privileged test `net_listener_on_uncommon_port_records_event` waits
+  for both NN-L-NET-006 records of its pid (lot 279): it found the 8443
+  twin's and counted before the 41999 one was appended (the CI of #493 on
+  Ubuntu 22.04). It waits for as many records as listeners it opened, then
+  asserts exactly that many, and checks each.
 - R009 no longer kills root automation run from a source tree outside
   COMBAT; an installer's trusted-installer window covers its own process
   tree (lot 278, the false positive of the review of #492, section f).

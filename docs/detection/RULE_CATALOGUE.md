@@ -267,15 +267,15 @@ Kernel-module tooling exec — category `persistence`.
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | unit+e2e+lab |
 
-**Observes.** The exec of `insmod`, `modprobe` or `kmod` whose parent is not a kernel thread (`PF_KTHREAD`, read by the sensor). A copy run from a staging directory is killed with its tree, the tool elsewhere alone.
+**Observes.** The exec of `insmod`, `modprobe` or `kmod` whose parent is not a kernel thread (`PF_KTHREAD`, read by the sensor), judged on what it loads (lot 279): the system's tool asked for module names that resolve, as kmod resolves them (configuration aliases, `modules.dep`, `modules.alias`, built-ins, soft dependencies), to files of the running kernel's tree that a package installed or DKMS built, unchanged since (`max(mtime, ctime)` against the package database's last change), signed when the kernel enforces signatures — or an invocation that inserts nothing (`-r`, `-n`, `-D`, `-c`, `kmod list`, `kmod static-nodes`) — is recorded. `insmod` of a file, `modprobe` of a path, `-C`/`-d`/`-S`/`--force`, a name nothing resolves, a module file no package installed or changed since, an argv not read whole: killed. A copy run from a staging directory is killed with its tree, the tool elsewhere alone.
 
-**Known false positives.** Kernel-driven loads (a kworker's modprobe at boot or hot-plug) are exempt. A root exec of the system's tool under a trusted actor of `process-comm-allowlist` (DKMS under apt or dpkg) is recorded, not killed; an administrator's manual `modprobe` is killed unless the tool itself is allowlisted.
+**Known false positives.** Kernel-driven loads (a kworker's modprobe at boot or hot-plug) are exempt. The container runtimes' and iptables' `modprobe` of the distribution's modules is recorded, not killed (lot 279), and so is a root exec of the system's tool under a trusted actor of `process-comm-allowlist` (DKMS under apt or dpkg). Killed still: an administrator's `insmod` of a built module, a `modprobe` of a module copied into the tree by hand, and every `modprobe` on a host whose module files changed after its last package transaction (an SELinux relabel, a restore from a backup) until the next transaction.
 
-**How to test.** `sudo modprobe dummy` (anti-tamper.sh case C16).
+**How to test.** `sudo modprobe dummy` (recorded; anti-tamper.sh case C16); `deploy/lab/malsim/kmod-check.sh` (the benign corpus recorded, the malicious shapes killed).
 
-**Tests.** `crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::fires_on_kmod_tooling`, `crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::kmod_tool_under_apt_is_recorded_not_killed`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::process_kernel_module_tooling_trips_r011`, `deploy/lab/adversarial/anti-tamper.sh::case C16`
+**Tests.** `crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::fires_on_kmod_tooling`, `crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::container_runtimes_modprobe_of_packaged_modules_is_recorded_not_killed`, `crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::what_no_package_vouches_for_is_still_killed`, `crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::kmod_tool_under_apt_is_recorded_not_killed`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::process_kernel_module_tooling_trips_r011`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::r011_records_a_packaged_modprobe_and_kills_an_insmod_from_tmp`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::r011_kills_a_module_copied_into_the_tree_and_r018_catches_what_argv_hides`, `deploy/lab/adversarial/anti-tamper.sh::case C16`
 
-**ATT&CK note.** The tool's exec, not the load itself (R018).
+**ATT&CK note.** The tool's exec, judged on what it asks to load; the load itself is R018's.
 
 ### R012_SetcapTooling
 

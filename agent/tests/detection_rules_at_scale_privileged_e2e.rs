@@ -765,6 +765,267 @@ fn process_kernel_module_tooling_trips_r011() {
     fx.wait_for_verdict("R011_KernelModuleTooling");
 }
 
+/// Lot 279: `rmmod` of the module on drop (the test loads it twice).
+struct Unload(&'static str);
+impl Drop for Unload {
+    fn drop(&mut self) {
+        let _ = Command::new("rmmod")
+            .arg(self.0)
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// The R011 record of `pid`, waited for.
+fn r011_record_of(fx: &Fixture, pid: u32) -> serde_json::Value {
+    common::wait_jsonl_row(
+        &fx.detections_log,
+        VERDICT_POLL_TIMEOUT,
+        "R011 record of the module tool",
+        |r| {
+            r["rule_id"] == "R011_KernelModuleTooling"
+                && r["principal"]["pid"].as_u64() == Some(u64::from(pid))
+        },
+    )
+}
+
+/// Lot 279 — R011 judges what the exec loads. The system's `modprobe` of a
+/// module of the running kernel's packaged tree (`dummy`, as anti-tamper
+/// C16) is recorded, High, no kill: the shape of the container runtimes'
+/// netfilter modprobe that R011 killed (lot 275's lab, W5 rootful podman on
+/// Ubuntu 22.04). An `insmod` of a copy of the same module in /tmp is
+/// killed (detect-only here: the record says what would run). Skipped,
+/// said so, where the kernel has no loadable `dummy`.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn r011_records_a_packaged_modprobe_and_kills_an_insmod_from_tmp() {
+    let ko = Command::new("modinfo")
+        .args(["-n", "dummy"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if ko.is_empty() || ko == "(builtin)" || !Path::new(&ko).is_file() {
+        eprintln!("no loadable dummy module on this kernel ({ko:?}): lot 279's e2e skipped");
+        return;
+    }
+    let _eni = EniIptablesGuard::install();
+    let fx = Fixture::setup(&[]);
+    let _unload = Unload("dummy");
+    let _ = Command::new("rmmod")
+        .arg("dummy")
+        .stderr(Stdio::null())
+        .status();
+
+    // The system's tool, by the path the container runtimes use.
+    let mut child = Command::new("/sbin/modprobe")
+        .arg("dummy")
+        .spawn()
+        .expect("spawn modprobe dummy");
+    let pid = child.id();
+    let status = child.wait().expect("wait modprobe");
+    assert!(status.success(), "modprobe dummy: {status}");
+    let rec = r011_record_of(&fx, pid);
+    assert_eq!(rec["severity"], "High", "record: {rec}");
+    assert_eq!(
+        rec["verdict"],
+        serde_json::json!({"Rule": "Log"}),
+        "record: {rec}"
+    );
+    assert_eq!(rec["response"], "none", "record: {rec}");
+    let _ = Command::new("rmmod")
+        .arg("dummy")
+        .stderr(Stdio::null())
+        .status();
+
+    // A copy of the module image in /tmp, loaded by file.
+    let dir = tempfile::Builder::new()
+        .prefix("nn-r011-")
+        .tempdir_in("/tmp")
+        .expect("tempdir in /tmp");
+    let name = Path::new(&ko).file_name().expect("module file name");
+    let copy = dir.path().join(name);
+    std::fs::copy(&ko, &copy).expect("copy the module image");
+    let mut child = Command::new("/sbin/insmod")
+        .arg(&copy)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn insmod");
+    let pid = child.id();
+    let _ = child.wait();
+    let rec = r011_record_of(&fx, pid);
+    assert_eq!(rec["severity"], "High", "record: {rec}");
+    assert_eq!(
+        rec["verdict"],
+        serde_json::json!({"Rule": "KillProcess"}),
+        "record: {rec}"
+    );
+    assert_eq!(rec["response"], "suppressed (detect-only)", "record: {rec}");
+}
+
+/// Lot 279: `depmod -a` again once the module copied into the running
+/// kernel's tree is removed (the guest's tree left as it was), and the
+/// staged tree in /tmp removed.
+struct TreeCopy {
+    file: PathBuf,
+}
+impl Drop for TreeCopy {
+    fn drop(&mut self) {
+        if self.file.exists() {
+            let _ = std::fs::remove_file(&self.file);
+        }
+        let _ = Command::new("depmod").arg("-a").status();
+    }
+}
+
+/// The R018 records of `pid` (the loader), waited for: at least one.
+fn r018_records_of(fx: &Fixture, pid: u32) -> Vec<serde_json::Value> {
+    let of = || -> Vec<serde_json::Value> {
+        common::records_of(&fx.detections_log, "R018_KernelModuleLoad")
+            .into_iter()
+            .filter(|r| r["principal"]["pid"].as_u64() == Some(u64::from(pid)))
+            .collect()
+    };
+    common::wait_until(VERDICT_POLL_TIMEOUT, || {
+        let v = of();
+        (!v.is_empty()).then_some(v)
+    })
+    .unwrap_or_else(|| panic!("no R018 record of loader {pid}: {:?}", of()))
+}
+
+/// `program args…` run with `env`, its pid and whether it succeeded.
+fn run_tool(program: &str, args: &[&str], env: &[(&str, &str)]) -> (u32, bool) {
+    let mut c = Command::new(program);
+    c.args(args).stdout(Stdio::null()).stderr(Stdio::null());
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    let mut child = c.spawn().unwrap_or_else(|e| panic!("spawn {program}: {e}"));
+    let pid = child.id();
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    (pid, ok)
+}
+
+/// Lot 279 — the malicious shapes the brief names, under the fixture's
+/// detect-only agent (each load lands; the records say what would run):
+///
+/// - a module copied into the running kernel's tree, `depmod -a`, then
+///   `modprobe`d: resolved, but no package installed it — R011 kills (and
+///   R018, on the load, kills the tree: an unowned module, an unexpected
+///   loader);
+/// - `modprobe -d <a tree in /tmp>`: R011 kills on the option alone;
+/// - the same tree through `MODPROBE_OPTIONS`, which the sensor does not
+///   see: R011 records (its argv is the packaged module's name) and R018
+///   kills the load from /tmp — the backstop the module doc of
+///   `module_request` names.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn r011_kills_a_module_copied_into_the_tree_and_r018_catches_what_argv_hides() {
+    let ko = Command::new("modinfo")
+        .args(["-n", "dummy"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if ko.is_empty() || ko == "(builtin)" || !Path::new(&ko).is_file() {
+        eprintln!("no loadable dummy module on this kernel ({ko:?}): lot 279's e2e skipped");
+        return;
+    }
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .expect("osrelease")
+        .trim()
+        .to_string();
+    let suffix = Path::new(&ko)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.split_once(".ko"))
+        .map(|(_, s)| format!(".ko{s}"))
+        .expect("a module image's suffix");
+    let _eni = EniIptablesGuard::install();
+    let fx = Fixture::setup(&[]);
+    let _unload = Unload("dummy");
+    let unload = || {
+        let _ = Command::new("rmmod")
+            .arg("dummy")
+            .stderr(Stdio::null())
+            .status();
+    };
+    unload();
+
+    // A module copied into the tree by hand, indexed by depmod.
+    let copy = PathBuf::from(format!(
+        "/lib/modules/{release}/extra/nn_k279_copied{suffix}"
+    ));
+    std::fs::create_dir_all(copy.parent().unwrap()).expect("mkdir extra");
+    let _tree = TreeCopy { file: copy.clone() };
+    std::fs::copy(&ko, &copy).expect("copy into the tree");
+    assert!(
+        Command::new("depmod")
+            .arg("-a")
+            .status()
+            .is_ok_and(|s| s.success()),
+        "depmod -a"
+    );
+    let (pid, _) = run_tool("/sbin/modprobe", &["nn_k279_copied"], &[]);
+    let rec = r011_record_of(&fx, pid);
+    assert_eq!(
+        rec["verdict"],
+        serde_json::json!({"Rule": "KillProcess"}),
+        "record: {rec}"
+    );
+    let r018 = r018_records_of(&fx, pid);
+    assert!(
+        r018.iter()
+            .any(|r| r["verdict"] == serde_json::json!({"Rule": "KillProcessTree"})),
+        "R018 kills the load of an unowned module by modprobe: {r018:?}"
+    );
+    unload();
+    drop(_tree);
+
+    // A tree staged in /tmp, named by the option, then by the environment.
+    let staged = tempfile::Builder::new()
+        .prefix("nn-k279-tree-")
+        .tempdir_in("/tmp")
+        .expect("tempdir in /tmp");
+    let root = staged.path().to_str().expect("utf-8 tempdir").to_string();
+    let dir = staged
+        .path()
+        .join(format!("lib/modules/{release}/kernel/drivers/net"));
+    std::fs::create_dir_all(&dir).expect("mkdir staged tree");
+    std::fs::copy(&ko, dir.join(format!("dummy{suffix}"))).expect("copy into the staged tree");
+    assert!(
+        Command::new("depmod")
+            .args(["-b", &root, &release])
+            .status()
+            .is_ok_and(|s| s.success()),
+        "depmod -b"
+    );
+    let (pid, _) = run_tool("/sbin/modprobe", &["-d", &root, "dummy"], &[]);
+    let rec = r011_record_of(&fx, pid);
+    assert_eq!(
+        rec["verdict"],
+        serde_json::json!({"Rule": "KillProcess"}),
+        "record: {rec}"
+    );
+    unload();
+    let opts = format!("-d {root}");
+    let (pid, _) = run_tool("/sbin/modprobe", &["dummy"], &[("MODPROBE_OPTIONS", &opts)]);
+    let rec = r011_record_of(&fx, pid);
+    assert_eq!(
+        rec["verdict"],
+        serde_json::json!({"Rule": "Log"}),
+        "the environment is not seen at the exec: {rec}"
+    );
+    let r018 = r018_records_of(&fx, pid);
+    assert!(
+        r018.iter().any(|r| r["severity"] == "Critical"
+            && r["verdict"] == serde_json::json!({"Rule": "KillProcessTree"})),
+        "R018 kills the load from the staged tree: {r018:?}"
+    );
+}
+
 /// R017 — shell binary from a non-standard path. Install a benign
 /// binary as `/usr/local/lib/nn-e2etest/bash` (comm == "bash"; outside
 /// every directory R017 exempts — `/usr/local/bin` is one since PROC-011),

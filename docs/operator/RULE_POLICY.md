@@ -86,6 +86,25 @@ copied to `/tmp` or a home (R017), and the module, capability and namespace
 tools (R011, R012, R013), run by root from there, are killed in every
 posture, as before.
 
+**R011 judges what is loaded (lot 279, 04/11/2026).** R011's kill existed
+before Wave 4 and stays in `OBSERVING_KILLS` below; lot 279 narrows its
+match and adds no kill. An exec of the system's module tool whose every
+module is vouched for — module names resolved, as kmod resolves them, to
+files of the running kernel's tree that a package installed or DKMS built,
+unchanged since the package database's last change, signed when the kernel
+enforces signatures — or that inserts no module, is a High record
+(T1547.006), not killed, in every posture. Everything else R011 matched is
+killed as before, in every posture: `insmod` of a file, `modprobe` of a path,
+a tree, configuration or kernel version of the caller's (`-d`, `-C`, `-S`),
+a forced load, a name nothing resolves, a module file no package installed
+or changed since. Why: the container runtimes, iptables and kube-proxy run
+`modprobe` of the distribution's netfilter, bridge and overlay modules (lot
+275's lab: rootful podman's network killed on Ubuntu 22.04). What is left:
+a load the exec does not show (the environment's `MODPROBE_OPTIONS`, the
+binary indexes) is judged at the load, by R018, on the file the kernel
+reads. No directive restores the kill of a vouched-for load: `enforce R011`
+runs R011's own response, which for it is the record.
+
 Inside an administrator's `sudo` session at a terminal, a package
 transaction or an installer's window (R009's Low record), those rules'
 kills of the same exec are held by the legacy ceiling (R009's record is the

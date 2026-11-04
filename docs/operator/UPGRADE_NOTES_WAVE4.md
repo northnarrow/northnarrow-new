@@ -41,7 +41,13 @@ has the details of each change below.
    test that expected the kill sees the record; `enforce R009` in the
    signed per-rule policy restores it in every posture
    (`RULE_POLICY.md` §1).
-8. **The first upgrade to this release** runs the scripts' windows through
+8. R011 no longer kills a `modprobe` of the distribution's modules (lot
+   279, §3): the container runtimes', iptables' and an administrator's
+   `modprobe` of a module a package installed is a High record. A dashboard
+   or a test that expected the kill of `sudo modprobe dummy` sees the
+   record; `insmod` of a file and `modprobe` of anything no package vouches
+   for are killed as before.
+9. **The first upgrade to this release** runs the scripts' windows through
    the installed nn-admin, the older one, which has no `--for-installer`:
    that upgrade's window names no installer. Below COMBAT nothing changes
    (the tree's `--version` is a High record, not killed); in COMBAT the
@@ -138,6 +144,21 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
 (`UPGRADE_NOTES_AUDIT_16f7563.md` §1).
 
 ## 3. Detections and evidence
+
+- **R011 judges what is loaded (lot 279).** An exec of `modprobe` (or
+  `insmod`, `kmod`) by the system's tool, of module names that resolve in
+  the running kernel's tree to files a package installed or DKMS built,
+  unchanged since the package database's last change, is recorded (High,
+  T1547.006, `response: none`), its reasoning naming each module, its file
+  and who installed it; a query that inserts nothing (`modprobe -r`, `-n`,
+  `kmod static-nodes`) too. Everything else is killed as before, the
+  reasoning saying why ("not vouched for: …"). On a host whose module files
+  changed after its last package transaction (an SELinux relabel, a restore
+  from a backup: their ctime is new) every `modprobe` is still killed until
+  the next package transaction. On an RPM host a module file counts as the
+  package's once its first load was seen (the module-load pump's `rpm -qf`);
+  before that an in-tree module is vouched for by the kernel's
+  `modules.order` and the boot, an out-of-tree one is killed.
 
 - **No more advisor detections.** An exec that no rule matches gets no
   detection (it was offered to the model when one was loaded). Rule

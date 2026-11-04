@@ -383,6 +383,14 @@ const STATICS: &[Kept] = &[
          database; bounded, asked again at every load)",
     ),
     kept(
+        "crates/nn-core/src/decision/rules/module_request.rs",
+        "REQUESTS",
+        HostFact,
+        "lot 279: what each exec of a kernel-module tool the exec pump read loads (its module \
+         names resolved in the running kernel's tree, their owners and times), which R011 judges \
+         the exec on (one host, one module tree; keyed by exec, bounded)",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/exe_identity.rs",
         "MOUNTS",
         HostFact,

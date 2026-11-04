@@ -23,7 +23,10 @@ pub mod epg;
 pub mod evasion;
 pub mod impact;
 pub mod iouring;
+/// Lot 279: what a module tool's exec asks for, and what it loads.
+pub mod kmod_invocation;
 pub mod module_provenance;
+pub mod module_request;
 pub mod net;
 pub mod net_fanout;
 mod r001_exec_from_tmp;
