@@ -1192,7 +1192,7 @@ Burst of renames to a new extension — category `impact_ransomware`.
 | [`NN-L-NET-021_SensorRecordFlood`](#nn-l-net-021_sensorrecordflood) | listen() or io_uring_setup() calls beyond the kernel's record budget | High | Log | T1685 |
 | [`NN-L-NET-026_ScanFanOut`](#nn-l-net-026_scanfanout) | Outbound connects to many hosts or ports (scan fan-out) | High | Log | T1046 |
 | [`NN-L-NET-027_OutboundAuthBruteforce`](#nn-l-net-027_outboundauthbruteforce) | Repeated outbound connects to authentication services (brute force) | High | Log | T1110 |
-| [`NN-L-NET-028_ConnectWithoutDns`](#nn-l-net-028_connectwithoutdns) | Connect to a public address the process's lineage did not resolve | Medium, Low | KillProcess, Log | T1071, T1105 |
+| [`NN-L-NET-028_ConnectWithoutDns`](#nn-l-net-028_connectwithoutdns) | Connect to a public address the process's lineage did not resolve | Medium, Low | Log | T1071, T1105 |
 
 ### NN-L-NET-001_OutboundToBlockedIp
 
@@ -1615,7 +1615,7 @@ Connect to a public address the process's lineage did not resolve — category `
 | | |
 |---|---|
 | Severity | Medium, Low |
-| Response | KillProcess, Log |
+| Response | Log |
 | ATT&CK | T1071 Application Layer Protocol (Command and Control); T1105 Ingress Tool Transfer (Command and Control) |
 | Sensor — data | network (TCP connect, DNS, flows, listeners) — DC0082 Network Connection Creation |
 | Validation | unit+lab |

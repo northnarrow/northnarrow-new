@@ -480,7 +480,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
     RuleDoc {
         id: "NN-L-NET-028_ConnectWithoutDns",
         severities: &[Severity::Medium, Severity::Low],
-        actions: &[ResponseAction::KillProcess, ResponseAction::Log],
+        // its kill held (`NODNS_KILL`) and its `enforce` refused: `Log`
+        actions: &[ResponseAction::Log],
         sensors: &[Sensor::Network],
         data_components: &["DC0082"],
         observes: "A TCP connect or a UDP send to a public address the DNS evidence does not \
