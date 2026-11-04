@@ -6,6 +6,26 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- CodeQL code scanning (lot codeql; C27, CI only, no product change):
+  `.github/workflows/codeql.yml`, an advanced setup (the repository's
+  default setup stays off). Every language of the tree — `rust` (the
+  workspace, `agent-ebpf`, the fuzz harness), `c-cpp` and `python` (the
+  lab's probes and helpers under `deploy/lab/`), `actions` (the workflows)
+  — analysed without a build (`build-mode: none`) with the
+  `security-extended` queries, on every pull request to `main`, every push
+  to `main` and weekly (Wednesday 03:37 UTC). The token reads the
+  repository; the `analyze` job alone also writes the code-scanning
+  results (`security-events: write`). Every action is pinned by commit SHA
+  (`github/codeql-action` v4.39.2, `1fc58d04…`). The Rust job installs the
+  pinned toolchains (with `rust-src`, and agent-ebpf's nightly), fetches
+  the three cargo projects from their lockfiles (`cargo fetch --locked`)
+  and fails if the extraction changed one. `xtask/tests/supply_chain.rs`:
+  `codeql_scans_every_language_of_the_tree` keeps the language list equal
+  to the languages of the tracked files (`the_codeql_language_of_a_file`)
+  and the triggers, suite, inputs, permissions and pins as they are, and
+  `every_workflow_token_is_read_only_unless_it_publishes` allows
+  `security-events: write` to that one job. `SECURITY.md` §Code scanning;
+  private vulnerability reporting is enabled (checked 2026-11-04).
 - The agent's threads each keep only their capabilities, its keys in one
   place, its unit hardened (lot 272, Wave 4 phase 2, R14c of the
   restructure plan, §3.1–§3.3; `docs/architecture/PROCESS_MODEL.md` §8–§10).

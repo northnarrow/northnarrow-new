@@ -5295,3 +5295,38 @@ number in parentheses is a lab PR.
     reached yet; the privileged test of a root dropper asserts the held
     record and was not run on a guest in this lot; EPG and EXECQ kill in
     OBSERVING only on their opt-ins.
+- **Lot codeql — CodeQL code scanning on every pull request, every push to
+  `main` and weekly (C27; CI only, no product change; no level changes).**
+  - What was open: no static analysis of the code ran on the repository.
+    Code scanning had never been set up (the API's default setup
+    `not-configured`, no analysis), so neither a pull request nor `main`
+    was checked for the dataflow and API-misuse classes CodeQL finds, in
+    the agent's Rust, the lab's C and Python, or the workflows themselves.
+  - What changed: `.github/workflows/codeql.yml`, an advanced setup (the
+    default setup stays off). The four languages GitHub detects in the tree
+    (`actions`, `c-cpp`, `python`, `rust`), each with `build-mode: none`,
+    with the `security-extended` suite. It runs on `pull_request` to `main`
+    (no path filter), on `push` to `main` and weekly. The token is
+    `contents: read`; the `analyze` job alone adds `security-events:
+    write`. `github/codeql-action` is pinned at v4.39.2 (`1fc58d04…`, the
+    commit of the annotated tag, head of `releases/v4`) and checkout at
+    ci.yml's SHA. The Rust job installs the toolchains the tree pins and
+    fetches the three cargo projects `--locked`, and fails if the
+    extraction changed a lockfile. `SECURITY.md` §Code scanning: an alert
+    is fixed or triaged in a pull request, never dismissed to make a run
+    pass. Private vulnerability reporting is enabled (checked 04/11).
+  - Evidence: `xtask/tests/supply_chain.rs`. The new
+    `codeql_scans_every_language_of_the_tree` derives the languages from
+    the tracked files and compares them with the matrix (a new language in
+    the tree, or one dropped from the scan, fails). It also checks the
+    triggers, the weekly cron, the suite, the inputs of init and analyze,
+    one pin for both, the permissions, the toolchain installs, the locked
+    fetches and the lockfile check of each tracked `rust-toolchain.toml`
+    and `Cargo.lock`, and that the step that frees disk space (it deletes
+    the CodeQL bundle) and any secret stay out. `the_codeql_language_of_a_file`
+    covers the extension map. The permission test allows one write:
+    `security-events` to `analyze`. 39 mutations of the workflow, each
+    failing a named test (after one survivor, agent-ebpf's toolchain
+    install dropped, got its assertion).
+  - Lab: no guest (CI only). The first runs are recorded below as
+    measured.

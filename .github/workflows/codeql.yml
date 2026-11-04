@@ -1,0 +1,104 @@
+# CodeQL code scanning (advanced setup; the repository's default setup is
+# off, and stays off: GitHub refuses the results of an advanced workflow
+# while it is on).
+#
+# Every language of the tree, each analysed without a build
+# (`build-mode: none`, generally available for Rust and C/C++ since
+# 2025-10-14): the Rust workspace, agent-ebpf and the fuzz harness; the
+# lab's C probes and Python helpers under deploy/lab/; and these workflows
+# (`actions`). The `security-extended` suite: the default queries and the
+# lower-precision security ones. On every pull request to main, every push
+# to main (the baseline a pull request's alerts are compared with), and
+# weekly, so a new query of a new CodeQL release runs on an unchanged main.
+# xtask/tests/supply_chain.rs keeps the language list equal to the
+# languages of the tracked files, and this file's triggers, suite and
+# permissions as they are.
+#
+# The results are alerts under Security → Code scanning. An alert is fixed
+# in the code or triaged in a PR; it is never dismissed to make a run green.
+name: CodeQL
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "37 3 * * 3" # Wednesday 03:37 UTC, apart from the nightly lab and CI runs
+
+# A newer push to a pull request supersedes its run; a push to main and the
+# weekly run each queue in a group of their own.
+concurrency:
+  group: codeql-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# External audit SUP-004: the token reads the repository and nothing else;
+# the analyze job alone may also write code-scanning results.
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # `security-events: write` uploads the SARIF of the analysis. A job
+    # that sets `permissions:` gets none of the others, so `contents: read`
+    # is restated for the checkout.
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+          - language: c-cpp
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: rust
+            build-mode: none
+
+    steps:
+      # SUP-004: the token is not left in .git/config, where the build
+      # scripts and proc-macros that rust-analyzer runs could read it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Rust only. The extractor runs rust-analyzer, which calls cargo in
+      # each cargo project of the tree (cargo metadata, then the build
+      # scripts and proc-macros). The toolchains are the ones the tree pins
+      # (SUP-015: rust-toolchain.toml, with rust-src for the standard
+      # library's sources; agent-ebpf's own nightly), installed here rather
+      # than by rustup on first use, and the dependencies are fetched from
+      # the committed lockfiles (SUP-016): cargo metadata is not --locked,
+      # and the last step checks that it changed none of them.
+      - name: Install the pinned Rust toolchains and fetch the locked dependencies
+        if: matrix.language == 'rust'
+        run: |
+          rustup toolchain install
+          rustup component add rust-src
+          (cd agent-ebpf && rustup toolchain install)
+          rustup show active-toolchain
+          cargo fetch --locked
+          (cd fuzz && cargo fetch --locked)
+          (cd agent-ebpf && cargo fetch --locked)
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        with:
+          category: "/language:${{ matrix.language }}"
+
+      - name: The lockfiles are unchanged
+        if: matrix.language == 'rust'
+        run: git diff --exit-code -- Cargo.lock fuzz/Cargo.lock agent-ebpf/Cargo.lock
