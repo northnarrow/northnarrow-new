@@ -351,6 +351,12 @@ const STATICS: &[Kept] = &[
         "lot 277: the start-in-cgroup tracker this boot attached (its pinned maps) or why not — one eBPF object per agent, read by the exemption check of every engine",
     ),
     kept(
+        "crates/nn-linux/src/cgroup_join.rs",
+        "PIN_DIR",
+        Kernel,
+        "lot 277 (the re-review of #494, R2): the tracker's pin directory this boot, named before the one eBPF object's load and read by its attach and the pins' registration",
+    ),
+    kept(
         "crates/nn-linux/src/anti_tamper/cgroup_guard.rs",
         "REGISTERED_UNITS",
         Kernel,
