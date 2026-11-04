@@ -5920,15 +5920,67 @@ number in parentheses is a lab PR.
     dies of SIGILL in the WHPX guest without `GNUTLS_CPUID_OVERRIDE=0x1`,
     set in both). `test-ignored` (every privileged test, as root): 89
     suites, 108 passed, 0 failed.
-  - Mutations: 67 on the new code (the counters' shared logic, the arm,
-    the transaction's refusal, the ladder's hold, NN-L-EVA-002's runtime
-    rule and its parent lookup, the process's own files), each caught by a
-    named test (four survivors of the first set and a compile error got
-    tests or were redone); the eBPF glue is covered
-    on the guest by `open-sensor-check`.
+  - The review of #500 (two blockers, three points; the coordinator's
+    decisions): files written new count whatever made them (`mknod`,
+    `O_TMPFILE` + `linkat`, a reopened read-only creation evaded
+    `FMODE_CREATED`); `PackageTamperRefusal` only for the file operations a
+    maintainer script does (an apt `Pre-Invoke` hook made any root
+    process's refused signal, ptrace, BPF handle or kexec ALERTED);
+    originals of any size that hold data, and one truncated then unlinked
+    (`OPEN_HAD_DATA`), count as destroyed; files under 4 KiB rewritten in
+    place count outside an authenticated session (`MASS_OVERWRITE_SMALL`;
+    inside one the 4 KiB floor of lab PR 127 stays); the replacement's
+    halves pair per cgroup too (the record carries the cgroup id); in
+    tracepoint mode `O_CREAT|O_EXCL` opens count again; `CNI-ADMIN` and
+    `KUBE-FIREWALL` are filter chains. Lab (as measured): Ubuntu 22.04,
+    `main` a97d5ff2 then the lot 6b8e60c7 on one guest — `ransom-check`
+    MS-23 with the three new variants (documents of about 2 KiB rewritten
+    in place without a rename; the same copied then deleted; an encryptor
+    and a separate deleter of one unit) 17 of 17 PASS on `main` (the lot's
+    scripts) and 17 of 17 on the lot, each variant ENGAGED on both (on the
+    lot the journal shows the arm raising each: the small-file crossing,
+    the replacement, the replacement paired in the unit's cgroup;
+    NN-L-IMP-001 none of them on either); the benign corpus again, 13
+    cases: no COMBAT, no NEUTRALIZE kill — podman rootful, rootless and big
+    no transition, sqlite none, `apt purge` ALERTED (PackageTamperRefusal);
+    ENGAGED by the arm only on true tree replacements (`npm ci`, `pip
+    install --force-reinstall`, a git checkout of another tree, `tar xf`
+    over the same tree) as in the round before the review; ENGAGED by other
+    triggers: docker (ExfiltrationPattern, dockerd's registry
+    connections), k3s (PersistenceMechanism; the rules' 43 kills, lot 283's
+    inventory), apt (CriticalFileModification during this round's upgrade,
+    open-vm-tools; dpkg's crossings exempt); the cold boot and bootcheck
+    (69 pins, 40 LSM programs); `verifier-check` 97 programs, 92 OK, 5 not
+    counted, 0 failing; `open-sensor-check` 22 of 22 PASS (its new cases:
+    files written new by `mknod`, `O_TMPFILE`, a reopened read-only
+    creation, one event each; 25 files of 1,000 bytes rewritten — one
+    small-file event — and unlinked — one burst; 25 originals truncated
+    then unlinked — one burst; an encryptor and a deleter of one unit —
+    both crossings in one cgroup, ConfirmedIntrusion); `test-ignored`
+    (every privileged test, as root) 91 suites, 121 passed, 0 failed. Ubuntu 24.04 (6.8.0-147, the lot): the cold boot and
+    bootcheck (73 pins, 42 LSM programs); `verifier-check` 97 programs, 95
+    OK, 2 not counted, 0 failing; `open-sensor-check` 22 of 22 PASS (a
+    first run 21 of 22: the O_TMPFILE case's own script linked the `/proc`
+    symlink, EXDEV, and was fixed); MS-23 17 of 17 PASS. The cost per call
+    and the maps' memory (5.15, `main` → the lot, ns: a creation's
+    `file_open` 516 → 1,568, an unlink 270 → 1,147, a rename onto a file
+    2,728 → 5,657, a chmod 115 → 351; about 5.1 MB of maps on 6.8) are in
+    the design's §10.6.
+  - Mutations: 98 on the new code (67 before the review — the counters'
+    shared logic, the arm, the transaction's refusal, the ladder's hold,
+    NN-L-EVA-002's runtime rule and its parent lookup, the process's own
+    files —, 31 after it — `write_kind`, the small-file crossing and its
+    count, an original destroyed, the cgroup pairing, the session gate,
+    tracepoint mode, the refused operations, IMP-001's shape (a), the
+    filter chains, the decoder), each caught by a named test (four
+    survivors of the first set and a compile error got tests or were
+    redone); the eBPF glue is covered on the guest by `open-sensor-check`.
   - Open: corroboration is per actor scope, not per process tree (future
     work); copy-then-delete ransomware run from an SSH shell is the
-    ransomware tracker's, not the mass-write arm's (as before);
+    ransomware tracker's, not the mass-write arm's (as before); what
+    neither sees — originals deleted more than a minute after the copies,
+    a deleter in another cgroup or forked once per file, writers forked
+    per file, tracepoint mode — is listed in the design's §10.5;
     kube-proxy, Calico and Cilium flush their chains from containers (no
     host package vouches for them): their flushes stay records.
   - No capability level moves.

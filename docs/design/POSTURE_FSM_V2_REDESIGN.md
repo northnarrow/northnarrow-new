@@ -941,9 +941,36 @@ value 8). Per call, a write-open of a regular file now looks its file up in
 `OPEN_CREATED`; an unlink, or a rename onto an existing name, reads the
 inode's key and looks it up in `OPEN_CREATED` (and, for an empty file, in
 `OPEN_HAD_DATA`), then its name in `OPEN_DESTROY_SEEN`; a setattr of a
-regular file that holds data inserts into `OPEN_HAD_DATA`. What that
-costs, and the memory the maps lock, as measured: the lab note of lot 282
-in `docs/roadmap/CAPABILITY_PROGRAM.md`.
+regular file that holds data inserts into `OPEN_HAD_DATA`. Measured on our
+own lab guests (4 vCPU, QEMU; the kernel's BPF statistics on for the bench
+only, `run_time_ns / run_cnt` of each program over 20,000 operations on
+files of 1 KiB; `main` a97d5ff2 against the lot on the same Ubuntu 22.04
+guest, 5.15):
+
+| operation (program) | `main`, ns a call | the lot, ns a call | the bench's operation, `main` → the lot |
+|---|---:|---:|---|
+| a file created (`fim_file_open_sensor`) | 516 | 1,568 | 27.2 → 31.3 µs |
+| an existing file rewritten, again (`fim_file_open_sensor`) | 320 | 347 | 3.26 → 3.16 µs |
+| an unlink (`fim_unlink_observe`) | 270 | 1,147 | 8.9 → 10.1 µs |
+| a rename onto an existing file (`fim_rename_observe`) | 2,728 | 5,657 | 102 → 115 µs |
+| a chmod (`fim_setattr_observe`) | 115 | 351 | 2.13 → 2.35 µs |
+
+`main`'s unlink of a file under 4 KiB returned at the size check; the lot
+counts it. On Ubuntu 24.04 (6.8, the lot only): 1,859, 664, 1,990, 7,342
+and 916 ns. Memory, as 6.8 accounts it (`bpftool map show`, `memlock`):
+1,573,952 bytes for each map of 16,384 entries and 361,536 for
+`OPEN_HAD_DATA` — about 5.1 MB together (5.15 reports page estimates, 512
+KiB and 96 KiB). The LRU lists are the maps' common ones; a per-CPU list
+(`BPF_F_NO_COMMON_LRU`) would take the lock off a creation burst's path,
+not evaluated here. The verifier: on 5.15 `fim_file_open_sensor` 4,379
+instructions, `fim_unlink_observe` 2,360, `fim_rename_observe` 6,270,
+`fim_setattr_observe` 1,008; on 6.8 the same, with 104,758, 9,038, 129,370
+and 1,220 instructions verified; every program loads on both. The
+variants of the review — small documents encrypted in place, small
+documents copied then deleted, an encryptor whose originals another
+process of its unit deletes — reach ENGAGED on `main` and on the lot
+(`ransom-check`, MS-23): on the lot the arm raises each (the small-file
+crossing, the replacement, the replacement paired in the unit's cgroup).
 
 ---
 
