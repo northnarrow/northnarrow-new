@@ -15,11 +15,17 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 [[ $(id -u) -eq 0 ]] || { echo "prog-cost: run as root" >&2; exit 2; }
 command -v bpftool >/dev/null || { echo "prog-cost: no bpftool" >&2; exit 2; }
 if [[ $# -gt 0 ]]; then PREFIXES="$*"; else PREFIXES="dns_answer inbound_accept tls_client_hel"; fi
-WORK=$(mktemp -d)
+# As run.sh: a fresh root-only work directory, the binary root-owned in a
+# root-owned tree — an image run from /tmp, /var/tmp or a user's home is
+# what R001, R003 and R009 kill (the lab's first round: every workload
+# killed under the agent).
+WORK=$(mktemp -d /var/tmp/nn-bench.XXXXXXXX)
+BIN=/usr/local/libexec/nn-lab/nn-bench-cost
 before=$(sysctl -n kernel.bpf_stats_enabled)
 cleanup() { sysctl -qw kernel.bpf_stats_enabled="$before"; rm -rf "$WORK"; }
 trap cleanup EXIT
-cc -O2 -o "$WORK/nn-bench" "$HERE/nn-bench.c" || exit 2
+mkdir -p /usr/local/libexec/nn-lab
+cc -O2 -o "$BIN" "$HERE/nn-bench.c" || exit 2
 sysctl -qw kernel.bpf_stats_enabled=1
 snap() {
     bpftool prog show -j | PREFIXES="$PREFIXES" python3 -I -c '
@@ -36,7 +42,7 @@ printf '%-9s %-16s %10s %10s\n' workload program calls ns/call
 for w in "udprecv 200000" "udp 200000" "tcpsend 200000" "connect 20000"; do
     set -- $w
     a=$(snap)
-    "$WORK/nn-bench" "$1" "$2" "$WORK" >/dev/null || echo "prog-cost: $1 failed" >&2
+    "$BIN" "$1" "$2" "$WORK" >/dev/null || echo "prog-cost: $1 failed" >&2
     b=$(snap)
     python3 -I - "$1" <<PY
 import sys
