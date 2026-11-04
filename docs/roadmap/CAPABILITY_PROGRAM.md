@@ -5852,8 +5852,9 @@ number in parentheses is a lab PR.
     heartbeat's pull (lot 270); a SIEM had no record of the agent's, and
     no way to check one against the chains.
   - What changed: a signed `export.local` (overlay kind 17,
-    `config-manage`, next start) turns on the export of the five chains
-    (detections, actions, fim_drift, netflow, canary_access) as OCSF 1.9.0
+    `config-manage`, next start) turns on the export of the chains it
+    names — the detections and the actions by default, fim_drift, netflow
+    and canary_access each opt-in (the review of #499, D6) — as OCSF 1.9.0
     records — Detection Finding (2004, with Process Activity 1007 for an
     exec detection), Remediation 7001–7004 from the actions chain's intent
     and outcome rows (one `correlation_uid`), File System Activity (1001),
@@ -5991,6 +5992,110 @@ number in parentheses is a lab PR.
     each an exception in `.cargo/audit.toml` with why it is not reached
     and the test that holds it (EXPORT.md §7); licences all permissive
     (Apache-2.0, MIT, ISC).
+  - Review of #499 (independent, at 096483b8: one blocker, eight points
+    to fix), each closed in the code with its test:
+    - X1, the blocker: a read inside a chain's rotation window (the
+      terminator appended to the active file, the archive not yet renamed)
+      took the cursor for one "ahead" and went back to the chain's oldest
+      file — the honest worker's answer then a violation (killed), or the
+      whole chain exported again, and `cursor_ahead` notes signed for
+      nothing. The read now waits for the rename.
+    - D1: `nn-admin export verify` maps each row again and compares the
+      record (a record with its OCSF fields rewritten is `TAMPERED`, exit
+      13); the export worker runs as an account of its own,
+      `northnarrow-export`, the only one that writes the export's
+      directory (the parse worker's account cannot). D2: the core carries
+      the terminator a read saw to the next row; a rotation without it is
+      `BROKEN` (exit 11). D3: a blank line, or a row no request can carry,
+      is lost, counted in stage 8 and signed, never retried forever; a
+      request the core refused itself leaves the worker's window as it
+      was. D4: the export says `failed` when its controller does not run
+      and `degraded` when its worker is disabled, unavailable or away past
+      30 s — never `on` — in the status, the beat (with the worker's
+      health; DEGRADED) and the manifest. D5: the worker's files are
+      bounded (`RLIMIT_FSIZE`, `SIGXFSZ` ignored; 4 GiB in all in the
+      signed text; the core measures the directory every second and kills
+      a worker past it or writing a name the sink does not write). D6: by
+      default the detections and the actions only, the flows, the file
+      drift and the canary reads each opt-in; `EXPORT.md` §1a lists every
+      field that leaves, chain by chain; README and C25 say nothing leaves
+      unless the operator signs the export. D7: an X25519 of our own
+      refuses an all-zero shared secret (RFC 8446 §7.4.2; the provider's
+      does not); `EXPORT.md` §7 quotes the provider's upstream warning
+      ("DO NOT USE IN PRODUCTION") and what the export holds against it.
+      D8: the sink's files 0600 whatever the umask, and the wait of a sink
+      down or failed (200 ms at least), each with a test. N3 (a comment
+      citing a TLS 1.2 test that did not exist), N13 (the receiver's
+      requirement, TLS 1.3 with X25519, documented); the provider's
+      webpki test reads the lockfile and the registry (CI's test job has
+      no offline `cargo metadata`). The xtask guards of the gates found
+      three forms to fix: the sink's file name in nn-proto (the core
+      names no worker-side module), nn-export's sinks opt-in, nn-admin →
+      nn-export in the module map.
+    - Found by the lab's round 5, fixed: with no row to send, the
+      controller no longer polled the worker (the D3 change), so a syslog
+      sink's rows stayed in flight, unacknowledged, though every one had
+      arrived (`caught-up` FAIL on both guests); the poll is back, a
+      tested function (bd1639ac).
+    - Mutations, run 5 (30 on the review's fixes, 196bbd35): 29 caught,
+      each by a named test; MC8 (netflow in the default chains) survived —
+      its test compared with the constant itself —, now a test names the
+      detections and the actions literally.
+    - Lab, rounds 5 to 9 (the review's phases: a chain rotated under the
+      export; `nn-admin export verify` on a rewritten record, a cut tail
+      and an empty capture; the worker killed until disabled), our guests
+      under lease k276, the agent installed as an operator does and
+      uninstalled at the end:
+      - Round 5 (196bbd35), Ubuntu 26.04 and Debian 12: the worker as
+        `northnarrow-export`, its directory its account's alone; every
+        chain row in the capture and in the files (120 and 57 rows), none
+        missing, none other, every record verified; the netflow chain
+        rotated under the export (0 → 1 archive, in 18 s and 51 s): 23,144
+        and 23,258 rows, none missing, none other, the capture verified
+        across the rotation, no `cursor_ahead` note; `TAMPERED` (exit 13)
+        for a rewritten record, `BROKEN` (11) for a cut tail without its
+        terminator, `EMPTY` (2) for an empty capture. `caught-up` failed
+        on both: the poll above.
+      - Round 6 (ceae04f0, the poll back), Ubuntu 26.04: all of the above
+        passed, both sinks caught up (67 rows; 23,272 across the rotation
+        of 21 s). Its Debian 12 did not boot (the host's WSL,
+        `UtilAcceptVsock` at the guest's start; nothing ran).
+      - Round 7 (abd82e59, the merge with lot 275), Debian 12: setup,
+        arrive (111 rows), the rotation (0 → 1 archive in 29 s; 23,769
+        rows) and verify's `TAMPERED`, `BROKEN` and `EMPTY` all passed,
+        both sinks caught up, no `cursor_ahead` note.
+      - The phase that killed the worker from the guest script until the
+        supervisor disabled it (D4) measured nothing in rounds 5 to 7: the
+        script ended at its first kill. Round 7's probe found why: that
+        root `kill -9` of the protected worker was refused in the kernel
+        (`task_kill`), signed (NN-L-AT-001, High, posture Combat) and
+        answered by the COMBAT ladder — `BlockOutbound`, then
+        `KillProcessTree` of the sender, the script itself (systemd:
+        killed, signal 9). The product's protection, the lab's method:
+        replaced by the phase `protected`, one root kill from a transient
+        unit of its own, which the ladder ends instead of the script.
+        Round 8 (Debian 12) ran it: the kill refused, the worker untouched,
+        the export on with its worker ready, the attempt signed for the
+        sender and the sender killed by the ladder (its two checks of
+        those last facts failed on the script's reading of the sender's
+        pid — systemd expands `$` itself —, the probe's rows showed both);
+        round 9 (11950df9, the pid read through systemd's `$$`): 17 of 17
+        (the setup's 12 and the 5 of `protected`: the worker's pid
+        unchanged, NN-L-AT-001 signed for the sender, `KillProcessTree`
+        of it, success). The degraded state is the unit tests' (the
+        controller's, the beat's; mutations ME1–ME4 caught).
+    - The merge with `main` a97d5ff2 (#495, lot 275): the export's
+      overlay is kind 17 (lot 275's `nodns-allow` is 16), the IPC's
+      version 4 (lot 275's 3, then the export's requests and the hello's
+      filesystem rules), each beat carries `nodns` and `export`. Lot 275
+      writes inbound connections to the netflow chain (`"inbound": true`,
+      the peer as the source): their OCSF records are Inbound, with
+      OCSF's `bytes_out` the bytes the host received (`EXPORT.md` §3, the
+      mapping's test and the end-to-end test's writer with one inbound row
+      in ten; 4 mutations, each caught by the mapping's test). NN-L-NET-028
+      judges the worker's connect to a receiver at a public address (by
+      address, never a name): `EXPORT.md` says to list it in
+      `nodns-allow.local`.
   - Level: C21 0 → 1. A signed, verifiable export of the detections and
     the other chains to a file and a SIEM's syslog, off by default,
     measured on two kernels (one with the pin, one without); not 2: no
@@ -6002,5 +6107,8 @@ number in parentheses is a lab PR.
     Landlock pins the receiver's port, not its address, and nothing below
     ABI 4 (a per-role `socket_connect` pin in the BPF LSM would); the
     worker's flows to its receiver are judged by the network rules like
-    any process's; the audit log, the status events and the heartbeat are
-    not exported.
+    any process's (NN-L-NET-028 on a receiver at a public address: list it
+    in `nodns-allow.local`); the degraded state has no lab phase (a root
+    kill of the worker is a tamper attempt: a debug trigger for the export
+    worker's faults would give one); the audit log, the status events and
+    the heartbeat are not exported.

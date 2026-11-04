@@ -44,10 +44,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The supervisor's pass no longer waits on a worker's long request; the
   IPC's version is 4 (after lot 275's 3); the fuzz target `ipc_check`
   covers the export's answers. After its independent review (#499): a
-  read inside a chain's
-  rotation window waits for the rename (it went "ahead" and back to the
-  chain's oldest file); `nn-admin export verify` maps each row again and
-  refuses a record whose OCSF fields were rewritten, and a rotation
+  read inside a chain's rotation window waits for the rename (it went
+  "ahead" and back to the chain's oldest file); `nn-admin export verify`
+  maps each row again and refuses a record whose OCSF fields were
+  rewritten, and a rotation
   without its terminator (`BROKEN`); the export worker runs as an account
   of its own, `northnarrow-export`, the only one that writes the export's
   directory; a blank line, or any row a request cannot carry, is lost,
@@ -57,7 +57,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   the directory measured by the core); by default only the detections and
   the actions are exported, the flows, file drift and canary reads each
   opt-in (`EXPORT.md` §1a lists every field that leaves); X25519 refuses
-  a shared secret of all zeros; the sink's files are 0600.
+  a shared secret of all zeros; the sink's files are 0600. Lot 275's
+  inbound connections in the netflow chain are exported as Inbound flows
+  (the peer as the source, OCSF's bytes out the bytes the host received).
 - Network telemetry, level 2 of C07 (lot 275,
   `docs/operator/NETWORK_TELEMETRY.md`): three new sources of the bus,
   each with its sensor-contract entry, its attach state in the signed
