@@ -1387,6 +1387,17 @@ mod tests {
             assess(&t, &modprobe(&["-a", "nft-expr-counter", "nft_compat"])),
             Assessment::Vouched(_)
         ));
+        // a built-in whose soft dependency is a module file: that file is
+        // loaded, so the request inserts something (judged, vouched)
+        t.write(
+            "etc/modprobe.d/s.conf",
+            "softdep nf_tables post: nft_compat\n",
+        );
+        let a = assess(&t, &modprobe(&["nft-expr-counter"]));
+        assert!(
+            matches!(&a, Assessment::Vouched(w) if w.contains("nft_compat")),
+            "{a:?}"
+        );
     }
 
     #[test]
