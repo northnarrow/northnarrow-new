@@ -2824,6 +2824,25 @@ fn an_upgrade_keeps_the_tracker_and_an_uninstall_removes_it() {
     let fns = ["tracker_pin_dirs", "pins_present", "remove_pins"]
         .map(|f| shell_fn("deploy/uninstall.sh", f))
         .join("\n");
+    let listed = run("uninstall.sh", &format!("{fns}\ntracker_pin_dirs"));
+    assert_eq!(
+        listed.lines().collect::<Vec<_>>(),
+        [
+            dir.join("pins-cgroup-join-v1-64").display().to_string(),
+            dir.join("pins-cgroup-join-v2-262144").display().to_string(),
+        ],
+        "the tracker's directories, beside the root"
+    );
+    // with the root already gone, the tracker's directories alone are pins
+    fs::rename(dir.join("pins"), dir.join("pins-moved-away")).unwrap();
+    assert_eq!(
+        run(
+            "uninstall.sh",
+            &format!("{fns}\npins_present && echo present")
+        ),
+        "present"
+    );
+    fs::rename(dir.join("pins-moved-away"), dir.join("pins")).unwrap();
     assert_eq!(
         run(
             "uninstall.sh",
@@ -2831,6 +2850,13 @@ fn an_upgrade_keeps_the_tracker_and_an_uninstall_removes_it() {
         ),
         "present\ngone"
     );
+    for d in [
+        "pins",
+        "pins-cgroup-join-v1-64",
+        "pins-cgroup-join-v2-262144",
+    ] {
+        assert!(!dir.join(d).exists(), "{d} left by the uninstall");
+    }
     assert!(
         dir.join("pins-other").exists(),
         "only the tracker's directories"
