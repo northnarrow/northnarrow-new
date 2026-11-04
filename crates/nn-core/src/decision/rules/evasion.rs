@@ -342,23 +342,25 @@ mod tests {
             &["/bin/sh", "/usr/lib/ufw/ufw-init", "force-stop"],
             at(601, 0),
         ));
-        for pid in 602..632 {
-            verdicts.extend(run(
+        // Lot 282: ufw-init's flushes of its own chains (`-F ufw-user-input`)
+        // flush one user-defined chain each — no switch-off, no finding,
+        // nothing counted; its flushes of whole tables (MANAGE_BUILTINS)
+        // are, and they coalesce.
+        for pid in 560..590 {
+            assert!(run(
                 pid,
                 601,
                 ipt,
                 &["iptables", "-F", "ufw-user-input"],
-                at(pid, 1),
-            ));
+                at(pid, 1)
+            )
+            .is_none());
+        }
+        for pid in 602..632 {
+            verdicts.extend(run(pid, 601, ipt, &["iptables", "-F"], at(pid, 1)));
         }
         for pid in 632..642 {
-            verdicts.extend(run(
-                pid,
-                601,
-                ipt,
-                &["ip6tables", "-F", "ufw6-user-input"],
-                at(pid, 2),
-            ));
+            verdicts.extend(run(pid, 601, ipt, &["ip6tables", "-F"], at(pid, 2)));
         }
         for pid in 642..645 {
             verdicts.extend(run(

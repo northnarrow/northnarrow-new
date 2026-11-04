@@ -2085,7 +2085,7 @@ Security tool switched off by its own command — category `defense_impairment`.
 
 **Observes.** A listed tool switched off by its own command: `auditctl -e 0` and `-D`, `ufw disable`, `setenforce 0`, `nft flush ruleset`, `iptables -F` (every chain of a table, or a built-in one), `aa-teardown`, cloud-agent uninstallers.
 
-**Known false positives.** As NN-L-EVA-001. One record per command and process tree (the children of one parent) within 10 s: `ufw disable` runs dozens of `iptables -F` through `ufw-init`; the repeats are counted (`detections_held`, the next record's `suppressed_before`), never on the kill path. Lot 282: a flush of one user-defined chain (`iptables -t nat -F CNI-HOSTPORT-…`, podman's network setup at a host's first run) switches nothing off and is not recorded.
+**Known false positives.** As NN-L-EVA-001. One record per command and process tree (the children of one parent) within 10 s: `ufw disable` runs dozens of `iptables` calls through `ufw-init`; the repeats are counted (`detections_held`, the next record's `suppressed_before`), never on the kill path. Lot 282: a flush of one user-defined chain (`iptables -t nat -F CNI-HOSTPORT-…`, podman's network setup at a host's first run) switches nothing off and is not recorded.
 
 **How to test.** `ransom-check.sh` MS-25: `auditctl -e 0`, `ufw disable`.
 

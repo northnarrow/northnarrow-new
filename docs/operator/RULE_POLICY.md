@@ -96,7 +96,7 @@ transaction before lot 278.
 where the kills above wait, and where the ladder's NEUTRALIZE kills the
 offender's process tree; on `main` before lot 282 a host's first `podman
 pull` and an `apt purge` reached it. Since lot 282
-([POSTURE_FSM_V2_REDESIGN.md](../design/POSTURE_FSM_V2_REDESIGN.md) §10):
+([the posture design, §10](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/POSTURE_FSM_V2_REDESIGN.md)):
 - the posture's mass-write signal counts distinct existing files rewritten
   in place, or destroyed (unlinked, or replaced by a rename) by a process
   that also created files — never files created alone (an image pulled, a

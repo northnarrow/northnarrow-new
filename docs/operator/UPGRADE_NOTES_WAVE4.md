@@ -216,7 +216,7 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
 - **The mass-write signal counts files destroyed, not writes; a package
   transaction's refusal no longer brings COMBAT; no kill on one heuristic
   (lot 282).** What you see change
-  ([POSTURE_FSM_V2_REDESIGN.md](../design/POSTURE_FSM_V2_REDESIGN.md) §10):
+  ([the posture design, §10](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/POSTURE_FSM_V2_REDESIGN.md)):
   - fewer `ConfirmedIntrusion` transitions: image pulls, package and build
     tools, clones and databases no longer raise it (an image pull on a
     fresh host reached COMBAT, and the ladder killed podman);
