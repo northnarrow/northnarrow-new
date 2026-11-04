@@ -12,8 +12,9 @@
 #
 # Benign (lot 279: no R011 kill expected):
 #   B1 iptables-legacy  `iptables-legacy -L` with ip_tables not loaded (libxtables' modprobe)
-#   B2 podman           rootful: a network created, a container on it with a published
-#                       port; rootless: a container with a published port
+#   B2 podman           rootful: a container with a published port on the default
+#                       network, then on a network created for it; rootless: a
+#                       container with a published port
 #   B3 docker           the distribution's docker.io: the daemon's start, a container with a
 #                       published port
 #   B4 k3s              k3s with kube-proxy in ipvs mode, until its node is Ready
@@ -143,6 +144,11 @@ if want B2 && [[ $online -eq 1 ]]; then
         apt_in podman && ours=1 && echo "INFO podman installed ($(podman --version 2>/dev/null))"
     fi
     if command -v podman >/dev/null; then
+        # lot 275's W5: rootful podman's default network (its modprobe killed)
+        measure B2 benign "podman rootful: run -p (the default network)" -- \
+            sudo timeout 180 podman run --rm -p 127.0.0.1:18278:80 docker.io/library/alpine:3.20 true
+        # podman 3.4 (Ubuntu 22.04) writes a CNI 1.0.0 file its firewall
+        # plugin refuses: this one fails there whatever the agent does
         measure B2 benign "podman rootful: network create, run -p on it" -- bash -c '
             sudo podman network create nnk279 &&
             sudo timeout 180 podman run --rm --network nnk279 -p 127.0.0.1:18279:80 docker.io/library/alpine:3.20 true;
