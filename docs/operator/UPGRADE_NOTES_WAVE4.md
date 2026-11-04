@@ -472,6 +472,24 @@ others. What an operator sees change:
     drop-in of the agent's units inside a window (a copy, `systemctl
     edit`) is a Low record of NN-L-FIM-009; before this release the rule
     killed the writer even inside a window.
-  - A package upgrade (`.deb`, `.rpm`) does not run the check: an existing
-    drop-in is left in place (the round does not move it) and reported by
-    the integrity round as a drop-in of our units.
+  - **Settings of the agent (`NN_` variables) in its units' drop-ins are
+    configuration, kept.** Write such a drop-in inside a trusted-installer
+    window (outside one the directories refuse it), `systemctl
+    daemon-reload`, restart the agent inside the window. The window's
+    close keeps it and write-protects it; the agent signs each `NN_`
+    setting it finds (`own_dropin_setting`, with the name, the value and
+    the drop-in), and a switch that weakens it — `NN_ANTI_TAMPER_ALLOW_DEGRADED`,
+    `NN_AUDIT_ALLOW_UNWRITABLE`, `NN_DETECT_ONLY`, a sensor back to its
+    fallback (`NN_FILE_OPEN_SENSOR=tracepoint`, `NN_EXEC_SENSOR=tracepoint`,
+    `NN_DNS_SENSOR=sendmsg`), `NN_EXEC_POLICY=off`, the others the agent's
+    own start flags — is a High `own_dropin_weakening`. `install.sh`
+    lists them as kept configuration and never refuses for them. A loader
+    variable (`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`) stays harmful:
+    the drop-in is quarantined, and so is one that sets an `NN_` variable
+    beside something harmful.
+  - A package install or upgrade (`.deb`, `.rpm`) runs the check as a
+    warning only: its configure step names each drop-in the agent judges
+    harmful and moves nothing (a package hook never fails on it). The
+    agent's integrity round leaves such a drop-in from before the install
+    in place and reports it, signed (`own_dropin_preinstall_harmful`):
+    remove it, or move it out inside a trusted-installer window.

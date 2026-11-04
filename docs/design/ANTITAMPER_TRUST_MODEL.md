@@ -1359,7 +1359,38 @@ precision its first judge of the host's drop-ins lacked.
     (`is_own_unit_dropin`: `<unit dir>/<one of our four .d
     directories>/<name>.conf`, one level, no `.`): inside an open window a
     Log/Low, judged at the close; outside one, or another unit's drop-in,
-    still a kill.
+    still a kill. The short re-check of #497: the rule reads the window
+    when it runs (`is_active_at(now)`), not at the event (NB4) — an event
+    queued past the close kills a writer the window allowed, and one just
+    before the opening is a Log — the same as for our unit files. The
+    exemption covers the vendor directory too (`/usr/lib/systemd/system/
+    <ours>.d/`, NB3): there the close and the round cannot move anything
+    (`ProtectSystem=strict` keeps `/usr` read-only to the agent: signed
+    `own_dropin_not_moved`), and that directory is not NOCREATE (the
+    package's own) — a drop-in written there inside a window stays.
+  - **The short re-check of #497.** A harmful drop-in from before the
+    install — a package's configure step runs the check only as a warning
+    (`install.sh --package-configure`) — is never moved by the round, and
+    each one is now a signed `own_dropin_preinstall_harmful` with the
+    remedy (RB1). Without the protected-inode map a `Protector` holds
+    nothing, fail-closed (an environment file under `/etc/northnarrow/` is
+    then not held, its drop-in quarantined; a map that cannot be opened is
+    the signed `own_dropins_unprotected` degradation), and a round that
+    cannot read the install time says so, signed (`own_dropin_round_skipped`)
+    — NB6. A relabel of the agent's binary (SELinux `restorecon`, a
+    `chcon`) changes its ctime, so the round's "since the install" moves
+    forward: drop-ins changed between the install and the relabel are no
+    longer judged by the round — the pre-install report names the harmful
+    ones (declared). **`NN_` settings are configuration** (the
+    coordinator's decision): in our units' drop-ins an `NN_` variable is
+    no longer harmful — the drop-in is kept (and write-protected) and the
+    agent signs each setting (`own_dropin_setting`; a weakening switch,
+    the agent's own list plus a sensor's fallback and `NN_EXEC_POLICY=off`
+    in `WEAKENING_DROPIN_EXTRA`, a High `own_dropin_weakening`); a loader
+    variable stays harmful, and `install.sh` lists `NN_` settings as kept
+    configuration. The units' own slice is a service tier for the exec
+    policy, as `system.slice` was for them (`EXECPOL_SLICES[OURS]`, NB5: a
+    regression of this lot's slice, fixed).
 - **The judge, precise** (the re-check of #492). A slice's floors follow
   the host: memory a quarter of it, between 544 MiB (the agent's and the
   watchdog's together) and 1 GiB; a CPU share an eighth of the online

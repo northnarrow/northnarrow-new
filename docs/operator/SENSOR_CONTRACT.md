@@ -220,8 +220,16 @@ says what the agent can see, not what it cannot.
 of the external review of 04/11). On 6.0 to 7.2 a write of `0` turns every
 call site ftrace manages back into a NOP, with no error, and the BPF
 trampolines on them stop firing: the fentry/fexit sensors (`cgroup_guard`,
-`epg`, `epg_lite`, `tcp_close`, `sensor_probe`), the kprobes ftrace
-carries and, by the kernel's code, the BPF-LSM programs — every deny hook.
+`epg`, `epg_lite`, `tcp_close`, `sensor_probe`; since the merge with lots
+277 and 275 also the start-in-cgroup tracker's `fexit:cgroup_procs_write_start`
+and `fentry:cgroup_post_fork`, and the network telemetry's
+`fexit:udp_recvmsg` / `udpv6_recvmsg` and `inet_csk_accept`), the kprobes
+ftrace carries (`tcp_connect`'s among them) and, by the kernel's code, the
+BPF-LSM programs — every deny hook. With the switch at `0` (possible only
+inside a window) the tracker misses a birth by `CLONE_INTO_CGROUP` into an
+exempt cgroup (`cgroup_post_fork` silenced), and NN-L-NET-028 loses half
+its evidence; treating the tracker's marks as lost while the `ftrace_enabled`
+degradation holds is lot 280's (the short re-check of #497, NB1).
 The lab measured it on our own guests (lot 273d, C106c: the run counts of
 the agent's programs under the same load, the switch written `0` inside a
 window, then `1`): on 6.1, 6.8, 6.12 and 7.0 the BPF-LSM programs ran

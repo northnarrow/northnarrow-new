@@ -530,7 +530,12 @@ run killed with `-9` stops the next run until it is moved back by hand.
 - the telemetry probe never went silent.
 
 Put a unit drop-in with `Environment=NN_FILE_OPEN_SENSOR=tracepoint` to
-compare with the old sensor, for example under `nn-lab.sh overhead`.
+compare with the old sensor, for example under `nn-lab.sh overhead`. Since
+lot 273d write it inside a trusted-installer window (the agent's drop-in
+directories refuse a new file outside one), then `systemctl daemon-reload`
+and restart the agent inside the window; the window's close keeps it, and
+the agent signs the setting — a sensor back to its fallback is a High
+`own_dropin_weakening` (a loader variable in it gets it quarantined).
 
 ### Exec sensor (Tappa 10.9 step 2)
 

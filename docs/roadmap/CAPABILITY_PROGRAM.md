@@ -5310,7 +5310,18 @@ number in parentheses is a lab PR.
     window refused (EPERM); C111 (round 17c): a kept drop-in and its
     environment file rewritten outside a window, both refused. Round 17
     found NN-L-FIM-009 killing a drop-in's writer inside a window (C111's
-    shell): its §15.1 exemption now covers our units' drop-ins.
+    shell): its §15.1 exemption now covers our units' drop-ins. The short
+    re-check of #497 (no blocker; RR1, RR2, NR1–NR6 held through the
+    merge): a package's configure step warns of harmful drop-ins and the
+    round reports one from before the install, signed, never moved (RB1);
+    the units' slice a service tier for the exec policy again (NB5, a
+    regression of this lot's slice); the protector fail-closed without its
+    map and the round's skip signed (NB6); the sensor contract's §5a, the
+    vendor directory and FIM-009's decision moment documented (NB1, NB3,
+    NB4). To lot 280: the tracker's marks taken as lost while
+    `ftrace_enabled` is 0, `kprobes/enabled`, tracepoints as a channel
+    ftrace does not carry (NB1); to the Wave 4 backlog: an `nn-admin`
+    command that ends a window before its deadline (NB2).
   - Lab: on our own QEMU guests — 22.04 (5.15), Debian 12 (6.1), 24.04 (6.8),
     Debian 13 (6.12, systemd 257), 26.04 (7.0) — each under its lease,
     rounds 12 to 15.

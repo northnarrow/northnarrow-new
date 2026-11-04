@@ -951,7 +951,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     RT runtime put back is never 0; the eBPF CI job fails unless both
     `check_cfg` tests ran; NN-L-FIM-009 no longer kills the writer of a
     drop-in of our units inside a trusted-installer window (a Low record,
-    the close judges it).
+    the close judges it);
+  - the short re-check of #497: a package's configure step warns of the
+    drop-ins of our units the agent judges harmful, and the round reports
+    one from before the install, signed (`own_dropin_preinstall_harmful`),
+    never moving it; without the protected-inode map nothing counts as
+    protected (fail-closed, a signed degradation when the map cannot be
+    opened) and a round that cannot read the install time says so; the
+    units' own `northnarrow.slice` is a service tier for the exec policy
+    again (it was UNKNOWN since the slice); an `NN_` setting in a drop-in
+    of our units is configuration again — kept, write-protected, each one
+    signed (`own_dropin_setting`, a High `own_dropin_weakening` for a
+    switch that weakens the agent), listed by `install.sh` as kept — and
+    only a loader variable gets such a drop-in quarantined.
   Still open (`docs/design/ANTITAMPER_TRUST_MODEL.md`, "Lot 273d",
   Residual): the seven sysctls judged by value are judged on the bytes the
   hook reads before the kernel copies them — a root writer's second thread
