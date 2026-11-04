@@ -172,14 +172,18 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
   `--remove-holders`, `--remove-dependencies`; an argument starting with
   `-` after the first name (`modprobe <name> -q`); a copy of the tool or a
   program whose device and inode are not those of the file `/usr/bin/kmod`
-  resolves to; one of those variables (a root shell with `LD_LIBRARY_PATH`
+  resolves to, or every tool when `/usr/bin/kmod` and `/bin/kmod` are two
+  different files (not one file under both names, as a merged `/usr`
+  shows it); one of those variables (a root shell with `LD_LIBRARY_PATH`
   set kills its `modprobe`; read, it is evidence: killed even if the
   process has since exited, not a false positive); a running process whose environment the agent
   could not read at the exec, an environment over 1 MiB; a cut argv. A
   module tool that had exited before the agent could read its environment
   is recorded, the reasoning saying so ("exited before its environment
   could be read — a load it made is the kernel's to judge (R018); its
-  environment not verified"): its kill would reach no one. R011 resolves no
+  environment not verified"): its kill would reach no one. A tool whose
+  first thread exited while another runs on has not exited: its
+  environment is read through the running thread. R011 resolves no
   name and reads no `modprobe.d`: the load is the kernel's signature
   policy's to refuse, and R018's to judge after it (with no verdict for a
   packaged file loaded by a comm of its loader allowlist). The

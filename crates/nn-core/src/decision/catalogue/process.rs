@@ -253,11 +253,13 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    (and their abbreviations); any argument starting with `-` after the first \
                    module name; a `kmod` command that is not `help`/`list`/`static-nodes`/the \
                    version; a program that is not the system's tool (its path; its device and \
-                   inode not those of the file `/usr/bin/kmod` resolves to), of another mount \
-                   namespace; `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or \
-                   `LD_LIBRARY_PATH` in its environment (read: killed even if the process has \
-                   since exited — evidence), a running process's environment not \
-                   read, over 1 MiB, an unknown start; an argv not read whole. Recorded \
+                   inode not those of the file `/usr/bin/kmod` resolves to; `/usr/bin/kmod` \
+                   and `/bin/kmod` two different files), of another mount namespace; \
+                   `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` in its \
+                   environment (read: killed even if the process has since exited — \
+                   evidence; a leader that exited while a thread runs on is read through that \
+                   thread), a running process's environment not read, over 1 MiB, an unknown \
+                   start; an argv not read whole. Recorded \
                    otherwise: the system's tool by module name, nothing moved or forced — no \
                    `modprobe.d` or index is read, what the names load is the kernel's to judge \
                    (its signature policy; R018's verdict on the load it reports, after it, \
@@ -275,7 +277,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           build outside a package transaction), a quiet probe written \
                           `modprobe <name> -q`, a module parameter with a `/`, a `modprobe` run \
                           from a shell whose environment sets `LD_LIBRARY_PATH` (or \
-                          `LD_PRELOAD`, `LD_AUDIT`).",
+                          `LD_PRELOAD`, `LD_AUDIT`), and every module tool's exec on a host \
+                          whose `/usr/bin/kmod` and `/bin/kmod` are two different files.",
         how_to_test: "`sudo modprobe dummy` (recorded; anti-tamper.sh case C16); \
                       `deploy/lab/malsim/kmod-check.sh` (the benign corpus recorded, the \
                       malicious shapes killed).",
@@ -296,6 +299,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-linux/src/sensors/kmod_exec.rs::\
              a_running_process_s_unreadable_environment_is_refused_an_exited_one_s_is_not",
             "crates/nn-linux/src/sensors/kmod_exec.rs::what_was_read_is_judged",
+            "crates/nn-linux/src/sensors/kmod_exec.rs::\
+             a_leader_that_exited_while_its_thread_runs_has_not_exited",
+            "crates/nn-linux/src/sensors/kmod_exec.rs::\
+             the_program_is_the_system_s_tool_by_device_and_inode",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::\
              process_kernel_module_tooling_trips_r011",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::\

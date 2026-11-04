@@ -7,7 +7,10 @@
 //!   `/usr/bin/kmod` resolves to, as the pump stats it then (the links the
 //!   distribution installs execute that file). A copy, a file of its own
 //!   under a tool's name, a file of another filesystem, an exec the hook
-//!   did not describe (tracepoint mode) is not;
+//!   did not describe (tracepoint mode) is not; nothing is when
+//!   `/usr/bin/kmod` and `/bin/kmod` are two different files (one file
+//!   under both names, a merged `/usr`, is the tool: the re-check of #498,
+//!   N-3);
 //! - **the environment**: the process's `/proc/<pid>/environ`, tied to the
 //!   exec by a pidfd and its start time, holds neither `MODPROBE_OPTIONS`
 //!   (options kmod puts in front of the command line: `-d`, `-C`, `--`…,
@@ -23,10 +26,15 @@
 //!   killed: a kill would reach no one and leave only a false High kill
 //!   (the coordinator's decision of 04/11, the re-review's conditions); an
 //!   invocation R011 would record otherwise is recorded, its environment
-//!   not verified ([`Environment::Exited`]). An empty environment read from
-//!   the running process is one (libxtables runs `modprobe` with none).
-//!   Best effort: a short-lived `modprobe` may exit before the pump reads
-//!   it, the likelier as a burst of execs slows the pump.
+//!   not verified ([`Environment::Exited`]). A leader that exited while
+//!   another thread of its process runs on (`pthread_exit`) has not: the
+//!   environment is read through that thread, refused when it cannot be
+//!   read whole (the re-check of #498, DC-A). An empty environment read
+//!   from the running process is one (libxtables runs `modprobe` with
+//!   none). Best effort: a short-lived `modprobe` may exit before the pump
+//!   reads it, the likelier as a burst of execs slows the pump; code
+//!   injected into the tool may outlive it in a child it forked, which
+//!   R011's kill of the tool would not reach (N-1).
 //!
 //! The core reads none of it (nn-linux's `sensors::kmod_exec` does, on the
 //! exec pump's thread, for the execs of a module tool only); the answer is

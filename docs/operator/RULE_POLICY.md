@@ -98,13 +98,18 @@ killed, in every posture. Killed as before, in every posture: `insmod`;
 `--remove-holders`, `--remove-dependencies`; any argument starting with `-`
 after the first name (`modprobe <name> -q` included); a copy of the tool or
 a program that is not the system's (its device and inode against the file
-`/usr/bin/kmod` resolves to); one of those variables (read, it is evidence:
-killed even if the process has since exited), a running process
+`/usr/bin/kmod` resolves to; every tool when `/usr/bin/kmod` and `/bin/kmod`
+are two different files, not one file under both names as a merged `/usr`
+shows it); one of those variables (read, it is evidence: killed even if the
+process has since exited), a running process
 whose environment the agent could not read at the exec, an environment over
 1 MiB, an unknown start; an argv not read whole. A tool that had exited
 before the agent could read its environment is recorded, its environment
-not verified — a kill would reach no one; for a short-lived `modprobe` the
-environment's check is best effort. R011 resolves nothing: whether a name
+not verified — a kill would reach no one; a tool whose first thread (its
+leader) exited while another thread runs on has not exited: the agent reads
+the environment through the running thread, and kills when it cannot read
+it whole. For a short-lived `modprobe` the environment's check is best
+effort. R011 resolves nothing: whether a name
 loads a module, and which, is the kernel's to judge — its module signature
 enforcement and lockdown (the host check reports both) and lot 285's deny of
 an untrusted file are what prevent a load. R018 judges the loads the kernel
@@ -117,7 +122,11 @@ those, a Log by another loader; every load a journal line. Taking `kmod` out
 of that allowlist goes with lot 285's redesign of R018. What R011 never
 covered: a root process loading a module with its own `finit_module(2)` (with
 comm `kmod`, maybe no verdict at all), a root parent tracing the tool and
-rewriting its argv or environment after the agent read them. The
+rewriting its argv or environment after the agent read them, code injected
+into the tool (an `LD_PRELOAD` read too late, `/etc/ld.so.preload`) that
+forks and lets the tool exit: the agent reads an exited tool (recorded),
+and a kill of the tool would not reach that child, which runs on out of its
+tree. The
 `install`/`remove` commands of root's `modprobe.d` run as programs the exec
 rules judge; before lot 279 a user-space `modprobe` was killed, its command
 then usually not run — the residual and `modprobe.d`'s coverage are in

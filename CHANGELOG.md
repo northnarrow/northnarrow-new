@@ -808,8 +808,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   parameter as the environment decides); an option the tool refuses; a
   `kmod` command other than `help`, `list`, `static-nodes`, the version; a
   program that is not the system's tool (its path, or its device and inode
-  against the file `/usr/bin/kmod` resolves to, stat'ed by the exec pump),
-  of another mount namespace; `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT`
+  against the file `/usr/bin/kmod` resolves to, stat'ed by the exec pump;
+  every tool when `/usr/bin/kmod` and `/bin/kmod` are two different files,
+  not one file under both names as a merged `/usr` shows it), of another
+  mount namespace; `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT`
   or `LD_LIBRARY_PATH` in the process's environment — read, it is evidence:
   killed even if the process has since exited — (`/proc/<pid>/environ`
   tied to the exec by a pidfd and the start time; an empty one read from
@@ -818,8 +820,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   1 MiB, an unknown start; an argv the kernel did not read whole. A tool
   that had exited before its environment could be read (no process with its
   pid, its pid another's, a zombie, its memory gone whatever was read) is
-  recorded, its environment not verified — its kill would reach no one; the
-  environment's check is best effort for a short-lived `modprobe`.
+  recorded, its environment not verified — its kill would reach no one; a
+  tool whose leader exited while another thread runs on (`pthread_exit`)
+  has not exited: its environment is read through the running thread
+  (`/proc/<pid>/task/<tid>/environ`), killed when not read whole. The
+  environment's check is best effort for a short-lived `modprobe`; code
+  injected into the tool may outlive it in a forked child, which R011's
+  kill of the tool would not reach.
   Recorded otherwise (High, T1547.006, the names said): what a name loads
   is the kernel's to judge — its signature policy, lockdown and lot 285
   prevent a load; R018 judges a load it reports after the fact, with no

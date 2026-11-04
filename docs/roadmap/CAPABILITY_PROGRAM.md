@@ -5927,6 +5927,28 @@ number in parentheses is a lab PR.
     (exited); `LD_PRELOAD`/`LD_AUDIT`/`LD_LIBRARY_PATH` killed; R018 said as
     it is (above); the `install`/`remove` residual in the trust model; the
     system's tool only the file `/usr/bin/kmod` resolves to.
+  - The re-check of #498 (18afcc73): no BLOCKING finding; DC-1–DC-5 closed
+    with named tests, its five mutations caught. Done in cf8c3507: DC-A — a
+    leader that exited by `pthread_exit` while another thread runs on (a
+    zombie without memory, its `environ` empty or unreadable, its pidfd not
+    exited) was read as an exit, R011's record, its `LD_*` or
+    `MODPROBE_OPTIONS` lost; the pump now reads the environment through a
+    thread with the process's memory (`/proc/<pid>/task/<tid>/environ`) and
+    judges it, refused when the threads cannot be listed while the process
+    runs or that read is not whole; a single-threaded process mid-exit
+    (DC-1) stays an exit. N-3 — `/usr/bin/kmod` and `/bin/kmod` two
+    different files: no file is the system's tool, every tool killed as an
+    unknown program (one file under both names, a merged `/usr` or a hard
+    link, is the tool). N-1 — code injected into the tool that forks and
+    lets it exit survives in the child, which a kill of the tool would not
+    reach: written as a residual. Tests: the re-check's case on a real
+    process (the test binary run again forks a process whose leader exits
+    while a thread sleeps on: `MODPROBE_OPTIONS`, `LD_PRELOAD` refused, a
+    clean environment clean), the thread path on a copy of `/proc` beside a
+    real pidfd, a read cut by the thread's or the process's exit (a FIFO
+    `environ`), the two `kmod` files. No guest round for these two: their
+    tests are the unit tests above; the R011 e2e runs in CI's KVM jobs
+    (22.04, 24.04).
   - Lab of the EARLIER design (retired: the decisions above; as measured;
     our own guests, lease `k279`; Ubuntu 22.04 5.15.0-202 and 24.04
     6.8.0-147; on each, `main` 80c8da36 then the lot on the same
@@ -6068,5 +6090,10 @@ number in parentheses is a lab PR.
     run with `LD_LIBRARY_PATH` set are killed; a tool that exits before the
     exec pump reads its environment is recorded on its command line alone
     (a burst of execs can make that likelier: `-d` or a path then R018's
-    after the load, `-C` with an `install` nobody's); the load itself is
-    prevented only by the kernel's signature policy and lot 285.
+    after the load, `-C` with an `install` nobody's); code injected into the
+    tool can outlive it in a forked child (N-1); the load itself is
+    prevented only by the kernel's signature policy and lot 285. Follow-ups
+    (the re-check's N-2, N-4): the refused variables searched before an
+    error of a read cut by the exit; the e2e's and the lab's
+    `MODPROBE_OPTIONS`/`LD_PRELOAD` kills made deterministic (a preload that
+    sleeps in its constructor).

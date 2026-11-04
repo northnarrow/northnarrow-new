@@ -54,9 +54,9 @@
 //! | `-C`/`--config`, `-d`/`--dirname`, `-S`/`--set-version`, `-f`/`--force*`, `-o`, `--remove-holders`, `--remove-dependencies` (and the abbreviations `getopt_long` takes) | kill |
 //! | any argument starting with `-` after the first module name; an option the tool refuses | kill |
 //! | a `kmod` command other than `help`, `list`, `static-nodes`, the version | kill |
-//! | not the system's tool: its path outside `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin` or another name, its device and inode not those of the file `/usr/bin/kmod` resolves to (as the exec pump stats it), a filesystem of another mount namespace | kill |
+//! | not the system's tool: its path outside `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin` or another name, its device and inode not those of the file `/usr/bin/kmod` resolves to (as the exec pump stats it), `/usr/bin/kmod` and `/bin/kmod` two different files, a filesystem of another mount namespace | kill |
 //! | `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` in its environment (read, it is evidence: killed even if the process has since exited); a running process whose environment the exec pump could not read at the exec; an environment over 1 MiB; an unknown start | kill |
-//! | a process that had exited before the exec pump could read its environment (no process with its pid, its pid another's, a zombie, its memory gone), the rest of it recorded | record, its environment not verified |
+//! | a process that had exited before the exec pump could read its environment (no process with its pid, its pid another's, a zombie, its memory gone), the rest of it recorded — not a leader that exited while another thread runs on: that thread's environment is read and judged, refused when not read whole | record, its environment not verified |
 //! | an argv the kernel did not read whole | kill |
 //! | otherwise — the system's tool, plain module names, before the first name only options that move and force nothing | record |
 //!
@@ -81,7 +81,11 @@
 //! What R011 does not see: a root process that loads a module without any
 //! tool (its own `finit_module(2)`) — as on `main`, with comm `kmod` maybe
 //! no verdict at all (above); a root parent that traces the tool and
-//! rewrites its argv or environment after the exec pump read them; a
+//! rewrites its argv or environment after the exec pump read them; code
+//! injected into the tool (an `LD_PRELOAD` read too late,
+//! `/etc/ld.so.preload`) that forks and lets the tool exit — the pump reads
+//! an exited tool (recorded), and a kill of the tool would not reach the
+//! child, which runs on out of its tree; a
 //! `modprobe.d` `install`/`remove` command — root's configuration, run by
 //! `modprobe` through `/bin/sh -c` as programs the exec rules judge (on
 //! `main` a user-space `modprobe` was killed, its command then usually not
