@@ -29,7 +29,7 @@ use nn_core::decision::rules::kmod_exec_facts::{self, ExecFacts, KMOD_TOOLS};
 use nn_model::{Event, ExeIdentity};
 
 use crate::anti_tamper::filesystem::stat_dev_to_kernel_dev;
-use crate::response::proc_ref::{pidfd_exited, pidfd_open, proc_start_ticks, started_at};
+use crate::response::proc_ref::{pidfd_exited, pidfd_open, started_at, stat_start_ticks};
 
 /// The system's module tools' paths under the host's root: kmod and the
 /// links the distributions install to it (or tools of those names).
@@ -77,7 +77,7 @@ pub fn facts(root: &Path, event: &Event) -> Option<ExecFacts> {
         return None;
     }
     // the environment first: the process may be short-lived
-    let environment = environment(*pid, *start_ns);
+    let environment = environment(Path::new("/proc"), *pid, *start_ns);
     Some(ExecFacts {
         program: program(root, exe),
         environment,
@@ -111,8 +111,9 @@ fn program(root: &Path, exe: &ExeIdentity) -> Result<(), String> {
 
 /// `Ok` when the environment of `pid`, the process that started at
 /// `start_ns` (`CLOCK_MONOTONIC`, as the sensors report it), was read and
-/// holds no `MODPROBE_OPTIONS`.
-fn environment(pid: u32, start_ns: u64) -> Result<(), String> {
+/// holds no `MODPROBE_OPTIONS`; `proc`: procfs (`/proc`; a copy of an
+/// entry in a test).
+fn environment(proc: &Path, pid: u32, start_ns: u64) -> Result<(), String> {
     if start_ns == 0 {
         return Err("its start is unknown: its environment cannot be tied to the exec".to_string());
     }
@@ -127,7 +128,8 @@ fn environment(pid: u32, start_ns: u64) -> Result<(), String> {
     };
     // The pidfd holds the process: `/proc/<pid>` describes it while it runs
     // (checked after the reads — a pid is not reused before it is reaped).
-    match proc_start_ticks(pid) {
+    let stat = || std::fs::read_to_string(proc.join(format!("{pid}/stat"))).ok();
+    match stat().as_deref().and_then(stat_start_ticks) {
         Some(ticks) if started_at(ticks, start_ns) => {}
         Some(_) => {
             return Err("its pid names another process (its start is not the exec's)".to_string())
@@ -135,13 +137,11 @@ fn environment(pid: u32, start_ns: u64) -> Result<(), String> {
         None => return Err("its /proc entry could not be read".to_string()),
     }
     let mut env = Vec::new();
-    let read = std::fs::File::open(format!("/proc/{pid}/environ"))
+    let read = std::fs::File::open(proc.join(format!("{pid}/environ")))
         .and_then(|f| f.take(MAX_ENVIRON + 1).read_to_end(&mut env));
     // after the read: a process past its exit reads an empty environment
     // (its memory gone) before its pidfd says it exited
-    let memory = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .is_some_and(|stat| has_memory(&stat));
+    let memory = stat().is_some_and(|stat| has_memory(&stat));
     if pidfd_exited(&fd) {
         return Err("it exited while its environment was read".to_string());
     }
@@ -237,36 +237,43 @@ mod tests {
     fn the_environment_is_read_from_the_exec_s_process() {
         let clean = sleeper(&[("PATH", "/usr/bin:/bin"), ("LANG", "C")]);
         let start = started(&clean);
-        assert_eq!(environment(clean.id(), start), Ok(()));
+        assert_eq!(environment(Path::new("/proc"), clean.id(), start), Ok(()));
         let later = start + 3_600_000_000_000;
-        assert!(environment(clean.id(), later)
+        assert!(environment(Path::new("/proc"), clean.id(), later)
             .unwrap_err()
             .contains("another process"));
-        assert!(environment(clean.id(), 0)
+        assert!(environment(Path::new("/proc"), clean.id(), 0)
             .unwrap_err()
             .contains("start is unknown"));
         let pid = clean.id();
         stop(clean);
-        assert!(environment(pid, start)
+        assert!(environment(Path::new("/proc"), pid, start)
             .unwrap_err()
             .contains("before its environment was read"));
 
         let set = sleeper(&[("PATH", "/usr/bin"), ("MODPROBE_OPTIONS", "-d /tmp/x")]);
-        let why = environment(set.id(), started(&set)).unwrap_err();
+        let why = environment(Path::new("/proc"), set.id(), started(&set)).unwrap_err();
         assert!(why.contains("MODPROBE_OPTIONS='-d /tmp/x'"), "{why}");
         stop(set);
         let empty_value = sleeper(&[("MODPROBE_OPTIONS", "")]);
-        let why = environment(empty_value.id(), started(&empty_value)).unwrap_err();
+        let why =
+            environment(Path::new("/proc"), empty_value.id(), started(&empty_value)).unwrap_err();
         assert!(why.contains("MODPROBE_OPTIONS=''"), "{why}");
         stop(empty_value);
         // a name that only starts like it is another variable
         let other = sleeper(&[("MODPROBE_OPTIONS_X", "-d /tmp/x")]);
-        assert_eq!(environment(other.id(), started(&other)), Ok(()));
+        assert_eq!(
+            environment(Path::new("/proc"), other.id(), started(&other)),
+            Ok(())
+        );
         stop(other);
 
         // none at all, as libxtables runs modprobe: read, nothing in it
         let empty = sleeper(&[]);
-        assert_eq!(environment(empty.id(), started(&empty)), Ok(()));
+        assert_eq!(
+            environment(Path::new("/proc"), empty.id(), started(&empty)),
+            Ok(())
+        );
         stop(empty);
 
         // exited, not yet reaped (a zombie still holds its pid and start)
@@ -284,7 +291,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let why = environment(pid, start).unwrap_err();
+        let why = environment(Path::new("/proc"), pid, start).unwrap_err();
         assert!(why.contains("exited while"), "{why}");
         zombie.wait().unwrap();
 
@@ -295,9 +302,46 @@ mod tests {
             .collect();
         let env: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         let large = sleeper(&env);
-        let why = environment(large.id(), started(&large)).unwrap_err();
+        let why = environment(Path::new("/proc"), large.id(), started(&large)).unwrap_err();
         assert!(why.contains("larger than 1048576 bytes"), "{why}");
         stop(large);
+    }
+
+    /// A process whose memory is gone while its pidfd does not say it
+    /// exited (the window of an exit): its environment reads empty and is
+    /// not taken for an empty one. The running child's own `/proc` entry,
+    /// copied with its virtual size set to 0 and an empty environment, is
+    /// what the window shows (the live pidfd says "not exited").
+    #[test]
+    fn an_environment_read_empty_without_the_process_s_memory_is_not_one() {
+        let child = sleeper(&[("PATH", "/usr/bin")]);
+        let start = started(&child);
+        let pid = child.id();
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let (head, rest) = stat.rsplit_once(')').unwrap();
+        let mut fields: Vec<&str> = rest.split_whitespace().collect();
+        let fake = tempfile::tempdir().unwrap();
+        let entry = fake.path().join(pid.to_string());
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("environ"), b"").unwrap();
+        let write_stat = |fields: &[&str]| {
+            std::fs::write(
+                entry.join("stat"),
+                format!("{head}) {}\n", fields.join(" ")),
+            )
+            .unwrap()
+        };
+        write_stat(&fields);
+        // its memory there: an empty environment, read
+        assert_eq!(environment(fake.path(), pid, start), Ok(()));
+        fields[20] = "0";
+        write_stat(&fields);
+        let why = environment(fake.path(), pid, start).unwrap_err();
+        assert!(
+            why.contains("exiting when its environment was read"),
+            "{why}"
+        );
+        stop(child);
     }
 
     /// A process past `exit_mm` (its virtual size 0) or a zombie shows no
@@ -349,7 +393,7 @@ mod tests {
             return;
         }
         let start = proc_start_ns(1).expect("init's start");
-        let why = environment(1, start).unwrap_err();
+        let why = environment(Path::new("/proc"), 1, start).unwrap_err();
         assert!(why.contains("could not be read"), "{why}");
     }
 
