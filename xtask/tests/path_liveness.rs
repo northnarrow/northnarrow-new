@@ -21,36 +21,13 @@ mod support;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use serde_yaml_ng::Value as Yaml;
-use support::{members, repo_root, rs_files};
+use support::{members, repo_root, rs_files, tracked_files};
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
-
-/// The files git tracks, repository-relative.
-fn tracked() -> Vec<String> {
-    let out = Command::new("git")
-        .current_dir(repo_root())
-        .args(["ls-files", "-z"])
-        .output()
-        .expect("git ls-files runs");
-    assert!(out.status.success(), "git ls-files failed");
-    let files: Vec<String> = out
-        .stdout
-        .split(|&b| b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).into_owned())
-        .collect();
-    assert!(
-        files.len() > 500,
-        "git ls-files lists {} files",
-        files.len()
-    );
-    files
 }
 
 fn workflows() -> Vec<(String, Yaml)> {
@@ -132,7 +109,7 @@ fn the_glob_reads_github_filters() {
 /// Every path filter of every workflow matches a tracked file.
 #[test]
 fn every_workflow_path_filter_matches_a_tracked_file() {
-    let files = tracked();
+    let files = tracked_files();
     let mut seen = 0;
     let mut bad = Vec::new();
     for (rel, wf) in workflows() {
