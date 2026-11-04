@@ -105,30 +105,35 @@ struct HostPolicyUnchanged(Vec<(PathBuf, Option<FileStamp>)>);
 type FileStamp = (u64, u64, u64, i64, i64);
 impl HostPolicyUnchanged {
     fn snapshot() -> Self {
+        Self(Self::stamps())
+    }
+
+    /// The stamps alone: a second `HostPolicyUnchanged` built in `drop`
+    /// would be dropped, and so compared, again (the guest run of
+    /// cb125646: a stack overflow).
+    fn stamps() -> Vec<(PathBuf, Option<FileStamp>)> {
         use std::os::unix::fs::MetadataExt;
         let file = PathBuf::from(northnarrow_agent::decision::rule_policy::DEFAULT_LOCAL);
         let sig = northnarrow_agent::config::overlay_auth::sig_path(&file);
-        Self(
-            [file, sig]
-                .into_iter()
-                .map(|p| {
-                    let m = std::fs::symlink_metadata(&p)
-                        .ok()
-                        .map(|m| (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec()));
-                    (p, m)
-                })
-                .collect(),
-        )
+        [file, sig]
+            .into_iter()
+            .map(|p| {
+                let m = std::fs::symlink_metadata(&p)
+                    .ok()
+                    .map(|m| (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec()));
+                (p, m)
+            })
+            .collect()
     }
 }
 impl Drop for HostPolicyUnchanged {
     fn drop(&mut self) {
-        let now = Self::snapshot();
-        if now.0 != self.0 {
+        let now = Self::stamps();
+        if now != self.0 {
             common::fail_teardown(&format!(
                 "the host's per-rule policy changed during the test (a fixture writes in its own \
                  directory): before {:?}, after {:?}",
-                self.0, now.0
+                self.0, now
             ));
         }
     }
