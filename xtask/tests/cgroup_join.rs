@@ -383,7 +383,7 @@ fn the_agent_asks_the_marks_where_it_decides() {
         &[
             "antitamper_bpf::pin_root_refusal_at(&st.dir)",
             "verify_map(&seen_at(&st.dir.join(name))?, reg)?;",
-            "return Err(format!(\"{n}: not a pin of the tracker\"));",
+            "if !is_tracker_pin(&n) {\n            return Err(format!(\"{n}: not a pin of the tracker\"));",
         ],
     )
     .unwrap();

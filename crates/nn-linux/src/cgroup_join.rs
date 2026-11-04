@@ -446,22 +446,25 @@ fn verify_state(st: &PinState) -> Result<u32, String> {
             entries = Some(reg.max_entries);
         }
     }
-    let known = |n: &str| {
-        PINNED_MAPS.contains(&n)
-            || PROGRAMS
-                .iter()
-                .any(|(p, _, _)| n == format!("prog_{p}") || n == format!("link_{p}"))
-    };
     for e in std::fs::read_dir(&st.dir)
         .map_err(|e| e.to_string())?
         .flatten()
     {
         let n = e.file_name().to_string_lossy().into_owned();
-        if !known(&n) {
+        if !is_tracker_pin(&n) {
             return Err(format!("{n}: not a pin of the tracker"));
         }
     }
     entries.ok_or_else(|| "no marks".to_string())
+}
+
+/// `name` is one of the files a tracker directory holds: a map of
+/// [`PINNED_MAPS`], or a program's `prog_`/`link_` pin.
+fn is_tracker_pin(name: &str) -> bool {
+    PINNED_MAPS.contains(&name)
+        || PROGRAMS
+            .iter()
+            .any(|(p, _, _)| name == format!("prog_{p}") || name == format!("link_{p}"))
 }
 
 /// The third review of #494 (R2-d): `dir` usable for the tracker's pins —
@@ -1485,6 +1488,31 @@ mod tests {
         // one is not adopted either: the registered one is
         let p = plan(root, "B", Some(&s0), &[d(0), d(7)], &ok(10), 10, None);
         assert!(p.adopt && p.dir == d(0));
+    }
+
+    /// The third review of #494, R2-b: a registered directory holds the
+    /// tracker's maps and programs' pins and nothing else.
+    #[test]
+    fn a_tracker_directory_holds_only_the_tracker_s_pins() {
+        for yes in [
+            "CGROUP_JOINED",
+            "CGROUP_JOIN_LOST",
+            "CGROUP_JOIN_STATS",
+            "CGROUP_JOIN_EPOCH",
+            "prog_cgroup_join_mark",
+            "link_cgroup_join_exit",
+        ] {
+            assert!(is_tracker_pin(yes), "{yes}");
+        }
+        for no in [
+            "CGROUP_EXEMPT_NAMES",
+            "prog_task_kill",
+            "link_cgroup_join_other",
+            "planted",
+            "CGROUP_JOINED.old",
+        ] {
+            assert!(!is_tracker_pin(no), "{no}");
+        }
     }
 
     /// The third review of #494, R2-a: after a reset, a process is "after"
