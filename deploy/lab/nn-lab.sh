@@ -2207,7 +2207,7 @@ done
 # left behind is a NorthNarrow process too, whatever its comm.
 left=$(for d in /proc/[0-9]*; do e=$(sudo readlink "$d/exe" 2>/dev/null) || continue; case "${e##*/}" in northnarrow-agent*|northnarrow-watchdog*) echo "${d#/proc/}:${e}";; esac; done)
 if [[ -n $left ]]; then echo "FAIL: northnarrow process still running: $left"; fail=1; fi
-if getent passwd northnarrow-worker >/dev/null || getent passwd northnarrow-scan >/dev/null; then echo "FAIL: an agent account is left (northnarrow-worker / northnarrow-scan)"; fail=1; fi
+if getent passwd northnarrow-worker >/dev/null || getent passwd northnarrow-scan >/dev/null || getent passwd northnarrow-export >/dev/null; then echo "FAIL: an agent account is left (northnarrow-worker / northnarrow-scan / northnarrow-export)"; fail=1; fi
 (( fail == 0 )) && echo "uninstall-check: OK (host clean)"
 # Bring the guest back: fresh install (new keys — the purge removed them).
 sudo ./deploy/install.sh --source-tree >/tmp/nn-reinstall.log 2>&1 || { echo "FAIL: reinstall after purge failed"; tail -20 /tmp/nn-reinstall.log; exit 1; }

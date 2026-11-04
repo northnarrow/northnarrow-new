@@ -4,10 +4,11 @@
 # .github/scripts/verify-release-tag.sh (`git verify-tag` with
 # gpg.ssh.allowedSignersFile); `package` and every later job wait for it.
 #
-# NO KEY IS LISTED YET. Until the maintainer adds the public half of a
-# tag-signing key below, verify-tag refuses every tag: nothing is built,
-# signed, attested or published from a tag (fail closed). Adding the key is
-# the maintainer's step; nobody else's key belongs here.
+# Only the maintainer's tag-signing key is listed (added 2026-11-04,
+# ED25519, SHA256:uTnR1UsJWH1wlE2muj5W21Y7L1rxysvcR2jZcO1B5d8). A tag signed
+# by any other key is refused at verify-tag: nothing is built, signed,
+# attested or published from it (fail closed). Nobody else's key belongs
+# here; adding, rotating or revoking one is a reviewed PR.
 #
 # Format: ssh-keygen(1) "ALLOWED SIGNERS", one key per line:
 #   <principal> namespaces="git" <key type> <base64 public key>
@@ -22,3 +23,5 @@
 #   rather than deleting it, so older tags still verify; a compromised key
 #   is deleted.
 # Signing and checking a tag: CONTRIBUTING.md, "Rilasci".
+
+northnarrow-release namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP2LtgOZ4vM7cq3+9G8QYP/W9CU6LbB73LQhlq4uwhfS

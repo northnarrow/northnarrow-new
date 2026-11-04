@@ -1415,12 +1415,14 @@ const BUDGET_SLOTS: [u32; 4] = [
 /// from their record's kernel time (R12b, lab PR 269: `queues`' over
 /// budget); 6 and 7 (R12c, lab PR 270) the response dispatcher's and the
 /// evidence writers' (`dispatch`: `(stage 6, stage 7)`, `None` without a
-/// dispatcher — tests); 8 not counted yet — R15, the export.
+/// dispatcher — tests); 8 (lot 276) the export's (`export`: the rows it can
+/// no longer deliver, `None` without an export configured).
 pub fn loss_stages(
     ring: &[(&'static str, u64)],
     rejected: u64,
     queues: &[QueueSnapshot],
     dispatch: Option<(u64, u64)>,
+    export: Option<u64>,
 ) -> Vec<StageCount> {
     let budget: Vec<&str> = BUDGET_SLOTS
         .iter()
@@ -1484,8 +1486,9 @@ pub fn loss_stages(
         StageCount {
             stage: 8,
             name: "export",
-            total: None,
-            source: "not counted yet: R15, the export",
+            total: export,
+            source: "rows the export can no longer deliver: evicted before a sink read them, \
+                     longer than a request carries (every sink's)",
         },
     ]
 }
@@ -2467,7 +2470,7 @@ mod tests {
             ("task_denial_rate", 1),
             ("open_sensor", 3),
         ];
-        let st = loss_stages(&ring, 4, &queues, None);
+        let st = loss_stages(&ring, 4, &queues, None, None);
         let totals: Vec<(u8, Option<u64>)> = st.iter().map(|s| (s.stage, s.total)).collect();
         assert_eq!(
             totals,
@@ -2484,14 +2487,16 @@ mod tests {
         );
         assert!(st[4].source.contains("budget") && st[5].source.contains("not run"));
         // R12c (lab PR 270): stages 6 and 7, the dispatcher's
-        let st = loss_stages(&ring, 4, &queues, Some((3, 9)));
+        let st = loss_stages(&ring, 4, &queues, Some((3, 9)), Some(2));
         assert_eq!((st[5].stage, st[5].total), (6, Some(3)));
         assert_eq!((st[6].stage, st[6].total), (7, Some(9)));
-        assert_eq!(st[7].total, None, "the export is R15's");
+        // lot 276: stage 8, the export's
+        assert_eq!((st[7].stage, st[7].total), (8, Some(2)));
+        assert!(st[7].source.contains("export"));
         queues[1].over_budget = 3;
         queues[3].over_budget = 2;
         assert_eq!(
-            loss_stages(&ring, 4, &queues, None)[4].total,
+            loss_stages(&ring, 4, &queues, None, None)[4].total,
             Some(5),
             "the late decisions"
         );
@@ -3680,7 +3685,7 @@ mod tests {
             assert_eq!((q.delay_timed, q.delay_untimed, q.over_budget), (2, 1, 1));
             assert!(q.delay_max_us.unwrap() >= 500_000, "{q:?}");
             assert_eq!(q.delay_budget_us, DECISION_BUDGET_NS[0] / 1_000);
-            let stages = loss_stages(&[], 0, &rx.stats().snapshot(), None);
+            let stages = loss_stages(&[], 0, &rx.stats().snapshot(), None, None);
             assert_eq!((stages[4].stage, stages[4].total), (5, Some(1)));
             let mut rec = LossRecorder::default();
             assert_eq!(rec.late([1, 0, 0, 0]), [(Priority::P0, 1, 1)]);

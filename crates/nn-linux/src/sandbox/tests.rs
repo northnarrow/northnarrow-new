@@ -410,7 +410,7 @@ fn landlock_denies_every_path_where_the_kernel_has_it() {
     let s = in_child(
         || {
             let mut level = SandboxLevel::default();
-            landlock_restrict(&mut level).is_ok()
+            landlock_restrict(&Profile::parse(3), &mut level).is_ok()
         },
         || {
             // SAFETY: plain syscall with a static C string.
@@ -456,7 +456,7 @@ fn the_level_declares_what_the_kernel_gave() {
     assert!(pid >= 0);
     if pid == 0 {
         let mut level = SandboxLevel::default();
-        let ok = landlock_restrict(&mut level).is_ok();
+        let ok = landlock_restrict(&Profile::parse(3), &mut level).is_ok();
         let out = [
             u8::from(ok),
             level.landlock_abi,
@@ -581,7 +581,7 @@ fn landlock_denies_tcp_and_signals_where_the_kernel_has_them() {
     let s = in_child(
         || {
             let mut level = SandboxLevel::default();
-            landlock_restrict(&mut level).is_ok()
+            landlock_restrict(&Profile::parse(3), &mut level).is_ok()
         },
         || connect_local() * 10 + signal_parent(),
     );
@@ -650,7 +650,7 @@ fn landlock_is_measured_where_the_kernel_has_it() {
         || true,
         || {
             let mut level = SandboxLevel::default();
-            if landlock_restrict(&mut level).is_err() {
+            if landlock_restrict(&Profile::parse(3), &mut level).is_err() {
                 return 100;
             }
             i32::from(level.fs_denied)
@@ -680,6 +680,286 @@ fn landlock_is_measured_where_the_kernel_has_it() {
     );
     assert!(libc::WIFEXITED(open), "status {open:#x}");
     assert_eq!(libc::WEXITSTATUS(open), 0);
+}
+
+// ── lot 276: the export worker's profile ────────────────────────────────
+
+/// nn-export's `SOCK_FLAGS` and `OPEN_FLAGS` (nn-linux does not depend on
+/// it; the agent's entry passes them, `xtask` checks the pair).
+const SOCK: i32 = libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+const OPEN: i32 =
+    libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+
+#[test]
+fn the_export_allowlist_keeps_its_sinks_and_nothing_to_escape_with() {
+    let a = Allowlist::export_worker(3, 1, SOCK, OPEN);
+    let names = a.names();
+    for kept in [
+        "recvfrom",
+        "recvfrom (receiver)",
+        "sendto",
+        "sendto (receiver)",
+        "write",
+        "write (file)",
+        "socket (tcp)",
+        "socket (tcp6)",
+        "connect",
+        "ppoll",
+        "getsockopt",
+        "ioctl",
+        "openat",
+        "renameat2",
+        "unlinkat",
+        "newfstatat",
+        "lseek",
+        "fdatasync",
+        "landlock_create_ruleset",
+        "landlock_add_rule",
+        "landlock_restrict_self",
+    ] {
+        assert!(names.contains(&kept), "{kept} kept");
+    }
+    for never in [
+        "open",
+        "socketpair",
+        "bind",
+        "listen",
+        "accept",
+        "accept4",
+        "execve",
+        "execveat",
+        "clone",
+        "clone3",
+        "fork",
+        "unshare",
+        "kill",
+        "tkill",
+        "rt_sigqueueinfo",
+        "pidfd_send_signal",
+        "ptrace",
+        "bpf",
+        "prctl",
+        "read",
+        "setuid",
+        "capset",
+        "recvmsg",
+        "sendmsg",
+        "pkey_mprotect",
+        "io_uring_setup",
+        "keyctl",
+        "perf_event_open",
+        "userfaultfd",
+        "mount",
+        "chmod",
+        "fchmod",
+        "chown",
+        "symlinkat",
+        "linkat",
+        "mknodat",
+    ] {
+        assert!(!names.contains(&never), "{never} not kept");
+    }
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), names.len(), "each rule named once");
+    assert!(program(&a).is_ok(), "the export allowlist compiles");
+    // a call kept both with and without arguments is refused: the empty
+    // set would stand for "any arguments" and the other would narrow it
+    let mut bad = Allowlist::default();
+    bad.calls.push((libc::SYS_write, "write", vec![]));
+    bad.calls.push((
+        libc::SYS_write,
+        "write (file)",
+        vec![seccomp::Arg::Ge(0, 4)],
+    ));
+    assert!(program(&bad).is_err());
+}
+
+#[test]
+fn under_the_export_filter_only_its_sinks_calls_run() {
+    let prog = program(&Allowlist::export_worker(3, u32::MAX, SOCK, OPEN)).unwrap();
+    let run = |body: fn() -> i32| in_child(|| install_prepared(&prog), body);
+    // its receiver's socket, its file's open: allowed
+    assert!(exited(
+        run(|| {
+            // SAFETY: plain syscalls on our own descriptor.
+            let fd = unsafe { libc::socket(libc::AF_INET, SOCK, 0) };
+            if fd < 0 {
+                return 1;
+            }
+            // SAFETY: our own descriptor.
+            unsafe { libc::close(fd) };
+            0
+        }),
+        0
+    ));
+    assert!(exited(
+        run(|| {
+            // SAFETY: openat of a fixed path with the sink's flags.
+            let fd = unsafe {
+                libc::openat(
+                    libc::AT_FDCWD,
+                    c"/nonexistent-dir/x".as_ptr(),
+                    OPEN,
+                    0o640 as libc::c_uint,
+                )
+            };
+            // ENOENT is fine: the call ran
+            i32::from(fd >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT))
+        }),
+        0
+    ));
+    // UDP, a UNIX socket, a read-open, an exec: killed
+    for body in [
+        (|| {
+            // SAFETY: a UDP socket.
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+            0
+        }) as fn() -> i32,
+        || {
+            // SAFETY: a UNIX socket.
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            0
+        },
+        || {
+            // SAFETY: a blocking TCP socket (not the sink's flags).
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            0
+        },
+        || {
+            // SAFETY: openat read-only.
+            unsafe { libc::openat(libc::AT_FDCWD, c"/etc/hostname".as_ptr(), libc::O_RDONLY) };
+            0
+        },
+        || {
+            // SAFETY: execve of a fixed path.
+            unsafe {
+                libc::execve(
+                    c"/bin/true".as_ptr(),
+                    [std::ptr::null()].as_ptr(),
+                    [std::ptr::null()].as_ptr(),
+                )
+            };
+            0
+        },
+        || {
+            // SAFETY: write to the channel's descriptor 3 by `write`
+            unsafe { libc::write(3, [0u8].as_ptr().cast(), 1) };
+            0
+        },
+    ] {
+        let s = run(body);
+        assert!(killed_by_sigsys(s), "status {s:#x}");
+    }
+}
+
+/// The export's Landlock: its directory writable, every other path not;
+/// after the pin, a TCP connect to another port refused (where the kernel's
+/// ABI handles TCP; below it the pin says it did not hold).
+#[test]
+fn the_export_landlock_grants_its_directory_and_pins_its_port() {
+    let abi = kernel_landlock_abi();
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().to_path_buf();
+    std::fs::write(dir.join("probe-path"), dir.as_os_str().as_encoded_bytes()).unwrap();
+    let profile = Profile {
+        fs_rules: vec![FsRule {
+            path: dir.clone(),
+            declared: nn_proto::ipc::EXPORT_DIR_RULE,
+        }],
+        ..Profile::export(3, SOCK, OPEN)
+    };
+    let (r, w) = {
+        let mut fds = [0; 2];
+        // SAFETY: pipe into a local array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    };
+    let inside =
+        std::ffi::CString::new(dir.join("export.jsonl").as_os_str().as_encoded_bytes()).unwrap();
+    let rotated =
+        std::ffi::CString::new(dir.join("export.jsonl.1").as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: fork; the child reports four bytes and exits.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        let mut level = SandboxLevel::default();
+        let ok = landlock_restrict(&profile, &mut level).is_ok();
+        // SAFETY: openat of a path inside the rule, and of one outside it.
+        let (inside_ok, outside_denied) = unsafe {
+            let fd = libc::openat(libc::AT_FDCWD, inside.as_ptr(), OPEN, 0o640 as libc::c_uint);
+            let a = fd >= 0;
+            if a {
+                libc::close(fd);
+            }
+            let fd = libc::openat(libc::AT_FDCWD, c"/etc/hostname".as_ptr(), libc::O_RDONLY);
+            (
+                a,
+                fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EACCES),
+            )
+        };
+        // the sink's rotation inside the rule: the active file renamed,
+        // the oldest removed (`JsonlSink::rotate`'s calls)
+        // SAFETY: renameat2 and unlinkat of paths inside the rule.
+        let (renamed, removed) = unsafe {
+            let rn = libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                inside.as_ptr(),
+                libc::AT_FDCWD,
+                rotated.as_ptr(),
+                0u32,
+            ) == 0;
+            (rn, libc::unlinkat(libc::AT_FDCWD, rotated.as_ptr(), 0) == 0)
+        };
+        let pinned = pin_tcp_connect(6514, SOCK);
+        // the pinned port itself is not Landlock's to refuse (nothing
+        // listens: `ECONNREFUSED`), another port is
+        let pinned_port_open = !tcp_refused(6514, SOCK);
+        let out = [
+            u8::from(ok),
+            u8::from(inside_ok) | u8::from(renamed) << 1 | u8::from(removed) << 2,
+            u8::from(outside_denied) | u8::from(!level.fs_rules.is_empty()) << 1,
+            u8::from(pinned) | u8::from(level.net_denied) << 1 | u8::from(pinned_port_open) << 2,
+        ];
+        // SAFETY: write to our pipe, then _exit.
+        unsafe {
+            libc::write(w, out.as_ptr().cast(), out.len());
+            libc::_exit(0);
+        }
+    }
+    let mut out = [0u8; 4];
+    // SAFETY: read from our pipe, wait for our child.
+    unsafe {
+        libc::close(w);
+        libc::read(r, out.as_mut_ptr().cast(), out.len());
+        libc::close(r);
+        let mut st = 0;
+        libc::waitpid(pid, &mut st, 0);
+    }
+    assert_eq!(out[0], 1, "the ruleset applied");
+    assert_eq!(
+        out[1], 0b111,
+        "its directory is writable, its files renamed and removed"
+    );
+    assert_eq!(out[3] & 0b100, 0b100, "the pinned port is not refused");
+    if abi == 0 {
+        assert_eq!(out[2], 0, "no Landlock: nothing denied, no rule declared");
+        assert_eq!(out[3] & 0b11, 0, "no pin");
+    } else {
+        assert_eq!(out[2], 0b11, "every other path denied, its rule declared");
+        assert_eq!(
+            out[3] & 0b10,
+            0,
+            "TCP not handled at entry: the pin does it"
+        );
+        assert_eq!(
+            out[3] & 1,
+            u8::from(abi >= 4),
+            "the pin holds from ABI 4, abi {abi}"
+        );
+    }
 }
 
 /// Lot 277: `getdents64` records as the kernel lays them out — `d_ino`,
@@ -789,4 +1069,101 @@ fn an_unreadable_task_list_refuses_the_sandbox() {
         }
         other => panic!("expected a refused step, got {other:?}"),
     }
+}
+
+/// The review of #499, D5: the export worker's files are bounded
+/// (`RLIMIT_FSIZE`), and a write past the bound fails with `EFBIG` — the
+/// process is not ended by `SIGXFSZ`.
+#[test]
+fn the_export_worker_s_files_are_bounded() {
+    assert_eq!(
+        Profile::export(3, SOCK, OPEN).max_file_bytes,
+        Some(EXPORT_MAX_FILE_BYTES)
+    );
+    assert_eq!(Profile::parse(3).max_file_bytes, None);
+    let st = in_child(
+        || {
+            harden(&Profile {
+                max_file_bytes: Some(4096),
+                ..Profile::export(2, SOCK, OPEN)
+            })
+            .is_ok()
+        },
+        || {
+            // SAFETY: plain syscalls on a file of our own.
+            unsafe {
+                let path = format!("/tmp/nn-fsize-{}\0", libc::getpid());
+                let fd = libc::open(
+                    path.as_ptr().cast(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC,
+                    0o600 as libc::c_uint,
+                );
+                if fd < 0 {
+                    return 2;
+                }
+                let buf = [b'a'; 8192];
+                let first = libc::write(fd, buf.as_ptr().cast(), buf.len());
+                let second = libc::write(fd, buf.as_ptr().cast(), buf.len());
+                let e = io::Error::last_os_error().raw_os_error();
+                libc::close(fd);
+                libc::unlink(path.as_ptr().cast());
+                if first == 4096 && second < 0 && e == Some(libc::EFBIG) {
+                    0
+                } else {
+                    3
+                }
+            }
+        },
+    );
+    assert!(exited(st, 0), "status {st:#x}");
+}
+
+/// The export directory's Landlock rule grants regular files only: read,
+/// list, write, create, remove, truncate — never a symbolic link, a device,
+/// a FIFO, a socket, a directory, execution or a move across directories
+/// (the second review of #499, mutation R7: `MakeSym` added went unseen;
+/// seccomp has no `symlink` either, but each layer holds alone).
+#[test]
+fn the_export_directory_s_rule_grants_regular_files_only() {
+    use landlock::AccessFs as A;
+    let r = export_dir_rights();
+    assert_eq!(
+        r,
+        A::ReadFile | A::ReadDir | A::WriteFile | A::RemoveFile | A::MakeReg | A::Truncate
+    );
+    for never in [
+        A::MakeSym,
+        A::MakeChar,
+        A::MakeBlock,
+        A::MakeFifo,
+        A::MakeSock,
+        A::MakeDir,
+        A::RemoveDir,
+        A::Execute,
+        A::Refer,
+    ] {
+        assert!(!r.contains(never), "{never:?}");
+    }
+}
+
+/// The export worker's `newfstatat` (the sink's open, the second review of
+/// #499, R3) only from the working directory and never following a link;
+/// the parse worker has none.
+#[test]
+fn the_export_worker_s_stat_never_follows_a_link() {
+    use super::seccomp::Arg;
+    let a = Allowlist::export_worker(3, 1, SOCK, OPEN);
+    let stat: Vec<_> = a.calls.iter().filter(|c| c.1 == "newfstatat").collect();
+    assert_eq!(stat.len(), 1);
+    assert_eq!(stat[0].0, libc::SYS_newfstatat);
+    assert_eq!(
+        stat[0].2,
+        vec![
+            Arg::Eq(0, u64::from(libc::AT_FDCWD as u32)),
+            Arg::Eq(3, libc::AT_SYMLINK_NOFOLLOW as u64),
+        ]
+    );
+    assert!(!Allowlist::parse_worker(3, 1)
+        .names()
+        .contains(&"newfstatat"));
 }

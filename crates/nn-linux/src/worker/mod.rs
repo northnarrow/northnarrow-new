@@ -47,6 +47,19 @@ pub use supervisor::{Health, WorkerError, Workers};
 /// The account the workers run as (install.sh, the packages' postinst).
 pub const WORKER_USER: &str = "northnarrow-worker";
 
+/// Lot 276, the review of #499 (D1): the export worker's own account — the
+/// one that owns the export's directory; the parse worker's cannot write
+/// it.
+pub const EXPORT_USER: &str = "northnarrow-export";
+
+/// The account a worker of `kind` runs as.
+pub fn account_name(kind: nn_proto::ipc::WorkerKind) -> &'static str {
+    match kind {
+        nn_proto::ipc::WorkerKind::Parse => WORKER_USER,
+        nn_proto::ipc::WorkerKind::Export => EXPORT_USER,
+    }
+}
+
 /// The lowest descriptor number [`SelfImage`] keeps its binary on: far
 /// from the channel's (3) and stdio, which a child rearranges.
 const IMAGE_FD_MIN: libc::c_int = 64;

@@ -272,7 +272,10 @@ ProtectHome=read-only
 # THIS process: the inode_protect write-deny hooks refuse every other
 # pid (at-authz-1/2), so widening the mount does not widen the attack
 # surface.
-ReadWritePaths=/run/northnarrow /var/lib/northnarrow /etc/northnarrow
+# Lot 276: the export worker's JSONL files (docs/operator/EXPORT.md). The
+# `-` keeps the unit starting where install.sh did not make it; the worker's
+# Landlock rule is this directory alone, and only it writes there.
+ReadWritePaths=/run/northnarrow /var/lib/northnarrow /etc/northnarrow -/var/log/northnarrow/export
 # Lot 273d: our units' and slice's own drop-in directories (the ones the
 # ExecStartPre=+ lines above make), so that a harmful drop-in made inside a
 # trusted-installer window is moved to /var/lib/northnarrow/quarantine at the

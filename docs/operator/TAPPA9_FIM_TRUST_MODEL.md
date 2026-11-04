@@ -192,6 +192,27 @@ the trusted-installer window first, or expect the capability to be removed.
   per-entry. Adding `/etc/passwd` to the watch list catches
   modifications to that exact path; it does NOT catch new files
   appearing under `/etc/` more generally.
+- **`modprobe.d`'s `install` and `remove` commands (lot 279).** kmod
+  runs the command an `install <module> <cmd>` or `remove <module> <cmd>`
+  line names, through `/bin/sh -c`, as root, whenever `modprobe` (or
+  `modprobe -r`) reaches that module — a name R011 records since lot 279
+  (it judges the command line, not the configuration). The command's
+  execs are judged by the exec rules like any other (`modprobe` is no
+  trusted actor: its children inherit no exemption), but no rule says
+  "modprobe started a shell". Writing the configuration takes root, who
+  can run the command directly; for a kernel-driven load
+  (`request_module`, a kernel thread's child) this was so before lot 279
+  too, while a `modprobe` run from user space was killed by R011 on `main`
+  (racing it, so its command usually did not run). Coverage today:
+  `/etc/modprobe.d` is in the watch list (`configs/fim-paths.v1`) but no
+  rule judges a write there — the drift is journalled, not alerted;
+  `/run/modprobe.d`, `/lib/modprobe.d`, `/usr/lib/modprobe.d` and
+  `/usr/local/lib/modprobe.d` are not watched; an `install` line in
+  `/lib/modules/$(uname -r)/modules.softdep`, which kmod reads with the
+  same parser, is a file under `/lib/modules/` (NN-L-FIM-008, Critical).
+  Follow-ups (another lot): a FIM rule (a High record) for writes in every
+  `modprobe.d` directory, and a record for a child of `modprobe`/`kmod`
+  other than `/bin/true` and `/bin/false`.
 
 ## Audit + integrity guarantees
 

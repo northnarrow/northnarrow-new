@@ -186,7 +186,9 @@ fn the_agent_can_move_a_drop_in_out_of_our_own_directories() {
             [
                 "/run/northnarrow",
                 "/var/lib/northnarrow",
-                "/etc/northnarrow"
+                "/etc/northnarrow",
+                // lot 276: the export worker's JSONL files
+                "/var/log/northnarrow/export"
             ]
             .contains(&p)
                 || made.iter().any(|m| m == p),

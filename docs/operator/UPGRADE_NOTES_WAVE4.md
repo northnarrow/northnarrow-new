@@ -44,7 +44,13 @@ has the details of each change below.
    test that expected the kill sees the record; `enforce R009` in the
    signed per-rule policy restores it in every posture
    (`RULE_POLICY.md` §1).
-8. **The first upgrade to this release** runs the scripts' windows through
+8. R011 no longer kills an exec of the system's `modprobe` by module name
+   (lot 279, §3): the container runtimes', kube-proxy's, k3s's and an
+   administrator's `modprobe <name>` is a High record. A dashboard or a test
+   that expected the kill of `sudo modprobe dummy` sees the record;
+   `insmod`, `modprobe` of a path, `-C`/`-d`/`-S`/`--force*`, an option
+   after the name and `MODPROBE_OPTIONS` are killed as before.
+9. **The first upgrade to this release** runs the scripts' windows through
    the installed nn-admin, the older one, which has no `--for-installer`:
    that upgrade's window names no installer. Below COMBAT nothing changes
    (the tree's `--version` is a High record, not killed); in COMBAT the
@@ -173,6 +179,37 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
 (`UPGRADE_NOTES_AUDIT_16f7563.md` §1).
 
 ## 3. Detections and evidence
+
+- **R011 judges a module tool's command line (lot 279).** An exec of
+  `modprobe` (or `kmod`) by the system's tool, of plain module names with
+  only options that move and force nothing before the first name, and none
+  of `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH` in its
+  environment, is recorded (High, T1547.006, `response: none`), its
+  reasoning naming the names ("modprobe of 'overlay'"); `kmod list`,
+  `static-nodes` and kmod run as `lsmod`, `rmmod`, `modinfo`, `depmod` too.
+  Killed as before, the reasoning saying why ("killed: …"): `insmod`; a
+  path or a `.ko*` name; `-C`, `-d`, `-S`, `--force*`, `-o`,
+  `--remove-holders`, `--remove-dependencies`; an argument starting with
+  `-` after the first name (`modprobe <name> -q`); a copy of the tool or a
+  program whose device and inode are not those of the file `/usr/bin/kmod`
+  resolves to, or every tool when `/usr/bin/kmod` and `/bin/kmod` are two
+  different files (not one file under both names, as a merged `/usr`
+  shows it); one of those variables (a root shell with `LD_LIBRARY_PATH`
+  set kills its `modprobe`; read, it is evidence: killed even if the
+  process has since exited, not a false positive); a running process whose environment the agent
+  could not read at the exec, an environment over 1 MiB; a cut argv. A
+  module tool that had exited before the agent could read its environment
+  is recorded, the reasoning saying so ("exited before its environment
+  could be read — a load it made is the kernel's to judge (R018); its
+  environment not verified"): its kill would reach no one. A tool whose
+  first thread exited while another runs on has not exited: its
+  environment is read through the running thread (killed when none is read
+  whole). R011 resolves no
+  name and reads no `modprobe.d`: the load is the kernel's signature
+  policy's to refuse, and R018's to judge after it (with no verdict for a
+  packaged file loaded by a comm of its loader allowlist). The
+  `install`/`remove` commands of `modprobe.d` are a residual
+  (`TAPPA9_FIM_TRUST_MODEL.md`).
 
 - **No more advisor detections.** An exec that no rule matches gets no
   detection (it was offered to the model when one was loaded). Rule

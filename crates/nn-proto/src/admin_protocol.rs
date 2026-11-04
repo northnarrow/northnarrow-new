@@ -925,6 +925,82 @@ pub struct StatusResponse {
     /// than the field.
     #[serde(default)]
     pub response_dispatch: Option<ResponseDispatchStatus>,
+    /// Lot 276: the export (`nn-admin export status --key`) — its signed
+    /// configuration, its worker, each sink's state and each chain's place,
+    /// and stage 8 (rows the export can no longer deliver). Appended after
+    /// `response_dispatch`; telemetry (`None` in the unsigned reply, one
+    /// byte); `None` from an agent older than the field.
+    #[serde(default)]
+    pub export: Option<ExportStatus>,
+}
+
+/// Lot 276: the export's state ([`StatusResponse::export`];
+/// `docs/operator/EXPORT.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportStatus {
+    /// `off` (no signed configuration, or `enabled = false`), `on`,
+    /// `refused` (its signature did not verify), `failed` (it does not
+    /// parse, or its CA file is not the one it pins).
+    pub state: String,
+    /// Why it is off, refused or failed.
+    pub why: Option<String>,
+    /// The configuration in one line, and the SHA-256 of its signed text.
+    pub config: Option<String>,
+    pub config_sha256: Option<String>,
+    /// The OCSF version of every record.
+    pub ocsf_version: String,
+    /// The export worker's state (`ready`, `restarting`, `disabled`,
+    /// `unavailable`, `stopped`), as the supervisor says it.
+    pub worker: String,
+    /// The worker's connects pinned to the receiver's port by Landlock
+    /// (measured; `None` before a setup, or without a syslog sink).
+    pub port_pinned: Option<bool>,
+    pub sinks: Vec<ExportSinkStatus>,
+    /// Stage 8: rows the export can no longer deliver (evicted before it
+    /// read them, longer than a request carries), every sink together.
+    pub lost: u64,
+    /// The cursors were last written (RFC 3339), and how many times.
+    pub cursors_saved: Option<String>,
+    pub cursor_saves: u64,
+}
+
+/// One sink of the export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportSinkStatus {
+    /// `file` or `syslog`.
+    pub sink: String,
+    /// Where: the file's directory, or `<ip>:<port> (<name>)`.
+    pub target: String,
+    /// `up`, `connecting`, `down`, `failed`, or `waiting` (no answer yet).
+    pub state: String,
+    /// Why it is not up (the worker's closed set, in words).
+    pub fault: Option<String>,
+    /// Rows delivered (written and synced; acknowledged by the receiver's
+    /// TCP and settled) and their OCSF records, since the start.
+    pub rows: u64,
+    pub records: u64,
+    /// Of the rows delivered, those whose signature did not verify.
+    pub unverified: u64,
+    /// Requests that failed, the worker's faults, since the start.
+    pub faults: u64,
+    /// Stage 8 for this sink.
+    pub lost: u64,
+    /// The last delivery (RFC 3339).
+    pub last_delivery: Option<String>,
+    pub chains: Vec<ExportChainStatus>,
+}
+
+/// One chain on one sink.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportChainStatus {
+    pub chain: String,
+    /// The last row delivered: its file and line (`None`: none yet).
+    pub cursor: Option<(u64, u64)>,
+    /// Rows sent and not delivered yet.
+    pub in_flight: u64,
+    /// The chain's bytes after the cursor: how far the sink is behind.
+    pub behind_bytes: u64,
+    pub lost: u64,
 }
 
 /// R12c (lab PR 270): stages 6 and 7 in `nn-admin status --key`
@@ -1236,6 +1312,7 @@ impl StatusResponse {
             event_bus: None,
             event_bus_decision: None,
             response_dispatch: None,
+            export: None,
         }
     }
 
@@ -2356,6 +2433,7 @@ mod tests {
             event_bus: None,
             event_bus_decision: None,
             response_dispatch: None,
+            export: None,
         }));
     }
 
@@ -2429,6 +2507,7 @@ mod tests {
             event_bus: None,
             event_bus_decision: None,
             response_dispatch: None,
+            export: None,
         }));
     }
 
@@ -2684,6 +2763,7 @@ mod tests {
             event_bus: None,
             event_bus_decision: None,
             response_dispatch: None,
+            export: None,
         }));
     }
 
@@ -2786,6 +2866,7 @@ mod tests {
             event_bus: None,
             event_bus_decision: None,
             response_dispatch: None,
+            export: None,
         }
     }
 
@@ -2882,11 +2963,14 @@ mod tests {
         });
         let a = postcard::to_allocvec(&without).unwrap();
         let b = postcard::to_allocvec(&with).unwrap();
-        // the three appended fields' tags: R12a's bus, R12b's decision
-        // delay, R12c's response dispatch (lab PR 270)
-        assert!(a.ends_with(&[0, 0, 0]), "the absent fields' tags");
-        assert!(b.starts_with(&a[..a.len() - 3]) && b.len() > a.len());
-        assert!(b.ends_with(&[0, 0]), "R12b's and R12c's fields, absent");
+        // the four appended fields' tags: R12a's bus, R12b's decision
+        // delay, R12c's response dispatch (lab PR 270), lot 276's export
+        assert!(a.ends_with(&[0, 0, 0, 0]), "the absent fields' tags");
+        assert!(b.starts_with(&a[..a.len() - 4]) && b.len() > a.len());
+        assert!(
+            b.ends_with(&[0, 0, 0]),
+            "R12b's, R12c's and lot 276's fields, absent"
+        );
         assert_eq!(postcard::from_bytes::<StatusResponse>(&b).unwrap(), with);
         let public = StatusResponse::public(PostureKind::Observing, false, None, None, None);
         assert_eq!(public.event_bus, None);
@@ -2912,7 +2996,9 @@ mod tests {
             cap_per_uid: 256,
         });
         let c = postcard::to_allocvec(&with_delay).unwrap();
-        assert!(c.starts_with(&b[..b.len() - 2]) && c.len() > b.len());
+        // (b's last three: the decision's delay, the dispatch, lot 276's
+        // export — all absent)
+        assert!(c.starts_with(&b[..b.len() - 3]) && c.len() > b.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&c).unwrap(),
             with_delay
@@ -2972,7 +3058,8 @@ mod tests {
             ransomware_inline: 0,
         });
         let d = postcard::to_allocvec(&with_dispatch).unwrap();
-        assert!(d.starts_with(&c[..c.len() - 1]) && d.len() > c.len());
+        // (c's last two: the dispatch and lot 276's export, absent)
+        assert!(d.starts_with(&c[..c.len() - 2]) && d.len() > c.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&d).unwrap(),
             with_dispatch
@@ -3520,8 +3607,8 @@ mod tests {
         // `cow_guard`, lab PR 223's ten `execq_*`, lab PR 224's four
         // counters, lab PR 225's seven, lab PR 226's ten, lab PR 267's
         // `event_bus`, lab PR 269's `event_bus_decision`, lab PR 270's
-        // `response_dispatch`.
-        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1;
+        // `response_dispatch`, lot 276's `export`.
+        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
@@ -4314,10 +4401,12 @@ mod tests {
         // prefix 0x4c → 0x4d).
         // R12c (lab PR 270): one byte longer (0x4d -> 0x4e) — the absent
         // tag of `response_dispatch`, appended last.
+        // Lot 276: one byte longer (0x4e -> 0x4f) — the absent tag of
+        // `export`, appended last; every byte before it is R12c's pin.
         const STATUS_RESPONSE: &str = concat!(
-            "0000004e050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
+            "0000004f050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
             "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "0000",
+            "000000",
         );
         const SHUTDOWN_REQUEST: &str = concat!(
             "0000007a0602abababababababababababababababababababababababababababababababab808f",

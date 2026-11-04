@@ -664,6 +664,40 @@ pub struct WorkerEntry {
     pub sandbox: Option<nn_proto::ipc::SandboxLevel>,
 }
 
+/// Lot 276: the export as its signed configuration sets it, and what its
+/// worker measured of its sandbox's pin (`docs/operator/EXPORT.md`). Its
+/// sinks' live state (up, down) is not a capability: the status and the
+/// beats carry it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportEntry {
+    /// `on`, `off` (`enabled = false`), `refused` (its signature did not
+    /// verify), `failed` (it does not parse, its CA file is not the one it
+    /// pins).
+    pub state: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+    pub ocsf_version: String,
+    pub chains: Vec<String>,
+    /// Each sink and where it writes.
+    pub sinks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_sha256: Option<String>,
+    /// The worker's connects pinned to the receiver's port by Landlock,
+    /// measured after its setup (`None`: not yet, or no syslog sink).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_pinned: Option<bool>,
+}
+
+impl ExportEntry {
+    fn rank(&self) -> u8 {
+        match self.state.as_str() {
+            "on" => 0,
+            "off" => 1,
+            _ => 2,
+        }
+    }
+}
+
 /// What this boot runs with (lab PR 218), and since R13 each source and
 /// class against its contract, the revision, its hashes and what changed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -713,6 +747,10 @@ pub struct CapabilityManifest {
     /// R14a: the workers (plan §3.1), their state and their sandbox level.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workers: Vec<WorkerEntry>,
+    /// Lot 276: the export, when a signed configuration of it is there
+    /// (none: no export).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<ExportEntry>,
     /// R13: the telemetry probe's period (`off` when switched off), and
     /// whether its first round has ended (`settled`: the manifest states
     /// the self-test's word on every probed source).
@@ -920,6 +958,25 @@ impl CapabilityManifest {
                 out.push(format!("worker {}: gone", b.kind));
             }
         }
+        if self.export != before.export {
+            let line = |e: &Option<ExportEntry>| match e {
+                None => "none".to_string(),
+                Some(e) => format!(
+                    "{}{}",
+                    e.state,
+                    match e.port_pinned {
+                        Some(true) => ", port pinned",
+                        Some(false) => ", port not pinned",
+                        None => "",
+                    }
+                ),
+            };
+            out.push(format!(
+                "export: {} → {}",
+                line(&before.export),
+                line(&self.export)
+            ));
+        }
         if self.deny_hooks != before.deny_hooks {
             out.push(format!(
                 "deny hooks: {} of {} → {} of {}",
@@ -981,6 +1038,20 @@ impl CapabilityManifest {
             || self.deny_hooks.attached < before.deny_hooks.attached
             || self.trust_level < before.trust_level
             || self.workers_worsen_from(before)
+            || self.export_worsens_from(before)
+    }
+
+    /// Lot 276: the export off, refused or failed where it was on, or its
+    /// pin lost.
+    fn export_worsens_from(&self, before: &CapabilityManifest) -> bool {
+        match (&self.export, &before.export) {
+            (Some(a), Some(b)) => {
+                a.rank() > b.rank() || (b.port_pinned == Some(true) && a.port_pinned != Some(true))
+            }
+            (None, Some(b)) => b.state == "on",
+            (Some(a), None) => a.rank() > 1,
+            (None, None) => false,
+        }
     }
 
     /// R14a: a worker kind in a worse state, gone, or sandboxed less than

@@ -282,8 +282,8 @@ pub fn full_status() -> StatusResponse {
                  "source": "responses decided and not run: displaced or refused by the full response queue, or queued at the stop (each signed in the actions chain)"},
                 {"stage": 7, "name": "evidence writer queue", "total": 3,
                  "source": "detection records dropped or refused, action rows not in their chain, canary rows not written"},
-                {"stage": 8, "name": "export", "total": null,
-                 "source": "not counted yet: R15, the export"}
+                {"stage": 8, "name": "export", "total": 2,
+                 "source": "rows the export can no longer deliver: evicted before a sink read them, longer than a request carries (every sink's)"}
             ]
         },
         // R12b (lab PR 269): stage 5 per queue, P0's floods capped per uid.
@@ -323,10 +323,34 @@ pub fn full_status() -> StatusResponse {
         "evidence_wait_max_us": 8000, "evidence_written": 4100, "evidence_append_failed": 0,
         "canary_unwritten": 1, "ransomware_prepared": 6, "ransomware_inline": 0
     });
+    // Lot 276: the export (a json! of its own, as the dispatcher's).
+    let export = json!({
+        "state": "on", "why": null,
+        "config": "on · chains detections,actions · start end · file (4 × 64 MiB), syslog 192.0.2.10:6514 (siem.example.org)",
+        "config_sha256": "5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f",
+        "ocsf_version": "1.9.0", "worker": "ready", "port_pinned": true,
+        "sinks": [
+            {"sink": "file", "target": "/var/log/northnarrow/export", "state": "up", "fault": null,
+             "rows": 1204, "records": 1612, "unverified": 0, "faults": 0, "lost": 0,
+             "last_delivery": "2026-11-03T20:00:00.000000Z",
+             "chains": [
+                {"chain": "detections", "cursor": [3, 112], "in_flight": 0, "behind_bytes": 0, "lost": 0},
+                {"chain": "actions", "cursor": null, "in_flight": 0, "behind_bytes": 0, "lost": 0}]},
+            {"sink": "syslog", "target": "192.0.2.10:6514 (siem.example.org)", "state": "down",
+             "fault": "connect: Connection refused (os error 111)",
+             "rows": 980, "records": 1300, "unverified": 1, "faults": 6, "lost": 2,
+             "last_delivery": null,
+             "chains": [
+                {"chain": "detections", "cursor": [3, 80], "in_flight": 4, "behind_bytes": 9811, "lost": 2},
+                {"chain": "actions", "cursor": [1, 7], "in_flight": 0, "behind_bytes": 0, "lost": 0}]}
+        ],
+        "lost": 2, "cursors_saved": "2026-11-03T20:00:01.000000Z", "cursor_saves": 31
+    });
     for (k, x) in fill.as_object().unwrap() {
         v[k] = x.clone();
     }
     v["response_dispatch"] = dispatch;
+    v["export"] = export;
     serde_json::from_value(v).unwrap()
 }
 
@@ -525,6 +549,17 @@ pub fn verbs() -> Vec<Verb> {
             "net status --json --socket admin.sock",
             Special::None,
         ),
+        // lot 276
+        (
+            "export-status",
+            "export status --socket admin.sock",
+            Special::None,
+        ),
+        (
+            "export-status-json",
+            "export status --json --socket admin.sock",
+            Special::None,
+        ),
     ] {
         let mut full_unsigned = full_status();
         full_unsigned.capability_manifest = None;
@@ -573,6 +608,17 @@ pub fn verbs() -> Vec<Verb> {
             format!("net status --json {SIGNED}"),
             Special::None,
         ),
+        // lot 276: the export, signed telemetry
+        (
+            "export-status-key",
+            format!("export status {SIGNED}"),
+            Special::None,
+        ),
+        (
+            "export-status-key-json",
+            format!("export status --json {SIGNED}"),
+            Special::None,
+        ),
         (
             "capabilities",
             format!("capabilities {SIGNED}"),
@@ -597,8 +643,14 @@ pub fn verbs() -> Vec<Verb> {
         if name.starts_with("capabilities") {
             success.push(("manifest-not-json".to_string(), telemetry(Some(not_json))));
         }
+        // lot 276: an agent with no export configured
+        if name.starts_with("export-") {
+            let mut none = full_status();
+            none.export = None;
+            success.push(("no-export".to_string(), telemetry(Some(none))));
+        }
         // R13 (lab PR 271): a revision of the sensor contract's manifest
-        if !name.starts_with("net-") {
+        if !name.starts_with("net-") && !name.starts_with("export-") {
             let mut r13 = full_status();
             r13.capability_manifest = Some(capability_manifest_r13());
             success.push(("contract-revision".to_string(), telemetry(Some(r13))));

@@ -258,7 +258,7 @@ impl Launcher for Scripted {
     fn unavailable(&self) -> Option<String> {
         None
     }
-    fn account(&self) -> Option<(u32, u32)> {
+    fn account(&self, _kind: WorkerKind) -> Option<(u32, u32)> {
         Some((UID, GID))
     }
     fn kernel_landlock_abi(&self) -> u8 {
@@ -768,6 +768,7 @@ fn an_unavailable_launcher_is_reported_once_and_never_started() {
         launcher: Arc::new(ImageLauncher {
             image: None,
             account: Err("no user".into()),
+            export_account: Err("no export account".into()),
             extra_args: vec![],
         }),
         roles,
@@ -882,7 +883,7 @@ impl Launcher for ShortLived {
     fn unavailable(&self) -> Option<String> {
         None
     }
-    fn account(&self) -> Option<(u32, u32)> {
+    fn account(&self, _kind: WorkerKind) -> Option<(u32, u32)> {
         Some((UID, GID))
     }
     fn kernel_landlock_abi(&self) -> u8 {
@@ -989,7 +990,7 @@ impl Launcher for Spinner {
     fn unavailable(&self) -> Option<String> {
         None
     }
-    fn account(&self) -> Option<(u32, u32)> {
+    fn account(&self, _kind: WorkerKind) -> Option<(u32, u32)> {
         Some((UID, GID))
     }
     fn kernel_landlock_abi(&self) -> u8 {
@@ -1105,6 +1106,7 @@ fn a_worker_is_started_from_the_supervisor_s_thread_only() {
     let launcher = ImageLauncher {
         image: None,
         account: Err("none".into()),
+        export_account: Err("no export account".into()),
         extra_args: vec![],
     };
     let err = launcher.launch(WorkerKind::Parse).unwrap_err();
@@ -1171,7 +1173,7 @@ impl Launcher for Contradicted {
     fn unavailable(&self) -> Option<String> {
         None
     }
-    fn account(&self) -> Option<(u32, u32)> {
+    fn account(&self, _kind: WorkerKind) -> Option<(u32, u32)> {
         Some((UID, GID))
     }
     fn kernel_landlock_abi(&self) -> u8 {
@@ -1236,6 +1238,39 @@ fn a_hello_the_kernel_or_proc_contradicts_is_refused() {
     }
 }
 
+/// Lot 276 (the review of #499, D1): each kind its account — the export
+/// worker's is its own, never the parse worker's, and none without it.
+#[test]
+fn each_worker_kind_runs_as_its_own_account() {
+    let acct = |name: &str, id: u32| crate::worker::WorkerAccount {
+        name: name.into(),
+        uid: id,
+        gid: id,
+    };
+    let both = ImageLauncher {
+        image: None,
+        account: Ok(acct("northnarrow-worker", 990)),
+        export_account: Ok(acct("northnarrow-export", 989)),
+        extra_args: Vec::new(),
+    };
+    assert_eq!(both.account(WorkerKind::Parse), Some((990, 990)));
+    assert_eq!(both.account(WorkerKind::Export), Some((989, 989)));
+    let no_export = ImageLauncher {
+        export_account: Err("no such user".into()),
+        ..both
+    };
+    assert_eq!(no_export.account(WorkerKind::Parse), Some((990, 990)));
+    assert_eq!(no_export.account(WorkerKind::Export), None);
+    assert_eq!(
+        crate::worker::account_name(WorkerKind::Export),
+        "northnarrow-export"
+    );
+    assert_eq!(
+        crate::worker::account_name(WorkerKind::Parse),
+        "northnarrow-worker"
+    );
+}
+
 /// F7: the production launcher reads the worker's `/proc/<pid>/status`
 /// itself — here this test process's, which is no worker (no seccomp
 /// filter, no `no_new_privs`), and a pid that does not exist.
@@ -1244,6 +1279,7 @@ fn the_image_launcher_reads_the_process_s_own_status() {
     let launcher = ImageLauncher {
         image: None,
         account: Err("none".into()),
+        export_account: Err("no export account".into()),
         extra_args: Vec::new(),
     };
     // SAFETY: getuid and getgid have no preconditions.
@@ -1259,5 +1295,59 @@ fn the_image_launcher_reads_the_process_s_own_status() {
     assert!(
         gone.as_ref().is_err_and(|e| e.contains("unreadable")),
         "{gone:?}"
+    );
+}
+
+/// Lot 276: a request in flight holds its slot; the supervisor's pass
+/// passes over it at once instead of waiting for it (the export's requests
+/// last their budget: the parse worker's watch is never held up by them).
+#[test]
+fn a_pass_does_not_wait_on_a_slot_a_request_holds() {
+    let f = fixture(Script::SlowNames);
+    assert!(tick_until(&f.workers, Health::Ready));
+    let w = f.workers.clone();
+    let req =
+        std::thread::spawn(move || w.request(WorkerKind::Parse, &names(), Duration::from_secs(2)));
+    // the request has the slot (the worker answers its names after 100 ms)
+    std::thread::sleep(Duration::from_millis(30));
+    let t = Instant::now();
+    f.workers.tick(Instant::now());
+    let took = t.elapsed();
+    assert!(
+        took < Duration::from_millis(60),
+        "the pass waited {took:?} on a slot held by a request"
+    );
+    assert!(matches!(req.join().unwrap(), Ok(Answer::DnsNames(_))));
+}
+
+/// Lot 276: the requester's own check of an answer (the export's window)
+/// condemns the worker as a violation: killed, counted, reported, another
+/// started.
+#[test]
+fn a_condemned_worker_is_killed_as_for_a_violation() {
+    let f = fixture(Script::Honest);
+    assert!(tick_until(&f.workers, Health::Ready));
+    let pid = f.workers.status()[0].pid.unwrap();
+    f.workers.condemn(
+        WorkerKind::Parse,
+        "export_rows: a row the core did not send",
+    );
+    let st = &f.workers.status()[0];
+    assert_eq!(st.violations, 1, "{st:?}");
+    assert_ne!(st.health, Health::Ready);
+    assert!(
+        f.reports
+            .lock()
+            .iter()
+            .any(|(_, d)| d.contains("a row the core did not send")),
+        "{:?}",
+        f.reports.lock()
+    );
+    assert!(tick_until(&f.workers, Health::Ready));
+    assert_ne!(f.workers.status()[0].pid, Some(pid), "another worker");
+    // a kind with no slot: nothing happens
+    f.workers.condemn(
+        WorkerKind::Export,
+        "export_rows: a row the core did not send",
     );
 }

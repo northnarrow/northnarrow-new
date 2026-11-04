@@ -87,6 +87,55 @@ copied to `/tmp` or a home (R017), and the module, capability and namespace
 tools (R011, R012, R013), run by root from there, are killed in every
 posture, as before.
 
+**R011 judges a module tool's command line (lot 279, 04/11/2026).**
+R011's kill existed before Wave 4 and stays in `OBSERVING_KILLS` below; lot
+279 narrows it and adds no kill. An exec of the system's module tool by
+module name — plain names, before the first name only options that move and
+force nothing, no `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or
+`LD_LIBRARY_PATH` in its environment — is a High record (T1547.006), not
+killed, in every posture. Killed as before, in every posture: `insmod`;
+`modprobe` of a path or a `.ko*` name; `-C`, `-d`, `-S`, `--force*`, `-o`,
+`--remove-holders`, `--remove-dependencies`; any argument starting with `-`
+after the first name (`modprobe <name> -q` included); a copy of the tool or
+a program that is not the system's (its device and inode against the file
+`/usr/bin/kmod` resolves to; every tool when `/usr/bin/kmod` and `/bin/kmod`
+are two different files, not one file under both names as a merged `/usr`
+shows it); one of those variables (read, it is evidence: killed even if the
+process has since exited), a running process
+whose environment the agent could not read at the exec, an environment over
+1 MiB, an unknown start; an argv not read whole. A tool that had exited
+before the agent could read its environment is recorded, its environment
+not verified — a kill would reach no one; a tool whose first thread (its
+leader) exited while another thread runs on has not exited: the agent reads
+the environment through the running thread, and kills when it cannot read
+it whole — or sees no thread running while the kernel counts more than one. For a short-lived `modprobe` the environment's check is best
+effort. R011 resolves nothing: whether a name
+loads a module, and which, is the kernel's to judge — its module signature
+enforcement and lockdown (the host check reports both) and lot 285's deny of
+an untrusted file are what prevent a load. R018 judges the loads the kernel
+reports, after them (it observes, it denies nothing): no verdict for a
+kernel thread's child; the loader's tree killed for a file outside the
+module directories; for an unowned file in them a kill, or a Log when the
+loader or its parent is in R018's loader allowlist (`systemd-udevd`,
+`systemd-modules`, `kmod`: comms); no verdict for a packaged file loaded by
+those, a Log by another loader; every load a journal line. Taking `kmod` out
+of that allowlist goes with lot 285's redesign of R018. What R011 never
+covered: a root process loading a module with its own `finit_module(2)` (with
+comm `kmod`, maybe no verdict at all), a root parent tracing the tool and
+rewriting its argv or environment after the agent read them, code injected
+into the tool (an `LD_PRELOAD` read too late, `/etc/ld.so.preload`) that
+forks and lets the tool exit: the agent reads an exited tool (recorded),
+and a kill of the tool would not reach that child, which runs on out of its
+tree. The
+`install`/`remove` commands of root's `modprobe.d` run as programs the exec
+rules judge; before lot 279 a user-space `modprobe` was killed, its command
+then usually not run — the residual and `modprobe.d`'s coverage are in
+`TAPPA9_FIM_TRUST_MODEL.md`. Why: the container runtimes, kube-proxy and k3s
+run `modprobe` of the distribution's netfilter, bridge and overlay modules
+(lot 275's lab: rootful podman's network killed on Ubuntu 22.04). No
+directive restores the kill of a recorded exec: `enforce R011` runs R011's
+own response, which for it is the record.
+
 Inside an administrator's `sudo` session at a terminal, a package
 transaction or an installer's window (R009's Low record), those rules'
 kills of the same exec are held by the legacy ceiling (R009's record is the
@@ -129,7 +178,12 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CAT
   answer the agent saw, which benign software can produce out of its sight
   (a container's resolvers of its own, DNS over TCP, DoT or DoH, an address
   configured by hand): refused until it is measured on a wider corpus
-  (review of #495; `NETWORK_TELEMETRY.md` §4). Its kill stays held.
+  (review of #495; `NETWORK_TELEMETRY.md` §4). Its kill stays held. The
+  agent's own export worker (lot 276) connects to its syslog receiver by
+  address, never by a name: a receiver at a public address is recorded
+  (Medium) unless it is in `nodns-allow.local`; were this `enforce` ever
+  accepted, its kill would be aimed at that worker — the allowlist first
+  (`EXPORT.md` §8).
 In a policy you sign, the line refuses the file like any bad line
 (`nn-admin config overlay set` and `policy-test` say so). In a policy
 signed before the upgrade, the agent's start takes only that line as

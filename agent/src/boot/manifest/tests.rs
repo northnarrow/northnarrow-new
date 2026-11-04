@@ -47,6 +47,7 @@ fn base() -> CapabilityManifest {
         missing: Vec::new(),
         content: Vec::new(),
         workers: Vec::new(),
+        export: None,
         telemetry_probe: String::new(),
         settled: false,
         contract_hash: String::new(),
@@ -130,6 +131,7 @@ fn inputs(bpf_lsm: BpfLsm, self_test: SelfTestOutcome) -> Inputs {
         opt_ins: Vec::new(),
         workers: None,
         proc_root: healthy_proc(),
+        export: None,
     }
 }
 
@@ -833,6 +835,7 @@ fn the_stop_beat_signs_what_is_pending() {
             audit: None,
             probe_on: false,
             nodns: None,
+            export: None,
         },
     );
     let view = m.current().unwrap();
@@ -858,6 +861,7 @@ fn the_workers_entries_say_their_state_and_why() {
         launcher: Arc::new(ImageLauncher {
             image: None,
             account: Err("no user".into()),
+            export_account: Err("no export account".into()),
             extra_args: Vec::new(),
         }),
         roles: Arc::new(NoPidRoles),

@@ -4415,6 +4415,7 @@ mod tests {
                 event_bus: None,
                 event_bus_decision: None,
                 response_dispatch: None,
+                export: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

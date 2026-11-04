@@ -148,6 +148,9 @@ pub const OBSERVING_KILLS: &[(&str, ObservingKill)] = {
         ("R006_ReverseShellTooling", BeforeWave4),
         ("R007_CryptoMiner", BeforeWave4),
         ("R010_BinaryInWebroot", BeforeWave4),
+        // Lot 279: the kill narrowed (an exec of the system's tool by
+        // module name, nothing moved or forced, is R011's own record); no
+        // kill added.
         ("R011_KernelModuleTooling", BeforeWave4),
         ("R012_SetcapTooling", BeforeWave4),
         ("R013_NamespaceEscapeTooling", BeforeWave4),

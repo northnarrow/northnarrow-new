@@ -15,6 +15,7 @@
 //! | [`Role::Supervisor`] | `nn-workers` | `SETUID SETGID KILL BPF` | the bounding set |
 //! | [`Role::Loader`] | the start's thread while the eBPF object loads and attaches ([`lower`]) | `BPF PERFMON` (and `SYS_ADMIN` where the Debian drop-in grants it) | the bounding set |
 //! | [`Role::Errands`] | `nn-errands` ([`errands`]): what the decision's filter refuses it, done for it | `BPF` | the bounding set |
+//! | [`Role::Export`] | `nn-export` (lot 276): the chains read as the export's log, its cursors written, the export worker asked | none | the bounding set |
 //!
 //! Every other thread — tokio's runtime, the sensors' pumps, the admin
 //! server's tasks, the chain writers that run on the runtime — keeps the
@@ -272,16 +273,20 @@ pub enum Role {
     /// The decision's errands ([`errands`]): a kernel map entry, an `rpm`
     /// query.
     Errands,
+    /// Lot 276: the export's thread — it reads the chains (root's files:
+    /// no capability needed by their owner) and writes its cursors.
+    Export,
 }
 
 impl Role {
-    pub const ALL: [Role; 6] = [
+    pub const ALL: [Role; 7] = [
         Role::Decision,
         Role::Actuator,
         Role::Writer,
         Role::Supervisor,
         Role::Loader,
         Role::Errands,
+        Role::Export,
     ];
 
     pub fn name(self) -> &'static str {
@@ -292,6 +297,7 @@ impl Role {
             Role::Supervisor => "supervisor",
             Role::Loader => "loader",
             Role::Errands => "errands",
+            Role::Export => "export",
         }
     }
 
@@ -328,6 +334,8 @@ impl Role {
     ///   `perf_event_paranoid` 3).
     /// - errands: `BPF` (`DEFENDER_PIDS`); the `rpm` it starts is a program
     ///   of its own (root's sets at its `execve`, as before).
+    /// - export (lot 276): none — the chains and its cursors are root's
+    ///   files, which their owner reads and writes without a capability.
     pub const fn wants(self) -> CapSet {
         use cap::*;
         match self {
@@ -337,6 +345,7 @@ impl Role {
             Role::Supervisor => CapSet::of(&[SETUID, SETGID, KILL, BPF]),
             Role::Loader => CapSet::of(&[BPF, PERFMON, SYS_ADMIN]),
             Role::Errands => CapSet::of(&[BPF]),
+            Role::Export => CapSet::of(&[]),
         }
     }
 

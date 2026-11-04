@@ -38,6 +38,10 @@ pub mod execq;
 /// again.
 pub mod ipc;
 
+/// Lot 276: the export worker's requests and answers (re-exported by
+/// [`ipc`]).
+pub mod ipc_export;
+
 // R03 shims (plan §4.1 rule 2; removed in R17): the paths the moved files
 // name, so they compile as they were in `common`.
 /// `crate::wire::admin_signed_payload`: the module was `common::wire`'s.

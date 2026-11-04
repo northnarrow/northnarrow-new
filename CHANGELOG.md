@@ -6,6 +6,88 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- The minimal signed export (lot 276, capability C21, R15's first step;
+  `docs/operator/EXPORT.md`). Off by default; a signed
+  `/etc/northnarrow/export.local` (overlay `export`, `config-manage`) turns
+  it on, at the next start. The signed chains are the write-ahead log: the
+  core's `nn-export` thread (no capability, never the decision thread)
+  reads the rows of the detections, actions, FIM drift, netflow and canary
+  access chains after a cursor per sink and chain, and hands them to a new
+  unprivileged **export worker** (the agent's binary as
+  `northnarrow-export`, `nn-worker-exp`), which verifies each with the
+  agent's public key, maps it to **OCSF 1.9.0** (Detection Finding, Process,
+  File System and Network Activity, Remediation, Base Event; the schema
+  pinned in `crates/nn-export/ocsf/`, every record validated by the tests)
+  and writes it to a rotating, bounded **JSONL file**
+  (`/var/log/northnarrow/export`) and to **syslog over TLS** (RFC 5424
+  messages in RFC 5425 frames; rustls with the RustCrypto provider, TLS 1.3,
+  X25519, the CA pinned by the signed text). Every record carries its
+  signed row (`raw_data`) and its place and links
+  (`unmapped.northnarrow.row`). At least once: a cursor moves past rows the
+  sink delivered only (file: synced; syslog: acknowledged by the receiver's
+  TCP and settled for a second), and is written atomically
+  (`detections/export-cursors.json`). The worker's sandbox: Landlock with
+  its directory alone and a second layer pinning TCP connect to the
+  receiver's port (ABI ≥ 4, measured, required), seccomp with TCP sockets
+  and its files' calls only. Stage 8 of the loss counters (rows the export
+  can no longer deliver) is counted and signed (`telemetry_loss`, every
+  beat's `loss`); `export_state` rows are signed at the start, at a sink's
+  change and at the stop; the manifest carries `export` (and the worker's
+  `fs_rules`), each beat `export`. New verbs: `nn-admin export status`
+  (signed telemetry) and `nn-admin export verify` (a receiver's check of
+  every record against the agent's key and each chain's continuity). New
+  dependencies (rustls 0.23.46, rustls-rustcrypto 0.0.2-alpha, pinned
+  exactly) with eight RustSEC advisories recorded as not reached
+  (`.cargo/audit.toml`): the receiver's chain is verified by rustls' own
+  rustls-webpki 0.103.16, the provider's key provider loads no private
+  key; the CI charter gate refuses ring and aws-lc in the agent's graph.
+  The supervisor's pass no longer waits on a worker's long request; the
+  IPC's version is 4 (after lot 275's 3); the fuzz target `ipc_check`
+  covers the export's answers. After its independent review (#499): a
+  read inside a chain's rotation window waits for the rename (it went
+  "ahead" and back to the chain's oldest file); `nn-admin export verify`
+  maps each row again and refuses a record whose OCSF fields were
+  rewritten, and a rotation
+  without its terminator (`BROKEN`); the export worker runs as an account
+  of its own, `northnarrow-export`, the only one that writes the export's
+  directory; a blank line, or any row a request cannot carry, is lost,
+  counted and signed, never retried forever; the export says `failed` or
+  `degraded`, never `on`, when its controller does not run or its worker
+  is away; the worker's files are bounded (`RLIMIT_FSIZE`, 4 GiB in all,
+  the directory measured by the core); by default only the detections and
+  the actions are exported, the flows, file drift and canary reads each
+  opt-in (`EXPORT.md` §1a lists every field that leaves); X25519 refuses
+  a shared secret of all zeros; the sink's files are 0600. Lot 275's
+  inbound connections in the netflow chain are exported as Inbound flows
+  (the peer as the source, OCSF's bytes out the bytes the host received),
+  every other flow as Outbound. After its second review: a read in the
+  rotation's second window (the archive renamed, the new active file not
+  made yet) waits there — no eviction, no "ahead" — and a file still
+  missing 30 s later is a signed `active_missing` note; an action
+  outcome's record carries its intent's signed row
+  (`unmapped.northnarrow.intent_raw`), so that `nn-admin export verify`
+  checks every record on its own, whatever its input holds around it — the
+  intent's row verified with the key and mapped first, a missing, bent or
+  foreign one with the intent's facts TAMPERED (after its third check: a
+  PARTIAL verdict of the second review depended on the intent being before
+  the outcome in the input); `verify` says each outcome without its intent
+  attached (a NOTICE, exit 0) and checks the place words no hash covers
+  (`verified` true, `rotate` only as the signed terminator before a later
+  file's first row); the TAMPERED verdict says which (a row not signed, or
+  a record rewritten); a
+  signed configuration with fewer or smaller JSONL files holds from the
+  sink's open (the files past the new count removed, regular files only —
+  the worker's seccomp gains `newfstatat` without following a link —, an
+  active file past the new size rotated), and the core judges the export's
+  directory from the first setup against its bound and the bytes of the
+  files an earlier configuration wrote larger than this one's: the honest
+  worker is no longer killed for them (lot 276's tenth lab found the first
+  form of this fix killing it).
+- The maintainer's release-tag signing key in `.github/allowed_signers`
+  (SUP-024; ED25519, `SHA256:uTnR1UsJWH1wlE2muj5W21Y7L1rxysvcR2jZcO1B5d8`,
+  `namespaces="git"`): a `v*` tag signed with it now passes `verify-tag`
+  and starts `release.yml`; a tag signed by any other key, unsigned or
+  lightweight is still refused before anything is built.
 - Network telemetry, level 2 of C07 (lot 275,
   `docs/operator/NETWORK_TELEMETRY.md`): three new sources of the bus,
   each with its sensor-contract entry, its attach state in the signed
@@ -790,6 +872,56 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- R011 no longer kills an exec of the system's kernel-module tool by module
+  name (lot 279): it killed the `modprobe` rootful podman runs for its
+  netfilter modules (lot 275's lab, Ubuntu 22.04), and every `modprobe` of
+  the container runtimes, kube-proxy, k3s, zfs-load-module and an
+  administrator. R011 judges the command line's syntax and what the exec
+  pump reads at the exec — no `modprobe.d`, index or module file is read
+  (an emulation of kmod's lookup was retired after the review of #498:
+  `--remove-holders` read as a removal, `install`/`remove` commands not
+  modelled, an option after the name under `POSIXLY_CORRECT`, the exec pump
+  blockable by a FIFO in `modprobe.d`). Killed, as before: `insmod`; a
+  `modprobe` argument with a `/` or a `.ko`, `.ko.xz`, `.ko.zst`, `.ko.gz`
+  suffix; `-C`/`--config`, `-d`/`--dirname`, `-S`/`--set-version`,
+  `-f`/`--force*`, `-o`, `--remove-holders`, `--remove-dependencies` (kmod
+  29..34 run the last two as an insertion) and their abbreviations; any
+  argument starting with `-` after the first module name (an option or a
+  parameter as the environment decides); an option the tool refuses; a
+  `kmod` command other than `help`, `list`, `static-nodes`, the version; a
+  program that is not the system's tool (its path, or its device and inode
+  against the file `/usr/bin/kmod` resolves to, stat'ed by the exec pump;
+  every tool when `/usr/bin/kmod` and `/bin/kmod` are two different files,
+  not one file under both names as a merged `/usr` shows it), of another
+  mount namespace; `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT`
+  or `LD_LIBRARY_PATH` in the process's environment — read, it is evidence:
+  killed even if the process has since exited — (`/proc/<pid>/environ`
+  tied to the exec by a pidfd and the start time; an empty one read from
+  the running process is one: libxtables runs `modprobe` with none), a
+  running process whose environment could not be read, an environment over
+  1 MiB, an unknown start; an argv the kernel did not read whole. A tool
+  that had exited before its environment could be read (no process with its
+  pid, its pid another's, a zombie, its memory gone whatever was read) is
+  recorded, its environment not verified — its kill would reach no one; a
+  tool whose leader exited while another thread runs on (`pthread_exit`)
+  has not exited: its environment is read through the running thread
+  (`/proc/<pid>/task/<tid>/environ`), killed when not read whole or when
+  no thread is seen while the kernel counts more than one (`Threads:`). The
+  environment's check is best effort for a short-lived `modprobe`; code
+  injected into the tool may outlive it in a forked child, which R011's
+  kill of the tool would not reach.
+  Recorded otherwise (High, T1547.006, the names said): what a name loads
+  is the kernel's to judge — its signature policy, lockdown and lot 285
+  prevent a load; R018 judges a load it reports after the fact, with no
+  verdict for a packaged file loaded by a comm of its loader allowlist
+  (`systemd-udevd`, `systemd-modules`, `kmod`) or a kernel thread's child
+  (taking `kmod` out of it goes with lot 285). `OBSERVING_KILLS` keeps R011
+  as a kill from before Wave 4: its kill narrowed, no kill was added.
+- The privileged test `net_listener_on_uncommon_port_records_event` waits
+  for both NN-L-NET-006 records of its pid (lot 279): it found the 8443
+  twin's and counted before the 41999 one was appended (the CI of #493 on
+  Ubuntu 22.04). It waits for as many records as listeners it opened, then
+  asserts exactly that many, and checks each.
 - The privileged tests' fixture teardown no longer waits out its 10 s
   and fails the test (lot 277, after #494's merge: CI's 22.04 privileged
   suites). Its rounds signalled only the processes still under the

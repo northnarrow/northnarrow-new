@@ -78,11 +78,12 @@ pub(crate) async fn load(
     audit: &mut checks::AuditOpen,
     bpf_lsm: &northnarrow_agent::boot::lsm::BpfLsm,
     image: std::io::Result<nn_linux::worker::SelfImage>,
+    export_on: bool,
 ) -> Result<Attached> {
     // R14b (plan §3.1, §3.5): the workers first — the parse worker ready
     // when the DNS pump's first records come; its pid registered once the
     // deny hooks below are attached (`super::workers::arm`).
-    let workers = super::workers::start(cli, image);
+    let workers = super::workers::start(cli, image, export_on);
     // Process-lineage cache shared by the posture triggers and the FIM
     // rules' package-manager carve-out (review 49): "does this writer
     // descend from dpkg/rpm/dnf?". Fed from Event::ProcessSpawn by the

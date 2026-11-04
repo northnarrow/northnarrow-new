@@ -24,6 +24,8 @@ pub mod epg;
 pub mod exe_identity;
 pub mod exec;
 pub mod flow_sock;
+/// Lot 279: the exec pump's reading of a module tool's exec (R011).
+pub mod kmod_exec;
 pub mod multiplexer;
 /// Lot 275 (C07): the inbound, DNS response and TLS ClientHello sensors'
 /// attach, and the pumps of the last two.

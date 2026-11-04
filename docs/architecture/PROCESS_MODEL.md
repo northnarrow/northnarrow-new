@@ -13,6 +13,7 @@ Operator side: [`docs/operator/WORKERS.md`](../operator/WORKERS.md).
 |---|---|---|---|---|
 | `northnarrow-agent`, the **core** | root; its pid in `PROTECTED_PIDS` as **protected and exempt** (`0x03`) | the unit's bounding set; per thread, each role's effective set (R14c, §8) | the unit (`ProtectSystem=strict`, `NoNewPrivileges=true`, `LimitCORE=0`, a system-call denylist, native calls only, the personality locked: §10); the decision thread's own seccomp filter (§8); no Landlock: it acts on any path through `/proc/1/root` | the eBPF loader and links, the keys (§9), the decision, the posture, the COMBAT ladder, the actuators, the signer and the chains, the admin server, the workers' supervisor |
 | the **`parse` worker** | `northnarrow-worker`; its pid **protected, not exempt** (`0x02`) | none: effective, permitted, inheritable and ambient sets empty; `no_new_privs` | seccomp allowlist; Landlock: every filesystem right handled with no rule, TCP bind/connect (ABI ≥ 4), signals and abstract sockets scoped (ABI ≥ 6); not dumpable; `RLIMIT_NPROC` 0, `RLIMIT_CORE` 0, 8 descriptors, 512 MiB of address space | nn-parse's parsers: the DNS pump's names (R14b, §6a) |
+| the **`export` worker** (lot 276, §11) | `northnarrow-export`, its own account (the review of #499); `0x02` | none | the parse worker's, and: Landlock with one rule (read, write, create, remove files beneath `/var/log/northnarrow/export`), a second layer pinning TCP connect to the receiver's port (ABI ≥ 4, measured, required); seccomp: TCP sockets, `connect`, `ppoll`, `SIOCOUTQ`, its files' calls; 16 descriptors | nn-export's OCSF mapping, its JSONL and syslog-over-TLS sinks (rustls with the RustCrypto provider); no key, no chain, no cursor |
 | the watchdog | unchanged (root, `CAP_BPF`, `CAP_SYS_PTRACE`); `0x03` | | | |
 | `nn-admin` | the operator | | | public keys only |
 
@@ -514,3 +515,36 @@ self-integrity round expects the process's `no_new_privs` 1, its seccomp
 mode 2 and its core limit 0 from the unit (`limit_unexpected` otherwise;
 `docs/operator/INSTALL_UPGRADE_UNINSTALL.md`).
 
+
+## 11. The export worker (lot 276)
+
+The export (`docs/operator/EXPORT.md`, capability C21) is the second worker
+kind: its code is nn-export's, its sandbox `nn_linux::sandbox::Profile::export`,
+its entry the agent's composition of both (`agent/src/export/worker.rs`:
+nn-linux may not depend on nn-export). Where it differs from the parse
+worker:
+
+- **Who reads the chains.** The core: its `nn-export` thread (role
+  `Export`, no capability; never the decision thread, never a lock of the
+  evidence writers') reads each chain's rows after a sink's cursor,
+  verbatim, and keeps the cursors (`detections/export-cursors.json`). The
+  chains are root's (0600 in 0700 directories) and the worker's Landlock
+  names no state directory: it holds neither the chains nor the cursors —
+  a compromised worker can lie about what it delivered, never move a cursor
+  past a row the core did not send it (`Workers::condemn` kills it for
+  that), never read or write the evidence.
+- **Two Landlock layers.** The first, at its start: every filesystem right,
+  one rule for its directory; TCP not handled. The second, after its setup
+  named the receiver: TCP bind and connect handled, connect allowed to the
+  receiver's port only (`pin_tcp_connect`, measured with a connect to
+  another port). A layer only takes rights away; the seccomp filter keeps
+  the three Landlock calls for that. The core requires the pin where the
+  kernel's ABI handles TCP (`SyslogSetup::pin_port`, `check_setup_out`).
+- **Long requests.** A request of the export may last its budget (1 s; the
+  core waits 3 s before it counts a hang): the supervisor's pass now skips
+  a slot a request holds (`TICK_LOCK_WAIT`) instead of waiting on it, so
+  the parse worker's watch is never held up by the export's network.
+- **Its answers checked twice.** The protocol's check against the request
+  (`check_rows_out`: committed past the rows, an ack past what was
+  committed, a file write in flight, a refusal) and the core's against its
+  window of rows in flight (a row it never sent, more records than rows).

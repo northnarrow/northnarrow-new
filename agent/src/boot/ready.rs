@@ -35,6 +35,7 @@ pub(crate) fn arm(
     pumps: Vec<&'static str>,
     opt_ins: Vec<&'static str>,
     workers: &nn_linux::worker::Workers,
+    export: Option<northnarrow_agent::export::ExportHandle>,
 ) -> Result<Armed> {
     // Lab PR 218 (external review G-12): every attach of this boot is done.
     // The capability manifest — kernel, BTF, LSMs, deny hooks, self-test,
@@ -90,6 +91,7 @@ pub(crate) fn arm(
             missing: Vec::new(),
             content: Vec::new(),
             workers: Vec::new(),
+            export: None,
             telemetry_probe: String::new(),
             settled: false,
             revision: 0,
@@ -110,6 +112,7 @@ pub(crate) fn arm(
             opt_ins: opt_ins.iter().map(|k| k.to_string()).collect(),
             workers: Some(workers.clone()),
             proc_root: std::path::PathBuf::from("/"),
+            export,
         };
         capability_manifest.arm(audit_log.as_ref(), inputs);
         match capability_manifest.current() {
