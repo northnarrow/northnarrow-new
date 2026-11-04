@@ -5641,6 +5641,22 @@ number in parentheses is a lab PR.
     workspace's tests, the privileged tests built, attack-coverage, golden
     ×5, MSRV, fuzz replay, portable-core, lockfiles): as PR #494 records
     them for this commit.
+  - After the merge (PR #494 merged at b13ce8a4): CI's 22.04 privileged
+    suites failed once on `a_reset_makes_what_started_before_it_not_known`,
+    "quit_agent … SIGQUIT to pid 16177 refused (EPERM)". A race of the
+    fixtures' teardown, not of the tracker (the task_kill hook never reads
+    it): the teardown evicted the tree from `PROTECTED_PIDS` and sent
+    SIGQUIT leaves first; a worker that died first was started again by
+    the agent's supervisor (backoff 0) and registered after the eviction,
+    so it refused the SIGQUIT; the agent then died withdrawn, and the new
+    worker's `PR_SET_PDEATHSIG` — sent by the dying agent, which the kernel
+    checks like a signal from userland (`check_kill_permission` →
+    `security_task_kill` for `SEND_SIG_NOINFO`) — was refused by the hook:
+    the worker lived on, orphaned and protected. Lot 275's two "still alive
+    10 s" teardowns on 5.15 were the same. The teardown now evicts and
+    signals every pid it has seen each round, the agent first; with it the
+    tracker's e2e passed 5 of 5 runs on 22.04 and 4 of 4 on 24.04. The
+    product's refusal of signals to a protected process is unchanged.
 - **Lot 278 — R009 kills in COMBAT only; the installer's window covers its
   own process tree; the lab's "R009 flake" fixed at its cause (C14, C17;
   the false positive of the review of #492, section f).**
