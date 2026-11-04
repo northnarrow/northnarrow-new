@@ -36,9 +36,9 @@
 use std::path::Path;
 
 use common::cgroup_limits::{
-    limit_value, sysctl_write_harmful, SYSCTL_FTRACE_ENABLED, SYSCTL_MAX_MAP_COUNT,
-    SYSCTL_OVERCOMMIT_KBYTES, SYSCTL_OVERCOMMIT_MEMORY, SYSCTL_OVERCOMMIT_RATIO, SYSCTL_PID_MAX,
-    SYSCTL_SCHED_RT_RUNTIME, SYSCTL_THREADS_MAX,
+    limit_value, rt_throttling_off, sysctl_write_harmful, SYSCTL_FTRACE_ENABLED,
+    SYSCTL_MAX_MAP_COUNT, SYSCTL_OVERCOMMIT_KBYTES, SYSCTL_OVERCOMMIT_MEMORY,
+    SYSCTL_OVERCOMMIT_RATIO, SYSCTL_PID_MAX, SYSCTL_SCHED_RT_RUNTIME, SYSCTL_THREADS_MAX,
 };
 
 /// The guarded files, their kinds and the safe value put back (`None`:
@@ -158,6 +158,26 @@ fn threads_default(mem_total: u64) -> String {
 /// The guarded sysctls under `root` (`/` on the host, a directory in the
 /// tests) judged, the harmful ones put back (`write`: false in a dry run).
 pub fn check(root: &Path, mem_total: u64, write: bool) -> Vec<Seen> {
+    check_with(root, mem_total, |path, text| {
+        if write {
+            std::fs::write(path, text)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+/// The RT period the round judges the runtime against (`/proc/sys/kernel/
+/// sched_rt_period_us`, the review of #497, D3).
+pub const RT_PERIOD: &str = "/proc/sys/kernel/sched_rt_period_us";
+
+/// [`check`] with the writer given (the tests' failing one, the review of
+/// #497, D5 M1).
+pub fn check_with(
+    root: &Path,
+    mem_total: u64,
+    mut put: impl FnMut(&Path, &str) -> std::io::Result<()>,
+) -> Vec<Seen> {
     let read = |p: &str| {
         std::fs::read_to_string(root.join(p.trim_start_matches('/')))
             .ok()
@@ -170,6 +190,11 @@ pub fn check(root: &Path, mem_total: u64, write: bool) -> Vec<Seen> {
         .and_then(|r| r.parse::<i64>().ok())
         .unwrap_or(0);
     let strict = read("/proc/sys/vm/overcommit_memory").as_deref() == Some("2");
+    // the review of #497 (D3): the runtime judged against the host's own
+    // period (unreadable: the default 1 s)
+    let period = read(RT_PERIOD)
+        .and_then(|r| r.parse::<i64>().ok())
+        .unwrap_or(1_000_000);
     let mut out = Vec::new();
     for (path, kind, safe) in GUARDED {
         // the ratio and the kbytes only count in strict mode
@@ -182,7 +207,13 @@ pub fn check(root: &Path, mem_total: u64, write: bool) -> Vec<Seen> {
         let Some(v) = limit_value(now.as_bytes()) else {
             continue;
         };
-        if !sysctl_write_harmful(*kind, Some(v)) {
+        let harmful = if *kind == SYSCTL_SCHED_RT_RUNTIME {
+            now.parse::<i64>()
+                .map_or(true, |r| rt_throttling_off(r, period))
+        } else {
+            sysctl_write_harmful(*kind, Some(v))
+        };
+        if !harmful {
             continue;
         }
         // strict accounting with room: the operator's
@@ -196,14 +227,17 @@ pub fn check(root: &Path, mem_total: u64, write: bool) -> Vec<Seen> {
             });
             continue;
         }
-        let safe = safe
-            .map(str::to_string)
-            .unwrap_or_else(|| threads_default(mem_total));
-        let r = if write {
-            std::fs::write(root.join(path.trim_start_matches('/')), format!("{safe}\n"))
+        let safe = if *kind == SYSCTL_SCHED_RT_RUNTIME {
+            // 95 % of the period, the kernel's default ratio
+            (period.max(1) / 100 * 95).to_string()
         } else {
-            Ok(())
+            safe.map(str::to_string)
+                .unwrap_or_else(|| threads_default(mem_total))
         };
+        let r = put(
+            &root.join(path.trim_start_matches('/')),
+            &format!("{safe}\n"),
+        );
         out.push(match r {
             Ok(()) => Seen {
                 kind: "sysctl_restored",
@@ -292,6 +326,46 @@ mod tests {
         );
         assert_eq!(threads_default(1 << 30), "8192");
         assert_eq!(threads_default(16 << 30), "131072");
+    }
+
+    /// The review of #497 (D5, M1): a restore that fails is said so, never
+    /// recorded as done.
+    #[test]
+    fn a_restore_that_fails_is_not_restored() {
+        let d = host(&[("/proc/sys/kernel/pid_max", "300\n")]);
+        let r = check_with(d.path(), 16 << 30, |_, _| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].kind, "sysctl_not_restored");
+        assert!(r[0].detail.contains("NOT put back"), "{r:?}");
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("proc/sys/kernel/pid_max")).unwrap(),
+            "300\n"
+        );
+    }
+
+    /// The review of #497 (D3): the RT runtime judged against the host's
+    /// period — the period cut to the runtime is throttling off (the
+    /// runtime put back to 95 % of it), a longer period's 75 % is not.
+    #[test]
+    fn the_rt_runtime_is_judged_against_the_period() {
+        let off = host(&[
+            ("/proc/sys/kernel/sched_rt_runtime_us", "950000\n"),
+            ("/proc/sys/kernel/sched_rt_period_us", "950000\n"),
+        ]);
+        let r = check(off.path(), 16 << 30, true);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].kind, "sysctl_restored");
+        assert!(r[0].detail.ends_with("put back to 902500"), "{r:?}");
+        let long = host(&[
+            ("/proc/sys/kernel/sched_rt_runtime_us", "1500000\n"),
+            ("/proc/sys/kernel/sched_rt_period_us", "2000000\n"),
+        ]);
+        assert!(check(long.path(), 16 << 30, true).is_empty());
+        let none = host(&[("/proc/sys/kernel/sched_rt_runtime_us", "-1\n")]);
+        let r = check(none.path(), 16 << 30, true);
+        assert!(r[0].detail.ends_with("put back to 950000"), "{r:?}");
     }
 
     /// R1: `ftrace_enabled=0` (set at boot, inside a window) is put back to

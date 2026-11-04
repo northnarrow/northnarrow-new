@@ -167,6 +167,19 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         body(&c, "refuse_sysctl").matches("written_value()").count(),
         1
     );
+    // the review of #497 (D2): an io-wq worker's or a kernel thread's
+    // registers are not read — its write is an unread one (refused)
+    in_order(
+        body(&c, "written_bytes"),
+        &[
+            "let task = generated::bpf_get_current_task_btf();",
+            "off!(TASK_STRUCT_FLAGS_OFFSET)",
+            ".ok()?;",
+            "if !regs_are_the_writes(flags) {\n        return None;\n    }",
+            "generated::bpf_task_pt_regs(task)",
+        ],
+    )
+    .unwrap();
     in_order(
         body(&c, "refuse_sysctl"),
         &[
@@ -834,7 +847,46 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
             && !od.contains("system.slice.d"),
         "own_dropins moves from our directories only"
     );
-    assert!(body(&od, "quarantine").contains("meta.modified().is_ok_and(|m| m < since)"));
+    // the review of #497 (D4): selected by ctime (no `touch -d` sets it
+    // back), never by the mtime; links and outside EnvironmentFile=
+    // quarantined whatever they set; the round judges every one again
+    // outside a window
+    let q = body(&od, "quarantine");
+    assert!(!q.contains("modified()"), "no selection by mtime");
+    in_order(
+        q,
+        &[
+            "std::fs::symlink_metadata(&from)",
+            "if !changed_since(&meta, since) {",
+            "shape_harm(&meta, &from, text.as_deref())",
+        ],
+    )
+    .unwrap();
+    assert!(body(&od, "changed_since").contains("meta.ctime()"));
+    in_order(
+        body(&od, "shape_harm"),
+        &[
+            "is_symlink()",
+            "is_file()",
+            "meta.nlink() > 1",
+            "\"EnvironmentFile\"",
+            "!f.starts_with(ENV_FILE_DIR)",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&si, "own_dropins_round"),
+        &[
+            "if g.window.is_window_open() {\n            return;\n        }",
+            "crate::own_dropins::quarantine(",
+            "UNIX_EPOCH,",
+            "Reason::OwnDropinQuarantined",
+        ],
+    )
+    .unwrap();
+    assert!(body(&si, "round").contains("self.own_dropins_round(at_boot);"));
+    assert!(code("agent/src/boot/evidence.rs")
+        .contains("Some(northnarrow_agent::self_integrity::OwnDropinGuard {"));
     // Lot 273d: the guarded sysctls checked by the round (put back when harmful)
     in_order(
         body(&si, "collect_round"),

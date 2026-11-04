@@ -433,8 +433,9 @@ pub const BINARY_AND_UNIT_PATHS: &[&str] = &[
     // host (a drop-in can replace ExecStart=, add a Condition*= that skips
     // the start, or set a weakening Environment=), and its directory —
     // removing or renaming an entry is denied, and since EBPF-015 a new
-    // drop-in too (`NOCREATE_UNIT_DIRS`). Where the directory does not
-    // exist, a drop-in made with it is reported by the integrity check.
+    // drop-in too (`NOCREATE_UNIT_DIRS`). The review of #497 (N7): the
+    // agent's unit makes it before every start, so it exists on every host
+    // (it was install.sh's on Debian or with --cow-guard only).
     "/etc/systemd/system/northnarrow-agent.service.d",
     "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
     // Lab PR 265 (review #466 F4-bis): the runtime drop-in directory the

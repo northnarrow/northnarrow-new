@@ -28,8 +28,9 @@ use aya_ebpf::{
     maps::{Array, HashMap},
 };
 use northnarrow_common::cgroup_limits::{
-    default_value, init_write_lets_through, limit_kind, special_fs, strip_newline, sysctl_kind,
-    sysctl_write_refused, word_mask, LimitValue, SpecialFs, LIMIT_NAME_MAX, LIMIT_NONE,
+    default_value, init_write_lets_through, limit_kind, regs_are_the_writes, special_fs,
+    strip_newline, sysctl_kind, sysctl_write_refused, word_mask, LimitValue, SpecialFs,
+    LIMIT_NAME_MAX, LIMIT_NONE,
     LIMIT_TEXT_MAX, SYSCTL_NONE,
 };
 use northnarrow_common::wire::{
@@ -44,8 +45,8 @@ use crate::btf_offsets::{
     KERNFS_NODE_PRIV_OFFSET, KERNFS_ROOT_KN_OFFSET, KERNFS_SUPER_INFO_ROOT_OFFSET,
     PATH_DENTRY_OFFSET, SUPER_BLOCK_S_FS_INFO_OFFSET, PID_TASKS_OFFSET, PROC_INODE_PID_OFFSET,
     PROC_INODE_VFS_INODE_OFFSET, PT_REGS_DX_OFFSET, PT_REGS_ORIG_AX_OFFSET, PT_REGS_SI_OFFSET,
-    QSTR_LEN_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_PID_LINKS_OFFSET,
-    TASK_STRUCT_TGID_OFFSET,
+    QSTR_LEN_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_FLAGS_OFFSET,
+    TASK_STRUCT_PID_LINKS_OFFSET, TASK_STRUCT_TGID_OFFSET,
 };
 
 /// The value each protected resource file held when the agent registered
@@ -341,6 +342,15 @@ unsafe fn written_bytes() -> Option<(LimitValue, u32)> {
         return None;
     }
     let task = generated::bpf_get_current_task_btf();
+    // the review of #497 (D2): an io-wq worker carries another write's
+    // registers, a kernel thread has none of its own — unread (refused)
+    let flags = bpf_probe_read_kernel::<u32>(
+        (task as *const u8).add(off!(TASK_STRUCT_FLAGS_OFFSET)) as *const u32,
+    )
+    .ok()?;
+    if !regs_are_the_writes(flags) {
+        return None;
+    }
     let regs = generated::bpf_task_pt_regs(task) as *const u8;
     if regs.is_null() {
         return None;

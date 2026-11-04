@@ -16,6 +16,11 @@
  *        nn-iou-probe --open-write <file>   open O_WRONLY|O_APPEND, write nothing
  *        nn-iou-probe --unlink <path>
  *        nn-iou-probe --rename <old> <new>
+ *        nn-iou-probe --write-async <file> <text>   (lot 273d, the review of
+ *            #497, D2) open <file> O_WRONLY, then IORING_OP_WRITE of <text>
+ *            at offset 0 with IOSQE_ASYNC: an io-wq worker runs it — the
+ *            process first writes <text> to /dev/null, so a worker born at
+ *            that return carries that write's registers
  *        nn-iou-probe --modes               list the tamper modes
  */
 #define _GNU_SOURCE
@@ -115,12 +120,13 @@ static int tamper_mode(int argc, char **argv)
 {
     const char *mode = argv[1];
     if (strcmp(mode, "--modes") == 0) {
-        printf("open-write unlink rename\n");
+        printf("open-write unlink rename write-async\n");
         return 0;
     }
     int is_rename = strcmp(mode, "--rename") == 0;
-    if (argc != (is_rename ? 4 : 3)) {
-        fprintf(stderr, "usage: %s --open-write <file> | --unlink <path> | --rename <old> <new>\n",
+    int is_write = strcmp(mode, "--write-async") == 0;
+    if (argc != (is_rename || is_write ? 4 : 3)) {
+        fprintf(stderr, "usage: %s --open-write <file> | --unlink <path> | --rename <old> <new> | --write-async <file> <text>\n",
                 argv[0]);
         return 2;
     }
@@ -148,6 +154,31 @@ static int tamper_mode(int argc, char **argv)
         res = ring_run(&r, &sqe);
         if (res == 0) {
             printf("unlink %s through the ring: unlinked\n", argv[2]);
+            return 0;
+        }
+    } else if (is_write) {
+        int fd = open(argv[2], O_WRONLY | O_NOFOLLOW);
+        if (fd < 0) {
+            printf("write-async %s: open errno=%s\n", argv[2], errno_name(errno));
+            return 1;
+        }
+        size_t n = strlen(argv[3]);
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) {
+            ssize_t w = write(dn, argv[3], n); /* the registers a worker may inherit */
+            (void)w;
+            close(dn);
+        }
+        sqe.opcode = IORING_OP_WRITE;
+        sqe.fd = fd;
+        sqe.addr = (uint64_t)(uintptr_t)argv[3];
+        sqe.len = (uint32_t)n;
+        sqe.off = 0;
+        sqe.flags = IOSQE_ASYNC;
+        res = ring_run(&r, &sqe);
+        close(fd);
+        if (res >= 0) {
+            printf("write-async %s through the ring: wrote %d bytes\n", argv[2], res);
             return 0;
         }
     } else if (is_rename) {

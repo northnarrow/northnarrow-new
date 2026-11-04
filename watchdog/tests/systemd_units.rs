@@ -163,18 +163,18 @@ fn the_agent_can_move_a_drop_in_out_of_our_own_directories() {
                 .collect::<Vec<_>>()
         })
         .collect();
-    assert_eq!(made.len(), 13, "{made:?}");
+    assert_eq!(made.len(), 14, "{made:?}");
     let rw: Vec<String> = d
         .iter()
         .filter(|(k, _)| k == "ReadWritePaths")
         .flat_map(|(_, v)| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())
         .collect();
-    // the persistent one is install.sh's (its own drop-ins live there)
-    let ours = made
+    // the review of #497 (N7): the persistent agent one made by the unit
+    // too, not by install.sh alone
+    assert!(made
         .iter()
-        .map(String::as_str)
-        .chain(["/etc/systemd/system/northnarrow-agent.service.d"]);
-    for dir in ours {
+        .any(|m| m == "/etc/systemd/system/northnarrow-agent.service.d"));
+    for dir in made.iter().map(String::as_str) {
         assert!(
             rw.iter().any(|p| p.strip_prefix('-') == Some(dir)),
             "{dir} is not in the agent's ReadWritePaths (`-`: made by a later line): {rw:?}"
@@ -189,8 +189,7 @@ fn the_agent_can_move_a_drop_in_out_of_our_own_directories() {
                 "/etc/northnarrow"
             ]
             .contains(&p)
-                || made.iter().any(|m| m == p)
-                || p == "/etc/systemd/system/northnarrow-agent.service.d",
+                || made.iter().any(|m| m == p),
             "{p}: writable to the agent, and not one of its own directories"
         );
     }

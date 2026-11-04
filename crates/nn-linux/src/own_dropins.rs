@@ -61,10 +61,76 @@ impl Moved {
     }
 }
 
-/// The harmful drop-ins of our units' directories under `roots`, made or
-/// changed at or after `since` (the window's opening), moved into
-/// `quarantine` (`now`: the name's stamp). `known`: a drop-in `install.sh`
-/// lays down, left.
+/// The directory an `EnvironmentFile=` of our units may name: our own
+/// configuration, protected (the review of #497, D4 — a file anywhere else
+/// can change after the judgment, outside any window).
+pub const ENV_FILE_DIR: &str = "/etc/northnarrow/";
+
+/// The judged directory's entry: changed at or after `since`, by its
+/// ctime — which no `touch -d` sets back and a new hard link, a rename or
+/// a content change all move (the review of #497, D4: the mtime did not
+/// hold). An unreadable ctime counts as changed.
+fn changed_since(meta: &std::fs::Metadata, since: SystemTime) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(s) = since.duration_since(SystemTime::UNIX_EPOCH) else {
+        return true;
+    };
+    let ct = std::time::Duration::new(
+        meta.ctime().max(0) as u64,
+        meta.ctime_nsec().clamp(0, 999_999_999) as u32,
+    );
+    ct >= s
+}
+
+/// Why an entry of our directories is quarantined whatever its directives
+/// say (the review of #497, D4): not a regular file (a symlink systemd
+/// follows to a target outside our directories), a hard link (its content
+/// changes through another name), or an `EnvironmentFile=` outside
+/// [`ENV_FILE_DIR`].
+fn shape_harm(meta: &std::fs::Metadata, from: &Path, text: Option<&str>) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    if meta.file_type().is_symlink() {
+        let to = std::fs::read_link(from)
+            .map(|t| t.display().to_string())
+            .unwrap_or_else(|_| "?".to_string());
+        return Some(format!(
+            "a symlink to {to}: its target lies outside our directories and changes without a window"
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Some("not a regular file".to_string());
+    }
+    if meta.nlink() > 1 {
+        return Some(format!(
+            "a hard link ({} names): its content changes through a name outside our directories",
+            meta.nlink()
+        ));
+    }
+    let text = text?;
+    effective(directives(text))
+        .into_iter()
+        .filter(|(k, _)| k == "EnvironmentFile")
+        .flat_map(|(_, v)| {
+            v.split_whitespace()
+                .map(|f| f.trim_start_matches('-').to_string())
+                .collect::<Vec<_>>()
+        })
+        .find(|f| !f.starts_with(ENV_FILE_DIR))
+        .map(|f| {
+            format!(
+                "EnvironmentFile={f} lies outside {ENV_FILE_DIR}: its content changes after the judgment"
+            )
+        })
+}
+
+/// The harmful drop-ins of our units' directories under `roots`, changed
+/// at or after `since` (by their ctime; the window's opening at its
+/// close, `UNIX_EPOCH` at the integrity round, which judges every one of
+/// them again — a drop-in kept at a close stays writable by root), moved
+/// into `quarantine` (`now`: the name's stamp). `known`: a drop-in
+/// `install.sh` lays down, left. Whatever its directives, a symlink, a
+/// hard link and an `EnvironmentFile=` outside [`ENV_FILE_DIR`] are
+/// quarantined (the review of #497, D4).
 pub fn quarantine(
     roots: &[&Path],
     host: &HostLimits,
@@ -94,25 +160,48 @@ pub fn quarantine(
                 let Ok(meta) = std::fs::symlink_metadata(&from) else {
                     continue;
                 };
-                if !meta.file_type().is_file() || meta.modified().is_ok_and(|m| m < since) {
+                if !changed_since(&meta, since) {
                     continue;
                 }
-                let Ok(bytes) = std::fs::read(&from) else {
-                    continue;
+                let regular = meta.file_type().is_file();
+                let bytes = if regular {
+                    std::fs::read(&from).ok()
+                } else {
+                    None
                 };
-                if known(&from, &bytes) {
+                if regular && bytes.is_none() {
                     continue;
                 }
-                let text = String::from_utf8_lossy(&bytes);
-                let why = effective(directives(&text)).into_iter().find_map(|(k, v)| {
-                    harms(reach, &k, &v, host)
-                        .map(|w| (k.clone(), v.clone(), w, Kind::Harmful))
-                        .or_else(|| breaks(&k, &v).map(|w| (k, v, w, Kind::BreaksAgent)))
-                });
-                let Some((k, v, w, _)) = why else {
+                if let Some(b) = &bytes {
+                    if known(&from, b) && meta_nlink(&meta) == 1 {
+                        continue;
+                    }
+                }
+                let text = bytes
+                    .as_ref()
+                    .map(|b| String::from_utf8_lossy(b).to_string());
+                let when = if since == SystemTime::UNIX_EPOCH {
+                    "found by the integrity round"
+                } else {
+                    "made inside the window"
+                };
+                let why = shape_harm(&meta, &from, text.as_deref())
+                    .map(|w| format!("{when}, {w}"))
+                    .or_else(|| {
+                        effective(directives(text.as_deref()?))
+                            .into_iter()
+                            .find_map(|(k, v)| {
+                                harms(reach, &k, &v, host)
+                                    .map(|w| (k.clone(), v.clone(), w, Kind::Harmful))
+                                    .or_else(|| {
+                                        breaks(&k, &v).map(|w| (k, v, w, Kind::BreaksAgent))
+                                    })
+                            })
+                            .map(|(k, v, w, _)| format!("{when}, sets {k}={v}: {w}"))
+                    });
+                let Some(why) = why else {
                     continue;
                 };
-                let why = format!("made inside the window, sets {k}={v}: {w}");
                 let name: String = from
                     .to_string_lossy()
                     .chars()
@@ -125,8 +214,18 @@ pub fn quarantine(
                     })
                     .collect();
                 let to = quarantine.join(format!("{now}-{name}"));
+                // a symlink is kept as its target's name, never followed
+                let keep = bytes.clone().unwrap_or_else(|| {
+                    format!(
+                        "symlink -> {}\n",
+                        std::fs::read_link(&from)
+                            .map(|t| t.display().to_string())
+                            .unwrap_or_default()
+                    )
+                    .into_bytes()
+                });
                 let moved = std::fs::create_dir_all(quarantine)
-                    .and_then(|()| std::fs::write(&to, &bytes))
+                    .and_then(|()| std::fs::write(&to, &keep))
                     .and_then(|()| std::fs::remove_file(&from));
                 out.push(match moved {
                     Ok(()) => Moved {
@@ -149,6 +248,11 @@ pub fn quarantine(
         }
     }
     out
+}
+
+fn meta_nlink(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink()
 }
 
 #[cfg(test)]
@@ -195,9 +299,95 @@ mod tests {
         assert!(wd.join("50-MemoryMax.conf").exists());
         assert!(ag.join("10-known.conf").exists());
         assert_eq!(std::fs::read_dir(q.path()).unwrap().count(), 1);
-        // a drop-in older than the window is not judged here
+        // a drop-in changed before the window is not judged here
         std::fs::write(ag.join("60-old.conf"), "[Service]\nMemoryMax=4K\n").unwrap();
         let later = SystemTime::now() + std::time::Duration::from_secs(60);
         assert!(quarantine(&[root.path()], &host(), later, q.path(), 1, |_, _| false).is_empty());
+    }
+
+    /// The review of #497 (D4): an mtime set back (`touch -d`) does not
+    /// hide a drop-in made inside the window — its ctime selects it.
+    #[test]
+    fn an_mtime_set_back_does_not_hide_a_drop_in() {
+        let root = tempfile::tempdir().unwrap();
+        let q = tempfile::tempdir().unwrap();
+        let ag = root.path().join("northnarrow-agent.service.d");
+        std::fs::create_dir_all(&ag).unwrap();
+        let since = SystemTime::now() - std::time::Duration::from_secs(5);
+        let f = ag.join("50-MemoryMax.conf");
+        std::fs::write(&f, "[Service]\nMemoryMax=4K\n").unwrap();
+        let old = std::fs::FileTimes::new()
+            .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_times(old)
+            .unwrap();
+        assert!(std::fs::metadata(&f).unwrap().modified().unwrap() < since);
+        let r = quarantine(&[root.path()], &host(), since, q.path(), 1, |_, _| false);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert!(!f.exists());
+    }
+
+    /// The review of #497 (D4): a symlink, a hard link and an
+    /// `EnvironmentFile=` outside /etc/northnarrow are quarantined whatever
+    /// they set; the symlink's target is never written or followed.
+    #[test]
+    fn a_link_or_an_outside_environment_file_is_quarantined() {
+        let root = tempfile::tempdir().unwrap();
+        let q = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ag = root.path().join("northnarrow-agent.service.d");
+        std::fs::create_dir_all(&ag).unwrap();
+        let since = SystemTime::now() - std::time::Duration::from_secs(5);
+        let target = outside.path().join("x.conf");
+        std::fs::write(&target, "[Service]\nMemoryMax=2G\n").unwrap();
+        std::os::unix::fs::symlink(&target, ag.join("50-link.conf")).unwrap();
+        let shared = outside.path().join("shared.conf");
+        std::fs::write(&shared, "[Service]\nMemoryMax=2G\n").unwrap();
+        std::fs::hard_link(&shared, ag.join("51-hard.conf")).unwrap();
+        std::fs::write(
+            ag.join("52-env.conf"),
+            "[Service]\nEnvironmentFile=-/var/tmp/nn.env\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ag.join("53-ours.conf"),
+            "[Service]\nEnvironmentFile=/etc/northnarrow/agent.env\nMemoryMax=2G\n",
+        )
+        .unwrap();
+        let r = quarantine(&[root.path()], &host(), since, q.path(), 7, |_, _| false);
+        let why: Vec<String> = r.iter().map(Moved::detail).collect();
+        assert_eq!(r.len(), 3, "{why:#?}");
+        assert!(
+            why[0].contains("50-link.conf: made inside the window, a symlink to"),
+            "{why:#?}"
+        );
+        assert!(
+            why[1].contains("51-hard.conf: made inside the window, a hard link (2 names)"),
+            "{why:#?}"
+        );
+        assert!(
+            why[2].contains("EnvironmentFile=/var/tmp/nn.env lies outside /etc/northnarrow/"),
+            "{why:#?}"
+        );
+        assert!(r.iter().all(|m| m.to.is_some()), "{why:#?}");
+        // the link's target untouched; ours (under /etc/northnarrow) kept
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "[Service]\nMemoryMax=2G\n"
+        );
+        assert!(shared.exists());
+        assert!(ag.join("53-ours.conf").exists());
+        let kept: Vec<String> = std::fs::read_dir(q.path())
+            .unwrap()
+            .flatten()
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert!(
+            kept.iter().any(|k| k.starts_with("symlink -> ")),
+            "{kept:?}"
+        );
     }
 }

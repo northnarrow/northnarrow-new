@@ -562,10 +562,24 @@ fn an_upgrade_of_units_the_boot_would_not_start_is_refused() {
             "unwanted.northnarrow-watchdog",
             "northnarrow-watchdog.service is enabled but not pulled in by the default target multi-user.target",
         ),
+        // the review of #497 (D5, M6): enabled for this boot only
+        (
+            "runtime",
+            "enabled.northnarrow-agent",
+            "northnarrow-agent.service is enabled-runtime (systemctl is-enabled)",
+        ),
     ] {
         let host = Host::new(&format!("install-boot-{case}"), &both, true, true);
         let marker = host.dir.join(file);
-        fs::write(&marker, if case == "disabled" { "disabled\n" } else { "" }).unwrap();
+        fs::write(
+            &marker,
+            match case {
+                "disabled" => "disabled\n",
+                "runtime" => "enabled-runtime\n",
+                _ => "",
+            },
+        )
+        .unwrap();
         let r = host.install("full", true, Some("key-role"));
         assert_eq!(r.status, 1, "{case}: {r:#?}");
         assert!(r.stderr.contains(&format!("REFUSED — {want}")), "{case}: {r:#?}");
@@ -1364,7 +1378,11 @@ case "$cmd" in
         [ -n "$q" ] || echo "$st"
         [ "$st" = active ] ;;
     is-enabled)
-        if [ -e "$T/enabled.${{1%.service}}" ]; then [ -n "$q" ] || echo enabled
+        # the marker's content is the state (the review of #497, D5:
+        # `enable --runtime` is "enabled-runtime", exit 0 as systemd's)
+        if [ -e "$T/enabled.${{1%.service}}" ]; then
+            st=$(cat "$T/enabled.${{1%.service}}"); [ -n "$st" ] || st=enabled
+            [ -n "$q" ] || echo "$st"
         else [ -n "$q" ] || echo disabled; exit 1; fi ;;
     get-default) echo multi-user.target ;;
     list-dependencies)
@@ -1373,7 +1391,10 @@ case "$cmd" in
             [ -e "$T/enabled.$u" ] && [ ! -e "$T/unwanted.$u" ] && echo "  $u.service"
         done
         exit 0 ;;
-    enable) for a; do : > "$T/enabled.${{a%.service}}"; done ;;
+    enable)
+        st=enabled
+        for a; do [ "$a" = --runtime ] && st=enabled-runtime; done
+        for a; do case "$a" in --*) ;; *) echo "$st" > "$T/enabled.${{a%.service}}" ;; esac; done ;;
     disable) for a; do /bin/rm -f "$T/enabled.${{a%.service}}"; done ;;
     start)
         u=${{1%.service}}
@@ -1876,14 +1897,53 @@ fn an_upgrade_that_leaves_a_unit_not_enabled_is_rolled_back() {
         "the old release restored"
     );
     for u in ["northnarrow-agent", "northnarrow-watchdog"] {
-        assert!(
-            lab.root.join(format!("enabled.{u}")).exists(),
+        // the review of #497 (D5, M9): enabled for every boot, not the
+        // runtime only
+        assert_eq!(
+            fs::read_to_string(lab.root.join(format!("enabled.{u}")))
+                .unwrap_or_default()
+                .trim(),
+            "enabled",
             "{u} enabled again: {r:#?}"
         );
     }
     let rows = lab.audit_rows("upgrade_rolled_back");
     assert_eq!(rows.len(), 1, "{r:#?}");
     assert_eq!(rows[0]["extra"]["stage"], "health_check");
+}
+
+/// The review of #497 (D5, M7): the rollback enables again only what was
+/// enabled before the run — a unit the operator disabled stays disabled.
+/// (Units not running: no preflight, the switch fails and is rolled back.)
+#[test]
+fn a_rollback_leaves_a_unit_the_operator_disabled_disabled() {
+    let lab = Lab::new("enable-operator");
+    lab.install_old();
+    for u in ["northnarrow-agent", "northnarrow-watchdog"] {
+        fs::write(lab.root.join(format!("state.{u}")), "inactive\n").unwrap();
+        fs::write(lab.root.join("cg").join(u).join("cgroup.procs"), "").unwrap();
+    }
+    let _ = fs::remove_dir_all(lab.root.join("pins"));
+    assert!(lab.systemctl(&["disable", "northnarrow-watchdog.service"]));
+    lab.binaries("new", NEW);
+    fs::write(lab.root.join("fail-daemon-reload"), "").unwrap();
+    let r = lab.install("new", &["--source-tree"]);
+    assert_ne!(r.status, 0, "{r:#?}");
+    assert!(
+        r.stderr.contains("UPGRADE FAILED") || r.stderr.contains("rolling back"),
+        "{r:#?}"
+    );
+    assert_eq!(
+        fs::read_to_string(lab.root.join("enabled.northnarrow-agent"))
+            .unwrap_or_default()
+            .trim(),
+        "enabled",
+        "{r:#?}"
+    );
+    assert!(
+        !lab.root.join("enabled.northnarrow-watchdog").exists(),
+        "the operator's disable kept: {r:#?}"
+    );
 }
 
 /// Lab PR 220 (P0 C-45 / G-07 / TD-09): the new agent starts but never logs

@@ -1937,7 +1937,7 @@ IOU_BUILT=0
 if [[ $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0) == 2 ]]; then
     # RHEL 9 ships kernel.io_uring_disabled=2: no ring, not even for root.
     skipped_case C22 "io_uring_disabled=2" 1
-elif ! selected_any C22,C59a,C59b,C59c; then
+elif ! selected_any C22,C59a,C59b,C59c,C108; then
     :
 elif [[ -f "$IOU_SRC" ]] && mkdir -p "$(dirname "$IOU_BIN")" && cc -O2 -o "$IOU_BIN" "$IOU_SRC" 2>"$TMPD/iou-cc.log"; then
     IOU_BUILT=1
@@ -2905,6 +2905,102 @@ else
             restored C106c "kernel.bpf_stats_enabled" "$ST0" "$(cat "$ST")"
         fi
     fi
+fi
+
+# ── the review of #497 (lot 273d): the sysctls' judgment, our drop-ins ────
+#   C107  D1: kernel.pid_max written 040000 (octal: the kernel reads 16384)
+#         outside a window — refused, the value kept;
+#   C108  D2: kernel.pid_max written by an io-wq worker (IORING_OP_WRITE
+#         with IOSQE_ASYNC; the process wrote the same bytes to /dev/null
+#         just before, so a worker born at that return carries that write's
+#         registers) — refused (its registers are never read), the value
+#         kept, even for the value it already holds;
+#   C109  D3: kernel.sched_rt_period_us written (its own value) outside a
+#         window — refused; then, inside a window, the period cut to the
+#         runtime (throttling off): put back by the close or the round to a
+#         runtime of 95 % of the period;
+#   C110  D4: inside a window a symlink drop-in (to a file outside our
+#         directories) and a hard-linked one made in the agent's runtime
+#         drop-in directory and a hard-linked one in the persistent one —
+#         both moved at the window's close, the link's target untouched.
+PM=/proc/sys/kernel/pid_max
+if selected C107; then
+    PM0=$(cat "$PM")
+    POST=$(post post_same_text "$PM" "$PM0") \
+    run_case C107 "kernel.pid_max=040000 (octal, the kernel's 16384; no window)" denied "deny=sysctl" 0 -- nnpy file write "$PM" 040000
+    [[ "$(cat "$PM")" == "$PM0" ]] || echo "$PM0" > "$PM"
+    restored C107 "kernel.pid_max" "$PM0" "$(cat "$PM")"
+fi
+if selected C108; then
+    if (( IOU_BUILT )); then
+        PM0=$(cat "$PM")
+        POST=$(post post_same_text "$PM" "$PM0") \
+        run_case C108 "kernel.pid_max written by an io-wq worker (its own value; no window)" denied "deny=sysctl" 0 -- "$IOU_BIN" --write-async "$PM" "$PM0"
+        restored C108 "kernel.pid_max" "$PM0" "$(cat "$PM")"
+    else
+        skipped_case C108 "the io_uring probe was not built (io_uring_disabled, or no compiler)" 1
+    fi
+fi
+if selected C109; then
+    RP=/proc/sys/kernel/sched_rt_period_us; RR=/proc/sys/kernel/sched_rt_runtime_us
+    RP0=$(cat "$RP"); RR0=$(cat "$RR")
+    POST=$(post post_same_text "$RP" "$RP0") \
+    run_case C109 "kernel.sched_rt_period_us written its own value (no window)" denied "deny=sysctl" 0 -- nnpy file write "$RP" "$RP0"
+    wait_no_window 90 || echo "C109: an earlier window not seen ended within 90 s" >&2
+    t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+    grant_window 12; sleep 2
+    w=$(nnpy file write "$RP" "$RR0"); tw=$(date +%s)
+    back=none
+    for i in $(seq 1 60); do
+        r=$(cat "$RR"); p=$(cat "$RP")
+        if (( r >= 0 && r * 100 < p * 99 )); then back=$(( $(date +%s) - tw )); break; fi
+        sleep 1
+    done
+    wait_no_window 60 || true
+    ev=$(evidence "$t0" "$a0" "$d0")
+    r=$(cat "$RR"); p=$(cat "$RP")
+    if [[ $w == *"wrote '$RR0'"* && $back != none ]] && (( r == p / 100 * 95 )); then
+        v=OK; st="the period cut to the runtime inside a window ($RR0 / $RR0), put back after ${back} s: runtime $r for the period $p (95 %)"
+    else
+        v="DEVIATION (the write: $w; runtime $r, period $p, back after $back s)"; fail=1; st="not as expected"
+    fi
+    rows+=("| C109 | kernel.sched_rt_period_us cut to the runtime inside a window | $st | $ev | $v |")
+    echo "C109 the RT period → $st; $ev; $v" >&2
+    grant_window 10; sleep 1; echo "$RP0" > "$RP"; echo "$RR0" > "$RR"; wait_no_window 60 || true
+    restored C109 "kernel.sched_rt_period_us" "$RP0" "$(cat "$RP")"
+    restored C109 "kernel.sched_rt_runtime_us" "$RR0" "$(cat "$RR")"
+fi
+if selected C110; then
+    OD=/run/systemd/system/northnarrow-agent.service.d
+    # the hard link on the root filesystem, as its source (no link crosses
+    # into /run's tmpfs)
+    OE=/etc/systemd/system/northnarrow-agent.service.d
+    OUT=$(mktemp -d /var/tmp/nn-lab-c110.XXXXXX)
+    printf '[Service]\nMemoryHigh=2G\n' > "$OUT/target.conf"
+    printf '[Service]\nMemoryHigh=2G\n' > "$OUT/shared.conf"
+    wait_no_window 90 || echo "C110: an earlier window not seen ended within 90 s" >&2
+    t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+    grant_window 12; sleep 2
+    ln -s "$OUT/target.conf" "$OD/60-nn-lab-c110-link.conf" 2>/dev/null
+    ln "$OUT/shared.conf" "$OE/61-nn-lab-c110-hard.conf" 2>/dev/null
+    made="$([[ -L $OD/60-nn-lab-c110-link.conf ]] && echo link) $([[ -e $OE/61-nn-lab-c110-hard.conf ]] && echo hard)"
+    wait_no_window 60 || true
+    sleep 5; ev=$(evidence "$t0" "$a0" "$d0")
+    q=$(audit_since "$a0" | grep '"trusted_installer_window_close"' | grep -c 'nn-lab-c110')
+    left="$([[ -e $OD/60-nn-lab-c110-link.conf || -L $OD/60-nn-lab-c110-link.conf ]] && echo link) $([[ -e $OE/61-nn-lab-c110-hard.conf ]] && echo hard)"
+    tgt=$(cat "$OUT/target.conf")
+    if [[ $made == "link hard" && $left == " " ]] && (( q > 0 )) && [[ $tgt == *"MemoryHigh=2G"* ]]; then
+        v=OK; st="the symlink and the hard link made inside the window moved at its close (in its signed record), the link's target untouched"
+    else
+        v="DEVIATION (made: $made; left after the close: $left; in the close record $q)"; fail=1; st="not as expected"
+    fi
+    rows+=("| C110 | a symlink and a hard-linked drop-in made inside a window in our directory | $st | $ev | $v |")
+    echo "C110 links in our drop-in directory → $st; $ev; $v" >&2
+    if [[ -e $OD/60-nn-lab-c110-link.conf || -L $OD/60-nn-lab-c110-link.conf || -e $OE/61-nn-lab-c110-hard.conf ]]; then
+        grant_window 10; sleep 1; rm -f "$OD/60-nn-lab-c110-link.conf" "$OE/61-nn-lab-c110-hard.conf"; wait_no_window 60 || true
+    fi
+    rm -rf "$OUT"
+    restored C110 "the lab's links" absent "$([[ -e $OD/60-nn-lab-c110-link.conf || -L $OD/60-nn-lab-c110-link.conf || -e $OE/61-nn-lab-c110-hard.conf ]] && echo present || echo absent)"
 fi
 
 # ── vectors the matrix lacked (external audit LAB-004, lab PR 154) ───────

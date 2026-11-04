@@ -311,10 +311,14 @@ pub const SYSCTL_PID_MAX: u8 = 5;
 pub const SYSCTL_THREADS_MAX: u8 = 6;
 pub const SYSCTL_SCHED_RT_RUNTIME: u8 = 7;
 pub const SYSCTL_FTRACE_ENABLED: u8 = 8;
+/// The review of #497 (D3): `kernel.sched_rt_period_us` — a period at or
+/// below the runtime switches real-time throttling off as `runtime=-1`
+/// does (`sched_rt_runtime_exceeded`: `runtime >= period` returns 0).
+pub const SYSCTL_SCHED_RT_PERIOD: u8 = 9;
 
 /// The guarded sysctls by their `/proc/sys` file name (unique in procfs:
 /// no `/proc/<pid>` file is named so), and their kinds.
-pub const SYSCTL_FILES: [(&str, u8); 8] = [
+pub const SYSCTL_FILES: [(&str, u8); 9] = [
     ("overcommit_memory", SYSCTL_OVERCOMMIT_MEMORY),
     ("overcommit_ratio", SYSCTL_OVERCOMMIT_RATIO),
     ("overcommit_kbytes", SYSCTL_OVERCOMMIT_KBYTES),
@@ -323,6 +327,7 @@ pub const SYSCTL_FILES: [(&str, u8); 8] = [
     ("threads-max", SYSCTL_THREADS_MAX),
     ("sched_rt_runtime_us", SYSCTL_SCHED_RT_RUNTIME),
     ("ftrace_enabled", SYSCTL_FTRACE_ENABLED),
+    ("sched_rt_period_us", SYSCTL_SCHED_RT_PERIOD),
 ];
 
 const fn sysctl_words() -> [(usize, [u64; 3], u8); SYSCTL_FILES.len()] {
@@ -378,6 +383,15 @@ const fn parse_step(p: Parsed, v: &LimitValue, i: usize) -> Parsed {
     if i == 0 && b == b'-' {
         return Parsed { neg: true, ..p };
     }
+    // The review of #497 (D1): the kernel reads a sysctl's integer in base
+    // 0 (`proc_get_long` → `strtoul_lenient(…, 0, …)`): a leading `0`
+    // followed by a digit is octal (`040000` is 16384), `0x` hexadecimal
+    // (the `x` is "bad" below). Any spelling the kernel reads in another
+    // base than 10 is "bad" — refused — never judged as the decimal it
+    // looks like.
+    if b.is_ascii_digit() && p.digits == 1 && p.n == 0 {
+        return Parsed { bad: true, ..p };
+    }
     if b.is_ascii_digit() && p.digits < 18 {
         return Parsed {
             n: p.n * 10 + (b - b'0') as i64,
@@ -389,7 +403,9 @@ const fn parse_step(p: Parsed, v: &LimitValue, i: usize) -> Parsed {
 }
 
 /// A written decimal integer (an optional `-`, digits, then the end or a
-/// blank), `None` when it is not one; 24 bytes at most. Lot 273d's lab
+/// blank), `None` when it is not one — or when the kernel would read it in
+/// another base (a leading `0` before a digit: octal; `0x`: hex); 24 bytes
+/// at most. Lot 273d's lab
 /// (round 12): written as a loop, LLVM laid it out with a fall-through
 /// back-edge that the 5.15 and 6.1 verifiers reject (`back-edge from insn
 /// … to …`: `loop_ok` is false for a non-jump instruction's edge there),
@@ -434,7 +450,11 @@ pub const fn sysctl_write_harmful(kind: u8, written: Option<LimitValue>) -> bool
         SYSCTL_MAX_MAP_COUNT => v < 65530,
         SYSCTL_PID_MAX => v < 32768,
         SYSCTL_THREADS_MAX => v < 8192,
-        // -1: no throttling; at or past 99 % of the default period, almost none
+        // -1: no throttling; at or past 99 % of the default 1 s period,
+        // almost none — the write deny's reading (it cannot read the
+        // period, whose every write it refuses outside a window); the
+        // round judges the runtime against the host's own period
+        // ([`rt_throttling_off`])
         SYSCTL_SCHED_RT_RUNTIME => v < 0 || v >= 990_000,
         // 0 stops ftrace (the kernel reads any other integer as on): the
         // value the round puts back. A write of it is refused whatever it
@@ -442,6 +462,25 @@ pub const fn sysctl_write_harmful(kind: u8, written: Option<LimitValue>) -> bool
         SYSCTL_FTRACE_ENABLED => v == 0,
         _ => false,
     }
+}
+
+/// The review of #497 (D2): whether the registers of the writing task are
+/// its own write's. An io-wq worker (`PF_IO_WORKER`) carries the creating
+/// task's `pt_regs` (`copy_thread`), so its `IORING_OP_WRITE` would be
+/// judged on another write's bytes; a kernel thread has no user write.
+/// Neither is read: their write is an unread one — refused outside a
+/// window (fail-closed), signed.
+#[inline(always)]
+pub const fn regs_are_the_writes(task_flags: u32) -> bool {
+    task_flags & (crate::epg::PF_IO_WORKER | crate::btf_offsets::PF_KTHREAD) == 0
+}
+
+/// The review of #497 (D3): real-time throttling off, or almost — a
+/// runtime of -1, or at or past 99 % of the period (`period` 0 or less,
+/// unreadable: off too). The integrity round's judgment, from both files.
+#[inline(always)]
+pub const fn rt_throttling_off(runtime: i64, period: i64) -> bool {
+    runtime < 0 || period <= 0 || runtime.saturating_mul(100) >= period.saturating_mul(99)
 }
 
 /// R1 (the coordinator's decision of 04/11): the sysctls of which every
@@ -453,7 +492,10 @@ pub const fn sysctl_write_harmful(kind: u8, written: Option<LimitValue>) -> bool
 /// judged by value: lot 280 closes their race with `cgroup/sysctl`).
 #[inline(always)]
 pub const fn sysctl_refuses_every_write(kind: u8) -> bool {
-    kind == SYSCTL_FTRACE_ENABLED
+    // the review of #497 (D3): the RT period too — it is almost never
+    // tuned, and judged alone its value says nothing (the ratio to the
+    // runtime does: the round's)
+    kind == SYSCTL_FTRACE_ENABLED || kind == SYSCTL_SCHED_RT_PERIOD
 }
 
 /// The write deny's verdict on a write of the guarded sysctl of `kind`:
@@ -718,14 +760,22 @@ mod tests {
             parse_i64(&limit_value(b"-950000\n").unwrap()),
             Some(-950_000)
         );
-        assert_eq!(
-            parse_i64(&limit_value(b"000000000000000007").unwrap()),
-            Some(7)
-        );
-        assert_eq!(
-            parse_i64(&limit_value(b"000000000000000000000007").unwrap()),
-            None
-        );
+        // the review of #497 (D1): a spelling the kernel reads in base 8 or
+        // 16 is no decimal here
+        assert_eq!(parse_i64(&limit_value(b"0").unwrap()), Some(0));
+        assert_eq!(parse_i64(&limit_value(b"-0").unwrap()), Some(0));
+        assert_eq!(parse_i64(&limit_value(b"100").unwrap()), Some(100));
+        for t in [
+            &b"00"[..],
+            b"010",
+            b"-010",
+            b"0x0a",
+            b"0X0A",
+            b"000000000000000007",
+            b"000000000000000000000007",
+        ] {
+            assert_eq!(parse_i64(&limit_value(t).unwrap()), None, "{t:?}");
+        }
         for (kind, bad, good) in [
             (SYSCTL_OVERCOMMIT_MEMORY, &b"2"[..], &b"0"[..]),
             (SYSCTL_OVERCOMMIT_MEMORY, b"2", b"1"),
@@ -736,6 +786,24 @@ mod tests {
             (SYSCTL_THREADS_MAX, b"64", b"126602"),
             (SYSCTL_SCHED_RT_RUNTIME, b"-1", b"950000"),
             (SYSCTL_SCHED_RT_RUNTIME, b"1000000", b"500000"),
+            // the review of #497 (D5, M4/M5): each threshold at its edge
+            (SYSCTL_OVERCOMMIT_MEMORY, b"2", b"3"),
+            (SYSCTL_OVERCOMMIT_RATIO, b"49", b"50"),
+            (SYSCTL_OVERCOMMIT_KBYTES, b"1048575", b"1048576"),
+            (SYSCTL_OVERCOMMIT_KBYTES, b"1", b"0"),
+            (SYSCTL_MAX_MAP_COUNT, b"65529", b"65530"),
+            (SYSCTL_PID_MAX, b"32767", b"32768"),
+            (SYSCTL_THREADS_MAX, b"8191", b"8192"),
+            (SYSCTL_SCHED_RT_RUNTIME, b"990000", b"989999"),
+            (SYSCTL_SCHED_RT_RUNTIME, b"-1", b"0"),
+            // the review of #497 (D1): the octal spellings that took a
+            // harmful value past the decimal reading
+            (SYSCTL_PID_MAX, b"040000", b"40000"),
+            (SYSCTL_MAX_MAP_COUNT, b"065530", b"65530"),
+            (SYSCTL_THREADS_MAX, b"010000", b"10000"),
+            (SYSCTL_OVERCOMMIT_RATIO, b"050", b"50"),
+            (SYSCTL_OVERCOMMIT_KBYTES, b"02000000", b"2000000"),
+            (SYSCTL_PID_MAX, b"0x10000", b"65536"),
             // R1: 0 in any spelling the kernel reads as 0 is refused, any
             // other integer (the kernel's "on") let through
             (SYSCTL_FTRACE_ENABLED, b"0", b"1"),
@@ -753,6 +821,36 @@ mod tests {
         assert!(sysctl_write_harmful(SYSCTL_FTRACE_ENABLED, None));
     }
 
+    /// The review of #497 (D2): an io-wq worker's or a kernel thread's
+    /// registers are not its write's.
+    #[test]
+    fn an_io_worker_s_registers_are_not_read() {
+        assert!(regs_are_the_writes(0));
+        assert!(regs_are_the_writes(0x0040_0000)); // PF_RANDOMIZE, any other bit
+        assert!(!regs_are_the_writes(crate::epg::PF_IO_WORKER));
+        assert!(!regs_are_the_writes(crate::btf_offsets::PF_KTHREAD));
+        assert!(!regs_are_the_writes(
+            crate::epg::PF_IO_WORKER | crate::btf_offsets::PF_KTHREAD
+        ));
+    }
+
+    /// The review of #497 (D3): the round's judgment of the RT throttling,
+    /// the runtime against the period.
+    #[test]
+    fn rt_throttling_is_judged_against_the_period() {
+        assert!(rt_throttling_off(-1, 1_000_000));
+        assert!(rt_throttling_off(990_000, 1_000_000));
+        assert!(!rt_throttling_off(989_999, 1_000_000));
+        assert!(!rt_throttling_off(950_000, 1_000_000));
+        // the period cut to the runtime: off (the bypass of D3)
+        assert!(rt_throttling_off(950_000, 950_000));
+        // a longer period: 75 % is not off (the absolute threshold was wrong)
+        assert!(!rt_throttling_off(1_500_000, 2_000_000));
+        assert!(rt_throttling_off(1_980_000, 2_000_000));
+        assert!(rt_throttling_off(950_000, 0));
+        assert!(rt_throttling_off(950_000, -1));
+    }
+
     /// R1 (the coordinator's decision of 04/11): every write of
     /// `ftrace_enabled` outside a window is refused, 1 too, and its bytes
     /// are never read (nothing for a second thread to race); the agent's
@@ -763,6 +861,10 @@ mod tests {
         let w = |t: &'static [u8]| move || Some(limit_value(t).unwrap());
         let unread = || -> Option<LimitValue> { panic!("ftrace_enabled's write was read") };
         assert!(sysctl_refuses_every_write(SYSCTL_FTRACE_ENABLED));
+        // the review of #497 (D3): the RT period, every write too
+        assert!(sysctl_refuses_every_write(SYSCTL_SCHED_RT_PERIOD));
+        assert!(sysctl_write_refused(SYSCTL_SCHED_RT_PERIOD, false, unread));
+        assert!(!sysctl_write_refused(SYSCTL_SCHED_RT_PERIOD, true, unread));
         assert!(sysctl_write_refused(SYSCTL_FTRACE_ENABLED, false, unread));
         assert!(sysctl_write_refused(SYSCTL_FTRACE_ENABLED, false, w(b"1")));
         // the round's restore (the agent's family) and a window
@@ -808,6 +910,7 @@ mod tests {
                 ("threads-max", SYSCTL_THREADS_MAX),
                 ("sched_rt_runtime_us", SYSCTL_SCHED_RT_RUNTIME),
                 ("ftrace_enabled", SYSCTL_FTRACE_ENABLED),
+                ("sched_rt_period_us", SYSCTL_SCHED_RT_PERIOD),
             ][..]
         );
         for (name, kind) in SYSCTL_FILES {

@@ -1669,9 +1669,60 @@ struct Checker {
     watchdog_pidfile: PathBuf,
     own_files: Vec<String>,
     audit_log: Option<Arc<Mutex<AuditLog>>>,
+    /// The review of #497 (D4): our units' drop-ins judged again at every
+    /// round outside a window (a kept one stays writable by root).
+    own_guard: Option<OwnDropinGuard>,
+}
+
+/// The review of #497 (D4): what the round needs to judge our units' own
+/// drop-ins again — whether a window is open (inside one the close judges
+/// them), and the reloader a quarantine asks.
+pub struct OwnDropinGuard {
+    pub window: Arc<crate::anti_tamper::trusted_installer::TrustedInstallerOverride>,
+    pub reloader: crate::systemd_reload::Reloader,
 }
 
 impl Checker {
+    /// The review of #497 (D4): outside a window, every drop-in of our
+    /// units' directories judged again (a kept one may have changed, root
+    /// may write it), the harmful ones quarantined, each a signed record,
+    /// and a reload asked when one moved.
+    fn own_dropins_round(&mut self, at_boot: bool) {
+        let Some(g) = &self.own_guard else {
+            return;
+        };
+        if g.window.is_window_open() {
+            return;
+        }
+        let roots = unit_roots(Path::new("/"));
+        let search: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+        let moved = crate::own_dropins::quarantine(
+            &search,
+            &crate::host_dropins::HostLimits::read(),
+            UNIX_EPOCH,
+            Path::new(crate::own_dropins::QUARANTINE_DIR),
+            unix_now(),
+            is_known_dropin,
+        );
+        if moved.iter().any(|m| m.to.is_some()) {
+            g.reloader
+                .request(crate::systemd_reload::Reason::OwnDropinQuarantined);
+        }
+        for m in moved {
+            self.report_once(
+                Finding {
+                    kind: if m.to.is_some() {
+                        "own_dropin_moved"
+                    } else {
+                        "own_dropin_not_moved"
+                    },
+                    detail: m.detail(),
+                },
+                at_boot,
+            );
+        }
+    }
+
     /// This round's mount findings ([`mount_round`] on the live files).
     fn read_mounts(&mut self) -> Vec<Finding> {
         mount_round(
@@ -1865,6 +1916,7 @@ impl Checker {
     fn round(&mut self, at_boot: bool) {
         let findings = self.collect_round();
         self.apply(findings, unix_now(), at_boot);
+        self.own_dropins_round(at_boot);
         // Lot 273c (the review of #490): resource values the registration
         // found below their floors and restored (at the attach, at a
         // window's close): each a signed drift.
@@ -1954,6 +2006,7 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
     audit_log: Option<Arc<Mutex<AuditLog>>>,
     watchdog_pidfile: PathBuf,
     overlay_gate: Option<Arc<G>>,
+    own_guard: Option<OwnDropinGuard>,
 ) {
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let mut own_files = Vec::new();
@@ -1973,6 +2026,7 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
         watchdog_pidfile,
         own_files,
         audit_log,
+        own_guard,
     };
     for f in weakening_env(&vars) {
         checker.report_once(f, true);
@@ -3035,6 +3089,7 @@ mod tests {
             watchdog_pidfile: dir.join("watchdog.pid"),
             own_files: Vec::new(),
             audit_log: Some(Arc::new(Mutex::new(log))),
+            own_guard: None,
         };
         (checker, path)
     }

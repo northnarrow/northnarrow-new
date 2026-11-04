@@ -289,6 +289,15 @@ jobs:
           NN_REQUIRE_EBPF_OBJECT: "1"
         run: cargo test --locked -p nn-linux --lib sensors::ebpf_object::tests::every_map_is_one_the_agents_aya_loads -- --exact
 
+      # Lot 273d (the lab's round 12; the review of #497): no function of
+      # the object just built carries a back-edge the 5.15 and 6.1
+      # verifiers reject (a fall-through one: the write deny did not load
+      # there), and the emulation itself tells the two kinds apart.
+      - name: eBPF object back-edges (the 5.15/6.1 verifier's check_cfg)
+        env:
+          NN_REQUIRE_EBPF_OBJECT: "1"
+        run: cargo test --locked -p nn-linux --lib sensors::ebpf_object::tests -- --exact sensors::ebpf_object::tests::no_function_has_a_back_edge_the_5_15_verifier_rejects sensors::ebpf_object::tests::the_back_edge_emulation_tells_a_fallthrough_from_a_jump
+
   fuzz:
     name: fuzz (smoke, nightly)
     if: github.event_name != 'schedule'
