@@ -1187,6 +1187,7 @@ dependencies = [
  "libc",
  "nn-core",
  "nn-evidence",
+ "nn-export",
  "nn-model",
  "nn-proto",
  "rand 0.10.3",

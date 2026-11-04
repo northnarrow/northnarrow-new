@@ -237,9 +237,16 @@ kept the frames) — and checks:
   as the chain log reads it: `fmt_ver` 3 under the chain's domain, none or
   up to 2 (rows an older agent wrote, still in the archives) without it, a
   later one refused as a format this reader does not know;
+- each record's OCSF fields are the agent's mapping of its row: the row is
+  mapped again (the mapping of the same `nn-admin` version as the agent)
+  and compared, field for field — a record whose fields were rewritten,
+  its row genuine, is `TAMPERED`. The fields no row carries — the host's
+  name, the agent's id and version (`device`, `metadata.product`) — are
+  the record's own context, not checked;
 - each chain's rows, in their order, link: a row's `prev_hash` is the row
   before it's `entry_hash`; across a rotation through the terminator the
-  first row of the next file carries;
+  first row of the next file carries — a first row without it is `BROKEN`
+  (the file before's tail is not shown complete);
 - a record delivered twice is counted (`duplicates`), not refused.
 
 Exit 0 (`OK`), 13 a row that does not verify (`TAMPERED`), 11 a chain that

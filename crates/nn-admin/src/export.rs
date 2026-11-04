@@ -136,6 +136,67 @@ fn pos_of(v: &serde_json::Value) -> Option<RowRef> {
     })
 }
 
+/// Whether record `v` is the agent's mapping of its row: the row mapped
+/// again (the record's context — the host's name, the agent's id and
+/// version, from the record — and its place) gives the record, field for
+/// field. An action's outcome maps with its intent's facts when the
+/// worker had seen the intent, without them when it had not (a worker
+/// started after it): either is the agent's.
+#[allow(clippy::too_many_arguments)]
+fn mapped_alike(
+    v: &serde_json::Value,
+    chain: &str,
+    file: u64,
+    line: u64,
+    raw: &str,
+    rotate: Option<&str>,
+    seal: &nn_evidence::row_verify::RowSeal,
+    mappers: &mut BTreeMap<String, nn_export::ocsf::Mapper>,
+) -> Result<(), String> {
+    use nn_export::ocsf::{Context, Mapper, Row};
+    let Some(c) = nn_proto::ipc::ExportChain::from_name(chain) else {
+        return Err(format!("a chain the export does not know: {chain}"));
+    };
+    let text = |p: &[&str]| {
+        let mut x = v;
+        for k in p {
+            x = x.get(*k)?;
+        }
+        x.as_str().map(str::to_string)
+    };
+    let r = &v["unmapped"]["northnarrow"]["row"];
+    let ctx = Context {
+        agent_id: text(&["device", "uid"]).unwrap_or_default(),
+        hostname: text(&["device", "hostname"]).unwrap_or_default(),
+        version: text(&["metadata", "product", "version"]).unwrap_or_default(),
+    };
+    let row = Row {
+        chain: c,
+        file,
+        line,
+        end: r.get("end").and_then(|e| e.as_u64()).unwrap_or(0),
+        raw: raw.as_bytes(),
+        rotate: rotate.map(str::as_bytes),
+        verified: r.get("verified").and_then(|e| e.as_bool()).unwrap_or(false),
+        prev_hash: Some(seal.prev_hash.clone()),
+        entry_hash: Some(seal.entry_hash.clone()),
+    };
+    // which record of the row: `<agent>/<chain>/<file>/<line>`, a
+    // companion's with `/1`
+    let base = format!("{}/{chain}/{file}/{line}", ctx.agent_id);
+    let n = usize::from(text(&["metadata", "uid"]) == Some(format!("{base}/1")));
+    let mapper = mappers.entry(chain.to_string()).or_default();
+    let again = mapper.map(&ctx, &row);
+    if again.get(n) == Some(v) {
+        return Ok(());
+    }
+    // an outcome mapped by a worker that had not seen its intent
+    if Mapper::new().map(&ctx, &row).get(n) == Some(v) {
+        return Ok(());
+    }
+    Err("its OCSF fields are not its row's mapping (a record rewritten)".to_string())
+}
+
 /// Verify every record of `input` with the agent's key.
 pub fn verify(input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report> {
     let mut rep = Report::default();
@@ -143,6 +204,9 @@ pub fn verify(input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report>
     let mut records: BTreeMap<String, u64> = BTreeMap::new();
     let mut dups: BTreeMap<String, u64> = BTreeMap::new();
     let mut uids: BTreeSet<String> = BTreeSet::new();
+    // one mapping state per chain, as the worker keeps it (an action's
+    // outcome carries its intent's facts)
+    let mut mappers: BTreeMap<String, nn_export::ocsf::Mapper> = BTreeMap::new();
     for (i, line) in input.lines().enumerate() {
         let line = line?;
         let n = i as u64 + 1;
@@ -193,6 +257,21 @@ pub fn verify(input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report>
             ));
             continue;
         }
+        // the OCSF fields are the agent's mapping of the row, or the
+        // record was rewritten (the review of #499, D1: they are not signed)
+        if let Err(why) = mapped_alike(
+            &v,
+            &chain,
+            file,
+            l,
+            raw,
+            rotate.as_deref(),
+            &seal,
+            &mut mappers,
+        ) {
+            rep.tampered.push((n, format!("{chain} {file}/{l}: {why}")));
+            continue;
+        }
         let duplicate = v
             .get("metadata")
             .and_then(|m| m.get("uid"))
@@ -239,9 +318,16 @@ pub fn verify(input: impl BufRead, pk: &VerifyingKey) -> std::io::Result<Report>
                         .then(|| "its prev_hash is not the row before's".to_string())
                 } else if at.0 == p.0 + 1 && at.1 == 1 {
                     match &r.rotate {
+                        // no terminator: nothing shows the file before
+                        // ended at the row seen last — its tail may be cut
+                        // (the review of #499, D2: it passed as OK)
                         None => {
                             c.unlinked_rotations += 1;
-                            None
+                            Some(
+                                "a rotation without its terminator: the file before's tail is not \
+                                 shown complete"
+                                    .to_string(),
+                            )
                         }
                         Some(t) => match verify_row(t.as_bytes(), &chain, pk) {
                             Ok(ts)
@@ -443,17 +529,37 @@ mod tests {
         )
     }
 
-    fn record(chain: &str, file: u64, line: u64, raw: &str, uid: &str) -> String {
-        let entry = nn_evidence::row_verify::links(raw.as_bytes()).unwrap().1;
-        serde_json::json!({
-            "class_uid": 2004,
-            "metadata": {"uid": uid},
-            "raw_data": raw,
-            "unmapped": {"northnarrow": {"row": {
-                "chain": chain, "file": file, "line": line, "entry_hash": entry
-            }}}
-        })
-        .to_string()
+    /// The agent's record of a row: its mapping (`nn_export::ocsf`), as
+    /// the worker writes it.
+    fn record(chain: &str, file: u64, line: u64, raw: &str, _uid: &str) -> String {
+        mapped(chain, file, line, raw, None).to_string()
+    }
+
+    fn mapped(
+        chain: &str,
+        file: u64,
+        line: u64,
+        raw: &str,
+        rotate: Option<&str>,
+    ) -> serde_json::Value {
+        let (prev, entry) = nn_evidence::row_verify::links(raw.as_bytes()).unwrap();
+        let ctx = nn_export::ocsf::Context {
+            agent_id: "0123456789abcdef0123456789abcdef".into(),
+            hostname: "host-1".into(),
+            version: "0.0.1".into(),
+        };
+        let row = nn_export::ocsf::Row {
+            chain: nn_proto::ipc::ExportChain::from_name(chain).unwrap(),
+            file,
+            line,
+            end: 100 * line,
+            raw: raw.as_bytes(),
+            rotate: rotate.map(str::as_bytes),
+            verified: true,
+            prev_hash: Some(prev),
+            entry_hash: Some(entry),
+        };
+        nn_export::ocsf::Mapper::new().map(&ctx, &row).remove(0)
     }
 
     fn chain_of(k: &SigningKey, n: u64) -> Vec<String> {
@@ -583,11 +689,7 @@ mod tests {
         let t = terminator(&k, "detections", &hash(&rows[1]));
         let next = row(&k, "detections", 3, &hash(&t));
         let with_next = |t: Option<&str>, next: &str| {
-            let mut v: serde_json::Value =
-                serde_json::from_str(&record("detections", 2, 1, next, "c")).unwrap();
-            if let Some(t) = t {
-                v["unmapped"]["northnarrow"]["row"]["rotate"] = t.into();
-            }
+            let v = mapped("detections", 2, 1, next, t);
             [
                 record("detections", 1, 1, &rows[0], "a"),
                 record("detections", 1, 2, &rows[1], "b"),
@@ -599,10 +701,26 @@ mod tests {
         let r = verify(with(Some(&t)).as_bytes(), &k.verifying_key()).unwrap();
         assert_eq!(r.exit_code(), 0, "{r:#?}");
         assert_eq!((r.chains[0].linked, r.chains[0].unlinked_rotations), (2, 0));
-        // without its terminator: counted, not a break
+        // without its terminator: BROKEN — the tail of file 1 may be cut
         let r = verify(with(None).as_bytes(), &k.verifying_key()).unwrap();
-        assert_eq!(r.exit_code(), 0, "{r:#?}");
+        assert_eq!(r.exit_code(), 11, "{r:#?}");
         assert_eq!(r.chains[0].unlinked_rotations, 1);
+        assert!(r.chains[0].breaks[0]
+            .why
+            .starts_with("a rotation without its terminator"));
+        // the review's case: file 1's last row dropped and the next file's
+        // first record stripped of its terminator — no longer OK
+        let rows3 = chain_of(&k, 3);
+        let t3 = terminator(&k, "detections", &hash(&rows3[2]));
+        let next3 = row(&k, "detections", 4, &hash(&t3));
+        let cut = [
+            record("detections", 1, 1, &rows3[0], "a"),
+            record("detections", 1, 2, &rows3[1], "b"),
+            record("detections", 2, 1, &next3, "d"),
+        ]
+        .join("\n");
+        let r = verify(cut.as_bytes(), &k.verifying_key()).unwrap();
+        assert_ne!(r.exit_code(), 0, "{:?}", report_lines(&r));
         // a genuine terminator of another place: it does not link the files
         let elsewhere = terminator(&k, "detections", &hash(&rows[0]));
         let r = verify(with(Some(&elsewhere)).as_bytes(), &k.verifying_key()).unwrap();
@@ -631,6 +749,49 @@ mod tests {
         let forged = terminator(&other, "detections", &hash(&rows[1]));
         let r = verify(with(Some(&forged)).as_bytes(), &k.verifying_key()).unwrap();
         assert_eq!(r.chains[0].breaks[0].why, "the terminator does not verify");
+    }
+
+    /// The review of #499, D1: a record whose OCSF fields are rewritten —
+    /// its row genuine — is TAMPERED: the row mapped again is not it.
+    #[test]
+    fn a_record_with_its_fields_rewritten_is_tampered() {
+        let k = SigningKey::from_bytes(&[5; 32]);
+        let rows = chain_of(&k, 2);
+        let genuine = record("detections", 1, 1, &rows[0], "a");
+        assert_eq!(
+            verify(genuine.as_bytes(), &k.verifying_key())
+                .unwrap()
+                .exit_code(),
+            0
+        );
+        let bent: [fn(&mut serde_json::Value); 5] = [
+            |v| v["severity_id"] = 1.into(),
+            |v| v["class_uid"] = 0.into(),
+            |v| v["message"] = "benign".into(),
+            |v| v["device"]["type_id"] = 1.into(),
+            |v| v["unmapped"]["northnarrow"]["extra"] = true.into(),
+        ];
+        for (i, f) in bent.iter().enumerate() {
+            let mut v: serde_json::Value = serde_json::from_str(&genuine).unwrap();
+            f(&mut v);
+            let r = verify(v.to_string().as_bytes(), &k.verifying_key()).unwrap();
+            assert_eq!(r.exit_code(), 13, "case {i}: {:?}", report_lines(&r));
+            assert!(
+                r.tampered[0].1.contains("not its row's mapping"),
+                "{:?}",
+                r.tampered
+            );
+        }
+        // the host's name and the agent's version are the record's own (no
+        // row carries them): a record says them as it was written
+        let mut v: serde_json::Value = serde_json::from_str(&genuine).unwrap();
+        v["device"]["hostname"] = "another".into();
+        assert_eq!(
+            verify(v.to_string().as_bytes(), &k.verifying_key())
+                .unwrap()
+                .exit_code(),
+            0
+        );
     }
 
     #[test]
