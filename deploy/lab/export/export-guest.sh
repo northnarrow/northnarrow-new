@@ -4,7 +4,7 @@
 # crates/nn-export/examples/syslog_receiver.rs, built in the guest's tree).
 # Our own lab guests only.
 #
-# usage: export-guest.sh <out-dir> <phase>...  (setup arrive outage hostile slow stall rotate rewritten dead cost off)
+# usage: export-guest.sh <out-dir> <phase>...  (setup arrive outage hostile slow stall rotate rewritten protected cost off)
 #
 #   setup   — a lab CA and a receiver certificate (receiver.lab, 127.0.0.1),
 #             the receiver up (honest), the signed export.local (both sinks,
@@ -527,46 +527,49 @@ PY
     check empty-not-ok "an empty capture: EMPTY, exit 2 (got $rc)" test "$rc" -eq 2
 }
 
-# The review of #499 (D4): the export's worker killed again and again
-# (inside a window: its pid is protected) until the supervisor disables it
-# — the status, the manifest and the next beat say degraded, never on.
-phase_dead() {
-    local i w st
-    bus_json > "$OUT/status-before-dead.json"
-    "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 120 >/dev/null 2>&1
-    for i in $(seq 1 12); do
-        w=$(worker_pid)
-        [ -n "$w" ] && kill -9 "$w" 2>/dev/null
-        sleep 2
-        st=$(status_json | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["export"]["state"])' 2>/dev/null)
-        [ "$st" = degraded ] && break
-    done
-    status_json > "$OUT/status-dead.json"
-    bus_json > "$OUT/status-after-dead.json"
-    journalctl -u northnarrow-agent --since "-3min" --no-pager 2>/dev/null | grep -iE 'posture|combat|isolat|worker_export|export' | tail -60 > "$OUT/journal-dead.txt"
-    check dead-status "the worker killed until disabled: export status degraded (worker $(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["export"]["worker"])' "$OUT/status-dead.json" 2>/dev/null))" bash -c "[ '$st' = degraded ]"
-    "$NNADMIN" capabilities --json --key "$KEY" > "$OUT/capabilities-dead.json" 2>&1
-    check dead-manifest "the manifest's export entry degraded" python3 -I -c '
-import json,sys
-e = json.load(open(sys.argv[1]))["manifest"].get("export") or {}
-print(e.get("state"), e.get("why"))
-sys.exit(0 if e.get("state") == "degraded" else 1)' "$OUT/capabilities-dead.json"
-    # the next beat (every 30 s)
-    sleep 35
-    "$NNADMIN" heartbeat export --count 1 > "$OUT/beat-dead.txt" 2>&1
-    check dead-beat "the beat says the export degraded" python3 -I -c '
-import json,sys
-line = [l for l in open(sys.argv[1]) if l.startswith("{")][-1]
-e = json.loads(line).get("export") or {}
-print(e.get("state"), e.get("worker"))
-sys.exit(0 if e.get("state") == "degraded" else 1)' "$OUT/beat-dead.txt"
-    # back as before: the agent started again inside a window
-    restart_agent > "$OUT/restart-dead.txt" 2>&1
-    sleep 5
-    check dead-recovered "after a restart: on again, its worker ready" python3 -I -c '
+# The export worker's protection, as the kernel and the agent hold it.
+# Lot 276's rounds 5 to 7 ran a phase that killed the worker from this
+# script, as root, until the supervisor disabled it (the review of #499,
+# D4): that kill is a tamper attempt — `task_kill` refuses it (the worker's
+# pid is protected, as the agent's), NN-L-AT-001 signs it and the COMBAT
+# ladder ends the sender (round 7: this script, `KillProcessTree`; nothing
+# measured after it). What the lab checks from outside is that protection:
+# one root `kill -9`, sent from a transient unit of its own, which the
+# ladder ends instead of this script. The degraded state (D4) is the unit
+# tests' (`agent::export`, the controller's and the beat's).
+phase_protected() {
+    local w w2 sender
+    w=$(worker_pid)
+    rm -f "$OUT/tamper.txt"
+    systemd-run --unit=nn-k276-tamper --collect --wait --quiet \
+        -p StandardOutput="file:$OUT/tamper.txt" -p StandardError="append:$OUT/tamper.txt" \
+        /bin/bash -c "echo sender=\$\$; kill -9 $w; echo kill-rc=\$?; sleep 10; echo sender-alive" >/dev/null 2>&1
+    sleep 3
+    w2=$(worker_pid)
+    sender=$(sed -n 's/^sender=//p' "$OUT/tamper.txt" | head -1)
+    check protected-refused "a root kill -9 of the export worker (pid ${w:-none}) refused" \
+        grep -q 'kill-rc=1' "$OUT/tamper.txt"
+    check protected-worker "the worker untouched (pid ${w:-none}, now ${w2:-none})" \
+        bash -c "[ -n '$w' ] && [ '$w' = '$w2' ]"
+    check protected-on "the export still on, its worker ready" python3 -I -c '
 import json,sys
 e = json.load(sys.stdin)["export"]
+print(e["state"], e["worker"])
 sys.exit(0 if e["state"] == "on" and e["worker"] == "ready" else 1)' < <(status_json)
+    check protected-recorded "the attempt signed: NN-L-AT-001 for the sender (pid ${sender:-none})" python3 -I -c '
+import json,sys
+pid = int(sys.argv[2] or 0)
+for l in open(sys.argv[1], errors="replace"):
+    if "NN-L-AT-001" not in l:
+        continue
+    r = json.loads(l)
+    if (r.get("principal") or {}).get("pid") == pid:
+        print(r.get("ts"), r.get("severity"), r.get("posture_at"))
+        sys.exit(0)
+sys.exit(1)' "$STATE/detections/detections.jsonl" "$sender"
+    check protected-answered "the sender ended by the response ladder, not by itself" bash -c "
+        ! grep -q sender-alive '$OUT/tamper.txt' &&
+        grep -q 'Killed { pid: $sender }' '$STATE/detections/actions.jsonl'"
 }
 
 ticks() { awk '{print $14 + $15}' "$1" 2>/dev/null; }
