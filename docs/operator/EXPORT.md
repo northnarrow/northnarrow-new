@@ -334,6 +334,8 @@ fuzz/Cargo.lock): the lot's note lists them.
   until the receiver read them; RELP's acknowledgement would on all.
 - No client certificate (mTLS): the receiver is authenticated, the agent
   is by its signed rows only.
+- The receiver must speak TLS 1.3 with X25519: one that offers only
+  TLS 1.2, or only the NIST curves, fails the handshake (`tls: protocol`).
 - Landlock pins the port, not the address; below ABI 4 nothing in the
   kernel pins the worker's connects (a per-role address pin in the BPF LSM
   `socket_connect` hook would, on every kernel).
