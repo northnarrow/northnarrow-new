@@ -95,6 +95,45 @@ impl Drop for AgentGuard {
     }
 }
 
+/// Lot 278: the host's per-rule policy and its `.sig` as a test found
+/// them (dev, inode, size, mtime; `None` absent), compared again once the
+/// agent quit — a fixture's policy goes in its own directory, and one
+/// stored on the host stayed there for the next suites (the guest run of
+/// 7a731dab).
+struct HostPolicyUnchanged(Vec<(PathBuf, Option<FileStamp>)>);
+/// dev, inode, size, mtime (s, ns).
+type FileStamp = (u64, u64, u64, i64, i64);
+impl HostPolicyUnchanged {
+    fn snapshot() -> Self {
+        use std::os::unix::fs::MetadataExt;
+        let file = PathBuf::from(northnarrow_agent::decision::rule_policy::DEFAULT_LOCAL);
+        let sig = northnarrow_agent::config::overlay_auth::sig_path(&file);
+        Self(
+            [file, sig]
+                .into_iter()
+                .map(|p| {
+                    let m = std::fs::symlink_metadata(&p)
+                        .ok()
+                        .map(|m| (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec()));
+                    (p, m)
+                })
+                .collect(),
+        )
+    }
+}
+impl Drop for HostPolicyUnchanged {
+    fn drop(&mut self) {
+        let now = Self::snapshot();
+        if now.0 != self.0 {
+            common::fail_teardown(&format!(
+                "the host's per-rule policy changed during the test (a fixture writes in its own \
+                 directory): before {:?}, after {:?}",
+                self.0, now.0
+            ));
+        }
+    }
+}
+
 /// An enforcing agent with every state file in a per-test tempdir, empty
 /// allow/blocklists, no FIM watch.
 struct Fixture {
@@ -107,6 +146,8 @@ struct Fixture {
     /// Lab PR 269: its admin socket (the debug triggers sit next to it).
     #[cfg_attr(not(feature = "debug-trigger"), allow(dead_code))]
     admin_socket: PathBuf,
+    /// Lot 278: checked once the agent quit (dropped after its guard).
+    _host_policy: HostPolicyUnchanged,
     /// Lot 278: dropped last, once the agent quit — a policy it stored
     /// there is a protected inode while it runs.
     _tempdir: tempfile::TempDir,
@@ -121,6 +162,7 @@ impl Fixture {
     /// admin socket once the agent runs (`nn-admin policy set`, a key with
     /// `config-manage`, nn-admin from a root-owned copy).
     fn setup_with(policy: Option<&str>) -> Self {
+        let host_policy = HostPolicyUnchanged::snapshot();
         wipe_pin_tree();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let dir = tempdir.path().to_path_buf();
@@ -283,6 +325,7 @@ impl Fixture {
             _agent_guard: guard,
             _installed_agent: installed_agent,
             admin_socket: socket,
+            _host_policy: host_policy,
         }
     }
 
