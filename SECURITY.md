@@ -75,7 +75,9 @@ workspace, `agent-ebpf` and the fuzz harness; the lab's C probes and
 Python helpers under `deploy/lab/`; and the GitHub Actions workflows. It
 runs on every pull request to `main`, on every push to `main` and weekly,
 so a query added by a new CodeQL release also runs on an unchanged `main`.
-Each language is analysed without a build (`build-mode: none`).
+Each language is analysed without a build (`build-mode: none`). A pull
+request's analysis is diff-informed: it reports the alerts in the lines
+the pull request changes, and the runs on `main` cover the rest.
 
 - An alert is fixed in the code, or triaged in a pull request (real,
   false positive, not applicable) and its fix scheduled; it is not

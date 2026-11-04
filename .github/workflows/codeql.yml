@@ -10,6 +10,9 @@
 # lower-precision security ones. On every pull request to main, every push
 # to main (the baseline a pull request's alerts are compared with), and
 # weekly, so a new query of a new CodeQL release runs on an unchanged main.
+# A pull request's analysis is diff-informed (codeql-action's default): it
+# reports what the lines the pull request changes bring, not the alerts
+# already on main, which the push and the weekly runs keep.
 # xtask/tests/supply_chain.rs keeps the language list equal to the
 # languages of the tracked files, and this file's triggers, suite and
 # permissions as they are.
@@ -42,11 +45,6 @@ jobs:
     name: CodeQL (${{ matrix.language }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # MEASUREMENT ONLY (lot codeql): one full analysis of the tree on this
-    # pull request instead of the diff-informed one; reverted by the next
-    # commit.
-    env:
-      CODEQL_ACTION_DIFF_INFORMED_QUERIES: "false"
     # `security-events: write` uploads the SARIF of the analysis. A job
     # that sets `permissions:` gets none of the others, so `contents: read`
     # is restated for the checkout.

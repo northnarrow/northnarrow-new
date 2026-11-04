@@ -5328,5 +5328,41 @@ number in parentheses is a lab PR.
     `security-events` to `analyze`. 39 mutations of the workflow, each
     failing a named test (after one survivor, agent-ebpf's toolchain
     install dropped, got its assertion).
-  - Lab: no guest (CI only). The first runs are recorded below as
-    measured.
+  - Lab: no guest (CI only); GitHub-hosted runners, as measured on PR
+    #496. The PR run at 8b4f29f6 (run 41790833220) was green on all four
+    languages: actions 40 s, c-cpp 60 s (13 source files), python 46 s
+    (5 files), rust 9 min 18 s. The Rust job's toolchains and fetches took
+    22 s; the extraction took 2 min 37 s, read 544 files and found the
+    three cargo manifests. No disk-freeing step was needed. It reported 0
+    alerts, but the run is diff-informed (codeql-action's default on a pull
+    request: 14 diff ranges in 7 files), so it covered the lines the PR
+    changes only. One full analysis of the tree followed: commit 2fd2db6f
+    set `CODEQL_ACTION_DIFF_INFORMED_QUERIES=false` and the next commit
+    reverted it (run 41792146816, rust 8 min 35 s). It reported 161
+    alerts, none of them real:
+    - rust 159. 152 are in test code, not applicable: 64
+      `hard-coded-cryptographic-value` (fixed keys and nonces of
+      deterministic tests) and 88 `cleartext-logging` (assertion and
+      panic messages that print a uid, a verdict's reasoning or a run's
+      output).
+    - Of the 7 in production code, 6 are false positives: three 32-byte
+      nonces zeroed and then filled at once by `OsRng.fill_bytes`, which
+      is getrandom and panics on failure (`admin_cli.rs:3221`,
+      `admin_auth.rs:928`, `quarantine.rs:633`); the vault's versioned
+      HKDF salts over a random master key (`vault.rs:42`, `:44`); and a
+      `getifaddrs` list walked only after its null check
+      (`canary/network.rs:90`). The seventh, the fuzz fixture's seed nonce
+      (`fuzz_api.rs:139`), is not applicable.
+    - c-cpp 2, not applicable: `cpp/toctou-race-condition` in the lab's
+      EXP-13 load generator, which is built in the guest and not shipped
+      (`deploy/lab/bus/nn-exp13.c:135`, `:360`).
+    - python 0, actions 0.
+    No alert was dismissed. Each is listed with its triage in the PR.
+  - Open: the push run after the merge opens the same 161 alerts on
+    `main`, 70 of them `critical` by CodeQL's rating. A maintainer
+    disposes of them (fixed, or closed with its reason); no run is made
+    green by dismissing. The build scripts and proc-macros of the locked
+    dependency tree run in the analyze step, which holds `security-events:
+    write`, as in GitHub's own default setup. Splitting the upload into a
+    job that runs no repository code would take the write away from them.
+  - Level unchanged (C27 1).
