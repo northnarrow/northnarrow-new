@@ -831,6 +831,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   twin's and counted before the 41999 one was appended (the CI of #493 on
   Ubuntu 22.04). It waits for as many records as listeners it opened, then
   asserts exactly that many, and checks each.
+- The privileged tests' fixture teardown no longer waits out its 10 s
+  and fails the test (lot 277, after #494's merge: CI's 22.04 privileged
+  suites). Its rounds signalled only the processes still under the
+  fixture's `sudo`: a child of the agent registered as protected (the move
+  guard's self-test target) outlived the agent, left that tree when the
+  agent died and was never signalled again. Each round now evicts and
+  signals every pid the teardown has seen, the agent first. Test code
+  only; the hook's refusals are unchanged.
 - R009 no longer kills root automation run from a source tree outside
   COMBAT; an installer's trusted-installer window covers its own process
   tree (lot 278, the false positive of the review of #492, section f).
