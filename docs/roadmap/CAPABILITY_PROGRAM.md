@@ -5387,8 +5387,10 @@ number in parentheses is a lab PR.
     touches no cgroup or anti-tamper code (C97's timing is lot 273d's to
     explain).
   - Gates on 3060d947 (the final check's code, the lot merged with
-    `main` 80c8da36, #493), and again on the commit that writes this line
-    (79cb419f before it changes a lab check, this one the notes only):
+    `main` 80c8da36, #493), and again on the final tip, the lot merged
+    with `main` 0131394c (#496, CodeQL; CHANGELOG.md's conflict resolved
+    with both entries in lot order) — the commits after 3060d947 change a
+    lab check, the notes and that merge:
     `build-ebpf --release`; clippy ×4 `-D warnings`; fmt; the workspace's
     tests, 84 suites, 3,738 passed, 0 failed, 17 ignored; the wire test
     with `--features debug-trigger`; the map test with
