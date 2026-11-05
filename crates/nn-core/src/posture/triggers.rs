@@ -207,22 +207,18 @@ fn lexical_form(path: &str) -> Option<String> {
 }
 
 /// A path (in [`lexical_form`]) through a link the kernel follows to a
-/// process's view of the filesystem:
-/// `/proc/<pid|self|thread-self>[/task/<tid>]/` then `cwd`, `root` or
-/// `exe` (the link itself or anything under it), or an entry of `fd/` or
-/// `map_files/` (each reopens the file it names); and (lot 286)
-/// `/dev/fd/<n>`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, links into
-/// `/proc/self/fd/` that the `/dev/` prefix carved out.
+/// process's view of the filesystem: `/proc/<pid>[/task/<tid>]/` (or
+/// `self`, `thread-self`) then `cwd`, `root` or `exe` (the link itself or
+/// anything under it), or an entry of `fd/` or `map_files/` (each reopens
+/// the file it names); and (lot 286) `/dev/fd/<n>`, `/dev/stdin`,
+/// `/dev/stdout`, `/dev/stderr`, links into `/proc/self/fd/` that the
+/// `/dev/` prefix carved out. Any second segment matches: no other entry
+/// of `/proc` holds such names, and a path that only looks like one counts.
 fn through_proc_link(path: &str) -> bool {
-    // a segment of a lexical form is never empty
-    let task = |s: &str| s == "self" || s == "thread-self" || s.bytes().all(|b| b.is_ascii_digit());
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     let rest = match segs.as_slice() {
         ["dev", "fd", _, ..] | ["dev", "stdin" | "stdout" | "stderr", ..] => return true,
-        ["proc", who, rest @ ..] if task(who) => match rest {
-            ["task", _, rest @ ..] => rest,
-            rest => rest,
-        },
+        ["proc", _, "task", _, rest @ ..] | ["proc", _, rest @ ..] => rest,
         _ => return false,
     };
     matches!(
@@ -3554,6 +3550,7 @@ mod tests {
         assert!(through_proc_link("/proc/self/cwd"));
         assert!(through_proc_link("/proc/self/exe"));
         assert!(through_proc_link("/proc/7/task/8/map_files/1-2"));
+        assert!(through_proc_link("/proc/12/task/12/exe"));
         assert!(through_proc_link("/dev/stdout"));
         assert!(through_proc_link("/dev/stderr"));
         assert!(through_proc_link("/dev/stdin"));

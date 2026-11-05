@@ -872,6 +872,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- Tracepoint mode's mass-write carve-out no longer folds a `..` through a
+  `/proc` link (lot 286, the re-review of #500, N2): a caller's path was
+  judged after its `..` were folded, so `/proc/self/root/../home/u/x` and
+  `/proc/self/cwd/../../x` were carved out by their `/proc/` prefix while
+  the kernel opened a user's file, and `/run/user/<uid>/../../../home/u/x`
+  by the writer's own runtime directory. A path no kernel resolved is
+  never carved out when it holds a `..` (it counts), nor when it goes
+  through a process's `cwd`, `root`, `exe`, `fd/<n>` or `map_files/` link
+  or `/dev/fd/<n>`, `/dev/std{in,out,err}`; `/proc/<pid>/status`,
+  `/run/udev/` and `/run/systemd/` keep their carve-out.
 - The posture no longer reaches COMBAT, and the ladder no longer kills, on
   benign workloads (lot 282, Tappa Prove P0; `docs/design/
   POSTURE_FSM_V2_REDESIGN.md` §10). Measured on `main` (Ubuntu 22.04): a
