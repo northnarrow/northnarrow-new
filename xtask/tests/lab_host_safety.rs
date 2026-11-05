@@ -1426,6 +1426,91 @@ fn open_sensor_check_refuses_a_host_that_is_not_a_lab_guest() {
     }
 }
 
+/// Lot 283a: the benign corpus installs and purges packages, services and
+/// containers. Each workload script refuses a host that is neither a lab
+/// guest nor declared disposable before it runs anything (stubs on PATH
+/// record any call), whatever NN_TEST_DISPOSABLE_HOST says but `1`.
+#[test]
+fn every_corpus_workload_refuses_a_host_that_is_not_a_lab_guest() {
+    if Path::new("/var/lib/nn-lab-provisioned").exists() {
+        eprintln!("SKIP: this host is an nn-lab guest");
+        return;
+    }
+    let dir = case_dir("corpus-refuse");
+    let bin = dir.join("bin");
+    for tool in [
+        "sudo",
+        "systemctl",
+        "systemd-run",
+        "apt-get",
+        "dpkg-query",
+        "readlink",
+        "mktemp",
+        "id",
+        "rm",
+        "mkdir",
+        "python3",
+        "git",
+        "docker",
+        "podman",
+        "curl",
+    ] {
+        write_exec(
+            &bin.join(tool),
+            &format!("#!/bin/bash\necho {tool} >> \"$CALLS\"\n"),
+        );
+    }
+    let path = bin.display().to_string();
+    let calls = dir.join("calls");
+    let scripts = [
+        "deploy/lab/corpus/dev-workstation.sh",
+        "deploy/lab/corpus/ci-runner.sh",
+        "deploy/lab/corpus/container-host.sh",
+        "deploy/lab/corpus/db-server.sh",
+    ];
+    for rel in scripts {
+        for opt_in in [None, Some("0"), Some("yes"), Some("")] {
+            let mut cmd = Command::new("/bin/bash");
+            cmd.arg(repo_root().join(rel))
+                .env("PATH", &path)
+                .env("CALLS", &calls)
+                .env("HOME", &dir)
+                .env_remove("NN_TEST_DISPOSABLE_HOST");
+            if let Some(v) = opt_in {
+                cmd.env("NN_TEST_DISPOSABLE_HOST", v);
+            }
+            let out = cmd.output().unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{rel} {opt_in:?}: {}",
+                text(&out)
+            );
+            assert!(
+                text(&out).contains("refusing to run"),
+                "{rel}: {}",
+                text(&out)
+            );
+            assert!(
+                !calls.exists(),
+                "{rel} {opt_in:?}: ran {:?}",
+                fs::read_to_string(&calls)
+            );
+        }
+    }
+    // the four workloads are the directory's scripts: a new one is checked
+    let mut found: Vec<String> = fs::read_dir(repo_root().join("deploy/lab/corpus"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sh") && n != "corpus-lib.sh")
+        .map(|n| format!("deploy/lab/corpus/{n}"))
+        .collect();
+    found.sort();
+    let mut want: Vec<String> = scripts.iter().map(|s| s.to_string()).collect();
+    want.sort();
+    assert_eq!(found, want);
+}
+
 /// How a run of the fixture ends: the end of step 2, an error exit, or a
 /// signal.
 const ENDINGS: [(&str, &str, i32); 5] = [

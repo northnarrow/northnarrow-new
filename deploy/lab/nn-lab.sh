@@ -67,6 +67,8 @@
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh net-check         # lab PR 224: connect-time network verdicts, reverse shells, outbound fan-out (CM-02/03/14)
 #   deploy/lab/nn-lab.sh ransom-check [--only MS23|MS25] # lab PR 225: MS-23 ransomware recorded (kill held, ENGAGED), negatives; MS-25 security tools
+#   deploy/lab/nn-lab.sh corpus NAME   # lot 283a: a benign corpus (dev | ci | containers | db), the kills, verdicts and
+#                                      # COMBAT entries of the signed chains by step (docs/validation/BENIGN_CORPUS.md)
 #   deploy/lab/nn-lab.sh fim-reuse-check  # review 57: a deleted watched file's reused inode is not attributed to it
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # agent death via systemd in a window, assert respawn v2 invariants
@@ -1554,6 +1556,25 @@ cmd_ransom_check() {
     vssh "sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/ransom-check.sh $args"
 }
 
+cmd_corpus() {
+    # Lot 283a (deploy/lab/corpus/, docs/validation/BENIGN_CORPUS.md): one
+    # benign workload on the installed agent in its default mode — a
+    # developer's workstation, a CI runner, a container host, a database
+    # server — run as the lab user, everything it installed or wrote
+    # removed; the report lists every kill, verdict and COMBAT entry of the
+    # signed chains by step. Needs a sync + install.
+    vm_running || die "guest is not running"
+    local script
+    case "${1:-}" in
+        dev) script=dev-workstation.sh ;;
+        ci) script=ci-runner.sh ;;
+        containers) script=container-host.sh ;;
+        db) script=db-server.sh ;;
+        *) die "corpus: dev | ci | containers | db" ;;
+    esac
+    vssh "sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/corpus/$script"
+}
+
 cmd_malsim_exec_check() {
     # Lab PR 226 (deploy/lab/malsim/exec-check.sh, EXPERIMENTAL): the exec
     # policy off, then enforce, audit and the desktop profile (unit drop-ins
@@ -2380,6 +2401,7 @@ case "${1:-help}" in
     test-one)      shift; cmd_test_one "$@" ;;
     dns-sensor-check) cmd_dns_sensor_check ;;
     ransom-check)  shift; cmd_ransom_check "$@" ;;
+    corpus)        shift; cmd_corpus "$@" ;;
     fim-reuse-check) cmd_fim_reuse_check ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;
