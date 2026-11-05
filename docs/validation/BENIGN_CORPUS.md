@@ -140,3 +140,29 @@ kprobe adds the cost of one probe per open while it runs.
 A record is attributed to the last step begun before it; one more than 10 s
 after that step's end is marked `(after)`. A step killed by the agent shows
 its rc (137 for SIGKILL) and the tail of its output.
+
+## Measurements
+
+**Lot 283a (2026-11-05), main fc438889**, default mode; ubuntu2404 (6.8) all
+four corpora, ubuntu2204 (5.15) `dev` and `ci`. No COMBAT stage and no
+NEUTRALIZE in any run; every kill was of a benign workload.
+
+| Corpus | Kill intents | Rules | Outcome |
+|---|---|---|---|
+| dev 24.04 / 22.04 | 6 / 4 | R001 (go test binaries, `go run`, AppImage `AppRun` from `/tmp/.mount_*` and `/tmp/appimage_extracted_*`) | 24.04 AlreadyGone; 22.04 Killed (the AppImage steps exit 137) |
+| ci 24.04 / 22.04 | 2 / 2 | R001 (go test, `go run`) | AlreadyGone / Killed |
+| containers 24.04 | 650 | R013 ×645 (k3s's bundled `runc`), FIM-009 ×5 (the k3s installer's `touch`, `tee`, `chmod`) | runc Killed every time: no pod started; FIM-009 AlreadyGone |
+| db 24.04 | 4 | FIM-007 ×3 (`crontab -u postgres`, `install` into `/etc/cron.d`, `crontab -r`), R011 ×1 (the initramfs-tools hook `kmod` in an apt upgrade) | AlreadyGone |
+
+Small-file probe (dev, 24.04): `cargo fmt` over 120 modules (122),
+`prettier --write` over 300 files (300) and `rsync --inplace` over 1,000
+files (1,000) reach their tree's size in one process; every other step stays
+at 5 or below.
+
+**Lot 283b (2026-11-06)**, the lot's agent, ubuntu2404, `dev`,
+`containers`, `db`: dev — one kill, the control's `www-data` run (rc 137);
+go test, `go run`, both AppImage runs and the lab user's control are R001
+High records. containers — 0 kills, k3s's pod runs to completion in 32 s.
+db — 0 kills, the dpkg trigger's initramfs hook recorded twice. The
+anti-tamper refusals, resolved: only the agent's own four drop-in
+directories (`deb-systemd-helper`'s `rmdir` during a purge).
