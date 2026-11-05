@@ -94,12 +94,28 @@ pub fn kind(uid: u32) -> AccountKind {
     }
     let key = (stamp(LOGIN_DEFS), stamp(PASSWD));
     let mut t = TABLE.get_or_init(Default::default).lock();
-    if t.key != Some(key) {
-        t.uid_min = uid_min(&read(LOGIN_DEFS));
-        t.shells = shells(&read(PASSWD));
-        t.key = Some(key);
+    t.refresh(key, || read(LOGIN_DEFS), || read(PASSWD));
+    t.kind(uid)
+}
+
+impl Table {
+    /// Read the files again when their stamps are not the ones read.
+    fn refresh(
+        &mut self,
+        key: (Stamp, Stamp),
+        login_defs: impl FnOnce() -> String,
+        passwd: impl FnOnce() -> String,
+    ) {
+        if self.key != Some(key) {
+            self.uid_min = uid_min(&login_defs());
+            self.shells = shells(&passwd());
+            self.key = Some(key);
+        }
     }
-    classify_account(uid, t.uid_min, t.shells.get(&uid).map(String::as_str))
+
+    fn kind(&self, uid: u32) -> AccountKind {
+        classify_account(uid, self.uid_min, self.shells.get(&uid).map(String::as_str))
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +130,32 @@ mod tests {
         assert_eq!(uid_min("UID_MIN 500\nUID_MIN x\n"), 500);
         assert_eq!(uid_min("UID_MIN 500\nUID_MIN 2000\n"), 2000);
         assert_eq!(uid_min("SYS_UID_MIN 100\n"), 1000);
+    }
+
+    /// The files are read once per version: again when a stamp changes,
+    /// not while both stay the same.
+    #[test]
+    fn the_table_is_read_again_when_a_file_changes() {
+        let mut t = Table::default();
+        let a: (Stamp, Stamp) = (Some((1, 2, 3, 0, 10)), Some((1, 3, 3, 0, 20)));
+        t.refresh(
+            a,
+            || "UID_MIN 500\n".into(),
+            || "u:x:600:600::/h:/bin/bash\n".into(),
+        );
+        assert_eq!(t.kind(600), AccountKind::Human);
+        t.refresh(a, || panic!("read again"), || panic!("read again"));
+        let b: (Stamp, Stamp) = (Some((1, 2, 3, 0, 10)), Some((1, 3, 4, 0, 20)));
+        t.refresh(
+            b,
+            || "UID_MIN 500\n".into(),
+            || "u:x:600:600::/h:/usr/sbin/nologin\n".into(),
+        );
+        assert_eq!(t.kind(600), AccountKind::System);
+        // a file that cannot be read: UID_MIN 1000, no entry
+        t.refresh((None, None), String::new, String::new);
+        assert_eq!(t.kind(600), AccountKind::System);
+        assert_eq!(t.kind(1000), AccountKind::Human);
     }
 
     #[test]

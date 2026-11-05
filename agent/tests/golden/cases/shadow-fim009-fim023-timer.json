@@ -1,5 +1,5 @@
 {
- "about": "Lab PR 236 (multi-match): a systemd .timer dropped in /etc/systemd/system by a program staged in /tmp. NN-L-FIM-009 (unit dropped) and NN-L-FIM-023 (timer created) both match the same drift; first-match gave FIM-009 alone and FIM-023 never fired. Now the record names both, FIM-009 primary (same severity and action, registered first), one kill of the writer.",
+ "about": "Lab PR 236 (multi-match): a systemd .timer dropped in /etc/systemd/system by a program staged in /tmp. NN-L-FIM-009 (unit dropped) and NN-L-FIM-023 (timer created) both match the same drift; first-match gave FIM-009 alone and FIM-023 never fired. Now the record names both; since lot 283b FIM-009's kill of the writer is held (a High record), so FIM-023 is primary and its kill of the writer is the one response.",
  "fires": [
   "NN-L-FIM-009_SystemdUnitDropped",
   "NN-L-FIM-023_SystemdTimerCreated"
