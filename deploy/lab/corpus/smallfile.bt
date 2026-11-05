@@ -1,0 +1,36 @@
+// Lot 283a — the benign corpus's small-file probe (corpus-lib.sh,
+// smallfile_start): every write-open of a regular file that existed before
+// the open (no FMODE_CREATED) and holds under 4 KiB when opened — the files
+// a rewrite in place of small documents touches, the shape the agent's
+// MASS_OVERWRITE_SMALL counts. One line per process and file per 60 s (the
+// report counts distinct files per process in any 60 s window):
+//   SF <monotonic ns> <tgid> <comm> <dev> <inode> <size at the open>
+// and SF-READY <monotonic ns> once, when the probes are attached.
+// security_file_open runs before an O_TRUNC truncation: the size is the
+// file's before the rewrite. FMODE_WRITE 0x2, FMODE_CREATED 0x100000 (5.15
+// to 6.8).
+// No BEGIN or END: Ubuntu 22.04's bpftrace 0.14 cannot resolve their
+// uprobes ("Could not resolve symbol: /proc/self/exe:BEGIN_trigger"). The
+// first tick of `interval` says the probes are attached; the maps printed
+// at exit are not SF lines (the report reads SF lines only).
+interval:s:1
+/@ready == 0/
+{
+    printf("SF-READY %llu\n", nsecs);
+    @ready = 1;
+}
+
+kprobe:security_file_open
+{
+    $f = (struct file *)arg0;
+    if (($f->f_mode & 0x2) != 0 && ($f->f_mode & 0x100000) == 0) {
+        $i = $f->f_inode;
+        if (($i->i_mode & 0xf000) == 0x8000 && $i->i_size < 4096) {
+            if (nsecs - @last[pid, $i->i_ino] > 60000000000) {
+                @last[pid, $i->i_ino] = nsecs;
+                printf("SF %llu %d %s %u %llu %lld\n", nsecs, pid, comm,
+                       $i->i_sb->s_dev, $i->i_ino, $i->i_size);
+            }
+        }
+    }
+}
