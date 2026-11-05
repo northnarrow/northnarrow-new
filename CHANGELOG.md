@@ -2373,6 +2373,37 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- The kills that broke benign workloads (lot 283b, the coordinator's
+  decision of 06/11/2026 after lot 283a's benign corpus;
+  `docs/operator/RULE_POLICY.md`, "Kills that broke benign workloads"). Each
+  is a default a signed `enforce <rule>` undoes:
+  - **R001, R003**: an exec from `/tmp` or `/var/tmp` by a person's account
+    (`UID_MIN` from `/etc/login.defs` and up, a login shell in
+    `/etc/passwd`) is a High record below COMBAT, killed in COMBAT — `go
+    test`, `go run`, an AppImage, a CI runner's user; a system account's
+    (`www-data`, `postgres`, `nobody`, a `nologin` shell) is killed in every
+    posture, as before. The host's account database is read by nn-linux
+    (`accounts`, again when either file changes) for the engine's
+    `DecisionHost::account_kind`.
+  - **R013**: a `runc` outside the system directories (k3s' bundled one) is
+    a High record, its kill held (`R013_RUNC_KILL`); k3s's pods start. A
+    copied `nsenter` or `unshare` is killed.
+  - **NN-L-FIM-007, NN-L-FIM-009**: the kill of a cron entry's or a unit's
+    writer, which came after the write, is held (`FIM_007_KILL`,
+    `FIM_009_KILL`, outside the package and administrator carve-outs: a
+    package transaction's write holds no kill even under `enforce`); the
+    record is High. Preventing the write is Wave 3's (the kernel's deny,
+    the persistence that repairs itself).
+  - **R011**: a root exec of a program in a system tree whose lineage the
+    exec pump read at the exec holds a package manager run by root is
+    recorded — the initramfs hook `kmod` a dpkg trigger's
+    `update-initramfs` runs from forks of `mkinitramfs` (the lineage walk
+    of the decision had lost them; the hook was killed in an `apt
+    upgrade`).
+  - NN-L-AT-001's catalogue names `deb-systemd-helper`'s `rmdir` of the
+    agent's own empty drop-in directories during any package purge
+    (refused, expected); the benign corpus's report resolves every refused
+    inode to its path.
 - NN-L-NET-003: a TLS fingerprint is an attribute, not an identity (lot
   275, R6 of the external review of 04/11). A ClientHello whose JA3 — or,
   new, JA4 — is in the operator's fingerprint list

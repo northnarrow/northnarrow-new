@@ -305,6 +305,29 @@ mod tests {
         const { assert!(!nn_model::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION) };
     }
 
+    /// Every switch is in [`ALL`] — what the policy's status prints and the
+    /// tests walk (lot 283b's three among them).
+    #[test]
+    fn every_switch_is_listed() {
+        for s in [
+            R020_KILL,
+            NET_026_KILL,
+            NET_027_KILL,
+            PORT_53_KILL,
+            REVOKED_TRANSFER_TOOL_KILL,
+            IMP_001_KILL,
+            EVA_KILL,
+            FIM_010_MOVED_IN_KILL,
+            NODNS_KILL,
+            R013_RUNC_KILL,
+            FIM_007_KILL,
+            FIM_009_KILL,
+        ] {
+            assert!(ALL.contains(&s), "{}", s.held);
+        }
+        assert_eq!(ALL.len(), 12);
+    }
+
     /// Off: the action is `Log`, severity and the rest kept, the reasoning
     /// says what was held, and the engine is told once.
     #[test]

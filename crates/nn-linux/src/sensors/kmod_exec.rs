@@ -101,6 +101,11 @@ pub fn read_and_keep(event: &Event) {
 /// `comm` is a module tool's; `root`: the host's root (`/`; a fixture tree
 /// in tests) the tools' paths are under.
 pub fn facts(root: &Path, event: &Event) -> Option<ExecFacts> {
+    facts_in(root, Path::new("/proc"), event)
+}
+
+/// [`facts`] with the processes read from `proc` (a fixture tree in tests).
+fn facts_in(root: &Path, proc: &Path, event: &Event) -> Option<ExecFacts> {
     let Event::ProcessSpawn {
         pid,
         comm,
@@ -115,9 +120,9 @@ pub fn facts(root: &Path, event: &Event) -> Option<ExecFacts> {
         return None;
     }
     // the environment first: the process may be short-lived
-    let environment = environment(Path::new("/proc"), *pid, *start_ns);
+    let environment = environment(proc, *pid, *start_ns);
     // lot 283b: and the lineage, while it is alive
-    let package_manager = package_manager(Path::new("/proc"), *pid);
+    let package_manager = package_manager(proc, *pid);
     Some(ExecFacts {
         program: program(root, exe),
         environment,
@@ -462,6 +467,14 @@ mod tests {
         mk(400, 1, "/tmp/dpkg", 0);
         mk(410, 400, "/usr/bin/dash", 0);
         assert_eq!(package_manager(proc, 410), None);
+        // the exec pump's facts of a module tool's exec carry it
+        let hook = "/usr/share/initramfs-tools/hooks/kmod";
+        let mut e = nn_core::decision::rules::testutil::spawn_exe("kmod", hook, hook, 0);
+        if let Event::ProcessSpawn { pid, .. } = &mut e {
+            *pid = 80;
+        }
+        let f = facts_in(Path::new("/"), proc, &e).expect("a module tool's exec");
+        assert_eq!(f.package_manager.as_deref(), Some("/usr/bin/dpkg"));
     }
 
     use super::*;
