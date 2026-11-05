@@ -1078,6 +1078,10 @@ pub enum FsProtectOperation {
     /// the moved process and what it starts are never exempt by cgroup or
     /// unit.
     CgroupJoin,
+    /// Lot 273d: a global sysctl's write that aborts or starves the agent
+    /// (overcommit, `pid_max`, `threads-max`, `max_map_count`, real-time
+    /// throttling).
+    Sysctl,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1115,6 +1119,7 @@ impl FsProtectOperation {
             crate::wire::FS_OP_NICE => Self::Nice,
             crate::wire::FS_OP_IOPRIO => Self::Ioprio,
             FS_OP_CGROUP_JOIN => Self::CgroupJoin,
+            crate::wire::FS_OP_SYSCTL => Self::Sysctl,
             other => Self::Unknown(other),
         }
     }
@@ -1150,6 +1155,7 @@ impl FsProtectOperation {
             Self::Nice => "nice",
             Self::Ioprio => "ioprio",
             Self::CgroupJoin => "cgroup_join",
+            Self::Sysctl => "sysctl",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -1712,6 +1718,11 @@ mod tests {
                 FsProtectOperation::CgroupJoin,
                 "cgroup_join",
             ),
+            (
+                crate::wire::FS_OP_SYSCTL,
+                FsProtectOperation::Sysctl,
+                "sysctl",
+            ),
         ];
         for (byte, op, name) in cases {
             assert_eq!(FsProtectOperation::from_wire(byte), op);
@@ -1719,8 +1730,8 @@ mod tests {
             assert_eq!(op.to_string(), name);
         }
         assert_eq!(
-            FsProtectOperation::from_wire(30),
-            FsProtectOperation::Unknown(30)
+            FsProtectOperation::from_wire(31),
+            FsProtectOperation::Unknown(31)
         );
     }
     use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};

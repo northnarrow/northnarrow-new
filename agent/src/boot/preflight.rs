@@ -395,6 +395,29 @@ fn bump_memlock_rlimit() -> std::io::Result<()> {
     }
 }
 
+/// `--own-dropins check|quarantine` (the re-review of #497, RR2): our
+/// units' drop-ins against this build's judge, every one whatever its
+/// age (`install.sh --upgrade`'s preflight). `check` lists and moves
+/// nothing: 3 when one would be quarantined, 0 when none. `quarantine`
+/// moves them (the operator accepted it): 1 when one could not be moved.
+/// An environment file under /etc/northnarrow counts as held when it is a
+/// regular file with one name — the agent protects it at its next round.
+pub(crate) fn own_dropins(quarantine: bool) -> i32 {
+    use nn_linux::own_dropins as od;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    od::installer_check(
+        std::path::Path::new("/"),
+        &nn_linux::host_dropins::HostLimits::read(),
+        std::path::Path::new(od::QUARANTINE_DIR),
+        quarantine,
+        now,
+        &mut std::io::stdout().lock(),
+    )
+}
+
 /// `--btf-check`: resolve the runtime offset table against a BTF file and
 /// print a one-line verdict plus every drifted or missing entry.
 pub(crate) fn btf_check(path: &std::path::Path) -> i32 {

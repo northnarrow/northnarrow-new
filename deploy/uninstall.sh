@@ -102,10 +102,14 @@ stop_nn_unit() {
     systemctl reset-failed "$u.service" 2>/dev/null || true
 }
 nn_unit_has_procs() {
-    local cg
+    local cg c
     cg=$(systemctl show -p ControlGroup --value "$1.service" 2>/dev/null)
-    cg=${cg:-/system.slice/$1.service}
-    [[ -n "$(cat "/sys/fs/cgroup$cg/cgroup.procs" 2>/dev/null)" ]]
+    # lot 273d: the units' slice of their own; an older install's units ran
+    # in system.slice
+    for c in "$cg" "/northnarrow.slice/$1.service" "/system.slice/$1.service"; do
+        [[ -n "$c" && -n "$(cat "/sys/fs/cgroup$c/cgroup.procs" 2>/dev/null)" ]] && return 0
+    done
+    return 1
 }
 
 NN_SELF=uninstall.sh
@@ -148,7 +152,7 @@ start_agent_for_window() {
 
 echo "NorthNarrow uninstall"
 echo "  binaries : $BIN_DIR/{northnarrow-agent,northnarrow-watchdog,nn-admin,northnarrow-scan}"
-echo "  units    : $UNIT_DIR/northnarrow-{agent,watchdog,watchdog-failed}.service"
+echo "  units    : $UNIT_DIR/northnarrow-{agent,watchdog,watchdog-failed}.service, $UNIT_DIR/northnarrow.slice"
 echo "  accounts : northnarrow-scan, northnarrow-worker, northnarrow-export"
 echo "  bpffs    : $BPFFS_ROOT"
 if (( PURGE )); then
@@ -379,6 +383,11 @@ done
 for u in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do
     [[ -e "$UNIT_DIR/$u.service" ]] && { log "removing $UNIT_DIR/$u.service"; rm -f "$UNIT_DIR/$u.service"; }
 done
+# Lot 273d: the units' slice and the drop-in directories its units' agent
+# made (empty unless a drop-in was added in a window).
+[[ -e "$UNIT_DIR/northnarrow.slice" ]] && { log "removing $UNIT_DIR/northnarrow.slice"; rm -f "$UNIT_DIR/northnarrow.slice"; }
+rm -rf "$DROPIN_ROOT/northnarrow.slice.d" "${RUNTIME_DROPIN_ROOT:-/run/systemd/system}/northnarrow.slice.d" \
+    /etc/systemd/system.control/northnarrow.slice.d /run/systemd/system.control/northnarrow.slice.d 2>/dev/null || true
 rm -rf "$DROPIN_ROOT/northnarrow-agent.service.d" "$DROPIN_ROOT/northnarrow-watchdog.service.d" 2>/dev/null || true
 # Lab PR 265: the runtime drop-in directory the unit makes before each start
 # (empty unless a drop-in was added in a window).

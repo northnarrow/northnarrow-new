@@ -111,6 +111,7 @@ pub(crate) fn arm(
             pumps: Some(pumps.iter().map(|p| p.to_string()).collect()),
             opt_ins: opt_ins.iter().map(|k| k.to_string()).collect(),
             workers: Some(workers.clone()),
+            proc_root: std::path::PathBuf::from("/"),
             export,
         };
         capability_manifest.arm(audit_log.as_ref(), inputs);

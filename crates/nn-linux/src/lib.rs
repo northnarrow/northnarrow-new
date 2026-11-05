@@ -405,8 +405,17 @@ pub mod shutdown_marker;
 // socket, whose server must be PID 1 (external audit EBPF-001; R09c, lab PR
 // 257; was the agent's `systemd_state`).
 pub mod host_dropins;
+/// Lot 273d: our units' own drop-ins made inside a window, judged at its
+/// close.
+pub mod own_dropins;
+/// Lot 273d: the global sysctls that abort or starve the agent.
+pub mod sysctl_guard;
 pub mod systemd_reload;
-pub mod systemd_state;
+/// Lot 273d: the client lives in `antitamper_bpf::systemd_bus`, shared
+/// with the watchdog.
+pub mod systemd_state {
+    pub use antitamper_bpf::systemd_bus::*;
+}
 
 // The continuous telemetry probe: one known exec, file open and DNS
 // datagram a round, each checked against its sensor's pipeline (Tappa

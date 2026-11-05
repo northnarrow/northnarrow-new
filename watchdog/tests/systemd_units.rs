@@ -145,6 +145,58 @@ fn agent_unit_keeps_restart_no_and_disables_start_rate_limit() {
     assert!(caps.split_whitespace().any(|c| c == "CAP_KILL"), "{caps}");
 }
 
+/// Lot 273d (the lab's round 11 on Debian 13): every drop-in directory of
+/// ours the agent's unit makes is writable to the agent — a harmful
+/// drop-in made inside a window is moved out of it at the close, which
+/// failed with EROFS under `ProtectSystem=strict` — and nothing else of
+/// systemd's is.
+#[test]
+fn the_agent_can_move_a_drop_in_out_of_our_own_directories() {
+    let d = directives(&unit("northnarrow-agent.service"));
+    let made: Vec<String> = d
+        .iter()
+        .filter(|(k, v)| k == "ExecStartPre" && v.starts_with("+/bin/mkdir -p "))
+        .flat_map(|(_, v)| {
+            v.trim_start_matches("+/bin/mkdir -p ")
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(made.len(), 14, "{made:?}");
+    let rw: Vec<String> = d
+        .iter()
+        .filter(|(k, _)| k == "ReadWritePaths")
+        .flat_map(|(_, v)| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    // the review of #497 (N7): the persistent agent one made by the unit
+    // too, not by install.sh alone
+    assert!(made
+        .iter()
+        .any(|m| m == "/etc/systemd/system/northnarrow-agent.service.d"));
+    for dir in made.iter().map(String::as_str) {
+        assert!(
+            rw.iter().any(|p| p.strip_prefix('-') == Some(dir)),
+            "{dir} is not in the agent's ReadWritePaths (`-`: made by a later line): {rw:?}"
+        );
+    }
+    for p in &rw {
+        let p = p.trim_start_matches('-');
+        assert!(
+            [
+                "/run/northnarrow",
+                "/var/lib/northnarrow",
+                "/etc/northnarrow",
+                // lot 276: the export worker's JSONL files
+                "/var/log/northnarrow/export"
+            ]
+            .contains(&p)
+                || made.iter().any(|m| m == p),
+            "{p}: writable to the agent, and not one of its own directories"
+        );
+    }
+}
+
 /// External audit EBPF-001: systemd's stop signals are refused outside a
 /// signed trusted-installer window, so a stop must give up quickly and
 /// never escalate to a second instance beside the running one.

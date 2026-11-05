@@ -28,7 +28,7 @@ pub const REPEAT_WINDOW: Duration = Duration::from_secs(600);
 pub trait KernelIo {
     fn ring_fd(&self) -> Option<RawFd>;
     fn drain(&mut self, out: &mut Vec<ExecPolRaw>);
-    fn set_slices(&mut self, system: u64, user: u64);
+    fn set_slices(&mut self, system: u64, user: u64, ours: u64);
     fn set_images(&mut self, entries: &[(ExecqKey, u32)]);
     fn set_roots(&mut self, roots: &[(ExecqKey, u32)]);
     fn counters(&self) -> [u64; counter::SLOTS as usize];
@@ -49,8 +49,8 @@ impl KernelIo for kernel::Kernel {
             }
         }
     }
-    fn set_slices(&mut self, system: u64, user: u64) {
-        kernel::Kernel::set_slices(self, system, user)
+    fn set_slices(&mut self, system: u64, user: u64, ours: u64) {
+        kernel::Kernel::set_slices(self, system, user, ours)
     }
     fn set_images(&mut self, entries: &[(ExecqKey, u32)]) {
         kernel::Kernel::set_images(self, entries)
@@ -98,7 +98,7 @@ pub struct Controller<K: KernelIo> {
     repeats: Repeats,
     last_refresh: Option<Instant>,
     /// Slice ids last published (a change is logged).
-    slices: (u64, u64),
+    slices: (u64, u64, u64),
     skipped_logged: bool,
 }
 
@@ -110,27 +110,28 @@ impl<K: KernelIo> Controller<K> {
             s,
             repeats: Repeats::new(REPEAT_WINDOW),
             last_refresh: None,
-            slices: (0, 0),
+            slices: (0, 0, 0),
             skipped_logged: false,
         }
     }
 
     /// Publish the slices, images and roots now (before the first exec the
     /// policy judges); the slice ids published.
-    pub fn refresh(&mut self, now: Instant) -> (u64, u64) {
+    pub fn refresh(&mut self, now: Instant) -> (u64, u64, u64) {
         let text = std::fs::read_to_string(&self.s.mountinfo).unwrap_or_default();
         let ids = kernel::cgroup2_mount(&text)
             .map(|mp| kernel::slice_ids(std::path::Path::new(&mp)))
-            .unwrap_or((0, 0));
+            .unwrap_or((0, 0, 0));
         if ids != self.slices {
             debug!(
                 system_slice = ids.0,
                 user_slice = ids.1,
+                our_slice = ids.2,
                 "exec policy: systemd slices published"
             );
             self.slices = ids;
         }
-        self.k.set_slices(ids.0, ids.1);
+        self.k.set_slices(ids.0, ids.1, ids.2);
         let mut skipped = Vec::new();
         let images = kernel::image_entries(&self.s.exempt, &self.s.proc_root, &mut skipped);
         if !skipped.is_empty() && !self.skipped_logged {
@@ -201,7 +202,7 @@ mod tests {
     #[derive(Default)]
     struct FakeKernel {
         queue: Vec<ExecPolRaw>,
-        slices: (u64, u64),
+        slices: (u64, u64, u64),
         images: Vec<(ExecqKey, u32)>,
         roots: Vec<(ExecqKey, u32)>,
         counters: [u64; counter::SLOTS as usize],
@@ -214,8 +215,8 @@ mod tests {
         fn drain(&mut self, out: &mut Vec<ExecPolRaw>) {
             out.append(&mut self.queue);
         }
-        fn set_slices(&mut self, system: u64, user: u64) {
-            self.slices = (system, user);
+        fn set_slices(&mut self, system: u64, user: u64, ours: u64) {
+            self.slices = (system, user, ours);
         }
         fn set_images(&mut self, entries: &[(ExecqKey, u32)]) {
             self.images = entries.to_vec();
@@ -260,6 +261,10 @@ mod tests {
             Box::new(rec),
             settings(d.path(), true),
         );
+        // the short re-check of #497 (NB5): the units' own slice, published
+        // for the kernel's service tier (UNKNOWN for them would be a
+        // regression of lot 273d's slice)
+        std::fs::create_dir_all(d.path().join("cg/northnarrow.slice")).unwrap();
         let ids = c.refresh(Instant::now());
         use std::os::unix::fs::MetadataExt;
         let sys = std::fs::metadata(d.path().join("cg/system.slice"))
@@ -268,6 +273,10 @@ mod tests {
         assert_eq!(ids.0, sys);
         assert_eq!(c.k.slices, ids);
         assert!(ids.1 != 0);
+        let ours = std::fs::metadata(d.path().join("cg/northnarrow.slice"))
+            .unwrap()
+            .ino();
+        assert_eq!(ids.2, ours);
         let tmp = std::fs::metadata("/tmp").unwrap().ino();
         assert!(
             c.k.roots.iter().any(|(k, _)| k.ino == tmp),

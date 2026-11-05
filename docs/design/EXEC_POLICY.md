@@ -317,6 +317,18 @@ The rules are outside the frozen V2 validation denominator, like
 | `--exec-policy-no-env` | `NN_EXEC_POLICY_NO_ENV` | off |
 | `--exec-policy-no-map` | `NN_EXEC_POLICY_NO_MAP` | off |
 
+The environment variables are set in a drop-in of the agent's unit
+(`/etc/systemd/system/northnarrow-agent.service.d/<name>.conf`,
+`Environment=NN_EXEC_POLICY=audit`), written inside a trusted-installer
+window (`nn-admin trusted-installer-grant`; outside one the directory
+refuses it), then `systemctl daemon-reload` and a restart of the agent
+inside the window. Lot 273d: the window's close keeps the drop-in and
+write-protects it, and the agent signs each `NN_` setting it gives
+(`own_dropin_setting`; `NN_EXEC_POLICY=off` and the other switches that
+weaken the agent are a High `own_dropin_weakening`); a loader variable
+(`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`) in it gets the drop-in
+quarantined.
+
 The signed overlay (`OverlayKind::ExecPolicy = 14`, keyword `exec-policy`,
 MUTATE-protected with its `.sig`), applied at the next agent start over the
 profile, in order; a line that does not parse refuses the whole file —

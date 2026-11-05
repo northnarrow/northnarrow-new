@@ -2210,7 +2210,14 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 run_trusted_installer_grant
             };
             match run(&socket, &key, &agent_id_file, clamped) {
-                Ok(outcome) => exit_from_trusted_installer_grant(outcome, clamped),
+                Ok(outcome) => {
+                    let ok = matches!(outcome, TrustedInstallerGrantOutcome::Success);
+                    let code = exit_from_trusted_installer_grant(outcome, clamped);
+                    if ok {
+                        warn_harmful_dropins(&socket, &key, &agent_id_file);
+                    }
+                    code
+                }
                 Err(e) => {
                     eprintln!("trusted-installer-grant: {e:#}");
                     ExitCode::from(5)
@@ -4903,6 +4910,55 @@ fn carveout_lines_dropped(
     }
 }
 
+/// Lot 273d (the review of #492): right after a grant, the agent's own
+/// verdict on the host's drop-ins (the `host_dropins` degradations of its
+/// signed status, refreshed at the grant): one on disk is applied to the
+/// agent's units by a `daemon-reload` inside this window — the agent, the
+/// watchdog and journald die (lot 273c's lab, round 7). Said before the
+/// operator works; a key without `telemetry-read` / `audit-read` gets a
+/// hint instead.
+fn warn_harmful_dropins(
+    socket: &std::path::Path,
+    key: &std::path::Path,
+    agent_id_file: &std::path::Path,
+) {
+    let tty = std::io::stderr().is_terminal();
+    match crate::admin_cli::run_telemetry_status(socket, key, agent_id_file) {
+        Ok(Ok(status)) => {
+            let lines = harmful_dropin_lines(status.degradations.as_deref().unwrap_or_default());
+            if !lines.is_empty() {
+                eprintln!(
+                    "{}",
+                    colorize(
+                        "trusted-installer-grant: WARNING — a host drop-in harmful to the \
+                         agent's units is on disk. A `systemctl daemon-reload` (or a restart of \
+                         the units) inside this window applies it: the agent, the watchdog and \
+                         journald die. Remove it before you work:",
+                        "31",
+                        tty
+                    )
+                );
+                for l in lines {
+                    eprintln!("  {l}");
+                }
+            }
+        }
+        Ok(Err(_)) | Err(_) => eprintln!(
+            "trusted-installer-grant: the host's drop-ins were not checked (this key reads no \
+             status): run `nn-admin status --key …` and look for `host_dropins` before a \
+             `daemon-reload` inside the window"
+        ),
+    }
+}
+
+/// The `host_dropins` lines of a status's degradations, their prefix cut.
+fn harmful_dropin_lines(degradations: &[String]) -> Vec<&str> {
+    degradations
+        .iter()
+        .filter_map(|d| d.strip_prefix("host_dropins: "))
+        .collect()
+}
+
 fn exit_from_trusted_installer_grant(
     outcome: TrustedInstallerGrantOutcome,
     window_secs: u32,
@@ -6416,5 +6472,23 @@ mod cow_guard_line_tests {
         assert_eq!(parse_since("1760000000"), Some(1_760_000_000));
         assert_eq!(parse_since("2026-10-20T14:00:00Z"), Some(1_792_504_800));
         assert_eq!(parse_since("yesterday"), None);
+    }
+}
+
+#[cfg(test)]
+mod grant_warning_tests {
+    /// Lot 273d: the grant's warning is the status's `host_dropins` lines.
+    #[test]
+    fn the_grant_warns_with_the_host_dropin_degradations() {
+        let d = vec![
+            "host_dropins: /etc/systemd/system/system.slice.d/99-x.conf sets MemoryMax=4K"
+                .to_string(),
+            "dns_sensor: IPv6 resolvers not observed".to_string(),
+        ];
+        assert_eq!(
+            super::harmful_dropin_lines(&d),
+            vec!["/etc/systemd/system/system.slice.d/99-x.conf sets MemoryMax=4K"]
+        );
+        assert!(super::harmful_dropin_lines(&[]).is_empty());
     }
 }

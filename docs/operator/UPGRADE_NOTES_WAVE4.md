@@ -10,10 +10,13 @@ has the details of each change below.
 
 ## Before you upgrade
 
-1. Nothing in the unit, its drop-ins or your wrappers has to change for
-   the agent to start: the settings of the removed LLM advisor are
-   accepted and ignored, each named in a WARN (§1). Drop them when
-   convenient.
+1. Nothing in the unit or your wrappers has to change for the agent to
+   start: the settings of the removed LLM advisor are accepted and
+   ignored, each named in a WARN (§1). Drop them when convenient. A
+   drop-in in the agent's own unit directories that this release's agent
+   judges harmful does have to change (lot 273d, §9): `install.sh
+   --upgrade` lists each one and refuses, nothing changed, until you
+   remove it or pass `--accept-dropin-quarantine`.
 2. A host that had the advisor's model installed keeps it on disk until
    you delete it (§2).
 3. A dashboard, report or SIEM rule that counted `VERDICT (ADE)` lines,
@@ -71,6 +74,23 @@ has the details of each change below.
     every process started before that start is "not known": **restart the
     exempt services** (`systemctl restart <unit>`) so that their processes
     are exempt again.
+11. **Guarded sysctls (lot 273d).** Outside a trusted-installer window
+    the agent refuses a write that would abort, starve or blind it (§9):
+   `vm.overcommit_*`, `vm.max_map_count`, `kernel.pid_max`,
+   `kernel.threads-max` and `kernel.sched_rt_runtime_us` by their value;
+   `kernel.ftrace_enabled` and `kernel.sched_rt_period_us` whatever the
+   write carries. A configuration management run or a `sysctl --system`
+   that sets one of them to a harmful value sees the write refused (a
+   signed `sysctl` record); inside a window it goes through and is put
+   back at the window's close or the next integrity round.
+12. **Upgrades refuse units the next boot would not start** (lot 273d,
+   §9): enable them first — `systemctl enable northnarrow-agent
+   northnarrow-watchdog` — then run `install.sh --upgrade` again.
+13. **Drop-ins of the agent's own units** (lot 273d, §9): the ones this
+   release's agent would quarantine are listed by `install.sh --upgrade`,
+   which refuses until they are gone or you accept their move
+   (`--accept-dropin-quarantine`); the ones kept are write-protected
+   outside a window from then on.
 
 ## 1. The on-host LLM advisor is removed (lab PR 214)
 
@@ -481,3 +501,93 @@ others. What an operator sees change:
   signed note says it is below the host's, and a process past it is "not
   known" (refused), never exempt. A reboot makes them at the new size.
 
+## 9. Guarded sysctls and the boot enablement (lot 273d)
+
+- **Known limit: tuned's `realtime` profile.** It sets
+  `kernel.sched_rt_runtime_us = -1` (real-time throttling off), which the
+  agent treats as harmful: outside a window the write is refused, and a
+  value set at boot or inside a window is put back (to 95 % of the period)
+  at the window's close and at every integrity round. With this release
+  that profile cannot hold, not even inside a window. A signed opt-out per
+  sysctl is planned (lot 280); until then, a real-time host keeps the
+  kernel's default ratio.
+- **`kernel.ftrace_enabled` and `kernel.sched_rt_period_us`** are refused
+  outside a window whatever the write carries: a tool that writes them,
+  even the value they hold, needs a window.
+- **A value written in another base than 10** (`040000`, `0x10000`) is
+  refused outside a window: write the decimal value.
+- **The hook and the round judge the RT runtime differently.** Outside a
+  window the write deny refuses a runtime of -1 or of at least 990000 µs —
+  99 % of the default 1 s period: it cannot read the period, whose every
+  write it refuses. The integrity round judges the runtime against the
+  period the host has (one set inside a window): with a period of 500000,
+  a runtime of 495000 passes the hook and is put back by the next round,
+  to 95 % of the period (never 0; for a 1 µs period, to the kernel's
+  defaults, 1 s and 950 ms).
+- **`install.sh --upgrade`** refuses, before it changes anything, to
+  upgrade running units that are not enabled or not pulled in by the
+  default target ("the next boot would start no agent"); its health check
+  reads the same after the switch, and a failed upgrade's rollback enables
+  again the units that were enabled before it.
+- **Drop-ins of the agent's own units.** The directories
+  `northnarrow-agent.service.d`, `northnarrow-watchdog.service.d`,
+  `northnarrow-.service.d` and `northnarrow.slice.d` (under
+  `/etc/systemd/system`, `/run/systemd/system` and both `system.control`)
+  are the agent's: a drop-in there that this release's agent judges
+  harmful to its units — a value below a floor, a setting that breaks the
+  agent, an `NN_` or loader variable, an `EnvironmentFile=` outside
+  `/etc/northnarrow/` (such as `EnvironmentFile=-/etc/default/…`), a
+  `CPUAffinity=` that leaves out online CPUs, a symlink, a hard link —
+  is moved to `/var/lib/northnarrow/quarantine/dropins/`.
+  - **At the upgrade, nothing of yours moves silently.** `install.sh`
+    (full mode, `--upgrade` or a new install) asks the new agent
+    (`northnarrow-agent --own-dropins check`, read-only) which existing
+    drop-ins it would quarantine, lists them, and refuses — nothing
+    changed — until you remove them or re-run with
+    `--accept-dropin-quarantine`, which moves them first (each move
+    printed). A refused `--upgrade` has already opened its
+    trusted-installer window: it ends at its deadline.
+  - **After the install,** the integrity round moves only a drop-in
+    changed outside a window since the agent was installed (its binary's
+    ctime): one made inside a window is judged at the window's close, one
+    from before the install is never moved by the round.
+  - **A drop-in kept** at a close or by a round — and the file an
+    `EnvironmentFile=` of it names under `/etc/northnarrow/` — is
+    write-protected outside a window: edit it inside one. Such an
+    environment file must be a regular file with one name, there when the
+    drop-in is judged; otherwise the drop-in is quarantined.
+  - **To put one back,** open a window (`nn-admin trusted-installer-grant`),
+    copy the file from the quarantine into place, `systemctl
+    daemon-reload`; it is judged again at the window's close. Writing a
+    drop-in of the agent's units inside a window (a copy, `systemctl
+    edit`) is a Low record of NN-L-FIM-009; before this release the rule
+    killed the writer even inside a window.
+  - **Settings of the agent (`NN_` variables) in its units' drop-ins are
+    configuration, kept.** Write such a drop-in inside a trusted-installer
+    window (outside one the directories refuse it), `systemctl
+    daemon-reload`, restart the agent inside the window. The window's
+    close keeps it and write-protects it; the agent signs each `NN_`
+    setting it finds (`own_dropin_setting`, with the name, the value and
+    the drop-in), and a switch that weakens it — `NN_ANTI_TAMPER_ALLOW_DEGRADED`,
+    `NN_AUDIT_ALLOW_UNWRITABLE`, `NN_DETECT_ONLY`, a sensor back to its
+    fallback (`NN_FILE_OPEN_SENSOR=tracepoint`, `NN_EXEC_SENSOR=tracepoint`,
+    `NN_DNS_SENSOR=sendmsg`), `NN_EXEC_POLICY=off`, `NN_EXEC_POLICY_NO_ENV`,
+    `NN_EXEC_POLICY_NO_MAP`, `NN_EXEC_POLICY_PROFILE=desktop`,
+    `NN_EXEC_QUARANTINE=off`, `NN_EXPLOIT_GUARD=off`, an
+    `NN_EXPLOIT_GUARD_TASKS` below the host's `pid_max`,
+    `NN_EXPLOIT_GUARD_RESPONSE=detect`, `NN_NET_CONNECT_DENY=0`,
+    `NORTHNARROW_DRY_RUN`, the others the agent's own start flags — is a
+    High `own_dropin_weakening`. `install.sh` lists them as kept
+    configuration and never refuses for them. A loader variable
+    (`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`), or one that points a
+    tool the agent runs elsewhere (`XTABLES_LIBDIR`, `IPTABLES_LIB_DIR`,
+    `RPM_CONFIGDIR`) or redirects systemd's notifications (`NOTIFY_SOCKET`),
+    stays harmful:
+    the drop-in is quarantined, and so is one that sets an `NN_` variable
+    beside something harmful.
+  - A package install or upgrade (`.deb`, `.rpm`) runs the check as a
+    warning only: its configure step names each drop-in the agent judges
+    harmful and moves nothing (a package hook never fails on it). The
+    agent's integrity round leaves such a drop-in from before the install
+    in place and reports it, signed (`own_dropin_preinstall_harmful`):
+    remove it, or move it out inside a trusted-installer window.

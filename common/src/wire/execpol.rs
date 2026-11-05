@@ -66,6 +66,9 @@ pub mod tier_sig {
     /// The exec re-runs the caller's own image (`/proc/self/exe` of a
     /// program whose file was replaced since it started).
     pub const SELF_REEXEC: u32 = 1 << 16;
+    /// Lot 273d (the last review of #497, NC2): in the units' own
+    /// `northnarrow.slice` (a service slice, as `system.slice`).
+    pub const OUR_SLICE: u32 = 1 << 17;
 }
 
 /// `EXECPOL_CONF` slots (an `Array<u64>`, written once by the agent before
@@ -128,7 +131,10 @@ pub mod flags {
 pub mod slice_slot {
     pub const SYSTEM: u32 = 0;
     pub const USER: u32 = 1;
-    pub const SLOTS: u32 = 2;
+    /// Lot 273d (the short re-check of #497, NB5): the units' own
+    /// `northnarrow.slice` — a service tier, as `system.slice` was for them.
+    pub const OURS: u32 = 2;
+    pub const SLOTS: u32 = 3;
 }
 
 /// `EXECPOL_IMAGES` value bits: what an executable image (by `(dev, ino)`)
@@ -420,6 +426,7 @@ pub fn tier_signals(v: u32) -> alloc::vec::Vec<&'static str> {
         (tier_sig::NO_SLICES, "no_slices"),
         (tier_sig::EXEMPT_IMAGE, "exempt_image"),
         (tier_sig::SELF_REEXEC, "self_reexec"),
+        (tier_sig::OUR_SLICE, "northnarrow.slice"),
     ] {
         if v & bit != 0 {
             out.push(name);

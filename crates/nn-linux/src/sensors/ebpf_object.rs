@@ -216,6 +216,127 @@ mod tests {
         );
     }
 
+    /// The 5.15 and 6.1 verifiers' `check_cfg` over one function's
+    /// instructions: the back-edges whose edge is a fall-through — a
+    /// non-jump instruction's or a call's next instruction (`loop_ok`
+    /// false there; a jump's back-edge is a bounded loop, simulated) —
+    /// which those kernels reject before verifying anything ("back-edge
+    /// from insn … to …"). A call's callee is another function: not
+    /// followed.
+    fn fallthrough_back_edges(insns: &[aya_obj::generated::bpf_insn]) -> Vec<(usize, usize)> {
+        const JMP: u8 = 0x05;
+        const JMP32: u8 = 0x06;
+        let n = insns.len();
+        let edges = |t: usize| -> Vec<(usize, bool)> {
+            let i = &insns[t];
+            let class = i.code & 0x07;
+            if class != JMP && class != JMP32 {
+                return vec![(t + 1, false)];
+            }
+            match i.code & 0xf0 {
+                0x90 => vec![],               // exit
+                0x80 => vec![(t + 1, false)], // call: its next instruction
+                0x00 if class == JMP => vec![((t as i64 + i.off as i64 + 1) as usize, true)],
+                _ => vec![
+                    (t + 1, true),
+                    ((t as i64 + i.off as i64 + 1) as usize, true),
+                ],
+            }
+        };
+        let mut state = vec![0u8; n];
+        let mut bad = Vec::new();
+        // (instruction, its edges, the next edge to follow)
+        type Frame = (usize, Vec<(usize, bool)>, usize);
+        let mut stack: Vec<Frame> = vec![(0, edges(0), 0)];
+        state[0] = 1;
+        while let Some((t, es, k)) = stack.last_mut() {
+            if *k == es.len() {
+                state[*t] = 2;
+                stack.pop();
+                continue;
+            }
+            let (w, ok) = es[*k];
+            *k += 1;
+            let t = *t;
+            if w >= n {
+                continue;
+            }
+            match state[w] {
+                1 if !ok => bad.push((t, w)),
+                0 => {
+                    state[w] = 1;
+                    stack.push((w, edges(w), 0));
+                }
+                _ => {}
+            }
+        }
+        bad
+    }
+
+    /// Lot 273d's lab (round 12): `protected_write_deny` did not load on
+    /// 5.15 and 6.1 — "back-edge from insn 4460 to 4461", a loop LLVM laid
+    /// out with a fall-through back-edge (`parse_i64`, now unrolled) — so
+    /// the agent did not start there. Every function of the embedded object
+    /// is checked as those kernels check it.
+    #[test]
+    fn no_function_has_a_back_edge_the_5_15_verifier_rejects() {
+        if EMBEDDED != "1" || EBPF_BYTES.is_empty() {
+            assert!(
+                std::env::var_os(REQUIRE_OBJECT_ENV).is_none(),
+                "{REQUIRE_OBJECT_ENV} is set but this build embeds no eBPF object"
+            );
+            return;
+        }
+        let obj = aya_obj::Object::parse(EBPF_BYTES).expect("the eBPF object parses");
+        let mut bad: Vec<String> = Vec::new();
+        for f in obj.functions.values() {
+            for (t, w) in fallthrough_back_edges(&f.instructions) {
+                bad.push(format!("{}: back-edge from insn {t} to {w}", f.name));
+            }
+        }
+        assert!(
+            !obj.functions.is_empty(),
+            "the object's functions were parsed"
+        );
+        assert!(
+            bad.is_empty(),
+            "functions the 5.15 / 6.1 verifier refuses to load: {bad:?}"
+        );
+    }
+
+    /// The emulation itself: a loop whose latch falls through to its
+    /// header is caught, a jump loop and a DAG are not.
+    #[test]
+    fn the_back_edge_emulation_tells_a_fallthrough_from_a_jump() {
+        let ins = |code: u8, off: i16| {
+            // SAFETY: a plain C struct of integers; all-zero is a valid value
+            let mut i: aya_obj::generated::bpf_insn = unsafe { std::mem::zeroed() };
+            i.code = code;
+            i.off = off;
+            i
+        };
+        const MOV: u8 = 0xb7; // r0 = imm
+        const JA: u8 = 0x05;
+        const JEQ: u8 = 0x15; // if r0 == imm goto
+        const EXIT: u8 = 0x95;
+        // 0: goto +2 (to 3); 1: mov; 2: mov (falls through to 3, the
+        // header, on the DFS stack via 3 -> 1); 3: if goto -3 (to 1); 4: exit
+        let fall = [
+            ins(JA, 2),
+            ins(MOV, 0),
+            ins(MOV, 0),
+            ins(JEQ, -3),
+            ins(EXIT, 0),
+        ];
+        assert_eq!(fallthrough_back_edges(&fall), vec![(2, 3)]);
+        // a jump loop: 0: mov; 1: if goto -2 (to 0); 2: exit
+        let jump = [ins(MOV, 0), ins(JEQ, -2), ins(EXIT, 0)];
+        assert!(fallthrough_back_edges(&jump).is_empty());
+        // a diamond
+        let dag = [ins(JEQ, 1), ins(MOV, 0), ins(MOV, 0), ins(EXIT, 0)];
+        assert!(fallthrough_back_edges(&dag).is_empty());
+    }
+
     /// [`AYA_0_14_MAP_TYPES`] was read from aya 0.14.0: an upgrade of the
     /// agent's aya must re-read it (a newer aya may load more types).
     #[test]

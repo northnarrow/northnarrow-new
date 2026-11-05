@@ -126,6 +126,12 @@ pub const NOCREATE_UNIT_DIRS: &[&str] = &[
     "/run/systemd/system/northnarrow-watchdog.service.d",
     "/etc/systemd/system/northnarrow-.service.d",
     "/run/systemd/system/northnarrow-.service.d",
+    // Lot 273d (the review of #492): the units' slice's own drop-in
+    // directories, made (empty) by the agent's unit.
+    "/etc/systemd/system/northnarrow.slice.d",
+    "/run/systemd/system/northnarrow.slice.d",
+    "/etc/systemd/system.control/northnarrow.slice.d",
+    "/run/systemd/system.control/northnarrow.slice.d",
 ];
 
 /// The files inside [`CONFIG_DIR`] that PROTECTED_INODES covers.
@@ -434,8 +440,9 @@ pub const BINARY_AND_UNIT_PATHS: &[&str] = &[
     // host (a drop-in can replace ExecStart=, add a Condition*= that skips
     // the start, or set a weakening Environment=), and its directory —
     // removing or renaming an entry is denied, and since EBPF-015 a new
-    // drop-in too (`NOCREATE_UNIT_DIRS`). Where the directory does not
-    // exist, a drop-in made with it is reported by the integrity check.
+    // drop-in too (`NOCREATE_UNIT_DIRS`). The review of #497 (N7): the
+    // agent's unit makes it before every start, so it exists on every host
+    // (it was install.sh's on Debian or with --cow-guard only).
     "/etc/systemd/system/northnarrow-agent.service.d",
     "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
     // Lab PR 265 (review #466 F4-bis): the runtime drop-in directory the
@@ -453,6 +460,14 @@ pub const BINARY_AND_UNIT_PATHS: &[&str] = &[
     "/run/systemd/system/northnarrow-watchdog.service.d",
     "/etc/systemd/system/northnarrow-.service.d",
     "/run/systemd/system/northnarrow-.service.d",
+    // Lot 273d (the review of #492): the units' slice, and its drop-in
+    // directories (`NOCREATE_UNIT_DIRS`).
+    "/etc/systemd/system/northnarrow.slice",
+    "/usr/lib/systemd/system/northnarrow.slice",
+    "/etc/systemd/system/northnarrow.slice.d",
+    "/run/systemd/system/northnarrow.slice.d",
+    "/etc/systemd/system.control/northnarrow.slice.d",
+    "/run/systemd/system.control/northnarrow.slice.d",
     // Lab PR 223 (EXPERIMENTAL): the exec quarantine's scanner, in both
     // layouts — a replaced scanner would call every file clean.
     "/usr/local/bin/northnarrow-scan",
@@ -2253,6 +2268,12 @@ impl ProtectedInodesHandle {
             })
     }
 
+    /// The flags `key` has in the map, when it is there (the re-review of
+    /// #497, RR1: a protection added to a key keeps what it had).
+    pub fn flags(&self, key: InodeKey) -> Option<u8> {
+        self.map.get(&AyaInodeKey(key), 0).ok()
+    }
+
     /// Drop a stale inode key (best-effort at the call sites that use it):
     /// after a rename-replace the old inode is freed and its dev/ino could
     /// later be reused by an unrelated, non-protected file.
@@ -3138,6 +3159,13 @@ mod tests {
                 "/run/systemd/system/northnarrow-watchdog.service.d",
                 "/etc/systemd/system/northnarrow-.service.d",
                 "/run/systemd/system/northnarrow-.service.d",
+                // lot 273d: the units' slice and its drop-in directories
+                "/etc/systemd/system/northnarrow.slice",
+                "/usr/lib/systemd/system/northnarrow.slice",
+                "/etc/systemd/system/northnarrow.slice.d",
+                "/run/systemd/system/northnarrow.slice.d",
+                "/etc/systemd/system.control/northnarrow.slice.d",
+                "/run/systemd/system.control/northnarrow.slice.d",
                 "/usr/local/bin/northnarrow-scan",
                 "/usr/bin/northnarrow-scan",
             ],
@@ -3314,6 +3342,11 @@ mod tests {
                 "/run/systemd/system/northnarrow-watchdog.service.d",
                 "/etc/systemd/system/northnarrow-.service.d",
                 "/run/systemd/system/northnarrow-.service.d",
+                // lot 273d: the units' slice's
+                "/etc/systemd/system/northnarrow.slice.d",
+                "/run/systemd/system/northnarrow.slice.d",
+                "/etc/systemd/system.control/northnarrow.slice.d",
+                "/run/systemd/system.control/northnarrow.slice.d",
             ]
         );
         for d in NOCREATE_UNIT_DIRS {

@@ -45,6 +45,8 @@ OnFailure=northnarrow-watchdog-failed.service
 # checked bpffs (and failed the agent unit without it).
 
 [Service]
+# Lot 273d: the agent's slice (deploy/systemd/northnarrow.slice).
+Slice=northnarrow.slice
 Type=notify
 # Logging footprint — same journal namespace as the agent (see agent unit).
 # With the systemd respawn backend the agent logs through its own unit;

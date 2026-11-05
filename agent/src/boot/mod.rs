@@ -138,6 +138,9 @@ pub fn main() -> Result<()> {
     if let Some(path) = &cli.btf_check {
         std::process::exit(preflight::btf_check(path));
     }
+    if let Some(mode) = &cli.own_dropins {
+        std::process::exit(preflight::own_dropins(mode == "quarantine"));
+    }
     if cli.sensor_feasibility {
         #[cfg(feature = "test-privileged")]
         {
@@ -355,8 +358,17 @@ async fn run(
     // Lot 273c (the review of #490): the reloads the agent asks systemd for
     // (a refused set-property's copy, a window's opening, a quarantined
     // drop-in), handed to whoever asks.
+    // Lot 273d: after a confirmed reload, the files left at their floors
+    // back at their configured values.
+    let pin_root = northnarrow_agent::anti_tamper::prepare_pin_root().map(|p| p.to_path_buf());
     let reloader = northnarrow_agent::systemd_reload::Reloader::start(
         northnarrow_agent::systemd_state::PRIVATE_SOCKET,
+        std::sync::Arc::new(move || {
+            northnarrow_agent::anti_tamper::cgroup_guard::back_to_configured(
+                pin_root.as_deref(),
+                std::path::Path::new(northnarrow_agent::systemd_state::PRIVATE_SOCKET),
+            );
+        }),
     );
     installer_override.set_reloader(reloader.clone());
     // R14c (plan §3.3): the quarantine vault's key is the key store's: the

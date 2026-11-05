@@ -535,6 +535,18 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     }
                 }
 
+                // Lot 273d (the review of #492): systemd's copy of our units
+                // before the start that applies it (a reload when it is
+                // below the floors), off the runtime's thread.
+                {
+                    let hold = hold_record_path(&cli.shutdown_marker);
+                    let pid = agent_pid;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        northnarrow_watchdog::check_systemds_copy(&hold, pid)
+                    })
+                    .await;
+                }
+
                 // Best-effort: remove the dead agent's pidfile
                 // BEFORE respawn so the wait for the new agent
                 // doesn't immediately read the dead PID.

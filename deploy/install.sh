@@ -153,6 +153,10 @@ AUDIT_GROUP=${NN_AUDIT_GROUP:-}
 # fanotify permission events). keep = leave an installed one in place
 # (refreshed), 1 = install it, 0 = remove it.
 COW_GUARD=keep
+# The re-review of #497 (RR2): drop-ins of our units' directories this
+# release's agent would quarantine are listed and the run refused, unless
+# the operator accepts their move (own_dropins_preflight).
+ACCEPT_DROPIN_QUARANTINE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --upgrade) UPGRADE=1 ;;
@@ -174,6 +178,7 @@ while [[ $# -gt 0 ]]; do
         --audit-group) AUDIT_GROUP=$2; shift ;;
         --cow-guard) COW_GUARD=1 ;;
         --no-cow-guard) COW_GUARD=0 ;;
+        --accept-dropin-quarantine) ACCEPT_DROPIN_QUARANTINE=1 ;;
         -h|--help)
             echo "usage: sudo $0 [--upgrade --grant-key KEY] [--tarball FILE] [--sums FILE] [--attestation BUNDLE]"
             echo "                 [--source-tree | --allow-unverified | --no-verify] [--without-nftables]"
@@ -198,6 +203,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --cow-guard            add the copy-on-first-write drop-in (CAP_SYS_ADMIN, CAP_CHOWN, CAP_FOWNER;"
             echo "                         EXPERIMENTAL; the guard stays off without a signed cow-guard.local)"
             echo "  --no-cow-guard         remove that drop-in"
+            echo "  --accept-dropin-quarantine"
+            echo "                         move the drop-ins of the agent's own unit directories this release's"
+            echo "                         agent judges harmful to /var/lib/northnarrow/quarantine/dropins (without"
+            echo "                         it the run lists them and is refused, nothing changed)"
             echo "  --audit-group GROUP    existing group that may read $ETC_DIR/audit.log and chain_heads.json"
             echo "                         besides root (a log shipper; NN_AUDIT_GROUP too). Kept by later upgrades"
             echo "  The flag that accepted a level below 'attested' is logged (auth.warning), recorded in the"
@@ -266,6 +275,8 @@ WATCHDOG_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-watchdog.service"
 # Lab PR 216: the watchdog unit's OnFailure= handler (records that systemd
 # gave up on the watchdog; not enabled, started only by OnFailure=).
 WATCHDOG_FAILED_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-watchdog-failed.service"
+# Lot 273d: the units' slice of their own.
+SLICE_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow.slice"
 # Dedicated journal-namespace config (activated by LogNamespace=northnarrow
 # in both units). Capped, isolated journald instance → no /var/log/syslog
 # amplification, hard SystemMaxUse ceiling, zero customer config.
@@ -910,6 +921,7 @@ txn_targets() {
     local f
     for f in northnarrow-agent northnarrow-watchdog nn-admin northnarrow-scan; do echo "$BIN_DIR/$f"; done
     for f in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do echo "$UNIT_DIR/$f.service"; done
+    echo "$UNIT_DIR/northnarrow.slice"
     echo "$DROPIN_ROOT/northnarrow-agent.service.d/10-debian-perf-paranoid.conf"
     # lab PR 222: the copy-on-first-write drop-in (--cow-guard)
     echo "$DROPIN_ROOT/northnarrow-agent.service.d/20-cow-guard.conf"
@@ -1188,6 +1200,11 @@ txn_rollback() {   # <exit status of the failure>
     n_restored=$(find "$TXN_DIR/backup" \( -type f -o -type l \) 2>/dev/null | wc -l)
     n_removed=$(grep -c . "$TXN_DIR/absent")
     systemctl daemon-reload
+    # Lot 273d: the enablement is not one of the files restored above — the
+    # units enabled before the upgrade are enabled again, as rollback.sh does
+    while IFS= read -r u; do
+        if [[ -n "$u" ]]; then systemctl enable "$u" 2>/dev/null || echo "install.sh: WARNING: $u could not be enabled again" >&2; fi
+    done < "$TXN_DIR/enabled"
     systemctl restart systemd-journald@northnarrow.service 2>/dev/null
     echo "install.sh: restored $n_restored file(s) byte for byte; the $n_removed the upgrade would have created are gone"
     record="none: nothing was running before the upgrade, nothing was started"
@@ -1286,6 +1303,7 @@ if [[ $MODE != stop ]]; then
 require_file "$AGENT_UNIT_SRC"    "expected at $AGENT_UNIT_SRC (this script's sibling deploy/systemd/)"
 require_file "$WATCHDOG_UNIT_SRC" "expected at $WATCHDOG_UNIT_SRC"
 require_file "$WATCHDOG_FAILED_UNIT_SRC" "expected at $WATCHDOG_FAILED_UNIT_SRC (lab PR 216: the watchdog's OnFailure= handler)"
+require_file "$SLICE_UNIT_SRC" "expected at $SLICE_UNIT_SRC (lot 273d: the units' slice)"
 require_file "$JOURNALD_NS_CONF_SRC" "expected at $JOURNALD_NS_CONF_SRC (NN journal-namespace cap; the LogNamespace=northnarrow journald config)"
 require_file "$FIM_PATHS_V1_SRC"  "expected at $FIM_PATHS_V1_SRC (Tappa 9 C7 default FIM watched-paths list)"
 require_file "$NETFLOW_BLOCKLIST_V1_SRC"     "expected at $NETFLOW_BLOCKLIST_V1_SRC (Tappa 10 N8 default NetFlow IP/CIDR blocklist)"
@@ -1433,10 +1451,37 @@ stop_nn_unit() {
     systemctl reset-failed "$u.service" 2>/dev/null || true
 }
 nn_unit_has_procs() {
-    local cg
+    local cg c
     cg=$(systemctl show -p ControlGroup --value "$1.service" 2>/dev/null)
-    cg=${cg:-/system.slice/$1.service}
-    [[ -n "$(cat "/sys/fs/cgroup$cg/cgroup.procs" 2>/dev/null)" ]]
+    # lot 273d: the units' slice of their own; an older install's units ran
+    # in system.slice
+    for c in "$cg" "/northnarrow.slice/$1.service" "/system.slice/$1.service"; do
+        [[ -n "$c" && -n "$(cat "/sys/fs/cgroup$c/cgroup.procs" 2>/dev/null)" ]] && return 0
+    done
+    return 1
+}
+# Lot 273d (the lab's round 13, Debian 13): an upgrade that passed every
+# health check left a host whose units were not enabled — they ran, and the
+# next boot started no agent. Each unit must be enabled ("enabled": its
+# [Install] links in place; a runtime-only enablement does not survive a
+# reboot) and pulled in by the boot's default target. ENABLE_FAILURE names
+# what is missing.
+boot_enablement() {   # <unit>...
+    local u state def deps
+    ENABLE_FAILURE=""
+    def=$(systemctl get-default 2>/dev/null) || def=""
+    # read whole, then matched: `grep -q` on the pipe would close it early
+    # and, under pipefail, fail the check on systemctl's SIGPIPE
+    deps=$( [[ -n "$def" ]] && systemctl list-dependencies --plain --no-pager "$def" 2>/dev/null ) || true
+    for u in "$@"; do
+        state=$(systemctl is-enabled "$u.service" 2>/dev/null) || true
+        if [[ "$state" != enabled ]]; then
+            ENABLE_FAILURE="${ENABLE_FAILURE:+$ENABLE_FAILURE; }$u.service is ${state:-not known to systemd} (systemctl is-enabled)"
+        elif [[ -z "$def" ]] || ! grep -qE "(^|[[:space:]])$u\.service$" <<<"$deps"; then
+            ENABLE_FAILURE="${ENABLE_FAILURE:+$ENABLE_FAILURE; }$u.service is enabled but not pulled in by the default target ${def:-(unknown: systemctl get-default)}"
+        fi
+    done
+    [[ -z "$ENABLE_FAILURE" ]]
 }
 
 # External audit DEP-006: the drain gate used to wait for "no LSM program on
@@ -1529,6 +1574,100 @@ tree_version() {
     new_ver=$(exec "$AGENT_BIN" --version 2>/dev/null) || true
     new_ver=${new_ver%%$'\n'*}
     new_ver=${new_ver:-unknown}
+    # The re-review of #497 (RR2): the drop-ins of our units' directories
+    # this release's agent would quarantine, every one whatever its age
+    # (its integrity round moves only one changed after its install) —
+    # own_dropins_preflight reads them. Exit 3: some, 0: none, else the
+    # tree's agent has no such check (an older release).
+    DROPINS_RC=0
+    DROPINS_FOUND=$(exec "$AGENT_BIN" --own-dropins check 2>/dev/null) || DROPINS_RC=$?
+}
+# The re-review of #497 (RR2): with --accept-dropin-quarantine, the tree's
+# agent moves them (inside the window, or with no agent left to judge the
+# exec, as tree_version).
+tree_dropins_quarantine() {
+    DROPINS_RC=0
+    DROPINS_MOVED=$(exec "$AGENT_BIN" --own-dropins quarantine 2>&1) || DROPINS_RC=$?
+}
+# Run once, right after tree_version and before anything is stopped or
+# changed: the operator's drop-ins this release's agent would quarantine
+# are listed, and the run refused unless --accept-dropin-quarantine (a
+# silent move of the operator's configuration is not an upgrade's to make).
+DROPINS_CHECKED=0
+DROPINS_RC=0
+DROPINS_FOUND=""
+DROPINS_MOVED=""
+WINDOW_OPENED=0
+own_dropins_preflight() {
+    (( ${DROPINS_CHECKED:-0} )) && return 0
+    DROPINS_CHECKED=1
+    # the coordinator's decision on #497's NN_ drop-ins: the agent's own
+    # settings are kept configuration — listed, never a refusal
+    own_dropins_kept "$DROPINS_FOUND"
+    case "${DROPINS_RC:-0}" in
+        0) return 0 ;;
+        3) ;;
+        *)
+            echo "install.sh: WARNING: the tree's agent could not judge the drop-ins of its units' directories (exit $DROPINS_RC): not checked" >&2
+            return 0 ;;
+    esac
+    echo "install.sh: the drop-in directories of the agent's own units hold drop-ins this release's agent quarantines:" >&2
+    while IFS= read -r l; do
+        [[ $l == "would move "* ]] && echo "install.sh:   ${l#would move }" >&2
+    done <<< "$DROPINS_FOUND"
+    if (( ! ${ACCEPT_DROPIN_QUARANTINE:-0} )); then
+        echo "install.sh: REFUSED — remove them (or move them out of those directories), or re-run with" >&2
+        echo "install.sh: --accept-dropin-quarantine to have them moved to /var/lib/northnarrow/quarantine/dropins" >&2
+        echo "install.sh: (docs/operator/UPGRADE_NOTES_WAVE4.md section 9)." >&2
+        if (( ${WINDOW_OPENED:-0} )); then
+            echo "install.sh: Nothing was changed (the trusted-installer window this run opened ends at its deadline)." >&2
+        else
+            echo "install.sh: Nothing was changed." >&2
+        fi
+        return 1
+    fi
+    tree_dropins_quarantine
+    while IFS= read -r l; do
+        [[ -n "$l" ]] && echo "install.sh: $l"
+    done <<< "$DROPINS_MOVED"
+    if (( DROPINS_RC != 0 )); then
+        echo "install.sh: REFUSED — a drop-in could not be moved (above); nothing else was changed." >&2
+        return 1
+    fi
+}
+# The short re-check of #497 (RB1): a package's configure step (deb
+# postinst, rpm %post) runs the installed agent's check as a warning — it
+# moves nothing and never fails the hook; the agent's integrity round
+# reports each one signed (own_dropin_preinstall_harmful) and never moves
+# it either.
+# The agent's NN_ settings in its units' drop-ins ("would keep" lines of
+# its check): kept configuration, each one signed by the agent.
+own_dropins_kept() {
+    local l first=1
+    while IFS= read -r l; do
+        [[ $l == "would keep "* ]] || continue
+        (( first )) && echo "install.sh: kept configuration in the drop-ins of the agent's own units (each setting signed by the agent):"
+        first=0
+        echo "install.sh:   ${l#would keep }"
+    done <<< "$1"
+}
+own_dropins_warn() {
+    local found rc=0 l
+    # the last review of #497 (NC3): a check that hangs never holds a
+    # package hook — a warning after 60 s, the hook goes on
+    found=$(timeout 60 "$BIN_DIR/northnarrow-agent" --own-dropins check 2>/dev/null) || rc=$?
+    if (( rc == 124 )); then
+        echo "install.sh: WARNING: the agent's drop-in check did not answer within 60 s: not checked" >&2
+        return 0
+    fi
+    own_dropins_kept "$found"
+    (( rc == 3 )) || return 0
+    echo "install.sh: WARNING: the drop-in directories of the agent's own units hold drop-ins this release's agent judges harmful — left in place:" >&2
+    while IFS= read -r l; do
+        [[ $l == "would move "* ]] && echo "install.sh:   ${l#would move }" >&2
+    done <<< "$found"
+    echo "install.sh: remove them, or move them out inside a trusted-installer window (docs/operator/UPGRADE_NOTES_WAVE4.md section 9)." >&2
+    return 0
 }
 open_trusted_installer_window() {
     local key=$1
@@ -1663,6 +1802,17 @@ if (( ${#UNITS_TO_RESTART[@]} || STARTED_FOR_WINDOW )); then
     # agent runs only its own window (opened with the key) lets the rollback
     # stop it and put the previous files back. A window opened by hand before
     # the run covers the stop, not that.
+    # Lot 273d: the running units must be the ones the next boot starts —
+    # an upgrade of units that run but are not enabled (started by hand, or
+    # after `systemctl disable`) would leave the host without its agent at
+    # the next reboot, and the health check below would pass.
+    if [[ $MODE == full ]] && (( ${#UNITS_TO_RESTART[@]} )) && ! boot_enablement northnarrow-agent northnarrow-watchdog; then
+        echo "install.sh: REFUSED — $ENABLE_FAILURE: the next boot would start no agent." >&2
+        echo "install.sh: Enable them first, then re-run --upgrade:" >&2
+        echo "install.sh:   systemctl enable northnarrow-agent northnarrow-watchdog" >&2
+        echo "install.sh: Nothing was changed." >&2
+        exit 1
+    fi
     if [[ $MODE == full ]] && (( ${#UNITS_TO_RESTART[@]} )) && [[ -z "$GRANT_KEY" ]]; then
         echo "install.sh: REFUSED — --upgrade needs --grant-key <admin key with the trusted-installer role>: its" >&2
         echo "install.sh: window stops the running units, and a rollback needs the new agent's window too." >&2
@@ -1682,12 +1832,21 @@ if (( ${#UNITS_TO_RESTART[@]} || STARTED_FOR_WINDOW )); then
                 echo "install.sh: the agent started for the window keeps running (its stop needs the window)" >&2
             exit 1
         fi
+        WINDOW_OPENED=1
     fi
     old_ver=$("$BIN_DIR/northnarrow-agent" --version 2>/dev/null | head -1 || echo "unknown")
+    if [[ $MODE == full ]]; then
+        # the window is open: R009 records the tree's execs at Low (lot 278)
+        tree_version
+        if ! own_dropins_preflight; then
+            (( STARTED_FOR_WINDOW )) &&
+                echo "install.sh: the agent started for the window keeps running (its stop needs the window)" >&2
+            exit 1
+        fi
+    fi
     if (( STARTED_FOR_WINDOW )); then
         echo "install.sh: $old_ver started only for the window — stopped again below, not restarted"
     elif [[ $MODE == full ]]; then
-        tree_version
         echo "install.sh: UPGRADE — installed: $old_ver → new: $new_ver"
     else
         echo "install.sh: stopping $old_ver for the package manager"
@@ -1720,6 +1879,9 @@ fi
 if [[ $MODE == full && ${new_ver:-unknown} == unknown ]]; then
     tree_version
 fi
+if [[ $MODE == full ]]; then
+    own_dropins_preflight || exit 1
+fi
 
 if [[ $MODE == stop ]]; then
     # $PKG_RESTART_FILE hands the list to --package-configure, or to the
@@ -1742,7 +1904,7 @@ if [[ $MODE == configure ]]; then
         for f in /usr/local/bin/northnarrow-agent /usr/local/bin/northnarrow-watchdog /usr/local/bin/nn-admin \
                  /usr/local/bin/northnarrow-scan \
                  /etc/systemd/system/northnarrow-agent.service /etc/systemd/system/northnarrow-watchdog.service \
-                 /etc/systemd/system/northnarrow-watchdog-failed.service; do
+                 /etc/systemd/system/northnarrow-watchdog-failed.service /etc/systemd/system/northnarrow.slice; do
             [[ -e "$f" ]] && { echo "install.sh: removing $f (install.sh layout, replaced by the package)"; rm -f "$f"; }
         done
         if (( ${#was_enabled[@]} )); then
@@ -1752,6 +1914,7 @@ if [[ $MODE == configure ]]; then
             echo "install.sh: kept enabled: ${was_enabled[*]}"
         fi
     fi
+    own_dropins_warn
 else
 TXN_PHASE=switch
 # Lab PR 220: staged next to the installed files (same directory, same file
@@ -1780,6 +1943,7 @@ install_unit() {
 install_unit "$AGENT_UNIT_SRC"    "$UNIT_DIR/northnarrow-agent.service.nn-new"
 install_unit "$WATCHDOG_UNIT_SRC" "$UNIT_DIR/northnarrow-watchdog.service.nn-new"
 install_unit "$WATCHDOG_FAILED_UNIT_SRC" "$UNIT_DIR/northnarrow-watchdog-failed.service.nn-new"
+install_unit "$SLICE_UNIT_SRC" "$UNIT_DIR/northnarrow.slice.nn-new"
 for staged in "$AGENT_BIN:northnarrow-agent" "$WATCHDOG_BIN:northnarrow-watchdog" "$NN_ADMIN_BIN:nn-admin" \
               "$SCAN_BIN:northnarrow-scan"; do
     if ! cmp -s "${staged%%:*}" "$BIN_DIR/${staged#*:}.nn-new"; then
@@ -1791,7 +1955,7 @@ done
 echo "install.sh: switching binaries and units (rename)"
 for f in "$BIN_DIR/northnarrow-agent" "$BIN_DIR/northnarrow-watchdog" "$BIN_DIR/nn-admin" \
          "$BIN_DIR/northnarrow-scan" "$UNIT_DIR/northnarrow-agent.service" "$UNIT_DIR/northnarrow-watchdog.service" \
-         "$UNIT_DIR/northnarrow-watchdog-failed.service"; do
+         "$UNIT_DIR/northnarrow-watchdog-failed.service" "$UNIT_DIR/northnarrow.slice"; do
     mv -fT "$f.nn-new" "$f"
 done
 fi
@@ -2373,6 +2537,15 @@ if (( UPGRADE )) && (( ${#UNITS_TO_RESTART[@]} )); then
         echo "install.sh: health check FAILED: $HEALTH_FAILURE" >&2
         exit 1
     fi
+    # Lot 273d: running is not enough — the next boot must start them too
+    # (the preflight checked it before; a unit file or link the switch
+    # changed is caught here, and rolled back like any failed check).
+    if ! boot_enablement northnarrow-agent northnarrow-watchdog; then
+        TXN_REASON="boot enablement: $ENABLE_FAILURE"
+        echo "install.sh: health check FAILED: $ENABLE_FAILURE — the next boot would start no agent" >&2
+        exit 1
+    fi
+    echo "install.sh: both units enabled and pulled in by $(systemctl get-default 2>/dev/null || echo 'the default target')"
     if [[ -n "$HEALTH_NOTE" ]]; then echo "install.sh: WARNING: $HEALTH_NOTE" >&2; fi
     for u in "${UNITS_TO_RESTART[@]}"; do
         echo "install.sh: $u is $(systemctl is-active "$u.service" || true)"

@@ -291,6 +291,70 @@ pub fn refresh_values(bpffs_root: Option<&Path>) -> usize {
     n
 }
 
+/// Lot 273d (the review of #492): after a confirmed reload, each file this
+/// agent restored to its floor goes back to its configured value — the
+/// unit's property in systemd's copy, now the unit's files — when that
+/// value is not below the floor: written (the agent is exempt), then the
+/// units' values registered again ([`refresh_values`]), so that PID 1's
+/// next write of the configured value is let through. Before, the floor
+/// stayed until the next window's close. Returns one line per file moved.
+pub fn back_to_configured(bpffs_root: Option<&Path>, socket: &Path) -> Vec<String> {
+    use antitamper_bpf::cgroup_floors::{at_floor, below_floor, floor_of, floor_role, left_floor};
+    let mut moved = Vec::new();
+    for path in at_floor() {
+        let configured = match antitamper_bpf::unit_props::configured_text(
+            socket,
+            std::time::Duration::from_secs(5),
+            &path,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                left_floor(&path);
+                continue;
+            }
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "anti-tamper cgroup: the configured value of a file at its floor not read");
+                continue;
+            }
+        };
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        else {
+            continue;
+        };
+        let Some(floor) = floor_of(floor_role(dir), name) else {
+            left_floor(&path);
+            continue;
+        };
+        if below_floor(
+            common::cgroup_limits::limit_kind_of(name),
+            &configured,
+            &floor,
+        ) {
+            // the units' files set it below: the floor stays
+            continue;
+        }
+        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        if current.trim() != configured {
+            if let Err(e) = std::fs::write(&path, format!("{configured}\n")) {
+                warn!(path = %path.display(), error = %e, "anti-tamper cgroup: a file at its floor NOT put back to its configured value");
+                continue;
+            }
+            moved.push(format!(
+                "{}: back from its floor {:?} to the configured {:?}",
+                path.display(),
+                current.trim(),
+                configured
+            ));
+        }
+        left_floor(&path);
+    }
+    if !moved.is_empty() {
+        refresh_values(bpffs_root);
+        info!(files = moved.len(), "anti-tamper cgroup: files at their floors back at their configured values after a confirmed reload");
+    }
+    moved
+}
+
 /// Lot 273b: the values this boot registered, for [`prune_stale_values`].
 static BOOT_VALUE_KEYS: parking_lot::Mutex<Option<std::collections::HashSet<(u64, u64)>>> =
     parking_lot::Mutex::new(None);

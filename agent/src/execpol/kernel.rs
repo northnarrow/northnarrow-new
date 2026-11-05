@@ -90,9 +90,10 @@ impl Kernel {
         out
     }
 
-    pub fn set_slices(&mut self, system: u64, user: u64) {
+    pub fn set_slices(&mut self, system: u64, user: u64, ours: u64) {
         let _ = self.slices.set(slice_slot::SYSTEM, system, 0);
         let _ = self.slices.set(slice_slot::USER, user, 0);
+        let _ = self.slices.set(slice_slot::OURS, ours, 0);
     }
 
     /// Replace the image roles with `entries`.
@@ -140,12 +141,17 @@ pub fn cgroup2_mount(mountinfo: &str) -> Option<String> {
     })
 }
 
-/// The cgroup ids of `system.slice` and `user.slice` under the cgroup v2
-/// mount `root` (a cgroup's id is its directory's inode number on
-/// cgroup2); 0 for a slice that does not exist (yet).
-pub fn slice_ids(root: &Path) -> (u64, u64) {
+/// The cgroup ids of `system.slice`, `user.slice` and (lot 273d, NB5)
+/// the units' own `northnarrow.slice` under the cgroup v2 mount `root` (a
+/// cgroup's id is its directory's inode number on cgroup2); 0 for a slice
+/// that does not exist (yet).
+pub fn slice_ids(root: &Path) -> (u64, u64, u64) {
     let id = |name: &str| std::fs::metadata(root.join(name)).map_or(0, |m| m.ino());
-    (id("system.slice"), id("user.slice"))
+    (
+        id("system.slice"),
+        id("user.slice"),
+        id("northnarrow.slice"),
+    )
 }
 
 /// The elevation binaries whose image in a root caller's lineage is one
@@ -249,7 +255,7 @@ mod tests {
     fn slice_ids_are_directory_inodes() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir(d.path().join("system.slice")).unwrap();
-        let (sys, user) = slice_ids(d.path());
+        let (sys, user, ours) = slice_ids(d.path());
         assert_eq!(
             sys,
             std::fs::metadata(d.path().join("system.slice"))
@@ -257,6 +263,16 @@ mod tests {
                 .ino()
         );
         assert_eq!(user, 0, "user.slice not there yet");
+        // the short re-check of #497 (NB5): the units' own slice is read
+        // (a service tier in the kernel, as system.slice was for them)
+        assert_eq!(ours, 0);
+        std::fs::create_dir(d.path().join("northnarrow.slice")).unwrap();
+        assert_eq!(
+            slice_ids(d.path()).2,
+            std::fs::metadata(d.path().join("northnarrow.slice"))
+                .unwrap()
+                .ino()
+        );
     }
 
     /// An exemption vouches for a caller's image: a file another account

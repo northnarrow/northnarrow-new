@@ -58,10 +58,12 @@ pub const AUDIT_OP: &str = crate::audit::INTEGRITY_DRIFT_OP;
 /// Units whose drop-ins, copies and masks are checked. Lab PR 216: the
 /// watchdog's `OnFailure=` handler too — masked or overridden, systemd's
 /// giving up on the watchdog would leave no record.
-pub const UNITS: [&str; 3] = [
+pub const UNITS: [&str; 4] = [
     "northnarrow-agent.service",
     "northnarrow-watchdog.service",
     "northnarrow-watchdog-failed.service",
+    // Lot 273d: the units' slice
+    "northnarrow.slice",
 ];
 
 /// systemd's system unit load path, highest precedence first
@@ -77,21 +79,9 @@ pub const UNITS: [&str; 3] = [
 /// portable-service directories) changed the agent's unit unseen. The
 /// generator directories are rewritten at every `daemon-reload`, but a
 /// drop-in a generator writes there is as effective as any.
-const UNIT_SEARCH_PATH: &[&str] = &[
-    "/etc/systemd/system.control",
-    "/run/systemd/system.control",
-    "/run/systemd/transient",
-    "/run/systemd/generator.early",
-    "/etc/systemd/system",
-    "/etc/systemd/system.attached",
-    "/run/systemd/system",
-    "/run/systemd/system.attached",
-    "/run/systemd/generator",
-    "/usr/local/lib/systemd/system",
-    "/usr/lib/systemd/system",
-    "/lib/systemd/system",
-    "/run/systemd/generator.late",
-];
+// Lot 273d: kept with the host drop-ins' judge, which the watchdog reads
+// too.
+use antitamper_bpf::host_dropins::UNIT_SEARCH_PATH;
 
 /// Drop-ins `install.sh` lays down itself, with the content it writes.
 /// External audit DEP-002: matched on content, not on path alone — the
@@ -113,6 +103,14 @@ const KNOWN_DROPINS: &[(&str, &str)] = &[
         )),
     ),
 ];
+
+/// Lot 273d: `path` holds exactly what `install.sh` lays down there.
+pub fn is_known_dropin(path: &Path, content: &[u8]) -> bool {
+    let shown = path.to_string_lossy();
+    KNOWN_DROPINS
+        .iter()
+        .any(|(known, c)| *known == shown && c.as_bytes() == content)
+}
 
 /// Environment variables that switch a protection off, into observe mode,
 /// or cut the evidence the agent keeps. Each comes with the test its
@@ -518,6 +516,8 @@ const MOUNT_WATCHED: &[&str] = &[
     "/usr/lib/systemd/system/northnarrow-watchdog.service",
     "/etc/systemd/system/northnarrow-watchdog-failed.service",
     "/usr/lib/systemd/system/northnarrow-watchdog-failed.service",
+    "/etc/systemd/system/northnarrow.slice",
+    "/usr/lib/systemd/system/northnarrow.slice",
 ];
 
 /// One line of a `mountinfo` text: the shared byte-level parse
@@ -626,9 +626,11 @@ fn is_unit_sandbox(m: &Mount, mounts: &[Mount], sandbox: &[String]) -> bool {
 /// The directories the agent's unit makes writable (and so binds onto
 /// themselves in its own namespace).
 fn unit_sandbox_dirs() -> Vec<String> {
-    let mut out: Vec<String> = unit_directive(AGENT_UNIT, "ReadWritePaths")
-        .unwrap_or("")
-        .split_whitespace()
+    // every ReadWritePaths= line (lot 273d: our drop-in directories on a
+    // second one)
+    let mut out: Vec<String> = unit_directives(AGENT_UNIT, "ReadWritePaths")
+        .into_iter()
+        .flat_map(str::split_whitespace)
         .map(|d| d.trim_start_matches(['-', '+']).to_string())
         .collect();
     if let Some(rt) = unit_directive(AGENT_UNIT, "RuntimeDirectory") {
@@ -1103,6 +1105,11 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
                             "limit_floor_restored",
                             "the watchdog restored a resource value below its floor",
                         ),
+                        wh::REASON_COPY_BEFORE_RESPAWN => (
+                            "systemd_copy_below_floor",
+                            "before a respawn the watchdog found systemd's copy of our units below \
+                             the floors",
+                        ),
                         wh::REASON_LIMIT_FLOOR_NOT_RESTORED => (
                             "limit_floor_not_restored",
                             "the watchdog found a resource value below its floor and could not \
@@ -1160,6 +1167,29 @@ pub fn watchdog_gone(prev: u32, now: &crate::posture::exempt::WatchdogResolution
 }
 
 /// The last `key=value` of a unit's `[Service]` section, comments skipped.
+/// Every value of `key` in `unit`'s `[Service]`, in order (a list
+/// directive that accumulates, `ReadWritePaths=`).
+fn unit_directives<'a>(unit: &'a str, key: &str) -> Vec<&'a str> {
+    let mut in_service = false;
+    let mut out = Vec::new();
+    for line in unit.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_service = line == "[Service]";
+            continue;
+        }
+        if !in_service || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == key {
+                out.push(v.trim());
+            }
+        }
+    }
+    out
+}
+
 fn unit_directive<'a>(unit: &'a str, key: &str) -> Option<&'a str> {
     let mut in_service = false;
     let mut found = None;
@@ -1639,9 +1669,122 @@ struct Checker {
     watchdog_pidfile: PathBuf,
     own_files: Vec<String>,
     audit_log: Option<Arc<Mutex<AuditLog>>>,
+    /// The review of #497 (D4): our units' drop-ins judged again at every
+    /// round outside a window (a kept one stays writable by root).
+    own_guard: Option<OwnDropinGuard>,
+}
+
+/// The review of #497 (D4): what the round needs to judge our units' own
+/// drop-ins again — whether a window is open (inside one the close judges
+/// them), and the reloader a quarantine asks.
+pub struct OwnDropinGuard {
+    pub window: Arc<crate::anti_tamper::trusted_installer::TrustedInstallerOverride>,
+    pub reloader: crate::systemd_reload::Reloader,
 }
 
 impl Checker {
+    /// The review of #497 (D4): outside a window, our units' drop-ins
+    /// judged again — the re-review (RR2): every one changed since the
+    /// agent's install (its binary's ctime, [`crate::own_dropins::install_time`]),
+    /// never one the operator had before it, which `install.sh --upgrade`
+    /// lists and refuses first — the harmful ones quarantined, each a
+    /// signed record, a reload asked when one moved; and (RR1) every one
+    /// kept write-protected, with the environment files it names.
+    fn own_dropins_round(&mut self, at_boot: bool) {
+        let Some(g) = &self.own_guard else {
+            return;
+        };
+        if g.window.is_window_open() {
+            return;
+        }
+        // the short re-check of #497 (NB6): said, signed, never silent
+        let Some(since) = crate::own_dropins::install_time() else {
+            self.report_once(
+                Finding {
+                    kind: "own_dropin_round_skipped",
+                    detail:
+                        "the agent's install time cannot be read (/proc/self/exe's ctime): our \
+                             units' drop-ins are not judged or protected by the integrity round"
+                            .to_string(),
+                },
+                at_boot,
+            );
+            return;
+        };
+        let roots = unit_roots(Path::new("/"));
+        let search: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+        let mut protector =
+            crate::own_dropins::Protector::open(g.window.bpffs_root(), g.window.own_dropin_keys());
+        let moved = crate::own_dropins::quarantine(
+            &search,
+            &crate::host_dropins::HostLimits::read(),
+            crate::own_dropins::Pass {
+                since,
+                when: crate::own_dropins::AT_ROUND,
+            },
+            Path::new(crate::own_dropins::QUARANTINE_DIR),
+            unix_now(),
+            is_known_dropin,
+            &mut |p| protector.protect(p),
+        );
+        protector.finish();
+        if moved.iter().any(|m| m.to.is_some()) {
+            g.reloader
+                .request(crate::systemd_reload::Reason::OwnDropinQuarantined);
+        }
+        for m in moved {
+            self.report_once(
+                Finding {
+                    kind: if m.to.is_some() {
+                        "own_dropin_moved"
+                    } else {
+                        "own_dropin_not_moved"
+                    },
+                    detail: m.detail(),
+                },
+                at_boot,
+            );
+        }
+        // the coordinator's decision on #497's `NN_` drop-ins: each `NN_`
+        // setting a kept drop-in of ours gives our units is signed — an
+        // informative record, a High alert for a switch that weakens the
+        // agent — once per setting
+        for n in crate::own_dropins::nn_settings(&search) {
+            let (kind, alert) = n.record();
+            let f = Finding {
+                kind,
+                detail: n.detail(),
+            };
+            if alert {
+                self.report_once(f, at_boot);
+            } else {
+                self.record_once(f, at_boot);
+            }
+        }
+        // the short re-check of #497 (RB1): a harmful drop-in from before
+        // the install (a package's runs no installer's check) is never
+        // moved by the round — reported, signed, with the remedy
+        for h in crate::own_dropins::preinstall_harmful(
+            &search,
+            &crate::host_dropins::HostLimits::read(),
+            since,
+            is_known_dropin,
+        ) {
+            self.report_once(
+                Finding {
+                    kind: "own_dropin_preinstall_harmful",
+                    detail: format!(
+                        "{}: {}; not moved (it predates the install): remove it, or move it out \
+                         inside a trusted-installer window (UPGRADE_NOTES_WAVE4.md §9)",
+                        h.from.display(),
+                        h.why
+                    ),
+                },
+                at_boot,
+            );
+        }
+    }
+
     /// This round's mount findings ([`mount_round`] on the live files).
     fn read_mounts(&mut self) -> Vec<Finding> {
         mount_round(
@@ -1664,6 +1807,21 @@ impl Checker {
         self.record_detected(&f, at_boot, 0);
     }
 
+    /// A one-shot record that is no drift (an `NN_` setting of a kept
+    /// drop-in of ours): signed, logged at INFO, reported once.
+    fn record_once(&mut self, f: Finding, at_boot: bool) {
+        if self.once.contains(&f) {
+            return;
+        }
+        if self.once.len() >= MAX_ONCE {
+            self.once.clear();
+        }
+        self.once.insert(f.clone());
+        info!(kind = f.kind, detail = %f.detail, at_boot, "integrity: a setting of ours recorded");
+        let extra = serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": at_boot });
+        self.append(AUDIT_OP, extra, "recorded");
+    }
+
     fn record_detected(&self, f: &Finding, at_boot: bool, reappeared: u32) {
         if f.kind == "bpffs_mount" {
             warn!(kind = f.kind, detail = %f.detail, at_boot, reappeared, "integrity: bpffs mounted outside /sys/fs/bpf");
@@ -1678,6 +1836,9 @@ impl Checker {
         }
         let mut extra =
             serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": at_boot });
+        if f.kind == "own_dropin_weakening" {
+            extra["severity"] = "high".into();
+        }
         if reappeared > 0 {
             extra["reappeared"] = reappeared.into();
         }
@@ -1733,15 +1894,34 @@ impl Checker {
         // Lot 273c (the review of #492, C1): the host's type- and slice-wide
         // drop-ins whose value harms our units, each a signed drift while
         // it is there; nothing is moved (`crate::host_dropins`).
-        c.extend(
-            crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read())
-                .into_iter()
-                .map(|h| Finding {
-                    kind: "unit_dropin_harmful",
-                    detail: h.detail(),
-                }),
-        );
+        let harms = crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read());
+        // Lot 273d: while it holds, a degradation too — `nn-admin status`,
+        // the manifest, the heartbeat — and the warning the window's grant
+        // gives (`nn-admin trusted-installer-grant`).
+        crate::host_dropins::note_degradation(&harms);
+        c.extend(harms.into_iter().map(|h| Finding {
+            kind: match h.kind {
+                crate::host_dropins::Kind::Harmful => "unit_dropin_harmful",
+                crate::host_dropins::Kind::BreaksAgent => "unit_dropin_breaks_agent",
+            },
+            detail: h.detail(),
+        }));
         c.extend(unit_shadows(&search));
+        // Lot 273d (the review of #492): the guarded sysctls; a harmful
+        // value the kernel could not refuse (set before the start, inside
+        // a window) put back.
+        c.extend(
+            crate::sysctl_guard::check(
+                Path::new("/"),
+                antitamper_bpf::cgroup_floors::Host::read().mem_total,
+                true,
+            )
+            .into_iter()
+            .map(|s| Finding {
+                kind: s.kind,
+                detail: s.detail,
+            }),
+        );
         c.extend(
             config_overlays(Path::new(CONFIG_DIR))
                 .into_iter()
@@ -1816,6 +1996,7 @@ impl Checker {
     fn round(&mut self, at_boot: bool) {
         let findings = self.collect_round();
         self.apply(findings, unix_now(), at_boot);
+        self.own_dropins_round(at_boot);
         // Lot 273c (the review of #490): resource values the registration
         // found below their floors and restored (at the attach, at a
         // window's close): each a signed drift.
@@ -1905,6 +2086,7 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
     audit_log: Option<Arc<Mutex<AuditLog>>>,
     watchdog_pidfile: PathBuf,
     overlay_gate: Option<Arc<G>>,
+    own_guard: Option<OwnDropinGuard>,
 ) {
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let mut own_files = Vec::new();
@@ -1924,6 +2106,7 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
         watchdog_pidfile,
         own_files,
         audit_log,
+        own_guard,
     };
     for f in weakening_env(&vars) {
         checker.report_once(f, true);
@@ -2151,6 +2334,7 @@ mod tests {
                 wh::REASON_LIMIT_FLOOR_NOT_RESTORED,
                 "limit_floor_not_restored",
             ),
+            (wh::REASON_COPY_BEFORE_RESPAWN, "systemd_copy_below_floor"),
         ];
         let body = reasons
             .iter()
@@ -2435,7 +2619,10 @@ mod tests {
 404 402 8:3 /lib/northnarrow /var/lib/northnarrow rw,relatime shared:204 master:3 - ext4 /dev/sda3 rw
 405 400 8:2 /etc/northnarrow /etc/northnarrow rw,relatime shared:205 master:1 - ext4 /dev/sda2 rw
 406 405 0:61 / /etc/northnarrow rw,relatime shared:206 master:60 - tmpfs tmpfs rw
+407 400 8:2 /etc/systemd/system/northnarrow-agent.service.d /etc/systemd/system/northnarrow-agent.service.d rw,relatime shared:207 master:1 - ext4 /dev/sda2 rw
 ";
+        // lot 273d: the unit's second ReadWritePaths= line (our drop-in
+        // directories, 407) is the unit's bind too
         let mut w = MountWatch::default();
         let f = mount_round(not_readable(), || Ok(own.to_string()), &[], &mut w);
         assert_eq!(
@@ -2446,7 +2633,7 @@ mod tests {
             }]
         );
         // The same lines read as the host's view: the binds are reported.
-        assert_eq!(mount_findings(own, &[]).len(), 4);
+        assert_eq!(mount_findings(own, &[]).len(), 5);
     }
 
     /// External audit EVD-014 (lab PR 180): a mount laid after the start
@@ -2783,6 +2970,8 @@ mod tests {
     fn the_slice_wide_drop_ins_are_alerts_and_stay() {
         let root = tempfile::tempdir().unwrap();
         let mut files = Vec::new();
+        // lot 273d: system.slice.d no longer reaches the units (their own
+        // northnarrow.slice): not read
         for d in ["service.d", "slice.d", "system.slice.d"] {
             let dir = root.path().join(d);
             std::fs::create_dir_all(&dir).unwrap();
@@ -2791,11 +2980,10 @@ mod tests {
             files.push(f);
         }
         let f = unit_dropins(&[root.path()]);
-        assert_eq!(f.len(), 3, "{f:?}");
+        assert_eq!(f.len(), 2, "{f:?}");
         assert!(f.iter().all(|x| x.kind == "unit_dropin"));
-        assert!(f
-            .iter()
-            .any(|x| x.detail.contains("/system.slice.d/50-host.conf")));
+        assert!(f.iter().any(|x| x.detail.contains("/slice.d/50-host.conf")));
+        assert!(!f.iter().any(|x| x.detail.contains("/system.slice.d/")));
         assert!(files.iter().all(|f| f.exists()));
     }
 
@@ -2981,6 +3169,7 @@ mod tests {
             watchdog_pidfile: dir.join("watchdog.pid"),
             own_files: Vec::new(),
             audit_log: Some(Arc::new(Mutex::new(log))),
+            own_guard: None,
         };
         (checker, path)
     }

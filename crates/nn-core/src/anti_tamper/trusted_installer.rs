@@ -33,7 +33,44 @@ pub const OWN_SYSTEMD_UNITS: &[&str] = &[
     "/etc/systemd/system/northnarrow-watchdog-failed.service",
     "/usr/lib/systemd/system/northnarrow-watchdog-failed.service",
     "/lib/systemd/system/northnarrow-watchdog-failed.service",
+    // Lot 273d: the units' slice.
+    "/etc/systemd/system/northnarrow.slice",
+    "/usr/lib/systemd/system/northnarrow.slice",
+    "/lib/systemd/system/northnarrow.slice",
 ];
+
+/// Lot 273d (round 17's C111): our units' drop-in directories under the
+/// unit directories NN-L-FIM-009 watches. A drop-in written in one of them
+/// inside an open window is the operator's configuration — judged at the
+/// window's close (`own_dropins`), never a reason to kill its writer.
+pub const OWN_UNIT_DROPIN_DIRS: &[&str] = &[
+    "northnarrow-agent.service.d",
+    "northnarrow-watchdog.service.d",
+    "northnarrow-.service.d",
+    "northnarrow.slice.d",
+];
+
+/// `path` is a drop-in of our units: `<unit dir>/<one of
+/// [`OWN_UNIT_DROPIN_DIRS`]>/<name>.conf`, one level deep, no `.` or `..`.
+pub fn is_own_unit_dropin(path: &str) -> bool {
+    [
+        "/etc/systemd/system/",
+        "/usr/lib/systemd/system/",
+        "/lib/systemd/system/",
+    ]
+    .iter()
+    .filter_map(|p| path.strip_prefix(p))
+    .any(|rest| match rest.split_once('/') {
+        Some((dir, name)) => {
+            OWN_UNIT_DROPIN_DIRS.contains(&dir)
+                && name.ends_with(".conf")
+                && !name.contains('/')
+                && name != ".conf"
+                && !name.starts_with('.')
+        }
+        None => false,
+    })
+}
 
 /// Lab PR 225: who opened the current window and when it ends — named in
 /// the records the window sanctions (a stop or restart of the agent's own

@@ -339,6 +339,13 @@ const STATICS: &[Kept] = &[
          integrity round (the agent) or its journal (the watchdog) (lot 273c)",
     ),
     kept(
+        "antitamper-bpf/src/cgroup_floors.rs",
+        "AT_FLOOR",
+        Log,
+        "the files this process restored to their floors, until they are back at their \
+         configured value after a confirmed reload (lot 273d)",
+    ),
+    kept(
         "crates/nn-linux/src/anti_tamper/cgroup_guard.rs",
         "BOOT_VALUE_KEYS",
         Kernel,

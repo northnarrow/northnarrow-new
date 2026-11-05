@@ -151,7 +151,7 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         &[
             "off!(SUPER_BLOCK_S_MAGIC_OFFSET)",
             "Ok(m) => m,",
-            "match special_fs(magic) {\n        Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),\n        Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),\n        Some(SpecialFs::Proc) => refuse_oom_adj(file, inode, phase),\n        None => false,\n    }",
+            "match special_fs(magic) {\n        Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),\n        Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),\n        Some(SpecialFs::Proc) => {\n            refuse_sysctl(file, inode, hook, phase) || refuse_oom_adj(file, inode, phase)\n        }\n        None => false,\n    }",
         ],
     )
     .unwrap();
@@ -160,6 +160,40 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         2,
         "the magic is read and classified, nothing else:\n{w}"
     );
+    // Lot 273d (the review of #492): a guarded sysctl's harmful write
+    // refused outside a window, judged at the write by the shared verdict
+    // (R1: written_value() appears nowhere else in it)
+    assert_eq!(
+        body(&c, "refuse_sysctl").matches("written_value()").count(),
+        1
+    );
+    // the review of #497 (D2): an io-wq worker's or a kernel thread's
+    // registers are not read — its write is an unread one (refused)
+    in_order(
+        body(&c, "written_bytes"),
+        &[
+            "let task = generated::bpf_get_current_task_btf();",
+            "off!(TASK_STRUCT_FLAGS_OFFSET)",
+            ".ok()?;",
+            "if !regs_are_the_writes(flags) {\n        return None;\n    }",
+            "generated::bpf_task_pt_regs(task)",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&c, "refuse_sysctl"),
+        &[
+            "if phase == Phase::Open {\n        return false;\n    }",
+            "let kind = sysctl_kind(len, words);",
+            "if kind == SYSCTL_NONE {\n        return false;\n    }",
+            // R1: the shared verdict, the caller's identity passed in (the
+            // agent's own restore), the bytes read only through it
+            "if !sysctl_write_refused(kind, caller_may(caller), || written_value()) {\n        return false;\n    }",
+            "sign(phase, FS_OP_SYSCTL, key);",
+            "true",
+        ],
+    )
+    .unwrap();
     // The review of #490 (B): the file is recognised by its registered
     // value or by its kernfs node (name, parent's id), the dentry only
     // without the node's offsets — a handle-opened file's dentry is
@@ -611,18 +645,27 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     // The reload is a SIGHUP to PID 1 once PID 1 is found serving
     // systemd's private socket (lab, round 4: `Manager.Reload()` waits for
     // polkit without CAP_SYS_ADMIN, its reload came only at the close).
-    let sd = code("crates/nn-linux/src/systemd_state.rs");
-    let r = body(&sd, "reload");
+    // Lot 273d: the client is shared with the watchdog, and the reload is
+    // confirmed (Reloading(false) on a connection opened before the signal).
+    let sd = code("antitamper-bpf/src/systemd_bus.rs");
+    let r = body(&sd, "reload_verified");
     in_order(
         r,
         &[
-            "let state = system_state(socket, Duration::from_secs(5))?;",
+            "let mut s = connect(socket, timeout)?;",
+            "let state = state_on(&mut s)?;",
             "if state == \"stopping\" {",
             "libc::kill(1, libc::SIGHUP)",
+            "match reloading_signal(&msg)? {",
+            "Some(false) => return Ok(\"reloaded (Reloading(false) received)\"),",
         ],
     )
     .unwrap();
-    assert!(!r.contains("Reload"), "no Manager.Reload() call:\n{r}");
+    assert!(
+        !r.contains("Manager.Reload") && !r.contains("\"Reload\""),
+        "no Manager.Reload() call:\n{r}"
+    );
+    assert!(body(&sd, "reload").contains("reload_verified(socket, Duration::from_secs(30))"));
     // PID 1 serves the socket: the peer check of every exchange
     in_order(
         body(&sd, "connect"),
@@ -639,15 +682,25 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         body(&rl, "worker"),
         &[
             "crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read());",
-            "match outcome(&harms, || crate::systemd_state::reload(socket)) {",
+            "match outcome(&harms, || {\n            crate::systemd_state::reload_verified(socket, RELOAD_TIMEOUT)\n        }) {",
             "Outcome::Withheld(what) => {",
+            "crate::boot::degradation::report(",
+            "Outcome::Confirmed(note) => {",
+            "antitamper_bpf::unit_props::below_floors(socket, PROPS_TIMEOUT)",
+            "after();",
+            "Outcome::Failed(e) => {",
+            "crate::boot::degradation::report(",
         ],
     )
     .unwrap();
+    // Lot 273d: a refusal within the target's quiet is verified, not skipped
+    assert!(
+        body(&rl, "worker").contains("Decision::Skip => match hostile_copy(socket, &on_disk) {")
+    );
     in_order(
         body(&rl, "outcome"),
         &[
-            "if let Some(h) = harms.first() {",
+            "if let Some(h) = crate::host_dropins::withholding(harms) {",
             "return Outcome::Withheld(",
             "match reload() {",
         ],
@@ -663,6 +716,8 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         body(&ti, "arm_for"),
         &[
             "self.armed.store(true, Ordering::SeqCst);",
+            "let harms = crate::host_dropins::harmful_here();",
+            "crate::host_dropins::note_degradation(&harms);",
             "r.request(crate::systemd_reload::Reason::WindowOpened);",
         ],
     )
@@ -683,15 +738,18 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         body(&si, "collect_round"),
         &[
             "c.extend(unit_dropins(&search));",
-            "c.extend(\n            crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read())",
-            "kind: \"unit_dropin_harmful\",",
+            "crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read());",
+            "crate::host_dropins::note_degradation(&harms);",
+            "c.extend(harms.into_iter().map(|h| Finding {",
+            "crate::host_dropins::Kind::Harmful => \"unit_dropin_harmful\",",
+            "crate::host_dropins::Kind::BreaksAgent => \"unit_dropin_breaks_agent\",",
         ],
     )
     .unwrap();
     assert!(
         body(&si, "unit_dropins_with").contains("for (d, _) in crate::host_dropins::TYPE_DIRS {")
     );
-    let hd = code("crates/nn-linux/src/host_dropins.rs");
+    let hd = code("antitamper-bpf/src/host_dropins.rs");
     let hd = &hd[..hd.find("#[cfg(test)]").expect("its tests")];
     for call in [
         "fs::rename",
@@ -706,6 +764,222 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         assert!(!hd.contains(call), "host_dropins.rs only reads: {call}");
     }
     assert!(!si.contains("Reason::Quarantined") && !si.contains("dropin_quarantine"));
+    // Lot 273d: the watchdog reads systemd's copy before each respawn (a
+    // reload unless a harmful host drop-in withholds it), and the agent
+    // takes the files at their floors back to their configured values after
+    // a confirmed reload
+    let wm = code("watchdog/src/main.rs");
+    in_order(
+        &wm,
+        &[
+            "northnarrow_watchdog::check_systemds_copy(&hold, pid)",
+            "let _ = std::fs::remove_file(&cli.agent_pidfile);",
+            "r = respawn_cycle(",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&code("watchdog/src/lib.rs"), "check_systemds_copy"),
+        &[
+            "below_floors(socket, timeout)",
+            "if let Some(h) = antitamper_bpf::host_dropins::withholding(&harms) {",
+            "antitamper_bpf::systemd_bus::reload_verified(",
+            "record_hold(hold_path, &rec)",
+        ],
+    )
+    .unwrap();
+    assert!(code("agent/src/boot/mod.rs")
+        .contains("northnarrow_agent::anti_tamper::cgroup_guard::back_to_configured("));
+    in_order(
+        body(
+            &code("crates/nn-linux/src/anti_tamper/cgroup_guard.rs"),
+            "back_to_configured",
+        ),
+        &[
+            "antitamper_bpf::unit_props::configured_text(",
+            "if below_floor(\n            common::cgroup_limits::limit_kind_of(name),\n            &configured,\n            &floor,\n        ) {",
+            "continue;",
+            "std::fs::write(&path, format!(\"{configured}\\n\"))",
+            "refresh_values(bpffs_root);",
+        ],
+    )
+    .unwrap();
+    // Lot 273d: at a window's close our units' own drop-ins made inside it
+    // are judged (a harmful one quarantined, a reload asked); only our
+    // directories — the host's are never moved
+    let ti = code("crates/nn-linux/src/anti_tamper/trusted_installer.rs");
+    in_order(
+        &ti,
+        &[
+            "super::cgroup_guard::refresh_values(self.bpffs_root.as_deref());",
+            "own_dropins_at_close(since, self.bpffs_root.as_deref(), &self.own_dropin_keys);",
+            "r.request(crate::systemd_reload::Reason::OwnDropinQuarantined);",
+            // R1: the guarded sysctls put back at the close, in its record
+            "let sysctls = sysctls_at_close();",
+            "self.audit_close(reason, close_failed.as_deref(), &lines, &sysctls);",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&ti, "sysctls_at_close"),
+        &[
+            "crate::sysctl_guard::check(",
+            "true,",
+            ".filter(|s| s.kind != \"sysctl_strict\")",
+        ],
+    )
+    .unwrap();
+    assert!(body(&ti, "audit_close").contains("extra[\"sysctls\"] = serde_json::json!(sysctls);"));
+    // the re-review of #497 (RR1): at the close the kept drop-ins are
+    // write-protected (the pinned map), the pass finished (stale keys out)
+    in_order(
+        body(&ti, "own_dropins_at_close"),
+        &[
+            "crate::own_dropins::Protector::open(bpffs_root, keys);",
+            "when: crate::own_dropins::AT_CLOSE,",
+            "&mut |p| protector.protect(p),",
+            "protector.finish();",
+        ],
+    )
+    .unwrap();
+    let od = code("crates/nn-linux/src/own_dropins.rs");
+    in_order(
+        body(&od, "own_dirs"),
+        &[
+            "root.join(\"northnarrow-agent.service.d\")",
+            "root.join(\"northnarrow-watchdog.service.d\")",
+            "root.join(\"northnarrow-.service.d\")",
+        ],
+    )
+    .unwrap();
+    assert!(
+        !od.contains("TYPE_DIRS")
+            && !od.contains("\"service.d\"")
+            && !od.contains("\"slice.d\"")
+            && !od.contains("system.slice.d"),
+        "own_dropins moves from our directories only"
+    );
+    // the review of #497 (D4): selected by ctime (no `touch -d` sets it
+    // back), never by the mtime; links and outside EnvironmentFile=
+    // quarantined whatever they set; the round judges every one again
+    // outside a window
+    let q = body(&od, "harmful");
+    assert!(!q.contains("modified()"), "no selection by mtime");
+    // the re-review of #497 (RR1): an entry kept — not judged in this
+    // pass, install.sh's, or judged harmless — is protected with the
+    // environment files it names
+    in_order(
+        q,
+        &[
+            "std::fs::symlink_metadata(&from)",
+            "let single = regular && meta_nlink(&meta) == 1;",
+            "if !changed_since(&meta, pass.since) {",
+            "keep_protected(&from, text.as_deref(), protect);",
+            "if single && known(&from, b) {",
+            "keep_protected(&from, text.as_deref(), protect);",
+            "shape_harm(&meta, &from, text.as_deref(), protect)",
+            "let Some(why) = why else {\n                    keep_protected(&from, text.as_deref(), protect);",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&od, "keep_protected"),
+        &[
+            "protect(from);",
+            "if under_env_dir(&f) {",
+            "protect(Path::new(&f));",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&od, "protect"),
+        &[
+            "if !meta.file_type().is_file() || meta.nlink() != 1 {",
+            "let want = had.unwrap_or(0) | FS_PROTECT_WRITE | FS_PROTECT_MUTATE;",
+            "map.register(key, want)",
+        ],
+    )
+    .unwrap();
+    assert!(body(&od, "changed_since").contains("meta.ctime()"));
+    in_order(
+        body(&od, "shape_harm"),
+        &[
+            "is_symlink()",
+            "is_file()",
+            "meta.nlink() > 1",
+            "for f in env_files(text?) {",
+            "if !under_env_dir(&f) {",
+            // RR1: one inside /etc/northnarrow held, or the drop-in moved
+            "if !protect(Path::new(&f)) {",
+        ],
+    )
+    .unwrap();
+    assert!(body(&od, "under_env_dir")
+        .contains("matches!(c, Component::RootDir | Component::Normal(_))"));
+    // the re-review of #497 (RR2): the round judges only what changed
+    // since the agent's install — an operator's drop-in from before it is
+    // never moved by the round; (RR1) the ones it keeps are protected
+    in_order(
+        body(&si, "own_dropins_round"),
+        &[
+            "if g.window.is_window_open() {\n            return;\n        }",
+            "let Some(since) = crate::own_dropins::install_time() else {",
+            "crate::own_dropins::Protector::open(g.window.bpffs_root(), g.window.own_dropin_keys());",
+            "crate::own_dropins::quarantine(",
+            "when: crate::own_dropins::AT_ROUND,",
+            "&mut |p| protector.protect(p),",
+            "protector.finish();",
+            "Reason::OwnDropinQuarantined",
+        ],
+    )
+    .unwrap();
+    assert!(!body(&si, "own_dropins_round").contains("UNIX_EPOCH"));
+    // the short re-check of #497: an unreadable install time is said,
+    // signed (NB6); a harmful drop-in from before the install reported,
+    // signed, never moved (RB1)
+    in_order(
+        body(&si, "own_dropins_round"),
+        &[
+            "let Some(since) = crate::own_dropins::install_time() else {",
+            "kind: \"own_dropin_round_skipped\",",
+            "return;",
+            "crate::own_dropins::quarantine(",
+            "crate::own_dropins::nn_settings(&search)",
+            "let (kind, alert) = n.record();",
+            "if alert {\n                self.report_once(f, at_boot);\n            } else {\n                self.record_once(f, at_boot);",
+            "crate::own_dropins::preinstall_harmful(",
+            "kind: \"own_dropin_preinstall_harmful\",",
+        ],
+    )
+    .unwrap();
+    // our drop-ins' environment judged by our judge: NN_ kept, loader harmful
+    assert!(body(&od, "harmful").contains("own_harms(reach, &k, &v, host)"));
+    assert!(body(&od, "own_harms").contains("LOADER_ENV.contains(&n.as_str())"));
+    in_order(
+        body(&od, "install_time"),
+        &["std::fs::metadata(\"/proc/self/exe\")", "meta.ctime()"],
+    )
+    .unwrap();
+    assert!(!body(&od, "install_time").contains("mtime"));
+    assert!(body(&si, "round").contains("self.own_dropins_round(at_boot);"));
+    assert!(code("agent/src/boot/evidence.rs")
+        .contains("Some(northnarrow_agent::self_integrity::OwnDropinGuard {"));
+    // Lot 273d: the guarded sysctls checked by the round (put back when harmful)
+    in_order(
+        body(&si, "collect_round"),
+        &["crate::sysctl_guard::check(", "true,"],
+    )
+    .unwrap();
+    // R1: ftrace_enabled read at every build of the capability manifest
+    in_order(
+        body(&code("agent/src/boot/manifest.rs"), "build"),
+        &[
+            "nn_linux::sysctl_guard::note_ftrace(&inputs.proc_root);",
+            "m.degradations = degradation::snapshot();",
+        ],
+    )
+    .unwrap();
+    assert!(code("agent/src/boot/ready.rs").contains("proc_root: std::path::PathBuf::from(\"/\"),"));
     let ab = code("antitamper-bpf/src/cgroup_guard.rs");
     in_order(
         body(&ab, "protect_unit_cgroup"),
@@ -789,4 +1063,76 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         ],
     )
     .unwrap();
+}
+
+/// The re-review of #497 (NR5, NR6): the eBPF CI job runs the `check_cfg`
+/// emulation against the object it built — after the build, with the
+/// object required — and the step fails unless both tests ran and passed
+/// (libtest skips a name it does not find in silence).
+#[test]
+fn the_ebpf_job_runs_the_check_cfg_tests_and_counts_them() {
+    let ci: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        &fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap(),
+    )
+    .unwrap();
+    let steps = ci["jobs"]["ebpf-build"]["steps"]
+        .as_sequence()
+        .expect("ci.yml has the ebpf-build job's steps");
+    let name = |s: &serde_yaml_ng::Value| s["name"].as_str().unwrap_or_default().to_string();
+    let built = steps
+        .iter()
+        .position(|s| name(s) == "cargo xtask build-ebpf")
+        .expect("the job builds the object");
+    let at = steps
+        .iter()
+        .position(|s| name(s).starts_with("eBPF object back-edges"))
+        .expect("the check_cfg step is in the eBPF job");
+    assert!(built < at, "the step runs on the object just built");
+    let step = &steps[at];
+    assert_eq!(step["env"]["NN_REQUIRE_EBPF_OBJECT"].as_str(), Some("1"));
+    let run = step["run"].as_str().unwrap();
+    in_order(
+        run,
+        &[
+            "cargo test --locked -p nn-linux --lib sensors::ebpf_object::tests -- --exact",
+            "sensors::ebpf_object::tests::no_function_has_a_back_edge_the_5_15_verifier_rejects",
+            "sensors::ebpf_object::tests::the_back_edge_emulation_tells_a_fallthrough_from_a_jump",
+            "|| { echo \"$out\"; exit 1; }",
+            "grep -q '^test result: ok\\. 2 passed; 0 failed' <<< \"$out\" || {",
+            "exit 1; }",
+        ],
+    )
+    .unwrap();
+    // both names are tests of the emulation that exist
+    let tests = code("crates/nn-linux/src/sensors/ebpf_object.rs");
+    for t in [
+        "fn no_function_has_a_back_edge_the_5_15_verifier_rejects()",
+        "fn the_back_edge_emulation_tells_a_fallthrough_from_a_jump()",
+    ] {
+        assert!(tests.contains(t), "{t}");
+    }
+}
+
+/// The short re-check of #497 (NB5): the units moved from `system.slice`
+/// to their own `northnarrow.slice`, and the exec policy's kernel side gave
+/// them the UNKNOWN tier instead of SERVICE. Their slice is published and
+/// judged a service slice, as `system.slice` was for them.
+#[test]
+fn the_units_own_slice_is_a_service_tier() {
+    let e = code("agent-ebpf/src/execpol.rs");
+    in_order(
+        body(&e, "tier_of"),
+        &[
+            "let sys = slice(slice_slot::SYSTEM);",
+            "let ours = slice(slice_slot::OURS);",
+            "if cg1 != 0 && cg1 == sys {",
+            "return tier::SERVICE | sig | tier_sig::SYSTEM_SLICE;",
+            "if cg1 != 0 && cg1 == ours {",
+            "return tier::SERVICE | sig | tier_sig::OUR_SLICE;",
+        ],
+    )
+    .unwrap();
+    let k = code("agent/src/execpol/kernel.rs");
+    assert!(body(&k, "slice_ids").contains("id(\"northnarrow.slice\")"));
+    assert!(body(&k, "set_slices").contains("self.slices.set(slice_slot::OURS, ours, 0);"));
 }

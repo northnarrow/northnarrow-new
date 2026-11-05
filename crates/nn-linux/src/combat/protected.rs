@@ -299,7 +299,8 @@ impl SystemProtectedProcs {
     /// manager (`user@<uid>.service`), who names its units as it likes.
     fn system_unit(&self, pid: u32) -> Option<String> {
         let path = self.cgroup_path(pid)?;
-        if !path.starts_with("/system.slice/") {
+        // lot 273d: our units' slice of their own, the system manager's too
+        if !path.starts_with("/system.slice/") && !path.starts_with("/northnarrow.slice/") {
             return None;
         }
         last_unit(&path)
@@ -590,6 +591,12 @@ mod tests {
             (
                 803,
                 "/system.slice/northnarrow-watchdog.service",
+                ProtectedReason::Watchdog,
+            ),
+            // lot 273d: the units' slice of their own
+            (
+                804,
+                "/northnarrow.slice/northnarrow-watchdog.service",
                 ProtectedReason::Watchdog,
             ),
         ];

@@ -1087,6 +1087,114 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     now: no allowance for the time suspended.
   - The posture is read once per decision. The static scan of `install.sh`
     sees every spelling of the tree's binaries.
+- **Security (lot 273d, C23): the units in a slice of their own, a
+  confirmed reload, systemd's copy read before a respawn, our units' own
+  drop-ins judged at a window's close, the critical sysctls refused a
+  harmful value** (the review of #492 and its focused re-check;
+  `docs/design/ANTITAMPER_TRUST_MODEL.md`, "Lot 273d"). Before: a
+  `system.slice.d` drop-in reached our units; a reload counted once
+  requested; the watchdog respawned the agent into systemd's copy of its
+  unit, however low; our own drop-ins made inside a window applied at the
+  next reload; no global sysctl was guarded, and `kernel.ftrace_enabled=0`
+  silenced the deny hooks' trampolines on 6.0 to 7.2 with nothing refused
+  or signed (R1 of the external review of 04/11).
+  Now:
+  - `northnarrow.slice` (both units `Slice=`): `system.slice.d` no longer
+    reaches them; its drop-in directories NOCREATE, the file protected,
+    a manual stop refused; installed, switched and rolled back by
+    `install.sh`, carried by the packages, removed by `uninstall.sh`;
+  - the reload confirmed by systemd's `Reloading(false)` (30 s, else a
+    signed `failed` and a degradation); a repeated refusal of one file
+    verified against systemd's copy instead of skipped; after a confirmed
+    reload a file at its floor back to its configured value;
+  - the watchdog reads systemd's copy of our units before each respawn
+    and reloads a copy below the floors (signed as
+    `systemd_copy_below_floor`);
+  - our units' own drop-ins made inside a window judged at its close, a
+    harmful one quarantined (in the signed close record) and a reload
+    asked (rate-limited);
+  - the host's drop-ins judged precisely: slice floors relative to the
+    host, only `NN_` and the loader's injection variables harmful,
+    `CPUAffinity=`/`AllowedCPUs=` against the online CPUs, the conditions
+    on their merits, a file's last assignment; a separate
+    `unit_dropin_breaks_agent` warning for the sandbox and capability
+    settings that take what the agent uses; a harmful one a degradation
+    while it holds, and `nn-admin trusted-installer-grant` warns of it;
+  - `io.prio.class` protected; `vm.overcommit_*`, `vm.max_map_count`,
+    `kernel.pid_max`, `kernel.threads-max`, `kernel.sched_rt_runtime_us`
+    refused a harmful value outside a window in the kernel (signed
+    `sysctl`) and put back by the integrity round when set at boot or in
+    a window;
+  - `kernel.ftrace_enabled` (R1 of the external review of 04/11: `0`, on
+    6.0 to 7.2, silences the BPF trampolines, the deny hooks' among them)
+    refused outside a window whatever the write carries (the agent's own
+    restore passes by its identity), read at every build of the
+    capability manifest (`0` or unreadable: a signed `ftrace_enabled`
+    degradation, `DEGRADED` off the host) and put back to `1` at a
+    window's close — where every guarded sysctl is now checked — and by
+    the integrity round;
+  - the quarantine of our own drop-ins at a window's close works in the
+    installed unit: the drop-in directories are in the agent's
+    `ReadWritePaths=` (they were read-only under `ProtectSystem=strict`:
+    "NOT moved (Read-only file system)");
+  - the write deny loads on 5.15 and 6.1 again: the sysctls' value parser
+    is unrolled (its loop carried a fall-through back-edge those kernels'
+    verifier rejects), and a test checks every function of the object as
+    they do;
+  - `install.sh --upgrade` refuses to upgrade units the next boot would not
+    start (not enabled, or not pulled in by the default target), naming
+    `systemctl enable northnarrow-agent northnarrow-watchdog`; its health
+    check reads the same after the switch (a failure rolls back), and a
+    rollback enables again the units that were enabled;
+  - the review of #497: a sysctl value the kernel reads in another base
+    than 10 (octal `040000`, hex `0x…`) is refused, never judged as the
+    decimal it looks like; a write an io-wq worker runs (io_uring with
+    `IOSQE_ASYNC`, whose registers are another write's) is refused unread;
+    `kernel.sched_rt_period_us` is refused whatever it carries and the
+    round judges the RT runtime against the host's own period (put back to
+    95 % of it); our drop-ins are selected by their ctime, a symlink, a
+    hard link or an `EnvironmentFile=` outside `/etc/northnarrow/` is
+    quarantined whatever it sets, and every drop-in of our directories is
+    judged again at each round outside a window; the unit makes
+    `/etc/systemd/system/northnarrow-agent.service.d` on every host.
+  - the re-review of #497: a drop-in of our units kept at a window's
+    close or by a round, and the file under `/etc/northnarrow/` an
+    `EnvironmentFile=` of it names, are write-protected outside a window
+    (such a file must be a regular file with one name, there, else the
+    drop-in is quarantined); the round judges only what changed since the
+    agent was installed, so an operator's drop-in from before is never
+    moved by it — `install.sh` lists the existing ones this release's
+    agent would quarantine (`northnarrow-agent --own-dropins check`) and
+    refuses, nothing changed, unless `--accept-dropin-quarantine`; the
+    RT runtime put back is never 0; the eBPF CI job fails unless both
+    `check_cfg` tests ran; NN-L-FIM-009 no longer kills the writer of a
+    drop-in of our units inside a trusted-installer window (a Low record,
+    the close judges it);
+  - the short re-check of #497: a package's configure step warns of the
+    drop-ins of our units the agent judges harmful, and the round reports
+    one from before the install, signed (`own_dropin_preinstall_harmful`),
+    never moving it; without the protected-inode map nothing counts as
+    protected (fail-closed, a signed degradation when the map cannot be
+    opened) and a round that cannot read the install time says so; the
+    units' own `northnarrow.slice` is a service tier for the exec policy
+    again (it was UNKNOWN since the slice); an `NN_` setting in a drop-in
+    of our units is configuration again — kept, write-protected, each one
+    signed (`own_dropin_setting`, a High `own_dropin_weakening` for a
+    switch that weakens the agent), listed by `install.sh` as kept — and
+    only a loader variable gets such a drop-in quarantined; the system
+    tools the agent runs get a fixed minimal environment, and
+    `XTABLES_LIBDIR`, `IPTABLES_LIB_DIR`, `RPM_CONFIGDIR`, `NOTIFY_SOCKET`
+    are harmful in a drop-in that reaches our units; the weakening
+    switches cover the exec policy's, the exec quarantine's, the exploit
+    guard's and the connect deny's, and every `NN_` variable of the command
+    line is classified.
+  Still open (`docs/design/ANTITAMPER_TRUST_MODEL.md`, "Lot 273d",
+  Residual): the seven sysctls judged by value are judged on the bytes the
+  hook reads before the kernel copies them — a root writer's second thread
+  put the harmful value in 72 to 210 times in 2,000 writes in the lab, put
+  back by the round after 12.6 to 33.8 s; lot 280 closes it with
+  `cgroup/sysctl` — and an operator's reload inside a window applies a
+  harmful host drop-in already on disk (accepted, the grant warns).
 - **Security (lot 273c, C23): another process's change of the agent's
   limits and priorities refused, PID 1's memory closed to attach-mode
   access, resource values below a floor never registered, systemd's copy

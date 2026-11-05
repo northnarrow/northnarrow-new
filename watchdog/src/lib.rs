@@ -1753,6 +1753,73 @@ pub fn record_floor_restores(hold_path: &Path, agent_pid: u32) {
     }
 }
 
+/// Lot 273d (the review of #492): before a respawn, systemd's copy of our
+/// units — the agent's next start applies it to its fresh cgroup, and a
+/// `memory.max` of one page there kills the agent at its exec, before any
+/// check of the cgroup (the agent's at its start, this watchdog's after
+/// the respawn). A copy below the floors is reloaded — confirmed, and read
+/// again — unless a host drop-in harmful to our units is on disk (a
+/// reload would load it, and inside a window apply it). What was found is
+/// a WARN and a record at `hold_path` the agent signs. Returns its detail,
+/// `None` when the copy is within the floors (or systemd cannot be asked).
+pub fn check_systemds_copy(hold_path: &Path, agent_pid: u32) -> Option<String> {
+    use antitamper_bpf::unit_props::{below_floors, Below};
+    let socket = Path::new(antitamper_bpf::systemd_bus::PRIVATE_SOCKET);
+    if !socket.exists() {
+        return None;
+    }
+    let timeout = std::time::Duration::from_secs(5);
+    let below = match below_floors(socket, timeout) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(target: "watchdog.respawn", error = %e, "systemd's copy of our units not read before the respawn");
+            return None;
+        }
+    };
+    if below.is_empty() {
+        return None;
+    }
+    let found = below
+        .iter()
+        .map(Below::detail)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let harms = antitamper_bpf::host_dropins::harmful_here();
+    let (reload, after) = if let Some(h) = antitamper_bpf::host_dropins::withholding(&harms) {
+        (
+            format!("no reload: {} is on disk", h.detail()),
+            found.clone(),
+        )
+    } else {
+        let r = match antitamper_bpf::systemd_bus::reload_verified(
+            socket,
+            std::time::Duration::from_secs(30),
+        ) {
+            Ok(note) => note.to_string(),
+            Err(e) => format!("reload not confirmed: {e}"),
+        };
+        let after = match below_floors(socket, timeout) {
+            Ok(b) if b.is_empty() => "within the floors".to_string(),
+            Ok(b) => b.iter().map(Below::detail).collect::<Vec<_>>().join("; "),
+            Err(e) => format!("not read again: {e}"),
+        };
+        (r, after)
+    };
+    let detail = format!("{found}; {reload}; after it: {after}");
+    warn!(target: "watchdog.respawn", detail = %detail, "systemd's copy of our units below the floors before a respawn");
+    let rec = nn_proto::watchdog_hold::HoldRecord {
+        at: unix_now(),
+        agent_pid,
+        reason: nn_proto::watchdog_hold::REASON_COPY_BEFORE_RESPAWN.to_string(),
+        detail: detail.clone(),
+        unit_state: None,
+    };
+    if let Err(e) = record_hold(hold_path, &rec) {
+        warn!(target: "watchdog.respawn", error = format!("{e:#}"), "could not record systemd's copy for the agent's audit chain");
+    }
+    Some(detail)
+}
+
 /// The hold record of one floor restoration.
 pub fn floor_record(
     r: &antitamper_bpf::cgroup_floors::FloorRestore,

@@ -23,7 +23,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use common::cgroup_limits::{
     limit_kind_of, limit_value, LimitValue, LIMIT_CPU_LIST, LIMIT_CPU_MAX, LIMIT_FILES, LIMIT_FLAG,
-    LIMIT_IO_MAX, LIMIT_IO_WEIGHT, LIMIT_NICE, LIMIT_PARTITION, LIMIT_UNSIGNED_MAX, LIMIT_WEIGHT,
+    LIMIT_IO_MAX, LIMIT_IO_PRIO_CLASS, LIMIT_IO_WEIGHT, LIMIT_NICE, LIMIT_PARTITION,
+    LIMIT_UNSIGNED_MAX, LIMIT_WEIGHT,
 };
 use common::wire::InodeKey;
 
@@ -47,29 +48,122 @@ pub fn floor_role(dir: &Path) -> FloorRole {
 
 const MIB: u64 = 1 << 20;
 
+/// What a slice's floors are relative to (lot 273d, the review of #492): the
+/// host's memory, its online CPUs, its task limit — a small VM's
+/// `system.slice` with `MemoryHigh=80%` or a `CPUQuota=50%` is not below
+/// a slice's floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Host {
+    pub mem_total: u64,
+    pub cpus: u32,
+    pub tasks_max: u64,
+}
+
+impl Host {
+    /// This host's (`/proc/meminfo`, `/sys/devices/system/cpu/online`,
+    /// `pid_max` and `threads-max`); what cannot be read is taken as large.
+    pub fn read() -> Self {
+        let mem_total = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|t| {
+                t.lines().find_map(|l| {
+                    let kb = l.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?;
+                    kb.trim().parse::<u64>().ok().map(|k| k * 1024)
+                })
+            })
+            .unwrap_or(u64::MAX);
+        let cpus = std::fs::read_to_string("/sys/devices/system/cpu/online")
+            .ok()
+            .map(|t| cpu_list(&t).len() as u32)
+            .filter(|n| *n > 0)
+            .unwrap_or(u32::MAX);
+        let read = |p: &str| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|t| t.trim().parse::<u64>().ok())
+                .unwrap_or(u64::MAX)
+        };
+        Self {
+            mem_total,
+            cpus,
+            tasks_max: read("/proc/sys/kernel/pid_max").min(read("/proc/sys/kernel/threads-max")),
+        }
+    }
+}
+
+/// A CPU list (`0-3,5`, `0 1 2`) as its CPUs.
+pub fn cpu_list(t: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    for part in t.split([',', ' ', '\n', '\t']).filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                if let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+                    out.extend(a..=b.min(a.saturating_add(4096)));
+                }
+            }
+            None => {
+                if let Ok(n) = part.trim().parse() {
+                    out.push(n);
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// The floor of resource file `name` in a cgroup of `role`: the text a
 /// value below it is replaced with, or `None` (any value is acceptable, or
-/// the file is the host's to set: a slice's `cpuset.*`).
+/// the file is the host's to set: a slice's `cpuset.*`). A slice's are
+/// this host's ([`floor_on`]).
 pub fn floor_of(role: FloorRole, name: &str) -> Option<String> {
+    if role == FloorRole::Slice {
+        floor_on(role, name, &Host::read())
+    } else {
+        floor_on(
+            role,
+            name,
+            &Host {
+                mem_total: u64::MAX,
+                cpus: u32::MAX,
+                tasks_max: u64::MAX,
+            },
+        )
+    }
+}
+
+/// [`floor_of`] on `host`. A slice's floors are relative to it: memory
+/// `max(544 MiB, min(1 GiB, a quarter of the host's))` — never below the
+/// agent's and the watchdog's together; tasks `max(264, min(1024, a
+/// quarter of the host's limit))`; a CPU share of `min(1, max(0.5, an
+/// eighth of the online CPUs))` — never below the agent's half a CPU.
+pub fn floor_on(role: FloorRole, name: &str, host: &Host) -> Option<String> {
+    let slice_mem = (host.mem_total / 4).clamp(544 * MIB, 1024 * MIB);
+    let slice_tasks = (host.tasks_max / 4).clamp(264, 1024);
+    // in millionths of a CPU
+    let slice_cpu = (u64::from(host.cpus) * 1_000_000 / 8).clamp(500_000, 1_000_000);
     let mem = match role {
         FloorRole::Agent => 512 * MIB,
         FloorRole::Watchdog => 32 * MIB,
-        FloorRole::Slice => 1024 * MIB,
+        FloorRole::Slice => slice_mem,
     };
     Some(match (name, role) {
         ("memory.max" | "memory.high", _) => mem.to_string(),
         ("pids.max", FloorRole::Agent) => "256".into(),
         ("pids.max", FloorRole::Watchdog) => "8".into(),
-        ("pids.max", FloorRole::Slice) => "1024".into(),
+        ("pids.max", FloorRole::Slice) => slice_tasks.to_string(),
         ("cpu.max", FloorRole::Agent) => "50000 100000".into(),
         ("cpu.max", FloorRole::Watchdog) => "10000 100000".into(),
-        ("cpu.max", FloorRole::Slice) => "100000 100000".into(),
+        ("cpu.max", FloorRole::Slice) => format!("{} 100000", slice_cpu / 10),
         ("cgroup.max.descendants", FloorRole::Slice) => "4096".into(),
         ("cgroup.max.depth", FloorRole::Slice) => "8".into(),
         ("cpu.weight", _) => "100".into(),
         ("cpu.weight.nice" | "cpu.idle" | "memory.oom.group", _) => "0".into(),
         ("io.max", _) => String::new(),
         ("io.weight" | "io.bfq.weight", _) => "default 100".into(),
+        // lot 273d: never idle (nor restricted to best-effort)
+        ("io.prio.class", _) => "no-change".into(),
         ("cpuset.cpus" | "cpuset.mems", FloorRole::Agent | FloorRole::Watchdog) => String::new(),
         ("cpuset.cpus.partition", FloorRole::Agent | FloorRole::Watchdog) => "member".into(),
         _ => return None,
@@ -139,6 +233,7 @@ pub fn below_floor(kind: u8, current: &str, floor: &str) -> bool {
         },
         LIMIT_CPU_LIST => current != floor,
         LIMIT_PARTITION => current != floor,
+        LIMIT_IO_PRIO_CLASS => current == "idle",
         _ => false,
     }
 }
@@ -293,6 +388,30 @@ pub fn note_restores(restores: &[FloorRestore]) {
     if let Ok(mut p) = PENDING.lock() {
         p.extend_from_slice(restores);
     }
+    if let Ok(mut r) = AT_FLOOR.lock() {
+        for x in restores.iter().filter(|x| x.ok) {
+            if !r.contains(&x.path) {
+                r.push(x.path.clone());
+            }
+        }
+    }
+}
+
+/// Lot 273d (the review of #492): the files this process restored to their
+/// floors, not yet back at their configured value (systemd's copy, read
+/// after a confirmed reload: `crate::unit_props::configured_text`).
+static AT_FLOOR: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// The files at their floor, for [`back_to_configured`].
+pub fn at_floor() -> Vec<PathBuf> {
+    AT_FLOOR.lock().map(|r| r.clone()).unwrap_or_default()
+}
+
+/// `path` is back at its configured value.
+pub fn left_floor(path: &Path) {
+    if let Ok(mut r) = AT_FLOOR.lock() {
+        r.retain(|p| p != path);
+    }
 }
 
 /// The restorations noted since the last call.
@@ -327,10 +446,58 @@ mod tests {
         );
     }
 
+    /// A host whose slice floors are the caps: 16 GiB, 8 CPUs.
+    const BIG: Host = Host {
+        mem_total: 16 << 30,
+        cpus: 8,
+        tasks_max: 4_194_304,
+    };
+    /// A small VM: 1 GiB, 1 CPU.
+    const SMALL: Host = Host {
+        mem_total: 1 << 30,
+        cpus: 1,
+        tasks_max: 32768,
+    };
+
+    /// Lot 273d (the review of #492): a slice's floors follow the host —
+    /// never below what the agent and the watchdog need together.
+    #[test]
+    fn a_slices_floors_follow_the_host() {
+        use FloorRole::*;
+        assert_eq!(
+            floor_on(Slice, "memory.max", &BIG).unwrap(),
+            (1u64 << 30).to_string()
+        );
+        assert_eq!(
+            floor_on(Slice, "memory.max", &SMALL).unwrap(),
+            (544u64 << 20).to_string()
+        );
+        assert_eq!(floor_on(Slice, "cpu.max", &BIG).unwrap(), "100000 100000");
+        assert_eq!(floor_on(Slice, "cpu.max", &SMALL).unwrap(), "50000 100000");
+        assert_eq!(floor_on(Slice, "pids.max", &BIG).unwrap(), "1024");
+        assert_eq!(floor_on(Slice, "pids.max", &SMALL).unwrap(), "1024");
+        // a small VM's MemoryHigh=80% and a CPUQuota=50% are not below
+        let m = floor_on(Slice, "memory.high", &SMALL).unwrap();
+        assert!(!below_floor(
+            LIMIT_UNSIGNED_MAX,
+            &((1u64 << 30) * 8 / 10).to_string(),
+            &m
+        ));
+        let c = floor_on(Slice, "cpu.max", &SMALL).unwrap();
+        assert!(!below_floor(LIMIT_CPU_MAX, "50000 100000", &c));
+        // the units' own floors are the same on every host
+        assert_eq!(
+            floor_on(Agent, "memory.max", &SMALL),
+            floor_on(Agent, "memory.max", &BIG)
+        );
+        assert_eq!(cpu_list("0-3,5\n"), vec![0, 1, 2, 3, 5]);
+        assert_eq!(cpu_list("0 2"), vec![0, 2]);
+    }
+
     #[test]
     fn a_value_below_its_floor_is_found_and_one_above_is_not() {
         use FloorRole::*;
-        let f = |role, name| floor_of(role, name).unwrap();
+        let f = |role, name| floor_on(role, name, &BIG).unwrap();
         // memory: bytes or max
         assert!(below_floor(
             LIMIT_UNSIGNED_MAX,
@@ -436,7 +603,7 @@ mod tests {
         // a unit's cpuset is its parent's; a slice's is the host's
         assert!(below_floor(LIMIT_CPU_LIST, "3", &f(Agent, "cpuset.cpus")));
         assert!(!below_floor(LIMIT_CPU_LIST, "\n", &f(Agent, "cpuset.cpus")));
-        assert_eq!(floor_of(Slice, "cpuset.cpus"), None);
+        assert_eq!(floor_on(Slice, "cpuset.cpus", &BIG), None);
         assert!(below_floor(
             LIMIT_PARTITION,
             "root",
@@ -456,12 +623,31 @@ mod tests {
         ));
         assert_eq!(floor_of(Agent, "cgroup.max.descendants"), None);
         assert_eq!(floor_of(Agent, "memory.reclaim"), None);
+        // lot 273d: io.prio.class never idle
+        assert!(below_floor(
+            LIMIT_IO_PRIO_CLASS,
+            "idle",
+            &f(Agent, "io.prio.class")
+        ));
+        assert!(!below_floor(
+            LIMIT_IO_PRIO_CLASS,
+            "no-change",
+            &f(Slice, "io.prio.class")
+        ));
+        assert!(!below_floor(
+            LIMIT_IO_PRIO_CLASS,
+            "promote-to-rt",
+            &f(Agent, "io.prio.class")
+        ));
     }
 
     #[test]
     fn every_floor_is_its_own_kinds_and_not_below_itself() {
         for role in [FloorRole::Agent, FloorRole::Watchdog, FloorRole::Slice] {
             for (name, kind) in LIMIT_FILES {
+                if let Some(f) = floor_on(role, name, &SMALL) {
+                    assert!(!below_floor(kind, &f, &f), "{role:?} {name} {f:?}");
+                }
                 if let Some(f) = floor_of(role, name) {
                     assert!(!below_floor(kind, &f, &f), "{role:?} {name} {f:?}");
                     assert!(limit_value(f.as_bytes()).is_some(), "{name}");

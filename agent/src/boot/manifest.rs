@@ -116,6 +116,10 @@ pub struct Inputs {
     pub opt_ins: Vec<String>,
     /// R14a: the workers' supervisor (`None`: no worker in this run).
     pub workers: Option<nn_linux::worker::Workers>,
+    /// R1 of the external review of 04/11: the root the kernel's switches
+    /// are read under at every build (`/`; a directory in the tests) —
+    /// `kernel.ftrace_enabled` (`nn_linux::sysctl_guard::note_ftrace`).
+    pub proc_root: std::path::PathBuf,
     /// Lot 276: the export (`None`: no configuration of it).
     pub export: Option<crate::export::ExportHandle>,
 }
@@ -171,6 +175,10 @@ fn lsm_runs(bpf_lsm: &BpfLsm, self_test: &SelfTestOutcome) -> (Option<bool>, Str
 /// The manifest of `inputs` now, with the adapters that ended.
 fn build(inputs: &Inputs, terminated: &[String]) -> CapabilityManifest {
     use crate::boot::degradation;
+    // R1: `kernel.ftrace_enabled` read at every build (the boot's, then
+    // every REFRESH_PERIOD): 0 or unknown is a degradation in this very
+    // build, signed at once — a worse state, so its row is too.
+    nn_linux::sysctl_guard::note_ftrace(&inputs.proc_root);
     let mut m = inputs.base.clone();
     m.manifest_version = MANIFEST_VERSION;
     m.contract_version = nn_core::contract::CONTRACT_VERSION;

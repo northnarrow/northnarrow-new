@@ -48,6 +48,11 @@ pub enum Reason {
         ino: u64,
     },
     WindowOpened,
+    /// Lot 273d: a drop-in of our own units' directories, made inside a
+    /// window and harmful to them, quarantined at the window's close
+    /// ([`crate::own_dropins`]): systemd's copy may hold it. At most one
+    /// reload per [`MIN_INTERVAL`], like a refusal.
+    OwnDropinQuarantined,
 }
 
 impl Reason {
@@ -57,6 +62,10 @@ impl Reason {
                 format!("PID 1's {op} refused on {dev}:{ino} (a set-property outside a window)")
             }
             Self::WindowOpened => "a trusted-installer window opened".to_string(),
+            Self::OwnDropinQuarantined => {
+                "a drop-in of our units made inside a window, harmful to them, was quarantined"
+                    .to_string()
+            }
         }
     }
 }
@@ -95,11 +104,19 @@ impl Limiter {
             self.targets
                 .retain(|_, t| now.saturating_duration_since(*t) < TARGET_QUIET);
             self.targets.insert((*dev, *ino), now);
-            if let Some(last) = self.last {
-                let since = now.saturating_duration_since(last);
-                if since < MIN_INTERVAL {
-                    return Decision::After(MIN_INTERVAL - since);
-                }
+        }
+        if matches!(reason, Reason::WindowOpened) {
+            return Decision::Now;
+        }
+        self.interval(now)
+    }
+
+    /// Now, or once [`MIN_INTERVAL`] since the last reload has passed.
+    pub fn interval(&self, now: Instant) -> Decision {
+        if let Some(last) = self.last {
+            let since = now.saturating_duration_since(last);
+            if since < MIN_INTERVAL {
+                return Decision::After(MIN_INTERVAL - since);
             }
         }
         Decision::Now
@@ -130,7 +147,7 @@ impl Reloader {
 
     /// Start the worker on systemd's private socket `socket`; inert when
     /// the socket is not there (no systemd) or the thread cannot start.
-    pub fn start(socket: &'static str) -> Self {
+    pub fn start(socket: &'static str, after: AfterReload) -> Self {
         if !Path::new(socket).exists() {
             return Self::inert();
         }
@@ -139,7 +156,7 @@ impl Reloader {
         let worker_audit = Arc::clone(&audit);
         let spawned = std::thread::Builder::new()
             .name("nn-sd-reload".into())
-            .spawn(move || worker(rx, Path::new(socket), worker_audit));
+            .spawn(move || worker(rx, Path::new(socket), worker_audit, after));
         match spawned {
             Ok(_) => Self {
                 tx: Some(tx),
@@ -170,7 +187,12 @@ impl Reloader {
     }
 }
 
-fn worker(rx: Receiver<Reason>, socket: &Path, audit: Arc<Mutex<Option<Arc<Mutex<AuditLog>>>>>) {
+fn worker(
+    rx: Receiver<Reason>,
+    socket: &Path,
+    audit: Arc<Mutex<Option<Arc<Mutex<AuditLog>>>>>,
+    after: AfterReload,
+) {
     // A chain writer on a thread of its own: no capability but the
     // writer's (the socket's peer, PID 1's SIGHUP — root to root — and the
     // audit log need none).
@@ -178,6 +200,10 @@ fn worker(rx: Receiver<Reason>, socket: &Path, audit: Arc<Mutex<Option<Arc<Mutex
     let mut limiter = Limiter::default();
     // A refusal kept for after the interval, and when.
     let mut pending: Option<(Reason, Instant)> = None;
+    // Lot 273d: what systemd's copy still held below the floors after a
+    // confirmed reload — the units' own files set it: no reload again for
+    // the same values (a loop), a signed degradation while it holds.
+    let mut on_disk: Vec<antitamper_bpf::unit_props::Below> = Vec::new();
     loop {
         let next = match &pending {
             Some((_, at)) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
@@ -192,7 +218,23 @@ fn worker(rx: Receiver<Reason>, socket: &Path, audit: Arc<Mutex<Option<Arc<Mutex
                     }
                     continue;
                 }
-                Decision::Skip => continue,
+                // Lot 273d (the review of #492): the same target within its
+                // quiet is verified, not skipped — systemd's copy read back;
+                // a copy below the floors that a reload did not already
+                // find on disk is reloaded (after the interval).
+                Decision::Skip => match hostile_copy(socket, &on_disk) {
+                    Some(_) => match limiter.interval(Instant::now()) {
+                        Decision::Now => r,
+                        Decision::After(wait) => {
+                            if pending.is_none() {
+                                pending = Some((r, Instant::now() + wait));
+                            }
+                            continue;
+                        }
+                        Decision::Skip => continue,
+                    },
+                    None => continue,
+                },
             },
             Err(RecvTimeoutError::Timeout) => match pending.take() {
                 Some((r, _)) => r,
@@ -206,30 +248,92 @@ fn worker(rx: Receiver<Reason>, socket: &Path, audit: Arc<Mutex<Option<Arc<Mutex
         let roots = crate::self_integrity::unit_roots(Path::new("/"));
         let search: Vec<&Path> = roots.iter().map(|p| p.as_path()).collect();
         let harms = crate::host_dropins::harmful(&search, &crate::host_dropins::HostLimits::read());
-        match outcome(&harms, || crate::systemd_state::reload(socket)) {
+        match outcome(&harms, || {
+            crate::systemd_state::reload_verified(socket, RELOAD_TIMEOUT)
+        }) {
             Outcome::Withheld(what) => {
                 warn!(reason = %why, withheld = %what, "systemd reload WITHHELD: a host drop-in harmful to our units is on disk, and a reload would apply it (inside a window, through)");
-                record(&audit, &why, "withheld", Some(what));
+                crate::boot::degradation::report(
+                    DEGRADATION,
+                    &format!("the agent's reloads of systemd are withheld while {what}"),
+                );
+                record(&audit, &why, "withheld", Some(what), None);
             }
-            Outcome::Requested => {
+            Outcome::Confirmed(note) => {
                 limiter.reloaded(Instant::now());
-                info!(reason = %why, "systemd asked to reload (SIGHUP, its daemon-reload): its copy of the units becomes their files again");
-                record(&audit, &why, "requested", None);
+                // Lot 273d: the copy after the reload is the units' files.
+                let still = antitamper_bpf::unit_props::below_floors(socket, PROPS_TIMEOUT)
+                    .unwrap_or_default();
+                crate::boot::degradation::withdraw(DEGRADATION, &[]);
+                let after_note = if still.is_empty() {
+                    on_disk.clear();
+                    info!(reason = %why, note, "systemd reloaded (confirmed): its copy of the units is their files again");
+                    None
+                } else {
+                    let what = still
+                        .iter()
+                        .map(antitamper_bpf::unit_props::Below::detail)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    warn!(reason = %why, still = %what, "systemd reloaded, and its copy is STILL below the floors: the units' files set it");
+                    crate::boot::degradation::report(
+                        DEGRADATION,
+                        &format!("after a confirmed reload, the units' files set: {what}"),
+                    );
+                    on_disk = still;
+                    Some(what)
+                };
+                record(
+                    &audit,
+                    &why,
+                    "reloaded",
+                    None,
+                    after_note.or(Some(note.to_string())),
+                );
+                after();
             }
             Outcome::Failed(e) => {
                 limiter.reloaded(Instant::now());
-                warn!(reason = %why, error = %e, "systemd reload NOT asked — a refused set-property's copy may stay until the next reload");
-                record(&audit, &why, "failed", Some(e));
+                warn!(reason = %why, error = %e, "systemd reload NOT confirmed — a refused set-property's copy may stay until the next reload");
+                crate::boot::degradation::report(
+                    DEGRADATION,
+                    &format!("a reload of systemd was not confirmed: {e}"),
+                );
+                record(&audit, &why, "failed", Some(e), None);
             }
         }
     }
 }
 
+/// How long a reload may take to be confirmed.
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a property read may take.
+const PROPS_TIMEOUT: Duration = Duration::from_secs(5);
+/// The degradation's source (`nn-admin status --key`, the manifest, the
+/// heartbeat).
+pub const DEGRADATION: &str = "systemd_reload";
+
+/// What runs after a confirmed reload (lot 273d: the floors' values back
+/// to the configured ones, `crate::anti_tamper::cgroup_guard`).
+pub type AfterReload = Arc<dyn Fn() + Send + Sync>;
+
+/// A value of systemd's copy below its floor that a confirmed reload did
+/// not find set by the units' files (`on_disk`): a hostile copy.
+fn hostile_copy(
+    socket: &Path,
+    on_disk: &[antitamper_bpf::unit_props::Below],
+) -> Option<antitamper_bpf::unit_props::Below> {
+    antitamper_bpf::unit_props::below_floors(socket, PROPS_TIMEOUT)
+        .ok()?
+        .into_iter()
+        .find(|b| !on_disk.contains(b))
+}
+
 /// What a reload came to.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// Asked (systemd's SIGHUP sent).
-    Requested,
+    /// Asked and confirmed (systemd's `Reloading(false)`).
+    Confirmed(&'static str),
     /// Not asked: a host drop-in harmful to our units is on disk
     /// (`crate::host_dropins`), and a reload would load it into systemd's
     /// copy — inside a trusted-installer window, where PID 1's writes are
@@ -244,10 +348,14 @@ pub enum Outcome {
 /// The reload of `reload`, unless `harms` holds a harmful drop-in.
 pub fn outcome(
     harms: &[crate::host_dropins::Harm],
-    reload: impl FnOnce() -> std::io::Result<()>,
+    reload: impl FnOnce() -> std::io::Result<&'static str>,
 ) -> Outcome {
-    if let Some(h) = harms.first() {
-        let more = harms.len() - 1;
+    if let Some(h) = crate::host_dropins::withholding(harms) {
+        let more = harms
+            .iter()
+            .filter(|x| x.kind == crate::host_dropins::Kind::Harmful)
+            .count()
+            - 1;
         return Outcome::Withheld(if more == 0 {
             h.detail()
         } else {
@@ -255,7 +363,7 @@ pub fn outcome(
         });
     }
     match reload() {
-        Ok(()) => Outcome::Requested,
+        Ok(note) => Outcome::Confirmed(note),
         Err(e) => Outcome::Failed(e.to_string()),
     }
 }
@@ -265,13 +373,14 @@ fn record(
     why: &str,
     result: &str,
     error: Option<String>,
+    note: Option<String>,
 ) {
     let audit = slot.lock().clone();
     let Some(audit) = audit else { return };
     let mut log = audit.lock();
     let draft = AuditEntryDraft {
         op: "systemd_reload".to_string(),
-        extra: serde_json::json!({ "reason": why, "error": error }),
+        extra: serde_json::json!({ "reason": why, "error": error, "note": note }),
         key_fp: "agent-self".to_string(),
         cosigner_fps: Vec::new(),
         result: result.to_string(),
@@ -334,19 +443,23 @@ mod tests {
             directive: "MemoryMax".into(),
             value: "4K".into(),
             why: "below the slice's floor".into(),
-            reach: crate::host_dropins::Reach::SystemSlice,
+            reach: crate::host_dropins::Reach::OurSlice,
+            kind: crate::host_dropins::Kind::Harmful,
         };
         let mut tried = false;
         let o = outcome(std::slice::from_ref(&harm), || {
             tried = true;
-            Ok(())
+            Ok("x")
         });
         assert!(!tried, "no reload tried");
         assert!(
             matches!(&o, Outcome::Withheld(w) if w.contains("99-x.conf sets MemoryMax=4K")),
             "{o:?}"
         );
-        assert_eq!(outcome(&[], || Ok(())), Outcome::Requested);
+        assert_eq!(
+            outcome(&[], || Ok("confirmed")),
+            Outcome::Confirmed("confirmed")
+        );
         assert_eq!(
             outcome(&[], || Err(std::io::Error::other("no"))),
             Outcome::Failed("no".into())

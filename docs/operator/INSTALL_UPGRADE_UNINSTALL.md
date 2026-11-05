@@ -223,8 +223,39 @@ start — left the host without a working agent. What it does now, in order:
    PROTECTED_PIDS` with its main pid. A deny-hook shortfall
    (`NN_ANTI_TAMPER_ALLOW_DEGRADED=1` included) fails the check; every deny
    hook with an observe hook missing passes with a WARNING (the agent signs
-   the missing telemetry as `subsystem_degraded`). Passed: the backup is
-   removed and the run ends `UPGRADE complete — health check passed`.
+   the missing telemetry as `subsystem_degraded`). Lot 273d: running is not
+   enough — both units must be **enabled** (`systemctl is-enabled`:
+   `enabled`; a runtime-only enablement does not survive a reboot) and
+   pulled in by the boot's default target (`systemctl get-default`, its
+   `list-dependencies`); a unit the next boot would not start fails the
+   check ("the next boot would start no agent") and the upgrade rolls back.
+   Passed: the backup is removed and the run ends `UPGRADE complete —
+   health check passed`.
+
+**An upgrade of units the boot would not start is refused** (lot 273d, the
+lab's round 13: units started by hand and never enabled were upgraded, every
+check passed, and the next reboot left the host without an agent). Before
+anything is stopped or a window asked for, `--upgrade` checks the running
+units the same way and, if one is not enabled or not pulled in by the
+default target, ends with `REFUSED — <unit> is disabled …: the next boot
+would start no agent`, the command to run first — `systemctl enable
+northnarrow-agent northnarrow-watchdog` — and "Nothing was changed". A
+rollback (below) enables again the units that were enabled before the
+upgrade: the enablement links are not among the files it restores.
+
+**Drop-ins of the agent's own units that the new agent would quarantine
+are listed first** (lot 273d, the re-review of #497). Once the window is
+open (or, with no agent running, before anything is copied), the script
+asks the new agent which drop-ins of `northnarrow-agent.service.d`,
+`northnarrow-watchdog.service.d`, `northnarrow-.service.d` and
+`northnarrow.slice.d` it judges harmful (`northnarrow-agent --own-dropins
+check`, read-only), prints each with the reason and ends with `REFUSED`
+and "Nothing was changed" (the window it opened ends at its deadline).
+Remove them, or re-run with `--accept-dropin-quarantine`: the new agent
+moves them to `/var/lib/northnarrow/quarantine/dropins/` (each move
+printed) and the upgrade goes on. After the install the agent's integrity
+round never moves a drop-in that was there before it
+(`UPGRADE_NOTES_WAVE4.md` §9).
 
 **Any failure after step 3 rolls back** (an EXIT trap; Ctrl-C included).
 The new units, if they ran, are stopped through the new agent's own window
@@ -846,6 +877,24 @@ start: remove it, or scope it to the services it is for (their own
 through there), and the agent withholds its own reloads while it is on
 disk (signed `systemd_reload` `withheld`). Debugging PID 1 (`gdb -p 1`, `strace -p 1`, `gcore 1`,
 `/proc/1/mem`) takes a window.
+
+Lot 273d (the review of #492): the units run in a slice of their own,
+`northnarrow.slice`, which `install.sh` installs, switches and rolls back
+with them (an upgrade moves both units there at their restart; a
+`system.slice.d` reservation no longer applies to them). `systemctl stop
+northnarrow.slice` is refused like a stop of the units. `nn-admin
+trusted-installer-grant` warns when a harmful host drop-in is on disk —
+remove it before the maintenance: a `daemon-reload` inside the window
+kills the agent, the watchdog and journald. A window ends with the agent
+that opened it (fail-closed): a maintenance that restarts the agent asks
+for a new grant before its next protected step (`install.sh --upgrade`'s
+rollback does). Tuning `vm.overcommit_*`, `vm.max_map_count`,
+`kernel.pid_max`, `kernel.threads-max` or `kernel.sched_rt_runtime_us` to
+a value that would abort or starve the agent needs a window; a value that
+harms nothing (a raised limit, overcommit 0 or 1) does not. The integrity
+round puts back such a value set at boot (`sysctl.d`), and leaves strict
+overcommit (`vm.overcommit_memory=2`) with a ratio of 50 or more to the
+operator (signed `sysctl_strict`).
 
 ### 3.8 No new entries in the agent's directories (external audit EBPF-015)
 

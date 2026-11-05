@@ -884,6 +884,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
                     nn_model::FsProtectOperation::Sched
                         | nn_model::FsProtectOperation::Nice
                         | nn_model::FsProtectOperation::Ioprio
+                        | nn_model::FsProtectOperation::Sysctl
                 ) {
                     // Lot 273c: a refused change of the agent's scheduling, nice
                     // value or I/O priority is an impairment (ENGAGED), not a

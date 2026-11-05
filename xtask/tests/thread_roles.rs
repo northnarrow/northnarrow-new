@@ -144,7 +144,7 @@ fn the_core_s_threads_get_the_core_s_set() {
 const THREADS_WITHOUT_A_CALL: &[(&str, &str, &str)] = &[
     (
         "crates/nn-linux/src/systemd_reload.rs",
-        ".spawn(move || worker(rx, Path::new(socket), worker_audit))",
+        ".spawn(move || worker(rx, Path::new(socket), worker_audit, after))",
         "the function it runs enters the writer's role first (lot 273c)",
     ),
     (

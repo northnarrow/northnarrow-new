@@ -28,12 +28,14 @@ use aya_ebpf::{
     maps::{Array, HashMap},
 };
 use northnarrow_common::cgroup_limits::{
-    default_value, init_write_lets_through, limit_kind, special_fs, strip_newline, word_mask,
-    LimitValue, SpecialFs, LIMIT_NAME_MAX, LIMIT_NONE, LIMIT_TEXT_MAX,
+    default_value, init_write_lets_through, limit_kind, regs_are_the_writes, special_fs,
+    strip_newline, sysctl_kind, sysctl_write_refused, word_mask, LimitValue, SpecialFs,
+    LIMIT_NAME_MAX, LIMIT_NONE,
+    LIMIT_TEXT_MAX, SYSCTL_NONE,
 };
 use northnarrow_common::wire::{
     InodeKey, CGROUP_POLICY_V1_REFUSE, FS_OP_CGROUP_LIMIT, FS_OP_CGROUP_V1, FS_OP_OOM_ADJ,
-    FS_PROTECT_LIMIT_DIR,
+    FS_OP_SYSCTL, FS_PROTECT_LIMIT_DIR,
 };
 
 use crate::btf_offsets::{
@@ -43,8 +45,8 @@ use crate::btf_offsets::{
     KERNFS_NODE_PRIV_OFFSET, KERNFS_ROOT_KN_OFFSET, KERNFS_SUPER_INFO_ROOT_OFFSET,
     PATH_DENTRY_OFFSET, SUPER_BLOCK_S_FS_INFO_OFFSET, PID_TASKS_OFFSET, PROC_INODE_PID_OFFSET,
     PROC_INODE_VFS_INODE_OFFSET, PT_REGS_DX_OFFSET, PT_REGS_ORIG_AX_OFFSET, PT_REGS_SI_OFFSET,
-    QSTR_LEN_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_PID_LINKS_OFFSET,
-    TASK_STRUCT_TGID_OFFSET,
+    QSTR_LEN_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_FLAGS_OFFSET,
+    TASK_STRUCT_PID_LINKS_OFFSET, TASK_STRUCT_TGID_OFFSET,
 };
 
 /// The value each protected resource file held when the agent registered
@@ -107,7 +109,9 @@ pub(crate) unsafe fn refuse_write(
     match special_fs(magic) {
         Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),
         Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),
-        Some(SpecialFs::Proc) => refuse_oom_adj(file, inode, phase),
+        Some(SpecialFs::Proc) => {
+            refuse_sysctl(file, inode, hook, phase) || refuse_oom_adj(file, inode, phase)
+        }
         None => false,
     }
 }
@@ -338,6 +342,15 @@ unsafe fn written_bytes() -> Option<(LimitValue, u32)> {
         return None;
     }
     let task = generated::bpf_get_current_task_btf();
+    // the review of #497 (D2): an io-wq worker carries another write's
+    // registers, a kernel thread has none of its own — unread (refused)
+    let flags = bpf_probe_read_kernel::<u32>(
+        (task as *const u8).add(off!(TASK_STRUCT_FLAGS_OFFSET)) as *const u32,
+    )
+    .ok()?;
+    if !regs_are_the_writes(flags) {
+        return None;
+    }
     let regs = generated::bpf_task_pt_regs(task) as *const u8;
     if regs.is_null() {
         return None;
@@ -450,6 +463,50 @@ unsafe fn refuse_v1(inode: *const c_void, hook: u32, phase: Phase) -> bool {
         return false;
     };
     sign(phase, FS_OP_CGROUP_V1, key);
+    true
+}
+
+/// Lot 273d (the review of #492): a write of a guarded global sysctl
+/// (`/proc/sys/vm/overcommit_*`, `max_map_count`, `kernel/pid_max`,
+/// `threads-max`, `sched_rt_runtime_us`, and `kernel/ftrace_enabled` — R1
+/// of the external review of 04/11: 0 silences the BPF trampolines, these
+/// programs' own among them, on 6.0 to 7.2; by name: no other procfs file
+/// is named so) is refused outside a window when its value aborts or
+/// starves the agent, and `ftrace_enabled` whatever it carries (unread:
+/// nothing for a second thread to race) — the verdict is the shared
+/// module's (`sysctl_write_refused`), for the seven others
+/// (`sysctl_write_harmful`), judged on the bytes the write carries; an
+/// unread write is refused. The open is let through (judged at the
+/// write); a value that harms nothing (a raised limit, overcommit 0 or 1)
+/// goes through: the operator's tuning stays possible, every tuning inside
+/// a window.
+#[inline(always)]
+unsafe fn refuse_sysctl(file: *const c_void, inode: *const c_void, hook: u32, phase: Phase) -> bool {
+    if phase == Phase::Open {
+        return false;
+    }
+    let Some(dentry) = file_dentry(file) else {
+        return false;
+    };
+    let Some((len, words)) = dentry_name_words(dentry) else {
+        return false;
+    };
+    let kind = sysctl_kind(len, words);
+    if kind == SYSCTL_NONE {
+        return false;
+    }
+    let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // the shared verdict: the caller's identity first (the agent's own
+    // restore, a window), then `ftrace_enabled` refused unread, the
+    // others by the bytes the write carries
+    if !sysctl_write_refused(kind, caller_may(caller), || written_value()) {
+        return false;
+    }
+    let Some(key) = crate::inode_protect::read_inode_key(inode) else {
+        crate::fail_open::bump(hook);
+        return false;
+    };
+    sign(phase, FS_OP_SYSCTL, key);
     true
 }
 

@@ -27,6 +27,7 @@ const MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
 const METHOD_CALL: u8 = 1;
 const METHOD_RETURN: u8 = 2;
 const ERROR: u8 = 3;
+const SIGNAL: u8 = 4;
 
 /// Header field codes.
 const FIELD_PATH: u8 = 1;
@@ -43,14 +44,198 @@ const MAX_MESSAGE: usize = 64 * 1024;
 /// [`PRIVATE_SOCKET`]), each read and write bounded by `timeout`.
 pub fn system_state(socket: &Path, timeout: Duration) -> io::Result<String> {
     let mut s = connect(socket, timeout)?;
-    const SERIAL: u32 = 1;
-    s.write_all(&get_property_call(SERIAL, MANAGER_INTERFACE, "SystemState"))?;
+    state_on(&mut s)
+}
+
+/// `SystemState` on an open connection.
+fn state_on(s: &mut UnixStream) -> io::Result<String> {
+    match get_on(s, 1, MANAGER_PATH, MANAGER_INTERFACE, "SystemState")? {
+        Value::Str(state) => Ok(state),
+        v => Err(other(format!("D-Bus: SystemState is {v:?}, not a string"))),
+    }
+}
+
+/// A property's value, as the variant carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Value {
+    Str(String),
+    U64(u64),
+    U32(u32),
+    I32(i32),
+    Bool(bool),
+}
+
+/// `Properties.Get(interface, property)` of the object at `path`, on an
+/// open connection; the signals before the reply are skipped.
+fn get_on(
+    s: &mut UnixStream,
+    serial: u32,
+    path: &str,
+    interface: &str,
+    property: &str,
+) -> io::Result<Value> {
+    s.write_all(&get_property_call(serial, path, interface, property))?;
     loop {
-        let msg = read_message(&mut s)?;
-        if let Some(state) = parse_reply(&msg, SERIAL)? {
-            return Ok(state);
+        let msg = read_message(s)?;
+        if let Some(v) = parse_reply(&msg, serial)? {
+            return Ok(v);
         }
     }
+}
+
+/// Lot 273d: a property of the manager (`Virtualization`, `Version`, …).
+pub fn manager_property(socket: &Path, timeout: Duration, property: &str) -> io::Result<Value> {
+    let mut s = connect(socket, timeout)?;
+    get_on(&mut s, 1, MANAGER_PATH, MANAGER_INTERFACE, property)
+}
+
+/// Lot 273d: a property of unit `unit` as systemd holds it in memory —
+/// its copy, which a refused `set-property` changed — through `interface`
+/// (`org.freedesktop.systemd1.Service`, `.Slice` for the resource
+/// properties). Read without authorization.
+pub fn unit_property(
+    socket: &Path,
+    timeout: Duration,
+    unit: &str,
+    interface: &str,
+    property: &str,
+) -> io::Result<Value> {
+    let mut s = connect(socket, timeout)?;
+    get_on(&mut s, 1, &unit_path(unit), interface, property)
+}
+
+/// The object path of unit `unit` (`bus_label_escape`: every byte but an
+/// ASCII letter or digit, and a leading digit, as `_` and two hex digits).
+pub fn unit_path(unit: &str) -> String {
+    let mut out = String::from("/org/freedesktop/systemd1/unit/");
+    for (i, b) in unit.bytes().enumerate() {
+        if b.is_ascii_alphabetic() || (b.is_ascii_digit() && i > 0) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("_{b:02x}"));
+        }
+    }
+    out
+}
+
+/// Lot 273d (the review of #492): a `daemon-reload` asked by SIGHUP and
+/// confirmed — the manager's `Reloading(false)` signal on a connection
+/// opened before the signal (a private connection is subscribed to the
+/// manager's signals without asking). `timeout` bounds the wait: no
+/// confirmation in time is an error (systemd refuses a reload with less
+/// than 16 MB free on `/run`, and from 253 past its `ReloadLimit*`). A
+/// connection the reload closed is reopened, and a manager that answers
+/// on it after the reload is taken as reloaded.
+pub fn reload_verified(socket: &Path, timeout: Duration) -> io::Result<&'static str> {
+    let mut s = connect(socket, timeout)?;
+    let state = state_on(&mut s)?;
+    if state == "stopping" {
+        return Err(other(
+            "systemd reports the host as stopping: no reload".to_string(),
+        ));
+    }
+    // SAFETY: kill(2) has no memory preconditions.
+    if unsafe { libc::kill(1, libc::SIGHUP) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let mut began = false;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(other(format!(
+                "no Reloading(false) from systemd within {}s{}: the reload was refused or is \
+                 still running (/run nearly full, ReloadLimit*)",
+                timeout.as_secs(),
+                if began {
+                    " after its Reloading(true)"
+                } else {
+                    ""
+                }
+            )));
+        }
+        s.set_read_timeout(Some(left))?;
+        let msg = match read_message(&mut s) {
+            Ok(m) => m,
+            Err(e)
+                if e.kind() == io::ErrorKind::UnexpectedEof
+                    || e.kind() == io::ErrorKind::ConnectionReset =>
+            {
+                // the reload closed the connection: ask again once it is back
+                std::thread::sleep(Duration::from_millis(500));
+                let mut again = connect(socket, timeout)?;
+                state_on(&mut again)?;
+                return Ok(
+                    "reloaded (the connection closed with the reload; systemd answers after it)",
+                );
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(e) => return Err(e),
+        };
+        match reloading_signal(&msg)? {
+            Some(true) => began = true,
+            Some(false) => return Ok("reloaded (Reloading(false) received)"),
+            None => {}
+        }
+    }
+}
+
+/// The body of a manager `Reloading` signal (`b`), `None` for any other
+/// message.
+fn reloading_signal(msg: &[u8]) -> io::Result<Option<bool>> {
+    if msg.get(1) != Some(&SIGNAL) {
+        return Ok(None);
+    }
+    let le = msg[0] == b'l';
+    let fields_len = u32_at(msg, 12, le) as usize;
+    let mut c = Cursor {
+        buf: msg,
+        pos: 16,
+        le,
+    };
+    let fields_end = 16 + fields_len;
+    let (mut member, mut interface, mut signature) = (String::new(), String::new(), String::new());
+    while c.pos < fields_end {
+        c.align(8);
+        if c.pos >= fields_end {
+            break;
+        }
+        let code = c.byte()?;
+        let sig = c.signature()?;
+        match sig.as_str() {
+            "u" => {
+                c.u32()?;
+            }
+            "s" | "o" => {
+                let v = c.string()?;
+                if code == FIELD_MEMBER {
+                    member = v;
+                } else if code == FIELD_INTERFACE {
+                    interface = v;
+                }
+            }
+            "g" => {
+                let v = c.signature()?;
+                if code == FIELD_SIGNATURE {
+                    signature = v;
+                }
+            }
+            other_sig => {
+                return Err(other(format!(
+                    "D-Bus: unexpected header field type {other_sig:?}"
+                )))
+            }
+        }
+    }
+    if member != "Reloading" || interface != MANAGER_INTERFACE || signature != "b" {
+        return Ok(None);
+    }
+    c.pos = fields_end.div_ceil(8) * 8;
+    Ok(Some(c.u32()? != 0))
 }
 
 /// Lot 273c (the review of #490): a `daemon-reload` — systemd reloads on
@@ -69,22 +254,7 @@ pub fn system_state(socket: &Path, timeout: Duration) -> io::Result<String> {
 /// to send queued message ... Transport endpoint is not connected"). Root
 /// signals PID 1 without a capability (same uid).
 pub fn reload(socket: &Path) -> io::Result<()> {
-    // PID 1 serves the socket and answers as systemd: the state it reports,
-    // read in a whole D-Bus exchange (a connection closed after the peer
-    // check alone made PID 1 log "Failed to start new connection bus:
-    // Connection reset by peer" at every reload; round 7). A host that is
-    // stopping is not reloaded.
-    let state = system_state(socket, Duration::from_secs(5))?;
-    if state == "stopping" {
-        return Err(other(
-            "systemd reports the host as stopping: no reload".to_string(),
-        ));
-    }
-    // SAFETY: kill(2) has no memory preconditions.
-    if unsafe { libc::kill(1, libc::SIGHUP) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    reload_verified(socket, Duration::from_secs(30)).map(|_| ())
 }
 
 /// A connection to systemd's private socket served by PID 1, authenticated
@@ -209,9 +379,9 @@ fn put_field(fields: &mut Vec<u8>, code: u8, sig: char, value: &str) {
 /// little-endian D-Bus wire format. The header fields array starts at
 /// offset 16, which is 8-aligned, so alignment inside `fields` and `body`
 /// can be counted from their own start.
-fn get_property_call(serial: u32, interface: &str, property: &str) -> Vec<u8> {
+fn get_property_call(serial: u32, path: &str, interface: &str, property: &str) -> Vec<u8> {
     let mut fields = Vec::new();
-    put_field(&mut fields, FIELD_PATH, 'o', MANAGER_PATH);
+    put_field(&mut fields, FIELD_PATH, 'o', path);
     put_field(&mut fields, FIELD_INTERFACE, 's', PROPERTIES_INTERFACE);
     put_field(&mut fields, FIELD_MEMBER, 's', "Get");
     put_field(
@@ -294,6 +464,16 @@ impl Cursor<'_> {
         self.pos += 4;
         Ok(v)
     }
+    fn u64(&mut self) -> io::Result<u64> {
+        self.align(8);
+        let b = self.bytes(8)?;
+        let a: [u8; 8] = b.try_into().expect("8 bytes");
+        Ok(if self.le {
+            u64::from_le_bytes(a)
+        } else {
+            u64::from_be_bytes(a)
+        })
+    }
     fn bytes(&mut self, n: usize) -> io::Result<&[u8]> {
         let end = self.pos.checked_add(n).filter(|e| *e <= self.buf.len());
         let end = end.ok_or_else(|| other("D-Bus: truncated".into()))?;
@@ -318,7 +498,7 @@ impl Cursor<'_> {
 /// The string a `METHOD_RETURN` to `serial` carries in its variant body;
 /// `None` for any other message (a signal, a reply to something else); an
 /// error for an `ERROR` reply to `serial`.
-fn parse_reply(msg: &[u8], serial: u32) -> io::Result<Option<String>> {
+fn parse_reply(msg: &[u8], serial: u32) -> io::Result<Option<Value>> {
     let le = msg[0] == b'l';
     let kind = msg[1];
     let fields_len = u32_at(msg, 12, le) as usize;
@@ -367,12 +547,18 @@ fn parse_reply(msg: &[u8], serial: u32) -> io::Result<Option<String>> {
     match kind {
         METHOD_RETURN if signature == "v" => {
             let inner = c.signature()?;
-            if inner != "s" {
-                return Err(other(format!(
-                    "D-Bus: SystemState is {inner:?}, not a string"
-                )));
-            }
-            Ok(Some(c.string()?))
+            Ok(Some(match inner.as_str() {
+                "s" | "o" => Value::Str(c.string()?),
+                "t" => Value::U64(c.u64()?),
+                "u" => Value::U32(c.u32()?),
+                "i" => Value::I32(c.u32()? as i32),
+                "b" => Value::Bool(c.u32()? != 0),
+                _ => {
+                    return Err(other(format!(
+                        "D-Bus: a property of type {inner:?} is not read here"
+                    )))
+                }
+            }))
         }
         METHOD_RETURN => Err(other(format!("D-Bus: reply signature {signature:?}"))),
         ERROR => Err(other("D-Bus: systemd answered with an error".into())),
@@ -394,6 +580,86 @@ mod tests {
         let e = reload(&path).unwrap_err();
         assert!(e.to_string().contains("not systemd"), "{e}");
         assert!(reload(&dir.path().join("none")).is_err());
+    }
+
+    /// Lot 273d: the object path of a unit, escaped as systemd escapes it.
+    #[test]
+    fn a_units_path_is_its_escaped_name() {
+        assert_eq!(
+            unit_path("northnarrow-agent.service"),
+            "/org/freedesktop/systemd1/unit/northnarrow_2dagent_2eservice"
+        );
+        assert_eq!(
+            unit_path("system.slice"),
+            "/org/freedesktop/systemd1/unit/system_2eslice"
+        );
+        assert_eq!(unit_path("1x"), "/org/freedesktop/systemd1/unit/_31x");
+    }
+
+    /// A message with the header fields `fields` (code, signature, value)
+    /// and the body `body`.
+    fn message(kind: u8, fields: &[(u8, char, &str)], body: &[u8]) -> Vec<u8> {
+        let mut f = Vec::new();
+        for (code, sig, v) in fields {
+            put_field(&mut f, *code, *sig, v);
+        }
+        let mut msg = vec![b'l', kind, 1, 1];
+        msg.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        msg.extend_from_slice(&3u32.to_le_bytes());
+        msg.extend_from_slice(&(f.len() as u32).to_le_bytes());
+        msg.extend_from_slice(&f);
+        pad(&mut msg, 8);
+        msg.extend_from_slice(body);
+        msg
+    }
+
+    /// Lot 273d: the manager's Reloading signal, true then false; any other
+    /// signal is not it.
+    #[test]
+    fn the_reloading_signal_is_read() {
+        let sig = |member: &str, v: u32| {
+            message(
+                SIGNAL,
+                &[
+                    (FIELD_PATH, 'o', MANAGER_PATH),
+                    (FIELD_INTERFACE, 's', MANAGER_INTERFACE),
+                    (FIELD_MEMBER, 's', member),
+                    (FIELD_SIGNATURE, 'g', "b"),
+                ],
+                &v.to_le_bytes(),
+            )
+        };
+        assert_eq!(reloading_signal(&sig("Reloading", 1)).unwrap(), Some(true));
+        assert_eq!(reloading_signal(&sig("Reloading", 0)).unwrap(), Some(false));
+        assert_eq!(reloading_signal(&sig("UnitNew", 0)).unwrap(), None);
+        assert_eq!(
+            reloading_signal(&reply(1, METHOD_RETURN, "x")).unwrap(),
+            None
+        );
+    }
+
+    /// Lot 273d: a `t` property (MemoryMax) is read as a number.
+    #[test]
+    fn a_u64_property_is_read() {
+        let mut fields = Vec::new();
+        pad(&mut fields, 8);
+        fields.push(FIELD_REPLY_SERIAL);
+        put_signature(&mut fields, "u");
+        pad(&mut fields, 4);
+        fields.extend_from_slice(&5u32.to_le_bytes());
+        put_field(&mut fields, FIELD_SIGNATURE, 'g', "v");
+        let mut body = Vec::new();
+        put_signature(&mut body, "t");
+        pad(&mut body, 8);
+        body.extend_from_slice(&536870912u64.to_le_bytes());
+        let mut msg = vec![b'l', METHOD_RETURN, 1, 1];
+        msg.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        msg.extend_from_slice(&7u32.to_le_bytes());
+        msg.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+        msg.extend_from_slice(&fields);
+        pad(&mut msg, 8);
+        msg.extend_from_slice(&body);
+        assert_eq!(parse_reply(&msg, 5).unwrap(), Some(Value::U64(536870912)));
     }
 
     /// A reply as systemd builds it: `METHOD_RETURN`, REPLY_SERIAL and
@@ -421,7 +687,7 @@ mod tests {
 
     #[test]
     fn the_call_is_a_well_formed_properties_get() {
-        let msg = get_property_call(1, MANAGER_INTERFACE, "SystemState");
+        let msg = get_property_call(1, MANAGER_PATH, MANAGER_INTERFACE, "SystemState");
         assert_eq!(&msg[..4], &[b'l', METHOD_CALL, 0, 1]);
         let fields_len = u32_at(&msg, 12, true) as usize;
         let body_start = (16 + fields_len).div_ceil(8) * 8;
@@ -465,7 +731,10 @@ mod tests {
         let mut stream = &msg[..];
         let read = read_message(&mut stream).unwrap();
         assert_eq!(read, msg);
-        assert_eq!(parse_reply(&read, 1).unwrap().as_deref(), Some("stopping"));
+        assert_eq!(
+            parse_reply(&read, 1).unwrap(),
+            Some(Value::Str("stopping".into()))
+        );
     }
 
     #[test]

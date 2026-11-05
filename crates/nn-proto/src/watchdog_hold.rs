@@ -81,6 +81,13 @@ pub const REASON_LIMIT_FLOOR_RESTORED: &str = "limit_floor_restored";
 /// agent signs it as `limit_floor_not_restored`.
 pub const REASON_LIMIT_FLOOR_NOT_RESTORED: &str = "limit_floor_not_restored";
 
+/// Lot 273d (the review of #492): before a respawn, the watchdog found
+/// systemd's copy of our units below the floors (the next start applies
+/// it: a `memory.max` of one page kills the agent at its exec); the detail
+/// says what, whether the reload it asked was confirmed or withheld, and
+/// what stayed below. The agent signs it as `systemd_copy_below_floor`.
+pub const REASON_COPY_BEFORE_RESPAWN: &str = "systemd_copy_before_respawn";
+
 /// One hold (or supervision event), as the watchdog records it at
 /// [`HOLD_PATH`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

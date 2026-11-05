@@ -669,7 +669,7 @@ not verify, or a file that is not one — recorded and removed`.
   or its ERROR (`… attached but the kernel does not run it`) / WARN
   (`… inconclusive (…)`).
 
-## 9. The units' cgroups (lots 273, 273b and 273c)
+## 9. The units' cgroups (lots 273, 273b, 273c and 273d)
 
 The agent's and the watchdog's unit cgroups are part of what the deny
 hooks protect (the mechanism, the systemd versions and the residual:
@@ -784,4 +784,35 @@ Lot 273c (the review of #490):
 - **More resource files**: `cpuset.cpus`, `cpuset.mems`,
   `cpuset.cpus.partition`, `memory.reclaim`, `io.weight`,
   `io.bfq.weight`.
+
+Lot 273d (the review of #492):
+
+- **A slice of the units' own**, `northnarrow.slice` (both units
+  `Slice=northnarrow.slice`): `system.slice.d` no longer reaches them. The
+  slice refuses a manual stop, its drop-in directories refuse a new entry
+  outside a window like the units', and its resource files are refused
+  like theirs (its floors follow the host: a quarter of its memory between
+  544 MiB and 1 GiB, an eighth of its CPUs between half a CPU and one).
+- **Reloads are confirmed** (systemd's `Reloading(false)`); one not
+  confirmed within 30 s is a signed `failed` and a `systemd_reload`
+  degradation. A repeated refusal of one file is verified against
+  systemd's copy instead of skipped, and after a confirmed reload a file
+  left at its floor goes back to its configured value.
+- **The watchdog reads systemd's copy of our units before each respawn**
+  and reloads it when it is below the floors (signed by the agent as
+  `systemd_copy_below_floor`).
+- **Our units' own drop-ins made inside a window** are judged at its
+  close: a harmful one is moved to `/var/lib/northnarrow/quarantine/dropins/`
+  (in the window's signed close record) and systemd reloads.
+- **A harmful host drop-in is a degradation while it is on disk**
+  (`host_dropins`, in `nn-admin status --key`, the manifest, the
+  heartbeat), and `nn-admin trusted-installer-grant` warns when one is on
+  disk. A sandbox or capability setting of `service.d` that would break
+  the agent is a separate warning (`unit_dropin_breaks_agent`).
+- **`io.prio.class`** is protected, and **the critical sysctls**
+  (`vm.overcommit_*`, `vm.max_map_count`, `kernel.pid_max`,
+  `kernel.threads-max`, `kernel.sched_rt_runtime_us`) are refused a
+  harmful value outside a window (signed `sysctl`) and put back by the
+  integrity round when one was set at boot or inside a window
+  (`sysctl_restored`).
 

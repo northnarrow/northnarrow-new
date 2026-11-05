@@ -16,10 +16,27 @@
  *        nn-iou-probe --open-write <file>   open O_WRONLY|O_APPEND, write nothing
  *        nn-iou-probe --unlink <path>
  *        nn-iou-probe --rename <old> <new>
+ *        nn-iou-probe --write-async <file> <text>   (lot 273d, the review of
+ *            #497, D2) open <file> O_WRONLY, then IORING_OP_WRITE of <text>
+ *            at offset 0 with IOSQE_ASYNC: an io-wq worker runs it — the
+ *            process first writes <text> to /dev/null, so a worker born at
+ *            that return carries that write's registers
+ *        nn-iou-probe --write-linked <file> <text>   (the re-review of #497,
+ *            NR1) a worker born OUTSIDE io_uring_enter: a READ of an empty
+ *            pipe (armed on poll: no worker yet) linked to an IOSQE_ASYNC
+ *            WRITE of <text> to <file>; the process then writes <text> to
+ *            the pipe with write(2), and that syscall's return runs the
+ *            wakeup's task_work — the read completes, the write is queued
+ *            to io-wq, and its worker is created there, with write(2)'s
+ *            registers: the pipe's buffer, <text>. A judge that read them
+ *            would see a write(2) of <text> (the code before D2 did); a
+ *            worker that existed before the pipe write (the read punted at
+ *            submit) makes the run no proof, and says so ("setup:")
  *        nn-iou-probe --modes               list the tamper modes
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/io_uring.h>
@@ -110,17 +127,145 @@ static const char *errno_name(int e)
     }
 }
 
+/* Queue one SQE without entering the kernel. */
+static void ring_push(struct ring *r, const struct io_uring_sqe *in)
+{
+    unsigned tail = *r->sq_tail;
+    unsigned idx = tail & *r->sq_mask;
+    r->sqes[idx] = *in;
+    r->sq_array[idx] = idx;
+    __atomic_store_n(r->sq_tail, tail + 1, __ATOMIC_RELEASE);
+}
+
+/* The process's io-wq workers (threads named iou-wrk-<pid>). */
+static int io_workers(void)
+{
+    DIR *d = opendir("/proc/self/task");
+    if (!d)
+        return -1;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.')
+            continue;
+        char path[300], comm[32] = {0};
+        snprintf(path, sizeof path, "/proc/self/task/%s/comm", e->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            continue;
+        if (fgets(comm, sizeof comm, f) && strncmp(comm, "iou-wrk-", 8) == 0)
+            n++;
+        fclose(f);
+    }
+    closedir(d);
+    return n;
+}
+
+/* --write-linked <file> <text>: see the usage above. */
+static int write_linked(const char *file, const char *text)
+{
+    size_t n = strlen(text);
+    if (n == 0 || n > 64) {
+        fprintf(stderr, "write-linked: 1 to 64 bytes of text\n");
+        return 2;
+    }
+    struct ring r;
+    if (ring_init(&r, 8) < 0) {
+        printf("setup: io_uring_setup failed (%s)\n", errno_name(errno));
+        return 2;
+    }
+    int fd = open(file, O_WRONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        printf("write-linked %s: open errno=%s\n", file, errno_name(errno));
+        return 1;
+    }
+    int p[2];
+    if (pipe(p) < 0) {
+        printf("setup: pipe failed (%s)\n", errno_name(errno));
+        return 2;
+    }
+    char rbuf[64];
+    struct io_uring_sqe rd, wr;
+    memset(&rd, 0, sizeof rd);
+    rd.opcode = IORING_OP_READ;
+    rd.fd = p[0];
+    rd.addr = (uint64_t)(uintptr_t)rbuf;
+    rd.len = (uint32_t)n;
+    rd.flags = IOSQE_IO_LINK;
+    rd.user_data = 1;
+    memset(&wr, 0, sizeof wr);
+    wr.opcode = IORING_OP_WRITE;
+    wr.fd = fd;
+    wr.addr = (uint64_t)(uintptr_t)text;
+    wr.len = (uint32_t)n;
+    wr.off = 0;
+    wr.flags = IOSQE_ASYNC;
+    wr.user_data = 2;
+    ring_push(&r, &rd);
+    ring_push(&r, &wr);
+    if (syscall(__NR_io_uring_enter, r.fd, 2, 0, 0, NULL, 0) < 0) {
+        printf("setup: io_uring_enter failed (%s)\n", errno_name(errno));
+        return 2;
+    }
+    int before = io_workers();
+    /* the syscall whose return runs the task_work that creates the worker */
+    ssize_t w = write(p[1], text, n);
+    if (w != (ssize_t)n) {
+        printf("setup: the pipe write failed (%s)\n", errno_name(errno));
+        return 2;
+    }
+    int res = 1, seen = 0;
+    while (seen < 2) {
+        if (syscall(__NR_io_uring_enter, r.fd, 0, 1, IORING_ENTER_GETEVENTS, NULL, 0) < 0) {
+            printf("setup: io_uring_enter failed (%s)\n", errno_name(errno));
+            return 2;
+        }
+        unsigned head = *r.cq_head;
+        while (head != __atomic_load_n(r.cq_tail, __ATOMIC_ACQUIRE)) {
+            struct io_uring_cqe *c = &r.cqes[head & *r.cq_mask];
+            if (c->user_data == 2)
+                res = c->res;
+            seen++;
+            head++;
+        }
+        __atomic_store_n(r.cq_head, head, __ATOMIC_RELEASE);
+    }
+    int after = io_workers();
+    close(fd);
+    if (before != 0 || after < 1) {
+        printf("setup: io-wq workers %d before the pipe write, %d after: the worker was not born at "
+               "write(2)'s return, no proof (write res %d)\n", before, after, res);
+        return 2;
+    }
+    if (res >= 0) {
+        printf("write-linked %s through the ring: wrote %d bytes (a worker born at write(2)'s return)\n",
+               file, res);
+        return 0;
+    }
+    printf("write-linked %s through the ring (a worker born at write(2)'s return): errno=%s\n", file,
+           errno_name(-res));
+    return 1;
+}
+
 /* One tamper request through the ring; returns the process exit code. */
 static int tamper_mode(int argc, char **argv)
 {
     const char *mode = argv[1];
     if (strcmp(mode, "--modes") == 0) {
-        printf("open-write unlink rename\n");
+        printf("open-write unlink rename write-async write-linked\n");
         return 0;
     }
+    if (strcmp(mode, "--write-linked") == 0) {
+        if (argc != 4) {
+            fprintf(stderr, "usage: %s --write-linked <file> <text>\n", argv[0]);
+            return 2;
+        }
+        return write_linked(argv[2], argv[3]);
+    }
     int is_rename = strcmp(mode, "--rename") == 0;
-    if (argc != (is_rename ? 4 : 3)) {
-        fprintf(stderr, "usage: %s --open-write <file> | --unlink <path> | --rename <old> <new>\n",
+    int is_write = strcmp(mode, "--write-async") == 0;
+    if (argc != (is_rename || is_write ? 4 : 3)) {
+        fprintf(stderr, "usage: %s --open-write <file> | --unlink <path> | --rename <old> <new> | --write-async <file> <text>\n",
                 argv[0]);
         return 2;
     }
@@ -148,6 +293,31 @@ static int tamper_mode(int argc, char **argv)
         res = ring_run(&r, &sqe);
         if (res == 0) {
             printf("unlink %s through the ring: unlinked\n", argv[2]);
+            return 0;
+        }
+    } else if (is_write) {
+        int fd = open(argv[2], O_WRONLY | O_NOFOLLOW);
+        if (fd < 0) {
+            printf("write-async %s: open errno=%s\n", argv[2], errno_name(errno));
+            return 1;
+        }
+        size_t n = strlen(argv[3]);
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) {
+            ssize_t w = write(dn, argv[3], n); /* the registers a worker may inherit */
+            (void)w;
+            close(dn);
+        }
+        sqe.opcode = IORING_OP_WRITE;
+        sqe.fd = fd;
+        sqe.addr = (uint64_t)(uintptr_t)argv[3];
+        sqe.len = (uint32_t)n;
+        sqe.off = 0;
+        sqe.flags = IOSQE_ASYNC;
+        res = ring_run(&r, &sqe);
+        close(fd);
+        if (res >= 0) {
+            printf("write-async %s through the ring: wrote %d bytes\n", argv[2], res);
             return 0;
         }
     } else if (is_rename) {

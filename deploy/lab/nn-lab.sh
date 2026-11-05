@@ -961,7 +961,7 @@ if sudo test -d /sys/fs/bpf/northnarrow || sudo sh -c 'ls -d /sys/fs/bpf/northna
     for u in northnarrow-watchdog northnarrow-agent; do
         sudo systemctl kill --signal=SIGTERM "$u" 2>/dev/null
         for i in $(seq 1 20); do
-            [ -z "$(sudo cat /sys/fs/cgroup/system.slice/$u.service/cgroup.procs 2>/dev/null)" ] && break
+            [ -z "$(sudo cat /sys/fs/cgroup/northnarrow.slice/$u.service/cgroup.procs /sys/fs/cgroup/system.slice/$u.service/cgroup.procs 2>/dev/null)" ] && break
             sleep 0.5
         done
         sudo systemctl kill --signal=SIGKILL "$u" 2>/dev/null
@@ -1150,7 +1150,7 @@ cmd_install() {
     guest_provision_nftables
     # External audit DEP-007: the lab installs its synced source tree (no
     # MANIFEST.sha256), which install.sh now refuses without --source-tree.
-    vcargo 'sudo ./deploy/install.sh --source-tree && sudo systemctl daemon-reload && sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog && systemctl --no-pager status northnarrow-agent northnarrow-watchdog | grep -E "Active|Loaded"'
+    vcargo 'sudo ./deploy/install.sh --source-tree && sudo systemctl daemon-reload && sudo systemctl enable --now northnarrow-agent && sleep 3 && sudo systemctl enable --now northnarrow-watchdog && systemctl --no-pager status northnarrow-agent northnarrow-watchdog | grep -E "Active|Loaded"'
 }
 
 cmd_respawn_check() {
@@ -2104,6 +2104,53 @@ if sudo journalctl --namespace=northnarrow -u northnarrow-agent _PID="$pid_after
         | sed 's/\x1b\[[0-9;]*m//g' | grep -qE 'DEFAULT LIST MODIFIED|the one an earlier release shipped'; then
     echo "FAIL: the upgraded agent found a default list edited or left over from an earlier release"; fail=1
 fi
+# Lot 273d (the lab's round 13: an upgrade that passed every check above
+# left units that were not enabled, and the next boot started no agent):
+# both units enabled, as the next boot needs them.
+for u in northnarrow-agent northnarrow-watchdog; do
+    st=$(systemctl is-enabled "$u.service" 2>/dev/null || true)
+    [[ "$st" == enabled ]] || { echo "FAIL: $u.service is ${st:-unknown} after the upgrade (systemctl is-enabled): the next boot starts no agent"; fail=1; }
+done
+(( fail == 0 )) && echo "upgrade-check: the upgrade OK; the cold boot next"
+exit $fail
+REMOTE
+    local rc=$?
+    (( rc == 0 )) || return $rc
+    # Lot 273d: every upgrade-check ends with a cold boot (powered off and
+    # on, as a host comes back after an outage) and the boot's own check —
+    # the units started by the boot, the agent's pin root and its LSM
+    # programs loaded, its health line in this boot's journal.
+    log "upgrade-check: cold boot (down, up)"
+    cmd_down
+    cmd_up
+    vssh bash -s <<'REMOTE'
+# the tree's helpers are read relative to it (round 14: without this cd the
+# health line was looked for with a lab-records.py that was not there)
+cd ~/northnarrow || exit 1
+for i in $(seq 1 180); do
+    [[ "$(systemctl is-active northnarrow-agent)" == active ]] && break
+    sleep 0.5
+done
+fail=0
+for u in northnarrow-agent northnarrow-watchdog; do
+    [[ "$(systemctl is-active "$u.service")" == active ]] || { echo "FAIL: after the cold boot $u.service is $(systemctl is-active "$u.service")"; fail=1; }
+done
+pins=$(sudo ls /sys/fs/bpf/northnarrow 2>/dev/null | wc -l)
+own=$(sudo awk '$1 ~ /^[0-9]+$/ {print $1}' /run/northnarrow/bpf-own-ids 2>/dev/null)
+n=0
+for id in $own; do sudo bpftool prog show id "$id" 2>/dev/null | grep -q " lsm " && n=$((n + 1)); done
+(( pins > 0 )) || { echo "FAIL: after the cold boot the pin root /sys/fs/bpf/northnarrow is empty or absent"; fail=1; }
+(( n > 0 )) || { echo "FAIL: after the cold boot the agent has no LSM program loaded"; fail=1; }
+pid=$(sudo cat /run/northnarrow/agent.pid 2>/dev/null)
+health=""
+for i in $(seq 1 30); do
+    health=$(sudo journalctl --namespace=northnarrow -b -u northnarrow-agent _PID="${pid:-0}" --no-pager -o json 2>/dev/null \
+        | python3 -I deploy/lab/lib/lab-records.py journal northnarrow-agent.service "${pid:-0}" INFO "anti-tamper: all LSM hooks attached " | tail -1)
+    [[ -n "$health" ]] && break
+    sleep 1
+done
+[[ -n "$health" ]] || { echo "FAIL: after the cold boot the agent (pid ${pid:-none}) logged no health line (its hooks attached)"; fail=1; }
+echo "cold boot: agent $(systemctl is-active northnarrow-agent), watchdog $(systemctl is-active northnarrow-watchdog), pin root entries $pins, own LSM programs $n; ${health:-no health line}"
 (( fail == 0 )) && echo "upgrade-check: OK"
 exit $fail
 REMOTE
@@ -2135,7 +2182,8 @@ at_tty sudo ./deploy/uninstall.sh --purge --yes --grant-key "$key" 2>&1 | grep -
 fail=0
 for f in /usr/local/bin/northnarrow-agent /usr/local/bin/northnarrow-watchdog /usr/local/bin/nn-admin \
          /etc/systemd/system/northnarrow-agent.service /etc/systemd/system/northnarrow-watchdog.service \
-         /etc/systemd/system/northnarrow-watchdog-failed.service \
+         /etc/systemd/system/northnarrow-watchdog-failed.service /etc/systemd/system/northnarrow.slice \
+         /etc/systemd/system/northnarrow.slice.d \
          /etc/systemd/journald@northnarrow.conf /etc/northnarrow /var/lib/northnarrow /run/northnarrow /sys/fs/bpf/northnarrow \
          /root/northnarrow-admin.key; do
     if sudo test -e "$f"; then echo "FAIL: $f still present"; fail=1; fi

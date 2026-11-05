@@ -303,6 +303,18 @@ case "$cmd" in
         echo inactive > "$T/state.$u"; : > "$T/cg/$u/cgroup.procs" ;;
     show)
         u=${4%.service}; echo "/../../..$T/cg/$u" ;;
+    is-enabled)
+        u=${1%.service}; st=$(cat "$T/enabled.$u" 2>/dev/null || echo enabled)
+        [ -n "$q" ] || echo "$st"
+        [ "$st" = enabled ] ;;
+    get-default) echo multi-user.target ;;
+    list-dependencies)
+        echo multi-user.target
+        for u in northnarrow-agent northnarrow-watchdog; do
+            st=$(cat "$T/enabled.$u" 2>/dev/null || echo enabled)
+            [ "$st" = enabled ] && [ ! -e "$T/unwanted.$u" ] && echo "  $u.service"
+        done
+        exit 0 ;;
     *) exit 0 ;;
 esac"#,
         );
@@ -412,6 +424,18 @@ exit 0"#,
 
     /// [`Self::install`] with the tree's agent at `agent_bin`.
     fn install_from(&self, mode: &str, upgrade: bool, key: Option<&str>, agent_bin: &str) -> Run {
+        self.install_with(mode, upgrade, key, agent_bin, "")
+    }
+
+    /// [`Self::install_from`] with `extra` (shell) set before the run.
+    fn install_with(
+        &self,
+        mode: &str,
+        upgrade: bool,
+        key: Option<&str>,
+        agent_bin: &str,
+        extra: &str,
+    ) -> Run {
         let body = section(
             "deploy/install.sh",
             "stop_nn_unit() {",
@@ -420,7 +444,7 @@ exit 0"#,
         let prelude = format!(
             "MODE={mode}; UPGRADE={}; GRANT_KEY={}\n\
              BIN_DIR=$T/bin; AGENT_BIN={agent_bin}\n\
-             PKG_RESTART_FILE=$T/pkg-restart; BPFFS_ROOT=$T/pins",
+             PKG_RESTART_FILE=$T/pkg-restart; BPFFS_ROOT=$T/pins\n{extra}",
             u8::from(upgrade),
             key.map(|k| format!("$T/{k}")).unwrap_or_default(),
         );
@@ -532,6 +556,219 @@ fn install_on_stale_pins_reports_a_refused_grant_or_a_failed_start() {
     assert_eq!(r.called(GRANT), 0, "{r:#?}");
 }
 
+/// Lot 273d (the lab's round 13): an upgrade of units that run but are not
+/// enabled — or enabled and pulled in by no boot target — would leave a host
+/// whose next boot starts no agent; it is refused before anything changes:
+/// no window asked for, nothing stopped.
+#[test]
+fn an_upgrade_of_units_the_boot_would_not_start_is_refused() {
+    let both = ["northnarrow-agent", "northnarrow-watchdog"];
+    for (case, file, want) in [
+        (
+            "disabled",
+            "enabled.northnarrow-agent",
+            "northnarrow-agent.service is disabled (systemctl is-enabled)",
+        ),
+        (
+            "unwanted",
+            "unwanted.northnarrow-watchdog",
+            "northnarrow-watchdog.service is enabled but not pulled in by the default target multi-user.target",
+        ),
+        // the review of #497 (D5, M6): enabled for this boot only
+        (
+            "runtime",
+            "enabled.northnarrow-agent",
+            "northnarrow-agent.service is enabled-runtime (systemctl is-enabled)",
+        ),
+    ] {
+        let host = Host::new(&format!("install-boot-{case}"), &both, true, true);
+        let marker = host.dir.join(file);
+        fs::write(
+            &marker,
+            match case {
+                "disabled" => "disabled\n",
+                "runtime" => "enabled-runtime\n",
+                _ => "",
+            },
+        )
+        .unwrap();
+        let r = host.install("full", true, Some("key-role"));
+        assert_eq!(r.status, 1, "{case}: {r:#?}");
+        assert!(r.stderr.contains(&format!("REFUSED — {want}")), "{case}: {r:#?}");
+        assert!(r.stderr.contains("Nothing was changed."), "{case}: {r:#?}");
+        assert!(
+            r.stderr
+                .contains("install.sh:   systemctl enable northnarrow-agent northnarrow-watchdog\n"),
+            "{case}: the exact command to run: {r:#?}"
+        );
+        assert_eq!(r.called(GRANT), 0, "{case}: {r:#?}");
+        assert!(
+            !r.calls.iter().any(|c| c.starts_with("systemctl kill")),
+            "{case}: {r:#?}"
+        );
+        assert_eq!(
+            fs::read_to_string(host.dir.join("state.northnarrow-agent")).unwrap(),
+            "active\n",
+            "{case}: still running"
+        );
+    }
+}
+
+/// The re-review of #497 (RR2): the drop-ins of our units' directories
+/// the tree's agent would quarantine are listed and the run refused before
+/// anything is stopped — unless the operator accepts their move
+/// (`--accept-dropin-quarantine`: the tree's agent moves them, then the
+/// upgrade goes on); a move that fails refuses it too. The check runs once
+/// the window is open (R009, lot 278), or with no agent left (an install
+/// over stopped units); a tree agent without the check (an older
+/// release) is a warning.
+#[test]
+fn the_operator_s_drop_ins_the_agent_would_quarantine_refuse_the_run_unless_accepted() {
+    const CHECK: &str = "tree-agent --own-dropins check";
+    const MOVE: &str = "tree-agent --own-dropins quarantine";
+    let both = ["northnarrow-agent", "northnarrow-watchdog"];
+    let d = "/etc/systemd/system/northnarrow-agent.service.d";
+    let tree_agent = |host: &Host, check_rc: u8, move_rc: u8| {
+        let tree = host.dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        write_exec(
+            &tree.join("northnarrow-agent"),
+            &format!(
+                r#"case "$*" in
+    --version) echo 'northnarrow-agent 0.0.2' ;;
+    "--own-dropins check")
+        echo "tree-agent $*" >> "$NN_TEST_DIR/calls"
+        [ {check_rc} = 3 ] && printf '%s\n' \
+            "would move {d}/10-pin.conf: found by the installer's check, sets CPUAffinity=0: fewer than the host's online ones" \
+            "would move {d}/override.conf: found by the installer's check, EnvironmentFile=/etc/default/northnarrow-agent lies outside /etc/northnarrow/"
+        exit {check_rc} ;;
+    "--own-dropins quarantine")
+        echo "tree-agent $*" >> "$NN_TEST_DIR/calls"
+        echo "moved {d}/10-pin.conf -> /var/lib/northnarrow/quarantine/dropins/1-x: found by the installer's check"
+        exit {move_rc} ;;
+esac
+exit 0"#
+            ),
+        );
+        "$T/tree/northnarrow-agent"
+    };
+    let running = |r: &Run, host: &Host, case: &str| {
+        assert!(
+            !r.calls.iter().any(|c| c.starts_with("systemctl kill")),
+            "{case}: {r:#?}"
+        );
+        assert_eq!(
+            fs::read_to_string(host.dir.join("state.northnarrow-agent")).unwrap(),
+            "active\n",
+            "{case}: still running"
+        );
+    };
+    // listed and refused, nothing stopped; the window the run opened named
+    let host = Host::new("install-dropins-refused", &both, true, true);
+    let bin = tree_agent(&host, 3, 0);
+    let r = host.install_from("full", true, Some("key-role"), bin);
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert!(r.index(GRANT) < r.index(CHECK), "{r:#?}");
+    for want in [
+        &format!("install.sh:   {d}/10-pin.conf: found by the installer's check, sets CPUAffinity=0"),
+        &format!("install.sh:   {d}/override.conf: found by the installer's check, EnvironmentFile=/etc/default/northnarrow-agent lies outside"),
+        "REFUSED — remove them",
+        "--accept-dropin-quarantine",
+        "Nothing was changed (the trusted-installer window this run opened ends at its deadline).",
+    ] {
+        assert!(r.stderr.contains(want), "{want}: {r:#?}");
+    }
+    assert_eq!(r.called(MOVE), 0, "{r:#?}");
+    running(&r, &host, "refused");
+
+    // accepted: the tree's agent moves them, the upgrade goes on
+    let host = Host::new("install-dropins-accepted", &both, true, true);
+    let bin = tree_agent(&host, 3, 0);
+    let r = host.install_with(
+        "full",
+        true,
+        Some("key-role"),
+        bin,
+        "ACCEPT_DROPIN_QUARANTINE=1",
+    );
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert!(r.index(CHECK) < r.index(MOVE), "{r:#?}");
+    assert!(
+        r.stdout.contains(&format!(
+            "install.sh: moved {d}/10-pin.conf -> /var/lib/northnarrow/quarantine/dropins/"
+        )),
+        "{r:#?}"
+    );
+
+    // accepted, but a move failed: refused, nothing stopped
+    let host = Host::new("install-dropins-move-failed", &both, true, true);
+    let bin = tree_agent(&host, 3, 1);
+    let r = host.install_with(
+        "full",
+        true,
+        Some("key-role"),
+        bin,
+        "ACCEPT_DROPIN_QUARANTINE=1",
+    );
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert!(r.stderr.contains("a drop-in could not be moved"), "{r:#?}");
+    running(&r, &host, "move failed");
+
+    // none: the upgrade goes on, nothing moved
+    let host = Host::new("install-dropins-none", &both, true, true);
+    let bin = tree_agent(&host, 0, 0);
+    let r = host.install_from("full", true, Some("key-role"), bin);
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert_eq!((r.called(CHECK), r.called(MOVE)), (1, 0), "{r:#?}");
+
+    // an older tree agent with no such check: a warning
+    let host = Host::new("install-dropins-older", &both, true, true);
+    let bin = tree_agent(&host, 2, 0);
+    let r = host.install_from("full", true, Some("key-role"), bin);
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert!(
+        r.stderr
+            .contains("could not judge the drop-ins of its units' directories (exit 2)"),
+        "{r:#?}"
+    );
+
+    // an install over stopped units: checked with no agent to judge the
+    // exec, no window to name
+    let host = Host::new("install-dropins-stopped", &[], false, true);
+    let bin = tree_agent(&host, 3, 0);
+    let r = host.install_from("full", false, None, bin);
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert_eq!(r.called(GRANT), 0, "{r:#?}");
+    assert!(
+        r.stderr.contains("install.sh: Nothing was changed.\n"),
+        "{r:#?}"
+    );
+}
+
+/// The coordinator's decision on #497's `NN_` drop-ins: the agent's `NN_`
+/// settings in its units' drop-ins are kept configuration — listed by the
+/// upgrade, never a refusal (an operator of the exec policy upgrades).
+#[test]
+fn an_upgrade_lists_the_agent_s_nn_settings_as_kept_configuration() {
+    let both = ["northnarrow-agent", "northnarrow-watchdog"];
+    let host = Host::new("install-dropins-kept", &both, true, true);
+    let tree = host.dir.join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    write_exec(
+        &tree.join("northnarrow-agent"),
+        r#"case "$*" in
+    --version) echo 'northnarrow-agent 0.0.2' ;;
+    "--own-dropins check") echo "would keep NN_EXEC_POLICY=audit set by /etc/systemd/system/northnarrow-agent.service.d/40-policy.conf"; exit 0 ;;
+esac
+exit 0"#,
+    );
+    let r = host.install_from("full", true, Some("key-role"), "$T/tree/northnarrow-agent");
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert!(r.stdout.contains("install.sh: kept configuration in the drop-ins of the agent's own units (each setting signed by the agent):"), "{r:#?}");
+    assert!(r.stdout.contains("install.sh:   NN_EXEC_POLICY=audit set by /etc/systemd/system/northnarrow-agent.service.d/40-policy.conf"), "{r:#?}");
+    assert!(!r.stderr.contains("REFUSED"), "{r:#?}");
+}
+
 /// A running install still takes the upgrade path: nothing extra started,
 /// both units restarted at the end; without --upgrade it is refused.
 #[test]
@@ -615,8 +852,21 @@ fn install_executes_the_tree_s_agent_only_in_tree_version() {
         body.contains("new_ver=$(exec \"$AGENT_BIN\" --version"),
         "{body}"
     );
+    // the re-review of #497 (RR2): the drop-in check, and the quarantine
+    // the operator accepted, are the tree's agent's too, run the same way
+    assert!(
+        body.contains("DROPINS_FOUND=$(exec \"$AGENT_BIN\" --own-dropins check"),
+        "{body}"
+    );
+    let quarantine = section("deploy/install.sh", "tree_dropins_quarantine() {", "\n}\n");
+    assert!(
+        quarantine.contains("DROPINS_MOVED=$(exec \"$AGENT_BIN\" --own-dropins quarantine"),
+        "{quarantine}"
+    );
     let start = text.find("tree_version() {").unwrap();
     let end = start + body.len();
+    let q_start = text.find("tree_dropins_quarantine() {").unwrap();
+    let q_end = q_start + quarantine.len();
     let mut at = 0;
     for (n, line) in text.lines().enumerate() {
         let here = at;
@@ -629,7 +879,7 @@ fn install_executes_the_tree_s_agent_only_in_tree_version() {
         if mentions.is_empty() {
             continue;
         }
-        let in_tree_version = (start..end).contains(&here);
+        let in_tree_version = (start..end).contains(&here) || (q_start..q_end).contains(&here);
         for m in &mentions {
             if m.runs() {
                 assert!(
@@ -1104,7 +1354,9 @@ fn the_watchdog_failure_handler_ships_with_the_units() {
     assert!(install.contains(&format!(
         "install_unit \"$WATCHDOG_FAILED_UNIT_SRC\" \"$UNIT_DIR/{UNIT}.nn-new\""
     )));
-    assert!(install.contains("\"$UNIT_DIR/northnarrow-watchdog-failed.service\"; do"));
+    assert!(install.contains(
+        "\"$UNIT_DIR/northnarrow-watchdog-failed.service\" \"$UNIT_DIR/northnarrow.slice\"; do"
+    ));
     assert!(install.contains(
         "for f in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do echo \"$UNIT_DIR/$f.service\"; done"
     ));
@@ -1128,6 +1380,54 @@ fn the_watchdog_failure_handler_ships_with_the_units() {
         "rpm %files"
     );
     assert!(read("deploy/release/mk-tarball.sh").contains("deploy/systemd"));
+}
+
+/// Lot 273d (the review of #492): the units' slice of their own ships,
+/// switches and leaves with them — `system.slice.d` no longer reaches the
+/// agent and the watchdog — and both units name it.
+#[test]
+fn the_units_slice_ships_with_the_units() {
+    const SLICE: &str = "northnarrow.slice";
+    let unit = read(&format!("deploy/systemd/{SLICE}"));
+    for want in ["[Slice]", "RefuseManualStop=yes", "IgnoreOnIsolate=yes"] {
+        assert!(unit.contains(want), "{want}");
+    }
+    for u in ["northnarrow-agent.service", "northnarrow-watchdog.service"] {
+        assert!(
+            read(&format!("deploy/systemd/{u}")).contains("\nSlice=northnarrow.slice\n"),
+            "{u}"
+        );
+    }
+    let install = read("deploy/install.sh");
+    for want in [
+        "SLICE_UNIT_SRC=\"$REPO_ROOT/deploy/systemd/northnarrow.slice\"",
+        "require_file \"$SLICE_UNIT_SRC\"",
+        "install_unit \"$SLICE_UNIT_SRC\" \"$UNIT_DIR/northnarrow.slice.nn-new\"",
+        "\"$UNIT_DIR/northnarrow.slice\"; do",
+        "    echo \"$UNIT_DIR/northnarrow.slice\"",
+        "/etc/systemd/system/northnarrow.slice; do",
+    ] {
+        assert!(install.contains(want), "{want}");
+    }
+    let uninstall = read("deploy/uninstall.sh");
+    assert!(uninstall.contains("rm -f \"$UNIT_DIR/northnarrow.slice\""));
+    assert!(uninstall.contains("\"$DROPIN_ROOT/northnarrow.slice.d\""));
+    let packages = read("deploy/release/mk-packages.sh");
+    assert!(packages.contains(
+        "install -m 0644 deploy/systemd/northnarrow.slice \"$root/usr/lib/systemd/system/northnarrow.slice\""
+    ));
+    assert!(
+        packages.contains("/usr/lib/systemd/system/northnarrow.slice\n"),
+        "rpm %files"
+    );
+    assert!(
+        read(".github/workflows/release.yml").contains("usr/lib/systemd/system/northnarrow.slice")
+    );
+    // the slice's drop-in directories, made empty for the agent to register
+    // NOCREATE
+    assert!(read("deploy/systemd/northnarrow-agent.service").contains(
+        "/etc/systemd/system/northnarrow.slice.d /run/systemd/system/northnarrow.slice.d"
+    ));
 }
 
 // ── Lab PR 220: the transactional upgrade and the blocking provenance ────
@@ -1257,8 +1557,24 @@ case "$cmd" in
         u=${{1%.service}}; st=$(cat "$T/state.$u" 2>/dev/null || echo inactive)
         [ -n "$q" ] || echo "$st"
         [ "$st" = active ] ;;
-    is-enabled) [ -e "$T/enabled.${{1%.service}}" ] ;;
-    enable) for a; do : > "$T/enabled.${{a%.service}}"; done ;;
+    is-enabled)
+        # the marker's content is the state (the review of #497, D5:
+        # `enable --runtime` is "enabled-runtime", exit 0 as systemd's)
+        if [ -e "$T/enabled.${{1%.service}}" ]; then
+            st=$(cat "$T/enabled.${{1%.service}}"); [ -n "$st" ] || st=enabled
+            [ -n "$q" ] || echo "$st"
+        else [ -n "$q" ] || echo disabled; exit 1; fi ;;
+    get-default) echo multi-user.target ;;
+    list-dependencies)
+        echo multi-user.target
+        for u in northnarrow-agent northnarrow-watchdog; do
+            [ -e "$T/enabled.$u" ] && [ ! -e "$T/unwanted.$u" ] && echo "  $u.service"
+        done
+        exit 0 ;;
+    enable)
+        st=enabled
+        for a; do [ "$a" = --runtime ] && st=enabled-runtime; done
+        for a; do case "$a" in --*) ;; *) echo "$st" > "$T/enabled.${{a%.service}}" ;; esac; done ;;
     disable) for a; do /bin/rm -f "$T/enabled.${{a%.service}}"; done ;;
     start)
         u=${{1%.service}}
@@ -1286,7 +1602,9 @@ case "$cmd" in
             MainPID) cat "$T/mainpid.$u" 2>/dev/null || echo 0 ;;
         esac ;;
     daemon-reload)
-        if [ -e "$T/fail-daemon-reload" ]; then /bin/rm -f "$T/fail-daemon-reload"; exit 1; fi ;;
+        if [ -e "$T/fail-daemon-reload" ]; then /bin/rm -f "$T/fail-daemon-reload"; exit 1; fi
+        # lot 273d: a switch that loses the watchdog's enablement link
+        if [ -e "$T/lose-enable" ]; then /bin/rm -f "$T/lose-enable" "$T/enabled.northnarrow-watchdog"; fi ;;
     *) exit 0 ;;
 esac"#
             ),
@@ -1459,6 +1777,8 @@ exec /bin/rm "$@""#
 FAIL={af}; READS_MARKER={marker}
 case "${{1:-}}" in
     --version) echo "northnarrow-agent {v}"; exit 0 ;;
+    --own-dropins) echo "own-dropins ${{2:-}}" >> "$NN_TEST_DIR/own-dropins.calls"
+        [ -s "$NN_TEST_DIR/own-dropins" ] && {{ cat "$NN_TEST_DIR/own-dropins"; exit 3; }}; exit 0 ;;
     __nn_test_boot) ;;
     *) exit 0 ;;
 esac
@@ -1735,6 +2055,79 @@ fn started(r: &Run, unit: &str) -> Vec<String> {
         .iter()
         .filter_map(|c| c.strip_prefix(&prefix).map(str::to_string))
         .collect()
+}
+
+/// Lot 273d: running is not enough — an upgrade whose switch lost a unit's
+/// enablement fails its health check (the next boot would start no agent)
+/// and is rolled back: the old release back, both units enabled again.
+#[test]
+fn an_upgrade_that_leaves_a_unit_not_enabled_is_rolled_back() {
+    let lab = Lab::new("enable-rollback");
+    lab.install_old();
+    lab.binaries("new", NEW);
+    fs::write(lab.root.join("lose-enable"), "").unwrap();
+    let r = lab.upgrade();
+    assert_ne!(r.status, 0, "{r:#?}");
+    assert!(
+        r.stderr.contains(
+            "health check FAILED: northnarrow-watchdog.service is disabled (systemctl is-enabled) — the next boot would start no agent"
+        ),
+        "{r:#?}"
+    );
+    assert!(!r.stdout.contains("UPGRADE complete"), "{r:#?}");
+    assert_eq!(
+        fs::read(lab.root.join("bin/northnarrow-agent")).unwrap(),
+        fs::read(lab.case.join("old/target/release/northnarrow-agent")).unwrap(),
+        "the old release restored"
+    );
+    for u in ["northnarrow-agent", "northnarrow-watchdog"] {
+        // the review of #497 (D5, M9): enabled for every boot, not the
+        // runtime only
+        assert_eq!(
+            fs::read_to_string(lab.root.join(format!("enabled.{u}")))
+                .unwrap_or_default()
+                .trim(),
+            "enabled",
+            "{u} enabled again: {r:#?}"
+        );
+    }
+    let rows = lab.audit_rows("upgrade_rolled_back");
+    assert_eq!(rows.len(), 1, "{r:#?}");
+    assert_eq!(rows[0]["extra"]["stage"], "health_check");
+}
+
+/// The review of #497 (D5, M7): the rollback enables again only what was
+/// enabled before the run — a unit the operator disabled stays disabled.
+/// (Units not running: no preflight, the switch fails and is rolled back.)
+#[test]
+fn a_rollback_leaves_a_unit_the_operator_disabled_disabled() {
+    let lab = Lab::new("enable-operator");
+    lab.install_old();
+    for u in ["northnarrow-agent", "northnarrow-watchdog"] {
+        fs::write(lab.root.join(format!("state.{u}")), "inactive\n").unwrap();
+        fs::write(lab.root.join("cg").join(u).join("cgroup.procs"), "").unwrap();
+    }
+    let _ = fs::remove_dir_all(lab.root.join("pins"));
+    assert!(lab.systemctl(&["disable", "northnarrow-watchdog.service"]));
+    lab.binaries("new", NEW);
+    fs::write(lab.root.join("fail-daemon-reload"), "").unwrap();
+    let r = lab.install("new", &["--source-tree"]);
+    assert_ne!(r.status, 0, "{r:#?}");
+    assert!(
+        r.stderr.contains("UPGRADE FAILED") || r.stderr.contains("rolling back"),
+        "{r:#?}"
+    );
+    assert_eq!(
+        fs::read_to_string(lab.root.join("enabled.northnarrow-agent"))
+            .unwrap_or_default()
+            .trim(),
+        "enabled",
+        "{r:#?}"
+    );
+    assert!(
+        !lab.root.join("enabled.northnarrow-watchdog").exists(),
+        "the operator's disable kept: {r:#?}"
+    );
 }
 
 /// Lab PR 220 (P0 C-45 / G-07 / TD-09): the new agent starts but never logs
@@ -2434,6 +2827,37 @@ impl Lab {
         )
         .unwrap();
     }
+}
+
+/// The short re-check of #497 (RB1): a package's configure step runs the
+/// installed agent's drop-in check as a warning — each one named, the
+/// remedy given, nothing moved, the hook not failed.
+#[test]
+fn the_package_configure_step_warns_of_the_drop_ins_the_agent_judges_harmful() {
+    let lab = Lab::new("pkg-dropins");
+    lab.unpacked();
+    let d = "/etc/systemd/system/northnarrow-agent.service.d";
+    fs::write(
+        lab.root.join("own-dropins"),
+        format!("would move {d}/60-env.conf: found by the installer's check, EnvironmentFile=/etc/default/nn lies outside /etc/northnarrow/\n"),
+    )
+    .unwrap();
+    let _ = fs::remove_file(lab.root.join("own-dropins.calls"));
+    let r = lab.package(&["--package-configure"]);
+    assert_eq!(r.status, 0, "the hook never fails on it: {r:#?}");
+    for want in [
+        "install.sh: WARNING: the drop-in directories of the agent's own units hold drop-ins",
+        &format!("install.sh:   {d}/60-env.conf: found by the installer's check, EnvironmentFile=/etc/default/nn"),
+        "UPGRADE_NOTES_WAVE4.md section 9",
+    ] {
+        assert!(r.stderr.contains(want), "{want}: {r:#?}");
+    }
+    assert_eq!(
+        fs::read_to_string(lab.root.join("own-dropins.calls")).unwrap(),
+        "own-dropins check\n",
+        "checked once, never asked to move"
+    );
+    assert!(r.stdout.contains("health check passed"), "{r:#?}");
 }
 
 /// External audit DEP-010 covered a failed operation; lab PR 220 covers the

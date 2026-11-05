@@ -585,3 +585,49 @@ fn anti_tamper_reports_what_only_asked_for() {
     );
     assert_eq!(run("", "report_unreported"), "fail=0\n");
 }
+
+/// Lot 273d (the lab's round 13: after a purge the lab's install STARTED the
+/// units without enabling them, an upgrade passed every check, and the next
+/// boot started no agent): the install step enables them as the operator
+/// does (`systemctl enable --now`, docs/operator/INSTALL_UPGRADE_UNINSTALL.md),
+/// and every upgrade-check ends with the units' enablement checked, a cold
+/// boot (down, up) and the boot's own check — the units active, the pin
+/// root and the agent's LSM programs there, its health line in this boot.
+#[test]
+fn the_lab_enables_what_it_installs_and_every_upgrade_check_ends_with_a_cold_boot() {
+    let lab = read(NN_LAB);
+    let install = section(&lab, "cmd_install() {", "\n}\n");
+    assert!(
+        install.contains("sudo systemctl enable --now northnarrow-agent && sleep 3 && sudo systemctl enable --now northnarrow-watchdog"),
+        "the install step enables the units"
+    );
+    assert!(!install.contains("sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog && systemctl --no-pager status"));
+    let upgrade = section(&lab, "cmd_upgrade_check() {", "\ncmd_uninstall_check() {");
+    let enabled = upgrade
+        .find("st=$(systemctl is-enabled \"$u.service\"")
+        .expect("upgrade-check reads the units' enablement");
+    let down = upgrade
+        .find("    cmd_down\n    cmd_up\n")
+        .expect("a cold boot");
+    let boot = upgrade
+        .rfind("lab-records.py journal northnarrow-agent.service \"${pid:-0}\" INFO \"anti-tamper: all LSM hooks attached \"")
+        .expect("the boot's health line read");
+    assert!(
+        enabled < down && down < boot,
+        "enablement, then the cold boot, then its check"
+    );
+    // its own remote shell starts in the tree, as the first one does (round
+    // 14: lab-records.py was looked for in the home directory)
+    let cd = upgrade[down..]
+        .find("cd ~/northnarrow || exit 1")
+        .map(|i| i + down)
+        .expect("the cold boot's check runs in the tree");
+    assert!(cd < boot);
+    assert!(upgrade.contains("(( pins > 0 )) ||"));
+    assert!(upgrade.contains("(( n > 0 )) ||"));
+    assert!(
+        upgrade.ends_with("echo \"upgrade-check: OK\"\nexit $fail\nREMOTE\n}")
+            || upgrade
+                .contains("(( fail == 0 )) && echo \"upgrade-check: OK\"\nexit $fail\nREMOTE\n}")
+    );
+}

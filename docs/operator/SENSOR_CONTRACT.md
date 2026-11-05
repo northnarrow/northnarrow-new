@@ -67,7 +67,7 @@ the heartbeat's.
 | `exec_check` | ExecCheck | `lsm:bprm_check_security`; `tracepoint:syscalls/sys_enter_execve` with `--exec-sensor tracepoint`, a `linux_binprm` offset missing, the LSM program refused, or `bpf` not in the active LSM list (the path read from the caller's memory, no executable identity, no exec guards) | none; opt-in: the exec policy refuses with `EACCES` | blind | — | filename 255 B, exe path 31 B per component, comm 15 B | `exec_check` |
 | `tcp_connect` | TcpConnect, NetFlow | `kprobe:tcp_v4_connect+tcp_v6_connect` | none; opt-in (`--net-connect-deny`): `socket_connect` refuses a blocklisted destination | blind; the opt-in deny lets a connect through when it cannot read the destination, uncounted | — | comm 15 B | `tcp_connect` |
 | `dns_query` | DnsQuery, DnsFlood | `kprobe:udp_send_skb+udp_v6_send_skb` (and `dns_nss`, a uprobe on `libnss_resolve`); `kprobe:udp_sendmsg` with `--dns-sensor sendmsg` or without what the socket-buffer programs need (the name read from the sender's memory, IPv4 only) | none | blind | 64 queries at once then 128 a second per process, 2,048 then 1,024 per user (`dns_rate`) | query 288 B wire form (`qname_partial`, `NONLINEAR`), 252 B on the fallback, comm 15 B | `dns` |
-| `fs_protect` | FsProtectDenial | `lsm:` the 21 deny hooks (lot 273b: `file_permission`, the write deny, the seventeenth; lot 273c: `task_setrlimit`, `task_setscheduler`, `task_setnice`, `task_setioprio`, another process's limits and priorities of a protected one; and `inode_set_acl`, `inode_remove_acl`, `file_ioctl_compat` where the kernel has them; lot 273: the cgroup move guard, `inode_permission`, `fexit:cgroup_procs_write_start` and (lot 273b) `fentry:cgroup_procs_write_finish`, where the kernel's BTF has the functions in the shape they read); lot 277: the start-in-cgroup tracker — `tp_btf:cgroup_attach_task`, `sched_process_fork`, `sched_process_exit`, `fentry:cgroup_post_fork`, `fexit:cgroup_procs_write_start`, their links and maps pinned beside the pin root so the marks go on while no agent runs and through an upgrade (`docs/operator/RULE_POLICY.md` §2.1) | **kernel deny** (the tracker refuses nothing: it marks a process not started in its cgroup, and the agent applies no exemption by cgroup or unit to it) | **fail-open**: a hook that cannot read what it needs lets the operation through, counted per hook and signed (`deny_fail_open`); a missing hook, `bpf` not in the LSM list or a delivered self-test signal refuses the start unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`; the move guard absent from the kernel is signed degraded; (lot 277) the tracker not attached is signed degraded and no exemption by cgroup or unit applies, a process whose mark could not be kept is *not known* (no such exemption for it and its forks until its thread group ends) | refused signals, ptraces (lot 273c: PID 1 in attach mode), kexecs, cgroup moves, `oom_score_adj` writes, (lot 273b) writes through a descriptor and (lot 273c) `prlimit` / `sched_set*` / `setpriority` / `ioprio_set` of a protected process, and (lot 277) a move into a cgroup an exemption names (`cgroup_join`, recorded, not refused): one record per caller and operation a second, 50 a second per CPU (`task_denial_rate`); cost (lot 273c, signed in the manifest's `overhead`; Ubuntu 24.04, the BPF stats off, medians of three A/B rounds): the move guard about 62 ns a call — `git status` ×10 +13 %, `find /usr` +2 % — and the write deny about 96 ns a write to a regular file — a 2,000-file package installed and removed +4 %; a socket, a pipe, a tty leave at its `i_mode`; the tracker (lot 277) runs at every fork (a new group's state cleared, a map lookup, a byte of the "not known" map, the reset's epoch) and at the exit of a marked group, and walks at most 255 bytes of path at a migration while an exemption by cgroup or unit is in force — about 0.93 µs a fork and its exit on Ubuntu 24.04 (6.8: `cgroup_post_fork` 469 ns, `sched_process_fork` 192 ns, `sched_process_exit` 272 ns a call) and 0.6 µs on 22.04 (5.15: 269, 139, 187 ns), `run_time_ns / run_cnt` over 100,024 calls with the BPF stats' own clock reads; a fork + exit + wait (about 140 µs on the 24.04 guest, 55 µs on the 22.04 one) the same with its links detached within the rounds' spread (lot 277, the third review of #494's lab) | comm 15 B | `fs_protect` |
+| `fs_protect` | FsProtectDenial | `lsm:` the 21 deny hooks (lot 273b: `file_permission`, the write deny, the seventeenth; lot 273c: `task_setrlimit`, `task_setscheduler`, `task_setnice`, `task_setioprio`, another process's limits and priorities of a protected one; and `inode_set_acl`, `inode_remove_acl`, `file_ioctl_compat` where the kernel has them; lot 273: the cgroup move guard, `inode_permission`, `fexit:cgroup_procs_write_start` and (lot 273b) `fentry:cgroup_procs_write_finish`, where the kernel's BTF has the functions in the shape they read); lot 277: the start-in-cgroup tracker — `tp_btf:cgroup_attach_task`, `sched_process_fork`, `sched_process_exit`, `fentry:cgroup_post_fork`, `fexit:cgroup_procs_write_start`, their links and maps pinned beside the pin root so the marks go on while no agent runs and through an upgrade (`docs/operator/RULE_POLICY.md` §2.1) | **kernel deny** (the tracker refuses nothing: it marks a process not started in its cgroup, and the agent applies no exemption by cgroup or unit to it) | **fail-open**: a hook that cannot read what it needs lets the operation through, counted per hook and signed (`deny_fail_open`); a missing hook, `bpf` not in the LSM list or a delivered self-test signal refuses the start unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`; the move guard absent from the kernel is signed degraded; (lot 277) the tracker not attached is signed degraded and no exemption by cgroup or unit applies, a process whose mark could not be kept is *not known* (no such exemption for it and its forks until its thread group ends) | refused signals, ptraces (lot 273c: PID 1 in attach mode), kexecs, cgroup moves, `oom_score_adj` writes, (lot 273b) writes through a descriptor and (lot 273c) `prlimit` / `sched_set*` / `setpriority` / `ioprio_set` of a protected process, (lot 273d) a harmful write of a critical sysctl, and (lot 277) a move into a cgroup an exemption names (`cgroup_join`, recorded, not refused): one record per caller and operation a second, 50 a second per CPU (`task_denial_rate`); cost (lot 273c, signed in the manifest's `overhead`; Ubuntu 24.04, the BPF stats off, medians of three A/B rounds): the move guard about 62 ns a call — `git status` ×10 +13 %, `find /usr` +2 % — and the write deny about 96 ns a write to a regular file — a 2,000-file package installed and removed +4 %; a socket, a pipe, a tty leave at its `i_mode`; the tracker (lot 277) runs at every fork (a new group's state cleared, a map lookup, a byte of the "not known" map, the reset's epoch) and at the exit of a marked group, and walks at most 255 bytes of path at a migration while an exemption by cgroup or unit is in force — about 0.93 µs a fork and its exit on Ubuntu 24.04 (6.8: `cgroup_post_fork` 469 ns, `sched_process_fork` 192 ns, `sched_process_exit` 272 ns a call) and 0.6 µs on 22.04 (5.15: 269, 139, 187 ns), `run_time_ns / run_cnt` over 100,024 calls with the BPF stats' own clock reads; a fork + exit + wait (about 140 µs on the 24.04 guest, 55 µs on the 22.04 one) the same with its links detached within the rounds' spread (lot 277, the third review of #494's lab) | comm 15 B | `fs_protect` |
 | `module_load` | ModuleLoad | `lsm:kernel_read_file+kernel_load_data` | none | blind | — | module path 31 B per component (`path_truncated`), comm 15 B | `module_load` |
 | `io_uring` | IoUring, SensorFlood | `tracepoint:io_uring/io_uring_create+io_uring_submit_req` (or `_sqe`); without a submit tracepoint `partial` | none | blind | ring creations 64 then 128 a second per process, 512 then 256 per user; submissions one record a second per process (`io_uring_rate`) | comm 15 B | `io_uring` |
 | `bpf_syscall` | BpfSyscall | `lsm:bpf` | none (the same hook's refusals of the agent's links are `fs_protect`'s) | blind | one record per process and command a second (not counted) | comm 15 B | `bpf` |
@@ -215,6 +215,51 @@ attach. Against a
 root on the host the deny hooks (the agent's own files, maps and processes)
 and the heartbeat's verifier off the host are the defence: the manifest
 says what the agent can see, not what it cannot.
+
+**`kernel.ftrace_enabled`, the switch under the deny hooks** (lot 273d, R1
+of the external review of 04/11). On 6.0 to 7.2 a write of `0` turns every
+call site ftrace manages back into a NOP, with no error, and the BPF
+trampolines on them stop firing: the fentry/fexit sensors (`cgroup_guard`,
+`epg`, `epg_lite`, `tcp_close`, `sensor_probe`; since the merge with lots
+277 and 275 also the start-in-cgroup tracker's `fexit:cgroup_procs_write_start`
+and `fentry:cgroup_post_fork`, and the network telemetry's
+`fexit:udp_recvmsg` / `udpv6_recvmsg` and `inet_csk_accept`), the kprobes
+ftrace carries (`tcp_connect`'s among them) and, by the kernel's code, the
+BPF-LSM programs — every deny hook. With the switch at `0` (possible only
+inside a window) the tracker misses a birth by `CLONE_INTO_CGROUP` into an
+exempt cgroup (`cgroup_post_fork` silenced), and NN-L-NET-028 loses half
+its evidence; treating the tracker's marks as lost while the `ftrace_enabled`
+degradation holds is lot 280's (the short re-check of #497, NB1).
+The lab measured it on our own guests (lot 273d, C106c: the run counts of
+the agent's programs under the same load, the switch written `0` inside a
+window, then `1`): on 6.1, 6.8, 6.12 and 7.0 the BPF-LSM programs ran
+10,535 to 13,333 times with the switch on and **0 times at 0**, the kprobe
+programs 5 and 0, the fentry programs (`epg_lite`'s `commit_creds` and
+`switch_task_namespaces`, `tcp_close`) 5 to 57 and 0; the programs on
+tracepoints (`tp_btf`: fork, exit) kept running, and everything ran again
+at `1`. On 5.15 the write was `EBUSY` and nothing stopped. On 5.15 to 5.19 the write is `EBUSY` while a trampoline is
+attached; from 7.3 it is refused. So the deny hooks defend against a root
+only while the switch is on, and the agent holds it there three ways:
+
+- every write of it outside a trusted-installer window is refused by the
+  write deny itself, whatever it carries (`sysctl`, signed, ENGAGED): no
+  legitimate use is known, and with no value to judge the hook reads no
+  byte a second thread of the writer could change before the kernel
+  copies it. The agent's own restore passes by its identity, as every
+  guarded write of its does;
+- the switch is read at every build of the capability manifest (5 s): `0`,
+  or a value that cannot be read, is a signed `ftrace_enabled`
+  degradation while it holds — a worse state, so its revision is signed at
+  once and the beat's hash changes: `DEGRADED` off the host within the
+  bound below;
+- a `0` set inside a window, or before the agent's start, is put back to
+  `1` at the window's close and by the integrity round (`sysctl_restored`,
+  signed).
+
+What `0` silenced in between stays silenced: the verifier is told that it
+happened, not that the hooks held. On 5.15 a `0` set before the agent's
+start makes the trampolines' attach fail (`EBUSY`, by the kernel's code;
+not measured here): the start's own degradations name the hooks.
 
 **Worst-case delays** for a probed source blinded at random: its next
 round within 72 s (60 s, +20 % jitter), its deadline 5 s, the next build
