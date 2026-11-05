@@ -6882,6 +6882,41 @@ number in parentheses is a lab PR.
     error of a read cut by the exit; the e2e's and the lab's
     `MODPROBE_OPTIONS`/`LD_PRELOAD` kills made deterministic (a preload that
     sleeps in its constructor).
+- **Lot 283b — the kills that broke benign workloads (C10/C11; the
+  coordinator's decision of 06/11/2026 after lot 283a's corpus).**
+  - What was open: lot 283a's benign corpus (`docs/validation/BENIGN_CORPUS.md`)
+    saw every kill of a default install land on benign work — R001 on `go
+    test`, `go run` and AppImages (killed on 5.15), R013 on k3s's bundled
+    `runc` (645 kills, no pod), NN-L-FIM-007/009 on `crontab`, `install` and
+    the k3s installer (after the write), R011 on the initramfs hook `kmod` of
+    a dpkg trigger.
+  - What changed: R001/R003 hold the kill of a person's exec (`UID_MIN` and
+    up, a login shell: `DecisionHost::account_kind`, nn-linux `accounts`)
+    below COMBAT, a High record; a system account's is killed as before. R013
+    holds a `runc`'s kill (`R013_RUNC_KILL`), NN-L-FIM-007/009 the writer's
+    (`FIM_007_KILL`, `FIM_009_KILL`, outside the package and administrator
+    carve-outs); `enforce <rule>` gives each back. R011 records a root exec
+    of a system-tree program whose lineage the exec pump read at the exec
+    holds a root package manager. NN-L-AT-001's catalogue names
+    `deb-systemd-helper`'s `rmdir` of the agent's own drop-in directories.
+  - Measured (lab, ubuntu2404 6.8, the lot's agent, one round): dev — go
+    test, go run, both AppImage runs and a program from `/tmp` run 3 s by the
+    lab user are R001 High records, no kill; the same program as `www-data`
+    is killed (rc 137, the only kill of the corpus); containers — k3s's pod
+    runs to completion (31.8 s; before: none in 600 s), 0 kills, R013 53 High
+    records; db — `apt-get install --reinstall initramfs-tools` records the
+    hook twice, no kill; FIM-007 High records, 0 kills; every anti-tamper
+    refusal is of the agent's own four drop-in directories. Host: named
+    tests for each change; 30 targeted mutations, all caught by a named test;
+    the golden replays updated, every changed line explained in the PR.
+  - Open: a person's account running a payload from `/tmp` below COMBAT is a
+    record (killed at its first egress or in COMBAT); a dropper whose only
+    egress is to port 53 of a server that is no configured resolver is no
+    longer killed (golden `port53-held`); fork-only processes lost by the
+    lineage walk are covered for R011 only; an administrator's own `sudo
+    update-initramfs -u` still has its hook killed (no package in the
+    lineage); NN-L-FIM-004/023 and NET-008 keep their kill (not measured);
+    the in-session small-file threshold is not turned on.
 - **Lot 286 — tracepoint mode's mass-write carve-out folds no `..`
   through a `/proc` link (C14; the re-review of #500, N2).**
   - What was open: with no LSM `file_open` sensor, the mass-write arm

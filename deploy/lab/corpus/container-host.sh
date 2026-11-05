@@ -24,8 +24,11 @@ corpus_cleanup() {
         sudo systemctl stop docker.socket docker containerd >/dev/null 2>&1
     fi
     # rootful podman's storage, made by the package the corpus installed
-    [[ " $INSTALLED " == *" podman "* ]] && sudo rm -rf /var/lib/containers
+    # (its purge makes it again: removed after it)
+    local podman_ours=0
+    [[ " $INSTALLED " == *" podman "* ]] && podman_ours=1
     corpus_purge
+    ((podman_ours)) && sudo rm -rf /var/lib/containers
     [[ -n ${PODMAN_NEW:-} ]] && rm -rf "$HOME/.local/share/containers" "$HOME/.config/containers"
     [[ -n ${DOCKER_NEW:-} ]] && sudo rm -rf /var/lib/docker /var/lib/containerd /etc/docker
     sudo rm -rf /var/lib/rancher /etc/rancher
