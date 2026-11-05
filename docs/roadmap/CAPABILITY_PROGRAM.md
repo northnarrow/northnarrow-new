@@ -6882,3 +6882,26 @@ number in parentheses is a lab PR.
     error of a read cut by the exit; the e2e's and the lab's
     `MODPROBE_OPTIONS`/`LD_PRELOAD` kills made deterministic (a preload that
     sleeps in its constructor).
+- **Lot 286 — tracepoint mode's mass-write carve-out folds no `..`
+  through a `/proc` link (C14; the re-review of #500, N2).**
+  - What was open: with no LSM `file_open` sensor, the mass-write arm
+    judged a caller's path after folding its `..` (POS-004): a write to
+    `/proc/self/root/../home/u/x` was folded to `/proc/self/home/u/x` and
+    carved out by `/proc/`, while the kernel opened `/home/u/x`; so were
+    `/proc/self/cwd/../..`, a link elsewhere under a carved prefix then `..`
+    (`/proc/net`, a sysfs `subsystem` link), and the writer's own runtime
+    directory, tested on the raw string (`/run/user/<uid>/../../..`).
+  - What changed (`crates/nn-core/src/posture/triggers.rs`): an unresolved
+    path is judged by its lexical form (`.` and repeated slashes folded)
+    and never carved out when it holds a `..` (fail closed: it counts) or
+    goes through a process's `cwd`, `root`, `exe`, `fd/<n>`, `map_files/`
+    link, `/dev/fd/<n>` or `/dev/std{in,out,err}`. The kernel's count (LSM
+    mode) judges resolved paths and is unchanged.
+  - Measured: host tests only (a pure function of the path; no guest):
+    6 named tests (one updated); 16 targeted mutations of the new code, all
+    caught by a named test.
+  - Open: a symbolic link a user plants in their own `/run/user/<uid>/`
+    (or under an operator's carve-out) still carves out the writes made
+    through it in tracepoint mode — the text shows no link; resolving it
+    needs the kernel's path (LSM mode).
+  - Level unchanged (C14 2).

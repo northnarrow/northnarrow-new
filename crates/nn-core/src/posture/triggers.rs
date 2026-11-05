@@ -169,56 +169,62 @@ fn is_mass_write_carveout(filename: &str, extras: &[String]) -> bool {
 }
 
 /// External audit POS-004: [`is_mass_write_carveout`] for a path the caller
-/// passed (tracepoint mode), which no kernel resolved: it is judged after
-/// its `.` and `..` segments are folded, and a path through a process's
-/// `cwd`, `root` or `fd` link under `/proc` — a door to any file, not a
-/// pseudo-file — is never carved out (`/proc/self/cwd/report.docx`,
-/// `/proc/../home/u/x` evaded the mass-write count).
+/// passed (tracepoint mode), which no kernel resolved: it is judged by its
+/// [`lexical_form`] only, and never carved out when it has none
+/// (`/proc/../home/u/x`, lot 286: `/proc/self/root/../home/u/x`) or goes
+/// through a link to another view of the filesystem
+/// ([`through_proc_link`]: `/proc/self/cwd/report.docx`) — the kernel
+/// opens what the link leads to, not a pseudo-file.
 fn is_mass_write_carveout_unresolved(filename: &str, extras: &[String]) -> bool {
-    let folded = fold_dot_segments(filename);
-    if through_proc_link(&folded) {
-        return false;
-    }
-    is_mass_write_carveout(&folded, extras)
+    lexical_form(filename)
+        .is_some_and(|p| !through_proc_link(&p) && is_mass_write_carveout(&p, extras))
 }
 
-/// `path` with `.` and `..` segments and repeated slashes folded, as the
-/// kernel would walk them were there no symlink on the way.
-fn fold_dot_segments(path: &str) -> String {
+/// Lot 286: the form of an unresolved `path` a prefix test may judge —
+/// its `.` segments and repeated slashes folded — or `None` when it holds
+/// a `..` segment. The kernel climbs a `..` from wherever the links before
+/// it led, which the text does not show: `/proc/self/root/..` is `/` and
+/// `/proc/self/cwd/../..` the cwd's grandparent, both folded to `/proc`
+/// before (POS-004's fold judged them carved out); `/proc/net` is a link
+/// to `self/net`, so `/proc/net/../root/…` reaches the process's root; a
+/// sysfs link leads deeper or elsewhere in `/sys`, from where enough `..`
+/// leave it.
+fn lexical_form(path: &str) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     for seg in path.split('/') {
         match seg {
             "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
+            ".." => return None,
             s => parts.push(s),
         }
     }
     let joined = parts.join("/");
-    if path.starts_with('/') {
+    Some(if path.starts_with('/') {
         format!("/{joined}")
     } else {
         joined
-    }
+    })
 }
 
-/// `/proc/<pid|self|thread-self>[/task/<tid>]/{cwd,root,fd}/…`: a link the
-/// kernel follows to the process's directory, root or open file (an
-/// `fd/<n>` reopens that file).
+/// A path (in [`lexical_form`]) through a link the kernel follows to a
+/// process's view of the filesystem: `/proc/<pid>[/task/<tid>]/` (or
+/// `self`, `thread-self`) then `cwd`, `root` or `exe` (the link itself or
+/// anything under it), or an entry of `fd/` or `map_files/` (each reopens
+/// the file it names); and (lot 286) `/dev/fd/<n>`, `/dev/stdin`,
+/// `/dev/stdout`, `/dev/stderr`, links into `/proc/self/fd/` that the
+/// `/dev/` prefix carved out. Any second segment matches: no other entry
+/// of `/proc` holds such names, and a path that only looks like one counts.
 fn through_proc_link(path: &str) -> bool {
-    let task = |s: &str| {
-        s == "self"
-            || s == "thread-self"
-            || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-    };
-    let door = |s: &str| matches!(s, "cwd" | "root" | "fd");
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    match segs.as_slice() {
-        ["proc", who, "task", tid, link, _, ..] => task(who) && task(tid) && door(link),
-        ["proc", who, link, _, ..] => task(who) && door(link),
-        _ => false,
-    }
+    let rest = match segs.as_slice() {
+        ["dev", "fd", _, ..] | ["dev", "stdin" | "stdout" | "stderr", ..] => return true,
+        ["proc", _, "task", _, rest @ ..] | ["proc", _, rest @ ..] => rest,
+        _ => return false,
+    };
+    matches!(
+        rest,
+        ["cwd" | "root" | "exe", ..] | ["fd" | "map_files", _, ..]
+    )
 }
 
 /// A device node under `/dev` (not the `/dev/shm` and `/dev/mqueue`
@@ -1855,7 +1861,13 @@ fn tracepoint_arm<H: PostureHost>(
     let own_runtime_dir = auth
         .loginuid_of(*focal_pid)
         .map(|uid| format!("/run/user/{uid}/"));
-    let in_own_runtime = |f: &str| own_runtime_dir.as_deref().is_some_and(|d| f.starts_with(d));
+    // Lot 286: judged as the carve-out above (`/run/user/<uid>/../../../home/u/x`
+    // started with the runtime dir).
+    let in_own_runtime = |f: &str| {
+        own_runtime_dir
+            .as_deref()
+            .is_some_and(|d| lexical_form(f).is_some_and(|p| p.starts_with(d)))
+    };
     if in_own_runtime(focal_filename) {
         return false;
     }
@@ -3397,14 +3409,155 @@ mod tests {
         assert!(!fired(burst(&|i| format!("/sys/fs/cgroup/x/{i}"))));
     }
 
+    /// Lot 286 (the re-review of #500, N2): a `..` of a caller's path
+    /// climbs from where the links before it led — `/proc/self/root/..` is
+    /// `/` — and was folded into a `/proc/` path first, carved out.
+    #[test]
+    fn the_reviewers_proc_root_dotdot_write_counts() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(711, 1, "/srv/app/worker", 1), &[]);
+        let hits = tracepoint_burst(&det, 711, &|i| {
+            format!("/proc/self/root/../home/u/docs/{i}.docx")
+        });
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+        assert!(!is_mass_write_carveout_unresolved(
+            "/proc/self/root/../home/u/x",
+            &[]
+        ));
+    }
+
+    /// Lot 286: `/proc/self/cwd/../..` is the cwd's grandparent, folded
+    /// to `/proc` before.
+    #[test]
+    fn proc_self_cwd_dotdot_dotdot_write_counts() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(712, 1, "/srv/app/worker", 1), &[]);
+        let hits = tracepoint_burst(&det, 712, &|i| format!("/proc/self/cwd/../../{i}.docx"));
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+        assert!(!is_mass_write_carveout_unresolved(
+            "/proc/self/cwd/../..",
+            &[]
+        ));
+    }
+
+    /// Lot 286: a link elsewhere under a carved-out prefix, then `..`
+    /// (`/proc/net` → `self/net`; a sysfs device's `subsystem` →
+    /// `/sys/class/net`, four levels up is `/`); `.` segments and a
+    /// relative path are judged as before, and so is every other door
+    /// into a process's view: `exe`, `map_files/`, `/dev/fd/<n>`.
+    #[test]
+    fn links_then_dotdot_and_other_proc_doors_count() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(713, 1, "/srv/app/worker", 1), &[]);
+        let fired = |path: &dyn Fn(u64) -> String| {
+            tracepoint_burst(&det, 713, path).contains(&TriggerType::ConfirmedIntrusion)
+        };
+        assert!(fired(&|i| format!("/proc/net/../root/home/u/{i}")));
+        assert!(fired(&|i| format!(
+            "/sys/devices/virtual/net/lo/subsystem/../../../../home/u/{i}"
+        )));
+        assert!(fired(&|i| format!("/proc/self/./root/home/u/{i}")));
+        assert!(fired(&|i| format!("/proc/{}/exe", 1000 + i)));
+        assert!(fired(&|i| format!("/proc/self/map_files/{i}000-{i}fff")));
+        assert!(fired(&|i| format!("/dev/fd/{i}")));
+        assert!(fired(&|i| format!("sys/fs/cgroup/x/{i}")), "relative");
+        assert!(!fired(&|i| format!("/sys/fs/cgroup//./x/{i}")));
+    }
+
+    /// Lot 286: a plain write to a process's pseudo-file stays carved out.
+    #[test]
+    fn plain_proc_pid_status_write_stays_carved_out() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(714, 1, "/srv/app/worker", 1), &[]);
+        let hits = tracepoint_burst(&det, 714, &|i| format!("/proc/{}/status", 2000 + i));
+        assert!(!hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+        assert!(is_mass_write_carveout_unresolved("/proc/42/status", &[]));
+        assert!(is_mass_write_carveout_unresolved(
+            "/proc/self/task/42/oom_score_adj",
+            &[]
+        ));
+    }
+
+    /// Lot 286: `/run/udev` and `/run/systemd` keep their carve-out in
+    /// tracepoint mode, `/run/user` still counts.
+    #[test]
+    fn run_udev_and_run_systemd_keep_their_carveout_unresolved() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(715, 1, "/srv/app/worker", 1), &[]);
+        let fired = |path: &dyn Fn(u64) -> String| {
+            tracepoint_burst(&det, 715, path).contains(&TriggerType::ConfirmedIntrusion)
+        };
+        assert!(!fired(&|i| format!("/run/udev/data/c4:{i}")));
+        assert!(!fired(&|i| format!(
+            "/run/systemd/units/invocation:{i}.service"
+        )));
+        assert!(fired(&|i| format!("/run/user/1000/f{i}")));
+        assert!(is_mass_write_carveout_unresolved(
+            "/run/udev/data/b8:0",
+            &[]
+        ));
+        assert!(is_mass_write_carveout_unresolved(
+            "/run/systemd/units/x",
+            &[]
+        ));
+    }
+
+    /// Lot 286: the writer's own runtime dir is judged the same way —
+    /// `/run/user/<uid>/../../../home/…` started with it.
+    #[test]
+    fn own_runtime_dir_carveout_does_not_fold_dotdot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_loginuid_fixture(tmp.path(), 716, 1000);
+        let det = detector_with_fixture_proc(tmp.path());
+        let _ = det.detect(&spawn_with_exe(716, 1, "/usr/bin/bash", 1), &[]);
+        let fired = |path: &dyn Fn(u64) -> String| {
+            tracepoint_burst(&det, 716, path).contains(&TriggerType::ConfirmedIntrusion)
+        };
+        assert!(
+            !fired(&|i| format!("/run/user/1000/app/{i}")),
+            "own runtime"
+        );
+        assert!(fired(&|i| format!(
+            "/run/user/1000/../../../home/u/docs/{i}.docx"
+        )));
+    }
+
+    /// `burst` of `the_mass_write_carveout_is_not_dodged_through_proc_links`:
+    /// MASS_WRITE_MIN + 1 tracepoint write-opens (`O_WRONLY`) by `pid`.
+    fn tracepoint_burst(
+        det: &TriggerDetector,
+        pid: u32,
+        path: &dyn Fn(u64) -> String,
+    ) -> Vec<TriggerType> {
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| file_open_from_user(pid, &path(i), 1, i + 10))
+            .collect();
+        let focal = file_open_from_user(pid, &path(99), 1, MASS_WRITE_MIN as u64 + 11);
+        det.detect(&focal, &recent)
+    }
+
     #[test]
     fn dot_segments_fold_and_proc_links_are_doors() {
-        assert_eq!(fold_dot_segments("/proc/../home//u/./x"), "/home/u/x");
-        assert_eq!(fold_dot_segments("/a/b/../../.."), "/");
+        assert_eq!(lexical_form("/home//u/./x").as_deref(), Some("/home/u/x"));
+        assert_eq!(lexical_form("a/./b").as_deref(), Some("a/b"));
+        // lot 286: a `..` is never folded (POS-004 folded both)
+        assert_eq!(lexical_form("/proc/../home//u/./x"), None);
+        assert_eq!(lexical_form("/a/b/../../.."), None);
         assert!(through_proc_link("/proc/self/cwd/x"));
         assert!(through_proc_link("/proc/42/task/43/root/etc/x"));
         assert!(through_proc_link("/proc/thread-self/fd/3"));
-        assert!(!through_proc_link("/proc/self/cwd"));
+        // lot 286: the link itself (a directory: never opened to write)
+        assert!(through_proc_link("/proc/self/cwd"));
+        assert!(through_proc_link("/proc/self/exe"));
+        assert!(through_proc_link("/proc/7/task/8/map_files/1-2"));
+        assert!(through_proc_link("/proc/12/task/12/exe"));
+        assert!(through_proc_link("/dev/stdout"));
+        assert!(through_proc_link("/dev/stderr"));
+        assert!(through_proc_link("/dev/stdin"));
+        assert!(!through_proc_link("/dev/fd"));
+        assert!(!through_proc_link("/dev/null"));
+        assert!(!through_proc_link("/proc/self/fd"));
+        assert!(!through_proc_link("/proc/self/task"));
         assert!(!through_proc_link("/proc/sys/vm/x"));
         assert!(!through_proc_link("/proc/self/oom_score_adj"));
     }

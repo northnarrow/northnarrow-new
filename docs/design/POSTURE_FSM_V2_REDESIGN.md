@@ -786,6 +786,11 @@ file (`O_CREAT | O_EXCL`) included (the review of #500, C1: a copy-and-delete
 encryptor's copies; tracepoint mode cannot tell them from an extraction, so
 an extraction outside a session raises the arm there, ENGAGED, as on
 `main`) — and inside a session no open that may create one does.
+There the carve-outs judge the caller's text, which no kernel resolved
+(lot 286): a path with a `..` segment, or through a process's link under
+`/proc` (`cwd`, `root`, `exe`, `fd/<n>`, `map_files/`; `/dev/fd/<n>`,
+`/dev/std{in,out,err}`), is never carved out — the kernel climbs a `..`
+from where the links before it led (`/proc/self/root/..` is `/`).
 Every shape is file-system evidence (`triggers::evidence_class`): no shape of
 the arm corroborates another, nor the ransomware tracker's
 `RansomwareEncryption` (file-system evidence too).
