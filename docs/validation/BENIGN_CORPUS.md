@@ -81,7 +81,10 @@ and back; `rsync -a --inplace` of 1,000 changed small files onto their
 copies; the AppImage: its squashfs image mounted by `squashfuse` on
 `/tmp/.mount_nncorpus…` and `AppRun` run from the mount (what the AppImage
 runtime does), then the image unpacked under `/tmp/appimage_extracted_…`
-and run from there (`--appimage-extract-and-run`). Versions pinned so the
+and run from there (`--appimage-extract-and-run`); the control (lot 283b):
+one program copied to `/tmp` run for a few seconds by the lab user, then by
+`www-data` — a person's exec is recorded, a system account's killed (rc
+137). Versions pinned so the
 same corpus runs on Node 12 and Go 1.18 (Ubuntu 22.04) and on 24.04.
 
 **ci** — the same builds and tests (crate, Go, npm, pip) in session-less
@@ -98,7 +101,9 @@ run to completion, `kubectl get pods -A`, the pod deleted,
 cluster), `pg_createcluster` of a second cluster (initdb) on port 5444,
 `createdb`, `pgbench -i -s 20` and a 60 s run with 4 clients, `pg_dump -Fc`,
 `pg_restore` into a new database, `vacuumdb --analyze`; then the host's own
-upkeep: `apt-get install --only-upgrade` of at most 15 upgradable packages
+upkeep: `apt-get install --reinstall initramfs-tools` (a dpkg trigger's
+`update-initramfs`, whose hooks run from forks of `mkinitramfs`),
+`apt-get install --only-upgrade` of at most 15 upgradable packages
 outside the kernel, boot, libc, systemd and ssh set (the guests are shared:
 their kernel stays the one the lab measures; what was upgraded stays
 upgraded), `unattended-upgrade --dry-run`, `systemctl start

@@ -13,6 +13,12 @@
 //! tree, as R001..R003 would ([`super::tool_kill`]); from another
 //! non-standard path (`/opt`, a home) it keeps the single-process kill.
 //!
+//! Lot 283b: a `runc` is recorded at High, its kill held behind
+//! [`R013_RUNC_KILL`] (a signed `enforce` gives it back): k3s runs its own
+//! from `/var/lib/rancher/k3s/data/<hash>/bin/runc`, and lot 283a's corpus
+//! saw 645 kills and no pod start. A copied `nsenter` or `unshare` is killed
+//! as before.
+//!
 //! External audit EBPF-021: the argv flags only enrich the reasoning; when
 //! the kernel cut the argv, the reasoning says so, since a flag may be
 //! past the cut.
@@ -24,6 +30,7 @@ use nn_model::{Event, Severity, Verdict};
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
 use crate::decision::attack::{AttackRef, Tactic};
+use crate::decision::response_policy::R013_RUNC_KILL;
 use crate::decision::{rules::build_verdict, Rule};
 use crate::posture::host::PostureHost;
 
@@ -117,7 +124,7 @@ impl<H: PostureHost> Rule for R013NamespaceEscapeTooling<H> {
         // External audit EBPF-021: flags past a cut argv were not seen.
         let reasoning = super::with_argv_cut_note(reasoning, event);
         // External audit PROC-008: and on the program's lineage.
-        Some(super::judge_actor(
+        let v = super::judge_actor(
             &self.allowlist,
             event,
             judgement.apply(
@@ -130,8 +137,22 @@ impl<H: PostureHost> Rule for R013NamespaceEscapeTooling<H> {
                 ),
                 comm,
             ),
-        ))
+        );
+        // Lot 283b: a runc is recorded, its kill held (a container
+        // runtime's bundled runc); a copied nsenter or unshare is killed.
+        Some(if is_runc(filename) {
+            R013_RUNC_KILL.hold(v)
+        } else {
+            v
+        })
     }
+}
+
+/// Lot 283b: the executed file is a `runc` — its name, as the kernel
+/// executed it (a copy of `nsenter` renamed `runc` is held too: its record
+/// stays High).
+fn is_runc(filename: &str) -> bool {
+    filename.rsplit('/').next() == Some("runc")
 }
 
 #[cfg(test)]
@@ -162,6 +183,40 @@ mod tests {
         assert_eq!(v.action, ResponseAction::KillProcess);
     }
 
+    /// Lot 283b: a runc outside the system directories — k3s' bundled one
+    /// — is recorded at High, its kill held (the engine is told: a signed
+    /// `enforce` gives it back); a copied nsenter or unshare at the same
+    /// path is killed.
+    #[test]
+    fn a_runtime_s_bundled_runc_is_recorded_and_a_copied_nsenter_killed() {
+        use crate::decision::response_policy::take_held;
+        let dir = "/var/lib/rancher/k3s/data/342d21a06834327c/bin";
+        take_held();
+        let v = rule()
+            .evaluate(&spawn("runc", &format!("{dir}/runc")))
+            .expect("fires");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        assert!(v.reasoning.contains("bundled runc"), "{}", v.reasoning);
+        let h = take_held().expect("held");
+        assert_eq!(h.action, ResponseAction::KillProcess);
+        assert_eq!(h.switch, R013_RUNC_KILL.held);
+        for tool in ["nsenter", "unshare"] {
+            let v = rule()
+                .evaluate(&spawn(tool, &format!("{dir}/{tool}")))
+                .expect("fires");
+            assert_eq!(v.action, ResponseAction::KillProcess, "{tool}");
+            assert!(take_held().is_none(), "{tool}");
+        }
+        // a runc under /usr/bin is no match at all
+        assert!(rule().evaluate(&spawn("runc", "/usr/bin/runc")).is_none());
+        assert!(
+            is_runc("/opt/x/runc") && !is_runc("/opt/x/runc2") && !is_runc("/opt/runc/nsenter")
+        );
+    }
+
     /// Empty filename = sensor could not read the path; must not fire.
     #[test]
     fn empty_filename_never_fires() {
@@ -175,7 +230,12 @@ mod tests {
                 .evaluate(&spawn(tool, &format!("/tmp/{tool}")))
                 .unwrap_or_else(|| panic!("should fire on /tmp/{tool}"));
             assert_eq!(v.rule_id, "R013_NamespaceEscapeTooling");
-            assert_eq!(v.action, ResponseAction::KillProcessTree);
+            let want = if *tool == "runc" {
+                ResponseAction::Log
+            } else {
+                ResponseAction::KillProcessTree
+            };
+            assert_eq!(v.action, want, "{tool}");
             assert_eq!(v.severity, Severity::High);
             // Graceful degrade: empty argv → no escape-flag clause.
             assert!(!v.reasoning.contains("host-escape flags"));

@@ -50,6 +50,7 @@ use parking_lot::Mutex;
 
 use crate::anti_tamper::trusted_installer::{is_own_unit_dropin, OWN_SYSTEMD_UNITS};
 use crate::decision::attack::{AttackRef, Tactic};
+use crate::decision::response_policy::{PolicySwitch, FIM_007_KILL, FIM_009_KILL};
 use crate::decision::Rule;
 use crate::posture::host::PostureHost;
 use crate::posture::lineage::AuthSessionTracker;
@@ -2421,6 +2422,42 @@ impl<H: PostureHost> Rule for PackageManaged<H> {
     }
 }
 
+/// Lot 283b (the coordinator's decision of 06/11/2026, after lot 283a's
+/// benign corpus): a rule's kill held behind a [`PolicySwitch`] —
+/// NN-L-FIM-007's and NN-L-FIM-009's, whose kill of the writer came after
+/// the write and prevented nothing. The outermost wrapper: a package
+/// transaction's Low record and an administrator's session's High record
+/// pass unchanged (a `Log` is never held), so a signed `enforce` gives back
+/// the kill only of what the carve-outs left a kill — never dpkg's.
+pub struct SwitchHeld {
+    inner: Box<dyn Rule>,
+    switch: PolicySwitch,
+}
+
+impl SwitchHeld {
+    pub fn new(inner: Box<dyn Rule>, switch: PolicySwitch) -> Self {
+        Self { inner, switch }
+    }
+}
+
+impl Rule for SwitchHeld {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn category(&self) -> &'static str {
+        self.inner.category()
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        self.inner.attack()
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        self.inner.evaluate(event).map(|v| self.switch.hold(v))
+    }
+}
+
 /// Review 52 — a configuration or scheduling write made in an
 /// administrator's interactive sudo/su session is recorded at the rule's
 /// severity, not killed.
@@ -2720,10 +2757,17 @@ pub fn fim_rules_with_lineage<H: PostureAgent>(
         admin(acct(Box::new(NnLFim003SensitiveConfigModified))),
         Box::new(NnLFim004AuthorizedKeysModified),
         Box::new(NnLFim005LogTruncated::new(syslog_uid)),
-        admin(Box::new(NnLFim007CronDropInCreated::with_fresh_window())),
-        admin(Box::new(NnLFim009SystemdUnitDropped::<H>::new(Arc::clone(
-            &installer_override,
-        )))),
+        // Lot 283b: outside the carve-outs, the kill held (`SwitchHeld`).
+        Box::new(SwitchHeld::new(
+            admin(Box::new(NnLFim007CronDropInCreated::with_fresh_window())),
+            FIM_007_KILL,
+        )),
+        Box::new(SwitchHeld::new(
+            admin(Box::new(NnLFim009SystemdUnitDropped::<H>::new(Arc::clone(
+                &installer_override,
+            )))),
+            FIM_009_KILL,
+        )),
         // C5.3 — cloud credential read family. Same High
         // tier as the rest of the credential-access bucket
         // (NN-L-FIM-003 sensitive config / NN-L-FIM-004
@@ -5073,21 +5117,77 @@ mod tests {
         ];
         for (id, op, path, pid, comm) in cases {
             let rule = rules.get(id).unwrap_or_else(|| panic!("{id} missing"));
-            let killer = rule
-                .evaluate(&written_by(*op, path, 600, "cp"))
+            let killer = built(rule.as_ref(), &written_by(*op, path, 600, "cp"))
                 .unwrap_or_else(|| panic!("{id} must fire on {path}"));
             assert_ne!(
                 killer.action,
                 ResponseAction::Log,
                 "{id}: foreign writer keeps its response"
             );
-            let v = rule
-                .evaluate(&written_by(*op, path, *pid, comm))
+            let v = built(rule.as_ref(), &written_by(*op, path, *pid, comm))
                 .unwrap_or_else(|| panic!("{id} must still record {path}"));
             assert_eq!(v.rule_id, *id);
             assert_eq!(v.action, ResponseAction::Log, "{id} on {path}");
             assert_eq!(v.severity, Severity::Low, "{id} on {path}");
             assert!(v.reasoning.contains("package manager"), "{}", v.reasoning);
+        }
+    }
+
+    /// Lot 283b: the verdict with the response the rule built, before a
+    /// switch held it ([`SwitchHeld`]) — what a signed `enforce` runs.
+    fn built(rule: &dyn Rule, e: &Event) -> Option<Verdict> {
+        crate::decision::response_policy::take_held();
+        let mut v = rule.evaluate(e)?;
+        if let Some(h) = crate::decision::response_policy::take_held() {
+            v.action = h.action;
+        }
+        Some(v)
+    }
+
+    /// Lot 283b: NN-L-FIM-007 and NN-L-FIM-009 record a foreign writer at
+    /// High, the kill of the writer held behind their switch (a signed
+    /// `enforce` gives it back); a package transaction's write stays Low
+    /// with nothing held, so `enforce` never kills dpkg.
+    #[test]
+    fn fim007_and_fim009_hold_the_writer_s_kill_outside_the_carve_outs() {
+        use crate::decision::response_policy::take_held;
+        let (_tmp, lineage) = pkg_fixture();
+        let rules = rules_by_id(&lineage);
+        for (id, path, switch) in [
+            (
+                "NN-L-FIM-007_CronDropInCreated",
+                "/etc/cron.d/backup",
+                FIM_007_KILL,
+            ),
+            (
+                "NN-L-FIM-009_SystemdUnitDropped",
+                "/etc/systemd/system/k3s.service",
+                FIM_009_KILL,
+            ),
+        ] {
+            let rule = &rules[id];
+            take_held();
+            let v = rule
+                .evaluate(&written_by(FimOp::Created, path, 600, "tee"))
+                .unwrap_or_else(|| panic!("{id} fires"));
+            assert_eq!(
+                (v.action, v.severity),
+                (ResponseAction::Log, Severity::High),
+                "{id}"
+            );
+            assert!(v.reasoning.contains("after the write"), "{}", v.reasoning);
+            let h = take_held().unwrap_or_else(|| panic!("{id}: held"));
+            assert_eq!(h.action, ResponseAction::KillProcess, "{id}");
+            assert_eq!(h.switch, switch.held, "{id}");
+            let v = rule
+                .evaluate(&written_by(FimOp::Created, path, 200, "dpkg"))
+                .unwrap_or_else(|| panic!("{id} records dpkg"));
+            assert_eq!(
+                (v.action, v.severity),
+                (ResponseAction::Log, Severity::Low),
+                "{id}"
+            );
+            assert!(take_held().is_none(), "{id}: dpkg's write holds no kill");
         }
     }
 
@@ -5097,14 +5197,16 @@ mod tests {
     fn comm_named_dpkg_is_not_trusted() {
         let (_tmp, lineage) = pkg_fixture();
         let rules = rules_by_id(&lineage);
-        let v = rules["NN-L-FIM-009_SystemdUnitDropped"]
-            .evaluate(&written_by(
+        let v = built(
+            rules["NN-L-FIM-009_SystemdUnitDropped"].as_ref(),
+            &written_by(
                 FimOp::Created,
                 "/etc/systemd/system/evil.service",
                 600,
                 "dpkg",
-            ))
-            .unwrap();
+            ),
+        )
+        .unwrap();
         assert_eq!(v.action, ResponseAction::KillProcess);
     }
 
@@ -5293,17 +5395,16 @@ mod tests {
         ];
         for (id, op, path) in cases {
             let rule = rules.get(id).unwrap_or_else(|| panic!("{id} missing"));
-            let killed = rule
-                .evaluate(&written_by(*op, path, 600, "cp"))
+            let killed = built(rule.as_ref(), &written_by(*op, path, 600, "cp"))
                 .unwrap_or_else(|| panic!("{id} must fire on {path}"));
             assert_ne!(
                 killed.action,
                 ResponseAction::Log,
                 "{id}: root shell, no sudo"
             );
-            let no_tty = rule.evaluate(&written_by(*op, path, 750, "tee")).unwrap();
+            let no_tty = built(rule.as_ref(), &written_by(*op, path, 750, "tee")).unwrap();
             assert_ne!(no_tty.action, ResponseAction::Log, "{id}: no terminal");
-            let v = rule.evaluate(&written_by(*op, path, 720, "vim")).unwrap();
+            let v = built(rule.as_ref(), &written_by(*op, path, 720, "vim")).unwrap();
             assert_eq!(v.action, ResponseAction::Log, "{id} on {path}");
             assert_eq!(v.severity, killed.severity, "{id} keeps its severity");
             assert!(
@@ -5759,8 +5860,7 @@ mod tests {
         if let Event::Fim(fe) = &mut e {
             fe.modifier_uid = 1000;
         }
-        let v = rules["NN-L-FIM-007_CronDropInCreated"]
-            .evaluate(&e)
+        let v = built(rules["NN-L-FIM-007_CronDropInCreated"].as_ref(), &e)
             .expect("the crontab install fires");
         assert_eq!(
             (v.action, v.severity),
@@ -5838,11 +5938,11 @@ mod tests {
             }
             e
         };
-        let v = r.evaluate(&at(200, exec_ns + 2_000_000_000)).unwrap();
+        let v = built(r.as_ref(), &at(200, exec_ns + 2_000_000_000)).unwrap();
         assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::Low));
-        let v = r.evaluate(&at(300, exec_ns + 59_000_000_000)).unwrap();
+        let v = built(r.as_ref(), &at(300, exec_ns + 59_000_000_000)).unwrap();
         assert_eq!(v.action, ResponseAction::Log);
-        let v = r.evaluate(&at(300, exec_ns + 61_000_000_000)).unwrap();
+        let v = built(r.as_ref(), &at(300, exec_ns + 61_000_000_000)).unwrap();
         assert_eq!(v.action, ResponseAction::KillProcess);
     }
 }

@@ -275,14 +275,58 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
             reasoning = format!("{reasoning}; parent={parent_comm}");
         }
         // External audit PROC-008: and on the program's lineage.
-        Some(super::judge_actor(
+        let v = super::judge_actor(
             &self.allowlist,
             event,
             judgement.apply(
                 build_verdict(self, event, action, Severity::High, &reasoning),
                 comm,
             ),
-        ))
+        );
+        // Lot 283b: and on the package transaction the exec pump read.
+        Some(in_package_transaction_at_exec(event, v))
+    }
+}
+
+/// Lot 283b (the coordinator's decision of 06/11/2026, after lot 283a's
+/// corpus): a root exec of a program in a system tree whose lineage, as the
+/// exec pump read it at the exec ([`ExecFacts::package_manager`]), holds a
+/// package manager proper run by root — the criterion of the package
+/// transaction the FIM rules, NN-L-NET-008, R009 and the chains read — is
+/// recorded, not killed. The case: a dpkg trigger's `update-initramfs`
+/// runs `/usr/share/initramfs-tools/hooks/kmod` (comm `kmod`) from forks of
+/// `mkinitramfs` that never execute; by the decision they had exited, the
+/// lineage walk lost the chain, the trusted-actor record of PROC-008 was
+/// not found, and the hook was killed in an `apt upgrade` (a kill that
+/// lands aborts the initramfs build). By lineage, never by name: a program
+/// outside a system tree (a malicious package's `/tmp/kmod`) or not run by
+/// root is judged as before.
+///
+/// [`ExecFacts::package_manager`]: kmod_exec_facts::ExecFacts::package_manager
+fn in_package_transaction_at_exec(event: &Event, v: Verdict) -> Verdict {
+    if v.action == ResponseAction::Log {
+        return v;
+    }
+    let Event::ProcessSpawn {
+        uid, filename, exe, ..
+    } = event
+    else {
+        return v;
+    };
+    if *uid != 0 || !crate::posture::lineage::in_system_tree(exe.path_or(filename)) {
+        return v;
+    }
+    let Some(pm) = kmod_exec_facts::of(event).and_then(|f| f.package_manager) else {
+        return v;
+    };
+    Verdict {
+        action: ResponseAction::Log,
+        reasoning: format!(
+            "{} [run in a package transaction ({pm}, run by root, read in its lineage at the \
+             exec): recorded, not killed — a kill would leave the transaction half done]",
+            v.reasoning
+        ),
+        ..v
     }
 }
 
@@ -341,6 +385,57 @@ mod tests {
         e
     }
 
+    /// Lot 283b: the initramfs hook `kmod` a dpkg trigger's
+    /// update-initramfs runs as root — not the system's module tool — is
+    /// recorded when the exec pump read a root package manager in its
+    /// lineage at the exec, killed when it read none; a program outside a
+    /// system tree, or a non-root exec, is judged as before even under one.
+    #[test]
+    fn a_dpkg_trigger_s_initramfs_hook_is_recorded_by_lineage() {
+        let hook = "/usr/share/initramfs-tools/hooks/kmod";
+        let not_tool = |pm: Option<&str>| ExecFacts {
+            program: Err("its device and inode are not the system's tool's".into()),
+            environment: Environment::Clean,
+            package_manager: pm.map(str::to_string),
+        };
+        let v = rule()
+            .evaluate(&read_as(
+                exec(hook, hook, &[hook, "prereqs"]),
+                not_tool(Some("/usr/bin/dpkg")),
+            ))
+            .expect("fires");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        assert!(
+            v.reasoning.contains("package transaction (/usr/bin/dpkg"),
+            "{}",
+            v.reasoning
+        );
+        let v = rule()
+            .evaluate(&read_as(exec(hook, hook, &[hook]), not_tool(None)))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        // a staged copy under dpkg: killed with its tree
+        let v = rule()
+            .evaluate(&read_as(
+                exec("/tmp/kmod", "/tmp/kmod", &["/tmp/kmod"]),
+                not_tool(Some("/usr/bin/dpkg")),
+            ))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        // a non-root exec: the facts say nothing for it
+        let mut e = exec(hook, hook, &[hook]);
+        if let Event::ProcessSpawn { uid, .. } = &mut e {
+            *uid = 1000;
+        }
+        let v = rule()
+            .evaluate(&read_as(e, not_tool(Some("/usr/bin/dpkg"))))
+            .expect("fires");
+        assert_ne!(v.action, ResponseAction::Log);
+    }
+
     /// `e` as the exec pump read it: the system's tool, no
     /// `MODPROBE_OPTIONS`.
     fn read_ok(e: Event) -> Event {
@@ -349,6 +444,7 @@ mod tests {
             ExecFacts {
                 program: Ok(()),
                 environment: Environment::Clean,
+                package_manager: None,
             },
         )
     }
@@ -582,6 +678,7 @@ mod tests {
                 ExecFacts {
                     program: Err("its device and inode are not the system's tool's".into()),
                     environment: Environment::Clean,
+                    package_manager: None,
                 },
                 "not the system's tool's",
             ),
@@ -591,6 +688,7 @@ mod tests {
                     environment: Environment::Refused(
                         "MODPROBE_OPTIONS='-d /tmp/x' in its environment".into(),
                     ),
+                    package_manager: None,
                 },
                 "MODPROBE_OPTIONS='-d /tmp/x'",
             ),
@@ -600,6 +698,7 @@ mod tests {
                     environment: Environment::Refused(
                         "its environment could not be read (Permission denied)".into(),
                     ),
+                    package_manager: None,
                 },
                 "could not be read",
             ),
@@ -609,6 +708,7 @@ mod tests {
                     environment: Environment::Refused(
                         "LD_PRELOAD='/tmp/x.so' in its environment".into(),
                     ),
+                    package_manager: None,
                 },
                 "LD_PRELOAD='/tmp/x.so'",
             ),
@@ -618,6 +718,7 @@ mod tests {
                     environment: Environment::Refused(
                         "its start is unknown: its environment cannot be tied to the exec".into(),
                     ),
+                    package_manager: None,
                 },
                 "its start is unknown",
             ),
@@ -642,6 +743,7 @@ mod tests {
         let exited = || ExecFacts {
             program: Ok(()),
             environment: Environment::Exited("no process had its pid any more".into()),
+            package_manager: None,
         };
         for (e, what) in [
             (modprobe(&["overlay"]), "modprobe of 'overlay'"),

@@ -45,6 +45,54 @@ use crate::decision::rule_policy::ActorFacts;
 use crate::impact::entropy::Sampler;
 use crate::posture::host::PostureAgent;
 
+/// Lot 283b: whose account a process runs as — what decides, for R001 and
+/// R003, whether a non-root exec from `/tmp` or `/var/tmp` is killed in
+/// every posture (a system account's: the web shell of `www-data`) or
+/// recorded below COMBAT (a person's: a test binary, an AppImage)
+/// ([`crate::decision::posture_floor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountKind {
+    /// uid 0.
+    Root,
+    /// An account no person logs in as: below `UID_MIN` (`/etc/login.defs`,
+    /// 1000 by default), a shell that refuses a login (`nologin`, `false`),
+    /// or, with no entry in the account database, a service uid (`nobody`,
+    /// systemd's dynamic users).
+    System,
+    /// A person's account: `UID_MIN` and up with a login shell, or with no
+    /// entry and no service uid — a rootless container's sub-uid carries
+    /// the standing of the person who owns the range.
+    Human,
+}
+
+/// [`AccountKind`] from what the host read: `uid_min`, `login.defs`'
+/// `UID_MIN`; `shell`, the account's shell in the account database
+/// (`None`: no entry for `uid`).
+pub fn classify_account(uid: u32, uid_min: u32, shell: Option<&str>) -> AccountKind {
+    if uid == 0 {
+        return AccountKind::Root;
+    }
+    if uid < uid_min {
+        return AccountKind::System;
+    }
+    match shell {
+        Some(sh) if refuses_login(sh) => AccountKind::System,
+        Some(_) => AccountKind::Human,
+        None if crate::decision::rules::is_service_uid(uid) => AccountKind::System,
+        None => AccountKind::Human,
+    }
+}
+
+/// `UID_MIN`'s default (`login.defs(5)`), for a host whose file names none.
+pub const DEFAULT_UID_MIN: u32 = 1000;
+
+/// A shell that refuses a login: `nologin` and `false`, wherever installed
+/// (`/usr/sbin/nologin`, `/sbin/nologin`, `/bin/false`, `/usr/bin/false`).
+/// An empty shell field is `/bin/sh` to `login(1)`: a login shell.
+fn refuses_login(shell: &str) -> bool {
+    matches!(shell.trim().rsplit('/').next(), Some("nologin" | "false"))
+}
+
 /// The host's calls the decision engine makes, on top of the posture's
 /// ([`PostureAgent`]: the process table, the clocks, the window) and the
 /// content's ([`ContentHost`]: the shipped lists).
@@ -106,6 +154,12 @@ pub trait DecisionHost: PostureAgent + ContentHost {
     /// Wake every current waiter of `notify` (the agent:
     /// `Notify::notify_waiters`).
     fn notify_flow_waiters(notify: &Self::FlowNotify);
+
+    /// Lot 283b: whose account `uid` is ([`classify_account`] over the
+    /// host's `UID_MIN` and the account's shell; the agent: `/etc/login.defs`
+    /// and `/etc/passwd` of the host's view, read again when either
+    /// changes).
+    fn account_kind(uid: u32) -> AccountKind;
 }
 
 /// The engine's own tests: the posture's portable test host
@@ -206,5 +260,46 @@ mod testing {
         type FlowNotify = ();
 
         fn notify_flow_waiters(_notify: &()) {}
+
+        /// No account database: `UID_MIN` 1000, no shell read.
+        fn account_kind(uid: u32) -> super::AccountKind {
+            super::classify_account(uid, super::DEFAULT_UID_MIN, None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_account, AccountKind::*, DEFAULT_UID_MIN};
+
+    /// Lot 283b: root; below `UID_MIN` a system account whatever its
+    /// shell; from `UID_MIN` up a person's, unless its shell refuses a
+    /// login; with no entry, a service uid is a system account and any
+    /// other uid a person's (a sub-uid).
+    #[test]
+    fn accounts_are_told_by_uid_min_and_shell() {
+        let m = DEFAULT_UID_MIN;
+        assert_eq!(classify_account(0, m, Some("/bin/bash")), Root);
+        assert_eq!(classify_account(33, m, Some("/usr/sbin/nologin")), System);
+        assert_eq!(classify_account(999, m, Some("/bin/bash")), System);
+        assert_eq!(classify_account(999, m, None), System);
+        assert_eq!(classify_account(1000, m, Some("/bin/bash")), Human);
+        assert_eq!(classify_account(1000, m, Some("")), Human);
+        assert_eq!(classify_account(1000, m, None), Human);
+        for sh in [
+            "/usr/sbin/nologin",
+            "/sbin/nologin",
+            "/bin/false",
+            "/usr/bin/false",
+        ] {
+            assert_eq!(classify_account(1001, m, Some(sh)), System, "{sh}");
+        }
+        assert_eq!(classify_account(1001, m, Some("/usr/bin/zsh")), Human);
+        assert_eq!(classify_account(65_534, m, None), System);
+        assert_eq!(classify_account(61_184, m, None), System);
+        assert_eq!(classify_account(100_000, m, None), Human);
+        // a host whose UID_MIN is 500 (an older RHEL)
+        assert_eq!(classify_account(600, 500, Some("/bin/bash")), Human);
+        assert_eq!(classify_account(600, m, Some("/bin/bash")), System);
     }
 }

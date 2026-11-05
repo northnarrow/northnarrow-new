@@ -100,6 +100,12 @@ impl DecisionHost for LinuxHost {
     fn notify_flow_waiters(notify: &tokio::sync::Notify) {
         notify.notify_waiters();
     }
+
+    /// Lot 283b: `login.defs`' `UID_MIN` and `passwd`'s shell, of the
+    /// host's view ([`crate::accounts`]).
+    fn account_kind(uid: u32) -> nn_core::decision::host::AccountKind {
+        crate::accounts::kind(uid)
+    }
 }
 
 // ── the exemption facts (from `decision::rule_policy`, R08b) ───────────

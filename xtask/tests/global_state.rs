@@ -276,6 +276,13 @@ const STATICS: &[Kept] = &[
     ),
     // ── nn-linux ──
     kept(
+        "crates/nn-linux/src/accounts.rs",
+        "TABLE",
+        HostFact,
+        "lot 283b: the host's account database (`login.defs`' UID_MIN, `passwd`'s shells), \
+         read again when either file changes",
+    ),
+    kept(
         "crates/nn-linux/src/anchored.rs",
         "DIRS",
         Process,

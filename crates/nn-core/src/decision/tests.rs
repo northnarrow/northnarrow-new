@@ -88,17 +88,27 @@ fn benign_exec_does_not_fire_anything() {
     assert!(engine.evaluate(&spawn("bash", "/bin/bash")).is_none());
 }
 
+/// A system account's exec from /tmp is R001's kill; lot 283b: a person's
+/// (uid 1000) is R001's High record below COMBAT.
 #[test]
 fn exec_from_tmp_routes_to_r001() {
     let engine = RuleEngine::with_default_rules();
     let v = engine
-        .evaluate(&spawn("payload", "/tmp/payload"))
+        .evaluate(&spawn_as(33, "payload", "/tmp/payload"))
         .expect("should fire");
     assert_eq!(v.rule_id, "R001_ExecFromTmp");
     assert_eq!(v.action, ResponseAction::KillProcessTree);
     assert_eq!(v.severity, Severity::Medium);
     assert_eq!(v.event_pid, 1234);
     assert_eq!(v.event_filename, "/tmp/payload");
+    let v = engine
+        .evaluate(&spawn("payload", "/tmp/payload"))
+        .expect("should fire");
+    assert_eq!(v.rule_id, "R001_ExecFromTmp");
+    assert_eq!(
+        (v.action, v.severity),
+        (ResponseAction::Log, Severity::High)
+    );
 }
 
 #[test]
@@ -846,12 +856,14 @@ fn staging_kmod_tool_is_r011() {
 fn a_log_rule_never_shadows_a_staging_kill() {
     let engine = RuleEngine::with_default_rules();
     for (uid, comm, path, rule) in [
-        (1000, "at", "/tmp/at", "R001_ExecFromTmp"),
+        // lot 283b: R001's and R003's of a system account (a person's is
+        // recorded below COMBAT)
+        (998, "at", "/tmp/at", "R001_ExecFromTmp"),
         (998, "base64", "/dev/shm/base64", "R002_ExecFromDevShm"),
         (998, "gdb", "/var/tmp/gdb", "R003_ExecFromVarTmp"),
-        (1000, "nc", "/tmp/nc", "R001_ExecFromTmp"),
+        (998, "nc", "/tmp/nc", "R001_ExecFromTmp"),
         (
-            1000,
+            998,
             "xmrig-cleanup",
             "/tmp/xmrig-cleanup",
             "R001_ExecFromTmp",
@@ -1525,12 +1537,15 @@ fn shadow_fim023_fires_with_fim009_on_a_timer() {
             "NN-L-FIM-023_SystemdTimerCreated"
         ]
     );
-    assert_eq!(d.verdict.rule_id, "NN-L-FIM-009_SystemdUnitDropped");
+    // Lot 283b: NN-L-FIM-009's kill of the writer is held (a record); the
+    // timer's own rule kills it, and is the primary.
+    assert_eq!(d.verdict.rule_id, "NN-L-FIM-023_SystemdTimerCreated");
     assert!(d
         .attack()
         .iter()
         .any(|a| a.technique.as_str() == "T1053.006"));
     assert_eq!(d.responses.len(), 1, "one kill of the writer");
+    assert_eq!(d.responses[0].rule_id, "NN-L-FIM-023_SystemdTimerCreated");
 }
 
 /// FIM-002 (a Log) used to win over FIM-004 (a kill) on a new
@@ -1638,6 +1653,64 @@ fn below_combat_r009_records_and_its_record_holds_the_staging_kill() {
         .expect("a decision");
     assert_eq!(d.responses.len(), 1);
     assert_eq!(d.responses[0].rule_id, "R001_ExecFromTmp");
+}
+
+/// Lot 283b: a person's exec from /tmp (uid 1000: `go test`'s binary, an
+/// AppImage's AppRun) is R001's High record below COMBAT, its kill held and
+/// given back by COMBAT or a signed `enforce`; the same program run by a
+/// system account (`www-data`, uid 33: a web shell's payload) is killed in
+/// every posture, as before. R003 likewise for /var/tmp.
+#[test]
+fn a_person_s_exec_from_tmp_is_recorded_a_system_account_s_is_killed() {
+    let p = prod("");
+    for (rule, path) in [
+        ("R001_ExecFromTmp", "/tmp/go-build1/b001/calc.test"),
+        ("R003_ExecFromVarTmp", "/var/tmp/app/AppRun"),
+    ] {
+        for posture in [
+            PostureKind::Observing,
+            PostureKind::Alerted,
+            PostureKind::Engaged,
+        ] {
+            let d = p
+                .decide_in(&spawn_as(1000, "calc.test", path), posture)
+                .expect("a decision");
+            assert_eq!(d.verdict.rule_id, rule, "{posture}");
+            assert_eq!(d.verdict.action, ResponseAction::Log, "{rule} {posture}");
+            assert_eq!(d.verdict.severity, Severity::High, "{rule} {posture}");
+            assert!(
+                d.responses.is_empty(),
+                "{rule} {posture}: {:?}",
+                d.responses
+            );
+            assert_eq!(
+                d.primary().held_action,
+                Some(ResponseAction::KillProcessTree)
+            );
+            let d = p
+                .decide_in(&spawn_as(33, "calc.test", path), posture)
+                .expect("a decision");
+            assert_eq!(d.verdict.rule_id, rule, "{posture}");
+            assert_eq!(
+                d.verdict.action,
+                ResponseAction::KillProcessTree,
+                "{rule} {posture}"
+            );
+            assert_eq!(d.responses.len(), 1, "{rule} {posture}");
+        }
+        let d = p
+            .decide_in(&spawn_as(1000, "calc.test", path), PostureKind::Combat)
+            .expect("a decision");
+        assert_eq!(d.verdict.action, ResponseAction::KillProcessTree, "{rule}");
+        let d = prod(&format!("enforce {rule}\n"))
+            .decide_in(&spawn_as(1000, "calc.test", path), PostureKind::Observing)
+            .expect("a decision");
+        assert_eq!(d.verdict.action, ResponseAction::KillProcessTree, "{rule}");
+        assert!(d
+            .verdict
+            .reasoning
+            .contains("enforced by the signed per-rule policy"));
+    }
 }
 
 /// Review of #493 (A1): R009's posture hold never stands in for the kill
@@ -1952,8 +2025,8 @@ fn the_policy_modes_on_a_held_kill() {
     let d = p.decide(&reverse_shell(34, 7201)).unwrap();
     assert_eq!(d.verdict.action, ResponseAction::KillProcessTree);
     // The other rules keep their response under a policy that names R020
-    // only: R001's kill of a /tmp exec.
-    let d = p.decide(&spawn("payload", "/tmp/payload")).unwrap();
+    // only: R001's kill of a system account's /tmp exec.
+    let d = p.decide(&spawn_as(33, "payload", "/tmp/payload")).unwrap();
     assert_eq!(d.verdict.action, ResponseAction::KillProcessTree);
     assert_eq!(d.primary().applied.name(), "builtin");
 }

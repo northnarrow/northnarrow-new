@@ -144,7 +144,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
     RuleDoc {
         id: "NN-L-FIM-007_CronDropInCreated",
         severities: &[Severity::High, Severity::Low],
-        actions: &[ResponseAction::KillProcess, ResponseAction::Log],
+        actions: &[ResponseAction::Log],
         sensors: &[Sensor::File],
         data_components: &["DC0039", "DC0061"],
         observes: "A new or rewritten cron entry: a file under /etc/cron.d, /etc/cron.hourly, \
@@ -152,10 +152,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
             /etc/crontab itself. The several events of one crontab install or editor save draw one \
             verdict; a second drop-in by the same process draws another.",
         false_positives: "A package transaction is recorded at Low, and a write in an \
-            administrator's interactive sudo or su session (`sudo crontab -e`) at High. A user's \
-            own `crontab -e` is killed after the write (the entry stays).",
+            administrator's interactive sudo or su session (`sudo crontab -e`) at High. Lot 283b: \
+            any other writer is recorded at High, the kill of the writer held (it came after the \
+            write: the entry stays) — a signed `enforce` gives it back; preventing the entry is the \
+            kernel's deny and the persistence that repairs itself (Wave 3).",
         how_to_test: "`sudo systemd-run --wait cp /dev/null /etc/cron.d/nn-test`, then remove the \
-            file; expect High, KillProcess aimed at cp.",
+            file; expect High, the KillProcess aimed at cp held (Log).",
         tests: &[
             "crates/nn-core/src/fim/rules.rs::fim007_fires_on_cron_dropin_created_or_modified",
             "crates/nn-core/src/fim/rules.rs::fim007_two_distinct_dropins_fire_twice",
@@ -186,16 +188,20 @@ pub(super) const DOCS: &[RuleDoc] = &[
     RuleDoc {
         id: "NN-L-FIM-009_SystemdUnitDropped",
         severities: &[Severity::High, Severity::Low],
-        actions: &[ResponseAction::KillProcess, ResponseAction::Log],
+        actions: &[ResponseAction::Log],
         sensors: &[Sensor::File],
         data_components: &["DC0039", "DC0061"],
         observes: "A new or rewritten file under /etc/systemd/system, /lib/systemd/system or \
             /usr/lib/systemd/system: a unit or a drop-in, a .timer included.",
         false_positives: "Package transactions are recorded at Low; `sudo systemctl edit` and \
             other writes in an interactive sudo or su session at High; the agent's own units, \
-            written while the operator's trusted-installer window is open, at Low.",
+            written while the operator's trusted-installer window is open, at Low. Lot 283b: any \
+            other writer (a vendor's install script: k3s' `k3s.service`) is recorded at High, the \
+            kill of the writer held (it came after the write) — a signed `enforce` gives it back; \
+            preventing the unit is the kernel's deny and the persistence that repairs itself \
+            (Wave 3).",
         how_to_test: "`sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.service`, \
-            then remove it; expect High, KillProcess aimed at cp.",
+            then remove it; expect High, the KillProcess aimed at cp held (Log).",
         tests: &[
             "crates/nn-core/src/fim/rules.rs::fim009_fires_on_systemd_unit_dropped_or_modified",
             "crates/nn-core/src/fim/rules.rs::fim009_downgrades_own_unit_under_open_window",

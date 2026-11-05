@@ -87,6 +87,68 @@ copied to `/tmp` or a home (R017), and the module, capability and namespace
 tools (R011, R012, R013), run by root from there, are killed in every
 posture, as before.
 
+**Kills that broke benign workloads (lot 283b, 06/11/2026).** Lot 283a's
+benign corpus ([BENIGN_CORPUS.md](../validation/BENIGN_CORPUS.md): a
+developer's workstation, a CI runner, a container host, a database server on
+Ubuntu 22.04 and 24.04) saw every kill of a default install land on benign
+work. Four changes, each a default the signed per-rule policy can undo with
+`enforce <rule>`:
+
+- **R001 and R003, a person's exec.** An exec from `/tmp` or `/var/tmp` by an
+  account a person logs in as — `UID_MIN` (`/etc/login.defs`, 1000 by
+  default) and up, with a login shell — is a High record below COMBAT, killed
+  in COMBAT: `go test`'s binaries and `go run`'s program
+  (`/tmp/go-build…`), an AppImage's `AppRun` (`/tmp/.mount_*`,
+  `/tmp/appimage_extracted_*`), a CI runner's user. An exec by a system
+  account — below `UID_MIN`, or a `nologin`/`false` shell (`www-data`,
+  `postgres`, `nobody`, systemd's dynamic users) — is killed in every
+  posture, as before: the web shell that runs its payload from `/tmp`. The
+  account decides, not a profile; root's exec waits for COMBAT (lot 278). An
+  account of another NSS source (LDAP, SSSD) has no `/etc/passwd` entry: from
+  `UID_MIN` up it counts as a person's, and so does a rootless container's
+  sub-uid (it carries its owner's standing).
+- **R013, a runc.** A `runc` executed from outside the system directories is
+  a High record, its kill held (`enforce R013` gives it back): k3s runs its
+  own from `/var/lib/rancher/k3s/data/<hash>/bin/runc`, and the corpus saw
+  645 kills and no pod start. A copied `nsenter` or `unshare` is killed as
+  before.
+- **NN-L-FIM-007 and NN-L-FIM-009.** A cron entry or a systemd unit written
+  outside a package transaction and an administrator's session is a High
+  record, the kill of its writer held (`enforce NN-L-FIM-007`,
+  `enforce NN-L-FIM-009`). The kill came after the write — the entry or the
+  unit stays — and the corpus saw it only on benign writers (`crontab -u
+  postgres`, `install` into `/etc/cron.d`, the k3s installer's `tee` of
+  `k3s.service`), each already gone. Preventing the write is not a kill's
+  job: the kernel's deny of a persistence write and the persistence that
+  repairs itself are Wave 3's. `enforce` gives back the kill only of what the
+  carve-outs left a kill: a package transaction's write stays a Low record
+  under `enforce`.
+- **R011 in a package transaction.** A root exec of a program in a system
+  tree whose lineage holds a package manager run by root, as the agent read
+  it at the exec, is recorded, not killed: a dpkg trigger's
+  `update-initramfs` runs `/usr/share/initramfs-tools/hooks/kmod` (comm
+  `kmod`) from forks of `mkinitramfs` that never execute, gone by the time the
+  decision walked the lineage — the hook was killed in an `apt upgrade`, and
+  a kill that lands aborts the initramfs build. By lineage, never by name.
+
+**Decision record (06/11/2026, lot 283b).** By the coordinator, with the
+authority the founder delegated, after lot 283a's inventory.
+- *What:* the four changes above. NN-L-FIM-004, NN-L-FIM-023 and
+  NN-L-NET-008 keep their kill: the corpus did not exercise them, there is no
+  measured false positive to correct; they are candidates to look at again
+  (the catalogue names their benign writers: `ssh-copy-id`, a timer outside a
+  package, an installer from `/tmp` that calls out).
+- *What is left:* a person's own account running a payload from `/tmp` below
+  COMBAT is a High record, not a kill — killed at its first egress
+  (NN-L-CHAIN-002/005/007, NN-L-NET-008) or in COMBAT. A cron entry or a unit
+  dropped by a foreign writer is recorded, not undone. A `runc` renamed copy
+  of `nsenter` is recorded, not killed. The in-session small-file threshold of
+  lot 282's backlog is not turned on: at 50, `cargo fmt` and `prettier` cross
+  it (the corpus's data, BENIGN_CORPUS.md).
+- *Not changed:* the `ConfirmedIntrusion` raises of ordinary servers
+  (PostgreSQL, containerd, the Go build cache: ENGAGED, never COMBAT) are lot
+  283c's.
+
 **R011 judges a module tool's command line (lot 279, 04/11/2026).**
 R011's kill existed before Wave 4 and stays in `OBSERVING_KILLS` below; lot
 279 narrows it and adds no kill. An exec of the system's module tool by

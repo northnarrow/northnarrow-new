@@ -366,7 +366,8 @@ mod tests {
     const CONFIGS: &str = concat!(env!("NN_REPO_ROOT"), "/configs");
 
     fn shell_line() -> String {
-        let e = crate::decision::rules::testutil::spawn("payload", "/tmp/payload");
+        // a system account's (lot 283b: a person's is recorded below COMBAT)
+        let e = crate::decision::rules::testutil::spawn_as(33, "payload", "/tmp/payload");
         serde_json::to_string(&e).unwrap()
     }
 

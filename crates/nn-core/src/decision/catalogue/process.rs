@@ -8,17 +8,22 @@ use crate::detection_payload::Sensor;
 pub(super) const DOCS: &[RuleDoc] = &[
     RuleDoc {
         id: "R001_ExecFromTmp",
-        severities: &[Severity::Medium],
-        actions: &[ResponseAction::KillProcessTree],
+        severities: &[Severity::High, Severity::Medium],
+        actions: &[ResponseAction::KillProcessTree, ResponseAction::Log],
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
         observes: "The exec of a file under `/tmp/`, judged on the file the kernel executed \
                    (a relative path, a symlink or `..` resolves to it).",
-        false_positives: "An installer or a build that runs what it unpacked in `/tmp` is \
-                          killed: the rule's whitelist is empty and the process allowlist does \
-                          not apply. A root exec in an administrator's sudo/su session or a \
-                          package transaction is R009's Low record instead (R009 runs first).",
-        how_to_test: "As an unprivileged user: `cp /bin/true /tmp/nn-r001 && /tmp/nn-r001`. \
+        false_positives: "Lot 283b: a person's exec (an account from `UID_MIN` up with a \
+                          login shell) — `go test`'s binaries, `go run`, an AppImage, a build \
+                          that runs what it unpacked in `/tmp` — is recorded at High below \
+                          COMBAT, killed in COMBAT or under a signed `enforce`. A system \
+                          account's exec (below `UID_MIN`, or a `nologin` shell: `www-data`, \
+                          `postgres`, `nobody`) is killed in every posture: the whitelist is \
+                          empty and the process allowlist does not apply. A root exec is \
+                          R009's (R009 runs first; R001's kill of it waits for COMBAT).",
+        how_to_test: "As a system account: `sudo -u www-data sh -c 'cp /bin/true /tmp/nn-r001 \
+                      && /tmp/nn-r001'` (killed); as the lab user, the same is recorded at High. \
                       Run as root it is R009's verdict.",
         tests: &[
             "crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::fires_on_exec_from_tmp",
@@ -51,15 +56,16 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "R003_ExecFromVarTmp",
-        severities: &[Severity::Medium],
-        actions: &[ResponseAction::KillProcessTree],
+        severities: &[Severity::High, Severity::Medium],
+        actions: &[ResponseAction::KillProcessTree, ResponseAction::Log],
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
         observes: "The exec of a file under `/var/tmp/`, the temporary directory that survives \
                    a reboot, judged on the file the kernel executed.",
-        false_positives: "A package scriptlet or an installer that runs from `/var/tmp` as an \
-                          unprivileged user is killed; run as root in a package transaction \
-                          or an administrator's session it is R009's Low record.",
+        false_positives: "As R001 (lot 283b): a person's exec from `/var/tmp` is recorded at \
+                          High below COMBAT; a system account's (a package scriptlet run as \
+                          one) is killed; run as root in a package transaction or an \
+                          administrator's session it is R009's Low record.",
         how_to_test: "As an unprivileged user: `cp /bin/true /var/tmp/nn-r003 && \
                       /var/tmp/nn-r003`.",
         tests: &[
@@ -356,11 +362,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
         observes: "The exec of `nsenter`, `unshare` or `runc` from outside `/usr/bin`, `/bin`, \
                    `/usr/sbin` and `/sbin`; host-escape flags in argv (`-t`, `--mount`, \
                    `--privileged`, `--net=host`) are named in the reasoning.",
-        false_positives: "A container runtime that runs its own `runc` from a non-standard \
-                          path (a bundled runtime under `/var/lib` or `/opt`) is killed until \
-                          `runc` is allowlisted in `process-comm-allowlist` \
-                          (`docs/operator/CONTAINER_HOST_DEPLOY.md`). An empty exec path never \
-                          fires.",
+        false_positives: "Lot 283b: a container runtime's own `runc` from a non-standard path \
+                          (k3s' `/var/lib/rancher/k3s/data/<hash>/bin/runc`, a bundle under \
+                          `/opt`) is recorded at High, its kill held behind a switch a signed \
+                          `enforce` turns on; allowlisting `runc` in `process-comm-allowlist` \
+                          silences it (`docs/operator/CONTAINER_HOST_DEPLOY.md`). A copied \
+                          `nsenter` or `unshare` is killed. An empty exec path never fires.",
         how_to_test: "`cp /usr/bin/unshare ~/unshare && ~/unshare --help`.",
         tests: &[
             "crates/nn-core/src/decision/rules/r013_namespace_escape_tooling.rs::\

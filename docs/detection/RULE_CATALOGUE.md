@@ -12,9 +12,9 @@ MITRE ATT&CK® Enterprise 20.0: the ids, tactics and names are MITRE's, from the
 
 | Rule | Name | Severity | Response | ATT&CK |
 |---|---|---|---|---|
-| [`R001_ExecFromTmp`](#r001_execfromtmp) | Exec from /tmp/ | Medium | KillProcessTree | T1059 |
+| [`R001_ExecFromTmp`](#r001_execfromtmp) | Exec from /tmp/ | High, Medium | KillProcessTree, Log | T1059 |
 | [`R002_ExecFromDevShm`](#r002_execfromdevshm) | Exec from /dev/shm/ | High | KillProcessTree | T1059, T1027.011 |
-| [`R003_ExecFromVarTmp`](#r003_execfromvartmp) | Exec from /var/tmp/ | Medium | KillProcessTree | T1059 |
+| [`R003_ExecFromVarTmp`](#r003_execfromvartmp) | Exec from /var/tmp/ | High, Medium | KillProcessTree, Log | T1059 |
 | [`R004_ExecFromProcSelfFd`](#r004_execfromprocselffd) | Exec from /proc/<pid>/fd/* (memfd) | Critical | KillProcessTree | T1620 |
 | [`R005_NetcatExec`](#r005_netcatexec) | Netcat family launched | High | Log | T1095 |
 | [`R006_ReverseShellTooling`](#r006_reverseshelltooling) | Reverse shell tooling | Critical, High | KillProcessTree, Log | T1095, T1059.004 |
@@ -43,17 +43,17 @@ Exec from /tmp/ — category `execution`.
 
 | | |
 |---|---|
-| Severity | Medium |
-| Response | KillProcessTree |
+| Severity | High, Medium |
+| Response | KillProcessTree, Log |
 | ATT&CK | T1059 Command and Scripting Interpreter (Execution) |
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | unit+e2e+lab |
 
 **Observes.** The exec of a file under `/tmp/`, judged on the file the kernel executed (a relative path, a symlink or `..` resolves to it).
 
-**Known false positives.** An installer or a build that runs what it unpacked in `/tmp` is killed: the rule's whitelist is empty and the process allowlist does not apply. A root exec in an administrator's sudo/su session or a package transaction is R009's Low record instead (R009 runs first).
+**Known false positives.** Lot 283b: a person's exec (an account from `UID_MIN` up with a login shell) — `go test`'s binaries, `go run`, an AppImage, a build that runs what it unpacked in `/tmp` — is recorded at High below COMBAT, killed in COMBAT or under a signed `enforce`. A system account's exec (below `UID_MIN`, or a `nologin` shell: `www-data`, `postgres`, `nobody`) is killed in every posture: the whitelist is empty and the process allowlist does not apply. A root exec is R009's (R009 runs first; R001's kill of it waits for COMBAT).
 
-**How to test.** As an unprivileged user: `cp /bin/true /tmp/nn-r001 && /tmp/nn-r001`. Run as root it is R009's verdict.
+**How to test.** As a system account: `sudo -u www-data sh -c 'cp /bin/true /tmp/nn-r001 && /tmp/nn-r001'` (killed); as the lab user, the same is recorded at High. Run as root it is R009's verdict.
 
 **Tests.** `crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::fires_on_exec_from_tmp`, `agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it`, `deploy/lab/exec-sensor/exec-sensor-check.sh::R001_ExecFromTmp`
 
@@ -87,15 +87,15 @@ Exec from /var/tmp/ — category `execution`.
 
 | | |
 |---|---|
-| Severity | Medium |
-| Response | KillProcessTree |
+| Severity | High, Medium |
+| Response | KillProcessTree, Log |
 | ATT&CK | T1059 Command and Scripting Interpreter (Execution) |
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | unit |
 
 **Observes.** The exec of a file under `/var/tmp/`, the temporary directory that survives a reboot, judged on the file the kernel executed.
 
-**Known false positives.** A package scriptlet or an installer that runs from `/var/tmp` as an unprivileged user is killed; run as root in a package transaction or an administrator's session it is R009's Low record.
+**Known false positives.** As R001 (lot 283b): a person's exec from `/var/tmp` is recorded at High below COMBAT; a system account's (a package scriptlet run as one) is killed; run as root in a package transaction or an administrator's session it is R009's Low record.
 
 **How to test.** As an unprivileged user: `cp /bin/true /var/tmp/nn-r003 && /var/tmp/nn-r003`.
 
@@ -313,7 +313,7 @@ Namespace/escape tooling from non-standard path — category `privilege_escalati
 
 **Observes.** The exec of `nsenter`, `unshare` or `runc` from outside `/usr/bin`, `/bin`, `/usr/sbin` and `/sbin`; host-escape flags in argv (`-t`, `--mount`, `--privileged`, `--net=host`) are named in the reasoning.
 
-**Known false positives.** A container runtime that runs its own `runc` from a non-standard path (a bundled runtime under `/var/lib` or `/opt`) is killed until `runc` is allowlisted in `process-comm-allowlist` (`docs/operator/CONTAINER_HOST_DEPLOY.md`). An empty exec path never fires.
+**Known false positives.** Lot 283b: a container runtime's own `runc` from a non-standard path (k3s' `/var/lib/rancher/k3s/data/<hash>/bin/runc`, a bundle under `/opt`) is recorded at High, its kill held behind a switch a signed `enforce` turns on; allowlisting `runc` in `process-comm-allowlist` silences it (`docs/operator/CONTAINER_HOST_DEPLOY.md`). A copied `nsenter` or `unshare` is killed. An empty exec path never fires.
 
 **How to test.** `cp /usr/bin/unshare ~/unshare && ~/unshare --help`.
 
@@ -567,9 +567,9 @@ Executable mapping of a file from a staging location — category `malware_preve
 | [`NN-L-FIM-004_AuthorizedKeysModified`](#nn-l-fim-004_authorizedkeysmodified) | SSH authorized_keys modified | High | KillProcess | T1098.004 |
 | [`NN-L-FIM-005_LogTruncated`](#nn-l-fim-005_logtruncated) | Log file modified (truncation suspect) | High | Log | T1685.006 |
 | [`NN-L-FIM-006_OperatorBinaryModified`](#nn-l-fim-006_operatorbinarymodified) | Operator-installed binary modified | Medium | Log | T1554 |
-| [`NN-L-FIM-007_CronDropInCreated`](#nn-l-fim-007_crondropincreated) | Cron drop-in created | High, Low | KillProcess, Log | T1053.003 |
+| [`NN-L-FIM-007_CronDropInCreated`](#nn-l-fim-007_crondropincreated) | Cron drop-in created | High, Low | Log | T1053.003 |
 | [`NN-L-FIM-008_KernelModuleModified`](#nn-l-fim-008_kernelmodulemodified) | Kernel module file modified | Critical, Low | KillProcessTree, Log | T1547.006, T1014 |
-| [`NN-L-FIM-009_SystemdUnitDropped`](#nn-l-fim-009_systemdunitdropped) | Systemd unit file dropped or modified | High, Low | KillProcess, Log | T1543.002 |
+| [`NN-L-FIM-009_SystemdUnitDropped`](#nn-l-fim-009_systemdunitdropped) | Systemd unit file dropped or modified | High, Low | Log | T1543.002 |
 | [`NN-L-FIM-010_RansomwareExtensionRename`](#nn-l-fim-010_ransomwareextensionrename) | Ransomware extension rename | Critical | KillProcessTree | T1486 |
 | [`NN-L-FIM-011_AwsCredsRead`](#nn-l-fim-011_awscredsread) | AWS credentials read by non-CLI process | High | KillProcess, Log | T1552.001 |
 | [`NN-L-FIM-012_AzureCredsRead`](#nn-l-fim-012_azurecredsread) | Azure credentials read by non-CLI process | High | KillProcess, Log | T1552.001 |
@@ -728,16 +728,16 @@ Cron drop-in created — category `fim_persistence`.
 | | |
 |---|---|
 | Severity | High, Low |
-| Response | KillProcess, Log |
+| Response | Log |
 | ATT&CK | T1053.003 Scheduled Task/Job: Cron (Persistence) |
 | Sensor — data | file (file_open LSM, FIM drift) — DC0039 File Creation, DC0061 File Modification |
 | Validation | unit |
 
 **Observes.** A new or rewritten cron entry: a file under /etc/cron.d, /etc/cron.hourly, /etc/cron.daily, /etc/cron.weekly, /etc/cron.monthly or /var/spool/cron, or /etc/crontab itself. The several events of one crontab install or editor save draw one verdict; a second drop-in by the same process draws another.
 
-**Known false positives.** A package transaction is recorded at Low, and a write in an administrator's interactive sudo or su session (`sudo crontab -e`) at High. A user's own `crontab -e` is killed after the write (the entry stays).
+**Known false positives.** A package transaction is recorded at Low, and a write in an administrator's interactive sudo or su session (`sudo crontab -e`) at High. Lot 283b: any other writer is recorded at High, the kill of the writer held (it came after the write: the entry stays) — a signed `enforce` gives it back; preventing the entry is the kernel's deny and the persistence that repairs itself (Wave 3).
 
-**How to test.** `sudo systemd-run --wait cp /dev/null /etc/cron.d/nn-test`, then remove the file; expect High, KillProcess aimed at cp.
+**How to test.** `sudo systemd-run --wait cp /dev/null /etc/cron.d/nn-test`, then remove the file; expect High, the KillProcess aimed at cp held (Log).
 
 **Tests.** `crates/nn-core/src/fim/rules.rs::fim007_fires_on_cron_dropin_created_or_modified`, `crates/nn-core/src/fim/rules.rs::fim007_two_distinct_dropins_fire_twice`, `crates/nn-core/src/fim/rules.rs::package_manager_writes_are_logged_not_killed`
 
@@ -772,16 +772,16 @@ Systemd unit file dropped or modified — category `fim_persistence`.
 | | |
 |---|---|
 | Severity | High, Low |
-| Response | KillProcess, Log |
+| Response | Log |
 | ATT&CK | T1543.002 Create or Modify System Process: Systemd Service (Persistence) |
 | Sensor — data | file (file_open LSM, FIM drift) — DC0039 File Creation, DC0061 File Modification |
 | Validation | unit |
 
 **Observes.** A new or rewritten file under /etc/systemd/system, /lib/systemd/system or /usr/lib/systemd/system: a unit or a drop-in, a .timer included.
 
-**Known false positives.** Package transactions are recorded at Low; `sudo systemctl edit` and other writes in an interactive sudo or su session at High; the agent's own units, written while the operator's trusted-installer window is open, at Low.
+**Known false positives.** Package transactions are recorded at Low; `sudo systemctl edit` and other writes in an interactive sudo or su session at High; the agent's own units, written while the operator's trusted-installer window is open, at Low. Lot 283b: any other writer (a vendor's install script: k3s' `k3s.service`) is recorded at High, the kill of the writer held (it came after the write) — a signed `enforce` gives it back; preventing the unit is the kernel's deny and the persistence that repairs itself (Wave 3).
 
-**How to test.** `sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.service`, then remove it; expect High, KillProcess aimed at cp.
+**How to test.** `sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.service`, then remove it; expect High, the KillProcess aimed at cp held (Log).
 
 **Tests.** `crates/nn-core/src/fim/rules.rs::fim009_fires_on_systemd_unit_dropped_or_modified`, `crates/nn-core/src/fim/rules.rs::fim009_downgrades_own_unit_under_open_window`
 

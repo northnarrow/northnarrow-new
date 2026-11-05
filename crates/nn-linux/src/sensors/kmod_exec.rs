@@ -66,6 +66,7 @@ use std::path::Path;
 
 use common::wire::exe::exe_flags;
 use nn_core::decision::rules::kmod_exec_facts::{self, Environment, ExecFacts, KMOD_TOOLS};
+use nn_core::posture::lineage::PACKAGE_MANAGER_EXES;
 use nn_model::{Event, ExeIdentity};
 
 use crate::anti_tamper::filesystem::stat_dev_to_kernel_dev;
@@ -115,10 +116,61 @@ pub fn facts(root: &Path, event: &Event) -> Option<ExecFacts> {
     }
     // the environment first: the process may be short-lived
     let environment = environment(Path::new("/proc"), *pid, *start_ns);
+    // lot 283b: and the lineage, while it is alive
+    let package_manager = package_manager(Path::new("/proc"), *pid);
     Some(ExecFacts {
         program: program(root, exe),
         environment,
+        package_manager,
     })
+}
+
+/// Lot 283b: the nearest package manager proper in `pid`'s lineage — `pid`
+/// itself, then its parents (`/proc/<pid>/stat`'s ppid), at most
+/// [`LINEAGE_HOPS`] up — by what the kernel executed (`/proc/<pid>/exe`,
+/// one of [`PACKAGE_MANAGER_EXES`]) and run by root (`/proc/<pid>/status`'
+/// real uid): the package transaction's criterion, read at the exec while
+/// the forks between the tool and the package manager are alive. `None`
+/// when the walk finds none, or loses the chain (an ancestor gone).
+pub fn package_manager(proc: &Path, pid: u32) -> Option<String> {
+    let mut p = pid;
+    for _ in 0..=LINEAGE_HOPS {
+        if p <= 1 {
+            return None;
+        }
+        let dir = proc.join(p.to_string());
+        if let Ok(exe) = std::fs::read_link(dir.join("exe")) {
+            let exe = exe.to_string_lossy().into_owned();
+            if PACKAGE_MANAGER_EXES.contains(&exe.as_str()) && real_uid(&dir) == Some(0) {
+                return Some(exe);
+            }
+        }
+        p = ppid(&dir)?;
+    }
+    None
+}
+
+/// The most parents [`package_manager`] walks up (the lineage's own cap).
+const LINEAGE_HOPS: usize = 32;
+
+/// The parent of the process at `dir` (`stat`'s fourth field, after the
+/// command name in parentheses, which may hold anything).
+fn ppid(dir: &Path) -> Option<u32> {
+    let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The real uid of the process at `dir` (`status`' `Uid:` line).
+fn real_uid(dir: &Path) -> Option<u32> {
+    let status = std::fs::read_to_string(dir.join("status")).ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// `Ok` when the file the kernel executed is the system's module tool
@@ -359,6 +411,59 @@ fn has_memory(stat: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Lot 283b: the package manager in the lineage, read from a `/proc`
+    /// — the nearest, by its executable, run by root; a chain that breaks
+    /// (a parent gone) or ends at init names none.
+    #[test]
+    fn the_package_manager_in_the_lineage_is_read_at_the_exec() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let proc = tmp.path();
+        let mk = |pid: u32, ppid: u32, exe: &str, uid: u32| {
+            let d = proc.join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("stat"),
+                format!("{pid} (a (b) c) S {ppid} 1 1 0 -1 4194560 0 0\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                d.join("status"),
+                format!("Name:\tx\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(exe, d.join("exe")).unwrap();
+        };
+        // apt-get (10) → dpkg (20) → postinst (30) → update-initramfs (40)
+        // → mkinitramfs (50) → fork (60) → fork (70) → hooks/kmod (80)
+        mk(10, 1, "/usr/bin/apt-get", 0);
+        mk(20, 10, "/usr/bin/dpkg", 0);
+        mk(30, 20, "/usr/bin/dash", 0);
+        mk(40, 30, "/usr/bin/dash", 0);
+        mk(50, 40, "/usr/bin/dash", 0);
+        mk(60, 50, "/usr/bin/dash", 0);
+        mk(70, 60, "/usr/bin/dash", 0);
+        mk(80, 70, "/usr/bin/dash", 0);
+        assert_eq!(package_manager(proc, 80).as_deref(), Some("/usr/bin/dpkg"));
+        // a user's dpkg vouches for nothing; the walk goes on to apt-get
+        mk(120, 10, "/usr/bin/dpkg", 1000);
+        mk(130, 120, "/usr/bin/dash", 0);
+        assert_eq!(
+            package_manager(proc, 130).as_deref(),
+            Some("/usr/bin/apt-get")
+        );
+        // a chain that breaks (its parent 999 gone), or ends at init
+        mk(200, 999, "/usr/bin/dash", 0);
+        assert_eq!(package_manager(proc, 200), None);
+        mk(300, 1, "/usr/bin/bash", 0);
+        mk(310, 300, "/usr/bin/kmod", 0);
+        assert_eq!(package_manager(proc, 310), None);
+        // a process named like a package manager is not one
+        mk(400, 1, "/tmp/dpkg", 0);
+        mk(410, 400, "/usr/bin/dash", 0);
+        assert_eq!(package_manager(proc, 410), None);
+    }
+
     use super::*;
     use std::process::{Child, Command, Stdio};
 

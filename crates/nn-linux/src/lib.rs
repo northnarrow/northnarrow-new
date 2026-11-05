@@ -54,6 +54,10 @@
 //! docs/architecture/module-map.toml, checked by
 //! xtask/tests/workspace_layers.rs.
 
+// Lot 283b: whose account a uid is (`login.defs`, `passwd`), for the
+// decision engine's host.
+pub mod accounts;
+
 // The per-install agent identity (`/var/lib/northnarrow/agent_id`), read
 // once at boot (R09a, lab PR 253; was the agent's `agent_id`).
 pub mod agent_id;
