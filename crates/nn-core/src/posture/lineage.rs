@@ -2175,6 +2175,27 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         None
     }
 
+    /// Lot 283c: the systemd service `pid` runs in now — its placing cgroup
+    /// is `/system.slice/[…slice/]<unit>.service`
+    /// ([`crate::posture::daemon_data::system_service`]) — or `None` (a
+    /// session's scope, a container's, a process gone).
+    pub fn system_service(&self, pid: u32) -> Option<String> {
+        let path = self.cgroup_path(pid)?;
+        crate::posture::daemon_data::system_service(&path).map(str::to_string)
+    }
+
+    /// Lot 283c: whose account `uid` is
+    /// ([`crate::decision::host::classify_account`]), from the host's
+    /// `etc/login.defs` and `etc/passwd`, read now (a file that cannot be
+    /// read: `UID_MIN` 1000, no entry).
+    pub fn account_kind(&self, uid: u32) -> crate::decision::host::AccountKind {
+        use crate::decision::host::{classify_account, shells, uid_min};
+        let read = |f: &str| H::read_to_string(self.inner.host_root.join(f)).unwrap_or_default();
+        let uid_min = uid_min(&read("etc/login.defs"));
+        let shells = shells(&read("etc/passwd"));
+        classify_account(uid, uid_min, shells.get(&uid).map(String::as_str))
+    }
+
     /// The cgroup path that places `pid` ([`placing_cgroup`]).
     fn cgroup_path(&self, pid: u32) -> Option<String> {
         if pid == 0 {

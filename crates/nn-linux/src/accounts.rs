@@ -18,7 +18,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use nn_core::decision::host::{classify_account, AccountKind, DEFAULT_UID_MIN};
+use nn_core::decision::host::{classify_account, AccountKind};
 use parking_lot::Mutex;
 
 const LOGIN_DEFS: &str = "/etc/login.defs";
@@ -56,36 +56,9 @@ fn read(path: &str) -> String {
     .unwrap_or_default()
 }
 
-/// `UID_MIN` of a `login.defs` text: its last valid setting, else
-/// [`DEFAULT_UID_MIN`].
-pub fn uid_min(login_defs: &str) -> u32 {
-    let mut found = DEFAULT_UID_MIN;
-    for line in login_defs.lines() {
-        let mut words = line.split_whitespace();
-        if words.next() == Some("UID_MIN") {
-            if let Some(n) = words.next().and_then(|w| w.parse::<u32>().ok()) {
-                found = n;
-            }
-        }
-    }
-    found
-}
-
-/// The shell of each uid of a `passwd` text — the first entry of a uid,
-/// as `getpwuid(3)` finds it.
-pub fn shells(passwd: &str) -> HashMap<u32, String> {
-    let mut out = HashMap::new();
-    for line in passwd.lines() {
-        let f: Vec<&str> = line.split(':').collect();
-        if f.len() < 7 || f[0].starts_with('+') || f[0].starts_with('-') {
-            continue;
-        }
-        if let Ok(uid) = f[2].parse::<u32>() {
-            out.entry(uid).or_insert_with(|| f[6].to_string());
-        }
-    }
-    out
-}
+/// `UID_MIN` of a `login.defs` text, and the shell of each uid of a
+/// `passwd` text: nn-core's (lot 283c: the posture reads them too).
+pub use nn_core::decision::host::{shells, uid_min};
 
 /// Whose account `uid` is on this host.
 pub fn kind(uid: u32) -> AccountKind {

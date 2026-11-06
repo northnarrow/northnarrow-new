@@ -92,6 +92,12 @@ pub fn parse_line(raw: &str) -> Result<Option<String>, String> {
     if entry.is_empty() {
         return Err("empty entry after `+`".to_string());
     }
+    // Lot 283c: `<unit>.service <dir>/` names a daemon's data directory
+    // (`super::daemon_data`), no carve-out: checked as such, and left to
+    // `load_daemon_data_extras`.
+    if is_daemon_line(entry) {
+        return super::daemon_data::parse_entry(entry).map(|_| None);
+    }
     if !entry.starts_with('/') {
         return Err(format!("`{entry}`: not an absolute path prefix"));
     }
@@ -100,9 +106,19 @@ pub fn parse_line(raw: &str) -> Result<Option<String>, String> {
     Ok(Some(folded))
 }
 
+/// Lot 283c: an entry whose first word names a systemd service is a
+/// daemon's data directory, not a path prefix.
+fn is_daemon_line(entry: &str) -> bool {
+    !entry.starts_with('/')
+        && entry
+            .split_whitespace()
+            .next()
+            .is_some_and(|w| w.ends_with(".service"))
+}
+
 /// `entry` with every run of `/` folded into one (its final `/`, which
 /// makes it a directory rather than a name prefix, kept).
-fn fold_slashes(entry: &str) -> String {
+pub(crate) fn fold_slashes(entry: &str) -> String {
     let mut out = String::with_capacity(entry.len());
     for c in entry.chars() {
         if c == '/' && out.ends_with('/') {
@@ -114,7 +130,7 @@ fn fold_slashes(entry: &str) -> String {
 }
 
 /// Why a folded entry covers too much, if it does.
-fn too_broad(entry: &str) -> Result<(), String> {
+pub(crate) fn too_broad(entry: &str) -> Result<(), String> {
     let comps: Vec<&str> = entry.split('/').filter(|c| !c.is_empty()).collect();
     if comps.iter().any(|c| *c == "." || *c == "..") {
         return Err("a `.` or `..` component (write the directory itself)".to_string());
@@ -228,6 +244,37 @@ pub fn load_mass_write_carveout_extras(local: &Verified) -> Vec<String> {
     out
 }
 
+/// Lot 283c: the daemons' data directories the overlay adds
+/// (`+<unit>.service <dir>/` lines; [`super::daemon_data`]), as the
+/// signed-overlay gate verified it; its carve-out lines are
+/// [`load_mass_write_carveout_extras`]'s. A refused line was a WARN there.
+/// A non-empty result is one WARN listing it.
+pub fn load_daemon_data_extras(local: &Verified) -> Vec<(String, String)> {
+    let (Some(body), Some(local_path)) = (local.text(), local.source()) else {
+        return Vec::new();
+    };
+    let out: Vec<(String, String)> = body
+        .lines()
+        .filter_map(|raw| {
+            let line = raw.split_once('#').map_or(raw, |(b, _)| b).trim();
+            let entry = line.strip_prefix('+').unwrap_or(line).trim();
+            if !is_daemon_line(entry) {
+                return None;
+            }
+            super::daemon_data::parse_entry(entry).ok().flatten()
+        })
+        .collect();
+    if !out.is_empty() {
+        warn!(
+            path = %local_path.display(),
+            daemon_data = ?out,
+            "mass-write overlay: these daemons' own writes in these directories do not raise \
+             the mass-write arm (the ransomware tracker still counts them)"
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +373,34 @@ mod tests {
             assert!(msg.contains(&format!("`{entry}`")), "{body}: {msg}");
             assert!(msg.contains(why), "{body}: {msg}");
         }
+    }
+
+    /// Lot 283c: a daemon's data directory in the overlay is no carve-out;
+    /// it is checked as an entry of the daemons' list and loaded apart.
+    #[test]
+    fn daemon_lines_are_no_carveouts() {
+        let body = "+/srv/build/\n\
+                    +minio.service /srv/minio/\n\
+                    containerd.service //var/lib/containerd\n\
+                    +x.service /home/alice/\n\
+                    +x.scope /srv/y/\n";
+        let (carveouts, refused) = parse_text(body);
+        assert_eq!(carveouts, vec!["/srv/build/".to_string()]);
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert_eq!(refused[0].0, 4);
+        assert!(refused[0].1.contains("whole user's tree"), "{refused:?}");
+        assert_eq!(refused[1].0, 5);
+        assert_eq!(
+            load_daemon_data_extras(&overlay(body)),
+            vec![
+                ("minio.service".to_string(), "/srv/minio/".to_string()),
+                (
+                    "containerd.service".to_string(),
+                    "/var/lib/containerd/".to_string()
+                ),
+            ]
+        );
+        assert!(load_daemon_data_extras(&Verified::Missing).is_empty());
     }
 
     /// What legitimate overlays carry still loads: the BUG-017 dev-host

@@ -38,6 +38,7 @@
 
 pub mod clock;
 pub mod corroboration;
+pub mod daemon_data;
 pub mod entry;
 pub mod escalation_allow;
 pub mod exempt;
@@ -429,6 +430,13 @@ impl<H: DecisionHost> PostureMachine<H> {
     /// the trigger never fires. Set once; a second call is ignored.
     pub fn set_ransom_tracker(&self, tracker: Arc<crate::impact::RansomTracker<H>>) {
         self.inner.triggers.set_ransom_tracker(tracker);
+    }
+
+    /// Lot 283c: the daemons' data directories, in the order the file-open
+    /// sensor tagged them: the mass-write arm leaves out a crossing of a
+    /// listed unit's own data. Unwired, such a crossing counts. Set once.
+    pub fn set_daemon_data(&self, data: Arc<daemon_data::DaemonData>) {
+        self.inner.triggers.set_daemon_data(data);
     }
 
     /// Lab PR 225: the security-tool detector the rules share; the posture

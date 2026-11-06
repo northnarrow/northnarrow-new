@@ -29,7 +29,7 @@ use common::wire::open_sensor::{
     open_class::{
         CHILDREN_PROBE, CHILD_FILES, DIR_HAS_FILES, FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE,
         LEAF_CRED, LEAVES_CRED, SUBTREE, TREE_CARVEOUT, TREE_CRED, TREE_CRITICAL, TREE_HOME,
-        TREE_PERSIST, TREE_RUNTIME,
+        TREE_PERSIST, TREE_RUNTIME, TREE_SVC_DATA, TREE_UNIT_DATA, TREE_USER_CACHE, UNIT_TAG_SHIFT,
     },
     open_reason, ChildRuleKey, OpenRecordRaw, CHILD_RULES_MAX, OPEN_CLASSIFY_DEPTH, OPEN_NAME_LEN,
     OPEN_NAME_RULES_MAX, OPEN_PATH_SLOTS, OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX, OPEN_SENSOR_ARMED,
@@ -156,30 +156,101 @@ pub struct RuleInputs {
     pub homes: Vec<PathBuf>,
     /// `/run/user/<uid>` mount roots and their uid.
     pub runtime: Vec<(PathBuf, u32)>,
+    /// Lot 283c: the trees a service account's own files are its own data
+    /// in (`TREE_SVC_DATA`): `/var/lib` (`None`: any owner) and each
+    /// service account's home with its uid ([`account_dirs`]).
+    pub svc_data: Vec<(PathBuf, Option<u32>)>,
+    /// Lot 283c: each person's `~/.cache` and its owner
+    /// (`TREE_USER_CACHE`).
+    pub caches: Vec<(PathBuf, u32)>,
+    /// Lot 283c: the daemons' data directories, in tag order
+    /// (`TREE_UNIT_DATA`; nn-core's `posture::daemon_data`).
+    pub unit_dirs: Vec<String>,
+}
+
+/// Lot 283c: what the agent adds to the file-open sensor's rules from its
+/// configuration — the operator's mass-write carve-outs and the daemons'
+/// data directories (in tag order) — read once at boot and at every
+/// refresh.
+#[derive(Debug, Clone, Default)]
+pub struct OpenSensorExtras {
+    pub carveout: Vec<String>,
+    pub unit_dirs: Vec<String>,
 }
 
 impl RuleInputs {
     /// The agent's own lists, the probe directory, `/root` and the home
-    /// of every account ([`home_roots`]), and the runtime directories
-    /// under `/run/user`.
-    pub fn from_host(carveout_extras: &[String]) -> Self {
+    /// of every account ([`home_roots`]), the runtime directories under
+    /// `/run/user`, and (lot 283c) the own-data trees: `/var/lib`, the
+    /// service accounts' homes, the persons' `~/.cache` ([`account_dirs`])
+    /// and the daemons' directories of `extras`.
+    pub fn from_host(extras: &OpenSensorExtras) -> Self {
         use crate::posture::triggers::{
             CRITICAL_FILES_PREFIXES, MASS_WRITE_CARVEOUT_PREFIXES, PERSISTENCE_PREFIXES,
             SENSITIVE_FILES,
         };
         let own = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut carveout = own(MASS_WRITE_CARVEOUT_PREFIXES);
-        carveout.extend(carveout_extras.iter().cloned());
+        carveout.extend(extras.carveout.iter().cloned());
+        let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+        let login_defs = std::fs::read_to_string("/etc/login.defs").unwrap_or_default();
+        let (svc_homes, caches) =
+            account_dirs(&passwd, nn_core::decision::host::uid_min(&login_defs));
+        let mut svc_data = vec![(PathBuf::from("/var/lib"), None)];
+        svc_data.extend(svc_homes.into_iter().map(|(h, uid)| (h, Some(uid))));
         RuleInputs {
             sensitive: own(SENSITIVE_FILES),
             critical: own(CRITICAL_FILES_PREFIXES),
             persistence: own(PERSISTENCE_PREFIXES),
             carveout,
             probe_dir: PathBuf::from(crate::telemetry_probe::PROBE_DIR),
-            homes: home_roots(&std::fs::read_to_string("/etc/passwd").unwrap_or_default()),
+            homes: home_roots(&passwd),
             runtime: runtime_dirs(Path::new("/run/user")),
+            svc_data,
+            caches,
+            unit_dirs: extras.unit_dirs.clone(),
         }
     }
+}
+
+/// Lot 283c: a directory and the uid it belongs to.
+pub type OwnedDir = (PathBuf, u32);
+
+/// Lot 283c: from a `passwd` text and `UID_MIN`, the homes of the service
+/// accounts (nn-core's `AccountKind::System`: below `UID_MIN`, or a shell
+/// that refuses a login) and each person's `~/.cache`
+/// (`AccountKind::Human`), each with its uid — root's never, nor a home
+/// that is a shared system directory ([`is_shared_system_dir`]) or not
+/// absolute. [`RuleSet::build`] keeps the directories that exist, are no
+/// symbolic link and belong to their account.
+pub fn account_dirs(passwd: &str, uid_min: u32) -> (Vec<OwnedDir>, Vec<OwnedDir>) {
+    use nn_core::decision::host::{classify_account, AccountKind};
+    let mut svc = Vec::new();
+    let mut caches = Vec::new();
+    for line in passwd.lines() {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() < 7 || f[0].starts_with('+') || f[0].starts_with('-') {
+            continue;
+        }
+        let Ok(uid) = f[2].parse::<u32>() else {
+            continue;
+        };
+        let home = PathBuf::from(f[5]);
+        if !f[5].starts_with('/') || is_shared_system_dir(&home) {
+            continue;
+        }
+        match classify_account(uid, uid_min, Some(f[6])) {
+            AccountKind::System if !svc.iter().any(|(h, _)| *h == home) => svc.push((home, uid)),
+            AccountKind::Human => {
+                let cache = home.join(".cache");
+                if !caches.iter().any(|(c, _)| *c == cache) {
+                    caches.push((cache, uid));
+                }
+            }
+            _ => {}
+        }
+    }
+    (svc, caches)
 }
 
 /// External audit SNS-010: declared homes that are directories every
@@ -271,6 +342,15 @@ pub fn home_roots(passwd: &str) -> Vec<PathBuf> {
     out
 }
 
+/// Lot 283c: the metadata of `dir` when it is a directory itself (no
+/// symbolic link followed at its last component) owned by `owner` (any
+/// owner for `None`).
+fn owned_dir(dir: &Path, owner: Option<u32>) -> Option<std::fs::Metadata> {
+    std::fs::symlink_metadata(dir)
+        .ok()
+        .filter(|m| m.is_dir() && owner.is_none_or(|o| m.uid() == o))
+}
+
 /// `/run/user/<uid>` directories and their uid.
 pub fn runtime_dirs(base: &Path) -> Vec<(PathBuf, u32)> {
     let Ok(rd) = std::fs::read_dir(base) else {
@@ -327,7 +407,55 @@ impl RuleSet {
         for (name, parent, bits) in CRED_NAME_RULES {
             *set.names.entry(name_key(name, parent)).or_default() |= bits;
         }
+        // Lot 283c: the own-data trees. The kernel still counts every write
+        // there; it tells the posture whose own data a window's files were.
+        for (dir, owner) in &inputs.svc_data {
+            if let Some(m) = owned_dir(dir, *owner) {
+                *set.inodes.entry(key_of(&m)).or_default() |= TREE_SVC_DATA;
+            }
+        }
+        for (dir, uid) in &inputs.caches {
+            if let Some(m) = owned_dir(dir, Some(*uid)) {
+                let k = key_of(&m);
+                *set.inodes.entry(k).or_default() |= TREE_USER_CACHE;
+                set.runtime.insert(k, *uid);
+            }
+        }
+        for (tag, dir) in inputs.unit_dirs.iter().enumerate() {
+            set.add_unit_dir(dir, tag as u32);
+        }
         set
+    }
+
+    /// Lot 283c: a daemon's data directory, tagged with its index in the
+    /// list. Placed as a carve-out is (walked from `/`, no symbolic link
+    /// followed: one refuses it); a missing directory whose parent exists
+    /// is a rule under that parent by its name, one missing deeper waits
+    /// for the next refresh (a rule higher up would tag a wider tree).
+    fn add_unit_dir(&mut self, dir: &str, tag: u32) {
+        let bits = TREE_UNIT_DATA | (tag << UNIT_TAG_SHIFT);
+        match place_carveout(Path::new(dir)) {
+            Ok(CarveoutPlace::Dir(m)) => {
+                *self.inodes.entry(key_of(&m)).or_default() |= bits;
+            }
+            Ok(CarveoutPlace::Missing {
+                parent,
+                name,
+                direct: true,
+            }) => {
+                let key = ChildRuleKey {
+                    parent: key_of(&parent),
+                    name: name32(&name),
+                };
+                *self.children.entry(key).or_default() |= bits;
+            }
+            Ok(CarveoutPlace::Missing { direct: false, .. }) => {}
+            Ok(CarveoutPlace::Link(at)) => self.refused.push(format!(
+                "{dir}: `{}` is a symbolic link — a daemon's data directory never follows one",
+                at.display()
+            )),
+            Ok(CarveoutPlace::NotDir) | Err(_) => self.skipped.push(dir.to_string()),
+        }
     }
 
     /// One mass-write carve-out: a directory rule (its subtree), or, while
@@ -1304,6 +1432,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             cgroup_window: r.reason & open_reason::MASS_OVERWRITE_CGROUP != 0,
             small_files: r.reason & open_reason::MASS_OVERWRITE_SMALL != 0 && r.reason & large == 0,
             cgroup_id: r.cgroup,
+            own_data: r.own,
         });
     }
     // Lab PR 225: the rename and unlink bursts (`inode_rename`,
@@ -1320,6 +1449,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             filename: filename.clone(),
             timestamp_ns: r.timestamp_ns,
             cgroup_id: r.cgroup,
+            own_data: 0,
         });
     }
     if r.reason & open_reason::MASS_UNLINK != 0 {
@@ -1334,6 +1464,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             filename,
             timestamp_ns: r.timestamp_ns,
             cgroup_id: r.cgroup,
+            own_data: r.own,
         });
     }
     out
@@ -1542,9 +1673,9 @@ impl DepthCapLog {
 pub fn refresh(
     maps: &mut OpenSensorMaps,
     current: &RuleSet,
-    carveout_extras: &[String],
+    extras: &OpenSensorExtras,
 ) -> Option<Applied> {
-    let next = RuleSet::build(&RuleInputs::from_host(carveout_extras));
+    let next = RuleSet::build(&RuleInputs::from_host(extras));
     if next == *current {
         return None;
     }
@@ -2194,6 +2325,7 @@ mod tests {
             cgroup_window: false,
             small_files: false,
             cgroup_id: 0,
+            own_data: 0,
         };
         rt.block_on(async {
             tx.send(mass(100)).await.unwrap();
@@ -2467,6 +2599,163 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Lot 283c: a crossing's own-data summary reaches its event — a mass
+    /// write's and an unlink burst's; a rename burst carries none.
+    #[test]
+    fn the_own_data_summary_reaches_the_events() {
+        use common::wire::open_sensor::own_data;
+        let mut mounts = MountTable::default();
+        mounts.roots.insert((7, 2), "/".into());
+        mounts.loaded = Some(Instant::now());
+        let mut r = record(
+            open_reason::MASS_OVERWRITE,
+            &[
+                "2833",
+                "16384",
+                "base",
+                "main",
+                "16",
+                "postgresql",
+                "lib",
+                "var",
+                "/",
+            ],
+            (7, 2),
+        );
+        r.own = own_data::SERVICE;
+        assert!(matches!(
+            &events_of(&r, &mut mounts)[..],
+            [Event::MassWrite {
+                own_data: own_data::SERVICE,
+                ..
+            }]
+        ));
+        r.reason = open_reason::MASS_UNLINK;
+        r.own = own_data::UNIT_BASE + 2;
+        assert!(matches!(
+            &events_of(&r, &mut mounts)[..],
+            [Event::FileBurst {
+                kind: nn_model::FileBurstKind::Unlink,
+                own_data: 5,
+                ..
+            }]
+        ));
+        r.reason = open_reason::MASS_RENAME;
+        assert!(matches!(
+            &events_of(&r, &mut mounts)[..],
+            [Event::FileBurst {
+                kind: nn_model::FileBurstKind::RenameExtension,
+                own_data: 0,
+                ..
+            }]
+        ));
+        r.reason = open_reason::MASS_OVERWRITE;
+        r.own = own_data::NONE;
+        assert!(matches!(
+            &events_of(&r, &mut mounts)[..],
+            [Event::MassWrite { own_data: 0, .. }]
+        ));
+    }
+
+    /// Lot 283c: the service accounts' homes and the persons' caches, from
+    /// the account database — never root's, never a shared directory.
+    #[test]
+    fn account_dirs_are_service_homes_and_persons_caches() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+                      daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
+                      postgres:x:113:120::/var/lib/postgresql:/bin/bash\n\
+                      redis:x:114:121::/var/lib/redis:/usr/sbin/nologin\n\
+                      www-data:x:33:33::/var/www:/usr/sbin/nologin\n\
+                      nobody:x:65534:65534::/nonexistent:/usr/sbin/nologin\n\
+                      alice:x:1000:1000::/home/alice:/bin/bash\n\
+                      bob:x:1001:1001::/home/bob:/bin/zsh\n\
+                      ci:x:1002:1002::/srv/ci:/usr/sbin/nologin\n\
+                      shared:x:1003:1003::/tmp:/bin/bash\n\
+                      rel:x:1004:1004::home/rel:/bin/bash\n";
+        let (svc, caches) = account_dirs(passwd, 1000);
+        assert_eq!(
+            svc,
+            vec![
+                (PathBuf::from("/var/lib/postgresql"), 113),
+                (PathBuf::from("/var/lib/redis"), 114),
+                (PathBuf::from("/var/www"), 33),
+                (PathBuf::from("/srv/ci"), 1002),
+            ]
+        );
+        assert_eq!(
+            caches,
+            vec![
+                (PathBuf::from("/home/alice/.cache"), 1000),
+                (PathBuf::from("/home/bob/.cache"), 1001),
+            ]
+        );
+    }
+
+    /// Lot 283c: the own-data trees reach the kernel's rules — a tree of a
+    /// service account only where its account owns it, a person's cache
+    /// with its owner, a daemon's directory with its tag (a missing one
+    /// under its parent; never through a symbolic link).
+    #[test]
+    fn own_data_trees_become_rules() {
+        use common::wire::open_sensor::open_class::UNIT_TAG_MASK;
+        let t = tempfile::TempDir::new().unwrap();
+        let me = std::fs::metadata(t.path()).unwrap().uid();
+        let dir = |p: &str| {
+            let d = t.path().join(p);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let key = |p: &Path| key_of(&std::fs::symlink_metadata(p).unwrap());
+        let (lib, home, cache, data) = (dir("lib"), dir("svc"), dir("u/.cache"), dir("cd"));
+        std::os::unix::fs::symlink(&data, t.path().join("link")).unwrap();
+        let inputs = RuleInputs {
+            svc_data: vec![
+                (lib.clone(), None),
+                (home.clone(), Some(me)),
+                (dir("theirs"), Some(me.wrapping_add(1))),
+            ],
+            caches: vec![(cache.clone(), me), (t.path().join("v/.cache"), me)],
+            unit_dirs: vec![
+                format!("{}/", data.display()),
+                format!("{}/run-k3s/", t.path().display()),
+                format!("{}/link/", t.path().display()),
+                format!("{}/a/b/", t.path().display()),
+            ],
+            ..RuleInputs::default()
+        };
+        let set = RuleSet::build(&inputs);
+        assert_eq!(set.inodes.get(&key(&lib)), Some(&TREE_SVC_DATA));
+        assert_eq!(set.inodes.get(&key(&home)), Some(&TREE_SVC_DATA));
+        assert_eq!(
+            set.inodes.get(&key(&t.path().join("theirs"))),
+            None,
+            "another's"
+        );
+        assert_eq!(set.inodes.get(&key(&cache)), Some(&TREE_USER_CACHE));
+        assert_eq!(set.runtime.get(&key(&cache)), Some(&me));
+        assert_eq!(set.inodes.get(&key(&data)), Some(&TREE_UNIT_DATA));
+        let missing = ChildRuleKey {
+            parent: key(t.path()),
+            name: name32("run-k3s"),
+        };
+        assert_eq!(
+            set.children.get(&missing),
+            Some(&(TREE_UNIT_DATA | (1 << UNIT_TAG_SHIFT)))
+        );
+        assert!(
+            set.refused.iter().any(|r| r.contains("link")),
+            "{:?}",
+            set.refused
+        );
+        assert!(
+            set.children
+                .values()
+                .all(|b| b & UNIT_TAG_MASK != 3 << UNIT_TAG_SHIFT),
+            "a directory missing deeper waits"
+        );
+        assert!(!set.children.keys().any(|k| k.name == name32("a")));
     }
 
     /// External audit EBPF-011: the cgroup window's crossing is an

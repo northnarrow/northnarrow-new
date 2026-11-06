@@ -343,6 +343,10 @@ NETFLOW_COMM_ALLOWLIST_V1_SRC="$REPO_ROOT/configs/netflow-comm-allowlist.v1"
 # Shipped content like the other .v1 lists (install_shipped_v1); protected
 # by PROTECTED_INODES; no overlay yet.
 SECURITY_TOOLS_V1_SRC="$REPO_ROOT/configs/security-tools.v1"
+# Lot 283c: the daemons' data directories (the mass-write arm's own-data
+# exemption). Shipped content like the other .v1 lists; the operator adds
+# entries in the signed mass-write overlay (`+<unit>.service <dir>/`).
+DAEMON_DATA_V1_SRC="$REPO_ROOT/configs/daemon-data.v1"
 # Beta Step 4b: empty-by-default COMBAT management carve-out CIDR list.
 COMBAT_ALLOW_CIDRS_SRC="$REPO_ROOT/configs/combat-allow.cidrs"
 
@@ -928,7 +932,7 @@ txn_targets() {
     echo "$JOURNALD_NS_CONF"
     echo "$ETC_DIR/install-manifest.json"
     for f in fim-paths netflow-blocklist netflow-ja3-blocklist process-comm-allowlist netflow-comm-allowlist \
-             security-tools; do
+             security-tools daemon-data; do
         echo "$ETC_DIR/$f.v1"
     done
     echo "$ETC_DIR/process-comm-allowlist.local.example"
@@ -2129,6 +2133,7 @@ declare -A SHIPPED_V1_EARLIER=(
     [process-comm-allowlist.v1]="4a3a973fff7875d6050b458778031c1e69f2ed0181bbde9da52854a1f16fe730 e99ae04a743682c471899cc997e7d5da6c055c043706d398e55aa976f0669b94"
     [netflow-comm-allowlist.v1]="4fca39d4d5a35da6fb5409bf25f76ce9020f444f4ac553b3c3ecda3ad9277f10"
     [security-tools.v1]=""
+    [daemon-data.v1]=""
 )
 install_shipped_v1() {
     local name=$1 src=$2 what=$3 dst="$ETC_DIR/$1" on_disk keep
@@ -2160,8 +2165,11 @@ install_shipped_v1() {
     install -m 0644 -o root -g root "$src" "$dst"
     echo "install.sh: WARNING: $dst was no list NorthNarrow shipped (edited by hand?): kept as $keep," >&2
     echo "install.sh:   the shipped $what installed — the agent applies only the shipped list. Move what you" >&2
+    # lot 283c: the daemons' directories are added in the mass-write overlay
+    local overlay=${name%.v1}
+    [[ $name == daemon-data.v1 ]] && overlay=mass-write-carveout
     echo "install.sh:   need into the signed overlay (+entry adds, -entry disables a shipped entry):" >&2
-    echo "install.sh:     nn-admin config overlay set ${name%.v1} --file <overlay> --key <config-manage key>" >&2
+    echo "install.sh:     nn-admin config overlay set $overlay --file <overlay> --key <config-manage key>" >&2
     if command -v diff >/dev/null 2>&1; then
         echo "install.sh:   shipped -> yours (+ yours only, - shipped entries you removed; first 40 lines):" >&2
         diff -u "$src" "$keep" | sed -n '3,42{s/^/install.sh:     /;p}' >&2 || true
@@ -2173,6 +2181,7 @@ install_shipped_v1 netflow-ja3-blocklist.v1 "$NETFLOW_JA3_BLOCKLIST_V1_SRC" "Net
 install_shipped_v1 process-comm-allowlist.v1 "$PROCESS_COMM_ALLOWLIST_V1_SRC" "process comm allowlist"
 install_shipped_v1 netflow-comm-allowlist.v1 "$NETFLOW_COMM_ALLOWLIST_V1_SRC" "NetFlow comm allowlist"
 install_shipped_v1 security-tools.v1 "$SECURITY_TOOLS_V1_SRC" "list of security tools"
+install_shipped_v1 daemon-data.v1 "$DAEMON_DATA_V1_SRC" "list of the daemons' data directories"
 
 # COMBAT rulesets (iptables-restore bodies for the NORTHNARROW_COMBAT
 # chain, v4 + v6). Load-bearing beyond isolation: without a loadable

@@ -43,13 +43,14 @@ use aya_ebpf::{
 use northnarrow_common::wire::open_sensor::{
     open_class::{
         CHILDREN_PROBE, CHILD_FILES, CLASSIFIED, DEPTH_CAPPED, DIRECT, DIR_HAS_FILES,
-        FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE, LEAF_CRED, LEAVES_CRED, SUBTREE,
+        FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE, LEAF_CRED, LEAVES_CRED, OWN_DATA_BITS, SUBTREE,
         TREE_CARVEOUT, TREE_CRED, TREE_CRITICAL, TREE_HOME, TREE_PERSIST, TREE_RUNTIME,
+        TREE_USER_CACHE,
     },
     carved_class, cgroup_step, created_in_window, destroys_an_original, first_in_window,
-    first_write, kdbx_suffix, marks_had_data, name_ext, open_reason, rename_shape_with, rename_step, unlink_step, write_kind, write_step, ChildRuleKey,
+    first_write, kdbx_suffix, marks_had_data, name_ext, open_reason, own_after, own_code, rename_shape_with, rename_step, unlink_step, write_kind, write_step, ChildRuleKey,
     DestroySeenKey, DirClass, NameParts, OpenCgKey, OpenCgWindow, OpenRecordRaw, OpenWriteWindow,
-    OverwriteSeenKey, RenameNames, RenameWindow, UnlinkWindow, CHILD_RULES_MAX, NAME_HEAD_LEN,
+    OverwriteSeenKey, RenameNames, RenameWindow, UnlinkWindow, WriteKind, CHILD_RULES_MAX, NAME_HEAD_LEN,
     NAME_TAIL_LEN, OPEN_CLASSIFY_DEPTH, OPEN_NAME_LEN, OPEN_NAME_RULES_MAX, OPEN_PATH_SLOTS,
     OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX, OPEN_SENSOR_ARMED, OVERWRITE_MIN_BYTES, RENAME_APPENDED,
     RENAME_OTHER, RUNTIME_UIDS_MAX,
@@ -60,7 +61,8 @@ use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_FLAGS_OFFSET,
     FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET, FILE_F_PATH_OFFSET, INODE_I_INO_OFFSET, INODE_I_MODE_OFFSET,
     INODE_I_SIZE_OFFSET,
-    INODE_I_SB_OFFSET, PATH_DENTRY_OFFSET, QSTR_LEN_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
+    INODE_I_NLINK_OFFSET, INODE_I_SB_OFFSET, INODE_I_UID_OFFSET, PATH_DENTRY_OFFSET, QSTR_LEN_OFFSET,
+    QSTR_NAME_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
     SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_LOGINUID_OFFSET,
 };
 use crate::read_repeat::ReadSeenKey;
@@ -340,26 +342,61 @@ unsafe fn dir_class(dkey: &InodeKey, dir: *const u8, dir_inode: *const u8) -> Di
     c
 }
 
-/// Lot 282 (the re-review of #500): the directory of `parent` (a dentry;
-/// on `key`'s filesystem) is one whose writes the mass-write count leaves
-/// out — `TREE_CARVEOUT`, or `TREE_RUNTIME` owned by the caller's login
-/// uid, as [`count_write`] judges an open there — its class from the cache,
-/// computed and cached on a miss ([`dir_class`]).
+/// Lot 282 (the re-review of #500): the class of the directory of
+/// `parent` (a dentry; on `key`'s filesystem), from the cache, computed and
+/// cached on a miss ([`dir_class`]); `None` when it cannot be read. Lot
+/// 283c: the unlink counter reads its owner bits too ([`own_of`]).
 #[inline(always)]
-unsafe fn carved_dir(key: &InodeKey, parent: *const u8) -> bool {
+unsafe fn parent_class(key: &InodeKey, parent: *const u8) -> Option<DirClass> {
     let parent_inode = read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET)));
     if parent_inode.is_null() {
-        return false;
+        return None;
     }
     let pkey = InodeKey {
         dev: key.dev,
         ino: match bpf_probe_read_kernel::<u64>(parent_inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
             Ok(i) => i,
-            Err(_) => return false,
+            Err(_) => return None,
         },
     };
-    let cls = dir_class(&pkey, parent, parent_inode);
-    carved_class(cls.bits, cls.uid, || loginuid())
+    Some(dir_class(&pkey, parent, parent_inode))
+}
+
+/// The owner (`i_uid`) of `inode`, or `u32::MAX` (no account's) when it
+/// cannot be read.
+#[inline(always)]
+unsafe fn inode_uid(inode: *const u8) -> u32 {
+    if inode.is_null() {
+        return u32::MAX;
+    }
+    match off_opt!(INODE_I_UID_OFFSET) {
+        Some(o) => bpf_probe_read_kernel::<u32>(inode.add(o) as *const u32).unwrap_or(u32::MAX),
+        None => u32::MAX,
+    }
+}
+
+/// Lot 283c: the [`own_code`] of the file of `dentry` (written, or
+/// destroyed) in a directory of class `bits` (owner `owner`) by the
+/// current task: its uid, the owners of the file and of its directory as
+/// the kernel resolved them (the dentry's parent), its links. Nothing is
+/// read outside a class [`own_code`] reads.
+#[inline(always)]
+unsafe fn own_of(bits: u32, owner: u32, dentry: *const u8) -> u32 {
+    if bits & OWN_DATA_BITS == 0 || dentry.is_null() {
+        return 0;
+    }
+    let inode = read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET)));
+    let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
+    if inode.is_null() || parent.is_null() {
+        return 0;
+    }
+    let nlink = match off_opt!(INODE_I_NLINK_OFFSET) {
+        Some(o) => bpf_probe_read_kernel::<u32>(inode.add(o) as *const u32).unwrap_or(0),
+        None => 0,
+    };
+    let dir_uid = inode_uid(read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET))));
+    let uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+    own_code(bits, owner, uid, dir_uid, inode_uid(inode), nlink)
 }
 
 /// The ancestor walk of [`dir_class`]: class bits in the low half, the
@@ -411,7 +448,9 @@ unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
         let keep = if level == 0 { DIRECT } else { SUBTREE };
         let r = rule(&key);
         bits |= r & keep;
-        if r & TREE_RUNTIME != 0 {
+        // Lot 283c: a person's cache directory carries its owner the
+        // same way.
+        if r & (TREE_RUNTIME | TREE_USER_CACHE) != 0 {
             if let Some(u) = RUNTIME_UIDS.get(&key) {
                 uid = *u;
             }
@@ -512,6 +551,7 @@ pub extern "C" fn nn_open_count_write(cls: u64, dentry: u64, dev_over: u64, ino:
             (dev_over >> 62) & 1 != 0,
             (dev_over >> 61) & 1 != 0,
             &key,
+            dentry as *const u8,
         );
         let reason = r as u32;
         if reason != 0 && !crate::fim_watch::caller_is_in_family() {
@@ -537,7 +577,10 @@ pub extern "C" fn nn_open_count_write(cls: u64, dentry: u64, dev_over: u64, ino:
 /// tgid's: the files it rewrote, or wrote new). Lot 282: each file counts
 /// once per window ([`OPEN_OVERWRITE_SEEN`]), as [`write_kind`] reads its
 /// first write-open — `data`: it held data, `created`: the open created
-/// it, `big`: at least [`OVERWRITE_MIN_BYTES`].
+/// it, `big`: at least [`OVERWRITE_MIN_BYTES`]. Lot 283c: each window keeps
+/// the [`own_after`] summary of the files it counted ([`own_of`] of
+/// `dentry`, the opened file's), and a crossing carries its window's in
+/// the reason's top byte ([`open_reason::OWN_SHIFT`]).
 #[inline(always)]
 unsafe fn count_write(
     cls_bits: u32,
@@ -546,6 +589,7 @@ unsafe fn count_write(
     created: bool,
     big: bool,
     key: &InodeKey,
+    dentry: *const u8,
 ) -> u64 {
     if carved_class(cls_bits, cls_uid, || loginuid()) {
         return 0;
@@ -580,28 +624,43 @@ unsafe fn count_write(
         let _ = OPEN_OVERWRITE_SEEN.insert(&seen, &start, 0);
     }
     let kind = write_kind(created, data, big, first);
-    let (mut reason, mut count, cg_add) = match window {
-        Some(w) => write_step(&mut *w, kind, now),
+    let counted = kind != WriteKind::Repeat;
+    let own = if counted { own_of(cls_bits, cls_uid, dentry) } else { 0 };
+    let (mut reason, mut count, cg_add, mut summary) = match window {
+        Some(w) => {
+            let (r, c, a) = write_step(&mut *w, kind, now);
+            // `write_step` starts a fresh window with one write-open.
+            (*w).own = own_after((*w).own, (*w).count == 1, counted, own);
+            (r, c, a, (*w).own)
+        }
         None => {
-            let _ = OPEN_WRITES.insert(&tgid, &OpenWriteWindow::fresh(now, kind), 0);
-            (0, 0, 0)
+            let mut fresh = OpenWriteWindow::fresh(now, kind);
+            fresh.own = own;
+            let _ = OPEN_WRITES.insert(&tgid, &fresh, 0);
+            (0, 0, 0, own)
         }
     };
     if cg_add != 0 {
-        let n = count_cgroup(cg_add, now);
+        let (n, cg_own) = count_cgroup(cg_add, summary, now);
         if n != 0 {
             reason |= open_reason::MASS_OVERWRITE_CGROUP;
             count = n;
+            summary = cg_own;
         }
+    }
+    if reason != 0 {
+        reason |= (summary & 0xFF) << open_reason::OWN_SHIFT;
     }
     (u64::from(count) << 32) | u64::from(reason)
 }
 
 /// `add` overwrites into the writer's cgroup window; the window's
-/// overwrites when they cross the threshold, else 0. A writer in the root
-/// cgroup (no cgroup v2 hierarchy in use) is keyed by uid and login uid.
+/// overwrites when they cross the threshold, else 0, and (lot 283c) the
+/// window's [`own_after`] summary with the process's `own`. A writer in the
+/// root cgroup (no cgroup v2 hierarchy in use) is keyed by uid and login
+/// uid.
 #[inline(always)]
-unsafe fn count_cgroup(add: u32, now: u64) -> u32 {
+unsafe fn count_cgroup(add: u32, own: u32, now: u64) -> (u32, u32) {
     let cgroup = bpf_get_current_cgroup_id();
     let key = if cgroup > 1 {
         OpenCgKey {
@@ -617,15 +676,22 @@ unsafe fn count_cgroup(add: u32, now: u64) -> u32 {
         }
     };
     match OPEN_CG_WRITES.get_ptr_mut(&key) {
-        Some(w) => cgroup_step(&mut *w, add, now),
+        Some(w) => {
+            let n = cgroup_step(&mut *w, add, now);
+            // A fresh window holds this add alone (every add is one or more).
+            (*w).own = own_after((*w).own, (*w).overwrites == add, true, own);
+            (n, (*w).own)
+        }
         None => {
             let w = OpenCgWindow {
                 start_ns: now,
                 overwrites: add,
                 fired: 0,
+                own,
+                _pad: 0,
             };
             let _ = OPEN_CG_WRITES.insert(&key, &w, 0);
-            0
+            (0, own)
         }
     }
 }
@@ -925,7 +991,10 @@ unsafe fn emit_record(reason: u32, key: &InodeKey, dentry: *const u8, flags: u32
     (*raw).ino = key.ino;
     (*raw).flags = flags;
     (*raw).mode = mode;
-    (*raw).reason = reason;
+    // Lot 283c: a crossing's own-data summary rides in the reason's top
+    // byte.
+    (*raw).reason = reason & open_reason::REASON_BITS;
+    (*raw).own = (reason >> open_reason::OWN_SHIFT) as u8;
     (*raw).count = count;
     // Lot 282 (the review of #500, C1): the replacement's halves are
     // paired per cgroup too.
@@ -1241,9 +1310,18 @@ unsafe fn unlink_burst(dentry: *const u8) {
     // Lot 282, the re-review of #500: what the writes' count leaves out,
     // the destructions' does too — a pseudo-filesystem, `/run/systemd`,
     // the journal, the operator's extras, the destroyer's own runtime
-    // directory ([`carved_dir`]): a daemon's atomic replacements there are
+    // directory ([`carved_class`]): a daemon's atomic replacements there are
     // no originals, and cost no map work.
-    if !parent.is_null() && carved_dir(&key, parent) {
+    let cls = if parent.is_null() {
+        None
+    } else {
+        parent_class(&key, parent)
+    };
+    let (bits, owner) = match cls {
+        Some(c) => (c.bits, c.uid),
+        None => (0, u32::MAX),
+    };
+    if cls.is_some() && carved_class(bits, owner, || loginuid()) {
         return;
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
@@ -1282,22 +1360,37 @@ unsafe fn unlink_burst(dentry: *const u8) {
         }
         let _ = OPEN_DESTROY_SEEN.insert(&seen, &start, 0);
     }
-    let count = match OPEN_UNLINKS.get_ptr_mut(&tgid) {
-        Some(w) => unlink_step(&mut *w, now),
+    // Lot 283c: whose own data the originals destroyed in the window were.
+    let own = own_of(bits, owner, dentry);
+    let (count, summary) = match OPEN_UNLINKS.get_ptr_mut(&tgid) {
+        Some(w) => {
+            let c = unlink_step(&mut *w, now);
+            (*w).own = own_after((*w).own, (*w).count == 1, true, own);
+            (c, (*w).own)
+        }
         None => {
             let w = UnlinkWindow {
                 start_ns: now,
                 count: 1,
                 fired: 0,
+                own,
+                _pad: 0,
             };
             let _ = OPEN_UNLINKS.insert(&tgid, &w, 0);
-            0
+            (0, own)
         }
     };
     if count == 0 {
         return;
     }
-    emit(open_reason::MASS_UNLINK, &key, dentry, 0, 0, count);
+    emit(
+        open_reason::MASS_UNLINK | ((summary & 0xFF) << open_reason::OWN_SHIFT),
+        &key,
+        dentry,
+        0,
+        0,
+        count,
+    );
 }
 
 /// Lot 282, the review of #500 (C1), from `inode_setattr`

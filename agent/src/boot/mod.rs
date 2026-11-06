@@ -396,7 +396,7 @@ async fn run(
     let posture::Posture {
         ladder_slot,
         exempt,
-        open_sensor_carveout,
+        open_sensor_extras,
         posture,
         watchdog_audit,
         stale_combat,
@@ -483,7 +483,7 @@ async fn run(
         agent_id,
         &audit_log,
         &mut sensor,
-        open_sensor_carveout,
+        open_sensor_extras,
         &posture,
         &own_prog_ids_file,
         watched_paths_load,

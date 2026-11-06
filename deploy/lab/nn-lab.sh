@@ -2117,7 +2117,7 @@ m=$(sudo stat -c %a /etc/northnarrow/canary-templates); [[ "$m" == 750 ]] || { e
 # External audit LLMR-015 (lab PR 168): the shipped `.v1` lists are the
 # release's after an upgrade (an edited one is kept as `.v1.operator`), and the
 # new agent reported none as edited or an earlier release's.
-for l in fim-paths netflow-blocklist netflow-ja3-blocklist process-comm-allowlist netflow-comm-allowlist; do
+for l in fim-paths netflow-blocklist netflow-ja3-blocklist process-comm-allowlist netflow-comm-allowlist daemon-data; do
     sudo cmp -s "/etc/northnarrow/$l.v1" "configs/$l.v1" || { echo "FAIL: /etc/northnarrow/$l.v1 is not the shipped list after the upgrade"; fail=1; }
     if sudo test -e "/etc/northnarrow/$l.v1.operator"; then echo "note: /etc/northnarrow/$l.v1.operator kept (an edited list, replaced)"; fi
 done

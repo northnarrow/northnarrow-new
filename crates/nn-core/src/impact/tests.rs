@@ -154,6 +154,7 @@ fn rewrites(pid: u32, ts: u64, file: &str) -> Event {
         cgroup_window: false,
         small_files: false,
         cgroup_id: 0,
+        own_data: 0,
     }
 }
 
@@ -169,6 +170,7 @@ fn new_files(pid: u32, ts: u64, file: &str) -> Event {
         cgroup_window: false,
         small_files: false,
         cgroup_id: 0,
+        own_data: 0,
     }
 }
 
@@ -184,6 +186,7 @@ fn renames(pid: u32, ts: u64, file: &str, appended: u32, sources: u32) -> Event 
         filename: file.into(),
         timestamp_ns: ts,
         cgroup_id: 0,
+        own_data: 0,
     }
 }
 
@@ -199,6 +202,7 @@ fn unlinks(pid: u32, ts: u64, file: &str) -> Event {
         filename: file.into(),
         timestamp_ns: ts,
         cgroup_id: 0,
+        own_data: 0,
     }
 }
 
@@ -511,4 +515,58 @@ fn one_event_is_assessed_once() {
             moved_in: false,
         }))
         .is_none());
+}
+
+/// Lot 283c, decision 5: NN-L-IMP-001 judges a service account that
+/// encrypts its own data exactly as it judges anyone — the kernel's
+/// own-data summary (`own_data`, which only the posture's mass-write arm
+/// reads) changes nothing. A payload the PostgreSQL account runs from its
+/// service, rewriting the account's own files into ciphertext, is decisive
+/// in place, and so are its copies with the originals deleted.
+#[test]
+fn imp001_still_judges_a_service_encrypting_its_own_data() {
+    use common::wire::open_sensor::own_data;
+    let own = |mut e: Event| {
+        match &mut e {
+            Event::MassWrite {
+                uid, own_data: o, ..
+            }
+            | Event::FileBurst {
+                uid, own_data: o, ..
+            } => (*uid, *o) = (113, own_data::SERVICE),
+            _ => unreachable!(),
+        }
+        e
+    };
+    let payload = "/var/lib/postgresql/.cache/enc";
+    for marked in [false, true] {
+        let h = Host::new();
+        h.lineage
+            .ingest_exec(400, 1, payload, &["enc".into()], 10 * S, 10 * S, 113);
+        let (_dir, dir) = sandbox();
+        let d = dir.to_str().unwrap().to_string();
+        let t = h.tracker(Fixed::high(&d));
+        let mark = |e: Event| if marked { own(e) } else { e };
+        // in place: the rewrites, ciphertext left behind
+        let a = t
+            .assess(&mark(rewrites(400, T0, &format!("{d}/base/16384/2833"))))
+            .unwrap();
+        assert!(a.decisive, "marked {marked}: {a:?}");
+        assert!(a.trusted.is_none(), "{a:?}");
+        assert_eq!(a.program, payload);
+        // copies, then the originals deleted
+        let h = Host::new();
+        h.lineage
+            .ingest_exec(401, 1, payload, &["enc".into()], 10 * S, 10 * S, 113);
+        std::fs::write(dir.join("f017.locked"), b"ciphertext").unwrap();
+        let t = h.tracker(Fixed::high(&d));
+        let first = t
+            .assess(&mark(new_files(401, T0, &format!("{d}/f003.locked"))))
+            .unwrap();
+        assert!(!first.decisive);
+        let b = t
+            .assess(&mark(unlinks(401, T0 + 2 * S, &format!("{d}/f017"))))
+            .unwrap();
+        assert!(b.decisive, "marked {marked}: {b:?}");
+    }
 }

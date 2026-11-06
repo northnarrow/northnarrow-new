@@ -26,8 +26,9 @@ pub(crate) struct Posture {
     /// [`ladder`].
     pub(crate) ladder_slot: Arc<std::sync::OnceLock<Arc<northnarrow_agent::combat::CombatLadder>>>,
     pub(crate) exempt: ExemptPids,
-    /// The operator's mass-write carve-outs, for the file-open sensor.
-    pub(crate) open_sensor_carveout: Vec<String>,
+    /// The operator's mass-write carve-outs and (lot 283c) the daemons'
+    /// data directories in tag order, for the file-open sensor.
+    pub(crate) open_sensor_extras: northnarrow_agent::sensors::open_sensor::OpenSensorExtras,
     pub(crate) posture: PostureMachine,
     /// The audit log the watchdog refresh signs to, set by [`crate::boot::evidence::wire`].
     pub(crate) watchdog_audit: Arc<std::sync::OnceLock<WatchdogAudit>>,
@@ -97,6 +98,30 @@ pub(crate) fn machine(
         northnarrow_agent::posture::mass_write_overlay::load_mass_write_carveout_extras(
             &mass_write_overlay,
         );
+    // Lot 283c: the daemons' data directories — the shipped list, pinned to
+    // the agent's copy, and the overlay's `+<unit>.service <dir>/` lines. The
+    // file-open sensor tags them in this order; the posture reads the tags.
+    let daemon_data_v1 =
+        std::path::Path::new(northnarrow_agent::posture::daemon_data::DAEMON_DATA_V1);
+    let (daemon_data, daemon_data_defaults) =
+        northnarrow_agent::posture::daemon_data::DaemonData::load::<
+            northnarrow_agent::chain_host_linux::LinuxHost,
+        >(
+            daemon_data_v1,
+            northnarrow_agent::posture::mass_write_overlay::load_daemon_data_extras(
+                &mass_write_overlay,
+            ),
+        );
+    super::policy::report_builtin_defaults(
+        overlay_gate,
+        "daemon-data",
+        daemon_data_v1,
+        &daemon_data_defaults,
+    );
+    let open_sensor_extras = northnarrow_agent::sensors::open_sensor::OpenSensorExtras {
+        carveout: open_sensor_carveout.clone(),
+        unit_dirs: daemon_data.dirs().iter().map(|d| d.dir.clone()).collect(),
+    };
     let posture = if let Some(iso) = isolator.as_ref() {
         // T7.13 (Beta Step 5): the auth-lineage tracker shared with
         // the posture trigger detector. Reads /proc on cache miss;
@@ -237,6 +262,9 @@ pub(crate) fn machine(
     // (DefenseImpairment, ENGAGED), judged as the rules judge them.
     posture.set_ransom_tracker(Arc::clone(ransom_tracker));
     posture.set_defense_detector(Arc::clone(defense_detector));
+    // Lot 283c: the daemons' data directories (the mass-write arm's own-data
+    // exemption reads the kernel's tags against them).
+    posture.set_daemon_data(Arc::new(daemon_data));
     // Lab PR 225 (decision of 21/10): inside a valid signed trusted-installer
     // window a stop or restart of the agent's own units is sanctioned (Low,
     // the window named; no posture move).
@@ -315,7 +343,7 @@ pub(crate) fn machine(
     Posture {
         ladder_slot,
         exempt,
-        open_sensor_carveout,
+        open_sensor_extras,
         posture,
         watchdog_audit,
         stale_combat,

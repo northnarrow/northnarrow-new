@@ -60,7 +60,7 @@ fn start_open_sensor(
     sensor: &mut SensorMultiplexer,
     mode: FileOpenSensor,
     fim_attached: &[&str],
-    carveout: &[String],
+    extras: &northnarrow_agent::sensors::open_sensor::OpenSensorExtras,
     audit_log: Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
     posture: &PostureMachine,
 ) {
@@ -90,7 +90,7 @@ fn start_open_sensor(
         open_sensor_on_tracepoint(sensor, "its file_open observer is not attached");
         return;
     }
-    let rules = RuleSet::build(&RuleInputs::from_host(carveout));
+    let rules = RuleSet::build(&RuleInputs::from_host(extras));
     warn_refused_carveouts(None, &rules);
     let mut maps = match OpenSensorMaps::take(sensor.ebpf_mut()) {
         Ok(m) => m,
@@ -170,7 +170,7 @@ fn start_open_sensor(
     );
     // New homes, runtime directories (logins) and paths created since:
     // re-registered every minute, against what the maps really hold.
-    let carveout = carveout.to_vec();
+    let extras = extras.clone();
     let refresher = tokio::spawn(async move {
         let mut current = applied.in_maps;
         let mut depth_cap = DepthCapLog::default();
@@ -179,7 +179,7 @@ fn start_open_sensor(
         loop {
             tick.tick().await;
             depth_cap.sample(&maps);
-            if let Some(applied) = refresh(&mut maps, &current, &carveout) {
+            if let Some(applied) = refresh(&mut maps, &current, &extras) {
                 report_open_rules(&mut health, &applied, audit_log.as_ref(), false);
                 current = applied.in_maps;
             }
@@ -337,7 +337,7 @@ pub(crate) fn start(
     agent_id: [u8; 16],
     audit_log: &AuditHandle,
     sensor: &mut SensorMultiplexer,
-    open_sensor_carveout: Vec<String>,
+    open_sensor_extras: northnarrow_agent::sensors::open_sensor::OpenSensorExtras,
     posture: &PostureMachine,
     own_prog_ids_file: &Option<PathBuf>,
     watched_paths_load: northnarrow_agent::fim::paths_config::WatchedPathsLoad,
@@ -505,7 +505,7 @@ pub(crate) fn start(
                     sensor,
                     cli.file_open_sensor,
                     &fim_attached,
-                    &open_sensor_carveout,
+                    &open_sensor_extras,
                     audit_log.clone(),
                     posture,
                 );
