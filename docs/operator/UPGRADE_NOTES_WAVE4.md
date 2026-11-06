@@ -681,3 +681,39 @@ others. What an operator sees change:
   pinned `northnarrow-cgroup-join-v2_*` map fails with `EPERM` for every
   caller, root and the agent included. The start no longer sweeps dead
   processes' marks (a dead group's mark goes at its pid's next fork).
+
+## 13. Kernel module loads judged in the kernel (lot 285)
+
+- **A module load of a file the agent does not vouch for is refused**
+  (`EPERM`), outside a signed trusted-installer window, by default — and
+  every `init_module` from memory (`RULE_POLICY.md` §2.4). The agent vouches
+  for the module files of the running kernel's tree that a verified
+  package installed or DKMS built (unchanged since boot), that a package
+  transaction wrote since boot, or that a signed `module-allow <module>`
+  names. Who loads does not matter: `modprobe`, `udev`, a service, a
+  process of its own.
+- **Before the upgrade, list what would be refused.** A DKMS module built
+  outside a package transaction (a root shell's `dkms install`, a vendor's
+  `.run` installer), a module copied into `/lib/modules` by hand (`make
+  modules_install`) is untrusted. After the upgrade the agent names each
+  such file in its journal at its start (`module-load judge: a module file
+  NOT trusted`, with why); a DKMS build DKMS registered for the running
+  kernel, made before this boot, is trusted (until it is rebuilt by hand). Sign a `module-allow <module>` for each module the
+  host needs, or put the deny off for the time being with a signed
+  `alert R018_KernelModuleLoad` (the record mode: every untrusted load
+  let through and recorded High).
+- **What the boot loads before the agent starts is not judged** (the
+  initramfs, `systemd-modules-load`, udev's first pass). From the agent's
+  start until its trust map is filled (the first seconds) nothing is judged
+  either; R018 judges those loads by the path, as before.
+- **R018 has no loader allowlist any more**: a trusted file is silent
+  whoever loads it (no more Medium for a standard module by an unexpected
+  loader); an untrusted one is recorded High whoever loads it (no more
+  silence for `kmod`, `systemd-udevd`, `systemd-modules-load`); a file
+  outside `/lib/modules` still has its loader's tree killed.
+- **New records**: NN-L-FIM-026 for a write in a `modprobe.d` directory
+  (High outside a package transaction), R011 Medium for a command a
+  `modprobe.d` `install`/`remove` directive runs. The FIM watch list gains
+  `/run`, `/usr/local/lib`, `/lib` and `/usr/lib` `modprobe.d`; an
+  unmodified `fim-paths.v1` of an earlier release is replaced by the
+  install, as for every shipped list.

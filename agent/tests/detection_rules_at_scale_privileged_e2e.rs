@@ -1032,8 +1032,8 @@ fn r011_records_a_name_and_kills_a_moved_tree_or_modprobe_options() {
     assert_r011(&fx, pid, "Log", "modprobe of 'nn_k279_copied'");
     let r018 = r018_records_of(&fx, pid);
     assert!(
-        r018.iter().any(|r| r["severity"] == "High"
-            && r["verdict"] == serde_json::json!({"Rule": "Log"})),
+        r018.iter()
+            .any(|r| r["severity"] == "High" && r["verdict"] == serde_json::json!({"Rule": "Log"})),
         "R018 records the load of a module copied into the tree by hand (lot 285: \
          untrusted, judged in the kernel): {r018:?}"
     );

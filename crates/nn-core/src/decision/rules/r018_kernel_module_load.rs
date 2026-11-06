@@ -780,6 +780,11 @@ mod tests {
             .expect("init_module must fire");
         assert_eq!(v.severity, Severity::High);
         assert_eq!(v.action, ResponseAction::Log); // alert, NOT kill
+        assert!(
+            v.reasoning.contains("init_module(2)") && v.reasoning.contains("no file to trust"),
+            "{}",
+            v.reasoning
+        );
     }
 
     #[test]

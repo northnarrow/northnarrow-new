@@ -593,6 +593,26 @@ mod tests {
             classify(&f, &before, None, &mut |_| false),
             Ok(trust_flag::DKMS)
         );
+        // DKMS registered another module for this kernel, not this one
+        let fx2 = fixture();
+        let p2 = fx2.tree.join("updates/dkms/vboxdrv.ko.zst");
+        put(&p2, b"vbox");
+        let reg2 = fx2
+            .registry
+            .join("other/1.0")
+            .join(REL)
+            .join("x86_64/module");
+        std::fs::create_dir_all(&reg2).unwrap();
+        put(&reg2.join("zfs.ko.zst"), b"zfs");
+        assert_eq!(
+            classify(
+                &file(&p2),
+                &inputs(&fx2, after_files(), &opt),
+                None,
+                &mut |_| false
+            ),
+            Err(UNVOUCHED)
+        );
         // not registered for this kernel: nothing vouches for it
         let other = Inputs {
             release: "6.8.0-other",
@@ -602,6 +622,12 @@ mod tests {
         // a file of DKMS's name outside DKMS's directory: not DKMS's
         let q = fx.tree.join("kernel/net/vboxdrv.ko.zst");
         put(&q, b"vbox");
+        // written in a transaction since boot, but no package's and not
+        // DKMS's: nothing vouches for it (not "changed outside one")
+        assert_eq!(
+            classify(&file(&q), &since, Some(created_in_tx), &mut |_| false),
+            Err(UNVOUCHED)
+        );
         assert_eq!(
             classify(&file(&q), &before, None, &mut |_| false),
             Err(UNVOUCHED)
@@ -693,6 +719,7 @@ mod tests {
         let dump = "/usr/lib/modules/5.14.0/kernel/a.ko.xz\t8\tABCD\n\
                     /usr/lib/modules/5.14.0/kernel/b.ko.xz\t1\tef01\n\
                     /usr/lib/modules/5.14.0/kernel/c.ko.xz\t8\t\n\
+                    /usr/lib/modules/5.14.0/kernel/e.ko.xz\t2\tabcd\n\
                     /usr/lib/modules/6.0/kernel/d.ko.xz\t8\taa\n\
                     /usr/bin/x\t8\tbb\n";
         let got = parse_rpm_dump(dump, &["/usr/lib/modules/5.14.0/".to_string()]);

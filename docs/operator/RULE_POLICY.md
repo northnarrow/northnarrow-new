@@ -618,7 +618,22 @@ host-check` reports both); on the RPM family a DKMS build under `dnf` (dnf
 is a Python program: its lineage is the interpreter's image, not a package
 manager's) is untrusted until the next boot or a `module-allow`; a module
 built after boot but before the agent started has no write history and is
-untrusted until the next boot (`akmods` at boot).
+untrusted until the next boot (`akmods` at boot). And the residuals of
+the judge itself: the trust map is the agent's (not pinned), so a restarted
+agent judges nothing until it has filled it again; the change time and
+size are what tie a file to its verification, so root who sets the clock
+back to the very nanosecond of a verified change time and rewrites the file
+in place keeps its entry (the package digests are checked again only when
+the change stamp moves); a module file written under a name that is no
+module's and renamed into the tree has no write history (untrusted, fail
+closed), but a file a package transaction created and root rewrote through
+a hard link of another name, outside the tree, before the agent first
+vouched for it (a race with the transaction) keeps its package history; the
+package
+database itself is root's to edit before a boot; the hooks judge
+`READING_MODULE` and `LOADING_MODULE` (2 in both enums on every kernel the
+agent supports) — a kernel that reads compressed modules under an id of its
+own would need it added.
 
 ### 2.3 Code injected into an exempt process: the exemption revoked (lot 281)
 
