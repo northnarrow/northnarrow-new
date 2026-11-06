@@ -320,6 +320,9 @@ planned = false
 # R11a (lab PR 261): `main.rs`'s stop, after the event loop: the
 # composition
 "shutdown" = "northnarrow-agent"
+# lot 288 (#125): the stop's deadline — the stop's stages, its note signed
+# in the agent's audit log, the process's exit: the composition's
+"stop_deadline" = "northnarrow-agent"
 
 # ── agent/src: the shims of R05, R07 and R08a ─────────────────────────
 # R05 (lab PR 241): these modules moved to nn-evidence. The agent keeps

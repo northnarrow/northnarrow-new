@@ -132,7 +132,7 @@ const OFF_PATH: &[(&str, &[&str], &str)] = &[
         &[
             "fn start_inner(",
             "fn spawn_worker(",
-            "pub(crate) fn stop(",
+            "pub(crate) fn stop_by(",
             "fn work(",
             "fn watch_stalls(",
             "fn run_one(",
