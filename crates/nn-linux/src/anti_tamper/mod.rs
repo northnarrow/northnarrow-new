@@ -563,20 +563,14 @@ fn attach_reporting(
     for why in signed {
         report.degraded.push(format!("cgroup exemptions: {why}"));
     }
-    match &tracker {
-        crate::cgroup_join::Tracker::Absent(why) => report.degraded.push(format!(
+    // Lot 281: no sweep of the marks of processes gone — the maps are
+    // frozen (no handle writes them); a dead group's mark goes at its
+    // tgid's next fork.
+    if let crate::cgroup_join::Tracker::Absent(why) = &tracker {
+        report.degraded.push(format!(
             "cgroup exemptions: {} ({why})",
             crate::cgroup_join::ABSENT_EFFECT
-        )),
-        crate::cgroup_join::Tracker::Attached(marks) => {
-            let gone = marks.sweep(std::path::Path::new("/proc"));
-            if gone > 0 {
-                info!(
-                    removed = gone,
-                    "cgroup exemptions: marks of processes gone while no agent ran removed"
-                );
-            }
-        }
+        ));
     }
     crate::cgroup_join::install(tracker);
 
@@ -654,8 +648,14 @@ fn attach_reporting(
     // The re-review of #494, R2: the tracker's pin directory (beside the
     // root) and its pins alike — no new entry, no unlink or rename by a
     // foreign caller outside the trusted-installer window.
+    // Lot 281 (#494's N1/N2): the tracker is armed — its answers given, the
+    // exemptions by executable, cgroup or unit honoured — only once its
+    // pins and its state are protected (or there is no bpffs: its maps are
+    // this process's); until then, and without that, every one is refused.
+    let mut tracker_protected = true;
     if let Some(dir) = crate::cgroup_join::pin_dir_now() {
         if let Err(e) = filesystem::register_bpffs_pins(ebpf, dir) {
+            tracker_protected = false;
             warn!(
                 error = format!("{e:#}"),
                 "anti-tamper FS: the tracker's pins NOT registered — removable by root"
@@ -673,6 +673,7 @@ fn attach_reporting(
         if !state.exists() {
             warn!("anti-tamper FS: no tracker pin state to protect");
         } else if let Err(e) = filesystem::register_agent_file(ebpf, state) {
+            tracker_protected = false;
             warn!(
                 error = format!("{e:#}"),
                 "anti-tamper FS: the tracker's pin state NOT protected — rewritable by root"
@@ -682,6 +683,18 @@ fn attach_reporting(
                 format!("{e:#}"),
             );
         }
+    }
+    if tracker_protected {
+        crate::cgroup_join::arm();
+    } else if matches!(
+        crate::cgroup_join::tracker(),
+        Some(crate::cgroup_join::Tracker::Attached(_))
+    ) {
+        report.degraded.push(
+            "cgroup exemptions: the tracker's pins or state are not protected — it is not armed, \
+             and every exemption by executable, cgroup or unit is refused this boot"
+                .to_string(),
+        );
     }
     // Lot 280a: the judge's pin directory (beside the root) and its pins
     // alike — no unlink or rename by a foreign caller outside a window.

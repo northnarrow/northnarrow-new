@@ -163,9 +163,11 @@ impl RuleMatchRecord {
     /// The record entries of `d`'s matches, when the record lists them.
     pub fn of(d: &crate::decision::combine::Decision) -> Option<Vec<Self>> {
         use crate::decision::combine::Applied;
+        // Lot 281: a match whose exemption did not hold is always listed.
         if d.matches.len() < 2
             && d.primary().applied == Applied::Builtin
             && d.primary().held != Some(crate::decision::combine::LEGACY_CEILING)
+            && d.primary().revoked.is_none()
         {
             return None;
         }
@@ -185,6 +187,7 @@ impl RuleMatchRecord {
                         Applied::Exempt(e) => Some(e.clone()),
                         _ => None,
                     },
+                    revoked: m.revoked.clone(),
                 })
                 .collect(),
         )
@@ -1536,6 +1539,62 @@ fn collect_latest_status_from_file(
 mod tests {
     use super::*;
     use crate::chainlog::{verify_log_set, NoProtection};
+
+    /// Lot 281 (named): the record of a match whose exemption did not hold
+    /// lists the match — built in alone too — and says which exemption and
+    /// why; a match with no exemption at stake keeps the record as it was.
+    #[test]
+    fn a_revoked_exemption_is_in_the_signed_record() {
+        use crate::decision::combine::{apply_policy, combine};
+        use crate::decision::rule_policy::{parse, Exempt};
+        let v = Verdict {
+            rule_id: "R020_ShellWithSocketStdio".to_string(),
+            rule_name: "r".to_string(),
+            category: "test".to_string(),
+            action: ResponseAction::KillProcess,
+            severity: nn_model::Severity::High,
+            reasoning: "test".to_string(),
+            event_pid: 4242,
+            event_filename: "/usr/bin/x".to_string(),
+            timestamp_ns: 1,
+        };
+        let p = parse(
+            "exempt R020 exe /usr/bin/x sha256 \
+             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        )
+        .unwrap();
+        let m = apply_policy(
+            0,
+            "R020_ShellWithSocketStdio",
+            &[],
+            v.clone(),
+            None,
+            &p,
+            |_| {
+                Some(Exempt::Revoked {
+                    exemption: "exe /usr/bin/x".into(),
+                    why: "code-injection access to it was given to pid 7".into(),
+                })
+            },
+        );
+        let d = combine(vec![m]).unwrap();
+        let recs = RuleMatchRecord::of(&d).expect("a revoked match is listed");
+        assert_eq!(
+            recs[0].revoked.as_deref(),
+            Some("exe /usr/bin/x: code-injection access to it was given to pid 7")
+        );
+        assert_eq!(recs[0].mode, "builtin");
+        assert_eq!(recs[0].exempt, None);
+        let json = serde_json::to_string(&recs[0]).unwrap();
+        assert!(
+            json.contains("\"revoked\":\"exe /usr/bin/x: code-injection"),
+            "{json}"
+        );
+        // nothing at stake: no list, no field
+        let plain = apply_policy(0, "R020_ShellWithSocketStdio", &[], v, None, &p, |_| None);
+        let d = combine(vec![plain]).unwrap();
+        assert!(RuleMatchRecord::of(&d).is_none());
+    }
 
     fn test_key() -> AgentSigningKey {
         let dir = tempfile::tempdir().unwrap();

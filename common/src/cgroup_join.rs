@@ -70,8 +70,12 @@ pub const LOST_SLOTS: u32 = PID_LIMIT / LOST_BYTES as u32;
 /// `CGROUP_JOIN_EPOCH`): raised with any change to one of them, so that a
 /// start never adopts maps of another layout. Not their size: the marks'
 /// entries are a capacity fixed when the map is made (the third review of
-/// #494, R2-a).
-pub const PIN_SCHEMA: u32 = 1;
+/// #494, R2-a). Lot 281: 2 — the mark carries the injection taint
+/// ([`HOW_INJECTED`], [`HOW_TAINT_INHERITED`]), the counters one more slot
+/// ([`STAT_INJECTED`]), the maps are frozen ([`EPOCH_SLOTS`]): a schema-1
+/// directory knew no injection, so its marks are not adopted (a signed
+/// reset at the upgrade).
+pub const PIN_SCHEMA: u32 = 2;
 
 /// The name's part before the schema of the tracker's pin directory:
 /// `<pin root><PIN_DIR_INFIX><schema>_<generation>` — no dot: bpffs refuses
@@ -86,7 +90,24 @@ pub const PIN_DIR_INFIX: &str = "-cgroup-join-v";
 /// and passes "not known" on to the child — so that a reset, whatever made
 /// it, gives no marked process back its exemption (the third review of
 /// #494, R2-a). PID 1's own forks are systemd's placement and pass nothing.
+///
+/// Lot 281 (#494's notes N1/N2): the pinned maps are frozen
+/// (`BPF_MAP_FREEZE`) as soon as they are made, so no handle — one a root
+/// took in a window, in an upgrade's gap or while a new generation was
+/// made — writes them ever after; only the tracker's programs do. The agent
+/// asks for a reset in the per-load `CGROUP_JOIN_EPOCH_RT` (same slots),
+/// and the fork program moves it into the pinned epoch when it is later
+/// ([`epoch_promoted`]): the pinned epoch only goes forward.
 pub const EPOCH_SLOTS: u32 = 2;
+
+/// Lot 281: the fork program takes the agent's request `request` (the
+/// per-load `CGROUP_JOIN_EPOCH_RT`'s monotonic slot) into the pinned epoch
+/// `epoch` when it is later — never back: a handle on the request that
+/// lowers it lowers nothing.
+#[inline(always)]
+pub const fn epoch_promoted(epoch: u64, request: u64) -> bool {
+    request > epoch
+}
 
 /// The tracker's pin directory for pin root `root`, generation `gen`:
 /// `/sys/fs/bpf/northnarrow-cgroup-join-v1_0`. A sibling of the root, so a
@@ -197,8 +218,11 @@ pub const STAT_ROOTS: u32 = 1;
 pub const STAT_INHERITED: u32 = 2;
 /// Moves into a cgroup an exemption names (each one signed, rate-limited).
 pub const STAT_INTO_EXEMPT: u32 = 3;
+/// Lot 281: processes code was first injected into (each one recorded,
+/// rate-limited; the agent signs those an exemption covered).
+pub const STAT_INJECTED: u32 = 4;
 /// The slots.
-pub const STAT_SLOTS: u32 = 4;
+pub const STAT_SLOTS: u32 = 5;
 
 /// Lot 280b: the new thread groups `cgroup_join_born` (fentry) saw, by
 /// tgid, until `cgroup_join_fork` (a BTF tracepoint, which runs whether or
@@ -234,12 +258,148 @@ pub const fn unseen_birth(armed_ns: u64, child_start_ns: u64, seen: bool) -> boo
     armed_ns != 0 && child_start_ns > armed_ns && !seen
 }
 
-/// How a process came to be marked (the value's byte 4).
+/// How a process came to be marked (the value's byte 4). Its low bits
+/// ([`HOW_PLACE`]) say where it runs: 0 started in its cgroup, else
+/// moved, born into it, or forked from a process that was; lot 281's high
+/// bits ([`HOW_TAINT`]) whether code was injected into it or into a
+/// process it was forked from after the injection.
 pub const HOW_MOVED: u8 = 1;
 /// Started by `clone3(CLONE_INTO_CGROUP)` by a process other than PID 1.
 pub const HOW_BORN_INTO: u8 = 2;
-/// Forked from a marked process.
+/// Forked from a process not started in its cgroup.
 pub const HOW_INHERITED: u8 = 3;
+/// The placement bits of a mark's `how`.
+pub const HOW_PLACE: u8 = 0x0f;
+/// Lot 281: code-injection access to the process was given to another
+/// (`by`): a debugger's attach, a write handle on its `/proc/<pid>/mem`,
+/// `process_vm_writev`, a descriptor taken by `pidfd_getfd`
+/// ([`injection`]), or it asked its parent to trace it
+/// (`PTRACE_TRACEME`). No exemption of the per-rule policy holds for it
+/// any more, whatever its kind.
+pub const HOW_INJECTED: u8 = 0x80;
+/// Lot 281: forked from a process [`HOW_INJECTED`] or this (`by`: the
+/// parent): never exempt either.
+pub const HOW_TAINT_INHERITED: u8 = 0x40;
+/// The taint bits of a mark's `how`.
+pub const HOW_TAINT: u8 = HOW_INJECTED | HOW_TAINT_INHERITED;
+
+/// Lot 281: the `how` a fork gives the child of a process marked `parent`:
+/// [`HOW_INHERITED`] if the parent does not run where it started, and the
+/// taint passed on.
+#[inline(always)]
+pub const fn inherited(parent: u8) -> u8 {
+    let place = if parent & HOW_PLACE != 0 {
+        HOW_INHERITED
+    } else {
+        0
+    };
+    let taint = if parent & HOW_TAINT != 0 {
+        HOW_TAINT_INHERITED
+    } else {
+        0
+    };
+    place | taint
+}
+
+/// Lot 281: the `how` of a new mark `how` on a process whose mark was
+/// `old` (this process's: the same leader start): its taint kept — a move
+/// after an injection does not clean it.
+#[inline(always)]
+pub const fn remarked(how: u8, old: u8) -> u8 {
+    how | (old & HOW_TAINT)
+}
+
+/// Lot 281: the `how` of a process code was just injected into, its mark
+/// `old` (this process's, 0 for none): its placement kept.
+#[inline(always)]
+pub const fn injected(old: u8) -> u8 {
+    (old & HOW_PLACE) | HOW_INJECTED
+}
+
+/// Lot 281: the access-mode bits of `ptrace_may_access`
+/// (include/linux/ptrace.h).
+pub const PTRACE_MODE_READ: u32 = 0x01;
+/// The access lets the caller change the target (attach, write).
+pub const PTRACE_MODE_ATTACH: u32 = 0x02;
+/// Checked with the caller's filesystem credentials (procfs files).
+pub const PTRACE_MODE_FSCREDS: u32 = 0x08;
+/// Checked with the caller's real credentials (the system calls).
+pub const PTRACE_MODE_REALCREDS: u32 = 0x10;
+
+/// x86-64 system call numbers (arch/x86/entry/syscalls/syscall_64.tbl) the
+/// injection check tells apart. On i386 (compat) none of 2, 257 and 310
+/// reaches `ptrace_may_access` (`fork`, `remap_file_pages`, `unshare`),
+/// and `openat2` is 437 with its `how` the third argument on both: a
+/// compat call is never taken for a read-only one it is not.
+pub const SYS_OPEN: u64 = 2;
+/// `openat(2)`.
+pub const SYS_OPENAT: u64 = 257;
+/// `process_vm_readv(2)`: reads the target's memory, writes nothing.
+pub const SYS_PROCESS_VM_READV: u64 = 310;
+/// `openat2(2)`.
+pub const SYS_OPENAT2: u64 = 437;
+/// `O_ACCMODE`.
+pub const O_ACCMODE: u64 = 3;
+
+/// Lot 281: whether an access `ptrace_may_access` allowed with `mode`,
+/// made by system call `syscall` (`None`: not read — an io-wq worker's, a
+/// kernel thread's, another architecture's) with open flags `open_flags`
+/// (an open's, `None` unread), gives the caller code-injection access to
+/// the target. Read mode never does (`ps`, `/proc/<pid>/environ`, `kcmp`);
+/// attach mode does, but for `process_vm_readv` and a read-only open of a
+/// procfs file (`/proc/<pid>/mem` for reading, `stack`, `syscall`).
+/// Anything else in attach mode, a call or flags unread included, is an
+/// injection: a debugger's `PTRACE_ATTACH` / `PTRACE_SEIZE`,
+/// `process_vm_writev`, `/proc/<pid>/mem` opened for writing,
+/// `pidfd_getfd` (whatever the descriptor), a `perf_event_open` that
+/// signals the target (fail closed).
+#[inline(always)]
+pub const fn injection(mode: u32, syscall: Option<u64>, open_flags: Option<u64>) -> bool {
+    if mode & PTRACE_MODE_ATTACH == 0 {
+        return false;
+    }
+    let Some(nr) = syscall else {
+        return true;
+    };
+    if nr == SYS_PROCESS_VM_READV {
+        return false;
+    }
+    if (nr == SYS_OPEN || nr == SYS_OPENAT || nr == SYS_OPENAT2) && mode & PTRACE_MODE_FSCREDS != 0
+    {
+        return match open_flags {
+            Some(f) => f & O_ACCMODE != 0,
+            None => true,
+        };
+    }
+    true
+}
+
+/// Lot 281: the record's `target_dev` for an injection — the access mode
+/// and the system call (`u32::MAX` unread).
+pub const fn inject_detail(mode: u32, syscall: Option<u64>) -> u64 {
+    let nr = match syscall {
+        Some(n) if n < u32::MAX as u64 => n,
+        _ => u32::MAX as u64,
+    };
+    (nr << 32) | mode as u64
+}
+
+/// Lot 281: [`inject_detail`]'s inverse — `(mode, syscall)`.
+pub const fn inject_detail_parts(detail: u64) -> (u32, Option<u64>) {
+    let nr = detail >> 32;
+    (
+        detail as u32,
+        if nr == u32::MAX as u64 {
+            None
+        } else {
+            Some(nr)
+        },
+    )
+}
+
+/// Lot 281: [`inject_detail`]'s mode for `PTRACE_TRACEME` (no access
+/// mode: the target asked its parent to trace it).
+pub const TRACEME_MODE: u32 = 0;
 
 /// `CLONE_INTO_CGROUP` (include/uapi/linux/sched.h, 5.7+).
 pub const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
@@ -533,6 +693,111 @@ mod tests {
         ] {
             assert_eq!(unpack(pack(how, by)), (how, by));
         }
+    }
+
+    /// Lot 281: a fork passes the placement (as `inherited`) and the taint
+    /// (as inherited taint); a move keeps an injection's taint; an
+    /// injection keeps the placement. Each bit apart from the others.
+    #[test]
+    fn the_taint_is_passed_on_and_never_cleaned() {
+        assert_eq!(inherited(0), 0);
+        assert_eq!(inherited(HOW_MOVED), HOW_INHERITED);
+        assert_eq!(inherited(HOW_BORN_INTO), HOW_INHERITED);
+        assert_eq!(inherited(HOW_INHERITED), HOW_INHERITED);
+        assert_eq!(inherited(HOW_INJECTED), HOW_TAINT_INHERITED);
+        assert_eq!(inherited(HOW_TAINT_INHERITED), HOW_TAINT_INHERITED);
+        assert_eq!(
+            inherited(HOW_MOVED | HOW_INJECTED),
+            HOW_INHERITED | HOW_TAINT_INHERITED
+        );
+        assert_eq!(remarked(HOW_MOVED, 0), HOW_MOVED);
+        assert_eq!(remarked(HOW_MOVED, HOW_INJECTED), HOW_MOVED | HOW_INJECTED);
+        assert_eq!(
+            remarked(HOW_INHERITED, HOW_TAINT_INHERITED | HOW_BORN_INTO),
+            HOW_INHERITED | HOW_TAINT_INHERITED
+        );
+        assert_eq!(injected(0), HOW_INJECTED);
+        assert_eq!(injected(HOW_MOVED), HOW_MOVED | HOW_INJECTED);
+        assert_eq!(injected(HOW_TAINT_INHERITED), HOW_INJECTED);
+        assert_eq!(HOW_PLACE & HOW_TAINT, 0);
+        for how in [HOW_MOVED, HOW_BORN_INTO, HOW_INHERITED] {
+            assert_eq!(how & HOW_TAINT, 0);
+            assert_eq!(how & HOW_PLACE, how);
+        }
+        for (how, by) in [(HOW_INJECTED | HOW_MOVED, 7), (HOW_TAINT_INHERITED, 1)] {
+            assert_eq!(unpack(pack(how, by)), (how, by));
+        }
+    }
+
+    /// Lot 281 (#494's N2): the pinned epoch only goes forward.
+    #[test]
+    fn the_epoch_request_only_moves_the_epoch_forward() {
+        assert!(epoch_promoted(0, 5));
+        assert!(epoch_promoted(5, 6));
+        assert!(!epoch_promoted(5, 5));
+        assert!(!epoch_promoted(6, 5));
+        assert!(!epoch_promoted(6, 0));
+    }
+
+    /// Lot 281: attach mode is an injection but for process_vm_readv and a
+    /// read-only open of a procfs file; read mode never is; a call or flags
+    /// unread is (fail closed).
+    #[test]
+    fn code_injection_access_is_told_from_a_read() {
+        const ATTACH_REAL: u32 = PTRACE_MODE_ATTACH | PTRACE_MODE_REALCREDS;
+        const ATTACH_FS: u32 = PTRACE_MODE_ATTACH | PTRACE_MODE_FSCREDS;
+        const READ_FS: u32 = PTRACE_MODE_READ | PTRACE_MODE_FSCREDS;
+        const SYS_PTRACE: u64 = 101;
+        const SYS_PROCESS_VM_WRITEV: u64 = 311;
+        const SYS_PIDFD_GETFD: u64 = 438;
+        // a debugger's attach (PTRACE_ATTACH / PTRACE_SEIZE)
+        assert!(injection(ATTACH_REAL, Some(SYS_PTRACE), None));
+        assert!(injection(ATTACH_REAL, Some(SYS_PROCESS_VM_WRITEV), None));
+        assert!(!injection(ATTACH_REAL, Some(SYS_PROCESS_VM_READV), None));
+        assert!(injection(ATTACH_REAL, Some(SYS_PIDFD_GETFD), None));
+        // /proc/<pid>/mem: O_RDONLY, O_WRONLY, O_RDWR, by each open call
+        for nr in [SYS_OPEN, SYS_OPENAT, SYS_OPENAT2] {
+            assert!(!injection(ATTACH_FS, Some(nr), Some(0)), "{nr}");
+            assert!(
+                !injection(ATTACH_FS, Some(nr), Some(0o100000 | 0o2000000)),
+                "{nr}: O_LARGEFILE|O_CLOEXEC read-only"
+            );
+            assert!(injection(ATTACH_FS, Some(nr), Some(1)), "{nr}");
+            assert!(injection(ATTACH_FS, Some(nr), Some(2)), "{nr}");
+            assert!(injection(ATTACH_FS, Some(nr), None), "{nr}: flags unread");
+            // an open never checks with the real credentials: not read-only
+            assert!(injection(ATTACH_REAL, Some(nr), Some(0)), "{nr}");
+        }
+        // read mode: never
+        for nr in [Some(SYS_PTRACE), Some(SYS_OPENAT), None] {
+            assert!(!injection(READ_FS, nr, Some(2)));
+            assert!(!injection(
+                PTRACE_MODE_READ | PTRACE_MODE_REALCREDS,
+                nr,
+                None
+            ));
+        }
+        // the call unread (an io-wq worker, a kernel thread): an injection
+        assert!(injection(ATTACH_FS, None, Some(0)));
+        assert!(injection(ATTACH_REAL, None, None));
+        // the record's detail round-trips
+        for (mode, nr) in [
+            (ATTACH_REAL, Some(SYS_PTRACE)),
+            (ATTACH_FS, Some(SYS_OPENAT)),
+            (ATTACH_REAL, None),
+            (TRACEME_MODE, None),
+        ] {
+            assert_eq!(inject_detail_parts(inject_detail(mode, nr)), (mode, nr));
+        }
+        assert_eq!(
+            inject_detail_parts(inject_detail(ATTACH_REAL, Some(u64::MAX))),
+            (ATTACH_REAL, None)
+        );
+        // a number past 32 bits is no call's: unread, never its low half
+        assert_eq!(
+            inject_detail_parts(inject_detail(ATTACH_REAL, Some(0x1_0000_0005))),
+            (ATTACH_REAL, None)
+        );
     }
 
     /// Lot 280b: a birth the fentry missed is one the armed check sees

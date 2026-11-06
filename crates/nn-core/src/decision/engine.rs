@@ -79,6 +79,14 @@ impl<H: DecisionHost> RuleEngine<H> {
         self
     }
 
+    /// Lot 281: the exemption of the policy in force (any rule's) that
+    /// covers process `pid` whatever was injected into it
+    /// ([`rule_policy::covering`]) — asked when code was first injected into
+    /// a process.
+    pub fn exempt_covering(&self, pid: u32) -> Option<String> {
+        rule_policy::covering(&self.policy.current(), pid, &*self.facts)
+    }
+
     /// This engine reading exemption facts from `facts` (the golden replay
     /// and `nn-admin policy test`: an empty `/proc`).
     pub fn with_facts(mut self, facts: Arc<dyn ActorFacts>) -> Self {

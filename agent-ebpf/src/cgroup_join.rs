@@ -47,31 +47,59 @@
 //!
 //! The agent's family (the agent, the watchdog) moves processes into its
 //! own containment cgroups, which no exemption may name: not marked.
+//!
+//! Lot 281 — the code a process runs, beside where it runs:
+//!
+//! * [`cgroup_join_inject`] (LSM `ptrace_access_check`): code-injection
+//!   access to a process granted to another (`common::cgroup_join::
+//!   injection`: a debugger's attach, `/proc/<pid>/mem` opened for writing,
+//!   `process_vm_writev`, `pidfd_getfd`; not a read) taints its mark
+//!   (`HOW_INJECTED`, by the injector) — no exemption of the per-rule
+//!   policy holds for it any more — and the first taint is recorded
+//!   ([`FS_OP_EXEMPT_INJECT`], rate-limited): the agent signs it when an
+//!   exemption covered the process.
+//! * [`cgroup_join_traceme`] (LSM `ptrace_traceme`): a process that asks
+//!   its parent to trace it (a program started under a debugger) is
+//!   tainted the same way, by the parent.
+//! * A fork passes the taint on (`HOW_TAINT_INHERITED`); a move keeps it.
+//!
+//! Neither refuses anything; the family's own accesses, PID 1 and the
+//! protected processes (whose attach the deny hook refuses) are not marked.
+//! Pinned with the others, they run while no agent does (an upgrade's gap).
+//!
+//! Lot 281 (#494's N2): the pinned maps are frozen by the agent — no
+//! handle writes them, only these programs; a reset's epoch is asked for
+//! in the per-load [`CGROUP_JOIN_EPOCH_RT`] and taken into the pinned
+//! [`CGROUP_JOIN_EPOCH`] by the fork program, forward only.
 
 use aya_ebpf::{
     helpers::{
         bpf_get_current_pid_tgid, bpf_get_current_task, bpf_ktime_get_ns, bpf_probe_read_kernel,
         generated,
     },
-    macros::{btf_tracepoint, fentry, fexit, map},
+    macros::{btf_tracepoint, fentry, fexit, lsm, map},
     maps::{Array, HashMap, PerCpuArray},
-    programs::{BtfTracePointContext, FEntryContext, FExitContext},
+    programs::{BtfTracePointContext, FEntryContext, FExitContext, LsmContext},
     EbpfContext,
 };
 use northnarrow_common::btf_offsets::CGROUP_MOVE_RET_ARG;
 use northnarrow_common::cgroup_join::{
-    fnv_step, lost_slot, noop, pack, path_read, placement, Move, PathRead, CLONE_INTO_CGROUP,
-    EPOCH_SLOTS, EXEMPT_NAMES_ENTRIES, FNV_OFFSET, HOW_BORN_INTO, HOW_INHERITED, HOW_MOVED, JOINED_ENTRIES,
-    LOST_BYTES, LOST_SLOTS, NAME_CGROUP, NAME_UNIT, PATH_READ, STAT_INHERITED, STAT_INTO_EXEMPT, STAT_LOST,
-    STAT_ROOTS, STAT_SLOTS, BORN_ENTRIES, SILENT_ARMED, SILENT_LAST_NS, SILENT_SLOTS, SILENT_UNSEEN,
-    unseen_birth,
+    epoch_promoted, fnv_step, inherited, inject_detail, injected, injection, lost_slot, noop,
+    pack, path_read, placement, remarked, unpack, Move, PathRead, CLONE_INTO_CGROUP, EPOCH_SLOTS,
+    EXEMPT_NAMES_ENTRIES, FNV_OFFSET, HOW_BORN_INTO, HOW_MOVED, HOW_TAINT, JOINED_ENTRIES, LOST_BYTES, LOST_SLOTS, NAME_CGROUP, NAME_UNIT,
+    PATH_READ, PTRACE_MODE_ATTACH, STAT_INHERITED, STAT_INJECTED, STAT_INTO_EXEMPT, STAT_LOST,
+    STAT_ROOTS, STAT_SLOTS, SYS_OPEN, SYS_OPENAT, SYS_OPENAT2, BORN_ENTRIES, SILENT_ARMED,
+    SILENT_LAST_NS, SILENT_SLOTS, SILENT_UNSEEN, unseen_birth,
 };
-use northnarrow_common::wire::{InodeKey, FS_OP_CGROUP_JOIN};
+use northnarrow_common::cgroup_limits::regs_are_the_writes;
+use northnarrow_common::wire::{InodeKey, FS_OP_CGROUP_JOIN, FS_OP_EXEMPT_INJECT};
 
 use crate::btf_offsets::{
-    KERNEL_CLONE_ARGS_FLAGS_OFFSET, MM_STRUCT_EXE_FILE_OFFSET, SIGNAL_STRUCT_LIVE_OFFSET,
-    TASK_STRUCT_GROUP_LEADER_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET,
-    TASK_STRUCT_SIGNAL_OFFSET, TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET,
+    KERNEL_CLONE_ARGS_FLAGS_OFFSET, MM_STRUCT_EXE_FILE_OFFSET, PT_REGS_DX_OFFSET,
+    PT_REGS_ORIG_AX_OFFSET, PT_REGS_SI_OFFSET, SIGNAL_STRUCT_LIVE_OFFSET,
+    TASK_STRUCT_FLAGS_OFFSET, TASK_STRUCT_GROUP_LEADER_OFFSET, TASK_STRUCT_MM_OFFSET,
+    TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_SIGNAL_OFFSET, TASK_STRUCT_START_TIME_OFFSET,
+    TASK_STRUCT_TGID_OFFSET,
 };
 
 /// `BPF_F_NO_PREALLOC`: an entry allocated at each mark.
@@ -113,6 +141,14 @@ pub static CGROUP_JOIN_STATS: Array<u64> = Array::with_max_entries(STAT_SLOTS, 0
 /// the marks.
 #[map]
 pub static CGROUP_JOIN_EPOCH: Array<u64> = Array::with_max_entries(EPOCH_SLOTS, 0);
+
+/// Lot 281 (#494's N2): the agent's request for a reset — the same slots
+/// as [`CGROUP_JOIN_EPOCH`], per load, written by the agent (the pinned
+/// epoch is frozen: no handle writes it). The fork program takes it into
+/// the pinned epoch when it is later ([`epoch_now`]): a handle that lowers
+/// the request lowers nothing.
+#[map]
+pub static CGROUP_JOIN_EPOCH_RT: Array<u64> = Array::with_max_entries(EPOCH_SLOTS, 0);
 
 /// The names the per-rule policy's exemptions by cgroup or unit give
 /// (FNV-1a of a cgroup path, or of a unit's name) → `NAME_CGROUP` /
@@ -242,11 +278,7 @@ fn found(tgid: u32) {
 /// forks. Not PID 1 (systemd's placement) nor the family. A start time
 /// unread is before (fail closed).
 #[inline(always)]
-unsafe fn before_epoch(parent: u64, ptgid: u32) -> bool {
-    let epoch = match CGROUP_JOIN_EPOCH.get(0) {
-        Some(e) => *e,
-        None => return false,
-    };
+unsafe fn before_epoch(epoch: u64, parent: u64, ptgid: u32) -> bool {
     if epoch == 0 || ptgid == 1 || family(ptgid) {
         return false;
     }
@@ -256,8 +288,48 @@ unsafe fn before_epoch(parent: u64, ptgid: u32) -> bool {
     leader_start(parent).unwrap_or(0) < epoch
 }
 
+/// Lot 281 (#494's N2): the marks' last reset — the agent's request
+/// ([`CGROUP_JOIN_EPOCH_RT`]) taken into the pinned [`CGROUP_JOIN_EPOCH`]
+/// first when it is later (boot-time slot first, as the agent writes it:
+/// the monotonic slot never names an epoch the other does not). 0: none.
+#[inline(always)]
+unsafe fn epoch_now() -> u64 {
+    let Some(e) = CGROUP_JOIN_EPOCH.get_ptr_mut(0) else {
+        return 0;
+    };
+    let request = match CGROUP_JOIN_EPOCH_RT.get(0) {
+        Some(r) => *r,
+        None => 0,
+    };
+    if epoch_promoted(*e, request) {
+        if let (Some(b), Some(rb)) = (
+            CGROUP_JOIN_EPOCH.get_ptr_mut(1),
+            CGROUP_JOIN_EPOCH_RT.get(1),
+        ) {
+            *b = *rb;
+        }
+        *e = request;
+    }
+    *e
+}
+
+/// The `how` of thread group `tgid`'s mark, when it is this process's
+/// (leader start `start`) — 0 for none.
+#[inline(always)]
+unsafe fn how_now(tgid: u32, start: u64) -> u8 {
+    match CGROUP_JOINED.get(&tgid) {
+        Some(rec) if rec[0] == start => unpack(rec[1]).0,
+        _ => 0,
+    }
+}
+
+/// Lot 281: a mark keeps the taint the process's mark had
+/// (`common::cgroup_join::remarked`): a move after an injection does not
+/// clean it.
 #[inline(always)]
 fn mark(tgid: u32, start: u64, how: u8, by: u32) -> bool {
+    // SAFETY: a lookup of the marks' map.
+    let how = remarked(how, unsafe { how_now(tgid, start) });
     let rec = [start, pack(how, by)];
     if CGROUP_JOINED.insert(&tgid, &rec, 0).is_err() {
         lose(tgid);
@@ -531,14 +603,17 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) {
     if check_birth(ptgid, child) {
         return;
     }
-    // The mark is this process's, not a dead one's at the same tgid.
-    let marked = match CGROUP_JOINED.get(&ptgid) {
-        Some(rec) => leader_start(parent) == Some(rec[0]),
-        None => false,
+    // Lot 281: the reset asked for taken in first, whoever forks.
+    let epoch = epoch_now();
+    // The mark is this process's, not a dead one's at the same tgid; lot
+    // 281: its `how`, for the child's.
+    let (marked, phow) = match CGROUP_JOINED.get(&ptgid) {
+        Some(rec) => (leader_start(parent) == Some(rec[0]), unpack(rec[1]).0),
+        None => (false, 0),
     };
     // The review of #494, D2: a group not known passes that on too — and
     // (the third review, R2-a) one that started before the last reset.
-    let lost = is_lost(ptgid) || before_epoch(parent, ptgid);
+    let lost = is_lost(ptgid) || before_epoch(epoch, parent, ptgid);
     if !marked && !lost {
         return;
     }
@@ -557,7 +632,8 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) {
         lose(ctgid);
         return;
     };
-    if mark(ctgid, start, HOW_INHERITED, ptgid) {
+    // Lot 281: where it runs and the taint, passed on.
+    if mark(ctgid, start, inherited(phow), ptgid) {
         count(STAT_INHERITED);
     }
 }
@@ -636,4 +712,154 @@ unsafe fn try_exit(ctx: &BtfTracePointContext) {
     if rd_u32(signal + off!(SIGNAL_STRUCT_LIVE_OFFSET) as u64) == Some(0) {
         let _ = CGROUP_JOINED.remove(&tgid);
     }
+}
+
+/// Lot 281: `int ptrace_access_check(struct task_struct *child, unsigned int
+/// mode)` — `ptrace_may_access` allowed `mode` to the caller, every check
+/// before the LSMs passed (a refusal by this hook's deny program, or an
+/// LSM before it, ends the chain before this one runs): code-injection
+/// access to `child`'s process taints its mark. Never refuses.
+#[lsm(hook = "ptrace_access_check")]
+pub fn cgroup_join_inject(ctx: LsmContext) -> i32 {
+    unsafe { try_inject(&ctx) };
+    0
+}
+
+#[inline(always)]
+unsafe fn try_inject(ctx: &LsmContext) {
+    let target: u64 = ctx.arg(0);
+    let mode: u32 = ctx.arg(1);
+    // Read mode (`ps`, `/proc/<pid>/environ`, `kcmp`): no injection.
+    if target == 0 || mode & PTRACE_MODE_ATTACH == 0 {
+        return;
+    }
+    let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // The agent and the watchdog: their accesses taint nothing.
+    if family(caller) {
+        return;
+    }
+    let Some(tgid) = tgid_of(target) else {
+        count(STAT_LOST);
+        return;
+    };
+    let (syscall, flags) = current_call();
+    if !injection(mode, syscall, flags) {
+        return;
+    }
+    taint(target, tgid, caller, inject_detail(mode, syscall), true);
+}
+
+/// Lot 281: `int ptrace_traceme(struct task_struct *parent)` — the current
+/// process asks `parent` to trace it (`PTRACE_TRACEME`: a program started
+/// under a debugger): the parent gets the access an attach gives. Tainted
+/// like an injection, by the parent; not recorded (a program about to be
+/// started is no exempt process yet). Never refuses.
+#[lsm(hook = "ptrace_traceme")]
+pub fn cgroup_join_traceme(ctx: LsmContext) -> i32 {
+    unsafe { try_traceme(&ctx) };
+    0
+}
+
+#[inline(always)]
+unsafe fn try_traceme(ctx: &LsmContext) {
+    let parent: u64 = ctx.arg(0);
+    if parent == 0 {
+        return;
+    }
+    let Some(tracer) = tgid_of(parent) else {
+        count(STAT_LOST);
+        return;
+    };
+    if family(tracer) {
+        return;
+    }
+    let me = (bpf_get_current_pid_tgid() >> 32) as u32;
+    taint(bpf_get_current_task(), me, tracer, 0, false);
+}
+
+/// Lot 281: thread group `tgid` (task `task`) tainted by `by` — its mark's
+/// placement kept, `HOW_INJECTED` added; a group already tainted keeps
+/// its mark (its exemptions are gone already). Not PID 1 (whose children
+/// would all inherit it: the deny hook refuses an attach to it outside a
+/// window) nor a protected process (the deny hook refuses the access).
+/// A mark the map cannot take: the group is not known. The first taint is
+/// counted and, when `record`, recorded with `detail`.
+#[inline(always)]
+unsafe fn taint(task: u64, tgid: u32, by: u32, detail: u64, record: bool) {
+    if tgid == 1 || crate::task_kill::is_protected_pid(tgid) {
+        return;
+    }
+    let Some(start) = leader_start(task) else {
+        lose(tgid);
+        return;
+    };
+    let old = how_now(tgid, start);
+    if old & HOW_TAINT != 0 {
+        return;
+    }
+    let rec = [start, pack(injected(old), by)];
+    if CGROUP_JOINED.insert(&tgid, &rec, 0).is_err() {
+        lose(tgid);
+    }
+    count(STAT_INJECTED);
+    if record {
+        crate::inode_protect::emit_limited(
+            FS_OP_EXEMPT_INJECT,
+            InodeKey {
+                dev: detail,
+                ino: u64::from(tgid),
+            },
+        );
+    }
+}
+
+/// Lot 281: the system call the current task is in, and its open flags
+/// when it is an open — `(None, None)` when its registers are not its own
+/// call's (an io-wq worker, a kernel thread: `regs_are_the_writes`) or
+/// cannot be read, or on an architecture without the offsets: every
+/// attach-mode access is then an injection (fail closed).
+#[inline(always)]
+unsafe fn current_call() -> (Option<u64>, Option<u64>) {
+    let (Some(ax), Some(si), Some(dx)) = (
+        off_opt!(PT_REGS_ORIG_AX_OFFSET),
+        off_opt!(PT_REGS_SI_OFFSET),
+        off_opt!(PT_REGS_DX_OFFSET),
+    ) else {
+        return (None, None);
+    };
+    if ax > 0xff || si > 0xff || dx > 0xff {
+        return (None, None);
+    }
+    let task = generated::bpf_get_current_task_btf();
+    let Ok(flags) = bpf_probe_read_kernel::<u32>(
+        (task as *const u8).add(off!(TASK_STRUCT_FLAGS_OFFSET)) as *const u32,
+    ) else {
+        return (None, None);
+    };
+    if !regs_are_the_writes(flags) {
+        return (None, None);
+    }
+    let regs = generated::bpf_task_pt_regs(task) as u64;
+    if regs == 0 {
+        return (None, None);
+    }
+    let Some(nr) = rd_u64(regs + ax as u64) else {
+        return (None, None);
+    };
+    let open_flags = if nr == SYS_OPEN {
+        rd_u64(regs + si as u64)
+    } else if nr == SYS_OPENAT {
+        rd_u64(regs + dx as u64)
+    } else if nr == SYS_OPENAT2 {
+        // `struct open_how *` (its `flags` the first u64), in user memory.
+        match rd_u64(regs + dx as u64) {
+            Some(how) if how != 0 => {
+                aya_ebpf::helpers::bpf_probe_read_user::<u64>(how as *const u64).ok()
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    (Some(nr), open_flags)
 }

@@ -1179,8 +1179,19 @@ pub const FS_OP_SYSCTL_ROOT_ATTACH: u8 = 36;
 /// attached after the judge, it runs after it (`target_ino` = its id).
 pub const FS_OP_SYSCTL_ROOT_PROG: u8 = 37;
 
+/// Lot 281: NOT a refusal — code-injection access to a process outside the
+/// agent's family was first given to another (a debugger's attach, a write
+/// handle on its `/proc/<pid>/mem`, `process_vm_writev`, `pidfd_getfd`, or
+/// `PTRACE_TRACEME`: `crate::cgroup_join::injection`), by a caller outside
+/// the family: the start-in-cgroup tracker marked it, and no exemption of
+/// the per-rule policy holds for it or what it forks any more
+/// (`target_ino` = its tgid, `target_dev` =
+/// `crate::cgroup_join::inject_detail`). The agent signs it when an
+/// exemption covered the process.
+pub const FS_OP_EXEMPT_INJECT: u8 = 38;
+
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_SYSCTL_ROOT_PROG;
+pub const FS_OP_LAST: u8 = FS_OP_EXEMPT_INJECT;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
@@ -2223,6 +2234,7 @@ mod tests {
             FS_OP_KERNEL_TAINT,
             FS_OP_SYSCTL_ROOT_ATTACH,
             FS_OP_SYSCTL_ROOT_PROG,
+            FS_OP_EXEMPT_INJECT,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
         for (i, a) in ops.iter().enumerate() {

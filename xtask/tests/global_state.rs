@@ -371,6 +371,24 @@ const STATICS: &[Kept] = &[
         "lot 277 (the re-review of #494, R2, and its third review): what this start does with the tracker's pins (the registered directory adopted, or a reset), decided before the one eBPF object's load and read by its attach and the pins' registration",
     ),
     kept(
+        "crates/nn-linux/src/cgroup_join.rs",
+        "ADOPTED",
+        Kernel,
+        "lot 281 (#494's N1): the registered state an adoption verified before the one eBPF object's load, against which its attach checks the maps the load took",
+    ),
+    kept(
+        "crates/nn-linux/src/cgroup_join.rs",
+        "PLANNED_AT",
+        Kernel,
+        "lot 281: when this start planned the tracker's pins, the arming's measure of the window in which no exemption is honoured (one start per process)",
+    ),
+    kept(
+        "crates/nn-linux/src/cgroup_join.rs",
+        "FINAL_DIR",
+        Kernel,
+        "lot 281 (#494's N1): the directory the one tracker's pins went to (the plan's, or a later generation's past a plant), read by the pins' protection and registration",
+    ),
+    kept(
         "crates/nn-linux/src/sysctl_cgroup.rs",
         "JUDGE",
         Kernel,

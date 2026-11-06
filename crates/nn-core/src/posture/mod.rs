@@ -445,6 +445,13 @@ impl<H: DecisionHost> PostureMachine<H> {
         self.inner.triggers.set_defense_detector(detector);
     }
 
+    /// Lot 281: whether `pid` belongs to an administrator's interactive
+    /// sudo/su session, as of `as_of` (`None` while it cannot be told) —
+    /// the injection record's lineage.
+    pub fn interactive_admin_status(&self, pid: u32, as_of: lineage::AsOf) -> Option<bool> {
+        self.inner.triggers.interactive_admin_status(pid, as_of)
+    }
+
     /// External audit POS-001: run `hook` when an unlocked COMBAT decays.
     /// Set once; a second call is ignored.
     pub fn on_combat_decay(&self, hook: CombatDecayHook) {

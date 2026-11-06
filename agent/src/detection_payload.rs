@@ -358,6 +358,10 @@ pub struct RuleMatchRecord {
     /// The policy's exemption that covered the actor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exempt: Option<String>,
+    /// Lot 281: the policy's exemption that matched the actor but did not
+    /// hold, and why (code was injected into the process).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked: Option<String>,
 }
 
 /// Lab PR 226: what the exec policy saw and decided

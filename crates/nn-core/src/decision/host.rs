@@ -201,6 +201,9 @@ mod testing {
         fn started_in_cgroup(&self, _pid: u32) -> Option<bool> {
             None
         }
+        fn injected(&self, _pid: u32) -> Option<crate::decision::rule_policy::Injected> {
+            None
+        }
     }
 
     /// Samples nothing: no burst's files are read.

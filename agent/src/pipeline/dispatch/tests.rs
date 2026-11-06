@@ -78,6 +78,7 @@ fn decided_on(
             held_action: None,
             builtin_action: action.clone(),
             switch_held: false,
+            revoked: None,
         }],
         responses: vec![Response {
             action,

@@ -72,8 +72,10 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
         // target, the caller a caller
         ("task_limits.rs", 1, 1),
         // lot 277: the writer of a move, the forker of a start — callers
-        // (the agent's family moves into its own containment cgroups)
-        ("cgroup_join.rs", 0, 1),
+        // (the agent's family moves into its own containment cgroups); lot
+        // 281: the process injected into is a target (a protected one is
+        // never tainted: the deny hook refuses the access)
+        ("cgroup_join.rs", 1, 1),
         // lot 280a: the writer of a guarded sysctl — a caller (the agent's
         // own restore passes as the family)
         ("sysctl_guard.rs", 0, 1),
