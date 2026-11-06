@@ -7075,7 +7075,8 @@ number in parentheses is a lab PR.
     that never ends: exit 75 before 2 s, its note first — and 15 more,
     `dispatch::tests::the_stop_s_deadline_ends_both_of_its_waits`,
     `export::controller::tests::the_stop_waits_at_most_what_it_is_given`);
-    mutations: 55 + 9, each caught by a named test but 2 argued equivalent.
+    63 mutations, 61 caught by a named test, 2 argued equivalent (the
+    deadline's thread left waiting after `finish`, which the exit follows).
     The flaky `nn-linux` exe test (lot 275): its child's `exe` read once the
     exec replaced the image; 200 suite runs under parallel load, 0
     failures.
