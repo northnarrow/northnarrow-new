@@ -2020,7 +2020,7 @@ Attempt on the agent refused by an anti-tamper hook — category `anti_tamper`.
 
 **Observes.** Every action on the agent an anti-tamper LSM hook refused: a signal to a protected pid, a ptrace or /proc/&lt;pid&gt;/mem access, a write, unlink, rename or new entry in its protected files, a handle to its BPF maps or links, a kexec load, a read of its signing key. Issued by process_event outside the engine.
 
-**Known false positives.** An administrator's `systemctl stop` or `kill` of the agent, or an upgrade, outside a trusted-installer window; a debugger or `strace -p` on the agent. The kernel refused the action either way; the record is Log only.
+**Known false positives.** An administrator's `systemctl stop` or `kill` of the agent, or an upgrade, outside a trusted-installer window; a debugger or `strace -p` on the agent. Lot 283b: `deb-systemd-helper`, when a package with units is purged, tries `rmdir` on the empty directories under /etc/systemd/system — the agent's four drop-in directories among them (`northnarrow-agent.service.d`, `northnarrow-watchdog.service.d`, `northnarrow-.service.d`, `northnarrow.slice.d`), the agent's own inodes, refused so a drop-in cannot be made in a directory the agent does not guard; the purge completes (the helper ignores the error). No path of another package is refused. The kernel refused the action either way; the record is Log only.
 
 **How to test.** `kill -9` the agent from a root shell (anti-tamper.sh case C01) or read /proc/&lt;agent&gt;/mem (case C03): the record names the refused operation (deny=signal, deny=ptrace).
 

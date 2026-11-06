@@ -88,7 +88,7 @@ tools (R011, R012, R013), run by root from there, are killed in every
 posture, as before.
 
 **Kills that broke benign workloads (lot 283b, 06/11/2026).** Lot 283a's
-benign corpus ([BENIGN_CORPUS.md](../validation/BENIGN_CORPUS.md): a
+benign corpus ([the benign corpus](https://github.com/northnarrow/northnarrow-new/blob/main/docs/validation/BENIGN_CORPUS.md): a
 developer's workstation, a CI runner, a container host, a database server on
 Ubuntu 22.04 and 24.04) saw every kill of a default install land on benign
 work. Four changes, each a default the signed per-rule policy can undo with
@@ -144,7 +144,7 @@ authority the founder delegated, after lot 283a's inventory.
   dropped by a foreign writer is recorded, not undone. A `runc` renamed copy
   of `nsenter` is recorded, not killed. The in-session small-file threshold of
   lot 282's backlog is not turned on: at 50, `cargo fmt` and `prettier` cross
-  it (the corpus's data, BENIGN_CORPUS.md).
+  it (the corpus's data, in the repository's `docs/validation/`).
 - *Not changed:* the `ConfirmedIntrusion` raises of ordinary servers
   (PostgreSQL, containerd, the Go build cache: ENGAGED, never COMBAT) are lot
   283c's.
