@@ -1250,3 +1250,66 @@ fn a_worker_worse_or_gone_or_less_sandboxed_is_worse_and_named() {
         .iter()
         .any(|l| l.ends_with("(5 failures in a row)")));
 }
+
+/// Lot 280b (named): the manifest's kernel code — a taint flag more, a
+/// mask no longer read or a livepatch more is a worse state (its row signed
+/// at once); a flag gone (a reboot's manifest) or a livepatch disabled is
+/// not; every change is named in the change row, the hash moves.
+#[test]
+fn the_kernel_code_changes_are_signed_and_a_new_flag_is_worse() {
+    use super::manifest::KernelCode;
+    let healthy = healthy();
+    let base = manifest_of(&healthy);
+    let with = |tainted: Option<u64>, taint: &str, livepatches: &[&str]| {
+        let mut m = base.clone();
+        m.kernel_code = Some(KernelCode {
+            tainted,
+            taint: taint.into(),
+            livepatches: livepatches.iter().map(|s| s.to_string()).collect(),
+        });
+        m.hash = m.content_hash();
+        m
+    };
+    let clean = with(Some(0), "", &[]);
+    let oot = with(Some(4096), "O", &[]);
+    let unsigned = with(Some(12288), "OE", &[]);
+    let unread = with(None, "gone", &[]);
+    let lp = with(Some(4096), "O", &["lp_cve"]);
+    let lp_off = with(Some(4096), "O", &["lp_cve (disabled)"]);
+    assert!(!clean.worsens_from(&clean));
+    assert!(oot.worsens_from(&clean), "a flag more");
+    assert!(unsigned.worsens_from(&oot), "a flag more");
+    assert!(!oot.worsens_from(&unsigned), "a flag less: not worse");
+    assert!(unread.worsens_from(&oot), "no longer read");
+    assert!(!oot.worsens_from(&unread), "read again");
+    assert!(lp.worsens_from(&oot), "a livepatch more");
+    assert!(!oot.worsens_from(&lp), "a livepatch less");
+    assert!(
+        lp_off.worsens_from(&lp),
+        "a livepatch in another state is a new line"
+    );
+    // no kernel code on either side (a manifest from before the lot): no
+    // worse state from it
+    assert!(!base.worsens_from(&oot));
+    assert!(!oot.worsens_from(&base));
+    // named in the change row, the capabilities' hash moved
+    assert_ne!(clean.content_hash(), oot.content_hash());
+    let ch = unsigned.changes_from(&oot);
+    assert_eq!(
+        ch,
+        vec!["kernel code: tainted 4096 (O), no livepatch → tainted 12288 (OE), no livepatch"]
+    );
+    assert_eq!(
+        oot.changes_from(&clean),
+        vec!["kernel code: not tainted, no livepatch → tainted 4096 (O), no livepatch"]
+    );
+    assert_eq!(
+        lp.changes_from(&base),
+        vec!["kernel code: not measured → tainted 4096 (O), livepatches lp_cve"]
+    );
+    assert_eq!(
+        unread.changes_from(&oot),
+        vec!["kernel code: tainted 4096 (O), no livepatch → taint not read (gone), no livepatch"]
+    );
+    assert!(oot.changes_from(&oot).is_empty());
+}
