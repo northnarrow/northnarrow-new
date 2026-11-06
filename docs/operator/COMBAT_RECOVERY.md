@@ -366,7 +366,9 @@ The stop ends in bounded time, in COMBAT or not. Within the unit's
 shutdown — leaves a process that outlives it running, and install.sh's and
 uninstall.sh's stop sends SIGKILL after 10 s, the signed `agent_stop` lost)
 the process must end *and* the kernel must release its BPF programs and
-links, which took 2.4 s on ubuntu2404 (lot 288's lab). So the stop has 2 s
+links, which took 2.1 to 2.4 s on ubuntu2404 (lot 288's lab: a stop in
+COMBAT seen ending by systemd at 2.72 s, one whose decision thread was
+stalled at 3.59 s). So the stop has 2 s
 from the end of the event loop: each stage that waits — the queued
 responses and the canary trips (at most 1 s), the export's thread, the
 runtime's blocking tasks — gets at most what is left; a stage that blocks

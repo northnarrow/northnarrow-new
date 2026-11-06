@@ -7065,7 +7065,17 @@ number in parentheses is a lab PR.
       at 5.67 s: 2.4 s after `_exit`, the kernel's release of the agent's
       BPF programs and links — the same 2.4 s as the plain stop's teardown.
       Over the 5 s: the budget was cut to 2 s after the round (4dee4168),
-      the release kept 3 s. Not measured again.
+      the release kept 3 s.
+    - Confirmation round (the coordinator's, the lot's agent at 4ad6b0b9,
+      budget 2 s, the same guest and path): a plain stop in COMBAT seen
+      ending by systemd at **2.72 s** (`agent_stop` at 0.43 s); the decision
+      thread stalled: the note at 1.50 s (stage `decision`, isolation kept,
+      both rows signed), `status=75/TEMPFAIL` seen by systemd at **3.59 s**
+      — under the 5 s, `TimeoutStopSec` unchanged. After each stop the
+      chain intact (3 rules, 3 jumps), torn down by the next start
+      (`combat_reconcile` repaired, 19 rules; the previous run read as
+      clean). The audit chain verified (43 rows); the guest left without
+      the agent, powered off.
     - The audit chain verified (45 rows); the guest left without the agent,
       powered off. A first round (78e1d468) used `systemctl restart`,
       refused: no stop took place, the agent stayed isolated; the guest was
@@ -7080,7 +7090,7 @@ number in parentheses is a lab PR.
     The flaky `nn-linux` exe test (lot 275): its child's `exe` read once the
     exec replaced the image; 200 suite runs under parallel load, 0
     failures.
-  - Open: the 2 s budget's lab measurement; the kernel's 2.4 s release of
-    the BPF programs (detaching them in parallel at the stop would shorten
-    every stop).
+  - Open: the kernel's release of the BPF programs after the exit (2.1 to
+    2.4 s measured; detaching them in parallel at the stop would shorten
+    every stop); other kernels than 6.8 not measured.
   - Levels unchanged (C18 1, C23 2).
