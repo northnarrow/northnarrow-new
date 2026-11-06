@@ -26,9 +26,9 @@
 #  T5  a cgroup/sysctl program on the ROOT cgroup: refused outside a window
 #      (sysctl_root_attach); attached inside one and held, found by the
 #      kernel-state round and signed (sysctl_root_prog);
-#  T6  (SWITCHES_CONFIDENTIALITY=1 only) lockdown raised to confidentiality
-#      inside a window: the host check's warning, then the agent restarted
-#      under it — what its start says and loads.
+#  T6  (SWITCHES_CONFIDENTIALITY=1: T6 alone) lockdown raised to
+#      confidentiality inside a window: the host check's warning, then the
+#      agent restarted under it — what its start says and loads.
 set -u
 PATH=$PATH:/usr/sbin:/sbin
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -92,6 +92,32 @@ print(int(x, 16) if isinstance(x, str) else int(x))' "$byte"
 echo "nn-admin: $NNADMIN  key: $KEY  kernel $(uname -r)  lockdown $(cat $LD 2>/dev/null)"
 sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 8; }
 sudo mountpoint -q /sys/kernel/debug || sudo mount -t debugfs debugfs /sys/kernel/debug
+
+# T6 alone (SWITCHES_CONFIDENTIALITY=1): the mode lasts until the next boot,
+# so it is a round of its own, the lab's last before the power-off.
+t6() {
+    echo "== T6. lockdown confidentiality (the guest keeps it until its next boot)"
+    window 600
+    echo confidentiality | sudo tee "$LD" >/dev/null; echo "    mode now: $(cat $LD)"
+    sudo "$NNADMIN" host-check 2>/dev/null | grep -A2 -i 'lockdown' | sed 's/^/    /'
+    hc=$(sudo "$NNADMIN" host-check --json 2>/dev/null | python3 -I -c 'import json,sys; [print(c["status"]) for c in json.load(sys.stdin) if c.get("id")=="lockdown"]' 2>/dev/null)
+    [[ $hc == warn ]] && pass "T6 the host check warns on [confidentiality]" || bad "T6 host check [$hc]"
+    t=$(date '+%F %T')
+    # the unit refuses a manual stop: the agent ended inside the window,
+    # systemd starts it again
+    old=$(sudo cat /run/northnarrow/agent.pid 2>/dev/null)
+    sudo systemctl kill --signal=SIGTERM northnarrow-agent
+    sleep 30
+    echo "    agent after a restart under confidentiality: $(systemctl is-active northnarrow-agent) (pid $old → $(sudo cat /run/northnarrow/agent.pid 2>/dev/null))"
+    sudo journalctl -u northnarrow-agent --since "$t" --no-pager -o cat 2>/dev/null | grep -iE 'refus|unknown func|lockdown|probe_read|degrad|not attached|FAILED' | cut -c1-240 | sort | uniq -c | sort -rn | head -25 | sed 's/^/    /'
+    echo "    programs loaded: $(sudo bpftool prog show 2>/dev/null | grep -c ' name nn_\| name cgroup_join\| name epg\| name fim')"
+}
+if [[ ${SWITCHES_CONFIDENTIALITY:-0} == 1 ]]; then
+    [[ -e $LD ]] || { echo "no lockdown LSM: T6 not run"; exit 1; }
+    t6
+    echo "switches check (T6): $( ((fail)) && echo FAIL || echo PASS)"
+    exit $fail
+fi
 
 echo "== T0. the check channel at rest"
 s0=$(silent); for _ in $(seq 1 20); do /bin/true; done; sleep 6; s1=$(silent)
@@ -215,18 +241,5 @@ if [[ -x $P ]]; then
     no_window
 else bad "T5 the probe was not built"; fi
 
-if [[ ${SWITCHES_CONFIDENTIALITY:-0} == 1 && -e $LD ]]; then
-    echo "== T6. lockdown confidentiality (the guest keeps it until its next boot)"
-    window 600
-    echo confidentiality | sudo tee "$LD" >/dev/null; echo "    mode now: $(cat $LD)"
-    sudo "$NNADMIN" host-check 2>/dev/null | grep -A2 -i 'lockdown' | sed 's/^/    /'
-    hc=$(sudo "$NNADMIN" host-check --json 2>/dev/null | python3 -I -c 'import json,sys; [print(c["status"]) for c in json.load(sys.stdin) if c.get("id")=="lockdown"]' 2>/dev/null)
-    [[ $hc == warn ]] && pass "T6 the host check warns on [confidentiality]" || bad "T6 host check [$hc]"
-    t=$(date '+%F %T')
-    sudo systemctl restart northnarrow-agent; sleep 20
-    echo "    agent after a restart under confidentiality: $(systemctl is-active northnarrow-agent)"
-    sudo journalctl -u northnarrow-agent --since "$t" --no-pager -o cat 2>/dev/null | grep -iE 'refus|unknown func|lockdown|probe_read|degrad|not attached|FAILED' | cut -c1-240 | sort | uniq -c | sort -rn | head -25 | sed 's/^/    /'
-    echo "    programs loaded: $(sudo bpftool prog show 2>/dev/null | grep -c ' name nn_\| name cgroup_join\| name epg\| name fim')"
-fi
 echo "switches check: $( ((fail)) && echo FAIL || echo PASS)"
 exit $fail
