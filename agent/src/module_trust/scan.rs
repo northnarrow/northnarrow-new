@@ -650,6 +650,12 @@ mod tests {
             })
             .is_err()
         );
+        // a file something else vouches for is not the opt-out's (its loads
+        // are not the opt-out's records)
+        assert_eq!(
+            classify(&f, &inputs(&fx, after_files(), &opt), None, &mut |_| true),
+            Ok(trust_flag::PACKAGE)
+        );
     }
 
     #[test]
