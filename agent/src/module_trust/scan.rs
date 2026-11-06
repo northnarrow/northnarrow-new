@@ -193,11 +193,7 @@ pub fn classify(
     let pkg_written = written_by_package(history);
     let attested = !since_boot || pkg_written;
     let dkms_dir = in_dkms_dir(inputs.tree, &f.path);
-    let by = if attested || dkms_dir {
-        vouch(f) & (trust_flag::PACKAGE | trust_flag::DKMS)
-    } else {
-        0
-    };
+    let by = if attested || dkms_dir { vouch(f) } else { 0 };
     let mut flags = 0u32;
     if attested && by != 0 {
         flags = by;
@@ -274,8 +270,9 @@ pub fn dkms_registered(registry: &Path, release: &str, module: &str, file: &Path
     false
 }
 
-/// `a` (a regular file, symbolic links not followed) holds exactly the
-/// `len` bytes `b` holds.
+/// `a` (a regular file, symbolic links not followed) holds the bytes `b`
+/// holds; `len` is `b`'s length, as its metadata gave it (a cheap first
+/// check).
 pub fn same_content(a: &Path, b: &Path, len: u64) -> bool {
     let Ok(m) = std::fs::symlink_metadata(a) else {
         return false;
@@ -288,19 +285,17 @@ pub fn same_content(a: &Path, b: &Path, len: u64) -> bool {
     };
     let mut ba = vec![0u8; 64 * 1024];
     let mut bb = vec![0u8; 64 * 1024];
-    let mut seen = 0u64;
     loop {
         let Ok(n) = fa.read(&mut ba) else {
             return false;
         };
         if n == 0 {
             // b ends here too
-            return seen == len && matches!(fb.read(&mut bb[..1]), Ok(0));
+            return matches!(fb.read(&mut bb[..1]), Ok(0));
         }
         if fb.read_exact(&mut bb[..n]).is_err() || ba[..n] != bb[..n] {
             return false;
         }
-        seen += n as u64;
     }
 }
 
@@ -919,12 +914,16 @@ mod tests {
         assert!(!same_content(&a, &b, big.len() as u64));
         // a of another length
         assert!(!same_content(&a, &b, big.len() as u64 + 1));
-        // a symbolic link is no build
+        // a symbolic link is no build, even one whose own length (its
+        // target's name) is the file's
+        let t = d.path().join("target");
+        let n = t.as_os_str().len();
+        std::fs::write(&t, vec![b'x'; n]).unwrap();
         let l = d.path().join("l");
-        std::os::unix::fs::symlink(&b, &l).unwrap();
-        std::fs::write(&b, &big).unwrap();
-        assert!(same_content(&a, &b, big.len() as u64));
-        assert!(!same_content(&l, &b, big.len() as u64));
+        std::os::unix::fs::symlink(&t, &l).unwrap();
+        assert_eq!(std::fs::symlink_metadata(&l).unwrap().len(), n as u64);
+        assert!(same_content(&t, &t, n as u64));
+        assert!(!same_content(&l, &t, n as u64));
         assert!(!same_content(&d.path().join("missing"), &b, 1));
         // empty files
         let e1 = d.path().join("e1");

@@ -167,6 +167,25 @@ pub fn offsets_resolved() -> bool {
     })
 }
 
+/// What a look classifies the tree's files with: the policy's part
+/// (`want`) and the host's.
+fn inputs_of<'a>(
+    want: &'a Desired,
+    release: &'a str,
+    tree: &'a Path,
+    boot_sec: i64,
+    dkms_registry: &'a Path,
+) -> scan::Inputs<'a> {
+    scan::Inputs {
+        release,
+        tree,
+        boot_sec,
+        dkms_registry,
+        opt_outs: &want.opt_outs,
+        unattested: want.unattested,
+    }
+}
+
 /// rpm's file digests of the tree (path → algorithm, hex).
 type RpmIndex = HashMap<String, (u32, String)>;
 
@@ -317,14 +336,7 @@ impl Controller {
         let registry = PathBuf::from("/var/lib/dkms");
         let release = self.release.clone();
         let tree = self.tree.clone();
-        let inputs = scan::Inputs {
-            release: &release,
-            tree: &tree,
-            boot_sec,
-            dkms_registry: &registry,
-            opt_outs: &want.opt_outs,
-            unattested: want.unattested,
-        };
+        let inputs = inputs_of(want, &release, &tree, boot_sec, &registry);
         let mut next: HashMap<InodeKey, ModuleTrust> = HashMap::with_capacity(files.len());
         let mut refused: Vec<(PathBuf, &'static str)> = Vec::new();
         let mut counts = [0usize; 5];
@@ -532,8 +544,27 @@ mod tests {
                 unattested: false,
             }
         );
+        // what a look classifies with
+        let enforced = desired();
+        let tree = Path::new("/lib/modules/6.8.0");
+        let reg = Path::new("/var/lib/dkms");
+        let i = inputs_of(&enforced, "6.8.0", tree, 7, reg);
+        assert!(!i.unattested);
+        assert_eq!(
+            (i.release, i.tree, i.boot_sec, i.dkms_registry),
+            ("6.8.0", tree, 7, reg)
+        );
         assert!(apply_policy(&RulePolicy::builtin(), true).is_none());
         assert_eq!(desired(), Desired::default());
+        let builtin = desired();
+        assert!(inputs_of(&builtin, "6.8.0", tree, 7, reg).unattested);
+        let named = parse("module-allow zfs\n").unwrap();
+        assert!(apply_policy(&named, true).is_none());
+        let with = desired();
+        assert!(inputs_of(&with, "6.8.0", tree, 7, reg)
+            .opt_outs
+            .contains("zfs"));
+        assert!(apply_policy(&RulePolicy::builtin(), true).is_none());
         assert_eq!(mode_name(mode::DENY), "deny");
         assert_eq!(mode_name(mode::NOT_READY), "not armed");
     }
