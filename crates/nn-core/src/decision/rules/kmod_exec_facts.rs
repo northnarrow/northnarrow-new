@@ -92,12 +92,15 @@ pub struct ExecFacts {
     /// hook `kmod` was killed (rc 137, lot 283b). `None`: none found, or
     /// the parent not the exec's (its start another).
     pub initramfs_builder: Option<String>,
-    /// Lot 287: the interpreter the kernel ran the executed file with — the
-    /// process's image (`/proc/<pid>/exe`, read at the exec, the process
-    /// still the exec's by its start) another file than the one executed
-    /// (a `#!` script), in a system tree, not the system's module tool.
-    /// `None`: the file runs as itself (a tool, a copy of one), or its
-    /// image could not be read.
+    /// Lot 287: the interpreter the kernel ran the executed file with,
+    /// another file than the one executed (a `#!` script), in a system
+    /// tree, not the system's module tool — the process's image
+    /// (`/proc/<pid>/exe`, read at the exec, the process still the exec's
+    /// by its start); once the process had exited (a kill would reach no
+    /// one), the `#!` line of the file the kernel executed, read through a
+    /// descriptor with the exec's device and inode (the hook `kmod` run for
+    /// its `prereqs` exits within a millisecond). `None`: the file runs as
+    /// itself (a tool, a copy of one), or nothing could be read.
     pub interpreter: Option<String>,
 }
 

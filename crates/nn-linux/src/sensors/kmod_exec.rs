@@ -291,10 +291,20 @@ fn initramfs_builder(
     None
 }
 
-/// Lot 287: the interpreter the kernel runs the exec's file with — `pid`'s
-/// image (`/proc/<pid>/exe`) another file than the one executed (`exe`'s
-/// device and inode), in a system tree, not the system's module tool, read
-/// while `pid` is still the process that started at `start_ns`.
+/// Lot 287: the interpreter the kernel runs the exec's file with, another
+/// file than the one executed (`exe`'s device and inode), in a system tree,
+/// not the system's module tool:
+///
+/// - while `pid` runs, still the process that started at `start_ns`: its
+///   image (`/proc/<pid>/exe`) — what runs, whatever the file says; one
+///   that cannot be read then says nothing;
+/// - once it has EXITED (no entry, its pid another's, a zombie, its memory
+///   gone): the `#!` line of the file the kernel executed, read through a
+///   descriptor of `exe`'s path whose device and inode are `exe`'s (the
+///   lab of lot 287: the hook `kmod` run for its `prereqs` exits within a
+///   millisecond, its image gone before the pump reads it). A kill would
+///   reach no one then: the line decides only whether the exec is a record
+///   or an empty kill.
 fn interpreter(
     root: &Path,
     proc: &Path,
@@ -306,25 +316,59 @@ fn interpreter(
         return None;
     }
     let dir = proc.join(pid.to_string());
-    let path = std::fs::read_link(dir.join("exe")).ok()?;
-    let m = std::fs::metadata(dir.join("exe")).ok()?;
-    let image = (stat_dev_to_kernel_dev(m.dev()), m.ino());
-    // still the exec's process (a pid is reused only once it is reaped)
-    let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
-    if !stat_start_ticks(&stat).is_some_and(|t| started_at(t, start_ns)) {
-        return None;
-    }
-    let path = path.to_string_lossy().into_owned();
+    let link = dir.join("exe");
+    let image = std::fs::read_link(&link)
+        .ok()
+        .zip(std::fs::metadata(&link).ok());
+    // after the image: still the exec's process (a pid is reused only once
+    // it is reaped), with its memory
+    let stat = std::fs::read_to_string(dir.join("stat")).ok();
+    let ours = stat
+        .as_deref()
+        .and_then(stat_start_ticks)
+        .is_some_and(|t| started_at(t, start_ns));
+    let (path, id) = match image {
+        Some((path, m)) if ours => (
+            path.to_string_lossy().into_owned(),
+            (stat_dev_to_kernel_dev(m.dev()), m.ino()),
+        ),
+        // running, its image unreadable: nothing said
+        None if ours && stat.as_deref().is_some_and(has_memory) => return None,
+        _ => shebang(root, exe)?,
+    };
     let tool = program(
         root,
         &ExeIdentity {
-            dev: image.0,
-            ino: image.1,
+            dev: id.0,
+            ino: id.1,
             flags: exe_flags::KNOWN,
             ..Default::default()
         },
     );
-    (image != (exe.dev, exe.ino) && in_system_tree(&path) && tool.is_err()).then_some(path)
+    (id != (exe.dev, exe.ino) && in_system_tree(&path) && tool.is_err()).then_some(path)
+}
+
+/// Lot 287: the interpreter the `#!` line of the file the kernel executed
+/// names (`exe`'s path under `root`, opened and checked to be `exe`'s
+/// device and inode; the first 256 bytes, as `binfmt_script` reads them)
+/// — its path and the device and inode it resolves to now. `None` for a
+/// file that is not that one, or is no `#!` script.
+fn shebang(root: &Path, exe: &ExeIdentity) -> Option<(String, (u64, u64))> {
+    let f = std::fs::File::open(root.join(exe.path.trim_start_matches('/'))).ok()?;
+    let m = f.metadata().ok()?;
+    if (stat_dev_to_kernel_dev(m.dev()), m.ino()) != (exe.dev, exe.ino) {
+        return None;
+    }
+    let mut head = Vec::new();
+    f.take(256).read_to_end(&mut head).ok()?;
+    let line = head.strip_prefix(b"#!")?;
+    let line = line.split(|b| *b == b'\n').next()?;
+    let path = std::str::from_utf8(line)
+        .ok()?
+        .split([' ', '\t'])
+        .find(|w| !w.is_empty())?;
+    let m = std::fs::metadata(root.join(path.trim_start_matches('/'))).ok()?;
+    Some((path.to_string(), (stat_dev_to_kernel_dev(m.dev()), m.ino())))
 }
 
 /// Lot 283b: the nearest package manager proper in `pid`'s lineage — `pid`
@@ -716,10 +760,17 @@ mod tests {
             "usr/sbin/update-initramfs",
             "usr/sbin/mkinitramfs",
             "usr/bin/dracut",
-            "usr/share/initramfs-tools/hooks/kmod",
         ] {
             std::fs::write(p(f), b"#!/bin/sh\n").unwrap();
         }
+        // the hook as initramfs-tools ships it (`#!/bin/sh -e`), here with
+        // its interpreter under the fixture root
+        std::fs::write(
+            p("usr/share/initramfs-tools/hooks/kmod"),
+            b"#! \t/usr/bin/dash -e\n# hook-functions\n",
+        )
+        .unwrap();
+        std::fs::write(p("usr/bin/dash"), b"\x7fELF dash").unwrap();
         std::os::unix::fs::symlink("/usr/bin/true", p("usr/bin/kmod")).unwrap();
         root
     }
@@ -818,6 +869,20 @@ mod tests {
         );
         assert_eq!(f.interpreter.as_deref(), Some("/usr/bin/env"));
         assert!(f.program.is_err(), "the hook is no module tool");
+        // its `prereqs` run (lot 287's lab): exited before the pump read it,
+        // its parent running — under the builder, by its `#!` line
+        let hook = described(
+            r,
+            "usr/share/initramfs-tools/hooks/kmod",
+            "/usr/share/initramfs-tools/hooks/kmod",
+        );
+        let e = exec_of("kmod", 61, 1061, 50, 1050, hook);
+        let f = facts_in(r, proc, &b.running(), &e).expect("a module tool's exec");
+        assert_eq!(
+            f.initramfs_builder.as_deref(),
+            Some("/usr/sbin/mkinitramfs")
+        );
+        assert_eq!(f.interpreter.as_deref(), Some("/usr/bin/dash"));
         // mkinitramfs's process executed something else: forgotten, the
         // walk goes on to update-initramfs
         let other = described(r, "usr/bin/dracut", "/usr/lib/x/other");
@@ -1061,12 +1126,15 @@ mod tests {
         assert_eq!(b.order.len(), KEPT_BUILDERS - 1);
     }
 
-    /// Lot 287: the interpreter of a `#!` script — the process's image
-    /// another file than the one executed, in a system tree, not the
-    /// system's module tool, the process the exec's by its start. A binary
+    /// Lot 287: the interpreter of a `#!` script — while the process runs
+    /// (the exec's by its start), its image: another file than the one
+    /// executed, in a system tree, not the system's module tool. A binary
     /// (its image the executed file), the module tool as the image, an
-    /// image outside a system tree, another process at the pid, an exec
-    /// the LSM hook did not describe: none.
+    /// image outside a system tree, a running process whose image cannot
+    /// be read, an exec the LSM hook did not describe: none. Once it has
+    /// exited (no entry, a zombie, its pid another's): the `#!` line of
+    /// the file the kernel executed — that file by its device and inode, a
+    /// script, its interpreter in a system tree and not the module tool.
     #[test]
     fn the_interpreter_of_a_script_is_read_at_the_exec() {
         let root = builder_root();
@@ -1084,7 +1152,11 @@ mod tests {
             interpreter(r, proc, 60, start, &hook).as_deref(),
             Some("/usr/bin/env")
         );
-        assert_eq!(interpreter(r, proc, 60, start + 100 * tick(), &hook), None);
+        // its pid another process's now: the hook had exited, its `#!`
+        assert_eq!(
+            interpreter(r, proc, 60, start + 100 * tick(), &hook).as_deref(),
+            Some("/usr/bin/dash")
+        );
         assert_eq!(
             interpreter(
                 r,
@@ -1098,7 +1170,50 @@ mod tests {
             ),
             None
         );
-        assert_eq!(interpreter(r, proc, 61, start, &hook), None);
+        // reaped (no entry), or a zombie: its `#!`
+        assert_eq!(
+            interpreter(r, proc, 61, start, &hook).as_deref(),
+            Some("/usr/bin/dash")
+        );
+        let z = proc.join("62");
+        std::fs::create_dir_all(&z).unwrap();
+        std::fs::write(
+            z.join("stat"),
+            "62 (kmod) Z 50 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 1062 0 0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            interpreter(r, proc, 62, 1062 * tick(), &hook).as_deref(),
+            Some("/usr/bin/dash")
+        );
+        // running, its image unreadable: nothing said
+        proc_entry(proc, 63, 50, 1063, 0, Path::new("/usr/bin/env"));
+        std::fs::remove_file(proc.join("63/exe")).unwrap();
+        assert_eq!(interpreter(r, proc, 63, 1063 * tick(), &hook), None);
+        // exited, and the file at its path not the one executed, no
+        // script, a script of the module tool, of an interpreter outside a
+        // system tree or of none there
+        let p = |rel: &str| r.join(rel);
+        let mk = described(r, "usr/sbin/mkinitramfs", "/usr/sbin/mkinitramfs");
+        let swapped = ExeIdentity {
+            path: hook.path.clone(),
+            ..mk
+        };
+        assert_eq!(interpreter(r, proc, 61, start, &swapped), None);
+        std::fs::create_dir_all(p("usr/lib/x")).unwrap();
+        std::fs::create_dir_all(p("tmp")).unwrap();
+        std::fs::write(p("tmp/sh"), b"\x7fELF sh").unwrap();
+        for (file, text) in [
+            ("usr/lib/x/kmod", &b"\x7fELF kmod"[..]),
+            ("usr/lib/x/modprobe", b"#!/usr/bin/kmod\n"),
+            ("usr/lib/x/insmod", b"#!/tmp/sh\n"),
+            ("usr/lib/x/depmod", b"#!/usr/bin/none\n"),
+            ("usr/lib/x/rmmod", b"#!\n"),
+        ] {
+            std::fs::write(p(file), text).unwrap();
+            let id = described(r, file, &format!("/{file}"));
+            assert_eq!(interpreter(r, proc, 61, start, &id), None, "{file}");
+        }
         // a binary: its image is the file executed
         let env = Path::new("/usr/bin/env");
         let m = std::fs::metadata(env).unwrap();
