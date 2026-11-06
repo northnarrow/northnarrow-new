@@ -59,12 +59,11 @@
 //! leader shows no memory). No configuration, index or module file is
 //! read.
 
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-
-use std::collections::{HashMap, VecDeque};
 
 use common::wire::exe::exe_flags;
 use nn_core::decision::rules::kmod_exec_facts::{self, Environment, ExecFacts, KMOD_TOOLS};
@@ -159,7 +158,7 @@ pub const INITRAMFS_BUILDERS: &[&str] = &[
 /// Lot 287: an exec of an initramfs builder the pump saw — the process's
 /// start (its fork: an exec keeps it), and which builder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Builder {
+struct Builder {
     start_ns: u64,
     path: &'static str,
 }
@@ -168,7 +167,7 @@ pub struct Builder {
 /// builder's ([`builder_exec`]), by pid; any other exec of the pid forgets
 /// it. At most [`KEPT_BUILDERS`]: past it, the oldest go.
 #[derive(Default)]
-pub struct Builders {
+struct Builders {
     by_pid: HashMap<u32, Builder>,
     order: VecDeque<u32>,
 }
