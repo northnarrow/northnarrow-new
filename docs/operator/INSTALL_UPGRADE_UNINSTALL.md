@@ -206,7 +206,11 @@ start — left the host without a working agent. What it does now, in order:
    (`/sys/fs/bpf/northnarrow-sysctl`, lot 280a): the judge goes on refusing
    the guarded sysctls' harmful writes through the upgrade, `kept` in
    `bpf-own-ids`, and the new agent swaps it for its own
-   (`UPGRADE_NOTES_WAVE4.md` §10);
+   (`UPGRADE_NOTES_WAVE4.md` §10). So are the module files' write
+   history's (`/sys/fs/bpf/northnarrow-module-writes`, lot 285): its
+   observer goes on through the upgrade and the new agent adopts the
+   history of the boot's package transactions (`UPGRADE_NOTES_WAVE4.md`
+   §13);
 5. **switches** the binaries and units: each new file is staged next to
    the installed one (`<path>.nn-new`, same directory, same file system),
    compared with its source, then renamed over it (`rename(2)`): every path
@@ -424,7 +428,8 @@ to be disabled first and left running) → drop the pin root and the
 start-in-cgroup tracker's directories beside it
 (`/sys/fs/bpf/northnarrow-cgroup-join-v*`) and the sysctl judge's
 (`/sys/fs/bpf/northnarrow-sysctl`, lot 280a: its link's last reference, so
-the judge leaves the root cgroup) and wait for
+the judge leaves the root cgroup) and the module files' write history's
+(`/sys/fs/bpf/northnarrow-module-writes`, lot 285) and wait for
 the agent's own BPF programs to unload (the ids in
 `/run/northnarrow/bpf-own-ids`, read before the stop, as in the upgrade;
 other products' LSM programs are left alone) → `chattr -R -i` on state and

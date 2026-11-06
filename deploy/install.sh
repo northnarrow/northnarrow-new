@@ -1505,6 +1505,9 @@ LSM_DRAIN_TIMEOUT=${LSM_DRAIN_TIMEOUT:-30}
 # upgrade; the new agent swaps them for its own. uninstall.sh removes them.
 # Lot 280a: so is the cgroup/sysctl judge ($BPFFS_ROOT-sysctl), which goes
 # on refusing the guarded sysctls' harmful writes through the upgrade.
+# Lot 285: so is the module files' write history's observer
+# ($BPFFS_ROOT-module-writes), so that the history of the package
+# transactions of this boot survives the upgrade.
 read_own_prog_ids() {
     [[ -r "$OWN_IDS_FILE" ]] || return 0
     awk '$1 ~ /^[0-9]+$/ && $3 != "kept" {print $1}' "$OWN_IDS_FILE" | sort -un | tr '\n' ' '

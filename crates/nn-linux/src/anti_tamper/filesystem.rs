@@ -571,13 +571,13 @@ pub(crate) const MODULE_LOAD_PROGRAMS: &[(&str, &str)] = &[
 /// file written since boot is then trusted by nothing but a signed opt-out
 /// until the next boot.
 ///
-/// Attached for this agent's life only ([`super::attach_transient`]), never
-/// pinned: the pins are named after the HOOK (`prog_file_open`,
-/// `link_file_open`), and `file_open` is the write-open deny's
-/// (`protected_open_deny`, [`LSM_PROGRAMS`]) — a pinned attach purged the
-/// deny's link and left the agent's files open to a write (the CI's
-/// privileged suite on #513). The history is this agent's anyway (its map
-/// is not pinned).
+/// Never pinned in the pin root: the pins are named after the HOOK
+/// (`prog_file_open`, `link_file_open`), and `file_open` is the write-open
+/// deny's there (`protected_open_deny`, [`LSM_PROGRAMS`]) — a pinned attach
+/// in the root purged the deny's link and left the agent's files open to a
+/// write (the CI's privileged suite on #513). It is pinned in the history's
+/// own directory beside the root, with its maps
+/// ([`crate::module_writes::attach`]).
 pub(crate) const MODULE_WRITE_PROGRAM: (&str, &str) = ("module_write_observe", "file_open");
 
 /// Attach outcome of the FS deny + observe hook sets (audit
@@ -600,6 +600,9 @@ pub(crate) struct FsAttachHealth {
     /// left unregistered; the bootstrap error itself. They refuse the start
     /// without lowering the hook count.
     pub infra_failures: Vec<(&'static str, String)>,
+    /// Lot 285: why the module files' write history of before this start
+    /// is not kept or not reliable (signed degraded).
+    pub module_history_note: Option<String>,
 }
 
 /// External audit ATP-016 (NN-AUD-264): the health of an FS bootstrap that
@@ -898,15 +901,20 @@ pub(crate) fn attach(
             health.observe_failures.push((program, format!("{e:#}")));
         }
     }
-    // Lot 285: the write history on `file_open`, unpinned — its hook's pins
-    // are the write-open deny's (see [`MODULE_WRITE_PROGRAM`]).
+    // Lot 285: the write history on `file_open`, pinned in its own
+    // directory beside the pin root, never in the root — `file_open`'s pins
+    // there are the write-open deny's (see [`MODULE_WRITE_PROGRAM`]).
     let (program, hook) = MODULE_WRITE_PROGRAM;
-    if let Err(e) = super::attach_transient(ebpf, program, hook, btf) {
-        warn!(
-            program, hook, error = %e,
-            "anti-tamper FS: module files' write history attach FAILED (lot 285)"
-        );
-        health.observe_failures.push((program, format!("{e:#}")));
+    match crate::module_writes::attach(ebpf, btf, pin_root) {
+        Ok(None) => {}
+        Ok(Some(note)) => health.module_history_note = Some(note),
+        Err(e) => {
+            warn!(
+                program, hook, error = %e,
+                "anti-tamper FS: module files' write history attach FAILED (lot 285)"
+            );
+            health.observe_failures.push((program, e));
+        }
     }
 
     Ok(health)
@@ -2444,9 +2452,9 @@ mod tests {
     /// after the HOOK (`prog_<hook>`, `link_<hook>`), so a second pinned
     /// program on a hook purges the first's link — the module files' write
     /// history on `file_open` took the write-open deny's, and a protected
-    /// file opened for writing went through. Every pinned LSM attach names
-    /// a hook of its own; the write history, on the deny's hook, is
-    /// attached unpinned.
+    /// file opened for writing went through. Every LSM attach pinned in the
+    /// pin root names a hook of its own; the write history, on the deny's
+    /// hook, is pinned in its own directory beside the root, never in it.
     #[test]
     fn every_pinned_lsm_hook_is_one_program_s_and_the_write_history_is_not_pinned() {
         let mut seen = std::collections::BTreeSet::new();
@@ -2478,9 +2486,25 @@ mod tests {
             .find("let (program, hook) = MODULE_WRITE_PROGRAM;")
             .expect("the write history's attach");
         let attach = &code[at..at + 160];
-        assert!(attach.contains("attach_transient("), "{attach}");
+        assert!(
+            attach.contains("crate::module_writes::attach(ebpf, btf, pin_root)"),
+            "{attach}"
+        );
         assert!(!attach.contains("reattach_fresh("), "{attach}");
         assert!(!code.contains("chain([&MODULE_WRITE_PROGRAM])"));
+        // and the history's attach pins in its own directory
+        let mw = include_str!("../module_writes.rs");
+        let mw = &mw[..mw.find("#[cfg(test)]").unwrap()];
+        assert!(mw.contains("let dir = pin_dir(root);"));
+        assert!(mw.contains("reattach_fresh(ebpf, PROGRAM, HOOK, btf, Some(&dir))"));
+        assert_eq!(
+            (crate::module_writes::PROGRAM, crate::module_writes::HOOK),
+            MODULE_WRITE_PROGRAM
+        );
+        assert_ne!(
+            crate::module_writes::pin_dir(Path::new("/sys/fs/bpf/northnarrow")),
+            Path::new("/sys/fs/bpf/northnarrow")
+        );
     }
 
     fn ids() -> (u32, u32) {

@@ -467,7 +467,7 @@ pub fn plan(
 }
 
 /// `/proc/sys/kernel/random/boot_id`.
-fn boot_id() -> String {
+pub(crate) fn boot_id() -> String {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
@@ -475,7 +475,7 @@ fn boot_id() -> String {
 
 /// What `BPF_OBJ_GET_INFO_BY_FD` says of the map pinned at `path` (opened
 /// read-only).
-fn seen_at(path: &Path) -> Result<Seen, String> {
+pub(crate) fn seen_at(path: &Path) -> Result<Seen, String> {
     let md = open_pinned_ro(path)?;
     let info = md.info().map_err(|e| e.to_string())?;
     Ok(Seen {
@@ -529,7 +529,7 @@ fn is_tracker_pin(name: &str) -> bool {
 
 /// The third review of #494 (R2-d): `dir` usable for the tracker's pins —
 /// never a symbolic link or anything but a directory, created `0700`.
-fn usable_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn usable_dir(dir: &Path) -> Result<(), String> {
     if let Some(why) = antitamper_bpf::pin_root_refusal_at(dir) {
         return Err(why);
     }

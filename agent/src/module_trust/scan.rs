@@ -136,6 +136,13 @@ pub struct Inputs<'a> {
     /// package transaction is let through and recorded
     /// ([`trust_flag::UNATTESTED`]): every policy but `enforce R018`.
     pub unattested: bool,
+    /// From when the kernel's write history covers every write (wall
+    /// clock: seconds, nanoseconds; `nn_linux::module_writes`): a file
+    /// changed since boot before it has no history to read — a package's or
+    /// DKMS's file is then let through and recorded like an unattested
+    /// build, never refused in silence. `(i64::MAX, 0)`: the history is not
+    /// reliable this boot.
+    pub history_since: (i64, u32),
 }
 
 /// Why a file is not trusted.
@@ -144,9 +151,10 @@ pub const NOT_SAFE: &str =
 pub const CHANGED_SINCE_BOOT: &str = "changed since boot outside a package transaction (the \
                                       kernel's write history of the file does not show one)";
 pub const UNVOUCHED: &str = "no verified package or DKMS build vouches for it";
-pub const UNATTESTED_ENFORCED: &str = "a DKMS or akmods build its registry vouches for, written \
-                                       since boot outside a recognised package transaction: \
-                                       refused while the policy enforces R018";
+pub const UNATTESTED_ENFORCED: &str = "a DKMS or akmods build its registry vouches for, or a \
+                                       package's file changed before the write history covers, \
+                                       written since boot outside a recognised package \
+                                       transaction: refused while the policy enforces R018";
 
 /// What vouches for the content of `f`: [`trust_flag::PACKAGE`] (a
 /// verified package's file: `packaged` reads it and compares the database's
@@ -190,10 +198,17 @@ pub fn classify(
     let name = f.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let module = module_name_of(name);
     let since_boot = f.facts.ctime_sec >= inputs.boot_sec;
-    let pkg_written = written_by_package(history);
+    // the history covers the file's last change
+    let covered = (f.facts.ctime_sec, f.facts.ctime_nsec) >= inputs.history_since;
+    let pkg_written = covered && written_by_package(history);
     let attested = !since_boot || pkg_written;
     let dkms_dir = in_dkms_dir(inputs.tree, &f.path);
-    let by = if attested || dkms_dir { vouch(f) } else { 0 };
+    let unknown = since_boot && !covered;
+    let by = if attested || dkms_dir || unknown {
+        vouch(f)
+    } else {
+        0
+    };
     let mut flags = 0u32;
     if attested && by != 0 {
         flags = by;
@@ -202,8 +217,9 @@ pub fn classify(
         }
     }
     // the coordinator's matrix: a registered build of a DKMS or akmods
-    // output directory, written outside a recognised transaction (outside
-    // one, `vouch` is asked only in those directories)
+    // output directory written outside a recognised transaction, and a
+    // vouched file changed before the history covers (outside a
+    // transaction, `vouch` is asked only for those)
     let late = !attested && by != 0;
     if flags == 0 && module.is_some_and(|m| inputs.opt_outs.contains(&m)) {
         flags = trust_flag::OPT_OUT;
@@ -460,6 +476,7 @@ mod tests {
             dkms_registry: &fx.registry,
             opt_outs: opt,
             unattested: true,
+            history_since: (0, 0),
         }
     }
 
@@ -637,6 +654,106 @@ mod tests {
                 &mut |_| trust_flag::PACKAGE
             ),
             Err(NOT_SAFE)
+        );
+    }
+
+    /// Named test (lot 285, the coordinator's decision on #513): a
+    /// package's modules for the running kernel installed this boot stay
+    /// trusted through an agent restart or upgrade — the history pinned and
+    /// adopted covers their write (`nn_linux::module_writes`). When the
+    /// history does not cover it (a reset: another layout, a history not
+    /// the registered one, the boot's first start after the write; or not
+    /// reliable), a file a package vouches for is let through and recorded,
+    /// never refused in silence — refused only under `enforce R018`; one
+    /// nothing vouches for is refused. A change after the history covers,
+    /// with no transaction in it, is refused as before.
+    #[test]
+    fn a_package_s_modules_installed_this_boot_stay_trusted_across_an_agent_restart() {
+        let fx = fixture();
+        let p = fx.tree.join("kernel/drivers/net/arcnet/arcnet.ko.zst");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        put(&p, b"linux-modules-extra's arcnet");
+        let f = file(&p);
+        let opt = BTreeSet::new();
+        let written = (f.facts.ctime_sec, f.facts.ctime_nsec);
+        let created = write_step(None, true, true);
+        let in_tx = Some(created);
+        // the restarted agent adopted the history of the start before it
+        let adopted = Inputs {
+            history_since: (written.0 - 60, 0),
+            ..inputs(&fx, before_files(), &opt)
+        };
+        assert_eq!(
+            classify(&f, &adopted, in_tx, &mut |_| trust_flag::PACKAGE),
+            Ok(trust_flag::PACKAGE | trust_flag::PKG_WRITTEN)
+        );
+        let map = trust_map(
+            std::slice::from_ref(&f),
+            &adopted,
+            &[(f.key, created)].into_iter().collect(),
+            &mut |_| trust_flag::PACKAGE,
+        );
+        assert_eq!(
+            finit_verdict(map.get(&f.key), &f.facts, false, mode::DENY),
+            verdict::TRUSTED
+        );
+        // a reset after the write (or not reliable): no history to read,
+        // whatever the map holds
+        for since in [(written.0 + 60, 0), (i64::MAX, 0)] {
+            let reset = Inputs {
+                history_since: since,
+                ..inputs(&fx, before_files(), &opt)
+            };
+            for h in [None, in_tx] {
+                assert_eq!(
+                    classify(&f, &reset, h, &mut |_| trust_flag::PACKAGE),
+                    Ok(trust_flag::UNATTESTED),
+                    "{since:?} {h:?}"
+                );
+            }
+            let v = finit_verdict(
+                Some(&entry(&f, trust_flag::UNATTESTED)),
+                &f.facts,
+                false,
+                mode::DENY,
+            );
+            assert!(!common::module_judge::refuses(v));
+            let enforce = Inputs {
+                unattested: false,
+                ..reset
+            };
+            assert_eq!(
+                classify(&f, &enforce, None, &mut |_| trust_flag::PACKAGE),
+                Err(UNATTESTED_ENFORCED)
+            );
+            // nothing vouches for it: refused
+            assert_eq!(
+                classify(&f, &reset, None, &mut |_| 0),
+                Err(CHANGED_SINCE_BOOT)
+            );
+        }
+        // the history covers the change, and no transaction made it
+        assert_eq!(
+            classify(&f, &adopted, None, &mut |_| trust_flag::PACKAGE),
+            Err(CHANGED_SINCE_BOOT)
+        );
+        assert_eq!(
+            classify(
+                &f,
+                &adopted,
+                Some(write_flag::PKG | write_flag::TAINT),
+                &mut |_| trust_flag::PACKAGE
+            ),
+            Err(CHANGED_SINCE_BOOT)
+        );
+        // older than the boot: the history is not asked
+        let older = Inputs {
+            history_since: (i64::MAX, 0),
+            ..inputs(&fx, after_files(), &opt)
+        };
+        assert_eq!(
+            classify(&f, &older, None, &mut |_| trust_flag::PACKAGE),
+            Ok(trust_flag::PACKAGE)
         );
     }
 

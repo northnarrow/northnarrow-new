@@ -207,10 +207,11 @@ units_inactive() {
 # Lot 277 (the re-review of #494, R2): the start-in-cgroup tracker's pin
 # directories, beside the pin root (an upgrade leaves them; the uninstall
 # removes them with it). Lot 280a: and the cgroup/sysctl judge's, whose
-# link removed detaches it from the root cgroup.
+# link removed detaches it from the root cgroup. Lot 285: and the module
+# files' write history's (its maps, its observer on file_open).
 tracker_pin_dirs() {
     local d
-    for d in "$BPFFS_ROOT"-cgroup-join-v* "$BPFFS_ROOT"-sysctl; do
+    for d in "$BPFFS_ROOT"-cgroup-join-v* "$BPFFS_ROOT"-sysctl "$BPFFS_ROOT"-module-writes; do
         [[ -d "$d" ]] && echo "$d"
     done
     return 0
@@ -303,7 +304,7 @@ if pins_present; then
     log "removing pinned maps/programs/links under $BPFFS_ROOT and the tracker's beside it"
     remove_pins
     if pins_present; then
-        echo "uninstall.sh: $BPFFS_ROOT (or $BPFFS_ROOT-cgroup-join-v*, $BPFFS_ROOT-sysctl) is PROTECTED by the anti-tamper and no trusted-installer window is open" >&2
+        echo "uninstall.sh: $BPFFS_ROOT (or $BPFFS_ROOT-cgroup-join-v*, $BPFFS_ROOT-sysctl, $BPFFS_ROOT-module-writes) is PROTECTED by the anti-tamper and no trusted-installer window is open" >&2
         echo "uninstall.sh: (review entry 39). Start the agent again (systemctl start northnarrow-agent) and re-run" >&2
         echo "uninstall.sh: with --grant-key <admin.key carrying the trusted-installer role>; or, if the agent" >&2
         echo "uninstall.sh: refuses to start (exit 78: its key lost or hidden), follow INSTALL_UPGRADE_UNINSTALL.md" >&2

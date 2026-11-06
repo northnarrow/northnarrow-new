@@ -175,6 +175,7 @@ fn inputs_of<'a>(
     tree: &'a Path,
     boot_sec: i64,
     dkms_registry: &'a Path,
+    history: Option<nn_linux::module_writes::History>,
 ) -> scan::Inputs<'a> {
     scan::Inputs {
         release,
@@ -183,7 +184,15 @@ fn inputs_of<'a>(
         dkms_registry,
         opt_outs: &want.opt_outs,
         unattested: want.unattested,
+        history_since: history_since(history),
     }
+}
+
+/// From when the kernel's write history covers every write: the pinned
+/// history's (`nn_linux::module_writes`); none, or not reliable: never
+/// (every file changed since boot is one the history does not cover).
+pub fn history_since(history: Option<nn_linux::module_writes::History>) -> (i64, u32) {
+    history.and_then(|h| h.since).unwrap_or((i64::MAX, 0))
 }
 
 /// rpm's file digests of the tree (path → algorithm, hex).
@@ -336,7 +345,14 @@ impl Controller {
         let registry = PathBuf::from("/var/lib/dkms");
         let release = self.release.clone();
         let tree = self.tree.clone();
-        let inputs = inputs_of(want, &release, &tree, boot_sec, &registry);
+        let inputs = inputs_of(
+            want,
+            &release,
+            &tree,
+            boot_sec,
+            &registry,
+            nn_linux::module_writes::history(),
+        );
         let mut next: HashMap<InodeKey, ModuleTrust> = HashMap::with_capacity(files.len());
         let mut refused: Vec<(PathBuf, &'static str)> = Vec::new();
         let mut counts = [0usize; 5];
@@ -548,8 +564,20 @@ mod tests {
         let enforced = desired();
         let tree = Path::new("/lib/modules/6.8.0");
         let reg = Path::new("/var/lib/dkms");
-        let i = inputs_of(&enforced, "6.8.0", tree, 7, reg);
+        let i = inputs_of(&enforced, "6.8.0", tree, 7, reg, None);
         assert!(!i.unattested);
+        // no history (none attached, or not reliable): it covers no write
+        assert_eq!(i.history_since, (i64::MAX, 0));
+        let h = nn_linux::module_writes::History {
+            since: Some((1_762_400_000, 7)),
+            note: None,
+        };
+        assert_eq!(
+            inputs_of(&enforced, "6.8.0", tree, 7, reg, Some(h.clone())).history_since,
+            (1_762_400_000, 7)
+        );
+        let unreliable = nn_linux::module_writes::History { since: None, ..h };
+        assert_eq!(history_since(Some(unreliable)), (i64::MAX, 0));
         assert_eq!(
             (i.release, i.tree, i.boot_sec, i.dkms_registry),
             ("6.8.0", tree, 7, reg)
@@ -557,11 +585,11 @@ mod tests {
         assert!(apply_policy(&RulePolicy::builtin(), true).is_none());
         assert_eq!(desired(), Desired::default());
         let builtin = desired();
-        assert!(inputs_of(&builtin, "6.8.0", tree, 7, reg).unattested);
+        assert!(inputs_of(&builtin, "6.8.0", tree, 7, reg, None).unattested);
         let named = parse("module-allow zfs\n").unwrap();
         assert!(apply_policy(&named, true).is_none());
         let with = desired();
-        assert!(inputs_of(&with, "6.8.0", tree, 7, reg)
+        assert!(inputs_of(&with, "6.8.0", tree, 7, reg, None)
             .opt_outs
             .contains("zfs"));
         assert!(apply_policy(&RulePolicy::builtin(), true).is_none());
