@@ -648,7 +648,10 @@ untrusted until the next boot, inside them a registered build is let
 through and recorded (`akmods` at boot); dnf's and yum's scripts are
 recognised only where the exec sensor runs on the LSM hook (its default
 where BPF-LSM is active; `--exec-sensor tracepoint` loses it: a DKMS build
-under dnf is then let through and recorded, not trusted). **By design**,
+under dnf is then let through and recorded, not trusted); a module file
+written once outside a package transaction keeps that history until it is
+created anew — a later transaction that overwrites it in place (DKMS 2.8
+does) leaves it let through and recorded until the next boot. **By design**,
 root who writes a module file into `updates/dkms/` or `extra/` AND puts
 the same content in DKMS's registry
 (`/var/lib/dkms/<package>/<version>/<release>/<arch>/module/`) gets a High
