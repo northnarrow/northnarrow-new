@@ -418,6 +418,15 @@ const STATICS: &[Kept] = &[
          oldest out first)",
     ),
     kept(
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "BUILDERS",
+        HostFact,
+        "lot 287: the host's processes whose last exec the exec pump saw run an initramfs \
+         builder (the packaged file, as root), which it reads an exec of a module tool's lineage \
+         against (one host, one exec pump; keyed by pid and start, forgotten at the pid's next \
+         exec, bounded, the oldest out first)",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/exe_identity.rs",
         "MOUNTS",
         HostFact,

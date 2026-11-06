@@ -6940,3 +6940,41 @@ number in parentheses is a lab PR.
     through it in tracepoint mode — the text shows no link; resolving it
     needs the kernel's path (LSM mode).
   - Level unchanged (C14 2).
+- **Lot 287 — R011 in an administrator's own initramfs build (C14; after
+  lot 283b's lab).**
+  - What was open: `sudo update-initramfs -u` run by hand had its hook
+    `/usr/share/initramfs-tools/hooks/kmod` (comm `kmod`) killed and exited
+    137: `mkinitramfs` runs the hooks from forks that never execute, and no
+    package manager is in that lineage (lot 283b's carve-out reads one).
+  - What changed (`crates/nn-linux/src/sensors/kmod_exec.rs`,
+    `crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs`,
+    `kmod_invocation.rs`): the exec pump remembers each process whose exec
+    ran an initramfs builder (`/usr/sbin/update-initramfs`,
+    `/usr/sbin/mkinitramfs`, `/usr/bin/dracut`: the packaged file by the
+    script's device and inode from the LSM hook, as root; any later exec of
+    the pid forgets it), and at an exec of a module tool reads the nearest
+    one from the exec's parent up (its start the event's, the builder still
+    root) and the interpreter the kernel runs the file with. In such a
+    build R011 records a `#!` script of a system tree outside the tools'
+    places and the system's `modprobe` asked to load nothing
+    (`--show-depends`, `--dry-run`); `MODPROBE_OPTIONS`/`LD_*`, a tool that
+    is not the system's, anything outside a system tree, `insmod` and a
+    loading `modprobe` are still killed.
+  - Measured (lab, ubuntu2404, kernel 6.8.0-147, initramfs-tools
+    0.142ubuntu25.8, one round, the lot's agent at a8adaaa3): `sudo
+    update-initramfs -u` rc 0, the initrd rewritten (`bin/kmod` and 293
+    modules in it); R011 on the hook: its exec by `mkinitramfs` recorded
+    (Log, High), its exec for `prereqs` — a process of about a millisecond,
+    its image gone when the pump read it — one KillProcess verdict (rc
+    still 0, its outcome not read); the dev corpus control (a program from
+    `/tmp` as `www-data`) killed by R001 (rc 137). The guest left without
+    the agent, powered off. After the round, an exited script's
+    interpreter is read from its `#!` line (host tests only: the lot's
+    budget was one round). Host: named tests for each case; 48 + 13
+    targeted mutations, each caught by a named test.
+  - Open: the `prereqs` exec's record is not measured on a guest; a
+    build's fork that exits before the pump reads the exec breaks the
+    lineage (judged as before); tracepoint mode sees no build; Debian 12's
+    and Ubuntu 22.04's `manual_add_modules` (`modprobe --show-depends -S`)
+    are covered by host tests, not measured.
+  - Level unchanged (C14 2).
