@@ -8,15 +8,18 @@ use tracing::{debug, info, warn};
 use crate::boot::cli::Cli;
 use crate::boot::evidence::{AnchorHandle, AuditHandle};
 use crate::run_loop::Stopped;
+use crate::stop_deadline::StopDeadline;
 
 /// The stop: the exec guards release what they hold, the BPF self-check
 /// is told the links go, the copy guard closes, the signed `agent_stop`,
 /// the heads anchored at stop, the pid file and the admin socket removed.
 /// A pump that exited is a failure (SNS-001): the watchdog restarts the
-/// agent.
+/// agent. Lot 288 (#125): each stage named to the stop's deadline, the
+/// export's wait bounded by what it leaves.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stop(
     cli: &Cli,
+    deadline: &StopDeadline,
     export: Option<northnarrow_agent::export::controller::Running>,
     workers: &nn_linux::worker::Workers,
     heartbeat: &Option<northnarrow_agent::heartbeat::Heartbeat>,
@@ -34,18 +37,22 @@ pub(crate) fn stop(
     } = stopped;
     // R12c-2 (lab PR 270): the heartbeat's signed `stop` beat, with the
     // reason — a verifier off the host tells a stop from a silence.
+    deadline.stage("heartbeat");
     if let Some(hb) = heartbeat {
         hb.stop(stop_reason);
     }
     // Lot 276: the export's thread first — its cursors written, its stop
     // row signed — while its worker still answers.
+    deadline.stage("export");
     if let Some(e) = export {
-        e.stop();
+        e.stop(deadline.drain_bound(northnarrow_agent::export::controller::STOP_WAIT));
     }
     // R14a: the workers end with their core (they would anyway: their
     // parent-death signal), their pids out of PROTECTED_PIDS first.
+    deadline.stage("workers");
     workers.stop();
     // Lab PR 223: nothing stays held by an agent that stops.
+    deadline.stage("guards");
     northnarrow_agent::execq::shutdown(execq_handle);
     // Lab PR 226: the kernel keeps the policy until its programs detach.
     northnarrow_agent::execpol::shutdown(execpol_handle);
@@ -57,20 +64,27 @@ pub(crate) fn stop(
     // protected scope waits on an agent that is leaving.
     cow_guard.shutdown();
 
+    deadline.stage("agent_stop");
     if let Some(log) = &audit_log {
         let uptime = loop_started.elapsed().as_secs();
-        match log.lock().stop_entry(stop_reason, uptime) {
-            Ok(_) => info!(
-                reason = stop_reason,
-                uptime_secs = uptime,
-                "audit: agent_stop entry appended"
-            ),
+        let signed = log.lock().stop_entry(stop_reason, uptime);
+        match signed {
+            Ok(_) => {
+                // the deadline's note signs no second one
+                deadline.stop_signed();
+                info!(
+                    reason = stop_reason,
+                    uptime_secs = uptime,
+                    "audit: agent_stop entry appended"
+                )
+            }
             Err(e) => warn!(error = format!("{e:#}"), "audit: agent_stop entry failed"),
         }
     }
     // Lab PR 160: the heads as this run leaves them, `agent_stop` included,
     // so a file emptied or cut while the agent is down is found at the
     // next start.
+    deadline.stage("anchor");
     if let Some(a) = &chain_anchor {
         let second = audit_log
             .as_ref()
@@ -91,6 +105,7 @@ pub(crate) fn stop(
     // must confirm /proc/<pid> is alive (and is the agent binary)
     // before trusting the contents. Removal failure is logged loudly,
     // never swallowed, but is non-fatal — we are already shutting down.
+    deadline.stage("files");
     if let Some(pid_file) = cli.pid_file.as_deref() {
         match std::fs::remove_file(pid_file) {
             Ok(()) => info!(
@@ -120,6 +135,16 @@ pub(crate) fn stop(
     admin_socket::unlink_socket(&cli.admin_socket);
 
     info!("NorthNarrow agent stopped.");
+    let result = stop_result(stop_reason);
+    // what follows is the drop of the start's state, then the runtime's
+    // own stop (`boot::main`): resources the process's exit releases too
+    deadline.evidence_done(if result.is_ok() { 0 } else { 1 });
+    result
+}
+
+/// The stop's result: a pump that ended, the responses' thread or the
+/// decision thread lost are failures (the watchdog restarts the agent).
+fn stop_result(stop_reason: &str) -> Result<()> {
     if stop_reason == "sensor_pump_exited" {
         // External audit SNS-001: a failure, not a clean stop.
         anyhow::bail!("a sensor pump exited; the agent stopped so the watchdog restarts it");

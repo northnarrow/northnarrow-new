@@ -51,6 +51,13 @@ pub const MAX_WINDOW: usize = 4096;
 pub const BUDGET: Duration = Duration::from_millis(1000);
 pub const MARGIN: Duration = Duration::from_millis(2000);
 
+/// What the stop waits for the thread at most: a request's budget and
+/// margin, and a second (lot 288: less when the stop's deadline leaves
+/// less, [`Running::stop`]).
+pub const STOP_WAIT: Duration = BUDGET
+    .saturating_add(MARGIN)
+    .saturating_add(Duration::from_secs(1));
+
 /// The pause of a round that moved nothing, and of a worker not ready.
 pub const IDLE: Duration = Duration::from_millis(200);
 
@@ -97,11 +104,11 @@ pub struct Running {
 
 impl Running {
     /// Stop it: its cursors written, its stop row signed; waited for at
-    /// most a request's budget and margin.
-    pub fn stop(mut self) {
+    /// most `wait` ([`STOP_WAIT`], or what the stop's deadline leaves).
+    pub fn stop(mut self, wait: Duration) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(j) = self.join.take() {
-            let until = Instant::now() + BUDGET + MARGIN + Duration::from_secs(1);
+            let until = Instant::now() + wait;
             while !j.is_finished() && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -1142,6 +1149,29 @@ fn round(p: &Params, k: &mut SinkRun, i: usize, set_up_for: &mut Option<u64>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 288 (#125): the stop waits for the export's thread at most what
+    /// it is given ([`STOP_WAIT`], or less: what the stop's deadline leaves),
+    /// its stop flag set.
+    #[test]
+    fn the_stop_waits_at_most_what_it_is_given() {
+        assert_eq!(STOP_WAIT, BUDGET + MARGIN + Duration::from_secs(1));
+        let flag = Arc::new(AtomicBool::new(false));
+        let r = Running {
+            stop: Arc::clone(&flag),
+            join: Some(std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(3))
+            })),
+        };
+        let at = Instant::now();
+        r.stop(Duration::from_millis(100));
+        let took = at.elapsed();
+        assert!(
+            took >= Duration::from_millis(100) && took < Duration::from_secs(1),
+            "{took:?}"
+        );
+        assert!(flag.load(Ordering::SeqCst));
+    }
 
     fn sent(line: u64) -> Sent {
         Sent {

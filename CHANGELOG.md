@@ -872,6 +872,31 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- The agent's stop ends in bounded time, in COMBAT or not (lot 288, #125;
+  `docs/operator/COMBAT_RECOVERY.md`, "A stop in COMBAT"). The unit's
+  `TimeoutStopSec=5s` must hold the stop and the kernel's release of the
+  agent's BPF programs and links after its exit (2.4 s measured): past it,
+  with `SendSIGKILL=no`, a stop job (the host's shutdown) left the process
+  running, and install.sh's and uninstall.sh's stop (`systemctl kill -s
+  SIGTERM` in the window) sent SIGKILL after 10 s, the signed `agent_stop`
+  lost. The stop now has 2 s from the end of the event loop. Its waits (the
+  queued responses and the canary trips at most 1 s — 2 s and 5 s before —,
+  the export's thread) get at most what is left, the runtime's shutdown too
+  (its drop waited for every blocking task with no bound); a stage that
+  blocks anyway — the decision thread is a scoped thread, joined however
+  long its turn takes — is cut by the stop's deadline at 1.5 s: before the
+  stop's signed rows, a signed `subsystem_degraded` (source
+  `stop_deadline`, the stage named, and whether the run leaves the host
+  isolated) and the run's `agent_stop` if the stop had not signed it, when
+  the audit log is free within 250 ms, then `_exit(75)` (at 2 s at the
+  latest); after them, `_exit` with the stop's own status. The COMBAT chain is never touched by the stop: an agent that
+  stops or dies in COMBAT leaves the host isolated, and the next start tears
+  the chain down and signs `combat_reconcile`.
+- `nn-linux`'s test `a_process_s_image_is_the_file_its_exe_opens` (lot 275)
+  no longer fails now and then under the parallel harness (CI, lot 283c's
+  gates): `spawn` returns when the kernel wakes the parent of its `vfork`
+  child, before the child's exec has replaced its image; the test reads the
+  child's `/proc/<pid>/exe` once it names the copy, waiting at most 10 s.
 - R011 no longer kills the hook `kmod` of an administrator's own `sudo
   update-initramfs -u` (lot 287; lot 283b's lab: rc 137, no package
   manager in its lineage). The exec pump remembers each process whose exec

@@ -368,6 +368,9 @@ pub(crate) struct Combat {
     /// event loop, the admin socket and the stop use it; process-wide until
     /// then).
     pub(crate) cow_guard: northnarrow_agent::cow::CowGuard,
+    /// Lot 288 (#125): the isolator the ladder isolates with — the stop's
+    /// deadline says whether the run leaves the host isolated.
+    pub(crate) isolator: Option<Arc<NetworkIsolator>>,
 }
 
 /// The COMBAT ladder on the system actuator and the signed evidence,
@@ -575,6 +578,7 @@ pub(crate) fn ladder(
         host_stopping,
         systemd,
         cow_guard,
+        isolator: isolator.clone(),
     }
 }
 

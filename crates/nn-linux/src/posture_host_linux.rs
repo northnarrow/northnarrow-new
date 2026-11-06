@@ -191,7 +191,8 @@ mod tests {
     /// is `current_exe`'s file, a copy of it another; a child running a
     /// copied `sleep` keeps that file's identity after another file is
     /// renamed over its path (an upgrade), which the path then no longer
-    /// names; a missing path has none.
+    /// names; a missing path has none. Lot 288: the child's link is read
+    /// once its exec has replaced its image ([`exec_done`]).
     #[test]
     fn a_process_s_image_is_the_file_its_exe_opens() {
         let me = Path::new(LinuxHost::PROC_ROOT).join(std::process::id().to_string());
@@ -225,7 +226,7 @@ mod tests {
             .join(child.id().to_string())
             .join("exe");
         let started = LinuxHost::file_id(&sleep);
-        let running = LinuxHost::file_id(&exe);
+        let running = exec_done(&exe, started, EXEC_DONE_WITHIN);
         let upgrade = tmp.path().join("sleep.new");
         fs::copy("/bin/sleep", &upgrade).unwrap();
         fs::rename(&upgrade, &sleep).unwrap();
@@ -237,6 +238,58 @@ mod tests {
         assert_eq!(running, started);
         assert_eq!(after, started);
         assert_ne!(path_now, started);
+    }
+
+    /// Lot 288: what `exe` (a child's `/proc/<pid>/exe`) opens once the
+    /// child's exec has replaced its image — `want` as soon as it does, the
+    /// last reading after `within` otherwise (and the caller's
+    /// assertion fails on it). `spawn` returns when the kernel wakes the
+    /// parent of a `vfork` child (glibc's `posix_spawn`, `CLONE_VFORK`): in
+    /// `exec_mmap`, before the child's `mm` is the new image's. Until then
+    /// the link names the parent's image (the shared `mm`: this test
+    /// binary), or no file: what the test read under the parallel harness
+    /// (lot 275's test failed in CI and in lot 283c's gates, and passed
+    /// when re-run).
+    fn exec_done(
+        exe: &Path,
+        want: Option<(u64, u64)>,
+        within: std::time::Duration,
+    ) -> Option<(u64, u64)> {
+        let until = std::time::Instant::now() + within;
+        loop {
+            let now = LinuxHost::file_id(exe);
+            if now == want || std::time::Instant::now() >= until {
+                return now;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Lot 288: how long a spawned child's exec may take to replace its
+    /// image (a loaded host, the parallel harness): far longer than it ever
+    /// does, bounded so a wrong `exe` still fails the test.
+    const EXEC_DONE_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Lot 288: [`exec_done`] waits for the exec only — a link that never
+    /// opens the file wanted is returned as it is, after the bound.
+    #[test]
+    fn exec_done_returns_what_the_link_opens_and_never_another_file() {
+        let me = Path::new(LinuxHost::PROC_ROOT)
+            .join(std::process::id().to_string())
+            .join("exe");
+        let own = LinuxHost::file_id(&me);
+        assert!(own.is_some());
+        let within = std::time::Duration::from_millis(300);
+        let at = std::time::Instant::now();
+        assert_eq!(exec_done(&me, own, within), own);
+        assert!(at.elapsed() < within);
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(tmp.path().join("other"), b"x").unwrap();
+        let other = LinuxHost::file_id(tmp.path().join("other"));
+        assert!(other.is_some() && other != own);
+        let at = std::time::Instant::now();
+        assert_eq!(exec_done(&me, other, within), own);
+        assert!(at.elapsed() >= within);
     }
 
     /// The clocks are the kernel's: the monotonic one between two readings

@@ -176,17 +176,28 @@ pub fn main() -> Result<()> {
     // never starts a worker of another version than its core.
     let image = nn_linux::worker::SelfImage::open_own();
 
+    // Lot 288 (#125): the stop's deadline, its thread idle until the event
+    // loop ends — started now, before anything could keep a thread from
+    // starting.
+    let stop = crate::stop_deadline::StopDeadline::start();
+
     // The runtime is the one `#[tokio::main]` built: multi-thread, every
     // driver. (External audit LLMR-009 built it by hand to pin the LLM
     // advisor's worker count first; the advisor was removed in lab PR 214.)
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // R14c (plan §3.1): a runtime thread holds the core's capabilities,
         // whichever thread made it start (a role's thread's `spawn_blocking`)
         .on_thread_start(nn_linux::caps::restore_core)
         .build()
-        .context("building the tokio runtime")?
-        .block_on(run(cli, undumpable, image))
+        .context("building the tokio runtime")?;
+    let result = runtime.block_on(run(cli, undumpable, image, &stop));
+    // Lot 288 (#125): the runtime's drop waits for every blocking task with
+    // no bound — its shutdown gets what is left of the stop's budget.
+    stop.stage("runtime");
+    runtime.shutdown_timeout(stop.left());
+    stop.finish();
+    result
 }
 
 /// The start: its phases in their order, the event loop, the stop (R11a,
@@ -195,6 +206,7 @@ async fn run(
     cli: Cli,
     undumpable: std::io::Result<()>,
     image: std::io::Result<nn_linux::worker::SelfImage>,
+    stop: &crate::stop_deadline::StopDeadline,
 ) -> Result<()> {
     // Wave 4 restructure, R11a (lab PR 261): the start in typed phases,
     // called in the order their code always ran. Each takes what the phases
@@ -684,10 +696,12 @@ async fn run(
         &ransom_tracker,
         &mut signals,
         &capability_manifest,
+        stop,
     )
     .await;
     crate::shutdown::stop(
         &cli,
+        stop,
         export_running,
         &workers,
         &heartbeat,

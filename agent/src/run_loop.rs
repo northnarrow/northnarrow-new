@@ -32,6 +32,7 @@ use crate::pipeline::dispatch::{Dispatcher, STOP_WAIT};
 use crate::pipeline::pid1_is_systemd_shutdown;
 use crate::pipeline::process_event::process_event;
 use crate::pipeline::slow::SlowWork;
+use crate::stop_deadline::{audit_note, StopDeadline};
 
 /// Why the event loop ended (the signed `agent_stop`), and when it began.
 pub(crate) struct Stopped {
@@ -107,12 +108,22 @@ pub(crate) async fn run(
     ransom_tracker: &Arc<northnarrow_agent::impact::RansomTracker>,
     signals: &mut Signals,
     capability_manifest: &northnarrow_agent::boot::manifest::SignedManifest,
+    stop: &StopDeadline,
 ) -> Stopped {
     // Why the event loop ended — written as the signed `agent_stop` entry
     // below; a run that never writes it is reported by the next boot.
     let loop_started = std::time::Instant::now();
+    // Lot 288 (#125): the stop begins when the loop ends — from then on its
+    // deadline runs, its note signed in the audit log if it expires.
+    let begin = |reason: &'static str| {
+        stop.begin(
+            reason,
+            audit_note(audit_log.clone(), combat.isolator.clone(), loop_started),
+        );
+    };
     let Some(mut rx) = sensor.take_receiver() else {
         error!("event bus: no receiver to judge from — stopping");
+        begin("sensor_pump_exited");
         return Stopped {
             stop_reason: "sensor_pump_exited",
             loop_started,
@@ -161,6 +172,7 @@ pub(crate) async fn run(
                 Ok(d) => d,
                 Err(e) => {
                     error!(error = %e, "the decision thread did not start — stopping");
+                    begin("decision_thread_failed");
                     return "decision_thread_failed";
                 }
             };
@@ -174,6 +186,10 @@ pub(crate) async fn run(
                 dispatcher,
                 capability_manifest,
             ));
+            begin(reason);
+            // a scoped thread is joined, however long its turn takes: the
+            // deadline bounds this wait (lot 288)
+            stop.stage("decision");
             ctl.stop.store(true, Ordering::Release);
             match decider.join() {
                 Ok(()) => reason,
@@ -187,11 +203,14 @@ pub(crate) async fn run(
     // it back). R12b: the receiver back from the joined decision thread.
     sensor.restore_receiver(rx);
     // R12c (lab PR 270): the responses decided are run (at most
-    // `STOP_WAIT`) or signed as not run before the stop.
-    off_the_runtime_stop(dispatcher);
+    // `STOP_WAIT`, lot 288: and what the stop's deadline leaves) or signed
+    // as not run before the stop.
+    stop.stage("dispatcher");
+    off_the_runtime_stop(dispatcher, stop);
     // R12b: the canary trips judged are in their chain before the stop.
+    stop.stage("canary");
     if let Some(d) = canary_detector {
-        if !d.flush(Duration::from_secs(5)) {
+        if !d.flush(stop.drain_bound(Duration::from_secs(5))) {
             warn!("canary: trips still queued for their access rows at the stop");
         }
         let (per_canary, unwritten) = d.unwritten();
@@ -204,6 +223,7 @@ pub(crate) async fn run(
             );
         }
     }
+    stop.stage("bus");
     sensor.stop_bus();
     Stopped {
         stop_reason,
@@ -464,9 +484,12 @@ async fn watch_loop(
 }
 
 /// R12c (lab PR 270): the dispatcher's stop waits (at most `STOP_WAIT`)
-/// for the responses still queued — off the runtime's worker.
-fn off_the_runtime_stop(dispatcher: &Dispatcher) {
-    northnarrow_agent::runtime::off_the_runtime(|| dispatcher.stop(STOP_WAIT));
+/// for the responses still queued — off the runtime's worker. Lot 288:
+/// every wait of it ended by the stop's deadline too.
+fn off_the_runtime_stop(dispatcher: &Dispatcher, stop: &StopDeadline) {
+    northnarrow_agent::runtime::off_the_runtime(|| {
+        dispatcher.stop_by(STOP_WAIT, stop.drain_until())
+    });
 }
 
 /// `debug-trigger` builds only: a file `debug-crash-mid-action` next to the
