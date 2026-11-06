@@ -192,7 +192,9 @@ impl<H: DecisionHost> Rule for R018KernelModuleLoad<H> {
                 ),
                 (_, Some(f)) if f.trust_flags == 0 => format!(
                     "no package or DKMS vouches for the file {}:{} (uid {}, mode {:o}) as it is \
-                     now — not in the running kernel's tree, copied or changed by hand",
+                     now — not in the running kernel's tree, copied or changed by hand, or a \
+                     DKMS or akmods build written outside a package transaction that `enforce \
+                     R018` refuses (the agent's journal names why)",
                     f.dev, f.ino, f.uid, f.mode
                 ),
                 (_, Some(f)) => format!(
