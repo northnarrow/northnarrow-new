@@ -25,6 +25,9 @@ pub struct AgentExecGuards {
     /// What the install took for each controller (`None`: it does not run).
     pub execq_kernel: Option<crate::execq::kernel::Kernel>,
     pub execpol_kernel: Option<crate::execpol::kernel::Kernel>,
+    /// Lot 285: the module-load judge's maps (`None`: not taken, the judge
+    /// stays unarmed).
+    pub module_kernel: Option<crate::module_trust::kernel::Kernel>,
 }
 
 impl AgentExecGuards {
@@ -35,12 +38,23 @@ impl AgentExecGuards {
             execpol,
             execq_kernel: None,
             execpol_kernel: None,
+            module_kernel: None,
         }
     }
 }
 
 impl ExecGuards for AgentExecGuards {
     fn install(&mut self, ebpf: &mut Ebpf, exec_on_lsm: bool) {
+        // Lot 285: the module-load judge's maps, for its controller (the
+        // load hooks attach later, with the anti-tamper set; the judge is
+        // unarmed until the controller filled the trust map).
+        match crate::module_trust::kernel::take(ebpf) {
+            Ok(k) => self.module_kernel = Some(k),
+            Err(e) => error!(
+                error = format!("{e:#}"),
+                "module-load judge: maps not taken — module loads are not judged"
+            ),
+        }
         // Lab PR 223 (EXPERIMENTAL): the exec quarantine's kernel
         // configuration, once the exec sensor's mode is known — written OFF
         // too, then frozen — and its maps for the controller. Not fatal:

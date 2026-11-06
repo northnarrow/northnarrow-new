@@ -1706,7 +1706,11 @@ mod tests {
                 |_| in_kernel,
                 "preparing /var/lib/northnarrow: a symbolic link".to_string(),
             );
-            assert_eq!(fs.observe_failures.len(), 2, "the module-load observers");
+            assert_eq!(
+                fs.observe_failures.len(),
+                3,
+                "the module-load hooks and the module files' write history (lot 285)"
+            );
             let mut deny = DenyHealth::default();
             for (p, w) in fs.deny_failures {
                 deny.missing_hook(p, w);

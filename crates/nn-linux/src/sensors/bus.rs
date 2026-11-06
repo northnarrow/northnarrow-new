@@ -2176,6 +2176,8 @@ mod tests {
             parent_is_kthread: false,
             path: Some("/tmp/rk.ko".into()),
             timestamp_ns: 0,
+            verdict: Default::default(),
+            file: None,
         }
     }
 

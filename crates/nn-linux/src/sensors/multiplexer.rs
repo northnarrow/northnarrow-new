@@ -2014,6 +2014,8 @@ mod module_path_tests {
             parent_is_kthread: false,
             path: Some(path.into()),
             timestamp_ns: 0,
+            verdict: Default::default(),
+            file: None,
         };
         let rk = "/lib/modules/6.8.0-1-generic/extra/k269-rk.ko";
         let e = placed(&raw, load(rk), &mut mounts, &owners);

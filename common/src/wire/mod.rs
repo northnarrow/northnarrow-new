@@ -1514,7 +1514,8 @@ pub const MODULE_PATH_UNREADABLE: u8 = 2;
 /// R011 (tool exec) both miss.
 ///
 /// Field order chosen for natural u64 alignment with no implicit
-/// padding: 8 + 4 + 4 + 16 + 16 + 1 + 1 + 2 + 1 + 3 + 512 + 8 + 8 = 584 (8-aligned).
+/// padding: 8 + 4 + 4 + 16 + 16 + 1 + 1 + 2 + 1 + 1 + 2 + 512 + 8 + 8
+/// + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 8 = 632 (8-aligned).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -1540,7 +1541,11 @@ pub struct ModuleLoadRaw {
     /// every slot was used first. [`MODULE_PATH_UNREADABLE`]: a kernel
     /// read failed (external audit PROC-004 tells the two apart).
     pub path_truncated: u8,
-    pub _pad: [u8; 3],
+    /// Lot 285: what the kernel made of the load
+    /// (`crate::module_judge::verdict`; 0, not judged, from an older
+    /// object).
+    pub verdict: u8,
+    pub _pad: [u8; 2],
     /// Source `.ko` path for a finit_module load (stage 1b); zeroed otherwise.
     pub path: [u8; MODULE_PATH_LEN],
     /// External audit PROC-005: the inode key of the filesystem root the
@@ -1550,6 +1555,18 @@ pub struct ModuleLoadRaw {
     /// when the root was not reached.
     pub root_dev: u64,
     pub root_ino: u64,
+    /// Lot 285: the file the kernel read (finit_module), as the judge read
+    /// it: its `InodeKey`, change time, size, owner and mode, and the trust
+    /// map entry's flags (`crate::module_judge::trust_flag`; 0 for none).
+    /// Zero for init_module.
+    pub file_dev: u64,
+    pub file_ino: u64,
+    pub ctime_sec: i64,
+    pub ctime_nsec: u32,
+    pub file_uid: u32,
+    pub file_mode: u32,
+    pub trust_flags: u32,
+    pub file_size: i64,
 }
 
 impl ModuleLoadRaw {
@@ -1564,10 +1581,19 @@ impl ModuleLoadRaw {
             parent_is_kthread: 0,
             path_len: 0,
             path_truncated: 0,
-            _pad: [0u8; 3],
+            verdict: 0,
+            _pad: [0u8; 2],
             path: [0u8; MODULE_PATH_LEN],
             root_dev: 0,
             root_ino: 0,
+            file_dev: 0,
+            file_ino: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            file_uid: 0,
+            file_mode: 0,
+            trust_flags: 0,
+            file_size: 0,
         }
     }
 }

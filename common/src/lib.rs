@@ -51,6 +51,7 @@ pub mod fail_open;
 /// entered it, and how much a new one weighs. NOT `std`-gated (the
 /// letters and meanings are).
 pub mod kernel_taint;
+pub mod module_judge;
 /// Ring-buffer drop slots shared by eBPF producers and the agent.
 pub mod ring_drops;
 pub mod sysctl_judge;

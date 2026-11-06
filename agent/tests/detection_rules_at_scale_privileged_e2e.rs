@@ -966,9 +966,10 @@ fn assert_r011(fx: &Fixture, pid: u32, verdict: &str, why: &str) {
 ///
 /// - a module copied into the running kernel's tree, `depmod -a`, then
 ///   `modprobe`d by name: R011 RECORDS it (no resolution: whether a name
-///   loads anything, and what, is the kernel's to judge) — and R018 judges
-///   the load the kernel reports, after it: an unowned module by an
-///   unexpected loader, its tree killed once the module is in;
+///   loads anything, and what, is the kernel's to judge) — and R018 records
+///   the load the kernel judged (lot 285: a file copied into the tree by
+///   hand is untrusted — refused in the deny mode, High, no kill: it is in
+///   a module directory);
 /// - `modprobe -d <a tree in /tmp>`: R011 kills on the argument alone;
 /// - the same tree through `MODPROBE_OPTIONS`, which the sensor does not
 ///   see: R011 kills on the environment the exec pump read at the exec (and
@@ -1031,9 +1032,10 @@ fn r011_records_a_name_and_kills_a_moved_tree_or_modprobe_options() {
     assert_r011(&fx, pid, "Log", "modprobe of 'nn_k279_copied'");
     let r018 = r018_records_of(&fx, pid);
     assert!(
-        r018.iter()
-            .any(|r| r["verdict"] == serde_json::json!({"Rule": "KillProcessTree"})),
-        "R018 judges the load of an unowned module by modprobe (after it): {r018:?}"
+        r018.iter().any(|r| r["severity"] == "High"
+            && r["verdict"] == serde_json::json!({"Rule": "Log"})),
+        "R018 records the load of a module copied into the tree by hand (lot 285: \
+         untrusted, judged in the kernel): {r018:?}"
     );
     unload("nn_k279_copied");
     unload("dummy");

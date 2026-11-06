@@ -286,7 +286,11 @@ impl Sensor {
     /// program-id list names them (`anti_tamper::bpf_defense`).
     pub const fn programs(self) -> &'static [&'static str] {
         match self {
-            Sensor::ModuleLoad => &["module_read_file_observe", "module_load_data_observe"],
+            Sensor::ModuleLoad => &[
+                "module_read_file_observe",
+                "module_load_data_observe",
+                "module_write_observe",
+            ],
             Sensor::ExploitGuard => &["epg_"],
             Sensor::DnsAnswer => &["dns_answer_"],
             _ => &[],

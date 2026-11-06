@@ -212,25 +212,20 @@ it whole — or sees no thread running while the kernel counts more than one. Fo
 effort. R011 resolves nothing: whether a name
 loads a module, and which, is the kernel's to judge — its module signature
 enforcement and lockdown (the host check reports both) and lot 285's deny of
-an untrusted file are what prevent a load. R018 judges the loads the kernel
-reports, after them (it observes, it denies nothing): no verdict for a
-kernel thread's child; the loader's tree killed for a file outside the
-module directories; for an unowned file in them a kill, or a Log when the
-loader or its parent is in R018's loader allowlist (`systemd-udevd`,
-`systemd-modules`, `kmod`: comms); no verdict for a packaged file loaded by
-those, a Log by another loader; every load a journal line. Taking `kmod` out
-of that allowlist goes with lot 285's redesign of R018. What R011 never
-covered: a root process loading a module with its own `finit_module(2)` (with
-comm `kmod`, maybe no verdict at all), a root parent tracing the tool and
+an untrusted file are what prevent a load. Lot 285: the kernel judges every
+load by the file it reads (§2.4), whoever loads it, and R018 records what it
+refused or let through; R018's loader allowlist by `comm` is gone. What R011
+never covered: a root parent tracing the tool and
 rewriting its argv or environment after the agent read them, code injected
 into the tool (an `LD_PRELOAD` read too late, `/etc/ld.so.preload`) that
 forks and lets the tool exit: the agent reads an exited tool (recorded),
 and a kill of the tool would not reach that child, which runs on out of its
 tree. The
 `install`/`remove` commands of root's `modprobe.d` run as programs the exec
-rules judge; before lot 279 a user-space `modprobe` was killed, its command
-then usually not run — the residual and `modprobe.d`'s coverage are in
-`TAPPA9_FIM_TRUST_MODEL.md`. Why: the container runtimes, kube-proxy and k3s
+rules judge; lot 285 records each child of the module tool (R011, Medium:
+the command a directive runs) and each write of kmod's configuration
+directories (NN-L-FIM-026, High outside a package transaction) — the
+residual is in `TAPPA9_FIM_TRUST_MODEL.md`. Why: the container runtimes, kube-proxy and k3s
 run `modprobe` of the distribution's netfilter, bridge and overlay modules
 (lot 275's lab: rootful podman's network killed on Ubuntu 22.04). No
 directive restores the kill of a recorded exec: `enforce R011` runs R011's
@@ -549,6 +544,81 @@ sysctl-allow kernel.pid_max 4096..32767
   host needs.
 - `nn-admin policy show` lists the lines in force; the policy's summary
   counts them (`…, 1 sysctl opt-out`).
+
+### 2.4 Kernel module loads judged in the kernel (lot 285)
+
+A root user loads a module without any tool — `finit_module(2)` on a file of
+their choice, `init_module(2)` on a buffer — so the prevention is the
+kernel's. The agent's two module-load hooks (`kernel_read_file` for
+`READING_MODULE`, `kernel_load_data` for `LOADING_MODULE`) judge the FILE,
+never who loads it:
+
+- **Trusted** (loads, no record): a regular file owned by root that neither
+  its group nor others may write, whose inode the agent found walking the
+  running kernel's tree (`/lib/modules/$(uname -r)`: the inode the kernel
+  reads, not a path's text — a copy elsewhere is another inode, a hard link
+  the same file), unchanged since the agent vouched for it (its change time
+  and size), and:
+  - unchanged since boot and a **verified package's** (dpkg's `md5sums`,
+    rpm's file digests, compared with the file's content) or **DKMS's
+    build** (in `updates/dkms/` or `extra/`, of a module DKMS registered for
+    this kernel); or
+  - written since boot **inside a package transaction**: the kernel keeps
+    the write history of every module file of the tree — created by a
+    process with a package manager's image (`dpkg`, `rpm`, `apt`, …) in its
+    lineage, run as root, and opened for writing by nothing else since. A
+    DKMS build under `apt install …-dkms` is one;
+  - or named by a signed **`module-allow <module>`** line.
+- **Untrusted**: anything else — a file outside the tree, a copy, a file
+  changed since boot outside a package transaction (a module built by hand,
+  `make modules_install`, a root shell's `dkms install`), one whose owner or
+  mode no longer protects it — and every `init_module` buffer.
+
+What happens to an untrusted load is the policy's mode of
+`R018_KernelModuleLoad`:
+
+| Policy line | Kernel | Record |
+|---|---|---|
+| none (default) | **refused** (`EPERM`) outside a signed trusted-installer window | R018 High; Critical and the loader's tree killed for a file outside `/lib/modules` |
+| `enforce R018` | refused, as the default | as the default |
+| `alert R018` / `audit R018` / `off R018` | let through | as the default (the rule's own mode applies to its record) |
+
+Inside a signed trusted-installer window an untrusted load goes through and
+is recorded (Medium). A load a `module-allow` line lets through is recorded
+(Medium) too. Until the agent has filled its trust map — the first seconds
+of its start, measured in the lab — nothing is judged (R018 then judges by
+the path, as before lot 285); the agent signs a degradation when the judge
+cannot be armed (its maps not taken, or this kernel's inode offsets
+unresolved: the record mode then, never the deny mode).
+
+```
+# rule-policy.local — signed by config-manage
+module-allow nvidia
+module-allow vboxdrv
+```
+
+- The name is the module's (`modinfo -F name`; `-` and `_` are the same
+  module): letters, digits, `_`, `-` only — never a path, a `.ko`, a glob.
+  At most 256 lines.
+- **Honoured only with a valid signature**, as `sysctl-allow`.
+- It names a module, not a file's content: while it is in force any root
+  process may replace that module's file in the tree and load it (each load
+  recorded). Prefer a package (the module built under the package manager)
+  where one exists.
+- The agent names in its journal, at its start and when the tree changes,
+  every module file of the tree it does not vouch for and why
+  (`module-load judge: a module file NOT trusted`): read it before you sign
+  an opt-out, and before you install the agent on a host whose DKMS modules
+  were built outside a package transaction.
+
+What it does not cover: a module the boot loads before the agent starts
+(the initramfs, `systemd-modules-load`, udev's first pass) — the kernel's
+module signature enforcement and lockdown are what judge those (`nn-admin
+host-check` reports both); on the RPM family a DKMS build under `dnf` (dnf
+is a Python program: its lineage is the interpreter's image, not a package
+manager's) is untrusted until the next boot or a `module-allow`; a module
+built after boot but before the agent started has no write history and is
+untrusted until the next boot (`akmods` at boot).
 
 ### 2.3 Code injected into an exempt process: the exemption revoked (lot 281)
 

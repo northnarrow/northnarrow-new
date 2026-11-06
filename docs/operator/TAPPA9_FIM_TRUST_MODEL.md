@@ -203,16 +203,18 @@ the trusted-installer window first, or expect the capability to be removed.
   can run the command directly; for a kernel-driven load
   (`request_module`, a kernel thread's child) this was so before lot 279
   too, while a `modprobe` run from user space was killed by R011 on `main`
-  (racing it, so its command usually did not run). Coverage today:
-  `/etc/modprobe.d` is in the watch list (`configs/fim-paths.v1`) but no
-  rule judges a write there — the drift is journalled, not alerted;
-  `/run/modprobe.d`, `/lib/modprobe.d`, `/usr/lib/modprobe.d` and
-  `/usr/local/lib/modprobe.d` are not watched; an `install` line in
+  (racing it, so its command usually did not run). Coverage (lot 285):
+  every `modprobe.d` directory — `/etc`, `/run`, `/usr/local/lib`, `/lib`
+  and `/usr/lib` — is in the watch list, and NN-L-FIM-026 records a write
+  there (High outside a package transaction, Low inside one; a directory
+  absent at the agent's start is not watched); R011 records each child of
+  the module tool (Medium: the command a directive runs, `/bin/sh -c …`),
+  but not the `install <module> /bin/true` (or `/bin/false`) idiom of the
+  hardening guides; an `install` line in
   `/lib/modules/$(uname -r)/modules.softdep`, which kmod reads with the
   same parser, is a file under `/lib/modules/` (NN-L-FIM-008, Critical).
-  Follow-ups (another lot): a FIM rule (a High record) for writes in every
-  `modprobe.d` directory, and a record for a child of `modprobe`/`kmod`
-  other than `/bin/true` and `/bin/false`.
+  The module a directive loads is the kernel's to judge (lot 285: by the
+  file).
 
 ## Audit + integrity guarantees
 

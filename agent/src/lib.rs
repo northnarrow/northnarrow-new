@@ -187,6 +187,7 @@ mod install_manifest_tests;
 /// nn-linux's.
 pub use nn_linux::keys;
 pub mod loop_progress;
+pub mod module_trust;
 pub mod net;
 /// R09a shim: the OS CSPRNG is nn-evidence's (R10, lab PR 259: from
 /// nn-linux, below nn-admin).

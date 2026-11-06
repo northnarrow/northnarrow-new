@@ -413,6 +413,18 @@ const STATICS: &[Kept] = &[
         "lot 280b: the id of the judge's program this boot linked to the root cgroup (the one eBPF object's), read by the kernel-state round to tell the root's other programs from it",
     ),
     kept(
+        "agent/src/module_trust/mod.rs",
+        "DESIRED",
+        Kernel,
+        "lot 285: the module-load judge's mode and signed opt-outs for the one eBPF object's trust map, written at the start and by `policy set`, read by its controller thread",
+    ),
+    kept(
+        "agent/src/module_trust/mod.rs",
+        "STATE",
+        Kernel,
+        "lot 285: the module-load judge's controller's last report on the one eBPF object's trust map (the journal and the status read it)",
+    ),
+    kept(
         "crates/nn-linux/src/sysctl_cgroup.rs",
         "OPT_OUTS",
         Kernel,
@@ -628,6 +640,11 @@ const START_CALLS: &[(&str, &str)] = &[
     (
         "execq::shutdown",
         "stops the exec quarantine's controller thread",
+    ),
+    (
+        "module_trust::apply_policy",
+        "the rule policy's mode for R018 and its signed module-allow lines, for the module-load \
+         judge of the one eBPF object (as sysctl_cgroup::apply_policy for its opt-outs)",
     ),
     (
         "execpol::start",

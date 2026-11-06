@@ -545,9 +545,13 @@ pub(crate) const OPTIONAL_LSM_PROGRAMS: &[(&str, &str)] = &[
     ("protected_ioctl_compat_deny", "file_ioctl_compat"),
 ];
 
-/// BUG-034 module-load observe hooks — `MODULE_LOAD_EVENTS` producers.
-/// Observe-only (return 0); the rootkit verdict is userland's (stage 2
-/// rule). Attached via the same `reattach_fresh` discipline as the
+/// BUG-034 module-load hooks — `MODULE_LOAD_EVENTS` producers. Lot 285:
+/// the two load hooks JUDGE the load by the file (`MODULE_TRUST`) and refuse
+/// an untrusted one in the deny mode the agent arms
+/// (`agent/src/module_trust`); `module_write_observe` keeps the module
+/// files' write history (observe only, [`MODULE_WRITE_PROGRAM`]). A failed
+/// attach is an observe failure (signed, the start goes on): module loads
+/// are then neither judged nor recorded. Attached via the same `reattach_fresh` discipline as the
 /// `LSM_PROGRAMS` deny set (zero-window + no ring split-brain across
 /// restart). (program-name, hook-name); both share the source file
 /// `agent-ebpf/src/module_load.rs`.
@@ -559,6 +563,14 @@ pub(crate) const MODULE_LOAD_PROGRAMS: &[(&str, &str)] = &[
     ("module_read_file_observe", "kernel_read_file"),
     ("module_load_data_observe", "kernel_load_data"),
 ];
+
+/// Lot 285: the module files' write history (`module_write_observe` on
+/// `file_open`, observe only), which the agent reads to vouch for a module
+/// file written since boot inside a package transaction. Attached with the
+/// load hooks; a failed attach is an observe failure (signed): a module
+/// file written since boot is then trusted by nothing but a signed opt-out
+/// until the next boot.
+pub(crate) const MODULE_WRITE_PROGRAM: (&str, &str) = ("module_write_observe", "file_open");
 
 /// Attach outcome of the FS deny + observe hook sets (audit
 /// `ebpf-lsm-1`): the caller aggregates it with task_kill/ptrace into one
@@ -607,6 +619,9 @@ pub(crate) fn hooks_lost_to_bootstrap_failure(
     for (program, _) in MODULE_LOAD_PROGRAMS {
         health.observe_failures.push((program, lost.clone()));
     }
+    health
+        .observe_failures
+        .push((MODULE_WRITE_PROGRAM.0, lost.clone()));
     health.infra_failures.push(("filesystem::attach", why));
     health
 }
@@ -866,11 +881,11 @@ pub(crate) fn attach(
     // MODULE_LOAD_EVENTS producers — on the same reattach-fresh path as
     // the deny set above (zero-window + no ring split-brain on restart).
     // Observe-only; the rootkit verdict is userland's (stage-2 rule).
-    for (program, hook) in MODULE_LOAD_PROGRAMS {
+    for (program, hook) in MODULE_LOAD_PROGRAMS.iter().chain([&MODULE_WRITE_PROGRAM]) {
         if let Err(e) = super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
             warn!(
                 program, hook, error = %e,
-                "anti-tamper FS: module-load LSM hook attach FAILED (BUG-034)"
+                "anti-tamper FS: module-load LSM hook attach FAILED (BUG-034, lot 285)"
             );
             health.observe_failures.push((program, format!("{e:#}")));
         }
@@ -2561,7 +2576,9 @@ mod tests {
         let h = hooks_lost_to_bootstrap_failure(|h| Some(h == "inode_set_acl"), "x".into());
         assert_eq!(h.deny_failures.len(), LSM_PROGRAMS.len() + 1);
         assert_eq!(h.optional_present, 1);
-        assert_eq!(h.observe_failures.len(), MODULE_LOAD_PROGRAMS.len());
+        // lot 285: and the module files' write history
+        assert_eq!(h.observe_failures.len(), MODULE_LOAD_PROGRAMS.len() + 1);
+        assert_eq!(h.observe_failures.last().unwrap().0, MODULE_WRITE_PROGRAM.0);
         assert_eq!(
             h.infra_failures,
             vec![("filesystem::attach", "x".to_string())]

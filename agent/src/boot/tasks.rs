@@ -56,6 +56,7 @@ pub(crate) fn start(
         execpol: execpol_cfg,
         execq_kernel,
         execpol_kernel,
+        module_kernel,
     } = exec_guards;
     // Decay loop: walks the posture down (ALERTED→OBSERVING after 1h
     // idle, ENGAGED→ALERTED after 24h idle, and — external audit POS-001 —
@@ -170,6 +171,14 @@ pub(crate) fn start(
         }
         handle
     };
+
+    // Lot 285: the module-load judge's controller — the trust map filled
+    // from the running kernel's tree, then the mode the policy asks; one
+    // that cannot start leaves the judge unarmed, signed.
+    if let Err(why) = northnarrow_agent::module_trust::start(module_kernel) {
+        error!(reason = %why, "module-load judge NOT armed — module loads are not judged");
+        attest_degraded(audit_log.as_ref(), &format!("module-load judge: {why}"));
+    }
 
     // Install the three shutdown signals up front, before the loop.
     // Re-creating the future inside `select!` every iteration (the

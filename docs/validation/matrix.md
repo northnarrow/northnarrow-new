@@ -9,7 +9,7 @@ The matrix itself is empty by design — V2–V4 populate it.
 
 | File | What it fixes | Version | Rows | sha256 (LF line endings) |
 |---|---|---|---|---|
-| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 4 | 89 | `10782403fc56afa3d064131db75d1e926ec97871a3406ffafd570a58462da4dd` |
+| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 5 | 90 | `58506ea916d8dbd9dae1739c87ace3a94ae09110673997b826880041c837bb01` |
 | [`v2-techniques.tsv`](v2-techniques.tsv) | the ATT&CK technique rows and their expected outcome | 2 | 62 | `f22ae7a6cf96db925177c4cf1d10ed3af0b70b53587e4b9d4f179cf4f767dbb9` |
 | [`v2-controls.tsv`](v2-controls.tsv) | one evasion row and one benign control per family | 2 | 22 | `f07c7a7f7cd83059f9bdc2f4993e98f87bd27b39a50277b7144b3f7f186162bd` |
 
@@ -73,6 +73,13 @@ Change log:
   program's identity (R6 of the external review of 04/11). It cannot issue
   a Critical verdict: out of the sub-gate (`gate -`), as any such rule. No
   new technique or control row. 89 rows, sub-gate 29.
+- `v2-rules.tsv` version 5 (2026-11-06, lot 285, before any V2 run):
+  NN-L-FIM-026 (a write in kmod's configuration directories, `modprobe.d`:
+  High outside a package transaction, Low inside one, never a kill; family
+  `fim`, out of the sub-gate). R018 keeps its row and its place in the
+  sub-gate: the kernel now refuses a load of an untrusted file (lot 285),
+  and the rule's kill of a load from outside `/lib/modules` is unchanged. No
+  new technique or control row. 90 rows, sub-gate 29.
 
 ## Gate formulas (§13 Q1, as frozen)
 
@@ -164,7 +171,7 @@ brings each one back:
 | R004_ExecFromProcSelfFd | - | `crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs::fires_on_proc_self_fd` | `agent/tests/detection_rules_at_scale_privileged_e2e.rs::process_memfd_fileless_exec_trips_r004` | `deploy/lab/exec-sensor/exec-sensor-check.sh::R004_ExecFromProcSelfFd` | no proof | e2e | The lab probe also checks the kill (exit status 137). |
 | R006_ReverseShellTooling | - | `crates/nn-core/src/decision/rules/r006_reverse_shell_tooling.rs::fires_on_each_offsec_tool` | no proof | no proof | no proof | unit | Critical with KillProcessTree since lab PR 166 (the shell `socat EXEC:` runs is its child). |
 | R007_CryptoMiner | - | `crates/nn-core/src/decision/rules/r007_crypto_miner.rs::match_is_case_insensitive` | no proof | no proof | no proof | unit | - |
-| R018_KernelModuleLoad | - | `crates/nn-core/src/decision/rules/r018_kernel_module_load.rs::fire_nonstandard_path_is_critical_killtree` | no proof | no proof | no proof | unit | Critical only for a module outside the module directories; anti-tamper.sh C16 loads an in-tree module. |
+| R018_KernelModuleLoad | - | `crates/nn-core/src/decision/rules/r018_kernel_module_load.rs::fire_nonstandard_path_is_critical_killtree` | no proof | no proof | no proof | unit | Critical only for a module outside the module directories; lot 285: the kernel refuses an untrusted file (anti-tamper.sh C58b), C16 and C58 load the tree's own module. |
 | R020_ShellWithSocketStdio | - | `crates/nn-core/src/decision/rules/r020_shell_with_socket_stdio.rs::a_shell_on_an_outbound_socket_is_a_critical_reverse_shell` | no proof | `deploy/lab/malsim/net-check.sh::MS06` | no proof | unit | Lab PR 224: the exec sensor reads the new image's fds 0..2 (and its parent's) in `sched_process_exec`; the lab probe (not yet run on a guest) asserts the signed record's `network` "stdio tcp … outbound". |
 | NN-L-EPG-001_CredentialPostcondition | - | `crates/nn-core/src/decision/rules/epg.rs::credential_write_in_detect_mode_is_a_critical_log` | no proof | no proof | no proof | unit | Lab PR 219, experimental. Issued outside the engine; Critical in both responses (detect: Log; enforce: the kernel's SIGKILL, and in lite the use refused), except lite's degraded evidence — a task record the LRU task map evicted, re-taken holding privilege — at High, Log only in either response (`crates/nn-core/src/decision/rules/epg.rs::a_lost_baseline_is_degraded_evidence`). Lite (default) catches it at the mechanism or at the first use (`capable`, exec, a root-private open), strict around every call; the record names the variant and the point. The lab probe exercises the record and the response through the debug-build injection, not a real kernel credential write. |
 | NN-L-EPG-002_NamespaceRootPostcondition | - | `crates/nn-core/src/decision/rules/epg.rs::namespace_escape_is_epg_002` | no proof | no proof | no proof | unit | Lab PR 219, experimental. As NN-L-EPG-001, for namespaces, the fs_struct and the root. |

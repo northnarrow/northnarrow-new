@@ -107,6 +107,10 @@ fn config_overlay_set(
                 warn!(target: "admin.config_overlay", detail = %detail, "sysctl opt-out");
                 nn_linux::boot::degradation::report("rule_policy", &detail);
             }
+            // Lot 285: the module-load judge's mode and opt-outs (signed)
+            if let Some(detail) = crate::module_trust::apply_policy(&rule_policy.current(), true) {
+                nn_linux::boot::degradation::report("rule_policy", &detail);
+            }
             warn!(
                 target: "admin.config_overlay",
                 path = %target.display(),

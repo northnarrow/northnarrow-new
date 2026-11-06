@@ -243,7 +243,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "R011_KernelModuleTooling",
-        severities: &[Severity::High],
+        severities: &[Severity::High, Severity::Medium],
         actions: &[
             ResponseAction::KillProcessTree,
             ResponseAction::KillProcess,
@@ -274,7 +274,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    could be read is recorded, its environment not verified (its kill would \
                    reach no one): the environment's check is best effort for a short-lived \
                    `modprobe`. A copy run from a staging directory is killed with its tree, \
-                   the tool elsewhere alone.",
+                   the tool elsewhere alone. Lot 285: a child of the module tool (the command \
+                   of a `modprobe.d` `install`/`remove` directive, `/bin/sh -c …`) is recorded \
+                   (Medium).",
         false_positives: "Kernel-driven loads (a kworker's modprobe at boot or hot-plug) are \
                           exempt. The container runtimes', kube-proxy's and an administrator's \
                           `modprobe <name>` are recorded, not killed (lot 279), and so is a \
@@ -298,6 +300,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
              modprobe_by_name_is_recorded_not_killed",
             "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::\
              what_the_command_line_names_is_killed",
+            "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::\
+             r011_records_the_children_of_modprobe",
             "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::\
              what_the_exec_pump_read_is_judged",
             "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::\
@@ -472,24 +476,43 @@ pub(super) const DOCS: &[RuleDoc] = &[
         actions: &[ResponseAction::KillProcessTree, ResponseAction::Log],
         sensors: &[Sensor::ModuleLoad],
         data_components: &["DC0031"],
-        observes: "A kernel module load (`finit_module`, `init_module`) at the LSM hooks. \
-                   Killed: a file outside `/lib/modules`, a path deeper than any module \
-                   directory, or a file under it that no package installed and DKMS did not \
-                   build, loaded by an unexpected loader. Recorded: a legacy `init_module` \
-                   (High), an unreadable path (High), a standard module by an unexpected \
-                   loader (Medium).",
-        false_positives: "Kernel-driven loads are exempt, and so are `systemd-udevd`, \
-                          `systemd-modules-load` and `kmod` (loader or parent) for a module in \
-                          a module directory. An administrator who loads a module from a build \
-                          directory (`insmod ~/driver.ko`) is killed.",
-        how_to_test: "Copy an in-tree module out of the module tree, decompressed, and \
-                      `insmod` it from `/tmp` (Critical); `exec -a modprobe` of a renamed \
-                      loader for a standard module (anti-tamper.sh case C58, Medium).",
+        observes: "A kernel module load (`finit_module`, `init_module`) at the LSM hooks, judged \
+                   IN THE KERNEL by the file (lot 285): a file of the running kernel's tree that \
+                   a verified package installed or DKMS built, unchanged since boot or written \
+                   since inside a package transaction, or named by a signed `module-allow`, \
+                   loads; any other file and every `init_module` buffer are refused outside a \
+                   signed trusted-installer window in the deny mode (the default), let through \
+                   in the record mode (`alert R018`). Who loads is not asked. Killed: a file \
+                   outside `/lib/modules` or deeper than any module directory, refused or not. \
+                   Recorded: any other untrusted file or buffer (High), a load a window or an \
+                   opt-out let through (Medium); a load the kernel did not judge (the agent's \
+                   first seconds) by the path and the package database.",
+        false_positives: "None measured on the benign corpus (lot 285: udev's and the services' \
+                          loads, docker's, k3s', a DKMS build under apt). A module built by \
+                          hand (`make modules_install`, a root shell's `dkms install`), a \
+                          vendor's installer outside the package manager, an RPM host's DKMS \
+                          build under dnf (its lineage is a Python script's) and a module built \
+                          after boot before the agent started are refused until a signed \
+                          `module-allow <module>` (or the next boot, for a DKMS build); an \
+                          administrator who loads a module from a build directory \
+                          (`insmod ~/driver.ko`) is refused and killed.",
+        how_to_test: "Copy an in-tree module to `/tmp` and `insmod` it: refused (EPERM), \
+                      Critical, the loader killed; a renamed loader of a trusted module \
+                      (anti-tamper.sh case C58) loads with no record, its copy in `/tmp` \
+                      (C58b) is refused.",
         tests: &[
+            "common/src/module_judge.rs::an_untrusted_module_file_outside_the_tree_is_denied",
+            "agent/src/module_trust/scan.rs::a_copy_of_a_trusted_module_in_tmp_is_denied",
+            "common/src/module_judge.rs::\
+             a_trusted_module_modified_after_boot_is_denied_outside_a_window",
+            "common/src/module_judge.rs::init_module_from_memory_is_denied",
+            "agent/src/module_trust/scan.rs::a_dkms_module_under_a_package_transaction_is_allowed",
+            "crates/nn-core/src/decision/rules/r018_kernel_module_load.rs::\
+             a_signed_per_module_opt_out_is_allowed_and_recorded",
+            "crates/nn-core/src/decision/rules/r018_kernel_module_load.rs::\
+             r018_comm_allowlist_removed",
             "crates/nn-core/src/decision/rules/r018_kernel_module_load.rs::\
              fire_nonstandard_path_is_critical_killtree",
-            "crates/nn-core/src/decision/rules/r018_kernel_module_load.rs::\
-             fire_stdpath_unexpected_loader_is_medium_log",
             "deploy/lab/adversarial/anti-tamper.sh::case C58",
         ],
         attack_note: "",

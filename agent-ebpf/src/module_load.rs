@@ -1,8 +1,18 @@
 //! Module-load BPF-LSM hooks (BUG-034) — kernel-module / rootkit-LKM
 //! detection at the load chokepoint.
 //!
-//! Two BPF-LSM programs OBSERVE (never deny, this commit) the two
-//! kernel module-load paths:
+//! Lot 285: the two kernel module-load paths are JUDGED here, by the file
+//! (`northnarrow_common::module_judge`: the verdicts, tested on the host):
+//! a `finit_module` of a file the agent's trust map does not vouch for, and
+//! an `init_module` of a buffer, are refused (`-EPERM`) outside a signed
+//! trusted-installer window when the agent armed the deny mode; the record
+//! mode lets them through and records them; until the agent filled the map
+//! nothing is judged. Each load is recorded with the verdict. A third
+//! program, [`module_write_observe`] (`file_open`), keeps the write history
+//! of the module files in the running kernel's tree that the agent reads
+//! to tell a package transaction's write from any other.
+//!
+//! The two load hooks:
 //!
 //! | Hook | Syscall | What it gives |
 //! |---|---|---|
@@ -40,21 +50,29 @@ use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
         bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
-        bpf_probe_read_kernel_str_bytes,
+        bpf_probe_read_kernel_str_bytes, generated,
     },
     macros::{lsm, map},
-    maps::RingBuf,
+    maps::{Array, HashMap, LruHashMap, RingBuf},
     programs::LsmContext,
 };
 
+use northnarrow_common::module_judge::{
+    conf_slot, finit_verdict, init_verdict, mode, module_file_name, refuses, write_step, FileFacts,
+    ModuleTrust, MODULE_PKG_IMAGES_MAX, MODULE_TRUST_MAX, MODULE_WRITES_MAX, NAME_TAIL, WALK_HOPS,
+};
 use northnarrow_common::wire::{
-    ModuleLoadRaw, MODULE_LOAD_FINIT, MODULE_LOAD_INIT, MODULE_PATH_TOO_DEEP, MODULE_PATH_UNREADABLE,
+    InodeKey, ModuleLoadRaw, MODULE_LOAD_FINIT, MODULE_LOAD_INIT, MODULE_PATH_TOO_DEEP,
+    MODULE_PATH_UNREADABLE,
 };
 
 use crate::btf_offsets::{
-    DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_PATH_OFFSET, PATH_DENTRY_OFFSET,
-    PF_KTHREAD, QSTR_NAME_OFFSET, TASK_STRUCT_COMM_OFFSET, TASK_STRUCT_FLAGS_OFFSET,
-    TASK_STRUCT_REAL_PARENT_OFFSET,
+    DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_INODE_OFFSET,
+    FILE_F_MODE_OFFSET, FILE_F_PATH_OFFSET, INODE_I_CTIME_NSEC_OFFSET, INODE_I_CTIME_SEC_OFFSET,
+    INODE_I_MODE_OFFSET, INODE_I_SIZE_OFFSET, INODE_I_UID_OFFSET, MM_STRUCT_EXE_FILE_OFFSET,
+    PATH_DENTRY_OFFSET, PF_KTHREAD, QSTR_LEN_OFFSET, QSTR_NAME_OFFSET, TASK_STRUCT_COMM_OFFSET,
+    TASK_STRUCT_FLAGS_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET,
+    TASK_STRUCT_TGID_OFFSET,
 };
 
 /// `enum kernel_read_file_id::READING_MODULE` (vmlinux BTF, 6.8).
@@ -66,6 +84,10 @@ const LOADING_MODULE: c_int = 2;
 const KEXEC_IMAGE: c_int = 3;
 /// Linux `EPERM`.
 const EPERM: c_int = 1;
+/// `FMODE_WRITE` / `FMODE_CREATED` (include/linux/fs.h; the latter since
+/// 4.19: this open created the file).
+const FMODE_WRITE: u32 = 0x2;
+const FMODE_CREATED: u32 = 0x10_0000;
 
 /// Path captured as up to 16 leaf→root components, each in a fixed
 /// 32-byte slot of `ModuleLoadRaw.path` (16 × 32 = 512 = MODULE_PATH_LEN).
@@ -81,6 +103,123 @@ const COMM_LEN: usize = 16;
 /// reattach-fresh rationale). 64 KiB ≈ ~115 [`ModuleLoadRaw`] (568 B).
 #[map]
 pub static MODULE_LOAD_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+/// Lot 285: the judge's mode and the running kernel's module tree
+/// (`module_judge::conf_slot`), written by the agent: zero (not judged)
+/// until it filled [`MODULE_TRUST`].
+#[map]
+pub static MODULE_CONF: Array<u64> = Array::with_max_entries(conf_slot::SLOTS, 0);
+
+/// Lot 285: the module files the agent vouches for, by `InodeKey`, with the
+/// change time and size it verified each at.
+#[map]
+pub static MODULE_TRUST: HashMap<InodeKey, ModuleTrust> =
+    HashMap::with_max_entries(MODULE_TRUST_MAX, 0);
+
+/// Lot 285: the package managers' images (`InodeKey` of each executable),
+/// written by the agent: a writer with one of them in its lineage, run as
+/// root, writes inside a package transaction.
+#[map]
+pub static MODULE_PKG_IMAGES: HashMap<InodeKey, u32> =
+    HashMap::with_max_entries(MODULE_PKG_IMAGES_MAX, 0);
+
+/// Lot 285: the write history of the module files in the running kernel's
+/// tree and of the inodes in [`MODULE_TRUST`] (`module_judge::write_flag`).
+/// An inode evicted has no history: the agent does not vouch for its
+/// writes (fail closed).
+#[map]
+pub static MODULE_WRITES: LruHashMap<InodeKey, u32> =
+    LruHashMap::with_max_entries(MODULE_WRITES_MAX, 0);
+
+/// Lot 285: bumped at every write the history records, which the agent
+/// polls to look at the tree again at once.
+#[map]
+pub static MODULE_WRITE_GEN: Array<u64> = Array::with_max_entries(1, 0);
+
+#[inline(always)]
+fn conf(slot: u32) -> u64 {
+    match MODULE_CONF.get(slot) {
+        Some(v) => *v,
+        None => 0,
+    }
+}
+
+#[inline(always)]
+unsafe fn peek_u64(src: *const u8) -> u64 {
+    let mut v = core::mem::MaybeUninit::<u64>::uninit();
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+    v.assume_init()
+}
+
+#[inline(always)]
+unsafe fn peek_u32(src: *const u8) -> u32 {
+    let mut v = core::mem::MaybeUninit::<u32>::uninit();
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+    v.assume_init()
+}
+
+#[inline(always)]
+unsafe fn peek_u16(src: *const u8) -> u16 {
+    let mut v = core::mem::MaybeUninit::<u16>::uninit();
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
+    v.assume_init()
+}
+
+/// What the judge reads of `inode`. An offset this kernel lacks leaves a
+/// value no trusted entry matches (uid `u32::MAX`, change time `i64::MIN`):
+/// fail closed — the agent never arms the deny mode then.
+#[inline(always)]
+unsafe fn facts_of(inode: *const u8) -> FileFacts {
+    let mut f = FileFacts {
+        uid: u32::MAX,
+        mode: 0,
+        ctime_sec: i64::MIN,
+        ctime_nsec: 0,
+        size: -1,
+    };
+    if inode.is_null() {
+        return f;
+    }
+    if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
+        f.uid = peek_u32(inode.add(o & 0xffff));
+    }
+    f.mode = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET) & 0xffff)));
+    f.size = peek_u64(inode.add(off!(INODE_I_SIZE_OFFSET) & 0xffff)) as i64;
+    if let (Some(a), Some(b)) = (off_opt!(INODE_I_CTIME_SEC_OFFSET), off_opt!(INODE_I_CTIME_NSEC_OFFSET)) {
+        f.ctime_sec = peek_u64(inode.add(a & 0xffff)) as i64;
+        f.ctime_nsec = peek_u32(inode.add(b & 0xffff));
+    }
+    f
+}
+
+/// The judged file of a `finit_module` load.
+struct Judged {
+    verdict: u8,
+    key: InodeKey,
+    facts: FileFacts,
+    trust_flags: u32,
+}
+
+/// Lot 285: judge the file `file` a `finit_module` reads.
+#[inline(always)]
+unsafe fn judge_file(file: *const u8) -> Judged {
+    let m = conf(conf_slot::MODE);
+    let inode = crate::open_sensor::read_ptr(file.add(off!(FILE_F_INODE_OFFSET) & 0xffff));
+    let key = crate::open_sensor::key_of(inode);
+    let facts = facts_of(inode);
+    let entry = if inode.is_null() { None } else { MODULE_TRUST.get(&key) };
+    let trust_flags = match entry {
+        Some(e) => e.flags,
+        None => 0,
+    };
+    let window = m != mode::NOT_READY && crate::inode_protect::override_active();
+    Judged {
+        verdict: finit_verdict(entry, &facts, window, m),
+        key,
+        facts,
+        trust_flags,
+    }
+}
 
 #[lsm(hook = "kernel_read_file")]
 pub fn module_read_file_observe(ctx: LsmContext) -> i32 {
@@ -98,8 +237,13 @@ unsafe fn try_read_file(ctx: &LsmContext) -> i32 {
         return 0;
     }
     let file: *const c_void = ctx.arg(0);
-    emit_module_load(MODULE_LOAD_FINIT, file);
-    0
+    let j = judge_file(file as *const u8);
+    emit_module_load(MODULE_LOAD_FINIT, file, &j);
+    if refuses(j.verdict) {
+        -EPERM
+    } else {
+        0
+    }
 }
 
 #[lsm(hook = "kernel_load_data")]
@@ -117,10 +261,22 @@ unsafe fn try_load_data(ctx: &LsmContext) -> i32 {
     if id != LOADING_MODULE {
         return 0;
     }
-    // Legacy init_module buffer load — no file, so no path. Its mere
-    // firing is the signal (legacy interface is rarely used legitimately).
-    emit_module_load(MODULE_LOAD_INIT, core::ptr::null());
-    0
+    // Legacy init_module buffer load — no file, so no path and nothing to
+    // trust: lot 285, refused outside a window in the deny mode.
+    let m = conf(conf_slot::MODE);
+    let window = m != mode::NOT_READY && crate::inode_protect::override_active();
+    let j = Judged {
+        verdict: init_verdict(window, m),
+        key: InodeKey { dev: 0, ino: 0 },
+        facts: FileFacts::default(),
+        trust_flags: 0,
+    };
+    emit_module_load(MODULE_LOAD_INIT, core::ptr::null(), &j);
+    if refuses(j.verdict) {
+        -EPERM
+    } else {
+        0
+    }
 }
 
 /// Review 82: refuse a kexec kernel image (`kexec_file_load` reads it
@@ -140,10 +296,10 @@ unsafe fn deny_kexec(id: c_int) -> i32 {
     -EPERM
 }
 
-/// Best-effort observation record. Drops silently if the ring is full
-/// (the load still proceeds — detection, not enforcement).
+/// Best-effort record of the load and its verdict. Dropped (and counted) if
+/// the ring is full: the verdict never depends on the record.
 #[inline(always)]
-unsafe fn emit_module_load(method: u8, file: *const c_void) {
+unsafe fn emit_module_load(method: u8, file: *const c_void, j: &Judged) {
     let mut entry = match MODULE_LOAD_EVENTS.reserve::<ModuleLoadRaw>(0) {
         Some(e) => e,
         None => {
@@ -159,14 +315,24 @@ unsafe fn emit_module_load(method: u8, file: *const c_void) {
     (*raw).loader_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     (*raw).loader_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
     (*raw).method = method;
+    (*raw).verdict = j.verdict;
+    (*raw).file_dev = j.key.dev;
+    (*raw).file_ino = j.key.ino;
+    (*raw).ctime_sec = j.facts.ctime_sec;
+    (*raw).ctime_nsec = j.facts.ctime_nsec;
+    (*raw).file_uid = j.facts.uid;
+    (*raw).file_mode = j.facts.mode;
+    (*raw).file_size = j.facts.size;
+    (*raw).trust_flags = j.trust_flags;
     if let Ok(comm) = bpf_get_current_comm() {
         (*raw).loader_comm = comm;
     }
     fill_parent(raw);
     if method == MODULE_LOAD_FINIT && !file.is_null() {
         // file → f_path.dentry (the source .ko's leaf dentry).
-        let dentry_slot =
-            (file as *const u8).add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) as *const *const u8;
+        let dentry_slot = (file as *const u8)
+            .add((off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) & 0xffff)
+            as *const *const u8;
         if let Ok(leaf) = bpf_probe_read_kernel::<*const u8>(dentry_slot) {
             if !leaf.is_null() {
                 let (n, truncated, top) = walk_components(leaf, (*raw).path.as_mut_ptr());
@@ -298,4 +464,147 @@ unsafe fn fill_parent(raw: *mut ModuleLoadRaw) {
             (*raw).parent_is_kthread = 1;
         }
     }
+}
+
+/// Lot 285: the write history of the module files in the running kernel's
+/// tree. Observe only (always 0). Every write-open of a file whose name is
+/// a module's ([`module_file_name`], the name's last bytes) under the tree
+/// ([`MODULE_CONF`]'s root, within [`WALK_HOPS`] ancestors), and of any
+/// inode in [`MODULE_TRUST`] whatever name opens it (a hard link), steps
+/// its history ([`write_step`]): created inside a package transaction, or
+/// not. The agent reads the history to vouch for a file changed since boot.
+#[lsm(hook = "file_open")]
+pub fn module_write_observe(ctx: LsmContext) -> i32 {
+    unsafe { try_write_open(&ctx) };
+    0
+}
+
+#[inline(always)]
+unsafe fn try_write_open(ctx: &LsmContext) {
+    let file: *const u8 = ctx.arg(0);
+    if file.is_null() {
+        return;
+    }
+    let fmode = peek_u32(file.add(off!(FILE_F_MODE_OFFSET) & 0xffff));
+    if fmode & FMODE_WRITE == 0 {
+        return;
+    }
+    if conf(conf_slot::TREE_DEV) == 0 {
+        return;
+    }
+    let inode = crate::open_sensor::read_ptr(file.add(off!(FILE_F_INODE_OFFSET) & 0xffff));
+    if inode.is_null() {
+        return;
+    }
+    let key = crate::open_sensor::key_of(inode);
+    if MODULE_TRUST.get(&key).is_none() {
+        let dentry = crate::open_sensor::read_ptr(
+            file.add((off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) & 0xffff),
+        );
+        if dentry.is_null() || !module_named(dentry) || nn_module_under_tree(dentry as u64) == 0 {
+            return;
+        }
+    }
+    let pkg = nn_module_pkg_lineage(bpf_get_current_task()) != 0;
+    let prev = MODULE_WRITES.get(&key).copied();
+    let next = write_step(prev, fmode & FMODE_CREATED != 0, pkg);
+    let _ = MODULE_WRITES.insert(&key, &next, 0);
+    if let Some(g) = MODULE_WRITE_GEN.get_ptr_mut(0) {
+        *g = (*g).wrapping_add(1);
+    }
+}
+
+/// The dentry's name ends like a module file's: its last
+/// [`NAME_TAIL`]` - 1` bytes read (with their NUL) and judged by
+/// [`module_file_name`].
+#[inline(always)]
+unsafe fn module_named(dentry: *const u8) -> bool {
+    let qstr = dentry.add(off!(DENTRY_D_NAME_OFFSET));
+    let len = peek_u32(qstr.add(off!(QSTR_LEN_OFFSET))) as usize;
+    let name = crate::open_sensor::read_ptr(qstr.add(off!(QSTR_NAME_OFFSET)));
+    if name.is_null() {
+        return false;
+    }
+    let start = if len > NAME_TAIL - 1 { (len - (NAME_TAIL - 1)) & 0xfff } else { 0 };
+    let mut tail = [0u8; NAME_TAIL];
+    if bpf_probe_read_kernel_str_bytes(name.add(start), &mut tail).is_err() {
+        return false;
+    }
+    module_file_name(&tail)
+}
+
+/// Lot 285: 1 when the directory above `dentry` (within [`WALK_HOPS`]) is
+/// the running kernel's module tree ([`MODULE_CONF`]'s root). A global
+/// function: the verifier checks its loop once.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_module_under_tree(dentry: u64) -> u64 {
+    unsafe { u64::from(under_tree(dentry as *const u8)) }
+}
+
+#[inline(always)]
+unsafe fn under_tree(leaf: *const u8) -> bool {
+    let dev = conf(conf_slot::TREE_DEV);
+    let ino = conf(conf_slot::TREE_INO);
+    if dev == 0 || leaf.is_null() {
+        return false;
+    }
+    let mut d = peek_u64(leaf.add(off!(DENTRY_D_PARENT_OFFSET))) as *const u8;
+    for _ in 0..WALK_HOPS {
+        if d.is_null() {
+            return false;
+        }
+        let k = crate::open_sensor::key_of(peek_u64(d.add(off!(DENTRY_D_INODE_OFFSET))) as *const u8);
+        if k.dev == dev && k.ino == ino {
+            return true;
+        }
+        let up = peek_u64(d.add(off!(DENTRY_D_PARENT_OFFSET))) as *const u8;
+        if up.is_null() || up == d {
+            return false;
+        }
+        d = up;
+    }
+    false
+}
+
+/// Lot 285: 1 when the current task runs as root and it, or an ancestor
+/// within [`WALK_HOPS`], runs a package manager's image
+/// ([`MODULE_PKG_IMAGES`]): a write inside a package transaction, read in
+/// the kernel at the write — no exit can race it. A global function.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_module_pkg_lineage(task: u64) -> u64 {
+    unsafe { u64::from(pkg_lineage(task as *const u8)) }
+}
+
+#[inline(always)]
+unsafe fn pkg_lineage(task: *const u8) -> bool {
+    if bpf_get_current_uid_gid() as u32 != 0 {
+        return false;
+    }
+    let mut t = task;
+    for _ in 0..WALK_HOPS {
+        if t.is_null() {
+            return false;
+        }
+        let mm = peek_u64(t.add(off!(TASK_STRUCT_MM_OFFSET))) as *const u8;
+        if !mm.is_null() {
+            let exe = peek_u64(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET))) as *const u8;
+            if !exe.is_null() {
+                let inode = peek_u64(exe.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
+                if !inode.is_null() {
+                    let k = crate::open_sensor::key_of(inode);
+                    if MODULE_PKG_IMAGES.get(&k).is_some() {
+                        return true;
+                    }
+                }
+            }
+        }
+        let up = peek_u64(t.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
+        if up.is_null() || up == t || peek_u32(up.add(off!(TASK_STRUCT_TGID_OFFSET))) <= 1 {
+            return false;
+        }
+        t = up;
+    }
+    false
 }
