@@ -493,12 +493,23 @@ mod tests {
     }
 
     /// Wait until `child` has executed `sleep` (its environment is then
-    /// the new image's), and return its start.
+    /// the new image's), and return its start. The kernel names the new
+    /// executable (`/proc/<pid>/exe`) before it places the new image's
+    /// environment (`env_start`, `env_end`): an environment read between
+    /// the two is empty (#505's CI, "not refused: Clean"). So the wait also
+    /// sees the environment, up to 500 ms (a child with none waits it out).
     fn started(child: &Child) -> u64 {
         let pid = child.id();
         for _ in 0..200 {
             let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap_or_default();
             if exe.file_name().is_some_and(|n| n == "sleep") {
+                for _ in 0..100 {
+                    let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+                    if !env.is_empty() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
                 return proc_start_ns(pid).expect("its start");
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
