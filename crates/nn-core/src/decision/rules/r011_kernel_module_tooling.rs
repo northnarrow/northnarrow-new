@@ -603,9 +603,25 @@ mod tests {
             .evaluate(&read_as(e, built(b, Ok(()), None)))
             .expect("fires");
         assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
+        // cut at the dry run itself (the word maybe cut): killed
+        let mut e = exec(
+            "/usr/sbin/modprobe",
+            "/usr/bin/kmod",
+            &["modprobe", "--set-version=6.8.0-1", "--show-depends"],
+        );
+        if let Event::ProcessSpawn { argv_truncated, .. } = &mut e {
+            *argv_truncated = true;
+        }
+        let v = rule()
+            .evaluate(&read_as(e, built(b, Ok(()), None)))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess, "{}", v.reasoning);
         // a record stays the rule's own (by module name)
         let v = rule()
-            .evaluate(&read_as(modprobe(&["overlay"]), built(b, Ok(()), None)))
+            .evaluate(&read_as(
+                modprobe(&["--show-depends", "overlay"]),
+                built(b, Ok(()), None),
+            ))
             .expect("fires");
         assert_eq!(v.action, ResponseAction::Log);
         assert!(!v.reasoning.contains("initramfs build"), "{}", v.reasoning);
