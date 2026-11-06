@@ -399,7 +399,7 @@ pub const SOURCES: [SourceContract; 16] = [
     },
     SourceContract {
         source: "fs_protect",
-        sensors: &["deny_hooks"],
+        sensors: &["deny_hooks", "sysctl_judge"],
         events: &[K::FsProtectDenial],
         attach: attach::DENY_HOOKS,
         also: &[],

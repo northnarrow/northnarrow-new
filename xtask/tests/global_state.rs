@@ -371,6 +371,24 @@ const STATICS: &[Kept] = &[
         "lot 277 (the re-review of #494, R2, and its third review): what this start does with the tracker's pins (the registered directory adopted, or a reset), decided before the one eBPF object's load and read by its attach and the pins' registration",
     ),
     kept(
+        "crates/nn-linux/src/sysctl_cgroup.rs",
+        "JUDGE",
+        Kernel,
+        "lot 280a: the cgroup/sysctl judge this boot linked to the root cgroup (the one eBPF object's program) or why not, read by the manifest's note and the BPF guard's registration",
+    ),
+    kept(
+        "crates/nn-linux/src/sysctl_cgroup.rs",
+        "LINK",
+        Kernel,
+        "lot 280a: the judge's link on the root cgroup, held open for the agent's life so the BPF guard registers it as the agent's own (a foreign handle, detach or update refused) and an unpinned link stays attached",
+    ),
+    kept(
+        "crates/nn-linux/src/sysctl_cgroup.rs",
+        "OPT_OUTS",
+        Kernel,
+        "lot 280a: the signed per-sysctl opt-outs in force, the mirror of the pinned SYSCTL_OPTOUT slots of the one eBPF object, written at the start and by `policy set`, read by the integrity round",
+    ),
+    kept(
         "crates/nn-linux/src/anti_tamper/cgroup_guard.rs",
         "REGISTERED_UNITS",
         Kernel,

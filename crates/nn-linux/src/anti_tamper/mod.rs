@@ -580,6 +580,25 @@ fn attach_reporting(
     }
     crate::cgroup_join::install(tracker);
 
+    // Lot 280a: the guarded sysctls judged on the kernel's copy of the
+    // write — cgroup/sysctl linked to the root cgroup (multi), pinned beside
+    // the pin root. Not a deny hook of the count: without it the write deny
+    // judges alone (the fallback), a signed degradation.
+    match crate::sysctl_cgroup::attach(ebpf, pin_root) {
+        crate::sysctl_cgroup::Judge::Attached { others } if !others.is_empty() => {
+            report.degraded.push(format!(
+                "sysctl judge: other cgroup/sysctl programs on the root cgroup (ids {others:?}): \
+                 attached after ours they run after it and could rewrite the value it judged \
+                 (the integrity round puts a harmful value back within 5 s)"
+            ))
+        }
+        crate::sysctl_cgroup::Judge::Attached { .. } => {}
+        crate::sysctl_cgroup::Judge::Fallback(why) => report.degraded.push(format!(
+            "sysctl judge: cgroup/sysctl not attached ({why}): {}",
+            crate::sysctl_cgroup::FALLBACK_EFFECT
+        )),
+    }
+
     // BPF self-defence (Tappa 10.8): map guard (deny) + bpf() observer.
     let bd = bpf_defense::attach(bpf_guard, ebpf, &btf, pin_root);
     for (program, why) in bd.deny_failures {
@@ -660,6 +679,23 @@ fn attach_reporting(
             );
             deny.infra_failure(
                 "filesystem::register_agent_file (tracker state)",
+                format!("{e:#}"),
+            );
+        }
+    }
+    // Lot 280a: the judge's pin directory (beside the root) and its pins
+    // alike — no unlink or rename by a foreign caller outside a window.
+    if let (Some(root), Some(crate::sysctl_cgroup::Judge::Attached { .. })) =
+        (pin_root, crate::sysctl_cgroup::judge())
+    {
+        if let Err(e) = filesystem::register_bpffs_pins(ebpf, &crate::sysctl_cgroup::pin_dir(root))
+        {
+            warn!(
+                error = format!("{e:#}"),
+                "anti-tamper FS: the sysctl judge's pins NOT registered — removable by root"
+            );
+            deny.infra_failure(
+                "filesystem::register_bpffs_pins (sysctl judge)",
                 format!("{e:#}"),
             );
         }

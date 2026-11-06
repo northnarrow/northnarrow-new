@@ -1023,6 +1023,10 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 self.attach_points.note(sensor, &note, took);
             }
         }
+        // Lot 280a: which judge of the guarded sysctls runs — cgroup/sysctl
+        // on the kernel's copy, or the write deny alone (the fallback)
+        let (note, took) = crate::sysctl_cgroup::attach_note();
+        self.attach_points.note("sysctl_judge", &note, took);
         Ok(report)
     }
 }

@@ -891,7 +891,13 @@ impl<H: DecisionHost> TriggerDetector<H> {
             ..
         } = event
         {
-            if *operation != nn_model::FsProtectOperation::CgroupJoin {
+            // Lot 280a: nor a write the signed per-sysctl opt-out let
+            // through (`SysctlOptOut`): recorded, the operator's tuning.
+            if !matches!(
+                operation,
+                nn_model::FsProtectOperation::CgroupJoin
+                    | nn_model::FsProtectOperation::SysctlOptOut
+            ) {
                 hits.push(if *pid == 1 {
                     TriggerType::RelayedTamperAttempt
                 } else if is_package_file_operation(*operation)
@@ -926,6 +932,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
                         | nn_model::FsProtectOperation::Nice
                         | nn_model::FsProtectOperation::Ioprio
                         | nn_model::FsProtectOperation::Sysctl
+                        | nn_model::FsProtectOperation::SysctlValue
                 ) {
                     // Lot 273c: a refused change of the agent's scheduling, nice
                     // value or I/O priority is an impairment (ENGAGED), not a
@@ -2906,6 +2913,30 @@ mod tests {
                 "{pid}: {hits:?}"
             );
         }
+    }
+
+    /// Lot 280a: a write the signed per-sysctl opt-out let through raises
+    /// no trigger at all (the operator's tuning, recorded); a refusal on the
+    /// kernel's copy is an impairment, as lot 273d's sysctl refusal.
+    #[test]
+    fn an_opted_out_sysctl_write_raises_nothing_and_a_refused_one_impairs() {
+        let det = TriggerDetector::new();
+        let ev = |operation| Event::FsProtectDenial {
+            pid: 9999,
+            uid: 0,
+            comm: "tuned".into(),
+            target_dev: 7,
+            target_ino: u64::MAX,
+            operation,
+            timestamp_ns: 1,
+        };
+        assert!(det
+            .detect(&ev(nn_model::FsProtectOperation::SysctlOptOut), &[])
+            .is_empty());
+        assert_eq!(
+            det.detect(&ev(nn_model::FsProtectOperation::SysctlValue), &[]),
+            vec![TriggerType::DefenseImpairment]
+        );
     }
 
     #[test]

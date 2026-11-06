@@ -2795,7 +2795,8 @@ fi
 #         EOPNOTSUPP), the manifest's degradation signed within 10 s, put
 #         back to 1 by the window's close or the round, signed;
 #   C106r a MEASURE of the declared residual of the seven sysctls judged
-#         by value (lot 280 closes it with cgroup/sysctl): the hook reads
+#         by value (lot 280a closes it with cgroup/sysctl where that judge
+#         is attached: then 0 of the writes get in): the hook reads
 #         the bytes before the kernel copies them, and a second thread flips
 #         one — kernel.sched_rt_runtime_us 950000 / 990000 (harmful at 99 %,
 #         harmless on a guest without real-time load): how many of N writes

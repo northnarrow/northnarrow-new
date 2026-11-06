@@ -326,6 +326,7 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CAT
 | `exempt <rule> cgroup <path>` | processes of that cgroup v2 path (it must end in a `.service` or `.scope`) **started there** (§2.1) |
 | `exempt <rule> unit <name>` | processes of that systemd unit (`backup.service`) **started there** (§2.1) |
 | `combat-without-corroboration NN-L-IMP-001` | the ransomware trigger reaches COMBAT without a second signal (it never locks COMBAT) |
+| `sysctl-allow <sysctl> <value>` or `sysctl-allow <sysctl> <min>..<max>` | (lot 280a) a guarded sysctl may take that value or range outside a trusted-installer window too, each such write recorded; honoured **only signed** (§2.2) |
 
 `enforce` is **refused** for a rule whose kill would not be fail-safe:
 - NN-L-NET-003, a TLS fingerprint (JA3 or JA4) in the operator's list — one
@@ -506,6 +507,48 @@ What it does not cover, as measured:
 - The same principle holds for any future exemption by container or
   workload: a process counts as the workload's when the workload's runtime
   started it there, never because its cgroup says so.
+
+### 2.2 The signed per-sysctl opt-out (lot 280a)
+
+The agent refuses, outside a trusted-installer window, a write of a guarded
+sysctl whose value aborts, starves or blinds it (`kernel.pid_max` below
+32768, `kernel.threads-max` below 8192, `vm.max_map_count` below 65530,
+`vm.overcommit_memory` 2, `vm.overcommit_ratio` below 50, a
+`vm.overcommit_kbytes` cap below 1 GiB, `kernel.sched_rt_runtime_us` -1 or
+at least 990000), and any write of `kernel.sched_rt_period_us` and
+`kernel.ftrace_enabled`; the integrity round puts such a value set at boot
+or inside a window back to a safe one (lots 273d and 280a in the trust
+model,
+https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/ANTITAMPER_TRUST_MODEL.md). Some hosts need one of them: tuned's `realtime` profile
+writes `kernel.sched_rt_runtime_us = -1`. Say so in the policy:
+
+```
+# rule-policy.local — signed by config-manage
+sysctl-allow kernel.sched_rt_runtime_us -1
+sysctl-allow kernel.pid_max 4096..32767
+```
+
+- The name is the `sysctl(8)` one of a guarded sysctl; `kernel.ftrace_enabled`
+  is refused (0 stops the BPF trampolines, the agent's deny hooks among
+  them: a window lets a write of it through). Any other name refuses the
+  file. One line per sysctl; the value a decimal integer, the range's ends
+  included and in order.
+- **Honoured only with a valid signature.** The agent writes the range to
+  the kernel only from a policy whose signature it verified for the very
+  text it applies, at its start or through `nn-admin policy set`. A policy
+  loaded unsigned through `NN_OVERLAY_ALLOW_UNSIGNED=1` keeps its other
+  lines and loses its `sysctl-allow` (a signed `rule_policy` degradation
+  says so); an edited file is refused whole, as every overlay.
+- **Every write it lets through is recorded**: NN-L-AT-001 with
+  `operation` `sysctl_opt_out`, the sysctl and the value, Low, no posture
+  change (the operator's tuning). A value in the range that is harmless
+  anyway is no record. The integrity round leaves a value in the range
+  (`sysctl_opted_out`, signed once while it holds).
+- It names a sysctl and its values, not a program: while it is in force any
+  root process may write a value in the range. Keep the range to what the
+  host needs.
+- `nn-admin policy show` lists the lines in force; the policy's summary
+  counts them (`…, 1 sysctl opt-out`).
 
 ## 3. Testing it before it is signed
 

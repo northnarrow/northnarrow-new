@@ -172,6 +172,42 @@ impl Rule for NnLAt001AntiTamperDenial {
                  max_map_count or real-time throttling), or kernel.ftrace_enabled, refused whatever \
                  it carries (0 stops the BPF trampolines, the agent's hooks among them)"
             ),
+            // Lot 280a: the cgroup/sysctl program on the root cgroup judged
+            // the kernel's copy of the write (no second thread changes it).
+            FsProtectOperation::SysctlValue => {
+                let (kind, value) = common::sysctl_judge::record_of(*target_dev, *target_ino);
+                let name = common::sysctl_judge::name_of_kind(kind).unwrap_or("a guarded sysctl");
+                let value = match value {
+                    Some(v) => format!("= {v}"),
+                    None => "with a value that is no integer the program could read".to_string(),
+                };
+                format!(
+                    "to write {name} {value} (judged on the kernel's copy of the write by the \
+                     cgroup/sysctl program on the root cgroup) — a value that aborts or starves \
+                     the agent with the host (overcommit, pid_max, threads-max, max_map_count, \
+                     real-time throttling), or a write of kernel.ftrace_enabled or \
+                     kernel.sched_rt_period_us, refused whatever it carries"
+                )
+            }
+            // Lot 280a: not refused — the signed per-sysctl opt-out let it
+            // through; every such write is recorded, none raises the posture.
+            FsProtectOperation::SysctlOptOut => {
+                let (kind, value) = common::sysctl_judge::record_of(*target_dev, *target_ino);
+                let name = common::sysctl_judge::name_of_kind(kind).unwrap_or("a guarded sysctl");
+                let value = value.map_or_else(|| "?".to_string(), |v| v.to_string());
+                let reasoning = format!(
+                    "`{comm}` wrote {name} = {value}, a value the agent refuses outside a \
+                     trusted-installer window; the signed per-rule policy's `sysctl-allow` \
+                     {name} let it through (not refused, recorded)."
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::Low,
+                    &reasoning,
+                ));
+            }
             // Lot 277: not refused — a process put in a cgroup the per-rule
             // policy exempts, by someone other than systemd: it and every
             // process it starts are never exempt by that cgroup or unit.
@@ -266,6 +302,7 @@ mod tests {
             FsProtectOperation::Ioprio,
             FsProtectOperation::CgroupJoin,
             FsProtectOperation::Sysctl,
+            FsProtectOperation::SysctlValue,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))
@@ -292,6 +329,61 @@ mod tests {
         assert!(r.contains("0x0000000000000009"), "{r}");
         assert!(r.contains("never exempt"), "{r}");
         assert!(!r.contains("the kernel refused it"), "{r}");
+    }
+
+    /// Lot 280a: a refusal on the kernel's copy names the sysctl and the
+    /// value the kernel would have stored; an opt-out's write is recorded
+    /// as let through (Low), never as a refusal.
+    #[test]
+    fn a_sysctl_judged_on_the_kernel_copy_names_its_value() {
+        use common::cgroup_limits::{SYSCTL_PID_MAX, SYSCTL_SCHED_RT_RUNTIME};
+        use common::sysctl_judge::record_dev;
+        let ev = |op, dev, ino| Event::FsProtectDenial {
+            pid: 4242,
+            uid: 0,
+            comm: "tuned".into(),
+            target_dev: dev,
+            target_ino: ino,
+            operation: op,
+            timestamp_ns: 1,
+        };
+        let r = NnLAt001AntiTamperDenial
+            .evaluate(&ev(
+                FsProtectOperation::SysctlValue,
+                record_dev(SYSCTL_PID_MAX, true),
+                16384,
+            ))
+            .unwrap()
+            .reasoning;
+        assert!(r.contains("to write kernel.pid_max = 16384"), "{r}");
+        assert!(r.contains("kernel's copy"), "{r}");
+        assert!(r.contains("the kernel refused it"), "{r}");
+        let r = NnLAt001AntiTamperDenial
+            .evaluate(&ev(
+                FsProtectOperation::SysctlValue,
+                record_dev(SYSCTL_PID_MAX, false),
+                0,
+            ))
+            .unwrap()
+            .reasoning;
+        assert!(r.contains("no integer the program could read"), "{r}");
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&ev(
+                FsProtectOperation::SysctlOptOut,
+                record_dev(SYSCTL_SCHED_RT_RUNTIME, true),
+                (-1i64) as u64,
+            ))
+            .unwrap();
+        assert_eq!(v.severity, Severity::Low);
+        assert!(matches!(v.action, ResponseAction::Log));
+        assert!(
+            v.reasoning
+                .contains("wrote kernel.sched_rt_runtime_us = -1"),
+            "{}",
+            v.reasoning
+        );
+        assert!(v.reasoning.contains("sysctl-allow"), "{}", v.reasoning);
+        assert!(!v.reasoning.contains("refused it"), "{}", v.reasoning);
     }
 
     /// External audit EBPF-015: a refused new entry names the directory as

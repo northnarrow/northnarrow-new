@@ -50,6 +50,7 @@ mod read_repeat;
 mod sensor_probe;
 mod socket_connect;
 mod stdio;
+mod sysctl_guard;
 mod task_kill;
 mod task_limits;
 mod tcp_close;

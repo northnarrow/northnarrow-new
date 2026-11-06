@@ -407,6 +407,8 @@ fn load_one(prog: &mut Program, section: &str, btf: &Btf) -> Outcome {
         Program::UProbe(p) => p.load(),
         Program::TracePoint(p) => p.load(),
         Program::RawTracePoint(p) => p.load(),
+        // Lot 280a: the sysctl judge (cgroup/sysctl on the root cgroup)
+        Program::CgroupSysctl(p) => p.load(),
         other => {
             return Outcome::Error(format!(
                 "program type {:?} is not one the agent loads",

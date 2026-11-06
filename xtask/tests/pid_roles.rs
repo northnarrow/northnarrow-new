@@ -74,6 +74,9 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
         // lot 277: the writer of a move, the forker of a start — callers
         // (the agent's family moves into its own containment cgroups)
         ("cgroup_join.rs", 0, 1),
+        // lot 280a: the writer of a guarded sysctl — a caller (the agent's
+        // own restore passes as the family)
+        ("sysctl_guard.rs", 0, 1),
     ] {
         let code = strip_comments(&fs::read_to_string(dir.join(file)).unwrap());
         assert_eq!(
@@ -99,6 +102,7 @@ fn every_kernel_lookup_of_protected_pids_goes_through_the_roles() {
             "cgroup_files.rs",
             "task_limits.rs",
             "cgroup_join.rs",
+            "sysctl_guard.rs",
         ]
         .contains(&name.as_str())
         {

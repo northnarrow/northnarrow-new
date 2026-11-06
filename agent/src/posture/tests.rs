@@ -1581,6 +1581,8 @@ fn a_refused_priority_change_engages_and_a_refused_rlimit_is_decisive() {
         nn_model::FsProtectOperation::Ioprio,
         // lot 273d: a refused sysctl too (an operator's tuning meets it)
         nn_model::FsProtectOperation::Sysctl,
+        // lot 280a: and one refused on the kernel's copy
+        nn_model::FsProtectOperation::SysctlValue,
     ] {
         let m = PostureMachine::new();
         let mut e = super::triggers::testutil::fs_protect_denial(7, 1);

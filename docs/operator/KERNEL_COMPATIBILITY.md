@@ -892,6 +892,17 @@ On 6.18+ with cgroup2's `favordynmods` (a remount by root; not systemd's
 default) a move no longer waits for a fork: see the trust model's
 residuals.
 
+**The sysctl judge (lot 280a)** is a `cgroup/sysctl` program (5.2+) linked
+to the root cgroup with `BPF_LINK_CREATE` (cgroup links: 5.7+), which needs
+a cgroup v2 mount of the hierarchy's root (`/sys/fs/cgroup` on a unified
+host, `/sys/fs/cgroup/unified` on a hybrid one; inode 1). Its helpers on
+5.15 include neither `bpf_get_current_pid_tgid` nor `bpf_get_current_comm`
+(`bpftool feature probe`, Ubuntu 22.04's 5.15.0-202: they came to this
+program type in 6.1): the writer's tgid and comm are read from its task
+(`bpf_get_current_task`, `bpf_probe_read_kernel`, both there). Without the
+mount, or where the kernel refuses the program or the root's mode, the
+agent starts with lot 273d's write deny alone, a signed degradation.
+
 ## Adding a distro to the lab
 
 `NN_LAB_DISTRO=<name> deploy/lab/nn-lab.sh up` boots a separate guest

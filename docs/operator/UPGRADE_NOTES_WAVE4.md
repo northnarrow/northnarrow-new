@@ -507,15 +507,19 @@ others. What an operator sees change:
   `kernel.sched_rt_runtime_us = -1` (real-time throttling off), which the
   agent treats as harmful: outside a window the write is refused, and a
   value set at boot or inside a window is put back (to 95 % of the period)
-  at the window's close and at every integrity round. With this release
-  that profile cannot hold, not even inside a window. A signed opt-out per
-  sysctl is planned (lot 280); until then, a real-time host keeps the
-  kernel's default ratio.
+  at the window's close and at every integrity round. With lot 273d alone
+  that profile cannot hold, not even inside a window. Since lot 280a a
+  signed opt-out per sysctl lets it: `sysctl-allow
+  kernel.sched_rt_runtime_us -1` in the signed per-rule policy
+  (`RULE_POLICY.md` §2.2), honoured only with a valid signature, every
+  write it lets through recorded.
 - **`kernel.ftrace_enabled` and `kernel.sched_rt_period_us`** are refused
   outside a window whatever the write carries: a tool that writes them,
   even the value they hold, needs a window.
 - **A value written in another base than 10** (`040000`, `0x10000`) is
-  refused outside a window: write the decimal value.
+  refused outside a window: write the decimal value. (Lot 280a: the
+  kernel's copy is judged in base 0, as the kernel reads it; the write
+  deny before it still refuses such a spelling unread.)
 - **The hook and the round judge the RT runtime differently.** Outside a
   window the write deny refuses a runtime of -1 or of at least 990000 µs —
   99 % of the default 1 s period: it cannot read the period, whose every
@@ -591,3 +595,25 @@ others. What an operator sees change:
     agent's integrity round leaves such a drop-in from before the install
     in place and reports it, signed (`own_dropin_preinstall_harmful`):
     remove it, or move it out inside a trusted-installer window.
+
+## 10. The sysctl judge on the root cgroup (lot 280a)
+
+- The agent links a `cgroup/sysctl` program to the root cgroup: a write of a
+  guarded sysctl is judged on the kernel's copy of the write, after the
+  write deny judged its bytes (a second thread can no longer change them in
+  between). Its program and link are pinned in
+  `/sys/fs/bpf/northnarrow-sysctl`, beside the pin root and protected like
+  it: they outlive an agent stop and `install.sh --upgrade` (marked `kept`
+  in `/run/northnarrow/bpf-own-ids`, not waited for), and the new agent
+  swaps them for its own. `uninstall.sh` removes them.
+- `bpftool cgroup show /sys/fs/cgroup` lists it (`sysctl`, `multi`,
+  `nn_sysctl_guard`). Another `cgroup/sysctl` program on the root cgroup
+  is named at the start, in a signed degradation (attached after ours it
+  runs after it).
+- A host without a cgroup v2 mount of the hierarchy's root (cgroup v1 only)
+  keeps lot 273d's write deny alone: a signed `anti_tamper` degradation,
+  and the manifest's `sysctl_judge` attach point names the fallback.
+- **A downgrade below lot 280a** with `install.sh --upgrade` of the older
+  release leaves the judge linked (that release does not know its
+  directory) until the next boot: run `uninstall.sh` first, or remove
+  `/sys/fs/bpf/northnarrow-sysctl` inside a trusted-installer window.

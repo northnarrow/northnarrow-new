@@ -616,7 +616,8 @@ impl TrustedInstallerOverride {
 /// Lot 273d (R1): the guarded sysctls judged at a window's close, the
 /// harmful ones put back (`sysctl_guard::check`); each one put back, or
 /// not, a line `<kind>: <detail>` of the signed close record (strict
-/// overcommit, the operator's, is the round's finding only).
+/// overcommit and, lot 280a, a value the signed opt-out allows — the
+/// operator's — are the round's findings only).
 fn sysctls_at_close() -> Vec<String> {
     crate::sysctl_guard::check(
         std::path::Path::new("/"),
@@ -624,7 +625,7 @@ fn sysctls_at_close() -> Vec<String> {
         true,
     )
     .into_iter()
-    .filter(|s| s.kind != "sysctl_strict")
+    .filter(|s| s.kind != "sysctl_strict" && s.kind != "sysctl_opted_out")
     .map(|s| format!("{}: {}", s.kind, s.detail))
     .collect()
 }

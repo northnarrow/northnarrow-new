@@ -23,19 +23,19 @@
 
 use aya_ebpf::{
     cty::c_void,
-    helpers::{bpf_get_current_pid_tgid, bpf_probe_read_kernel, generated},
+    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel, generated},
     macros::map,
     maps::{Array, HashMap},
 };
 use northnarrow_common::cgroup_limits::{
     default_value, init_write_lets_through, limit_kind, regs_are_the_writes, special_fs,
-    strip_newline, sysctl_kind, sysctl_write_refused, word_mask, LimitValue, SpecialFs,
-    LIMIT_NAME_MAX, LIMIT_NONE,
+    strip_newline, sysctl_kind, word_mask, LimitValue, SpecialFs, LIMIT_NAME_MAX, LIMIT_NONE,
     LIMIT_TEXT_MAX, SYSCTL_NONE,
 };
+use northnarrow_common::sysctl_judge::{record_dev, sysctl_write_verdict, SysctlVerdict};
 use northnarrow_common::wire::{
     InodeKey, CGROUP_POLICY_V1_REFUSE, FS_OP_CGROUP_LIMIT, FS_OP_CGROUP_V1, FS_OP_OOM_ADJ,
-    FS_OP_SYSCTL, FS_PROTECT_LIMIT_DIR,
+    FS_OP_SYSCTL, FS_OP_SYSCTL_OPT_OUT, FS_PROTECT_LIMIT_DIR,
 };
 
 use crate::btf_offsets::{
@@ -479,7 +479,11 @@ unsafe fn refuse_v1(inode: *const c_void, hook: u32, phase: Phase) -> bool {
 /// unread write is refused. The open is let through (judged at the
 /// write); a value that harms nothing (a raised limit, overcommit 0 or 1)
 /// goes through: the operator's tuning stays possible, every tuning inside
-/// a window.
+/// a window. Lot 280a: and a value the signed per-sysctl opt-out allows
+/// (`crate::sysctl_guard::SYSCTL_OPTOUT`, `sysctl_write_verdict`); what
+/// this lets through is judged again on the kernel's copy by
+/// `crate::sysctl_guard` where that program is attached (a second thread
+/// may have changed the bytes read here).
 #[inline(always)]
 unsafe fn refuse_sysctl(file: *const c_void, inode: *const c_void, hook: u32, phase: Phase) -> bool {
     if phase == Phase::Open {
@@ -498,9 +502,36 @@ unsafe fn refuse_sysctl(file: *const c_void, inode: *const c_void, hook: u32, ph
     let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
     // the shared verdict: the caller's identity first (the agent's own
     // restore, a window), then `ftrace_enabled` refused unread, the
-    // others by the bytes the write carries
-    if !sysctl_write_refused(kind, caller_may(caller), || written_value()) {
-        return false;
+    // others by the bytes the write carries — lot 280a: and the signed
+    // opt-out's range let through (the RT period's bytes read only when a
+    // range names it)
+    let (verdict, v) = sysctl_write_verdict(
+        kind,
+        caller_may(caller),
+        crate::sysctl_guard::opt_out(kind),
+        || written_value(),
+    );
+    match verdict {
+        SysctlVerdict::Allow => return false,
+        // the opt-out's write recorded once: by the cgroup/sysctl program,
+        // on the kernel's copy, when this boot attached it; else here (an
+        // opted-out write is one whose value was read)
+        SysctlVerdict::OptedOut => {
+            if !crate::sysctl_guard::kernel_judge_attached() {
+                crate::inode_protect::emit_sysctl_record(
+                    FS_OP_SYSCTL_OPT_OUT,
+                    InodeKey {
+                        dev: record_dev(kind, true),
+                        ino: v as u64,
+                    },
+                    caller,
+                    bpf_get_current_comm().unwrap_or([0u8; 16]),
+                    false,
+                );
+            }
+            return false;
+        }
+        SysctlVerdict::Refuse => {}
     }
     let Some(key) = crate::inode_protect::read_inode_key(inode) else {
         crate::fail_open::bump(hook);

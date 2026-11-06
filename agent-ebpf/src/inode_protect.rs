@@ -62,7 +62,7 @@ use northnarrow_common::wire::{
     fs_protect_thaw_value, FsGrant, FsProtectDenialRaw,
     InodeKey, FS_OP_CREATE, FS_OP_IOCTL,
     FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
-    FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR, READ_PROTECTED_SLOTS,
+    FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR, READ_PROTECTED_SLOTS, TASK_COMM_LEN,
 };
 
 use crate::btf_offsets::{
@@ -319,6 +319,73 @@ pub(crate) fn emit_limited(operation: u8, key: InodeKey) {
         (*rate)[1] += 1;
     }
     emit_denial(operation, key);
+}
+
+/// Lot 280a: a record of the `cgroup/sysctl` program (`crate::
+/// sysctl_guard`), on the denials' ring — whose 5.15 helpers include
+/// neither `bpf_get_current_pid_tgid` nor `bpf_get_current_comm`: the
+/// writer's `tgid` and `comm` are read from its task by the caller. A
+/// refusal (`limited`) goes behind the per-caller dedup of
+/// [`emit_limited`]; an opt-out's write behind the per-CPU budget only —
+/// each one is recorded, a flood is counted as a ring drop.
+#[inline(always)]
+pub(crate) fn emit_sysctl_record(
+    operation: u8,
+    key: InodeKey,
+    tgid: u32,
+    comm: [u8; TASK_COMM_LEN],
+    limited: bool,
+) {
+    let now = unsafe { bpf_ktime_get_ns() };
+    if limited {
+        let seen = ((tgid as u64) << 8) | operation as u64;
+        match TASK_DENIAL_SEEN.get_ptr_mut(&seen) {
+            Some(last) => unsafe {
+                if now.wrapping_sub(*last) < TASK_DENIAL_DEDUP_NS {
+                    return;
+                }
+                *last = now;
+            },
+            None => {
+                let _ = TASK_DENIAL_SEEN.insert(&seen, &now, 0);
+            }
+        }
+    }
+    let Some(rate) = TASK_DENIAL_RATE.get_ptr_mut(0) else {
+        return;
+    };
+    unsafe {
+        // SAFETY: this CPU's slot, owned by the program while it runs.
+        if now.wrapping_sub((*rate)[0]) >= TASK_DENIAL_WINDOW_NS {
+            (*rate)[0] = now;
+            (*rate)[1] = 0;
+        }
+        if (*rate)[1] >= TASK_DENIAL_PER_SEC {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::TASK_DENIAL_RATE);
+            return;
+        }
+        (*rate)[1] += 1;
+    }
+    let mut entry = match FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0) {
+        Some(e) => e,
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FS_PROTECT);
+            return;
+        }
+    };
+    let raw_ptr: *mut FsProtectDenialRaw = entry.as_mut_ptr();
+    unsafe {
+        // SAFETY: the reservation is exclusive and sized for the record.
+        crate::zero::zero(raw_ptr);
+        (*raw_ptr).timestamp_ns = now;
+        (*raw_ptr).attacker_pid = tgid;
+        (*raw_ptr).attacker_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+        (*raw_ptr).target_dev = key.dev;
+        (*raw_ptr).target_ino = key.ino;
+        (*raw_ptr).operation = operation;
+        (*raw_ptr).attacker_comm = comm;
+    }
+    entry.submit(0);
 }
 
 /// Best-effort audit record. Silently drops if the ringbuffer is

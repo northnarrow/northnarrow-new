@@ -1129,6 +1129,22 @@ pub const FS_OP_CGROUP_JOIN: u8 = 29;
 /// file's inode).
 pub const FS_OP_SYSCTL: u8 = 30;
 
+/// Lot 280a: a write of a guarded sysctl refused by the `cgroup/sysctl`
+/// program on the root cgroup, judged on the kernel's copy of the write
+/// (`crate::sysctl_judge`) — after lot 273d's write deny let its bytes
+/// through (a second thread changed them, or they are harmless only as
+/// that deny reads them) or where that deny is not armed. `target_dev` =
+/// the sysctl's kind (`crate::sysctl_judge::record_dev`: with
+/// `SYSCTL_RECORD_UNREAD` when the value was no integer), `target_ino` =
+/// the value (`i64`).
+pub const FS_OP_SYSCTL_VALUE: u8 = 31;
+
+/// Lot 280a: NOT a refusal — a write of a guarded sysctl the signed
+/// per-sysctl opt-out alone let through (the per-rule policy's
+/// `sysctl-allow`): recorded, every one. `target_dev` = the kind,
+/// `target_ino` = the value, as [`FS_OP_SYSCTL_VALUE`].
+pub const FS_OP_SYSCTL_OPT_OUT: u8 = 32;
+
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
 /// each registered inode, so the WRITE-open deny can cover a secret/integrity
@@ -2048,7 +2064,7 @@ mod tests {
         }
         // Lot 273: the new bits mark, they never require (no operation is
         // refused for carrying one).
-        for op in 1..=FS_OP_SYSCTL {
+        for op in 1..=FS_OP_SYSCTL_OPT_OUT {
             let r = fs_protect_required(op);
             assert_eq!(
                 r & (FS_PROTECT_INIT_RMDIR
@@ -2071,7 +2087,7 @@ mod tests {
         for caller in [0, 2, 1000, u32::MAX] {
             assert!(!fs_protect_init_may(FS_OP_RMDIR, dir, caller), "{caller}");
         }
-        for op in 1..=FS_OP_SYSCTL {
+        for op in 1..=FS_OP_SYSCTL_OPT_OUT {
             if op != FS_OP_RMDIR && op != FS_OP_XATTR {
                 assert!(!fs_protect_init_may(op, dir, 1), "op {op}");
             }
@@ -2159,6 +2175,8 @@ mod tests {
             FS_OP_IOPRIO,
             FS_OP_CGROUP_JOIN,
             FS_OP_SYSCTL,
+            FS_OP_SYSCTL_VALUE,
+            FS_OP_SYSCTL_OPT_OUT,
         ];
         for (i, a) in ops.iter().enumerate() {
             assert_ne!(*a, 0);

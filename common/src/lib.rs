@@ -49,6 +49,7 @@ pub mod epg;
 pub mod fail_open;
 /// Ring-buffer drop slots shared by eBPF producers and the agent.
 pub mod ring_drops;
+pub mod sysctl_judge;
 
 // Wave 4 restructure, R03 (lab PR 240): the admin protocol
 // (`wire::admin_protocol`), the signed payloads
