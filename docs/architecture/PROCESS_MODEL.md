@@ -336,7 +336,8 @@ which start inside the loader's window, and every other thread the core
 starts — the copy-on-first-write guard's and its restore (review of #482,
 R14c-4: `nn-cow-restore` is started by a response worker, and kept that
 role's set: no `CAP_CHOWN`, no `CAP_FOWNER` for the files it puts back),
-the exec guards, the slow-work and lineage-sweep threads.
+the exec guards, the slow-work and lineage-sweep threads, the stop's
+deadline and its note (`nn-stop-deadline`, `nn-stop-note`, lot 288).
 `xtask/tests/thread_roles.rs` holds every production thread of the core to
 a role or `restore_core` in its first lines, or to a listed reason. A
 thread that cannot take the core's set back — its sets unreadable or

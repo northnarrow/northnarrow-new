@@ -141,6 +141,9 @@ Restart=no
 # within TimeoutStopSec with the process still running, which ends with
 # systemd-shutdown's final SIGTERM (allowed). SendSIGKILL=no: with a
 # process left in the cgroup systemd refuses to start a second instance.
+# Lot 288 (#125): the agent's own stop ends within 4 s of its loop's end
+# (agent/src/stop_deadline.rs, whose test reads this value): what blocks
+# past it is cut, signed, and the agent exits with status 75.
 TimeoutStopSec=5s
 SendSIGKILL=no
 # Lab PR 216 (static review C-43): READY=1 comes once every subsystem is

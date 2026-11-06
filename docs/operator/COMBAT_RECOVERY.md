@@ -350,6 +350,36 @@ So after a crash + restart the host comes back on the network on its own.
 > nn-admin force-posture combat --key /path/to/admin.key
 > ```
 
+### A stop in COMBAT (lot 288, #125)
+
+A stop — `systemctl stop` or `restart` inside a signed trusted-installer
+window, the signed admin shutdown, a sensor pump that ended — never touches
+the isolation: the stop runs no `iptables`, and the `NORTHNARROW_COMBAT`
+chain stays as the run left it. The next start finds it and tears it down
+as above (signed `combat_reconcile`); until then the host stays isolated.
+An agent that dies in COMBAT leaves the host isolated the same way.
+
+The stop ends in bounded time, in COMBAT or not. From the end of the event
+loop it has 4 s: the unit's `TimeoutStopSec=5s` less a second (with
+`SendSIGKILL=no`, systemd leaves a process that outlives it in the unit,
+fails the stop job, and a `restart` does not start the new agent). Each
+stage that waits — the queued responses, the canary trips, the export's
+thread, the runtime's blocking tasks — gets at most what is left of the 4 s;
+a stage that blocks anyway (a decision thread that does not come back, a
+lock held, a drop that waits) is cut by the stop's deadline:
+
+- at 3.25 s the agent writes, if the audit log is free within 250 ms, a
+  signed `subsystem_degraded` row (`"source":"stop_deadline"`) that names
+  the stage, the time and whether the run leaves the host isolated, and
+  the run's `agent_stop` (its reason) when the stop had not signed it yet;
+- then it exits with status 75 (`EX_TEMPFAIL`; systemd logs
+  `status=75/TEMPFAIL`), at 4 s at the latest whatever the note does.
+
+A stop cut this way: `sudo grep '"source":"stop_deadline"'
+/etc/northnarrow/audit.log`. Without the row (the audit log was held by the
+stage that blocked), the next start reports the run as ended without
+`agent_stop`, as for a crash.
+
 ### A second isolation, before CMB-006
 
 Agents before external audit CMB-006 could also isolate the host outside

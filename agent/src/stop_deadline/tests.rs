@@ -93,6 +93,8 @@ fn a_deadline_never_begun_never_exits() {
 fn a_blocked_stage_is_noted_then_cut_within_the_budget() {
     let (exits, exit) = recorder();
     let stop = StopDeadline::start_with(SHORT, exit);
+    // the deadline's thread waits for the stop, as from the agent's start
+    std::thread::sleep(Duration::from_millis(50));
     let (notes, note) = noted();
     let at = Instant::now();
     stop.begin("sigterm", note);
