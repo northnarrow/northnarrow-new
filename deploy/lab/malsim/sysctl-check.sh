@@ -46,7 +46,7 @@ N=${N:-2000}
 fail=0
 pass() { printf 'PASS  %s\n' "$*"; }
 bad() { printf 'FAIL  %s\n' "$*"; fail=1; }
-lines() { sudo wc -l < "$1" 2>/dev/null || echo 0; }
+lines() { sudo sh -c 'wc -l < "$1"' _ "$1" 2>/dev/null || echo 0; }
 since() { sudo tail -n +"$(( $2 + 1 ))" "$1" 2>/dev/null; }
 ops() { since "$DET" "$1" | grep -o '"operation":"[a-z_]*"' | sort | uniq -c | tr -s ' ' | tr '\n' ';'; }
 judge_ids() { sudo bpftool cgroup show "$CG" 2>/dev/null | awk '/nn_sysctl_guard/ {print $1}' | tr '\n' ' '; }
@@ -106,7 +106,17 @@ echo "== S1. the judge on the root cgroup"
 sudo bpftool cgroup show "$CG" 2>&1 | sed 's/^/    /'
 row=$(sudo bpftool cgroup show "$CG" 2>/dev/null | grep nn_sysctl_guard)
 pins=$(sudo ls "$PINS" 2>/dev/null | tr '\n' ' ')
-note=$(sudo "$NNADMIN" capabilities --key "$KEY" 2>/dev/null | grep -i "sysctl_judge" | head -2 | tr -s ' ' | tr '\n' ';')
+note=$(sudo "$NNADMIN" capabilities --key "$KEY" --json 2>/dev/null | python3 -I -c '
+import json, sys
+def walk(o):
+    if isinstance(o, dict):
+        if o.get("sensor") == "sysctl_judge":
+            print(o.get("attach"), o.get("took", ""))
+        for v in o.values(): walk(v)
+    elif isinstance(o, list):
+        for v in o: walk(v)
+try: walk(json.load(sys.stdin))
+except ValueError: pass' | head -1)
 echo "    pins: $pins; manifest: $note"
 if [[ $row == *sysctl*multi* && $pins == *link_nn_sysctl_guard* && $pins == *prog_nn_sysctl_guard* ]]; then
     pass "S1 nn_sysctl_guard on the root cgroup, sysctl multi; pinned in $PINS"
@@ -175,9 +185,10 @@ if [[ -x $P ]]; then
     c=$(sudo "$P" "$CG/nn280a-probe" none kernel/printk_ratelimit "$PR0" 300); echo "    control: $c"
     [[ $c == *"errno=0; now 300"* ]] && pass "S5 control: the child's program runs and rewrites an unguarded sysctl ($c)" || bad "S5 control: $c"
     echo "$PR0" | sudo tee "$PR" >/dev/null
+    # (4096: above the kernel's own minimum of 301, below the floor)
     for mode in none override multi; do
-        c=$(sudo "$P" "$CG/nn280a-probe" "$mode" kernel/pid_max "$(cat "$PM")" 300); echo "    $c"
-        [[ $c == *"errno=EPERM; now $PM0;"* ]] && pass "S5 child program ($mode): the rewritten 300 refused on the kernel's copy" || bad "S5 $mode: $c"
+        c=$(sudo "$P" "$CG/nn280a-probe" "$mode" kernel/pid_max "$(cat "$PM")" 4096); echo "    $c"
+        [[ $c == *"errno=EPERM; now $PM0;"* ]] && pass "S5 child program ($mode): the rewritten 4096 refused on the kernel's copy" || bad "S5 $mode: $c"
     done
     sudo rmdir "$CG/nn280a-probe"; sudo rm -f "$P"
 else bad "S5 the probe was not built"; fi

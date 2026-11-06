@@ -28,9 +28,9 @@ use aya_ebpf::{
     maps::{Array, HashMap},
 };
 use northnarrow_common::cgroup_limits::{
-    default_value, init_write_lets_through, limit_kind, parse_i64, regs_are_the_writes,
-    special_fs, strip_newline, sysctl_kind, word_mask, LimitValue, SpecialFs, LIMIT_NAME_MAX,
-    LIMIT_NONE, LIMIT_TEXT_MAX, SYSCTL_NONE,
+    default_value, init_write_lets_through, limit_kind, regs_are_the_writes, special_fs,
+    strip_newline, sysctl_kind, word_mask, LimitValue, SpecialFs, LIMIT_NAME_MAX, LIMIT_NONE,
+    LIMIT_TEXT_MAX, SYSCTL_NONE,
 };
 use northnarrow_common::sysctl_judge::{record_dev, sysctl_write_verdict, SysctlVerdict};
 use northnarrow_common::wire::{
@@ -505,35 +505,29 @@ unsafe fn refuse_sysctl(file: *const c_void, inode: *const c_void, hook: u32, ph
     // others by the bytes the write carries — lot 280a: and the signed
     // opt-out's range let through (the RT period's bytes read only when a
     // range names it)
-    let mut read: Option<i64> = None;
-    let verdict = sysctl_write_verdict(
+    let (verdict, v) = sysctl_write_verdict(
         kind,
         caller_may(caller),
         crate::sysctl_guard::opt_out(kind),
-        || {
-            let w = written_value();
-            read = w.as_ref().and_then(parse_i64);
-            w
-        },
+        || written_value(),
     );
     match verdict {
         SysctlVerdict::Allow => return false,
         // the opt-out's write recorded once: by the cgroup/sysctl program,
-        // on the kernel's copy, when this boot attached it; else here
+        // on the kernel's copy, when this boot attached it; else here (an
+        // opted-out write is one whose value was read)
         SysctlVerdict::OptedOut => {
             if !crate::sysctl_guard::kernel_judge_attached() {
-                if let Some(v) = read {
-                    crate::inode_protect::emit_sysctl_record(
-                        FS_OP_SYSCTL_OPT_OUT,
-                        InodeKey {
-                            dev: record_dev(kind, true),
-                            ino: v as u64,
-                        },
-                        caller,
-                        bpf_get_current_comm().unwrap_or([0u8; 16]),
-                        false,
-                    );
-                }
+                crate::inode_protect::emit_sysctl_record(
+                    FS_OP_SYSCTL_OPT_OUT,
+                    InodeKey {
+                        dev: record_dev(kind, true),
+                        ino: v as u64,
+                    },
+                    caller,
+                    bpf_get_current_comm().unwrap_or([0u8; 16]),
+                    false,
+                );
             }
             return false;
         }

@@ -68,12 +68,16 @@ fn a_race_thread_is_judged_on_the_kernel_copy() {
     in_order(
         body(&g, "new_value"),
         &[
-            "generated::bpf_sysctl_get_new_value(ctx.sysctl, p, VALUE_BUF as u64) < 0 {\n        return None;\n    }",
-            "generated::bpf_strtol(p, VALUE_BUF as u64, BASE_0, &mut res) < 0 {\n        return None;\n    }",
-            "Some(res as i64)",
+            "generated::bpf_sysctl_get_new_value(ctx.sysctl, p, VALUE_BUF as u64) < 0 {\n        return (false, 0);\n    }",
+            "generated::bpf_strtol(p, VALUE_BUF as u64, BASE_0, &mut res) < 0 {\n        return (false, 0);\n    }",
+            "(true, res as i64)",
         ],
     )
     .unwrap();
+    // no `Option` of a value or a range in the program (lot 280a's first
+    // lab round: an undefined `None` payload read, `R2 !read_ok`)
+    assert!(!g.contains("Option<i64>") && !g.contains("Option<(i64, i64)>"));
+    assert!(!g.contains("sysctl_kernel_verdict") && !g.contains(".live("));
     assert!(g.contains("const BASE_0: u64 = 0;"));
     assert!(g.contains("const VALUE_BUF: usize = 64;"));
     assert_eq!(g.matches("new_value(ctx)").count(), 1);
@@ -88,10 +92,10 @@ fn a_race_thread_is_judged_on_the_kernel_copy() {
             "off!(TASK_STRUCT_TGID_OFFSET)",
             "let caller_may = (tgid != 0 && crate::task_kill::is_exempt_pid(tgid))\n        || crate::inode_protect::override_active();",
             "if caller_may {\n        return SysctlVerdict::Allow;\n    }",
-            "let value = new_value(ctx);",
-            "let verdict = sysctl_kernel_verdict(kind, false, value, opt_out(kind));",
-            "SysctlVerdict::Refuse => record(FS_OP_SYSCTL_VALUE, kind, value, task, tgid, true),",
-            "SysctlVerdict::OptedOut => record(FS_OP_SYSCTL_OPT_OUT, kind, value, task, tgid, false),",
+            "let (read, v) = new_value(ctx);",
+            "let verdict = verdict_of(kind, false, read, v, opt_out(kind));",
+            "SysctlVerdict::Refuse => record(FS_OP_SYSCTL_VALUE, kind, read, v, task, tgid, true),",
+            "SysctlVerdict::OptedOut => record(FS_OP_SYSCTL_OPT_OUT, kind, read, v, task, tgid, false),",
             "verdict",
         ],
     )
@@ -123,7 +127,7 @@ fn a_race_thread_is_judged_on_the_kernel_copy() {
         &[
             "crate::task_kill::AGENT_SESSION.get(0)",
             "SYSCTL_OPTOUT.get(kind as u32)",
-            "Some(slot) => slot.live(session),",
+            "Some(slot) => slot.range(session),",
         ],
     )
     .unwrap();
@@ -140,8 +144,8 @@ fn a_race_thread_is_judged_on_the_kernel_copy() {
         &[
             "off!(TASK_STRUCT_COMM_OFFSET)",
             "crate::inode_protect::emit_sysctl_record(",
-            "dev: record_dev(kind, value.is_some()),",
-            "ino: value.unwrap_or(0) as u64,",
+            "dev: record_dev(kind, read),",
+            "ino: v as u64,",
             "limited,",
         ],
     )
@@ -175,11 +179,10 @@ fn the_write_deny_honours_the_opt_out_and_records_it_once() {
         body(&c, "refuse_sysctl"),
         &[
             "let kind = sysctl_kind(len, words);",
-            "let verdict = sysctl_write_verdict(",
+            "let (verdict, v) = sysctl_write_verdict(",
             "caller_may(caller),",
             "crate::sysctl_guard::opt_out(kind),",
-            "let w = written_value();",
-            "read = w.as_ref().and_then(parse_i64);",
+            "|| written_value(),",
             "SysctlVerdict::Allow => return false,",
             "SysctlVerdict::OptedOut => {",
             "if !crate::sysctl_guard::kernel_judge_attached() {",

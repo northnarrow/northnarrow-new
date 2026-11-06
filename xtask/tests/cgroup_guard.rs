@@ -189,8 +189,8 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
             // R1: the shared verdict, the caller's identity passed in (the
             // agent's own restore), the bytes read only through it — lot
             // 280a: with the signed opt-out (xtask/tests/sysctl_cgroup.rs)
-            "let verdict = sysctl_write_verdict(\n        kind,\n        caller_may(caller),",
-            "|| {\n            let w = written_value();",
+            "let (verdict, v) = sysctl_write_verdict(\n        kind,\n        caller_may(caller),",
+            "|| written_value(),",
             "SysctlVerdict::Allow => return false,",
             "SysctlVerdict::Refuse => {}",
             "sign(phase, FS_OP_SYSCTL, key);",

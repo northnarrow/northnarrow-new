@@ -173,6 +173,50 @@ impl SysctlOptOut {
             None
         }
     }
+
+    /// [`Self::live`] as the programs carry it ([`Range`]).
+    #[inline(always)]
+    pub const fn range(&self, session: u32) -> Range {
+        if self.armed != 0 && self.session == session {
+            Range {
+                on: true,
+                min: self.min,
+                max: self.max,
+            }
+        } else {
+            Range::NONE
+        }
+    }
+}
+
+/// An opt-out's range as the eBPF programs carry it: every field written,
+/// no `Option` — LLVM leaves a `None`'s payload undefined, may read it on a
+/// path whose result it then drops, and the verifier refuses a read of a
+/// register never written (lot 280a's first lab round on 6.8: `R2
+/// !read_ok` in the opt-out's test). The same holds for the value read:
+/// [`verdict_of`] takes it as `(read, v)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Range {
+    pub on: bool,
+    pub min: i64,
+    pub max: i64,
+}
+
+impl Range {
+    /// No opt-out.
+    pub const NONE: Range = Range {
+        on: false,
+        min: 0,
+        max: 0,
+    };
+
+    /// The range of an `Option` (userland and tests).
+    pub const fn of(o: Option<(i64, i64)>) -> Range {
+        match o {
+            Some((min, max)) => Range { on: true, min, max },
+            None => Range::NONE,
+        }
+    }
 }
 
 /// What a write of a guarded sysctl gets.
@@ -201,76 +245,95 @@ pub const fn opt_out_allowed(kind: u8) -> Result<(), &'static str> {
     }
 }
 
-/// The verdict on `value`, the integer the kernel will store in the sysctl
-/// of `kind` (`None`: not read, not an integer, past 63 characters or
-/// past `i64`), outside the agent's family and a window: refused when it
-/// is not known, when it is harmful (`sysctl_value_harmful`) and when the
-/// sysctl's every write is refused (`sysctl_refuses_every_write`) — unless
-/// `optout` (the signed range in force) holds it, then let through and
-/// recorded. A harmless value in the range is plain `Allow`.
+/// The verdict on `v`, the integer the kernel will store in the sysctl of
+/// `kind` (`read` false: not read, not an integer, past 63 characters or
+/// past `i64` — `v` is then 0 and not looked at), the agent's family and a
+/// window passing first (`caller_may`: the identity every guarded write is
+/// let through by, the round's own restore among them; `SYSCTL_NONE`: not
+/// a guarded sysctl, let through): refused when it is not known, when it is
+/// harmful (`sysctl_value_harmful`) and when the sysctl's every write is
+/// refused (`sysctl_refuses_every_write`) — unless `opt` (the signed range
+/// in force) holds it, then let through and recorded; a harmless value in
+/// the range is plain `Allow`. The eBPF programs' one entry: no `Option`.
 #[inline(always)]
+pub const fn verdict_of(
+    kind: u8,
+    caller_may: bool,
+    read: bool,
+    v: i64,
+    opt: Range,
+) -> SysctlVerdict {
+    if kind == SYSCTL_NONE || caller_may {
+        return SysctlVerdict::Allow;
+    }
+    if !read {
+        return SysctlVerdict::Refuse;
+    }
+    if !sysctl_refuses_every_write(kind) && !sysctl_value_harmful(kind, v) {
+        return SysctlVerdict::Allow;
+    }
+    if opt.on && opt.min <= v && v <= opt.max && kind != SYSCTL_FTRACE_ENABLED {
+        SysctlVerdict::OptedOut
+    } else {
+        SysctlVerdict::Refuse
+    }
+}
+
+/// [`verdict_of`] outside the family and a window, of `Option`s (userland
+/// and tests).
 pub const fn sysctl_value_verdict(
     kind: u8,
     value: Option<i64>,
     optout: Option<(i64, i64)>,
 ) -> SysctlVerdict {
-    let v = match value {
-        Some(v) => v,
-        None => return SysctlVerdict::Refuse,
-    };
-    if !sysctl_refuses_every_write(kind) && !sysctl_value_harmful(kind, v) {
-        return SysctlVerdict::Allow;
-    }
-    match optout {
-        Some((min, max)) if min <= v && v <= max && kind != SYSCTL_FTRACE_ENABLED => {
-            SysctlVerdict::OptedOut
-        }
-        _ => SysctlVerdict::Refuse,
+    match value {
+        Some(v) => verdict_of(kind, false, true, v, Range::of(optout)),
+        None => verdict_of(kind, false, false, 0, Range::of(optout)),
     }
 }
 
-/// The `cgroup/sysctl` program's verdict on a write of the guarded sysctl
-/// of `kind` (`SYSCTL_NONE`: not one, let through): the agent's family
-/// and a window pass (`caller_may`: the identity every guarded write is
-/// let through by, the round's own restore among them), the others by
-/// [`sysctl_value_verdict`] on the kernel's copy.
-#[inline(always)]
+/// The `cgroup/sysctl` program's verdict ([`verdict_of`]) of `Option`s
+/// (userland and tests).
 pub const fn sysctl_kernel_verdict(
     kind: u8,
     caller_may: bool,
     value: Option<i64>,
     optout: Option<(i64, i64)>,
 ) -> SysctlVerdict {
-    if kind == SYSCTL_NONE || caller_may {
-        return SysctlVerdict::Allow;
+    match value {
+        Some(v) => verdict_of(kind, caller_may, true, v, Range::of(optout)),
+        None => verdict_of(kind, caller_may, false, 0, Range::of(optout)),
     }
-    sysctl_value_verdict(kind, value, optout)
 }
 
 /// The write deny's verdict (`file_permission`, lot 273d), with the
-/// opt-out: as [`sysctl_kernel_verdict`], except that a sysctl whose
-/// every write is refused is refused without reading the write when no
-/// opt-out names it (nothing for a second thread to race), and that the
-/// bytes are read from the writer (`written`, decimal only: a spelling the
-/// kernel reads in another base is refused, `cgroup_limits::parse_i64`).
+/// opt-out: [`verdict_of`], except that a sysctl whose every write is
+/// refused is refused without reading the write when no opt-out names it
+/// (nothing for a second thread to race), and that the bytes are read from
+/// the writer (`written`, decimal only: a spelling the kernel reads in
+/// another base is refused, `cgroup_limits::parse_i64`). With the value
+/// read (0 when it was not), for the opt-out's record.
 #[inline(always)]
 pub fn sysctl_write_verdict(
     kind: u8,
     caller_may: bool,
-    optout: Option<(i64, i64)>,
+    opt: Range,
     written: impl FnOnce() -> Option<crate::cgroup_limits::LimitValue>,
-) -> SysctlVerdict {
+) -> (SysctlVerdict, i64) {
     if kind == SYSCTL_NONE || caller_may {
-        return SysctlVerdict::Allow;
+        return (SysctlVerdict::Allow, 0);
     }
-    if sysctl_refuses_every_write(kind) && optout.is_none() {
-        return SysctlVerdict::Refuse;
+    if sysctl_refuses_every_write(kind) && !opt.on {
+        return (SysctlVerdict::Refuse, 0);
     }
-    let value = match written() {
-        Some(w) => crate::cgroup_limits::parse_i64(&w),
-        None => None,
+    let (read, v) = match written() {
+        Some(w) => match crate::cgroup_limits::parse_i64(&w) {
+            Some(v) => (true, v),
+            None => (false, 0),
+        },
+        None => (false, 0),
     };
-    sysctl_value_verdict(kind, value, optout)
+    (verdict_of(kind, false, read, v, opt), v)
 }
 
 /// The record of a write the `cgroup/sysctl` program judged (on
@@ -361,9 +424,10 @@ mod tests {
             );
             // the write deny reads the bytes, decimal only: refused
             assert_eq!(
-                sysctl_write_verdict(SYSCTL_PID_MAX, false, None, || limit_value(
+                sysctl_write_verdict(SYSCTL_PID_MAX, false, Range::NONE, || limit_value(
                     spelling.as_bytes()
-                )),
+                ))
+                .0,
                 SysctlVerdict::Refuse,
                 "{spelling}"
             );
@@ -492,15 +556,17 @@ mod tests {
         // too), reads the RT period's bytes only when a slot names it
         let mut read = false;
         assert_eq!(
-            sysctl_write_verdict(SYSCTL_SCHED_RT_RUNTIME, false, rt, || limit_value(b"-1\n")),
-            OptedOut
+            sysctl_write_verdict(SYSCTL_SCHED_RT_RUNTIME, false, Range::of(rt), || {
+                limit_value(b"-1\n")
+            }),
+            (OptedOut, -1)
         );
         assert_eq!(
-            sysctl_write_verdict(SYSCTL_SCHED_RT_PERIOD, false, None, || {
+            sysctl_write_verdict(SYSCTL_SCHED_RT_PERIOD, false, Range::NONE, || {
                 read = true;
                 limit_value(b"500000")
             }),
-            Refuse
+            (Refuse, 0)
         );
         assert!(
             !read,
@@ -510,18 +576,47 @@ mod tests {
             sysctl_write_verdict(
                 SYSCTL_SCHED_RT_PERIOD,
                 false,
-                Some((500_000, 500_000)),
-                || { limit_value(b"500000") }
+                Range::of(Some((500_000, 500_000))),
+                || limit_value(b"500000")
             ),
+            (OptedOut, 500_000)
+        );
+        // a value it cannot read: refused, whatever the range
+        assert_eq!(
+            sysctl_write_verdict(SYSCTL_PID_MAX, false, Range::of(Some((0, 99))), || None).0,
+            Refuse
+        );
+        assert_eq!(
+            sysctl_write_verdict(SYSCTL_PID_MAX, true, Range::NONE, || None).0,
+            Allow
+        );
+        assert_eq!(
+            sysctl_write_verdict(SYSCTL_NONE, false, Range::NONE, || None).0,
+            Allow
+        );
+        // the programs' entry: a value not read is refused even inside a
+        // range that holds its 0
+        assert_eq!(
+            verdict_of(SYSCTL_PID_MAX, false, false, 0, Range::of(Some((0, 99)))),
+            Refuse
+        );
+        assert_eq!(
+            verdict_of(SYSCTL_PID_MAX, false, true, 0, Range::of(Some((0, 99)))),
             OptedOut
         );
         assert_eq!(
-            sysctl_write_verdict(SYSCTL_PID_MAX, true, None, || None),
-            Allow
-        );
-        assert_eq!(
-            sysctl_write_verdict(SYSCTL_NONE, false, None, || None),
-            Allow
+            verdict_of(
+                SYSCTL_PID_MAX,
+                false,
+                true,
+                50,
+                Range {
+                    on: false,
+                    min: 0,
+                    max: 99
+                }
+            ),
+            Refuse
         );
     }
 
@@ -539,6 +634,26 @@ mod tests {
         assert_eq!(SysctlOptOut { armed: 0, ..s }.live(7), None);
         assert_eq!(SysctlOptOut::default().live(0), None);
         assert_eq!(core::mem::size_of::<SysctlOptOut>(), 24);
+        // the programs' form: the same, every field written
+        assert_eq!(
+            s.range(7),
+            Range {
+                on: true,
+                min: -1,
+                max: -1
+            }
+        );
+        assert_eq!(s.range(8), Range::NONE);
+        assert_eq!(SysctlOptOut { armed: 0, ..s }.range(7), Range::NONE);
+        assert_eq!(Range::of(None), Range::NONE);
+        assert_eq!(
+            Range::of(Some((3, 4))),
+            Range {
+                on: true,
+                min: 3,
+                max: 4
+            }
+        );
     }
 
     /// The record carries the kind and the value, or that it was not read.

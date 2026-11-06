@@ -38,7 +38,7 @@ use aya_ebpf::{
 };
 use northnarrow_common::cgroup_limits::SYSCTL_NONE;
 use northnarrow_common::sysctl_judge::{
-    record_dev, sysctl_kernel_verdict, sysctl_path_kind, SysctlOptOut, SysctlVerdict,
+    record_dev, sysctl_path_kind, verdict_of, Range, SysctlOptOut, SysctlVerdict,
     SYSCTL_OPTOUT_SLOTS, SYSCTL_PATH_MAX,
 };
 use northnarrow_common::wire::{InodeKey, FS_OP_SYSCTL_OPT_OUT, FS_OP_SYSCTL_VALUE, TASK_COMM_LEN};
@@ -96,11 +96,13 @@ unsafe fn try_sysctl_guard(ctx: &SysctlContext) -> SysctlVerdict {
     if caller_may {
         return SysctlVerdict::Allow;
     }
-    let value = new_value(ctx);
-    let verdict = sysctl_kernel_verdict(kind, false, value, opt_out(kind));
+    // every value written (no `Option`: lot 280a's first lab round, `R2
+    // !read_ok` — `common::sysctl_judge::Range`)
+    let (read, v) = new_value(ctx);
+    let verdict = verdict_of(kind, false, read, v, opt_out(kind));
     match verdict {
-        SysctlVerdict::Refuse => record(FS_OP_SYSCTL_VALUE, kind, value, task, tgid, true),
-        SysctlVerdict::OptedOut => record(FS_OP_SYSCTL_OPT_OUT, kind, value, task, tgid, false),
+        SysctlVerdict::Refuse => record(FS_OP_SYSCTL_VALUE, kind, read, v, task, tgid, true),
+        SysctlVerdict::OptedOut => record(FS_OP_SYSCTL_OPT_OUT, kind, read, v, task, tgid, false),
         SysctlVerdict::Allow => {}
     }
     verdict
@@ -125,34 +127,34 @@ unsafe fn sysctl_of(ctx: &SysctlContext) -> u8 {
     sysctl_path_kind(n as usize, name)
 }
 
-/// The kernel's copy of the write, read in base 0 as the kernel reads it;
-/// `None` when it is longer than [`VALUE_BUF`] - 1 bytes, not an integer,
-/// or past `i64` (refused).
+/// The kernel's copy of the write, read in base 0 as the kernel reads it:
+/// `(true, value)`, or `(false, 0)` when it is longer than [`VALUE_BUF`] -
+/// 1 bytes, not an integer, or past `i64` (refused).
 #[inline(always)]
-unsafe fn new_value(ctx: &SysctlContext) -> Option<i64> {
+unsafe fn new_value(ctx: &SysctlContext) -> (bool, i64) {
     let mut buf = core::mem::MaybeUninit::<[u8; VALUE_BUF]>::uninit();
     let p = buf.as_mut_ptr() as *mut c_char;
     // zero-filled past the value by the helper; -E2BIG when cut
     if generated::bpf_sysctl_get_new_value(ctx.sysctl, p, VALUE_BUF as u64) < 0 {
-        return None;
+        return (false, 0);
     }
     let mut res: c_long = 0;
     if generated::bpf_strtol(p, VALUE_BUF as u64, BASE_0, &mut res) < 0 {
-        return None;
+        return (false, 0);
     }
-    Some(res as i64)
+    (true, res as i64)
 }
 
-/// The signed opt-out's range in force for `kind`, if any.
+/// The signed opt-out's range in force for `kind` (`Range::NONE`: none).
 #[inline(always)]
-pub(crate) fn opt_out(kind: u8) -> Option<(i64, i64)> {
+pub(crate) fn opt_out(kind: u8) -> Range {
     let session = match crate::task_kill::AGENT_SESSION.get(0) {
         Some(s) => *s,
-        None => return None,
+        None => return Range::NONE,
     };
     match SYSCTL_OPTOUT.get(kind as u32) {
-        Some(slot) => slot.live(session),
-        None => None,
+        Some(slot) => slot.range(session),
+        None => Range::NONE,
     }
 }
 
@@ -169,7 +171,8 @@ pub(crate) fn kernel_judge_attached() -> bool {
 unsafe fn record(
     operation: u8,
     kind: u8,
-    value: Option<i64>,
+    read: bool,
+    v: i64,
     task: *const u8,
     tgid: u32,
     limited: bool,
@@ -181,8 +184,8 @@ unsafe fn record(
     crate::inode_protect::emit_sysctl_record(
         operation,
         InodeKey {
-            dev: record_dev(kind, value.is_some()),
-            ino: value.unwrap_or(0) as u64,
+            dev: record_dev(kind, read),
+            ino: v as u64,
         },
         tgid,
         comm,
