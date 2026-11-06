@@ -933,7 +933,8 @@ known" (`CGROUP_JOIN_SILENT`); the marks' epoch is reset once ftrace runs
 again. Measured on Ubuntu 24.04: with the switch on, 0 births missed over
 the lab's forks; at `0` inside a window, 63 counted within 5 s and 77 by
 the next read, the degradation `cgroup_join_marks` signed, and 6 s after
-the switch was back at `1` the reset signed with the period.
+the switch was back at `1` the reset signed with the period. On Ubuntu 22.04
+(5.15.0-202) the write is `EBUSY`: nothing stops, nothing is lost.
 
 **The kprobes' switches.** `/sys/kernel/debug/kprobes/enabled` (debugfs,
 mounted at `/sys/kernel/debug`) and `debug.kprobes-optimization` (absent

@@ -7267,6 +7267,23 @@ number in parentheses is a lab PR.
       `sysctl_root_attach` signed; attached inside a window and held 12 s:
       found by the round, `sysctl_root_prog` High. Uninstalled, the guest
       off.
+    - **Ubuntu 22.04** (`5.15.0-202-generic`, 6d01354c): `verifier-check`
+      98 programs, 93 OK, 5 not counted, 0 failing (`cgroup_join_fork` 740,
+      `cgroup_join_born` 394, `bpf_syscall_observe` 2,272,
+      `protected_write_deny` 9,303, `protected_open_deny` 6,878,
+      `nn_sysctl_guard` 904); `switches-check` all PASS: 0 births missed
+      with ftrace on; the write of `ftrace_enabled=0` inside a window
+      `EBUSY` (a trampoline is attached: nothing stops); the kprobes'
+      switches and the lockdown file refused and signed, a 0 written
+      inside a window put back; `insmod` killed by R011, the taint
+      simulated (E Critical, K High; the manifest 41472, `WEK`: the `W` a
+      warning of that guest's boot); the root attach refused
+      (`sysctl_root_attach`), one attached inside a window found
+      (`sysctl_root_prog`, High). Uninstalled, the guest clean and off.
+  - Gates (2e3e38ce): all green; one golden replay of five hit a clock
+    step in `every_verb_refuses_every_reason_with_its_reply_and_row` (the
+    server's timestamp outside the test's `[now, now]`; untouched by this
+    lot) — the five replays run again alone: all pass, the same bytes.
   - Host: named tests `ftrace_off_loses_the_marks_and_its_return_resets_the_epoch`,
     `a_birth_the_fentry_missed_loses_the_marks_with_ftrace_on`,
     `a_birth_the_fentry_missed_is_told_from_one_it_saw`,
