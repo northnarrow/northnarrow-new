@@ -403,6 +403,23 @@ mod tests {
         w[3] |= 1 << 56;
         assert_eq!(sysctl_path_kind(14, w), SYSCTL_NONE);
         assert_eq!(kind_of_name("kernel/pid_max"), SYSCTL_NONE);
+        // the words are the name's bytes as the kernel writes them in the
+        // program's buffer (little-endian words), and the length counts
+        assert_eq!(
+            path_words(b"kernel/pid_max"),
+            [
+                u64::from_le_bytes(*b"kernel/p"),
+                u64::from_le_bytes(*b"id_max\0\0"),
+                0,
+                0
+            ]
+        );
+        assert_eq!(
+            sysctl_path_kind(13, path_words(b"kernel/pid_max")),
+            SYSCTL_NONE
+        );
+        assert_eq!(kind_of_name("kernel.pid_ma"), SYSCTL_NONE);
+        assert_eq!(kind_of_name(""), SYSCTL_NONE);
         assert_eq!(name_of_kind(SYSCTL_NONE), None);
         assert_eq!(name_of_kind(200), None);
     }

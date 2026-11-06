@@ -397,13 +397,29 @@ fn attach_inner(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<Vec<u32>, St
         obj_pin(link.as_raw_fd(), &link_pin)
             .map_err(|e| format!("pinning {PROGRAM}'s link to {}: {e}", link_pin.display()))?;
     }
-    // what the kernel reports for the root now: multi, ours among them
-    let q = query_root(root.as_raw_fd())
-        .map_err(|e| format!("BPF_PROG_QUERY of the root cgroup: {e}"))?;
-    let others = judge_query(&q, own)?;
+    // what the kernel reports for the root now: multi, ours among them. The
+    // prior link removed above goes through the kernel's workqueue
+    // (`bpf_link_put` defers its release), so its program can still be
+    // listed for a moment — the lab's upgrade round named it "another
+    // program": asked again while another one is there, 2 s at most.
+    let mut others = Vec::new();
+    for _ in 0..QUERY_TRIES {
+        let q = query_root(root.as_raw_fd())
+            .map_err(|e| format!("BPF_PROG_QUERY of the root cgroup: {e}"))?;
+        others = judge_query(&q, own)?;
+        if others.is_empty() {
+            break;
+        }
+        std::thread::sleep(QUERY_PAUSE);
+    }
     let _ = LINK.set(link);
     Ok(others)
 }
+
+/// How often, and how far apart, the root is asked again while another
+/// program is listed there (the prior link's deferred release): 2 s.
+const QUERY_TRIES: u32 = 40;
+const QUERY_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The judge flag (`SYSCTL_KERNEL_JUDGE[0]`).
 fn set_judge_flag(ebpf: &mut Ebpf, v: u32) -> Result<(), String> {

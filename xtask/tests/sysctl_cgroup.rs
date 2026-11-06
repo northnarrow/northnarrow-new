@@ -225,8 +225,11 @@ fn the_judge_is_linked_to_the_root_cgroup_multi() {
             "purge_pins(d, false);",
             "prog.pin(&prog_pin)",
             "obj_pin(link.as_raw_fd(), &link_pin)",
+            "for _ in 0..QUERY_TRIES {",
             "let q = query_root(root.as_raw_fd())",
-            "let others = judge_query(&q, own)?;",
+            "others = judge_query(&q, own)?;",
+            "if others.is_empty() {\n            break;\n        }",
+            "std::thread::sleep(QUERY_PAUSE);",
             "let _ = LINK.set(link);",
         ],
     )
