@@ -152,6 +152,23 @@ work. Four changes, each a default the signed per-rule policy can undo with
   lineage, and R011 judges the exec as before. Tracepoint mode (no LSM exec
   hook) sees no build: killed as before.
 
+**Decision record (06/11/2026, lot 287).** By the coordinator, with the
+authority the founder delegated.
+- *A narrow record, not the whole tree.* Inside a build R011 records only
+  what the build itself runs: the hook (a `#!` script of a system tree) and
+  `modprobe`'s dry runs. It does not record every exec under a builder.
+  `mkinitramfs -d <dir>` and `/etc/initramfs-tools/hooks` run hooks that
+  root chooses, so a record of the whole tree would let `sudo mkinitramfs -d
+  /tmp/x` launder an `insmod /tmp/rk.ko`. The narrow record keeps that
+  `insmod` killed.
+- *No "not modified since boot" check on the builder.* The builder is
+  trusted by its packaged file's device and inode in a root-owned tree, run
+  by root. Its modification time is not compared with the boot: an `apt
+  upgrade` of initramfs-tools changes the builder's ctime, and the
+  administrator's `update-initramfs -u` run right after it, before a
+  reboot, would be killed again. No helper of the agent compares a file
+  with the boot either.
+
 **Decision record (06/11/2026, lot 283b).** By the coordinator, with the
 authority the founder delegated, after lot 283a's inventory.
 - *What:* the four changes above. NN-L-FIM-004, NN-L-FIM-023 and
