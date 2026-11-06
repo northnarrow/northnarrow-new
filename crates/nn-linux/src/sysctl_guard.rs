@@ -313,6 +313,18 @@ pub fn check_with(
 mod tests {
     use super::*;
 
+    /// [`super::check`] without the process's opt-outs (another test may
+    /// have some in force: `sysctl_cgroup`'s, run in parallel).
+    fn check(root: &Path, mem_total: u64, write: bool) -> Vec<Seen> {
+        check_with(root, mem_total, &|_| None, |path, text| {
+            if write {
+                std::fs::write(path, text)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
     fn host(files: &[(&str, &str)]) -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
         for (p, v) in files {
@@ -471,6 +483,10 @@ mod tests {
         let r = check_with(d.path(), 16 << 30, &pm, |p, t| std::fs::write(p, t));
         assert_eq!(r[0].kind, "sysctl_opted_out", "{r:?}");
         assert!(r[0].detail.ends_with("allows 4096..8192"), "{r:?}");
+        // above the range, still harmful: put back
+        let d = host(&[("/proc/sys/kernel/pid_max", "10000\n")]);
+        let r = check_with(d.path(), 16 << 30, &pm, |p, t| std::fs::write(p, t));
+        assert_eq!(r[0].kind, "sysctl_restored", "{r:?}");
     }
 
     /// R1: `ftrace_enabled=0` (set at boot, inside a window) is put back to
