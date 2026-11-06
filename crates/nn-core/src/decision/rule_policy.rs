@@ -148,6 +148,11 @@ pub struct RulePolicy {
     exemptions: BTreeMap<&'static str, Vec<Exemption>>,
     /// `combat-without-corroboration NN-L-IMP-001`.
     pub ransomware_combat_without_corroboration: bool,
+    /// Lot 280a: `sysctl-allow <name> <value>|<min>..<max>` — the signed
+    /// per-sysctl opt-out, by the `sysctl(8)` name of a guarded sysctl
+    /// (`common::sysctl_judge::SYSCTL_PATHS`). The agent honours it only
+    /// from a policy whose signature it verified.
+    sysctl_allow: BTreeMap<&'static str, (i64, i64)>,
     /// Where it came from (`built-in defaults`, `<path> (signed, sha256 …)`).
     pub source: String,
 }
@@ -181,19 +186,33 @@ impl RulePolicy {
         self.exemptions.iter().map(|(k, v)| (*k, v.as_slice()))
     }
 
+    /// Lot 280a: the signed per-sysctl opt-outs — the `sysctl(8)` name,
+    /// the guarded sysctl's kind and the values allowed (`min..=max`).
+    pub fn sysctl_opt_outs(&self) -> impl Iterator<Item = (&'static str, u8, i64, i64)> + '_ {
+        self.sysctl_allow
+            .iter()
+            .map(|(n, (min, max))| (*n, common::sysctl_judge::kind_of_name(n), *min, *max))
+    }
+
     /// No directive at all.
     pub fn is_builtin(&self) -> bool {
         self.modes.is_empty()
             && self.exemptions.is_empty()
             && !self.ransomware_combat_without_corroboration
+            && self.sysctl_allow.is_empty()
     }
 
-    /// One line for the logs and the audit row.
+    /// One line for the logs and the audit row (lot 280a: the sysctl
+    /// opt-outs counted at its end when there are any).
     pub fn summary(&self) -> String {
         let count = |m: Mode| self.modes.values().filter(|x| **x == m).count();
+        let opt_outs = match self.sysctl_allow.len() {
+            0 => String::new(),
+            n => format!(", {n} sysctl opt-out{}", if n == 1 { "" } else { "s" }),
+        };
         format!(
             "{} enforce, {} alert, {} audit, {} off, {} exemptions on {} rules, \
-             ransomware COMBAT without corroboration {}",
+             ransomware COMBAT without corroboration {}{opt_outs}",
             count(Mode::Enforce),
             count(Mode::Alert),
             count(Mode::Audit),
@@ -222,7 +241,38 @@ impl RulePolicy {
         if self.ransomware_combat_without_corroboration {
             out.push_str(&format!("combat-without-corroboration {RANSOMWARE_RULE}\n"));
         }
+        for (n, (min, max)) in &self.sysctl_allow {
+            out.push_str(&format!("sysctl-allow {n} {}\n", range_text(*min, *max)));
+        }
         out
+    }
+}
+
+/// `v` for one value, `min..max` for a range (the directive's spelling).
+fn range_text(min: i64, max: i64) -> String {
+    if min == max {
+        min.to_string()
+    } else {
+        format!("{min}..{max}")
+    }
+}
+
+/// Lot 280a: the value or range of a `sysctl-allow` line — a decimal
+/// integer, or two joined by `..` with the first not above the second.
+fn parse_range(text: &str) -> Result<(i64, i64), String> {
+    let int = |t: &str| {
+        t.parse::<i64>()
+            .map_err(|_| format!("{t:?}: not a decimal integer"))
+    };
+    match text.split_once("..") {
+        None => int(text).map(|v| (v, v)),
+        Some((a, b)) => {
+            let (min, max) = (int(a)?, int(b)?);
+            if min > max {
+                return Err(format!("{text}: the range's first value is above its last"));
+            }
+            Ok((min, max))
+        }
     }
 }
 
@@ -244,6 +294,13 @@ pub fn show(p: &RulePolicy) -> String {
             for e in ex {
                 out.push_str(&format!("exempt   {r}: {e}\n"));
             }
+        }
+        // Lot 280a
+        for (n, _, min, max) in p.sysctl_opt_outs() {
+            out.push_str(&format!(
+                "sysctl-allow {n} {} (outside a window too; honoured only signed)\n",
+                range_text(min, max)
+            ));
         }
     }
     out.push_str(&format!(
@@ -541,6 +598,33 @@ fn parse_as(
                     "`exempt <rule> uid|exe|cgroup|unit <value>`".to_string()
                 ))
             }
+            // Lot 280a: the signed per-sysctl opt-out
+            ["sysctl-allow", name, value] => {
+                let kind = common::sysctl_judge::kind_of_name(name);
+                if let Err(why) = common::sysctl_judge::opt_out_allowed(kind) {
+                    let known: Vec<&str> = common::sysctl_judge::SYSCTL_PATHS
+                        .iter()
+                        .map(|(_, n, _)| *n)
+                        .filter(|n| *n != "kernel.ftrace_enabled")
+                        .collect();
+                    return Err(err(format!(
+                        "sysctl-allow {name}: {why} (one of {})",
+                        known.join(", ")
+                    )));
+                }
+                let range =
+                    parse_range(value).map_err(|e| err(format!("sysctl-allow {name}: {e}")))?;
+                let dotted = common::sysctl_judge::name_of_kind(kind).expect("a guarded kind");
+                if p.sysctl_allow.insert(dotted, range).is_some() {
+                    return Err(err(format!("sysctl-allow {dotted} twice")));
+                }
+            }
+            ["sysctl-allow", ..] => {
+                return Err(err(
+                    "`sysctl-allow <sysctl> <value>` or `sysctl-allow <sysctl> <min>..<max>`"
+                        .to_string(),
+                ))
+            }
             ["combat-without-corroboration", rule] => {
                 let id = resolve_rule(rule).map_err(err)?;
                 if id != RANSOMWARE_RULE {
@@ -556,7 +640,7 @@ fn parse_as(
             [kw, ..] => {
                 return Err(err(format!(
                     "unknown directive `{kw}`: enforce, alert, audit, off, exempt, \
-                     combat-without-corroboration"
+                     combat-without-corroboration, sysctl-allow"
                 )))
             }
             [] => unreachable!("empty content skipped"),
@@ -794,6 +878,102 @@ mod tests {
         assert_eq!(p.mode(resolve_rule("R008").unwrap()), Some(Mode::Off));
         // The rendering reads back to the same policy.
         assert_eq!(parse(&p.render()).unwrap(), p);
+    }
+
+    /// Lot 280a: the signed per-sysctl opt-out — a guarded sysctl by its
+    /// `sysctl(8)` name and a value or a range; read back as written,
+    /// counted, shown; never kernel.ftrace_enabled, never another sysctl,
+    /// one line per sysctl, a range in order.
+    #[test]
+    fn a_sysctl_opt_out_names_a_guarded_sysctl_and_its_values() {
+        use common::cgroup_limits::{SYSCTL_PID_MAX, SYSCTL_SCHED_RT_RUNTIME};
+        let p = parse(
+            "sysctl-allow kernel.sched_rt_runtime_us -1   # tuned realtime\n\
+             sysctl-allow kernel.pid_max 4096..32767\n",
+        )
+        .unwrap();
+        assert!(!p.is_builtin());
+        let got: Vec<_> = p.sysctl_opt_outs().collect();
+        assert_eq!(
+            got,
+            [
+                ("kernel.pid_max", SYSCTL_PID_MAX, 4096, 32767),
+                (
+                    "kernel.sched_rt_runtime_us",
+                    SYSCTL_SCHED_RT_RUNTIME,
+                    -1,
+                    -1
+                ),
+            ]
+        );
+        assert_eq!(parse(&p.render()).unwrap(), p);
+        assert!(p
+            .render()
+            .contains("sysctl-allow kernel.sched_rt_runtime_us -1\n"));
+        assert!(p
+            .render()
+            .contains("sysctl-allow kernel.pid_max 4096..32767\n"));
+        assert!(
+            p.summary().ends_with(", 2 sysctl opt-outs"),
+            "{}",
+            p.summary()
+        );
+        assert!(parse("sysctl-allow kernel.pid_max 4096\n")
+            .unwrap()
+            .summary()
+            .ends_with(", 1 sysctl opt-out"));
+        // without one, the summary is the one before lot 280a
+        assert!(parse("enforce R020\n")
+            .unwrap()
+            .summary()
+            .ends_with("ransomware COMBAT without corroboration off"));
+        let shown = show(&p);
+        assert!(
+            shown.contains("sysctl-allow kernel.sched_rt_runtime_us -1 (outside a window too; honoured only signed)"),
+            "{shown}"
+        );
+        for (text, what) in [
+            ("sysctl-allow kernel.ftrace_enabled 1\n", "never opted out"),
+            (
+                "sysctl-allow kernel.printk 4\n",
+                "not a sysctl the agent guards",
+            ),
+            (
+                "sysctl-allow kernel/pid_max 4096\n",
+                "not a sysctl the agent guards",
+            ),
+            (
+                "sysctl-allow pid_max 4096\n",
+                "not a sysctl the agent guards",
+            ),
+            (
+                "sysctl-allow kernel.pid_max\n",
+                "sysctl-allow <sysctl> <value>",
+            ),
+            (
+                "sysctl-allow kernel.pid_max 1 2\n",
+                "sysctl-allow <sysctl> <value>",
+            ),
+            (
+                "sysctl-allow kernel.pid_max 0x1000\n",
+                "not a decimal integer",
+            ),
+            ("sysctl-allow kernel.pid_max 9..1\n", "above its last"),
+            ("sysctl-allow kernel.pid_max 1..\n", "not a decimal integer"),
+            (
+                "sysctl-allow kernel.pid_max 1\nsysctl-allow kernel.pid_max 2\n",
+                "twice",
+            ),
+        ] {
+            let e = refused(text);
+            assert!(e.why.contains(what), "{text:?}: {e}");
+        }
+        assert!(refused("sysctl-allow kernel.printk 4\n")
+            .why
+            .contains("kernel.sched_rt_runtime_us"));
+        assert!(!refused("sysctl-allow kernel.printk 4\n")
+            .why
+            .contains("kernel.ftrace_enabled,"));
     }
 
     #[test]

@@ -343,14 +343,25 @@ pub(crate) fn load(
     let rule_policy = {
         use northnarrow_agent::config::overlay_auth::Verified;
         use northnarrow_agent::decision::rule_policy as rp;
-        let boot = match overlay_gate.verified(OverlayKind::RulePolicy, &cli.rule_policy_local) {
-            Verified::Content { path, text } => rp::boot_policy(Some((&path, &text))),
-            _ => rp::boot_policy(None),
-        };
+        // Lot 280a: and whether the text applied is the signed one (its
+        // sysctl opt-outs are honoured only then)
+        let (boot, signed) =
+            match overlay_gate.verified(OverlayKind::RulePolicy, &cli.rule_policy_local) {
+                Verified::Content { path, text } => (
+                    rp::boot_policy(Some((&path, &text))),
+                    overlay_gate.signs(OverlayKind::RulePolicy, &path, &text),
+                ),
+                _ => (rp::boot_policy(None), false),
+            };
         report_boot_policy(&boot, |source, detail| {
             northnarrow_agent::boot::degradation::report(source, detail);
         });
         let policy = boot.policy;
+        // Lot 280a: the signed per-sysctl opt-outs to the kernel and the
+        // round; an unsigned policy's are withheld, signed degraded.
+        if let Some(detail) = nn_linux::sysctl_cgroup::apply_policy(&policy, signed) {
+            northnarrow_agent::boot::degradation::report("rule_policy", &detail);
+        }
         if !policy.is_builtin() {
             warn!(
                 source = %policy.source,

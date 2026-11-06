@@ -412,6 +412,9 @@ pub mod host_dropins;
 /// Lot 273d: our units' own drop-ins made inside a window, judged at its
 /// close.
 pub mod own_dropins;
+/// Lot 280a: the same, judged on the kernel's copy of the write
+/// (`cgroup/sysctl` on the root cgroup), and the signed per-sysctl opt-out.
+pub mod sysctl_cgroup;
 /// Lot 273d: the global sysctls that abort or starve the agent.
 pub mod sysctl_guard;
 pub mod systemd_reload;

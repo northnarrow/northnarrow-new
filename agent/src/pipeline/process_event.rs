@@ -478,6 +478,9 @@ pub(crate) fn process_event(
             // refusal: the move went through, the moved tree lost its
             // exemptions by cgroup or unit (the kernel's mark).
             let joined = *operation == nn_model::FsProtectOperation::CgroupJoin;
+            // Lot 280a: a write the signed per-sysctl opt-out let through —
+            // recorded, not refused.
+            let opted_out = *operation == nn_model::FsProtectOperation::SysctlOptOut;
             let exemption = joined
                 .then(|| {
                     nn_linux::cgroup_join::exemption_named(&engine.policy().current(), *target_dev)
@@ -492,6 +495,15 @@ pub(crate) fn process_event(
                         "CGROUP EXEMPTION SPOOF: a process moved into an exempt cgroup by someone \
                          other than systemd — not refused; it and what it starts are never exempt \
                          by that cgroup or unit"
+                    );
+                } else if opted_out {
+                    let (kind, value) = common::sysctl_judge::record_of(*target_dev, *target_ino);
+                    warn!(
+                        pid, uid, comm = %Escaped(comm),
+                        sysctl = common::sysctl_judge::name_of_kind(kind).unwrap_or("?"),
+                        value = ?value,
+                        "SYSCTL OPT-OUT: a guarded sysctl's write let through by the signed \
+                         per-rule policy's sysctl-allow (recorded, not refused)"
                     );
                 } else {
                     warn!(
@@ -518,6 +530,14 @@ pub(crate) fn process_event(
                                  never exempt by {} (start-in-cgroup tracker)",
                                 exemption.as_deref().unwrap_or("the cgroup or the unit")
                             )
+                        } else if opted_out {
+                            "not refused: let through by the signed per-rule policy's \
+                             sysctl-allow (cgroup/sysctl or the write deny)"
+                                .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::SysctlValue {
+                            "denied in kernel (cgroup/sysctl on the root cgroup, the kernel's \
+                             copy of the write)"
+                                .to_string()
                         } else {
                             "denied in kernel (anti-tamper LSM hook)".to_string()
                         };

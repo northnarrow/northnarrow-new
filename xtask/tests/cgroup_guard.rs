@@ -187,8 +187,12 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
             "let kind = sysctl_kind(len, words);",
             "if kind == SYSCTL_NONE {\n        return false;\n    }",
             // R1: the shared verdict, the caller's identity passed in (the
-            // agent's own restore), the bytes read only through it
-            "if !sysctl_write_refused(kind, caller_may(caller), || written_value()) {\n        return false;\n    }",
+            // agent's own restore), the bytes read only through it — lot
+            // 280a: with the signed opt-out (xtask/tests/sysctl_cgroup.rs)
+            "let verdict = sysctl_write_verdict(\n        kind,\n        caller_may(caller),",
+            "|| {\n            let w = written_value();",
+            "SysctlVerdict::Allow => return false,",
+            "SysctlVerdict::Refuse => {}",
             "sign(phase, FS_OP_SYSCTL, key);",
             "true",
         ],
@@ -825,7 +829,7 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         &[
             "crate::sysctl_guard::check(",
             "true,",
-            ".filter(|s| s.kind != \"sysctl_strict\")",
+            ".filter(|s| s.kind != \"sysctl_strict\" && s.kind != \"sysctl_opted_out\")",
         ],
     )
     .unwrap();

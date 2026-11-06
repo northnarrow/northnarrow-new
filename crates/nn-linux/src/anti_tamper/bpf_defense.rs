@@ -464,6 +464,19 @@ pub(crate) fn register_own_objects(
         );
     }
     *guard.0.foreign_pins.lock() = foreign;
+    // Lot 280a: the cgroup/sysctl judge's link pin, beside the pin root (its
+    // link id is registered above, from the descriptor the agent holds)
+    let mut pin_names = pin_names;
+    if pin_root.is_some()
+        && matches!(
+            crate::sysctl_cgroup::judge(),
+            Some(crate::sysctl_cgroup::Judge::Attached { .. })
+        )
+    {
+        if let Some(k) = pin_name_key(&format!("link_{}", crate::sysctl_cgroup::PROGRAM)) {
+            pin_names.push(k);
+        }
+    }
     {
         let names = ebpf
             .map_mut(PIN_NAMES_MAP)
@@ -619,14 +632,17 @@ pub fn write_own_prog_ids(ebpf: &Ebpf, path: &Path) -> Result<usize> {
         }
     }
     progs.sort_unstable();
-    let body = render_own_prog_ids(
-        std::process::id(),
-        &progs,
-        crate::cgroup_join::is_kept_program,
-    );
+    let body = render_own_prog_ids(std::process::id(), &progs, kept_program);
     crate::atomic_file::replace(path, body.as_bytes(), 0o600)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(progs.len())
+}
+
+/// The programs pinned outside the pin root, which outlive an upgrade's
+/// purge of it: the start-in-cgroup tracker's (lot 277) and, lot 280a, the
+/// `cgroup/sysctl` judge's.
+fn kept_program(name: &str) -> bool {
+    crate::cgroup_join::is_kept_program(name) || crate::sysctl_cgroup::is_kept_program(name)
 }
 
 /// The body of the [`OWN_IDS_FILE_NAME`] file. The scripts read the first
@@ -1191,5 +1207,29 @@ mod tests {
             assert!(crate::cgroup_join::is_kept_program(name));
         }
         assert!(!crate::cgroup_join::is_kept_program("cgroup_join"));
+    }
+
+    /// Lot 280a: the own-programs file marks the cgroup/sysctl judge kept
+    /// too (pinned beside the pin root, it outlives an upgrade's purge),
+    /// with the tracker's; nothing else.
+    #[test]
+    fn the_sysctl_judge_is_listed_as_kept() {
+        let body = render_own_prog_ids(
+            7,
+            &[
+                (3, "cgroup_join_mark"),
+                (8, crate::sysctl_cgroup::PROGRAM),
+                (6, "task_kill"),
+                (9, "protected_write_deny"),
+            ],
+            kept_program,
+        );
+        let kept: Vec<&str> = body
+            .lines()
+            .filter(|l| l.split_whitespace().nth(2) == Some("kept"))
+            .collect();
+        assert_eq!(kept, ["3 cgroup_join_mark kept", "8 nn_sysctl_guard kept"]);
+        assert!(body.contains("\n6 task_kill\n") && body.contains("\n9 protected_write_deny\n"));
+        assert!(pin_name_key(&format!("link_{}", crate::sysctl_cgroup::PROGRAM)).is_some());
     }
 }

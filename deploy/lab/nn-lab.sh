@@ -63,6 +63,7 @@
 #   deploy/lab/nn-lab.sh test-one <target> # lot 277: one privileged test target of the agent on a purged pin root
 #   deploy/lab/nn-lab.sh tracker-persist-check  # lot 277: the tracker's marks outlive an agent stop and install.sh --upgrade; its pins refuse root
 #   deploy/lab/nn-lab.sh fork-cost       # lot 277: the tracker's cost a fork + exit (BPF stats per call; wall clock attached / detached)
+#   deploy/lab/nn-lab.sh sysctl-check    # lot 280a: the guarded sysctls judged on the kernel's copy (cgroup/sysctl on the root cgroup): the race, octal/hex, the signed opt-out, a child cgroup's program, the cost a write
 #   deploy/lab/nn-lab.sh exempt-check    # lot 277: an exemption by unit holds for MS-23 started by systemd in the unit, not for a root shell moved into its cgroup (nor its orphan): killed, the move signed
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh net-check         # lab PR 224: connect-time network verdicts, reverse shells, outbound fan-out (CM-02/03/14)
@@ -935,7 +936,7 @@ lab_purge_pins() {
 agent_exe=$(systemctl show -p ExecStart --value northnarrow-agent 2>/dev/null | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)
 agent_exe=${agent_exe:-/usr/local/bin/northnarrow-agent}
 nn_admin=$(dirname "$agent_exe")/nn-admin
-if sudo test -d /sys/fs/bpf/northnarrow || sudo sh -c 'ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* >/dev/null 2>&1'; then
+if sudo test -d /sys/fs/bpf/northnarrow || sudo test -d /sys/fs/bpf/northnarrow-sysctl || sudo sh -c 'ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* >/dev/null 2>&1'; then
     # The window can only be opened through a running agent. After an e2e
     # run the fixtures' pins are still there (protected) and the installed
     # agent is stopped: start it — as a protected pid it purges the stale
@@ -976,8 +977,9 @@ if sudo test -d /sys/fs/bpf/northnarrow || sudo sh -c 'ls -d /sys/fs/bpf/northna
     sudo bash -c 'for d in /proc/[0-9]*; do e=$(readlink "$d/exe" 2>/dev/null) || continue; case "$e" in */northnarrow-agent-e2etest-*|*/northnarrow-watchdog-e2etest-*) kill -9 "${d#/proc/}" 2>/dev/null ;; esac; done'
     sudo rm -rf /sys/fs/bpf/northnarrow 2>/dev/null
     sudo test -d /sys/fs/bpf/northnarrow && echo PINS_PROTECTED
-    # Lot 277 (the re-review of #494, R2): the tracker's pins, beside the root.
-    for d in $(sudo sh -c 'ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* 2>/dev/null'); do
+    # Lot 277 (the re-review of #494, R2): the tracker's pins, beside the root;
+    # lot 280a: the cgroup/sysctl judge's.
+    for d in $(sudo sh -c 'ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* /sys/fs/bpf/northnarrow-sysctl 2>/dev/null'); do
         sudo test -d "$d" || continue
         sudo rm -rf "$d" 2>/dev/null
         sudo test -d "$d" && echo PINS_PROTECTED
@@ -1012,7 +1014,7 @@ REMOTE
         cmd_down
         cmd_up
         vssh bash -s <<'REMOTE'
-sudo rm -rf /sys/fs/bpf/northnarrow 2>/dev/null
+sudo rm -rf /sys/fs/bpf/northnarrow /sys/fs/bpf/northnarrow-sysctl 2>/dev/null
 sudo systemctl enable northnarrow-agent northnarrow-watchdog 2>/dev/null; true
 echo "lsm programs after restart: $(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")"
 REMOTE
@@ -1636,6 +1638,17 @@ cmd_fork_cost() {
     vssh "cd ~/northnarrow && N=${N:-20000} ROUNDS=${ROUNDS:-5} bash deploy/lab/malsim/fork-cost.sh"
 }
 
+cmd_sysctl_check() {
+    # Lot 280a (deploy/lab/malsim/sysctl-check.sh): the guarded sysctls
+    # judged on the kernel's copy of the write — the cgroup/sysctl judge on
+    # the root cgroup, the flipped-buffer race refused, octal and hex below a
+    # floor refused, tuned's realtime opt-out honoured signed only, a child
+    # cgroup's program unable to get around it, the cost a write. Needs a
+    # sync + install.
+    vm_running || die "guest is not running"
+    vssh "cd ~/northnarrow && N=${N:-2000} bash deploy/lab/malsim/sysctl-check.sh"
+}
+
 cmd_dns_sensor_check() {
     # Tappa 10.9 step 3 (deploy/lab/dns-sensor/dns-sensor-check.sh): the DNS
     # sensor reads the kernel's copy of the query. NET-004 kills a sender
@@ -2206,7 +2219,7 @@ for f in /usr/local/bin/northnarrow-agent /usr/local/bin/northnarrow-watchdog /u
          /etc/systemd/system/northnarrow-watchdog-failed.service /etc/systemd/system/northnarrow.slice \
          /etc/systemd/system/northnarrow.slice.d \
          /etc/systemd/journald@northnarrow.conf /etc/northnarrow /var/lib/northnarrow /run/northnarrow /sys/fs/bpf/northnarrow \
-         /root/northnarrow-admin.key; do
+         /sys/fs/bpf/northnarrow-sysctl /root/northnarrow-admin.key; do
     if sudo test -e "$f"; then echo "FAIL: $f still present"; fail=1; fi
 done
 if [[ -n "$own_ids" ]]; then
@@ -2223,6 +2236,10 @@ for u in northnarrow-agent northnarrow-watchdog; do
     st=$(systemctl is-active "$u" 2>/dev/null || true)
     [[ "$st" == inactive || "$st" == "" ]] || { echo "FAIL: $u is $st"; fail=1; }
 done
+# Lot 280a: the cgroup/sysctl judge left the root cgroup with its pins
+if sudo bpftool cgroup show /sys/fs/cgroup 2>/dev/null | grep -q "nn_sysctl_guard"; then
+    echo "FAIL: the cgroup/sysctl judge is still attached to the root cgroup"; fail=1
+fi
 # R14a: by the binary each process runs, not a name in a command line: an
 # agent's worker (`northnarrow-agent --worker parse`, as northnarrow-worker)
 # left behind is a NorthNarrow process too, whatever its comm.
@@ -2398,6 +2415,7 @@ case "${1:-help}" in
     exempt-check)  cmd_exempt_check ;;
     tracker-persist-check) cmd_tracker_persist_check ;;
     fork-cost)     cmd_fork_cost ;;
+    sysctl-check)  cmd_sysctl_check ;;
     test-one)      shift; cmd_test_one "$@" ;;
     dns-sensor-check) cmd_dns_sensor_check ;;
     ransom-check)  shift; cmd_ransom_check "$@" ;;

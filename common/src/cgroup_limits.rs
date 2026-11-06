@@ -435,13 +435,22 @@ pub const fn parse_i64(v: &LimitValue) -> Option<i64> {
 /// unread or unparsable write is refused like PID 1's unread write.
 #[inline(always)]
 pub const fn sysctl_write_harmful(kind: u8, written: Option<LimitValue>) -> bool {
-    let v = match written {
+    match written {
         Some(w) => match parse_i64(&w) {
-            Some(v) => v,
-            None => return true,
+            Some(v) => sysctl_value_harmful(kind, v),
+            None => true,
         },
-        None => return true,
-    };
+        None => true,
+    }
+}
+
+/// Lot 280a: whether `v`, the integer the kernel would store in the
+/// sysctl of `kind`, aborts or starves the agent — the floors of
+/// [`sysctl_write_harmful`] (the write deny's, on the bytes it read) and of
+/// `common::sysctl_judge` (the `cgroup/sysctl` program's, on the kernel's
+/// copy), one table.
+#[inline(always)]
+pub const fn sysctl_value_harmful(kind: u8, v: i64) -> bool {
     match kind {
         SYSCTL_OVERCOMMIT_MEMORY => v == 2,
         SYSCTL_OVERCOMMIT_RATIO => v < 50,

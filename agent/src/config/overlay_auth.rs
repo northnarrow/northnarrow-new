@@ -552,6 +552,17 @@ impl OverlayGate {
     pub fn is_signed(&self, kind: OverlayKind, path: &Path) -> bool {
         matches!(self.check(kind, path), Decision::Accepted { .. })
     }
+
+    /// Lot 280a: whether `text` — what a loader applies from `path`
+    /// ([`Self::verified`]) — is the content a valid signature covers
+    /// there: the per-sysctl opt-out is honoured only then, never from an
+    /// unsigned file loaded through the escape hatch.
+    pub fn signs(&self, kind: OverlayKind, path: &Path, text: &str) -> bool {
+        match self.check(kind, path) {
+            Decision::Accepted { sha256, .. } => sha256 == hex(&content_sha256(text.as_bytes())),
+            _ => false,
+        }
+    }
 }
 
 /// The audit entry a decision makes, if any: a newly accepted signature, or
@@ -1115,6 +1126,68 @@ mod tests {
         assert!(
             validate_content(OverlayKind::ProcessCommAllowlist, "# comment\n+backupd\n").is_ok()
         );
+    }
+
+    /// Named test (lot 280a): the per-sysctl opt-out with a valid signature
+    /// is in force — tuned's `sched_rt_runtime_us = -1` is let through and
+    /// recorded (`OptedOut`) — and with an invalid one it is not: an edit
+    /// after signing leaves the defaults (refused), and so does an unsigned
+    /// file loaded through the escape hatch (its rules apply, its
+    /// `sysctl-allow` is withheld).
+    #[test]
+    fn the_sysctl_opt_out_is_honoured_only_with_a_valid_signature() {
+        use crate::decision::rule_policy::boot_policy;
+        use common::cgroup_limits::SYSCTL_SCHED_RT_RUNTIME as RT;
+        use common::sysctl_judge::{sysctl_kernel_verdict, SysctlVerdict};
+        use nn_linux::sysctl_cgroup::{opt_out_for, opt_outs_of, set_opt_outs, Applied};
+        let body = "sysctl-allow kernel.sched_rt_runtime_us -1\nenforce R020\n";
+        // what the start does: the gate's text, and whether it signs it
+        let start = |gate: &OverlayGate, p: &Path| match gate.verified(OverlayKind::RulePolicy, p) {
+            Verified::Content { path, text } => {
+                let signed = gate.signs(OverlayKind::RulePolicy, &path, &text);
+                let policy = boot_policy(Some((&path, &text))).policy;
+                set_opt_outs(opt_outs_of(&policy), signed, None)
+            }
+            _ => set_opt_outs(Vec::new(), false, None),
+        };
+        let tuned = || sysctl_kernel_verdict(RT, false, Some(-1), opt_out_for(RT));
+        let (dir, key, admin_pub) = setup("config-manage");
+        let p = write_signed(dir.path(), &key, OverlayKind::RulePolicy, body, 100);
+        let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::default());
+        assert!(gate.signs(OverlayKind::RulePolicy, &p, body));
+        assert!(!gate.signs(
+            OverlayKind::RulePolicy,
+            &p,
+            "sysctl-allow kernel.pid_max 1\n"
+        ));
+        assert_eq!(
+            start(&gate, &p),
+            Applied::InForce {
+                count: 1,
+                kernel: false
+            }
+        );
+        assert_eq!(opt_out_for(RT), Some((-1, -1)));
+        assert_eq!(tuned(), SysctlVerdict::OptedOut, "allowed and recorded");
+        // an invalid signature: the content edited after signing
+        std::fs::write(
+            &p,
+            "sysctl-allow kernel.sched_rt_runtime_us -1..0\nenforce R020\n",
+        )
+        .unwrap();
+        assert!(!gate.signs(OverlayKind::RulePolicy, &p, body));
+        assert_eq!(start(&gate, &p), Applied::Withheld { count: 0 });
+        assert_eq!(opt_out_for(RT), None);
+        assert_eq!(tuned(), SysctlVerdict::Refuse, "denied");
+        // the escape hatch loads the unsigned text: the opt-out withheld
+        let mut hatch = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::default());
+        hatch.allow_unsigned = true;
+        assert!(matches!(
+            hatch.verified(OverlayKind::RulePolicy, &p),
+            Verified::Content { .. }
+        ));
+        assert_eq!(start(&hatch, &p), Applied::Withheld { count: 1 });
+        assert_eq!(tuned(), SysctlVerdict::Refuse, "denied");
     }
 
     /// Lab PR 236: the per-rule policy is an overlay like the others — a

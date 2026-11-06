@@ -1100,6 +1100,14 @@ pub enum FsProtectOperation {
     /// (overcommit, `pid_max`, `threads-max`, `max_map_count`, real-time
     /// throttling).
     Sysctl,
+    /// Lot 280a: the same, refused by the `cgroup/sysctl` program on the
+    /// kernel's copy of the write; `target_dev` the kind
+    /// (`common::sysctl_judge::record_of`), `target_ino` the value.
+    SysctlValue,
+    /// Lot 280a: NOT a refusal — a guarded sysctl's write the signed
+    /// per-sysctl opt-out alone let through; the target as
+    /// [`Self::SysctlValue`]'s.
+    SysctlOptOut,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1138,6 +1146,8 @@ impl FsProtectOperation {
             crate::wire::FS_OP_IOPRIO => Self::Ioprio,
             FS_OP_CGROUP_JOIN => Self::CgroupJoin,
             crate::wire::FS_OP_SYSCTL => Self::Sysctl,
+            crate::wire::FS_OP_SYSCTL_VALUE => Self::SysctlValue,
+            crate::wire::FS_OP_SYSCTL_OPT_OUT => Self::SysctlOptOut,
             other => Self::Unknown(other),
         }
     }
@@ -1174,6 +1184,8 @@ impl FsProtectOperation {
             Self::Ioprio => "ioprio",
             Self::CgroupJoin => "cgroup_join",
             Self::Sysctl => "sysctl",
+            Self::SysctlValue => "sysctl_value",
+            Self::SysctlOptOut => "sysctl_opt_out",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -1741,6 +1753,17 @@ mod tests {
                 FsProtectOperation::Sysctl,
                 "sysctl",
             ),
+            // Lot 280a
+            (
+                crate::wire::FS_OP_SYSCTL_VALUE,
+                FsProtectOperation::SysctlValue,
+                "sysctl_value",
+            ),
+            (
+                crate::wire::FS_OP_SYSCTL_OPT_OUT,
+                FsProtectOperation::SysctlOptOut,
+                "sysctl_opt_out",
+            ),
         ];
         for (byte, op, name) in cases {
             assert_eq!(FsProtectOperation::from_wire(byte), op);
@@ -1748,8 +1771,8 @@ mod tests {
             assert_eq!(op.to_string(), name);
         }
         assert_eq!(
-            FsProtectOperation::from_wire(31),
-            FsProtectOperation::Unknown(31)
+            FsProtectOperation::from_wire(33),
+            FsProtectOperation::Unknown(33)
         );
     }
     use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};

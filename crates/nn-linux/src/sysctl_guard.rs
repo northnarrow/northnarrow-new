@@ -157,14 +157,22 @@ fn threads_default(mem_total: u64) -> String {
 
 /// The guarded sysctls under `root` (`/` on the host, a directory in the
 /// tests) judged, the harmful ones put back (`write`: false in a dry run).
+/// Lot 280a: a value the signed per-sysctl opt-out in force allows
+/// (`crate::sysctl_cgroup::opt_out_for`) is left, a `sysctl_opted_out`
+/// finding.
 pub fn check(root: &Path, mem_total: u64, write: bool) -> Vec<Seen> {
-    check_with(root, mem_total, |path, text| {
-        if write {
-            std::fs::write(path, text)
-        } else {
-            Ok(())
-        }
-    })
+    check_with(
+        root,
+        mem_total,
+        &crate::sysctl_cgroup::opt_out_for,
+        |path, text| {
+            if write {
+                std::fs::write(path, text)
+            } else {
+                Ok(())
+            }
+        },
+    )
 }
 
 /// The RT period the round judges the runtime against (`/proc/sys/kernel/
@@ -186,11 +194,12 @@ pub fn rt_restore(period: i64) -> (Option<i64>, i64) {
     }
 }
 
-/// [`check`] with the writer given (the tests' failing one, the review of
-/// #497, D5 M1).
+/// [`check`] with the opt-outs in force and the writer given (the tests'
+/// failing one, the review of #497, D5 M1).
 pub fn check_with(
     root: &Path,
     mem_total: u64,
+    opt_out: &dyn Fn(u8) -> Option<(i64, i64)>,
     mut put: impl FnMut(&Path, &str) -> std::io::Result<()>,
 ) -> Vec<Seen> {
     let read = |p: &str| {
@@ -230,6 +239,25 @@ pub fn check_with(
         };
         if !harmful {
             continue;
+        }
+        // Lot 280a: a value the signed opt-out allows — the operator's
+        // (tuned's realtime profile): left, said
+        if let (Some((min, max)), Ok(v)) = (opt_out(*kind), now.parse::<i64>()) {
+            if min <= v && v <= max {
+                out.push(Seen {
+                    kind: "sysctl_opted_out",
+                    detail: format!(
+                        "{path} is {now:?}, which the agent refuses outside a window: left — the \
+                         signed per-rule policy's sysctl-allow allows {}",
+                        if min == max {
+                            min.to_string()
+                        } else {
+                            format!("{min}..{max}")
+                        }
+                    ),
+                });
+                continue;
+            }
         }
         // strict accounting with room: the operator's
         if *kind == SYSCTL_OVERCOMMIT_MEMORY && ratio_ok && (kbytes == 0 || kbytes >= 1 << 20) {
@@ -358,7 +386,7 @@ mod tests {
     #[test]
     fn a_restore_that_fails_is_not_restored() {
         let d = host(&[("/proc/sys/kernel/pid_max", "300\n")]);
-        let r = check_with(d.path(), 16 << 30, |_, _| {
+        let r = check_with(d.path(), 16 << 30, &|_| None, |_, _| {
             Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
         });
         assert_eq!(r.len(), 1, "{r:?}");
@@ -414,6 +442,35 @@ mod tests {
             assert!(r >= 1, "{p}");
             assert!(!rt_throttling_off(r, np.unwrap_or(p)), "{p} → {r}");
         }
+    }
+
+    /// Lot 280a: a harmful value the signed opt-out allows is left by the
+    /// round (tuned's realtime profile keeps its -1), said once a round as a
+    /// finding; outside its range it is put back as before.
+    #[test]
+    fn the_round_leaves_a_value_the_signed_opt_out_allows() {
+        use common::cgroup_limits::SYSCTL_PID_MAX;
+        let rt_only = |k: u8| (k == SYSCTL_SCHED_RT_RUNTIME).then_some((-1, -1));
+        let d = host(&[
+            ("/proc/sys/kernel/sched_rt_runtime_us", "-1\n"),
+            ("/proc/sys/kernel/pid_max", "300\n"),
+        ]);
+        let r = check_with(d.path(), 16 << 30, &rt_only, |p, t| std::fs::write(p, t));
+        let kinds: Vec<_> = r.iter().map(|s| s.kind).collect();
+        assert_eq!(kinds, ["sysctl_restored", "sysctl_opted_out"], "{r:?}");
+        assert!(r[1].detail.contains("sysctl-allow allows -1"), "{r:?}");
+        let read = |p: &str| std::fs::read_to_string(d.path().join(p)).unwrap();
+        assert_eq!(read("proc/sys/kernel/sched_rt_runtime_us"), "-1\n");
+        assert_eq!(read("proc/sys/kernel/pid_max"), "32768\n");
+        // outside the range: put back
+        let pm = |k: u8| (k == SYSCTL_PID_MAX).then_some((4096, 8192));
+        let d = host(&[("/proc/sys/kernel/pid_max", "300\n")]);
+        let r = check_with(d.path(), 16 << 30, &pm, |p, t| std::fs::write(p, t));
+        assert_eq!(r[0].kind, "sysctl_restored", "{r:?}");
+        let d = host(&[("/proc/sys/kernel/pid_max", "8192\n")]);
+        let r = check_with(d.path(), 16 << 30, &pm, |p, t| std::fs::write(p, t));
+        assert_eq!(r[0].kind, "sysctl_opted_out", "{r:?}");
+        assert!(r[0].detail.ends_with("allows 4096..8192"), "{r:?}");
     }
 
     /// R1: `ftrace_enabled=0` (set at boot, inside a window) is put back to

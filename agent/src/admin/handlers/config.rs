@@ -99,6 +99,14 @@ fn config_overlay_set(
             // Lot 277: the new policy's cgroup paths and unit names to the
             // kernel (a move into one is signed).
             nn_linux::cgroup_join::sync_names(&rule_policy.current());
+            // Lot 280a: its sysctl opt-outs in force (the request's
+            // signature verified above: honoured)
+            if let Some(detail) =
+                nn_linux::sysctl_cgroup::apply_policy(&rule_policy.current(), true)
+            {
+                warn!(target: "admin.config_overlay", detail = %detail, "sysctl opt-out");
+                nn_linux::boot::degradation::report("rule_policy", &detail);
+            }
             warn!(
                 target: "admin.config_overlay",
                 path = %target.display(),
