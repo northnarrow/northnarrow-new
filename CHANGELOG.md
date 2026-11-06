@@ -6,6 +6,28 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- The switches that blind the sensors (lot 280b;
+  `docs/design/ANTITAMPER_TRUST_MODEL.md` § Lot 280b). `kernel.ftrace_enabled=0`
+  inside a window: the start-in-cgroup tracker's fork tracepoint (which
+  runs while ftrace does not) checks every new thread group against what
+  its fentry saw — a birth the fentry missed is not known at once and
+  counted (`CGROUP_JOIN_SILENT`); the marks are treated as lost while the
+  switch is off or a birth is missed (signed degradation
+  `cgroup_join_marks`, the period named) and the marks' epoch is reset once
+  ftrace runs again. `debug.kprobes-optimization` joins the guarded sysctls
+  (every write refused outside a window, never opted out, 0 put back);
+  `/sys/kernel/debug/kprobes/enabled` and `/sys/kernel/security/lockdown`
+  are refused outside a window by the write deny's debugfs and securityfs
+  branch (NN-L-AT-001 `kprobes`, `lockdown`), kprobes/enabled put back to
+  1. The host check warns on `lockdown=confidentiality` (its own fix). The
+  capability manifest records the kernel's taint flags and livepatches
+  (`kernel_code`); the kernel-state round (5 s) signs a new taint of code
+  entering the kernel (`kernel_taint`: Critical for an unsigned or forced
+  module, High for an out-of-tree module or a livepatch) and a
+  `cgroup/sysctl` program not the agent's on the root cgroup
+  (`sysctl_root_prog`, High), and the `bpf` hook refuses such an attach to
+  the root outside a window (`sysctl_root_attach`). `nn-lab.sh
+  switches-check` (`deploy/lab/malsim/switches-check.sh`).
 - The guarded sysctls judged on the kernel's copy of the write (lot 280a;
   `docs/design/ANTITAMPER_TRUST_MODEL.md` § Lot 280a). A `cgroup/sysctl`
   program, `nn_sysctl_guard`, linked to the root cgroup (`BPF_LINK_CREATE`

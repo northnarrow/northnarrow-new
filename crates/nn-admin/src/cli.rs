@@ -3254,6 +3254,31 @@ fn capability_lines(v: &serde_json::Value) -> Vec<String> {
             ));
         }
     }
+    // Lot 280b: the kernel's taint flags and livepatches (a manifest from
+    // before the lot has none)
+    let k = &m["kernel_code"];
+    if k.is_object() {
+        let lp: Vec<String> = k["livepatches"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(clean)).collect())
+            .unwrap_or_default();
+        lines.push(format!(
+            "kernel code       : {}; livepatches: {}",
+            match k["tainted"].as_u64() {
+                Some(0) => "not tainted".to_string(),
+                Some(t) => format!("tainted {t} ({})", clean(k["taint"].as_str().unwrap_or(""))),
+                None => format!(
+                    "taint not read ({})",
+                    clean(k["taint"].as_str().unwrap_or(""))
+                ),
+            },
+            if lp.is_empty() {
+                "none".to_string()
+            } else {
+                lp.join(", ")
+            }
+        ));
+    }
     let d = list("degradations");
     lines.push(format!("degradations      : {}", d.len()));
     lines.extend(d.into_iter().map(|l| format!("  - {l}")));
@@ -6209,6 +6234,32 @@ mod flow_sock_line_tests {
         assert!(
             text.contains("contract          : (none: an agent older than the sensor contract)"),
             "{text}"
+        );
+        // lot 280b: no kernel_code (an older agent's manifest), no line
+        assert!(!text.contains("kernel code"), "{text}");
+    }
+
+    /// Lot 280b (named): the manifest's kernel code — the taint mask and
+    /// its letters, the livepatches — on a line of its own.
+    #[test]
+    fn capabilities_print_the_kernel_code() {
+        let line = |k: serde_json::Value| {
+            capability_lines(&serde_json::json!({ "manifest": { "kernel_code": k } }))
+                .into_iter()
+                .find(|l| l.starts_with("kernel code"))
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            line(serde_json::json!({"tainted": 12288, "taint": "OE", "livepatches": ["lp_cve"]})),
+            "kernel code       : tainted 12288 (OE); livepatches: lp_cve"
+        );
+        assert_eq!(
+            line(serde_json::json!({"tainted": 0, "taint": ""})),
+            "kernel code       : not tainted; livepatches: none"
+        );
+        assert_eq!(
+            line(serde_json::json!({"tainted": null, "taint": "/proc/sys/kernel/tainted: gone"})),
+            "kernel code       : taint not read (/proc/sys/kernel/tainted: gone); livepatches: none"
         );
     }
 

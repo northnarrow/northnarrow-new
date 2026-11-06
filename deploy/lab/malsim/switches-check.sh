@@ -53,8 +53,21 @@ sev_of() { since "$DET" "$1" | grep "\"operation\":\"$2\"" | grep -o '"severity"
 WIN_END=0
 window() { WIN_END=$(( $(date +%s) + ${1:-60} )); sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs "${1:-60}" >/dev/null 2>&1; }
 no_window() { while (( $(date +%s) <= WIN_END + 2 )); do sleep 1; done; }
+# the unit refuses a manual stop: the agent ended by a signal inside a
+# window, systemd starts it again (a restart ends the window)
+restart_agent() {
+    local old new i
+    window 300 || { bad "trusted-installer-grant"; return 1; }
+    old=$(sudo cat /run/northnarrow/agent.pid 2>/dev/null)
+    sudo systemctl kill --signal=SIGTERM northnarrow-agent
+    for i in $(seq 1 60); do
+        sleep 1
+        new=$(sudo cat /run/northnarrow/agent.pid 2>/dev/null)
+        [[ -n $new && $new != "$old" ]] && sudo kill -0 "$new" 2>/dev/null && { sleep 8; WIN_END=0; return 0; }
+    done
+    sudo systemctl start northnarrow-agent; sleep 8; WIN_END=0
+}
 status_lines() { sudo "$NNADMIN" status --key "$KEY" 2>/dev/null | grep -E "$1" | sed 's/^ *//'; }
-tracker_dir() { sudo ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* 2>/dev/null | head -1; }
 # an array of u64's values, in key order, as one line (bpftool -j: raw
 # bytes, or the formatted value with BTF)
 map_words() {
@@ -78,11 +91,14 @@ ids = [m["id"] for m in json.load(sys.stdin) if m.get("name") == sys.argv[1]]
 print(max(ids) if ids else "")' "$1"
 }
 silent() { local id; id=$(map_id CGROUP_JOIN_SIL); [[ -n $id ]] && map_words id "$id" | awk '{print $2}'; }
-epoch_boot() { map_words pinned "$(tracker_dir)/CGROUP_JOIN_EPOCH" | awk '{print $2}'; }
-lost_byte() { # <tgid>: its byte in the pinned CGROUP_JOIN_LOST (64 a slot)
-    local t=$1 slot byte
-    slot=$(( t / 64 )); byte=$(( t % 64 ))
-    sudo bpftool -j map lookup pinned "$(tracker_dir)/CGROUP_JOIN_LOST" key $(( slot & 255 )) $(( (slot >> 8) & 255 )) $(( (slot >> 16) & 255 )) 0 2>/dev/null \
+# (by id: the tracker's pin directory refuses a path open to anyone but the
+# agent's family)
+epoch_boot() { local id; id=$(map_id CGROUP_JOIN_EPO); [[ -n $id ]] && map_words id "$id" | awk '{print $2}'; }
+lost_byte() { # <tgid>: its byte in CGROUP_JOIN_LOST (64 a slot)
+    local t=$1 slot byte id
+    slot=$(( t / 64 )); byte=$(( t % 64 )); id=$(map_id CGROUP_JOIN_LOS)
+    [[ -n $id ]] || return
+    sudo bpftool -j map lookup id "$id" key $(( slot & 255 )) $(( (slot >> 8) & 255 )) $(( (slot >> 16) & 255 )) 0 2>/dev/null \
         | python3 -I -c '
 import json, sys
 v = json.load(sys.stdin)["value"]
@@ -158,8 +174,8 @@ no_window
 
 echo "== T2. the kprobes' switches"
 d0=$(lines "$DET")
-if [[ -e $KE ]]; then
-    r=$(echo 0 | sudo tee "$KE" 2>&1 >/dev/null); now=$(cat "$KE")
+if sudo test -e "$KE"; then
+    r=$(echo 0 | sudo tee "$KE" 2>&1 >/dev/null); now=$(sudo cat "$KE")
     [[ $r == *"not permitted"* && $now == 1 ]] && pass "T2 kprobes/enabled=0 outside a window refused, kept 1" || bad "T2 kprobes/enabled [$r] now $now"
 else bad "T2 $KE absent"; fi
 if [[ -e $KO ]]; then
@@ -172,13 +188,13 @@ o=$(ops "$d0"); echo "    signed: $o"
 [[ ! -e $KO || $o == *'"sysctl'* ]] && pass "T2 the sysctl refusal signed" || bad "T2 no sysctl record: $o"
 a0=$(lines "$AUDIT")
 window 20
-echo 0 | sudo tee "$KE" >/dev/null; inside=$(cat "$KE")
+echo 0 | sudo tee "$KE" >/dev/null; inside=$(sudo cat "$KE")
 no_window
-for i in $(seq 1 40); do [[ $(cat "$KE") == 1 ]] && break; sleep 1; done
-back=$(cat "$KE"); rs=$(since "$AUDIT" "$a0" | grep -c 'kprobes/enabled was')
+for i in $(seq 1 40); do [[ $(sudo cat "$KE") == 1 ]] && break; sleep 1; done
+back=$(sudo cat "$KE"); rs=$(since "$AUDIT" "$a0" | grep -c 'kprobes/enabled was')
 echo "    inside a window: 0 written ($inside); after its close: $back; signed restores: $rs"
 [[ $inside == 0 && $back == 1 && $rs -ge 1 ]] && pass "T2 a 0 written inside a window put back to 1, signed (sysctl_restored)" || bad "T2 inside=$inside back=$back restores=$rs"
-[[ $(cat "$KE") == 1 ]] || { window 15; echo 1 | sudo tee "$KE" >/dev/null; no_window; }
+[[ $(sudo cat "$KE") == 1 ]] || { window 15; echo 1 | sudo tee "$KE" >/dev/null; no_window; }
 
 echo "== T3. the lockdown file"
 d0=$(lines "$DET"); m0=$(cat "$LD" 2>/dev/null)
@@ -197,9 +213,20 @@ if [[ -d /lib/modules/$(uname -r)/build ]] && command -v make >/dev/null && comm
     mkdir -p "$MD"
     printf '#include <linux/module.h>\nstatic int __init h(void){return 0;}\nstatic void __exit g(void){}\nmodule_init(h);\nmodule_exit(g);\nMODULE_LICENSE("GPL");\nMODULE_DESCRIPTION("nn lot 280b taint probe");\n' > "$MD/nn280b_taint.c"
     echo 'obj-m := nn280b_taint.o' > "$MD/Makefile"
-    if make -s -C "/lib/modules/$(uname -r)/build" M="$MD" modules >/dev/null 2>&1 && sudo insmod "$MD/nn280b_taint.ko" 2>/dev/null; then
-        how="an unsigned out-of-tree module loaded (insmod)"
+    if make -s -C "/lib/modules/$(uname -r)/build" M="$MD" modules >/dev/null 2>&1; then
+        # outside a window the agent's own module-load rules answer the
+        # insmod first (lab r1: killed); inside one it loads
+        r=$(sudo insmod "$MD/nn280b_taint.ko" 2>&1; echo "rc=$?")
+        echo "    insmod outside a window: $(tr '\n' ' ' <<<"$r"); signed: $(ops "$d0")"
+        if lsmod | grep -q '^nn280b_taint'; then
+            how="an unsigned out-of-tree module loaded (insmod, outside a window)"
+        else
+            window 60
+            sudo insmod "$MD/nn280b_taint.ko" 2>/dev/null
+            lsmod | grep -q '^nn280b_taint' && how="an unsigned out-of-tree module loaded (insmod, inside a window)"
+        fi
         sudo rmmod nn280b_taint 2>/dev/null
+        no_window
     fi
     rm -rf "$MD"
 fi
@@ -216,13 +243,20 @@ echo 32768 | sudo tee /proc/sys/kernel/tainted >/dev/null
 sleep 9
 sevK=$(sev_of "$d1" kernel_taint); echo "    simulated: K written to kernel.tainted; severities: $sevK"
 [[ $sevK == *High* && $sevK != *Critical* ]] && pass "T4 a new K (livepatch) taint signed High (simulated)" || bad "T4 K: [$sevK]"
-kc=$(sudo "$NNADMIN" capabilities --key "$KEY" --json 2>/dev/null | python3 -I -c 'import json,sys; k=json.load(sys.stdin).get("kernel_code") or {}; print(k.get("tainted"), k.get("taint"))' 2>/dev/null)
+kc=$(sudo "$NNADMIN" capabilities --key "$KEY" --json 2>/dev/null | python3 -I -c 'import json,sys; k=json.load(sys.stdin).get("manifest", {}).get("kernel_code") or {}; print(k.get("tainted"), k.get("taint"))' 2>/dev/null)
 echo "    manifest kernel_code: $kc"
 [[ $kc == "$(cat /proc/sys/kernel/tainted) "* ]] && pass "T4 the manifest records the taint ($kc)" || bad "T4 manifest [$kc]"
 
 echo "== T5. a cgroup/sysctl program on the root cgroup"
 P=/usr/local/libexec/nn280b-sysctl-probe
 cc -O2 -o /tmp/nn280b-probe "$ROOT/deploy/lab/adversarial/sysctl-child-probe.c" && sudo install -m 0755 /tmp/nn280b-probe "$P"; rm -f /tmp/nn280b-probe
+# a lab build (debug-trigger) runs the BPF guard in observe mode: the
+# refusal is checked with the guard enforcing (NN_BPF_DEFENSE_ENFORCE=1,
+# the manager's environment), then the agent is started without it again
+ENF=0
+if [[ -x $P ]] && ! sudo grep -qa 'NN_BPF_DEFENSE_ENFORCE=1' "/proc/$(sudo cat /run/northnarrow/agent.pid)/environ" 2>/dev/null; then
+    sudo systemctl set-environment NN_BPF_DEFENSE_ENFORCE=1 && ENF=1 && restart_agent
+fi
 if [[ -x $P ]]; then
     PR0=$(cat "$PR"); d0=$(lines "$DET")
     c=$(sudo "$P" "$CG" multi kernel/printk_ratelimit "$PR0" 300); echo "    outside a window: $c"
@@ -240,6 +274,10 @@ if [[ -x $P ]]; then
     sudo rm -f "$P"
     no_window
 else bad "T5 the probe was not built"; fi
+if [[ $ENF == 1 ]]; then
+    sudo systemctl unset-environment NN_BPF_DEFENSE_ENFORCE
+    restart_agent
+fi
 
 echo "switches check: $( ((fail)) && echo FAIL || echo PASS)"
 exit $fail

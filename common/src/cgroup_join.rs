@@ -545,8 +545,10 @@ mod tests {
         assert!(!unseen_birth(100, 100, false), "the arming's own tick");
         assert!(!unseen_birth(100, 99, false), "started before the arming");
         assert!(!unseen_birth(0, 101, false), "not armed");
-        assert_eq!(SILENT_SLOTS, 3);
-        assert!(SILENT_ARMED < SILENT_SLOTS && SILENT_UNSEEN < SILENT_SLOTS);
-        assert!(SILENT_LAST_NS < SILENT_SLOTS);
+        const {
+            assert!(SILENT_SLOTS == 3);
+            assert!(SILENT_ARMED < SILENT_SLOTS && SILENT_UNSEEN < SILENT_SLOTS);
+            assert!(SILENT_LAST_NS < SILENT_SLOTS);
+        }
     }
 }

@@ -208,7 +208,8 @@ stopped (`stale`). It does not hold against **an adaptive root**: the probe
 child is the agent's own binary run with `--telemetry-probe`, which a root
 watching the execs can recognise and serve, re-arming what it disarmed for
 the probe's few milliseconds; kprobes can be switched off as a whole through
-debugfs (`/sys/kernel/debug/kprobes/enabled`); and the ten sources the probe
+debugfs (`/sys/kernel/debug/kprobes/enabled`: refused outside a window since
+lot 280b, below); and the ten sources the probe
 does not exercise (`evidence: attach_only`; `fs_protect`'s `self_test` is
 one deny hook of sixteen, at the boot) are never verified again after their
 attach. Against a
@@ -228,8 +229,17 @@ ftrace carries (`tcp_connect`'s among them) and, by the kernel's code, the
 BPF-LSM programs — every deny hook. With the switch at `0` (possible only
 inside a window) the tracker misses a birth by `CLONE_INTO_CGROUP` into an
 exempt cgroup (`cgroup_post_fork` silenced), and NN-L-NET-028 loses half
-its evidence; treating the tracker's marks as lost while the `ftrace_enabled`
-degradation holds is lot 280's (the short re-check of #497, NB1).
+its evidence. Since lot 280b (the short re-check of #497, NB1) the tracker
+treats that period as marks lost: its fork tracepoint (`tp_btf`, which goes
+on) checks every new thread group against what its fentry saw — a birth
+the fentry missed is "not known" at once (that process tree, fail closed)
+and counted, the check channel that tells "silent because ftrace is off"
+from "silent because nothing happened"; at every build of the manifest the
+switch at `0` (or unknown) or a birth missed opens a signed
+`cgroup_join_marks` degradation naming when the loss began, and once the
+switch is back at `1` with no birth missed since the last read the marks'
+epoch is reset (every process started before is not known until it exits)
+and the period is signed, the reset's line kept.
 The lab measured it on our own guests (lot 273d, C106c: the run counts of
 the agent's programs under the same load, the switch written `0` inside a
 window, then `1`): on 6.1, 6.8, 6.12 and 7.0 the BPF-LSM programs ran
@@ -255,6 +265,20 @@ only while the switch is on, and the agent holds it there three ways:
 - a `0` set inside a window, or before the agent's start, is put back to
   `1` at the window's close and by the integrity round (`sysctl_restored`,
   signed).
+
+**The kprobes' switches** (lot 280b). `/sys/kernel/debug/kprobes/enabled`
+at `0` disarms every kprobe on the host, the agent's among them (they stay
+registered, silent); `debug.kprobes-optimization` at `0` turns every
+optimised kprobe back into a breakpoint trap (a cost on each probed call,
+not a blindness). Every write of either is refused outside a window,
+whatever it carries — the debugfs file by the write deny's debugfs branch
+(found by its filesystem and its names, `kprobes`), the sysctl by the write
+deny and the `cgroup/sysctl` judge (`sysctl`), never opted out — and a `0`
+set before the start or inside a window is put back to `1` at the window's
+close and by the integrity round, signed as blinding. The lockdown file
+(`/sys/kernel/security/lockdown`, `lockdown`) is refused the same way: a
+raise to `confidentiality` takes the helpers that read kernel memory from
+every BPF program loaded after it (`KERNEL_COMPATIBILITY.md`, "Lockdown").
 
 The sysctl judge of lot 280a is a `cgroup/sysctl` program, which the
 sysctl handler calls directly, not a trampoline: by the kernel's code

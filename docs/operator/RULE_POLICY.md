@@ -530,7 +530,9 @@ sysctl-allow kernel.pid_max 4096..32767
 
 - The name is the `sysctl(8)` one of a guarded sysctl; `kernel.ftrace_enabled`
   is refused (0 stops the BPF trampolines, the agent's deny hooks among
-  them: a window lets a write of it through). Any other name refuses the
+  them: a window lets a write of it through), and so is
+  `debug.kprobes-optimization` (lot 280b: 0 makes every kprobe a breakpoint
+  trap). Any other name refuses the
   file. One line per sysctl; the value a decimal integer, the range's ends
   included and in order.
 - **Honoured only with a valid signature.** The agent writes the range to
