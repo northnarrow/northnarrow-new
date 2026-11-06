@@ -51,6 +51,13 @@ pub const MAX_WINDOW: usize = 4096;
 pub const BUDGET: Duration = Duration::from_millis(1000);
 pub const MARGIN: Duration = Duration::from_millis(2000);
 
+/// What the stop waits for the thread at most: a request's budget and
+/// margin, and a second (lot 288: less when the stop's deadline leaves
+/// less, [`Running::stop`]).
+pub const STOP_WAIT: Duration = BUDGET
+    .saturating_add(MARGIN)
+    .saturating_add(Duration::from_secs(1));
+
 /// The pause of a round that moved nothing, and of a worker not ready.
 pub const IDLE: Duration = Duration::from_millis(200);
 
@@ -97,11 +104,11 @@ pub struct Running {
 
 impl Running {
     /// Stop it: its cursors written, its stop row signed; waited for at
-    /// most a request's budget and margin.
-    pub fn stop(mut self) {
+    /// most `wait` ([`STOP_WAIT`], or what the stop's deadline leaves).
+    pub fn stop(mut self, wait: Duration) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(j) = self.join.take() {
-            let until = Instant::now() + BUDGET + MARGIN + Duration::from_secs(1);
+            let until = Instant::now() + wait;
             while !j.is_finished() && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(20));
             }

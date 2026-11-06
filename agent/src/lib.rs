@@ -227,6 +227,9 @@ pub mod sensors;
 pub use nn_evidence::verify_lines;
 /// The agent's stop (R11a, lab PR 261: from `main.rs`).
 mod shutdown;
+/// Lot 288 (#125): the stop's deadline — the stop ends within its budget,
+/// under the unit's `TimeoutStopSec`.
+mod stop_deadline;
 /// R09c shim: the shutdown marker's file (its format is nn-proto's) is
 /// nn-linux's.
 pub use nn_linux::shutdown_marker;

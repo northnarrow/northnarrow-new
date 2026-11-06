@@ -776,10 +776,18 @@ impl Dispatcher {
     /// The stop: run what is queued for at most `wait`, answer the rest
     /// "not run: the agent stopped" (counted, signed), end the workers —
     /// a worker whose action hangs is left (named), not waited for — and
-    /// sign the run's end.
+    /// sign the run's end. (The agent's stop is [`Self::stop_by`], lot 288.)
+    #[cfg(test)]
     pub(crate) fn stop(&self, wait: Duration) {
+        self.stop_by(wait, None);
+    }
+
+    /// [`Self::stop`], every wait of it ended by `until` too (lot 288: the
+    /// stop's deadline, `StopDeadline::drain_until`).
+    pub(crate) fn stop_by(&self, wait: Duration, until: Option<Instant>) {
         let s = &self.shared;
-        let deadline = Instant::now() + wait;
+        let by = |at: Instant| until.map_or(at, |u| at.min(u));
+        let deadline = by(Instant::now() + wait);
         while Instant::now() < deadline {
             if s.queue.lock().is_empty() && s.active.load(Ordering::Acquire) == 0 {
                 break;
@@ -809,7 +817,7 @@ impl Dispatcher {
         }
         s.ready.notify_all();
         let threads: Vec<_> = std::mem::take(&mut *s.threads.lock());
-        let joined_by = Instant::now() + Duration::from_secs(2);
+        let joined_by = by(Instant::now() + Duration::from_secs(2));
         for t in threads {
             while !t.is_finished() && Instant::now() < joined_by {
                 std::thread::park_timeout(Duration::from_millis(10));

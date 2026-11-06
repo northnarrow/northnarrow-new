@@ -445,6 +445,62 @@ fn the_stop_answers_what_it_could_not_run() {
     assert!(!st.running);
 }
 
+/// Lot 288 (#125): the stop's deadline ends both of its waits — for the
+/// queue (here 5 s) and for a worker held in its action (2 s) — at its
+/// `until`; what is queued is answered "not run" all the same.
+#[test]
+fn the_stop_s_deadline_ends_both_of_its_waits() {
+    let (d, _journal, sink) = dispatcher(true, 64);
+    let hold = d.shared.hold.lock();
+    submit_one(
+        &d,
+        &decided(
+            "NN-L-T-0",
+            ResponseAction::KillProcess,
+            Severity::High,
+            9100,
+        ),
+    );
+    let t0 = Instant::now();
+    while d.status().queue.taken == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for i in 1..4u32 {
+        submit_one(
+            &d,
+            &decided(
+                &format!("NN-L-T-{i}"),
+                ResponseAction::KillProcess,
+                Severity::High,
+                9100 + i,
+            ),
+        );
+    }
+    let at = Instant::now();
+    d.stop_by(
+        Duration::from_secs(5),
+        Some(at + Duration::from_millis(150)),
+    );
+    let took = at.elapsed();
+    drop(hold);
+    assert!(
+        took >= Duration::from_millis(150) && took < Duration::from_secs(1),
+        "{took:?}"
+    );
+    let st = d.status();
+    assert_eq!(st.not_run_at_stop, 3, "{st:?}");
+    assert!(!st.running);
+    let t0 = Instant::now();
+    while sink.queued_for_test().len() < 4 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "every decision answered"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// A dispatcher whose thread is not running answers every response "not
 /// run", counts it — never runs it on the caller's thread.
 #[test]
