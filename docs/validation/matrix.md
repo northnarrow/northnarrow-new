@@ -204,7 +204,7 @@ brings each one back:
 |---|---|---|---|---|---|---|---|
 | `chain` (NN-L-CHAIN-001..008) | 8 | | | | | | |
 | `process` (R001–R018, R020) | 19 | | | | | | |
-| `fim` (NN-L-FIM-001..025) | 25 | | | | | | |
+| `fim` (NN-L-FIM-001..026) | 26 | | | | | | |
 | `canary` (NN-L-CANARY-001..004) | 4 | | | | | | |
 | `net` (NN-L-NET-*) | 20 | | | | | | |
 | `io_uring` (NN-L-IOU-001/002) | 2 | | | | | | |
@@ -213,5 +213,5 @@ brings each one back:
 | `exploit-guard` (NN-L-EPG-001/002) | 2 | | | | | | |
 | `impact` (NN-L-IMP-001/002) | 2 | | | | | | |
 | `evasion` (NN-L-EVA-001..004) | 4 | | | | | | |
-| **Total** | **89** | | | | | | |
+| **Total** | **90** | | | | | | |
 | **Critical sub-gate** | **29** | | | | | | |

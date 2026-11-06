@@ -482,20 +482,27 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    since inside a package transaction, or named by a signed `module-allow`, \
                    loads; any other file and every `init_module` buffer are refused outside a \
                    signed trusted-installer window in the deny mode (the default), let through \
-                   in the record mode (`alert R018`). Who loads is not asked. Killed: a file \
-                   outside `/lib/modules` or deeper than any module directory, refused or not. \
-                   Recorded: any other untrusted file or buffer (High), a load a window or an \
-                   opt-out let through (Medium); a load the kernel did not judge (the agent's \
-                   first seconds) by the path and the package database.",
+                   in the record mode (`alert R018`). A DKMS or akmods build in \
+                   `updates/dkms/` or `extra/` whose content is the registered build (DKMS's \
+                   copy, the package's digest), written since boot outside a recognised package \
+                   transaction (dnf's and yum's scripts recognised by the file their exec \
+                   named), is let through and recorded High under every policy but `enforce \
+                   R018`, which refuses it; a file of those directories nothing vouches for is \
+                   refused. Who loads is not asked. Killed: a file outside `/lib/modules` or \
+                   deeper than any module directory, refused or not. Recorded: any other \
+                   untrusted file or buffer, an unattested DKMS or akmods build (High), a load \
+                   a window or an opt-out let through (Medium); a load the kernel did not judge \
+                   (the agent's first seconds) by the path and the package database.",
         false_positives: "None measured on the benign corpus (lot 285: udev's and the services' \
                           loads, docker's, k3s', a DKMS build under apt). A module built by \
-                          hand (`make modules_install`, a root shell's `dkms install`), a \
-                          vendor's installer outside the package manager, an RPM host's DKMS \
-                          build under dnf (its lineage is a Python script's) and a module built \
-                          after boot before the agent started are refused until a signed \
-                          `module-allow <module>` (or the next boot, for a DKMS build); an \
-                          administrator who loads a module from a build directory \
-                          (`insmod ~/driver.ko`) is refused and killed.",
+                          hand outside the DKMS and akmods directories (`make \
+                          modules_install`), a vendor's installer outside the package manager \
+                          and a module of the tree written after boot before the agent started \
+                          are refused until a signed `module-allow <module>` (or the next boot); \
+                          a registered DKMS or akmods build written outside a package \
+                          transaction (a root shell's `dkms install`, `akmods` at boot) is let \
+                          through, recorded High; an administrator who loads a module from a \
+                          build directory (`insmod ~/driver.ko`) is refused and killed.",
         how_to_test: "Copy an in-tree module to `/tmp` and `insmod` it: refused (EPERM), \
                       Critical, the loader killed; a renamed loader of a trusted module \
                       (anti-tamper.sh case C58) loads with no record, its copy in `/tmp` \

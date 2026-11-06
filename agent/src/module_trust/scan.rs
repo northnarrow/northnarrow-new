@@ -202,8 +202,9 @@ pub fn classify(
         }
     }
     // the coordinator's matrix: a registered build of a DKMS or akmods
-    // output directory, written outside a recognised transaction
-    let late = !attested && dkms_dir && by != 0;
+    // output directory, written outside a recognised transaction (outside
+    // one, `vouch` is asked only in those directories)
+    let late = !attested && by != 0;
     if flags == 0 && module.is_some_and(|m| inputs.opt_outs.contains(&m)) {
         flags = trust_flag::OPT_OUT;
     } else if flags == 0 && late && inputs.unattested {
@@ -778,6 +779,9 @@ mod tests {
                 "{h:?}"
             );
         }
+        // what vouches for it: the registry (a package first, when one does)
+        assert_eq!(registry(&default)(&f), trust_flag::DKMS);
+        assert_eq!(vouched_by(&f, &default, |_| true), trust_flag::PACKAGE);
         let map = trust_map(
             std::slice::from_ref(&f),
             &default,
