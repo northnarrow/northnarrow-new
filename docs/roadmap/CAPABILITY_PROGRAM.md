@@ -7641,6 +7641,16 @@ number in parentheses is a lab PR.
       active at the start and 30 s later, the judge armed 3.9 to 4.2 s
       after the agent started, 0 R018 from the boot's loads, 56 modules
       loaded (r3, r5).
+    - Found by the CI's privileged suite on #513, and fixed: the LSM pins
+      are named after the hook, and `module_write_observe` was attached
+      pinned on `file_open`, the write-open deny's hook — its pin purged
+      the deny's link (rounds r1 to r5 ran so), and a write-open of the
+      agent's `admin.pub` went through (`cgroup_guard_privileged_e2e`).
+      The write history is now attached unpinned (a named test: one
+      pinned program per hook). Round r6 (ubuntu2404, b953386a): the
+      write-open refused (`EPERM`), both programs loaded, the write
+      history PKG under `dpkg -i` and under the dnf stand-in (both
+      writers), the bootcheck as before (0 R018 from the boot's loads).
     - The seven R018 Medium records of r1's tally were not this lot's: the
       guest had kept an earlier agent's state (`admin.pub` and the lists
       "already present" at the install), and main's R018 recorded a
