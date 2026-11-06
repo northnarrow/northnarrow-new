@@ -7094,3 +7094,111 @@ number in parentheses is a lab PR.
     2.4 s measured; detaching them in parallel at the stop would shorten
     every stop); other kernels than 6.8 not measured.
   - Levels unchanged (C18 1, C23 2).
+- **Lot 280a — the guarded sysctls judged on the kernel's copy of the
+  write; the signed per-sysctl opt-out (Wave 1 of lot 280; C23, C15).**
+  - What was open: lot 273d's declared residual. The write deny
+    (`file_permission`) judges a guarded sysctl's bytes in the writer's
+    memory before the kernel copies them; a second thread of the writer
+    changing them in between put a harmful value in (273d's lab, C106r: 72
+    to 210 of 2,000 flipped writes on 5.15 to 7.0). And no host could keep
+    tuned's `realtime` profile (`kernel.sched_rt_runtime_us = -1`), not
+    even inside a window: the round put it back.
+  - What changed: a `cgroup/sysctl` program, `nn_sysctl_guard`
+    (`agent-ebpf/src/sysctl_guard.rs`; the verdict
+    `common::sysctl_judge`, the agent's half
+    `crates/nn-linux/src/sysctl_cgroup.rs`), linked to the root cgroup with
+    `BPF_LINK_CREATE` and no flag — the kernel attaches a cgroup link
+    `BPF_F_ALLOW_MULTI`; `ALLOW_OVERRIDE` is never asked — and checked with
+    `BPF_PROG_QUERY` (the root's mode multi, ours among its programs). It
+    reads the kernel's copy (`bpf_sysctl_get_new_value`) in base 0
+    (`bpf_strtol`), as the handler does, and judges it with the write
+    deny's floors; the agent's family and a window pass (the writer's tgid
+    read from its task: 5.15 has no `bpf_get_current_pid_tgid` for this
+    program type). A refusal is `EPERM` and a signed NN-L-AT-001
+    `sysctl_value` (the sysctl, the value). Pinned with its link in
+    `/sys/fs/bpf/northnarrow-sysctl` (protected like the pin root; `kept`
+    through `install.sh --upgrade`; swapped by the next start; removed by
+    `uninstall.sh`); the link held open and registered with the BPF guard.
+    Where it cannot be linked, the write deny alone (signed degradation; the
+    manifest's `sysctl_judge` attach point says which). The write deny stays
+    the first layer. The per-rule policy's `sysctl-allow <sysctl>
+    <value>|<min>..<max>` (never `kernel.ftrace_enabled`), in force only
+    from a policy whose signature the agent verified for the text it
+    applies (`OverlayGate::signs`) or a signed `policy set`; every write it
+    lets through recorded (`sysctl_opt_out`, Low, no posture change), the
+    round leaves the value (`sysctl_opted_out`).
+  - The lab, as measured (our own guests under lease k280a, one at a time):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`). Round 1 (d16abc67): the
+      verifier refused the program (`R2 !read_ok`: LLVM read the payload of
+      an `Option<(i64, i64)>` left undefined on its `None` path); the start
+      fell back to the write deny, signed, as designed — and the race, run
+      again on the fallback, put the harmful value in 238 and 210 times of
+      2,000 (pid_max, the RT runtime). The judge then carries no `Option`
+      (`sysctl_judge::{verdict_of, Range}`). Round 2 (ca81a67e):
+      `verifier-check` 96 OK, 0 failing (`nn_sysctl_guard` 884
+      instructions, 3,436 verified); the upgrade's start named the prior
+      judge as "another program" on the root — the kernel releases an
+      unpinned link from its workqueue — so the start asks again (2 s at
+      most), and S5–S7 ran inside the lab's own cleanup window (not
+      counted). Round 3 (b75a17f3), `nn-lab.sh sysctl-check`, all PASS:
+      the judge on the root cgroup (`cgroup_sysctl`, `multi`), its pins,
+      the manifest's `sysctl_judge` whole; a second thread flipping the
+      buffer, **0 of 2,000** writes put `040000` (the kernel's 16384) in
+      `kernel.pid_max` (419 refused) and **0 of 2,000** put 990000 in
+      `kernel.sched_rt_runtime_us` (359 refused), the refusals signed
+      `sysctl_value`; `040000` and `0x4000` written plainly, refused;
+      tuned's `-1` refused without an opt-out, let through and recorded
+      (`sysctl_opt_out`) under a signed `sysctl-allow`, left by the round
+      12 s later (`sysctl_opted_out`), and with the file edited after
+      signing (the agent restarted: `unauthorized_overlay`) put back to
+      950000 and refused again; a program in a child cgroup, attached with
+      no flag, `override` and `multi`, that lets every write through and
+      rewrites the value (4194304 → 4096): `EPERM`, the value kept — the
+      control (an unguarded sysctl) shows it runs and rewrites (5 → 300);
+      the judge's pin removed inside a window, still attached (the agent
+      holds its link); detached (`bpftool link detach`) and the agent
+      restarted: one program on the root, the new one.
+      `upgrade-check`: the judge 380 → 489, one program, its link pinned,
+      `kept` in `bpf-own-ids`; the prior one stayed attached through the
+      purge until the new start (round 2 saw it there). `uninstall`: no
+      judge on the root cgroup, no pins.
+    - **Cost** (24.04, `kernel.bpf_stats_enabled` on for the step only):
+      **455 ns** a judged write (`run_time_ns / run_cnt`, 20,009 calls: the
+      name, the tgid, the window, the copy, `bpf_strtol`, the verdict) and
+      **56 ns** a read (20,009 calls); wall clock, a write of `pid_max`
+      written back as it is: 3,490 / 3,518 ns with the judge attached,
+      2,073 ns detached — the detached runs inside a window, where the
+      write deny lets it through early too, so the difference counts both.
+    - **Ubuntu 22.04** (`5.15.0-202-generic`, b75a17f3): `verifier-check`
+      98 programs, 93 OK, 5 not counted, 0 failing (`nn_sysctl_guard` 886
+      instructions); the judge linked (`sysctl`, `multi`, no other program);
+      the same race on `kernel.pid_max` (140000 / 040000), **0 of 1,000**
+      writes in (255 refused, `sysctl_value` signed); `040000` written
+      plainly, refused. `uninstall`: no judge, no pins.
+    - Every guest left without the agent, its sysctls as they were,
+      powered off.
+  - Host: named tests `an_octal_or_hex_value_below_a_floor_is_denied`,
+    `a_race_thread_is_judged_on_the_kernel_copy` (xtask: the program reads
+    the kernel's copy only, in base 0, no `Option`),
+    `the_sysctl_opt_out_is_honoured_only_with_a_valid_signature` (the
+    agent's gate: signed in force and `OptedOut`; edited after signing, or
+    unsigned through the escape hatch, `Refuse`),
+    `a_child_cgroup_program_cannot_override` (the link's flags, the root's
+    report) and 20 more (`common::sysctl_judge` 5, `sysctl_cgroup` 7, the
+    source-reading ones of `xtask/tests/sysctl_cgroup.rs` 3, the round's
+    opt-out, the kept program, the rule policy's directive, the rule's and
+    the posture's records). 74 mutations of the new code (the
+    verdict 23, the agent's half 23, the policy, rule and posture 10, the
+    gate 2, the eBPF code read by `xtask/tests/sysctl_cgroup.rs` 16): 73
+    caught by a named test — four only once their tests were added (the
+    path's bytes and length, a dotted prefix, a value above the range) —
+    and one argued equivalent (the record's kind masked with `0x1ff`
+    before its `u8` cast).
+  - Open: a `cgroup/sysctl` program attached at the root after ours runs
+    after it and could rewrite what it judged (named at the start, signed;
+    the round is the backstop) — refusing a foreign one outside a window is
+    a candidate for lot 280b; an opt-out names a sysctl, not a program;
+    `bpf_strtol` reads up to 63 characters where the kernel reads 21 (a
+    longer write is refused). 5.15's cost not measured.
+  - Levels unchanged (C23 2 provisional, C15 1): a residual of the
+    anti-tamper closed and an operator switch added, not a new capability.

@@ -1565,8 +1565,9 @@ kept running); on 5.15 the write was `EBUSY`. It is the eighth guarded
   kernel already copied (`bpf_sysctl_get_new_value`) and is not carried
   by ftrace, verified on 5.15 and 6.8, with its link protected from a
   detach outside a window and this hook kept as the second layer. **Closed
-  by lot 280a where that program is attached** (§ Lot 280a below); the
-  residual stays on a host where it is not (the fallback, signed).
+  by lot 280a where that program is attached** (§ Lot 280a below: the same
+  race, 0 of 2,000 writes in on 6.8); the residual stays on a host where it
+  is not (the fallback, signed).
   `ftrace_enabled` is outside this residual: no write of it is judged by
   value.
 - `kernel.ftrace_enabled=0` silences the trampolines until it is put back
