@@ -159,8 +159,13 @@ pub const FALLBACK_EFFECT: &str =
 
 /// The manifest's note of the judge: its attach point, or the fallback.
 pub fn attach_note() -> (String, crate::boot::manifest::Took) {
+    note_of(judge())
+}
+
+/// [`attach_note`] of `judge`.
+fn note_of(judge: Option<&Judge>) -> (String, crate::boot::manifest::Took) {
     use crate::boot::manifest::Took;
-    match judge() {
+    match judge {
         Some(Judge::Attached { .. }) => (ATTACH.to_string(), Took::Whole),
         Some(Judge::Fallback(why)) => (
             format!("lsm:file_permission (the write deny alone: {why})"),
@@ -783,6 +788,22 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// The manifest's note: the judge's attach point whole, the write deny
+    /// as the fallback with why, nothing before the attach.
+    #[test]
+    fn the_manifest_names_the_judge_that_runs() {
+        use crate::boot::manifest::Took;
+        assert_eq!(
+            note_of(Some(&Judge::Attached { others: vec![] })),
+            (ATTACH.to_string(), Took::Whole)
+        );
+        let (n, t) = note_of(Some(&Judge::Fallback("no cgroup v2 mount".into())));
+        assert_eq!(t, Took::Fallback);
+        assert!(n.starts_with("lsm:file_permission"), "{n}");
+        assert!(n.contains("no cgroup v2 mount"), "{n}");
+        assert_eq!(note_of(None), ("not attached".to_string(), Took::Absent));
     }
 
     /// The tests that set the process-wide opt-outs, one at a time.

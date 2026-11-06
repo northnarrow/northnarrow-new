@@ -918,6 +918,13 @@ mod tests {
             "{}",
             p.summary()
         );
+        // a range of one value is that value
+        let one = parse("sysctl-allow kernel.pid_max 4096..4096\n").unwrap();
+        assert_eq!(
+            one.sysctl_opt_outs().collect::<Vec<_>>(),
+            [("kernel.pid_max", SYSCTL_PID_MAX, 4096, 4096)]
+        );
+        assert_eq!(one.render(), "sysctl-allow kernel.pid_max 4096\n");
         assert!(parse("sysctl-allow kernel.pid_max 4096\n")
             .unwrap()
             .summary()

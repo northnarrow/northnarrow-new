@@ -250,6 +250,17 @@ fn the_judge_is_linked_to_the_root_cgroup_multi() {
         ],
     )
     .unwrap();
+    // the fallback and another program on the root are signed degradations
+    in_order(
+        at,
+        &[
+            "crate::sysctl_cgroup::Judge::Attached { others } if !others.is_empty() => {",
+            "report.degraded.push(format!(",
+            "crate::sysctl_cgroup::Judge::Fallback(why) => report.degraded.push(format!(",
+            "crate::sysctl_cgroup::FALLBACK_EFFECT",
+        ],
+    )
+    .unwrap();
     let d = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
     assert!(body(&d, "register_own_objects")
         .contains("pin_name_key(&format!(\"link_{}\", crate::sysctl_cgroup::PROGRAM))"));
