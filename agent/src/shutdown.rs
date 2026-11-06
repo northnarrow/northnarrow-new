@@ -135,9 +135,16 @@ pub(crate) fn stop(
     admin_socket::unlink_socket(&cli.admin_socket);
 
     info!("NorthNarrow agent stopped.");
+    let result = stop_result(stop_reason);
     // what follows is the drop of the start's state, then the runtime's
-    // own stop (`boot::main`)
-    deadline.stage("teardown");
+    // own stop (`boot::main`): resources the process's exit releases too
+    deadline.evidence_done(if result.is_ok() { 0 } else { 1 });
+    result
+}
+
+/// The stop's result: a pump that ended, the responses' thread or the
+/// decision thread lost are failures (the watchdog restarts the agent).
+fn stop_result(stop_reason: &str) -> Result<()> {
     if stop_reason == "sensor_pump_exited" {
         // External audit SNS-001: a failure, not a clean stop.
         anyhow::bail!("a sensor pump exited; the agent stopped so the watchdog restarts it");

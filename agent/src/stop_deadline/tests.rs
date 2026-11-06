@@ -144,6 +144,47 @@ fn a_note_that_blocks_does_not_hold_the_exit() {
     assert!(exited <= at + SHORT.total + SLACK, "{:?}", exited - at);
 }
 
+/// Once the stop's signed rows are written, what blocks is the release of
+/// the process's resources: at the note's point the deadline exits with the
+/// stop's own status, and signs nothing.
+#[test]
+fn after_the_signed_rows_the_deadline_exits_with_the_stop_s_status() {
+    for status in [0, 1] {
+        let (exits, exit) = recorder();
+        let stop = StopDeadline::start_with(SHORT, exit);
+        std::thread::sleep(Duration::from_millis(50));
+        let (notes, note) = noted();
+        let at = Instant::now();
+        stop.begin("sigterm", note);
+        stop.stop_signed();
+        stop.evidence_done(status);
+        let (got, exited) = first_exit(&exits, SHORT.total + SLACK).expect("the deadline exits");
+        assert_eq!(got, status);
+        let note_point = SHORT.total - SHORT.note;
+        assert!(exited >= at + note_point, "{:?}", exited - at);
+        assert!(exited < at + SHORT.total, "{:?}", exited - at);
+        assert!(notes.lock().is_empty(), "no note");
+        let at = Instant::now();
+        stop.finish();
+        assert!(at.elapsed() < Duration::from_millis(200), "the exit came");
+        assert_eq!(exits.lock().len(), 1);
+    }
+}
+
+/// `evidence_done` names the stage: a stop whose signed rows are written
+/// is in its teardown.
+#[test]
+fn the_signed_rows_written_the_stage_is_the_teardown() {
+    let (_exits, exit) = recorder();
+    let stop = StopDeadline::start_with(SHORT, exit);
+    stop.stage("files");
+    stop.evidence_done(0);
+    let st = stop.shared.state.lock();
+    assert_eq!((st.stage, st.evidence_done), ("teardown", Some(0)));
+    drop(st);
+    stop.finish();
+}
+
 /// The note is told the stop signed its `agent_stop` (it signs no other),
 /// and only the first `begin` counts: its reason, its note.
 #[test]
@@ -255,7 +296,12 @@ fn the_budget_fits_the_unit_s_timeout_stop_sec() {
         .unwrap();
     assert_eq!(Duration::from_secs(secs), UNIT_TIMEOUT_STOP);
     assert_eq!(value("SendSIGKILL="), "no");
-    assert!(BUDGET.total + Duration::from_secs(1) <= UNIT_TIMEOUT_STOP);
+    assert!(BUDGET.total + KERNEL_RELEASE <= UNIT_TIMEOUT_STOP);
+    assert!(
+        KERNEL_RELEASE >= Duration::from_millis(2400),
+        "measured: 2.4 s"
+    );
+    assert_eq!(BUDGET.total, Duration::from_secs(2));
     assert!(BUDGET.note + BUDGET.evidence < BUDGET.total);
     assert!(NOTE_LOCK_WAIT < BUDGET.note);
 }
@@ -264,7 +310,7 @@ fn expired(stop_signed: bool) -> Expired {
     Expired {
         reason: "sigterm",
         stage: "decision",
-        after: Duration::from_millis(3300),
+        after: Duration::from_millis(1500),
         stop_signed,
         budget: BUDGET,
     }
@@ -278,8 +324,8 @@ fn the_note_says_the_stage_and_what_stays_isolated() {
     let kept = note_detail(&e, Isolation::Kept);
     for part in [
         "the stop (sigterm)",
-        "stage decision still running after 3300 ms",
-        "budget 4000 ms",
+        "stage decision still running after 1500 ms",
+        "budget 2000 ms",
         "TimeoutStopSec 5 s",
         "status 75",
         "COMBAT isolation kept",
@@ -475,7 +521,9 @@ fn the_agent_s_stop_runs_under_its_deadline() {
             "deadline.stop_signed();",
             "deadline.stage(\"anchor\");",
             "deadline.stage(\"files\");",
-            "deadline.stage(\"teardown\");",
+            "let result = stop_result(stop_reason);",
+            "deadline.evidence_done(if result.is_ok() { 0 } else { 1 });",
+            "result\n}",
         ],
     );
     in_order(
@@ -583,5 +631,5 @@ fn a_stop_with_a_blocked_stage_exits_within_the_deadline() {
     assert!(after_ms >= note_point.as_millis() as u64, "{after_ms}");
     let took = Duration::from_nanos(exit_ns - begin_ns);
     assert!(took >= note_point, "{took:?}");
-    assert!(took < UNIT_TIMEOUT_STOP, "{took:?}");
+    assert!(took < BUDGET.total, "{took:?}");
 }

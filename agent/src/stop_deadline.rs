@@ -1,15 +1,23 @@
 //! Lot 288 (#125): the agent's stop ends in bounded time.
 //!
 //! From the moment the event loop ends (a signal, the admin shutdown, a
-//! dead pump) the stop has [`BUDGET`]`.total` to finish: systemd's
-//! `TimeoutStopSec` of the unit (5 s) less a margin of a second. Each stage
-//! of the stop that waits is bounded by what is left of it ([`StopDeadline::
-//! drain_bound`], [`StopDeadline::left`]); a stage that blocks anyway (a
-//! thread that does not come back to be joined, a lock held, a drop that
-//! waits) is cut by the deadline's own thread: at the note's point it signs
-//! a note if the audit chain is still writable ([`audit_note`]), then the
-//! process exits with [`EXIT_STATUS`] — at [`BUDGET`]`.total` at the latest,
-//! whatever the note does.
+//! dead pump) the stop has [`BUDGET`]`.total` (2 s) to end the process: what
+//! follows its exit — the kernel's release of the agent's BPF programs and
+//! links, 2.4 s measured on ubuntu2404 (lot 288's lab) — must fit in
+//! systemd's `TimeoutStopSec` of the unit (5 s) too ([`KERNEL_RELEASE`]).
+//! Each stage of the stop that waits is bounded by what is left of it
+//! ([`StopDeadline::drain_bound`], [`StopDeadline::left`]); a stage that
+//! blocks anyway (a thread that does not come back to be joined, a lock
+//! held, a drop that waits) is cut by the deadline's own thread at the
+//! note's point:
+//!
+//! - before the stop's signed rows are written, it signs a note if the
+//!   audit chain is still writable ([`audit_note`]), then the process exits
+//!   with [`EXIT_STATUS`] — at [`BUDGET`]`.total` at the latest, whatever
+//!   the note does;
+//! - after them ([`StopDeadline::evidence_done`]) what is left is the
+//!   release of the process's resources, which its exit does in the kernel:
+//!   the process exits with the stop's own status, no note.
 //!
 //! The COMBAT isolation is never touched by the stop: the iptables chain
 //! stays as the run left it (the stop runs no `iptables`, and an exit cuts
@@ -41,18 +49,27 @@ pub(crate) struct Budget {
 }
 
 /// systemd's `TimeoutStopSec` of `northnarrow-agent.service` (a test reads
-/// it from the unit): with `SendSIGKILL=no`, a process still there after
-/// it fails the stop job, and a restart's start is refused.
+/// it from the unit): with `SendSIGKILL=no`, a stop job (the host's
+/// shutdown) leaves a process still there after it running; install.sh's
+/// and uninstall.sh's stop (`systemctl kill -s SIGTERM` in the window)
+/// sends SIGKILL after 10 s.
 pub(crate) const UNIT_TIMEOUT_STOP: Duration = Duration::from_secs(5);
 
-/// The agent's: 4 s in all — [`UNIT_TIMEOUT_STOP`] less a second (the
-/// signal's way to the loop, the process's teardown in the kernel); the
-/// last 0.75 s for the note, the 0.75 s before it for the stop's signed
-/// rows.
+/// What the kernel takes, after the process's exit, to release the agent's
+/// BPF programs and links (the trampolines of its fentry/fexit and LSM
+/// programs, its kprobes, tracepoints and rings) — or what the agent's own
+/// drops take to detach them: 2.4 s on ubuntu2404, kernel 6.8, in both
+/// cases (lot 288's lab: an `_exit` at 3.25 s seen by systemd at 5.67 s, a
+/// clean stop's drops 2.37 s), kept with a margin.
+pub(crate) const KERNEL_RELEASE: Duration = Duration::from_secs(3);
+
+/// The agent's: 2 s in all — [`UNIT_TIMEOUT_STOP`] less
+/// [`KERNEL_RELEASE`]; the last 0.5 s for the note, the 0.5 s before it for
+/// the stop's signed rows, the first second for what drains.
 pub(crate) const BUDGET: Budget = Budget {
-    total: Duration::from_secs(4),
-    note: Duration::from_millis(750),
-    evidence: Duration::from_millis(750),
+    total: UNIT_TIMEOUT_STOP.saturating_sub(KERNEL_RELEASE),
+    note: Duration::from_millis(500),
+    evidence: Duration::from_millis(500),
 };
 
 /// What the note waits for the audit log's lock: a stage that holds it
@@ -100,6 +117,8 @@ struct State {
     note: Option<Note>,
     stage: &'static str,
     stop_signed: bool,
+    /// The stop's signed rows are written: its exit status.
+    evidence_done: Option<i32>,
     finished: bool,
     fired: bool,
     noted: bool,
@@ -159,6 +178,17 @@ impl StopDeadline {
     /// The stop's `agent_stop` is signed: the note does not sign another.
     pub(crate) fn stop_signed(&self) {
         self.shared.state.lock().stop_signed = true;
+    }
+
+    /// The stop's signed rows are written (its `agent_stop`, the heads
+    /// anchored, its files removed) and `status` is its exit status: from
+    /// here the drop of the start's state and the runtime's shutdown
+    /// release what the process holds, which its exit does in the kernel —
+    /// at the note's point the deadline exits with `status`, no note.
+    pub(crate) fn evidence_done(&self, status: i32) {
+        let mut st = self.shared.state.lock();
+        st.stage = "teardown";
+        st.evidence_done = Some(status);
     }
 
     /// When the stages that drain must have ended: the note's point less
@@ -236,6 +266,13 @@ fn watch(shared: &Arc<Shared>, exit: &Exit) {
         return;
     }
     st.fired = true;
+    if let Some(status) = st.evidence_done {
+        drop(st);
+        exit(status);
+        shared.state.lock().exited = true;
+        shared.wake.notify_all();
+        return;
+    }
     let expired = Expired {
         reason,
         stage: st.stage,

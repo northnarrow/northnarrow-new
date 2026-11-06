@@ -352,28 +352,37 @@ So after a crash + restart the host comes back on the network on its own.
 
 ### A stop in COMBAT (lot 288, #125)
 
-A stop — `systemctl stop` or `restart` inside a signed trusted-installer
-window, the signed admin shutdown, a sensor pump that ended — never touches
-the isolation: the stop runs no `iptables`, and the `NORTHNARROW_COMBAT`
+A stop — inside a signed trusted-installer window, `systemctl kill -s
+SIGTERM northnarrow-agent.service` then `systemctl start` (what install.sh and
+uninstall.sh do: `systemctl stop` and `restart` by hand are refused by the
+unit, `RefuseManualStop=yes`), the host's shutdown, the signed admin
+shutdown, a sensor pump that ended — never touches the isolation: the stop runs no `iptables`, and the `NORTHNARROW_COMBAT`
 chain stays as the run left it. The next start finds it and tears it down
 as above (signed `combat_reconcile`); until then the host stays isolated.
 An agent that dies in COMBAT leaves the host isolated the same way.
 
-The stop ends in bounded time, in COMBAT or not. From the end of the event
-loop it has 4 s: the unit's `TimeoutStopSec=5s` less a second (with
-`SendSIGKILL=no`, systemd leaves a process that outlives it in the unit,
-fails the stop job, and a `restart` does not start the new agent). Each
-stage that waits — the queued responses, the canary trips, the export's
-thread, the runtime's blocking tasks — gets at most what is left of the 4 s;
-a stage that blocks anyway (a decision thread that does not come back, a
-lock held, a drop that waits) is cut by the stop's deadline:
+The stop ends in bounded time, in COMBAT or not. Within the unit's
+`TimeoutStopSec=5s` (with `SendSIGKILL=no`, a stop job — the host's
+shutdown — leaves a process that outlives it running, and install.sh's and
+uninstall.sh's stop sends SIGKILL after 10 s, the signed `agent_stop` lost)
+the process must end *and* the kernel must release its BPF programs and
+links, which took 2.4 s on ubuntu2404 (lot 288's lab). So the stop has 2 s
+from the end of the event loop: each stage that waits — the queued
+responses and the canary trips (at most 1 s), the export's thread, the
+runtime's blocking tasks — gets at most what is left; a stage that blocks
+anyway (a decision thread that does not come back, a lock held, a drop that
+waits) is cut by the stop's deadline at 1.5 s:
 
-- at 3.25 s the agent writes, if the audit log is free within 250 ms, a
-  signed `subsystem_degraded` row (`"source":"stop_deadline"`) that names
-  the stage, the time and whether the run leaves the host isolated, and
-  the run's `agent_stop` (its reason) when the stop had not signed it yet;
-- then it exits with status 75 (`EX_TEMPFAIL`; systemd logs
-  `status=75/TEMPFAIL`), at 4 s at the latest whatever the note does.
+- before the stop's own signed rows are written, the agent writes, if the
+  audit log is free within 250 ms, a signed `subsystem_degraded` row
+  (`"source":"stop_deadline"`) that names the stage, the time and whether
+  the run leaves the host isolated, and the run's `agent_stop` (its reason)
+  when the stop had not signed it yet; then it exits with status 75
+  (`EX_TEMPFAIL`; systemd logs `status=75/TEMPFAIL`), at 2 s at the latest
+  whatever the note does;
+- after them (the `agent_stop`, the heads anchored, the pid file removed),
+  what is left is releasing what the process holds, which its exit does in
+  the kernel: it exits with the stop's own status, no note.
 
 A stop cut this way: `sudo grep '"source":"stop_deadline"'
 /etc/northnarrow/audit.log`. Without the row (the audit log was held by the
