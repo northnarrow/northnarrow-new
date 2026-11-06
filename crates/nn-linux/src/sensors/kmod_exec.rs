@@ -270,7 +270,6 @@ fn initramfs_builder(
     if builders.is_empty() || parent_start_ns == 0 {
         return None;
     }
-    let start_of = |stat: &str| stat_start_ticks(stat);
     let mut p = ppid;
     for hop in 0..=LINEAGE_HOPS {
         if p <= 1 {
@@ -278,7 +277,7 @@ fn initramfs_builder(
         }
         let dir = proc.join(p.to_string());
         let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
-        let ticks = start_of(&stat)?;
+        let ticks = stat_start_ticks(&stat)?;
         if hop == 0 && !started_at(ticks, parent_start_ns) {
             return None;
         }
