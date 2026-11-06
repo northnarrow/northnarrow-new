@@ -591,18 +591,32 @@ fn bpf_lsm(root: &Path) -> Check {
     }
 }
 
+/// The lockdown check's fix when the mode is none.
+const LOCKDOWN_FIX: &str = "boot with `lockdown=integrity` (Secure Boot enables it on most distros) — recommended on every host the agent defends: without it root can rewrite the running kernel (an unsigned module, /dev/mem, kexec of an unsigned kernel, a kprobe's write) and remove the agent's hooks with it, which no hook of the agent can refuse";
+
+/// Lot 280b: the lockdown check's fix when the mode is confidentiality.
+const LOCKDOWN_CONFIDENTIALITY_FIX: &str = "boot with `lockdown=integrity` instead of `confidentiality`: confidentiality takes from every BPF program loaded after it the helpers that read kernel memory (bpf_probe_read_kernel and its kin) and refuses new kprobes, so the agent's next start (an upgrade, a restart) loads without the sensors and deny hooks that use them (docs/operator/KERNEL_COMPATIBILITY.md, \"Lockdown\"); integrity keeps every protection against rewriting the kernel";
+
 fn lockdown(root: &Path) -> Check {
-    let (status, value) = match read(root, "/sys/kernel/security/lockdown") {
-        Some(s) if s.contains("[integrity]") || s.contains("[confidentiality]") => (Status::Ok, s),
-        Some(s) => (Status::Warn, s),
-        None => (Status::Unknown, "lockdown LSM not present".to_string()),
+    let (status, value, fix) = match read(root, "/sys/kernel/security/lockdown") {
+        // Lot 280b: confidentiality blinds the agent's next start
+        Some(s) if s.contains("[confidentiality]") => {
+            (Status::Warn, s, LOCKDOWN_CONFIDENTIALITY_FIX)
+        }
+        Some(s) if s.contains("[integrity]") => (Status::Ok, s, LOCKDOWN_FIX),
+        Some(s) => (Status::Warn, s, LOCKDOWN_FIX),
+        None => (
+            Status::Unknown,
+            "lockdown LSM not present".to_string(),
+            LOCKDOWN_FIX,
+        ),
     };
     Check {
         id: "lockdown",
         name: "Kernel lockdown mode",
         status,
         value,
-        fix: "boot with `lockdown=integrity` (Secure Boot enables it on most distros) — recommended on every host the agent defends: without it root can rewrite the running kernel (an unsigned module, /dev/mem, kexec of an unsigned kernel, a kprobe's write) and remove the agent's hooks with it, which no hook of the agent can refuse",
+        fix,
     }
 }
 
@@ -1404,6 +1418,32 @@ mod tests {
                 assert_eq!(c.status, Status::Unknown, "{}", c.id);
             }
         }
+    }
+
+    /// Lot 280b (named): lockdown in confidentiality mode is a warning with
+    /// its own fix — integrity is the recommendation; none keeps its own.
+    #[test]
+    fn lockdown_confidentiality_is_a_warning_with_its_own_fix() {
+        let at = |v: &[u8]| {
+            let d = tempfile::tempdir().unwrap();
+            w(d.path(), "sys/kernel/security/lockdown", v);
+            lockdown(d.path())
+        };
+        let c = at(b"none integrity [confidentiality]\n");
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.fix.contains("instead of `confidentiality`"), "{}", c.fix);
+        assert!(c.fix.contains("bpf_probe_read_kernel"), "{}", c.fix);
+        let i = at(b"none [integrity] confidentiality\n");
+        assert_eq!(i.status, Status::Ok);
+        let n = at(b"[none] integrity confidentiality\n");
+        assert_eq!(n.status, Status::Warn);
+        assert!(
+            n.fix
+                .starts_with("boot with `lockdown=integrity` (Secure Boot"),
+            "{}",
+            n.fix
+        );
+        assert_ne!(n.fix, c.fix);
     }
 
     /// Lockdown in integrity mode refuses unsigned modules whatever

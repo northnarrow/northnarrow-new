@@ -20,7 +20,9 @@
 //! The eBPF programs and the agent share this module: the names, the
 //! values and their comparison are tested once, here.
 
-use crate::wire::{CGROUP2_SUPER_MAGIC, CGROUP_SUPER_MAGIC, PROC_SUPER_MAGIC};
+use crate::wire::{
+    CGROUP2_SUPER_MAGIC, CGROUP_SUPER_MAGIC, DEBUGFS_MAGIC, PROC_SUPER_MAGIC, SECURITYFS_MAGIC,
+};
 
 /// Not a protected resource file.
 pub const LIMIT_NONE: u8 = 0;
@@ -275,6 +277,10 @@ pub enum SpecialFs {
     CgroupV1,
     /// procfs: `oom_score_adj`, `oom_adj`.
     Proc,
+    /// Lot 280b: debugfs — `kprobes/enabled` ([`KPROBES_ENABLED_NAME`]).
+    Debugfs,
+    /// Lot 280b: securityfs — `lockdown` ([`LOCKDOWN_NAME`]).
+    Securityfs,
 }
 
 /// The filesystem of a superblock whose `s_magic` is `s_magic`, when the
@@ -288,6 +294,8 @@ pub const fn special_fs(s_magic: u64) -> Option<SpecialFs> {
         CGROUP2_SUPER_MAGIC => Some(SpecialFs::Cgroup2),
         CGROUP_SUPER_MAGIC => Some(SpecialFs::CgroupV1),
         PROC_SUPER_MAGIC => Some(SpecialFs::Proc),
+        DEBUGFS_MAGIC => Some(SpecialFs::Debugfs),
+        SECURITYFS_MAGIC => Some(SpecialFs::Securityfs),
         _ => None,
     }
 }
@@ -315,10 +323,30 @@ pub const SYSCTL_FTRACE_ENABLED: u8 = 8;
 /// below the runtime switches real-time throttling off as `runtime=-1`
 /// does (`sched_rt_runtime_exceeded`: `runtime >= period` returns 0).
 pub const SYSCTL_SCHED_RT_PERIOD: u8 = 9;
+/// Lot 280b: `debug.kprobes-optimization` — 0 turns every optimised kprobe
+/// back into a breakpoint trap (each probe hit an `int3` and its handler:
+/// a cost on every probed call, the agent's kprobes among them, not a
+/// blindness — they still run); no use outside a kernel debugging session
+/// is known, so every write is refused outside a window, like
+/// `ftrace_enabled`'s.
+pub const SYSCTL_KPROBES_OPTIMIZATION: u8 = 10;
+/// Lot 280b: NOT a sysctl — `/sys/kernel/debug/kprobes/enabled` (debugfs):
+/// 0 disarms every kprobe on the host, the agent's among them (they stay
+/// registered and silent). A kind of its own so that the integrity round
+/// judges and puts it back like a guarded sysctl; the write deny finds the
+/// file by its filesystem and name ([`SpecialFs::Debugfs`],
+/// [`KPROBES_ENABLED_NAME`]), not in [`SYSCTL_FILES`].
+pub const SYSCTL_KPROBES_ENABLED: u8 = 11;
+
+/// Lot 280b: the debugfs file that arms the kprobes, and its directory.
+pub const KPROBES_ENABLED_NAME: &[u8] = b"enabled";
+pub const KPROBES_DIR_NAME: &[u8] = b"kprobes";
+/// Lot 280b: the securityfs file of the kernel's lockdown mode.
+pub const LOCKDOWN_NAME: &[u8] = b"lockdown";
 
 /// The guarded sysctls by their `/proc/sys` file name (unique in procfs:
 /// no `/proc/<pid>` file is named so), and their kinds.
-pub const SYSCTL_FILES: [(&str, u8); 9] = [
+pub const SYSCTL_FILES: [(&str, u8); 10] = [
     ("overcommit_memory", SYSCTL_OVERCOMMIT_MEMORY),
     ("overcommit_ratio", SYSCTL_OVERCOMMIT_RATIO),
     ("overcommit_kbytes", SYSCTL_OVERCOMMIT_KBYTES),
@@ -328,6 +356,8 @@ pub const SYSCTL_FILES: [(&str, u8); 9] = [
     ("sched_rt_runtime_us", SYSCTL_SCHED_RT_RUNTIME),
     ("ftrace_enabled", SYSCTL_FTRACE_ENABLED),
     ("sched_rt_period_us", SYSCTL_SCHED_RT_PERIOD),
+    // lot 280b
+    ("kprobes-optimization", SYSCTL_KPROBES_OPTIMIZATION),
 ];
 
 const fn sysctl_words() -> [(usize, [u64; 3], u8); SYSCTL_FILES.len()] {
@@ -469,6 +499,10 @@ pub const fn sysctl_value_harmful(kind: u8, v: i64) -> bool {
         // value the round puts back. A write of it is refused whatever it
         // carries ([`sysctl_refuses_every_write`]).
         SYSCTL_FTRACE_ENABLED => v == 0,
+        // lot 280b: 0 unoptimises every kprobe (every write is refused
+        // outside a window), and 0 disarms them all — the values the round
+        // puts back to 1
+        SYSCTL_KPROBES_OPTIMIZATION | SYSCTL_KPROBES_ENABLED => v == 0,
         _ => false,
     }
 }
@@ -504,7 +538,58 @@ pub const fn sysctl_refuses_every_write(kind: u8) -> bool {
     // the review of #497 (D3): the RT period too — it is almost never
     // tuned, and judged alone its value says nothing (the ratio to the
     // runtime does: the round's)
-    kind == SYSCTL_FTRACE_ENABLED || kind == SYSCTL_SCHED_RT_PERIOD
+    kind == SYSCTL_FTRACE_ENABLED
+        || kind == SYSCTL_SCHED_RT_PERIOD
+        // lot 280b: the kprobes' switches — nothing to judge, nothing to race
+        || kind == SYSCTL_KPROBES_OPTIMIZATION
+        || kind == SYSCTL_KPROBES_ENABLED
+}
+
+/// Lot 280b: the kinds whose harmful value blinds the agent's hooks
+/// rather than aborting or starving it (`ftrace_enabled`, the kprobes'
+/// switches): what the integrity round's record says of them.
+pub const fn sysctl_blinds(kind: u8) -> bool {
+    matches!(
+        kind,
+        SYSCTL_FTRACE_ENABLED | SYSCTL_KPROBES_OPTIMIZATION | SYSCTL_KPROBES_ENABLED
+    )
+}
+
+/// Lot 280b: whether a write of the debugfs or securityfs file named
+/// `name` (its dentry's name, `parent` its directory's) is one the write
+/// deny refuses outside a window, whatever it carries — and the denial's
+/// code: `kprobes/enabled` on debugfs ([`crate::wire::FS_OP_KPROBES`]),
+/// `lockdown` on securityfs ([`crate::wire::FS_OP_LOCKDOWN`]); 0 for any
+/// other file. Pure, so that the host's tests judge what the eBPF program
+/// decides; the names as [`name_words`] packs them.
+#[inline(always)]
+pub const fn switch_file_op(
+    fs: SpecialFs,
+    name: (usize, [u64; 3]),
+    parent: (usize, [u64; 3]),
+) -> u8 {
+    const ENABLED: [u64; 3] = name_words(KPROBES_ENABLED_NAME);
+    const KPROBES: [u64; 3] = name_words(KPROBES_DIR_NAME);
+    const LOCKDOWN: [u64; 3] = name_words(LOCKDOWN_NAME);
+    match fs {
+        SpecialFs::Debugfs
+            if same_name(name, KPROBES_ENABLED_NAME.len(), ENABLED)
+                && same_name(parent, KPROBES_DIR_NAME.len(), KPROBES) =>
+        {
+            crate::wire::FS_OP_KPROBES
+        }
+        SpecialFs::Securityfs if same_name(name, LOCKDOWN_NAME.len(), LOCKDOWN) => {
+            crate::wire::FS_OP_LOCKDOWN
+        }
+        _ => 0,
+    }
+}
+
+/// `n` (a name as [`name_words`] packs it, with its length) is the name of
+/// `len` bytes packed in `w`.
+#[inline(always)]
+const fn same_name(n: (usize, [u64; 3]), len: usize, w: [u64; 3]) -> bool {
+    n.0 == len && n.1[0] == w[0] && n.1[1] == w[1] && n.1[2] == w[2]
 }
 
 /// The write deny's verdict on a write of the guarded sysctl of `kind`:
@@ -734,6 +819,60 @@ mod tests {
         assert_eq!(special_fs(0x0102_1994), None);
         assert_eq!(special_fs(0xef53), None);
         assert_eq!(special_fs(0x6265_6572), None);
+        // lot 280b: debugfs and securityfs, their 32 bits only
+        assert_eq!(special_fs(0x6462_6720), Some(SpecialFs::Debugfs));
+        assert_eq!(special_fs(0x7363_6673), Some(SpecialFs::Securityfs));
+        assert_eq!(special_fs(0x0000_0001_6462_6720), Some(SpecialFs::Debugfs));
+        assert_eq!(special_fs(0x6720), None);
+        assert_eq!(special_fs(0x6673), None);
+        // tracefs, sysfs: not judged
+        assert_eq!(special_fs(0x7472_6163), None);
+        assert_eq!(special_fs(0x6265_6572), None);
+    }
+
+    /// Lot 280b: the kprobes' debugfs switch and the lockdown file, by
+    /// their filesystem and names — no other file, no other filesystem.
+    #[test]
+    fn the_switch_files_are_found_by_filesystem_and_name() {
+        use crate::wire::{FS_OP_KPROBES, FS_OP_LOCKDOWN};
+        let n = |t: &[u8]| (t.len(), name_words(t));
+        let none = (0usize, [0u64; 3]);
+        assert_eq!(
+            switch_file_op(SpecialFs::Debugfs, n(b"enabled"), n(b"kprobes")),
+            FS_OP_KPROBES
+        );
+        assert_eq!(
+            switch_file_op(SpecialFs::Securityfs, n(b"lockdown"), n(b"/")),
+            FS_OP_LOCKDOWN
+        );
+        assert_eq!(
+            switch_file_op(SpecialFs::Securityfs, n(b"lockdown"), none),
+            FS_OP_LOCKDOWN
+        );
+        for (fs, name, parent) in [
+            // another directory's `enabled`, another file of kprobes
+            (SpecialFs::Debugfs, n(b"enabled"), n(b"tracing")),
+            (SpecialFs::Debugfs, n(b"enabled"), n(b"kprobe")),
+            (SpecialFs::Debugfs, n(b"enabled"), n(b"kprobess")),
+            (SpecialFs::Debugfs, n(b"list"), n(b"kprobes")),
+            (SpecialFs::Debugfs, n(b"enable"), n(b"kprobes")),
+            (SpecialFs::Debugfs, n(b"enabledx"), n(b"kprobes")),
+            (SpecialFs::Debugfs, n(b"lockdown"), n(b"kprobes")),
+            // the names on another filesystem
+            (SpecialFs::Securityfs, n(b"enabled"), n(b"kprobes")),
+            (SpecialFs::Proc, n(b"enabled"), n(b"kprobes")),
+            (SpecialFs::Proc, n(b"lockdown"), none),
+            (SpecialFs::Cgroup2, n(b"lockdown"), none),
+            (SpecialFs::Debugfs, n(b"lockdown"), none),
+            (SpecialFs::Securityfs, n(b"lockdow"), none),
+            (SpecialFs::Securityfs, n(b"lsm"), none),
+        ] {
+            assert_eq!(
+                switch_file_op(fs, name, parent),
+                0,
+                "{fs:?} {name:?} {parent:?}"
+            );
+        }
     }
 
     /// Lot 273d: the guarded sysctls, judged by the value written.
@@ -861,6 +1000,38 @@ mod tests {
     }
 
     /// R1 (the coordinator's decision of 04/11): every write of
+    /// Lot 280b: the kprobes' switches outside a window are refused
+    /// whatever they carry, unread; 0 is what the round puts back; a
+    /// window and the family pass; they blind, they do not starve.
+    #[test]
+    fn the_kprobes_switches_are_refused_whatever_they_carry() {
+        for kind in [SYSCTL_KPROBES_OPTIMIZATION, SYSCTL_KPROBES_ENABLED] {
+            assert!(sysctl_refuses_every_write(kind));
+            assert!(sysctl_blinds(kind));
+            let unread = || -> Option<LimitValue> { panic!("the switch's write was read") };
+            assert!(sysctl_write_refused(kind, false, unread));
+            assert!(!sysctl_write_refused(kind, true, || None));
+            assert!(sysctl_value_harmful(kind, 0));
+            assert!(!sysctl_value_harmful(kind, 1));
+            assert!(!sysctl_value_harmful(kind, 2));
+        }
+        let k = |n: &str| sysctl_kind(n.len(), name_words(n.as_bytes()));
+        assert_eq!(k("kprobes-optimization"), SYSCTL_KPROBES_OPTIMIZATION);
+        assert_eq!(k("kprobes-optimisation"), SYSCTL_NONE);
+        // the debugfs file is found by its filesystem, never by a sysctl
+        // name
+        assert_eq!(k("enabled"), SYSCTL_NONE);
+        for kind in [
+            SYSCTL_OVERCOMMIT_MEMORY,
+            SYSCTL_PID_MAX,
+            SYSCTL_SCHED_RT_RUNTIME,
+            SYSCTL_SCHED_RT_PERIOD,
+        ] {
+            assert!(!sysctl_blinds(kind), "{kind}");
+        }
+        assert!(sysctl_blinds(SYSCTL_FTRACE_ENABLED));
+    }
+
     /// `ftrace_enabled` outside a window is refused, 1 too, and its bytes
     /// are never read (nothing for a second thread to race); the agent's
     /// own restore and a window's write pass by the caller's identity, as
@@ -920,6 +1091,7 @@ mod tests {
                 ("sched_rt_runtime_us", SYSCTL_SCHED_RT_RUNTIME),
                 ("ftrace_enabled", SYSCTL_FTRACE_ENABLED),
                 ("sched_rt_period_us", SYSCTL_SCHED_RT_PERIOD),
+                ("kprobes-optimization", SYSCTL_KPROBES_OPTIMIZATION),
             ][..]
         );
         for (name, kind) in SYSCTL_FILES {

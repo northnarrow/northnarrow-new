@@ -481,6 +481,13 @@ pub(crate) fn process_event(
             // Lot 280a: a write the signed per-sysctl opt-out let through —
             // recorded, not refused.
             let opted_out = *operation == nn_model::FsProtectOperation::SysctlOptOut;
+            // Lot 280b: what the kernel-state round found — the kernel's own
+            // record, not a refusal.
+            let found = matches!(
+                operation,
+                nn_model::FsProtectOperation::KernelTaint
+                    | nn_model::FsProtectOperation::SysctlRootProg
+            );
             let exemption = joined
                 .then(|| {
                     nn_linux::cgroup_join::exemption_named(&engine.policy().current(), *target_dev)
@@ -504,6 +511,12 @@ pub(crate) fn process_event(
                         value = ?value,
                         "SYSCTL OPT-OUT: a guarded sysctl's write let through by the signed \
                          per-rule policy's sysctl-allow (recorded, not refused)"
+                    );
+                } else if found {
+                    warn!(
+                        op = %operation,
+                        target_dev, target_ino,
+                        "KERNEL STATE: found by the kernel-state round (not refused)"
                     );
                 } else {
                     warn!(
@@ -533,6 +546,17 @@ pub(crate) fn process_event(
                         } else if opted_out {
                             "not refused: let through by the signed per-rule policy's \
                              sysctl-allow (cgroup/sysctl or the write deny)"
+                                .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::KernelTaint {
+                            "not refused: a taint flag of code entering the kernel, read by the \
+                             kernel-state round"
+                                .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::SysctlRootProg {
+                            "not refused: found on the root cgroup's cgroup/sysctl slot by the \
+                             kernel-state round"
+                                .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::SysctlRootAttach {
+                            "denied in kernel (the bpf LSM hook: an attach to the root cgroup)"
                                 .to_string()
                         } else if *operation == nn_model::FsProtectOperation::SysctlValue {
                             "denied in kernel (cgroup/sysctl on the root cgroup, the kernel's \

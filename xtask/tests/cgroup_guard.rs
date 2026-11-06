@@ -151,7 +151,8 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         &[
             "off!(SUPER_BLOCK_S_MAGIC_OFFSET)",
             "Ok(m) => m,",
-            "match special_fs(magic) {\n        Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),\n        Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),\n        Some(SpecialFs::Proc) => {\n            refuse_sysctl(file, inode, hook, phase) || refuse_oom_adj(file, inode, phase)\n        }\n        None => false,\n    }",
+            // lot 280b: and the switches of debugfs and securityfs
+            "match special_fs(magic) {\n        Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),\n        Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),\n        Some(SpecialFs::Proc) => {\n            refuse_sysctl(file, inode, hook, phase) || refuse_oom_adj(file, inode, phase)\n        }\n        Some(fs @ (SpecialFs::Debugfs | SpecialFs::Securityfs)) => refuse_switch(file, inode, fs, phase),\n        None => false,\n    }",
         ],
     )
     .unwrap();
@@ -160,6 +161,20 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         2,
         "the magic is read and classified, nothing else:\n{w}"
     );
+    // Lot 280b: a switch's write is refused by its names alone (the shared
+    // judge), the family and a window passing first, and an inode that
+    // cannot be read refused all the same (signed 0:0)
+    in_order(
+        body(&c, "refuse_switch"),
+        &[
+            "let op = switch_file_op(fs, name, parent);",
+            "if op == 0 {\n        return false;\n    }",
+            "if caller_may((bpf_get_current_pid_tgid() >> 32) as u32) {\n        return false;\n    }",
+            "read_inode_key(inode).unwrap_or(InodeKey { dev: 0, ino: 0 });",
+            "sign(phase, op, key);\n    true",
+        ],
+    )
+    .unwrap();
     // Lot 273d (the review of #492): a guarded sysctl's harmful write
     // refused outside a window, judged at the write by the shared verdict
     // (R1: written_value() appears nowhere else in it)

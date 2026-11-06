@@ -1934,8 +1934,9 @@ integrity round leaves such a value (`sysctl_opted_out`, signed).
   It takes a root that loads BPF; the BPF guard records the load and the
   attach (`bpf_syscall`), the start names any other program it finds there
   (a signed degradation), and the integrity round puts a harmful value back
-  at its next pass. Refusing a foreign `cgroup/sysctl` program outside a
-  window is a candidate for lot 280b.
+  at its next pass. Lot 280b: such an attach is refused outside a window
+  (the `bpf` hook), and one made inside a window or before the start is
+  found by the kernel-state round and signed (§ Lot 280b).
 - An opt-out names a sysctl and its values, not a program: while it is in
   force, any root process may write a value in its range.
 - `bpf_strtol` reads up to 63 characters where the kernel reads 21: a value
@@ -1945,3 +1946,103 @@ integrity round leaves such a value (`sysctl_opted_out`, signed).
 - The writer's tgid is read from its task; a read that fails is no one's
   (not the agent's family): such a write is judged, never let through by
   identity.
+
+## Lot 280b — the switches that blind the sensors
+
+**What it closes.** The kernel switches that silence the agent's hooks
+without touching them, which lots 273d and 280a left open or only read.
+
+**`kernel.ftrace_enabled=0` inside a window** (the short re-check of #497,
+NB1). Outside a window every write of it is refused (lot 273d); inside one
+it can be set to `0`, and on 6.0 to 7.2 the fentry/fexit programs, the
+kprobes on ftrace and the BPF-LSM programs stop while the BTF tracepoints
+go on. The start-in-cgroup tracker (lot 277) marks a birth by
+`clone3(CLONE_INTO_CGROUP)` in its fentry on `cgroup_post_fork`: with the
+switch at `0` such a birth into an exempt cgroup was not marked and stayed
+exempt after the window. Now:
+- the fentry records each new thread group it sees (`CGROUP_JOIN_BORN`,
+  per load) and the fork's tracepoint (`sched_process_fork`, `tp_btf`)
+  checks it: a new thread group the fentry did not see, for a child started
+  after the agent armed the check (`CGROUP_JOIN_SILENT`: armed once the
+  start's programs run, so the swap of a prior boot's programs is never a
+  miss), is "not known" at once — its byte in `CGROUP_JOIN_LOST`, passed on
+  to what it forks: refused every exemption by cgroup or unit — and
+  counted with its instant. That is the check channel: it tells "silent
+  because ftrace is off" from "silent because nothing happened", and it
+  works while no agent runs (the programs are pinned);
+- at every build of the capability manifest (5 s) the switch at `0`, or
+  unreadable, or a birth counted since the last read opens a signed
+  `cgroup_join_marks` degradation naming when the loss began; once the
+  switch reads `1` and no birth was missed since the last read, the marks'
+  epoch is reset (`CGROUP_JOIN_EPOCH`: every process started before is not
+  known until it exits, fail closed) and the period is signed — the loss's
+  line leaves, the reset's stays.
+A move is judged by the tracker's tracepoint on `cgroup_attach_task`, which
+goes on: with the fexit on `cgroup_procs_write_start` silent its source
+slot is stale, which can only make a move count as one, never hide it.
+
+**The kprobes' switches.** `/sys/kernel/debug/kprobes/enabled` at `0`
+disarms every kprobe of the host (the agent's `tcp_connect`, `udp_send_skb`
+and the others stay registered and silent); `debug.kprobes-optimization` at
+`0` turns every optimised kprobe back into a breakpoint trap (a cost on each
+probed call, not a blindness). The sysctl joins the guarded ones: every
+write refused outside a window (the write deny and the `cgroup/sysctl`
+judge), never opted out, a `0` put back by the integrity round and at a
+window's close. The debugfs file is no sysctl: the write deny's
+`file_open` / `file_permission` find it by the superblock's magic
+(`DEBUGFS_MAGIC`) and the names (`enabled` in `kprobes`), refuse every write
+of it outside the family and a window (NN-L-AT-001 `kprobes`, ENGAGED), and
+the round puts a `0` back to `1` (signed `sysctl_restored`, "blinds the
+agent's hooks").
+
+**Lockdown.** `/sys/kernel/security/lockdown` is refused the same way, on
+securityfs (`lockdown`): a raise to `confidentiality` takes from every BPF
+program loaded after it the helpers that read kernel memory, so the
+agent's next start (an upgrade, a restart) would load without the programs
+that use them (`KERNEL_COMPATIBILITY.md`, "Lockdown", as measured); raising
+the mode is an operator's act at boot (`lockdown=`), or inside a window.
+The host check warns on `[confidentiality]` with its own fix (integrity
+keeps every protection against rewriting the kernel).
+
+**The kernel's code.** The capability manifest records the taint mask, its
+letters and each livepatch with its state (`kernel_code`): a change is a
+signed revision, a flag or a livepatch more a worse one (signed at once).
+The kernel-state round (5 s, `crates/nn-linux/src/kernel_state.rs`) signs a
+flag of code entering the kernel that appears while the agent runs
+(`common::kernel_taint::CODE_ENTRY`: P, F, R, C, O, E, K, X, N) as
+NN-L-AT-001 `kernel_taint` — Critical for an unsigned module or anything
+forced (E, F, R), High otherwise (an out-of-tree or proprietary module, a
+livepatch): not a refusal, so no posture trigger; the module-load sensor's
+rules judge the load itself. The flags set before the start are the
+manifest's, not news.
+
+**A foreign program on the root's sysctl slot** (lot 280a's residual). The
+`bpf` hook refuses `BPF_PROG_ATTACH` and `BPF_LINK_CREATE` of a
+`cgroup/sysctl` program whose target descriptor is the cgroup v2 root
+(its kernfs inode 1, read through the caller's file table) by anyone
+outside the agent's family, a fresh instance of it and a window — a target
+it cannot read refused too (that attach type only, fail closed) —
+NN-L-AT-001 `sysctl_root_attach`, ENGAGED. One attached inside a window or
+before the start is found by the kernel-state round (`BPF_PROG_QUERY` of
+the root) and signed once per program (`sysctl_root_prog`, High); a root
+the judge's attach no longer finds as it left it (our program gone, the
+mode no longer multi) is a signed degradation while it holds.
+
+**What stays open.**
+- A birth the fentry missed is not known, and the marks' epoch is reset
+  once ftrace runs again: every exempt service's processes started before
+  the reset lose their exemption until they exit (restart them). The
+  reset waits for a read with ftrace on and no birth missed since the last
+  one (5 to 10 s).
+- The other fentry/fexit sensors and the kprobes stay silent while
+  `ftrace_enabled` is `0` inside a window; what they did not see is not
+  recovered (the degradations say when).
+- The BPF guard refuses the root attach only in enforce mode (a production
+  build); a lab build observes.
+- A taint flag set before the agent's start is in the manifest, not a
+  detection; a module's load itself is the module-load rules' (the lab's
+  `insmod` of an unsigned module outside a window was killed by them).
+- A program attached to the root inside a window stays after it until it
+  is detached; the round signs it within 5 s, it is not detached by the
+  agent (another tool's program, the operator's to judge).
+

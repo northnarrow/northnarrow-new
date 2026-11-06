@@ -617,3 +617,34 @@ others. What an operator sees change:
   release leaves the judge linked (that release does not know its
   directory) until the next boot: run `uninstall.sh` first, or remove
   `/sys/fs/bpf/northnarrow-sysctl` inside a trusted-installer window.
+
+## 11. The switches that blind the sensors (lot 280b)
+
+- **Refused outside a trusted-installer window, whatever they carry**:
+  writes of `/sys/kernel/debug/kprobes/enabled`, of
+  `debug.kprobes-optimization` and of `/sys/kernel/security/lockdown`
+  (NN-L-AT-001 `kprobes`, `sysctl`, `lockdown`, ENGAGED). A tool that
+  writes one of them, even the value it holds, needs a window; raise the
+  lockdown mode at boot (`lockdown=integrity`). A `0` found in either
+  kprobes switch is put back to `1` at a window's close and by the
+  integrity round.
+- **`lockdown=confidentiality`**: the agent does not start under it (the
+  helpers its programs read kernel memory with are taken from every BPF
+  program loaded after the raise: `KERNEL_COMPATIBILITY.md`, "Lockdown").
+  The host check now warns on it; boot with `lockdown=integrity`.
+- **An attach of a `cgroup/sysctl` program to the root cgroup** outside a
+  window is refused (`sysctl_root_attach`); one already there, or attached
+  inside a window, is signed High once (`sysctl_root_prog`, not refused).
+  A tool that attaches such a program to the root needs a window; one that
+  attaches it to its own child cgroup is not concerned.
+- **New detections, not refusals**: a taint flag of code entering the
+  kernel that appears while the agent runs (`kernel_taint`: Critical for
+  an unsigned or forced module, High for an out-of-tree or proprietary
+  module or a livepatch). A DKMS module built and loaded after the start
+  is one: the detection says so, the posture does not move. The flags set
+  before the start are only in the manifest's new `kernel_code` (and in
+  `nn-admin capabilities`).
+- **`kernel.ftrace_enabled=0` inside a window**: the start-in-cgroup
+  tracker's marks are lost while it holds (signed `cgroup_join_marks`) and
+  reset once ftrace runs again — as after a start that could not adopt
+  them, **restart the exempt services** after it.

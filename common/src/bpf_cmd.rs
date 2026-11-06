@@ -61,6 +61,33 @@ pub const BPF_LINK_GET_NEXT_ID: u32 = 31;
 /// `BPF_LINK_DETACH`: detaches a link (by link fd).
 pub const BPF_LINK_DETACH: u32 = 34;
 
+/// Lot 280b: `enum bpf_attach_type`'s `BPF_CGROUP_SYSCTL` — not a command:
+/// the attach type at +8 of `BPF_PROG_ATTACH` and `BPF_LINK_CREATE`'s
+/// `union bpf_attr`.
+pub const ATTACH_CGROUP_SYSCTL: u32 = 18;
+
+/// Lot 280b: where a command that attaches a program to a cgroup carries
+/// the cgroup's descriptor in `union bpf_attr`: `BPF_PROG_ATTACH`'s
+/// `target_fd` at 0, `BPF_LINK_CREATE`'s at 4 (after `prog_fd`); `None` for
+/// any other command. Both carry the attach type at 8.
+#[inline(always)]
+pub const fn attach_target_offset(cmd: u32) -> Option<usize> {
+    match cmd {
+        BPF_PROG_ATTACH => Some(0),
+        BPF_LINK_CREATE => Some(4),
+        _ => None,
+    }
+}
+
+/// Lot 280b: an attach whose target the `bpf` hook judges — a
+/// `cgroup/sysctl` program's (refused on the root cgroup outside the
+/// agent's family and a window: after the agent's judge, it would run
+/// after it and could rewrite the value judged).
+#[inline(always)]
+pub const fn judges_attach_target(cmd: u32, attach_type: u32) -> bool {
+    attach_target_offset(cmd).is_some() && attach_type == ATTACH_CGROUP_SYSCTL
+}
+
 /// Every number above with its uapi name, for the checks against the
 /// header and the kernel's BTF. A command added above goes here too
 /// (`every_constant_is_listed` checks it).
@@ -201,6 +228,33 @@ mod tests {
             wrong.is_empty(),
             "bpf_cmd numbers that differ from {UAPI_HEADER} (name, ours, the header's): {wrong:?}"
         );
+    }
+
+    /// Lot 280b: the attach type the `bpf` hook judges is the header's,
+    /// and only the two attaching commands carry it there.
+    #[test]
+    fn the_judged_attach_is_the_headers_cgroup_sysctl() {
+        let header = std::fs::read_to_string(UAPI_HEADER).expect("the uapi header");
+        let types = c_enum(&header, "bpf_attach_type").expect("enum bpf_attach_type");
+        assert_eq!(
+            types.get("BPF_CGROUP_SYSCTL"),
+            Some(&i64::from(ATTACH_CGROUP_SYSCTL))
+        );
+        assert!(judges_attach_target(BPF_PROG_ATTACH, ATTACH_CGROUP_SYSCTL));
+        assert!(judges_attach_target(BPF_LINK_CREATE, ATTACH_CGROUP_SYSCTL));
+        assert_eq!(attach_target_offset(BPF_PROG_ATTACH), Some(0));
+        assert_eq!(attach_target_offset(BPF_LINK_CREATE), Some(4));
+        for (_, cmd) in UAPI {
+            if cmd != BPF_PROG_ATTACH && cmd != BPF_LINK_CREATE {
+                assert!(!judges_attach_target(cmd, ATTACH_CGROUP_SYSCTL), "{cmd}");
+                assert_eq!(attach_target_offset(cmd), None, "{cmd}");
+            }
+        }
+        // another attach type on the same commands: not judged
+        for t in [0u32, 17, 19, 27] {
+            assert!(!judges_attach_target(BPF_LINK_CREATE, t), "{t}");
+            assert!(!judges_attach_target(BPF_PROG_ATTACH, t), "{t}");
+        }
     }
 
     /// The parser counts the way the C compiler does: an alias takes no

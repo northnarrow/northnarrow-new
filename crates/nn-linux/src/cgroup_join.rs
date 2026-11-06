@@ -33,6 +33,17 @@
 //! directory: a signed degradation, "marks reset" ([`attach`]). A move made
 //! before the first start since the host booted is not seen: the residual
 //! is the trust model's (`docs/design/ANTITAMPER_TRUST_MODEL.md`).
+//!
+//! Lot 280b: `kernel.ftrace_enabled=0` (refused outside a window; 6.0 to
+//! 7.2) stops the tracker's fentry and fexit programs while its BTF
+//! tracepoints go on. The fork's tracepoint checks each new thread group
+//! against what the fentry saw (`CGROUP_JOIN_SILENT`, armed here once the
+//! programs run): a birth it missed is "not known" at once. And the marks
+//! are treated as lost while ftrace is off or such a birth is counted
+//! ([`watch_marks`], at every build of the manifest): a signed degradation
+//! for the whole period, and once ftrace runs again the marks' epoch is
+//! reset (fail closed: every process started before is not known until it
+//! exits), signed with the period.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -43,7 +54,8 @@ use aya::programs::{BtfTracePoint, FEntry, FExit};
 use aya::{Btf, Ebpf, EbpfLoader};
 use common::cgroup_join::{
     fnv, is_pin_dir_of, lost_slot, parse_pin_dir, unpack, EPOCH_SLOTS, LOST_BYTES, LOST_SLOTS,
-    NAME_CGROUP, NAME_UNIT, PIN_SCHEMA, STAT_INTO_EXEMPT, STAT_LOST, STAT_ROOTS, STAT_SLOTS,
+    NAME_CGROUP, NAME_UNIT, PIN_SCHEMA, SILENT_ARMED, SILENT_UNSEEN, STAT_INTO_EXEMPT, STAT_LOST,
+    STAT_ROOTS, STAT_SLOTS,
 };
 use nn_core::decision::rule_policy::{Exemption, RulePolicy};
 use parking_lot::Mutex;
@@ -71,6 +83,9 @@ pub const PINNED_MAPS: [&str; 4] = [JOINED_MAP, LOST_MAP, STATS_MAP, EPOCH_MAP];
 pub const STATE_PATH: &str = "/run/northnarrow/cgroup-join-pins";
 /// The exemptions' names the kernel matches a destination against.
 pub const NAMES_MAP: &str = "CGROUP_EXEMPT_NAMES";
+/// Lot 280b: the tracepoint's check of the fentry (per load, not pinned:
+/// `common::cgroup_join::SILENT_*`).
+pub const SILENT_MAP: &str = "CGROUP_JOIN_SILENT";
 
 /// How a program of the tracker attaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +127,7 @@ type Lost = Array<MapData, [u8; LOST_BYTES]>;
 type Stats = Array<MapData, u64>;
 type Epoch = Array<MapData, u64>;
 type Names = HashMap<MapData, u64, u8>;
+type Silent = Array<MapData, u64>;
 
 /// The tracker's maps, for the exemption check, the names and the sweep.
 #[derive(Clone)]
@@ -121,6 +137,8 @@ pub struct Marks {
     stats: Arc<Mutex<Stats>>,
     epoch: Arc<Mutex<Epoch>>,
     names: Arc<Mutex<Names>>,
+    /// Lot 280b: the births the fentry missed.
+    silent: Arc<Mutex<Silent>>,
 }
 
 /// The tracker as this boot has it.
@@ -597,28 +615,53 @@ fn register_pins(dir: &Path) -> Result<(), String> {
     crate::atomic_file::replace(path, st.render().as_bytes(), 0o600).map_err(|e| format!("{e:#}"))
 }
 
+/// `clock` now, in ns.
+fn clock_ns(clock: libc::clockid_t) -> Result<u64, String> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid out-parameter for clock_gettime.
+    if unsafe { libc::clock_gettime(clock, &mut ts) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+}
+
 /// The third review of #494 (R2-a): this instant as the marks' last reset
 /// — `[monotonic, boot time]` ns into `CGROUP_JOIN_EPOCH`, once the new
 /// programs run: a process started before it is not known.
 fn set_epoch(ebpf: &mut Ebpf) -> Result<(), String> {
-    let now = |clock| {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: a valid out-parameter for clock_gettime.
-        if unsafe { libc::clock_gettime(clock, &mut ts) } != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        Ok(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
-    };
-    let (mono, boot) = (now(libc::CLOCK_MONOTONIC)?, now(libc::CLOCK_BOOTTIME)?);
     let map = ebpf
         .map_mut(EPOCH_MAP)
         .ok_or_else(|| format!("map {EPOCH_MAP} missing from the eBPF object"))?;
     let mut arr: Array<&mut MapData, u64> = Array::try_from(map).map_err(|e| e.to_string())?;
+    write_epoch(&mut arr)
+}
+
+/// [`set_epoch`]'s write, into the map however it is held (the start's
+/// object, the running tracker's [`Marks`]): boot time first, so that the
+/// kernel's monotonic slot — the one a fork reads — never names an epoch
+/// the agent's slot does not.
+fn write_epoch<M: std::borrow::BorrowMut<MapData>>(arr: &mut Array<M, u64>) -> Result<(), String> {
+    let (mono, boot) = (
+        clock_ns(libc::CLOCK_MONOTONIC)?,
+        clock_ns(libc::CLOCK_BOOTTIME)?,
+    );
     arr.set(1, boot, 0).map_err(|e| e.to_string())?;
     arr.set(0, mono, 0).map_err(|e| e.to_string())
+}
+
+/// Lot 280b: the fork's check of the fentry armed at this instant
+/// (`CGROUP_JOIN_SILENT[SILENT_ARMED]`, `CLOCK_MONOTONIC` ns: a task's
+/// start time's clock).
+fn arm_silent(ebpf: &mut Ebpf) -> Result<(), String> {
+    let map = ebpf
+        .map_mut(SILENT_MAP)
+        .ok_or_else(|| format!("map {SILENT_MAP} missing from the eBPF object"))?;
+    let mut arr: Array<&mut MapData, u64> = Array::try_from(map).map_err(|e| e.to_string())?;
+    arr.set(SILENT_ARMED, clock_ns(libc::CLOCK_MONOTONIC)?, 0)
+        .map_err(|e| e.to_string())
 }
 
 /// The tracker pin directories beside `pin_root` other than `keep`: those
@@ -903,6 +946,17 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
             warn!("cgroup exemptions: tracker attached WITHOUT pin (no bpffs): not kept while no agent runs");
         }
     }
+    // Lot 280b: the fork's check of the fentry armed now that this start's
+    // programs run (and the prior boot's are gone): a child that starts
+    // after this instant was seen by the fentry unless ftrace is off. Not
+    // armed, the check counts nothing — a signed degradation.
+    if let Err(e) = arm_silent(ebpf) {
+        warn!(error = %e, "cgroup exemptions: the ftrace check of the tracker NOT armed");
+        signed.push(format!(
+            "the tracker's ftrace check is not armed ({e}): a birth the fentry misses while \
+             kernel.ftrace_enabled is 0 is not counted (the manifest's ftrace read still is)"
+        ));
+    }
     let take = |ebpf: &mut Ebpf, name: &str| {
         ebpf.take_map(name)
             .ok_or_else(|| format!("map {name} missing from the eBPF object"))
@@ -913,12 +967,14 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
         let stats = Stats::try_from(take(ebpf, STATS_MAP)?).map_err(|e| e.to_string())?;
         let epoch = Epoch::try_from(take(ebpf, EPOCH_MAP)?).map_err(|e| e.to_string())?;
         let names = Names::try_from(take(ebpf, NAMES_MAP)?).map_err(|e| e.to_string())?;
+        let silent = Silent::try_from(take(ebpf, SILENT_MAP)?).map_err(|e| e.to_string())?;
         Ok(Marks {
             joined: Arc::new(Mutex::new(joined)),
             lost: Arc::new(Mutex::new(lost)),
             stats: Arc::new(Mutex::new(stats)),
             epoch: Arc::new(Mutex::new(epoch)),
             names: Arc::new(Mutex::new(names)),
+            silent: Arc::new(Mutex::new(silent)),
         })
     })();
     match maps {
@@ -1011,6 +1067,21 @@ impl Marks {
         self.stats.lock().get(&slot, 0).map_err(|e| e.to_string())
     }
 
+    /// Lot 280b: the births the fentry missed since this start
+    /// (`CGROUP_JOIN_SILENT`), on the caller's thread.
+    pub fn unseen_births(&self) -> Result<u64, String> {
+        self.silent
+            .lock()
+            .get(&SILENT_UNSEEN, 0)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Lot 280b: the marks' epoch reset to this instant (every process
+    /// started before it not known until it exits), on the caller's thread.
+    pub fn reset_epoch(&self) -> Result<(), String> {
+        write_epoch(&mut self.epoch.lock())
+    }
+
     /// Give the kernel `names` ([`exempt_names`]) in place of what it had.
     /// On the caller's thread: the start's and the admin socket's (never
     /// the decision's).
@@ -1037,6 +1108,135 @@ impl Marks {
             .into_iter()
             .filter(|k| map.remove(k).is_ok())
             .count()
+    }
+}
+
+/// Lot 280b: the degradation's source while the marks are lost.
+pub const MARKS_LOST_DEGRADATION: &str = "cgroup_join_marks";
+
+/// Lot 280b: what [`watch_marks`] keeps between two reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarksWatch {
+    /// Since when the marks are lost (the time as signed), and why first.
+    pub lost: Option<(String, String)>,
+    /// The births the fentry missed, as last read.
+    pub unseen: u64,
+}
+
+/// What a read of the switch and the check channel asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarksStep {
+    /// Nothing changes.
+    Hold,
+    /// The marks are lost from now: the degradation's line.
+    Lost(String),
+    /// Ftrace runs again and no birth was missed since the last read: the
+    /// epoch is reset and the period signed (the record's line).
+    Reset(String),
+}
+
+/// Lot 280b: one read — `ftrace_off` the manifest's word on
+/// `kernel.ftrace_enabled` (`None`: on), `unseen` the births the fentry
+/// missed (an error: the check channel unread, taken as a miss: fail
+/// closed), `now` the time as signed. Pure, so that the tests judge it.
+pub fn marks_step(
+    w: &mut MarksWatch,
+    ftrace_off: Option<&str>,
+    unseen: Result<u64, String>,
+    now: &str,
+) -> MarksStep {
+    let missed = match &unseen {
+        Ok(n) if *n > w.unseen => Some(format!(
+            "{} birth(s) the tracker's fentry did not see (the fork's tracepoint counted them; \
+             each is not known)",
+            n - w.unseen
+        )),
+        Ok(_) => None,
+        Err(e) => Some(format!(
+            "the tracker's ftrace check could not be read ({e})"
+        )),
+    };
+    if let Ok(n) = unseen {
+        w.unseen = n;
+    }
+    let why = match (ftrace_off, missed) {
+        (Some(f), Some(m)) => Some(format!("{f}; {m}")),
+        (Some(f), None) => Some(f.to_string()),
+        (None, Some(m)) => Some(m),
+        (None, None) => None,
+    };
+    match (why, w.lost.take()) {
+        (Some(why), None) => {
+            let line = format!(
+                "the start-in-cgroup tracker's marks are lost since {now}: {why} — its fentry and \
+                 fexit do not run while kernel.ftrace_enabled is 0, so a process started meanwhile \
+                 by clone3(CLONE_INTO_CGROUP) may not be marked; the marks' epoch is reset once \
+                 ftrace runs again"
+            );
+            w.lost = Some((now.to_string(), why));
+            MarksStep::Lost(line)
+        }
+        (Some(_), Some(lost)) => {
+            w.lost = Some(lost);
+            MarksStep::Hold
+        }
+        (None, Some((since, first))) => MarksStep::Reset(format!(
+            "the start-in-cgroup tracker's marks were lost from {since} to {now} ({first}): the \
+             marks' epoch is reset at {now} — every process started before is not known (refused \
+             an exemption by cgroup or unit) until it exits; restart the exempt services"
+        )),
+        (None, None) => MarksStep::Hold,
+    }
+}
+
+static MARKS_WATCH: Mutex<MarksWatch> = parking_lot::const_mutex(MarksWatch {
+    lost: None,
+    unseen: 0,
+});
+
+/// Lot 280b: called at every build of the capability manifest with its
+/// word on `kernel.ftrace_enabled` (`None`: on). While the marks are lost
+/// — ftrace off or unknown, or a birth the fentry missed — a degradation
+/// ([`MARKS_LOST_DEGRADATION`], signed at once); once ftrace runs again and
+/// no birth was missed since the last read, the marks' epoch is reset
+/// (fail closed) and the period signed: the loss's line leaves, the
+/// reset's stays (its effect lasts until the processes before it exit). An
+/// epoch that cannot be written keeps the degradation, and the next read
+/// tries again. No tracker attached: nothing (its absence is signed).
+pub fn watch_marks(ftrace_off: Option<&str>) {
+    let Some(Tracker::Attached(marks)) = tracker() else {
+        return;
+    };
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut w = MARKS_WATCH.lock();
+    let before = w.clone();
+    match marks_step(&mut w, ftrace_off, marks.unseen_births(), &now) {
+        MarksStep::Hold => {}
+        MarksStep::Lost(line) => {
+            warn!(detail = %line, "cgroup exemptions: marks lost");
+            if crate::boot::degradation::report(MARKS_LOST_DEGRADATION, &line) {
+                crate::boot::degradation::flush();
+            }
+        }
+        MarksStep::Reset(line) => match marks.reset_epoch() {
+            Ok(()) => {
+                warn!(detail = %line, "cgroup exemptions: marks reset after ftrace ran again");
+                // the loss's line leaves; the reset's stays, like a
+                // start's reset (its effect lasts until the processes
+                // started before it exit)
+                crate::boot::degradation::withdraw(MARKS_LOST_DEGRADATION, &[]);
+                if crate::boot::degradation::report(MARKS_LOST_DEGRADATION, &line) {
+                    crate::boot::degradation::flush();
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "cgroup exemptions: the marks' epoch NOT reset — the next read tries again");
+                *w = MarksWatch {
+                    unseen: w.unseen,
+                    ..before
+                };
+            }
+        },
     }
 }
 
@@ -1698,5 +1898,92 @@ mod tests {
         .unwrap();
         assert_eq!(tgid_of(d.path(), 42), Some(40));
         assert_eq!(tgid_of(d.path(), 43), None);
+    }
+
+    /// Lot 280b (named): ftrace off inside a window — the marks are lost
+    /// from the first read that sees it (one signed line for the whole
+    /// period, not one a read), and reset only once ftrace runs again with
+    /// no birth missed since the last read; the reset's line names the
+    /// period.
+    #[test]
+    fn ftrace_off_loses_the_marks_and_its_return_resets_the_epoch() {
+        let mut w = MarksWatch::default();
+        assert_eq!(marks_step(&mut w, None, Ok(0), "t0"), MarksStep::Hold);
+        let off = "kernel.ftrace_enabled is 0 — the trampolines stop";
+        let lost = marks_step(&mut w, Some(off), Ok(0), "t1");
+        let MarksStep::Lost(line) = lost else {
+            panic!("{lost:?}")
+        };
+        assert!(line.contains("lost since t1"), "{line}");
+        assert!(line.contains("kernel.ftrace_enabled is 0"), "{line}");
+        assert!(line.contains("CLONE_INTO_CGROUP"), "{line}");
+        // still off, births missed meanwhile: the same period, no new line
+        assert_eq!(marks_step(&mut w, Some(off), Ok(3), "t2"), MarksStep::Hold);
+        assert_eq!(marks_step(&mut w, Some(off), Ok(5), "t3"), MarksStep::Hold);
+        // ftrace back, but a birth missed since the last read: still lost
+        assert_eq!(marks_step(&mut w, None, Ok(6), "t4"), MarksStep::Hold);
+        assert!(w.lost.is_some());
+        // back, nothing missed since: the reset, naming the period
+        let reset = marks_step(&mut w, None, Ok(6), "t5");
+        let MarksStep::Reset(line) = reset else {
+            panic!("{reset:?}")
+        };
+        assert!(line.contains("from t1 to t5"), "{line}");
+        assert!(line.contains("epoch is reset at t5"), "{line}");
+        assert!(line.contains("not known"), "{line}");
+        assert_eq!(w.lost, None);
+        assert_eq!(w.unseen, 6);
+        assert_eq!(marks_step(&mut w, None, Ok(6), "t6"), MarksStep::Hold);
+    }
+
+    /// Lot 280b (named): the tracepoint channel alone — ftrace reads on, but
+    /// the fork's tracepoint counted births the fentry missed (a quick off
+    /// and on between two reads): lost, then reset at the next quiet read;
+    /// an unread channel is a miss (fail closed), and an unknown ftrace is
+    /// off.
+    #[test]
+    fn a_birth_the_fentry_missed_loses_the_marks_with_ftrace_on() {
+        let mut w = MarksWatch::default();
+        let MarksStep::Lost(line) = marks_step(&mut w, None, Ok(1), "t1") else {
+            panic!()
+        };
+        assert!(
+            line.contains("1 birth(s) the tracker's fentry did not see"),
+            "{line}"
+        );
+        assert!(matches!(
+            marks_step(&mut w, None, Ok(1), "t2"),
+            MarksStep::Reset(_)
+        ));
+        // the count goes on from where it was
+        assert_eq!(marks_step(&mut w, None, Ok(1), "t3"), MarksStep::Hold);
+        let MarksStep::Lost(line) = marks_step(&mut w, None, Ok(4), "t4") else {
+            panic!()
+        };
+        assert!(line.contains("3 birth(s)"), "{line}");
+        assert!(matches!(
+            marks_step(&mut w, None, Ok(4), "t5"),
+            MarksStep::Reset(_)
+        ));
+        // the channel unread: lost, its count kept
+        let MarksStep::Lost(line) = marks_step(&mut w, None, Err("EBADF".into()), "t6") else {
+            panic!()
+        };
+        assert!(line.contains("could not be read (EBADF)"), "{line}");
+        assert_eq!(w.unseen, 4);
+        assert_eq!(
+            marks_step(&mut w, None, Err("EBADF".into()), "t7"),
+            MarksStep::Hold
+        );
+        assert!(matches!(
+            marks_step(&mut w, None, Ok(4), "t8"),
+            MarksStep::Reset(_)
+        ));
+        // ftrace unknown (the manifest's line for it) is a loss too
+        let unknown = "kernel.ftrace_enabled could not be read";
+        assert!(matches!(
+            marks_step(&mut w, Some(unknown), Ok(4), "t9"),
+            MarksStep::Lost(l) if l.contains(unknown)
+        ));
     }
 }

@@ -178,8 +178,15 @@ fn build(inputs: &Inputs, terminated: &[String]) -> CapabilityManifest {
     // R1: `kernel.ftrace_enabled` read at every build (the boot's, then
     // every REFRESH_PERIOD): 0 or unknown is a degradation in this very
     // build, signed at once — a worse state, so its row is too.
-    nn_linux::sysctl_guard::note_ftrace(&inputs.proc_root);
+    let ftrace = nn_linux::sysctl_guard::note_ftrace(&inputs.proc_root);
+    // Lot 280b: the start-in-cgroup tracker's marks while ftrace is off
+    // (and the fork's tracepoint's count of the births its fentry missed):
+    // lost, then the epoch reset once ftrace runs again — before the
+    // degradations are read below, so that this build shows it.
+    nn_linux::cgroup_join::watch_marks(ftrace.degradation().as_deref());
     let mut m = inputs.base.clone();
+    // Lot 280b: the kernel's taint flags and livepatches at every build.
+    m.kernel_code = Some(nn_linux::kernel_state::kernel_code(&inputs.proc_root));
     m.manifest_version = MANIFEST_VERSION;
     m.contract_version = nn_core::contract::CONTRACT_VERSION;
     m.degradations = degradation::snapshot();

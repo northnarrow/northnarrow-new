@@ -200,6 +200,40 @@ pub const STAT_INTO_EXEMPT: u32 = 3;
 /// The slots.
 pub const STAT_SLOTS: u32 = 4;
 
+/// Lot 280b: the new thread groups `cgroup_join_born` (fentry) saw, by
+/// tgid, until `cgroup_join_fork` (a BTF tracepoint, which runs whether or
+/// not ftrace does) checks them, microseconds later in the same fork: an
+/// entry lives only between the two, so a few thousand are room for any
+/// host's forks in flight.
+pub const BORN_ENTRIES: u32 = 4096;
+
+/// Lot 280b: `CGROUP_JOIN_SILENT`, the tracepoint's check of the fentry
+/// (per load, not pinned): with `kernel.ftrace_enabled=0` (6.0 to 7.2) the
+/// fentry and fexit programs stop and the tracepoints go on, so a new
+/// thread group the tracepoint sees and the fentry did not is a birth the
+/// tracker missed — "silent because ftrace is off", never "silent because
+/// nothing happened". Slot [`SILENT_ARMED`]: the `CLOCK_MONOTONIC` ns the
+/// agent armed the check at, once its programs were attached (0: not
+/// armed); a child that started after it was seen by this load's fentry
+/// unless the fentry did not run.
+pub const SILENT_ARMED: u32 = 0;
+/// The births the fentry did not see, counted (each child "not known").
+pub const SILENT_UNSEEN: u32 = 1;
+/// The last one's `CLOCK_MONOTONIC` ns.
+pub const SILENT_LAST_NS: u32 = 2;
+/// The slots.
+pub const SILENT_SLOTS: u32 = 3;
+
+/// Lot 280b: whether a new thread group the tracepoint sees is one the
+/// fentry missed: the check armed, the child started after it (its
+/// `cgroup_post_fork` ran with this load's fentry attached), and no entry
+/// of it in `CGROUP_JOIN_BORN`. Pure, so that the host's tests judge what
+/// the eBPF program decides.
+#[inline(always)]
+pub const fn unseen_birth(armed_ns: u64, child_start_ns: u64, seen: bool) -> bool {
+    armed_ns != 0 && child_start_ns > armed_ns && !seen
+}
+
 /// How a process came to be marked (the value's byte 4).
 pub const HOW_MOVED: u8 = 1;
 /// Started by `clone3(CLONE_INTO_CGROUP)` by a process other than PID 1.
@@ -498,6 +532,23 @@ mod tests {
             (HOW_INHERITED, 4242),
         ] {
             assert_eq!(unpack(pack(how, by)), (how, by));
+        }
+    }
+
+    /// Lot 280b: a birth the fentry missed is one the armed check sees
+    /// after its arming, without the fentry's entry — not before arming,
+    /// not a child that started before it, not one the fentry saw.
+    #[test]
+    fn a_birth_the_fentry_missed_is_told_from_one_it_saw() {
+        assert!(unseen_birth(100, 101, false));
+        assert!(!unseen_birth(100, 101, true));
+        assert!(!unseen_birth(100, 100, false), "the arming's own tick");
+        assert!(!unseen_birth(100, 99, false), "started before the arming");
+        assert!(!unseen_birth(0, 101, false), "not armed");
+        const {
+            assert!(SILENT_SLOTS == 3);
+            assert!(SILENT_ARMED < SILENT_SLOTS && SILENT_UNSEEN < SILENT_SLOTS);
+            assert!(SILENT_LAST_NS < SILENT_SLOTS);
         }
     }
 }

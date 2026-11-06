@@ -16,6 +16,12 @@
  * the sysctl holds after it; detaches the program. Nothing else is touched;
  * the caller puts SYSCTL back and removes CGROUP_DIR.
  *
+ * Lot 280b (`nn-lab.sh switches-check`, case T5): CGROUP_DIR may be the
+ * root cgroup itself — refused outside a window by the agent's bpf hook
+ * ("attach (multi): errno=EPERM"); NN_PROBE_HOLD_SECS=<n> keeps the
+ * program attached n seconds after the write (at most 60), long enough for
+ * the agent's kernel-state round to find it.
+ *
  * Expected with the judge on the root cgroup (multi): for a guarded SYSCTL
  * and a harmful REWRITE, "errno=EPERM" and the value unchanged, whatever
  * FLAGS; for an unguarded SYSCTL (the control), "errno=0" and REWRITE in
@@ -136,6 +142,11 @@ int main(int argc, char **argv)
     if (read(pipefd[0], &e, sizeof e) != sizeof e)
         e = -1;
     waitpid(c, NULL, 0);
+    const char *hold = getenv("NN_PROBE_HOLD_SECS");
+    if (hold) {
+        int h = atoi(hold);
+        sleep(h < 0 ? 0 : h > 60 ? 60 : h);
+    }
     memset(&a, 0, sizeof a);
     a.target_fd = cgfd;
     a.attach_bpf_fd = prog;

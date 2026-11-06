@@ -227,6 +227,70 @@ impl Rule for NnLAt001AntiTamperDenial {
                     &reasoning,
                 ));
             }
+            // Lot 280b: the switches that blind the sensors.
+            FsProtectOperation::Kprobes => format!(
+                "to write /sys/kernel/debug/kprobes/enabled (inode {target_dev}:{target_ino}) \
+                 outside a trusted-installer window — 0 disarms every kprobe on the host, the \
+                 agent's among them"
+            ),
+            FsProtectOperation::Lockdown => format!(
+                "to write /sys/kernel/security/lockdown (inode {target_dev}:{target_ino}) outside \
+                 a trusted-installer window — a raise to confidentiality takes the helpers that \
+                 read kernel memory from every BPF program loaded after it, the agent's next \
+                 start among them"
+            ),
+            FsProtectOperation::SysctlRootAttach => format!(
+                "to attach a cgroup/sysctl program to the root cgroup (attach type \
+                 {target_ino}) outside a trusted-installer window — attached after the agent's \
+                 sysctl judge, it would run after it and could rewrite the value it judged"
+            ),
+            // Lot 280b: not refused — the kernel-state round's finding.
+            FsProtectOperation::KernelTaint => {
+                let new = *target_dev;
+                let meaning = common::kernel_taint::meaning(new).join(", ");
+                let critical = common::kernel_taint::is_critical(new);
+                let reasoning = format!(
+                    "The kernel's taint flags gained {} ({meaning}) while the agent runs (taint \
+                     mask now {target_ino}: {}): foreign code entered the kernel, beside the \
+                     agent's hooks — a module the distribution did not ship{}, or a livepatch, \
+                     which replaces kernel functions, those a hook is attached to included. Not \
+                     refused: the kernel's own record, read every 5 s.",
+                    common::kernel_taint::letters(new),
+                    common::kernel_taint::letters(*target_ino),
+                    if critical {
+                        ", one the kernel could not vouch for (unsigned) or forced in or out"
+                    } else {
+                        ""
+                    }
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    if critical {
+                        Severity::Critical
+                    } else {
+                        Severity::High
+                    },
+                    &reasoning,
+                ));
+            }
+            FsProtectOperation::SysctlRootProg => {
+                let reasoning = format!(
+                    "A cgroup/sysctl program not the agent's (id {target_ino}) is attached to the \
+                     root cgroup: attached after the agent's sysctl judge, it runs after it on \
+                     every sysctl write and may rewrite the value the judge let through. Not \
+                     refused — found by the kernel-state round (attached inside a window, or \
+                     before the agent started); `bpftool prog show id {target_ino}` names it."
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::High,
+                    &reasoning,
+                ));
+            }
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -303,6 +367,10 @@ mod tests {
             FsProtectOperation::CgroupJoin,
             FsProtectOperation::Sysctl,
             FsProtectOperation::SysctlValue,
+            FsProtectOperation::Kprobes,
+            FsProtectOperation::Lockdown,
+            FsProtectOperation::SysctlRootAttach,
+            FsProtectOperation::SysctlRootProg,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))
@@ -498,5 +566,89 @@ mod tests {
         assert!(r.contains("cgroup v1 hierarchy (inode 9:709)"), "{r}");
         let r = direct(FsProtectOperation::OomAdj);
         assert!(r.contains("protected pid 709 (oom_score_adj)"), "{r}");
+    }
+
+    /// Lot 280b (named): a new taint of code entering the kernel is a
+    /// signed detection — Critical for an unsigned or forced module, High
+    /// for an out-of-tree module or a livepatch — named by its flags, and
+    /// never worded as a refusal.
+    #[test]
+    fn a_new_kernel_taint_is_critical_when_unsigned_or_forced() {
+        use common::kernel_taint::{
+            TAINT_FORCED_MODULE, TAINT_FORCED_RMMOD, TAINT_LIVEPATCH, TAINT_OOT_MODULE,
+            TAINT_UNSIGNED_MODULE,
+        };
+        let taint = |new: u64, mask: u64| Event::FsProtectDenial {
+            pid: 0,
+            uid: 0,
+            comm: "kernel".into(),
+            target_dev: new,
+            target_ino: mask,
+            operation: FsProtectOperation::KernelTaint,
+            timestamp_ns: 1,
+        };
+        for (new, sev) in [
+            (TAINT_UNSIGNED_MODULE, Severity::Critical),
+            (TAINT_FORCED_MODULE, Severity::Critical),
+            (TAINT_FORCED_RMMOD, Severity::Critical),
+            (TAINT_OOT_MODULE | TAINT_UNSIGNED_MODULE, Severity::Critical),
+            (TAINT_OOT_MODULE, Severity::High),
+            (TAINT_LIVEPATCH, Severity::High),
+        ] {
+            let v = NnLAt001AntiTamperDenial
+                .evaluate(&taint(new, new | 1))
+                .expect("verdict");
+            assert_eq!(v.severity, sev, "{new:#x}");
+            assert!(matches!(v.action, ResponseAction::Log));
+            assert!(!v.reasoning.contains("refused it"), "{}", v.reasoning);
+            assert!(v.reasoning.contains("Not refused"), "{}", v.reasoning);
+        }
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&taint(
+                TAINT_UNSIGNED_MODULE,
+                TAINT_OOT_MODULE | TAINT_UNSIGNED_MODULE,
+            ))
+            .unwrap();
+        assert!(
+            v.reasoning.contains("gained E (E: an unsigned module)"),
+            "{}",
+            v.reasoning
+        );
+        assert!(
+            v.reasoning.contains("mask now 12288: OE"),
+            "{}",
+            v.reasoning
+        );
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&taint(TAINT_LIVEPATCH, TAINT_LIVEPATCH))
+            .unwrap();
+        assert!(v.reasoning.contains("K: a livepatch"), "{}", v.reasoning);
+    }
+
+    /// Lot 280b (named): the switches refused by name, and a foreign
+    /// program on the root's slot signed as found, not refused.
+    #[test]
+    fn the_blinding_switches_and_a_foreign_root_program_are_named() {
+        let r = |op| {
+            NnLAt001AntiTamperDenial
+                .evaluate(&denial(op))
+                .unwrap()
+                .reasoning
+        };
+        let k = r(FsProtectOperation::Kprobes);
+        assert!(
+            k.contains("kprobes/enabled") && k.contains("refused it"),
+            "{k}"
+        );
+        let l = r(FsProtectOperation::Lockdown);
+        assert!(
+            l.contains("security/lockdown") && l.contains("refused it"),
+            "{l}"
+        );
+        let a = r(FsProtectOperation::SysctlRootAttach);
+        assert!(a.contains("root cgroup") && a.contains("refused it"), "{a}");
+        let p = r(FsProtectOperation::SysctlRootProg);
+        assert!(p.contains("(id 709)") && p.contains("Not refused"), "{p}");
+        assert!(!p.contains("refused it"), "{p}");
     }
 }

@@ -47,6 +47,10 @@ pub mod epg;
 /// Per-hook fail-open counter slots of the deny hooks, shared by the eBPF
 /// programs and the agent (lab PR 215). NOT `std`-gated.
 pub mod fail_open;
+/// Lot 280b: the kernel's taint flags, the ones that say foreign code
+/// entered it, and how much a new one weighs. NOT `std`-gated (the
+/// letters and meanings are).
+pub mod kernel_taint;
 /// Ring-buffer drop slots shared by eBPF producers and the agent.
 pub mod ring_drops;
 pub mod sysctl_judge;

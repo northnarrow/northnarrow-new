@@ -383,6 +383,18 @@ const STATICS: &[Kept] = &[
         "lot 280a: the judge's link on the root cgroup, held open for the agent's life so the BPF guard registers it as the agent's own (a foreign handle, detach or update refused) and an unpinned link stays attached",
     ),
     kept(
+        "crates/nn-linux/src/cgroup_join.rs",
+        "MARKS_WATCH",
+        Kernel,
+        "lot 280b: since when the one tracker's marks are lost (ftrace off, a birth its fentry missed) and the births it missed as last read, kept between the manifest's builds until the epoch reset",
+    ),
+    kept(
+        "crates/nn-linux/src/sysctl_cgroup.rs",
+        "OWN_PROG",
+        Kernel,
+        "lot 280b: the id of the judge's program this boot linked to the root cgroup (the one eBPF object's), read by the kernel-state round to tell the root's other programs from it",
+    ),
+    kept(
         "crates/nn-linux/src/sysctl_cgroup.rs",
         "OPT_OUTS",
         Kernel,
@@ -610,6 +622,10 @@ const START_CALLS: &[(&str, &str)] = &[
     (
         "execpol::shutdown",
         "stops the exec policy's controller thread",
+    ),
+    (
+        "cgroup_join::watch_marks",
+        "lot 280b: the manifest's build reads the one tracker's ftrace check and resets its epoch once ftrace runs again (the tracker's own state, kept between builds)",
     ),
     (
         "degradation::report",

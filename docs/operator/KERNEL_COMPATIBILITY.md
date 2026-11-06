@@ -903,6 +903,46 @@ program type in 6.1): the writer's tgid and comm are read from its task
 mount, or where the kernel refuses the program or the root's mode, the
 agent starts with lot 273d's write deny alone, a signed degradation.
 
+## Lockdown, ftrace and the kprobes' switches (lot 280b)
+
+**Lockdown.** In `confidentiality` mode the kernel takes from every BPF
+program loaded after the raise the helpers that read kernel memory
+(`LOCKDOWN_BPF_READ_KERNEL`: `bpf_probe_read`, `bpf_probe_read_str`,
+`bpf_probe_read_kernel`, `bpf_probe_read_kernel_str` are "unknown" to the
+verifier) and refuses new kprobes (`LOCKDOWN_KPROBES`). Programs already
+loaded keep theirs (5.13+ resolves the helper at load). Measured on our
+Ubuntu 24.04 guest (6.8.0-147, `/sys/kernel/security/lockdown` raised to
+`confidentiality` inside a window, lot 280b's lab): `verifier-check` loaded
+**7 of the agent's 98 programs** (83 refused, 8 not counted — the first
+refusal named in the logs is `unknown func bpf_probe_read#4` in 440 lines,
+`bpf_probe_read_str#45` in 5; the 7 that load read no kernel memory:
+`role_exit`, `epg_task_exit`, `epg_lite_task_exit`, `epg_chroot_fs_refs`,
+`cgroup_move_clear` and two feasibility probes), and **the agent restarted
+under it does not start** (the unit `failed`: its deny hooks cannot load).
+So the agent does not run under `lockdown=confidentiality`; `integrity`
+keeps every protection against rewriting the kernel and costs it nothing.
+The host check warns on `[confidentiality]` with that fix, and a write of
+`/sys/kernel/security/lockdown` outside a window is refused (NN-L-AT-001
+`lockdown`): a raise while the agent runs would blind its next start.
+
+**`kernel.ftrace_enabled=0`** (6.0 to 7.2; 5.15 to 5.19 `EBUSY` while a
+trampoline is attached): the fentry/fexit and BPF-LSM programs stop, the
+tracepoints go on (lot 273d's measure). The start-in-cgroup tracker's fork
+tracepoint counts the births its fentry missed and makes each one "not
+known" (`CGROUP_JOIN_SILENT`); the marks' epoch is reset once ftrace runs
+again. Measured on Ubuntu 24.04: with the switch on, 0 births missed over
+the lab's forks; at `0` inside a window, 63 counted within 5 s and 77 by
+the next read, the degradation `cgroup_join_marks` signed, and 6 s after
+the switch was back at `1` the reset signed with the period. On Ubuntu 22.04
+(5.15.0-202) the write is `EBUSY`: nothing stops, nothing is lost.
+
+**The kprobes' switches.** `/sys/kernel/debug/kprobes/enabled` (debugfs,
+mounted at `/sys/kernel/debug`) and `debug.kprobes-optimization` (absent
+without `CONFIG_OPTPROBES`): every write refused outside a window, a `0`
+put back to `1`. A host that does not mount debugfs has no such file to
+write until it mounts it; the write deny finds the file on any mount of
+debugfs (by its filesystem and its names).
+
 ## Adding a distro to the lab
 
 `NN_LAB_DISTRO=<name> deploy/lab/nn-lab.sh up` boots a separate guest

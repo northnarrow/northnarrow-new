@@ -92,6 +92,7 @@ pub(crate) fn arm(
             content: Vec::new(),
             workers: Vec::new(),
             export: None,
+            kernel_code: None,
             telemetry_probe: String::new(),
             settled: false,
             revision: 0,

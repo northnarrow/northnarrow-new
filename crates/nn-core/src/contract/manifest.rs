@@ -698,6 +698,55 @@ impl ExportEntry {
     }
 }
 
+/// Lot 280b: what may have changed the kernel's code under the agent's
+/// hooks — its taint flags (`/proc/sys/kernel/tainted`) and its livepatches
+/// (`/sys/kernel/livepatch`: a livepatch replaces kernel functions, the ones
+/// a hook is attached to included). Read at every build of the manifest:
+/// a change is a signed revision, a worse one at once.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelCode {
+    /// The taint mask (`None`: not read).
+    pub tainted: Option<u64>,
+    /// Its flags' letters, as the kernel prints them in an oops (`OE`, …;
+    /// empty: none), or why it was not read.
+    pub taint: String,
+    /// Each livepatch and its state (`name`, `name (disabled)`, `name (in
+    /// transition)`), sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub livepatches: Vec<String>,
+}
+
+impl KernelCode {
+    /// The line a change row names.
+    pub fn line(&self) -> String {
+        let taint = match self.tainted {
+            Some(0) => "not tainted".to_string(),
+            Some(m) => format!("tainted {m} ({})", self.taint),
+            None => format!("taint not read ({})", self.taint),
+        };
+        if self.livepatches.is_empty() {
+            format!("{taint}, no livepatch")
+        } else {
+            format!("{taint}, livepatches {}", self.livepatches.join(", "))
+        }
+    }
+
+    /// Worse than `before`: a taint flag more (a flag never clears while
+    /// the kernel runs), the mask no longer read, or a livepatch more.
+    pub fn worsens_from(&self, before: &KernelCode) -> bool {
+        let flags = match (self.tainted, before.tainted) {
+            (Some(now), Some(then)) => now & !then != 0,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        flags
+            || self
+                .livepatches
+                .iter()
+                .any(|l| !before.livepatches.contains(l))
+    }
+}
+
 /// What this boot runs with (lab PR 218), and since R13 each source and
 /// class against its contract, the revision, its hashes and what changed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -751,6 +800,10 @@ pub struct CapabilityManifest {
     /// (none: no export).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export: Option<ExportEntry>,
+    /// Lot 280b: the kernel's taint flags and livepatches (none: not
+    /// measured — a manifest from before the lot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_code: Option<KernelCode>,
     /// R13: the telemetry probe's period (`off` when switched off), and
     /// whether its first round has ended (`settled`: the manifest states
     /// the self-test's word on every probed source).
@@ -977,6 +1030,17 @@ impl CapabilityManifest {
                 line(&self.export)
             ));
         }
+        if self.kernel_code != before.kernel_code {
+            let line = |k: &Option<KernelCode>| {
+                k.as_ref()
+                    .map_or_else(|| "not measured".to_string(), KernelCode::line)
+            };
+            out.push(format!(
+                "kernel code: {} → {}",
+                line(&before.kernel_code),
+                line(&self.kernel_code)
+            ));
+        }
         if self.deny_hooks != before.deny_hooks {
             out.push(format!(
                 "deny hooks: {} of {} → {} of {}",
@@ -1039,6 +1103,10 @@ impl CapabilityManifest {
             || self.trust_level < before.trust_level
             || self.workers_worsen_from(before)
             || self.export_worsens_from(before)
+            || match (&self.kernel_code, &before.kernel_code) {
+                (Some(a), Some(b)) => a.worsens_from(b),
+                _ => false,
+            }
     }
 
     /// Lot 276: the export off, refused or failed where it was on, or its

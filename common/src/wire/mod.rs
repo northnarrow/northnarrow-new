@@ -1145,6 +1145,43 @@ pub const FS_OP_SYSCTL_VALUE: u8 = 31;
 /// `target_ino` = the value, as [`FS_OP_SYSCTL_VALUE`].
 pub const FS_OP_SYSCTL_OPT_OUT: u8 = 32;
 
+/// Lot 280b: a write of `/sys/kernel/debug/kprobes/enabled` (debugfs) —
+/// 0 disarms every kprobe on the host, the agent's among them — refused
+/// outside a window whatever it carries, at the write-open and at the
+/// write (`target_dev`/`target_ino` = the file's inode).
+pub const FS_OP_KPROBES: u8 = 33;
+
+/// Lot 280b: a write of `/sys/kernel/security/lockdown` (securityfs) — a
+/// raise to `confidentiality` takes the helpers that read kernel memory
+/// from every BPF program loaded after it, the agent's next start among
+/// them — refused outside a window whatever it carries (`target_dev`/
+/// `target_ino` = the file's inode).
+pub const FS_OP_LOCKDOWN: u8 = 34;
+
+/// Lot 280b: NOT a refusal — a taint flag of the kernel that says foreign
+/// code entered it (`common::kernel_taint::CODE_ENTRY`: a proprietary,
+/// forced, staging, out-of-tree or unsigned module, a forced unload, a
+/// livepatch, an auxiliary or test taint) appeared while the agent runs,
+/// read by its kernel-state round (`target_dev` = the new flags,
+/// `target_ino` = the whole mask).
+pub const FS_OP_KERNEL_TAINT: u8 = 35;
+
+/// Lot 280b: an attach of a `cgroup/sysctl` program to the ROOT cgroup
+/// (`BPF_PROG_ATTACH` or `BPF_LINK_CREATE`, `BPF_CGROUP_SYSCTL`, the
+/// target the cgroup v2 root) by a caller outside the agent's family and
+/// outside a window, refused by the `bpf` LSM hook: attached after the
+/// agent's judge, such a program runs after it and may rewrite the value
+/// it judged (`target_ino` = the attach type).
+pub const FS_OP_SYSCTL_ROOT_ATTACH: u8 = 36;
+
+/// Lot 280b: NOT a refusal — a `cgroup/sysctl` program not the agent's,
+/// found on the ROOT cgroup by its kernel-state round (`BPF_PROG_QUERY`):
+/// attached after the judge, it runs after it (`target_ino` = its id).
+pub const FS_OP_SYSCTL_ROOT_PROG: u8 = 37;
+
+/// Lot 280b: the last denial code (the tests' loops).
+pub const FS_OP_LAST: u8 = FS_OP_SYSCTL_ROOT_PROG;
+
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
 /// each registered inode, so the WRITE-open deny can cover a secret/integrity
@@ -1201,6 +1238,10 @@ pub const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 pub const CGROUP_SUPER_MAGIC: u64 = 0x0027_e0eb;
 /// `PROC_SUPER_MAGIC`.
 pub const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+/// Lot 280b: `DEBUGFS_MAGIC` (`kprobes/enabled`).
+pub const DEBUGFS_MAGIC: u64 = 0x6462_6720;
+/// Lot 280b: `SECURITYFS_MAGIC` (`lockdown`).
+pub const SECURITYFS_MAGIC: u64 = 0x7363_6673;
 
 /// Lot 273b: bit of `CGROUP_POLICY[0]` — writes to cgroup v1 hierarchies are
 /// refused outside a trusted-installer window ([`FS_OP_CGROUP_V1`]). The
@@ -2064,7 +2105,7 @@ mod tests {
         }
         // Lot 273: the new bits mark, they never require (no operation is
         // refused for carrying one).
-        for op in 1..=FS_OP_SYSCTL_OPT_OUT {
+        for op in 1..=FS_OP_LAST {
             let r = fs_protect_required(op);
             assert_eq!(
                 r & (FS_PROTECT_INIT_RMDIR
@@ -2087,7 +2128,7 @@ mod tests {
         for caller in [0, 2, 1000, u32::MAX] {
             assert!(!fs_protect_init_may(FS_OP_RMDIR, dir, caller), "{caller}");
         }
-        for op in 1..=FS_OP_SYSCTL_OPT_OUT {
+        for op in 1..=FS_OP_LAST {
             if op != FS_OP_RMDIR && op != FS_OP_XATTR {
                 assert!(!fs_protect_init_may(op, dir, 1), "op {op}");
             }
@@ -2177,7 +2218,13 @@ mod tests {
             FS_OP_SYSCTL,
             FS_OP_SYSCTL_VALUE,
             FS_OP_SYSCTL_OPT_OUT,
+            FS_OP_KPROBES,
+            FS_OP_LOCKDOWN,
+            FS_OP_KERNEL_TAINT,
+            FS_OP_SYSCTL_ROOT_ATTACH,
+            FS_OP_SYSCTL_ROOT_PROG,
         ];
+        assert_eq!(ops.len(), FS_OP_LAST as usize);
         for (i, a) in ops.iter().enumerate() {
             assert_ne!(*a, 0);
             for b in &ops[i + 1..] {

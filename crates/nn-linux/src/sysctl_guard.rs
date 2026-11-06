@@ -32,13 +32,23 @@
 //! 0, or a value that cannot be read, is a signed degradation while it
 //! holds — the manifest changes, and the verifier off the host says
 //! DEGRADED.
+//!
+//! Lot 280b: the kprobes' switches, refused outside a window whatever they
+//! carry like `ftrace_enabled` — `debug.kprobes-optimization` (0 makes
+//! every kprobe a breakpoint trap: a cost on every probed call, not a
+//! blindness) by the write deny and the `cgroup/sysctl` judge, and
+//! `/sys/kernel/debug/kprobes/enabled` (debugfs: 0 disarms every kprobe,
+//! the agent's among them) by the write deny's debugfs branch; a 0 found
+//! by the round (set before the start, inside a window) is put back to 1,
+//! signed.
 
 use std::path::Path;
 
 use common::cgroup_limits::{
-    limit_value, rt_throttling_off, sysctl_write_harmful, SYSCTL_FTRACE_ENABLED,
-    SYSCTL_MAX_MAP_COUNT, SYSCTL_OVERCOMMIT_KBYTES, SYSCTL_OVERCOMMIT_MEMORY,
-    SYSCTL_OVERCOMMIT_RATIO, SYSCTL_PID_MAX, SYSCTL_SCHED_RT_RUNTIME, SYSCTL_THREADS_MAX,
+    limit_value, rt_throttling_off, sysctl_blinds, sysctl_write_harmful, SYSCTL_FTRACE_ENABLED,
+    SYSCTL_KPROBES_ENABLED, SYSCTL_KPROBES_OPTIMIZATION, SYSCTL_MAX_MAP_COUNT,
+    SYSCTL_OVERCOMMIT_KBYTES, SYSCTL_OVERCOMMIT_MEMORY, SYSCTL_OVERCOMMIT_RATIO, SYSCTL_PID_MAX,
+    SYSCTL_SCHED_RT_RUNTIME, SYSCTL_THREADS_MAX,
 };
 
 /// The guarded files, their kinds and the safe value put back (`None`:
@@ -72,7 +82,18 @@ pub const GUARDED: &[(&str, u8, Option<&str>)] = &[
         Some("950000"),
     ),
     (FTRACE_ENABLED, SYSCTL_FTRACE_ENABLED, Some("1")),
+    // lot 280b: the kprobes' switches (absent without CONFIG_OPTPROBES, or
+    // with debugfs not mounted: then not read)
+    (
+        "/proc/sys/debug/kprobes-optimization",
+        SYSCTL_KPROBES_OPTIMIZATION,
+        Some("1"),
+    ),
+    (KPROBES_ENABLED, SYSCTL_KPROBES_ENABLED, Some("1")),
 ];
+
+/// Lot 280b: the debugfs switch of every kprobe.
+pub const KPROBES_ENABLED: &str = "/sys/kernel/debug/kprobes/enabled";
 
 /// R1: the switch of ftrace, read at every build of the manifest.
 pub const FTRACE_ENABLED: &str = "/proc/sys/kernel/ftrace_enabled";
@@ -291,18 +312,20 @@ pub fn check_with(
                 &format!("{safe}\n"),
             )
         });
+        // lot 280b: what the value does, said as it is
+        let harm = if sysctl_blinds(*kind) {
+            "which blinds the agent's hooks"
+        } else {
+            "which aborts or starves the agent"
+        };
         out.push(match r {
             Ok(()) => Seen {
                 kind: "sysctl_restored",
-                detail: format!(
-                    "{path} was {now:?}, which aborts or starves the agent: put back to {safe}"
-                ),
+                detail: format!("{path} was {now:?}, {harm}: put back to {safe}"),
             },
             Err(e) => Seen {
                 kind: "sysctl_not_restored",
-                detail: format!(
-                    "{path} is {now:?}, which aborts or starves the agent: NOT put back ({e})"
-                ),
+                detail: format!("{path} is {now:?}, {harm}: NOT put back ({e})"),
             },
         });
     }
@@ -487,6 +510,40 @@ mod tests {
         let d = host(&[("/proc/sys/kernel/pid_max", "10000\n")]);
         let r = check_with(d.path(), 16 << 30, &pm, |p, t| std::fs::write(p, t));
         assert_eq!(r[0].kind, "sysctl_restored", "{r:?}");
+    }
+
+    /// Lot 280b (named): the kprobes' switches at 0 (set at boot, inside a
+    /// window) are put back to 1, signed as blinding; at 1, or absent (no
+    /// OPTPROBES, no debugfs), nothing.
+    #[test]
+    fn the_kprobes_switches_at_0_are_put_back() {
+        let d = host(&[
+            ("/proc/sys/debug/kprobes-optimization", "0\n"),
+            ("/sys/kernel/debug/kprobes/enabled", "0\n"),
+        ]);
+        let r = check(d.path(), 0, true);
+        assert_eq!(r.len(), 2, "{r:?}");
+        for s in &r {
+            assert_eq!(s.kind, "sysctl_restored", "{s:?}");
+            assert!(s.detail.contains("blinds the agent's hooks"), "{s:?}");
+            assert!(s.detail.ends_with("put back to 1"), "{s:?}");
+        }
+        for f in [
+            "proc/sys/debug/kprobes-optimization",
+            "sys/kernel/debug/kprobes/enabled",
+        ] {
+            assert_eq!(std::fs::read_to_string(d.path().join(f)).unwrap(), "1\n");
+        }
+        let on = host(&[
+            ("/proc/sys/debug/kprobes-optimization", "1\n"),
+            ("/sys/kernel/debug/kprobes/enabled", "1\n"),
+        ]);
+        assert!(check(on.path(), 0, true).is_empty());
+        assert!(check(host(&[]).path(), 0, true).is_empty());
+        // the starving kinds keep their own words
+        let pid = host(&[("/proc/sys/kernel/pid_max", "300\n")]);
+        let r = check(pid.path(), 0, false);
+        assert!(r[0].detail.contains("aborts or starves the agent"), "{r:?}");
     }
 
     /// R1: `ftrace_enabled=0` (set at boot, inside a window) is put back to
