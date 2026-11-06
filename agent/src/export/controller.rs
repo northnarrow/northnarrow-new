@@ -1150,6 +1150,29 @@ fn round(p: &Params, k: &mut SinkRun, i: usize, set_up_for: &mut Option<u64>) ->
 mod tests {
     use super::*;
 
+    /// Lot 288 (#125): the stop waits for the export's thread at most what
+    /// it is given ([`STOP_WAIT`], or less: what the stop's deadline leaves),
+    /// its stop flag set.
+    #[test]
+    fn the_stop_waits_at_most_what_it_is_given() {
+        assert_eq!(STOP_WAIT, BUDGET + MARGIN + Duration::from_secs(1));
+        let flag = Arc::new(AtomicBool::new(false));
+        let r = Running {
+            stop: Arc::clone(&flag),
+            join: Some(std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(3))
+            })),
+        };
+        let at = Instant::now();
+        r.stop(Duration::from_millis(100));
+        let took = at.elapsed();
+        assert!(
+            took >= Duration::from_millis(100) && took < Duration::from_secs(1),
+            "{took:?}"
+        );
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
     fn sent(line: u64) -> Sent {
         Sent {
             pos: RowPos { file: 1, line },

@@ -4,12 +4,12 @@
 
 use super::*;
 
-/// A short budget for the tests in this process: 600 ms, the note from
-/// 400 ms, the drains until 300 ms.
+/// A short budget for the tests in this process: 1.5 s, the note from
+/// 0.8 s, the drains until 0.5 s.
 const SHORT: Budget = Budget {
-    total: Duration::from_millis(600),
-    note: Duration::from_millis(200),
-    evidence: Duration::from_millis(100),
+    total: Duration::from_millis(1500),
+    note: Duration::from_millis(700),
+    evidence: Duration::from_millis(300),
 };
 
 /// The scheduler's slack on a loaded host (the parallel harness).
@@ -64,7 +64,12 @@ fn a_stop_that_ends_in_time_is_never_cut() {
     stop.begin("sigterm", note);
     stop.stage("decision");
     std::thread::sleep(Duration::from_millis(50));
+    let at = Instant::now();
     stop.finish();
+    assert!(
+        at.elapsed() < Duration::from_millis(100),
+        "finish returns at once"
+    );
     std::thread::sleep(SHORT.total + SLACK);
     assert!(exits.lock().is_empty());
     assert!(notes.lock().is_empty());
@@ -103,10 +108,18 @@ fn a_blocked_stage_is_noted_then_cut_within_the_budget() {
     assert!(!e.stop_signed);
     assert_eq!(e.budget, SHORT);
     let note_point = SHORT.total - SHORT.note;
-    assert!(e.after >= note_point, "{:?}", e.after);
+    assert!(
+        e.after >= note_point && e.after < note_point + Duration::from_millis(500),
+        "{:?}",
+        e.after
+    );
     assert!(*when >= at + note_point);
     assert!(exited >= *when, "the exit follows the note");
-    assert!(exited <= at + SHORT.total + SLACK, "{:?}", exited - at);
+    assert!(
+        exited + Duration::from_millis(200) < at + SHORT.total,
+        "the exit once the note is done: {:?}",
+        exited - at
+    );
     assert_eq!(exits.lock().len(), 1, "one exit");
 }
 
@@ -151,11 +164,19 @@ fn the_note_is_told_the_first_begin_and_a_signed_stop() {
 }
 
 /// A stop that ends after the deadline expired leaves the exit to it, and
-/// waits for it (the note may be writing a row).
+/// waits for it (the note may be writing a row) — until it comes, not to
+/// the end of the budget.
 #[test]
 fn a_stop_that_ends_after_the_deadline_waits_for_its_exit() {
     let (exits, exit) = recorder();
-    let stop = StopDeadline::start_with(SHORT, exit);
+    // the note from 0.5 s, the budget's end at 2 s
+    let budget = Budget {
+        total: Duration::from_secs(2),
+        note: Duration::from_millis(1500),
+        evidence: Duration::from_millis(100),
+    };
+    let stop = StopDeadline::start_with(budget, exit);
+    let at = Instant::now();
     let started = Arc::new(Mutex::new(false));
     let s = Arc::clone(&started);
     stop.begin(
@@ -165,7 +186,7 @@ fn a_stop_that_ends_after_the_deadline_waits_for_its_exit() {
             std::thread::sleep(Duration::from_millis(100));
         }),
     );
-    let until = Instant::now() + SHORT.total + SLACK;
+    let until = Instant::now() + budget.total + SLACK;
     while !*started.lock() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -173,6 +194,11 @@ fn a_stop_that_ends_after_the_deadline_waits_for_its_exit() {
     assert!(exits.lock().is_empty(), "not yet: the note is writing");
     stop.finish();
     assert_eq!(exits.lock().len(), 1, "finish returned after the exit");
+    assert!(
+        at.elapsed() < Duration::from_millis(1500),
+        "and not at the budget's end: {:?}",
+        at.elapsed()
+    );
 }
 
 /// The stages that drain get their own bound, or what is left before the
@@ -372,16 +398,95 @@ fn the_agent_s_note_signs_into_its_audit_log() {
     let dir = tempfile::tempdir().unwrap();
     let (log, pubkey) = audit_log(dir.path());
     let before = rows(dir.path(), &pubkey).len();
-    let note = audit_note(Some(Arc::new(log)), None, Instant::now());
+    let rules = dir.path().join("combat-rules.v4");
+    std::fs::write(&rules, "*filter\nCOMMIT\n").unwrap();
+    let isolator = Arc::new(NetworkIsolator::new(rules).unwrap());
+    let note = audit_note(Some(Arc::new(log)), Some(isolator), Instant::now());
     note(&expired(false));
     let all = rows(dir.path(), &pubkey);
     assert_eq!(all.len(), before + 2);
     assert_eq!(
         all[before].extra["detail"],
-        note_detail(&expired(false), Isolation::NoIsolator)
+        note_detail(&expired(false), Isolation::None)
     );
     assert_eq!(all[before + 1].op, "agent_stop");
     audit_note(None, None, Instant::now())(&expired(false));
+}
+
+/// Lot 288 (#125): the agent's stop runs under its deadline — begun where
+/// the event loop ends (on each way out of it, before the decision thread
+/// is joined), every stage named, every wait bounded by what it leaves,
+/// the `agent_stop` told to it; made before the runtime, whose shutdown
+/// gets what is left, and finished after it.
+#[test]
+fn the_agent_s_stop_runs_under_its_deadline() {
+    let src = |f: &str| {
+        std::fs::read_to_string(format!("{}/agent/src/{f}", env!("NN_REPO_ROOT"))).unwrap()
+    };
+    let in_order = |text: &str, parts: &[&str]| {
+        let mut at = 0;
+        for p in parts {
+            let i = text[at..]
+                .find(p)
+                .unwrap_or_else(|| panic!("`{p}`: missing, or before the one it follows"));
+            at += i + p.len();
+        }
+    };
+    let run_loop = src("run_loop.rs");
+    in_order(
+        &run_loop,
+        &[
+            "audit_note(audit_log.clone(), combat.isolator.clone(), loop_started)",
+            "error!(\"event bus: no receiver to judge from — stopping\");",
+            "begin(\"sensor_pump_exited\");",
+            "return Stopped {",
+            "the decision thread did not start — stopping",
+            "begin(\"decision_thread_failed\");",
+            "rt.block_on(watch_loop(",
+            "begin(reason);",
+            "stop.stage(\"decision\");",
+            "decider.join()",
+            "stop.stage(\"dispatcher\");",
+            "off_the_runtime_stop(dispatcher, stop);",
+            "stop.stage(\"canary\");",
+            "d.flush(stop.drain_bound(Duration::from_secs(5)))",
+            "stop.stage(\"bus\");",
+            "sensor.stop_bus();",
+            "dispatcher.stop_by(STOP_WAIT, stop.drain_until())",
+        ],
+    );
+    in_order(
+        &src("shutdown.rs"),
+        &[
+            "deadline.stage(\"heartbeat\");",
+            "hb.stop(stop_reason);",
+            "deadline.stage(\"export\");",
+            "e.stop(deadline.drain_bound(northnarrow_agent::export::controller::STOP_WAIT));",
+            "deadline.stage(\"workers\");",
+            "workers.stop();",
+            "deadline.stage(\"guards\");",
+            "deadline.stage(\"agent_stop\");",
+            "stop_entry(stop_reason, uptime)",
+            "Ok(_) => {",
+            "deadline.stop_signed();",
+            "deadline.stage(\"anchor\");",
+            "deadline.stage(\"files\");",
+            "deadline.stage(\"teardown\");",
+        ],
+    );
+    in_order(
+        &src("boot/mod.rs"),
+        &[
+            "let stop = crate::stop_deadline::StopDeadline::start();",
+            "tokio::runtime::Builder::new_multi_thread()",
+            "runtime.block_on(run(cli, undumpable, image, &stop));",
+            "stop.stage(\"runtime\");",
+            "runtime.shutdown_timeout(stop.left());",
+            "stop.finish();",
+            "result",
+        ],
+    );
+    assert!(src("boot/posture.rs").contains("isolator: isolator.clone(),"));
 }
 
 /// The child's switch: the helper below is a no-op without it.
@@ -440,7 +545,7 @@ fn a_stop_with_a_blocked_stage_exits_within_the_deadline() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let give_up = Instant::now() + Duration::from_secs(60);
+    let give_up = Instant::now() + Duration::from_secs(30);
     let (status, exit_ns) = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break (status, monotonic_ns());
