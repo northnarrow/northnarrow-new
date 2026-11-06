@@ -322,9 +322,9 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CAT
 | `audit <rule>` | recorded only (no alert line, not counted) |
 | `off <rule>` | not recorded, no response (the rule still runs, so chains and windows keep their state) |
 | `exempt <rule> uid <uid>` | that uid's matches of the rule are recorded only (not uid 0) |
-| `exempt <rule> exe <path> sha256 <hex>` | that executable — root-owned, in `/usr`, `/opt`, `/bin`, `/sbin`, `/lib*`, `/snap` or `/nix/store`, every directory up to `/` root-owned, no one else may write it, and its content exactly that digest |
-| `exempt <rule> cgroup <path>` | processes of that cgroup v2 path (it must end in a `.service` or `.scope`) **started there** (§2.1) |
-| `exempt <rule> unit <name>` | processes of that systemd unit (`backup.service`) **started there** (§2.1) |
+| `exempt <rule> exe <path> sha256 <hex>` | that executable — root-owned, in `/usr`, `/opt`, `/bin`, `/sbin`, `/lib*`, `/snap` or `/nix/store`, every directory up to `/` root-owned, no one else may write it, and its content exactly that digest — while **no code was injected** into the process (§2.3) |
+| `exempt <rule> cgroup <path>` | processes of that cgroup v2 path (it must end in a `.service` or `.scope`) **started there** (§2.1) and **not injected into** (§2.3) |
+| `exempt <rule> unit <name>` | processes of that systemd unit (`backup.service`) **started there** (§2.1) and **not injected into** (§2.3) |
 | `combat-without-corroboration NN-L-IMP-001` | the ransomware trigger reaches COMBAT without a second signal (it never locks COMBAT) |
 | `sysctl-allow <sysctl> <value>` or `sysctl-allow <sysctl> <min>..<max>` | (lot 280a) a guarded sysctl may take that value or range outside a trusted-installer window too, each such write recorded; honoured **only signed** (§2.2) |
 
@@ -488,10 +488,8 @@ What it does not cover, as measured:
   digest).
 - **A root that writes PID 1's memory**, or its pre-exec child's (systemd up
   to 254): `ptrace`, `/proc/1/mem`. What PID 1 does is systemd's placement.
-- **Code injected into an exempt process that is already running**
-  (`ptrace`, `process_vm_writev`, `/proc/<pid>/mem`): nothing moves, and
-  every kind of exemption covers what the process then does — `exe <path>
-  sha256 <hex>` too, which is the file's digest, not the memory's.
+- Code injected into an exempt process that is already running: since
+  lot 281 its exemption is revoked (§2.3).
 - A move made before the agent's first start since the host booted (no
   program ran). Inside the trusted-installer window (a signed, audited
   grant; an upgrade's), root can replace both the tracker's pins and
@@ -551,6 +549,101 @@ sysctl-allow kernel.pid_max 4096..32767
   host needs.
 - `nn-admin policy show` lists the lines in force; the policy's summary
   counts them (`…, 1 sysctl opt-out`).
+
+### 2.3 Code injected into an exempt process: the exemption revoked (lot 281)
+
+An exemption names a program (`exe`, by its file's digest) or where it was
+started (`cgroup`, `unit`); neither says what the process's memory holds
+once another process could write it. Since lot 281, when a process gains
+**code-injection access** to another, the start-in-cgroup tracker taints
+the target's mark (`agent-ebpf/src/cgroup_join.rs`, two BPF LSM programs
+that never refuse anything):
+
+- a debugger's attach (`PTRACE_ATTACH`, `PTRACE_SEIZE`: `gdb -p`,
+  `strace -p`), `process_vm_writev`, `/proc/<pid>/mem` opened for writing,
+  `pidfd_getfd` (whatever the descriptor), and any other access the kernel
+  checks in attach mode whose system call the agent cannot read (an io_uring
+  worker's: fail closed);
+- a program that asks its parent to trace it (`PTRACE_TRACEME`: a program
+  started under `gdb` or `strace`), tainted by the parent;
+- **not** a read: `/proc/<pid>/mem` opened read-only, `process_vm_readv`,
+  `ps`, `/proc/<pid>/environ`, `perf`, `kcmp` (read mode).
+
+The taint lasts for the rest of the process's life — an exec, a move into
+another cgroup, the agent's restart or upgrade do not clean it — and every
+process it forks after is tainted too (inherited). The match of a tainted
+process is **not exempt** by `exe`, `cgroup` or `unit`: it is judged like
+any other process's, by its rule, the policy's mode and the posture, a held
+kill included; the record's reasoning names the exemption and why it does
+not hold ("… does not hold: code-injection access to it was given to pid
+N"). An exemption by `uid` still holds: it is the uid's, whatever code runs
+as it (root can become that uid without injecting anything).
+
+Not tainted: an access by the agent or its watchdog; PID 1 and the agent's
+protected processes (the anti-tamper hook refuses the access; a tainted
+PID 1 would taint every service it starts); an access another LSM refused
+before ours (Yama's `ptrace_scope`, AppArmor).
+
+**The detection.** The first injection into a process is recorded by the
+kernel; the agent signs it when an exemption of the policy covered the
+process (whatever the taint says now): NN-L-AT-001 with `operation`
+`exempt_injection`, Log, not refused, no posture trigger. Its severity:
+
+| injector | severity |
+|---|---|
+| root, from an administrator's interactive `sudo`/`su` session (login uid and terminal) | **High** |
+| root, any other lineage (a service, a cron job, `ssh host sudo …` without a terminal, a setuid exploit) or a lineage that cannot be told | **Critical** |
+| not root | **Critical** |
+
+The record names the injector (`principal`, `exe`), the process and its
+exemption, the access (`ptrace` attach, `process_vm_writev`, …). An
+injection into a process no exemption covers is a debug line only (its
+mark is tainted all the same).
+
+Where an exemption by `exe`, `cgroup` or `unit` is refused because the
+taint is **not known** (fail closed): no tracker on this kernel; a process
+whose mark the kernel could not keep; one started before a reset of the
+marks (an upgrade from a release before lot 281 is one: its marks knew no
+injection — **restart the exempt services** after it); until the tracker
+is armed at the agent's start (below); a process gone before its match was
+judged.
+
+**Kept from tampering (#494's notes N1, N2).** The tracker's pinned maps
+are frozen (`BPF_MAP_FREEZE`) as soon as they exist: no handle writes them,
+the agent's own included — one a root took in a window, in an upgrade's
+gap or while a new generation was being made writes nothing; only the
+tracker's programs do. A start that makes a new generation makes its maps
+with the load and pins them after it, in a directory it made: a file
+planted at a pin's path or anything else in that directory is never
+adopted — the maps go to the next generation, signed ("the new tracker
+directory … was not the tracker's alone"). No exemption by `exe`, `cgroup`
+or `unit` holds until the tracker is armed: its pins and their record
+protected (the journal's "the tracker is armed" line gives the time since
+the start planned them).
+
+Refusals that are not an attack (fail closed): a tool that takes a
+descriptor of a process with `pidfd_getfd` (a container runtime, a
+supervisor) taints it, whatever the descriptor; an io_uring worker's
+access in attach mode (its registers are not its own call) is an
+injection; debugging an exempt service ends its exemption until it is
+restarted.
+
+What it does not cover:
+
+- an injection before the agent's first start since the host booted, or
+  while `kernel.ftrace_enabled` is 0 (possible inside a window only): the
+  BPF programs do not run; the agent resets the marks' epoch once ftrace
+  runs again (every process started before is not known);
+- inside the trusted-installer window, root can plant a registered tracker
+  directory with maps of its making (the window trusts its holder: it can
+  replace the binaries); those maps are frozen when the next start adopts
+  them, and the record says they were not;
+- a BPF program of root's own that names a tracker map (any handle, a
+  read-only one included, lets a program write a map): the agent's
+  `bpf()` observer records the load, it does not refuse it;
+- a shared library planted in the exempt program's path, an
+  `LD_PRELOAD` in its unit, a writable memory mapping shared with another
+  process: not an access the kernel checks as `ptrace`.
 
 ## 3. Testing it before it is signed
 

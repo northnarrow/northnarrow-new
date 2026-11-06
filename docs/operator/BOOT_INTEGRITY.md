@@ -475,8 +475,10 @@ kernel's BTF lacks one of the four proc offsets), and every PID 1 write
 of a protected resource file refused (no syscall argument offsets: an
 architecture other than x86-64). Lot 277 added one: `cgroup exemptions`,
 the start-in-cgroup tracker not attached (a target of its five programs
-absent or of another shape, one of its offsets absent, or a failed load).
-Every exemption by cgroup or unit of the per-rule policy is then refused
+absent or of another shape, one of its offsets absent, or a failed load;
+lot 281: seven programs, its maps not frozen, its pins or their record
+not protected — then it is not armed).
+Every exemption by cgroup or unit (lot 281: or executable) of the per-rule policy is then refused
 (`RULE_POLICY.md` §2.1); `host-check`'s `kernel_fixes` row joins the
 manifest's `host_hardening`, like every other check.
 

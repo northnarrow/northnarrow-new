@@ -6,6 +6,35 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- An exemption is revoked when code is injected into the exempt process
+  (lot 281; `docs/operator/RULE_POLICY.md` §2.3). Two BPF LSM programs of
+  the start-in-cgroup tracker (`ptrace_access_check`, `ptrace_traceme`,
+  never refusing) taint a process's mark when another gains code-injection
+  access to it — a debugger's attach, `process_vm_writev`, a write handle
+  on `/proc/<pid>/mem`, `pidfd_getfd`, `PTRACE_TRACEME`; not a read
+  (`/proc/<pid>/mem` read-only, `process_vm_readv`): the system call read
+  from the caller's own registers, any other attach-mode access an
+  injection. The agent and its watchdog, PID 1 and the protected
+  processes are left out. The taint is passed on at a fork and kept
+  through a move and an upgrade; an exemption by `exe`, `cgroup` or `unit`
+  no longer holds for the process or what it forks (`uid` does), the
+  match judged with the reasoning naming the exemption and the injector.
+  The first injection into a process an exemption covered is signed
+  (NN-L-AT-001 `exempt_injection`, wire op 38): High from an
+  administrator's interactive sudo/su session, Critical from any other
+  lineage or a non-root injector. The tracker's schema is 2 (a signed
+  reset at the upgrade: restart the exempt services).
+- #494's notes N1 and N2 closed (lot 281;
+  `docs/design/ANTITAMPER_TRUST_MODEL.md`). A new generation's tracker
+  maps are made by the load and pinned after it in a directory the start
+  makes then: a plant at a pin's path (`EEXIST`) or in the directory moves
+  them to the next generation, signed, the plant removed; an adoption's
+  maps are checked after the load against the ids verified before. All
+  four pinned maps are frozen (`BPF_MAP_FREEZE`): a handle taken in a
+  window, an upgrade's gap or a generation's making writes nothing; a
+  reset's instant goes through a per-load request the fork program takes
+  in, forward only. No exemption by executable, cgroup or unit is honoured
+  until the tracker is armed (its pins and record protected).
 - Every sensor proves it is alive, every round (lot 280c;
   `docs/operator/SENSOR_CONTRACT.md` §5a). The telemetry probe became the
   sensor self-test: each round's child of the agent's binary makes one

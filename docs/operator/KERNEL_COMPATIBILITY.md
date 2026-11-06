@@ -863,8 +863,10 @@ and `kernel.modules_disabled=1`.
 ## The start-in-cgroup tracker (lot 277)
 
 The per-rule policy's exemptions by cgroup or unit hold for processes
-started in their cgroup only (`RULE_POLICY.md` §2.1). The kernel's half is
-five programs, attached together where the kernel's BTF has their
+started in their cgroup only (`RULE_POLICY.md` §2.1), and (lot 281) no
+exemption by executable, cgroup or unit holds for a process code was
+injected into (§2.3). The kernel's half is
+five programs (seven since lot 281, below), attached together where the kernel's BTF has their
 targets in the shapes they read (`northnarrow-agent --btf-check` prints
 `tracker cgroup_join`): the BTF tracepoints `cgroup_attach_task` (with
 its `path` argument), `sched_process_fork` and `sched_process_exit`,
@@ -877,7 +879,7 @@ programs load, `cgroup_join_mark` 876 and 908 instructions; lot 277's
 note); the review of #494's code on 6.8: lot 277's note in
 https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md. A kernel without them
 starts with a signed `subsystem_degraded` "cgroup exemptions", and every
-exemption by cgroup or unit is refused there. An optional offset absent
+exemption by cgroup or unit (lot 281: or executable) is refused there. An optional offset absent
 makes the tracker absent (`btf_revalidate`), never a tracker reading a
 sentinel. The programs' links and the four maps are pinned beside the pin root, in
 `/sys/fs/bpf/northnarrow-cgroup-join-v<schema>_<generation>` (recorded in
@@ -891,6 +893,19 @@ holds the last reset's instant. A start checks each map it adopts with
 On 6.18+ with cgroup2's `favordynmods` (a remount by root; not systemd's
 default) a move no longer waits for a fork: see the trust model's
 residuals.
+
+Lot 281 adds two BPF LSM programs to the tracker, attached and pinned with
+the five: `cgroup_join_inject` on `ptrace_access_check` and
+`cgroup_join_traceme` on `ptrace_traceme` (both hooks in every kernel with
+the BPF LSM, which the agent needs anyway; they never refuse). The first
+reads the caller's system call from its own registers
+(`bpf_get_current_task_btf`, `bpf_task_pt_regs`: 5.11 and 5.15, the
+x86-64 `pt_regs` offsets the write deny reads; on another architecture,
+or for an io_uring worker or a kernel thread, every attach-mode access is
+an injection — fail closed). All four pinned maps are frozen
+(`BPF_MAP_FREEZE`, 5.2+); `CGROUP_JOIN_EPOCH_RT`, per load, carries a
+reset's request. The marks' schema is 2. `verifier-check` on 5.15 and
+6.8: lot 281's note.
 
 **The sysctl judge (lot 280a)** is a `cgroup/sysctl` program (5.2+) linked
 to the root cgroup with `BPF_LINK_CREATE` (cgroup links: 5.7+), which needs
