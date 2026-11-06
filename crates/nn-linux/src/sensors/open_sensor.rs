@@ -29,7 +29,8 @@ use common::wire::open_sensor::{
     open_class::{
         CHILDREN_PROBE, CHILD_FILES, DIR_HAS_FILES, FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE,
         LEAF_CRED, LEAVES_CRED, SUBTREE, TREE_CARVEOUT, TREE_CRED, TREE_CRITICAL, TREE_HOME,
-        TREE_PERSIST, TREE_RUNTIME, TREE_SVC_DATA, TREE_UNIT_DATA, TREE_USER_CACHE, UNIT_TAG_SHIFT,
+        TREE_PERSIST, TREE_RUNTIME, TREE_SHM, TREE_SVC_DATA, TREE_UNIT_DATA, TREE_USER_CACHE,
+        UNIT_TAG_SHIFT,
     },
     open_reason, ChildRuleKey, OpenRecordRaw, CHILD_RULES_MAX, OPEN_CLASSIFY_DEPTH, OPEN_NAME_LEN,
     OPEN_NAME_RULES_MAX, OPEN_PATH_SLOTS, OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX, OPEN_SENSOR_ARMED,
@@ -163,6 +164,9 @@ pub struct RuleInputs {
     /// Lot 283c: each person's `~/.cache` and its owner
     /// (`TREE_USER_CACHE`).
     pub caches: Vec<(PathBuf, u32)>,
+    /// Lot 283c: the POSIX shared memory directory (`/dev/shm`,
+    /// `TREE_SHM`): a segment there is its owner's own data.
+    pub shm: Option<PathBuf>,
     /// Lot 283c: the daemons' data directories, in tag order
     /// (`TREE_UNIT_DATA`; nn-core's `posture::daemon_data`).
     pub unit_dirs: Vec<String>,
@@ -194,8 +198,7 @@ impl RuleInputs {
         carveout.extend(extras.carveout.iter().cloned());
         let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
         let login_defs = std::fs::read_to_string("/etc/login.defs").unwrap_or_default();
-        let (svc_homes, caches) =
-            account_dirs(&passwd, nn_core::decision::host::uid_min(&login_defs));
+        let (svc_homes, caches) = account_dirs(&passwd, crate::accounts::uid_min(&login_defs));
         let mut svc_data = vec![(PathBuf::from("/var/lib"), None)];
         svc_data.extend(svc_homes.into_iter().map(|(h, uid)| (h, Some(uid))));
         RuleInputs {
@@ -208,6 +211,7 @@ impl RuleInputs {
             runtime: runtime_dirs(Path::new("/run/user")),
             svc_data,
             caches,
+            shm: Some(PathBuf::from("/dev/shm")),
             unit_dirs: extras.unit_dirs.clone(),
         }
     }
@@ -420,6 +424,9 @@ impl RuleSet {
                 *set.inodes.entry(k).or_default() |= TREE_USER_CACHE;
                 set.runtime.insert(k, *uid);
             }
+        }
+        if let Some(m) = inputs.shm.as_deref().and_then(|d| owned_dir(d, None)) {
+            *set.inodes.entry(key_of(&m)).or_default() |= TREE_SHM;
         }
         for (tag, dir) in inputs.unit_dirs.iter().enumerate() {
             set.add_unit_dir(dir, tag as u32);
@@ -2709,6 +2716,7 @@ mod tests {
         };
         let key = |p: &Path| key_of(&std::fs::symlink_metadata(p).unwrap());
         let (lib, home, cache, data) = (dir("lib"), dir("svc"), dir("u/.cache"), dir("cd"));
+        let shm = dir("shm");
         std::os::unix::fs::symlink(&data, t.path().join("link")).unwrap();
         let inputs = RuleInputs {
             svc_data: vec![
@@ -2717,6 +2725,7 @@ mod tests {
                 (dir("theirs"), Some(me.wrapping_add(1))),
             ],
             caches: vec![(cache.clone(), me), (t.path().join("v/.cache"), me)],
+            shm: Some(shm.clone()),
             unit_dirs: vec![
                 format!("{}/", data.display()),
                 format!("{}/run-k3s/", t.path().display()),
@@ -2734,6 +2743,7 @@ mod tests {
             "another's"
         );
         assert_eq!(set.inodes.get(&key(&cache)), Some(&TREE_USER_CACHE));
+        assert_eq!(set.inodes.get(&key(&shm)), Some(&TREE_SHM));
         assert_eq!(set.runtime.get(&key(&cache)), Some(&me));
         assert_eq!(set.inodes.get(&key(&data)), Some(&TREE_UNIT_DATA));
         let missing = ChildRuleKey {

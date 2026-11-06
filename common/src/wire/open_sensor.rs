@@ -84,13 +84,18 @@ pub mod open_class {
     /// refuses it): their tags would mix in the walk.
     pub const UNIT_TAG_SHIFT: u32 = 18;
     pub const UNIT_TAG_MASK: u32 = 0xFF << UNIT_TAG_SHIFT;
+    /// Lot 283c: `/dev/shm`, the POSIX shared memory every account shares
+    /// (sticky, root's): a file a non-root uid owns there is that
+    /// account's own segment ([`super::own_code`]) — PostgreSQL's dynamic
+    /// shared memory, which its backends open to write beside their data.
+    pub const TREE_SHM: u32 = 1 << 26;
     /// The class bits that carry an owner in `DirClass::uid` (or, for a
     /// daemon's directory, a tag): [`super::own_code`] reads a class with
     /// exactly one of them.
     pub const OWNER_BITS: u32 = TREE_RUNTIME | TREE_USER_CACHE | TREE_UNIT_DATA;
     /// The class bits [`super::own_code`] reads: a write elsewhere is no
     /// one's own data, and its inodes are not read.
-    pub const OWN_DATA_BITS: u32 = TREE_SVC_DATA | TREE_USER_CACHE | TREE_UNIT_DATA;
+    pub const OWN_DATA_BITS: u32 = TREE_SVC_DATA | TREE_USER_CACHE | TREE_UNIT_DATA | TREE_SHM;
     /// A computed `DIR_CLASS` entry (an empty class is still cached).
     pub const CLASSIFIED: u32 = 1 << 31;
     /// What a directory passes to every descendant.
@@ -103,7 +108,8 @@ pub mod open_class {
         | TREE_SVC_DATA
         | TREE_USER_CACHE
         | TREE_UNIT_DATA
-        | UNIT_TAG_MASK;
+        | UNIT_TAG_MASK
+        | TREE_SHM;
     /// What a directory's own rule says about its direct children.
     pub const DIRECT: u32 = SUBTREE | CHILDREN_PROBE | LEAVES_CRED | CHILD_FILES | DIR_HAS_FILES;
 }
@@ -200,7 +206,8 @@ pub mod own_data {
     /// Some file of the window was no one's own data (or there was none).
     pub const NONE: u8 = 0;
     /// Every file lay under `/var/lib` or a service account's home, in a
-    /// directory the writer's uid owns, owned by it (not root).
+    /// directory the writer's uid owns, or in `/dev/shm` (its POSIX shared
+    /// memory), owned by it (not root).
     pub const SERVICE: u8 = 1;
     /// Every file lay in the writer's person's `~/.cache`, owned by it.
     pub const CACHE: u8 = 2;
@@ -534,7 +541,11 @@ pub fn carved_class(bits: u32, owner: u32, loginuid: impl FnOnce() -> u32) -> bo
 ///   its owner and owns the file and its directory;
 /// - under `/var/lib` or a service account's home (`TREE_SVC_DATA`):
 ///   `SERVICE` when a uid other than root owns the file and its directory
-///   and writes it (the posture checks the account is a service's).
+///   and writes it (the posture checks the account is a service's);
+/// - in `/dev/shm` (`TREE_SHM`, a directory every account shares):
+///   `SERVICE` when a uid other than root owns the file and writes it — its
+///   own shared memory segment, as a service's data (lot 283c's lab:
+///   PostgreSQL's backends open their dynamic shared memory to write).
 ///
 /// A file with another link is no one's: a hard link puts any file the
 /// writer may link into its own directory. A class with two owner-bearing
@@ -562,7 +573,8 @@ pub fn own_code(bits: u32, owner: u32, uid: u32, dir_uid: u32, file_uid: u32, nl
             own_data::NONE as u32
         };
     }
-    if owners == 0 && bits & TREE_SVC_DATA != 0 && owned {
+    let shm = uid != 0 && file_uid == uid && bits & TREE_SHM != 0;
+    if owners == 0 && (bits & TREE_SVC_DATA != 0 && owned || shm) {
         own_data::SERVICE as u32
     } else {
         own_data::NONE as u32
@@ -1077,10 +1089,11 @@ mod tests {
             | DIR_HAS_FILES
             | DEPTH_CAPPED
             | CLASSIFIED;
-        let own = TREE_SVC_DATA | TREE_USER_CACHE | TREE_UNIT_DATA | UNIT_TAG_MASK;
+        let own = TREE_SVC_DATA | TREE_USER_CACHE | TREE_UNIT_DATA | UNIT_TAG_MASK | TREE_SHM;
         assert_eq!(own & others, 0);
         assert_eq!(SUBTREE & own, own);
         assert_eq!(OWN_DATA_BITS & UNIT_TAG_MASK, 0);
+        assert_eq!(TREE_SHM & UNIT_TAG_MASK, 0);
         assert_eq!((UNIT_TAG_MASK >> UNIT_TAG_SHIFT) + 1, 256);
         let all_reasons = open_reason::SENSITIVE
             | open_reason::CRITICAL
@@ -1133,6 +1146,17 @@ mod tests {
             "outside the trees"
         );
         assert_eq!(code(0, NO, PG, PG, PG, 1), NONE);
+        // its own POSIX shared memory: a file it owns in `/dev/shm`, the
+        // directory root's (sticky) — anyone else's segment is not
+        assert_eq!(code(TREE_SHM, NO, PG, 0, PG, 1), SERVICE);
+        assert_eq!(
+            code(TREE_SHM, NO, PG, 0, 1000, 1),
+            NONE,
+            "a person's segment"
+        );
+        assert_eq!(code(TREE_SHM, NO, 0, 0, 0, 1), NONE, "root's");
+        assert_eq!(code(TREE_SHM, NO, PG, 0, PG, 2), NONE, "a hard link");
+        assert_eq!(code(TREE_SHM | TREE_RUNTIME, PG, PG, 0, PG, 1), NONE);
         // decision 3: a person's cache, by its owner only
         assert_eq!(
             code(TREE_USER_CACHE | TREE_HOME, 1000, 1000, 1000, 1000, 1),

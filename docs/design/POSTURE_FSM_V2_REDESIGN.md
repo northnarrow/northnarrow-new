@@ -1089,7 +1089,12 @@ from the class of its directory and the inodes the kernel resolved:
   from the account database: below `UID_MIN` or a shell that refuses a
   login): `SERVICE` when a uid other than root writes a file it owns in a
   directory it owns (the file's dentry's parent, as the kernel resolved it,
-  not the path text);
+  not the path text); in `/dev/shm` (`TREE_SHM`, the POSIX shared memory
+  every account shares, sticky and root's), `SERVICE` when a uid other
+  than root writes a file it owns there — its own segment. The lab found
+  PostgreSQL's backends opening their dynamic shared memory
+  (`/dev/shm/PostgreSQL.*`) to write beside their relation files: without
+  it every window of theirs held a file outside their data;
 - in a person's `~/.cache` (`TREE_USER_CACHE`, its owner beside it as a
   runtime directory's): `CACHE` when its owner writes a file it owns there;
 - in a directory of the shipped list `configs/daemon-data.v1` or the signed

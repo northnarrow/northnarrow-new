@@ -258,7 +258,8 @@ pull` and an `apt purge` reached it. Since lot 282
 - since lot 283c, a server doing its normal job does not sit in ENGAGED: a
   crossing whose every file was the writer's own data does not raise the
   mass-write signal — a service account's files under `/var/lib` or its home,
-  in a directory it owns, written from its system service (PostgreSQL's
+  in a directory it owns, and its own shared memory in `/dev/shm`, written
+  from its system service (PostgreSQL's
   backends, not `initdb` run by hand in a session); a listed root daemon's
   directory (`daemon-data.v1`: containerd, Docker, the kubelet, etcd, k3s;
   more in the mass-write overlay) written from that unit's cgroup; a person's

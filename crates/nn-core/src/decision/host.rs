@@ -86,38 +86,6 @@ pub fn classify_account(uid: u32, uid_min: u32, shell: Option<&str>) -> AccountK
 /// `UID_MIN`'s default (`login.defs(5)`), for a host whose file names none.
 pub const DEFAULT_UID_MIN: u32 = 1000;
 
-/// `UID_MIN` of a `login.defs` text: its last valid setting, else
-/// [`DEFAULT_UID_MIN`] (lot 283b; lot 283c moved it here, for the posture's
-/// own-data exemption too).
-pub fn uid_min(login_defs: &str) -> u32 {
-    let mut found = DEFAULT_UID_MIN;
-    for line in login_defs.lines() {
-        let mut words = line.split_whitespace();
-        if words.next() == Some("UID_MIN") {
-            if let Some(n) = words.next().and_then(|w| w.parse::<u32>().ok()) {
-                found = n;
-            }
-        }
-    }
-    found
-}
-
-/// The shell of each uid of a `passwd` text — the first entry of a uid,
-/// as `getpwuid(3)` finds it (lot 283b; moved here by lot 283c).
-pub fn shells(passwd: &str) -> std::collections::HashMap<u32, String> {
-    let mut out = std::collections::HashMap::new();
-    for line in passwd.lines() {
-        let f: Vec<&str> = line.split(':').collect();
-        if f.len() < 7 || f[0].starts_with('+') || f[0].starts_with('-') {
-            continue;
-        }
-        if let Ok(uid) = f[2].parse::<u32>() {
-            out.entry(uid).or_insert_with(|| f[6].to_string());
-        }
-    }
-    out
-}
-
 /// A shell that refuses a login: `nologin` and `false`, wherever installed
 /// (`/usr/sbin/nologin`, `/sbin/nologin`, `/bin/false`, `/usr/bin/false`).
 /// An empty shell field is `/bin/sh` to `login(1)`: a login shell.

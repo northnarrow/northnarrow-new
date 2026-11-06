@@ -785,8 +785,8 @@ NN-L-IMP-001). The directory obeys the carve-outs' limits (not `/`, a
 top-level directory, a user's tree, `/var/tmp`, `/dev/shm`, `/run/user`)
 and may not lie inside another listed directory or hold one. A service
 account's own data (PostgreSQL, MySQL, Redis: files it owns, in a directory
-it owns, under `/var/lib` or its home) and a person's `~/.cache` need no
-line. What this lets through is in the [posture design, §10.5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/POSTURE_FSM_V2_REDESIGN.md).
+it owns, under `/var/lib` or its home, and its own segments in `/dev/shm`)
+and a person's `~/.cache` need no line. What this lets through is in the [posture design, §10.5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/POSTURE_FSM_V2_REDESIGN.md).
 
 Every accepted new content is a `config_overlay_accepted` audit entry,
 every stored one a `config_overlay_set` entry. The two posture overlays and

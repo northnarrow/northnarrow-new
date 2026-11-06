@@ -2399,7 +2399,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   crossing, whether every file its window counted was the writer's own data
   (the record's `own` byte, `MassWrite`/`FileBurst`'s `own_data`): a service
   account's (under `/var/lib` or its home, the file and its directory owned
-  by its uid, not root's, one link), a person's `~/.cache` (its owner), or a
+  by its uid, not root's, one link; or its own POSIX shared memory segment
+  in `/dev/shm`, which PostgreSQL's backends open to write), a person's `~/.cache` (its owner), or a
   directory of the new shipped list `configs/daemon-data.v1` (containerd,
   Docker, the kubelet, etcd; k3s's `/var/lib/rancher`, `/var/lib/kubelet`,
   `/var/lib/cni`, `/run/k3s` and `/var/log/pods`, where lot 283a measured
@@ -2411,8 +2412,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   data; a session's tree replacements count as before. The operator adds a
   daemon's directory with a `+<unit>.service <dir>/` line in the signed
   mass-write overlay. Residuals in §10.5 and `docs/operator/RULE_POLICY.md`.
-  New: `TREE_SVC_DATA`, `TREE_USER_CACHE`, `TREE_UNIT_DATA` (and an 8-bit
-  tag) directory classes; `daemon-data.v1` installed by `install.sh`,
+  New: `TREE_SVC_DATA`, `TREE_SHM`, `TREE_USER_CACHE`, `TREE_UNIT_DATA` (and
+  an 8-bit tag) directory classes; `daemon-data.v1` installed by `install.sh`,
   write-denied and pinned like the other shipped lists; nn-core's
   `uid_min`/`shells` (moved from nn-linux's `accounts`).
 - The kills that broke benign workloads (lot 283b, the coordinator's

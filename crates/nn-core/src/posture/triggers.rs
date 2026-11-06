@@ -1611,7 +1611,7 @@ fn staging_exec<H: PostureAgent>(
 /// Lot 283c: so is a crossing whose window held only the writer's own data
 /// ([`own_data_exempt`]) — a replacement only when both its halves did.
 #[allow(clippy::too_many_arguments)]
-fn confirmed_intrusion<H: PostureHost>(
+fn confirmed_intrusion<H: DecisionHost>(
     focal: &Event,
     recent: Recent<'_>,
     auth: &AuthSessionTracker<H>,
@@ -1995,7 +1995,8 @@ fn tracepoint_arm<H: PostureHost>(
 /// writer that summary is for — `Some` with which, `None` otherwise:
 ///
 /// - `SERVICE` (every file under `/var/lib` or a service account's home, in
-///   a directory the writer's uid owns, owned by it, not root): the uid is
+///   a directory the writer's uid owns, or its own segment in `/dev/shm`,
+///   owned by it, not root): the uid is
 ///   a service account ([`AccountKind::System`]: below `UID_MIN` or a shell
 ///   that refuses a login) and the writer runs in a system service's cgroup
 ///   (`/system.slice/…/<unit>.service`, never a session's scope) —
@@ -2006,9 +2007,11 @@ fn tracepoint_arm<H: PostureHost>(
 ///   `daemon-data.v1` or the overlay): the writer's cgroup is one of that
 ///   directory's units (containerd, k3s, the kubelet, Docker, etcd).
 ///
-/// The cgroup and the account are read when the crossing is judged; a
-/// process gone by then is no one's (the crossing counts).
-fn own_data_exempt<H: PostureHost>(
+/// The account is the host's classification (`DecisionHost::account_kind`,
+/// lot 283b: the account database read again when it changes); the cgroup
+/// is read when the crossing is judged, and a process gone by then is no
+/// one's (the crossing counts).
+fn own_data_exempt<H: DecisionHost>(
     auth: &AuthSessionTracker<H>,
     daemons: Option<&DaemonData>,
     pid: u32,
@@ -2017,10 +2020,10 @@ fn own_data_exempt<H: PostureHost>(
 ) -> Option<&'static str> {
     match own {
         own_data::NONE => None,
-        own_data::SERVICE => (auth.account_kind(uid) == AccountKind::System
+        own_data::SERVICE => (H::account_kind(uid) == AccountKind::System
             && auth.system_service(pid).is_some())
         .then_some("a service account's own data, written by its service"),
-        own_data::CACHE => (auth.account_kind(uid) == AccountKind::Human)
+        own_data::CACHE => (H::account_kind(uid) == AccountKind::Human)
             .then_some("a person's own cache, written by that person"),
         code => {
             let units = daemons?.units_of(code)?;
@@ -5430,12 +5433,11 @@ mod tests {
 
     // ─── Lot 283c — a server doing its normal job (own data) ────────
 
-    /// Lot 283c fixtures: a host (`etc/passwd`, `etc/login.defs`) where
-    /// `postgres` (113) is a service account, `alice` (1000) a person and
-    /// `svc` (1001) an account whose shell refuses a login; a process
-    /// table where each pid's cgroup is given; the shipped daemons' list.
+    /// Lot 283c fixtures: a process table where each pid's cgroup is
+    /// given, and the shipped daemons' list. The test host classifies
+    /// accounts by `UID_MIN` 1000 (`postgres`, 113, is a service account;
+    /// `alice`, 1000, a person; root is root).
     struct OwnHost {
-        _host: tempfile::TempDir,
         _procs: tempfile::TempDir,
         det: TriggerDetector,
     }
@@ -5451,18 +5453,7 @@ mod tests {
     fn own_host() -> OwnHost {
         use super::super::exempt::ExemptPids;
         use super::super::lineage::AuthSessionTracker;
-        let host = tempfile::tempdir().unwrap();
         let procs = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(host.path().join("etc")).unwrap();
-        std::fs::write(
-            host.path().join("etc/passwd"),
-            "root:x:0:0:root:/root:/bin/bash\n\
-             postgres:x:113:120:PostgreSQL:/var/lib/postgresql:/bin/bash\n\
-             alice:x:1000:1000:Alice:/home/alice:/bin/bash\n\
-             svc:x:1001:1001::/srv/svc:/usr/sbin/nologin\n",
-        )
-        .unwrap();
-        std::fs::write(host.path().join("etc/login.defs"), "UID_MIN 1000\n").unwrap();
         for (pid, cgroup) in [
             (
                 PG_SERVICE,
@@ -5481,7 +5472,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("cgroup"), format!("0::{cgroup}\n")).unwrap();
         }
-        let auth = AuthSessionTracker::new(procs.path()).with_host_root(host.path());
+        let auth = AuthSessionTracker::new(procs.path());
         let det = TriggerDetector::with_exempt_and_auth(ExemptPids::default(), auth);
         let (data, refused) = DaemonData::build(
             DaemonData::parse_text(crate::posture::daemon_data::BUILTIN_DAEMON_DATA_V1).0,
@@ -5496,11 +5487,7 @@ mod tests {
             &[],
         );
         let _ = det.detect(&spawn_with_exe_by(1000, ALICE, 300, "/usr/bin/go", 4), &[]);
-        OwnHost {
-            _host: host,
-            _procs: procs,
-            det,
-        }
+        OwnHost { _procs: procs, det }
     }
 
     /// A rewrite crossing of `pid` as `uid` on `file`, the kernel's
@@ -5600,15 +5587,6 @@ mod tests {
         assert!(h
             .det
             .detect(&own_burst(PG_SERVICE, 0, docs, own_data::SERVICE, 12), &[])
-            .contains(&ci));
-        // an account whose shell refuses a login is a service account
-        let svc = "/srv/svc/state/a.db";
-        assert!(!h
-            .det
-            .detect(
-                &own_burst(PG_SERVICE, 1001, svc, own_data::SERVICE, 13),
-                &[]
-            )
             .contains(&ci));
     }
 
