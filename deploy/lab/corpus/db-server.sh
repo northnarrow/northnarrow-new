@@ -73,6 +73,9 @@ if [[ -n $up ]]; then
 else
     echo "  (no upgradable package outside the excluded set)"
 fi
+# a dpkg trigger's update-initramfs, whatever was upgradable (lot 283b):
+# its hooks run from forks of mkinitramfs
+step "db apt-get install --reinstall initramfs-tools (update-initramfs trigger)" 900 -- sudo apt-get install -y -qq --reinstall initramfs-tools
 if command -v unattended-upgrade >/dev/null; then
     step "db unattended-upgrade --dry-run" 600 -- sudo unattended-upgrade --dry-run
 fi

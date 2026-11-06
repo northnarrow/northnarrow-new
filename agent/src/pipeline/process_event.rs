@@ -966,8 +966,10 @@ mod tests {
         let expected = northnarrow_agent::boot::deny_selftest::ExpectedDenial::default();
         let stopping = HostStopping::default();
         let systemd = SystemdSnapshot::default();
-        // a uid of this test's own: the budget is the process's
-        let uid = 77_001;
+        // a uid of this test's own: the budget is the process's; a system
+        // account's (below UID_MIN): lot 283b records a person's exec from
+        // /tmp below COMBAT, a system account's stays R001's kill
+        let uid = 977;
         for i in 0..150u32 {
             process_event(
                 &engine,

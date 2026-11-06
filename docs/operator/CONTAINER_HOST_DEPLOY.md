@@ -22,7 +22,15 @@ path **outside** the standard binary dirs (`/usr/bin`, `/bin`,
 Most container runtimes install `runc` under a standard path, so they
 **do not** trip R013 and need no exemption. You only need the overlay
 when your runtime invokes `runc` (or a copy of it) from a non-standard
-location — some bundle layouts and older runtimes do.
+location — some bundle layouts and older runtimes do, and k3s does
+(`/var/lib/rancher/k3s/data/<hash>/bin/runc`).
+
+Since lot 283b (`RULE_POLICY.md` §1, the decision of 06/11/2026) such
+a `runc` is a High record, not killed: k3s starts its pods on a default
+install (before, every container start killed its `runc` and no pod ran).
+The overlay below silences the record; `enforce R013` in the signed per-rule
+policy gives the kill back. A copied `nsenter` or `unshare` is killed either
+way.
 
 ## The security tradeoff (read before enabling)
 

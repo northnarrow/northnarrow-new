@@ -71,6 +71,16 @@ pub struct ExecFacts {
     /// not.
     pub program: Result<(), String>,
     pub environment: Environment,
+    /// Lot 283b: the nearest package manager proper in the exec's lineage
+    /// ([`crate::posture::lineage::PACKAGE_MANAGER_EXES`], what the kernel
+    /// executed), run by root, as the pump read `/proc` at the exec — the
+    /// criterion of [`crate::posture::lineage::AuthSessionTracker::in_package_transaction`],
+    /// read while the lineage is alive: a dpkg trigger's `update-initramfs`
+    /// runs its hooks from forks of `mkinitramfs` that never execute, gone
+    /// by the time the decision walks the lineage (lot 283a's corpus: the
+    /// hook `/usr/share/initramfs-tools/hooks/kmod`, comm `kmod`, killed in
+    /// an `apt upgrade`). `None`: none found.
+    pub package_manager: Option<String>,
 }
 
 impl ExecFacts {
@@ -166,6 +176,7 @@ mod tests {
         ExecFacts {
             program: Ok(()),
             environment: Environment::Clean,
+            package_manager: None,
         }
     }
 

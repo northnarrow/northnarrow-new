@@ -232,7 +232,23 @@ corpus_report() {
     python3 -I "$CORPUS_DIR/corpus-report.py" --corpus "$CORPUS" --steps "$STEPS" \
         --actions "$OUT/actions.jsonl" --detections "$OUT/detections.jsonl" \
         --audit "$OUT/audit.jsonl" --journal "$OUT/journal.txt" "${sf[@]}"
+    corpus_refusals
     echo "== done corpus $CORPUS $(date -u +%FT%TZ) posture=$(posture)"
+}
+
+# Lot 283b: the anti-tamper refusals of the run (NN-L-AT-001), each inode
+# resolved to its path now — whose file the kernel refused to touch.
+corpus_refusals() {
+    sudo journalctl --namespace=northnarrow -q -o cat -u northnarrow-agent --since "@$T0" 2>/dev/null |
+        grep -oE '`[^`]+` attempted [a-z_]+ on protected inode [0-9]+:[0-9]+' | sort | uniq -c > "$OUT/refusals.txt"
+    [[ -s $OUT/refusals.txt ]] || return 0
+    echo "  anti-tamper refusals (journal; each inode resolved to its path now):"
+    local n who op ino path
+    while read -r n who _ op _ _ _ ino; do
+        path=$(sudo find / /run -xdev -inum "${ino#*:}" 2>/dev/null | head -1)
+        echo "    ${n}x $who $op ${path:-inode $ino (no path now)}"
+        printf 'TSV\trefusal\t%s\t%s\t%s\t%s\t%s\n' "$CORPUS" "$who" "$op" "${path:-$ino}" "$n"
+    done < "$OUT/refusals.txt"
 }
 
 # The common end of a workload script: cleanup measured, then the report.

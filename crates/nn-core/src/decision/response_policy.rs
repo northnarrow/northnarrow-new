@@ -220,6 +220,38 @@ pub const NODNS_KILL: PolicySwitch = PolicySwitch::off(
      (NN-L-NET-028, lot 275)",
 );
 
+/// Lot 283b (the coordinator's decision of 06/11/2026, after lot 283a's
+/// benign corpus, `docs/validation/BENIGN_CORPUS.md`): R013's kill of a
+/// `runc` executed from outside the system directories. A container
+/// runtime's bundled runc (k3s' `/var/lib/rancher/k3s/data/<hash>/bin/runc`)
+/// was killed at every container start: 645 kills, no pod of k3s ever
+/// started. Recorded at High; the kill of a copied `nsenter` or `unshare`
+/// is the rule's as before.
+pub const R013_RUNC_KILL: PolicySwitch = PolicySwitch::off(
+    "the kill of a runc outside the system directories — a container runtime's bundled \
+     runc (R013, lot 283b)",
+);
+
+/// Lot 283b (the same decision): NN-L-FIM-007's kill of the writer of a
+/// cron entry, outside a package transaction and an administrator's
+/// session. It came after the write — the entry stays, the writer had
+/// usually exited (the corpus: `crontab -u postgres`, `install` into
+/// `/etc/cron.d`, `crontab -r`, every kill AlreadyGone) — so it prevented
+/// nothing, and it would hit a long-lived writer (a configuration-management
+/// run). Recorded at High. Preventing the entry is the kernel's deny and
+/// the persistence that repairs itself, Wave 3's.
+pub const FIM_007_KILL: PolicySwitch = PolicySwitch::off(
+    "the kill of a cron entry's writer, after the write (NN-L-FIM-007, lot 283b)",
+);
+
+/// Lot 283b (the same decision): NN-L-FIM-009's kill of the writer of a
+/// systemd unit or drop-in, as [`FIM_007_KILL`] — the corpus saw it on
+/// the k3s installer's `touch`, `tee` and `chmod` of `k3s.service`, after
+/// the unit was written. Recorded at High.
+pub const FIM_009_KILL: PolicySwitch = PolicySwitch::off(
+    "the kill of a systemd unit's writer, after the write (NN-L-FIM-009, lot 283b)",
+);
+
 // NN-L-NET-003 has no switch: from lot 275 (R6 of the external review of
 // 04/11) a fingerprint match is Medium and `Log`, with no response to hold,
 // and the per-rule policy refuses `enforce` for it
@@ -236,6 +268,9 @@ pub const ALL: &[PolicySwitch] = &[
     EVA_KILL,
     FIM_010_MOVED_IN_KILL,
     NODNS_KILL,
+    R013_RUNC_KILL,
+    FIM_007_KILL,
+    FIM_009_KILL,
 ];
 
 #[cfg(test)]
@@ -268,6 +303,29 @@ mod tests {
         }
         // The posture half of NN-L-IMP-001's hold.
         const { assert!(!nn_model::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION) };
+    }
+
+    /// Every switch is in [`ALL`] — what the policy's status prints and the
+    /// tests walk (lot 283b's three among them).
+    #[test]
+    fn every_switch_is_listed() {
+        for s in [
+            R020_KILL,
+            NET_026_KILL,
+            NET_027_KILL,
+            PORT_53_KILL,
+            REVOKED_TRANSFER_TOOL_KILL,
+            IMP_001_KILL,
+            EVA_KILL,
+            FIM_010_MOVED_IN_KILL,
+            NODNS_KILL,
+            R013_RUNC_KILL,
+            FIM_007_KILL,
+            FIM_009_KILL,
+        ] {
+            assert!(ALL.contains(&s), "{}", s.held);
+        }
+        assert_eq!(ALL.len(), 12);
     }
 
     /// Off: the action is `Log`, severity and the rest kept, the reasoning
