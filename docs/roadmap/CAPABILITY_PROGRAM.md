@@ -6969,12 +6969,20 @@ number in parentheses is a lab PR.
     still 0, its outcome not read); the dev corpus control (a program from
     `/tmp` as `www-data`) killed by R001 (rc 137). The guest left without
     the agent, powered off. After the round, an exited script's
-    interpreter is read from its `#!` line (host tests only: the lot's
-    budget was one round). Host: named tests for each case; 48 + 13
-    targeted mutations, each caught by a named test.
-  - Open: the `prereqs` exec's record is not measured on a guest; a
-    build's fork that exits before the pump reads the exec breaks the
-    lineage (judged as before); tracepoint mode sees no build; Debian 12's
-    and Ubuntu 22.04's `manual_add_modules` (`modprobe --show-depends -S`)
-    are covered by host tests, not measured.
+    interpreter is read from its `#!` line. Round 2 (the coordinator's,
+    the lot's agent at 72dac0f0, the same guest): `sudo update-initramfs
+    -u` rc 0, the initrd rewritten (`bin/kmod`, 293 modules); both execs of
+    the hook — `prereqs` included — recorded by R011 (Log, High), 0 kill
+    verdicts, the actions chain 0 intents in the window; the `www-data`
+    control killed by R001 (rc 137; its intent's outcome in the chain:
+    success, killed). The guest left without the agent, powered off. Host:
+    named tests for each case; 48 + 13 targeted mutations, each caught by a
+    named test.
+  - Decided (the coordinator, 06/11/2026; `RULE_POLICY.md`): the narrow
+    record (the hook and modprobe's dry runs, not every exec under a
+    builder), and no "not modified since boot" check on the builder.
+  - Open: a build's fork that exits before the pump reads the exec breaks
+    the lineage (judged as before); tracepoint mode sees no build; Debian
+    12's and Ubuntu 22.04's `manual_add_modules` (`modprobe --show-depends
+    -S`) are covered by host tests, not measured.
   - Level unchanged (C14 2).
