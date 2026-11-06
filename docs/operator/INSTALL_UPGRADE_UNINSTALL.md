@@ -125,6 +125,11 @@ applied. `security-tools.v1` (lab PR 225, the security tools whose
 switch-off NN-L-EVA-001..004 record) is installed the same way but has no
 signed overlay yet: it is pinned to the agent's built-in copy, and an
 edited file is never applied — not even under `NN_OVERLAY_ALLOW_UNSIGNED=1`.
+`daemon-data.v1` (lot 283c: the data directories of root daemons —
+containerd, Docker, the kubelet, etcd, k3s — whose own writes there do not
+raise the posture's mass-write arm) is installed the same way; its
+directories are added in the signed mass-write overlay (§3.6), not in an
+overlay of its own.
 
 ## 2. Upgrade in place
 
@@ -159,8 +164,9 @@ start — left the host without a working agent. What it does now, in order:
    the three units (the agent's, the watchdog's
    and its `OnFailure=` handler, lab PR 216), the Debian drop-in and the
    copy-on-first-write one (lab PR 222),
-   `journald@northnarrow.conf`, `install-manifest.json`, the six `.v1`
-   lists (`security-tools.v1` since lab PR 225), the overlay template, the ten control-surface files, the five
+   `journald@northnarrow.conf`, `install-manifest.json`, the seven `.v1`
+   lists (`security-tools.v1` since lab PR 225, `daemon-data.v1` since lot
+   283c), the overlay template, the ten control-surface files, the five
    canary templates, the overlay signatures the run may add and, when
    missing, `admin.pub`, the bootstrap key and the COMBAT files. The eBPF
    object travels inside the agent binary; its pins are re-created by
@@ -770,6 +776,18 @@ Kinds: `fim-paths`, `process-comm-allowlist`, `netflow-comm-allowlist`,
 `netflow-blocklist`, `netflow-ja3-blocklist`, `mass-write-carveout`,
 `escalation-allow`. Content is checked with the loader's own rules before
 it is signed or stored (a malformed line is refused, not silently dropped).
+Lot 283c: a line `+<unit>.service <directory>/` in `mass-write-carveout`
+is no carve-out — it adds a daemon's data directory to the shipped
+`daemon-data.v1`: the unit's own writes there do not raise the mass-write
+arm (a crossing of its process's window counts whole when one file lay
+elsewhere, and every write still reaches the ransomware tracker,
+NN-L-IMP-001). The directory obeys the carve-outs' limits (not `/`, a
+top-level directory, a user's tree, `/var/tmp`, `/dev/shm`, `/run/user`)
+and may not lie inside another listed directory or hold one. A service
+account's own data (PostgreSQL, MySQL, Redis: files it owns, in a directory
+it owns, under `/var/lib` or its home, and its own segments in `/dev/shm`)
+and a person's `~/.cache` need no line. What this lets through is in the [posture design, §10.5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/POSTURE_FSM_V2_REDESIGN.md).
+
 Every accepted new content is a `config_overlay_accepted` audit entry,
 every stored one a `config_overlay_set` entry. The two posture overlays and
 every `.sig` are now protected against unlink and rename like the other

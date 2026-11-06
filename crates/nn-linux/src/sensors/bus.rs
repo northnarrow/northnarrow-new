@@ -2299,6 +2299,7 @@ mod tests {
                 cgroup_window: false,
                 small_files: false,
                 cgroup_id: 0,
+                own_data: 0,
             };
             let tx2 = tx.clone();
             let waiter = tokio::spawn(async move { tx2.send(drift).await });
@@ -2971,6 +2972,7 @@ mod tests {
                 cgroup_window: false,
                 small_files: false,
                 cgroup_id: 0,
+                own_data: 0,
             };
             for i in 0..core_bus::FILE_OPEN_SHARE as u32 {
                 tx.send(mass(i)).await.unwrap();
@@ -3043,6 +3045,7 @@ mod tests {
                 cgroup_window: false,
                 small_files: false,
                 cgroup_id: 0,
+                own_data: 0,
             };
             tx.send(drift).await.unwrap();
             let snap = rx.stats().snapshot();

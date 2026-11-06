@@ -2165,6 +2165,7 @@ fn overwrites(pid: u32, uid: u32) -> Event {
         cgroup_window: false,
         small_files: false,
         cgroup_id: 0,
+        own_data: 0,
     }
 }
 

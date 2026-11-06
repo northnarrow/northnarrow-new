@@ -250,6 +250,9 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     // like the other overlays (its CA file is pinned by the signed text).
     "export.local",
     "export.local.sig",
+    // Lot 283c: the daemons' data directories (the mass-write arm's
+    // own-data exemption). Write-denied like the other shipped lists.
+    "daemon-data.v1",
 ];
 
 /// External audit EVD-001: the subset of [`ETC_WRITE_DENY_FILES`] no
@@ -298,6 +301,8 @@ pub const ETC_WRITE_DENY_FILES: &[&str] = &[
     "netflow-comm-allowlist.v1",
     // Lab PR 225: the list of security tools, on the same reasoning.
     "security-tools.v1",
+    // Lot 283c: the daemons' data directories, on the same reasoning.
+    "daemon-data.v1",
 ];
 
 /// Tappa 9 C7 + Tappa 9.5 K7: the files inside [`STATE_DIR`] that
@@ -2700,6 +2705,8 @@ mod tests {
                 // Lot 276 — APPENDED.
                 "export.local",
                 "export.local.sig",
+                // Lot 283c — APPENDED.
+                "daemon-data.v1",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"

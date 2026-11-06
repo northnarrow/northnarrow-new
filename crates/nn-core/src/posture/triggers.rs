@@ -29,16 +29,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use common::wire::exe::exe_flags;
-use common::wire::open_sensor::open_reason;
+use common::wire::open_sensor::{open_reason, own_data};
 use nn_model::posture_types::{EvidenceClass, TriggerType};
 use nn_model::Event;
 
 use super::corroboration::Scope;
+use super::daemon_data::DaemonData;
 use super::escalation_allow::{AllowTrigger, EscalationAllowList};
 use super::exempt::ExemptPids;
 use super::host::{PostureAgent, PostureHost};
 use super::lineage::{AsOf, AuthSessionTracker};
-use crate::decision::host::DecisionHost;
+use crate::decision::host::{AccountKind, DecisionHost};
 
 /// The recent events the triggers scan, borrowed (review 72). The
 /// correlation buffer is a ring of up to 1,000 events; cloning it for every
@@ -381,6 +382,11 @@ pub struct TriggerDetector<H: DecisionHost> {
     /// this detector's own ([`Self::set_kernel_mass_write`]; it was a
     /// process-wide switch).
     kernel_mass_write: Arc<AtomicBool>,
+    /// Lot 283c: the daemons' data directories (`daemon-data.v1` and the
+    /// overlay's), once the agent has wired them
+    /// ([`Self::set_daemon_data`]); the kernel's tags index them. Unset, a
+    /// crossing in a daemon's directory always counts.
+    daemon_data: Arc<std::sync::OnceLock<Arc<DaemonData>>>,
 }
 
 /// Lab PR 225: the shared judges of the ransomware and security-tool
@@ -504,35 +510,55 @@ enum PairKey {
 
 /// Lot 282: per process and per cgroup, the last time each half of the
 /// replacement shape was reported (pruned of keys older than a window past
-/// 1,024, as [`MassWriters`]).
+/// 1,024, as [`MassWriters`]) and (lot 283c) whether that half was the
+/// writer's own data ([`own_data_exempt`]).
 #[derive(Debug, Default, Clone)]
-struct Replacements(Arc<parking_lot::Mutex<HashMap<PairKey, [Option<u64>; 2]>>>);
+struct Replacements(Arc<parking_lot::Mutex<HashMap<PairKey, [Option<HalfSeen>; 2]>>>);
+
+/// Lot 283c: when a half of the replacement shape was reported, and
+/// whether it was the writer's own data.
+type HalfSeen = (u64, bool);
 
 impl Replacements {
-    /// Record `half` of `pid` — and of `cgroup`, when given — at `ts_ns`;
-    /// whether the other half of either lies within a mass-write window of
-    /// it, on either side (the rings are drained apart, and a writer may
-    /// delete before it writes).
-    fn record(&self, pid: u32, cgroup: Option<u64>, half: Half, ts_ns: u64) -> bool {
+    /// Record `half` of `pid` — and of `cgroup`, when given — at `ts_ns`,
+    /// `own` when its window held only the writer's own data; `Some` when
+    /// the other half of either lies within a mass-write window of it, on
+    /// either side (the rings are drained apart, and a writer may delete
+    /// before it writes), with whether this half and every such other half
+    /// were own data (lot 283c: a replacement is left out only whole).
+    fn record(
+        &self,
+        pid: u32,
+        cgroup: Option<u64>,
+        half: Half,
+        ts_ns: u64,
+        own: bool,
+    ) -> Option<bool> {
         let mut g = self.0.lock();
         if g.len() > 1024 {
             let cutoff = ts_ns.saturating_sub(MASS_WRITE_WINDOW_NS);
-            g.retain(|_, h| h.iter().flatten().any(|t| *t >= cutoff));
+            g.retain(|_, h| h.iter().flatten().any(|(t, _)| *t >= cutoff));
         }
         let (mine, other) = match half {
             Half::Created => (0, 1),
             Half::Destroyed => (1, 0),
         };
         let mut paired = false;
+        let mut all_own = own;
         for key in [Some(PairKey::Pid(pid)), cgroup.map(PairKey::Cgroup)]
             .into_iter()
             .flatten()
         {
             let h = g.entry(key).or_default();
-            h[mine] = Some(ts_ns);
-            paired |= h[other].is_some_and(|t| t.abs_diff(ts_ns) <= MASS_WRITE_WINDOW_NS);
+            h[mine] = Some((ts_ns, own));
+            if let Some((t, o)) = h[other] {
+                if t.abs_diff(ts_ns) <= MASS_WRITE_WINDOW_NS {
+                    paired = true;
+                    all_own &= o;
+                }
+            }
         }
-        paired
+        paired.then_some(all_own)
     }
 }
 
@@ -579,6 +605,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
             installer_window: InstallerWindow::default(),
             impact: ImpactHooks::default(),
             kernel_mass_write: Arc::default(),
+            daemon_data: Arc::default(),
         }
     }
 
@@ -597,6 +624,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
             installer_window: InstallerWindow::default(),
             impact: ImpactHooks::default(),
             kernel_mass_write: Arc::default(),
+            daemon_data: Arc::default(),
         }
     }
 
@@ -616,6 +644,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
             installer_window: InstallerWindow::default(),
             impact: ImpactHooks::default(),
             kernel_mass_write: Arc::default(),
+            daemon_data: Arc::default(),
         }
     }
 
@@ -642,6 +671,12 @@ impl<H: DecisionHost> TriggerDetector<H> {
     /// Lab PR 225: the security-tool detector (`DefenseImpairment`). Set once.
     pub fn set_defense_detector(&self, detector: Arc<crate::impair::DefenseDetector<H>>) {
         let _ = self.impact.defense.set(detector);
+    }
+
+    /// Lot 283c: the daemons' data directories, in the order the file-open
+    /// sensor tagged them. Set once.
+    pub fn set_daemon_data(&self, data: Arc<DaemonData>) {
+        let _ = self.daemon_data.set(data);
     }
 
     /// Switch the mass-write arm between the kernel count (LSM file-open
@@ -936,6 +971,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
             &self.mass_write_warned,
             &self.replacements,
             self.kernel_mass_write(),
+            self.daemon_data.get().map(Arc::as_ref),
         );
         if mass_write {
             if let (Some(pid), (_, ts)) = (event_owner_pid(event), event_owner_seen(event)) {
@@ -1572,8 +1608,10 @@ fn staging_exec<H: PostureAgent>(
 /// a session no open that may create one does (POS-002).
 ///
 /// The writers [`mass_write_exempt`] names are exempt from every shape.
+/// Lot 283c: so is a crossing whose window held only the writer's own data
+/// ([`own_data_exempt`]) — a replacement only when both its halves did.
 #[allow(clippy::too_many_arguments)]
-fn confirmed_intrusion<H: PostureHost>(
+fn confirmed_intrusion<H: DecisionHost>(
     focal: &Event,
     recent: Recent<'_>,
     auth: &AuthSessionTracker<H>,
@@ -1581,6 +1619,7 @@ fn confirmed_intrusion<H: PostureHost>(
     warned: &parking_lot::Mutex<HashMap<u32, u64>>,
     replacements: &Replacements,
     kernel_mass_write: bool,
+    daemons: Option<&DaemonData>,
 ) -> bool {
     // BUG-032: the FsProtectDenial arm moved OUT to the Decisive
     // `AntiTamperDenial` trigger (raised directly in `detect`) — a
@@ -1594,6 +1633,7 @@ fn confirmed_intrusion<H: PostureHost>(
     match focal {
         Event::MassWrite {
             pid,
+            uid,
             comm,
             filename,
             count,
@@ -1602,18 +1642,21 @@ fn confirmed_intrusion<H: PostureHost>(
             cgroup_window,
             small_files,
             cgroup_id,
-            ..
+            own_data,
         } => {
+            let mut own = own_data_exempt(auth, daemons, *pid, *uid, *own_data);
             let shape = if *overwrites && *small_files {
                 Shape::SmallRewrites
             } else if *overwrites {
                 Shape::Rewrites
-            } else if replacements.record(
+            } else if let Some(all_own) = replacements.record(
                 *pid,
                 pairing_cgroup(auth, *pid, *cgroup_id, *timestamp_ns, filename),
                 Half::Created,
                 *timestamp_ns,
+                own.is_some(),
             ) {
+                own = own.filter(|_| all_own);
                 Shape::Replacement
             } else {
                 tracing::debug!(
@@ -1633,24 +1676,28 @@ fn confirmed_intrusion<H: PostureHost>(
                 timestamp_ns: *timestamp_ns,
                 cgroup_window: *cgroup_window,
             };
-            kernel_arm(auth, warned, &crossing, shape)
+            kernel_arm(auth, warned, &crossing, shape, own)
         }
         Event::FileBurst {
             pid,
+            uid,
             comm,
             kind: nn_model::FileBurstKind::Unlink,
             count,
             filename,
             timestamp_ns,
             cgroup_id,
+            own_data,
             ..
         } => {
-            if !replacements.record(
+            let own = own_data_exempt(auth, daemons, *pid, *uid, *own_data);
+            let Some(all_own) = replacements.record(
                 *pid,
                 pairing_cgroup(auth, *pid, *cgroup_id, *timestamp_ns, filename),
                 Half::Destroyed,
                 *timestamp_ns,
-            ) {
+                own.is_some(),
+            ) else {
                 tracing::debug!(
                     pid = *pid,
                     comm = %nn_model::log_escape::Escaped(comm),
@@ -1659,7 +1706,7 @@ fn confirmed_intrusion<H: PostureHost>(
                      not counted"
                 );
                 return false;
-            }
+            };
             let crossing = Crossing {
                 pid: *pid,
                 comm,
@@ -1668,7 +1715,13 @@ fn confirmed_intrusion<H: PostureHost>(
                 timestamp_ns: *timestamp_ns,
                 cgroup_window: false,
             };
-            kernel_arm(auth, warned, &crossing, Shape::Replacement)
+            kernel_arm(
+                auth,
+                warned,
+                &crossing,
+                Shape::Replacement,
+                own.filter(|_| all_own),
+            )
         }
         // Tracepoint mode: every open reaches userland.
         Event::FileOpen { .. } if !kernel_mass_write => {
@@ -1718,12 +1771,14 @@ struct Crossing<'a> {
 }
 
 /// The arm on a kernel crossing that meets `shape`: the exempt writers,
-/// then (a replacement) the authenticated session.
+/// (lot 283c) a window of the writer's own data (`own`, from
+/// [`own_data_exempt`]), then (a replacement) the authenticated session.
 fn kernel_arm<H: PostureHost>(
     auth: &AuthSessionTracker<H>,
     warned: &parking_lot::Mutex<HashMap<u32, u64>>,
     c: &Crossing<'_>,
     shape: Shape,
+    own: Option<&'static str>,
 ) -> bool {
     use nn_model::log_escape::Escaped;
     if let Some(why) = mass_write_exempt(auth, c.pid, c.timestamp_ns, c.filename, false) {
@@ -1737,6 +1792,19 @@ fn kernel_arm<H: PostureHost>(
             shape = shape.as_str(),
             exempt = why,
             "mass-write arm: crossing of an exempt writer — not counted"
+        );
+        return false;
+    }
+    if let Some(why) = own {
+        tracing::info!(
+            pid = c.pid,
+            comm = %Escaped(c.comm),
+            filename = %Escaped(c.filename),
+            count = c.count,
+            shape = shape.as_str(),
+            own_data = why,
+            "mass-write arm: every file of the crossing's window was the writer's own data — \
+             not counted (the ransomware tracker still judges it)"
         );
         return false;
     }
@@ -1920,6 +1988,51 @@ fn tracepoint_arm<H: PostureHost>(
         );
     }
     true
+}
+
+/// Lot 283c: a crossing whose window held only the writer's own data, as
+/// the kernel judged each file (`own`, the event's `own_data`), and a
+/// writer that summary is for — `Some` with which, `None` otherwise:
+///
+/// - `SERVICE` (every file under `/var/lib` or a service account's home, in
+///   a directory the writer's uid owns, or its own segment in `/dev/shm`,
+///   owned by it, not root): the uid is
+///   a service account ([`AccountKind::System`]: below `UID_MIN` or a shell
+///   that refuses a login) and the writer runs in a system service's cgroup
+///   (`/system.slice/…/<unit>.service`, never a session's scope) —
+///   PostgreSQL, MySQL, Redis writing their own data;
+/// - `CACHE` (every file in its owner's `~/.cache`, written by that owner):
+///   the uid is a person's ([`AccountKind::Human`]);
+/// - a daemon directory's code (every file in one directory of
+///   `daemon-data.v1` or the overlay): the writer's cgroup is one of that
+///   directory's units (containerd, k3s, the kubelet, Docker, etcd).
+///
+/// The account is the host's classification (`DecisionHost::account_kind`,
+/// lot 283b: the account database read again when it changes); the cgroup
+/// is read when the crossing is judged, and a process gone by then is no
+/// one's (the crossing counts).
+fn own_data_exempt<H: DecisionHost>(
+    auth: &AuthSessionTracker<H>,
+    daemons: Option<&DaemonData>,
+    pid: u32,
+    uid: u32,
+    own: u8,
+) -> Option<&'static str> {
+    match own {
+        own_data::NONE => None,
+        own_data::SERVICE => (H::account_kind(uid) == AccountKind::System
+            && auth.system_service(pid).is_some())
+        .then_some("a service account's own data, written by its service"),
+        own_data::CACHE => (H::account_kind(uid) == AccountKind::Human)
+            .then_some("a person's own cache, written by that person"),
+        code => {
+            let units = daemons?.units_of(code)?;
+            let unit = auth.system_service(pid)?;
+            units
+                .contains(&unit)
+                .then_some("a listed daemon's own data directory, written by its unit")
+        }
+    }
 }
 
 /// The mass-write arm's writers (review 49 (ii), FP-2): a package
@@ -3584,6 +3697,7 @@ mod tests {
             cgroup_window: false,
             small_files: false,
             cgroup_id: 0,
+            own_data: 0,
         }
     }
 
@@ -3623,6 +3737,7 @@ mod tests {
             filename: "/home/u/docs/report.docx".into(),
             timestamp_ns: ts,
             cgroup_id,
+            own_data: 0,
         }
     }
 
@@ -3740,6 +3855,7 @@ mod tests {
             filename: "/home/u/a.pdf.locked".into(),
             timestamp_ns: 12,
             cgroup_id: 0,
+            own_data: 0,
         };
         assert!(!det.detect(&renames, &[]).contains(&ci));
         assert!(!det.detect(&mass_write(650, false, 13), &[]).contains(&ci));
@@ -3911,18 +4027,23 @@ mod tests {
         let r = Replacements::default();
         let w = MASS_WRITE_WINDOW_NS;
         // pid 1: an old creation, then a recent destruction (no pair yet)
-        assert!(!r.record(1, None, Half::Created, 0));
-        assert!(!r.record(1, None, Half::Destroyed, 3 * w));
+        assert!(r.record(1, None, Half::Created, 0, false).is_none());
+        assert!(r.record(1, None, Half::Destroyed, 3 * w, false).is_none());
         // 1,100 other pids, a little later: the map is pruned on each record
         for pid in 1000..2100u32 {
-            assert!(!r.record(pid, None, Half::Created, 3 * w + 2));
+            assert!(r
+                .record(pid, None, Half::Created, 3 * w + 2, false)
+                .is_none());
         }
         // pid 1's recent destruction is still there to pair with
-        assert!(r.record(1, None, Half::Created, 3 * w + 1));
+        assert_eq!(
+            r.record(1, None, Half::Created, 3 * w + 1, false),
+            Some(false)
+        );
         // a pid with nothing recent is gone once the map is pruned
-        assert!(!r.record(7, Some(77), Half::Created, 0));
+        assert!(r.record(7, Some(77), Half::Created, 0, false).is_none());
         for pid in 2100..2200u32 {
-            r.record(pid, None, Half::Created, 10 * w);
+            r.record(pid, None, Half::Created, 10 * w, false);
         }
         assert!(!r.0.lock().contains_key(&PairKey::Pid(7)));
         assert!(!r.0.lock().contains_key(&PairKey::Cgroup(77)));
@@ -5307,6 +5428,293 @@ mod tests {
         }
         assert!(!det
             .detect(&e, &[])
+            .contains(&TriggerType::ConfirmedIntrusion));
+    }
+
+    // ─── Lot 283c — a server doing its normal job (own data) ────────
+
+    /// Lot 283c fixtures: a process table where each pid's cgroup is
+    /// given, and the shipped daemons' list. The test host classifies
+    /// accounts by `UID_MIN` 1000 (`postgres`, 113, is a service account;
+    /// `alice`, 1000, a person; root is root).
+    struct OwnHost {
+        _procs: tempfile::TempDir,
+        det: TriggerDetector,
+    }
+
+    /// The pids of [`own_host`] and their cgroups.
+    const PG_SERVICE: u32 = 501;
+    const PG_SESSION: u32 = 502;
+    const CONTAINERD: u32 = 601;
+    const OTHER_UNIT: u32 = 602;
+    const CONTAINERD_SUBGROUP: u32 = 603;
+    const ALICE: u32 = 701;
+
+    fn own_host() -> OwnHost {
+        use super::super::exempt::ExemptPids;
+        use super::super::lineage::AuthSessionTracker;
+        let procs = tempfile::tempdir().unwrap();
+        for (pid, cgroup) in [
+            (
+                PG_SERVICE,
+                "/system.slice/system-postgresql.slice/postgresql@16-main.service",
+            ),
+            (PG_SESSION, "/user.slice/user-1000.slice/session-3.scope"),
+            (CONTAINERD, "/system.slice/containerd.service"),
+            (OTHER_UNIT, "/system.slice/other.service"),
+            (
+                CONTAINERD_SUBGROUP,
+                "/system.slice/containerd.service/payload",
+            ),
+            (ALICE, "/user.slice/user-1000.slice/session-3.scope"),
+        ] {
+            let dir = procs.path().join(pid.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("cgroup"), format!("0::{cgroup}\n")).unwrap();
+        }
+        let auth = AuthSessionTracker::new(procs.path());
+        let det = TriggerDetector::with_exempt_and_auth(ExemptPids::default(), auth);
+        let (data, refused) = DaemonData::build(
+            DaemonData::parse_text(crate::posture::daemon_data::BUILTIN_DAEMON_DATA_V1).0,
+        );
+        assert!(refused.is_empty());
+        det.set_daemon_data(Arc::new(data));
+        // the session: sshd → bash → the client run as postgres
+        let _ = det.detect(&spawn_with_exe(200, 1, "/usr/sbin/sshd", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(300, 200, "/usr/bin/bash", 2), &[]);
+        let _ = det.detect(
+            &spawn_with_exe_by(113, PG_SESSION, 300, "/usr/lib/postgresql/16/bin/initdb", 3),
+            &[],
+        );
+        let _ = det.detect(&spawn_with_exe_by(1000, ALICE, 300, "/usr/bin/go", 4), &[]);
+        OwnHost { _procs: procs, det }
+    }
+
+    /// A rewrite crossing of `pid` as `uid` on `file`, the kernel's
+    /// own-data summary `own`.
+    fn own_burst(pid: u32, uid: u32, file: &str, own: u8, ts: u64) -> Event {
+        let mut e = mass_write(pid, true, ts);
+        if let Event::MassWrite {
+            uid: u,
+            filename,
+            own_data,
+            ..
+        } = &mut e
+        {
+            (*u, *filename, *own_data) = (uid, file.to_string(), own);
+        }
+        e
+    }
+
+    /// The code of the shipped list's directory `dir`.
+    fn unit_code(det: &TriggerDetector, dir: &str) -> u8 {
+        let data = det.daemon_data.get().unwrap();
+        let tag = data.dirs().iter().position(|d| d.dir == dir).unwrap();
+        own_data::UNIT_BASE + tag as u8
+    }
+
+    /// Lot 283c, decision 1 (the postgres-like burst): PostgreSQL's
+    /// backends rewriting their own relation files — every file of the
+    /// window the service account's own, in a directory it owns under
+    /// `/var/lib` (the kernel's `SERVICE` summary) — from the service's
+    /// cgroup cross no threshold of the arm.
+    #[test]
+    fn a_service_account_rewriting_its_own_data_raises_nothing() {
+        let h = own_host();
+        let pg = "/var/lib/postgresql/16/main/base/16384/2833";
+        for (i, pid) in [PG_SERVICE].into_iter().enumerate() {
+            let hits = h.det.detect(
+                &own_burst(pid, 113, pg, own_data::SERVICE, 10 + i as u64),
+                &[],
+            );
+            assert!(!hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+        }
+        // its replacement too (a checkpoint's new files, the old ones
+        // unlinked), both halves its own data
+        let mut created = mass_write(PG_SERVICE, false, 20);
+        let mut gone = destroyed(PG_SERVICE, 21);
+        for e in [&mut created, &mut gone] {
+            match e {
+                Event::MassWrite { uid, own_data, .. } | Event::FileBurst { uid, own_data, .. } => {
+                    (*uid, *own_data) = (113, own_data::SERVICE)
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert!(!h
+            .det
+            .detect(&created, &[])
+            .contains(&TriggerType::ConfirmedIntrusion));
+        assert!(!h
+            .det
+            .detect(&gone, &[])
+            .contains(&TriggerType::ConfirmedIntrusion));
+    }
+
+    /// Lot 283c, decision 1: the same burst from a login session — `initdb`
+    /// run from `sudo -u postgres` in an SSH shell — counts: the writer is
+    /// no system service.
+    #[test]
+    fn the_same_service_burst_from_a_session_counts() {
+        let h = own_host();
+        let pg = "/var/lib/postgresql/16/main/base/1/2678";
+        let hits = h
+            .det
+            .detect(&own_burst(PG_SESSION, 113, pg, own_data::SERVICE, 10), &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+    }
+
+    /// Lot 283c, decision 1: the same burst with one file of its window
+    /// outside the account's own data (the kernel's summary `NONE`) counts;
+    /// a service account's summary for a person (the kernel never gives it,
+    /// the posture does not trust it) and for root count too.
+    #[test]
+    fn the_same_service_burst_outside_its_own_data_counts() {
+        let h = own_host();
+        let ci = TriggerType::ConfirmedIntrusion;
+        let docs = "/home/alice/Documents/report.docx";
+        assert!(h
+            .det
+            .detect(&own_burst(PG_SERVICE, 113, docs, own_data::NONE, 10), &[])
+            .contains(&ci));
+        assert!(h
+            .det
+            .detect(
+                &own_burst(PG_SERVICE, 1000, docs, own_data::SERVICE, 11),
+                &[]
+            )
+            .contains(&ci));
+        assert!(h
+            .det
+            .detect(&own_burst(PG_SERVICE, 0, docs, own_data::SERVICE, 12), &[])
+            .contains(&ci));
+    }
+
+    /// Lot 283c, decision 2: containerd replacing its own state under
+    /// `/var/lib/containerd` from its unit crosses nothing; the same burst
+    /// from another unit, or from a cgroup containerd made below its own,
+    /// counts; its unit's burst in another daemon's directory counts.
+    #[test]
+    fn a_daemon_in_its_listed_directory_counts_only_from_another_unit() {
+        let h = own_host();
+        let ci = TriggerType::ConfirmedIntrusion;
+        let code = unit_code(&h.det, "/var/lib/containerd/");
+        let docker = unit_code(&h.det, "/var/lib/docker/");
+        let f = "/var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db";
+        assert!(!h
+            .det
+            .detect(&own_burst(CONTAINERD, 0, f, code, 10), &[])
+            .contains(&ci));
+        assert!(h
+            .det
+            .detect(&own_burst(OTHER_UNIT, 0, f, code, 11), &[])
+            .contains(&ci));
+        assert!(h
+            .det
+            .detect(&own_burst(CONTAINERD_SUBGROUP, 0, f, code, 12), &[])
+            .contains(&ci));
+        let d = "/var/lib/docker/overlay2/x/diff/a";
+        assert!(h
+            .det
+            .detect(&own_burst(CONTAINERD, 0, d, docker, 13), &[])
+            .contains(&ci));
+        // a code no listed directory has
+        assert!(h
+            .det
+            .detect(
+                &own_burst(CONTAINERD, 0, f, own_data::UNIT_BASE + 200, 14),
+                &[]
+            )
+            .contains(&ci));
+    }
+
+    /// Lot 283c, decision 2: a replacement (new files, originals destroyed
+    /// — the shape containerd and k3s measured) is left out only when both
+    /// its halves were the unit's own data, whichever came first.
+    #[test]
+    fn a_daemon_replacement_is_left_out_only_whole() {
+        let h = own_host();
+        let ci = TriggerType::ConfirmedIntrusion;
+        let code = unit_code(&h.det, "/var/lib/containerd/");
+        let own = |mut e: Event, o: u8| {
+            match &mut e {
+                Event::MassWrite { uid, own_data, .. } | Event::FileBurst { uid, own_data, .. } => {
+                    (*uid, *own_data) = (0, o)
+                }
+                _ => unreachable!(),
+            }
+            e
+        };
+        let det = &h.det;
+        let s = 1_000_000_000u64;
+        let raised = |e: Event| det.detect(&e, &[]).contains(&ci);
+        // both halves its own data, either order
+        assert!(!raised(own(mass_write(CONTAINERD, false, 10 * s), code)));
+        assert!(!raised(own(destroyed(CONTAINERD, 11 * s), code)));
+        assert!(!raised(own(destroyed(CONTAINERD, 300 * s), code)));
+        assert!(!raised(own(mass_write(CONTAINERD, false, 301 * s), code)));
+        // the originals destroyed elsewhere, after its own new files
+        assert!(!raised(own(mass_write(CONTAINERD, false, 600 * s), code)));
+        assert!(raised(own(destroyed(CONTAINERD, 601 * s), own_data::NONE)));
+        // its own originals destroyed, the new files written elsewhere first
+        assert!(!raised(own(
+            mass_write(CONTAINERD, false, 900 * s),
+            own_data::NONE
+        )));
+        assert!(raised(own(destroyed(CONTAINERD, 901 * s), code)));
+        // and the other way round
+        assert!(!raised(own(
+            destroyed(CONTAINERD, 1200 * s),
+            own_data::NONE
+        )));
+        assert!(raised(own(mass_write(CONTAINERD, false, 1201 * s), code)));
+    }
+
+    /// Lot 283c, decision 3: a person's process rewriting its own
+    /// `~/.cache` (the kernel's `CACHE` summary: the cache's owner writing,
+    /// owning the files) crosses nothing; the summary for a service account
+    /// — no person's cache — counts.
+    #[test]
+    fn a_persons_own_cache_does_not_count_another_accounts_does() {
+        let h = own_host();
+        let ci = TriggerType::ConfirmedIntrusion;
+        let f = "/home/alice/.cache/go-build/3f/3f0a-d";
+        assert!(!h
+            .det
+            .detect(&own_burst(ALICE, 1000, f, own_data::CACHE, 10), &[])
+            .contains(&ci));
+        assert!(h
+            .det
+            .detect(&own_burst(ALICE, 113, f, own_data::CACHE, 11), &[])
+            .contains(&ci));
+        assert!(h
+            .det
+            .detect(&own_burst(ALICE, 0, f, own_data::CACHE, 12), &[])
+            .contains(&ci));
+    }
+
+    /// Lot 283c, decision 4: a person's tree rewritten or replaced in a
+    /// session (`rsync --inplace`, `npm ci`, `git checkout` outside the
+    /// cache) is no one's own data to the kernel and raises the arm as
+    /// before.
+    #[test]
+    fn tree_rewrites_in_a_session_stay_engaged() {
+        let h = own_host();
+        let f = "/srv/nn-corpus/dev/rs/dst/r0019.cfg";
+        let hits = h
+            .det
+            .detect(&own_burst(ALICE, 1000, f, own_data::NONE, 10), &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+    }
+
+    /// Lot 283c: an unwired list (a test, a build that does not wire it)
+    /// leaves out no daemon's crossing.
+    #[test]
+    fn without_the_daemons_list_a_daemon_burst_counts() {
+        let det = detector_with_empty_proc();
+        let f = "/var/lib/containerd/meta.db";
+        assert!(det
+            .detect(&own_burst(1, 0, f, own_data::UNIT_BASE, 10), &[])
             .contains(&TriggerType::ConfirmedIntrusion));
     }
 }

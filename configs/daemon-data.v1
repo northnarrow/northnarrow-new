@@ -1,0 +1,50 @@
+# NorthNarrow — the data directories of root daemons (default, v1)
+#
+# Lot 283c. A server doing its normal job does not sit in ENGAGED: the
+# mass-write arm of the posture's ConfirmedIntrusion leaves out a crossing
+# of the kernel's write counters when every file its window counted lies in
+# one directory listed here AND the writer's cgroup is one of that
+# directory's units (/system.slice/<unit>). A root process outside the unit,
+# and the unit writing anywhere else, still count. The counters count every
+# write, and the ransomware tracker (NN-L-IMP-001: entropy, renames, copies
+# and deletions) judges every crossing, these included.
+#
+# Service accounts (postgres, mysql, redis, ...) need no entry: their own
+# files under /var/lib or their home, in a directory they own, are told by
+# ownership. A person's ~/.cache by its owner.
+#
+# The shipped list is content of the release: the agent applies the copy it
+# was built with whenever /etc/northnarrow/daemon-data.v1 is not that copy
+# (an edit is an ERROR and a signed `default_list_modified` at every boot);
+# install.sh installs it. The operator adds directories in the signed
+# overlay /etc/northnarrow/mass-write-carveout.local, one line each:
+#
+#   +<unit>.service <directory>/
+#
+# Format, one entry per line; `#` starts a comment:
+#
+#   <unit>.service <directory>/
+#
+# A directory may not lie inside another listed one or hold one, nor be too
+# broad (`/`, a top-level directory, a user's tree, /var/tmp, /dev/shm,
+# /run/user).
+
+containerd.service /var/lib/containerd/
+docker.service /var/lib/docker/
+kubelet.service /var/lib/kubelet/
+etcd.service /var/lib/etcd/
+
+# k3s runs containerd and the kubelet inside its own unit. Lot 283a measured
+# its crossings in the kubelet's directory, the CNI results and containerd's
+# task state under /run/k3s, beside /var/lib/rancher; /var/log/pods holds the
+# logs of the pods it runs.
+k3s.service /var/lib/rancher/
+k3s.service /var/lib/kubelet/
+k3s.service /var/lib/cni/
+k3s.service /run/k3s/
+k3s.service /var/log/pods/
+k3s-agent.service /var/lib/rancher/
+k3s-agent.service /var/lib/kubelet/
+k3s-agent.service /var/lib/cni/
+k3s-agent.service /run/k3s/
+k3s-agent.service /var/log/pods/

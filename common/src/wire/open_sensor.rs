@@ -64,11 +64,52 @@ pub mod open_class {
     /// so a rule further up was not seen (external audit EBPF-011). The
     /// walk also counts it in `OPEN_DEPTH_CAPPED`, which userland reads.
     pub const DEPTH_CAPPED: u32 = 1 << 14;
+    /// Lot 283c: directory under `/var/lib` or a service account's home
+    /// (a system account of the account database): a file there that a
+    /// non-root uid owns, in a directory that uid owns, is that account's
+    /// own data ([`super::own_code`]). The writes still count; the posture
+    /// reads the window's [`super::own_data`] summary.
+    pub const TREE_SVC_DATA: u32 = 1 << 15;
+    /// Lot 283c: a person's cache directory (`~/.cache`, the
+    /// `XDG_CACHE_HOME` default); its owner is `DirClass::uid`, as a
+    /// runtime directory's.
+    pub const TREE_USER_CACHE: u32 = 1 << 16;
+    /// Lot 283c: a data directory of the shipped list `daemon-data.v1` (or
+    /// the operator's signed overlay); the directory's tag
+    /// ([`UNIT_TAG_SHIFT`]) names the units it belongs to.
+    pub const TREE_UNIT_DATA: u32 = 1 << 17;
+    /// Lot 283c: the tag of a [`TREE_UNIT_DATA`] directory, bits 18 to 25
+    /// (at most [`super::own_data::UNIT_TAGS`] directories). A tag is a
+    /// directory's, so no two registered directories nest (the list
+    /// refuses it): their tags would mix in the walk.
+    pub const UNIT_TAG_SHIFT: u32 = 18;
+    pub const UNIT_TAG_MASK: u32 = 0xFF << UNIT_TAG_SHIFT;
+    /// Lot 283c: `/dev/shm`, the POSIX shared memory every account shares
+    /// (sticky, root's): a file a non-root uid owns there is that
+    /// account's own segment ([`super::own_code`]) — PostgreSQL's dynamic
+    /// shared memory, which its backends open to write beside their data.
+    pub const TREE_SHM: u32 = 1 << 26;
+    /// The class bits that carry an owner in `DirClass::uid` (or, for a
+    /// daemon's directory, a tag): [`super::own_code`] reads a class with
+    /// exactly one of them.
+    pub const OWNER_BITS: u32 = TREE_RUNTIME | TREE_USER_CACHE | TREE_UNIT_DATA;
+    /// The class bits [`super::own_code`] reads: a write elsewhere is no
+    /// one's own data, and its inodes are not read.
+    pub const OWN_DATA_BITS: u32 = TREE_SVC_DATA | TREE_USER_CACHE | TREE_UNIT_DATA | TREE_SHM;
     /// A computed `DIR_CLASS` entry (an empty class is still cached).
     pub const CLASSIFIED: u32 = 1 << 31;
     /// What a directory passes to every descendant.
-    pub const SUBTREE: u32 =
-        TREE_CRITICAL | TREE_PERSIST | TREE_CRED | TREE_HOME | TREE_CARVEOUT | TREE_RUNTIME;
+    pub const SUBTREE: u32 = TREE_CRITICAL
+        | TREE_PERSIST
+        | TREE_CRED
+        | TREE_HOME
+        | TREE_CARVEOUT
+        | TREE_RUNTIME
+        | TREE_SVC_DATA
+        | TREE_USER_CACHE
+        | TREE_UNIT_DATA
+        | UNIT_TAG_MASK
+        | TREE_SHM;
     /// What a directory's own rule says about its direct children.
     pub const DIRECT: u32 = SUBTREE | CHILDREN_PROBE | LEAVES_CRED | CHILD_FILES | DIR_HAS_FILES;
 }
@@ -146,6 +187,37 @@ pub mod open_reason {
     /// one, as before, only files of 4 KiB or more count (a build rewrites
     /// its own small outputs: lab PR 127, cargo killed).
     pub const MASS_OVERWRITE_SMALL: u32 = 1 << 12;
+    /// Lot 283c: the [`super::own_data`] summary of the crossing's window
+    /// rides in the reason's top byte from the counter to the record
+    /// (`OpenRecordRaw::own`); no reason bit lies there.
+    pub const OWN_SHIFT: u32 = 24;
+    /// The reason bits proper, below [`OWN_SHIFT`].
+    pub const REASON_BITS: u32 = (1 << OWN_SHIFT) - 1;
+}
+
+/// Lot 283c: whose own data every file a window counted was
+/// ([`own_code`], [`own_after`]): the summary of a crossing
+/// (`OpenRecordRaw::own`, `MassWrite`'s and `FileBurst`'s `own_data`). The
+/// counts are the same whatever it says — the ransomware tracker reads
+/// every crossing — and the posture's mass-write arm leaves a crossing out
+/// only when it says the writer's own data and the writer is who the
+/// summary needs (its unit, its account).
+pub mod own_data {
+    /// Some file of the window was no one's own data (or there was none).
+    pub const NONE: u8 = 0;
+    /// Every file lay under `/var/lib` or a service account's home, in a
+    /// directory the writer's uid owns, or in `/dev/shm` (its POSIX shared
+    /// memory), owned by it (not root).
+    pub const SERVICE: u8 = 1;
+    /// Every file lay in the writer's person's `~/.cache`, owned by it.
+    pub const CACHE: u8 = 2;
+    /// Every file lay in one listed daemon directory: `UNIT_BASE + tag`.
+    pub const UNIT_BASE: u8 = 3;
+    /// Tags of daemon directories: `0..UNIT_TAGS` (a byte, less the codes
+    /// above).
+    pub const UNIT_TAGS: u32 = 256 - UNIT_BASE as u32;
+    // every code fits the record's byte
+    const _: () = assert!(UNIT_BASE as u32 + UNIT_TAGS == 256);
 }
 
 /// Names in the rule maps: NUL-padded, at most 31 bytes kept.
@@ -225,7 +297,8 @@ pub struct ChildRuleKey {
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
 pub struct DirClass {
     pub bits: u32,
-    /// Owner of a runtime directory (`TREE_RUNTIME`).
+    /// Owner of a runtime directory (`TREE_RUNTIME`) or, lot 283c, of a
+    /// person's cache directory (`TREE_USER_CACHE`).
     pub uid: u32,
     /// `DIR_CLASS_GEN[0]` when computed; any other value is stale.
     pub gen: u32,
@@ -256,7 +329,9 @@ pub struct OpenWriteWindow {
     /// under [`OVERWRITE_MIN_BYTES`] rewritten ([`WriteKind::SmallRewrite`]),
     /// each once per window.
     pub small: u32,
-    pub _pad: u32,
+    /// Lot 283c: the window's [`own_data`] summary ([`own_after`]), set by
+    /// the counter after each [`write_step`].
+    pub own: u32,
 }
 
 /// Lot 282: what one write-open of a regular file adds to its tgid's
@@ -307,7 +382,7 @@ impl OpenWriteWindow {
             overwrites: (kind == WriteKind::Rewrite) as u32,
             created: (kind == WriteKind::New) as u32,
             small: (kind == WriteKind::SmallRewrite) as u32,
-            _pad: 0,
+            own: 0,
         }
     }
 
@@ -454,6 +529,74 @@ pub fn carved_class(bits: u32, owner: u32, loginuid: impl FnOnce() -> u32) -> bo
         || (bits & open_class::TREE_RUNTIME != 0 && loginuid() == owner)
 }
 
+/// Lot 283c: whose own data one counted write (or destroyed original)
+/// is, from its directory's class `bits` and owner `owner`
+/// (`DirClass::uid`), the writer's uid `uid`, the owners of the file's
+/// directory and of the file (`dir_uid`, `file_uid`) and the file's links
+/// `nlink` — an [`own_data`] code:
+///
+/// - a listed daemon's directory (`TREE_UNIT_DATA`, its tag): the code of
+///   the tag, whoever writes (the posture checks the writer's unit);
+/// - a person's `~/.cache` (`TREE_USER_CACHE`): `CACHE` when the writer is
+///   its owner and owns the file and its directory;
+/// - under `/var/lib` or a service account's home (`TREE_SVC_DATA`):
+///   `SERVICE` when a uid other than root owns the file and its directory
+///   and writes it (the posture checks the account is a service's);
+/// - in `/dev/shm` (`TREE_SHM`, a directory every account shares):
+///   `SERVICE` when a uid other than root owns the file and writes it — its
+///   own shared memory segment, as a service's data (lot 283c's lab:
+///   PostgreSQL's backends open their dynamic shared memory to write).
+///
+/// A file with another link is no one's: a hard link puts any file the
+/// writer may link into its own directory. A class with two owner-bearing
+/// bits (nested registrations) is no one's either.
+#[inline(always)]
+pub fn own_code(bits: u32, owner: u32, uid: u32, dir_uid: u32, file_uid: u32, nlink: u32) -> u32 {
+    use open_class::*;
+    if nlink != 1 {
+        return own_data::NONE as u32;
+    }
+    let owners = bits & OWNER_BITS;
+    if owners == TREE_UNIT_DATA {
+        let tag = (bits & UNIT_TAG_MASK) >> UNIT_TAG_SHIFT;
+        return if tag < own_data::UNIT_TAGS {
+            own_data::UNIT_BASE as u32 + tag
+        } else {
+            own_data::NONE as u32
+        };
+    }
+    let owned = uid != 0 && dir_uid == uid && file_uid == uid;
+    if owners == TREE_USER_CACHE {
+        return if owned && owner == uid {
+            own_data::CACHE as u32
+        } else {
+            own_data::NONE as u32
+        };
+    }
+    let shm = uid != 0 && file_uid == uid && bits & TREE_SHM != 0;
+    if owners == 0 && (bits & TREE_SVC_DATA != 0 && owned || shm) {
+        own_data::SERVICE as u32
+    } else {
+        own_data::NONE as u32
+    }
+}
+
+/// Lot 283c: a window's [`own_data`] summary after one more event of code
+/// `code` — the event's own when the window starts with it (`fresh`), the
+/// summary kept when the event counts nothing new (`counted` false: a file
+/// already counted in the window), else the summary when the codes agree
+/// and `NONE` from the first that does not, for the rest of the window.
+#[inline(always)]
+pub fn own_after(summary: u32, fresh: bool, counted: bool, code: u32) -> u32 {
+    if fresh {
+        code
+    } else if !counted || summary == code {
+        summary
+    } else {
+        own_data::NONE as u32
+    }
+}
+
 /// `ATTR_SIZE` (include/linux/fs.h, `1 << 3` in every kernel): an
 /// `inode_setattr` that changes the file's size.
 pub const ATTR_SIZE: u32 = 1 << 3;
@@ -512,6 +655,10 @@ pub struct OpenCgWindow {
     pub overwrites: u32,
     /// 1 once the crossing was reported in this window.
     pub fired: u32,
+    /// Lot 283c: the window's [`own_data`] summary: each process's own
+    /// window summary as it adds its overwrites ([`own_after`]).
+    pub own: u32,
+    pub _pad: u32,
 }
 
 /// `add` overwrites ([`write_step`]'s third value) into a cgroup's window
@@ -567,7 +714,9 @@ pub struct OpenRecordRaw {
     pub comm: [u8; TASK_COMM_LEN],
     pub path_n: u16,
     pub path_truncated: u8,
-    pub _pad: u8,
+    /// Lot 283c: the [`own_data`] summary of a mass-write or unlink
+    /// crossing's window; `NONE` for any other record.
+    pub own: u8,
     pub path: [u8; OPEN_PATH_SLOTS * OPEN_PATH_SLOT_LEN],
 }
 
@@ -798,6 +947,10 @@ pub struct UnlinkWindow {
     pub count: u32,
     /// 1 once the window reported.
     pub fired: u32,
+    /// Lot 283c: the window's [`own_data`] summary of the originals
+    /// destroyed ([`own_after`]).
+    pub own: u32,
+    pub _pad: u32,
 }
 
 impl UnlinkWindow {
@@ -823,7 +976,7 @@ pub fn unlink_step(w: &mut UnlinkWindow, now: u64) -> u32 {
         *w = UnlinkWindow {
             start_ns: now,
             count: 1,
-            fired: 0,
+            ..UnlinkWindow::default()
         };
         return 0;
     }
@@ -894,11 +1047,11 @@ mod tests {
         assert_eq!(core::mem::size_of::<DirClass>(), 16);
         assert_eq!(core::mem::size_of::<OpenWriteWindow>(), 32);
         assert_eq!(core::mem::size_of::<OpenCgKey>(), 16);
-        assert_eq!(core::mem::size_of::<OpenCgWindow>(), 16);
+        assert_eq!(core::mem::size_of::<OpenCgWindow>(), 24);
         assert_eq!(core::mem::size_of::<NameParts>(), 56);
         assert_eq!(core::mem::size_of::<RenameNames>(), 112);
         assert_eq!(core::mem::size_of::<RenameWindow>(), 40);
-        assert_eq!(core::mem::size_of::<UnlinkWindow>(), 16);
+        assert_eq!(core::mem::size_of::<UnlinkWindow>(), 24);
     }
 
     #[test]
@@ -912,6 +1065,176 @@ mod tests {
         );
         // a computed bit, never inherited nor taken from a rule
         assert_eq!((DIRECT | CLASSIFIED) & DEPTH_CAPPED, 0);
+    }
+
+    /// Lot 283c: the own-data bits and the tag fit beside the others, every
+    /// directory class of them passes to the subtree, and the summary's
+    /// byte lies above every reason bit.
+    #[test]
+    fn own_data_bits_fit() {
+        use open_class::*;
+        let others = FILE_SENSITIVE
+            | FILE_CRITICAL
+            | FILE_PERSIST
+            | TREE_CRITICAL
+            | TREE_PERSIST
+            | CHILDREN_PROBE
+            | TREE_CRED
+            | LEAVES_CRED
+            | TREE_HOME
+            | TREE_CARVEOUT
+            | TREE_RUNTIME
+            | LEAF_CRED
+            | CHILD_FILES
+            | DIR_HAS_FILES
+            | DEPTH_CAPPED
+            | CLASSIFIED;
+        let own = TREE_SVC_DATA | TREE_USER_CACHE | TREE_UNIT_DATA | UNIT_TAG_MASK | TREE_SHM;
+        assert_eq!(own & others, 0);
+        assert_eq!(SUBTREE & own, own);
+        assert_eq!(OWN_DATA_BITS & UNIT_TAG_MASK, 0);
+        assert_eq!(TREE_SHM & UNIT_TAG_MASK, 0);
+        assert_eq!((UNIT_TAG_MASK >> UNIT_TAG_SHIFT) + 1, 256);
+        let all_reasons = open_reason::SENSITIVE
+            | open_reason::CRITICAL
+            | open_reason::PERSIST
+            | open_reason::PROBE
+            | open_reason::CRED
+            | open_reason::MASS_WRITE
+            | open_reason::FILE_CAP
+            | open_reason::MASS_OVERWRITE
+            | open_reason::MASS_OVERWRITE_CGROUP
+            | open_reason::MASS_RENAME
+            | open_reason::MASS_UNLINK
+            | open_reason::DEFENDER_SIGNAL
+            | open_reason::MASS_OVERWRITE_SMALL;
+        assert_eq!(all_reasons & !open_reason::REASON_BITS, 0);
+        assert_eq!(0xFFu32 << open_reason::OWN_SHIFT, !open_reason::REASON_BITS);
+    }
+
+    /// Lot 283c: whose own data one counted file is, as the kernel judges
+    /// it — decisions 1 to 3 at the file.
+    #[test]
+    fn own_code_tells_whose_own_data_a_file_is() {
+        use open_class::*;
+        use own_data::*;
+        let code = |bits: u32, owner: u32, uid: u32, dir: u32, file: u32, nlink: u32| {
+            own_code(bits, owner, uid, dir, file, nlink) as u8
+        };
+        const PG: u32 = 113;
+        const NO: u32 = u32::MAX;
+        // decision 1: a service account's file, in its directory, under
+        // `/var/lib` or its home — not root's, not another's, not a link
+        assert_eq!(code(TREE_SVC_DATA, NO, PG, PG, PG, 1), SERVICE);
+        assert_eq!(code(TREE_SVC_DATA | TREE_HOME, NO, PG, PG, PG, 1), SERVICE);
+        assert_eq!(code(TREE_SVC_DATA, NO, 0, 0, 0, 1), NONE, "root");
+        assert_eq!(
+            code(TREE_SVC_DATA, NO, PG, 0, PG, 1),
+            NONE,
+            "a directory of root's"
+        );
+        assert_eq!(
+            code(TREE_SVC_DATA, NO, PG, PG, 1000, 1),
+            NONE,
+            "a person's file"
+        );
+        assert_eq!(code(TREE_SVC_DATA, NO, PG, PG, PG, 2), NONE, "a hard link");
+        assert_eq!(code(TREE_SVC_DATA, NO, PG, NO, PG, 1), NONE, "unread");
+        assert_eq!(
+            code(TREE_HOME, NO, PG, PG, PG, 1),
+            NONE,
+            "outside the trees"
+        );
+        assert_eq!(code(0, NO, PG, PG, PG, 1), NONE);
+        // its own POSIX shared memory: a file it owns in `/dev/shm`, the
+        // directory root's (sticky) — anyone else's segment is not
+        assert_eq!(code(TREE_SHM, NO, PG, 0, PG, 1), SERVICE);
+        assert_eq!(
+            code(TREE_SHM, NO, PG, 0, 1000, 1),
+            NONE,
+            "a person's segment"
+        );
+        assert_eq!(code(TREE_SHM, NO, 0, 0, 0, 1), NONE, "root's");
+        assert_eq!(code(TREE_SHM, NO, PG, 0, PG, 2), NONE, "a hard link");
+        assert_eq!(code(TREE_SHM | TREE_RUNTIME, PG, PG, 0, PG, 1), NONE);
+        // decision 3: a person's cache, by its owner only
+        assert_eq!(
+            code(TREE_USER_CACHE | TREE_HOME, 1000, 1000, 1000, 1000, 1),
+            CACHE
+        );
+        assert_eq!(
+            code(TREE_USER_CACHE, 1000, 1001, 1001, 1001, 1),
+            NONE,
+            "another uid"
+        );
+        assert_eq!(code(TREE_USER_CACHE, 1000, 0, 0, 0, 1), NONE, "root");
+        assert_eq!(
+            code(TREE_USER_CACHE, 1000, 1000, 1000, 0, 1),
+            NONE,
+            "root's file"
+        );
+        assert_eq!(
+            code(TREE_USER_CACHE, 1000, 1000, 1000, 1000, 3),
+            NONE,
+            "a hard link"
+        );
+        // decision 2: a listed daemon's directory — its tag, whoever writes
+        // (the posture checks the writer's unit)
+        let tagged = |tag: u32| TREE_UNIT_DATA | TREE_SVC_DATA | (tag << UNIT_TAG_SHIFT);
+        assert_eq!(code(tagged(0), 0, 0, 0, 0, 1), UNIT_BASE);
+        assert_eq!(code(tagged(7), 0, 0, 0, 1000, 1), UNIT_BASE + 7);
+        assert_eq!(code(tagged(UNIT_TAGS - 1), 0, 0, 0, 0, 1), 255);
+        // past the tags no code: the record's byte would wrap to another's
+        for tag in UNIT_TAGS..256 {
+            assert_eq!(
+                own_code(tagged(tag), 0, 0, 0, 0, 1),
+                NONE as u32,
+                "tag {tag}"
+            );
+        }
+        assert_eq!(code(tagged(7), 0, 0, 0, 0, 2), NONE, "a hard link");
+        // two owner-bearing registrations nested: no one's
+        assert_eq!(
+            code(tagged(7) | TREE_USER_CACHE, 1000, 1000, 1000, 1000, 1),
+            NONE
+        );
+        assert_eq!(
+            code(TREE_USER_CACHE | TREE_RUNTIME, 1000, 1000, 1000, 1000, 1),
+            NONE
+        );
+        assert_eq!(code(TREE_SVC_DATA | TREE_RUNTIME, PG, PG, PG, PG, 1), NONE);
+    }
+
+    /// Lot 283c: a window is one owner's data only when every file it
+    /// counted was — one file elsewhere makes the rest of the window no
+    /// one's; a file counted again changes nothing; a new window starts
+    /// over.
+    #[test]
+    fn a_window_is_own_data_only_when_every_file_it_counted_was() {
+        let pg = own_data::SERVICE as u32;
+        let unit = own_data::UNIT_BASE as u32 + 4;
+        let none = own_data::NONE as u32;
+        // the counter's sequence: fresh, then each write's code
+        let run = |writes: &[(u32, bool)]| {
+            let mut w = own_after(0, true, true, writes[0].0);
+            for (code, counted) in &writes[1..] {
+                w = own_after(w, false, *counted, *code);
+            }
+            w
+        };
+        assert_eq!(run(&[(pg, true); 20]), pg);
+        assert_eq!(run(&[(unit, true); 20]), unit);
+        let mut mixed = vec![(pg, true); 20];
+        mixed[7] = (none, true);
+        assert_eq!(run(&mixed), none, "one file outside");
+        mixed[7] = (unit, true);
+        assert_eq!(run(&mixed), none, "another owner's file");
+        mixed[7] = (none, false);
+        assert_eq!(run(&mixed), pg, "a file counted already");
+        let mut late = vec![(none, true)];
+        late.extend([(pg, true); 19]);
+        assert_eq!(run(&late), none, "no one's from its first file");
+        assert_eq!(own_after(none, true, true, pg), pg, "a fresh window");
     }
 
     const S: u64 = 1_000_000_000;
@@ -1345,6 +1668,7 @@ mod tests {
             start_ns: 2 * S,
             count: 1,
             fired: 0,
+            ..UnlinkWindow::default()
         };
         assert_eq!(u.start_for(62 * S), 2 * S);
         assert_eq!(u.start_for(62 * S + 1), 62 * S + 1);
@@ -1371,6 +1695,7 @@ mod tests {
                         start_ns: now,
                         count: 1,
                         fired: 0,
+                        ..UnlinkWindow::default()
                     });
                     0
                 }
@@ -1407,6 +1732,7 @@ mod tests {
                             start_ns: now,
                             count: 1,
                             fired: 0,
+                            ..UnlinkWindow::default()
                         });
                         0
                     }
@@ -1556,6 +1882,7 @@ mod tests {
             start_ns: 0,
             count: 1,
             fired: 0,
+            ..UnlinkWindow::default()
         };
         for i in 1..OPEN_UNLINK_MIN - 1 {
             assert_eq!(unlink_step(&mut w, i as u64), 0);

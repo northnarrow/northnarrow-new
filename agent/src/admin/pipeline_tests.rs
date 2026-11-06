@@ -2184,6 +2184,7 @@ fn a_signed_policy_set_applies_at_once_to_the_engine_the_posture_and_the_executo
             cgroup_window: false,
             small_files: false,
             cgroup_id: 0,
+            own_data: 0,
         }
     };
 

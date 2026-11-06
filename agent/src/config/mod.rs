@@ -107,7 +107,7 @@ mod tests {
 
     /// Every shipped default list: its file name in `/etc/northnarrow` and
     /// its shipped copies.
-    fn shipped_lists() -> [(&'static str, Shipped<'static>); 6] {
+    fn shipped_lists() -> [(&'static str, Shipped<'static>); 7] {
         [
             ("fim-paths.v1", crate::fim::paths_config::FIM_PATHS_SHIPPED),
             (
@@ -128,6 +128,11 @@ mod tests {
             ),
             // Lab PR 225.
             ("security-tools.v1", crate::impair::SECURITY_TOOLS_SHIPPED),
+            // Lot 283c.
+            (
+                "daemon-data.v1",
+                crate::posture::daemon_data::DAEMON_DATA_SHIPPED,
+            ),
         ]
     }
 
@@ -213,6 +218,10 @@ mod tests {
             (
                 "security-tools.v1",
                 "38cef57a92f6b394be9307c0f16e8799d553d0cff7bb6d7fd3db0b3906736335",
+            ),
+            (
+                "daemon-data.v1",
+                "b2ce219ecbf149981fbef7e23a04de42e8a06a43a474173da7c9a4b7f9804292",
             ),
         ];
         for ((name, shipped), (pin_name, pin)) in shipped_lists().into_iter().zip(pins) {

@@ -18,6 +18,12 @@ use crate::wire::{
 };
 
 /// Serde default of `Event::CanaryTripped::first_trip`.
+/// Lot 283c: an own-data summary of none is not written (the records
+/// written before it read the same).
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+
 fn canary_first_trip_default() -> bool {
     true
 }
@@ -156,6 +162,14 @@ pub enum Event {
         /// pairs a replacement's halves within one cgroup.
         #[serde(default)]
         cgroup_id: u64,
+        /// Lot 283c: whose own data every file the crossing's window
+        /// counted was, as the kernel judged each
+        /// (`common::wire::open_sensor::own_data`: 0 none, 1 a service
+        /// account's, 2 a person's cache, 3 and up a listed daemon's
+        /// directory). Only the posture's mass-write arm reads it; the
+        /// ransomware tracker counts every crossing.
+        #[serde(default, skip_serializing_if = "is_zero_u8")]
+        own_data: u8,
     },
     /// Lab PR 225: one process crossed a rename or an unlink burst
     /// threshold, counted in the kernel on `inode_rename` / `inode_unlink`
@@ -185,6 +199,10 @@ pub enum Event {
         /// the kernel read it (0 when unknown, 1 the root).
         #[serde(default)]
         cgroup_id: u64,
+        /// Lot 283c: an unlink burst's own-data summary, as `MassWrite`'s
+        /// (the originals destroyed in the window); 0 for a rename burst.
+        #[serde(default, skip_serializing_if = "is_zero_u8")]
+        own_data: u8,
     },
     /// Lab PR 225 (CM-18): a signal that stops or ends a process, sent to
     /// the main process of another security tool of the host (the list

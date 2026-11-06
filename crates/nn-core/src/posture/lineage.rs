@@ -2175,6 +2175,15 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         None
     }
 
+    /// Lot 283c: the systemd service `pid` runs in now — its placing cgroup
+    /// is `/system.slice/[…slice/]<unit>.service`
+    /// ([`crate::posture::daemon_data::system_service`]) — or `None` (a
+    /// session's scope, a container's, a process gone).
+    pub fn system_service(&self, pid: u32) -> Option<String> {
+        let path = self.cgroup_path(pid)?;
+        crate::posture::daemon_data::system_service(&path).map(str::to_string)
+    }
+
     /// The cgroup path that places `pid` ([`placing_cgroup`]).
     fn cgroup_path(&self, pid: u32) -> Option<String> {
         if pid == 0 {

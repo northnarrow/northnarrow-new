@@ -959,6 +959,31 @@ an accepted residual of a heuristic, the filter chains excluded.
   plugin, under `sudo`) vouched for rootless podman's mass write. The
   NEUTRALIZE hold of §10.3 judges the cause's evidence classes, not which
   process raised them.
+- **A writer's own data (lot 283c, §10.7).** The arm leaves out a crossing
+  whose window held only the writer's own data; what that lets through is
+  said here, and every such crossing still reaches the ransomware tracker:
+  - *A compromised service account encrypting its own data directory only
+    reaches NN-L-IMP-001* (entropy, renames to a new extension, copies and
+    deletions; its kill held by the per-rule policy, off by default) — the
+    mass-write arm does not see it. A payload the account runs in a
+    session, or anything it writes outside its own files (a person's, root's,
+    a file with another link), still raises the arm.
+  - *A root daemon named like a listed unit gets that unit's directory
+    exempt, and nothing else*: any root process that installs and starts a
+    unit of that name (`containerd.service`), or runs in its cgroup, writes
+    that unit's listed directories unseen by the arm; its writes anywhere
+    else count, and so does the same directory written from any other
+    cgroup.
+  - *A file moved into an own-data directory before it is rewritten* is
+    judged there (the kernel classifies the directory the file is in when
+    it is opened): a person's process that moves documents into its
+    `~/.cache` — or a listed daemon that moves files into its directory —
+    and encrypts them there, then moves them back, only reaches
+    NN-L-IMP-001 for those rewrites. A hard link is no way in (a file with
+    another link is no one's own data), nor is a bind mount (the
+    classification follows the dentries, not the mount).
+  - *Tracepoint mode* knows no own data (no kernel summary): every crossing
+    counts there, as before.
 
 ### 10.6 The review of #500: the kernel's cost, and the variants measured
 
@@ -1040,3 +1065,68 @@ byte, written, the originals deleted): ENGAGED and NN-L-IMP-001 on
 **End of design doc.** This is the V2 contract — open questions are
 explicitly carved out and will be answered in subsequent design notes
 or implementation PRs. No code in this doc.
+
+### 10.7 A server doing its normal job: its own data (lot 283c)
+
+Lot 283a's benign corpus measured `ConfirmedIntrusion_MassWrite`, and ENGAGED,
+from servers doing their normal job: PostgreSQL's backends and `initdb`
+rewriting their relation files (every `pgbench`, restore and vacuum), and
+containerd and k3s-server replacing their own state (task directories,
+CNI results, the kubelet's files) every half minute while k3s ran pods. The
+coordinator's decisions of 06/11/2026: **a service writing its own data does
+not feed the mass-write arm**; tree replacements in a session (`npm ci`,
+`rsync --inplace`, `git checkout`) stay ENGAGED (decided on 04/11 as the
+honest signal); NN-L-IMP-001 is exempted nowhere.
+
+**Where it is judged.** The ransomware tracker reads the same kernel
+crossings as the arm, so the kernel keeps counting every write, and tells
+whose own data the files of each crossing's window were. Each counted file
+(a write-open of a file first counted in the window, or an original
+destroyed) gets an own-data code (`common::wire::open_sensor::own_code`),
+from the class of its directory and the inodes the kernel resolved:
+
+- under `/var/lib` or a service account's home (`TREE_SVC_DATA`, registered
+  from the account database: below `UID_MIN` or a shell that refuses a
+  login): `SERVICE` when a uid other than root writes a file it owns in a
+  directory it owns (the file's dentry's parent, as the kernel resolved it,
+  not the path text); in `/dev/shm` (`TREE_SHM`, the POSIX shared memory
+  every account shares, sticky and root's), `SERVICE` when a uid other
+  than root writes a file it owns there — its own segment. The lab found
+  PostgreSQL's backends opening their dynamic shared memory
+  (`/dev/shm/PostgreSQL.*`) to write beside their relation files: without
+  it every window of theirs held a file outside their data;
+- in a person's `~/.cache` (`TREE_USER_CACHE`, its owner beside it as a
+  runtime directory's): `CACHE` when its owner writes a file it owns there;
+- in a directory of the shipped list `configs/daemon-data.v1` or the signed
+  overlay's `+<unit>.service <dir>/` lines (`TREE_UNIT_DATA`, an 8-bit tag:
+  the directory's index): `UNIT_BASE + tag`, whoever writes;
+- a file with another link, a class with two owner-bearing registrations,
+  anything else: `NONE`.
+
+Each window — the process's write window, its cgroup's overwrite window,
+its unlink window — keeps a summary (`own_after`): the first file's code,
+kept while every further counted file has the same, `NONE` from the first
+that does not, for the rest of the window. The crossing carries its
+window's summary (the record's `own` byte; `MassWrite` and `FileBurst`'s
+`own_data`). The posture's arm then leaves the crossing out — an INFO line
+naming why, never silent — when the summary is:
+
+- `SERVICE` and the writer's account is a service account
+  (`classify_account`, lot 283b) and its cgroup a system service
+  (`/system.slice/…/<unit>.service`, a template's instance in a slice
+  below `system.slice` included; never a session's scope, a container's,
+  or a sub-cgroup a service made);
+- `CACHE` and the writer's account is a person's;
+- a daemon directory's code and the writer's cgroup is one of that
+  directory's units.
+
+A replacement (rule 2 of §10.1) is left out only when both its halves
+were. The cgroup and the account are read when the crossing is judged: a
+process gone by then is no one's, and its crossing counts. A window with
+one file of anyone else counts whole — the arm never subtracts.
+
+**What it measured.** See the lot's note in `docs/roadmap/CAPABILITY_PROGRAM.md`.
+`initdb` run from `sudo -u postgres` in an SSH session (`pg_createcluster`
+by hand) is a session's process, not the service's, and counts; so does
+anything a service account writes outside its own files.
+

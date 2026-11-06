@@ -1615,6 +1615,7 @@ mod tests {
             cgroup_window: false,
             small_files: false,
             cgroup_id: 0,
+            own_data: 0,
         };
         assert_eq!(when_full(&mass), WhenFull::Backpressure);
         let denial = Event::FsProtectDenial {

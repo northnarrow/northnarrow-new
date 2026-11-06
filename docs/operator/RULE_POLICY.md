@@ -255,6 +255,22 @@ pull` and an `apt purge` reached it. Since lot 282
   files deleted alone (`rm -rf`, a purge). Files of any size that hold data
   count; rewrites of files under 4 KiB only outside an authenticated session
   (a build's own small outputs inside one: lab PR 127);
+- since lot 283c, a server doing its normal job does not sit in ENGAGED: a
+  crossing whose every file was the writer's own data does not raise the
+  mass-write signal — a service account's files under `/var/lib` or its home,
+  in a directory it owns, and its own shared memory in `/dev/shm`, written
+  from its system service (PostgreSQL's
+  backends, not `initdb` run by hand in a session); a listed root daemon's
+  directory (`daemon-data.v1`: containerd, Docker, the kubelet, etcd, k3s;
+  more in the mass-write overlay) written from that unit's cgroup; a person's
+  `~/.cache` written by that person. One file of anyone else in the window
+  and the crossing counts whole; tree replacements in a session (`npm ci`,
+  `rsync --inplace`, `git checkout`) count as before. NN-L-IMP-001 judges
+  every crossing, these included. Residuals: a compromised service account
+  encrypting its own data directory only reaches NN-L-IMP-001; a root daemon
+  named like a listed unit gets that unit's directory exempt, and nothing
+  else; a file moved into such a directory before it is rewritten is judged
+  there (the posture design, §10.5 and §10.7);
 - an anti-tamper refusal of a package transaction's process (a package
   manager root executed, whose run covers it, as R009 judges it) of a file
   operation a maintainer script does — removing, renaming, changing the
