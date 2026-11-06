@@ -130,6 +130,44 @@ work. Four changes, each a default the signed per-rule policy can undo with
   `kmod`) from forks of `mkinitramfs` that never execute, gone by the time the
   decision walked the lineage — the hook was killed in an `apt upgrade`, and
   a kill that lands aborts the initramfs build. By lineage, never by name.
+- **R011 in an initramfs build (lot 287).** The same hook in an
+  administrator's own `sudo update-initramfs -u` has no package manager in
+  its lineage (lot 283b's lab: killed, rc 137). The agent remembers each
+  process whose exec ran an initramfs builder — `/usr/sbin/update-initramfs`,
+  `/usr/sbin/mkinitramfs`, `/usr/bin/dracut`: the packaged file by the
+  device and inode the kernel gave for the script, run by root; a copy, a
+  file under `/tmp`, a user's run is none — and reads, at an exec of a
+  module tool, the nearest one from the exec's parent up, while the build's
+  forks are alive. In such a build a root exec is recorded (High), not
+  killed, when it is what the build runs: a `#!` script of a system tree
+  outside the tools' own places (the hook; the interpreter is the process's
+  image, or its `#!` line once it has exited), or the system's `modprobe`
+  asked to load nothing (`--show-depends`, `--dry-run`: `manual_add_modules`
+  on Debian 12 and Ubuntu 22.04). Still killed in a build: `MODPROBE_OPTIONS`
+  or `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH` in the environment; a tool
+  that is not the system's; anything outside a system tree; `insmod` and a
+  `modprobe` that may load, so a hook root plants (`mkinitramfs -d`,
+  `/etc/initramfs-tools/hooks`) does not launder them. Best effort: a
+  build's fork that exited before the agent read the exec breaks the
+  lineage, and R011 judges the exec as before. Tracepoint mode (no LSM exec
+  hook) sees no build: killed as before.
+
+**Decision record (06/11/2026, lot 287).** By the coordinator, with the
+authority the founder delegated.
+- *A narrow record, not the whole tree.* Inside a build R011 records only
+  what the build itself runs: the hook (a `#!` script of a system tree) and
+  `modprobe`'s dry runs. It does not record every exec under a builder.
+  `mkinitramfs -d <dir>` and `/etc/initramfs-tools/hooks` run hooks that
+  root chooses, so a record of the whole tree would let `sudo mkinitramfs -d
+  /tmp/x` launder an `insmod /tmp/rk.ko`. The narrow record keeps that
+  `insmod` killed.
+- *No "not modified since boot" check on the builder.* The builder is
+  trusted by its packaged file's device and inode in a root-owned tree, run
+  by root. Its modification time is not compared with the boot: an `apt
+  upgrade` of initramfs-tools changes the builder's ctime, and the
+  administrator's `update-initramfs -u` run right after it, before a
+  reboot, would be killed again. No helper of the agent compares a file
+  with the boot either.
 
 **Decision record (06/11/2026, lot 283b).** By the coordinator, with the
 authority the founder delegated, after lot 283a's inventory.

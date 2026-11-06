@@ -1265,10 +1265,15 @@ fn resolved<T>(_: &T, mut e: Event) -> (Event, [Option<Event>; 2]) {
 /// read first, while the process may still run (its program's device and
 /// inode, its environment: [`crate::sensors::kmod_exec`]) and the facts
 /// kept for R011; then its path made absolute as every exec's
-/// ([`resolved`]).
+/// ([`resolved`]). Lot 287: then the exec noted for the initramfs builds
+/// the later execs of module tools are read under (an exec of a builder
+/// remembered by its process, any other exec forgets its pid) — in the
+/// pump's order, before any exec its process forks.
 fn kmod_read_then_resolved(raw: &ProcessSpawnRaw, e: Event) -> (Event, [Option<Event>; 2]) {
     crate::sensors::kmod_exec::read_and_keep(&e);
-    resolved(raw, e)
+    let (e, carried) = resolved(raw, e);
+    crate::sensors::kmod_exec::note_exec(&e);
+    (e, carried)
 }
 
 /// R12b (lab PR 269): a ring's pump on a thread of its own, a source of

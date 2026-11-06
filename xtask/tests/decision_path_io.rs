@@ -601,7 +601,9 @@ fn the_rules_fail_on_planted_violations() {
 /// against the system's tool, `MODPROBE_OPTIONS` in its environment — on its
 /// own thread, first, while the process may still run: the process_spawn
 /// pump's step is `kmod_read_then_resolved`, which reads and keeps the
-/// facts before it resolves the path. The decision reads no `/proc`.
+/// facts before it resolves the path. The decision reads no `/proc`. Lot
+/// 287: then it notes every exec for the initramfs builds, after the path
+/// was resolved.
 #[test]
 fn the_exec_pump_reads_a_module_tool_s_exec() {
     let mux = strip_comments(
@@ -625,6 +627,12 @@ fn the_exec_pump_reads_a_module_tool_s_exec() {
         .expect("the exec read and its facts kept");
     let resolve = step.find("resolved(raw, e)").expect("then resolved");
     assert!(read < resolve, "read after its path was resolved: {step}");
+    // lot 287: then every exec noted for the initramfs builds, its path
+    // the kernel's made absolute
+    let note = step
+        .find("kmod_exec::note_exec(&e)")
+        .expect("every exec noted for the initramfs builds");
+    assert!(resolve < note, "noted before its path was resolved: {step}");
     // the core keeps the facts; it reads nothing itself
     let core = strip_comments(
         &std::fs::read_to_string(

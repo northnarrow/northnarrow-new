@@ -872,6 +872,25 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- R011 no longer kills the hook `kmod` of an administrator's own `sudo
+  update-initramfs -u` (lot 287; lot 283b's lab: rc 137, no package
+  manager in its lineage). The exec pump remembers each process whose exec
+  ran an initramfs builder — `/usr/sbin/update-initramfs`,
+  `/usr/sbin/mkinitramfs`, `/usr/bin/dracut`, the packaged file by the
+  device and inode the LSM hook gave for the script, as root (a copy, a
+  file under `/tmp`, a user's run: none) — and, at an exec of a module
+  tool, reads the nearest one from the exec's parent up (`/proc`, while the
+  forks of `mkinitramfs` that never execute are alive), and the interpreter
+  the kernel runs the file with (`/proc/<pid>/exe`; once the process has
+  exited, its `#!` line). In such a build R011 records, at High, a `#!`
+  script of a system tree outside the tools' places (the hook) and the
+  system's `modprobe` asked to load nothing (`--show-depends`,
+  `--dry-run`: `manual_add_modules` of Debian 12's and Ubuntu 22.04's
+  initramfs-tools, `--set-version` beside it). Still killed in a build:
+  `MODPROBE_OPTIONS` or `LD_*` in the environment, a tool that is not the
+  system's (a copy, a file in a tool's place), anything outside a system
+  tree, `insmod`, a `modprobe` that may load — a hook root plants
+  (`mkinitramfs -d`, `/etc/initramfs-tools/hooks`) does not launder them.
 - Tracepoint mode's mass-write carve-out no longer folds a `..` through a
   `/proc` link (lot 286, the re-review of #500, N2): a caller's path was
   judged after its `..` were folded, so `/proc/self/root/../home/u/x` and
