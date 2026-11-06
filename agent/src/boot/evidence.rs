@@ -402,7 +402,18 @@ pub(crate) fn wire(
         executor.set_audit_log(Arc::clone(audit));
     }
     // Tappa 10.8 telemetry probe: known events on each sensor, every minute.
-    let telemetry_probe = northnarrow_agent::telemetry_probe::spawn(audit_log.clone());
+    // Lot 280c: every source proves it is alive each round — the deny
+    // steps not exercised in a trusted-installer window, the attach checks
+    // read from the program-id list and the pin root.
+    let window = Arc::clone(installer_override);
+    let telemetry_probe = northnarrow_agent::telemetry_probe::spawn(
+        audit_log.clone(),
+        northnarrow_agent::telemetry_probe::SelfTestEnv {
+            window_open: Some(Arc::new(move || window.is_window_open())),
+            own_ids_file: super::attach::own_prog_ids_file(cli),
+            pin_root: installer_override.bpffs_root().map(|p| p.to_path_buf()),
+        },
+    );
     // Lot 280b: the kernel's taint flags and livepatches and the root
     // cgroup's cgroup/sysctl programs, every 5 s — a new taint of code
     // entering the kernel, a foreign program on the root: signed detections

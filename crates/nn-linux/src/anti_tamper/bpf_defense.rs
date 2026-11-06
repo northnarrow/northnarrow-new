@@ -696,7 +696,7 @@ fn own_link_ids(prog_ids: &[u32], pin_root: Option<&Path>) -> Vec<u32> {
 /// `(link_id, prog_id)` of every link reachable from this process right
 /// now: held fds and `link_*` pins. A link detached from outside keeps its
 /// id but reports `prog_id` 0; a pin that is gone is simply absent.
-fn live_links(pin_root: Option<&Path>) -> Vec<(u32, u32)> {
+pub(crate) fn live_links(pin_root: Option<&Path>) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
         for entry in entries.flatten() {

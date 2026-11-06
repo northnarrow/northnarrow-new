@@ -1275,8 +1275,14 @@ fn the_event_loop_wires_the_bus_as_modelled() {
     // the decision thread: one judging site, `judge`, the probe first
     let thread = at("fn decision_loop(", 0);
     let judge_fn = at("let judge = |e: nn_model::Event| {", thread);
-    let probe = at("probe.observe(&e);", judge_fn);
+    let probe = at("if probe.observe(&e) {", judge_fn);
+    // lot 280c: the self-test's own event is taken there, never judged
+    let taken = at("return;", probe);
     let judging = at("process_event(", probe);
+    assert!(
+        taken < judging && !code[probe..taken].contains('}'),
+        "a taken event returns before it is judged"
+    );
     let answered = at("for e in systemd.take_answered() {", judging);
     assert!(
         code[answered..].find("judge(e);").is_some(),
@@ -1319,6 +1325,70 @@ fn the_event_loop_wires_the_bus_as_modelled() {
         1,
         "one judging site"
     );
+}
+
+/// Lot 280c (the brief's third named test): the sensor self-test's events
+/// never trigger the rules or the posture. Each event one round's child
+/// makes (as the pipeline decodes it) is taken by the probe's tap, which
+/// the decision thread offers every event first (pinned above: a taken
+/// event returns before `process_event`); offered as the thread offers
+/// them, none reaches the engine or the posture machine. Without the tap
+/// the same events move the posture (the deny step's refusals are attempts
+/// on the agent): what the take prevents.
+#[test]
+fn self_test_events_never_trigger_rules_or_the_posture() {
+    use crate::telemetry_probe::{round_events_for_tests, TelemetryProbe, Window};
+    use nn_model::posture_types::PostureKind;
+    let case: Case =
+        serde_json::from_value(json!({"about": "lot 280c: the sensor self-test", "items": []}))
+            .unwrap();
+    let host = Host::new(&case, tempfile::TempDir::new().unwrap());
+    let (nonce, agent, child, ts) = ("0123456789abcdef", 4_000, 4_242, 1_500_000);
+    let exe = "/usr/local/bin/northnarrow-agent";
+    let deny = (0x0080_0001, 77);
+    let events = round_events_for_tests(nonce, agent, exe, child, ts, deny);
+    let probe = TelemetryProbe::for_tests(Duration::from_secs(60));
+    probe.open_round_for_tests(
+        nonce,
+        agent,
+        exe,
+        Window {
+            pid: child,
+            from_ns: 1_000_000,
+            until_ns: 2_000_000,
+        },
+        Some(deny),
+    );
+    let posture = crate::posture::PostureMachine::new();
+    let mut recent: Vec<Event> = Vec::new();
+    let mut judged = Vec::new();
+    for (_, e) in &events {
+        // the decision thread's `judge`: the tap first
+        if probe.observe(e) {
+            continue;
+        }
+        judged.push(e.clone());
+        assert_eq!(host.decide(e), Value::Null, "a rule on a self-test event");
+        assert!(posture.observe(e, &recent).is_none());
+        recent.push(e.clone());
+    }
+    assert!(judged.is_empty(), "self-test events judged: {judged:#?}");
+    assert_eq!(posture.current_kind(), PostureKind::Observing);
+    // without the tap: the posture moves
+    let bare = crate::posture::PostureMachine::new();
+    let mut recent: Vec<Event> = Vec::new();
+    let mut moved = Vec::new();
+    for (_, e) in &events {
+        if bare.observe(e, &recent).is_some() {
+            moved.push(format!("{e:?}"));
+        }
+        recent.push(e.clone());
+    }
+    assert!(
+        !moved.is_empty(),
+        "the self-test's events judged move nothing: the take would guard nothing"
+    );
+    assert_ne!(bare.current_kind(), PostureKind::Observing);
 }
 
 /// Review #471 A1, R12b (R-F of its second review): each event is judged

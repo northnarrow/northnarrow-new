@@ -2332,6 +2332,8 @@ pub async fn drain_loop(
     watched_paths: Option<std::sync::Arc<parking_lot::Mutex<WatchedPathsHandle>>>,
     lineage: AuthSessionTracker,
     event_tx: crate::sensors::bus::BusSender,
+    // Lot 280c: the sensor self-test's child — its record is no drift
+    self_test: Option<crate::telemetry_probe::SelfTestTag>,
 ) -> std::io::Result<()> {
     let mut async_fd = crate::async_fd::register(rb)?;
     info!(
@@ -2463,7 +2465,17 @@ pub async fn drain_loop(
             // hash the file, which can take milliseconds). Owning
             // `raw` by value already disconnected from the borrow.
             let _ = item; // keep clippy happy + readable
-            if let Err(e) = check(&raw, &mut outbox) {
+
+            // Lot 280c: the sensor self-test's create in the probe
+            // directory — the event its tap takes, and nothing else: no
+            // baseline, hash, enrollment, rule or signed drift row (the
+            // export never carries it).
+            if self_test
+                .as_ref()
+                .is_some_and(|t| t.skip(raw.modifier_pid, raw.timestamp_ns))
+            {
+                outbox.push(self_test_event(&raw, &inode_map));
+            } else if let Err(e) = check(&raw, &mut outbox) {
                 warn!(
                     target: "fim.drain",
                     error = %format!("{e:#}"),
@@ -2492,6 +2504,42 @@ pub async fn drain_loop(
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
+}
+
+/// Lot 280c: the sensor self-test's FIM record as the event its tap takes
+/// — the watched directory's path and the child's name, its op and its
+/// modifier; nothing read from the file.
+fn self_test_event(raw: &FimDriftRaw, inode_map: &InodePathMap) -> Event {
+    let dir = inode_map
+        .lookup(&InodeKey {
+            dev: raw.target_dev,
+            ino: raw.target_ino,
+        })
+        .unwrap_or_default();
+    let path = reconstruct_child_path(&format!("{dir}/"), raw).unwrap_or(dir);
+    Event::Fim(FimEvent {
+        timestamp_ns: raw.timestamp_ns,
+        path,
+        op: FimOp::try_from(raw.op).unwrap_or(FimOp::Modified),
+        new_sha256: None,
+        baseline_sha256: None,
+        new_size: None,
+        baseline_size: None,
+        modifier_exe: None,
+        modifier_pid: raw.modifier_pid,
+        modifier_uid: raw.modifier_uid,
+        modifier_comm: comm_to_string(&raw.modifier_comm),
+        dest_path: None,
+        child_truncated: false,
+        wide_coverage: false,
+        owner_uid: None,
+        reader_dac_capable: false,
+        capability: None,
+        attrs: None,
+        file_key: None,
+        is_dir: false,
+        moved_in: false,
+    })
 }
 
 /// Records read per drain turn at most before the loop yields.
@@ -2901,6 +2949,29 @@ mod tests {
         };
         assert!(ev.child_truncated, "truncated leaf must flag the event");
         assert!(ev.path.starts_with(&format!("{dir_str}/")));
+    }
+
+    /// Lot 280c: the sensor self-test's create in the probe directory is
+    /// the event its tap takes — the directory's path and the child's
+    /// name, its op and its modifier; nothing of a drift (no hash, no
+    /// baseline).
+    #[test]
+    fn the_self_test_s_record_is_its_event_and_no_drift() {
+        let map = InodePathMap::new();
+        let key = InodeKey { dev: 0x77, ino: 7 };
+        map.insert_as(key, "/run/northnarrow/probe".into(), WatchClass::Configured);
+        let mut raw = raw_with_leaf(b"0123456789abcdef.fim");
+        raw.modifier_pid = 4242;
+        raw.timestamp_ns = 99;
+        match self_test_event(&raw, &map) {
+            Event::Fim(f) => {
+                assert_eq!(f.path, "/run/northnarrow/probe/0123456789abcdef.fim");
+                assert_eq!(f.op, FimOp::Created);
+                assert_eq!((f.modifier_pid, f.timestamp_ns), (4242, 99));
+                assert!(f.new_sha256.is_none() && f.baseline_sha256.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     fn raw_with_leaf(leaf: &[u8]) -> FimDriftRaw {

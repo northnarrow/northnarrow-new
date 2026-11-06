@@ -35,6 +35,8 @@ pub(crate) fn start(
         parking_lot::Mutex<northnarrow_agent::decision::correlation::CorrelationStore>,
     >,
     signing_key: &northnarrow_agent::keys::KeyStore,
+    // Lot 280c: the sensor self-test's child, whose rows are not written
+    self_test: Option<northnarrow_agent::telemetry_probe::SelfTestTag>,
 ) {
     // ── Tappa 10 N9 — net drain subsystem boot ─────────────────────
     //
@@ -74,7 +76,12 @@ pub(crate) fn start(
                 netflow_rotation,
             )
         }) {
-            Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
+            Ok(mut db) => {
+                if let Some(tag) = &self_test {
+                    db.set_self_test(tag.clone());
+                }
+                Some(Arc::new(parking_lot::Mutex::new(db)))
+            }
             Err(e) => {
                 // Lab PR 218 (external review P0 C-14): the drain no longer
                 // stays off for the whole boot (TCP, UDP and listeners
@@ -102,6 +109,9 @@ pub(crate) fn start(
             .and_then(|key| NetListenerDb::open(&cli.netflow_listeners_file, key, agent_id))
         {
             Ok(mut db) => {
+                if let Some(tag) = &self_test {
+                    db.set_self_test(tag.clone());
+                }
                 if let (Some(r), Some(log)) = (db.take_tail_repair(), audit_log.as_ref()) {
                     if let Err(e) = log
                         .lock()

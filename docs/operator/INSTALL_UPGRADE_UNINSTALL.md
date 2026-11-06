@@ -629,25 +629,34 @@ the deny in a test build (lab checks of the deny path; the privileged e2e
 health: if it does not attach the agent refuses to start like for any
 other deny hook (`NN_ANTI_TAMPER_ALLOW_DEGRADED=1` to override).
 
-### 3.4 The agent proves its own coverage (`telemetry probe`)
+### 3.4 The agent proves its own coverage (the sensor self-test)
 
 A sensor that stops delivering is worse than one that was never there:
 the host looks quiet. Every 60 s the agent runs a child of its own binary
-(`northnarrow-agent --telemetry-probe <nonce>`, hidden flag) that produces
-one known, harmless event per probed sensor — the exec itself, a read of
-`/run/northnarrow/probe/<nonce>` and a DNS datagram naming
-`<nonce>.probe.northnarrow.invalid` sent from and to loopback
-(`127.0.0.1:53`; the sensor hooks the send, no resolver needed) — and
-checks that each one reaches its own pipeline within 5 s. The nonce is
-random, and the datagram is flagged as a DNS *response* (`QR` set, no
-recursion asked): a resolver listening on `127.0.0.1:53` drops it instead
-of answering or forwarding it upstream (external audit EVD-015). A silent sensor is a **telemetry gap**:
-`ERROR TELEMETRY GAP` in the journal and a signed audit entry
-(`op=telemetry_gap`, sensor and nonce in `extra`), once per gap, with
-`op=telemetry_restored` when the sensor delivers again. None of the three
-events trips a rule (root-owned binary from its install path, a dedicated
-probe directory, a reserved `.invalid` name). `NN_TELEMETRY_PROBE_SECS`
-in the unit environment changes the period; `0` disables the probe.
+(`northnarrow-agent --telemetry-probe <nonce>`, hidden flag) that makes one
+known, harmless event for each source of the sensor contract (lot 280c) —
+its own exec, a read of `/run/northnarrow/probe/<nonce>`, a DNS datagram
+naming `<nonce>.probe.northnarrow.invalid` sent from and to loopback
+(`127.0.0.1:53`; the sensor hooks the send, no resolver needed), a listen,
+connect, accept and TLS ClientHello on a loopback port, an io_uring and a
+BPF map made and closed, a file created in the probe directory, and a
+signal to the agent and a file created in `/etc/northnarrow` that the deny
+hooks must refuse — and checks that each one reaches its own pipeline
+within 5 s; three sources (module loads, the exploit guard, the DNS
+responses) have their attach checked instead. The nonce is random, and the
+datagram is flagged as a DNS *response* (`QR` set, no recursion asked): a
+resolver listening on `127.0.0.1:53` drops it instead of answering or
+forwarding it upstream (external audit EVD-015). A source missed is a
+signed degradation at once (`subsystem_degraded`, source
+`sensor_selftest`, the sensor and the step named; `nn-admin status --key`
+lists it), missed in two rounds in a row an **alert** (`ERROR SENSOR
+SELF-TEST ALERT` in the journal, `op=sensor_selftest_alert`), and
+`op=sensor_selftest_restored` when it delivers again — they replace the
+`telemetry_gap` and `telemetry_restored` rows of earlier versions. The
+child's events are taken before the rules, the posture and the signed logs:
+none trips a rule or reaches the export (`SENSOR_CONTRACT.md` §5a).
+`NN_TELEMETRY_PROBE_SECS` in the unit environment changes the period; `0`
+disables the self-test.
 
 At boot the agent also proves its deny hooks run (lab PR 218): right
 after they attach, a child of its binary (`--deny-self-test`, hidden flag)

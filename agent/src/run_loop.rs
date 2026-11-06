@@ -253,10 +253,17 @@ fn decision_loop(
     } = p.combat;
     // One event judged: offered to the telemetry probe (Tappa 10.8: every
     // event before the decision engine; R11c, lab PR 264: the probe the late
-    // binding started), then `process_event`.
+    // binding started), then `process_event`. Lot 280c: an event of the
+    // sensor self-test is taken there — never the rules, the posture or the
+    // detection store.
     let judge = |e: nn_model::Event| {
         if let Some(probe) = p.telemetry_probe {
-            probe.observe(&e);
+            if probe.observe(&e) {
+                // the probe child's exec, judged by being taken: a hold of
+                // the exec quarantine (opt-in) released at once
+                drop(northnarrow_agent::execq::SpawnGuard::for_event(&e));
+                return;
+            }
         }
         process_event(
             p.engine,

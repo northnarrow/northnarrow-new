@@ -213,6 +213,8 @@ pub fn run_ring(
 ) -> io::Result<()> {
     let mut reject = RejectThrottle::new();
     let mut batch: Vec<nn_model::Event> = Vec::with_capacity(BATCH_MAX + 4);
+    #[cfg(feature = "debug-trigger")]
+    let mut drop_trigger = DropTrigger::default();
     loop {
         if stop.load(Ordering::Acquire) {
             return Ok(());
@@ -230,6 +232,10 @@ pub fn run_ring(
                 break;
             }
             read += 1;
+            #[cfg(feature = "debug-trigger")]
+            if drop_trigger.on(label) {
+                batch.clear();
+            }
             if let Some(len) = bad {
                 reject.record(label, record_size, len);
                 rejected = true;
@@ -251,6 +257,54 @@ pub fn run_ring(
     }
 }
 
+/// Lot 280c: the `debug-trigger` builds' blinding of one source for the
+/// lab — while this file names a ring pump's label (whitespace between
+/// several), that pump reads its ring and drops every event it decodes, as
+/// a ring no longer delivered: the sensor self-test must miss it (a signed
+/// degradation), then raise the alert at the second round. The pumps that
+/// read their ring through [`run_ring`]: `process_spawn`, `file_open`,
+/// `exec_check`, `fs_protect`, `module_load`, `io_uring`, `bpf_syscall`
+/// and the exploit guard's (the connect, DNS and file-open sensors and the
+/// drains read theirs in loops of their own).
+pub const DEBUG_RING_DROP: &str = "/run/northnarrow/debug-ring-drop";
+
+/// Whether the trigger file's text `names` names `label`.
+pub fn drops(label: &str, names: &str) -> bool {
+    names.split_whitespace().any(|n| n == label)
+}
+
+/// The trigger file, read at most every 500 ms by a pump.
+#[cfg(feature = "debug-trigger")]
+#[derive(Default)]
+struct DropTrigger {
+    read_at: Option<std::time::Instant>,
+    on: bool,
+}
+
+#[cfg(feature = "debug-trigger")]
+impl DropTrigger {
+    fn on(&mut self, label: &str) -> bool {
+        let now = std::time::Instant::now();
+        if self
+            .read_at
+            .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_millis(500))
+        {
+            self.read_at = Some(now);
+            let was = self.on;
+            self.on = std::fs::read_to_string(DEBUG_RING_DROP).is_ok_and(|t| drops(label, &t));
+            if self.on != was {
+                tracing::warn!(
+                    pump = label,
+                    dropping = self.on,
+                    "debug-trigger: this pump drops the events it decodes (lab test of the sensor \
+                     self-test, lot 280c)"
+                );
+            }
+        }
+        self.on
+    }
+}
+
 /// Send the batch and empty it.
 fn send(
     tx: &BusSender,
@@ -266,6 +320,7 @@ pub const STOP_WITHIN: Duration = Duration::from_millis(POLL_MS as u64 * 2);
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::sensors::bus::channel;
     use nn_model::Event;
     use std::collections::VecDeque;
@@ -583,5 +638,17 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Lot 280c: the debug-trigger's ring drop names a pump's label
+    /// exactly (whitespace between several): `tcp_connect` blinds that pump
+    /// only, not `tcp_connect_x` or the empty file.
+    #[test]
+    fn the_ring_drop_trigger_names_a_pump_exactly() {
+        assert!(drops("tcp_connect", "tcp_connect\n"));
+        assert!(drops("dns", "exec  dns"));
+        assert!(!drops("tcp_connect", "tcp_connect_x"));
+        assert!(!drops("tcp", "tcp_connect"));
+        assert!(!drops("tcp_connect", ""));
     }
 }

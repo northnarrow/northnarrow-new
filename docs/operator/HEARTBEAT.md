@@ -34,7 +34,7 @@ carries:
 | `decision_rounds`, `decision_since_last_ms` | the decision thread's progress: a count that stands still is a decision that does |
 | `loss` | the events lost at each stage of their path since the run started — stages 1 to 8: the kernel's ring, the kernel's budget, the decoder, the bus's queues, the decision's delay, the response queue, the evidence writers, and (lot 276) the export's rows it can no longer deliver (`null` without an export configured; seven entries from an older agent) ([the event bus, §5](https://github.com/northnarrow/northnarrow-new/blob/main/docs/architecture/EVENT_BUS.md), [`EXPORT.md`](EXPORT.md)) |
 | `actions` | the actions chain's intents and outcomes, rows it could not take, intents of an earlier run found interrupted, actions in flight (`EVIDENCE_CHAINS.md`, the actions chain) |
-| `probe_gaps` | the telemetry probe's gaps since the run started (`null`: the probe is off) |
+| `probe_gaps` | the sensor self-test's missed rounds since the run started, every source counted (lot 280c; `null`: the self-test is off) |
 | `nodns` | lot 275 (the second review of #495, R2): NN-L-NET-028's judgements this run — `lineage`, `other_lineage`, `unresolved`, the `unknown` ones by reason (`degraded`: the DNS evidence lost for every process; `held`, `unseen`, `start`, `barrier`, `sensor`, `older`) and `coverage_lost`, its `nodns_coverage_lost` rows queued to be signed (at most one a cause every 5 minutes; kept queued until the audit log is bound, an `append` that fails logged as a warning — the final check of #495, N4); absent from an agent older than lot 275 (`NETWORK_TELEMETRY.md` §4) |
 | `capabilities` | R13 (lab PR 271): the capability manifest's newest view — its capabilities `hash`, the last `revision` signed (0: the boot's), `settled` (the telemetry probe's first round has ended) and `contract` (the hash of the sensor contract's terms, the agent's version and the kernel's release), with `contract_version` and `kernel` (the versions the verifier checks do not go backwards); absent from an agent older than R13 (`SENSOR_CONTRACT.md` §4, §5) |
 | `export` | lot 276: the export's state (`on`, `off`, `refused`, `failed` — its configuration, or its controller not running —, `degraded` — on, its worker disabled, unavailable or away past 30 s), its worker's health, and each sink's (`up`, `connecting`, `down`, `failed`), the rows it delivered and how far it is behind (bytes); absent without an export configured — `heartbeat watch` says `DEGRADED` when the export is not `on` or a sink `failed` ([`EXPORT.md`](EXPORT.md) §4) |
@@ -205,14 +205,16 @@ TPM quote of the measured boot and the agent (the Keylime model; report
 06, R2-12/R2-13) — and an anchor of the chains' heads off the host on every
 beat (R15's export). The self-test that pushes a synthetic event through
 the sensors, the bus, the rules and a dry response into a signed row is not
-in the beat yet (the telemetry probe's gaps are); it is open.
+in the beat yet (the sensor self-test's missed rounds are: each source's own
+event every round, lot 280c, which stops at the decision's tap); it is
+open.
 
 **The capability manifest's hash is the agent's own word** (R13): it
 changes when the agent sees a change — a hook not attached, a fallback, the
-telemetry probe's event not arriving or its rounds stopping. The probe
-finds a sensor blinded naively or by accident; a root on the host that
-recognises the probe's child (the agent's own binary, `--telemetry-probe`)
-and serves it, or that blinds a source the probe does not exercise while
-leaving its attach in place, changes nothing the beats carry
-(`SENSOR_CONTRACT.md` §5a, with the worst-case delays: about 82 s to the
-signed row, about 2.4 minutes to `DEGRADED` for a probed source).
+sensor self-test's event not arriving or its rounds stopping. The
+self-test finds a sensor blinded naively or by accident; a root on the host
+that recognises its child (the agent's own binary, `--telemetry-probe`) and
+serves it, or that blinds one of the three sources with an attach check
+only while leaving its attach in place, changes nothing the beats carry
+(`SENSOR_CONTRACT.md` §5a, with the worst-case delays: about 77 s to the
+signed degradation, about 2.4 minutes to `DEGRADED`).

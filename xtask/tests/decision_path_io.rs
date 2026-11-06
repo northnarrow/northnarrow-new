@@ -187,10 +187,16 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/telemetry_probe.rs",
-        14,
+        // lot 280c: 14 → 24, the sensor self-test — the round's FIM and deny
+        // files, the child reaped (its wait's sleep, off the runtime), the
+        // attach checks' reads (`bpf-own-ids`, `/proc/modules`), and the
+        // child's own steps (`run_child`: a process of its own)
+        24,
         "the probe's own task (its marker files, sleeps, child processes; R13, lab PR 271: in \
-         debug-trigger builds the lab's `debug-probe-blind` file, read once a round); `observe` \
-         matches an event in memory",
+         debug-trigger builds the lab's `debug-probe-blind` file, read once a round; lot 280c: \
+         the attach checks' reads, the child's reap off the runtime) and the probe child's steps \
+         (`run_child`, another process); `observe` matches an event in memory and counts a \
+         module load",
     ),
     (
         "crates/nn-core/src/canary/detector.rs",

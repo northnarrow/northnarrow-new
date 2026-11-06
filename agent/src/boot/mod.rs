@@ -507,7 +507,13 @@ async fn run(
         paths_summary,
         &state_protection,
         &signing_key,
+        telemetry_probe.as_ref().map(|p| p.tag()),
     );
+    // Lot 280c: the sensor self-test's FIM step creates its file in the
+    // probe directory, watched through the FIM's own watch.
+    if let (Some(probe), Some(fim)) = (&telemetry_probe, &fim_admin_state) {
+        probe.watch_fim(fim.watch.clone());
+    }
     let canary::Canary {
         canary_admin_state,
         canary_detector,
@@ -528,6 +534,7 @@ async fn run(
         netflow_blocklist,
         chain_store,
         &signing_key,
+        telemetry_probe.as_ref().map(|p| p.tag()),
     );
     // R12c (lab PR 270): the response dispatcher — the decisions'
     // responses run on its thread, each with its signed intent and outcome.
