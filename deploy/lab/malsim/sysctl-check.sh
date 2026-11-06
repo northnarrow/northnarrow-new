@@ -50,7 +50,11 @@ lines() { sudo sh -c 'wc -l < "$1"' _ "$1" 2>/dev/null || echo 0; }
 since() { sudo tail -n +"$(( $2 + 1 ))" "$1" 2>/dev/null; }
 ops() { since "$DET" "$1" | grep -o '"operation":"[a-z_]*"' | sort | uniq -c | tr -s ' ' | tr '\n' ';'; }
 judge_ids() { sudo bpftool cgroup show "$CG" 2>/dev/null | awk '/nn_sysctl_guard/ {print $1}' | tr '\n' ' '; }
-window() { sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs "${1:-60}" >/dev/null 2>&1; }
+WIN_END=0
+window() { WIN_END=$(( $(date +%s) + ${1:-60} )); sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs "${1:-60}" >/dev/null 2>&1; }
+# a case judged outside a window waits for the last one granted here to end
+# (a restart ends one: the new agent boot-zeroes its grant)
+no_window() { while (( $(date +%s) <= WIN_END + 2 )); do sleep 1; done; }
 restart_agent() {
     local old new i
     window 300 || { bad "trusted-installer-grant"; return 1; }
@@ -59,9 +63,9 @@ restart_agent() {
     for i in $(seq 1 60); do
         sleep 1
         new=$(sudo cat /run/northnarrow/agent.pid 2>/dev/null)
-        [[ -n $new && $new != "$old" ]] && sudo kill -0 "$new" 2>/dev/null && { sleep 8; return 0; }
+        [[ -n $new && $new != "$old" ]] && sudo kill -0 "$new" 2>/dev/null && { sleep 8; WIN_END=0; return 0; }
     done
-    sudo systemctl start northnarrow-agent; sleep 8
+    sudo systemctl start northnarrow-agent; sleep 8; WIN_END=0
 }
 race() { # <path> <good> <bad> <bad as the kernel prints it> <tries>
     sudo python3 -I - "$@" <<'PY'
@@ -172,11 +176,13 @@ r=$(sudo sysctl -w kernel.sched_rt_runtime_us=-1 2>&1); now=$(cat "$RT")
 echo "    invalid signature: unauthorized_overlay rows $drift; put back to $after; a new -1: [$r] now $now"
 [[ $drift -ge 1 && $after != -1 && $r == *"not permitted"* && $now != -1 ]] \
     && pass "S4c invalid signature: the opt-out not honoured — -1 put back ($after) and refused" || bad "S4c drift=$drift after=$after [$r] now $now"
-window 120 && sudo rm -f /etc/northnarrow/rule-policy.local /etc/northnarrow/rule-policy.local.sig
+window 15 && sudo rm -f /etc/northnarrow/rule-policy.local /etc/northnarrow/rule-policy.local.sig
 rm -f /tmp/k280a-rp.local
-[[ $(cat "$RT") == "$RT0" ]] || { window 60; echo "$RT0" | sudo tee "$RT" >/dev/null; }
+[[ $(cat "$RT") == "$RT0" ]] || { window 15; echo "$RT0" | sudo tee "$RT" >/dev/null; }
+no_window
 
 echo "== S5. a program in a child cgroup"
+no_window
 P=/usr/local/libexec/nn280a-sysctl-child-probe
 cc -O2 -o /tmp/nn280a-probe "$ROOT/deploy/lab/adversarial/sysctl-child-probe.c" && sudo install -m 0755 /tmp/nn280a-probe "$P"; rm -f /tmp/nn280a-probe
 if [[ -x $P ]]; then
@@ -191,6 +197,7 @@ if [[ -x $P ]]; then
         [[ $c == *"errno=EPERM; now $PM0;"* ]] && pass "S5 child program ($mode): the rewritten 4096 refused on the kernel's copy" || bad "S5 $mode: $c"
     done
     sudo rmdir "$CG/nn280a-probe"; sudo rm -f "$P"
+    [[ $(cat "$PM") == "$PM0" ]] || echo "$PM0" | sudo tee "$PM" >/dev/null
 else bad "S5 the probe was not built"; fi
 
 echo "== S6/S7. the cost; the restart swaps the pinned judge"
@@ -205,6 +212,9 @@ for _ in range(n):
     if w: os.pwrite(fd, v, 0)
     else: os.pread(fd, 32, 0)
 print((time.perf_counter_ns() - t) // n)' "$PM" "${1:-20000}" "${2:-w}"; }
+no_window
+ID1=$(judge_ids)
+echo "    pid_max $(cat "$PM") (written back as it is: judged, harmless), no window; judge [$ID1]"
 sudo sysctl -q kernel.bpf_stats_enabled=1
 read -r c0 t0 < <(prog_stat); bench 20000 w >/dev/null; read -r c1 t1 < <(prog_stat)
 w_calls=$((c1 - c0)); w_ns=$(( w_calls > 0 ? (t1 - t0) / w_calls : 0 ))
