@@ -3093,15 +3093,23 @@ if selected C57b && cp -p "$DETS" "$SCRATCH/detections.jsonl"; then
 fi
 # C58: a renamed module tool. R011 matches the comm (insmod, modprobe,
 # kmod); a copy of the tool under another name, run as `modprobe` through
-# argv[0], is not R011's. The load itself is R018's (kernel_read_file),
-# whatever the loader calls itself: expect R018, allowed (an alert).
+# argv[0], is not R011's. Lot 285: the load is judged in the kernel by the
+# FILE, whatever the loader calls itself — the module tree's own dummy is
+# trusted and loads (no record expected); C58b: the same loader given a
+# copy of it in a scratch directory is refused (deny mode, R018).
 ko=$(modinfo -n dummy 2>/dev/null)
 if selected C58 && [[ -n "$ko" && "$ko" != "(builtin)" ]] && command -v modprobe >/dev/null; then
     MODLD=/usr/local/libexec/nn-lab/nn-modld
     if mkdir -p "$(dirname "$MODLD")" && cp "$(readlink -f "$(command -v modprobe)")" "$MODLD"; then
         rmmod dummy 2>/dev/null
-        run_case C58 "a renamed module tool loads dummy (comm nn-modld)" allowed "R018_KernelModuleLoad" 0 -- bash -c "exec -a modprobe $MODLD dummy"
+        run_case C58 "a renamed module tool loads dummy (comm nn-modld)" allowed "" 0 -- bash -c "exec -a modprobe $MODLD dummy"
         rmmod dummy 2>/dev/null
+        KOCOPY="$SCRATCH/$(basename "$ko")"
+        if selected C58b && cp "$ko" "$KOCOPY"; then
+            run_case C58b "a copy of dummy outside the module tree (insmod)" denied "R018_KernelModuleLoad" 0 -- bash -c "exec -a insmod $MODLD $KOCOPY"
+            rmmod dummy 2>/dev/null
+            rm -f "$KOCOPY"
+        fi
     fi
     rm -f "$MODLD"
 fi

@@ -1640,6 +1640,8 @@ mod tests {
             parent_is_kthread: false,
             path: None,
             timestamp_ns: 0,
+            verdict: Default::default(),
+            file: None,
         };
         assert_eq!(class_of(&module), EventClass::Tamper);
         assert_eq!(when_full(&module), WhenFull::Backpressure);

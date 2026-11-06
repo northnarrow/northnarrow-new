@@ -413,6 +413,42 @@ const STATICS: &[Kept] = &[
         "lot 280b: the id of the judge's program this boot linked to the root cgroup (the one eBPF object's), read by the kernel-state round to tell the root's other programs from it",
     ),
     kept(
+        "crates/nn-linux/src/module_writes.rs",
+        "PLAN",
+        Kernel,
+        "lot 285: what this start does with the module files' write history's pins (the registered history adopted, or a new one), decided before the one eBPF object's load and read by its after-load step and its attach",
+    ),
+    kept(
+        "crates/nn-linux/src/module_writes.rs",
+        "LOADED",
+        Kernel,
+        "lot 285: the ids of the write history's new maps the one eBPF object's load made and pinned, registered by the attach in the boot's state",
+    ),
+    kept(
+        "crates/nn-linux/src/module_writes.rs",
+        "LOAD_OUTCOME",
+        Kernel,
+        "lot 285: whether the one eBPF object's load took the registered history's maps (or pinned new ones), read by its attach to sign a history that is not kept",
+    ),
+    kept(
+        "crates/nn-linux/src/module_writes.rs",
+        "HISTORY",
+        Kernel,
+        "lot 285: from when the one eBPF object's write history covers every write, set by its attach and read by the module-load judge's controller thread",
+    ),
+    kept(
+        "agent/src/module_trust/mod.rs",
+        "DESIRED",
+        Kernel,
+        "lot 285: the module-load judge's mode and signed opt-outs for the one eBPF object's trust map, written at the start and by `policy set`, read by its controller thread",
+    ),
+    kept(
+        "agent/src/module_trust/mod.rs",
+        "STATE",
+        Kernel,
+        "lot 285: the module-load judge's controller's last report on the one eBPF object's trust map (the journal and the status read it)",
+    ),
+    kept(
         "crates/nn-linux/src/sysctl_cgroup.rs",
         "OPT_OUTS",
         Kernel,
@@ -628,6 +664,11 @@ const START_CALLS: &[(&str, &str)] = &[
     (
         "execq::shutdown",
         "stops the exec quarantine's controller thread",
+    ),
+    (
+        "module_trust::apply_policy",
+        "the rule policy's mode for R018 and its signed module-allow lines, for the module-load \
+         judge of the one eBPF object (as sysctl_cgroup::apply_policy for its opt-outs)",
     ),
     (
         "execpol::start",

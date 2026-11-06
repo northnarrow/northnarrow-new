@@ -534,6 +534,9 @@ fn attach_reporting(
     }
     observe_failures.extend(fs.observe_failures);
     deny_expected += fs.optional_present;
+    if let Some(note) = fs.module_history_note {
+        report.degraded.push(format!("module-load judge: {note}"));
+    }
 
     // Lot 273: the cgroup move guard — an optional deny pair, expected
     // where the kernel's BTF has its attach point in the shape it reads; a
@@ -695,6 +698,37 @@ fn attach_reporting(
              and every exemption by executable, cgroup or unit is refused this boot"
                 .to_string(),
         );
+    }
+    // Lot 285: the module files' write history's pin directory (beside the
+    // root), its pins and its state alike. Not protected: the next start
+    // adopts nothing (its state removed) — a reset, never a planted
+    // history.
+    if let Some(root) = pin_root {
+        let dir = crate::module_writes::pin_dir(root);
+        if dir.is_dir() {
+            let state = std::path::Path::new(crate::module_writes::STATE_PATH);
+            let protected = filesystem::register_bpffs_pins(ebpf, &dir)
+                .map_err(|e| format!("{e:#}"))
+                .and_then(|_| {
+                    if state.exists() {
+                        filesystem::register_agent_file(ebpf, state).map_err(|e| format!("{e:#}"))
+                    } else {
+                        Ok(())
+                    }
+                });
+            if let Err(e) = protected {
+                crate::module_writes::forget_state();
+                warn!(
+                    error = %e,
+                    "anti-tamper FS: the module write history's pins or state NOT protected — the \
+                     next start resets the history"
+                );
+                report.degraded.push(format!(
+                    "module-load judge: the module files' write history's pins or state are not \
+                     protected ({e}) — the next start resets it"
+                ));
+            }
+        }
     }
     // Lot 280a: the judge's pin directory (beside the root) and its pins
     // alike — no unlink or rename by a foreign caller outside a window.
@@ -1706,7 +1740,11 @@ mod tests {
                 |_| in_kernel,
                 "preparing /var/lib/northnarrow: a symbolic link".to_string(),
             );
-            assert_eq!(fs.observe_failures.len(), 2, "the module-load observers");
+            assert_eq!(
+                fs.observe_failures.len(),
+                3,
+                "the module-load hooks and the module files' write history (lot 285)"
+            );
             let mut deny = DenyHealth::default();
             for (p, w) in fs.deny_failures {
                 deny.missing_hook(p, w);

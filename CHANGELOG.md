@@ -6,6 +6,53 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Kernel module loads judged in the kernel, by the file (lot 285;
+  `docs/operator/RULE_POLICY.md` §2.4). The `kernel_read_file`
+  (`READING_MODULE`) and `kernel_load_data` (`LOADING_MODULE`) hooks refuse
+  (`EPERM`), outside a signed trusted-installer window, a `finit_module` of
+  a file the agent does not vouch for and every `init_module` buffer: the
+  agent vouches for the module files of the running kernel's tree (walked
+  from `/lib/modules/$(uname -r)`, the kernel's inode) owned by root and
+  writable by no one else, unchanged since boot and a verified package's
+  (digest compared) or DKMS's build, or written since boot inside a package
+  transaction (a new `file_open` program keeps their write history in the
+  kernel, the writer's package-manager lineage read there), or named by a
+  signed `module-allow <module>` line (new rule-policy directive). The
+  policy's mode of R018 sets the kernel's: none or `enforce` refuses,
+  `alert`/`audit`/`off` records. `ModuleLoadRaw` carries the kernel's
+  verdict and the file's identity (632 bytes, was 584). GPU and DKMS hosts
+  (the coordinator's matrix): a DKMS build is DKMS's when its content is,
+  byte for byte, the build DKMS registered for the running kernel; one in
+  `updates/dkms/` or `extra/` (or an akmods `kmod-*` package's file there)
+  written since boot outside a recognised package transaction is let
+  through and recorded High (verdict `dkms-unattested`) unless the policy
+  enforces R018; a file there nothing vouches for is refused. dnf's and
+  yum's Python scripts count as package managers by the file their exec
+  named (a new map, `MODULE_PKG_SCRIPTS`, noted at `sched_process_exec`);
+  `dnf5` joins the judge's package managers. The write history and the
+  scripts' map are pinned with their observer beside the pin root
+  (`/sys/fs/bpf/northnarrow-module-writes`) and adopted by the next start
+  of the boot (an agent restart, an upgrade): a package of modules
+  installed this boot stays trusted; a file changed since boot that the
+  history does not cover is let through and recorded High when a package or
+  DKMS vouches for it.
+- NN-L-FIM-026 (lot 285): a write in kmod's configuration directories
+  (`/etc`, `/run`, `/usr/local/lib`, `/lib`, `/usr/lib` `modprobe.d`) is a
+  High record outside a package transaction, Low inside one; the four
+  directories other than `/etc/modprobe.d` join the FIM watch list.
+- R011 records the children of the module tool (lot 285, Medium): the
+  command of a `modprobe.d` `install`/`remove` directive, but not the
+  hardening guides' `install <module> /bin/true`.
+
+### Changed
+- R018 (lot 285) records what the kernel refused or let through (High; the
+  loader's tree still killed for a file outside `/lib/modules`; a window's
+  or an opt-out's load Medium) and judges by the path only a load the
+  kernel did not judge. Its loader allowlist by `comm` (`kmod`,
+  `systemd-udevd`, `systemd-modules-load`) is removed, and so is the
+  kernel-thread exemption: the kernel judges the file, not the caller.
+  Lab case C58 (a renamed module tool) now loads the tree's module with no
+  record; C58b, its copy outside the tree, is refused.
 - An exemption is revoked when code is injected into the exempt process
   (lot 281; `docs/operator/RULE_POLICY.md` §2.3). Two BPF LSM programs of
   the start-in-cgroup tracker (`ptrace_access_check`, `ptrace_traceme`,

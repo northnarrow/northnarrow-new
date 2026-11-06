@@ -331,7 +331,7 @@
       "techniqueID": "T1543.002"
     },
     {
-      "comment": "R011_KernelModuleTooling, R018_KernelModuleLoad, NN-L-FIM-008_KernelModuleModified",
+      "comment": "R011_KernelModuleTooling, R018_KernelModuleLoad, NN-L-FIM-008_KernelModuleModified, NN-L-FIM-026_ModprobeConfigWritten",
       "enabled": true,
       "metadata": [
         {
@@ -345,9 +345,13 @@
         {
           "name": "rule",
           "value": "NN-L-FIM-008_KernelModuleModified (unit)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-FIM-026_ModprobeConfigWritten (unit)"
         }
       ],
-      "score": 3,
+      "score": 4,
       "showSubtechniques": false,
       "tactic": "persistence",
       "techniqueID": "T1547.006"

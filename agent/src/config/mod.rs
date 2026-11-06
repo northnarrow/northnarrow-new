@@ -197,7 +197,7 @@ mod tests {
         let pins = [
             (
                 "fim-paths.v1",
-                "44a5f17e037148eb31a8798d7c0918e31d4657ba2ca7003b696a775741326508",
+                "c1ad6a6ec9b5cc80775d4c7ff5dc2031d67187283cbb966e69e53889b532861f",
             ),
             (
                 "netflow-blocklist.v1",

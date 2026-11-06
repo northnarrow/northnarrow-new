@@ -381,7 +381,12 @@ fn try_sched_process_exec<const STDIO: bool>(ctx: &TracePointContext) -> Result<
                     v as *const aya_ebpf::cty::c_void,
                 );
             }
+            // Lot 285: a package manager's `#!` script (dnf, yum) noted for
+            // the module write history's lineage (read before the entry
+            // goes). A global function.
+            let (dev, ino) = unsafe { ((*v).dev, (*v).ino) };
             let _ = crate::exec_lsm::EXEC_HANDOFF.remove(&key);
+            let _ = crate::module_load::nn_module_note_exec(task as u64, dev, ino);
         }
     }
 

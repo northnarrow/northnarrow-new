@@ -106,12 +106,102 @@ use crate::posture::host::PostureHost;
 
 pub struct R011KernelModuleTooling<H: PostureHost> {
     allowlist: Arc<CommAllowlist<H>>,
+    /// Lot 285: the lineage that names a child's parent by what the kernel
+    /// executed (production); without it, by the parent's `comm`.
+    lineage: Option<crate::posture::lineage::AuthSessionTracker<H>>,
 }
 
 impl<H: PostureHost> R011KernelModuleTooling<H> {
     pub fn new(allowlist: Arc<CommAllowlist<H>>) -> Self {
-        Self { allowlist }
+        Self {
+            allowlist,
+            lineage: None,
+        }
     }
+
+    /// Lot 285: with the lineage the parent of a child of the module tool
+    /// is read from.
+    pub fn with_lineage(
+        mut self,
+        lineage: Option<crate::posture::lineage::AuthSessionTracker<H>>,
+    ) -> Self {
+        self.lineage = lineage;
+        self
+    }
+
+    /// Lot 285: an exec whose parent is the module tool — the command of a
+    /// `modprobe.d` `install` or `remove` directive (kmod runs it through
+    /// `/bin/sh -c`), or anything the tool was made to run. Recorded
+    /// (Medium): a directive is root's configuration, and the
+    /// configuration's own writes are NN-L-FIM-026's.
+    fn child_of_the_tool(&self, event: &Event) -> Option<Verdict> {
+        let Event::ProcessSpawn {
+            pid,
+            comm,
+            filename,
+            exe,
+            argv,
+            parent_comm,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        // the parent's comm first (no lineage walk for every exec): the
+        // kernel names the tool it runs for a module request
+        // `/sbin/modprobe`, and udev's and the services' runs are named the
+        // same
+        if !matches!(parent_comm.as_str(), "modprobe" | "kmod" | "insmod") {
+            return None;
+        }
+        // then its image, when the lineage knows it: a process merely named
+        // like the tool is not kmod running a directive
+        let by_image = self.lineage.as_ref().and_then(|l| {
+            l.parent_identity(*pid, crate::posture::lineage::AsOf::of_event(event))
+                .map(|p| p.exe.to_str().is_some_and(is_module_tool_image))
+        });
+        if by_image == Some(false) {
+            return None;
+        }
+        // the hardening guides' `install <module> /bin/true` (or false):
+        // the shell kmod runs, and the tool it becomes
+        if is_true_or_false(exe.path_or(filename))
+            || matches!(argv.as_slice(), [_, c, cmd] if c == "-c" && is_true_or_false(cmd.trim()))
+        {
+            return None;
+        }
+        let shown: Vec<&str> = argv.iter().take(8).map(String::as_str).collect();
+        Some(build_verdict(
+            self,
+            event,
+            ResponseAction::Log,
+            Severity::Medium,
+            &format!(
+                "'{comm}' ({}) run by the module tool '{parent_comm}' — a modprobe.d \
+                 install/remove directive's command, run as root whenever the module is asked \
+                 for (T1547.006); argv {shown:?}. Recorded.",
+                exe.path_or(filename)
+            ),
+        ))
+    }
+}
+
+/// Lot 285: `true` or `false`, by name or system path — a directive that
+/// disables a module.
+fn is_true_or_false(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "true" | "false" | "/bin/true" | "/bin/false" | "/usr/bin/true" | "/usr/bin/false"
+    )
+}
+
+/// Lot 285: kmod's image as the kernel names it (every tool name is a link
+/// to it).
+fn is_module_tool_image(exe: &str) -> bool {
+    matches!(
+        exe,
+        "/usr/bin/kmod" | "/bin/kmod" | "/usr/sbin/kmod" | "/sbin/kmod"
+    )
 }
 
 /// Lot 279: the note of a record whose process had exited before the exec
@@ -200,7 +290,7 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
             return None;
         };
         if !KMOD_TOOLS.contains(&comm.as_str()) {
-            return None;
+            return self.child_of_the_tool(event);
         }
         // External audit NETR-003 class: the allowlist judged on what the
         // kernel executed, not on the comm the process chose.
@@ -431,6 +521,79 @@ mod tests {
 
     fn rule() -> R011KernelModuleTooling {
         R011KernelModuleTooling::new(Arc::new(CommAllowlist::default()))
+    }
+
+    /// Named test (lot 285): a child of the module tool — the command of a
+    /// `modprobe.d` install/remove directive, `/bin/sh -c …` — is recorded
+    /// (Medium, no kill): its parent named like the tool, and running kmod's
+    /// image when the lineage knows it; a shell whose parent is not the
+    /// tool is not R011's, nor the hardening guides' `install … /bin/true`.
+    #[test]
+    fn r011_records_the_children_of_modprobe() {
+        let sh = |parent: &str| {
+            spawn_full(
+                "sh",
+                "/bin/sh",
+                0,
+                &[
+                    "sh",
+                    "-c",
+                    "/usr/local/bin/x; /sbin/modprobe --ignore-install foo",
+                ],
+                parent,
+            )
+        };
+        let v = rule().evaluate(&sh("modprobe")).expect("recorded");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::Medium)
+        );
+        assert!(
+            v.reasoning.contains("install/remove directive"),
+            "{}",
+            v.reasoning
+        );
+        assert!(v.reasoning.contains("/usr/local/bin/x"), "{}", v.reasoning);
+        assert!(rule().evaluate(&sh("bash")).is_none());
+        // the hardening guides' idiom: `install cramfs /bin/true`
+        for cmd in ["/bin/true", "/bin/false", "true", " /usr/bin/false "] {
+            let e = spawn_full("sh", "/bin/sh", 0, &["sh", "-c", cmd], "modprobe");
+            assert!(rule().evaluate(&e).is_none(), "{cmd}");
+        }
+        let e = spawn_full("true", "/bin/true", 0, &["/bin/true"], "modprobe");
+        assert!(rule().evaluate(&e).is_none());
+        let e = spawn_full(
+            "sh",
+            "/bin/sh",
+            0,
+            &["sh", "-c", "/bin/true; id"],
+            "modprobe",
+        );
+        assert!(rule().evaluate(&e).is_some());
+        // the lineage: the parent's image decides, not its comm
+        let tmp = tempfile::tempdir().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        lineage.ingest_spawn(77, 1, "/usr/bin/kmod", 1);
+        lineage.ingest_spawn(1234, 77, "/usr/bin/dash", 2);
+        let r = rule().with_lineage(Some(lineage.clone()));
+        let child = |parent_comm: &str| {
+            let mut e = sh(parent_comm);
+            if let Event::ProcessSpawn { ppid, .. } = &mut e {
+                *ppid = 77;
+            }
+            e
+        };
+        assert!(r.evaluate(&child("modprobe")).is_some(), "kmod's image");
+        let other = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        other.ingest_spawn(77, 1, "/usr/bin/bash", 1);
+        other.ingest_spawn(1234, 77, "/usr/bin/dash", 2);
+        let r = rule().with_lineage(Some(other));
+        assert!(
+            r.evaluate(&child("modprobe")).is_none(),
+            "a comm alone, the image not kmod"
+        );
+        assert!(is_module_tool_image("/bin/kmod"));
+        assert!(!is_module_tool_image("/tmp/kmod"));
     }
 
     /// Lot 279: a root exec of `exe` as the caller ran it (`filename`),

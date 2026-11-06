@@ -282,6 +282,10 @@ planned = false
 "impair" = "nn-core"
 # post-plan (lab PR 216): the event loop's progress, for the watchdog
 "loop_progress" = "northnarrow-agent"
+# Lot 285: the kernel's module-load judge fed — the tree's walk and
+# classification, the controller and the kernel maps (with the exec guards'
+# loader, which takes them)
+"module_trust" = "nn-linux"
 # flow_tracker, dns_cache (the state; its reply parser went to nn-parse's
 # dns_records in R06, lab PR 242), limiter, blocklist (lab PR 247 sent its
 # inactive-rules report, which reads the resolver's configuration, to
@@ -545,6 +549,9 @@ planned = false
 # Lot 280b: the kernel's taint flags, the ones of code entering it, and how
 # much a new one weighs (the rule's severity, the kernel-state round)
 "kernel_taint" = "northnarrow-common"
+# Lot 285: the kernel's module-load verdicts, the trust map's entry, the
+# write history's step (the eBPF programs and the agent)
+"module_judge" = "northnarrow-common"
 # R03 (lab PR 240) moved wire::admin_protocol, wire::admin_signed_payload,
 # admin_quorum, shutdown_marker and watchdog_hold to nn-proto, atomic_file
 # and sd_notify to northnarrow-antitamper-bpf; R02 (lab PR 240) model,

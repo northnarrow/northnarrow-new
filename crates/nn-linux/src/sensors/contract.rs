@@ -451,11 +451,20 @@ pub const SOURCES: [SourceContract; 16] = [
         needs_bpf_lsm: true,
         lsm_part: None,
         fallbacks: &[],
-        sync_verdict: SyncVerdict::None,
+        // Lot 285: the load judged in the kernel, by the file
+        sync_verdict: SyncVerdict::KernelDeny {
+            hooks: "kernel_read_file (READING_MODULE: a file the agent does not vouch for) and \
+                    kernel_load_data (LOADING_MODULE: a buffer), outside a signed window, in \
+                    the deny mode (lot 285)",
+        },
         opt_in: None,
         on_failure: FailureMode::Blind,
         on_failure_detail: "not attached: signed (anti_tamper's observe hooks), the module-load \
-             rule blind; its pump ending stops the agent within 5 s (signed)",
+             rule blind and no load judged; its pump ending stops the agent within 5 s \
+             (signed); (lot 285) the judge's controller not started, or this kernel's inode \
+             offsets unresolved: signed, nothing judged or the record mode; the module files' \
+             write history (`module_write_observe`, file_open) not attached: signed, a file \
+             written since boot trusted by nothing but a signed opt-out",
         kernel_budgets: &[],
         overhead: &[],
         truncations: &[

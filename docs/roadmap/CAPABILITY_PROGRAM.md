@@ -7549,3 +7549,147 @@ number in parentheses is a lab PR.
   - Levels unchanged (C15 1, C23 2 provisional): a way around the signed
     exemptions and two ways to the tracker's marks closed and measured,
     not a new capability.
+- **Lot 285 — kernel module loads judged in the kernel, by the file (C12,
+  C23; Wave 4 phase 3, wave 1; the coordinator's decision of 04/11 that
+  withdrew the kmod emulation from R011).**
+  - What was open: a root process loads a module without any tool
+    (`finit_module(2)` on a file of its choice, `init_module(2)` on a
+    buffer). R018 only recorded the load, and its loader allowlist by
+    `comm` (`kmod`, `systemd-udevd`, `systemd-modules-load`: names any
+    process can take) kept the rest silent; R011 judged the tool's exec,
+    not the load.
+  - What changed: the `kernel_read_file` (`READING_MODULE`) and
+    `kernel_load_data` (`LOADING_MODULE`) BPF-LSM hooks judge the FILE
+    (`common::module_judge`, host-tested). A file whose inode the agent's
+    trust map holds, with the change time and size it verified, owned by
+    root and writable by no one else, loads; any other file and every
+    `init_module` buffer are refused (`EPERM`) outside a signed
+    trusted-installer window under the default policy (`alert`, `audit` or
+    `off R018`: let through, recorded). The agent fills the map from a walk
+    of `/lib/modules/$(uname -r)` (`agent/src/module_trust`): a verified
+    package's file (dpkg `md5sums`, rpm digests, read from the file) or
+    DKMS's build (byte for byte the registry's copy), unchanged since boot
+    or written since inside a package transaction — a third program, on
+    `file_open`, keeps the write history of the tree's module files in the
+    kernel, the writer's package-manager lineage read at the write (dnf's
+    and yum's Python scripts by the file their exec named, noted at
+    `sched_process_exec`) — and the files a signed `module-allow <module>`
+    names (a new policy directive, honoured only signed). The
+    coordinator's matrix for GPU and DKMS hosts: a registered DKMS or
+    akmods build in `updates/dkms/` or `extra/` written since boot outside
+    a recognised transaction is let through and recorded High (verdict
+    `dkms-unattested`) unless the policy enforces R018; a file there that
+    nothing vouches for is refused. R018 records the kernel's verdict (no
+    loader allowlist, no kernel-thread exemption); NN-L-FIM-026 records a
+    write in the `modprobe.d` directories (High outside a package
+    transaction); R011 records a child of the module tool (Medium).
+  - The lab, as measured (our own guests under lease k285, one at a time;
+    every round ended with the agent uninstalled and the guest powered
+    off):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`; rounds r1 at b7fa0965, r2 at
+      d57c86fd, r4 at 6cc96c39). `verifier-check` 101 programs, 99 OK, 2
+      not counted (`dns_answer`, as on main), 0 failing; at 6cc96c39
+      `module_read_file_observe` 79,909 instructions verified,
+      `module_write_observe` 28,365, `module_load_data_observe` 1,755,
+      `sched_process_exec` 3,765 (3,663 before the dnf note). The judge
+      armed 0.7 s after the agent started on a running host, 7.5 to 8.7 s
+      after it at a cold boot; 1,011 module files trusted, all packaged,
+      0 untrusted. 23 benign `modprobe`s (docker's, k3s', the network
+      stack's): 0 refused. A copy of the tree's `dummy` in `/tmp`: refused
+      (`EPERM`), R018 Critical; `init_module` of a buffer: refused, High;
+      an out-of-tree module built in the guest, by `finit_module` from
+      python: refused and Critical, inside a window loaded and Medium; its
+      hand copy in `updates/`: refused and High, with a signed
+      `module-allow` loaded and Medium; `dummy` touched after boot:
+      refused, trusted again after the next boot.
+      `linux-modules-extra` installed after boot: 6,474 files trusted
+      (5,463 written in the transaction), 8 of its modules probed, 0
+      refused (2 hardware errors, `EIO`/`ENODEV`), 0 R018; during dpkg's
+      unpack 1,162 of its files were untrusted for about 0.4 s (their
+      digests not yet written). DKMS 3.0 (zstd): the installed build is
+      the registry's byte for byte; under `dpkg -i` trusted and silent;
+      rebuilt by a root shell's `dkms install` let through and recorded
+      High, refused under a signed `enforce R018`, let through again
+      when the policy went back to the defaults; a file of
+      `updates/dkms/` with another module's content, and one of a module
+      DKMS never registered: refused. A stand-in `/usr/bin/dnf` (a Python
+      `#!` script, root's) running `dkms install`: its process noted
+      (`MODULE_PKG_SCRIPTS`, its pid and `mm`), the build trusted as a
+      package transaction's, silent; `python3 /usr/bin/dnf`: let through,
+      High. The benign corpus (dev, ci, containers, db; r1): rc 0, no R018
+      in its steps. Bootcheck (r1, r2, r4): agent and watchdog active at
+      the unit's start and 30 s later, pin root populated, 0 R018 from
+      the boot's loads, 52 to 56 modules loaded.
+    - **Ubuntu 22.04** (`5.15.0-202-generic`; r3 at 48d5242d, r5 at
+      6cc96c39). `verifier-check` 101 programs, 96 OK, 5 not counted, 0
+      failing. 1,024 module files trusted, all packaged; 23 benign
+      `modprobe`s: 0 refused; the copy in `/tmp`, `init_module`, the
+      out-of-tree module, the hand copy and the opt-out as on 24.04;
+      `linux-modules-extra` after boot: 6,025 trusted (5,001 written in
+      the transaction), 0 refused (3 hardware errors), 0 R018. DKMS 2.8
+      (uncompressed): the matrix as on 24.04 (byte for byte, trusted under
+      dpkg, the hand build let through and High, refused under `enforce`,
+      the two foreign files refused). The stand-in `/usr/bin/dnf` (r5,
+      a clean build): its process noted, the build trusted as a package
+      transaction's whether the script wrote the file itself or `dkms`
+      under it did. In r3 the same stand-in's build ran after the lab had
+      rewritten the installed file by hand (M2): DKMS 2.8 overwrote that
+      file in place (the same inode), and a file once written outside a
+      transaction keeps that history until it is created anew — let
+      through and recorded High, never refused. The corpus (dev, ci,
+      containers, db; r3): rc 0, no R018. Bootcheck: agent and watchdog
+      active at the start and 30 s later, the judge armed 3.9 to 4.2 s
+      after the agent started, 0 R018 from the boot's loads, 56 modules
+      loaded (r3, r5).
+    - Found by the CI's privileged suite on #513, and fixed: the LSM pins
+      are named after the hook, and `module_write_observe` was attached
+      pinned on `file_open`, the write-open deny's hook — its pin purged
+      the deny's link (rounds r1 to r5 ran so), and a write-open of the
+      agent's `admin.pub` went through (`cgroup_guard_privileged_e2e`).
+      The write history is now attached unpinned (a named test: one
+      pinned program per hook). Round r6 (ubuntu2404, b953386a): the
+      write-open refused (`EPERM`), both programs loaded, the write
+      history PKG under `dpkg -i` and under the dnf stand-in (both
+      writers), the bootcheck as before (0 R018 from the boot's loads).
+    - The coordinator's decision on #513 (the write history through an
+      agent restart and an upgrade within the boot): its maps and observer
+      pinned beside the pin root (`/sys/fs/bpf/northnarrow-module-writes`),
+      the next start adopting the history registered this boot. Round r7
+      (ubuntu2404, 392b7fdd): `linux-modules-extra` installed (6,474 files
+      trusted, 5,463 written in the transaction), the agent restarted inside
+      a signed window (SIGTERM to the watchdog and the agent): the same maps
+      adopted (ids 82 and 86, the same `since`), 5,463 still written in a
+      transaction, 12 of its modules probed — 0 refused (3 hardware
+      errors), 0 R018; the write-open deny `EPERM`; after a cold boot 0 R018
+      from the boot's loads; `uninstall.sh` left no pin directory, no state.
+    - The seven R018 Medium records of r1's tally were not this lot's: the
+      guest had kept an earlier agent's state (`admin.pub` and the lists
+      "already present" at the install), and main's R018 recorded a
+      standard module loaded by a loader outside its allowlist as Medium;
+      on a clean guest (r2) the install, the start and the arming gave no
+      R018 record, and the lot's R018 has no Medium but a window's or an
+      opt-out's.
+  - Decided (the coordinator, 06/11/2026; `RULE_POLICY.md` §2.4): deny by
+    default, scoped by the matrix so GPU and DKMS hosts keep their
+    modules; the residual — root who writes a module into a DKMS or akmods
+    output directory AND registers the same content gets a High record,
+    not a refusal, unless `enforce R018`.
+  - Open: the boot's own loads before the agent starts (the initramfs,
+    `systemd-modules-load`, udev's first pass) are the kernel's signature
+    policy's; a module changed after boot before the write history covers
+    it (the agent's first start of the boot, a reset of the history) is let
+    through and recorded High if a package or DKMS vouches for it, refused
+    otherwise, until the next boot; the trust map is the agent's (a restarted agent
+    judges nothing until it has filled it again, 0.7 s measured); no RPM
+    guest was in this lot's lab (rpm's digests and akmods by host tests
+    only); a module file rewritten in place by a package transaction after
+    a write outside one stays unattested (let through, High) until it is
+    created anew or the host reboots; dnf's and yum's scripts are
+    recognised only with the exec sensor on its LSM hook (the default where
+    BPF-LSM is active).
+  - Host: named tests for each case of the brief and of the matrix;
+    mutation rounds on the decision code: 59 of 59 caught (the first
+    code), then 30 on the matrix's code — 27 caught, 2 argued equivalent
+    (one removed from the code), 1 named and caught.
+  - Levels unchanged (C12 2, C23 2 provisional): a new kernel deny,
+    measured on two kernels, in capabilities already at their level.

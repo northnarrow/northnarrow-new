@@ -249,6 +249,15 @@ pub enum Event {
         /// init_module (legacy buffer load — no file).
         path: Option<String>,
         timestamp_ns: u64,
+        /// Lot 285: what the kernel made of the load, judging the file
+        /// (`common::module_judge`). `NotJudged` on older records and
+        /// from an older eBPF object.
+        #[serde(default)]
+        verdict: ModuleLoadVerdict,
+        /// Lot 285: the file the kernel judged (finit_module), as it read
+        /// it. `None` for init_module and on older records.
+        #[serde(default)]
+        file: Option<ModuleFileFacts>,
     },
     /// A `bpf()` syscall of interest by a process that is not the agent or
     /// the watchdog (LSM hook `bpf`): program load, attach, link create /
@@ -1454,6 +1463,67 @@ pub enum ModuleLoadMethod {
     Unknown,
 }
 
+/// Lot 285: what the kernel made of a module load
+/// ([`crate::wire::ModuleLoadRaw::verdict`], `common::module_judge::verdict`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ModuleLoadVerdict {
+    /// The judge was not armed (the agent had not filled its trust map),
+    /// or an older eBPF object.
+    #[default]
+    NotJudged,
+    /// A file the agent vouches for.
+    Trusted,
+    /// Untrusted (or a buffer), let through by a signed trusted-installer
+    /// window.
+    Window,
+    /// A file a signed per-module opt-out names.
+    OptOut,
+    /// Untrusted (or a buffer), let through: the record mode.
+    Recorded,
+    /// Untrusted (or a buffer), refused.
+    Denied,
+    /// A DKMS or akmods build its registry vouches for, written since boot
+    /// outside a recognised package transaction: let through by the
+    /// default policy, recorded (`common::module_judge::trust_flag::UNATTESTED`).
+    DkmsUnattested,
+}
+
+impl ModuleLoadVerdict {
+    pub fn from_wire(v: u8) -> Self {
+        use common::module_judge::verdict as w;
+        match v {
+            w::TRUSTED => Self::Trusted,
+            w::WINDOW => Self::Window,
+            w::OPT_OUT => Self::OptOut,
+            w::RECORDED => Self::Recorded,
+            w::DENIED => Self::Denied,
+            w::UNATTESTED => Self::DkmsUnattested,
+            _ => Self::NotJudged,
+        }
+    }
+
+    /// The kernel refused the load.
+    pub fn refused(self) -> bool {
+        self == Self::Denied
+    }
+}
+
+/// Lot 285: the file a `finit_module` named, as the kernel's judge read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModuleFileFacts {
+    /// `stat()`'s device and inode.
+    pub dev: u64,
+    pub ino: u64,
+    pub uid: u32,
+    /// `i_mode` (type and permission bits).
+    pub mode: u32,
+    pub ctime_sec: i64,
+    pub size: i64,
+    /// The trust map entry's flags (`common::module_judge::trust_flag`; 0:
+    /// no entry).
+    pub trust_flags: u32,
+}
+
 impl From<&crate::wire::BpfSyscallRaw> for Event {
     fn from(raw: &crate::wire::BpfSyscallRaw) -> Self {
         Event::BpfSyscall {
@@ -1516,6 +1586,17 @@ impl From<&crate::wire::ModuleLoadRaw> for Event {
             parent_is_kthread: raw.parent_is_kthread != 0,
             path: reconstruct_module_path(&raw.path, raw.path_len as usize, raw.path_truncated),
             timestamp_ns: raw.timestamp_ns,
+            verdict: ModuleLoadVerdict::from_wire(raw.verdict),
+            file: (method == ModuleLoadMethod::Finit && (raw.file_dev != 0 || raw.file_ino != 0))
+                .then_some(ModuleFileFacts {
+                    dev: raw.file_dev,
+                    ino: raw.file_ino,
+                    uid: raw.file_uid,
+                    mode: raw.file_mode,
+                    ctime_sec: raw.ctime_sec,
+                    size: raw.file_size,
+                    trust_flags: raw.trust_flags,
+                }),
         }
     }
 }

@@ -452,6 +452,7 @@ fn spawn_rules<H: DecisionHost>(
     installer: Option<Arc<<H as PostureAgent>::InstallerWindow>>,
 ) -> Vec<Box<dyn Rule>> {
     let r020 = R020ShellWithSocketStdio::new(Arc::clone(&allowlist), lineage.clone());
+    let r011_lineage = lineage.clone();
     let (r004, r009) = match lineage {
         Some(l) => (
             R004ExecFromProcSelfFd::new(l.clone()),
@@ -472,7 +473,7 @@ fn spawn_rules<H: DecisionHost>(
         Box::new(R006ReverseShellTooling::new(al())),
         Box::new(r009),
         Box::new(R010BinaryInWebroot),
-        Box::new(R011KernelModuleTooling::new(al())),
+        Box::new(R011KernelModuleTooling::new(al()).with_lineage(r011_lineage)),
         Box::new(R012SetcapTooling::new(al())),
         Box::new(R013NamespaceEscapeTooling::new(al())),
         Box::new(R017ShellFromNonstandardPath::new(al())),
@@ -489,29 +490,13 @@ fn spawn_rules<H: DecisionHost>(
     ]
 }
 
-/// BUG-034 — the kernel-module LOAD rule (R018), with its DEDICATED
-/// module-loader allowlist seeded from the trusted system auto-loaders
-/// (`systemd-udevd`, `systemd-modules-load`, `kmod`). Deliberately NOT
-/// `insmod`/`modprobe` (arbitrary-path loaders — allowlisting them
-/// would blind the non-standard-path Critical). Kept separate from the
-/// R011..R017 process-comm allowlist so loosening one never silently
-/// widens the other. v1 seeds in-code; operator extension via a
-/// `module-loader-allowlist.{v1,local}` file is a fast-follow.
+/// BUG-034 — the kernel-module LOAD rule (R018). Lot 285: the kernel
+/// judges the file the load reads (`common::module_judge`); the rule records
+/// what it refused or let through. Its loader allowlist by `comm`
+/// (`systemd-udevd`, `systemd-modules`, `kmod`: names any process can take)
+/// is gone.
 pub fn module_load_rules<H: DecisionHost>() -> Vec<Box<dyn Rule>> {
-    // Seed = the kernel's 15-char-truncated `comm` (TASK_COMM_LEN=16,
-    // NUL-terminated), NOT the full binary name: `systemd-modules-load`
-    // → `systemd-modules` (loads via libkmod directly, so ITS comm is
-    // the loader). udev-spawned modprobe is matched via its PARENT comm
-    // `systemd-udevd`; kernel auto-loads (request_module) are
-    // PF_KTHREAD-exempt regardless of comm. `modprobe`/`insmod` are
-    // deliberately NOT seeded — they load arbitrary paths, so seeding
-    // them would blind the non-standard-path Critical.
-    let loader_allowlist = Arc::new(CommAllowlist::<H>::from_iter_owned(
-        ["systemd-udevd", "systemd-modules", "kmod"]
-            .into_iter()
-            .map(String::from),
-    ));
-    vec![Box::new(R018KernelModuleLoad::new(loader_allowlist))]
+    vec![Box::new(R018KernelModuleLoad::<H>::new())]
 }
 
 /// Demo rule set for Tappa 5. Returned only when the `demo-tappa5`

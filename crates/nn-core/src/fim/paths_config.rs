@@ -65,6 +65,9 @@ pub const EARLIER_PATHS_V1_SHA256: &[&str] = &[
     "99e3364b81cf77ccd51cda88e80bc71a45b13e7b75c7ff480b195e157ab3011a",
     // Tappa 9.5.1 D2 (dffc6b8), before lab PR 188 added the restore links
     "3fc62222695e595a26069123393850cfe917c614d863947248240a3b41810c9b",
+    // lab PR 188 (the restore links), before lot 285 added kmod's other
+    // configuration directories
+    "44a5f17e037148eb31a8798d7c0918e31d4657ba2ca7003b696a775741326508",
 ];
 /// The shipped `fim-paths.v1` (built-in copy, earlier ones).
 pub const FIM_PATHS_SHIPPED: Shipped<'static> =

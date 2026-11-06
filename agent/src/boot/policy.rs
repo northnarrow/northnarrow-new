@@ -362,6 +362,10 @@ pub(crate) fn load(
         if let Some(detail) = nn_linux::sysctl_cgroup::apply_policy(&policy, signed) {
             northnarrow_agent::boot::degradation::report("rule_policy", &detail);
         }
+        // Lot 285: the module-load judge's mode and signed opt-outs
+        if let Some(detail) = northnarrow_agent::module_trust::apply_policy(&policy, signed) {
+            northnarrow_agent::boot::degradation::report("rule_policy", &detail);
+        }
         if !policy.is_builtin() {
             warn!(
                 source = %policy.source,

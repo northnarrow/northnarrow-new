@@ -413,6 +413,9 @@ pub mod host_dropins;
 /// change — its taint flags and livepatches, the root cgroup's
 /// `cgroup/sysctl` programs — read every 5 s.
 pub mod kernel_state;
+/// Lot 285: the module files' write history pinned beside the pin root
+/// (kept through an agent restart and an upgrade within the boot).
+pub mod module_writes;
 /// Lot 273d: our units' own drop-ins made inside a window, judged at its
 /// close.
 pub mod own_dropins;

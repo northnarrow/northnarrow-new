@@ -139,6 +139,12 @@
 /etc/modules
 /etc/modules-load.d
 /etc/modprobe.d
+# Lot 285: kmod's other configuration directories (NN-L-FIM-026; a
+# directory absent at the agent's start is not watched)
+/run/modprobe.d
+/usr/local/lib/modprobe.d
+/lib/modprobe.d
+/usr/lib/modprobe.d
 
 # ── systemd unit roots (NN-L-FIM-009) ─────────────────────────────────
 /etc/systemd/system

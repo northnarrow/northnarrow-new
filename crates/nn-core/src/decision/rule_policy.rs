@@ -153,6 +153,14 @@ pub struct RulePolicy {
     /// (`common::sysctl_judge::SYSCTL_PATHS`). The agent honours it only
     /// from a policy whose signature it verified.
     sysctl_allow: BTreeMap<&'static str, (i64, i64)>,
+    /// Lot 285: `module-allow <module>` — the signed per-module opt-out of
+    /// the kernel's module-load judge (a DKMS module built outside a
+    /// package transaction, a vendor's module): the files of that module in
+    /// the running kernel's tree, owned by root and writable by no one
+    /// else, load; every such load is recorded. By the module's name, `-`
+    /// read as `_`. The agent honours it only from a policy whose signature
+    /// it verified.
+    module_allow: std::collections::BTreeSet<String>,
     /// Where it came from (`built-in defaults`, `<path> (signed, sha256 …)`).
     pub source: String,
 }
@@ -194,22 +202,37 @@ impl RulePolicy {
             .map(|(n, (min, max))| (*n, common::sysctl_judge::kind_of_name(n), *min, *max))
     }
 
+    /// Lot 285: the signed per-module opt-outs, by module name (`_` for
+    /// `-`).
+    pub fn module_opt_outs(&self) -> impl Iterator<Item = &str> + '_ {
+        self.module_allow.iter().map(String::as_str)
+    }
+
     /// No directive at all.
     pub fn is_builtin(&self) -> bool {
         self.modes.is_empty()
             && self.exemptions.is_empty()
             && !self.ransomware_combat_without_corroboration
             && self.sysctl_allow.is_empty()
+            && self.module_allow.is_empty()
     }
 
     /// One line for the logs and the audit row (lot 280a: the sysctl
     /// opt-outs counted at its end when there are any).
     pub fn summary(&self) -> String {
         let count = |m: Mode| self.modes.values().filter(|x| **x == m).count();
-        let opt_outs = match self.sysctl_allow.len() {
+        let mut opt_outs = match self.sysctl_allow.len() {
             0 => String::new(),
             n => format!(", {n} sysctl opt-out{}", if n == 1 { "" } else { "s" }),
         };
+        // Lot 285
+        match self.module_allow.len() {
+            0 => {}
+            n => opt_outs.push_str(&format!(
+                ", {n} module opt-out{}",
+                if n == 1 { "" } else { "s" }
+            )),
+        }
         format!(
             "{} enforce, {} alert, {} audit, {} off, {} exemptions on {} rules, \
              ransomware COMBAT without corroboration {}{opt_outs}",
@@ -243,6 +266,9 @@ impl RulePolicy {
         }
         for (n, (min, max)) in &self.sysctl_allow {
             out.push_str(&format!("sysctl-allow {n} {}\n", range_text(*min, *max)));
+        }
+        for m in &self.module_allow {
+            out.push_str(&format!("module-allow {m}\n"));
         }
         out
     }
@@ -300,6 +326,13 @@ pub fn show(p: &RulePolicy) -> String {
             out.push_str(&format!(
                 "sysctl-allow {n} {} (outside a window too; honoured only signed)\n",
                 range_text(min, max)
+            ));
+        }
+        // Lot 285
+        for m in p.module_opt_outs() {
+            out.push_str(&format!(
+                "module-allow {m} (its files in the running kernel's tree load, each load \
+                 recorded; honoured only signed)\n"
             ));
         }
     }
@@ -442,6 +475,28 @@ fn valid_cgroup(p: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Lot 285: `module-allow` lines a policy may have.
+pub const MAX_MODULE_OPT_OUTS: usize = 256;
+
+/// Lot 285: a module name as kmod spells it — letters, digits, `_` and `-`
+/// (read as `_`), at most 55 bytes (`MODULE_NAME_LEN` - 1): never a path,
+/// a glob or a file name (`.ko`).
+pub fn module_opt_out_name(name: &str) -> Result<String, String> {
+    if name.is_empty() || name.len() > 55 {
+        return Err("a module name is 1 to 55 characters".to_string());
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(
+            "not a module name (letters, digits, `_` and `-` only: no path, no `.ko`, no glob)"
+                .to_string(),
+        );
+    }
+    Ok(name.replace('-', "_"))
 }
 
 /// Parse a policy file. Any bad line refuses the whole file.
@@ -625,6 +680,20 @@ fn parse_as(
                         .to_string(),
                 ))
             }
+            // Lot 285: the signed per-module opt-out
+            ["module-allow", name] => {
+                let m = module_opt_out_name(name)
+                    .map_err(|why| err(format!("module-allow {name}: {why}")))?;
+                if !p.module_allow.insert(m.clone()) {
+                    return Err(err(format!("module-allow {m} twice")));
+                }
+                if p.module_allow.len() > MAX_MODULE_OPT_OUTS {
+                    return Err(err(format!(
+                        "more than {MAX_MODULE_OPT_OUTS} module-allow lines"
+                    )));
+                }
+            }
+            ["module-allow", ..] => return Err(err("`module-allow <module>`".to_string())),
             ["combat-without-corroboration", rule] => {
                 let id = resolve_rule(rule).map_err(err)?;
                 if id != RANSOMWARE_RULE {
@@ -640,7 +709,7 @@ fn parse_as(
             [kw, ..] => {
                 return Err(err(format!(
                     "unknown directive `{kw}`: enforce, alert, audit, off, exempt, \
-                     combat-without-corroboration, sysctl-allow"
+                     combat-without-corroboration, sysctl-allow, module-allow"
                 )))
             }
             [] => unreachable!("empty content skipped"),
@@ -1684,5 +1753,53 @@ mod tests {
         assert_eq!(h.current().mode(IMP), Some(Mode::Enforce));
         // A reader that took the policy before keeps it whole.
         assert!(held.is_builtin());
+    }
+
+    /// Named test (lot 285, the policy's half): `module-allow <module>` names
+    /// a module (`-` read as `_`), read back as written, counted and shown;
+    /// never a path, a file name or a glob, never twice.
+    #[test]
+    fn a_signed_per_module_opt_out_names_a_module() {
+        let p = parse("module-allow nvidia-drm\nmodule-allow vboxdrv   # VirtualBox\n").unwrap();
+        assert!(!p.is_builtin());
+        assert_eq!(
+            p.module_opt_outs().collect::<Vec<_>>(),
+            ["nvidia_drm", "vboxdrv"]
+        );
+        assert_eq!(parse(&p.render()).unwrap(), p);
+        assert!(p.render().contains("module-allow nvidia_drm\n"));
+        assert!(
+            p.summary().ends_with(", 2 module opt-outs"),
+            "{}",
+            p.summary()
+        );
+        assert!(
+            show(&p).contains("module-allow vboxdrv (its files"),
+            "{}",
+            show(&p)
+        );
+        for (text, what) in [
+            ("module-allow /tmp/rk.ko\n", "not a module name"),
+            ("module-allow rk.ko\n", "not a module name"),
+            ("module-allow nv*\n", "not a module name"),
+            ("module-allow\n", "`module-allow <module>`"),
+            ("module-allow a b\n", "`module-allow <module>`"),
+            (
+                "module-allow nvidia_drm\nmodule-allow nvidia-drm\n",
+                "twice",
+            ),
+        ] {
+            let e = parse(text).unwrap_err().to_string();
+            assert!(e.contains(what), "{text:?}: {e}");
+        }
+        let long = "m".repeat(56);
+        assert!(parse(&format!("module-allow {long}\n")).is_err());
+        let many: String = (0..=MAX_MODULE_OPT_OUTS)
+            .map(|i| format!("module-allow m{i}\n"))
+            .collect();
+        assert!(parse(&many)
+            .unwrap_err()
+            .to_string()
+            .contains("module-allow lines"));
     }
 }

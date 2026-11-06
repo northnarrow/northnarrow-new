@@ -2341,6 +2341,98 @@ impl<H: PostureAgent> Rule for NnLFim025FileCapabilityGranted<H> {
 /// the front of the Critical tier — ransomware is the
 /// canonical kill-the-tree-immediately signal so it gets first
 /// pass.
+/// Lot 285: kmod's configuration directories (`modprobe.d(5)`): an
+/// `install` or `remove` directive runs a command as root each time the
+/// module is asked for (the kernel's own `request_module` included), an
+/// `options` line changes what loads, a `blacklist` what does not.
+pub const MODPROBE_CONFIG_PREFIXES: &[&str] = &[
+    "/etc/modprobe.d/",
+    "/run/modprobe.d/",
+    "/usr/local/lib/modprobe.d/",
+    "/lib/modprobe.d/",
+    "/usr/lib/modprobe.d/",
+    "/etc/modprobe.conf",
+];
+
+// ── NN-L-FIM-026 — kmod configuration written ───────────────────────
+
+/// Lot 285: a file of kmod's configuration directories created, changed,
+/// renamed, linked or removed. Persistence through an `install` directive
+/// (T1547.006: a command run as root when the module is asked for, at
+/// every boot by udev) needs no module at all. Outside a package
+/// transaction (the writer's kernel-resolved lineage at the write,
+/// [`AuthSessionTracker::is_package_transaction_write`]) a High record;
+/// inside one, Low. No kill: the write is done when the event arrives.
+pub struct NnLFim026ModprobeConfigWritten<H: PostureAgent> {
+    lineage: AuthSessionTracker<H>,
+}
+
+impl<H: PostureAgent> NnLFim026ModprobeConfigWritten<H> {
+    pub fn new(lineage: AuthSessionTracker<H>) -> Self {
+        Self { lineage }
+    }
+}
+
+/// `path` is in (or is) one of [`MODPROBE_CONFIG_PREFIXES`].
+pub fn is_modprobe_config(path: &str) -> bool {
+    MODPROBE_CONFIG_PREFIXES
+        .iter()
+        .any(|p| path.starts_with(p) && (p.ends_with('/') || path.len() == p.len()))
+}
+
+impl<H: PostureAgent> Rule for NnLFim026ModprobeConfigWritten<H> {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-026_ModprobeConfigWritten"
+    }
+    fn name(&self) -> &'static str {
+        "Kernel module configuration written"
+    }
+    fn category(&self) -> &'static str {
+        "fim_persistence"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Persistence, "T1547.006")];
+        ATTACK
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let fe = as_fim(event)?;
+        if fe.op == FimOp::Opened {
+            return None;
+        }
+        let hit =
+            is_modprobe_config(&fe.path) || fe.dest_path.as_deref().is_some_and(is_modprobe_config);
+        if !hit {
+            return None;
+        }
+        let pkg = self.lineage.is_package_transaction_write(
+            fe.modifier_pid,
+            crate::posture::lineage::AsOf::judged(fe.timestamp_ns),
+        );
+        let (severity, reasoning) = if pkg {
+            (
+                Severity::Low,
+                "Kernel module configuration (modprobe.d) written by the package manager \
+                 (dpkg/rpm/dnf lineage): recorded",
+            )
+        } else {
+            (
+                Severity::High,
+                "Kernel module configuration (modprobe.d) written outside a package \
+                 transaction — an install/remove directive runs a command as root whenever \
+                 the module is asked for (persistence, T1547.006): recorded, not killed (the \
+                 write is done)",
+            )
+        };
+        Some(fim_verdict(
+            self,
+            fe,
+            ResponseAction::Log,
+            severity,
+            reasoning,
+        ))
+    }
+}
+
 /// Review 49 — a persistence-shaped write made by the package manager is
 /// recorded, not killed.
 ///
@@ -2798,6 +2890,8 @@ pub fn fim_rules_with_lineage<H: PostureAgent>(
         admin(Box::new(NnLFim025FileCapabilityGranted::<H>::new(
             installer_override,
         ))),
+        // Lot 285 — kmod's configuration, recorded.
+        Box::new(NnLFim026ModprobeConfigWritten::<H>::new(lineage.clone())),
         // Medium last.
         Box::new(NnLFim006OperatorBinaryModified),
         Box::new(NnLFim020ShellHistoryCleared),
@@ -4570,13 +4664,14 @@ mod tests {
     }
 
     #[test]
-    fn fim_builder_has_twenty_five_rules() {
+    fn fim_builder_has_twenty_six_rules() {
         // C5 shipped 9, C5.1 added 1, C5.3 added 4 → 14; Tappa 10.5
         // D3 adds NN-L-FIM-015..023 (9) → 23; Tappa 9.5.1 adds
         // NN-L-FIM-024 (anti-tamper bait) → 24; review 86 adds
-        // NN-L-FIM-025 (file capability granted) → 25.
+        // NN-L-FIM-025 (file capability granted) → 25; lot 285 adds
+        // NN-L-FIM-026 (kmod's configuration) → 26.
         let n = fim_rules(H::inert_installer_window()).len();
-        assert_eq!(n, 25, "expected 25 FIM rules, got {n}");
+        assert_eq!(n, 26, "expected 26 FIM rules, got {n}");
     }
 
     // ── Tappa 9.5.1 — NN-L-FIM-024 anti-tamper bait ─────────────────
@@ -5046,6 +5141,85 @@ mod tests {
             .into_iter()
             .map(|r| (r.id(), r))
             .collect()
+    }
+
+    /// Named test (lot 285): NN-L-FIM-026 — a write in kmod's configuration
+    /// directories outside a package transaction is a High record, inside
+    /// one a Low record; never a kill; other paths and reads are not its.
+    #[test]
+    fn fim026_records_a_modprobe_d_write_outside_a_package_transaction() {
+        let (_tmp, lineage) = pkg_fixture();
+        let rules = rules_by_id(&lineage);
+        let r = &rules["NN-L-FIM-026_ModprobeConfigWritten"];
+        for path in [
+            "/etc/modprobe.d/evil.conf",
+            "/run/modprobe.d/x.conf",
+            "/lib/modprobe.d/x.conf",
+            "/usr/lib/modprobe.d/x.conf",
+            "/usr/local/lib/modprobe.d/x.conf",
+            "/etc/modprobe.conf",
+        ] {
+            for op in [
+                FimOp::Created,
+                FimOp::Modified,
+                FimOp::Deleted,
+                FimOp::Linked,
+            ] {
+                let v = r
+                    .evaluate(&written_by(op, path, 600, "tee"))
+                    .unwrap_or_else(|| panic!("{path} {op:?}"));
+                assert_eq!(
+                    (v.action, v.severity),
+                    (ResponseAction::Log, Severity::High),
+                    "{path}"
+                );
+                assert!(v.reasoning.contains("outside a package transaction"));
+                let v = r.evaluate(&written_by(op, path, 200, "dpkg")).unwrap();
+                assert_eq!(
+                    (v.action, v.severity),
+                    (ResponseAction::Log, Severity::Low),
+                    "{path}"
+                );
+            }
+        }
+        // a rename into the directory: by its destination
+        let Event::Fim(mut fe) = written_by(FimOp::Renamed, "/etc/x.tmp", 600, "mv") else {
+            unreachable!()
+        };
+        fe.dest_path = Some("/etc/modprobe.d/x.conf".into());
+        let v = r.evaluate(&Event::Fim(fe)).expect("renamed in");
+        assert_eq!(v.severity, Severity::High);
+        for other in [
+            "/etc/modprobe.d.bak/x.conf",
+            "/etc/modprobe.conf.bak",
+            "/etc/modules-load.d/x.conf",
+            "/etc/systemd/system/x.service",
+        ] {
+            assert!(
+                r.evaluate(&written_by(FimOp::Created, other, 600, "tee"))
+                    .is_none(),
+                "{other}"
+            );
+        }
+        assert!(r
+            .evaluate(&written_by(
+                FimOp::Opened,
+                "/etc/modprobe.d/x.conf",
+                600,
+                "cat"
+            ))
+            .is_none());
+        // the FIM paths shipped watch every directory
+        let shipped = include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/fim-paths.v1"));
+        for d in [
+            "/etc/modprobe.d",
+            "/run/modprobe.d",
+            "/lib/modprobe.d",
+            "/usr/lib/modprobe.d",
+            "/usr/local/lib/modprobe.d",
+        ] {
+            assert!(shipped.lines().any(|l| l.trim() == d), "{d} not watched");
+        }
     }
 
     /// The shapes the lab saw dpkg killed for (FIM-007/009/021), plus the

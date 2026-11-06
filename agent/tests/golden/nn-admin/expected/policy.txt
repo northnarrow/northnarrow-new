@@ -7957,7 +7957,7 @@ exit: 2
 --- stdout
 (empty)
 --- stderr
-| policy test: candidate.local: line 1: unknown directive `panic`: enforce, alert, audit, off, exempt, combat-without-corroboration, sysctl-allow
+| policy test: candidate.local: line 1: unknown directive `panic`: enforce, alert, audit, off, exempt, combat-without-corroboration, sysctl-allow, module-allow
 
 ### policy-test.error.policy-empty
 $ nn-admin policy test --events events.json --config-dir empty --policy candidate.local

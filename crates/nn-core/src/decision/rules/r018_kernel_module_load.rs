@@ -8,33 +8,35 @@
 //! `finit_module(2)`), this scores the LOAD itself — the chokepoint a
 //! rootkit cannot avoid.
 //!
-//! ## Verdict model (autonomous kill on exactly ONE condition)
+//! ## Lot 285: the kernel judges the file, the rule records
 //!
-//! Path is the primary discriminator — legit modules live ONLY under
-//! `/lib/modules`. Autonomous `KillProcessTree` fires on exactly the
-//! near-certain case (non-standard path); everything else ALERTS, with
-//! severity ranking the alert without arming a kill:
+//! The load hooks judge the FILE in the kernel (`common::module_judge`): a
+//! file of the running kernel's tree that a verified package installed or
+//! DKMS built, unchanged since boot or written since inside a package
+//! transaction, or named by a signed opt-out, loads; anything else — and an
+//! `init_module` buffer — is refused outside a signed trusted-installer
+//! window in the deny mode, let through in the record mode. The event
+//! carries the kernel's verdict; who loads is not asked (the loader
+//! allowlist by `comm` — `kmod`, `systemd-udevd`, `systemd-modules-load`,
+//! names any process can take — is gone):
 //!
-//! | Condition | Severity | Action |
-//! |---|---|---|
-//! | `parent_is_kthread` (non-forgeable kernel-driven load) | — | exempt |
-//! | trusted auto-loader (loader/parent in the allowlist) | — | exempt |
-//! | `finit_module` + **non-standard path** (`/tmp`, …) | **Critical** | **KillProcessTree** |
-//! | `init_module(2)` legacy (no path), non-exempt | **High** | **Log** |
-//! | `finit_module` + standard path, unexpected loader | **Medium** | **Log** |
+//! | Kernel verdict | Condition | Severity | Action |
+//! |---|---|---|---|
+//! | trusted | — | — | none |
+//! | window | a signed trusted-installer window let an untrusted load through | Medium | Log |
+//! | opt-out | a signed per-module opt-out let it through | Medium | Log |
+//! | dkms-unattested | a DKMS or akmods build its registry vouches for, written since boot outside a recognised package transaction: let through unless the policy enforces R018 | High | Log |
+//! | denied / recorded / not judged | `finit_module` from a **non-standard path** (`/tmp`, …) or deeper than any module directory | **Critical** | **KillProcessTree** |
+//! | denied / recorded | any other untrusted file, or an `init_module` buffer | High | Log |
+//! | not judged | a module directory's file: by its provenance (package, DKMS: none; copied by hand: High; no database: Medium) | | Log |
 //!
-//! ORDERING is security-critical: the non-standard-path Critical is
-//! checked BEFORE the loader allowlist, so an attacker who forges a
-//! loader/parent `comm` cannot exempt a load from `/tmp`. (The
-//! `KillProcessTree` is the interim autonomous response; the effective
-//! fix is denying the load at the `kernel_read_file` hook — see
-//! BUG-037, the stage-3 fast-follow.)
+//! "Not judged" is a load the kernel did not judge: the agent had not
+//! filled its trust map yet (the first seconds of its start), or an older
+//! eBPF object; the rule then judges by the path and the package database,
+//! as before lot 285 but without the loader allowlist.
 
-use std::sync::Arc;
+use nn_model::{Event, ModuleLoadMethod, ModuleLoadVerdict, ResponseAction, Severity, Verdict};
 
-use nn_model::{Event, ModuleLoadMethod, ResponseAction, Severity, Verdict};
-
-use crate::config::comm_allowlist::CommAllowlist;
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::host::DecisionHost;
 use crate::decision::rules::module_provenance::{ModuleOwners, Provenance};
@@ -49,25 +51,49 @@ fn is_standard_module_path(p: &str) -> bool {
 }
 
 pub struct R018KernelModuleLoad<H: DecisionHost> {
-    /// Dedicated module-loader allowlist — the trusted system
-    /// auto-loaders (`systemd-udevd`, `systemd-modules-load`, `kmod`).
-    /// Deliberately NOT `insmod`/`modprobe`: they load arbitrary paths,
-    /// so allowlisting them would blind the non-standard-path Critical.
-    loader_allowlist: Arc<CommAllowlist<H>>,
-    /// External audit PROC-005: who installed a module file.
+    /// External audit PROC-005: who installed a module file — read for a
+    /// load the kernel did not judge.
     owners: ModuleOwners<H>,
 }
 
+impl<H: DecisionHost> Default for R018KernelModuleLoad<H> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<H: DecisionHost> R018KernelModuleLoad<H> {
-    pub fn new(loader_allowlist: Arc<CommAllowlist<H>>) -> Self {
-        Self::with_owners(loader_allowlist, ModuleOwners::default())
+    pub fn new() -> Self {
+        Self::with_owners(ModuleOwners::default())
     }
 
-    pub fn with_owners(loader_allowlist: Arc<CommAllowlist<H>>, owners: ModuleOwners<H>) -> Self {
-        Self {
-            loader_allowlist,
-            owners,
+    pub fn with_owners(owners: ModuleOwners<H>) -> Self {
+        Self { owners }
+    }
+}
+
+/// Whose file the kernel read, for the reasoning: root's or another
+/// account's (the account itself is not the record's to name).
+fn owner(f: &nn_model::ModuleFileFacts) -> &'static str {
+    if f.uid == 0 {
+        "owned by root"
+    } else {
+        "not owned by root"
+    }
+}
+
+/// What the kernel did with the load, for the reasoning.
+fn kernel_said(v: ModuleLoadVerdict) -> &'static str {
+    match v {
+        ModuleLoadVerdict::Denied => "REFUSED by the kernel (deny mode)",
+        ModuleLoadVerdict::Recorded => "let through by the kernel: the record mode, not refused",
+        ModuleLoadVerdict::Window => "let through by a signed trusted-installer window",
+        ModuleLoadVerdict::OptOut => "let through by a signed per-module opt-out",
+        ModuleLoadVerdict::Trusted => "trusted by the kernel",
+        ModuleLoadVerdict::DkmsUnattested => {
+            "let through by the default policy, not trusted (`enforce R018` refuses it)"
         }
+        ModuleLoadVerdict::NotJudged => "not judged by the kernel (its trust map not filled yet)",
     }
 }
 
@@ -94,167 +120,165 @@ impl<H: DecisionHost> Rule for R018KernelModuleLoad<H> {
             method,
             loader_comm,
             parent_comm,
-            parent_is_kthread,
             path,
+            verdict,
+            file,
             ..
         } = event
         else {
             return None;
         };
-
-        // (1) Kernel-driven load (boot / hot-plug) — non-forgeable
-        // PF_KTHREAD. Exempt. A kthread never loads from a non-standard
-        // path, so exempting it here cannot hide the /tmp case below.
-        if *parent_is_kthread {
-            return None;
-        }
-
-        // (2) NEAR-CERTAIN rootkit — a finit_module load from a
-        // NON-standard path. Checked BEFORE the loader allowlist so a
-        // forged-comm loader from /tmp cannot be exempted. The ONE
-        // autonomous-kill condition.
-        if *method == ModuleLoadMethod::Finit {
-            if let Some(p) = path {
-                // Audit `abi-modpath-1`: a RELATIVE path means the kernel
-                // walk ran out of slots before the root — the prefix is
-                // unknown, so it must not be classified as non-standard
-                // (that branch SIGKILLs + COMBATs). Surface it as a
-                // Medium alert unless the loader is allowlisted.
-                // External audit PROC-004: deeper than the walk's slots is
-                // deeper than any module directory (a legitimate one sits a
-                // dozen components down at most). The loader chose that
-                // depth; it must not buy the load an alert instead of the
-                // kill.
-                if nn_model::module_path_too_deep(p) {
-                    return Some(build_verdict(
-                        self,
-                        event,
-                        ResponseAction::KillProcessTree,
-                        Severity::Critical,
-                        &format!(
-                            "Kernel module loaded from a path deeper than any module \
-                             directory ({p}) by '{loader_comm}' (parent '{parent_comm}') — \
-                             legit modules live under /lib/modules; near-certain rootkit \
-                             (T1014 / T1547.006). Kill tree + posture → COMBAT."
-                        ),
-                    ));
-                }
-                if nn_model::module_path_is_truncated(p) {
-                    if self.loader_allowlist.contains(loader_comm)
-                        || self.loader_allowlist.contains(parent_comm)
-                    {
-                        return None;
-                    }
-                    // A kernel read failed: the origin is unknown, which is
-                    // not the same as benign (external audit PROC-004).
-                    return Some(build_verdict(
-                        self,
-                        event,
-                        ResponseAction::Log,
-                        Severity::High,
-                        &format!(
-                            "Kernel module loaded from a path the sensor could not read to \
-                             the root (components: {p}) by '{loader_comm}' (parent \
-                             '{parent_comm}') — origin unverifiable, NOT auto-killing. Alert."
-                        ),
-                    ));
-                }
-                if !is_standard_module_path(p) {
-                    return Some(build_verdict(
-                        self,
-                        event,
-                        ResponseAction::KillProcessTree,
-                        Severity::Critical,
-                        &format!(
-                            "Kernel module loaded from NON-standard path {p} — legit \
-                             modules are only under /lib/modules; near-certain rootkit \
-                             (T1014 / T1547.006). Kill tree + posture → COMBAT."
-                        ),
-                    ));
-                }
-                // External audit PROC-005: whoever loads a module can write
-                // under /lib/modules; a file there that no package installed
-                // and DKMS did not build was put there by hand. From an
-                // unexpected loader that is the non-standard case again;
-                // from a system loader (a locally built module at boot, or
-                // a comm that only claims to be one) an alert, no kill.
-                if self.owners.of(p) == Provenance::Unowned {
-                    let system_loader = self.loader_allowlist.contains(loader_comm)
-                        || self.loader_allowlist.contains(parent_comm);
-                    return Some(if system_loader {
-                        build_verdict(
-                            self,
-                            event,
-                            ResponseAction::Log,
-                            Severity::High,
-                            &format!(
-                                "Kernel module {p} loaded by '{loader_comm}' (parent \
-                                 '{parent_comm}') is in a module directory but no package \
-                                 installed it and DKMS did not build it (T1547.006). Alert."
-                            ),
-                        )
-                    } else {
-                        build_verdict(
-                            self,
-                            event,
-                            ResponseAction::KillProcessTree,
-                            Severity::Critical,
-                            &format!(
-                                "Kernel module {p} loaded by '{loader_comm}' (parent \
-                                 '{parent_comm}') — under /lib/modules, but no package \
-                                 installed it and DKMS did not build it: copied there by \
-                                 hand; rootkit shape (T1014 / T1547.006). Kill tree + \
-                                 posture → COMBAT."
-                            ),
-                        )
-                    });
-                }
-            }
-        }
-
-        // (3) Trusted system auto-loader — exempt the legit boot /
-        // hot-plug path (the loader OR its parent is an allowlisted
-        // auto-loader). Pragmatic FP guard (comm is forgeable — same
-        // class as R011's allowlist), deliberately AFTER the
-        // non-standard-path Critical so it can never blind it.
-        if self.loader_allowlist.contains(loader_comm)
-            || self.loader_allowlist.contains(parent_comm)
-        {
-            return None;
-        }
-
-        // (4) Legacy init_module(2) (buffer load, no path) by a
-        // non-exempt loader — the legacy interface is rarely used
-        // legitimately. Strong signal, not near-certain → ALERT,
-        // don't autonomous-kill.
-        if *method == ModuleLoadMethod::Init {
-            return Some(build_verdict(
+        let kernel = kernel_said(*verdict);
+        let log = |severity: Severity, why: String| {
+            Some(build_verdict(
                 self,
                 event,
                 ResponseAction::Log,
-                Severity::High,
-                &format!(
-                    "Kernel module loaded via legacy init_module(2) by '{loader_comm}' \
-                     (parent '{parent_comm}') — legacy buffer-load interface, rarely \
-                     legitimate (T1547.006). Alert."
-                ),
-            ));
+                severity,
+                &why,
+            ))
+        };
+        let shown = path.as_deref().unwrap_or("(no file: init_module)");
+        match verdict {
+            // (1) The kernel vouches for the file: nothing to record.
+            ModuleLoadVerdict::Trusted => return None,
+            // (2) Let through by a signed decision: recorded.
+            ModuleLoadVerdict::Window | ModuleLoadVerdict::OptOut => {
+                return log(
+                    Severity::Medium,
+                    format!(
+                        "Kernel module {shown} loaded by '{loader_comm}' (parent \
+                         '{parent_comm}'), a file the agent does not vouch for — {kernel} \
+                         (T1547.006). Recorded."
+                    ),
+                );
+            }
+            ModuleLoadVerdict::Denied
+            | ModuleLoadVerdict::Recorded
+            | ModuleLoadVerdict::DkmsUnattested
+            | ModuleLoadVerdict::NotJudged => {}
         }
-
-        // (5) finit_module from a STANDARD path by an unexpected
-        // (non-allowlisted, non-kthread) loader — DKMS / installer /
-        // admin tool. Suspicious-but-not-conclusive → ALERT, no kill.
-        let p = path.as_deref().unwrap_or("(unresolved)");
-        Some(build_verdict(
-            self,
-            event,
-            ResponseAction::Log,
-            Severity::Medium,
-            &format!(
-                "Kernel module {p} loaded by unexpected loader '{loader_comm}' (parent \
-                 '{parent_comm}') — standard path but non-allowlisted loader (T1547.006). Alert."
+        // (3) NEAR-CERTAIN rootkit — a finit_module load from a NON-standard
+        // path, or one deeper than any module directory (external audit
+        // PROC-004: the loader chose that depth): kill the tree whatever
+        // the kernel did (refused, the attempt is the signal).
+        if *method == ModuleLoadMethod::Finit {
+            if let Some(p) = path {
+                let too_deep = nn_model::module_path_too_deep(p);
+                if too_deep
+                    || (!nn_model::module_path_is_truncated(p) && !is_standard_module_path(p))
+                {
+                    let place = if too_deep {
+                        "a path deeper than any module directory"
+                    } else {
+                        "a NON-standard path"
+                    };
+                    return Some(build_verdict(
+                        self,
+                        event,
+                        ResponseAction::KillProcessTree,
+                        Severity::Critical,
+                        &format!(
+                            "Kernel module loaded from {place} ({p}) by '{loader_comm}' \
+                             (parent '{parent_comm}') — legit modules live under \
+                             /lib/modules; near-certain rootkit (T1014 / T1547.006); \
+                             {kernel}. Kill tree + posture → COMBAT."
+                        ),
+                    ));
+                }
+            }
+        }
+        // (4) The kernel judged it untrusted (refused or recorded): High.
+        if *verdict != ModuleLoadVerdict::NotJudged {
+            let why = match (method, file) {
+                (ModuleLoadMethod::Init, _) => {
+                    "a module from memory (init_module): no file to trust".to_string()
+                }
+                (_, Some(f)) if *verdict == ModuleLoadVerdict::DkmsUnattested => format!(
+                    "the file {}:{} is a DKMS or akmods build its registry vouches for (the \
+                     same content), but it was written since boot outside a recognised package \
+                     transaction — built by hand, or before the agent started",
+                    f.dev, f.ino
+                ),
+                (_, Some(f)) if f.trust_flags == 0 => format!(
+                    "no package or DKMS vouches for the file {}:{} ({}, mode {:o}) as it is \
+                     now — not in the running kernel's tree, copied or changed by hand, or a \
+                     DKMS or akmods build written outside a package transaction that `enforce \
+                     R018` refuses (the agent's journal names why)",
+                    f.dev,
+                    f.ino,
+                    owner(f),
+                    f.mode
+                ),
+                (_, Some(f)) => format!(
+                    "the file {}:{} changed since the agent vouched for it, or its owner or \
+                     mode no longer protect it ({}, mode {:o})",
+                    f.dev,
+                    f.ino,
+                    owner(f),
+                    f.mode
+                ),
+                (_, None) => "the file could not be read".to_string(),
+            };
+            return log(
+                Severity::High,
+                format!(
+                    "Kernel module {shown} loaded by '{loader_comm}' (parent '{parent_comm}'): \
+                     {why} — {kernel} (T1547.006 / T1014)."
+                ),
+            );
+        }
+        // (5) Not judged: by the path and the package database.
+        if *method != ModuleLoadMethod::Finit {
+            return log(
+                Severity::High,
+                format!(
+                    "Kernel module loaded via init_module(2) by '{loader_comm}' (parent \
+                     '{parent_comm}') — a buffer, no file to trust; {kernel} (T1547.006). Alert."
+                ),
+            );
+        }
+        let Some(p) = path else {
+            return log(
+                Severity::High,
+                format!(
+                    "Kernel module loaded by '{loader_comm}' (parent '{parent_comm}') from a \
+                     file whose path the sensor could not read; {kernel} (T1547.006). Alert."
+                ),
+            );
+        };
+        if nn_model::module_path_is_truncated(p) {
+            // A kernel read failed: the origin is unknown, which is not the
+            // same as benign (external audit PROC-004).
+            return log(
+                Severity::High,
+                format!(
+                    "Kernel module loaded from a path the sensor could not read to the root \
+                     (components: {p}) by '{loader_comm}' (parent '{parent_comm}') — origin \
+                     unverifiable; {kernel}. Alert."
+                ),
+            );
+        }
+        // External audit PROC-005: a file no package installed and DKMS
+        // did not build was put there by hand.
+        match self.owners.of(p) {
+            Provenance::Package | Provenance::Dkms => None,
+            Provenance::Unowned => log(
+                Severity::High,
+                format!(
+                    "Kernel module {p} loaded by '{loader_comm}' (parent '{parent_comm}') is in \
+                     a module directory but no package installed it and DKMS did not build it; \
+                     {kernel} (T1547.006). Alert."
+                ),
             ),
-        ))
+            Provenance::Unknown => log(
+                Severity::Medium,
+                format!(
+                    "Kernel module {p} loaded by '{loader_comm}' (parent '{parent_comm}'), no \
+                     package database to ask who installed it; {kernel} (T1547.006). Alert."
+                ),
+            ),
+        }
     }
 }
 
@@ -263,29 +287,44 @@ mod tests {
     use super::*;
     // R08b (lab PR 251): on the portable test host.
     use crate::posture::host::testing::TestHost as H;
-    type CommAllowlist = crate::config::comm_allowlist::CommAllowlist<H>;
     type ModuleOwners = crate::decision::rules::module_provenance::ModuleOwners<H>;
     type R018KernelModuleLoad = super::R018KernelModuleLoad<H>;
+    use common::module_judge::{trust_flag, verdict as kv};
     use common::wire::{ModuleLoadRaw, MODULE_LOAD_FINIT, MODULE_LOAD_INIT};
 
-    fn allowlist() -> Arc<CommAllowlist> {
-        Arc::new(CommAllowlist::from_iter_owned(
-            ["systemd-udevd", "systemd-modules-load", "kmod"]
-                .into_iter()
-                .map(String::from),
-        ))
-    }
-
-    /// The rule on a host with no package database (provenance unknown:
-    /// judged by path and loader, as before PROC-005).
+    /// The rule on a host with no package database (provenance unknown).
     fn rule() -> R018KernelModuleLoad {
-        R018KernelModuleLoad::with_owners(allowlist(), ModuleOwners::new("/nonexistent-root"))
+        R018KernelModuleLoad::with_owners(ModuleOwners::new("/nonexistent-root"))
     }
 
-    /// External audit PROC-005: a module copied under /lib/modules — no
-    /// package lists it, DKMS did not build it — is the non-standard case
-    /// for an unexpected loader, an alert for a system loader; a packaged
-    /// one keeps its Medium alert.
+    const TREE: &[&str] = &[
+        "/",
+        "lib",
+        "modules",
+        "6.8.0",
+        "kernel",
+        "net",
+        "tls",
+        "tls.ko.zst",
+    ];
+
+    /// `raw` as the kernel judged it: `verdict`, and for a file its
+    /// identity with the trust entry's `flags`.
+    fn judged(mut r: ModuleLoadRaw, verdict: u8, flags: u32) -> ModuleLoadRaw {
+        r.verdict = verdict;
+        if r.method == MODULE_LOAD_FINIT {
+            r.file_dev = 0x0080_0001;
+            r.file_ino = 4242;
+            r.file_mode = 0o100_644;
+            r.trust_flags = flags;
+        }
+        r
+    }
+
+    /// External audit PROC-005, lot 285: a load the kernel did not judge
+    /// (its trust map not filled yet): a module copied under /lib/modules —
+    /// no package lists it, DKMS did not build it — is High whoever loads it
+    /// (no loader allowlist); a packaged one is not recorded.
     #[test]
     fn a_module_copied_under_lib_modules_is_not_standard() {
         let host = tempfile::TempDir::new().unwrap();
@@ -297,53 +336,30 @@ mod tests {
             "/lib/modules/6.8.0/kernel/fs/foo.ko\n",
         )
         .unwrap();
-        let r = R018KernelModuleLoad::with_owners(allowlist(), ModuleOwners::new(host.path()));
+        let r = R018KernelModuleLoad::with_owners(ModuleOwners::new(host.path()));
         let copied = [
             "/", "usr", "lib", "modules", "6.8.0", "kernel", "fs", "rk.ko",
         ];
-        let v = r
-            .evaluate(&ev(&raw(MODULE_LOAD_FINIT, "insmod", "bash", 0, &copied)))
-            .expect("fires");
-        assert_eq!(
-            (v.action, v.severity),
-            (ResponseAction::KillProcessTree, Severity::Critical)
-        );
-        let v = r
-            .evaluate(&ev(&raw(
-                MODULE_LOAD_FINIT,
-                "systemd-udevd",
-                "systemd",
-                0,
-                &copied,
-            )))
-            .expect("alerts");
-        assert_eq!(
-            (v.action, v.severity),
-            (ResponseAction::Log, Severity::High)
-        );
+        for (loader, parent) in [
+            ("insmod", "bash"),
+            ("systemd-udevd", "systemd"),
+            ("kmod", "kmod"),
+        ] {
+            let v = r
+                .evaluate(&ev(&raw(MODULE_LOAD_FINIT, loader, parent, 0, &copied)))
+                .expect("fires");
+            assert_eq!(
+                (v.action, v.severity),
+                (ResponseAction::Log, Severity::High),
+                "{loader}"
+            );
+        }
         let packaged = ["/", "lib", "modules", "6.8.0", "kernel", "fs", "foo.ko"];
-        let v = r
-            .evaluate(&ev(&raw(
-                MODULE_LOAD_FINIT,
-                "modprobe",
-                "bash",
-                0,
-                &packaged,
-            )))
-            .expect("alerts");
-        assert_eq!(
-            (v.action, v.severity),
-            (ResponseAction::Log, Severity::Medium)
-        );
-        assert!(r
-            .evaluate(&ev(&raw(
-                MODULE_LOAD_FINIT,
-                "systemd-udevd",
-                "systemd",
-                0,
-                &packaged
-            )))
-            .is_none());
+        for loader in ["modprobe", "systemd-udevd"] {
+            assert!(r
+                .evaluate(&ev(&raw(MODULE_LOAD_FINIT, loader, "bash", 0, &packaged)))
+                .is_none());
+        }
     }
 
     /// External audit PROC-005: a component that is not UTF-8 is kept, and
@@ -378,6 +394,7 @@ mod tests {
     /// 32-byte slots — so the test exercises the genuine
     /// `From<&ModuleLoadRaw>` reconstruction, not a hand-built Event.
     /// `path_root_to_leaf` is the human path order (e.g. `["/","tmp","x.ko"]`).
+    /// Not judged by the kernel ([`judged`] for a verdict).
     fn raw(
         method: u8,
         loader: &str,
@@ -451,6 +468,40 @@ mod tests {
         }
     }
 
+    /// Lot 285: the wire's verdict and file facts reach the event.
+    #[test]
+    fn from_carries_the_kernel_verdict_and_the_file() {
+        let e = ev(&judged(
+            raw(MODULE_LOAD_FINIT, "modprobe", "bash", 0, TREE),
+            kv::DENIED,
+            0,
+        ));
+        let Event::ModuleLoad { verdict, file, .. } = e else {
+            panic!("not ModuleLoad")
+        };
+        assert_eq!(verdict, ModuleLoadVerdict::Denied);
+        let f = file.expect("the file");
+        assert_eq!(
+            (f.dev, f.ino, f.mode, f.trust_flags),
+            (0x0080_0001, 4242, 0o100_644, 0)
+        );
+        let e = ev(&judged(
+            raw(MODULE_LOAD_INIT, "x", "bash", 0, &[]),
+            kv::RECORDED,
+            0,
+        ));
+        let Event::ModuleLoad { verdict, file, .. } = e else {
+            panic!("not ModuleLoad")
+        };
+        assert_eq!((verdict, file), (ModuleLoadVerdict::Recorded, None));
+        // an older object: no verdict
+        let Event::ModuleLoad { verdict, .. } = ev(&raw(MODULE_LOAD_FINIT, "x", "y", 0, TREE))
+        else {
+            panic!("not ModuleLoad")
+        };
+        assert_eq!(verdict, ModuleLoadVerdict::NotJudged);
+    }
+
     /// Audit `abi-modpath-1`: a 12-component stock path
     /// (`mcp251xfd.ko.zst`) must reconstruct WITH its prefix and be
     /// classified standard — it used to lose `/usr/lib/modules`.
@@ -480,110 +531,290 @@ mod tests {
         }
         let v = rule()
             .evaluate(&e)
-            .expect("non-allowlisted loader still alerts");
+            .expect("no package database: still recorded");
         assert_eq!(v.action, ResponseAction::Log);
         assert_eq!(v.severity, Severity::Medium);
     }
 
     /// External audit PROC-004: a path deeper than the 16-slot budget is
     /// deeper than any module directory — the depth the loader chose must
-    /// not turn the kill into an alert, allowlisted loader or not.
+    /// not turn the kill into an alert, whoever loads it and whatever the
+    /// kernel did.
     #[test]
     fn too_deep_path_is_not_downgraded() {
         let leaf_side: Vec<String> = (0..15).map(|i| format!("d{i}")).collect();
         let mut comps: Vec<&str> = leaf_side.iter().map(String::as_str).collect();
         comps.push("evil.ko");
         for (loader, parent) in [("insmod", "bash"), ("systemd-udevd", "systemd")] {
-            let e = ev(&raw_too_deep(loader, parent, &comps));
-            let Event::ModuleLoad { ref path, .. } = e else {
-                panic!("not ModuleLoad")
-            };
-            let p = path.as_deref().unwrap();
-            assert!(nn_model::module_path_too_deep(p), "{p}");
-            let v = rule().evaluate(&e).expect("fires");
-            assert_eq!(v.action, ResponseAction::KillProcessTree, "{loader}");
-            assert_eq!(v.severity, Severity::Critical);
+            for verdict in [kv::NOT_JUDGED, kv::DENIED, kv::RECORDED] {
+                let e = ev(&judged(raw_too_deep(loader, parent, &comps), verdict, 0));
+                let Event::ModuleLoad { ref path, .. } = e else {
+                    panic!("not ModuleLoad")
+                };
+                let p = path.as_deref().unwrap();
+                assert!(nn_model::module_path_too_deep(p), "{p}");
+                let v = rule().evaluate(&e).expect("fires");
+                assert_eq!(v.action, ResponseAction::KillProcessTree, "{loader}");
+                assert_eq!(v.severity, Severity::Critical);
+            }
         }
     }
 
     /// A path a failed read left unknown comes back RELATIVE and must never
     /// take the Critical/KillTree branch — but unknown is not benign
-    /// (external audit PROC-004): High, not Medium.
+    /// (external audit PROC-004): High, whoever loads it (lot 285: no
+    /// allowlisted loader keeps it silent).
     #[test]
     fn unreadable_path_is_high_log_never_killtree() {
         // No leading "/" component → raw() marks it truncated.
         let tail = ["6.8.0-124-generic", "kernel", "drivers", "x", "deep.ko.zst"];
-        let e = ev(&raw(MODULE_LOAD_FINIT, "insmod", "bash", 0, &tail));
-        match e {
-            Event::ModuleLoad { ref path, .. } => {
-                let p = path.as_deref().unwrap();
-                assert!(
-                    !p.starts_with('/'),
-                    "truncated path must stay relative: {p}"
-                );
-                assert!(nn_model::module_path_is_truncated(p));
+        for (loader, parent) in [("insmod", "bash"), ("systemd-udevd", "systemd")] {
+            let e = ev(&raw(MODULE_LOAD_FINIT, loader, parent, 0, &tail));
+            match e {
+                Event::ModuleLoad { ref path, .. } => {
+                    let p = path.as_deref().unwrap();
+                    assert!(
+                        !p.starts_with('/'),
+                        "truncated path must stay relative: {p}"
+                    );
+                    assert!(nn_model::module_path_is_truncated(p));
+                }
+                _ => panic!("not ModuleLoad"),
             }
-            _ => panic!("not ModuleLoad"),
+            let v = rule().evaluate(&e).expect("alert");
+            assert_eq!(v.action, ResponseAction::Log);
+            assert_eq!(v.severity, Severity::High);
         }
-        let v = rule().evaluate(&e).expect("alert");
-        assert_eq!(v.action, ResponseAction::Log);
-        assert_eq!(v.severity, Severity::High);
-
-        // Allowlisted loader + truncated path: silent, like a standard path.
-        let e2 = ev(&raw(
-            MODULE_LOAD_FINIT,
-            "systemd-udevd",
-            "systemd",
-            0,
-            &tail,
-        ));
-        assert!(rule().evaluate(&e2).is_none());
     }
 
-    // ── exempt conditions ──────────────────────────────────────────
+    /// Lot 285: a kernel thread's child is no exemption — the kernel judges
+    /// the file (a request_module's modprobe loads trusted files).
     #[test]
-    fn exempt_kthread() {
-        // kernel-driven load — even from /tmp (impossible in practice,
-        // but the non-forgeable signal is trusted first).
-        let v = rule().evaluate(&ev(&raw(
-            MODULE_LOAD_FINIT,
-            "modprobe",
-            "kworker/0:1",
-            1,
-            &["/", "tmp", "x.ko"],
-        )));
-        assert!(v.is_none(), "kthread-driven load must be exempt");
-    }
-
-    #[test]
-    fn exempt_allowlisted_loader() {
-        let v = rule().evaluate(&ev(&raw(
-            MODULE_LOAD_FINIT,
-            "kmod",
-            "systemd",
-            0,
-            &["/", "usr", "lib", "modules", "6.8.0", "kernel", "x.ko"],
-        )));
-        assert!(
-            v.is_none(),
-            "allowlisted loader (kmod) on a standard path must not fire"
+    fn a_kernel_thread_parent_is_no_exemption() {
+        let v = rule()
+            .evaluate(&ev(&raw(
+                MODULE_LOAD_FINIT,
+                "modprobe",
+                "kworker/0:1",
+                1,
+                &["/", "tmp", "x.ko"],
+            )))
+            .expect("judged by the file");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        let trusted = judged(
+            raw(MODULE_LOAD_FINIT, "modprobe", "kworker/0:1", 1, TREE),
+            kv::TRUSTED,
+            trust_flag::PACKAGE,
         );
+        assert!(rule().evaluate(&ev(&trusted)).is_none());
     }
 
+    /// Named test (lot 285): R018's loader allowlist by `comm` is gone — a
+    /// process named `kmod`, `systemd-udevd` or `systemd-modules` that loads
+    /// a file the kernel does not trust is recorded like any other, and a
+    /// trusted file is silent whoever loads it.
     #[test]
-    fn exempt_allowlisted_parent() {
-        // boot modprobe under systemd-udevd: loader=modprobe (not
-        // allowlisted) but parent=systemd-udevd (allowlisted) → exempt.
-        let v = rule().evaluate(&ev(&raw(
-            MODULE_LOAD_FINIT,
-            "modprobe",
-            "systemd-udevd",
-            0,
-            &["/", "lib", "modules", "6.8.0", "kernel", "snd.ko"],
-        )));
+    fn r018_comm_allowlist_removed() {
+        for (loader, parent) in [
+            ("kmod", "systemd"),
+            ("modprobe", "systemd-udevd"),
+            ("systemd-modules", "systemd"),
+            ("insmod", "bash"),
+        ] {
+            for verdict in [kv::DENIED, kv::RECORDED] {
+                let v = rule()
+                    .evaluate(&ev(&judged(
+                        raw(MODULE_LOAD_FINIT, loader, parent, 0, TREE),
+                        verdict,
+                        0,
+                    )))
+                    .unwrap_or_else(|| panic!("{loader}/{parent} recorded"));
+                assert_eq!(
+                    (v.action, v.severity),
+                    (ResponseAction::Log, Severity::High),
+                    "{loader}"
+                );
+            }
+            assert!(rule()
+                .evaluate(&ev(&judged(
+                    raw(MODULE_LOAD_FINIT, loader, parent, 0, TREE),
+                    kv::TRUSTED,
+                    trust_flag::PACKAGE,
+                )))
+                .is_none());
+        }
+        // the rule set builds R018 with nothing to allowlist
+        let rules = crate::decision::rules::module_load_rules::<H>();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id(), "R018_KernelModuleLoad");
+        let src = include_str!("r018_kernel_module_load.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap()];
         assert!(
-            v.is_none(),
-            "load under an allowlisted auto-loader parent must not fire"
+            !code.contains("CommAllowlist"),
+            "R018 keeps a comm allowlist"
+        );
+        let mod_rs = include_str!("mod.rs");
+        let builder = &mod_rs[mod_rs.find("pub fn module_load_rules").unwrap()..];
+        let builder = &builder[..builder.find("\n}\n").unwrap()];
+        assert!(!builder.contains("CommAllowlist"), "{builder}");
+    }
+
+    /// Lot 285: the kernel's verdicts — refused or recorded in the tree:
+    /// High; a window or a signed opt-out: Medium; from /tmp: the kill.
+    #[test]
+    fn the_kernel_verdicts() {
+        let r = rule();
+        let at = |verdict, flags| {
+            r.evaluate(&ev(&judged(
+                raw(MODULE_LOAD_FINIT, "modprobe", "bash", 0, TREE),
+                verdict,
+                flags,
+            )))
+        };
+        let v = at(kv::DENIED, 0).unwrap();
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        assert!(
+            v.reasoning.contains("REFUSED by the kernel"),
+            "{}",
+            v.reasoning
+        );
+        assert!(
+            v.reasoning.contains("no package or DKMS vouches"),
+            "{}",
+            v.reasoning
+        );
+        let v = at(kv::RECORDED, trust_flag::PACKAGE).unwrap();
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        assert!(v.reasoning.contains("the record mode"), "{}", v.reasoning);
+        assert!(
+            v.reasoning.contains("changed since the agent vouched"),
+            "{}",
+            v.reasoning
+        );
+        assert!(v.reasoning.contains("(owned by root, mode 100644)"));
+        // another account's file: said so, the account not named
+        let mut theirs = judged(
+            raw(MODULE_LOAD_FINIT, "modprobe", "bash", 0, TREE),
+            kv::DENIED,
+            0,
+        );
+        theirs.file_uid = 1000;
+        let v = r.evaluate(&ev(&theirs)).unwrap();
+        assert!(
+            v.reasoning.contains("(not owned by root, mode 100644)")
+                && !v.reasoning.contains("1000"),
+            "{}",
+            v.reasoning
+        );
+        let v = at(kv::WINDOW, 0).unwrap();
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::Medium)
+        );
+        assert!(
+            v.reasoning.contains("trusted-installer window"),
+            "{}",
+            v.reasoning
+        );
+        assert!(at(kv::TRUSTED, trust_flag::DKMS).is_none());
+        let v = r
+            .evaluate(&ev(&judged(
+                raw(
+                    MODULE_LOAD_FINIT,
+                    "insmod",
+                    "bash",
+                    0,
+                    &["/", "tmp", "rk.ko"],
+                ),
+                kv::DENIED,
+                0,
+            )))
+            .unwrap();
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::KillProcessTree, Severity::Critical)
+        );
+        assert!(
+            v.reasoning.contains("REFUSED by the kernel"),
+            "{}",
+            v.reasoning
+        );
+        let v = r
+            .evaluate(&ev(&judged(
+                raw(MODULE_LOAD_INIT, "x", "bash", 0, &[]),
+                kv::DENIED,
+                0,
+            )))
+            .unwrap();
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        assert!(v.reasoning.contains("from memory"), "{}", v.reasoning);
+    }
+
+    /// Named test (lot 285, the rule's half): a load a signed per-module
+    /// opt-out let through is recorded (Medium), never silent.
+    #[test]
+    fn a_signed_per_module_opt_out_is_allowed_and_recorded() {
+        let v = rule()
+            .evaluate(&ev(&judged(
+                raw(MODULE_LOAD_FINIT, "modprobe", "bash", 0, TREE),
+                kv::OPT_OUT,
+                trust_flag::OPT_OUT,
+            )))
+            .expect("recorded");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::Medium)
+        );
+        assert!(v.reasoning.contains("opt-out"), "{}", v.reasoning);
+    }
+
+    /// Named test (lot 285, the coordinator's matrix, the rule's half): a
+    /// DKMS or akmods build the kernel let through as unattested (written
+    /// since boot outside a recognised package transaction) is recorded
+    /// High, never silent, never killed in the tree; the wire's verdict
+    /// reaches the event.
+    #[test]
+    fn a_registered_dkms_build_written_outside_a_transaction_is_recorded_high() {
+        let dkms_tree: &[&str] = &[
+            "/",
+            "lib",
+            "modules",
+            "6.8.0",
+            "updates",
+            "dkms",
+            "zfs.ko.zst",
+        ];
+        let e = ev(&judged(
+            raw(MODULE_LOAD_FINIT, "modprobe", "bash", 0, dkms_tree),
+            kv::UNATTESTED,
+            trust_flag::UNATTESTED,
+        ));
+        let Event::ModuleLoad { verdict, .. } = &e else {
+            panic!("not ModuleLoad")
+        };
+        assert_eq!(*verdict, ModuleLoadVerdict::DkmsUnattested);
+        assert!(!verdict.refused());
+        let v = rule().evaluate(&e).expect("recorded");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        assert!(
+            v.reasoning.contains("registry vouches for")
+                && v.reasoning
+                    .contains("outside a recognised package transaction")
+                && v.reasoning.contains("let through by the default policy"),
+            "{}",
+            v.reasoning
         );
     }
 
@@ -610,9 +841,8 @@ mod tests {
         );
     }
 
-    /// SECURITY-CRITICAL: a load from /tmp must fire Critical EVEN when
-    /// the loader's comm is allowlisted (forged) — the non-standard-path
-    /// check precedes the allowlist, so the allowlist cannot blind it.
+    /// SECURITY-CRITICAL: a load from /tmp must fire Critical whatever the
+    /// loader's comm.
     #[test]
     fn nonstandard_path_fires_even_with_allowlisted_loader() {
         let v = rule()
@@ -623,7 +853,7 @@ mod tests {
                 0,
                 &["/", "tmp", "evil.ko"],
             )))
-            .expect("non-standard path must fire even for an allowlisted comm");
+            .expect("non-standard path must fire whatever the comm");
         assert_eq!(v.severity, Severity::Critical);
         assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
@@ -632,13 +862,18 @@ mod tests {
     fn fire_legacy_init_module_is_high_log() {
         let v = rule()
             .evaluate(&ev(&raw(MODULE_LOAD_INIT, "python3", "bash", 0, &[])))
-            .expect("legacy init_module by a non-exempt loader must fire");
+            .expect("init_module must fire");
         assert_eq!(v.severity, Severity::High);
         assert_eq!(v.action, ResponseAction::Log); // alert, NOT kill
+        assert!(
+            v.reasoning.contains("init_module(2)") && v.reasoning.contains("no file to trust"),
+            "{}",
+            v.reasoning
+        );
     }
 
     #[test]
-    fn fire_stdpath_unexpected_loader_is_medium_log() {
+    fn fire_stdpath_without_a_package_database_is_medium_log() {
         let v = rule()
             .evaluate(&ev(&raw(
                 MODULE_LOAD_FINIT,
@@ -647,34 +882,9 @@ mod tests {
                 0,
                 &["/", "lib", "modules", "6.8.0", "updates", "nvidia.ko"],
             )))
-            .expect("standard path + unexpected loader must fire");
+            .expect("standard path, provenance unknown, not judged: recorded");
         assert_eq!(v.severity, Severity::Medium);
         assert_eq!(v.action, ResponseAction::Log); // alert, NOT kill
-    }
-
-    // ── negative control ───────────────────────────────────────────
-    #[test]
-    fn negative_stdpath_allowlisted_loader_does_not_fire() {
-        let v = rule().evaluate(&ev(&raw(
-            MODULE_LOAD_FINIT,
-            "kmod",
-            "systemd-modules-load",
-            0,
-            &[
-                "/",
-                "lib",
-                "modules",
-                "6.8.0",
-                "kernel",
-                "net",
-                "tls",
-                "tls.ko.zst",
-            ],
-        )));
-        assert!(
-            v.is_none(),
-            "a legit /lib/modules load by an allowlisted loader must stay silent"
-        );
     }
 
     #[test]

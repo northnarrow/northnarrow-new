@@ -940,7 +940,7 @@ lab_purge_pins() {
 agent_exe=$(systemctl show -p ExecStart --value northnarrow-agent 2>/dev/null | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)
 agent_exe=${agent_exe:-/usr/local/bin/northnarrow-agent}
 nn_admin=$(dirname "$agent_exe")/nn-admin
-if sudo test -d /sys/fs/bpf/northnarrow || sudo test -d /sys/fs/bpf/northnarrow-sysctl || sudo sh -c 'ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* >/dev/null 2>&1'; then
+if sudo test -d /sys/fs/bpf/northnarrow || sudo test -d /sys/fs/bpf/northnarrow-sysctl || sudo test -d /sys/fs/bpf/northnarrow-module-writes || sudo sh -c 'ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* >/dev/null 2>&1'; then
     # The window can only be opened through a running agent. After an e2e
     # run the fixtures' pins are still there (protected) and the installed
     # agent is stopped: start it — as a protected pid it purges the stale
@@ -982,15 +982,15 @@ if sudo test -d /sys/fs/bpf/northnarrow || sudo test -d /sys/fs/bpf/northnarrow-
     sudo rm -rf /sys/fs/bpf/northnarrow 2>/dev/null
     sudo test -d /sys/fs/bpf/northnarrow && echo PINS_PROTECTED
     # Lot 277 (the re-review of #494, R2): the tracker's pins, beside the root;
-    # lot 280a: the cgroup/sysctl judge's.
-    for d in $(sudo sh -c 'ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* /sys/fs/bpf/northnarrow-sysctl 2>/dev/null'); do
+    # lot 280a: the cgroup/sysctl judge's; lot 285: the module write history's.
+    for d in $(sudo sh -c 'ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* /sys/fs/bpf/northnarrow-sysctl /sys/fs/bpf/northnarrow-module-writes 2>/dev/null'); do
         sudo test -d "$d" || continue
         sudo rm -rf "$d" 2>/dev/null
         sudo test -d "$d" && echo PINS_PROTECTED
     done
     # ... and their registration (the third review of #494, R2-b): a purge
     # is a fresh start, not "marks lost between agents".
-    sudo rm -f /run/northnarrow/cgroup-join-pins 2>/dev/null
+    sudo rm -f /run/northnarrow/cgroup-join-pins /run/northnarrow/module-writes-pins 2>/dev/null
     # tamper-check leftovers (protected while an agent ran; the window is open now)
     sudo rm -f /etc/northnarrow/zz-tamper-*.local 2>/dev/null
     sudo rm -rf /run/systemd/system.control/northnarrow-agent.service.d 2>/dev/null

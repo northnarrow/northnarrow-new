@@ -571,6 +571,26 @@ pub(super) const DOCS: &[RuleDoc] = &[
         attack_note: "T1548: ATT&CK has no sub-technique for Linux file capabilities (T1548.001 is \
             the set-id bits).",
     },
+    RuleDoc {
+        id: "NN-L-FIM-026_ModprobeConfigWritten",
+        severities: &[Severity::High, Severity::Low],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::File],
+        data_components: &["DC0039", "DC0061"],
+        observes: "Lot 285: a file of kmod's configuration directories (/etc, /run, \
+            /usr/local/lib, /lib and /usr/lib modprobe.d, /etc/modprobe.conf) created, changed, \
+            renamed in, linked or removed: an `install` or `remove` directive runs a command as \
+            root whenever the module is asked for. High outside a package transaction (the \
+            writer's lineage at the write), Low inside one; never a kill (the write is done).",
+        false_positives: "An administrator's own blacklist or options file is recorded at High; \
+            a package's at Low. A directory absent at the agent's start is not watched.",
+        how_to_test: "`echo 'install dummy /bin/true' | sudo tee /etc/modprobe.d/nn-test.conf`, \
+            then remove it; expect High, Log.",
+        tests: &["crates/nn-core/src/fim/rules.rs::\
+            fim026_records_a_modprobe_d_write_outside_a_package_transaction"],
+        attack_note: "T1547.006: the directive is a kernel module's configuration, run by \
+            `modprobe` (R011 records the command it runs).",
+    },
     // ── ransomware, decisive (lab PR 225, CM-16) ────────────────────
     RuleDoc {
         id: "NN-L-IMP-001_RansomwareEncryption",

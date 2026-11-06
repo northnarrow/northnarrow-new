@@ -681,3 +681,71 @@ others. What an operator sees change:
   pinned `northnarrow-cgroup-join-v2_*` map fails with `EPERM` for every
   caller, root and the agent included. The start no longer sweeps dead
   processes' marks (a dead group's mark goes at its pid's next fork).
+
+## 13. Kernel module loads judged in the kernel (lot 285)
+
+- **A module load of a file the agent does not vouch for is refused**
+  (`EPERM`), outside a signed trusted-installer window, by default — and
+  every `init_module` from memory (`RULE_POLICY.md` §2.4). The agent vouches
+  for the module files of the running kernel's tree that a verified
+  package installed or DKMS built (unchanged since boot), that a package
+  transaction wrote since boot, or that a signed `module-allow <module>`
+  names. Who loads does not matter: `modprobe`, `udev`, a service, a
+  process of its own.
+- **GPU and DKMS hosts keep loading their modules** (the coordinator's
+  matrix, `RULE_POLICY.md` §2.4). A DKMS build in `updates/dkms/`, or an
+  akmods `kmod-*` package's file in `extra/`, whose content is the build
+  DKMS registered for the running kernel (compared byte for byte with
+  `/var/lib/dkms/…/module/`) or the digest the package database recorded,
+  is trusted when it was written before this boot or inside a package
+  transaction (`apt`, `dpkg`, `rpm`, `dnf`, `dnf5`, `yum`: dnf's and yum's
+  Python script recognised by the file their exec named). Written since
+  boot outside one — a root shell's `dkms install`, `akmods` at boot
+  before the agent started — it is **let through and recorded High**
+  (`R018`, "let through by the default policy"); with a signed
+  `enforce R018_KernelModuleLoad` it is refused. **A file in those
+  directories that DKMS's registry and the packages do not vouch for is
+  refused**, like a file outside the tree, a copy, a buffer, and a
+  packaged file elsewhere in the tree changed since boot outside a
+  transaction.
+- **Before the upgrade, list what would be refused.** A module copied into
+  `/lib/modules` by hand (`make modules_install`), a vendor's `.run`
+  installer's module (not DKMS-registered), a file of `updates/dkms/` or
+  `extra/` that is not the registered build: untrusted, refused. After the
+  upgrade the agent names each such file in its journal at its start
+  (`module-load judge: a module file NOT trusted`, with why); the summary
+  line counts the DKMS or akmods builds let through and recorded. Sign a
+  `module-allow <module>` for each module the host needs, or put the deny
+  off for the time being with a signed `alert R018_KernelModuleLoad` (the
+  record mode: every untrusted load let through and recorded High).
+- **The module files' write history goes through the upgrade**: its maps
+  and observer are pinned beside the pin root
+  (`/sys/fs/bpf/northnarrow-module-writes`, protected, kept by the
+  upgrade's purge, removed by `uninstall.sh`), and the new agent adopts the
+  history of this boot's package transactions — a package of modules for
+  the running kernel installed earlier in the boot stays trusted. A history
+  the new agent cannot adopt (another version's layout) is reset, signed:
+  until the next boot the files changed since boot before the new agent
+  started are let through and recorded High when a package or DKMS vouches
+  for them. The first upgrade to this release finds no history: the same,
+  for the files written this boot before it.
+- **Residual, by design**: root who writes a module file into a DKMS
+  output directory AND registers the same content in DKMS's state
+  (`/var/lib/dkms/<package>/<version>/<release>/<arch>/module/`) gets a
+  High record, not a refusal, unless the policy enforces R018. Hosts with
+  no DKMS or akmods modules lose nothing by `enforce R018_KernelModuleLoad`.
+- **What the boot loads before the agent starts is not judged** (the
+  initramfs, `systemd-modules-load`, udev's first pass). From the agent's
+  start until its trust map is filled (the first seconds) nothing is judged
+  either; R018 judges those loads by the path, as before.
+- **R018 has no loader allowlist any more**: a trusted file is silent
+  whoever loads it (no more Medium for a standard module by an unexpected
+  loader); an untrusted one is recorded High whoever loads it (no more
+  silence for `kmod`, `systemd-udevd`, `systemd-modules-load`); a file
+  outside `/lib/modules` still has its loader's tree killed.
+- **New records**: NN-L-FIM-026 for a write in a `modprobe.d` directory
+  (High outside a package transaction), R011 Medium for a command a
+  `modprobe.d` `install`/`remove` directive runs. The FIM watch list gains
+  `/run`, `/usr/local/lib`, `/lib` and `/usr/lib` `modprobe.d`; an
+  unmodified `fim-paths.v1` of an earlier release is replaced by the
+  install, as for every shipped list.

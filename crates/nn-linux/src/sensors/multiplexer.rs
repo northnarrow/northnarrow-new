@@ -331,9 +331,14 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         // directory, beside the pin root — an upgrade's purge of the root
         // leaves the marks.
         crate::cgroup_join::prepare_pins(&mut loader, pin_root, joined_entries);
+        // Lot 285: the module files' write history, beside it too.
+        crate::module_writes::prepare_pins(&mut loader, pin_root);
         let mut ebpf = loader
             .load(EBPF_BYTES)
             .with_context(|| "loading eBPF object (BTF, maps, programs)")?;
+        // Lot 285: the history's maps checked or pinned, and frozen, before
+        // the module-load judge's controller takes them.
+        let _ = crate::module_writes::after_load(&mut ebpf, pin_root);
         // External audit ATP-013: every map's id, before the ring buffers
         // and RING_DROPS are taken out of the object below — the BPF guard
         // registers them as the agent's own from this record (R11c, lab PR
@@ -2014,6 +2019,8 @@ mod module_path_tests {
             parent_is_kthread: false,
             path: Some(path.into()),
             timestamp_ns: 0,
+            verdict: Default::default(),
+            file: None,
         };
         let rk = "/lib/modules/6.8.0-1-generic/extra/k269-rk.ko";
         let e = placed(&raw, load(rk), &mut mounts, &owners);

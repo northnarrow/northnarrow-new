@@ -1,5 +1,5 @@
 # NorthNarrow — V2 validation campaign — frozen rule denominator.
-# version: 4
+# version: 5
 # frozen: 2026-10-15, before any V2 run (external audit NN-AUD-217, NN-AUD-235).
 # version 2 (2026-10-16, lab PR 163, before any V2 run): NN-L-NET-003 leaves
 # the Critical sub-gate (gate -), inactive until BUG-025 (no sensor produces
@@ -23,8 +23,13 @@
 # NN-L-NET-003 judges), and NN-L-NET-003 is Medium and Log, a fingerprint
 # being an attribute, not an identity (R6 of the external review of 04/11):
 # it cannot issue a Critical verdict and stays out of the sub-gate (gate -).
+# version 5 (2026-11-06, lot 285, before any V2 run): NN-L-FIM-026 (a write
+# in kmod's configuration directories, modprobe.d: High outside a package
+# transaction, Low inside one, never a kill), family fim, out of the sub-gate
+# (gate -). R018 stays in the sub-gate (its kill of a load from outside
+# /lib/modules is unchanged; the kernel now refuses an untrusted file).
 #
-# One row per rule the agent can record: the 85 rules the production engine
+# One row per rule the agent can record: the 86 rules the production engine
 # loads (decision::rules::default_rules_with_net) and NN-L-AT-001 and
 # NN-L-EPG-001/002, which process_event issues outside the engine. The rule-coverage headline and the
 # Critical sub-gate are computed over these rows and no others; matrix.md
@@ -99,6 +104,7 @@ NN-L-FIM-022_LdSoPreloadModified	fim	engine	critical	yes	in
 NN-L-FIM-023_SystemdTimerCreated	fim	engine	-	-	in
 NN-L-FIM-024_AntiTamperHoneypotModified	fim	engine	critical	-	in
 NN-L-FIM-025_FileCapabilityGranted	fim	engine	critical	-	in
+NN-L-FIM-026_ModprobeConfigWritten	fim	engine	-	-	in
 NN-L-IMP-001_RansomwareEncryption	impact	engine	critical	-	in
 NN-L-IMP-002_RenameExtensionBurst	impact	engine	-	-	in
 NN-L-EVA-001_SecurityServiceStopped	evasion	engine	-	-	in

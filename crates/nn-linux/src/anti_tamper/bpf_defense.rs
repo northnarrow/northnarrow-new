@@ -642,7 +642,9 @@ pub fn write_own_prog_ids(ebpf: &Ebpf, path: &Path) -> Result<usize> {
 /// purge of it: the start-in-cgroup tracker's (lot 277) and, lot 280a, the
 /// `cgroup/sysctl` judge's.
 fn kept_program(name: &str) -> bool {
-    crate::cgroup_join::is_kept_program(name) || crate::sysctl_cgroup::is_kept_program(name)
+    crate::cgroup_join::is_kept_program(name)
+        || crate::sysctl_cgroup::is_kept_program(name)
+        || crate::module_writes::is_kept_program(name)
 }
 
 /// The body of the [`OWN_IDS_FILE_NAME`] file. The scripts read the first
