@@ -7426,3 +7426,126 @@ number in parentheses is a lab PR.
     self-test or a stated attach check each round, but C23's step to 3
     asks a periodic self-test of every deny hook, and the round exercises
     two.
+- **Lot 281 — C15/C23: an exemption is revoked when code is injected into
+  the exempt process; #494's notes N1 and N2 (Wave 4 phase 3, wave 1).**
+  - What was open: an exemption by executable (its file's digest), cgroup
+    or unit covered whatever the process's memory held once a debugger, a
+    write handle on its `/proc/<pid>/mem` or `process_vm_writev` had
+    changed it (`RULE_POLICY.md` §2.1 named it as not covered); the
+    re-review of #494 left two notes on the tracker's maps: N1, a new
+    generation's directory made before the load, the loader taking any map
+    planted at a pin's path; N2, a handle on the maps taken in a window or
+    an upgrade's gap staying good after it.
+  - What changed: the start-in-cgroup tracker's two BPF LSM programs
+    (`ptrace_access_check`: attach mode, the call read from the caller's
+    own registers — `process_vm_readv` and a read-only open of a procfs
+    file are reads, everything else an injection, a call unread included;
+    `ptrace_traceme`) taint the target's mark (`how` 0x80, passed on at a
+    fork as 0x40, kept through a move), never the family's accesses, PID 1
+    or a protected process; no exemption by executable, cgroup or unit holds
+    for a tainted process (a uid's does), the match judged by its mode and
+    the record's match naming the exemption revoked and why; the first
+    injection into a process an exemption covered signed (NN-L-AT-001
+    `exempt_injection`: High from an administrator's interactive sudo/su
+    session, Critical otherwise). N1: a new generation's maps made by the
+    load and pinned after it in a directory the start makes then (a plant
+    — `EEXIST` at a pin's path, anything else in it — moves them to the next
+    generation, signed); an adoption's ids checked after the load. N2: the
+    four pinned maps frozen (`BPF_MAP_FREEZE`; an adopted map's state read
+    from its fdinfo), a reset's instant asked for in a per-load map the
+    fork program takes in forward only; no exemption by executable, cgroup
+    or unit honoured until the tracker is armed (its pins and record
+    protected). Schema 2: the upgrade is a signed reset.
+  - The lab, as measured (our own guests under lease k281, one at a
+    time; `nn-lab.sh inject-check`, `tracker-gap-check`, the tracker's
+    privileged e2e):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`, systemd 255). `verifier-check`
+      100 programs, 98 OK, 2 not counted, 0 failing — `cgroup_join_inject`
+      772 instructions, `cgroup_join_traceme` 315, `mark` 991, `fork` 832,
+      `born` 412, `exit` 149, `src` 47. `inject-check` 9/9 (the last run,
+      2f21af19): a read-only peek at the waiting exempt service
+      (`/proc/<pid>/mem` read, 16 bytes) left no mark and its action stayed
+      exempt (300 of 300 files, recorded only); an attach by root's
+      `ptrace(PTRACE_ATTACH)` from the lab's ssh session tainted the
+      service's main process (`injected`, by the attacher), the injection
+      was signed (NN-L-AT-001 `exempt_injection`, Critical: no interactive
+      sudo session), and its next action was judged — `enforce`, killed
+      at 21 of 300 files, the signed record's match `revoked: "unit
+      nn-lab-exempt.service: code-injection access to it was given to pid
+      …"`; inside a window the four maps refused a write through a handle
+      (EPERM). Lot 277's `exempt-check` 14/14 (50 starts each). N2: an
+      attach 0.14 s after the old agent went down in an `install.sh
+      --upgrade` (18.00 s; the agent inactive) was tainted by the pinned
+      programs and found by the new agent (the directory adopted, no
+      reset); the old agent down → the new one starting 5.18 s, starting →
+      armed 4.62 s (`since_plan_ms` 4,464), 9.80 s in all with no exemption
+      honoured (a run before: 5.54, 4.63, 10.17 s). N1, a cold boot: the
+      agent started at 10.46 s after the kernel, its tracker attached at
+      16.33 s and armed at 16.57 s (`since_plan_ms` 5,633, a new
+      generation); a fresh install armed 5,332 to 5,457 ms after the plan.
+      The tracker e2e: 16 of 16 on 2f21af19 (the seven named of this lot, the nine of lot 277).
+      - Found by the lab, fixed: a second `BPF_MAP_FREEZE` answers `EPERM`,
+        not `EBUSY` (`map_freeze` checks the descriptor's write right, which
+        a frozen map has lost, first): every adoption left the tracker
+        absent (fail closed, every exemption refused; the e2e 4 of 15) —
+        the state now read from the fdinfo; the e2e's `process_vm_*` calls
+        passed 32-bit ints to the variadic `syscall` and got `EINVAL`
+        before the check (now `long`s, `EFAULT` asserted).
+    - **Ubuntu 22.04** (`5.15.0-202-generic`, 2f21af19): `verifier-check`
+      100 programs, 95 OK, 5 not counted, 0 failing, the tracker's seven
+      with the same instruction counts; `inject-check` 9/9 (the peek's
+      `process_vm_readv` 16 bytes, no mark; the attach tainted, signed
+      Critical, the action killed at 20 of 300, the record's `revoked`);
+      armed 905 ms after the plan. Both guests uninstalled, clean and off.
+  - Host: named tests `code_injection_access_is_told_from_a_read`,
+    `the_taint_is_passed_on_and_never_cleaned`,
+    `the_epoch_request_only_moves_the_epoch_forward`,
+    `an_exemption_is_revoked_once_code_was_injected`,
+    `a_revoked_exemption_leaves_the_match_judged`,
+    `an_injection_into_an_exempt_process_is_high_or_critical`,
+    `a_revoked_exemption_is_in_the_signed_record`,
+    `the_check_reads_the_placement_and_the_taint_from_one_mark`,
+    `a_frozen_map_is_told_by_its_fdinfo`,
+    `a_map_frozen_before_is_told_from_a_failed_freeze`,
+    `a_new_generation_is_made_by_the_start_and_holds_its_maps_alone`,
+    `an_adoption_takes_only_the_registered_maps`,
+    `a_refused_write_names_its_errno`, and the xtask ratchets; privileged:
+    `a_ptrace_attach_to_an_exempt_process_revokes_it_and_is_signed`,
+    `a_read_only_proc_mem_open_does_not_revoke`,
+    `process_vm_writev_revokes`, `a_proc_mem_write_handle_revokes`,
+    `the_child_of_a_tainted_process_is_not_exempt`,
+    `the_agent_s_own_ptrace_does_not_revoke`,
+    `a_new_generation_is_never_one_with_a_plant_and_its_maps_are_frozen`. 53 host mutations, all caught by a named test (C12, the
+    detail's call past 32 bits, once its test was added; three rerun
+    well-formed); 8 mutations of the eBPF and the
+    agent's tracker code against the privileged e2e on 24.04, all caught by
+    a named test: the family's access tainting
+    (`the_agent_s_own_ptrace_does_not_revoke`), the taint not passed on at
+    a fork (`the_child_of_a_tainted_process_is_not_exempt`), the record
+    not emitted (`a_ptrace_attach…signed`), the epoch request never taken in
+    (`a_reset_makes_what_started_before_it_not_known`), the freeze skipped
+    and a pin's `EEXIST` ignored (`a_new_generation…frozen`), a frozen map
+    frozen again (ten tests: every adoption absent), and `openat`'s flags
+    read from the path argument — which survived the first round (an
+    aligned path pointer reads as read-only) and was caught once
+    `a_proc_mem_write_handle_revokes` was added
+  - Gates: e4a01fa9 all green — the eBPF build, the four clippy runs,
+    fmt, 91 suites 4,156 passed 0 failed 20 ignored, the privileged no-run,
+    attack coverage, the golden replays five times (57 files, the same
+    bytes), MSRV 1.89, the fuzz replay (14 targets), the portable core on
+    five targets, the lockfiles unchanged; after them a test-only commit (a
+    privileged test) and CodeQL's fix (the uid's number out of the
+    injection's reasoning, two test messages), each with its crate's
+    clippy and tests. CodeQL on the PR: 0 open alerts, none dismissed.
+  - Open: an injection before the agent's first start since boot or while
+    `kernel.ftrace_enabled` is 0 (a window; the epoch is reset after it);
+    root inside the window planting a registered directory with its own
+    maps (frozen at adoption, signed); a BPF program of root's own naming
+    a tracker map (a read-only handle lets a program write it); a planted
+    library or `LD_PRELOAD` (no ptrace check); `pidfd_getfd` by a
+    container runtime and an io_uring worker's attach-mode access are false
+    refusals (fail closed); gdb was absent on the guests, the attach made
+    with `ptrace(PTRACE_ATTACH)` by python (the same kernel path).
+  - Levels unchanged (C15 1, C23 2 provisional): a way around the signed
+    exemptions and two ways to the tracker's marks closed and measured,
+    not a new capability.
