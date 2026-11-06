@@ -279,9 +279,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           exempt. The container runtimes', kube-proxy's and an administrator's \
                           `modprobe <name>` are recorded, not killed (lot 279), and so is a \
                           root exec of the system's tool under a trusted actor of \
-                          `process-comm-allowlist` (DKMS under apt or dpkg). Killed still: an \
-                          administrator's `insmod` of a built module, `modprobe -S` (an initramfs \
-                          build outside a package transaction), a quiet probe written \
+                          `process-comm-allowlist` (DKMS under apt or dpkg); in an initramfs \
+                          build (the packaged `update-initramfs`, `mkinitramfs` or `dracut` run \
+                          by root, read by the exec pump; lot 287), the hook `kmod` and \
+                          modprobe's dry runs (`--show-depends`, `--dry-run`, `-S` beside them) \
+                          are recorded too. Killed still: an administrator's `insmod` of a built \
+                          module, a `modprobe -S` that may load, a quiet probe written \
                           `modprobe <name> -q`, a module parameter with a `/`, a `modprobe` run \
                           from a shell whose environment sets `LD_LIBRARY_PATH` (or \
                           `LD_PRELOAD`, `LD_AUDIT`), and every module tool's exec on a host \

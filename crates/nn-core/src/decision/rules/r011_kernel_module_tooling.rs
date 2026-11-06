@@ -58,6 +58,7 @@
 //! | `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` in its environment (read, it is evidence: killed even if the process has since exited); a running process whose environment the exec pump could not read at the exec; an environment over 1 MiB; an unknown start | kill |
 //! | a process that had exited before the exec pump could read its environment (no process with its pid, its pid another's, a zombie, its memory gone), the rest of it recorded — not a leader that exited while another thread runs on: that thread's environment is read and judged, refused when not read whole or when no thread is seen while the kernel counts more than one | record, its environment not verified |
 //! | an argv the kernel did not read whole | kill |
+//! | in an initramfs build (lot 287: the packaged `update-initramfs`, `mkinitramfs` or `dracut`, run and still running as root, which the exec pump found from the exec's parent up at the exec), a root exec — the environment not refused — of a `#!` script of a system tree outside the tools' places (the hook `kmod`) or of the system's `modprobe` asked to load nothing (`--show-depends`, `--dry-run`, whatever else: `-S`, an argv cut after the flag) | record |
 //! | otherwise — the system's tool, plain module names, before the first name only options that move and force nothing | record |
 //!
 //! Whether the names load anything, and what, is the kernel's to judge at
