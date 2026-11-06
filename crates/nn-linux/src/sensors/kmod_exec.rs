@@ -1214,6 +1214,16 @@ mod tests {
             let id = described(r, file, &format!("/{file}"));
             assert_eq!(interpreter(r, proc, 61, start, &id), None, "{file}");
         }
+        // only a `#!` line names an interpreter, and only its first line
+        std::fs::write(p("usr/lib/x/lsmod"), b"/usr/bin/dash -e\n").unwrap();
+        let id = described(r, "usr/lib/x/lsmod", "/usr/lib/x/lsmod");
+        assert_eq!(interpreter(r, proc, 61, start, &id), None);
+        std::fs::write(p("usr/lib/x/hook"), b"#!/usr/bin/dash\n# a hook\n").unwrap();
+        let id = described(r, "usr/lib/x/hook", "/usr/lib/x/hook");
+        assert_eq!(
+            interpreter(r, proc, 61, start, &id).as_deref(),
+            Some("/usr/bin/dash")
+        );
         // a binary: its image is the file executed
         let env = Path::new("/usr/bin/env");
         let m = std::fs::metadata(env).unwrap();
