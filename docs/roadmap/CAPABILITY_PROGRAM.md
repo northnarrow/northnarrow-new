@@ -6917,6 +6917,50 @@ number in parentheses is a lab PR.
     update-initramfs -u` still has its hook killed (no package in the
     lineage); NN-L-FIM-004/023 and NET-008 keep their kill (not measured);
     the in-session small-file threshold is not turned on.
+- **Lot 283c — a server doing its normal job no longer sits in ENGAGED
+  (C14; the coordinator's decisions of 06/11/2026 after lot 283a's
+  corpus).**
+  - What was open: lot 283a measured `ConfirmedIntrusion_MassWrite`, and
+    ENGAGED, from PostgreSQL's backends and `initdb`, from containerd and
+    k3s-server replacing their own state, from `go test`, `npm ci` and
+    `rsync --inplace`.
+  - What changed (`common/src/wire/open_sensor.rs`,
+    `agent-ebpf/src/open_sensor.rs`, `crates/nn-core/src/posture/triggers.rs`,
+    `daemon_data.rs`, `configs/daemon-data.v1`): the kernel still counts
+    every write (NN-L-IMP-001 reads the same crossings) and gives each
+    crossing the summary of its window — every counted file a service
+    account's own (under `/var/lib` or its home, the file and its directory
+    its uid's; or its own segment in `/dev/shm`), a person's own
+    `~/.cache`, or one listed daemon directory, else none (`own_code`,
+    `own_after`; the record's `own` byte). The posture's mass-write arm
+    leaves a crossing out when the summary says so and the writer is a
+    service account in a system service's cgroup, the cache's person, or one
+    of the directory's units; a window with one file of anyone else counts
+    whole; a replacement only when both halves were. The operator adds a
+    daemon's directory in the signed mass-write overlay
+    (`+<unit>.service <dir>/`). Residuals in the posture design, §10.5.
+  - Measured (lab, ubuntu2404 6.8, two rounds, the guest left without the
+    agent, powered off): round 1 (e24430a4) — db: 21 raises from PostgreSQL,
+    6 left out (its backends open their dynamic shared memory in
+    `/dev/shm` to write; a bpftrace probe); containers: no crossing from
+    containerd or k3s (the pod ran in 11 s); `go test` raised on go's work
+    directory `/tmp/go-build…` (not the cache), `rsync --inplace` and `npm
+    ci` raised as before; MS-23 PASS. Round 2 (67105468, `/dev/shm`
+    segments): db — 23 PostgreSQL crossings left out, 2 raises, both in the
+    `pg_createcluster` step run from the SSH session (`initdb`, and a
+    `postgres` process of that step); a probe at the source — a listed unit
+    (`etcd.service`) in its directory left out and another unit there
+    raised, a service account from its service left out and through `sudo`
+    raised, a person in its `~/.cache` left out and root there raised; MS-23
+    19 of 19 PASS. Host: named tests for each decision; 47 targeted
+    mutations, each caught by a named test.
+  - Open: `go test`'s crossing is in its work directory under `/tmp`, which
+    no decision covers (only `~/.cache` is a person's cache); `initdb` and
+    the server's processes it runs from a session count; containerd's and
+    k3s's own crossings were not exercised by the corpus (the probe's
+    transient unit stands for them); the lab ran on 6.8 only (the 5.15
+    verifier not measured for the counter's new branches).
+  - Level unchanged (C14 2).
 - **Lot 286 — tracepoint mode's mass-write carve-out folds no `..`
   through a `/proc` link (C14; the re-review of #500, N2).**
   - What was open: with no LSM `file_open` sensor, the mass-write arm

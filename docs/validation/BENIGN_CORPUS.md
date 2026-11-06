@@ -166,3 +166,21 @@ High records. containers — 0 kills, k3s's pod runs to completion in 32 s.
 db — 0 kills, the dpkg trigger's initramfs hook recorded twice. The
 anti-tamper refusals, resolved: only the agent's own four drop-in
 directories (`deb-systemd-helper`'s `rmdir` during a purge).
+
+**Lot 283c (2026-11-06)**, the lot's agent, ubuntu2404 (6.8), the agent's
+journal read for every `ConfirmedIntrusion_MassWrite` raised and every
+crossing left out as the writer's own data. Round 1 (e24430a4): db — 21
+raises from PostgreSQL's processes, 6 left out: their windows held their
+dynamic shared memory (`/dev/shm/PostgreSQL.*`, opened to write by the
+backends: a probe with bpftrace); containers — no crossing from containerd
+or k3s (the pod ran in 11 s, no retries); a subset of `dev` and `ci` — `go
+test` raised on `/tmp/go-build…/_pkg_.a` (go's work directory: the corpus
+puts `GOCACHE` under `/srv`), `rsync --inplace` and `npm ci` raised as
+before. Round 2 (67105468, a service's own `/dev/shm` segment its own
+data): db — 23 crossings of the service's PostgreSQL left out, 2 raises,
+both in the `pg_createcluster` step run from the SSH session (`initdb` and
+a `postgres` process of that step); a probe of 25 files of 8 KiB rewritten
+in place: `etcd.service` in `/var/lib/etcd` left out, another unit there
+raised; `www-data` in its own directory under `/var/lib` from a service
+left out, the same through `sudo` in the session raised; the lab user in
+its `~/.cache` left out, root there raised. MS-23: 19 of 19 PASS.
