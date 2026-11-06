@@ -29,7 +29,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   enforces R018; a file there nothing vouches for is refused. dnf's and
   yum's Python scripts count as package managers by the file their exec
   named (a new map, `MODULE_PKG_SCRIPTS`, noted at `sched_process_exec`);
-  `dnf5` joins the judge's package managers.
+  `dnf5` joins the judge's package managers. The write history and the
+  scripts' map are pinned with their observer beside the pin root
+  (`/sys/fs/bpf/northnarrow-module-writes`) and adopted by the next start
+  of the boot (an agent restart, an upgrade): a package of modules
+  installed this boot stays trusted; a file changed since boot that the
+  history does not cover is let through and recorded High when a package or
+  DKMS vouches for it.
 - NN-L-FIM-026 (lot 285): a write in kmod's configuration directories
   (`/etc`, `/run`, `/usr/local/lib`, `/lib`, `/usr/lib` `modprobe.d`) is a
   High record outside a package transaction, Low inside one; the four

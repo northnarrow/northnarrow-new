@@ -7651,6 +7651,17 @@ number in parentheses is a lab PR.
       write-open refused (`EPERM`), both programs loaded, the write
       history PKG under `dpkg -i` and under the dnf stand-in (both
       writers), the bootcheck as before (0 R018 from the boot's loads).
+    - The coordinator's decision on #513 (the write history through an
+      agent restart and an upgrade within the boot): its maps and observer
+      pinned beside the pin root (`/sys/fs/bpf/northnarrow-module-writes`),
+      the next start adopting the history registered this boot. Round r7
+      (ubuntu2404, 392b7fdd): `linux-modules-extra` installed (6,474 files
+      trusted, 5,463 written in the transaction), the agent restarted inside
+      a signed window (SIGTERM to the watchdog and the agent): the same maps
+      adopted (ids 82 and 86, the same `since`), 5,463 still written in a
+      transaction, 12 of its modules probed — 0 refused (3 hardware
+      errors), 0 R018; the write-open deny `EPERM`; after a cold boot 0 R018
+      from the boot's loads; `uninstall.sh` left no pin directory, no state.
     - The seven R018 Medium records of r1's tally were not this lot's: the
       guest had kept an earlier agent's state (`admin.pub` and the lists
       "already present" at the install), and main's R018 recorded a
@@ -7665,11 +7676,10 @@ number in parentheses is a lab PR.
     not a refusal, unless `enforce R018`.
   - Open: the boot's own loads before the agent starts (the initramfs,
     `systemd-modules-load`, udev's first pass) are the kernel's signature
-    policy's; a module written after boot before the agent started has no
-    write history (outside the DKMS and akmods directories it is refused
-    until the next boot) — an agent restart or upgrade counts, so a
-    package of modules for the running kernel installed earlier in the
-    boot is refused after it until the next boot (not measured); the trust map is the agent's (a restarted agent
+    policy's; a module changed after boot before the write history covers
+    it (the agent's first start of the boot, a reset of the history) is let
+    through and recorded High if a package or DKMS vouches for it, refused
+    otherwise, until the next boot; the trust map is the agent's (a restarted agent
     judges nothing until it has filled it again, 0.7 s measured); no RPM
     guest was in this lot's lab (rpm's digests and akmods by host tests
     only); a module file rewritten in place by a package transaction after

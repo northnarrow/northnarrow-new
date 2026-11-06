@@ -602,6 +602,24 @@ The matrix, by file:
 | in `updates/dkms/` or `extra/`, not registered (or other content than the registered build) | **refused** | refused |
 | named by a signed `module-allow` | let through, R018 Medium | let through, R018 Medium |
 
+**The write history survives an agent restart and an upgrade within the
+boot.** Its maps (`MODULE_WRITES`, and `MODULE_PKG_SCRIPTS` for dnf's and
+yum's scripts) and the observer's program and link are pinned in a
+directory of their own beside the pin root,
+`/sys/fs/bpf/northnarrow-module-writes` (an upgrade's purge of the pin root
+leaves it; `uninstall.sh` removes it). The observer goes on while no agent
+runs, and the next start adopts the history registered this boot
+(`/run/northnarrow/module-writes-pins`): each map the one registered (its
+id), in this version's layout, the observer's link pinned beside them. The
+maps are frozen (no handle writes them; the observer does), the directory
+and the state protected like the agent's other pins. Anything else is a
+signed reset (degraded "the module files' write history was reset"): a file
+changed since boot before the new history begins is let through and
+recorded High if a package or DKMS vouches for it, until the next boot —
+never refused in silence. Measured: `linux-modules-extra` installed, the
+agent restarted inside a window, the history adopted (the same maps), 12 of
+its modules probed, 0 refused.
+
 What happens to an untrusted load is the policy's mode of
 `R018_KernelModuleLoad`:
 
@@ -642,13 +660,12 @@ module-allow vboxdrv
 What it does not cover: a module the boot loads before the agent starts
 (the initramfs, `systemd-modules-load`, udev's first pass) — the kernel's
 module signature enforcement and lockdown are what judge those (`nn-admin
-host-check` reports both); a module built after boot but before the agent
-started has no write history — the history is the running agent's, so a
-restart or an upgrade of the agent counts: a package of modules for the
-running kernel installed earlier in the boot (`linux-modules-extra-…`) is
-then untrusted until the next boot — outside `updates/dkms/` and `extra/`
-it is untrusted until the next boot, inside them a registered build is let
-through and recorded (`akmods` at boot); dnf's and yum's scripts are
+host-check` reports both); a module file changed after boot but before the
+write history covers it (the agent's first start of the boot; a reset of
+the history, below) has no history to read: a package's or DKMS's file is
+let through and recorded High (refused under `enforce R018`), one nothing
+vouches for is refused, until the next boot (`akmods` at boot is one);
+dnf's and yum's scripts are
 recognised only where the exec sensor runs on the LSM hook (its default
 where BPF-LSM is active; `--exec-sensor tracepoint` loses it: a DKMS build
 under dnf is then let through and recorded, not trusted); a module file

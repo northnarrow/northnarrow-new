@@ -718,6 +718,17 @@ others. What an operator sees change:
   `module-allow <module>` for each module the host needs, or put the deny
   off for the time being with a signed `alert R018_KernelModuleLoad` (the
   record mode: every untrusted load let through and recorded High).
+- **The module files' write history goes through the upgrade**: its maps
+  and observer are pinned beside the pin root
+  (`/sys/fs/bpf/northnarrow-module-writes`, protected, kept by the
+  upgrade's purge, removed by `uninstall.sh`), and the new agent adopts the
+  history of this boot's package transactions — a package of modules for
+  the running kernel installed earlier in the boot stays trusted. A history
+  the new agent cannot adopt (another version's layout) is reset, signed:
+  until the next boot the files changed since boot before the new agent
+  started are let through and recorded High when a package or DKMS vouches
+  for them. The first upgrade to this release finds no history: the same,
+  for the files written this boot before it.
 - **Residual, by design**: root who writes a module file into a DKMS
   output directory AND registers the same content in DKMS's state
   (`/var/lib/dkms/<package>/<version>/<release>/<arch>/module/`) gets a
