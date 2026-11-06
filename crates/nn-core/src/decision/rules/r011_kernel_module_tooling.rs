@@ -603,6 +603,12 @@ mod tests {
             .evaluate(&read_as(e, built(b, Ok(()), None)))
             .expect("fires");
         assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
+        // a record stays the rule's own (by module name)
+        let v = rule()
+            .evaluate(&read_as(modprobe(&["overlay"]), built(b, Ok(()), None)))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert!(!v.reasoning.contains("initramfs build"), "{}", v.reasoning);
         // no builder found: killed, as before
         let v = rule()
             .evaluate(&read_as(
@@ -761,6 +767,15 @@ mod tests {
             ),
             (
                 exec("/usr/bin/kmod", "/usr/bin/kmod", &["kmod", "insert", "rk"]),
+                built(b, Ok(()), None),
+            ),
+            // the dry run is modprobe's: insmod is killed whatever its options
+            (
+                exec(
+                    "/usr/sbin/insmod",
+                    "/usr/bin/kmod",
+                    &["insmod", "-n", "/tmp/rk.ko"],
+                ),
                 built(b, Ok(()), None),
             ),
         ] {

@@ -871,6 +871,23 @@ mod tests {
         assert_eq!(walk(&b, 50, 1050), None);
         // no builder kept: nothing walked
         assert_eq!(walk(&Builders::default(), 30, 1030), None);
+        // the parent's start unknown: nothing tied, even to a builder
+        // started at boot
+        proc_entry(proc, 90, 1, 1, 0, dash);
+        let mut boot = Builders::default();
+        boot.note(
+            r,
+            &exec_of(
+                "mkinitramfs",
+                90,
+                1,
+                1,
+                1,
+                described(r, "usr/sbin/mkinitramfs", "/usr/sbin/mkinitramfs"),
+            ),
+        );
+        assert_eq!(walk(&boot, 90, 1).as_deref(), Some("/usr/sbin/mkinitramfs"));
+        assert_eq!(walk(&boot, 90, 0), None);
     }
 
     /// Lot 287: a copy of update-initramfs (in `/tmp`, or a file of its own

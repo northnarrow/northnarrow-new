@@ -791,6 +791,8 @@ mod tests {
             &["modprobe", "-S6.8.0-1", "-D", "x"],
             &["modprobe", "--set-version", "6.8.0-1", "-D", "x"],
             &["modprobe", "-w", "5", "-qn", "x"],
+            &["modprobe", "--set-version=6.8.0-1", "-D", "x"],
+            &["modprobe", "--quiet", "-D", "x"],
         ] {
             assert!(dry(a), "{a:?}");
         }
@@ -805,6 +807,7 @@ mod tests {
             &["modprobe", "-d", "-n", "x"],
             &["modprobe", "-o", "-D", "x"],
             &["modprobe", "x", "-D"],
+            &["modprobe", "snd", "-D"],
             &["modprobe", "--", "-D"],
             &["modprobe", "-", "-D"],
             &["modprobe", "--show-dep", "x"],
