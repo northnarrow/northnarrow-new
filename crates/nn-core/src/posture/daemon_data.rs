@@ -76,7 +76,7 @@ fn valid_unit(unit: &str) -> bool {
     unit.len() <= 255
         && unit
             .strip_suffix(".service")
-            .is_some_and(|name| !name.is_empty() && !name.starts_with('.'))
+            .is_some_and(|name| !name.is_empty())
         && unit
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b":_.@\\-".contains(&b))

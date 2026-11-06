@@ -5652,38 +5652,44 @@ mod tests {
 
     /// Lot 283c, decision 2: a replacement (new files, originals destroyed
     /// — the shape containerd and k3s measured) is left out only when both
-    /// its halves were the unit's own data.
+    /// its halves were the unit's own data, whichever came first.
     #[test]
     fn a_daemon_replacement_is_left_out_only_whole() {
         let h = own_host();
         let ci = TriggerType::ConfirmedIntrusion;
         let code = unit_code(&h.det, "/var/lib/containerd/");
-        let half = |e: Event, own: u8| match e {
-            Event::MassWrite { .. } => {
-                let mut e = e;
-                if let Event::MassWrite { uid, own_data, .. } = &mut e {
-                    (*uid, *own_data) = (0, own);
+        let own = |mut e: Event, o: u8| {
+            match &mut e {
+                Event::MassWrite { uid, own_data, .. } | Event::FileBurst { uid, own_data, .. } => {
+                    (*uid, *own_data) = (0, o)
                 }
-                e
+                _ => unreachable!(),
             }
-            mut e => {
-                if let Event::FileBurst { uid, own_data, .. } = &mut e {
-                    (*uid, *own_data) = (0, own);
-                }
-                e
-            }
+            e
         };
         let det = &h.det;
-        assert!(!det
-            .detect(&half(mass_write(CONTAINERD, false, 10), code), &[])
-            .contains(&ci));
-        assert!(!det
-            .detect(&half(destroyed(CONTAINERD, 11), code), &[])
-            .contains(&ci));
-        // the originals destroyed elsewhere: the replacement counts
-        assert!(det
-            .detect(&half(destroyed(CONTAINERD, 12), own_data::NONE), &[])
-            .contains(&ci));
+        let s = 1_000_000_000u64;
+        let raised = |e: Event| det.detect(&e, &[]).contains(&ci);
+        // both halves its own data, either order
+        assert!(!raised(own(mass_write(CONTAINERD, false, 10 * s), code)));
+        assert!(!raised(own(destroyed(CONTAINERD, 11 * s), code)));
+        assert!(!raised(own(destroyed(CONTAINERD, 300 * s), code)));
+        assert!(!raised(own(mass_write(CONTAINERD, false, 301 * s), code)));
+        // the originals destroyed elsewhere, after its own new files
+        assert!(!raised(own(mass_write(CONTAINERD, false, 600 * s), code)));
+        assert!(raised(own(destroyed(CONTAINERD, 601 * s), own_data::NONE)));
+        // its own originals destroyed, the new files written elsewhere first
+        assert!(!raised(own(
+            mass_write(CONTAINERD, false, 900 * s),
+            own_data::NONE
+        )));
+        assert!(raised(own(destroyed(CONTAINERD, 901 * s), code)));
+        // and the other way round
+        assert!(!raised(own(
+            destroyed(CONTAINERD, 1200 * s),
+            own_data::NONE
+        )));
+        assert!(raised(own(mass_write(CONTAINERD, false, 1201 * s), code)));
     }
 
     /// Lot 283c, decision 3: a person's process rewriting its own

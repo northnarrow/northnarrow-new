@@ -1160,7 +1160,14 @@ mod tests {
         assert_eq!(code(tagged(0), 0, 0, 0, 0, 1), UNIT_BASE);
         assert_eq!(code(tagged(7), 0, 0, 0, 1000, 1), UNIT_BASE + 7);
         assert_eq!(code(tagged(UNIT_TAGS - 1), 0, 0, 0, 0, 1), 255);
-        assert_eq!(code(tagged(UNIT_TAGS), 0, 0, 0, 0, 1), NONE, "no such tag");
+        // past the tags no code: the record's byte would wrap to another's
+        for tag in UNIT_TAGS..256 {
+            assert_eq!(
+                own_code(tagged(tag), 0, 0, 0, 0, 1),
+                NONE as u32,
+                "tag {tag}"
+            );
+        }
         assert_eq!(code(tagged(7), 0, 0, 0, 0, 2), NONE, "a hard link");
         // two owner-bearing registrations nested: no one's
         assert_eq!(
