@@ -517,8 +517,9 @@ sysctl whose value aborts, starves or blinds it (`kernel.pid_max` below
 `vm.overcommit_kbytes` cap below 1 GiB, `kernel.sched_rt_runtime_us` -1 or
 at least 990000), and any write of `kernel.sched_rt_period_us` and
 `kernel.ftrace_enabled`; the integrity round puts such a value set at boot
-or inside a window back to a safe one (`ANTITAMPER_TRUST_MODEL.md`, lots
-273d and 280a). Some hosts need one of them: tuned's `realtime` profile
+or inside a window back to a safe one (lots 273d and 280a in the trust
+model,
+https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/ANTITAMPER_TRUST_MODEL.md). Some hosts need one of them: tuned's `realtime` profile
 writes `kernel.sched_rt_runtime_us = -1`. Say so in the policy:
 
 ```
