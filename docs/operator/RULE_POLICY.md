@@ -643,8 +643,11 @@ What it does not cover: a module the boot loads before the agent starts
 (the initramfs, `systemd-modules-load`, udev's first pass) — the kernel's
 module signature enforcement and lockdown are what judge those (`nn-admin
 host-check` reports both); a module built after boot but before the agent
-started has no write history: outside `updates/dkms/` and `extra/` it is
-untrusted until the next boot, inside them a registered build is let
+started has no write history — the history is the running agent's, so a
+restart or an upgrade of the agent counts: a package of modules for the
+running kernel installed earlier in the boot (`linux-modules-extra-…`) is
+then untrusted until the next boot — outside `updates/dkms/` and `extra/`
+it is untrusted until the next boot, inside them a registered build is let
 through and recorded (`akmods` at boot); dnf's and yum's scripts are
 recognised only where the exec sensor runs on the LSM hook (its default
 where BPF-LSM is active; `--exec-sensor tracepoint` loses it: a DKMS build

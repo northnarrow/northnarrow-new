@@ -7667,7 +7667,9 @@ number in parentheses is a lab PR.
     `systemd-modules-load`, udev's first pass) are the kernel's signature
     policy's; a module written after boot before the agent started has no
     write history (outside the DKMS and akmods directories it is refused
-    until the next boot); the trust map is the agent's (a restarted agent
+    until the next boot) — an agent restart or upgrade counts, so a
+    package of modules for the running kernel installed earlier in the
+    boot is refused after it until the next boot (not measured); the trust map is the agent's (a restarted agent
     judges nothing until it has filled it again, 0.7 s measured); no RPM
     guest was in this lot's lab (rpm's digests and akmods by host tests
     only); a module file rewritten in place by a package transaction after
