@@ -401,7 +401,8 @@ fn the_agent_s_note_signs_into_its_audit_log() {
     let rules = dir.path().join("combat-rules.v4");
     std::fs::write(&rules, "*filter\nCOMMIT\n").unwrap();
     let isolator = Arc::new(NetworkIsolator::new(rules).unwrap());
-    let note = audit_note(Some(Arc::new(log)), Some(isolator), Instant::now());
+    let loop_started = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
+    let note = audit_note(Some(Arc::new(log)), Some(isolator), loop_started);
     note(&expired(false));
     let all = rows(dir.path(), &pubkey);
     assert_eq!(all.len(), before + 2);
@@ -410,6 +411,7 @@ fn the_agent_s_note_signs_into_its_audit_log() {
         note_detail(&expired(false), Isolation::None)
     );
     assert_eq!(all[before + 1].op, "agent_stop");
+    assert!(all[before + 1].extra["uptime_secs"].as_u64() >= Some(5));
     audit_note(None, None, Instant::now())(&expired(false));
 }
 
