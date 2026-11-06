@@ -202,7 +202,11 @@ start — left the host without a working agent. What it does now, in order:
    or — when the recorded pins are gone or not as recorded, or of an older
    schema — builds new ones, a signed "marks reset", after which every
    process started before it is not known: restart the exempt services
-   (`UPGRADE_NOTES_WAVE4.md` §8);
+   (`UPGRADE_NOTES_WAVE4.md` §8). The sysctl judge's pins are beside it too
+   (`/sys/fs/bpf/northnarrow-sysctl`, lot 280a): the judge goes on refusing
+   the guarded sysctls' harmful writes through the upgrade, `kept` in
+   `bpf-own-ids`, and the new agent swaps it for its own
+   (`UPGRADE_NOTES_WAVE4.md` §10);
 5. **switches** the binaries and units: each new file is staged next to
    the installed one (`<path>.nn-new`, same directory, same file system),
    compared with its source, then renamed over it (`rename(2)`): every path
@@ -418,7 +422,9 @@ unit whose stop is refused (no window on a protected host) stops the
 script before anything is disabled or removed (lab PR 194; the units used
 to be disabled first and left running) → drop the pin root and the
 start-in-cgroup tracker's directories beside it
-(`/sys/fs/bpf/northnarrow-cgroup-join-v*`) and wait for
+(`/sys/fs/bpf/northnarrow-cgroup-join-v*`) and the sysctl judge's
+(`/sys/fs/bpf/northnarrow-sysctl`, lot 280a: its link's last reference, so
+the judge leaves the root cgroup) and wait for
 the agent's own BPF programs to unload (the ids in
 `/run/northnarrow/bpf-own-ids`, read before the stop, as in the upgrade;
 other products' LSM programs are left alone) → `chattr -R -i` on state and

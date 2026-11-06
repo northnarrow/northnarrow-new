@@ -6,6 +6,39 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- The guarded sysctls judged on the kernel's copy of the write (lot 280a;
+  `docs/design/ANTITAMPER_TRUST_MODEL.md` § Lot 280a). A `cgroup/sysctl`
+  program, `nn_sysctl_guard`, linked to the root cgroup (`BPF_LINK_CREATE`
+  with no flag: the kernel's `BPF_F_ALLOW_MULTI`, never `ALLOW_OVERRIDE`;
+  the start checks the root's mode and programs with `BPF_PROG_QUERY`),
+  reads the value the sysctl handler is about to parse
+  (`bpf_sysctl_get_new_value`) and parses it in base 0 (`bpf_strtol`), as
+  the kernel does: lot 273d's declared residual — a second thread changing
+  the bytes the write deny read — is closed where it is attached. Same
+  floors as the write deny (`common::sysctl_judge`), the agent's family and
+  a signed window pass, a refusal is `EPERM` and a signed NN-L-AT-001
+  `sysctl_value` naming the sysctl and the value. A program a child cgroup
+  attaches, in any mode, runs before it and cannot replace it. Pinned with
+  its link in `/sys/fs/bpf/northnarrow-sysctl` (protected; kept through
+  `install.sh --upgrade`, swapped by the next start, removed by
+  `uninstall.sh`); the link is registered as the agent's own with the BPF
+  guard. Where it cannot be linked (no cgroup v2 mount of the root) the
+  write deny judges alone: a signed degradation; the manifest's attach
+  point `sysctl_judge` says which runs.
+- The signed per-sysctl opt-out (lot 280a; `docs/operator/RULE_POLICY.md`
+  §2.2): `sysctl-allow <sysctl> <value>|<min>..<max>` in the per-rule
+  policy — tuned's `realtime` profile (`kernel.sched_rt_runtime_us = -1`)
+  can hold. Honoured only from a policy whose signature the agent verified
+  for the text it applies (an unsigned one loaded through
+  `NN_OVERLAY_ALLOW_UNSIGNED` keeps its other lines, its `sysctl-allow`
+  withheld and signed degraded); never `kernel.ftrace_enabled`. Every write
+  it lets through is recorded (NN-L-AT-001 `sysctl_opt_out`, Low, no
+  posture change); the integrity round leaves such a value
+  (`sysctl_opted_out`). The write deny honours it too.
+- `nn-lab.sh sysctl-check` (`deploy/lab/malsim/sysctl-check.sh`,
+  `deploy/lab/adversarial/sysctl-child-probe.c`): the race, octal and hex
+  below a floor, the opt-out signed and not, a child cgroup's program, the
+  cost a write.
 - The minimal signed export (lot 276, capability C21, R15's first step;
   `docs/operator/EXPORT.md`). Off by default; a signed
   `/etc/northnarrow/export.local` (overlay `export`, `config-manage`) turns

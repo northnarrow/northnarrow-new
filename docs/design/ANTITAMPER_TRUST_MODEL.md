@@ -1564,7 +1564,9 @@ kept running); on 5.15 the write was `EBUSY`. It is the eighth guarded
   `cgroup/sysctl` program on the root cgroup, which reads the value the
   kernel already copied (`bpf_sysctl_get_new_value`) and is not carried
   by ftrace, verified on 5.15 and 6.8, with its link protected from a
-  detach outside a window and this hook kept as the second layer.
+  detach outside a window and this hook kept as the second layer. **Closed
+  by lot 280a where that program is attached** (§ Lot 280a below); the
+  residual stays on a host where it is not (the fallback, signed).
   `ftrace_enabled` is outside this residual: no write of it is judged by
   value.
 - `kernel.ftrace_enabled=0` silences the trampolines until it is put back
@@ -1849,3 +1851,96 @@ attaches the programs for the agent's life and warns.
   or workload follows the same rule. A process counts as the workload's
   when the workload's runtime started it there, never because its cgroup
   says so.
+
+## Lot 280a — the guarded sysctls judged on the kernel's copy; the signed per-sysctl opt-out
+
+**What it closes.** The residual lot 273d declared: the write deny
+(`file_permission`) judges the bytes of a write of a guarded sysctl in the
+writer's memory, before the kernel copies them, and a second thread of the
+writer can change them in between.
+
+**The judge** (`agent-ebpf/src/sysctl_guard.rs`, `crates/nn-linux/src/
+sysctl_cgroup.rs`, the verdict `common::sysctl_judge`). A `cgroup/sysctl`
+program linked to the root cgroup of the unified hierarchy. The kernel runs
+it inside `proc_sys_call_handler`, after it duplicated the user buffer and
+before the sysctl's handler parses that same copy; the program reads it
+with `bpf_sysctl_get_new_value` and parses it with `bpf_strtol` in base 0,
+as the handler does (`proc_get_long` → `strtoul_lenient(…, 0, …)`: `040000`
+is 16384, `0x4000` too, leading blanks skipped). The floors are the write
+deny's (one function, `cgroup_limits::sysctl_value_harmful`);
+`kernel.ftrace_enabled` and `kernel.sched_rt_period_us` are refused
+whatever they carry, a value that is no integer (or longer than 63
+characters, or past `i64`) is refused. The agent's family and a signed
+trusted-installer window pass, by the same checks as every deny hook (the
+writer's tgid read from its task: the 5.15 helpers of this program type
+have no `bpf_get_current_pid_tgid`). A refusal is `EPERM` and a signed
+NN-L-AT-001 `sysctl_value` (the sysctl and the value the kernel would have
+stored; ENGAGED, as lot 273d's `sysctl`). The write deny stays the first
+layer: it refuses a non-decimal spelling unread, and what it lets through
+is judged again on the kernel's copy.
+
+**A child cgroup's program cannot get around it.** The agent attaches it
+with `BPF_LINK_CREATE` and no flag: the kernel attaches a cgroup link
+`BPF_F_ALLOW_MULTI` (`cgroup_bpf_link_attach`), the one mode in which the
+root's programs stay in every descendant's effective array, whatever mode a
+child attaches with (`compute_effective_progs`); the legacy
+`BPF_PROG_ATTACH`, whose flags could say `BPF_F_ALLOW_OVERRIDE`, is never
+used. The array runs a child's programs before the root's and makes any
+program's 0 the write's `EPERM`; a child's `bpf_sysctl_set_new_value`
+rewrites the very copy the root's program then reads. The start checks
+what the kernel reports for the root (`BPF_PROG_QUERY`: multi, our program
+among the root's) and refuses the judge otherwise. The lab's S5 attaches,
+in a child cgroup, a program that lets every write through and rewrites the
+value, with no flag, `override` and `multi`.
+
+**Its link** is pinned with the program in `/sys/fs/bpf/northnarrow-sysctl`,
+beside the pin root (protected like it: no unlink or rename by a foreign
+caller outside a window), and held open by the agent: the BPF guard
+registers it as one of the agent's links (a foreign handle by id or by its
+pin, a `LINK_DETACH`, a `LINK_UPDATE` refused in enforce mode). It outlives
+an agent stop and `install.sh --upgrade` (which purges the pin root only):
+while no agent runs the judge goes on refusing, with the maps it was loaded
+with — a window the stopped agent granted holds until its deadline, and a
+refusal's record goes to that agent's ring, which nobody reads (the deny
+hooks' own case). The next start links its own program first, then removes
+the prior link. `uninstall.sh` removes the directory (the link's last
+reference: the judge leaves the root cgroup).
+
+**Fallback.** Where the judge cannot be linked — no cgroup v2 mount of the
+hierarchy's root (a v1-only host), a mount point that is not the root
+cgroup (inode 1: a cgroup namespace's view), a kernel or a root mode that
+refuses it — the write deny judges alone, with lot 273d's residual: a
+signed `anti_tamper` degradation, and the manifest's attach point
+`sysctl_judge` names the fallback (`fs_protect`'s `why`).
+
+**The signed per-sysctl opt-out.** `sysctl-allow <sysctl> <value>|<min>..<max>`
+in the per-rule policy (`RULE_POLICY.md` §2.2): a guarded sysctl but
+`kernel.ftrace_enabled`, by its `sysctl(8)` name. The agent writes it to the
+kernel (`SYSCTL_OPTOUT`, one slot a sysctl, bound to the boot's session
+nonce: a slot an earlier agent wrote is dead after a restart until the new
+one writes it) only from a policy whose signature it verified for the very
+text it applies (`OverlayGate::signs`) or from a signed `policy set`; an
+unsigned policy loaded through `NN_OVERLAY_ALLOW_UNSIGNED=1` has its other
+lines applied and its `sysctl-allow` withheld, signed degraded. A write the
+range allows and the floors would refuse goes through, recorded every time
+(NN-L-AT-001 `sysctl_opt_out`, Low, no posture trigger; by the judge on the
+kernel's copy, or by the write deny where the judge is not attached); the
+integrity round leaves such a value (`sysctl_opted_out`, signed).
+
+**What stays open.**
+- A `cgroup/sysctl` program attached at the ROOT cgroup after ours runs
+  after it (same cgroup, attach order) and can rewrite the value it judged.
+  It takes a root that loads BPF; the BPF guard records the load and the
+  attach (`bpf_syscall`), the start names any other program it finds there
+  (a signed degradation), and the integrity round puts a harmful value back
+  at its next pass. Refusing a foreign `cgroup/sysctl` program outside a
+  window is a candidate for lot 280b.
+- An opt-out names a sysctl and its values, not a program: while it is in
+  force, any root process may write a value in its range.
+- `bpf_strtol` reads up to 63 characters where the kernel reads 21: a value
+  the kernel would refuse (`EINVAL`) may be judged — refused or let
+  through, the kernel then refuses it; a write longer than 63 bytes (many
+  leading blanks) is refused, which the kernel would have read.
+- The writer's tgid is read from its task; a read that fails is no one's
+  (not the agent's family): such a write is judged, never let through by
+  identity.
