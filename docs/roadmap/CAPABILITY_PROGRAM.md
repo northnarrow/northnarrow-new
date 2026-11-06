@@ -7030,3 +7030,56 @@ number in parentheses is a lab PR.
     12's and Ubuntu 22.04's `manual_add_modules` (`modprobe --show-depends
     -S`) are covered by host tests, not measured.
   - Level unchanged (C14 2).
+- **Lot 288 — a stop in COMBAT ends in bounded time (#125; C18, C23).**
+  - What was open (#125, after the ADE's removal): whether a stop inside a
+    signed trusted-installer window ends in bounded time while the agent is
+    in COMBAT. Read in the code: the decision thread is a scoped thread,
+    joined however long its turn takes; the runtime's drop waited for every
+    blocking task with no bound; the stop's own waits (the queued responses
+    2 + 2 s, the canary trips 5 s, the export's thread 4 s) added up past
+    the unit's `TimeoutStopSec=5s` (`SendSIGKILL=no`).
+  - What changed (`agent/src/stop_deadline.rs`, `run_loop.rs`,
+    `shutdown.rs`, `boot/mod.rs`): the stop's deadline, a thread made at the
+    start and begun where the event loop ends; every stage named; the
+    drains bounded by what is left (at most 1 s), the export's wait and the
+    runtime's shutdown too; at 1.5 s, before the stop's signed rows, a
+    signed `subsystem_degraded` (`stop_deadline`: the stage, the time, the
+    isolation kept) and the run's `agent_stop`, then `_exit(75)` (2 s at
+    the latest); after the signed rows, `_exit` with the stop's own status.
+    The stop never runs `iptables`: an agent that stops or dies in COMBAT
+    leaves the chain, and the next start tears it down and signs
+    `combat_reconcile`.
+  - Measured (lab, ubuntu2404, kernel 6.8.0-147, iptables 1.8.10 nf_tables,
+    our own guest under lease k288; the lot's agent at 55795c8d, whose
+    budget was then 4 s): `systemctl restart northnarrow-agent` by hand is
+    refused by the unit (`RefuseManualStop=yes`, rc 4) — the stop is the
+    operator's (install.sh's): `systemctl kill -s SIGTERM` inside the
+    window, then `start`. In COMBAT, isolated (3 rules, 3 jumps):
+    - a plain stop: SIGTERM to the process's exit 2.83 s (`agent_stop`
+      signed at 0.45 s, then 2.37 s of teardown); the chain intact after the
+      stop; the next start tore it down (`combat_reconcile` repaired, 19
+      rules) and read the previous run as clean (`sigterm`);
+    - the decision thread stalled (debug trigger, 60 s): the note at
+      3.25 s (stage `decision`, isolation kept; `subsystem_degraded` and
+      `agent_stop` signed), the process seen exiting (`status=75/TEMPFAIL`)
+      at 5.67 s: 2.4 s after `_exit`, the kernel's release of the agent's
+      BPF programs and links — the same 2.4 s as the plain stop's teardown.
+      Over the 5 s: the budget was cut to 2 s after the round (4dee4168),
+      the release kept 3 s. Not measured again.
+    - The audit chain verified (45 rows); the guest left without the agent,
+      powered off. A first round (78e1d468) used `systemctl restart`,
+      refused: no stop took place, the agent stayed isolated; the guest was
+      booted again only to read it and uninstall.
+  - Host: named tests (`stop_deadline::tests::a_stop_with_a_blocked_stage_exits_within_the_deadline`
+    — a child of the test binary, the agent's deadline and `_exit`, a stage
+    that never ends: exit 75 before 2 s, its note first — and 15 more,
+    `dispatch::tests::the_stop_s_deadline_ends_both_of_its_waits`,
+    `export::controller::tests::the_stop_waits_at_most_what_it_is_given`);
+    mutations: 55 + 9, each caught by a named test but 2 argued equivalent.
+    The flaky `nn-linux` exe test (lot 275): its child's `exe` read once the
+    exec replaced the image; 200 suite runs under parallel load, 0
+    failures.
+  - Open: the 2 s budget's lab measurement; the kernel's 2.4 s release of
+    the BPF programs (detaching them in parallel at the stop would shorten
+    every stop).
+  - Levels unchanged (C18 1, C23 2).
