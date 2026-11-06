@@ -284,7 +284,93 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
             ),
         );
         // Lot 283b: and on the package transaction the exec pump read.
-        Some(in_package_transaction_at_exec(event, v))
+        let v = in_package_transaction_at_exec(event, v);
+        // Lot 287: and on the initramfs build it read.
+        Some(in_initramfs_build_at_exec(event, v))
+    }
+}
+
+/// Lot 287 (after lot 283b's lab: an administrator's own `sudo
+/// update-initramfs -u` exited 137): inside an initramfs build — a builder
+/// the exec pump found in the exec's lineage at the exec, the packaged
+/// file by its device and inode, run and still running as root
+/// ([`ExecFacts::initramfs_builder`]) — a root exec is recorded, not
+/// killed, when it is what the build runs:
+///
+/// - a `#!` script of a system tree, run by an interpreter that is not the
+///   module tool ([`ExecFacts::interpreter`]), outside the tools' own
+///   places: initramfs-tools' hook `/usr/share/initramfs-tools/hooks/kmod`
+///   (comm `kmod`, a shell script that copies kmod into the image); a
+///   script loads no module without executing a tool, which R011 judges
+///   on its own;
+/// - the system's `modprobe` asked to load nothing (`--show-depends`,
+///   `--dry-run`, [`kmod_invocation::loads_nothing`]), whatever else it
+///   is told (`--set-version`, an argv cut after the dry run):
+///   `manual_add_modules` of the initramfs-tools that do not use
+///   `dracut-install` (Debian 12, Ubuntu 22.04).
+///
+/// Still killed in a build: `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT`,
+/// `LD_LIBRARY_PATH` in its environment (or an environment not read from
+/// the running process); a tool that is not the system's (a copy, a file
+/// of its own in a tool's place, a binary of another name); anything
+/// outside a system tree; `insmod`, and a `modprobe` that may load — a
+/// hook root plants (`mkinitramfs -d`, `/etc/initramfs-tools/hooks`) does
+/// not launder them; a non-root exec, a builder run by no root, a copy of
+/// the builder (`/tmp/update-initramfs`).
+///
+/// [`ExecFacts::initramfs_builder`]: kmod_exec_facts::ExecFacts::initramfs_builder
+/// [`ExecFacts::interpreter`]: kmod_exec_facts::ExecFacts::interpreter
+fn in_initramfs_build_at_exec(event: &Event, v: Verdict) -> Verdict {
+    if v.action == ResponseAction::Log {
+        return v;
+    }
+    let Event::ProcessSpawn {
+        uid,
+        filename,
+        exe,
+        argv,
+        argv_truncated,
+        ..
+    } = event
+    else {
+        return v;
+    };
+    if *uid != 0 {
+        return v;
+    }
+    let Some(facts) = kmod_exec_facts::of(event) else {
+        return v;
+    };
+    let Some(builder) = facts.initramfs_builder.as_deref() else {
+        return v;
+    };
+    if matches!(facts.environment, kmod_exec_facts::Environment::Refused(_)) {
+        return v;
+    }
+    let image = exe.path_or(filename);
+    let what = match (&facts.program, facts.interpreter.as_deref()) {
+        (Ok(()), _)
+            if kmod_invocation::tool_of(image, argv) == Ok(kmod_invocation::Tool::Modprobe)
+                && kmod_invocation::loads_nothing(argv, *argv_truncated) =>
+        {
+            "the system's modprobe, asked to load nothing (--show-depends or --dry-run)".to_string()
+        }
+        (Err(_), Some(interpreter))
+            if crate::posture::lineage::in_system_tree(image)
+                && !kmod_invocation::in_tool_place(image) =>
+        {
+            format!("a script of a system tree, run by {interpreter} — no module tool")
+        }
+        _ => return v,
+    };
+    Verdict {
+        action: ResponseAction::Log,
+        reasoning: format!(
+            "{} [in an initramfs build ({builder}, the packaged file, run by root, read in its \
+             lineage at the exec): {what} — recorded, not killed (lot 287)]",
+            v.reasoning
+        ),
+        ..v
     }
 }
 
@@ -397,6 +483,8 @@ mod tests {
             program: Err("its device and inode are not the system's tool's".into()),
             environment: Environment::Clean,
             package_manager: pm.map(str::to_string),
+            initramfs_builder: None,
+            interpreter: None,
         };
         let v = rule()
             .evaluate(&read_as(
@@ -436,6 +524,252 @@ mod tests {
         assert_ne!(v.action, ResponseAction::Log);
     }
 
+    /// Lot 287: what the exec pump read of an exec under a builder
+    /// (`builder`), its program and interpreter, a clean environment.
+    fn built(
+        builder: Option<&str>,
+        program: Result<(), String>,
+        interpreter: Option<&str>,
+    ) -> ExecFacts {
+        ExecFacts {
+            program,
+            environment: Environment::Clean,
+            package_manager: None,
+            initramfs_builder: builder.map(str::to_string),
+            interpreter: interpreter.map(str::to_string),
+        }
+    }
+
+    const HOOK: &str = "/usr/share/initramfs-tools/hooks/kmod";
+    const UPDATE_INITRAMFS: &str = "/usr/sbin/update-initramfs";
+
+    fn not_tool() -> Result<(), String> {
+        Err("its device and inode are not the system's tool's".into())
+    }
+
+    /// initramfs-tools' `manual_add_modules` (Debian 12, Ubuntu 22.04).
+    const SHOW_DEPENDS: &[&str] = &[
+        "modprobe",
+        "--all",
+        "--set-version=6.8.0-1",
+        "--ignore-install",
+        "--quiet",
+        "--show-depends",
+        "ext4",
+    ];
+
+    /// Lot 287: the hook `kmod` (a shell script, run by dash) of an
+    /// administrator's own `sudo update-initramfs -u` — the exec pump
+    /// found the packaged builder, run by root, in its lineage — is
+    /// recorded at High; so is the system's modprobe asked to load nothing
+    /// (`--set-version` beside it, its argv even cut after the dry run).
+    /// Without the builder both are killed, as before.
+    #[test]
+    fn the_admin_s_update_initramfs_hook_is_recorded() {
+        let b = Some(UPDATE_INITRAMFS);
+        let v = rule()
+            .evaluate(&read_as(
+                exec(HOOK, HOOK, &[HOOK, "prereqs"]),
+                built(b, not_tool(), Some("/usr/bin/dash")),
+            ))
+            .expect("fires");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        for part in [
+            "in an initramfs build (/usr/sbin/update-initramfs",
+            "a script of a system tree, run by /usr/bin/dash",
+        ] {
+            assert!(v.reasoning.contains(part), "{part}: {}", v.reasoning);
+        }
+        let v = rule()
+            .evaluate(&read_as(
+                exec("/usr/sbin/modprobe", "/usr/bin/kmod", SHOW_DEPENDS),
+                built(b, Ok(()), None),
+            ))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert!(
+            v.reasoning.contains("asked to load nothing"),
+            "{}",
+            v.reasoning
+        );
+        let mut e = exec("/usr/sbin/modprobe", "/usr/bin/kmod", SHOW_DEPENDS);
+        if let Event::ProcessSpawn { argv_truncated, .. } = &mut e {
+            *argv_truncated = true;
+        }
+        let v = rule()
+            .evaluate(&read_as(e, built(b, Ok(()), None)))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::Log, "{}", v.reasoning);
+        // no builder found: killed, as before
+        let v = rule()
+            .evaluate(&read_as(
+                exec(HOOK, HOOK, &[HOOK]),
+                built(None, not_tool(), Some("/usr/bin/dash")),
+            ))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        let v = rule()
+            .evaluate(&read_as(
+                exec("/usr/sbin/modprobe", "/usr/bin/kmod", SHOW_DEPENDS),
+                built(None, Ok(()), None),
+            ))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+    }
+
+    /// Lot 287: the same hook under a copy of update-initramfs in `/tmp` —
+    /// the exec pump finds no builder (the copy is not the packaged file:
+    /// `sensors::kmod_exec`'s tests) — is killed; so is a copy of the hook
+    /// in `/tmp`, or a hook outside a system tree, under the real builder.
+    #[test]
+    fn the_hook_under_a_copy_of_update_initramfs_in_tmp_is_killed() {
+        let v = rule()
+            .evaluate(&read_as(
+                exec(HOOK, HOOK, &[HOOK, "prereqs"]),
+                built(None, not_tool(), Some("/usr/bin/dash")),
+            ))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        for (hook, kill) in [
+            ("/tmp/kmod", ResponseAction::KillProcessTree),
+            ("/tmp/conf/hooks/kmod", ResponseAction::KillProcessTree),
+            (
+                "/etc/initramfs-tools/hooks/kmod",
+                ResponseAction::KillProcess,
+            ),
+        ] {
+            let v = rule()
+                .evaluate(&read_as(
+                    exec(hook, hook, &[hook]),
+                    built(Some(UPDATE_INITRAMFS), not_tool(), Some("/usr/bin/dash")),
+                ))
+                .expect("fires");
+            assert_eq!(v.action, kill, "{hook}: {}", v.reasoning);
+        }
+    }
+
+    /// Lot 287: a non-root exec under a builder is killed — the hook of a
+    /// build a user runs (`mkinitramfs -o ~/x` as uid 1000: the pump finds
+    /// no builder, which must run as root; a user's exec under a root
+    /// builder is not root's either).
+    #[test]
+    fn a_non_root_initramfs_build_is_killed() {
+        for builder in [None, Some(UPDATE_INITRAMFS)] {
+            let mut e = exec(HOOK, HOOK, &[HOOK]);
+            if let Event::ProcessSpawn { uid, .. } = &mut e {
+                *uid = 1000;
+            }
+            let v = rule()
+                .evaluate(&read_as(
+                    e,
+                    built(builder, not_tool(), Some("/usr/bin/dash")),
+                ))
+                .expect("fires");
+            assert_ne!(v.action, ResponseAction::Log, "{builder:?}");
+        }
+    }
+
+    /// Lot 287: `LD_PRELOAD` (and `MODPROBE_OPTIONS`, `LD_AUDIT`,
+    /// `LD_LIBRARY_PATH`, an environment not read) in the environment of an
+    /// exec under update-initramfs is killed, the hook's or the dry run's.
+    #[test]
+    fn ld_preload_under_update_initramfs_is_killed() {
+        for why in [
+            "LD_PRELOAD='/tmp/x.so' in its environment",
+            "MODPROBE_OPTIONS='-d /tmp/x' in its environment",
+            "its environment could not be read (Permission denied)",
+        ] {
+            for (e, program, interpreter) in [
+                (exec(HOOK, HOOK, &[HOOK]), not_tool(), Some("/usr/bin/dash")),
+                (
+                    exec("/usr/sbin/modprobe", "/usr/bin/kmod", SHOW_DEPENDS),
+                    Ok(()),
+                    None,
+                ),
+            ] {
+                let facts = ExecFacts {
+                    environment: Environment::Refused(why.into()),
+                    ..built(Some(UPDATE_INITRAMFS), program, interpreter)
+                };
+                let v = rule().evaluate(&read_as(e, facts)).expect("fires");
+                assert_eq!(v.action, ResponseAction::KillProcess, "{why}");
+                assert!(!v.reasoning.contains("initramfs build"), "{}", v.reasoning);
+            }
+        }
+        // an exec that had exited before its environment was read: its
+        // environment is no refusal
+        let facts = ExecFacts {
+            environment: Environment::Exited("reaped".into()),
+            ..built(Some(UPDATE_INITRAMFS), not_tool(), Some("/usr/bin/dash"))
+        };
+        let v = rule()
+            .evaluate(&read_as(exec(HOOK, HOOK, &[HOOK]), facts))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::Log);
+    }
+
+    /// Lot 287: in a build, a tool that is not the system's is killed — a
+    /// copy of kmod under a tool's name (a binary: no interpreter), a
+    /// script in a tool's own place — and so are the system's `insmod` and
+    /// a `modprobe` that may load: a hook root plants does not launder them.
+    #[test]
+    fn a_tool_that_is_not_the_system_s_is_killed_in_an_initramfs_build() {
+        let b = Some(UPDATE_INITRAMFS);
+        for (e, facts) in [
+            (
+                exec(
+                    "/usr/lib/x/insmod",
+                    "/usr/lib/x/insmod",
+                    &["insmod", "/tmp/rk.ko"],
+                ),
+                built(b, not_tool(), None),
+            ),
+            (
+                exec("/usr/lib/x/kmod", "/usr/lib/x/kmod", &["kmod", "list"]),
+                built(b, not_tool(), None),
+            ),
+            (
+                exec("/usr/sbin/modprobe", "/usr/sbin/modprobe", SHOW_DEPENDS),
+                built(b, not_tool(), Some("/usr/bin/dash")),
+            ),
+            (
+                exec(
+                    "/usr/sbin/insmod",
+                    "/usr/bin/kmod",
+                    &["insmod", "/tmp/rk.ko"],
+                ),
+                built(b, Ok(()), None),
+            ),
+            (
+                exec(
+                    "/usr/sbin/modprobe",
+                    "/usr/bin/kmod",
+                    &["modprobe", "--set-version=6.8.0-1", "rk"],
+                ),
+                built(b, Ok(()), None),
+            ),
+            (
+                exec(
+                    "/usr/sbin/modprobe",
+                    "/usr/bin/kmod",
+                    &["modprobe", "-S", "-D", "rk"],
+                ),
+                built(b, Ok(()), None),
+            ),
+            (
+                exec("/usr/bin/kmod", "/usr/bin/kmod", &["kmod", "insert", "rk"]),
+                built(b, Ok(()), None),
+            ),
+        ] {
+            let what = format!("{e:?}");
+            let v = rule().evaluate(&read_as(e, facts)).expect("fires");
+            assert_ne!(v.action, ResponseAction::Log, "{what}: {}", v.reasoning);
+        }
+    }
+
     /// `e` as the exec pump read it: the system's tool, no
     /// `MODPROBE_OPTIONS`.
     fn read_ok(e: Event) -> Event {
@@ -445,6 +779,8 @@ mod tests {
                 program: Ok(()),
                 environment: Environment::Clean,
                 package_manager: None,
+                initramfs_builder: None,
+                interpreter: None,
             },
         )
     }
@@ -679,6 +1015,8 @@ mod tests {
                     program: Err("its device and inode are not the system's tool's".into()),
                     environment: Environment::Clean,
                     package_manager: None,
+                    initramfs_builder: None,
+                    interpreter: None,
                 },
                 "not the system's tool's",
             ),
@@ -689,6 +1027,8 @@ mod tests {
                         "MODPROBE_OPTIONS='-d /tmp/x' in its environment".into(),
                     ),
                     package_manager: None,
+                    initramfs_builder: None,
+                    interpreter: None,
                 },
                 "MODPROBE_OPTIONS='-d /tmp/x'",
             ),
@@ -699,6 +1039,8 @@ mod tests {
                         "its environment could not be read (Permission denied)".into(),
                     ),
                     package_manager: None,
+                    initramfs_builder: None,
+                    interpreter: None,
                 },
                 "could not be read",
             ),
@@ -709,6 +1051,8 @@ mod tests {
                         "LD_PRELOAD='/tmp/x.so' in its environment".into(),
                     ),
                     package_manager: None,
+                    initramfs_builder: None,
+                    interpreter: None,
                 },
                 "LD_PRELOAD='/tmp/x.so'",
             ),
@@ -719,6 +1063,8 @@ mod tests {
                         "its start is unknown: its environment cannot be tied to the exec".into(),
                     ),
                     package_manager: None,
+                    initramfs_builder: None,
+                    interpreter: None,
                 },
                 "its start is unknown",
             ),
@@ -744,6 +1090,8 @@ mod tests {
             program: Ok(()),
             environment: Environment::Exited("no process had its pid any more".into()),
             package_manager: None,
+            initramfs_builder: None,
+            interpreter: None,
         };
         for (e, what) in [
             (modprobe(&["overlay"]), "modprobe of 'overlay'"),

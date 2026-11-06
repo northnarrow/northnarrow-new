@@ -81,6 +81,24 @@ pub struct ExecFacts {
     /// hook `/usr/share/initramfs-tools/hooks/kmod`, comm `kmod`, killed in
     /// an `apt upgrade`). `None`: none found.
     pub package_manager: Option<String>,
+    /// Lot 287: the initramfs builder the exec runs under — the nearest
+    /// ancestor, from the exec's parent up (`/proc`, read at the exec),
+    /// whose own exec the pump saw run, as root, the builder's packaged
+    /// file (`/usr/sbin/update-initramfs`, `/usr/sbin/mkinitramfs`,
+    /// `/usr/bin/dracut`: the script's device and inode, from the LSM
+    /// hook, against that file's — not a copy, not a file under `/tmp`),
+    /// and which still runs as root. An administrator's own `sudo
+    /// update-initramfs -u` has no package manager in its lineage: its
+    /// hook `kmod` was killed (rc 137, lot 283b). `None`: none found, or
+    /// the parent not the exec's (its start another).
+    pub initramfs_builder: Option<String>,
+    /// Lot 287: the interpreter the kernel ran the executed file with — the
+    /// process's image (`/proc/<pid>/exe`, read at the exec, the process
+    /// still the exec's by its start) another file than the one executed
+    /// (a `#!` script), in a system tree, not the system's module tool.
+    /// `None`: the file runs as itself (a tool, a copy of one), or its
+    /// image could not be read.
+    pub interpreter: Option<String>,
 }
 
 impl ExecFacts {
@@ -177,6 +195,8 @@ mod tests {
             program: Ok(()),
             environment: Environment::Clean,
             package_manager: None,
+            initramfs_builder: None,
+            interpreter: None,
         }
     }
 

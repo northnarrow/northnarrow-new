@@ -64,10 +64,13 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+use std::collections::{HashMap, VecDeque};
+
 use common::wire::exe::exe_flags;
 use nn_core::decision::rules::kmod_exec_facts::{self, Environment, ExecFacts, KMOD_TOOLS};
-use nn_core::posture::lineage::PACKAGE_MANAGER_EXES;
+use nn_core::posture::lineage::{in_system_tree, PACKAGE_MANAGER_EXES};
 use nn_model::{Event, ExeIdentity};
+use parking_lot::Mutex;
 
 use crate::anti_tamper::filesystem::stat_dev_to_kernel_dev;
 use crate::response::proc_ref::{pidfd_exited, pidfd_open, started_at, stat_start_ticks};
@@ -101,15 +104,24 @@ pub fn read_and_keep(event: &Event) {
 /// `comm` is a module tool's; `root`: the host's root (`/`; a fixture tree
 /// in tests) the tools' paths are under.
 pub fn facts(root: &Path, event: &Event) -> Option<ExecFacts> {
-    facts_in(root, Path::new("/proc"), event)
+    let builders = BUILDERS.lock().running();
+    facts_in(root, Path::new("/proc"), &builders, event)
 }
 
-/// [`facts`] with the processes read from `proc` (a fixture tree in tests).
-fn facts_in(root: &Path, proc: &Path, event: &Event) -> Option<ExecFacts> {
+/// [`facts`] with the processes read from `proc` (a fixture tree in tests)
+/// and the initramfs builders the pump saw executed ([`Builders::running`]).
+fn facts_in(
+    root: &Path,
+    proc: &Path,
+    builders: &[(u32, Builder)],
+    event: &Event,
+) -> Option<ExecFacts> {
     let Event::ProcessSpawn {
         pid,
+        ppid,
         comm,
         start_ns,
+        parent_start_ns,
         exe,
         ..
     } = event
@@ -123,11 +135,197 @@ fn facts_in(root: &Path, proc: &Path, event: &Event) -> Option<ExecFacts> {
     let environment = environment(proc, *pid, *start_ns);
     // lot 283b: and the lineage, while it is alive
     let package_manager = package_manager(proc, *pid);
+    // lot 287: and the initramfs build, from its parent up
+    let initramfs_builder = initramfs_builder(proc, *ppid, *parent_start_ns, builders);
     Some(ExecFacts {
         program: program(root, exe),
         environment,
         package_manager,
+        initramfs_builder,
+        interpreter: interpreter(root, proc, *pid, *start_ns, exe),
     })
+}
+
+/// Lot 287: the initramfs builders, as the distributions package them —
+/// `#!` scripts (`/bin/sh`, `/bin/bash`), executed by their path: the LSM
+/// hook's first binfmt pass describes the script itself (its device and
+/// inode), the event's `exe`.
+pub const INITRAMFS_BUILDERS: &[&str] = &[
+    "/usr/sbin/update-initramfs",
+    "/usr/sbin/mkinitramfs",
+    "/usr/bin/dracut",
+];
+
+/// Lot 287: an exec of an initramfs builder the pump saw — the process's
+/// start (its fork: an exec keeps it), and which builder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Builder {
+    start_ns: u64,
+    path: &'static str,
+}
+
+/// Lot 287: the processes whose last exec the pump saw was an initramfs
+/// builder's ([`builder_exec`]), by pid; any other exec of the pid forgets
+/// it. At most [`KEPT_BUILDERS`]: past it, the oldest go.
+#[derive(Default)]
+pub struct Builders {
+    by_pid: HashMap<u32, Builder>,
+    order: VecDeque<u32>,
+}
+
+/// The builders [`BUILDERS`] keeps at most (builds are rare and short; a
+/// builder that exited is matched by no later process: its start).
+const KEPT_BUILDERS: usize = 64;
+
+static BUILDERS: std::sync::LazyLock<Mutex<Builders>> = std::sync::LazyLock::new(Default::default);
+
+impl Builders {
+    /// `event` (an exec) noted: a builder's kept, by its pid and start;
+    /// any other exec of a pid kept forgets it (its image is another now).
+    fn note(&mut self, root: &Path, event: &Event) {
+        let Event::ProcessSpawn { pid, .. } = event else {
+            return;
+        };
+        match builder_exec(root, event) {
+            Some(b) => {
+                if self.by_pid.insert(*pid, b).is_none() {
+                    self.order.push_back(*pid);
+                }
+                while self.order.len() > KEPT_BUILDERS {
+                    if let Some(old) = self.order.pop_front() {
+                        self.by_pid.remove(&old);
+                    }
+                }
+            }
+            None => {
+                if self.by_pid.remove(pid).is_some() {
+                    self.order.retain(|p| p != pid);
+                }
+            }
+        }
+    }
+
+    /// The builders kept (none, but during a build).
+    fn running(&self) -> Vec<(u32, Builder)> {
+        self.by_pid.iter().map(|(p, b)| (*p, *b)).collect()
+    }
+}
+
+/// Lot 287: the exec pump's step after each exec (its path resolved): an
+/// exec of an initramfs builder remembered, any other forgets its pid.
+pub fn note_exec(event: &Event) {
+    BUILDERS.lock().note(Path::new("/"), event);
+}
+
+/// Lot 287: the builder `event` executes, if it is one — run as root
+/// (the exec's real uid, from the kernel's credentials), the file the
+/// kernel executed described by the LSM hook (not in tracepoint mode),
+/// on no memory filesystem, not a memfd, not unlinked, its path (the
+/// kernel's, made absolute) in a system tree and a builder's name, and
+/// its device and inode those of the builder's packaged file under `root`
+/// (stat'ed now, links followed): a copy, a file of its own, a builder of
+/// another mount namespace is none. An exec whose start is unknown is
+/// none (nothing would tie a later process to it).
+fn builder_exec(root: &Path, event: &Event) -> Option<Builder> {
+    let Event::ProcessSpawn {
+        uid, start_ns, exe, ..
+    } = event
+    else {
+        return None;
+    };
+    if *uid != 0
+        || *start_ns == 0
+        || !exe.has(exe_flags::KNOWN)
+        || exe.has(exe_flags::TMPFS | exe_flags::MEMFD | exe_flags::DELETED)
+        || !in_system_tree(&exe.path)
+    {
+        return None;
+    }
+    let name = exe.path.rsplit('/').next()?;
+    let path = INITRAMFS_BUILDERS
+        .iter()
+        .find(|b| b.rsplit('/').next() == Some(name))?;
+    let m = std::fs::metadata(root.join(path.trim_start_matches('/'))).ok()?;
+    ((stat_dev_to_kernel_dev(m.dev()), m.ino()) == (exe.dev, exe.ino)).then_some(Builder {
+        start_ns: *start_ns,
+        path,
+    })
+}
+
+/// Lot 287: the nearest initramfs builder in the lineage of an exec whose
+/// parent is `ppid`, started at `parent_start_ns` (the event's, from the
+/// kernel) — that parent, then its parents (`/proc/<pid>/stat`'s ppid), at
+/// most [`LINEAGE_HOPS`] up: a process `builders` holds, its start the
+/// builder exec's, run by root now (`status`' real uid). Walked from the
+/// parent, not the exec's own process: a short-lived tool may have exited
+/// by the read while its parent runs on; and a process's own entry is its
+/// image before this exec. `None` when the parent is not the exec's (its
+/// start another, or unknown), the chain breaks, or it ends at init.
+fn initramfs_builder(
+    proc: &Path,
+    ppid: u32,
+    parent_start_ns: u64,
+    builders: &[(u32, Builder)],
+) -> Option<String> {
+    if builders.is_empty() || parent_start_ns == 0 {
+        return None;
+    }
+    let start_of = |stat: &str| stat_start_ticks(stat);
+    let mut p = ppid;
+    for hop in 0..=LINEAGE_HOPS {
+        if p <= 1 {
+            return None;
+        }
+        let dir = proc.join(p.to_string());
+        let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+        let ticks = start_of(&stat)?;
+        if hop == 0 && !started_at(ticks, parent_start_ns) {
+            return None;
+        }
+        if let Some((_, b)) = builders.iter().find(|(pid, _)| *pid == p) {
+            if started_at(ticks, b.start_ns) && real_uid(&dir) == Some(0) {
+                return Some(b.path.to_string());
+            }
+        }
+        p = ppid_of(&stat)?;
+    }
+    None
+}
+
+/// Lot 287: the interpreter the kernel runs the exec's file with — `pid`'s
+/// image (`/proc/<pid>/exe`) another file than the one executed (`exe`'s
+/// device and inode), in a system tree, not the system's module tool, read
+/// while `pid` is still the process that started at `start_ns`.
+fn interpreter(
+    root: &Path,
+    proc: &Path,
+    pid: u32,
+    start_ns: u64,
+    exe: &ExeIdentity,
+) -> Option<String> {
+    if !exe.has(exe_flags::KNOWN) {
+        return None;
+    }
+    let dir = proc.join(pid.to_string());
+    let path = std::fs::read_link(dir.join("exe")).ok()?;
+    let m = std::fs::metadata(dir.join("exe")).ok()?;
+    let image = (stat_dev_to_kernel_dev(m.dev()), m.ino());
+    // still the exec's process (a pid is reused only once it is reaped)
+    let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+    if !stat_start_ticks(&stat).is_some_and(|t| started_at(t, start_ns)) {
+        return None;
+    }
+    let path = path.to_string_lossy().into_owned();
+    let tool = program(
+        root,
+        &ExeIdentity {
+            dev: image.0,
+            ino: image.1,
+            flags: exe_flags::KNOWN,
+            ..Default::default()
+        },
+    );
+    (image != (exe.dev, exe.ino) && in_system_tree(&path) && tool.is_err()).then_some(path)
 }
 
 /// Lot 283b: the nearest package manager proper in `pid`'s lineage — `pid`
@@ -162,6 +360,11 @@ const LINEAGE_HOPS: usize = 32;
 /// command name in parentheses, which may hold anything).
 fn ppid(dir: &Path) -> Option<u32> {
     let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+    ppid_of(&stat)
+}
+
+/// The parent a `stat` line names.
+fn ppid_of(stat: &str) -> Option<u32> {
     let rest = &stat[stat.rfind(')')? + 1..];
     rest.split_whitespace().nth(1)?.parse().ok()
 }
@@ -473,8 +676,430 @@ mod tests {
         if let Event::ProcessSpawn { pid, .. } = &mut e {
             *pid = 80;
         }
-        let f = facts_in(Path::new("/"), proc, &e).expect("a module tool's exec");
+        let f = facts_in(Path::new("/"), proc, &[], &e).expect("a module tool's exec");
         assert_eq!(f.package_manager.as_deref(), Some("/usr/bin/dpkg"));
+    }
+
+    /// Lot 287: one clock tick in ns (`/proc`'s starts are counted in them).
+    fn tick() -> u64 {
+        // SAFETY: sysconf has no preconditions.
+        1_000_000_000 / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64
+    }
+
+    /// Lot 287: a fixture `/proc` entry — `pid`, its parent, its start (in
+    /// ticks), its real uid, its image (`exe`, a link).
+    fn proc_entry(proc: &Path, pid: u32, ppid: u32, start: u64, uid: u32, exe: &Path) {
+        let d = proc.join(pid.to_string());
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("stat"),
+            format!("{pid} (a (b) c) S {ppid} 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {start} 1000000 100\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("status"),
+            format!("Name:\tx\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(exe, d.join("exe")).unwrap();
+    }
+
+    /// Lot 287: a fixture host root with the builders' packaged files and
+    /// the system's module tool (`usr/bin/kmod`, here a link to the host's
+    /// `/usr/bin/true`).
+    fn builder_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let p = |rel: &str| root.path().join(rel);
+        std::fs::create_dir_all(p("usr/sbin")).unwrap();
+        std::fs::create_dir_all(p("usr/bin")).unwrap();
+        std::fs::create_dir_all(p("usr/share/initramfs-tools/hooks")).unwrap();
+        for f in [
+            "usr/sbin/update-initramfs",
+            "usr/sbin/mkinitramfs",
+            "usr/bin/dracut",
+            "usr/share/initramfs-tools/hooks/kmod",
+        ] {
+            std::fs::write(p(f), b"#!/bin/sh\n").unwrap();
+        }
+        std::os::unix::fs::symlink("/usr/bin/true", p("usr/bin/kmod")).unwrap();
+        root
+    }
+
+    /// Lot 287: the kernel's description of `rel` under `root`, as the LSM
+    /// hook gives it: its device and inode, its path as the host shows it.
+    fn described(root: &Path, rel: &str, path: &str) -> ExeIdentity {
+        let m = std::fs::metadata(root.join(rel)).unwrap();
+        ExeIdentity {
+            path: path.to_string(),
+            dev: stat_dev_to_kernel_dev(m.dev()),
+            ino: m.ino(),
+            flags: exe_flags::KNOWN,
+            ..Default::default()
+        }
+    }
+
+    /// Lot 287: a root exec of `exe` by `pid` (started at `start` ticks),
+    /// whose parent is `ppid` (started at `pstart` ticks).
+    fn exec_of(
+        comm: &str,
+        pid: u32,
+        start: u64,
+        ppid: u32,
+        pstart: u64,
+        exe: ExeIdentity,
+    ) -> Event {
+        Event::ProcessSpawn {
+            pid,
+            ppid,
+            uid: 0,
+            gid: 0,
+            comm: comm.into(),
+            filename: exe.path.clone(),
+            timestamp_ns: 287_000 + u64::from(pid),
+            argv: vec![exe.path.clone()],
+            parent_comm: "sh".into(),
+            parent_start_ns: pstart * tick(),
+            start_ns: start * tick(),
+            parent_is_kthread: false,
+            exe,
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        }
+    }
+
+    /// Lot 287: an administrator's own `sudo update-initramfs -u` — the
+    /// pump saw update-initramfs and mkinitramfs executed (the packaged
+    /// files, as root); the hook `kmod` its forks run is read under the
+    /// nearest, walked from the hook's parent through forks that never
+    /// executed. A builder process that executed something else since, a
+    /// pid another process holds now, a builder no longer root, a parent
+    /// that is not the exec's: none.
+    #[test]
+    fn the_admin_s_update_initramfs_is_found_in_the_lineage_at_the_exec() {
+        let root = builder_root();
+        let r = root.path();
+        let tmp = tempfile::tempdir().unwrap();
+        let proc = tmp.path();
+        let dash = Path::new("/usr/bin/dash");
+        // sudo (10) → update-initramfs (20) → mkinitramfs (30) → fork (40)
+        // → fork (50) → hooks/kmod (60)
+        proc_entry(proc, 10, 1, 1010, 0, Path::new("/usr/bin/sudo"));
+        proc_entry(proc, 20, 10, 1020, 0, dash);
+        proc_entry(proc, 30, 20, 1030, 0, dash);
+        proc_entry(proc, 40, 30, 1040, 0, dash);
+        proc_entry(proc, 50, 40, 1050, 0, dash);
+        proc_entry(proc, 60, 50, 1060, 0, Path::new("/usr/bin/env"));
+        let update = described(r, "usr/sbin/update-initramfs", "/usr/sbin/update-initramfs");
+        let mkinit = described(r, "usr/sbin/mkinitramfs", "/usr/sbin/mkinitramfs");
+        let hook = described(
+            r,
+            "usr/share/initramfs-tools/hooks/kmod",
+            "/usr/share/initramfs-tools/hooks/kmod",
+        );
+        let mut b = Builders::default();
+        b.note(r, &exec_of("update-initramfs", 20, 1020, 10, 1010, update));
+        b.note(
+            r,
+            &exec_of("mkinitramfs", 30, 1030, 20, 1020, mkinit.clone()),
+        );
+        let walk = |b: &Builders, ppid, pstart: u64| {
+            initramfs_builder(proc, ppid, pstart * tick(), &b.running())
+        };
+        assert_eq!(walk(&b, 50, 1050).as_deref(), Some("/usr/sbin/mkinitramfs"));
+        // the hook an exec of mkinitramfs itself runs (its parent)
+        assert_eq!(walk(&b, 30, 1030).as_deref(), Some("/usr/sbin/mkinitramfs"));
+        // the exec pump's facts of the hook's exec carry it — and the
+        // interpreter the kernel runs it with (its image: env here)
+        let e = exec_of("kmod", 60, 1060, 50, 1050, hook);
+        let f = facts_in(r, proc, &b.running(), &e).expect("a module tool's exec");
+        assert_eq!(
+            f.initramfs_builder.as_deref(),
+            Some("/usr/sbin/mkinitramfs")
+        );
+        assert_eq!(f.interpreter.as_deref(), Some("/usr/bin/env"));
+        assert!(f.program.is_err(), "the hook is no module tool");
+        // mkinitramfs's process executed something else: forgotten, the
+        // walk goes on to update-initramfs
+        let other = described(r, "usr/bin/dracut", "/usr/lib/x/other");
+        b.note(r, &exec_of("other", 30, 1030, 20, 1020, other));
+        assert_eq!(
+            walk(&b, 50, 1050).as_deref(),
+            Some("/usr/sbin/update-initramfs")
+        );
+        // the parent is not the exec's (its start another): nothing read
+        assert_eq!(walk(&b, 50, 1150), None);
+        assert_eq!(walk(&b, 50, 0), None);
+        // update-initramfs's pid held by another process (its start later
+        // than the builder's exec): no builder
+        let mut later = Builders::default();
+        later.note(
+            r,
+            &exec_of(
+                "update-initramfs",
+                20,
+                1120,
+                10,
+                1010,
+                described(r, "usr/sbin/update-initramfs", "/usr/sbin/update-initramfs"),
+            ),
+        );
+        assert_eq!(walk(&later, 50, 1050), None);
+        // a builder no longer root: passed over (the walk goes on, finds none)
+        let tmp2 = tempfile::tempdir().unwrap();
+        let proc2 = tmp2.path();
+        proc_entry(proc2, 20, 10, 1020, 1000, dash);
+        proc_entry(proc2, 30, 20, 1030, 0, dash);
+        let mut only = Builders::default();
+        only.note(
+            r,
+            &exec_of(
+                "update-initramfs",
+                20,
+                1020,
+                10,
+                1010,
+                described(r, "usr/sbin/update-initramfs", "/usr/sbin/update-initramfs"),
+            ),
+        );
+        assert_eq!(
+            initramfs_builder(proc2, 30, 1030 * tick(), &only.running()),
+            None
+        );
+        // a chain that breaks (a fork gone): none
+        std::fs::remove_dir_all(proc.join("40")).unwrap();
+        assert_eq!(walk(&b, 50, 1050), None);
+        // no builder kept: nothing walked
+        assert_eq!(walk(&Builders::default(), 30, 1030), None);
+    }
+
+    /// Lot 287: a copy of update-initramfs (in `/tmp`, or a file of its own
+    /// where the packaged one is) is no builder, nor the packaged file
+    /// under another path (a hard link in `/tmp`), on a memory filesystem,
+    /// a memfd, unlinked, or not described by the LSM hook — so the hook
+    /// under it is read under none, and killed.
+    #[test]
+    fn a_copy_of_update_initramfs_in_tmp_is_no_builder() {
+        let root = builder_root();
+        let r = root.path();
+        let real = described(r, "usr/sbin/update-initramfs", "/usr/sbin/update-initramfs");
+        let at = |exe: ExeIdentity| {
+            builder_exec(r, &exec_of("update-initramfs", 20, 1020, 10, 1010, exe))
+        };
+        assert_eq!(
+            at(real.clone()).map(|b| b.path),
+            Some("/usr/sbin/update-initramfs")
+        );
+        // dracut by its own file
+        let dracut = described(r, "usr/bin/dracut", "/usr/bin/dracut");
+        assert_eq!(at(dracut).map(|b| b.path), Some("/usr/bin/dracut"));
+        // a copy in /tmp, and one where the packaged file is
+        std::fs::create_dir_all(r.join("tmp")).unwrap();
+        std::fs::copy(
+            r.join("usr/sbin/update-initramfs"),
+            r.join("tmp/update-initramfs"),
+        )
+        .unwrap();
+        assert_eq!(
+            at(described(
+                r,
+                "tmp/update-initramfs",
+                "/tmp/update-initramfs"
+            )),
+            None
+        );
+        assert_eq!(
+            at(described(
+                r,
+                "tmp/update-initramfs",
+                "/usr/sbin/update-initramfs"
+            )),
+            None
+        );
+        // the packaged file under /tmp (a hard link), or another name
+        assert_eq!(
+            at(ExeIdentity {
+                path: "/tmp/update-initramfs".into(),
+                ..real.clone()
+            }),
+            None
+        );
+        assert_eq!(
+            at(ExeIdentity {
+                path: "/usr/sbin/update-grub".into(),
+                ..real.clone()
+            }),
+            None
+        );
+        for flag in [exe_flags::TMPFS, exe_flags::MEMFD, exe_flags::DELETED] {
+            assert_eq!(
+                at(ExeIdentity {
+                    flags: exe_flags::KNOWN | flag,
+                    ..real.clone()
+                }),
+                None
+            );
+        }
+        assert_eq!(
+            at(ExeIdentity {
+                flags: 0,
+                ..real.clone()
+            }),
+            None
+        );
+        // its start unknown: nothing could be tied to it
+        assert_eq!(
+            builder_exec(
+                r,
+                &exec_of("update-initramfs", 20, 0, 10, 1010, real.clone())
+            ),
+            None
+        );
+        // the hook under the copy: no builder
+        let tmp = tempfile::tempdir().unwrap();
+        let proc = tmp.path();
+        proc_entry(proc, 20, 10, 1020, 0, Path::new("/usr/bin/dash"));
+        proc_entry(proc, 60, 20, 1060, 0, Path::new("/usr/bin/env"));
+        let mut b = Builders::default();
+        b.note(
+            r,
+            &exec_of(
+                "update-initramfs",
+                20,
+                1020,
+                10,
+                1010,
+                described(r, "tmp/update-initramfs", "/tmp/update-initramfs"),
+            ),
+        );
+        let hook = described(
+            r,
+            "usr/share/initramfs-tools/hooks/kmod",
+            "/usr/share/initramfs-tools/hooks/kmod",
+        );
+        let f = facts_in(
+            r,
+            proc,
+            &b.running(),
+            &exec_of("kmod", 60, 1060, 20, 1020, hook),
+        )
+        .unwrap();
+        assert_eq!(f.initramfs_builder, None);
+    }
+
+    /// Lot 287: an update-initramfs a user runs is no builder (not root).
+    #[test]
+    fn a_non_root_update_initramfs_is_no_builder() {
+        let root = builder_root();
+        let r = root.path();
+        let mut e = exec_of(
+            "update-initramfs",
+            20,
+            1020,
+            10,
+            1010,
+            described(r, "usr/sbin/update-initramfs", "/usr/sbin/update-initramfs"),
+        );
+        assert!(builder_exec(r, &e).is_some());
+        if let Event::ProcessSpawn { uid, .. } = &mut e {
+            *uid = 1000;
+        }
+        assert_eq!(builder_exec(r, &e), None);
+        let mut b = Builders::default();
+        b.note(r, &e);
+        assert!(b.running().is_empty());
+    }
+
+    /// Lot 287: the builders kept by process — the next exec of a pid
+    /// forgets it, a builder's exec keeps it once, the oldest go past the cap.
+    #[test]
+    fn the_builders_are_kept_by_process_and_forgotten_at_its_next_exec() {
+        let root = builder_root();
+        let r = root.path();
+        let update = || described(r, "usr/sbin/update-initramfs", "/usr/sbin/update-initramfs");
+        let mut b = Builders::default();
+        for pid in 100..100 + KEPT_BUILDERS as u32 + 2 {
+            b.note(r, &exec_of("update-initramfs", pid, 2000, 1, 1, update()));
+        }
+        assert_eq!(b.by_pid.len(), KEPT_BUILDERS);
+        assert_eq!(b.order.len(), KEPT_BUILDERS);
+        assert!(
+            !b.by_pid.contains_key(&100) && !b.by_pid.contains_key(&101),
+            "the oldest went"
+        );
+        assert!(b.by_pid.contains_key(&(101 + KEPT_BUILDERS as u32)));
+        // kept again: not counted twice
+        b.note(r, &exec_of("update-initramfs", 102, 2000, 1, 1, update()));
+        assert_eq!(b.order.len(), KEPT_BUILDERS);
+        // another exec of a kept pid forgets it; of another pid, nothing
+        let hook = described(
+            r,
+            "usr/share/initramfs-tools/hooks/kmod",
+            "/usr/share/initramfs-tools/hooks/kmod",
+        );
+        b.note(r, &exec_of("kmod", 102, 2000, 1, 1, hook.clone()));
+        assert!(!b.by_pid.contains_key(&102));
+        assert!(!b.order.contains(&102));
+        b.note(r, &exec_of("kmod", 7, 2000, 1, 1, hook));
+        assert_eq!(b.by_pid.len(), KEPT_BUILDERS - 1);
+        assert_eq!(b.order.len(), KEPT_BUILDERS - 1);
+    }
+
+    /// Lot 287: the interpreter of a `#!` script — the process's image
+    /// another file than the one executed, in a system tree, not the
+    /// system's module tool, the process the exec's by its start. A binary
+    /// (its image the executed file), the module tool as the image, an
+    /// image outside a system tree, another process at the pid, an exec
+    /// the LSM hook did not describe: none.
+    #[test]
+    fn the_interpreter_of_a_script_is_read_at_the_exec() {
+        let root = builder_root();
+        let r = root.path();
+        let tmp = tempfile::tempdir().unwrap();
+        let proc = tmp.path();
+        let hook = described(
+            r,
+            "usr/share/initramfs-tools/hooks/kmod",
+            "/usr/share/initramfs-tools/hooks/kmod",
+        );
+        let start = 1060 * tick();
+        proc_entry(proc, 60, 50, 1060, 0, Path::new("/usr/bin/env"));
+        assert_eq!(
+            interpreter(r, proc, 60, start, &hook).as_deref(),
+            Some("/usr/bin/env")
+        );
+        assert_eq!(interpreter(r, proc, 60, start + 100 * tick(), &hook), None);
+        assert_eq!(
+            interpreter(
+                r,
+                proc,
+                60,
+                start,
+                &ExeIdentity {
+                    flags: 0,
+                    ..hook.clone()
+                }
+            ),
+            None
+        );
+        assert_eq!(interpreter(r, proc, 61, start, &hook), None);
+        // a binary: its image is the file executed
+        let env = Path::new("/usr/bin/env");
+        let m = std::fs::metadata(env).unwrap();
+        let binary = ExeIdentity {
+            path: "/usr/lib/x/kmod".into(),
+            dev: stat_dev_to_kernel_dev(m.dev()),
+            ino: m.ino(),
+            flags: exe_flags::KNOWN,
+            ..Default::default()
+        };
+        assert_eq!(interpreter(r, proc, 60, start, &binary), None);
+        // the system's module tool as the image (usr/bin/kmod → true)
+        proc_entry(proc, 70, 50, 1070, 0, Path::new("/usr/bin/true"));
+        assert_eq!(interpreter(r, proc, 70, 1070 * tick(), &hook), None);
+        // an image outside a system tree
+        proc_entry(proc, 80, 50, 1080, 0, &r.join("usr/sbin/mkinitramfs"));
+        assert_eq!(interpreter(r, proc, 80, 1080 * tick(), &hook), None);
     }
 
     use super::*;

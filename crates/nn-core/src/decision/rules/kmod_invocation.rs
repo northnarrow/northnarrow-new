@@ -349,6 +349,72 @@ fn modprobe(args: &[String]) -> Syntax {
     ))
 }
 
+/// Lot 287: `image` is where the distribution puts a module tool — a file
+/// named `kmod`, `modprobe` or `insmod` right in one of its tool
+/// directories. A file there that is not the system's tool (a copy, a
+/// script) stands in for the tool.
+pub fn in_tool_place(image: &str) -> bool {
+    TOOL_DIRS.iter().any(|d| {
+        image
+            .strip_prefix(d)
+            .is_some_and(|f| matches!(f, "kmod" | "modprobe" | "insmod"))
+    })
+}
+
+/// Lot 287: `argv` (`argv[0]` first) asks `modprobe` to load nothing — `-D`
+/// (`--show-depends`) or `-n` (`--dry-run`, `--show`) among its options
+/// before the first module name, read as `getopt_long` reads them (an
+/// option's argument is no option: `-S -D`). kmod sets its dry run for
+/// both: it inserts nothing and runs no `install` command, it prints them.
+/// A long option only by its exact name (an abbreviation, an unknown or
+/// ambiguous option: false). `cut`: the kernel cut the argv — its last
+/// word may be cut too, and is not read.
+pub fn loads_nothing(argv: &[String], cut: bool) -> bool {
+    let mut args = argv.get(1..).unwrap_or_default();
+    if cut {
+        args = &args[..args.len().saturating_sub(1)];
+    }
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--" || a.len() < 2 || !a.starts_with('-') {
+            // the end of the options, or the first name
+            return false;
+        }
+        if let Some(body) = a.strip_prefix("--") {
+            let (name, inline) = match body.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (body, None),
+            };
+            if matches!(name, "show-depends" | "dry-run" | "show") {
+                return true;
+            }
+            let Some((_, takes, _)) = MODPROBE_LONG.iter().find(|(n, _, _)| *n == name) else {
+                return false;
+            };
+            if *takes && inline.is_none() {
+                it.next();
+            }
+            continue;
+        }
+        for (i, c) in a[1..].char_indices() {
+            if matches!(c, 'D' | 'n') {
+                return true;
+            }
+            let Some((takes, _)) = modprobe_short(c) else {
+                return false;
+            };
+            if takes {
+                // its argument: the rest of the word, or the next one
+                if a[1 + i + c.len_utf8()..].is_empty() {
+                    it.next();
+                }
+                break;
+            }
+        }
+    }
+    false
+}
+
 /// `kmod [options] <command>`: getopt with `+` (options stop at the first
 /// operand), then the command.
 fn kmod(args: &[String]) -> Syntax {
@@ -670,5 +736,91 @@ mod tests {
                 "{mode}"
             );
         }
+    }
+
+    /// Lot 287: a module tool's place — its name right in a tool
+    /// directory; anywhere else, or under another name, it is not.
+    #[test]
+    fn a_tool_s_place_is_its_name_in_a_tool_directory() {
+        for at in [
+            "/usr/bin/kmod",
+            "/usr/sbin/modprobe",
+            "/bin/kmod",
+            "/sbin/insmod",
+            "/usr/sbin/insmod",
+        ] {
+            assert!(in_tool_place(at), "{at}");
+        }
+        for not in [
+            "/usr/share/initramfs-tools/hooks/kmod",
+            "/usr/local/sbin/modprobe",
+            "/usr/bin/x/modprobe",
+            "/usr/sbin/modprobe (deleted)",
+            "/usr/sbin/depmod",
+            "/tmp/kmod",
+            "modprobe",
+        ] {
+            assert!(!in_tool_place(not), "{not}");
+        }
+    }
+
+    /// Lot 287: modprobe asked to load nothing — `-D`/`--show-depends`,
+    /// `-n`/`--dry-run`/`--show` before the first name, as getopt reads
+    /// it: initramfs-tools' `manual_add_modules` (`--set-version` beside
+    /// it, the argv cut after it). An option's argument, a name, `--`, an
+    /// abbreviation or an unknown option before it: not a dry run.
+    #[test]
+    fn a_modprobe_that_loads_nothing_is_read_as_getopt_reads_it() {
+        let dry = |a: &[&str]| loads_nothing(&v(a), false);
+        for a in [
+            &[
+                "modprobe",
+                "--all",
+                "--set-version=6.8.0-1",
+                "--ignore-install",
+                "--quiet",
+                "--show-depends",
+                "ext4",
+            ][..],
+            &["modprobe", "-D", "x"],
+            &["modprobe", "-qD", "x"],
+            &["modprobe", "-n", "x"],
+            &["modprobe", "--dry-run", "x"],
+            &["modprobe", "--show", "x"],
+            &["modprobe", "-S", "6.8.0-1", "--show-depends", "x"],
+            &["modprobe", "-S6.8.0-1", "-D", "x"],
+            &["modprobe", "--set-version", "6.8.0-1", "-D", "x"],
+            &["modprobe", "-w", "5", "-qn", "x"],
+        ] {
+            assert!(dry(a), "{a:?}");
+        }
+        for a in [
+            &["modprobe", "x"][..],
+            &["modprobe", "-S", "-D", "x"],
+            &["modprobe", "-qS", "-D", "x"],
+            &["modprobe", "--set-version", "-D", "x"],
+            &["modprobe", "--set-version", "--show-depends", "x"],
+            &["modprobe", "--config", "-n", "x"],
+            &["modprobe", "-C", "--dry-run", "x"],
+            &["modprobe", "-d", "-n", "x"],
+            &["modprobe", "-o", "-D", "x"],
+            &["modprobe", "x", "-D"],
+            &["modprobe", "--", "-D"],
+            &["modprobe", "-", "-D"],
+            &["modprobe", "--show-dep", "x"],
+            &["modprobe", "--bogus", "-D", "x"],
+            &["modprobe", "-Z", "-D", "x"],
+            &["modprobe", "-S"],
+            &["modprobe"],
+            &[],
+        ] {
+            assert!(!dry(a), "{a:?}");
+        }
+        // a cut argv: its last word not read
+        let a = v(&["modprobe", "--set-version=6.8.0-1", "--show-depends"]);
+        assert!(loads_nothing(&a, false));
+        assert!(!loads_nothing(&a, true));
+        let a = v(&["modprobe", "--show-depends", "ext4", "ex"]);
+        assert!(loads_nothing(&a, true));
     }
 }
