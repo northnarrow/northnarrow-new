@@ -7202,3 +7202,101 @@ number in parentheses is a lab PR.
     longer write is refused). 5.15's cost not measured.
   - Levels unchanged (C23 2 provisional, C15 1): a residual of the
     anti-tamper closed and an operator switch added, not a new capability.
+- **Lot 280b — the switches that blind the sensors (Wave 1 of lot 280;
+  C23, C18).**
+  - What was open: `kernel.ftrace_enabled=0` inside a window silenced the
+    start-in-cgroup tracker's fentry/fexit (a birth by `CLONE_INTO_CGROUP`
+    into an exempt cgroup unmarked, exempt after the window: the short
+    re-check of #497, NB1); `/sys/kernel/debug/kprobes/enabled`,
+    `debug.kprobes-optimization` and `/sys/kernel/security/lockdown` were
+    writable outside a window; no record of the kernel's taint or
+    livepatches; a foreign `cgroup/sysctl` program on the root cgroup
+    after the judge (lot 280a's residual) only named at the start.
+  - What changed: the tracker's fork tracepoint checks every new thread
+    group against its fentry's record (`CGROUP_JOIN_BORN`,
+    `CGROUP_JOIN_SILENT`, armed once the start's programs run): a birth
+    the fentry missed is not known at once and counted; the manifest's
+    build (5 s) signs `cgroup_join_marks` while ftrace is off or a birth
+    is missed and resets the marks' epoch once ftrace runs again, the
+    period signed. `debug.kprobes-optimization` a guarded sysctl (every
+    write refused outside a window, never opted out, 0 put back); the
+    write deny's debugfs and securityfs branch refuses
+    `kprobes/enabled` and `lockdown` (`kprobes`, `lockdown`), the round
+    puts `kprobes/enabled` back to 1. The host check warns on
+    `[confidentiality]`. The manifest's `kernel_code` (taint mask,
+    letters, livepatches; a flag or a livepatch more is worse); the
+    kernel-state round (5 s) signs a new taint of code entering the kernel
+    (`kernel_taint`, Critical for E/F/R, High otherwise, no posture
+    trigger) and a foreign program on the root's sysctl slot
+    (`sysctl_root_prog`, High); the `bpf` hook refuses such an attach to
+    the root outside a window (`sysctl_root_attach`, enforce mode).
+  - The lab, as measured (our own guests under lease k280b, one at a
+    time; `nn-lab.sh switches-check`):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`). Round 1 (55b3500d):
+      `verifier-check` 98 programs, 96 OK, 0 failing (`cgroup_join_fork`
+      740 instructions, `cgroup_join_born` 394, `bpf_syscall_observe`
+      2,272, `protected_write_deny` 9,294, `protected_open_deny` 6,873);
+      with ftrace on, 0 births missed over 6 s of forks; at 0 inside a
+      window, 63 then 77 births the fentry missed, `cgroup_join_marks`
+      signed ("lost since 10:28:20"), back at 1 the reset signed ("lost
+      from 10:28:20 to 10:28:26", 4 signed rows); the debugfs, sysctl and
+      lockdown refusals (some read wrongly by the script: debugfs read as
+      the lab user, the tracker's maps by their protected pins, the
+      manifest's JSON path — fixed for round 2); T5's root attach NOT
+      refused — the lab's `debug-trigger` build runs the BPF guard in
+      observe mode (round 2 enforces it). **Lockdown confidentiality**
+      (raised inside a window): the host check warns with its own fix; the
+      agent restarted under it **does not start** (unit failed);
+      `verifier-check` under it loads **7 of 98 programs** (83 refused, the
+      first refusal `unknown func bpf_probe_read#4` in 440 log lines,
+      `bpf_probe_read_str#45` in 5). The lab's in-guest reboot stopped
+      QEMU instead (no uninstall in that round): the guest was cold-booted,
+      its agent (round 1's) came up whole (27 of 27 deny hooks, L3) and was
+      uninstalled first in round 2. Round 2 (6d01354c), all PASS: a process
+      started while ftrace is 0 not known at once (its byte 1), 66 births
+      counted, the degradation, the epoch reset (0 → 193,610,975,700 ns
+      boot time) and the period signed; `kprobes/enabled=0` and
+      `debug.kprobes-optimization=0` outside a window refused, kept 1,
+      signed (`kprobes`, `sysctl`), a 0 written inside a window put back
+      at its close (`sysctl_restored`); `lockdown` refused, signed;
+      `insmod` of an unsigned test module killed by R011 (rc 137, inside a
+      window too), so the taint was **simulated** by writing the flags to
+      `kernel.tainted`: E signed Critical, K High, the manifest's
+      `kernel_code` 40960 (EK); a `cgroup/sysctl` program attached to the
+      root outside a window with the guard enforcing: `EPERM`,
+      `sysctl_root_attach` signed; attached inside a window and held 12 s:
+      found by the round, `sysctl_root_prog` High. Uninstalled, the guest
+      off.
+  - Host: named tests `ftrace_off_loses_the_marks_and_its_return_resets_the_epoch`,
+    `a_birth_the_fentry_missed_loses_the_marks_with_ftrace_on`,
+    `a_birth_the_fentry_missed_is_told_from_one_it_saw`,
+    `the_kprobes_switches_are_refused_whatever_they_carry`,
+    `the_switch_files_are_found_by_filesystem_and_name`,
+    `the_kprobes_switches_at_0_are_put_back`,
+    `lockdown_confidentiality_is_a_warning_with_its_own_fix`,
+    `the_manifest_records_the_taint_and_the_livepatches`,
+    `a_new_code_entry_taint_is_found_once`,
+    `a_new_kernel_taint_is_critical_when_unsigned_or_forced`,
+    `a_foreign_root_program_is_found_once_and_a_wrong_root_degrades`,
+    `the_kernel_code_changes_are_signed_and_a_new_flag_is_worse`,
+    `the_kernel_state_findings_raise_nothing_and_the_switches_impair`,
+    `the_judged_attach_is_the_headers_cgroup_sysctl`,
+    `capabilities_print_the_kernel_code`, and the source-reading
+    `xtask/tests/blinding_switches.rs` (the fork's check, the bpf hook's
+    root refusal, the wiring). 57 mutations of the new code (common 26,
+    nn-model 2, nn-core 10, nn-linux 14, the eBPF code and the wiring read
+    by xtask 13 + 2): 56 caught by a named test — five only once their test
+    was added (the manifest's kernel code), two attributed to a stale build
+    in the first run and caught alone — and one argued equivalent (a
+    name's length dropped from the comparison: the bytes past it are
+    masked to zero and a name holds no NUL).
+  - Split: the brief's item 6 (a live self-test of each of the 13
+    sensors every round) is lot 280c, not in this lot.
+  - Open: what the other fentry/fexit sensors and the kprobes did not see
+    while ftrace was 0 is not recovered; the epoch reset refuses the
+    exempt services' processes until they exit; the root-attach refusal
+    holds in enforce mode only; a taint set before the start is in the
+    manifest only; a program attached to the root inside a window stays
+    (signed, not detached).
+  - Levels unchanged (C23 2 provisional, C18 1): switches closed and
+    recorded, not a new capability.
