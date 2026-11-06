@@ -2493,7 +2493,10 @@ mod tests {
         assert!(!attach.contains("reattach_fresh("), "{attach}");
         assert!(!code.contains("chain([&MODULE_WRITE_PROGRAM])"));
         // and the history's attach pins in its own directory
-        let mw = include_str!("../module_writes.rs");
+        let mw = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/crates/nn-linux/src/module_writes.rs"
+        ));
         let mw = &mw[..mw.find("#[cfg(test)]").unwrap()];
         assert!(mw.contains("let dir = pin_dir(root);"));
         assert!(mw.contains("reattach_fresh(ebpf, PROGRAM, HOOK, btf, Some(&dir))"));

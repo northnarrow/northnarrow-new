@@ -304,13 +304,15 @@ fn the_opt_out_is_applied_where_the_policy_is() {
     let raw = |rel: &str| fs::read_to_string(repo_root().join(rel)).unwrap();
     let u = raw("deploy/uninstall.sh");
     assert!(
-        u.contains("for d in \"$BPFFS_ROOT\"-cgroup-join-v* \"$BPFFS_ROOT\"-sysctl; do"),
+        u.contains(
+            "for d in \"$BPFFS_ROOT\"-cgroup-join-v* \"$BPFFS_ROOT\"-sysctl \"$BPFFS_ROOT\"-module-writes; do"
+        ),
         "uninstall.sh removes the judge's pins"
     );
     let l = raw("deploy/lab/nn-lab.sh");
     assert!(
         l.contains(
-            "/sys/fs/bpf/northnarrow-cgroup-join-v* /sys/fs/bpf/northnarrow-sysctl 2>/dev/null"
+            "/sys/fs/bpf/northnarrow-cgroup-join-v* /sys/fs/bpf/northnarrow-sysctl /sys/fs/bpf/northnarrow-module-writes 2>/dev/null"
         ),
         "the lab's purge removes them"
     );
