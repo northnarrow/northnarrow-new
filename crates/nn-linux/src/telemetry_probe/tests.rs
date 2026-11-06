@@ -127,7 +127,7 @@ fn the_probe_s_word_on_each_sensor() {
 /// sensor is seen; the round ends with every sensor seen, nothing signed.
 #[test]
 fn each_sensor_s_self_test_sees_its_event() {
-    let nonce = "0123456789abcdef";
+    let nonce = &make_nonce().unwrap();
     let probe = probe_with_round(nonce);
     for (sensor, e) in round_events_for_tests(nonce, AGENT, EXE, CHILD, TS, DENY) {
         assert!(probe.observe(&e), "{sensor:?} not taken: {e:?}");
@@ -165,7 +165,7 @@ fn each_sensor_s_self_test_sees_its_event() {
 /// connect off the host, an event of the deny's kind on another target).
 #[test]
 fn only_the_child_s_own_events_of_its_steps_are_taken() {
-    let nonce = "00aa00aa00aa00aa";
+    let nonce = &make_nonce().unwrap();
     let events = round_events_for_tests(nonce, AGENT, EXE, CHILD, TS, DENY);
     let of = |s: Sensor| {
         events
@@ -233,7 +233,9 @@ fn only_the_child_s_own_events_of_its_steps_are_taken() {
         "a create refused in another directory"
     );
     // another round's nonce, another parent
-    let wrong = round_events_for_tests("ffffffffffffffff", AGENT + 1, EXE, CHILD, TS, DENY);
+    let other = make_nonce().unwrap();
+    assert_ne!(other, *nonce);
+    let wrong = round_events_for_tests(&other, AGENT + 1, EXE, CHILD, TS, DENY);
     let probe = probe_with_round(nonce);
     for (s, e) in &wrong {
         if matches!(
@@ -692,14 +694,15 @@ fn the_attach_checks_and_the_module_count() {
 /// ClientHello's shape the tls_hello sensor reads.
 #[test]
 fn the_tcp_steps_run_on_loopback_and_the_hello_has_the_sensor_s_shape() {
-    assert_eq!(tcp_steps("0123456789abcdef"), "ok");
-    let h = client_hello(&dns_name("0123456789abcdef"));
+    let nonce = make_nonce().unwrap();
+    assert_eq!(tcp_steps(&nonce), "ok");
+    let h = client_hello(&dns_name(&nonce));
     assert_eq!(&h[..3], &[0x16, 0x03, 0x01], "a handshake record");
     assert_eq!(h[5], 0x01, "a ClientHello");
     assert_eq!(u16::from_be_bytes([h[3], h[4]]) as usize, h.len() - 5);
     let hs_len = u32::from_be_bytes([0, h[6], h[7], h[8]]) as usize;
     assert_eq!(hs_len, h.len() - 9);
-    let name = dns_name("0123456789abcdef");
+    let name = dns_name(&nonce);
     assert!(
         h.windows(name.len()).any(|w| w == name.as_bytes()),
         "the SNI"
@@ -772,7 +775,7 @@ fn dns_packet_is_well_formed() {
 /// asked (`RD` clear), no answer records.
 #[test]
 fn probe_packet_is_a_response_no_resolver_forwards() {
-    let p = dns_probe_packet(&dns_name("0123456789abcdef"));
+    let p = dns_probe_packet(&dns_name(&make_nonce().unwrap()));
     assert_eq!(p[2] & DNS_FLAG_QR, DNS_FLAG_QR, "QR set");
     assert_eq!(p[2] & DNS_FLAG_RD, 0, "RD clear");
     assert_eq!(p[2] & 0x78, 0, "opcode QUERY");
@@ -795,7 +798,8 @@ fn probe_datagram_stays_on_loopback_and_carries_the_name() {
     listener
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let name = dns_name("0123456789abcdef");
+    let nonce = make_nonce().unwrap();
+    let name = dns_name(&nonce);
     let sent = send_dns_probe(&name, listener.local_addr().unwrap()).unwrap();
     let mut buf = [0u8; 512];
     let (n, from) = listener.recv_from(&mut buf).unwrap();
@@ -803,7 +807,7 @@ fn probe_datagram_stays_on_loopback_and_carries_the_name() {
     assert!(from.ip().is_loopback(), "{from}");
     assert_eq!(&buf[..n], &dns_probe_packet(&name)[..]);
     assert_eq!(buf[2] & DNS_FLAG_QR, DNS_FLAG_QR);
-    assert_eq!(&buf[13..29], b"0123456789abcdef");
+    assert_eq!(&buf[13..29], nonce.as_bytes());
 }
 
 #[test]

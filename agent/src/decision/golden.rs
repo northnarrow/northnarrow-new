@@ -1343,7 +1343,10 @@ fn self_test_events_never_trigger_rules_or_the_posture() {
         serde_json::from_value(json!({"about": "lot 280c: the sensor self-test", "items": []}))
             .unwrap();
     let host = Host::new(&case, tempfile::TempDir::new().unwrap());
-    let (nonce, agent, child, ts) = ("0123456789abcdef", 4_000, 4_242, 1_500_000);
+    // a nonce of its own, as each round makes one (`make_nonce`): no fixed
+    // value is compared here
+    let nonce = &crate::telemetry_probe::make_nonce().unwrap();
+    let (agent, child, ts) = (4_000, 4_242, 1_500_000);
     let exe = "/usr/local/bin/northnarrow-agent";
     let deny = (0x0080_0001, 77);
     let events = round_events_for_tests(nonce, agent, exe, child, ts, deny);

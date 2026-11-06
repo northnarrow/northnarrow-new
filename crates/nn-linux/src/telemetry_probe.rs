@@ -887,8 +887,15 @@ impl TelemetryProbe {
         cpu: Duration,
         audit_log: Option<&Arc<Mutex<AuditLog>>>,
     ) -> Vec<Note> {
+        let nonce = self
+            .tracker
+            .lock()
+            .round
+            .as_ref()
+            .map(|r| r.id.nonce.clone())
+            .unwrap_or_default();
         let (notes, _, open) = self.close_round(report, false, checks, cpu);
-        sign(&notes, "test", &open, audit_log);
+        sign(&notes, &nonce, &open, audit_log);
         notes
     }
 
