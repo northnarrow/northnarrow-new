@@ -394,8 +394,9 @@ fn injection_verdict(
         Some(e) => format!("the per-rule policy exempted it ({e}); "),
         None => String::new(),
     };
+    // Not the uid's number: the record's principal carries it.
     let who = if uid != 0 {
-        format!("uid {uid}, not root")
+        "not root".to_string()
     } else {
         match interactive_admin {
             Some(true) => "root, from an administrator's interactive sudo/su session".to_string(),
@@ -773,13 +774,9 @@ mod tests {
             assert!(v.reasoning.contains(needle), "{needle}: {}", v.reasoning);
         }
         assert!(!v.reasoning.contains("the kernel refused it"));
-        let v = exempt_injection(&ev(1000, attach), "uid 998", Some(true)).unwrap();
+        let v = exempt_injection(&ev(1000, attach), "unit y.service", Some(true)).unwrap();
         assert_eq!(v.severity, Severity::Critical);
-        assert!(
-            v.reasoning.contains("uid 1000, not root"),
-            "{}",
-            v.reasoning
-        );
+        assert!(v.reasoning.contains("(not root)"));
         let mem = common::cgroup_join::inject_detail(0x0a, Some(257));
         let v = exempt_injection(&ev(0, mem), "unit x.service", None).unwrap();
         assert_eq!(v.severity, Severity::Critical);

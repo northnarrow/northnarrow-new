@@ -1407,7 +1407,7 @@ mod tests {
             injected: None,
             reads: Mutex::new(Vec::new()),
         };
-        for e in [
+        for (case, e) in [
             Exemption::Uid(998),
             Exemption::Unit("backup.service".into()),
             Exemption::Cgroup("/system.slice/backup.service".into()),
@@ -1415,8 +1415,14 @@ mod tests {
                 path: "/usr/bin/backup".into(),
                 sha256: [7; 32],
             },
-        ] {
-            assert_eq!(exempt(std::slice::from_ref(&e), 42, None, &f), None, "{e}");
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                exempt(std::slice::from_ref(e), 42, None, &f).is_none(),
+                "case {case}"
+            );
         }
     }
 
@@ -1458,13 +1464,13 @@ mod tests {
                 injected,
                 ..facts()
             };
-            for e in &kinds {
+            for (case, e) in kinds.iter().enumerate() {
                 match exempt(std::slice::from_ref(e), 42, None, &f) {
                     Some(Exempt::Revoked { exemption, why }) => {
-                        assert_eq!(exemption, e.to_string());
-                        assert!(why.contains(needle), "{e}: {why}");
+                        assert!(exemption == e.to_string(), "case {case}");
+                        assert!(why.contains(needle), "case {case}: {needle}");
                     }
-                    other => panic!("{e} with {injected:?}: {other:?}"),
+                    other => panic!("case {case}: revoked expected, found {}", other.is_some()),
                 }
             }
             // the uid's exemption holds, whatever runs as it
