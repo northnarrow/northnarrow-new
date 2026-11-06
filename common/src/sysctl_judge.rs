@@ -23,15 +23,16 @@
 //! that would otherwise be refused is recorded.
 
 use crate::cgroup_limits::{
-    sysctl_refuses_every_write, sysctl_value_harmful, SYSCTL_FTRACE_ENABLED, SYSCTL_MAX_MAP_COUNT,
-    SYSCTL_NONE, SYSCTL_OVERCOMMIT_KBYTES, SYSCTL_OVERCOMMIT_MEMORY, SYSCTL_OVERCOMMIT_RATIO,
-    SYSCTL_PID_MAX, SYSCTL_SCHED_RT_PERIOD, SYSCTL_SCHED_RT_RUNTIME, SYSCTL_THREADS_MAX,
+    sysctl_refuses_every_write, sysctl_value_harmful, SYSCTL_FTRACE_ENABLED,
+    SYSCTL_KPROBES_ENABLED, SYSCTL_KPROBES_OPTIMIZATION, SYSCTL_MAX_MAP_COUNT, SYSCTL_NONE,
+    SYSCTL_OVERCOMMIT_KBYTES, SYSCTL_OVERCOMMIT_MEMORY, SYSCTL_OVERCOMMIT_RATIO, SYSCTL_PID_MAX,
+    SYSCTL_SCHED_RT_PERIOD, SYSCTL_SCHED_RT_RUNTIME, SYSCTL_THREADS_MAX,
 };
 
 /// The guarded sysctls by the name `bpf_sysctl_get_name` gives without
 /// `BPF_F_SYSCTL_BASE_NAME` (their path under `/proc/sys`), and by the name
 /// `sysctl(8)` and the policy use, with their kinds.
-pub const SYSCTL_PATHS: [(&str, &str, u8); 9] = [
+pub const SYSCTL_PATHS: [(&str, &str, u8); 10] = [
     (
         "vm/overcommit_memory",
         "vm.overcommit_memory",
@@ -68,6 +69,12 @@ pub const SYSCTL_PATHS: [(&str, &str, u8); 9] = [
         "kernel/sched_rt_period_us",
         "kernel.sched_rt_period_us",
         SYSCTL_SCHED_RT_PERIOD,
+    ),
+    // lot 280b
+    (
+        "debug/kprobes-optimization",
+        "debug.kprobes-optimization",
+        SYSCTL_KPROBES_OPTIMIZATION,
     ),
 ];
 
@@ -233,7 +240,8 @@ pub enum SysctlVerdict {
 /// The kinds the opt-out may name: every guarded sysctl but
 /// `kernel.ftrace_enabled` — 0 blinds the agent itself (the BPF
 /// trampolines stop, its deny hooks among them), and no other value is a
-/// tuning anyone needs. `Err` says why.
+/// tuning anyone needs — and (lot 280b) the kprobes' switches, which no
+/// host tunes either. `Err` says why.
 pub const fn opt_out_allowed(kind: u8) -> Result<(), &'static str> {
     match kind {
         SYSCTL_NONE => Err("not a sysctl the agent guards"),
@@ -241,8 +249,23 @@ pub const fn opt_out_allowed(kind: u8) -> Result<(), &'static str> {
             "kernel.ftrace_enabled is never opted out: 0 stops the BPF trampolines, the \
              agent's deny hooks among them (a window lets it through)",
         ),
+        SYSCTL_KPROBES_OPTIMIZATION | SYSCTL_KPROBES_ENABLED => Err(
+            "the kprobes' switches are never opted out: 0 unoptimises (debug.kprobes-optimization) \
+             or disarms (kprobes/enabled) the agent's kprobes (a window lets it through)",
+        ),
         _ => Ok(()),
     }
+}
+
+/// The kinds [`opt_out_allowed`] refuses whatever the slot says, as the
+/// eBPF programs test it (no string): `ftrace_enabled` and (lot 280b) the
+/// kprobes' switches.
+#[inline(always)]
+pub const fn never_opted_out(kind: u8) -> bool {
+    matches!(
+        kind,
+        SYSCTL_FTRACE_ENABLED | SYSCTL_KPROBES_OPTIMIZATION | SYSCTL_KPROBES_ENABLED
+    )
 }
 
 /// The verdict on `v`, the integer the kernel will store in the sysctl of
@@ -272,7 +295,7 @@ pub const fn verdict_of(
     if !sysctl_refuses_every_write(kind) && !sysctl_value_harmful(kind, v) {
         return SysctlVerdict::Allow;
     }
-    if opt.on && opt.min <= v && v <= opt.max && kind != SYSCTL_FTRACE_ENABLED {
+    if opt.on && opt.min <= v && v <= opt.max && !never_opted_out(kind) {
         SysctlVerdict::OptedOut
     } else {
         SysctlVerdict::Refuse
@@ -486,6 +509,9 @@ mod tests {
         }
         assert_eq!(v(SYSCTL_FTRACE_ENABLED, Some(1)), Refuse);
         assert_eq!(v(SYSCTL_FTRACE_ENABLED, Some(0)), Refuse);
+        // lot 280b: the kprobes' optimisation switch, whatever it carries
+        assert_eq!(v(SYSCTL_KPROBES_OPTIMIZATION, Some(1)), Refuse);
+        assert_eq!(v(SYSCTL_KPROBES_OPTIMIZATION, Some(0)), Refuse);
         assert_eq!(v(SYSCTL_SCHED_RT_PERIOD, Some(1_000_000)), Refuse);
         assert_eq!(v(SYSCTL_PID_MAX, Some(32767)), Refuse);
         assert_eq!(v(SYSCTL_PID_MAX, Some(32768)), Allow);
@@ -564,8 +590,31 @@ mod tests {
         );
         assert!(opt_out_allowed(SYSCTL_FTRACE_ENABLED).is_err());
         assert!(opt_out_allowed(SYSCTL_NONE).is_err());
+        // lot 280b: nor the kprobes' switches, even with a slot
+        for kind in [SYSCTL_KPROBES_OPTIMIZATION, SYSCTL_KPROBES_ENABLED] {
+            assert!(opt_out_allowed(kind).is_err(), "{kind}");
+            assert_eq!(
+                sysctl_kernel_verdict(kind, false, Some(0), Some((0, 1))),
+                Refuse,
+                "{kind}"
+            );
+            assert_eq!(
+                verdict_of(kind, false, true, 1, Range::of(Some((0, 1)))),
+                Refuse,
+                "{kind}"
+            );
+        }
+        // the programs' test is the policy's
+        for kind in 1..=32u8 {
+            assert_eq!(
+                never_opted_out(kind),
+                opt_out_allowed(kind).is_err(),
+                "{kind}"
+            );
+        }
+        assert!(!never_opted_out(SYSCTL_NONE));
         for (_, _, kind) in SYSCTL_PATHS {
-            if kind != SYSCTL_FTRACE_ENABLED {
+            if kind != SYSCTL_FTRACE_ENABLED && kind != SYSCTL_KPROBES_OPTIMIZATION {
                 assert!(opt_out_allowed(kind).is_ok(), "{kind}");
             }
         }

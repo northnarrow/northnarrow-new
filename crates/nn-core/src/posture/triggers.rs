@@ -893,10 +893,15 @@ impl<H: DecisionHost> TriggerDetector<H> {
         {
             // Lot 280a: nor a write the signed per-sysctl opt-out let
             // through (`SysctlOptOut`): recorded, the operator's tuning.
+            // Lot 280b: nor what the kernel-state round found (a new
+            // kernel taint, a foreign program on the root's sysctl slot):
+            // the kernel's record, no refusal — signed, the rules' to weigh.
             if !matches!(
                 operation,
                 nn_model::FsProtectOperation::CgroupJoin
                     | nn_model::FsProtectOperation::SysctlOptOut
+                    | nn_model::FsProtectOperation::KernelTaint
+                    | nn_model::FsProtectOperation::SysctlRootProg
             ) {
                 hits.push(if *pid == 1 {
                     TriggerType::RelayedTamperAttempt
@@ -933,6 +938,12 @@ impl<H: DecisionHost> TriggerDetector<H> {
                         | nn_model::FsProtectOperation::Ioprio
                         | nn_model::FsProtectOperation::Sysctl
                         | nn_model::FsProtectOperation::SysctlValue
+                        // lot 280b: the switches that blind the sensors, and
+                        // a cgroup/sysctl attach to the root — refused; a
+                        // debugging script meets them too
+                        | nn_model::FsProtectOperation::Kprobes
+                        | nn_model::FsProtectOperation::Lockdown
+                        | nn_model::FsProtectOperation::SysctlRootAttach
                 ) {
                     // Lot 273c: a refused change of the agent's scheduling, nice
                     // value or I/O priority is an impairment (ENGAGED), not a
@@ -2937,6 +2948,40 @@ mod tests {
             det.detect(&ev(nn_model::FsProtectOperation::SysctlValue), &[]),
             vec![TriggerType::DefenseImpairment]
         );
+    }
+
+    /// Lot 280b (named): the kernel-state round's findings raise no
+    /// trigger (no refusal); the refused switches impair (ENGAGED), never
+    /// the decisive tamper.
+    #[test]
+    fn the_kernel_state_findings_raise_nothing_and_the_switches_impair() {
+        let det = TriggerDetector::new();
+        let ev = |operation| Event::FsProtectDenial {
+            pid: 9999,
+            uid: 0,
+            comm: "x".into(),
+            target_dev: 7,
+            target_ino: 8,
+            operation,
+            timestamp_ns: 1,
+        };
+        for op in [
+            nn_model::FsProtectOperation::KernelTaint,
+            nn_model::FsProtectOperation::SysctlRootProg,
+        ] {
+            assert!(det.detect(&ev(op), &[]).is_empty(), "{op}");
+        }
+        for op in [
+            nn_model::FsProtectOperation::Kprobes,
+            nn_model::FsProtectOperation::Lockdown,
+            nn_model::FsProtectOperation::SysctlRootAttach,
+        ] {
+            assert_eq!(
+                det.detect(&ev(op), &[]),
+                vec![TriggerType::DefenseImpairment],
+                "{op}"
+            );
+        }
     }
 
     #[test]

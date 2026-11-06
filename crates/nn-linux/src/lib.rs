@@ -409,6 +409,10 @@ pub mod shutdown_marker;
 // socket, whose server must be PID 1 (external audit EBPF-001; R09c, lab PR
 // 257; was the agent's `systemd_state`).
 pub mod host_dropins;
+/// Lot 280b: the kernel's state the hooks depend on and no hook sees
+/// change — its taint flags and livepatches, the root cgroup's
+/// `cgroup/sysctl` programs — read every 5 s.
+pub mod kernel_state;
 /// Lot 273d: our units' own drop-ins made inside a window, judged at its
 /// close.
 pub mod own_dropins;

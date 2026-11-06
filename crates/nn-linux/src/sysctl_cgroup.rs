@@ -51,7 +51,7 @@ pub const ATTACH: &str = "cgroup/sysctl:root cgroup (link, multi)";
 
 /// `enum bpf_attach_type`'s `BPF_CGROUP_SYSCTL` (uapi; the test checks it
 /// against aya-obj's bindings).
-pub const BPF_CGROUP_SYSCTL: u32 = 18;
+pub const BPF_CGROUP_SYSCTL: u32 = common::bpf_cmd::ATTACH_CGROUP_SYSCTL;
 /// `BPF_F_ALLOW_OVERRIDE` / `BPF_F_ALLOW_MULTI` (uapi).
 pub const BPF_F_ALLOW_OVERRIDE: u32 = 1;
 pub const BPF_F_ALLOW_MULTI: u32 = 2;
@@ -145,6 +145,9 @@ static JUDGE: OnceLock<Judge> = OnceLock::new();
 /// it finds among the agent's descriptors as its own (a foreign handle,
 /// detach or update of it refused) and its self-check expects it.
 static LINK: OnceLock<OwnedFd> = OnceLock::new();
+/// Lot 280b: the id of this boot's program (the round tells the root's
+/// other programs from it).
+static OWN_PROG: OnceLock<u32> = OnceLock::new();
 
 /// The boot's judge, once [`attach`]ed.
 pub fn judge() -> Option<&'static Judge> {
@@ -413,7 +416,25 @@ fn attach_inner(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<Vec<u32>, St
         std::thread::sleep(QUERY_PAUSE);
     }
     let _ = LINK.set(link);
+    let _ = OWN_PROG.set(own);
     Ok(others)
+}
+
+/// Lot 280b: what the root cgroup's `cgroup/sysctl` slot holds now, asked
+/// again by the kernel-state round (`crate::kernel_state`): `Ok(None)` no
+/// judge of ours this boot (the fallback, signed at the attach), `Ok(Some)`
+/// the ids of the programs not ours (attached after ours, they run after
+/// it and may rewrite the value it judged), `Err` why the root is not as
+/// the attach left it (the mode no longer multi, our program no longer
+/// among them, the root unreadable).
+pub fn root_report() -> Result<Option<Vec<u32>>, String> {
+    let Some(own) = OWN_PROG.get() else {
+        return Ok(None);
+    };
+    let root = open_root_cgroup()?;
+    let q = query_root(root.as_raw_fd())
+        .map_err(|e| format!("BPF_PROG_QUERY of the root cgroup: {e}"))?;
+    judge_query(&q, *own).map(Some)
 }
 
 /// How often, and how far apart, the root is asked again while another

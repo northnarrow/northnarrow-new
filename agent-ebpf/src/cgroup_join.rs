@@ -34,11 +34,25 @@
 //! * [`cgroup_join_exit`] (tracepoint `sched_process_exit`, BTF): the mark
 //!   goes when the thread group's last thread exits (`signal->live` 0).
 //!
+//! Lot 280b: with `kernel.ftrace_enabled=0` (possible inside a window; 6.0
+//! to 7.2) the fentry and fexit programs stop while the BTF tracepoints go
+//! on. A move is judged by the tracepoint (`cgroup_join_mark`: a stale
+//! source slot only makes a move count as one); a birth into a cgroup is
+//! the fentry's. So the fentry records each new thread group it sees
+//! ([`CGROUP_JOIN_BORN`]) and the fork's tracepoint checks it: a new group
+//! the fentry did not see is "not known" at once (that tree, fail closed)
+//! and counted with its instant ([`CGROUP_JOIN_SILENT`]) — the check channel
+//! that tells "silent because ftrace is off" from "silent because nothing
+//! happened"; the agent resets the marks' epoch once ftrace runs again.
+//!
 //! The agent's family (the agent, the watchdog) moves processes into its
 //! own containment cgroups, which no exemption may name: not marked.
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_pid_tgid, bpf_get_current_task, bpf_probe_read_kernel, generated},
+    helpers::{
+        bpf_get_current_pid_tgid, bpf_get_current_task, bpf_ktime_get_ns, bpf_probe_read_kernel,
+        generated,
+    },
     macros::{btf_tracepoint, fentry, fexit, map},
     maps::{Array, HashMap, PerCpuArray},
     programs::{BtfTracePointContext, FEntryContext, FExitContext},
@@ -49,7 +63,8 @@ use northnarrow_common::cgroup_join::{
     fnv_step, lost_slot, noop, pack, path_read, placement, Move, PathRead, CLONE_INTO_CGROUP,
     EPOCH_SLOTS, EXEMPT_NAMES_ENTRIES, FNV_OFFSET, HOW_BORN_INTO, HOW_INHERITED, HOW_MOVED, JOINED_ENTRIES,
     LOST_BYTES, LOST_SLOTS, NAME_CGROUP, NAME_UNIT, PATH_READ, STAT_INHERITED, STAT_INTO_EXEMPT, STAT_LOST,
-    STAT_ROOTS, STAT_SLOTS,
+    STAT_ROOTS, STAT_SLOTS, BORN_ENTRIES, SILENT_ARMED, SILENT_LAST_NS, SILENT_SLOTS, SILENT_UNSEEN,
+    unseen_birth,
 };
 use northnarrow_common::wire::{InodeKey, FS_OP_CGROUP_JOIN};
 
@@ -105,6 +120,19 @@ pub static CGROUP_JOIN_EPOCH: Array<u64> = Array::with_max_entries(EPOCH_SLOTS, 
 /// agent at its start and at every policy change.
 #[map]
 pub static CGROUP_EXEMPT_NAMES: HashMap<u64, u8> = HashMap::with_max_entries(EXEMPT_NAMES_ENTRIES, 0);
+
+/// Lot 280b: the new thread groups [`cgroup_join_born`] saw (tgid → 1),
+/// until [`cgroup_join_fork`] checks and removes them in the same fork.
+/// Per load: the programs that write it are the ones that read it.
+#[map]
+static CGROUP_JOIN_BORN: HashMap<u32, u8> = HashMap::with_max_entries(BORN_ENTRIES, 0);
+
+/// Lot 280b: the tracepoint's check of the fentry
+/// (`common::cgroup_join::SILENT_*`): armed by the agent once its programs
+/// run, the births the fentry did not see counted with the last one's
+/// instant. Per load.
+#[map]
+pub static CGROUP_JOIN_SILENT: Array<u64> = Array::with_max_entries(SILENT_SLOTS, 0);
 
 /// The write in progress (`cgroup_mutex` serialises them): `[pid_tgid of a
 /// thread moving itself, its cgroup id before the move]`, `[0, 0]` for a
@@ -446,6 +474,10 @@ unsafe fn try_born(ctx: &FEntryContext) {
     if tgid == forker {
         return;
     }
+    // Lot 280b: seen by the fentry — the fork's tracepoint checks it. An
+    // entry the map cannot take makes the tracepoint count this birth as
+    // unseen: more "not known", never less.
+    let _ = CGROUP_JOIN_BORN.insert(&tgid, &1, 0);
     if CGROUP_JOINED.get(&tgid).is_some() {
         let _ = CGROUP_JOINED.remove(&tgid);
     }
@@ -494,6 +526,11 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) {
     let Some(ptgid) = tgid_of(parent) else {
         return;
     };
+    // Lot 280b: a new thread group the fentry did not see — ftrace off
+    // (or the fentry gone): not known, counted.
+    if check_birth(ptgid, child) {
+        return;
+    }
     // The mark is this process's, not a dead one's at the same tgid.
     let marked = match CGROUP_JOINED.get(&ptgid) {
         Some(rec) => leader_start(parent) == Some(rec[0]),
@@ -523,6 +560,44 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) {
     if mark(ctgid, start, HOW_INHERITED, ptgid) {
         count(STAT_INHERITED);
     }
+}
+
+/// Lot 280b: the fork's check of the fentry — for a new thread group
+/// (not a thread of the parent's), its entry in [`CGROUP_JOIN_BORN`] taken
+/// away; none, for a child that started after the check was armed
+/// (`common::cgroup_join::unseen_birth`), means `cgroup_post_fork` ran
+/// without this load's fentry: the child is not known (fail closed) and
+/// the miss counted with its instant. `true` when the child was made not
+/// known here (nothing more to decide for it).
+#[inline(always)]
+unsafe fn check_birth(ptgid: u32, child: u64) -> bool {
+    let Some(ctgid) = tgid_of(child) else {
+        return false;
+    };
+    if ctgid == ptgid {
+        return false;
+    }
+    let seen = CGROUP_JOIN_BORN.get(&ctgid).is_some();
+    if seen {
+        let _ = CGROUP_JOIN_BORN.remove(&ctgid);
+    }
+    let armed = match CGROUP_JOIN_SILENT.get(SILENT_ARMED) {
+        Some(a) => *a,
+        None => 0,
+    };
+    // A start unread counts as after the arming (fail closed).
+    let start = rd_u64(child + off!(TASK_STRUCT_START_TIME_OFFSET) as u64).unwrap_or(u64::MAX);
+    if !unseen_birth(armed, start, seen) {
+        return false;
+    }
+    lose(ctgid);
+    if let Some(n) = CGROUP_JOIN_SILENT.get_ptr_mut(SILENT_UNSEEN) {
+        *n += 1;
+    }
+    if let Some(t) = CGROUP_JOIN_SILENT.get_ptr_mut(SILENT_LAST_NS) {
+        *t = bpf_ktime_get_ns();
+    }
+    true
 }
 
 /// `sched_process_exit(struct task_struct *p, …)`: the mark goes with the

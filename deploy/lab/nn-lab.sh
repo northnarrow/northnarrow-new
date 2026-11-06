@@ -64,6 +64,7 @@
 #   deploy/lab/nn-lab.sh tracker-persist-check  # lot 277: the tracker's marks outlive an agent stop and install.sh --upgrade; its pins refuse root
 #   deploy/lab/nn-lab.sh fork-cost       # lot 277: the tracker's cost a fork + exit (BPF stats per call; wall clock attached / detached)
 #   deploy/lab/nn-lab.sh sysctl-check    # lot 280a: the guarded sysctls judged on the kernel's copy (cgroup/sysctl on the root cgroup): the race, octal/hex, the signed opt-out, a child cgroup's program, the cost a write
+#   deploy/lab/nn-lab.sh switches-check  # lot 280b: the switches that blind the sensors — ftrace off in a window (marks lost, epoch reset), kprobes/enabled and kprobes-optimization, the lockdown file, a new taint, a cgroup/sysctl program on the root (SWITCHES_CONFIDENTIALITY=1: lockdown raised, the agent restarted under it)
 #   deploy/lab/nn-lab.sh exempt-check    # lot 277: an exemption by unit holds for MS-23 started by systemd in the unit, not for a root shell moved into its cgroup (nor its orphan): killed, the move signed
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh net-check         # lab PR 224: connect-time network verdicts, reverse shells, outbound fan-out (CM-02/03/14)
@@ -1649,6 +1650,18 @@ cmd_sysctl_check() {
     vssh "cd ~/northnarrow && N=${N:-2000} bash deploy/lab/malsim/sysctl-check.sh"
 }
 
+cmd_switches_check() {
+    # Lot 280b (deploy/lab/malsim/switches-check.sh): the switches that
+    # blind the sensors — kernel.ftrace_enabled=0 inside a window (the
+    # tracker's marks lost, its epoch reset when ftrace runs again), the
+    # kprobes' debugfs switch and debug.kprobes-optimization, the lockdown
+    # file, a taint that appears while the agent runs, a cgroup/sysctl
+    # program on the root cgroup. Taints and lockdown last until the guest's
+    # next boot. Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh "cd ~/northnarrow && SWITCHES_CONFIDENTIALITY=${SWITCHES_CONFIDENTIALITY:-0} bash deploy/lab/malsim/switches-check.sh"
+}
+
 cmd_dns_sensor_check() {
     # Tappa 10.9 step 3 (deploy/lab/dns-sensor/dns-sensor-check.sh): the DNS
     # sensor reads the kernel's copy of the query. NET-004 kills a sender
@@ -2430,6 +2443,7 @@ case "${1:-help}" in
     tracker-persist-check) cmd_tracker_persist_check ;;
     fork-cost)     cmd_fork_cost ;;
     sysctl-check)  cmd_sysctl_check ;;
+    switches-check) cmd_switches_check ;;
     test-one)      shift; cmd_test_one "$@" ;;
     dns-sensor-check) cmd_dns_sensor_check ;;
     ransom-check)  shift; cmd_ransom_check "$@" ;;

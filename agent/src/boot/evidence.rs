@@ -403,6 +403,11 @@ pub(crate) fn wire(
     }
     // Tappa 10.8 telemetry probe: known events on each sensor, every minute.
     let telemetry_probe = northnarrow_agent::telemetry_probe::spawn(audit_log.clone());
+    // Lot 280b: the kernel's taint flags and livepatches and the root
+    // cgroup's cgroup/sysctl programs, every 5 s — a new taint of code
+    // entering the kernel, a foreign program on the root: signed detections
+    // through the bus, as the `fs_protect` source's events.
+    nn_linux::kernel_state::spawn(sensor.event_tx_for("fs_protect"));
     // Tappa 10.8 adversarial findings: drop-ins, set-property, oom_score_adj, mounts.
     northnarrow_agent::self_integrity::spawn(
         audit_log.clone(),

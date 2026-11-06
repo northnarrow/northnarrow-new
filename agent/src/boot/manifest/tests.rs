@@ -48,6 +48,7 @@ fn base() -> CapabilityManifest {
         content: Vec::new(),
         workers: Vec::new(),
         export: None,
+        kernel_code: None,
         telemetry_probe: String::new(),
         settled: false,
         contract_hash: String::new(),

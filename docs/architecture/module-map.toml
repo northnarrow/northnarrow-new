@@ -542,6 +542,9 @@ planned = false
 # Lot 280a: the guarded sysctls' verdict on the kernel's copy of a write
 # (the cgroup/sysctl program's and the write deny's), the signed opt-out
 "sysctl_judge" = "northnarrow-common"
+# Lot 280b: the kernel's taint flags, the ones of code entering it, and how
+# much a new one weighs (the rule's severity, the kernel-state round)
+"kernel_taint" = "northnarrow-common"
 # R03 (lab PR 240) moved wire::admin_protocol, wire::admin_signed_payload,
 # admin_quorum, shutdown_marker and watchdog_hold to nn-proto, atomic_file
 # and sd_notify to northnarrow-antitamper-bpf; R02 (lab PR 240) model,

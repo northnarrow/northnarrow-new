@@ -27,6 +27,13 @@
 //!   `OBJ_GET`) and a `LINK_DETACH` / `LINK_UPDATE` of one of them. The
 //!   enumeration (`*_GET_NEXT_ID`) gives no handle and is let through.
 //!
+//!   Lot 280b: and an attach of a `cgroup/sysctl` program to the ROOT
+//!   cgroup (`PROG_ATTACH` / `LINK_CREATE`, the target descriptor the
+//!   cgroup v2 root) outside a trusted-installer window — after the
+//!   agent's sysctl judge it would run after it and could rewrite the value
+//!   judged; a target that cannot be read is refused too (that attach type
+//!   only: fail closed).
+//!
 //! A read either hook needs that fails is a fail-open, counted in
 //! `DENY_FAIL_OPEN` (`crate::fail_open`, lab PR 215).
 //!
@@ -46,20 +53,21 @@ use aya_ebpf::{
     programs::{LsmContext, RawTracePointContext},
 };
 use northnarrow_common::bpf_cmd::{
-    observed, BPF_LINK_CREATE, BPF_LINK_DETACH, BPF_LINK_GET_FD_BY_ID, BPF_LINK_UPDATE,
-    BPF_MAP_GET_FD_BY_ID, BPF_OBJ_GET, BPF_PROG_ATTACH,
+    attach_target_offset, judges_attach_target, observed, BPF_LINK_CREATE, BPF_LINK_DETACH,
+    BPF_LINK_GET_FD_BY_ID, BPF_LINK_UPDATE, BPF_MAP_GET_FD_BY_ID, BPF_OBJ_GET, BPF_PROG_ATTACH,
 };
+use northnarrow_common::cgroup_limits::{special_fs, SpecialFs};
 use northnarrow_common::fail_open::hook as fail_open_hook;
 use northnarrow_common::ring_drops::ring_slot;
 use northnarrow_common::wire::{
     BpfSyscallRaw, FsProtectDenialRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, FS_OP_BPF_LINK,
-    FS_OP_BPF_MAP,
+    FS_OP_BPF_MAP, FS_OP_SYSCTL_ROOT_ATTACH,
 };
 
 use crate::btf_offsets::{
     BPF_LINK_ID_OFFSET, BPF_MAP_ID_OFFSET, FDTABLE_FD_OFFSET, FDTABLE_MAX_FDS_OFFSET,
     FILES_STRUCT_FDT_OFFSET, FILE_F_INODE_OFFSET, FILE_PRIVATE_DATA_OFFSET, INODE_I_INO_OFFSET,
-    INODE_I_SB_OFFSET, MM_STRUCT_EXE_FILE_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
+    INODE_I_SB_OFFSET, MM_STRUCT_EXE_FILE_OFFSET, SUPER_BLOCK_S_DEV_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET,
     TASK_STRUCT_FILES_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_START_TIME_OFFSET,
 };
 use northnarrow_common::wire::{InodeKey, PIN_NAME_HASH_PRIME, PIN_NAME_HASH_SEED};
@@ -302,6 +310,88 @@ unsafe fn link_id_of_fd(fd: u32) -> Result<Option<u32>, ()> {
         .map(Some)
         .map_err(|_| ())
 }
+
+/// [`nn_fd_is_root_cgroup`]: the descriptor names no cgroup v2 root (out
+/// of range, closed, another file).
+const ROOT_NO: u64 = 0;
+/// [`nn_fd_is_root_cgroup`]: the cgroup v2 hierarchy's root (its kernfs
+/// inode 1).
+const ROOT_YES: u64 = 1;
+/// [`nn_fd_is_root_cgroup`]: the file could not be read.
+const ROOT_UNREADABLE: u64 = 2;
+
+/// Lot 280b: [`fd_is_root_cgroup`] as a global BPF function (exported,
+/// never inlined, scalar argument), as [`nn_link_id_of_fd`]: checked once,
+/// on its own. [`ROOT_NO`], [`ROOT_YES`], [`ROOT_UNREADABLE`].
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_fd_is_root_cgroup(fd: u64) -> u64 {
+    match unsafe { fd_is_root_cgroup(fd as u32) } {
+        Ok(true) => ROOT_YES,
+        Ok(false) => ROOT_NO,
+        Err(()) => ROOT_UNREADABLE,
+    }
+}
+
+/// Lot 280b: whether `fd` in the caller's file table is the root cgroup's
+/// directory — a file of a cgroup v2 superblock whose inode is 1 (the
+/// kernel names the default hierarchy's root so; a cgroup namespace's top
+/// is another node). `Ok(false)`: out of range, closed, another file.
+#[inline(always)]
+unsafe fn fd_is_root_cgroup(fd: u32) -> Result<bool, ()> {
+    let o_files = off_opt!(TASK_STRUCT_FILES_OFFSET).ok_or(())?;
+    let o_fdt = off_opt!(FILES_STRUCT_FDT_OFFSET).ok_or(())?;
+    let o_max = off_opt!(FDTABLE_MAX_FDS_OFFSET).ok_or(())?;
+    let o_fd = off_opt!(FDTABLE_FD_OFFSET).ok_or(())?;
+    let task = bpf_get_current_task() as *const u8;
+    if task.is_null() {
+        return Err(());
+    }
+    let files = bpf_probe_read_kernel::<u64>(task.add(o_files) as *const u64).map_err(|_| ())?;
+    if files == 0 {
+        return Ok(false);
+    }
+    let fdt = bpf_probe_read_kernel::<u64>((files as *const u8).add(o_fdt) as *const u64)
+        .map_err(|_| ())?;
+    if fdt == 0 {
+        return Err(());
+    }
+    let max = bpf_probe_read_kernel::<u32>((fdt as *const u8).add(o_max) as *const u32)
+        .map_err(|_| ())?;
+    if fd >= max {
+        return Ok(false);
+    }
+    let arr = bpf_probe_read_kernel::<u64>((fdt as *const u8).add(o_fd) as *const u64)
+        .map_err(|_| ())?;
+    if arr == 0 {
+        return Err(());
+    }
+    let file = bpf_probe_read_kernel::<u64>((arr + 8 * fd as u64) as *const u64).map_err(|_| ())?;
+    if file == 0 {
+        return Ok(false);
+    }
+    let inode = bpf_probe_read_kernel::<u64>((file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const u64)
+        .map_err(|_| ())?;
+    if inode == 0 {
+        return Err(());
+    }
+    let sb = bpf_probe_read_kernel::<u64>((inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const u64)
+        .map_err(|_| ())?;
+    if sb == 0 {
+        return Err(());
+    }
+    let magic = bpf_probe_read_kernel::<u64>((sb as *const u8).add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)) as *const u64)
+        .map_err(|_| ())?;
+    if !matches!(special_fs(magic), Some(SpecialFs::Cgroup2)) {
+        return Ok(false);
+    }
+    let ino = bpf_probe_read_kernel::<u64>((inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64)
+        .map_err(|_| ())?;
+    Ok(ino == ROOT_CGROUP_INO)
+}
+
+/// The kernel's inode number of the cgroup v2 hierarchy's root.
+const ROOT_CGROUP_INO: u64 = 1;
 
 /// [`nn_obj_get_own_link`]: the path names one of the agent's link pins.
 const PIN_OWN: u64 = 1;
@@ -667,6 +757,30 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
             crate::fail_open::bump(fail_open_hook::BPF);
         } else if id <= u64::from(u32::MAX) && is_own_kind(id as u32, OWN_KIND_LINK) {
             emit_denial(FS_OP_BPF_LINK, id as u32);
+            return -EPERM;
+        }
+    }
+    // Lot 280b: a cgroup/sysctl program attached to the root cgroup outside
+    // a window (the family returned above; a fresh agent before it is a
+    // protected pid may attach its judge) — refused, signed. `arg` is the
+    // attach type for both commands; the target is read only for them.
+    if judges_attach_target(cmd, arg)
+        && enforce()
+        && !crate::inode_protect::override_active()
+        && !fresh_instance_may_load()
+    {
+        let target = match attach_target_offset(cmd) {
+            Some(off) if !attr.is_null() => {
+                bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32).ok()
+            }
+            _ => None,
+        };
+        let root = match target {
+            Some(fd) => nn_fd_is_root_cgroup(u64::from(fd)),
+            None => ROOT_UNREADABLE,
+        };
+        if root != ROOT_NO {
+            emit_denial(FS_OP_SYSCTL_ROOT_ATTACH, arg);
             return -EPERM;
         }
     }

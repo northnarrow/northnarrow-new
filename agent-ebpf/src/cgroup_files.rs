@@ -19,6 +19,13 @@
 //! * a protected process's `oom_score_adj` / `oom_adj`: `1000` makes it the
 //!   OOM killer's first choice, whose SIGKILL no `task_kill` hook sees.
 //!
+//! * (lot 280b) the switches that blind the sensors outside the sysctls:
+//!   `/sys/kernel/debug/kprobes/enabled` (debugfs: 0 disarms every kprobe)
+//!   and `/sys/kernel/security/lockdown` (securityfs: a raise to
+//!   `confidentiality` takes the kernel-memory helpers from the BPF
+//!   programs loaded after it) — every write refused, found by the
+//!   filesystem and the names ([`refuse_switch`]).
+//!
 //! Outside a signed trusted-installer window only, like every deny.
 
 use aya_ebpf::{
@@ -29,8 +36,8 @@ use aya_ebpf::{
 };
 use northnarrow_common::cgroup_limits::{
     default_value, init_write_lets_through, limit_kind, regs_are_the_writes, special_fs,
-    strip_newline, sysctl_kind, word_mask, LimitValue, SpecialFs, LIMIT_NAME_MAX, LIMIT_NONE,
-    LIMIT_TEXT_MAX, SYSCTL_NONE,
+    strip_newline, switch_file_op, sysctl_kind, word_mask, LimitValue, SpecialFs, LIMIT_NAME_MAX,
+    LIMIT_NONE, LIMIT_TEXT_MAX, SYSCTL_NONE,
 };
 use northnarrow_common::sysctl_judge::{record_dev, sysctl_write_verdict, SysctlVerdict};
 use northnarrow_common::wire::{
@@ -112,8 +119,43 @@ pub(crate) unsafe fn refuse_write(
         Some(SpecialFs::Proc) => {
             refuse_sysctl(file, inode, hook, phase) || refuse_oom_adj(file, inode, phase)
         }
+        Some(fs @ (SpecialFs::Debugfs | SpecialFs::Securityfs)) => refuse_switch(file, inode, fs, phase),
         None => false,
     }
+}
+
+/// Lot 280b: a write of `kprobes/enabled` on debugfs or of `lockdown` on
+/// securityfs (`northnarrow_common::cgroup_limits::switch_file_op`, by the
+/// file's name and its directory's), refused outside the agent's family
+/// and a window whatever it carries — at the write-open and at the write
+/// (a descriptor opened inside a window). The decision needs no read
+/// beyond the names: an inode that cannot be read is signed as `0:0`, and
+/// refused all the same (fail closed); a name that cannot be read is no
+/// switch's.
+#[inline(always)]
+unsafe fn refuse_switch(file: *const c_void, inode: *const c_void, fs: SpecialFs, phase: Phase) -> bool {
+    let Some(dentry) = file_dentry(file) else {
+        return false;
+    };
+    let Some(name) = dentry_name_words(dentry) else {
+        return false;
+    };
+    let parent = match bpf_probe_read_kernel::<*const c_void>(
+        (dentry as *const u8).add(off!(DENTRY_D_PARENT_OFFSET)) as *const *const c_void,
+    ) {
+        Ok(p) if !p.is_null() => dentry_name_words(p).unwrap_or((0, [0; 3])),
+        _ => (0, [0; 3]),
+    };
+    let op = switch_file_op(fs, name, parent);
+    if op == 0 {
+        return false;
+    }
+    if caller_may((bpf_get_current_pid_tgid() >> 32) as u32) {
+        return false;
+    }
+    let key = crate::inode_protect::read_inode_key(inode).unwrap_or(InodeKey { dev: 0, ino: 0 });
+    sign(phase, op, key);
+    true
 }
 
 /// The dentry of `file` (`file->f_path.dentry`).

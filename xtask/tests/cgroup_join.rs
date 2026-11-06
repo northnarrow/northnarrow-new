@@ -453,9 +453,10 @@ fn the_agent_asks_the_marks_where_it_decides() {
         .contains("nn_linux::cgroup_join::sync_names(&rule_policy.current());"));
     // a cgroup_join record raises no tamper trigger, and is signed as such
     let tr = code("crates/nn-core/src/posture/triggers.rs");
-    // (lot 280a: nor a write the signed per-sysctl opt-out let through)
+    // (lot 280a: nor a write the signed per-sysctl opt-out let through;
+    // lot 280b: nor the kernel-state round's findings)
     assert!(tr.contains(
-        "if !matches!(\n                operation,\n                nn_model::FsProtectOperation::CgroupJoin\n                    | nn_model::FsProtectOperation::SysctlOptOut\n            ) {"
+        "if !matches!(\n                operation,\n                nn_model::FsProtectOperation::CgroupJoin\n                    | nn_model::FsProtectOperation::SysctlOptOut\n                    | nn_model::FsProtectOperation::KernelTaint\n                    | nn_model::FsProtectOperation::SysctlRootProg\n            ) {"
     ));
     let pe = code("agent/src/pipeline/process_event.rs");
     assert!(pe.contains("let joined = *operation == nn_model::FsProtectOperation::CgroupJoin;"));

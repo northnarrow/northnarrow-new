@@ -1108,6 +1108,24 @@ pub enum FsProtectOperation {
     /// per-sysctl opt-out alone let through; the target as
     /// [`Self::SysctlValue`]'s.
     SysctlOptOut,
+    /// Lot 280b: a write of `/sys/kernel/debug/kprobes/enabled` (0 disarms
+    /// every kprobe), refused whatever it carries; the target its inode.
+    Kprobes,
+    /// Lot 280b: a write of `/sys/kernel/security/lockdown` (a raise to
+    /// `confidentiality` takes the kernel-memory helpers from the BPF
+    /// programs loaded after it), refused whatever it carries; the target
+    /// its inode.
+    Lockdown,
+    /// Lot 280b: NOT a refusal — a taint flag of foreign code entering the
+    /// kernel appeared while the agent runs (`common::kernel_taint`):
+    /// `target_dev` the new flags, `target_ino` the whole mask.
+    KernelTaint,
+    /// Lot 280b: an attach of a `cgroup/sysctl` program to the root cgroup
+    /// outside the family and a window, refused by the `bpf` hook.
+    SysctlRootAttach,
+    /// Lot 280b: NOT a refusal — a `cgroup/sysctl` program not the
+    /// agent's found on the root cgroup; `target_ino` its id.
+    SysctlRootProg,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1148,6 +1166,11 @@ impl FsProtectOperation {
             crate::wire::FS_OP_SYSCTL => Self::Sysctl,
             crate::wire::FS_OP_SYSCTL_VALUE => Self::SysctlValue,
             crate::wire::FS_OP_SYSCTL_OPT_OUT => Self::SysctlOptOut,
+            crate::wire::FS_OP_KPROBES => Self::Kprobes,
+            crate::wire::FS_OP_LOCKDOWN => Self::Lockdown,
+            crate::wire::FS_OP_KERNEL_TAINT => Self::KernelTaint,
+            crate::wire::FS_OP_SYSCTL_ROOT_ATTACH => Self::SysctlRootAttach,
+            crate::wire::FS_OP_SYSCTL_ROOT_PROG => Self::SysctlRootProg,
             other => Self::Unknown(other),
         }
     }
@@ -1186,6 +1209,11 @@ impl FsProtectOperation {
             Self::Sysctl => "sysctl",
             Self::SysctlValue => "sysctl_value",
             Self::SysctlOptOut => "sysctl_opt_out",
+            Self::Kprobes => "kprobes",
+            Self::Lockdown => "lockdown",
+            Self::KernelTaint => "kernel_taint",
+            Self::SysctlRootAttach => "sysctl_root_attach",
+            Self::SysctlRootProg => "sysctl_root_prog",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -1764,6 +1792,32 @@ mod tests {
                 FsProtectOperation::SysctlOptOut,
                 "sysctl_opt_out",
             ),
+            // Lot 280b
+            (
+                crate::wire::FS_OP_KPROBES,
+                FsProtectOperation::Kprobes,
+                "kprobes",
+            ),
+            (
+                crate::wire::FS_OP_LOCKDOWN,
+                FsProtectOperation::Lockdown,
+                "lockdown",
+            ),
+            (
+                crate::wire::FS_OP_KERNEL_TAINT,
+                FsProtectOperation::KernelTaint,
+                "kernel_taint",
+            ),
+            (
+                crate::wire::FS_OP_SYSCTL_ROOT_ATTACH,
+                FsProtectOperation::SysctlRootAttach,
+                "sysctl_root_attach",
+            ),
+            (
+                crate::wire::FS_OP_SYSCTL_ROOT_PROG,
+                FsProtectOperation::SysctlRootProg,
+                "sysctl_root_prog",
+            ),
         ];
         for (byte, op, name) in cases {
             assert_eq!(FsProtectOperation::from_wire(byte), op);
@@ -1771,8 +1825,8 @@ mod tests {
             assert_eq!(op.to_string(), name);
         }
         assert_eq!(
-            FsProtectOperation::from_wire(33),
-            FsProtectOperation::Unknown(33)
+            FsProtectOperation::from_wire(crate::wire::FS_OP_LAST + 1),
+            FsProtectOperation::Unknown(crate::wire::FS_OP_LAST + 1)
         );
     }
     use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};
