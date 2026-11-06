@@ -6,6 +6,36 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Every sensor proves it is alive, every round (lot 280c;
+  `docs/operator/SENSOR_CONTRACT.md` §5a). The telemetry probe became the
+  sensor self-test: each round's child of the agent's binary makes one
+  harmless event for each source of the sensor contract — its exec (both
+  exec sensors), the probe file's read, the DNS datagram, a listen,
+  connect, accept and TLS ClientHello on a loopback port, an io_uring and a
+  BPF array map made and closed, a file created in the probe directory
+  (watched by the FIM), a signal to the agent and a file created in
+  `/etc/northnarrow` that the deny hooks must refuse — and checks each
+  reaches its pipeline within 5 s; `module_load` (its programs linked, a
+  load reported for every module new in `/proc/modules`), `exploit_guard`
+  and `dns_answer` get an attach check, stated as such (`evidence:
+  attach_check`). A source missed is a signed degradation at once
+  (`subsystem_degraded`, source `sensor_selftest`, the sensor and the step;
+  the manifest's word `missed`, the source `unknown`), two rounds in a row
+  an alert (`sensor_selftest_alert`; `gap`, `attached_not_invoked`), its
+  return `sensor_selftest_restored` with the degradation withdrawn; a step
+  that cannot run is `not_exercised`. These rows replace `telemetry_gap`
+  and `telemetry_restored`, and a gap after one round is now `missed`
+  (`unknown`) before it is `gap`: the manifest's pinned row changed with
+  these words. The self-test's events are taken at the decision thread's
+  first step (the child's pid within its lifetime, its steps' shape and
+  count) and never reach the rules, the posture, the detection store or a
+  response; the netflow, listener and FIM drift logs skip the child's rows,
+  so the export never carries them (the probe's DNS datagram left a netflow
+  row a minute). Each round's cost is measured (the child's CPU, the
+  agent's checks) against a 50 ms budget, a summary in the journal every
+  ten rounds. `debug-trigger` builds: `/run/northnarrow/debug-ring-drop`
+  names a ring pump whose events are dropped (the lab's blinding).
+  `nn-lab.sh selftest-check` (`deploy/lab/contract/selftest-check.sh`).
 - The switches that blind the sensors (lot 280b;
   `docs/design/ANTITAMPER_TRUST_MODEL.md` § Lot 280b). `kernel.ftrace_enabled=0`
   inside a window: the start-in-cgroup tracker's fork tracepoint (which

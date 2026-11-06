@@ -320,8 +320,14 @@ pub struct SourceContract {
     pub truncations: &'static [Truncation],
     /// Its rings' `RING_DROPS` slots (stage 1).
     pub rings: &'static [&'static str],
-    /// The telemetry probe's sensor that exercises it, if any.
+    /// The sensor self-test's word on it (the telemetry probe's sensor that
+    /// exercises it), if any — lot 280c: every source has one.
     pub probe: Option<&'static str>,
+    /// Lot 280c: that word is a check of its attach (each of its programs
+    /// still linked), not a live event: no cheap, harmless operation makes
+    /// it report (a module load, an exploit's post-condition, a DNS
+    /// response from port 53, which the unit cannot bind).
+    pub attach_check: bool,
     /// The deny self-test exercises it (one of its hooks, at the boot).
     pub self_tested: bool,
     /// The degradation registry's sources that are about it (their entries
@@ -515,6 +521,12 @@ pub fn check(sources: &[SourceContract]) -> Vec<String> {
                     s.source, f.attach
                 ));
             }
+        }
+        if s.attach_check && s.probe.is_none() {
+            problems.push(format!(
+                "source {}: an attach check without the self-test's word",
+                s.source
+            ));
         }
         if s.lsm_part.is_some() && !s.needs_bpf_lsm {
             problems.push(format!(

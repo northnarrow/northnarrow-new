@@ -170,27 +170,43 @@ fn worsen(state: &mut SourceState, to: SourceState) {
     }
 }
 
-/// The telemetry probe's word on a source.
+/// The sensor self-test's word on a source (the telemetry probe's; lot
+/// 280c: every round, each source's own live event — or, for the three
+/// sources no cheap event can exercise, a check of its attach).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeState {
     /// No round has ended yet.
     Pending,
-    /// The last round's event reached the pipeline.
+    /// The last round's event reached the pipeline (its check held).
     Seen,
-    /// The last round's event did not (a `telemetry_gap`).
+    /// Lot 280c: the last round's event did not, after rounds that saw it —
+    /// one round missed (a signed `sensor_selftest` degradation): not
+    /// known whether the source sees.
+    Missed,
+    /// Two rounds or more in a row missed it (lot 280c: the
+    /// `sensor_selftest_alert`).
     Gap,
     /// No round has ended for two of its intervals (the review of #479,
     /// X2): what it said last is not believed any more.
     Stale,
+    /// Lot 280c: its step could not run on this host (io_uring switched
+    /// off, a trusted-installer window open, no program of it loaded): the
+    /// round says nothing of it.
+    NotExercised,
 }
 
 /// What a source's `ok` rests on (the review of #479).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Evidence {
-    /// The telemetry probe's event reached the pipeline through it.
+    /// The sensor self-test's event reached the pipeline through it, in its
+    /// last round.
     Probe,
+    /// Lot 280c: its attach checked in the last round — each of its
+    /// programs still linked (and, `module_load`, no module in the
+    /// kernel's list it did not report); no live event exercises it.
+    AttachCheck,
     /// The deny self-test's refusal (one hook, at the boot).
     SelfTest,
     /// Its attach and its pump only.
@@ -387,15 +403,35 @@ pub fn source_entries(contract: &[SourceContract], facts: &SourceFacts) -> Vec<S
     out
 }
 
-/// The probe's word on `e`: a gap is not invoked, a stale word unknown.
+/// The self-test's word on `e` (lot 280c): one round missed is not
+/// known (unknown), two in a row not invoked, a stale word unknown; a
+/// step that could not run says why and changes nothing.
 fn probe_word(e: &mut SourceEntry, c: &SourceContract, probe: Option<ProbeState>) {
     let sensor = c.probe.unwrap_or("?");
+    let what = if c.attach_check {
+        "attach check failed"
+    } else {
+        "event did not reach the pipeline within the round's deadline"
+    };
     match probe {
+        Some(ProbeState::Missed) => {
+            worsen(&mut e.state, SourceState::Unknown);
+            e.why.push(format!(
+                "sensor self-test: its {sensor} {what} in the last round (signed \
+                 sensor_selftest degradation)"
+            ));
+        }
         Some(ProbeState::Gap) => {
             worsen(&mut e.state, SourceState::AttachedNotInvoked);
             e.why.push(format!(
-                "telemetry probe: its {sensor} event did not reach the pipeline within the \
-                 round's deadline (signed telemetry_gap)"
+                "sensor self-test: its {sensor} {what} in two rounds or more in a row \
+                 (signed sensor_selftest_alert)"
+            ));
+        }
+        Some(ProbeState::NotExercised) => {
+            e.why.push(format!(
+                "sensor self-test: its {sensor} step could not run on this host (the journal \
+                 says why): its last round says nothing of it"
             ));
         }
         Some(ProbeState::Stale) => {
@@ -410,7 +446,9 @@ fn probe_word(e: &mut SourceEntry, c: &SourceContract, probe: Option<ProbeState>
 }
 
 fn evidence(c: &SourceContract, probe: Option<ProbeState>, facts: &SourceFacts) -> Evidence {
-    if probe == Some(ProbeState::Seen) {
+    if probe == Some(ProbeState::Seen) && c.attach_check {
+        Evidence::AttachCheck
+    } else if probe == Some(ProbeState::Seen) {
         Evidence::Probe
     } else if c.self_tested && facts.lsm_runs == Some(true) {
         Evidence::SelfTest
@@ -949,7 +987,7 @@ impl CapabilityManifest {
                     }
                     if b.probe != s.probe {
                         out.push(format!(
-                            "source {}: telemetry probe {} → {}",
+                            "source {}: sensor self-test {} → {}",
                             s.source,
                             probe_name(b.probe),
                             probe_name(s.probe)
@@ -1079,8 +1117,10 @@ impl CapabilityManifest {
             match before.sources.iter().find(|b| b.source == s.source) {
                 Some(b) => {
                     s.state.rank() > b.state.rank()
-                        || (matches!(s.probe, Some(ProbeState::Gap | ProbeState::Stale))
-                            && s.probe != b.probe)
+                        || (matches!(
+                            s.probe,
+                            Some(ProbeState::Missed | ProbeState::Gap | ProbeState::Stale)
+                        ) && s.probe != b.probe)
                 }
                 None => s.state.rank() > 0,
             }
@@ -1169,8 +1209,10 @@ fn probe_name(p: Option<ProbeState>) -> &'static str {
         None => "not probed",
         Some(ProbeState::Pending) => "pending",
         Some(ProbeState::Seen) => "seen",
+        Some(ProbeState::Missed) => "missed",
         Some(ProbeState::Gap) => "gap",
         Some(ProbeState::Stale) => "stale",
+        Some(ProbeState::NotExercised) => "not exercised",
     }
 }
 

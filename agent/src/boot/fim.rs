@@ -351,6 +351,8 @@ pub(crate) fn start(
         std::sync::Arc<northnarrow_agent::anti_tamper::filesystem::StateDirProtection>,
     >,
     signing_key: &northnarrow_agent::keys::KeyStore,
+    // Lot 280c: the sensor self-test's child, whose FIM record is no drift
+    self_test: Option<northnarrow_agent::telemetry_probe::SelfTestTag>,
 ) -> Option<Arc<admin_socket::FimAdminState>> {
     let fim_admin_state: Option<Arc<admin_socket::FimAdminState>> = {
         // The signing key + agent_id for FIM: a copy of the start's one
@@ -748,6 +750,7 @@ pub(crate) fn start(
                                         watched_paths_for_drain,
                                         lineage_for_drain,
                                         event_tx,
+                                        self_test,
                                     )
                                     .await;
                                     drain_ended("fim", outcome, audit_for_drain.as_ref());

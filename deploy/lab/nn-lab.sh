@@ -65,6 +65,7 @@
 #   deploy/lab/nn-lab.sh fork-cost       # lot 277: the tracker's cost a fork + exit (BPF stats per call; wall clock attached / detached)
 #   deploy/lab/nn-lab.sh sysctl-check    # lot 280a: the guarded sysctls judged on the kernel's copy (cgroup/sysctl on the root cgroup): the race, octal/hex, the signed opt-out, a child cgroup's program, the cost a write
 #   deploy/lab/nn-lab.sh switches-check  # lot 280b: the switches that blind the sensors — ftrace off in a window (marks lost, epoch reset), kprobes/enabled and kprobes-optimization, the lockdown file, a new taint, a cgroup/sysctl program on the root (SWITCHES_CONFIDENTIALITY=1: lockdown raised, the agent restarted under it)
+#   deploy/lab/nn-lab.sh selftest-check  # lot 280c: the sensor self-test — every source's word, 10 rounds all seen, no rule/posture/signed row of the probe child, one ring's events dropped (BLIND=bpf_syscall; a pump reading its ring through run_ring): the signed degradation, the alert, the return; the round's cost (ROUNDS=10)
 #   deploy/lab/nn-lab.sh exempt-check    # lot 277: an exemption by unit holds for MS-23 started by systemd in the unit, not for a root shell moved into its cgroup (nor its orphan): killed, the move signed
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh net-check         # lab PR 224: connect-time network verdicts, reverse shells, outbound fan-out (CM-02/03/14)
@@ -1662,6 +1663,17 @@ cmd_switches_check() {
     vssh "cd ~/northnarrow && SWITCHES_CONFIDENTIALITY=${SWITCHES_CONFIDENTIALITY:-0} bash deploy/lab/malsim/switches-check.sh"
 }
 
+cmd_selftest_check() {
+    # Lot 280c (deploy/lab/contract/selftest-check.sh): the sensor
+    # self-test — every source's word in the manifest, ROUNDS rounds with
+    # every sensor seen, the probe child's events taken before every judge
+    # and every signed log, one ring's events dropped (debug-trigger build:
+    # /run/northnarrow/debug-ring-drop) for the signed degradation, the
+    # alert and the return; the round's cost. Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh "cd ~/northnarrow && ROUNDS=${ROUNDS:-10} BLIND=${BLIND:-bpf_syscall} bash deploy/lab/contract/selftest-check.sh"
+}
+
 cmd_dns_sensor_check() {
     # Tappa 10.9 step 3 (deploy/lab/dns-sensor/dns-sensor-check.sh): the DNS
     # sensor reads the kernel's copy of the query. NET-004 kills a sender
@@ -2444,6 +2456,7 @@ case "${1:-help}" in
     fork-cost)     cmd_fork_cost ;;
     sysctl-check)  cmd_sysctl_check ;;
     switches-check) cmd_switches_check ;;
+    selftest-check) cmd_selftest_check ;;
     test-one)      shift; cmd_test_one "$@" ;;
     dns-sensor-check) cmd_dns_sensor_check ;;
     ransom-check)  shift; cmd_ransom_check "$@" ;;

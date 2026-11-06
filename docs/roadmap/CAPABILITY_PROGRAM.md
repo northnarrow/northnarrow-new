@@ -7317,3 +7317,112 @@ number in parentheses is a lab PR.
     (signed, not detached).
   - Levels unchanged (C23 2 provisional, C18 1): switches closed and
     recorded, not a new capability.
+- **Lot 280c — every sensor proves it is alive, every round (Wave 1 of
+  lot 280, item 6; C23).**
+  - What was open: the telemetry probe exercised three sources of the
+    contract's sixteen (an exec, a file open, a DNS datagram a minute);
+    the other thirteen rested on their attach after the start
+    (`evidence: attach_only`; `fs_protect` on one deny hook, at the boot);
+    the probe's events reached the rules, and its datagram left a netflow
+    row a minute, which the export carries.
+  - What changed: the probe became the sensor self-test — each round's
+    child (`--telemetry-probe <nonce>`, released by a go byte once its pid
+    is recorded) makes one event per source: its exec (both exec sensors),
+    the probe file's read, the DNS datagram, a listen, connect, accept and
+    ClientHello on a loopback port, an io_uring and a BPF array map made
+    and closed, a file created in the FIM-watched probe directory, a
+    `SIGURG` to the agent and a file created in `/etc/northnarrow` that
+    the deny hooks must refuse; `module_load` (its programs linked, a load
+    reported for each module new in `/proc/modules`), `exploit_guard` and
+    `dns_answer` an attach check (`evidence: attach_check`). A miss is a
+    signed degradation (`sensor_selftest`, the sensor and the step; word
+    `missed`, the source `unknown`), two in a row an alert
+    (`sensor_selftest_alert`; `gap`, `attached_not_invoked`), the return
+    signed and the degradation withdrawn; a step that cannot run is
+    `not_exercised`. The child's events are taken at the decision thread's
+    first step (its pid within its lifetime, its steps' shape and count)
+    and its rows skipped by the signed netflow, listener and FIM drift
+    logs. Each round's cost (the child's CPU, the agent's checks) against
+    a 50 ms budget. `debug-trigger`: `/run/northnarrow/debug-ring-drop`.
+  - The lab, as measured (our own guests under lease k280c, one at a
+    time; `nn-lab.sh selftest-check`):
+    - **Ubuntu 24.04** (`6.8.0-147-generic`). Round 1 (the draft on the
+      tree #510 merged): at the first round every source had its word —
+      the thirteen live ones `seen` (evidence `probe`: both exec sensors,
+      the file open, DNS, connect, listen, accept, ClientHello, io_uring,
+      the BPF map, the FIM create, the two deny refusals), the three
+      attach checks `seen` (`module_load`, `exploit_guard`, `dns_answer`);
+      ten rounds, ten with every sensor seen, no `sensor_selftest` row;
+      the posture observing, no detection, netflow, listener or drift row
+      of the child since the start (40 rows skipped by the drains); the
+      round's cost: the child's CPU 3,866 us at most, the agent's checks
+      6,535 us, the slowest event 5 ms after the round began. The script
+      blinded `tcp_connect`, whose pump reads its ring in a loop of its
+      own, not through `run_ring`: nothing dropped, no miss — the trigger
+      covers the `run_ring` pumps only (documented; the script's default
+      became `bpf_syscall`), and its T0 counted the standby `file_open`
+      (no word, by design) — both fixed. Round 2 (the lot's commit): the
+      same words and ten rounds all seen, 40 rows skipped, the cost 3,913
+      us and 6,422 us, 4 ms; `bpf_syscall`'s ring dropped: the signed
+      degradation 65 s later ("bpf (bpf_syscall): self-test step `a
+      one-entry BPF array map made and closed` missed — its event did not
+      reach the pipeline within 5 s"; the manifest `unknown`, `missed`),
+      the alert at the next round (135 s; `rounds_missed` 2, the manifest
+      `attached_not_invoked`, `gap`), the file removed: the return signed,
+      the manifest `ok`, `seen`, the degradation withdrawn (the script
+      counted the status's "changed since: degradation - sensor_selftest"
+      line, the withdrawal itself, as an open one — fixed to read the
+      manifest's degradations). Uninstalled, the guest clean and off.
+    - **Ubuntu 22.04** (`5.15.0-202-generic`, the lot's commit with the
+      scripts' fixes): `verifier-check` 98 programs, 93 OK, 5 not counted,
+      0 failing (no eBPF change in this lot); every source's word at the
+      first round as on 6.8 (thirteen live `seen`, three attach checks
+      `seen`); ten rounds all seen, no `sensor_selftest` row; the posture
+      observing, no detection, netflow, listener or drift row of the child
+      (40 rows skipped); `bpf_syscall`'s ring dropped: the degradation
+      signed 50 s later (`unknown`, `missed`), the alert at the next round
+      (110 s, `attached_not_invoked`, `gap`), the return signed, the
+      manifest `ok`, `seen`, its degradations none (the status: "none", and
+      the pending revision's "changed since: degradation -
+      sensor_selftest…", the withdrawal); the cost: the child's CPU 2,593
+      us at most, the agent's checks 3,136 us, the slowest event 4 ms.
+      Uninstalled, the guest clean and off.
+  - Host: named tests `each_sensor_s_self_test_sees_its_event`,
+    `a_sensor_whose_events_are_dropped_gives_the_signed_degradation_then_the_alert`,
+    `self_test_events_never_trigger_rules_or_the_posture` (the brief's
+    three), `only_the_child_s_own_events_of_its_steps_are_taken`,
+    `the_drains_skip_the_child_s_rows`,
+    `the_self_test_child_s_rows_are_not_written`,
+    `the_self_test_s_record_is_its_event_and_no_drift`,
+    `a_step_that_cannot_run_is_not_exercised_and_a_deny_let_through_is_missed`,
+    `a_sensor_whose_source_does_not_run_is_not_exercised`,
+    `the_attach_checks_and_the_module_count`,
+    `the_tcp_steps_run_on_loopback_and_the_hello_has_the_sensor_s_shape`,
+    `every_source_of_the_contract_has_a_self_test_word`,
+    `a_missed_round_is_unknown_two_are_not_invoked_and_an_attach_check_says_so`,
+    `the_ring_drop_trigger_names_a_pump_exactly`, and the event loop's
+    pinned source (a taken event returns before `process_event`). 43
+    mutations of the new code (nn-core 7, the matcher, the round and what
+    it signs 30, the drains 4, the pump's trigger 1, the decision thread's
+    take 1): 38 caught by a named test at the first run, four more once
+    their test was added (a miss on a source already not known, a create
+    refused in another directory, a window with no child yet, one round
+    missed then seen), one argued equivalent (the netflow row's skip read
+    at its start instead of its end: the pid is the child's for the whole
+    window, any timestamp of its row inside it names it).
+  - Gates (5bcce1fc, the code of this lot): all green — the eBPF build,
+    the four clippy runs, fmt, 91 suites 4,144 tests passed 0 failed, the
+    privileged no-run, the wire and nn-admin with `debug-trigger`, the
+    eBPF maps, attack coverage, the golden replays five times (57 files,
+    the same bytes), MSRV 1.89, the fuzz replay (14 targets), the portable
+    core on five targets, the lockfiles unchanged; the lab scripts' fixes
+    after it are shell only.
+  - Open: an adaptive root that recognises the child can serve it; an
+    attach check proves a program linked, not run; the deny step exercises
+    two of the twenty-one deny hooks a round; the alert is an audit row and
+    the manifest's word (`DEGRADED` off the host through the beat's hash),
+    not a detection record.
+  - Levels unchanged (C23 2 provisional): every source now has a live
+    self-test or a stated attach check each round, but C23's step to 3
+    asks a periodic self-test of every deny hook, and the round exercises
+    two.

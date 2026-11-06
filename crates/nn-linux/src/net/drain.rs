@@ -201,6 +201,8 @@ pub struct NetListenerEntry {
 pub struct NetFlowDb {
     inner: crate::chainlog::RotatingChainLog<NetFlowPayload>,
     agent_id: [u8; 16],
+    /// Lot 280c: the sensor self-test's child, whose rows are not written.
+    self_test: Option<crate::telemetry_probe::SelfTestTag>,
     /// External audit NET-019: when the last group commit ran.
     last_sync: Instant,
 }
@@ -218,6 +220,7 @@ impl NetFlowDb {
         Ok(Self {
             inner,
             agent_id,
+            self_test: None,
             last_sync: Instant::now(),
         })
     }
@@ -230,6 +233,19 @@ impl NetFlowDb {
     /// back from the rules (`decision_engine_skipped`).
     pub fn append(&mut self, ev: &NetFlowEvent, skipped: bool) -> Result<String> {
         self.append_row(ev, skipped, false)
+    }
+
+    /// Lot 280c: the sensor self-test's child's rows are not written as
+    /// real flows (the export never carries them); counted by the tag.
+    pub fn set_self_test(&mut self, tag: crate::telemetry_probe::SelfTestTag) {
+        self.self_test = Some(tag);
+    }
+
+    /// Lot 280c: `ev` is a row of the self-test's child, not to be written.
+    pub fn self_test_row(&self, ev: &NetFlowEvent) -> bool {
+        self.self_test
+            .as_ref()
+            .is_some_and(|t| t.skip(ev.pid, ev.start_ns.max(ev.end_ns)))
     }
 
     /// Lot 275: [`Self::append`] for an inbound connection's closed row
@@ -294,6 +310,8 @@ impl NetFlowDb {
 /// Append-only chained writer for `netflow_listeners.jsonl`. Same
 /// shape as [`NetFlowDb`].
 pub struct NetListenerDb {
+    /// Lot 280c: the sensor self-test's child, whose rows are not written.
+    self_test: Option<crate::telemetry_probe::SelfTestTag>,
     path: PathBuf,
     key: AgentSigningKey,
     agent_id: [u8; 16],
@@ -315,6 +333,7 @@ impl NetListenerDb {
             })?;
         let last_hash = read_tail_hash_listener(path)?;
         Ok(Self {
+            self_test: None,
             // review 44: appends go through a directory fd taken now
             path: crate::anchored::anchor(path),
             key,
@@ -329,6 +348,18 @@ impl NetListenerDb {
     /// The torn tail repaired at open, for the caller to attest once.
     pub fn take_tail_repair(&mut self) -> Option<crate::chainlog::TailRepair> {
         self.tail_repair.take()
+    }
+
+    /// Lot 280c: the sensor self-test's child's listeners are not written.
+    pub fn set_self_test(&mut self, tag: crate::telemetry_probe::SelfTestTag) {
+        self.self_test = Some(tag);
+    }
+
+    /// Lot 280c: `ev` is the self-test's child's listener, not to be written.
+    pub fn self_test_row(&self, ev: &NetListenerEvent) -> bool {
+        self.self_test
+            .as_ref()
+            .is_some_and(|t| t.skip(ev.pid, ev.timestamp_ns))
     }
 
     pub fn append(&mut self, ev: &NetListenerEvent) -> Result<NetListenerEntry> {
@@ -932,8 +963,12 @@ async fn process_close_record(
     // Lab PR 218: without the log (it could not be opened at boot, a
     // signed `subsystem_degraded` says so) the row goes to the rules only.
     if let Some(db) = netflow_db {
-        if let Err(e) = db.lock().append(&event, skipped) {
-            warn!(error = %e, "appending NetFlowEntry to netflow log failed");
+        let mut db = db.lock();
+        // lot 280c: the sensor self-test's rows reach its tap only
+        if !db.self_test_row(&event) {
+            if let Err(e) = db.append(&event, skipped) {
+                warn!(error = %e, "appending NetFlowEntry to netflow log failed");
+            }
         }
     }
     if skipped {
@@ -987,8 +1022,12 @@ async fn process_listen_record(
         raw.timestamp_ns,
     );
     if let Some(db) = listener_db {
-        if let Err(e) = db.lock().append(&ev) {
-            warn!(error = %e, "appending NetListenerEntry to listeners log failed");
+        let mut db = db.lock();
+        // lot 280c: the sensor self-test's listener reaches its tap only
+        if !db.self_test_row(&ev) {
+            if let Err(e) = db.append(&ev) {
+                warn!(error = %e, "appending NetListenerEntry to listeners log failed");
+            }
         }
     }
     if event_tx.send(Event::NetListener(ev)).await.is_err() {
@@ -1879,6 +1918,91 @@ mod tests {
             .unwrap()
             .verifying_key();
         crate::chainlog::verify_log_set::<NetFlowPayload>(&path, &pk).unwrap();
+    }
+
+    /// Lot 280c: the sensor self-test child's rows are not written to the
+    /// signed netflow and listener logs (the export never carries them),
+    /// and still reach the bus, where the self-test's tap takes them; any
+    /// other process's are written as before.
+    #[tokio::test]
+    async fn the_self_test_child_s_rows_are_not_written() {
+        use crate::decision::correlation::CorrelationStore;
+        use crate::net::limiter::UidPacer;
+        use crate::telemetry_probe::{SelfTestTag, Window};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("netflow.jsonl");
+        let lpath = dir.path().join("netflow_listeners.jsonl");
+        let tag = SelfTestTag::for_tests(Window {
+            pid: 4242,
+            from_ns: 5_000_000_000,
+            until_ns: 5_000_000_100,
+        });
+        let mut netflow = open_db(&path);
+        netflow.set_self_test(tag.clone());
+        let db = Arc::new(Mutex::new(netflow));
+        let mut listeners = NetListenerDb::open(&lpath, fresh_key(), [0u8; 16]).unwrap();
+        listeners.set_self_test(tag.clone());
+        let ldb = Arc::new(Mutex::new(listeners));
+        let tracker = Arc::new(Mutex::new(FlowTracker::default()));
+        let dns = Arc::new(DnsCache::default());
+        let proc_root = tempfile::tempdir().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::new(proc_root.path());
+        let mut gate = RuleGate::with_pacer(
+            Arc::new(crate::net::blocklist::NetBlocklist::from_entries([])),
+            Arc::new(Mutex::new(CorrelationStore::new())),
+            UidPacer::with_rate(100, 100),
+        );
+        let (tx, mut rx) = crate::sensors::bus::channel();
+        for (pid, corr) in [(4242, 1u8), (4243, 2)] {
+            let raw = close_raw(0, pid, [127, 0, 0, 1], 40001, corr);
+            process_close_record(
+                &raw,
+                &tracker,
+                &dns,
+                &Default::default(),
+                true,
+                Some(&db),
+                &lineage,
+                &mut gate,
+                &tx,
+            )
+            .await;
+            let mut listen = NetListenRaw::zeroed();
+            listen.timestamp_ns = 5_000_000_000 + u64::from(corr);
+            listen.pid = pid;
+            listen.family = 2;
+            listen.bind_addr[..4].copy_from_slice(&[127, 0, 0, 1]);
+            listen.bind_port = 40001;
+            listen.proto = IPPROTO_TCP;
+            process_listen_record(bytemuck::bytes_of(&listen), Some(&ldb), &tx).await;
+        }
+        drop(tx);
+        let mut sent = Vec::new();
+        while let Some(r) = rx.recv().await {
+            match r.envelope.event {
+                Event::NetFlow(f) => sent.push(("flow", f.pid)),
+                Event::NetListener(l) => sent.push(("listener", l.pid)),
+                _ => {}
+            }
+        }
+        sent.sort();
+        assert_eq!(
+            sent,
+            [
+                ("flow", 4242),
+                ("flow", 4243),
+                ("listener", 4242),
+                ("listener", 4243)
+            ],
+            "every row reaches the bus"
+        );
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.matches("\"pid\":4243").count(), 1, "{body}");
+        assert_eq!(body.matches("\"pid\":4242").count(), 0, "{body}");
+        let lbody = std::fs::read_to_string(&lpath).unwrap();
+        assert_eq!(lbody.matches("\"pid\":4243").count(), 1, "{lbody}");
+        assert_eq!(lbody.matches("\"pid\":4242").count(), 0, "{lbody}");
+        assert_eq!(tag.skipped(), 2);
     }
 
     #[derive(Clone, Default)]

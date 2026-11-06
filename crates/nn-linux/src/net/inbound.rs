@@ -160,8 +160,13 @@ pub async fn inbound_loop(
                     };
                     let (evs, closed) = inbound_events(&mut tracker, raw, &lineage);
                     if let (Some(db), Some(row)) = (netflow_db.as_ref(), closed.as_ref()) {
-                        if let Err(e) = db.lock().append_inbound(row) {
-                            warn!(error = %e, "appending an inbound row to the netflow log failed");
+                        let mut db = db.lock();
+                        // lot 280c: the sensor self-test's accepted
+                        // connection reaches its tap only
+                        if !db.self_test_row(row) {
+                            if let Err(e) = db.append_inbound(row) {
+                                warn!(error = %e, "appending an inbound row to the netflow log failed");
+                            }
                         }
                     }
                     events.extend(evs);

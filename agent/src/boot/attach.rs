@@ -445,7 +445,7 @@ pub(crate) fn self_test(
 /// go — next to `--pid-file` (the unit: `/run/northnarrow/bpf-own-ids`).
 /// Without `--pid-file` (the e2e fixtures, a manual run) nothing is
 /// written, so the installed agent's list is never overwritten by another.
-fn own_prog_ids_file(cli: &Cli) -> Option<PathBuf> {
+pub(crate) fn own_prog_ids_file(cli: &Cli) -> Option<PathBuf> {
     cli.pid_file
         .as_deref()
         .and_then(std::path::Path::parent)

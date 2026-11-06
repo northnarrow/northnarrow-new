@@ -54,9 +54,9 @@ held to it too (a test reads it for every source and class).
 | health | P0's | — | — | none yet | — | — | — |
 
 The health class has no event yet: the sensors' health is the capability
-manifest's (below), the telemetry probe's (an exec, a file open and a DNS
-datagram a minute, each signed `telemetry_gap` when it does not arrive) and
-the heartbeat's.
+manifest's (below), the sensor self-test's (lot 280c, §5a: every round, each
+source's own event or, for three, a check of its attach; a miss signed at
+once, two in a row an alert) and the heartbeat's.
 
 ## 3. The sources
 
@@ -98,8 +98,8 @@ R14b: a `dns_query` event's name is decoded by the agent's parse worker
 disabled the events still come, with no name (`qname_partial`), and the
 core does not decode them itself: the DNS rules that match on a name are
 silent, the connects that follow are not attributed to a name, and the
-telemetry probe's DNS round finds a gap (`dns_query`'s `probe: gap`), which
-the manifest signs as any other.
+sensor self-test's DNS step finds a miss (`dns_query`'s word `missed`, then
+`gap`), which the manifest signs as any other.
 
 ## 4. The capability manifest
 
@@ -119,12 +119,12 @@ What R13 adds to the row (`manifest_version` 2):
 |---|---|
 | `sensors[].took` | how the attach code took each attach point: `whole`, `partial` (with what did not attach), `fallback`, `off`, `absent` |
 | `contract_version`, `contract_hash` | the contract's version (1), and the hash of its terms, the agent's version and the kernel's release |
-| `sources` | one entry per source: `source`, `classes`, `attach` (as the boot noted it, `not attached` without), `on` (`primary`, `fallback`, `none`), `state`, `why` (the boot's reasons and the degradations recorded about it), `probe` (the telemetry probe's word: `pending`, `seen`, `gap`, `stale`; absent for a source it does not exercise), `evidence` (what its `ok` rests on: `probe`, `self_test`, `attach_only`; `fs_protect`'s `self_test` is the deny self-test's one hook, `task_kill`, of the sixteen: the other fifteen rest on their attach), `terms` (its contract, as in §3: in the boot's row; a change's row names them by `contract_hash`) |
+| `sources` | one entry per source: `source`, `classes`, `attach` (as the boot noted it, `not attached` without), `on` (`primary`, `fallback`, `none`), `state`, `why` (the boot's reasons and the degradations recorded about it), `probe` (the sensor self-test's word, lot 280c — every source has one: `pending` before its first round, `seen`, `missed` (the last round missed it), `gap` (two rounds or more in a row), `stale` (no round ended for 149 s), `not_exercised` (its step cannot run here: io_uring switched off, a trusted-installer window, its source not running); §5a), `evidence` (what its `ok` rests on: `probe` (its own event in the last round), `attach_check` (its programs found linked in the last round: the three sources no live event exercises), `self_test` (`fs_protect` before its first round: the boot's deny self-test, one hook), `attach_only`), `terms` (its contract, as in §3: in the boot's row; a change's row names them by `contract_hash`) |
 | `classes` | one entry per class: its queue, capacity, full-queue policy, decision budget, sources, strongest verdict, worst failure, loss stages, and `state`, the worst of its sources' |
 | `fallbacks` | each source on a fallback, with its attach point |
 | `missing` | each deny or observe hook not attached, and each source not `ok` (with its first reason) |
 | `content` | the shipped lists not in force from their file: the copy built into the agent took over, or the file was edited by hand (the overlay gate's `default_list_*` rows say when) |
-| `telemetry_probe`, `settled` | the probe's period (`off`), and whether its first round has ended (before it, every probed source is `pending`) |
+| `telemetry_probe`, `settled` | the self-test's period (`off`), and whether its first round has ended (before it, every source is `pending`) |
 | `degradations`, `trust_level`, `trust_reasons` | as before, now of this revision — the status shows these |
 | `revision`, `hash`, `previous_hash`, `change`, `changes` | the revision (0 at the boot), its capabilities hash, the hash of the revision before it, what changed (one line each) and how many changes the row folds; the running view (`status`, `capabilities`) adds `unsigned_changes`, the changes not signed yet |
 | `workers` | R14a (`WORKERS.md`): each worker kind, its `state` (`ready`, `restarting`, `disabled`, `unavailable`, `stopped`), `why`, `kernel_landlock_abi`, and the `sandbox` its worker declared (the Landlock ABI and what it enforced, the seccomp filter, `no_new_privs`, the account, the capability sets). A worse state — a kind disabled, unavailable, gone, or a worker sandboxed less than before — is signed at once like a source's; a worker's restart that ends within the 5 s between two builds changes nothing |
@@ -137,8 +137,8 @@ The **states** of a source:
 | `standby` | attached and inert by design: the fallback of a source that runs on its own (the `file_open` tracepoint while `open_sensor` runs) |
 | `disabled_by_admin` | switched off by the operator (`--exploit-guard off`) |
 | `partial` | part of it runs: a hook of it not attached (12 of 16 deny hooks; the DNS sensor without `udp_v6_send_skb`), a fallback that covers less (`open_sensor` on the tracepoint: no `MassWrite`, `FileBurst`, `DefenderSignal`, no FIM `Opened` records, the path read from the caller's memory; `exec_check` on `sys_enter_execve`: no executable identity, no exec guards), part of it an LSM program that does not run (the lite exploit guard without `bpf`), an opt-in configured that cannot run (`--exec-policy enforce`, `--exec-quarantine enforce`, `--net-connect-deny` without `bpf`) — what is missing in `why` |
-| `unknown` | not known: an attach note the contract does not know, or one that does not say how it attached; the telemetry probe's word `stale` (no round ended for two of its longest intervals and its deadline: 149 s at 60 s) |
-| `attached_not_invoked` | attached, and not running: its BPF LSM programs do not run (`bpf` not in the active LSM list, or the deny self-test's signal was delivered), or the telemetry probe's event did not reach the pipeline |
+| `unknown` | not known: an attach note the contract does not know, or one that does not say how it attached; the self-test's word `stale` (no round ended for two of its longest intervals and its deadline: 149 s at 60 s); lot 280c: its word `missed` (the last round's event did not come, or its attach check failed: not known whether it sees) |
+| `attached_not_invoked` | attached, and not running: its BPF LSM programs do not run (`bpf` not in the active LSM list, or the deny self-test's signal was delivered), or (lot 280c) the self-test's event did not reach the pipeline in two rounds in a row (`gap`) |
 | `unavailable` | nothing attached on this host (with why), or attached with no pump or drain started to read it |
 | `adapter_terminated` | its pump or drain ended: the agent stops for the watchdog's restart, and signs this revision first |
 
@@ -152,15 +152,15 @@ without its revision fields, without the contract's terms, without what an
 upgrade or a new kernel changes by itself (the agent's version, the
 kernel's release, the offsets counted, the host checks' values), its
 unordered lists sorted. Two starts that attach the same way have the same
-hash; the telemetry probe's first round changes it once (`pending` to
+hash; the self-test's first round changes it once (`pending` to
 `seen`); a change of a capability changes it, an upgrade alone does not.
 `contract_hash` covers the terms, the contract's and the agent's versions
 and the kernel's release: what an upgrade changes.
 
 **What signs a revision**: a degradation recorded after the boot (a drain
 that ended, a fallback, a stream not persisted — every `subsystem_degraded`,
-its own row kept), the telemetry probe's first round, a gap, its end, its
-word going stale, an adapter that ended, a shipped list given way to its
+its own row kept), the self-test's first round, a miss (lot 280c), a gap,
+its end, its word going stale, an adapter that ended, a shipped list given way to its
 built-in copy. The running agent builds the manifest every 5 s (and for
 each status and each beat): a change shows at once in the status and the
 beats. Its `capability_manifest_change` row is signed **at once** when the
@@ -198,24 +198,90 @@ the field after beats that had it, are `DEGRADED` too. The first check
 anchors what it sees. On the host, `nn-admin capabilities --key` names the
 change; the audit log holds each revision.
 
-## 5a. What the probe proves, and what it does not
+## 5a. What the self-test proves, and what it does not
 
-The telemetry probe makes one exec, one file open and one DNS datagram a
-minute and checks that each reaches the pipeline. It finds a sensor blinded
-**naively or by accident** — a hook detached, a ring no longer read, a
-kprobe disarmed for all, a layout broken by a kernel update, its own rounds
-stopped (`stale`). It does not hold against **an adaptive root**: the probe
-child is the agent's own binary run with `--telemetry-probe`, which a root
-watching the execs can recognise and serve, re-arming what it disarmed for
-the probe's few milliseconds; kprobes can be switched off as a whole through
-debugfs (`/sys/kernel/debug/kprobes/enabled`: refused outside a window since
-lot 280b, below); and the ten sources the probe
-does not exercise (`evidence: attach_only`; `fs_protect`'s `self_test` is
-one deny hook of sixteen, at the boot) are never verified again after their
-attach. Against a
-root on the host the deny hooks (the agent's own files, maps and processes)
-and the heartbeat's verifier off the host are the defence: the manifest
-says what the agent can see, not what it cannot.
+Lot 280c (Wave 1): the telemetry probe became the **sensor self-test**.
+Every round (60 s, ±20 %; `NN_TELEMETRY_PROBE_SECS`) a child of the
+agent's own binary (`--telemetry-probe <nonce>`) makes one known, harmless
+event for each source, and each must reach its pipeline within 5 s. Three
+sources have no such event and get a check of their attach instead —
+stated as such (`evidence: attach_check`):
+
+| Source | The round's step | Word |
+|---|---|---|
+| `process_spawn` | the child's exec (`sched_process_exec`) | live |
+| `exec_check` | the same exec (`bprm_check_security`; `sys_enter_execve` on the fallback) | live |
+| `open_sensor`, `file_open` | a read of `/run/northnarrow/probe/<nonce>` | live |
+| `dns_query` | a datagram naming `<nonce>.probe.northnarrow.invalid` sent to `127.0.0.1:53` (a response: no resolver answers or forwards it, external audit EVD-015) | live |
+| `tcp_connect` | a connect to the child's own listener on a loopback port | live |
+| `net_drain` | that listener's `listen()` (the listen kprobe) | live |
+| `net_inbound` | the connection's accept | live |
+| `tls_hello` | a ClientHello for the nonce's name as the connection's first send | live |
+| `io_uring` | a ring of one entry made and closed | live (not exercised where io_uring is switched off) |
+| `bpf_syscall` | a one-entry array map made and closed (`BPF_MAP_CREATE`) | live |
+| `fim_drain` | a file created in the probe directory, which the FIM watches | live |
+| `fs_protect` | `SIGURG` to the agent and a file created in `/etc/northnarrow`: both must be refused and their denials must arrive — two of the deny hooks (`task_kill`, `inode_create`); a step let through is a miss by itself; not exercised in a trusted-installer window, where nothing is refused by design | live |
+| `module_load` | each of its programs still linked, and a load reported for each module new in `/proc/modules` since the last round | attach check |
+| `exploit_guard` | each of its loaded programs still linked | attach check |
+| `dns_answer` | each of its programs still linked | attach check |
+
+The three attach checks, and why: loading a module is neither cheap nor
+harmless; the exploit guard's event is an exploit's post-condition; a DNS
+response comes from port 53, which the unit cannot bind (no
+`CAP_NET_BIND_SERVICE`), and a query to the host's resolver is what
+EVD-015 removed. The state directory is `chattr +i`: a create there is
+refused by the kernel before any LSM hook runs, so the deny step creates in
+`/etc/northnarrow` (registered `NOCREATE`, not immutable).
+
+**A source missed** — its event did not come, its attach check failed, a
+deny step was let through: at the round's end a signed degradation
+(`subsystem_degraded`, source `sensor_selftest`, its detail naming the
+sensor, its source and the step), the manifest's word `missed` and the
+source `unknown` (a worse state: the revision signed at the next build),
+the trust level counting it; **missed in two rounds in a row**, an alert
+(`sensor_selftest_alert`, ERROR in the journal), the word `gap` and the
+source `attached_not_invoked`; later rounds the journal only; **seen
+again**, `sensor_selftest_restored` and the degradation withdrawn. A step
+that cannot run is `not_exercised` (a WARN once): its round says nothing
+of the source.
+
+**The self-test's events are never judged.** The decision thread offers
+every event to the self-test's tap first: an event of the child — its pid
+within its lifetime (the agent reaps the child itself, so its pid is not
+reused before) —, of its steps' shape (the round's nonce, a loopback
+address, the expected target) and within the number its steps make, is
+taken there and never reaches the rules, the posture, the detection store
+or a response; anything else the child did is judged as any process's. The
+network and FIM drains do not write the child's rows to the signed
+netflow, listener and FIM drift logs, which the export reads (counted:
+the journal's `rows_skipped`); before this lot the probe's DNS datagram left
+one netflow row a minute.
+
+**Its cost** is measured every round — the child's CPU time (its
+`rusage`) and the agent's own checks — against a budget of 50 ms of CPU a
+round; a round over it is a signed degradation until a round is back
+under. The journal's summary every ten rounds gives the maxima
+(`sensor self-test: the rounds' cost`). The lab measured, over ten rounds,
+at most 3.9 ms of the child's CPU and 6.5 ms of the agent's checks a round
+on Ubuntu 24.04 (6.8), 2.6 and 3.1 ms on 22.04 (5.15), every event within
+5 ms of the round's start
+([the capability programme, lot 280c](https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md)).
+
+It finds a sensor blinded **naively or by accident** — a hook detached, a
+ring no longer read, a kprobe disarmed for all, a layout broken by a kernel
+update, its own rounds stopped (`stale`). It does not hold against **an
+adaptive root**: the child is the agent's own binary run with
+`--telemetry-probe`, which a root watching the execs can recognise and
+serve, re-arming what it disarmed for the child's few milliseconds; kprobes
+can be switched off as a whole through debugfs
+(`/sys/kernel/debug/kprobes/enabled`: refused outside a window since lot
+280b, below); an attach check proves a program linked, not that the kernel
+runs it (a BPF LSM program without `bpf` in the active LSM list is the
+manifest's other word, §6); and the deny step exercises two deny hooks of
+the twenty-one each round. Against a root on the host the deny hooks (the
+agent's own files, maps and processes) and the heartbeat's verifier off the
+host are the defence: the manifest says what the agent can see, not what
+it cannot.
 
 **`kernel.ftrace_enabled`, the switch under the deny hooks** (lot 273d, R1
 of the external review of 04/11). On 6.0 to 7.2 a write of `0` turns every
@@ -289,15 +355,16 @@ happened, not that the hooks held. On 5.15 a `0` set before the agent's
 start makes the trampolines' attach fail (`EBUSY`, by the kernel's code;
 not measured here): the start's own degradations name the hooks.
 
-**Worst-case delays** for a probed source blinded at random: its next
-round within 72 s (60 s, +20 % jitter), its deadline 5 s, the next build
-5 s — about **82 s to the signed row** (a worse state is signed at that
-build, whatever row came before it; an oscillation already signed in the
-minute waits for the next row); then the
-next beat (30 s) and the verifier's next check (its timer, 30 s in the
-example of `HEARTBEAT.md`) — about **2.4 minutes to `DEGRADED`** off the
-host. A probe whose rounds stop is `stale` after 149 s. For the sources the
-probe does not exercise there is no such bound: their blinding by a root
+**Worst-case delays** for a source blinded at random: its next round
+within 72 s (60 s, +20 % jitter), its deadline 5 s — about **77 s to the
+signed degradation**, the next build 5 s later the manifest's revision (a
+worse state is signed at that build, whatever row came before it; an
+oscillation already signed in the minute waits for the next row); the
+alert one round later (at most 72 s more); then the next beat (30 s) and
+the verifier's next check (its timer, 30 s in the example of
+`HEARTBEAT.md`) — about **2.4 minutes to `DEGRADED`** off the host. A
+self-test whose rounds stop is `stale` after 149 s. For the three sources
+with an attach check the bound holds for a detach; their blinding by a root
 that leaves the attach in place is not seen.
 
 ## 6. A kernel without `bpf` in `lsm=` (EXP-37)

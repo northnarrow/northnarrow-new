@@ -45,6 +45,7 @@ const LSM_SOURCE: SourceContract = SourceContract {
     rings: &["open_sensor"],
     probe: Some("file_open"),
     self_tested: false,
+    attach_check: false,
     degradation_sources: &["file_open_sensor"],
     standby_for: None,
 };
@@ -68,6 +69,7 @@ const STANDBY: SourceContract = SourceContract {
     rings: &["file_open"],
     probe: Some("file_open"),
     self_tested: false,
+    attach_check: false,
     degradation_sources: &[],
     standby_for: Some("open_sensor"),
 };
@@ -96,6 +98,7 @@ const DENY: SourceContract = SourceContract {
     rings: &["fs_protect"],
     probe: None,
     self_tested: true,
+    attach_check: false,
     degradation_sources: &["anti_tamper"],
     standby_for: None,
 };
@@ -128,6 +131,7 @@ const DNS: SourceContract = SourceContract {
     rings: &["dns"],
     probe: Some("dns"),
     self_tested: false,
+    attach_check: false,
     degradation_sources: &["dns_sensor"],
     standby_for: None,
 };
@@ -160,6 +164,7 @@ const GUARD: SourceContract = SourceContract {
     rings: &["exploit_guard"],
     probe: None,
     self_tested: false,
+    attach_check: false,
     degradation_sources: &[],
     standby_for: None,
 };
@@ -190,6 +195,7 @@ const CONNECT: SourceContract = SourceContract {
     rings: &["tcp_connect"],
     probe: None,
     self_tested: false,
+    attach_check: false,
     degradation_sources: &[],
     standby_for: None,
 };
@@ -688,7 +694,7 @@ fn a_gap_a_stale_word_an_off_a_missing_and_an_ended_source() {
         "{dns:?}"
     );
     assert!(
-        dns.why.iter().any(|w| w.contains("telemetry_gap")),
+        dns.why.iter().any(|w| w.contains("sensor_selftest_alert")),
         "{dns:?}"
     );
     let guard = entry(&e, "exploit_guard");
@@ -741,7 +747,10 @@ fn a_gap_a_stale_word_an_off_a_missing_and_an_ended_source() {
     let tp = entry(&e, "file_open");
     assert_eq!(tp.state, SourceState::AttachedNotInvoked);
     assert_eq!(tp.probe, Some(ProbeState::Gap));
-    assert!(tp.why.iter().any(|w| w.contains("telemetry_gap")), "{tp:?}");
+    assert!(
+        tp.why.iter().any(|w| w.contains("sensor_selftest_alert")),
+        "{tp:?}"
+    );
     // the standby source in charge, then its probe's gap and its end
     let mut f = healthy();
     set(&mut f, note("file_open", OPEN_TP, Took::Fallback));
@@ -754,6 +763,107 @@ fn a_gap_a_stale_word_an_off_a_missing_and_an_ended_source() {
         "its fallback's, not its gap"
     );
     assert_eq!(entry(&e, "file_open").state, SourceState::AdapterTerminated);
+}
+
+/// Lot 280c: the sensor self-test's words — one round missed is not known
+/// (`unknown`, the signed `sensor_selftest` degradation named), two in a row
+/// not invoked (the alert), a step that could not run changes nothing but
+/// says so; an attach check's word is `attach_check` evidence, its miss
+/// says the check failed. A missed round is a worse manifest (signed at
+/// once), its end a better one.
+#[test]
+fn a_missed_round_is_unknown_two_are_not_invoked_and_an_attach_check_says_so() {
+    let before = manifest_of(&healthy());
+    let mut f = healthy();
+    f.probe[1].1 = ProbeState::Missed;
+    let e = source_entries(&sample(), &f);
+    let dns = entry(&e, "dns_query");
+    assert_eq!(dns.state, SourceState::Unknown);
+    assert_eq!(dns.probe, Some(ProbeState::Missed));
+    assert_eq!(dns.evidence, Evidence::AttachOnly);
+    assert!(
+        dns.why
+            .iter()
+            .any(|w| w.contains("in the last round") && w.contains("sensor_selftest degradation")),
+        "{dns:?}"
+    );
+    let missed = manifest_of(&f);
+    assert!(missed.worsens_from(&before), "one round missed is worse");
+    assert!(!before.worsens_from(&missed), "its end is better");
+    assert!(missed
+        .changes_from(&before)
+        .contains(&"source dns_query: sensor self-test seen → missed".to_string()));
+    // a source already not known for another reason: the miss alone is
+    // worse (its word), though its state stays
+    let mut u = healthy();
+    set(&mut u, whole("dns", "kprobe:udp_sendmsg (something else)"));
+    let unknown = manifest_of(&u);
+    assert_eq!(
+        entry(&unknown.sources, "dns_query").state,
+        SourceState::Unknown
+    );
+    u.probe[1].1 = ProbeState::Missed;
+    let unknown_missed = manifest_of(&u);
+    assert_eq!(
+        entry(&unknown_missed.sources, "dns_query").state,
+        SourceState::Unknown
+    );
+    assert!(unknown_missed.worsens_from(&unknown), "the miss is worse");
+    // two in a row: the alert's word, worse again
+    let mut g = healthy();
+    g.probe[1].1 = ProbeState::Gap;
+    let gap = manifest_of(&g);
+    assert!(gap.worsens_from(&missed));
+    assert_eq!(
+        entry(&gap.sources, "dns_query").state,
+        SourceState::AttachedNotInvoked
+    );
+    // a step that could not run: ok as attached, why said, not worse
+    let mut n = healthy();
+    n.probe[1].1 = ProbeState::NotExercised;
+    let e = source_entries(&sample(), &n);
+    let dns = entry(&e, "dns_query");
+    assert_eq!(dns.state, SourceState::Ok);
+    assert_eq!(dns.evidence, Evidence::AttachOnly);
+    assert!(
+        dns.why.iter().any(|w| w.contains("could not run")),
+        "{dns:?}"
+    );
+    let not_run = manifest_of(&n);
+    assert!(!not_run.worsens_from(&before));
+    assert!(not_run.settled, "a step not run is not pending");
+    // an attach check (the exploit guard: no live event exercises it)
+    let mut guard = GUARD;
+    guard.probe = Some("exploit_guard");
+    guard.attach_check = true;
+    let contract = vec![LSM_SOURCE, STANDBY, DENY, DNS, guard, CONNECT];
+    assert!(
+        !check(&contract).iter().any(|p| p.contains("attach check")),
+        "{:?}",
+        check(&contract)
+    );
+    let mut a = healthy();
+    a.probe.push(("exploit_guard".into(), ProbeState::Seen));
+    let e = source_entries(&contract, &a);
+    assert_eq!(entry(&e, "exploit_guard").evidence, Evidence::AttachCheck);
+    assert_eq!(entry(&e, "dns_query").evidence, Evidence::Probe);
+    a.probe.last_mut().unwrap().1 = ProbeState::Missed;
+    let e = source_entries(&contract, &a);
+    let g = entry(&e, "exploit_guard");
+    assert_eq!(g.state, SourceState::Unknown);
+    assert_eq!(g.evidence, Evidence::AttachOnly);
+    assert!(
+        g.why
+            .iter()
+            .any(|w| w.contains("exploit_guard attach check failed")),
+        "{g:?}"
+    );
+    // an attach check needs its word
+    let mut bad = guard;
+    bad.probe = None;
+    assert!(check(&[bad])
+        .iter()
+        .any(|p| p.contains("an attach check without the self-test's word")));
 }
 
 /// A source on its attach point whose pump or drain the start did not
@@ -1023,7 +1133,7 @@ fn a_change_is_named_line_by_line() {
         lines.contains(&format!("source dns_query: ok on its attach point ({DNS_SKB}) → attached, not invoked on its attach point ({DNS_SKB})")),
         "{lines:#?}"
     );
-    assert!(lines.contains(&"source dns_query: telemetry probe seen → gap".to_string()));
+    assert!(lines.contains(&"source dns_query: sensor self-test seen → gap".to_string()));
     assert!(lines.iter().any(
         |l| l.starts_with("source open_sensor: ok on its attach point")
             && l.contains("→ partial on a fallback")
@@ -1050,7 +1160,7 @@ fn a_change_is_named_line_by_line() {
     stale.probe[1].1 = ProbeState::Stale;
     assert!(manifest_of(&stale)
         .changes_from(&before)
-        .contains(&"source dns_query: telemetry probe seen → stale".to_string()));
+        .contains(&"source dns_query: sensor self-test seen → stale".to_string()));
 }
 
 /// The manifest's JSON reads back (the agent's signed row is it).
@@ -1116,7 +1226,7 @@ fn the_manifest_row_and_its_hash_are_pinned() {
     m.hash = m.content_hash();
     m.revision = 1;
     m.previous_hash = Some("ab".repeat(32));
-    m.change = vec!["source dns_query: telemetry probe seen → gap".into()];
+    m.change = vec!["source dns_query: sensor self-test seen → gap".into()];
     m.changes = 2;
     let row = m.without_terms();
     assert_eq!(
@@ -1127,10 +1237,10 @@ fn the_manifest_row_and_its_hash_are_pinned() {
 }
 
 const MANIFEST_HASHES: (&str, &str) = (
-    "a718b2c510d027d0e100765799315db68159c50a9b2895b6f8ba506957c00c4f",
+    "41a20f4478b82ab956bbd2893d7ab9d607e6ede8252b14671aab945bcc927abd",
     "3e228be2458b5f5b6055dc11189cf28938e7ba1832acb5e55ca18ee65fa671da",
 );
-const MANIFEST_JSON: &str = r#"{"manifest_version":2,"agent_version":"0.0.1","kernel":"6.8.0","btf":true,"btf_offsets_resolved":40,"btf_offsets_drifted":0,"btf_offsets_absent":[],"active_lsms":"capability,bpf","bpf_lsm":"active","deny_hooks":{"expected":0,"attached":0,"missing":[],"observe_missing":[]},"deny_self_test":"denied","bpf_guard":"enforce","sensors":[{"sensor":"file_open","attach":"lsm:file_open (FIM observer)","took":{"as":"whole"}},{"sensor":"deny_hooks","attach":"lsm:deny hooks","took":{"as":"whole"}},{"sensor":"dns","attach":"kprobe:udp_send_skb+udp_v6_send_skb","took":{"as":"whole"}},{"sensor":"dns_nss","attach":"uprobe:libnss_resolve.so.2","took":{"as":"whole"}},{"sensor":"exploit_guard","attach":"lsm:capable, fentry:commit_creds (lite)","took":{"as":"whole"}},{"sensor":"tcp_connect","attach":"kprobe:tcp_v4_connect+tcp_v6_connect","took":{"as":"whole"}}],"host_hardening":[{"id":"lockdown","status":"warn","value":"[none]"}],"detect_only":false,"degradations":["b","a"],"trust_level":3,"trust_reasons":[],"contract_version":1,"sources":[{"source":"dns_query","classes":["network"],"attach":"kprobe:udp_send_skb+udp_v6_send_skb","on":"primary","state":"attached_not_invoked","why":["telemetry probe: its dns event did not reach the pipeline within the round's deadline (signed telemetry_gap)"],"probe":"gap","evidence":"attach_only"}],"classes":[{"class":"network","queue":"P3","queue_capacity":8192,"when_full":"drop the new event","decision_budget_ms":500,"sources":["dns_query","tcp_connect"],"sync_verdict":"none (the event reports what happened)","on_failure":"blind","loss_counters":[1,3,4,5],"state":"attached_not_invoked"}],"fallbacks":[],"missing":["dns_query: attached, not invoked (kprobe:udp_send_skb+udp_v6_send_skb) — telemetry probe: its dns event did not reach the pipeline within the round's deadline (signed telemetry_gap)"],"content":[],"telemetry_probe":"every 60 s","settled":true,"contract_hash":"3e228be2458b5f5b6055dc11189cf28938e7ba1832acb5e55ca18ee65fa671da","revision":1,"hash":"a718b2c510d027d0e100765799315db68159c50a9b2895b6f8ba506957c00c4f","previous_hash":"abababababababababababababababababababababababababababababababab","change":["source dns_query: telemetry probe seen → gap"],"changes":2}"#;
+const MANIFEST_JSON: &str = r#"{"manifest_version":2,"agent_version":"0.0.1","kernel":"6.8.0","btf":true,"btf_offsets_resolved":40,"btf_offsets_drifted":0,"btf_offsets_absent":[],"active_lsms":"capability,bpf","bpf_lsm":"active","deny_hooks":{"expected":0,"attached":0,"missing":[],"observe_missing":[]},"deny_self_test":"denied","bpf_guard":"enforce","sensors":[{"sensor":"file_open","attach":"lsm:file_open (FIM observer)","took":{"as":"whole"}},{"sensor":"deny_hooks","attach":"lsm:deny hooks","took":{"as":"whole"}},{"sensor":"dns","attach":"kprobe:udp_send_skb+udp_v6_send_skb","took":{"as":"whole"}},{"sensor":"dns_nss","attach":"uprobe:libnss_resolve.so.2","took":{"as":"whole"}},{"sensor":"exploit_guard","attach":"lsm:capable, fentry:commit_creds (lite)","took":{"as":"whole"}},{"sensor":"tcp_connect","attach":"kprobe:tcp_v4_connect+tcp_v6_connect","took":{"as":"whole"}}],"host_hardening":[{"id":"lockdown","status":"warn","value":"[none]"}],"detect_only":false,"degradations":["b","a"],"trust_level":3,"trust_reasons":[],"contract_version":1,"sources":[{"source":"dns_query","classes":["network"],"attach":"kprobe:udp_send_skb+udp_v6_send_skb","on":"primary","state":"attached_not_invoked","why":["sensor self-test: its dns event did not reach the pipeline within the round's deadline in two rounds or more in a row (signed sensor_selftest_alert)"],"probe":"gap","evidence":"attach_only"}],"classes":[{"class":"network","queue":"P3","queue_capacity":8192,"when_full":"drop the new event","decision_budget_ms":500,"sources":["dns_query","tcp_connect"],"sync_verdict":"none (the event reports what happened)","on_failure":"blind","loss_counters":[1,3,4,5],"state":"attached_not_invoked"}],"fallbacks":[],"missing":["dns_query: attached, not invoked (kprobe:udp_send_skb+udp_v6_send_skb) — sensor self-test: its dns event did not reach the pipeline within the round's deadline in two rounds or more in a row (signed sensor_selftest_alert)"],"content":[],"telemetry_probe":"every 60 s","settled":true,"contract_hash":"3e228be2458b5f5b6055dc11189cf28938e7ba1832acb5e55ca18ee65fa671da","revision":1,"hash":"41a20f4478b82ab956bbd2893d7ab9d607e6ede8252b14671aab945bcc927abd","previous_hash":"abababababababababababababababababababababababababababababababab","change":["source dns_query: sensor self-test seen → gap"],"changes":2}"#;
 
 /// R14a: a worker kind's entry — its state, the sandbox it declared.
 fn with_worker(

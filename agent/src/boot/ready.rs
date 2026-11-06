@@ -100,6 +100,11 @@ pub(crate) fn arm(
             previous_hash: None,
             change: Vec::new(),
         };
+        // Lot 280c: a sensor whose source does not run is not exercised by
+        // the self-test (the manifest's own word says why).
+        if let Some(probe) = telemetry_probe {
+            probe.set_running(&pumps);
+        }
         let inputs = manifest::Inputs {
             base,
             bpf_lsm: bpf_lsm_state,
