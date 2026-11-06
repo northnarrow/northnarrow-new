@@ -72,6 +72,16 @@ impl<H: DecisionHost> R018KernelModuleLoad<H> {
     }
 }
 
+/// Whose file the kernel read, for the reasoning: root's or another
+/// account's (the account itself is not the record's to name).
+fn owner(f: &nn_model::ModuleFileFacts) -> &'static str {
+    if f.uid == 0 {
+        "owned by root"
+    } else {
+        "not owned by root"
+    }
+}
+
 /// What the kernel did with the load, for the reasoning.
 fn kernel_said(v: ModuleLoadVerdict) -> &'static str {
     match v {
@@ -191,16 +201,22 @@ impl<H: DecisionHost> Rule for R018KernelModuleLoad<H> {
                     f.dev, f.ino
                 ),
                 (_, Some(f)) if f.trust_flags == 0 => format!(
-                    "no package or DKMS vouches for the file {}:{} (uid {}, mode {:o}) as it is \
+                    "no package or DKMS vouches for the file {}:{} ({}, mode {:o}) as it is \
                      now — not in the running kernel's tree, copied or changed by hand, or a \
                      DKMS or akmods build written outside a package transaction that `enforce \
                      R018` refuses (the agent's journal names why)",
-                    f.dev, f.ino, f.uid, f.mode
+                    f.dev,
+                    f.ino,
+                    owner(f),
+                    f.mode
                 ),
                 (_, Some(f)) => format!(
                     "the file {}:{} changed since the agent vouched for it, or its owner or \
-                     mode no longer protect it (uid {}, mode {:o})",
-                    f.dev, f.ino, f.uid, f.mode
+                     mode no longer protect it ({}, mode {:o})",
+                    f.dev,
+                    f.ino,
+                    owner(f),
+                    f.mode
                 ),
                 (_, None) => "the file could not be read".to_string(),
             };
@@ -678,6 +694,21 @@ mod tests {
         assert!(v.reasoning.contains("the record mode"), "{}", v.reasoning);
         assert!(
             v.reasoning.contains("changed since the agent vouched"),
+            "{}",
+            v.reasoning
+        );
+        assert!(v.reasoning.contains("(owned by root, mode 100644)"));
+        // another account's file: said so, the account not named
+        let mut theirs = judged(
+            raw(MODULE_LOAD_FINIT, "modprobe", "bash", 0, TREE),
+            kv::DENIED,
+            0,
+        );
+        theirs.file_uid = 1000;
+        let v = r.evaluate(&ev(&theirs)).unwrap();
+        assert!(
+            v.reasoning.contains("(not owned by root, mode 100644)")
+                && !v.reasoning.contains("1000"),
             "{}",
             v.reasoning
         );
