@@ -25,6 +25,7 @@
 //! | trusted | — | — | none |
 //! | window | a signed trusted-installer window let an untrusted load through | Medium | Log |
 //! | opt-out | a signed per-module opt-out let it through | Medium | Log |
+//! | dkms-unattested | a DKMS or akmods build its registry vouches for, written since boot outside a recognised package transaction: let through unless the policy enforces R018 | High | Log |
 //! | denied / recorded / not judged | `finit_module` from a **non-standard path** (`/tmp`, …) or deeper than any module directory | **Critical** | **KillProcessTree** |
 //! | denied / recorded | any other untrusted file, or an `init_module` buffer | High | Log |
 //! | not judged | a module directory's file: by its provenance (package, DKMS: none; copied by hand: High; no database: Medium) | | Log |
@@ -79,6 +80,9 @@ fn kernel_said(v: ModuleLoadVerdict) -> &'static str {
         ModuleLoadVerdict::Window => "let through by a signed trusted-installer window",
         ModuleLoadVerdict::OptOut => "let through by a signed per-module opt-out",
         ModuleLoadVerdict::Trusted => "trusted by the kernel",
+        ModuleLoadVerdict::DkmsUnattested => {
+            "let through by the default policy, not trusted (`enforce R018` refuses it)"
+        }
         ModuleLoadVerdict::NotJudged => "not judged by the kernel (its trust map not filled yet)",
     }
 }
@@ -141,6 +145,7 @@ impl<H: DecisionHost> Rule for R018KernelModuleLoad<H> {
             }
             ModuleLoadVerdict::Denied
             | ModuleLoadVerdict::Recorded
+            | ModuleLoadVerdict::DkmsUnattested
             | ModuleLoadVerdict::NotJudged => {}
         }
         // (3) NEAR-CERTAIN rootkit — a finit_module load from a NON-standard
@@ -179,6 +184,12 @@ impl<H: DecisionHost> Rule for R018KernelModuleLoad<H> {
                 (ModuleLoadMethod::Init, _) => {
                     "a module from memory (init_module): no file to trust".to_string()
                 }
+                (_, Some(f)) if *verdict == ModuleLoadVerdict::DkmsUnattested => format!(
+                    "the file {}:{} is a DKMS or akmods build its registry vouches for (the \
+                     same content), but it was written since boot outside a recognised package \
+                     transaction — built by hand, or before the agent started",
+                    f.dev, f.ino
+                ),
                 (_, Some(f)) if f.trust_flags == 0 => format!(
                     "no package or DKMS vouches for the file {}:{} (uid {}, mode {:o}) as it is \
                      now — not in the running kernel's tree, copied or changed by hand",
@@ -731,6 +742,47 @@ mod tests {
             (ResponseAction::Log, Severity::Medium)
         );
         assert!(v.reasoning.contains("opt-out"), "{}", v.reasoning);
+    }
+
+    /// Named test (lot 285, the coordinator's matrix, the rule's half): a
+    /// DKMS or akmods build the kernel let through as unattested (written
+    /// since boot outside a recognised package transaction) is recorded
+    /// High, never silent, never killed in the tree; the wire's verdict
+    /// reaches the event.
+    #[test]
+    fn a_registered_dkms_build_written_outside_a_transaction_is_recorded_high() {
+        let dkms_tree: &[&str] = &[
+            "/",
+            "lib",
+            "modules",
+            "6.8.0",
+            "updates",
+            "dkms",
+            "zfs.ko.zst",
+        ];
+        let e = ev(&judged(
+            raw(MODULE_LOAD_FINIT, "modprobe", "bash", 0, dkms_tree),
+            kv::UNATTESTED,
+            trust_flag::UNATTESTED,
+        ));
+        let Event::ModuleLoad { verdict, .. } = &e else {
+            panic!("not ModuleLoad")
+        };
+        assert_eq!(*verdict, ModuleLoadVerdict::DkmsUnattested);
+        assert!(!verdict.refused());
+        let v = rule().evaluate(&e).expect("recorded");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        assert!(
+            v.reasoning.contains("registry vouches for")
+                && v.reasoning
+                    .contains("outside a recognised package transaction")
+                && v.reasoning.contains("let through by the default policy"),
+            "{}",
+            v.reasoning
+        );
     }
 
     // ── fire conditions ────────────────────────────────────────────

@@ -16,7 +16,10 @@
 //! the deny mode, `alert`, `audit` or `off` the record mode, no line the
 //! default ([`DEFAULT_MODE`]). The signed `module-allow <module>` lines are
 //! the per-module opt-outs, honoured only from a policy whose signature
-//! the agent verified.
+//! the agent verified. A DKMS or akmods build its registry vouches for,
+//! written since boot outside a recognised package transaction, is let
+//! through and recorded under every policy but `enforce R018`
+//! ([`Desired::unattested`], the coordinator's matrix).
 
 pub mod kernel;
 pub mod scan;
@@ -49,6 +52,9 @@ pub const FULL_EVERY: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(250);
 /// Untrusted files named in the journal per look.
 const NAMED_MAX: usize = 20;
+/// Package managers the judge's lineage knows besides the posture's list:
+/// dnf5 (Fedora 41 on; `/usr/bin/dnf` links to it there).
+const EXTRA_PKG_IMAGES: &[&str] = &["/usr/bin/dnf5"];
 
 /// What the policy asks of the judge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +62,10 @@ pub struct Desired {
     pub mode: u64,
     /// The signed per-module opt-outs (module names, `_` for `-`).
     pub opt_outs: BTreeSet<String>,
+    /// A DKMS or akmods build its registry vouches for, written since boot
+    /// outside a recognised package transaction, goes in the map (let
+    /// through, recorded High): every policy but `enforce R018`.
+    pub unattested: bool,
 }
 
 impl Default for Desired {
@@ -63,6 +73,7 @@ impl Default for Desired {
         Self {
             mode: DEFAULT_MODE,
             opt_outs: BTreeSet::new(),
+            unattested: true,
         }
     }
 }
@@ -85,6 +96,12 @@ pub fn mode_of(policy: &RulePolicy) -> u64 {
     }
 }
 
+/// An unattested DKMS or akmods build is let through (recorded) under
+/// `policy`: every policy but `enforce R018`.
+pub fn unattested_of(policy: &RulePolicy) -> bool {
+    policy.mode(RULE) != Some(Mode::Enforce)
+}
+
 /// The judge's part of `policy`: its mode, and its `module-allow` lines
 /// when `signed` (the text applied is the signed one; an unsigned policy
 /// loaded through `NN_OVERLAY_ALLOW_UNSIGNED` honours none). The detail of
@@ -95,6 +112,7 @@ pub fn apply_policy(policy: &RulePolicy, signed: bool) -> Option<String> {
     *DESIRED.lock() = Desired {
         mode: mode_of(policy),
         opt_outs: if signed { names } else { BTreeSet::new() },
+        unattested: unattested_of(policy),
     };
     (!signed && count > 0).then(|| {
         format!(
@@ -199,10 +217,15 @@ fn rpm_host() -> bool {
 impl Controller {
     /// The package managers' images in the kernel: added as found (a
     /// running package manager keeps its old image across its own
-    /// upgrade), replaced whole only when the map is full.
+    /// upgrade), replaced whole only when the map is full. A `#!` script
+    /// among them (dnf, yum: Python) is matched by the file its exec named
+    /// (`MODULE_PKG_SCRIPTS`), an executable by its image.
     fn refresh_pkg_images(&mut self) {
         let mut changed = false;
-        for p in crate::posture::lineage::PACKAGE_MANAGER_EXES {
+        for p in crate::posture::lineage::PACKAGE_MANAGER_EXES
+            .iter()
+            .chain(EXTRA_PKG_IMAGES)
+        {
             if let Some(k) = crate::execpol::kernel::trusted_image_key(Path::new(p)) {
                 let k = InodeKey {
                     dev: k.dev,
@@ -222,32 +245,35 @@ impl Controller {
         }
     }
 
-    /// Whether `f` is a verified package's file (its content hashed, the
-    /// package database's digest compared).
-    fn packaged(&mut self, f: &scan::TreeFile) -> bool {
+    /// What vouches for `f` ([`scan::vouched_by`]): a verified package
+    /// (its content hashed, the package database's digest compared), DKMS's
+    /// registry (the same content), nothing. Cached by the file's identity
+    /// and change stamp.
+    fn vouch(&mut self, f: &scan::TreeFile, inputs: &scan::Inputs<'_>) -> u32 {
         let dpkg = &self.dpkg;
         let rpm = self.rpm.as_ref().map(|(_, idx)| idx);
         self.cache.get(f, |f| {
-            let Some(path) = f.path.to_str() else {
-                return false;
-            };
-            if let Some(idx) = rpm {
-                let alias = path
-                    .strip_prefix("/usr")
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("/usr{path}"));
-                return idx
-                    .get(path)
-                    .or_else(|| idx.get(&alias))
-                    .is_some_and(|(algo, want)| scan::rpm_digest_matches(&f.path, *algo, want));
-            }
-            let Ok(file) = std::fs::File::open(&f.path) else {
-                return false;
-            };
-            matches!(
-                dpkg.check(path, &file),
-                crate::execq::pkgtrust::PkgOutcome::Trusted { .. }
-            )
+            scan::vouched_by(f, inputs, |f| {
+                let Some(path) = f.path.to_str() else {
+                    return false;
+                };
+                if let Some(idx) = rpm {
+                    let alias = path
+                        .strip_prefix("/usr")
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("/usr{path}"));
+                    return idx.get(path).or_else(|| idx.get(&alias)).is_some_and(
+                        |(algo, want)| scan::rpm_digest_matches(&f.path, *algo, want),
+                    );
+                }
+                let Ok(file) = std::fs::File::open(&f.path) else {
+                    return false;
+                };
+                matches!(
+                    dpkg.check(path, &file),
+                    crate::execq::pkgtrust::PkgOutcome::Trusted { .. }
+                )
+            })
         })
     }
 
@@ -297,22 +323,24 @@ impl Controller {
             boot_sec,
             dkms_registry: &registry,
             opt_outs: &want.opt_outs,
+            unattested: want.unattested,
         };
         let mut next: HashMap<InodeKey, ModuleTrust> = HashMap::with_capacity(files.len());
         let mut refused: Vec<(PathBuf, &'static str)> = Vec::new();
-        let mut counts = [0usize; 4];
+        let mut counts = [0usize; 5];
         for f in &files {
             let history = (f.facts.ctime_sec >= boot_sec)
                 .then(|| self.kernel.history(f.key))
                 .flatten();
-            let mut packaged = |f: &scan::TreeFile| self.packaged(f);
-            match scan::classify(f, &inputs, history, &mut packaged) {
+            let mut vouch = |f: &scan::TreeFile| self.vouch(f, &inputs);
+            match scan::classify(f, &inputs, history, &mut vouch) {
                 Ok(flags) => {
                     for (i, bit) in [
                         trust_flag::PACKAGE,
                         trust_flag::DKMS,
                         trust_flag::PKG_WRITTEN,
                         trust_flag::OPT_OUT,
+                        trust_flag::UNATTESTED,
                     ]
                     .iter()
                     .enumerate()
@@ -365,7 +393,8 @@ impl Controller {
         }
         let summary = format!(
             "{}: {} module files trusted in {} ({} packaged, {} DKMS, {} written in a package \
-             transaction since boot, {} by a signed opt-out), {} not{}{}",
+             transaction since boot, {} by a signed opt-out, {} DKMS or akmods builds written \
+             since boot outside one: let through, recorded), {} not{}{}",
             mode_name(self.armed.unwrap_or(mode::NOT_READY)),
             self.mirror.len(),
             self.tree.display(),
@@ -373,6 +402,7 @@ impl Controller {
             counts[1],
             counts[2],
             counts[3],
+            counts[4],
             refused.len(),
             if over > 0 {
                 format!(", {over} past the map's capacity (untrusted)")
@@ -456,6 +486,17 @@ mod tests {
     fn the_policy_sets_the_judge() {
         assert_eq!(mode_of(&RulePolicy::builtin()), DEFAULT_MODE);
         assert_eq!(mode_of(&parse("enforce R018\n").unwrap()), mode::DENY);
+        // the coordinator's matrix: an unattested DKMS build let through
+        // (recorded) by every policy but `enforce R018`
+        assert!(unattested_of(&RulePolicy::builtin()));
+        assert!(!unattested_of(&parse("enforce R018\n").unwrap()));
+        for m in ["alert", "audit", "off"] {
+            assert!(
+                unattested_of(&parse(&format!("{m} R018\n")).unwrap()),
+                "{m}"
+            );
+        }
+        assert!(unattested_of(&parse("enforce R011\n").unwrap()));
         for m in ["alert", "audit", "off"] {
             assert_eq!(
                 mode_of(&parse(&format!("{m} R018\n")).unwrap()),
@@ -473,13 +514,23 @@ mod tests {
             desired(),
             Desired {
                 mode: mode::RECORD,
-                opt_outs: BTreeSet::new()
+                opt_outs: BTreeSet::new(),
+                unattested: true,
             }
         );
         assert!(apply_policy(&p, true).is_none());
         assert_eq!(
             desired().opt_outs,
             ["nvidia_drm".to_string()].into_iter().collect()
+        );
+        assert!(apply_policy(&parse("enforce R018\n").unwrap(), true).is_none());
+        assert_eq!(
+            desired(),
+            Desired {
+                mode: mode::DENY,
+                opt_outs: BTreeSet::new(),
+                unattested: false,
+            }
         );
         assert!(apply_policy(&RulePolicy::builtin(), true).is_none());
         assert_eq!(desired(), Desired::default());

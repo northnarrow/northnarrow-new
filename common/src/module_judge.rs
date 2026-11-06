@@ -16,7 +16,11 @@
 //!   so the inode is the kernel's, not a path's text) that a verified
 //!   package installed or DKMS built, unchanged since boot or written since
 //!   inside a package transaction (the write history below), and the files
-//!   a signed opt-out names;
+//!   a signed opt-out names. One more kind is let through but recorded
+//!   ([`trust_flag::UNATTESTED`]): a DKMS or akmods build in its output
+//!   directory, the same content DKMS's registry or the package database
+//!   holds, written since boot outside a recognised package transaction —
+//!   in the map unless the policy enforces R018;
 //! - a buffer (`init_module`) has no file to trust: refused outside a
 //!   signed trusted-installer window.
 //!
@@ -25,7 +29,8 @@
 //! a module file in the running kernel's tree, and of any inode in the
 //! trust map (whatever name it is opened by), marks the inode as written
 //! by a package transaction (the writer, or an ancestor within the
-//! lineage's hops, runs a package manager's image as root) or not. A file
+//! lineage's hops, runs a package manager's image as root — or its `#!`
+//! script, executed by its own file: dnf, yum) or not. A file
 //! created inside a transaction and opened for writing only by it since is
 //! [`write_flag::PKG`]; anything else, or no history at all, is not.
 //!
@@ -71,6 +76,10 @@ pub mod verdict {
     pub const RECORDED: u8 = 4;
     /// Untrusted (or a buffer), refused.
     pub const DENIED: u8 = 5;
+    /// A DKMS or akmods build the registry vouches for, written since boot
+    /// outside a recognised package transaction
+    /// ([`super::trust_flag::UNATTESTED`]): let through, recorded High.
+    pub const UNATTESTED: u8 = 6;
 }
 
 /// Why a file is in the trust map (`ModuleTrust::flags`).
@@ -86,6 +95,17 @@ pub mod trust_flag {
     pub const PKG_WRITTEN: u32 = 4;
     /// Named by a signed per-module opt-out (nothing else trusts it).
     pub const OPT_OUT: u32 = 8;
+    /// In a DKMS or akmods output directory (`updates/dkms/`, `extra/`),
+    /// its content the registry's build (DKMS's own copy, or the digest
+    /// the package database recorded for an akmods-built kmod package),
+    /// written since boot outside a recognised package transaction — a
+    /// build by hand, or one the agent's start did not see (`akmods` at
+    /// boot). Let through and recorded High, not trusted; the agent leaves
+    /// it out of the map when the policy enforces R018 (refused then).
+    /// Nothing else trusts it.
+    pub const UNATTESTED: u32 = 16;
+    /// The flags that let a load through without a record.
+    pub const TRUSTING: u32 = PACKAGE | DKMS | PKG_WRITTEN;
 }
 
 /// The write history of an inode (`MODULE_WRITES`).
@@ -107,6 +127,9 @@ pub const MODULE_PKG_IMAGES_MAX: u32 = 64;
 /// The write histories kept (least recently used evicted: no history, no
 /// trust).
 pub const MODULE_WRITES_MAX: u32 = 8_192;
+/// The processes running a package manager's `#!` script kept (least
+/// recently used evicted: a write of one evicted is no transaction's).
+pub const MODULE_PKG_SCRIPTS_MAX: u32 = 1_024;
 
 /// `inode.i_ctime`'s nanoseconds as the kernel reads them back: from 6.13
 /// the field's high bit tells whether the time was queried
@@ -175,8 +198,9 @@ pub fn finit_verdict(entry: Option<&ModuleTrust>, f: &FileFacts, window: bool, m
         return verdict::NOT_JUDGED;
     }
     match trusted_flags(entry, f) {
-        Some(flags) if flags & !trust_flag::OPT_OUT != 0 => verdict::TRUSTED,
+        Some(flags) if flags & trust_flag::TRUSTING != 0 => verdict::TRUSTED,
         Some(flags) if flags & trust_flag::OPT_OUT != 0 => verdict::OPT_OUT,
+        Some(flags) if flags & trust_flag::UNATTESTED != 0 => verdict::UNATTESTED,
         _ => untrusted(window, mode),
     }
 }
@@ -215,6 +239,7 @@ pub const fn verdict_name(v: u8) -> &'static str {
         verdict::OPT_OUT => "opt-out",
         verdict::RECORDED => "recorded",
         verdict::DENIED => "denied",
+        verdict::UNATTESTED => "dkms-unattested",
         _ => "not-judged",
     }
 }
@@ -431,6 +456,12 @@ mod tests {
             finit_verdict(Some(&both), &f, false, mode::DENY),
             verdict::TRUSTED
         );
+        // an opt-out over an unattested build: the operator's signed choice
+        let over = entry(trust_flag::OPT_OUT | trust_flag::UNATTESTED);
+        assert_eq!(
+            finit_verdict(Some(&over), &f, false, mode::DENY),
+            verdict::OPT_OUT
+        );
         // an entry with no flag trusts nothing
         assert_eq!(
             finit_verdict(Some(&entry(0)), &f, false, mode::DENY),
@@ -466,6 +497,56 @@ mod tests {
         assert_eq!(write_step(None, false, true), TAINT);
         assert!(!written_by_package(None));
         assert!(!written_by_package(Some(TAINT)));
+    }
+
+    /// Named test (lot 285, the coordinator's matrix): a DKMS or akmods
+    /// build the registry vouches for, written since boot outside a
+    /// recognised package transaction, is let through and recorded (its
+    /// own verdict, not "trusted"), in the deny mode too; changed since the
+    /// agent put it in, it is refused like any untrusted file; with no
+    /// entry (the policy enforces R018: the agent leaves it out) refused.
+    #[test]
+    fn a_registered_dkms_build_written_outside_a_transaction_is_allowed_and_recorded() {
+        let f = file();
+        let late = entry(trust_flag::UNATTESTED);
+        assert_eq!(
+            finit_verdict(Some(&late), &f, false, mode::DENY),
+            verdict::UNATTESTED
+        );
+        assert!(!refuses(verdict::UNATTESTED));
+        assert_eq!(
+            finit_verdict(Some(&late), &f, false, mode::RECORD),
+            verdict::UNATTESTED
+        );
+        assert_eq!(
+            finit_verdict(Some(&late), &f, false, mode::NOT_READY),
+            verdict::NOT_JUDGED
+        );
+        let changed = FileFacts { size: 1, ..f };
+        assert_eq!(
+            finit_verdict(Some(&late), &changed, false, mode::DENY),
+            verdict::DENIED
+        );
+        assert_eq!(finit_verdict(None, &f, false, mode::DENY), verdict::DENIED);
+        // a trusting flag beside it: trusted
+        for t in [
+            trust_flag::PACKAGE,
+            trust_flag::DKMS,
+            trust_flag::PKG_WRITTEN,
+        ] {
+            assert_eq!(
+                finit_verdict(
+                    Some(&entry(t | trust_flag::UNATTESTED)),
+                    &f,
+                    false,
+                    mode::DENY
+                ),
+                verdict::TRUSTED,
+                "{t}"
+            );
+        }
+        assert_eq!(trust_flag::TRUSTING & trust_flag::UNATTESTED, 0);
+        assert_eq!(trust_flag::TRUSTING & trust_flag::OPT_OUT, 0);
     }
 
     #[test]
@@ -519,6 +600,7 @@ mod tests {
             verdict::OPT_OUT,
             verdict::RECORDED,
             verdict::DENIED,
+            verdict::UNATTESTED,
         ];
         let names: std::collections::BTreeSet<_> = all.iter().map(|v| verdict_name(*v)).collect();
         assert_eq!(names.len(), all.len());

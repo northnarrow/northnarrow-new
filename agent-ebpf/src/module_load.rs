@@ -59,7 +59,8 @@ use aya_ebpf::{
 
 use northnarrow_common::module_judge::{
     conf_slot, finit_verdict, init_verdict, mode, module_file_name, refuses, write_step, FileFacts,
-    ModuleTrust, MODULE_PKG_IMAGES_MAX, MODULE_TRUST_MAX, MODULE_WRITES_MAX, NAME_TAIL, WALK_HOPS,
+    ModuleTrust, MODULE_PKG_IMAGES_MAX, MODULE_PKG_SCRIPTS_MAX, MODULE_TRUST_MAX,
+    MODULE_WRITES_MAX, NAME_TAIL, WALK_HOPS,
 };
 use northnarrow_common::wire::{
     InodeKey, ModuleLoadRaw, MODULE_LOAD_FINIT, MODULE_LOAD_INIT, MODULE_PATH_TOO_DEEP,
@@ -122,6 +123,19 @@ pub static MODULE_TRUST: HashMap<InodeKey, ModuleTrust> =
 #[map]
 pub static MODULE_PKG_IMAGES: HashMap<InodeKey, u32> =
     HashMap::with_max_entries(MODULE_PKG_IMAGES_MAX, 0);
+
+/// Lot 285 (the coordinator's matrix): the processes whose last exec ran a
+/// package manager's `#!` script by its own file — `/usr/bin/dnf`,
+/// `dnf-3`, `yum`, Python programs whose image (`mm->exe_file`) is the
+/// interpreter's — by thread group, with the `mm` that exec made: the
+/// write history's lineage counts such a process as a package manager
+/// while that image runs ([`nn_module_note_exec`], from
+/// `sched_process_exec`, with the file the exec sensor's first binfmt pass
+/// read). An exec of the interpreter itself (`python3 /usr/bin/dnf`) is
+/// not one.
+#[map]
+pub static MODULE_PKG_SCRIPTS: LruHashMap<u32, u64> =
+    LruHashMap::with_max_entries(MODULE_PKG_SCRIPTS_MAX, 0);
 
 /// Lot 285: the write history of the module files in the running kernel's
 /// tree and of the inodes in [`MODULE_TRUST`] (`module_judge::write_flag`).
@@ -569,7 +583,8 @@ unsafe fn under_tree(leaf: *const u8) -> bool {
 
 /// Lot 285: 1 when the current task runs as root and it, or an ancestor
 /// within [`WALK_HOPS`], runs a package manager's image
-/// ([`MODULE_PKG_IMAGES`]): a write inside a package transaction, read in
+/// ([`MODULE_PKG_IMAGES`]), or a package manager's `#!` script
+/// ([`MODULE_PKG_SCRIPTS`]): a write inside a package transaction, read in
 /// the kernel at the write — no exit can race it. A global function.
 #[no_mangle]
 #[inline(never)]
@@ -599,6 +614,13 @@ unsafe fn pkg_lineage(task: *const u8) -> bool {
                     }
                 }
             }
+            // a package manager's `#!` script, its image the interpreter's
+            let tgid = peek_u32(t.add(off!(TASK_STRUCT_TGID_OFFSET)));
+            if let Some(m) = MODULE_PKG_SCRIPTS.get(&tgid) {
+                if *m == mm as u64 {
+                    return true;
+                }
+            }
         }
         let up = peek_u64(t.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
         if up.is_null() || up == t || peek_u32(up.add(off!(TASK_STRUCT_TGID_OFFSET))) <= 1 {
@@ -607,4 +629,35 @@ unsafe fn pkg_lineage(task: *const u8) -> bool {
         t = up;
     }
     false
+}
+
+/// Lot 285 (the coordinator's matrix): after a successful exec
+/// (`sched_process_exec`), `dev`/`ino` the file the exec named (the exec
+/// sensor's first binfmt pass, `bprm->file`: a `#!` script's own file, not
+/// its interpreter): when it is a package manager's ([`MODULE_PKG_IMAGES`],
+/// the agent's `(dev, ino)` of `/usr/bin/dnf`, `dnf-3`, `yum`, …), the
+/// task's thread group is noted with its new `mm` ([`MODULE_PKG_SCRIPTS`]).
+/// A global function (scalars only): the verifier checks it once, on its
+/// own. 1 when noted.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_module_note_exec(task: u64, dev: u64, ino: u64) -> u64 {
+    unsafe { note_exec(task as *const u8, dev, ino) }
+}
+
+#[inline(always)]
+unsafe fn note_exec(task: *const u8, dev: u64, ino: u64) -> u64 {
+    if task.is_null() || (dev == 0 && ino == 0) {
+        return 0;
+    }
+    if MODULE_PKG_IMAGES.get(&InodeKey { dev, ino }).is_none() {
+        return 0;
+    }
+    let tgid = peek_u32(task.add(off!(TASK_STRUCT_TGID_OFFSET)));
+    let mm = peek_u64(task.add(off!(TASK_STRUCT_MM_OFFSET)));
+    if mm == 0 {
+        return 0;
+    }
+    let _ = MODULE_PKG_SCRIPTS.insert(&tgid, &mm, 0);
+    1
 }

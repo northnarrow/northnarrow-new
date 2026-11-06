@@ -20,7 +20,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   signed `module-allow <module>` line (new rule-policy directive). The
   policy's mode of R018 sets the kernel's: none or `enforce` refuses,
   `alert`/`audit`/`off` records. `ModuleLoadRaw` carries the kernel's
-  verdict and the file's identity (632 bytes, was 584).
+  verdict and the file's identity (632 bytes, was 584). GPU and DKMS hosts
+  (the coordinator's matrix): a DKMS build is DKMS's when its content is,
+  byte for byte, the build DKMS registered for the running kernel; one in
+  `updates/dkms/` or `extra/` (or an akmods `kmod-*` package's file there)
+  written since boot outside a recognised package transaction is let
+  through and recorded High (verdict `dkms-unattested`) unless the policy
+  enforces R018; a file there nothing vouches for is refused. dnf's and
+  yum's Python scripts count as package managers by the file their exec
+  named (a new map, `MODULE_PKG_SCRIPTS`, noted at `sched_process_exec`);
+  `dnf5` joins the judge's package managers.
 - NN-L-FIM-026 (lot 285): a write in kmod's configuration directories
   (`/etc`, `/run`, `/usr/local/lib`, `/lib`, `/usr/lib` `modprobe.d`) is a
   High record outside a package transaction, Low inside one; the four

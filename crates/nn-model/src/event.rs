@@ -1482,6 +1482,10 @@ pub enum ModuleLoadVerdict {
     Recorded,
     /// Untrusted (or a buffer), refused.
     Denied,
+    /// A DKMS or akmods build its registry vouches for, written since boot
+    /// outside a recognised package transaction: let through by the
+    /// default policy, recorded (`common::module_judge::trust_flag::UNATTESTED`).
+    DkmsUnattested,
 }
 
 impl ModuleLoadVerdict {
@@ -1493,6 +1497,7 @@ impl ModuleLoadVerdict {
             w::OPT_OUT => Self::OptOut,
             w::RECORDED => Self::Recorded,
             w::DENIED => Self::Denied,
+            w::UNATTESTED => Self::DkmsUnattested,
             _ => Self::NotJudged,
         }
     }

@@ -7,8 +7,9 @@
 //! - unchanged since boot (its change time before the boot's) and a
 //!   verified package's — listed by the package database with the digest
 //!   the database recorded, read from the file (dpkg's `md5sums`, rpm's
-//!   file digests) — or DKMS's build (in DKMS's install directory, for a
-//!   module DKMS registered for this kernel);
+//!   file digests) — or DKMS's build (in a DKMS or akmods output
+//!   directory, the same content as DKMS's own copy of a module it
+//!   registered for this kernel, [`dkms_registered`]);
 //! - or changed since boot, and written inside a package transaction: the
 //!   kernel's write history of the inode says a package manager's lineage
 //!   created it and nothing else opened it for writing since
@@ -16,10 +17,20 @@
 //!   above;
 //! - or named by a signed per-module opt-out (`module-allow <module>`).
 //!
-//! The answer per file is cached by `(dev, ino, ctime, size)`: a file
+//! The coordinator's matrix (lot 285) adds one kind, let through but
+//! recorded, never trusted ([`trust_flag::UNATTESTED`]): a file of a DKMS or
+//! akmods output directory that a package or DKMS's registry vouches for as
+//! above, but changed since boot outside a recognised package transaction
+//! (built by hand, or before the agent started: `akmods` at boot) — in the
+//! map unless the policy enforces R018 ([`Inputs::unattested`]). Anywhere
+//! else in the tree such a file is refused, and a file of those directories
+//! nothing vouches for is refused.
+//!
+//! What vouches for a file is cached by `(dev, ino, ctime, size)`: a file
 //! hashed once is not hashed again until it changes.
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -121,6 +132,10 @@ pub struct Inputs<'a> {
     pub dkms_registry: &'a Path,
     /// The signed per-module opt-outs (module names, `_` for `-`).
     pub opt_outs: &'a BTreeSet<String>,
+    /// A DKMS or akmods build written since boot outside a recognised
+    /// package transaction is let through and recorded
+    /// ([`trust_flag::UNATTESTED`]): every policy but `enforce R018`.
+    pub unattested: bool,
 }
 
 /// Why a file is not trusted.
@@ -129,16 +144,45 @@ pub const NOT_SAFE: &str =
 pub const CHANGED_SINCE_BOOT: &str = "changed since boot outside a package transaction (the \
                                       kernel's write history of the file does not show one)";
 pub const UNVOUCHED: &str = "no verified package or DKMS build vouches for it";
+pub const UNATTESTED_ENFORCED: &str = "a DKMS or akmods build its registry vouches for, written \
+                                       since boot outside a recognised package transaction: \
+                                       refused while the policy enforces R018";
+
+/// What vouches for the content of `f`: [`trust_flag::PACKAGE`] (a
+/// verified package's file: `packaged` reads it and compares the database's
+/// digest), else [`trust_flag::DKMS`] (in a DKMS or akmods output directory,
+/// the same content as DKMS's copy of a module it registered for this
+/// kernel), else 0. The controller caches it by the file's identity and
+/// change stamp.
+pub fn vouched_by(
+    f: &TreeFile,
+    inputs: &Inputs<'_>,
+    packaged: impl FnOnce(&TreeFile) -> bool,
+) -> u32 {
+    if packaged(f) {
+        return trust_flag::PACKAGE;
+    }
+    let name = f.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let registered = in_dkms_dir(inputs.tree, &f.path)
+        && module_name_of(name)
+            .is_some_and(|m| dkms_registered(inputs.dkms_registry, inputs.release, &m, &f.path));
+    if registered {
+        trust_flag::DKMS
+    } else {
+        0
+    }
+}
 
 /// The trust flags of `f` (`common::module_judge::trust_flag`), or why it
 /// is not trusted. `history` is the kernel's write history of the inode;
-/// `packaged` answers whether a verified package's file it is (its
-/// content read, the digest compared).
+/// `vouch` answers what vouches for its content ([`vouched_by`]: a verified
+/// package, DKMS's registry, nothing) — asked only of a file whose answer
+/// can change the verdict.
 pub fn classify(
     f: &TreeFile,
     inputs: &Inputs<'_>,
     history: Option<u32>,
-    packaged: &mut dyn FnMut(&TreeFile) -> bool,
+    vouch: &mut dyn FnMut(&TreeFile) -> u32,
 ) -> Result<u32, &'static str> {
     if !safe_owner(&f.facts) {
         return Err(NOT_SAFE);
@@ -147,26 +191,33 @@ pub fn classify(
     let module = module_name_of(name);
     let since_boot = f.facts.ctime_sec >= inputs.boot_sec;
     let pkg_written = written_by_package(history);
+    let attested = !since_boot || pkg_written;
+    let dkms_dir = in_dkms_dir(inputs.tree, &f.path);
+    let by = if attested || dkms_dir {
+        vouch(f) & (trust_flag::PACKAGE | trust_flag::DKMS)
+    } else {
+        0
+    };
     let mut flags = 0u32;
-    if !since_boot || pkg_written {
-        if packaged(f) {
-            flags |= trust_flag::PACKAGE;
-        } else if module.as_deref().is_some_and(|m| {
-            in_dkms_dir(inputs.tree, &f.path)
-                && dkms_registered(inputs.dkms_registry, inputs.release, m)
-        }) {
-            flags |= trust_flag::DKMS;
-        }
-        if since_boot && flags != 0 {
+    if attested && by != 0 {
+        flags = by;
+        if since_boot {
             flags |= trust_flag::PKG_WRITTEN;
         }
     }
+    // the coordinator's matrix: a registered build of a DKMS or akmods
+    // output directory, written outside a recognised transaction
+    let late = !attested && dkms_dir && by != 0;
     if flags == 0 && module.is_some_and(|m| inputs.opt_outs.contains(&m)) {
         flags = trust_flag::OPT_OUT;
+    } else if flags == 0 && late && inputs.unattested {
+        flags = trust_flag::UNATTESTED;
     }
     if flags != 0 {
         Ok(flags)
-    } else if since_boot && !pkg_written {
+    } else if late {
+        Err(UNATTESTED_ENFORCED)
+    } else if !attested {
         Err(CHANGED_SINCE_BOOT)
     } else {
         Err(UNVOUCHED)
@@ -182,10 +233,15 @@ pub fn in_dkms_dir(tree: &Path, path: &Path) -> bool {
     rel.starts_with("updates/dkms") || rel.starts_with("extra")
 }
 
-/// DKMS registered module `module` (kmod's spelling) for `release`: a
-/// `<registry>/<package>/<version>/<release>/<arch>/module/` directory of
-/// it holds a file of that module.
-pub fn dkms_registered(registry: &Path, release: &str, module: &str) -> bool {
+/// DKMS registered module `module` (kmod's spelling) for `release`, built
+/// as the file `file` holds it: a
+/// `<registry>/<package>/<version>/<release>/<arch>/module/` directory
+/// holds a file of that module with the same content (DKMS installs its
+/// own copy, compressed and signed there).
+pub fn dkms_registered(registry: &Path, release: &str, module: &str, file: &Path) -> bool {
+    let Ok(want) = std::fs::metadata(file) else {
+        return false;
+    };
     let dirs = |p: &Path| -> Vec<PathBuf> {
         std::fs::read_dir(p)
             .map(|rd| {
@@ -208,6 +264,7 @@ pub fn dkms_registered(registry: &Path, release: &str, module: &str) -> bool {
                         .to_str()
                         .and_then(module_name_of)
                         .is_some_and(|m| m == module)
+                        && same_content(&e.path(), file, want.len())
                 }) {
                     return true;
                 }
@@ -215,6 +272,36 @@ pub fn dkms_registered(registry: &Path, release: &str, module: &str) -> bool {
         }
     }
     false
+}
+
+/// `a` (a regular file, symbolic links not followed) holds exactly the
+/// `len` bytes `b` holds.
+pub fn same_content(a: &Path, b: &Path, len: u64) -> bool {
+    let Ok(m) = std::fs::symlink_metadata(a) else {
+        return false;
+    };
+    if !m.is_file() || m.len() != len {
+        return false;
+    }
+    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    let mut ba = vec![0u8; 64 * 1024];
+    let mut bb = vec![0u8; 64 * 1024];
+    let mut seen = 0u64;
+    loop {
+        let Ok(n) = fa.read(&mut ba) else {
+            return false;
+        };
+        if n == 0 {
+            // b ends here too
+            return seen == len && matches!(fb.read(&mut bb[..1]), Ok(0));
+        }
+        if fb.read_exact(&mut bb[..n]).is_err() || ba[..n] != bb[..n] {
+            return false;
+        }
+        seen += n as u64;
+    }
 }
 
 /// The boot's time from `/proc/stat` (`btime`).
@@ -225,15 +312,16 @@ pub fn boot_time(proc_stat: &str) -> Option<i64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
-/// The package answers cached by the file's identity and change stamp.
+/// What vouches for a file ([`vouched_by`]), cached by the file's identity
+/// and change stamp.
 #[derive(Default)]
 pub struct PackagedCache {
-    seen: HashMap<(InodeKey, i64, u32, i64), bool>,
+    seen: HashMap<(InodeKey, i64, u32, i64), u32>,
 }
 
 impl PackagedCache {
     /// `ask` once per `(dev, ino, ctime, size)`.
-    pub fn get(&mut self, f: &TreeFile, ask: impl FnOnce(&TreeFile) -> bool) -> bool {
+    pub fn get(&mut self, f: &TreeFile, ask: impl FnOnce(&TreeFile) -> u32) -> u32 {
         let k = (f.key, f.facts.ctime_sec, f.facts.ctime_nsec, f.facts.size);
         if let Some(v) = self.seen.get(&k) {
             return *v;
@@ -375,7 +463,14 @@ mod tests {
             boot_sec,
             dkms_registry: &fx.registry,
             opt_outs: opt,
+            unattested: true,
         }
+    }
+
+    /// What vouches for a file as the agent asks it: no package, DKMS's
+    /// registry read.
+    fn registry<'a>(inputs: &'a Inputs<'a>) -> impl FnMut(&TreeFile) -> u32 + 'a {
+        move |f| vouched_by(f, inputs, |_| false)
     }
 
     /// The file's change time is now: a boot an hour later makes it older
@@ -408,12 +503,12 @@ mod tests {
         files: &[TreeFile],
         inputs: &Inputs<'_>,
         writes: &HashMap<InodeKey, u32>,
-        packaged: &mut dyn FnMut(&TreeFile) -> bool,
+        vouch: &mut dyn FnMut(&TreeFile) -> u32,
     ) -> HashMap<InodeKey, ModuleTrust> {
         files
             .iter()
             .filter_map(|f| {
-                classify(f, inputs, writes.get(&f.key).copied(), packaged)
+                classify(f, inputs, writes.get(&f.key).copied(), vouch)
                     .ok()
                     .map(|fl| (f.key, entry(f, fl)))
             })
@@ -454,7 +549,7 @@ mod tests {
             &files,
             &inputs(&fx, after_files(), &opt),
             &HashMap::new(),
-            &mut |_| true,
+            &mut |_| trust_flag::PACKAGE,
         );
         let o = file(&orig);
         assert_eq!(
@@ -490,12 +585,14 @@ mod tests {
         let f = file(&p);
         // older than the boot, packaged: trusted
         assert_eq!(
-            classify(&f, &inputs(&fx, after_files(), &opt), None, &mut |_| true),
+            classify(&f, &inputs(&fx, after_files(), &opt), None, &mut |_| {
+                trust_flag::PACKAGE
+            }),
             Ok(trust_flag::PACKAGE)
         );
         // a package's digest that no longer matches: not
         assert_eq!(
-            classify(&f, &inputs(&fx, after_files(), &opt), None, &mut |_| false),
+            classify(&f, &inputs(&fx, after_files(), &opt), None, &mut |_| 0),
             Err(UNVOUCHED)
         );
         // changed since boot, no history (or a tainted one): not
@@ -505,7 +602,9 @@ mod tests {
             Some(write_flag::PKG | write_flag::TAINT),
         ] {
             assert_eq!(
-                classify(&f, &inputs(&fx, before_files(), &opt), h, &mut |_| true),
+                classify(&f, &inputs(&fx, before_files(), &opt), h, &mut |_| {
+                    trust_flag::PACKAGE
+                }),
                 Err(CHANGED_SINCE_BOOT),
                 "{h:?}"
             );
@@ -528,7 +627,7 @@ mod tests {
         loose.facts.mode |= 0o002;
         assert_eq!(
             classify(&loose, &inputs(&fx, after_files(), &opt), None, &mut |_| {
-                true
+                trust_flag::PACKAGE
             }),
             Err(NOT_SAFE)
         );
@@ -539,7 +638,7 @@ mod tests {
                 &theirs,
                 &inputs(&fx, after_files(), &opt),
                 None,
-                &mut |_| true
+                &mut |_| trust_flag::PACKAGE
             ),
             Err(NOT_SAFE)
         );
@@ -566,31 +665,36 @@ mod tests {
         let f = file(&p);
         let since = inputs(&fx, before_files(), &opt);
         let created_in_tx = write_step(None, true, true);
-        let flags = classify(&f, &since, Some(created_in_tx), &mut |_| false).unwrap();
+        let flags = classify(&f, &since, Some(created_in_tx), &mut registry(&since)).unwrap();
         assert_eq!(flags, trust_flag::DKMS | trust_flag::PKG_WRITTEN);
         let mut writes = HashMap::new();
         writes.insert(f.key, created_in_tx);
-        let map = trust_map(std::slice::from_ref(&f), &since, &writes, &mut |_| false);
+        let map = trust_map(
+            std::slice::from_ref(&f),
+            &since,
+            &writes,
+            &mut registry(&since),
+        );
         assert_eq!(
             finit_verdict(map.get(&f.key), &f.facts, false, mode::DENY),
             verdict::TRUSTED
         );
-        // built by hand: a root shell's `dkms install`
+        // built by hand (a root shell's `dkms install`), or rewritten by
+        // hand after the transaction: not trusted — the coordinator's
+        // matrix lets it through, recorded (its own test below)
         let by_hand = write_step(None, true, false);
-        assert_eq!(
-            classify(&f, &since, Some(by_hand), &mut |_| false),
-            Err(CHANGED_SINCE_BOOT)
-        );
-        // rewritten by hand after the transaction
         let after = write_step(Some(created_in_tx), false, false);
-        assert_eq!(
-            classify(&f, &since, Some(after), &mut |_| false),
-            Err(CHANGED_SINCE_BOOT)
-        );
+        for h in [by_hand, after] {
+            assert_eq!(
+                classify(&f, &since, Some(h), &mut registry(&since)),
+                Ok(trust_flag::UNATTESTED),
+                "{h}"
+            );
+        }
         // older than the boot: DKMS's registered build for this kernel
         let before = inputs(&fx, after_files(), &opt);
         assert_eq!(
-            classify(&f, &before, None, &mut |_| false),
+            classify(&f, &before, None, &mut registry(&before)),
             Ok(trust_flag::DKMS)
         );
         // DKMS registered another module for this kernel, not this one
@@ -604,13 +708,9 @@ mod tests {
             .join("x86_64/module");
         std::fs::create_dir_all(&reg2).unwrap();
         put(&reg2.join("zfs.ko.zst"), b"zfs");
+        let in2 = inputs(&fx2, after_files(), &opt);
         assert_eq!(
-            classify(
-                &file(&p2),
-                &inputs(&fx2, after_files(), &opt),
-                None,
-                &mut |_| false
-            ),
+            classify(&file(&p2), &in2, None, &mut registry(&in2)),
             Err(UNVOUCHED)
         );
         // not registered for this kernel: nothing vouches for it
@@ -618,20 +718,220 @@ mod tests {
             release: "6.8.0-other",
             ..inputs(&fx, after_files(), &opt)
         };
-        assert_eq!(classify(&f, &other, None, &mut |_| false), Err(UNVOUCHED));
+        assert_eq!(
+            classify(&f, &other, None, &mut registry(&other)),
+            Err(UNVOUCHED)
+        );
         // a file of DKMS's name outside DKMS's directory: not DKMS's
         let q = fx.tree.join("kernel/net/vboxdrv.ko.zst");
         put(&q, b"vbox");
         // written in a transaction since boot, but no package's and not
         // DKMS's: nothing vouches for it (not "changed outside one")
         assert_eq!(
-            classify(&file(&q), &since, Some(created_in_tx), &mut |_| false),
+            classify(
+                &file(&q),
+                &since,
+                Some(created_in_tx),
+                &mut registry(&since)
+            ),
             Err(UNVOUCHED)
         );
         assert_eq!(
-            classify(&file(&q), &before, None, &mut |_| false),
+            classify(&file(&q), &before, None, &mut registry(&before)),
             Err(UNVOUCHED)
         );
+    }
+
+    /// A DKMS registry fixture: `module`'s build for [`REL`] holding
+    /// `content`.
+    fn register(fx: &Fixture, package: &str, module_file: &str, content: &[u8]) {
+        let reg = fx
+            .registry
+            .join(package)
+            .join("1.0")
+            .join(REL)
+            .join("x86_64/module");
+        std::fs::create_dir_all(&reg).unwrap();
+        put(&reg.join(module_file), content);
+    }
+
+    /// Named test (lot 285, the coordinator's matrix): a file of a DKMS
+    /// output directory whose content is DKMS's registered build, written
+    /// since boot outside a recognised package transaction (a hand
+    /// rebuild, or before the agent started), is let through and recorded
+    /// under the default policy; under `enforce R018` it is left out of
+    /// the map and refused. An akmods build (`extra/`, the content the
+    /// package database recorded) is the same; a packaged file anywhere
+    /// else in the tree changed outside a transaction is refused.
+    #[test]
+    fn a_registered_dkms_build_written_after_boot_outside_a_transaction_is_allowed_and_recorded() {
+        let fx = fixture();
+        let p = fx.tree.join("updates/dkms/zfs.ko.zst");
+        put(&p, b"zfs build");
+        register(&fx, "zfs", "zfs.ko.zst", b"zfs build");
+        let opt = BTreeSet::new();
+        let f = file(&p);
+        let default = inputs(&fx, before_files(), &opt);
+        for h in [
+            None,
+            Some(write_flag::TAINT),
+            Some(write_flag::PKG | write_flag::TAINT),
+        ] {
+            assert_eq!(
+                classify(&f, &default, h, &mut registry(&default)),
+                Ok(trust_flag::UNATTESTED),
+                "{h:?}"
+            );
+        }
+        let map = trust_map(
+            std::slice::from_ref(&f),
+            &default,
+            &HashMap::new(),
+            &mut registry(&default),
+        );
+        let v = finit_verdict(map.get(&f.key), &f.facts, false, mode::DENY);
+        assert_eq!(v, verdict::UNATTESTED);
+        assert!(!common::module_judge::refuses(v));
+        // `enforce R018`: left out of the map, refused
+        let enforce = Inputs {
+            unattested: false,
+            ..inputs(&fx, before_files(), &opt)
+        };
+        assert_eq!(
+            classify(&f, &enforce, None, &mut registry(&enforce)),
+            Err(UNATTESTED_ENFORCED)
+        );
+        let map = trust_map(
+            std::slice::from_ref(&f),
+            &enforce,
+            &HashMap::new(),
+            &mut registry(&enforce),
+        );
+        assert_eq!(
+            finit_verdict(map.get(&f.key), &f.facts, false, mode::DENY),
+            verdict::DENIED
+        );
+        // a signed opt-out over it: the operator's choice
+        let named: BTreeSet<String> = ["zfs".to_string()].into();
+        let opted = inputs(&fx, before_files(), &named);
+        assert_eq!(
+            classify(&f, &opted, None, &mut registry(&opted)),
+            Ok(trust_flag::OPT_OUT)
+        );
+        // akmods: a kmod package's file in `extra/`, vouched for by the
+        // package database, written since boot without a transaction seen
+        let k = fx.tree.join("extra/nvidia/nvidia.ko.xz");
+        std::fs::create_dir_all(k.parent().unwrap()).unwrap();
+        put(&k, b"kmod-nvidia");
+        assert_eq!(
+            classify(&file(&k), &default, None, &mut |_| trust_flag::PACKAGE),
+            Ok(trust_flag::UNATTESTED)
+        );
+        assert_eq!(
+            classify(&file(&k), &enforce, None, &mut |_| trust_flag::PACKAGE),
+            Err(UNATTESTED_ENFORCED)
+        );
+        // the same outside a DKMS or akmods directory: refused
+        let t = fx.tree.join("kernel/net/tls.ko.zst");
+        put(&t, b"tls");
+        assert_eq!(
+            classify(&file(&t), &default, None, &mut |_| trust_flag::PACKAGE),
+            Err(CHANGED_SINCE_BOOT)
+        );
+    }
+
+    /// Named test (lot 285, the coordinator's matrix): a file of a DKMS
+    /// output directory nothing vouches for — no registered build of its
+    /// module, or a registered name whose build holds other content — is
+    /// refused, written before or after boot; an in-tree file that fails
+    /// the package check outside those directories is refused.
+    #[test]
+    fn a_file_in_a_dkms_location_nothing_vouches_for_is_denied() {
+        let fx = fixture();
+        let p = fx.tree.join("updates/dkms/vboxdrv.ko");
+        put(&p, b"a rootkit under vboxdrv's name");
+        register(&fx, "virtualbox", "vboxdrv.ko", b"virtualbox's build");
+        let opt = BTreeSet::new();
+        let f = file(&p);
+        let since = inputs(&fx, before_files(), &opt);
+        let before = inputs(&fx, after_files(), &opt);
+        assert_eq!(registry(&since)(&f), 0);
+        assert_eq!(
+            classify(&f, &since, None, &mut registry(&since)),
+            Err(CHANGED_SINCE_BOOT)
+        );
+        assert_eq!(
+            classify(&f, &before, None, &mut registry(&before)),
+            Err(UNVOUCHED)
+        );
+        // in a package transaction, still nothing vouches for it
+        assert_eq!(
+            classify(
+                &f,
+                &since,
+                Some(write_step(None, true, true)),
+                &mut registry(&since)
+            ),
+            Err(UNVOUCHED)
+        );
+        // not registered at all
+        let q = fx.tree.join("extra/rk.ko");
+        std::fs::create_dir_all(q.parent().unwrap()).unwrap();
+        put(&q, b"rk");
+        assert_eq!(
+            classify(&file(&q), &since, None, &mut registry(&since)),
+            Err(CHANGED_SINCE_BOOT)
+        );
+        // in the tree, the package check failed, before boot
+        let t = fx.tree.join("kernel/net/tls.ko.zst");
+        put(&t, b"tls");
+        assert_eq!(
+            classify(&file(&t), &before, None, &mut |_| 0),
+            Err(UNVOUCHED)
+        );
+        // the registry's build with the same content: DKMS's
+        register(
+            &fx,
+            "virtualbox",
+            "vboxdrv.ko",
+            b"a rootkit under vboxdrv's name",
+        );
+        assert_eq!(registry(&before)(&f), trust_flag::DKMS);
+    }
+
+    #[test]
+    fn the_registry_build_is_compared_byte_for_byte() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        let b = d.path().join("b");
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&a, &big).unwrap();
+        std::fs::write(&b, &big).unwrap();
+        assert!(same_content(&a, &b, big.len() as u64));
+        let mut other = big.clone();
+        other[150_000] ^= 1;
+        std::fs::write(&b, &other).unwrap();
+        assert!(!same_content(&a, &b, big.len() as u64));
+        // b longer than the length its metadata gave
+        let mut longer = big.clone();
+        longer.push(0);
+        std::fs::write(&b, &longer).unwrap();
+        assert!(!same_content(&a, &b, big.len() as u64));
+        // a of another length
+        assert!(!same_content(&a, &b, big.len() as u64 + 1));
+        // a symbolic link is no build
+        let l = d.path().join("l");
+        std::os::unix::fs::symlink(&b, &l).unwrap();
+        std::fs::write(&b, &big).unwrap();
+        assert!(same_content(&a, &b, big.len() as u64));
+        assert!(!same_content(&l, &b, big.len() as u64));
+        assert!(!same_content(&d.path().join("missing"), &b, 1));
+        // empty files
+        let e1 = d.path().join("e1");
+        let e2 = d.path().join("e2");
+        std::fs::write(&e1, b"").unwrap();
+        std::fs::write(&e2, b"").unwrap();
+        assert!(same_content(&e1, &e2, 0));
     }
 
     /// Named test (lot 285, the scan's half): a signed opt-out by module
@@ -645,13 +945,11 @@ mod tests {
         let f = file(&p);
         let none = BTreeSet::new();
         assert_eq!(
-            classify(&f, &inputs(&fx, before_files(), &none), None, &mut |_| {
-                false
-            }),
+            classify(&f, &inputs(&fx, before_files(), &none), None, &mut |_| 0),
             Err(CHANGED_SINCE_BOOT)
         );
         let opt: BTreeSet<String> = ["nvidia_drm".to_string()].into();
-        let flags = classify(&f, &inputs(&fx, before_files(), &opt), None, &mut |_| false).unwrap();
+        let flags = classify(&f, &inputs(&fx, before_files(), &opt), None, &mut |_| 0).unwrap();
         assert_eq!(flags, trust_flag::OPT_OUT);
         assert_eq!(
             finit_verdict(Some(&entry(&f, flags)), &f.facts, false, mode::DENY),
@@ -660,26 +958,18 @@ mod tests {
         let mut loose = f.clone();
         loose.facts.mode |= 0o020;
         assert_eq!(
-            classify(
-                &loose,
-                &inputs(&fx, before_files(), &opt),
-                None,
-                &mut |_| false
-            ),
+            classify(&loose, &inputs(&fx, before_files(), &opt), None, &mut |_| 0),
             Err(NOT_SAFE)
         );
         // another module's opt-out is not this one's
         let other: BTreeSet<String> = ["nvidia".to_string()].into();
-        assert!(
-            classify(&f, &inputs(&fx, before_files(), &other), None, &mut |_| {
-                false
-            })
-            .is_err()
-        );
+        assert!(classify(&f, &inputs(&fx, before_files(), &other), None, &mut |_| 0).is_err());
         // a file something else vouches for is not the opt-out's (its loads
         // are not the opt-out's records)
         assert_eq!(
-            classify(&f, &inputs(&fx, after_files(), &opt), None, &mut |_| true),
+            classify(&f, &inputs(&fx, after_files(), &opt), None, &mut |_| {
+                trust_flag::PACKAGE
+            }),
             Ok(trust_flag::PACKAGE)
         );
     }
@@ -692,21 +982,27 @@ mod tests {
         let mut cache = PackagedCache::default();
         let mut asked = 0;
         let f = file(&p);
-        assert!(cache.get(&f, |_| {
-            asked += 1;
-            true
-        }));
-        assert!(cache.get(&f, |_| {
-            asked += 1;
-            false
-        }));
+        assert_eq!(
+            cache.get(&f, |_| {
+                asked += 1;
+                trust_flag::PACKAGE
+            }),
+            trust_flag::PACKAGE
+        );
+        assert_eq!(
+            cache.get(&f, |_| {
+                asked += 1;
+                0
+            }),
+            trust_flag::PACKAGE
+        );
         assert_eq!(asked, 1);
         let mut changed = f.clone();
         changed.facts.size += 1;
-        assert!(!cache.get(&changed, |_| false));
+        assert_eq!(cache.get(&changed, |_| trust_flag::DKMS), trust_flag::DKMS);
         let keep = std::collections::HashSet::new();
         cache.retain(&keep);
-        assert!(!cache.get(&f, |_| false));
+        assert_eq!(cache.get(&f, |_| 0), 0);
     }
 
     #[test]

@@ -692,16 +692,37 @@ others. What an operator sees change:
   transaction wrote since boot, or that a signed `module-allow <module>`
   names. Who loads does not matter: `modprobe`, `udev`, a service, a
   process of its own.
-- **Before the upgrade, list what would be refused.** A DKMS module built
-  outside a package transaction (a root shell's `dkms install`, a vendor's
-  `.run` installer), a module copied into `/lib/modules` by hand (`make
-  modules_install`) is untrusted. After the upgrade the agent names each
-  such file in its journal at its start (`module-load judge: a module file
-  NOT trusted`, with why); a DKMS build DKMS registered for the running
-  kernel, made before this boot, is trusted (until it is rebuilt by hand). Sign a `module-allow <module>` for each module the
-  host needs, or put the deny off for the time being with a signed
-  `alert R018_KernelModuleLoad` (the record mode: every untrusted load
-  let through and recorded High).
+- **GPU and DKMS hosts keep loading their modules** (the coordinator's
+  matrix, `RULE_POLICY.md` §2.4). A DKMS build in `updates/dkms/`, or an
+  akmods `kmod-*` package's file in `extra/`, whose content is the build
+  DKMS registered for the running kernel (compared byte for byte with
+  `/var/lib/dkms/…/module/`) or the digest the package database recorded,
+  is trusted when it was written before this boot or inside a package
+  transaction (`apt`, `dpkg`, `rpm`, `dnf`, `dnf5`, `yum`: dnf's and yum's
+  Python script recognised by the file their exec named). Written since
+  boot outside one — a root shell's `dkms install`, `akmods` at boot
+  before the agent started — it is **let through and recorded High**
+  (`R018`, "let through by the default policy"); with a signed
+  `enforce R018_KernelModuleLoad` it is refused. **A file in those
+  directories that DKMS's registry and the packages do not vouch for is
+  refused**, like a file outside the tree, a copy, a buffer, and a
+  packaged file elsewhere in the tree changed since boot outside a
+  transaction.
+- **Before the upgrade, list what would be refused.** A module copied into
+  `/lib/modules` by hand (`make modules_install`), a vendor's `.run`
+  installer's module (not DKMS-registered), a file of `updates/dkms/` or
+  `extra/` that is not the registered build: untrusted, refused. After the
+  upgrade the agent names each such file in its journal at its start
+  (`module-load judge: a module file NOT trusted`, with why); the summary
+  line counts the DKMS or akmods builds let through and recorded. Sign a
+  `module-allow <module>` for each module the host needs, or put the deny
+  off for the time being with a signed `alert R018_KernelModuleLoad` (the
+  record mode: every untrusted load let through and recorded High).
+- **Residual, by design**: root who writes a module file into a DKMS
+  output directory AND registers the same content in DKMS's state
+  (`/var/lib/dkms/<package>/<version>/<release>/<arch>/module/`) gets a
+  High record, not a refusal, unless the policy enforces R018. Hosts with
+  no DKMS or akmods modules lose nothing by `enforce R018_KernelModuleLoad`.
 - **What the boot loads before the agent starts is not judged** (the
   initramfs, `systemd-modules-load`, udev's first pass). From the agent's
   start until its trust map is filled (the first seconds) nothing is judged

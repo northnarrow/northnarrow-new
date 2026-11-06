@@ -561,26 +561,54 @@ never who loads it:
   and size), and:
   - unchanged since boot and a **verified package's** (dpkg's `md5sums`,
     rpm's file digests, compared with the file's content) or **DKMS's
-    build** (in `updates/dkms/` or `extra/`, of a module DKMS registered for
-    this kernel); or
+    build** (in a DKMS or akmods output directory — `updates/dkms/`,
+    `extra/` — the same content, byte for byte, as DKMS's own copy of a
+    module it registered for this kernel,
+    `/var/lib/dkms/<package>/<version>/<release>/<arch>/module/`); or
   - written since boot **inside a package transaction**: the kernel keeps
     the write history of every module file of the tree — created by a
-    process with a package manager's image (`dpkg`, `rpm`, `apt`, …) in its
-    lineage, run as root, and opened for writing by nothing else since. A
-    DKMS build under `apt install …-dkms` is one;
+    process with a package manager in its lineage, run as root, and opened
+    for writing by nothing else since. A package manager is a process whose
+    image is one (`dpkg`, `apt`, `rpm`, `dnf5`, `microdnf`, …) or whose
+    last exec named the package manager's `#!` script by its own file
+    (`/usr/bin/dnf`, `dnf-3`, `yum`: Python programs, their image the
+    interpreter's; `python3 /usr/bin/dnf` is not one) — the inode the
+    agent stat'ed, root-owned and written by no one else. A DKMS build
+    under `apt install …-dkms` or `dnf install …-dkms` is one;
   - or named by a signed **`module-allow <module>`** line.
-- **Untrusted**: anything else — a file outside the tree, a copy, a file
-  changed since boot outside a package transaction (a module built by hand,
-  `make modules_install`, a root shell's `dkms install`), one whose owner or
-  mode no longer protects it — and every `init_module` buffer.
+- **Let through, recorded High** (the coordinator's matrix, for GPU and DKMS
+  hosts): a file of `updates/dkms/` or `extra/` that DKMS's registry (the
+  same content) or a verified package (an akmods-built `kmod-*` package)
+  vouches for, but written since boot **outside** a recognised package
+  transaction — a root shell's `dkms install`, `akmods` at boot before the
+  agent started. Under `enforce R018` it is refused.
+- **Untrusted**: anything else — a file outside the tree, a copy, a file of
+  the tree outside those two directories changed since boot outside a
+  package transaction (a module built by hand, `make modules_install`), a
+  file of those directories nothing vouches for (no registered build of
+  its module, or one with other content), one whose owner or mode no
+  longer protects it — and every `init_module` buffer.
+
+The matrix, by file:
+
+| The file | Default policy | `enforce R018` |
+|---|---|---|
+| outside `/lib/modules/$(uname -r)` (a copy, `/tmp`, another kernel's tree) | **refused** | refused |
+| an `init_module` buffer | **refused** | refused |
+| in the tree, a verified package's, unchanged since boot or written in a package transaction | trusted | trusted |
+| in the tree outside `updates/dkms/` and `extra/`, failing the package check, or changed since boot outside a transaction | **refused** | refused |
+| in `updates/dkms/` or `extra/`, the registered build (DKMS's copy, or the package's digest), before boot or written in a package transaction | trusted | trusted |
+| in `updates/dkms/` or `extra/`, the registered build, written since boot outside a recognised transaction | **let through, R018 High** | refused |
+| in `updates/dkms/` or `extra/`, not registered (or other content than the registered build) | **refused** | refused |
+| named by a signed `module-allow` | let through, R018 Medium | let through, R018 Medium |
 
 What happens to an untrusted load is the policy's mode of
 `R018_KernelModuleLoad`:
 
 | Policy line | Kernel | Record |
 |---|---|---|
-| none (default) | **refused** (`EPERM`) outside a signed trusted-installer window | R018 High; Critical and the loader's tree killed for a file outside `/lib/modules` |
-| `enforce R018` | refused, as the default | as the default |
+| none (default) | **refused** (`EPERM`) outside a signed trusted-installer window; an unattested DKMS or akmods build let through | R018 High; Critical and the loader's tree killed for a file outside `/lib/modules` |
+| `enforce R018` | refused, an unattested DKMS or akmods build too | as the default |
 | `alert R018` / `audit R018` / `off R018` | let through | as the default (the rule's own mode applies to its record) |
 
 Inside a signed trusted-installer window an untrusted load goes through and
@@ -614,11 +642,19 @@ module-allow vboxdrv
 What it does not cover: a module the boot loads before the agent starts
 (the initramfs, `systemd-modules-load`, udev's first pass) — the kernel's
 module signature enforcement and lockdown are what judge those (`nn-admin
-host-check` reports both); on the RPM family a DKMS build under `dnf` (dnf
-is a Python program: its lineage is the interpreter's image, not a package
-manager's) is untrusted until the next boot or a `module-allow`; a module
-built after boot but before the agent started has no write history and is
-untrusted until the next boot (`akmods` at boot). And the residuals of
+host-check` reports both); a module built after boot but before the agent
+started has no write history: outside `updates/dkms/` and `extra/` it is
+untrusted until the next boot, inside them a registered build is let
+through and recorded (`akmods` at boot); dnf's and yum's scripts are
+recognised only where the exec sensor runs on the LSM hook (its default
+where BPF-LSM is active; `--exec-sensor tracepoint` loses it: a DKMS build
+under dnf is then let through and recorded, not trusted). **By design**,
+root who writes a module file into `updates/dkms/` or `extra/` AND puts
+the same content in DKMS's registry
+(`/var/lib/dkms/<package>/<version>/<release>/<arch>/module/`) gets a High
+record, not a refusal, unless the policy enforces R018 — as root who runs
+the package manager on a package of its own making gets a trusted file
+(the package database is root's). And the residuals of
 the judge itself: the trust map is the agent's (not pinned), so a restarted
 agent judges nothing until it has filled it again; the change time and
 size are what tie a file to its verification, so root who sets the clock
