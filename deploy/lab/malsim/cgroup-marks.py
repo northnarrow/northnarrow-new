@@ -5,9 +5,12 @@ agent's BPF map guard refuses a write handle to any other process).
 
 usage (root): cgroup-marks.py mark PID...   one line per pid:
                   "<pid> moved|born|inherited <by>", "<pid> lost",
+                  (lot 281) "<pid> injected <by>", "<pid> taint-inherited
+                  <by>", or the placement and the taint joined by "+"
+                  ("moved+injected <by>"),
                   "<pid> pre-epoch" (started before the marks' last reset:
                   not known) or "<pid> -"
-              cgroup-marks.py stat           "lost N roots N inherited N into_exempt N"
+              cgroup-marks.py stat           "lost N roots N inherited N into_exempt N injected N"
               cgroup-marks.py dir            the tracker's pin directory
               cgroup-marks.py epoch          "mono N boot N" (0 0: no reset this boot)
               cgroup-marks.py plant DIR      (a lab case) DIR made, an LRU hash
@@ -118,8 +121,8 @@ def main():
         return
     if cmd == ["stat"]:
         fd = obj_get("CGROUP_JOIN_STATS")
-        vals = [struct.unpack("<Q", lookup(fd, struct.pack("<I", i), 8))[0] for i in range(4)]
-        print("lost %d roots %d inherited %d into_exempt %d" % tuple(vals))
+        vals = [struct.unpack("<Q", lookup(fd, struct.pack("<I", i), 8))[0] for i in range(5)]
+        print("lost %d roots %d inherited %d into_exempt %d injected %d" % tuple(vals))
         return
     joined, lost = obj_get("CGROUP_JOINED"), obj_get("CGROUP_JOIN_LOST")
     epoch_boot = epoch()[1]
@@ -137,7 +140,13 @@ def main():
             print(pid, "-")
             continue
         _, info = struct.unpack("<QQ", rec)
-        print(pid, HOW.get(info >> 32, "?"), info & 0xFFFFFFFF)
+        how = (info >> 32) & 0xFF
+        words = [HOW.get(how & 0x0F, "?")] if how & 0x0F else []
+        if how & 0x80:
+            words.append("injected")
+        elif how & 0x40:
+            words.append("taint-inherited")
+        print(pid, "+".join(words) or "?", info & 0xFFFFFFFF)
 
 
 if __name__ == "__main__":

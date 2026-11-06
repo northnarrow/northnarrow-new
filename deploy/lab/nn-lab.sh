@@ -66,6 +66,8 @@
 #   deploy/lab/nn-lab.sh sysctl-check    # lot 280a: the guarded sysctls judged on the kernel's copy (cgroup/sysctl on the root cgroup): the race, octal/hex, the signed opt-out, a child cgroup's program, the cost a write
 #   deploy/lab/nn-lab.sh switches-check  # lot 280b: the switches that blind the sensors — ftrace off in a window (marks lost, epoch reset), kprobes/enabled and kprobes-optimization, the lockdown file, a new taint, a cgroup/sysctl program on the root (SWITCHES_CONFIDENTIALITY=1: lockdown raised, the agent restarted under it)
 #   deploy/lab/nn-lab.sh selftest-check  # lot 280c: the sensor self-test — every source's word, 10 rounds all seen, no rule/posture/signed row of the probe child, one ring's events dropped (BLIND=bpf_syscall; a pump reading its ring through run_ring): the signed degradation, the alert, the return; the round's cost (ROUNDS=10)
+#   deploy/lab/nn-lab.sh inject-check    # lot 281: a read-only peek at an exempt service leaves its exemption; a debugger's attach revokes it — its next action killed, the injection signed; the tracker's maps refuse a write (frozen)
+#   deploy/lab/nn-lab.sh tracker-gap-check  # lot 281: install.sh --upgrade timed (the old agent down to the new tracker armed), an attach in its gap tainted by the pinned programs
 #   deploy/lab/nn-lab.sh exempt-check    # lot 277: an exemption by unit holds for MS-23 started by systemd in the unit, not for a root shell moved into its cgroup (nor its orphan): killed, the move signed
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh net-check         # lab PR 224: connect-time network verdicts, reverse shells, outbound fan-out (CM-02/03/14)
@@ -1622,6 +1624,25 @@ cmd_exempt_check() {
     vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/exempt-check.sh'
 }
 
+cmd_inject_check() {
+    # Lot 281 (deploy/lab/malsim/inject-check.sh): an exemption by unit on
+    # MS-23 run by the unit's own main process — kept after a read-only
+    # peek, revoked by a debugger's attach (the action killed under
+    # `enforce NN-L-IMP-001`, the injection a signed NN-L-AT-001
+    # `exempt_injection`); the tracker's maps frozen. Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/inject-check.sh'
+}
+
+cmd_tracker_gap_check() {
+    # Lot 281 (deploy/lab/malsim/tracker-gap-check.sh, #494's N2): an
+    # upgrade timed from the old agent down to the new tracker armed, an
+    # attach in its gap tainted by the tracker's pinned programs.
+    # Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/tracker-gap-check.sh'
+}
+
 cmd_tracker_persist_check() {
     # Lot 277 (the re-review of #494, R2/D6; deploy/lab/malsim/
     # tracker-persist-check.sh): the tracker's marks outlive a stop of the
@@ -2452,6 +2473,8 @@ case "${1:-help}" in
     malsim-exec-check) cmd_malsim_exec_check ;;
     policy-check)  cmd_policy_check ;;
     exempt-check)  cmd_exempt_check ;;
+    inject-check)  cmd_inject_check ;;
+    tracker-gap-check) cmd_tracker_gap_check ;;
     tracker-persist-check) cmd_tracker_persist_check ;;
     fork-cost)     cmd_fork_cost ;;
     sysctl-check)  cmd_sysctl_check ;;
