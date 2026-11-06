@@ -2040,6 +2040,12 @@ key=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo t
 # another product's LSM programs (bpftrace in the lab) are left alone.
 own_before=$(sudo awk '$1 ~ /^[0-9]+$/ {print $1}' /run/northnarrow/bpf-own-ids 2>/dev/null | tr '\n' ' ')
 foreign_before=$(sudo bpftool prog show 2>/dev/null | grep " lsm " | grep -vcE "^(${own_before// /|}x):" || true)
+# Lot 280a: the sysctl judge on the root cgroup, kept through the purge of
+# the pin root and swapped by the new agent for its own
+judge() { sudo bpftool cgroup show /sys/fs/cgroup 2>/dev/null | awk '/nn_sysctl_guard/ {print $1}' | tr '\n' ' '; }
+judge_before=$(judge)
+kept_before=$(sudo awk '$3 == "kept" {print $2}' /run/northnarrow/bpf-own-ids 2>/dev/null | sort -u | tr '\n' ' ')
+echo "before: sysctl judge ids=[${judge_before% }] kept=[${kept_before% }]"
 n_before=0
 for id in $own_before; do sudo bpftool prog show id "$id" 2>/dev/null | grep -q " lsm " && n_before=$((n_before + 1)); done
 echo "before: own program ids=[${own_before% }] own LSM programs=$n_before foreign LSM programs=$foreign_before"
@@ -2116,6 +2122,14 @@ if [[ -n "$own_before" ]] && (( foreign_after < foreign_before )); then
     echo "FAIL: foreign LSM programs $foreign_before -> $foreign_after"; fail=1
 fi
 echo "after : own LSM programs=$n (before: $n_before) foreign LSM programs=$foreign_after"
+judge_after=$(judge)
+echo "after : sysctl judge ids=[${judge_after% }] pins=[$(sudo ls /sys/fs/bpf/northnarrow-sysctl 2>/dev/null | tr '\n' ' ')]"
+if [[ -n "${judge_before// /}" ]]; then
+    [[ $(wc -w <<<"$judge_after") == 1 && "$judge_after" != "$judge_before" ]] \
+        || { echo "FAIL: the sysctl judge after the upgrade [$judge_after] (before [$judge_before]): one program, the new agent's"; fail=1; }
+    [[ " $kept_before " == *" nn_sysctl_guard "* ]] || { echo "FAIL: the sysctl judge not kept in bpf-own-ids before the upgrade"; fail=1; }
+    sudo test -e /sys/fs/bpf/northnarrow-sysctl/link_nn_sysctl_guard || { echo "FAIL: the sysctl judge's link not pinned after the upgrade"; fail=1; }
+fi
 sudo ls /sys/fs/bpf/northnarrow/PROTECTED_PIDS >/dev/null || { echo "FAIL: PROTECTED_PIDS not re-pinned"; fail=1; }
 # External audit DEC-007: a template an earlier release shipped named the
 # product in every decoy rendered from it; the upgrade replaces it (an
