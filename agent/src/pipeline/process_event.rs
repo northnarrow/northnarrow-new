@@ -465,7 +465,37 @@ pub(crate) fn process_event(
             // refused attempts that left no record in the chain logs.
             use northnarrow_agent::decision::Rule as _;
             let at001 = northnarrow_agent::decision::rules::anti_tamper::NnLAt001AntiTamperDenial;
-            let verdict = at001.evaluate(&event);
+            // Lot 281: code-injection access to a process (its first: the
+            // kernel taints its mark) — signed only when an exemption of the
+            // per-rule policy covered it: High, Critical from a non-root
+            // injector or one outside an administrator's interactive
+            // session. Any other process's is a debug line.
+            let injection = *operation == nn_model::FsProtectOperation::ExemptInjection;
+            let covered = injection
+                .then(|| u32::try_from(*target_ino).ok())
+                .flatten()
+                .and_then(|t| engine.exempt_covering(t));
+            if injection && covered.is_none() {
+                debug!(
+                    pid, uid, comm = %Escaped(comm),
+                    injected_pid = target_ino,
+                    detail = target_dev,
+                    "code-injection access to a process no exemption covers (its mark tainted)"
+                );
+                return;
+            }
+            let verdict = match &covered {
+                Some(exemption) => {
+                    let admin = posture.interactive_admin_status(
+                        *pid,
+                        northnarrow_agent::posture::lineage::AsOf::of_event(&event),
+                    );
+                    northnarrow_agent::decision::rules::anti_tamper::exempt_injection(
+                        &event, exemption, admin,
+                    )
+                }
+                None => at001.evaluate(&event),
+            };
             // Review 75: a loop of denied attempts is logged and stored
             // within the rule's budget for that uid.
             let admit = match &verdict {
@@ -494,7 +524,15 @@ pub(crate) fn process_event(
                 })
                 .flatten();
             if admit.record() {
-                if joined {
+                if let Some(exemption) = &covered {
+                    warn!(
+                        pid, uid, comm = %Escaped(comm),
+                        injected_pid = target_ino,
+                        exemption = %exemption,
+                        "EXEMPTION REVOKED: code-injection access to an exempt process — not \
+                         refused; that process and what it forks are never exempt again"
+                    );
+                } else if joined {
                     warn!(
                         pid, uid, comm = %Escaped(comm),
                         moved = target_ino,
@@ -537,7 +575,13 @@ pub(crate) fn process_event(
                     );
                     if let Some(sink) = detection_sink {
                         // Lot 273: who, by executable too.
-                        let outcome = if joined {
+                        let outcome = if let Some(exemption) = &covered {
+                            format!(
+                                "not refused: the exemption ({exemption}) and every other no \
+                                 longer hold for pid {target_ino} or what it forks \
+                                 (start-in-cgroup tracker, injection taint)"
+                            )
+                        } else if joined {
                             format!(
                                 "not refused: the moved process and every process it starts are \
                                  never exempt by {} (start-in-cgroup tracker)",

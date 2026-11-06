@@ -648,3 +648,36 @@ others. What an operator sees change:
   tracker's marks are lost while it holds (signed `cgroup_join_marks`) and
   reset once ftrace runs again — as after a start that could not adopt
   them, **restart the exempt services** after it.
+
+## 12. Code injected into an exempt process (lot 281)
+
+- **An exemption by `exe`, `cgroup` or `unit` no longer holds for a
+  process code was injected into** — a debugger's attach (`gdb -p`,
+  `strace -p`), `process_vm_writev`, a write handle on its
+  `/proc/<pid>/mem`, `pidfd_getfd`, or a program started under a debugger
+  (`PTRACE_TRACEME`) — nor for what it forks after, for the rest of their
+  lives (`RULE_POLICY.md` §2.3). Its matches are judged like any other's;
+  the record's reasoning says which exemption did not hold and why. A
+  read (`/proc/<pid>/mem` read-only, `process_vm_readv`, `ps`) changes
+  nothing; an exemption by `uid` still holds. Debugging an exempt service
+  ends its exemption until it is restarted: restart it after a debugging
+  session.
+- **A new detection, not a refusal**: NN-L-AT-001 `exempt_injection` for
+  the first injection into a process an exemption covered — High from an
+  administrator's interactive `sudo`/`su` session, Critical otherwise
+  (another lineage, not root). No posture trigger.
+- **The upgrade resets the marks once**: the tracker's schema is now 2
+  (its marks carry the injection taint); a schema-1 directory is not
+  adopted. The start signs "cgroup exemptions: marks reset … schema v1 …"
+  and every process started before it is refused an exemption by `exe`,
+  `cgroup` or `unit` until it exits. **Restart the exempt services after
+  the upgrade.**
+- **Until the tracker is armed** at each start (its pins and their record
+  protected; the journal's "the tracker is armed" line), and on a kernel
+  without the tracker, an exemption by `exe` is refused too (before, only
+  `cgroup` and `unit` were): whether code was injected into the process is
+  not known.
+- **The tracker's maps are frozen**: `bpftool map update` or `delete` on a
+  pinned `northnarrow-cgroup-join-v2_*` map fails with `EPERM` for every
+  caller, root and the agent included. The start no longer sweeps dead
+  processes' marks (a dead group's mark goes at its pid's next fork).

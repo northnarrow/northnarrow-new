@@ -34,7 +34,19 @@
 //! - the third review of #494 (R2-b): a tracker directory planted beside
 //!   the pin root under a name a later start could take, an LRU map in it
 //!   as the marks, is never adopted — the agent keeps its registered pins
-//!   and removes the planted one, signed.
+//!   and removes the planted one, signed;
+//! - lot 281: a debugger's attach to a process an exemption covers (an
+//!   executable's, by its digest) taints its mark (by the injector) and is
+//!   signed (`EXEMPTION REVOKED`); `process_vm_writev` and a write handle on
+//!   its `/proc/<pid>/mem` taint;
+//!   `/proc/<pid>/mem` opened read-only and `process_vm_readv` do not; a
+//!   fork of a tainted process is tainted (inherited, by its parent); the
+//!   agent's own write handle on a process's memory taints nothing
+//!   (`NN_DEBUG_CGROUP_JOIN_SELF_INJECT`, a `debug-trigger` build's);
+//! - lot 281 (#494's N1/N2): a plant in a new generation's directory between
+//!   its making and its maps' pinning (`NN_DEBUG_CGROUP_JOIN_PLANT=1`) moves
+//!   the maps to the next generation, signed, the plant removed; no write
+//!   through a handle on a pinned map of the tracker goes through (frozen).
 //!
 //! Run (lab guest, units stopped, pins purged — `nn-lab.sh test-ignored`
 //! does both):
@@ -101,6 +113,13 @@ impl Fixture {
     /// [`Fixture::setup`] with `env` for the agent too (a `debug-trigger`
     /// build's knobs).
     fn setup_with(env: &[(&str, &str)]) -> Self {
+        Self::setup_full(env, None)
+    }
+
+    /// Lot 281: [`Fixture::setup_with`] and a per-rule policy of the test's
+    /// own (`--rule-policy-local` in its tempdir, unsigned: the test agents
+    /// allow it) — never the host's.
+    fn setup_full(env: &[(&str, &str)], policy: Option<&str>) -> Self {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let dir = tempdir.path().to_path_buf();
         let state = AgentState::new(&dir);
@@ -142,6 +161,9 @@ impl Fixture {
         all_env.extend_from_slice(env);
         let mut cmd = installed_agent.command(&state, Launch::Sudo, &all_env);
         cmd.arg("--combat-rules").arg(&combat);
+        let rule_policy = dir.join("rule-policy.local");
+        std::fs::write(&rule_policy, policy.unwrap_or("")).expect("write the rule policy");
+        cmd.arg("--rule-policy-local").arg(&rule_policy);
         for (flag, file) in [
             ("--fim-paths-v1", "fim-paths.v1"),
             ("--fim-paths-local", "fim-paths.local"),
@@ -821,6 +843,322 @@ for _ in sys.stdin:
         os._exit(0)
     print(c, flush=True)
 "#;
+
+/// Lot 281: the exemption the injection tests give `/usr/bin/sleep` (by its
+/// digest): a process running it is exempt — until code is injected into it.
+fn sleep_exemption() -> String {
+    let out = Command::new("sha256sum")
+        .arg("/usr/bin/sleep")
+        .output()
+        .expect("sha256sum");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let hex = text.split_whitespace().next().expect("a digest");
+    format!("exempt NN-L-IMP-001 exe /usr/bin/sleep sha256 {hex}\n")
+}
+
+/// A `sleep 60` of its own process group.
+fn sleeper() -> Child {
+    use std::os::unix::process::CommandExt;
+    Command::new("/usr/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .expect("sleep")
+}
+
+/// `python3 -I -c <code> <args>` run to its end; its stdout (asserted
+/// `ok …`).
+fn run_py(code: &str, args: &[&str]) -> String {
+    let out = Command::new("python3")
+        .arg("-I")
+        .arg("-c")
+        .arg(code)
+        .args(args)
+        .output()
+        .expect("python3");
+    let o = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        o.starts_with("ok"),
+        "{code}: {o} / {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    o
+}
+
+/// Attaches to argv[1] with PTRACE_ATTACH, waits for its stop, detaches;
+/// prints `ok <own pid>`.
+const ATTACH: &str = r#"
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+pid = int(sys.argv[1])
+if libc.ptrace(16, pid, None, None) != 0:
+    raise SystemExit("PTRACE_ATTACH: errno %d" % ctypes.get_errno())
+os.waitpid(pid, 0)
+libc.ptrace(17, pid, None, None)
+print("ok", os.getpid(), flush=True)
+"#;
+
+/// Opens /proc/argv[1]/mem read-only and reads its first mapping's first
+/// bytes; prints `ok <own pid>`.
+const PEEK: &str = r#"
+import os, sys
+pid = sys.argv[1]
+start = int(open("/proc/%s/maps" % pid).readline().split("-")[0], 16)
+fd = os.open("/proc/%s/mem" % pid, os.O_RDONLY)
+os.pread(fd, 16, start)
+os.close(fd)
+print("ok", os.getpid(), flush=True)
+"#;
+
+/// `process_vm_readv` (argv[2] = "read") or `process_vm_writev` ("write")
+/// of one byte at address 0 of argv[1]: the access is checked before the
+/// copy, which then fails with EFAULT (14) — the proof the check was
+/// reached; prints `ok <own pid> <errno>`. Every argument a `long`: a
+/// variadic `syscall` reads whole registers (lot 281's first lab run passed
+/// plain ints and got EINVAL before any check).
+const VM_RW: &str = r#"
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+class iovec(ctypes.Structure):
+    _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+buf = ctypes.create_string_buffer(1)
+local = iovec(ctypes.cast(buf, ctypes.c_void_p), 1)
+remote = iovec(None, 1)
+nr = 310 if sys.argv[2] == "read" else 311
+L = ctypes.c_long
+r = libc.syscall(L(nr), L(int(sys.argv[1])), ctypes.byref(local), L(1), ctypes.byref(remote), L(1), L(0))
+print("ok", os.getpid(), 0 if r >= 0 else ctypes.get_errno(), flush=True)
+"#;
+
+/// The agent's log line of an injection into an exempt process, for `target`.
+fn revoked_line(fx: &Fixture, target: u32) -> bool {
+    fx.log_text()
+        .lines()
+        .any(|l| l.contains("EXEMPTION REVOKED") && l.contains(&format!("injected_pid={target}")))
+}
+
+/// Lot 281 (named): a debugger's attach to an exempt process taints its
+/// mark (by the injector, the placement untouched) and is signed.
+#[test]
+#[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
+fn a_ptrace_attach_to_an_exempt_process_revokes_it_and_is_signed() {
+    let fx = Fixture::setup_full(&[], Some(&sleep_exemption()));
+    let mut target = sleeper();
+    let tpid = target.id();
+    assert_eq!(mark(tpid), None, "a clean start");
+    let out = run_py(ATTACH, &[&tpid.to_string()]);
+    let injector: u32 = out.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let m = wait_mark(tpid).expect("the attach taints the target");
+    let deadline = Instant::now() + LOG_POLL_TIMEOUT;
+    while !revoked_line(&fx, tpid) && Instant::now() < deadline {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    let signed = revoked_line(&fx, tpid);
+    let _ = target.kill();
+    let _ = target.wait();
+    assert_eq!(m.how, ::common::cgroup_join::HOW_INJECTED, "{m:?}");
+    assert_eq!(m.by, injector, "by the injector");
+    assert!(signed, "no signed revocation:\n{}", tail(&fx.log_text()));
+}
+
+/// Lot 281 (named): `/proc/<pid>/mem` opened read-only (and read) is no
+/// injection; nor is `process_vm_readv`.
+#[test]
+#[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
+fn a_read_only_proc_mem_open_does_not_revoke() {
+    let fx = Fixture::setup_full(&[], Some(&sleep_exemption()));
+    let mut target = sleeper();
+    let tpid = target.id();
+    run_py(PEEK, &[&tpid.to_string()]);
+    let read = run_py(VM_RW, &[&tpid.to_string(), "read"]);
+    std::thread::sleep(Duration::from_millis(500));
+    let after = mark(tpid);
+    let signed = revoked_line(&fx, tpid);
+    let _ = target.kill();
+    let _ = target.wait();
+    assert_eq!(
+        read.split_whitespace().nth(2),
+        Some("14"),
+        "process_vm_readv reached its check (EFAULT at the copy): {read}"
+    );
+    assert_eq!(after, None, "a read tainted the target");
+    assert!(!signed, "a read was signed as an injection");
+}
+
+/// Opens /proc/argv[1]/mem for reading and writing (`openat`, `O_RDWR`)
+/// and closes it, writing nothing; prints `ok <own pid>`.
+const MEM_RW: &str = r#"
+import os, sys
+fd = os.open("/proc/%s/mem" % sys.argv[1], os.O_RDWR)
+os.close(fd)
+print("ok", os.getpid(), flush=True)
+"#;
+
+/// Lot 281 (named): a write handle on a process's `/proc/<pid>/mem` taints
+/// it (by the opener), the handle's flags read from the `openat` call.
+#[test]
+#[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
+fn a_proc_mem_write_handle_revokes() {
+    let _fx = Fixture::setup();
+    let mut target = sleeper();
+    let tpid = target.id();
+    let out = run_py(MEM_RW, &[&tpid.to_string()]);
+    let opener: u32 = out.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let m = wait_mark(tpid);
+    let _ = target.kill();
+    let _ = target.wait();
+    let m = m.expect("a write handle on its memory taints the target");
+    assert_eq!((m.how, m.by), (::common::cgroup_join::HOW_INJECTED, opener));
+}
+
+/// Lot 281 (named): `process_vm_writev` taints, whatever the copy did.
+#[test]
+#[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
+fn process_vm_writev_revokes() {
+    let fx = Fixture::setup_full(&[], Some(&sleep_exemption()));
+    let mut target = sleeper();
+    let tpid = target.id();
+    let out = run_py(VM_RW, &[&tpid.to_string(), "write"]);
+    let injector: u32 = out.split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert_eq!(
+        out.split_whitespace().nth(2),
+        Some("14"),
+        "process_vm_writev reached its check (EFAULT at the copy): {out}"
+    );
+    let m = wait_mark(tpid);
+    let deadline = Instant::now() + LOG_POLL_TIMEOUT;
+    while !revoked_line(&fx, tpid) && Instant::now() < deadline {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    let signed = revoked_line(&fx, tpid);
+    let _ = target.kill();
+    let _ = target.wait();
+    let m = m.expect("process_vm_writev taints the target");
+    assert_eq!(
+        (m.how, m.by),
+        (::common::cgroup_join::HOW_INJECTED, injector)
+    );
+    assert!(signed, "no signed revocation:\n{}", tail(&fx.log_text()));
+}
+
+/// Lot 281 (named): a process forked by a tainted one after the injection
+/// is tainted too (inherited, by its parent) — never exempt either.
+#[test]
+#[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
+fn the_child_of_a_tainted_process_is_not_exempt() {
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    let _fx = Fixture::setup();
+    let mut parent = Command::new("python3")
+        .args(["-I", "-c", FORK_ON_LINE])
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("python3");
+    let mut out = std::io::BufReader::new(parent.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("its pid");
+    let ppid: u32 = line.trim().parse().expect("a pid");
+    run_py(ATTACH, &[&ppid.to_string()]);
+    let pm = wait_mark(ppid);
+    parent
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(b"fork\n")
+        .expect("fork");
+    line.clear();
+    out.read_line(&mut line).expect("the child's pid");
+    let child: u32 = line.trim().parse().expect("a pid");
+    let cm = mark(child);
+    let _ = parent.kill();
+    let _ = parent.wait();
+    let pm = pm.expect("the parent tainted");
+    assert_ne!(pm.how & ::common::cgroup_join::HOW_INJECTED, 0, "{pm:?}");
+    let cm = cm.expect("the child marked at its fork");
+    assert_eq!(
+        (cm.how, cm.by),
+        (::common::cgroup_join::HOW_TAINT_INHERITED, ppid),
+        "inherited taint, by the parent; the placement untouched"
+    );
+}
+
+/// Lot 281 (named): the agent's own write handle on a process's memory
+/// taints nothing (the family's accesses are not injections).
+#[test]
+#[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
+fn the_agent_s_own_ptrace_does_not_revoke() {
+    let mut target = sleeper();
+    let tpid = target.id().to_string();
+    let fx = Fixture::setup_with(&[("NN_DEBUG_CGROUP_JOIN_SELF_INJECT", &tpid)]);
+    fx.wait_for_log("the agent's own write handle on /proc/<pid>/mem");
+    let opened = fx
+        .log_text()
+        .lines()
+        .any(|l| l.contains("the agent's own write handle") && l.contains("opened=true"));
+    std::thread::sleep(Duration::from_millis(500));
+    let m = mark(target.id());
+    let _ = target.kill();
+    let _ = target.wait();
+    assert!(
+        opened,
+        "the agent did not open it:\n{}",
+        tail(&fx.log_text())
+    );
+    assert_eq!(m, None, "the agent's own access tainted {tpid}");
+}
+
+/// Lot 281 (named, #494's N1): a plant in the new generation's directory
+/// between its making and the maps' pinning (a directory at the marks' pin
+/// path) moves the maps to the next generation, signed; the planted
+/// directory goes. And (N2) no write through a handle on the pinned maps
+/// goes through: they are frozen.
+#[test]
+#[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
+fn a_new_generation_is_never_one_with_a_plant_and_its_maps_are_frozen() {
+    let fx = Fixture::setup_with(&[
+        ("NN_DEBUG_CGROUP_JOIN_RESET", "1"),
+        ("NN_DEBUG_CGROUP_JOIN_PLANT", "1"),
+    ]);
+    fx.wait_for_log("debug — a plant in the new tracker directory");
+    fx.wait_for_log("was not the tracker's alone");
+    let reg = registered();
+    let pinned_there = nn_linux::cgroup_join::PINNED_MAPS
+        .iter()
+        .all(|n| reg.dir.join(n).exists());
+    let writes = nn_linux::cgroup_join::pinned_writes(root());
+    let planted_left: Vec<PathBuf> = std::fs::read_dir(root().parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name().is_some_and(|n| {
+                n.to_string_lossy()
+                    .contains(::common::cgroup_join::PIN_DIR_INFIX)
+            }) && *p != reg.dir
+        })
+        .collect();
+    drop(fx);
+    // the next tests' agents: new maps with no epoch (as after the reset test)
+    let _clean = Fixture::setup_with(&[("NN_DEBUG_CGROUP_JOINED_ENTRIES", "32768")]);
+    assert!(pinned_there, "the maps pinned in {}", reg.dir.display());
+    assert!(
+        planted_left.is_empty(),
+        "left beside the root: {planted_left:?}"
+    );
+    let writes = writes.expect("no write through a handle");
+    assert_eq!(writes.len(), nn_linux::cgroup_join::PINNED_MAPS.len());
+    for (map, e) in &writes {
+        assert!(
+            e.contains("Operation not permitted") || e.contains("handle refused"),
+            "{map}: {e}"
+        );
+    }
+}
 
 #[test]
 #[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]

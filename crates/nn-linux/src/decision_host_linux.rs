@@ -245,6 +245,12 @@ impl ActorFacts for ProcFacts {
     fn started_in_cgroup(&self, pid: u32) -> Option<bool> {
         crate::cgroup_join::started_in_cgroup(&self.root, pid)
     }
+
+    /// Lot 281: the injection taint in the same marks; not known without
+    /// the boot's tracker.
+    fn injected(&self, pid: u32) -> Option<nn_core::decision::rule_policy::Injected> {
+        crate::cgroup_join::injected(&self.root, pid)
+    }
 }
 
 #[cfg(test)]

@@ -34,6 +34,21 @@
 //! before the first start since the host booted is not seen: the residual
 //! is the trust model's (`docs/design/ANTITAMPER_TRUST_MODEL.md`).
 //!
+//! Lot 281: the same marks carry the code a process runs — its LSM
+//! programs on `ptrace_access_check` and `ptrace_traceme` taint a process
+//! code-injection access to which was given to another (and what it forks
+//! after); the exemption check asks ([`injected`]): no exemption by
+//! executable, cgroup or unit holds for it, and the first taint is recorded
+//! (`FS_OP_EXEMPT_INJECT`, signed by the agent when an exemption covered
+//! the process). #494's notes N1 and N2: a new generation's maps are made
+//! at the load and pinned after it ([`attach`]: a file already at a pin's
+//! path, or anything else in the new directory, is a plant — the next
+//! generation, signed), every pinned map is frozen (`BPF_MAP_FREEZE`: no
+//! handle writes it, one taken in a window or an upgrade's gap included;
+//! the programs do), a reset's epoch asked for in a per-load map the fork
+//! program takes in forward only, and no exemption is honoured until the
+//! tracker is armed ([`arm`]: its pins and its state protected).
+//!
 //! Lot 280b: `kernel.ftrace_enabled=0` (refused outside a window; 6.0 to
 //! 7.2) stops the tracker's fentry and fexit programs while its BTF
 //! tracepoints go on. The fork's tracepoint checks each new thread group
@@ -46,18 +61,20 @@
 //! exits), signed with the period.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use aya::maps::{Array, HashMap, MapData};
 use aya::programs::links::FdLink;
-use aya::programs::{BtfTracePoint, FEntry, FExit};
+use aya::programs::{BtfTracePoint, FEntry, FExit, Lsm};
 use aya::{Btf, Ebpf, EbpfLoader};
 use common::cgroup_join::{
-    fnv, is_pin_dir_of, lost_slot, parse_pin_dir, unpack, EPOCH_SLOTS, LOST_BYTES, LOST_SLOTS,
-    NAME_CGROUP, NAME_UNIT, PIN_SCHEMA, SILENT_ARMED, SILENT_UNSEEN, STAT_INTO_EXEMPT, STAT_LOST,
-    STAT_ROOTS, STAT_SLOTS,
+    fnv, is_pin_dir_of, lost_slot, parse_pin_dir, unpack, EPOCH_SLOTS, HOW_INJECTED, HOW_PLACE,
+    HOW_TAINT, LOST_BYTES, LOST_SLOTS, NAME_CGROUP, NAME_UNIT, PIN_SCHEMA, SILENT_ARMED,
+    SILENT_UNSEEN, STAT_INJECTED, STAT_INTO_EXEMPT, STAT_LOST, STAT_ROOTS, STAT_SLOTS,
 };
-use nn_core::decision::rule_policy::{Exemption, RulePolicy};
+use nn_core::decision::rule_policy::{Exemption, Injected, RulePolicy};
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
@@ -86,6 +103,10 @@ pub const NAMES_MAP: &str = "CGROUP_EXEMPT_NAMES";
 /// Lot 280b: the tracepoint's check of the fentry (per load, not pinned:
 /// `common::cgroup_join::SILENT_*`).
 pub const SILENT_MAP: &str = "CGROUP_JOIN_SILENT";
+/// Lot 281 (#494's N2): the agent's request for a reset of the marks (per
+/// load, not pinned, not frozen); the fork program takes it into the
+/// pinned, frozen [`EPOCH_MAP`] when it is later.
+pub const EPOCH_RT_MAP: &str = "CGROUP_JOIN_EPOCH_RT";
 
 /// How a program of the tracker attaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +115,8 @@ pub enum Kind {
     FEntry,
     /// A BTF tracepoint.
     TpBtf,
+    /// Lot 281: a BPF LSM program (it never refuses).
+    Lsm,
 }
 
 /// The tracker's programs: `(program, how, target)`, in the order a start
@@ -101,7 +124,13 @@ pub enum Kind {
 /// `cgroup_join_src` (the re-review of #494, N-f) — the new `mark` reads the
 /// new, empty source slot until the new `src` writes it, and marks every
 /// move meanwhile (more, never less).
-pub const PROGRAMS: [(&str, Kind, &str); 5] = [
+///
+/// Lot 281: the two LSM programs of the injection taint first — a start
+/// that marks the moves before it taints the injections would let an
+/// injection meanwhile go unmarked; the prior boot's run until then.
+pub const PROGRAMS: [(&str, Kind, &str); 7] = [
+    ("cgroup_join_inject", Kind::Lsm, "ptrace_access_check"),
+    ("cgroup_join_traceme", Kind::Lsm, "ptrace_traceme"),
     ("cgroup_join_exit", Kind::TpBtf, "sched_process_exit"),
     ("cgroup_join_fork", Kind::TpBtf, "sched_process_fork"),
     ("cgroup_join_born", Kind::FEntry, "cgroup_post_fork"),
@@ -118,9 +147,9 @@ pub fn is_kept_program(name: &str) -> bool {
 
 /// What a kernel without the tracker loses.
 pub const ABSENT_EFFECT: &str =
-    "the start-in-cgroup tracker is not attached: every exemption by cgroup or unit of the \
-     per-rule policy is refused (a process moved into an exempt service's cgroup could not be \
-     told from the service)";
+    "the start-in-cgroup tracker is not attached: every exemption by executable, cgroup or unit \
+     of the per-rule policy is refused (a process moved into an exempt service's cgroup could not \
+     be told from the service, nor one code was injected into from the program it runs)";
 
 type Joined = HashMap<MapData, u32, [u64; 2]>;
 type Lost = Array<MapData, [u8; LOST_BYTES]>;
@@ -128,8 +157,9 @@ type Stats = Array<MapData, u64>;
 type Epoch = Array<MapData, u64>;
 type Names = HashMap<MapData, u64, u8>;
 type Silent = Array<MapData, u64>;
+type EpochRt = Array<MapData, u64>;
 
-/// The tracker's maps, for the exemption check, the names and the sweep.
+/// The tracker's maps, for the exemption check and the names.
 #[derive(Clone)]
 pub struct Marks {
     joined: Arc<Mutex<Joined>>,
@@ -139,6 +169,12 @@ pub struct Marks {
     names: Arc<Mutex<Names>>,
     /// Lot 280b: the births the fentry missed.
     silent: Arc<Mutex<Silent>>,
+    /// Lot 281: the agent's reset requests (per load).
+    epoch_rt: Arc<Mutex<EpochRt>>,
+    /// Lot 281 (#494's N1/N2): no answer is given (every exemption by
+    /// executable, cgroup or unit refused) until the tracker is armed —
+    /// its pins and its state protected ([`arm`]).
+    armed: Arc<AtomicBool>,
 }
 
 /// The tracker as this boot has it.
@@ -517,15 +553,21 @@ fn usable_dir(dir: &Path) -> Result<(), String> {
 
 /// The re-review of #494 (R2) and its third review: before the object's
 /// load, what this start does with the tracker's pins ([`plan`]) — the
-/// registered directory adopted, its maps verified, or a new one — and the
-/// loader told to pin the tracker's maps there ([`PINNED_MAPS`]). Nothing
+/// registered directory adopted, its maps verified, or a new one. Nothing
 /// is removed here: the agent is not a protected pid yet, and a reset
 /// directory goes once the new programs run ([`attach`]). Without a bpffs
 /// (`pin_root` `None`) the maps are this process's.
+///
+/// Lot 281 (#494's N1): only an adoption tells the loader to take the
+/// registered pins ([`PINNED_MAPS`], their ids checked again after the
+/// load); a new generation's maps are made by the load and pinned after it
+/// ([`attach`]), its directory made then — never one the loader would take
+/// a planted map from.
 pub fn prepare_pins(loader: &mut EbpfLoader<'_>, pin_root: Option<&Path>, entries: u32) {
     let Some(root) = pin_root else {
         return;
     };
+    let _ = PLANNED_AT.set(Instant::now());
     let plan = PLAN.get_or_init(|| {
         let state = std::fs::read_to_string(STATE_PATH)
             .ok()
@@ -548,15 +590,37 @@ pub fn prepare_pins(loader: &mut EbpfLoader<'_>, pin_root: Option<&Path>, entrie
             entries,
             debug_entries(),
         );
-        usable_dir(&p.dir)?;
+        if p.adopt {
+            usable_dir(&p.dir)?;
+            if let Some(st) = state.filter(|st| st.dir == p.dir) {
+                let _ = ADOPTED.set(st);
+            }
+        }
         Ok(p)
     });
     if let Ok(p) = plan {
-        for name in PINNED_MAPS {
-            loader.map_pin_path(name, p.dir.join(name));
+        if p.adopt {
+            for name in PINNED_MAPS {
+                loader.map_pin_path(name, p.dir.join(name));
+            }
         }
     }
 }
+
+/// Lot 281 (#494's N1): the registered state an adoption verified before
+/// the load — the maps the load took are checked against it after.
+static ADOPTED: OnceLock<PinState> = OnceLock::new();
+
+/// Lot 281: when [`prepare_pins`] planned (the arming's measure).
+static PLANNED_AT: OnceLock<Instant> = OnceLock::new();
+
+/// Lot 281 (#494's N1): the directory this start pinned in — the plan's, or
+/// a later generation's when a plant was found in it.
+static FINAL_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Lot 281 (#494's N1): generations a new directory is tried in before the
+/// tracker is given up (absent: fail closed, signed).
+pub const NEW_DIR_ATTEMPTS: u32 = 4;
 
 /// A `debug-trigger` build's knob ([`joined_entries_now`]).
 fn debug_entries() -> Option<u32> {
@@ -580,11 +644,14 @@ fn debug_reset() -> bool {
     false
 }
 
-/// The tracker's pin directory this boot, once [`prepare_pins`] chose it.
+/// The tracker's pin directory this boot, once [`attach`] pinned in it
+/// (before: the one [`prepare_pins`] planned).
 pub fn pin_dir_now() -> Option<&'static Path> {
-    PLAN.get()
-        .and_then(|r| r.as_ref().ok())
-        .map(|p| p.dir.as_path())
+    FINAL_DIR.get().map(PathBuf::as_path).or_else(|| {
+        PLAN.get()
+            .and_then(|r| r.as_ref().ok())
+            .map(|p| p.dir.as_path())
+    })
 }
 
 /// Register this start's pins in [`STATE_PATH`] (atomically, `0600`): the
@@ -629,14 +696,37 @@ fn clock_ns(clock: libc::clockid_t) -> Result<u64, String> {
 }
 
 /// The third review of #494 (R2-a): this instant as the marks' last reset
-/// — `[monotonic, boot time]` ns into `CGROUP_JOIN_EPOCH`, once the new
-/// programs run: a process started before it is not known.
+/// — `[monotonic, boot time]` ns, once the new programs run: a process
+/// started before it is not known. Lot 281 (#494's N2): asked for in
+/// `CGROUP_JOIN_EPOCH_RT`; the fork program takes it into the pinned,
+/// frozen `CGROUP_JOIN_EPOCH` at the next fork (forward only).
 fn set_epoch(ebpf: &mut Ebpf) -> Result<(), String> {
     let map = ebpf
-        .map_mut(EPOCH_MAP)
-        .ok_or_else(|| format!("map {EPOCH_MAP} missing from the eBPF object"))?;
+        .map_mut(EPOCH_RT_MAP)
+        .ok_or_else(|| format!("map {EPOCH_RT_MAP} missing from the eBPF object"))?;
     let mut arr: Array<&mut MapData, u64> = Array::try_from(map).map_err(|e| e.to_string())?;
-    write_epoch(&mut arr)
+    write_epoch(&mut arr)?;
+    promote_now();
+    Ok(())
+}
+
+/// Lot 281 (#494's N2): a fork of the agent's own, so that the fork program
+/// takes the request into the pinned epoch now — any fork on the host would
+/// soon (the agent reads the later of the two meanwhile). Best effort: the
+/// child only `_exit`s.
+fn promote_now() {
+    // SAFETY: fork(2); the child calls only `_exit` (async-signal-safe),
+    // the parent reaps it.
+    unsafe {
+        let pid = libc::fork();
+        if pid == 0 {
+            libc::_exit(0);
+        }
+        if pid > 0 {
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+    }
 }
 
 /// [`set_epoch`]'s write, into the map however it is held (the start's
@@ -686,8 +776,14 @@ fn other_pin_dirs(pin_root: &Path, keep: Option<&Path>) -> Vec<PathBuf> {
 
 /// Remove tracker pin directory `dir`: its links first (their programs
 /// detach), then the rest, then the directory. The agent is a protected
-/// pid by then; a pin it cannot remove is logged.
+/// pid by then; a pin it cannot remove is logged. Lot 281: a directory in
+/// it (a plant at a pin's path, #494's N1) goes the same way, a few levels
+/// deep at most.
 fn purge_pin_dir(dir: &Path) {
+    purge_pin_dir_at(dir, 4);
+}
+
+fn purge_pin_dir_at(dir: &Path, depth: u32) {
     // The third review of #494 (R2-d): a link is removed, never followed
     // (its target's files are another's).
     if std::fs::symlink_metadata(dir).is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink()) {
@@ -702,7 +798,10 @@ fn purge_pin_dir(dir: &Path) {
             .is_some_and(|n| n.to_string_lossy().starts_with("link_"))
     });
     for f in &files {
-        antitamper_bpf::purge_stale_pin(f);
+        match std::fs::symlink_metadata(f) {
+            Ok(m) if m.is_dir() && depth > 0 => purge_pin_dir_at(f, depth - 1),
+            _ => antitamper_bpf::purge_stale_pin(f),
+        }
     }
     if let Err(e) = std::fs::remove_dir(dir) {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -781,6 +880,12 @@ fn load_attach(
                 p.load(target, btf).map_err(|e| format!("{e:#}"))?;
                 p.attach().map(drop).map_err(|e| format!("{e:#}"))
             }),
+        Kind::Lsm => <&mut Lsm>::try_from(prog)
+            .map_err(|e| e.to_string())
+            .and_then(|p| {
+                p.load(target, btf).map_err(|e| format!("{e:#}"))?;
+                p.attach().map(drop).map_err(|e| format!("{e:#}"))
+            }),
     };
     r.map_err(|e| format!("{name} ({target}): {e}"))
 }
@@ -811,6 +916,11 @@ fn pin_fresh(ebpf: &mut Ebpf, root: &Path, name: &str, kind: Kind) -> Result<(),
             let id = p.attach().map_err(|e| format!("{e:#}"))?;
             p.take_link(id).map_err(|e| format!("{e:#}"))?.into()
         }
+        Kind::Lsm => {
+            let p = <&mut Lsm>::try_from(prog).map_err(|e| e.to_string())?;
+            let id = p.attach().map_err(|e| format!("{e:#}"))?;
+            p.take_link(id).map_err(|e| format!("{e:#}"))?.into()
+        }
     };
     antitamper_bpf::purge_stale_pin(&link_path);
     antitamper_bpf::purge_stale_pin(&prog_path);
@@ -833,6 +943,7 @@ fn unload(ebpf: &mut Ebpf, name: &str, kind: Kind) {
         Kind::FExit => <&mut FExit>::try_from(prog).map(|p| p.unload()),
         Kind::FEntry => <&mut FEntry>::try_from(prog).map(|p| p.unload()),
         Kind::TpBtf => <&mut BtfTracePoint>::try_from(prog).map(|p| p.unload()),
+        Kind::Lsm => <&mut Lsm>::try_from(prog).map(|p| p.unload()),
     };
 }
 
@@ -874,7 +985,6 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
             );
         }
         (Some(root), Some(Ok(plan))) => {
-            let dir = plan.dir.as_path();
             for (i, (name, kind, target)) in PROGRAMS.iter().enumerate() {
                 if let Err(e) = load_only(ebpf, btf, name, *kind, target) {
                     for (n, k, _) in &PROGRAMS[..=i] {
@@ -884,10 +994,60 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
                     return (Tracker::Absent(e), Vec::new());
                 }
             }
+            // Lot 281 (#494's N1/N2): the maps frozen before anything can
+            // reach them by a pin — a handle on them, taken now or in any
+            // window after, writes nothing; an adoption's maps checked to be
+            // the ones registered, and frozen if they were not.
+            let fail = |ebpf: &mut Ebpf, why: String, signed: Vec<String>| {
+                for (n, k, _) in &PROGRAMS {
+                    unload(ebpf, n, *k);
+                }
+                warn!(reason = %why, effect = ABSENT_EFFECT, "cgroup exemptions: tracker NOT attached");
+                (Tracker::Absent(why), signed)
+            };
+            if plan.adopt {
+                if let Err(why) = adopted_as_registered(ebpf, ADOPTED.get()) {
+                    return fail(
+                        ebpf,
+                        format!("the adopted tracker maps are not the ones verified: {why}"),
+                        vec![format!(
+                            "the tracker's registered maps changed between their check and the \
+                             load ({why}): no tracker this boot; the next start resets the marks"
+                        )],
+                    );
+                }
+            }
+            match freeze_pinned(ebpf) {
+                Ok(unfrozen) if plan.adopt && !unfrozen.is_empty() => signed.push(format!(
+                    "the adopted tracker maps {} were not frozen (no start of this version made \
+                     them): frozen now — a handle taken on them before writes nothing from now",
+                    unfrozen.join(", ")
+                )),
+                Ok(_) => {}
+                Err(e) => {
+                    return fail(ebpf, format!("the tracker's maps not frozen: {e}"), signed);
+                }
+            }
+            let dir = if plan.adopt {
+                plan.dir.clone()
+            } else {
+                match pin_new(ebpf, root, &plan.dir) {
+                    Ok((d, planted)) => {
+                        signed.extend(planted);
+                        d
+                    }
+                    Err((why, planted)) => {
+                        signed.extend(planted);
+                        return fail(ebpf, why, signed);
+                    }
+                }
+            };
+            let _ = FINAL_DIR.set(dir.clone());
+            let dir = dir.as_path();
             for (name, kind, _) in &PROGRAMS {
                 if let Err(e) = pin_fresh(ebpf, dir, name, *kind) {
                     warn!(program = name, error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker attach or pin FAILED");
-                    return (Tracker::Absent(e), Vec::new());
+                    return (Tracker::Absent(e), signed);
                 }
             }
             // The third review of #494 (R2-a): a reset makes every process
@@ -906,7 +1066,8 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
                 warn!(reason = %why, "cgroup exemptions: marks reset — every process started before now is not known until it exits");
                 signed.push(format!(
                     "{why}; every process started before this start is not known (refused an \
-                     exemption by cgroup or unit) until it exits — restart the exempt services"
+                     exemption by executable, cgroup or unit) until it exits — restart the exempt \
+                     services"
                 ));
             }
             if let Some(note) = &plan.note {
@@ -943,6 +1104,16 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
                     return (Tracker::Absent(e), Vec::new());
                 }
             }
+            if let Err(e) = freeze_pinned(ebpf) {
+                for (n, k, _) in &PROGRAMS {
+                    unload(ebpf, n, *k);
+                }
+                warn!(error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: the tracker's maps NOT frozen");
+                return (
+                    Tracker::Absent(format!("the tracker's maps not frozen: {e}")),
+                    Vec::new(),
+                );
+            }
             warn!("cgroup exemptions: tracker attached WITHOUT pin (no bpffs): not kept while no agent runs");
         }
     }
@@ -968,6 +1139,7 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
         let epoch = Epoch::try_from(take(ebpf, EPOCH_MAP)?).map_err(|e| e.to_string())?;
         let names = Names::try_from(take(ebpf, NAMES_MAP)?).map_err(|e| e.to_string())?;
         let silent = Silent::try_from(take(ebpf, SILENT_MAP)?).map_err(|e| e.to_string())?;
+        let epoch_rt = EpochRt::try_from(take(ebpf, EPOCH_RT_MAP)?).map_err(|e| e.to_string())?;
         Ok(Marks {
             joined: Arc::new(Mutex::new(joined)),
             lost: Arc::new(Mutex::new(lost)),
@@ -975,6 +1147,8 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
             epoch: Arc::new(Mutex::new(epoch)),
             names: Arc::new(Mutex::new(names)),
             silent: Arc::new(Mutex::new(silent)),
+            epoch_rt: Arc::new(Mutex::new(epoch_rt)),
+            armed: Arc::new(AtomicBool::new(false)),
         })
     })();
     match maps {
@@ -994,6 +1168,263 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
             warn!(error = %e, effect = ABSENT_EFFECT, "cgroup exemptions: tracker maps unavailable");
             (Tracker::Absent(e), signed)
         }
+    }
+}
+
+/// Lot 281: the tracker's map `name` in the loaded object.
+fn map_data<'a>(ebpf: &'a Ebpf, name: &str) -> Result<&'a MapData, String> {
+    match ebpf.map(name) {
+        Some(aya::maps::Map::HashMap(d)) | Some(aya::maps::Map::Array(d)) => Ok(d),
+        Some(_) => Err(format!("{name}: not the kind of map the tracker has")),
+        None => Err(format!("map {name} missing from the eBPF object")),
+    }
+}
+
+/// Lot 281 (#494's N1): the maps the load took for an adoption are the ones
+/// the registered state names (`registered`, verified before the load) —
+/// not a map swapped in at a pin between the check and the load.
+fn adopted_as_registered(ebpf: &Ebpf, registered: Option<&PinState>) -> Result<(), String> {
+    let st = registered.ok_or("no registered state was verified")?;
+    let mut loaded = Vec::new();
+    for name in PINNED_MAPS {
+        let id = map_data(ebpf, name)?
+            .info()
+            .map_err(|e| format!("{name}: {e}"))?
+            .id();
+        loaded.push((name, id));
+    }
+    ids_as_registered(st, &loaded)
+}
+
+/// Lot 281 (#494's N1): each of the tracker's maps the load took
+/// (`loaded`: name, id) is the one `st` registered.
+pub fn ids_as_registered(st: &PinState, loaded: &[(&str, u32)]) -> Result<(), String> {
+    for name in PINNED_MAPS {
+        let reg = st
+            .maps
+            .iter()
+            .find(|m| m.name == name)
+            .ok_or_else(|| format!("{name} not registered"))?;
+        let id = loaded
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, id)| *id)
+            .ok_or_else(|| format!("{name} not loaded"))?;
+        if id != reg.id {
+            return Err(format!("{name}: id {id} where {} was registered", reg.id));
+        }
+    }
+    Ok(())
+}
+
+/// What a `BPF_MAP_FREEZE` gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freeze {
+    /// Frozen now.
+    Now,
+    /// Frozen before (`EBUSY`): a start of this version made it.
+    Already,
+}
+
+/// The outcome of `BPF_MAP_FREEZE` as the kernel answered it (`errno` 0 for
+/// success) — `EBUSY` is a map frozen by another between our read of its
+/// state and the call; anything else a failure. (A map frozen before the
+/// call answers `EPERM`, not `EBUSY`: `map_freeze` checks the descriptor's
+/// write right, which a frozen map has lost, first — lot 281's lab; hence
+/// [`fdinfo_frozen`] before the call.)
+pub fn freeze_outcome(errno: i32) -> Result<Freeze, String> {
+    match errno {
+        0 => Ok(Freeze::Now),
+        libc::EBUSY => Ok(Freeze::Already),
+        e => Err(std::io::Error::from_raw_os_error(e).to_string()),
+    }
+}
+
+/// Lot 281: a map's `frozen` state as its descriptor's fdinfo says it
+/// (`frozen:\t1`, 5.2+); `None` when the line is not there.
+pub fn fdinfo_frozen(fdinfo: &str) -> Option<bool> {
+    fdinfo
+        .lines()
+        .find_map(|l| l.strip_prefix("frozen:"))
+        .and_then(|v| match v.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
+}
+
+/// Lot 281 (#494's N2): every pinned map of the tracker frozen
+/// (`BPF_MAP_FREEZE`): no handle — the agent's, one a root took in a window
+/// or an upgrade's gap, a planted map's maker's — writes it from now; the
+/// tracker's programs still do. A map already frozen (an adoption's: the
+/// start that made it froze it) is left as it is — its state read from the
+/// descriptor's fdinfo; one whose state cannot be read is a failure (no
+/// tracker: fail closed). The maps that were not frozen before.
+fn freeze_pinned(ebpf: &Ebpf) -> Result<Vec<&'static str>, String> {
+    use std::os::fd::{AsFd, AsRawFd};
+    const MAP_FREEZE: libc::c_long = common::bpf_cmd::BPF_MAP_FREEZE as libc::c_long;
+    #[repr(C)]
+    struct FreezeAttr {
+        map_fd: u32,
+    }
+    let mut unfrozen = Vec::new();
+    for name in PINNED_MAPS {
+        let fd = map_data(ebpf, name)?.fd().as_fd().as_raw_fd();
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+            .map_err(|e| format!("{name}: its fdinfo: {e}"))?;
+        match fdinfo_frozen(&info) {
+            Some(true) => continue,
+            Some(false) => {}
+            None => return Err(format!("{name}: no frozen state in its fdinfo")),
+        }
+        let attr = FreezeAttr { map_fd: fd as u32 };
+        // SAFETY: bpf(BPF_MAP_FREEZE) with a valid, fully initialised
+        // attribute block of its exact size; the fd is borrowed from the
+        // live map.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                MAP_FREEZE,
+                &attr as *const FreezeAttr as *const libc::c_void,
+                std::mem::size_of::<FreezeAttr>() as u32,
+            )
+        };
+        let errno = if rc < 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        } else {
+            0
+        };
+        if freeze_outcome(errno).map_err(|e| format!("{name}: {e}"))? == Freeze::Now {
+            unfrozen.push(name);
+        }
+    }
+    Ok(unfrozen)
+}
+
+/// Lot 281 (#494's N1): the next generation's directory after `dir`, above
+/// every tracker directory beside `root` now (a plant made since the plan
+/// included).
+fn next_dir(root: &Path, dir: &Path) -> PathBuf {
+    let root_name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let gen = |p: &Path| {
+        p.file_name()
+            .and_then(|n| parse_pin_dir(&root_name, &n.to_string_lossy()))
+            .and_then(|(_, g)| g)
+    };
+    let top = other_pin_dirs(root, None)
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(std::iter::once(dir))
+        .filter_map(gen)
+        .max()
+        .unwrap_or(0);
+    PathBuf::from(common::cgroup_join::pin_dir(
+        &root.to_string_lossy(),
+        top.saturating_add(1),
+    ))
+}
+
+/// Lot 281 (#494's N1): `dir` made by this start — `0700`, never a link —
+/// for a new generation: one that exists already is a plant (nothing named
+/// it before the plan's listing).
+fn fresh_dir(dir: &Path) -> Result<(), String> {
+    if let Some(why) = antitamper_bpf::pin_root_refusal_at(dir) {
+        return Err(why);
+    }
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
+            "{} exists already: made by someone else between the plan and the load",
+            dir.display()
+        )),
+        Err(e) => Err(format!("creating {}: {e}", dir.display())),
+    }
+}
+
+/// Lot 281 (#494's N1): what a new directory holds that the tracker did not
+/// pin there — after its maps were pinned, nothing but them.
+pub fn foreign_entries(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| !PINNED_MAPS.contains(&n.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Lot 281 (#494's N1): the new generation's maps — made by the load,
+/// frozen — pinned after it, in a directory this start made: `dir`, or the
+/// next generation's when a plant is found in it (a file at a pin's path:
+/// `BPF_OBJ_PIN` refuses with `EEXIST`; anything else in it), each one
+/// signed. The plants go with their directory once the programs run (an
+/// unregistered tracker directory). The directory and the signed lines;
+/// past [`NEW_DIR_ATTEMPTS`], no tracker (fail closed).
+fn pin_new(
+    ebpf: &Ebpf,
+    root: &Path,
+    dir: &Path,
+) -> Result<(PathBuf, Vec<String>), (String, Vec<String>)> {
+    let mut signed = Vec::new();
+    let mut dir = dir.to_path_buf();
+    for attempt in 0..NEW_DIR_ATTEMPTS {
+        let tried = (|| -> Result<(), String> {
+            fresh_dir(&dir)?;
+            if attempt == 0 {
+                debug_plant(&dir);
+            }
+            for name in PINNED_MAPS {
+                map_data(ebpf, name)?
+                    .pin(dir.join(name))
+                    .map_err(|e| format!("pinning {name}: {e}"))?;
+            }
+            let names: Vec<String> = std::fs::read_dir(&dir)
+                .map_err(|e| e.to_string())?
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            let foreign = foreign_entries(&names);
+            if !foreign.is_empty() {
+                return Err(format!("{} planted in it", foreign.join(", ")));
+            }
+            Ok(())
+        })();
+        match tried {
+            Ok(()) => return Ok((dir, signed)),
+            Err(why) => {
+                let next = next_dir(root, &dir);
+                warn!(dir = %dir.display(), reason = %why, next = %next.display(), "cgroup exemptions: the new tracker directory was not the tracker's alone (a plant in it) — its maps go to the next generation");
+                signed.push(format!(
+                    "the new tracker directory {} was not the tracker's alone ({why}): never \
+                     adopted, its maps pinned in {} instead",
+                    dir.display(),
+                    next.display()
+                ));
+                dir = next;
+            }
+        }
+    }
+    Err((
+        format!("no new tracker directory free of plants after {NEW_DIR_ATTEMPTS} tries"),
+        signed,
+    ))
+}
+
+/// A `debug-trigger` build's `NN_DEBUG_CGROUP_JOIN_PLANT=1`: a plant made
+/// in the new directory between its making and its maps' pinning (a
+/// directory at the marks' pin path, as a root watching the bpffs could) —
+/// the privileged test of #494's N1. Never in a release.
+fn debug_plant(_dir: &Path) {
+    #[cfg(feature = "debug-trigger")]
+    if std::env::var("NN_DEBUG_CGROUP_JOIN_PLANT").as_deref() == Ok("1") {
+        let r = std::fs::create_dir(_dir.join(JOINED_MAP));
+        warn!(
+            dir = %_dir.display(),
+            planted = r.is_ok(),
+            "cgroup exemptions: debug — a plant in the new tracker directory"
+        );
     }
 }
 
@@ -1018,6 +1449,9 @@ fn load_only(
         Kind::TpBtf => <&mut BtfTracePoint>::try_from(prog)
             .map_err(|e| e.to_string())
             .and_then(|p| p.load(target, btf).map_err(|e| format!("{e:#}"))),
+        Kind::Lsm => <&mut Lsm>::try_from(prog)
+            .map_err(|e| e.to_string())
+            .and_then(|p| p.load(target, btf).map_err(|e| format!("{e:#}"))),
     };
     r.map_err(|e| format!("{name} ({target}): {e}"))
 }
@@ -1027,8 +1461,49 @@ fn load_only(
 pub struct Mark {
     /// `common::cgroup_join::HOW_*`.
     pub how: u8,
-    /// The writer of the move, the forker of the start, or the parent.
+    /// The writer of the move, the forker of the start, or the parent —
+    /// lot 281: the injector (the parent, for an inherited taint).
     pub by: u32,
+}
+
+impl Mark {
+    /// Lot 277: it does not run where it started (moved, born into its
+    /// cgroup, or forked from one that was) — the placement bits.
+    pub fn placed(&self) -> bool {
+        self.how & HOW_PLACE != 0
+    }
+
+    /// Lot 281: what its taint bits say of its code.
+    pub fn injected(&self) -> Injected {
+        if self.how & HOW_TAINT == 0 {
+            Injected::No
+        } else {
+            Injected::Yes {
+                by: self.by,
+                inherited: self.how & HOW_INJECTED == 0,
+            }
+        }
+    }
+}
+
+/// Lot 281: the exemption check's two questions on one group's mark —
+/// `started` (lot 277: `Some(true)` it runs where it started) and
+/// `injected` — from `lost` (its byte), `after` (started after the marks'
+/// last reset) and `mark`, as read: not known (`None`) when the group is
+/// lost, started before the reset, or its mark unread.
+pub fn judge(
+    lost: Option<bool>,
+    after: bool,
+    mark: Result<Option<Mark>, ()>,
+) -> Option<(bool, Injected)> {
+    if lost != Some(false) || !after {
+        return None;
+    }
+    match mark {
+        Ok(None) => Some((true, Injected::No)),
+        Ok(Some(m)) => Some((!m.placed(), m.injected())),
+        Err(()) => None,
+    }
 }
 
 impl Marks {
@@ -1037,22 +1512,52 @@ impl Marks {
     /// `Some(true)` not marked, `Some(false)` marked, `None` not known — the
     /// group's mark could not be taken (its bit in `CGROUP_JOIN_LOST`: that
     /// tree only, the review of #494, D2), a failed read, no answer in time.
+    ///
+    /// Lot 281: a mark of the taint alone (code injected into a process
+    /// started where it runs) is "started here" — the exemption is then
+    /// refused by [`Self::injected`], which says why. Nothing is known
+    /// until the tracker is armed ([`arm`]).
     pub fn started(&self, tgid: u32, start_boot_ns: Option<u64>) -> Option<bool> {
-        let (joined, lost, epoch) = (
+        self.both(tgid, start_boot_ns).map(|(s, _)| s)
+    }
+
+    /// Lot 281: the injection taint of thread group `tgid`, in one errand —
+    /// `None` not known (not armed, the group lost, started before the
+    /// marks' last reset, a failed read).
+    pub fn injected(&self, tgid: u32, start_boot_ns: Option<u64>) -> Option<Injected> {
+        self.both(tgid, start_boot_ns).map(|(_, i)| i)
+    }
+
+    /// [`judge`] on the group's byte, the marks' epoch (the pinned one and
+    /// a request not yet taken in, the later) and its mark, in one errand.
+    fn both(&self, tgid: u32, start_boot_ns: Option<u64>) -> Option<(bool, Injected)> {
+        if !self.armed.load(Ordering::Acquire) {
+            return None;
+        }
+        let (joined, lost, epoch, epoch_rt) = (
             Arc::clone(&self.joined),
             Arc::clone(&self.lost),
             Arc::clone(&self.epoch),
+            Arc::clone(&self.epoch_rt),
         );
         crate::caps::errands::run(move || {
-            if lost_in(&lost.lock(), tgid).ok()? {
-                return None;
-            }
-            if !after_epoch(epoch.lock().get(&1, 0).ok()?, start_boot_ns) {
-                return None;
-            }
-            mark_in(&joined.lock(), tgid).ok().map(|m| m.is_none())
+            let reset = epoch
+                .lock()
+                .get(&1, 0)
+                .ok()?
+                .max(epoch_rt.lock().get(&1, 0).ok()?);
+            judge(
+                lost_in(&lost.lock(), tgid).ok(),
+                after_epoch(reset, start_boot_ns),
+                mark_in(&joined.lock(), tgid).map_err(drop),
+            )
         })
         .flatten()
+    }
+
+    /// Lot 281: the tracker armed — its answers given from now.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
     }
 
     /// The mark of thread group `tgid`, if any (a tool's, a test's read:
@@ -1078,8 +1583,12 @@ impl Marks {
 
     /// Lot 280b: the marks' epoch reset to this instant (every process
     /// started before it not known until it exits), on the caller's thread.
+    /// Lot 281: asked for in the per-load request the fork program takes in
+    /// (the pinned epoch is frozen).
     pub fn reset_epoch(&self) -> Result<(), String> {
-        write_epoch(&mut self.epoch.lock())
+        write_epoch(&mut self.epoch_rt.lock())?;
+        promote_now();
+        Ok(())
     }
 
     /// Give the kernel `names` ([`exempt_names`]) in place of what it had.
@@ -1097,17 +1606,6 @@ impl Marks {
             map.insert(k, v, 0).map_err(|e| e.to_string())?;
         }
         Ok(names.len())
-    }
-
-    /// Remove the marks of thread groups `proc_root` holds no more (gone
-    /// while no agent ran, so no exit removed them); the number removed.
-    pub fn sweep(&self, proc_root: &Path) -> usize {
-        let mut map = self.joined.lock();
-        let keys: Vec<u32> = map.keys().filter_map(Result::ok).collect();
-        gone(&keys, proc_root)
-            .into_iter()
-            .filter(|k| map.remove(k).is_ok())
-            .count()
     }
 }
 
@@ -1297,6 +1795,68 @@ pub fn pinned_dir(root: &Path) -> Result<PathBuf, String> {
 /// BPF map guard refuses a write handle on the agent's maps to any other
 /// process, and a read needs none.
 fn open_pinned_ro(path: &Path) -> Result<MapData, String> {
+    open_pinned(path, true)
+}
+
+/// Lot 281 (#494's N2): a write through a handle on each pinned map of the
+/// tracker beside bpffs `root` — a test's, a tool's probe of the freeze:
+/// per map, the error that refused it (the handle itself, where the BPF
+/// map guard refuses one; else the write). `Err` when a write went through
+/// (put back as it was).
+pub fn pinned_writes(root: &Path) -> Result<Vec<(&'static str, String)>, String> {
+    let dir = pinned_dir(root)?;
+    let mut out = Vec::new();
+    for name in PINNED_MAPS {
+        let md = match open_pinned(&dir.join(name), false) {
+            Ok(md) => md,
+            Err(e) => {
+                out.push((name, format!("handle refused: {e}")));
+                continue;
+            }
+        };
+        let refused = if name == JOINED_MAP {
+            let mut map =
+                Joined::try_from(aya::maps::Map::HashMap(md)).map_err(|e| e.to_string())?;
+            let probe = u32::MAX - 1;
+            match map.insert(probe, [0, 0], 0) {
+                Ok(()) => {
+                    let _ = map.remove(&probe);
+                    None
+                }
+                Err(e) => Some(with_sources(&e)),
+            }
+        } else if name == LOST_MAP {
+            let mut map = Lost::try_from(aya::maps::Map::Array(md)).map_err(|e| e.to_string())?;
+            let v = map.get(&0, 0).map_err(|e| e.to_string())?;
+            map.set(0, v, 0).err().map(|e| with_sources(&e))
+        } else {
+            let mut map = Stats::try_from(aya::maps::Map::Array(md)).map_err(|e| e.to_string())?;
+            let v = map.get(&0, 0).map_err(|e| e.to_string())?;
+            map.set(0, v, 0).err().map(|e| with_sources(&e))
+        };
+        match refused {
+            Some(e) => out.push((name, e)),
+            None => return Err(format!("{name}: a write through a handle went through")),
+        }
+    }
+    Ok(out)
+}
+
+/// `e` and its sources (aya's errors put the system call's own in the
+/// source: `` `bpf_map_update_elem` failed: Operation not permitted``).
+pub fn with_sources(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut cur = e.source();
+    while let Some(c) = cur {
+        s.push_str(": ");
+        s.push_str(&c.to_string());
+        cur = c.source();
+    }
+    s
+}
+
+/// A pinned map opened (`BPF_OBJ_GET`), read-only with `ro`.
+fn open_pinned(path: &Path, ro: bool) -> Result<MapData, String> {
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     const BPF_OBJ_GET: libc::c_long = common::bpf_cmd::BPF_OBJ_GET as libc::c_long;
@@ -1311,7 +1871,7 @@ fn open_pinned_ro(path: &Path) -> Result<MapData, String> {
     let attr = ObjGet {
         pathname: c.as_ptr() as u64,
         bpf_fd: 0,
-        file_flags: BPF_F_RDONLY,
+        file_flags: if ro { BPF_F_RDONLY } else { 0 },
     };
     // SAFETY: bpf(BPF_OBJ_GET) with a valid attribute block and a
     // NUL-terminated path that outlives the call.
@@ -1362,15 +1922,6 @@ pub fn pinned_lost(root: &Path, tgid: u32) -> Result<bool, String> {
     let md = open_pinned_ro(&pinned_dir(root)?.join(LOST_MAP))?;
     let map = Lost::try_from(aya::maps::Map::Array(md)).map_err(|e| e.to_string())?;
     lost_in(&map, tgid)
-}
-
-/// The thread groups among `tgids` that `proc_root` holds no more.
-fn gone(tgids: &[u32], proc_root: &Path) -> Vec<u32> {
-    tgids
-        .iter()
-        .copied()
-        .filter(|k| !proc_root.join(k.to_string()).exists())
-        .collect()
 }
 
 /// Lot 277: the policy's exemption names the kernel matches a move's
@@ -1484,6 +2035,68 @@ pub fn started_in_cgroup(proc_root: &Path, pid: u32) -> Option<bool> {
     m.started(tgid, start_boot_ns(proc_root, tgid))
 }
 
+/// Lot 281: whether code-injection access to process `pid` (or to one it
+/// was forked from, after it) was given to another, for the exemption
+/// check (`ActorFacts::injected`): `None` not known — no tracker this boot,
+/// not armed yet, the process gone, a mark the kernel could not take, a
+/// start before the marks' last reset. Read on the errands thread; only
+/// when an exemption by executable, cgroup or unit matched.
+pub fn injected(proc_root: &Path, pid: u32) -> Option<Injected> {
+    let Some(Tracker::Attached(m)) = tracker() else {
+        return None;
+    };
+    let tgid = tgid_of(proc_root, pid)?;
+    m.injected(tgid, start_boot_ns(proc_root, tgid))
+}
+
+/// Lot 281 (#494's N1/N2): the tracker armed — its pins and its state
+/// protected by the caller (the anti-tamper start): from now its answers
+/// are given and the exemptions by executable, cgroup or unit can hold.
+/// Before, every one was refused. Logged with the time since the plan (the
+/// lab's measure of that window); `None` without a tracker.
+pub fn arm() -> Option<std::time::Duration> {
+    let Some(Tracker::Attached(m)) = tracker() else {
+        return None;
+    };
+    m.arm();
+    let since = PLANNED_AT.get().map(Instant::elapsed).unwrap_or_default();
+    let fresh = PLAN
+        .get()
+        .and_then(|r| r.as_ref().ok())
+        .is_some_and(|p| !p.adopt);
+    info!(
+        since_plan_ms = since.as_millis() as u64,
+        new_generation = fresh,
+        dir = pin_dir_now().map(|d| d.display().to_string()),
+        "cgroup exemptions: the tracker is armed — exemptions by executable, cgroup or unit are \
+         honoured from now (none before)"
+    );
+    debug_self_inject();
+    Some(since)
+}
+
+/// A `debug-trigger` build's `NN_DEBUG_CGROUP_JOIN_SELF_INJECT=<pid>`: the
+/// agent opens `/proc/<pid>/mem` for writing once armed (an attach-mode
+/// access that would taint `pid` were it anyone's but the family's) — the
+/// privileged test of the family's exclusion. Never in a release.
+fn debug_self_inject() {
+    #[cfg(feature = "debug-trigger")]
+    if let Some(pid) = std::env::var("NN_DEBUG_CGROUP_JOIN_SELF_INJECT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        let r = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/{pid}/mem"));
+        info!(
+            pid,
+            opened = r.is_ok(),
+            "cgroup exemptions: debug — the agent's own write handle on /proc/<pid>/mem"
+        );
+    }
+}
+
 /// The tracker's line for the journal at the start: its counters.
 pub fn describe() -> String {
     match tracker() {
@@ -1492,9 +2105,11 @@ pub fn describe() -> String {
         Some(Tracker::Attached(m)) => {
             let s = |slot| m.stat(slot).map_or("?".to_string(), |v| v.to_string());
             format!(
-                "attached: {} roots marked, {} moves into an exempt cgroup, {} marks lost",
+                "attached: {} roots marked, {} moves into an exempt cgroup, {} processes injected \
+                 into, {} marks lost",
                 s(STAT_ROOTS),
                 s(STAT_INTO_EXEMPT),
+                s(STAT_INJECTED),
                 s(STAT_LOST)
             )
         }
@@ -1535,6 +2150,9 @@ mod tests {
         ] {
             std::fs::write(old.join(f), "").unwrap();
         }
+        // lot 281: a plant at a pin's path may be a directory
+        std::fs::create_dir_all(other.join("CGROUP_JOINED/deeper")).unwrap();
+        std::fs::write(other.join("CGROUP_JOINED/deeper/x"), "").unwrap();
         purge_pin_dir(&old);
         purge_pin_dir(&other);
         assert!(!old.exists() && !other.exists());
@@ -1644,7 +2262,7 @@ mod tests {
     #[test]
     fn a_start_adopts_only_the_registered_pins_and_signs_every_reset() {
         let root = Path::new("/b/northnarrow");
-        let d = |g: u32| PathBuf::from(format!("/b/northnarrow-cgroup-join-v1_{g}"));
+        let d = |g: u32| PathBuf::from(format!("/b/northnarrow-cgroup-join-v{PIN_SCHEMA}_{g}"));
         let st = |dir: PathBuf| PinState {
             boot: "B".to_string(),
             dir,
@@ -1724,6 +2342,24 @@ mod tests {
         );
         assert!(!p.adopt && p.dir == d(5));
         assert!(p.reset.unwrap().contains("schema v0"));
+        // lot 281: the upgrade from schema 1 (no injection taint in its
+        // marks) is a signed reset, never an adoption
+        assert_eq!(PIN_SCHEMA, 2);
+        let v1 = PathBuf::from("/b/northnarrow-cgroup-join-v1_0");
+        let p = plan(
+            root,
+            "B",
+            Some(&st(v1.clone())),
+            std::slice::from_ref(&v1),
+            &ok(63_222),
+            63_222,
+            None,
+        );
+        assert!(!p.adopt && p.dir == d(1));
+        assert!(
+            p.reset.unwrap().contains("schema v1"),
+            "the v1 maps are not migrated"
+        );
         // a debug build's size is a reset, never the host's
         let p = plan(root, "B", Some(&s0), &[d(0)], &ok(63_222), 63_222, Some(64));
         assert!(!p.adopt && p.dir == d(1) && p.reset.is_none());
@@ -1734,6 +2370,190 @@ mod tests {
         // one is not adopted either: the registered one is
         let p = plan(root, "B", Some(&s0), &[d(0), d(7)], &ok(10), 10, None);
         assert!(p.adopt && p.dir == d(0));
+    }
+
+    /// Lot 281 (named, #494's N1/N2): the exemption check's answer from one
+    /// mark — the placement for a cgroup or unit, the taint for every kind;
+    /// nothing known while the group is lost, started before the reset, or
+    /// its mark unread.
+    #[test]
+    fn the_check_reads_the_placement_and_the_taint_from_one_mark() {
+        use common::cgroup_join::{HOW_INHERITED, HOW_MOVED, HOW_TAINT_INHERITED};
+        let m = |how, by| Ok(Some(Mark { how, by }));
+        assert_eq!(
+            judge(Some(false), true, Ok(None)),
+            Some((true, Injected::No))
+        );
+        assert_eq!(
+            judge(Some(false), true, m(HOW_MOVED, 9)),
+            Some((false, Injected::No))
+        );
+        assert_eq!(
+            judge(Some(false), true, m(HOW_INJECTED, 42)),
+            Some((
+                true,
+                Injected::Yes {
+                    by: 42,
+                    inherited: false
+                }
+            )),
+            "injected alone: it still runs where it started"
+        );
+        assert_eq!(
+            judge(Some(false), true, m(HOW_MOVED | HOW_INJECTED, 42)),
+            Some((
+                false,
+                Injected::Yes {
+                    by: 42,
+                    inherited: false
+                }
+            ))
+        );
+        assert_eq!(
+            judge(Some(false), true, m(HOW_INHERITED | HOW_TAINT_INHERITED, 7)),
+            Some((
+                false,
+                Injected::Yes {
+                    by: 7,
+                    inherited: true
+                }
+            ))
+        );
+        assert_eq!(
+            judge(Some(false), true, m(HOW_TAINT_INHERITED, 7)).map(|(s, _)| s),
+            Some(true)
+        );
+        for (lost, after, mark) in [
+            (Some(true), true, Ok(None)),
+            (None, true, Ok(None)),
+            (Some(false), false, Ok(None)),
+            (Some(false), true, Err(())),
+        ] {
+            assert_eq!(judge(lost, after, mark), None, "{lost:?} {after}");
+        }
+    }
+
+    /// Lot 281: an aya error is rendered with its system call's errno.
+    #[test]
+    fn a_refused_write_names_its_errno() {
+        let e = aya::maps::MapError::SyscallError(aya::sys::SyscallError {
+            call: "bpf_map_update_elem",
+            io_error: std::io::Error::from_raw_os_error(libc::EPERM),
+        });
+        let s = with_sources(&e);
+        assert!(s.contains("bpf_map_update_elem"), "{s}");
+        assert!(s.contains("Operation not permitted"), "{s}");
+    }
+
+    /// Lot 281 (named, #494's N2): a map's frozen state is read from its
+    /// descriptor's fdinfo (a frozen map refuses a second freeze with
+    /// EPERM, which the call alone cannot tell from a failure — the lab's
+    /// find); a missing line is no state.
+    #[test]
+    fn a_frozen_map_is_told_by_its_fdinfo() {
+        let info = |f: &str| {
+            format!(
+                "pos:\t0\nflags:\t02000002\nmnt_id:\t15\nino:\t1052\nmap_type:\t1\n\
+                 key_size:\t4\nvalue_size:\t16\nmax_entries:\t63222\nmap_flags:\t0x1\n\
+                 map_extra:\t0x0\nmemlock:\t1049664\nmap_id:\t42\nfrozen:\t{f}\n"
+            )
+        };
+        assert_eq!(fdinfo_frozen(&info("1")), Some(true));
+        assert_eq!(fdinfo_frozen(&info("0")), Some(false));
+        assert_eq!(fdinfo_frozen(&info("x")), None);
+        assert_eq!(fdinfo_frozen("map_id:\t42\n"), None);
+        // the host's own: a map this test cannot make; at least the parse
+        // of a real fdinfo of this process (no frozen line) is None
+        let own = std::fs::read_to_string("/proc/self/fdinfo/0").unwrap_or_default();
+        assert_eq!(fdinfo_frozen(&own), None);
+    }
+
+    /// Lot 281 (named, #494's N2): a freeze that answers EBUSY is a map
+    /// frozen before — an adoption's of this version; any other error is
+    /// no tracker.
+    #[test]
+    fn a_map_frozen_before_is_told_from_a_failed_freeze() {
+        assert_eq!(freeze_outcome(0), Ok(Freeze::Now));
+        assert_eq!(freeze_outcome(libc::EBUSY), Ok(Freeze::Already));
+        assert!(freeze_outcome(libc::EPERM).is_err());
+        assert!(freeze_outcome(libc::EINVAL).is_err());
+    }
+
+    /// Lot 281 (named, #494's N1): the maps an adoption's load took are the
+    /// ones registered — one swapped in at a pin between the check and the
+    /// load is refused, by name.
+    #[test]
+    fn an_adoption_takes_only_the_registered_maps() {
+        let st = PinState {
+            boot: "B".into(),
+            dir: PathBuf::from("/b/northnarrow-cgroup-join-v2_0"),
+            maps: PINNED_MAPS
+                .iter()
+                .enumerate()
+                .map(|(i, n)| reg(n, 10 + i as u32, 1))
+                .collect(),
+        };
+        let loaded: Vec<(&str, u32)> = PINNED_MAPS
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (*n, 10 + i as u32))
+            .collect();
+        assert_eq!(ids_as_registered(&st, &loaded), Ok(()));
+        for k in 0..PINNED_MAPS.len() {
+            let mut swapped = loaded.clone();
+            swapped[k].1 = 99;
+            let e = ids_as_registered(&st, &swapped).unwrap_err();
+            assert!(e.contains(PINNED_MAPS[k]) && e.contains("id 99"), "{e}");
+        }
+        assert!(
+            ids_as_registered(&st, &loaded[1..]).is_err(),
+            "a map not loaded"
+        );
+        let mut partial = st.clone();
+        partial.maps.pop();
+        assert!(
+            ids_as_registered(&partial, &loaded).is_err(),
+            "a map not registered"
+        );
+    }
+
+    /// Lot 281 (named, #494's N1): a new generation's directory is made by
+    /// the start (one that exists is a plant), holds the four maps and
+    /// nothing else, and the next generation is above every directory
+    /// beside the root — a plant made since the plan included.
+    #[test]
+    fn a_new_generation_is_made_by_the_start_and_holds_its_maps_alone() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("northnarrow");
+        std::fs::create_dir(&root).unwrap();
+        let g = |n: u32| PathBuf::from(common::cgroup_join::pin_dir(&root.to_string_lossy(), n));
+        assert_eq!(fresh_dir(&g(0)), Ok(()));
+        assert!(fresh_dir(&g(0)).unwrap_err().contains("exists already"));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(g(0)).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        std::os::unix::fs::symlink(t.path(), g(1)).unwrap();
+        assert!(
+            fresh_dir(&g(1)).is_err(),
+            "a link is never made the directory"
+        );
+        assert_eq!(next_dir(&root, &g(0)), g(2), "above the planted link's");
+        std::fs::create_dir(g(6)).unwrap();
+        assert_eq!(next_dir(&root, &g(2)), g(7));
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(foreign_entries(&names(&PINNED_MAPS)).is_empty());
+        assert_eq!(
+            foreign_entries(&names(&[
+                "CGROUP_JOINED",
+                "planted",
+                "prog_cgroup_join_mark"
+            ])),
+            names(&["planted", "prog_cgroup_join_mark"]),
+            "before the programs are pinned, a program's pin is a plant too"
+        );
+        const { assert!(NEW_DIR_ATTEMPTS >= 2) };
     }
 
     /// The third review of #494, R2-b: a registered directory holds the
@@ -1864,10 +2684,21 @@ mod tests {
                 None
             );
         }
+        // lot 281: the two LSM programs of the injection taint, the rest the
+        // BTF targets' (and the move guard's fexit target)
+        let lsm: Vec<&str> = PROGRAMS
+            .iter()
+            .filter(|(_, k, _)| *k == Kind::Lsm)
+            .map(|(_, _, t)| *t)
+            .collect();
+        assert_eq!(lsm, ["ptrace_access_check", "ptrace_traceme"]);
         assert_eq!(
             PROGRAMS.len(),
-            common::btf_offsets::CGROUP_JOIN_TARGETS.len() + 1
+            common::btf_offsets::CGROUP_JOIN_TARGETS.len() + 1 + lsm.len()
         );
+        assert!(PROGRAMS
+            .iter()
+            .all(|(n, _, _)| n.starts_with("cgroup_join_")));
         for t in common::btf_offsets::CGROUP_JOIN_TARGETS {
             assert!(
                 PROGRAMS.iter().any(|(_, _, target)| *target == t.name),
@@ -1875,16 +2706,6 @@ mod tests {
                 t.name
             );
         }
-    }
-
-    /// The start's sweep removes the marks of thread groups gone, and
-    /// only those.
-    #[test]
-    fn the_sweep_finds_the_groups_gone() {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(d.path().join("40")).unwrap();
-        assert_eq!(gone(&[40, 41, 42], d.path()), vec![41, 42]);
-        assert!(gone(&[40], d.path()).is_empty());
     }
 
     #[test]

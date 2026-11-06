@@ -1126,6 +1126,12 @@ pub enum FsProtectOperation {
     /// Lot 280b: NOT a refusal — a `cgroup/sysctl` program not the
     /// agent's found on the root cgroup; `target_ino` its id.
     SysctlRootProg,
+    /// Lot 281: NOT a refusal — code-injection access to a process was
+    /// first given to another (`common::cgroup_join::injection`): no
+    /// exemption of the per-rule policy holds for it or what it forks any
+    /// more. `target_ino` its tgid, `target_dev` the access
+    /// (`common::cgroup_join::inject_detail`).
+    ExemptInjection,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1171,6 +1177,7 @@ impl FsProtectOperation {
             crate::wire::FS_OP_KERNEL_TAINT => Self::KernelTaint,
             crate::wire::FS_OP_SYSCTL_ROOT_ATTACH => Self::SysctlRootAttach,
             crate::wire::FS_OP_SYSCTL_ROOT_PROG => Self::SysctlRootProg,
+            crate::wire::FS_OP_EXEMPT_INJECT => Self::ExemptInjection,
             other => Self::Unknown(other),
         }
     }
@@ -1214,6 +1221,7 @@ impl FsProtectOperation {
             Self::KernelTaint => "kernel_taint",
             Self::SysctlRootAttach => "sysctl_root_attach",
             Self::SysctlRootProg => "sysctl_root_prog",
+            Self::ExemptInjection => "exempt_injection",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -1817,6 +1825,12 @@ mod tests {
                 crate::wire::FS_OP_SYSCTL_ROOT_PROG,
                 FsProtectOperation::SysctlRootProg,
                 "sysctl_root_prog",
+            ),
+            // Lot 281
+            (
+                crate::wire::FS_OP_EXEMPT_INJECT,
+                FsProtectOperation::ExemptInjection,
+                "exempt_injection",
             ),
         ];
         for (byte, op, name) in cases {

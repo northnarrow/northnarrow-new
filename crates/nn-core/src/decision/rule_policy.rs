@@ -777,6 +777,76 @@ pub trait ActorFacts: Send + Sync {
     /// `None`: not known (no tracker on this kernel, a mark the kernel
     /// could not take) — not exempt either.
     fn started_in_cgroup(&self, pid: u32) -> Option<bool>;
+    /// Lot 281: whether code-injection access to `pid` — or to a process it
+    /// was forked from, after that access — was given to another process
+    /// (the kernel's marks, `nn_linux::cgroup_join`): an exemption by
+    /// executable, cgroup or unit then no longer holds for it. `None`: not
+    /// known (no tracker, the process gone or started before the marks'
+    /// last reset, a mark the kernel could not take) — no exemption either.
+    fn injected(&self, pid: u32) -> Option<Injected>;
+}
+
+/// Lot 281: what the kernel's marks say of the code a process runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Injected {
+    /// No code-injection access to it was ever given, nor to a process it
+    /// was forked from after such an access.
+    No,
+    /// Code-injection access to it was given to pid `by` (a debugger's
+    /// attach, a write handle on its memory, ...) — or, `inherited`, to a
+    /// process it was forked from (`by` its parent then).
+    Yes { by: u32, inherited: bool },
+}
+
+/// The outcome of an exemption that matched a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exempt {
+    /// The exemption holds: the match is recorded only.
+    Holds(String),
+    /// Lot 281: the exemption (by executable, cgroup or unit) matched, but
+    /// does not hold — code was injected into the process, or that is not
+    /// known (`why`): the match is judged as without it.
+    Revoked { exemption: String, why: String },
+}
+
+impl Exempt {
+    /// The exemption, when it holds.
+    pub fn holds(&self) -> Option<&str> {
+        match self {
+            Exempt::Holds(e) => Some(e),
+            Exempt::Revoked { .. } => None,
+        }
+    }
+}
+
+/// Lot 281: why an exemption by executable, cgroup or unit does not hold
+/// for a process, given what the marks say of its code (`None`: it holds).
+pub fn revoked_why(injected: Option<Injected>) -> Option<String> {
+    match injected {
+        Some(Injected::No) => None,
+        Some(Injected::Yes {
+            by,
+            inherited: false,
+        }) => Some(format!(
+            "code-injection access to it was given to pid {by} (a debugger's attach, a write \
+             handle on its memory, process_vm_writev, pidfd_getfd or PTRACE_TRACEME): revoked for \
+             the rest of its life and its children's"
+        )),
+        Some(Injected::Yes {
+            by,
+            inherited: true,
+        }) => Some(format!(
+            "it was forked from a process code-injection access to which had been given (its \
+             parent pid {by}): revoked for the rest of its life and its children's"
+        )),
+        None => Some(
+            "whether code was injected into it is not known (no start-in-cgroup tracker, the \
+             process gone or started before the marks' last reset, a mark the kernel could not \
+             take): an exemption by executable, cgroup or unit holds only for a process known \
+             clean"
+                .to_string(),
+        ),
+    }
 }
 
 /// The unit a cgroup path names: its last `.service` / `.scope` component.
@@ -791,13 +861,18 @@ fn unit_of(cgroup: &str) -> Option<&str> {
 /// present, at most once each. Lot 277: an exemption by cgroup or unit
 /// covers a process of that cgroup only if it started there
 /// ([`ActorFacts::started_in_cgroup`], read once, and only when a cgroup
-/// or a unit matched).
+/// or a unit matched). Lot 281: an exemption by executable, cgroup or unit
+/// that matched holds only for a process no code was injected into
+/// ([`ActorFacts::injected`], read once, after the match): else it is
+/// [`Exempt::Revoked`] — no other exemption is looked for (the taint voids
+/// them all). A uid exemption is the uid's, whatever code runs as it (root
+/// can become that uid without injecting anything): not revoked.
 pub fn exempt(
     ex: &[Exemption],
     pid: u32,
     event_uid: Option<u32>,
     facts: &dyn ActorFacts,
-) -> Option<String> {
+) -> Option<Exempt> {
     if ex.is_empty() {
         return None;
     }
@@ -835,10 +910,46 @@ pub fn exempt(
                 .is_some_and(|(p, h)| p == path && h == sha256),
         };
         if hit {
-            return Some(e.to_string());
+            if matches!(e, Exemption::Uid(_)) {
+                return Some(Exempt::Holds(e.to_string()));
+            }
+            return Some(match revoked_why(facts.injected(pid)) {
+                None => Exempt::Holds(e.to_string()),
+                Some(why) => Exempt::Revoked {
+                    exemption: e.to_string(),
+                    why,
+                },
+            });
         }
     }
     None
+}
+
+/// Lot 281: the exemption of `policy` (any rule's) that covers process
+/// `pid` whatever was injected into it — the agent's question when code
+/// was first injected into a process: was it an exempt one? `rule: what`.
+pub fn covering(policy: &RulePolicy, pid: u32, facts: &dyn ActorFacts) -> Option<String> {
+    struct Clean<'a>(&'a dyn ActorFacts);
+    impl ActorFacts for Clean<'_> {
+        fn uid(&self, pid: u32) -> Option<u32> {
+            self.0.uid(pid)
+        }
+        fn cgroup(&self, pid: u32) -> Option<String> {
+            self.0.cgroup(pid)
+        }
+        fn trusted_exe(&self, pid: u32) -> Option<(String, [u8; 32])> {
+            self.0.trusted_exe(pid)
+        }
+        fn started_in_cgroup(&self, pid: u32) -> Option<bool> {
+            self.0.started_in_cgroup(pid)
+        }
+        fn injected(&self, _: u32) -> Option<Injected> {
+            Some(Injected::No)
+        }
+    }
+    policy.all_exemptions().find_map(|(rule, ex)| {
+        exempt(ex, pid, None, &Clean(facts)).and_then(|e| e.holds().map(|e| format!("{rule}: {e}")))
+    })
 }
 
 #[cfg(test)]
@@ -1107,6 +1218,8 @@ mod tests {
         exe: Option<(&'static str, [u8; 32])>,
         /// Lot 277.
         started: Option<bool>,
+        /// Lot 281.
+        injected: Option<Injected>,
         reads: Mutex<Vec<&'static str>>,
     }
 
@@ -1127,6 +1240,10 @@ mod tests {
             self.reads.lock().push("started");
             self.started
         }
+        fn injected(&self, _: u32) -> Option<Injected> {
+            self.reads.lock().push("injected");
+            self.injected
+        }
     }
 
     fn facts() -> Facts {
@@ -1135,6 +1252,7 @@ mod tests {
             cgroup: Some("/system.slice/backup.service"),
             exe: Some(("/usr/bin/backup", [7u8; 32])),
             started: Some(true),
+            injected: Some(Injected::No),
             reads: Mutex::new(Vec::new()),
         }
     }
@@ -1218,7 +1336,8 @@ mod tests {
                 None,
                 &moved
             )
-            .as_deref(),
+            .as_ref()
+            .and_then(Exempt::holds),
             Some("uid 998")
         );
         // the start is read once, after a cgroup matched, never before
@@ -1253,7 +1372,10 @@ mod tests {
     fn exemptions_match_their_actor_only() {
         let f = facts();
         let ex = |e: Exemption| exempt(&[e], 42, None, &f);
-        assert_eq!(ex(Exemption::Uid(998)).as_deref(), Some("uid 998"));
+        assert_eq!(
+            ex(Exemption::Uid(998)).as_ref().and_then(Exempt::holds),
+            Some("uid 998")
+        );
         assert_eq!(ex(Exemption::Uid(999)), None);
         assert!(ex(Exemption::Unit("backup.service".into())).is_some());
         assert!(ex(Exemption::Unit("other.service".into())).is_none());
@@ -1282,9 +1404,10 @@ mod tests {
             cgroup: None,
             exe: None,
             started: None,
+            injected: None,
             reads: Mutex::new(Vec::new()),
         };
-        for e in [
+        for (case, e) in [
             Exemption::Uid(998),
             Exemption::Unit("backup.service".into()),
             Exemption::Cgroup("/system.slice/backup.service".into()),
@@ -1292,9 +1415,131 @@ mod tests {
                 path: "/usr/bin/backup".into(),
                 sha256: [7; 32],
             },
-        ] {
-            assert_eq!(exempt(std::slice::from_ref(&e), 42, None, &f), None, "{e}");
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                exempt(std::slice::from_ref(e), 42, None, &f).is_none(),
+                "case {case}"
+            );
         }
+    }
+
+    /// Lot 281 (named): an exemption by executable, cgroup or unit that
+    /// matched does not hold for a process code was injected into — nor
+    /// for one forked from it, nor where that is not known — and says why;
+    /// a uid exemption is the uid's and holds; the marks are read once,
+    /// after a match only; `covering` names the exemption whatever was
+    /// injected (the agent's question at the injection).
+    #[test]
+    fn an_exemption_is_revoked_once_code_was_injected() {
+        let exe = Exemption::Exe {
+            path: "/usr/bin/backup".into(),
+            sha256: [7; 32],
+        };
+        let kinds = [
+            exe.clone(),
+            Exemption::Unit("backup.service".into()),
+            Exemption::Cgroup("/system.slice/backup.service".into()),
+        ];
+        for (injected, needle) in [
+            (
+                Some(Injected::Yes {
+                    by: 4242,
+                    inherited: false,
+                }),
+                "given to pid 4242",
+            ),
+            (
+                Some(Injected::Yes {
+                    by: 77,
+                    inherited: true,
+                }),
+                "parent pid 77",
+            ),
+            (None, "not known"),
+        ] {
+            let f = Facts {
+                injected,
+                ..facts()
+            };
+            for (case, e) in kinds.iter().enumerate() {
+                match exempt(std::slice::from_ref(e), 42, None, &f) {
+                    Some(Exempt::Revoked { exemption, why }) => {
+                        assert!(exemption == e.to_string(), "case {case}");
+                        assert!(why.contains(needle), "case {case}: {needle}");
+                    }
+                    other => panic!("case {case}: revoked expected, found {}", other.is_some()),
+                }
+            }
+            // the uid's exemption holds, whatever runs as it
+            assert_eq!(
+                exempt(&[Exemption::Uid(998)], 42, None, &f),
+                Some(Exempt::Holds("uid 998".into()))
+            );
+            // the taint voids them all: the first match answers
+            assert!(matches!(
+                exempt(&[exe.clone(), Exemption::Uid(998)], 42, None, &f),
+                Some(Exempt::Revoked { .. })
+            ));
+        }
+        // a clean process keeps its exemptions
+        let f = facts();
+        for e in &kinds {
+            assert_eq!(
+                exempt(std::slice::from_ref(e), 42, None, &f),
+                Some(Exempt::Holds(e.to_string()))
+            );
+        }
+        // read once, after the match, never for a miss or a uid
+        let f = facts();
+        exempt(
+            &[
+                Exemption::Exe {
+                    path: "/usr/bin/other".into(),
+                    sha256: [7; 32],
+                },
+                Exemption::Uid(5),
+            ],
+            42,
+            None,
+            &f,
+        );
+        assert_eq!(*f.reads.lock(), vec!["exe", "uid"]);
+        let f = facts();
+        exempt(&[Exemption::Uid(998)], 42, None, &f);
+        assert_eq!(*f.reads.lock(), vec!["uid"]);
+        let f = facts();
+        exempt(&kinds[1..], 42, None, &f);
+        assert_eq!(*f.reads.lock(), vec!["cgroup", "started", "injected"]);
+        // the agent's question at the injection: the exemption, whatever
+        // the marks say now
+        let p = parse(
+            "exempt R017 uid 1\n\
+             exempt NN-L-IMP-001 exe /usr/bin/backup sha256 0707070707070707070707070707070707070707070707070707070707070707\n",
+        )
+        .unwrap();
+        let tainted = Facts {
+            injected: Some(Injected::Yes {
+                by: 1,
+                inherited: false,
+            }),
+            ..facts()
+        };
+        let got = covering(&p, 42, &tainted).expect("an exemption covered it");
+        assert!(
+            got.starts_with("NN-L-IMP-001_RansomwareEncryption: exe /usr/bin/backup"),
+            "{got}"
+        );
+        assert!(!tainted.reads.lock().contains(&"injected"));
+        let nobody = Facts {
+            exe: None,
+            uid: Some(5),
+            ..facts()
+        };
+        assert_eq!(covering(&p, 42, &nobody), None);
+        assert_eq!(covering(&RulePolicy::builtin(), 42, &tainted), None);
     }
 
     /// Facts are read only for the kinds present, once each.

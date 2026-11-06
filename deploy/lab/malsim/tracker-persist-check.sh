@@ -80,7 +80,8 @@ sudo "$NNADMIN" trusted-installer-grant --key "$KEY" --window-secs 300 >/dev/nul
 units_stop
 systemctl is-active --quiet northnarrow-agent && bad "the agent still runs"
 links=$(sudo sh -c "ls $dir0" | grep -c '^link_cgroup_join_')
-[[ $links -eq 5 ]] && pass "agent stopped: the tracker's 5 links still pinned in $dir0" || bad "links pinned: $links"
+# lot 281: seven programs (the injection taint's two LSM programs)
+[[ $links -eq 7 ]] && pass "agent stopped: the tracker's 7 links still pinned in $dir0" || bad "links pinned: $links"
 p2=$(mover nn277-persist-b /tmp/nn277-p2.pid)
 m2=$(mark_of "$p2"); m1=$(mark_of "$p1"); echo "    $m2"; echo "    $m1"
 grep -q "^$p2 moved $p2" <<<"$m2" && pass "a move with no agent running: marked" || bad "move while stopped: [$m2]"

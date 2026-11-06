@@ -66,7 +66,7 @@ fn the_fork_tracepoint_checks_every_birth_the_fentry_saw() {
         &[
             "let Some(ptgid) = tgid_of(parent) else {",
             "if check_birth(ptgid, child) {\n        return;\n    }",
-            "let marked = match CGROUP_JOINED.get(&ptgid) {",
+            "let (marked, phow) = match CGROUP_JOINED.get(&ptgid) {",
         ],
     )
     .unwrap();

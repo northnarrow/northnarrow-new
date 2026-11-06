@@ -748,6 +748,13 @@ impl<H: DecisionHost> TriggerDetector<H> {
         }
     }
 
+    /// Lot 281: whether `pid` belongs to an administrator's interactive
+    /// sudo/su session ([`AuthSessionTracker::interactive_admin_status`]),
+    /// `None` while it cannot be told — the injection record's lineage.
+    pub fn interactive_admin_status(&self, pid: u32, as_of: AsOf) -> Option<bool> {
+        self.auth.interactive_admin_status(pid, as_of)
+    }
+
     /// Review 52: a pending writer placed —
     /// [`AuthSessionTracker::interactive_admin_status`] and its session's
     /// scope — or `None` while it still cannot be. As of `as_of` (R12b,
@@ -896,12 +903,16 @@ impl<H: DecisionHost> TriggerDetector<H> {
             // Lot 280b: nor what the kernel-state round found (a new
             // kernel taint, a foreign program on the root's sysctl slot):
             // the kernel's record, no refusal — signed, the rules' to weigh.
+            // Lot 281: nor code-injection access to a process (a debugger's
+            // attach, any process's): recorded, the process's exemptions
+            // revoked — what it does next is judged without them.
             if !matches!(
                 operation,
                 nn_model::FsProtectOperation::CgroupJoin
                     | nn_model::FsProtectOperation::SysctlOptOut
                     | nn_model::FsProtectOperation::KernelTaint
                     | nn_model::FsProtectOperation::SysctlRootProg
+                    | nn_model::FsProtectOperation::ExemptInjection
             ) {
                 hits.push(if *pid == 1 {
                     TriggerType::RelayedTamperAttempt
@@ -2968,6 +2979,8 @@ mod tests {
         for op in [
             nn_model::FsProtectOperation::KernelTaint,
             nn_model::FsProtectOperation::SysctlRootProg,
+            // lot 281: an injection's record (no refusal) raises nothing
+            nn_model::FsProtectOperation::ExemptInjection,
         ] {
             assert!(det.detect(&ev(op), &[]).is_empty(), "{op}");
         }

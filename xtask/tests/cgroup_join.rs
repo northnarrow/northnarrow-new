@@ -51,6 +51,9 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
         "#[fentry(function = \"cgroup_post_fork\")]\npub fn cgroup_join_born(",
         "#[btf_tracepoint(function = \"sched_process_fork\")]\npub fn cgroup_join_fork(",
         "#[btf_tracepoint(function = \"sched_process_exit\")]\npub fn cgroup_join_exit(",
+        // lot 281: the injection taint's two LSM programs
+        "#[lsm(hook = \"ptrace_access_check\")]\npub fn cgroup_join_inject(",
+        "#[lsm(hook = \"ptrace_traceme\")]\npub fn cgroup_join_traceme(",
     ] {
         assert!(j.contains(a), "{a}");
     }
@@ -82,9 +85,25 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     in_order(
         body(&j, "before_epoch"),
         &[
-            "CGROUP_JOIN_EPOCH.get(0)",
             "if epoch == 0 || ptgid == 1 || family(ptgid) {\n        return false;\n    }",
             "leader_start(parent).unwrap_or(0) < epoch",
+        ],
+    )
+    .unwrap();
+    // lot 281 (#494's N2): the agent's request taken into the pinned epoch,
+    // forward only (`common::cgroup_join::epoch_promoted`), by every fork
+    assert!(j.contains(
+        "pub static CGROUP_JOIN_EPOCH_RT: Array<u64> = Array::with_max_entries(EPOCH_SLOTS, 0);"
+    ));
+    in_order(
+        body(&j, "epoch_now"),
+        &[
+            "CGROUP_JOIN_EPOCH.get_ptr_mut(0)",
+            "CGROUP_JOIN_EPOCH_RT.get(0)",
+            "if epoch_promoted(*e, request) {",
+            "CGROUP_JOIN_EPOCH.get_ptr_mut(1),\n            CGROUP_JOIN_EPOCH_RT.get(1),",
+            "*b = *rb;",
+            "*e = request;",
         ],
     )
     .unwrap();
@@ -107,6 +126,8 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     in_order(
         body(&j, "mark"),
         &[
+            // lot 281: the process's taint kept by any new mark of it
+            "let how = remarked(how, unsafe { how_now(tgid, start) });",
             "if CGROUP_JOINED.insert(&tgid, &rec, 0).is_err() {",
             "lose(tgid);\n        return false;",
         ],
@@ -229,14 +250,74 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
         &[
             "let parent: u64 = ctx.arg(0);",
             "let child: u64 = ctx.arg(1);",
-            "let marked = match CGROUP_JOINED.get(&ptgid) {\n        Some(rec) => leader_start(parent) == Some(rec[0]),\n        None => false,\n    };",
+            // lot 281: the reset asked for taken in first, by every fork
+            "let epoch = epoch_now();",
+            "let (marked, phow) = match CGROUP_JOINED.get(&ptgid) {\n        Some(rec) => (leader_start(parent) == Some(rec[0]), unpack(rec[1]).0),\n        None => (false, 0),\n    };",
             // the third review of #494, R2-a: a parent started before the
             // marks' last reset is not known, and passes that on
-            "let lost = is_lost(ptgid) || before_epoch(parent, ptgid);",
+            "let lost = is_lost(ptgid) || before_epoch(epoch, parent, ptgid);",
             "if !marked && !lost {\n        return;\n    }",
             "if ctgid == ptgid {\n        return;\n    }",
             "if lost {\n        lose(ctgid);\n        return;\n    }",
-            "if mark(ctgid, start, HOW_INHERITED, ptgid) {",
+            // lot 281: where it runs and the taint, passed on
+            "if mark(ctgid, start, inherited(phow), ptgid) {",
+        ],
+    )
+    .unwrap();
+    // lot 281: attach mode only, the family's accesses never, the shared
+    // decision on the call (`common::cgroup_join::injection`), then the
+    // taint; never a refusal
+    in_order(
+        body(&j, "try_inject"),
+        &[
+            "if target == 0 || mode & PTRACE_MODE_ATTACH == 0 {\n        return;\n    }",
+            "if family(caller) {\n        return;\n    }",
+            "let (syscall, flags) = current_call();",
+            "if !injection(mode, syscall, flags) {\n        return;\n    }",
+            "taint(target, tgid, caller, inject_detail(mode, syscall), true);",
+        ],
+    )
+    .unwrap();
+    assert!(body(&j, "cgroup_join_inject").contains("unsafe { try_inject(&ctx) };\n    0"));
+    assert!(body(&j, "cgroup_join_traceme").contains("unsafe { try_traceme(&ctx) };\n    0"));
+    in_order(
+        body(&j, "try_traceme"),
+        &[
+            "let Some(tracer) = tgid_of(parent) else {",
+            "if family(tracer) {\n        return;\n    }",
+            "taint(bpf_get_current_task(), me, tracer, 0, false);",
+        ],
+    )
+    .unwrap();
+    // PID 1 and the protected never; a group already tainted keeps its
+    // mark; the placement kept; a mark refused is "not known"; the first
+    // taint recorded
+    in_order(
+        body(&j, "taint"),
+        &[
+            "if tgid == 1 || crate::task_kill::is_protected_pid(tgid) {\n        return;\n    }",
+            "let Some(start) = leader_start(task) else {\n        lose(tgid);",
+            "let old = how_now(tgid, start);",
+            "if old & HOW_TAINT != 0 {\n        return;\n    }",
+            "let rec = [start, pack(injected(old), by)];",
+            "if CGROUP_JOINED.insert(&tgid, &rec, 0).is_err() {\n        lose(tgid);\n    }",
+            "count(STAT_INJECTED);",
+            "if record {",
+            "FS_OP_EXEMPT_INJECT,",
+            "ino: u64::from(tgid),",
+        ],
+    )
+    .unwrap();
+    // the call read from the task's own registers only (an io-wq worker's
+    // or a kernel thread's are not its call: unread, an injection)
+    in_order(
+        body(&j, "current_call"),
+        &[
+            "off_opt!(PT_REGS_ORIG_AX_OFFSET)",
+            "if !regs_are_the_writes(flags) {\n        return (None, None);\n    }",
+            "generated::bpf_task_pt_regs(task)",
+            "let open_flags = if nr == SYS_OPEN {\n        rd_u64(regs + si as u64)\n    } else if nr == SYS_OPENAT {\n        rd_u64(regs + dx as u64)\n    } else if nr == SYS_OPENAT2 {",
+            "bpf_probe_read_user::<u64>(how as *const u64)",
         ],
     )
     .unwrap();
@@ -301,18 +382,64 @@ fn the_agent_asks_the_marks_where_it_decides() {
     // the review of #494, D2), a mark is "not started here", only a missing
     // key is "started here" — the same reads as the privileged test's
     // (`lost_in`, `mark_in`: its behaviour is that test's)
-    assert!(!body(&cj, "started").contains("STAT_LOST"));
+    assert!(!body(&cj, "both").contains("STAT_LOST"));
+    assert!(body(&cj, "started").contains("self.both(tgid, start_boot_ns).map(|(s, _)| s)"));
+    assert!(cj.contains(
+        "pub fn injected(&self, tgid: u32, start_boot_ns: Option<u64>) -> Option<Injected> {\n        self.both(tgid, start_boot_ns).map(|(_, i)| i)"
+    ));
     in_order(
-        body(&cj, "started"),
+        body(&cj, "both"),
         &[
+            // lot 281 (#494's N1/N2): nothing known until armed
+            "if !self.armed.load(Ordering::Acquire) {\n            return None;\n        }",
             "crate::caps::errands::run(move || {",
-            "if lost_in(&lost.lock(), tgid).ok()? {\n                return None;\n            }",
-            // R2-a: started before the marks' last reset, not known
-            "if !after_epoch(epoch.lock().get(&1, 0).ok()?, start_boot_ns) {\n                return None;\n            }",
-            "mark_in(&joined.lock(), tgid).ok().map(|m| m.is_none())",
+            // R2-a: the marks' last reset — lot 281: the pinned one or a
+            // request not yet taken in, the later
+            ".max(epoch_rt.lock().get(&1, 0).ok()?);",
+            "lost_in(&lost.lock(), tgid).ok(),",
+            "after_epoch(reset, start_boot_ns),",
+            "mark_in(&joined.lock(), tgid).map_err(drop),",
         ],
     )
     .unwrap();
+    // the group's byte refuses its answer, a reset too, an unread mark too;
+    // the placement bits answer the cgroup, the taint bits the code (its
+    // behaviour: `the_check_reads_the_placement_and_the_taint_from_one_mark`)
+    in_order(
+        body(&cj, "judge"),
+        &[
+            "if lost != Some(false) || !after {\n        return None;\n    }",
+            "Ok(None) => Some((true, Injected::No)),",
+            "Ok(Some(m)) => Some((!m.placed(), m.injected())),",
+            "Err(()) => None,",
+        ],
+    )
+    .unwrap();
+    assert!(body(&cj, "placed").contains("self.how & HOW_PLACE != 0"));
+    assert!(cj.contains(
+        "pub fn arm() -> Option<std::time::Duration> {\n    let Some(Tracker::Attached(m)) = tracker() else {\n        return None;\n    };\n    m.arm();"
+    ));
+    in_order(
+        body(&cj, "debug_self_inject"),
+        &[
+            "#[cfg(feature = \"debug-trigger\")]",
+            "std::env::var(\"NN_DEBUG_CGROUP_JOIN_SELF_INJECT\")",
+        ],
+    )
+    .unwrap();
+    // armed only once the tracker's pins and state are protected
+    let at = code("crates/nn-linux/src/anti_tamper/mod.rs");
+    in_order(
+        &at,
+        &[
+            "let mut tracker_protected = true;",
+            "if let Err(e) = filesystem::register_bpffs_pins(ebpf, dir) {\n            tracker_protected = false;",
+            "} else if let Err(e) = filesystem::register_agent_file(ebpf, state) {\n            tracker_protected = false;",
+            "if tracker_protected {\n        crate::cgroup_join::arm();",
+        ],
+    )
+    .unwrap();
+    assert!(!at.contains(".sweep("), "the marks are frozen: no sweep");
     in_order(
         body(&cj, "mark_in"),
         &[
@@ -341,6 +468,12 @@ fn the_agent_asks_the_marks_where_it_decides() {
             "(Some(_), Some(Err(why))) => {",
             "Tracker::Absent(format!(\"the tracker's pin directory: {why}\")),",
             "if let Err(e) = load_only(ebpf, btf, name, *kind, target) {\n                    for (n, k, _) in &PROGRAMS[..=i] {\n                        unload(ebpf, n, *k);\n                    }",
+            // lot 281 (#494's N1/N2): an adoption's maps the ones verified,
+            // every map frozen, a new generation pinned after the load
+            "if let Err(why) = adopted_as_registered(ebpf, ADOPTED.get()) {",
+            "match freeze_pinned(ebpf) {",
+            "match pin_new(ebpf, root, &plan.dir) {",
+            "let _ = FINAL_DIR.set(dir.clone());",
             "if let Err(e) = pin_fresh(ebpf, dir, name, *kind) {",
             // the third review, R2-a: a reset's epoch once the new programs
             // run, or no tracker; signed with what it means
@@ -374,8 +507,10 @@ fn the_agent_asks_the_marks_where_it_decides() {
             "verify_state(st)",
             "let p = plan(",
             "&verify,",
-            "usable_dir(&p.dir)?;",
-            "for name in PINNED_MAPS {\n            loader.map_pin_path(name, p.dir.join(name));",
+            // lot 281 (#494's N1): the loader takes pins for an adoption
+            // only; a new generation is pinned after the load
+            "if p.adopt {\n            usable_dir(&p.dir)?;",
+            "if p.adopt {\n            for name in PINNED_MAPS {\n                loader.map_pin_path(name, p.dir.join(name));",
         ],
     )
     .unwrap();
@@ -389,6 +524,18 @@ fn the_agent_asks_the_marks_where_it_decides() {
     )
     .unwrap();
     assert!(body(&cj, "seen_at").contains("let md = open_pinned_ro(path)?;"));
+    // lot 281 (the lab's find): a frozen map's state read from its fdinfo
+    // before the freeze (a second freeze answers EPERM)
+    in_order(
+        body(&cj, "freeze_pinned"),
+        &[
+            "std::fs::read_to_string(format!(\"/proc/self/fdinfo/{fd}\"))",
+            "match fdinfo_frozen(&info) {\n            Some(true) => continue,\n            Some(false) => {}",
+            "libc::SYS_bpf,\n                MAP_FREEZE,",
+            "freeze_outcome(errno)",
+        ],
+    )
+    .unwrap();
     let mx = code("crates/nn-linux/src/sensors/multiplexer.rs");
     in_order(
         &mx,
@@ -434,7 +581,7 @@ fn the_agent_asks_the_marks_where_it_decides() {
         &[
             "let (tracker, signed) = crate::cgroup_join::attach(ebpf, &btf, pin_root);",
             "for why in signed {\n        report.degraded.push(format!(\"cgroup exemptions: {why}\"));",
-            "crate::cgroup_join::Tracker::Absent(why) => report.degraded.push(format!(",
+            "if let crate::cgroup_join::Tracker::Absent(why) = &tracker {\n        report.degraded.push(format!(",
             "crate::cgroup_join::install(tracker);",
             // the tracker's pins protected like the root's
             "if let Some(dir) = crate::cgroup_join::pin_dir_now() {\n        if let Err(e) = filesystem::register_bpffs_pins(ebpf, dir) {",
@@ -455,11 +602,39 @@ fn the_agent_asks_the_marks_where_it_decides() {
     let tr = code("crates/nn-core/src/posture/triggers.rs");
     // (lot 280a: nor a write the signed per-sysctl opt-out let through;
     // lot 280b: nor the kernel-state round's findings)
+    // (lot 281: nor an injection's record)
     assert!(tr.contains(
-        "if !matches!(\n                operation,\n                nn_model::FsProtectOperation::CgroupJoin\n                    | nn_model::FsProtectOperation::SysctlOptOut\n                    | nn_model::FsProtectOperation::KernelTaint\n                    | nn_model::FsProtectOperation::SysctlRootProg\n            ) {"
+        "if !matches!(\n                operation,\n                nn_model::FsProtectOperation::CgroupJoin\n                    | nn_model::FsProtectOperation::SysctlOptOut\n                    | nn_model::FsProtectOperation::KernelTaint\n                    | nn_model::FsProtectOperation::SysctlRootProg\n                    | nn_model::FsProtectOperation::ExemptInjection\n            ) {"
     ));
     let pe = code("agent/src/pipeline/process_event.rs");
     assert!(pe.contains("let joined = *operation == nn_model::FsProtectOperation::CgroupJoin;"));
+    // lot 281: an injection signed only when an exemption covered the
+    // process (whatever its taint now), with the injector's lineage
+    in_order(
+        &pe,
+        &[
+            "let injection = *operation == nn_model::FsProtectOperation::ExemptInjection;",
+            ".and_then(|t| engine.exempt_covering(t));",
+            "if injection && covered.is_none() {",
+            "return;",
+            "let admin = posture.interactive_admin_status(",
+            "anti_tamper::exempt_injection(\n                        &event, exemption, admin,\n                    )",
+        ],
+    )
+    .unwrap();
+    // the exemption check: a uid's holds, every other kind asks the taint
+    // once, after its match (its behaviour: rule_policy's
+    // `an_exemption_is_revoked_once_code_was_injected`)
+    in_order(
+        body(&rp, "exempt"),
+        &[
+            "if hit {\n            if matches!(e, Exemption::Uid(_)) {\n                return Some(Exempt::Holds(e.to_string()));\n            }",
+            "return Some(match revoked_why(facts.injected(pid)) {",
+            "None => Exempt::Holds(e.to_string()),",
+        ],
+    )
+    .unwrap();
+    assert!(pf.contains("crate::cgroup_join::injected(&self.root, pid)"));
 }
 
 /// The worker's single-thread check is the sandbox's first step, in both

@@ -227,6 +227,11 @@ impl Rule for NnLAt001AntiTamperDenial {
                     &reasoning,
                 ));
             }
+            // Lot 281: not refused — code-injection access to a process
+            // (`exempt_injection` signs it when an exemption covered it).
+            FsProtectOperation::ExemptInjection => {
+                return Some(injection_verdict(self, event, None, None));
+            }
             // Lot 280b: the switches that blind the sensors.
             FsProtectOperation::Kprobes => format!(
                 "to write /sys/kernel/debug/kprobes/enabled (inode {target_dev}:{target_ino}) \
@@ -305,6 +310,113 @@ impl Rule for NnLAt001AntiTamperDenial {
             &reasoning,
         ))
     }
+}
+
+/// Lot 281: the severity of code-injection access to a process an
+/// exemption of the per-rule policy covered — at least High; Critical when
+/// the injector is not root, or does not come from an administrator's
+/// interactive sudo/su session (`interactive_admin`: the lineage's
+/// `interactive_admin_status`, `None` while it cannot be told — counted as
+/// unusual).
+pub fn injection_severity(injector_uid: u32, interactive_admin: Option<bool>) -> Severity {
+    if injector_uid != 0 || interactive_admin != Some(true) {
+        Severity::Critical
+    } else {
+        Severity::High
+    }
+}
+
+/// What a record's access detail (`common::cgroup_join::inject_detail`)
+/// was, in words.
+fn access_words(detail: u64) -> String {
+    use common::cgroup_join::{
+        inject_detail_parts, PTRACE_MODE_FSCREDS, SYS_OPEN, SYS_OPENAT, SYS_OPENAT2,
+    };
+    let (mode, nr) = inject_detail_parts(detail);
+    let what = match nr {
+        Some(101) => "a debugger's attach (ptrace PTRACE_ATTACH / PTRACE_SEIZE)",
+        Some(311) => "process_vm_writev",
+        Some(438) => "pidfd_getfd (a descriptor of the process taken)",
+        Some(SYS_OPEN | SYS_OPENAT | SYS_OPENAT2) if mode & PTRACE_MODE_FSCREDS != 0 => {
+            "a write handle on its /proc/<pid>/mem"
+        }
+        Some(_) => "an attach-mode access",
+        None => "an attach-mode access whose system call was not read",
+    };
+    match nr {
+        Some(n) => format!("{what}; mode {mode:#x}, system call {n}"),
+        None => format!("{what}; mode {mode:#x}"),
+    }
+}
+
+/// Lot 281: NN-L-AT-001's verdict on code-injection access to a process
+/// (`FsProtectOperation::ExemptInjection`) — `exemption` the policy's
+/// exemption that covered the process (the agent signs the record only
+/// then), `interactive_admin` the injector's lineage
+/// ([`injection_severity`]). Not refused: the process and what it forks
+/// lose every exemption for the rest of their lives.
+pub fn exempt_injection(
+    event: &Event,
+    exemption: &str,
+    interactive_admin: Option<bool>,
+) -> Option<Verdict> {
+    match event {
+        Event::FsProtectDenial {
+            operation: FsProtectOperation::ExemptInjection,
+            ..
+        } => Some(injection_verdict(
+            &NnLAt001AntiTamperDenial,
+            event,
+            Some(exemption),
+            interactive_admin,
+        )),
+        _ => None,
+    }
+}
+
+fn injection_verdict(
+    rule: &NnLAt001AntiTamperDenial,
+    event: &Event,
+    exemption: Option<&str>,
+    interactive_admin: Option<bool>,
+) -> Verdict {
+    let (uid, comm, detail, target) = match event {
+        Event::FsProtectDenial {
+            uid,
+            comm,
+            target_dev,
+            target_ino,
+            ..
+        } => (*uid, comm.as_str(), *target_dev, *target_ino),
+        _ => (0, "", 0, 0),
+    };
+    let covered = match exemption {
+        Some(e) => format!("the per-rule policy exempted it ({e}); "),
+        None => String::new(),
+    };
+    // Not the uid's number: the record's principal carries it.
+    let who = if uid != 0 {
+        "not root".to_string()
+    } else {
+        match interactive_admin {
+            Some(true) => "root, from an administrator's interactive sudo/su session".to_string(),
+            Some(false) => {
+                "root, not from an administrator's interactive sudo/su session".to_string()
+            }
+            None => "root, from a lineage that could not be told".to_string(),
+        }
+    };
+    let reasoning = format!(
+        "`{comm}` ({who}) gained code-injection access to pid {target} — {}. Not refused;          {covered}that exemption, and every other, no longer holds for that process or for what          it forks, for the rest of their lives: what they do is judged like any other process's.",
+        access_words(detail)
+    );
+    build_verdict(
+        rule,
+        event,
+        ResponseAction::Log,
+        injection_severity(uid, interactive_admin),
+        &reasoning,
+    )
 }
 
 #[cfg(test)]
@@ -627,6 +739,63 @@ mod tests {
 
     /// Lot 280b (named): the switches refused by name, and a foreign
     /// program on the root's slot signed as found, not refused.
+    /// Lot 281 (named): code-injection access to an exempt process is at
+    /// least High, Critical when the injector is not root or not an
+    /// administrator's interactive session (unknown counts as unusual);
+    /// signed as not refused, naming the exemption and the access.
+    #[test]
+    fn an_injection_into_an_exempt_process_is_high_or_critical() {
+        assert_eq!(injection_severity(0, Some(true)), Severity::High);
+        assert_eq!(injection_severity(0, Some(false)), Severity::Critical);
+        assert_eq!(injection_severity(0, None), Severity::Critical);
+        assert_eq!(injection_severity(1000, Some(true)), Severity::Critical);
+        assert_eq!(injection_severity(1000, None), Severity::Critical);
+        let ev = |uid, detail| Event::FsProtectDenial {
+            pid: 4242,
+            uid,
+            comm: "gdb".into(),
+            target_dev: detail,
+            target_ino: 709,
+            operation: FsProtectOperation::ExemptInjection,
+            timestamp_ns: 1,
+        };
+        let attach = common::cgroup_join::inject_detail(0x12, Some(101));
+        let v = exempt_injection(&ev(0, attach), "exe /usr/bin/x sha256 aa", Some(true))
+            .expect("verdict");
+        assert_eq!(v.severity, Severity::High);
+        assert!(matches!(v.action, ResponseAction::Log));
+        for needle in [
+            "pid 709",
+            "debugger's attach",
+            "exe /usr/bin/x sha256 aa",
+            "Not refused",
+            "no longer holds",
+        ] {
+            assert!(v.reasoning.contains(needle), "{needle}: {}", v.reasoning);
+        }
+        assert!(!v.reasoning.contains("the kernel refused it"));
+        let v = exempt_injection(&ev(1000, attach), "unit y.service", Some(true)).unwrap();
+        assert_eq!(v.severity, Severity::Critical);
+        assert!(v.reasoning.contains("(not root)"));
+        let mem = common::cgroup_join::inject_detail(0x0a, Some(257));
+        let v = exempt_injection(&ev(0, mem), "unit x.service", None).unwrap();
+        assert_eq!(v.severity, Severity::Critical);
+        assert!(v
+            .reasoning
+            .contains("a write handle on its /proc/<pid>/mem"));
+        let w = common::cgroup_join::inject_detail(0x12, Some(311));
+        assert!(exempt_injection(&ev(0, w), "e", None)
+            .unwrap()
+            .reasoning
+            .contains("process_vm_writev"));
+        // another operation is not this verdict
+        assert!(exempt_injection(&denial(FsProtectOperation::Ptrace), "e", None).is_none());
+        // the rule alone (no exemption context): severity by uid only
+        let plain = NnLAt001AntiTamperDenial.evaluate(&ev(0, attach)).unwrap();
+        assert_eq!(plain.severity, Severity::Critical);
+        assert!(!plain.reasoning.contains("exempted it"));
+    }
+
     #[test]
     fn the_blinding_switches_and_a_foreign_root_program_are_named() {
         let r = |op| {

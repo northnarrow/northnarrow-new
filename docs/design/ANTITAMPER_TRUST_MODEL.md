@@ -1766,6 +1766,59 @@ before it. The exempt services are then refused until they are restarted
 A kernel that refuses the tracker removes its pins; a host without bpffs
 attaches the programs for the agent's life and warns.
 
+**Code injected into an exempt process** (lot 281). The same marks carry
+the code a process runs: two more programs of the tracker, BPF LSM
+programs that never refuse, taint a process's mark when another gains
+code-injection access to it — `cgroup_join_inject` on `ptrace_access_check`
+(attach mode only; the access is read from the caller's own registers,
+`bpf_task_pt_regs`: `process_vm_readv` and a read-only open of a procfs
+file are reads, everything else in attach mode, a call that cannot be
+read included, is an injection — `common::cgroup_join::injection`) and
+`cgroup_join_traceme` on `ptrace_traceme` (the parent gets the access). A
+caller of the family, PID 1 and the protected processes are left out. The
+taint is passed on at a fork and kept through a move; an exemption by
+executable, cgroup or unit no longer holds for a tainted process
+(`RULE_POLICY.md` §2.3), a uid's does. The first taint is recorded
+(`FS_OP_EXEMPT_INJECT`, the task denials' budget); the agent signs it
+(NN-L-AT-001 `exempt_injection`, High or Critical) when an exemption
+covered the process. They are pinned with the tracker's other programs:
+they taint during an upgrade's gap too. The marks' layout changed with
+the taint bits: schema 2, so an upgrade from schema 1 is a signed reset.
+
+**Kept from tampering** (lot 281, #494's notes N1 and N2). The re-review
+of #494 found two ways to the marks that are not root's in a window:
+
+- N1 — a new generation's directory was made before the load and the
+  loader pinned the maps by name in it, taking any map already at a pin's
+  path (aya opens an existing pin first): a root watching the bpffs could
+  plant one between the two and keep a handle on it. Now a new
+  generation's maps are made by the load, unpinned, frozen, and pinned
+  after it in a directory the start makes then (one that exists is a
+  plant); `BPF_OBJ_PIN`'s `EEXIST` at a pin's path, or anything else in
+  the directory, moves the maps to the next generation, signed, the plant
+  removed with its directory (never followed, a few levels deep). An
+  adoption's maps are checked after the load against the ids verified
+  before it.
+- N2 — a handle on the tracker's maps taken in a window or an upgrade's
+  gap stayed good after it: the maps are the only ones an upgrade keeps.
+  Now all four are frozen (`BPF_MAP_FREEZE`) as soon as they exist: no
+  handle writes them, the agent's own included; an adopted map that was
+  not frozen (none a start of this version made) is frozen at its
+  adoption and signed. A map's frozen state is read from its descriptor's
+  fdinfo (`frozen: 1`) before the call: a second freeze answers `EPERM`
+  (`map_freeze` checks the descriptor's write right, which a frozen map
+  has lost, before its frozen state) — lot 281's lab found every adoption
+  leaving the tracker absent while the call alone decided. A reset's instant is asked for in a per-load map
+  (`CGROUP_JOIN_EPOCH_RT`) the fork program takes into the pinned epoch,
+  forward only (the agent forks once to take it in at once); the agent
+  reads the later of the two. The start's sweep of dead groups' marks is
+  gone (a dead group's mark goes at its tgid's next fork).
+- No exemption by executable, cgroup or unit is honoured until the
+  tracker is **armed**: its pins and their record protected
+  (`register_bpffs_pins`, `register_agent_file`); not protected, it is
+  never armed this boot (signed). The start logs the time from its plan
+  to the arming (the lab's measure: `CAPABILITY_PROGRAM.md`, lot 281).
+
 ### Residual
 
 - **Root changes the unit itself.** A drop-in that rewrites `ExecStart=`,
@@ -1776,10 +1829,17 @@ attaches the programs for the agent's life and warns.
 - **A root that writes PID 1's memory** — or its pre-exec child's
   (systemd up to 254) — with `ptrace` or `/proc/1/mem`: what PID 1 does is
   systemd's placement (the review of #494, N3).
-- **Code injected into a running exempt process** (`ptrace`,
-  `process_vm_writev`, `/proc/<pid>/mem`): nothing moves; every kind of
-  exemption covers what the process then does, `exe … sha256` too (the
-  file's digest, not the memory's).
+- **Code injected into a running exempt process**: revoked since lot 281
+  (above). Not seen: an injection before the agent's first start since the
+  host booted, or while `kernel.ftrace_enabled` is 0 (a window only: the
+  trampolines stop; the epoch is reset when ftrace runs again); a shared
+  library or an `LD_PRELOAD` the exempt program loads, a writable mapping
+  shared with another process (no `ptrace` check); a BPF program of root's
+  own that names a tracker map (a read-only handle is enough for a
+  program to write a map, frozen or not; the `bpf()` observer records the
+  load, it does not refuse it). An io_uring worker's attach-mode access
+  (its registers are not its call) is taken for an injection: a false
+  refusal, fail closed.
 - **A move before the agent's first start** since the host booted: no
   program ran. While no agent runs, the last agent's and watchdog's pids
   stay the family in the pinned `PROTECTED_PIDS` until the next start's
@@ -1790,9 +1850,13 @@ attaches the programs for the agent's life and warns.
   between an upgrade's purge of the pin root and the new agent's start
   (the deny hooks detach with the purge), root can replace both the
   tracker's pins and their record in `/run/northnarrow`: a planted map
-  registered by a forged record is adopted. The window trusts its holder.
-  The pins removed then are signed ("marks lost between agents"), and a
-  reboot removes them with every process.
+  registered by a forged record is adopted — with the marks root put in
+  it, frozen at the adoption (lot 281: signed, "were not frozen"), so a
+  handle kept from then writes nothing after. The window trusts its
+  holder. The pins removed then are signed ("marks lost between agents"),
+  and a reboot removes them with every process. Before lot 281 a handle on
+  the tracker's maps taken in the window or the gap wrote the marks after
+  it (#494's N2): closed by the freeze.
 - **A downgrade to a version before lot 277** leaves the tracker's
   programs attached and marking — harmless, nothing reads the marks —
   until `uninstall.sh` or a reboot. (No release pinned them in the pin

@@ -29,7 +29,7 @@ use nn_model::{ResponseAction, Severity, Verdict};
 
 use super::attack::AttackRef;
 use super::response_policy::Held;
-use super::rule_policy::{Mode, RulePolicy};
+use super::rule_policy::{Exempt, Mode, RulePolicy};
 
 /// Strength of an action, weakest first.
 pub fn action_rank(a: &ResponseAction) -> u8 {
@@ -100,6 +100,9 @@ pub struct RuleMatch {
     pub builtin_action: ResponseAction,
     /// A switch held the rule's response (before the policy).
     pub switch_held: bool,
+    /// Lot 281: the exemption that matched but did not hold, and why
+    /// ([`Exempt::Revoked`]: code was injected into the process).
+    pub revoked: Option<String>,
 }
 
 impl RuleMatch {
@@ -174,7 +177,10 @@ impl Decision {
 /// The match of rule `rule_id` (index `index`) as the policy makes it
 /// (an `off` rule's is [`Applied::Off`]). `held` is what the rule's switch held
 /// ([`super::response_policy::take_held`]); `exempt` says which exemption,
-/// if any, covers the actor (read only when the rule has exemptions).
+/// if any, covers the actor (read only when the rule has exemptions). Lot
+/// 281: one that matched but does not hold ([`Exempt::Revoked`]: code was
+/// injected into the process) leaves the match to its mode, the reasoning
+/// naming the exemption and why.
 pub fn apply_policy(
     index: usize,
     rule_id: &'static str,
@@ -182,7 +188,7 @@ pub fn apply_policy(
     mut v: Verdict,
     held: Option<Held>,
     policy: &RulePolicy,
-    exempt: impl FnOnce(&Verdict) -> Option<String>,
+    exempt: impl FnOnce(&Verdict) -> Option<Exempt>,
 ) -> RuleMatch {
     let mode = policy.mode(rule_id);
     let builtin_action = v.action.clone();
@@ -195,13 +201,17 @@ pub fn apply_policy(
     // Named only while the switch still holds the response (built in).
     let mut held_switch = held.as_ref().map(|h| h.switch);
     let held_action = held.as_ref().map(|h| h.action.clone());
+    let checked = (mode != Some(Mode::Off) && !policy.exemptions(rule_id).is_empty())
+        .then(|| exempt(&v))
+        .flatten();
+    let revoked = match &checked {
+        Some(Exempt::Revoked { exemption, why }) => Some((exemption.clone(), why.clone())),
+        _ => None,
+    };
     let applied = if mode == Some(Mode::Off) {
         held_switch = None;
         Applied::Off
-    } else if let Some(e) = (!policy.exemptions(rule_id).is_empty())
-        .then(|| exempt(&v))
-        .flatten()
-    {
+    } else if let Some(Exempt::Holds(e)) = checked {
         v.action = ResponseAction::Log;
         v.reasoning = format!(
             "{} [exempt by the signed per-rule policy ({e}): recorded only]",
@@ -246,6 +256,11 @@ pub fn apply_policy(
             Some(Mode::Off) => unreachable!("handled above"),
         }
     };
+    if let Some((exemption, why)) = &revoked {
+        v.reasoning.push_str(&format!(
+            " [the signed per-rule policy's exemption ({exemption}) does not hold: {why}]"
+        ));
+    }
     RuleMatch {
         index,
         rule_id,
@@ -256,6 +271,7 @@ pub fn apply_policy(
         held: held_switch,
         builtin_action,
         switch_held,
+        revoked: revoked.map(|(exemption, why)| format!("{exemption}: {why}")),
     }
 }
 
@@ -517,6 +533,7 @@ mod tests {
             held: None,
             held_action: None,
             switch_held: false,
+            revoked: None,
         }
     }
 
@@ -765,7 +782,9 @@ mod tests {
     fn an_exemption_makes_the_match_a_record() {
         let p = parse("enforce R020\nexempt R020 uid 998\n").unwrap();
         let (out, held) = held_kill();
-        let m = apply_policy(0, R020, A1, out, held, &p, |_| Some("uid 998".into()));
+        let m = apply_policy(0, R020, A1, out, held, &p, |_| {
+            Some(Exempt::Holds("uid 998".into()))
+        });
         assert_eq!(m.applied, Applied::Exempt("uid 998".into()));
         assert_eq!(m.verdict.action, Log);
         assert!(!m.acts() && !m.counted());
@@ -778,6 +797,57 @@ mod tests {
         let p = parse("enforce R020\n").unwrap();
         let (out, held) = held_kill();
         apply_policy(0, R020, A1, out, held, &p, |_| panic!("asked"));
+    }
+
+    /// Lot 281 (named): an exemption that matched but no longer holds (code
+    /// was injected into the process) leaves the match to its mode — the
+    /// held kill enforced, the reasoning naming the exemption and why; an
+    /// `off` rule never asks.
+    #[test]
+    fn a_revoked_exemption_leaves_the_match_judged() {
+        let p = parse("enforce R020\nexempt R020 cgroup /system.slice/x.service\n").unwrap();
+        let revoked = || {
+            Some(Exempt::Revoked {
+                exemption: "cgroup /system.slice/x.service".into(),
+                why: "code-injection access to it was given to pid 4242".into(),
+            })
+        };
+        let (out, held) = held_kill();
+        let m = apply_policy(0, R020, A1, out, held, &p, |_| revoked());
+        assert_eq!(m.applied, Applied::Enforce);
+        assert_eq!(m.verdict.action, KillProcessTree);
+        assert!(m.acts() && m.counted());
+        assert_eq!(
+            m.revoked.as_deref(),
+            Some(
+                "cgroup /system.slice/x.service: code-injection access to it was given to pid \
+                 4242"
+            ),
+            "the record's match says which exemption and why"
+        );
+        let r = &m.verdict.reasoning;
+        assert!(r.contains("[enforced by the signed per-rule policy"), "{r}");
+        assert!(
+            r.ends_with(
+                "[the signed per-rule policy's exemption (cgroup /system.slice/x.service) does \
+                 not hold: code-injection access to it was given to pid 4242]"
+            ),
+            "{r}"
+        );
+        // built in: the rule's own response, annotated
+        let p = parse("exempt R020 cgroup /system.slice/x.service\n").unwrap();
+        let m = apply_policy(0, R020, A1, v(R020, KillProcess, High, 1), None, &p, |_| {
+            revoked()
+        });
+        assert_eq!(m.applied, Applied::Builtin);
+        assert_eq!(m.verdict.action, KillProcess);
+        assert!(m.verdict.reasoning.contains("does not hold"));
+        // off: never asked
+        let p = parse("off R020\nexempt R020 uid 998\n").unwrap();
+        let m = apply_policy(0, R020, A1, v(R020, KillProcess, High, 1), None, &p, |_| {
+            panic!("asked")
+        });
+        assert_eq!(m.applied, Applied::Off);
     }
 
     /// The same matches in any order give the same decision.
