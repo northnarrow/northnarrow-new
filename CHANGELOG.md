@@ -6,6 +6,42 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Foreign BPF (lot 290; `docs/design/ANTITAMPER_TRUST_MODEL.md` "Lot 290",
+  `docs/operator/RULE_POLICY.md` §2.5). The `bpf` hook refuses (`EPERM`),
+  outside a signed trusted-installer window and in every mode, a
+  `BPF_PROG_LOAD` of a `kprobe`, `tracing`, `lsm`, `ext` or `struct_ops`
+  program by a process outside the agent's family, unless a signed
+  `bpf-loader-allow <executable> <types>` line (new rule-policy directive:
+  the executable by the device and inode its path names when the policy is
+  applied) names the loader and the type (let through, recorded Low,
+  `bpf_prog_opt_out`); refused: NN-L-AT-001 `bpf_prog_type`, High. Lot
+  280b's refusal of a `cgroup/sysctl` attach to the root cgroup holds in
+  every mode too. The agent's maps and programs are off limits outside a
+  window (enforce mode): `BPF_MAP_GET_FD_BY_ID` (read-only too),
+  `BPF_PROG_GET_FD_BY_ID` and `BPF_OBJ_GET` of a path under
+  `/sys/fs/bpf/northnarrow*` refused, and a handle reached by any other
+  path refused on the object by the `bpf_map` hook (read handles too) and a
+  new `bpf_prog` hook (NN-L-AT-001 `bpf_handle`). A light cross-view in the
+  kernel-state round (5 s): the agent enumerates the host's programs and
+  links with its own BPF iterators (`iter/bpf_prog`, `iter/bpf_link`; its
+  unit has no `CAP_SYS_ADMIN`) and compares them with the loads its hook saw
+  since its start (`SEEN_PROGS`, written by the `bpf_prog` hook): the
+  start's foreign programs signed once (`bpf_baseline`, Low, High for the
+  five types), one that appears later unseen High (`bpf_unseen`, with its
+  type, name, tag and attach point); `/run/northnarrow/bpf-foreign` lists
+  them and every load seen with its loader. `BPF_MAP_FREEZE` on
+  `BPF_DEFENSE_MODE`, `OWN_EXE_INODES`, `OWN_PIN_NAMES`,
+  `SYSCTL_KERNEL_JUDGE`, `DNS_EXEMPT_UIDS` and `NET_CONNECT_DENY_MODE`. Six
+  optional BTF offsets (slots 120–125; the enum, tracepoint and hook-argument
+  slots moved by six), wire codes 39–43, `BPF_ITER_CREATE`.
+
+### Changed
+- R011's record of the system's `modprobe` asked for modules by name by
+  root, its environment read clean, is Low (was High; backlog lot 289: a
+  lab round left 369 such lines). The rest keeps its severity.
+- `bpftool prog|map|link show` outside a window stops at the first
+  NorthNarrow object and loses its `pids` column (lot 290, above).
+
 - Kernel module loads judged in the kernel, by the file (lot 285;
   `docs/operator/RULE_POLICY.md` §2.4). The `kernel_read_file`
   (`READING_MODULE`) and `kernel_load_data` (`LOADING_MODULE`) hooks refuse

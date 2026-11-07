@@ -2110,3 +2110,122 @@ mode no longer multi) is a signed degradation while it holds.
   is detached; the round signs it within 5 s, it is not detached by the
   agent (another tool's program, the operator's to judge).
 
+
+## Lot 290 — foreign BPF: the rootkit-grade program types, the agent's objects off limits, a light cross-view
+
+**What it closes.** Three residuals: a root BPF program that names one of
+the agent's maps (lot 281: the start-in-cgroup tracker's), a foreign
+`cgroup/sysctl` program and the `bpf` hook's root refusal holding in
+enforce mode only (lots 280a and 280b), and the BPF programs a root can load
+beside the agent's hooks at all — the vehicles of `bpf_probe_write_user`,
+`bpf_override_return`, `bpf_send_signal` and of a hook's replacement.
+
+**The agent's objects are off limits** outside a trusted-installer window
+to every process outside its family (the agent and the watchdog once
+protected pids; a fresh instance of either before it is one): `EPERM` on
+- `BPF_MAP_GET_FD_BY_ID` of one of its maps (read-write or read-only),
+  `BPF_PROG_GET_FD_BY_ID` of one of its programs, `BPF_LINK_GET_FD_BY_ID`
+  of one of its links (the ids it registers in `OWN_BPF_IDS`, by kind);
+- `BPF_OBJ_GET` of a path that starts with `/sys/fs/bpf/northnarrow` —
+  the pin root and the directories kept beside it (`-cgroup-join-v*`,
+  `-sysctl`, `-module-writes`);
+- a handle reached otherwise (a relative path, `..`, a symlink, a bind
+  mount of the bpffs) is judged on the object it opens: the `bpf_map` hook
+  refuses any handle on one of its maps (a read handle too; a write handle
+  stays refused inside a window as before) and the new `bpf_prog` hook any
+  handle on one of its programs; a link pin keeps its final-name match and
+  the detach/update refusal of lot 215.
+Records: NN-L-AT-001 `bpf_handle` (the kind and the id; ENGAGED: a
+`bpftool prog list` of an administrator meets it) and `bpf_link`, `bpf_map`
+as before. The refusals of handles follow the guard's mode (observe in a
+lab build: its fixtures evict pids with `bpftool map delete`).
+
+A program is loaded against a map only through a descriptor of it, and
+`freplace` of one of the agent's functions needs a descriptor of its
+program: with neither obtainable, lot 281's residual is closed. **The paths
+that remain:** a descriptor inherited from the agent or passed over
+`SCM_RIGHTS` by it (the agent passes none, and spawns its workers and
+scanner without its BPF descriptors), and `pidfd_getfd` on the agent, which
+needs ptrace access to it — refused by the agent's `ptrace_access_check`
+deny.
+
+**The rootkit-grade types.** Outside a window a `BPF_PROG_LOAD` of `kprobe`,
+`tracing` (fentry, fexit, fmod_ret, iterators), `lsm`, `ext` and
+`struct_ops` by a caller outside the family is refused (`EPERM`, NN-L-AT-001
+`bpf_prog_type`, High, ENGAGED) — **in every mode**: the observe mode
+relaxes only the guard of the agent's own objects. Lot 280b's root
+`cgroup/sysctl` attach refusal holds in every mode too now. The other types
+are let through and recorded (`BpfSyscall` records, one a second per loader
+and type); inside a window everything is. The signed per-loader opt-out
+(`bpf-loader-allow <executable> <types>`, `RULE_POLICY.md` §2.5) lets a
+named executable — matched by the device and inode its path named when the
+policy was applied — load the named types outside a window, each load
+recorded (`bpf_prog_opt_out`, Low).
+
+**Freeze.** The configuration maps written once per load are frozen right
+after their write (`BPF_MAP_FREEZE`; a frozen map's state read from its
+descriptor's fdinfo first, as lot 281 learned): `BPF_DEFENSE_MODE`,
+`OWN_EXE_INODES`, `OWN_PIN_NAMES` (at the registration),
+`SYSCTL_KERNEL_JUDGE` (when the judge is linked), `DNS_EXEMPT_UIDS` (the DNS
+budget's resolvers) and `NET_CONNECT_DENY_MODE` (when the connect deny is
+armed). Frozen before this lot: `BTF_OFFSETS`, `EXECPOL_CONF`,
+`EXECQ_CONF`, the start-in-cgroup tracker's pinned maps. Every other map of
+the object is written again while the agent runs (policies, registrations,
+modes, rings, counters) and is guarded by the handle refusals above.
+
+**The light cross-view.** The agent's unit has no `CAP_SYS_ADMIN` (BUG-042),
+which `BPF_PROG_GET_NEXT_ID` and `BPF_LINK_GET_NEXT_ID` need; it enumerates
+with its own BPF iterators instead (`iter/bpf_prog`, 5.10+;
+`iter/bpf_link` where the kernel has it), which `CAP_BPF` and
+`CAP_PERFMON` load. Every kernel-state round (5 s) it reads every program
+(id, type, expected attach type, tag, name, attach function) and link (id,
+type, program), and compares them with what its `bpf` hook saw loading
+since its start: a load the hook lets through marks its thread, and the
+`bpf_prog` hook — called when the load hands out the new program's
+descriptor, its id assigned — records that id with its loader
+(`SEEN_PROGS`). An object that is not the agent's and was never seen
+loading is
+- the **baseline** when it was there at the first enumeration (loaded while
+  the agent was not running: at boot before it, in a restart's or an
+  upgrade's gap) — each signed once, NN-L-AT-001 `bpf_baseline`, Low, High
+  for one of the refused types;
+- **unseen** when it appears later — loaded through a path the hook does not
+  see, or hidden from it: NN-L-AT-001 `bpf_unseen`, High, with its type,
+  name, tag and attach point.
+An object is judged once it is in two enumerations in a row: a program of
+the agent's prior run whose release is pending, or one whose load is
+recorded between the two reads, is no finding. A link is judged through its
+program; one whose program the program enumeration does not show is judged
+itself. No finding raises the posture (the kernel's record, like lot 280b's).
+`/run/northnarrow/bpf-foreign` lists each round the foreign objects, their
+state, and every load the hook saw since the start with its loader and
+type: the host's inventory of foreign BPF.
+
+**Operator notes.**
+- `bpftool prog|map|link show` outside a window stops at the first
+  NorthNarrow object (its `*_GET_FD_BY_ID` refused, bpftool gives up the
+  listing) and its `pids` column is gone (its iterator, a `tracing`
+  program, is refused); inside a window both work. The agent's own
+  programs are listed in `/run/northnarrow/bpf-own-ids`, the foreign ones
+  in `/run/northnarrow/bpf-foreign`.
+- A tool that loads the refused types outside a window needs a signed
+  `bpf-loader-allow` line; bpftrace, Falco, Tetragon and Cilium's agent are
+  such tools.
+
+**What stays open.**
+- The refusals of handles hold in enforce mode only (a production build;
+  `NN_BPF_DEFENSE_OBSERVE=1` is a signed weakening that refuses the start
+  without the degraded-mode override); the lab's build observes them.
+- `tracepoint`, `raw_tracepoint` and `perf_event` programs can call
+  `bpf_probe_write_user` and `bpf_send_signal` too; they are let through and
+  recorded (the brief's list; bpftrace's tracepoints and the profilers' perf
+  events use them) — a candidate for a later lot with the corpus's data.
+- A program that lives less than a round is not seen by the cross-view
+  (the light part of it); one loaded while the agent was stopped is in the
+  baseline, signed at the next start, not refused.
+- The `bpf` and `bpf_prog` hooks are not pinned: while no agent runs (a
+  restart's or an upgrade's gap, which only a window opens) nothing refuses
+  a load; the next start's baseline signs what it left.
+- A program pinned under another path through a bind mount of the bpffs is
+  refused on its object (maps, programs); a link pin through it is matched
+  by its final name only, behind the detach/update refusal.

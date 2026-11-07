@@ -243,7 +243,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "R011_KernelModuleTooling",
-        severities: &[Severity::High, Severity::Medium],
+        severities: &[Severity::High, Severity::Medium, Severity::Low],
         actions: &[
             ResponseAction::KillProcessTree,
             ResponseAction::KillProcess,
@@ -270,7 +270,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    otherwise: the system's tool by module name, nothing moved or forced — no \
                    `modprobe.d` or index is read, what the names load is the kernel's to judge \
                    (its signature policy; R018's verdict on the load it reports, after it, \
-                   where R018 gives one). A process that had exited before its environment \
+                   where R018 gives one) — Low when run by root with its environment read \
+                   clean (lot 290; High before: a lab round left 369 such lines), High \
+                   otherwise. A process that had exited before its environment \
                    could be read is recorded, its environment not verified (its kill would \
                    reach no one): the environment's check is best effort for a short-lived \
                    `modprobe`. A copy run from a staging directory is killed with its tree, \

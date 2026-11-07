@@ -344,3 +344,39 @@ fn the_configuration_maps_are_frozen_and_the_opt_out_is_applied() {
     assert!(code("agent/src/admin/handlers/config.rs")
         .contains("nn_linux::anti_tamper::bpf_defense::apply_loader_policy("));
 }
+
+/// Named (lot 290, the lab's first start): `OWN_BPF_IDS` holds every map,
+/// program and link of the object — at least twice its maps and programs
+/// (a program has at most one link of its own here). At 256 the start of
+/// this lot's object failed with `E2BIG` at the 257th registration.
+#[test]
+fn the_own_ids_map_holds_every_object_of_the_agent() {
+    let dir = repo_root().join("agent-ebpf/src");
+    let (mut maps, mut progs) = (0usize, 0usize);
+    for e in fs::read_dir(&dir).unwrap().flatten() {
+        let src = strip_comments(&fs::read_to_string(e.path()).unwrap());
+        maps += src.matches("#[map]").count();
+        progs += src
+            .lines()
+            .filter(|l| {
+                let l = l.trim_start();
+                ["#[lsm(", "#[kprobe", "#[kretprobe", "#[tracepoint", "#[raw_tracepoint", "#[btf_tracepoint", "#[fentry", "#[fexit", "#[uprobe", "#[cgroup_sysctl", "#[link_section = \""]
+                    .iter()
+                    .any(|p| l.starts_with(p))
+            })
+            .count();
+    }
+    assert!(maps > 100 && progs > 90, "{maps} maps, {progs} programs counted");
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    let cap: usize = c
+        .split("pub const OWN_IDS_CAPACITY: u32 = ")
+        .nth(1)
+        .and_then(|r| r.split(';').next())
+        .and_then(|v| v.trim().parse().ok())
+        .expect("OWN_IDS_CAPACITY");
+    assert!(
+        cap >= 2 * (maps + progs),
+        "OWN_BPF_IDS holds {cap}: the object has {maps} maps and {progs} programs"
+    );
+    assert!(c.contains("HashMap::with_max_entries(OWN_IDS_CAPACITY, 0);"));
+}

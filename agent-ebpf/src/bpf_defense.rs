@@ -145,9 +145,16 @@ pub static OWN_PIN_NAMES: HashMap<u64, u8> = HashMap::with_max_entries(64, 0);
 /// AND one link — keyed by id alone, the later registration overwrote the
 /// earlier and some own maps were not recognised (lab: 66 registrations,
 /// 48 entries). Value = kind (kept for bpftool readability). Filled by
-/// userland right after load/attach; per boot, not pinned.
+/// userland right after load/attach; per boot, not pinned. Lot 290: 1024
+/// entries — the object's maps, programs and links were within ten of the
+/// 256 it had (the lab's first start of this lot: `E2BIG` at the 257th, the
+/// start refused); `xtask/tests/foreign_bpf.rs` keeps it at twice the
+/// object's maps and programs.
 #[map]
-pub static OWN_BPF_IDS: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
+pub static OWN_BPF_IDS: HashMap<u64, u8> = HashMap::with_max_entries(OWN_IDS_CAPACITY, 0);
+
+/// [`OWN_BPF_IDS`]' capacity.
+pub const OWN_IDS_CAPACITY: u32 = 1024;
 
 /// Key of [`OWN_BPF_IDS`] (mirrored in userland `anti_tamper::bpf_defense`).
 #[inline(always)]
