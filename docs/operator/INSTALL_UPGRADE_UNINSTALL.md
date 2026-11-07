@@ -557,7 +557,16 @@ enumerates (bpftool stops at the first error) and each attempt is an
 anti-tamper denial → posture COMBAT (INVESTIGATE stage, no isolation).
 Read the agent's state with `nn-admin status` / `nn-admin host-check`;
 inspect foreign maps with `bpftool map show id <n>`; for a debugging
-session set `NN_BPF_DEFENSE_OBSERVE=1` (restart required).
+session set `NN_BPF_DEFENSE_OBSERVE=1` (restart required). Lot 290: a
+read-only handle is refused too (outside a window), and so are a handle on
+one of the agent's programs (`bpftool prog show` stops at the first
+NorthNarrow program) and `BPF_OBJ_GET` of anything under
+`/sys/fs/bpf/northnarrow*`; these refusals are NN-L-AT-001 `bpf_handle`
+and raise the posture to ENGAGED only (an administrator's listing, never the
+decisive tamper). bpftool's `pids` column needs a `tracing` program, refused
+outside a window. `/run/northnarrow/bpf-own-ids` lists the agent's programs,
+`/run/northnarrow/bpf-foreign` the host's other BPF objects (the cross-view,
+`docs/design/ANTITAMPER_TRUST_MODEL.md` "Lot 290").
 
 **Links (second half).** The only object that can *detach* one of the
 agent's LSM hooks is a handle to its BPF link, and there are two ways to
@@ -626,8 +635,11 @@ inode) would be denied its own registration — which is why `install.sh
 programs to detach before copying binaries.
 
 Diagnosis mode: `NN_BPF_DEFENSE_OBSERVE=1` in the unit environment turns
-the guard into an observer (nothing denied, a `foreign_map_write` record
-instead); test builds (`debug-trigger`) run in that mode because the e2e
+the guard of the agent's own objects into an observer (nothing of them
+denied, a `foreign_map_write` record instead; lot 290: the refusal of a
+`kprobe`, `tracing`, `lsm`, `ext` or `struct_ops` load and of a
+`cgroup/sysctl` attach to the root cgroup outside a window hold in every
+mode); test builds (`debug-trigger`) run in that mode because the e2e
 fixtures unprotect pids with `bpftool`; `NN_BPF_DEFENSE_ENFORCE=1` forces
 the deny in a test build (lab checks of the deny path; the privileged e2e
 `bpf_guard_enforce_refuses_protected_pids_write` asserts it). The guard counts in the LSM

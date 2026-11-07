@@ -360,13 +360,28 @@ fn the_own_ids_map_holds_every_object_of_the_agent() {
             .lines()
             .filter(|l| {
                 let l = l.trim_start();
-                ["#[lsm(", "#[kprobe", "#[kretprobe", "#[tracepoint", "#[raw_tracepoint", "#[btf_tracepoint", "#[fentry", "#[fexit", "#[uprobe", "#[cgroup_sysctl", "#[link_section = \""]
-                    .iter()
-                    .any(|p| l.starts_with(p))
+                [
+                    "#[lsm(",
+                    "#[kprobe",
+                    "#[kretprobe",
+                    "#[tracepoint",
+                    "#[raw_tracepoint",
+                    "#[btf_tracepoint",
+                    "#[fentry",
+                    "#[fexit",
+                    "#[uprobe",
+                    "#[cgroup_sysctl",
+                    "#[link_section = \"",
+                ]
+                .iter()
+                .any(|p| l.starts_with(p))
             })
             .count();
     }
-    assert!(maps > 100 && progs > 90, "{maps} maps, {progs} programs counted");
+    assert!(
+        maps > 100 && progs > 90,
+        "{maps} maps, {progs} programs counted"
+    );
     let c = code("agent-ebpf/src/bpf_defense.rs");
     let cap: usize = c
         .split("pub const OWN_IDS_CAPACITY: u32 = ")

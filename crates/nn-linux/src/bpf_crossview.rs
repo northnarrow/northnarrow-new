@@ -338,10 +338,8 @@ pub fn judge(
         w.first = candidates.keys().copied().collect();
     }
     let mut out = Vec::new();
+    // a key signed once is never pending again (below): signed once
     for (key, o) in &candidates {
-        if w.signed.contains(key) {
-            continue;
-        }
         if w.pending.contains(key) {
             w.signed.insert(*key);
             out.push(if w.first.contains(key) {
@@ -652,7 +650,7 @@ mod tests {
         let p = prog(3, 2, "x");
         let mut bytes = bytemuck::bytes_of(&p).to_vec();
         bytes.extend_from_slice(bytemuck::bytes_of(&p));
-        bytes.extend_from_slice(&[1, 2, 3]);
+        bytes.extend_from_slice(&[1; 40]);
         let got = records::<ProgRecord>(&bytes);
         assert_eq!(got.len(), 2);
         assert_eq!(got[1].id, 3);

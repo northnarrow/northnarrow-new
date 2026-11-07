@@ -301,6 +301,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::\
              modprobe_by_name_is_recorded_not_killed",
             "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::\
+             a_plain_root_modprobe_is_low_and_the_suspicious_keep_high",
+            "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::\
              what_the_command_line_names_is_killed",
             "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::\
              r011_records_the_children_of_modprobe",
