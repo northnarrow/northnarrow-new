@@ -466,6 +466,15 @@ fn optional_reason(name: &str, section: &str, outcome: &Outcome) -> Option<Strin
             return Some(why);
         }
     }
+    // Lot 290: the cross-view's link iterator, on a kernel without one
+    // (`bpf_iter_bpf_link`, 5.19+): the programs are enumerated alone
+    if section == "iter/bpf_link" && matches!(outcome, Outcome::Absent(_)) {
+        return Some(
+            "optional: this kernel has no bpf_link iterator (the cross-view enumerates the \
+             programs only)"
+                .into(),
+        );
+    }
     if let Outcome::Absent(_) = outcome {
         let hook = section.strip_prefix("lsm/").unwrap_or("");
         if OPTIONAL_DENY_HOOKS.contains(&hook) {
@@ -1023,5 +1032,12 @@ mod tests {
         };
         assert!(optional_reason("probe_bprm", "lsm/bprm_check_security", &refused).is_some());
         assert!(optional_reason("exec_check_lsm", "lsm/bprm_check_security", &refused).is_none());
+        // lot 290: the link iterator absent does not count; refused it does,
+        // and so does the program iterator absent
+        let no_link_iter = Outcome::Absent("bpf_iter_bpf_link".into());
+        assert!(optional_reason("nn_iter_links", "iter/bpf_link", &no_link_iter).is_some());
+        assert!(optional_reason("nn_iter_links", "iter/bpf_link", &refused).is_none());
+        let no_prog_iter = Outcome::Absent("bpf_iter_bpf_prog".into());
+        assert!(optional_reason("nn_iter_progs", "iter/bpf_prog", &no_prog_iter).is_none());
     }
 }
