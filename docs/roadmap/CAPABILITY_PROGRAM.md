@@ -7776,8 +7776,23 @@ number in parentheses is a lab PR.
       `bpf_handle`); the maps frozen; the gap's `kprobe` High and socket
       filter Low at the next start; R011 Low. The round found the exploit
       guard's programs (loaded after the registration) listed foreign for a
-      round — they are the agent's own by their seen loader now.
-      @R2204B@
+      round — they are the agent's own by their seen loader now. Round
+      r2204b (the guard enforcing): `BPF_MAP_GET_FD_BY_ID` of the tracker's
+      `CGROUP_JOINED` read-write and read-only, `BPF_PROG_GET_FD_BY_ID`, the
+      pin root map's read-only `BPF_OBJ_GET`, the tracker's pin, a bind
+      mount and a relative path: all `EPERM`, 7 `bpf_handle` High; a
+      read-only handle by id and by path inside a window given; `bpftool
+      prog show` outside a window stops at once (rc 255).
+  - Gates (33eadc11, once): eBPF, the four clippy runs, fmt, 92 suites
+    4,206 passed and 2 failed (the agent's catalogue tests, on this lot's
+    NN-L-AT-001 entry), the privileged no-run, attack-coverage, golden ×5
+    (57 files, the same bytes), MSRV 1.89, the fuzz replay (14), portable
+    (5), the lockfiles unchanged; an added run of nn-linux's debug-trigger
+    tests found `verifier_check`'s sections test failing on lot 280a's
+    `nn_sysctl_guard` (a program named like a subprogram; CI compiles that
+    test only) and this lot's iterators. Fixed (c4a05c5b: the iterators
+    renamed, the catalogue entry, the test by section) and those suites run
+    again: all pass.
   - Host: named tests `only_the_rootkit_grade_types_are_refused_by_default`,
     `the_type_tables_are_the_uapi_headers`, `a_cross_view_record_round_trips`,
     `the_kernel_s_own_programs_are_told_by_name_and_attach_point`,
