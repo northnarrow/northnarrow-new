@@ -1541,12 +1541,15 @@ impl GuardFixture {
         let shared = AgentState::new(dir.path());
         let admin_pub = shared.admin_pub();
         std::fs::write(&admin_pub, "").expect("touch admin.pub");
+        // lot 290: and the trusted-installer role, for the window in which
+        // the test reads the agent's link ids (a read handle on its maps is
+        // refused outside one in enforce mode)
         let (key_a, _) = init_admin_keypair_with_roles(
             &nn_admin,
             dir.path(),
             &admin_pub,
             "admin_a",
-            "unlock,shutdown",
+            "unlock,shutdown,trusted-installer",
         );
         let (key_b, _) = init_admin_keypair_with_roles(
             &nn_admin,
@@ -1617,6 +1620,30 @@ impl GuardFixture {
             cosign_key: &self.key_b,
             agent_id_file: &self.agent_id_file,
             socket,
+        }
+    }
+
+    /// Lot 290: a trusted-installer window of `secs` on run `name`'s agent,
+    /// opened the way `install.sh` opens one.
+    fn grant_window(&self, name: &'static str, secs: u32) -> Result<(), String> {
+        let state = AgentState::named(self.dir.path(), name);
+        let out = Command::new(&self.nn_admin)
+            .arg("trusted-installer-grant")
+            .arg("--key")
+            .arg(&self.key_a)
+            .arg("--window-secs")
+            .arg(secs.to_string())
+            .args(state.client_args())
+            .output()
+            .map_err(|e| format!("spawn nn-admin trusted-installer-grant: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "trusted-installer-grant failed: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ))
         }
     }
 
@@ -1754,9 +1781,20 @@ fn bpf_guard_enforce_refuses_protected_pids_write() {
     //     the handle was granted and not recorded), and the enumeration
     //     from each of its link ids — the step `bpftool link list` takes —
     //     is not (it was refused, and recorded as a denial). The ids come
-    //     from OWN_BPF_IDS through read-only map handles.
+    //     from OWN_BPF_IDS through read-only map handles — lot 290: inside a
+    //     trusted-installer window (outside one a read handle on the
+    //     agent's maps is refused too), the checks after it has closed.
+    const WINDOW_SECS: u32 = 5;
+    fx.grant_window("enforce", WINDOW_SECS)
+        .unwrap_or_else(|e| panic!("{e}\n{}", log_tail(&log)));
     let links = common::raw_bpf::own_link_ids()
         .unwrap_or_else(|e| panic!("the agent's link ids: {e}\n{}", log_tail(&log)));
+    std::thread::sleep(Duration::from_secs(u64::from(WINDOW_SECS) + 2));
+    assert!(
+        common::raw_bpf::own_link_ids().is_err(),
+        "OWN_BPF_IDS read through a read-only handle outside a window in enforce mode (lot 290: \
+         refused)"
+    );
     assert_eq!(
         common::raw_bpf::link_fd_by_id(links[0]),
         Err(libc::EPERM),
@@ -1770,8 +1808,10 @@ fn bpf_guard_enforce_refuses_protected_pids_write() {
         }
     }
 
-    // 4. The agent saw the three refusals.
-    for op in ["op=bpf_map", "op=signal", "op=bpf_link"] {
+    // 4. The agent saw the three refusals (lot 290: the eviction's handle
+    //    on the pinned PROTECTED_PIDS is refused at its path now —
+    //    `bpf_handle` — before any write handle exists).
+    for op in ["op=bpf_handle", "op=signal", "op=bpf_link"] {
         assert!(
             wait_for_log_line(&log, &["ANTI-TAMPER DENIAL", op], GUARD_LOG_TIMEOUT).is_some(),
             "no ANTI-TAMPER DENIAL {op} in the agent log\n{}",
