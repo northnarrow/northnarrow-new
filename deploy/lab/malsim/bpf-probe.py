@@ -10,7 +10,7 @@
 #       BPF_PROG_LOAD of a socket filter (a type the agent lets through)
 #   bpf-probe.py map-fd-by-id ID [--rdonly]
 #   bpf-probe.py prog-fd-by-id ID
-#   bpf-probe.py obj-get PATH
+#   bpf-probe.py obj-get PATH [--rdonly]
 #
 # A program loaded with --pin is pinned at PATH (its directory made) so it
 # outlives this process.
@@ -121,8 +121,9 @@ def main(argv):
     if cmd == "prog-fd-by-id":
         return report(*bpf(BPF_PROG_GET_FD_BY_ID, struct.pack("<III", int(args[0]), 0, 0)))
     if cmd == "obj-get":
+        flags = BPF_F_RDONLY if "--rdonly" in args else 0
         p = ctypes.create_string_buffer(args[0].encode() + b"\0")
-        return report(*bpf(BPF_OBJ_GET, struct.pack("<QII", ctypes.addressof(p), 0, 0)))
+        return report(*bpf(BPF_OBJ_GET, struct.pack("<QII", ctypes.addressof(p), 0, flags)))
     print(f"unknown command {cmd}", file=sys.stderr)
     return 2
 

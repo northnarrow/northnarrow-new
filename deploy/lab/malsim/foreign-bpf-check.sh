@@ -141,25 +141,37 @@ if want F4; then
         sudo systemctl set-environment NN_BPF_DEFENSE_ENFORCE=1 && ENF=1 && restart_agent
     fi
     TDIR=$(sudo sh -c "ls -d /sys/fs/bpf/northnarrow-cgroup-join-v* 2>/dev/null" | head -1)
+    # the pin root's maps are openable by path to root (the tracker's
+    # directory refuses any foreign open on its own: lot 281), so the path
+    # refusals are shown on PROTECTED_PIDS, read-only (a write handle was
+    # refused before this lot, in a window too); the tracker's map by its id
+    RPIN=/sys/fs/bpf/northnarrow/PROTECTED_PIDS
     window 60
-    MID=$(sudo bpftool -j map show pinned "$TDIR/CGROUP_JOINED" 2>/dev/null | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null)
+    MID=$(sudo bpftool -j map show 2>/dev/null | python3 -I -c '
+import json, sys
+ids = [m["id"] for m in json.load(sys.stdin) if m.get("name") == "CGROUP_JOINED"]
+print(max(ids) if ids else "")')
     PID_=$(sudo awk '$1 ~ /^[0-9]+$/ {print $1; exit}' /run/northnarrow/bpf-own-ids 2>/dev/null)
     echo "    tracker map CGROUP_JOINED id ${MID:-?} ($TDIR), an agent program id ${PID_:-?}"
-    o=$(sudo $PROBE map-fd-by-id "$MID")
+    o=$(sudo $PROBE map-fd-by-id "${MID:-0}")
     [[ $o == OK* ]] && pass "F4 inside a window a handle is given ($o)" || bad "F4 inside a window: $o"
+    o=$(sudo $PROBE obj-get "$RPIN" --rdonly)
+    [[ $o == OK* ]] && pass "F4 inside a window the pin root's map opens by path ($o)" || bad "F4 inside a window, $RPIN: $o"
     no_window
     n0=$(lines "$DET")
-    for c in "map-fd-by-id $MID" "map-fd-by-id $MID --rdonly" "prog-fd-by-id $PID_" "obj-get $TDIR/CGROUP_JOINED"; do
+    for c in "map-fd-by-id ${MID:-0}" "map-fd-by-id ${MID:-0} --rdonly" "prog-fd-by-id ${PID_:-0}" "obj-get $RPIN --rdonly" "obj-get $TDIR/CGROUP_JOINED --rdonly"; do
         o=$(sudo $PROBE $c)
         [[ $o == "ERR EPERM"* ]] && pass "F4 $c: EPERM" || bad "F4 $c: $o"
     done
     sudo mkdir -p /run/k290-bpfbind && sudo mount --bind /sys/fs/bpf /run/k290-bpfbind
-    o=$(sudo $PROBE obj-get "/run/k290-bpfbind/${TDIR##*/}/CGROUP_JOINED")
-    [[ $o == "ERR EPERM"* ]] && pass "F4 the same pin through a bind mount: EPERM (judged on the map)" || bad "F4 bind mount: $o"
+    o=$(sudo $PROBE obj-get "/run/k290-bpfbind/northnarrow/PROTECTED_PIDS" --rdonly)
+    [[ $o == "ERR EPERM"* ]] && pass "F4 the same pin through a bind mount of the bpffs: EPERM (judged on the map)" || bad "F4 bind mount: $o"
+    o2=$(sudo sh -c "cd /sys/fs/bpf && python3 -I $HERE/bpf-probe.py obj-get northnarrow/PROTECTED_PIDS --rdonly")
+    [[ $o2 == "ERR EPERM"* ]] && pass "F4 a relative path: EPERM (judged on the map)" || bad "F4 relative path: $o2"
     sudo umount /run/k290-bpfbind; sudo rmdir /run/k290-bpfbind
     sleep 2
     measure "F4 bpf_handle records: $(count "$n0" bpf_handle) ($(sev_of "$n0" bpf_handle))"
-    (( $(count "$n0" bpf_handle) >= 5 )) && pass "F4 each refusal signed bpf_handle" || bad "F4 records: $(count "$n0" bpf_handle)"
+    (( $(count "$n0" bpf_handle) >= 6 )) && pass "F4 the refusals signed bpf_handle ($(count "$n0" bpf_handle))" || bad "F4 records: $(count "$n0" bpf_handle)"
     n0=$(lines "$DET")
     o=$(sudo bpftool prog show 2>&1); rc=$?
     measure "F4 bpftool prog show outside a window: rc $rc, $(echo "$o" | grep -cE '^[0-9]+: ') programs listed, last line: $(echo "$o" | tail -1 | cut -c1-120)"
