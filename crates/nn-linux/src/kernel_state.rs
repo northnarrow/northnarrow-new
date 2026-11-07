@@ -493,12 +493,15 @@ mod tests {
             ),
             "{e:?}"
         );
+        // the kernel's own program: its early bit carried
+        let kernel_s = crate::bpf_crossview::Object { early: true, ..o };
         assert!(matches!(
-            event_of(&Finding::Bpf(crate::bpf_crossview::Finding::Baseline(o)), 3),
+            event_of(&Finding::Bpf(crate::bpf_crossview::Finding::Baseline(kernel_s)), 3),
             Event::FsProtectDenial {
                 operation: FsProtectOperation::BpfBaseline,
+                target_ino,
                 ..
-            }
+            } if target_ino == common::bpf_prog_class::crossview_ino(false, true, 29, 77)
         ));
         assert!(matches!(
             event_of(&Finding::RootProgram(812), 1),
