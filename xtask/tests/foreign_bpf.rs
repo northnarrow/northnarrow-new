@@ -217,6 +217,7 @@ fn a_seen_load_is_marked_and_the_iterators_write_whole_records() {
             "let seq = *meta;",
             "crate::zero::zero(rec);",
             "(*rec).id = id;",
+            "if let Some(o) = off_opt!(BPF_PROG_AUX_LOAD_TIME_OFFSET) {\n        (*rec).load_time = rd_u64(aux + o as u64).unwrap_or(0);",
             "core::mem::size_of::<ProgRecord>() as u32,",
         ],
     )
