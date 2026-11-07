@@ -72,7 +72,7 @@ if want F1; then
     for i in $(seq 1 30); do sudo test -s "$STATUS" && sudo grep -q ' baseline\| seen\| pending' "$STATUS" 2>/dev/null && break; sleep 1; done
     if sudo test -s "$STATUS"; then
         sudo head -1 "$STATUS" | sed 's/^/    /'
-        measure "F1 foreign objects: $(sudo grep -cE '^(prog|link) ' "$STATUS"); by state: $(sudo awk '/^(prog|link) /{print $8}' "$STATUS" | sort | uniq -c | tr -s ' ' | tr '\n' ' ')"
+        measure "F1 foreign objects: $(sudo grep -cE '^(prog|link) ' "$STATUS"); by state: $(sudo awk '/^(prog|link) /{print $7}' "$STATUS" | sort | uniq -c | tr -s ' ' | tr '\n' ' ')"
         sudo grep -E '^(prog|link) ' "$STATUS" | head -40 | sed 's/^/    /'
         pass "F1 the cross-view writes its status file"
     else

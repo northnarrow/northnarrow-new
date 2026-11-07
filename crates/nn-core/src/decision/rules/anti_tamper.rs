@@ -364,11 +364,12 @@ impl Rule for NnLAt001AntiTamperDenial {
 pub fn crossview_severity(
     operation: FsProtectOperation,
     is_link: bool,
+    early: bool,
     object_type: u32,
 ) -> Severity {
     match operation {
         FsProtectOperation::BpfBaseline
-            if is_link || !common::bpf_prog_class::denied_by_default(object_type) =>
+            if is_link || early || !common::bpf_prog_class::denied_by_default(object_type) =>
         {
             Severity::Low
         }
@@ -386,7 +387,7 @@ fn crossview_verdict(
     target_ino: u64,
 ) -> Verdict {
     use common::bpf_prog_class as c;
-    let (is_link, t, id) = c::crossview_of(target_ino);
+    let (is_link, early, t, id) = c::crossview_of(target_ino);
     let (name, attach) = c::object_of_comm(comm);
     let what = if is_link {
         format!(
@@ -407,11 +408,17 @@ fn crossview_verdict(
              the shape of a BPF rootkit. Found by the cross-view (the agent's own enumeration of \
              the kernel's programs and links every 5 s); not refused."
         )
+    } else if early {
+        format!(
+            "The {what} was loaded by the kernel itself before user space started (its load \
+             time before PID 1's start): the kernel's own program, the cross-view's baseline, \
+             signed once. Not refused."
+        )
     } else {
         format!(
             "The {what} was loaded while the agent was not running (present at its start): \
              the cross-view's baseline, signed once. Not refused{}.",
-            if crossview_severity(operation, is_link, t) == Severity::High {
+            if crossview_severity(operation, is_link, early, t) == Severity::High {
                 "; its type is one the agent refuses outside a trusted-installer window"
             } else {
                 ""
@@ -422,7 +429,7 @@ fn crossview_verdict(
         rule,
         event,
         ResponseAction::Log,
-        crossview_severity(operation, is_link, t),
+        crossview_severity(operation, is_link, early, t),
         &reasoning,
     )
 }
@@ -989,7 +996,7 @@ mod tests {
             FsProtectOperation::BpfUnseen,
             &object_comm("hide_me", "bpf_lsm_file_open"),
             tag,
-            crossview_ino(false, 29, 812),
+            crossview_ino(false, false, 29, 812),
         ));
         assert_eq!(u.severity, Severity::High);
         for n in [
@@ -1007,7 +1014,7 @@ mod tests {
             FsProtectOperation::BpfUnseen,
             &object_comm("", "prog 900"),
             0,
-            crossview_ino(true, 2, 41),
+            crossview_ino(true, false, 2, 41),
         ));
         assert_eq!(l.severity, Severity::High);
         assert!(
@@ -1020,7 +1027,7 @@ mod tests {
                 FsProtectOperation::BpfBaseline,
                 &object_comm("sd_devices", "cgroup_device"),
                 0,
-                crossview_ino(link, t, 5),
+                crossview_ino(link, false, t, 5),
             ))
         };
         assert_eq!(b(15, false).severity, Severity::Low);
@@ -1038,8 +1045,27 @@ mod tests {
             .reasoning
             .contains("refuses outside a trusted-installer window"));
         assert_eq!(
-            crossview_severity(FsProtectOperation::BpfUnseen, true, 0),
+            crossview_severity(FsProtectOperation::BpfUnseen, true, false, 0),
             Severity::High
+        );
+        // the kernel's own program (loaded before user space): Low, said so
+        let k = v(ev(
+            FsProtectOperation::BpfBaseline,
+            &object_comm("hid_tail_call", "__hid_bpf_tail_call"),
+            0,
+            crossview_ino(false, true, 26, 2),
+        ));
+        assert_eq!(k.severity, Severity::Low);
+        assert!(
+            k.reasoning
+                .contains("by the kernel itself before user space"),
+            "{}",
+            k.reasoning
+        );
+        assert_eq!(
+            crossview_severity(FsProtectOperation::BpfUnseen, false, true, 26),
+            Severity::High,
+            "an unseen object stays High"
         );
     }
 }

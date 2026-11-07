@@ -50,7 +50,9 @@ fn the_bpf_hook_refuses_the_rootkit_grade_types_in_every_mode() {
     in_order(
         h,
         &[
-            "if !observed(cmd) || caller_is_exempt() {\n        return 0;\n    }",
+            "if !observed(cmd) {\n        return 0;\n    }",
+            "if caller_is_exempt() {",
+            "if cmd == BPF_PROG_LOAD {\n            crate::bpf_census::mark_load();\n        }\n        return 0;\n    }",
             "| BPF_PROG_LOAD",
             "crate::fail_open::bump(fail_open_hook::BPF);",
             "if cmd == BPF_PROG_LOAD {\n        if denied_by_default(arg)\n            && !crate::inode_protect::override_active()\n            && !fresh_instance_may_load()\n        {",
@@ -61,8 +63,10 @@ fn the_bpf_hook_refuses_the_rootkit_grade_types_in_every_mode() {
         ],
     )
     .unwrap();
-    let load = &h[h.find("if cmd == BPF_PROG_LOAD {").unwrap()
-        ..h.find("crate::bpf_census::mark_load();").unwrap()];
+    let start = h
+        .find("if cmd == BPF_PROG_LOAD {\n        if denied_by_default(arg)")
+        .expect("the load's refusal");
+    let load = &h[start..start + h[start..].find("crate::bpf_census::mark_load();").unwrap()];
     assert!(
         !load.contains("enforce()"),
         "the type refusal holds in every mode"

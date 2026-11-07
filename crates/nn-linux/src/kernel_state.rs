@@ -203,7 +203,7 @@ pub fn event_of(f: &Finding, timestamp_ns: u64) -> Event {
             (
                 op,
                 o.tag,
-                common::bpf_prog_class::crossview_ino(o.is_link, o.object_type, o.id),
+                common::bpf_prog_class::crossview_ino(o.is_link, o.early, o.object_type, o.id),
             )
         }
     };
@@ -472,6 +472,7 @@ mod tests {
             name: "hide".into(),
             tag: 0xabcd,
             attach: "bpf_lsm_file_open".into(),
+            early: false,
         };
         let e = event_of(
             &Finding::Bpf(crate::bpf_crossview::Finding::Unseen(o.clone())),
@@ -488,7 +489,7 @@ mod tests {
                     target_ino,
                     ..
                 } if comm == "hide@bpf_lsm_file_open"
-                    && *target_ino == common::bpf_prog_class::crossview_ino(false, 29, 77)
+                    && *target_ino == common::bpf_prog_class::crossview_ino(false, false, 29, 77)
             ),
             "{e:?}"
         );

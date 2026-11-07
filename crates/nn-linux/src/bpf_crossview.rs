@@ -218,8 +218,11 @@ pub struct Object {
     /// The program's tag (`tag_word`), 0 for a link.
     pub tag: u64,
     /// Where it is attached: the attach function, else the link types of
-    /// its links, else its expected attach type.
+    /// its links, else its expected attach type (when it has one).
     pub attach: String,
+    /// Loaded by the kernel itself before user space started (its load
+    /// time before PID 1's start: HID-BPF's `hid_tail_call`).
+    pub early: bool,
 }
 
 /// A finding to sign.
@@ -244,6 +247,9 @@ pub struct Watch {
     /// Every program the hook saw loading since the start (the kernel's
     /// map is LRU: what was copied here stays).
     seen: BTreeMap<u32, SeenLoad>,
+    /// When user space started (PID 1's start, boot-time ns): a program
+    /// loaded before it is the kernel's own.
+    pub user_space_since: Option<u64>,
 }
 
 /// A program record's attach point.
@@ -256,11 +262,39 @@ fn attach_of(p: &ProgRecord, link_types: &BTreeMap<u32, BTreeSet<String>>) -> St
     }
     match link_types.get(&p.id) {
         Some(t) if !t.is_empty() => t.iter().cloned().collect::<Vec<_>>().join("+"),
+        // 0 is also "none given" (a cgroup program attached the legacy way
+        // says nothing of where): not named
+        _ if p.expected_attach_type == 0 => "unknown (no link, no attach type)".to_string(),
         _ => attach_type_name(p.expected_attach_type),
     }
 }
 
+/// When user space started: PID 1's start in `/proc/1/stat` (field 22,
+/// clock ticks since boot), in boot-time ns — the clock of a program's
+/// `load_time`.
+pub fn user_space_start_ns(stat: &str, clk_tck: u64) -> Option<u64> {
+    let after = &stat[stat.rfind(')')? + 1..];
+    let ticks: u64 = after.split_whitespace().nth(19)?.parse().ok()?;
+    (clk_tck > 0).then(|| ticks.saturating_mul(1_000_000_000) / clk_tck)
+}
+
+/// [`user_space_start_ns`] of this host.
+pub fn host_user_space_start_ns() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/1/stat").ok()?;
+    // SAFETY: sysconf has no preconditions.
+    let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    user_space_start_ns(&stat, u64::try_from(tck).ok()?)
+}
+
 impl Watch {
+    /// A watch that tells the kernel's own programs by `user_space_since`.
+    pub fn new(user_space_since: Option<u64>) -> Self {
+        Self {
+            user_space_since,
+            ..Self::default()
+        }
+    }
+
     /// The programs seen loading so far, with their loaders.
     pub fn seen(&self) -> &BTreeMap<u32, SeenLoad> {
         &self.seen
@@ -312,6 +346,7 @@ pub fn judge(
             name: text(&p.name),
             tag: tag_word(p.tag),
             attach: attach_of(p, &link_types),
+            early: p.load_time != 0 && w.user_space_since.is_some_and(|t| p.load_time < t),
         });
     }
     // a link is judged through its program; one whose program the program
@@ -327,6 +362,7 @@ pub fn judge(
             name: String::new(),
             tag: 0,
             attach: format!("program {} not enumerated", l.prog_id),
+            early: false,
         });
     }
     let candidates: BTreeMap<(bool, u32), &Object> = foreign
@@ -382,16 +418,18 @@ pub fn render_status(w: &Watch, foreign: &[Object]) -> String {
                 .unwrap_or_default()
         };
         body.push_str(&format!(
-            "{kind} {} {t} {} {:016x} {} {state}{loader}\n",
+            "{kind} {} {t} {} {:016x} {} {state}{}{loader}\n",
             o.id,
             if o.name.is_empty() { "-" } else { &o.name },
             o.tag,
             o.attach.replace(' ', "_"),
+            if o.early { " kernel" } else { "" },
         ));
     }
     // every load the hook saw since the start, gone or not: the host's
-    // loaders and their types
-    for (id, l) in w.seen() {
+    // loaders and their types (the agent's own loads left out)
+    let me = std::process::id();
+    for (id, l) in w.seen().iter().filter(|(_, l)| l.tgid != me) {
         body.push_str(&format!(
             "load {id} {} pid={} uid={} comm={}\n",
             prog_type_name(l.prog_type),
@@ -451,6 +489,7 @@ mod tests {
             prog_type: t,
             expected_attach_type: 6,
             attach_read: 0,
+            load_time: 9_000_000_000,
             tag: [0xab, 0, 0, 0, 0, 0, 0, id as u8],
             name: n,
             attach: [0u8; 64],
@@ -644,7 +683,56 @@ mod tests {
         );
     }
 
-    /// Lot 290: the iterators' bytes are read as whole records.
+    /// Lot 290 (named; the lab's first round): a program the kernel loaded
+    /// before user space started (HID-BPF's `hid_tail_call`, prog id 2 on
+    /// the 6.8 guest) is told by its load time — the baseline's object
+    /// carries it, the status file says `kernel`; a program loaded later is
+    /// not; a load time not read is not; a cgroup program with no attach
+    /// type and no link is not named an attach point it may not have.
+    #[test]
+    fn the_kernel_s_own_program_is_told_by_its_load_time() {
+        let own: BTreeSet<u32> = BTreeSet::new();
+        let mut w = Watch {
+            user_space_since: Some(3_000_000_000),
+            ..Watch::default()
+        };
+        let mut hid = with_attach(prog(2, 26, "hid_tail_call"), "__hid_bpf_tail_call");
+        hid.load_time = 1_200_000_000;
+        let mut unread = prog(4, 26, "x");
+        unread.load_time = 0;
+        let mut legacy = prog(5, 15, "sd_devices");
+        legacy.expected_attach_type = 0;
+        let r = en(vec![hid, prog(3, 2, "late"), unread, legacy], None);
+        judge(&mut w, vec![], &r, &own);
+        let (f, foreign) = judge(&mut w, vec![], &r, &own);
+        let early: Vec<(u32, bool)> = f
+            .iter()
+            .map(|f| match f {
+                Finding::Baseline(o) | Finding::Unseen(o) => (o.id, o.early),
+            })
+            .collect();
+        assert_eq!(early, vec![(2, true), (3, false), (4, false), (5, false)]);
+        assert_eq!(
+            foreign.iter().find(|o| o.id == 5).unwrap().attach,
+            "unknown (no link, no attach type)"
+        );
+        let body = render_status(&w, &foreign);
+        assert!(
+            body.contains("__hid_bpf_tail_call baseline kernel\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("late ab00000000000003 cgroup_device baseline\n"),
+            "{body}"
+        );
+        // PID 1's start: field 22 after the command's parenthesis
+        let stat = "1 (systemd) S 0 1 1 0 -1 4194560 5 6 7 8 9 10 11 12 20 0 1 0 345 1 2";
+        assert_eq!(user_space_start_ns(stat, 100), Some(3_450_000_000));
+        assert_eq!(user_space_start_ns("1 (a) b) S", 100), None);
+        assert_eq!(user_space_start_ns(stat, 0), None);
+    }
+
+    /// Lot 290: the iterator bytes are read as whole records.
     #[test]
     fn the_iterator_bytes_are_whole_records() {
         let p = prog(3, 2, "x");

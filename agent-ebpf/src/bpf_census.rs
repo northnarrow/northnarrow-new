@@ -31,7 +31,7 @@ use northnarrow_common::bpf_prog_class::{LinkRecord, ProgRecord, SeenLoad, ATTAC
 
 use crate::btf_offsets::{
     BPF_LINK_ID_OFFSET, BPF_LINK_PROG_OFFSET, BPF_LINK_TYPE_OFFSET, BPF_PROG_AUX_ATTACH_FUNC_NAME_OFFSET,
-    BPF_PROG_AUX_ID_OFFSET, BPF_PROG_AUX_NAME_OFFSET, BPF_PROG_AUX_OFFSET, BPF_PROG_EXPECTED_ATTACH_TYPE_OFFSET, BPF_PROG_TAG_OFFSET,
+    BPF_PROG_AUX_ID_OFFSET, BPF_PROG_AUX_LOAD_TIME_OFFSET, BPF_PROG_AUX_NAME_OFFSET, BPF_PROG_AUX_OFFSET, BPF_PROG_EXPECTED_ATTACH_TYPE_OFFSET, BPF_PROG_TAG_OFFSET,
     BPF_PROG_TYPE_OFFSET,
 };
 
@@ -147,6 +147,9 @@ unsafe fn try_iter_progs(ctx: *mut c_void) {
         if let Ok(tag) = bpf_probe_read_kernel::<[u8; 8]>((prog + o as u64) as *const [u8; 8]) {
             (*rec).tag = tag;
         }
+    }
+    if let Some(o) = off_opt!(BPF_PROG_AUX_LOAD_TIME_OFFSET) {
+        (*rec).load_time = rd_u64(aux + o as u64).unwrap_or(0);
     }
     if let Some(o) = off_opt!(BPF_PROG_AUX_NAME_OFFSET) {
         if let Ok(name) = bpf_probe_read_kernel::<[u8; 16]>((aux + o as u64) as *const [u8; 16]) {

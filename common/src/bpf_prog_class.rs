@@ -251,6 +251,8 @@ pub struct ProgRecord {
     pub expected_attach_type: u32,
     /// 1 when the attach function's name was read.
     pub attach_read: u32,
+    /// When it was loaded (boot-time ns; 0: not read).
+    pub load_time: u64,
     pub tag: [u8; 8],
     pub name: [u8; OBJ_NAME_LEN],
     pub attach: [u8; ATTACH_NAME_LEN],
@@ -293,20 +295,27 @@ pub fn text(bytes: &[u8]) -> String {
 /// whether it is a link (this bit), its type (bits 32–62: the program's
 /// or the link's) and its id (bits 0–31).
 pub const CROSSVIEW_LINK_BIT: u64 = 1 << 63;
+/// A cross-view record's bit for a program the kernel loaded before user
+/// space started (its load time before PID 1's start): the kernel's own
+/// (HID-BPF's `hid_tail_call`), not one loaded while the agent was not
+/// running. The type takes bits 32–61.
+pub const CROSSVIEW_EARLY_BIT: u64 = 1 << 62;
 
 /// `target_ino` of a cross-view record.
 #[inline(always)]
-pub const fn crossview_ino(is_link: bool, object_type: u32, id: u32) -> u64 {
+pub const fn crossview_ino(is_link: bool, early: bool, object_type: u32, id: u32) -> u64 {
     let link = if is_link { CROSSVIEW_LINK_BIT } else { 0 };
-    link | (((object_type as u64) & 0x7fff_ffff) << 32) | id as u64
+    let early = if early { CROSSVIEW_EARLY_BIT } else { 0 };
+    link | early | (((object_type as u64) & 0x3fff_ffff) << 32) | id as u64
 }
 
-/// `(is_link, type, id)` of a cross-view record's `target_ino`.
+/// `(is_link, early, type, id)` of a cross-view record's `target_ino`.
 #[inline(always)]
-pub const fn crossview_of(target_ino: u64) -> (bool, u32, u32) {
+pub const fn crossview_of(target_ino: u64) -> (bool, bool, u32, u32) {
     (
         target_ino & CROSSVIEW_LINK_BIT != 0,
-        ((target_ino >> 32) & 0x7fff_ffff) as u32,
+        target_ino & CROSSVIEW_EARLY_BIT != 0,
+        ((target_ino >> 32) & 0x3fff_ffff) as u32,
         target_ino as u32,
     )
 }
@@ -486,15 +495,20 @@ mod tests {
     /// come back the same.
     #[test]
     fn a_cross_view_record_round_trips() {
-        for (link, t, id) in [
-            (false, 29, 7),
-            (true, 2, u32::MAX),
-            (false, 0, 0),
-            (true, 13, 1),
+        for (link, early, t, id) in [
+            (false, false, 29, 7),
+            (true, false, 2, u32::MAX),
+            (false, true, 0, 0),
+            (true, true, 13, 1),
+            (false, true, 26, 2),
         ] {
-            assert_eq!(crossview_of(crossview_ino(link, t, id)), (link, t, id));
+            assert_eq!(
+                crossview_of(crossview_ino(link, early, t, id)),
+                (link, early, t, id)
+            );
         }
-        assert_eq!(crossview_ino(false, 29, 7), (29 << 32) | 7);
+        assert_eq!(crossview_ino(false, false, 29, 7), (29 << 32) | 7);
+        assert_eq!(crossview_ino(false, true, 0, 0), 1 << 62);
         assert_eq!(
             tag_hex(tag_word([0xde, 0xad, 0xbe, 0xef, 0, 1, 2, 3])),
             "deadbeef00010203"
@@ -509,7 +523,7 @@ mod tests {
     /// Lot 290: the iterators' records, as userland reads them.
     #[test]
     fn the_records_have_their_sizes() {
-        assert_eq!(core::mem::size_of::<ProgRecord>(), 16 + 8 + 16 + 64);
+        assert_eq!(core::mem::size_of::<ProgRecord>(), 16 + 8 + 8 + 16 + 64);
         assert_eq!(core::mem::size_of::<LinkRecord>(), 16);
         assert_eq!(core::mem::size_of::<SeenLoad>(), 32);
     }

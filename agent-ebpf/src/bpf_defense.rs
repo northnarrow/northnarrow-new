@@ -835,7 +835,15 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     // Only the commands worth a record (`bpf_cmd::observed`); the hot ones
     // (MAP_LOOKUP/UPDATE from bpftool, OBJ_GET_INFO, PROG_RUN) and the
     // `*_GET_NEXT_ID` enumerations, which give no handle, are not reported.
-    if !observed(cmd) || caller_is_exempt() {
+    if !observed(cmd) {
+        return 0;
+    }
+    if caller_is_exempt() {
+        // Lot 290: the family's loads are seen too — a program the agent
+        // loads after its registration of its own objects is never "unseen"
+        if cmd == BPF_PROG_LOAD {
+            crate::bpf_census::mark_load();
+        }
         return 0;
     }
     // bpf_attr is uapi-stable: the first u32 of the union is prog_type

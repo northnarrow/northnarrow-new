@@ -141,7 +141,8 @@ fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
     in_order(
         h,
         &[
-            "if !observed(cmd) || caller_is_exempt() {\n        return 0;\n    }",
+            "if !observed(cmd) {\n        return 0;\n    }",
+            "if caller_is_exempt() {",
             "BPF_PROG_ATTACH | BPF_LINK_CREATE => 8,",
             "if judges_attach_target(cmd, arg)\n        && !crate::inode_protect::override_active()\n        && !fresh_instance_may_load()\n    {",
             "Some(off) if !attr.is_null() => {",

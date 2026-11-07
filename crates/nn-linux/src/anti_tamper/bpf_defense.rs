@@ -149,7 +149,9 @@ impl BpfGuard {
             parts,
             own: Box::new(move || guard.own_prog_ids()),
             status,
-            watch: crate::bpf_crossview::Watch::default(),
+            watch: crate::bpf_crossview::Watch::new(
+                crate::bpf_crossview::host_user_space_start_ns(),
+            ),
         })
     }
 
