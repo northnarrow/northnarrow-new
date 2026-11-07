@@ -566,7 +566,7 @@ and raise the posture to ENGAGED only (an administrator's listing, never the
 decisive tamper). bpftool's `pids` column needs a `tracing` program, refused
 outside a window. `/run/northnarrow/bpf-own-ids` lists the agent's programs,
 `/run/northnarrow/bpf-foreign` the host's other BPF objects (the cross-view,
-`docs/design/ANTITAMPER_TRUST_MODEL.md` "Lot 290").
+https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/ANTITAMPER_TRUST_MODEL.md, "Lot 290").
 
 **Links (second half).** The only object that can *detach* one of the
 agent's LSM hooks is a handle to its BPF link, and there are two ways to
