@@ -958,6 +958,37 @@ put back to `1`. A host that does not mount debugfs has no such file to
 write until it mounts it; the write deny finds the file on any mount of
 debugfs (by its filesystem and its names).
 
+## Foreign BPF and the cross-view (lot 290)
+
+**What it needs.** The `bpf` and `bpf_prog` LSM hooks (5.7+, `bpf` in the
+active LSM list), and for the cross-view the BPF iterators: `iter/bpf_prog`
+(5.10+) and, where the kernel has it, `iter/bpf_link` (`bpf_iter_bpf_link`,
+5.19+). The agent's unit has no `CAP_SYS_ADMIN`, which
+`BPF_PROG_GET_NEXT_ID` and `BPF_LINK_GET_NEXT_ID` need: it enumerates with
+its own iterators, which `CAP_BPF` and `CAP_PERFMON` load. Seven optional
+BTF offsets (`bpf_prog.expected_attach_type`, `.tag`, `bpf_prog_aux.name`,
+`.attach_func_name`, `.load_time`, `bpf_link.type`, `.prog`): one absent
+leaves that field of the record empty, nothing else. Without the program
+iterator the cross-view does not run (signed degraded `bpf_crossview`); the
+refusals do not depend on it.
+
+**As measured** (our lab guests, lot 290):
+- **Ubuntu 24.04** (`6.8.0-147-generic`): `verifier-check` 104 programs,
+  102 OK, 2 not counted, 0 failing — `bpf_syscall_observe` 4,330
+  instructions (2,272 before the lot), `bpf_prog_guard` 1,097, `bpf_map_guard`
+  1,017, `nn_iter_progs` 514, `nn_iter_links` 255. Both iterators run.
+  `bpf_prog_aux`'s offsets on that kernel: `attach_func_name` 200,
+  `load_time` 928, `name` 960. The kernel loads one program of its own,
+  HID-BPF's `hid_tail_call` (a `tracing` program on `__hid_bpf_tail_call`,
+  prog id 2), when udev loads `hid` in the initramfs — after PID 1 started:
+  the cross-view tells it by its name and attach function (Low).
+- **Ubuntu 22.04** (`5.15.0-202-generic`): `verifier-check` 104 programs,
+  98 OK, 6 not counted, 0 failing — `nn_iter_links` absent (no
+  `bpf_iter_bpf_link`: the programs are enumerated alone), the rest as on
+  6.8. `bpf_prog_aux` there: `attach_func_name` 168, `load_time` 504,
+  `name` 528 (resolved at boot). No HID-BPF program; systemd 249 loads its
+  cgroup programs unnamed.
+
 ## Adding a distro to the lab
 
 `NN_LAB_DISTRO=<name> deploy/lab/nn-lab.sh up` boots a separate guest
