@@ -275,6 +275,9 @@ pub struct LinkRecord {
 pub struct SeenLoad {
     pub tgid: u32,
     pub uid: u32,
+    /// The program's type (`u32::MAX`: not read).
+    pub prog_type: u32,
+    pub _pad: u32,
     pub comm: [u8; 16],
 }
 
@@ -484,6 +487,6 @@ mod tests {
     fn the_records_have_their_sizes() {
         assert_eq!(core::mem::size_of::<ProgRecord>(), 16 + 8 + 16 + 64);
         assert_eq!(core::mem::size_of::<LinkRecord>(), 16);
-        assert_eq!(core::mem::size_of::<SeenLoad>(), 24);
+        assert_eq!(core::mem::size_of::<SeenLoad>(), 32);
     }
 }

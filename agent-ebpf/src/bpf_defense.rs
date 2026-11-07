@@ -776,7 +776,7 @@ unsafe fn try_bpf_prog_guard(ctx: &LsmContext) -> i32 {
         }
     };
     if loading {
-        crate::bpf_census::mark_seen(id);
+        crate::bpf_census::mark_seen(id, prog);
         return 0;
     }
     if !is_own_kind(id, OWN_KIND_PROG) || caller_is_exempt() || fresh_instance_may_load() {

@@ -57,7 +57,7 @@ pub const DEGRADATION: &str = "bpf_crossview";
 #[derive(Clone, Copy)]
 struct AyaSeen(SeenLoad);
 
-// SAFETY: `SeenLoad` is `#[repr(C)]` over u32, u32, [u8; 16] — no padding,
+// SAFETY: `SeenLoad` is `#[repr(C)]` over four u32 and [u8; 16] — no padding,
 // every bit pattern valid; `AyaSeen` is `#[repr(transparent)]`.
 unsafe impl aya::Pod for AyaSeen {}
 
@@ -391,6 +391,17 @@ pub fn render_status(w: &Watch, foreign: &[Object]) -> String {
             o.attach.replace(' ', "_"),
         ));
     }
+    // every load the hook saw since the start, gone or not: the host's
+    // loaders and their types
+    for (id, l) in w.seen() {
+        body.push_str(&format!(
+            "load {id} {} pid={} uid={} comm={}\n",
+            prog_type_name(l.prog_type),
+            l.tgid,
+            l.uid,
+            text(&l.comm)
+        ));
+    }
     body
 }
 
@@ -461,7 +472,13 @@ mod tests {
     fn seen(tgid: u32) -> SeenLoad {
         let mut comm = [0u8; 16];
         comm[..4].copy_from_slice(b"runc");
-        SeenLoad { tgid, uid: 0, comm }
+        SeenLoad {
+            tgid,
+            uid: 0,
+            prog_type: 15,
+            _pad: 0,
+            comm,
+        }
     }
 
     fn ids(found: &[Finding]) -> Vec<(char, bool, u32)> {
@@ -562,7 +579,7 @@ mod tests {
     }
 
     /// Lot 290: the status file names each foreign object, its state and
-    /// the loader the hook saw.
+    /// the loader the hook saw, and every load seen since the start.
     #[test]
     fn the_status_file_names_each_foreign_object_and_its_loader() {
         let own: BTreeSet<u32> = BTreeSet::new();
@@ -573,6 +590,7 @@ mod tests {
         let body = render_status(&w, &foreign);
         assert!(body.contains("prog 10 cgroup_device sd_devices ab0000000000000a cgroup_device baseline\n"), "{body}");
         assert!(body.contains("prog 20 cgroup_device runc_dev ab00000000000014 cgroup_device seen pid=77 uid=0 comm=runc\n"), "{body}");
+        assert!(body.contains("load 20 cgroup_device pid=77 uid=0 comm=runc\n"), "{body}");
         assert_eq!(
             status_path(Path::new("/run/northnarrow/agent.pid")),
             Path::new("/run/northnarrow/bpf-foreign")

@@ -79,13 +79,15 @@ pub fn take_load_mark() -> bool {
     marked
 }
 
-/// Program `id` was just loaded by the calling process.
+/// Program `id` (`prog`) was just loaded by the calling process.
 #[inline(always)]
-pub fn mark_seen(id: u32) {
+pub unsafe fn mark_seen(id: u32, prog: *const c_void) {
     let pid_tgid = bpf_get_current_pid_tgid();
     let seen = SeenLoad {
         tgid: (pid_tgid >> 32) as u32,
         uid: bpf_get_current_uid_gid() as u32,
+        prog_type: rd_u32(prog as u64 + off!(BPF_PROG_TYPE_OFFSET) as u64).unwrap_or(u32::MAX),
+        _pad: 0,
         comm: bpf_get_current_comm().unwrap_or([0u8; 16]),
     };
     let _ = SEEN_PROGS.insert(&id, &seen, 0);
