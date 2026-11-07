@@ -276,7 +276,9 @@ fn the_cross_view_runs_in_the_kernel_state_round() {
         &[
             "let seen = self.parts.seen()?;",
             "let en = self.parts.enumerate()?;",
-            "let own = (self.own)();",
+            "let mut own = (self.own)();",
+            "let me = std::process::id();",
+            "own.extend(seen.iter().filter(|(_, l)| l.tgid == me).map(|(id, _)| *id));",
             "judge(&mut self.watch, seen, &en, &own)",
         ],
     )
