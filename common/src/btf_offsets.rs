@@ -1897,19 +1897,21 @@ pub const KERNEL_CLONE_ARGS_FLAGS_OFFSET: usize = 0;
 /// is attached. All optional: without one of them the cross-view does not
 /// run (signed degraded) and nothing else changes. Compiled values: the
 /// 6.8 build kernel (`bpf_prog`: `type` 4, `expected_attach_type` 8, `tag`
-/// 20; `bpf_link`: `id` 8, `type` 12, `prog` 24); `bpf_prog_aux`'s are
-/// resolved at boot (its layout moves with the kernel's options).
+/// 20; `bpf_link`: `id` 8, `type` 12, `prog` 24; `bpf_prog_aux`:
+/// `attach_func_name` 200, `load_time` 928, `name` 960, read from the 6.8
+/// guest's BTF by the lab — its layout moves with the kernel's options, and
+/// is resolved at boot).
 pub const BPF_PROG_EXPECTED_ATTACH_TYPE_OFFSET: usize = 8;
 pub const BPF_PROG_TAG_OFFSET: usize = 20;
-pub const BPF_PROG_AUX_NAME_OFFSET: usize = 216;
-pub const BPF_PROG_AUX_ATTACH_FUNC_NAME_OFFSET: usize = 128;
+pub const BPF_PROG_AUX_NAME_OFFSET: usize = 960;
+pub const BPF_PROG_AUX_ATTACH_FUNC_NAME_OFFSET: usize = 200;
 pub const BPF_LINK_TYPE_OFFSET: usize = 12;
 pub const BPF_LINK_PROG_OFFSET: usize = 24;
 /// Lot 290 (the lab's first round): `bpf_prog_aux.load_time` (boot-time
 /// ns), to tell a program the kernel loaded itself before user space
 /// started (HID-BPF's `hid_tail_call`) from one loaded while the agent was
 /// not running.
-pub const BPF_PROG_AUX_LOAD_TIME_OFFSET: usize = 136;
+pub const BPF_PROG_AUX_LOAD_TIME_OFFSET: usize = 928;
 
 // ── Lab PR 219 — exploit post-condition guard (`agent-ebpf/src/epg.rs`) ──
 //
