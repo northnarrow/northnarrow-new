@@ -1673,7 +1673,7 @@ Connect to a public address the process's lineage did not resolve — category `
 | [`NN-L-IOU-002_IoUringFileAndNetwork`](#nn-l-iou-002_iouringfileandnetwork) | io_uring file and network I/O from the same unlisted process | High | Log | T1106 |
 | [`NN-L-BPF-001_BpfProgramLoaded`](#nn-l-bpf-001_bpfprogramloaded) | BPF program loaded or attached by an unlisted process | Medium | Log | T1014 |
 | [`NN-L-BPF-002_BpfForeignHandleOrDetach`](#nn-l-bpf-002_bpfforeignhandleordetach) | Handle to the agent's BPF objects, or a program/link detach, by an unlisted process | High | Log | T1685 |
-| [`NN-L-AT-001_AntiTamperDenial`](#nn-l-at-001_antitamperdenial) | Attempt on the agent refused by an anti-tamper hook | Critical, High, Low | Log | T1685, T1055.008, T1055.009, T1552.004 |
+| [`NN-L-AT-001_AntiTamperDenial`](#nn-l-at-001_antitamperdenial) | Attempt on the agent refused by an anti-tamper hook | High, Low | Log | T1685, T1055.008, T1055.009, T1552.004 |
 | [`NN-L-EPG-001_CredentialPostcondition`](#nn-l-epg-001_credentialpostcondition) | Credentials gained without a legitimate kernel transition | Critical, High | KillProcess, Log | T1068 |
 | [`NN-L-EPG-002_NamespaceRootPostcondition`](#nn-l-epg-002_namespacerootpostcondition) | Namespaces or root left without a legitimate kernel transition | Critical | KillProcess, Log | T1611 |
 | [`NN-L-EVA-001_SecurityServiceStopped`](#nn-l-eva-001_securityservicestopped) | Security tool's service stopped, disabled or masked | High, Low | Log | T1685, T1685.004, T1686 |
@@ -2035,7 +2035,7 @@ Attempt on the agent refused by an anti-tamper hook — category `anti_tamper`.
 
 | | |
 |---|---|
-| Severity | Critical, High, Low |
+| Severity | High, Low |
 | Response | Log |
 | ATT&CK | T1685 Disable or Modify Tools (Defense Impairment); T1055.008 Process Injection: Ptrace System Calls (Stealth); T1055.009 Process Injection: Proc Memory (Stealth); T1552.004 Unsecured Credentials: Private Keys (Credential Access) |
 | Sensor — data | anti-tamper (LSM denials, bpf() syscalls) — DC0035 Process Access, DC0061 File Modification, DC0040 File Deletion, DC0055 File Access, DC0021 OS API Execution |
@@ -2047,7 +2047,7 @@ Attempt on the agent refused by an anti-tamper hook — category `anti_tamper`.
 
 **How to test.** `kill -9` the agent from a root shell (anti-tamper.sh case C01) or read /proc/&lt;agent&gt;/mem (case C03): the record names the refused operation (deny=signal, deny=ptrace).
 
-**Tests.** `crates/nn-core/src/decision/rules/anti_tamper.rs::every_denial_kind_is_a_high_log_verdict`, `crates/nn-core/src/decision/rules/anti_tamper.rs::foreign_bpf_is_named_and_weighed`, `deploy/lab/malsim/foreign-bpf-check.sh`, `deploy/lab/adversarial/anti-tamper.sh::case C01`, `deploy/lab/adversarial/anti-tamper.sh::case C03`
+**Tests.** `crates/nn-core/src/decision/rules/anti_tamper.rs::every_denial_kind_is_a_high_log_verdict`, `crates/nn-core/src/decision/rules/anti_tamper.rs::foreign_bpf_is_named_and_weighed`, `deploy/lab/malsim/foreign-bpf-check.sh::F2`, `deploy/lab/adversarial/anti-tamper.sh::case C01`, `deploy/lab/adversarial/anti-tamper.sh::case C03`
 
 **ATT&CK note.** Killing, stopping or rewriting the sensor is T1685. A ptrace or /proc/&lt;pid&gt;/mem access on the agent is the injection attempt the V2 rows TQ13 and TQ15 expect denied (T1055.008, T1055.009); a read of the signing key is T1552.004.
 

@@ -42,9 +42,9 @@ use common::bpf_prog_class::{
 };
 
 /// The program iterator's program in the eBPF object.
-pub const ITER_PROGS: &str = "nn_iter_progs";
+pub const ITER_PROGS: &str = "census_progs";
 /// The link iterator's program (kernels with `bpf_iter_bpf_link`).
-pub const ITER_LINKS: &str = "nn_iter_links";
+pub const ITER_LINKS: &str = "census_links";
 /// The map of the programs the hook saw loading.
 pub const SEEN_MAP: &str = "SEEN_PROGS";
 /// The status file's name, beside the agent's pid file.

@@ -10,9 +10,9 @@
 //!   verifier refused never marks another program. The agent's family is
 //!   not marked (its programs are its own).
 //! * "Enumerated": two BPF iterators the agent runs every round —
-//!   `iter/bpf_prog` ([`nn_iter_progs`]) writes one
+//!   `iter/bpf_prog` ([`census_progs`]) writes one
 //!   [`ProgRecord`] per program loaded on the host, `iter/bpf_link`
-//!   ([`nn_iter_links`], kernels that have it) one [`LinkRecord`] per link.
+//!   ([`census_links`], kernels that have it) one [`LinkRecord`] per link.
 //!   The agent's unit has no `CAP_SYS_ADMIN`, which `BPF_*_GET_NEXT_ID`
 //!   needs; an iterator needs `CAP_BPF` and `CAP_PERFMON`, which it has.
 //!
@@ -111,7 +111,7 @@ unsafe fn rd_u64(addr: u64) -> Option<u64> {
 /// at boot. A field whose offset is absent stays zero.
 #[no_mangle]
 #[link_section = "iter/bpf_prog"]
-pub fn nn_iter_progs(ctx: *mut c_void) -> i32 {
+pub fn census_progs(ctx: *mut c_void) -> i32 {
     unsafe { try_iter_progs(ctx) };
     0
 }
@@ -179,7 +179,7 @@ unsafe fn try_iter_progs(ctx: *mut c_void) {
 /// programs only.
 #[no_mangle]
 #[link_section = "iter/bpf_link"]
-pub fn nn_iter_links(ctx: *mut c_void) -> i32 {
+pub fn census_links(ctx: *mut c_void) -> i32 {
     unsafe { try_iter_links(ctx) };
     0
 }

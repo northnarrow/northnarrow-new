@@ -203,10 +203,10 @@ fn a_seen_load_is_marked_and_the_iterators_write_whole_records() {
     )
     .unwrap();
     assert!(k.contains(
-        "#[link_section = \"iter/bpf_prog\"]\npub fn nn_iter_progs(ctx: *mut c_void) -> i32 {"
+        "#[link_section = \"iter/bpf_prog\"]\npub fn census_progs(ctx: *mut c_void) -> i32 {"
     ));
     assert!(k.contains(
-        "#[link_section = \"iter/bpf_link\"]\npub fn nn_iter_links(ctx: *mut c_void) -> i32 {"
+        "#[link_section = \"iter/bpf_link\"]\npub fn census_links(ctx: *mut c_void) -> i32 {"
     ));
     in_order(
         body(&k, "try_iter_progs"),

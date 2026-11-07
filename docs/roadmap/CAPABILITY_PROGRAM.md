@@ -7753,8 +7753,9 @@ number in parentheses is a lab PR.
       `RestrictFileSystems` ran, nothing refused; `modprobe dummy` by root:
       R011 Low. `verifier-check` 104 programs, 102 OK, 2 not counted, 0
       failing (`bpf_syscall_observe` 4,330 instructions, `bpf_prog_guard`
-      1,097, `bpf_map_guard` 1,017, `nn_iter_progs` 514, `nn_iter_links`
-      255). Round r2 found HID-BPF's `hid_tail_call` (a `tracing` program
+      1,097, `bpf_map_guard` 1,017, the iterators `census_progs` 514 and
+      `census_links` 255 — measured under their first names `nn_iter_*`,
+      renamed after the lab: a `nn_*` symbol is a subprogram). Round r2 found HID-BPF's `hid_tail_call` (a `tracing` program
       the kernel loads when udev loads `hid` in the initramfs, after PID 1)
       signed High at every start — fixed (the kernel's own programs by name
       and attach function; r3: `baseline kernel`, Low). Round r3: with the
@@ -7768,7 +7769,7 @@ number in parentheses is a lab PR.
       255). Each round: uninstalled, the guest clean and off.
     - **Ubuntu 22.04** (`5.15.0-202-generic`, systemd 249).
       `verifier-check` 104 programs, 98 OK, 6 not counted, 0 failing
-      (`nn_iter_links` absent: no `bpf_iter_bpf_link`, the programs are
+      (`census_links` absent: no `bpf_iter_bpf_link`, the programs are
       enumerated alone); the `kprobe` with `bpf_probe_write_user` refused
       and loaded inside a window; the program handle, the pin root map's
       and the tracker's pins, a bind mount and a relative path refused (5

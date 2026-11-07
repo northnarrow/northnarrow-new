@@ -976,14 +976,14 @@ refusals do not depend on it.
 - **Ubuntu 24.04** (`6.8.0-147-generic`): `verifier-check` 104 programs,
   102 OK, 2 not counted, 0 failing — `bpf_syscall_observe` 4,330
   instructions (2,272 before the lot), `bpf_prog_guard` 1,097, `bpf_map_guard`
-  1,017, `nn_iter_progs` 514, `nn_iter_links` 255. Both iterators run.
+  1,017, `census_progs` 514, `census_links` 255 (the iterators, measured under their first names `nn_iter_*`; renamed: a `nn_*` symbol is a subprogram). Both iterators run.
   `bpf_prog_aux`'s offsets on that kernel: `attach_func_name` 200,
   `load_time` 928, `name` 960. The kernel loads one program of its own,
   HID-BPF's `hid_tail_call` (a `tracing` program on `__hid_bpf_tail_call`,
   prog id 2), when udev loads `hid` in the initramfs — after PID 1 started:
   the cross-view tells it by its name and attach function (Low).
 - **Ubuntu 22.04** (`5.15.0-202-generic`): `verifier-check` 104 programs,
-  98 OK, 6 not counted, 0 failing — `nn_iter_links` absent (no
+  98 OK, 6 not counted, 0 failing — `census_links` absent (no
   `bpf_iter_bpf_link`: the programs are enumerated alone), the rest as on
   6.8. `bpf_prog_aux` there: `attach_func_name` 168, `load_time` 504,
   `name` 528 (resolved at boot). No HID-BPF program; systemd 249 loads its

@@ -382,7 +382,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
     // ── anti-tamper ─────────────────────────────────────────────────
     RuleDoc {
         id: "NN-L-AT-001_AntiTamperDenial",
-        severities: &[Severity::Critical, Severity::High, Severity::Low],
+        severities: &[Severity::High, Severity::Low],
         actions: &[ResponseAction::Log],
         sensors: &[Sensor::AntiTamper],
         data_components: &["DC0035", "DC0061", "DC0040", "DC0055", "DC0021"],
@@ -416,7 +416,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
         tests: &[
             "crates/nn-core/src/decision/rules/anti_tamper.rs::every_denial_kind_is_a_high_log_verdict",
             "crates/nn-core/src/decision/rules/anti_tamper.rs::foreign_bpf_is_named_and_weighed",
-            "deploy/lab/malsim/foreign-bpf-check.sh",
+            "deploy/lab/malsim/foreign-bpf-check.sh::F2",
             "deploy/lab/adversarial/anti-tamper.sh::case C01",
             "deploy/lab/adversarial/anti-tamper.sh::case C03",
         ],
