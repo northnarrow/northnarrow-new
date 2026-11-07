@@ -136,6 +136,16 @@ fi
 
 if want F4; then
     echo "== F4. the agent's objects off limits (the guard enforcing)"
+    # the tracker map's id first, while the lab build observes (an enforcing
+    # guard refuses bpftool's write handle on the agent's maps, in a window
+    # too: its listing stops at the first); a pinned map keeps its id across
+    # the restart below
+    window 60
+    MID=$(sudo bpftool -j map show 2>/dev/null | python3 -I -c '
+import json, sys
+ids = [m["id"] for m in json.load(sys.stdin) if m.get("name") == "CGROUP_JOINED"]
+print(max(ids) if ids else "")')
+    no_window
     ENF=0
     if ! sudo grep -qa 'NN_BPF_DEFENSE_ENFORCE=1' "/proc/$(agent_pid)/environ" 2>/dev/null; then
         sudo systemctl set-environment NN_BPF_DEFENSE_ENFORCE=1 && ENF=1 && restart_agent
@@ -147,10 +157,6 @@ if want F4; then
     # refused before this lot, in a window too); the tracker's map by its id
     RPIN=/sys/fs/bpf/northnarrow/PROTECTED_PIDS
     window 60
-    MID=$(sudo bpftool -j map show 2>/dev/null | python3 -I -c '
-import json, sys
-ids = [m["id"] for m in json.load(sys.stdin) if m.get("name") == "CGROUP_JOINED"]
-print(max(ids) if ids else "")')
     PID_=$(sudo awk '$1 ~ /^[0-9]+$/ {print $1; exit}' /run/northnarrow/bpf-own-ids 2>/dev/null)
     echo "    tracker map CGROUP_JOINED id ${MID:-?} ($TDIR), an agent program id ${PID_:-?}"
     o=$(sudo $PROBE map-fd-by-id "${MID:-0}")

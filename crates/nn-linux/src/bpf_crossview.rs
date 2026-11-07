@@ -461,7 +461,19 @@ impl CrossView {
     pub fn round(&mut self) -> Result<Vec<Finding>, String> {
         let seen = self.parts.seen()?;
         let en = self.parts.enumerate()?;
-        let own = (self.own)();
+        let mut own = (self.own)();
+        // the agent's own loads not registered yet (a sensor attached after
+        // the registration, until the late one: the lab's 22.04 round saw
+        // the exploit guard's programs so for a round)
+        let me = std::process::id();
+        own.extend(seen.iter().filter(|(_, l)| l.tgid == me).map(|(id, _)| *id));
+        own.extend(
+            self.watch
+                .seen()
+                .iter()
+                .filter(|(_, l)| l.tgid == me)
+                .map(|(id, _)| *id),
+        );
         let (found, foreign) = judge(&mut self.watch, seen, &en, &own);
         if let Some(path) = &self.status {
             let body = render_status(&self.watch, &foreign);
