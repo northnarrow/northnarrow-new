@@ -18,6 +18,7 @@
 
 #[macro_use]
 mod btf_offsets;
+mod bpf_census;
 mod bpf_defense;
 mod cgroup_files;
 mod cgroup_guard;

@@ -34,6 +34,30 @@
 //!   judged; a target that cannot be read is refused too (that attach type
 //!   only: fail closed).
 //!
+//!   Lot 290: foreign BPF. Outside a trusted-installer window, a caller
+//!   outside the family (and not a fresh instance of ours) gets `EPERM` on
+//!   a `BPF_PROG_LOAD` of a type that can rewrite user memory, override a
+//!   kernel function's return, signal a process or replace a hook
+//!   (`northnarrow_common::bpf_prog_class::denied_by_default`: kprobe,
+//!   tracing, LSM, extension, struct_ops) unless the signed per-loader
+//!   opt-out names its executable and the type ([`BPF_LOADER_OPTOUT`]);
+//!   on a handle on one of the agent's maps or programs by id
+//!   (`*_GET_FD_BY_ID`) and on `BPF_OBJ_GET` of a path under the agent's
+//!   pin directories (`/sys/fs/bpf/northnarrow*`). The two attach and load
+//!   refusals (this one and lot 280b's root `cgroup/sysctl` attach) hold in
+//!   every mode — the observe mode relaxes only the guard of the agent's
+//!   own objects, which the lab's fixtures reach with `bpftool`. A load the
+//!   hook lets through marks its thread ([`crate::bpf_census`]) so the
+//!   `bpf_prog` hook records the new program's id: the cross-view's "seen".
+//! * `bpf_prog(struct bpf_prog *prog)` (lot 290) — every program handle
+//!   (the load's own, by id, through any path): a handle on one of the
+//!   agent's programs outside a window refused (enforce mode); the
+//!   program a load just made recorded as seen.
+//! * `bpf_map` (lot 290): a READ handle on one of the agent's maps is
+//!   refused outside a window too (enforce mode) — a program cannot be
+//!   loaded against a map it cannot get a descriptor of (lot 281's
+//!   residual); a write handle stays refused in a window as before.
+//!
 //! A read either hook needs that fails is a fail-open, counted in
 //! `DENY_FAIL_OPEN` (`crate::fail_open`, lab PR 215).
 //!
@@ -55,17 +79,19 @@ use aya_ebpf::{
 use northnarrow_common::bpf_cmd::{
     attach_target_offset, judges_attach_target, observed, BPF_LINK_CREATE, BPF_LINK_DETACH,
     BPF_LINK_GET_FD_BY_ID, BPF_LINK_UPDATE, BPF_MAP_GET_FD_BY_ID, BPF_OBJ_GET, BPF_PROG_ATTACH,
+    BPF_PROG_GET_FD_BY_ID, BPF_PROG_LOAD,
 };
+use northnarrow_common::bpf_prog_class::{denied_by_default, type_bit};
 use northnarrow_common::cgroup_limits::{special_fs, SpecialFs};
 use northnarrow_common::fail_open::hook as fail_open_hook;
 use northnarrow_common::ring_drops::ring_slot;
 use northnarrow_common::wire::{
-    BpfSyscallRaw, FsProtectDenialRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, FS_OP_BPF_LINK,
-    FS_OP_BPF_MAP, FS_OP_SYSCTL_ROOT_ATTACH,
+    BpfSyscallRaw, FsProtectDenialRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, FS_OP_BPF_HANDLE,
+    FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_BPF_PROG_OPT_OUT, FS_OP_BPF_PROG_TYPE, FS_OP_SYSCTL_ROOT_ATTACH,
 };
 
 use crate::btf_offsets::{
-    BPF_LINK_ID_OFFSET, BPF_MAP_ID_OFFSET, FDTABLE_FD_OFFSET, FDTABLE_MAX_FDS_OFFSET,
+    BPF_LINK_ID_OFFSET, BPF_MAP_ID_OFFSET, BPF_PROG_AUX_ID_OFFSET, BPF_PROG_AUX_OFFSET, FDTABLE_FD_OFFSET, FDTABLE_MAX_FDS_OFFSET,
     FILES_STRUCT_FDT_OFFSET, FILE_F_INODE_OFFSET, FILE_PRIVATE_DATA_OFFSET, INODE_I_INO_OFFSET,
     INODE_I_SB_OFFSET, MM_STRUCT_EXE_FILE_OFFSET, SUPER_BLOCK_S_DEV_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET,
     TASK_STRUCT_FILES_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_START_TIME_OFFSET,
@@ -84,7 +110,6 @@ const FMODE_WRITE: u32 = 0x2;
 /// Object kinds in [`OWN_BPF_IDS`] values (written by userland: 1 = map,
 /// 2 = program, 3 = link). The hooks only test membership.
 pub const OWN_KIND_MAP: u8 = 1;
-#[allow(dead_code)]
 pub const OWN_KIND_PROG: u8 = 2;
 pub const OWN_KIND_LINK: u8 = 3;
 
@@ -120,15 +145,31 @@ pub static OWN_PIN_NAMES: HashMap<u64, u8> = HashMap::with_max_entries(64, 0);
 /// AND one link — keyed by id alone, the later registration overwrote the
 /// earlier and some own maps were not recognised (lab: 66 registrations,
 /// 48 entries). Value = kind (kept for bpftool readability). Filled by
-/// userland right after load/attach; per boot, not pinned.
+/// userland right after load/attach; per boot, not pinned. Lot 290: 1024
+/// entries — the object's maps, programs and links were within ten of the
+/// 256 it had (the lab's first start of this lot: `E2BIG` at the 257th, the
+/// start refused); `xtask/tests/foreign_bpf.rs` keeps it at twice the
+/// object's maps and programs.
 #[map]
-pub static OWN_BPF_IDS: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
+pub static OWN_BPF_IDS: HashMap<u64, u8> = HashMap::with_max_entries(OWN_IDS_CAPACITY, 0);
+
+/// [`OWN_BPF_IDS`]' capacity.
+pub const OWN_IDS_CAPACITY: u32 = 1024;
 
 /// Key of [`OWN_BPF_IDS`] (mirrored in userland `anti_tamper::bpf_defense`).
 #[inline(always)]
 pub fn own_key(kind: u8, id: u32) -> u64 {
     ((kind as u64) << 32) | id as u64
 }
+
+/// Lot 290: the signed per-loader opt-out (`bpf-loader-allow`): the
+/// `(dev, ino)` of a loader's executable → the mask of the refused types
+/// it may load outside a window (`bpf_prog_class::type_bit`). Written by
+/// the agent from a policy whose signature it verified, at its start and
+/// when a signed policy is set; pinned by name so the policy's writer
+/// reaches it through the pin root.
+#[map]
+pub static BPF_LOADER_OPTOUT: HashMap<InodeKey, u32> = HashMap::pinned(64, 0);
 
 /// Slot 0: 1 = enforce (deny), 0 = observe.
 #[map]
@@ -234,6 +275,16 @@ fn is_own_kind(id: u32, kind: u8) -> bool {
 /// The agent's pin root (`DEFAULT_BPFFS_ROOT` in userland), with the
 /// trailing slash: a truncated `OBJ_GET` path under it counts as ours.
 const PIN_ROOT: &[u8; 24] = b"/sys/fs/bpf/northnarrow/";
+
+/// Lot 290: the prefix every pin directory of the agent's shares — the pin
+/// root and the directories kept beside it (`northnarrow-cgroup-join-v*`,
+/// `northnarrow-sysctl`, `northnarrow-module-writes`). `BPF_OBJ_GET` of a
+/// path that starts with it is refused to a foreign caller outside a
+/// window. A path that reaches a pin otherwise (relative, `..`, a symlink,
+/// a bind mount of the bpffs) is judged on the object it opens: the
+/// `bpf_map` and `bpf_prog` hooks refuse a handle on the agent's maps and
+/// programs, the link-name match below the agent's link pins.
+const PIN_DIRS_PREFIX: &[u8; 23] = b"/sys/fs/bpf/northnarrow";
 
 /// [`nn_link_id_of_fd`]: the fd names no link here (out of range,
 /// closed, not a link) — the kernel refuses the command itself.
@@ -400,39 +451,45 @@ const PIN_OWN: u64 = 1;
 /// the kernel may still read it later, after a page fault this program
 /// cannot take).
 const PIN_UNREADABLE: u64 = 2;
+/// Lot 290 ([`nn_obj_get_own_link`]): the path starts with
+/// [`PIN_DIRS_PREFIX`] and its last component is not one of the agent's
+/// link pins.
+const PIN_UNDER_DIRS: u64 = 3;
 
 /// [`obj_get_names_own_link`] as a global BPF function (exported, never
 /// inlined, scalar argument): the verifier checks its loops once, on its
 /// own. Inlined, they multiplied with the rest of the hook past the
 /// million-instruction budget once the detach/update deny was added (lab,
 /// 6.8: "BPF program is too large"). 0: not ours, [`PIN_OWN`],
-/// [`PIN_UNREADABLE`].
+/// [`PIN_UNREADABLE`], [`PIN_UNDER_DIRS`] (lot 290).
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn nn_obj_get_own_link(user_ptr: u64) -> u64 {
     match unsafe { obj_get_names_own_link(user_ptr) } {
-        Ok(true) => PIN_OWN,
-        Ok(false) => 0,
+        Ok(v) => v,
         Err(()) => PIN_UNREADABLE,
     }
 }
 
 /// `OBJ_GET` whose pathname's final component is one of the agent's own
-/// LINK pins. `user_ptr` is the first field of the `OBJ_GET` variant of
-/// the kernel's copy of `bpf_attr`: the user pointer to the pathname.
+/// LINK pins ([`PIN_OWN`]), or (lot 290) whose path starts with
+/// [`PIN_DIRS_PREFIX`] ([`PIN_UNDER_DIRS`]), else 0. `user_ptr` is the
+/// first field of the `OBJ_GET` variant of the kernel's copy of
+/// `bpf_attr`: the user pointer to the pathname.
 ///
 /// Verifier budget (5.15): the string is read once only to learn its
-/// length `n`, then the LAST [`PIN_NAME_LEN`] bytes are read again from
-/// user memory into the head of the scratch buffer — our pin names are
-/// shorter than that, so a final component that is ours lies entirely in
-/// the window. Every map index is then a loop counter in `0..32`: no
-/// subtraction reaches a map access (`n - 32` gave "R4 min value is
-/// negative" on 5.15), no 256-byte scan (minutes of verification), no
-/// stack array (memset subprogram).
+/// length `n` (and, lot 290, its head is compared with the prefix there,
+/// before the second read overwrites it), then the LAST [`PIN_NAME_LEN`]
+/// bytes are read again from user memory into the head of the scratch
+/// buffer — our pin names are shorter than that, so a final component that
+/// is ours lies entirely in the window. Every map index is then a loop
+/// counter in `0..32`: no subtraction reaches a map access (`n - 32` gave
+/// "R4 min value is negative" on 5.15), no 256-byte scan (minutes of
+/// verification), no stack array (memset subprogram).
 #[inline(always)]
-unsafe fn obj_get_names_own_link(user_ptr: u64) -> Result<bool, ()> {
+unsafe fn obj_get_names_own_link(user_ptr: u64) -> Result<u64, ()> {
     if user_ptr == 0 {
-        return Ok(false);
+        return Ok(0);
     }
     let buf: *mut [u8; PATH_BUF_LEN] = match OBJ_GET_PATH_SCRATCH.get_ptr_mut(0) {
         Some(p) => p,
@@ -449,8 +506,20 @@ unsafe fn obj_get_names_own_link(user_ptr: u64) -> Result<bool, ()> {
         Err(_) => return Err(()),
     };
     if n == 0 {
-        return Ok(false);
+        return Ok(0);
     }
+    // Lot 290: the head against the pin directories' prefix, now (the
+    // second pass writes the head of the same buffer).
+    let mut under = n >= PIN_DIRS_PREFIX.len();
+    let mut k: usize = 0;
+    while k < PIN_DIRS_PREFIX.len() {
+        if (*buf)[k] != PIN_DIRS_PREFIX[k] {
+            under = false;
+            break;
+        }
+        k += 1;
+    }
+    let other: u64 = if under { PIN_UNDER_DIRS } else { 0 };
     // External audit EBPF-010: a path that does not fit the buffer is not
     // let through when it starts at the agent's pin root — padding a pin's
     // path past the buffer (`/sys/fs/bpf/northnarrow/./././…/link_task_kill`)
@@ -462,11 +531,11 @@ unsafe fn obj_get_names_own_link(user_ptr: u64) -> Result<bool, ()> {
         let mut i: usize = 0;
         while i < PIN_ROOT.len() {
             if (*buf)[i] != PIN_ROOT[i] {
-                return Ok(false);
+                return Ok(other);
             }
             i += 1;
         }
-        return Ok(true);
+        return Ok(PIN_OWN);
     }
     // pass 2: the last PIN_NAME_LEN bytes plus the terminator (user-pointer
     // arithmetic is a plain scalar add for the verifier)
@@ -481,7 +550,7 @@ unsafe fn obj_get_names_own_link(user_ptr: u64) -> Result<bool, ()> {
         Err(_) => return Err(()),
     };
     if m == 0 || m > PIN_NAME_LEN {
-        return Ok(false);
+        return Ok(other);
     }
     // External audit EBPF-010: the final component, hashed in one pass —
     // the hash restarts after every '/'. An empty component (trailing '/')
@@ -502,8 +571,8 @@ unsafe fn obj_get_names_own_link(user_ptr: u64) -> Result<bool, ()> {
         j += 1;
     }
     Ok(match OWN_PIN_NAMES.get(&h) {
-        Some(kind) => *kind == OWN_KIND_LINK,
-        None => false,
+        Some(kind) if *kind == OWN_KIND_LINK => PIN_OWN,
+        _ => other,
     })
 }
 
@@ -642,20 +711,31 @@ unsafe fn try_bpf_map_guard(ctx: &LsmContext) -> i32 {
         return 0;
     }
     let fmode: u32 = ctx.arg(1);
-    if fmode & FMODE_WRITE == 0 {
+    let write = fmode & FMODE_WRITE != 0;
+    // Lot 290: a read handle is judged too, but only in enforce mode and
+    // outside a window — the rest of the read path is left alone.
+    if !write && (!enforce() || crate::inode_protect::override_active()) {
         return 0;
     }
     let id_slot = (map as *const u8).add(off!(BPF_MAP_ID_OFFSET)) as *const u32;
     let id = match bpf_probe_read_kernel::<u32>(id_slot) {
         Ok(v) => v,
         Err(_) => {
-            // Lab PR 215: a write handle the guard could not judge.
+            // Lab PR 215: a handle the guard could not judge.
             crate::fail_open::bump(fail_open_hook::BPF_MAP);
             return 0;
         }
     };
     if !is_own_kind(id, OWN_KIND_MAP) || caller_is_exempt() || fresh_instance_may_load() {
         return 0;
+    }
+    if !write {
+        // Lot 290: a read handle on one of the agent's maps, through any
+        // path (a bind mount of the bpffs, a relative path, a symlink): a
+        // program is loaded against a map only through a descriptor of it
+        // (lot 281's residual).
+        emit_denial_kind(FS_OP_BPF_HANDLE, OWN_KIND_MAP, id);
+        return -EPERM;
     }
     if enforce() {
         emit_denial(FS_OP_BPF_MAP, id);
@@ -665,9 +745,87 @@ unsafe fn try_bpf_map_guard(ctx: &LsmContext) -> i32 {
     0
 }
 
+/// Lot 290: the id of program `prog` (`prog->aux->id`), `None` when a read
+/// fails.
+#[inline(always)]
+pub(crate) unsafe fn prog_id_of(prog: *const c_void) -> Option<u32> {
+    let aux = bpf_probe_read_kernel::<u64>((prog as *const u8).add(off!(BPF_PROG_AUX_OFFSET)) as *const u64).ok()?;
+    if aux == 0 {
+        return None;
+    }
+    bpf_probe_read_kernel::<u32>((aux as *const u8).add(off!(BPF_PROG_AUX_ID_OFFSET)) as *const u32).ok()
+}
+
+/// Lot 290: `bpf_prog(struct bpf_prog *prog)` — every new program handle:
+/// the one a load returns, one by id, one through a path. The program a
+/// load the `bpf` hook let through just made is recorded as seen
+/// ([`crate::bpf_census::mark_seen`]); a handle on one of the agent's own
+/// programs by a caller outside the family, outside a window, is refused
+/// (enforce mode) — an `freplace` of one of its functions needs one, as an
+/// attach of it elsewhere does.
+#[lsm(hook = "bpf_prog")]
+pub fn bpf_prog_guard(ctx: LsmContext) -> i32 {
+    unsafe { try_bpf_prog_guard(&ctx) }
+}
+
+#[inline(always)]
+unsafe fn try_bpf_prog_guard(ctx: &LsmContext) -> i32 {
+    let prog: *const c_void = ctx.arg(0);
+    if prog.is_null() {
+        return 0;
+    }
+    let loading = crate::bpf_census::take_load_mark();
+    let id = match prog_id_of(prog) {
+        Some(id) => id,
+        None => {
+            crate::fail_open::bump(fail_open_hook::BPF);
+            return 0;
+        }
+    };
+    if loading {
+        crate::bpf_census::mark_seen(id, prog);
+        return 0;
+    }
+    if !is_own_kind(id, OWN_KIND_PROG) || caller_is_exempt() || fresh_instance_may_load() {
+        return 0;
+    }
+    if enforce() && !crate::inode_protect::override_active() {
+        emit_denial_kind(FS_OP_BPF_HANDLE, OWN_KIND_PROG, id);
+        return -EPERM;
+    }
+    0
+}
+
 #[lsm(hook = "bpf")]
 pub fn bpf_syscall_observe(ctx: LsmContext) -> i32 {
     unsafe { try_bpf_syscall_observe(&ctx) }
+}
+
+/// Lot 290 ([`nn_loader_opted_out`]): the caller's executable and the type
+/// are in the signed per-loader opt-out.
+const LOADER_OPTED_OUT: u64 = 1;
+/// Lot 290: the dedup key's command of an opt-out's record (one a second
+/// per loader and type, the type in its low byte).
+const OPT_OUT_REPORT: u32 = 0xFFFF_0100;
+
+/// Lot 290: whether the signed per-loader opt-out ([`BPF_LOADER_OPTOUT`])
+/// names the caller's executable, by device and inode, with
+/// `prog_type`'s bit. A global BPF function (exported, never inlined,
+/// scalar argument): checked once, on its own, like the others here.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_loader_opted_out(prog_type: u64) -> u64 {
+    let bit = type_bit(prog_type as u32);
+    if bit == 0 {
+        return 0;
+    }
+    match unsafe { caller_exe_key() } {
+        Some(k) => match unsafe { BPF_LOADER_OPTOUT.get(&k) } {
+            Some(mask) if *mask & bit != 0 => LOADER_OPTED_OUT,
+            _ => 0,
+        },
+        None => 0,
+    }
 }
 
 #[inline(always)]
@@ -677,7 +835,15 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     // Only the commands worth a record (`bpf_cmd::observed`); the hot ones
     // (MAP_LOOKUP/UPDATE from bpftool, OBJ_GET_INFO, PROG_RUN) and the
     // `*_GET_NEXT_ID` enumerations, which give no handle, are not reported.
-    if !observed(cmd) || caller_is_exempt() {
+    if !observed(cmd) {
+        return 0;
+    }
+    if caller_is_exempt() {
+        // Lot 290: the family's loads are seen too — a program the agent
+        // loads after its registration of its own objects is never "unseen"
+        if cmd == BPF_PROG_LOAD {
+            crate::bpf_census::mark_load();
+        }
         return 0;
     }
     // bpf_attr is uapi-stable: the first u32 of the union is prog_type
@@ -686,11 +852,16 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     // link_id (*_GET_FD_BY_ID).
     // Lab PR 215: the commands whose argument decides a deny here (a link
     // handle by id, a detach or update of one of our links); for them an
-    // unreadable argument is a fail-open, counted. A map handle's deny is
-    // the `bpf_map` guard's, on the handle's mode.
+    // unreadable argument is a fail-open, counted. Lot 290: and a load's
+    // type, a map's or a program's handle by id.
     let decides = matches!(
         cmd,
-        BPF_LINK_GET_FD_BY_ID | BPF_LINK_DETACH | BPF_LINK_UPDATE
+        BPF_LINK_GET_FD_BY_ID
+            | BPF_LINK_DETACH
+            | BPF_LINK_UPDATE
+            | BPF_PROG_LOAD
+            | BPF_MAP_GET_FD_BY_ID
+            | BPF_PROG_GET_FD_BY_ID
     );
     let mut arg: u32 = 0;
     if !attr.is_null() {
@@ -707,41 +878,84 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
             }
         }
     }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // Lot 290: a program type that can rewrite user memory, override a
+    // kernel function's return, signal a process or take a hook's place
+    // (kprobe, tracing, LSM, extension, struct_ops), loaded by a caller
+    // outside the family (returned above) outside a window — refused, in
+    // every mode, unless the signed per-loader opt-out names the caller's
+    // executable and the type (let through, recorded once a second). A
+    // fresh agent or watchdog before it is a protected pid loads its own.
+    // A load let through marks its thread: the `bpf_prog` hook records the
+    // program it makes as seen (the cross-view).
+    if cmd == BPF_PROG_LOAD {
+        if denied_by_default(arg)
+            && !crate::inode_protect::override_active()
+            && !fresh_instance_may_load()
+        {
+            if nn_loader_opted_out(u64::from(arg)) != LOADER_OPTED_OUT {
+                emit_denial(FS_OP_BPF_PROG_TYPE, arg);
+                return -EPERM;
+            }
+            if should_report(pid, OPT_OUT_REPORT | (arg & 0xff)) {
+                emit_denial(FS_OP_BPF_PROG_OPT_OUT, arg);
+            }
+        }
+        crate::bpf_census::mark_load();
+    } else if matches!(cmd, BPF_PROG_GET_FD_BY_ID | BPF_OBJ_GET) {
+        // a handle the `bpf_prog` hook may see: not a load
+        crate::bpf_census::clear_load_mark();
+    }
     // A handle to one of the agent's own MAPS or LINKS taken by id: the
     // shape of `bpftool map update id N` / `bpftool link show id N` /
     // `bpftool link detach id N` (and of each NorthNarrow entry `bpftool
     // link list` reaches: it takes a handle by id on every link it prints).
-    // Program handles are not reported (`bpftool prog list` takes one per
-    // program and a prog fd cannot modify the agent); the map hook decides
-    // the deny on the write path.
+    // Lot 290: and its PROGRAMS (`bpftool prog show id N`; an `freplace`
+    // of one of its functions needs a handle on it).
     let own_map_handle = cmd == BPF_MAP_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_MAP);
+    let own_prog_handle = cmd == BPF_PROG_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_PROG);
     let own_link_handle = cmd == BPF_LINK_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_LINK);
-    let own_link_pin = cmd == BPF_OBJ_GET
-        && !attr.is_null()
-        && match bpf_probe_read_kernel::<u64>(attr as *const u64) {
-            Ok(p) => match nn_obj_get_own_link(p) {
-                PIN_OWN => true,
-                PIN_UNREADABLE => {
-                    crate::fail_open::bump(fail_open_hook::BPF);
-                    false
-                }
-                _ => false,
-            },
-            Err(_) => {
-                crate::fail_open::bump(fail_open_hook::BPF);
-                false
-            }
-        };
+    let pin = if cmd == BPF_OBJ_GET && !attr.is_null() {
+        match bpf_probe_read_kernel::<u64>(attr as *const u64) {
+            Ok(p) => nn_obj_get_own_link(p),
+            Err(_) => PIN_UNREADABLE,
+        }
+    } else {
+        0
+    };
+    if pin == PIN_UNREADABLE {
+        crate::fail_open::bump(fail_open_hook::BPF);
+    }
+    let own_link_pin = pin == PIN_OWN;
+    let own_dir_pin = pin == PIN_UNDER_DIRS;
     // Second half of the self-defence: a link handle is the only thing
     // that can DETACH or UPDATE one of our LSM hooks (`bpftool link detach
     // id N` / `… pinned <path>`), so in enforce mode a foreign process
-    // never gets one — by id or through the pin. Map handles are decided
-    // on the write path by the `bpf_map` guard; program handles are
-    // harmless and stay allowed (`bpftool prog show` keeps working).
+    // never gets one — by id or through the pin.
     // External audit EBPF-002: no exemption by executable — a link handle
     // is taken only once the agent is a protected pid.
     if (own_link_handle || own_link_pin) && enforce() {
         emit_denial(FS_OP_BPF_LINK, if own_link_handle { arg } else { 0 });
+        return -EPERM;
+    }
+    // Lot 290: a handle on one of the agent's maps or programs by id, or
+    // anything under its pin directories, outside a window (enforce mode):
+    // a program cannot be loaded against a map it has no descriptor of,
+    // nor replace a function of a program it has none of. The `bpf_map`
+    // and `bpf_prog` hooks judge the object a path reaches otherwise.
+    if (own_map_handle || own_prog_handle || own_dir_pin)
+        && enforce()
+        && !crate::inode_protect::override_active()
+        && !fresh_instance_may_load()
+    {
+        let kind = if own_map_handle {
+            OWN_KIND_MAP
+        } else if own_prog_handle {
+            OWN_KIND_PROG
+        } else {
+            0
+        };
+        emit_denial_kind(FS_OP_BPF_HANDLE, kind, if kind == 0 { 0 } else { arg });
         return -EPERM;
     }
     // External audit EBPF-010: whatever gave the handle (a pin reached
@@ -764,8 +978,8 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     // a window (the family returned above; a fresh agent before it is a
     // protected pid may attach its judge) — refused, signed. `arg` is the
     // attach type for both commands; the target is read only for them.
+    // Lot 290: in every mode (it held in enforce mode only).
     if judges_attach_target(cmd, arg)
-        && enforce()
         && !crate::inode_protect::override_active()
         && !fresh_instance_may_load()
     {
@@ -784,14 +998,21 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
             return -EPERM;
         }
     }
-    let foreign_handle = own_map_handle || own_link_handle || own_link_pin;
-    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let foreign_handle =
+        own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;
     let report_cmd = if foreign_handle {
         BPF_CMD_FOREIGN_GET_FD
     } else {
         cmd
     };
-    if should_report(pid, report_cmd) {
+    // Lot 290: one record a second per loader and program TYPE (a loader
+    // of several types records each).
+    let dedup = if cmd == BPF_PROG_LOAD {
+        cmd | ((arg & 0xff) << 8)
+    } else {
+        report_cmd
+    };
+    if should_report(pid, dedup) {
         emit_syscall(report_cmd, arg);
     }
     0
@@ -827,6 +1048,13 @@ fn emit_syscall(cmd: u32, arg: u32) {
 /// `target_ino`).
 #[inline(always)]
 fn emit_denial(operation: u8, object_id: u32) {
+    emit_denial_kind(operation, 0, object_id)
+}
+
+/// [`emit_denial`] with the object's kind in `target_dev` (lot 290:
+/// `FS_OP_BPF_HANDLE`).
+#[inline(always)]
+fn emit_denial_kind(operation: u8, kind: u8, object_id: u32) {
     let mut entry = match crate::inode_protect::FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0)
     {
         Some(e) => e,
@@ -842,7 +1070,7 @@ fn emit_denial(operation: u8, object_id: u32) {
         let pid_tgid = bpf_get_current_pid_tgid();
         (*raw_ptr).attacker_pid = (pid_tgid >> 32) as u32;
         (*raw_ptr).attacker_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
-        (*raw_ptr).target_dev = 0;
+        (*raw_ptr).target_dev = kind as u64;
         (*raw_ptr).target_ino = object_id as u64;
         (*raw_ptr).operation = operation;
         if let Ok(comm) = bpf_get_current_comm() {

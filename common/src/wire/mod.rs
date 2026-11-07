@@ -1190,8 +1190,42 @@ pub const FS_OP_SYSCTL_ROOT_PROG: u8 = 37;
 /// exemption covered the process.
 pub const FS_OP_EXEMPT_INJECT: u8 = 38;
 
+/// Lot 290: a handle on one of the agent's own BPF objects refused by the
+/// BPF guard outside a window — a map by id or through any path (a read
+/// handle too: the `bpf_map` guard), a program by id or through any path
+/// (the `bpf_prog` guard), or `BPF_OBJ_GET` of a path under the agent's
+/// pin directories (`/sys/fs/bpf/northnarrow*`). `target_dev` = the kind
+/// (1 map, 2 program, 0 a path), `target_ino` = the object's id (0 for a
+/// path). A link handle keeps [`FS_OP_BPF_LINK`].
+pub const FS_OP_BPF_HANDLE: u8 = 39;
+
+/// Lot 290: a `BPF_PROG_LOAD` of a program type that can rewrite user
+/// memory, override a kernel function's return, signal a process or
+/// replace a hook (`crate::bpf_prog_class::denied_by_default`: kprobe,
+/// tracing, LSM, extension, struct_ops) by a caller outside the agent's
+/// family, outside a window and without the signed per-loader opt-out —
+/// refused by the `bpf` hook (`target_ino` = the program type).
+pub const FS_OP_BPF_PROG_TYPE: u8 = 40;
+
+/// Lot 290: NOT a refusal — such a load let through by the signed
+/// per-loader opt-out (`bpf-loader-allow`: the loader's executable by
+/// device and inode, and the type), recorded (`target_ino` = the type).
+pub const FS_OP_BPF_PROG_OPT_OUT: u8 = 41;
+
+/// Lot 290: NOT a refusal — the kernel-state round's cross-view: a BPF
+/// program (or a link) the `bpf` hook never saw loading since the agent's
+/// start, enumerated by the agent's iterator (`target_ino` = type << 32 |
+/// id, `target_dev` = its tag; the program's name and attach point in the
+/// event's `comm`, `name@attach`).
+pub const FS_OP_BPF_UNSEEN: u8 = 42;
+
+/// Lot 290: NOT a refusal — a BPF program present when the agent started
+/// (loaded while it was not running), the cross-view's baseline, signed
+/// once; the fields as [`FS_OP_BPF_UNSEEN`].
+pub const FS_OP_BPF_BASELINE: u8 = 43;
+
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_EXEMPT_INJECT;
+pub const FS_OP_LAST: u8 = FS_OP_BPF_BASELINE;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
@@ -2261,6 +2295,11 @@ mod tests {
             FS_OP_SYSCTL_ROOT_ATTACH,
             FS_OP_SYSCTL_ROOT_PROG,
             FS_OP_EXEMPT_INJECT,
+            FS_OP_BPF_HANDLE,
+            FS_OP_BPF_PROG_TYPE,
+            FS_OP_BPF_PROG_OPT_OUT,
+            FS_OP_BPF_UNSEEN,
+            FS_OP_BPF_BASELINE,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
         for (i, a) in ops.iter().enumerate() {

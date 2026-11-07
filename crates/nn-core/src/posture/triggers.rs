@@ -906,6 +906,9 @@ impl<H: DecisionHost> TriggerDetector<H> {
             // Lot 281: nor code-injection access to a process (a debugger's
             // attach, any process's): recorded, the process's exemptions
             // revoked — what it does next is judged without them.
+            // Lot 290: nor a load the signed per-loader opt-out let through,
+            // nor the cross-view's findings (a program the hook never saw,
+            // the start's baseline): signed, no refusal.
             if !matches!(
                 operation,
                 nn_model::FsProtectOperation::CgroupJoin
@@ -913,6 +916,9 @@ impl<H: DecisionHost> TriggerDetector<H> {
                     | nn_model::FsProtectOperation::KernelTaint
                     | nn_model::FsProtectOperation::SysctlRootProg
                     | nn_model::FsProtectOperation::ExemptInjection
+                    | nn_model::FsProtectOperation::BpfProgOptOut
+                    | nn_model::FsProtectOperation::BpfUnseen
+                    | nn_model::FsProtectOperation::BpfBaseline
             ) {
                 hits.push(if *pid == 1 {
                     TriggerType::RelayedTamperAttempt
@@ -955,6 +961,12 @@ impl<H: DecisionHost> TriggerDetector<H> {
                         | nn_model::FsProtectOperation::Kprobes
                         | nn_model::FsProtectOperation::Lockdown
                         | nn_model::FsProtectOperation::SysctlRootAttach
+                        // lot 290: a load of a refused program type, a
+                        // handle on the agent's maps or programs to read or
+                        // inspect them — refused; an administrator's
+                        // bpftrace or `bpftool prog list` meets them too
+                        | nn_model::FsProtectOperation::BpfProgType
+                        | nn_model::FsProtectOperation::BpfHandle
                 ) {
                     // Lot 273c: a refused change of the agent's scheduling, nice
                     // value or I/O priority is an impairment (ENGAGED), not a
@@ -2994,6 +3006,53 @@ mod tests {
                 vec![TriggerType::DefenseImpairment],
                 "{op}"
             );
+        }
+    }
+
+    /// Lot 290 (named): a refused load of a refused program type and a
+    /// refused handle on the agent's maps or programs impair (ENGAGED) — an
+    /// administrator's bpftrace or `bpftool prog list` meets them, the
+    /// ladder must not kill it; a write handle and a link handle stay
+    /// decisive; an opt-out's load and the cross-view's findings raise
+    /// nothing.
+    #[test]
+    fn foreign_bpf_refusals_impair_and_the_cross_view_raises_nothing() {
+        let det = TriggerDetector::new();
+        let ev = |operation| Event::FsProtectDenial {
+            pid: 4242,
+            uid: 0,
+            comm: "bpftrace".into(),
+            target_dev: 2,
+            target_ino: 77,
+            operation,
+            timestamp_ns: 1,
+        };
+        for op in [
+            nn_model::FsProtectOperation::BpfProgType,
+            nn_model::FsProtectOperation::BpfHandle,
+        ] {
+            assert_eq!(
+                det.detect(&ev(op), &[]),
+                vec![TriggerType::DefenseImpairment],
+                "{op}"
+            );
+        }
+        for op in [
+            nn_model::FsProtectOperation::BpfMap,
+            nn_model::FsProtectOperation::BpfLink,
+        ] {
+            assert_eq!(
+                det.detect(&ev(op), &[]),
+                vec![TriggerType::AntiTamperDenial],
+                "{op}"
+            );
+        }
+        for op in [
+            nn_model::FsProtectOperation::BpfProgOptOut,
+            nn_model::FsProtectOperation::BpfUnseen,
+            nn_model::FsProtectOperation::BpfBaseline,
+        ] {
+            assert!(det.detect(&ev(op), &[]).is_empty(), "{op}");
         }
     }
 

@@ -514,7 +514,9 @@ pub(crate) fn start(
                 // External audit ATP-013: the FIM observers and the file-open
                 // sensor were loaded after the BPF guard registered the
                 // agent's objects: their programs and links join the set.
+                let bpf_guard = sensor.bpf_guard().clone();
                 match northnarrow_agent::anti_tamper::bpf_defense::register_late_objects(
+                    &bpf_guard,
                     sensor.ebpf_mut(),
                 ) {
                     Ok(n) => debug!(

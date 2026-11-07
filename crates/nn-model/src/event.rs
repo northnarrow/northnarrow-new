@@ -1141,6 +1141,25 @@ pub enum FsProtectOperation {
     /// more. `target_ino` its tgid, `target_dev` the access
     /// (`common::cgroup_join::inject_detail`).
     ExemptInjection,
+    /// Lot 290: a handle on one of the agent's own BPF objects refused
+    /// outside a window — a map or program by id or through any path, or a
+    /// path under its pin directories (`target_dev` the kind: 1 map, 2
+    /// program, 0 a path; `target_ino` the id).
+    BpfHandle,
+    /// Lot 290: a load of a program type refused by default (kprobe,
+    /// tracing, LSM, extension, struct_ops) outside the family and a window,
+    /// without the signed per-loader opt-out (`target_ino` the type).
+    BpfProgType,
+    /// Lot 290: NOT a refusal — such a load let through by the signed
+    /// per-loader opt-out (`target_ino` the type).
+    BpfProgOptOut,
+    /// Lot 290: NOT a refusal — the cross-view: a BPF program or link the
+    /// `bpf` hook never saw loading since the agent's start (`target_ino`
+    /// type << 32 | id, `target_dev` its tag, `comm` `name@attach`).
+    BpfUnseen,
+    /// Lot 290: NOT a refusal — a BPF program present at the agent's start,
+    /// the cross-view's baseline, signed once (fields as `BpfUnseen`).
+    BpfBaseline,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1187,6 +1206,11 @@ impl FsProtectOperation {
             crate::wire::FS_OP_SYSCTL_ROOT_ATTACH => Self::SysctlRootAttach,
             crate::wire::FS_OP_SYSCTL_ROOT_PROG => Self::SysctlRootProg,
             crate::wire::FS_OP_EXEMPT_INJECT => Self::ExemptInjection,
+            crate::wire::FS_OP_BPF_HANDLE => Self::BpfHandle,
+            crate::wire::FS_OP_BPF_PROG_TYPE => Self::BpfProgType,
+            crate::wire::FS_OP_BPF_PROG_OPT_OUT => Self::BpfProgOptOut,
+            crate::wire::FS_OP_BPF_UNSEEN => Self::BpfUnseen,
+            crate::wire::FS_OP_BPF_BASELINE => Self::BpfBaseline,
             other => Self::Unknown(other),
         }
     }
@@ -1231,6 +1255,11 @@ impl FsProtectOperation {
             Self::SysctlRootAttach => "sysctl_root_attach",
             Self::SysctlRootProg => "sysctl_root_prog",
             Self::ExemptInjection => "exempt_injection",
+            Self::BpfHandle => "bpf_handle",
+            Self::BpfProgType => "bpf_prog_type",
+            Self::BpfProgOptOut => "bpf_prog_opt_out",
+            Self::BpfUnseen => "bpf_unseen",
+            Self::BpfBaseline => "bpf_baseline",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -1912,6 +1941,32 @@ mod tests {
                 crate::wire::FS_OP_EXEMPT_INJECT,
                 FsProtectOperation::ExemptInjection,
                 "exempt_injection",
+            ),
+            // Lot 290
+            (
+                crate::wire::FS_OP_BPF_HANDLE,
+                FsProtectOperation::BpfHandle,
+                "bpf_handle",
+            ),
+            (
+                crate::wire::FS_OP_BPF_PROG_TYPE,
+                FsProtectOperation::BpfProgType,
+                "bpf_prog_type",
+            ),
+            (
+                crate::wire::FS_OP_BPF_PROG_OPT_OUT,
+                FsProtectOperation::BpfProgOptOut,
+                "bpf_prog_opt_out",
+            ),
+            (
+                crate::wire::FS_OP_BPF_UNSEEN,
+                FsProtectOperation::BpfUnseen,
+                "bpf_unseen",
+            ),
+            (
+                crate::wire::FS_OP_BPF_BASELINE,
+                FsProtectOperation::BpfBaseline,
+                "bpf_baseline",
             ),
         ];
         for (byte, op, name) in cases {

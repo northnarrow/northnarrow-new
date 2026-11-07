@@ -442,13 +442,18 @@ pub fn root_report() -> Result<Option<Vec<u32>>, String> {
 const QUERY_TRIES: u32 = 40;
 const QUERY_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// The judge flag (`SYSCTL_KERNEL_JUDGE[0]`).
+/// The judge flag (`SYSCTL_KERNEL_JUDGE[0]`), then (lot 290, item 3) the
+/// map frozen: set once per load, read by the write deny only.
 fn set_judge_flag(ebpf: &mut Ebpf, v: u32) -> Result<(), String> {
     let map = ebpf
         .map_mut(JUDGE_MAP)
         .ok_or_else(|| format!("map {JUDGE_MAP} missing from the eBPF object"))?;
     let mut a: Array<&mut MapData, u32> = Array::try_from(map).map_err(|e| e.to_string())?;
-    a.set(0, v, 0).map_err(|e| e.to_string())
+    a.set(0, v, 0).map_err(|e| e.to_string())?;
+    if let Err(e) = crate::anti_tamper::bpf_defense::freeze_named(ebpf, JUDGE_MAP) {
+        warn!(error = %e, "sysctl judge: the judge flag's map NOT frozen");
+    }
+    Ok(())
 }
 
 /// aya view of [`SysctlOptOut`].

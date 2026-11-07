@@ -545,6 +545,54 @@ sysctl-allow kernel.pid_max 4096..32767
 - `nn-admin policy show` lists the lines in force; the policy's summary
   counts them (`…, 1 sysctl opt-out`).
 
+### 2.5 The signed per-loader opt-out of the refused BPF program types (lot 290)
+
+Outside a trusted-installer window the agent refuses (`EPERM`) a
+`BPF_PROG_LOAD` of the program types that can rewrite a process's memory
+(`bpf_probe_write_user`), override a kernel function's return
+(`bpf_override_return`, `fmod_ret`), signal a process (`bpf_send_signal`)
+or take one of the agent's hooks' place: `kprobe`, `tracing` (fentry,
+fexit, fmod_ret, iterators), `lsm`, `ext` (freplace) and `struct_ops`.
+Every other type — the cgroup device, skb, sock and sysctl programs of
+systemd and the container runtimes, tc and XDP networking, socket filters,
+tracepoints, perf events — is let through and recorded; inside a window
+everything is let through and recorded (the trust model's lot 290,
+https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/ANTITAMPER_TRUST_MODEL.md).
+A host that runs bpftrace, Falco, Tetragon, Cilium or another BPF tool of
+those types outside a window says so in the policy:
+
+```
+# rule-policy.local — signed by config-manage
+bpf-loader-allow /usr/bin/bpftrace kprobe,tracing
+bpf-loader-allow /usr/bin/falco kprobe,tracing
+```
+
+- The executable is an absolute path (no `.` or `..` component); the types
+  are among the five above, each once. Any other type refuses the file:
+  there is nothing to opt out of. One line per executable, 32 at most.
+- **By device and inode.** When the policy is applied (the agent's start,
+  `nn-admin policy set`) the path is resolved — a symlink followed to the
+  file the kernel runs — and the kernel matches the loader's executable by
+  that device and inode, not by its name. A package upgrade that replaces
+  the file leaves the line without effect (its loads refused again) until
+  the policy is applied again: `nn-admin policy set` with the same file, or
+  the agent's next start. A path that is not there is named in a signed
+  `rule_policy` degradation.
+- **Honoured only with a valid signature**, like `sysctl-allow`: an unsigned
+  policy loaded through `NN_OVERLAY_ALLOW_UNSIGNED=1` keeps its other lines
+  and loses its `bpf-loader-allow` (a signed `rule_policy` degradation says
+  so).
+- **Every load it lets through is recorded**: NN-L-AT-001 with `operation`
+  `bpf_prog_opt_out`, the loader and the type, Low, no posture change (one
+  record a second per loader and type). A refused load is NN-L-AT-001
+  `bpf_prog_type`, High, and raises the posture to ENGAGED (an
+  administrator's bpftrace meets it too: never the decisive tamper).
+- It names an executable, not a user: while it is in force any root process
+  that runs that executable may load those types. bpftrace runs what it is
+  given — opt out a tool only where its use outside a window is routine.
+- `nn-admin policy show` lists the lines in force; the policy's summary
+  counts them (`…, 1 BPF loader opt-out`).
+
 ### 2.4 Kernel module loads judged in the kernel (lot 285)
 
 A root user loads a module without any tool — `finit_module(2)` on a file of

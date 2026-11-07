@@ -58,6 +58,9 @@ pub const BPF_LINK_GET_FD_BY_ID: u32 = 30;
 /// `BPF_LINK_GET_NEXT_ID`: enumeration, no handle (the first step of each
 /// entry of `bpftool link list`).
 pub const BPF_LINK_GET_NEXT_ID: u32 = 31;
+/// `BPF_ITER_CREATE`: a readable descriptor of an iterator link (lot 290:
+/// the cross-view's enumeration).
+pub const BPF_ITER_CREATE: u32 = 33;
 /// `BPF_LINK_DETACH`: detaches a link (by link fd).
 pub const BPF_LINK_DETACH: u32 = 34;
 
@@ -91,7 +94,7 @@ pub const fn judges_attach_target(cmd: u32, attach_type: u32) -> bool {
 /// Every number above with its uapi name, for the checks against the
 /// header and the kernel's BTF. A command added above goes here too
 /// (`every_constant_is_listed` checks it).
-pub const UAPI: [(&str, u32); 19] = [
+pub const UAPI: [(&str, u32); 20] = [
     ("BPF_MAP_CREATE", BPF_MAP_CREATE),
     ("BPF_MAP_GET_NEXT_KEY", BPF_MAP_GET_NEXT_KEY),
     ("BPF_PROG_LOAD", BPF_PROG_LOAD),
@@ -110,6 +113,7 @@ pub const UAPI: [(&str, u32); 19] = [
     ("BPF_LINK_UPDATE", BPF_LINK_UPDATE),
     ("BPF_LINK_GET_FD_BY_ID", BPF_LINK_GET_FD_BY_ID),
     ("BPF_LINK_GET_NEXT_ID", BPF_LINK_GET_NEXT_ID),
+    ("BPF_ITER_CREATE", BPF_ITER_CREATE),
     ("BPF_LINK_DETACH", BPF_LINK_DETACH),
 ];
 
